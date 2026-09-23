@@ -268,8 +268,7 @@ impl Warden {
                 WardenOutcome::Executed(audit)
             }
             Err(_execution_error) => {
-                self.audit
-                    .record(AuditEvent::ExecutionFailed { action });
+                self.audit.record(AuditEvent::ExecutionFailed { action });
                 WardenOutcome::ExecutionFailed
             }
         }
@@ -291,18 +290,19 @@ mod tests {
     use super::{Warden, WardenOutcome};
     use crate::audit::{AuditEvent, RecordingAuditSink};
     use crate::executor::RecordingExecutor;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_dod_warden_proto::{
         AuthorizationProof, Denial, EscalationStage, ProposedAction, WardenAction,
         WardenActionRequest, WardenResponse,
     };
     use harw_types::{ApprovalActor, CgroupId, FindingId};
 
-    fn cgroup(id: &str) -> CgroupId {
-        CgroupId::try_from_str(id).expect("non-empty id")
+    fn cgroup(id: &str) -> TestResult<CgroupId> {
+        CgroupId::try_from_str(id).map_err(ctx("non-empty id"))
     }
 
-    fn finding(id: &str) -> FindingId {
-        FindingId::try_from_str(id).expect("non-empty id")
+    fn finding(id: &str) -> TestResult<FindingId> {
+        FindingId::try_from_str(id).map_err(ctx("non-empty id"))
     }
 
     fn actor() -> ApprovalActor {
@@ -315,33 +315,33 @@ mod tests {
         finding_id: FindingId,
         action: &WardenAction,
         stage: EscalationStage,
-    ) -> AuthorizationProof {
-        AuthorizationProof::new(
+    ) -> TestResult<AuthorizationProof> {
+        Ok(AuthorizationProof::new(
             finding_id,
             stage,
             actor(),
             jiff::Timestamp::UNIX_EPOCH,
-            action.content_digest().expect("action encodes"),
-        )
+            action.content_digest().map_err(ctx("action encodes"))?,
+        ))
     }
 
     // -- Der wichtigste Test: Beleg, der an eine andere Aktion gebunden ist ---
 
     #[test]
-    fn test_mismatched_proof_and_action_is_denied_via_public_path() {
+    fn test_mismatched_proof_and_action_is_denied_via_public_path() -> TestResult {
         // Der Beleg wird an FreezeCgroup(cgroup-1) gebunden ausgestellt ...
         let bound_action = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
-        let f = finding("finding-1");
-        let proof = proof_for(f.clone(), &bound_action, EscalationStage::Escalated);
+        let f = finding("finding-1")?;
+        let proof = proof_for(f.clone(), &bound_action, EscalationStage::Escalated)?;
 
         // ... aber über den öffentlichen Weg (WardenActionRequest::new) wird
         // eine ANDERE Aktion mit diesem Beleg verschickt. Kein handgebauter
         // interner Zustand: der Beleg und die Aktion durchlaufen exakt den
         // Weg, den ein realer Absender nutzen würde.
         let different_action = ProposedAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-2"),
+            cgroup: cgroup("cgroup-2")?,
         };
         let request = WardenActionRequest::new(different_action, proof);
 
@@ -355,17 +355,18 @@ mod tests {
 
         let outcome = warden.handle(&f, &request);
         assert_eq!(outcome, WardenOutcome::Denied(Denial::ProofMismatch));
+        Ok(())
     }
 
     #[test]
-    fn test_proof_bound_to_different_finding_is_denied() {
+    fn test_proof_bound_to_different_finding_is_denied() -> TestResult {
         let action = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
-        let proof = proof_for(finding("finding-1"), &action, EscalationStage::Escalated);
+        let proof = proof_for(finding("finding-1")?, &action, EscalationStage::Escalated)?;
         let request = WardenActionRequest::new(
             ProposedAction::FreezeCgroup {
-                cgroup: cgroup("cgroup-1"),
+                cgroup: cgroup("cgroup-1")?,
             },
             proof,
         );
@@ -381,25 +382,26 @@ mod tests {
         // `finding` kommt hier unabhängig vom Beleg herein (Session-Kontext,
         // der laut Test einen ANDEREN Befund erwartet) - siehe Moduldoku,
         // Abschnitt „Die K43-Falle".
-        let other_finding = finding("finding-2");
+        let other_finding = finding("finding-2")?;
         let outcome = warden.handle(&other_finding, &request);
         assert_eq!(outcome, WardenOutcome::Denied(Denial::ProofMismatch));
+        Ok(())
     }
 
     // -- Beleg für eine unzulässige Stufe --------------------------------------
 
     #[test]
-    fn test_proof_for_inadmissible_stage_is_denied() {
+    fn test_proof_for_inadmissible_stage_is_denied() -> TestResult {
         let action = WardenAction::KillProcessTree {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
-        let f = finding("finding-1");
+        let f = finding("finding-1")?;
         // RuleTriggered erlaubt kein KillProcessTree (siehe
         // `harw_dod_warden_proto::action`).
-        let proof = proof_for(f.clone(), &action, EscalationStage::RuleTriggered);
+        let proof = proof_for(f.clone(), &action, EscalationStage::RuleTriggered)?;
         let request = WardenActionRequest::new(
             ProposedAction::KillProcessTree {
-                cgroup: cgroup("cgroup-1"),
+                cgroup: cgroup("cgroup-1")?,
             },
             proof,
         );
@@ -414,12 +416,13 @@ mod tests {
 
         let outcome = warden.handle(&f, &request);
         assert_eq!(outcome, WardenOutcome::Denied(Denial::NotAdmissibleAtStage));
+        Ok(())
     }
 
     // -- Audit vor jedem Fehlerpfad ---------------------------------------------
 
     #[test]
-    fn test_denied_request_audit_entry_is_observable() {
+    fn test_denied_request_audit_entry_is_observable() -> TestResult {
         use std::sync::Arc;
 
         struct SharedSink(Arc<RecordingAuditSink>);
@@ -430,13 +433,13 @@ mod tests {
         }
 
         let action = WardenAction::KillProcessTree {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
-        let f = finding("finding-1");
-        let proof = proof_for(f.clone(), &action, EscalationStage::RuleTriggered);
+        let f = finding("finding-1")?;
+        let proof = proof_for(f.clone(), &action, EscalationStage::RuleTriggered)?;
         let request = WardenActionRequest::new(
             ProposedAction::KillProcessTree {
-                cgroup: cgroup("cgroup-1"),
+                cgroup: cgroup("cgroup-1")?,
             },
             proof,
         );
@@ -462,10 +465,11 @@ mod tests {
                 ..
             }
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_failed_execution_leaves_audit_entry() {
+    fn test_failed_execution_leaves_audit_entry() -> TestResult {
         use std::sync::Arc;
 
         struct SharedSink(Arc<RecordingAuditSink>);
@@ -476,13 +480,13 @@ mod tests {
         }
 
         let action = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
-        let f = finding("finding-1");
-        let proof = proof_for(f.clone(), &action, EscalationStage::Escalated);
+        let f = finding("finding-1")?;
+        let proof = proof_for(f.clone(), &action, EscalationStage::Escalated)?;
         let request = WardenActionRequest::new(
             ProposedAction::FreezeCgroup {
-                cgroup: cgroup("cgroup-1"),
+                cgroup: cgroup("cgroup-1")?,
             },
             proof,
         );
@@ -503,20 +507,21 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], AuditEvent::Attempting { .. }));
         assert!(matches!(events[1], AuditEvent::ExecutionFailed { .. }));
+        Ok(())
     }
 
     // -- Erfolgreiche Ausführung --------------------------------------------------
 
     #[test]
-    fn test_admissible_and_bound_request_is_executed() {
+    fn test_admissible_and_bound_request_is_executed() -> TestResult {
         let action = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
-        let f = finding("finding-1");
-        let proof = proof_for(f.clone(), &action, EscalationStage::RuleTriggered);
+        let f = finding("finding-1")?;
+        let proof = proof_for(f.clone(), &action, EscalationStage::RuleTriggered)?;
         let request = WardenActionRequest::new(
             ProposedAction::FreezeCgroup {
-                cgroup: cgroup("cgroup-1"),
+                cgroup: cgroup("cgroup-1")?,
             },
             proof,
         );
@@ -534,22 +539,27 @@ mod tests {
             WardenOutcome::Executed(audit) => {
                 assert_eq!(audit.audit_name, "warden.freeze_cgroup");
             }
-            other => panic!("expected Executed, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Executed, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     // -- Antwort enthält keinen Inhalt -------------------------------------------
 
     #[test]
-    fn test_denied_wire_response_serialized_text_is_content_free() {
+    fn test_denied_wire_response_serialized_text_is_content_free() -> TestResult {
         let action = WardenAction::KillProcessTree {
-            cgroup: cgroup("very-identifiable-cgroup-name"),
+            cgroup: cgroup("very-identifiable-cgroup-name")?,
         };
-        let f = finding("very-identifiable-finding-name");
-        let proof = proof_for(f.clone(), &action, EscalationStage::RuleTriggered);
+        let f = finding("very-identifiable-finding-name")?;
+        let proof = proof_for(f.clone(), &action, EscalationStage::RuleTriggered)?;
         let request = WardenActionRequest::new(
             ProposedAction::KillProcessTree {
-                cgroup: cgroup("very-identifiable-cgroup-name"),
+                cgroup: cgroup("very-identifiable-cgroup-name")?,
             },
             proof,
         );
@@ -563,23 +573,26 @@ mod tests {
         );
 
         let outcome = warden.handle(&f, &request);
-        let response = outcome.to_wire().expect("Denied maps to WardenResponse");
-        let json = serde_json::to_string(&response).expect("serializes");
+        let response = outcome
+            .to_wire()
+            .ok_or(TestError::Missing("Denied maps to WardenResponse"))?;
+        let json = serde_json::to_string(&response).map_err(ctx("serializes"))?;
 
         assert!(!json.contains("very-identifiable"));
         assert!(matches!(response, WardenResponse::Denied { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_execution_failed_has_no_wire_representation() {
+    fn test_execution_failed_has_no_wire_representation() -> TestResult {
         let action = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
-        let f = finding("finding-1");
-        let proof = proof_for(f.clone(), &action, EscalationStage::RuleTriggered);
+        let f = finding("finding-1")?;
+        let proof = proof_for(f.clone(), &action, EscalationStage::RuleTriggered)?;
         let request = WardenActionRequest::new(
             ProposedAction::FreezeCgroup {
-                cgroup: cgroup("cgroup-1"),
+                cgroup: cgroup("cgroup-1")?,
             },
             proof,
         );
@@ -595,31 +608,35 @@ mod tests {
         let outcome = warden.handle(&f, &request);
         assert_eq!(outcome, WardenOutcome::ExecutionFailed);
         assert!(outcome.to_wire().is_none());
+        Ok(())
     }
 
     // -- unbekanntes Feld in der Anfrage -----------------------------------------
 
     #[test]
-    fn test_request_with_unknown_field_is_rejected_at_deserialization() {
+    fn test_request_with_unknown_field_is_rejected_at_deserialization() -> TestResult {
         let action = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
-        let f = finding("finding-1");
-        let proof = proof_for(f, &action, EscalationStage::RuleTriggered);
+        let f = finding("finding-1")?;
+        let proof = proof_for(f, &action, EscalationStage::RuleTriggered)?;
         let request = WardenActionRequest::new(
             ProposedAction::FreezeCgroup {
-                cgroup: cgroup("cgroup-1"),
+                cgroup: cgroup("cgroup-1")?,
             },
             proof,
         );
 
-        let mut value = serde_json::to_value(&request).expect("serializes");
+        let mut value = serde_json::to_value(&request).map_err(ctx("serializes"))?;
         value
             .as_object_mut()
-            .unwrap()
+            .ok_or(TestError::Unexpected(
+                "serialized request is not a JSON object".to_string(),
+            ))?
             .insert("extra".to_string(), serde_json::Value::Bool(true));
 
         let result: Result<WardenActionRequest, _> = serde_json::from_value(value);
         assert!(result.is_err());
+        Ok(())
     }
 }

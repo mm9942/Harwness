@@ -246,13 +246,16 @@ pub(crate) fn launch_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use crate::test_support::{TestError, TestResult, ctx};
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_types::{TenantId, WorkspaceId};
     use tempfile::TempDir;
 
-    fn sandbox(dir: &TempDir) -> SandboxSpec {
+    fn sandbox(dir: &TempDir) -> TestResult<SandboxSpec> {
         let workspace = dir.path().join("project");
-        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        std::fs::create_dir_all(&workspace).map_err(ctx("workspace dir"))?;
         let registry = WorkspaceRegistry::build(
             dir.path(),
             [WorkspaceRegistration {
@@ -261,17 +264,17 @@ mod tests {
                 root: workspace,
             }],
         )
-        .expect("registry");
+        .map_err(ctx("registry"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("tenant"),
                 &WorkspaceId::from_str("project"),
             )
-            .expect("binding");
-        SandboxSpec::from_resolved(
+            .map_err(ctx("binding"))?;
+        Ok(SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ExecuteProcess]),
-        )
+        ))
     }
 
     fn strings(args: &[OsString]) -> Vec<String> {
@@ -299,19 +302,22 @@ mod tests {
     }
 
     #[test]
-    fn error_message_names_util_linux_prlimit_and_the_config_switch() {
+    fn error_message_names_util_linux_prlimit_and_the_config_switch() -> TestResult {
         // R1-03: die Fehlermeldung muss klar machen, *was* fehlt (util-linux/
         // prlimit) und *wie* man es fail-open umgehen kann (der Konfig-Schalter
         // `require_rlimits`), damit ein Betreiber nicht raten muss.
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let missing = dir.path().join("prlimit");
-        let message = ShellLimits::default()
-            .resolve_prlimit_in(&[missing.as_path()])
-            .expect_err("missing prlimit must error when required")
-            .to_string();
+        let Err(error) = ShellLimits::default().resolve_prlimit_in(&[missing.as_path()]) else {
+            return Err(TestError::Unexpected(
+                "missing prlimit must error when required".into(),
+            ));
+        };
+        let message = error.to_string();
         assert!(message.contains("util-linux/prlimit fehlt"), "{message}");
         assert!(message.contains("require_rlimits"), "{message}");
         assert!(message.contains("PATH is never searched"), "{message}");
+        Ok(())
     }
 
     #[test]
@@ -365,21 +371,21 @@ mod tests {
     }
 
     #[test]
-    fn launch_command_golden_prlimit_then_bwrap_then_plan() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn launch_command_golden_prlimit_then_bwrap_then_plan() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let limits = ShellLimits::default();
         let launcher = BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
-            .with_tmpfs_size(limits.tmpfs_size().expect("tmpfs size"));
+            .with_tmpfs_size(limits.tmpfs_size().map_err(ctx("tmpfs size"))?);
         let plan = launcher
             .plan(
-                &sandbox(&dir),
+                &sandbox(&dir)?,
                 &[
                     OsString::from("/bin/sh"),
                     OsString::from("-c"),
                     OsString::from("echo hi"),
                 ],
             )
-            .expect("plan");
+            .map_err(ctx("plan"))?;
 
         let command = launch_command(
             Some(Path::new("/usr/bin/prlimit")),
@@ -403,18 +409,25 @@ mod tests {
             ]
         );
         assert_eq!(args[7..], strings(plan.args())[..]);
-        let tmpfs = args.iter().position(|argument| argument == "--tmpfs").expect("tmpfs");
-        assert_eq!(args[tmpfs - 2..tmpfs + 2], ["--size", "268435456", "--tmpfs", "/tmp"]);
+        let tmpfs = args
+            .iter()
+            .position(|argument| argument == "--tmpfs")
+            .ok_or(TestError::Missing("tmpfs"))?;
+        assert_eq!(
+            args[tmpfs - 2..tmpfs + 2],
+            ["--size", "268435456", "--tmpfs", "/tmp"]
+        );
         assert_eq!(args[args.len() - 3..], ["/bin/sh", "-c", "echo hi"]);
+        Ok(())
     }
 
     #[test]
-    fn launch_command_without_prlimit_starts_bwrap_directly() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn launch_command_without_prlimit_starts_bwrap_directly() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let launcher = BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"));
         let plan = launcher
-            .plan(&sandbox(&dir), &[OsString::from("/bin/true")])
-            .expect("plan");
+            .plan(&sandbox(&dir)?, &[OsString::from("/bin/true")])
+            .map_err(ctx("plan"))?;
 
         let command = launch_command(
             None,
@@ -425,7 +438,12 @@ mod tests {
 
         assert_eq!(command.program, PathBuf::from("/usr/bin/bwrap"));
         assert_eq!(command.args, plan.args());
-        assert!(!strings(&command.args).iter().any(|argument| argument.starts_with("--nproc")));
+        assert!(
+            !strings(&command.args)
+                .iter()
+                .any(|argument| argument.starts_with("--nproc"))
+        );
+        Ok(())
     }
 
     #[test]
@@ -474,8 +492,8 @@ mod tests {
     }
 
     #[test]
-    fn missing_prlimit_is_typed_error_when_required() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn missing_prlimit_is_typed_error_when_required() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let missing = dir.path().join("prlimit");
         let result = ShellLimits::default().resolve_prlimit_in(&[missing.as_path()]);
         assert_eq!(
@@ -484,19 +502,24 @@ mod tests {
                 candidates: vec![missing.clone()],
             })
         );
-        let message = result.expect_err("error").to_string();
+        let Err(error) = result else {
+            return Err(TestError::Unexpected("error erwartet".into()));
+        };
+        let message = error.to_string();
         assert!(message.contains("PATH is never searched"), "{message}");
+        Ok(())
     }
 
     #[test]
-    fn missing_prlimit_is_allowed_only_when_not_required() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn missing_prlimit_is_allowed_only_when_not_required() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let missing = dir.path().join("prlimit");
         let limits = ShellLimits {
             require_rlimits: false,
             ..ShellLimits::default()
         };
         assert_eq!(limits.resolve_prlimit_in(&[missing.as_path()]), Ok(None));
+        Ok(())
     }
 
     #[test]
@@ -511,26 +534,27 @@ mod tests {
     }
 
     #[test]
-    fn user_owned_fake_prlimit_is_not_trusted() {
+    fn user_owned_fake_prlimit_is_not_trusted() -> TestResult {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let fake = dir.path().join("prlimit");
-        std::fs::write(&fake, b"#!/bin/sh\nexec \"$@\"\n").expect("write fake");
+        std::fs::write(&fake, b"#!/bin/sh\nexec \"$@\"\n").map_err(ctx("write fake"))?;
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod fake");
-        if std::fs::metadata(&fake).expect("metadata").uid() == 0 {
+            .map_err(ctx("chmod fake"))?;
+        if std::fs::metadata(&fake).map_err(ctx("metadata"))?.uid() == 0 {
             eprintln!("übersprungen: Test läuft als root, Eigentümerprüfung nicht beobachtbar");
-            return;
+            return Ok(());
         }
         assert!(matches!(
             ShellLimits::default().resolve_prlimit_in(&[fake.as_path()]),
             Err(ShellLimitsError::PrlimitUnavailable { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn fixed_prlimit_resolution_returns_only_pinned_path() {
+    fn fixed_prlimit_resolution_returns_only_pinned_path() -> TestResult {
         let limits = ShellLimits {
             require_rlimits: false,
             ..ShellLimits::default()
@@ -538,7 +562,12 @@ mod tests {
         match limits.resolve_prlimit() {
             Ok(Some(path)) => assert_eq!(path, PathBuf::from(PRLIMIT_CANDIDATES[0])),
             Ok(None) => eprintln!("hinweis: kein vertrauenswürdiges /usr/bin/prlimit vorhanden"),
-            Err(error) => panic!("require_rlimits=false darf nicht fehlschlagen: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "require_rlimits=false darf nicht fehlschlagen: {error}"
+                )));
+            }
         }
+        Ok(())
     }
 }

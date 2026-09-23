@@ -20,6 +20,7 @@
 //! - Konverter: [`task_ids`], [`scopes`], [`plan_nodes`]
 //! - Leer-Konstanten: [`NO_DEPS`], [`NO_SCOPES`]
 //! - Assertion-Helfer ohne `unwrap()`: [`expect_ok`], [`expect_err`]
+//! - Fehlertyp der Assertion-Helfer: [`ExpectationError`]
 //!
 //! # Sichtbarkeit
 //! Das Modul ist **unbedingt** `pub` — nicht `#[cfg(test)]` und nicht hinter
@@ -53,9 +54,11 @@
 //! Fixtures deterministisch bleiben.
 //!
 //! # Errors
-//! Dieses Modul erzeugt keine Fehler. [`expect_ok`] und [`expect_err`]
-//! *konsumieren* fremde [`crate::error::PlanResult`]-Werte und brechen den
-//! Test per `panic!` mit Kontext ab, statt `unwrap()`/`expect()` zu verwenden.
+//! [`expect_ok`] und [`expect_err`] *konsumieren* fremde
+//! [`crate::error::PlanResult`]-Werte (oder andere `Result`/`Debug`-taugliche
+//! Werte) und geben bei unerwarteter Form ein [`ExpectationError`] zurück,
+//! statt per `panic!`/`unwrap()`/`expect()` abzubrechen. Der Aufrufer
+//! propagiert den Fehler per `?`.
 //!
 //! # Examples
 //! ```rust,no_run
@@ -285,7 +288,54 @@ pub fn plan_nodes(nodes: impl IntoIterator<Item = PlanNode>) -> Vec<PlanNode> {
     nodes.into_iter().collect()
 }
 
-/// Packt ein `Ok` aus oder bricht den Test mit Kontext ab.
+/// Fehler von [`expect_ok`] und [`expect_err`].
+///
+/// # Description
+/// Ersetzt den früheren `panic!`-Abbruch: beide Assertion-Helfer geben bei
+/// unerwarteter Form ein `Err(ExpectationError)` zurück, das der Aufrufer per
+/// `?` weiterreicht, statt den Test-Thread abzubrechen.
+///
+/// # Concurrency
+/// Reiner Werttyp, `Send + Sync`.
+pub enum ExpectationError {
+    /// [`expect_ok`] erhielt ein `Err`, obwohl ein `Ok` erwartet wurde.
+    UnexpectedErr {
+        /// Beschreibung der Aufrufstelle, z. B. `"Create anwenden"`.
+        context: String,
+        /// Der [`std::fmt::Display`]-Text des unerwarteten Fehlers.
+        error: String,
+    },
+    /// [`expect_err`] erhielt ein `Ok`, obwohl ein `Err` erwartet wurde.
+    UnexpectedOk {
+        /// Beschreibung der Aufrufstelle.
+        context: String,
+        /// Der [`std::fmt::Debug`]-Text des unerwarteten Werts.
+        value: String,
+    },
+}
+
+impl std::fmt::Display for ExpectationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExpectationError::UnexpectedErr { context, error } => {
+                write!(f, "{context}: unerwarteter Fehler: {error}")
+            }
+            ExpectationError::UnexpectedOk { context, value } => {
+                write!(f, "{context}: Fehler erwartet, war aber Ok({value})")
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for ExpectationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::error::Error for ExpectationError {}
+
+/// Packt ein `Ok` aus oder meldet den unerwarteten `Err` mit Kontext.
 ///
 /// # Description
 /// Ersetzt `unwrap()`/`expect()` in Tests: Der Fehler wird über
@@ -297,51 +347,58 @@ pub fn plan_nodes(nodes: impl IntoIterator<Item = PlanNode>) -> Vec<PlanNode> {
 /// - `context` (`&str`): was versucht wurde, z. B. `"Create anwenden"`.
 ///
 /// # Returns
-/// Den `Ok`-Wert.
+/// `Ok(value)` mit dem entpackten `Ok`-Wert.
 ///
-/// # Panics
-/// Wenn `result` ein `Err` ist — der beabsichtigte Testabbruch.
+/// # Errors
+/// [`ExpectationError::UnexpectedErr`], wenn `result` ein `Err` ist.
 ///
 /// # Concurrency
 /// Rein funktional, thread-sicher.
 ///
 /// # Examples
 /// ```rust,no_run
-/// use harw_plan::testing::expect_ok;
+/// use harw_plan::testing::{expect_ok, ExpectationError};
 /// let value: Result<u8, String> = Ok(1);
-/// assert_eq!(expect_ok(value, "Beispiel"), 1);
+/// assert_eq!(expect_ok(value, "Beispiel")?, 1);
+/// # Ok::<(), ExpectationError>(())
 /// ```
-pub fn expect_ok<T, E>(result: Result<T, E>, context: &str) -> T
+pub fn expect_ok<T, E>(result: Result<T, E>, context: &str) -> Result<T, ExpectationError>
 where
     E: std::fmt::Display,
 {
     match result {
-        Ok(value) => value,
-        Err(error) => panic!("{context}: unerwarteter Fehler: {error}"),
+        Ok(value) => Ok(value),
+        Err(error) => Err(ExpectationError::UnexpectedErr {
+            context: context.to_owned(),
+            error: error.to_string(),
+        }),
     }
 }
 
-/// Packt ein `Err` aus oder bricht den Test mit Kontext ab.
+/// Packt ein `Err` aus oder meldet das unerwartete `Ok` mit Kontext.
 ///
 /// # Arguments
 /// - `result` (`Result<T, E>`): das zu entpackende Ergebnis.
 /// - `context` (`&str`): welcher Fehler erwartet wurde.
 ///
 /// # Returns
-/// Den `Err`-Wert zur weiteren Prüfung (z. B. per `matches!`).
+/// `Ok(error)` mit dem `Err`-Wert zur weiteren Prüfung (z. B. per `matches!`).
 ///
-/// # Panics
-/// Wenn `result` ein `Ok` ist — der Test erwartete einen Fehler.
+/// # Errors
+/// [`ExpectationError::UnexpectedOk`], wenn `result` ein `Ok` ist.
 ///
 /// # Concurrency
 /// Rein funktional, thread-sicher.
-pub fn expect_err<T, E>(result: Result<T, E>, context: &str) -> E
+pub fn expect_err<T, E>(result: Result<T, E>, context: &str) -> Result<E, ExpectationError>
 where
     T: std::fmt::Debug,
 {
     match result {
-        Ok(value) => panic!("{context}: Fehler erwartet, war aber Ok({value:?})"),
-        Err(error) => error,
+        Ok(value) => Err(ExpectationError::UnexpectedOk {
+            context: context.to_owned(),
+            value: format!("{value:?}"),
+        }),
+        Err(error) => Ok(error),
     }
 }
 
@@ -541,8 +598,7 @@ macro_rules! __plan_field {
         $plan.revision = $crate::ids::RevisionId::new($value);
     };
     ($plan:ident, parent_revision, $value:expr) => {
-        $plan.parent_revision =
-            ::core::option::Option::Some($crate::ids::RevisionId::new($value));
+        $plan.parent_revision = ::core::option::Option::Some($crate::ids::RevisionId::new($value));
     };
     ($plan:ident, at, $value:expr) => {{
         let at = $value;
@@ -577,9 +633,10 @@ macro_rules! __plan_field {
 ///   In-Memory-Stores `()`, für dateibasierte Stores das `TempDir`, das sonst
 ///   sofort gelöscht würde. Das Closure wird pro Test einmal ausgewertet.
 ///
-/// # Panics
-/// Die erzeugten Tests brechen per `panic!` ab, wenn der Store den Vertrag
-/// verletzt (über [`expect_ok`] / [`expect_err`], nicht über `unwrap()`).
+/// # Errors
+/// Die erzeugten Tests geben `Err(`[`ExpectationError`]`)` zurück, wenn der
+/// Store den Vertrag verletzt (über [`expect_ok`] / [`expect_err`], nicht
+/// über `panic!`/`unwrap()`).
 ///
 /// # Concurrency
 /// Die erzeugten Tests teilen keinen Zustand; jeder baut seinen eigenen
@@ -624,7 +681,12 @@ macro_rules! impl_store_conformance_tests {
             }
 
             /// Legt den Plan an, über den die meisten Tests arbeiten.
-            fn seed<S: $crate::store::PlanStore>(store: &S) -> $crate::actions::PlanEvent {
+            fn seed<S: $crate::store::PlanStore>(
+                store: &S,
+            ) -> ::core::result::Result<
+                $crate::actions::PlanEvent,
+                $crate::testing::ExpectationError,
+            > {
                 $crate::testing::expect_ok(
                     $crate::store::PlanStore::apply(
                         store,
@@ -651,36 +713,41 @@ macro_rules! impl_store_conformance_tests {
             }
 
             #[test]
-            fn current_without_plan_reports_plan_not_found() {
+            fn current_without_plan_reports_plan_not_found()
+            -> ::core::result::Result<(), $crate::testing::ExpectationError> {
                 let (store, _guard) = fresh_store!();
                 let error = $crate::testing::expect_err(
                     $crate::store::PlanStore::current(&store),
                     "current() ohne Plan",
-                );
+                )?;
                 assert!(
                     matches!(error, $crate::error::PlanError::PlanNotFound),
                     "erwartet PlanNotFound, war: {error}"
                 );
+                Ok(())
             }
 
             #[test]
-            fn create_makes_goal_and_id_visible() {
+            fn create_makes_goal_and_id_visible()
+            -> ::core::result::Result<(), $crate::testing::ExpectationError> {
                 let (store, _guard) = fresh_store!();
-                seed(&store);
+                seed(&store)?;
 
                 let plan = $crate::testing::expect_ok(
                     $crate::store::PlanStore::current(&store),
                     "current() nach Create",
-                );
+                )?;
                 assert_eq!(plan.id, $crate::ids::PlanId::new("p-conformance"));
                 assert_eq!(plan.goal_statement, "Conformance-Ziel");
                 assert!(plan.nodes.is_empty(), "neuer Plan hat keine Knoten");
+                Ok(())
             }
 
             #[test]
-            fn second_create_is_rejected_with_plan_exists() {
+            fn second_create_is_rejected_with_plan_exists()
+            -> ::core::result::Result<(), $crate::testing::ExpectationError> {
                 let (store, _guard) = fresh_store!();
-                seed(&store);
+                seed(&store)?;
 
                 let error = $crate::testing::expect_err(
                     $crate::store::PlanStore::apply(
@@ -692,69 +759,77 @@ macro_rules! impl_store_conformance_tests {
                         "conformance",
                     ),
                     "zweites Create",
-                );
+                )?;
                 assert!(
                     matches!(error, $crate::error::PlanError::PlanExists { .. }),
                     "erwartet PlanExists, war: {error}"
                 );
+                Ok(())
             }
 
             #[test]
-            fn add_node_without_plan_reports_plan_not_found() {
+            fn add_node_without_plan_reports_plan_not_found()
+            -> ::core::result::Result<(), $crate::testing::ExpectationError> {
                 let (store, _guard) = fresh_store!();
                 let error = $crate::testing::expect_err(
                     add(&store, $crate::testing::base_node("t-1")),
                     "AddNode ohne Plan",
-                );
+                )?;
                 assert!(
                     matches!(error, $crate::error::PlanError::PlanNotFound),
                     "erwartet PlanNotFound, war: {error}"
                 );
+                Ok(())
             }
 
             #[test]
-            fn added_node_is_visible_in_current() {
+            fn added_node_is_visible_in_current()
+            -> ::core::result::Result<(), $crate::testing::ExpectationError> {
                 let (store, _guard) = fresh_store!();
-                seed(&store);
+                seed(&store)?;
                 $crate::testing::expect_ok(
                     add(&store, $crate::testing::base_node("t-1")),
                     "AddNode",
-                );
+                )?;
 
                 let plan = $crate::testing::expect_ok(
                     $crate::store::PlanStore::current(&store),
                     "current() nach AddNode",
-                );
+                )?;
                 assert_eq!(plan.nodes.len(), 1);
                 assert_eq!(
                     plan.nodes.first().map(|node| node.id.clone()),
                     ::core::option::Option::Some($crate::ids::TaskId::new("t-1"))
                 );
+                Ok(())
             }
 
             #[test]
-            fn duplicate_node_id_is_rejected() {
+            fn duplicate_node_id_is_rejected()
+            -> ::core::result::Result<(), $crate::testing::ExpectationError> {
                 let (store, _guard) = fresh_store!();
-                seed(&store);
+                seed(&store)?;
                 $crate::testing::expect_ok(
                     add(&store, $crate::testing::base_node("t-1")),
                     "erstes AddNode",
-                );
+                )?;
 
                 let error = $crate::testing::expect_err(
                     add(&store, $crate::testing::base_node("t-1")),
                     "zweites AddNode mit gleicher ID",
-                );
+                )?;
                 assert!(
                     matches!(error, $crate::error::PlanError::DuplicateNode { .. }),
                     "erwartet DuplicateNode, war: {error}"
                 );
+                Ok(())
             }
 
             #[test]
-            fn node_with_unknown_dependency_is_rejected() {
+            fn node_with_unknown_dependency_is_rejected()
+            -> ::core::result::Result<(), $crate::testing::ExpectationError> {
                 let (store, _guard) = fresh_store!();
-                seed(&store);
+                seed(&store)?;
 
                 let mut node = $crate::testing::base_node("t-orphan");
                 node.dependencies = $crate::testing::task_ids(["t-missing"]);
@@ -762,44 +837,48 @@ macro_rules! impl_store_conformance_tests {
                 let error = $crate::testing::expect_err(
                     add(&store, node),
                     "AddNode mit unbekannter Dependency",
-                );
+                )?;
                 assert!(
                     matches!(error, $crate::error::PlanError::NodeMissing { .. }),
                     "erwartet NodeMissing, war: {error}"
                 );
+                Ok(())
             }
 
             #[test]
-            fn revision_advances_with_every_applied_action() {
+            fn revision_advances_with_every_applied_action()
+            -> ::core::result::Result<(), $crate::testing::ExpectationError> {
                 let (store, _guard) = fresh_store!();
-                seed(&store);
+                seed(&store)?;
                 let after_create = $crate::store::PlanStore::revision(&store);
 
                 $crate::testing::expect_ok(
                     add(&store, $crate::testing::base_node("t-1")),
                     "AddNode",
-                );
+                )?;
                 let after_add = $crate::store::PlanStore::revision(&store);
 
                 assert!(
                     after_add > after_create,
                     "Revision muss steigen: {after_create} -> {after_add}"
                 );
+                Ok(())
             }
 
             #[test]
-            fn history_records_applied_actions_in_order() {
+            fn history_records_applied_actions_in_order()
+            -> ::core::result::Result<(), $crate::testing::ExpectationError> {
                 let (store, _guard) = fresh_store!();
-                let create_event = seed(&store);
+                let create_event = seed(&store)?;
                 let add_event = $crate::testing::expect_ok(
                     add(&store, $crate::testing::base_node("t-1")),
                     "AddNode",
-                );
+                )?;
 
                 let events = $crate::testing::expect_ok(
                     $crate::store::PlanStore::history(&store, ::core::option::Option::None),
                     "history(None)",
-                );
+                )?;
                 assert_eq!(events.len(), 2, "beide Aktionen müssen in der History stehen");
                 assert_eq!(
                     events.first().map(|event| event.revision),
@@ -810,16 +889,18 @@ macro_rules! impl_store_conformance_tests {
                     events.get(1).map(|event| event.revision),
                     ::core::option::Option::Some(add_event.revision)
                 );
+                Ok(())
             }
 
             #[test]
-            fn history_since_filters_by_revision() {
+            fn history_since_filters_by_revision()
+            -> ::core::result::Result<(), $crate::testing::ExpectationError> {
                 let (store, _guard) = fresh_store!();
-                seed(&store);
+                seed(&store)?;
                 let add_event = $crate::testing::expect_ok(
                     add(&store, $crate::testing::base_node("t-1")),
                     "AddNode",
-                );
+                )?;
 
                 let events = $crate::testing::expect_ok(
                     $crate::store::PlanStore::history(
@@ -827,32 +908,35 @@ macro_rules! impl_store_conformance_tests {
                         ::core::option::Option::Some(add_event.revision),
                     ),
                     "history(Some(revision))",
-                );
+                )?;
                 assert_eq!(events.len(), 1, "`since` ist inklusiv und filtert davor weg");
                 assert_eq!(
                     events.first().map(|event| event.revision),
                     ::core::option::Option::Some(add_event.revision)
                 );
+                Ok(())
             }
 
             #[test]
-            fn ready_nodes_lists_draft_node_without_dependencies() {
+            fn ready_nodes_lists_draft_node_without_dependencies()
+            -> ::core::result::Result<(), $crate::testing::ExpectationError> {
                 let (store, _guard) = fresh_store!();
-                seed(&store);
+                seed(&store)?;
                 $crate::testing::expect_ok(
                     add(&store, $crate::testing::base_node("t-ready")),
                     "AddNode",
-                );
+                )?;
 
                 let ready = $crate::testing::expect_ok(
                     $crate::store::PlanStore::ready_nodes(&store),
                     "ready_nodes()",
-                );
+                )?;
                 assert_eq!(
                     ready,
                     vec![$crate::ids::TaskId::new("t-ready")],
                     "ein abhängigkeitsfreier Draft-Knoten ist ausführbar"
                 );
+                Ok(())
             }
         }
     };
@@ -862,13 +946,11 @@ macro_rules! impl_store_conformance_tests {
 mod tests {
     use super::*;
     use crate::memory_store::InMemoryPlanStore;
+    use crate::test_support::{TestResult, ctx};
 
     // Führt die gemeinsame Store-Testliste an einer Stelle vor. Der
     // In-Memory-Store braucht keinen Guard, deshalb `()`.
-    crate::impl_store_conformance_tests!(
-        in_memory_conformance,
-        || (InMemoryPlanStore::new(), ())
-    );
+    crate::impl_store_conformance_tests!(in_memory_conformance, || (InMemoryPlanStore::new(), ()));
 
     #[test]
     fn base_node_uses_the_majority_defaults_of_the_replaced_fixtures() {
@@ -1027,14 +1109,16 @@ mod tests {
     }
 
     #[test]
-    fn expect_ok_returns_the_value_and_expect_err_the_error() {
+    fn expect_ok_returns_the_value_and_expect_err_the_error() -> TestResult {
         let ok: Result<u8, crate::error::PlanError> = Ok(7);
-        assert_eq!(expect_ok(ok, "Beispiel"), 7);
+        assert_eq!(expect_ok(ok, "Beispiel").map_err(ctx("expect_ok"))?, 7);
 
         let err: Result<u8, crate::error::PlanError> = Err(crate::error::PlanError::PlanNotFound);
+        let unwrapped_err = expect_err(err, "Beispiel").map_err(ctx("expect_err"))?;
         assert!(matches!(
-            expect_err(err, "Beispiel"),
+            unwrapped_err,
             crate::error::PlanError::PlanNotFound
         ));
+        Ok(())
     }
 }

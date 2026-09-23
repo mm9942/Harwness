@@ -285,6 +285,7 @@ fn write_document(config_path: &Path, doc: &DocumentMut) -> Result<(), Migration
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Dummy-Migration 0→1: setzt einen Marker-Schlüssel `step_a`.
     struct AddStepA;
@@ -324,7 +325,7 @@ mod tests {
         }
     }
 
-    fn tmp_config(name: &str) -> PathBuf {
+    fn tmp_config(name: &str) -> TestResult<PathBuf> {
         let mut dir = std::env::temp_dir();
         let unique = format!(
             "harw-migration-{}-{}-{}",
@@ -336,91 +337,96 @@ mod tests {
                 .unwrap_or(0)
         );
         dir.push(unique);
-        std::fs::create_dir_all(&dir).expect("temp dir anlegen"); // Testaufbau
+        std::fs::create_dir_all(&dir).map_err(ctx("temp dir anlegen"))?; // Testaufbau
         dir.push("config.toml");
-        dir
+        Ok(dir)
     }
 
     #[test]
-    fn test_run_chain_zero_to_two_applies_both() {
-        let path = tmp_config("chain");
-        std::fs::write(&path, "config_version = 0\n").expect("schreiben"); // Testaufbau
+    fn test_run_chain_zero_to_two_applies_both() -> TestResult {
+        let path = tmp_config("chain")?;
+        std::fs::write(&path, "config_version = 0\n").map_err(ctx("schreiben"))?; // Testaufbau
 
         let runner = MigrationRunner::new(vec![Box::new(AddStepA), Box::new(AddStepB)], 2);
-        let reached = runner.run(&path).expect("migration"); // Testprüfung
+        let reached = runner.run(&path).map_err(ctx("migration"))?; // Testprüfung
         assert_eq!(reached, 2);
 
-        let text = std::fs::read_to_string(&path).expect("lesen"); // Testprüfung
-        let doc = text.parse::<DocumentMut>().expect("parse"); // Testprüfung
+        let text = std::fs::read_to_string(&path).map_err(ctx("lesen"))?; // Testprüfung
+        let doc = text.parse::<DocumentMut>().map_err(ctx("parse"))?; // Testprüfung
         assert_eq!(read_version(&doc), 2);
         assert_eq!(doc.get("step_a").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(doc.get("step_b").and_then(|v| v.as_integer()), Some(42));
+        Ok(())
     }
 
     #[test]
-    fn test_run_missing_file_starts_from_zero() {
-        let path = tmp_config("missing");
+    fn test_run_missing_file_starts_from_zero() -> TestResult {
+        let path = tmp_config("missing")?;
         // Datei existiert bewusst nicht.
         let runner = MigrationRunner::new(vec![Box::new(AddStepA), Box::new(AddStepB)], 2);
-        let reached = runner.run(&path).expect("migration"); // Testprüfung
+        let reached = runner.run(&path).map_err(ctx("migration"))?; // Testprüfung
         assert_eq!(reached, 2);
         assert!(path.exists());
+        Ok(())
     }
 
     #[test]
-    fn test_run_writes_backup_on_migration() {
-        let path = tmp_config("backup");
-        std::fs::write(&path, "config_version = 0\n").expect("schreiben"); // Testaufbau
+    fn test_run_writes_backup_on_migration() -> TestResult {
+        let path = tmp_config("backup")?;
+        std::fs::write(&path, "config_version = 0\n").map_err(ctx("schreiben"))?; // Testaufbau
 
         let runner = MigrationRunner::new(vec![Box::new(AddStepA), Box::new(AddStepB)], 2);
-        runner.run(&path).expect("migration"); // Testprüfung
+        runner.run(&path).map_err(ctx("migration"))?; // Testprüfung
 
         let backup = backup_candidate(&path, 0);
         assert!(backup.exists(), "Backup config.toml.bak.0 muss entstehen");
-        let backup_text = std::fs::read_to_string(&backup).expect("backup lesen"); // Testprüfung
+        let backup_text = std::fs::read_to_string(&backup).map_err(ctx("backup lesen"))?; // Testprüfung
         assert_eq!(backup_text, "config_version = 0\n");
+        Ok(())
     }
 
     #[test]
-    fn test_run_backup_numbering_increments() {
-        let path = tmp_config("numbering");
-        std::fs::write(&path, "config_version = 0\n").expect("schreiben"); // Testaufbau
+    fn test_run_backup_numbering_increments() -> TestResult {
+        let path = tmp_config("numbering")?;
+        std::fs::write(&path, "config_version = 0\n").map_err(ctx("schreiben"))?; // Testaufbau
 
         // Erster Lauf 0→1 legt .bak.0 an.
         MigrationRunner::new(vec![Box::new(AddStepA)], 1)
             .run(&path)
-            .expect("erster lauf"); // Testprüfung
+            .map_err(ctx("erster lauf"))?; // Testprüfung
         // Zweiter Lauf 1→2 legt .bak.1 an.
         MigrationRunner::new(vec![Box::new(AddStepB)], 2)
             .run(&path)
-            .expect("zweiter lauf"); // Testprüfung
+            .map_err(ctx("zweiter lauf"))?; // Testprüfung
 
         assert!(backup_candidate(&path, 0).exists());
         assert!(backup_candidate(&path, 1).exists());
+        Ok(())
     }
 
     #[test]
-    fn test_run_idempotent_no_op_when_current_equals_latest() {
-        let path = tmp_config("idempotent");
-        std::fs::write(&path, "config_version = 2\n").expect("schreiben"); // Testaufbau
+    fn test_run_idempotent_no_op_when_current_equals_latest() -> TestResult {
+        let path = tmp_config("idempotent")?;
+        std::fs::write(&path, "config_version = 2\n").map_err(ctx("schreiben"))?; // Testaufbau
 
         let runner = MigrationRunner::new(vec![Box::new(AddStepA), Box::new(AddStepB)], 2);
-        let reached = runner.run(&path).expect("migration"); // Testprüfung
+        let reached = runner.run(&path).map_err(ctx("migration"))?; // Testprüfung
         assert_eq!(reached, 2);
 
         // Kein Backup, da No-op.
         assert!(!backup_candidate(&path, 0).exists());
         // Marker aus AddStepA/B dürfen NICHT gesetzt worden sein.
-        let text = std::fs::read_to_string(&path).expect("lesen"); // Testprüfung
-        let doc = text.parse::<DocumentMut>().expect("parse"); // Testprüfung
+        let text = std::fs::read_to_string(&path).map_err(ctx("lesen"))?; // Testprüfung
+        let doc = text.parse::<DocumentMut>().map_err(ctx("parse"))?; // Testprüfung
         assert!(doc.get("step_a").is_none());
         assert!(doc.get("step_b").is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_run_rejects_downgrade_with_version_error() {
-        let path = tmp_config("downgrade");
-        std::fs::write(&path, "config_version = 5\n").expect("schreiben"); // Testaufbau
+    fn test_run_rejects_downgrade_with_version_error() -> TestResult {
+        let path = tmp_config("downgrade")?;
+        std::fs::write(&path, "config_version = 5\n").map_err(ctx("schreiben"))?; // Testaufbau
 
         let runner = MigrationRunner::new(vec![Box::new(AddStepA)], 2);
         match runner.run(&path) {
@@ -428,46 +434,58 @@ mod tests {
                 assert_eq!(found, 5);
                 assert_eq!(expected, 2);
             }
-            other => panic!("erwartete Version-Fehler, erhielt {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartete Version-Fehler, erhielt {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_run_propagates_apply_error() {
-        let path = tmp_config("apply-fail");
-        std::fs::write(&path, "config_version = 0\n").expect("schreiben"); // Testaufbau
+    fn test_run_propagates_apply_error() -> TestResult {
+        let path = tmp_config("apply-fail")?;
+        std::fs::write(&path, "config_version = 0\n").map_err(ctx("schreiben"))?; // Testaufbau
 
         let runner = MigrationRunner::new(vec![Box::new(FailingStep)], 1);
         match runner.run(&path) {
             Err(MigrationError::Apply { from_version, .. }) => assert_eq!(from_version, 0),
-            other => panic!("erwartete Apply-Fehler, erhielt {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartete Apply-Fehler, erhielt {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_run_invalid_toml_returns_parse_error() {
-        let path = tmp_config("badtoml");
-        std::fs::write(&path, "a = = 1\n").expect("schreiben"); // Testaufbau
+    fn test_run_invalid_toml_returns_parse_error() -> TestResult {
+        let path = tmp_config("badtoml")?;
+        std::fs::write(&path, "a = = 1\n").map_err(ctx("schreiben"))?; // Testaufbau
 
         let runner = MigrationRunner::new(vec![Box::new(AddStepA)], 1);
         assert!(matches!(
             runner.run(&path),
             Err(MigrationError::Parse { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_only_matching_migrations_applied() {
-        let path = tmp_config("subset");
-        std::fs::write(&path, "config_version = 1\n").expect("schreiben"); // Testaufbau
+    fn test_only_matching_migrations_applied() -> TestResult {
+        let path = tmp_config("subset")?;
+        std::fs::write(&path, "config_version = 1\n").map_err(ctx("schreiben"))?; // Testaufbau
 
         // current=1: nur AddStepB (from_version 1) darf greifen, AddStepA nicht.
         let runner = MigrationRunner::new(vec![Box::new(AddStepA), Box::new(AddStepB)], 2);
-        runner.run(&path).expect("migration"); // Testprüfung
+        runner.run(&path).map_err(ctx("migration"))?; // Testprüfung
 
-        let text = std::fs::read_to_string(&path).expect("lesen"); // Testprüfung
-        let doc = text.parse::<DocumentMut>().expect("parse"); // Testprüfung
+        let text = std::fs::read_to_string(&path).map_err(ctx("lesen"))?; // Testprüfung
+        let doc = text.parse::<DocumentMut>().map_err(ctx("parse"))?; // Testprüfung
         assert!(doc.get("step_a").is_none(), "AddStepA darf nicht greifen");
         assert_eq!(doc.get("step_b").and_then(|v| v.as_integer()), Some(42));
+        Ok(())
     }
 }

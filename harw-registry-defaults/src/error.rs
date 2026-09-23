@@ -4,8 +4,8 @@
 //! binary presentation boundary chooses how to render it. No `anyhow` or
 //! `thiserror` is used here.
 
-use std::fmt;
 use harw_extension_api::registry::ContextProviderRegistrationError;
+use std::fmt;
 
 use harw_agent_dsl::error::DslError;
 use harw_egress::EgressError;
@@ -66,7 +66,10 @@ impl fmt::Display for RegistryDefaultsError {
                 write!(f, "default registry project discovery failed: {source}")
             }
             Self::BrowserHost(reason) => {
-                write!(f, "default registry browser host construction failed: {reason}")
+                write!(
+                    f,
+                    "default registry browser host construction failed: {reason}"
+                )
             }
             Self::AgentDefinition { name, source } => {
                 write!(
@@ -75,7 +78,10 @@ impl fmt::Display for RegistryDefaultsError {
                 )
             }
             Self::ContextProviderRegistration { source } => {
-                write!(f, "Kontextanbieter konnte nicht registriert werden: {source}")
+                write!(
+                    f,
+                    "Kontextanbieter konnte nicht registriert werden: {source}"
+                )
             }
             Self::ResearcherWebPolicy { source } => {
                 write!(

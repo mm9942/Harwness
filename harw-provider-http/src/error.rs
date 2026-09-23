@@ -63,6 +63,13 @@ pub enum HttpProviderError {
     },
     /// Transportfehler aus `reqwest`.
     Http(reqwest::Error),
+    /// Der geteilte `reqwest::Client` (TLS-Backend + Redirect-Policy) konnte
+    /// nicht gebaut werden.
+    ///
+    /// Getrennt von [`Self::Http`]: dieser Fehler entsteht einmalig beim
+    /// Aufbau des Clients in [`crate::http_client`], bevor irgendein Request
+    /// unterwegs ist — kein Transportfehler eines laufenden Requests.
+    ClientBuild(reqwest::Error),
     /// Antwort konnte nicht in das erwartete Schema dekodiert werden.
     Decode(String),
     /// Nicht-erfolgreiche API-Antwort.
@@ -125,6 +132,7 @@ impl fmt::Display for HttpProviderError {
                 write!(f, "required environment variable not set: {var}")
             }
             Self::Http(error) => write!(f, "HTTP transport failed: {error}"),
+            Self::ClientBuild(error) => write!(f, "failed to build HTTP client: {error}"),
             Self::Decode(reason) => write!(f, "failed to decode provider response: {reason}"),
             Self::Api { status, body } => {
                 let _ = body;
@@ -336,7 +344,9 @@ pub(crate) fn model_error_for_status(
 /// - Redirect-Ablehnung (W1-06b-Policy) → `RequestFailed` (nie retryable:
 ///   eine Wiederholung würde dieselbe Cross-Origin-Weiterleitung treffen).
 /// - Zeitüberschreitung → `Timeout`.
-/// - Verbindungsaufbau gescheitert → `Transient{status: None}`.
+/// - Verbindungsaufbau gescheitert oder Senden des Requests gescheitert
+///   (`is_request`, z. B. geschlossene Keep-Alive-Verbindung) →
+///   `Transient{status: None}`.
 /// - Abbruch beim Lesen des Bodys (`body_phase = true`) → `Truncated`.
 /// - sonst → `RequestFailed`.
 ///
@@ -351,7 +361,12 @@ pub(crate) fn model_error_for_status(
 pub(crate) fn model_error_for_transport(error: reqwest::Error, body_phase: bool) -> ModelError {
     let is_redirect = error.is_redirect();
     let is_timeout = error.is_timeout();
-    let is_connect = error.is_connect();
+    // `is_request` ist reqwests Sammelart für „error sending request“ jenseits
+    // der Verbindungsphase — typisch eine vom Server/Worker geschlossene
+    // Keep-Alive-Verbindung nach einer längeren Pause (z. B. Freigabe-Warten).
+    // Solche Fehler sind vorübergehend und dürfen vom `RetryingProvider`
+    // wiederholt werden; im Body-Lesen bleibt es bei `Truncated`.
+    let is_connect = error.is_connect() || (!body_phase && error.is_request());
     let message = HttpProviderError::from(error).to_string();
     if is_redirect {
         ModelError::RequestFailed(message)
@@ -379,7 +394,7 @@ impl fmt::Debug for HttpProviderError {
 impl std::error::Error for HttpProviderError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Http(error) => Some(error),
+            Self::Http(error) | Self::ClientBuild(error) => Some(error),
             _ => None,
         }
     }

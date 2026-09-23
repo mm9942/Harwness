@@ -99,6 +99,7 @@ pub enum ObserveError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn test_observe_error_display_invalid_trace_id() {
@@ -132,11 +133,12 @@ mod tests {
     }
 
     #[test]
-    fn test_observe_result_alias_exists() {
+    fn test_observe_result_alias_exists() -> TestResult {
         fn make() -> ObserveResult<u8> {
             Ok(1)
         }
-        assert_eq!(make().unwrap(), 1);
+        assert_eq!(make().map_err(ctx("observe result alias"))?, 1);
+        Ok(())
     }
 
     #[test]

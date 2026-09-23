@@ -162,8 +162,7 @@ pub(crate) fn from_crossterm(event: Event) -> Option<TuiEvent> {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{
-        KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseEvent,
-        MouseEventKind,
+        KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseEvent, MouseEventKind,
     };
 
     use super::*;

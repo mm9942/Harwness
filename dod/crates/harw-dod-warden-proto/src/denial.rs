@@ -115,6 +115,7 @@ impl fmt::Display for Denial {
 #[cfg(test)]
 mod tests {
     use super::Denial;
+    use crate::test_support::{TestResult, ctx};
 
     const ALL: [Denial; 7] = [
         Denial::ProofMismatch,
@@ -142,31 +143,33 @@ mod tests {
     }
 
     #[test]
-    fn test_serde_roundtrip_for_each_variant() {
+    fn test_serde_roundtrip_for_each_variant() -> TestResult {
         for denial in ALL {
-            let json = serde_json::to_string(&denial).expect("serializes");
-            let round_tripped: Denial = serde_json::from_str(&json).expect("deserializes");
+            let json = serde_json::to_string(&denial).map_err(ctx("serializes"))?;
+            let round_tripped: Denial = serde_json::from_str(&json).map_err(ctx("deserializes"))?;
             assert_eq!(round_tripped, denial);
         }
+        Ok(())
     }
 
     #[test]
-    fn test_wire_names_are_kebab_case() {
+    fn test_wire_names_are_kebab_case() -> TestResult {
         assert_eq!(
-            serde_json::to_string(&Denial::ProofMismatch).unwrap(),
+            serde_json::to_string(&Denial::ProofMismatch).map_err(ctx("serializes"))?,
             "\"proof-mismatch\""
         );
         assert_eq!(
-            serde_json::to_string(&Denial::NotAdmissibleAtStage).unwrap(),
+            serde_json::to_string(&Denial::NotAdmissibleAtStage).map_err(ctx("serializes"))?,
             "\"not-admissible-at-stage\""
         );
         assert_eq!(
-            serde_json::to_string(&Denial::UnsupportedVersion).unwrap(),
+            serde_json::to_string(&Denial::UnsupportedVersion).map_err(ctx("serializes"))?,
             "\"unsupported-version\""
         );
         assert_eq!(
-            serde_json::to_string(&Denial::ExecutionFailed).unwrap(),
+            serde_json::to_string(&Denial::ExecutionFailed).map_err(ctx("serializes"))?,
             "\"execution-failed\""
         );
+        Ok(())
     }
 }

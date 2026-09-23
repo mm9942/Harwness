@@ -36,6 +36,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
+use harw_authority::SandboxSpec;
 use harw_config::ResolvedConfig;
 use harw_core::{ModelProvider, StateStore};
 use harw_plan::PlanNodeKind;
@@ -43,7 +44,6 @@ use harw_runtime::{
     EntryKind, ModelSource, RuntimeAssembly, RuntimeNarrowing, RuntimeStores, plan_node_sandbox,
     root_sandbox,
 };
-use harw_authority::SandboxSpec;
 use harw_session_store::JobStore;
 use harw_types::{IngressSurface, PermissionTier, Principal, PrincipalKind, SessionId};
 
@@ -240,8 +240,9 @@ pub(crate) fn configured_principal_ids(config: &ResolvedConfig) -> BTreeSet<Stri
 mod tests {
     use super::*;
 
-    use harw_config::{HarnessConfig, McpListenerSection, McpPrincipalToml, SecretRef};
+    use crate::test_support::{TestResult, ctx};
     use harw_authority::Permission;
+    use harw_config::{HarnessConfig, McpListenerSection, McpPrincipalToml, SecretRef};
 
     fn listener_principal(id: &str) -> McpPrincipalToml {
         McpPrincipalToml {
@@ -289,23 +290,25 @@ mod tests {
     }
 
     #[test]
-    fn test_job_sandbox_prompt_has_no_permissions() {
+    fn test_job_sandbox_prompt_has_no_permissions() -> TestResult {
         // tempfile ist dev-dependency von harw-cli; root_sandbox kanonisiert den Pfad.
-        let dir = tempfile::tempdir().expect("test: tempdir");
-        let sandbox = job_sandbox(JobEntry::Prompt, dir.path()).expect("test: sandbox binds");
+        let dir = tempfile::tempdir().map_err(ctx("test: tempdir"))?;
+        let sandbox =
+            job_sandbox(JobEntry::Prompt, dir.path()).map_err(ctx("test: sandbox binds"))?;
         assert_eq!(sandbox.permissions().iter().count(), 0);
         assert!(sandbox.network_scope().is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_job_sandbox_research_node_never_writes_or_executes() {
-        let dir = tempfile::tempdir().expect("test: tempdir");
+    fn test_job_sandbox_research_node_never_writes_or_executes() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("test: tempdir"))?;
         for may_write in [false, true] {
             let entry = JobEntry::PlanNode {
                 kind: PlanNodeKind::Research,
                 may_write,
             };
-            let sandbox = job_sandbox(entry, dir.path()).expect("test: sandbox binds");
+            let sandbox = job_sandbox(entry, dir.path()).map_err(ctx("test: sandbox binds"))?;
             let permissions = sandbox.permissions();
             assert!(permissions.contains(Permission::ReadWorkspace));
             assert!(!permissions.contains(Permission::WriteWorkspace));
@@ -313,6 +316,7 @@ mod tests {
             assert!(!permissions.contains(Permission::NetworkAccess));
             assert!(sandbox.network_scope().is_empty());
         }
+        Ok(())
     }
 
     #[test]
@@ -325,11 +329,11 @@ mod tests {
     }
 
     #[test]
-    fn test_job_assembly_prompt_uses_given_session_id_and_no_tools() {
-        let home = tempfile::tempdir().expect("test: home tempdir");
-        let cwd = tempfile::tempdir().expect("test: cwd tempdir");
-        let jobs = tempfile::tempdir().expect("test: job store tempdir");
-        harw_home::ensure_home(home.path()).expect("test: scaffold home");
+    fn test_job_assembly_prompt_uses_given_session_id_and_no_tools() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("test: home tempdir"))?;
+        let cwd = tempfile::tempdir().map_err(ctx("test: cwd tempdir"))?;
+        let jobs = tempfile::tempdir().map_err(ctx("test: job store tempdir"))?;
+        harw_home::ensure_home(home.path()).map_err(ctx("test: scaffold home"))?;
         let session_id = SessionId::from_str("durable-job-assembly-test");
 
         let assembly = job_assembly(JobAssemblyInputs {
@@ -343,7 +347,7 @@ mod tests {
             model: Arc::new(harw_core::EchoModelProvider::new("x")),
             narrowing: None,
         })
-        .expect("test: prompt job assembly builds");
+        .map_err(ctx("test: prompt job assembly builds"))?;
 
         assert_eq!(assembly.root_session_id(), &session_id);
         assert_eq!(assembly.spec().entry, EntryKind::JobPrompt);
@@ -355,5 +359,6 @@ mod tests {
         // principal's `PermissionTier` (now `Observer`, see `job_principal`)
         // has nothing to gate here.
         assert_eq!(assembly.operations().iter().count(), 0);
+        Ok(())
     }
 }

@@ -134,7 +134,9 @@ impl RegistrySourceLocator {
         let version_segment = version.unwrap_or("latest");
         let module_path = crate_name.replace('-', "_");
         match item_path {
-            Some(item) => format!("https://docs.rs/{crate_name}/{version_segment}/{module_path}/{item}"),
+            Some(item) => {
+                format!("https://docs.rs/{crate_name}/{version_segment}/{module_path}/{item}")
+            }
             None => format!("https://docs.rs/{crate_name}/{version_segment}/{module_path}/"),
         }
     }
@@ -168,12 +170,14 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
-    fn scratch_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("harw-code-graph-{}-{label}", std::process::id()));
+    fn scratch_dir(label: &str) -> TestResult<PathBuf> {
+        let dir =
+            std::env::temp_dir().join(format!("harw-code-graph-{}-{label}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("Scratch-Verzeichnis anlegen");
-        dir
+        fs::create_dir_all(&dir).map_err(ctx("Scratch-Verzeichnis anlegen"))?;
+        Ok(dir)
     }
 
     #[test]
@@ -200,18 +204,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_contained_rejects_parent_traversal() {
-        let cargo_home = scratch_dir("registry-home");
+    fn resolve_contained_rejects_parent_traversal() -> TestResult {
+        let cargo_home = scratch_dir("registry-home")?;
         let index_dir = cargo_home
             .join("registry")
             .join("src")
             .join("index.crates.io-testhash");
         let crate_dir = index_dir.join("serde-1.0.228");
-        fs::create_dir_all(&crate_dir).expect("Fixture-Crate-Verzeichnis anlegen");
+        fs::create_dir_all(&crate_dir).map_err(ctx("Fixture-Crate-Verzeichnis anlegen"))?;
 
         let locator = RegistrySourceLocator::with_home(cargo_home.clone());
 
-        let resolved = locator.resolve("serde", "1.0.228").expect("Crate-Quelle gefunden");
+        let resolved = locator
+            .resolve("serde", "1.0.228")
+            .map_err(ctx("Crate-Quelle gefunden"))?;
         assert_eq!(resolved, crate_dir);
 
         let escape = locator.resolve_contained(
@@ -223,37 +229,40 @@ mod tests {
 
         let contained = locator
             .resolve_contained("serde", "1.0.228", Path::new("src/lib.rs"))
-            .expect("enthaltener Pfad akzeptiert");
+            .map_err(ctx("enthaltener Pfad akzeptiert"))?;
         assert_eq!(contained, crate_dir.join("src/lib.rs"));
 
         fs::remove_dir_all(&cargo_home).ok();
+        Ok(())
     }
 
     #[test]
-    fn available_versions_lists_matching_directories() {
-        let cargo_home = scratch_dir("registry-versions");
+    fn available_versions_lists_matching_directories() -> TestResult {
+        let cargo_home = scratch_dir("registry-versions")?;
         let index_dir = cargo_home
             .join("registry")
             .join("src")
             .join("index.crates.io-testhash");
-        fs::create_dir_all(index_dir.join("serde-1.0.228")).expect("Fixture 1 anlegen");
-        fs::create_dir_all(index_dir.join("serde-1.0.219")).expect("Fixture 2 anlegen");
-        fs::create_dir_all(index_dir.join("toml-1.1.3+spec-1.1.0")).expect("Fixture 3 anlegen");
+        fs::create_dir_all(index_dir.join("serde-1.0.228")).map_err(ctx("Fixture 1 anlegen"))?;
+        fs::create_dir_all(index_dir.join("serde-1.0.219")).map_err(ctx("Fixture 2 anlegen"))?;
+        fs::create_dir_all(index_dir.join("toml-1.1.3+spec-1.1.0"))
+            .map_err(ctx("Fixture 3 anlegen"))?;
 
         let locator = RegistrySourceLocator::with_home(cargo_home.clone());
         let mut versions = locator
             .available_versions("serde")
-            .expect("Versionen auflisten");
+            .map_err(ctx("Versionen auflisten"))?;
         versions.sort();
         assert_eq!(versions, vec!["1.0.219".to_owned(), "1.0.228".to_owned()]);
 
         fs::remove_dir_all(&cargo_home).ok();
+        Ok(())
     }
 
     #[test]
-    fn resolve_reports_missing_source() {
-        let cargo_home = scratch_dir("registry-missing");
-        fs::create_dir_all(&cargo_home).expect("cargo_home anlegen");
+    fn resolve_reports_missing_source() -> TestResult {
+        let cargo_home = scratch_dir("registry-missing")?;
+        fs::create_dir_all(&cargo_home).map_err(ctx("cargo_home anlegen"))?;
         let locator = RegistrySourceLocator::with_home(cargo_home.clone());
 
         let result = locator.resolve("does-not-exist", "9.9.9");
@@ -263,5 +272,6 @@ mod tests {
         ));
 
         fs::remove_dir_all(&cargo_home).ok();
+        Ok(())
     }
 }

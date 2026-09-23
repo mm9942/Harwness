@@ -233,8 +233,7 @@ impl ContextProvider for HandoffContextProvider {
                 return Vec::new();
             };
 
-            let mut content =
-                String::from("Übergabe aus vorheriger Session (automatisch):\n");
+            let mut content = String::from("Übergabe aus vorheriger Session (automatisch):\n");
             match handoff.summary.as_deref().map(str::trim) {
                 Some(summary) if !summary.is_empty() => {
                     content.push_str(summary);
@@ -262,32 +261,38 @@ impl ContextProvider for HandoffContextProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_core::auto_compact::CompactDecision;
     use harw_core::compaction::{CompactionObserver, CompactionOutcome};
     use harw_home::project::{ProjectKind, ProjectRoot};
 
-    fn temp_home(tag: &str) -> ProjectHome {
+    fn temp_home(tag: &str) -> TestResult<ProjectHome> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "harw-runtime-handoff-{tag}-{}-{id}",
             std::process::id()
         ));
-        std::fs::create_dir_all(&root).expect("Testwurzel anlegen");
-        ProjectHome::at(&ProjectRoot {
+        std::fs::create_dir_all(&root).map_err(ctx("Testwurzel anlegen"))?;
+        Ok(ProjectHome::at(&ProjectRoot {
             trust_key: root.clone(),
             root,
             kind: ProjectKind::Directory,
-        })
+        }))
     }
 
-    fn cleanup(home: &ProjectHome) {
-        let _ = std::fs::remove_dir_all(home.dir.parent().expect("Projekt-Root"));
+    fn cleanup(home: &ProjectHome) -> TestResult {
+        let parent = home
+            .dir
+            .parent()
+            .ok_or(TestError::Missing("Projekt-Root"))?;
+        let _ = std::fs::remove_dir_all(parent);
+        Ok(())
     }
 
     #[test]
-    fn on_compacted_writes_a_readable_handoff() {
-        let home = temp_home("write-read");
+    fn on_compacted_writes_a_readable_handoff() -> TestResult {
+        let home = temp_home("write-read")?;
         let writer = HandoffWriter::new(home.clone());
         let session = harw_types::SessionId::from_str("session-a");
         let outcome = CompactionOutcome {
@@ -298,7 +303,8 @@ mod tests {
 
         writer.on_compacted(&session, &outcome);
 
-        let loaded = read_handoff(&home).expect("handoff must be readable after writing");
+        let loaded = read_handoff(&home)
+            .ok_or(TestError::Missing("handoff must be readable after writing"))?;
         assert_eq!(loaded.session_id, "session-a");
         assert_eq!(
             loaded.summary.as_deref(),
@@ -308,14 +314,14 @@ mod tests {
         assert!(loaded.open_items.is_empty());
         assert!(loaded.touched_files.is_empty());
 
-        cleanup(&home);
+        cleanup(&home)
     }
 
     #[test]
-    fn read_handoff_without_a_written_file_returns_none() {
-        let home = temp_home("missing");
+    fn read_handoff_without_a_written_file_returns_none() -> TestResult {
+        let home = temp_home("missing")?;
         assert!(read_handoff(&home).is_none());
-        cleanup(&home);
+        cleanup(&home)
     }
 
     #[test]
@@ -351,20 +357,20 @@ mod tests {
     }
 
     #[test]
-    fn context_provider_contributes_nothing_without_a_handoff() {
-        let home = temp_home("provider-empty");
+    fn context_provider_contributes_nothing_without_a_handoff() -> TestResult {
+        let home = temp_home("provider-empty")?;
         let provider = HandoffContextProvider::new(home.clone());
 
         let ctx = TurnInputContext::default();
         let fragments = block_on(provider.contribute(&ctx));
 
         assert!(fragments.is_empty());
-        cleanup(&home);
+        cleanup(&home)
     }
 
     #[test]
-    fn context_provider_contributes_a_labeled_fragment_with_summary() {
-        let home = temp_home("provider-fragment");
+    fn context_provider_contributes_a_labeled_fragment_with_summary() -> TestResult {
+        let home = temp_home("provider-fragment")?;
         let writer = HandoffWriter::new(home.clone());
         let session = harw_types::SessionId::from_str("session-b");
         let outcome = CompactionOutcome {
@@ -379,9 +385,13 @@ mod tests {
 
         assert_eq!(fragments.len(), 1);
         assert_eq!(fragments[0].label, "handoff");
-        assert!(fragments[0].content.starts_with("Übergabe aus vorheriger Session (automatisch):"));
+        assert!(
+            fragments[0]
+                .content
+                .starts_with("Übergabe aus vorheriger Session (automatisch):")
+        );
         assert!(fragments[0].content.contains("Kurzfassung"));
 
-        cleanup(&home);
+        cleanup(&home)
     }
 }

@@ -171,8 +171,9 @@ fn valid_session_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     #[test]
-    fn session_expiry_and_protocol_are_enforced() {
+    fn session_expiry_and_protocol_are_enforced() -> TestResult {
         let now = Timestamp::now();
         let mut sessions = McpSessionRegistry::new(1, SignedDuration::from_secs(1));
         let session = sessions
@@ -182,7 +183,7 @@ mod tests {
                 "principal-a".to_owned(),
                 now,
             )
-            .unwrap();
+            .map_err(ctx("Session initialisieren"))?;
         assert!(
             sessions
                 .require(&session.id, MCP_PROTOCOL_VERSION, now)
@@ -198,19 +199,19 @@ mod tests {
         ));
         sessions
             .mark_initialized(&session.id, MCP_PROTOCOL_VERSION, now)
-            .unwrap();
+            .map_err(ctx("Session als initialisiert markieren"))?;
         assert!(
             sessions
                 .require_initialized(&session.id, MCP_PROTOCOL_VERSION, now)
                 .is_ok()
         );
+        let later = now
+            .checked_add(SignedDuration::from_secs(1))
+            .map_err(ctx("later timestamp in range"))?;
         assert!(matches!(
-            sessions.require(
-                &session.id,
-                MCP_PROTOCOL_VERSION,
-                now.checked_add(SignedDuration::from_secs(1)).unwrap()
-            ),
+            sessions.require(&session.id, MCP_PROTOCOL_VERSION, later),
             Err(McpServerError::SessionUnknown)
         ));
+        Ok(())
     }
 }

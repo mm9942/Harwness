@@ -587,6 +587,7 @@ impl crate::TelegramOutbound for TelegramRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_channel::ApprovalAction;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -669,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_approval_callback_data_is_opaque_and_excludes_approval_data() {
+    fn prepared_approval_callback_data_is_opaque_and_excludes_approval_data() -> TestResult {
         let renderer = renderer(RendererConfig::default());
         let request_id = "sensitive-request-id";
         let decision = "sensitive-decision";
@@ -684,7 +685,9 @@ mod tests {
         });
 
         let ChannelSendOp::SendMessage { inline_actions, .. } = prepared.operation() else {
-            panic!("approval must render as a Telegram message");
+            return Err(TestError::Unexpected(
+                "approval must render as a Telegram message".into(),
+            ));
         };
         assert_eq!(prepared.issued_tokens().len(), 1);
         assert_eq!(
@@ -693,10 +696,11 @@ mod tests {
         );
         assert!(!inline_actions[0].callback_payload.contains(request_id));
         assert!(!inline_actions[0].callback_payload.contains(decision));
+        Ok(())
     }
 
     #[test]
-    fn approval_binding_requires_the_actual_send_result_context() {
+    fn approval_binding_requires_the_actual_send_result_context() -> TestResult {
         let delivery = ApprovalDelivery {
             message: SentMessage {
                 message_id: 200,
@@ -717,9 +721,10 @@ mod tests {
                 assert_eq!(message.message_thread_id, Some(42));
                 true
             })
-            .expect("binding must receive Telegram's sendMessage result");
+            .map_err(ctx("binding must receive Telegram's sendMessage result"))?;
 
         assert!(called);
+        Ok(())
     }
 
     #[test]
@@ -741,12 +746,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn draft_strategy_fails_closed_before_network_use() {
+    async fn draft_strategy_fails_closed_before_network_use() -> TestResult {
         let renderer = renderer(RendererConfig {
             strategy: StreamingStrategy::Draft,
             ..RendererConfig::default()
         });
-        let error = renderer
+        let result = renderer
             .send_async(
                 7,
                 None,
@@ -754,8 +759,13 @@ mod tests {
                     markdown: "draft".to_owned(),
                 },
             )
-            .await
-            .expect_err("Draft must never select an unimplemented transport");
+            .await;
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "Draft must never select an unimplemented transport".into(),
+            ));
+        };
         assert_eq!(error.to_string(), "Telegram Bot API rejected 'draft' (0)");
+        Ok(())
     }
 }

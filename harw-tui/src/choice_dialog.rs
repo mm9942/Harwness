@@ -358,22 +358,34 @@ mod tests {
     #[test]
     fn test_esc_returns_cancel() {
         let mut dialog = export_dialog();
-        assert_eq!(dialog.handle_key(make_key(KeyCode::Esc)), ChoiceAction::Cancel);
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Esc)),
+            ChoiceAction::Cancel
+        );
     }
 
     /// `Enter` auf der Startauswahl liefert `ChoiceAction::Chosen(0)`.
     #[test]
     fn test_enter_returns_chosen_zero_by_default() {
         let mut dialog = export_dialog();
-        assert_eq!(dialog.handle_key(make_key(KeyCode::Enter)), ChoiceAction::Chosen(0));
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Enter)),
+            ChoiceAction::Chosen(0)
+        );
     }
 
     /// `Down` gefolgt von `Enter` wählt die zweite Option.
     #[test]
     fn test_down_then_enter_chooses_second_option() {
         let mut dialog = export_dialog();
-        assert_eq!(dialog.handle_key(make_key(KeyCode::Down)), ChoiceAction::Stay);
-        assert_eq!(dialog.handle_key(make_key(KeyCode::Enter)), ChoiceAction::Chosen(1));
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Down)),
+            ChoiceAction::Stay
+        );
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Enter)),
+            ChoiceAction::Chosen(1)
+        );
     }
 
     /// `Down` über das Ende hinaus bleibt bei der letzten Option.
@@ -383,7 +395,10 @@ mod tests {
         for _ in 0..10 {
             dialog.handle_key(make_key(KeyCode::Down));
         }
-        assert_eq!(dialog.handle_key(make_key(KeyCode::Enter)), ChoiceAction::Chosen(2));
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Enter)),
+            ChoiceAction::Chosen(2)
+        );
     }
 
     /// `Up` an Position 0 bleibt bei 0.
@@ -391,28 +406,40 @@ mod tests {
     fn test_up_stays_in_bounds() {
         let mut dialog = export_dialog();
         dialog.handle_key(make_key(KeyCode::Up));
-        assert_eq!(dialog.handle_key(make_key(KeyCode::Enter)), ChoiceAction::Chosen(0));
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Enter)),
+            ChoiceAction::Chosen(0)
+        );
     }
 
     /// Zifferntaste `'3'` wählt direkt die dritte Option.
     #[test]
     fn test_digit_selects_nth_option() {
         let mut dialog = export_dialog();
-        assert_eq!(dialog.handle_key(make_key(KeyCode::Char('3'))), ChoiceAction::Chosen(2));
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Char('3'))),
+            ChoiceAction::Chosen(2)
+        );
     }
 
     /// Zifferntaste außerhalb der Optionsliste liefert `Stay`.
     #[test]
     fn test_digit_out_of_range_returns_stay() {
         let mut dialog = export_dialog();
-        assert_eq!(dialog.handle_key(make_key(KeyCode::Char('9'))), ChoiceAction::Stay);
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Char('9'))),
+            ChoiceAction::Stay
+        );
     }
 
     /// Bei leerer Optionsliste liefert `Enter` stets `Stay`.
     #[test]
     fn test_enter_on_empty_options_stays() {
         let mut dialog = ChoiceDialog::new("Export", None, vec![]);
-        assert_eq!(dialog.handle_key(make_key(KeyCode::Enter)), ChoiceAction::Stay);
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Enter)),
+            ChoiceAction::Stay
+        );
     }
 
     /// Das Rendering enthält Titel, alle Optionsbeschriftungen und die Fußzeile.
@@ -457,7 +484,8 @@ mod tests {
     /// `with_footer_hint` überschreibt den gerenderten Fußzeilentext.
     #[test]
     fn test_with_footer_hint_overrides_rendered_footer() {
-        let dialog = export_dialog().with_footer_hint("↑↓ wählen · ← zurück · Enter bestätigen · Esc abbrechen");
+        let dialog = export_dialog()
+            .with_footer_hint("↑↓ wählen · ← zurück · Enter bestätigen · Esc abbrechen");
         let area = Rect::new(0, 0, 60, 8);
         let mut buf = Buffer::empty(area);
         dialog.render(area, &mut buf, style::Theme::Dark);

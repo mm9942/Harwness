@@ -386,6 +386,7 @@ pub static FIELD_TABLE: &[FieldScope] = &[
 #[cfg(test)]
 mod merge_rule_tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn test_field_table_has_exactly_89_entries() {
@@ -420,9 +421,17 @@ mod merge_rule_tests {
     fn test_only_stricter_of_entries_carry_an_ordering() {
         for entry in FIELD_TABLE {
             if entry.merge == MergeRule::StricterOf {
-                assert!(entry.ordering.is_some(), "{} sollte eine ordering tragen", entry.path);
+                assert!(
+                    entry.ordering.is_some(),
+                    "{} sollte eine ordering tragen",
+                    entry.path
+                );
             } else {
-                assert!(entry.ordering.is_none(), "{} sollte keine ordering tragen", entry.path);
+                assert!(
+                    entry.ordering.is_none(),
+                    "{} sollte keine ordering tragen",
+                    entry.path
+                );
             }
         }
     }
@@ -443,36 +452,50 @@ mod merge_rule_tests {
     }
 
     #[test]
-    fn test_security_critical_fields_match_abschnitt_2_lock_marks() {
-        assert!(FIELD_TABLE.iter().find(|f| f.path == "workspace_root").unwrap().security_critical);
-        assert!(FIELD_TABLE.iter().find(|f| f.path == "policy_profile").unwrap().security_critical);
+    fn test_security_critical_fields_match_abschnitt_2_lock_marks() -> TestResult {
+        assert!(
+            FIELD_TABLE
+                .iter()
+                .find(|f| f.path == "workspace_root")
+                .ok_or(TestError::Missing("workspace_root"))?
+                .security_critical
+        );
+        assert!(
+            FIELD_TABLE
+                .iter()
+                .find(|f| f.path == "policy_profile")
+                .ok_or(TestError::Missing("policy_profile"))?
+                .security_critical
+        );
         assert!(
             FIELD_TABLE
                 .iter()
                 .find(|f| f.path == "mcp_listener.principals")
-                .unwrap()
+                .ok_or(TestError::Missing("mcp_listener.principals"))?
                 .security_critical
         );
         assert!(
             !FIELD_TABLE
                 .iter()
                 .find(|f| f.path == "session.retention_days")
-                .unwrap()
+                .ok_or(TestError::Missing("session.retention_days"))?
                 .security_critical
         );
         assert!(
             !FIELD_TABLE
                 .iter()
                 .find(|f| f.path == "compaction.absolute_ceiling_tokens")
-                .unwrap()
+                .ok_or(TestError::Missing("compaction.absolute_ceiling_tokens"))?
                 .security_critical
         );
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use std::cmp::Ordering;
 
     #[test]
@@ -487,21 +510,26 @@ mod tests {
     }
 
     #[test]
-    fn test_as_str_matches_from_str_round_trip() {
+    fn test_as_str_matches_from_str_round_trip() -> TestResult {
         for scope in [
             SettingScope::Session,
             SettingScope::Project,
             SettingScope::Global,
         ] {
-            let parsed: SettingScope = scope.as_str().parse().expect("valid scope text");
+            let parsed: SettingScope = scope.as_str().parse().map_err(ctx("valid scope text"))?;
             assert_eq!(parsed, scope);
         }
+        Ok(())
     }
 
     #[test]
-    fn test_from_str_rejects_unknown_value() {
-        let error = "world".parse::<SettingScope>().unwrap_err();
+    fn test_from_str_rejects_unknown_value() -> TestResult {
+        let error = match "world".parse::<SettingScope>() {
+            Err(e) => e,
+            Ok(_) => return Err(TestError::Unexpected("Err erwartet".into())),
+        };
         assert!(error.to_string().contains("world"));
+        Ok(())
     }
 
     #[test]
@@ -512,10 +540,13 @@ mod tests {
     }
 
     #[test]
-    fn test_serde_uses_lowercase_encoding() {
-        let encoded = serde_json::to_string(&SettingScope::Project).expect("serialize scope");
+    fn test_serde_uses_lowercase_encoding() -> TestResult {
+        let encoded =
+            serde_json::to_string(&SettingScope::Project).map_err(ctx("serialize scope"))?;
         assert_eq!(encoded, "\"project\"");
-        let decoded: SettingScope = serde_json::from_str("\"session\"").expect("deserialize scope");
+        let decoded: SettingScope =
+            serde_json::from_str("\"session\"").map_err(ctx("deserialize scope"))?;
         assert_eq!(decoded, SettingScope::Session);
+        Ok(())
     }
 }

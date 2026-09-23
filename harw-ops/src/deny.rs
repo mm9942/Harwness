@@ -117,10 +117,13 @@ async fn deny(ctx: &OpContext, args: DenyArgs) -> Result<OpOutput, OpError> {
 #[cfg(test)]
 mod tests {
     use super::{DenyArgs, deny};
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_job_runtime::{Budget, Job, JobKind, JobScope, JobState, RetryPolicy, StoredJob};
     use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_session_store::JobStore;
     use harw_types::{ApprovalActor, SessionId, TenantId, TurnId, WorkId, WorkspaceId};
     use jiff::{SignedDuration, Timestamp};
@@ -129,12 +132,13 @@ mod tests {
         atomic::{AtomicU64, Ordering},
     };
 
-    fn make_test_ctx(with_store: bool) -> (OpContext, std::path::PathBuf, Option<Arc<JobStore>>) {
+    fn make_test_ctx(
+        with_store: bool,
+    ) -> TestResult<(OpContext, std::path::PathBuf, Option<Arc<JobStore>>)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("harw-deny-test-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(root.join("ws")).expect("create test workspace");
+        let root = std::env::temp_dir().join(format!("harw-deny-test-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(root.join("ws")).map_err(ctx("create test workspace"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -143,13 +147,13 @@ mod tests {
                 root: std::path::PathBuf::from("ws"),
             }],
         )
-        .expect("build workspace registry");
+        .map_err(ctx("build workspace registry"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .expect("resolve workspace binding");
+            .map_err(ctx("resolve workspace binding"))?;
         let sandbox = SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ReadWorkspace]),
@@ -159,14 +163,14 @@ mod tests {
         if let Some(store) = &store {
             services.insert(Arc::clone(store));
         }
-        (
+        Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, services),
             root,
             store,
-        )
+        ))
     }
 
-    fn job_in_state(id: &str, state: JobState) -> StoredJob {
+    fn job_in_state(id: &str, state: JobState) -> TestResult<StoredJob> {
         let now = Timestamp::now();
         let mut job = Job::new(
             WorkId::from_str(id),
@@ -181,11 +185,12 @@ mod tests {
             now,
         );
         if state == JobState::Ready {
-            job.mark_ready(now).expect("pending job can become ready");
+            job.mark_ready(now)
+                .map_err(ctx("pending job can become ready"))?;
         } else {
             job.state = state;
         }
-        StoredJob {
+        Ok(StoredJob {
             job,
             scope: JobScope::new(
                 TenantId::from_str("test-tenant"),
@@ -203,31 +208,38 @@ mod tests {
             cancellation: None,
             revision: 0,
             trace: None,
-        }
+        })
     }
 
     #[test]
-    fn test_deny_args_from_raw_args_splits_work_id_and_reason() {
-        let args = DenyArgs::from_raw_args(&toks(&["work-1", "too", "risky"])).unwrap();
+    fn test_deny_args_from_raw_args_splits_work_id_and_reason() -> TestResult {
+        let args = DenyArgs::from_raw_args(&toks(&["work-1", "too", "risky"]))
+            .map_err(ctx("DenyArgs::from_raw_args"))?;
         assert_eq!(args.work_id.as_deref(), Some("work-1"));
         assert_eq!(args.reason.as_deref(), Some("too risky"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn deny_without_work_id_returns_invalid_arguments() {
-        let (ctx, root, _) = make_test_ctx(false);
+    async fn deny_without_work_id_returns_invalid_arguments() -> TestResult {
+        let (ctx, root, _) = make_test_ctx(false)?;
         let result = deny(&ctx, DenyArgs::default()).await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         match result {
             Err(OpError::InvalidArguments(message)) => assert!(message.contains("work_id")),
-            other => panic!("expected InvalidArguments, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected InvalidArguments, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn deny_without_reason_returns_invalid_arguments() {
-        let (ctx, root, _) = make_test_ctx(false);
+    async fn deny_without_reason_returns_invalid_arguments() -> TestResult {
+        let (ctx, root, _) = make_test_ctx(false)?;
         let result = deny(
             &ctx,
             DenyArgs {
@@ -236,17 +248,22 @@ mod tests {
             },
         )
         .await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         match result {
             Err(OpError::InvalidArguments(message)) => assert!(message.contains("reason")),
-            other => panic!("expected InvalidArguments, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected InvalidArguments, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn deny_without_job_store_returns_not_available() {
-        let (ctx, root, _) = make_test_ctx(false);
+    async fn deny_without_job_store_returns_not_available() -> TestResult {
+        let (ctx, root, _) = make_test_ctx(false)?;
         let result = deny(
             &ctx,
             DenyArgs {
@@ -255,22 +272,27 @@ mod tests {
             },
         )
         .await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         match result {
             Err(OpError::NotAvailable(message)) => assert!(message.contains("job store")),
-            other => panic!("expected NotAvailable, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn deny_cancels_a_ready_job_and_reports_previous_state() {
-        let (ctx, root, store) = make_test_ctx(true);
-        let store = store.expect("test context includes job store");
+    async fn deny_cancels_a_ready_job_and_reports_previous_state() -> TestResult {
+        let (ctx, root, store) = make_test_ctx(true)?;
+        let store = store.ok_or(TestError::Missing("test context includes job store"))?;
         let work_id = WorkId::from_str("work-deny");
         store
-            .admit(&job_in_state(work_id.as_str(), JobState::Ready))
-            .expect("admit ready job");
+            .admit(&job_in_state(work_id.as_str(), JobState::Ready)?)
+            .map_err(crate::test_support::ctx("admit ready job"))?;
 
         let output = deny(
             &ctx,
@@ -280,25 +302,28 @@ mod tests {
             },
         )
         .await
-        .expect("deny cancels the ready job");
-        let persisted = store.get(&work_id).expect("read denied job");
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        .map_err(crate::test_support::ctx("deny cancels the ready job"))?;
+        let persisted = store
+            .get(&work_id)
+            .map_err(crate::test_support::ctx("read denied job"))?;
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         assert_eq!(persisted.job.state, JobState::Cancelled);
         assert!(output.text.contains(work_id.as_str()));
+        Ok(())
     }
 
     /// `/deny` gegen den zentralen §4-Fall: ein bereits `Blocked`er Job (die
     /// eigentliche "wartet auf Freigabe"-Situation) muss über die dedizierte
     /// `JobStore::deny_blocked`-Transition ablehnbar sein.
     #[tokio::test]
-    async fn deny_cancels_a_blocked_job_via_the_dedicated_transition() {
-        let (ctx, root, store) = make_test_ctx(true);
-        let store = store.expect("test context includes job store");
+    async fn deny_cancels_a_blocked_job_via_the_dedicated_transition() -> TestResult {
+        let (ctx, root, store) = make_test_ctx(true)?;
+        let store = store.ok_or(TestError::Missing("test context includes job store"))?;
         let work_id = WorkId::from_str("work-blocked");
         store
-            .admit(&job_in_state(work_id.as_str(), JobState::Blocked))
-            .expect("admit blocked job");
+            .admit(&job_in_state(work_id.as_str(), JobState::Blocked)?)
+            .map_err(crate::test_support::ctx("admit blocked job"))?;
 
         let output = deny(
             &ctx,
@@ -308,9 +333,13 @@ mod tests {
             },
         )
         .await
-        .expect("deny cancels the blocked job via deny_blocked");
-        let persisted = store.get(&work_id).expect("read denied job");
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        .map_err(crate::test_support::ctx(
+            "deny cancels the blocked job via deny_blocked",
+        ))?;
+        let persisted = store
+            .get(&work_id)
+            .map_err(crate::test_support::ctx("read denied job"))?;
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         assert_eq!(persisted.job.state, JobState::Cancelled);
         assert!(matches!(
@@ -320,5 +349,6 @@ mod tests {
         ));
         assert!(output.text.contains(work_id.as_str()));
         assert!(output.text.contains("Blocked"));
+        Ok(())
     }
 }

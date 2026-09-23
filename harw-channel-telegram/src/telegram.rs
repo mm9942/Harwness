@@ -631,20 +631,24 @@ impl From<TelegramChannelError> for ChannelError {
             // with the same "telegram" placeholder channel used above so this
             // match stays exhaustive without inventing new `ChannelError`
             // shapes for a path that does not exercise them today.
-            TelegramChannelError::WorkspaceUnresolved {
-                alias, tenant, ..
-            } => ChannelError::AdmissionDenied {
-                channel: harw_types::ChannelId::from_str("telegram"),
-                reason: format!("workspace alias '{alias}' unresolved for tenant '{tenant}'"),
-            },
-            TelegramChannelError::InvalidWorkRequestRole { role } => ChannelError::AdmissionDenied {
-                channel: harw_types::ChannelId::from_str("telegram"),
-                reason: format!("invalid work-request role '{role}'"),
-            },
-            TelegramChannelError::WorkRequestNotFound { work_id } => ChannelError::AdmissionDenied {
-                channel: harw_types::ChannelId::from_str("telegram"),
-                reason: format!("work request '{work_id}' is unknown"),
-            },
+            TelegramChannelError::WorkspaceUnresolved { alias, tenant, .. } => {
+                ChannelError::AdmissionDenied {
+                    channel: harw_types::ChannelId::from_str("telegram"),
+                    reason: format!("workspace alias '{alias}' unresolved for tenant '{tenant}'"),
+                }
+            }
+            TelegramChannelError::InvalidWorkRequestRole { role } => {
+                ChannelError::AdmissionDenied {
+                    channel: harw_types::ChannelId::from_str("telegram"),
+                    reason: format!("invalid work-request role '{role}'"),
+                }
+            }
+            TelegramChannelError::WorkRequestNotFound { work_id } => {
+                ChannelError::AdmissionDenied {
+                    channel: harw_types::ChannelId::from_str("telegram"),
+                    reason: format!("work request '{work_id}' is unknown"),
+                }
+            }
             TelegramChannelError::WorkRequestInvalidTransition {
                 work_id,
                 from,
@@ -691,13 +695,14 @@ mod tests {
 
     use super::*;
     use crate::approval_tokens::{TelegramChatId, TelegramMessageId, TelegramThreadId};
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_channel::{ApprovalAction, ApprovalPrompt, PairingStore, SenderRef, ThreadRef};
     use harw_types::{ChannelId, PeerId, TenantId};
 
-    fn store() -> (tempfile::TempDir, Arc<PairingStore>) {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn store() -> TestResult<(tempfile::TempDir, Arc<PairingStore>)> {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = Arc::new(PairingStore::new(dir.path()));
-        (dir, store)
+        Ok((dir, store))
     }
 
     fn config(channel: ChannelId) -> TelegramChannelConfig {
@@ -706,14 +711,15 @@ mod tests {
         config
     }
 
-    fn pair(store: &PairingStore, channel: &ChannelId, peer: &str, tenant: &str) {
+    fn pair(store: &PairingStore, channel: &ChannelId, peer: &str, tenant: &str) -> TestResult {
         let now = Timestamp::now();
         let code = store
             .issue_code(channel, &TenantId::from_str(tenant), b"seed12345", now)
-            .expect("issue");
+            .map_err(ctx("issue"))?;
         store
             .redeem_once(channel, &code, &PeerId::from_str(peer), now)
-            .expect("redeem");
+            .map_err(ctx("redeem"))?;
+        Ok(())
     }
 
     fn event(peer: &str, mentioned: bool) -> InboundEvent {
@@ -734,21 +740,24 @@ mod tests {
     }
 
     #[test]
-    fn unpaired_dm_defers_without_a_real_tenant() {
-        let (_dir, store) = store();
+    fn unpaired_dm_defers_without_a_real_tenant() -> TestResult {
+        let (_dir, store) = store()?;
         let adapter = TelegramChannel::new(config(ChannelId::from_str("telegram:ops")), store);
         let inbound = event("100", true);
-        let key = adapter.derive_session_key(&inbound).unwrap();
+        let key = adapter
+            .derive_session_key(&inbound)
+            .map_err(ctx("derive_session_key"))?;
         assert_eq!(key.tenant.as_str(), UNPAIRED_TENANT);
         assert_eq!(
             adapter.admit(&inbound, &key),
             Admission::Deferred(DeferralReason::Onboarding)
         );
+        Ok(())
     }
 
     #[test]
-    fn unpinned_sender_is_rejected_before_onboarding_or_group_mention_checks() {
-        let (_dir, store) = store();
+    fn unpinned_sender_is_rejected_before_onboarding_or_group_mention_checks() -> TestResult {
+        let (_dir, store) = store()?;
         let mut config = config(ChannelId::from_str("telegram:ops"));
         config.allowed_group_chats.insert("-1001".to_owned());
         let adapter = TelegramChannel::new(config, store);
@@ -757,63 +766,75 @@ mod tests {
             id: "mallory".to_owned(),
             display_name: None,
         });
-        let key = adapter.derive_session_key(&inbound).unwrap();
+        let key = adapter
+            .derive_session_key(&inbound)
+            .map_err(ctx("derive_session_key"))?;
 
         assert_eq!(key.tenant.as_str(), UNPAIRED_TENANT);
         assert_eq!(
             adapter.admit(&inbound, &key),
             Admission::Rejected(RejectionReason::NotAllowlisted)
         );
+        Ok(())
     }
 
     #[test]
-    fn paired_dm_resolves_real_tenant_and_admits() {
-        let (_dir, store) = store();
+    fn paired_dm_resolves_real_tenant_and_admits() -> TestResult {
+        let (_dir, store) = store()?;
         let channel = ChannelId::from_str("telegram:ops");
-        pair(&store, &channel, "100", "ops");
+        pair(&store, &channel, "100", "ops")?;
         let adapter = TelegramChannel::new(config(channel), store);
         let inbound = event("100", true);
-        let key = adapter.derive_session_key(&inbound).unwrap();
+        let key = adapter
+            .derive_session_key(&inbound)
+            .map_err(ctx("derive_session_key"))?;
         assert_eq!(key.tenant.as_str(), "ops");
         assert_eq!(adapter.admit(&inbound, &key), Admission::Admitted);
-        let key_again = adapter.derive_session_key(&inbound).unwrap();
+        let key_again = adapter
+            .derive_session_key(&inbound)
+            .map_err(ctx("derive_session_key"))?;
         assert_eq!(key, key_again);
+        Ok(())
     }
 
     #[test]
-    fn groups_require_a_mention_before_admission() {
-        let (_dir, store) = store();
+    fn groups_require_a_mention_before_admission() -> TestResult {
+        let (_dir, store) = store()?;
         let mut config = config(ChannelId::from_str("telegram:ops"));
         config.allowed_group_chats.insert("-1001".to_owned());
         let adapter = TelegramChannel::new(config, store);
         let inbound = event("-1001", false);
-        let key = adapter.derive_session_key(&inbound).unwrap();
+        let key = adapter
+            .derive_session_key(&inbound)
+            .map_err(ctx("derive_session_key"))?;
         assert_eq!(
             adapter.admit(&inbound, &key),
             Admission::Rejected(RejectionReason::NoMention)
         );
+        Ok(())
     }
 
     #[test]
-    fn shared_topic_mode_collapses_threads() {
-        let (_dir, store) = store();
+    fn shared_topic_mode_collapses_threads() -> TestResult {
+        let (_dir, store) = store()?;
         let channel = ChannelId::from_str("telegram:ops");
-        pair(&store, &channel, "100", "ops");
+        pair(&store, &channel, "100", "ops")?;
         let mut config = config(channel);
         config.topic_mode = TopicMode::SharedSession;
         let adapter = TelegramChannel::new(config, store);
         assert_eq!(
             adapter
                 .derive_session_key(&event("100", true))
-                .unwrap()
+                .map_err(ctx("derive_session_key"))?
                 .thread,
             None
         );
+        Ok(())
     }
 
     #[test]
-    fn approval_callbacks_require_bound_context_and_are_single_use() {
-        let (_dir, store) = store();
+    fn approval_callbacks_require_bound_context_and_are_single_use() -> TestResult {
+        let (_dir, store) = store()?;
         let adapter = TelegramChannel::new(config(ChannelId::from_str("telegram:ops")), store);
         let ops = adapter.render_outbound(&OutboundContent::Approval(ApprovalPrompt {
             request_id: "a-1".to_owned(),
@@ -829,7 +850,9 @@ mod tests {
             inline_actions,
         } = &ops[0]
         else {
-            panic!("approval must render as a Telegram message");
+            return Err(TestError::Unexpected(
+                "approval must render as a Telegram message".to_owned(),
+            ));
         };
         let unbound_token = &inline_actions[0].callback_payload;
         assert!(text.contains("file\\!"));
@@ -862,7 +885,9 @@ mod tests {
             }],
         }));
         let ChannelSendOp::SendMessage { inline_actions, .. } = &ops[0] else {
-            panic!("approval must render as a Telegram message");
+            return Err(TestError::Unexpected(
+                "approval must render as a Telegram message".to_owned(),
+            ));
         };
         let bound_token = &inline_actions[0].callback_payload;
         assert!(adapter.bind_approval_callback(bound_token, context.clone()));
@@ -877,11 +902,12 @@ mod tests {
             adapter.consume_approval_callback(bound_token, &context),
             None
         );
+        Ok(())
     }
 
     #[test]
-    fn approval_callback_wrong_context_is_denied() {
-        let (_dir, store) = store();
+    fn approval_callback_wrong_context_is_denied() -> TestResult {
+        let (_dir, store) = store()?;
         let adapter = TelegramChannel::new(config(ChannelId::from_str("telegram:ops")), store);
         let ops = adapter.render_outbound(&OutboundContent::Approval(ApprovalPrompt {
             request_id: "a-2".to_owned(),
@@ -893,7 +919,9 @@ mod tests {
             }],
         }));
         let ChannelSendOp::SendMessage { inline_actions, .. } = &ops[0] else {
-            panic!("approval must render as a Telegram message");
+            return Err(TestError::Unexpected(
+                "approval must render as a Telegram message".to_owned(),
+            ));
         };
         let token = &inline_actions[0].callback_payload;
         let expected = ApprovalCallbackContext::new(
@@ -912,13 +940,14 @@ mod tests {
         assert!(adapter.bind_approval_callback(token, expected.clone()));
         assert_eq!(adapter.consume_approval_callback(token, &wrong), None);
         assert_eq!(adapter.consume_approval_callback(token, &expected), None);
+        Ok(())
     }
 
     #[test]
-    fn telegram_profile_only_removes_upstream_capabilities() {
+    fn telegram_profile_only_removes_upstream_capabilities() -> TestResult {
         use harw_authority::Permission::{ExecuteProcess, ReadWorkspace, WriteWorkspace};
 
-        let (_dir, store) = store();
+        let (_dir, store) = store()?;
         let adapter = TelegramChannel::new(config(ChannelId::from_str("telegram:ops")), store);
         let reduced = adapter
             .sandbox()
@@ -927,48 +956,51 @@ mod tests {
         assert!(reduced.contains(ReadWorkspace));
         assert!(!reduced.contains(WriteWorkspace));
         assert!(!reduced.contains(ExecuteProcess));
+        Ok(())
     }
 
     #[test]
-    fn claim_update_deduplicates_retried_updates() {
-        let (_dir, store) = store();
+    fn claim_update_deduplicates_retried_updates() -> TestResult {
+        let (_dir, store) = store()?;
         let adapter = TelegramChannel::new(config(ChannelId::from_str("telegram:ops")), store);
         let mut ev = event("100", true);
         ev.raw_event_id = Some("55".to_owned());
-        assert!(adapter.claim_update(&ev).unwrap());
-        assert!(!adapter.claim_update(&ev).unwrap());
+        assert!(adapter.claim_update(&ev).map_err(ctx("claim_update"))?);
+        assert!(!adapter.claim_update(&ev).map_err(ctx("claim_update"))?);
+        Ok(())
     }
 
     #[test]
-    fn ingress_forwards_only_paired_first_delivery() {
-        let (_dir, store) = store();
+    fn ingress_forwards_only_paired_first_delivery() -> TestResult {
+        let (_dir, store) = store()?;
         let channel = ChannelId::from_str("telegram:ops");
-        pair(&store, &channel, "100", "ops");
+        pair(&store, &channel, "100", "ops")?;
         let (ingress_tx, ingress_rx) = mpsc::channel();
         let adapter = TelegramChannel::with_ingress_receiver(config(channel), store, ingress_rx);
         let (sink_tx, sink_rx) = mpsc::channel();
 
         let inbound = event("100", true);
-        ingress_tx.send(inbound.clone()).unwrap();
-        ingress_tx.send(inbound).unwrap();
+        ingress_tx.send(inbound.clone()).map_err(ctx("send"))?;
+        ingress_tx.send(inbound).map_err(ctx("send"))?;
         drop(ingress_tx);
 
-        adapter.run_ingress(sink_tx).unwrap();
-        assert_eq!(sink_rx.recv().unwrap().peer.as_str(), "100");
+        adapter.run_ingress(sink_tx).map_err(ctx("run_ingress"))?;
+        assert_eq!(sink_rx.recv().map_err(ctx("recv"))?.peer.as_str(), "100");
         assert!(sink_rx.try_recv().is_err());
+        Ok(())
     }
 
     #[test]
-    fn ingress_releases_channel_mutex_before_waiting_for_events() {
-        let (_dir, store) = store();
+    fn ingress_releases_channel_mutex_before_waiting_for_events() -> TestResult {
+        let (_dir, store) = store()?;
         let channel = ChannelId::from_str("telegram:ops");
-        pair(&store, &channel, "100", "ops");
+        pair(&store, &channel, "100", "ops")?;
         let (ingress_tx, ingress_rx) = mpsc::channel();
         let adapter = TelegramChannel::with_ingress_receiver(config(channel), store, ingress_rx);
         let ingress = adapter
             .ingress
             .as_ref()
-            .expect("configured ingress")
+            .ok_or(TestError::Missing("configured ingress"))?
             .clone();
         let (sink_tx, sink_rx) = mpsc::channel();
         let runner = adapter.clone();
@@ -985,7 +1017,12 @@ mod tests {
         // reaching either assertion.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if ingress.lock().expect("ingress lock").as_ref().is_none() {
+            if ingress
+                .lock()
+                .map_err(ctx("ingress lock"))?
+                .as_ref()
+                .is_none()
+            {
                 assert!(
                     ingress.try_lock().is_ok(),
                     "the ingress mutex must not remain locked while recv blocks"
@@ -1001,39 +1038,50 @@ mod tests {
 
         ingress_tx
             .send(event("100", true))
-            .expect("send ingress event");
+            .map_err(ctx("send ingress event"))?;
         drop(ingress_tx);
 
-        join.join().expect("ingress runner panicked").unwrap();
+        let run_result = join
+            .join()
+            .map_err(|_| TestError::Unexpected("ingress runner panicked".to_owned()))?;
+        run_result.map_err(ctx("run_ingress"))?;
         assert_eq!(
-            sink_rx.recv().expect("forwarded event").peer.as_str(),
+            sink_rx
+                .recv()
+                .map_err(ctx("forwarded event"))?
+                .peer
+                .as_str(),
             "100"
         );
-        assert!(ingress.lock().expect("ingress lock").is_some());
+        assert!(ingress.lock().map_err(ctx("ingress lock"))?.is_some());
+        Ok(())
     }
 
     #[test]
-    fn ingress_drops_unpaired_and_rejected_events() {
-        let (_dir, store) = store();
+    fn ingress_drops_unpaired_and_rejected_events() -> TestResult {
+        let (_dir, store) = store()?;
         let mut config = config(ChannelId::from_str("telegram:ops"));
         config.allowed_group_chats.insert("-1001".to_owned());
         let (ingress_tx, ingress_rx) = mpsc::channel();
         let adapter = TelegramChannel::with_ingress_receiver(config, store, ingress_rx);
         let (sink_tx, sink_rx) = mpsc::channel();
 
-        ingress_tx.send(event("100", true)).unwrap();
-        ingress_tx.send(event("-1001", false)).unwrap();
+        ingress_tx.send(event("100", true)).map_err(ctx("send"))?;
+        ingress_tx
+            .send(event("-1001", false))
+            .map_err(ctx("send"))?;
         drop(ingress_tx);
 
-        adapter.run_ingress(sink_tx).unwrap();
+        adapter.run_ingress(sink_tx).map_err(ctx("run_ingress"))?;
         assert!(sink_rx.try_recv().is_err());
+        Ok(())
     }
 
     #[test]
-    fn ingress_drops_unpinned_sender_before_claiming_replay_or_pairing() {
-        let (_dir, store) = store();
+    fn ingress_drops_unpinned_sender_before_claiming_replay_or_pairing() -> TestResult {
+        let (_dir, store) = store()?;
         let channel = ChannelId::from_str("telegram:ops");
-        pair(&store, &channel, "100", "ops");
+        pair(&store, &channel, "100", "ops")?;
         let (ingress_tx, ingress_rx) = mpsc::channel();
         let adapter = TelegramChannel::with_ingress_receiver(config(channel), store, ingress_rx);
         let (sink_tx, sink_rx) = mpsc::channel();
@@ -1043,10 +1091,10 @@ mod tests {
             id: "mallory".to_owned(),
             display_name: None,
         });
-        ingress_tx.send(inbound.clone()).unwrap();
+        ingress_tx.send(inbound.clone()).map_err(ctx("send"))?;
         drop(ingress_tx);
 
-        adapter.run_ingress(sink_tx).unwrap();
+        adapter.run_ingress(sink_tx).map_err(ctx("run_ingress"))?;
 
         // Kein Treffer im Sink ...
         assert!(sink_rx.try_recv().is_err());
@@ -1054,34 +1102,40 @@ mod tests {
         // angelegt. Ein anschließender `claim_update` desselben Updates ist
         // also weiterhin der *erste* Claim (liefert `true`), nicht der
         // zweite (F-040/S5).
-        assert!(adapter.claim_update(&inbound).unwrap());
+        assert!(
+            adapter
+                .claim_update(&inbound)
+                .map_err(ctx("claim_update"))?
+        );
         // Nur der zustandslose Zähler hat den Vorgang beobachtet.
         assert_eq!(adapter.rejected_unpinned_sender_count(), 1);
+        Ok(())
     }
 
     #[test]
-    fn ingress_drops_events_without_a_replayable_update_id() {
-        let (_dir, store) = store();
+    fn ingress_drops_events_without_a_replayable_update_id() -> TestResult {
+        let (_dir, store) = store()?;
         let channel = ChannelId::from_str("telegram:ops");
-        pair(&store, &channel, "100", "ops");
+        pair(&store, &channel, "100", "ops")?;
         let (ingress_tx, ingress_rx) = mpsc::channel();
         let adapter = TelegramChannel::with_ingress_receiver(config(channel), store, ingress_rx);
         let (sink_tx, sink_rx) = mpsc::channel();
 
         let mut inbound = event("100", true);
         inbound.raw_event_id = None;
-        ingress_tx.send(inbound).unwrap();
+        ingress_tx.send(inbound).map_err(ctx("send"))?;
         drop(ingress_tx);
 
-        adapter.run_ingress(sink_tx).unwrap();
+        adapter.run_ingress(sink_tx).map_err(ctx("run_ingress"))?;
         assert!(sink_rx.try_recv().is_err());
+        Ok(())
     }
 
     #[test]
-    fn ingress_drops_contentless_events_before_replay_claim_or_pairing() {
-        let (_dir, store) = store();
+    fn ingress_drops_contentless_events_before_replay_claim_or_pairing() -> TestResult {
+        let (_dir, store) = store()?;
         let channel = ChannelId::from_str("telegram:ops");
-        pair(&store, &channel, "100", "ops");
+        pair(&store, &channel, "100", "ops")?;
         let (ingress_tx, ingress_rx) = mpsc::channel();
         let adapter =
             TelegramChannel::with_ingress_receiver(config(channel.clone()), store, ingress_rx);
@@ -1090,19 +1144,24 @@ mod tests {
         let mut inbound = event("100", true);
         inbound.text = None;
         inbound.attachments.clear();
-        ingress_tx.send(inbound.clone()).unwrap();
+        ingress_tx.send(inbound.clone()).map_err(ctx("send"))?;
         drop(ingress_tx);
 
-        adapter.run_ingress(sink_tx).unwrap();
+        adapter.run_ingress(sink_tx).map_err(ctx("run_ingress"))?;
         assert!(sink_rx.try_recv().is_err());
-        assert!(adapter.claim_update(&inbound).unwrap());
+        assert!(
+            adapter
+                .claim_update(&inbound)
+                .map_err(ctx("claim_update"))?
+        );
+        Ok(())
     }
 
     #[test]
-    fn ingress_drops_whitespace_identifiers_and_malformed_payload_metadata() {
-        let (_dir, store) = store();
+    fn ingress_drops_whitespace_identifiers_and_malformed_payload_metadata() -> TestResult {
+        let (_dir, store) = store()?;
         let channel = ChannelId::from_str("telegram:ops");
-        pair(&store, &channel, "100", "ops");
+        pair(&store, &channel, "100", "ops")?;
         let (ingress_tx, ingress_rx) = mpsc::channel();
         let adapter = TelegramChannel::with_ingress_receiver(config(channel), store, ingress_rx);
         let (sink_tx, sink_rx) = mpsc::channel();
@@ -1113,17 +1172,22 @@ mod tests {
             id: "  ".to_owned(),
             display_name: None,
         });
-        ingress_tx.send(inbound.clone()).unwrap();
+        ingress_tx.send(inbound.clone()).map_err(ctx("send"))?;
         drop(ingress_tx);
 
-        adapter.run_ingress(sink_tx).unwrap();
+        adapter.run_ingress(sink_tx).map_err(ctx("run_ingress"))?;
         assert!(sink_rx.try_recv().is_err());
-        assert!(adapter.claim_update(&inbound).unwrap());
+        assert!(
+            adapter
+                .claim_update(&inbound)
+                .map_err(ctx("claim_update"))?
+        );
+        Ok(())
     }
 
     #[test]
-    fn ingress_without_transport_receiver_fails_closed() {
-        let (_dir, store) = store();
+    fn ingress_without_transport_receiver_fails_closed() -> TestResult {
+        let (_dir, store) = store()?;
         let adapter = TelegramChannel::new(config(ChannelId::from_str("telegram:ops")), store);
         let (sink_tx, _sink_rx) = mpsc::channel();
 
@@ -1131,6 +1195,7 @@ mod tests {
             adapter.run_ingress(sink_tx),
             Err(TelegramChannelError::IngressUnavailable)
         ));
+        Ok(())
     }
 
     #[test]
@@ -1174,10 +1239,10 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_rejects_beyond_budget_and_recovers_next_window() {
-        let (_dir, store) = store();
+    fn rate_limit_rejects_beyond_budget_and_recovers_next_window() -> TestResult {
+        let (_dir, store) = store()?;
         let channel = ChannelId::from_str("telegram:ops");
-        pair(&store, &channel, "100", "ops");
+        pair(&store, &channel, "100", "ops")?;
         let mut config = config(channel);
         config.max_updates_per_peer_per_min = 2;
         let adapter = TelegramChannel::new(config, store);
@@ -1186,7 +1251,9 @@ mod tests {
         let mut first = event("100", true);
         first.raw_event_id = Some("1".to_owned());
         first.received_at = base;
-        let key = adapter.derive_session_key(&first).unwrap();
+        let key = adapter
+            .derive_session_key(&first)
+            .map_err(ctx("derive_session_key"))?;
         assert_eq!(adapter.admit(&first, &key), Admission::Admitted);
 
         let mut second = event("100", true);
@@ -1204,33 +1271,39 @@ mod tests {
 
         let mut fourth = event("100", true);
         fourth.raw_event_id = Some("4".to_owned());
-        fourth.received_at = base.checked_add(jiff::SignedDuration::from_secs(61)).unwrap();
+        fourth.received_at = base
+            .checked_add(jiff::SignedDuration::from_secs(61))
+            .map_err(ctx("checked_add"))?;
         assert_eq!(adapter.admit(&fourth, &key), Admission::Admitted);
+        Ok(())
     }
 
     #[test]
-    fn rate_limit_is_idempotent_across_a_repeated_admit_call_for_one_event() {
-        let (_dir, store) = store();
+    fn rate_limit_is_idempotent_across_a_repeated_admit_call_for_one_event() -> TestResult {
+        let (_dir, store) = store()?;
         let channel = ChannelId::from_str("telegram:ops");
-        pair(&store, &channel, "100", "ops");
+        pair(&store, &channel, "100", "ops")?;
         let mut config = config(channel);
         config.max_updates_per_peer_per_min = 1;
         let adapter = TelegramChannel::new(config, store);
         let inbound = event("100", true);
-        let key = adapter.derive_session_key(&inbound).unwrap();
+        let key = adapter
+            .derive_session_key(&inbound)
+            .map_err(ctx("derive_session_key"))?;
 
         // A second `admit()` call for the exact same event (mirroring the
         // gateway's own redundant post-ingress admission re-check) must not
         // consume a second slot of the peer's budget.
         assert_eq!(adapter.admit(&inbound, &key), Admission::Admitted);
         assert_eq!(adapter.admit(&inbound, &key), Admission::Admitted);
+        Ok(())
     }
 
     #[test]
-    fn rate_limited_ingress_emits_at_most_one_throttle_notice_per_window() {
-        let (_dir, store) = store();
+    fn rate_limited_ingress_emits_at_most_one_throttle_notice_per_window() -> TestResult {
+        let (_dir, store) = store()?;
         let channel = ChannelId::from_str("telegram:ops");
-        pair(&store, &channel, "100", "ops");
+        pair(&store, &channel, "100", "ops")?;
         let mut config = config(channel);
         config.max_updates_per_peer_per_min = 1;
         let (ingress_tx, ingress_rx) = mpsc::channel();
@@ -1245,36 +1318,40 @@ mod tests {
         second.raw_event_id = Some("2".to_owned());
         let mut third = event("100", true);
         third.raw_event_id = Some("3".to_owned());
-        ingress_tx.send(first).unwrap();
-        ingress_tx.send(second).unwrap();
-        ingress_tx.send(third).unwrap();
+        ingress_tx.send(first).map_err(ctx("send"))?;
+        ingress_tx.send(second).map_err(ctx("send"))?;
+        ingress_tx.send(third).map_err(ctx("send"))?;
         drop(ingress_tx);
 
-        adapter.run_ingress(sink_tx).unwrap();
+        adapter.run_ingress(sink_tx).map_err(ctx("run_ingress"))?;
 
-        assert_eq!(sink_rx.recv().unwrap().peer.as_str(), "100");
+        assert_eq!(sink_rx.recv().map_err(ctx("recv"))?.peer.as_str(), "100");
         assert!(sink_rx.try_recv().is_err());
 
-        let notice = throttle_rx.recv().expect("exactly one throttle notice");
+        let notice = throttle_rx
+            .recv()
+            .map_err(ctx("exactly one throttle notice"))?;
         assert_eq!(notice.peer.as_str(), "100");
         assert!(throttle_rx.try_recv().is_err());
+        Ok(())
     }
 
     #[test]
-    fn no_throttle_notice_without_a_configured_sink() {
-        let (_dir, store) = store();
+    fn no_throttle_notice_without_a_configured_sink() -> TestResult {
+        let (_dir, store) = store()?;
         let channel = ChannelId::from_str("telegram:ops");
-        pair(&store, &channel, "100", "ops");
+        pair(&store, &channel, "100", "ops")?;
         let mut config = config(channel);
         config.max_updates_per_peer_per_min = 0;
         let (ingress_tx, ingress_rx) = mpsc::channel();
         let adapter = TelegramChannel::with_ingress_receiver(config, store, ingress_rx);
         let (sink_tx, sink_rx) = mpsc::channel();
 
-        ingress_tx.send(event("100", true)).unwrap();
+        ingress_tx.send(event("100", true)).map_err(ctx("send"))?;
         drop(ingress_tx);
 
-        adapter.run_ingress(sink_tx).unwrap();
+        adapter.run_ingress(sink_tx).map_err(ctx("run_ingress"))?;
         assert!(sink_rx.try_recv().is_err());
+        Ok(())
     }
 }

@@ -290,7 +290,10 @@ fn intersection_list<T: Clone + PartialEq + std::fmt::Debug>(
     if !present {
         return;
     }
-    let rejected: Vec<&T> = incoming.iter().filter(|item| !trusted.contains(item)).collect();
+    let rejected: Vec<&T> = incoming
+        .iter()
+        .filter(|item| !trusted.contains(item))
+        .collect();
     trusted.retain(|item| incoming.contains(item));
     for item in rejected {
         let diagnostic = ScopeDiagnostic::new(field, layer_path, item);
@@ -544,7 +547,16 @@ fn merge_optional_stricter_of(
     match (trusted.clone(), incoming) {
         (None, Some(value)) => *trusted = Some(value),
         (Some(mut current), Some(value)) => {
-            stricter_of(&mut current, value, true, role, ordering, field, layer_path, out);
+            stricter_of(
+                &mut current,
+                value,
+                true,
+                role,
+                ordering,
+                field,
+                layer_path,
+                out,
+            );
             *trusted = Some(current);
         }
         (_, None) => {}
@@ -683,9 +695,24 @@ fn merge_top_level(
         present("active_agent_definition"),
         role,
     );
-    profile_replaces(&mut trusted.uia_provider, incoming.uia_provider.clone(), present("uia_provider"), role);
-    profile_replaces(&mut trusted.uia_model, incoming.uia_model.clone(), present("uia_model"), role);
-    profile_replaces(&mut trusted.uia_worker_model, incoming.uia_worker_model.clone(), present("uia_worker_model"), role);
+    profile_replaces(
+        &mut trusted.uia_provider,
+        incoming.uia_provider.clone(),
+        present("uia_provider"),
+        role,
+    );
+    profile_replaces(
+        &mut trusted.uia_model,
+        incoming.uia_model.clone(),
+        present("uia_model"),
+        role,
+    );
+    profile_replaces(
+        &mut trusted.uia_worker_model,
+        incoming.uia_worker_model.clone(),
+        present("uia_worker_model"),
+        role,
+    );
     profile_replaces(
         &mut trusted.project_root_markers,
         incoming.project_root_markers.clone(),
@@ -705,22 +732,47 @@ fn merge_top_level(
 
 // `[logging]` (Abschnitt 1.2) — alle drei Felder `ProfileReplaces`, nie
 // diagnostizierbar.
-fn merge_logging(trusted: &mut HarnessConfig, incoming: crate::harness_config::LoggingSection, raw: &toml::Value, role: LayerRole) {
+fn merge_logging(
+    trusted: &mut HarnessConfig,
+    incoming: crate::harness_config::LoggingSection,
+    raw: &toml::Value,
+    role: LayerRole,
+) {
     let present = |field: &str| field_present(raw, &["logging", field]);
-    profile_replaces(&mut trusted.logging.level, incoming.level, present("level"), role);
+    profile_replaces(
+        &mut trusted.logging.level,
+        incoming.level,
+        present("level"),
+        role,
+    );
     profile_replaces(
         &mut trusted.logging.target_module_paths,
         incoming.target_module_paths,
         present("target_module_paths"),
         role,
     );
-    profile_replaces(&mut trusted.logging.json, incoming.json, present("json"), role);
+    profile_replaces(
+        &mut trusted.logging.json,
+        incoming.json,
+        present("json"),
+        role,
+    );
 }
 
 // `[tui]` (Abschnitt 1.3) — beide Felder `ProfileReplaces`.
-fn merge_tui(trusted: &mut HarnessConfig, incoming: TuiSection, raw: &toml::Value, role: LayerRole) {
+fn merge_tui(
+    trusted: &mut HarnessConfig,
+    incoming: TuiSection,
+    raw: &toml::Value,
+    role: LayerRole,
+) {
     let present = |field: &str| field_present(raw, &["tui", field]);
-    profile_replaces(&mut trusted.tui.theme, incoming.theme, present("theme"), role);
+    profile_replaces(
+        &mut trusted.tui.theme,
+        incoming.theme,
+        present("theme"),
+        role,
+    );
     profile_replaces(
         &mut trusted.tui.keybindings_file,
         incoming.keybindings_file,
@@ -740,7 +792,12 @@ fn merge_session(
     out: &mut Vec<ScopeDiagnostic>,
 ) {
     let present = |field: &str| field_present(raw, &["session", field]);
-    profile_replaces(&mut trusted.session.store_dir, incoming.store_dir, present("store_dir"), role);
+    profile_replaces(
+        &mut trusted.session.store_dir,
+        incoming.store_dir,
+        present("store_dir"),
+        role,
+    );
     profile_replaces(
         &mut trusted.session.journal_format,
         incoming.journal_format,
@@ -762,7 +819,12 @@ fn merge_session(
         present("title_generation"),
         role,
     );
-    profile_replaces(&mut trusted.session.title_model, incoming.title_model, present("title_model"), role);
+    profile_replaces(
+        &mut trusted.session.title_model,
+        incoming.title_model,
+        present("title_model"),
+        role,
+    );
 }
 
 // `[policy]` (Abschnitt 1.5) — beide Felder sicherheitskritisch (🔒):
@@ -849,7 +911,12 @@ fn merge_mcp_listener(
 // Per-Flag-Merge. Nie vom nicht vertrauten Projekt-Layer angewendet
 // (`ProfileReplaces`, Abschnitt 7c) — heute ohnehin unerreichbar
 // (`discovery.rs:542-558`).
-fn merge_onboarding(trusted: &mut HarnessConfig, incoming: OnboardingSection, raw: &toml::Value, role: LayerRole) {
+fn merge_onboarding(
+    trusted: &mut HarnessConfig,
+    incoming: OnboardingSection,
+    raw: &toml::Value,
+    role: LayerRole,
+) {
     if role == LayerRole::UntrustedProject {
         return;
     }
@@ -870,8 +937,18 @@ fn merge_tools_plan(
 ) {
     let plan = incoming.plan;
     let present = |field: &str| field_present(raw, &["tools", "plan", field]);
-    profile_replaces(&mut trusted.tools.plan.enabled, plan.enabled, present("enabled"), role);
-    profile_replaces(&mut trusted.tools.plan.persist, plan.persist, present("persist"), role);
+    profile_replaces(
+        &mut trusted.tools.plan.enabled,
+        plan.enabled,
+        present("enabled"),
+        role,
+    );
+    profile_replaces(
+        &mut trusted.tools.plan.persist,
+        plan.persist,
+        present("persist"),
+        role,
+    );
     profile_replaces(
         &mut trusted.tools.plan.require_for_complex_work,
         plan.require_for_complex_work,
@@ -929,7 +1006,12 @@ fn merge_tools_plan(
 }
 
 // `[mode]` (Abschnitt 1.9) — einziges Feld `ProfileReplaces`.
-fn merge_mode(trusted: &mut HarnessConfig, incoming: ModeSection, raw: &toml::Value, role: LayerRole) {
+fn merge_mode(
+    trusted: &mut HarnessConfig,
+    incoming: ModeSection,
+    raw: &toml::Value,
+    role: LayerRole,
+) {
     let present = field_present(raw, &["mode", "default"]);
     profile_replaces(&mut trusted.mode.default, incoming.default, present, role);
 }
@@ -1028,7 +1110,12 @@ fn merge_permissions(
         layer_path,
         out,
     );
-    union_list(&mut trusted.permissions.deny, &incoming.deny, present("deny"), role);
+    union_list(
+        &mut trusted.permissions.deny,
+        &incoming.deny,
+        present("deny"),
+        role,
+    );
     intersection_list(
         &mut trusted.permissions.extra_roots,
         &incoming.extra_roots,
@@ -1128,9 +1215,19 @@ fn merge_compaction(
 }
 
 // `[reasoning]` (Abschnitt 1.15) — alle sechs Felder `ProfileReplaces`.
-fn merge_reasoning(trusted: &mut HarnessConfig, incoming: ReasoningWeightsToml, raw: &toml::Value, role: LayerRole) {
+fn merge_reasoning(
+    trusted: &mut HarnessConfig,
+    incoming: ReasoningWeightsToml,
+    raw: &toml::Value,
+    role: LayerRole,
+) {
     let present = |field: &str| field_present(raw, &["reasoning", field]);
-    profile_replaces(&mut trusted.reasoning.uia, incoming.uia, present("uia"), role);
+    profile_replaces(
+        &mut trusted.reasoning.uia,
+        incoming.uia,
+        present("uia"),
+        role,
+    );
     profile_replaces(
         &mut trusted.reasoning.root_orchestrator,
         incoming.root_orchestrator,
@@ -1300,15 +1397,36 @@ pub fn merge_layer_into(
     merge_tui(trusted, incoming.tui, raw, role);
     merge_session(trusted, incoming.session, raw, role, layer_path, &mut out);
     merge_policy(trusted, incoming.policy, raw, role, layer_path, &mut out);
-    merge_mcp_listener(trusted, incoming.mcp_listener, raw, role, layer_path, &mut out);
+    merge_mcp_listener(
+        trusted,
+        incoming.mcp_listener,
+        raw,
+        role,
+        layer_path,
+        &mut out,
+    );
     merge_onboarding(trusted, incoming.onboarding, raw, role);
     merge_tools_plan(trusted, incoming.tools, raw, role, layer_path, &mut out);
     merge_mode(trusted, incoming.mode, raw, role);
     merge_research(trusted, incoming.research, raw, role, layer_path, &mut out);
-    merge_permissions(trusted, incoming.permissions, raw, role, layer_path, &mut out);
+    merge_permissions(
+        trusted,
+        incoming.permissions,
+        raw,
+        role,
+        layer_path,
+        &mut out,
+    );
     merge_sandbox(trusted, incoming.sandbox, raw, role, layer_path, &mut out);
     merge_internal_models(trusted, incoming.internal_models, raw, role);
-    merge_compaction(trusted, incoming.compaction, raw, role, layer_path, &mut out);
+    merge_compaction(
+        trusted,
+        incoming.compaction,
+        raw,
+        role,
+        layer_path,
+        &mut out,
+    );
     merge_reasoning(trusted, incoming.reasoning, raw, role);
     merge_guards(trusted, incoming.guards, raw, role, layer_path, &mut out);
 
@@ -1330,25 +1448,26 @@ pub fn merge_layer_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use std::path::PathBuf;
 
     fn layer_path() -> PathBuf {
         PathBuf::from("/home/user/.harw/profiles/default/config.toml")
     }
 
-    fn raw_from(src: &str) -> toml::Value {
-        toml::from_str(src).expect("valid toml fixture")
+    fn raw_from(src: &str) -> TestResult<toml::Value> {
+        toml::from_str(src).map_err(ctx("valid toml fixture"))
     }
 
     // Test 1 (Abschnitt 7h): ProfileReplaces — Profil laesst das Feld
     // unbenutzt, Home-Wert bleibt erhalten statt auf den Default zu
     // fallen.
     #[test]
-    fn test_profile_replaces_keeps_trusted_value_when_layer_omits_field() {
+    fn test_profile_replaces_keeps_trusted_value_when_layer_omits_field() -> TestResult {
         let mut trusted = HarnessConfig::default();
         trusted.logging.level = "debug".to_owned();
         let incoming = HarnessConfig::default();
-        let raw = raw_from("default_provider = \"anthropic\"");
+        let raw = raw_from("default_provider = \"anthropic\"")?;
         let diagnostics = merge_layer_into(
             &mut trusted,
             incoming,
@@ -1358,12 +1477,13 @@ mod tests {
         );
         assert_eq!(trusted.logging.level, "debug");
         assert!(diagnostics.is_empty());
+        Ok(())
     }
 
     // uia_worker_model (Abschnitt 6.3, 1.1): ProfileReplaces — ein
     // vertrautes Profil setzt einen neuen Wert und ersetzt den Home-Wert.
     #[test]
-    fn test_uia_worker_model_profile_replaces_overrides_trusted_value() {
+    fn test_uia_worker_model_profile_replaces_overrides_trusted_value() -> TestResult {
         let mut trusted = HarnessConfig {
             uia_worker_model: Some("claude-old".to_owned()),
             ..Default::default()
@@ -1372,7 +1492,7 @@ mod tests {
             uia_worker_model: Some("claude-new".to_owned()),
             ..Default::default()
         };
-        let raw = raw_from("uia_worker_model = \"claude-new\"");
+        let raw = raw_from("uia_worker_model = \"claude-new\"")?;
         let diagnostics = merge_layer_into(
             &mut trusted,
             incoming,
@@ -1382,6 +1502,7 @@ mod tests {
         );
         assert_eq!(trusted.uia_worker_model.as_deref(), Some("claude-new"));
         assert!(diagnostics.is_empty());
+        Ok(())
     }
 
     // uia_worker_model gegen einen nicht vertrauten Projekt-Layer: `profile_replaces`
@@ -1389,7 +1510,7 @@ mod tests {
     // der Projekt-Layer kann den Wert nicht setzen, auch wenn er ihn im
     // rohen TOML traegt.
     #[test]
-    fn test_uia_worker_model_untrusted_project_layer_cannot_set_it() {
+    fn test_uia_worker_model_untrusted_project_layer_cannot_set_it() -> TestResult {
         let mut trusted = HarnessConfig {
             uia_worker_model: Some("claude-trusted".to_owned()),
             ..Default::default()
@@ -1398,7 +1519,7 @@ mod tests {
             uia_worker_model: Some("claude-evil".to_owned()),
             ..Default::default()
         };
-        let raw = raw_from("uia_worker_model = \"claude-evil\"");
+        let raw = raw_from("uia_worker_model = \"claude-evil\"")?;
         let diagnostics = merge_layer_into(
             &mut trusted,
             incoming,
@@ -1408,11 +1529,12 @@ mod tests {
         );
         assert_eq!(trusted.uia_worker_model.as_deref(), Some("claude-trusted"));
         assert!(diagnostics.is_empty());
+        Ok(())
     }
 
     // Test 3: GlobalOnly — Profil versucht sandbox.cargo zu aendern.
     #[test]
-    fn test_global_only_rejects_profile_override_and_emits_diagnostic() {
+    fn test_global_only_rejects_profile_override_and_emits_diagnostic() -> TestResult {
         use crate::harness_config::{CargoSandboxModeToml, CargoSandboxToml};
 
         let mut trusted = HarnessConfig::default();
@@ -1439,7 +1561,7 @@ mod tests {
                 rustup_home = "/opt/harw/rustup"
                 cargo_home = "/opt/harw/cargo-home"
             "#,
-        );
+        )?;
         let diagnostics = merge_layer_into(
             &mut trusted,
             incoming,
@@ -1447,16 +1569,19 @@ mod tests {
             LayerRole::Refinement,
             &layer_path(),
         );
-        assert_eq!(
-            trusted.sandbox.cargo.as_ref().unwrap().cargo_bin,
-            "/opt/harw/cargo"
-        );
+        let cargo = trusted
+            .sandbox
+            .cargo
+            .as_ref()
+            .ok_or(TestError::Missing("sandbox.cargo after merge"))?;
+        assert_eq!(cargo.cargo_bin, "/opt/harw/cargo");
         assert!(diagnostics.iter().any(|d| d.field == "sandbox.cargo"));
+        Ok(())
     }
 
     // Test 4: Union — beide Layer-Eintraege ueberleben.
     #[test]
-    fn test_union_combines_entries_from_both_layers() {
+    fn test_union_combines_entries_from_both_layers() -> TestResult {
         let mut trusted = HarnessConfig::default();
         trusted.policy.require_approval_for = vec!["shell.exec".to_owned()];
         let mut incoming = HarnessConfig::default();
@@ -1466,28 +1591,57 @@ mod tests {
                 [policy]
                 require_approval_for = ["fs.write"]
             "#,
+        )?;
+        merge_layer_into(
+            &mut trusted,
+            incoming,
+            &raw,
+            LayerRole::Refinement,
+            &layer_path(),
         );
-        merge_layer_into(&mut trusted, incoming, &raw, LayerRole::Refinement, &layer_path());
         assert_eq!(trusted.policy.require_approval_for.len(), 2);
-        assert!(trusted.policy.require_approval_for.contains(&"shell.exec".to_owned()));
-        assert!(trusted.policy.require_approval_for.contains(&"fs.write".to_owned()));
+        assert!(
+            trusted
+                .policy
+                .require_approval_for
+                .contains(&"shell.exec".to_owned())
+        );
+        assert!(
+            trusted
+                .policy
+                .require_approval_for
+                .contains(&"fs.write".to_owned())
+        );
+        Ok(())
     }
 
     // Test 5: Intersection — ein neuer Eintrag wird verworfen +
     // diagnostiziert.
     #[test]
-    fn test_intersection_drops_new_entry_and_emits_diagnostic() {
+    fn test_intersection_drops_new_entry_and_emits_diagnostic() -> TestResult {
         use crate::permissions_toml::RuleToml;
 
         let mut trusted = HarnessConfig::default();
         trusted.permissions.allow = vec![
-            RuleToml { tool: "shell.exec".to_owned(), pattern: None },
-            RuleToml { tool: "fs.read".to_owned(), pattern: None },
+            RuleToml {
+                tool: "shell.exec".to_owned(),
+                pattern: None,
+            },
+            RuleToml {
+                tool: "fs.read".to_owned(),
+                pattern: None,
+            },
         ];
         let mut incoming = HarnessConfig::default();
         incoming.permissions.allow = vec![
-            RuleToml { tool: "shell.exec".to_owned(), pattern: None },
-            RuleToml { tool: "fs.write".to_owned(), pattern: None },
+            RuleToml {
+                tool: "shell.exec".to_owned(),
+                pattern: None,
+            },
+            RuleToml {
+                tool: "fs.write".to_owned(),
+                pattern: None,
+            },
         ];
         let raw = raw_from(
             r#"
@@ -1496,7 +1650,7 @@ mod tests {
                 [[permissions.allow]]
                 tool = "fs.write"
             "#,
-        );
+        )?;
         let diagnostics = merge_layer_into(
             &mut trusted,
             incoming,
@@ -1507,11 +1661,12 @@ mod tests {
         assert_eq!(trusted.permissions.allow.len(), 1);
         assert_eq!(trusted.permissions.allow[0].tool, "shell.exec");
         assert!(diagnostics.iter().any(|d| d.field == "permissions.allow"));
+        Ok(())
     }
 
     // Test 6: MinBound.
     #[test]
-    fn test_min_bound_rejects_higher_value_and_keeps_lower() {
+    fn test_min_bound_rejects_higher_value_and_keeps_lower() -> TestResult {
         let mut trusted = HarnessConfig::default();
         trusted.guards.repeated_failure_warn = Some(2);
         let mut incoming = HarnessConfig::default();
@@ -1521,7 +1676,7 @@ mod tests {
                 [guards]
                 repeated_failure_warn = 5
             "#,
-        );
+        )?;
         let diagnostics = merge_layer_into(
             &mut trusted,
             incoming,
@@ -1530,12 +1685,17 @@ mod tests {
             &layer_path(),
         );
         assert_eq!(trusted.guards.repeated_failure_warn, Some(2));
-        assert!(diagnostics.iter().any(|d| d.field == "guards.repeated_failure_warn"));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.field == "guards.repeated_failure_warn")
+        );
+        Ok(())
     }
 
     // Test 7: AndBool.
     #[test]
-    fn test_and_bool_keeps_false_when_profile_tries_to_enable() {
+    fn test_and_bool_keeps_false_when_profile_tries_to_enable() -> TestResult {
         let mut trusted = HarnessConfig::default();
         trusted.mcp_listener.enabled = false;
         let mut incoming = HarnessConfig::default();
@@ -1545,7 +1705,7 @@ mod tests {
                 [mcp_listener]
                 enabled = true
             "#,
-        );
+        )?;
         let diagnostics = merge_layer_into(
             &mut trusted,
             incoming,
@@ -1554,12 +1714,17 @@ mod tests {
             &layer_path(),
         );
         assert!(!trusted.mcp_listener.enabled);
-        assert!(diagnostics.iter().any(|d| d.field == "mcp_listener.enabled"));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.field == "mcp_listener.enabled")
+        );
+        Ok(())
     }
 
     // Test 9 + 24: StricterOf inkl. R1-Fallback fuer unbekannte Werte.
     #[test]
-    fn test_stricter_of_falls_back_to_global_only_for_unknown_value() {
+    fn test_stricter_of_falls_back_to_global_only_for_unknown_value() -> TestResult {
         let mut trusted = HarnessConfig::default();
         trusted.policy.default_visibility_scope = "self".to_owned();
         let mut incoming = HarnessConfig::default();
@@ -1569,7 +1734,7 @@ mod tests {
                 [policy]
                 default_visibility_scope = "team"
             "#,
-        );
+        )?;
         let diagnostics = merge_layer_into(
             &mut trusted,
             incoming,
@@ -1578,27 +1743,33 @@ mod tests {
             &layer_path(),
         );
         assert_eq!(trusted.policy.default_visibility_scope, "self");
-        assert!(diagnostics.iter().any(|d| d.field == "policy.default_visibility_scope"
-            && d.rejected_value.contains("team")));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.field == "policy.default_visibility_scope"
+                    && d.rejected_value.contains("team"))
+        );
+        Ok(())
     }
 
     // Test 25/26/27: mcp_listener.principals Intersection-by-key (R2).
     #[test]
-    fn test_mcp_listener_principals_allows_removal_rejects_addition_and_field_change() {
+    fn test_mcp_listener_principals_allows_removal_rejects_addition_and_field_change() -> TestResult
+    {
         use crate::auth_toml::SecretRef;
         use crate::harness_config::McpPrincipalToml;
         use std::str::FromStr;
 
         let p1 = McpPrincipalToml {
             id: "p1".to_owned(),
-            credential_ref: SecretRef::from_str("env:P1_TOKEN").unwrap(),
+            credential_ref: SecretRef::from_str("env:P1_TOKEN").map_err(ctx("env:P1_TOKEN"))?,
             tenant: "mia".to_owned(),
             workspace: "harwness".to_owned(),
             job_capabilities: vec![],
         };
         let p2 = McpPrincipalToml {
             id: "p2".to_owned(),
-            credential_ref: SecretRef::from_str("env:P2_TOKEN").unwrap(),
+            credential_ref: SecretRef::from_str("env:P2_TOKEN").map_err(ctx("env:P2_TOKEN"))?,
             tenant: "mia".to_owned(),
             workspace: "harwness".to_owned(),
             job_capabilities: vec![],
@@ -1616,7 +1787,7 @@ mod tests {
                 tenant = "mia"
                 workspace = "harwness"
             "#,
-        );
+        )?;
         let diagnostics = merge_layer_into(
             &mut trusted,
             incoming,
@@ -1626,13 +1797,17 @@ mod tests {
         );
         assert_eq!(trusted.mcp_listener.principals.len(), 1);
         assert_eq!(trusted.mcp_listener.principals[0].id, "p1");
-        assert!(diagnostics.is_empty(), "removal alone must not be diagnosed");
+        assert!(
+            diagnostics.is_empty(),
+            "removal alone must not be diagnosed"
+        );
+        Ok(())
     }
 
     // Test 21 (Regression): Baseline-Layer setzt die erste Vereinigungsmenge
     // ohne Diagnostic, egal welche Rolle spaeter kommt.
     #[test]
-    fn test_baseline_layer_behaves_like_profile_replaces_for_every_rule() {
+    fn test_baseline_layer_behaves_like_profile_replaces_for_every_rule() -> TestResult {
         let mut trusted = HarnessConfig::default();
         let mut incoming = HarnessConfig::default();
         incoming.mcp_listener.enabled = true;
@@ -1644,7 +1819,7 @@ mod tests {
                 [guards]
                 repeated_failure_warn = 9
             "#,
-        );
+        )?;
         let diagnostics = merge_layer_into(
             &mut trusted,
             incoming,
@@ -1655,5 +1830,6 @@ mod tests {
         assert!(trusted.mcp_listener.enabled);
         assert_eq!(trusted.guards.repeated_failure_warn, Some(9));
         assert!(diagnostics.is_empty());
+        Ok(())
     }
 }

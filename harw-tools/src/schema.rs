@@ -152,38 +152,42 @@ pub enum AdditionalProperties {
 #[cfg(test)]
 mod tests {
     use super::{JsonSchema, JsonSchemaType};
+    use crate::test_support::{TestError, TestResult, ctx};
     use serde_json::json;
     use std::collections::BTreeMap;
 
     #[test]
-    fn default_is_omitted_when_absent() {
+    fn default_is_omitted_when_absent() -> TestResult {
         let schema = JsonSchema {
             schema_type: Some(JsonSchemaType::String),
             ..Default::default()
         };
 
-        let serialized = serde_json::to_value(&schema).expect("schema serializes");
+        let serialized = serde_json::to_value(&schema).map_err(ctx("schema serializes"))?;
 
         assert_eq!(serialized, json!({"type": "string"}));
+        Ok(())
     }
 
     #[test]
-    fn default_round_trips_as_json_value() {
+    fn default_round_trips_as_json_value() -> TestResult {
         let schema = JsonSchema {
             schema_type: Some(JsonSchemaType::Integer),
             default: Some(json!({"limit": 10, "enabled": true})),
             ..Default::default()
         };
 
-        let serialized = serde_json::to_value(&schema).expect("schema serializes");
+        let serialized = serde_json::to_value(&schema).map_err(ctx("schema serializes"))?;
         assert_eq!(
             serialized,
             json!({"type": "integer", "default": {"limit": 10, "enabled": true}})
         );
 
-        let deserialized: JsonSchema = serde_json::from_value(serialized).expect("schema parses");
+        let deserialized: JsonSchema =
+            serde_json::from_value(serialized).map_err(ctx("schema parses"))?;
 
         assert_eq!(deserialized, schema);
+        Ok(())
     }
 
     // Baut ein Objekt-Schema mit einem Pflichtfeld (`path`) und einem
@@ -214,20 +218,27 @@ mod tests {
     }
 
     #[test]
-    fn test_into_strict_required_field_becomes_superset_of_properties() {
+    fn test_into_strict_required_field_becomes_superset_of_properties() -> TestResult {
         let strict = object_with_required_and_optional_field().into_strict();
 
-        let required = strict.required.expect("required present");
+        let required = strict
+            .required
+            .ok_or(TestError::Missing("required present"))?;
         assert_eq!(required, vec!["max_bytes".to_owned(), "path".to_owned()]);
+        Ok(())
     }
 
     #[test]
-    fn test_into_strict_optional_field_becomes_nullable_any_of() {
+    fn test_into_strict_optional_field_becomes_nullable_any_of() -> TestResult {
         let strict = object_with_required_and_optional_field().into_strict();
 
-        let properties = strict.properties.expect("properties present");
-        let max_bytes = properties.get("max_bytes").expect("max_bytes present");
-        let serialized = serde_json::to_value(max_bytes).expect("schema serializes");
+        let properties = strict
+            .properties
+            .ok_or(TestError::Missing("properties present"))?;
+        let max_bytes = properties
+            .get("max_bytes")
+            .ok_or(TestError::Missing("max_bytes present"))?;
+        let serialized = serde_json::to_value(max_bytes).map_err(ctx("schema serializes"))?;
 
         assert_eq!(
             serialized,
@@ -236,17 +247,23 @@ mod tests {
                 "anyOf": [{"type": "integer"}, {"type": "null"}],
             })
         );
+        Ok(())
     }
 
     #[test]
-    fn test_into_strict_required_field_stays_unchanged() {
+    fn test_into_strict_required_field_stays_unchanged() -> TestResult {
         let strict = object_with_required_and_optional_field().into_strict();
 
-        let properties = strict.properties.expect("properties present");
-        let path = properties.get("path").expect("path present");
-        let serialized = serde_json::to_value(path).expect("schema serializes");
+        let properties = strict
+            .properties
+            .ok_or(TestError::Missing("properties present"))?;
+        let path = properties
+            .get("path")
+            .ok_or(TestError::Missing("path present"))?;
+        let serialized = serde_json::to_value(path).map_err(ctx("schema serializes"))?;
 
         assert_eq!(serialized, json!({"type": "string"}));
+        Ok(())
     }
 
     #[test]
@@ -281,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn test_into_strict_recurses_into_nested_object_properties() {
+    fn test_into_strict_recurses_into_nested_object_properties() -> TestResult {
         let mut inner_properties = BTreeMap::new();
         inner_properties.insert(
             "city".to_owned(),
@@ -316,9 +333,9 @@ mod tests {
         let strict = outer.into_strict();
         let address = strict
             .properties
-            .expect("outer properties present")
+            .ok_or(TestError::Missing("outer properties present"))?
             .remove("address")
-            .expect("address present");
+            .ok_or(TestError::Missing("address present"))?;
 
         assert_eq!(
             address.required,
@@ -326,14 +343,15 @@ mod tests {
         );
         let zip = address
             .properties
-            .expect("nested properties present")
+            .ok_or(TestError::Missing("nested properties present"))?
             .remove("zip")
-            .expect("zip present");
+            .ok_or(TestError::Missing("zip present"))?;
         assert!(zip.any_of.is_some());
+        Ok(())
     }
 
     #[test]
-    fn test_into_strict_recurses_into_array_items() {
+    fn test_into_strict_recurses_into_array_items() -> TestResult {
         let mut properties = BTreeMap::new();
         properties.insert(
             "name".to_owned(),
@@ -362,11 +380,12 @@ mod tests {
         };
 
         let strict = array_schema.into_strict();
-        let items = strict.items.expect("items present");
+        let items = strict.items.ok_or(TestError::Missing("items present"))?;
 
         assert_eq!(
             items.required,
             Some(vec!["name".to_owned(), "score".to_owned()])
         );
+        Ok(())
     }
 }

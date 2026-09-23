@@ -444,9 +444,7 @@ impl SessionController for TuiSessionController {
                 active_model: inner.active_model.clone(),
                 active_provider: inner.active_provider.clone(),
                 uia_selection: inner.uia_selection.clone().unwrap_or_default(),
-                interaction_mode: inner
-                    .interaction_mode
-                    .map(|mode| mode.as_str().to_owned()),
+                interaction_mode: inner.interaction_mode.map(|mode| mode.as_str().to_owned()),
             },
             Err(_) => SessionControlSnapshot::empty(),
         }
@@ -488,6 +486,7 @@ fn is_uia_root_identity(has_no_parent: bool, role: Option<AgentRoleId>) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use harw_extension_api::ExtensionRegistryBuilder;
     use harw_types::AgentRole;
     use tokio::sync::mpsc;
@@ -526,75 +525,79 @@ mod tests {
     // ── 2. set_reasoning_effort aktualisiert den Snapshot ────────────────────
 
     #[test]
-    fn test_set_reasoning_effort_updates_snapshot() {
+    fn test_set_reasoning_effort_updates_snapshot() -> TestResult {
         let ctrl = TuiSessionController::new();
         ctrl.set_reasoning_effort(Some(ReasoningEffort::High))
-            .expect("set_reasoning_effort should succeed");
+            .map_err(ctx("set_reasoning_effort should succeed"))?;
         let snap = ctrl.snapshot();
         assert_eq!(
             snap.reasoning_effort,
             Some(ReasoningEffort::High),
             "snapshot must reflect the set reasoning effort"
         );
+        Ok(())
     }
 
     // ── 3. set_active_model aktualisiert den Snapshot ────────────────────────
 
     #[test]
-    fn test_set_active_model_updates_snapshot() {
+    fn test_set_active_model_updates_snapshot() -> TestResult {
         let ctrl = TuiSessionController::new();
         ctrl.set_active_model("claude-opus-4".to_owned())
-            .expect("set_active_model should succeed");
+            .map_err(ctx("set_active_model should succeed"))?;
         let snap = ctrl.snapshot();
         assert_eq!(
             snap.active_model.as_deref(),
             Some("claude-opus-4"),
             "snapshot must reflect the set model id"
         );
+        Ok(())
     }
 
     // ── 4. set_active_provider aktualisiert den Snapshot ─────────────────────
 
     #[test]
-    fn test_set_active_provider_updates_snapshot() {
+    fn test_set_active_provider_updates_snapshot() -> TestResult {
         let ctrl = TuiSessionController::new();
         ctrl.set_active_provider("anthropic".to_owned())
-            .expect("set_active_provider should succeed");
+            .map_err(ctx("set_active_provider should succeed"))?;
         let snap = ctrl.snapshot();
         assert_eq!(
             snap.active_provider.as_deref(),
             Some("anthropic"),
             "snapshot must reflect the set provider id"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_uia_selection_is_separate_and_prioritized_only_for_uia_root() {
+    fn test_uia_selection_is_separate_and_prioritized_only_for_uia_root() -> TestResult {
         let ctrl = TuiSessionController::new();
         ctrl.set_active_model("generic-model".to_owned())
-            .expect("generic model setter should succeed");
+            .map_err(ctx("generic model setter should succeed"))?;
         ctrl.set_uia_selection(UiaSelection::new(
             Some("uia-provider".to_owned()),
             Some("uia-model".to_owned()),
         ))
-        .expect("UIA selection setter should succeed");
+        .map_err(ctx("UIA selection setter should succeed"))?;
 
         let snap = ctrl.snapshot();
         assert_eq!(snap.active_model.as_deref(), Some("generic-model"));
         assert_eq!(snap.uia_selection.model(), Some("uia-model"));
         assert!(is_uia_root_identity(true, Some(AgentRoleId::UserInterface)));
+        Ok(())
     }
 
     #[test]
-    fn test_uia_selection_is_not_applied_to_child_sessions() {
+    fn test_uia_selection_is_not_applied_to_child_sessions() -> TestResult {
         let ctrl = TuiSessionController::new();
         ctrl.set_active_model("generic-model".to_owned())
-            .expect("generic model setter should succeed");
+            .map_err(ctx("generic model setter should succeed"))?;
         ctrl.set_uia_selection(UiaSelection::new(
             Some("uia-provider".to_owned()),
             Some("uia-model".to_owned()),
         ))
-        .expect("UIA selection setter should succeed");
+        .map_err(ctx("UIA selection setter should succeed"))?;
 
         let (event_tx, _rx) = mpsc::unbounded_channel();
         let mut child = AgentSession::new(
@@ -605,16 +608,20 @@ mod tests {
         );
         ctrl.apply_to_session(&mut child);
         assert_eq!(child.active_model(), Some(&ModelId::from("generic-model")));
-        assert!(!is_uia_root_identity(false, Some(AgentRoleId::UserInterface)));
+        assert!(!is_uia_root_identity(
+            false,
+            Some(AgentRoleId::UserInterface)
+        ));
+        Ok(())
     }
 
     // ── 5. apply_to_session überträgt reasoning_effort auf AgentSession ──────
 
     #[test]
-    fn test_apply_to_session_moves_reasoning_effort_to_agent_session() {
+    fn test_apply_to_session_moves_reasoning_effort_to_agent_session() -> TestResult {
         let ctrl = TuiSessionController::new();
         ctrl.set_reasoning_effort(Some(ReasoningEffort::Medium))
-            .expect("set_reasoning_effort should succeed");
+            .map_err(ctx("set_reasoning_effort should succeed"))?;
 
         let mut session = test_session();
         assert_eq!(
@@ -633,6 +640,7 @@ mod tests {
             Some(ReasoningEffort::Medium),
             "session must reflect the applied reasoning effort"
         );
+        Ok(())
     }
 
     // ── 6. apply_to_session ist No-op wenn keine Mutation ansteht ────────────
@@ -658,10 +666,10 @@ mod tests {
     // ── 7. Zweiter Apply nach Apply ist No-op (generation == applied_generation) ──
 
     #[test]
-    fn test_apply_to_session_second_apply_is_noop_after_drain() {
+    fn test_apply_to_session_second_apply_is_noop_after_drain() -> TestResult {
         let ctrl = TuiSessionController::new();
         ctrl.set_reasoning_effort(Some(ReasoningEffort::Low))
-            .expect("set should succeed");
+            .map_err(ctx("set should succeed"))?;
 
         let mut session = test_session();
         let first = ctrl.apply_to_session(&mut session);
@@ -681,6 +689,7 @@ mod tests {
             Some(ReasoningEffort::High),
             "session must not be overwritten by a no-op apply"
         );
+        Ok(())
     }
 
     // ── 8. with_snapshot vorbelegt Zustand korrekt ───────────────────────────
@@ -705,12 +714,12 @@ mod tests {
     // ── 9. Arc-Clone teilt denselben Zustand ─────────────────────────────────
 
     #[test]
-    fn test_arc_clone_shares_state() {
+    fn test_arc_clone_shares_state() -> TestResult {
         let ctrl = Arc::new(TuiSessionController::new());
         let ctrl2 = Arc::clone(&ctrl);
 
         ctrl.set_active_model("shared-model".to_owned())
-            .expect("set_active_model should succeed");
+            .map_err(ctx("set_active_model should succeed"))?;
 
         let snap = ctrl2.snapshot();
         assert_eq!(
@@ -718,31 +727,33 @@ mod tests {
             Some("shared-model"),
             "Arc clone must observe mutations made via the original handle"
         );
+        Ok(())
     }
 
     // ── 10. set_reasoning_effort None löscht gesetzten Wert ──────────────────
 
     #[test]
-    fn test_set_reasoning_effort_none_clears_previous_value() {
+    fn test_set_reasoning_effort_none_clears_previous_value() -> TestResult {
         let ctrl = TuiSessionController::new();
         ctrl.set_reasoning_effort(Some(ReasoningEffort::High))
-            .expect("initial set should succeed");
+            .map_err(ctx("initial set should succeed"))?;
         ctrl.set_reasoning_effort(None)
-            .expect("clearing effort should succeed");
+            .map_err(ctx("clearing effort should succeed"))?;
         assert_eq!(
             ctrl.snapshot().reasoning_effort,
             None,
             "snapshot must be None after clearing the reasoning effort"
         );
+        Ok(())
     }
 
     // ── 11. apply_to_session propagates active_model to AgentSession ──────────
 
     #[test]
-    fn apply_to_session_propagates_active_model() {
+    fn apply_to_session_propagates_active_model() -> TestResult {
         let ctrl = TuiSessionController::new();
         ctrl.set_active_model("claude-opus-4".to_owned())
-            .expect("set_active_model should succeed");
+            .map_err(ctx("set_active_model should succeed"))?;
 
         let mut session = test_session();
         assert!(
@@ -760,15 +771,16 @@ mod tests {
             Some(&ModelId::from("claude-opus-4")),
             "session.active_model must equal the model set on the controller"
         );
+        Ok(())
     }
 
     // ── 12. apply_to_session propagates active_provider to AgentSession ───────
 
     #[test]
-    fn apply_to_session_propagates_active_provider() {
+    fn apply_to_session_propagates_active_provider() -> TestResult {
         let ctrl = TuiSessionController::new();
         ctrl.set_active_provider("anthropic".to_owned())
-            .expect("set_active_provider should succeed");
+            .map_err(ctx("set_active_provider should succeed"))?;
 
         let mut session = test_session();
         assert!(
@@ -786,17 +798,18 @@ mod tests {
             Some(&ProviderId::from("anthropic")),
             "session.active_provider must equal the provider set on the controller"
         );
+        Ok(())
     }
 
     // ── 13. apply_to_session clears active_model when set to None ────────────
 
     #[test]
-    fn apply_to_session_clears_active_model_when_set_to_none() {
+    fn apply_to_session_clears_active_model_when_set_to_none() -> TestResult {
         let ctrl = TuiSessionController::new();
 
         // Prime the session with a model via the controller.
         ctrl.set_active_model("claude-opus-4".to_owned())
-            .expect("initial set_active_model should succeed");
+            .map_err(ctx("initial set_active_model should succeed"))?;
         let mut session = test_session();
         ctrl.apply_to_session(&mut session);
         assert_eq!(
@@ -820,9 +833,9 @@ mod tests {
         let ctrl2 = TuiSessionController::with_snapshot(snap_none);
         // with_snapshot initialises both counters to 0, so apply_to_session sees no
         // pending mutation.  We need to trigger a generation bump via any setter.
-        ctrl2
-            .set_reasoning_effort(None)
-            .expect("set_reasoning_effort(None) should succeed to bump generation");
+        ctrl2.set_reasoning_effort(None).map_err(ctx(
+            "set_reasoning_effort(None) should succeed to bump generation",
+        ))?;
 
         let modified = ctrl2.apply_to_session(&mut session);
         assert!(modified, "apply must return true after setter call");
@@ -830,13 +843,14 @@ mod tests {
             session.active_model().is_none(),
             "session.active_model must be None after applying a None snapshot"
         );
+        Ok(())
     }
 
     // ── 14. apply_to_session mit unverändertem Modus lässt die Aktivierung
     //        unangetastet (W2A-01: set_mode schneidet immer von der Basis) ────
 
     #[test]
-    fn test_apply_to_session_same_mode_does_not_reset_activation() {
+    fn test_apply_to_session_same_mode_does_not_reset_activation() -> TestResult {
         use harw_tools::ToolName;
 
         let mut session = test_session();
@@ -853,13 +867,15 @@ mod tests {
             .activation_mut()
             .disable_tool(ToolName::new("shell.exec"));
         assert!(
-            !session.activation().is_tool_enabled(&ToolName::new("shell.exec")),
+            !session
+                .activation()
+                .is_tool_enabled(&ToolName::new("shell.exec")),
             "precondition: tool override must be in effect before apply"
         );
 
         let ctrl = TuiSessionController::new();
         ctrl.request_mode("chat")
-            .expect("chat must be a known mode");
+            .map_err(ctx("chat must be a known mode"))?;
 
         let modified = ctrl.apply_to_session(&mut session);
         assert!(
@@ -872,16 +888,19 @@ mod tests {
             "mode must remain Chat (no change requested)"
         );
         assert!(
-            !session.activation().is_tool_enabled(&ToolName::new("shell.exec")),
+            !session
+                .activation()
+                .is_tool_enabled(&ToolName::new("shell.exec")),
             "requesting the session's current mode must not re-cut activation \
              from the base and must not undo the manual restriction"
         );
+        Ok(())
     }
 
     // ── 15. apply_to_session mit geändertem Modus wendet den Modus an ────────
 
     #[test]
-    fn test_apply_to_session_changed_mode_applies_mode() {
+    fn test_apply_to_session_changed_mode_applies_mode() -> TestResult {
         let mut session = test_session();
         assert_eq!(
             session.mode(),
@@ -891,7 +910,7 @@ mod tests {
 
         let ctrl = TuiSessionController::new();
         ctrl.request_mode("explore")
-            .expect("explore must be a known mode");
+            .map_err(ctx("explore must be a known mode"))?;
 
         let modified = ctrl.apply_to_session(&mut session);
         assert!(
@@ -903,5 +922,6 @@ mod tests {
             InteractionMode::Explore,
             "an actual mode change must still be applied via set_mode"
         );
+        Ok(())
     }
 }

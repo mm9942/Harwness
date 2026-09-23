@@ -111,3 +111,7 @@ pub use freeze_ops::{authorize_freeze, authorize_release, authorize_stage_gated,
 pub use harw_dod_rules::{triage, Finding, RuleChecked, Triaged, Verdict};
 pub use ladder::Ladder;
 pub use submission::{SubmissionError, SubmissionResult, TRIAGE_SUBMISSION_VERSION, TriageSubmission};
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

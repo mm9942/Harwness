@@ -262,6 +262,7 @@ fn collapse_whitespace(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     const HTML_SNIPPET: &str = concat!(
         "<html><head><title>T</title><style>body{color:red}</style></head><body>",
@@ -278,9 +279,15 @@ mod tests {
         let text = html_to_text(HTML_SNIPPET);
         assert!(text.contains("Titel") && text.contains("Absatz"), "{text}");
         for leaked in ["ignoriere", "color:red", "NOSCRIPT-TEXT", "TEMPLATE-TEXT"] {
-            assert!(!text.contains(leaked), "{leaked} darf nicht erscheinen: {text}");
+            assert!(
+                !text.contains(leaked),
+                "{leaked} darf nicht erscheinen: {text}"
+            );
         }
-        assert!(!text.contains('<'), "Tags dürfen nicht übrig bleiben: {text}");
+        assert!(
+            !text.contains('<'),
+            "Tags dürfen nicht übrig bleiben: {text}"
+        );
     }
 
     /// F-037: versteckte Elemente (hidden, aria-hidden, Inline-Stil) entfallen.
@@ -301,8 +308,8 @@ mod tests {
 
     /// Markdown entsteht aus dem bereinigten Dokument.
     #[test]
-    fn test_html_to_markdown_removes_script_and_style() {
-        let markdown = html_to_markdown(HTML_SNIPPET).expect("Konvertierung");
+    fn test_html_to_markdown_removes_script_and_style() -> TestResult {
+        let markdown = html_to_markdown(HTML_SNIPPET).map_err(ctx("Konvertierung"))?;
         assert!(markdown.contains("Titel"), "{markdown}");
         assert!(
             markdown.contains("**Absatz**") || markdown.contains("__Absatz__"),
@@ -311,6 +318,7 @@ mod tests {
         for leaked in ["ignoriere", "color:red", "NOSCRIPT-TEXT", "TEMPLATE-TEXT"] {
             assert!(!markdown.contains(leaked), "{leaked} in {markdown}");
         }
+        Ok(())
     }
 
     /// `sanitize_html` lässt sichtbare Struktur stehen und entfernt den Rest.
@@ -318,7 +326,10 @@ mod tests {
     fn test_sanitize_html_keeps_visible_markup() {
         let clean = sanitize_html("<p id=\"a\">x</p><div style=\"display:none\">y</div>");
         assert!(clean.contains("<p id=\"a\">x</p>"), "{clean}");
-        assert!(!clean.contains(">y<") && !clean.contains("display"), "{clean}");
+        assert!(
+            !clean.contains(">y<") && !clean.contains("display"),
+            "{clean}"
+        );
     }
 
     /// Kappung an einer Mehrbyte-Grenze schneidet vor dem Zeichen.

@@ -302,12 +302,12 @@ impl EdgeIndex {
 
     /// Bringt ein Kantentripel in eine kanonische, reihenfolgeunabhängige
     /// Form.
-    fn normalize(a: ChunkDigest, b: ChunkDigest, kind: EdgeKind) -> (ChunkDigest, ChunkDigest, EdgeKind) {
-        if a <= b {
-            (a, b, kind)
-        } else {
-            (b, a, kind)
-        }
+    fn normalize(
+        a: ChunkDigest,
+        b: ChunkDigest,
+        kind: EdgeKind,
+    ) -> (ChunkDigest, ChunkDigest, EdgeKind) {
+        if a <= b { (a, b, kind) } else { (b, a, kind) }
     }
 }
 
@@ -327,17 +327,18 @@ pub struct Packed {
 mod tests {
     use super::*;
     use crate::chunk::{ByteSpan, SourceRef};
+    use crate::test_support::{TestResult, ctx};
     use harw_types::ContentDigest;
 
-    fn sample_chunk(text: &str) -> Chunk {
-        Chunk {
+    fn sample_chunk(text: &str) -> TestResult<Chunk> {
+        Ok(Chunk {
             digest: ChunkDigest(ContentDigest::of(text.as_bytes())),
             source: SourceRef::File {
                 path: "a.txt".to_owned(),
             },
-            span: ByteSpan::new(0, text.len()).expect("valid span"),
+            span: ByteSpan::new(0, text.len()).map_err(ctx("valid span"))?,
             text: text.to_owned(),
-        }
+        })
     }
 
     #[test]
@@ -406,19 +407,20 @@ mod tests {
     }
 
     #[test]
-    fn test_ranked_clone_and_equality() {
+    fn test_ranked_clone_and_equality() -> TestResult {
         let ranked = Ranked {
-            chunk: sample_chunk("hello"),
+            chunk: sample_chunk("hello")?,
             score: 0.5,
         };
         assert_eq!(ranked.clone(), ranked);
+        Ok(())
     }
 
     #[test]
-    fn test_packed_equality_over_selected_spent_dropped() {
+    fn test_packed_equality_over_selected_spent_dropped() -> TestResult {
         let packed_a = Packed {
             selected: vec![Ranked {
-                chunk: sample_chunk("hello"),
+                chunk: sample_chunk("hello")?,
                 score: 1.0,
             }],
             spent: CostEstimate(2),
@@ -430,5 +432,6 @@ mod tests {
             dropped: 1,
         };
         assert_eq!(packed_a, packed_b);
+        Ok(())
     }
 }

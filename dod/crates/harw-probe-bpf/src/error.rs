@@ -1,14 +1,15 @@
 //! Fehlertyp der eBPF-Sonde `harw-probe-bpf`.
 //!
 //! # Verantwortungsbereich
-//! [`ProbeError`] ist der eine Fehlertyp dieses Binaries. Er deckt vier
+//! [`ProbeError`] ist der eine Fehlertyp dieses Binaries. Er deckt fünf
 //! Quellen ab: die Landlock-Durchsetzung ([`crate::landlock`]), den
 //! (nach Aufgabenstellung nicht gebauten) realen eBPF-Ladeteil
 //! ([`crate::real_loader`]) samt eines fehlgeschlagenen `load()`-Aufrufs auf
 //! einem echten oder Fixture-`harw_dod_bpf::BpfLoader`
 //! ([`crate::sensors`]), den Sendeweg zum Sentinel ([`crate::sink`]) und
 //! Sensorfehler aus der Sammelschleife ([`crate::collect`], über
-//! `harw_dod_cap::SensorError`). Kommandozeilenfehler gehören **nicht**
+//! `harw_dod_cap::SensorError`) sowie den `completions`-Unterbefehl (über
+//! `harw_completions::CompletionError`). Kommandozeilenfehler gehören **nicht**
 //! hierher — `clap::Error` behandelt `main` direkt, ohne Umweg über diesen
 //! Typ (Muster: `harw-sentinel/src/main.rs`, `harw-probe-fs/src/main.rs`).
 //!
@@ -28,10 +29,11 @@
 //! Die Form bleibt trotzdem an der Makro-Konvention dieses Workspace
 //! ausgerichtet: `#[from]`-artige Konvertierung gibt es nur für
 //! Ein-Feld-Tupel-Varianten ([`ProbeError::BpfLoad`],
-//! [`ProbeError::EventEncodeFailed`], [`ProbeError::Sensor`]), nie für ein
+//! [`ProbeError::EventEncodeFailed`], [`ProbeError::Sensor`],
+//! [`ProbeError::Completions`]), nie für ein
 //! benanntes Feld — auf einem benannten Feld wäre ein `#[from]` des Makros
 //! ohnehin inert (kompiliert, erzeugt aber still kein `From`). Diese Datei
-//! schreibt die `From`-Impls für genau diese drei Varianten von Hand nach.
+//! schreibt die `From`-Impls für genau diese vier Varianten von Hand nach.
 //!
 //! # Inhaltsfreiheit
 //! [`ProbeError::BpfLoad`] und [`ProbeError::Sensor`] sind inhaltsfrei
@@ -40,6 +42,8 @@
 //! wie `harw-probe-fs::error::ProbeError::SentinelConnectFailed` (den vom
 //! Betreiber selbst konfigurierten Socket-Pfad) — kein Dateiinhalt, kein vom
 //! Host gelesenes Geheimnis, kein Rohereignisbyte.
+//! [`ProbeError::Completions`] trägt höchstens Pfade der Shell-
+//! Konfiguration des aufrufenden Nutzers (Completion-Datei, rc-Datei).
 //!
 //! # Exportierte Typen
 //! [`ProbeError`].
@@ -106,6 +110,14 @@ pub enum ProbeError {
     ///   als auch bei `sensors::FlowSensor::poll`. Über
     ///   `std::error::Error::source()` verlinkt.
     Sensor(harw_dod_cap::SensorError),
+
+    /// Der `completions`-Unterbefehl ist gescheitert (Skriptausgabe,
+    /// Installation oder Deinstallation).
+    ///
+    /// # Arguments
+    /// - `source` (`harw_completions::CompletionError`): die zugrunde
+    ///   liegende Ursache. Über `std::error::Error::source()` verlinkt.
+    Completions(harw_completions::CompletionError),
 }
 
 impl fmt::Display for ProbeError {
@@ -124,6 +136,7 @@ impl fmt::Display for ProbeError {
                 write!(f, "failed to encode a security event as JSON: {source}")
             }
             Self::Sensor(source) => write!(f, "sensor error: {source}"),
+            Self::Completions(source) => write!(f, "shell completions failed: {source}"),
         }
     }
 }
@@ -140,6 +153,7 @@ impl std::error::Error for ProbeError {
             Self::BpfLoad(source) => Some(source),
             Self::EventEncodeFailed(source) => Some(source),
             Self::Sensor(source) => Some(source),
+            Self::Completions(source) => Some(source),
             _ => None,
         }
     }
@@ -163,9 +177,16 @@ impl From<serde_json::Error> for ProbeError {
     }
 }
 
+impl From<harw_completions::CompletionError> for ProbeError {
+    fn from(err: harw_completions::CompletionError) -> Self {
+        Self::Completions(err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ProbeError;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn test_landlock_unavailable_display_is_exact() {
@@ -231,12 +252,16 @@ mod tests {
     }
 
     #[test]
-    fn test_from_serde_json_error_wraps_into_event_encode_failed() {
-        let json_err = serde_json::from_str::<serde_json::Value>("{not valid json")
-            .expect_err("deliberately malformed JSON");
+    fn test_from_serde_json_error_wraps_into_event_encode_failed() -> TestResult {
+        let Err(json_err) = serde_json::from_str::<serde_json::Value>("{not valid json") else {
+            return Err(TestError::Unexpected(
+                "deliberately malformed JSON must fail to parse".to_owned(),
+            ));
+        };
         let mapped: ProbeError = json_err.into();
         assert!(matches!(mapped, ProbeError::EventEncodeFailed(_)));
         assert!(std::error::Error::source(&mapped).is_some());
+        Ok(())
     }
 
     #[test]

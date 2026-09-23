@@ -111,15 +111,28 @@ impl ConfigWriter {
     /// # Arguments
     /// - `mode` (`&str`): sollte `ask`, `auto` oder `full` sein;
     ///   `PermissionsSection::validate` prüft dies erst bei `save()`.
-    pub fn set_default_mode(&mut self, mode: &str) {
-        self.permissions_table().insert("default_mode", value(mode));
+    ///
+    /// # Errors
+    /// - [`ConfigError::WriterShapeMismatch`]: interner Invariantenbruch
+    ///   beim Normalisieren von `[permissions]` zu einer Tabelle (siehe
+    ///   [`ensure_table`]; sollte bei ausschließlicher Nutzung dieser API
+    ///   nie auftreten).
+    pub fn set_default_mode(&mut self, mode: &str) -> ConfigResult<()> {
+        self.permissions_table()?
+            .insert("default_mode", value(mode));
+        Ok(())
     }
 
     /// Setzt `[permissions] approval_timeout_secs`.
-    pub fn set_approval_timeout(&mut self, secs: u64) {
+    ///
+    /// # Errors
+    /// - [`ConfigError::WriterShapeMismatch`][]: siehe
+    ///   [`ConfigWriter::set_default_mode`].
+    pub fn set_approval_timeout(&mut self, secs: u64) -> ConfigResult<()> {
         let as_i64 = i64::try_from(secs).unwrap_or(i64::MAX);
-        self.permissions_table()
+        self.permissions_table()?
             .insert("approval_timeout_secs", value(as_i64));
+        Ok(())
     }
 
     /// Hängt `rule` an `[[permissions.allow]]` bzw. `[[permissions.deny]]` an.
@@ -128,13 +141,17 @@ impl ConfigWriter {
     /// `true`, wenn die Regel neu angehängt wurde; `false`, wenn eine
     /// identische Regel (`tool` **und** `pattern`) bereits vorhanden war
     /// (kein Duplikat, keine Änderung).
-    pub fn append_rule(&mut self, kind: RuleKind, rule: &RuleToml) -> bool {
-        let array = self.rule_array(kind);
+    ///
+    /// # Errors
+    /// - [`ConfigError::WriterShapeMismatch`][]: siehe
+    ///   [`ConfigWriter::set_default_mode`].
+    pub fn append_rule(&mut self, kind: RuleKind, rule: &RuleToml) -> ConfigResult<bool> {
+        let array = self.rule_array(kind)?;
         if rule_array_contains(array, rule) {
-            return false;
+            return Ok(false);
         }
         array.push(rule_to_table(rule));
-        true
+        Ok(true)
     }
 
     /// Entfernt die Regel an `index` aus `[[permissions.allow]]` bzw.
@@ -143,12 +160,16 @@ impl ConfigWriter {
     /// # Returns
     /// Die entfernte Regel, oder `None`, wenn `index` außerhalb der aktuellen
     /// Länge liegt (keine Änderung).
-    pub fn remove_rule(&mut self, kind: RuleKind, index: usize) -> Option<RuleToml> {
-        let array = self.rule_array(kind);
+    ///
+    /// # Errors
+    /// - [`ConfigError::WriterShapeMismatch`][]: siehe
+    ///   [`ConfigWriter::set_default_mode`].
+    pub fn remove_rule(&mut self, kind: RuleKind, index: usize) -> ConfigResult<Option<RuleToml>> {
+        let array = self.rule_array(kind)?;
         if index >= array.len() {
-            return None;
+            return Ok(None);
         }
-        Some(table_to_rule(&array.remove(index)))
+        Ok(Some(table_to_rule(&array.remove(index))))
     }
 
     /// Hängt `root` an `[permissions] extra_roots` an.
@@ -156,14 +177,18 @@ impl ConfigWriter {
     /// # Returns
     /// `true`, wenn der Pfad neu angehängt wurde; `false`, wenn er bereits
     /// enthalten war.
-    pub fn append_extra_root(&mut self, root: &Path) -> bool {
+    ///
+    /// # Errors
+    /// - [`ConfigError::WriterShapeMismatch`][]: siehe
+    ///   [`ConfigWriter::set_default_mode`].
+    pub fn append_extra_root(&mut self, root: &Path) -> ConfigResult<bool> {
         let root_str = root.to_string_lossy().into_owned();
-        let array = self.extra_roots_array();
+        let array = self.extra_roots_array()?;
         if array_contains_str(array, &root_str) {
-            return false;
+            return Ok(false);
         }
         array.push(root_str);
-        true
+        Ok(true)
     }
 
     /// Entfernt `root` aus `[permissions] extra_roots`.
@@ -171,25 +196,33 @@ impl ConfigWriter {
     /// # Returns
     /// `true`, wenn der Pfad entfernt wurde; `false`, wenn er nicht
     /// enthalten war.
-    pub fn remove_extra_root(&mut self, root: &Path) -> bool {
+    ///
+    /// # Errors
+    /// - [`ConfigError::WriterShapeMismatch`][]: siehe
+    ///   [`ConfigWriter::set_default_mode`].
+    pub fn remove_extra_root(&mut self, root: &Path) -> ConfigResult<bool> {
         let root_str = root.to_string_lossy().into_owned();
-        let array = self.extra_roots_array();
-        match array_index_of_str(array, &root_str) {
+        let array = self.extra_roots_array()?;
+        Ok(match array_index_of_str(array, &root_str) {
             Some(index) => {
                 array.remove(index);
                 true
             }
             None => false,
-        }
+        })
     }
 
     /// Setzt einen beliebigen Wert über einen punktgetrennten Schlüsselpfad
     /// (z. B. `"permissions.default_mode"`). Zwischentabellen entstehen bei
     /// Bedarf; ein Nicht-Tabellen-Wert auf dem Pfad wird durch eine leere
     /// Tabelle ersetzt.
-    pub fn set_value(&mut self, dotted_key: &str, item: Item) {
+    ///
+    /// # Errors
+    /// - [`ConfigError::WriterShapeMismatch`][]: siehe
+    ///   [`ConfigWriter::set_default_mode`].
+    pub fn set_value(&mut self, dotted_key: &str, item: Item) -> ConfigResult<()> {
         let segments: Vec<&str> = dotted_key.split('.').collect();
-        set_value_in_table(self.doc.as_table_mut(), &segments, item);
+        set_value_in_table(self.doc.as_table_mut(), &segments, item)
     }
 
     /// Entfernt einen per Punktnotation adressierten Wert, falls er existiert.
@@ -234,9 +267,12 @@ impl ConfigWriter {
     pub fn save(&self) -> ConfigResult<()> {
         let rendered = self.doc.to_string();
 
-        let parsed: PermissionsOnlyDocument = toml::from_str(&rendered)
-            .map_err(|err| ConfigError::TomlParse(err.to_string()))?;
-        parsed.permissions.validate().map_err(ConfigError::Invalid)?;
+        let parsed: PermissionsOnlyDocument =
+            toml::from_str(&rendered).map_err(|err| ConfigError::TomlParse(err.to_string()))?;
+        parsed
+            .permissions
+            .validate()
+            .map_err(ConfigError::Invalid)?;
 
         rotate_backups(&self.path)?;
         harw_fsutil::write_atomic(
@@ -249,21 +285,32 @@ impl ConfigWriter {
 
     /// Liefert `[permissions]` als veränderliche Tabelle, legt sie bei
     /// Bedarf an.
-    fn permissions_table(&mut self) -> &mut Table {
+    ///
+    /// # Errors
+    /// - [`ConfigError::WriterShapeMismatch`]: siehe [`ensure_table`].
+    fn permissions_table(&mut self) -> ConfigResult<&mut Table> {
         ensure_table(self.doc.as_table_mut(), "permissions")
     }
 
     /// Liefert `[[permissions.allow]]`/`[[permissions.deny]]` als
     /// veränderliches Array-of-Tables, legt es bei Bedarf an.
-    fn rule_array(&mut self, kind: RuleKind) -> &mut ArrayOfTables {
-        let permissions = ensure_table(self.doc.as_table_mut(), "permissions");
+    ///
+    /// # Errors
+    /// - [`ConfigError::WriterShapeMismatch`]: siehe [`ensure_table`] bzw.
+    ///   [`ensure_array_of_tables`].
+    fn rule_array(&mut self, kind: RuleKind) -> ConfigResult<&mut ArrayOfTables> {
+        let permissions = ensure_table(self.doc.as_table_mut(), "permissions")?;
         ensure_array_of_tables(permissions, kind.table_key())
     }
 
     /// Liefert `[permissions] extra_roots` als veränderliches Array, legt es
     /// bei Bedarf an.
-    fn extra_roots_array(&mut self) -> &mut Array {
-        let permissions = ensure_table(self.doc.as_table_mut(), "permissions");
+    ///
+    /// # Errors
+    /// - [`ConfigError::WriterShapeMismatch`]: siehe [`ensure_table`] bzw.
+    ///   [`ensure_array`].
+    fn extra_roots_array(&mut self) -> ConfigResult<&mut Array> {
+        let permissions = ensure_table(self.doc.as_table_mut(), "permissions")?;
         ensure_array(permissions, "extra_roots")
     }
 }
@@ -280,51 +327,82 @@ struct PermissionsOnlyDocument {
 /// Stellt sicher, dass `table[key]` eine Tabelle ist (legt sie an oder
 /// ersetzt einen Nicht-Tabellen-Wert), und gibt eine veränderliche Referenz
 /// darauf zurück.
-fn ensure_table<'a>(table: &'a mut Table, key: &str) -> &'a mut Table {
+///
+/// # Errors
+/// - [`ConfigError::WriterShapeMismatch`]: `table[key]` wurde gerade erst
+///   auf eine Tabelle normalisiert, ließ sich aber nicht als Tabelle
+///   zurücklesen — ein interner Invariantenbruch, der bei ausschließlicher
+///   Nutzung von `toml_edit::Table::insert`/`get_mut` hier nicht auftreten
+///   sollte.
+fn ensure_table<'a>(table: &'a mut Table, key: &str) -> ConfigResult<&'a mut Table> {
     if !matches!(table.get(key), Some(item) if item.is_table()) {
         table.insert(key, Item::Table(Table::new()));
     }
-    match table.get_mut(key).and_then(Item::as_table_mut) {
-        Some(t) => t,
-        None => unreachable!("key {key:?} was just normalised to a table"),
-    }
+    table
+        .get_mut(key)
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| ConfigError::WriterShapeMismatch {
+            key: key.to_owned(),
+            expected: "table",
+        })
 }
 
 /// Stellt sicher, dass `table[key]` ein Array-of-Tables ist, und gibt eine
 /// veränderliche Referenz darauf zurück.
-fn ensure_array_of_tables<'a>(table: &'a mut Table, key: &str) -> &'a mut ArrayOfTables {
+///
+/// # Errors
+/// - [`ConfigError::WriterShapeMismatch`]: siehe [`ensure_table`], hier für
+///   `expected = "array of tables"`.
+fn ensure_array_of_tables<'a>(
+    table: &'a mut Table,
+    key: &str,
+) -> ConfigResult<&'a mut ArrayOfTables> {
     if !matches!(table.get(key), Some(item) if item.is_array_of_tables()) {
         table.insert(key, Item::ArrayOfTables(ArrayOfTables::new()));
     }
-    match table.get_mut(key).and_then(Item::as_array_of_tables_mut) {
-        Some(a) => a,
-        None => unreachable!("key {key:?} was just normalised to an array of tables"),
-    }
+    table
+        .get_mut(key)
+        .and_then(Item::as_array_of_tables_mut)
+        .ok_or_else(|| ConfigError::WriterShapeMismatch {
+            key: key.to_owned(),
+            expected: "array of tables",
+        })
 }
 
 /// Stellt sicher, dass `table[key]` ein Inline-Array ist, und gibt eine
 /// veränderliche Referenz darauf zurück.
-fn ensure_array<'a>(table: &'a mut Table, key: &str) -> &'a mut Array {
+///
+/// # Errors
+/// - [`ConfigError::WriterShapeMismatch`]: siehe [`ensure_table`], hier für
+///   `expected = "array"`.
+fn ensure_array<'a>(table: &'a mut Table, key: &str) -> ConfigResult<&'a mut Array> {
     if !matches!(table.get(key), Some(item) if item.is_array()) {
         table.insert(key, Item::Value(Value::Array(Array::new())));
     }
-    match table.get_mut(key).and_then(Item::as_array_mut) {
-        Some(a) => a,
-        None => unreachable!("key {key:?} was just normalised to an array"),
-    }
+    table
+        .get_mut(key)
+        .and_then(Item::as_array_mut)
+        .ok_or_else(|| ConfigError::WriterShapeMismatch {
+            key: key.to_owned(),
+            expected: "array",
+        })
 }
 
 /// Setzt `item` rekursiv unter `segments` in `table` (letztes Segment =
 /// Blattschlüssel); Zwischensegmente werden über [`ensure_table`] normalisiert.
-fn set_value_in_table(table: &mut Table, segments: &[&str], item: Item) {
+///
+/// # Errors
+/// - [`ConfigError::WriterShapeMismatch`]: siehe [`ensure_table`].
+fn set_value_in_table(table: &mut Table, segments: &[&str], item: Item) -> ConfigResult<()> {
     match segments {
-        [] => {}
+        [] => Ok(()),
         [last] => {
             table.insert(last, item);
+            Ok(())
         }
         [head, rest @ ..] => {
-            let child = ensure_table(table, head);
-            set_value_in_table(child, rest, item);
+            let child = ensure_table(table, head)?;
+            set_value_in_table(child, rest, item)
         }
     }
 }
@@ -361,7 +439,10 @@ fn table_to_rule(table: &Table) -> RuleToml {
             .and_then(Item::as_str)
             .unwrap_or_default()
             .to_owned(),
-        pattern: table.get("pattern").and_then(Item::as_str).map(str::to_owned),
+        pattern: table
+            .get("pattern")
+            .and_then(Item::as_str)
+            .map(str::to_owned),
     }
 }
 
@@ -477,225 +558,299 @@ fn collect_backup_numbers(path: &Path) -> ConfigResult<Vec<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn temp_config_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
         dir.path().join(name)
     }
 
     #[test]
-    fn test_open_missing_file_creates_private_parent_dir() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_open_missing_file_creates_private_parent_dir() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let nested = dir.path().join("nested").join("config.toml");
 
-        let writer = ConfigWriter::open(&nested).expect("open missing file");
+        let writer = ConfigWriter::open(&nested).map_err(ctx("open missing file"))?;
         assert!(!nested.exists());
-        let parent_mode = fs::metadata(nested.parent().expect("parent"))
-            .expect("parent metadata")
+        let parent = nested.parent().ok_or(TestError::Missing("parent"))?;
+        let parent_mode = fs::metadata(parent)
+            .map_err(ctx("parent metadata"))?
             .permissions()
             .mode()
             & 0o777;
         assert_eq!(parent_mode, 0o700);
         assert!(writer.get_value("permissions.default_mode").is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_set_default_mode_and_save_round_trips() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_set_default_mode_and_save_round_trips() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let path = temp_config_path(&dir, "config.toml");
 
-        let mut writer = ConfigWriter::open(&path).expect("open");
-        writer.set_default_mode("auto");
-        writer.save().expect("save");
+        let mut writer = ConfigWriter::open(&path).map_err(ctx("open"))?;
+        writer
+            .set_default_mode("auto")
+            .map_err(ctx("set_default_mode"))?;
+        writer.save().map_err(ctx("save"))?;
 
-        let reopened = ConfigWriter::open(&path).expect("reopen");
+        let reopened = ConfigWriter::open(&path).map_err(ctx("reopen"))?;
         assert_eq!(
             reopened.get_value("permissions.default_mode"),
             Some("auto".to_owned())
         );
+        Ok(())
     }
 
     #[test]
-    fn test_save_preserves_existing_comment() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_save_preserves_existing_comment() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let path = temp_config_path(&dir, "config.toml");
         fs::write(
             &path,
             "# wichtiger Kommentar\ndefault_provider = \"anthropic\"\n",
         )
-        .expect("seed file");
+        .map_err(ctx("seed file"))?;
 
-        let mut writer = ConfigWriter::open(&path).expect("open");
-        writer.set_default_mode("ask");
-        writer.save().expect("save");
+        let mut writer = ConfigWriter::open(&path).map_err(ctx("open"))?;
+        writer
+            .set_default_mode("ask")
+            .map_err(ctx("set_default_mode"))?;
+        writer.save().map_err(ctx("save"))?;
 
-        let content = fs::read_to_string(&path).expect("read back");
+        let content = fs::read_to_string(&path).map_err(ctx("read back"))?;
         assert!(content.contains("# wichtiger Kommentar"));
         assert!(content.contains("default_provider = \"anthropic\""));
         assert!(content.contains("default_mode = \"ask\""));
+        Ok(())
     }
 
     #[test]
-    fn test_save_creates_first_backup_as_bak_1() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_save_creates_first_backup_as_bak_1() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let path = temp_config_path(&dir, "config.toml");
-        fs::write(&path, "default_provider = \"anthropic\"\n").expect("seed file");
+        fs::write(&path, "default_provider = \"anthropic\"\n").map_err(ctx("seed file"))?;
 
-        let mut writer = ConfigWriter::open(&path).expect("open");
-        writer.set_default_mode("ask");
-        writer.save().expect("save");
+        let mut writer = ConfigWriter::open(&path).map_err(ctx("open"))?;
+        writer
+            .set_default_mode("ask")
+            .map_err(ctx("set_default_mode"))?;
+        writer.save().map_err(ctx("save"))?;
 
         assert!(backup_candidate(&path, 1).exists());
+        Ok(())
     }
 
     #[test]
-    fn test_save_keeps_only_five_newest_backups() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_save_keeps_only_five_newest_backups() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let path = temp_config_path(&dir, "config.toml");
-        fs::write(&path, "default_provider = \"anthropic\"\n").expect("seed file");
+        fs::write(&path, "default_provider = \"anthropic\"\n").map_err(ctx("seed file"))?;
 
         for i in 0..7 {
-            let mut writer = ConfigWriter::open(&path).expect("open");
-            writer.set_approval_timeout(10 + i);
-            writer.save().expect("save");
+            let mut writer = ConfigWriter::open(&path).map_err(ctx("open"))?;
+            writer
+                .set_approval_timeout(10 + i)
+                .map_err(ctx("set_approval_timeout"))?;
+            writer.save().map_err(ctx("save"))?;
         }
 
         for n in 1..=2 {
-            assert!(!backup_candidate(&path, n).exists(), "bak.{n} should be pruned");
+            assert!(
+                !backup_candidate(&path, n).exists(),
+                "bak.{n} should be pruned"
+            );
         }
         for n in 3..=7 {
             assert!(backup_candidate(&path, n).exists(), "bak.{n} should remain");
         }
+        Ok(())
     }
 
     #[test]
-    fn test_append_rule_dedupes_identical_rules() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_append_rule_dedupes_identical_rules() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let path = temp_config_path(&dir, "config.toml");
-        let mut writer = ConfigWriter::open(&path).expect("open");
+        let mut writer = ConfigWriter::open(&path).map_err(ctx("open"))?;
 
         let rule = RuleToml {
             tool: "shell.exec".to_owned(),
             pattern: Some("cargo check".to_owned()),
         };
-        assert!(writer.append_rule(RuleKind::Allow, &rule));
-        assert!(!writer.append_rule(RuleKind::Allow, &rule));
-        writer.save().expect("save");
+        assert!(
+            writer
+                .append_rule(RuleKind::Allow, &rule)
+                .map_err(ctx("append_rule"))?
+        );
+        assert!(
+            !writer
+                .append_rule(RuleKind::Allow, &rule)
+                .map_err(ctx("append_rule dedupe"))?
+        );
+        writer.save().map_err(ctx("save"))?;
 
-        let content = fs::read_to_string(&path).expect("read back");
+        let content = fs::read_to_string(&path).map_err(ctx("read back"))?;
         assert_eq!(content.matches("cargo check").count(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_remove_rule_returns_removed_value_and_shifts_indices() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_remove_rule_returns_removed_value_and_shifts_indices() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let path = temp_config_path(&dir, "config.toml");
-        let mut writer = ConfigWriter::open(&path).expect("open");
+        let mut writer = ConfigWriter::open(&path).map_err(ctx("open"))?;
 
-        writer.append_rule(
-            RuleKind::Deny,
-            &RuleToml {
-                tool: "fs.write".to_owned(),
-                pattern: None,
-            },
-        );
-        writer.append_rule(
-            RuleKind::Deny,
-            &RuleToml {
-                tool: "fs.delete".to_owned(),
-                pattern: None,
-            },
-        );
+        writer
+            .append_rule(
+                RuleKind::Deny,
+                &RuleToml {
+                    tool: "fs.write".to_owned(),
+                    pattern: None,
+                },
+            )
+            .map_err(ctx("append_rule fs.write"))?;
+        writer
+            .append_rule(
+                RuleKind::Deny,
+                &RuleToml {
+                    tool: "fs.delete".to_owned(),
+                    pattern: None,
+                },
+            )
+            .map_err(ctx("append_rule fs.delete"))?;
 
-        let removed = writer.remove_rule(RuleKind::Deny, 0).expect("removed rule");
+        let removed = writer
+            .remove_rule(RuleKind::Deny, 0)
+            .map_err(ctx("remove_rule 0"))?
+            .ok_or(TestError::Missing("removed rule"))?;
         assert_eq!(removed.tool, "fs.write");
-        assert!(writer.remove_rule(RuleKind::Deny, 5).is_none());
+        assert!(
+            writer
+                .remove_rule(RuleKind::Deny, 5)
+                .map_err(ctx("remove_rule 5"))?
+                .is_none()
+        );
 
-        writer.save().expect("save");
-        let content = fs::read_to_string(&path).expect("read back");
+        writer.save().map_err(ctx("save"))?;
+        let content = fs::read_to_string(&path).map_err(ctx("read back"))?;
         assert!(!content.contains("fs.write"));
         assert!(content.contains("fs.delete"));
+        Ok(())
     }
 
     #[test]
-    fn test_append_and_remove_extra_root() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_append_and_remove_extra_root() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let path = temp_config_path(&dir, "config.toml");
-        let mut writer = ConfigWriter::open(&path).expect("open");
+        let mut writer = ConfigWriter::open(&path).map_err(ctx("open"))?;
 
         let root = Path::new("/home/mia/scratch");
-        assert!(writer.append_extra_root(root));
-        assert!(!writer.append_extra_root(root));
-        writer.save().expect("save");
+        assert!(
+            writer
+                .append_extra_root(root)
+                .map_err(ctx("append_extra_root"))?
+        );
+        assert!(
+            !writer
+                .append_extra_root(root)
+                .map_err(ctx("append_extra_root dedupe"))?
+        );
+        writer.save().map_err(ctx("save"))?;
 
-        let reopened_content = fs::read_to_string(&path).expect("read back");
+        let reopened_content = fs::read_to_string(&path).map_err(ctx("read back"))?;
         assert!(reopened_content.contains("/home/mia/scratch"));
 
-        let mut writer = ConfigWriter::open(&path).expect("reopen");
-        assert!(writer.remove_extra_root(root));
-        assert!(!writer.remove_extra_root(root));
-        writer.save().expect("save after removal");
+        let mut writer = ConfigWriter::open(&path).map_err(ctx("reopen"))?;
+        assert!(
+            writer
+                .remove_extra_root(root)
+                .map_err(ctx("remove_extra_root"))?
+        );
+        assert!(
+            !writer
+                .remove_extra_root(root)
+                .map_err(ctx("remove_extra_root again"))?
+        );
+        writer.save().map_err(ctx("save after removal"))?;
 
-        let final_content = fs::read_to_string(&path).expect("read back again");
+        let final_content = fs::read_to_string(&path).map_err(ctx("read back again"))?;
         assert!(!final_content.contains("/home/mia/scratch"));
+        Ok(())
     }
 
     #[test]
-    fn test_invalid_mode_leaves_file_unchanged() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_invalid_mode_leaves_file_unchanged() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let path = temp_config_path(&dir, "config.toml");
-        fs::write(&path, "default_provider = \"anthropic\"\n").expect("seed file");
-        let before = fs::read_to_string(&path).expect("read before");
+        fs::write(&path, "default_provider = \"anthropic\"\n").map_err(ctx("seed file"))?;
+        let before = fs::read_to_string(&path).map_err(ctx("read before"))?;
 
-        let mut writer = ConfigWriter::open(&path).expect("open");
-        writer.set_default_mode("yolo");
+        let mut writer = ConfigWriter::open(&path).map_err(ctx("open"))?;
+        writer
+            .set_default_mode("yolo")
+            .map_err(ctx("set_default_mode"))?;
         let result = writer.save();
         assert!(result.is_err());
 
-        let after = fs::read_to_string(&path).expect("read after failed save");
+        let after = fs::read_to_string(&path).map_err(ctx("read after failed save"))?;
         assert_eq!(before, after);
         assert!(!backup_candidate(&path, 1).exists());
+        Ok(())
     }
 
     #[test]
-    fn test_set_value_and_get_value_dotted_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_set_value_and_get_value_dotted_path() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let path = temp_config_path(&dir, "config.toml");
-        let mut writer = ConfigWriter::open(&path).expect("open");
+        let mut writer = ConfigWriter::open(&path).map_err(ctx("open"))?;
 
-        writer.set_value("workspace.extra_roots_hint", value("/tmp/example"));
+        writer
+            .set_value("workspace.extra_roots_hint", value("/tmp/example"))
+            .map_err(ctx("set_value"))?;
         assert_eq!(
             writer.get_value("workspace.extra_roots_hint"),
             Some("/tmp/example".to_owned())
         );
         assert!(writer.get_value("workspace.missing").is_none());
         assert!(writer.get_value("missing.entirely").is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_remove_value_removes_only_the_requested_dotted_key() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_remove_value_removes_only_the_requested_dotted_key() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let path = temp_config_path(&dir, "config.toml");
-        let mut writer = ConfigWriter::open(&path).expect("open");
-        writer.set_value("harness.uia_provider", value("fireworks"));
-        writer.set_value("harness.uia_model", value("old-model"));
+        let mut writer = ConfigWriter::open(&path).map_err(ctx("open"))?;
+        writer
+            .set_value("harness.uia_provider", value("fireworks"))
+            .map_err(ctx("set_value uia_provider"))?;
+        writer
+            .set_value("harness.uia_model", value("old-model"))
+            .map_err(ctx("set_value uia_model"))?;
 
         assert!(writer.remove_value("harness.uia_model"));
         assert!(!writer.remove_value("harness.uia_model"));
-        assert_eq!(writer.get_value("harness.uia_provider"), Some("fireworks".to_owned()));
+        assert_eq!(
+            writer.get_value("harness.uia_provider"),
+            Some("fireworks".to_owned())
+        );
         assert!(writer.get_value("harness.uia_model").is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_set_value_replaces_non_table_intermediate() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_set_value_replaces_non_table_intermediate() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let path = temp_config_path(&dir, "config.toml");
-        fs::write(&path, "permissions = \"not-a-table\"\n").expect("seed file");
+        fs::write(&path, "permissions = \"not-a-table\"\n").map_err(ctx("seed file"))?;
 
-        let mut writer = ConfigWriter::open(&path).expect("open");
-        writer.set_default_mode("ask");
+        let mut writer = ConfigWriter::open(&path).map_err(ctx("open"))?;
+        writer
+            .set_default_mode("ask")
+            .map_err(ctx("set_default_mode"))?;
         assert_eq!(
             writer.get_value("permissions.default_mode"),
             Some("ask".to_owned())
         );
+        Ok(())
     }
 }

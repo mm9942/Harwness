@@ -63,9 +63,7 @@ impl ResearchSection {
         for host in &self.network_allow_hosts {
             let trimmed = host.trim();
             if trimmed.is_empty() {
-                return Err(
-                    "research.network_allow_hosts enthält einen leeren Eintrag".to_owned(),
-                );
+                return Err("research.network_allow_hosts enthält einen leeren Eintrag".to_owned());
             }
             if trimmed.contains("://") {
                 return Err(format!(
@@ -107,10 +105,11 @@ fn default_cache_ttl() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn test_research_section_defaults_from_empty_toml() {
-        let section: ResearchSection = toml::from_str("").unwrap();
+    fn test_research_section_defaults_from_empty_toml() -> TestResult {
+        let section: ResearchSection = toml::from_str("").map_err(ctx("leeres TOML parsen"))?;
         assert_eq!(
             section.network_allow_hosts,
             vec![
@@ -125,10 +124,11 @@ mod tests {
         assert_eq!(section.fetch_timeout_secs, 20);
         assert_eq!(section.cache_ttl_secs, 3_600);
         assert_eq!(section, ResearchSection::default());
+        Ok(())
     }
 
     #[test]
-    fn test_research_section_full_toml_round_trip() {
+    fn test_research_section_full_toml_round_trip() -> TestResult {
         let src = r#"
             network_allow_hosts = ["docs.rs", "internal.example.test"]
             cargo_registry_read = false
@@ -136,7 +136,7 @@ mod tests {
             fetch_timeout_secs = 5
             cache_ttl_secs = 60
         "#;
-        let section: ResearchSection = toml::from_str(src).unwrap();
+        let section: ResearchSection = toml::from_str(src).map_err(ctx("TOML parsen"))?;
         assert_eq!(
             section.network_allow_hosts,
             vec!["docs.rs".to_owned(), "internal.example.test".to_owned()]
@@ -146,29 +146,43 @@ mod tests {
         assert_eq!(section.fetch_timeout_secs, 5);
         assert_eq!(section.cache_ttl_secs, 60);
 
-        let encoded = toml::to_string(&section).unwrap();
-        let decoded: ResearchSection = toml::from_str(&encoded).unwrap();
+        let encoded = toml::to_string(&section).map_err(ctx("TOML serialisieren"))?;
+        let decoded: ResearchSection =
+            toml::from_str(&encoded).map_err(ctx("serialisiertes TOML parsen"))?;
         assert_eq!(decoded, section);
+        Ok(())
     }
 
     #[test]
-    fn test_research_section_rejects_unknown_field() {
+    fn test_research_section_rejects_unknown_field() -> TestResult {
         let src = r#"
             max_fetch_bytes = 2048
             max_ftech_bytes = 2048
         "#;
-        let error = toml::from_str::<ResearchSection>(src).unwrap_err();
+        let outcome = toml::from_str::<ResearchSection>(src);
+        let Err(error) = outcome else {
+            return Err(TestError::Unexpected(
+                "unbekanntes Feld muss abgelehnt werden".to_owned(),
+            ));
+        };
         assert!(error.to_string().contains("unknown field"));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_empty_allow_hosts() {
+    fn test_validate_rejects_empty_allow_hosts() -> TestResult {
         let section = ResearchSection {
             network_allow_hosts: Vec::new(),
             ..ResearchSection::default()
         };
-        let error = section.validate().unwrap_err();
+        let outcome = section.validate();
+        let Err(error) = outcome else {
+            return Err(TestError::Unexpected(
+                "leere network_allow_hosts müssen abgelehnt werden".to_owned(),
+            ));
+        };
         assert!(error.contains("network_allow_hosts"));
+        Ok(())
     }
 
     #[test]
@@ -181,33 +195,51 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rejects_host_with_scheme_prefix() {
+    fn test_validate_rejects_host_with_scheme_prefix() -> TestResult {
         let section = ResearchSection {
             network_allow_hosts: vec!["http://docs.rs".to_owned()],
             ..ResearchSection::default()
         };
-        let error = section.validate().unwrap_err();
+        let outcome = section.validate();
+        let Err(error) = outcome else {
+            return Err(TestError::Unexpected(
+                "Host mit Schema-Präfix muss abgelehnt werden".to_owned(),
+            ));
+        };
         assert!(error.contains("http://docs.rs"));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_zero_max_fetch_bytes() {
+    fn test_validate_rejects_zero_max_fetch_bytes() -> TestResult {
         let section = ResearchSection {
             max_fetch_bytes: 0,
             ..ResearchSection::default()
         };
-        let error = section.validate().unwrap_err();
+        let outcome = section.validate();
+        let Err(error) = outcome else {
+            return Err(TestError::Unexpected(
+                "max_fetch_bytes = 0 muss abgelehnt werden".to_owned(),
+            ));
+        };
         assert!(error.contains("max_fetch_bytes"));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_zero_fetch_timeout() {
+    fn test_validate_rejects_zero_fetch_timeout() -> TestResult {
         let section = ResearchSection {
             fetch_timeout_secs: 0,
             ..ResearchSection::default()
         };
-        let error = section.validate().unwrap_err();
+        let outcome = section.validate();
+        let Err(error) = outcome else {
+            return Err(TestError::Unexpected(
+                "fetch_timeout_secs = 0 muss abgelehnt werden".to_owned(),
+            ));
+        };
         assert!(error.contains("fetch_timeout_secs"));
+        Ok(())
     }
 
     #[test]

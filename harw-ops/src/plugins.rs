@@ -132,7 +132,11 @@ async fn plugins(ctx: &OpContext, args: PluginsArgs) -> Result<OpOutput, OpError
             let mut lines = vec![format!("{} konfigurierte(s) Plugin(s):", names.len())];
             for name in names {
                 let plugin = &config.plugins[name];
-                let status = if plugin.enabled { "enabled" } else { "disabled" };
+                let status = if plugin.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
                 lines.push(format!(
                     "- {name}@{} ({status}): {}",
                     plugin.version, plugin.description
@@ -152,19 +156,20 @@ async fn plugins(ctx: &OpContext, args: PluginsArgs) -> Result<OpOutput, OpError
 #[cfg(test)]
 mod tests {
     use super::PluginsArgs;
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
+    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_operations::operation::{CommandVisibility, Surface};
     use harw_operations::{FromRawArgs, OpContext, OpError, Operation, context::ServiceMap};
-    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn test_context() -> (OpContext, std::path::PathBuf) {
+    fn test_context() -> TestResult<(OpContext, std::path::PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root =
             std::env::temp_dir().join(format!("harw-plugins-test-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(root.join("ws")).expect("create test workspace");
+        std::fs::create_dir_all(root.join("ws")).map_err(ctx("create test workspace"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -173,55 +178,46 @@ mod tests {
                 root: std::path::PathBuf::from("ws"),
             }],
         )
-        .expect("build workspace registry");
+        .map_err(ctx("build workspace registry"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .expect("resolve workspace binding");
+            .map_err(ctx("resolve workspace binding"))?;
         let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
-        (
+        Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new()),
             root,
-        )
+        ))
     }
 
     #[test]
-    fn test_plugins_args_from_raw_args_sets_action() {
-        let args = PluginsArgs::from_raw_args(&toks(&["install"]));
-        match args {
-            Ok(a) => {
-                assert_eq!(a.action.as_deref(), Some("install"));
-                assert!(a.target.is_none());
-            }
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
-        }
+    fn test_plugins_args_from_raw_args_sets_action() -> TestResult {
+        let args = PluginsArgs::from_raw_args(&toks(&["install"]))
+            .map_err(ctx("PluginsArgs::from_raw_args"))?;
+        assert_eq!(args.action.as_deref(), Some("install"));
+        assert!(args.target.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_plugins_args_from_raw_args_install_preserves_target() {
-        let args = PluginsArgs::from_raw_args(&toks(&["install", "my-plugin"]));
-        match args {
-            Ok(a) => {
-                assert_eq!(a.action.as_deref(), Some("install"));
-                assert_eq!(a.target.as_deref(), Some("my-plugin"));
-                assert!(a.value.is_none());
-            }
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
-        }
+    fn test_plugins_args_from_raw_args_install_preserves_target() -> TestResult {
+        let args = PluginsArgs::from_raw_args(&toks(&["install", "my-plugin"]))
+            .map_err(ctx("PluginsArgs::from_raw_args"))?;
+        assert_eq!(args.action.as_deref(), Some("install"));
+        assert_eq!(args.target.as_deref(), Some("my-plugin"));
+        assert!(args.value.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_plugins_args_from_raw_args_empty_tokens_sets_action_none() {
-        let args = PluginsArgs::from_raw_args(&toks(&[]));
-        match args {
-            Ok(a) => {
-                assert!(a.action.is_none());
-                assert!(a.target.is_none());
-            }
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
-        }
+    fn test_plugins_args_from_raw_args_empty_tokens_sets_action_none() -> TestResult {
+        let args =
+            PluginsArgs::from_raw_args(&toks(&[])).map_err(ctx("PluginsArgs::from_raw_args"))?;
+        assert!(args.action.is_none());
+        assert!(args.target.is_none());
+        Ok(())
     }
 
     #[test]
@@ -245,23 +241,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plugins_default_list_returns_static_not_available() {
-        let (ctx, root) = test_context();
-        let result = super::plugins(&ctx, PluginsArgs::default()).await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+    async fn plugins_default_list_returns_static_not_available() -> TestResult {
+        let (op_ctx, root) = test_context()?;
+        let result = super::plugins(&op_ctx, PluginsArgs::default()).await;
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
 
         assert!(
             matches!(result, Err(OpError::NotAvailable(message)) if message == "extension registry is not available")
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn plugins_list_with_config_service_reports_configured_plugins() {
+    async fn plugins_list_with_config_service_reports_configured_plugins() -> TestResult {
         use harw_config::PluginToml;
         use harw_operations::context::ServiceMap;
         use std::sync::Arc;
 
-        let (ctx, root) = test_context();
+        let (op_ctx, root) = test_context()?;
         let mut config = harw_config::ResolvedConfig::default();
         config.plugins.insert(
             "review".to_owned(),
@@ -276,30 +273,35 @@ mod tests {
         );
         let mut services = ServiceMap::new();
         services.insert(Arc::new(config));
-        let ctx = OpContext::new(
-            ctx.session_id().clone(),
-            ctx.turn_id().clone(),
-            ctx.sandbox().clone(),
+        let op_ctx = OpContext::new(
+            op_ctx.session_id().clone(),
+            op_ctx.turn_id().clone(),
+            op_ctx.sandbox().clone(),
             services,
         );
 
-        let result = super::plugins(&ctx, PluginsArgs::default()).await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        let result = super::plugins(&op_ctx, PluginsArgs::default()).await;
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
 
         match result {
-            Ok(output) => assert!(output.text.contains("review")),
-            other => panic!("expected Ok listing, got: {other:?}"),
+            Ok(output) => {
+                assert!(output.text.contains("review"));
+                Ok(())
+            }
+            other => Err(TestError::Unexpected(format!(
+                "expected Ok listing, got: {other:?}"
+            ))),
         }
     }
 
     #[tokio::test]
-    async fn plugins_target_bearing_action_does_not_leak_input() {
-        let (ctx, root) = test_context();
+    async fn plugins_target_bearing_action_does_not_leak_input() -> TestResult {
+        let (op_ctx, root) = test_context()?;
         let action = "install-sensitive-action";
         let target = "private-plugin-name";
         let value = "secret-registry-value";
         let result = super::plugins(
-            &ctx,
+            &op_ctx,
             PluginsArgs {
                 action: Some(action.to_owned()),
                 target: Some(target.to_owned()),
@@ -307,7 +309,7 @@ mod tests {
             },
         )
         .await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
 
         match result {
             Err(OpError::NotAvailable(message)) => {
@@ -315,8 +317,11 @@ mod tests {
                 assert!(!message.contains(action));
                 assert!(!message.contains(target));
                 assert!(!message.contains(value));
+                Ok(())
             }
-            other => panic!("expected NotAvailable, got: {other:?}"),
+            other => Err(TestError::Unexpected(format!(
+                "expected NotAvailable, got: {other:?}"
+            ))),
         }
     }
 }

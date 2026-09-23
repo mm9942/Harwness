@@ -59,14 +59,18 @@
 //!
 //! # Examples
 //! ```rust,no_run
-//! use harw_provider_http::OpenAiResponsesProvider;
+//! use harw_provider_http::{HttpProviderError, OpenAiResponsesProvider};
 //! use secrecy::SecretString;
 //!
+//! # fn main() -> Result<(), HttpProviderError> {
 //! let provider = OpenAiResponsesProvider::new(
 //!     "https://api.openai.com/v1",
 //!     "gpt-4o",
 //!     SecretString::new("sk-...".into()),
-//! );
+//! )?;
+//! # let _ = provider;
+//! # Ok(())
+//! # }
 //! ```
 
 #![forbid(unsafe_code)]
@@ -79,13 +83,15 @@ mod error;
 pub mod rate_limiter;
 pub mod retry;
 pub mod routing;
+mod text_tool_calls;
 mod tool_names;
 
 use error::{model_error_for_status, model_error_for_transport, retry_after_hint};
 use harw_core::envelope::render_tool_result;
 use harw_core::model::StopReason;
 use harw_core::{
-    ModelError, ModelFuture, ModelProvider, ModelRequest, ModelResponse, ToolCallResult,
+    ModelError, ModelFuture, ModelProvider, ModelRequest, ModelResponse, RequestIdentity,
+    ToolCallResult,
 };
 use harw_protocol::{OpaqueReasoning, ResultTrust, TurnItem};
 use harw_provider::openai::{ContentPart, InputItem, ReasoningConfig, ResponsesRequest, ToolDef};
@@ -252,7 +258,8 @@ pub fn build_provider_with_resolver(
     config: &harw_config::ResolvedConfig,
     resolver: &dyn SecretResolver,
 ) -> HttpProviderResult<Box<dyn ModelProvider>> {
-    build_provider_with_optional_resolver(config, Some(resolver), None).map(|(provider, _)| provider)
+    build_provider_with_optional_resolver(config, Some(resolver), None)
+        .map(|(provider, _)| provider)
 }
 
 /// Wie [`build_provider`], liefert zusätzlich eine [`ProviderLoadRegistry`]
@@ -315,7 +322,8 @@ pub fn build_provider_with_home(
     home: &Path,
     resolver: Option<&dyn SecretResolver>,
 ) -> HttpProviderResult<Box<dyn ModelProvider>> {
-    build_provider_with_optional_resolver(config, resolver, Some(home)).map(|(provider, _)| provider)
+    build_provider_with_optional_resolver(config, resolver, Some(home))
+        .map(|(provider, _)| provider)
 }
 
 fn build_provider_with_optional_resolver(
@@ -407,7 +415,10 @@ fn network_retry_policy() -> RetryPolicy {
 
 /// Rückgabe von [`build_named_provider`]: der gebaute Provider-Backend plus
 /// dessen optionales [`ProviderLoadControl`]-Handle.
-type NamedProviderBuild = (Box<dyn ModelProvider>, Option<std::sync::Arc<dyn ProviderLoadControl>>);
+type NamedProviderBuild = (
+    Box<dyn ModelProvider>,
+    Option<std::sync::Arc<dyn ProviderLoadControl>>,
+);
 
 /// Builds one named provider backend, plus its [`ProviderLoadControl`] handle
 /// when the backend supports it.
@@ -530,7 +541,7 @@ fn build_named_provider(
             (Err(error), None) => return Err(error),
         };
         let mut backend =
-            AnthropicMessagesProvider::from_base(&base_url, model.to_owned(), credential);
+            AnthropicMessagesProvider::from_base(&base_url, model.to_owned(), credential)?;
         backend.configure(
             provider_name,
             configured_headers(provider_name, &provider.headers, sources)?,
@@ -554,15 +565,21 @@ fn build_named_provider(
         ));
     }
 
-    let http_provider =
-        OpenAiResponsesProvider::from_named_config(provider_name, provider, config, model, sources)?;
+    let http_provider = OpenAiResponsesProvider::from_named_config(
+        provider_name,
+        provider,
+        config,
+        model,
+        sources,
+    )?;
     // Beide `Arc`s werden geklont, *bevor* `http_provider` unten per Wert in
     // `RetryingProvider::new` verschoben wird — siehe [`ProviderLoadHandle`]-Doku.
-    let load_control: std::sync::Arc<dyn ProviderLoadControl> = std::sync::Arc::new(ProviderLoadHandle {
-        provider_id: provider_name.to_owned(),
-        concurrency_limiter: http_provider.concurrency_limiter(),
-        rate_limiter: http_provider.rate_limiter_handle(),
-    });
+    let load_control: std::sync::Arc<dyn ProviderLoadControl> =
+        std::sync::Arc::new(ProviderLoadHandle {
+            provider_id: provider_name.to_owned(),
+            concurrency_limiter: http_provider.concurrency_limiter(),
+            rate_limiter: http_provider.rate_limiter_handle(),
+        });
     Ok((
         Box::new(RetryingProvider::new(http_provider, network_retry_policy())),
         Some(load_control),
@@ -784,15 +801,16 @@ fn redirect_policy() -> reqwest::redirect::Policy {
 
 /// Baut den HTTP-Client eines Providers mit [`redirect_policy`].
 ///
-/// # Panics
-/// Wie `reqwest::Client::new()` (das intern `ClientBuilder::new().build()
-/// .expect(..)` aufruft), wenn das TLS-Backend nicht initialisiert werden kann.
-/// Die zusätzliche Redirect-Policy fügt keinen Fehlerpfad hinzu.
-pub(crate) fn http_client() -> reqwest::Client {
+/// # Errors
+/// [`HttpProviderError::ClientBuild`], wenn `reqwest::ClientBuilder::build`
+/// scheitert (z. B. TLS-Backend nicht initialisierbar). Kein `expect` mehr
+/// (Bible R087/R165): Aufrufer entscheiden selbst, wie sie einen
+/// Client-Aufbaufehler behandeln.
+pub(crate) fn http_client() -> HttpProviderResult<reqwest::Client> {
     reqwest::Client::builder()
         .redirect(redirect_policy())
         .build()
-        .expect("reqwest client with TLS backend and redirect policy")
+        .map_err(HttpProviderError::ClientBuild)
 }
 
 /// Baut einen als sensitiv markierten Header-Wert für ein Credential.
@@ -1002,7 +1020,9 @@ impl DynamicConcurrencyLimiter {
     /// Lock-frei (CAS-Schleife über `total_permits`); sicher, wenn mehrere
     /// Aufrufer gleichzeitig `set_target` aufrufen.
     pub fn set_target(&self, new_target: Option<usize>) {
-        let new_target = new_target.unwrap_or(UNLIMITED_PERMITS).min(UNLIMITED_PERMITS);
+        let new_target = new_target
+            .unwrap_or(UNLIMITED_PERMITS)
+            .min(UNLIMITED_PERMITS);
         self.state.target.store(new_target, Ordering::SeqCst);
         loop {
             let current_total = self.state.total_permits.load(Ordering::SeqCst);
@@ -1019,7 +1039,12 @@ impl DynamicConcurrencyLimiter {
                 if self
                     .state
                     .total_permits
-                    .compare_exchange(current_total, new_target, Ordering::SeqCst, Ordering::SeqCst)
+                    .compare_exchange(
+                        current_total,
+                        new_target,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
                     .is_ok()
                 {
                     self.state.semaphore.add_permits(delta);
@@ -1320,6 +1345,14 @@ pub struct OpenAiResponsesProvider {
     /// `None` heißt: dieser Provider nutzt ausschließlich `api_key`/`base_url`
     /// oben (unverändertes Verhalten ohne Pool).
     credential_pool: Option<std::sync::Arc<credential_pool::CredentialPool<SecretString>>>,
+    /// Opt-in aus [`harw_config::ProviderToml::gateway_identity_headers`]
+    /// (Standard `false`): sendet, wenn `true` **und** der aktuelle
+    /// [`ModelRequest::identity`] gesetzt ist, zusätzlich zu den statischen
+    /// `[headers]` die Header `x-harw-session`/`x-harw-agent`/`x-harw-role`
+    /// an eigene Cloudflare-Worker/AI-Gateway-Endpunkte (siehe
+    /// [`Self::authorized_request`], [`identity_headers`]). Andere Provider
+    /// bleiben unberührt, solange dieses Feld `false` ist.
+    gateway_identity_headers: bool,
 }
 
 /// Eine gemerkte Reasoning-Runde der Responses-API (W4a / A-OAI).
@@ -1404,12 +1437,15 @@ impl OpenAiResponsesProvider {
     ///
     /// # Returns
     /// Einen einsatzbereiten [`OpenAiResponsesProvider`].
-    #[must_use]
+    ///
+    /// # Errors
+    /// [`HttpProviderError::ClientBuild`] aus [`http_client`], wenn der
+    /// geteilte `reqwest::Client` nicht gebaut werden kann.
     pub fn new(
         base_url: impl Into<String>,
         model: impl Into<String>,
         api_key: SecretString,
-    ) -> Self {
+    ) -> HttpProviderResult<Self> {
         Self::with_transport(base_url, model, api_key, Transport::Responses)
     }
 
@@ -1424,15 +1460,18 @@ impl OpenAiResponsesProvider {
     /// # Returns
     /// Einen einsatzbereiten [`OpenAiResponsesProvider`] für den gewählten
     /// Transport.
-    #[must_use]
+    ///
+    /// # Errors
+    /// [`HttpProviderError::ClientBuild`] aus [`http_client`], wenn der
+    /// geteilte `reqwest::Client` nicht gebaut werden kann.
     pub fn with_transport(
         base_url: impl Into<String>,
         model: impl Into<String>,
         api_key: SecretString,
         transport: Transport,
-    ) -> Self {
-        Self {
-            client: http_client(),
+    ) -> HttpProviderResult<Self> {
+        Ok(Self {
+            client: http_client()?,
             base_url: base_url.into(),
             provider_id: "openai".to_owned(),
             model: model.into(),
@@ -1447,7 +1486,8 @@ impl OpenAiResponsesProvider {
             rate_limiter: std::sync::Arc::new(rate_limiter::ProviderRateLimiter::new(None)),
             concurrency_limiter: None,
             credential_pool: None,
-        }
+            gateway_identity_headers: false,
+        })
     }
 
     /// Baut einen Provider aus einer aufgelösten Konfiguration.
@@ -1465,6 +1505,8 @@ impl OpenAiResponsesProvider {
     ///   nicht aufgelöst werden kann.
     /// - [`HttpProviderError::UnsupportedCredentialReference`]: wenn `secrets:`
     ///   ohne injizierten Resolver verwendet wird.
+    /// - [`HttpProviderError::ClientBuild`]: aus [`Self::with_transport`], wenn
+    ///   der geteilte `reqwest::Client` nicht gebaut werden kann.
     pub fn from_config(config: &harw_config::ResolvedConfig) -> HttpProviderResult<Self> {
         Self::from_config_with_optional_resolver(config, None)
     }
@@ -1571,25 +1613,24 @@ impl OpenAiResponsesProvider {
         } else {
             None
         };
-        let pool: Option<credential_pool::CredentialPool<SecretString>> =
-            if codex_route.is_none() {
-                let pool = credential_pool::CredentialPool::from_auth_config(
-                    &config.auth,
-                    provider_name,
-                    sources,
-                    Ok,
-                )?;
-                if let Some(pool) = &pool {
-                    for index in 0..pool.len() {
-                        if let Some(url) = &pool.entry(index).base_url {
-                            validate_endpoint(url)?;
-                        }
+        let pool: Option<credential_pool::CredentialPool<SecretString>> = if codex_route.is_none() {
+            let pool = credential_pool::CredentialPool::from_auth_config(
+                &config.auth,
+                provider_name,
+                sources,
+                Ok,
+            )?;
+            if let Some(pool) = &pool {
+                for index in 0..pool.len() {
+                    if let Some(url) = &pool.entry(index).base_url {
+                        validate_endpoint(url)?;
                     }
                 }
-                pool
-            } else {
-                None
-            };
+            }
+            pool
+        } else {
+            None
+        };
         let (api_key, pool) = match (pool, primary) {
             (Some(pool), Some(primary_value)) => {
                 let pool = pool.prepend_primary(primary_value, format!("{provider_name}#primary"));
@@ -1623,7 +1664,7 @@ impl OpenAiResponsesProvider {
             model.to_owned(),
             api_key,
             transport_from_api(&provider.api),
-        );
+        )?;
         http_provider.auth_header = auth_header.to_owned();
         http_provider.codex_route = codex_route;
         http_provider.credential_pool = pool.map(std::sync::Arc::new);
@@ -1648,6 +1689,7 @@ impl OpenAiResponsesProvider {
         }
         http_provider.provider_id = provider_name.to_owned();
         http_provider.headers = configured_headers(provider_name, &provider.headers, sources)?;
+        http_provider.gateway_identity_headers = provider.gateway_identity_headers;
         for model_entry in config
             .models
             .values()
@@ -1692,9 +1734,7 @@ impl OpenAiResponsesProvider {
     /// Threads/Tasks gleichzeitig nutzbar (siehe [`DynamicConcurrencyLimiter`]).
     #[must_use]
     pub fn concurrency_limiter(&self) -> Option<std::sync::Arc<DynamicConcurrencyLimiter>> {
-        self.concurrency_limiter
-            .as_ref()
-            .map(std::sync::Arc::clone)
+        self.concurrency_limiter.as_ref().map(std::sync::Arc::clone)
     }
 
     /// Liefert einen geteilten Zugriff auf den [`rate_limiter::ProviderRateLimiter`]
@@ -2024,6 +2064,74 @@ fn resolve_secret(
     }
 }
 
+/// Löst das Credential eines konfigurierten Providers auf (Design
+/// `doc.read_pdf` § „Anbindung → W2": `harw-cli`s Mistral-OCR-Installation
+/// nutzt sie, um den Key des gewählten Mistral-Providers zu bekommen, ohne
+/// den internen Aufbaupfad von [`build_provider`] zu duplizieren).
+///
+/// # Description
+/// Fehlt `provider.auth`, ist das Ergebnis `Ok(None)` — kein Credential
+/// konfiguriert, der Aufrufer entscheidet dann selbst (z. B. Provider
+/// überspringen). Ist `auth` gesetzt, wird die `SecretRef` exakt wie im
+/// internen Auflösungspfad (siehe [`build_named_provider`]) über
+/// [`resolve_secret`] aufgelöst: `sources.endpoint` wird an
+/// `provider.base_url` gebunden, damit endpoint-gebundene Referenzen (z. B.
+/// `file-json:` auf fremde CLI-Credentials) nur an ihren offiziellen Host
+/// gehen.
+///
+/// # Arguments
+/// - `provider` (`&harw_config::ProviderToml`): Provider-Konfiguration,
+///   deren `auth`-`SecretRef` (falls vorhanden) aufgelöst wird.
+/// - `env_layer` (`&BTreeMap<String, String>`): Env-Layer aus den `.env`-
+///   Dateien der Konfigurations-Layer (siehe [`SecretSources::env_layer`]).
+/// - `home` (`Option<&Path>`): harw-Home für `file:`/`file-json:`-Referenzen;
+///   `None` lässt diese fail-closed scheitern (siehe [`resolve_secret`]).
+/// - `resolver` (`Option<&dyn SecretResolver>`): injizierter Resolver für
+///   `secrets:`-Referenzen.
+///
+/// # Returns
+/// `Ok(None)`, wenn `provider.auth` fehlt; sonst `Ok(Some(secret))` mit dem
+/// aufgelösten Klartext-Credential.
+///
+/// # Errors
+/// Wie [`resolve_secret`]: u. a. [`HttpProviderError::UnresolvedCredential`]
+/// (Referenz nicht auflösbar) und
+/// [`HttpProviderError::UnsupportedCredentialReference`] (`secrets:` ohne
+/// injizierten Resolver).
+///
+/// # Concurrency
+/// Reiner Aufbau ohne geteilten Zustand; beliebig parallel aufrufbar.
+///
+/// # Examples
+/// ```rust,no_run
+/// use harw_provider_http::resolve_provider_credential;
+/// use std::collections::BTreeMap;
+///
+/// # fn example(provider: &harw_config::ProviderToml) -> harw_provider_http::HttpProviderResult<()> {
+/// let env_layer = BTreeMap::new();
+/// let credential = resolve_provider_credential(provider, &env_layer, None, None)?;
+/// # let _ = credential;
+/// # Ok(())
+/// # }
+/// ```
+pub fn resolve_provider_credential(
+    provider: &harw_config::ProviderToml,
+    env_layer: &BTreeMap<String, String>,
+    home: Option<&Path>,
+    resolver: Option<&dyn SecretResolver>,
+) -> HttpProviderResult<Option<SecretString>> {
+    let Some(secret_ref) = &provider.auth else {
+        return Ok(None);
+    };
+    let sources = SecretSources {
+        env_layer,
+        resolver,
+        home,
+        endpoint: Some(&provider.base_url),
+    };
+    resolve_secret(secret_ref, sources).map(Some)
+}
+
 /// Referenz-Form für Fehlertexte: Dateireferenzen ohne Pfad (kein Orakel für
 /// Dateinamen/Home-Layout), alle anderen in kanonischer Form.
 fn diagnostic_reference(secret_ref: &harw_config::SecretRef) -> String {
@@ -2344,7 +2452,7 @@ fn build_request(model: &str, request: &ModelRequest) -> ResponsesRequest {
     if let Some(effort) = request.reasoning_effort {
         req.reasoning = Some(ReasoningConfig {
             effort: Some(map_effort_to_openai(effort).to_owned()),
-            summary: None,
+            summary: Some("auto".to_owned()),
         });
     }
     req
@@ -2604,22 +2712,55 @@ fn interpret_responses(
 /// nur `message.refusal` → `Refusal`; `stop`/`tool_calls`/fehlend → `EndTurn`;
 /// unbekannt → `Other`.
 ///
+/// `choices[0].message.reasoning_content` (DeepSeek/Kimi/GLM-Konvention):
+/// vorhanden und nicht leer/nur Whitespace → `OpaqueReasoning{provider, model,
+/// blocks: [{"type": "reasoning_content", "text": ...}]}`; fehlt das Feld
+/// oder ist es leer, bleibt `reasoning: None` (kein Verhaltensbruch für
+/// Provider ohne dieses Feld).
+///
+/// Ein führender `<think>...</think>`-Block bzw. ein verwaister führender
+/// `</think>`-Marker in `content` wird immer (auch ohne Tool-Calls)
+/// entfernt; sein Text landet — sofern `reasoning_content` fehlt — als
+/// `{"type": "think", "text": ...}`-Block in `reasoning` (siehe
+/// [`text_tool_calls::strip_leading_think`]).
+///
+/// Manche GLM-5.x/Kimi-Gateways senden Tool-Calls als Text in `content`
+/// (`<tool_call>...`) statt strukturiert in `message.tool_calls`. Bot der
+/// Request `offered_tools` an und blieb `message.tool_calls` leer, versucht
+/// [`text_tool_calls::parse_text_tool_calls`] den Text zu parsen; gelingt
+/// das (jeder `<tool_call>`-Name in `offered_tools`, alle Segmente
+/// vertrauenswürdig parsbar), werden daraus synthetische `ToolCall`s mit
+/// `call_text_<n>`-IDs — sonst bleibt die Antwort unverändert (kein Raten).
+///
+/// # Arguments
+/// - `body` (`&Value`): der geparste JSON-Antwortkörper.
+/// - `provider` (`&str`): Provider-ID für `OpaqueReasoning::provider`.
+/// - `model` (`&str`): Modellname für `OpaqueReasoning::model`.
+/// - `offered_tools` (`&[&str]`): die für diesen Request tatsächlich
+///   angebotenen, Wire-kodierten Tool-Namen (leer, wenn keine Tools
+///   angeboten wurden) — Fail-closed-Grenze für [`text_tool_calls`].
+///
 /// # Errors
 /// `RequestFailed` bei defekten Tool-Calls; `EmptyResponse`, wenn eine nicht
 /// abgeschnittene Antwort weder Text, Tool-Calls noch Refusal enthält.
-fn interpret_chat(body: &Value) -> Result<ModelResponse, ModelError> {
+fn interpret_chat(
+    body: &Value,
+    provider: &str,
+    model: &str,
+    offered_tools: &[&str],
+) -> Result<ModelResponse, ModelError> {
     let choice = body.pointer("/choices/0");
     let finish = choice
         .and_then(|choice| choice.get("finish_reason"))
         .and_then(Value::as_str);
-    let text = extract_chat_content(body);
+    let raw_text = extract_chat_content(body);
     let refusal = choice
         .and_then(|choice| choice.pointer("/message/refusal"))
         .and_then(Value::as_str)
         .filter(|refusal| !refusal.is_empty())
         .map(str::to_owned);
     let truncated = matches!(finish, Some("length" | "content_filter"));
-    let tool_calls = if truncated {
+    let mut tool_calls = if truncated {
         let dropped = choice
             .and_then(|choice| choice.pointer("/message/tool_calls"))
             .and_then(Value::as_array)
@@ -2635,6 +2776,53 @@ fn interpret_chat(body: &Value) -> Result<ModelResponse, ModelError> {
         extract_openai_tool_calls(body, Transport::Chat)
             .map_err(|error| ModelError::RequestFailed(error.to_string()))?
     };
+
+    // Immer, günstig: einen führenden <think>-Block bzw. einen verwaisten
+    // führenden </think>-Marker aus dem sichtbaren Text entfernen —
+    // unabhängig davon, ob unten Text-Tool-Calls gefunden werden.
+    let (mut text, think_text) = match raw_text {
+        Some(raw) => {
+            let (remaining, think) = text_tool_calls::strip_leading_think(&raw);
+            let remaining = if remaining.is_empty() {
+                None
+            } else {
+                Some(remaining)
+            };
+            (remaining, think)
+        }
+        None => (None, None),
+    };
+
+    // GLM-5.x/Kimi-Gateways senden Tool-Calls gelegentlich als Text in
+    // `content` statt strukturiert in `tool_calls`. Nur aktiv, wenn
+    // strukturierte Tool-Calls fehlen, der Request tatsächlich Tools
+    // angeboten hat, und der (bereits think-bereinigte) Text einen
+    // `<tool_call>`-Marker enthält — sonst bleibt die Antwort unverändert.
+    if !truncated
+        && tool_calls.is_empty()
+        && !offered_tools.is_empty()
+        && let Some(candidate) = text.as_deref()
+        && candidate.contains("<tool_call>")
+        && let Some((remaining, parsed)) =
+            text_tool_calls::parse_text_tool_calls(candidate, offered_tools)
+    {
+        tracing::debug!(count = parsed.len(), "parsed text-embedded tool calls");
+        tool_calls = parsed
+            .into_iter()
+            .enumerate()
+            .map(|(index, call)| ToolCall {
+                id: ToolCallId::from_str(format!("call_text_{index}")),
+                name: ToolName::new(call.name),
+                arguments: call.arguments,
+            })
+            .collect();
+        text = if remaining.is_empty() {
+            None
+        } else {
+            Some(remaining)
+        };
+    }
+
     let stop = match finish {
         Some("length") => StopReason::MaxTokens,
         Some("content_filter") => StopReason::ContentFilter,
@@ -2648,12 +2836,35 @@ fn interpret_chat(body: &Value) -> Result<ModelResponse, ModelError> {
     if !truncated && text.is_none() && tool_calls.is_empty() && refusal.is_none() {
         return Err(ModelError::EmptyResponse);
     }
+    let field_reasoning = choice
+        .and_then(|choice| choice.pointer("/message/reasoning_content"))
+        .and_then(Value::as_str)
+        .filter(|content| !content.trim().is_empty());
+    let reasoning = if let Some(reasoning_content) = field_reasoning {
+        Some(OpaqueReasoning {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            blocks: vec![serde_json::json!({
+                "type": "reasoning_content",
+                "text": reasoning_content,
+            })],
+        })
+    } else {
+        think_text.map(|think_text| OpaqueReasoning {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            blocks: vec![serde_json::json!({
+                "type": "think",
+                "text": think_text,
+            })],
+        })
+    };
     Ok(ModelResponse {
         message: text,
         tool_calls,
         usage: extract_openai_usage(body, Transport::Chat),
         stop,
-        reasoning: None,
+        reasoning,
     })
 }
 
@@ -3104,6 +3315,65 @@ fn extract_openai_usage(body: &Value, transport: Transport) -> TokenUsage {
     }
 }
 
+/// Höchstlänge eines sanitierten Identity-Header-Werts (siehe
+/// [`identity_headers`]).
+const MAX_IDENTITY_HEADER_CHARS: usize = 64;
+
+/// Reduziert `value` auf sichtbares, druckbares ASCII (`0x21..=0x7E`, also
+/// ohne Leerzeichen und ohne Steuerzeichen) und kürzt danach auf höchstens
+/// [`MAX_IDENTITY_HEADER_CHARS`] Zeichen.
+///
+/// Reine String-Hilfsfunktion für [`identity_headers`] — kein `HeaderValue`-
+/// Aufbau hier, damit sie ohne `reqwest` isoliert testbar bleibt.
+fn sanitize_identity_header_value(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| matches!(*c as u32, 0x21..=0x7E))
+        .take(MAX_IDENTITY_HEADER_CHARS)
+        .collect()
+}
+
+/// Baut die optionalen Gateway-Identity-Header (`x-harw-session`,
+/// `x-harw-agent`, `x-harw-role`) aus einer [`RequestIdentity`].
+///
+/// # Description
+/// Nur für Provider mit aktiviertem
+/// [`harw_config::ProviderToml::gateway_identity_headers`] relevant (siehe
+/// [`OpenAiResponsesProvider::authorized_request`]). Jeder Wert wird über
+/// [`sanitize_identity_header_value`] auf sichtbares ASCII reduziert und auf
+/// 64 Zeichen gekürzt; wird der Wert dadurch leer oder lehnt
+/// `HeaderValue::from_str` ihn danach trotzdem ab, wird genau dieser Header
+/// übersprungen (`tracing::debug!`) statt den Request scheitern zu lassen —
+/// die Identity-Header sind rein additiv und dürfen nie einen sonst gültigen
+/// Request verhindern. `x-session-affinity` wird bewusst nie gesetzt; der
+/// Cloudflare Worker leitet die Affinität selbst aus `session`+`agent` ab.
+///
+/// # Returns
+/// Eine [`reqwest::header::HeaderMap`] mit 0 bis 3 Einträgen.
+fn identity_headers(identity: &RequestIdentity) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (name, raw_value) in [
+        ("x-harw-session", identity.session.as_str()),
+        ("x-harw-agent", identity.agent.as_str()),
+        ("x-harw-role", identity.role.as_str()),
+    ] {
+        let sanitized = sanitize_identity_header_value(raw_value);
+        if sanitized.is_empty() {
+            tracing::debug!(header = name, "gateway_identity_headers.skip_empty_value");
+            continue;
+        }
+        match reqwest::header::HeaderValue::from_str(&sanitized) {
+            Ok(header_value) => {
+                headers.insert(reqwest::header::HeaderName::from_static(name), header_value);
+            }
+            Err(_) => {
+                tracing::debug!(header = name, "gateway_identity_headers.skip_invalid_value");
+            }
+        }
+    }
+    headers
+}
+
 impl OpenAiResponsesProvider {
     /// Baut den POST-Request mit konfigurierten Headern und Credential.
     ///
@@ -3115,23 +3385,43 @@ impl OpenAiResponsesProvider {
     /// immer `self.api_key` zu lesen, damit ein aktiver
     /// `credential_pool`-Eintrag denselben Header-Aufbau ohne Duplikation
     /// nutzen kann.
+    ///
+    /// `identity` ist [`ModelRequest::identity`] des aktuellen Requests. Ist
+    /// [`Self::gateway_identity_headers`] `true` **und** `identity` `Some`,
+    /// werden zusätzlich `x-harw-session`/`x-harw-agent`/`x-harw-role`
+    /// gesetzt (siehe [`identity_headers`]) — aber nie mit einem Namen, den
+    /// die statischen `[headers]` (`self.headers`) bereits belegen; die
+    /// statische Konfiguration gewinnt immer. Die Codex-Route (`self.
+    /// codex_route`) bleibt davon unberührt und kehrt unverändert vor dieser
+    /// Ergänzung zurück.
     async fn authorized_request(
         &self,
         url: &str,
         api_key: &SecretString,
+        identity: Option<&RequestIdentity>,
     ) -> Result<reqwest::RequestBuilder, ModelError> {
         let builder = self.client.post(url).headers(self.headers.clone());
         if let Some(route) = &self.codex_route {
             return Ok(builder.headers(route.headers(&self.client).await?));
         }
-        Ok(match self.auth_header.as_str() {
+        let mut builder = match self.auth_header.as_str() {
             "none" => builder,
             "api-key" | "x-api-key" => builder.header(
                 self.auth_header.as_str(),
                 sensitive_header_value(api_key.expose_secret())?,
             ),
             _ => builder.bearer_auth(api_key.expose_secret()),
-        })
+        };
+        if self.gateway_identity_headers
+            && let Some(identity) = identity
+        {
+            for (name, value) in identity_headers(identity).iter() {
+                if !self.headers.contains_key(name) {
+                    builder = builder.header(name, value.clone());
+                }
+            }
+        }
+        Ok(builder)
     }
 
     /// Liefert API-Key + Basis-URL für einen Versuch.
@@ -3173,6 +3463,10 @@ impl OpenAiResponsesProvider {
     ) -> Result<ModelResponse, ModelError> {
         let (api_key, base_url) = self.credential_for(credential_idx);
         let model = self.selected_model(&request)?;
+        // Für `authorized_request` (Gateway-Identity-Header, siehe
+        // [`Self::gateway_identity_headers`]) — geliehen von `request`, das
+        // bis nach dem Response-Parsing im Scope bleibt.
+        let identity = request.identity();
         let (url, mut wire) = match self.transport {
             Transport::Responses => {
                 let replay = self
@@ -3226,7 +3520,7 @@ impl OpenAiResponsesProvider {
         // `codex::CodexRoute::refresh`).
         let mut codex_refreshed_after_401 = false;
         let response = loop {
-            let builder = self.authorized_request(&url, api_key).await?;
+            let builder = self.authorized_request(&url, api_key, identity).await?;
             let response = builder
                 .json(&wire)
                 .timeout(self.request_timeout)
@@ -3282,6 +3576,7 @@ impl OpenAiResponsesProvider {
 
             serde_json::from_str(&body)?
         };
+        let names = tool_names::ToolNameCodec::for_request(&request);
         let mut response = match self.transport {
             Transport::Responses => {
                 let (response, replay) = interpret_responses(&value, &self.provider_id, model)?;
@@ -3290,9 +3585,24 @@ impl OpenAiResponsesProvider {
                 }
                 response
             }
-            Transport::Chat => interpret_chat(&value)?,
+            Transport::Chat => {
+                // Wire-kodierte Namen der für diesen Request angebotenen
+                // Tools — exakt das, was das Modell im `tools`-Array
+                // gesehen hat (siehe `build_chat_tools`). Grenze für
+                // `text_tool_calls::parse_text_tool_calls` (text-
+                // eingebettete Tool-Calls bei GLM-5.x/Kimi-Gateways).
+                let offered_wire_names: Vec<String> = request
+                    .tools
+                    .iter()
+                    .map(|spec| match spec {
+                        ToolSpec::Function(function) => names.encode(function.name.as_str()),
+                    })
+                    .collect();
+                let offered_tools: Vec<&str> =
+                    offered_wire_names.iter().map(String::as_str).collect();
+                interpret_chat(&value, &self.provider_id, model, &offered_tools)?
+            }
         };
-        let names = tool_names::ToolNameCodec::for_request(&request);
         for call in &mut response.tool_calls {
             call.name = ToolName::new(names.decode(call.name.as_str()));
         }
@@ -3386,11 +3696,18 @@ impl ModelProvider for OpenAiResponsesProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc::{self, Receiver};
     use std::thread;
+
+    /// Wandelt einen fehlgeschlagenen Thread-Join (Panic im Hintergrund-Thread)
+    /// in einen [`TestError`] um, statt ihn zu unwrappen.
+    fn join_thread_error(_payload: Box<dyn std::any::Any + Send>) -> TestError {
+        TestError::Unexpected("Hintergrund-Thread ist paniert".to_owned())
+    }
 
     #[test]
     fn anthropic_subscription_token_warning_is_non_empty_and_cites_source() {
@@ -3401,21 +3718,27 @@ mod tests {
         );
     }
 
-    fn mock_chat_server(request_count: usize) -> (String, Receiver<Value>, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
-        let base_url = format!("http://{}", listener.local_addr().expect("mock address"));
+    fn mock_chat_server(
+        request_count: usize,
+    ) -> TestResult<(String, Receiver<Value>, thread::JoinHandle<TestResult<()>>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("bind mock server"))?;
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().map_err(ctx("mock address"))?
+        );
         let (sender, receiver) = mpsc::channel();
-        let handle = thread::spawn(move || {
+        let handle = thread::spawn(move || -> TestResult<()> {
             for _ in 0..request_count {
-                let (mut stream, _) = listener.accept().expect("accept mock request");
+                let (mut stream, _) = listener.accept().map_err(ctx("accept mock request"))?;
                 let mut bytes = Vec::new();
                 let mut buffer = [0_u8; 4096];
                 let (header_end, content_length) = loop {
-                    let read = stream.read(&mut buffer).expect("read mock request");
-                    assert!(
-                        read > 0,
-                        "mock client closed connection before request completed"
-                    );
+                    let read = stream.read(&mut buffer).map_err(ctx("read mock request"))?;
+                    if read == 0 {
+                        return Err(TestError::Unexpected(
+                            "mock client closed connection before request completed".to_owned(),
+                        ));
+                    }
                     bytes.extend_from_slice(&buffer[..read]);
                     let Some(header_end) =
                         bytes.windows(4).position(|window| window == b"\r\n\r\n")
@@ -3424,43 +3747,52 @@ mod tests {
                     };
                     let header_end = header_end + 4;
                     let headers = std::str::from_utf8(&bytes[..header_end])
-                        .expect("mock request headers are UTF-8");
+                        .map_err(ctx("mock request headers are UTF-8"))?;
                     let content_length = headers
                         .lines()
                         .find_map(|line| line.strip_prefix("content-length: "))
-                        .expect("content length header")
+                        .ok_or(TestError::Missing("content length header"))?
                         .parse::<usize>()
-                        .expect("numeric content length");
+                        .map_err(ctx("numeric content length"))?;
                     break (header_end, content_length);
                 };
                 while bytes.len() < header_end + content_length {
-                    let read = stream.read(&mut buffer).expect("read mock request body");
-                    assert!(
-                        read > 0,
-                        "mock client closed connection before body completed"
-                    );
+                    let read = stream
+                        .read(&mut buffer)
+                        .map_err(ctx("read mock request body"))?;
+                    if read == 0 {
+                        return Err(TestError::Unexpected(
+                            "mock client closed connection before body completed".to_owned(),
+                        ));
+                    }
                     bytes.extend_from_slice(&buffer[..read]);
                 }
                 let body: Value =
                     serde_json::from_slice(&bytes[header_end..header_end + content_length])
-                        .expect("mock request JSON");
-                sender.send(body).expect("report mock request");
+                        .map_err(ctx("mock request JSON"))?;
+                sender.send(body).map_err(ctx("report mock request"))?;
                 stream
                     .write_all(
                         b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 44\r\nconnection: close\r\n\r\n{\"choices\":[{\"message\":{\"content\":\"mock\"}}]}",
                     )
-                    .expect("write mock response");
+                    .map_err(ctx("write mock response"))?;
             }
+            Ok(())
         });
-        (base_url, receiver, handle)
+        Ok((base_url, receiver, handle))
     }
 
-    fn mock_json_response_server(response: Value) -> (String, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
-        let base_url = format!("http://{}", listener.local_addr().expect("mock address"));
-        let response = serde_json::to_vec(&response).expect("serialize mock response");
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept mock request");
+    fn mock_json_response_server(
+        response: Value,
+    ) -> TestResult<(String, thread::JoinHandle<TestResult<()>>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("bind mock server"))?;
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().map_err(ctx("mock address"))?
+        );
+        let response = serde_json::to_vec(&response).map_err(ctx("serialize mock response"))?;
+        let handle = thread::spawn(move || -> TestResult<()> {
+            let (mut stream, _) = listener.accept().map_err(ctx("accept mock request"))?;
             let mut request_buffer = [0_u8; 4096];
             // Der Mock verwirft die Anfrage bewusst — er antwortet immer
             // dasselbe. Gelesen werden muss trotzdem, sonst schließt der Server
@@ -3469,17 +3801,22 @@ mod tests {
             // ignoriert: `read` liefert bei einem Socket regelmäßig weniger als
             // den Puffer, und ein `read_exact` würde hier auf 4096 Bytes warten,
             // die nie kommen.
-            let _read = stream.read(&mut request_buffer).expect("read mock request");
+            let _read = stream
+                .read(&mut request_buffer)
+                .map_err(ctx("read mock request"))?;
             let headers = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 response.len()
             );
             stream
                 .write_all(headers.as_bytes())
-                .expect("write response headers");
-            stream.write_all(&response).expect("write response body");
+                .map_err(ctx("write response headers"))?;
+            stream
+                .write_all(&response)
+                .map_err(ctx("write response body"))?;
+            Ok(())
         });
-        (base_url, handle)
+        Ok((base_url, handle))
     }
 
     /// Startet einen Mock-HTTP-Server, der pro Verbindung einen eigenen
@@ -3491,23 +3828,32 @@ mod tests {
     /// begrenzt, statt nur Requests seriell abzuarbeiten.
     fn mock_concurrency_probe_server(
         request_count: usize,
-    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>, thread::JoinHandle<()>) {
+    ) -> TestResult<(
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        thread::JoinHandle<TestResult<()>>,
+    )> {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
-        let base_url = format!("http://{}", listener.local_addr().expect("mock address"));
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("bind mock server"))?;
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().map_err(ctx("mock address"))?
+        );
         let in_flight = std::sync::Arc::new(AtomicUsize::new(0));
         let peak = std::sync::Arc::new(AtomicUsize::new(0));
         let peak_for_thread = std::sync::Arc::clone(&peak);
-        let handle = thread::spawn(move || {
+        let handle = thread::spawn(move || -> TestResult<()> {
             let mut connection_handles = Vec::with_capacity(request_count);
             for _ in 0..request_count {
-                let (mut stream, _) = listener.accept().expect("accept mock request");
+                let (mut stream, _) = listener.accept().map_err(ctx("accept mock request"))?;
                 let in_flight = std::sync::Arc::clone(&in_flight);
                 let peak = std::sync::Arc::clone(&peak_for_thread);
-                connection_handles.push(thread::spawn(move || {
+                connection_handles.push(thread::spawn(move || -> TestResult<()> {
                     let mut request_buffer = [0_u8; 4096];
-                    let _read = stream.read(&mut request_buffer).expect("read mock request");
+                    let _read = stream
+                        .read(&mut request_buffer)
+                        .map_err(ctx("read mock request"))?;
                     let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(current, Ordering::SeqCst);
                     // Künstliche Latenz, damit gleichzeitig eingehende
@@ -3522,36 +3868,36 @@ mod tests {
                     );
                     stream
                         .write_all(headers.as_bytes())
-                        .expect("write mock response headers");
-                    stream.write_all(body).expect("write mock response body");
+                        .map_err(ctx("write mock response headers"))?;
+                    stream
+                        .write_all(body)
+                        .map_err(ctx("write mock response body"))?;
+                    Ok(())
                 }));
             }
             for handle in connection_handles {
-                handle.join().expect("mock connection handler completes");
+                handle.join().map_err(join_thread_error)??;
             }
+            Ok(())
         });
-        (base_url, peak, handle)
+        Ok((base_url, peak, handle))
     }
 
     #[tokio::test]
-    async fn respond_honors_max_concurrency_hard_cap() {
+    async fn respond_honors_max_concurrency_hard_cap() -> TestResult {
         const MAX_CONCURRENCY: usize = 2;
         const REQUEST_COUNT: usize = 5;
 
-        let (base_url, peak, server) = mock_concurrency_probe_server(REQUEST_COUNT);
-        let mut provider = configured_provider(
-            "capped",
-            base_url,
-            vec!["gpt-test"],
-            "CAPPED_PROVIDER_KEY",
-        );
+        let (base_url, peak, server) = mock_concurrency_probe_server(REQUEST_COUNT)?;
+        let mut provider =
+            configured_provider("capped", base_url, vec!["gpt-test"], "CAPPED_PROVIDER_KEY");
         provider.max_concurrency = Some(MAX_CONCURRENCY);
-        provider.validate().expect("max_concurrency = 2 is valid");
+        provider
+            .validate()
+            .map_err(ctx("max_concurrency = 2 is valid"))?;
 
-        let env_layer = BTreeMap::from([(
-            "CAPPED_PROVIDER_KEY".to_owned(),
-            "sk-secret".to_owned(),
-        )]);
+        let env_layer =
+            BTreeMap::from([("CAPPED_PROVIDER_KEY".to_owned(), "sk-secret".to_owned())]);
         let mut config = harw_config::ResolvedConfig::default();
         config.harness.default_provider = Some("capped".to_owned());
         config.harness.default_model = Some("gpt-test".to_owned());
@@ -3567,7 +3913,7 @@ mod tests {
                 "gpt-test",
                 test_sources(&env_layer, None, None),
             )
-            .expect("provider builds with max_concurrency configured"),
+            .map_err(ctx("provider builds with max_concurrency configured"))?,
         );
 
         let mut handles = Vec::with_capacity(REQUEST_COUNT);
@@ -3577,25 +3923,33 @@ mod tests {
                 http_provider
                     .respond(request_with_ids(None, None))
                     .await
-                    .expect("mock chat response parses")
+                    .map_err(ctx("mock chat response parses"))
             }));
         }
         for handle in handles {
-            handle.await.expect("respond task completes");
+            handle.await.map_err(ctx("respond task completes"))??;
         }
-        server.join().expect("mock server completes");
+        server.join().map_err(join_thread_error)??;
 
         assert!(
             peak.load(std::sync::atomic::Ordering::SeqCst) <= MAX_CONCURRENCY,
             "observed more than {MAX_CONCURRENCY} requests in flight simultaneously"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn dynamic_limiter_set_target_grows_immediately_without_waiting_for_existing_permits() {
+    async fn dynamic_limiter_set_target_grows_immediately_without_waiting_for_existing_permits()
+    -> TestResult {
         let limiter = std::sync::Arc::new(DynamicConcurrencyLimiter::new(Some(2)));
-        let permit1 = limiter.acquire().await.expect("permit 1 acquires immediately");
-        let permit2 = limiter.acquire().await.expect("permit 2 acquires immediately");
+        let permit1 = limiter
+            .acquire()
+            .await
+            .map_err(ctx("permit 1 acquires immediately"))?;
+        let permit2 = limiter
+            .acquire()
+            .await
+            .map_err(ctx("permit 2 acquires immediately"))?;
         assert_eq!(limiter.available(), 0);
         assert_eq!(limiter.target(), Some(2));
 
@@ -3607,12 +3961,16 @@ mod tests {
         // waits for the pre-existing in-flight permits to be released.
         let permit3 = tokio::time::timeout(Duration::from_millis(200), limiter.acquire())
             .await
-            .expect("permit 3 must be available immediately after growing, without waiting")
-            .expect("acquire succeeds");
+            .map_err(ctx(
+                "permit 3 must be available immediately after growing, without waiting",
+            ))?
+            .map_err(ctx("acquire succeeds"))?;
         let permit4 = tokio::time::timeout(Duration::from_millis(200), limiter.acquire())
             .await
-            .expect("permit 4 must be available immediately after growing, without waiting")
-            .expect("acquire succeeds");
+            .map_err(ctx(
+                "permit 4 must be available immediately after growing, without waiting",
+            ))?
+            .map_err(ctx("acquire succeeds"))?;
 
         assert_eq!(limiter.available(), 0);
         drop(permit1);
@@ -3624,6 +3982,7 @@ mod tests {
             4,
             "all four permits must be free again after every guard dropped"
         );
+        Ok(())
     }
 
     #[tokio::test]
@@ -3647,14 +4006,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dynamic_limiter_set_target_shrink_with_some_free_permits_forgets_only_the_free_ones() {
+    async fn dynamic_limiter_set_target_shrink_with_some_free_permits_forgets_only_the_free_ones()
+    -> TestResult {
         // 1 of 4 permits busy, 3 free. Shrinking to 2 must immediately
         // forget exactly one of the three free permits (3 free - 1 needed
         // headroom for the still-busy permit = 2 to forget down to target),
         // leaving `available() == 1` right away; the remaining shrink (the
         // busy permit itself) only happens lazily once it is released.
         let limiter = std::sync::Arc::new(DynamicConcurrencyLimiter::new(Some(4)));
-        let permit1 = limiter.acquire().await.expect("permit 1 acquires immediately");
+        let permit1 = limiter
+            .acquire()
+            .await
+            .map_err(ctx("permit 1 acquires immediately"))?;
         assert_eq!(limiter.available(), 3);
 
         limiter.set_target(Some(2));
@@ -3671,6 +4034,7 @@ mod tests {
             2,
             "releasing the last busy permit completes the lazy part of the shrink"
         );
+        Ok(())
     }
 
     #[tokio::test]
@@ -3685,7 +4049,11 @@ mod tests {
         assert_eq!(limiter.available(), 6, "growing always applies immediately");
 
         limiter.set_target(Some(1));
-        assert_eq!(limiter.available(), 1, "shrinking again from an idle state is immediate");
+        assert_eq!(
+            limiter.available(),
+            1,
+            "shrinking again from an idle state is immediate"
+        );
 
         limiter.set_target(None);
         assert_eq!(
@@ -3697,12 +4065,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dynamic_limiter_set_target_shrink_waits_until_enough_permits_forgotten() {
+    async fn dynamic_limiter_set_target_shrink_waits_until_enough_permits_forgotten() -> TestResult
+    {
         let limiter = std::sync::Arc::new(DynamicConcurrencyLimiter::new(Some(4)));
-        let permit1 = limiter.acquire().await.expect("permit 1 acquires immediately");
-        let permit2 = limiter.acquire().await.expect("permit 2 acquires immediately");
-        let permit3 = limiter.acquire().await.expect("permit 3 acquires immediately");
-        let permit4 = limiter.acquire().await.expect("permit 4 acquires immediately");
+        let permit1 = limiter
+            .acquire()
+            .await
+            .map_err(ctx("permit 1 acquires immediately"))?;
+        let permit2 = limiter
+            .acquire()
+            .await
+            .map_err(ctx("permit 2 acquires immediately"))?;
+        let permit3 = limiter
+            .acquire()
+            .await
+            .map_err(ctx("permit 3 acquires immediately"))?;
+        let permit4 = limiter
+            .acquire()
+            .await
+            .map_err(ctx("permit 4 acquires immediately"))?;
         assert_eq!(limiter.available(), 0);
 
         limiter.set_target(Some(2));
@@ -3751,9 +4132,11 @@ mod tests {
         drop(permit3);
         let waiter_permit = tokio::time::timeout(Duration::from_millis(200), waiter)
             .await
-            .expect("waiter must resolve once capacity has shrunk to the target")
-            .expect("waiter task completes without panicking")
-            .expect("waiter acquires a permit");
+            .map_err(ctx(
+                "waiter must resolve once capacity has shrunk to the target",
+            ))?
+            .map_err(ctx("waiter task completes without panicking"))?
+            .map_err(ctx("waiter acquires a permit"))?;
 
         // The fourth return is also a real release now.
         drop(permit4);
@@ -3761,22 +4144,27 @@ mod tests {
             limiter.available() <= 2,
             "available() must never exceed the shrunk target of 2"
         );
-        assert_eq!(limiter.available(), 1, "one free permit plus one held by the waiter");
+        assert_eq!(
+            limiter.available(),
+            1,
+            "one free permit plus one held by the waiter"
+        );
         drop(waiter_permit);
         assert_eq!(
             limiter.available(),
             2,
             "capacity has fully settled at the shrunk target once everything is released"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn respond_hard_cap_never_overshoots_while_shrinking_target() {
+    async fn respond_hard_cap_never_overshoots_while_shrinking_target() -> TestResult {
         const INITIAL_MAX_CONCURRENCY: usize = 4;
         const SHRUNK_TARGET: usize = 2;
         const REQUEST_COUNT: usize = 6;
 
-        let (base_url, peak, server) = mock_concurrency_probe_server(REQUEST_COUNT);
+        let (base_url, peak, server) = mock_concurrency_probe_server(REQUEST_COUNT)?;
         let mut provider = configured_provider(
             "elastic",
             base_url,
@@ -3784,12 +4172,12 @@ mod tests {
             "ELASTIC_PROVIDER_KEY",
         );
         provider.max_concurrency = Some(INITIAL_MAX_CONCURRENCY);
-        provider.validate().expect("max_concurrency = 4 is valid");
+        provider
+            .validate()
+            .map_err(ctx("max_concurrency = 4 is valid"))?;
 
-        let env_layer = BTreeMap::from([(
-            "ELASTIC_PROVIDER_KEY".to_owned(),
-            "sk-secret".to_owned(),
-        )]);
+        let env_layer =
+            BTreeMap::from([("ELASTIC_PROVIDER_KEY".to_owned(), "sk-secret".to_owned())]);
         let mut config = harw_config::ResolvedConfig::default();
         config.harness.default_provider = Some("elastic".to_owned());
         config.harness.default_model = Some("gpt-test".to_owned());
@@ -3805,11 +4193,13 @@ mod tests {
                 "gpt-test",
                 test_sources(&env_layer, None, None),
             )
-            .expect("provider builds with max_concurrency configured"),
+            .map_err(ctx("provider builds with max_concurrency configured"))?,
         );
         let limiter = http_provider
             .concurrency_limiter()
-            .expect("from_named_config always installs a limiter, even for a finite max_concurrency");
+            .ok_or(TestError::Missing(
+                "from_named_config always installs a limiter, even for a finite max_concurrency",
+            ))?;
         assert_eq!(limiter.target(), Some(INITIAL_MAX_CONCURRENCY));
 
         let mut handles = Vec::with_capacity(REQUEST_COUNT);
@@ -3819,7 +4209,7 @@ mod tests {
                 http_provider
                     .respond(request_with_ids(None, None))
                     .await
-                    .expect("mock chat response parses")
+                    .map_err(ctx("mock chat response parses"))
             }));
         }
 
@@ -3832,9 +4222,9 @@ mod tests {
         limiter.set_target(Some(SHRUNK_TARGET));
 
         for handle in handles {
-            handle.await.expect("respond task completes");
+            handle.await.map_err(ctx("respond task completes"))??;
         }
-        server.join().expect("mock server completes");
+        server.join().map_err(join_thread_error)??;
 
         assert!(
             peak.load(std::sync::atomic::Ordering::SeqCst) <= INITIAL_MAX_CONCURRENCY,
@@ -3846,12 +4236,17 @@ mod tests {
             SHRUNK_TARGET,
             "capacity must have fully settled to the shrunk target once every request returned"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn dynamic_limiter_unbounded_never_waits() {
+    async fn dynamic_limiter_unbounded_never_waits() -> TestResult {
         let limiter = std::sync::Arc::new(DynamicConcurrencyLimiter::new(None));
-        assert_eq!(limiter.target(), None, "None must mean unbounded, not a numeric cap");
+        assert_eq!(
+            limiter.target(),
+            None,
+            "None must mean unbounded, not a numeric cap"
+        );
 
         // Acquiring far more permits than any realistic max_concurrency
         // would allow must never block, proving `None` behaves exactly as
@@ -3860,21 +4255,23 @@ mod tests {
         for _ in 0..1000 {
             let permit = tokio::time::timeout(Duration::from_millis(50), limiter.acquire())
                 .await
-                .expect("unbounded limiter must never block on acquire")
-                .expect("acquire succeeds");
+                .map_err(ctx("unbounded limiter must never block on acquire"))?
+                .map_err(ctx("acquire succeeds"))?;
             permits.push(permit);
         }
         drop(permits);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_with_transport_never_installs_concurrency_limiter() {
+    async fn test_with_transport_never_installs_concurrency_limiter() -> TestResult {
         let provider = OpenAiResponsesProvider::with_transport(
             "http://127.0.0.1:0",
             "gpt-test",
             SecretString::new("sk-secret".into()),
             Transport::Chat,
-        );
+        )
+        .map_err(ctx("with_transport"))?;
         assert!(
             provider.concurrency_limiter.is_none(),
             "with_transport() must never configure a hard concurrency cap on its own"
@@ -3883,26 +4280,32 @@ mod tests {
         // Confirm the absent limiter never blocks/panics on the respond() path:
         // a plain with_transport() provider must behave exactly as before this
         // feature existed.
-        let (base_url, receiver, server) = mock_chat_server(1);
+        let (base_url, receiver, server) = mock_chat_server(1)?;
         let provider = OpenAiResponsesProvider::with_transport(
             base_url,
             "gpt-test",
             SecretString::new("sk-secret".into()),
             Transport::Chat,
-        );
+        )
+        .map_err(ctx("with_transport"))?;
         let response = tokio::time::timeout(
             Duration::from_secs(5),
             provider.respond(request_with_ids(None, None)),
         )
         .await
-        .expect("respond() must not block when no concurrency limiter is configured");
+        .map_err(ctx(
+            "respond() must not block when no concurrency limiter is configured",
+        ))?;
         assert!(response.is_ok(), "unexpected error: {response:?}");
-        let _sent_body = receiver.recv().expect("mock server observed one request");
-        server.join().expect("mock server completes");
+        let _sent_body = receiver
+            .recv()
+            .map_err(ctx("mock server observed one request"))?;
+        server.join().map_err(join_thread_error)??;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_respond_releases_permit_after_transport_error() {
+    async fn test_respond_releases_permit_after_transport_error() -> TestResult {
         // A listener that is bound and then immediately dropped frees the
         // port but leaves nothing accepting connections, so every request
         // against it fails fast with a connection-refused transport error.
@@ -3912,10 +4315,12 @@ mod tests {
         // single-slot semaphore below would starve every request after the
         // first failure and the final successful request would deadlock.
         let unreachable_listener =
-            TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port for closure");
+            TcpListener::bind("127.0.0.1:0").map_err(ctx("bind ephemeral port for closure"))?;
         let unreachable_url = format!(
             "http://{}",
-            unreachable_listener.local_addr().expect("ephemeral address")
+            unreachable_listener
+                .local_addr()
+                .map_err(ctx("ephemeral address"))?
         );
         drop(unreachable_listener);
 
@@ -3924,19 +4329,28 @@ mod tests {
             "gpt-test",
             SecretString::new("sk-secret".into()),
             Transport::Chat,
-        );
+        )
+        .map_err(ctx("with_transport"))?;
         provider.concurrency_limiter =
             Some(std::sync::Arc::new(DynamicConcurrencyLimiter::new(Some(1))));
 
         const FAILED_REQUESTS: usize = 3;
         for attempt in 0..FAILED_REQUESTS {
-            let error = tokio::time::timeout(
+            let inner = tokio::time::timeout(
                 Duration::from_secs(5),
                 provider.respond(request_with_ids(None, None)),
             )
             .await
-            .unwrap_or_else(|_| panic!("attempt {attempt}: must not deadlock while acquiring the permit"))
-            .expect_err("connecting to a closed port must fail");
+            .map_err(|_| {
+                TestError::Unexpected(format!(
+                    "attempt {attempt}: must not deadlock while acquiring the permit"
+                ))
+            })?;
+            let Err(error) = inner else {
+                return Err(TestError::Unexpected(format!(
+                    "attempt {attempt}: connecting to a closed port must fail"
+                )));
+            };
             assert!(
                 matches!(error, ModelError::Transient { .. }),
                 "attempt {attempt}: expected a connect-transient error, got {error:?}"
@@ -3946,43 +4360,53 @@ mod tests {
         // The single permit must have been returned after each failure above;
         // a fresh request against a real mock server must still succeed
         // promptly instead of hanging on an exhausted semaphore.
-        let (base_url, receiver, server) = mock_chat_server(1);
+        let (base_url, receiver, server) = mock_chat_server(1)?;
         provider.base_url = base_url;
         let response = tokio::time::timeout(
             Duration::from_secs(5),
             provider.respond(request_with_ids(None, None)),
         )
         .await
-        .expect("permit must have been released by every prior failed request")
-        .expect("mock chat response parses");
+        .map_err(ctx(
+            "permit must have been released by every prior failed request",
+        ))?
+        .map_err(ctx("mock chat response parses"))?;
         assert_eq!(response.message.as_deref(), Some("mock"));
-        let _sent_body = receiver.recv().expect("mock server observed one request");
-        server.join().expect("mock server completes");
+        let _sent_body = receiver
+            .recv()
+            .map_err(ctx("mock server observed one request"))?;
+        server.join().map_err(join_thread_error)??;
+        Ok(())
     }
 
     async fn assert_respond_rejects_tool_call(
         transport: Transport,
         response: Value,
         expected_message: &str,
-    ) {
-        let (base_url, server) = mock_json_response_server(response);
+    ) -> TestResult {
+        let (base_url, server) = mock_json_response_server(response)?;
         let provider = OpenAiResponsesProvider::with_transport(
             base_url,
             "gpt-test",
             SecretString::new("sk-secret".into()),
             transport,
-        );
+        )
+        .map_err(ctx("with_transport"))?;
 
-        let error = provider
-            .respond(request_with_ids(None, None))
-            .await
-            .expect_err("malformed tool call must fail closed");
+        let Err(error) = provider.respond(request_with_ids(None, None)).await else {
+            return Err(TestError::Unexpected(
+                "malformed tool call must fail closed".to_owned(),
+            ));
+        };
         let ModelError::RequestFailed(message) = error else {
-            panic!("invalid tool-call arguments must be a request failure");
+            return Err(TestError::Unexpected(
+                "invalid tool-call arguments must be a request failure".to_owned(),
+            ));
         };
         assert_eq!(message, expected_message);
         assert!(!message.contains("private-provider-arguments"));
-        server.join().expect("mock server completes");
+        server.join().map_err(join_thread_error)??;
+        Ok(())
     }
 
     fn configured_provider(
@@ -4006,6 +4430,7 @@ mod tests {
             max_concurrency: None,
             originator: None,
             default_reasoning_effort: None,
+            gateway_identity_headers: false,
         }
     }
 
@@ -4064,14 +4489,16 @@ mod tests {
     }
 
     #[test]
-    fn injected_resolver_enables_secrets_references_for_openai_and_anthropic() {
+    fn injected_resolver_enables_secrets_references_for_openai_and_anthropic() -> TestResult {
         let resolver = FakeSecretResolver {
             result: Ok(SecretString::new("resolved-secret".into())),
         };
 
         let config = secrets_config("openai-chat");
         let provider = OpenAiResponsesProvider::from_config_with_resolver(&config, &resolver)
-            .expect("injected resolver constructs OpenAI-compatible provider");
+            .map_err(ctx(
+                "injected resolver constructs OpenAI-compatible provider",
+            ))?;
         assert_eq!(provider.api_key.expose_secret(), "resolved-secret");
 
         let anthropic = secrets_provider_config("anthropic-messages");
@@ -4082,20 +4509,65 @@ mod tests {
             test_sources(&env_layer, Some(&resolver), None),
             &no_process_env,
         )
-        .expect("injected resolver constructs Anthropic credential");
+        .map_err(ctx("injected resolver constructs Anthropic credential"))?;
         let AnthropicCredential::ApiKey(secret) = credential else {
-            panic!("ordinary resolved secret must be an Anthropic API key");
+            return Err(TestError::Unexpected(
+                "ordinary resolved secret must be an Anthropic API key".to_owned(),
+            ));
         };
         assert_eq!(secret.expose_secret(), "resolved-secret");
 
-        build_provider_with_resolver(&config, &resolver)
-            .expect("injected resolver constructs configured provider router");
+        build_provider_with_resolver(&config, &resolver).map_err(ctx(
+            "injected resolver constructs configured provider router",
+        ))?;
+        Ok(())
     }
 
     #[test]
-    fn build_provider_without_resolver_rejects_secrets_references() {
+    fn resolve_provider_credential_returns_none_without_auth() -> TestResult {
+        let mut provider = configured_provider(
+            "openai-chat-no-auth",
+            "https://example.test/v1".to_owned(),
+            vec!["model"],
+            "UNUSED_KEY",
+        );
+        provider.auth = None;
+        let env_layer = BTreeMap::new();
+
+        let credential = resolve_provider_credential(&provider, &env_layer, None, None)
+            .map_err(ctx("provider without configured auth must still resolve"))?;
+        assert!(credential.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_provider_credential_resolves_env_reference() -> TestResult {
+        let provider = configured_provider(
+            "openai-chat-provider",
+            "https://example.test/v1".to_owned(),
+            vec!["model"],
+            "DOC_READ_PDF_PROVIDER_KEY",
+        );
+        let env_layer = BTreeMap::from([(
+            "DOC_READ_PDF_PROVIDER_KEY".to_owned(),
+            "sk-secret".to_owned(),
+        )]);
+
+        let credential = resolve_provider_credential(&provider, &env_layer, None, None)
+            .map_err(ctx("env-layer credential must resolve"))?
+            .ok_or(TestError::Missing("resolved provider credential"))?;
+        assert_eq!(credential.expose_secret(), "sk-secret");
+        Ok(())
+    }
+
+    #[test]
+    fn build_provider_without_resolver_rejects_secrets_references() -> TestResult {
         let error = match build_provider(&secrets_config("openai-chat")) {
-            Ok(_) => panic!("secrets references remain fail-closed without a resolver"),
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "secrets references remain fail-closed without a resolver".to_owned(),
+                ));
+            }
             Err(error) => error,
         };
 
@@ -4103,16 +4575,21 @@ mod tests {
             error,
             HttpProviderError::UnsupportedCredentialReference { .. }
         ));
+        Ok(())
     }
 
     #[test]
-    fn resolver_failure_diagnostic_does_not_include_secret_value() {
+    fn resolver_failure_diagnostic_does_not_include_secret_value() -> TestResult {
         let secret = "resolver-private-secret";
         let resolver = FakeSecretResolver {
             result: Err(format!("resolver unavailable: {secret}")),
         };
         let error = match build_provider_with_resolver(&secrets_config("openai-chat"), &resolver) {
-            Ok(_) => panic!("resolver failure must fail construction"),
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "resolver failure must fail construction".to_owned(),
+                ));
+            }
             Err(error) => error,
         };
 
@@ -4122,10 +4599,11 @@ mod tests {
                 if reason == SECRET_RESOLVER_FAILURE_REASON
         ));
         assert!(!error.to_string().contains(secret));
+        Ok(())
     }
 
     #[test]
-    fn resolver_failure_diagnostic_is_redacted_for_anthropic() {
+    fn resolver_failure_diagnostic_is_redacted_for_anthropic() -> TestResult {
         let secret = "anthropic-resolver-private-secret";
         let resolver = FakeSecretResolver {
             result: Err(format!("resolver unavailable: {secret}")),
@@ -4138,7 +4616,11 @@ mod tests {
             test_sources(&env_layer, Some(&resolver), None),
             &no_process_env,
         ) {
-            Ok(_) => panic!("resolver failure must fail Anthropic construction"),
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "resolver failure must fail Anthropic construction".to_owned(),
+                ));
+            }
             Err(error) => error,
         };
 
@@ -4148,10 +4630,11 @@ mod tests {
                 if reason == SECRET_RESOLVER_FAILURE_REASON
         ));
         assert!(!error.to_string().contains(secret));
+        Ok(())
     }
 
     #[test]
-    fn empty_resolver_credentials_are_rejected_for_openai_and_anthropic() {
+    fn empty_resolver_credentials_are_rejected_for_openai_and_anthropic() -> TestResult {
         for credential in ["", " \t\n"] {
             let resolver = FakeSecretResolver {
                 result: Ok(SecretString::new(credential.to_owned().into())),
@@ -4159,7 +4642,11 @@ mod tests {
             let config = secrets_config("openai-chat");
             let openai_error =
                 match OpenAiResponsesProvider::from_config_with_resolver(&config, &resolver) {
-                    Ok(_) => panic!("empty OpenAI resolver credential must fail construction"),
+                    Ok(_) => {
+                        return Err(TestError::Unexpected(
+                            "empty OpenAI resolver credential must fail construction".to_owned(),
+                        ));
+                    }
                     Err(error) => error,
                 };
             assert!(matches!(
@@ -4176,7 +4663,11 @@ mod tests {
                 test_sources(&env_layer, Some(&resolver), None),
                 &no_process_env,
             ) {
-                Ok(_) => panic!("empty Anthropic resolver credential must fail construction"),
+                Ok(_) => {
+                    return Err(TestError::Unexpected(
+                        "empty Anthropic resolver credential must fail construction".to_owned(),
+                    ));
+                }
                 Err(error) => error,
             };
             assert!(matches!(
@@ -4185,11 +4676,12 @@ mod tests {
                     if reason == EMPTY_CREDENTIAL_REASON
             ));
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn router_accepts_onboarded_secondary_provider_with_model_files() {
-        let (url, requests, server) = mock_chat_server(1);
+    async fn router_accepts_onboarded_secondary_provider_with_model_files() -> TestResult {
+        let (url, requests, server) = mock_chat_server(1)?;
         let mut config = harw_config::ResolvedConfig::default();
         config.harness.default_provider = Some("primary".into());
         config.harness.default_model = Some("primary-model".into());
@@ -4207,27 +4699,30 @@ mod tests {
             ("z-model", "secondary"),
             ("a-model", "secondary"),
         ] {
-            let model =
-                serde_json::from_value(serde_json::json!({"id": id, "provider": owner})).unwrap();
+            let model = serde_json::from_value(serde_json::json!({"id": id, "provider": owner}))
+                .map_err(ctx("model onboarding JSON"))?;
             config.models.insert(id.into(), model);
         }
-        let router = build_provider(&config).expect("onboarding model files must suffice");
+        let router = build_provider(&config).map_err(ctx("onboarding model files must suffice"))?;
         router
             .respond(request_with_ids(None, Some("secondary")))
             .await
-            .unwrap();
-        let request = requests.recv().unwrap();
+            .map_err(ctx("respond succeeds"))?;
+        let request = requests
+            .recv()
+            .map_err(ctx("mock server observed one request"))?;
         assert_eq!(
             request.get("model").and_then(Value::as_str),
             Some("a-model")
         );
-        server.join().unwrap();
+        server.join().map_err(join_thread_error)??;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn build_provider_routes_named_backends_to_distinct_endpoints_and_models() {
-        let (primary_url, primary_requests, primary_server) = mock_chat_server(1);
-        let (secondary_url, secondary_requests, secondary_server) = mock_chat_server(2);
+    async fn build_provider_routes_named_backends_to_distinct_endpoints_and_models() -> TestResult {
+        let (primary_url, primary_requests, primary_server) = mock_chat_server(1)?;
+        let (secondary_url, secondary_requests, secondary_server) = mock_chat_server(2)?;
         let mut config = harw_config::ResolvedConfig::default();
         config.harness.default_provider = Some("primary".to_owned());
         config.harness.default_model = Some("global-default-model".to_owned());
@@ -4256,27 +4751,27 @@ mod tests {
             .env_layer
             .insert("SECONDARY_KEY".to_owned(), "secondary-secret".to_owned());
 
-        let provider = build_provider(&config).expect("construct configured router");
+        let provider = build_provider(&config).map_err(ctx("construct configured router"))?;
         provider
             .respond(request_with_ids(Some("primary-request-model"), None))
             .await
-            .expect("default provider response");
+            .map_err(ctx("default provider response"))?;
         provider
             .respond(request_with_ids(None, Some("secondary")))
             .await
-            .expect("secondary fallback response");
+            .map_err(ctx("secondary fallback response"))?;
         provider
             .respond(request_with_ids(
                 Some("secondary-request-model"),
                 Some("secondary"),
             ))
             .await
-            .expect("secondary override response");
+            .map_err(ctx("secondary override response"))?;
 
         assert_eq!(
             primary_requests
                 .recv()
-                .expect("primary request")
+                .map_err(ctx("primary request"))?
                 .get("model")
                 .and_then(Value::as_str),
             Some("primary-request-model")
@@ -4284,7 +4779,7 @@ mod tests {
         assert_eq!(
             secondary_requests
                 .recv()
-                .expect("secondary fallback request")
+                .map_err(ctx("secondary fallback request"))?
                 .get("model")
                 .and_then(Value::as_str),
             Some("secondary-fallback")
@@ -4292,21 +4787,18 @@ mod tests {
         assert_eq!(
             secondary_requests
                 .recv()
-                .expect("secondary override request")
+                .map_err(ctx("secondary override request"))?
                 .get("model")
                 .and_then(Value::as_str),
             Some("secondary-request-model")
         );
-        primary_server
-            .join()
-            .expect("primary mock server completes");
-        secondary_server
-            .join()
-            .expect("secondary mock server completes");
+        primary_server.join().map_err(join_thread_error)??;
+        secondary_server.join().map_err(join_thread_error)??;
+        Ok(())
     }
 
     #[test]
-    fn build_provider_with_load_registry_exposes_a_handle_per_openai_provider() {
+    fn build_provider_with_load_registry_exposes_a_handle_per_openai_provider() -> TestResult {
         let mut config = harw_config::ResolvedConfig::default();
         config.harness.default_provider = Some("primary".to_owned());
         config.harness.default_model = Some("a-model".to_owned());
@@ -4323,26 +4815,24 @@ mod tests {
             .env_layer
             .insert("PRIMARY_KEY".to_owned(), "primary-secret".to_owned());
 
-        let (_provider, registry) =
-            build_provider_with_load_registry(&config).expect("construct configured provider");
+        let (_provider, registry) = build_provider_with_load_registry(&config)
+            .map_err(ctx("construct configured provider"))?;
 
-        let handle = registry
-            .get("primary")
-            .expect("openai-compatible provider must expose a ProviderLoadControl handle");
+        let handle = registry.get("primary").ok_or(TestError::Missing(
+            "openai-compatible provider must expose a ProviderLoadControl handle",
+        ))?;
         let status = handle.provider_status();
         assert_eq!(status.provider, "primary");
         assert_eq!(
             status.max_concurrency, None,
             "unconfigured max_concurrency stays unlimited"
         );
-        assert_eq!(
-            status.recent_rate_limited, 0,
-            "no 429 observed yet"
-        );
+        assert_eq!(status.recent_rate_limited, 0, "no 429 observed yet");
+        Ok(())
     }
 
     #[test]
-    fn provider_load_control_set_max_concurrency_applies_immediately() {
+    fn provider_load_control_set_max_concurrency_applies_immediately() -> TestResult {
         let mut config = harw_config::ResolvedConfig::default();
         config.harness.default_provider = Some("primary".to_owned());
         config.harness.default_model = Some("a-model".to_owned());
@@ -4359,19 +4849,22 @@ mod tests {
             .env_layer
             .insert("PRIMARY_KEY".to_owned(), "primary-secret".to_owned());
 
-        let (_provider, registry) =
-            build_provider_with_load_registry(&config).expect("construct configured provider");
-        let handle = registry.get("primary").expect("handle registered");
+        let (_provider, registry) = build_provider_with_load_registry(&config)
+            .map_err(ctx("construct configured provider"))?;
+        let handle = registry
+            .get("primary")
+            .ok_or(TestError::Missing("handle registered"))?;
 
         let applied = handle.set_max_concurrency(Some(2));
         assert!(applied, "OpenAI-compatible provider always has a limiter");
         let status = handle.provider_status();
         assert_eq!(status.max_concurrency, Some(2));
         assert_eq!(status.available_permits, 2);
+        Ok(())
     }
 
     #[test]
-    fn provider_load_registry_has_entry_for_anthropic_messages_provider() {
+    fn provider_load_registry_has_entry_for_anthropic_messages_provider() -> TestResult {
         let mut config = harw_config::ResolvedConfig::default();
         config.harness.default_provider = Some("claude".to_owned());
         config.harness.default_model = Some("claude-model".to_owned());
@@ -4387,11 +4880,11 @@ mod tests {
             .env_layer
             .insert("CLAUDE_KEY".to_owned(), "claude-secret".to_owned());
 
-        let (_provider, registry) =
-            build_provider_with_load_registry(&config).expect("construct configured provider");
-        let handle = registry
-            .get("claude")
-            .expect("anthropic-messages provider now exposes a ProviderLoadControl handle");
+        let (_provider, registry) = build_provider_with_load_registry(&config)
+            .map_err(ctx("construct configured provider"))?;
+        let handle = registry.get("claude").ok_or(TestError::Missing(
+            "anthropic-messages provider now exposes a ProviderLoadControl handle",
+        ))?;
         let status = handle.provider_status();
         assert_eq!(status.provider, "claude");
         assert_eq!(
@@ -4399,10 +4892,11 @@ mod tests {
             "unconfigured max_concurrency stays unlimited"
         );
         assert_eq!(status.recent_rate_limited, 0, "no 429 observed yet");
+        Ok(())
     }
 
     #[test]
-    fn anthropic_provider_load_control_set_max_concurrency_applies_immediately() {
+    fn anthropic_provider_load_control_set_max_concurrency_applies_immediately() -> TestResult {
         let mut config = harw_config::ResolvedConfig::default();
         config.harness.default_provider = Some("claude".to_owned());
         config.harness.default_model = Some("claude-model".to_owned());
@@ -4418,15 +4912,18 @@ mod tests {
             .env_layer
             .insert("CLAUDE_KEY".to_owned(), "claude-secret".to_owned());
 
-        let (_provider, registry) =
-            build_provider_with_load_registry(&config).expect("construct configured provider");
-        let handle = registry.get("claude").expect("handle registered");
+        let (_provider, registry) = build_provider_with_load_registry(&config)
+            .map_err(ctx("construct configured provider"))?;
+        let handle = registry
+            .get("claude")
+            .ok_or(TestError::Missing("handle registered"))?;
 
         let applied = handle.set_max_concurrency(Some(2));
         assert!(applied, "Anthropic-Provider always has a limiter");
         let status = handle.provider_status();
         assert_eq!(status.max_concurrency, Some(2));
         assert_eq!(status.available_permits, 2);
+        Ok(())
     }
 
     fn request_with_ids(model_id: Option<&str>, provider_id: Option<&str>) -> ModelRequest {
@@ -4444,6 +4941,7 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         }
     }
 
@@ -4491,20 +4989,23 @@ mod tests {
     }
 
     #[test]
-    fn test_new_sets_fields() {
+    fn test_new_sets_fields() -> TestResult {
         let provider = OpenAiResponsesProvider::new(
             "https://example.test/v1",
             "gpt-test",
             SecretString::new("sk-secret".into()),
-        );
+        )
+        .map_err(ctx("OpenAiResponsesProvider::new"))?;
         assert_eq!(provider.base_url, "https://example.test/v1");
         assert_eq!(provider.model, "gpt-test");
         assert_eq!(provider.api_key.expose_secret(), "sk-secret");
         assert_eq!(provider.request_timeout, DEFAULT_REQUEST_TIMEOUT);
+        Ok(())
     }
 
     #[test]
-    fn provider_load_status_reflects_recorded_rate_limits_without_a_concurrency_limiter() {
+    fn provider_load_status_reflects_recorded_rate_limits_without_a_concurrency_limiter()
+    -> TestResult {
         // `OpenAiResponsesProvider::new` (unlike `from_named_config`) never
         // installs a `DynamicConcurrencyLimiter` — `load_status`/
         // `ProviderLoadControl::set_max_concurrency` must degrade cleanly:
@@ -4515,7 +5016,8 @@ mod tests {
             "https://example.test/v1",
             "gpt-test",
             SecretString::new("sk-secret".into()),
-        );
+        )
+        .map_err(ctx("OpenAiResponsesProvider::new"))?;
         let status = provider.load_status();
         assert_eq!(status.max_concurrency, None);
         assert_eq!(status.available_permits, usize::MAX);
@@ -4530,6 +5032,7 @@ mod tests {
             !ProviderLoadControl::set_max_concurrency(&provider, Some(1)),
             "no limiter installed via ::new — must not silently succeed"
         );
+        Ok(())
     }
 
     #[test]
@@ -4582,15 +5085,15 @@ mod tests {
     }
 
     #[test]
-    fn test_read_external_cli_credential_non_official_host_returns_none() {
+    fn test_read_external_cli_credential_non_official_host_returns_none() -> TestResult {
         let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
             // Ohne HOME kann der Allowlist-Pfad nicht gebildet werden; das ist
             // hier irrelevant, weil der Host schon vorher ablehnt, aber die
             // Funktion selbst liest HOME zuerst.
-            return;
+            return Ok(());
         };
         let path = PathBuf::from(home).join(".codex/auth.json");
-        let raw_path = path.to_str().expect("utf8 test path");
+        let raw_path = path.to_str().ok_or(TestError::Missing("utf8 test path"))?;
 
         let result = read_external_cli_credential(
             Some("https://evil.example/v1"),
@@ -4599,15 +5102,16 @@ mod tests {
         );
 
         assert!(result.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_read_external_cli_credential_wrong_pointer_returns_none() {
+    fn test_read_external_cli_credential_wrong_pointer_returns_none() -> TestResult {
         let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
-            return;
+            return Ok(());
         };
         let path = PathBuf::from(home).join(".codex/auth.json");
-        let raw_path = path.to_str().expect("utf8 test path");
+        let raw_path = path.to_str().ok_or(TestError::Missing("utf8 test path"))?;
 
         let result = read_external_cli_credential(
             Some("https://api.openai.com/v1"),
@@ -4616,15 +5120,16 @@ mod tests {
         );
 
         assert!(result.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_codex_chatgpt_access_token_cannot_be_used_for_openai_api() {
+    fn test_codex_chatgpt_access_token_cannot_be_used_for_openai_api() -> TestResult {
         let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
-            return;
+            return Ok(());
         };
         let path = PathBuf::from(home).join(".codex/auth.json");
-        let raw_path = path.to_str().expect("utf8 test path");
+        let raw_path = path.to_str().ok_or(TestError::Missing("utf8 test path"))?;
 
         let result = read_external_cli_credential(
             Some("https://api.openai.com/v1"),
@@ -4633,15 +5138,16 @@ mod tests {
         );
 
         assert!(result.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_read_external_cli_credential_wrong_path_returns_none() {
+    fn test_read_external_cli_credential_wrong_path_returns_none() -> TestResult {
         let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
-            return;
+            return Ok(());
         };
         let path = PathBuf::from(home).join("not-an-allowlisted-file.json");
-        let raw_path = path.to_str().expect("utf8 test path");
+        let raw_path = path.to_str().ok_or(TestError::Missing("utf8 test path"))?;
 
         let result = read_external_cli_credential(
             Some("https://api.openai.com/v1"),
@@ -4650,23 +5156,28 @@ mod tests {
         );
 
         assert!(result.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_secret_rejects_secrets_reference_without_disclosing_it() {
+    fn test_resolve_secret_rejects_secrets_reference_without_disclosing_it() -> TestResult {
         let reference = "tenant/provider-token-with-secret-metadata";
         let env_layer = BTreeMap::new();
-        let error = resolve_secret(
+        let Err(error) = resolve_secret(
             &harw_config::SecretRef::Secrets(reference.to_owned()),
             test_sources(&env_layer, None, None),
-        )
-        .expect_err("secrets references are unsupported by the HTTP provider");
+        ) else {
+            return Err(TestError::Unexpected(
+                "secrets references are unsupported by the HTTP provider".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             &error,
             HttpProviderError::UnsupportedCredentialReference { .. }
         ));
         assert!(!error.to_string().contains(reference));
+        Ok(())
     }
 
     #[test]
@@ -4684,22 +5195,23 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_request_id_prefers_openai_header_and_bounds_value() {
+    fn test_provider_request_id_prefers_openai_header_and_bounds_value() -> TestResult {
         let mut headers = reqwest::header::HeaderMap::new();
         let long_request_id = "r".repeat(140);
         headers.insert(
             "x-request-id",
-            long_request_id.parse().expect("valid header value"),
+            long_request_id.parse().map_err(ctx("valid header value"))?,
         );
         headers.insert(
             "request-id",
             reqwest::header::HeaderValue::from_static("fallback"),
         );
 
-        let request_id = provider_request_id(&headers).expect("request ID");
+        let request_id = provider_request_id(&headers).ok_or(TestError::Missing("request ID"))?;
 
         assert_eq!(request_id.len(), 128);
         assert!(request_id.chars().all(|character| character == 'r'));
+        Ok(())
     }
 
     #[test]
@@ -4741,52 +5253,63 @@ mod tests {
     }
 
     #[test]
-    fn test_new_defaults_to_responses_transport() {
+    fn test_new_defaults_to_responses_transport() -> TestResult {
         let provider = OpenAiResponsesProvider::new(
             "https://example.test/v1",
             "gpt-test",
             SecretString::new("sk-secret".into()),
-        );
+        )
+        .map_err(ctx("OpenAiResponsesProvider::new"))?;
         assert_eq!(provider.transport, Transport::Responses);
+        Ok(())
     }
 
     #[test]
-    fn test_selected_model_uses_requested_model_for_compatible_provider() {
+    fn test_selected_model_uses_requested_model_for_compatible_provider() -> TestResult {
         let provider = OpenAiResponsesProvider::new(
             "https://example.test/v1",
             "configured-model",
             SecretString::new("sk-secret".into()),
-        );
+        )
+        .map_err(ctx("OpenAiResponsesProvider::new"))?;
         let request = request_with_ids(Some("requested-model"), Some("openai"));
 
         assert_eq!(
-            provider.selected_model(&request).unwrap(),
+            provider
+                .selected_model(&request)
+                .map_err(ctx("selected_model succeeds"))?,
             "requested-model"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_selected_model_preserves_configured_default_for_empty_identifiers() {
+    fn test_selected_model_preserves_configured_default_for_empty_identifiers() -> TestResult {
         let provider = OpenAiResponsesProvider::new(
             "https://example.test/v1",
             "configured-model",
             SecretString::new("sk-secret".into()),
-        );
+        )
+        .map_err(ctx("OpenAiResponsesProvider::new"))?;
         let request = request_with_ids(Some(""), Some(""));
 
         assert_eq!(
-            provider.selected_model(&request).unwrap(),
+            provider
+                .selected_model(&request)
+                .map_err(ctx("selected_model succeeds"))?,
             "configured-model"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_selected_model_rejects_provider_mismatch() {
+    fn test_selected_model_rejects_provider_mismatch() -> TestResult {
         let provider = OpenAiResponsesProvider::new(
             "https://example.test/v1",
             "configured-model",
             SecretString::new("sk-secret".into()),
-        );
+        )
+        .map_err(ctx("OpenAiResponsesProvider::new"))?;
         let request = request_with_ids(Some("requested-model"), Some("anthropic"));
 
         assert!(matches!(
@@ -4794,30 +5317,37 @@ mod tests {
             Err(ModelError::RequestFailed(message))
                 if message.contains("anthropic") && message.contains("openai")
         ));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_respond_rejects_provider_mismatch_before_http_request() {
+    async fn test_respond_rejects_provider_mismatch_before_http_request() -> TestResult {
         let provider = OpenAiResponsesProvider::new(
             "http://127.0.0.1:1/v1",
             "configured-model",
             SecretString::new("sk-secret".into()),
-        );
+        )
+        .map_err(ctx("OpenAiResponsesProvider::new"))?;
 
-        let error = provider
+        let Err(error) = provider
             .respond(request_with_ids(Some("requested-model"), Some("anthropic")))
             .await
-            .expect_err("a request for another provider must fail before HTTP");
+        else {
+            return Err(TestError::Unexpected(
+                "a request for another provider must fail before HTTP".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
             ModelError::RequestFailed(message)
                 if message.contains("anthropic") && message.contains("openai")
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_build_chat_body_shape() {
+    fn test_build_chat_body_shape() -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Hi there");
         let request = ModelRequest {
@@ -4834,6 +5364,7 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
 
         let body = build_chat_body(&request, "gpt-4o-mini");
@@ -4844,7 +5375,7 @@ mod tests {
         let messages = body
             .get("messages")
             .and_then(Value::as_array)
-            .expect("messages array");
+            .ok_or(TestError::Missing("messages array"))?;
         assert_eq!(messages.len(), 2);
         assert_eq!(
             messages[0].get("role").and_then(Value::as_str),
@@ -4862,10 +5393,11 @@ mod tests {
             messages[1].get("content").and_then(Value::as_str),
             Some("Hi there")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_build_chat_body_omits_empty_system() {
+    fn test_build_chat_body_omits_empty_system() -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Only user");
         let request = ModelRequest {
@@ -4882,18 +5414,20 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
 
         let body = build_chat_body(&request, "m");
         let messages = body
             .get("messages")
             .and_then(Value::as_array)
-            .expect("messages array");
+            .ok_or(TestError::Missing("messages array"))?;
         assert_eq!(messages.len(), 1);
         assert_eq!(
             messages[0].get("role").and_then(Value::as_str),
             Some("user")
         );
+        Ok(())
     }
 
     #[test]
@@ -4904,6 +5438,118 @@ mod tests {
             ]
         });
         assert_eq!(extract_chat_content(&body).as_deref(), Some("Hello world"));
+    }
+
+    #[test]
+    fn test_interpret_chat_parses_reasoning_content_into_opaque_reasoning() -> TestResult {
+        let body = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello world",
+                    "reasoning_content": "Let me think about this step by step."
+                }
+            }]
+        });
+        let response = interpret_chat(&body, "dashscope", "qwen-thinking", &[])
+            .map_err(ctx("interpret_chat must succeed"))?;
+        let reasoning = response
+            .reasoning
+            .ok_or(TestError::Missing("reasoning must be present"))?;
+        assert_eq!(reasoning.provider, "dashscope");
+        assert_eq!(reasoning.model, "qwen-thinking");
+        assert_eq!(
+            reasoning.blocks,
+            vec![serde_json::json!({
+                "type": "reasoning_content",
+                "text": "Let me think about this step by step."
+            })]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_interpret_chat_reasoning_none_when_field_absent() -> TestResult {
+        let body = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello world"
+                }
+            }]
+        });
+        let response = interpret_chat(&body, "dashscope", "qwen-plain", &[])
+            .map_err(ctx("interpret_chat must succeed"))?;
+        assert!(response.reasoning.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_interpret_chat_reasoning_none_when_field_blank() -> TestResult {
+        let body = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello world",
+                    "reasoning_content": "   "
+                }
+            }]
+        });
+        let response = interpret_chat(&body, "dashscope", "qwen-plain", &[])
+            .map_err(ctx("interpret_chat must succeed"))?;
+        assert!(response.reasoning.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_interpret_chat_recovers_text_embedded_tool_call_when_offered() -> TestResult {
+        let body = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "<tool_call>fs.read{\"path\":\"harw-cli/src/main.rs\"}"
+                }
+            }]
+        });
+        let response = interpret_chat(&body, "glm-gateway", "glm-5", &["fs.read"])
+            .map_err(ctx("interpret_chat must succeed"))?;
+        assert!(response.message.is_none());
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id.as_str(), "call_text_0");
+        assert_eq!(response.tool_calls[0].name.as_str(), "fs.read");
+        assert_eq!(
+            response.tool_calls[0].arguments,
+            serde_json::json!({"path": "harw-cli/src/main.rs"})
+        );
+        assert!(matches!(response.stop, StopReason::ToolUse));
+        Ok(())
+    }
+
+    #[test]
+    fn test_interpret_chat_leaves_text_tool_call_as_plain_text_when_not_offered() -> TestResult {
+        let body = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "<tool_call>fs.read{\"path\":\"harw-cli/src/main.rs\"}"
+                }
+            }]
+        });
+        // Kein Tool angeboten (`offered_tools` leer) -- der Text bleibt
+        // unverändert die finale Antwort, kein synthetischer Tool-Call.
+        let response = interpret_chat(&body, "glm-gateway", "glm-5", &[])
+            .map_err(ctx("interpret_chat must succeed"))?;
+        assert_eq!(
+            response.message.as_deref(),
+            Some("<tool_call>fs.read{\"path\":\"harw-cli/src/main.rs\"}")
+        );
+        assert!(response.tool_calls.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -5009,7 +5655,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_request_sets_reasoning_when_effort_present() {
+    fn test_build_request_sets_reasoning_when_effort_present() -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Hi there");
         let request = ModelRequest {
@@ -5026,12 +5672,46 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
 
         let req = build_request("gpt-test", &request);
-        let reasoning = req.reasoning.expect("reasoning must be set");
+        let reasoning = req
+            .reasoning
+            .ok_or(TestError::Missing("reasoning must be set"))?;
         assert_eq!(reasoning.effort.as_deref(), Some("minimal"));
-        assert_eq!(reasoning.summary, None);
+        assert_eq!(reasoning.summary.as_deref(), Some("auto"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_request_reasoning_summary_serializes_as_auto() -> TestResult {
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_user_text("Hi there");
+        let request = ModelRequest {
+            system_prompt: String::new(),
+            instruction_fragments: Vec::new(),
+            context: Vec::new(),
+            history,
+            tools: Vec::new(),
+            context_assembly: Default::default(),
+            reasoning_effort: Some(harw_types::ReasoningEffort::High),
+            model_id: None,
+            provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
+            cancel: None,
+            identity: None,
+        };
+
+        let req = build_request("gpt-test", &request);
+        let json = serde_json::to_value(&req).map_err(ctx("request must serialize"))?;
+        assert_eq!(
+            json.pointer("/reasoning/summary"),
+            Some(&Value::from("auto"))
+        );
+        Ok(())
     }
 
     #[test]
@@ -5052,6 +5732,7 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
 
         let req = build_request("gpt-test", &request);
@@ -5103,7 +5784,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_responses_tools_strict_true_required_includes_every_property() {
+    fn test_build_responses_tools_strict_true_required_includes_every_property() -> TestResult {
         let tools = vec![tool_spec_with_optional_field(true)];
         let defs = build_responses_tools(&tools);
         assert_eq!(defs.len(), 1);
@@ -5112,15 +5793,16 @@ mod tests {
             .parameters
             .get("required")
             .and_then(Value::as_array)
-            .expect("required array present");
+            .ok_or(TestError::Missing("required array present"))?;
         let required: Vec<&str> = required.iter().filter_map(Value::as_str).collect();
         assert!(required.contains(&"path"));
         assert!(required.contains(&"max_bytes"));
         assert_eq!(required.len(), 2);
+        Ok(())
     }
 
     #[test]
-    fn test_build_responses_tools_strict_false_leaves_parameters_unchanged() {
+    fn test_build_responses_tools_strict_false_leaves_parameters_unchanged() -> TestResult {
         let tools = vec![tool_spec_with_optional_field(false)];
         let defs = build_responses_tools(&tools);
         assert_eq!(defs.len(), 1);
@@ -5129,20 +5811,21 @@ mod tests {
             .parameters
             .get("required")
             .and_then(Value::as_array)
-            .expect("required array present");
+            .ok_or(TestError::Missing("required array present"))?;
         let required: Vec<&str> = required.iter().filter_map(Value::as_str).collect();
         assert_eq!(required, vec!["path"]);
         assert!(defs[0].parameters.get("additionalProperties").is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_build_chat_tools_strict_true_required_includes_every_property() {
+    fn test_build_chat_tools_strict_true_required_includes_every_property() -> TestResult {
         let tools = vec![tool_spec_with_optional_field(true)];
         let defs = build_chat_tools(&tools);
         assert_eq!(defs.len(), 1);
         let required = defs[0]["function"]["parameters"]["required"]
             .as_array()
-            .expect("required array present");
+            .ok_or(TestError::Missing("required array present"))?;
         let required: Vec<&str> = required.iter().filter_map(Value::as_str).collect();
         assert!(required.contains(&"path"));
         assert!(required.contains(&"max_bytes"));
@@ -5151,19 +5834,21 @@ mod tests {
             defs[0]["function"]["parameters"]["additionalProperties"],
             Value::Bool(false)
         );
+        Ok(())
     }
 
     #[test]
-    fn test_build_chat_tools_strict_false_leaves_parameters_unchanged() {
+    fn test_build_chat_tools_strict_false_leaves_parameters_unchanged() -> TestResult {
         let tools = vec![tool_spec_with_optional_field(false)];
         let defs = build_chat_tools(&tools);
         assert_eq!(defs.len(), 1);
         let required = defs[0]["function"]["parameters"]["required"]
             .as_array()
-            .expect("required array present");
+            .ok_or(TestError::Missing("required array present"))?;
         let required: Vec<&str> = required.iter().filter_map(Value::as_str).collect();
         assert_eq!(required, vec!["path"]);
         assert!(defs[0]["function"]["parameters"]["additionalProperties"].is_null());
+        Ok(())
     }
 
     #[test]
@@ -5184,6 +5869,7 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
         let req = build_request("gpt-test", &request);
         assert_eq!(req.tools.len(), 1);
@@ -5192,7 +5878,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_request_maps_tool_call_to_function_call_item() {
+    fn test_build_request_maps_tool_call_to_function_call_item() -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
         history.push_tool_call(
             harw_types::ToolCallId::from_str("call_1"),
@@ -5213,6 +5899,7 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
         let req = build_request("gpt-test", &request);
         assert_eq!(req.input.len(), 1);
@@ -5224,18 +5911,23 @@ mod tests {
             } => {
                 assert_eq!(call_id, "call_1");
                 assert_eq!(name, "get_weather");
-                let parsed: Value = serde_json::from_str(arguments).expect("valid JSON");
+                let parsed: Value = serde_json::from_str(arguments).map_err(ctx("valid JSON"))?;
                 assert_eq!(
                     parsed.get("location").and_then(Value::as_str),
                     Some("Paris")
                 );
             }
-            other => panic!("expected FunctionCall item, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected FunctionCall item, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_build_chat_body_includes_tools_when_present() {
+    fn test_build_chat_body_includes_tools_when_present() -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("weather?");
         let request = ModelRequest {
@@ -5252,12 +5944,13 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
         let body = build_chat_body(&request, "gpt-4o-mini");
         let tools = body
             .get("tools")
             .and_then(Value::as_array)
-            .expect("tools array");
+            .ok_or(TestError::Missing("tools array"))?;
         assert_eq!(tools.len(), 1);
         assert_eq!(
             tools[0].get("type").and_then(Value::as_str),
@@ -5270,6 +5963,7 @@ mod tests {
                 .and_then(Value::as_str),
             Some("get_weather")
         );
+        Ok(())
     }
 
     #[test]
@@ -5290,13 +5984,14 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
         let body = build_chat_body(&request, "gpt-4o-mini");
         assert!(body.get("tools").is_none());
     }
 
     #[test]
-    fn test_build_chat_body_maps_tool_call_to_tool_calls_array() {
+    fn test_build_chat_body_maps_tool_call_to_tool_calls_array() -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
         history.push_tool_call(
             harw_types::ToolCallId::from_str("call_1"),
@@ -5317,12 +6012,13 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
         let body = build_chat_body(&request, "gpt-4o-mini");
         let messages = body
             .get("messages")
             .and_then(Value::as_array)
-            .expect("messages");
+            .ok_or(TestError::Missing("messages"))?;
         assert_eq!(
             messages[0].get("role").and_then(Value::as_str),
             Some("assistant")
@@ -5330,7 +6026,7 @@ mod tests {
         let tool_calls = messages[0]
             .get("tool_calls")
             .and_then(Value::as_array)
-            .expect("tool_calls array");
+            .ok_or(TestError::Missing("tool_calls array"))?;
         assert_eq!(
             tool_calls[0].get("id").and_then(Value::as_str),
             Some("call_1")
@@ -5339,7 +6035,9 @@ mod tests {
             tool_calls[0].get("type").and_then(Value::as_str),
             Some("function")
         );
-        let function = tool_calls[0].get("function").expect("function object");
+        let function = tool_calls[0]
+            .get("function")
+            .ok_or(TestError::Missing("function object"))?;
         assert_eq!(
             function.get("name").and_then(Value::as_str),
             Some("get_weather")
@@ -5347,16 +6045,17 @@ mod tests {
         let arguments_str = function
             .get("arguments")
             .and_then(Value::as_str)
-            .expect("arguments string");
-        let parsed: Value = serde_json::from_str(arguments_str).expect("valid JSON");
+            .ok_or(TestError::Missing("arguments string"))?;
+        let parsed: Value = serde_json::from_str(arguments_str).map_err(ctx("valid JSON"))?;
         assert_eq!(
             parsed.get("location").and_then(Value::as_str),
             Some("Paris")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_build_chat_body_maps_tool_result_to_tool_role_with_call_id() {
+    fn test_build_chat_body_maps_tool_result_to_tool_role_with_call_id() -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
         history.push_tool_result(
             harw_types::ToolCallId::from_str("call_1"),
@@ -5377,12 +6076,13 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
         let body = build_chat_body(&request, "gpt-4o-mini");
         let messages = body
             .get("messages")
             .and_then(Value::as_array)
-            .expect("messages");
+            .ok_or(TestError::Missing("messages"))?;
         assert_eq!(
             messages[0].get("role").and_then(Value::as_str),
             Some("tool")
@@ -5391,10 +6091,11 @@ mod tests {
             messages[0].get("tool_call_id").and_then(Value::as_str),
             Some("call_1")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_build_chat_body_groups_parallel_tool_calls_into_one_assistant_message() {
+    fn test_build_chat_body_groups_parallel_tool_calls_into_one_assistant_message() -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("what's the weather in Paris and Berlin?");
         history.push_tool_call(
@@ -5431,12 +6132,13 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
         let body = build_chat_body(&request, "gpt-4o-mini");
         let messages = body
             .get("messages")
             .and_then(Value::as_array)
-            .expect("messages");
+            .ok_or(TestError::Missing("messages"))?;
 
         // user, one grouped assistant message, two tool-result messages.
         assert_eq!(messages.len(), 4);
@@ -5452,7 +6154,7 @@ mod tests {
         let tool_calls = messages[1]
             .get("tool_calls")
             .and_then(Value::as_array)
-            .expect("tool_calls array");
+            .ok_or(TestError::Missing("tool_calls array"))?;
         assert_eq!(tool_calls.len(), 2);
         assert_eq!(
             tool_calls[0].get("id").and_then(Value::as_str),
@@ -5479,10 +6181,11 @@ mod tests {
             messages[3].get("tool_call_id").and_then(Value::as_str),
             Some("call_b")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_build_chat_body_single_tool_call_stays_one_assistant_message() {
+    fn test_build_chat_body_single_tool_call_stays_one_assistant_message() -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
         history.push_tool_call(
             harw_types::ToolCallId::from_str("call_1"),
@@ -5503,22 +6206,24 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
         let body = build_chat_body(&request, "gpt-4o-mini");
         let messages = body
             .get("messages")
             .and_then(Value::as_array)
-            .expect("messages");
+            .ok_or(TestError::Missing("messages"))?;
         assert_eq!(messages.len(), 1);
         let tool_calls = messages[0]
             .get("tool_calls")
             .and_then(Value::as_array)
-            .expect("tool_calls array");
+            .ok_or(TestError::Missing("tool_calls array"))?;
         assert_eq!(tool_calls.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_build_chat_body_separate_tool_rounds_stay_separate_assistant_messages() {
+    fn test_build_chat_body_separate_tool_rounds_stay_separate_assistant_messages() -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
         history.push_tool_call(
             harw_types::ToolCallId::from_str("call_a"),
@@ -5554,12 +6259,13 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
         let body = build_chat_body(&request, "gpt-4o-mini");
         let messages = body
             .get("messages")
             .and_then(Value::as_array)
-            .expect("messages");
+            .ok_or(TestError::Missing("messages"))?;
 
         // call_a, result_a, call_b, result_b: four separate messages, no grouping.
         assert_eq!(messages.len(), 4);
@@ -5570,7 +6276,7 @@ mod tests {
         let first_calls = messages[0]
             .get("tool_calls")
             .and_then(Value::as_array)
-            .expect("first tool_calls array");
+            .ok_or(TestError::Missing("first tool_calls array"))?;
         assert_eq!(first_calls.len(), 1);
         assert_eq!(
             messages[1].get("role").and_then(Value::as_str),
@@ -5583,16 +6289,17 @@ mod tests {
         let second_calls = messages[2]
             .get("tool_calls")
             .and_then(Value::as_array)
-            .expect("second tool_calls array");
+            .ok_or(TestError::Missing("second tool_calls array"))?;
         assert_eq!(second_calls.len(), 1);
         assert_eq!(
             messages[3].get("role").and_then(Value::as_str),
             Some("tool")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_extract_responses_tool_calls_parses_function_call_items() {
+    fn test_extract_responses_tool_calls_parses_function_call_items() -> TestResult {
         let body = serde_json::json!({
             "output": [
                 { "type": "reasoning" },
@@ -5605,7 +6312,7 @@ mod tests {
             ]
         });
         let calls = extract_openai_tool_calls(&body, Transport::Responses)
-            .expect("valid Responses tool-call arguments");
+            .map_err(ctx("valid Responses tool-call arguments"))?;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id.as_str(), "call_1");
         assert_eq!(calls[0].name.as_str(), "get_weather");
@@ -5613,10 +6320,11 @@ mod tests {
             calls[0].arguments.get("location").and_then(Value::as_str),
             Some("Paris")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_extract_chat_tool_calls_parses_message_tool_calls() {
+    fn test_extract_chat_tool_calls_parses_message_tool_calls() -> TestResult {
         let body = serde_json::json!({
             "choices": [{
                 "message": {
@@ -5633,7 +6341,7 @@ mod tests {
             }]
         });
         let calls = extract_openai_tool_calls(&body, Transport::Chat)
-            .expect("valid Chat tool-call arguments");
+            .map_err(ctx("valid Chat tool-call arguments"))?;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id.as_str(), "call_1");
         assert_eq!(calls[0].name.as_str(), "get_weather");
@@ -5641,10 +6349,11 @@ mod tests {
             calls[0].arguments.get("location").and_then(Value::as_str),
             Some("Paris")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_extract_responses_tool_calls_rejects_malformed_item_with_valid_sibling() {
+    fn test_extract_responses_tool_calls_rejects_malformed_item_with_valid_sibling() -> TestResult {
         let valid_sibling = serde_json::json!({
             "type": "function_call",
             "call_id": "call_valid",
@@ -5692,14 +6401,18 @@ mod tests {
             let body = serde_json::json!({
                 "output": [valid_sibling, malformed_item]
             });
-            let error = extract_openai_tool_calls(&body, Transport::Responses)
-                .expect_err("a malformed function_call must reject its valid sibling");
+            let Err(error) = extract_openai_tool_calls(&body, Transport::Responses) else {
+                return Err(TestError::Unexpected(
+                    "a malformed function_call must reject its valid sibling".to_owned(),
+                ));
+            };
             assert_eq!(error, expected_error);
         }
+        Ok(())
     }
 
     #[test]
-    fn test_extract_chat_tool_calls_rejects_malformed_item_with_valid_sibling() {
+    fn test_extract_chat_tool_calls_rejects_malformed_item_with_valid_sibling() -> TestResult {
         let valid_sibling = serde_json::json!({
             "id": "call_valid",
             "function": { "name": "get_weather", "arguments": "{}" }
@@ -5748,28 +6461,33 @@ mod tests {
                     "message": { "tool_calls": [valid_sibling, malformed_call] }
                 }]
             });
-            let error = extract_openai_tool_calls(&body, Transport::Chat)
-                .expect_err("a malformed tool_calls item must reject its valid sibling");
+            let Err(error) = extract_openai_tool_calls(&body, Transport::Chat) else {
+                return Err(TestError::Unexpected(
+                    "a malformed tool_calls item must reject its valid sibling".to_owned(),
+                ));
+            };
             assert_eq!(error, expected_error);
         }
+        Ok(())
     }
 
     #[test]
-    fn test_extract_openai_tool_calls_empty_when_absent() {
+    fn test_extract_openai_tool_calls_empty_when_absent() -> TestResult {
         assert!(
             extract_openai_tool_calls(&serde_json::json!({"output": []}), Transport::Responses)
-                .expect("empty Responses output is valid")
+                .map_err(ctx("empty Responses output is valid"))?
                 .is_empty()
         );
         assert!(
             extract_openai_tool_calls(&serde_json::json!({"choices": []}), Transport::Chat)
-                .expect("empty Chat choices are valid")
+                .map_err(ctx("empty Chat choices are valid"))?
                 .is_empty()
         );
+        Ok(())
     }
 
     #[test]
-    fn test_extract_openai_tool_calls_preserves_empty_object_arguments() {
+    fn test_extract_openai_tool_calls_preserves_empty_object_arguments() -> TestResult {
         let responses_body = serde_json::json!({
             "output": [{
                 "type": "function_call",
@@ -5790,16 +6508,17 @@ mod tests {
         });
 
         let responses_calls = extract_openai_tool_calls(&responses_body, Transport::Responses)
-            .expect("empty object is valid Responses arguments");
+            .map_err(ctx("empty object is valid Responses arguments"))?;
         let chat_calls = extract_openai_tool_calls(&chat_body, Transport::Chat)
-            .expect("empty object is valid Chat arguments");
+            .map_err(ctx("empty object is valid Chat arguments"))?;
 
         assert_eq!(responses_calls[0].arguments, serde_json::json!({}));
         assert_eq!(chat_calls[0].arguments, serde_json::json!({}));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_respond_rejects_malformed_responses_tool_call_arguments() {
+    async fn test_respond_rejects_malformed_responses_tool_call_arguments() -> TestResult {
         assert_respond_rejects_tool_call(
             Transport::Responses,
             serde_json::json!({
@@ -5812,11 +6531,11 @@ mod tests {
             }),
             "provider returned a tool call with missing or invalid arguments",
         )
-        .await;
+        .await
     }
 
     #[tokio::test]
-    async fn test_respond_rejects_missing_responses_tool_call_arguments() {
+    async fn test_respond_rejects_missing_responses_tool_call_arguments() -> TestResult {
         assert_respond_rejects_tool_call(
             Transport::Responses,
             serde_json::json!({
@@ -5828,11 +6547,11 @@ mod tests {
             }),
             "provider returned a tool call with missing or invalid arguments",
         )
-        .await;
+        .await
     }
 
     #[tokio::test]
-    async fn test_respond_rejects_malformed_chat_tool_call_arguments() {
+    async fn test_respond_rejects_malformed_chat_tool_call_arguments() -> TestResult {
         assert_respond_rejects_tool_call(
             Transport::Chat,
             serde_json::json!({
@@ -5850,11 +6569,11 @@ mod tests {
             }),
             "provider returned a tool call with missing or invalid arguments",
         )
-        .await;
+        .await
     }
 
     #[tokio::test]
-    async fn test_respond_rejects_missing_chat_tool_call_arguments() {
+    async fn test_respond_rejects_missing_chat_tool_call_arguments() -> TestResult {
         assert_respond_rejects_tool_call(
             Transport::Chat,
             serde_json::json!({
@@ -5869,11 +6588,12 @@ mod tests {
             }),
             "provider returned a tool call with missing or invalid arguments",
         )
-        .await;
+        .await
     }
 
     #[tokio::test]
-    async fn test_respond_maps_malformed_responses_tool_call_to_generic_model_error() {
+    async fn test_respond_maps_malformed_responses_tool_call_to_generic_model_error() -> TestResult
+    {
         assert_respond_rejects_tool_call(
             Transport::Responses,
             serde_json::json!({
@@ -5885,11 +6605,11 @@ mod tests {
             }),
             "provider returned a tool call with missing or invalid call ID",
         )
-        .await;
+        .await
     }
 
     #[tokio::test]
-    async fn test_respond_maps_malformed_chat_tool_call_to_generic_model_error() {
+    async fn test_respond_maps_malformed_chat_tool_call_to_generic_model_error() -> TestResult {
         assert_respond_rejects_tool_call(
             Transport::Chat,
             serde_json::json!({
@@ -5904,13 +6624,13 @@ mod tests {
             }),
             "provider returned a tool call with missing or invalid function",
         )
-        .await;
+        .await
     }
 
     // ── W1-06b: Endpoint, Env-Fallback, file:-Secrets, Header, Redirects ─────
 
     #[test]
-    fn validate_endpoint_rejects_http_for_non_loopback_hosts() {
+    fn validate_endpoint_rejects_http_for_non_loopback_hosts() -> TestResult {
         for endpoint in [
             "http://api.openai.com/v1",
             "http://gateway.example/v1",
@@ -5918,14 +6638,19 @@ mod tests {
             "http://10.0.0.1/v1",
             "http://localhost.evil.example/v1",
         ] {
-            let error = validate_endpoint(endpoint).expect_err(endpoint);
+            let Err(error) = validate_endpoint(endpoint) else {
+                return Err(TestError::Unexpected(format!(
+                    "{endpoint}: expected rejection"
+                )));
+            };
             assert!(matches!(error, HttpProviderError::Decode(_)), "{endpoint}");
             assert!(!error.to_string().contains(endpoint), "{endpoint}");
         }
+        Ok(())
     }
 
     #[test]
-    fn validate_endpoint_allows_https_and_http_loopback() {
+    fn validate_endpoint_allows_https_and_http_loopback() -> TestResult {
         for endpoint in [
             "https://api.openai.com/v1",
             "https://gateway.example:8443/anthropic/",
@@ -5935,8 +6660,10 @@ mod tests {
             "http://ollama.localhost:11434",
             "http://[::1]:8080/v1",
         ] {
-            validate_endpoint(endpoint).unwrap_or_else(|error| panic!("{endpoint}: {error}"));
+            validate_endpoint(endpoint)
+                .map_err(|error| TestError::Unexpected(format!("{endpoint}: {error}")))?;
         }
+        Ok(())
     }
 
     #[test]
@@ -5957,7 +6684,7 @@ mod tests {
     }
 
     #[test]
-    fn build_provider_rejects_plain_http_gateway_before_resolving_credentials() {
+    fn build_provider_rejects_plain_http_gateway_before_resolving_credentials() -> TestResult {
         let mut config = harw_config::ResolvedConfig::default();
         config.harness.default_provider = Some("gateway".to_owned());
         config.harness.default_model = Some("model".to_owned());
@@ -5971,10 +6698,15 @@ mod tests {
             ),
         );
         let error = match build_provider(&config) {
-            Ok(_) => panic!("plain-http non-loopback endpoint must be rejected"),
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "plain-http non-loopback endpoint must be rejected".to_owned(),
+                ));
+            }
             Err(error) => error,
         };
         assert!(matches!(error, HttpProviderError::Decode(_)));
+        Ok(())
     }
 
     fn anthropic_provider_without_auth(base_url: &str) -> harw_config::ProviderToml {
@@ -5993,6 +6725,7 @@ mod tests {
             max_concurrency: None,
             originator: None,
             default_reasoning_effort: None,
+            gateway_identity_headers: false,
         }
     }
 
@@ -6005,7 +6738,7 @@ mod tests {
     }
 
     #[test]
-    fn implicit_anthropic_env_credentials_are_not_sent_to_foreign_hosts() {
+    fn implicit_anthropic_env_credentials_are_not_sent_to_foreign_hosts() -> TestResult {
         let env_layer = BTreeMap::new();
         let lookups = std::cell::RefCell::new(Vec::<String>::new());
         let process_env = |name: &str| {
@@ -6027,7 +6760,11 @@ mod tests {
                 test_sources(&env_layer, None, None),
                 &process_env,
             ) {
-                Ok(_) => panic!("{foreign}: implicit env credential must not be used"),
+                Ok(_) => {
+                    return Err(TestError::Unexpected(format!(
+                        "{foreign}: implicit env credential must not be used"
+                    )));
+                }
                 Err(error) => error,
             };
             assert!(
@@ -6054,17 +6791,20 @@ mod tests {
                 &process_env,
             ) {
                 Ok(resolved) => resolved,
-                Err(error) => panic!("{official}: {error}"),
+                Err(error) => {
+                    return Err(TestError::Unexpected(format!("{official}: {error}")));
+                }
             };
             assert!(
                 matches!(credential, AnthropicCredential::OAuth(_)),
                 "{official}"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn implicit_foundry_env_key_requires_matching_process_env_endpoint() {
+    fn implicit_foundry_env_key_requires_matching_process_env_endpoint() -> TestResult {
         let mut env_layer = BTreeMap::new();
         env_layer.insert(
             "ANTHROPIC_FOUNDRY_API_KEY".to_owned(),
@@ -6095,128 +6835,153 @@ mod tests {
                 test_sources(&env_layer, None, None),
                 process_env,
             ) {
-                Ok(_) => panic!("unbound Foundry endpoint must not receive the env key"),
+                Ok(_) => {
+                    return Err(TestError::Unexpected(
+                        "unbound Foundry endpoint must not receive the env key".to_owned(),
+                    ));
+                }
                 Err(error) => error,
             };
             assert!(matches!(error, HttpProviderError::MissingDefault { .. }));
             assert!(!error.to_string().contains("foundry-layer-key"));
         }
+        Ok(())
     }
 
-    fn write_file_with_mode(path: &Path, contents: &str, mode: u32) {
+    fn write_file_with_mode(path: &Path, contents: &str, mode: u32) -> TestResult {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::write(path, contents).expect("write credential fixture");
+        std::fs::write(path, contents).map_err(ctx("write credential fixture"))?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-            .expect("chmod credential fixture");
+            .map_err(ctx("chmod credential fixture"))?;
+        Ok(())
     }
 
-    fn home_with_secrets() -> (tempfile::TempDir, PathBuf) {
-        let home = tempfile::tempdir().expect("temporary home");
+    fn home_with_secrets() -> TestResult<(tempfile::TempDir, PathBuf)> {
+        let home = tempfile::tempdir().map_err(ctx("temporary home"))?;
         let secrets = home.path().join("secrets");
-        std::fs::create_dir(&secrets).expect("create secrets directory");
-        (home, secrets)
+        std::fs::create_dir(&secrets).map_err(ctx("create secrets directory"))?;
+        Ok((home, secrets))
     }
 
-    fn file_ref(path: &Path) -> harw_config::SecretRef {
-        harw_config::SecretRef::File(path.to_str().expect("UTF-8 fixture path").to_owned())
+    fn file_ref(path: &Path) -> TestResult<harw_config::SecretRef> {
+        Ok(harw_config::SecretRef::File(
+            path.to_str()
+                .ok_or(TestError::Missing("UTF-8 fixture path"))?
+                .to_owned(),
+        ))
     }
 
     /// Löst `reference` auf und liefert (Grund, gerenderter Fehler).
     fn file_credential_error(
         reference: &harw_config::SecretRef,
         home: Option<&Path>,
-    ) -> (String, String) {
+    ) -> TestResult<(String, String)> {
         let env_layer = BTreeMap::new();
         let error = match resolve_secret(reference, test_sources(&env_layer, None, home)) {
-            Ok(_) => panic!("file credential must be rejected"),
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "file credential must be rejected".to_owned(),
+                ));
+            }
             Err(error) => error,
         };
         let rendered = error.to_string();
         let HttpProviderError::UnresolvedCredential { reason, .. } = error else {
-            panic!("unexpected error kind: {rendered}");
+            return Err(TestError::Unexpected(format!(
+                "unexpected error kind: {rendered}"
+            )));
         };
-        (reason, rendered)
+        Ok((reason, rendered))
     }
 
     #[test]
-    fn file_credentials_below_home_secrets_are_resolved() {
-        let (home, secrets) = home_with_secrets();
+    fn file_credentials_below_home_secrets_are_resolved() -> TestResult {
+        let (home, secrets) = home_with_secrets()?;
         let token = secrets.join("provider.token");
-        write_file_with_mode(&token, "  file-token-value\n", 0o600);
+        write_file_with_mode(&token, "  file-token-value\n", 0o600)?;
         let nested_dir = secrets.join("nested");
-        std::fs::create_dir(&nested_dir).expect("create nested directory");
+        std::fs::create_dir(&nested_dir).map_err(ctx("create nested directory"))?;
         let json = nested_dir.join("credentials.json");
-        write_file_with_mode(&json, r#"{"oauth":{"access":" json-token "}}"#, 0o400);
+        write_file_with_mode(&json, r#"{"oauth":{"access":" json-token "}}"#, 0o400)?;
 
         let env_layer = BTreeMap::new();
         let sources = test_sources(&env_layer, None, Some(home.path()));
-        let secret = resolve_secret(&file_ref(&token), sources).expect("private token file");
+        let secret =
+            resolve_secret(&file_ref(&token)?, sources).map_err(ctx("private token file"))?;
         assert_eq!(secret.expose_secret(), "file-token-value");
 
         let json_ref = harw_config::SecretRef::FileJson {
-            path: json.to_str().expect("UTF-8 fixture path").to_owned(),
+            path: json
+                .to_str()
+                .ok_or(TestError::Missing("UTF-8 fixture path"))?
+                .to_owned(),
             pointer: "/oauth/access".to_owned(),
         };
-        let secret = resolve_secret(&json_ref, sources).expect("private JSON credential");
+        let secret = resolve_secret(&json_ref, sources).map_err(ctx("private JSON credential"))?;
         assert_eq!(secret.expose_secret(), "json-token");
+        Ok(())
     }
 
     #[test]
-    fn file_credentials_outside_home_secrets_are_rejected_without_path_or_content() {
-        let (home, secrets) = home_with_secrets();
+    fn file_credentials_outside_home_secrets_are_rejected_without_path_or_content() -> TestResult {
+        let (home, secrets) = home_with_secrets()?;
         let outside = home.path().join("outside.token");
-        write_file_with_mode(&outside, "outside-secret-value", 0o600);
+        write_file_with_mode(&outside, "outside-secret-value", 0o600)?;
         let sibling_dir = home.path().join("secrets-evil");
-        std::fs::create_dir(&sibling_dir).expect("create sibling directory");
+        std::fs::create_dir(&sibling_dir).map_err(ctx("create sibling directory"))?;
         let sibling = sibling_dir.join("x.token");
-        write_file_with_mode(&sibling, "outside-secret-value", 0o600);
+        write_file_with_mode(&sibling, "outside-secret-value", 0o600)?;
 
         let traversal = format!("{}/../outside.token", secrets.display());
         let references = [
-            file_ref(&outside),
-            file_ref(&sibling),
-            file_ref(&secrets),
+            file_ref(&outside)?,
+            file_ref(&sibling)?,
+            file_ref(&secrets)?,
             harw_config::SecretRef::File(traversal),
             harw_config::SecretRef::File("secrets/provider.token".to_owned()),
             harw_config::SecretRef::FileJson {
-                path: outside.to_str().expect("UTF-8 fixture path").to_owned(),
+                path: outside
+                    .to_str()
+                    .ok_or(TestError::Missing("UTF-8 fixture path"))?
+                    .to_owned(),
                 pointer: "/token".to_owned(),
             },
         ];
         for reference in &references {
-            let (reason, rendered) = file_credential_error(reference, Some(home.path()));
+            let (reason, rendered) = file_credential_error(reference, Some(home.path()))?;
             assert_eq!(reason, FILE_CREDENTIAL_OUTSIDE_SECRETS_REASON, "{rendered}");
-            assert!(!rendered.contains(home.path().to_str().expect("UTF-8")));
+            assert!(!rendered.contains(home.path().to_str().ok_or(TestError::Missing("UTF-8"))?));
             assert!(!rendered.contains("outside-secret-value"));
         }
 
-        let (reason, rendered) = file_credential_error(&file_ref(&outside), None);
+        let (reason, rendered) = file_credential_error(&file_ref(&outside)?, None)?;
         assert_eq!(reason, FILE_CREDENTIAL_NO_HOME_REASON);
         assert!(!rendered.contains("outside.token"));
+        Ok(())
     }
 
     #[test]
-    fn file_credentials_through_symlinks_are_rejected() {
+    fn file_credentials_through_symlinks_are_rejected() -> TestResult {
         use std::os::unix::fs::symlink;
 
-        let (home, secrets) = home_with_secrets();
+        let (home, secrets) = home_with_secrets()?;
         let outside = home.path().join("outside.token");
-        write_file_with_mode(&outside, "symlinked-secret-value", 0o600);
+        write_file_with_mode(&outside, "symlinked-secret-value", 0o600)?;
         let outside_dir = home.path().join("outside-dir");
-        std::fs::create_dir(&outside_dir).expect("create outside directory");
+        std::fs::create_dir(&outside_dir).map_err(ctx("create outside directory"))?;
         write_file_with_mode(
             &outside_dir.join("t.token"),
             "symlinked-secret-value",
             0o600,
-        );
+        )?;
 
         let final_link = secrets.join("link.token");
-        symlink(&outside, &final_link).expect("create final-component symlink");
+        symlink(&outside, &final_link).map_err(ctx("create final-component symlink"))?;
         let dir_link = secrets.join("linked-dir");
-        symlink(&outside_dir, &dir_link).expect("create intermediate symlink");
+        symlink(&outside_dir, &dir_link).map_err(ctx("create intermediate symlink"))?;
 
         for path in [final_link, dir_link.join("t.token")] {
-            let (reason, rendered) = file_credential_error(&file_ref(&path), Some(home.path()));
+            let (reason, rendered) = file_credential_error(&file_ref(&path)?, Some(home.path()))?;
             assert_eq!(reason, FILE_CREDENTIAL_OPEN_REASON, "{rendered}");
             assert!(!rendered.contains("symlinked-secret-value"));
             assert!(!rendered.contains("link.token"));
@@ -6224,72 +6989,84 @@ mod tests {
         }
 
         // `<home>/secrets` selbst als Symlink.
-        let other_home = tempfile::tempdir().expect("second temporary home");
-        symlink(&outside_dir, other_home.path().join("secrets")).expect("secrets symlink");
+        let other_home = tempfile::tempdir().map_err(ctx("second temporary home"))?;
+        symlink(&outside_dir, other_home.path().join("secrets")).map_err(ctx("secrets symlink"))?;
         let via_link = other_home.path().join("secrets").join("t.token");
-        let (reason, _) = file_credential_error(&file_ref(&via_link), Some(other_home.path()));
+        let (reason, _) = file_credential_error(&file_ref(&via_link)?, Some(other_home.path()))?;
         assert_eq!(reason, FILE_CREDENTIAL_OPEN_REASON);
+        Ok(())
     }
 
     #[test]
-    fn file_credentials_with_group_or_other_permissions_are_rejected() {
-        let (home, secrets) = home_with_secrets();
+    fn file_credentials_with_group_or_other_permissions_are_rejected() -> TestResult {
+        let (home, secrets) = home_with_secrets()?;
         for (name, mode) in [("world.token", 0o644), ("group.token", 0o640)] {
             let path = secrets.join(name);
-            write_file_with_mode(&path, "shared-secret-value", mode);
-            let (reason, rendered) = file_credential_error(&file_ref(&path), Some(home.path()));
+            write_file_with_mode(&path, "shared-secret-value", mode)?;
+            let (reason, rendered) = file_credential_error(&file_ref(&path)?, Some(home.path()))?;
             assert_eq!(reason, FILE_CREDENTIAL_NOT_PRIVATE_REASON, "{name}");
             assert!(!rendered.contains("shared-secret-value"));
             assert!(!rendered.contains(name));
         }
+        Ok(())
     }
 
     #[test]
-    fn file_json_credential_errors_do_not_echo_content() {
-        let (home, secrets) = home_with_secrets();
+    fn file_json_credential_errors_do_not_echo_content() -> TestResult {
+        let (home, secrets) = home_with_secrets()?;
         let path = secrets.join("broken.json");
-        write_file_with_mode(&path, "{not json broken-secret-value", 0o600);
+        write_file_with_mode(&path, "{not json broken-secret-value", 0o600)?;
         let reference = harw_config::SecretRef::FileJson {
-            path: path.to_str().expect("UTF-8 fixture path").to_owned(),
+            path: path
+                .to_str()
+                .ok_or(TestError::Missing("UTF-8 fixture path"))?
+                .to_owned(),
             pointer: "/token".to_owned(),
         };
-        let (reason, rendered) = file_credential_error(&reference, Some(home.path()));
+        let (reason, rendered) = file_credential_error(&reference, Some(home.path()))?;
         assert_eq!(reason, FILE_CREDENTIAL_JSON_REASON);
         assert!(!rendered.contains("broken-secret-value"));
         assert!(!rendered.contains("broken.json"));
+        Ok(())
     }
 
     #[test]
-    fn oversized_file_credentials_are_rejected() {
-        let (home, secrets) = home_with_secrets();
+    fn oversized_file_credentials_are_rejected() -> TestResult {
+        let (home, secrets) = home_with_secrets()?;
         let path = secrets.join("huge.token");
-        let limit = usize::try_from(MAX_FILE_CREDENTIAL_BYTES).expect("limit fits usize");
-        write_file_with_mode(&path, &"x".repeat(limit + 1), 0o600);
-        let (reason, _) = file_credential_error(&file_ref(&path), Some(home.path()));
+        let limit = usize::try_from(MAX_FILE_CREDENTIAL_BYTES).map_err(ctx("limit fits usize"))?;
+        write_file_with_mode(&path, &"x".repeat(limit + 1), 0o600)?;
+        let (reason, _) = file_credential_error(&file_ref(&path)?, Some(home.path()))?;
         assert_eq!(reason, FILE_CREDENTIAL_READ_REASON);
+        Ok(())
     }
 
     #[test]
-    fn build_provider_with_home_enables_file_credentials_that_build_provider_rejects() {
-        let (home, secrets) = home_with_secrets();
+    fn build_provider_with_home_enables_file_credentials_that_build_provider_rejects() -> TestResult
+    {
+        let (home, secrets) = home_with_secrets()?;
         let token = secrets.join("gateway.key");
-        write_file_with_mode(&token, "gateway-file-key", 0o600);
+        write_file_with_mode(&token, "gateway-file-key", 0o600)?;
         let mut provider = configured_provider(
             "gateway",
             "https://gateway.example/v1".to_owned(),
             vec!["model"],
             "unused",
         );
-        provider.auth = Some(file_ref(&token));
+        provider.auth = Some(file_ref(&token)?);
         let mut config = harw_config::ResolvedConfig::default();
         config.harness.default_provider = Some("gateway".to_owned());
         config.harness.default_model = Some("model".to_owned());
         config.providers.insert("gateway".to_owned(), provider);
 
         build_provider_with_home(&config, home.path(), None)
-            .expect("file credential below <home>/secrets");
+            .map_err(ctx("file credential below <home>/secrets"))?;
         let error = match build_provider(&config) {
-            Ok(_) => panic!("file credentials require a home"),
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "file credentials require a home".to_owned(),
+                ));
+            }
             Err(error) => error,
         };
         assert!(matches!(
@@ -6298,10 +7075,11 @@ mod tests {
                 if reason == FILE_CREDENTIAL_NO_HOME_REASON
         ));
         assert!(!error.to_string().contains("gateway.key"));
+        Ok(())
     }
 
     #[test]
-    fn configured_credential_headers_reject_plaintext_and_resolve_secret_refs() {
+    fn configured_credential_headers_reject_plaintext_and_resolve_secret_refs() -> TestResult {
         let mut env_layer = BTreeMap::new();
         env_layer.insert(
             "HARW_TEST_GATEWAY_HEADER_TOKEN_W106B".to_owned(),
@@ -6313,8 +7091,11 @@ mod tests {
             "cf-aig-authorization".to_owned(),
             "Bearer plaintext-gateway-token".to_owned(),
         )]);
-        let error = configured_headers("gateway", &plaintext, sources)
-            .expect_err("plaintext credential header must be rejected");
+        let Err(error) = configured_headers("gateway", &plaintext, sources) else {
+            return Err(TestError::Unexpected(
+                "plaintext credential header must be rejected".to_owned(),
+            ));
+        };
         assert!(!error.to_string().contains("plaintext-gateway-token"));
 
         let referenced = HashMap::from([
@@ -6324,24 +7105,25 @@ mod tests {
             ),
             ("x-provider-marker".to_owned(), "gateway".to_owned()),
         ]);
-        let headers =
-            configured_headers("gateway", &referenced, sources).expect("secret ref header");
+        let headers = configured_headers("gateway", &referenced, sources)
+            .map_err(ctx("secret ref header"))?;
         let credential = headers
             .get("cf-aig-authorization")
-            .expect("credential header");
+            .ok_or(TestError::Missing("credential header"))?;
         assert_eq!(credential.as_bytes(), b"Bearer resolved-gateway-token");
         assert!(credential.is_sensitive());
         assert!(
             !headers
                 .get("x-provider-marker")
-                .expect("marker")
+                .ok_or(TestError::Missing("marker"))?
                 .is_sensitive()
         );
         assert!(!format!("{headers:?}").contains("resolved-gateway-token"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn openai_credential_headers_are_marked_sensitive() {
+    async fn openai_credential_headers_are_marked_sensitive() -> TestResult {
         for (auth_header, header_name) in [
             ("api-key", "api-key"),
             ("x-api-key", "x-api-key"),
@@ -6351,34 +7133,241 @@ mod tests {
                 "https://example.test/v1",
                 "model",
                 SecretString::new("sk-sensitive-header-value".into()),
-            );
+            )
+            .map_err(ctx("OpenAiResponsesProvider::new"))?;
             provider.auth_header = auth_header.to_owned();
             let api_key = provider.api_key.clone();
             let request = provider
-                .authorized_request("https://example.test/v1/chat/completions", &api_key)
+                .authorized_request("https://example.test/v1/chat/completions", &api_key, None)
                 .await
-                .expect("credential header")
+                .map_err(ctx("credential header"))?
                 .build()
-                .expect("request builds");
-            let value = request.headers().get(header_name).expect(header_name);
+                .map_err(ctx("request builds"))?;
+            let value = request
+                .headers()
+                .get(header_name)
+                .ok_or(TestError::Unexpected(format!(
+                    "missing header {header_name}"
+                )))?;
             assert!(value.is_sensitive(), "{auth_header}");
             assert!(!format!("{:?}", request.headers()).contains("sk-sensitive-header-value"));
+        }
+        Ok(())
+    }
+
+    fn test_identity(session: &str, agent: &str, role: &str) -> RequestIdentity {
+        RequestIdentity {
+            session: session.to_owned(),
+            agent: agent.to_owned(),
+            role: role.to_owned(),
         }
     }
 
     #[test]
-    fn invalid_credential_header_value_is_rejected_without_echo() {
-        let error = sensitive_header_value("line\nbreak-secret").expect_err("CR/LF rejected");
-        let ModelError::RequestFailed(message) = error else {
-            panic!("invalid header value must be a request failure");
-        };
-        assert!(!message.contains("break-secret"));
+    fn test_identity_headers_builds_three_headers() -> TestResult {
+        let identity = test_identity("sess-123", "agent-x", "worker");
+        let headers = identity_headers(&identity);
+        assert_eq!(headers.len(), 3);
+        assert_eq!(
+            headers
+                .get("x-harw-session")
+                .ok_or(TestError::Missing("x-harw-session"))?,
+            "sess-123"
+        );
+        assert_eq!(
+            headers
+                .get("x-harw-agent")
+                .ok_or(TestError::Missing("x-harw-agent"))?,
+            "agent-x"
+        );
+        assert_eq!(
+            headers
+                .get("x-harw-role")
+                .ok_or(TestError::Missing("x-harw-role"))?,
+            "worker"
+        );
+        Ok(())
     }
 
     #[test]
-    fn redirect_decision_follows_only_same_origin_within_limit() {
-        let url = |value: &str| reqwest::Url::parse(value).expect("test URL");
-        let origin = vec![url("https://api.example.test/v1/messages")];
+    fn test_identity_headers_strips_non_ascii_and_control_chars() -> TestResult {
+        let identity = test_identity("sess\n123\t äöü", "agent", "role");
+        let headers = identity_headers(&identity);
+        assert_eq!(
+            headers
+                .get("x-harw-session")
+                .ok_or(TestError::Missing("x-harw-session"))?,
+            "sess123"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_identity_headers_truncates_overlong_value_to_64_chars() -> TestResult {
+        let long_session = "s".repeat(100);
+        let identity = test_identity(&long_session, "agent", "role");
+        let headers = identity_headers(&identity);
+        let value = headers
+            .get("x-harw-session")
+            .ok_or(TestError::Missing("x-harw-session"))?;
+        assert_eq!(value.len(), 64);
+        assert_eq!(
+            value.to_str().map_err(ctx("header value is ASCII"))?,
+            "s".repeat(64)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_identity_headers_skips_empty_value_after_sanitization() {
+        // Nur Whitespace/Steuerzeichen — nach der Sanitisierung leer, also
+        // wird der Header übersprungen statt einen leeren Wert zu senden.
+        let identity = test_identity("sess", "   \n\t  ", "role");
+        let headers = identity_headers(&identity);
+        assert_eq!(headers.len(), 2);
+        assert!(headers.get("x-harw-agent").is_none());
+        assert!(headers.get("x-harw-session").is_some());
+        assert!(headers.get("x-harw-role").is_some());
+    }
+
+    #[test]
+    fn test_sanitize_identity_header_value_keeps_only_visible_ascii() {
+        assert_eq!(sanitize_identity_header_value("abc-123_XYZ"), "abc-123_XYZ");
+        assert_eq!(sanitize_identity_header_value("a b\tc\n"), "abc");
+        assert_eq!(sanitize_identity_header_value("héllo"), "hllo");
+        assert_eq!(sanitize_identity_header_value(""), "");
+    }
+
+    #[tokio::test]
+    async fn authorized_request_adds_identity_headers_when_flag_enabled() -> TestResult {
+        let mut provider = OpenAiResponsesProvider::new(
+            "https://example.test/v1",
+            "model",
+            SecretString::new("sk-identity-headers-test".into()),
+        )
+        .map_err(ctx("OpenAiResponsesProvider::new"))?;
+        provider.gateway_identity_headers = true;
+        let api_key = provider.api_key.clone();
+        let identity = test_identity("sess-abc", "agent-b", "planner");
+        let request = provider
+            .authorized_request(
+                "https://example.test/v1/chat/completions",
+                &api_key,
+                Some(&identity),
+            )
+            .await
+            .map_err(ctx("request builds"))?
+            .build()
+            .map_err(ctx("request builds"))?;
+        assert_eq!(
+            request
+                .headers()
+                .get("x-harw-session")
+                .ok_or(TestError::Missing("x-harw-session"))?,
+            "sess-abc"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("x-harw-agent")
+                .ok_or(TestError::Missing("x-harw-agent"))?,
+            "agent-b"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("x-harw-role")
+                .ok_or(TestError::Missing("x-harw-role"))?,
+            "planner"
+        );
+        assert!(request.headers().get("x-session-affinity").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authorized_request_omits_identity_headers_when_flag_disabled() -> TestResult {
+        let provider = OpenAiResponsesProvider::new(
+            "https://example.test/v1",
+            "model",
+            SecretString::new("sk-identity-headers-test".into()),
+        )
+        .map_err(ctx("OpenAiResponsesProvider::new"))?;
+        assert!(!provider.gateway_identity_headers);
+        let api_key = provider.api_key.clone();
+        let identity = test_identity("sess-abc", "agent-b", "planner");
+        let request = provider
+            .authorized_request(
+                "https://example.test/v1/chat/completions",
+                &api_key,
+                Some(&identity),
+            )
+            .await
+            .map_err(ctx("request builds"))?
+            .build()
+            .map_err(ctx("request builds"))?;
+        assert!(request.headers().get("x-harw-session").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authorized_request_static_header_wins_over_identity_header() -> TestResult {
+        let mut provider = OpenAiResponsesProvider::new(
+            "https://example.test/v1",
+            "model",
+            SecretString::new("sk-identity-headers-test".into()),
+        )
+        .map_err(ctx("OpenAiResponsesProvider::new"))?;
+        provider.gateway_identity_headers = true;
+        provider.headers.insert(
+            reqwest::header::HeaderName::from_static("x-harw-session"),
+            reqwest::header::HeaderValue::from_static("static-configured-value"),
+        );
+        let api_key = provider.api_key.clone();
+        let identity = test_identity("sess-from-request", "agent-b", "planner");
+        let request = provider
+            .authorized_request(
+                "https://example.test/v1/chat/completions",
+                &api_key,
+                Some(&identity),
+            )
+            .await
+            .map_err(ctx("request builds"))?
+            .build()
+            .map_err(ctx("request builds"))?;
+        // Statischer `[headers]`-Wert gewinnt; der Identity-Header wird nicht
+        // zusätzlich gesendet (kein doppelter `x-harw-session`-Header).
+        let values: Vec<_> = request.headers().get_all("x-harw-session").iter().collect();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0], "static-configured-value");
+        // Header ohne statische Kollision werden weiterhin ergänzt.
+        assert_eq!(
+            request
+                .headers()
+                .get("x-harw-agent")
+                .ok_or(TestError::Missing("x-harw-agent"))?,
+            "agent-b"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_credential_header_value_is_rejected_without_echo() -> TestResult {
+        let Err(error) = sensitive_header_value("line\nbreak-secret") else {
+            return Err(TestError::Unexpected("CR/LF rejected".to_owned()));
+        };
+        let ModelError::RequestFailed(message) = error else {
+            return Err(TestError::Unexpected(
+                "invalid header value must be a request failure".to_owned(),
+            ));
+        };
+        assert!(!message.contains("break-secret"));
+        Ok(())
+    }
+
+    #[test]
+    fn redirect_decision_follows_only_same_origin_within_limit() -> TestResult {
+        let url = |value: &str| reqwest::Url::parse(value).map_err(ctx("test URL"));
+        let origin = vec![url("https://api.example.test/v1/messages")?];
 
         let same = [
             "https://api.example.test/v1/messages/",
@@ -6386,7 +7375,7 @@ mod tests {
         ];
         for next in same {
             assert_eq!(
-                redirect_decision(&url(next), &origin),
+                redirect_decision(&url(next)?, &origin),
                 RedirectDecision::Follow,
                 "{next}"
             );
@@ -6401,65 +7390,74 @@ mod tests {
         ];
         for next in cross {
             assert_eq!(
-                redirect_decision(&url(next), &origin),
+                redirect_decision(&url(next)?, &origin),
                 RedirectDecision::RejectCrossOrigin,
                 "{next}"
             );
         }
 
         assert_eq!(
-            redirect_decision(&url("https://api.example.test/x"), &[]),
+            redirect_decision(&url("https://api.example.test/x")?, &[]),
             RedirectDecision::RejectCrossOrigin
         );
         let tainted_chain = vec![
-            url("https://api.example.test/a"),
-            url("https://evil.example/b"),
+            url("https://api.example.test/a")?,
+            url("https://evil.example/b")?,
         ];
         assert_eq!(
-            redirect_decision(&url("https://api.example.test/c"), &tainted_chain),
+            redirect_decision(&url("https://api.example.test/c")?, &tainted_chain),
             RedirectDecision::RejectCrossOrigin
         );
 
-        let chain = |len: usize| vec![url("https://api.example.test/hop"); len];
+        let chain = |len: usize| -> TestResult<Vec<reqwest::Url>> {
+            Ok(vec![url("https://api.example.test/hop")?; len])
+        };
         assert_eq!(
-            redirect_decision(&url("https://api.example.test/next"), &chain(MAX_REDIRECTS)),
+            redirect_decision(
+                &url("https://api.example.test/next")?,
+                &chain(MAX_REDIRECTS)?
+            ),
             RedirectDecision::Follow
         );
         assert_eq!(
             redirect_decision(
-                &url("https://api.example.test/next"),
-                &chain(MAX_REDIRECTS + 1)
+                &url("https://api.example.test/next")?,
+                &chain(MAX_REDIRECTS + 1)?
             ),
             RedirectDecision::RejectLimit
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn cross_port_redirect_is_not_followed_with_api_key() {
-        let target = TcpListener::bind("127.0.0.1:0").expect("bind redirect target");
+    async fn cross_port_redirect_is_not_followed_with_api_key() -> TestResult {
+        let target = TcpListener::bind("127.0.0.1:0").map_err(ctx("bind redirect target"))?;
         target
             .set_nonblocking(true)
-            .expect("non-blocking redirect target");
+            .map_err(ctx("non-blocking redirect target"))?;
         let target_url = format!(
             "http://{}/v1/chat/completions",
-            target.local_addr().expect("target address")
+            target.local_addr().map_err(ctx("target address"))?
         );
 
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind redirecting server");
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("bind redirecting server"))?;
         let base_url = format!(
             "http://{}/v1",
-            listener.local_addr().expect("server address")
+            listener.local_addr().map_err(ctx("server address"))?
         );
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept provider request");
+        let server = thread::spawn(move || -> TestResult<()> {
+            let (mut stream, _) = listener.accept().map_err(ctx("accept provider request"))?;
             let mut request = [0_u8; 4096];
-            let _read = stream.read(&mut request).expect("read provider request");
+            let _read = stream
+                .read(&mut request)
+                .map_err(ctx("read provider request"))?;
             let response = format!(
                 "HTTP/1.1 307 Temporary Redirect\r\nlocation: {target_url}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
             );
             stream
                 .write_all(response.as_bytes())
-                .expect("write redirect response");
+                .map_err(ctx("write redirect response"))?;
+            Ok(())
         });
 
         let mut provider = OpenAiResponsesProvider::with_transport(
@@ -6467,34 +7465,41 @@ mod tests {
             "model",
             SecretString::new("sk-redirect-secret".into()),
             Transport::Chat,
-        );
+        )
+        .map_err(ctx("with_transport"))?;
         provider.auth_header = "x-api-key".to_owned();
-        let error = provider
-            .respond(request_with_ids(None, None))
-            .await
-            .expect_err("cross-origin redirect must fail");
+        let Err(error) = provider.respond(request_with_ids(None, None)).await else {
+            return Err(TestError::Unexpected(
+                "cross-origin redirect must fail".to_owned(),
+            ));
+        };
         let ModelError::RequestFailed(message) = error else {
-            panic!("redirect rejection must be a request failure");
+            return Err(TestError::Unexpected(
+                "redirect rejection must be a request failure".to_owned(),
+            ));
         };
         assert!(!message.contains("sk-redirect-secret"));
-        server.join().expect("redirecting server completes");
+        server.join().map_err(join_thread_error)??;
         assert!(
             matches!(target.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
             "redirect target must never be contacted"
         );
+        Ok(())
     }
 
     // Echter Netzwerk-Test: braucht einen gültigen OPENAI_API_KEY und
     // Netzwerkzugang. Deshalb `#[ignore]` — niemals im Default-Lauf.
     #[tokio::test]
     #[ignore = "requires real OPENAI_API_KEY and network access"]
-    async fn test_respond_live() {
-        let key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY set for live test");
+    async fn test_respond_live() -> TestResult {
+        let key =
+            std::env::var("OPENAI_API_KEY").map_err(ctx("OPENAI_API_KEY set for live test"))?;
         let provider = OpenAiResponsesProvider::new(
             harw_provider::openai::DEFAULT_OPENAI_BASE_URL,
             "gpt-4o-mini",
             SecretString::new(key.into()),
-        );
+        )
+        .map_err(ctx("OpenAiResponsesProvider::new"))?;
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Say hello in one word.");
         let request = ModelRequest {
@@ -6511,8 +7516,17 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
-        let response = provider.respond(request).await.expect("live respond");
+        let response = provider
+            .respond(request)
+            .await
+            .map_err(ctx("live respond"))?;
         assert!(response.message.is_some());
+        Ok(())
     }
 }
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

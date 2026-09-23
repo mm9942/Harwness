@@ -381,3 +381,7 @@ pub use harw_lens_source::{
 
 // --- harw-lens-query: Abfragepfad (siehe Begründung oben) ---
 pub use harw_lens_query::{IndexSelector, QueryError, QueryProvenance, ReadScope};
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

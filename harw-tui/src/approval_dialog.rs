@@ -541,7 +541,9 @@ impl ApprovalDialog {
     pub(crate) fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         let theme = *theme;
         let border_color = style::warning_color(theme);
-        let title_style = Style::default().fg(border_color).add_modifier(Modifier::BOLD);
+        let title_style = Style::default()
+            .fg(border_color)
+            .add_modifier(Modifier::BOLD);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border_color))
@@ -748,7 +750,12 @@ fn argument_display_strings(argument: &ApprovalArgument, width: u16) -> Vec<Stri
 fn wrapped_strings(text: &str, width: u16) -> Vec<String> {
     wrap_plain(text, width)
         .into_iter()
-        .map(|line| line.spans.into_iter().map(|s| s.content.into_owned()).collect())
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|s| s.content.into_owned())
+                .collect()
+        })
         .collect()
 }
 
@@ -840,7 +847,10 @@ mod tests {
             rendered.contains("2. Ja, und nicht mehr fragen für: git status"),
             "{rendered}"
         );
-        assert!(rendered.contains("3. Ja, und in den auto-Modus wechseln"), "{rendered}");
+        assert!(
+            rendered.contains("3. Ja, und in den auto-Modus wechseln"),
+            "{rendered}"
+        );
         assert!(rendered.contains("4. Nein"), "{rendered}");
     }
 
@@ -850,7 +860,10 @@ mod tests {
         let rendered = render_dialog(&dialog, 70, 20);
         assert!(rendered.contains("1. Ja"), "{rendered}");
         assert!(!rendered.contains("nicht mehr fragen"), "{rendered}");
-        assert!(rendered.contains("2. Ja, und in den auto-Modus wechseln"), "{rendered}");
+        assert!(
+            rendered.contains("2. Ja, und in den auto-Modus wechseln"),
+            "{rendered}"
+        );
         assert!(rendered.contains("3. Nein"), "{rendered}");
         assert!(!rendered.contains("4."), "{rendered}");
     }
@@ -862,13 +875,22 @@ mod tests {
         let mut dialog = shell_dialog(None); // Optionen: Ja / AutoMode / Nein
         assert_eq!(dialog.selected, 0);
 
-        assert_eq!(dialog.handle_key(make_key(KeyCode::Down), true), DialogAction::Stay);
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Down), true),
+            DialogAction::Stay
+        );
         assert_eq!(dialog.selected, 1);
 
-        assert_eq!(dialog.handle_key(make_key(KeyCode::Char('3')), true), DialogAction::Stay);
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Char('3')), true),
+            DialogAction::Stay
+        );
         assert_eq!(dialog.selected, 2);
 
-        assert_eq!(dialog.handle_key(make_key(KeyCode::Up), true), DialogAction::Stay);
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Up), true),
+            DialogAction::Stay
+        );
         assert_eq!(dialog.selected, 1);
     }
 
@@ -876,7 +898,10 @@ mod tests {
     fn test_enter_returns_choice_for_currently_selected_option() {
         let mut dialog = shell_dialog(Some("git status"));
         // Option 3 (AutoMode) über Ziffer markieren, dann mit Enter bestätigen.
-        assert_eq!(dialog.handle_key(make_key(KeyCode::Char('3')), true), DialogAction::Stay);
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Char('3')), true),
+            DialogAction::Stay
+        );
         assert_eq!(
             dialog.handle_key(make_key(KeyCode::Enter), true),
             DialogAction::Decided(ApprovalChoice::ApproveAndAutoMode)
@@ -886,7 +911,10 @@ mod tests {
     #[test]
     fn test_enter_returns_remember_choice_with_rule_text() {
         let mut dialog = shell_dialog(Some("git status"));
-        assert_eq!(dialog.handle_key(make_key(KeyCode::Char('2')), true), DialogAction::Stay);
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Char('2')), true),
+            DialogAction::Stay
+        );
         assert_eq!(
             dialog.handle_key(make_key(KeyCode::Enter), true),
             DialogAction::Decided(ApprovalChoice::ApproveAndRemember("git status".to_owned()))
@@ -923,9 +951,15 @@ mod tests {
     #[test]
     fn test_v_toggles_details() {
         let mut dialog = shell_dialog(None);
-        assert_eq!(dialog.handle_key(make_key(KeyCode::Char('v')), true), DialogAction::ToggleDetails);
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Char('v')), true),
+            DialogAction::ToggleDetails
+        );
         assert!(dialog.expanded);
-        assert_eq!(dialog.handle_key(make_key(KeyCode::Char('v')), true), DialogAction::ToggleDetails);
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Char('v')), true),
+            DialogAction::ToggleDetails
+        );
         assert!(!dialog.expanded);
     }
 
@@ -964,7 +998,10 @@ mod tests {
     #[test]
     fn test_countdown_appears_in_render() {
         let dialog = ApprovalDialog::new(ApprovalDialogRequest {
-            call: tool_call("shell.exec", harw_tools::serde_json::json!({ "command": "ls" })),
+            call: tool_call(
+                "shell.exec",
+                harw_tools::serde_json::json!({ "command": "ls" }),
+            ),
             cwd: None,
             justification: None,
             risk: None,
@@ -974,7 +1011,10 @@ mod tests {
             reason_input_enabled: false,
         });
         let rendered = render_dialog(&dialog, 70, 20);
-        assert!(rendered.contains("noch 4:5") || rendered.contains("noch 5:00"), "{rendered}");
+        assert!(
+            rendered.contains("noch 4:5") || rendered.contains("noch 5:00"),
+            "{rendered}"
+        );
     }
 
     // ── Terminal-Sicherheit ──────────────────────────────────────────────
@@ -998,7 +1038,10 @@ mod tests {
         });
         let rendered = render_dialog(&dialog, 70, 20);
         assert!(!rendered.contains('\u{1b}'), "{rendered}");
-        assert!(rendered.contains("⟨U+001B⟩") || rendered.contains("⟨ESC⟩"), "{rendered}");
+        assert!(
+            rendered.contains("⟨U+001B⟩") || rendered.contains("⟨ESC⟩"),
+            "{rendered}"
+        );
         // Der Befehl bleibt trotzdem lesbar (nichts wird verschluckt).
         assert!(rendered.contains("rm -rf /"), "{rendered}");
     }
@@ -1019,7 +1062,10 @@ mod tests {
             );
         }
         let mut dialog = ApprovalDialog::new(ApprovalDialogRequest {
-            call: tool_call("shell.exec", harw_tools::serde_json::Value::Object(arguments)),
+            call: tool_call(
+                "shell.exec",
+                harw_tools::serde_json::Value::Object(arguments),
+            ),
             cwd: None,
             justification: None,
             risk: None,
@@ -1032,7 +1078,10 @@ mod tests {
         let collapsed_height = dialog.desired_height(70);
         dialog.handle_key(make_key(KeyCode::Char('v')), true);
         let expanded_height = dialog.desired_height(70);
-        assert!(expanded_height > collapsed_height, "{expanded_height} <= {collapsed_height}");
+        assert!(
+            expanded_height > collapsed_height,
+            "{expanded_height} <= {collapsed_height}"
+        );
     }
 
     // ── Freitext-Ablehnung ───────────────────────────────────────────────
@@ -1040,11 +1089,17 @@ mod tests {
     #[test]
     fn test_reason_input_captures_text_and_enter_rejects_with_reason() {
         let mut dialog = shell_dialog(None);
-        assert_eq!(dialog.handle_key(make_key(KeyCode::Tab), true), DialogAction::Stay);
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Tab), true),
+            DialogAction::Stay
+        );
         assert!(dialog.reason_editing);
 
         for c in "zu riskant".chars() {
-            assert_eq!(dialog.handle_key(make_key(KeyCode::Char(c)), true), DialogAction::Stay);
+            assert_eq!(
+                dialog.handle_key(make_key(KeyCode::Char(c)), true),
+                DialogAction::Stay
+            );
         }
         assert_eq!(dialog.reason_text, "zu riskant");
 
@@ -1065,14 +1120,20 @@ mod tests {
         dialog.handle_key(make_key(KeyCode::Backspace), true);
         assert_eq!(dialog.reason_text, "");
 
-        assert_eq!(dialog.handle_key(make_key(KeyCode::Esc), true), DialogAction::Stay);
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Esc), true),
+            DialogAction::Stay
+        );
         assert!(!dialog.reason_editing);
     }
 
     #[test]
     fn test_reason_input_not_offered_when_disabled() {
         let dialog = ApprovalDialog::new(ApprovalDialogRequest {
-            call: tool_call("shell.exec", harw_tools::serde_json::json!({ "command": "ls" })),
+            call: tool_call(
+                "shell.exec",
+                harw_tools::serde_json::json!({ "command": "ls" }),
+            ),
             cwd: None,
             justification: None,
             risk: None,
@@ -1093,7 +1154,10 @@ mod tests {
         assert!(render_dialog(&shell, 70, 20).contains("Befehl ausführen?"));
 
         let write = ApprovalDialog::new(ApprovalDialogRequest {
-            call: tool_call("fs.write", harw_tools::serde_json::json!({ "path": "/tmp/x" })),
+            call: tool_call(
+                "fs.write",
+                harw_tools::serde_json::json!({ "path": "/tmp/x" }),
+            ),
             cwd: None,
             justification: None,
             risk: None,

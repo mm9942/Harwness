@@ -810,6 +810,7 @@ pub(crate) fn write_scopes_conflict(left: &str, right: &str) -> bool {
 mod tests {
     use super::*;
     use crate::ids::{PathOrSymbol, RevisionId, TaskId};
+    use crate::test_support::TestResult;
     use crate::types::{PlanNode, PlanNodeStatus};
     use time::OffsetDateTime;
 
@@ -1062,7 +1063,7 @@ mod tests {
     // ── Test 11: Serde-Roundtrip für AdmissionReport ─────────────────────────
 
     #[test]
-    fn admission_report_serde_roundtrip() {
+    fn admission_report_serde_roundtrip() -> TestResult {
         let report = AdmissionReport {
             admitted: false,
             violations: vec![
@@ -1080,10 +1081,10 @@ mod tests {
             ],
             scanned_files: 5,
         };
-        let json = serde_json::to_string(&report).expect("Serialisierung fehlgeschlagen");
-        let back: AdmissionReport =
-            serde_json::from_str(&json).expect("Deserialisierung fehlgeschlagen");
+        let json = serde_json::to_string(&report)?;
+        let back: AdmissionReport = serde_json::from_str(&json)?;
         assert_eq!(report, back, "Serde-Roundtrip muss verlustfrei sein");
+        Ok(())
     }
 
     // ── Test 12: Leerer Diff ist admitted ────────────────────────────────────
@@ -1314,12 +1315,18 @@ mod tests {
         let rule = PathRule::Glob("a?.rs".to_owned());
         assert!(rule.matches("ab.rs"));
         assert!(!rule.matches("a.rs"), "? verlangt genau ein Zeichen");
-        assert!(!rule.matches("abc.rs"), "? darf nicht mehrere Zeichen decken");
+        assert!(
+            !rule.matches("abc.rs"),
+            "? darf nicht mehrere Zeichen decken"
+        );
     }
 
     #[test]
     fn glob_matches_rejects_invalid_normalization_on_either_side() {
-        assert!(!ScopeMatcher::matches_glob("src/**/*.rs", "src/../secret.rs"));
+        assert!(!ScopeMatcher::matches_glob(
+            "src/**/*.rs",
+            "src/../secret.rs"
+        ));
         assert!(!ScopeMatcher::matches_glob("../*.rs", "a.rs"));
         assert!(!ScopeMatcher::matches_glob("*.rs", "/abs/a.rs"));
     }
@@ -1355,7 +1362,10 @@ mod tests {
 
     #[test]
     fn scope_matcher_contains_true_for_self_and_descendants() {
-        assert!(ScopeMatcher::contains("src", "src"), "Scope enthält sich selbst");
+        assert!(
+            ScopeMatcher::contains("src", "src"),
+            "Scope enthält sich selbst"
+        );
         assert!(ScopeMatcher::contains("src", "src/lib.rs"), "Nachfahre");
         assert!(
             ScopeMatcher::contains("src", "src/a/b.rs"),
@@ -1369,7 +1379,10 @@ mod tests {
             !ScopeMatcher::contains("src/lib.rs", "src"),
             "contains ist gerichtet — Vorfahre ist kein Nachfahre"
         );
-        assert!(!ScopeMatcher::contains("src/a.rs", "src/b.rs"), "Geschwister");
+        assert!(
+            !ScopeMatcher::contains("src/a.rs", "src/b.rs"),
+            "Geschwister"
+        );
         assert!(
             !ScopeMatcher::contains("src", "src-evasion/secret.rs"),
             "Präfix ohne Slash ist kein Nachfahre"

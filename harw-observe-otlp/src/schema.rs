@@ -394,29 +394,43 @@ pub(crate) fn to_json_bytes(request: &ExportMetricsServiceRequest) -> Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn test_timestamp_to_unix_nanos_at_epoch_is_zero() {
+    fn test_timestamp_to_unix_nanos_at_epoch_is_zero() -> TestResult {
         // `OtlpError` leitet bewusst kein `PartialEq` ab (Vertrag §H.1
         // nennt es nicht als Anforderung, und `serde_json::Error` in
         // `OtlpError::Json` trägt selbst keines) — deshalb wird hier der
         // entpackte `Ok`-Wert verglichen statt des ganzen `Result`.
-        assert_eq!(timestamp_to_unix_nanos(jiff::Timestamp::UNIX_EPOCH).unwrap(), 0);
+        assert_eq!(
+            timestamp_to_unix_nanos(jiff::Timestamp::UNIX_EPOCH).map_err(ctx("timestamp"))?,
+            0
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_timestamp_to_unix_nanos_far_future_within_range_succeeds() {
+    fn test_timestamp_to_unix_nanos_far_future_within_range_succeeds() -> TestResult {
         // ~ Jahr 2096, deutlich unter der u64-Nanosekundengrenze (~ Jahr 2554).
-        let far_future = jiff::Timestamp::from_second(4_000_000_000).unwrap();
+        let far_future = jiff::Timestamp::from_second(4_000_000_000).map_err(ctx("from_second"))?;
         let expected = far_future.as_nanosecond() as u64;
-        assert_eq!(timestamp_to_unix_nanos(far_future).unwrap(), expected);
+        assert_eq!(
+            timestamp_to_unix_nanos(far_future).map_err(ctx("timestamp"))?,
+            expected
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_timestamp_to_unix_nanos_before_epoch_is_out_of_range() {
-        let before_epoch = jiff::Timestamp::from_second(-1).unwrap();
-        let err = timestamp_to_unix_nanos(before_epoch).unwrap_err();
+    fn test_timestamp_to_unix_nanos_before_epoch_is_out_of_range() -> TestResult {
+        let before_epoch = jiff::Timestamp::from_second(-1).map_err(ctx("from_second"))?;
+        let Err(err) = timestamp_to_unix_nanos(before_epoch) else {
+            return Err(TestError::Unexpected(
+                "timestamp before epoch must be rejected".to_string(),
+            ));
+        };
         assert!(matches!(err, OtlpError::TimestampOutOfRange { nanos } if nanos < 0));
+        Ok(())
     }
 
     #[test]
@@ -425,12 +439,19 @@ mod tests {
     }
 
     #[test]
-    fn test_timestamp_to_unix_nanos_max_overflows_u64() {
+    fn test_timestamp_to_unix_nanos_max_overflows_u64() -> TestResult {
         // `Timestamp::MAX` liegt weit jenseits des Jahres 2554 und passt
         // damit nicht mehr in ein u64-Nanosekundenfeld — der Überlauf muss
         // als Fehler sichtbar werden, nicht still umschlagen.
-        let err = timestamp_to_unix_nanos(jiff::Timestamp::MAX).unwrap_err();
-        assert!(matches!(err, OtlpError::TimestampOutOfRange { nanos } if nanos > i128::from(u64::MAX)));
+        let Err(err) = timestamp_to_unix_nanos(jiff::Timestamp::MAX) else {
+            return Err(TestError::Unexpected(
+                "timestamp far beyond u64 range must be rejected".to_string(),
+            ));
+        };
+        assert!(
+            matches!(err, OtlpError::TimestampOutOfRange { nanos } if nanos > i128::from(u64::MAX))
+        );
+        Ok(())
     }
 
     #[test]
@@ -518,10 +539,11 @@ mod tests {
     }
 
     #[test]
-    fn test_to_json_bytes_produces_valid_json() {
+    fn test_to_json_bytes_produces_valid_json() -> TestResult {
         let request = ExportMetricsServiceRequest::default();
-        let bytes = to_json_bytes(&request).unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let bytes = to_json_bytes(&request).map_err(ctx("to_json_bytes"))?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(ctx("from_slice"))?;
         assert_eq!(value, serde_json::json!({}));
+        Ok(())
     }
 }

@@ -21,6 +21,9 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+mod common;
+use common::{TestResult, ctx};
+
 struct RecordingRuntime {
     session_id: BrowserSessionId,
     primary_context_id: BrowserContextId,
@@ -126,7 +129,7 @@ fn typed_bridge_policy_rejects_unbounded_configuration() {
 }
 
 #[test]
-fn session_handle_forwards_typed_page_bridge_installation() {
+fn session_handle_forwards_typed_page_bridge_installation() -> TestResult {
     let session_id = BrowserSessionId::new();
     let context_id = BrowserContextId::new();
     let installation_id = PageBridgeInstallationId::new();
@@ -146,7 +149,7 @@ fn session_handle_forwards_typed_page_bridge_installation() {
     let handle = BrowserSessionHandle::new(runtime.clone());
     assert_eq!(handle.primary_context_id(), context_id);
     let policy = PageBridgePolicy::new(4_096, 20, Duration::from_secs(60))
-        .unwrap_or_else(|error| panic!("bounded bridge policy must be valid: {error}"));
+        .map_err(ctx("bounded bridge policy must be valid"))?;
     let request = PageBridgeInstallRequest::new(
         context_id,
         "generic-chat",
@@ -154,14 +157,14 @@ fn session_handle_forwards_typed_page_bridge_installation() {
         "window.__harwBridge = Object.freeze({ version: '1.0.0' });",
         policy,
     )
-    .unwrap_or_else(|error| panic!("versioned bridge request must be valid: {error}"));
+    .map_err(ctx("versioned bridge request must be valid"))?;
 
     assert_eq!(
         request.emitted_content_trust(),
         PageBridgeContentTrust::Untrusted
     );
     let returned = block_on(handle.install_page_bridge(request))
-        .unwrap_or_else(|error| panic!("handle must forward bridge installation: {error}"));
+        .map_err(ctx("handle must forward bridge installation"))?;
 
     assert_eq!(returned.installation_id(), installation_id);
     assert_eq!(returned.context_id(), context_id);
@@ -179,6 +182,7 @@ fn session_handle_forwards_typed_page_bridge_installation() {
     assert_eq!(requests[0].version(), "1.0.0");
     assert_eq!(requests[0].policy(), &policy);
     assert!(requests[0].script().contains("Object.freeze"));
+    Ok(())
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {

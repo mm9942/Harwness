@@ -35,11 +35,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use harw_agent_dsl::context_program::{
-    render_context_program, resolve_context_program, RawContextProgramDefinition,
-    ResolvedContextProgramDefinition,
+    RawContextProgramDefinition, ResolvedContextProgramDefinition, render_context_program,
+    resolve_context_program,
 };
 use harw_agent_dsl::ids::DefinitionId;
 use harw_agent_dsl::layers::DefinitionLayer;
+
+mod common;
+use common::{TestError, TestResult, ctx};
 
 /// Marker-Zeile, ab der eine Golden-Datei den tatsächlich zu vergleichenden
 /// Renderer-Output trägt (§ Moduldoku „Warum nur dieser eine Abschnitt").
@@ -75,22 +78,27 @@ fn context_programs_dir() -> PathBuf {
 /// Layer-Reihenfolge irrelevant (siehe `resolve_context_program`, das nach
 /// `target_id` sucht, nicht nach Layer, sobald keine zwei Einträge dieselbe
 /// `id` teilen).
-fn load_layers() -> Vec<(DefinitionLayer, RawContextProgramDefinition)> {
+fn load_layers() -> TestResult<Vec<(DefinitionLayer, RawContextProgramDefinition)>> {
     let dir = context_programs_dir();
-    let entries = fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("agents/context-programs/ nicht lesbar ({dir:?}): {e}"));
+    let entries = fs::read_dir(&dir).map_err(|error| TestError::Context {
+        context: "agents/context-programs/ nicht lesbar",
+        source: format!("{dir:?}: {error}"),
+    })?;
 
     let mut layers = Vec::new();
     for entry in entries {
-        let entry = entry.expect("Verzeichniseintrag sollte lesbar sein");
+        let entry = entry.map_err(ctx("Verzeichniseintrag sollte lesbar sein"))?;
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
             continue;
         }
-        let src = fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{path:?} nicht lesbar: {e}"));
-        let raw: RawContextProgramDefinition = toml::from_str(&src)
-            .unwrap_or_else(|e| panic!("{path:?} parst nicht als Kontextprogramm: {e}"));
+        let src = fs::read_to_string(&path).map_err(|error| TestError::Context {
+            context: "Quelldatei nicht lesbar",
+            source: format!("{path:?}: {error}"),
+        })?;
+        let raw: RawContextProgramDefinition = toml::from_str(&src).map_err(|error| {
+            TestError::Unexpected(format!("{path:?} parst nicht als Kontextprogramm: {error}"))
+        })?;
         layers.push((DefinitionLayer::BuiltIn, raw));
     }
     assert_eq!(
@@ -99,7 +107,7 @@ fn load_layers() -> Vec<(DefinitionLayer, RawContextProgramDefinition)> {
         "erwartet base.toml + neun Rollenprogramme unter {dir:?}, gefunden: {}",
         layers.len()
     );
-    layers
+    Ok(layers)
 }
 
 /// Löst `name` (z. B. `"curate"`) über die geladenen Layer zu
@@ -107,33 +115,39 @@ fn load_layers() -> Vec<(DefinitionLayer, RawContextProgramDefinition)> {
 fn resolve(
     layers: &[(DefinitionLayer, RawContextProgramDefinition)],
     name: &str,
-) -> ResolvedContextProgramDefinition {
-    let id = DefinitionId::parse(&format!("harwness.context.{name}@1"))
-        .unwrap_or_else(|e| panic!("ungültige ID für Programm '{name}': {e}"));
-    resolve_context_program(&id, layers, time::OffsetDateTime::now_utc())
-        .unwrap_or_else(|e| panic!("Auflösung von '{name}' schlägt fehl: {e}"))
+) -> TestResult<ResolvedContextProgramDefinition> {
+    let id = DefinitionId::parse(&format!("harwness.context.{name}@1")).map_err(|error| {
+        TestError::Unexpected(format!("ungültige ID für Programm '{name}': {error}"))
+    })?;
+    resolve_context_program(&id, layers, time::OffsetDateTime::now_utc()).map_err(|error| {
+        TestError::Unexpected(format!("Auflösung von '{name}' schlägt fehl: {error}"))
+    })
 }
 
 /// Extrahiert den erwarteten Renderer-Output aus einer Golden-Datei: alles
 /// nach [`RENDER_MARKER`], von der führenden Leerzeile befreit, ohne
 /// nachgestellte Leerzeichen/Zeilenumbrüche.
-fn expected_render(golden_path: &Path) -> String {
-    let content = fs::read_to_string(golden_path)
-        .unwrap_or_else(|e| panic!("Golden-Datei {golden_path:?} nicht lesbar: {e}"));
-    let idx = content.find(RENDER_MARKER).unwrap_or_else(|| {
-        panic!("Golden-Datei {golden_path:?} enthält nicht die Marker-Zeile '{RENDER_MARKER}'")
-    });
+fn expected_render(golden_path: &Path) -> TestResult<String> {
+    let content = fs::read_to_string(golden_path).map_err(|error| TestError::Context {
+        context: "Golden-Datei nicht lesbar",
+        source: format!("{golden_path:?}: {error}"),
+    })?;
+    let idx = content
+        .find(RENDER_MARKER)
+        .ok_or(TestError::Unexpected(format!(
+            "Golden-Datei {golden_path:?} enthält nicht die Marker-Zeile '{RENDER_MARKER}'"
+        )))?;
     let after_marker = &content[idx + RENDER_MARKER.len()..];
-    after_marker.trim_start_matches('\n').trim_end().to_owned()
+    Ok(after_marker.trim_start_matches('\n').trim_end().to_owned())
 }
 
 /// Vergleicht `actual` gegen `expected` und meldet bei Abweichung **welches
 /// Programm** und **welche Zeile** zuerst voneinander abweicht (§ Auftrag:
 /// „die Fehlermeldung muss zeigen, welches Programm und welche Zeile
 /// abweicht, nicht nur 'nicht gleich'").
-fn assert_render_matches(program: &str, actual: &str, expected: &str) {
+fn assert_render_matches(program: &str, actual: &str, expected: &str) -> TestResult {
     if actual == expected {
-        return;
+        return Ok(());
     }
     let actual_lines: Vec<&str> = actual.split('\n').collect();
     let expected_lines: Vec<&str> = expected.split('\n').collect();
@@ -142,38 +156,41 @@ fn assert_render_matches(program: &str, actual: &str, expected: &str) {
         let a = actual_lines.get(i).copied();
         let e = expected_lines.get(i).copied();
         if a != e {
-            panic!(
+            return Err(TestError::Unexpected(format!(
                 "Golden-Abweichung bei Programm '{program}', Zeile {line}:\n  \
                  erwartet (golden): {expected:?}\n  \
                  tatsächlich (renderer): {actual:?}",
                 line = i + 1,
                 expected = e.unwrap_or("<Datei endet hier>"),
                 actual = a.unwrap_or("<Renderer-Ausgabe endet hier>"),
-            );
+            )));
         }
     }
     // Sollte nie erreicht werden, wenn `actual != expected`: Fallback, falls
     // beide Zeilenlisten identisch sind, sich aber z. B. nur in einem
     // führenden/nachgestellten Zeichen außerhalb der Zeilenaufteilung
     // unterscheiden.
-    panic!("Golden-Abweichung bei Programm '{program}', aber keine einzelne Zeile identifizierbar");
+    Err(TestError::Unexpected(format!(
+        "Golden-Abweichung bei Programm '{program}', aber keine einzelne Zeile identifizierbar"
+    )))
 }
 
 /// Der wichtigste Test dieses Knotens (§ TESTS.txt Punkt 6): alle neun
 /// Programme werden aufgelöst, gerendert und gegen ihre Golden-Datei
 /// verglichen.
 #[test]
-fn all_nine_programs_render_match_golden() {
-    let layers = load_layers();
+fn all_nine_programs_render_match_golden() -> TestResult {
+    let layers = load_layers()?;
     let golden_dir = context_programs_dir().join("golden");
 
     for name in NINE_PROGRAMS {
-        let resolved = resolve(&layers, name);
+        let resolved = resolve(&layers, name)?;
         let actual = render_context_program(&resolved);
         let golden_path = golden_dir.join(format!("{name}.golden.txt"));
-        let expected = expected_render(&golden_path);
-        assert_render_matches(name, &actual, &expected);
+        let expected = expected_render(&golden_path)?;
+        assert_render_matches(name, &actual, &expected)?;
     }
+    Ok(())
 }
 
 /// Zwei Läufe über dasselbe aufgelöste Programm liefern byte-genau dieselbe
@@ -181,10 +198,10 @@ fn all_nine_programs_render_match_golden() {
 /// oben wertlos, da ein flackernder Renderer jeden Lauf zufällig grün oder
 /// rot färben könnte.
 #[test]
-fn render_is_byte_identical_across_repeated_calls() {
-    let layers = load_layers();
+fn render_is_byte_identical_across_repeated_calls() -> TestResult {
+    let layers = load_layers()?;
     for name in NINE_PROGRAMS {
-        let resolved = resolve(&layers, name);
+        let resolved = resolve(&layers, name)?;
         let first = render_context_program(&resolved);
         let second = render_context_program(&resolved);
         assert_eq!(
@@ -192,6 +209,7 @@ fn render_is_byte_identical_across_repeated_calls() {
             "render_context_program('{name}') ist nicht deterministisch"
         );
     }
+    Ok(())
 }
 
 /// Ein Programm, das `base` über `extends` erweitert, zeigt im gerenderten
@@ -205,21 +223,21 @@ fn render_is_byte_identical_across_repeated_calls() {
 /// die rohe Deklaration statt der Auflösung sehen, schlüge diese Prüfung
 /// fehl.
 #[test]
-fn extends_renders_resolved_program_not_raw_declaration() {
-    let layers = load_layers();
+fn extends_renders_resolved_program_not_raw_declaration() -> TestResult {
+    let layers = load_layers()?;
 
     let raw_curate = layers
         .iter()
         .map(|(_, def)| def)
         .find(|def| def.id.name == "curate")
-        .expect("curate.toml sollte geladen sein");
+        .ok_or(TestError::Missing("curate.toml sollte geladen sein"))?;
     assert_eq!(
         raw_curate.sections.len(),
         2,
         "rohe curate.toml sollte nur ihre zwei eigenen Sektionen deklarieren"
     );
 
-    let resolved = resolve(&layers, "curate");
+    let resolved = resolve(&layers, "curate")?;
     assert_eq!(
         resolved.sections.len(),
         4,
@@ -227,11 +245,7 @@ fn extends_renders_resolved_program_not_raw_declaration() {
          plus seine zwei eigenen tragen"
     );
 
-    let section_names: Vec<&str> = resolved
-        .sections
-        .iter()
-        .map(|s| s.name.as_str())
-        .collect();
+    let section_names: Vec<&str> = resolved.sections.iter().map(|s| s.name.as_str()).collect();
     assert!(
         section_names.contains(&"task.objective"),
         "aufgelöstes curate-Programm sollte die von base geerbte Sektion \
@@ -254,16 +268,17 @@ fn extends_renders_resolved_program_not_raw_declaration() {
         "gerendertes curate-Programm sollte den Header der geerbten Sektion \
          'history.tail' enthalten:\n{rendered}"
     );
+    Ok(())
 }
 
 /// Jede der neun `extends`-Auflösungen trägt tatsächlich einen `"base"`-
 /// Auflösungsschritt, der exakt auf `harwness.context.base@1` zeigt (§
 /// TESTS.txt Punkt 3) — nicht nur irgendeinen `"base"`-Schritt.
 #[test]
-fn every_program_traces_a_base_step_pointing_at_base_definition() {
-    let layers = load_layers();
+fn every_program_traces_a_base_step_pointing_at_base_definition() -> TestResult {
+    let layers = load_layers()?;
     for name in NINE_PROGRAMS {
-        let resolved = resolve(&layers, name);
+        let resolved = resolve(&layers, name)?;
         let has_base_step = resolved
             .trace
             .steps
@@ -276,27 +291,25 @@ fn every_program_traces_a_base_step_pointing_at_base_definition() {
             resolved.trace.steps
         );
     }
+    Ok(())
 }
 
 /// Regressionstest für die Diff-Fehlermeldung selbst (§ Auftrag: „die
 /// Fehlermeldung muss zeigen, welches Programm und welche Zeile abweicht").
-/// Erzeugt absichtlich zwei unterschiedliche Texte und prüft, dass die
-/// `panic`-Nachricht von [`assert_render_matches`] den Programmnamen und die
-/// abweichende Zeilennummer nennt.
+/// Erzeugt absichtlich zwei unterschiedliche Texte und prüft, dass das
+/// `Err`, das [`assert_render_matches`] bei Abweichung liefert, den
+/// Programmnamen und die abweichende Zeilennummer nennt.
 #[test]
-fn assert_render_matches_names_program_and_line_on_mismatch() {
+fn assert_render_matches_names_program_and_line_on_mismatch() -> TestResult {
     let actual = "## a [instruction]\n<eins>\n\n## b [evidence]\n<zwei>";
     let expected = "## a [instruction]\n<eins>\n\n## b [evidence]\n<ANDERS>";
 
-    let result = std::panic::catch_unwind(|| {
-        assert_render_matches("beispiel-programm", actual, expected);
-    });
-    let err = result.expect_err("assert_render_matches sollte bei Abweichung panicken");
-    let message = err
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| err.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-        .expect("panic-Payload sollte ein String sein");
+    let Err(error) = assert_render_matches("beispiel-programm", actual, expected) else {
+        return Err(TestError::Unexpected(
+            "assert_render_matches sollte bei Abweichung ein Err liefern".to_owned(),
+        ));
+    };
+    let message = error.to_string();
 
     assert!(
         message.contains("beispiel-programm"),
@@ -306,6 +319,7 @@ fn assert_render_matches_names_program_and_line_on_mismatch() {
         message.contains("Zeile 5"),
         "Fehlermeldung sollte die abweichende Zeilennummer (5) nennen: {message}"
     );
+    Ok(())
 }
 
 /// Keine Namenskollision zwischen den zehn Kontextprogramm-IDs dieses
@@ -313,8 +327,8 @@ fn assert_render_matches_names_program_and_line_on_mismatch() {
 /// Rollennamen aus AW6-00 gehört laut TESTS.txt Punkt 2 einem zentralen
 /// Verzeichnis-Loader, der außerhalb dieses Schreibbereichs liegt).
 #[test]
-fn ten_context_program_ids_are_pairwise_distinct() {
-    let layers = load_layers();
+fn ten_context_program_ids_are_pairwise_distinct() -> TestResult {
+    let layers = load_layers()?;
     let mut seen: HashMap<String, ()> = HashMap::new();
     for (_, def) in &layers {
         let key = def.id.as_string();
@@ -324,4 +338,5 @@ fn ten_context_program_ids_are_pairwise_distinct() {
         );
     }
     assert_eq!(seen.len(), 10);
+    Ok(())
 }

@@ -287,31 +287,41 @@ impl ContextCeiling {
 mod tests {
     use super::{CeilingViolation, ContextCeiling, LEGACY_V1_SECTION, ROOT_CONTEXT_SECTIONS};
     use crate::budget::ContextBudgetSpec;
-    use crate::fragment::{Fragment, FragmentLabel, FragmentOrigin, SectionName, Stability, TrustClass};
+    use crate::fragment::{
+        Fragment, FragmentLabel, FragmentOrigin, SectionName, Stability, TrustClass,
+    };
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_lens_types::BudgetSpec;
 
-    fn section(name: &str) -> SectionName {
-        SectionName::try_new(name).unwrap()
+    fn section(name: &str) -> TestResult<SectionName> {
+        SectionName::try_new(name).map_err(ctx("valid section name"))
     }
 
-    fn ceiling(sections: &[&str], max_trust: TrustClass, per_section: &[(&str, u32)]) -> ContextCeiling {
-        ContextCeiling {
-            sections: sections.iter().map(|s| section(s)).collect(),
+    fn ceiling(
+        sections: &[&str],
+        max_trust: TrustClass,
+        per_section: &[(&str, u32)],
+    ) -> TestResult<ContextCeiling> {
+        Ok(ContextCeiling {
+            sections: sections
+                .iter()
+                .map(|s| section(s))
+                .collect::<TestResult<_>>()?,
             max_trust,
             budget: ContextBudgetSpec {
                 total: BudgetSpec { total: 1_000 },
                 per_section: per_section
                     .iter()
-                    .map(|(name, value)| (section(name), *value))
-                    .collect(),
+                    .map(|(name, value)| section(name).map(|s| (s, *value)))
+                    .collect::<TestResult<_>>()?,
             },
-        }
+        })
     }
 
-    fn fragment(section_name: &str, trust: TrustClass, cost: u32) -> Fragment {
-        Fragment {
-            label: FragmentLabel::try_new("turn-1").unwrap(),
-            section: section(section_name),
+    fn fragment(section_name: &str, trust: TrustClass, cost: u32) -> TestResult<Fragment> {
+        Ok(Fragment {
+            label: FragmentLabel::try_new("turn-1").map_err(ctx("valid fragment label"))?,
+            section: section(section_name)?,
             trust,
             stability: Stability::Stable,
             origin: FragmentOrigin {
@@ -322,27 +332,49 @@ mod tests {
             cost: harw_lens_types::CostEstimate(cost),
             digest: harw_types::ContentDigest::of(b"fragment body"),
             body: "fragment body".to_owned(),
-        }
+        })
     }
 
     #[test]
-    fn test_intersect_is_commutative() {
-        let a = ceiling(&["history.tail", "plan.current"], TrustClass::Instruction, &[("history.tail", 100)]);
-        let b = ceiling(&["plan.current", "other"], TrustClass::Data, &[("plan.current", 40)]);
+    fn test_intersect_is_commutative() -> TestResult {
+        let a = ceiling(
+            &["history.tail", "plan.current"],
+            TrustClass::Instruction,
+            &[("history.tail", 100)],
+        )?;
+        let b = ceiling(
+            &["plan.current", "other"],
+            TrustClass::Data,
+            &[("plan.current", 40)],
+        )?;
 
         assert_eq!(a.intersect(&b), b.intersect(&a));
+        Ok(())
     }
 
     #[test]
-    fn test_intersect_is_idempotent() {
-        let a = ceiling(&["history.tail"], TrustClass::Evidence, &[("history.tail", 100)]);
+    fn test_intersect_is_idempotent() -> TestResult {
+        let a = ceiling(
+            &["history.tail"],
+            TrustClass::Evidence,
+            &[("history.tail", 100)],
+        )?;
         assert_eq!(a.intersect(&a), a);
+        Ok(())
     }
 
     #[test]
-    fn test_intersect_result_is_subset_of_both_inputs() {
-        let a = ceiling(&["history.tail", "plan.current"], TrustClass::Instruction, &[("history.tail", 100)]);
-        let b = ceiling(&["plan.current", "other"], TrustClass::Data, &[("plan.current", 40)]);
+    fn test_intersect_result_is_subset_of_both_inputs() -> TestResult {
+        let a = ceiling(
+            &["history.tail", "plan.current"],
+            TrustClass::Instruction,
+            &[("history.tail", 100)],
+        )?;
+        let b = ceiling(
+            &["plan.current", "other"],
+            TrustClass::Data,
+            &[("plan.current", 40)],
+        )?;
 
         let intersected = a.intersect(&b);
 
@@ -352,104 +384,146 @@ mod tests {
         assert!(intersected.max_trust.trust_rank() <= b.max_trust.trust_rank());
         assert!(intersected.budget.total.total <= a.budget.total.total);
         assert!(intersected.budget.total.total <= b.budget.total.total);
+        Ok(())
     }
 
     #[test]
-    fn test_admits_rejects_section_not_in_ceiling() {
-        let ceiling = ceiling(&["history.tail"], TrustClass::Instruction, &[]);
-        let fragment = fragment("plan.current", TrustClass::Data, 1);
+    fn test_admits_rejects_section_not_in_ceiling() -> TestResult {
+        let ceiling = ceiling(&["history.tail"], TrustClass::Instruction, &[])?;
+        let fragment = fragment("plan.current", TrustClass::Data, 1)?;
 
         assert!(matches!(
             ceiling.admits(&fragment),
             Err(CeilingViolation::SectionNotAllowed { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_admits_rejects_trust_above_max_trust() {
-        let ceiling = ceiling(&["history.tail"], TrustClass::Data, &[]);
-        let fragment = fragment("history.tail", TrustClass::Instruction, 1);
+    fn test_admits_rejects_trust_above_max_trust() -> TestResult {
+        let ceiling = ceiling(&["history.tail"], TrustClass::Data, &[])?;
+        let fragment = fragment("history.tail", TrustClass::Instruction, 1)?;
 
         assert!(matches!(
             ceiling.admits(&fragment),
             Err(CeilingViolation::TrustExceeded { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_admits_rejects_cost_over_section_budget() {
-        let ceiling = ceiling(&["history.tail"], TrustClass::Instruction, &[("history.tail", 10)]);
-        let fragment = fragment("history.tail", TrustClass::Instruction, 11);
+    fn test_admits_rejects_cost_over_section_budget() -> TestResult {
+        let ceiling = ceiling(
+            &["history.tail"],
+            TrustClass::Instruction,
+            &[("history.tail", 10)],
+        )?;
+        let fragment = fragment("history.tail", TrustClass::Instruction, 11)?;
 
         assert!(matches!(
             ceiling.admits(&fragment),
             Err(CeilingViolation::OverBudget { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_admits_accepts_fragment_exactly_at_all_three_boundaries() {
-        let ceiling = ceiling(&["history.tail"], TrustClass::Evidence, &[("history.tail", 10)]);
-        let fragment = fragment("history.tail", TrustClass::Evidence, 10);
+    fn test_admits_accepts_fragment_exactly_at_all_three_boundaries() -> TestResult {
+        let ceiling = ceiling(
+            &["history.tail"],
+            TrustClass::Evidence,
+            &[("history.tail", 10)],
+        )?;
+        let fragment = fragment("history.tail", TrustClass::Evidence, 10)?;
 
         assert_eq!(ceiling.admits(&fragment), Ok(()));
+        Ok(())
     }
 
     #[test]
-    fn test_admits_rejects_under_declared_cost_via_body_floor() {
+    fn test_admits_rejects_under_declared_cost_via_body_floor() -> TestResult {
         // Body "fragment body" is 13 bytes => floor ceil(13/4) = 4 units.
-        let ceiling = ceiling(&["history.tail"], TrustClass::Instruction, &[("history.tail", 3)]);
-        let fragment = fragment("history.tail", TrustClass::Data, 0);
+        let ceiling = ceiling(
+            &["history.tail"],
+            TrustClass::Instruction,
+            &[("history.tail", 3)],
+        )?;
+        let fragment = fragment("history.tail", TrustClass::Data, 0)?;
 
         match ceiling.admits(&fragment) {
             Err(CeilingViolation::OverBudget { cost, budget, .. }) => {
                 assert_eq!(cost.0, 4);
                 assert_eq!(budget, 3);
             }
-            other => panic!("a cost-0 claim must not bypass the section budget, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "a cost-0 claim must not bypass the section budget, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
     fn test_root_context_sections_are_valid_unique_and_contain_legacy_v1() {
         let mut seen = std::collections::BTreeSet::new();
         for name in ROOT_CONTEXT_SECTIONS {
-            assert!(SectionName::try_new(*name).is_ok(), "{name} must be a valid section name");
+            assert!(
+                SectionName::try_new(*name).is_ok(),
+                "{name} must be a valid section name"
+            );
             assert!(seen.insert(*name), "{name} must appear only once");
         }
         assert!(ROOT_CONTEXT_SECTIONS.contains(&LEGACY_V1_SECTION));
         assert!(ROOT_CONTEXT_SECTIONS.contains(&"history.tail"));
-        for forbidden in ["credential.tokens", "secret.values", "plan.current", "web.fetch_allowlist"] {
-            assert!(!ROOT_CONTEXT_SECTIONS.contains(&forbidden), "{forbidden} must stay outside");
+        for forbidden in [
+            "credential.tokens",
+            "secret.values",
+            "plan.current",
+            "web.fetch_allowlist",
+        ] {
+            assert!(
+                !ROOT_CONTEXT_SECTIONS.contains(&forbidden),
+                "{forbidden} must stay outside"
+            );
         }
     }
 
     #[test]
-    fn test_root_context_sections_ceiling_admits_legacy_v1_data_fragment() {
-        let ceiling = ceiling(ROOT_CONTEXT_SECTIONS, TrustClass::Instruction, &[]);
-        let fragment = fragment(LEGACY_V1_SECTION, TrustClass::Data, 4);
+    fn test_root_context_sections_ceiling_admits_legacy_v1_data_fragment() -> TestResult {
+        let ceiling = ceiling(ROOT_CONTEXT_SECTIONS, TrustClass::Instruction, &[])?;
+        let fragment = fragment(LEGACY_V1_SECTION, TrustClass::Data, 4)?;
 
         assert_eq!(ceiling.admits(&fragment), Ok(()));
+        Ok(())
     }
 
     #[test]
-    fn test_context_ceiling_serde_roundtrip() {
-        let ceiling = ceiling(&["history.tail"], TrustClass::Evidence, &[("history.tail", 10)]);
-        let json = serde_json::to_string(&ceiling).expect("ceiling must serialize");
-        let restored: ContextCeiling = serde_json::from_str(&json).expect("ceiling must deserialize");
+    fn test_context_ceiling_serde_roundtrip() -> TestResult {
+        let ceiling = ceiling(
+            &["history.tail"],
+            TrustClass::Evidence,
+            &[("history.tail", 10)],
+        )?;
+        let json = serde_json::to_string(&ceiling).map_err(ctx("ceiling must serialize"))?;
+        let restored: ContextCeiling =
+            serde_json::from_str(&json).map_err(ctx("ceiling must deserialize"))?;
         assert_eq!(ceiling, restored);
+        Ok(())
     }
 
     #[test]
-    fn test_context_ceiling_deserialize_rejects_unknown_field() {
-        let ceiling = ceiling(&["history.tail"], TrustClass::Evidence, &[]);
-        let mut value = serde_json::to_value(&ceiling).expect("ceiling must serialize to value");
+    fn test_context_ceiling_deserialize_rejects_unknown_field() -> TestResult {
+        let ceiling = ceiling(&["history.tail"], TrustClass::Evidence, &[])?;
+        let mut value =
+            serde_json::to_value(&ceiling).map_err(ctx("ceiling must serialize to value"))?;
         value
             .as_object_mut()
-            .expect("ceiling serializes to an object")
+            .ok_or(TestError::Missing("ceiling serializes to an object"))?
             .insert("unexpected".to_owned(), serde_json::json!(true));
 
         let result: Result<ContextCeiling, _> = serde_json::from_value(value);
         assert!(result.is_err());
+        Ok(())
     }
 }

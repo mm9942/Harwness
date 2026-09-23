@@ -86,16 +86,7 @@ pub enum PlanNodeStatus {
 // Alle Varianten sind einwortig, kebab-case und das `snake_case` von serde
 // fallen hier also zusammen — die Wire-Form ändert sich nicht.
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    Serialize,
-    Deserialize,
-    Default,
-    harw_macros::KebabEnum,
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, harw_macros::KebabEnum,
 )]
 #[serde(rename_all = "snake_case")]
 #[kebab_enum(error = "crate::error::PlanError", ctor = "unknown_variant")]
@@ -462,6 +453,7 @@ pub struct Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
     use time::OffsetDateTime;
 
     fn make_node(id: &str) -> PlanNode {
@@ -488,16 +480,17 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_node_serde_roundtrip() {
+    fn test_plan_node_serde_roundtrip() -> TestResult {
         let node = make_node("t-001");
-        let json = serde_json::to_string(&node).expect("serialize PlanNode");
-        let back: PlanNode = serde_json::from_str(&json).expect("deserialize PlanNode");
+        let json = serde_json::to_string(&node)?;
+        let back: PlanNode = serde_json::from_str(&json)?;
         assert_eq!(back.id, node.id);
         assert_eq!(back.status, PlanNodeStatus::Draft);
+        Ok(())
     }
 
     #[test]
-    fn test_plan_node_status_snake_case() {
+    fn test_plan_node_status_snake_case() -> TestResult {
         let cases = [
             (PlanNodeStatus::Draft, "\"draft\""),
             (PlanNodeStatus::Ready, "\"ready\""),
@@ -508,45 +501,46 @@ mod tests {
             (PlanNodeStatus::Invalidated, "\"invalidated\""),
         ];
         for (status, expected) in &cases {
-            let json = serde_json::to_string(status).unwrap();
+            let json = serde_json::to_string(status)?;
             assert_eq!(
                 &json, expected,
                 "Status {:?} serialisiert nicht korrekt",
                 status
             );
         }
+        Ok(())
     }
 
     /// Simuliert einen Alt-Snapshot ohne `kind`/`wave`/`assignment`/`parent`
     /// und prüft, dass die Deserialisierung dank `#[serde(default)]`
     /// weiterhin gelingt und die erwarteten Default-Werte greifen.
     #[test]
-    fn test_plan_node_deserializes_legacy_json_without_new_fields() {
+    fn test_plan_node_deserializes_legacy_json_without_new_fields() -> TestResult {
         let node = make_node("t-legacy");
-        let mut value = serde_json::to_value(&node).expect("serialize PlanNode to Value");
+        let mut value = serde_json::to_value(&node)?;
         let obj = value
             .as_object_mut()
-            .expect("PlanNode serialisiert als JSON-Objekt");
+            .ok_or(TestError::Missing("PlanNode serialisiert als JSON-Objekt"))?;
         obj.remove("kind");
         obj.remove("wave");
         obj.remove("assignment");
         obj.remove("parent");
 
-        let restored: PlanNode =
-            serde_json::from_value(value).expect("deserialize legacy PlanNode ohne neue Felder");
+        let restored: PlanNode = serde_json::from_value(value)?;
 
         assert_eq!(restored.kind, PlanNodeKind::default());
         assert_eq!(restored.kind, PlanNodeKind::Coding);
         assert_eq!(restored.wave, None);
         assert_eq!(restored.assignment, None);
         assert_eq!(restored.parent, None);
+        Ok(())
     }
 
     /// Prüft den Serde-Roundtrip aller `EvidenceKind`-Varianten sowie die
     /// tolerante Deserialisierung von kebab-case- und unbekannten Werten
     /// (Fallback auf `Other`).
     #[test]
-    fn test_evidence_kind_roundtrip_and_unknown_fallback() {
+    fn test_evidence_kind_roundtrip_and_unknown_fallback() -> TestResult {
         let cases = [
             (EvidenceKind::Finding, "\"finding\""),
             (EvidenceKind::CargoTest, "\"cargo_test\""),
@@ -558,25 +552,23 @@ mod tests {
             (EvidenceKind::Other, "\"other\""),
         ];
         for (kind, expected_json) in cases {
-            let json = serde_json::to_string(&kind).expect("serialize EvidenceKind");
+            let json = serde_json::to_string(&kind)?;
             assert_eq!(
                 json, expected_json,
                 "unerwartete Serialisierung für {kind:?}"
             );
-            let back: EvidenceKind =
-                serde_json::from_str(&json).expect("deserialize EvidenceKind");
+            let back: EvidenceKind = serde_json::from_str(&json)?;
             assert_eq!(back, kind, "Roundtrip schlägt fehl für {kind:?}");
         }
 
         // kebab-case wird toleriert und auf denselben Wert wie snake_case gemappt.
-        let kebab: EvidenceKind =
-            serde_json::from_str("\"cargo-test\"").expect("deserialize kebab-case Wert");
+        let kebab: EvidenceKind = serde_json::from_str("\"cargo-test\"")?;
         assert_eq!(kebab, EvidenceKind::CargoTest);
 
         // Unbekannte Werte fallen auf `Other`, statt einen Fehler zu erzeugen.
-        let unknown: EvidenceKind = serde_json::from_str("\"totally-unknown-value\"")
-            .expect("deserialize unbekannten Wert");
+        let unknown: EvidenceKind = serde_json::from_str("\"totally-unknown-value\"")?;
         assert_eq!(unknown, EvidenceKind::Other);
+        Ok(())
     }
 
     /// Kanonischer Test-Nachweis ohne `digest` — Ausgangspunkt für die
@@ -595,28 +587,28 @@ mod tests {
     /// [`harw_types::ContentDigest`] übersteht Serialisierung und
     /// Deserialisierung unverändert.
     #[test]
-    fn test_evidence_ref_serde_roundtrip_with_digest() {
+    fn test_evidence_ref_serde_roundtrip_with_digest() -> TestResult {
         let evidence = EvidenceRef {
             digest: Some(harw_types::ContentDigest::of(b"evidence content")),
             ..make_evidence()
         };
-        let json = serde_json::to_string(&evidence).expect("serialize EvidenceRef mit digest");
-        let back: EvidenceRef =
-            serde_json::from_str(&json).expect("deserialize EvidenceRef mit digest");
+        let json = serde_json::to_string(&evidence)?;
+        let back: EvidenceRef = serde_json::from_str(&json)?;
         assert_eq!(back.digest, evidence.digest);
         assert_eq!(back.kind, evidence.kind);
         assert_eq!(back.locator, evidence.locator);
+        Ok(())
     }
 
     /// Roundtrip ohne `digest`: `None` bleibt nach Serialisierung und
     /// Deserialisierung `None`.
     #[test]
-    fn test_evidence_ref_serde_roundtrip_without_digest() {
+    fn test_evidence_ref_serde_roundtrip_without_digest() -> TestResult {
         let evidence = make_evidence();
-        let json = serde_json::to_string(&evidence).expect("serialize EvidenceRef ohne digest");
-        let back: EvidenceRef =
-            serde_json::from_str(&json).expect("deserialize EvidenceRef ohne digest");
+        let json = serde_json::to_string(&evidence)?;
+        let back: EvidenceRef = serde_json::from_str(&json)?;
         assert_eq!(back.digest, None);
+        Ok(())
     }
 
     /// Der wichtigste Test: JSON ohne das Feld `digest` (Simulation einer
@@ -624,7 +616,7 @@ mod tests {
     /// ergibt `None`. Das ist die Zusage "bestehende Dateien bleiben lesbar"
     /// als Test, nicht als Absicht.
     #[test]
-    fn test_evidence_ref_deserializes_legacy_json_without_digest_field() {
+    fn test_evidence_ref_deserializes_legacy_json_without_digest_field() -> TestResult {
         let legacy = serde_json::json!({
             "kind": "cargo_test",
             "locator": "cargo test",
@@ -636,23 +628,24 @@ mod tests {
             "Testaufbau: Legacy-JSON darf kein digest-Feld enthalten"
         );
 
-        let restored: EvidenceRef =
-            serde_json::from_value(legacy).expect("deserialize Legacy-EvidenceRef ohne digest");
+        let restored: EvidenceRef = serde_json::from_value(legacy)?;
         assert_eq!(restored.digest, None);
         assert_eq!(restored.kind, EvidenceKind::CargoTest);
         assert_eq!(restored.locator, "cargo test");
+        Ok(())
     }
 
     /// Ein `EvidenceRef` ohne `digest` serialisiert kein `"digest": null` —
     /// `skip_serializing_if` muss das Feld vollständig auslassen, nicht nur
     /// auf `null` setzen.
     #[test]
-    fn test_evidence_ref_without_digest_omits_null_in_json() {
+    fn test_evidence_ref_without_digest_omits_null_in_json() -> TestResult {
         let evidence = make_evidence();
-        let json = serde_json::to_string(&evidence).expect("serialize EvidenceRef ohne digest");
+        let json = serde_json::to_string(&evidence)?;
         assert!(
             !json.contains("digest"),
             "JSON darf kein digest-Feld enthalten, wenn digest None ist: {json}"
         );
+        Ok(())
     }
 }

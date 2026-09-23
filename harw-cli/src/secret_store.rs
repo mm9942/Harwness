@@ -295,74 +295,83 @@ mod tests {
         configured_secret_store_persisted_audit_chain_status, open_configured_secret_resolver,
         open_configured_secret_resolver_for_active_provider,
     };
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn no_secrets_provider_reference_returns_none_without_a_kek() {
+    fn no_secrets_provider_reference_returns_none_without_a_kek() -> TestResult {
         let config = harw_config::ResolvedConfig::default();
-        let home = TempDir::new().expect("temporary home");
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
 
         assert!(
             open_configured_secret_resolver(home.path(), &config)
-                .expect("no sealed provider must not require a KEK")
+                .map_err(ctx("no sealed provider must not require a KEK"))?
                 .is_none()
         );
+        Ok(())
     }
 
     #[test]
-    fn sealed_provider_without_a_kek_fails_closed() {
-        let config = sealed_provider_config();
-        let home = TempDir::new().expect("temporary home");
+    fn sealed_provider_without_a_kek_fails_closed() -> TestResult {
+        let config = sealed_provider_config()?;
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
 
-        let error = match open_configured_secret_resolver(home.path(), &config) {
-            Ok(_) => panic!("sealed provider without KEK must fail"),
-            Err(error) => error,
+        let result = open_configured_secret_resolver(home.path(), &config);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "sealed provider without KEK must fail".into(),
+            ));
         };
         assert!(error.contains("requires a configured KEK"));
+        Ok(())
     }
 
     #[test]
-    fn invalid_keyring_kek_fails_closed_when_sealed_provider_is_configured() {
-        let mut config = sealed_provider_config();
+    fn invalid_keyring_kek_fails_closed_when_sealed_provider_is_configured() -> TestResult {
+        let mut config = sealed_provider_config()?;
         config.auth.kek = Some(KekConfig {
             provenance: ConfigKekProvenance::Keyring,
             key_file_path: None,
             keyring_entry: Some("missing-account".to_owned()),
             env_seed_var: None,
         });
-        let home = TempDir::new().expect("temporary home");
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
 
-        let error = match open_configured_secret_resolver(home.path(), &config) {
-            Ok(_) => panic!("malformed keyring entry must fail"),
-            Err(error) => error,
+        let result = open_configured_secret_resolver(home.path(), &config);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "malformed keyring entry must fail".into(),
+            ));
         };
         assert_eq!(error, "keyring KEK entry must be service/account");
+        Ok(())
     }
 
     #[test]
-    fn resolver_returns_a_valid_utf8_sealed_secret() {
-        let home = TempDir::new().expect("temporary home");
-        let key_path = write_test_kek(home.path());
-        let mut store = store_with_test_kek(home.path(), &key_path);
+    fn resolver_returns_a_valid_utf8_sealed_secret() -> TestResult {
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
+        let key_path = write_test_kek(home.path())?;
+        let mut store = store_with_test_kek(home.path(), &key_path)?;
         store
             .create(
                 "provider-token",
                 "provider authentication",
                 &SecretBox::new(b"utf8-token".to_vec().into_boxed_slice()),
             )
-            .expect("seal test token");
+            .map_err(ctx("seal test token"))?;
         let resolver = ConfiguredSecretResolver::new(store);
 
         let resolved = resolver
             .resolve("provider-token")
-            .expect("resolve valid UTF-8 secret");
+            .map_err(ctx("resolve valid UTF-8 secret"))?;
         assert_eq!(resolved.expose_secret(), "utf8-token");
+        Ok(())
     }
 
     #[test]
-    fn resolver_rejects_non_utf8_sealed_secret_without_leaking_data() {
-        let home = TempDir::new().expect("temporary home");
-        let key_path = write_test_kek(home.path());
-        let mut store = store_with_test_kek(home.path(), &key_path);
+    fn resolver_rejects_non_utf8_sealed_secret_without_leaking_data() -> TestResult {
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
+        let key_path = write_test_kek(home.path())?;
+        let mut store = store_with_test_kek(home.path(), &key_path)?;
         let secret_bytes = [0xff, 0x00, 0x80];
         store
             .create(
@@ -370,49 +379,54 @@ mod tests {
                 "provider authentication",
                 &SecretBox::new(secret_bytes.to_vec().into_boxed_slice()),
             )
-            .expect("seal binary test token");
+            .map_err(ctx("seal binary test token"))?;
         let resolver = ConfiguredSecretResolver::new(store);
 
-        let error = resolver
-            .resolve("binary-provider-token")
-            .expect_err("non-UTF-8 secret must be rejected");
+        let result = resolver.resolve("binary-provider-token");
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "non-UTF-8 secret must be rejected".into(),
+            ));
+        };
         assert_eq!(error, "sealed secret is not valid UTF-8");
         assert!(!error.contains("255"));
         assert!(!error.contains("binary-provider-token"));
+        Ok(())
     }
 
     #[test]
-    fn resolver_reports_a_retired_kem_with_a_migration_hint() {
-        let home = TempDir::new().expect("temporary home");
-        let key_path = write_test_kek(home.path());
+    fn resolver_reports_a_retired_kem_with_a_migration_hint() -> TestResult {
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
+        let key_path = write_test_kek(home.path())?;
         {
-            let mut store = store_with_test_kek(home.path(), &key_path);
+            let mut store = store_with_test_kek(home.path(), &key_path)?;
             store
                 .create(
                     "provider-token",
                     "provider authentication",
                     &SecretBox::new(b"legacy-token".to_vec().into_boxed_slice()),
                 )
-                .expect("seal test token");
+                .map_err(ctx("seal test token"))?;
         }
         // Reset the durable KEM name to a retired pure ML-KEM level, as written
         // before the hybrid switch.
         let entry = fs::read_dir(home.path().join("sealed-secrets").join("secrets"))
-            .expect("sealed secrets directory")
+            .map_err(ctx("sealed secrets directory"))?
             .next()
-            .expect("one sealed entry")
-            .expect("sealed entry")
+            .ok_or(TestError::Missing("one sealed entry"))?
+            .map_err(ctx("sealed entry"))?
             .path();
         let mut durable: serde_json::Value =
-            serde_json::from_slice(&fs::read(&entry).expect("read sealed entry"))
-                .expect("sealed entry is JSON");
+            serde_json::from_slice(&fs::read(&entry).map_err(ctx("read sealed entry"))?)
+                .map_err(ctx("sealed entry is JSON"))?;
         durable["record"]["kem_algo"] = serde_json::Value::String("ml_kem_768".to_owned());
-        let legacy_entry = serde_json::to_vec(&durable).expect("encode legacy entry");
-        fs::write(&entry, legacy_entry).expect("write legacy entry");
+        let legacy_entry = serde_json::to_vec(&durable).map_err(ctx("encode legacy entry"))?;
+        fs::write(&entry, legacy_entry).map_err(ctx("write legacy entry"))?;
 
         let policy = CryptoPolicy::strongest();
         let provenance = KekProvenance::KeyFile { path: key_path };
-        let key_material = load_kek_material(&policy, &provenance).expect("load test KEK material");
+        let key_material =
+            load_kek_material(&policy, &provenance).map_err(ctx("load test KEK material"))?;
         let store = SecretStore::open_with_key_material(
             home.path().join("sealed-secrets"),
             policy,
@@ -420,22 +434,27 @@ mod tests {
             KeyVersion::initial(),
             key_material,
         )
-        .expect("legacy record still loads");
+        .map_err(ctx("legacy record still loads"))?;
         let resolver = ConfiguredSecretResolver::new(store);
 
-        let error = resolver
-            .resolve("secrets:provider-token")
-            .expect_err("retired KEM must not resolve");
+        let result = resolver.resolve("secrets:provider-token");
+        let Err(error) = result else {
+            return Err(TestError::Unexpected("retired KEM must not resolve".into()));
+        };
         assert!(error.contains("retired KEM 'ml_kem_768'"));
         assert!(error.contains("re-create the secret"));
         assert!(error.contains("docs/setup/crypt-guard.md"));
         assert!(!error.contains("legacy-token"));
 
-        let masked = resolver
-            .resolve("secrets:missing-provider-token")
-            .expect_err("unknown reference must not resolve");
+        let masked_result = resolver.resolve("secrets:missing-provider-token");
+        let Err(masked) = masked_result else {
+            return Err(TestError::Unexpected(
+                "unknown reference must not resolve".into(),
+            ));
+        };
         assert_eq!(masked, "sealed secret could not be resolved");
         assert!(!masked.contains("missing-provider-token"));
+        Ok(())
     }
 
     /// Der wichtigste Test dieses Knotens: die periodische Kettenprüfung
@@ -444,25 +463,32 @@ mod tests {
     /// Speicher gibt es nichts zu prüfen.
     #[test]
     fn configured_secret_store_persisted_audit_chain_status_returns_none_without_a_sealed_provider()
-    {
+    -> TestResult {
         let config = harw_config::ResolvedConfig::default();
-        let home = TempDir::new().expect("temporary home");
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
 
         assert!(
             configured_secret_store_persisted_audit_chain_status(home.path(), &config)
-                .expect("no sealed provider must not require a KEK")
+                .map_err(ctx("no sealed provider must not require a KEK"))?
                 .is_none()
         );
+        Ok(())
     }
 
     #[test]
-    fn configured_secret_store_persisted_audit_chain_status_fails_closed_without_a_kek() {
-        let config = sealed_provider_config();
-        let home = TempDir::new().expect("temporary home");
+    fn configured_secret_store_persisted_audit_chain_status_fails_closed_without_a_kek()
+    -> TestResult {
+        let config = sealed_provider_config()?;
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
 
-        let error = configured_secret_store_persisted_audit_chain_status(home.path(), &config)
-            .expect_err("sealed provider without KEK must fail closed");
+        let result = configured_secret_store_persisted_audit_chain_status(home.path(), &config);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "sealed provider without KEK must fail closed".into(),
+            ));
+        };
         assert!(error.contains("requires a configured KEK"));
+        Ok(())
     }
 
     /// Der wichtigste Test dieses Knotens: die geprüfte Kette ist die auf der
@@ -472,20 +498,21 @@ mod tests {
     /// durch eine separate `SecretStore`-Instanz an derselben Wurzel muss
     /// hier sichtbar werden, weil sie auf die Platte durchgeschrieben wurde.
     #[test]
-    fn configured_secret_store_persisted_audit_chain_status_reads_the_real_disk_file() {
-        let home = TempDir::new().expect("temporary home");
-        let key_path = write_test_kek(home.path());
+    fn configured_secret_store_persisted_audit_chain_status_reads_the_real_disk_file() -> TestResult
+    {
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
+        let key_path = write_test_kek(home.path())?;
         {
-            let mut store = store_with_test_kek(home.path(), &key_path);
+            let mut store = store_with_test_kek(home.path(), &key_path)?;
             store
                 .create(
                     "provider-token",
                     "provider authentication",
                     &SecretBox::new(b"utf8-token".to_vec().into_boxed_slice()),
                 )
-                .expect("seal test token");
+                .map_err(ctx("seal test token"))?;
         }
-        let mut config = sealed_provider_config();
+        let mut config = sealed_provider_config()?;
         config.auth.kek = Some(KekConfig {
             provenance: ConfigKekProvenance::KeyFile,
             key_file_path: Some(key_path.to_string_lossy().into_owned()),
@@ -494,9 +521,9 @@ mod tests {
         });
 
         let status = configured_secret_store_persisted_audit_chain_status(home.path(), &config)
-            .expect("valid KEK must open the configured store")
-            .expect("sealed provider is configured")
-            .expect("a freshly written chain must verify intact");
+            .map_err(ctx("valid KEK must open the configured store"))?
+            .ok_or(TestError::Missing("sealed provider is configured"))?
+            .map_err(ctx("a freshly written chain must verify intact"))?;
 
         match status {
             PersistedChainStatus::Intact { event_count, .. } => {
@@ -505,17 +532,23 @@ mod tests {
                     "the disk-persisted chain must show the mutation made by the earlier instance"
                 );
             }
-            other => panic!("expected an intact persisted chain, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected an intact persisted chain, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// Ohne jede Mutation existiert `audit.log` noch nicht — das ist kein
     /// Fund, sondern „nichts protokolliert".
     #[test]
-    fn configured_secret_store_persisted_audit_chain_status_reports_absent_without_mutations() {
-        let home = TempDir::new().expect("temporary home");
-        let key_path = write_test_kek(home.path());
-        let mut config = sealed_provider_config();
+    fn configured_secret_store_persisted_audit_chain_status_reports_absent_without_mutations()
+    -> TestResult {
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
+        let key_path = write_test_kek(home.path())?;
+        let mut config = sealed_provider_config()?;
         config.auth.kek = Some(KekConfig {
             provenance: ConfigKekProvenance::KeyFile,
             key_file_path: Some(key_path.to_string_lossy().into_owned()),
@@ -524,52 +557,59 @@ mod tests {
         });
 
         let status = configured_secret_store_persisted_audit_chain_status(home.path(), &config)
-            .expect("valid KEK must open the configured store")
-            .expect("sealed provider is configured");
+            .map_err(ctx("valid KEK must open the configured store"))?
+            .ok_or(TestError::Missing("sealed provider is configured"))?;
 
         assert!(matches!(status, Ok(PersistedChainStatus::Absent)));
+        Ok(())
     }
 
     #[test]
     fn configured_secret_store_persisted_audit_chain_status_never_leaks_secret_content_on_open_failure()
-     {
-        let mut config = sealed_provider_config();
+    -> TestResult {
+        let mut config = sealed_provider_config()?;
         config.auth.kek = Some(KekConfig {
             provenance: ConfigKekProvenance::Keyring,
             key_file_path: None,
             keyring_entry: Some("missing-account".to_owned()),
             env_seed_var: None,
         });
-        let home = TempDir::new().expect("temporary home");
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
 
-        let error = configured_secret_store_persisted_audit_chain_status(home.path(), &config)
-            .expect_err("malformed keyring entry must fail");
+        let result = configured_secret_store_persisted_audit_chain_status(home.path(), &config);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "malformed keyring entry must fail".into(),
+            ));
+        };
         assert_eq!(error, "keyring KEK entry must be service/account");
         assert!(!error.contains("provider-token"));
+        Ok(())
     }
 
     /// Ein Lesefehler der persistierten Kette (hier: eine abgeschnittene
     /// Datei) trägt weder Geheimnisinhalt noch Kettenereignisdaten in seiner
     /// `Display`-Meldung.
     #[test]
-    fn configured_secret_store_persisted_audit_chain_status_io_error_carries_no_secret_content() {
-        let home = TempDir::new().expect("temporary home");
-        let key_path = write_test_kek(home.path());
+    fn configured_secret_store_persisted_audit_chain_status_io_error_carries_no_secret_content()
+    -> TestResult {
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
+        let key_path = write_test_kek(home.path())?;
         {
-            let mut store = store_with_test_kek(home.path(), &key_path);
+            let mut store = store_with_test_kek(home.path(), &key_path)?;
             store
                 .create(
                     "provider-token",
                     "provider authentication",
                     &SecretBox::new(b"utf8-token".to_vec().into_boxed_slice()),
                 )
-                .expect("seal test token");
+                .map_err(ctx("seal test token"))?;
         }
         let audit_log_path = home.path().join("sealed-secrets").join("audit.log");
-        let bytes = std::fs::read(&audit_log_path).expect("read persisted audit log");
+        let bytes = std::fs::read(&audit_log_path).map_err(ctx("read persisted audit log"))?;
         std::fs::write(&audit_log_path, &bytes[..bytes.len() / 2])
-            .expect("truncate persisted audit log");
-        let mut config = sealed_provider_config();
+            .map_err(ctx("truncate persisted audit log"))?;
+        let mut config = sealed_provider_config()?;
         config.auth.kek = Some(KekConfig {
             provenance: ConfigKekProvenance::KeyFile,
             key_file_path: Some(key_path.to_string_lossy().into_owned()),
@@ -578,105 +618,118 @@ mod tests {
         });
 
         let status = configured_secret_store_persisted_audit_chain_status(home.path(), &config)
-            .expect("valid KEK must open the configured store")
-            .expect("sealed provider is configured");
+            .map_err(ctx("valid KEK must open the configured store"))?
+            .ok_or(TestError::Missing("sealed provider is configured"))?;
 
         let error = match status {
             Err(error @ AuditError::Io(_)) => error,
-            other => panic!("expected an unreadable persisted chain, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected an unreadable persisted chain, got {other:?}"
+                )));
+            }
         };
         assert!(!error.to_string().contains("provider-token"));
         assert!(!error.to_string().contains("utf8-token"));
+        Ok(())
     }
 
-    fn sealed_provider_config() -> harw_config::ResolvedConfig {
+    fn sealed_provider_config() -> TestResult<harw_config::ResolvedConfig> {
         let mut config = harw_config::ResolvedConfig::default();
         config.providers.insert(
             "sealed".to_owned(),
             toml::from_str::<ProviderToml>(
                 "name = \"sealed\"\napi = \"openai-compatible\"\nbase_url = \"https://example.test\"\nauth = \"secrets:provider-token\"\n",
             )
-            .expect("valid test provider"),
+            .map_err(ctx("valid test provider"))?,
         );
-        config
+        Ok(config)
     }
 
     /// Wie [`sealed_provider_config`], zusätzlich mit einem `env:`-Provider,
     /// der als `default_provider` gewählt wird — der versiegelte `sealed`-
     /// Provider bleibt konfiguriert, aber von diesem Lauf ungenutzt.
-    fn config_with_unused_sealed_provider() -> harw_config::ResolvedConfig {
-        let mut config = sealed_provider_config();
+    fn config_with_unused_sealed_provider() -> TestResult<harw_config::ResolvedConfig> {
+        let mut config = sealed_provider_config()?;
         config.providers.insert(
             "plain".to_owned(),
             toml::from_str::<ProviderToml>(
                 "name = \"plain\"\napi = \"openai-compatible\"\nbase_url = \"https://example.test\"\nauth = \"env:PLAIN_TOKEN\"\n",
             )
-            .expect("valid test provider"),
+            .map_err(ctx("valid test provider"))?,
         );
         config.harness.default_provider = Some("plain".to_owned());
-        config
+        Ok(config)
     }
 
     #[test]
-    fn active_provider_scoped_resolver_ignores_an_unused_sealed_provider_without_a_kek() {
-        let config = config_with_unused_sealed_provider();
-        let home = TempDir::new().expect("temporary home");
+    fn active_provider_scoped_resolver_ignores_an_unused_sealed_provider_without_a_kek()
+    -> TestResult {
+        let config = config_with_unused_sealed_provider()?;
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
 
         let resolver = open_configured_secret_resolver_for_active_provider(home.path(), &config)
-            .expect("an unused sealed provider must not require a KEK");
+            .map_err(ctx("an unused sealed provider must not require a KEK"))?;
         assert!(resolver.is_none());
+        Ok(())
     }
 
     #[test]
-    fn active_provider_scoped_resolver_ignores_a_dangling_default_provider() {
-        let mut config = sealed_provider_config();
+    fn active_provider_scoped_resolver_ignores_a_dangling_default_provider() -> TestResult {
+        let mut config = sealed_provider_config()?;
         config.harness.default_provider = Some("missing".to_owned());
-        let home = TempDir::new().expect("temporary home");
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
 
         let resolver = open_configured_secret_resolver_for_active_provider(home.path(), &config)
-            .expect("a dangling default_provider must not require a KEK");
+            .map_err(ctx("a dangling default_provider must not require a KEK"))?;
         assert!(resolver.is_none());
+        Ok(())
     }
 
     #[test]
-    fn active_provider_scoped_resolver_returns_none_without_any_default_provider() {
-        let config = sealed_provider_config();
-        let home = TempDir::new().expect("temporary home");
+    fn active_provider_scoped_resolver_returns_none_without_any_default_provider() -> TestResult {
+        let config = sealed_provider_config()?;
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
 
         let resolver = open_configured_secret_resolver_for_active_provider(home.path(), &config)
-            .expect("no default_provider means nothing is selected yet");
+            .map_err(ctx("no default_provider means nothing is selected yet"))?;
         assert!(resolver.is_none());
+        Ok(())
     }
 
     #[test]
-    fn active_provider_scoped_resolver_fails_closed_when_the_active_provider_is_sealed() {
-        let mut config = sealed_provider_config();
+    fn active_provider_scoped_resolver_fails_closed_when_the_active_provider_is_sealed()
+    -> TestResult {
+        let mut config = sealed_provider_config()?;
         config.harness.default_provider = Some("sealed".to_owned());
-        let home = TempDir::new().expect("temporary home");
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
 
         let result = open_configured_secret_resolver_for_active_provider(home.path(), &config);
         let Err(error) = result else {
-            panic!("the actually selected sealed provider must still require a KEK");
+            return Err(TestError::Unexpected(
+                "the actually selected sealed provider must still require a KEK".into(),
+            ));
         };
         assert!(error.contains("requires a configured KEK"));
+        Ok(())
     }
 
     #[test]
     fn active_provider_scoped_resolver_resolves_when_the_active_provider_is_sealed_and_kek_is_set()
-     {
-        let home = TempDir::new().expect("temporary home");
-        let key_path = write_test_kek(home.path());
+    -> TestResult {
+        let home = TempDir::new().map_err(ctx("temporary home"))?;
+        let key_path = write_test_kek(home.path())?;
         {
-            let mut store = store_with_test_kek(home.path(), &key_path);
+            let mut store = store_with_test_kek(home.path(), &key_path)?;
             store
                 .create(
                     "provider-token",
                     "provider authentication",
                     &SecretBox::new(b"utf8-token".to_vec().into_boxed_slice()),
                 )
-                .expect("seal test token");
+                .map_err(ctx("seal test token"))?;
         }
-        let mut config = sealed_provider_config();
+        let mut config = sealed_provider_config()?;
         config.harness.default_provider = Some("sealed".to_owned());
         config.auth.kek = Some(KekConfig {
             provenance: ConfigKekProvenance::KeyFile,
@@ -686,44 +739,49 @@ mod tests {
         });
 
         let resolver = open_configured_secret_resolver_for_active_provider(home.path(), &config)
-            .expect("a configured KEK must open the resolver")
-            .expect("the active provider uses secrets:");
+            .map_err(ctx("a configured KEK must open the resolver"))?
+            .ok_or(TestError::Missing("the active provider uses secrets:"))?;
         let resolved = resolver
             .resolve("provider-token")
-            .expect("resolve the sealed secret");
+            .map_err(ctx("resolve the sealed secret"))?;
         assert_eq!(resolved.expose_secret(), "utf8-token");
+        Ok(())
     }
 
-    fn store_with_test_kek(home: &Path, key_path: &Path) -> SecretStore {
+    fn store_with_test_kek(home: &Path, key_path: &Path) -> TestResult<SecretStore> {
         let policy = CryptoPolicy::strongest();
         let provenance = KekProvenance::KeyFile {
             path: key_path.to_owned(),
         };
-        let key_material = load_kek_material(&policy, &provenance).expect("load test KEK material");
-        SecretStore::with_key_material(
+        let key_material =
+            load_kek_material(&policy, &provenance).map_err(ctx("load test KEK material"))?;
+        Ok(SecretStore::with_key_material(
             home.join("sealed-secrets"),
             policy,
             provenance,
             KeyVersion::initial(),
             key_material,
-        )
+        ))
     }
 
-    fn write_test_kek(home: &Path) -> std::path::PathBuf {
+    fn write_test_kek(home: &Path) -> TestResult<std::path::PathBuf> {
         let path = home.join("test.kek");
-        fs::write(&path, b"01234567890123456789012345678901").expect("write test KEK");
-        set_private_permissions(&path);
-        path
+        fs::write(&path, b"01234567890123456789012345678901").map_err(ctx("write test KEK"))?;
+        set_private_permissions(&path)?;
+        Ok(path)
     }
 
     #[cfg(unix)]
-    fn set_private_permissions(path: &Path) {
+    fn set_private_permissions(path: &Path) -> TestResult {
         use std::os::unix::fs::PermissionsExt as _;
 
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .expect("restrict test KEK permissions");
+            .map_err(ctx("restrict test KEK permissions"))?;
+        Ok(())
     }
 
     #[cfg(not(unix))]
-    fn set_private_permissions(_path: &Path) {}
+    fn set_private_permissions(_path: &Path) -> TestResult {
+        Ok(())
+    }
 }

@@ -141,7 +141,9 @@ impl BrowserSection {
         }
         if let Some(digest) = &self.geckodriver_sha256 {
             let valid = digest.len() == 64
-                && digest.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase());
+                && digest
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase());
             if !valid {
                 return Err(format!(
                     "browser.geckodriver_sha256 muss aus 64 klein geschriebenen Hex-Zeichen \
@@ -160,24 +162,26 @@ fn default_max_actions() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn valid_sha256() -> String {
         "a".repeat(64)
     }
 
     #[test]
-    fn test_browser_section_defaults_from_empty_toml() {
-        let section: BrowserSection = toml::from_str("").unwrap();
+    fn test_browser_section_defaults_from_empty_toml() -> TestResult {
+        let section: BrowserSection = toml::from_str("").map_err(ctx("empty toml parses"))?;
         assert!(!section.enabled);
         assert!(section.allowed_origins.is_empty());
         assert_eq!(section.max_actions, 20);
         assert_eq!(section.geckodriver_path, None);
         assert_eq!(section.geckodriver_sha256, None);
         assert_eq!(section, BrowserSection::default());
+        Ok(())
     }
 
     #[test]
-    fn test_browser_section_full_toml_round_trip() {
+    fn test_browser_section_full_toml_round_trip() -> TestResult {
         let src = format!(
             r#"
             enabled = true
@@ -188,7 +192,7 @@ mod tests {
         "#,
             valid_sha256()
         );
-        let section: BrowserSection = toml::from_str(&src).unwrap();
+        let section: BrowserSection = toml::from_str(&src).map_err(ctx("valid toml parses"))?;
         assert!(section.enabled);
         assert_eq!(
             section.allowed_origins,
@@ -199,21 +203,31 @@ mod tests {
             section.geckodriver_path,
             Some(PathBuf::from("/opt/geckodriver/geckodriver"))
         );
-        assert_eq!(section.geckodriver_sha256.as_deref(), Some(valid_sha256().as_str()));
+        assert_eq!(
+            section.geckodriver_sha256.as_deref(),
+            Some(valid_sha256().as_str())
+        );
 
-        let encoded = toml::to_string(&section).unwrap();
-        let decoded: BrowserSection = toml::from_str(&encoded).unwrap();
+        let encoded = toml::to_string(&section).map_err(ctx("section serializes"))?;
+        let decoded: BrowserSection =
+            toml::from_str(&encoded).map_err(ctx("serialized toml parses"))?;
         assert_eq!(decoded, section);
+        Ok(())
     }
 
     #[test]
-    fn test_browser_section_rejects_unknown_field() {
+    fn test_browser_section_rejects_unknown_field() -> TestResult {
         let src = r#"
             enabled = true
             enalbed = true
         "#;
-        let error = toml::from_str::<BrowserSection>(src).unwrap_err();
+        let Err(error) = toml::from_str::<BrowserSection>(src) else {
+            return Err(TestError::Unexpected(
+                "unknown field must be rejected".into(),
+            ));
+        };
         assert!(error.to_string().contains("unknown field"));
+        Ok(())
     }
 
     #[test]
@@ -222,65 +236,89 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rejects_enabled_without_allowed_origins() {
+    fn test_validate_rejects_enabled_without_allowed_origins() -> TestResult {
         let section = BrowserSection {
             enabled: true,
             ..BrowserSection::default()
         };
-        let error = section.validate().unwrap_err();
+        let Err(error) = section.validate() else {
+            return Err(TestError::Unexpected(
+                "enabled without origins must fail".into(),
+            ));
+        };
         assert!(error.contains("allowed_origins"));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_host_only_origin_without_scheme() {
+    fn test_validate_rejects_host_only_origin_without_scheme() -> TestResult {
         let section = BrowserSection {
             enabled: true,
             allowed_origins: vec!["intranet.example.test".to_owned()],
             ..BrowserSection::default()
         };
-        let error = section.validate().unwrap_err();
+        let Err(error) = section.validate() else {
+            return Err(TestError::Unexpected("scheme-less origin must fail".into()));
+        };
         assert!(error.contains("intranet.example.test"));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_zero_max_actions() {
+    fn test_validate_rejects_zero_max_actions() -> TestResult {
         let section = BrowserSection {
             max_actions: 0,
             ..BrowserSection::default()
         };
-        let error = section.validate().unwrap_err();
+        let Err(error) = section.validate() else {
+            return Err(TestError::Unexpected("zero max_actions must fail".into()));
+        };
         assert!(error.contains("max_actions"));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_geckodriver_path_without_sha256() {
+    fn test_validate_rejects_geckodriver_path_without_sha256() -> TestResult {
         let section = BrowserSection {
             geckodriver_path: Some(PathBuf::from("/opt/geckodriver/geckodriver")),
             ..BrowserSection::default()
         };
-        let error = section.validate().unwrap_err();
+        let Err(error) = section.validate() else {
+            return Err(TestError::Unexpected(
+                "path without sha256 must fail".into(),
+            ));
+        };
         assert!(error.contains("geckodriver_sha256"));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_geckodriver_sha256_without_path() {
+    fn test_validate_rejects_geckodriver_sha256_without_path() -> TestResult {
         let section = BrowserSection {
             geckodriver_sha256: Some(valid_sha256()),
             ..BrowserSection::default()
         };
-        let error = section.validate().unwrap_err();
+        let Err(error) = section.validate() else {
+            return Err(TestError::Unexpected(
+                "sha256 without path must fail".into(),
+            ));
+        };
         assert!(error.contains("geckodriver_path"));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_malformed_sha256() {
+    fn test_validate_rejects_malformed_sha256() -> TestResult {
         let section = BrowserSection {
             geckodriver_path: Some(PathBuf::from("/opt/geckodriver/geckodriver")),
             geckodriver_sha256: Some("not-a-hash".to_owned()),
             ..BrowserSection::default()
         };
-        let error = section.validate().unwrap_err();
+        let Err(error) = section.validate() else {
+            return Err(TestError::Unexpected("malformed sha256 must fail".into()));
+        };
         assert!(error.contains("geckodriver_sha256"));
+        Ok(())
     }
 
     #[test]

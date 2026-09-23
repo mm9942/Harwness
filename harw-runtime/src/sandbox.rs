@@ -270,6 +270,7 @@ pub fn plan_node_sandbox(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Alle Einstiege, in der Reihenfolge der Vertragstabelle.
     const ALL_ENTRIES: [EntryKind; 11] = [
@@ -313,30 +314,33 @@ mod tests {
     /// das beim Fallenlassen automatisch entfernt wird. Die Tests schreiben
     /// nichts hinein; sie brauchen nur einen Pfad, den
     /// [`WorkspaceRegistry::build`] akzeptiert.
-    fn existing_root() -> tempfile::TempDir {
-        tempfile::TempDir::new().expect("temp dir")
+    fn existing_root() -> TestResult<tempfile::TempDir> {
+        tempfile::TempDir::new().map_err(ctx("temp dir"))
     }
 
     #[test]
-    fn root_sandbox_takes_its_permissions_from_the_entry_profile() {
-        let dir = existing_root();
+    fn root_sandbox_takes_its_permissions_from_the_entry_profile() -> TestResult {
+        let dir = existing_root()?;
         let root = dir.path();
         for entry in ALL_ENTRIES {
-            let sandbox = root_sandbox(entry, root).expect("temp dir binds as workspace root");
+            let sandbox =
+                root_sandbox(entry, root).map_err(ctx("temp dir binds as workspace root"))?;
             assert_eq!(
                 sandbox.permissions(),
                 &entry.profile().permissions,
                 "{entry:?}"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn no_entry_sandbox_carries_network() {
-        let dir = existing_root();
+    fn no_entry_sandbox_carries_network() -> TestResult {
+        let dir = existing_root()?;
         let root = dir.path();
         for entry in ALL_ENTRIES {
-            let sandbox = root_sandbox(entry, root).expect("temp dir binds as workspace root");
+            let sandbox =
+                root_sandbox(entry, root).map_err(ctx("temp dir binds as workspace root"))?;
             assert!(
                 !sandbox.permissions().contains(Permission::NetworkAccess),
                 "{entry:?} holds NetworkAccess"
@@ -346,25 +350,33 @@ mod tests {
                 "{entry:?} has a non-empty egress scope"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn root_sandbox_binds_the_given_project_root() {
-        let dir = existing_root();
+    fn root_sandbox_binds_the_given_project_root() -> TestResult {
+        let dir = existing_root()?;
         let root = dir.path();
-        let canonical = root.canonicalize().expect("temp dir is canonicalizable");
-        let sandbox = root_sandbox(EntryKind::Tui, root).expect("temp dir binds as workspace root");
+        let canonical = root
+            .canonicalize()
+            .map_err(ctx("temp dir is canonicalizable"))?;
+        let sandbox =
+            root_sandbox(EntryKind::Tui, root).map_err(ctx("temp dir binds as workspace root"))?;
         assert_eq!(sandbox.workspace().canonical_root(), canonical.as_path());
         assert_eq!(sandbox.workspace().workspace().as_str(), PROJECT_WORKSPACE);
         assert_eq!(sandbox.workspace().tenant().as_str(), "tui");
+        Ok(())
     }
 
     #[test]
-    fn root_sandbox_rejects_a_root_that_is_not_a_directory() {
-        let dir = existing_root();
+    fn root_sandbox_rejects_a_root_that_is_not_a_directory() -> TestResult {
+        let dir = existing_root()?;
         let missing = dir.path().join("harw-runtime-no-such-directory-w2b02");
-        let error = root_sandbox(EntryKind::Tui, &missing).expect_err("missing root must fail");
+        let Err(error) = root_sandbox(EntryKind::Tui, &missing) else {
+            return Err(TestError::Unexpected("missing root must fail".into()));
+        };
         assert!(matches!(error, RuntimeError::Sandbox { .. }));
+        Ok(())
     }
 
     #[test]
@@ -413,33 +425,35 @@ mod tests {
     }
 
     #[test]
-    fn web_entry_narrowed_by_tier_never_exceeds_its_profile() {
-        let dir = existing_root();
+    fn web_entry_narrowed_by_tier_never_exceeds_its_profile() -> TestResult {
+        let dir = existing_root()?;
         let root = dir.path();
-        let sandbox = root_sandbox(EntryKind::Web, root).expect("temp dir binds");
+        let sandbox = root_sandbox(EntryKind::Web, root).map_err(ctx("temp dir binds"))?;
         for tier in ALL_TIERS {
             let narrowed = sandbox.restrict(&PermissionRequest::from_permissions(
                 permissions_for_tier(tier).iter(),
             ));
             narrowed
                 .ensure_child_of(&sandbox)
-                .expect("a tier narrowing is always a reduction");
+                .map_err(ctx("a tier narrowing is always a reduction"))?;
             assert!(!narrowed.permissions().contains(Permission::WriteWorkspace));
             assert!(!narrowed.permissions().contains(Permission::ExecuteProcess));
         }
+        Ok(())
     }
 
     #[test]
-    fn plan_node_sandbox_is_monotone_and_never_executes_or_networks() {
-        let dir = existing_root();
+    fn plan_node_sandbox_is_monotone_and_never_executes_or_networks() -> TestResult {
+        let dir = existing_root()?;
         let root = dir.path();
-        let parent = root_sandbox(EntryKind::JobPlanNode, root).expect("temp dir binds");
+        let parent = root_sandbox(EntryKind::JobPlanNode, root).map_err(ctx("temp dir binds"))?;
         for kind in ALL_KINDS {
             for may_write in [false, true] {
-                let sandbox = plan_node_sandbox(kind, may_write, root).expect("temp dir binds");
-                sandbox
-                    .ensure_child_of(&parent)
-                    .expect("plan-node sandbox must be a reduction of the job sandbox");
+                let sandbox =
+                    plan_node_sandbox(kind, may_write, root).map_err(ctx("temp dir binds"))?;
+                sandbox.ensure_child_of(&parent).map_err(ctx(
+                    "plan-node sandbox must be a reduction of the job sandbox",
+                ))?;
                 assert!(sandbox.permissions().contains(Permission::ReadWorkspace));
                 assert!(
                     !sandbox.permissions().contains(Permission::ExecuteProcess),
@@ -457,11 +471,12 @@ mod tests {
                 );
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn read_only_node_kinds_never_write_even_with_a_writing_contract() {
-        let dir = existing_root();
+    fn read_only_node_kinds_never_write_even_with_a_writing_contract() -> TestResult {
+        let dir = existing_root()?;
         let root = dir.path();
         for kind in [
             PlanNodeKind::Research,
@@ -470,11 +485,12 @@ mod tests {
             PlanNodeKind::Synthesis,
             PlanNodeKind::Composite,
         ] {
-            let sandbox = plan_node_sandbox(kind, true, root).expect("temp dir binds");
+            let sandbox = plan_node_sandbox(kind, true, root).map_err(ctx("temp dir binds"))?;
             assert!(
                 !sandbox.permissions().contains(Permission::WriteWorkspace),
                 "{kind:?}"
             );
         }
+        Ok(())
     }
 }

@@ -217,6 +217,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{FixtureFsEventSource, FsEventSource, RawFsEvent};
+    use crate::test_support::{TestResult, ctx};
 
     fn sample_event() -> RawFsEvent {
         RawFsEvent {
@@ -228,35 +229,44 @@ mod tests {
     }
 
     #[test]
-    fn test_fixture_source_returns_configured_events() {
+    fn test_fixture_source_returns_configured_events() -> TestResult {
         let source = FixtureFsEventSource::new(vec![sample_event()]);
         let read = source
             .read_events(Duration::from_millis(5))
-            .expect("Fixture-Quelle scheitert nie");
+            .map_err(ctx("Fixture-Quelle scheitert nie"))?;
         assert_eq!(read, vec![sample_event()]);
+        Ok(())
     }
 
     #[test]
-    fn test_fixture_source_empty_list_returns_empty_vec() {
+    fn test_fixture_source_empty_list_returns_empty_vec() -> TestResult {
         let source = FixtureFsEventSource::new(vec![]);
         let read = source
             .read_events(Duration::ZERO)
-            .expect("Fixture-Quelle scheitert nie");
+            .map_err(ctx("Fixture-Quelle scheitert nie"))?;
         assert!(read.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_fixture_source_ignores_timeout_and_is_repeatable() {
+    fn test_fixture_source_ignores_timeout_and_is_repeatable() -> TestResult {
         let source = FixtureFsEventSource::new(vec![sample_event()]);
-        let first = source.read_events(Duration::from_secs(0)).expect("liest");
-        let second = source.read_events(Duration::from_secs(60)).expect("liest");
+        let first = source
+            .read_events(Duration::from_secs(0))
+            .map_err(ctx("liest"))?;
+        let second = source
+            .read_events(Duration::from_secs(60))
+            .map_err(ctx("liest"))?;
         assert_eq!(first, second);
+        Ok(())
     }
 
     #[test]
-    fn test_fixture_source_is_usable_as_boxed_trait_object() {
-        let boxed: Box<dyn FsEventSource> = Box::new(FixtureFsEventSource::new(vec![sample_event()]));
-        let read = boxed.read_events(Duration::ZERO).expect("liest");
+    fn test_fixture_source_is_usable_as_boxed_trait_object() -> TestResult {
+        let boxed: Box<dyn FsEventSource> =
+            Box::new(FixtureFsEventSource::new(vec![sample_event()]));
+        let read = boxed.read_events(Duration::ZERO).map_err(ctx("liest"))?;
         assert_eq!(read.len(), 1);
+        Ok(())
     }
 }

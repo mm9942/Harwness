@@ -285,8 +285,14 @@ mod tests {
             EntryKind::GatewayDream,
         ] {
             let budget = RootBudget::from_config(&config, entry);
-            assert!(budget.max_model_rounds < local.max_model_rounds, "{entry:?}");
-            assert!(budget.max_total_tokens < local.max_total_tokens, "{entry:?}");
+            assert!(
+                budget.max_model_rounds < local.max_model_rounds,
+                "{entry:?}"
+            );
+            assert!(
+                budget.max_total_tokens < local.max_total_tokens,
+                "{entry:?}"
+            );
             assert!(budget.max_wall < local.max_wall, "{entry:?}");
         }
     }

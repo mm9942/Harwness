@@ -246,8 +246,8 @@ impl IpcListener {
         // Fehler dieser Funktion.
         let _ = std::fs::remove_file(path);
 
-        let socket =
-            net::socket(AddressFamily::UNIX, SocketType::SEQPACKET, None).map_err(|_| bind_err())?;
+        let socket = net::socket(AddressFamily::UNIX, SocketType::SEQPACKET, None)
+            .map_err(|_| bind_err())?;
         let addr = net::SocketAddrUnix::new(path).map_err(|_| bind_err())?;
         net::bind(&socket, &addr).map_err(|_| bind_err())?;
         net::listen(&socket, 16).map_err(|_| bind_err())?;
@@ -499,15 +499,17 @@ impl IpcInbox {
 /// Moduldoku). `inbox` wird nur über den `Mutex` berührt, nie ohne ihn.
 #[must_use]
 pub fn spawn_receive_loop(listener: IpcListener, inbox: Arc<Mutex<IpcInbox>>) -> JoinHandle<()> {
-    std::thread::spawn(move || loop {
-        match listener.accept() {
-            Ok(connection) => {
-                let inbox = Arc::clone(&inbox);
-                std::thread::spawn(move || receive_until_closed(connection, &inbox));
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "ipc accept failed; receive loop is stopping");
-                break;
+    std::thread::spawn(move || {
+        loop {
+            match listener.accept() {
+                Ok(connection) => {
+                    let inbox = Arc::clone(&inbox);
+                    std::thread::spawn(move || receive_until_closed(connection, &inbox));
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "ipc accept failed; receive loop is stopping");
+                    break;
+                }
             }
         }
     })
@@ -558,6 +560,7 @@ fn receive_until_closed(connection: IpcConnection, inbox: &Mutex<IpcInbox>) {
 #[cfg(test)]
 mod tests {
     use super::{IpcConnection, IpcInbox, IpcListener, PeerCredentials, ReceivedEvent};
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_dod_signals::{EventKind, SecurityEvent};
     use harw_types::SensorId;
 
@@ -598,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ipc_inbox_evicts_oldest_when_full() {
+    fn test_ipc_inbox_evicts_oldest_when_full() -> TestResult {
         let mut inbox = IpcInbox::new(2);
         for i in 0..3u32 {
             let mut event = sample_event();
@@ -613,11 +616,15 @@ mod tests {
         assert_eq!(inbox.len(), 2);
         let remaining = inbox.drain();
         let EventKind::SensorDegraded { sensor } = &remaining[0].event.kind else {
-            panic!("expected SensorDegraded");
+            return Err(TestError::Unexpected(format!(
+                "expected SensorDegraded, got {:?}",
+                remaining[0].event.kind
+            )));
         };
         // Der älteste Eintrag (probe-0) wurde verdrängt; die verbleibenden
         // zwei sind probe-1 und probe-2.
         assert_eq!(sensor.as_str(), "probe-1");
+        Ok(())
     }
 
     #[test]
@@ -627,12 +634,13 @@ mod tests {
     }
 
     #[test]
-    fn test_wire_format_roundtrip_matches_security_event_json_contract() {
+    fn test_wire_format_roundtrip_matches_security_event_json_contract() -> TestResult {
         let event = sample_event();
-        let encoded = serde_json::to_vec(&event).expect("SecurityEvent serializes");
+        let encoded = serde_json::to_vec(&event).map_err(ctx("SecurityEvent serializes"))?;
         let decoded: SecurityEvent =
-            serde_json::from_slice(&encoded).expect("round-trips through the wire format");
+            serde_json::from_slice(&encoded).map_err(ctx("round-trips through the wire format"))?;
         assert_eq!(decoded, event);
+        Ok(())
     }
 
     /// Kompilierzeit-Beleg für „Push-only": dieser Test benennt genau die

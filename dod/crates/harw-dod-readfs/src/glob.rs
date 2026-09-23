@@ -305,26 +305,27 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Baut das Muster, das `dir` unter dem simulierten Wurzel-Startpunkt
     /// `/` adressiert — siehe Modul-Dokumentation zur Suche ab `/`.
-    fn pattern_for(dir: &std::path::Path, suffix: &str) -> String {
+    fn pattern_for(dir: &std::path::Path, suffix: &str) -> TestResult<String> {
         let relative = dir
             .strip_prefix("/")
-            .expect("Testverzeichnisse liegen unter /");
-        format!("{}/{suffix}", relative.display())
+            .map_err(ctx("Testverzeichnisse liegen unter /"))?;
+        Ok(format!("{}/{suffix}", relative.display()))
     }
 
     #[test]
-    fn test_glob_matches_are_sorted() {
-        let dir = tempdir().expect("tempdir");
-        fs::write(dir.path().join("c.txt"), "").expect("write");
-        fs::write(dir.path().join("a.txt"), "").expect("write");
-        fs::write(dir.path().join("b.txt"), "").expect("write");
+    fn test_glob_matches_are_sorted() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
+        fs::write(dir.path().join("c.txt"), "").map_err(ctx("write"))?;
+        fs::write(dir.path().join("a.txt"), "").map_err(ctx("write"))?;
+        fs::write(dir.path().join("b.txt"), "").map_err(ctx("write"))?;
         let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
 
-        let pattern = pattern_for(dir.path(), "*.txt");
-        let results = glob(&scope, &pattern).expect("glob muss gelingen");
+        let pattern = pattern_for(dir.path(), "*.txt")?;
+        let results = glob(&scope, &pattern).map_err(ctx("glob muss gelingen"))?;
 
         let mut expected = vec![
             dir.path().join("a.txt"),
@@ -333,157 +334,189 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(results, expected);
+        Ok(())
     }
 
     #[test]
-    fn test_glob_rejects_absolute_pattern() {
-        let dir = tempdir().expect("tempdir");
+    fn test_glob_rejects_absolute_pattern() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
 
-        let err = glob(&scope, "/etc/passwd").expect_err("absolutes Muster muss scheitern");
+        let Err(err) = glob(&scope, "/etc/passwd") else {
+            return Err(TestError::Unexpected(
+                "absolutes Muster muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, ReadFsError::GlobPatternAbsolute { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_glob_rejects_pattern_with_parent_traversal() {
-        let dir = tempdir().expect("tempdir");
+    fn test_glob_rejects_pattern_with_parent_traversal() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
 
-        let err =
-            glob(&scope, "sub/../etc/passwd").expect_err("Muster mit '..' muss scheitern");
+        let Err(err) = glob(&scope, "sub/../etc/passwd") else {
+            return Err(TestError::Unexpected(
+                "Muster mit '..' muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, ReadFsError::GlobPatternTraversal { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_glob_rejects_pattern_over_component_limit() {
-        let dir = tempdir().expect("tempdir");
+    fn test_glob_rejects_pattern_over_component_limit() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
         let pattern = vec!["a"; MAX_GLOB_COMPONENTS + 1].join("/");
 
-        let err = glob(&scope, &pattern).expect_err("zu tiefes Muster muss scheitern");
+        let Err(err) = glob(&scope, &pattern) else {
+            return Err(TestError::Unexpected(
+                "zu tiefes Muster muss scheitern".into(),
+            ));
+        };
         assert!(matches!(
             err,
             ReadFsError::GlobLimitExceeded { limit_name: "components", limit, .. }
                 if limit == MAX_GLOB_COMPONENTS
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_glob_rejects_more_candidates_than_limit() {
-        let dir = tempdir().expect("tempdir");
+    fn test_glob_rejects_more_candidates_than_limit() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         for i in 0..=MAX_GLOB_CANDIDATES {
-            fs::write(dir.path().join(format!("f{i}")), "").expect("write");
+            fs::write(dir.path().join(format!("f{i}")), "").map_err(ctx("write"))?;
         }
         let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
-        let pattern = pattern_for(dir.path(), "f*");
+        let pattern = pattern_for(dir.path(), "f*")?;
 
-        let err = glob(&scope, &pattern).expect_err("zu viele Kandidaten müssen scheitern");
+        let Err(err) = glob(&scope, &pattern) else {
+            return Err(TestError::Unexpected(
+                "zu viele Kandidaten müssen scheitern".into(),
+            ));
+        };
         assert!(matches!(
             err,
             ReadFsError::GlobLimitExceeded { limit_name: "candidates", limit, .. }
                 if limit == MAX_GLOB_CANDIDATES
         ));
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_glob_excludes_symlink_pointing_outside_scope() {
-        let inside = tempdir().expect("tempdir");
-        let outside = tempdir().expect("tempdir");
-        fs::write(outside.path().join("secret.txt"), "geheim").expect("write");
-        symlink(outside.path(), inside.path().join("link")).expect("symlink");
+    fn test_glob_excludes_symlink_pointing_outside_scope() -> TestResult {
+        let inside = tempdir().map_err(ctx("tempdir"))?;
+        let outside = tempdir().map_err(ctx("tempdir"))?;
+        fs::write(outside.path().join("secret.txt"), "geheim").map_err(ctx("write"))?;
+        symlink(outside.path(), inside.path().join("link")).map_err(ctx("symlink"))?;
 
         let scope = ReadScope::from_roots([inside.path().to_path_buf()]);
-        let pattern = pattern_for(inside.path(), "link/*.txt");
+        let pattern = pattern_for(inside.path(), "link/*.txt")?;
 
-        let results = glob(&scope, &pattern).expect("glob muss gelingen");
+        let results = glob(&scope, &pattern).map_err(ctx("glob muss gelingen"))?;
         assert!(
             results.is_empty(),
             "ein Symlink aus dem Bereich heraus darf keinen Treffer liefern: {results:?}"
         );
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_glob_includes_symlink_pointing_inside_scope() {
-        let dir = tempdir().expect("tempdir");
+    fn test_glob_includes_symlink_pointing_inside_scope() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let real = dir.path().join("real");
-        fs::create_dir(&real).expect("create_dir");
-        fs::write(real.join("value.txt"), "42").expect("write");
-        symlink(&real, dir.path().join("link")).expect("symlink");
+        fs::create_dir(&real).map_err(ctx("create_dir"))?;
+        fs::write(real.join("value.txt"), "42").map_err(ctx("write"))?;
+        symlink(&real, dir.path().join("link")).map_err(ctx("symlink"))?;
 
         let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
-        let pattern = pattern_for(dir.path(), "link/*.txt");
+        let pattern = pattern_for(dir.path(), "link/*.txt")?;
 
-        let results = glob(&scope, &pattern).expect("glob muss gelingen");
+        let results = glob(&scope, &pattern).map_err(ctx("glob muss gelingen"))?;
         assert_eq!(results, vec![dir.path().join("link").join("value.txt")]);
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_glob_prunes_sibling_names_outside_root() {
-        let dir = tempdir().expect("tempdir");
+    fn test_glob_prunes_sibling_names_outside_root() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let root = dir.path().join("a");
-        fs::create_dir(&root).expect("create_dir");
-        fs::write(root.join("x.txt"), "1").expect("write");
+        fs::create_dir(&root).map_err(ctx("create_dir"))?;
+        fs::write(root.join("x.txt"), "1").map_err(ctx("write"))?;
         // `b` zeigt kanonisch in die Wurzel, liegt aber namentlich daneben.
-        symlink(&root, dir.path().join("b")).expect("symlink");
+        symlink(&root, dir.path().join("b")).map_err(ctx("symlink"))?;
 
         let scope = ReadScope::from_roots([root.clone()]);
-        let pattern = pattern_for(dir.path(), "*/x.txt");
+        let pattern = pattern_for(dir.path(), "*/x.txt")?;
 
-        let results = glob(&scope, &pattern).expect("glob muss gelingen");
+        let results = glob(&scope, &pattern).map_err(ctx("glob muss gelingen"))?;
         assert_eq!(results, vec![root.join("x.txt")]);
+        Ok(())
     }
 
     /// Nachgebauter sysfs-Baum mit echten Symlinks (class -> devices),
     /// strukturgleich zu `/sys/class/thermal` auf dem RPi 5.
     #[cfg(unix)]
-    fn fake_sysfs(base: &std::path::Path) {
+    fn fake_sysfs(base: &std::path::Path) -> TestResult {
         let zones = base.join("sys/devices/virtual/thermal");
         for zone in ["thermal_zone0", "thermal_zone1"] {
-            fs::create_dir_all(zones.join(zone)).expect("create zone");
-            fs::write(zones.join(zone).join("temp"), "42000\n").expect("write temp");
+            fs::create_dir_all(zones.join(zone)).map_err(ctx("create zone"))?;
+            fs::write(zones.join(zone).join("temp"), "42000\n").map_err(ctx("write temp"))?;
         }
         let class = base.join("sys/class/thermal");
-        fs::create_dir_all(&class).expect("create class");
+        fs::create_dir_all(&class).map_err(ctx("create class"))?;
         symlink(
             "../../devices/virtual/thermal/thermal_zone0",
             class.join("thermal_zone0"),
         )
-        .expect("symlink zone0");
+        .map_err(ctx("symlink zone0"))?;
         symlink(
             "../../devices/virtual/thermal/thermal_zone1",
             class.join("thermal_zone1"),
         )
-        .expect("symlink zone1");
-        fs::create_dir_all(base.join("outside")).expect("create outside");
-        fs::write(base.join("outside/temp"), "1\n").expect("write outside");
+        .map_err(ctx("symlink zone1"))?;
+        fs::create_dir_all(base.join("outside")).map_err(ctx("create outside"))?;
+        fs::write(base.join("outside/temp"), "1\n").map_err(ctx("write outside"))?;
+        Ok(())
     }
 
     #[cfg(unix)]
-    fn thermal_alias_scope(base: &std::path::Path) -> ReadScope {
+    fn thermal_alias_scope(base: &std::path::Path) -> TestResult<ReadScope> {
         let alias = AliasRoot::new(base.join("sys/class/thermal"), base.join("sys/devices"))
-            .expect("valid alias root");
-        ReadScope::from_roots_and_aliases(Vec::<PathBuf>::new(), [alias])
+            .map_err(ctx("valid alias root"))?;
+        Ok(ReadScope::from_roots_and_aliases(
+            Vec::<PathBuf>::new(),
+            [alias],
+        ))
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_glob_alias_root_finds_class_symlinks_regression_f005() {
-        let dir = tempdir().expect("tempdir");
-        let base = dir.path().canonicalize().expect("canonical tempdir");
-        fake_sysfs(&base);
+    fn test_glob_alias_root_finds_class_symlinks_regression_f005() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
+        let base = dir
+            .path()
+            .canonicalize()
+            .map_err(ctx("canonical tempdir"))?;
+        fake_sysfs(&base)?;
         let class = base.join("sys/class/thermal");
 
         let plain = ReadScope::from_roots([class.clone()]);
-        let pattern = pattern_for(&class, "thermal_zone*/temp");
+        let pattern = pattern_for(&class, "thermal_zone*/temp")?;
+        let plain_results = glob(&plain, &pattern).map_err(ctx("glob muss gelingen"))?;
         assert!(
-            glob(&plain, &pattern).expect("glob muss gelingen").is_empty(),
+            plain_results.is_empty(),
             "ohne Alias-Wurzel bleibt sysfs unsichtbar (Befund F-005)"
         );
 
-        let results = glob(&thermal_alias_scope(&base), &pattern).expect("glob muss gelingen");
+        let alias_scope = thermal_alias_scope(&base)?;
+        let results = glob(&alias_scope, &pattern).map_err(ctx("glob muss gelingen"))?;
         assert_eq!(
             results,
             vec![
@@ -491,37 +524,52 @@ mod tests {
                 class.join("thermal_zone1/temp"),
             ]
         );
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_glob_alias_root_excludes_entry_pointing_outside() {
-        let dir = tempdir().expect("tempdir");
-        let base = dir.path().canonicalize().expect("canonical tempdir");
-        fake_sysfs(&base);
+    fn test_glob_alias_root_excludes_entry_pointing_outside() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
+        let base = dir
+            .path()
+            .canonicalize()
+            .map_err(ctx("canonical tempdir"))?;
+        fake_sysfs(&base)?;
         let class = base.join("sys/class/thermal");
-        symlink("../../../outside", class.join("thermal_zone9")).expect("evil symlink");
+        symlink("../../../outside", class.join("thermal_zone9")).map_err(ctx("evil symlink"))?;
 
-        let pattern = pattern_for(&class, "thermal_zone*/temp");
-        let results = glob(&thermal_alias_scope(&base), &pattern).expect("glob muss gelingen");
+        let pattern = pattern_for(&class, "thermal_zone*/temp")?;
+        let alias_scope = thermal_alias_scope(&base)?;
+        let results = glob(&alias_scope, &pattern).map_err(ctx("glob muss gelingen"))?;
         assert!(!results.contains(&class.join("thermal_zone9/temp")));
         assert_eq!(results.len(), 2);
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_glob_alias_root_excludes_double_symlink() {
-        let dir = tempdir().expect("tempdir");
-        let base = dir.path().canonicalize().expect("canonical tempdir");
-        fake_sysfs(&base);
+    fn test_glob_alias_root_excludes_double_symlink() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
+        let base = dir
+            .path()
+            .canonicalize()
+            .map_err(ctx("canonical tempdir"))?;
+        fake_sysfs(&base)?;
         let class = base.join("sys/class/thermal");
-        symlink("virtual/thermal/thermal_zone0", base.join("sys/devices/hop"))
-            .expect("second-level symlink");
-        symlink("../../devices/hop", class.join("thermal_zone5")).expect("first-level symlink");
+        symlink(
+            "virtual/thermal/thermal_zone0",
+            base.join("sys/devices/hop"),
+        )
+        .map_err(ctx("second-level symlink"))?;
+        symlink("../../devices/hop", class.join("thermal_zone5"))
+            .map_err(ctx("first-level symlink"))?;
 
-        let pattern = pattern_for(&class, "thermal_zone*/temp");
-        let results = glob(&thermal_alias_scope(&base), &pattern).expect("glob muss gelingen");
+        let pattern = pattern_for(&class, "thermal_zone*/temp")?;
+        let alias_scope = thermal_alias_scope(&base)?;
+        let results = glob(&alias_scope, &pattern).map_err(ctx("glob muss gelingen"))?;
         assert!(!results.contains(&class.join("thermal_zone5/temp")));
         assert_eq!(results.len(), 2);
+        Ok(())
     }
 }

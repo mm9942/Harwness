@@ -48,3 +48,7 @@ pub use spec::{FunctionToolSpec, ToolName, ToolSpec};
 /// der generierte Sicherheits-Prolog keine direkte `harw-authority`-Dependency
 /// im aufrufenden Crate voraussetzt.
 pub use harw_authority::Permission;
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

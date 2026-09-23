@@ -992,6 +992,7 @@ fn run_one_shot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_core::{
         ModelError, ModelFuture, ModelProvider, ModelRequest, ModelResponse, ToolCallResult,
     };
@@ -1026,20 +1027,21 @@ mod tests {
         cwd: PathBuf,
     }
 
-    fn chat_fixture() -> ChatFixture {
-        let dir = tempfile::tempdir().expect("create fixture directory");
+    fn chat_fixture() -> TestResult<ChatFixture> {
+        let dir = tempfile::tempdir().map_err(ctx("create fixture directory"))?;
         let home = dir.path().join("home");
         let cwd = dir.path().join("project");
-        harw_home::ensure_home(&home).expect("scaffold home");
-        std::fs::create_dir_all(&cwd).expect("create project directory");
+        harw_home::ensure_home(&home).map_err(ctx("scaffold home"))?;
+        std::fs::create_dir_all(&cwd).map_err(ctx("create project directory"))?;
         // Projekt-Marker, damit die Projekterkennung genau hier stehen bleibt.
-        std::fs::write(cwd.join("Cargo.toml"), "[workspace]\n").expect("write project marker");
-        write_fixture_uia(&home);
-        ChatFixture {
+        std::fs::write(cwd.join("Cargo.toml"), "[workspace]\n")
+            .map_err(ctx("write project marker"))?;
+        write_fixture_uia(&home)?;
+        Ok(ChatFixture {
             _dir: dir,
             home,
             cwd,
-        }
+        })
     }
 
     /// Legt eine minimale, gültige UIA (`role = "user-interface"`) im
@@ -1071,23 +1073,23 @@ mod tests {
     /// `[mcp_listener]` platziert und (mit `deny_unknown_fields`) einen
     /// Parse-Fehler ausgelöst. Voranstellen hält den Schlüssel auf
     /// Root-Ebene, wo `HarnessConfig::active_uia_definition` ihn erwartet.
-    fn write_fixture_uia(home: &Path) {
+    fn write_fixture_uia(home: &Path) -> TestResult {
         let profile_dir = home.join("profiles").join("default");
         let agent_dir = profile_dir.join("agents").join("fixture-uia");
-        std::fs::create_dir_all(&agent_dir).expect("fixture uia dir");
+        std::fs::create_dir_all(&agent_dir).map_err(ctx("fixture uia dir"))?;
         std::fs::write(
             agent_dir.join("definition.toml"),
             "schema = \"harwness.agent/v1\"\nid = \"harwness.agent.fixture-uia@1\"\nversion = \"1.0.0\"\nrole = \"user-interface\"\nspecialization = \"terminal-ui\"\n",
         )
-        .expect("fixture uia definition");
+        .map_err(ctx("fixture uia definition"))?;
         let config_path = profile_dir.join("config.toml");
-        let existing =
-            std::fs::read_to_string(&config_path).expect("read profile config for the fixture UIA");
-        let updated = format!(
-            "active_uia_definition = \"harwness.agent.fixture-uia@1\"\n\n{existing}"
-        );
+        let existing = std::fs::read_to_string(&config_path)
+            .map_err(ctx("read profile config for the fixture UIA"))?;
+        let updated =
+            format!("active_uia_definition = \"harwness.agent.fixture-uia@1\"\n\n{existing}");
         std::fs::write(&config_path, updated)
-            .expect("prepend active_uia_definition to profile config");
+            .map_err(ctx("prepend active_uia_definition to profile config"))?;
+        Ok(())
     }
 
     fn fixture_inputs(
@@ -1095,10 +1097,10 @@ mod tests {
         entry: EntryKind,
         surface: IngressSurface,
         startup: ChatStartup,
-    ) -> ChatRuntimeInputs {
+    ) -> TestResult<ChatRuntimeInputs> {
         let spec = runtime_spec(entry, &fixture.home, &fixture.cwd, local_principal(surface));
-        let config = load_chat_config(&spec).expect("load fixture config");
-        ChatRuntimeInputs::new(spec, &config, startup, false).expect("build chat inputs")
+        let config = load_chat_config(&spec).map_err(ctx("load fixture config"))?;
+        ChatRuntimeInputs::new(spec, &config, startup, false).map_err(ctx("build chat inputs"))
     }
 
     fn startup(mode: InteractionMode) -> ChatStartup {
@@ -1113,10 +1115,11 @@ mod tests {
         ModelSource::Echo("chat test reply".to_owned())
     }
 
-    fn write_transcript(sessions_root: &Path, session_id: &str) {
-        std::fs::create_dir_all(sessions_root).expect("create sessions directory");
+    fn write_transcript(sessions_root: &Path, session_id: &str) -> TestResult {
+        std::fs::create_dir_all(sessions_root).map_err(ctx("create sessions directory"))?;
         std::fs::write(sessions_root.join(format!("{session_id}.jsonl")), "{}\n")
-            .expect("write transcript");
+            .map_err(ctx("write transcript"))?;
+        Ok(())
     }
 
     #[test]
@@ -1131,14 +1134,14 @@ mod tests {
     }
 
     #[test]
-    fn active_profile_memories_root_uses_the_active_profile_memories_directory() {
-        let home = tempfile::tempdir().expect("create home directory");
-        harw_home::ensure_home(home.path()).expect("scaffold home");
+    fn active_profile_memories_root_uses_the_active_profile_memories_directory() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create home directory"))?;
+        harw_home::ensure_home(home.path()).map_err(ctx("scaffold home"))?;
         std::fs::write(harw_home::active_profile_path(home.path()), "analysis\n")
-            .expect("select analysis profile");
+            .map_err(ctx("select analysis profile"))?;
 
         let memories_root =
-            active_profile_memories_root(home.path()).expect("resolve memories root");
+            active_profile_memories_root(home.path()).map_err(ctx("resolve memories root"))?;
         let expected = home
             .path()
             .join("profiles")
@@ -1146,30 +1149,38 @@ mod tests {
             .join("memories");
 
         assert_eq!(memories_root, expected);
+        Ok(())
     }
 
     #[test]
-    fn chat_job_store_uses_the_active_profile_jobs_directory() {
-        let home = tempfile::tempdir().expect("create home directory");
-        harw_home::ensure_home(home.path()).expect("scaffold home");
+    fn chat_job_store_uses_the_active_profile_jobs_directory() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create home directory"))?;
+        harw_home::ensure_home(home.path()).map_err(ctx("scaffold home"))?;
         std::fs::write(harw_home::active_profile_path(home.path()), "analysis\n")
-            .expect("select analysis profile");
+            .map_err(ctx("select analysis profile"))?;
 
-        let store_root = active_profile_job_store_root(home.path()).expect("resolve job root");
+        let store_root =
+            active_profile_job_store_root(home.path()).map_err(ctx("resolve job root"))?;
         let store = JobStore::new(&store_root);
 
         assert_eq!(
             store.root(),
             home.path().join("profiles").join("analysis").join("jobs")
         );
+        Ok(())
     }
 
     #[test]
-    fn prompt_and_resume_are_mutually_exclusive() {
-        let error = validate_chat_mode(Some("continue this"), Some(&None))
-            .expect_err("prompt plus interactive resume must be rejected");
+    fn prompt_and_resume_are_mutually_exclusive() -> TestResult {
+        let result = validate_chat_mode(Some("continue this"), Some(&None));
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "prompt plus interactive resume must be rejected".into(),
+            ));
+        };
 
         assert_eq!(error, PROMPT_RESUME_CONFLICT);
+        Ok(())
     }
 
     #[test]
@@ -1180,9 +1191,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_startup_resume_uses_the_discovered_session_id() {
-        let sessions = tempfile::tempdir().expect("create sessions directory");
-        write_transcript(sessions.path(), "session-42");
+    fn explicit_startup_resume_uses_the_discovered_session_id() -> TestResult {
+        let sessions = tempfile::tempdir().map_err(ctx("create sessions directory"))?;
+        write_transcript(sessions.path(), "session-42")?;
 
         let selected = resolve_startup_resume_selection(
             sessions.path(),
@@ -1190,36 +1201,43 @@ mod tests {
             None,
             false,
         )
-        .expect("resolve explicit session");
+        .map_err(ctx("resolve explicit session"))?;
 
         assert_eq!(selected, Some(SessionId::from_str("session-42")));
+        Ok(())
     }
 
     #[test]
-    fn unknown_startup_resume_selector_fails_closed() {
-        let sessions = tempfile::tempdir().expect("create sessions directory");
-        write_transcript(sessions.path(), "session-42");
+    fn unknown_startup_resume_selector_fails_closed() -> TestResult {
+        let sessions = tempfile::tempdir().map_err(ctx("create sessions directory"))?;
+        write_transcript(sessions.path(), "session-42")?;
 
-        let error = resolve_startup_resume_selection(
+        let result = resolve_startup_resume_selection(
             sessions.path(),
             Some(Some("missing".to_owned())),
             None,
             false,
-        )
-        .expect_err("unknown selector must not create a new session");
+        );
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "unknown selector must not create a new session".into(),
+            ));
+        };
 
         assert!(error.contains("unbekannte Session-Auswahl"));
+        Ok(())
     }
 
     #[test]
-    fn no_resume_selection_preserves_new_session_startup() {
-        let sessions = tempfile::tempdir().expect("create sessions directory");
+    fn no_resume_selection_preserves_new_session_startup() -> TestResult {
+        let sessions = tempfile::tempdir().map_err(ctx("create sessions directory"))?;
 
         assert_eq!(
             resolve_startup_resume_selection(sessions.path(), None, None, false)
-                .expect("no resume request is valid"),
+                .map_err(ctx("no resume request is valid"))?,
             None
         );
+        Ok(())
     }
 
     // Ein `-r` ohne Wert an einem Terminal darf nicht mehr blockierend über
@@ -1229,13 +1247,14 @@ mod tests {
     // Nicht-TTY-Zweig: er respektiert denselben Projektfilter wie der
     // Picker, statt alle Sessions unbesehen anzuzeigen.
     #[test]
-    fn bare_resume_without_a_tty_prompts_only_over_sessions_matching_the_project_filter() {
-        let sessions_dir = tempfile::tempdir().expect("create sessions directory");
+    fn bare_resume_without_a_tty_prompts_only_over_sessions_matching_the_project_filter()
+    -> TestResult {
+        let sessions_dir = tempfile::tempdir().map_err(ctx("create sessions directory"))?;
         // Leere Datei (kein `{}`-Inhalt wie `write_transcript`): ein leeres
         // Transcript lässt `meta::load_or_derive` einen frischen Sidecar
         // ableiten, statt an einem nicht-parsbaren Datensatz zu scheitern.
         std::fs::File::create(sessions_dir.path().join("session-other-project.jsonl"))
-            .expect("create empty transcript for meta derivation");
+            .map_err(ctx("create empty transcript for meta derivation"))?;
         harw_session_store::meta::set_project(
             sessions_dir.path(),
             &SessionId::from_str("session-other-project"),
@@ -1243,7 +1262,7 @@ mod tests {
             None,
             Some("other-project-key"),
         )
-        .expect("tag session with a foreign project key");
+        .map_err(ctx("tag session with a foreign project key"))?;
 
         assert!(
             !std::io::stdin().is_terminal(),
@@ -1255,18 +1274,23 @@ mod tests {
         // einzige Session gehört zu einem anderen Projekt, die gefilterte
         // Liste ist leer, und `prompt_for_session` lehnt eine leere Liste
         // mit `ResumeError::NoSessions` ab, statt stdin überhaupt zu lesen.
-        let error = resolve_startup_resume_selection(
+        let result = resolve_startup_resume_selection(
             sessions_dir.path(),
             Some(None),
             Some("current-project-key"),
             false,
-        )
-        .expect_err("no session matches the current project");
+        );
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "no session matches the current project".into(),
+            ));
+        };
 
         assert!(
             error.contains("keine dauerhaften Sessions gefunden"),
             "{error}"
         );
+        Ok(())
     }
 
     // `ProfileResumeSelector::available_sessions` ist der reale Abnehmer des
@@ -1274,18 +1298,19 @@ mod tests {
     // dieser Liste plus `TuiResume::session_store_root`, ohne einen eigenen
     // `Vec<SessionEntry>`-Baustein von hier entgegenzunehmen.
     #[test]
-    fn profile_resume_selector_filters_available_sessions_by_project_unless_all() {
+    fn profile_resume_selector_filters_available_sessions_by_project_unless_all() -> TestResult {
         use harw_tui::app::ResumeSessionSelector;
 
-        let project_dir = tempfile::tempdir().expect("create project directory");
-        let sessions_dir = tempfile::tempdir().expect("create sessions directory");
+        let project_dir = tempfile::tempdir().map_err(ctx("create project directory"))?;
+        let sessions_dir = tempfile::tempdir().map_err(ctx("create sessions directory"))?;
         std::fs::File::create(sessions_dir.path().join("in-project.jsonl"))
-            .expect("create empty transcript for meta derivation");
+            .map_err(ctx("create empty transcript for meta derivation"))?;
         std::fs::File::create(sessions_dir.path().join("other-project.jsonl"))
-            .expect("create empty transcript for meta derivation");
+            .map_err(ctx("create empty transcript for meta derivation"))?;
 
-        let current_key = current_project_key(project_dir.path())
-            .expect("a real directory always yields a project key");
+        let current_key = current_project_key(project_dir.path()).ok_or(TestError::Missing(
+            "a real directory always yields a project key",
+        ))?;
         harw_session_store::meta::set_project(
             sessions_dir.path(),
             &SessionId::from_str("in-project"),
@@ -1293,7 +1318,7 @@ mod tests {
             None,
             Some(current_key.as_str()),
         )
-        .expect("tag in-project session with the current project key");
+        .map_err(ctx("tag in-project session with the current project key"))?;
         harw_session_store::meta::set_project(
             sessions_dir.path(),
             &SessionId::from_str("other-project"),
@@ -1301,7 +1326,7 @@ mod tests {
             None,
             Some("some-other-project-key"),
         )
-        .expect("tag other-project session with a foreign project key");
+        .map_err(ctx("tag other-project session with a foreign project key"))?;
 
         let filtered = ProfileResumeSelector::new(
             sessions_dir.path().to_path_buf(),
@@ -1311,7 +1336,7 @@ mod tests {
         assert_eq!(
             filtered
                 .available_sessions()
-                .expect("list filtered sessions"),
+                .map_err(ctx("list filtered sessions"))?,
             vec![SessionId::from_str("in-project")]
         );
 
@@ -1322,7 +1347,7 @@ mod tests {
         );
         let mut all_ids = unfiltered
             .available_sessions()
-            .expect("list all sessions with --all");
+            .map_err(ctx("list all sessions with --all"))?;
         all_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         assert_eq!(
             all_ids,
@@ -1331,35 +1356,40 @@ mod tests {
                 SessionId::from_str("other-project"),
             ]
         );
+        Ok(())
     }
 
     #[test]
-    fn test_tag_session_project_tags_an_untagged_session() {
-        let fixture = chat_fixture();
-        let sessions_root = profile_sessions_root(&fixture.home).expect("resolve sessions root");
-        std::fs::create_dir_all(&sessions_root).expect("create sessions directory");
+    fn test_tag_session_project_tags_an_untagged_session() -> TestResult {
+        let fixture = chat_fixture()?;
+        let sessions_root =
+            profile_sessions_root(&fixture.home).map_err(ctx("resolve sessions root"))?;
+        std::fs::create_dir_all(&sessions_root).map_err(ctx("create sessions directory"))?;
         std::fs::File::create(sessions_root.join("sess-untagged.jsonl"))
-            .expect("create empty transcript for meta derivation");
+            .map_err(ctx("create empty transcript for meta derivation"))?;
         let session_id = SessionId::from_str("sess-untagged");
 
         tag_session_project(&fixture.home, &fixture.cwd, &session_id);
 
         let meta = harw_session_store::meta::load_or_derive(&sessions_root, &session_id)
-            .expect("load meta after tagging");
-        let expected_key =
-            current_project_key(&fixture.cwd).expect("fixture cwd always yields a project key");
+            .map_err(ctx("load meta after tagging"))?;
+        let expected_key = current_project_key(&fixture.cwd).ok_or(TestError::Missing(
+            "fixture cwd always yields a project key",
+        ))?;
         assert_eq!(meta.project_key.as_deref(), Some(expected_key.as_str()));
         assert_eq!(meta.cwd.as_deref(), Some(fixture.cwd.as_path()));
         assert!(meta.project_root.is_some());
+        Ok(())
     }
 
     #[test]
-    fn test_tag_session_project_does_not_overwrite_an_existing_different_key() {
-        let fixture = chat_fixture();
-        let sessions_root = profile_sessions_root(&fixture.home).expect("resolve sessions root");
-        std::fs::create_dir_all(&sessions_root).expect("create sessions directory");
+    fn test_tag_session_project_does_not_overwrite_an_existing_different_key() -> TestResult {
+        let fixture = chat_fixture()?;
+        let sessions_root =
+            profile_sessions_root(&fixture.home).map_err(ctx("resolve sessions root"))?;
+        std::fs::create_dir_all(&sessions_root).map_err(ctx("create sessions directory"))?;
         std::fs::File::create(sessions_root.join("sess-already-tagged.jsonl"))
-            .expect("create empty transcript for meta derivation");
+            .map_err(ctx("create empty transcript for meta derivation"))?;
         let session_id = SessionId::from_str("sess-already-tagged");
         harw_session_store::meta::set_project(
             &sessions_root,
@@ -1368,32 +1398,35 @@ mod tests {
             None,
             Some("pre-existing-key"),
         )
-        .expect("pre-tag session with a foreign project key");
+        .map_err(ctx("pre-tag session with a foreign project key"))?;
 
         tag_session_project(&fixture.home, &fixture.cwd, &session_id);
 
         let meta = harw_session_store::meta::load_or_derive(&sessions_root, &session_id)
-            .expect("load meta after tagging attempt");
+            .map_err(ctx("load meta after tagging attempt"))?;
         assert_eq!(meta.project_key.as_deref(), Some("pre-existing-key"));
+        Ok(())
     }
 
     #[test]
-    fn test_tag_session_project_with_nonexistent_cwd_leaves_meta_untouched() {
-        let fixture = chat_fixture();
-        let sessions_root = profile_sessions_root(&fixture.home).expect("resolve sessions root");
-        std::fs::create_dir_all(&sessions_root).expect("create sessions directory");
+    fn test_tag_session_project_with_nonexistent_cwd_leaves_meta_untouched() -> TestResult {
+        let fixture = chat_fixture()?;
+        let sessions_root =
+            profile_sessions_root(&fixture.home).map_err(ctx("resolve sessions root"))?;
+        std::fs::create_dir_all(&sessions_root).map_err(ctx("create sessions directory"))?;
         std::fs::File::create(sessions_root.join("sess-missing-cwd.jsonl"))
-            .expect("create empty transcript for meta derivation");
+            .map_err(ctx("create empty transcript for meta derivation"))?;
         let session_id = SessionId::from_str("sess-missing-cwd");
         let missing_cwd = fixture.cwd.join("does-not-exist");
 
         tag_session_project(&fixture.home, &missing_cwd, &session_id);
 
         let meta = harw_session_store::meta::load_or_derive(&sessions_root, &session_id)
-            .expect("load meta after failed tagging attempt");
+            .map_err(ctx("load meta after failed tagging attempt"))?;
         assert_eq!(meta.project_key, None);
         assert_eq!(meta.cwd, None);
         assert_eq!(meta.project_root, None);
+        Ok(())
     }
 
     // Bugfix: `harw -r` ohne `--all` zeigte zuvor auch Alt-Sessions ohne
@@ -1404,20 +1437,21 @@ mod tests {
     // erreichbar — analog zu einer Session mit einem fremden `project_key`.
     #[test]
     fn test_profile_resume_selector_available_sessions_excludes_untagged_legacy_session_without_all()
-     {
+    -> TestResult {
         use harw_tui::app::ResumeSessionSelector;
 
-        let project_dir = tempfile::tempdir().expect("create project directory");
-        let sessions_dir = tempfile::tempdir().expect("create sessions directory");
+        let project_dir = tempfile::tempdir().map_err(ctx("create project directory"))?;
+        let sessions_dir = tempfile::tempdir().map_err(ctx("create sessions directory"))?;
         std::fs::File::create(sessions_dir.path().join("in-project.jsonl"))
-            .expect("create empty transcript for meta derivation");
+            .map_err(ctx("create empty transcript for meta derivation"))?;
         std::fs::File::create(sessions_dir.path().join("legacy-untagged.jsonl"))
-            .expect("create empty transcript for meta derivation");
+            .map_err(ctx("create empty transcript for meta derivation"))?;
         std::fs::File::create(sessions_dir.path().join("other-project.jsonl"))
-            .expect("create empty transcript for meta derivation");
+            .map_err(ctx("create empty transcript for meta derivation"))?;
 
-        let current_key = current_project_key(project_dir.path())
-            .expect("a real directory always yields a project key");
+        let current_key = current_project_key(project_dir.path()).ok_or(TestError::Missing(
+            "a real directory always yields a project key",
+        ))?;
         harw_session_store::meta::set_project(
             sessions_dir.path(),
             &SessionId::from_str("in-project"),
@@ -1425,7 +1459,7 @@ mod tests {
             None,
             Some(current_key.as_str()),
         )
-        .expect("tag in-project session with the current project key");
+        .map_err(ctx("tag in-project session with the current project key"))?;
         harw_session_store::meta::set_project(
             sessions_dir.path(),
             &SessionId::from_str("other-project"),
@@ -1433,7 +1467,7 @@ mod tests {
             None,
             Some("some-other-project-key"),
         )
-        .expect("tag other-project session with a foreign project key");
+        .map_err(ctx("tag other-project session with a foreign project key"))?;
         // `legacy-untagged` gets no `set_project` call and an empty
         // transcript: `meta::load_or_derive` leaves `project_key` as `None`,
         // and `crate::resume::backfill_project_key` finds no path candidate
@@ -1447,7 +1481,7 @@ mod tests {
         );
         let visible_ids = filtered
             .available_sessions()
-            .expect("list filtered sessions");
+            .map_err(ctx("list filtered sessions"))?;
         assert_eq!(visible_ids, vec![SessionId::from_str("in-project")]);
 
         let all = ProfileResumeSelector::new(
@@ -1457,7 +1491,7 @@ mod tests {
         );
         let mut all_ids = all
             .available_sessions()
-            .expect("list all sessions with --all");
+            .map_err(ctx("list all sessions with --all"))?;
         all_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         assert_eq!(
             all_ids,
@@ -1467,6 +1501,7 @@ mod tests {
                 SessionId::from_str("other-project"),
             ]
         );
+        Ok(())
     }
 
     #[test]
@@ -1484,50 +1519,56 @@ mod tests {
     }
 
     #[test]
-    fn test_transcript_state_store_persists_cli_turns_in_the_active_profile_sessions_root() {
-        let home = tempfile::tempdir().expect("create home directory");
-        harw_home::ensure_home(home.path()).expect("scaffold home");
-        let sessions_root = profile_sessions_root(home.path()).expect("resolve sessions root");
+    fn test_transcript_state_store_persists_cli_turns_in_the_active_profile_sessions_root()
+    -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create home directory"))?;
+        harw_home::ensure_home(home.path()).map_err(ctx("scaffold home"))?;
+        let sessions_root =
+            profile_sessions_root(home.path()).map_err(ctx("resolve sessions root"))?;
         let store = transcript_state_store(&sessions_root, cli_thread_for_session);
         let session = SessionId::from_str("session-123");
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("persist this turn");
-        let item = history.items().first().expect("history has a turn item");
+        let item = history
+            .items()
+            .first()
+            .ok_or(TestError::Missing("history has a turn item"))?;
         let runtime = Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("build test runtime");
+            .map_err(ctx("build test runtime"))?;
 
         runtime
             .block_on(store.save_turn(&session, item))
-            .expect("persist turn through transcript adapter");
+            .map_err(ctx("persist turn through transcript adapter"))?;
 
         let records = TranscriptStore::new(&sessions_root)
             .reader(&session)
-            .expect("open CLI transcript")
+            .map_err(ctx("open CLI transcript"))?
             .collect::<harw_session_store::SessionStoreResult<Vec<_>>>()
-            .expect("read CLI transcript");
+            .map_err(ctx("read CLI transcript"))?;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].thread, cli_thread_for_session(&session));
+        Ok(())
     }
 
     #[test]
-    fn test_goal_context_contributor_registers_provider() {
-        let fixture = chat_fixture();
+    fn test_goal_context_contributor_registers_provider() -> TestResult {
+        let fixture = chat_fixture()?;
         let goal_context: Arc<dyn ContextProvider> = Arc::new(TestGoalContext);
         let with_goal = ChatStartup {
             goal_context: Some(goal_context),
             ..startup(InteractionMode::Chat)
         };
-        let inputs = fixture_inputs(&fixture, EntryKind::OneShot, IngressSurface::Cli, with_goal);
+        let inputs = fixture_inputs(&fixture, EntryKind::OneShot, IngressSurface::Cli, with_goal)?;
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
         let (turn_tx, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
 
         let assembly = one_shot_assembly(&inputs, echo_model_source(), event_tx.clone())
-            .expect("assemble one-shot runtime with goal context");
+            .map_err(ctx("assemble one-shot runtime with goal context"))?;
         let root = assembly
             .new_root_session(assembly.root_session_id().clone(), event_tx, turn_tx, None)
-            .expect("create root session");
+            .map_err(ctx("create root session"))?;
 
         let registered = root
             .session
@@ -1546,14 +1587,14 @@ mod tests {
             EntryKind::OneShot,
             IngressSurface::Cli,
             startup(InteractionMode::Chat),
-        );
+        )?;
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
         let (turn_tx, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
         let baseline = one_shot_assembly(&without_goal, echo_model_source(), event_tx.clone())
-            .expect("assemble one-shot runtime without goal context");
+            .map_err(ctx("assemble one-shot runtime without goal context"))?;
         let baseline_root = baseline
             .new_root_session(baseline.root_session_id().clone(), event_tx, turn_tx, None)
-            .expect("create baseline root session");
+            .map_err(ctx("create baseline root session"))?;
         assert!(
             !baseline_root
                 .session
@@ -1563,11 +1604,12 @@ mod tests {
                 .any(|provider| provider.namespace() == TEST_GOAL_NAMESPACE),
             "without a goal context no such provider may appear"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_one_shot_assembly_applies_mode_and_config_policy() {
-        let fixture = chat_fixture();
+    fn test_one_shot_assembly_applies_mode_and_config_policy() -> TestResult {
+        let fixture = chat_fixture()?;
         // `[policy]` gehört ins **Profil**-`config.toml`, nicht ins
         // Root-`config.toml` von `fixture.home`: `discover_config_with_restricted`
         // (`harw-config/src/discovery.rs`) läuft `layers` (Root, dann aktives
@@ -1596,22 +1638,22 @@ mod tests {
         let mut config_file = std::fs::OpenOptions::new()
             .append(true)
             .open(&profile_config_path)
-            .expect("open profile config");
+            .map_err(ctx("open profile config"))?;
         config_file
             .write_all(b"\n[policy]\nrequire_approval_for = [\"fs.write\"]\n")
-            .expect("append approval policy");
+            .map_err(ctx("append approval policy"))?;
         drop(config_file);
         let inputs = fixture_inputs(
             &fixture,
             EntryKind::OneShot,
             IngressSurface::Cli,
             startup(InteractionMode::Explore),
-        );
+        )?;
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
         let (turn_tx, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
 
         let assembly = one_shot_assembly(&inputs, echo_model_source(), event_tx.clone())
-            .expect("assemble one-shot runtime");
+            .map_err(ctx("assemble one-shot runtime"))?;
         let snapshot = assembly.rights_snapshot();
         assert_eq!(snapshot.entry, EntryKind::OneShot);
         assert!(
@@ -1629,34 +1671,38 @@ mod tests {
 
         let root = assembly
             .new_root_session(assembly.root_session_id().clone(), event_tx, turn_tx, None)
-            .expect("create root session");
+            .map_err(ctx("create root session"))?;
         assert_eq!(root.session.mode(), InteractionMode::Explore);
+        Ok(())
     }
 
     #[test]
-    fn test_chat_tui_factory_uses_selected_root_session_id() {
-        let fixture = chat_fixture();
+    fn test_chat_tui_factory_uses_selected_root_session_id() -> TestResult {
+        let fixture = chat_fixture()?;
         let inputs = fixture_inputs(
             &fixture,
             EntryKind::Tui,
             IngressSurface::Tui,
             startup(InteractionMode::Chat),
-        );
+        )?;
         let factory = ChatTuiFactory::new(inputs, echo_model_source, Vec::new());
         let selected = SessionId::from_str("session-42");
 
         let (resumed, _wiring) = factory
             .assemble(Some(selected.clone()))
-            .expect("assemble with a selected root session");
+            .map_err(ctx("assemble with a selected root session"))?;
         assert_eq!(resumed.root_session_id(), &selected);
         assert_eq!(resumed.spec().entry, EntryKind::Tui);
 
-        let (fresh, _fresh_wiring) = factory.assemble(None).expect("assemble a fresh session");
+        let (fresh, _fresh_wiring) = factory
+            .assemble(None)
+            .map_err(ctx("assemble a fresh session"))?;
         assert_ne!(fresh.root_session_id(), &selected);
         assert!(
             Arc::ptr_eq(resumed.state_store(), fresh.state_store()),
             "every assembly of one factory must share the same transcript store"
         );
+        Ok(())
     }
 
     /// Liefert eine vorprogrammierte Folge von Model-Antworten, eine pro Aufruf
@@ -1675,7 +1721,15 @@ mod tests {
 
     impl ModelProvider for ScriptedModel {
         fn respond<'a>(&'a self, _request: ModelRequest) -> ModelFuture<'a> {
-            let next = self.responses.lock().unwrap().pop_front();
+            // Test-Double: ein vergifteter Mutex kann hier nur entstehen, wenn
+            // ein früherer Aufruf paniken würde — das gibt es in diesem
+            // Modul nicht mehr (Bible R087/R165). `into_inner` gewinnt den
+            // Guard trotzdem zurück, statt zu paniken.
+            let next = self
+                .responses
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front();
             Box::pin(async move { next.ok_or(ModelError::EmptyResponse) })
         }
     }
@@ -1688,15 +1742,15 @@ mod tests {
     // Responder sofort ablehnt (harw-runtime/src/approval.rs ~:201-211:
     // `would_ask` → `Deny`, nie `AskUser`, wenn niemand antworten kann).
     #[test]
-    fn test_one_shot_policy_gated_tool_call_is_denied_without_pausing() {
-        let fixture = chat_fixture();
+    fn test_one_shot_policy_gated_tool_call_is_denied_without_pausing() -> TestResult {
+        let fixture = chat_fixture()?;
         let mut config_file = std::fs::OpenOptions::new()
             .append(true)
             .open(fixture.home.join("config.toml"))
-            .expect("open home config");
+            .map_err(ctx("open home config"))?;
         config_file
             .write_all(b"\n[policy]\nrequire_approval_for = [\"fs.write\"]\n")
-            .expect("append approval policy");
+            .map_err(ctx("append approval policy"))?;
         drop(config_file);
 
         let inputs = fixture_inputs(
@@ -1704,7 +1758,7 @@ mod tests {
             EntryKind::OneShot,
             IngressSurface::Cli,
             startup(InteractionMode::Chat),
-        );
+        )?;
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
         let (turn_tx, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
 
@@ -1723,15 +1777,17 @@ mod tests {
         ]));
 
         let assembly = one_shot_assembly(&inputs, ModelSource::Override(model), event_tx.clone())
-            .expect("assemble one-shot runtime with a scripted, policy-gated tool call");
+            .map_err(ctx(
+            "assemble one-shot runtime with a scripted, policy-gated tool call",
+        ))?;
         let mut root = assembly
             .new_root_session(assembly.root_session_id().clone(), event_tx, turn_tx, None)
-            .expect("create root session");
+            .map_err(ctx("create root session"))?;
 
         let runtime = Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("build test runtime");
+            .map_err(ctx("build test runtime"))?;
         let outcome = runtime
             .block_on(run_turn(
                 &mut root.session,
@@ -1739,7 +1795,9 @@ mod tests {
                 assembly.state_store().as_ref(),
                 TurnInput::user("please write the file"),
             ))
-            .expect("a rejected turn still runs to completion, it never errors out");
+            .map_err(ctx(
+                "a rejected turn still runs to completion, it never errors out",
+            ))?;
 
         assert!(
             matches!(outcome, TurnOutcome::Completed),
@@ -1758,15 +1816,20 @@ mod tests {
                 }
                 _ => None,
             })
-            .expect("the gated tool call must have produced a tool result in history");
+            .ok_or(TestError::Missing(
+                "the gated tool call must have produced a tool result in history",
+            ))?;
         match denial {
             ToolCallResult::Error { message } => assert!(
                 message.contains("denied"),
                 "the tool result must record the denial: {message}"
             ),
-            ToolCallResult::Success { .. } => panic!(
-                "a policy-gated fs.write must never be dispatched without an interactive responder"
-            ),
+            ToolCallResult::Success { .. } => {
+                return Err(TestError::Unexpected(
+                    "a policy-gated fs.write must never be dispatched without an interactive responder".into(),
+                ));
+            }
         }
+        Ok(())
     }
 }

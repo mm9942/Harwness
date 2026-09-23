@@ -405,7 +405,8 @@ impl SessionActivation {
             candidates.extend(set);
         }
 
-        let both_full = self.tool_profile == ToolProfile::Full && other.tool_profile == ToolProfile::Full;
+        let both_full =
+            self.tool_profile == ToolProfile::Full && other.tool_profile == ToolProfile::Full;
         let mut result = if both_full {
             Self::new(ToolProfile::Full)
         } else {
@@ -647,8 +648,14 @@ mod tests {
         for name in PROBE_NAMES {
             let t = tool(name);
             if i.is_tool_enabled(&t) {
-                assert!(a.is_tool_enabled(&t), "result allows {name:?} but a does not");
-                assert!(b.is_tool_enabled(&t), "result allows {name:?} but b does not");
+                assert!(
+                    a.is_tool_enabled(&t),
+                    "result allows {name:?} but a does not"
+                );
+                assert!(
+                    b.is_tool_enabled(&t),
+                    "result allows {name:?} but b does not"
+                );
             }
         }
     }
@@ -667,7 +674,10 @@ mod tests {
         for name in PROBE_NAMES {
             let t = tool(name);
             assert_eq!(ab.is_tool_enabled(&t), ba.is_tool_enabled(&t));
-            assert_eq!(ab.is_instructions_enabled(name), ba.is_instructions_enabled(name));
+            assert_eq!(
+                ab.is_instructions_enabled(name),
+                ba.is_instructions_enabled(name)
+            );
             assert_eq!(ab.is_context_enabled(name), ba.is_context_enabled(name));
         }
     }
@@ -686,7 +696,10 @@ mod tests {
             let t = tool(name);
             assert_eq!(once.is_tool_enabled(&t), a.is_tool_enabled(&t));
             assert_eq!(twice.is_tool_enabled(&t), a.is_tool_enabled(&t));
-            assert_eq!(once.is_instructions_enabled(name), a.is_instructions_enabled(name));
+            assert_eq!(
+                once.is_instructions_enabled(name),
+                a.is_instructions_enabled(name)
+            );
             assert_eq!(once.is_context_enabled(name), a.is_context_enabled(name));
         }
     }

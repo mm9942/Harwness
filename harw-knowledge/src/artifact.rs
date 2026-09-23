@@ -200,7 +200,8 @@ impl RecallQuery {
     /// `max_hops` exceeds its cap.
     pub fn validate(&self) -> KnowledgeResult<()> {
         if self.max_artifacts > MAX_RECALL_ARTIFACTS {
-            crate::context_steward::STEWARD_CEILING_VIOLATION.violated(&harw_observe::NullSink, &[]);
+            crate::context_steward::STEWARD_CEILING_VIOLATION
+                .violated(&harw_observe::NullSink, &[]);
             return Err(KnowledgeError::RecallBoundExceeded {
                 field: "max_artifacts".to_owned(),
                 value: self.max_artifacts,
@@ -208,7 +209,8 @@ impl RecallQuery {
             });
         }
         if self.max_hops > MAX_RECALL_HOPS {
-            crate::context_steward::STEWARD_CEILING_VIOLATION.violated(&harw_observe::NullSink, &[]);
+            crate::context_steward::STEWARD_CEILING_VIOLATION
+                .violated(&harw_observe::NullSink, &[]);
             return Err(KnowledgeError::RecallBoundExceeded {
                 field: "max_hops".to_owned(),
                 value: usize::from(self.max_hops),
@@ -222,12 +224,13 @@ impl RecallQuery {
 #[cfg(test)]
 mod tests {
     use super::ArtifactKind;
+    use crate::test_support::{TestError, TestResult};
 
     /// Every existing variant's snake_case wire form, pinned so the AW4-05
     /// additive change (`SecurityFinding`, `Baseline`) cannot silently shift
     /// an already-stored variant's serialized form.
     #[test]
-    fn test_existing_artifact_kind_variants_serialize_unchanged() {
+    fn test_existing_artifact_kind_variants_serialize_unchanged() -> TestResult {
         let cases = [
             (ArtifactKind::CoreMemory, "\"core_memory\""),
             (ArtifactKind::TopicMemory, "\"topic_memory\""),
@@ -235,53 +238,57 @@ mod tests {
             (ArtifactKind::DiaryEntry, "\"diary_entry\""),
             (ArtifactKind::DreamReport, "\"dream_report\""),
             (ArtifactKind::WorkbenchNote, "\"workbench_note\""),
-            (ArtifactKind::WorkbenchHypothesis, "\"workbench_hypothesis\""),
+            (
+                ArtifactKind::WorkbenchHypothesis,
+                "\"workbench_hypothesis\"",
+            ),
             (ArtifactKind::KanbanCard, "\"kanban_card\""),
         ];
         for (kind, expected) in cases {
-            assert_eq!(serde_json::to_string(&kind).expect("kind serializes"), expected);
+            assert_eq!(serde_json::to_string(&kind)?, expected);
         }
+        Ok(())
     }
 
     /// The two AW4-05 variants serialize/deserialize in the same snake_case
     /// style as every existing variant (round-trip plus a literal check).
     #[test]
-    fn test_new_artifact_kind_variants_round_trip_snake_case() {
+    fn test_new_artifact_kind_variants_round_trip_snake_case() -> TestResult {
         let cases = [
             (ArtifactKind::SecurityFinding, "\"security_finding\""),
             (ArtifactKind::Baseline, "\"baseline\""),
         ];
         for (kind, expected) in cases {
-            let encoded = serde_json::to_string(&kind).expect("kind serializes");
+            let encoded = serde_json::to_string(&kind)?;
             assert_eq!(encoded, expected);
-            let decoded: ArtifactKind =
-                serde_json::from_str(&encoded).expect("kind deserializes");
+            let decoded: ArtifactKind = serde_json::from_str(&encoded)?;
             assert_eq!(decoded, kind);
         }
+        Ok(())
     }
 
     /// The AW5-09 addition round-trips in the same snake_case style as every
     /// other variant (literal check plus round-trip, mirroring the AW4-05 test
     /// above without touching it).
     #[test]
-    fn test_context_proposal_artifact_kind_round_trips_snake_case() {
-        let encoded =
-            serde_json::to_string(&ArtifactKind::ContextProposal).expect("kind serializes");
+    fn test_context_proposal_artifact_kind_round_trips_snake_case() -> TestResult {
+        let encoded = serde_json::to_string(&ArtifactKind::ContextProposal)?;
         assert_eq!(encoded, "\"context_proposal\"");
-        let decoded: ArtifactKind = serde_json::from_str(&encoded).expect("kind deserializes");
+        let decoded: ArtifactKind = serde_json::from_str(&encoded)?;
         assert_eq!(decoded, ArtifactKind::ContextProposal);
+        Ok(())
     }
 
     /// The AW6-06 addition round-trips in the same snake_case style as every
     /// other variant (literal check plus round-trip, mirroring the AW5-09 test
     /// above without touching it).
     #[test]
-    fn test_model_behavior_proposal_artifact_kind_round_trips_snake_case() {
-        let encoded = serde_json::to_string(&ArtifactKind::ModelBehaviorProposal)
-            .expect("kind serializes");
+    fn test_model_behavior_proposal_artifact_kind_round_trips_snake_case() -> TestResult {
+        let encoded = serde_json::to_string(&ArtifactKind::ModelBehaviorProposal)?;
         assert_eq!(encoded, "\"model_behavior_proposal\"");
-        let decoded: ArtifactKind = serde_json::from_str(&encoded).expect("kind deserializes");
+        let decoded: ArtifactKind = serde_json::from_str(&encoded)?;
         assert_eq!(decoded, ArtifactKind::ModelBehaviorProposal);
+        Ok(())
     }
 
     /// A query within the hard bounds validates and never trips
@@ -291,7 +298,9 @@ mod tests {
         use crate::context_steward::{STEWARD_CEILING_VIOLATION, STEWARD_COUNTER_LOCK};
         use crate::visibility::VisibilityScope;
 
-        let _guard = STEWARD_COUNTER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = STEWARD_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let before = STEWARD_CEILING_VIOLATION.count();
         let query = super::RecallQuery::new("", VisibilityScope::OperatorOnly);
         assert!(query.validate().is_ok());
@@ -308,41 +317,55 @@ mod tests {
     /// by `search_with` on every `/context-proposal` invocation), not a
     /// synthetic mirror of the counter mechanism.
     #[test]
-    fn test_validate_rejects_max_artifacts_above_ceiling_and_trips_the_counter() {
+    fn test_validate_rejects_max_artifacts_above_ceiling_and_trips_the_counter() -> TestResult {
         use crate::context_steward::{STEWARD_CEILING_VIOLATION, STEWARD_COUNTER_LOCK};
         use crate::error::KnowledgeError;
         use crate::visibility::VisibilityScope;
 
-        let _guard = STEWARD_COUNTER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = STEWARD_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let before = STEWARD_CEILING_VIOLATION.count();
         let mut query = super::RecallQuery::new("", VisibilityScope::OperatorOnly);
         query.max_artifacts = super::MAX_RECALL_ARTIFACTS + 1;
 
-        let error = query.validate().expect_err("bound above the ceiling must be rejected");
+        let Err(error) = query.validate() else {
+            return Err(TestError::Unexpected(
+                "bound above the ceiling must be rejected".to_owned(),
+            ));
+        };
         assert!(matches!(error, KnowledgeError::RecallBoundExceeded { .. }));
         assert!(
             STEWARD_CEILING_VIOLATION.count() > before,
             "exceeding max_artifacts must trip the ceiling counter"
         );
+        Ok(())
     }
 
     /// The `max_hops` branch of the same check, independently.
     #[test]
-    fn test_validate_rejects_max_hops_above_ceiling_and_trips_the_counter() {
+    fn test_validate_rejects_max_hops_above_ceiling_and_trips_the_counter() -> TestResult {
         use crate::context_steward::{STEWARD_CEILING_VIOLATION, STEWARD_COUNTER_LOCK};
         use crate::error::KnowledgeError;
         use crate::visibility::VisibilityScope;
 
-        let _guard = STEWARD_COUNTER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = STEWARD_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let before = STEWARD_CEILING_VIOLATION.count();
         let mut query = super::RecallQuery::new("", VisibilityScope::OperatorOnly);
         query.max_hops = super::MAX_RECALL_HOPS + 1;
 
-        let error = query.validate().expect_err("bound above the ceiling must be rejected");
+        let Err(error) = query.validate() else {
+            return Err(TestError::Unexpected(
+                "bound above the ceiling must be rejected".to_owned(),
+            ));
+        };
         assert!(matches!(error, KnowledgeError::RecallBoundExceeded { .. }));
         assert!(
             STEWARD_CEILING_VIOLATION.count() > before,
             "exceeding max_hops must trip the ceiling counter"
         );
+        Ok(())
     }
 }

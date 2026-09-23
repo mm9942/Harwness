@@ -49,6 +49,7 @@ pub enum OmissionReason {
 #[cfg(test)]
 mod tests {
     use super::{DetailMode, OmissionReason};
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn test_detail_mode_variants_are_pairwise_distinct() {
@@ -58,25 +59,28 @@ mod tests {
     }
 
     #[test]
-    fn test_omission_reason_serde_roundtrip() {
+    fn test_omission_reason_serde_roundtrip() -> TestResult {
         for reason in [
             OmissionReason::OverBudget,
             OmissionReason::BelowCeiling,
             OmissionReason::ExcludedByProgram,
             OmissionReason::Superseded,
         ] {
-            let json = serde_json::to_string(&reason).expect("reason must serialize");
+            let json = serde_json::to_string(&reason).map_err(ctx("reason must serialize"))?;
             let restored: OmissionReason =
-                serde_json::from_str(&json).expect("reason must deserialize");
+                serde_json::from_str(&json).map_err(ctx("reason must deserialize"))?;
             assert_eq!(reason, restored);
         }
+        Ok(())
     }
 
     #[test]
-    fn test_detail_mode_serializes_kebab_case() {
+    fn test_detail_mode_serializes_kebab_case() -> TestResult {
         assert_eq!(
-            serde_json::to_string(&DetailMode::References).unwrap(),
+            serde_json::to_string(&DetailMode::References)
+                .map_err(ctx("detail mode must serialize"))?,
             "\"references\""
         );
+        Ok(())
     }
 }

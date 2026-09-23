@@ -22,15 +22,20 @@ use harw_agent_dsl::lower;
 use harw_agent_dsl::parse::parse_toml;
 use harw_agent_dsl::resolved::{ResolutionTrace, ResolvedAgentDefinition};
 use harw_agent_dsl::roles::AgentRoleId;
+use harw_authority::{
+    Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+};
 use harw_core::activation::{SessionActivation, ToolProfile};
 use harw_core::mode::InteractionMode;
 use harw_core::session::{AgentSession, SpawnContext};
 use harw_extension_api::ExtensionRegistryBuilder;
-use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
 use harw_tools::ToolName;
 use harw_types::{AgentRole, SessionId, TenantId, WorkspaceId};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
+
+mod common;
+use common::{TestResult, ctx};
 
 /// Baut eine Session ohne Sandbox und ohne IR — die Basis ist der Default.
 fn plain_session() -> AgentSession {
@@ -48,7 +53,7 @@ fn plain_session() -> AgentSession {
 ///
 /// Wortgleich zum Helfer der Unit-Tests in `session.rs`: `parse_toml` + `lower`
 /// sind der einzige öffentliche Weg zu einer [`ExecutableAgentIr`].
-fn executable_agent_ir(admitted: &[&str], forbidden: &[&str]) -> ExecutableAgentIr {
+fn executable_agent_ir(admitted: &[&str], forbidden: &[&str]) -> TestResult<ExecutableAgentIr> {
     let admitted = admitted
         .iter()
         .map(|name| format!("\"{name}\""))
@@ -72,7 +77,7 @@ admitted = [{admitted}]
 forbidden = [{forbidden}]
 "#
     ))
-    .expect("Test-Agent-Definition muss parsen");
+    .map_err(ctx("Test-Agent-Definition muss parsen"))?;
     let resolved = ResolvedAgentDefinition {
         id: raw.id,
         version: raw.version,
@@ -86,14 +91,16 @@ forbidden = [{forbidden}]
         reasoning_effort: raw.reasoning_effort.clone(),
     };
 
-    lower(&resolved).expect("Test-Agent-Definition muss lowern")
+    lower(&resolved).map_err(ctx("Test-Agent-Definition muss lowern"))
 }
 
 /// Sandbox auf dem echten Harness-Verzeichnis mit genau diesen Permissions.
-fn test_sandbox(permissions: &[Permission]) -> SandboxSpec {
+fn test_sandbox(permissions: &[Permission]) -> TestResult<SandboxSpec> {
     let harness_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("harw-core hat ein Workspace-Elternverzeichnis")
+        .ok_or(common::TestError::Missing(
+            "harw-core hat ein Workspace-Elternverzeichnis",
+        ))?
         .to_path_buf();
     let registry = WorkspaceRegistry::build(
         &harness_root,
@@ -103,16 +110,16 @@ fn test_sandbox(permissions: &[Permission]) -> SandboxSpec {
             root: PathBuf::from("harw-core"),
         }],
     )
-    .expect("Test-Workspace ist registrierbar");
-    SandboxSpec::from_resolved(
+    .map_err(ctx("Test-Workspace ist registrierbar"))?;
+    Ok(SandboxSpec::from_resolved(
         registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("core-mode-intersection-tests"),
             )
-            .expect("Test-Workspace löst auf"),
+            .map_err(ctx("Test-Workspace löst auf"))?,
         PermissionSet::from_policy(permissions.iter().copied()),
-    )
+    ))
 }
 
 fn spawn_context(sandbox: SandboxSpec) -> SpawnContext {
@@ -128,11 +135,13 @@ fn spawn_context(sandbox: SandboxSpec) -> SpawnContext {
     }
 }
 
-fn sandbox_of(session: &AgentSession) -> &SandboxSpec {
-    &session
+fn sandbox_of(session: &AgentSession) -> TestResult<&SandboxSpec> {
+    Ok(&session
         .spawn_context()
-        .expect("Test-Session hat einen Spawn-Kontext")
-        .sandbox
+        .ok_or(common::TestError::Missing(
+            "Test-Session hat einen Spawn-Kontext",
+        ))?
+        .sandbox)
 }
 
 fn enabled(session: &AgentSession, name: &str) -> bool {
@@ -144,8 +153,8 @@ fn enabled(session: &AgentSession, name: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn ir_forbidden_tool_stays_forbidden_after_set_mode_work() {
-    let executable = executable_agent_ir(&["fs.read", "shell.exec"], &["shell.exec"]);
+fn ir_forbidden_tool_stays_forbidden_after_set_mode_work() -> TestResult {
+    let executable = executable_agent_ir(&["fs.read", "shell.exec"], &["shell.exec"])?;
     let mut session = plain_session().with_executable_agent_ir(&executable);
 
     assert!(!enabled(&session, "shell.exec"));
@@ -160,11 +169,12 @@ fn ir_forbidden_tool_stays_forbidden_after_set_mode_work() {
         enabled(&session, "fs.read"),
         "ein zugelassenes Werkzeug bleibt in Work sichtbar"
     );
+    Ok(())
 }
 
 #[test]
-fn set_mode_work_admits_nothing_the_ir_never_admitted() {
-    let executable = executable_agent_ir(&["fs.read"], &[]);
+fn set_mode_work_admits_nothing_the_ir_never_admitted() -> TestResult {
+    let executable = executable_agent_ir(&["fs.read"], &[])?;
     let mut session = plain_session().with_executable_agent_ir(&executable);
 
     session.set_mode(InteractionMode::Work);
@@ -181,6 +191,7 @@ fn set_mode_work_admits_nothing_the_ir_never_admitted() {
         ToolProfile::Full,
         "das Full-Profil des Modus darf die deny-by-default-Fläche der IR nicht ersetzen"
     );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -188,8 +199,8 @@ fn set_mode_work_admits_nothing_the_ir_never_admitted() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn explore_then_work_restores_exactly_the_ir_tool_surface() {
-    let executable = executable_agent_ir(&["fs.read", "fs.write"], &["shell.exec"]);
+fn explore_then_work_restores_exactly_the_ir_tool_surface() -> TestResult {
+    let executable = executable_agent_ir(&["fs.read", "fs.write"], &["shell.exec"])?;
     let mut session = plain_session().with_executable_agent_ir(&executable);
 
     session.set_mode(InteractionMode::Explore);
@@ -207,11 +218,12 @@ fn explore_then_work_restores_exactly_the_ir_tool_surface() {
         !enabled(&session, "shell.exec"),
         "der Rückweg gibt nur die Basis zurück, nie mehr"
     );
+    Ok(())
 }
 
 #[test]
-fn base_activation_is_the_unmodified_ir_surface_while_a_mode_narrows_it() {
-    let executable = executable_agent_ir(&["fs.read", "fs.write"], &[]);
+fn base_activation_is_the_unmodified_ir_surface_while_a_mode_narrows_it() -> TestResult {
+    let executable = executable_agent_ir(&["fs.read", "fs.write"], &[])?;
     let mut session = plain_session().with_executable_agent_ir(&executable);
     session.set_mode(InteractionMode::Explore);
 
@@ -224,21 +236,22 @@ fn base_activation_is_the_unmodified_ir_surface_while_a_mode_narrows_it() {
         !enabled(&session, "fs.write"),
         "die wirksame Aktivierung ist die engere von beiden"
     );
+    Ok(())
 }
 
 #[test]
-fn sandbox_after_explore_then_work_equals_the_base_sandbox() {
+fn sandbox_after_explore_then_work_equals_the_base_sandbox() -> TestResult {
     let base_sandbox = test_sandbox(&[
         Permission::ReadWorkspace,
         Permission::WriteWorkspace,
         Permission::ExecuteProcess,
-    ]);
+    ])?;
     let mut session = plain_session().with_spawn_context(spawn_context(base_sandbox.clone()));
-    assert_eq!(sandbox_of(&session), &base_sandbox);
+    assert_eq!(sandbox_of(&session)?, &base_sandbox);
 
     session.set_mode(InteractionMode::Explore);
     assert!(
-        !sandbox_of(&session)
+        !sandbox_of(&session)?
             .permissions()
             .contains(Permission::WriteWorkspace),
         "Explore entzieht das Schreibrecht"
@@ -247,15 +260,16 @@ fn sandbox_after_explore_then_work_equals_the_base_sandbox() {
     session.set_mode(InteractionMode::Work);
 
     assert_eq!(
-        sandbox_of(&session),
+        sandbox_of(&session)?,
         &base_sandbox,
         "Work stellt die Basis-Sandbox vollständig wieder her: Workspace, Permissions, NetworkScope"
     );
+    Ok(())
 }
 
 #[test]
-fn no_mode_ever_exceeds_the_base_sandbox() {
-    let base_sandbox = test_sandbox(&[Permission::ReadWorkspace]);
+fn no_mode_ever_exceeds_the_base_sandbox() -> TestResult {
+    let base_sandbox = test_sandbox(&[Permission::ReadWorkspace])?;
     let mut session = plain_session().with_spawn_context(spawn_context(base_sandbox.clone()));
 
     for mode in [
@@ -265,33 +279,34 @@ fn no_mode_ever_exceeds_the_base_sandbox() {
         InteractionMode::Chat,
     ] {
         session.set_mode(mode);
-        let permissions = sandbox_of(&session).permissions().clone();
+        let permissions = sandbox_of(&session)?.permissions().clone();
         assert!(
             permissions.is_subset_of(base_sandbox.permissions()),
             "{mode:?} darf die Basis-Autorität nicht überschreiten"
         );
         assert!(
-            sandbox_of(&session).ensure_child_of(&base_sandbox).is_ok(),
+            sandbox_of(&session)?.ensure_child_of(&base_sandbox).is_ok(),
             "{mode:?} muss eine zulässige Verengung der Basis bleiben"
         );
     }
+    Ok(())
 }
 
 #[test]
-fn mode_intersection_is_independent_of_builder_order() {
-    let executable = executable_agent_ir(&["fs.read", "fs.write"], &[]);
+fn mode_intersection_is_independent_of_builder_order() -> TestResult {
+    let executable = executable_agent_ir(&["fs.read", "fs.write"], &[])?;
     let permissions = [Permission::ReadWorkspace, Permission::WriteWorkspace];
 
     let mode_first = plain_session()
         .with_mode(InteractionMode::Explore)
         .with_executable_agent_ir(&executable)
-        .with_spawn_context(spawn_context(test_sandbox(&permissions)));
+        .with_spawn_context(spawn_context(test_sandbox(&permissions)?));
     let mode_last = plain_session()
         .with_executable_agent_ir(&executable)
-        .with_spawn_context(spawn_context(test_sandbox(&permissions)))
+        .with_spawn_context(spawn_context(test_sandbox(&permissions)?))
         .with_mode(InteractionMode::Explore);
 
-    assert_eq!(sandbox_of(&mode_first), sandbox_of(&mode_last));
+    assert_eq!(sandbox_of(&mode_first)?, sandbox_of(&mode_last)?);
     for name in ["fs.read", "fs.write", "shell.exec"] {
         assert_eq!(
             enabled(&mode_first, name),
@@ -301,6 +316,7 @@ fn mode_intersection_is_independent_of_builder_order() {
     }
     assert!(enabled(&mode_first, "fs.read"));
     assert!(!enabled(&mode_first, "fs.write"));
+    Ok(())
 }
 
 #[test]
@@ -363,9 +379,9 @@ fn a_base_set_through_with_activation_survives_a_mode_switch() {
 }
 
 #[test]
-fn narrow_base_activation_is_monotone_and_outlives_every_mode() {
+fn narrow_base_activation_is_monotone_and_outlives_every_mode() -> TestResult {
     // A1: die Decke landet in der Basis, nicht im abgeleiteten Wert.
-    let executable = executable_agent_ir(&["fs.read", "fs.write", "shell.exec"], &[]);
+    let executable = executable_agent_ir(&["fs.read", "fs.write", "shell.exec"], &[])?;
     let mut session = plain_session().with_executable_agent_ir(&executable);
     assert!(enabled(&session, "shell.exec"));
 
@@ -388,4 +404,5 @@ fn narrow_base_activation_is_monotone_and_outlives_every_mode() {
     assert!(!enabled(&session, "shell.exec"));
     assert!(!enabled(&session, "fs.write"));
     assert!(enabled(&session, "fs.read"));
+    Ok(())
 }

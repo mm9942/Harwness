@@ -10,6 +10,16 @@
 //! (`--sentinel-socket`, Pflicht). Diese Datei parst nur — sie kennt weder
 //! `ReadScope` noch `FsMonSensor`.
 //!
+//! # Unterbefehl `completions`
+//! Optional: `harw-probe-fs completions [SHELL] [--install|--uninstall]`
+//! (`harw_completions::CompletionsSubcommand`). `subcommand_negates_reqs`
+//! hebt die Pflichtangaben für diesen Pfad auf. Deshalb ist
+//! [`Cli::sentinel_socket`] ein `Option<PathBuf>` mit `required = true`:
+//! ein nacktes `PathBuf` würde im abgeleiteten `FromArgMatches` auch beim
+//! Unterbefehl einen `MissingRequiredArgument`-Fehler auslösen. Ohne
+//! Unterbefehl erzwingt `clap` die Angabe weiterhin; `main` prüft sie
+//! zusätzlich defensiv.
+//!
 //! # `--log`: ein ungültiger Wert ist ein Fehler
 //! Wie `harw-sentinel` (und anders als `harw-cli`, dessen `--log` ein
 //! unvalidierter `String` ist, der bei einem ungültigen Wert **still** auf
@@ -108,7 +118,8 @@ impl LogLevel {
     name = "harw-probe-fs",
     bin_name = "harw-probe-fs",
     version,
-    about = "fanotify-Sonde, Push-Only: sammelt Dateisystem-Ereignisse und sendet sie an den Sentinel."
+    about = "fanotify-Sonde, Push-Only: sammelt Dateisystem-Ereignisse und sendet sie an den Sentinel.",
+    subcommand_negates_reqs = true
 )]
 pub struct Cli {
     /// Log-Stufe für `tracing`. Siehe [`LogLevel`] für die Begründung, warum
@@ -135,16 +146,23 @@ pub struct Cli {
 
     /// Pfad des `SOCK_SEQPACKET`-Unix-Sockets, über den der Sentinel hört.
     /// Pflicht — es gibt keinen betriebsfähigen Vorgabewert, der nicht von
-    /// einer laufenden Sentinel-Instanz abhinge.
-    #[arg(long, value_name = "PATH")]
-    pub sentinel_socket: PathBuf,
+    /// einer laufenden Sentinel-Instanz abhinge. `Option` nur wegen des
+    /// `completions`-Unterbefehls (siehe Moduldoku); ohne Unterbefehl ist
+    /// der Wert immer gesetzt.
+    #[arg(long, value_name = "PATH", required = true)]
+    pub sentinel_socket: Option<PathBuf>,
+
+    /// Optional subcommand; without it the binary runs normally.
+    #[command(subcommand)]
+    pub command: Option<harw_completions::CompletionsSubcommand>,
 }
 
 #[cfg(test)]
 mod tests {
     use clap::Parser as _;
 
-    use super::{Cli, LogLevel, DEFAULT_PROC_ROOT, DEFAULT_SENSOR_ID};
+    use super::{Cli, DEFAULT_PROC_ROOT, DEFAULT_SENSOR_ID, LogLevel};
+    use crate::test_support::{TestResult, ctx};
 
     fn minimal_args() -> Vec<&'static str> {
         vec![
@@ -157,21 +175,23 @@ mod tests {
     }
 
     #[test]
-    fn test_log_defaults_to_info_when_omitted() {
-        let cli = Cli::try_parse_from(minimal_args()).expect("minimal valid arguments");
+    fn test_log_defaults_to_info_when_omitted() -> TestResult {
+        let cli = Cli::try_parse_from(minimal_args()).map_err(ctx("minimal valid arguments"))?;
         assert_eq!(cli.log, LogLevel::Info);
+        Ok(())
     }
 
     #[test]
-    fn test_log_accepts_every_documented_value() {
+    fn test_log_accepts_every_documented_value() -> TestResult {
         for value in ["trace", "debug", "info", "warn", "error"] {
             let mut args = minimal_args();
             args.push("--log");
             args.push(value);
             let cli = Cli::try_parse_from(args)
-                .unwrap_or_else(|err| panic!("expected {value} to parse, got {err}"));
+                .map_err(ctx("erwartete, dass der Wert erfolgreich geparst wird"))?;
             assert_eq!(cli.log.as_filter_directive(), value);
         }
+        Ok(())
     }
 
     #[test]
@@ -199,11 +219,14 @@ mod tests {
     #[test]
     fn test_sentinel_socket_is_required() {
         let result = Cli::try_parse_from(["harw-probe-fs", "--scope-root", "/srv/data"]);
-        assert!(result.is_err(), "missing --sentinel-socket must be rejected");
+        assert!(
+            result.is_err(),
+            "missing --sentinel-socket must be rejected"
+        );
     }
 
     #[test]
-    fn test_scope_root_collects_multiple_occurrences() {
+    fn test_scope_root_collects_multiple_occurrences() -> TestResult {
         let cli = Cli::try_parse_from([
             "harw-probe-fs",
             "--scope-root",
@@ -213,17 +236,22 @@ mod tests {
             "--sentinel-socket",
             "/run/harw-sentinel.sock",
         ])
-        .expect("two scope roots");
+        .map_err(ctx("two scope roots"))?;
         assert_eq!(
             cli.scope_roots,
-            vec![std::path::PathBuf::from("/srv/data"), std::path::PathBuf::from("/srv/other")]
+            vec![
+                std::path::PathBuf::from("/srv/data"),
+                std::path::PathBuf::from("/srv/other")
+            ]
         );
+        Ok(())
     }
 
     #[test]
-    fn test_proc_root_and_sensor_id_use_documented_defaults() {
-        let cli = Cli::try_parse_from(minimal_args()).expect("minimal valid arguments");
+    fn test_proc_root_and_sensor_id_use_documented_defaults() -> TestResult {
+        let cli = Cli::try_parse_from(minimal_args()).map_err(ctx("minimal valid arguments"))?;
         assert_eq!(cli.proc_root, std::path::PathBuf::from(DEFAULT_PROC_ROOT));
         assert_eq!(cli.sensor_id, DEFAULT_SENSOR_ID);
+        Ok(())
     }
 }

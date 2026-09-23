@@ -252,17 +252,29 @@ pub fn topological_waves(plan: &Plan) -> PlanResult<Vec<Vec<TaskId>>> {
             .collect();
 
         if level.is_empty() {
-            let Some(stuck) = active
+            let stuck = active
                 .iter()
                 .copied()
                 .find(|node| !scheduled.contains(&node.id))
-            else {
-                // Unerreichbar: `while scheduled.len() < active.len()` garantiert,
-                // dass mindestens ein Knoten noch nicht eingeplant ist.
-                unreachable!(
-                    "Schleifeninvariante verletzt: scheduled.len() < active.len() \
-                     erfordert einen verbleibenden Knoten"
-                );
+                // Verteidigungsfall: `while scheduled.len() < active.len()`
+                // garantiert an dieser Stelle bereits, dass `active`
+                // mindestens einen noch nicht eingeplanten Knoten enthält —
+                // `find` müsste also nie `None` liefern. Statt das per
+                // `unreachable!` zu erzwingen (Bible R089/R101), fällt dieser
+                // Zweig auf den ersten aktiven Knoten zurück; bei korrekt
+                // funktionierender Schleifenzählung wird er nie ausgewertet.
+                .or_else(|| active.first().copied());
+
+            let Some(stuck) = stuck else {
+                // Zweite Verteidigungsebene: `active` wäre hier vollständig
+                // leer, obwohl `scheduled.len() < active.len()` bereits
+                // `active.len() >= 1` erzwingt. Panikfreier Ersatz über die
+                // vorhandene Zyklus-Variante statt `unreachable!`; auch
+                // dieser Zweig ist bei korrekter Zählung unerreichbar.
+                return Err(PlanError::CycleDetected {
+                    child: TaskId::new("<schleifeninvariante-verletzt>"),
+                    parent: TaskId::new("<schleifeninvariante-verletzt>"),
+                });
             };
 
             let blocking_dependency = stuck
@@ -369,11 +381,7 @@ pub fn partition_write_sets(nodes: &[&PlanNode]) -> Vec<Vec<TaskId>> {
 ///
 /// # Concurrency
 /// Rein funktional, keine Seiteneffekte, keine Systemzeit-Zugriffe.
-pub fn missing_explorations(
-    plan: &Plan,
-    cfg: &PlanToolConfig,
-    now: OffsetDateTime,
-) -> Vec<TaskId> {
+pub fn missing_explorations(plan: &Plan, cfg: &PlanToolConfig, now: OffsetDateTime) -> Vec<TaskId> {
     plan.nodes
         .iter()
         .filter(|node| EXPLORATION_PENDING_STATUSES.contains(&node.status))
@@ -467,6 +475,7 @@ pub fn children_of<'a>(plan: &'a Plan, id: &TaskId) -> Vec<&'a PlanNode> {
 mod tests {
     use super::*;
     use crate::ids::{PathOrSymbol, PlanId, RevisionId};
+    use crate::test_support::TestResult;
 
     fn make_plan(nodes: Vec<PlanNode>) -> Plan {
         Plan {
@@ -546,7 +555,7 @@ mod tests {
     // ── (a) Kette a→b→c ergibt 3 Wellen ──────────────────────────────────────
 
     #[test]
-    fn test_topological_waves_chain_yields_three_waves() {
+    fn test_topological_waves_chain_yields_three_waves() -> TestResult {
         let a = make_node("a", PlanNodeStatus::Draft, PlanNodeKind::Coding);
         let mut b = make_node("b", PlanNodeStatus::Draft, PlanNodeKind::Coding);
         b.dependencies = vec![TaskId::new("a")];
@@ -554,23 +563,24 @@ mod tests {
         c.dependencies = vec![TaskId::new("b")];
 
         let plan = make_plan(vec![a, b, c]);
-        let waves = topological_waves(&plan).expect("Kette darf keinen Zyklus enthalten");
+        let waves = topological_waves(&plan)?;
 
         assert_eq!(waves.len(), 3, "Kette a→b→c muss genau 3 Wellen ergeben");
         assert_eq!(waves[0], vec![TaskId::new("a")]);
         assert_eq!(waves[1], vec![TaskId::new("b")]);
         assert_eq!(waves[2], vec![TaskId::new("c")]);
+        Ok(())
     }
 
     // ── (b) zwei unabhängige Knoten mit disjunktem write_scope ──────────────
 
     #[test]
-    fn test_topological_waves_independent_disjoint_scopes_single_batch() {
+    fn test_topological_waves_independent_disjoint_scopes_single_batch() -> TestResult {
         let a = make_node("a", PlanNodeStatus::Draft, PlanNodeKind::Coding);
         let b = make_node("b", PlanNodeStatus::Draft, PlanNodeKind::Coding);
         let plan = make_plan(vec![a, b]);
 
-        let waves = topological_waves(&plan).expect("keine Abhängigkeiten, kein Zyklus");
+        let waves = topological_waves(&plan)?;
 
         assert_eq!(
             waves.len(),
@@ -578,19 +588,20 @@ mod tests {
             "disjunkte write_scopes müssen in einer Welle mit einem Batch landen"
         );
         assert_eq!(waves[0].len(), 2);
+        Ok(())
     }
 
     // ── (c) zwei unabhängige Knoten mit kollidierendem write_scope ──────────
 
     #[test]
-    fn test_topological_waves_independent_colliding_scopes_two_batches() {
+    fn test_topological_waves_independent_colliding_scopes_two_batches() -> TestResult {
         let mut a = make_node("a", PlanNodeStatus::Draft, PlanNodeKind::Coding);
         a.write_scope = vec![PathOrSymbol::new("src/shared.rs")];
         let mut b = make_node("b", PlanNodeStatus::Draft, PlanNodeKind::Coding);
         b.write_scope = vec![PathOrSymbol::new("src/shared.rs")];
         let plan = make_plan(vec![a, b]);
 
-        let waves = topological_waves(&plan).expect("keine Abhängigkeiten, kein Zyklus");
+        let waves = topological_waves(&plan)?;
 
         assert_eq!(
             waves.len(),
@@ -599,6 +610,7 @@ mod tests {
         );
         assert_eq!(waves[0].len(), 1);
         assert_eq!(waves[1].len(), 1);
+        Ok(())
     }
 
     // ── (d) Zyklus → Err ─────────────────────────────────────────────────────
@@ -653,7 +665,11 @@ mod tests {
 
     #[test]
     fn test_missing_explorations_ignores_node_with_completed_explore_dependency() {
-        let explore = make_node("explore-1", PlanNodeStatus::Completed, PlanNodeKind::Explore);
+        let explore = make_node(
+            "explore-1",
+            PlanNodeStatus::Completed,
+            PlanNodeKind::Explore,
+        );
         let mut coding_node = make_node("impl-1", PlanNodeStatus::Draft, PlanNodeKind::Coding);
         coding_node.dependencies = vec![TaskId::new("explore-1")];
         let plan = make_plan(vec![explore, coding_node]);
@@ -793,6 +809,9 @@ mod tests {
 
         let missing = missing_explorations(&plan, &exploration_cfg(), OffsetDateTime::UNIX_EPOCH);
 
-        assert!(missing.is_empty(), "F-130: Research deckt wie in validate ab");
+        assert!(
+            missing.is_empty(),
+            "F-130: Research deckt wie in validate ab"
+        );
     }
 }

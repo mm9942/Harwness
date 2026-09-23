@@ -130,13 +130,15 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::Poll;
+use std::time::{Duration, Instant};
 
-use harw_core::StateStore;
+use harw_authority::{Permission, PermissionRequest, PermissionSet, SandboxSpec};
+use harw_core::cancel::CancelToken;
 use harw_core::child_controller::{
     AgentBudget, ChildRegistryFactory, ChildRunResult, JoinSemantics, ManagedAgentSpawner,
 };
 use harw_core::turn_loop::{TurnInput, TurnOutcome};
-use harw_authority::{Permission, PermissionRequest, PermissionSet, SandboxSpec};
+use harw_core::{ModelMessage, StateStore};
 use harw_types::{ReasoningEffort, SessionId};
 use serde_json::{Value, json};
 
@@ -408,8 +410,12 @@ impl AgentToolAdapter {
     /// - [`OpError::NotAvailable`]: Die Effort-Klammerung des Kindes schlug fehl.
     /// - [`OpError::NotAvailable`]: Die `Surface::AgentTool`-Deklaration trägt ein
     ///   ungültiges `budget_hint`.
-    /// - [`OpError::NotAvailable`]: `spawn_child` oder `run_child_with_budget`
-    ///   schlug fehl (Meldung nennt Kind, Rolle und Pause-Sperre).
+    /// - [`OpError::NotAvailable`]: `spawn_child_or_wait` oder
+    ///   `run_child_with_budget` schlug fehl (Meldung nennt Kind, Rolle und
+    ///   Pause-Sperre). Ein voller Admission-Slot ist dabei **kein**
+    ///   Sofortfehler: `spawn_child_or_wait` wartet bis zu
+    ///   [`CHILD_SLOT_MAX_WAIT`] auf einen frei werdenden Slot, bevor es den
+    ///   Kapazitätsfehler zurückgibt.
     /// - [`OpError::NotAvailable`]: Das Kind pausierte, obwohl sein Lebenszyklus
     ///   das Pausieren verbietet.
     /// - [`OpError::NotAvailable`]: Die Abschlussantwort des Kindes ist nicht
@@ -424,8 +430,8 @@ impl AgentToolAdapter {
     /// # Concurrency
     /// `async fn`, `Send`-fähig. Mehrere gleichzeitige `invoke`-Aufrufe auf demselben
     /// Adapter sind sicher, da kein gemeinsamer veränderlicher Zustand verwendet wird.
-    /// `spawn_child` und `run_child_with_budget` sind selbst nebenläufigkeitssicher
-    /// (siehe `ManagedAgentSpawner`-Dokumentation).
+    /// `spawn_child_or_wait` und `run_child_with_budget` sind selbst
+    /// nebenläufigkeitssicher (siehe `ManagedAgentSpawner`-Dokumentation).
     ///
     /// # Examples
     /// ```rust,no_run
@@ -503,15 +509,39 @@ impl AgentToolAdapter {
                 ceiling: None,
             };
 
-            let child = harw_extension_api::AgentSpawner::spawn_child(
-                spawner.as_ref(),
-                self.child_name,
-                spawn_input,
-                child_sandbox,
-                None,
-            )
-            .await
-            .map_err(|e| OpError::NotAvailable(format!("Agent-Spawn fehlgeschlagen: {e}")))?;
+            // Der Cancel-Token des laufenden Turns, falls die Laufzeit einen
+            // gesetzt hat (`install_operation_model_tools` in
+            // `harw-runtime::assembly`, aus `ToolExecutionContext::cancel`).
+            // Ohne registrierten Turn (z. B. ein One-Shot-Pfad ohne
+            // `TurnControl` oder ein Test-Fixture) fällt das Warten auf einen
+            // frischen, nie abgebrochenen Token zurück und bleibt allein
+            // durch `CHILD_SLOT_MAX_WAIT` begrenzt.
+            let spawn_cancel = ctx.cancel_token().cloned().unwrap_or_else(CancelToken::new);
+            let wait_started = Instant::now();
+            let child_guard = spawner
+                .spawn_child_or_wait(
+                    self.child_name,
+                    spawn_input,
+                    child_sandbox,
+                    None,
+                    CHILD_SLOT_MAX_WAIT,
+                    &spawn_cancel,
+                )
+                .await
+                .map_err(|e| OpError::NotAvailable(format!("Agent-Spawn fehlgeschlagen: {e}")))?;
+            let waited = wait_started.elapsed();
+            if waited > Duration::from_millis(50) {
+                tracing::debug!(
+                    child = %child_guard.child(),
+                    waited_ms = waited.as_millis() as u64,
+                    "AgentToolAdapter: Spawn wartete auf freien Admission-Slot"
+                );
+            }
+            // `keep()` entschärft den frisch erhaltenen `ChildGuard`, ohne das
+            // Kind freizugeben: die Freigabepflicht geht unten unverändert an
+            // `ChildSlotGuard` über (identische Freigabe-Semantik wie vor
+            // W2d: `child_finished`, nicht `release_child`).
+            let child = child_guard.keep();
             // K1/G-016: ab hier gibt jeder Ausgang (auch `?` und ein verworfener
             // Future) den Admission-Slot frei; nur eine zulässige Pause hält ihn.
             let slot = ChildSlotGuard::new(spawner.as_ref(), child.clone());
@@ -770,9 +800,9 @@ impl AgentProductAdapter {
                 set_requested,
             } => {
                 ensure_owned_child_target(ctx, spawner.as_ref(), &target)?;
-                let budget = spawner.child_budget(&target).ok_or_else(|| {
-                    OpError::NotAvailable(CHILD_TARGET_UNAVAILABLE.to_owned())
-                })?;
+                let budget = spawner
+                    .child_budget(&target)
+                    .ok_or_else(|| OpError::NotAvailable(CHILD_TARGET_UNAVAILABLE.to_owned()))?;
                 let note = if set_requested {
                     "das angeforderte Setzen wurde NICHT angewendet: der Agent-Spawner stellt \
                      keine mutable Child-Budget-Transition bereit; das gemeldete Budget ist der \
@@ -933,9 +963,7 @@ fn ensure_owned_child_target(
     spawner: &ManagedAgentSpawner,
     target: &SessionId,
 ) -> Result<(), OpError> {
-    let owned = spawner
-        .child_record(target)
-        .is_some_and(|record| record.parent == ctx.session_id().clone());
+    let owned = spawner.owns_descendant(ctx.session_id(), target);
     if owned {
         Ok(())
     } else {
@@ -1049,7 +1077,10 @@ pub fn parse_budget_hint(hint: &str) -> Result<AgentBudget, OpError> {
 
         if let Some(level) = segment.strip_prefix("effort=") {
             let parsed = level.parse::<ReasoningEffort>().map_err(|error| {
-                invalid_hint(hint, &format!("unbekanntes Effort-Level '{level}': {error}"))
+                invalid_hint(
+                    hint,
+                    &format!("unbekanntes Effort-Level '{level}': {error}"),
+                )
             })?;
             set_budget_dimension(&mut budget.reasoning_effort, parsed, hint, "effort")?;
         } else if let Some(number) = strip_budget_unit(segment, "tokens") {
@@ -1183,12 +1214,8 @@ fn parse_scaled_count(text: &str, hint: &str, unit: &str) -> Result<u64, OpError
         },
     };
     let base = parse_plain_count(digits, hint, unit)?;
-    base.checked_mul(scale).ok_or_else(|| {
-        invalid_hint(
-            hint,
-            &format!("`{unit}` überläuft den 64-Bit-Wertebereich"),
-        )
-    })
+    base.checked_mul(scale)
+        .ok_or_else(|| invalid_hint(hint, &format!("`{unit}` überläuft den 64-Bit-Wertebereich")))
 }
 
 /// Baut die einheitliche Fehlermeldung für ein ungültiges Budget-Label.
@@ -1856,15 +1883,26 @@ const QUESTION_ID_EXCERPT_CHARS: usize = 64;
 /// Ablauf (W4a/A-BRIDGE, K1/K2):
 /// 1. Sandbox einmal monoton reduzieren ([`resolve_authority_reducer`]).
 /// 2. Ein rollierender Pool mit höchstens `max_parallel` Plätzen. Ein Platz
-///    durchläuft **lazy** und vollständig: `spawn_child` → Budget mit dem
+///    durchläuft **lazy** und vollständig: `spawn_child_or_wait` (wartet bis
+///    zu [`CHILD_SLOT_MAX_WAIT`] auf einen freien Admission-Slot, statt bei
+///    voller Kapazität sofort zu scheitern) → Budget mit dem
 ///    IR-Budget verschneiden ([`tighten_budget`]) → Effort klammern (ohne
 ///    Override, fail-closed) → `run_child_with_budget` → Auswertung über
 ///    denselben Contract-Pfad wie [`AgentToolAdapter::invoke`]
-///    ([`evaluate_child_return`], plus `question_id`-Bindung) → Slot-Freigabe.
-///    Erst danach wird die nächste Frage admittiert. Damit sind nie mehr als
+///    ([`evaluate_child_return`], plus bei `ResearchFinding` die
+///    Belegungsprüfung und `question_id`-Bindung) → Slot-Freigabe. Erst
+///    danach wird die nächste Frage admittiert. Damit sind nie mehr als
 ///    `max_parallel` Kinder dieser Welle gleichzeitig admittiert — vorher wurden
 ///    alle Kinder vorab admittiert, und ab dem neunten scheiterte die Welle am
 ///    Admission-Limit, unabhängig von `max_parallel` (G-016).
+///
+///    Verletzt der Abschlusstext eines Kindes den Contract oder — bei
+///    `ResearchFinding` — den Belegungs-Vertrag (ein behaupteter lokaler
+///    Beleg ohne einen einzigen ausgeführten Werkzeugaufruf), bekommt **genau
+///    dieses eine Kind einen Reparatur-Turn** auf derselben Session, bevor
+///    seine Position endgültig als `Err` gilt (siehe [`evaluate_with_repair`]).
+///    Das zählt nicht gegen `max_parallel`: der Platz bleibt belegt, es wird
+///    keine neue Frage admittiert.
 /// 3. [`JoinSemantics::AnyTerminal`]: das erste verwertbare Ergebnis gewinnt;
 ///    laufende Geschwister werden kooperativ abgebrochen, noch nicht gestartete
 ///    gar nicht erst admittiert. `AllTerminal` und `Collect` warten auf alle.
@@ -2027,7 +2065,12 @@ pub async fn fanout_children(
     let mut winner_decided = false;
     // Ein Event statt eines betretenen Spans: `span::Entered` ist `!Send` und
     // würde über die `await`s gehalten den ganzen Future `!Send` machen.
-    tracing::info!(role, children = total, max_parallel = slots, "agent_fanout.start");
+    tracing::info!(
+        role,
+        children = total,
+        max_parallel = slots,
+        "agent_fanout.start"
+    );
 
     loop {
         while running.len() < slots {
@@ -2040,7 +2083,12 @@ pub async fn fanout_children(
             }
             running.push((
                 position,
-                Box::pin(run_fanout_slot(&shared, position, question, &admitted[position])),
+                Box::pin(run_fanout_slot(
+                    &shared,
+                    position,
+                    question,
+                    &admitted[position],
+                )),
             ));
         }
         if running.is_empty() {
@@ -2137,18 +2185,45 @@ async fn run_fanout_slot(
         // already enforces, unchanged (see `SpawnInput::ceiling`).
         ceiling: None,
     };
-    let child = harw_extension_api::AgentSpawner::spawn_child(
-        shared.spawner,
-        shared.role,
-        spawn_input,
-        shared.child_sandbox.clone(),
-        None,
-    )
-    .await
-    .map_err(|error| {
-        tracing::warn!(role = shared.role, position, error = %error, "agent_fanout.spawn_failed");
-        format!("Agent-Spawn fehlgeschlagen: {error}")
-    })?;
+    // Der Cancel-Token des laufenden Turns, falls die Laufzeit einen gesetzt
+    // hat (`install_operation_model_tools` in `harw-runtime::assembly`, aus
+    // `ToolExecutionContext::cancel`). Ohne registrierten Turn fällt das
+    // Warten auf einen frischen, nie abgebrochenen Token zurück und bleibt
+    // allein durch `CHILD_SLOT_MAX_WAIT` begrenzt.
+    let spawn_cancel = shared
+        .ctx
+        .cancel_token()
+        .cloned()
+        .unwrap_or_else(CancelToken::new);
+    let wait_started = Instant::now();
+    let child_guard = shared
+        .spawner
+        .spawn_child_or_wait(
+            shared.role,
+            spawn_input,
+            shared.child_sandbox.clone(),
+            None,
+            CHILD_SLOT_MAX_WAIT,
+            &spawn_cancel,
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(role = shared.role, position, error = %error, "agent_fanout.spawn_failed");
+            format!("Agent-Spawn fehlgeschlagen: {error}")
+        })?;
+    let waited = wait_started.elapsed();
+    if waited > Duration::from_millis(50) {
+        tracing::debug!(
+            child = %child_guard.child(),
+            position,
+            waited_ms = waited.as_millis() as u64,
+            "agent_fanout.spawn_waited_for_slot"
+        );
+    }
+    // `keep()` entschärft den frisch erhaltenen `ChildGuard`, ohne das Kind
+    // freizugeben: die Freigabepflicht geht unten unverändert an
+    // `ChildSlotGuard` über (identische Freigabe-Semantik wie vor W2d).
+    let child = child_guard.keep();
     let slot = ChildSlotGuard::new(shared.spawner, child.clone());
     if admitted.set(child.clone()).is_err() {
         // Unerreichbar (eine Position wird genau einmal gestartet); ohne ID
@@ -2188,7 +2263,16 @@ async fn run_fanout_slot(
         return Err(CANCELLED_BY_SIBLING.to_owned());
     }
 
-    match fanout_child_value(shared.spawner, shared.contract, &run, question)? {
+    match fanout_child_value(
+        shared.spawner,
+        shared.store,
+        effective,
+        shared.contract,
+        &run,
+        question,
+    )
+    .await?
+    {
         FanoutValue::Final(value) => Ok(value),
         FanoutValue::Paused(report) => {
             slot.keep_admitted();
@@ -2214,8 +2298,19 @@ enum FanoutValue {
 /// `Refused`/`Failed`) ist ebenfalls sofort ein `Err` — dort gibt es nichts
 /// fortzusetzen. Beim Contract `ResearchFinding` wird das Finding zusätzlich
 /// an die gestellte Frage gebunden ([`bind_finding_to_question`]).
-fn fanout_child_value(
+///
+/// # Reparatur-Turn
+/// Verletzt der Abschlusstext den Contract oder — bei `ResearchFinding` —
+/// den Belegungs-Vertrag ([`evaluate_return_with_grounding`]), wird über
+/// [`evaluate_with_repair`] **ein** Reparatur-Turn an dieselbe Kind-Session
+/// gesendet, bevor endgültig aufgegeben wird (siehe dort). Die Bindung an
+/// die gestellte Frage ([`bind_finding_to_question`]) ist davon
+/// ausgenommen: eine falsch zugeordnete `question_id` ist kein Formatfehler,
+/// den ein Reparatur-Turn beheben könnte, sondern ein Zuordnungsfehler.
+async fn fanout_child_value(
     spawner: &ManagedAgentSpawner,
+    store: &dyn StateStore,
+    budget: AgentBudget,
     contract: ChildReturnContract,
     result: &ChildRunResult,
     question: &Value,
@@ -2284,11 +2379,258 @@ fn fanout_child_value(
                 result.child
             )
         })?;
-    let value = evaluate_child_return(contract, &text).map_err(|violation| violation.to_message())?;
+    let value =
+        evaluate_with_repair(spawner, store, contract, &result.child, budget, &text).await?;
     if contract == ChildReturnContract::ResearchFinding {
         bind_finding_to_question(&value, question)?;
     }
     Ok(FanoutValue::Final(value))
+}
+
+// ── Contract-/Belegungsauswertung mit Ein-Versuch-Reparatur ─────────────────
+//
+// Ausgangsproblem (Auftrag "Explore-Kinder liefern kein valides
+// ResearchFinding"): read-only Fan-out-Kinder (u. a. Modell `glm-5.3`)
+// scheiterten am Contract auf vier Arten — Freitext statt JSON, Echo des
+// eingebetteten JSON-Schemas selbst, `{"answers":{}}`, und ein formal
+// valides, aber unbelegtes Finding (0 Werkzeugaufrufe, erfundene
+// Zeitstempel). Ein einzelner Vertragsbruch beendete den Kind-Lauf bislang
+// sofort mit einem `OpError` beim Parent — ohne jede Chance zur Selbstkorrektur.
+// Die folgenden Bausteine geben dem Kind **genau einen** Reparatur-Turn,
+// bevor endgültig aufgegeben wird.
+
+/// Belege-Arten, die einen tatsächlich ausgeführten Werkzeugaufruf
+/// voraussetzen — im Unterschied zu `official_docs`/`repository`/
+/// `release_notes`/`standard`/`web`, die ein Kind auch ohne lokale
+/// Werkzeuge (aus Trainingswissen oder mitgelieferten Web-Belegen) kennen
+/// darf.
+const GROUNDED_EVIDENCE_KINDS: [&str; 2] = ["local_source", "cargo_registry_source"];
+
+/// Ob ein kanonisches `ResearchFinding`-JSON mindestens einen Beleg einer
+/// [`GROUNDED_EVIDENCE_KINDS`]-Art führt.
+///
+/// # Arguments
+/// - `finding` (`&Value`): das kanonisch serialisierte, bereits
+///   contract-validierte Finding.
+///
+/// # Returns
+/// `true`, wenn `evidence` mindestens einen Eintrag mit `kind` aus
+/// [`GROUNDED_EVIDENCE_KINDS`] enthält; sonst `false` — insbesondere auch
+/// bei fehlendem oder leerem `evidence`-Feld.
+fn claims_local_evidence(finding: &Value) -> bool {
+    finding
+        .get("evidence")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| GROUNDED_EVIDENCE_KINDS.contains(&kind))
+            })
+        })
+}
+
+/// Zählt die von einem Kind über seine gesamte Session hinweg tatsächlich
+/// ausgeführten Werkzeugaufrufe.
+///
+/// # Description
+/// `ManagedAgentSpawner` führt intern denselben Zähler
+/// (`child_tool_call_count`, für die `max_tool_calls`-Budgetdurchsetzung),
+/// hält ihn aber privat — diese Crate hat nur über den ebenfalls von
+/// `run_child_with_budget` benutzten [`StateStore`] Zugriff auf die
+/// Kind-Historie. [`StateStore::load_history`] liefert dieselben
+/// `TurnItem`s, die `run_turn`/`run_turn_durable` während des Laufs
+/// persistiert haben; die Projektion auf [`ModelMessage::ToolCall`]
+/// (`ConversationHistory::to_model_messages`) zählt sie, ohne den
+/// `TurnItem`-Typ selbst zu benennen (diese Crate hängt nicht direkt von
+/// `harw-protocol` ab).
+///
+/// # Arguments
+/// - `store` (`&dyn StateStore`): derselbe Store, mit dem das Kind lief.
+/// - `child` (`&SessionId`): die zu zählende Kind-Session.
+///
+/// # Returns
+/// Anzahl der `ToolCall`-Einträge über die gesamte Historie des Kindes.
+///
+/// # Errors
+/// `Err(String)`, wenn der Store die Historie nicht laden kann.
+async fn count_child_tool_calls(
+    store: &dyn StateStore,
+    child: &SessionId,
+) -> Result<usize, String> {
+    let history = store.load_history(child).await.map_err(|error| {
+        format!("Werkzeugaufruf-Zählung für Kind '{child}' fehlgeschlagen: {error}")
+    })?;
+    Ok(history
+        .to_model_messages()
+        .iter()
+        .filter(|message| matches!(message, ModelMessage::ToolCall { .. }))
+        .count())
+}
+
+/// Wertet den Kind-Text gegen den Contract und — bei `ResearchFinding` —
+/// zusätzlich gegen den Belegungs-Vertrag aus.
+///
+/// # Description
+/// Ein Finding, das mindestens einen Beleg der Art [`GROUNDED_EVIDENCE_KINDS`]
+/// behauptet, aber aus einer Kind-Session stammt, die keinen einzigen
+/// Werkzeugaufruf ausgeführt hat, ist eine unbelegte Behauptung — der
+/// Beleg-Locator kann nicht tatsächlich gelesen worden sein. Das ist
+/// derselbe Vertragsbruch-Kanal wie ein Contract-Verstoß
+/// ([`ContractViolation`]), damit [`evaluate_with_repair`] beide Fälle
+/// identisch behandelt.
+///
+/// Kann die Werkzeugaufruf-Anzahl nicht ermittelt werden (Store-Fehler), ist
+/// das ein Store-/Werkzeugfehler dieses Adapters, keine Auskunft über das
+/// Kind — der Fall wird geloggt und **nicht** als Vertragsbruch gewertet
+/// (fail-open nur für diese eine, werkzeugseitige Fehlerquelle; die übrigen
+/// Prüfungen dieser Funktion bleiben fail-closed).
+///
+/// # Errors
+/// [`ContractViolation`] bei einem Contract- oder Belegungs-Verstoß.
+async fn evaluate_return_with_grounding(
+    store: &dyn StateStore,
+    contract: ChildReturnContract,
+    child: &SessionId,
+    text: &str,
+) -> Result<Value, ContractViolation> {
+    let value = evaluate_child_return(contract, text)?;
+    if contract != ChildReturnContract::ResearchFinding || !claims_local_evidence(&value) {
+        return Ok(value);
+    }
+    match count_child_tool_calls(store, child).await {
+        Ok(0) => Err(ContractViolation::new(
+            contract,
+            "Befund ohne Werkzeugaufruf — Belege nicht verifiziert (das Finding behauptet \
+             lokale Belege der Art local_source/cargo_registry_source, aber die Kind-Session \
+             hat keinen einzigen Werkzeugaufruf ausgeführt)"
+                .to_owned(),
+            text,
+        )),
+        Ok(_) => Ok(value),
+        Err(error) => {
+            tracing::warn!(
+                child = %child,
+                error = %error,
+                "agent_fanout.tool_call_count_unavailable: Belegungsprüfung übersprungen"
+            );
+            Ok(value)
+        }
+    }
+}
+
+/// Baut die Reparatur-Aufforderung an ein Kind, dessen letzte Antwort den
+/// Vertrag verletzt hat.
+///
+/// Nutzt die kurze `violation.message` statt [`ContractViolation::to_message`]
+/// — der Rohtext-Auszug, den `to_message` anhängt, ist hier redundant, das
+/// Kind kennt seine eigene letzte Antwort bereits über die fortgeführte
+/// Session-Historie.
+fn repair_prompt(violation: &ContractViolation) -> String {
+    format!(
+        "Deine Antwort verletzt den Vertrag: {}. Antworte jetzt ausschließlich mit dem \
+         geforderten JSON-Objekt (kein Schema, kein Tool-Call-Text).",
+        violation.message
+    )
+}
+
+/// Wertet den Abschlusstext eines Fan-out-Kindes gegen Contract und
+/// Belegungs-Vertrag aus; verletzt die erste Antwort einen der beiden, wird
+/// **genau ein** Reparatur-Turn an dieselbe Kind-Session gesendet und erneut
+/// gewertet, bevor endgültig aufgegeben wird.
+///
+/// # Description
+/// Der Reparatur-Turn läuft über [`ManagedAgentSpawner::run_child_with_budget`]
+/// auf **derselben** `child`-`SessionId` (nicht über einen neuen Spawn): die
+/// Kind-Session bleibt zwischen beiden Turns admittiert (der Admission-Slot
+/// wird erst nach dieser Auswertung freigegeben, siehe [`run_fanout_slot`]),
+/// ihre Historie — inklusive bereits ausgeführter Werkzeugaufrufe — bleibt
+/// erhalten und fließt in den zweiten `evaluate_return_with_grounding`-Versuch
+/// ein. `run_child_with_budget` erlaubt einen zweiten Turn auf einer bereits
+/// `Completed` markierten Session ausdrücklich (siehe
+/// `ManagedAgentSpawner::mark_running`); nur ein bereits abgebrochenes Kind
+/// (`ChildStatus::Cancelled`) lehnt einen weiteren Turn ab.
+///
+/// Der Reparatur-Turn zählt gegen dasselbe, bereits verschärfte `budget` wie
+/// der erste Turn (`max_tool_calls`/`max_tokens` rechnen kumulativ über die
+/// gesamte Kind-Session ab) — es gibt kein zusätzliches Budget für den
+/// Reparaturversuch.
+///
+/// # Arguments
+/// - `spawner` (`&ManagedAgentSpawner`): fährt den Reparatur-Turn.
+/// - `store` (`&dyn StateStore`): persistiert den Reparatur-Turn und liefert
+///   die Werkzeugaufruf-Zählung für die erneute Belegungsprüfung.
+/// - `contract` (`ChildReturnContract`): derselbe Contract wie beim ersten
+///   Versuch.
+/// - `child` (`&SessionId`): die fortzuführende Kind-Session.
+/// - `budget` (`AgentBudget`): das für dieses Kind bereits verschärfte
+///   Budget (siehe [`tighten_budget`]).
+/// - `text` (`&str`): der erste Abschlusstext des Kindes.
+///
+/// # Returns
+/// Das kanonisch serialisierte, validierte JSON — entweder aus dem ersten
+/// Versuch (kein Vertragsbruch) oder aus dem Reparatur-Turn.
+///
+/// # Errors
+/// `Err(String)`: die (ggf. um den Reparatur-Ausgang ergänzte)
+/// Vertragsbruch-Meldung. Scheitert auch der Reparatur-Versuch, trägt die
+/// Meldung den Hinweis „nach 1 Reparaturversuch".
+async fn evaluate_with_repair(
+    spawner: &ManagedAgentSpawner,
+    store: &dyn StateStore,
+    contract: ChildReturnContract,
+    child: &SessionId,
+    budget: AgentBudget,
+    text: &str,
+) -> Result<Value, String> {
+    let violation = match evaluate_return_with_grounding(store, contract, child, text).await {
+        Ok(value) => return Ok(value),
+        Err(violation) => violation,
+    };
+    tracing::warn!(
+        child = %child,
+        contract = contract.as_label(),
+        error = %violation.message,
+        "agent_fanout.contract_violation.repair_attempt"
+    );
+
+    let repair_run = spawner
+        .run_child_with_budget(
+            child,
+            store,
+            None,
+            TurnInput::user(repair_prompt(&violation)),
+            budget,
+        )
+        .await
+        .map_err(|error| {
+            format!(
+                "{} (nach 1 Reparaturversuch: Reparatur-Turn fehlgeschlagen: {error})",
+                violation.to_message()
+            )
+        })?;
+    if !matches!(repair_run.outcome, TurnOutcome::Completed) {
+        return Err(format!(
+            "{} (nach 1 Reparaturversuch: der Reparatur-Turn schloss nicht regulär ab, \
+             Outcome: {:?})",
+            violation.to_message(),
+            repair_run.outcome
+        ));
+    }
+    let repaired_text = spawner.child_final_assistant_text(child).map_err(|error| {
+        format!(
+            "{} (nach 1 Reparaturversuch: Abschlussantwort nicht verfügbar: {error})",
+            violation.to_message()
+        )
+    })?;
+    evaluate_return_with_grounding(store, contract, child, &repaired_text)
+        .await
+        .map_err(|second_violation| {
+            format!(
+                "{} (nach 1 Reparaturversuch)",
+                second_violation.to_message()
+            )
+        })
 }
 
 /// Liefert die `id` einer gestellten Frage.
@@ -2338,6 +2680,18 @@ fn bind_finding_to_question(finding: &Value, question: &Value) -> Result<(), Str
 }
 
 // ── Slot-Freigabe und Effort-Sperre ──────────────────────────────────────────
+
+/// Obergrenze, wie lange ein Spawn-Versuch auf einen freien Admission-Slot
+/// wartet, bevor er endgültig mit dem ursprünglichen Kapazitätsfehler
+/// fehlschlägt (siehe
+/// [`harw_core::child_controller::ManagedAgentSpawner::spawn_child_or_wait`]).
+///
+/// Ohne dieses Warten scheiterten parallele `explore`-/Fan-out-Aufrufe, die
+/// `max_active_children_per_parent` überschreiten, sofort statt sich
+/// einzureihen. Die Obergrenze ist bewusst endlich, damit ein hängendes
+/// Geschwister-Kind (das seinen Slot nie freigibt) den Parent nicht auf
+/// unbestimmte Zeit blockiert.
+const CHILD_SLOT_MAX_WAIT: Duration = Duration::from_secs(120);
 
 /// Hält den Admission-Slot eines Kindes und gibt ihn beim Drop frei (K1, G-016).
 ///
@@ -2406,24 +2760,32 @@ mod tests {
     use harw_agent_dsl::executable::{ExecutableAgentIr, lower};
     use harw_agent_dsl::parse::parse_toml;
     use harw_agent_dsl::resolved::{ResolutionTrace, ResolvedAgentDefinition};
-    use harw_catalog::AgentSuggestions;
-    use harw_core::child_controller::{AgentBudget, ChildRegistryFactory, ManagedAgentSpawner};
-    use harw_core::turn_loop::TurnOutcome;
-    use harw_core::{ChildLimits, InMemoryStateStore, ModelProvider, SessionManager, StateStore};
-    use harw_extension_api::{AgentSpawnError, ExtensionRegistry, SpawnInput};
     use harw_authority::{
         NetworkScope, Permission, PermissionSet, SandboxSpec, WorkspaceRegistration,
         WorkspaceRegistry,
     };
-    use harw_types::{ItemId, ReasoningEffort, SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
+    use harw_catalog::AgentSuggestions;
+    use harw_core::child_controller::{AgentBudget, ChildRegistryFactory, ManagedAgentSpawner};
+    use harw_core::turn_loop::TurnOutcome;
+    use harw_core::{
+        ChildLimits, ConversationHistory, InMemoryStateStore, ModelProvider, SessionManager,
+        StateStore,
+    };
+    use harw_extension_api::{AgentSpawnError, ExtensionRegistry, SpawnInput};
+    use harw_types::{
+        ItemId, ReasoningEffort, SessionId, TenantId, ToolCallId, TurnId, WorkspaceId,
+    };
 
     use super::{
-        AgentToolAdapter, ChildReturnContract, KNOWN_AUTHORITY_REDUCERS, PauseKind,
-        bind_finding_to_question, completed_child_output, contract_output, model_effort_field,
-        parse_budget_hint, paused_child_result, reducer_ceiling, resolve_authority_reducer,
-        resolve_child_contract, tighten_budget,
+        AgentToolAdapter, ChildReturnContract, ContractViolation, KNOWN_AUTHORITY_REDUCERS,
+        PauseKind, bind_finding_to_question, claims_local_evidence, completed_child_output,
+        contract_output, count_child_tool_calls, evaluate_return_with_grounding,
+        evaluate_with_repair, model_effort_field, parse_budget_hint, paused_child_result,
+        reducer_ceiling, repair_prompt, resolve_authority_reducer, resolve_child_contract,
+        tighten_budget,
     };
     use crate::context_ext::OpContextCoreExt;
+    use crate::test_support::{TestError, TestResult};
     use harw_operations::context::{OpContext, ServiceMap};
     use harw_operations::error::OpError;
     use harw_operations::operation::{
@@ -2437,12 +2799,12 @@ mod tests {
     ///
     /// Verwendet einen atomaren Zähler für Thread-sichere, eindeutige
     /// Verzeichnisnamen, sodass parallele Tests nicht kollidieren.
-    fn make_test_ctx() -> (OpContext, PathBuf) {
+    fn make_test_ctx() -> TestResult<(OpContext, PathBuf)> {
         make_test_ctx_with(ServiceMap::new())
     }
 
     /// Wie [`make_test_ctx`], aber mit vorbereiteter [`ServiceMap`].
-    fn make_test_ctx_with(services: ServiceMap) -> (OpContext, PathBuf) {
+    fn make_test_ctx_with(services: ServiceMap) -> TestResult<(OpContext, PathBuf)> {
         static CTX_COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = CTX_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = std::env::temp_dir().join(format!(
@@ -2450,7 +2812,9 @@ mod tests {
             std::process::id(),
             id
         ));
-        std::fs::create_dir_all(tmp.join("ws")).unwrap();
+        std::fs::create_dir_all(tmp.join("ws")).map_err(crate::test_support::ctx(
+            "Test-Workspace-Verzeichnis anlegen",
+        ))?;
         let registry = WorkspaceRegistry::build(
             &tmp,
             [WorkspaceRegistration {
@@ -2459,19 +2823,19 @@ mod tests {
                 root: PathBuf::from("ws"),
             }],
         )
-        .unwrap();
+        .map_err(crate::test_support::ctx("Test-Workspace-Registry aufbauen"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .unwrap();
+            .map_err(crate::test_support::ctx("Test-Workspace auflösen"))?;
         let sandbox = SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ReadWorkspace]),
         );
         let ctx = OpContext::new(SessionId::new(), TurnId::new(), sandbox, services);
-        (ctx, tmp)
+        Ok((ctx, tmp))
     }
 
     /// Baut eine `ServiceMap` mit echter Core-Laufzeit (Spawner ohne Rollen,
@@ -2487,7 +2851,11 @@ mod tests {
         ));
         let store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
         let mut services = ServiceMap::new();
-        <OpContext as OpContextCoreExt>::register_agent_tool_services(&mut services, spawner, store);
+        <OpContext as OpContextCoreExt>::register_agent_tool_services(
+            &mut services,
+            spawner,
+            store,
+        );
         (services, Box::new(event_rx))
     }
 
@@ -2528,7 +2896,7 @@ mod tests {
     }
 
     /// Lowert eine Test-Agent-IR mit dem angegebenen `[return]`-Abschnitt.
-    fn ir_with_contract(contract: &str) -> ExecutableAgentIr {
+    fn ir_with_contract(contract: &str) -> TestResult<ExecutableAgentIr> {
         let raw = parse_toml(&format!(
             r#"
 schema = "harwness.agent/v1"
@@ -2541,7 +2909,9 @@ specialization = "bridge-contract-test"
 contract = "{contract}"
 "#
         ))
-        .expect("Test-Agent-Definition muss parsen");
+        .map_err(crate::test_support::ctx(
+            "Test-Agent-Definition muss parsen",
+        ))?;
         let resolved = ResolvedAgentDefinition {
             id: raw.id,
             version: raw.version,
@@ -2554,7 +2924,9 @@ contract = "{contract}"
             config: raw.tables,
             reasoning_effort: raw.reasoning_effort.clone(),
         };
-        lower(&resolved).expect("Test-Agent-Definition muss lowern")
+        lower(&resolved).map_err(crate::test_support::ctx(
+            "Test-Agent-Definition muss lowern",
+        ))
     }
 
     // ── test-op fixtures ──────────────────────────────────────────────────────
@@ -2634,44 +3006,52 @@ contract = "{contract}"
     }
 
     #[test]
-    fn from_operation_extracts_agent_tool_metadata() {
-        let adapter = AgentToolAdapter::from_operation(Arc::new(AgentOp))
-            .expect("Op mit AgentTool-Surface muss Some liefern");
+    fn from_operation_extracts_agent_tool_metadata() -> TestResult {
+        let adapter = AgentToolAdapter::from_operation(Arc::new(AgentOp)).ok_or(
+            TestError::Missing("Op mit AgentTool-Surface muss Some liefern"),
+        )?;
         assert_eq!(adapter.child_name(), "researcher");
         assert_eq!(adapter.authority_reducer(), "reduce_ro");
         assert_eq!(adapter.budget_hint(), "8k");
+        Ok(())
     }
 
     #[test]
-    fn from_operation_operation_accessor_returns_correct_meta_name() {
-        let adapter = AgentToolAdapter::from_operation(Arc::new(AgentOp)).expect("Erwartet Some");
+    fn from_operation_operation_accessor_returns_correct_meta_name() -> TestResult {
+        let adapter = AgentToolAdapter::from_operation(Arc::new(AgentOp))
+            .ok_or(TestError::Missing("Erwartet Some"))?;
         assert_eq!(adapter.operation().meta().name, "spawn_x");
+        Ok(())
     }
 
     // ── Budget-Parser ─────────────────────────────────────────────────────────
 
     #[test]
-    fn test_parse_budget_hint_reads_every_unit() {
-        let budget =
-            parse_budget_hint("8k_tokens,20_tool_calls,30s").expect("vollständiges Label ist gültig");
+    fn test_parse_budget_hint_reads_every_unit() -> TestResult {
+        let budget = parse_budget_hint("8k_tokens,20_tool_calls,30s")
+            .map_err(crate::test_support::ctx("vollständiges Label ist gültig"))?;
         assert_eq!(budget.max_tokens, Some(8_000));
         assert_eq!(budget.max_tool_calls, Some(20));
         assert_eq!(budget.max_wall_time_ms, Some(30_000));
         assert_eq!(budget.reasoning_effort, None);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_budget_hint_reads_millis_effort_and_mega_scale() {
-        let budget = parse_budget_hint(" 500ms , effort=low , 1m_tokens ")
-            .expect("Whitespace und beliebige Reihenfolge sind erlaubt");
+    fn test_parse_budget_hint_reads_millis_effort_and_mega_scale() -> TestResult {
+        let budget = parse_budget_hint(" 500ms , effort=low , 1m_tokens ").map_err(
+            crate::test_support::ctx("Whitespace und beliebige Reihenfolge sind erlaubt"),
+        )?;
         assert_eq!(budget.max_wall_time_ms, Some(500));
         assert_eq!(budget.reasoning_effort, Some(ReasoningEffort::Low));
         assert_eq!(budget.max_tokens, Some(1_000_000));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_budget_hint_scales_only_tokens() {
-        let plain = parse_budget_hint("64000_tokens").expect("Zahl ohne Suffix ist gültig");
+    fn test_parse_budget_hint_scales_only_tokens() -> TestResult {
+        let plain = parse_budget_hint("64000_tokens")
+            .map_err(crate::test_support::ctx("Zahl ohne Suffix ist gültig"))?;
         assert_eq!(plain.max_tokens, Some(64_000));
 
         let scaled_tool_calls = parse_budget_hint("2k_tool_calls");
@@ -2679,6 +3059,7 @@ contract = "{contract}"
             matches!(scaled_tool_calls, Err(OpError::InvalidArguments(ref message)) if message.contains("tool_calls")),
             "der k/m-Multiplikator gilt nur für Tokens: {scaled_tool_calls:?}"
         );
+        Ok(())
     }
 
     #[test]
@@ -2737,25 +3118,27 @@ contract = "{contract}"
     }
 
     #[test]
-    fn test_parse_budget_hint_empty_and_unlimited_default_to_no_limit() {
+    fn test_parse_budget_hint_empty_and_unlimited_default_to_no_limit() -> TestResult {
         for hint in ["", "   ", "unlimited", "UNLIMITED"] {
-            let budget = parse_budget_hint(hint).expect("Label ohne Grenzen ist gültig");
+            let budget = parse_budget_hint(hint)
+                .map_err(crate::test_support::ctx("Label ohne Grenzen ist gültig"))?;
             assert_eq!(budget, AgentBudget::default(), "Label {hint:?}");
             assert!(budget.max_tokens.is_none());
             assert!(budget.max_tool_calls.is_none());
             assert!(budget.max_wall_time_ms.is_none());
             assert!(budget.reasoning_effort.is_none());
         }
+        Ok(())
     }
 
     // ── Budget-Verschärfung ───────────────────────────────────────────────────
 
     #[test]
-    fn test_tighten_budget_keeps_the_stricter_limit_per_dimension() {
+    fn test_tighten_budget_keeps_the_stricter_limit_per_dimension() -> TestResult {
         let declared = parse_budget_hint("8k_tokens,20_tool_calls,60s,effort=high")
-            .expect("gültiges Label");
-        let from_ir =
-            parse_budget_hint("2k_tokens,64_tool_calls,30s,effort=low").expect("gültiges Label");
+            .map_err(crate::test_support::ctx("gültiges Label"))?;
+        let from_ir = parse_budget_hint("2k_tokens,64_tool_calls,30s,effort=low")
+            .map_err(crate::test_support::ctx("gültiges Label"))?;
 
         let effective = tighten_budget(declared, from_ir);
         assert_eq!(effective.max_tokens, Some(2_000), "IR-Grenze ist strenger");
@@ -2766,11 +3149,13 @@ contract = "{contract}"
         );
         assert_eq!(effective.max_wall_time_ms, Some(30_000));
         assert_eq!(effective.reasoning_effort, Some(ReasoningEffort::Low));
+        Ok(())
     }
 
     #[test]
-    fn test_tighten_budget_lets_none_lose_against_any_limit() {
-        let limited = parse_budget_hint("4k_tokens").expect("gültiges Label");
+    fn test_tighten_budget_lets_none_lose_against_any_limit() -> TestResult {
+        let limited =
+            parse_budget_hint("4k_tokens").map_err(crate::test_support::ctx("gültiges Label"))?;
         let unlimited = AgentBudget::default();
 
         assert_eq!(
@@ -2788,12 +3173,15 @@ contract = "{contract}"
             AgentBudget::default(),
             "ohne jede Grenze bleibt das Budget offen"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_tighten_budget_is_idempotent() {
-        let budget = parse_budget_hint("1k_tokens,5_tool_calls,10s").expect("gültiges Label");
+    fn test_tighten_budget_is_idempotent() -> TestResult {
+        let budget = parse_budget_hint("1k_tokens,5_tool_calls,10s")
+            .map_err(crate::test_support::ctx("gültiges Label"))?;
         assert_eq!(tighten_budget(budget, budget), budget);
+        Ok(())
     }
 
     // ── Return-Contract ───────────────────────────────────────────────────────
@@ -2845,10 +3233,11 @@ contract = "{contract}"
     }
 
     #[test]
-    fn test_contract_output_returns_canonical_json_for_a_valid_finding() {
+    fn test_contract_output_returns_canonical_json_for_a_valid_finding() -> TestResult {
         let output = contract_output(ChildReturnContract::ResearchFinding, VALID_FINDING);
-        let value: serde_json::Value =
-            serde_json::from_str(&output.text).expect("die Ausgabe muss gültiges JSON sein");
+        let value: serde_json::Value = serde_json::from_str(&output.text).map_err(
+            crate::test_support::ctx("die Ausgabe muss gültiges JSON sein"),
+        )?;
 
         assert_eq!(value["question_id"], "q-1");
         assert_eq!(value["conclusion"], "jiff 0.2.32 is current");
@@ -2860,25 +3249,28 @@ contract = "{contract}"
             !output.text.contains('\n'),
             "die Ausgabe muss die kanonische Serialisierung sein, nicht der Rohtext"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_contract_output_accepts_a_fenced_finding() {
+    fn test_contract_output_accepts_a_fenced_finding() -> TestResult {
         let fenced = format!("```json\n{VALID_FINDING}\n```");
         let output = contract_output(ChildReturnContract::ResearchFinding, &fenced);
-        let value: serde_json::Value =
-            serde_json::from_str(&output.text).expect("die Ausgabe muss gültiges JSON sein");
+        let value: serde_json::Value = serde_json::from_str(&output.text).map_err(
+            crate::test_support::ctx("die Ausgabe muss gültiges JSON sein"),
+        )?;
         assert_eq!(value["produced_by"], "explorer-1");
+        Ok(())
     }
 
     #[test]
-    fn test_contract_output_reports_garbage_as_structured_error_output() {
+    fn test_contract_output_reports_garbage_as_structured_error_output() -> TestResult {
         let output = contract_output(
             ChildReturnContract::ResearchFinding,
             "Ich habe nachgesehen, jiff sieht aktuell aus.",
         );
-        let value: serde_json::Value =
-            serde_json::from_str(&output.text).expect("auch der Fehlerfall ist JSON");
+        let value: serde_json::Value = serde_json::from_str(&output.text)
+            .map_err(crate::test_support::ctx("auch der Fehlerfall ist JSON"))?;
 
         assert!(
             value["error"].as_str().is_some_and(|m| !m.is_empty()),
@@ -2889,35 +3281,39 @@ contract = "{contract}"
             "der Rohtext muss erhalten bleiben, damit das Parent nachsteuern kann"
         );
         assert_eq!(value["contract"], "harwness.return.research-finding@1");
+        Ok(())
     }
 
     #[test]
-    fn test_contract_output_reports_an_invalid_finding_as_structured_error_output() {
+    fn test_contract_output_reports_an_invalid_finding_as_structured_error_output() -> TestResult {
         // Syntaktisch gültiges JSON, das die Vertragsregel „ab Confidence
         // Medium sind Belege Pflicht" verletzt.
         let no_evidence = r#"{"question_id":"q-2","conclusion":"vermutlich aktuell",
             "evidence":[],"confidence":"high","produced_by":"explorer-2",
             "produced_at":"2026-08-27T00:00:00Z"}"#;
         let output = contract_output(ChildReturnContract::ResearchFinding, no_evidence);
-        let value: serde_json::Value =
-            serde_json::from_str(&output.text).expect("auch der Fehlerfall ist JSON");
+        let value: serde_json::Value = serde_json::from_str(&output.text)
+            .map_err(crate::test_support::ctx("auch der Fehlerfall ist JSON"))?;
         assert!(
             value["error"]
                 .as_str()
                 .is_some_and(|m| m.contains("Recherche-Vertrag")),
             "die Validierung muss vom Parsen unterscheidbar gemeldet werden: {value}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_contract_output_validates_a_return_envelope() {
+    fn test_contract_output_validates_a_return_envelope() -> TestResult {
         let envelope = r#"{"agent_id":"explorer-1","outcome":"success",
             "summary":"fertig","payload":{"k":1}}"#;
         let output = contract_output(ChildReturnContract::ReturnEnvelope, envelope);
-        let value: serde_json::Value =
-            serde_json::from_str(&output.text).expect("die Ausgabe muss gültiges JSON sein");
+        let value: serde_json::Value = serde_json::from_str(&output.text).map_err(
+            crate::test_support::ctx("die Ausgabe muss gültiges JSON sein"),
+        )?;
         assert_eq!(value["agent_id"], "explorer-1");
         assert_eq!(value["outcome"], "success");
+        Ok(())
     }
 
     #[test]
@@ -2943,43 +3339,46 @@ contract = "{contract}"
     }"#;
 
     #[test]
-    fn test_contract_output_validates_a_security_verdict() {
+    fn test_contract_output_validates_a_security_verdict() -> TestResult {
         let output = contract_output(ChildReturnContract::SecurityVerdict, VALID_VERDICT);
-        let value: serde_json::Value =
-            serde_json::from_str(&output.text).expect("die Ausgabe muss gültiges JSON sein");
+        let value: serde_json::Value = serde_json::from_str(&output.text).map_err(
+            crate::test_support::ctx("die Ausgabe muss gültiges JSON sein"),
+        )?;
         assert_eq!(value["classification"], "suspicious");
         assert_eq!(value["issued_by"], "security-triage-1");
         assert!(
             value.get("error").is_none(),
             "ein gültiges Verdikt darf keinen Fehler melden"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_contract_output_rejects_wrong_verdict_contract_version_without_content() {
+    fn test_contract_output_rejects_wrong_verdict_contract_version_without_content() -> TestResult {
         let v2 = VALID_VERDICT.replace(
             "harwness.security-verdict/v1",
             "harwness.security-verdict/v2",
         );
         let output = contract_output(ChildReturnContract::SecurityVerdict, &v2);
-        let value: serde_json::Value =
-            serde_json::from_str(&output.text).expect("auch der Fehlerfall ist JSON");
+        let value: serde_json::Value = serde_json::from_str(&output.text)
+            .map_err(crate::test_support::ctx("auch der Fehlerfall ist JSON"))?;
         assert!(
             value["error"].as_str().is_some_and(|m| !m.is_empty()),
             "der Vertragsbruch muss benannt werden: {value}"
         );
         assert_eq!(value["contract"], "harwness.security-verdict/v1");
+        Ok(())
     }
 
     #[test]
-    fn test_contract_output_reports_malformed_verdict_without_raw_text() {
+    fn test_contract_output_reports_malformed_verdict_without_raw_text() -> TestResult {
         // Der zentrale Unterschied zu den beiden anderen typisierten Armen:
         // kein `"raw"`-Feld und die eingebettete Fehlermeldung enthält den
         // Rohtext nicht — ein Verdikt sagt bei Ablehnung "dass", nicht "was".
         let attacker_text = "SECRET_PROCESS_NAME_do_not_log_me";
         let output = contract_output(ChildReturnContract::SecurityVerdict, attacker_text);
-        let value: serde_json::Value =
-            serde_json::from_str(&output.text).expect("auch der Fehlerfall ist JSON");
+        let value: serde_json::Value = serde_json::from_str(&output.text)
+            .map_err(crate::test_support::ctx("auch der Fehlerfall ist JSON"))?;
         assert!(
             value.get("raw").is_none(),
             "ein Verdict-Vertragsbruch darf keinen Rohtext-Auszug enthalten: {value}"
@@ -2989,10 +3388,11 @@ contract = "{contract}"
             "die Ablehnung darf den angreiferkontrollierten Rohtext nicht zitieren: {value}"
         );
         assert_eq!(value["contract"], "harwness.security-verdict/v1");
+        Ok(())
     }
 
     #[test]
-    fn test_contract_output_rejects_a_verdict_with_unknown_field() {
+    fn test_contract_output_rejects_a_verdict_with_unknown_field() -> TestResult {
         // `deny_unknown_fields` (K19): ein zusätzliches Feld macht das
         // Verdikt ungültig, statt es stillschweigend zu ignorieren.
         let with_extra = VALID_VERDICT.replace(
@@ -3000,9 +3400,10 @@ contract = "{contract}"
             "\"issued_by\": \"security-triage-1\", \"extra\": true,",
         );
         let output = contract_output(ChildReturnContract::SecurityVerdict, &with_extra);
-        let value: serde_json::Value =
-            serde_json::from_str(&output.text).expect("auch der Fehlerfall ist JSON");
+        let value: serde_json::Value = serde_json::from_str(&output.text)
+            .map_err(crate::test_support::ctx("auch der Fehlerfall ist JSON"))?;
         assert!(value["error"].as_str().is_some_and(|m| !m.is_empty()));
+        Ok(())
     }
 
     /// Kein Weg von einem validierten Verdikt zu einer autorisierten Aktion.
@@ -3018,10 +3419,11 @@ contract = "{contract}"
     /// hier keine Zielangaben, aus denen sich eine Aktion zusammensetzen
     /// ließe.
     #[test]
-    fn test_security_verdict_output_carries_no_action_target() {
+    fn test_security_verdict_output_carries_no_action_target() -> TestResult {
         let output = contract_output(ChildReturnContract::SecurityVerdict, VALID_VERDICT);
-        let value: serde_json::Value =
-            serde_json::from_str(&output.text).expect("die Ausgabe muss gültiges JSON sein");
+        let value: serde_json::Value = serde_json::from_str(&output.text).map_err(
+            crate::test_support::ctx("die Ausgabe muss gültiges JSON sein"),
+        )?;
         assert_eq!(value["suggested_response"], "escalate");
         for forbidden in ["cgroup", "pid", "process_id", "host", "action", "target"] {
             assert!(
@@ -3029,16 +3431,17 @@ contract = "{contract}"
                 "ein Verdikt darf kein Aktionsziel '{forbidden}' tragen: {value}"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_security_verdict_arm_does_not_disturb_the_three_existing_arms() {
+    fn test_security_verdict_arm_does_not_disturb_the_three_existing_arms() -> TestResult {
         // Additivitätsbeleg: dieselben drei bestehenden Zuordnungen liefern
         // nach Einführung des vierten Arms noch dieselben Ergebnisse.
         let finding_output = contract_output(ChildReturnContract::ResearchFinding, VALID_FINDING);
         assert!(
             serde_json::from_str::<serde_json::Value>(&finding_output.text)
-                .expect("json")
+                .map_err(crate::test_support::ctx("json"))?
                 .get("error")
                 .is_none()
         );
@@ -3048,18 +3451,19 @@ contract = "{contract}"
         let envelope_output = contract_output(ChildReturnContract::ReturnEnvelope, envelope);
         assert!(
             serde_json::from_str::<serde_json::Value>(&envelope_output.text)
-                .expect("json")
+                .map_err(crate::test_support::ctx("json"))?
                 .get("error")
                 .is_none()
         );
 
         let text_output = contract_output(ChildReturnContract::Text, "unverändert");
         assert_eq!(text_output.text, "unverändert");
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_child_contract_defaults_to_text_without_registry_factory() {
-        let (ctx, tmp) = make_test_ctx();
+    fn test_resolve_child_contract_defaults_to_text_without_registry_factory() -> TestResult {
+        let (ctx, tmp) = make_test_ctx()?;
         let contract = resolve_child_contract(&ctx, "researcher");
         std::fs::remove_dir_all(tmp).ok();
         assert_eq!(
@@ -3067,44 +3471,47 @@ contract = "{contract}"
             ChildReturnContract::Text,
             "ohne Registry-Factory gibt es keine IR und damit keine Vertragsbehauptung"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_child_contract_reads_the_agent_ir() {
+    fn test_resolve_child_contract_reads_the_agent_ir() -> TestResult {
         let factory: Arc<dyn ChildRegistryFactory> = Arc::new(IrRegistryFactory {
-            ir: ir_with_contract("harwness.return.research-finding@1"),
+            ir: ir_with_contract("harwness.return.research-finding@1")?,
         });
         let mut services = ServiceMap::new();
         services.insert(factory);
-        let (ctx, tmp) = make_test_ctx_with(services);
+        let (ctx, tmp) = make_test_ctx_with(services)?;
 
         let contract = resolve_child_contract(&ctx, "explorer");
         std::fs::remove_dir_all(tmp).ok();
         assert_eq!(contract, ChildReturnContract::ResearchFinding);
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_child_contract_reads_the_security_verdict_ir_label() {
+    fn test_resolve_child_contract_reads_the_security_verdict_ir_label() -> TestResult {
         let factory: Arc<dyn ChildRegistryFactory> = Arc::new(IrRegistryFactory {
-            ir: ir_with_contract(ChildReturnContract::SECURITY_VERDICT_ID),
+            ir: ir_with_contract(ChildReturnContract::SECURITY_VERDICT_ID)?,
         });
         let mut services = ServiceMap::new();
         services.insert(factory);
-        let (ctx, tmp) = make_test_ctx_with(services);
+        let (ctx, tmp) = make_test_ctx_with(services)?;
 
         let contract = resolve_child_contract(&ctx, "security-triage-1");
         std::fs::remove_dir_all(tmp).ok();
         assert_eq!(contract, ChildReturnContract::SecurityVerdict);
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_child_contract_falls_back_on_an_unknown_ir_label() {
+    fn test_resolve_child_contract_falls_back_on_an_unknown_ir_label() -> TestResult {
         let factory: Arc<dyn ChildRegistryFactory> = Arc::new(IrRegistryFactory {
-            ir: ir_with_contract("harwness.return.coding-task@1"),
+            ir: ir_with_contract("harwness.return.coding-task@1")?,
         });
         let mut services = ServiceMap::new();
         services.insert(factory);
-        let (ctx, tmp) = make_test_ctx_with(services);
+        let (ctx, tmp) = make_test_ctx_with(services)?;
 
         let contract = resolve_child_contract(&ctx, "coder");
         std::fs::remove_dir_all(tmp).ok();
@@ -3113,12 +3520,13 @@ contract = "{contract}"
             ChildReturnContract::Text,
             "ein nicht implementierter Contract darf nicht als geprüft gelten"
         );
+        Ok(())
     }
 
     // ── Pause-Behandlung ──────────────────────────────────────────────────────
 
     #[test]
-    fn test_paused_child_fails_closed_with_role_and_outcome() {
+    fn test_paused_child_fails_closed_with_role_and_outcome() -> TestResult {
         let child = SessionId::new();
         let outcome = TurnOutcome::AwaitingApproval {
             call_id: ToolCallId::new(),
@@ -3129,10 +3537,7 @@ contract = "{contract}"
         match result {
             Err(OpError::NotAvailable(message)) => {
                 assert!(message.contains("explorer"), "Rolle fehlt: {message}");
-                assert!(
-                    message.contains(child.as_str()),
-                    "Kind-ID fehlt: {message}"
-                );
+                assert!(message.contains(child.as_str()), "Kind-ID fehlt: {message}");
                 assert!(
                     message.contains("AwaitingApproval"),
                     "Outcome fehlt: {message}"
@@ -3142,12 +3547,17 @@ contract = "{contract}"
                     "der Hinweis auf die Pause-Sperre fehlt: {message}"
                 );
             }
-            other => panic!("Pause ohne Erlaubnis muss fail-closed sein, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Pause ohne Erlaubnis muss fail-closed sein, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_paused_child_reports_a_permitted_pause_as_structured_output() {
+    fn test_paused_child_reports_a_permitted_pause_as_structured_output() -> TestResult {
         let child = SessionId::new();
         let outcome = TurnOutcome::AwaitingChild {
             child: SessionId::new(),
@@ -3155,12 +3565,301 @@ contract = "{contract}"
             role: "grandchild".to_owned(),
         };
         let output = paused_child_result(PauseKind::Child, &child, "planner", true, &outcome)
-            .expect("eine erlaubte Pause ist kein Fehler");
-        let value: serde_json::Value =
-            serde_json::from_str(&output.text).expect("der Pause-Report ist JSON");
+            .map_err(crate::test_support::ctx(
+                "eine erlaubte Pause ist kein Fehler",
+            ))?;
+        let value: serde_json::Value = serde_json::from_str(&output.text)
+            .map_err(crate::test_support::ctx("der Pause-Report ist JSON"))?;
 
         assert_eq!(value["paused"], "child");
         assert_eq!(value["child"], child.as_str());
+        Ok(())
+    }
+
+    // ── Reparatur-Turn: Belegungsprüfung und Ein-Versuch-Reparatur ───────────
+    //
+    // Ein voller Spawn-plus-Lauf-Beweis (echtes Kind über `spawn_child`
+    // admittiert und über `run_child_with_budget` zweimal gefahren) bräuchte
+    // eine registrierte Eltern-`AgentSession` samt `SpawnContext`
+    // (`organizational_role`, `allowed_child_orchestrators`, Sandbox, …) oder
+    // einen `with_external_root_parent`-Aufbau — dieselbe Maschinerie, die
+    // laut Kommentar bei `fanout_children_uia_worker_cap_is_reachable_from_this_crate`
+    // (oben) bewusst in `harw-core/src/child_controller.rs`s eigener
+    // Testsuite lebt, nicht hier. Die folgenden Tests decken stattdessen jede
+    // neue Entscheidung (Belegungsprüfung, Contract-Auswertung,
+    // Reparatur-Prompt, Reparatur-Anstoß) isoliert über [`InMemoryStateStore`]
+    // und einen ungebundenen [`ManagedAgentSpawner`] ab, ohne einen echten
+    // Kind-Lauf zu benötigen.
+
+    /// Echo des eingebetteten JSON-Schemas selbst statt einer ausgefüllten
+    /// Instanz — das Ausgangsproblem dieses Auftrags (u. a. Modell `glm-5.3`).
+    const SCHEMA_ECHO_TEXT: &str = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema",
+        "title":"ResearchFinding","type":"object"}"#;
+
+    /// Ein gültiges `ResearchFinding` mit einem *nicht* lokalen Beleg
+    /// (`kind: "web"`) — löst die Belegungsprüfung nicht aus.
+    const VALID_FINDING_WITHOUT_LOCAL_EVIDENCE: &str = r#"{"question_id":"q-1","conclusion":"c",
+        "evidence":[{"kind":"web","locator":"https://example.com",
+        "retrieved_at":"2026-08-27T00:00:00Z"}],"confidence":"high","produced_by":"explorer-1",
+        "produced_at":"2026-08-27T00:00:00Z"}"#;
+
+    #[test]
+    fn test_claims_local_evidence_true_only_for_grounded_kinds() {
+        let local = serde_json::json!({ "evidence": [{ "kind": "local_source" }] });
+        let registry = serde_json::json!({ "evidence": [{ "kind": "cargo_registry_source" }] });
+        let web = serde_json::json!({ "evidence": [{ "kind": "web" }] });
+        let empty = serde_json::json!({ "evidence": [] });
+        let missing = serde_json::json!({});
+
+        assert!(claims_local_evidence(&local));
+        assert!(claims_local_evidence(&registry));
+        assert!(!claims_local_evidence(&web));
+        assert!(!claims_local_evidence(&empty));
+        assert!(!claims_local_evidence(&missing));
+    }
+
+    #[tokio::test]
+    async fn test_count_child_tool_calls_counts_only_tool_call_items() -> TestResult {
+        let store = InMemoryStateStore::new();
+        let child = SessionId::new();
+        let mut history = ConversationHistory::new();
+        history.push_user_text("frage");
+        history.push_tool_call(ToolCallId::new(), "fs.read", serde_json::Value::Null);
+        history.push_tool_call(ToolCallId::new(), "fs.grep", serde_json::Value::Null);
+        history.push_assistant_text("antwort", None);
+        store
+            .save_history(&child, &history)
+            .await
+            .map_err(crate::test_support::ctx(
+                "Historie muss sich speichern lassen",
+            ))?;
+
+        let count =
+            count_child_tool_calls(&store, &child)
+                .await
+                .map_err(crate::test_support::ctx(
+                    "die Zählung darf bei einem funktionierenden Store nicht fehlschlagen",
+                ))?;
+        assert_eq!(count, 2, "nur ToolCall-Items dürfen gezählt werden");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_count_child_tool_calls_is_zero_for_an_untouched_child() -> TestResult {
+        let store = InMemoryStateStore::new();
+        let child = SessionId::new();
+
+        let count =
+            count_child_tool_calls(&store, &child)
+                .await
+                .map_err(crate::test_support::ctx(
+                    "ein leerer Verlauf ist kein Store-Fehler",
+                ))?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_return_with_grounding_rejects_schema_echo_as_contract_violation()
+    -> TestResult {
+        let store = InMemoryStateStore::new();
+        let child = SessionId::new();
+
+        let Err(violation) = evaluate_return_with_grounding(
+            &store,
+            ChildReturnContract::ResearchFinding,
+            &child,
+            SCHEMA_ECHO_TEXT,
+        )
+        .await
+        else {
+            return Err(TestError::Unexpected(
+                "ein Schema-Echo ist kein gültiges ResearchFinding".into(),
+            ));
+        };
+
+        assert!(
+            violation
+                .message
+                .contains("kein gültiges ResearchFinding-JSON"),
+            "{}",
+            violation.message
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_return_with_grounding_rejects_local_evidence_without_a_tool_call()
+    -> TestResult {
+        let store = InMemoryStateStore::new();
+        let child = SessionId::new();
+
+        // `VALID_FINDING` (oben) behauptet einen cargo_registry_source-Beleg;
+        // die Kind-Session hat hier keinen einzigen Werkzeugaufruf ausgeführt.
+        let Err(violation) = evaluate_return_with_grounding(
+            &store,
+            ChildReturnContract::ResearchFinding,
+            &child,
+            VALID_FINDING,
+        )
+        .await
+        else {
+            return Err(TestError::Unexpected(
+                "ein behaupteter lokaler Beleg ohne Werkzeugaufruf ist ein Vertragsbruch".into(),
+            ));
+        };
+
+        assert!(
+            violation.message.contains("Befund ohne Werkzeugaufruf"),
+            "{}",
+            violation.message
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_return_with_grounding_accepts_local_evidence_with_a_tool_call()
+    -> TestResult {
+        let store = InMemoryStateStore::new();
+        let child = SessionId::new();
+        let mut history = ConversationHistory::new();
+        history.push_tool_call(ToolCallId::new(), "fs.read", serde_json::Value::Null);
+        store
+            .save_history(&child, &history)
+            .await
+            .map_err(crate::test_support::ctx(
+                "Historie muss sich speichern lassen",
+            ))?;
+
+        let value = evaluate_return_with_grounding(
+            &store,
+            ChildReturnContract::ResearchFinding,
+            &child,
+            VALID_FINDING,
+        )
+        .await
+        .map_err(|violation| {
+            TestError::Unexpected(format!(
+                "ein belegter Werkzeugaufruf darf nicht abgelehnt werden: {}",
+                violation.message
+            ))
+        })?;
+        assert_eq!(value["question_id"], "q-1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_return_with_grounding_accepts_non_local_evidence_without_a_tool_call()
+    -> TestResult {
+        let store = InMemoryStateStore::new();
+        let child = SessionId::new();
+
+        let value = evaluate_return_with_grounding(
+            &store,
+            ChildReturnContract::ResearchFinding,
+            &child,
+            VALID_FINDING_WITHOUT_LOCAL_EVIDENCE,
+        )
+        .await
+        .map_err(|violation| {
+            TestError::Unexpected(format!(
+                "Web-Belege verlangen keinen Werkzeugaufruf: {}",
+                violation.message
+            ))
+        })?;
+        assert_eq!(value["question_id"], "q-1");
+        Ok(())
+    }
+
+    #[test]
+    fn test_repair_prompt_uses_the_short_message_and_states_the_instance_only_rule() {
+        let violation = ContractViolation::new(
+            ChildReturnContract::ResearchFinding,
+            "kurzer Testfehler".to_owned(),
+            "roher Kindtext, der nicht im Reparatur-Prompt auftauchen soll",
+        );
+        let prompt = repair_prompt(&violation);
+
+        assert!(prompt.contains("Deine Antwort verletzt den Vertrag: kurzer Testfehler"));
+        assert!(prompt.contains("kein Schema, kein Tool-Call-Text"));
+        assert!(
+            !prompt.contains("roher Kindtext"),
+            "der Reparatur-Prompt soll die kurze Meldung nutzen, nicht den \
+             Rohtext-Auszug aus `to_message`: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_with_repair_returns_immediately_when_the_first_attempt_is_valid()
+    -> TestResult {
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let spawner = ManagedAgentSpawner::new(
+            Arc::new(Mutex::new(SessionManager::new(event_tx))),
+            ChildLimits::conservative(),
+        );
+        let store = InMemoryStateStore::new();
+        let child = SessionId::new();
+
+        let value = evaluate_with_repair(
+            &spawner,
+            &store,
+            ChildReturnContract::ResearchFinding,
+            &child,
+            AgentBudget::default(),
+            VALID_FINDING_WITHOUT_LOCAL_EVIDENCE,
+        )
+        .await
+        .map_err(crate::test_support::ctx(
+            "ein bereits gültiges Finding braucht keine Reparatur",
+        ))?;
+        assert_eq!(value["question_id"], "q-1");
+
+        // Kein Kind wurde admittiert: hätte `evaluate_with_repair` den
+        // Reparatur-Pfad genommen, wäre `run_child_with_budget` an der
+        // fehlenden Admission gescheitert (siehe Test unten). Dass hier kein
+        // Fehler auftrat, belegt den sofortigen Rückweg ohne Reparatur-Turn.
+        assert_eq!(spawner.child_record(&child), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_with_repair_attempts_one_repair_turn_and_reports_it_on_failure()
+    -> TestResult {
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let spawner = ManagedAgentSpawner::new(
+            Arc::new(Mutex::new(SessionManager::new(event_tx))),
+            ChildLimits::conservative(),
+        );
+        let store = InMemoryStateStore::new();
+        // Absichtlich nie admittiert: der Reparatur-Turn muss dennoch
+        // *versucht* werden (Beweis, dass `evaluate_with_repair` nach dem
+        // ersten Vertragsbruch tatsächlich einen zweiten Turn anstößt), er
+        // scheitert hier lediglich an der fehlenden Admission — das reicht,
+        // um den "nach 1 Reparaturversuch"-Pfad zu belegen.
+        let child = SessionId::new();
+
+        let Err(error) = evaluate_with_repair(
+            &spawner,
+            &store,
+            ChildReturnContract::ResearchFinding,
+            &child,
+            AgentBudget::default(),
+            SCHEMA_ECHO_TEXT,
+        )
+        .await
+        else {
+            return Err(TestError::Unexpected(
+                "ein Schema-Echo ohne erfolgreiche Reparatur bleibt ein Fehler".into(),
+            ));
+        };
+
+        assert!(error.contains("nach 1 Reparaturversuch"), "{error}");
+        assert!(error.contains("Reparatur-Turn fehlgeschlagen"), "{error}");
+        assert!(
+            error.contains("kein gültiges ResearchFinding-JSON"),
+            "{error}"
+        );
+        Ok(())
     }
 
     // ── invoke tests ──────────────────────────────────────────────────────────
@@ -3172,15 +3871,17 @@ contract = "{contract}"
     // modell-sichtbare Rückgabe isoliert ab.
 
     #[test]
-    fn completed_child_output_returns_the_child_final_response() {
-        let output = completed_child_output(Ok("final child response".to_owned()))
-            .expect("available child response must produce tool output");
+    fn completed_child_output_returns_the_child_final_response() -> TestResult {
+        let output = completed_child_output(Ok("final child response".to_owned())).map_err(
+            crate::test_support::ctx("available child response must produce tool output"),
+        )?;
 
         assert_eq!(output.text, "final child response");
         assert!(
             !output.text.contains("hat den Turn abgeschlossen"),
             "die Tool-Antwort darf keine generische Abschlussbestätigung sein"
         );
+        Ok(())
     }
 
     #[test]
@@ -3196,9 +3897,10 @@ contract = "{contract}"
     }
 
     #[tokio::test]
-    async fn invoke_returns_not_available_in_skeleton_phase() {
-        let adapter = AgentToolAdapter::from_operation(Arc::new(AgentOp)).expect("Erwartet Some");
-        let (ctx, tmp) = make_test_ctx();
+    async fn invoke_returns_not_available_in_skeleton_phase() -> TestResult {
+        let adapter = AgentToolAdapter::from_operation(Arc::new(AgentOp))
+            .ok_or(TestError::Missing("Erwartet Some"))?;
+        let (ctx, tmp) = make_test_ctx()?;
         let result = adapter
             .invoke(&ctx, serde_json::json!({ "topic": "Rust" }))
             .await;
@@ -3210,18 +3912,24 @@ contract = "{contract}"
                     "Fehlermeldung sollte 'kein Agent-Spawner' enthalten, war: {msg}"
                 );
             }
-            other => panic!("Erwartet OpError::NotAvailable, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Erwartet OpError::NotAvailable, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn invoke_rejects_an_undecodable_budget_hint_before_spawning() {
+    async fn invoke_rejects_an_undecodable_budget_hint_before_spawning() -> TestResult {
         // `AgentOp` trägt das historische Label "8k"; mit vollständiger
         // Core-Laufzeit im Kontext ist der Budget-Parser die nächste Grenze —
         // und sie muss fail-closed sein statt „kein Limit" zu bedeuten.
-        let adapter = AgentToolAdapter::from_operation(Arc::new(AgentOp)).expect("Erwartet Some");
+        let adapter = AgentToolAdapter::from_operation(Arc::new(AgentOp))
+            .ok_or(TestError::Missing("Erwartet Some"))?;
         let (services, _events) = services_with_runtime();
-        let (ctx, tmp) = make_test_ctx_with(services);
+        let (ctx, tmp) = make_test_ctx_with(services)?;
         let result = adapter
             .invoke(&ctx, serde_json::json!({ "topic": "Rust" }))
             .await;
@@ -3231,17 +3939,19 @@ contract = "{contract}"
             matches!(result, Err(OpError::NotAvailable(ref message)) if message.contains("budget_hint")),
             "ein unlesbares Budget-Label muss das Werkzeug sperren: {result:?}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn invoke_rejects_non_object_args_before_child_scheduling() {
-        let adapter = AgentToolAdapter::from_operation(Arc::new(AgentOp)).expect("Erwartet Some");
+    async fn invoke_rejects_non_object_args_before_child_scheduling() -> TestResult {
+        let adapter = AgentToolAdapter::from_operation(Arc::new(AgentOp))
+            .ok_or(TestError::Missing("Erwartet Some"))?;
         for args in [
             serde_json::Value::Null,
             serde_json::json!("not-an-object"),
             serde_json::json!(["not-an-object"]),
         ] {
-            let (ctx, tmp) = make_test_ctx();
+            let (ctx, tmp) = make_test_ctx()?;
             let result = adapter.invoke(&ctx, args).await;
             std::fs::remove_dir_all(tmp).ok();
             assert!(
@@ -3249,18 +3959,19 @@ contract = "{contract}"
                 "nicht-objektartige Args müssen vor dem Scheduling deterministisch abgelehnt werden: {result:?}"
             );
         }
+        Ok(())
     }
 
     // ── /agent product boundary tests ───────────────────────────────────────
 
     #[tokio::test]
-    async fn agent_product_rejects_missing_or_unknown_action_before_runtime_lookup() {
+    async fn agent_product_rejects_missing_or_unknown_action_before_runtime_lookup() -> TestResult {
         for args in [
             serde_json::json!({}),
             serde_json::json!({ "action": "resume" }),
             serde_json::json!("list"),
         ] {
-            let (ctx, tmp) = make_test_ctx();
+            let (ctx, tmp) = make_test_ctx()?;
             let result = AgentToolAdapter::invoke_product(&ctx, args).await;
             std::fs::remove_dir_all(tmp).ok();
             assert!(
@@ -3268,15 +3979,16 @@ contract = "{contract}"
                 "invalid /agent request must be rejected before runtime dispatch: {result:?}"
             );
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn agent_product_rejects_missing_or_empty_target_before_runtime_lookup() {
+    async fn agent_product_rejects_missing_or_empty_target_before_runtime_lookup() -> TestResult {
         for args in [
             serde_json::json!({ "action": "stop" }),
             serde_json::json!({ "action": "budget", "target": "", "budget": { "max_tokens": 1 } }),
         ] {
-            let (ctx, tmp) = make_test_ctx();
+            let (ctx, tmp) = make_test_ctx()?;
             let result = AgentToolAdapter::invoke_product(&ctx, args).await;
             std::fs::remove_dir_all(tmp).ok();
             assert!(
@@ -3284,11 +3996,12 @@ contract = "{contract}"
                 "missing or empty targets must fail closed: {result:?}"
             );
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn agent_product_rejects_list_extra_arguments() {
-        let (ctx, tmp) = make_test_ctx();
+    async fn agent_product_rejects_list_extra_arguments() -> TestResult {
+        let (ctx, tmp) = make_test_ctx()?;
         let result = AgentToolAdapter::invoke_product(
             &ctx,
             serde_json::json!({ "action": "list", "target": "foreign-child" }),
@@ -3300,11 +4013,12 @@ contract = "{contract}"
             matches!(result, Err(OpError::InvalidArguments(ref message)) if message.contains("list does not accept")),
             "list must not accept arbitrary target probes: {result:?}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn agent_product_rejects_untyped_budget_before_runtime_lookup() {
-        let (ctx, tmp) = make_test_ctx();
+    async fn agent_product_rejects_untyped_budget_before_runtime_lookup() -> TestResult {
+        let (ctx, tmp) = make_test_ctx()?;
         let result = AgentToolAdapter::invoke_product(
             &ctx,
             serde_json::json!({
@@ -3320,11 +4034,12 @@ contract = "{contract}"
             matches!(result, Err(OpError::InvalidArguments(ref message)) if message.contains("max_tokens")),
             "budget limits must be typed before a spawner is consulted: {result:?}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn agent_product_reports_missing_spawner_without_success_output() {
-        let (ctx, tmp) = make_test_ctx();
+    async fn agent_product_reports_missing_spawner_without_success_output() -> TestResult {
+        let (ctx, tmp) = make_test_ctx()?;
         let result =
             AgentToolAdapter::invoke_product(&ctx, serde_json::json!({ "action": "list" })).await;
         std::fs::remove_dir_all(tmp).ok();
@@ -3333,31 +4048,35 @@ contract = "{contract}"
             matches!(result, Err(OpError::NotAvailable(ref message)) if message.contains("kein Agent-Spawner")),
             "a missing runtime spawner must not become a synthetic /agent success: {result:?}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn agent_product_list_reports_an_empty_child_set_as_json() {
+    async fn agent_product_list_reports_an_empty_child_set_as_json() -> TestResult {
         let (services, _events) = services_with_runtime();
-        let (ctx, tmp) = make_test_ctx_with(services);
+        let (ctx, tmp) = make_test_ctx_with(services)?;
         let result =
             AgentToolAdapter::invoke_product(&ctx, serde_json::json!({ "action": "list" })).await;
         std::fs::remove_dir_all(tmp).ok();
 
-        let output = result.expect("mit Spawner ist /agent list verfügbar");
-        let value: serde_json::Value =
-            serde_json::from_str(&output.text).expect("die Liste ist JSON");
+        let output = result.map_err(crate::test_support::ctx(
+            "mit Spawner ist /agent list verfügbar",
+        ))?;
+        let value: serde_json::Value = serde_json::from_str(&output.text)
+            .map_err(crate::test_support::ctx("die Liste ist JSON"))?;
         assert_eq!(
             value["children"].as_array().map(Vec::len),
             Some(0),
             "ohne admittierte Kinder ist die Liste leer, nicht 'nicht verfügbar': {}",
             output.text
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn agent_product_stop_on_a_foreign_child_stays_fail_closed() {
+    async fn agent_product_stop_on_a_foreign_child_stays_fail_closed() -> TestResult {
         let (services, _events) = services_with_runtime();
-        let (ctx, tmp) = make_test_ctx_with(services);
+        let (ctx, tmp) = make_test_ctx_with(services)?;
         let result = AgentToolAdapter::invoke_product(
             &ctx,
             serde_json::json!({ "action": "stop", "target": "foreign-child" }),
@@ -3369,10 +4088,11 @@ contract = "{contract}"
             matches!(result, Err(OpError::NotAvailable(ref message)) if message == "agent target is unavailable in this parent session"),
             "ein fremdes Kind darf weder gestoppt noch als existent bestätigt werden: {result:?}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn agent_product_budget_on_a_foreign_child_stays_fail_closed() {
+    async fn agent_product_budget_on_a_foreign_child_stays_fail_closed() -> TestResult {
         for args in [
             serde_json::json!({ "action": "budget", "target": "foreign-child" }),
             serde_json::json!({
@@ -3382,7 +4102,7 @@ contract = "{contract}"
             }),
         ] {
             let (services, _events) = services_with_runtime();
-            let (ctx, tmp) = make_test_ctx_with(services);
+            let (ctx, tmp) = make_test_ctx_with(services)?;
             let result = AgentToolAdapter::invoke_product(&ctx, args).await;
             std::fs::remove_dir_all(tmp).ok();
 
@@ -3391,6 +4111,7 @@ contract = "{contract}"
                 "lesen wie setzen bleiben an der Besitzgrenze: {result:?}"
             );
         }
+        Ok(())
     }
 
     // ── W4a/A-BRIDGE: K3 Reducer, K4 question_id, K5 Effort ──────────────────
@@ -3422,19 +4143,20 @@ contract = "{contract}"
     }
 
     #[test]
-    fn test_resolve_authority_reducer_never_widens_any_parent_permission_set() {
-        let (ctx, tmp) = make_test_ctx();
+    fn test_resolve_authority_reducer_never_widens_any_parent_permission_set() -> TestResult {
+        let (ctx, tmp) = make_test_ctx()?;
         let binding = ctx.sandbox().workspace().clone();
         std::fs::remove_dir_all(tmp).ok();
-        let names = KNOWN_AUTHORITY_REDUCERS
-            .iter()
-            .copied()
-            .chain(["reduce_ro", "", "reduce_to_everything"]);
+        let names = KNOWN_AUTHORITY_REDUCERS.iter().copied().chain([
+            "reduce_ro",
+            "",
+            "reduce_to_everything",
+        ]);
         for name in names {
             let reducer = resolve_authority_reducer(name);
             let ceiling = reducer_ceiling(name)
                 .or_else(|| reducer_ceiling("reduce_to_read_only"))
-                .expect("read_only ist bekannt");
+                .ok_or(TestError::Missing("read_only ist bekannt"))?;
             for granted in every_permission_subset() {
                 // `SandboxSpec` hat keinen `with_network_scope`-Setter mehr: die reale API
                 // erlaubt außerhalb von harw-authority nur `NetworkScope::empty()` über
@@ -3476,6 +4198,7 @@ contract = "{contract}"
                 );
             }
         }
+        Ok(())
     }
 
     #[test]
@@ -3487,7 +4210,10 @@ contract = "{contract}"
         );
         assert_eq!(
             reducer_ceiling("reduce_to_read_registry"),
-            Some(set(&[Permission::ReadWorkspace, Permission::ReadCargoRegistry]))
+            Some(set(&[
+                Permission::ReadWorkspace,
+                Permission::ReadCargoRegistry
+            ]))
         );
         assert_eq!(
             reducer_ceiling("reduce_to_read_network"),
@@ -3508,8 +4234,9 @@ contract = "{contract}"
     /// `harw-authority` nur `NetworkScope::empty()` erzeugt werden, wodurch
     /// dieser Test vakuos war (siehe git-Historie).
     #[test]
-    fn test_reduce_to_read_network_never_reads_the_workspace_and_keeps_only_parent_hosts() {
-        let (ctx, tmp) = make_test_ctx();
+    fn test_reduce_to_read_network_never_reads_the_workspace_and_keeps_only_parent_hosts()
+    -> TestResult {
+        let (ctx, tmp) = make_test_ctx()?;
         let binding = ctx.sandbox().workspace().clone();
         std::fs::remove_dir_all(tmp).ok();
         let parent = SandboxSpec::from_resolved_for_test(
@@ -3527,15 +4254,26 @@ contract = "{contract}"
             "reduce_to_read_network muss die Parent-Hosts durchreichen"
         );
 
-        for name in ["reduce_to_read_only", "reduce_to_read_registry", "reduce_to_read_execute"] {
+        for name in [
+            "reduce_to_read_only",
+            "reduce_to_read_registry",
+            "reduce_to_read_execute",
+        ] {
             let child = resolve_authority_reducer(name)(&parent);
-            assert!(!child.permissions().contains(Permission::NetworkAccess), "{name}");
-            assert!(child.network_scope().is_empty(), "{name}: Host-Scope muss leer sein");
+            assert!(
+                !child.permissions().contains(Permission::NetworkAccess),
+                "{name}"
+            );
+            assert!(
+                child.network_scope().is_empty(),
+                "{name}: Host-Scope muss leer sein"
+            );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_bind_finding_to_question_accepts_only_the_open_question() {
+    fn test_bind_finding_to_question_accepts_only_the_open_question() -> TestResult {
         let finding = serde_json::json!({ "question_id": "q-1" });
         let nested = serde_json::json!({ "question": { "id": "q-1" }, "response_format": {} });
         let flat = serde_json::json!({ "id": "q-1" });
@@ -3543,9 +4281,15 @@ contract = "{contract}"
         assert_eq!(bind_finding_to_question(&finding, &flat), Ok(()));
 
         let foreign = serde_json::json!({ "question": { "id": "q-2" } });
-        let error = bind_finding_to_question(&finding, &foreign)
-            .expect_err("ein Finding zu einer anderen Frage ist ein Vertragsbruch");
-        assert!(error.contains("'q-1'") && error.contains("'q-2'"), "{error}");
+        let Err(error) = bind_finding_to_question(&finding, &foreign) else {
+            return Err(TestError::Unexpected(
+                "ein Finding zu einer anderen Frage ist ein Vertragsbruch".into(),
+            ));
+        };
+        assert!(
+            error.contains("'q-1'") && error.contains("'q-2'"),
+            "{error}"
+        );
 
         let without_id = serde_json::json!({ "question": "Welche Version?" });
         assert!(bind_finding_to_question(&finding, &without_id).is_err());
@@ -3553,21 +4297,29 @@ contract = "{contract}"
         assert!(bind_finding_to_question(&finding, &blank_id).is_err());
         let no_claim = serde_json::json!({ "conclusion": "c" });
         assert!(bind_finding_to_question(&no_claim, &nested).is_err());
+        Ok(())
     }
 
     #[test]
     fn test_model_effort_field_detects_both_override_fields() {
-        assert_eq!(model_effort_field(&serde_json::json!({ "effort": "max" })), Some("effort"));
+        assert_eq!(
+            model_effort_field(&serde_json::json!({ "effort": "max" })),
+            Some("effort")
+        );
         assert_eq!(
             model_effort_field(&serde_json::json!({ "reasoning_effort": null })),
             Some("reasoning_effort")
         );
-        assert_eq!(model_effort_field(&serde_json::json!({ "topic": "effort" })), None);
+        assert_eq!(
+            model_effort_field(&serde_json::json!({ "topic": "effort" })),
+            None
+        );
     }
 
     #[tokio::test]
-    async fn test_invoke_rejects_a_model_effort_argument_before_spawning() {
-        let adapter = AgentToolAdapter::from_operation(Arc::new(AgentOp)).expect("Erwartet Some");
+    async fn test_invoke_rejects_a_model_effort_argument_before_spawning() -> TestResult {
+        let adapter = AgentToolAdapter::from_operation(Arc::new(AgentOp))
+            .ok_or(TestError::Missing("Erwartet Some"))?;
         for args in [
             serde_json::json!({ "topic": "Rust", "effort": "max" }),
             serde_json::json!({ "topic": "Rust", "reasoning_effort": "xhigh" }),
@@ -3578,8 +4330,8 @@ contract = "{contract}"
             let spawner = services
                 .get::<Arc<ManagedAgentSpawner>>()
                 .map(Arc::clone)
-                .expect("Spawner registriert");
-            let (ctx, tmp) = make_test_ctx_with(services);
+                .ok_or(TestError::Missing("Spawner registriert"))?;
+            let (ctx, tmp) = make_test_ctx_with(services)?;
             let result = adapter.invoke(&ctx, args).await;
             let active = spawner.active_children_for(ctx.session_id());
             std::fs::remove_dir_all(tmp).ok();
@@ -3589,6 +4341,7 @@ contract = "{contract}"
             );
             assert_eq!(active, 0, "abgelehnter Aufruf darf kein Kind admittieren");
         }
+        Ok(())
     }
 
     // ── UiaWorker-Fan-out-Deckelung ───────────────────────────────────────────
@@ -3611,7 +4364,7 @@ contract = "{contract}"
     /// Testinfrastruktur braucht, `harw-core`-privat sind und von hier aus nicht
     /// erreichbar sind.
     #[test]
-    fn fanout_children_uia_worker_cap_is_reachable_from_this_crate() {
+    fn fanout_children_uia_worker_cap_is_reachable_from_this_crate() -> TestResult {
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
         let spawner = ManagedAgentSpawner::new(
             Arc::new(Mutex::new(SessionManager::new(event_tx))),
@@ -3624,7 +4377,7 @@ contract = "{contract}"
             },
             harw_agent_dsl::roles::AgentRoleId::UiaWorker,
             Arc::new(IrRegistryFactory {
-                ir: ir_with_contract("harwness.return.coding-task@1"),
+                ir: ir_with_contract("harwness.return.coding-task@1")?,
             }),
         )
         .with_role(
@@ -3634,7 +4387,7 @@ contract = "{contract}"
             },
             harw_agent_dsl::roles::AgentRoleId::Worker,
             Arc::new(IrRegistryFactory {
-                ir: ir_with_contract("harwness.return.coding-task@1"),
+                ir: ir_with_contract("harwness.return.coding-task@1")?,
             }),
         );
 
@@ -3648,6 +4401,7 @@ contract = "{contract}"
             usize::MAX,
             "a non-uia-worker role must stay unbounded"
         );
+        Ok(())
     }
 
     // ── Send + Sync compile-time check ────────────────────────────────────────

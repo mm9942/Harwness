@@ -65,20 +65,17 @@ use harw_sandbox::ExtraRootsCell;
 /// Das ist kein Fehler der Operation, sondern eine unvollständige
 /// Zusammenstellung der Laufzeit: ohne Zelle gibt es keinen Freigabemodus zu
 /// lesen oder zu setzen. Die Antwort sagt das, statt einen Modus zu behaupten.
-pub(crate) const NO_APPROVAL_MODE_CELL: &str =
-    "In dieser Laufzeit ist keine ApprovalModeCell registriert — der Freigabemodus \
+pub(crate) const NO_APPROVAL_MODE_CELL: &str = "In dieser Laufzeit ist keine ApprovalModeCell registriert — der Freigabemodus \
      kann weder gelesen noch gewechselt werden. Die Oberfläche muss eine \
      `ApprovalModeCell` in die ServiceMap legen.";
 
 /// Meldung für den Fall, dass kein [`AllowRuleSet`] registriert ist.
-pub(crate) const NO_ALLOW_RULE_SET: &str =
-    "In dieser Laufzeit ist kein AllowRuleSet registriert — Allow-/Deny-Regeln \
+pub(crate) const NO_ALLOW_RULE_SET: &str = "In dieser Laufzeit ist kein AllowRuleSet registriert — Allow-/Deny-Regeln \
      können weder gelesen noch gesetzt werden. Die Oberfläche muss ein \
      `AllowRuleSet` in die ServiceMap legen.";
 
 /// Meldung für den Fall, dass keine [`ExtraRootsCell`] registriert ist.
-pub(crate) const NO_EXTRA_ROOTS_CELL: &str =
-    "In dieser Laufzeit ist keine ExtraRootsCell registriert — zusätzliche \
+pub(crate) const NO_EXTRA_ROOTS_CELL: &str = "In dieser Laufzeit ist keine ExtraRootsCell registriert — zusätzliche \
      Arbeitsverzeichnisse können nicht angezeigt werden. Die Oberfläche muss \
      eine `ExtraRootsCell` in die ServiceMap legen.";
 
@@ -204,8 +201,9 @@ pub(crate) fn project_config_path(
     markers: &[String],
     cwd: &Path,
 ) -> Result<PathBuf, OpError> {
-    let project = harw_home::discover_project(cwd, markers)
-        .map_err(|error| OpError::Execution(format!("Projekt-Erkennung fehlgeschlagen: {error}")))?;
+    let project = harw_home::discover_project(cwd, markers).map_err(|error| {
+        OpError::Execution(format!("Projekt-Erkennung fehlgeschlagen: {error}"))
+    })?;
     let key = harw_home::project_key(&project.root);
     let dir = harw_home::project_settings_dir(home, profile, &key).map_err(|error| {
         OpError::Execution(format!("Projekt-Settings-Pfad fehlgeschlagen: {error}"))
@@ -285,6 +283,17 @@ fn to_rule_scope(scope: SettingScope) -> RuleScope {
         SettingScope::Session => RuleScope::Session,
         SettingScope::Project => RuleScope::Project,
         SettingScope::Global => RuleScope::Global,
+    }
+}
+
+// Kehrt `to_rule_scope` um; `RuleScope::Session` hat keine persistierbare
+// `SettingScope`-Entsprechung und wird darum strukturell per `None`
+// ausgeschlossen (kein `unreachable!`-Fall im Aufrufer nötig).
+fn persisted_scope(scope: RuleScope) -> Option<SettingScope> {
+    match scope {
+        RuleScope::Project => Some(SettingScope::Project),
+        RuleScope::Global => Some(SettingScope::Global),
+        RuleScope::Session => None,
     }
 }
 
@@ -481,7 +490,8 @@ fn show(ctx: &OpContext) -> Result<OpOutput, OpError> {
 /// - [`OpError::InvalidArguments`]: kein oder unbekannter Modus,
 ///   widersprüchliche Scope-Flags, oder `full` dauerhaft ohne `--yes`.
 /// - [`OpError::NotAvailable`]: keine `ApprovalModeCell` registriert.
-/// - [`OpError::Execution`]: Config-Pfad, -Öffnen oder -Speichern schlug fehl.
+/// - [`OpError::Execution`]: Config-Pfad, -Öffnen, -Schreiben oder -Speichern
+///   schlug fehl.
 fn set_mode(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpError> {
     let (positional, flags) = parse_scope_flags(tail, SettingScope::Session)?;
     let Some(requested) = positional.first().map(String::as_str) else {
@@ -517,9 +527,11 @@ fn set_mode(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpError> {
     }
 
     let path = scope_path(ctx, flags.scope)?;
-    let mut writer =
-        ConfigWriter::open(&path).map_err(|error| config_error("Config öffnen fehlgeschlagen", error))?;
-    writer.set_default_mode(mode.as_str());
+    let mut writer = ConfigWriter::open(&path)
+        .map_err(|error| config_error("Config öffnen fehlgeschlagen", error))?;
+    writer
+        .set_default_mode(mode.as_str())
+        .map_err(|error| config_error("Config schreiben fehlgeschlagen", error))?;
     writer
         .save()
         .map_err(|error| config_error("Config speichern fehlgeschlagen", error))?;
@@ -538,7 +550,8 @@ fn set_mode(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpError> {
 /// # Errors
 /// - [`OpError::InvalidArguments`]: kein `tool`, widersprüchliche Scope-Flags.
 /// - [`OpError::NotAvailable`]: kein `AllowRuleSet` registriert.
-/// - [`OpError::Execution`]: Config-Pfad, -Öffnen oder -Speichern schlug fehl.
+/// - [`OpError::Execution`]: Config-Pfad, -Öffnen, -Schreiben oder -Speichern
+///   schlug fehl.
 fn set_rule(ctx: &OpContext, decision: RuleDecision, tail: &[String]) -> Result<OpOutput, OpError> {
     let (positional, flags) = parse_scope_flags(tail, SettingScope::Project)?;
     let verb = match decision {
@@ -573,14 +586,20 @@ fn set_rule(ctx: &OpContext, decision: RuleDecision, tail: &[String]) -> Result<
             tool: tool.clone(),
             pattern: pattern.clone(),
         };
-        let newly_persisted = writer.append_rule(kind, &rule_toml);
+        let newly_persisted = writer
+            .append_rule(kind, &rule_toml)
+            .map_err(|error| config_error("Config schreiben fehlgeschlagen", error))?;
         writer
             .save()
             .map_err(|error| config_error("Config speichern fehlgeschlagen", error))?;
         note = format!(
             " Dauerhaft in {} gespeichert{}.",
             path.display(),
-            if newly_persisted { "" } else { " (war bereits vorhanden)" }
+            if newly_persisted {
+                ""
+            } else {
+                " (war bereits vorhanden)"
+            }
         );
     }
 
@@ -601,7 +620,9 @@ fn set_rule(ctx: &OpContext, decision: RuleDecision, tail: &[String]) -> Result<
 /// - [`OpError::NotAvailable`]: kein `AllowRuleSet` registriert.
 fn remove_rule(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpError> {
     let Some(nr_str) = tail.first() else {
-        return Err(OpError::InvalidArguments("/permissions remove <nr>".to_owned()));
+        return Err(OpError::InvalidArguments(
+            "/permissions remove <nr>".to_owned(),
+        ));
     };
     let Ok(nr) = nr_str.parse::<usize>() else {
         return Err(OpError::InvalidArguments(format!(
@@ -623,15 +644,15 @@ fn remove_rule(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpError> {
     };
 
     let mut note = String::new();
-    if removed.scope != RuleScope::Session {
-        let scope = match removed.scope {
-            RuleScope::Project => SettingScope::Project,
-            RuleScope::Global => SettingScope::Global,
-            RuleScope::Session => unreachable!("Session wurde oben bereits ausgeschlossen"),
-        };
+    if let Some(scope) = persisted_scope(removed.scope) {
         match scope_path(ctx, scope) {
             Ok(path) => {
-                match remove_persisted_rule(&path, removed.decision, &removed.tool, removed.pattern.as_deref()) {
+                match remove_persisted_rule(
+                    &path,
+                    removed.decision,
+                    &removed.tool,
+                    removed.pattern.as_deref(),
+                ) {
                     Ok(true) => note = format!(" Auch dauerhaft aus {} entfernt.", path.display()),
                     Ok(false) => note = format!(" In {} nicht (mehr) gefunden.", path.display()),
                     Err(error) => {
@@ -660,8 +681,8 @@ fn remove_rule(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpError> {
 /// enthält.
 ///
 /// # Errors
-/// [`OpError::Execution`], wenn Öffnen oder Speichern der Config fehlschlägt,
-/// nachdem eine passende Regel gefunden wurde.
+/// [`OpError::Execution`], wenn Öffnen, Schreiben oder Speichern der Config
+/// fehlschlägt, nachdem eine passende Regel gefunden wurde.
 fn remove_persisted_rule(
     path: &Path,
     decision: RuleDecision,
@@ -682,9 +703,11 @@ fn remove_persisted_rule(
         return Ok(false);
     };
     let kind = to_rule_kind(decision);
-    let mut writer =
-        ConfigWriter::open(path).map_err(|error| config_error("Config öffnen fehlgeschlagen", error))?;
-    writer.remove_rule(kind, index);
+    let mut writer = ConfigWriter::open(path)
+        .map_err(|error| config_error("Config öffnen fehlgeschlagen", error))?;
+    writer
+        .remove_rule(kind, index)
+        .map_err(|error| config_error("Config schreiben fehlgeschlagen", error))?;
     writer
         .save()
         .map_err(|error| config_error("Config speichern fehlgeschlagen", error))?;
@@ -694,17 +717,20 @@ fn remove_persisted_rule(
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalMode, PermissionsArgs, compute_mode_origin, global_config_path,
-        parse_scope_flags, permissions, project_config_path,
+        ApprovalMode, PermissionsArgs, compute_mode_origin, global_config_path, parse_scope_flags,
+        permissions, project_config_path,
     };
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_config::{ConfigWriter, PermissionsSection, RuleKind, RuleToml, SettingScope};
     use harw_extension_api::allow_rules::{AllowRuleSet, ApprovalRule, RuleDecision, RuleScope};
     use harw_extension_api::approval_mode::ApprovalModeCell;
     use harw_operations::context::ServiceMap;
     use harw_operations::{FromRawArgs, OpContext, OpError};
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
-    use harw_sandbox    ::ExtraRootsCell;
+    use harw_sandbox::ExtraRootsCell;
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -712,12 +738,12 @@ mod tests {
     /// Baut einen [`OpContext`] mit leerer [`ServiceMap`] — keine Zellen
     /// registriert. Jeder Test bekommt eine eigene Workspace-Wurzel, damit
     /// Tests parallel laufen können, ohne sich gegenseitig zu stören.
-    fn test_context() -> OpContext {
+    fn test_context() -> TestResult<OpContext> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root =
             std::env::temp_dir().join(format!("harw-permissions-test-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(root.join("workspace")).expect("create test workspace");
+        std::fs::create_dir_all(root.join("workspace")).map_err(ctx("create test workspace"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -726,14 +752,14 @@ mod tests {
                 root: PathBuf::from("workspace"),
             }],
         )
-        .expect("build workspace registry");
+        .map_err(ctx("build workspace registry"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("workspace"),
             )
-            .expect("resolve workspace binding");
-        OpContext::new(
+            .map_err(ctx("resolve workspace binding"))?;
+        Ok(OpContext::new(
             SessionId::new(),
             TurnId::new(),
             SandboxSpec::from_resolved(
@@ -741,13 +767,13 @@ mod tests {
                 PermissionSet::from_policy([Permission::WriteWorkspace, Permission::ReadWorkspace]),
             ),
             ServiceMap::new(),
-        )
+        ))
     }
 
     /// Wie [`test_context`], aber mit einer eigenen [`ApprovalModeCell`]
     /// (Startwert `mode`) in der `ServiceMap`.
-    fn test_context_with_mode(mode: ApprovalMode) -> (OpContext, ApprovalModeCell) {
-        let ctx = test_context();
+    fn test_context_with_mode(mode: ApprovalMode) -> TestResult<(OpContext, ApprovalModeCell)> {
+        let ctx = test_context()?;
         let cell = ApprovalModeCell::new(mode);
         let mut services = ServiceMap::new();
         services.insert(cell.clone());
@@ -757,13 +783,15 @@ mod tests {
             ctx.sandbox().clone(),
             services,
         );
-        (ctx, cell)
+        Ok((ctx, cell))
     }
 
     /// Wie [`test_context_with_mode`], zusätzlich mit einem leeren
     /// [`AllowRuleSet`] und einer leeren [`ExtraRootsCell`] in der `ServiceMap`.
-    fn test_context_with_all_cells(mode: ApprovalMode) -> (OpContext, ApprovalModeCell, AllowRuleSet) {
-        let (ctx, cell) = test_context_with_mode(mode);
+    fn test_context_with_all_cells(
+        mode: ApprovalMode,
+    ) -> TestResult<(OpContext, ApprovalModeCell, AllowRuleSet)> {
+        let (ctx, cell) = test_context_with_mode(mode)?;
         let rule_set = AllowRuleSet::new();
         let mut services = ServiceMap::new();
         services.insert(cell.clone());
@@ -775,48 +803,52 @@ mod tests {
             ctx.sandbox().clone(),
             services,
         );
-        (ctx, cell, rule_set)
+        Ok((ctx, cell, rule_set))
     }
 
     #[test]
-    fn test_permissions_args_from_raw_args_sets_cmd_and_tail() {
+    fn test_permissions_args_from_raw_args_sets_cmd_and_tail() -> TestResult {
         let args = PermissionsArgs::from_raw_args(&toks(&["allow", "shell.exec", "git status"]))
-            .expect("parse");
+            .map_err(ctx("parse"))?;
         assert_eq!(args.cmd.as_deref(), Some("allow"));
         assert_eq!(
             args.tail,
             vec!["shell.exec".to_owned(), "git status".to_owned()]
         );
+        Ok(())
     }
 
     #[test]
-    fn test_permissions_args_from_raw_args_empty_tokens_sets_cmd_none() {
-        let args = PermissionsArgs::from_raw_args(&toks(&[])).expect("parse");
+    fn test_permissions_args_from_raw_args_empty_tokens_sets_cmd_none() -> TestResult {
+        let args = PermissionsArgs::from_raw_args(&toks(&[])).map_err(ctx("parse"))?;
         assert!(args.cmd.is_none());
         assert!(args.tail.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_parse_scope_flags_defaults_when_no_flag_given() {
+    fn test_parse_scope_flags_defaults_when_no_flag_given() -> TestResult {
         let (positional, flags) =
-            parse_scope_flags(&toks(&["full"]), SettingScope::Session).expect("parse");
+            parse_scope_flags(&toks(&["full"]), SettingScope::Session).map_err(ctx("parse"))?;
         assert_eq!(positional, vec!["full".to_owned()]);
         assert_eq!(flags.scope, SettingScope::Session);
         assert!(!flags.confirmed);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_scope_flags_reads_explicit_scope_and_yes() {
+    fn test_parse_scope_flags_reads_explicit_scope_and_yes() -> TestResult {
         let (positional, flags) =
             parse_scope_flags(&toks(&["full", "--global", "--yes"]), SettingScope::Session)
-                .expect("parse");
+                .map_err(ctx("parse"))?;
         assert_eq!(positional, vec!["full".to_owned()]);
         assert_eq!(flags.scope, SettingScope::Global);
         assert!(flags.confirmed);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_scope_flags_rejects_conflicting_scope_flags() {
+    fn test_parse_scope_flags_rejects_conflicting_scope_flags() -> TestResult {
         let result = parse_scope_flags(
             &toks(&["full", "--project", "--global"]),
             SettingScope::Session,
@@ -825,16 +857,22 @@ mod tests {
             Err(OpError::InvalidArguments(message)) => {
                 assert!(message.contains("widersprüchliche"));
             }
-            other => panic!("expected InvalidArguments, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected InvalidArguments, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_parse_scope_flags_repeating_same_flag_is_not_a_conflict() {
+    fn test_parse_scope_flags_repeating_same_flag_is_not_a_conflict() -> TestResult {
         let (_positional, flags) =
             parse_scope_flags(&toks(&["--project", "--project"]), SettingScope::Session)
-                .expect("parse");
+                .map_err(ctx("parse"))?;
         assert_eq!(flags.scope, SettingScope::Project);
+        Ok(())
     }
 
     #[test]
@@ -880,52 +918,71 @@ mod tests {
     }
 
     #[test]
-    fn test_project_config_path_builds_settings_toml_under_profile_projects() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_project_config_path_builds_settings_toml_under_profile_projects() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let repo = dir.path().join("repo");
-        std::fs::create_dir_all(repo.join(".git")).expect("create fake git dir");
+        std::fs::create_dir_all(repo.join(".git")).map_err(ctx("create fake git dir"))?;
         let home = dir.path().join("home");
 
-        let path = project_config_path(&home, "default", &[], &repo).expect("resolve path");
+        let path =
+            project_config_path(&home, "default", &[], &repo).map_err(ctx("resolve path"))?;
         assert!(path.starts_with(home.join("profiles/default/projects")));
-        assert_eq!(path.file_name().and_then(|n| n.to_str()), Some("settings.toml"));
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("settings.toml")
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn permissions_show_without_a_mode_cell_is_not_available() {
-        let ctx = test_context();
+    async fn permissions_show_without_a_mode_cell_is_not_available() -> TestResult {
+        let ctx = test_context()?;
         let result = permissions(&ctx, PermissionsArgs::default()).await;
         match result {
             Err(OpError::NotAvailable(message)) => {
                 assert!(message.contains("ApprovalModeCell"));
             }
-            other => panic!("expected NotAvailable, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn permissions_show_lists_all_modes_and_marks_the_active_one() {
-        let (ctx, _cell) = test_context_with_mode(ApprovalMode::AlwaysAsk);
-        let output = permissions(&ctx, PermissionsArgs::default()).await.expect("show");
+    async fn permissions_show_lists_all_modes_and_marks_the_active_one() -> TestResult {
+        let (ctx, _cell) = test_context_with_mode(ApprovalMode::AlwaysAsk)?;
+        let output = permissions(&ctx, PermissionsArgs::default())
+            .await
+            .map_err(crate::test_support::ctx("show"))?;
         for mode in ApprovalMode::ALL {
-            assert!(output.text.contains(mode.as_str()), "expected {mode:?} to be listed");
+            assert!(
+                output.text.contains(mode.as_str()),
+                "expected {mode:?} to be listed"
+            );
         }
         assert!(output.text.contains("* ask"));
         assert!(output.text.contains("Regeln:"));
         assert!(output.text.contains("Arbeitsverzeichnisse:"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn permissions_show_degrades_honestly_without_allow_rule_set() {
-        let (ctx, _cell) = test_context_with_mode(ApprovalMode::Delegated);
-        let output = permissions(&ctx, PermissionsArgs::default()).await.expect("show");
+    async fn permissions_show_degrades_honestly_without_allow_rule_set() -> TestResult {
+        let (ctx, _cell) = test_context_with_mode(ApprovalMode::Delegated)?;
+        let output = permissions(&ctx, PermissionsArgs::default())
+            .await
+            .map_err(crate::test_support::ctx("show"))?;
         assert!(output.text.contains("AllowRuleSet"));
         assert!(output.text.contains("ExtraRootsCell"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn permissions_rejects_unknown_subcommand() {
-        let ctx = test_context();
+    async fn permissions_rejects_unknown_subcommand() -> TestResult {
+        let ctx = test_context()?;
         let result = permissions(
             &ctx,
             PermissionsArgs {
@@ -939,13 +996,18 @@ mod tests {
                 assert!(message.contains("revoke"));
                 assert!(message.contains("unveränderlich"));
             }
-            other => panic!("expected unavailable mutation, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected unavailable mutation, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn permissions_mode_default_scope_is_session_only() {
-        let (ctx, cell, _rules) = test_context_with_all_cells(ApprovalMode::Delegated);
+    async fn permissions_mode_default_scope_is_session_only() -> TestResult {
+        let (ctx, cell, _rules) = test_context_with_all_cells(ApprovalMode::Delegated)?;
         let other_cell = ApprovalModeCell::new(ApprovalMode::Delegated);
 
         let result = permissions(
@@ -956,17 +1018,18 @@ mod tests {
             },
         )
         .await
-        .expect("mode switch");
+        .map_err(crate::test_support::ctx("mode switch"))?;
 
         assert!(result.text.contains("full"));
         assert!(result.text.contains("Sitzung"));
         assert_eq!(cell.get(), ApprovalMode::FullAccess);
         assert_eq!(other_cell.get(), ApprovalMode::Delegated);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn permissions_set_alias_behaves_like_mode() {
-        let (ctx, cell, _rules) = test_context_with_all_cells(ApprovalMode::Delegated);
+    async fn permissions_set_alias_behaves_like_mode() -> TestResult {
+        let (ctx, cell, _rules) = test_context_with_all_cells(ApprovalMode::Delegated)?;
         let result = permissions(
             &ctx,
             PermissionsArgs {
@@ -975,14 +1038,15 @@ mod tests {
             },
         )
         .await
-        .expect("set alias");
+        .map_err(crate::test_support::ctx("set alias"))?;
         assert!(result.text.contains("full"));
         assert_eq!(cell.get(), ApprovalMode::FullAccess);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn permissions_mode_without_a_cell_is_not_available() {
-        let ctx = test_context();
+    async fn permissions_mode_without_a_cell_is_not_available() -> TestResult {
+        let ctx = test_context()?;
         let result = permissions(
             &ctx,
             PermissionsArgs {
@@ -993,13 +1057,18 @@ mod tests {
         .await;
         match result {
             Err(OpError::NotAvailable(message)) => assert!(message.contains("ApprovalModeCell")),
-            other => panic!("expected NotAvailable, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn permissions_mode_without_mode_returns_invalid_arguments() {
-        let ctx = test_context();
+    async fn permissions_mode_without_mode_returns_invalid_arguments() -> TestResult {
+        let ctx = test_context()?;
         let result = permissions(
             &ctx,
             PermissionsArgs {
@@ -1009,14 +1078,21 @@ mod tests {
         )
         .await;
         match result {
-            Err(OpError::InvalidArguments(message)) => assert!(message.contains("/permissions mode")),
-            other => panic!("expected invalid arguments, got {other:?}"),
+            Err(OpError::InvalidArguments(message)) => {
+                assert!(message.contains("/permissions mode"))
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected invalid arguments, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn permissions_mode_unknown_mode_returns_invalid_arguments() {
-        let ctx = test_context();
+    async fn permissions_mode_unknown_mode_returns_invalid_arguments() -> TestResult {
+        let ctx = test_context()?;
         let result = permissions(
             &ctx,
             PermissionsArgs {
@@ -1027,13 +1103,18 @@ mod tests {
         .await;
         match result {
             Err(OpError::InvalidArguments(message)) => assert!(message.contains("quatsch")),
-            other => panic!("expected invalid arguments, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected invalid arguments, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn permissions_mode_persisting_full_without_yes_is_rejected() {
-        let (ctx, _cell, _rules) = test_context_with_all_cells(ApprovalMode::AlwaysAsk);
+    async fn permissions_mode_persisting_full_without_yes_is_rejected() -> TestResult {
+        let (ctx, _cell, _rules) = test_context_with_all_cells(ApprovalMode::AlwaysAsk)?;
         let result = permissions(
             &ctx,
             PermissionsArgs {
@@ -1046,13 +1127,19 @@ mod tests {
             Err(OpError::InvalidArguments(message)) => {
                 assert!(message.contains("--yes"));
             }
-            other => panic!("expected invalid arguments, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected invalid arguments, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn permissions_allow_defaults_to_project_scope_and_updates_cell_immediately() {
-        let (ctx, _cell, rules) = test_context_with_all_cells(ApprovalMode::AlwaysAsk);
+    async fn permissions_allow_defaults_to_project_scope_and_updates_cell_immediately() -> TestResult
+    {
+        let (ctx, _cell, rules) = test_context_with_all_cells(ApprovalMode::AlwaysAsk)?;
         let result = permissions(
             &ctx,
             PermissionsArgs {
@@ -1072,11 +1159,12 @@ mod tests {
                 && r.pattern.as_deref() == Some("git status")
                 && r.scope == RuleScope::Project));
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn permissions_allow_session_scope_never_touches_disk() {
-        let (ctx, _cell, rules) = test_context_with_all_cells(ApprovalMode::AlwaysAsk);
+    async fn permissions_allow_session_scope_never_touches_disk() -> TestResult {
+        let (ctx, _cell, rules) = test_context_with_all_cells(ApprovalMode::AlwaysAsk)?;
         let output = permissions(
             &ctx,
             PermissionsArgs {
@@ -1089,18 +1177,21 @@ mod tests {
             },
         )
         .await
-        .expect("session-scope allow must never fail on disk access");
+        .map_err(crate::test_support::ctx(
+            "session-scope allow must never fail on disk access",
+        ))?;
         assert!(output.text.contains("erlaubt"));
         let snapshot = rules.snapshot();
         assert!(snapshot.iter().any(|r| r.tool == "shell.exec"
             && r.pattern.as_deref() == Some("cargo check")
             && r.scope == RuleScope::Session
             && r.decision == RuleDecision::Allow));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn permissions_deny_session_scope_records_deny_decision() {
-        let (ctx, _cell, rules) = test_context_with_all_cells(ApprovalMode::AlwaysAsk);
+    async fn permissions_deny_session_scope_records_deny_decision() -> TestResult {
+        let (ctx, _cell, rules) = test_context_with_all_cells(ApprovalMode::AlwaysAsk)?;
         permissions(
             &ctx,
             PermissionsArgs {
@@ -1109,16 +1200,19 @@ mod tests {
             },
         )
         .await
-        .expect("session-scope deny");
+        .map_err(crate::test_support::ctx("session-scope deny"))?;
         let snapshot = rules.snapshot();
-        assert!(snapshot
-            .iter()
-            .any(|r| r.tool == "fs.write" && r.decision == RuleDecision::Deny));
+        assert!(
+            snapshot
+                .iter()
+                .any(|r| r.tool == "fs.write" && r.decision == RuleDecision::Deny)
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn permissions_allow_without_a_rule_set_is_not_available() {
-        let (ctx, _cell) = test_context_with_mode(ApprovalMode::AlwaysAsk);
+    async fn permissions_allow_without_a_rule_set_is_not_available() -> TestResult {
+        let (ctx, _cell) = test_context_with_mode(ApprovalMode::AlwaysAsk)?;
         let result = permissions(
             &ctx,
             PermissionsArgs {
@@ -1129,13 +1223,18 @@ mod tests {
         .await;
         match result {
             Err(OpError::NotAvailable(message)) => assert!(message.contains("AllowRuleSet")),
-            other => panic!("expected NotAvailable, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn permissions_allow_without_a_tool_returns_invalid_arguments() {
-        let (ctx, _cell, _rules) = test_context_with_all_cells(ApprovalMode::AlwaysAsk);
+    async fn permissions_allow_without_a_tool_returns_invalid_arguments() -> TestResult {
+        let (ctx, _cell, _rules) = test_context_with_all_cells(ApprovalMode::AlwaysAsk)?;
         let result = permissions(
             &ctx,
             PermissionsArgs {
@@ -1145,14 +1244,21 @@ mod tests {
         )
         .await;
         match result {
-            Err(OpError::InvalidArguments(message)) => assert!(message.contains("/permissions allow")),
-            other => panic!("expected invalid arguments, got {other:?}"),
+            Err(OpError::InvalidArguments(message)) => {
+                assert!(message.contains("/permissions allow"))
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected invalid arguments, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn permissions_remove_session_scoped_rule_by_index() {
-        let (ctx, _cell, rules) = test_context_with_all_cells(ApprovalMode::AlwaysAsk);
+    async fn permissions_remove_session_scoped_rule_by_index() -> TestResult {
+        let (ctx, _cell, rules) = test_context_with_all_cells(ApprovalMode::AlwaysAsk)?;
         rules.add(ApprovalRule {
             tool: "shell.exec".to_owned(),
             pattern: Some("git status".to_owned()),
@@ -1174,17 +1280,18 @@ mod tests {
             },
         )
         .await
-        .expect("remove by index");
+        .map_err(crate::test_support::ctx("remove by index"))?;
         assert!(output.text.contains("shell.exec"));
 
         let remaining = rules.snapshot();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].tool, "fs.write");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn permissions_remove_out_of_range_index_returns_invalid_arguments() {
-        let (ctx, _cell, _rules) = test_context_with_all_cells(ApprovalMode::AlwaysAsk);
+    async fn permissions_remove_out_of_range_index_returns_invalid_arguments() -> TestResult {
+        let (ctx, _cell, _rules) = test_context_with_all_cells(ApprovalMode::AlwaysAsk)?;
         let result = permissions(
             &ctx,
             PermissionsArgs {
@@ -1195,13 +1302,18 @@ mod tests {
         .await;
         match result {
             Err(OpError::InvalidArguments(message)) => assert!(message.contains("Nr. 5")),
-            other => panic!("expected invalid arguments, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected invalid arguments, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn permissions_remove_zero_is_rejected() {
-        let (ctx, _cell, _rules) = test_context_with_all_cells(ApprovalMode::AlwaysAsk);
+    async fn permissions_remove_zero_is_rejected() -> TestResult {
+        let (ctx, _cell, _rules) = test_context_with_all_cells(ApprovalMode::AlwaysAsk)?;
         let result = permissions(
             &ctx,
             PermissionsArgs {
@@ -1211,11 +1323,12 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(OpError::InvalidArguments(_))));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn permissions_remove_non_numeric_argument_is_rejected() {
-        let (ctx, _cell, _rules) = test_context_with_all_cells(ApprovalMode::AlwaysAsk);
+    async fn permissions_remove_non_numeric_argument_is_rejected() -> TestResult {
+        let (ctx, _cell, _rules) = test_context_with_all_cells(ApprovalMode::AlwaysAsk)?;
         let result = permissions(
             &ctx,
             PermissionsArgs {
@@ -1225,11 +1338,12 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(OpError::InvalidArguments(_))));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn permissions_remove_without_a_rule_set_is_not_available() {
-        let (ctx, _cell) = test_context_with_mode(ApprovalMode::AlwaysAsk);
+    async fn permissions_remove_without_a_rule_set_is_not_available() -> TestResult {
+        let (ctx, _cell) = test_context_with_mode(ApprovalMode::AlwaysAsk)?;
         let result = permissions(
             &ctx,
             PermissionsArgs {
@@ -1240,8 +1354,13 @@ mod tests {
         .await;
         match result {
             Err(OpError::NotAvailable(message)) => assert!(message.contains("AllowRuleSet")),
-            other => panic!("expected NotAvailable, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     // ── Persistenz-Rundlauf (Contract §2), ohne echte HARW_HOME-Env-Mutation ──
@@ -1252,61 +1371,78 @@ mod tests {
     // würde parallel laufende Tests gefährden).
 
     #[test]
-    fn test_permissions_persistence_round_trip_default_mode_and_rules() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_permissions_persistence_round_trip_default_mode_and_rules() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let home = dir.path().join("home");
         let path = global_config_path(&home);
 
-        let mut writer = ConfigWriter::open(&path).expect("open");
-        writer.set_default_mode("auto");
-        writer.append_rule(
-            RuleKind::Allow,
-            &RuleToml {
-                tool: "shell.exec".to_owned(),
-                pattern: Some("cargo check".to_owned()),
-            },
+        let mut writer = ConfigWriter::open(&path).map_err(ctx("open"))?;
+        writer
+            .set_default_mode("auto")
+            .map_err(ctx("set_default_mode"))?;
+        writer
+            .append_rule(
+                RuleKind::Allow,
+                &RuleToml {
+                    tool: "shell.exec".to_owned(),
+                    pattern: Some("cargo check".to_owned()),
+                },
+            )
+            .map_err(ctx("append_rule"))?;
+        writer.save().map_err(ctx("save"))?;
+
+        let reopened = ConfigWriter::open(&path).map_err(ctx("reopen"))?;
+        assert_eq!(
+            reopened.get_value("permissions.default_mode"),
+            Some("auto".to_owned())
         );
-        writer.save().expect("save");
 
-        let reopened = ConfigWriter::open(&path).expect("reopen");
-        assert_eq!(reopened.get_value("permissions.default_mode"), Some("auto".to_owned()));
-
-        let content = std::fs::read_to_string(&path).expect("read back");
+        let content = std::fs::read_to_string(&path).map_err(ctx("read back"))?;
         assert!(content.contains("cargo check"));
+        Ok(())
     }
 
     #[test]
-    fn test_remove_persisted_rule_finds_and_removes_matching_entry() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_remove_persisted_rule_finds_and_removes_matching_entry() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let path = dir.path().join("settings.toml");
 
-        let mut writer = ConfigWriter::open(&path).expect("open");
-        writer.append_rule(
-            RuleKind::Deny,
-            &RuleToml {
-                tool: "fs.write".to_owned(),
-                pattern: None,
-            },
-        );
-        writer.save().expect("save");
+        let mut writer = ConfigWriter::open(&path).map_err(ctx("open"))?;
+        writer
+            .append_rule(
+                RuleKind::Deny,
+                &RuleToml {
+                    tool: "fs.write".to_owned(),
+                    pattern: None,
+                },
+            )
+            .map_err(ctx("append_rule"))?;
+        writer.save().map_err(ctx("save"))?;
 
         let removed = super::remove_persisted_rule(&path, RuleDecision::Deny, "fs.write", None)
-            .expect("remove");
+            .map_err(ctx("remove"))?;
         assert!(removed, "matching rule must be found and removed");
 
-        let content = std::fs::read_to_string(&path).expect("read back");
+        let content = std::fs::read_to_string(&path).map_err(ctx("read back"))?;
         assert!(!content.contains("fs.write"));
 
         let removed_again =
-            super::remove_persisted_rule(&path, RuleDecision::Deny, "fs.write", None).expect("second call");
-        assert!(!removed_again, "already-removed rule must not be found again");
+            super::remove_persisted_rule(&path, RuleDecision::Deny, "fs.write", None)
+                .map_err(ctx("second call"))?;
+        assert!(
+            !removed_again,
+            "already-removed rule must not be found again"
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_remove_persisted_rule_on_missing_file_returns_false_not_an_error() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_remove_persisted_rule_on_missing_file_returns_false_not_an_error() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let missing = dir.path().join("does-not-exist.toml");
-        let result = super::remove_persisted_rule(&missing, RuleDecision::Allow, "shell.exec", None);
-        assert!(!result.expect("must not error"));
+        let result =
+            super::remove_persisted_rule(&missing, RuleDecision::Allow, "shell.exec", None);
+        assert!(!result.map_err(ctx("must not error"))?);
+        Ok(())
     }
 }

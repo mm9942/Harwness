@@ -552,6 +552,7 @@ mod tests {
 
     use super::*;
     use crate::short_term::StmRole;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Erzeugt einen einzigartigen temporären Verzeichnispfad.
     fn tmp_root(tag: &str) -> std::path::PathBuf {
@@ -613,13 +614,15 @@ mod tests {
 
     /// 5 Einträge mit hoher Salience → Some(summary), source_entries=5.
     #[test]
-    fn sufficient_input_produces_summary() {
+    fn sufficient_input_produces_summary() -> TestResult {
         let entries: Vec<StmEntry> = (0..5)
             .map(|i| entry(StmRole::Assistant, 80, &format!("lektion {i}")))
             .collect();
         let cfg = SummaryConfig::default();
         let result = extract_summary(&entries, "coding-task", cfg);
-        let summary = result.expect("5 Einträge mit hoher Salience müssen Some ergeben");
+        let summary = result.ok_or(TestError::Missing(
+            "5 Einträge mit hoher Salience müssen Some ergeben",
+        ))?;
         assert_eq!(summary.source_entries, 5, "source_entries muss 5 sein");
         assert_eq!(summary.context, "coding-task");
         assert!(
@@ -627,13 +630,14 @@ mod tests {
             "total_salience muss >= 60 sein"
         );
         assert!(!summary.lesson.is_empty(), "lesson darf nicht leer sein");
+        Ok(())
     }
 
     // ── Test 4 ───────────────────────────────────────────────────────────────
 
     /// Mix User+Assistant+Tool: nur Assistant/Tool-Content im Lesson-Text.
     #[test]
-    fn prefers_assistant_and_tool() {
+    fn prefers_assistant_and_tool() -> TestResult {
         let mut entries = vec![
             entry(StmRole::User, 10, "user-data"),
             entry(StmRole::User, 10, "user-data"),
@@ -646,7 +650,9 @@ mod tests {
 
         let cfg = SummaryConfig::default();
         let result = extract_summary(&entries, "mixed-test", cfg);
-        let summary = result.expect("Ausreichend Einträge mit hoher Salience");
+        let summary = result.ok_or(TestError::Missing(
+            "Ausreichend Einträge mit hoher Salience",
+        ))?;
 
         assert!(
             summary.lesson.contains("assistant-lektion")
@@ -659,13 +665,14 @@ mod tests {
             "Lesson darf keinen User-Content enthalten, wenn Assistant/Tool verfügbar; got: {:?}",
             summary.lesson
         );
+        Ok(())
     }
 
     // ── Test 5 ───────────────────────────────────────────────────────────────
 
     /// Nur User-Einträge → Fallback auf alle Rollen, Summary vorhanden.
     #[test]
-    fn falls_back_when_only_user_role() {
+    fn falls_back_when_only_user_role() -> TestResult {
         let entries: Vec<StmEntry> = (0..5)
             .map(|i| entry(StmRole::User, 20, &format!("user-content-{i}")))
             .collect();
@@ -675,19 +682,22 @@ mod tests {
             max_lesson_chars: 400,
         };
         let result = extract_summary(&entries, "user-only", cfg);
-        let summary = result.expect("Fallback auf User-Einträge muss Summary ergeben");
+        let summary = result.ok_or(TestError::Missing(
+            "Fallback auf User-Einträge muss Summary ergeben",
+        ))?;
         assert!(
             summary.lesson.contains("user-content"),
             "User-Content muss im Fallback-Fall in der Lesson erscheinen; got: {:?}",
             summary.lesson
         );
+        Ok(())
     }
 
     // ── Test 6 ───────────────────────────────────────────────────────────────
 
     /// Sehr langer Content, max_lesson_chars=50 → lesson.chars().count() <= 50.
     #[test]
-    fn lesson_truncated_to_max_chars() {
+    fn lesson_truncated_to_max_chars() -> TestResult {
         let long_text = "x".repeat(300);
         let entries = vec![
             entry(StmRole::Assistant, 90, &long_text),
@@ -700,22 +710,23 @@ mod tests {
             max_lesson_chars: 50,
         };
         let result = extract_summary(&entries, "truncation-test", cfg);
-        let summary = result.expect("Ausreichend Einträge");
+        let summary = result.ok_or(TestError::Missing("Ausreichend Einträge"))?;
         let char_count = summary.lesson.chars().count();
         assert!(
             char_count <= 50,
             "Lesson muss auf 50 Zeichen gekürzt sein; tatsächlich: {char_count}"
         );
+        Ok(())
     }
 
     // ── Test 7 ───────────────────────────────────────────────────────────────
 
     /// `extract_and_record` persistiert eine Reflection in `signals/reflections.jsonl`.
     #[test]
-    fn extract_and_record_persists_reflection() {
+    fn extract_and_record_persists_reflection() -> TestResult {
         let root = tmp_root("record");
         let store = crate::file_store::FileMemoryStore::open(&root)
-            .expect("FileMemoryStore::open muss erfolgreich sein");
+            .map_err(ctx("FileMemoryStore::open muss erfolgreich sein"))?;
 
         let entries = vec![
             entry(StmRole::Assistant, 90, "Lesson 1"),
@@ -724,13 +735,13 @@ mod tests {
         ];
         let cfg = SummaryConfig::default();
         let result = extract_and_record(&store, &entries, "record-test", cfg)
-            .expect("extract_and_record darf keinen Fehler erzeugen");
+            .map_err(ctx("extract_and_record darf keinen Fehler erzeugen"))?;
 
         assert!(result.is_some(), "Summary muss erzeugt worden sein");
 
         let jsonl_path = root.join("signals/reflections.jsonl");
         let content = std::fs::read_to_string(&jsonl_path)
-            .expect("reflections.jsonl muss nach record existieren");
+            .map_err(ctx("reflections.jsonl muss nach record existieren"))?;
         assert_eq!(
             content.lines().count(),
             1,
@@ -738,6 +749,7 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // ── Test 8 ───────────────────────────────────────────────────────────────
@@ -861,7 +873,10 @@ mod tests {
         assert_eq!(summary.last_maintenance, Some(now));
         assert_eq!(summary.facts_decayed, 7);
         assert_eq!(summary.total_facts, 0);
-        assert_eq!(summary.by_scope, vec![(FactScope::Project, 0), (FactScope::Global, 0)]);
+        assert_eq!(
+            summary.by_scope,
+            vec![(FactScope::Project, 0), (FactScope::Global, 0)]
+        );
     }
 
     // ── Test 12 ──────────────────────────────────────────────────────────────
@@ -869,7 +884,11 @@ mod tests {
     /// Die deutsche `Display`-Textform enthält alle Kernzahlen.
     #[test]
     fn memory_stats_summary_display_contains_all_sections() {
-        let facts = vec![stats_fact("tui-fix", FactScope::Project, FactType::Decision)];
+        let facts = vec![stats_fact(
+            "tui-fix",
+            FactScope::Project,
+            FactType::Decision,
+        )];
         let mut usage = HashMap::new();
         usage.insert("tui-fix".to_owned(), 4u64);
         let now = OffsetDateTime::now_utc();
@@ -898,26 +917,30 @@ mod tests {
     /// `count_incoming_candidates` zählt nur `.md`-Dateien und liefert `0`
     /// statt eines Fehlers, wenn `_incoming/` noch nicht existiert.
     #[test]
-    fn count_incoming_candidates_counts_md_files_and_defaults_to_zero() {
+    fn count_incoming_candidates_counts_md_files_and_defaults_to_zero() -> TestResult {
         let root = tmp_root("incoming");
         assert_eq!(
-            count_incoming_candidates(&root).unwrap(),
+            count_incoming_candidates(&root).map_err(ctx("count_incoming_candidates"))?,
             0,
             "fehlendes Verzeichnis muss Ok(0) liefern"
         );
 
         let incoming = root.join("facts").join("_incoming");
-        std::fs::create_dir_all(&incoming).unwrap();
-        std::fs::write(incoming.join("kandidat-a.md"), "---\n---\n").unwrap();
-        std::fs::write(incoming.join("kandidat-b.md"), "---\n---\n").unwrap();
-        std::fs::write(incoming.join("notiz.txt"), "kein Kandidat").unwrap();
+        std::fs::create_dir_all(&incoming).map_err(ctx("_incoming anlegen"))?;
+        std::fs::write(incoming.join("kandidat-a.md"), "---\n---\n")
+            .map_err(ctx("kandidat-a.md schreiben"))?;
+        std::fs::write(incoming.join("kandidat-b.md"), "---\n---\n")
+            .map_err(ctx("kandidat-b.md schreiben"))?;
+        std::fs::write(incoming.join("notiz.txt"), "kein Kandidat")
+            .map_err(ctx("notiz.txt schreiben"))?;
 
         assert_eq!(
-            count_incoming_candidates(&root).unwrap(),
+            count_incoming_candidates(&root).map_err(ctx("count_incoming_candidates"))?,
             2,
             "nur .md-Dateien zaehlen als Kandidaten"
         );
 
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 }

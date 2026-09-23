@@ -124,6 +124,7 @@ mod tests {
     use crate::observation::{
         BrowserObservation, DocumentIdentity, ObservationMode, ObservedElement,
     };
+    use crate::test_support::{TestResult, ctx};
     use crate::wait::{WaitCondition, WaitOutcome, WaitTimeout};
 
     // Polls `fut` to completion, assuming it resolves on the very first poll
@@ -165,7 +166,7 @@ mod tests {
                 session_id: self.session_id,
                 context_id: *context_id,
                 revision: BrowserObservationRevision::initial(),
-                url: url::Url::parse("https://example.com").expect("valid static url"),
+                url: url::Url::parse("https://example.com")?,
                 title: "mock".to_owned(),
                 document_identity: DocumentIdentity::new("mock-doc"),
                 elements: Vec::new(),
@@ -270,18 +271,23 @@ mod tests {
     }
 
     #[test]
-    fn test_browser_session_handle_events_resolves_empty() {
+    fn test_browser_session_handle_events_resolves_empty() -> TestResult {
         let (_session_id, _primary_context_id, handle) = mock_handle();
         let result = block_on(handle.events(BrowserEventCursor::zero()));
-        assert_eq!(result.expect("mock events call succeeds"), Vec::new());
+        assert_eq!(
+            result.map_err(ctx("mock events call succeeds"))?,
+            Vec::new()
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_browser_session_handle_capability_probe_resolves() {
+    fn test_browser_session_handle_capability_probe_resolves() -> TestResult {
         let (_session_id, _primary_context_id, handle) = mock_handle();
         let result = block_on(handle.capability_probe());
-        let probe = result.expect("mock capability probe succeeds");
+        let probe = result.map_err(ctx("mock capability probe succeeds"))?;
         assert_eq!(probe.browser_name, "mock-browser");
+        Ok(())
     }
 
     #[test]
@@ -292,37 +298,40 @@ mod tests {
     }
 
     #[test]
-    fn test_browser_session_handle_observe_delegates_to_runtime() {
+    fn test_browser_session_handle_observe_delegates_to_runtime() -> TestResult {
         let (session_id, _primary_context_id, handle) = mock_handle();
         let context_id = BrowserContextId::new();
         let observation = block_on(handle.observe(&context_id, ObservationMode::PageSummary))
-            .expect("mock observe always succeeds");
+            .map_err(ctx("mock observe always succeeds"))?;
         assert_eq!(observation.session_id, session_id);
         assert_eq!(observation.context_id, context_id);
+        Ok(())
     }
 
     #[test]
-    fn test_browser_session_handle_find_delegates_to_runtime() {
+    fn test_browser_session_handle_find_delegates_to_runtime() -> TestResult {
         let (_session_id, _primary_context_id, handle) = mock_handle();
         let context_id = BrowserContextId::new();
         let target = crate::selector::Target::new(crate::selector::Selector::Id("a".to_owned()));
         let element =
             block_on(handle.find(&context_id, &target, BrowserObservationRevision::initial()))
-                .expect("mock find always succeeds");
+                .map_err(ctx("mock find always succeeds"))?;
         assert_eq!(element.element_ref, "mock-ref");
+        Ok(())
     }
 
     #[test]
-    fn test_browser_session_handle_act_delegates_to_runtime() {
+    fn test_browser_session_handle_act_delegates_to_runtime() -> TestResult {
         let (_session_id, _primary_context_id, handle) = mock_handle();
         let context_id = BrowserContextId::new();
         let request = ActionRequest::new(context_id, crate::action::BrowserAction::Reload);
-        let outcome = block_on(handle.act(request)).expect("mock act always succeeds");
+        let outcome = block_on(handle.act(request)).map_err(ctx("mock act always succeeds"))?;
         assert!(!outcome.confirmed);
+        Ok(())
     }
 
     #[test]
-    fn test_browser_session_handle_wait_delegates_to_runtime() {
+    fn test_browser_session_handle_wait_delegates_to_runtime() -> TestResult {
         let (_session_id, _primary_context_id, handle) = mock_handle();
         let context_id = BrowserContextId::new();
         let condition = WaitCondition::NavigationComplete;
@@ -331,13 +340,14 @@ mod tests {
             condition.clone(),
             WaitTimeout::from_millis(100),
         ))
-        .expect("mock wait always succeeds");
+        .map_err(ctx("mock wait always succeeds"))?;
         assert!(outcome.satisfied);
         assert_eq!(outcome.condition, condition);
+        Ok(())
     }
 
     #[test]
-    fn test_session_info_serde_json_round_trip() {
+    fn test_session_info_serde_json_round_trip() -> TestResult {
         let info = SessionInfo {
             id: BrowserSessionId::new(),
             state: BrowserSessionState::Ready,
@@ -346,17 +356,19 @@ mod tests {
             driver_version: None,
         };
 
-        let json = serde_json::to_string(&info).expect("session info serializes");
-        let decoded: SessionInfo = serde_json::from_str(&json).expect("session info deserializes");
+        let json = serde_json::to_string(&info).map_err(ctx("session info serializes"))?;
+        let decoded: SessionInfo =
+            serde_json::from_str(&json).map_err(ctx("session info deserializes"))?;
         assert_eq!(decoded.id, info.id);
         assert_eq!(decoded.state, info.state);
         assert_eq!(decoded.browser_name, info.browser_name);
         assert_eq!(decoded.browser_version, info.browser_version);
         assert_eq!(decoded.driver_version, info.driver_version);
+        Ok(())
     }
 
     #[test]
-    fn test_browser_session_state_variants_serde_json_round_trip() {
+    fn test_browser_session_state_variants_serde_json_round_trip() -> TestResult {
         let states = [
             BrowserSessionState::Starting,
             BrowserSessionState::Ready,
@@ -367,10 +379,11 @@ mod tests {
             BrowserSessionState::Failed,
         ];
         for state in states {
-            let json = serde_json::to_string(&state).expect("state serializes");
+            let json = serde_json::to_string(&state).map_err(ctx("state serializes"))?;
             let decoded: BrowserSessionState =
-                serde_json::from_str(&json).expect("state deserializes");
+                serde_json::from_str(&json).map_err(ctx("state deserializes"))?;
             assert_eq!(decoded, state);
         }
+        Ok(())
     }
 }

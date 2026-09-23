@@ -67,12 +67,12 @@ use harw_authority::{
     NetworkScope, PermissionRequest, PermissionSet, SandboxSpec, WorkspaceRegistration,
     WorkspaceRegistry,
 };
-use harw_config::{PermissionsSection, PlanSection, ResolvedConfig, discover_config};
+use harw_config::{PermissionsSection, PlanSection, ResolvedConfig};
 use harw_context::ContextCeiling;
 use harw_core::{
     AgentSession, ChildRegistryFactory, DriftObserver, GuardPolicy, InteractionMode,
-    ManagedAgentSpawner, ModelProvider, PitfallAdvisor, RoleEffortWeights, SessionActivation,
-    SessionManager, SpawnContext, StateStore, ToolProfile,
+    ManagedAgentSpawner, ModelProvider, OrchestrationObserver, PitfallAdvisor, RoleEffortWeights,
+    SessionActivation, SessionManager, SpawnContext, StateStore, ToolProfile,
 };
 use harw_extension_api::allow_rules::{AllowRuleSet, ApprovalRule, RuleDecision, RuleScope};
 use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
@@ -83,30 +83,33 @@ use harw_extension_api::{
     capabilities::AgentSpawner,
 };
 use harw_home::paths::{active_profile_name, profile_dir};
-use harw_home::project::{
-    ProjectHome, ProjectRoot, discover_project as discover_home_project, project_key,
-    project_settings_dir,
-};
+use harw_home::project::{ProjectHome, ProjectRoot, discover_project as discover_home_project};
 use harw_memory::Memory;
 use harw_operations::adapter::ModelToolProvider;
 use harw_operations::operation::{Operation, Surface};
 use harw_operations::registry::OperationRegistry;
 use harw_operations::{OpContext, SharedSessionController};
-use harw_plan::{InMemoryGoalStore, InMemoryPlanStore, PlanNodeKind, PlanToolConfig};
+use harw_plan::{
+    FileGoalStore, FilePlanStore, GoalStore, InMemoryGoalStore, InMemoryPlanStore, PlanNodeKind,
+    PlanStore, PlanToolConfig,
+};
 use harw_plan_bridge::FindingStore;
 use harw_project_discovery::{DiscoveryConfig, ProjectContext, discover_project};
-use harw_protocol::events::{SessionEvent, TurnEvent};
+use harw_protocol::{
+    AgentOrchestrationEvent,
+    events::{SessionEvent, TurnEvent},
+};
 use harw_provider_http::{ProviderLoadRegistry, SecretResolver};
 use harw_registry_defaults::embedded_agents::builtin_agent_definitions;
 use harw_registry_defaults::profile::{
     HostPermitWiring, IdentityOverrides, RegistryProfile, role_names,
 };
 use harw_sandbox::{ExtraRootsCell, HostPermitSessionRegistry, ProcessPermitLedger};
+use harw_session_store::{ApprovalStore, JobStore};
 use harw_tool_shell::host_permit_prompt::{
     HostPermitHandles, HostPermitPromptReceiver, HostPermitPromptSender, HostPermitVariant,
     host_permit_prompt_channel,
 };
-use harw_session_store::{ApprovalStore, JobStore};
 use harw_types::{
     AgentRole, ModelId, Principal, ProviderId, SessionId, TenantId, TurnId, WorkspaceId,
 };
@@ -320,57 +323,6 @@ fn os_user_home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Lädt die projekt-scoped `[permissions]`-Sektion (Contract §2, Zeile A2).
-///
-/// # Beschreibung
-/// Der autoritätsgewährende Speicherort eines Projekts ist
-/// `~/.harw/profiles/<profil>/projects/<project-key>` — außerhalb jedes
-/// Repos, damit ein geklontes Projekt sich keine Rechte selbst geben kann.
-/// Dieses Verzeichnis wird wie jeder andere Config-Layer über
-/// [`harw_config::discover_config`] gelesen (eine `config.toml` darunter);
-/// fehlt das Verzeichnis oder die Datei, liefert `discover_config` bereits
-/// eine leere [`ResolvedConfig`] — das ist der normale „noch nichts
-/// gemerkt“-Zustand eines Projekts, kein Fehler.
-///
-/// Jeder andere Fehler (ungültiger Profilname, kaputtes TOML) wird
-/// **nicht** weitergereicht: die Wurzel-Montage darf an einer beschädigten
-/// Projekt-Einstellungsdatei nicht scheitern. Es bleibt bei einem `warn!`
-/// und der leeren Sektion.
-///
-/// # Arguments
-/// - `home` (`&Path`): aufgelöster Root-Space.
-/// - `profile` (`&str`): aktives Profil ([`active_profile_name`]).
-/// - `key` (`&str`): Projekt-Schlüssel ([`project_key`]).
-///
-/// # Returns
-/// Die geladene [`PermissionsSection`]; leer, wenn nichts gemerkt wurde oder
-/// das Lesen fehlschlug.
-fn load_project_permissions(home: &Path, profile: &str, key: &str) -> PermissionsSection {
-    let dir = match project_settings_dir(home, profile, key) {
-        Ok(dir) => dir,
-        Err(error) => {
-            tracing::warn!(
-                profile,
-                key,
-                error = %error,
-                "runtime.project_settings.path_invalid"
-            );
-            return PermissionsSection::default();
-        }
-    };
-    match discover_config(std::slice::from_ref(&dir)) {
-        Ok(config) => config.harness.permissions,
-        Err(error) => {
-            tracing::warn!(
-                dir = %dir.display(),
-                error = %error,
-                "runtime.project_settings.load_failed"
-            );
-            PermissionsSection::default()
-        }
-    }
-}
-
 /// Baut ein [`SandboxProfile`] aus der vertrauenswürdigen
 /// `[sandbox]`-Konfiguration.
 ///
@@ -451,10 +403,12 @@ fn sandbox_profile_from_config(
 /// # Arguments
 /// - `entry` ([`EntryKind`]): der Einstieg, dessen eingebaute Vorgabe die
 ///   unterste Stufe bildet.
-/// - `global` (`&PermissionsSection`): `[permissions]` aus der globalen
-///   Konfiguration (`config.harness.permissions`).
-/// - `project` (`&PermissionsSection`): `[permissions]` aus der
-///   Projekt-Einstellungsdatei ([`load_project_permissions`]).
+/// - `global` (`&PermissionsSection`): die bereits vollständig gemergte
+///   `[permissions]`-Sektion aus `config.harness.permissions`; sie enthält
+///   gegebenenfalls die Projekt-Einstellungen als höchste Präzedenz.
+/// - `project` (`&PermissionsSection`): zusätzlicher, nur für explizite
+///   Einbettungen gelieferter Projekt-Override. Die normale Montage übergibt
+///   ihn leer, weil `load_config` diesen Layer bereits eingemergt hat.
 ///
 /// # Returns
 /// Den effektiven [`ApprovalMode`].
@@ -572,49 +526,6 @@ fn seed_extra_roots(
     cell
 }
 
-/// Baut die eingebauten Plan-Dienste, mit denen die TUI ohne jede
-/// Konfiguration startet (Plan Schritt 1, `[tools.plan] enabled` Default
-/// `true` für interaktive TUI-Einstiege).
-///
-/// # Beschreibung
-/// `plan`/`goal` sind reine In-Memory-Speicher — bewusst nicht persistent,
-/// solange niemand `[tools.plan] persist = true` setzt (derselbe Vorgabewert
-/// wie [`PlanToolConfig::enabled_defaults`]). Der [`FindingStore`] wurzelt
-/// auf [`ProjectHome::plans_dir`]: er legt sein Verzeichnis erst beim ersten
-/// Schreiben an, ein unbenutztes Projekt bleibt also ohne Spur auf der
-/// Platte.
-///
-/// # Arguments
-/// - `project_home` (`&ProjectHome`): das Projekt-Home dieses Laufs.
-///
-/// # Returns
-/// [`PlanServices`] mit aktivierter [`PlanToolConfig`].
-fn default_tui_plan_services(project_home: &ProjectHome) -> PlanServices {
-    PlanServices {
-        plan: Arc::new(InMemoryPlanStore::new()),
-        goal: Arc::new(InMemoryGoalStore::new()),
-        findings: Arc::new(FindingStore::new(project_home.plans_dir())),
-        plan_config: PlanToolConfig::enabled_defaults(),
-    }
-}
-
-/// Ob der Aufrufer `[tools.plan]` in keiner Konfigurationsebene angefasst hat.
-///
-/// # Beschreibung
-/// `PlanSection::enabled` ist ein einfaches `bool` (kein `Option<bool>`) und
-/// kann „nie gesetzt“ nicht von „ausdrücklich auf `false` gesetzt“
-/// unterscheiden (Kopplung an `harw-config`, außerhalb dieser Welle). Als
-/// Näherung gilt die Sektion nur dann als unangetastet, wenn sie **exakt**
-/// [`PlanSection::default`] entspricht — jede andere Abweichung (auch nur
-/// `persist = true` bei weiterhin `enabled = false`) wird als bewusste
-/// Entscheidung gewertet und nicht überschrieben.
-///
-/// # Returns
-/// `true`, wenn `section == PlanSection::default()`.
-fn plan_section_is_untouched(section: &PlanSection) -> bool {
-    *section == PlanSection::default()
-}
-
 /// Übersetzt eine deklarative `[tools.plan]`-Sektion in eine [`PlanToolConfig`].
 ///
 /// # Beschreibung
@@ -676,18 +587,14 @@ fn plan_tool_config_from_section(section: &PlanSection) -> Result<PlanToolConfig
 ///    durch diese Funktion nicht.
 /// 2. **Nicht-`Tui`-Einstiege ohne Builder-Wert**: bleiben ohne eingebaute
 ///    Vorgabe geschlossen.
-/// 3. **Unangetastete Sektion** ([`plan_section_is_untouched`]): gilt als
-///    „noch nie entschieden“ und wird zu [`default_tui_plan_services`] —
-///    `/plan` und `/goal` funktionieren damit ohne jeden Konfigurationseintrag.
-/// 4. **Berührte Sektion, `enabled = false`**: bleibt geschlossen — eine
+/// 3. **`enabled = false`**: bleibt geschlossen — eine
 ///    bewusste Abschaltung wird nie überschrieben.
-/// 5. **Berührte Sektion, `enabled = true`**: [`plan_tool_config_from_section`]
+/// 4. **`enabled = true`** (auch der deklarative Default): [`plan_tool_config_from_section`]
 ///    übersetzt die volle Konfiguration (Knotenlimits,
-///    `require_exploration_for` etc.). Schlägt die Übersetzung fehl, bleibt
-///    die Fläche geschlossen (`warn!`, fail-soft wie
-///    [`load_project_permissions`]). Die Speicher bleiben, wie im eingebauten
-///    Vorgabefall, In-Memory — das Umschalten auf `FilePlanStore`/
-///    `FileGoalStore` bei `persist = true` ist nicht Teil dieser Welle.
+///    `require_exploration_for` etc.). Ein Fehler beendet die Montage, statt
+///    einen unbemerkten In-Memory-Ersatz zu verwenden. Bei `persist = true`
+///    werden Plan und Goal als [`FilePlanStore`] bzw. [`FileGoalStore`] unter
+///    dem bereits aufgelösten Projekt-Home geöffnet.
 ///
 /// # Arguments
 /// - `entry` ([`EntryKind`]): der Einstieg des Laufs.
@@ -702,35 +609,45 @@ fn resolve_plan_services(
     explicit: Option<PlanServices>,
     section: &PlanSection,
     project_home: &ProjectHome,
-) -> Option<PlanServices> {
+) -> RuntimeResult<Option<PlanServices>> {
     if explicit.is_some() {
-        return explicit;
+        return Ok(explicit);
     }
     if !matches!(entry, EntryKind::Tui) {
-        return None;
-    }
-    if plan_section_is_untouched(section) {
-        return Some(default_tui_plan_services(project_home));
+        return Ok(None);
     }
     if !section.enabled {
-        return None;
+        return Ok(None);
     }
-    match plan_tool_config_from_section(section) {
-        Ok(plan_config) => Some(PlanServices {
-            plan: Arc::new(InMemoryPlanStore::new()),
-            goal: Arc::new(InMemoryGoalStore::new()),
-            findings: Arc::new(FindingStore::new(project_home.plans_dir())),
-            plan_config,
-        }),
-        Err(error) => {
-            tracing::warn!(
-                entry = ?entry,
-                error = %error,
-                "runtime.plan_tool_config.invalid"
-            );
-            None
-        }
-    }
+    let plan_config =
+        plan_tool_config_from_section(section).map_err(|detail| RuntimeError::Config { detail })?;
+    let (plan, goal): (Arc<dyn PlanStore>, Arc<dyn GoalStore>) = if plan_config.persist {
+        let plan = FilePlanStore::with_config(
+            project_home.plans_dir().join("default"),
+            plan_config.clone(),
+        )
+        .map_err(|error| RuntimeError::Config {
+            detail: format!("cannot open persistent plan store: {error}"),
+        })?;
+        let goal =
+            FileGoalStore::new(project_home.goals_dir().join("default")).map_err(|error| {
+                RuntimeError::Config {
+                    detail: format!("cannot open persistent goal store: {error}"),
+                }
+            })?;
+        (Arc::new(plan), Arc::new(goal))
+    } else {
+        (
+            Arc::new(InMemoryPlanStore::new()),
+            Arc::new(InMemoryGoalStore::new()),
+        )
+    };
+    Ok(Some(PlanServices {
+        plan,
+        goal,
+        findings: Arc::new(FindingStore::new(project_home.plans_dir())),
+        plan_config,
+    }))
 }
 
 /// Die organisatorische Rolle (§3-Spawn-Matrix) der Wurzel eines Einstiegs.
@@ -1456,7 +1373,9 @@ impl RuntimeAssemblyBuilder {
     ///   geprüft).
     /// - [`RuntimeError::Spawner`], wenn ein Einstieg mit
     ///   [`SpawnerPolicy::BuiltinRoles`] ohne [`Self::session_events`] gebaut
-    ///   wird oder die Wurzelregistrierung scheitert.
+    ///   wird, die Wurzelregistrierung scheitert, oder der Wurzel-Trace aus
+    ///   [`new_root_trace`] nicht erzeugt werden kann (per Konstruktion
+    ///   unerreichbar, siehe dort).
     pub fn build(self) -> RuntimeResult<RuntimeAssembly> {
         let Self {
             spec,
@@ -1584,14 +1503,15 @@ impl RuntimeAssemblyBuilder {
                 as Arc<dyn PitfallAdvisor>
         });
 
-        // Freigaben-Konfiguration: Projekt schlägt Global schlägt eingebaute
-        // Vorgabe (Contract §2). Die Projekt-Einstellungsdatei liegt
-        // autoritätsgewährend außerhalb des Repos.
+        // Die komplette Konfigurationskette, einschließlich der
+        // autoritätsgewährenden Projekt-Einstellungen außerhalb des Repos,
+        // wurde in `load_config` genau einmal gemergt. Ein zweites,
+        // permissions-spezifisches Einlesen würde Allow-/Deny-Regeln doppelt
+        // registrieren. Die effektive Sektion enthält daher bereits die
+        // Projekt-Präzedenz.
         let profile_name = active_profile_name(&spec.home);
-        let project_settings_key = project_key(&home_project_root.root);
-        let project_permissions =
-            load_project_permissions(&spec.home, &profile_name, &project_settings_key);
         let global_permissions = config.harness.permissions.clone();
+        let project_permissions = PermissionsSection::default();
         // Welle FANIN-K/FANIN-RT: das Agentendefinitions-Verzeichnis des
         // aktiven Profils (`<profil>/agents`) — gebraucht sowohl für die
         // Kind-Fabrik (Schritt 9, `agent-steward`-Kinder) als auch für die
@@ -1652,7 +1572,16 @@ impl RuntimeAssemblyBuilder {
         } else {
             resolve_active_agent(spec.active_agent.as_deref(), &config, &agent_definitions)?
         };
-        let activation = root_activation(uia_ir.as_ref().or(agent_ir.as_ref()));
+        // Die Kind-Decke ist die *tatsächliche* Aktivierung der Root-Session:
+        // `new_root_session` wendet ausschließlich `agent_ir` an (bei aktiver
+        // UIA `None` → `SessionActivation::default()`), nie `uia_ir`. Früher
+        // stand hier `uia_ir.or(agent_ir)`; eine UIA-Definition ohne
+        // `[tools]`-Abschnitt ergab damit eine leere `Minimal`-Decke, gegen
+        // die jedes Kind auf null Werkzeuge geschnitten wurde, während die
+        // Wurzel selbst weiter lesen konnte (Explore-Kinder schrieben daraufhin
+        // Tool-Calls als Text). Enkel ⊆ Kind ⊆ Wurzel gilt so gegen die echte
+        // Wurzel.
+        let activation = root_activation(agent_ir.as_ref());
         // Welle 8: Provider-/Modell-/Agenten-Reasoning-Effort-Vorgaben der
         // Wurzel-UIA, einmalig hier bestimmt (nicht in
         // [`Self::new_root_session`], das keinen Zugriff auf `uia_ir` selbst
@@ -1661,7 +1590,9 @@ impl RuntimeAssemblyBuilder {
             resolve_root_uia_reasoning_effort_defaults(&config, uia_ir.as_ref());
 
         // 5. Ein Trace, ein Spawn-Kontext.
-        let trace = new_root_trace(spec.entry);
+        let trace = new_root_trace(spec.entry).map_err(|error| RuntimeError::Spawner {
+            detail: error.to_string(),
+        })?;
         let spawn_context = SpawnContext {
             sandbox: sandbox.clone(),
             suggestions: None,
@@ -1775,8 +1706,7 @@ impl RuntimeAssemblyBuilder {
         // gebaut wird, über `with_host_permit_prompts` an genau diesen Provider;
         // die Empfängerseite hält [`RuntimeAssembly::take_host_permit_prompts`]
         // bis zur ersten Abholung durch den Renderer (z. B. `harw-tui`) fest.
-        let (host_permit_prompt_sender, host_permit_prompt_receiver) =
-            host_permit_prompt_channel();
+        let (host_permit_prompt_sender, host_permit_prompt_receiver) = host_permit_prompt_channel();
         // Verdrahtung für `assemble_registry_for_sandbox_with_definition_access_
         // and_sandbox_profile_and_permits`: bündelt Ledger, Sitzungs-Registry und
         // Fragekanal-Sender. Vorauswahl `SessionLease` nur für den Shell-Modus
@@ -1890,7 +1820,7 @@ impl RuntimeAssemblyBuilder {
             plan_services,
             &config.harness.tools.plan,
             &home_project,
-        );
+        )?;
 
         // 8. Operationen nach der Fläche des Einstiegs.
         let operations = build_operations(profile.operations, plan_services.as_ref());
@@ -1978,6 +1908,7 @@ impl RuntimeAssemblyBuilder {
                 // `host-process-worker`).
                 sandbox_profile: &sandbox_profile,
                 host_permit_wiring: &host_permit_wiring_for_children,
+                state_store: Arc::clone(&stores.state_store),
             },
             session_events,
         )?;
@@ -2059,32 +1990,45 @@ impl RuntimeAssemblyBuilder {
 
         // 11. Dienste. Sie entstehen **vor** dem Bau der Registry, weil die
         //     Modell-Tool-Fläche der Operationen ihre Service-Map braucht.
-        let services = Arc::new(RuntimeServices::new(RuntimeServicesParts {
-            operations: Arc::clone(&operations),
-            state_store: Arc::clone(&stores.state_store),
-            job_store: stores.job_store.clone(),
-            spawner: spawner.clone(),
-            memory,
-            config: Arc::clone(&config),
-            plan: plan_services,
-            approval_mode: approval_mode.clone(),
-            allow_rules: allow_rules.clone(),
-            extra_roots: extra_roots.clone(),
-            principal: spec.principal.clone(),
-            session_controller,
-            provider_load_registry: provider_load_registry.clone(),
-            // Teil B3: derselbe Wurzel-Ledger/-Registry/-Sender wie
-            // `Self::host_permit_ledger`/`host_permit_session_registry`/
-            // `host_permit_prompt_sender` (siehe deren Accessoren unten) —
-            // nur `Arc::clone`/Sender-Klon, kein zweiter Ledger. Der
-            // `RuntimeAssembly`-Literal am Ende dieser Funktion bewegt die
-            // ungeklonten Originale, darum wird hier geklont statt bewegt.
-            host_permit_handles: Some(Arc::new(HostPermitHandles {
-                ledger: Arc::clone(&host_permit_ledger),
-                registry: Arc::clone(&host_permit_registry),
-                prompts: Some(host_permit_prompt_sender.clone()),
-            })),
-        }));
+        let home_context = Arc::new(
+            harw_home::ResolvedHomeContext::new(
+                &spec.home,
+                profile_name.clone(),
+                home_project_root.clone(),
+            )
+            .map_err(|error| RuntimeError::Config {
+                detail: error.to_string(),
+            })?,
+        );
+        let services = Arc::new(
+            RuntimeServices::new(RuntimeServicesParts {
+                operations: Arc::clone(&operations),
+                state_store: Arc::clone(&stores.state_store),
+                job_store: stores.job_store.clone(),
+                spawner: spawner.clone(),
+                memory,
+                config: Arc::clone(&config),
+                plan: plan_services,
+                approval_mode: approval_mode.clone(),
+                allow_rules: allow_rules.clone(),
+                extra_roots: extra_roots.clone(),
+                principal: spec.principal.clone(),
+                session_controller,
+                provider_load_registry: provider_load_registry.clone(),
+                // Teil B3: derselbe Wurzel-Ledger/-Registry/-Sender wie
+                // `Self::host_permit_ledger`/`host_permit_session_registry`/
+                // `host_permit_prompt_sender` (siehe deren Accessoren unten) —
+                // nur `Arc::clone`/Sender-Klon, kein zweiter Ledger. Der
+                // `RuntimeAssembly`-Literal am Ende dieser Funktion bewegt die
+                // ungeklonten Originale, darum wird hier geklont statt bewegt.
+                host_permit_handles: Some(Arc::new(HostPermitHandles {
+                    ledger: Arc::clone(&host_permit_ledger),
+                    registry: Arc::clone(&host_permit_registry),
+                    prompts: Some(host_permit_prompt_sender.clone()),
+                })),
+            })
+            .with_home_context(home_context),
+        );
 
         // 12. Modell-Tool-Fläche der Operationen — **nur** für
         //     `OperationSurface::AllWithModelTools`.
@@ -2368,8 +2312,11 @@ fn resolve_root_uia_reasoning_effort_defaults(
 /// gebaut werden kann.
 /// Rückgabe von [`split_root_and_uia_worker_models`]: `(model,
 /// uia_worker_model, uia_load_registry)`, siehe dortige `# Returns`-Sektion.
-type SplitRootAndUiaWorkerModels =
-    (Arc<dyn ModelProvider>, Arc<dyn ModelProvider>, ProviderLoadRegistry);
+type SplitRootAndUiaWorkerModels = (
+    Arc<dyn ModelProvider>,
+    Arc<dyn ModelProvider>,
+    ProviderLoadRegistry,
+);
 
 fn split_root_and_uia_worker_models(
     spec: &RuntimeSpec,
@@ -2521,6 +2468,11 @@ fn build_operations(surface: OperationSurface, plan: Option<&PlanServices>) -> O
 /// Die Sandbox kommt aus dem `ToolExecutionContext`, den der Turn-Loop stellt
 /// — **nie** aus Modell-Argumenten. Die Fabrik bekommt nur diesen Kontext zu
 /// sehen (`OpContextFactory`, `harw-operations/src/adapter/model_tool.rs:52`).
+/// Aus demselben `ToolExecutionContext` übernimmt die Fabrik auch den
+/// `CancelToken` des Turns (`ToolExecutionContext::cancel`) in den gebauten
+/// [`OpContext`] (`OpContext::with_cancel_token`) — ist keiner gesetzt
+/// (z. B. in einem Test-Fixture ohne `TurnControl`), bleibt
+/// `OpContext::cancel_token` `None`.
 fn install_operation_model_tools(
     builder: ExtensionRegistryBuilder,
     surface: OperationSurface,
@@ -2533,12 +2485,23 @@ fn install_operation_model_tools(
             let exposed: Vec<Arc<dyn Operation>> = operations.iter().map(Arc::clone).collect();
             let services = Arc::clone(services);
             let provider = ModelToolProvider::new(exposed, move |execution_context| {
-                OpContext::new(
+                let ctx = OpContext::new(
                     execution_context.session_id().clone(),
                     execution_context.turn_id().clone(),
                     execution_context.sandbox().clone(),
                     services.service_map(ServiceSurface::ModelTool),
-                )
+                );
+                // Der Turn-Loop hängt seinen `CancelToken` an jeden
+                // `ToolExecutionContext` (`control.cancel_token()`, siehe
+                // `harw-core::turn_loop`); ohne diesen Schritt bekäme jede
+                // Operation — u. a. `AgentToolAdapter::invoke` und
+                // `fanout_children` in `harw-core-bridge` — nie den echten
+                // Turn-Abbruch zu sehen und müsste immer auf einen frischen,
+                // nie abgebrochenen Token zurückfallen.
+                match execution_context.cancel() {
+                    Some(cancel) => ctx.with_cancel_token(cancel.clone()),
+                    None => ctx,
+                }
             });
             builder.tool_provider(Arc::new(provider))
         }
@@ -2984,6 +2947,51 @@ fn resolve_context_window(config: &ResolvedConfig) -> u64 {
         .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS)
 }
 
+/// Bridges controller lifecycle snapshots into the runtime's existing durable
+/// session store. The observer never blocks controller locks: it schedules a
+/// write on the current Tokio runtime after the controller has released its
+/// own registry locks. A controller can also be driven from a synchronous
+/// caller (notably command setup and embedding hosts); in that case a short
+/// lived current-thread runtime synchronously owns the write instead of
+/// dropping or detaching it. Controller locks have already been released at
+/// this boundary, so this bridge cannot stall controller scheduling.
+struct StateStoreOrchestrationObserver {
+    state_store: Arc<dyn StateStore>,
+}
+
+impl OrchestrationObserver for StateStoreOrchestrationObserver {
+    fn on_orchestration_event(&self, event: AgentOrchestrationEvent) {
+        let store = Arc::clone(&self.state_store);
+        let session = event.root_session_id.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    if let Err(error) = store.record_agent_orchestration(&session, &event).await {
+                        tracing::warn!(%error, session = %session, "orchestration_event.persist_failed");
+                    }
+                });
+            }
+            Err(_) => {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        tracing::warn!(%error, session = %session, "orchestration_event.bridge_runtime_failed");
+                        return;
+                    }
+                };
+                runtime.block_on(async move {
+                    if let Err(error) = store.record_agent_orchestration(&session, &event).await {
+                        tracing::warn!(%error, session = %session, "orchestration_event.persist_failed");
+                    }
+                });
+            }
+        }
+    }
+}
+
 /// Die Leihgaben, aus denen [`build_spawner`] den Spawner baut.
 ///
 /// # Beschreibung
@@ -3059,6 +3067,8 @@ struct SpawnerInputs<'a> {
     /// durchgereicht — damit erreichen auch `uia-shell-worker` und
     /// `host-process-worker` dieselbe Freigabekette wie die Wurzel.
     host_permit_wiring: &'a Option<HostPermitWiring>,
+    /// Shared transcript/state store used by lifecycle observer records.
+    state_store: Arc<dyn StateStore>,
 }
 
 /// Montiert den Spawner eines Laufs nach seiner [`SpawnerPolicy`].
@@ -3097,6 +3107,7 @@ fn build_spawner(
         reasoning_effort_config,
         sandbox_profile,
         host_permit_wiring,
+        state_store,
     } = inputs;
 
     let events = session_events.ok_or_else(|| RuntimeError::Spawner {
@@ -3181,6 +3192,7 @@ fn build_spawner(
     let model_id = config.harness.default_model.as_deref().unwrap_or_default();
     let manager = Arc::new(std::sync::Mutex::new(SessionManager::new(events)));
     let mut spawner = ManagedAgentSpawner::new(manager, child_limits(config, model_id))
+        .with_orchestration_observer(Arc::new(StateStoreOrchestrationObserver { state_store }))
         // Addendum F+G: Rollen-Reasoning-Gewichtung und Drift-Beobachter
         // gelten für jedes über diesen Spawner admittierte Kind.
         .with_role_effort_weights(Some(crate::guard_wiring::role_effort_weights_from_config(
@@ -3504,9 +3516,12 @@ impl RuntimeAssembly {
     /// [`RuntimeError::Registry`], wenn der Empfänger bereits ausgehändigt
     /// wurde oder die interne Sperre vergiftet ist.
     pub fn take_host_permit_prompts(&self) -> RuntimeResult<HostPermitPromptReceiver> {
-        let mut slot = self.host_permit_prompts.lock().map_err(|_| RuntimeError::Registry {
-            detail: "the host permit prompt lock is poisoned".to_owned(),
-        })?;
+        let mut slot = self
+            .host_permit_prompts
+            .lock()
+            .map_err(|_| RuntimeError::Registry {
+                detail: "the host permit prompt lock is poisoned".to_owned(),
+            })?;
         slot.take().ok_or_else(|| RuntimeError::Registry {
             detail: "this runtime has already handed out its host permit prompt receiver"
                 .to_owned(),
@@ -3577,8 +3592,9 @@ impl RuntimeAssembly {
     /// # Beschreibung
     /// Genau der Wert, mit dem
     /// [`ManagedAgentSpawner::with_external_root_parent`] registriert wurde
-    /// (W2A-02) und den [`Self::new_root_session`] der Sitzung als
-    /// `base_activation` gibt. Er ist hier lesbar, weil die Anzeige den
+    /// (W2A-02). Er entspricht der Basis-Aktivierung, die
+    /// [`Self::new_root_session`] aus derselben `agent_ir` ableitet (bei
+    /// aktiver UIA: `SessionActivation::default()`). Er ist hier lesbar, weil die Anzeige den
     /// Unterschied „vom Modus verengt" gegen „von der Agent-Definition
     /// verboten" braucht — `harw-tui`s `/tools` (W2A-01, „noch kein
     /// Aufrufer") ist der benannte Verbraucher in Welle W2d.
@@ -4006,6 +4022,7 @@ impl RuntimeAssembly {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
     fn turn_limits_never_exceed_the_root_budget() {
@@ -4061,39 +4078,45 @@ mod tests {
     }
 
     /// Die gesenkten eingebauten Rollen einer leeren Konfiguration.
-    fn builtin() -> (ResolvedConfig, HashMap<String, ExecutableAgentIr>) {
+    fn builtin() -> TestResult<(ResolvedConfig, HashMap<String, ExecutableAgentIr>)> {
         let config = ResolvedConfig::default();
-        let definitions = lower_agent_definitions(&config).expect("Rollen senken");
-        (config, definitions)
+        let definitions = lower_agent_definitions(&config).map_err(ctx("Rollen senken"))?;
+        Ok((config, definitions))
     }
 
     #[test]
-    fn interactive_entries_require_a_configured_user_interface_agent() {
-        let (config, definitions) = builtin();
-        let error = resolve_active_uia(EntryKind::Tui, &config, &definitions).unwrap_err();
+    fn interactive_entries_require_a_configured_user_interface_agent() -> TestResult {
+        let (config, definitions) = builtin()?;
+        let Err(error) = resolve_active_uia(EntryKind::Tui, &config, &definitions) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(error, RuntimeError::Registry { .. }));
 
         let explorer = definitions
             .get(role_names::EXPLORER)
-            .expect("explorer")
+            .ok_or(TestError::Missing("explorer"))?
             .clone();
         let mut config = config;
         config.harness.active_uia_definition = Some("not-a-uia".to_owned());
         config
             .executable_agents
             .insert("not-a-uia".to_owned(), explorer);
-        let error = resolve_active_uia(EntryKind::Tui, &config, &definitions).unwrap_err();
+        let Err(error) = resolve_active_uia(EntryKind::Tui, &config, &definitions) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(error, RuntimeError::Registry { .. }));
+        Ok(())
     }
 
     #[test]
-    fn non_interactive_entries_do_not_require_a_uia() {
-        let (config, definitions) = builtin();
+    fn non_interactive_entries_do_not_require_a_uia() -> TestResult {
+        let (config, definitions) = builtin()?;
         assert!(
             resolve_active_uia(EntryKind::Doctor, &config, &definitions)
-                .expect("doctor has no UIA requirement")
+                .map_err(ctx("doctor has no UIA requirement"))?
                 .is_none()
         );
+        Ok(())
     }
 
     // ── split_root_and_uia_worker_models (Welle 3a, Teil A) ─────────────
@@ -4139,6 +4162,7 @@ mod tests {
                 max_concurrency: None,
                 originator: None,
                 default_reasoning_effort: None,
+                gateway_identity_headers: false,
             }
         }
 
@@ -4150,8 +4174,12 @@ mod tests {
             },
             ..ResolvedConfig::default()
         };
-        config.providers.insert("local-a".to_owned(), loopback_provider("local-a"));
-        config.providers.insert("local-b".to_owned(), loopback_provider("local-b"));
+        config
+            .providers
+            .insert("local-a".to_owned(), loopback_provider("local-a"));
+        config
+            .providers
+            .insert("local-b".to_owned(), loopback_provider("local-b"));
         config
     }
 
@@ -4168,54 +4196,66 @@ mod tests {
     }
 
     #[test]
-    fn resolve_root_uia_reasoning_effort_defaults_prefers_uia_pair_when_usable() {
+    fn resolve_root_uia_reasoning_effort_defaults_prefers_uia_pair_when_usable() -> TestResult {
         let mut config = two_provider_config();
         // `local-a` (der Vorgabe-Provider) trägt einen anderen Effort als
         // `local-b` (der abweichende UIA-Provider) — nur `local-b` darf
         // gewinnen, wenn `uia_provider`/`uia_model` beide gesetzt und
         // `uia_provider` nutzbar ist.
-        config.providers.get_mut("local-a").expect("local-a").default_reasoning_effort =
-            Some(harw_types::ReasoningEffort::Low);
-        config.providers.get_mut("local-b").expect("local-b").default_reasoning_effort =
-            Some(harw_types::ReasoningEffort::Xhigh);
+        config
+            .providers
+            .get_mut("local-a")
+            .ok_or(TestError::Missing("local-a"))?
+            .default_reasoning_effort = Some(harw_types::ReasoningEffort::Low);
+        config
+            .providers
+            .get_mut("local-b")
+            .ok_or(TestError::Missing("local-b"))?
+            .default_reasoning_effort = Some(harw_types::ReasoningEffort::Xhigh);
         config.harness.uia_provider = Some("local-b".to_owned());
         config.harness.uia_model = Some("local-b-model".to_owned());
 
-        let (_config_for_definitions, definitions) = builtin();
+        let (_config_for_definitions, definitions) = builtin()?;
         let uia_ir = definitions
             .get(role_names::EXPLORER)
-            .expect("builtin explorer definition");
+            .ok_or(TestError::Missing("builtin explorer definition"))?;
 
         let (provider_default, model_default, _agent_default) =
             resolve_root_uia_reasoning_effort_defaults(&config, Some(uia_ir));
         assert_eq!(provider_default, Some(harw_types::ReasoningEffort::Xhigh));
         assert_eq!(model_default, None, "local-b-model ist nicht katalogisiert");
+        Ok(())
     }
 
     #[test]
-    fn resolve_root_uia_reasoning_effort_defaults_falls_back_to_default_pair_without_a_usable_uia_pair() {
+    fn resolve_root_uia_reasoning_effort_defaults_falls_back_to_default_pair_without_a_usable_uia_pair()
+    -> TestResult {
         let mut config = two_provider_config();
-        config.providers.get_mut("local-a").expect("local-a").default_reasoning_effort =
-            Some(harw_types::ReasoningEffort::High);
+        config
+            .providers
+            .get_mut("local-a")
+            .ok_or(TestError::Missing("local-a"))?
+            .default_reasoning_effort = Some(harw_types::ReasoningEffort::High);
         // Kein `uia_provider`/`uia_model` gesetzt: die Auflösung muss auf
         // `default_provider` (`local-a`) zurückfallen.
-        let (_config_for_definitions, definitions) = builtin();
+        let (_config_for_definitions, definitions) = builtin()?;
         let uia_ir = definitions
             .get(role_names::EXPLORER)
-            .expect("builtin explorer definition");
+            .ok_or(TestError::Missing("builtin explorer definition"))?;
 
         let (provider_default, _model_default, _agent_default) =
             resolve_root_uia_reasoning_effort_defaults(&config, Some(uia_ir));
         assert_eq!(provider_default, Some(harw_types::ReasoningEffort::High));
+        Ok(())
     }
 
     #[test]
-    fn resolve_root_uia_reasoning_effort_defaults_carries_the_agent_label() {
+    fn resolve_root_uia_reasoning_effort_defaults_carries_the_agent_label() -> TestResult {
         let config = two_provider_config();
-        let (_config_for_definitions, definitions) = builtin();
+        let (_config_for_definitions, definitions) = builtin()?;
         let uia_ir = definitions
             .get(role_names::EXPLORER)
-            .expect("builtin explorer definition");
+            .ok_or(TestError::Missing("builtin explorer definition"))?;
         let (_provider_default, _model_default, agent_default) =
             resolve_root_uia_reasoning_effort_defaults(&config, Some(uia_ir));
         assert_eq!(
@@ -4224,10 +4264,11 @@ mod tests {
             "das dritte Feld ist ExecutableAgentIr::reasoning_effort() der UIA, als \
              eigenständiger String geklont"
         );
+        Ok(())
     }
 
     #[test]
-    fn builder_splits_model_and_uia_worker_model_only_when_a_uia_is_active() {
+    fn builder_splits_model_and_uia_worker_model_only_when_a_uia_is_active() -> TestResult {
         let spec = model_spec();
         let config = ResolvedConfig::default();
         let default_tree_model: Arc<dyn ModelProvider> =
@@ -4241,7 +4282,7 @@ mod tests {
             None,
             None,
         )
-        .expect("without an active uia the split never fails");
+        .map_err(ctx("without an active uia the split never fails"))?;
         assert!(
             uia_load_registry.is_empty(),
             "without an active uia there is no dedicated client, so no dedicated registry"
@@ -4256,24 +4297,25 @@ mod tests {
             "without an active uia, the uia-worker family must also fall back to the \
              default tree model"
         );
+        Ok(())
     }
 
     #[test]
-    fn builder_gives_the_uia_session_its_own_provider_client_when_configured() {
+    fn builder_gives_the_uia_session_its_own_provider_client_when_configured() -> TestResult {
         let spec = model_spec();
         let mut config = two_provider_config();
         config.harness.uia_provider = Some("local-b".to_owned());
         config.harness.uia_model = Some("local-b-model".to_owned());
         let default_tree_model: Arc<dyn ModelProvider> =
             crate::model::build_root_model(&spec, &config, ModelSource::Configured)
-                .expect("default provider (local-a) must build");
+                .map_err(ctx("default provider (local-a) must build"))?;
 
         // Any `Some` is enough to flip the branch — the split function only
         // checks presence, never the IR's own content.
-        let (_config_for_definitions, definitions) = builtin();
+        let (_config_for_definitions, definitions) = builtin()?;
         let uia_ir = definitions
             .get(role_names::EXPLORER)
-            .expect("builtin explorer definition");
+            .ok_or(TestError::Missing("builtin explorer definition"))?;
 
         let (model, uia_worker_model, _uia_load_registry) = split_root_and_uia_worker_models(
             &spec,
@@ -4283,7 +4325,9 @@ mod tests {
             Some(uia_ir),
             None,
         )
-        .expect("uia provider (local-b) must build as a dedicated client");
+        .map_err(ctx(
+            "uia provider (local-b) must build as a dedicated client",
+        ))?;
 
         assert!(
             !Arc::ptr_eq(&model, &default_tree_model),
@@ -4295,22 +4339,26 @@ mod tests {
             "the uia-worker family must be derived from the uia client, not the default \
              tree model, once the uia provider differs"
         );
+        Ok(())
     }
 
     #[test]
-    fn an_unknown_agent_name_fails_closed() {
-        let (config, definitions) = builtin();
-        let error =
-            resolve_active_agent(Some("definitely-not-a-role"), &config, &definitions).unwrap_err();
+    fn an_unknown_agent_name_fails_closed() -> TestResult {
+        let (config, definitions) = builtin()?;
+        let Err(error) = resolve_active_agent(Some("definitely-not-a-role"), &config, &definitions)
+        else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(error, RuntimeError::Registry { .. }));
+        Ok(())
     }
 
     #[test]
-    fn a_known_agent_name_resolves_and_narrows_the_activation() {
-        let (config, definitions) = builtin();
+    fn a_known_agent_name_resolves_and_narrows_the_activation() -> TestResult {
+        let (config, definitions) = builtin()?;
         let ir = resolve_active_agent(Some(role_names::EXPLORER), &config, &definitions)
-            .expect("explorer resolves")
-            .expect("explorer exists");
+            .map_err(ctx("explorer resolves"))?
+            .ok_or(TestError::Missing("explorer exists"))?;
         let activation = root_activation(Some(&ir));
         // `Minimal` ist deny-by-default: nur ausdrücklich admittierte
         // Werkzeuge sind sichtbar. `SessionActivation` hat kein `PartialEq`,
@@ -4330,27 +4378,29 @@ mod tests {
                 .all(|name| !activation.is_tool_enabled(&ToolName::new(name.clone()))),
             "keine verbotene Fähigkeit der IR ist aktiviert"
         );
+        Ok(())
     }
 
     #[test]
-    fn without_an_agent_the_activation_cuts_nothing() {
-        let (config, definitions) = builtin();
+    fn without_an_agent_the_activation_cuts_nothing() -> TestResult {
+        let (config, definitions) = builtin()?;
         assert!(
             resolve_active_agent(None, &config, &definitions)
-                .expect("none")
+                .map_err(ctx("none"))?
                 .is_none()
         );
         assert_eq!(root_activation(None).profile(), ToolProfile::default());
+        Ok(())
     }
 
     /// Z2c-05: Eine in `[agents]` konfigurierte Rolle löst auf — und geht der
     /// gleichnamigen eingebauten vor.
     #[test]
-    fn a_configured_agent_wins_over_the_builtin_one() {
-        let (mut config, definitions) = builtin();
+    fn a_configured_agent_wins_over_the_builtin_one() -> TestResult {
+        let (mut config, definitions) = builtin()?;
         let explorer = definitions
             .get(role_names::EXPLORER)
-            .expect("explorer exists")
+            .ok_or(TestError::Missing("explorer exists"))?
             .clone();
         config
             .executable_agents
@@ -4358,14 +4408,15 @@ mod tests {
 
         let expected = definitions
             .get(role_names::EXPLORER)
-            .expect("explorer")
+            .ok_or(TestError::Missing("explorer"))?
             .tool_surface()
             .admitted()
             .to_vec();
         let ir = resolve_active_agent(Some("hausrolle"), &config, &definitions)
-            .expect("konfigurierte Rolle löst auf")
-            .expect("sie existiert");
+            .map_err(ctx("konfigurierte Rolle löst auf"))?
+            .ok_or(TestError::Missing("sie existiert"))?;
         assert_eq!(ir.tool_surface().admitted(), expected.as_slice());
+        Ok(())
     }
 
     /// Z2c-01: Die drei Operations-Flächen sind wirklich drei.
@@ -4498,37 +4549,39 @@ mod tests {
         project: std::path::PathBuf,
     }
 
-    fn build_fixture() -> BuildFixture {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn build_fixture() -> TestResult<BuildFixture> {
+        let dir = tempfile::tempdir()?;
         let home = dir.path().join("home");
         let project = dir.path().join("project");
-        std::fs::create_dir_all(&home).expect("home");
-        std::fs::create_dir_all(&project).expect("project");
+        std::fs::create_dir_all(&home).map_err(ctx("home"))?;
+        std::fs::create_dir_all(&project).map_err(ctx("project"))?;
         // Projekt-Marker, damit `discover_project` genau hier stehen bleibt.
-        std::fs::write(project.join("Cargo.toml"), "[workspace]\n").expect("marker");
-        write_fixture_uia(&home);
-        BuildFixture {
+        std::fs::write(project.join("Cargo.toml"), "[workspace]\n").map_err(ctx("marker"))?;
+        write_fixture_uia(&home)?;
+        Ok(BuildFixture {
             _dir: dir,
             home,
             project,
-        }
+        })
     }
 
     /// Wie [`build_fixture`], mit [`write_fixture_uia_with_default_provider_effort`]
     /// statt [`write_fixture_uia`].
-    fn build_fixture_with_default_provider_effort(provider_effort: &str) -> BuildFixture {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn build_fixture_with_default_provider_effort(
+        provider_effort: &str,
+    ) -> TestResult<BuildFixture> {
+        let dir = tempfile::tempdir()?;
         let home = dir.path().join("home");
         let project = dir.path().join("project");
-        std::fs::create_dir_all(&home).expect("home");
-        std::fs::create_dir_all(&project).expect("project");
-        std::fs::write(project.join("Cargo.toml"), "[workspace]\n").expect("marker");
-        write_fixture_uia_with_default_provider_effort(&home, provider_effort);
-        BuildFixture {
+        std::fs::create_dir_all(&home).map_err(ctx("home"))?;
+        std::fs::create_dir_all(&project).map_err(ctx("project"))?;
+        std::fs::write(project.join("Cargo.toml"), "[workspace]\n").map_err(ctx("marker"))?;
+        write_fixture_uia_with_default_provider_effort(&home, provider_effort)?;
+        Ok(BuildFixture {
             _dir: dir,
             home,
             project,
-        }
+        })
     }
 
     /// Legt eine minimale, gültige UIA (`role = "user-interface"`) im
@@ -4548,20 +4601,20 @@ mod tests {
     /// `active_uia_definition = "<id>"` — das aktive Profil ohne
     /// `active_profile`-Datei ist `"default"`
     /// (`harw_home::active_profile_name`).
-    fn write_fixture_uia(home: &std::path::Path) {
+    fn write_fixture_uia(home: &std::path::Path) -> TestResult {
         let profile_dir = home.join("profiles").join("default");
         let agent_dir = profile_dir.join("agents").join("fixture-uia");
-        std::fs::create_dir_all(&agent_dir).expect("fixture uia dir");
+        std::fs::create_dir_all(&agent_dir).map_err(ctx("fixture uia dir"))?;
         std::fs::write(
             agent_dir.join("definition.toml"),
             "schema = \"harwness.agent/v1\"\nid = \"harwness.agent.fixture-uia@1\"\nversion = \"1.0.0\"\nrole = \"user-interface\"\nspecialization = \"terminal-ui\"\n",
         )
-        .expect("fixture uia definition");
+        .map_err(ctx("fixture uia definition"))?;
         std::fs::write(
             profile_dir.join("config.toml"),
             "active_uia_definition = \"harwness.agent.fixture-uia@1\"\n",
         )
-        .expect("fixture profile config");
+        .map_err(ctx("fixture profile config"))
     }
 
     /// Wie [`write_fixture_uia`], zusätzlich mit einem `default_provider`/
@@ -4574,24 +4627,24 @@ mod tests {
     fn write_fixture_uia_with_default_provider_effort(
         home: &std::path::Path,
         provider_effort: &str,
-    ) {
+    ) -> TestResult {
         let profile_dir = home.join("profiles").join("default");
         let agent_dir = profile_dir.join("agents").join("fixture-uia");
-        std::fs::create_dir_all(&agent_dir).expect("fixture uia dir");
+        std::fs::create_dir_all(&agent_dir).map_err(ctx("fixture uia dir"))?;
         std::fs::write(
             agent_dir.join("definition.toml"),
             "schema = \"harwness.agent/v1\"\nid = \"harwness.agent.fixture-uia@1\"\nversion = \"1.0.0\"\nrole = \"user-interface\"\nspecialization = \"terminal-ui\"\n",
         )
-        .expect("fixture uia definition");
+        .map_err(ctx("fixture uia definition"))?;
         std::fs::write(
             profile_dir.join("config.toml"),
             "active_uia_definition = \"harwness.agent.fixture-uia@1\"\n\
              default_provider = \"fixture-provider\"\n\
              default_model = \"fixture-model\"\n",
         )
-        .expect("fixture profile config");
+        .map_err(ctx("fixture profile config"))?;
         let providers_dir = profile_dir.join("providers");
-        std::fs::create_dir_all(&providers_dir).expect("providers dir");
+        std::fs::create_dir_all(&providers_dir).map_err(ctx("providers dir"))?;
         std::fs::write(
             providers_dir.join("fixture-provider.toml"),
             format!(
@@ -4602,14 +4655,14 @@ mod tests {
                  default_reasoning_effort = \"{provider_effort}\"\n"
             ),
         )
-        .expect("fixture provider toml");
+        .map_err(ctx("fixture provider toml"))?;
         let models_dir = profile_dir.join("models");
-        std::fs::create_dir_all(&models_dir).expect("models dir");
+        std::fs::create_dir_all(&models_dir).map_err(ctx("models dir"))?;
         std::fs::write(
             models_dir.join("fixture-model.toml"),
             "id = \"fixture-model\"\nprovider = \"fixture-provider\"\n",
         )
-        .expect("fixture model toml");
+        .map_err(ctx("fixture model toml"))
     }
 
     /// Ein Builder mit Echo-Modell und In-Memory-Verlauf. Nur für Einstiege
@@ -4654,8 +4707,8 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_services_accessor_returns_builder_input() {
-        let fixture = build_fixture();
+    fn test_plan_services_accessor_returns_builder_input() -> TestResult {
+        let fixture = build_fixture()?;
         let findings = Arc::new(harw_plan_bridge::FindingStore::new("/nonexistent/r0/plans"));
         let plan = PlanServices {
             plan: Arc::new(harw_plan::InMemoryPlanStore::new()),
@@ -4666,45 +4719,53 @@ mod tests {
         let assembly = fixture_builder(EntryKind::LocalEcho, &fixture)
             .plan_services(plan)
             .build()
-            .expect("LocalEcho montiert");
+            .map_err(ctx("LocalEcho montiert"))?;
 
         let Some(returned) = assembly.plan_services() else {
-            panic!("plan_services() muss die Builder-Eingabe liefern");
+            return Err(TestError::Missing(
+                "plan_services() muss die Builder-Eingabe liefern",
+            ));
         };
         assert!(
             Arc::ptr_eq(&returned.findings, &findings),
             "plan_services() liefert genau den übergebenen Wert"
         );
         let Some(via_services) = assembly.services().plan() else {
-            panic!("RuntimeServices::plan() muss dieselbe Planungsfläche liefern");
+            return Err(TestError::Missing(
+                "RuntimeServices::plan() muss dieselbe Planungsfläche liefern",
+            ));
         };
         assert!(Arc::ptr_eq(&via_services.findings, &findings));
+        Ok(())
     }
 
     #[test]
-    fn test_memory_accessor_none_without_memory() {
-        let fixture = build_fixture();
+    fn test_memory_accessor_none_without_memory() -> TestResult {
+        let fixture = build_fixture()?;
         let assembly = fixture_builder(EntryKind::LocalEcho, &fixture)
             .build()
-            .expect("LocalEcho montiert");
+            .map_err(ctx("LocalEcho montiert"))?;
         assert!(assembly.memory().is_none());
         assert!(assembly.services().memory().is_none());
         assert!(assembly.plan_services().is_none());
+        Ok(())
     }
 
     /// Plan Teil B3: die Root-`ServiceMap` trägt `Arc<HostPermitHandles>` mit
     /// demselben Ledger wie [`RuntimeAssembly::host_permit_ledger`] — kein
     /// zweiter, unabhängig instanziierter Ledger.
     #[test]
-    fn test_root_service_map_shares_the_host_permit_ledger_with_the_assembly() {
-        let fixture = build_fixture();
+    fn test_root_service_map_shares_the_host_permit_ledger_with_the_assembly() -> TestResult {
+        let fixture = build_fixture()?;
         let assembly = fixture_builder(EntryKind::LocalEcho, &fixture)
             .build()
-            .expect("LocalEcho montiert");
+            .map_err(ctx("LocalEcho montiert"))?;
 
         let map = assembly.services().service_map(ServiceSurface::Slash);
         let Some(handles) = map.get::<Arc<HostPermitHandles>>() else {
-            panic!("Root-ServiceMap muss HostPermitHandles tragen (Plan Teil B3)");
+            return Err(TestError::Missing(
+                "Root-ServiceMap muss HostPermitHandles tragen (Plan Teil B3)",
+            ));
         };
         assert!(
             Arc::ptr_eq(&handles.ledger, assembly.host_permit_ledger()),
@@ -4715,17 +4776,18 @@ mod tests {
             "HostPermitHandles.registry muss derselbe Arc wie \
              assembly.host_permit_session_registry() sein"
         );
+        Ok(())
     }
 
     /// Addendum B: eine Montage in einem frischen Tempdir-Projekt öffnet die
     /// Erfassungsfläche best-effort und hängt daraus einen
     /// [`crate::memory_wiring::MemoryCaptureObserver`] an die Wurzelsitzung.
     #[test]
-    fn test_root_session_gets_a_memory_capture_observer_when_capture_opens() {
-        let fixture = build_fixture();
+    fn test_root_session_gets_a_memory_capture_observer_when_capture_opens() -> TestResult {
+        let fixture = build_fixture()?;
         let assembly = fixture_builder(EntryKind::LocalEcho, &fixture)
             .build()
-            .expect("LocalEcho montiert");
+            .map_err(ctx("LocalEcho montiert"))?;
 
         let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
         let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
@@ -4736,13 +4798,14 @@ mod tests {
                 turn_events,
                 None,
             )
-            .expect("Wurzelsitzung entsteht");
+            .map_err(ctx("Wurzelsitzung entsteht"))?;
 
         assert!(
             root.session.tool_outcome_observer().is_some(),
             "eine erfolgreich geöffnete Erfassungsfläche muss die Wurzelsitzung \
              mit einem ToolOutcomeObserver verdrahten"
         );
+        Ok(())
     }
 
     /// Welle 8: eine UIA-Wurzel ohne explizites `spec.reasoning_effort`
@@ -4751,16 +4814,16 @@ mod tests {
     /// Provider-Ebene steht in der Rangfolge Provider > Modell > Agent > Rolle
     /// über der Rollen-Ebene.
     #[test]
-    fn test_root_uia_session_reasoning_effort_prefers_provider_default_over_role_weight() {
-        let fixture = build_fixture_with_default_provider_effort("xhigh");
+    fn test_root_uia_session_reasoning_effort_prefers_provider_default_over_role_weight()
+    -> TestResult {
+        let fixture = build_fixture_with_default_provider_effort("xhigh")?;
         let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
         let assembly = fixture_builder(EntryKind::Tui, &fixture)
             .session_events(events)
             .build()
-            .expect("Tui montiert");
+            .map_err(ctx("Tui montiert"))?;
 
-        let (session_events, _session_rx) =
-            tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let (session_events, _session_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
         let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
         let root = assembly
             .new_root_session(
@@ -4769,7 +4832,7 @@ mod tests {
                 turn_events,
                 None,
             )
-            .expect("UIA-Wurzelsitzung entsteht");
+            .map_err(ctx("UIA-Wurzelsitzung entsteht"))?;
 
         assert_eq!(
             root.session.reasoning_effort(),
@@ -4777,22 +4840,23 @@ mod tests {
             "der `default_provider`-Vorgabewert (\"xhigh\") muss vor \
              `role_effort_weights.uia` (High) gewinnen"
         );
+        Ok(())
     }
 
     /// Regressionstest: ohne konfigurierten Provider-/Modell-/Agenten-
     /// Standard bleibt die UIA-Wurzel unverändert bei `role_effort_weights.uia`
     /// (Addendum F+G, bisheriges Verhalten).
     #[test]
-    fn test_root_uia_session_reasoning_effort_falls_back_to_role_weight_without_any_default() {
-        let fixture = build_fixture();
+    fn test_root_uia_session_reasoning_effort_falls_back_to_role_weight_without_any_default()
+    -> TestResult {
+        let fixture = build_fixture()?;
         let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
         let assembly = fixture_builder(EntryKind::Tui, &fixture)
             .session_events(events)
             .build()
-            .expect("Tui montiert");
+            .map_err(ctx("Tui montiert"))?;
 
-        let (session_events, _session_rx) =
-            tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let (session_events, _session_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
         let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
         let root = assembly
             .new_root_session(
@@ -4801,13 +4865,14 @@ mod tests {
                 turn_events,
                 None,
             )
-            .expect("UIA-Wurzelsitzung entsteht");
+            .map_err(ctx("UIA-Wurzelsitzung entsteht"))?;
 
         assert_eq!(
             root.session.reasoning_effort(),
             Some(RoleEffortWeights::default().uia),
             "ohne jede konfigurierte Ebene bleibt die UIA-Wurzel beim Rollengewicht"
         );
+        Ok(())
     }
 
     /// Eine explizite Live-Einstellung (`RuntimeSpec::reasoning_effort`)
@@ -4815,15 +4880,15 @@ mod tests {
     /// Modell > Agent > Rolle — auch über einem konfigurierten
     /// `default_provider`.
     #[test]
-    fn test_root_uia_session_reasoning_effort_explicit_spec_wins_over_provider_default() {
-        let fixture = build_fixture_with_default_provider_effort("xhigh");
+    fn test_root_uia_session_reasoning_effort_explicit_spec_wins_over_provider_default()
+    -> TestResult {
+        let fixture = build_fixture_with_default_provider_effort("xhigh")?;
         let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
         let mut builder = fixture_builder(EntryKind::Tui, &fixture).session_events(events);
         builder.spec.reasoning_effort = Some(harw_types::ReasoningEffort::Low);
-        let assembly = builder.build().expect("Tui montiert");
+        let assembly = builder.build().map_err(ctx("Tui montiert"))?;
 
-        let (session_events, _session_rx) =
-            tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let (session_events, _session_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
         let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
         let root = assembly
             .new_root_session(
@@ -4832,21 +4897,22 @@ mod tests {
                 turn_events,
                 None,
             )
-            .expect("UIA-Wurzelsitzung entsteht");
+            .map_err(ctx("UIA-Wurzelsitzung entsteht"))?;
 
         assert_eq!(
             root.session.reasoning_effort(),
             Some(harw_types::ReasoningEffort::Low),
             "eine explizite Live-Einstellung steht über der gesamten Rangfolge"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_approval_mode_accessor_shares_the_services_cell() {
-        let fixture = build_fixture();
+    fn test_approval_mode_accessor_shares_the_services_cell() -> TestResult {
+        let fixture = build_fixture()?;
         let assembly = fixture_builder(EntryKind::LocalEcho, &fixture)
             .build()
-            .expect("LocalEcho montiert");
+            .map_err(ctx("LocalEcho montiert"))?;
         assert_eq!(assembly.approval_mode().get(), ApprovalMode::Delegated);
         assembly.approval_mode().set(ApprovalMode::AlwaysAsk);
         assert_eq!(
@@ -4854,14 +4920,15 @@ mod tests {
             ApprovalMode::AlwaysAsk,
             "approval_mode() ist dieselbe Zelle wie in den Service-Maps"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_narrowing_readonly_on_full_entry_drops_write_tools() {
-        let fixture = build_fixture();
+    fn test_narrowing_readonly_on_full_entry_drops_write_tools() -> TestResult {
+        let fixture = build_fixture()?;
         let baseline = fixture_builder(EntryKind::LocalEcho, &fixture)
             .build()
-            .expect("LocalEcho montiert")
+            .map_err(ctx("LocalEcho montiert"))?
             .rights_snapshot();
         assert!(baseline.tools.iter().any(|tool| tool == "fs.write"));
         assert!(baseline.tools.iter().any(|tool| tool == "shell.exec"));
@@ -4876,7 +4943,7 @@ mod tests {
                 workspace_root: None,
             })
             .build()
-            .expect("Full → ReadOnlyExplore ist zugelassen");
+            .map_err(ctx("Full → ReadOnlyExplore ist zugelassen"))?;
         let snapshot = narrowed.rights_snapshot();
 
         assert!(!snapshot.tools.iter().any(|tool| tool == "fs.write"));
@@ -4902,12 +4969,13 @@ mod tests {
             RegistryProfile::Full,
             "die Tabellenzeile selbst bleibt unverändert"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_narrowing_rejects_full_on_notools_entry() {
-        let fixture = build_fixture();
-        let error = fixture_builder(EntryKind::JobPrompt, &fixture)
+    fn test_narrowing_rejects_full_on_notools_entry() -> TestResult {
+        let fixture = build_fixture()?;
+        let Err(error) = fixture_builder(EntryKind::JobPrompt, &fixture)
             .narrowing(RuntimeNarrowing {
                 registry_profile: RegistryProfile::Full,
                 identity: IdentityOverrides::default(),
@@ -4915,7 +4983,11 @@ mod tests {
                 workspace_root: None,
             })
             .build()
-            .expect_err("NoTools → Full muss abgelehnt werden");
+        else {
+            return Err(TestError::Unexpected(
+                "NoTools → Full muss abgelehnt werden".into(),
+            ));
+        };
         assert!(matches!(error, RuntimeError::Registry { .. }), "{error}");
 
         // Die übrige Whitelist, geprüft an der reinen Entscheidung.
@@ -4957,13 +5029,14 @@ mod tests {
                 workspace_root: None,
             })
             .build()
-            .expect("NoTools → NoTools ist zugelassen");
+            .map_err(ctx("NoTools → NoTools ist zugelassen"))?;
         assert!(same.rights_snapshot().tools.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_narrowing_permissions_never_exceed_profile() {
-        let fixture = build_fixture();
+    fn test_narrowing_permissions_never_exceed_profile() -> TestResult {
+        let fixture = build_fixture()?;
         for entry in [
             EntryKind::LocalEcho,
             EntryKind::Doctor,
@@ -4980,7 +5053,9 @@ mod tests {
                     workspace_root: None,
                 })
                 .build()
-                .unwrap_or_else(|error| panic!("{entry:?} montiert nicht: {error}"));
+                .map_err(|error| {
+                    TestError::Unexpected(format!("{entry:?} montiert nicht: {error}"))
+                })?;
             let granted = assembly.sandbox().permissions();
             assert!(granted.is_subset_of(&profile.permissions), "{entry:?}");
             assert_eq!(
@@ -5004,16 +5079,17 @@ mod tests {
                 workspace_root: None,
             })
             .build()
-            .expect("LocalEcho montiert");
+            .map_err(ctx("LocalEcho montiert"))?;
         assert_eq!(
             assembly.sandbox().permissions(),
             &PermissionSet::from_policy([harw_authority::Permission::ReadWorkspace])
         );
+        Ok(())
     }
 
     #[test]
-    fn test_root_identity_active_agent_wins_over_narrowing() {
-        let fixture = build_fixture();
+    fn test_root_identity_active_agent_wins_over_narrowing() -> TestResult {
+        let fixture = build_fixture()?;
         let mut spec = fixture_builder(EntryKind::LocalEcho, &fixture).spec;
         let narrowing = RuntimeNarrowing {
             registry_profile: RegistryProfile::ReadOnlyExplore,
@@ -5043,15 +5119,21 @@ mod tests {
         let default = root_identity(&spec, None);
         assert_eq!(default.agent_name.as_deref(), Some("explorer"));
         assert!(default.role_description.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_narrowing_workspace_root_descendant_binds_sandbox_to_it() {
-        let fixture = build_fixture();
+    fn test_narrowing_workspace_root_descendant_binds_sandbox_to_it() -> TestResult {
+        let fixture = build_fixture()?;
         let workspace = fixture.project.join("nested").join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace");
-        let canonical_workspace = workspace.canonicalize().expect("canonical workspace");
-        let canonical_project = fixture.project.canonicalize().expect("canonical project");
+        std::fs::create_dir_all(&workspace).map_err(ctx("workspace"))?;
+        let canonical_workspace = workspace
+            .canonicalize()
+            .map_err(ctx("canonical workspace"))?;
+        let canonical_project = fixture
+            .project
+            .canonicalize()
+            .map_err(ctx("canonical project"))?;
 
         // Projekterkennung ab dem Unterordner endet am markierten Elternprojekt.
         let mut builder = fixture_builder(EntryKind::JobPlanNode, &fixture);
@@ -5066,7 +5148,7 @@ mod tests {
                 workspace_root: Some(workspace.clone()),
             })
             .build()
-            .expect("ein Nachfahre des Projekt-Roots ist zugelassen");
+            .map_err(ctx("ein Nachfahre des Projekt-Roots ist zugelassen"))?;
 
         assert_eq!(
             assembly.project().project_root,
@@ -5101,21 +5183,24 @@ mod tests {
                 workspace_root: Some(fixture.project.clone()),
             })
             .build()
-            .expect("der Projekt-Root selbst ist zugelassen");
+            .map_err(ctx("der Projekt-Root selbst ist zugelassen"))?;
         assert_eq!(
             same.sandbox().workspace().canonical_root(),
             canonical_project.as_path()
         );
+        Ok(())
     }
 
     #[test]
-    fn test_narrowing_workspace_root_outside_project_is_rejected() {
-        let fixture = build_fixture();
+    fn test_narrowing_workspace_root_outside_project_is_rejected() -> TestResult {
+        let fixture = build_fixture()?;
         let Some(parent) = fixture.project.parent().map(Path::to_path_buf) else {
-            panic!("das Fixture-Projekt hat ein Elternverzeichnis");
+            return Err(TestError::Missing(
+                "das Fixture-Projekt hat ein Elternverzeichnis",
+            ));
         };
         let sibling = parent.join("sibling");
-        std::fs::create_dir_all(&sibling).expect("sibling");
+        std::fs::create_dir_all(&sibling).map_err(ctx("sibling"))?;
 
         let narrowing_to = |root: PathBuf| RuntimeNarrowing {
             registry_profile: RegistryProfile::Full,
@@ -5130,7 +5215,7 @@ mod tests {
             // String-Präfix, aber kein Pfad-Nachfahre: `<tmp>/project` vs. `<tmp>/project-evil`.
             ("Präfix-Geschwister", {
                 let evil = parent.join("project-evil");
-                std::fs::create_dir_all(&evil).expect("prefix sibling");
+                std::fs::create_dir_all(&evil).map_err(ctx("prefix sibling"))?;
                 evil
             }),
             (
@@ -5140,10 +5225,12 @@ mod tests {
             ("fehlendes Verzeichnis", fixture.project.join("missing")),
             ("relativer Pfad", PathBuf::from("nested")),
         ] {
-            let error = fixture_builder(EntryKind::LocalEcho, &fixture)
+            let Err(error) = fixture_builder(EntryKind::LocalEcho, &fixture)
                 .narrowing(narrowing_to(root))
                 .build()
-                .expect_err(label);
+            else {
+                return Err(TestError::Unexpected(label.to_owned()));
+            };
             assert!(
                 matches!(error, RuntimeError::Sandbox { .. }),
                 "{label}: {error}"
@@ -5154,13 +5241,16 @@ mod tests {
         #[cfg(unix)]
         {
             let link = fixture.project.join("escape-link");
-            std::os::unix::fs::symlink(&sibling, &link).expect("symlink");
-            let error = fixture_builder(EntryKind::LocalEcho, &fixture)
+            std::os::unix::fs::symlink(&sibling, &link).map_err(ctx("symlink"))?;
+            let Err(error) = fixture_builder(EntryKind::LocalEcho, &fixture)
                 .narrowing(narrowing_to(link))
                 .build()
-                .expect_err("Symlink nach außen");
+            else {
+                return Err(TestError::Unexpected("Symlink nach außen".into()));
+            };
             assert!(matches!(error, RuntimeError::Sandbox { .. }), "{error}");
         }
+        Ok(())
     }
 
     // ── Projektkontext im Modellkontext (Befunde Z2d2-R1/R2/R8) ─────────────
@@ -5168,12 +5258,14 @@ mod tests {
     /// Liest ein [`harw_extension_api::ExtFuture`] synchron aus. Die Provider
     /// der Registry (`ProjectContextProvider`, `BaselineInstructionsProvider`)
     /// haben keinen `.await`-Punkt und sind beim ersten `poll` fertig.
-    fn ready<T>(mut future: harw_extension_api::ExtFuture<'_, T>) -> T {
+    fn ready<T>(mut future: harw_extension_api::ExtFuture<'_, T>) -> TestResult<T> {
         use std::task::{Context, Poll, Waker};
         let mut cx = Context::from_waker(Waker::noop());
         match future.as_mut().poll(&mut cx) {
-            Poll::Ready(value) => value,
-            Poll::Pending => panic!("der Provider wurde beim ersten poll nicht fertig"),
+            Poll::Ready(value) => Ok(value),
+            Poll::Pending => Err(TestError::Unexpected(
+                "der Provider wurde beim ersten poll nicht fertig".into(),
+            )),
         }
     }
 
@@ -5181,39 +5273,44 @@ mod tests {
     /// Systemprompt und Fragmente der Instruktions-Provider sowie jedes
     /// Kontextfragment als `label\ncontent`. Nimmt die Registry aus der
     /// Montage (danach ist sie für `new_root_session` verbraucht).
-    fn registry_model_context(assembly: &RuntimeAssembly) -> Vec<String> {
+    fn registry_model_context(assembly: &RuntimeAssembly) -> TestResult<Vec<String>> {
         let registry = assembly
             .registry
             .lock()
-            .expect("registry lock")
+            .map_err(|_| TestError::Unexpected("registry lock poisoned".into()))?
             .take()
-            .expect("die Registry wurde noch nicht herausgegeben");
+            .ok_or(TestError::Missing(
+                "die Registry wurde noch nicht herausgegeben",
+            ))?;
         let turn = harw_extension_api::TurnInputContext::default();
         let mut out = Vec::new();
         for provider in registry.instructions_providers() {
-            let loaded = ready(provider.load());
+            let loaded = ready(provider.load())?;
             out.push(loaded.system_prompt);
             out.extend(loaded.fragments);
         }
         for provider in registry.context_providers() {
-            for fragment in ready(provider.contribute(&turn)) {
+            for fragment in ready(provider.contribute(&turn))? {
                 out.push(format!("{}\n{}", fragment.label, fragment.content));
             }
         }
-        out
+        Ok(out)
     }
 
     const AGENTS_MARKER: &str = "R1-MARKER-agents-doc-must-not-leak";
 
     #[test]
-    fn test_job_prompt_assembly_has_no_project_docs() {
-        let fixture = build_fixture();
+    fn test_job_prompt_assembly_has_no_project_docs() -> TestResult {
+        let fixture = build_fixture()?;
         std::fs::write(
             fixture.project.join("AGENTS.md"),
             format!("# Geheim\n{AGENTS_MARKER}\n"),
         )
-        .expect("AGENTS.md");
-        let canonical_project = fixture.project.canonicalize().expect("canonical project");
+        .map_err(ctx("AGENTS.md"))?;
+        let canonical_project = fixture
+            .project
+            .canonicalize()
+            .map_err(ctx("canonical project"))?;
 
         for entry in [
             EntryKind::JobPrompt,
@@ -5223,9 +5320,9 @@ mod tests {
             EntryKind::Web,
         ] {
             assert!(!entry.profile().project_context, "{entry:?}");
-            let assembly = fixture_builder(entry, &fixture)
-                .build()
-                .unwrap_or_else(|error| panic!("{entry:?} montiert nicht: {error}"));
+            let assembly = fixture_builder(entry, &fixture).build().map_err(|error| {
+                TestError::Unexpected(format!("{entry:?} montiert nicht: {error}"))
+            })?;
             assert!(
                 assembly
                     .project()
@@ -5235,7 +5332,7 @@ mod tests {
                 "{entry:?}: die Erkennung selbst hat AGENTS.md gefunden (Test ist aussagekräftig)"
             );
 
-            let context = registry_model_context(&assembly);
+            let context = registry_model_context(&assembly)?;
             assert!(!context.is_empty(), "{entry:?}");
             for text in &context {
                 assert!(
@@ -5263,17 +5360,21 @@ mod tests {
                 "{entry:?}: neutraler Platzhalter statt Host-Pfad: {context:?}"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_tui_assembly_keeps_project_docs() {
-        let fixture = build_fixture();
+    fn test_tui_assembly_keeps_project_docs() -> TestResult {
+        let fixture = build_fixture()?;
         std::fs::write(
             fixture.project.join("AGENTS.md"),
             format!("# Projekt\n{AGENTS_MARKER}\n"),
         )
-        .expect("AGENTS.md");
-        let canonical_project = fixture.project.canonicalize().expect("canonical project");
+        .map_err(ctx("AGENTS.md"))?;
+        let canonical_project = fixture
+            .project
+            .canonicalize()
+            .map_err(ctx("canonical project"))?;
         assert!(EntryKind::Tui.profile().project_context);
 
         // `Tui` spawnt (`BuiltinRoles`) und braucht deshalb einen Ereigniskanal.
@@ -5281,9 +5382,9 @@ mod tests {
         let assembly = fixture_builder(EntryKind::Tui, &fixture)
             .session_events(events)
             .build()
-            .expect("Tui montiert");
+            .map_err(ctx("Tui montiert"))?;
 
-        let context = registry_model_context(&assembly);
+        let context = registry_model_context(&assembly)?;
         let shows_agents_doc = |text: &String| {
             text.starts_with("project.doc:AGENTS.md\n") && text.contains(AGENTS_MARKER)
         };
@@ -5300,19 +5401,23 @@ mod tests {
             context.contains(&expected_root),
             "Tui zeigt den erkannten Projekt-Root: {context:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_narrowing_workspace_root_filters_docs_above_root() {
+    fn test_narrowing_workspace_root_filters_docs_above_root() -> TestResult {
         const ABOVE: &str = "R2-MARKER-doc-above-bound-root";
         const INSIDE: &str = "R2-MARKER-doc-inside-bound-root";
 
-        let fixture = build_fixture();
+        let fixture = build_fixture()?;
         let workspace = fixture.project.join("nested").join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace");
-        std::fs::write(fixture.project.join("AGENTS.md"), ABOVE).expect("oberes AGENTS.md");
-        std::fs::write(workspace.join("AGENTS.md"), INSIDE).expect("inneres AGENTS.md");
-        let canonical_workspace = workspace.canonicalize().expect("canonical workspace");
+        std::fs::create_dir_all(&workspace).map_err(ctx("workspace"))?;
+        std::fs::write(fixture.project.join("AGENTS.md"), ABOVE)
+            .map_err(ctx("oberes AGENTS.md"))?;
+        std::fs::write(workspace.join("AGENTS.md"), INSIDE).map_err(ctx("inneres AGENTS.md"))?;
+        let canonical_workspace = workspace
+            .canonicalize()
+            .map_err(ctx("canonical workspace"))?;
 
         let mut builder = fixture_builder(EntryKind::JobPlanNode, &fixture);
         builder.spec.cwd.clone_from(&workspace);
@@ -5326,14 +5431,14 @@ mod tests {
                 workspace_root: Some(workspace.clone()),
             })
             .build()
-            .expect("Plan-Knoten mit gebundenem Workspace montiert");
+            .map_err(ctx("Plan-Knoten mit gebundenem Workspace montiert"))?;
         assert_eq!(
             assembly.project().docs.len(),
             2,
             "die Erkennung findet beide Dateien; gefiltert wird nur der Modellkontext"
         );
 
-        let context = registry_model_context(&assembly);
+        let context = registry_model_context(&assembly)?;
         assert!(
             context.iter().all(|text| !text.contains(ABOVE)),
             "Doku oberhalb des gebundenen Roots darf nicht erscheinen: {context:?}"
@@ -5395,11 +5500,12 @@ mod tests {
             PathBuf::from(PROJECT_CONTEXT_PLACEHOLDER)
         );
         assert_eq!(redacted.cwd, PathBuf::from(PROJECT_CONTEXT_PLACEHOLDER));
+        Ok(())
     }
 
     #[test]
-    fn test_narrowing_rejects_restricted_profile_with_model_tool_operations() {
-        let fixture = build_fixture();
+    fn test_narrowing_rejects_restricted_profile_with_model_tool_operations() -> TestResult {
+        let fixture = build_fixture()?;
         assert_eq!(
             EntryKind::Doctor.profile().operations,
             OperationSurface::AllWithModelTools
@@ -5412,10 +5518,14 @@ mod tests {
         };
 
         for requested in [RegistryProfile::ReadOnlyExplore, RegistryProfile::NoTools] {
-            let error = fixture_builder(EntryKind::Doctor, &fixture)
+            let Err(error) = fixture_builder(EntryKind::Doctor, &fixture)
                 .narrowing(narrowing_to(requested))
                 .build()
-                .expect_err("Werkzeugverengung an AllWithModelTools muss abgelehnt werden");
+            else {
+                return Err(TestError::Unexpected(
+                    "Werkzeugverengung an AllWithModelTools muss abgelehnt werden".into(),
+                ));
+            };
             assert!(
                 matches!(error, RuntimeError::Registry { .. }),
                 "{requested:?}: {error}"
@@ -5426,11 +5536,13 @@ mod tests {
         fixture_builder(EntryKind::Doctor, &fixture)
             .narrowing(narrowing_to(RegistryProfile::Full))
             .build()
-            .expect("Doctor mit Full montiert");
+            .map_err(ctx("Doctor mit Full montiert"))?;
         fixture_builder(EntryKind::LocalEcho, &fixture)
             .narrowing(narrowing_to(RegistryProfile::ReadOnlyExplore))
             .build()
-            .expect("LocalEcho (OperationSurface::None) mit ReadOnlyExplore montiert");
+            .map_err(ctx(
+                "LocalEcho (OperationSurface::None) mit ReadOnlyExplore montiert",
+            ))?;
 
         // Reine Entscheidung für alle Einstiege mit Modell-Tool-Fläche.
         for entry in [EntryKind::Tui, EntryKind::OneShot, EntryKind::Doctor] {
@@ -5458,6 +5570,7 @@ mod tests {
                 );
             }
         }
+        Ok(())
     }
 
     // ── Freigaben: Präzedenz und Fail-Soft (Contract §2/§4/§5) ───────────────
@@ -5523,12 +5636,12 @@ mod tests {
     /// (die vorherige Fassung dieses Tests platzierte `valid` fälschlich
     /// unter `primary` und scheiterte deshalb mit `0` statt `1`).
     #[test]
-    fn test_seed_extra_roots_skips_invalid_entries() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_seed_extra_roots_skips_invalid_entries() -> TestResult {
+        let dir = tempfile::tempdir()?;
         let primary = dir.path().join("primary");
-        std::fs::create_dir_all(&primary).expect("primary");
+        std::fs::create_dir_all(&primary).map_err(ctx("primary"))?;
         let valid = dir.path().join("valid");
-        std::fs::create_dir_all(&valid).expect("valid");
+        std::fs::create_dir_all(&valid).map_err(ctx("valid"))?;
         let missing = primary.join("does-not-exist");
 
         let global = PermissionsSection {
@@ -5543,27 +5656,32 @@ mod tests {
             1,
             "nur der gültige Eintrag bleibt: {snapshot:?}"
         );
+        Ok(())
     }
 
-    // ── Plan-Dienste: Default an, außer ausdrücklich abgeschaltet (G-024) ────
+    // ── Plan-Dienste: Default persistent an, außer ausdrücklich abgeschaltet ─
 
     /// Ein interaktiver TUI-Lauf ohne jeden Konfigurationseintrag bekommt die
-    /// eingebaute Plan-Vorgabe — `/plan` und `/goal` funktionieren ohne
-    /// `[tools.plan]` (G-024/G-098). Andere Einstiege bleiben unverändert
-    /// ohne eingebaute Vorgabe.
+    /// persistente Plan-Vorgabe — `/plan` und `/goal` funktionieren ohne
+    /// `[tools.plan]` (G-024/G-098), und die Stores liegen unter dem
+    /// Projekt-Home. Andere Einstiege bleiben unverändert ohne Planfläche.
     #[test]
-    fn test_resolve_plan_services_defaults_on_for_tui_when_untouched() {
-        let fixture = build_fixture();
+    fn test_resolve_plan_services_defaults_on_for_tui_when_untouched() -> TestResult {
+        let fixture = build_fixture()?;
         let home_project_root =
-            discover_home_project(&fixture.project, &[]).expect("Projekt-Home erkannt");
+            discover_home_project(&fixture.project, &[]).map_err(ctx("Projekt-Home erkannt"))?;
         let project_home = ProjectHome::at(&home_project_root);
 
         let resolved =
-            resolve_plan_services(EntryKind::Tui, None, &PlanSection::default(), &project_home);
+            resolve_plan_services(EntryKind::Tui, None, &PlanSection::default(), &project_home)
+                .map_err(ctx("plan stores"))?;
         let Some(plan) = resolved else {
-            panic!("Tui ohne Config-Eintrag muss die eingebaute Plan-Vorgabe bekommen");
+            return Err(TestError::Missing(
+                "Tui ohne Config-Eintrag muss die eingebaute Plan-Vorgabe bekommen",
+            ));
         };
         assert!(plan.plan_config.enabled);
+        assert!(plan.plan_config.persist);
 
         assert!(
             resolve_plan_services(
@@ -5572,44 +5690,55 @@ mod tests {
                 &PlanSection::default(),
                 &project_home
             )
+            .map_err(ctx("plan configuration"))?
             .is_none(),
             "die Gate-Semantik anderer Einstiege bleibt unverändert"
         );
+        Ok(())
     }
 
     /// Eine berührte Sektion mit `enabled = false` bleibt geschlossen — eine
     /// bewusste Abschaltung wird nie überschrieben. Ein expliziter
     /// Builder-Wert gewinnt dagegen immer, unabhängig von der Konfiguration.
     #[test]
-    fn test_resolve_plan_services_stays_off_when_touched_and_disabled() {
-        let fixture = build_fixture();
+    fn test_resolve_plan_services_stays_off_when_touched_and_disabled() -> TestResult {
+        let fixture = build_fixture()?;
         let home_project_root =
-            discover_home_project(&fixture.project, &[]).expect("Projekt-Home erkannt");
+            discover_home_project(&fixture.project, &[]).map_err(ctx("Projekt-Home erkannt"))?;
         let project_home = ProjectHome::at(&home_project_root);
 
         let section = PlanSection {
             enabled: false,
             ..PlanSection::default()
         };
-        assert!(!plan_section_is_untouched(&section));
-
         assert!(
-            resolve_plan_services(EntryKind::Tui, None, &section, &project_home).is_none(),
+            resolve_plan_services(EntryKind::Tui, None, &section, &project_home)
+                .map_err(ctx("disabled plan"))?
+                .is_none(),
             "eine berührte, weiterhin `enabled = false`-Sektion bleibt geschlossen"
         );
 
-        let explicit = default_tui_plan_services(&project_home);
+        let explicit = PlanServices {
+            plan: Arc::new(InMemoryPlanStore::new()),
+            goal: Arc::new(InMemoryGoalStore::new()),
+            findings: Arc::new(FindingStore::new(project_home.plans_dir())),
+            plan_config: PlanToolConfig::enabled_defaults(),
+        };
         let findings = Arc::clone(&explicit.findings);
         let resolved =
             resolve_plan_services(EntryKind::Tui, Some(explicit), &section, &project_home)
-                .expect("ein expliziter Builder-Wert bleibt erhalten");
+                .map_err(ctx("plan configuration"))?
+                .ok_or(TestError::Missing(
+                    "ein expliziter Builder-Wert bleibt erhalten",
+                ))?;
         assert!(Arc::ptr_eq(&resolved.findings, &findings));
+        Ok(())
     }
 
     /// Eine berührte, ausdrücklich aktivierte Sektion wird vollständig
     /// übersetzt (Knotenlimits, Exploration-Vorgaben).
     #[test]
-    fn test_plan_tool_config_from_section_translates_fields() {
+    fn test_plan_tool_config_from_section_translates_fields() -> TestResult {
         let section = PlanSection {
             enabled: true,
             max_nodes: 12,
@@ -5617,16 +5746,18 @@ mod tests {
             ..PlanSection::default()
         };
 
-        let config = plan_tool_config_from_section(&section).expect("gültige Sektion übersetzt");
+        let config =
+            plan_tool_config_from_section(&section).map_err(ctx("gültige Sektion übersetzt"))?;
         assert!(config.enabled);
         assert_eq!(config.max_nodes, 12);
         assert_eq!(config.require_exploration_for, vec![PlanNodeKind::Coding]);
+        Ok(())
     }
 
-    /// Eine ungültige Sektion (`max_nodes = 0`) übersetzt nicht — dieselbe
-    /// Prüfung, die [`resolve_plan_services`] fail-soft in `None` auflöst.
+    /// Eine ungültige Sektion (`max_nodes = 0`) übersetzt nicht und beendet
+    /// die Runtime-Montage, statt einen flüchtigen Ersatzstore zu öffnen.
     #[test]
-    fn test_plan_tool_config_from_section_rejects_zero_max_nodes() {
+    fn test_plan_tool_config_from_section_rejects_zero_max_nodes() -> TestResult {
         let section = PlanSection {
             enabled: true,
             max_nodes: 0,
@@ -5634,13 +5765,14 @@ mod tests {
         };
         assert!(plan_tool_config_from_section(&section).is_err());
 
-        let fixture = build_fixture();
+        let fixture = build_fixture()?;
         let home_project_root =
-            discover_home_project(&fixture.project, &[]).expect("Projekt-Home erkannt");
+            discover_home_project(&fixture.project, &[]).map_err(ctx("Projekt-Home erkannt"))?;
         let project_home = ProjectHome::at(&home_project_root);
         assert!(
-            resolve_plan_services(EntryKind::Tui, None, &section, &project_home).is_none(),
-            "eine ungültige, berührte Sektion bleibt fail-soft geschlossen"
+            resolve_plan_services(EntryKind::Tui, None, &section, &project_home).is_err(),
+            "eine ungültige Plan-Konfiguration muss die Montage ablehnen"
         );
+        Ok(())
     }
 }

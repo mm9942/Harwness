@@ -395,10 +395,13 @@ mod tests {
     }
 
     #[test]
-    fn test_build_without_any_flag_activates_only_the_file_sink() {
+    fn test_build_without_any_flag_activates_only_the_file_sink() -> crate::test_support::TestResult
+    {
+        use crate::test_support::TestError;
+
         let home = match tempfile::tempdir() {
             Ok(dir) => dir,
-            Err(error) => panic!("tempdir: {error}"),
+            Err(error) => return Err(TestError::Unexpected(format!("tempdir: {error}"))),
         };
         let args = TelemetryArgs {
             metrics_prometheus_port: None,
@@ -407,7 +410,11 @@ mod tests {
 
         let sinks = match build(home.path(), &args) {
             Ok(sinks) => sinks,
-            Err(error) => panic!("build without flags must succeed: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "build without flags must succeed: {error}"
+                )));
+            }
         };
 
         assert!(
@@ -415,5 +422,6 @@ mod tests {
             "no --metrics-prometheus-port must bind no endpoint"
         );
         assert_eq!(sinks.sink.name(), "routing");
+        Ok(())
     }
 }

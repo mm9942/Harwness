@@ -34,8 +34,13 @@
 //! beseitigt.
 //!
 //! # Fehler
-//! Keine: die gezogenen Zeichenketten sind per Konstruktion gültiges
-//! Kleinbuchstaben-Hex der geforderten Länge.
+//! [`new_root_trace`] gibt seit der R087/R165-Bereinigung (Bible: kein
+//! `expect` in Produktionscode) ein `Result` zurück. Die gezogenen
+//! Zeichenketten sind per Konstruktion gültiges Kleinbuchstaben-Hex der
+//! geforderten Länge; ein `Err` wäre daher ein Vertragsbruch von
+//! `harw_observe::TraceContext::new` selbst, kein erwarteter Laufzeitzustand
+//! dieser Datei. [`crate::assembly::RuntimeAssembly::build`] übersetzt ihn in
+//! [`crate::error::RuntimeError::Spawner`].
 
 use harw_observe::TraceContext;
 use harw_types::SessionId;
@@ -81,29 +86,30 @@ fn draw_hex32() -> String {
 /// # Rückgabe
 /// Ein [`TraceContext`] ohne Elternspanne.
 ///
-/// # Panics
-/// Nie: [`TraceContext::new`] prüft Länge und Zeichensatz, und beide
-/// Zeichenketten erfüllen sie per Konstruktion (siehe `draw_hex32`). Die
-/// Prüfung läuft trotzdem, statt die `pub`-Felder direkt zu setzen — der
-/// validierende Konstruktor ist die eine Stelle, die das Format kennt.
-#[must_use]
-pub fn new_root_trace(entry: EntryKind) -> TraceContext {
+/// # Fehler
+/// - [`harw_observe::ObserveError::InvalidTraceId`] /
+///   [`harw_observe::ObserveError::InvalidSpanId`]: wenn
+///   [`TraceContext::new`] die gezogenen Hexziffern ablehnt. Per Konstruktion
+///   (siehe `draw_hex32`) unerreichbar, aber die validierende Konstruktion
+///   bleibt die eine Stelle, die das Format kennt, statt die `pub`-Felder
+///   direkt zu setzen — deshalb `Result` statt `expect` (Bible R087/R165).
+pub fn new_root_trace(entry: EntryKind) -> Result<TraceContext, harw_observe::ObserveError> {
     let trace_id = draw_hex32();
     let span_id: String = draw_hex32().chars().take(16).collect();
-    let trace = TraceContext::new(trace_id, span_id)
-        .expect("a UUID v4's hex digits are valid lowercase trace and span identifiers");
+    let trace = TraceContext::new(trace_id, span_id)?;
     tracing::debug!(
         entry = ?entry,
         trace_id = %trace.trace_id,
         span_id = %trace.span_id,
         "runtime.trace.root_created"
     );
-    trace
+    Ok(trace)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     const ALL_ENTRIES: [EntryKind; 11] = [
         EntryKind::Tui,
@@ -134,26 +140,29 @@ mod tests {
     }
 
     #[test]
-    fn every_entry_gets_a_well_formed_root_span() {
+    fn every_entry_gets_a_well_formed_root_span() -> TestResult {
         for entry in ALL_ENTRIES {
-            let trace = new_root_trace(entry);
+            let trace = new_root_trace(entry).map_err(ctx("new_root_trace"))?;
             assert!(is_lowercase_hex(&trace.trace_id, 32), "{entry:?}");
             assert!(is_lowercase_hex(&trace.span_id, 16), "{entry:?}");
             assert!(trace.parent_span_id.is_none(), "{entry:?}");
         }
+        Ok(())
     }
 
     #[test]
-    fn two_roots_never_share_a_trace_id() {
-        let first = new_root_trace(EntryKind::Tui);
-        let second = new_root_trace(EntryKind::Tui);
+    fn two_roots_never_share_a_trace_id() -> TestResult {
+        let first = new_root_trace(EntryKind::Tui).map_err(ctx("first root trace"))?;
+        let second = new_root_trace(EntryKind::Tui).map_err(ctx("second root trace"))?;
         assert_ne!(first.trace_id, second.trace_id);
         assert_ne!(first.span_id, second.span_id);
+        Ok(())
     }
 
     #[test]
-    fn trace_id_and_span_id_are_independent_draws() {
-        let trace = new_root_trace(EntryKind::OneShot);
+    fn trace_id_and_span_id_are_independent_draws() -> TestResult {
+        let trace = new_root_trace(EntryKind::OneShot).map_err(ctx("new_root_trace"))?;
         assert_ne!(trace.trace_id[..16], trace.span_id);
+        Ok(())
     }
 }

@@ -313,6 +313,7 @@ mod tests {
     use super::*;
     use crate::error::PlanError;
     use crate::ids::{PathOrSymbol, RevisionId, TaskId};
+    use crate::test_support::{TestError, TestResult};
     use crate::types::{Plan, PlanNode, PlanNodeStatus};
     use time::OffsetDateTime;
 
@@ -353,27 +354,32 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_action_serde_roundtrip() {
+    fn test_plan_action_serde_roundtrip() -> TestResult {
         let action = PlanAction::SetStatus {
             id: TaskId::new("t-1"),
             status: PlanNodeStatus::Ready,
             reason: Some("alle Deps grün".to_owned()),
         };
-        let json = serde_json::to_string(&action).expect("serialize");
-        let back: PlanAction = serde_json::from_str(&json).expect("deserialize");
+        let json = serde_json::to_string(&action)?;
+        let back: PlanAction = serde_json::from_str(&json)?;
         match back {
             PlanAction::SetStatus { id, status, .. } => {
                 assert_eq!(id, TaskId::new("t-1"));
                 assert_eq!(status, PlanNodeStatus::Ready);
             }
-            other => panic!("Unerwartete Variante: {:?}", other),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Unerwartete Variante: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_plan_action_op_tag() {
+    fn test_plan_action_op_tag() -> TestResult {
         let action = PlanAction::Inspect;
-        let json = serde_json::to_string(&action).expect("serialize");
+        let json = serde_json::to_string(&action)?;
         assert!(
             json.contains("\"op\":\"inspect\""),
             "op-Tag fehlt oder falsch: {}",
@@ -384,16 +390,17 @@ mod tests {
             plan_id: PlanId::new("p-1"),
             goal: "Ziel".to_owned(),
         };
-        let json2 = serde_json::to_string(&create).expect("serialize create");
+        let json2 = serde_json::to_string(&create)?;
         assert!(
             json2.contains("\"op\":\"create\""),
             "op-Tag für Create fehlt: {}",
             json2
         );
+        Ok(())
     }
 
     #[test]
-    fn test_update_node_patch_roundtrip() {
+    fn test_update_node_patch_roundtrip() -> TestResult {
         let action = PlanAction::UpdateNode {
             id: TaskId::new("t-1"),
             patch: NodePatch {
@@ -403,13 +410,13 @@ mod tests {
                 ..Default::default()
             },
         };
-        let json = serde_json::to_string(&action).expect("serialize update_node");
+        let json = serde_json::to_string(&action)?;
         assert!(
             json.contains("\"op\":\"update_node\""),
             "op-Tag für UpdateNode fehlt: {}",
             json
         );
-        let back: PlanAction = serde_json::from_str(&json).expect("deserialize update_node");
+        let back: PlanAction = serde_json::from_str(&json)?;
         match back {
             PlanAction::UpdateNode { id, patch } => {
                 assert_eq!(id, TaskId::new("t-1"));
@@ -421,8 +428,13 @@ mod tests {
                 assert!(patch.kind.is_none());
                 assert!(patch.dependencies.is_none());
             }
-            other => panic!("Unerwartete Variante: {:?}", other),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Unerwartete Variante: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
@@ -445,27 +457,32 @@ mod tests {
     }
 
     #[test]
-    fn test_expand_action_serde_roundtrip() {
+    fn test_expand_action_serde_roundtrip() -> TestResult {
         let child = test_node("child-1", PlanNodeStatus::Draft);
         let action = PlanAction::Expand {
             parent: TaskId::new("parent-1"),
             children: vec![child],
         };
-        let json = serde_json::to_string(&action).expect("serialize expand");
+        let json = serde_json::to_string(&action)?;
         assert!(
             json.contains("\"op\":\"expand\""),
             "op-Tag für Expand fehlt: {}",
             json
         );
-        let back: PlanAction = serde_json::from_str(&json).expect("deserialize expand");
+        let back: PlanAction = serde_json::from_str(&json)?;
         match back {
             PlanAction::Expand { parent, children } => {
                 assert_eq!(parent, TaskId::new("parent-1"));
                 assert_eq!(children.len(), 1);
                 assert_eq!(children[0].id, TaskId::new("child-1"));
             }
-            other => panic!("Unerwartete Variante: {:?}", other),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Unerwartete Variante: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]

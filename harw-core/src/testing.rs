@@ -76,36 +76,38 @@ impl RecordingModelProvider {
     /// Returns a clone of all recorded requests in call order.
     ///
     /// # Returns
-    /// A `Vec<ModelRequest>` snapshot; the buffer is not cleared.
-    ///
-    /// # Panics
-    /// Panics if the internal mutex is poisoned (only possible if a thread panicked
-    /// while holding the lock — should not occur in normal test usage).
+    /// A `Vec<ModelRequest>` snapshot; the buffer is not cleared. Returns an empty
+    /// `Vec` if the internal mutex is poisoned (R087: no panics) instead of the
+    /// actual buffer contents.
     #[must_use]
     pub fn recorded(&self) -> Vec<ModelRequest> {
-        self.inner.lock().unwrap().clone()
+        match self.inner.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Returns the last recorded request, or `None` if no calls have been made yet.
     ///
     /// # Returns
-    /// `Some(ModelRequest)` clone of the last entry, or `None`.
-    ///
-    /// # Panics
-    /// Panics if the internal mutex is poisoned.
+    /// `Some(ModelRequest)` clone of the last entry, or `None` — including when the
+    /// internal mutex is poisoned (R087: no panics).
     #[must_use]
     pub fn last(&self) -> Option<ModelRequest> {
-        self.inner.lock().unwrap().last().cloned()
+        match self.inner.lock() {
+            Ok(guard) => guard.last().cloned(),
+            Err(_) => None,
+        }
     }
 
     /// Clears the recording buffer.
     ///
     /// Useful when a single provider instance is reused across multiple test phases.
-    ///
-    /// # Panics
-    /// Panics if the internal mutex is poisoned.
+    /// A no-op if the internal mutex is poisoned (R087: no panics).
     pub fn clear(&self) {
-        self.inner.lock().unwrap().clear();
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.clear();
+        }
     }
 }
 
@@ -131,9 +133,12 @@ impl ModelProvider for RecordingModelProvider {
     ///
     /// # Concurrency
     /// The mutex is held only for the duration of the push. The future itself does not
-    /// hold any lock.
+    /// hold any lock. If the mutex is poisoned, the request is silently dropped from the
+    /// recording buffer instead of panicking (R087).
     fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
-        self.inner.lock().unwrap().push(request);
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.push(request);
+        }
         let response = ModelResponse::text(self.canned_response.as_str());
         Box::pin(async move { Ok(response) })
     }
@@ -145,6 +150,7 @@ mod tests {
 
     use super::*;
     use crate::history::ConversationHistory;
+    use crate::test_support::{TestError, TestResult};
     use harw_extension_api::LoadedInstructions;
 
     fn make_request(effort: Option<ReasoningEffort>) -> ModelRequest {
@@ -157,16 +163,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_recording_captures_both_calls_in_order() {
+    async fn test_recording_captures_both_calls_in_order() -> TestResult {
         let provider = RecordingModelProvider::new();
 
         // First call — no reasoning effort specified.
         let req1 = make_request(None);
-        let _ = provider.respond(req1).await.unwrap();
+        let _ = provider.respond(req1).await?;
 
         // Second call — high reasoning effort.
         let req2 = make_request(Some(ReasoningEffort::High));
-        let _ = provider.respond(req2).await.unwrap();
+        let _ = provider.respond(req2).await?;
 
         let recorded = provider.recorded();
         assert_eq!(recorded.len(), 2, "expected exactly two recorded requests");
@@ -183,24 +189,26 @@ mod tests {
             Some(ReasoningEffort::High),
             "second request reasoning_effort should be High"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_recording_returns_canned_response() {
+    async fn test_recording_returns_canned_response() -> TestResult {
         let provider = RecordingModelProvider::with_response("hello from test");
         let req = make_request(None);
-        let response = provider.respond(req).await.unwrap();
+        let response = provider.respond(req).await?;
         assert_eq!(
             response.message.as_deref(),
             Some("hello from test"),
             "canned response text should match"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_clear_empties_buffer() {
+    async fn test_clear_empties_buffer() -> TestResult {
         let provider = RecordingModelProvider::new();
-        let _ = provider.respond(make_request(None)).await.unwrap();
+        let _ = provider.respond(make_request(None)).await?;
         assert_eq!(provider.recorded().len(), 1);
         provider.clear();
         assert_eq!(
@@ -208,33 +216,36 @@ mod tests {
             0,
             "buffer should be empty after clear"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_last_returns_most_recent() {
+    async fn test_last_returns_most_recent() -> TestResult {
         let provider = RecordingModelProvider::new();
         assert!(
             provider.last().is_none(),
             "last() should be None when empty"
         );
 
-        let _ = provider.respond(make_request(None)).await.unwrap();
+        let _ = provider.respond(make_request(None)).await?;
         let _ = provider
             .respond(make_request(Some(ReasoningEffort::Low)))
-            .await
-            .unwrap();
+            .await?;
 
-        let last = provider.last().expect("last() should be Some after calls");
+        let last = provider
+            .last()
+            .ok_or(TestError::Missing("last() should be Some after calls"))?;
         assert_eq!(last.reasoning_effort, Some(ReasoningEffort::Low));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_clone_shares_buffer() {
+    async fn test_clone_shares_buffer() -> TestResult {
         let provider = RecordingModelProvider::new();
         let clone = provider.clone();
 
         // Call via the clone.
-        let _ = clone.respond(make_request(None)).await.unwrap();
+        let _ = clone.respond(make_request(None)).await?;
 
         // Original should see the recording made through the clone.
         assert_eq!(
@@ -242,5 +253,6 @@ mod tests {
             1,
             "clone and original must share the same recording buffer"
         );
+        Ok(())
     }
 }

@@ -268,6 +268,7 @@ pub fn route(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     fn sample_catalog_toml() -> &'static str {
         r#"
@@ -312,15 +313,17 @@ mod tests {
     }
 
     #[test]
-    fn test_load_default_parses_embedded_toml() {
-        let catalog = EmbeddingCatalog::load_default().expect("embeddings.toml parses");
+    fn test_load_default_parses_embedded_toml() -> TestResult {
+        let catalog = EmbeddingCatalog::load_default().map_err(ctx("embeddings.toml parses"))?;
         assert!(!catalog.entries().is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_parse_valid_catalog_succeeds() {
-        let catalog = EmbeddingCatalog::parse(sample_catalog_toml()).expect("parses");
+    fn test_parse_valid_catalog_succeeds() -> TestResult {
+        let catalog = EmbeddingCatalog::parse(sample_catalog_toml()).map_err(ctx("parses"))?;
         assert_eq!(catalog.entries().len(), 2);
+        Ok(())
     }
 
     #[test]
@@ -359,14 +362,16 @@ mod tests {
     }
 
     #[test]
-    fn test_route_confidential_returns_local_profile() {
-        let catalog = EmbeddingCatalog::parse(sample_catalog_toml()).expect("parses");
-        let profile = route(&catalog, EmbeddingRole::Confidential).expect("local profile exists");
+    fn test_route_confidential_returns_local_profile() -> TestResult {
+        let catalog = EmbeddingCatalog::parse(sample_catalog_toml()).map_err(ctx("parses"))?;
+        let profile =
+            route(&catalog, EmbeddingRole::Confidential).map_err(ctx("local profile exists"))?;
         assert_eq!(profile.locality, Locality::Local);
+        Ok(())
     }
 
     #[test]
-    fn test_route_confidential_fails_without_local_profile() {
+    fn test_route_confidential_fails_without_local_profile() -> TestResult {
         let toml_src = r#"
             [[model]]
             roles = ["confidential"]
@@ -387,15 +392,16 @@ mod tests {
             locality = "remote"
             batch_size = 16
         "#;
-        let catalog = EmbeddingCatalog::parse(toml_src).expect("parses");
+        let catalog = EmbeddingCatalog::parse(toml_src).map_err(ctx("parses"))?;
         assert_eq!(
             route(&catalog, EmbeddingRole::Confidential),
             Err(EmbedError::NoLocalProfileForConfidential)
         );
+        Ok(())
     }
 
     #[test]
-    fn test_route_returns_err_for_role_with_no_candidates() {
+    fn test_route_returns_err_for_role_with_no_candidates() -> TestResult {
         let toml_src = r#"
             [[model]]
             roles = ["code"]
@@ -416,17 +422,18 @@ mod tests {
             locality = "local"
             batch_size = 32
         "#;
-        let catalog = EmbeddingCatalog::parse(toml_src).expect("parses");
+        let catalog = EmbeddingCatalog::parse(toml_src).map_err(ctx("parses"))?;
         assert_eq!(
             route(&catalog, EmbeddingRole::Query),
             Err(EmbedError::NoProfileForRole {
                 role: EmbeddingRole::Query
             })
         );
+        Ok(())
     }
 
     #[test]
-    fn test_route_confidential_filters_before_picking_first_match() {
+    fn test_route_confidential_filters_before_picking_first_match() -> TestResult {
         // Der erste gelistete Kandidat ist entfernt; nur der zweite ist
         // lokal. Würde der Router zuerst "erster Treffer" wählen und danach
         // filtern, gäbe er fälschlich das entfernte Profil zurück.
@@ -469,14 +476,16 @@ mod tests {
             locality = "local"
             batch_size = 32
         "#;
-        let catalog = EmbeddingCatalog::parse(toml_src).expect("parses");
-        let profile = route(&catalog, EmbeddingRole::Confidential).expect("local profile exists");
+        let catalog = EmbeddingCatalog::parse(toml_src).map_err(ctx("parses"))?;
+        let profile =
+            route(&catalog, EmbeddingRole::Confidential).map_err(ctx("local profile exists"))?;
         assert_eq!(profile.backend, "onnx-local");
         assert_eq!(profile.locality, Locality::Local);
+        Ok(())
     }
 
     #[test]
-    fn test_embedding_role_deserializes_kebab_case_from_toml() {
+    fn test_embedding_role_deserializes_kebab_case_from_toml() -> TestResult {
         // Bestätigt, dass die `roles`-Liste (z. B. "confidential") über die
         // `#[serde(rename_all = "kebab-case")]`-Kodierung geparst wird, die
         // auch `embeddings.toml` verwendet.
@@ -484,7 +493,9 @@ mod tests {
         struct Wrapper {
             roles: Vec<EmbeddingRole>,
         }
-        let wrapper: Wrapper = toml::from_str(r#"roles = ["confidential"]"#).expect("parses");
+        let wrapper: Wrapper =
+            toml::from_str(r#"roles = ["confidential"]"#).map_err(ctx("parses"))?;
         assert_eq!(wrapper.roles, vec![EmbeddingRole::Confidential]);
+        Ok(())
     }
 }

@@ -321,9 +321,7 @@ pub fn admit_family_member(
     } else {
         Err(DslError::AuthorityElevation {
             of: Box::new(membership.role.id.clone()),
-            added_capabilities: membership
-                .capabilities
-                .added_relative_to(&family.universe),
+            added_capabilities: membership.capabilities.added_relative_to(&family.universe),
             location: crate::error::DiagLocation::field("membership.capabilities"),
         })
     }
@@ -855,12 +853,13 @@ fn parse_def_ref(s: &str) -> DslResult<DefinitionRef> {
 mod tests {
     use super::*;
     use crate::ids::Version;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Erzeugt eine minimale [`RawFamilyDefinition`] mit gegebener ID und Name.
-    fn make_raw(id_str: &str, name: &str) -> RawFamilyDefinition {
-        RawFamilyDefinition {
+    fn make_raw(id_str: &str, name: &str) -> TestResult<RawFamilyDefinition> {
+        Ok(RawFamilyDefinition {
             schema: "harwness.family/v1".to_owned(),
-            id: DefinitionId::parse(id_str).unwrap(),
+            id: DefinitionId::parse(id_str)?,
             version: Version(semver::Version::new(1, 0, 0)),
             extends: None,
             name: name.to_owned(),
@@ -870,15 +869,15 @@ mod tests {
             invariants: Vec::new(),
             universe: AuthorityCeiling::default(),
             patch: toml::Table::new(),
-        }
+        })
     }
 
     /// Erzeugt eine [`DefinitionRef`] aus einem ID-String.
-    fn def_ref(id_str: &str) -> DefinitionRef {
-        DefinitionRef {
-            id: DefinitionId::parse(id_str).unwrap(),
+    fn def_ref(id_str: &str) -> TestResult<DefinitionRef> {
+        Ok(DefinitionRef {
+            id: DefinitionId::parse(id_str)?,
             version: None,
-        }
+        })
     }
 
     fn now() -> OffsetDateTime {
@@ -892,7 +891,7 @@ mod tests {
     /// Verifiziert, dass eine [`RawFamilyDefinition`] korrekt zu TOML serialisiert
     /// und wieder deserialisiert werden kann.
     #[test]
-    fn raw_family_serde_roundtrip() {
+    fn raw_family_serde_roundtrip() -> TestResult {
         // TOML ohne Array-of-inline-tables (einfacher zu serialisieren).
         let src2 = r#"
 schema = "harwness.family/v1"
@@ -904,20 +903,23 @@ invariants = ["disjoint_write_sets", "workers_are_pure_implementers"]
 [defaults]
 context_policy = "harwness.context.coding-orchestrator@1"
 "#;
-        let raw: RawFamilyDefinition = toml::from_str(src2).unwrap();
+        let raw: RawFamilyDefinition = toml::from_str(src2)?;
         assert_eq!(raw.schema, "harwness.family/v1");
         assert_eq!(raw.name, "Focused Coding Family");
         assert_eq!(raw.invariants.len(), 2);
         assert_eq!(
-            raw.defaults["context_policy"].as_str().unwrap(),
+            raw.defaults["context_policy"]
+                .as_str()
+                .ok_or(TestError::Missing("defaults.context_policy as str"))?,
             "harwness.context.coding-orchestrator@1"
         );
 
         // Serialisierung und Re-Deserialisierung
-        let serialized = toml::to_string(&raw).unwrap();
-        let recovered: RawFamilyDefinition = toml::from_str(&serialized).unwrap();
+        let serialized = toml::to_string(&raw).map_err(ctx("toml::to_string should succeed"))?;
+        let recovered: RawFamilyDefinition = toml::from_str(&serialized)?;
         assert_eq!(recovered.name, raw.name);
         assert_eq!(recovered.invariants, raw.invariants);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -927,8 +929,8 @@ context_policy = "harwness.context.coding-orchestrator@1"
     /// Verifiziert, dass [`resolve_family`] [`DslError::MissingBase`] zurückgibt,
     /// wenn `target_id` in keinem der Layer vorhanden ist.
     #[test]
-    fn resolve_missing_base_errors() {
-        let id = DefinitionId::parse("harwness.family.nonexistent@1").unwrap();
+    fn resolve_missing_base_errors() -> TestResult {
+        let id = DefinitionId::parse("harwness.family.nonexistent@1")?;
         let layers: Vec<(DefinitionLayer, RawFamilyDefinition)> = vec![];
         let result = resolve_family(&id, &layers, now());
         assert!(
@@ -936,6 +938,7 @@ context_policy = "harwness.context.coding-orchestrator@1"
             "Erwartet MissingBase, bekommen: {:?}",
             result
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -945,20 +948,20 @@ context_policy = "harwness.context.coding-orchestrator@1"
     /// Verifiziert, dass eine Familie ohne `extends` direkt aufgelöst wird
     /// und alle Felder korrekt übernommen werden.
     #[test]
-    fn resolve_no_extends_returns_direct() {
+    fn resolve_no_extends_returns_direct() -> TestResult {
         let id_str = "harwness.family.focused-coding@1";
-        let id = DefinitionId::parse(id_str).unwrap();
-        let mut raw = make_raw(id_str, "Focused Coding Family");
+        let id = DefinitionId::parse(id_str)?;
+        let mut raw = make_raw(id_str, "Focused Coding Family")?;
         raw.workers
             .allowed
-            .push(def_ref("harwness.agent.focused-pure-coding@1"));
+            .push(def_ref("harwness.agent.focused-pure-coding@1")?);
         raw.workers
             .allowed
-            .push(def_ref("harwness.agent.focused-coding-planning@1"));
+            .push(def_ref("harwness.agent.focused-coding-planning@1")?);
         raw.invariants.push("disjoint_write_sets".to_owned());
 
         let layers = vec![(DefinitionLayer::BuiltIn, raw)];
-        let resolved = resolve_family(&id, &layers, now()).unwrap();
+        let resolved = resolve_family(&id, &layers, now())?;
 
         assert_eq!(resolved.id, id);
         assert_eq!(resolved.name, "Focused Coding Family");
@@ -966,6 +969,7 @@ context_policy = "harwness.context.coding-orchestrator@1"
         assert_eq!(resolved.invariants, vec!["disjoint_write_sets"]);
         assert_eq!(resolved.trace.steps.len(), 1);
         assert_eq!(resolved.trace.steps[0].kind, "base");
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -975,21 +979,21 @@ context_policy = "harwness.context.coding-orchestrator@1"
     /// Verifiziert, dass `patch.workers.allowed.append` einen neuen Worker hinzufügt.
     /// Base hat 2 Worker, Patch-Layer fügt 1 hinzu → Result hat 3 Worker.
     #[test]
-    fn resolve_applies_append_patch_to_workers() {
+    fn resolve_applies_append_patch_to_workers() -> TestResult {
         let id_str = "harwness.family.focused-coding@1";
-        let id = DefinitionId::parse(id_str).unwrap();
+        let id = DefinitionId::parse(id_str)?;
 
         // Base-Layer: 2 Worker
-        let mut base = make_raw(id_str, "Focused Coding Family");
+        let mut base = make_raw(id_str, "Focused Coding Family")?;
         base.workers
             .allowed
-            .push(def_ref("harwness.agent.focused-pure-coding@1"));
+            .push(def_ref("harwness.agent.focused-pure-coding@1")?);
         base.workers
             .allowed
-            .push(def_ref("harwness.agent.focused-coding-planning@1"));
+            .push(def_ref("harwness.agent.focused-coding-planning@1")?);
 
         // Patch-Layer: append 1 Worker
-        let mut patch_def = make_raw(id_str, "Focused Coding Family");
+        let mut patch_def = make_raw(id_str, "Focused Coding Family")?;
         let mut patch_table = toml::Table::new();
         let mut workers_table = toml::Table::new();
         let mut allowed_table = toml::Table::new();
@@ -1007,14 +1011,15 @@ context_policy = "harwness.context.coding-orchestrator@1"
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::UserGlobal, patch_def),
         ];
-        let resolved = resolve_family(&id, &layers, now()).unwrap();
+        let resolved = resolve_family(&id, &layers, now())?;
 
         assert_eq!(resolved.workers.len(), 3);
         assert!(
             resolved
                 .workers
-                .contains(&def_ref("mia.agent.rust-pqc-pure-coder@1"))
+                .contains(&def_ref("mia.agent.rust-pqc-pure-coder@1")?)
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1023,22 +1028,22 @@ context_policy = "harwness.context.coding-orchestrator@1"
 
     /// Verifiziert, dass `patch.workers.allowed.remove` einen Worker entfernt.
     #[test]
-    fn resolve_applies_remove_patch() {
+    fn resolve_applies_remove_patch() -> TestResult {
         let id_str = "harwness.family.focused-coding@1";
-        let id = DefinitionId::parse(id_str).unwrap();
+        let id = DefinitionId::parse(id_str)?;
 
-        let mut base = make_raw(id_str, "Focused Coding Family");
+        let mut base = make_raw(id_str, "Focused Coding Family")?;
         base.workers
             .allowed
-            .push(def_ref("harwness.agent.focused-pure-coding@1"));
+            .push(def_ref("harwness.agent.focused-pure-coding@1")?);
         base.workers
             .allowed
-            .push(def_ref("harwness.agent.focused-coding-planning@1"));
+            .push(def_ref("harwness.agent.focused-coding-planning@1")?);
         base.workers
             .allowed
-            .push(def_ref("harwness.agent.focused-docs-update@1"));
+            .push(def_ref("harwness.agent.focused-docs-update@1")?);
 
-        let mut patch_def = make_raw(id_str, "Focused Coding Family");
+        let mut patch_def = make_raw(id_str, "Focused Coding Family")?;
         let mut patch_table = toml::Table::new();
         let mut workers_table = toml::Table::new();
         let mut allowed_table = toml::Table::new();
@@ -1056,14 +1061,15 @@ context_policy = "harwness.context.coding-orchestrator@1"
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::Project, patch_def),
         ];
-        let resolved = resolve_family(&id, &layers, now()).unwrap();
+        let resolved = resolve_family(&id, &layers, now())?;
 
         assert_eq!(resolved.workers.len(), 2);
         assert!(
             !resolved
                 .workers
-                .contains(&def_ref("harwness.agent.focused-docs-update@1"))
+                .contains(&def_ref("harwness.agent.focused-docs-update@1")?)
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1072,14 +1078,14 @@ context_policy = "harwness.context.coding-orchestrator@1"
 
     /// Verifiziert, dass `patch.invariants.append` neue Invarianten hinzufügt.
     #[test]
-    fn resolve_appends_invariants() {
+    fn resolve_appends_invariants() -> TestResult {
         let id_str = "harwness.family.crypt-guard@1";
-        let id = DefinitionId::parse(id_str).unwrap();
+        let id = DefinitionId::parse(id_str)?;
 
-        let mut base = make_raw(id_str, "Crypt Guard Family");
+        let mut base = make_raw(id_str, "Crypt Guard Family")?;
         base.invariants.push("disjoint_write_sets".to_owned());
 
-        let mut patch_def = make_raw(id_str, "Crypt Guard Family");
+        let mut patch_def = make_raw(id_str, "Crypt Guard Family")?;
         let mut patch_table = toml::Table::new();
         let mut inv_table = toml::Table::new();
         inv_table.insert(
@@ -1096,7 +1102,7 @@ context_policy = "harwness.context.coding-orchestrator@1"
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::Workspace, patch_def),
         ];
-        let resolved = resolve_family(&id, &layers, now()).unwrap();
+        let resolved = resolve_family(&id, &layers, now())?;
 
         assert_eq!(resolved.invariants.len(), 3);
         assert!(
@@ -1105,6 +1111,7 @@ context_policy = "harwness.context.coding-orchestrator@1"
                 .contains(&"secret_types_never_clone".to_owned())
         );
         assert!(resolved.invariants.contains(&"zeroize_on_drop".to_owned()));
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1114,17 +1121,17 @@ context_policy = "harwness.context.coding-orchestrator@1"
     /// Verifiziert, dass bei unsortierter Eingabe die Layer-Priorisierung
     /// korrekt ist: höherer Layer (RunLocal) überschreibt niedrigeren (BuiltIn).
     #[test]
-    fn resolve_layer_ordering_respects_priority() {
+    fn resolve_layer_ordering_respects_priority() -> TestResult {
         let id_str = "harwness.family.focused-coding@1";
-        let id = DefinitionId::parse(id_str).unwrap();
+        let id = DefinitionId::parse(id_str)?;
 
-        let mut base = make_raw(id_str, "Focused Coding Family");
+        let mut base = make_raw(id_str, "Focused Coding Family")?;
         base.workers
             .allowed
-            .push(def_ref("harwness.agent.focused-pure-coding@1"));
+            .push(def_ref("harwness.agent.focused-pure-coding@1")?);
 
         // Patch-Layer mit höherer Priorität fügt Worker hinzu.
-        let mut patch_def = make_raw(id_str, "Focused Coding Family");
+        let mut patch_def = make_raw(id_str, "Focused Coding Family")?;
         let mut patch_table = toml::Table::new();
         let mut workers_table = toml::Table::new();
         let mut allowed_table = toml::Table::new();
@@ -1143,14 +1150,15 @@ context_policy = "harwness.context.coding-orchestrator@1"
             (DefinitionLayer::RunLocal, patch_def),
             (DefinitionLayer::BuiltIn, base),
         ];
-        let resolved = resolve_family(&id, &layers, now()).unwrap();
+        let resolved = resolve_family(&id, &layers, now())?;
 
         assert_eq!(resolved.workers.len(), 2);
         assert!(
             resolved
                 .workers
-                .contains(&def_ref("harwness.agent.focused-verification@1"))
+                .contains(&def_ref("harwness.agent.focused-verification@1")?)
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1160,13 +1168,13 @@ context_policy = "harwness.context.coding-orchestrator@1"
     /// Verifiziert, dass der [`ResolutionTrace`] bei Base + 1 Patch-Layer
     /// genau 2 Schritte enthält.
     #[test]
-    fn resolve_trace_contains_all_steps() {
+    fn resolve_trace_contains_all_steps() -> TestResult {
         let id_str = "harwness.family.focused-coding@1";
-        let id = DefinitionId::parse(id_str).unwrap();
+        let id = DefinitionId::parse(id_str)?;
 
-        let base = make_raw(id_str, "Focused Coding Family");
+        let base = make_raw(id_str, "Focused Coding Family")?;
 
-        let mut patch_def = make_raw(id_str, "Focused Coding Family");
+        let mut patch_def = make_raw(id_str, "Focused Coding Family")?;
         let mut patch_table = toml::Table::new();
         let mut inv_table = toml::Table::new();
         inv_table.insert(
@@ -1180,11 +1188,12 @@ context_policy = "harwness.context.coding-orchestrator@1"
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::UserGlobal, patch_def),
         ];
-        let resolved = resolve_family(&id, &layers, now()).unwrap();
+        let resolved = resolve_family(&id, &layers, now())?;
 
         assert_eq!(resolved.trace.steps.len(), 2);
         assert_eq!(resolved.trace.steps[0].kind, "base");
         assert_eq!(resolved.trace.steps[1].kind, "patch");
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1193,13 +1202,13 @@ context_policy = "harwness.context.coding-orchestrator@1"
 
     /// Verifiziert, dass `patch.name.replace` den Namen der Familie überschreiben kann.
     #[test]
-    fn family_name_taken_from_topmost_layer() {
+    fn family_name_taken_from_topmost_layer() -> TestResult {
         let id_str = "harwness.family.focused-coding@1";
-        let id = DefinitionId::parse(id_str).unwrap();
+        let id = DefinitionId::parse(id_str)?;
 
-        let base = make_raw(id_str, "Ursprünglicher Name");
+        let base = make_raw(id_str, "Ursprünglicher Name")?;
 
-        let mut patch_def = make_raw(id_str, "Ursprünglicher Name");
+        let mut patch_def = make_raw(id_str, "Ursprünglicher Name")?;
         let mut patch_table = toml::Table::new();
         let mut name_table = toml::Table::new();
         name_table.insert(
@@ -1213,9 +1222,10 @@ context_policy = "harwness.context.coding-orchestrator@1"
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::Project, patch_def),
         ];
-        let resolved = resolve_family(&id, &layers, now()).unwrap();
+        let resolved = resolve_family(&id, &layers, now())?;
 
         assert_eq!(resolved.name, "Überschriebener Name");
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1225,18 +1235,19 @@ context_policy = "harwness.context.coding-orchestrator@1"
     /// Verifiziert, dass eine [`FamilyRoster`]-Instanz ohne explizite Konfiguration
     /// eine leere `allowed`-Liste hat.
     #[test]
-    fn raw_default_roster_is_empty() {
+    fn raw_default_roster_is_empty() -> TestResult {
         let src = r#"
 schema = "harwness.family/v1"
 id = "harwness.family.minimal@1"
 version = "1.0.0"
 name = "Minimal Family"
 "#;
-        let raw: RawFamilyDefinition = toml::from_str(src).unwrap();
+        let raw: RawFamilyDefinition = toml::from_str(src)?;
         assert!(raw.orchestrators.allowed.is_empty());
         assert!(raw.workers.allowed.is_empty());
         assert!(raw.invariants.is_empty());
         assert!(raw.defaults.is_empty());
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1246,19 +1257,19 @@ name = "Minimal Family"
     /// Verifiziert, dass 3 aufeinanderfolgende Layer jeweils einen Worker hinzufügen
     /// und das Ergebnis alle 3 Worker enthält.
     #[test]
-    fn resolve_multi_layer_composition() {
+    fn resolve_multi_layer_composition() -> TestResult {
         let id_str = "harwness.family.focused-coding@1";
-        let id = DefinitionId::parse(id_str).unwrap();
+        let id = DefinitionId::parse(id_str)?;
 
         // Layer 1 (BuiltIn): 1 Worker
-        let mut base = make_raw(id_str, "Focused Coding Family");
+        let mut base = make_raw(id_str, "Focused Coding Family")?;
         base.workers
             .allowed
-            .push(def_ref("harwness.agent.focused-pure-coding@1"));
+            .push(def_ref("harwness.agent.focused-pure-coding@1")?);
 
         // Layer 2 (UserGlobal): append 1 Worker
         let patch_def2 = {
-            let mut def = make_raw(id_str, "Focused Coding Family");
+            let mut def = make_raw(id_str, "Focused Coding Family")?;
             let mut patch_table = toml::Table::new();
             let mut workers_table = toml::Table::new();
             let mut allowed_table = toml::Table::new();
@@ -1276,7 +1287,7 @@ name = "Minimal Family"
 
         // Layer 3 (Workspace): append 1 weiteren Worker
         let patch_def3 = {
-            let mut def = make_raw(id_str, "Focused Coding Family");
+            let mut def = make_raw(id_str, "Focused Coding Family")?;
             let mut patch_table = toml::Table::new();
             let mut workers_table = toml::Table::new();
             let mut allowed_table = toml::Table::new();
@@ -1297,26 +1308,27 @@ name = "Minimal Family"
             (DefinitionLayer::UserGlobal, patch_def2),
             (DefinitionLayer::Workspace, patch_def3),
         ];
-        let resolved = resolve_family(&id, &layers, now()).unwrap();
+        let resolved = resolve_family(&id, &layers, now())?;
 
         assert_eq!(resolved.workers.len(), 3);
         assert!(
             resolved
                 .workers
-                .contains(&def_ref("harwness.agent.focused-pure-coding@1"))
+                .contains(&def_ref("harwness.agent.focused-pure-coding@1")?)
         );
         assert!(
             resolved
                 .workers
-                .contains(&def_ref("harwness.agent.focused-coding-planning@1"))
+                .contains(&def_ref("harwness.agent.focused-coding-planning@1")?)
         );
         assert!(
             resolved
                 .workers
-                .contains(&def_ref("mia.agent.rust-pqc-pure-coder@1"))
+                .contains(&def_ref("mia.agent.rust-pqc-pure-coder@1")?)
         );
         // Trace: 1 base + 2 patches
         assert_eq!(resolved.trace.steps.len(), 3);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1327,20 +1339,21 @@ name = "Minimal Family"
     /// leere [`AuthorityCeiling`] — rein additiv, bestehende Family-Dateien
     /// ohne `[universe]` bleiben gültig.
     #[test]
-    fn universe_defaults_to_empty_when_omitted() {
+    fn universe_defaults_to_empty_when_omitted() -> TestResult {
         let src = r#"
 schema = "harwness.family/v1"
 id = "harwness.family.minimal@1"
 version = "1.0.0"
 name = "Minimal Family"
 "#;
-        let raw: RawFamilyDefinition = toml::from_str(src).unwrap();
+        let raw: RawFamilyDefinition = toml::from_str(src)?;
         assert!(raw.universe.capabilities.is_empty());
+        Ok(())
     }
 
     /// Ein deklariertes `[universe]` wird korrekt zu [`AuthorityCeiling`] deserialisiert.
     #[test]
-    fn universe_declared_explicitly_parses() {
+    fn universe_declared_explicitly_parses() -> TestResult {
         let src = r#"
 schema = "harwness.family/v1"
 id = "harwness.family.security@1"
@@ -1350,7 +1363,7 @@ name = "Security Family"
 [universe]
 capabilities = ["security.sensor.read", "security.verdict.propose"]
 "#;
-        let raw: RawFamilyDefinition = toml::from_str(src).unwrap();
+        let raw: RawFamilyDefinition = toml::from_str(src)?;
         assert_eq!(
             raw.universe.capabilities,
             vec![
@@ -1358,6 +1371,7 @@ capabilities = ["security.sensor.read", "security.verdict.propose"]
                 "security.verdict.propose".to_owned()
             ]
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1367,45 +1381,49 @@ capabilities = ["security.sensor.read", "security.verdict.propose"]
     /// Ohne `extends` ist `resolved.universe` genau die deklarierte Menge der
     /// Basis-Definition.
     #[test]
-    fn resolve_no_extends_carries_universe_through() {
+    fn resolve_no_extends_carries_universe_through() -> TestResult {
         let id_str = "harwness.family.security@1";
-        let id = DefinitionId::parse(id_str).unwrap();
-        let mut raw = make_raw(id_str, "Security Family");
+        let id = DefinitionId::parse(id_str)?;
+        let mut raw = make_raw(id_str, "Security Family")?;
         raw.universe = AuthorityCeiling {
             capabilities: vec!["security.sensor.read".to_owned()],
         };
 
         let layers = vec![(DefinitionLayer::BuiltIn, raw)];
-        let resolved = resolve_family(&id, &layers, now()).unwrap();
+        let resolved = resolve_family(&id, &layers, now())?;
 
         assert_eq!(
             resolved.universe.capabilities,
             vec!["security.sensor.read".to_owned()]
         );
+        Ok(())
     }
 
     /// `extends`, Kind erklärt kein eigenes `[universe]` (leere Menge) → das
     /// `universe` der Basis wird unverändert übernommen, nicht auf leer
     /// kollabiert.
     #[test]
-    fn resolve_extends_inherits_parent_universe_when_child_declares_none() {
+    fn resolve_extends_inherits_parent_universe_when_child_declares_none() -> TestResult {
         let base_id = "harwness.family.security-base@1";
         let derived_id = "harwness.family.security-derived@1";
 
-        let mut base = make_raw(base_id, "Security Base");
+        let mut base = make_raw(base_id, "Security Base")?;
         base.universe = AuthorityCeiling {
-            capabilities: vec!["security.sensor.read".to_owned(), "security.context.read".to_owned()],
+            capabilities: vec![
+                "security.sensor.read".to_owned(),
+                "security.context.read".to_owned(),
+            ],
         };
 
-        let mut derived = make_raw(derived_id, "Security Derived");
-        derived.extends = Some(def_ref(base_id));
+        let mut derived = make_raw(derived_id, "Security Derived")?;
+        derived.extends = Some(def_ref(base_id)?);
 
-        let id = DefinitionId::parse(derived_id).unwrap();
+        let id = DefinitionId::parse(derived_id)?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::UserGlobal, derived),
         ];
-        let resolved = resolve_family(&id, &layers, now()).unwrap();
+        let resolved = resolve_family(&id, &layers, now())?;
 
         let mut caps = resolved.universe.capabilities.clone();
         caps.sort();
@@ -1416,6 +1434,7 @@ capabilities = ["security.sensor.read", "security.verdict.propose"]
                 "security.sensor.read".to_owned()
             ]
         );
+        Ok(())
     }
 
     /// `extends`, Kind erklärt ein ENGERES `[universe]` → das Ergebnis ist der
@@ -1423,11 +1442,11 @@ capabilities = ["security.sensor.read", "security.verdict.propose"]
     /// `append`-Merge hier wäre eine stille Möglichkeit, die
     /// Disjunktheits-Zusicherung zweier Familien über `extends` zu brechen.
     #[test]
-    fn resolve_extends_intersects_when_child_declares_narrower_universe() {
+    fn resolve_extends_intersects_when_child_declares_narrower_universe() -> TestResult {
         let base_id = "harwness.family.security-base2@1";
         let derived_id = "harwness.family.security-derived2@1";
 
-        let mut base = make_raw(base_id, "Security Base 2");
+        let mut base = make_raw(base_id, "Security Base 2")?;
         base.universe = AuthorityCeiling {
             capabilities: vec![
                 "security.sensor.read".to_owned(),
@@ -1436,8 +1455,8 @@ capabilities = ["security.sensor.read", "security.verdict.propose"]
             ],
         };
 
-        let mut derived = make_raw(derived_id, "Security Derived 2");
-        derived.extends = Some(def_ref(base_id));
+        let mut derived = make_raw(derived_id, "Security Derived 2")?;
+        derived.extends = Some(def_ref(base_id)?);
         derived.universe = AuthorityCeiling {
             capabilities: vec![
                 "security.context.read".to_owned(),
@@ -1446,12 +1465,12 @@ capabilities = ["security.sensor.read", "security.verdict.propose"]
             ],
         };
 
-        let id = DefinitionId::parse(derived_id).unwrap();
+        let id = DefinitionId::parse(derived_id)?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::UserGlobal, derived),
         ];
-        let resolved = resolve_family(&id, &layers, now()).unwrap();
+        let resolved = resolve_family(&id, &layers, now())?;
 
         assert_eq!(
             resolved.universe.capabilities,
@@ -1462,6 +1481,7 @@ capabilities = ["security.sensor.read", "security.verdict.propose"]
             "das Ergebnis muss der Schnitt sein: 'security.advisory.correlate' \
              war nicht in der Basis und darf die effektive Menge nicht erweitern"
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1478,9 +1498,8 @@ capabilities = ["security.sensor.read", "security.verdict.propose"]
         include_str!("../../harw-registry-defaults/agents/family/research.toml");
     const CODING_FAMILY_TOML: &str =
         include_str!("../../harw-registry-defaults/agents/family/coding.toml");
-    const SECURITY_FAMILY_TOML: &str = include_str!(
-        "../../harw-registry-defaults/agents/families/security/security.toml"
-    );
+    const SECURITY_FAMILY_TOML: &str =
+        include_str!("../../harw-registry-defaults/agents/families/security/security.toml");
 
     /// Die tragende Zusicherung von Knoten AW6-01: die `universe`-Mengen aller
     /// eingebauten Families sind paarweise disjunkt.
@@ -1495,13 +1514,13 @@ capabilities = ["security.sensor.read", "security.verdict.propose"]
     /// nur, dass die REALEN, ausgelieferten Definitionen die Zusicherung
     /// heute erfüllen, nicht, dass das Prädikat scharf ist.
     #[test]
-    fn all_real_registry_family_universes_are_pairwise_disjoint() {
+    fn all_real_registry_family_universes_are_pairwise_disjoint() -> TestResult {
         let research: RawFamilyDefinition = toml::from_str(RESEARCH_FAMILY_TOML)
-            .expect("family/research.toml muss parsen");
+            .map_err(ctx("family/research.toml muss parsen"))?;
         let coding: RawFamilyDefinition =
-            toml::from_str(CODING_FAMILY_TOML).expect("family/coding.toml muss parsen");
+            toml::from_str(CODING_FAMILY_TOML).map_err(ctx("family/coding.toml muss parsen"))?;
         let security: RawFamilyDefinition = toml::from_str(SECURITY_FAMILY_TOML)
-            .expect("families/security/security.toml muss parsen");
+            .map_err(ctx("families/security/security.toml muss parsen"))?;
 
         let families = [
             ("family/research", &research.universe),
@@ -1522,20 +1541,22 @@ capabilities = ["security.sensor.read", "security.verdict.propose"]
                 );
             }
         }
+        Ok(())
     }
 
     /// Die Security-Familie deklariert ein nicht-leeres `universe` — sonst
     /// wäre der Disjunktheitstest oben für sie trivial und würde nichts
     /// beweisen.
     #[test]
-    fn security_family_declares_a_nonempty_universe() {
+    fn security_family_declares_a_nonempty_universe() -> TestResult {
         let security: RawFamilyDefinition = toml::from_str(SECURITY_FAMILY_TOML)
-            .expect("families/security/security.toml muss parsen");
+            .map_err(ctx("families/security/security.toml muss parsen"))?;
         assert!(
             !security.universe.capabilities.is_empty(),
             "die Security-Familie muss ein nicht-leeres universe deklarieren, \
              sonst ist die Disjunktheit trivial und ungeprüft"
         );
+        Ok(())
     }
 
     /// AW6-03 ist gelandet: das Worker-Roster der Security-Familie ist nicht
@@ -1565,7 +1586,7 @@ capabilities = ["security.sensor.read", "security.verdict.propose"]
     /// ist ein weiterhin zutreffender Fakt dieser Datei, keine überholte
     /// Vorhersage wie zuvor beim Worker-Roster.
     #[test]
-    fn security_family_workers_roster_matches_the_declared_triage_role_files() {
+    fn security_family_workers_roster_matches_the_declared_triage_role_files() -> TestResult {
         const EGRESS_TRIAGE_TOML: &str = include_str!(
             "../../harw-registry-defaults/agents/roles/security-egress-triage/security-egress-triage.toml"
         );
@@ -1590,17 +1611,17 @@ capabilities = ["security.sensor.read", "security.verdict.propose"]
         .into_iter()
         .map(|source| {
             crate::parse::parse_toml(source)
-                .expect("jede Security-Triage-Rollendatei muss parsen")
-                .id
+                .map_err(ctx("jede Security-Triage-Rollendatei muss parsen"))
+                .map(|raw| raw.id)
         })
-        .collect();
+        .collect::<TestResult<_>>()?;
 
         // Die ANDERE Seite: das aufgelöste Roster aus `security.toml`.
-        let id = DefinitionId::parse("harwness.family.security@1").unwrap();
+        let id = DefinitionId::parse("harwness.family.security@1")?;
         let raw: RawFamilyDefinition =
-            toml::from_str(SECURITY_FAMILY_TOML).expect("security.toml muss parsen");
+            toml::from_str(SECURITY_FAMILY_TOML).map_err(ctx("security.toml muss parsen"))?;
         let layers = vec![(DefinitionLayer::BuiltIn, raw)];
-        let resolved = resolve_family(&id, &layers, now()).unwrap();
+        let resolved = resolve_family(&id, &layers, now())?;
 
         let roster_ids: std::collections::HashSet<DefinitionId> = resolved
             .workers
@@ -1620,6 +1641,7 @@ capabilities = ["security.sensor.read", "security.verdict.propose"]
              as_orchestrator = true trägt — kein vorhergesagter Zustand, ein \
              aktueller Fakt dieser Datei"
         );
+        Ok(())
     }
 
     /// Die Security-Familie löst mit der erwarteten `id` und dem erwarteten
@@ -1630,7 +1652,7 @@ capabilities = ["security.sensor.read", "security.verdict.propose"]
     /// die Namensableitungsregel manuell gegen den literalen Pfad, an dem die
     /// Datei liegt, und dass ihr Inhalt vollständig auflöst.
     #[test]
-    fn security_family_resolves_with_expected_id_and_derived_name() {
+    fn security_family_resolves_with_expected_id_and_derived_name() -> TestResult {
         // Namensableitung laut `harw_registry_defaults::embedded_agents`
         // Modul-Dokumentation: "der volle Pfad relativ zu `agents/`, ohne
         // `.toml`". Dieser Test bildet die Regel nach, statt den echten Loader
@@ -1639,21 +1661,25 @@ capabilities = ["security.sensor.read", "security.verdict.propose"]
         let relative_path = "families/security/security.toml";
         let derived_name = relative_path
             .strip_suffix(".toml")
-            .expect("Pfad muss auf .toml enden");
+            .ok_or(TestError::Missing("'.toml' suffix on relative_path"))?;
         assert_eq!(derived_name, "families/security/security");
 
-        let id = DefinitionId::parse("harwness.family.security@1").unwrap();
+        let id = DefinitionId::parse("harwness.family.security@1")?;
         let raw: RawFamilyDefinition =
-            toml::from_str(SECURITY_FAMILY_TOML).expect("security.toml muss parsen");
+            toml::from_str(SECURITY_FAMILY_TOML).map_err(ctx("security.toml muss parsen"))?;
         assert_eq!(raw.id, id);
 
         let layers = vec![(DefinitionLayer::BuiltIn, raw)];
-        let resolved = resolve_family(&id, &layers, now()).unwrap();
+        let resolved = resolve_family(&id, &layers, now())?;
         assert_eq!(
-            resolved.defaults.get("return_contract").and_then(|v| v.as_str()),
+            resolved
+                .defaults
+                .get("return_contract")
+                .and_then(|v| v.as_str()),
             Some("harwness.security-verdict/v1")
         );
         assert_eq!(resolved.trace.steps.len(), 1);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1663,14 +1689,14 @@ capabilities = ["security.sensor.read", "security.verdict.propose"]
 
     /// Baut eine minimal aufgelöste Familie mit gegebenem `universe`, ohne
     /// TOML zu parsen — Hilfsfunktion nur für die Mitgliedschafts-Tests.
-    fn resolved_with_universe(id_str: &str, universe_caps: &[&str]) -> ResolvedFamily {
-        let mut raw = make_raw(id_str, "Security Family");
+    fn resolved_with_universe(id_str: &str, universe_caps: &[&str]) -> TestResult<ResolvedFamily> {
+        let mut raw = make_raw(id_str, "Security Family")?;
         raw.universe = AuthorityCeiling {
             capabilities: universe_caps.iter().map(|s| (*s).to_owned()).collect(),
         };
-        let id = DefinitionId::parse(id_str).unwrap();
+        let id = DefinitionId::parse(id_str)?;
         let layers = vec![(DefinitionLayer::BuiltIn, raw)];
-        resolve_family(&id, &layers, now()).unwrap()
+        Ok(resolve_family(&id, &layers, now())?)
     }
 
     /// Baut einen Mitgliedschaftsantrag für Tests.
@@ -1679,67 +1705,73 @@ capabilities = ["security.sensor.read", "security.verdict.propose"]
         role_id: &str,
         as_orchestrator: bool,
         caps: &[&str],
-    ) -> RawFamilyMembership {
-        RawFamilyMembership {
+    ) -> TestResult<RawFamilyMembership> {
+        Ok(RawFamilyMembership {
             schema: "harwness.family-membership/v1".to_owned(),
-            family: def_ref(family_id),
-            role: def_ref(role_id),
+            family: def_ref(family_id)?,
+            role: def_ref(role_id)?,
             as_orchestrator,
             capabilities: AuthorityCeiling {
                 capabilities: caps.iter().map(|s| (*s).to_owned()).collect(),
             },
-        }
+        })
     }
 
     /// `RawFamilyMembership` parst per TOML-Roundtrip mit den erwarteten Defaults.
     #[test]
-    fn family_membership_toml_roundtrip_has_expected_defaults() {
+    fn family_membership_toml_roundtrip_has_expected_defaults() -> TestResult {
         let src = r#"
 schema = "harwness.family-membership/v1"
 family = "harwness.family.security@1"
 role = "harwness.agent.security-triage-1@1"
 "#;
-        let parsed: RawFamilyMembership = toml::from_str(src).unwrap();
+        let parsed: RawFamilyMembership = toml::from_str(src)?;
         assert!(!parsed.as_orchestrator);
         assert!(parsed.capabilities.capabilities.is_empty());
         assert_eq!(
             parsed.family.id,
-            DefinitionId::parse("harwness.family.security@1").unwrap()
+            DefinitionId::parse("harwness.family.security@1")?
         );
+        Ok(())
     }
 
     /// Eine Mitgliedschaft, deren Capabilities vollständig im `universe`
     /// liegen, wird zugelassen.
     #[test]
-    fn admit_family_member_accepts_capabilities_within_universe() {
+    fn admit_family_member_accepts_capabilities_within_universe() -> TestResult {
         let family = resolved_with_universe(
             "harwness.family.security@1",
             &["security.sensor.read", "security.verdict.propose"],
-        );
+        )?;
         let request = membership(
             "harwness.family.security@1",
             "harwness.agent.security-triage-1@1",
             false,
             &["security.sensor.read"],
-        );
+        )?;
         assert!(admit_family_member(&family, &request).is_ok());
+        Ok(())
     }
 
     /// Der wichtigste Test dieses Knotens: eine Rolle mit einer Fähigkeit
     /// außerhalb des `universe` wird abgelehnt — mit `AuthorityElevation` und
     /// der beitretenden Rolle als `of`.
     #[test]
-    fn admit_family_member_rejects_capability_outside_universe() {
+    fn admit_family_member_rejects_capability_outside_universe() -> TestResult {
         let family =
-            resolved_with_universe("harwness.family.security@1", &["security.sensor.read"]);
+            resolved_with_universe("harwness.family.security@1", &["security.sensor.read"])?;
         let request = membership(
             "harwness.family.security@1",
             "harwness.agent.security-triage-1@1",
             false,
             &["security.sensor.read", "filesystem.write"],
-        );
-        let error = admit_family_member(&family, &request)
-            .expect_err("Capability außerhalb des universe muss abgelehnt werden");
+        )?;
+        let result = admit_family_member(&family, &request);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "Capability außerhalb des universe muss abgelehnt werden".into(),
+            ));
+        };
         match error {
             DslError::AuthorityElevation {
                 of,
@@ -1748,52 +1780,57 @@ role = "harwness.agent.security-triage-1@1"
             } => {
                 assert_eq!(
                     *of,
-                    DefinitionId::parse("harwness.agent.security-triage-1@1").unwrap()
+                    DefinitionId::parse("harwness.agent.security-triage-1@1")?
                 );
                 assert_eq!(added_capabilities, vec!["filesystem.write".to_owned()]);
             }
-            other => panic!("erwartet AuthorityElevation, bekommen: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet AuthorityElevation, bekommen: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// Eine Familie ohne `[universe]` (leere Menge) lässt keine Mitgliedschaft
     /// mit nichtleeren Capabilities zu — eine leere Autoritätsgrenze heißt
     /// "nichts ist geprüft worden", nicht "alles ist erlaubt".
     #[test]
-    fn admit_family_member_rejects_any_capability_when_universe_is_empty() {
-        let family = resolved_with_universe("harwness.family.security@1", &[]);
+    fn admit_family_member_rejects_any_capability_when_universe_is_empty() -> TestResult {
+        let family = resolved_with_universe("harwness.family.security@1", &[])?;
         let request = membership(
             "harwness.family.security@1",
             "harwness.agent.security-triage-1@1",
             false,
             &["security.sensor.read"],
-        );
+        )?;
         assert!(admit_family_member(&family, &request).is_err());
+        Ok(())
     }
 
     /// Eine Mitgliedschaft ohne beanspruchte Capabilities ist immer eine
     /// Teilmenge — auch eines leeren `universe`.
     #[test]
-    fn admit_family_member_accepts_empty_capabilities_against_empty_universe() {
-        let family = resolved_with_universe("harwness.family.security@1", &[]);
+    fn admit_family_member_accepts_empty_capabilities_against_empty_universe() -> TestResult {
+        let family = resolved_with_universe("harwness.family.security@1", &[])?;
         let request = membership(
             "harwness.family.security@1",
             "harwness.agent.security-triage-1@1",
             false,
             &[],
-        );
+        )?;
         assert!(admit_family_member(&family, &request).is_ok());
+        Ok(())
     }
 
     /// `merge_memberships_into` nimmt eine zulässige Rolle ins Worker-Roster
     /// auf, ohne dass die Familiendatei selbst geändert wurde (`resolved` kam
     /// aus einer Familie mit leerem Roster).
     #[test]
-    fn merge_memberships_into_admits_role_without_touching_family_file() {
-        let mut family = resolved_with_universe(
-            "harwness.family.security@1",
-            &["security.sensor.read"],
-        );
+    fn merge_memberships_into_admits_role_without_touching_family_file() -> TestResult {
+        let mut family =
+            resolved_with_universe("harwness.family.security@1", &["security.sensor.read"])?;
         assert!(family.workers.is_empty(), "Vorbedingung: leeres Roster");
 
         let memberships = vec![membership(
@@ -1801,127 +1838,135 @@ role = "harwness.agent.security-triage-1@1"
             "harwness.agent.security-triage-1@1",
             false,
             &["security.sensor.read"],
-        )];
-        merge_memberships_into(&mut family, &memberships).unwrap();
+        )?];
+        merge_memberships_into(&mut family, &memberships)?;
 
         assert_eq!(
             family.workers,
-            vec![def_ref("harwness.agent.security-triage-1@1")]
+            vec![def_ref("harwness.agent.security-triage-1@1")?]
         );
+        Ok(())
     }
 
     /// Ein Mitgliedschaftsantrag für eine andere Familie wird übersprungen.
     #[test]
-    fn merge_memberships_into_skips_membership_for_other_family() {
-        let mut family = resolved_with_universe("harwness.family.security@1", &["security.sensor.read"]);
+    fn merge_memberships_into_skips_membership_for_other_family() -> TestResult {
+        let mut family =
+            resolved_with_universe("harwness.family.security@1", &["security.sensor.read"])?;
         let memberships = vec![membership(
             "harwness.family.coding@1",
             "harwness.agent.some-coder@1",
             false,
             &[],
-        )];
-        merge_memberships_into(&mut family, &memberships).unwrap();
+        )?];
+        merge_memberships_into(&mut family, &memberships)?;
         assert!(family.workers.is_empty());
         assert!(family.orchestrators.is_empty());
+        Ok(())
     }
 
     /// Eine Mitgliedschaft mit `as_orchestrator = true` landet im
     /// Orchestrator-Roster, nicht im Worker-Roster.
     #[test]
-    fn merge_memberships_into_respects_as_orchestrator_flag() {
+    fn merge_memberships_into_respects_as_orchestrator_flag() -> TestResult {
         let mut family =
-            resolved_with_universe("harwness.family.security@1", &["security.verdict.propose"]);
+            resolved_with_universe("harwness.family.security@1", &["security.verdict.propose"])?;
         let memberships = vec![membership(
             "harwness.family.security@1",
             "harwness.agent.security-lead@1",
             true,
             &["security.verdict.propose"],
-        )];
-        merge_memberships_into(&mut family, &memberships).unwrap();
+        )?];
+        merge_memberships_into(&mut family, &memberships)?;
         assert_eq!(
             family.orchestrators,
-            vec![def_ref("harwness.agent.security-lead@1")]
+            vec![def_ref("harwness.agent.security-lead@1")?]
         );
         assert!(family.workers.is_empty());
+        Ok(())
     }
 
     /// Mehrere zulässige Mitgliedschaften werden additiv und in der
     /// übergebenen Reihenfolge angehängt (Reihenfolgestabilität).
     #[test]
-    fn merge_memberships_into_appends_multiple_in_given_order() {
+    fn merge_memberships_into_appends_multiple_in_given_order() -> TestResult {
         let mut family = resolved_with_universe(
             "harwness.family.security@1",
             &["security.sensor.read", "security.context.read"],
-        );
+        )?;
         let memberships = vec![
             membership(
                 "harwness.family.security@1",
                 "harwness.agent.security-triage-1@1",
                 false,
                 &["security.sensor.read"],
-            ),
+            )?,
             membership(
                 "harwness.family.security@1",
                 "harwness.agent.context-steward@1",
                 false,
                 &["security.context.read"],
-            ),
+            )?,
         ];
-        merge_memberships_into(&mut family, &memberships).unwrap();
+        merge_memberships_into(&mut family, &memberships)?;
         assert_eq!(
             family.workers,
             vec![
-                def_ref("harwness.agent.security-triage-1@1"),
-                def_ref("harwness.agent.context-steward@1"),
+                def_ref("harwness.agent.security-triage-1@1")?,
+                def_ref("harwness.agent.context-steward@1")?,
             ]
         );
+        Ok(())
     }
 
     /// Eine abgelehnte Mitgliedschaft bricht `merge_memberships_into` ab und
     /// ändert `resolved.universe` nicht.
     #[test]
-    fn merge_memberships_into_never_changes_universe() {
+    fn merge_memberships_into_never_changes_universe() -> TestResult {
         let mut family =
-            resolved_with_universe("harwness.family.security@1", &["security.sensor.read"]);
+            resolved_with_universe("harwness.family.security@1", &["security.sensor.read"])?;
         let original_universe = family.universe.clone();
         let memberships = vec![membership(
             "harwness.family.security@1",
             "harwness.agent.security-triage-1@1",
             false,
             &["security.sensor.read", "filesystem.write"],
-        )];
+        )?];
         let result = merge_memberships_into(&mut family, &memberships);
         assert!(result.is_err());
         assert_eq!(family.universe, original_universe);
+        Ok(())
     }
 
     /// Repeated resolution (zweimaliges Laden derselben Family + Memberships)
     /// liefert dasselbe Roster in derselben Reihenfolge — Voraussetzung für
     /// stabile `SnapshotId`/Golden-Tests stromabwärts.
     #[test]
-    fn merge_memberships_into_is_stable_across_repeated_resolution() {
+    fn merge_memberships_into_is_stable_across_repeated_resolution() -> TestResult {
         let memberships = vec![
             membership(
                 "harwness.family.security@1",
                 "harwness.agent.security-triage-1@1",
                 false,
                 &["security.sensor.read"],
-            ),
+            )?,
             membership(
                 "harwness.family.security@1",
                 "harwness.agent.security-triage-2@1",
                 false,
                 &["security.sensor.read"],
-            ),
+            )?,
         ];
 
-        let mut first = resolved_with_universe("harwness.family.security@1", &["security.sensor.read"]);
-        merge_memberships_into(&mut first, &memberships).unwrap();
+        let mut first =
+            resolved_with_universe("harwness.family.security@1", &["security.sensor.read"])?;
+        merge_memberships_into(&mut first, &memberships)?;
 
         let mut second =
-            resolved_with_universe("harwness.family.security@1", &["security.sensor.read"]);
-        merge_memberships_into(&mut second, &memberships).unwrap();
+            resolved_with_universe("harwness.family.security@1", &["security.sensor.read"])?;
+        merge_memberships_into(&mut second, &memberships)?;
 
         assert_eq!(first.workers, second.workers);
+        Ok(())
     }
 }

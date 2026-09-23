@@ -320,7 +320,12 @@ impl ConversationHistory {
         // zu pflegen.
         group_indices(&self.items)
             .into_iter()
-            .map(|indices| indices.into_iter().map(|index| &self.items[index]).collect())
+            .map(|indices| {
+                indices
+                    .into_iter()
+                    .map(|index| &self.items[index])
+                    .collect()
+            })
             .collect()
     }
 
@@ -425,16 +430,18 @@ impl ConversationHistory {
 
         let index_groups = group_indices(&processed);
         let mut slots: Vec<Option<TurnItem>> = processed.into_iter().map(Some).collect();
+        // `group_indices` garantiert, dass jeder Index genau einer Gruppe
+        // zugeordnet ist; `slots[index].take()` liefert daher im Normalfall
+        // immer `Some`. `filter_map` statt `.expect(...)` verhindert eine
+        // Panik in Produktion (R087), falls diese Invariante je verletzt
+        // würde — dann fehlt das Item in der Gruppe, statt den Prozess
+        // abzubrechen.
         let mut groups: Vec<Vec<TurnItem>> = index_groups
             .into_iter()
             .map(|indices| {
                 indices
                     .into_iter()
-                    .map(|index| {
-                        slots[index]
-                            .take()
-                            .expect("group_indices liefert jeden Index genau einmal")
-                    })
+                    .filter_map(|index| slots[index].take())
                     .collect()
             })
             .collect();
@@ -448,7 +455,11 @@ impl ConversationHistory {
         };
 
         let after = groups.split_off(user_idx + 1);
-        let user_group = groups.pop().expect("user_idx ist ein gültiger Index");
+        // `user_idx < groups.len()` (per `rposition`), also hat `groups`
+        // nach dem `split_off` mindestens `user_idx + 1` Elemente — `pop()`
+        // kann strukturell nicht fehlschlagen. `unwrap_or_default()` statt
+        // `.expect(...)` vermeidet dennoch jede Panik in Produktion (R087).
+        let user_group = groups.pop().unwrap_or_default();
         let before = groups;
 
         let mut used = group_bytes(&user_group);
@@ -467,8 +478,10 @@ impl ConversationHistory {
                     }
                     if let TurnItem::ToolResult(result_item) = &*item {
                         let before_item_bytes = item_bytes(item);
-                        let placeholder_item =
-                            TurnItem::ToolResult(full_placeholder_result(result_item, before_item_bytes));
+                        let placeholder_item = TurnItem::ToolResult(full_placeholder_result(
+                            result_item,
+                            before_item_bytes,
+                        ));
                         let placeholder_bytes = item_bytes(&placeholder_item);
                         if placeholder_bytes < before_item_bytes {
                             *item = placeholder_item;
@@ -732,6 +745,7 @@ fn flatten_content(parts: &[ContentPart]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_protocol::items::ReasoningItem;
 
     // Baut einen Call-Eintrag mit gegebener call_id; `id` bleibt zufällig,
@@ -936,7 +950,7 @@ mod tests {
     /// sichert nur zu, dass die bestehende `TurnItem::Reasoning`-Speicherung
     /// durch diesen Knoten nicht beschädigt wurde.
     #[test]
-    fn test_conversation_history_roundtrip_preserves_reasoning_item() {
+    fn test_conversation_history_roundtrip_preserves_reasoning_item() -> TestResult {
         let mut history = ConversationHistory::new();
         history.push(user("hi"));
         let reasoning_id = ItemId::new();
@@ -947,9 +961,10 @@ mod tests {
         }));
         history.push(assistant("here is the answer"));
 
-        let json = serde_json::to_string(&history).expect("ConversationHistory serializes");
+        let json =
+            serde_json::to_string(&history).map_err(ctx("ConversationHistory serializes"))?;
         let restored: ConversationHistory =
-            serde_json::from_str(&json).expect("ConversationHistory deserializes");
+            serde_json::from_str(&json).map_err(ctx("ConversationHistory deserializes"))?;
 
         assert_eq!(restored.len(), 3);
         let restored_signatures: Vec<&'static str> =
@@ -968,7 +983,11 @@ mod tests {
                     vec!["raw provider thinking payload".to_owned()]
                 );
             }
-            other => panic!("expected a Reasoning item after roundtrip, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected a Reasoning item after roundtrip, got {other:?}"
+                )));
+            }
         }
 
         // `to_model_messages` lässt Reasoning-Items weiterhin bewusst aus
@@ -976,6 +995,7 @@ mod tests {
         // dem Roundtrip.
         let messages = restored.to_model_messages();
         assert_eq!(messages.len(), 2);
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -993,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tail_preserving_current_turn_always_keeps_last_user_message() {
+    fn test_tail_preserving_current_turn_always_keeps_last_user_message() -> TestResult {
         let mut history = ConversationHistory::new();
         // Größer als das gesamte Budget unten (256 KiB): egal wie viel
         // Restbudget die Kürzung des aktuellen Turns freigibt, dieser ältere
@@ -1069,7 +1089,7 @@ mod tests {
                     .as_str()
                     .strip_prefix("call-")
                     .and_then(|s| s.parse().ok())
-                    .expect("Test-Call-IDs haben die Form call-<n>");
+                    .ok_or(TestError::Missing("Test-Call-IDs haben die Form call-<n>"))?;
                 seen_indices.push(index);
             }
         }
@@ -1080,25 +1100,24 @@ mod tests {
         // Das neueste Paar (call-9) ist am unwahrscheinlichsten betroffen und
         // bleibt unbeschnitten erhalten.
         if call_ids.contains("call-9") {
-            let newest_result_text = tail
-                .items()
-                .iter()
-                .find_map(|item| match item {
-                    TurnItem::ToolResult(r) if r.call_id.as_str() == "call-9" => {
-                        tool_result_string_value(item)
-                    }
-                    _ => None,
-                });
+            let newest_result_text = tail.items().iter().find_map(|item| match item {
+                TurnItem::ToolResult(r) if r.call_id.as_str() == "call-9" => {
+                    tool_result_string_value(item)
+                }
+                _ => None,
+            });
             assert!(
                 newest_result_text.is_none(),
                 "das neueste Ergebnis sollte nicht auf einen reinen String-Platzhalter \
                  reduziert worden sein"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_tail_preserving_current_turn_always_truncates_oversized_single_result_head_tail() {
+    fn test_tail_preserving_current_turn_always_truncates_oversized_single_result_head_tail()
+    -> TestResult {
         let mut history = ConversationHistory::new();
         history.push(user("trigger"));
         history.push(call("only", "fs.read"));
@@ -1127,7 +1146,9 @@ mod tests {
                 }
                 _ => None,
             })
-            .expect("das einzige Tool-Ergebnis bleibt als Erfolg mit Text-Inhalt erhalten");
+            .ok_or(TestError::Missing(
+                "das einzige Tool-Ergebnis bleibt als Erfolg mit Text-Inhalt erhalten",
+            ))?;
 
         assert!(
             truncated_value.starts_with("HEADMARK"),
@@ -1148,6 +1169,7 @@ mod tests {
             truncated_value.len() < huge_text.len(),
             "der gekürzte Text ist nicht kleiner als das Original"
         );
+        Ok(())
     }
 
     #[test]

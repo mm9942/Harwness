@@ -66,7 +66,9 @@ pub enum WebError {
 
     /// Unter `path` liegt kein Socket (reguläre Datei, Symlink, Verzeichnis,
     /// …). Die Datei wurde **nicht** angefasst.
-    #[msg("Web-Socket-Pfad '{path}' ist durch eine Nicht-Socket-Datei belegt — wird nicht entfernt")]
+    #[msg(
+        "Web-Socket-Pfad '{path}' ist durch eine Nicht-Socket-Datei belegt — wird nicht entfernt"
+    )]
     SocketPathOccupied {
         /// Der belegte Pfad.
         path: String,
@@ -134,6 +136,7 @@ impl ::core::fmt::Debug for WebError {
 #[cfg(test)]
 mod tests {
     use super::WebError;
+    use crate::test_support::{TestError, TestResult};
     use std::error::Error;
 
     #[test]
@@ -211,26 +214,34 @@ mod tests {
     fn test_source_is_none_for_content_free_variants() {
         assert!(WebError::Accept.source().is_none());
         assert!(
-            WebError::SocketInUse { path: String::new() }
-                .source()
-                .is_none()
+            WebError::SocketInUse {
+                path: String::new()
+            }
+            .source()
+            .is_none()
         );
         assert!(
-            WebError::SocketPathOccupied { path: String::new() }
-                .source()
-                .is_none()
+            WebError::SocketPathOccupied {
+                path: String::new()
+            }
+            .source()
+            .is_none()
         );
         assert!(WebError::PeerCredentialsUnavailable.source().is_none());
         assert!(WebError::InvalidEventCapacity.source().is_none());
     }
 
     #[test]
-    fn test_from_serde_json_error_wires_source() {
-        let json_err = serde_json::from_str::<serde_json::Value>("{not json")
-            .expect_err("malformed JSON must fail to parse");
+    fn test_from_serde_json_error_wires_source() -> TestResult {
+        let Err(json_err) = serde_json::from_str::<serde_json::Value>("{not json") else {
+            return Err(TestError::Unexpected(
+                "malformed JSON must fail to parse".into(),
+            ));
+        };
         let err: WebError = json_err.into();
         assert!(matches!(err, WebError::EventEncode(_)));
         assert!(err.source().is_some());
+        Ok(())
     }
 
     #[test]

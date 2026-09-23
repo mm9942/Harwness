@@ -287,25 +287,20 @@
 //!   `drive_turn`-Aufruf; `record_model_round`/`record_usage` laufen nach
 //!   jeder Modellantwort, `record_tool_calls` nach bestandenem
 //!   `tool_checkpoint`, unmittelbar bevor die Runde tatsächlich dispatcht wird.
-//! - **Offene Lücke, ehrlich benannt:** [`resume_after_child`] und
-//!   [`resume_after_approval`] (bzw. ihre `_durable`-Varianten) sind
-//!   öffentliche Einstiegspunkte, die von `harw-tui`, `harw-cli` und den Tests
-//!   dieses Workspaces mit ihrer heutigen Signatur aufgerufen werden — Dateien
-//!   außerhalb des Schreibbereichs dieses Knotens
-//!   (`harw-core/src/turn_loop.rs`, `harw-core/src/child_controller.rs`). Sie
-//!   nehmen deshalb weiterhin **keinen** `TurnControl`-Parameter entgegen und
-//!   können ihn auch nicht aus [`AgentSession`] lesen: die Session trägt bis
-//!   heute kein Feld, das einen `TurnControl`-Block über eine
-//!   Handoff-/Approval-Pause hinweg aufbewahrt (ein solches Feld läge in
-//!   `session.rs`, ebenfalls außerhalb dieses Schreibbereichs). Jede dieser
-//!   vier Funktionen baut sich deshalb für ihren `drive_turn`-Aufruf einen
-//!   frischen `TurnControl::new()` (unbegrenzt, eigener `CancelToken`) — die
-//!   Checkpoint-Logik läuft also auch nach einer Pause, nur ohne die
-//!   `TurnLimits` und ohne den `CancelToken` des ursprünglichen Turns. Eine
-//!   Grenze, die *vor* einem Handoff oder einer Rückfrage galt, gilt danach
-//!   also nicht automatisch weiter — das ist eine dokumentierte Lücke, kein
-//!   stiller Fehler: sie zu schließen verlangt ein neues, session-persistes
-//!   Feld außerhalb dieses Schreibbereichs, keine weitere Logik hier.
+//! - **Lücke war offen, ist seit „Siebter Nachtrag" geschlossen:**
+//!   [`resume_after_child`] und [`resume_after_approval`] (bzw. ihre
+//!   `_durable`-Varianten) sind öffentliche Einstiegspunkte, die von
+//!   `harw-tui`, `harw-cli` und den Tests dieses Workspaces mit ihrer
+//!   heutigen Signatur aufgerufen werden — ihre Signatur nimmt weiterhin
+//!   **keinen** `TurnControl`-Parameter entgegen, das war und bleibt
+//!   unverändert. Der damalige Blocker war ein fehlendes session-persistes
+//!   Feld außerhalb des Schreibbereichs dieses Knotens (`session.rs`); jener
+//!   Schreibbereich schließt seit „Siebter Nachtrag" auch `session.rs` ein.
+//!   `AgentSession::active_turn_control` trägt den Block jetzt über die Pause
+//!   hinweg, `resume_after_child`/`resume_after_approval` (bzw. ihre
+//!   `_durable`-Varianten) lesen ihn darüber zurück, statt bedingungslos einen
+//!   frischen `TurnControl::new()` zu bauen — Details siehe „Siebter
+//!   Nachtrag" unten.
 //!
 //! ## Sechster Nachtrag (dieser Knoten, Welle 3): der Modellaufruf racet
 //! jetzt tatsächlich, und `ToolsError::Cancelled` bricht mitten in der
@@ -348,16 +343,118 @@
 //!   frischen `TurnControl::new()` (siehe „Fünfter Nachtrag", offene Lücke)
 //!   — plumbing, keine neue Dispatch-Reaktion dort.
 //!
+//! ## Siebter Nachtrag (dieser Knoten): die „Fünfter Nachtrag"-Lücke ist
+//! geschlossen — der Steuerblock überlebt Handoff- und Rückfrage-Pausen jetzt
+//! tatsächlich, und zwei bisher ungeracete Ausführungspfade racen jetzt auch
+//!
+//! Der „Fünfter Nachtrag" oben nannte drei offene Punkte: kein session-persister
+//! `TurnControl`-Speicher über eine Pause hinweg, ein ungeracetes
+//! `executor.traced_execute(...)` im Rückfrage-Fortsetzungspfad, und einen
+//! ungeraceten parallelen Join-Loop. Alle drei sind mit diesem Knoten
+//! geschlossen:
+//!
+//! - **Fix A — Steuerblock übersteht die Pause.** [`AgentSession`] trägt jetzt
+//!   `active_turn_control: Option<TurnControl>` (`session.rs`, Feld-Doku dort):
+//!   [`run_turn`]/[`run_turn_durable`] hinterlegen darauf einen Klon des
+//!   `TurnInput::control`-Blocks, sobald der Turn beginnt
+//!   (`AgentSession::set_active_turn_control`); [`resume_after_child`]/
+//!   [`resume_after_child_durable`] und [`resume_after_approval`]/
+//!   [`resume_after_approval_durable`] lesen ihn über
+//!   `session.active_turn_control().cloned().unwrap_or_else(TurnControl::new)`
+//!   zurück, statt bedingungslos einen frischen, unbegrenzten Block zu bauen.
+//!   Der Fallback auf einen frischen Block bleibt für den Fall, dass eine
+//!   Session ihren Turn nie über `run_turn`/`run_turn_durable` gestartet hat
+//!   (z. B. Tests, die direkt `AgentSession::try_start_turn` rufen) — kein
+//!   Panic, keine Regression für Aufrufer außerhalb dieses Knotens.
+//!   `AgentSession::complete_turn` löscht das Feld wieder, symmetrisch zu
+//!   `current_turn`. Ein `CancelToken`, der vor einer Handoff- oder
+//!   Rückfrage-Pause abgebrochen wurde (Ctrl+C), erreicht damit jetzt auch die
+//!   Fortsetzung nach der Pause — vorher verschluckte der frische Token genau
+//!   diesen Fall stillschweigend.
+//! - **Fix B — der Rückfrage-Fortsetzungspfad racet jetzt auch.**
+//!   `resume_after_approval_with_store`s Zweig für einen genehmigten,
+//!   nicht-Handoff-Call (der „Rückfrage"-Pfad, nach einem `AskUser`) hatte
+//!   keine `was_cancelled`-Weiche — ein hier hängender Ausführer war gegen
+//!   Cancel vollständig blind, unabhängig davon, ob er selbst kooperativ ist.
+//!   Der Aufruf racet jetzt exakt wie im sequenziellen Pfad (`tokio::select!`,
+//!   `biased`, `control.cancel_token().cancelled()` gegen
+//!   `executor.traced_execute(...)`) und liefert bei einem Treffer ein
+//!   synthetisches `Err(ToolsError::Cancelled)`; ein Treffer geht über
+//!   [`cancel_turn_with_pending_calls`] mit `remaining: Vec::new()` — ein
+//!   Rückfrage-Resume setzt genau einen Call fort, die übrigen Calls derselben
+//!   Modellantwort wurden beim `AskUser`-Treffer nie in den Verlauf
+//!   geschrieben (siehe `ApprovalDecision::AskUser` im sequenziellen Pfad) und
+//!   sind daher keine offenen Geschwister, die noch ein Ergebnis bräuchten.
+//!   Der sequenzielle Dispatch-Pfad selbst bekam denselben Race schon
+//!   zusätzlich um den ungeraceten `.await` seines Werkzeugaufrufs herum —
+//!   vorher konnte ein Ausführer, der `ctx.cancel()` nie selbst abfragt, den
+//!   Turn bis zu seinem eigenen Ende blockieren; jetzt beendet ein Treffer den
+//!   `select!` synchron mit einem synthetischen `Err(ToolsError::Cancelled)`.
+//! - **Fix C — der parallele Join-Loop racet jetzt auch.**
+//!   [`try_execute_parallel_calls`] wartete mit
+//!   `while let Some(joined) = joins.join_next().await` ungeracet auf **alle**
+//!   Aufrufe der `JoinSet`, bevor überhaupt auf Cancel reagiert wurde — ein
+//!   nicht kooperativer Ausführer blockierte damit die gesamte Antwort. Die
+//!   Reaper-Schleife racet jetzt selbst gegen `control.cancel_token()`: ein
+//!   Treffer setzt `cancel_hit` und ruft `joins.abort_all()`; danach werden
+//!   weiterhin abgeschlossene Jobs abgeholt (`join_next()` bleibt aktiv), ein
+//!   `JoinError` eines abgebrochenen Jobs wird nach einem Cancel-Treffer
+//!   verworfen statt propagiert (vorher — ohne Cancel-Treffer — bleibt ein
+//!   `JoinError` weiterhin ein echter Fehler dieser Funktion). Jeder Slot, der
+//!   danach noch `None` ist (abgebrochen, bevor sein Ergebnis geerntet wurde),
+//!   bekommt synthetisch dasselbe `"turn cancelled before delivery"`-Ergebnis,
+//!   das die bereits bestehende `TurnGuard`-Abort-Auslieferung darunter auch
+//!   für andere Abbruchgründe erzeugt — die Auslieferungsschleife selbst
+//!   bleibt unverändert, sie verlangt nur, dass jeder Slot `Some(...)` ist,
+//!   was jetzt garantiert ist.
+//!
+//! ## Achter Nachtrag (dieser Knoten): hängender `Running`-Zustand nach einem
+//! Fehler beim Rückfrage-Resume, und ein Fortschritts-Hinweis, den ein Modell
+//! als Antwort-Cache fehldeutete
+//!
+//! - **Fix A — jeder Fehlerausstieg von [`resume_after_approval_with_store`]
+//!   nach erfolgreichem `resolve_approval` durchläuft jetzt
+//!   [`transition_after_turn_failure`].** Vorher gaben mehrere Stellen (jedes
+//!   `?` nach dem Rückfrage-Resume, sowie zwei `return drive_turn(...)`/
+//!   `return cancel_turn_with_pending_calls(...)`) ihr `Result` direkt aus der
+//!   Funktion zurück — anders als [`run_turn_with_approvals`] und
+//!   [`resume_after_child_with_approvals`], die diesen Übergang bereits
+//!   korrekt anwenden. Ein Transport-Fehler des Modells während eines
+//!   fortgesetzten Rückfrage-Turns ließ die Session dadurch dauerhaft in
+//!   `Running` hängen; der nächste Turn scheiterte mit „session not idle:
+//!   Running", obwohl der ursprüngliche Fehler retrybar war. Der gesamte
+//!   Auflösungspfad (der `match resolution { ... }`-Ausdruck) läuft jetzt in
+//!   einem inneren `async`-Block; `return`/`?` darin beenden nur diesen Block,
+//!   nicht die Funktion — genau ein `Result` wird danach geprüft und im
+//!   Fehlerfall genau einmal an [`transition_after_turn_failure`] gereicht,
+//!   bevor es zurückgegeben wird.
+//! - **Fix C — Polling zählt als Fortschritt.** [`apply_tool_guard`] wertete
+//!   einen erfolgreichen Tool-Aufruf nur dann als Rundenfortschritt, wenn
+//!   seine Signatur (Name + kanonische Argumente) in diesem Turn noch nicht
+//!   gesehen wurde. Für [`crate::guard::POLLING_TOOLS`] (aktuell nur
+//!   `shell.exec`) ist ein wiederholter identischer Aufruf jedoch legitimes
+//!   Warten auf einen laufenden Hintergrundprozess, kein Stillstand — ein
+//!   Modell, das so pollte, sah stattdessen den
+//!   [`crate::guard::TurnGuard::observe_round_end`]-Hinweis zu ausbleibendem
+//!   Fortschritt und deutete ihn als Beleg für einen nicht existenten
+//!   Antwort-Cache, woraufhin es Befehle künstlich variierte, um „neue"
+//!   Aufrufe zu erzwingen. Ein wiederholter *erfolgreicher* Aufruf eines
+//!   `POLLING_TOOLS`-Eintrags zählt deshalb jetzt unabhängig von seiner
+//!   Signatur als Fortschritt, und der Hinweistext benennt das Missverständnis
+//!   jetzt explizit („Es gibt keinen Antwort-Cache — jeder Aufruf wurde echt
+//!   ausgeführt"). Die Schwellenwerte selbst (`no_progress_rounds_warn`/
+//!   `_abort`) sind unverändert.
+//!
 use crate::cancel::{CancelReason, CancelToken};
 use crate::capture::{ToolOutcome, ToolOutcomeStatus};
 use crate::error::{CoreError, CoreResult};
 use crate::guard::{DriftEvent, DriftKind, GuardVerdict, TurnGuard};
-use crate::model::{ModelProvider, ModelRequest};
+use crate::model::{ModelProvider, ModelRequest, RequestIdentity};
 use crate::session::{AgentSession, SpawnContext, TurnHandle};
 use crate::state_store::{StateStore, StateStoreError, UsageRound};
 use harw_extension_api::{
-    ApprovalDecision, LoadedInstructions, SpawnInput, ToolExecutor,
-    TurnInputContext, TurnStartInput, TurnStopInput,
+    ApprovalDecision, LoadedInstructions, SpawnInput, ToolExecutor, TurnInputContext,
+    TurnStartInput, TurnStopInput,
 };
 use harw_protocol::events::TurnEvent;
 use harw_protocol::items::{
@@ -365,8 +462,7 @@ use harw_protocol::items::{
 };
 use harw_session_store::{ApprovalRecord, ApprovalStore};
 use harw_tools::{
-    ToolCall, ToolExecutionContext, ToolName, ToolOutput, ToolSpec, ToolsError,
-    TracedToolExecutor,
+    ToolCall, ToolExecutionContext, ToolName, ToolOutput, ToolSpec, ToolsError, TracedToolExecutor,
 };
 use harw_types::{
     ApprovalActor, Clock, ReviewDecision, SessionId, SystemClock, TokenUsage, ToolCallId,
@@ -383,8 +479,14 @@ pub const HANDOFF_PREFIX: &str = "transfer_to_";
 /// Ergebnis-Slot für einen parallelen Tool-Call: (ID, Ergebnis, Wandzeit ms).
 // Letztes Feld: `true`, wenn dieser Call mit `ToolsError::Cancelled`
 // endete (siehe `try_execute_parallel_calls`s Ergebnis-Auslieferung).
-type ParallelCallSlot =
-    Option<(ToolCallId, ToolCallResult, u64, String, serde_json::Value, bool)>;
+type ParallelCallSlot = Option<(
+    ToolCallId,
+    ToolCallResult,
+    u64,
+    String,
+    serde_json::Value,
+    bool,
+)>;
 
 /// Grenzwerte eines einzelnen Turns (W4a A-LOOP).
 ///
@@ -653,10 +755,10 @@ impl TurnControl {
             return Some(reason);
         }
         let meter = self.meter();
-        let requested = u64::from(meter.tool_calls)
-            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
-        let exhausted = requested > u64::from(self.limits.max_tool_calls)
-            || self.wall_time_exceeded(&meter);
+        let requested =
+            u64::from(meter.tool_calls).saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        let exhausted =
+            requested > u64::from(self.limits.max_tool_calls) || self.wall_time_exceeded(&meter);
         exhausted.then_some(CancelReason::Budget)
     }
 }
@@ -848,7 +950,10 @@ fn delegation_targets_fragment(names: &[String]) -> Option<harw_context::Fragmen
     if names.is_empty() {
         return None;
     }
-    let body = format!("Delegierbare Ziele (transfer_to_<name>): {}", names.join(", "));
+    let body = format!(
+        "Delegierbare Ziele (transfer_to_<name>): {}",
+        names.join(", ")
+    );
     let label = harw_context::FragmentLabel::try_new("delegation.targets").ok()?;
     let section = harw_context::SectionName::try_new("delegation.targets").ok()?;
     Some(harw_context::Fragment {
@@ -918,16 +1023,76 @@ fn is_uia_root_session(session: &AgentSession) -> bool {
             == Some(harw_agent_dsl::roles::AgentRoleId::UserInterface)
 }
 
-/// Extrahiert lesbaren Denktext aus den `thinking`-Blöcken eines
-/// `OpaqueReasoning` (Welle 3 — 3e).
+// Baut die per-Request-Identität für optionale Gateway-Header (`x-harw-*`),
+// die `drive_turn` unten an `ModelRequest::with_identity` übergibt.
+//
+// `agent` ist die eigene Session-ID. `session` soll die Wurzel-Session des
+// Agentenbaums gruppieren — `SpawnContext` (siehe `harw-core/src/session.rs`)
+// trägt dafür kein eigenes Feld, nur `organizational_role`, deshalb ist der
+// direkte Parent (`session.parent_session_id()`) die nächstbeste verfügbare
+// Näherung: ein Kind kennt nur seinen unmittelbaren Elternteil, keine
+// mehrstufige Kette bis zur Wurzel. Ohne Parent ist die Session selbst die
+// Wurzel. `role` liest `SpawnContext::organizational_role`; fehlt der
+// `SpawnContext` ganz (kein tatsächlich modellierter Root — jeder modellierte
+// Root, siehe `is_uia_root_session` oben, trägt einen `SpawnContext`, z. B.
+// eine bare Test-Session), fällt `role` auf `"main"` zurück.
+fn request_identity(session: &AgentSession) -> RequestIdentity {
+    let agent = session.id().as_str().to_owned();
+    let session_id = session
+        .parent_session_id()
+        .map(|parent| parent.as_str().to_owned())
+        .unwrap_or_else(|| agent.clone());
+    let role = session
+        .spawn_context()
+        .map(|context| organizational_role_str(context.organizational_role))
+        .unwrap_or("main")
+        .to_owned();
+    RequestIdentity {
+        session: session_id,
+        agent,
+        role,
+    }
+}
+
+// Kebab-case-Darstellung von `AgentRoleId`, identisch zu dessen
+// `#[serde(rename_all = "kebab-case")]` (`harw-agent-dsl/src/roles.rs`) — das
+// Enum trägt selbst kein `as_str`/`Display`.
+fn organizational_role_str(role: harw_agent_dsl::roles::AgentRoleId) -> &'static str {
+    use harw_agent_dsl::roles::AgentRoleId;
+    match role {
+        AgentRoleId::UserInterface => "user-interface",
+        AgentRoleId::RootOrchestrator => "root-orchestrator",
+        AgentRoleId::ChildOrchestrator => "child-orchestrator",
+        AgentRoleId::Worker => "worker",
+        AgentRoleId::UiaWorker => "uia-worker",
+        AgentRoleId::AgentSteward => "agent-steward",
+    }
+}
+
+/// Extrahiert lesbaren Denktext aus den Blöcken eines `OpaqueReasoning`
+/// (Welle 3 — 3e; Block-Typen `"reasoning"`/`"reasoning_content"` ergänzt in
+/// Teil 2 / Datei B des Reasoning-Sichtbarkeits-Plans).
 ///
 /// # Beschreibung
-/// Nur Anthropic-Blöcke vom Typ `"thinking"` tragen ein lesbares
-/// `"thinking"`-Textfeld (Anthropic Messages API). `"redacted_thinking"`
-/// (Anthropic, verschlüsselt) und OpenAI-Reasoning-Blöcke (ebenfalls
-/// verschlüsselt, kein `"thinking"`-Feld) liefern keinen extrahierbaren Text
-/// und werden stillschweigend übersprungen — robust gegen fehlende Felder,
-/// kein Panic, kein Fehler.
+/// Unterstützt drei Block-Formen, je nach Provider/Transport:
+/// - `"thinking"` (Anthropic Messages API): Text direkt aus dem
+///   `"thinking"`-Feld.
+/// - `"reasoning"` (OpenAI-Responses-Transport): Text aus allen Einträgen
+///   des `"summary"`-Arrays vom Typ `"summary_text"`, deren `"text"`-Felder
+///   mit `\n` verbunden werden (dasselbe Verkettungsmuster wie für mehrere
+///   `"thinking"`-Blöcke unten). Ein leeres oder fehlendes `"summary"`-Array
+///   sowie ausschließlich leere `"text"`-Felder liefern für diesen Block
+///   keinen Text (zählt nicht als „gefunden").
+/// - `"reasoning_content"` (Chat-Transport, DeepSeek/Kimi/GLM-Konvention):
+///   Text direkt aus dem `"text"`-Feld, wenn nicht leer.
+///
+/// `"redacted_thinking"` (Anthropic, verschlüsselt) und jeder andere/
+/// unbekannte Block-Typ liefern keinen extrahierbaren Text und werden
+/// stillschweigend übersprungen — robust gegen fehlende Felder, kein Panic,
+/// kein Fehler. Eine gemischte Blockliste (in der Praxis nie vom selben
+/// Provider gemeinsam geliefert) wird pro Block einzeln ausgewertet und die
+/// gefundenen Texte werden wie bei mehreren `"thinking"`-Blöcken mit `\n`
+/// verbunden.
 ///
 /// Bewusst lokal in `turn_loop.rs` statt in `harw-provider-http` verortet:
 /// letzteres Crate wird parallel von einem anderen Agenten bearbeitet; die
@@ -940,25 +1105,59 @@ fn is_uia_root_session(session: &AgentSession) -> bool {
 ///   unverändert erhaltenen Denkblöcke.
 ///
 /// # Returns
-/// `Some(String)` — alle `"thinking"`-Textfelder in Blockreihenfolge, mit
-/// `\n` verbunden — wenn mindestens ein Block extrahierbaren Text trug;
-/// sonst `None` (z. B. nur `redacted_thinking`-Blöcke oder leere Liste).
+/// `Some(String)` — die pro Block extrahierten Texte in Blockreihenfolge,
+/// mit `\n` verbunden — wenn mindestens ein Block extrahierbaren Text trug;
+/// sonst `None` (z. B. nur `redacted_thinking`-/unbekannte Blöcke, leere
+/// `summary`-Arrays oder eine leere Blockliste).
 fn extract_thinking_text(reasoning: &OpaqueReasoning) -> Option<String> {
+    /// Extrahiert den lesbaren Text eines einzelnen `"reasoning"`-Blocks
+    /// (OpenAI Responses) aus dessen `"summary"`-Array: alle Einträge vom
+    /// Typ `"summary_text"` mit nicht-leerem `"text"`-Feld, mit `\n`
+    /// verbunden. Lokale Hilfsfunktion, kein eigener Doc-Header nötig.
+    fn extract_reasoning_summary_text(block: &serde_json::Value) -> Option<String> {
+        let summary = block.get("summary").and_then(serde_json::Value::as_array)?;
+        let mut joined = String::new();
+        for entry in summary {
+            if entry.get("type").and_then(serde_json::Value::as_str) != Some("summary_text") {
+                continue;
+            }
+            let Some(text) = entry.get("text").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if text.is_empty() {
+                continue;
+            }
+            if !joined.is_empty() {
+                joined.push('\n');
+            }
+            joined.push_str(text);
+        }
+        (!joined.is_empty()).then_some(joined)
+    }
+
     let mut joined = String::new();
     for block in &reasoning.blocks {
-        if block.get("type").and_then(serde_json::Value::as_str) != Some("thinking") {
-            continue;
-        }
-        let Some(text) = block.get("thinking").and_then(serde_json::Value::as_str) else {
+        let block_text = match block.get("type").and_then(serde_json::Value::as_str) {
+            Some("thinking") => block
+                .get("thinking")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned),
+            Some("reasoning") => extract_reasoning_summary_text(block),
+            Some("reasoning_content") => block
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned),
+            _ => None,
+        };
+        let Some(block_text) = block_text else {
             continue;
         };
-        if text.is_empty() {
-            continue;
-        }
         if !joined.is_empty() {
             joined.push('\n');
         }
-        joined.push_str(text);
+        joined.push_str(&block_text);
     }
     (!joined.is_empty()).then_some(joined)
 }
@@ -1480,6 +1679,11 @@ async fn apply_pitfall_advice(
 /// werden kann, bleibt in `pending_hint` für das nächste Tool-Ergebnis des
 /// Turns stehen.
 ///
+/// Für [`crate::guard::POLLING_TOOLS`] zählt ein wiederholter *erfolgreicher*
+/// Aufruf mit bereits gesehener Signatur trotzdem als Rundenfortschritt
+/// (Fix C, Moduldoku „Achter Nachtrag") — legitimes Polling eines laufenden
+/// Hintergrundprozesses soll nicht als Stillstand erkannt werden.
+///
 /// # Returns
 /// `None`, wenn der Turn weiterläuft; `Some(reason)`, wenn ein `Abort`-Befund
 /// den Turn beenden muss — der Aufrufer beendet ihn dann wie bei
@@ -1501,7 +1705,15 @@ async fn apply_tool_guard(
     let (status, output_text) = tool_outcome_parts(result);
     if status == ToolOutcomeStatus::Success {
         let signature = crate::guard::call_signature(tool_name, arguments);
-        if seen_success_signatures.insert(signature) {
+        // Fix C (Moduldoku „Achter Nachtrag"): eine bereits gesehene Signatur
+        // zählt normalerweise nicht erneut als Fortschritt — für
+        // `crate::guard::POLLING_TOOLS` (z. B. `shell.exec`) ist ein
+        // wiederholter *erfolgreicher* Aufruf mit identischen Argumenten
+        // jedoch legitimes Warten auf einen laufenden Hintergrundprozess,
+        // kein Stillstand, und zählt deshalb unabhängig davon, ob die
+        // Signatur neu ist.
+        let is_polling_tool = crate::guard::POLLING_TOOLS.contains(&tool_name);
+        if seen_success_signatures.insert(signature) || is_polling_tool {
             *round_progressed = true;
         }
     }
@@ -1601,12 +1813,10 @@ fn tool_execution_context(
         .ok_or_else(|| CoreError::MissingToolExecutionContext {
             session_id: session.id().to_string(),
         })?;
-    Ok(ToolExecutionContext::new(
-        ctx.session_id.clone(),
-        ctx.turn_id.clone(),
-        sandbox,
+    Ok(
+        ToolExecutionContext::new(ctx.session_id.clone(), ctx.turn_id.clone(), sandbox)
+            .with_cancel(cancel.clone()),
     )
-    .with_cancel(cancel.clone()))
 }
 
 /// Converts the one recoverable authority-boundary rejection into a result
@@ -1681,11 +1891,14 @@ async fn run_turn_with_approvals(
         .map_err(|r| CoreError::TurnRejected(r.to_string()))?;
     let turn_id = handle.turn_id.clone();
     let session_id = handle.session_id.clone();
-    // Siehe Moduldoku „Fünfter Nachtrag": der einzige Ort, an dem der von
-    // `TurnInput::with_control` gesetzte Steuerblock den Turn tatsächlich
-    // erreicht — `resume_after_child`/`resume_after_approval` bauen sich
-    // mangels Signatur-Slot einen frischen.
+    // Siehe Moduldoku „Siebter Nachtrag": der von `TurnInput::with_control`
+    // gesetzte Steuerblock wird hier zusätzlich auf der Session hinterlegt
+    // (`AgentSession::set_active_turn_control`), damit `resume_after_child`/
+    // `resume_after_approval` ihn nach einer Handoff-/Rückfrage-Pause
+    // zurücklesen können, statt sich einen frischen, unbegrenzten Block zu
+    // bauen.
     let control = input.control.clone();
+    session.set_active_turn_control(control.clone());
 
     // Outer span covering the entire turn's lifecycle.
     let turn_span = tracing::info_span!(
@@ -1931,10 +2144,16 @@ async fn resume_after_child_with_approvals(
         session_id,
     };
 
-    // Moduldoku „Fünfter Nachtrag": kein Signatur-Slot für den Steuerblock des
-    // ursprünglichen Turns, also ein frischer, unbegrenzter — dokumentierte
-    // Lücke, kein stiller Abbruch.
-    let control = TurnControl::new();
+    // Moduldoku „Siebter Nachtrag": der Steuerblock des ursprünglichen Turns
+    // überlebt jetzt die Handoff-Pause auf der Session
+    // (`AgentSession::set_active_turn_control`) — nur wenn dort wider
+    // Erwarten nichts hinterlegt ist (Session nie über `run_turn`/
+    // `run_turn_durable` gestartet, z. B. direkter `try_start_turn` in
+    // Tests), fällt dies auf einen frischen, unbegrenzten Block zurück.
+    let control = session
+        .active_turn_control()
+        .cloned()
+        .unwrap_or_else(TurnControl::new);
     let result = drive_turn(session, model, store, approvals, &ctx, handle, control).await;
     if let Err(error) = &result {
         transition_after_turn_failure(session, &ctx, error);
@@ -2021,167 +2240,252 @@ async fn resume_after_approval_with_store(
         turn_id,
         session_id,
     };
-    // Moduldoku „Fünfter Nachtrag": kein Signatur-Slot für den Steuerblock des
-    // ursprünglichen Turns, also ein frischer, unbegrenzter — dokumentierte
-    // Lücke, kein stiller Abbruch.
-    let control = TurnControl::new();
+    // Moduldoku „Siebter Nachtrag": wie in `resume_after_child_with_approvals`
+    // — der Steuerblock des ursprünglichen Turns überlebt die Approval-Pause
+    // auf der Session; nur ohne hinterlegten Block (Session nie über
+    // `run_turn`/`run_turn_durable` gestartet) entsteht hier ein frischer.
+    let control = session
+        .active_turn_control()
+        .cloned()
+        .unwrap_or_else(TurnControl::new);
 
-    match resolution {
-        ApprovalResolution::Reject { reason } => {
-            let denied_result = ToolCallResult::error(format!("denied by user: {reason}"));
-            notify_tool_outcome(
-                session,
-                pending.call.name.as_str(),
-                &pending.call.arguments,
-                &denied_result,
-            );
-            notify_progress(session);
-            session
-                .history_mut()
-                .push_tool_result(pending.call.id, denied_result, 0);
-            persist_last(session, store).await?;
-            drive_turn(session, model, store, approvals, &ctx, handle, control).await
-        }
-        ApprovalResolution::Approve => {
-            if let Some(role) = handoff_role(&pending.call.name) {
-                let spawner = session.registry().spawner().cloned().ok_or_else(|| {
-                    CoreError::HandoffFailed {
-                        role: role.clone(),
-                        reason: "no AgentSpawner registered".to_owned(),
-                    }
-                })?;
-                // Vor dem Verschieben der Argumente in den SpawnInput lesen.
-                let question = child_question(&pending.call.arguments);
-                let input = SpawnInput {
-                    parent_session_id: session.id().clone(),
-                    handoff_call_id: pending.call.id.clone(),
-                    instructions: None,
-                    context: pending.call.arguments,
-                    // Hereditär, nie neu erfunden: dieser Handoff deklariert
-                    // selbst keine eigene Kontextdecke (`call.arguments`
-                    // trägt keine), also reicht dieses Feld exakt die bereits
-                    // geschnittene Decke des laufenden Turns durch — dieselbe
-                    // Regel, mit der `ManagedAgentSpawner::admit`
-                    // (`child_controller.rs`) Sandbox und Trace im selben
-                    // Schritt vererbt. `ContextCeiling::default()` stünde
-                    // hier für eine erfundene Grenze, die nichts mit der
-                    // tatsächlichen Autorität dieser Sitzung zu tun hätte.
-                    ceiling: session
-                        .spawn_context()
-                        .and_then(|spawn_context| spawn_context.ceiling.clone()),
-                };
-                let context = match governed_spawn_context(session) {
-                    Ok(context) => context,
-                    Err(error) => {
-                        let result = missing_tool_execution_context_result(error)?;
-                        session
-                            .history_mut()
-                            .push_tool_result(pending.call.id, result, 0);
-                        persist_last(session, store).await?;
-                        return drive_turn(session, model, store, approvals, &ctx, handle, control)
-                            .await;
-                    }
-                };
-                let child = spawner
-                    .spawn_child(&role, input, context.sandbox, context.suggestions)
-                    .await
-                    .map_err(|error| CoreError::HandoffFailed {
-                        role: role.clone(),
-                        reason: error.to_string(),
-                    })?;
-                session.begin_handoff(child.clone(), pending.call.id.clone(), role.clone())?;
-                // Ein genehmigungspflichtiger Handoff wird ausschließlich hier
-                // gespawnt (`drive_turn` kehrt vorher mit `AwaitingApproval`
-                // zurück). Ohne dieses Event bliebe ein solches Kind für jeden
-                // Beobachter unsichtbar; doppelt gemeldet wird es nicht.
-                emit(
+    // Fix A (Moduldoku „Achter Nachtrag"): jeder Fehlerausstieg dieser
+    // Funktion nach erfolgreich abgeschlossenem `resolve_approval` (oben) lief
+    // bisher direkt aus der Funktion heraus (`?`, `return …`), ohne
+    // `transition_after_turn_failure` zu durchlaufen — die Session blieb dann
+    // dauerhaft in `Running` hängen, obwohl `run_turn_with_approvals` und
+    // `resume_after_child_with_approvals` dieses Muster bereits korrekt
+    // anwenden. Der gesamte Auflösungspfad läuft deshalb jetzt in einem
+    // inneren async-Block: `return`/`?` darin beenden nur diesen Block
+    // (dieselbe Scope-Regel wie bei Closures), nicht die Funktion, sodass
+    // genau ein `Result` unten geprüft und — im Fehlerfall genau einmal — die
+    // Übergangsfunktion aufgerufen wird, bevor es zurückgegeben wird.
+    let outcome: CoreResult<TurnOutcome> = async {
+        match resolution {
+            ApprovalResolution::Reject { reason } => {
+                let denied_result = ToolCallResult::error(format!("denied by user: {reason}"));
+                notify_tool_outcome(
                     session,
-                    TurnEvent::ChildSpawned {
-                        turn_id: ctx.turn_id.clone(),
-                        child: child.clone(),
-                        role: role.clone(),
-                        question,
-                    },
+                    pending.call.name.as_str(),
+                    &pending.call.arguments,
+                    &denied_result,
                 );
-                Ok(TurnOutcome::AwaitingChild {
-                    child,
-                    call_id: pending.call.id,
-                    role,
-                })
-            } else {
-                let tool_name = pending.call.name.to_string();
-                let tool_span = tracing::info_span!("tool.call", tool_name = %tool_name);
-                emit(
-                    session,
-                    TurnEvent::ToolCallRequested {
-                        turn_id: ctx.turn_id.clone(),
-                        call_id: pending.call.id.clone(),
-                        tool_name: tool_name.clone(),
-                        arguments: pending.call.arguments.clone(),
-                    },
-                );
-                let result: (ToolCallResult, u64) = async {
-                    match find_executor(session, &pending.call.name) {
-                        Some(executor) => {
-                            let (result, duration_ms) = match tool_execution_context(
-                                session,
-                                &ctx,
-                                control.cancel_token(),
-                            ) {
-                                Ok(execution_context) => {
-                                    let started = std::time::Instant::now();
-                                    let output = executor
-                                        .traced_execute(&execution_context, &pending.call)
-                                        .await;
-                                    let duration_ms = started.elapsed().as_millis() as u64;
-                                    let result =
-                                        output.map(output_to_result).unwrap_or_else(|error| {
-                                            ToolCallResult::error(error.to_string())
-                                        });
-                                    (result, duration_ms)
-                                }
-                                Err(error) => (missing_tool_execution_context_result(error)?, 0),
-                            };
-                            tracing::info!(
-                                duration_ms = duration_ms,
-                                status = if result.is_success() { "ok" } else { "err" },
-                                "tool.execute",
-                            );
-                            Ok::<_, CoreError>((result, duration_ms))
-                        }
-                        None => {
-                            tracing::info!(duration_ms = 0u64, status = "err", "tool.execute",);
-                            Ok::<_, CoreError>((
-                                ToolCallResult::error(format!(
-                                    "no executor for tool '{}'",
-                                    pending.call.name
-                                )),
-                                0u64,
-                            ))
-                        }
-                    }
-                }
-                .instrument(tool_span)
-                .await?;
-                emit(
-                    session,
-                    TurnEvent::ToolCallCompleted {
-                        turn_id: ctx.turn_id.clone(),
-                        call_id: pending.call.id.clone(),
-                        result: result.0.clone(),
-                        duration_ms: result.1,
-                    },
-                );
-                notify_tool_outcome(session, &tool_name, &pending.call.arguments, &result.0);
                 notify_progress(session);
                 session
                     .history_mut()
-                    .push_tool_result(pending.call.id, result.0, result.1);
+                    .push_tool_result(pending.call.id, denied_result, 0);
                 persist_last(session, store).await?;
                 drive_turn(session, model, store, approvals, &ctx, handle, control).await
             }
+            ApprovalResolution::Approve => {
+                if let Some(role) = handoff_role(&pending.call.name) {
+                    let spawner = session.registry().spawner().cloned().ok_or_else(|| {
+                        CoreError::HandoffFailed {
+                            role: role.clone(),
+                            reason: "no AgentSpawner registered".to_owned(),
+                        }
+                    })?;
+                    // Vor dem Verschieben der Argumente in den SpawnInput lesen.
+                    let question = child_question(&pending.call.arguments);
+                    let input = SpawnInput {
+                        parent_session_id: session.id().clone(),
+                        handoff_call_id: pending.call.id.clone(),
+                        instructions: None,
+                        context: pending.call.arguments,
+                        // Hereditär, nie neu erfunden: dieser Handoff deklariert
+                        // selbst keine eigene Kontextdecke (`call.arguments`
+                        // trägt keine), also reicht dieses Feld exakt die bereits
+                        // geschnittene Decke des laufenden Turns durch — dieselbe
+                        // Regel, mit der `ManagedAgentSpawner::admit`
+                        // (`child_controller.rs`) Sandbox und Trace im selben
+                        // Schritt vererbt. `ContextCeiling::default()` stünde
+                        // hier für eine erfundene Grenze, die nichts mit der
+                        // tatsächlichen Autorität dieser Sitzung zu tun hätte.
+                        ceiling: session
+                            .spawn_context()
+                            .and_then(|spawn_context| spawn_context.ceiling.clone()),
+                    };
+                    let context = match governed_spawn_context(session) {
+                        Ok(context) => context,
+                        Err(error) => {
+                            let result = missing_tool_execution_context_result(error)?;
+                            session
+                                .history_mut()
+                                .push_tool_result(pending.call.id, result, 0);
+                            persist_last(session, store).await?;
+                            return drive_turn(session, model, store, approvals, &ctx, handle, control)
+                                .await;
+                        }
+                    };
+                    let child = spawner
+                        .spawn_child(&role, input, context.sandbox, context.suggestions)
+                        .await
+                        .map_err(|error| CoreError::HandoffFailed {
+                            role: role.clone(),
+                            reason: error.to_string(),
+                        })?;
+                    session.begin_handoff(child.clone(), pending.call.id.clone(), role.clone())?;
+                    // Ein genehmigungspflichtiger Handoff wird ausschließlich hier
+                    // gespawnt (`drive_turn` kehrt vorher mit `AwaitingApproval`
+                    // zurück). Ohne dieses Event bliebe ein solches Kind für jeden
+                    // Beobachter unsichtbar; doppelt gemeldet wird es nicht.
+                    emit(
+                        session,
+                        TurnEvent::ChildSpawned {
+                            turn_id: ctx.turn_id.clone(),
+                            child: child.clone(),
+                            role: role.clone(),
+                            question,
+                        },
+                    );
+                    Ok(TurnOutcome::AwaitingChild {
+                        child,
+                        call_id: pending.call.id,
+                        role,
+                    })
+                } else {
+                    let tool_name = pending.call.name.to_string();
+                    let tool_span = tracing::info_span!("tool.call", tool_name = %tool_name);
+                    emit(
+                        session,
+                        TurnEvent::ToolCallRequested {
+                            turn_id: ctx.turn_id.clone(),
+                            call_id: pending.call.id.clone(),
+                            tool_name: tool_name.clone(),
+                            arguments: pending.call.arguments.clone(),
+                        },
+                    );
+                    // Fix B (Moduldoku „Siebter Nachtrag"): dieser Rückfrage-
+                    // Fortsetzungspfad hatte bis hierher keine `was_cancelled`-
+                    // Weiche — ein hier hängender Ausführer war gegen Cancel
+                    // vollständig blind. Struktur jetzt identisch zum
+                    // sequenziellen Pfad oben: der Aufruf selbst racet gegen
+                    // `control`s `CancelToken`, und ein Treffer geht über
+                    // denselben `cancel_turn_with_pending_calls`-Weg wie ein
+                    // Prüfpunkt-Treffer.
+                    let (result, was_cancelled): ((ToolCallResult, u64), bool) = async {
+                        match find_executor(session, &pending.call.name) {
+                            Some(executor) => {
+                                let (result, duration_ms, cancelled) = match tool_execution_context(
+                                    session,
+                                    &ctx,
+                                    control.cancel_token(),
+                                ) {
+                                    Ok(execution_context) => {
+                                        let started = std::time::Instant::now();
+                                        let outcome = tokio::select! {
+                                            biased;
+                                            () = control.cancel_token().cancelled() => Err(ToolsError::Cancelled),
+                                            outcome = executor.traced_execute(&execution_context, &pending.call) => outcome,
+                                        };
+                                        let duration_ms = started.elapsed().as_millis() as u64;
+                                        let cancelled = matches!(outcome, Err(ToolsError::Cancelled));
+                                        let result = match outcome {
+                                            Ok(output) => output_to_result(output),
+                                            Err(e) => ToolCallResult::error(e.to_string()),
+                                        };
+                                        (result, duration_ms, cancelled)
+                                    }
+                                    Err(error) => {
+                                        (missing_tool_execution_context_result(error)?, 0, false)
+                                    }
+                                };
+                                tracing::info!(
+                                    duration_ms = duration_ms,
+                                    status = if result.is_success() { "ok" } else { "err" },
+                                    "tool.execute",
+                                );
+                                Ok::<_, CoreError>(((result, duration_ms), cancelled))
+                            }
+                            None => {
+                                tracing::info!(duration_ms = 0u64, status = "err", "tool.execute",);
+                                Ok::<_, CoreError>((
+                                    (
+                                        ToolCallResult::error(format!(
+                                            "no executor for tool '{}'",
+                                            pending.call.name
+                                        )),
+                                        0u64,
+                                    ),
+                                    false,
+                                ))
+                            }
+                        }
+                    }
+                    .instrument(tool_span)
+                    .await?;
+                    if was_cancelled {
+                        // Derselbe Weg wie im sequenziellen Pfad oben: der
+                        // laufende Call bekommt sein eigenes (bereits als
+                        // Cancel-Fehler geformtes) Ergebnis, dann endet der Turn
+                        // über `cancel_turn_with_pending_calls`. Ein
+                        // Rückfrage-Resume setzt genau einen Call fort — es gibt
+                        // keine Geschwister-Calls derselben Modellantwort, die
+                        // hier noch anstünden (die pausierende `AskUser`-Antwort
+                        // verließ die sequenzielle Schleife oben sofort mit
+                        // `AwaitingApproval`, ohne die übrigen Calls der Antwort
+                        // überhaupt in den Verlauf zu schreiben — siehe
+                        // `ApprovalDecision::AskUser` im sequenziellen Pfad).
+                        // `remaining: Vec::new()` ist deshalb korrekt, nicht nur
+                        // bequem.
+                        let (result_value, result_duration_ms) = result;
+                        emit(
+                            session,
+                            TurnEvent::ToolCallCompleted {
+                                turn_id: ctx.turn_id.clone(),
+                                call_id: pending.call.id.clone(),
+                                result: result_value.clone(),
+                                duration_ms: result_duration_ms,
+                            },
+                        );
+                        notify_tool_outcome(
+                            session,
+                            &tool_name,
+                            &pending.call.arguments,
+                            &result_value,
+                        );
+                        notify_progress(session);
+                        session
+                            .history_mut()
+                            .push_tool_result(pending.call.id, result_value, result_duration_ms);
+                        persist_last(session, store).await?;
+                        return cancel_turn_with_pending_calls(
+                            session,
+                            store,
+                            handle,
+                            harw_types::TokenUsage::default(),
+                            control.cancel_token().reason().unwrap_or(CancelReason::User),
+                            Vec::new(),
+                        )
+                        .await;
+                    }
+                    let (result_value, result_duration_ms) = result;
+                    emit(
+                        session,
+                        TurnEvent::ToolCallCompleted {
+                            turn_id: ctx.turn_id.clone(),
+                            call_id: pending.call.id.clone(),
+                            result: result_value.clone(),
+                            duration_ms: result_duration_ms,
+                        },
+                    );
+                    notify_tool_outcome(session, &tool_name, &pending.call.arguments, &result_value);
+                    notify_progress(session);
+                    session
+                        .history_mut()
+                        .push_tool_result(pending.call.id, result_value, result_duration_ms);
+                    persist_last(session, store).await?;
+                    drive_turn(session, model, store, approvals, &ctx, handle, control).await
+                }
+            }
         }
     }
+    .await;
+
+    if let Err(error) = &outcome {
+        transition_after_turn_failure(session, &ctx, error);
+    }
+    outcome
 }
 
 /// Der Model-/Tool-Zyklus. Setzt `Running`-State voraus.
@@ -2203,8 +2507,7 @@ async fn drive_turn(
     // kostenpflichtigen Endlos-Loop; danach erhält der Aufrufer weiterhin den
     // ehrlichen `Truncated`-Ausgang mitsamt bereits persistiertem Teiltext.
     const MAX_AUTOMATIC_CONTINUATIONS: u32 = 3;
-    const CONTINUATION_INSTRUCTION: &str =
-        "Die unmittelbar vorherige Assistant-Antwort wurde wegen eines Ausgabelimits abgeschnitten. Setze exakt an ihrer letzten Stelle fort, ohne Text zu wiederholen oder neu anzufangen. Schließe den ursprünglichen Auftrag eigenständig ab.";
+    const CONTINUATION_INSTRUCTION: &str = "Die unmittelbar vorherige Assistant-Antwort wurde wegen eines Ausgabelimits abgeschnitten. Setze exakt an ihrer letzten Stelle fort, ohne Text zu wiederholen oder neu anzufangen. Schließe den ursprünglichen Auftrag eigenständig ab.";
 
     let mut total_usage = harw_types::TokenUsage::default();
     let mut automatic_continuations = 0u32;
@@ -2313,7 +2616,8 @@ async fn drive_turn(
         .with_model_id(session.active_model().cloned())
         .with_provider_id(session.active_provider().cloned())
         .with_tool_result_max_bytes(control.limits().tool_result_max_bytes_hint())
-        .with_cancel_token(control.cancel_token().clone());
+        .with_cancel_token(control.cancel_token().clone())
+        .with_identity(request_identity(session));
 
         // Emit model.request event: byte-count proxy via system_prompt +
         // instruction fragments length (ModelRequest is not serde::Serialize).
@@ -2358,7 +2662,10 @@ async fn drive_turn(
                     session,
                     handle,
                     total_usage,
-                    control.cancel_token().reason().unwrap_or(CancelReason::User),
+                    control
+                        .cancel_token()
+                        .reason()
+                        .unwrap_or(CancelReason::User),
                 )
                 .await;
             }
@@ -2416,11 +2723,13 @@ async fn drive_turn(
         if is_uia_root_session(session) {
             if let Some(text) = response.reasoning.as_ref().and_then(extract_thinking_text) {
                 let reasoning_id = harw_types::ItemId::new();
-                session.history_mut().push(TurnItem::Reasoning(ReasoningItem {
-                    id: reasoning_id.clone(),
-                    summary_text: vec![text.clone()],
-                    raw_content: Vec::new(),
-                }));
+                session
+                    .history_mut()
+                    .push(TurnItem::Reasoning(ReasoningItem {
+                        id: reasoning_id.clone(),
+                        summary_text: vec![text.clone()],
+                        raw_content: Vec::new(),
+                    }));
                 persist_last(session, store).await?;
                 emit(
                     session,
@@ -2475,7 +2784,7 @@ async fn drive_turn(
                         pending_guard_hint.clone(),
                         TurnOutcome::Truncated,
                     )
-                        .await;
+                    .await;
                 }
                 crate::model::StopReason::Refusal { detail } => {
                     return finish_model_stop(
@@ -2549,7 +2858,7 @@ async fn drive_turn(
                         pending_guard_hint.clone(),
                         TurnOutcome::Truncated,
                     )
-                        .await;
+                    .await;
                 }
                 crate::model::StopReason::Refusal { detail } => {
                     return finish_model_stop(
@@ -2666,7 +2975,12 @@ async fn drive_turn(
                         &mut denied_result,
                     )
                     .await;
-                    notify_tool_outcome(session, call.name.as_str(), &call.arguments, &denied_result);
+                    notify_tool_outcome(
+                        session,
+                        call.name.as_str(),
+                        &call.arguments,
+                        &denied_result,
+                    );
                     notify_progress(session);
                     session
                         .history_mut()
@@ -2811,7 +3125,8 @@ async fn drive_turn(
             // Wächter-Beratung vor der Ausführung (Addendum F+G): ein
             // Treffer wird sofort gemeldet, der Hinweis aber erst an das
             // Ergebnis DIESES Aufrufs angehängt, sobald es feststeht.
-            if let Some(hint) = apply_pitfall_advice(session, store, &tool_name, &call.arguments).await
+            if let Some(hint) =
+                apply_pitfall_advice(session, store, &tool_name, &call.arguments).await
             {
                 pending_guard_hint = Some(match pending_guard_hint.take() {
                     Some(existing) => format!("{existing}\n\n{hint}"),
@@ -2835,8 +3150,17 @@ async fn drive_turn(
                         ) {
                             Ok(execution_context) => {
                                 let started = std::time::Instant::now();
-                                let outcome =
-                                    executor.traced_execute(&execution_context, &call).await;
+                                // Fix B (Moduldoku „Siebter Nachtrag"): racet
+                                // den Aufruf selbst gegen `control`s
+                                // `CancelToken`, exakt wie der Modellaufruf-Race
+                                // oben — ein Ausführer, der `ctx.cancel()`
+                                // selbst nie abfragt, blockiert den Turn damit
+                                // nicht mehr bis zu seinem eigenen Ende.
+                                let outcome = tokio::select! {
+                                    biased;
+                                    () = control.cancel_token().cancelled() => Err(ToolsError::Cancelled),
+                                    outcome = executor.traced_execute(&execution_context, &call) => outcome,
+                                };
                                 let duration_ms = started.elapsed().as_millis() as u64;
                                 let cancelled = matches!(outcome, Err(ToolsError::Cancelled));
                                 let result = match outcome {
@@ -2902,7 +3226,10 @@ async fn drive_turn(
                     store,
                     handle,
                     total_usage,
-                    control.cancel_token().reason().unwrap_or(CancelReason::User),
+                    control
+                        .cancel_token()
+                        .reason()
+                        .unwrap_or(CancelReason::User),
                     remaining,
                 )
                 .await;
@@ -3102,7 +3429,8 @@ async fn maybe_compact(
         return;
     }
 
-    let mut plan = crate::compaction::CompactionPlan::for_context_window(policy.context_window_tokens());
+    let mut plan =
+        crate::compaction::CompactionPlan::for_context_window(policy.context_window_tokens());
     let (summary_provider, summary_model) = session.compaction_summary_model();
     plan.summary_provider = summary_provider.cloned();
     plan.summary_model = summary_model.cloned();
@@ -3499,6 +3827,21 @@ async fn try_execute_parallel_calls(
         );
     }
 
+    // Fix C (Moduldoku „Siebter Nachtrag"): Metadaten je Position VOR dem
+    // Spawn-Loop mitschneiden, der `jobs` konsumiert — der spätere
+    // Cancel-Fill-in unten braucht `call_id`/`tool_name`/`arguments` je
+    // Slot, kann sie nach `jobs.into_iter()` aber nicht mehr aus `jobs`
+    // lesen.
+    let call_meta: Vec<(ToolCallId, String, serde_json::Value)> = jobs
+        .iter()
+        .map(|(call, _executor)| {
+            (
+                call.id.clone(),
+                call.name.to_string(),
+                call.arguments.clone(),
+            )
+        })
+        .collect();
     let mut joins = tokio::task::JoinSet::new();
     for (position, (call, executor)) in jobs.into_iter().enumerate() {
         let execution_context = execution_context.clone();
@@ -3534,10 +3877,64 @@ async fn try_execute_parallel_calls(
         );
     }
     let mut results: Vec<ParallelCallSlot> = vec![None; calls.len()];
-    while let Some(joined) = joins.join_next().await {
-        let (position, call_id, result, duration_ms, tool_name, arguments, cancelled) =
-            joined.map_err(|error| CoreError::ToolFailed(error.to_string()))?;
-        results[position] = Some((call_id, result, duration_ms, tool_name, arguments, cancelled));
+    // Fix C (Moduldoku „Siebter Nachtrag"): dieser Join-Loop wartete bisher
+    // ungeraced auf **alle** Aufrufe, bevor überhaupt auf Cancel reagiert
+    // wurde — ein Ausführer, der `ctx.cancel()` selbst nie abfragt, blockierte
+    // die gesamte Antwort bis zu seinem eigenen Ende. Jetzt racet die
+    // Reaper-Schleife selbst gegen `control`s `CancelToken`: ein Treffer
+    // bricht alle noch laufenden Jobs über `joins.abort_all()` ab, statt
+    // weiter auf sie zu warten.
+    let mut cancel_hit = false;
+    loop {
+        tokio::select! {
+            biased;
+            () = control.cancel_token().cancelled(), if !cancel_hit => {
+                cancel_hit = true;
+                joins.abort_all();
+            }
+            joined = joins.join_next() => {
+                match joined {
+                    Some(Ok((position, call_id, result, duration_ms, tool_name, arguments, cancelled))) => {
+                        results[position] =
+                            Some((call_id, result, duration_ms, tool_name, arguments, cancelled));
+                    }
+                    Some(Err(error)) => {
+                        // `abort_all()` selbst kann noch laufende Jobs als
+                        // `Err(JoinError)` zurückliefern — erwartet, sobald
+                        // `cancel_hit` bereits `true` ist: ihr `None`-Slot
+                        // wird gleich unten synthetisch befüllt, das Ergebnis
+                        // hier wird verworfen. Ohne vorherigen Cancel-Treffer
+                        // ist ein `JoinError` (z. B. ein echter Panic) weiterhin
+                        // ein echter Fehler dieser Funktion.
+                        if !cancel_hit {
+                            return Err(CoreError::ToolFailed(error.to_string()));
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    if cancel_hit {
+        for (position, slot) in results.iter_mut().enumerate() {
+            if slot.is_none() {
+                let (call_id, tool_name, arguments) = call_meta[position].clone();
+                *slot = Some((
+                    call_id,
+                    ToolCallResult::error(format!(
+                        "turn cancelled before delivery ({:?})",
+                        control
+                            .cancel_token()
+                            .reason()
+                            .unwrap_or(CancelReason::User)
+                    )),
+                    0,
+                    tool_name,
+                    arguments,
+                    true, // cancelled
+                ));
+            }
+        }
     }
     // `while let` über den Positions-Iterator statt `for`: bei einem
     // `TurnGuard`-`Abort` mitten in der Auslieferung (Addendum F+G) brauchen
@@ -3547,8 +3944,8 @@ async fn try_execute_parallel_calls(
     let mut results_iter = results.into_iter();
     let mut aborted: Option<CancelReason> = None;
     for result in results_iter.by_ref() {
-        let (call_id, mut value, duration_ms, tool_name, arguments, cancelled) =
-            result.ok_or_else(|| {
+        let (call_id, mut value, duration_ms, tool_name, arguments, cancelled) = result
+            .ok_or_else(|| {
                 CoreError::ToolFailed("parallel tool scheduler lost a completed call".to_owned())
             })?;
         // `ToolsError::Cancelled` (der `ToolExecutionContext` trägt `control`s
@@ -3559,7 +3956,12 @@ async fn try_execute_parallel_calls(
         // korrekt geformtes Cancel-Ergebnis (`value`) wird unverändert
         // ausgeliefert.
         let abort_reason = if cancelled {
-            Some(control.cancel_token().reason().unwrap_or(CancelReason::User))
+            Some(
+                control
+                    .cancel_token()
+                    .reason()
+                    .unwrap_or(CancelReason::User),
+            )
         } else {
             apply_tool_guard(
                 session,
@@ -3596,8 +3998,8 @@ async fn try_execute_parallel_calls(
     }
     if let Some(reason) = aborted {
         for result in results_iter {
-            let (call_id, _value, _duration_ms, _tool_name, _arguments, _cancelled) =
-                result.ok_or_else(|| {
+            let (call_id, _value, _duration_ms, _tool_name, _arguments, _cancelled) = result
+                .ok_or_else(|| {
                     CoreError::ToolFailed(
                         "parallel tool scheduler lost a completed call".to_owned(),
                     )
@@ -3692,12 +4094,13 @@ mod tests {
     use super::*;
     use crate::activation::{SessionActivation, ToolProfile};
     use crate::session::AgentSession;
+    use crate::test_support::{TestError, TestResult, ctx};
+    use harw_authority::SandboxSpec;
     use harw_catalog::AgentSuggestions;
     use harw_extension_api::contributors::ToolProvider;
     use harw_extension_api::{
         AgentSpawnError, AgentSpawner, ExtensionRegistryBuilder, SpawnFuture, SpawnInput,
     };
-    use harw_authority::SandboxSpec;
     use harw_tools::{
         FunctionToolSpec, JsonSchema, ToolCall, ToolExecutionContext, ToolExecutor,
         ToolExecutorFuture, ToolName, ToolOutput, ToolSpec, ToolsError,
@@ -3905,7 +4308,10 @@ mod tests {
             _child: &SessionId,
             _completed_at: jiff::Timestamp,
         ) -> Result<(), AgentSpawnError> {
-            let mut events = self.events.lock().expect("test event lock is not poisoned");
+            let mut events = self
+                .events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             assert_eq!(events.as_slice(), ["persisted_child_result"]);
             events.push("durably_completed_child");
             self.child_completed.fetch_add(1, Ordering::SeqCst);
@@ -3936,7 +4342,7 @@ mod tests {
                 if is_child_result {
                     events
                         .lock()
-                        .expect("test event lock is not poisoned")
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .push("persisted_child_result");
                 }
                 Ok(())
@@ -3956,33 +4362,33 @@ mod tests {
 
     fn paused_child_session(
         spawner: Arc<CompletionTrackingSpawner>,
-    ) -> (AgentSession, SessionId, ToolCallId) {
+    ) -> TestResult<(AgentSession, SessionId, ToolCallId)> {
         let (tx, _rx) = mpsc::unbounded_channel();
         let registry = ExtensionRegistryBuilder::default().spawner(spawner).build();
         let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx);
-        session.try_start_turn().expect("test turn starts");
+        session.try_start_turn().map_err(ctx("test turn starts"))?;
         let child = SessionId::new();
         let call_id = ToolCallId::new();
         session
             .begin_handoff(child.clone(), call_id.clone(), "worker".to_owned())
-            .expect("test handoff pauses");
-        (session, child, call_id)
+            .map_err(ctx("test handoff pauses"))?;
+        Ok((session, child, call_id))
     }
 
     #[tokio::test]
-    async fn durable_child_completion_follows_persisted_child_result() {
+    async fn durable_child_completion_follows_persisted_child_result() -> TestResult {
         let events = Arc::new(Mutex::new(Vec::new()));
         let spawner = Arc::new(CompletionTrackingSpawner {
             child_completed: AtomicUsize::new(0),
             child_finished: AtomicUsize::new(0),
             events: events.clone(),
         });
-        let (mut session, child, call_id) = paused_child_session(spawner.clone());
+        let (mut session, child, call_id) = paused_child_session(spawner.clone())?;
         let store = ChildResultStore {
             fail_child_result: false,
             events: events.clone(),
         };
-        let temp = tempfile::tempdir().expect("temporary approval directory");
+        let temp = tempfile::tempdir().map_err(ctx("temporary approval directory"))?;
         let approvals = ApprovalStore::new(temp.path());
 
         let outcome = resume_after_child_durable(
@@ -3995,7 +4401,7 @@ mod tests {
             ToolCallResult::success(serde_json::json!({"child": "done"})),
         )
         .await
-        .expect("durable child result resumes the parent");
+        .map_err(ctx("durable child result resumes the parent"))?;
 
         assert!(matches!(outcome, TurnOutcome::Completed));
         assert_eq!(spawner.child_completed.load(Ordering::SeqCst), 1);
@@ -4003,29 +4409,30 @@ mod tests {
         assert_eq!(
             events
                 .lock()
-                .expect("test event lock is not poisoned")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .as_slice(),
             ["persisted_child_result", "durably_completed_child"]
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn failed_child_result_persistence_does_not_release_durable_child() {
+    async fn failed_child_result_persistence_does_not_release_durable_child() -> TestResult {
         let events = Arc::new(Mutex::new(Vec::new()));
         let spawner = Arc::new(CompletionTrackingSpawner {
             child_completed: AtomicUsize::new(0),
             child_finished: AtomicUsize::new(0),
             events: events.clone(),
         });
-        let (mut session, child, call_id) = paused_child_session(spawner.clone());
+        let (mut session, child, call_id) = paused_child_session(spawner.clone())?;
         let store = ChildResultStore {
             fail_child_result: true,
             events: events.clone(),
         };
-        let temp = tempfile::tempdir().expect("temporary approval directory");
+        let temp = tempfile::tempdir().map_err(ctx("temporary approval directory"))?;
         let approvals = ApprovalStore::new(temp.path());
 
-        let error = resume_after_child_durable(
+        let Err(error) = resume_after_child_durable(
             &mut session,
             &crate::model::EchoModelProvider::new("must not run"),
             &store,
@@ -4035,7 +4442,11 @@ mod tests {
             ToolCallResult::success(serde_json::json!({"child": "done"})),
         )
         .await
-        .expect_err("failed child-result persistence rejects the resume");
+        else {
+            return Err(TestError::Unexpected(
+                "failed child-result persistence rejects the resume".to_owned(),
+            ));
+        };
 
         assert!(matches!(error, CoreError::TurnRejected(_)));
         assert_eq!(spawner.child_completed.load(Ordering::SeqCst), 0);
@@ -4043,10 +4454,11 @@ mod tests {
         assert!(
             events
                 .lock()
-                .expect("test event lock is not poisoned")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_empty(),
             "a failed persistence attempt must not release the child"
         );
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -4119,20 +4531,21 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn test_collect_tools_full_profile_includes_all() {
+    fn test_collect_tools_full_profile_includes_all() -> TestResult {
         let provider = StubToolProvider::with_names(&["fs.read", "custom.tool"]);
         let session = make_session(provider, SessionActivation::new(ToolProfile::Full));
-        let tools = collect_tools(&session).expect("collect_tools should not fail");
+        let tools = collect_tools(&session).map_err(ctx("collect_tools should not fail"))?;
         let names: Vec<_> = tools.iter().map(|t| t.name().to_owned()).collect();
         assert!(names.contains(&"fs.read".to_owned()));
         assert!(names.contains(&"custom.tool".to_owned()));
+        Ok(())
     }
 
     #[test]
-    fn test_collect_tools_coding_profile_excludes_unlisted() {
+    fn test_collect_tools_coding_profile_excludes_unlisted() -> TestResult {
         let provider = StubToolProvider::with_names(&["fs.read", "custom.tool"]);
         let session = make_session(provider, SessionActivation::new(ToolProfile::Coding));
-        let tools = collect_tools(&session).expect("collect_tools should not fail");
+        let tools = collect_tools(&session).map_err(ctx("collect_tools should not fail"))?;
         let names: Vec<_> = tools.iter().map(|t| t.name().to_owned()).collect();
         assert!(
             names.contains(&"fs.read".to_owned()),
@@ -4142,32 +4555,35 @@ mod tests {
             !names.contains(&"custom.tool".to_owned()),
             "custom.tool must be hidden by Coding profile"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_collect_tools_disable_override_hides_allowlisted_tool() {
+    fn test_collect_tools_disable_override_hides_allowlisted_tool() -> TestResult {
         let provider = StubToolProvider::with_names(&["fs.read", "fs.write"]);
         let mut activation = SessionActivation::new(ToolProfile::Full);
         activation.disable_tool(ToolName::new("fs.write"));
         let session = make_session(provider, activation);
-        let tools = collect_tools(&session).expect("collect_tools should not fail");
+        let tools = collect_tools(&session).map_err(ctx("collect_tools should not fail"))?;
         let names: Vec<_> = tools.iter().map(|t| t.name().to_owned()).collect();
         assert!(names.contains(&"fs.read".to_owned()));
         assert!(
             !names.contains(&"fs.write".to_owned()),
             "fs.write must be hidden by override"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_collect_tools_sorted_by_name() {
+    fn test_collect_tools_sorted_by_name() -> TestResult {
         // Absichtlich unsortiert registriert — die Provider-Reihenfolge darf
         // die Reihenfolge im Tool-Array nicht bestimmen (Prompt-Cache).
         let provider = StubToolProvider::with_names(&["zeta.tool", "alpha.tool", "mid.tool"]);
         let session = make_session(provider, SessionActivation::new(ToolProfile::Full));
-        let tools = collect_tools(&session).expect("collect_tools should not fail");
+        let tools = collect_tools(&session).map_err(ctx("collect_tools should not fail"))?;
         let names: Vec<_> = tools.iter().map(ToolSpec::name).collect();
         assert_eq!(names, vec!["alpha.tool", "mid.tool", "zeta.tool"]);
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -4192,20 +4608,120 @@ mod tests {
         assert!(result.is_some(), "enabled tool must return an executor");
     }
 
+    // Fix C (Moduldoku „Achter Nachtrag"): `shell.exec` is one of
+    // `crate::guard::POLLING_TOOLS` — repeating the exact same successful
+    // call is legitimate while waiting on a long-running background job, so
+    // every repeat must still count as round progress. Before the fix, only
+    // the *first* occurrence of a call signature counted, so a model
+    // legitimately polling a background process saw the "no progress" hint
+    // and misread it as proof of a response cache.
     #[tokio::test]
-    async fn rate_limited_model_failure_leaves_the_session_retryable() {
+    async fn apply_tool_guard_repeated_shell_exec_success_always_counts_as_progress() {
+        let provider = StubToolProvider::with_names(&["shell.exec"]);
+        let session = make_session(provider, SessionActivation::new(ToolProfile::Full));
+        let store = crate::state_store::InMemoryStateStore::new();
+        let mut guard = TurnGuard::new(crate::guard::GuardPolicy::default(), session.id());
+        let mut seen_success_signatures: HashSet<String> = HashSet::new();
+        let args = serde_json::json!({"cmd": "jobs -l"});
+
+        // More rounds than the default `no_progress_rounds_abort` (8), to
+        // prove polling never trips the guard, not merely within a narrow
+        // window.
+        for round in 0..10 {
+            let mut round_progressed = false;
+            let mut pending_hint = None;
+            let mut result = ToolCallResult::success(serde_json::json!("still running"));
+            let abort_reason = apply_tool_guard(
+                &session,
+                &store,
+                Some(&mut guard),
+                &mut seen_success_signatures,
+                &mut pending_hint,
+                &mut round_progressed,
+                "shell.exec",
+                &args,
+                &mut result,
+            )
+            .await;
+            assert!(abort_reason.is_none(), "round {round}: unexpected abort");
+            assert!(
+                round_progressed,
+                "round {round}: a repeated successful shell.exec call must count as progress"
+            );
+            assert!(
+                matches!(
+                    guard.observe_round_end(round_progressed),
+                    GuardVerdict::Continue
+                ),
+                "round {round}: polling a running process must never trigger the no-progress hint"
+            );
+        }
+    }
+
+    // Companion to the polling exemption above: an *unexempted* tool
+    // (`fs.read`) repeated with identical arguments must still trip the
+    // no-progress warning within the default threshold — the fix narrows the
+    // exemption to `crate::guard::POLLING_TOOLS`, it does not weaken the
+    // guard generally.
+    #[tokio::test]
+    async fn apply_tool_guard_repeated_fs_read_success_still_warns_no_progress() {
+        let provider = StubToolProvider::with_names(&["fs.read"]);
+        let session = make_session(provider, SessionActivation::new(ToolProfile::Full));
+        let store = crate::state_store::InMemoryStateStore::new();
+        let mut guard = TurnGuard::new(crate::guard::GuardPolicy::default(), session.id());
+        let mut seen_success_signatures: HashSet<String> = HashSet::new();
+        let args = serde_json::json!({"path": "same.txt"});
+
+        let mut saw_warn = false;
+        for _ in 0..crate::guard::GuardPolicy::default().no_progress_rounds_warn + 1 {
+            let mut round_progressed = false;
+            let mut pending_hint = None;
+            let mut result = ToolCallResult::success(serde_json::json!("contents"));
+            let _ = apply_tool_guard(
+                &session,
+                &store,
+                Some(&mut guard),
+                &mut seen_success_signatures,
+                &mut pending_hint,
+                &mut round_progressed,
+                "fs.read",
+                &args,
+                &mut result,
+            )
+            .await;
+            if matches!(
+                guard.observe_round_end(round_progressed),
+                GuardVerdict::Warn { .. }
+            ) {
+                saw_warn = true;
+                break;
+            }
+        }
+        assert!(
+            saw_warn,
+            "repeated identical fs.read calls must still trigger the no-progress hint \
+             within the default threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limited_model_failure_leaves_the_session_retryable() -> TestResult {
         let provider = StubToolProvider::with_names(&[]);
         let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
         let store = crate::state_store::InMemoryStateStore::new();
 
-        let error = run_turn(
+        let Err(error) = run_turn(
             &mut session,
             &RateLimitedModel,
             &store,
             TurnInput::user("retry me"),
         )
         .await
-        .expect_err("rate limiting reaches the caller");
+        else {
+            return Err(TestError::Unexpected(
+                "rate limiting reaches the caller".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
@@ -4223,24 +4739,29 @@ mod tests {
             TurnInput::user("try again"),
         )
         .await
-        .expect("the same session accepts a later retry");
+        .map_err(ctx("the same session accepts a later retry"))?;
         assert!(matches!(outcome, TurnOutcome::Completed));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn transient_model_failure_leaves_the_session_retryable() {
+    async fn transient_model_failure_leaves_the_session_retryable() -> TestResult {
         let provider = StubToolProvider::with_names(&[]);
         let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
         let store = crate::state_store::InMemoryStateStore::new();
 
-        let error = run_turn(
+        let Err(error) = run_turn(
             &mut session,
             &TransientModel,
             &store,
             TurnInput::user("retry me"),
         )
         .await
-        .expect_err("a transient provider failure reaches the caller");
+        else {
+            return Err(TestError::Unexpected(
+                "a transient provider failure reaches the caller".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
@@ -4258,24 +4779,29 @@ mod tests {
             TurnInput::user("try again"),
         )
         .await
-        .expect("the same session accepts a later retry");
+        .map_err(ctx("the same session accepts a later retry"))?;
         assert!(matches!(outcome, TurnOutcome::Completed));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn timeout_model_failure_leaves_the_session_retryable() {
+    async fn timeout_model_failure_leaves_the_session_retryable() -> TestResult {
         let provider = StubToolProvider::with_names(&[]);
         let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
         let store = crate::state_store::InMemoryStateStore::new();
 
-        let error = run_turn(
+        let Err(error) = run_turn(
             &mut session,
             &TimeoutModel,
             &store,
             TurnInput::user("retry me"),
         )
         .await
-        .expect_err("a provider timeout reaches the caller");
+        else {
+            return Err(TestError::Unexpected(
+                "a provider timeout reaches the caller".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
@@ -4293,24 +4819,29 @@ mod tests {
             TurnInput::user("try again"),
         )
         .await
-        .expect("the same session accepts a later retry");
+        .map_err(ctx("the same session accepts a later retry"))?;
         assert!(matches!(outcome, TurnOutcome::Completed));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn refusal_model_failure_terminalizes_the_session() {
+    async fn refusal_model_failure_terminalizes_the_session() -> TestResult {
         let provider = StubToolProvider::with_names(&[]);
         let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
         let store = crate::state_store::InMemoryStateStore::new();
 
-        let error = run_turn(
+        let Err(error) = run_turn(
             &mut session,
             &RefusalModel,
             &store,
             TurnInput::user("do the thing"),
         )
         .await
-        .expect_err("a refusal reaches the caller");
+        else {
+            return Err(TestError::Unexpected(
+                "a refusal reaches the caller".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
@@ -4320,6 +4851,7 @@ mod tests {
             matches!(session.state(), crate::session::SessionState::Failed(_)),
             "a non-retryable provider failure (Refusal) must still terminalize the session"
         );
+        Ok(())
     }
 
     // `transition_after_turn_failure`'s retryable branch calls
@@ -4334,13 +4866,14 @@ mod tests {
     // `turn_id` deliberately does not match the session's actual active
     // turn, forcing `complete_turn` to reject it.
     #[test]
-    fn transition_after_turn_failure_logs_but_does_not_panic_when_complete_turn_itself_fails() {
+    fn transition_after_turn_failure_logs_but_does_not_panic_when_complete_turn_itself_fails()
+    -> TestResult {
         let provider = StubToolProvider::with_names(&[]);
         let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
 
-        let real_handle = session
-            .try_start_turn()
-            .expect("a freshly created session starts Idle and accepts a turn");
+        let real_handle = session.try_start_turn().map_err(ctx(
+            "a freshly created session starts Idle and accepts a turn",
+        ))?;
         assert!(matches!(
             session.state(),
             crate::session::SessionState::Running
@@ -4353,11 +4886,10 @@ mod tests {
             turn_id: TurnId::new(),
             metadata: serde_json::Value::Null,
         };
-        let retryable_error =
-            CoreError::Model(crate::model::ModelError::RateLimited {
-                retry_after_secs: 1,
-                message: "test provider limit".to_owned(),
-            });
+        let retryable_error = CoreError::Model(crate::model::ModelError::RateLimited {
+            retry_after_secs: 1,
+            message: "test provider limit".to_owned(),
+        });
 
         transition_after_turn_failure(&mut session, &stale_ctx, &retryable_error);
 
@@ -4375,22 +4907,27 @@ mod tests {
             Some(&real_handle.turn_id),
             "the session's real active turn must be untouched by the rejected completion"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn quota_exceeded_model_failure_terminalizes_the_session() {
+    async fn quota_exceeded_model_failure_terminalizes_the_session() -> TestResult {
         let provider = StubToolProvider::with_names(&[]);
         let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
         let store = crate::state_store::InMemoryStateStore::new();
 
-        let error = run_turn(
+        let Err(error) = run_turn(
             &mut session,
             &QuotaExceededModel,
             &store,
             TurnInput::user("do the thing"),
         )
         .await
-        .expect_err("a quota-exceeded failure reaches the caller");
+        else {
+            return Err(TestError::Unexpected(
+                "a quota-exceeded failure reaches the caller".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
@@ -4401,10 +4938,11 @@ mod tests {
             "an exhausted quota is not a transient condition a retry can fix, \
              so the session must terminalize instead of staying Idle"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn missing_tool_execution_context_is_model_visible_and_recoverable() {
+    async fn missing_tool_execution_context_is_model_visible_and_recoverable() -> TestResult {
         let provider = StubToolProvider::with_names(&["fs.read"]);
         let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
         let store = crate::state_store::InMemoryStateStore::new();
@@ -4416,7 +4954,7 @@ mod tests {
 
         let outcome = run_turn(&mut session, &model, &store, TurnInput::user("read this"))
             .await
-            .expect("the model can recover from a rejected tool boundary");
+            .map_err(ctx("the model can recover from a rejected tool boundary"))?;
 
         assert!(matches!(outcome, TurnOutcome::Completed));
         assert_eq!(model.responses.load(Ordering::SeqCst), 2);
@@ -4429,10 +4967,11 @@ mod tests {
             crate::session::SessionState::Idle
         ));
         assert_eq!(session.history().len(), 4);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn empty_live_history_is_hydrated_before_a_new_user_turn() {
+    async fn empty_live_history_is_hydrated_before_a_new_user_turn() -> TestResult {
         let provider = StubToolProvider::with_names(&[]);
         let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
         let store = crate::state_store::InMemoryStateStore::new();
@@ -4442,7 +4981,7 @@ mod tests {
         store
             .save_history(session.id(), &persisted)
             .await
-            .expect("seed history");
+            .map_err(ctx("seed history"))?;
 
         run_turn(
             &mut session,
@@ -4451,25 +4990,30 @@ mod tests {
             TurnInput::user("new question"),
         )
         .await
-        .expect("hydrated turn runs");
+        .map_err(ctx("hydrated turn runs"))?;
 
         assert_eq!(session.history().len(), 4);
         assert_eq!(store.turn_count(session.id()), 4);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn history_load_error_fails_closed_before_user_item_is_admitted() {
+    async fn history_load_error_fails_closed_before_user_item_is_admitted() -> TestResult {
         let provider = StubToolProvider::with_names(&[]);
         let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
 
-        let error = run_turn(
+        let Err(error) = run_turn(
             &mut session,
             &crate::model::EchoModelProvider::new("must not run"),
             &LoadFailStore,
             TurnInput::user("must not be persisted"),
         )
         .await
-        .expect_err("history load failure must reject the turn");
+        else {
+            return Err(TestError::Unexpected(
+                "history load failure must reject the turn".to_owned(),
+            ));
+        };
 
         assert!(matches!(error, CoreError::TurnRejected(_)));
         assert!(session.history().is_empty());
@@ -4477,10 +5021,11 @@ mod tests {
             session.state(),
             crate::session::SessionState::Failed(_)
         ));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn duplicate_tool_catalog_failure_remains_terminal() {
+    async fn duplicate_tool_catalog_failure_remains_terminal() -> TestResult {
         let (tx, _rx) = mpsc::unbounded_channel();
         let registry = ExtensionRegistryBuilder::default()
             .tool_provider(StubToolProvider::with_names(&["duplicate"]))
@@ -4489,20 +5034,25 @@ mod tests {
         let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx);
         let store = crate::state_store::InMemoryStateStore::new();
 
-        let error = run_turn(
+        let Err(error) = run_turn(
             &mut session,
             &crate::model::EchoModelProvider::new("must not run"),
             &store,
             TurnInput::user("go"),
         )
         .await
-        .expect_err("duplicate tools are an invariant violation");
+        else {
+            return Err(TestError::Unexpected(
+                "duplicate tools are an invariant violation".to_owned(),
+            ));
+        };
 
         assert!(matches!(error, CoreError::DuplicateTool { .. }));
         assert!(matches!(
             session.state(),
             crate::session::SessionState::Failed(_)
         ));
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -4527,7 +5077,7 @@ mod tests {
             let next = self
                 .responses
                 .lock()
-                .expect("test model lock is not poisoned")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .pop_front();
             Box::pin(async move { next.ok_or(crate::model::ModelError::EmptyResponse) })
         }
@@ -4555,7 +5105,7 @@ mod tests {
         fn reviews_for(&self, call_id: &ToolCallId) -> usize {
             self.reviews
                 .lock()
-                .expect("test review lock is not poisoned")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .iter()
                 .filter(|reviewed| *reviewed == call_id)
                 .count()
@@ -4564,7 +5114,7 @@ mod tests {
         fn total_reviews(&self) -> usize {
             self.reviews
                 .lock()
-                .expect("test review lock is not poisoned")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .len()
         }
     }
@@ -4576,7 +5126,7 @@ mod tests {
         ) -> harw_extension_api::ExtFuture<'a, ApprovalDecision> {
             self.reviews
                 .lock()
-                .expect("test review lock is not poisoned")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(call.id.clone());
             let decision = self
                 .scripted
@@ -4695,10 +5245,12 @@ mod tests {
     /// Sandbox auf dem echten Harness-Verzeichnis. Ohne aufgelösten
     /// Spawn-Kontext lehnt der Turn-Loop jede Tool-Ausführung ab, der
     /// Parallel-Pfad wäre also gar nicht erreichbar.
-    fn test_sandbox() -> SandboxSpec {
+    fn test_sandbox() -> TestResult<SandboxSpec> {
         let harness_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
-            .expect("harw-core hat ein Workspace-Elternverzeichnis")
+            .ok_or(TestError::Missing(
+                "harw-core hat ein Workspace-Elternverzeichnis",
+            ))?
             .to_path_buf();
         let registry = harw_authority::WorkspaceRegistry::build(
             &harness_root,
@@ -4708,25 +5260,25 @@ mod tests {
                 root: std::path::PathBuf::from("harw-core"),
             }],
         )
-        .expect("Test-Workspace ist registrierbar");
-        SandboxSpec::from_resolved(
+        .map_err(ctx("Test-Workspace ist registrierbar"))?;
+        Ok(SandboxSpec::from_resolved(
             registry
                 .resolve(
                     &harw_types::TenantId::from_str("test-tenant"),
                     &harw_types::WorkspaceId::from_str("core-parallel-tests"),
                 )
-                .expect("Test-Workspace löst auf"),
+                .map_err(ctx("Test-Workspace löst auf"))?,
             harw_authority::PermissionSet::from_policy([
                 harw_authority::Permission::ReadWorkspace,
                 harw_authority::Permission::WriteWorkspace,
                 harw_authority::Permission::ExecuteProcess,
             ]),
-        )
+        ))
     }
 
-    fn test_spawn_context() -> SpawnContext {
-        SpawnContext {
-            sandbox: test_sandbox(),
+    fn test_spawn_context() -> TestResult<SpawnContext> {
+        Ok(SpawnContext {
+            sandbox: test_sandbox()?,
             suggestions: None,
             capability_snapshot: None,
             approval_actor: Some(ApprovalActor::Operator {
@@ -4742,20 +5294,20 @@ mod tests {
             // behavior unchanged. Tests that need a real ceiling build their
             // own `SpawnContext` literal instead of this shared helper.
             ceiling: None,
-        }
+        })
     }
 
     fn guarded_session(
         provider: Arc<dyn ToolProvider>,
         handler: Arc<CountingApproval>,
-    ) -> AgentSession {
+    ) -> TestResult<AgentSession> {
         let (tx, _rx) = mpsc::unbounded_channel();
         let registry = ExtensionRegistryBuilder::default()
             .tool_provider(provider)
             .approval_handler(handler)
             .build();
-        AgentSession::new(AgentRole::Assistant, None, registry, tx)
-            .with_spawn_context(test_spawn_context())
+        Ok(AgentSession::new(AgentRole::Assistant, None, registry, tx)
+            .with_spawn_context(test_spawn_context()?))
     }
 
     /// Wie [`guarded_session`], aber mit mehreren Handlern in genau der
@@ -4763,7 +5315,7 @@ mod tests {
     fn multi_guarded_session(
         provider: Arc<dyn ToolProvider>,
         handlers: &[Arc<CountingApproval>],
-    ) -> AgentSession {
+    ) -> TestResult<AgentSession> {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut builder = ExtensionRegistryBuilder::default().tool_provider(provider);
         for handler in handlers {
@@ -4771,8 +5323,10 @@ mod tests {
             let handler: Arc<CountingApproval> = Arc::clone(handler);
             builder = builder.approval_handler(handler);
         }
-        AgentSession::new(AgentRole::Assistant, None, builder.build(), tx)
-            .with_spawn_context(test_spawn_context())
+        Ok(
+            AgentSession::new(AgentRole::Assistant, None, builder.build(), tx)
+                .with_spawn_context(test_spawn_context()?),
+        )
     }
 
     fn call(id: &ToolCallId, name: &str) -> ToolCall {
@@ -4801,7 +5355,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_registered_approval_handler_no_longer_disables_parallel_dispatch() {
+    async fn a_registered_approval_handler_no_longer_disables_parallel_dispatch() -> TestResult {
         // Regression W2-14: früher genügte ein registrierter Handler, um den
         // JoinSet-Pfad abzuschalten. Die Barriere über zwei Parteien beweist,
         // dass beide Calls tatsächlich gleichzeitig laufen — seriell würde der
@@ -4811,7 +5365,7 @@ mod tests {
         let executions = Arc::new(AtomicUsize::new(0));
         let handler = Arc::new(CountingApproval::allow_everything());
         let provider = StubParallelProvider::joined(&["lookup"], Arc::clone(&executions), 2);
-        let mut session = guarded_session(provider, Arc::clone(&handler));
+        let mut session = guarded_session(provider, Arc::clone(&handler))?;
         let store = crate::state_store::InMemoryStateStore::new();
         let model = ScriptedModel::new(vec![
             response_with(vec![call(&first, "lookup"), call(&second, "lookup")]),
@@ -4823,21 +5377,24 @@ mod tests {
             run_turn(&mut session, &model, &store, TurnInput::user("parallel")),
         )
         .await
-        .expect("die Calls müssen gleichzeitig laufen, sonst blockiert die Barriere")
-        .expect("der Turn läuft durch");
+        .map_err(ctx(
+            "die Calls müssen gleichzeitig laufen, sonst blockiert die Barriere",
+        ))?
+        .map_err(ctx("der Turn läuft durch"))?;
 
         assert!(matches!(outcome, TurnOutcome::Completed));
         assert_eq!(executions.load(Ordering::SeqCst), 2);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn parallel_preflight_asks_every_handler_exactly_once() {
+    async fn parallel_preflight_asks_every_handler_exactly_once() -> TestResult {
         let first = ToolCallId::new();
         let second = ToolCallId::new();
         let executions = Arc::new(AtomicUsize::new(0));
         let handler = Arc::new(CountingApproval::allow_everything());
         let provider = StubParallelProvider::instant(&["lookup"], Arc::clone(&executions));
-        let mut session = guarded_session(provider, Arc::clone(&handler));
+        let mut session = guarded_session(provider, Arc::clone(&handler))?;
         let store = crate::state_store::InMemoryStateStore::new();
         let model = ScriptedModel::new(vec![
             response_with(vec![call(&first, "lookup"), call(&second, "lookup")]),
@@ -4846,7 +5403,7 @@ mod tests {
 
         let outcome = run_turn(&mut session, &model, &store, TurnInput::user("parallel"))
             .await
-            .expect("der Turn läuft durch");
+            .map_err(ctx("der Turn läuft durch"))?;
 
         assert!(matches!(outcome, TurnOutcome::Completed));
         assert_eq!(executions.load(Ordering::SeqCst), 2);
@@ -4857,10 +5414,11 @@ mod tests {
             2,
             "im Parallel-Pfad darf kein Handler ein zweites Mal gefragt werden"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn ask_user_falls_back_to_the_sequential_path_and_pauses_the_turn() {
+    async fn ask_user_falls_back_to_the_sequential_path_and_pauses_the_turn() -> TestResult {
         let allowed = ToolCallId::new();
         let asked = ToolCallId::new();
         let request = harw_types::ItemId::new();
@@ -4870,7 +5428,7 @@ mod tests {
             ApprovalDecision::AskUser(request.clone()),
         )]));
         let provider = StubParallelProvider::instant(&["lookup"], Arc::clone(&executions));
-        let mut session = guarded_session(provider, Arc::clone(&handler));
+        let mut session = guarded_session(provider, Arc::clone(&handler))?;
         let store = crate::state_store::InMemoryStateStore::new();
         let model = ScriptedModel::new(vec![response_with(vec![
             call(&allowed, "lookup"),
@@ -4879,7 +5437,7 @@ mod tests {
 
         let outcome = run_turn(&mut session, &model, &store, TurnInput::user("ask me"))
             .await
-            .expect("der Turn pausiert statt zu scheitern");
+            .map_err(ctx("der Turn pausiert statt zu scheitern"))?;
 
         match &outcome {
             TurnOutcome::AwaitingApproval {
@@ -4889,7 +5447,11 @@ mod tests {
                 assert_eq!(call_id, &asked);
                 assert_eq!(paused_request, &request);
             }
-            other => panic!("erwartet wurde eine Approval-Pause, nicht {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet wurde eine Approval-Pause, nicht {other:?}"
+                )));
+            }
         }
         assert!(matches!(
             session.state(),
@@ -4908,10 +5470,11 @@ mod tests {
             "die Vorprüfung reicht ihre Entscheidungen an den sequenziellen \
              Pfad weiter, statt erneut zu fragen"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn denied_call_falls_back_to_the_sequential_path_without_asking_twice() {
+    async fn denied_call_falls_back_to_the_sequential_path_without_asking_twice() -> TestResult {
         let denied = ToolCallId::new();
         let allowed = ToolCallId::new();
         let executions = Arc::new(AtomicUsize::new(0));
@@ -4920,7 +5483,7 @@ mod tests {
             ApprovalDecision::Deny("policy".to_owned()),
         )]));
         let provider = StubParallelProvider::instant(&["lookup"], Arc::clone(&executions));
-        let mut session = guarded_session(provider, Arc::clone(&handler));
+        let mut session = guarded_session(provider, Arc::clone(&handler))?;
         let store = crate::state_store::InMemoryStateStore::new();
         let model = ScriptedModel::new(vec![
             response_with(vec![call(&denied, "lookup"), call(&allowed, "lookup")]),
@@ -4929,7 +5492,7 @@ mod tests {
 
         let outcome = run_turn(&mut session, &model, &store, TurnInput::user("deny one"))
             .await
-            .expect("ein Deny beendet den Turn nicht");
+            .map_err(ctx("ein Deny beendet den Turn nicht"))?;
 
         assert!(matches!(outcome, TurnOutcome::Completed));
         assert_eq!(
@@ -4940,10 +5503,11 @@ mod tests {
         assert_eq!(handler.reviews_for(&denied), 1);
         assert_eq!(handler.reviews_for(&allowed), 1);
         assert_eq!(handler.total_reviews(), 2);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn a_non_parallel_safe_call_skips_the_preflight_entirely() {
+    async fn a_non_parallel_safe_call_skips_the_preflight_entirely() -> TestResult {
         // Die Vorprüfung steht bewusst hinter der Executor-Auflösung: ein
         // Handler darf nicht für einen Parallel-Pfad gefragt werden, der ohnehin
         // verworfen wird.
@@ -4956,7 +5520,7 @@ mod tests {
             "mutate",
             Arc::clone(&executions),
         );
-        let mut session = guarded_session(provider, Arc::clone(&handler));
+        let mut session = guarded_session(provider, Arc::clone(&handler))?;
         let store = crate::state_store::InMemoryStateStore::new();
         let model = ScriptedModel::new(vec![
             response_with(vec![call(&parallel, "lookup"), call(&serial, "mutate")]),
@@ -4965,22 +5529,23 @@ mod tests {
 
         let outcome = run_turn(&mut session, &model, &store, TurnInput::user("mixed"))
             .await
-            .expect("der gemischte Fall läuft seriell durch");
+            .map_err(ctx("der gemischte Fall läuft seriell durch"))?;
 
         assert!(matches!(outcome, TurnOutcome::Completed));
         assert_eq!(executions.load(Ordering::SeqCst), 2);
         assert_eq!(handler.reviews_for(&parallel), 1);
         assert_eq!(handler.reviews_for(&serial), 1);
         assert_eq!(handler.total_reviews(), 2);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn a_single_call_never_enters_the_parallel_path() {
+    async fn a_single_call_never_enters_the_parallel_path() -> TestResult {
         let only = ToolCallId::new();
         let executions = Arc::new(AtomicUsize::new(0));
         let handler = Arc::new(CountingApproval::allow_everything());
         let provider = StubParallelProvider::instant(&["lookup"], Arc::clone(&executions));
-        let mut session = guarded_session(provider, Arc::clone(&handler));
+        let mut session = guarded_session(provider, Arc::clone(&handler))?;
         let store = crate::state_store::InMemoryStateStore::new();
         let model = ScriptedModel::new(vec![
             response_with(vec![call(&only, "lookup")]),
@@ -4989,10 +5554,11 @@ mod tests {
 
         let outcome = run_turn(&mut session, &model, &store, TurnInput::user("single"))
             .await
-            .expect("ein einzelner Call läuft seriell");
+            .map_err(ctx("ein einzelner Call läuft seriell"))?;
 
         assert!(matches!(outcome, TurnOutcome::Completed));
         assert_eq!(handler.total_reviews(), 1);
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -5024,7 +5590,7 @@ mod tests {
         ) {
             self.outcomes
                 .lock()
-                .expect("test outcome lock is not poisoned")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push((outcome.tool_name.to_owned(), outcome.status));
         }
 
@@ -5034,14 +5600,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_outcome_observer_sees_a_successful_tool_call() {
+    async fn tool_outcome_observer_sees_a_successful_tool_call() -> TestResult {
         let only = ToolCallId::new();
         let executions = Arc::new(AtomicUsize::new(0));
         let handler = Arc::new(CountingApproval::allow_everything());
         let provider = StubParallelProvider::instant(&["lookup"], Arc::clone(&executions));
         let observer = Arc::new(RecordingObserver::new());
-        let mut session =
-            guarded_session(provider, Arc::clone(&handler)).with_tool_outcome_observer(Some(
+        let mut session = guarded_session(provider, Arc::clone(&handler))?
+            .with_tool_outcome_observer(Some(
                 Arc::clone(&observer) as Arc<dyn crate::capture::ToolOutcomeObserver>
             ));
         let store = crate::state_store::InMemoryStateStore::new();
@@ -5052,17 +5618,18 @@ mod tests {
 
         let outcome = run_turn(&mut session, &model, &store, TurnInput::user("single"))
             .await
-            .expect("ein einzelner Call läuft seriell");
+            .map_err(ctx("ein einzelner Call läuft seriell"))?;
 
         assert!(matches!(outcome, TurnOutcome::Completed));
         let recorded = observer
             .outcomes
             .lock()
-            .expect("test outcome lock is not poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].0, "lookup");
         assert_eq!(recorded[0].1, crate::capture::ToolOutcomeStatus::Success);
         assert_eq!(observer.turns_finished.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -5070,7 +5637,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    async fn check_approval_lets_a_later_deny_beat_an_earlier_ask_user() {
+    async fn check_approval_lets_a_later_deny_beat_an_earlier_ask_user() -> TestResult {
         // Regression G-004: früher gewann das vorn registrierte `AskUser`, der
         // Nutzer hätte freigeben können, was eine spätere Politik verbietet.
         let id = ToolCallId::new();
@@ -5085,37 +5652,43 @@ mod tests {
         let session = multi_guarded_session(
             StubToolProvider::with_names(&["lookup"]),
             &[Arc::clone(&asking), Arc::clone(&denying)],
-        );
+        )?;
 
         let decision = check_approval(&session, &call(&id, "lookup")).await;
 
         match decision {
             ApprovalDecision::Deny(reason) => assert_eq!(reason, "policy"),
-            other => panic!("ein späteres Deny muss gewinnen, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "ein späteres Deny muss gewinnen, war: {other:?}"
+                )));
+            }
         }
         assert_eq!(asking.reviews_for(&id), 1, "jeder Handler genau einmal");
         assert_eq!(denying.reviews_for(&id), 1, "jeder Handler genau einmal");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn check_approval_allows_only_when_every_handler_allows() {
+    async fn check_approval_allows_only_when_every_handler_allows() -> TestResult {
         let id = ToolCallId::new();
         let first = Arc::new(CountingApproval::allow_everything());
         let second = Arc::new(CountingApproval::allow_everything());
         let session = multi_guarded_session(
             StubToolProvider::with_names(&["lookup"]),
             &[Arc::clone(&first), Arc::clone(&second)],
-        );
+        )?;
 
         let decision = check_approval(&session, &call(&id, "lookup")).await;
 
         assert!(matches!(decision, ApprovalDecision::Allow));
         assert_eq!(first.reviews_for(&id), 1);
         assert_eq!(second.reviews_for(&id), 1);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn check_approval_keeps_the_first_ask_user_over_allow_and_later_requests() {
+    async fn check_approval_keeps_the_first_ask_user_over_allow_and_later_requests() -> TestResult {
         let id = ToolCallId::new();
         let first_request = harw_types::ItemId::new();
         let asking = Arc::new(CountingApproval::new(vec![(
@@ -5134,7 +5707,7 @@ mod tests {
                 Arc::clone(&allowing),
                 Arc::clone(&asking_later),
             ],
-        );
+        )?;
 
         let decision = check_approval(&session, &call(&id, "lookup")).await;
 
@@ -5143,15 +5716,20 @@ mod tests {
                 request, first_request,
                 "die erste Anfrage-ID gilt, spätere werden verworfen"
             ),
-            other => panic!("AskUser + Allow muss AskUser ergeben, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "AskUser + Allow muss AskUser ergeben, war: {other:?}"
+                )));
+            }
         }
         assert_eq!(asking.reviews_for(&id), 1);
         assert_eq!(allowing.reviews_for(&id), 1);
         assert_eq!(asking_later.reviews_for(&id), 1);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn parallel_preflight_aggregates_a_later_deny_over_an_earlier_ask_user() {
+    async fn parallel_preflight_aggregates_a_later_deny_over_an_earlier_ask_user() -> TestResult {
         // Der Parallel-Vorprüfpfad muss identisch aggregieren: statt einer
         // Approval-Pause (früheres `AskUser`) wird der Call abgelehnt, der
         // erlaubte Call läuft, und kein Handler wird doppelt gefragt.
@@ -5168,7 +5746,7 @@ mod tests {
         )]));
         let provider = StubParallelProvider::instant(&["lookup"], Arc::clone(&executions));
         let mut session =
-            multi_guarded_session(provider, &[Arc::clone(&asking), Arc::clone(&denying)]);
+            multi_guarded_session(provider, &[Arc::clone(&asking), Arc::clone(&denying)])?;
         let store = crate::state_store::InMemoryStateStore::new();
         let model = ScriptedModel::new(vec![
             response_with(vec![call(&allowed, "lookup"), call(&contested, "lookup")]),
@@ -5177,7 +5755,7 @@ mod tests {
 
         let outcome = run_turn(&mut session, &model, &store, TurnInput::user("aggregate"))
             .await
-            .expect("ein Deny beendet den Turn nicht");
+            .map_err(ctx("ein Deny beendet den Turn nicht"))?;
 
         assert!(
             matches!(outcome, TurnOutcome::Completed),
@@ -5193,6 +5771,7 @@ mod tests {
             assert_eq!(handler.reviews_for(&contested), 1);
             assert_eq!(handler.total_reviews(), 2);
         }
+        Ok(())
     }
 
     #[test]
@@ -5247,7 +5826,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handoff_emits_child_spawned_with_role_and_question() {
+    async fn handoff_emits_child_spawned_with_role_and_question() -> TestResult {
         let child = SessionId::new();
         let (tx, _rx) = mpsc::unbounded_channel();
         let (turn_tx, mut turn_rx) = mpsc::unbounded_channel();
@@ -5257,7 +5836,7 @@ mod tests {
             }))
             .build();
         let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx)
-            .with_spawn_context(test_spawn_context())
+            .with_spawn_context(test_spawn_context()?)
             .with_turn_event_sink(turn_tx);
         let store = crate::state_store::InMemoryStateStore::new();
         let model = ScriptedModel::new(vec![response_with(vec![ToolCall {
@@ -5268,13 +5847,13 @@ mod tests {
 
         let outcome = run_turn(&mut session, &model, &store, TurnInput::user("handoff"))
             .await
-            .expect("der Handoff pausiert den Turn");
+            .map_err(ctx("der Handoff pausiert den Turn"))?;
 
         assert!(matches!(outcome, TurnOutcome::AwaitingChild { .. }));
         let spawned = drain_turn_events(&mut turn_rx)
             .into_iter()
             .find(|event| matches!(event, TurnEvent::ChildSpawned { .. }))
-            .expect("ein Handoff meldet ein ChildSpawned");
+            .ok_or(TestError::Missing("ein Handoff meldet ein ChildSpawned"))?;
         match spawned {
             TurnEvent::ChildSpawned {
                 child: spawned_child,
@@ -5286,12 +5865,17 @@ mod tests {
                 assert_eq!(role, "worker");
                 assert_eq!(question.as_deref(), Some("wo liegt der Fehler?"));
             }
-            other => panic!("erwartet wurde ChildSpawned, nicht {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet wurde ChildSpawned, nicht {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn handoff_without_a_question_argument_reports_none() {
+    async fn handoff_without_a_question_argument_reports_none() -> TestResult {
         let child = SessionId::new();
         let (tx, _rx) = mpsc::unbounded_channel();
         let (turn_tx, mut turn_rx) = mpsc::unbounded_channel();
@@ -5301,7 +5885,7 @@ mod tests {
             }))
             .build();
         let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx)
-            .with_spawn_context(test_spawn_context())
+            .with_spawn_context(test_spawn_context()?)
             .with_turn_event_sink(turn_tx);
         let store = crate::state_store::InMemoryStateStore::new();
         let model = ScriptedModel::new(vec![response_with(vec![ToolCall {
@@ -5312,20 +5896,21 @@ mod tests {
 
         run_turn(&mut session, &model, &store, TurnInput::user("handoff"))
             .await
-            .expect("der Handoff pausiert den Turn");
+            .map_err(ctx("der Handoff pausiert den Turn"))?;
 
         let spawned = drain_turn_events(&mut turn_rx)
             .into_iter()
             .find(|event| matches!(event, TurnEvent::ChildSpawned { .. }))
-            .expect("ein Handoff meldet ein ChildSpawned");
+            .ok_or(TestError::Missing("ein Handoff meldet ein ChildSpawned"))?;
         assert!(matches!(
             spawned,
             TurnEvent::ChildSpawned { question: None, role, .. } if role == "reviewer"
         ));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn child_completion_emits_child_completed_after_the_result_is_persisted() {
+    async fn child_completion_emits_child_completed_after_the_result_is_persisted() -> TestResult {
         let (tx, _rx) = mpsc::unbounded_channel();
         let (turn_tx, mut turn_rx) = mpsc::unbounded_channel();
         let child = SessionId::new();
@@ -5335,13 +5920,13 @@ mod tests {
             }))
             .build();
         let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx)
-            .with_spawn_context(test_spawn_context())
+            .with_spawn_context(test_spawn_context()?)
             .with_turn_event_sink(turn_tx);
-        session.try_start_turn().expect("Turn startet");
+        session.try_start_turn().map_err(ctx("Turn startet"))?;
         let call_id = ToolCallId::new();
         session
             .begin_handoff(child.clone(), call_id.clone(), "worker".to_owned())
-            .expect("Handoff pausiert");
+            .map_err(ctx("Handoff pausiert"))?;
         let store = crate::state_store::InMemoryStateStore::new();
 
         let outcome = resume_after_child(
@@ -5353,13 +5938,15 @@ mod tests {
             ToolCallResult::success(serde_json::json!({"child": "done"})),
         )
         .await
-        .expect("das Kind-Ergebnis nimmt den Eltern-Turn wieder auf");
+        .map_err(ctx("das Kind-Ergebnis nimmt den Eltern-Turn wieder auf"))?;
 
         assert!(matches!(outcome, TurnOutcome::Completed));
         let completed = drain_turn_events(&mut turn_rx)
             .into_iter()
             .find(|event| matches!(event, TurnEvent::ChildCompleted { .. }))
-            .expect("ein terminiertes Kind meldet ChildCompleted");
+            .ok_or(TestError::Missing(
+                "ein terminiertes Kind meldet ChildCompleted",
+            ))?;
         match completed {
             TurnEvent::ChildCompleted {
                 child: completed_child,
@@ -5375,8 +5962,13 @@ mod tests {
                      und wird deshalb nicht geraten"
                 );
             }
-            other => panic!("erwartet wurde ChildCompleted, nicht {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet wurde ChildCompleted, nicht {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     // Keep the unused import lint quiet — ToolsError is used in the
@@ -5391,7 +5983,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    async fn turn_exceeding_its_model_round_budget_is_cancelled_with_budget_reason() {
+    async fn turn_exceeding_its_model_round_budget_is_cancelled_with_budget_reason() -> TestResult {
         let provider = StubToolProvider::with_names(&[]);
         let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
         let store = crate::state_store::InMemoryStateStore::new();
@@ -5410,7 +6002,7 @@ mod tests {
             input,
         )
         .await
-        .expect("a tripped budget ends the turn cleanly, not as an Err");
+        .map_err(ctx("a tripped budget ends the turn cleanly, not as an Err"))?;
 
         assert!(
             matches!(
@@ -5425,10 +6017,11 @@ mod tests {
             matches!(session.state(), crate::session::SessionState::Idle),
             "a cancelled turn returns the session to Idle, exactly like Completed"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn turn_within_its_limits_still_completes() {
+    async fn turn_within_its_limits_still_completes() -> TestResult {
         let provider = StubToolProvider::with_names(&[]);
         let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
         let store = crate::state_store::InMemoryStateStore::new();
@@ -5452,7 +6045,7 @@ mod tests {
             input,
         )
         .await
-        .expect("a turn within its budget completes normally");
+        .map_err(ctx("a turn within its budget completes normally"))?;
 
         assert!(
             matches!(outcome, TurnOutcome::Completed),
@@ -5467,6 +6060,7 @@ mod tests {
             1,
             "drive_turn must record the one model round it actually ran"
         );
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -5491,7 +6085,9 @@ mod tests {
             let delay = self.delay;
             Box::pin(async move {
                 tokio::time::sleep(delay).await;
-                Ok(crate::model::ModelResponse::text("too late — cancellation should have won"))
+                Ok(crate::model::ModelResponse::text(
+                    "too late — cancellation should have won",
+                ))
             })
         }
     }
@@ -5593,7 +6189,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_call_cancelled_mid_flight_ends_the_turn_quickly() {
+    async fn model_call_cancelled_mid_flight_ends_the_turn_quickly() -> TestResult {
         let provider = StubToolProvider::with_names(&[]);
         let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
         let store = crate::state_store::InMemoryStateStore::new();
@@ -5616,11 +6212,13 @@ mod tests {
             tokio::join!(run, canceller)
         })
         .await
-        .expect(
+        .map_err(ctx(
             "cancellation must win long before the provider's 30s delay elapses — \
              the model call is not actually racing the cancel token",
-        );
-        let outcome = outcome.expect("a cancelled model call ends the turn cleanly, not as Err");
+        ))?;
+        let outcome = outcome.map_err(ctx(
+            "a cancelled model call ends the turn cleanly, not as Err",
+        ))?;
 
         assert!(
             matches!(
@@ -5635,10 +6233,11 @@ mod tests {
             matches!(session.state(), crate::session::SessionState::Idle),
             "a cancelled turn returns the session to Idle, exactly like Completed"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn tool_call_cancelled_mid_flight_aborts_pending_calls_sequential_path() {
+    async fn tool_call_cancelled_mid_flight_aborts_pending_calls_sequential_path() -> TestResult {
         let first = ToolCallId::new();
         let second = ToolCallId::new();
         let executions = Arc::new(AtomicUsize::new(0));
@@ -5648,7 +6247,7 @@ mod tests {
             started: Arc::clone(&started),
         });
         let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full))
-            .with_spawn_context(test_spawn_context());
+            .with_spawn_context(test_spawn_context()?);
         let store = crate::state_store::InMemoryStateStore::new();
         let model = ScriptedModel::new(vec![response_with(vec![
             call(&first, "block"),
@@ -5668,9 +6267,12 @@ mod tests {
             tokio::join!(run, canceller)
         })
         .await
-        .expect("cancellation must resolve the blocked sequential call quickly");
-        let outcome =
-            outcome.expect("a cancelled sequential tool call ends the turn cleanly, not as Err");
+        .map_err(ctx(
+            "cancellation must resolve the blocked sequential call quickly",
+        ))?;
+        let outcome = outcome.map_err(ctx(
+            "a cancelled sequential tool call ends the turn cleanly, not as Err",
+        ))?;
 
         assert!(
             matches!(
@@ -5706,10 +6308,11 @@ mod tests {
             "every tool_call must be paired with a tool_result, or the history is not \
              provider-valid for the next model call"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn tool_call_cancelled_mid_flight_aborts_pending_calls_parallel_path() {
+    async fn tool_call_cancelled_mid_flight_aborts_pending_calls_parallel_path() -> TestResult {
         let first = ToolCallId::new();
         let second = ToolCallId::new();
         let executions = Arc::new(AtomicUsize::new(0));
@@ -5719,7 +6322,7 @@ mod tests {
             executions: Arc::clone(&executions),
             started: Arc::clone(&started),
         });
-        let mut session = guarded_session(provider, Arc::clone(&handler));
+        let mut session = guarded_session(provider, Arc::clone(&handler))?;
         let store = crate::state_store::InMemoryStateStore::new();
         let model = ScriptedModel::new(vec![response_with(vec![
             call(&first, "block"),
@@ -5739,9 +6342,12 @@ mod tests {
             tokio::join!(run, canceller)
         })
         .await
-        .expect("cancellation must resolve the blocked parallel calls quickly");
-        let outcome =
-            outcome.expect("a cancelled parallel tool call ends the turn cleanly, not as Err");
+        .map_err(ctx(
+            "cancellation must resolve the blocked parallel calls quickly",
+        ))?;
+        let outcome = outcome.map_err(ctx(
+            "a cancelled parallel tool call ends the turn cleanly, not as Err",
+        ))?;
 
         assert!(
             matches!(
@@ -5774,28 +6380,533 @@ mod tests {
             "every tool_call must be paired with a tool_result, or the history is not \
              provider-valid for the next model call"
         );
-        let delivered_cancelled = results.iter().any(|result| {
+        // Angepasst für Fix C (Moduldoku „Siebter Nachtrag"): vor Fix C konnte
+        // dieser Test einen deterministischen 1-und-1-Split annehmen — ein
+        // Call lieferte über `CancelAwareExecutor`s eigenes
+        // `Err(ToolsError::Cancelled)` aus, der andere war beim `TurnGuard`-
+        // artigen Abort noch unzugestellt. Fix C lässt die Reaper-Schleife
+        // selbst gegen `control.cancel_token()` racen und `joins.abort_all()`
+        // rufen, sobald sie gewinnt — das kann jetzt auch einen an sich
+        // Cancel-bewussten Job abbrechen, bevor er seine eigene
+        // `Err(ToolsError::Cancelled)`-Antwort zurückgeben konnte (ein
+        // `abort()`ter Task wird nie zu Ende poll't). Welcher der beiden Wege
+        // im Einzelfall gewinnt, ist jetzt eine echte, gewollte
+        // Scheduler-Race — der Test prüft deshalb nur noch die Invariante,
+        // die für beide Fälle gilt: jedes Ergebnis ist ein
+        // Cancel-Fehlerergebnis, keines ein generischer Tool-Fehler.
+        let all_cancelled = results.iter().all(|result| {
             matches!(
                 result,
-                ToolCallResult::Error { message } if message == "tool execution was cancelled"
+                ToolCallResult::Error { message }
+                    if message == "tool execution was cancelled"
+                        || message.contains("cancelled before delivery")
             )
         });
-        let synthesized_pending = results.iter().any(|result| {
+        assert!(
+            all_cancelled,
+            "every result must be cancellation-shaped — either the executor's own \
+             ToolsError::Cancelled message or the synthetic 'cancelled before delivery' \
+             fill-in — got {results:?}"
+        );
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Fix A/B/C (Moduldoku „Siebter Nachtrag"): der Steuerblock übersteht
+    // jetzt eine Handoff-/Rückfrage-Pause, und zwei bisher ungeracete
+    // Ausführungspfade (Rückfrage-Fortsetzung sequenziell; paralleler
+    // Join-Loop) racen jetzt auch gegen `control.cancel_token()`.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cancelling_the_original_control_after_a_handoff_pause_cancels_the_resumed_turn()
+    -> TestResult {
+        let child = SessionId::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .spawner(Arc::new(FixedChildSpawner {
+                child: child.clone(),
+            }))
+            .build();
+        let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx)
+            .with_spawn_context(test_spawn_context()?);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![response_with(vec![ToolCall {
+            id: ToolCallId::new(),
+            name: ToolName::new("transfer_to_worker"),
+            arguments: serde_json::json!({}),
+        }])]);
+        let control = TurnControl::new();
+        let cancel_token = control.cancel_token().clone();
+        let input = TurnInput::user("go").with_control(control);
+
+        let outcome = run_turn(&mut session, &model, &store, input)
+            .await
+            .map_err(ctx("the handoff pauses the turn"))?;
+        let (child_returned, call_id_returned) = match outcome {
+            TurnOutcome::AwaitingChild {
+                child: awaited_child,
+                call_id: awaited_call_id,
+                ..
+            } => (awaited_child, awaited_call_id),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected AwaitingChild, got {other:?}"
+                )));
+            }
+        };
+
+        // Ctrl+C-Äquivalent: der URSPRÜNGLICHE Token wird erst NACH der Pause
+        // abgebrochen. Vor Fix A verschluckte `resume_after_child_with_approvals`s
+        // frischer, unbegrenzter `TurnControl::new()` genau diesen Fall — dieser
+        // Test muss vor Fix A rot sein (Ergebnis `Completed`), danach grün
+        // (Ergebnis `Cancelled`).
+        cancel_token.cancel(CancelReason::User);
+
+        let outcome = resume_after_child(
+            &mut session,
+            &crate::model::EchoModelProvider::new("must not be reached"),
+            &store,
+            child_returned,
+            call_id_returned,
+            ToolCallResult::success(serde_json::json!({"child": "done"})),
+        )
+        .await
+        .map_err(ctx(
+            "a cancelled resume still ends the turn cleanly, not as Err",
+        ))?;
+
+        assert!(
             matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::User
+                }
+            ),
+            "AgentSession::active_turn_control must carry the original control across the \
+             handoff pause so the resumed turn observes its cancellation — got {outcome:?}"
+        );
+        assert!(
+            matches!(session.state(), crate::session::SessionState::Idle),
+            "a cancelled turn returns the session to Idle, exactly like Completed"
+        );
+        Ok(())
+    }
+
+    /// Ausführer, der `ctx.cancel()` NIE selbst abfragt — schläft `delay`
+    /// lang und liefert danach ein gewöhnliches Ergebnis. Anders als
+    /// [`CancelAwareExecutor`] oben: dieser Fixture prüft, dass Fix B/C auch
+    /// einen unkooperativen Ausführer unterbrechen, nicht nur einen, der den
+    /// Token selbst abfragt.
+    struct DelayedNonCancelAwareExecutor {
+        delay: Duration,
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    impl ToolExecutor for DelayedNonCancelAwareExecutor {
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a ToolExecutionContext,
+            _call: &'a ToolCall,
+        ) -> ToolExecutorFuture<'a> {
+            self.started.notify_one();
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(ToolOutput::Text {
+                    content: "too late — the outer cancel race should have won".to_owned(),
+                })
+            })
+        }
+    }
+
+    /// Einzelnes, **nicht** `parallel_safe` markiertes Werkzeug `"slow"` —
+    /// erzwingt den sequenziellen Dispatch-Pfad.
+    struct SlowToolProvider {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    impl ToolProvider for SlowToolProvider {
+        fn tools(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec::Function(FunctionToolSpec {
+                name: ToolName::new("slow"),
+                description: "ignores cancellation and sleeps".to_owned(),
+                parameters: JsonSchema::default(),
+                strict: false,
+            })]
+        }
+
+        fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
+            (name.as_str() == "slow").then(|| {
+                Arc::new(DelayedNonCancelAwareExecutor {
+                    delay: Duration::from_secs(30),
+                    started: Arc::clone(&self.started),
+                }) as Arc<dyn ToolExecutor>
+            })
+        }
+    }
+
+    /// Wie [`SlowToolProvider`], aber `"slow"` ist `parallel_safe` — erzwingt
+    /// den `JoinSet`-Pfad ([`try_execute_parallel_calls`]).
+    struct SlowParallelToolProvider {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    impl ToolProvider for SlowParallelToolProvider {
+        fn tools(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec::Function(FunctionToolSpec {
+                name: ToolName::new("slow"),
+                description: "ignores cancellation and sleeps".to_owned(),
+                parameters: JsonSchema::default(),
+                strict: false,
+            })]
+        }
+
+        fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
+            (name.as_str() == "slow").then(|| {
+                Arc::new(DelayedNonCancelAwareExecutor {
+                    delay: Duration::from_secs(30),
+                    started: Arc::clone(&self.started),
+                }) as Arc<dyn ToolExecutor>
+            })
+        }
+
+        fn parallel_safe(&self, name: &ToolName) -> bool {
+            name.as_str() == "slow"
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_call_ignoring_cancel_itself_is_still_interrupted_sequential_path() -> TestResult {
+        let call_id = ToolCallId::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(SlowToolProvider {
+            started: Arc::clone(&started),
+        });
+        let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full))
+            .with_spawn_context(test_spawn_context()?);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![response_with(vec![call(&call_id, "slow")])]);
+        let control = TurnControl::new();
+        let cancel_token = control.cancel_token().clone();
+        let input = TurnInput::user("go").with_control(control);
+
+        let run = run_turn(&mut session, &model, &store, input);
+        let canceller = async {
+            started.notified().await;
+            cancel_token.cancel(CancelReason::User);
+        };
+
+        let (outcome, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(run, canceller)
+        })
+        .await
+        .map_err(ctx(
+            "Fix B must race the executor's own await against the cancel token — an \
+             executor that never checks cancellation itself must not be able to block the \
+             turn for its full 30s delay",
+        ))?;
+        let outcome = outcome.map_err(ctx(
+            "a cancelled tool call ends the turn cleanly, not as Err",
+        ))?;
+
+        assert!(
+            matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::User
+                }
+            ),
+            "expected Cancelled{{reason: User}}, got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_call_ignoring_cancel_itself_is_still_interrupted_ask_user_resume_path()
+    -> TestResult {
+        let call_id = ToolCallId::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(SlowToolProvider {
+            started: Arc::clone(&started),
+        });
+        let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full))
+            .with_spawn_context(test_spawn_context()?);
+        session.try_start_turn().map_err(ctx("test turn starts"))?;
+        let actor = ApprovalActor::Operator {
+            id: "test-operator".to_owned(),
+        };
+        let pending_call = ToolCall {
+            id: call_id.clone(),
+            name: ToolName::new("slow"),
+            arguments: serde_json::json!({}),
+        };
+        session
+            .begin_approval(
+                pending_call,
+                harw_types::ItemId::new(),
+                actor.clone(),
+                jiff::Timestamp::now(),
+            )
+            .map_err(ctx("pause for approval"))?;
+        // Fix B testet den Rückfrage-Fortsetzungspfad unabhängig von Fix A:
+        // der Steuerblock wird hier direkt über den neuen Setter hinterlegt,
+        // statt über einen vollen `run_turn`-Durchlauf.
+        let control = TurnControl::new();
+        let cancel_token = control.cancel_token().clone();
+        session.set_active_turn_control(control);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = crate::model::EchoModelProvider::new("must not be reached");
+
+        let run = resume_after_approval(
+            &mut session,
+            &model,
+            &store,
+            actor,
+            ApprovalResolution::Approve,
+        );
+        let canceller = async {
+            started.notified().await;
+            cancel_token.cancel(CancelReason::User);
+        };
+
+        let (outcome, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(run, canceller)
+        })
+        .await
+        .map_err(ctx(
+            "Fix B must race the resume-after-approval executor call against the cancel \
+             token too — this path had no was_cancelled handling at all before this node",
+        ))?;
+        let outcome = outcome.map_err(ctx(
+            "a cancelled resumed tool call ends the turn cleanly, not as Err",
+        ))?;
+
+        assert!(
+            matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::User
+                }
+            ),
+            "expected Cancelled{{reason: User}}, got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    // Fix A (Moduldoku „Achter Nachtrag"): a transport error on the model
+    // call that `drive_turn` makes right after a resumed approval's tool
+    // executes must not leave the session stuck in `Running` forever.
+    // Before the fix, every error exit of `resume_after_approval_with_store`
+    // after `resolve_approval` succeeded (here: the trailing `drive_turn`
+    // call) returned directly, bypassing `transition_after_turn_failure` —
+    // the next `try_start_turn` then failed with "session not idle:
+    // Running" even though the failure itself was retryable.
+    #[tokio::test]
+    async fn resume_after_approval_retryable_provider_failure_leaves_session_idle_not_running()
+    -> TestResult {
+        let call_id = ToolCallId::new();
+        let provider = StubToolProvider::with_names(&["fs.read"]);
+        let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full))
+            .with_spawn_context(test_spawn_context()?);
+        session.try_start_turn().map_err(ctx("test turn starts"))?;
+        let actor = ApprovalActor::Operator {
+            id: "test-operator".to_owned(),
+        };
+        let pending_call = ToolCall {
+            id: call_id.clone(),
+            name: ToolName::new("fs.read"),
+            arguments: serde_json::json!({}),
+        };
+        session
+            .begin_approval(
+                pending_call,
+                harw_types::ItemId::new(),
+                actor.clone(),
+                jiff::Timestamp::now(),
+            )
+            .map_err(ctx("pause for approval"))?;
+        session.set_active_turn_control(TurnControl::new());
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let Err(error) = resume_after_approval(
+            &mut session,
+            &TransientModel,
+            &store,
+            actor,
+            ApprovalResolution::Approve,
+        )
+        .await
+        else {
+            return Err(TestError::Unexpected(
+                "the transport error surfaces to the caller".to_owned(),
+            ));
+        };
+
+        assert!(matches!(
+            error,
+            CoreError::Model(crate::model::ModelError::Transient { .. })
+        ));
+        assert!(
+            matches!(session.state(), crate::session::SessionState::Idle),
+            "a retryable provider failure on the post-approval drive_turn call must not leave \
+             the session stuck in Running, got {:?}",
+            session.state()
+        );
+
+        let outcome = run_turn(
+            &mut session,
+            &crate::model::EchoModelProvider::new("recovered"),
+            &store,
+            TurnInput::user("try again"),
+        )
+        .await
+        .map_err(ctx(
+            "the same session accepts a new turn after the retryable failure",
+        ))?;
+        assert!(matches!(outcome, TurnOutcome::Completed));
+        Ok(())
+    }
+
+    // Companion to the retryable case above: a non-retryable provider
+    // failure on the post-approval `drive_turn` call must still move the
+    // session to the terminal `Failed` state via `transition_after_turn_failure`
+    // — never leave it hanging in `Running`.
+    #[tokio::test]
+    async fn resume_after_approval_non_retryable_provider_failure_terminalizes_session()
+    -> TestResult {
+        let call_id = ToolCallId::new();
+        let provider = StubToolProvider::with_names(&["fs.read"]);
+        let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full))
+            .with_spawn_context(test_spawn_context()?);
+        session.try_start_turn().map_err(ctx("test turn starts"))?;
+        let actor = ApprovalActor::Operator {
+            id: "test-operator".to_owned(),
+        };
+        let pending_call = ToolCall {
+            id: call_id.clone(),
+            name: ToolName::new("fs.read"),
+            arguments: serde_json::json!({}),
+        };
+        session
+            .begin_approval(
+                pending_call,
+                harw_types::ItemId::new(),
+                actor.clone(),
+                jiff::Timestamp::now(),
+            )
+            .map_err(ctx("pause for approval"))?;
+        session.set_active_turn_control(TurnControl::new());
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let Err(error) = resume_after_approval(
+            &mut session,
+            &RefusalModel,
+            &store,
+            actor,
+            ApprovalResolution::Approve,
+        )
+        .await
+        else {
+            return Err(TestError::Unexpected(
+                "the refusal surfaces to the caller".to_owned(),
+            ));
+        };
+
+        assert!(matches!(
+            error,
+            CoreError::Model(crate::model::ModelError::Refusal { .. })
+        ));
+        assert!(
+            matches!(session.state(), crate::session::SessionState::Failed(_)),
+            "a non-retryable provider failure on the post-approval drive_turn call must \
+             terminalize the session instead of leaving it Running, got {:?}",
+            session.state()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parallel_dispatch_aborts_still_running_non_cancel_aware_calls_on_cancel() -> TestResult
+    {
+        let first = ToolCallId::new();
+        let second = ToolCallId::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let handler = Arc::new(CountingApproval::allow_everything());
+        let provider = Arc::new(SlowParallelToolProvider {
+            started: Arc::clone(&started),
+        });
+        let mut session = guarded_session(provider, Arc::clone(&handler))?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![response_with(vec![
+            call(&first, "slow"),
+            call(&second, "slow"),
+        ])]);
+        let control = TurnControl::new();
+        let cancel_token = control.cancel_token().clone();
+        let input = TurnInput::user("go").with_control(control);
+
+        let run = run_turn(&mut session, &model, &store, input);
+        let canceller = async {
+            started.notified().await;
+            cancel_token.cancel(CancelReason::User);
+        };
+
+        let (outcome, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(run, canceller)
+        })
+        .await
+        .map_err(ctx(
+            "Fix C must race the JoinSet reaper loop against the cancel token and \
+             abort_all() still-running jobs — executors that never check cancellation \
+             themselves must not be able to block the turn for their full 30s delay",
+        ))?;
+        let outcome = outcome.map_err(ctx(
+            "a cancelled parallel dispatch ends the turn cleanly, not as Err",
+        ))?;
+
+        assert!(
+            matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::User
+                }
+            ),
+            "expected Cancelled{{reason: User}}, got {outcome:?}"
+        );
+        let items = session.history().items();
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| matches!(item, TurnItem::ToolCall(_)))
+                .count(),
+            2,
+            "the JoinSet path pushes both tool_call entries up front, before spawning"
+        );
+        let results: Vec<ToolCallResult> = items
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::ToolResult(result) => Some(result.result.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results.len(),
+            2,
+            "every tool_call must be paired with a tool_result — including the calls that \
+             were still in flight when abort_all() fired, which the synthetic fill-in \
+             (Fix C) must cover"
+        );
+        assert!(
+            results.iter().all(|result| matches!(
                 result,
                 ToolCallResult::Error { message } if message.contains("cancelled before delivery")
-            )
-        });
-        assert!(
-            delivered_cancelled,
-            "the call whose own result was delivered must carry ToolsError::Cancelled's \
-             message, not a generic tool error — got {results:?}"
+            )),
+            "neither call checks cancellation itself, so abort_all() must be the only way \
+             either of them ever resolves, and both must get the synthetic 'cancelled \
+             before delivery' fill-in — got {results:?}"
         );
-        assert!(
-            synthesized_pending,
-            "the call that was not yet delivered when the abort hit must get the same \
-             synthetic message a TurnGuard abort produces — got {results:?}"
-        );
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -5818,8 +6929,15 @@ mod tests {
     }
 
     impl crate::compaction::CompactionObserver for RecordingCompactionObserver {
-        fn on_compacted(&self, _session_id: &SessionId, outcome: &crate::compaction::CompactionOutcome) {
-            *self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome.clone());
+        fn on_compacted(
+            &self,
+            _session_id: &SessionId,
+            outcome: &crate::compaction::CompactionOutcome,
+        ) {
+            *self
+                .last
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome.clone());
         }
     }
 
@@ -5862,7 +6980,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_maybe_compact_triggers_and_shrinks_history_with_tiny_policy() {
+    async fn test_maybe_compact_triggers_and_shrinks_history_with_tiny_policy() -> TestResult {
         // Winziges Kontextfenster ⇒ winzige Schwellen (70/30 Tokens), leicht
         // von einer kleinen künstlichen Nutzung überschritten.
         let policy = crate::auto_compact::AutoCompactPolicy::for_context_window(100);
@@ -5911,7 +7029,9 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-            .expect("policy set and thresholds exceeded ⇒ compact_session must run");
+            .ok_or(TestError::Missing(
+                "policy set and thresholds exceeded ⇒ compact_session must run",
+            ))?;
         assert_eq!(
             outcome.reason,
             Some(crate::auto_compact::CompactDecision::TaskCompleted)
@@ -5926,6 +7046,7 @@ mod tests {
             bytes_after <= bytes_before,
             "compaction must not grow the history (before={bytes_before}, after={bytes_after})"
         );
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -5944,7 +7065,9 @@ mod tests {
         session = session.with_compaction_observer(Some(observer.clone()));
         for i in 0..20 {
             session.history_mut().push_user_text("frage");
-            session.history_mut().push_assistant_text(format!("antwort {i}"), None);
+            session
+                .history_mut()
+                .push_assistant_text(format!("antwort {i}"), None);
         }
         let store = crate::state_store::InMemoryStateStore::new();
 
@@ -5966,7 +7089,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_turn_start_hard_compact_triggers_above_target() {
+    async fn test_turn_start_hard_compact_triggers_above_target() -> TestResult {
         // Winziges Ziel ⇒ die künstlich aufgeblähte Historie liegt sicher
         // darüber und löst die harte Verdichtung aus.
         let policy = crate::auto_compact::AutoCompactPolicy::for_context_window(200_000)
@@ -5997,8 +7120,14 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-            .expect("history far above the tiny target ⇒ compact_session must run");
-        assert_eq!(outcome.reason, Some(crate::auto_compact::CompactDecision::TurnStart));
+            .ok_or(TestError::Missing(
+                "history far above the tiny target ⇒ compact_session must run",
+            ))?;
+        assert_eq!(
+            outcome.reason,
+            Some(crate::auto_compact::CompactDecision::TurnStart)
+        );
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -6006,7 +7135,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_last_round_usage_from_response_drives_auto_compaction() {
+    async fn test_last_round_usage_from_response_drives_auto_compaction() -> TestResult {
         // `last_round_usage` wird in `drive_turn` bei jeder Modellrunde aus
         // `response.usage` gesetzt und an `maybe_compact` weitergereicht
         // (Turn-Ende-Aufruf). Mit `TokenUsage::default()` (der ungenutzte
@@ -6034,7 +7163,7 @@ mod tests {
 
         let outcome = run_turn(&mut session, &model, &store, TurnInput::user("hi"))
             .await
-            .expect("der Turn läuft durch");
+            .map_err(ctx("der Turn läuft durch"))?;
         assert!(matches!(outcome, TurnOutcome::Completed));
 
         let compaction_outcome = observer
@@ -6042,15 +7171,16 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-            .expect(
+            .ok_or(TestError::Missing(
                 "die tatsächliche Antwort-Nutzung (80 > 70er-Schwelle) muss den \
                  Turn-Ende-Compact auslösen — geschieht das nicht, wurde \
                  `last_round_usage` nicht an `maybe_compact` durchgereicht",
-            );
+            ))?;
         assert_eq!(
             compaction_outcome.reason,
             Some(crate::auto_compact::CompactDecision::BudgetExceeded)
         );
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -6060,16 +7190,18 @@ mod tests {
     /// UIA-Root-Fixture: kein Parent, `organizational_role` =
     /// `AgentRoleId::UserInterface` — identisches Kriterium zu
     /// `is_uia_root_session` in `harw-tui/src/session_controller.rs`.
-    fn uia_root_session(provider: Arc<dyn ToolProvider>) -> AgentSession {
+    fn uia_root_session(provider: Arc<dyn ToolProvider>) -> TestResult<AgentSession> {
         let (tx, _rx) = mpsc::unbounded_channel();
         let registry = ExtensionRegistryBuilder::default()
             .tool_provider(provider)
             .build();
-        AgentSession::new(AgentRole::Assistant, None, registry, tx).with_spawn_context(
-            SpawnContext {
-                organizational_role: harw_agent_dsl::roles::AgentRoleId::UserInterface,
-                ..test_spawn_context()
-            },
+        Ok(
+            AgentSession::new(AgentRole::Assistant, None, registry, tx).with_spawn_context(
+                SpawnContext {
+                    organizational_role: harw_agent_dsl::roles::AgentRoleId::UserInterface,
+                    ..test_spawn_context()?
+                },
+            ),
         )
     }
 
@@ -6082,9 +7214,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_thinking_block_emits_reasoning_item_for_uia_root_session() {
+    async fn test_thinking_block_emits_reasoning_item_for_uia_root_session() -> TestResult {
         let provider = StubToolProvider::with_names(&[]);
-        let mut session = uia_root_session(provider);
+        let mut session = uia_root_session(provider)?;
         let (turn_tx, mut turn_rx) = mpsc::unbounded_channel();
         session = session.with_turn_event_sink(turn_tx);
         let store = crate::state_store::InMemoryStateStore::new();
@@ -6098,7 +7230,7 @@ mod tests {
 
         let outcome = run_turn(&mut session, &model, &store, TurnInput::user("frage"))
             .await
-            .expect("der Turn läuft durch");
+            .map_err(ctx("der Turn läuft durch"))?;
         assert!(matches!(outcome, TurnOutcome::Completed));
 
         // History: Reasoning-Item kommt vor der AssistantMessage.
@@ -6106,11 +7238,15 @@ mod tests {
         let reasoning_pos = items
             .iter()
             .position(|item| matches!(item, TurnItem::Reasoning(_)))
-            .expect("ein Reasoning-Item muss in der History stehen");
+            .ok_or(TestError::Missing(
+                "ein Reasoning-Item muss in der History stehen",
+            ))?;
         let assistant_pos = items
             .iter()
             .position(|item| matches!(item, TurnItem::AssistantMessage(_)))
-            .expect("die AssistantMessage muss in der History stehen");
+            .ok_or(TestError::Missing(
+                "die AssistantMessage muss in der History stehen",
+            ))?;
         assert!(
             reasoning_pos < assistant_pos,
             "Reasoning muss vor der AssistantMessage stehen (Denken vor Antwort)"
@@ -6123,7 +7259,11 @@ mod tests {
                 );
                 assert!(item.raw_content.is_empty());
             }
-            other => panic!("erwartete TurnItem::Reasoning, war {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartete TurnItem::Reasoning, war {other:?}"
+                )));
+            }
         }
 
         // Event: TurnEvent::ItemAdded mit TurnItem::Reasoning wurde emittiert.
@@ -6141,10 +7281,11 @@ mod tests {
             reasoning_event.is_some(),
             "ein TurnEvent::ItemAdded für das Reasoning-Item muss emittiert werden"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_thinking_block_emits_no_reasoning_item_for_non_uia_session() {
+    async fn test_thinking_block_emits_no_reasoning_item_for_non_uia_session() -> TestResult {
         // Identische Antwort wie im UIA-Test, aber eine Session mit
         // Standard-Rolle (`test_spawn_context()` ⇒ `RootOrchestrator`) —
         // das UIA-Filter-Kriterium darf hier nicht greifen.
@@ -6161,7 +7302,7 @@ mod tests {
 
         let outcome = run_turn(&mut session, &model, &store, TurnInput::user("frage"))
             .await
-            .expect("der Turn läuft durch");
+            .map_err(ctx("der Turn läuft durch"))?;
         assert!(matches!(outcome, TurnOutcome::Completed));
 
         assert!(
@@ -6172,15 +7313,16 @@ mod tests {
                 .any(|item| matches!(item, TurnItem::Reasoning(_))),
             "eine Nicht-UIA-Session darf kein Reasoning-Item bekommen"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_redacted_thinking_emits_no_reasoning_item_and_does_not_error() {
+    async fn test_redacted_thinking_emits_no_reasoning_item_and_does_not_error() -> TestResult {
         // `redacted_thinking`-Blöcke tragen keinen lesbaren Text — die
         // Extraktion muss robust `None` liefern statt zu paniken, auch für
         // eine UIA-Root-Session.
         let provider = StubToolProvider::with_names(&[]);
-        let mut session = uia_root_session(provider);
+        let mut session = uia_root_session(provider)?;
         let store = crate::state_store::InMemoryStateStore::new();
         let model = ScriptedModel::new(vec![crate::model::ModelResponse {
             reasoning: Some(anthropic_reasoning(vec![serde_json::json!({
@@ -6192,7 +7334,9 @@ mod tests {
 
         let outcome = run_turn(&mut session, &model, &store, TurnInput::user("frage"))
             .await
-            .expect("ein redacted_thinking-Block darf den Turn nicht scheitern lassen");
+            .map_err(ctx(
+                "ein redacted_thinking-Block darf den Turn nicht scheitern lassen",
+            ))?;
         assert!(matches!(outcome, TurnOutcome::Completed));
 
         assert!(
@@ -6203,26 +7347,31 @@ mod tests {
                 .any(|item| matches!(item, TurnItem::Reasoning(_))),
             "redacted_thinking liefert keinen extrahierbaren Text ⇒ kein Reasoning-Item"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_no_reasoning_data_leaves_behavior_unchanged() {
+    async fn test_no_reasoning_data_leaves_behavior_unchanged() -> TestResult {
         // `response.reasoning == None` (kein Extended Thinking) — auch für
         // eine UIA-Root-Session darf sich am bisherigen Verhalten nichts
         // ändern: nur die AssistantMessage landet in der History.
         let provider = StubToolProvider::with_names(&[]);
-        let mut session = uia_root_session(provider);
+        let mut session = uia_root_session(provider)?;
         let store = crate::state_store::InMemoryStateStore::new();
-        let model = ScriptedModel::new(vec![crate::model::ModelResponse::text("Antwort ohne Denken")]);
+        let model = ScriptedModel::new(vec![crate::model::ModelResponse::text(
+            "Antwort ohne Denken",
+        )]);
 
         let outcome = run_turn(&mut session, &model, &store, TurnInput::user("frage"))
             .await
-            .expect("der Turn läuft durch");
+            .map_err(ctx("der Turn läuft durch"))?;
         assert!(matches!(outcome, TurnOutcome::Completed));
 
         let items = session.history().items();
         assert!(
-            !items.iter().any(|item| matches!(item, TurnItem::Reasoning(_))),
+            !items
+                .iter()
+                .any(|item| matches!(item, TurnItem::Reasoning(_))),
             "ohne Reasoning-Daten darf kein Reasoning-Item entstehen"
         );
         assert!(
@@ -6231,6 +7380,7 @@ mod tests {
                 .any(|item| matches!(item, TurnItem::AssistantMessage(_))),
             "die AssistantMessage muss weiterhin in der History stehen"
         );
+        Ok(())
     }
 
     #[test]
@@ -6266,6 +7416,60 @@ mod tests {
     #[test]
     fn test_extract_thinking_text_none_for_empty_blocks() {
         let reasoning = anthropic_reasoning(vec![]);
+        assert_eq!(extract_thinking_text(&reasoning), None);
+    }
+
+    #[test]
+    fn test_extract_thinking_text_joins_reasoning_summary_text_entries() {
+        // OpenAI-Responses-Transport: ein "reasoning"-Block trägt mehrere
+        // summary_text-Einträge, die verkettet werden müssen.
+        let reasoning = anthropic_reasoning(vec![serde_json::json!({
+            "type": "reasoning",
+            "summary": [
+                {"type": "summary_text", "text": "erster Abschnitt"},
+                {"type": "summary_text", "text": "zweiter Abschnitt"},
+            ],
+        })]);
+        assert_eq!(
+            extract_thinking_text(&reasoning),
+            Some("erster Abschnitt\nzweiter Abschnitt".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_extract_thinking_text_takes_reasoning_content_text() {
+        // Chat-Transport (DeepSeek/Kimi/GLM-Konvention): Feld "text" wird
+        // direkt übernommen.
+        let reasoning = anthropic_reasoning(vec![serde_json::json!({
+            "type": "reasoning_content",
+            "text": "Gedankengang aus reasoning_content",
+        })]);
+        assert_eq!(
+            extract_thinking_text(&reasoning),
+            Some("Gedankengang aus reasoning_content".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_extract_thinking_text_skips_unknown_block_type() {
+        // Ein Block, der weder "thinking" noch "reasoning" noch
+        // "reasoning_content" ist, darf weiterhin kein Item/keinen Fehler
+        // erzeugen — nur stillschweigend übersprungen werden.
+        let reasoning = anthropic_reasoning(vec![serde_json::json!({
+            "type": "some_future_block_type",
+            "text": "sollte ignoriert werden",
+        })]);
+        assert_eq!(extract_thinking_text(&reasoning), None);
+    }
+
+    #[test]
+    fn test_extract_thinking_text_none_for_empty_reasoning_summary_array() {
+        // Ein leeres summary-Array darf nicht als „gefunden" zählen — kein
+        // leerer String, sondern `None`.
+        let reasoning = anthropic_reasoning(vec![serde_json::json!({
+            "type": "reasoning",
+            "summary": [],
+        })]);
         assert_eq!(extract_thinking_text(&reasoning), None);
     }
 }

@@ -170,6 +170,7 @@ mod tests {
     use super::shape_event;
     use crate::error::FsMonError;
     use crate::raw::RawFsEvent;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn sensor() -> SensorId {
         SensorId::from_str("fsmon-0")
@@ -185,101 +186,159 @@ mod tests {
     }
 
     #[test]
-    fn test_shape_event_write_mask_produces_file_write_event() {
-        let proc_root = tempfile::tempdir().expect("proc-tempdir");
+    fn test_shape_event_write_mask_produces_file_write_event() -> TestResult {
+        let proc_root = tempfile::tempdir().map_err(ctx("proc-tempdir"))?;
         let scope = ReadScope::from_roots([Path::new("/srv/data").to_path_buf()]);
         let raw = write_event("/srv/data/report.csv", 0x08 /* FAN_CLOSE_WRITE */);
 
-        let event = shape_event(&raw, &scope, proc_root.path(), &sensor(), Timestamp::UNIX_EPOCH)
-            .expect("Schreibmaske muss formbar sein")
-            .expect("Pfad liegt im Bereich");
+        let event = shape_event(
+            &raw,
+            &scope,
+            proc_root.path(),
+            &sensor(),
+            Timestamp::UNIX_EPOCH,
+        )
+        .map_err(ctx("Schreibmaske muss formbar sein"))?
+        .ok_or(TestError::Missing("Pfad liegt im Bereich"))?;
 
         match event.kind {
             EventKind::FileWrite { path } => assert_eq!(path, "/srv/data/report.csv"),
-            other => panic!("erwartet FileWrite, erhalten {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet FileWrite, erhalten {other:?}"
+                )));
+            }
         }
         assert_eq!(event.sensor, sensor());
+        Ok(())
     }
 
     #[test]
-    fn test_shape_event_path_outside_scope_is_dropped() {
-        let proc_root = tempfile::tempdir().expect("proc-tempdir");
+    fn test_shape_event_path_outside_scope_is_dropped() -> TestResult {
+        let proc_root = tempfile::tempdir().map_err(ctx("proc-tempdir"))?;
         let scope = ReadScope::from_roots([Path::new("/srv/data").to_path_buf()]);
         let raw = write_event("/etc/passwd", 0x08);
 
-        let result = shape_event(&raw, &scope, proc_root.path(), &sensor(), Timestamp::UNIX_EPOCH)
-            .expect("Formung selbst schlägt hier nicht fehl");
+        let result = shape_event(
+            &raw,
+            &scope,
+            proc_root.path(),
+            &sensor(),
+            Timestamp::UNIX_EPOCH,
+        )
+        .map_err(ctx("Formung selbst schlägt hier nicht fehl"))?;
 
         assert!(result.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_shape_event_unrecognized_mask_is_malformed_source_error() {
-        let proc_root = tempfile::tempdir().expect("proc-tempdir");
+    fn test_shape_event_unrecognized_mask_is_malformed_source_error() -> TestResult {
+        let proc_root = tempfile::tempdir().map_err(ctx("proc-tempdir"))?;
         let scope = ReadScope::from_roots([Path::new("/srv/data").to_path_buf()]);
         let raw = write_event("/srv/data/report.csv", 0x01 /* FAN_ACCESS */);
 
-        let err = shape_event(&raw, &scope, proc_root.path(), &sensor(), Timestamp::UNIX_EPOCH)
-            .expect_err("unerwartete Ereignisform muss scheitern");
+        let result = shape_event(
+            &raw,
+            &scope,
+            proc_root.path(),
+            &sensor(),
+            Timestamp::UNIX_EPOCH,
+        );
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "unerwartete Ereignisform muss scheitern".into(),
+            ));
+        };
 
         assert!(matches!(err, FsMonError::MalformedSource));
+        Ok(())
     }
 
     #[test]
-    fn test_shape_event_enriches_actor_with_resolved_loginuid() {
-        let proc_root = tempfile::tempdir().expect("proc-tempdir");
+    fn test_shape_event_enriches_actor_with_resolved_loginuid() -> TestResult {
+        let proc_root = tempfile::tempdir().map_err(ctx("proc-tempdir"))?;
         let pid_dir = proc_root.path().join("4242");
-        fs::create_dir_all(&pid_dir).expect("pid dir");
-        fs::write(pid_dir.join("loginuid"), "1000\n").expect("loginuid schreiben");
+        fs::create_dir_all(&pid_dir).map_err(ctx("pid dir"))?;
+        fs::write(pid_dir.join("loginuid"), "1000\n").map_err(ctx("loginuid schreiben"))?;
 
         let scope = ReadScope::from_roots([Path::new("/srv/data").to_path_buf()]);
         let raw = write_event("/srv/data/report.csv", 0x08);
 
-        let event = shape_event(&raw, &scope, proc_root.path(), &sensor(), Timestamp::UNIX_EPOCH)
-            .expect("formbar")
-            .expect("im Bereich");
+        let event = shape_event(
+            &raw,
+            &scope,
+            proc_root.path(),
+            &sensor(),
+            Timestamp::UNIX_EPOCH,
+        )
+        .map_err(ctx("formbar"))?
+        .ok_or(TestError::Missing("im Bereich"))?;
 
-        let actor = event.actor.expect("Actor muss gesetzt sein");
+        let actor = event
+            .actor
+            .ok_or(TestError::Missing("Actor muss gesetzt sein"))?;
         assert_eq!(actor.uid, 1000);
         assert_eq!(actor.auid, Some(1000));
+        Ok(())
     }
 
     #[test]
-    fn test_shape_event_unset_loginuid_yields_none_auid_not_sentinel() {
-        let proc_root = tempfile::tempdir().expect("proc-tempdir");
+    fn test_shape_event_unset_loginuid_yields_none_auid_not_sentinel() -> TestResult {
+        let proc_root = tempfile::tempdir().map_err(ctx("proc-tempdir"))?;
         let pid_dir = proc_root.path().join("4242");
-        fs::create_dir_all(&pid_dir).expect("pid dir");
-        fs::write(pid_dir.join("loginuid"), "4294967295\n").expect("loginuid schreiben");
+        fs::create_dir_all(&pid_dir).map_err(ctx("pid dir"))?;
+        fs::write(pid_dir.join("loginuid"), "4294967295\n").map_err(ctx("loginuid schreiben"))?;
 
         let scope = ReadScope::from_roots([Path::new("/srv/data").to_path_buf()]);
         let raw = write_event("/srv/data/report.csv", 0x08);
 
-        let event = shape_event(&raw, &scope, proc_root.path(), &sensor(), Timestamp::UNIX_EPOCH)
-            .expect("formbar")
-            .expect("im Bereich");
+        let event = shape_event(
+            &raw,
+            &scope,
+            proc_root.path(),
+            &sensor(),
+            Timestamp::UNIX_EPOCH,
+        )
+        .map_err(ctx("formbar"))?
+        .ok_or(TestError::Missing("im Bereich"))?;
 
-        assert_eq!(event.actor.expect("Actor gesetzt").auid, None);
+        assert_eq!(
+            event.actor.ok_or(TestError::Missing("Actor gesetzt"))?.auid,
+            None
+        );
+        Ok(())
     }
 
     /// Zusage der Crate: kein emittiertes Feld enthält Dateiinhalt.
     #[test]
-    fn test_shape_event_never_carries_file_content() {
-        let proc_root = tempfile::tempdir().expect("proc-tempdir");
-        let watched = tempfile::tempdir().expect("watched-tempdir");
+    fn test_shape_event_never_carries_file_content() -> TestResult {
+        let proc_root = tempfile::tempdir().map_err(ctx("proc-tempdir"))?;
+        let watched = tempfile::tempdir().map_err(ctx("watched-tempdir"))?;
         let target = watched.path().join("report.csv");
-        fs::write(&target, "TOP-SECRET-CONTENT").expect("Zieldatei mit Inhalt schreiben");
+        fs::write(&target, "TOP-SECRET-CONTENT").map_err(ctx("Zieldatei mit Inhalt schreiben"))?;
 
         let scope = ReadScope::from_roots([watched.path().to_path_buf()]);
-        let raw = write_event(target.to_str().expect("utf8 Pfad"), 0x08);
+        let raw = write_event(
+            target.to_str().ok_or(TestError::Missing("utf8 Pfad"))?,
+            0x08,
+        );
 
-        let event = shape_event(&raw, &scope, proc_root.path(), &sensor(), Timestamp::UNIX_EPOCH)
-            .expect("formbar")
-            .expect("im Bereich");
+        let event = shape_event(
+            &raw,
+            &scope,
+            proc_root.path(),
+            &sensor(),
+            Timestamp::UNIX_EPOCH,
+        )
+        .map_err(ctx("formbar"))?
+        .ok_or(TestError::Missing("im Bereich"))?;
 
-        let json = serde_json::to_string(&event).expect("SecurityEvent serialisiert");
+        let json = serde_json::to_string(&event).map_err(ctx("SecurityEvent serialisiert"))?;
         assert!(
             !json.contains("TOP-SECRET-CONTENT"),
             "Ereignis darf keinen Dateiinhalt tragen: {json}"
         );
+        Ok(())
     }
 }

@@ -117,7 +117,11 @@ pub trait BpfLoader: Send + Sync {
     /// # Errors
     /// - [`BpfError::MalformedEvent`], wenn ein gelesener Puffer nicht die
     ///   erwartete Form hat.
-    fn read_events(&self, handle: &BpfHandle, timeout: Duration) -> Result<Vec<RawBpfEvent>, BpfError>;
+    fn read_events(
+        &self,
+        handle: &BpfHandle,
+        timeout: Duration,
+    ) -> Result<Vec<RawBpfEvent>, BpfError>;
 }
 
 #[cfg(test)]
@@ -128,6 +132,7 @@ mod tests {
     use crate::fixture::FixtureBpfLoader;
     use crate::handle::BpfHandle;
     use crate::spec::{BpfProgramKind, BpfProgramSource, BpfProgramSpec};
+    use crate::test_support::{TestResult, ctx};
     use harw_types::SensorId;
     use std::borrow::Cow;
     use std::time::Duration;
@@ -142,13 +147,16 @@ mod tests {
     }
 
     #[test]
-    fn test_boxed_loader_is_object_safe_and_usable_through_dyn() {
+    fn test_boxed_loader_is_object_safe_and_usable_through_dyn() -> TestResult {
         let loader: Box<dyn BpfLoader> = Box::new(FixtureBpfLoader::new(Vec::new()));
-        let handle = loader.load(&sample_spec()).expect("fixture loader always succeeds");
+        let handle = loader
+            .load(&sample_spec())
+            .map_err(ctx("fixture loader always succeeds"))?;
         let events = loader
             .read_events(&handle, Duration::from_millis(0))
-            .expect("fixture loader read_events never fails");
+            .map_err(ctx("fixture loader read_events never fails"))?;
         assert!(events.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -159,14 +167,16 @@ mod tests {
         ];
         assert_eq!(loaders.len(), 2);
 
-        let results: Vec<Result<BpfHandle, BpfError>> =
-            loaders.iter().map(|loader| loader.load(&sample_spec())).collect();
+        let results: Vec<Result<BpfHandle, BpfError>> = loaders
+            .iter()
+            .map(|loader| loader.load(&sample_spec()))
+            .collect();
         assert!(results[0].is_ok());
         assert!(matches!(results[1], Err(BpfError::CapabilityUnavailable)));
     }
 
     #[test]
-    fn test_read_all_helper_collects_events_across_handles() {
+    fn test_read_all_helper_collects_events_across_handles() -> TestResult {
         let event = RawBpfEvent {
             pid: 1,
             comm: "init".to_owned(),
@@ -174,11 +184,14 @@ mod tests {
             payload: vec![],
         };
         let loader = FixtureBpfLoader::new(vec![event.clone()]);
-        let handle = loader.load(&sample_spec()).expect("fixture loader always succeeds");
+        let handle = loader
+            .load(&sample_spec())
+            .map_err(ctx("fixture loader always succeeds"))?;
 
         let events = loader
             .read_events(&handle, Duration::from_millis(0))
-            .expect("fixture loader read_events never fails");
+            .map_err(ctx("fixture loader read_events never fails"))?;
         assert_eq!(events, vec![event]);
+        Ok(())
     }
 }

@@ -455,10 +455,24 @@ pub fn render_markdown_with_extensions(
     );
     out.push('\n');
     out.push_str("- **Verzeichnis:** ");
-    out.push_str(&meta.cwd.as_deref().map(redact_text).map(|text| sanitize_inline(&text)).unwrap_or_else(|| UNKNOWN_PLACEHOLDER.to_owned()));
+    out.push_str(
+        &meta
+            .cwd
+            .as_deref()
+            .map(redact_text)
+            .map(|text| sanitize_inline(&text))
+            .unwrap_or_else(|| UNKNOWN_PLACEHOLDER.to_owned()),
+    );
     out.push('\n');
     out.push_str("- **Modell:** ");
-    out.push_str(&meta.model.as_deref().map(redact_text).map(|text| sanitize_inline(&text)).unwrap_or_else(|| UNKNOWN_PLACEHOLDER.to_owned()));
+    out.push_str(
+        &meta
+            .model
+            .as_deref()
+            .map(redact_text)
+            .map(|text| sanitize_inline(&text))
+            .unwrap_or_else(|| UNKNOWN_PLACEHOLDER.to_owned()),
+    );
     for (key, value) in extensions {
         if is_system_prompt_key(key) {
             continue;
@@ -467,7 +481,9 @@ pub fn render_markdown_with_extensions(
         out.push_str("- **");
         out.push_str(&sanitize_inline(&redact_text(key)));
         out.push_str(":** ");
-        out.push_str(&sanitize_inline(&redact_text(&display_json(&redact_json_value(value)))));
+        out.push_str(&sanitize_inline(&redact_text(&display_json(
+            &redact_json_value(value),
+        ))));
     }
     out.push_str("\n\n");
 
@@ -480,7 +496,9 @@ pub fn render_markdown_with_extensions(
                     out.push_str("## Du\n\n");
                     current = Some(Section::Du);
                 }
-                out.push_str(&sanitize_display(&redact_text(&demote_markdown_headings(text))));
+                out.push_str(&sanitize_display(&redact_text(&demote_markdown_headings(
+                    text,
+                ))));
                 out.push_str("\n\n");
             }
             ExportEntry::Assistant(text) => {
@@ -488,7 +506,9 @@ pub fn render_markdown_with_extensions(
                     out.push_str("## harw\n\n");
                     current = Some(Section::Harw);
                 }
-                out.push_str(&sanitize_display(&redact_text(&demote_markdown_headings(text))));
+                out.push_str(&sanitize_display(&redact_text(&demote_markdown_headings(
+                    text,
+                ))));
                 out.push_str("\n\n");
             }
             ExportEntry::System(text) => {
@@ -907,7 +927,11 @@ fn split_json_for_block(
             if let Ok(parsed) = serde_json::from_str::<Value>(text) {
                 Some(parsed)
             } else if text.contains('\n') {
-                let label = if path.is_empty() { "value".to_owned() } else { path.to_owned() };
+                let label = if path.is_empty() {
+                    "value".to_owned()
+                } else {
+                    path.to_owned()
+                };
                 text_blocks.push((label, text.to_owned()));
                 None
             } else {
@@ -986,7 +1010,10 @@ fn render_json_block(out: &mut String, value: &Value, max_chars_per_entry: Optio
 
     if let Some(json_value) = reduced {
         out.push_str("```json\n");
-        out.push_str(&apply_block_cap(&display_json(&json_value), max_chars_per_entry));
+        out.push_str(&apply_block_cap(
+            &display_json(&json_value),
+            max_chars_per_entry,
+        ));
         out.push_str("\n```\n");
     }
 
@@ -994,7 +1021,10 @@ fn render_json_block(out: &mut String, value: &Value, max_chars_per_entry: Optio
         out.push_str("  - Text (");
         out.push_str(&sanitize_inline(&redact_text(label)));
         out.push_str("):\n\n```text\n");
-        out.push_str(&apply_block_cap(&sanitize_display(text), max_chars_per_entry));
+        out.push_str(&apply_block_cap(
+            &sanitize_display(text),
+            max_chars_per_entry,
+        ));
         out.push_str("\n```\n");
     }
 }
@@ -1241,7 +1271,8 @@ fn redact_text(text: &str) -> String {
             output.push_str(&text[cursor..]);
             break;
         };
-        let Some((value_start, value_end)) = sensitive_value_range(text, start, marker.len()) else {
+        let Some((value_start, value_end)) = sensitive_value_range(text, start, marker.len())
+        else {
             output.push_str(&text[cursor..start + marker.len()]);
             cursor = start + marker.len();
             continue;
@@ -1275,12 +1306,18 @@ fn next_sensitive_marker<'a>(
 fn sensitive_value_range(text: &str, start: usize, marker_len: usize) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut index = start + marker_len;
-    while bytes.get(index).is_some_and(|byte| byte.is_ascii_whitespace()) {
+    while bytes
+        .get(index)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
         index += 1;
     }
     if bytes.get(index) == Some(&b'"') || bytes.get(index) == Some(&b'\'') {
         index += 1;
-        while bytes.get(index).is_some_and(|byte| byte.is_ascii_whitespace()) {
+        while bytes
+            .get(index)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
             index += 1;
         }
     }
@@ -1288,7 +1325,10 @@ fn sensitive_value_range(text: &str, start: usize, marker_len: usize) -> Option<
         return None;
     }
     index += 1;
-    while bytes.get(index).is_some_and(|byte| byte.is_ascii_whitespace()) {
+    while bytes
+        .get(index)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
         index += 1;
     }
     if bytes.get(index) == Some(&b'"') || bytes.get(index) == Some(&b'\'') {
@@ -1397,7 +1437,8 @@ fn demote_heading_line(line: &str) -> Option<String> {
     let after_hashes = &rest[hashes..];
     // Eine ATX-Überschrift braucht ein Leerzeichen/Tab (oder Zeilenende)
     // direkt nach den Rauten; sonst ist es z. B. ein `#tag` im Fließtext.
-    if !after_hashes.is_empty() && !after_hashes.starts_with(' ') && !after_hashes.starts_with('\t') {
+    if !after_hashes.is_empty() && !after_hashes.starts_with(' ') && !after_hashes.starts_with('\t')
+    {
         return None;
     }
     let new_level = (hashes + 2).min(6);
@@ -1588,6 +1629,7 @@ pub fn write_export_path(path: &Path, content: &str) -> Result<PathBuf, ExportEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn meta_minimal() -> ExportMeta {
         ExportMeta {
@@ -1601,7 +1643,7 @@ mod tests {
 
     /// Titel, Metadaten und Rollenüberschriften erscheinen in der Eingabereihenfolge.
     #[test]
-    fn test_render_markdown_order_and_headers() {
+    fn test_render_markdown_order_and_headers() -> TestResult {
         let meta = ExportMeta {
             title: Some("Mein Export".to_owned()),
             session_id: "sess-42".to_owned(),
@@ -1622,15 +1664,22 @@ mod tests {
         assert!(out.contains("- **Verzeichnis:** /home/mia/projects/harwness"));
         assert!(out.contains("- **Modell:** groq/llama"));
 
-        let du_first = out.find("## Du").expect("erste Du-Überschrift fehlt");
-        let harw_pos = out.find("## harw").expect("harw-Überschrift fehlt");
-        let du_second = out.rfind("## Du").expect("zweite Du-Überschrift fehlt");
+        let du_first = out
+            .find("## Du")
+            .ok_or(TestError::Missing("erste Du-Überschrift"))?;
+        let harw_pos = out
+            .find("## harw")
+            .ok_or(TestError::Missing("harw-Überschrift"))?;
+        let du_second = out
+            .rfind("## Du")
+            .ok_or(TestError::Missing("zweite Du-Überschrift"))?;
         assert!(du_first < harw_pos, "Frage 1 muss vor der Antwort stehen");
         assert!(harw_pos < du_second, "Antwort muss vor Frage 2 stehen");
         assert!(out.contains("Frage 1"));
         assert!(out.contains("Antwort 1"));
         assert!(out.contains("Frage 2"));
         assert!(out.ends_with('\n'));
+        Ok(())
     }
 
     /// Fehlende optionale Metadaten fallen auf `"unbekannt"` zurück.
@@ -1718,7 +1767,7 @@ mod tests {
     /// Strukturierte ToolCall-/ToolResult-Daten behalten ihre Reihenfolge und
     /// werden in Markdown vollständig, aber redigiert dargestellt.
     #[test]
-    fn test_structured_tools_are_ordered_and_complete() {
+    fn test_structured_tools_are_ordered_and_complete() -> TestResult {
         let entries = vec![
             ExportEntry::ToolCall {
                 call_id: "call-7".to_owned(),
@@ -1748,18 +1797,24 @@ mod tests {
             },
         ];
         let out = render_markdown(&meta_minimal(), &entries, &ExportOptions::default());
-        assert!(out.find("ToolCall").expect("ToolCall fehlt") < out.find("ToolResult").expect("ToolResult fehlt"));
+        assert!(
+            out.find("ToolCall").ok_or(TestError::Missing("ToolCall"))?
+                < out
+                    .find("ToolResult")
+                    .ok_or(TestError::Missing("ToolResult"))?
+        );
         assert!(out.contains("call-7"));
         assert!(out.contains("http.request"));
         assert!(out.contains("\"answer\": 42"));
         assert!(out.contains("Dauer: 12 ms"));
         assert!(!out.contains("should-not-leak"));
+        Ok(())
     }
 
     /// JSON enthält versionierte Metadaten sowie getrennte Ereignisse in der
     /// Eingabereihenfolge und exportiert keine Systemprompt-Felder.
     #[test]
-    fn test_render_json_is_structured_ordered_and_redacted() {
+    fn test_render_json_is_structured_ordered_and_redacted() -> TestResult {
         let entries = vec![
             ExportEntry::Plan(ExportPlanEntry {
                 plan_id: Some("plan-1".to_owned()),
@@ -1794,8 +1849,10 @@ mod tests {
             &entries,
             &ExportOptions::default(),
         ))
-        .expect("JSON muss gültig sein");
-        let events = value["events"].as_array().expect("events array");
+        .map_err(ctx("JSON muss gültig sein"))?;
+        let events = value["events"]
+            .as_array()
+            .ok_or(TestError::Missing("events array"))?;
         assert_eq!(events[0]["type"], "plan");
         assert_eq!(events[1]["type"], "error");
         assert_eq!(events[2]["type"], "tool_result");
@@ -1806,6 +1863,7 @@ mod tests {
         assert!(!serialized.contains("text-secret"));
         assert!(!serialized.contains("do not export"));
         assert_eq!(events[2]["result"]["password"], REDACTED);
+        Ok(())
     }
 
     /// Redaction gilt auch für Legacy-Freitext und typische Header-/Env-Formate.
@@ -1842,39 +1900,45 @@ mod tests {
     /// Existiert die Zieldatei bereits, wird bei erneutem `write_export` ein
     /// Suffix `-2` angehängt statt zu überschreiben.
     #[test]
-    fn test_write_export_suffixes_when_file_exists() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_write_export_suffixes_when_file_exists() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let path = dir.path().join("harw-export-2026-09-14T05-30-00.md");
 
-        write_export(&path, "erster Inhalt\n").expect("erster Export sollte klappen");
+        write_export(&path, "erster Inhalt\n").map_err(ctx("erster Export sollte klappen"))?;
         assert!(path.exists());
         assert_eq!(
-            std::fs::read_to_string(&path).expect("lesen"),
+            std::fs::read_to_string(&path).map_err(ctx("lesen"))?,
             "erster Inhalt\n"
         );
 
-        write_export(&path, "zweiter Inhalt\n").expect("zweiter Export sollte klappen");
+        write_export(&path, "zweiter Inhalt\n").map_err(ctx("zweiter Export sollte klappen"))?;
         let suffixed = dir.path().join("harw-export-2026-09-14T05-30-00-2.md");
         assert!(suffixed.exists(), "Suffix -2 muss angelegt werden");
         assert_eq!(
-            std::fs::read_to_string(&suffixed).expect("lesen"),
+            std::fs::read_to_string(&suffixed).map_err(ctx("lesen"))?,
             "zweiter Inhalt\n"
         );
         // Die ursprüngliche Datei bleibt unverändert.
         assert_eq!(
-            std::fs::read_to_string(&path).expect("lesen"),
+            std::fs::read_to_string(&path).map_err(ctx("lesen"))?,
             "erster Inhalt\n"
         );
+        Ok(())
     }
 
     /// Ein Zielpfad mit `..`-Komponente wird abgelehnt.
     #[test]
-    fn test_write_export_refuses_traversal() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_write_export_refuses_traversal() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let path = dir.path().join("../escape.md");
 
-        let err = write_export(&path, "inhalt\n").expect_err("Traversal muss abgelehnt werden");
+        let Err(err) = write_export(&path, "inhalt\n") else {
+            return Err(TestError::Unexpected(
+                "Traversal muss abgelehnt werden: Err erwartet".into(),
+            ));
+        };
         assert!(matches!(err, ExportError::PathRejected(_)));
+        Ok(())
     }
 
     // -----------------------------------------------------------------
@@ -1927,7 +1991,7 @@ mod tests {
     /// einem eigenen ```text-Block mit erhaltenen Zeilenumbrüchen; der
     /// json-Block enthält den großen String nicht mehr.
     #[test]
-    fn test_render_json_block_extracts_multiline_string_into_text_block() {
+    fn test_render_json_block_extracts_multiline_string_into_text_block() -> TestResult {
         let entries = vec![ExportEntry::ToolResult {
             call_id: "call-10".to_owned(),
             tool_name: Some("demo".to_owned()),
@@ -1941,14 +2005,17 @@ mod tests {
         let out = render_markdown(&meta_minimal(), &entries, &ExportOptions::default());
         assert!(out.contains("  - Text (value):\n\n```text\nZeile 1\nZeile 2\nZeile 3"));
 
-        let json_start = out.find("```json\n").expect("json-Block fehlt");
+        let json_start = out
+            .find("```json\n")
+            .ok_or(TestError::Missing("json-Block"))?;
         let json_end = out[json_start..]
             .find("\n```\n")
             .map(|offset| json_start + offset)
-            .expect("json-Block-Ende fehlt");
+            .ok_or(TestError::Missing("json-Block-Ende"))?;
         let json_block = &out[json_start..json_end];
         assert!(!json_block.contains("Zeile 1"));
         assert!(json_block.contains("\"status\""));
+        Ok(())
     }
 
     /// Jeder Block wird unabhängig über `max_chars_per_entry` gekappt, schneidet
@@ -2022,7 +2089,7 @@ mod tests {
     /// ToolCall und ToolResult nach einer Nutzernachricht schalten auf die
     /// `## harw`-Überschrift um, statt unter `## Du` zu bleiben.
     #[test]
-    fn test_tool_entries_after_user_message_switch_to_harw_section() {
+    fn test_tool_entries_after_user_message_switch_to_harw_section() -> TestResult {
         let entries = vec![
             ExportEntry::User("Frage".to_owned()),
             ExportEntry::ToolCall {
@@ -2046,19 +2113,27 @@ mod tests {
         ];
         let out = render_markdown(&meta_minimal(), &entries, &ExportOptions::default());
 
-        let du_pos = out.find("## Du\n\n").expect("Du-Überschrift fehlt");
-        let harw_pos = out.find("## harw\n\n").expect("harw-Überschrift fehlt");
-        let tool_call_pos = out.find("ToolCall").expect("ToolCall fehlt");
-        assert!(du_pos < harw_pos, "Frage muss vor der harw-Überschrift stehen");
+        let du_pos = out
+            .find("## Du\n\n")
+            .ok_or(TestError::Missing("Du-Überschrift"))?;
+        let harw_pos = out
+            .find("## harw\n\n")
+            .ok_or(TestError::Missing("harw-Überschrift"))?;
+        let tool_call_pos = out.find("ToolCall").ok_or(TestError::Missing("ToolCall"))?;
+        assert!(
+            du_pos < harw_pos,
+            "Frage muss vor der harw-Überschrift stehen"
+        );
         assert!(harw_pos < tool_call_pos, "ToolCall muss unter harw stehen");
         // ToolCall und ToolResult teilen sich dieselbe Überschrift.
         assert_eq!(out.matches("## harw\n\n").count(), 1);
+        Ok(())
     }
 
     /// Ein Reasoning-Eintrag nach einer Nutzernachricht schaltet ebenfalls auf
     /// `## harw` um.
     #[test]
-    fn test_reasoning_entry_after_user_message_switches_to_harw_section() {
+    fn test_reasoning_entry_after_user_message_switches_to_harw_section() -> TestResult {
         let entries = vec![
             ExportEntry::User("Frage".to_owned()),
             ExportEntry::Reasoning("weil X gilt".to_owned()),
@@ -2069,11 +2144,18 @@ mod tests {
         };
         let out = render_markdown(&meta_minimal(), &entries, &opts);
 
-        let du_pos = out.find("## Du").expect("Du-Überschrift fehlt");
-        let harw_pos = out.find("## harw").expect("harw-Überschrift fehlt");
-        let reasoning_pos = out.find("weil X gilt").expect("Reasoning-Text fehlt");
+        let du_pos = out
+            .find("## Du")
+            .ok_or(TestError::Missing("Du-Überschrift"))?;
+        let harw_pos = out
+            .find("## harw")
+            .ok_or(TestError::Missing("harw-Überschrift"))?;
+        let reasoning_pos = out
+            .find("weil X gilt")
+            .ok_or(TestError::Missing("Reasoning-Text"))?;
         assert!(du_pos < harw_pos);
         assert!(harw_pos < reasoning_pos);
+        Ok(())
     }
 
     // -----------------------------------------------------------------

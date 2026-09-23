@@ -202,9 +202,7 @@ fn build_event(
         .as_ref()
         .and_then(|advisory| advisory.severity.as_deref());
 
-    let raw = format!(
-        "cargo-audit {id} {package}@{version}: {title} -- {description}",
-    );
+    let raw = format!("cargo-audit {id} {package}@{version}: {title} -- {description}",);
 
     SecurityEvent {
         sensor: sensor.clone(),
@@ -220,13 +218,14 @@ fn build_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn sensor_id() -> SensorId {
         SensorId::from_str("scanreport-0")
     }
 
     #[test]
-    fn test_to_events_maps_one_event_per_vulnerability() {
+    fn test_to_events_maps_one_event_per_vulnerability() -> TestResult {
         let json = r#"{
             "vulnerabilities": {
                 "found": true,
@@ -244,27 +243,30 @@ mod tests {
             }
         }"#;
         let document: CargoAuditDocument =
-            serde_json::from_str(json).expect("valides cargo-audit-Fixture");
+            serde_json::from_str(json).map_err(ctx("valides cargo-audit-Fixture"))?;
         let events = to_events(&document, &sensor_id(), Timestamp::UNIX_EPOCH);
         assert_eq!(events.len(), 2);
+        Ok(())
     }
 
     #[test]
-    fn test_to_events_no_vulnerabilities_yields_no_events() {
+    fn test_to_events_no_vulnerabilities_yields_no_events() -> TestResult {
         let json = r#"{"vulnerabilities": {"found": false, "count": 0, "list": []}}"#;
         let document: CargoAuditDocument =
-            serde_json::from_str(json).expect("valides cargo-audit-Fixture");
+            serde_json::from_str(json).map_err(ctx("valides cargo-audit-Fixture"))?;
         let events = to_events(&document, &sensor_id(), Timestamp::UNIX_EPOCH);
         assert!(events.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_to_events_missing_vulnerabilities_block_defaults_to_empty() {
+    fn test_to_events_missing_vulnerabilities_block_defaults_to_empty() -> TestResult {
         let json = r#"{}"#;
         let document: CargoAuditDocument =
-            serde_json::from_str(json).expect("leeres Dokument ist noch valide");
+            serde_json::from_str(json).map_err(ctx("leeres Dokument ist noch valide"))?;
         let events = to_events(&document, &sensor_id(), Timestamp::UNIX_EPOCH);
         assert!(events.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -292,35 +294,37 @@ mod tests {
     }
 
     #[test]
-    fn test_build_event_includes_advisory_id_package_and_version() {
+    fn test_build_event_includes_advisory_id_package_and_version() -> TestResult {
         let json = r#"{
             "advisory": {"id": "RUSTSEC-2021-0001", "title": "Beispiel", "description": "Details", "severity": "high"},
             "package": {"name": "example-crate", "version": "0.1.0"}
         }"#;
         let vulnerability: CargoAuditVulnerability =
-            serde_json::from_str(json).expect("valides Treffer-Fixture");
+            serde_json::from_str(json).map_err(ctx("valides Treffer-Fixture"))?;
         let event = build_event(&vulnerability, &sensor_id(), Timestamp::UNIX_EPOCH);
         let harw_dod_signals::EventKind::StructureDrift { severity, detail } = event.kind else {
-            panic!("erwartete StructureDrift");
+            return Err(TestError::Unexpected("erwartete StructureDrift".into()));
         };
         assert_eq!(severity, DriftSeverity::High);
         assert!(detail.contains("RUSTSEC-2021-0001"));
         assert!(detail.contains("example-crate"));
         assert!(detail.contains("0.1.0"));
+        Ok(())
     }
 
     #[test]
-    fn test_build_event_falls_back_on_missing_advisory_and_package() {
+    fn test_build_event_falls_back_on_missing_advisory_and_package() -> TestResult {
         let vulnerability = CargoAuditVulnerability {
             advisory: None,
             package: None,
         };
         let event = build_event(&vulnerability, &sensor_id(), Timestamp::UNIX_EPOCH);
         let harw_dod_signals::EventKind::StructureDrift { severity, detail } = event.kind else {
-            panic!("erwartete StructureDrift");
+            return Err(TestError::Unexpected("erwartete StructureDrift".into()));
         };
         assert_eq!(severity, DriftSeverity::Unknown);
         assert!(detail.contains("<ohne ID>"));
         assert!(detail.contains("<unbekanntes Paket>"));
+        Ok(())
     }
 }

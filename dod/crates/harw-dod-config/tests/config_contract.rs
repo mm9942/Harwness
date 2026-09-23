@@ -1,3 +1,6 @@
+mod common;
+
+use common::{TestError, TestResult, ctx};
 use harw_dod_config::{Config, ConfigError, ObservationScope, SYSTEM_CONFIG_PATH, Sensor};
 
 const CGROUP_PROFILE: &str = r#"
@@ -14,11 +17,11 @@ egress_allow_cidrs = ["192.0.2.0/24", "2001:db8::/32"]
 "#;
 
 #[test]
-fn resolves_an_explicit_named_multi_cgroup_profile() {
+fn resolves_an_explicit_named_multi_cgroup_profile() -> TestResult {
     let profile = Config::from_toml(CGROUP_PROFILE)
-        .expect("valid config")
+        .map_err(ctx("valid config"))?
         .resolve_active()
-        .expect("selected profile resolves");
+        .map_err(ctx("selected profile resolves"))?;
 
     assert_eq!(profile.profile_id().as_str(), "selected-services");
     assert_eq!(profile.sensors(), &[Sensor::Exec, Sensor::TcpConnect]);
@@ -26,10 +29,11 @@ fn resolves_an_explicit_named_multi_cgroup_profile() {
     assert!(
         matches!(profile.scope(), ObservationScope::Cgroups(scope) if scope.include_descendants())
     );
+    Ok(())
 }
 
 #[test]
-fn canonicalizes_set_valued_profile_fields_before_resolution() {
+fn canonicalizes_set_valued_profile_fields_before_resolution() -> TestResult {
     let config = Config::from_toml(
         r#"
 schema_version = 1
@@ -44,16 +48,19 @@ sensors = ["tcp-connect", "exec"]
 egress_allow_cidrs = ["2001:db8::/32", "192.0.2.0/24"]
 "#,
     )
-    .expect("valid config");
-    let profile = config.resolve_active().expect("selected profile resolves");
+    .map_err(ctx("valid config"))?;
+    let profile = config
+        .resolve_active()
+        .map_err(ctx("selected profile resolves"))?;
 
     assert_eq!(profile.sensors(), &[Sensor::Exec, Sensor::TcpConnect]);
     assert_eq!(profile.egress_allow_cidrs()[0].to_string(), "192.0.2.0/24");
     let ObservationScope::Cgroups(scope) = profile.scope() else {
-        panic!("expected cgroup scope");
+        return Err(TestError::Unexpected("expected cgroup scope".to_owned()));
     };
     assert_eq!(scope.paths()[0].as_path().to_str(), Some("/a"));
     assert_eq!(scope.paths()[1].as_path().to_str(), Some("/z"));
+    Ok(())
 }
 
 #[test]
@@ -78,7 +85,7 @@ egress_allow_cidrs = []
 }
 
 #[test]
-fn no_active_profile_never_falls_back_to_host() {
+fn no_active_profile_never_falls_back_to_host() -> TestResult {
     let config = Config::from_toml(
         r#"
 schema_version = 1
@@ -90,16 +97,17 @@ sensors = ["exec"]
 egress_allow_cidrs = []
 "#,
     )
-    .expect("config syntax is valid");
+    .map_err(ctx("config syntax is valid"))?;
 
     assert!(matches!(
         config.resolve_active(),
         Err(ConfigError::MissingActiveProfile)
     ));
+    Ok(())
 }
 
 #[test]
-fn rejects_an_unknown_active_profile() {
+fn rejects_an_unknown_active_profile() -> TestResult {
     let config = Config::from_toml(
         r#"
 schema_version = 1
@@ -112,12 +120,13 @@ sensors = ["exec"]
 egress_allow_cidrs = []
 "#,
     )
-    .expect("config syntax is valid");
+    .map_err(ctx("config syntax is valid"))?;
 
     assert!(matches!(
         config.resolve_active(),
         Err(ConfigError::UnknownActiveProfile { .. })
     ));
+    Ok(())
 }
 
 #[test]

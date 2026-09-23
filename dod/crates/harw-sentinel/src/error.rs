@@ -66,6 +66,15 @@ pub enum SentinelBinError {
     ///   Nutzungsmeldung; sie wird unverändert durchgereicht.
     #[from]
     Cli(clap::Error),
+
+    /// Das Unterkommando `completions` ist fehlgeschlagen.
+    ///
+    /// # Arguments
+    /// - `0` (`harw_completions::CompletionError`): die zugrunde liegende
+    ///   Ursache (Shell nicht erkennbar, fremde Zieldatei, I/O-Fehler).
+    #[msg("shell completions failed: {0}")]
+    #[from]
+    Completions(harw_completions::CompletionError),
 }
 
 #[cfg(test)]

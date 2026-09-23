@@ -611,6 +611,7 @@ pub fn resolve_organization(
 mod tests {
     use super::*;
     use crate::layers::DefinitionLayer;
+    use crate::test_support::{TestResult, ctx};
 
     // Hilfsfunktion: minimale TOML-Org ohne Clans/Cells
     fn minimal_org_toml(id: &str, name: &str) -> String {
@@ -628,8 +629,8 @@ family = {{ id = "harwness.family.focused-coding@1" }}
         )
     }
 
-    fn parse_org(toml_str: &str) -> RawOrganizationDefinition {
-        toml::from_str(toml_str).expect("TOML-Parsing fehlgeschlagen")
+    fn parse_org(toml_str: &str) -> TestResult<RawOrganizationDefinition> {
+        toml::from_str(toml_str).map_err(ctx("TOML-Parsing fehlgeschlagen"))
     }
 
     fn now() -> OffsetDateTime {
@@ -638,20 +639,21 @@ family = {{ id = "harwness.family.focused-coding@1" }}
 
     // Test 1: minimale TOML-Org → Serde-Roundtrip
     #[test]
-    fn raw_org_serde_roundtrip_minimal() {
+    fn raw_org_serde_roundtrip_minimal() -> TestResult {
         let toml_str = minimal_org_toml("harwness.organization.sw@1", "SW Org");
-        let raw: RawOrganizationDefinition = toml::from_str(&toml_str).unwrap();
+        let raw: RawOrganizationDefinition = toml::from_str(&toml_str)?;
         assert_eq!(raw.schema, "harwness.organization/v1");
         assert_eq!(raw.id.name, "sw");
         assert_eq!(raw.name, "SW Org");
         assert!(raw.clans.is_empty());
         assert!(raw.cells.is_empty());
         assert!(raw.extends.is_none());
+        Ok(())
     }
 
     // Test 2: vollständiges TOML-Beispiel mit root + 2 clans + 1 cell
     #[test]
-    fn raw_org_serde_full_example() {
+    fn raw_org_serde_full_example() -> TestResult {
         let toml_str = r#"
 schema = "harwness.organization/v1"
 id = "harwness.organization.software-project@1"
@@ -684,67 +686,71 @@ barrier = "all-terminal"
 write_partition = "required"
 members_from_plan = "implementation/providers/*"
 "#;
-        let raw: RawOrganizationDefinition = toml::from_str(toml_str).unwrap();
+        let raw: RawOrganizationDefinition = toml::from_str(toml_str)?;
         assert_eq!(raw.clans.len(), 2);
         assert_eq!(raw.cells.len(), 1);
         assert_eq!(raw.clans[0].id, "research");
         assert_eq!(raw.clans[1].id, "implementation");
         assert_eq!(raw.cells[0].clan, "implementation");
+        Ok(())
     }
 
     // Test 3: CellKind::Fanout → snake_case "fanout"
     #[test]
-    fn cell_kind_serde_snake_case() {
+    fn cell_kind_serde_snake_case() -> TestResult {
         let kind = CellKind::Fanout;
-        let json = serde_json::to_string(&kind).unwrap();
+        let json = serde_json::to_string(&kind)?;
         assert_eq!(json, "\"fanout\"");
-        let back: CellKind = serde_json::from_str(&json).unwrap();
+        let back: CellKind = serde_json::from_str(&json)?;
         assert_eq!(back, CellKind::Fanout);
 
         let barrier = CellKind::Barrier;
-        let json2 = serde_json::to_string(&barrier).unwrap();
+        let json2 = serde_json::to_string(&barrier)?;
         assert_eq!(json2, "\"barrier\"");
 
         let seq = CellKind::Sequential;
-        let json3 = serde_json::to_string(&seq).unwrap();
+        let json3 = serde_json::to_string(&seq)?;
         assert_eq!(json3, "\"sequential\"");
+        Ok(())
     }
 
     // Test 4: CellBarrier::AllTerminal → kebab-case "all-terminal"
     #[test]
-    fn cell_barrier_serde_kebab_case() {
+    fn cell_barrier_serde_kebab_case() -> TestResult {
         let barrier = CellBarrier::AllTerminal;
-        let json = serde_json::to_string(&barrier).unwrap();
+        let json = serde_json::to_string(&barrier)?;
         assert_eq!(json, "\"all-terminal\"");
-        let back: CellBarrier = serde_json::from_str(&json).unwrap();
+        let back: CellBarrier = serde_json::from_str(&json)?;
         assert_eq!(back, CellBarrier::AllTerminal);
 
         let any = CellBarrier::AnyTerminal;
-        let json2 = serde_json::to_string(&any).unwrap();
+        let json2 = serde_json::to_string(&any)?;
         assert_eq!(json2, "\"any-terminal\"");
 
         let explicit = CellBarrier::ExplicitJoin;
-        let json3 = serde_json::to_string(&explicit).unwrap();
+        let json3 = serde_json::to_string(&explicit)?;
         assert_eq!(json3, "\"explicit-join\"");
+        Ok(())
     }
 
     // Test 5: CellWritePartition::None deserialisiert korrekt
     #[test]
-    fn cell_write_partition_default_none_deserializes() {
+    fn cell_write_partition_default_none_deserializes() -> TestResult {
         let json = "\"none\"";
-        let wp: CellWritePartition = serde_json::from_str(json).unwrap();
+        let wp: CellWritePartition = serde_json::from_str(json)?;
         assert_eq!(wp, CellWritePartition::None);
 
-        let req: CellWritePartition = serde_json::from_str("\"required\"").unwrap();
+        let req: CellWritePartition = serde_json::from_str("\"required\"")?;
         assert_eq!(req, CellWritePartition::Required);
 
-        let adv: CellWritePartition = serde_json::from_str("\"advisory\"").unwrap();
+        let adv: CellWritePartition = serde_json::from_str("\"advisory\"")?;
         assert_eq!(adv, CellWritePartition::Advisory);
+        Ok(())
     }
 
     // Test 6: TOML ohne child_depth_cost → Standard 1
     #[test]
-    fn default_child_depth_cost_is_1() {
+    fn default_child_depth_cost_is_1() -> TestResult {
         let toml_str = r#"
 id = "research"
 name = "Research Clan"
@@ -752,13 +758,14 @@ leader = { id = "harwness.agent.focused-coding-orchestrator@1" }
 family = { id = "harwness.family.focused-coding@1" }
 plan_scope = "research/*"
 "#;
-        let clan: RawClanSpec = toml::from_str(toml_str).unwrap();
+        let clan: RawClanSpec = toml::from_str(toml_str)?;
         assert_eq!(clan.child_depth_cost, 1);
+        Ok(())
     }
 
     // Test 7: extends verweist auf unbekannte ID → DslError::MissingBase
     #[test]
-    fn resolve_missing_base_errors() {
+    fn resolve_missing_base_errors() -> TestResult {
         let toml_str = r#"
 schema = "harwness.organization/v1"
 id = "mia.organization.derived@1"
@@ -770,8 +777,8 @@ extends = { id = "harwness.organization.nonexistent@1" }
 agent = { id = "harwness.agent.focused-coding-orchestrator@1" }
 family = { id = "harwness.family.focused-coding@1" }
 "#;
-        let raw: RawOrganizationDefinition = toml::from_str(toml_str).unwrap();
-        let id = DefinitionId::parse("mia.organization.derived@1").unwrap();
+        let raw: RawOrganizationDefinition = toml::from_str(toml_str)?;
+        let id = DefinitionId::parse("mia.organization.derived@1")?;
         let layers = vec![(DefinitionLayer::BuiltIn, raw)];
         let result = resolve_organization(&id, &layers, now());
         assert!(
@@ -779,11 +786,12 @@ family = { id = "harwness.family.focused-coding@1" }
             "Erwartet MissingBase, got: {:?}",
             result
         );
+        Ok(())
     }
 
     // Test 8: Zwei Clans mit gleicher id → DslError::Parse
     #[test]
-    fn resolve_duplicate_clan_id_errors() {
+    fn resolve_duplicate_clan_id_errors() -> TestResult {
         let toml_str = r#"
 schema = "harwness.organization/v1"
 id = "harwness.organization.dup@1"
@@ -808,8 +816,8 @@ leader = { id = "harwness.agent.focused-coding-orchestrator@1" }
 family = { id = "harwness.family.focused-coding@1" }
 plan_scope = "research/*"
 "#;
-        let raw: RawOrganizationDefinition = toml::from_str(toml_str).unwrap();
-        let id = DefinitionId::parse("harwness.organization.dup@1").unwrap();
+        let raw: RawOrganizationDefinition = toml::from_str(toml_str)?;
+        let id = DefinitionId::parse("harwness.organization.dup@1")?;
         let layers = vec![(DefinitionLayer::BuiltIn, raw)];
         let result = resolve_organization(&id, &layers, now());
         assert!(
@@ -817,11 +825,12 @@ plan_scope = "research/*"
             "Erwartet Parse-Fehler bei doppelter clan.id, got: {:?}",
             result
         );
+        Ok(())
     }
 
     // Test 9: cell.clan zeigt auf nicht vorhandenen Clan → DslError::MissingBase
     #[test]
-    fn resolve_cell_refs_unknown_clan_errors() {
+    fn resolve_cell_refs_unknown_clan_errors() -> TestResult {
         let toml_str = r#"
 schema = "harwness.organization/v1"
 id = "harwness.organization.badcell@1"
@@ -847,8 +856,8 @@ barrier = "all-terminal"
 write_partition = "required"
 members_from_plan = "impl/*"
 "#;
-        let raw: RawOrganizationDefinition = toml::from_str(toml_str).unwrap();
-        let id = DefinitionId::parse("harwness.organization.badcell@1").unwrap();
+        let raw: RawOrganizationDefinition = toml::from_str(toml_str)?;
+        let id = DefinitionId::parse("harwness.organization.badcell@1")?;
         let layers = vec![(DefinitionLayer::BuiltIn, raw)];
         let result = resolve_organization(&id, &layers, now());
         assert!(
@@ -856,11 +865,12 @@ members_from_plan = "impl/*"
             "Erwartet MissingBase für unbekannten Clan, got: {:?}",
             result
         );
+        Ok(())
     }
 
     // Test 10: Base hat 1 Clan, Patch fügt 2 hinzu → Ergebnis 3
     #[test]
-    fn resolve_appends_clans_via_patch() {
+    fn resolve_appends_clans_via_patch() -> TestResult {
         let base_toml = r#"
 schema = "harwness.organization/v1"
 id = "harwness.organization.base@1"
@@ -897,15 +907,15 @@ append = [
 ]
 "#;
 
-        let base_def: RawOrganizationDefinition = toml::from_str(base_toml).unwrap();
-        let derived_def: RawOrganizationDefinition = toml::from_str(derived_toml).unwrap();
+        let base_def: RawOrganizationDefinition = toml::from_str(base_toml)?;
+        let derived_def: RawOrganizationDefinition = toml::from_str(derived_toml)?;
 
-        let id = DefinitionId::parse("mia.organization.derived@1").unwrap();
+        let id = DefinitionId::parse("mia.organization.derived@1")?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base_def),
             (DefinitionLayer::UserGlobal, derived_def),
         ];
-        let resolved = resolve_organization(&id, &layers, now()).unwrap();
+        let resolved = resolve_organization(&id, &layers, now())?;
         assert_eq!(
             resolved.clans.len(),
             3,
@@ -915,11 +925,12 @@ append = [
         assert_eq!(resolved.clans[0].id, "research");
         assert_eq!(resolved.clans[1].id, "memory");
         assert_eq!(resolved.clans[2].id, "agent-runtime");
+        Ok(())
     }
 
     // Test 11: patch.cells.append fügt Cells hinzu
     #[test]
-    fn resolve_appends_cells_via_patch() {
+    fn resolve_appends_cells_via_patch() -> TestResult {
         let base_toml = r#"
 schema = "harwness.organization/v1"
 id = "harwness.organization.base2@1"
@@ -956,25 +967,26 @@ append = [
 ]
 "#;
 
-        let base_def: RawOrganizationDefinition = toml::from_str(base_toml).unwrap();
-        let derived_def: RawOrganizationDefinition = toml::from_str(derived_toml).unwrap();
+        let base_def: RawOrganizationDefinition = toml::from_str(base_toml)?;
+        let derived_def: RawOrganizationDefinition = toml::from_str(derived_toml)?;
 
-        let id = DefinitionId::parse("mia.organization.derived2@1").unwrap();
+        let id = DefinitionId::parse("mia.organization.derived2@1")?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base_def),
             (DefinitionLayer::UserGlobal, derived_def),
         ];
-        let resolved = resolve_organization(&id, &layers, now()).unwrap();
+        let resolved = resolve_organization(&id, &layers, now())?;
         assert_eq!(resolved.cells.len(), 2);
         assert_eq!(resolved.cells[0].id, "provider-adapters");
         assert_eq!(resolved.cells[1].id, "api-layer");
         assert_eq!(resolved.cells[0].kind, CellKind::Fanout);
         assert_eq!(resolved.cells[1].kind, CellKind::Sequential);
+        Ok(())
     }
 
     // Test 12: 2 Layer → mind. 2 Trace-Steps
     #[test]
-    fn resolve_trace_contains_multi_layer_steps() {
+    fn resolve_trace_contains_multi_layer_steps() -> TestResult {
         let base_toml = minimal_org_toml("harwness.organization.trace-base@1", "Trace Base");
         let derived_toml = r#"
 schema = "harwness.organization/v1"
@@ -987,15 +999,15 @@ extends = { id = "harwness.organization.trace-base@1" }
 agent = { id = "harwness.agent.focused-coding-orchestrator@1" }
 family = { id = "harwness.family.focused-coding@1" }
 "#;
-        let base_def = parse_org(&base_toml);
-        let derived_def: RawOrganizationDefinition = toml::from_str(derived_toml).unwrap();
+        let base_def = parse_org(&base_toml)?;
+        let derived_def: RawOrganizationDefinition = toml::from_str(derived_toml)?;
 
-        let id = DefinitionId::parse("mia.organization.trace-derived@1").unwrap();
+        let id = DefinitionId::parse("mia.organization.trace-derived@1")?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base_def),
             (DefinitionLayer::Workspace, derived_def),
         ];
-        let resolved = resolve_organization(&id, &layers, now()).unwrap();
+        let resolved = resolve_organization(&id, &layers, now())?;
         assert!(
             resolved.trace.steps.len() >= 2,
             "Erwartet mind. 2 Trace-Schritte, got {}",
@@ -1003,5 +1015,6 @@ family = { id = "harwness.family.focused-coding@1" }
         );
         assert_eq!(resolved.trace.steps[0].kind, "base");
         assert_eq!(resolved.trace.steps[1].kind, "overlay");
+        Ok(())
     }
 }

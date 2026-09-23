@@ -128,20 +128,23 @@ fn secret_matches(provided: &HeaderValue, expected: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use axum::body::Body;
     use axum::http::Request;
     use harw_channel::InboundEvent;
 
-    fn config(sender: SyncSender<InboundEvent>) -> WebhookConfig {
-        WebhookConfig::new(
-            "127.0.0.1:0".parse().expect("test address is valid"),
+    fn config(sender: SyncSender<InboundEvent>) -> TestResult<WebhookConfig> {
+        Ok(WebhookConfig::new(
+            "127.0.0.1:0"
+                .parse()
+                .map_err(ctx("test address is valid"))?,
             "/telegram",
             "correct-secret",
             "telegram:support",
             700,
             Some("harwbot".to_owned()),
             sender,
-        )
+        ))
     }
 
     fn update_body() -> &'static str {
@@ -152,75 +155,83 @@ mod tests {
         webhook_handler(State(config), request).await.status()
     }
 
-    fn request(secret: Option<&str>, body: &'static str) -> Request<Body> {
+    fn request(secret: Option<&str>, body: &'static str) -> TestResult<Request<Body>> {
         let mut request = Request::builder()
             .uri("/telegram")
             .body(Body::from(body))
-            .expect("request");
+            .map_err(ctx("request"))?;
         if let Some(secret) = secret {
             request.headers_mut().insert(
                 SECRET_HEADER,
-                HeaderValue::from_str(secret).expect("test secret is valid"),
+                HeaderValue::from_str(secret).map_err(ctx("test secret is valid"))?,
             );
         }
-        request
+        Ok(request)
     }
 
     #[tokio::test]
-    async fn missing_secret_returns_401_before_body_parse() {
+    async fn missing_secret_returns_401_before_body_parse() -> TestResult {
         let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
         assert_eq!(
-            call(config(sender), request(None, "not json")).await,
+            call(config(sender)?, request(None, "not json")?).await,
             StatusCode::UNAUTHORIZED
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn valid_update_maps_and_forwards() {
+    async fn valid_update_maps_and_forwards() -> TestResult {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         assert_eq!(
             call(
-                config(sender),
-                request(Some("correct-secret"), update_body())
+                config(sender)?,
+                request(Some("correct-secret"), update_body())?
             )
             .await,
             StatusCode::NO_CONTENT
         );
-        let event = receiver.try_recv().expect("mapped event forwarded");
+        let event = receiver.try_recv().map_err(ctx("mapped event forwarded"))?;
         assert_eq!(event.channel.as_str(), "telegram:support");
         assert_eq!(event.peer.as_str(), "123");
         assert_eq!(event.text.as_deref(), Some("hello"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn malformed_body_is_rejected_without_forwarding() {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        assert_eq!(
-            call(config(sender), request(Some("correct-secret"), "not json")).await,
-            StatusCode::BAD_REQUEST
-        );
-        assert!(receiver.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn unsupported_update_is_accepted_without_forwarding() {
+    async fn malformed_body_is_rejected_without_forwarding() -> TestResult {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         assert_eq!(
             call(
-                config(sender),
+                config(sender)?,
+                request(Some("correct-secret"), "not json")?
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(receiver.try_recv().is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unsupported_update_is_accepted_without_forwarding() -> TestResult {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        assert_eq!(
+            call(
+                config(sender)?,
                 request(
                     Some("correct-secret"),
                     r#"{"update_id":43,"callback_query":{"id":"query","from":{"id":8,"is_bot":false,"first_name":"Mia"}}}"#,
-                ),
+                )?,
             )
             .await,
             StatusCode::NO_CONTENT
         );
         assert!(receiver.try_recv().is_err());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn full_sink_returns_service_unavailable_without_blocking() {
+    async fn full_sink_returns_service_unavailable_without_blocking() -> TestResult {
         let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
         sender
             .try_send(InboundEvent {
@@ -234,24 +245,30 @@ mod tests {
                 raw_event_id: None,
                 received_at: jiff::Timestamp::now(),
             })
-            .expect("fill bounded test sink");
+            .map_err(ctx("fill bounded test sink"))?;
         assert_eq!(
             call(
-                config(sender),
-                request(Some("correct-secret"), update_body())
+                config(sender)?,
+                request(Some("correct-secret"), update_body())?
             )
             .await,
             StatusCode::SERVICE_UNAVAILABLE
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn invalid_secret_never_reaches_mapping() {
+    async fn invalid_secret_never_reaches_mapping() -> TestResult {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         assert_eq!(
-            call(config(sender), request(Some("wrong-secret"), update_body())).await,
+            call(
+                config(sender)?,
+                request(Some("wrong-secret"), update_body())?
+            )
+            .await,
             StatusCode::UNAUTHORIZED
         );
         assert!(receiver.try_recv().is_err());
+        Ok(())
     }
 }

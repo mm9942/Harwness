@@ -24,6 +24,8 @@ harw-dod-warden-proto = { path = "../harw-dod-warden-proto" }
 harw-types = { path = "../../../harw-types" }
 # `#[derive(harw_macros::HarwError)]` für `src/error.rs` und `src/ipc.rs`.
 harw-macros = { path = "../../../harw-macros" }
+# `harw-warden completions <shell> [--install|--uninstall]`.
+harw-completions = { path = "../../../harw-completions", features = ["clap-args"] }
 # Wire-Kodierung des eigenen Umschlags (`src/protocol.rs`) und von
 # `WardenResponse`. Bereits transitiv durch die obige Kette vorhanden
 # (`harw-dod-warden-proto` hängt selbst von `serde`/`serde_json` ab) — kein

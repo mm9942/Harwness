@@ -153,7 +153,9 @@ impl RelayConfig {
         let mut args = args.into_iter();
         let port_arg = args.next().ok_or_else(|| usage("<tcp-port> fehlt"))?;
         let port = parse_port(&port_arg)?;
-        let socket_arg = args.next().ok_or_else(|| usage("<unix-socket-path> fehlt"))?;
+        let socket_arg = args
+            .next()
+            .ok_or_else(|| usage("<unix-socket-path> fehlt"))?;
         if socket_arg.is_empty() || socket_arg == "--" {
             return Err(usage("<unix-socket-path> fehlt oder ist leer"));
         }
@@ -164,19 +166,28 @@ impl RelayConfig {
                 if program.is_empty() {
                     return Err(usage("<cmd> nach `--` ist leer"));
                 }
-                Some(ChildCommand { program, args: args.collect() })
+                Some(ChildCommand {
+                    program,
+                    args: args.collect(),
+                })
             }
             Some(_) => {
                 return Err(usage("unerwartetes Argument; Kindprozess nur nach `--`"));
             }
         };
-        Ok(Self { port, proxy_socket: PathBuf::from(socket_arg), command })
+        Ok(Self {
+            port,
+            proxy_socket: PathBuf::from(socket_arg),
+            command,
+        })
     }
 }
 
 // Port-Argument: Dezimalzahl 1..=65535.
 fn parse_port(raw: &OsStr) -> Result<u16, RelayError> {
-    let text = raw.to_str().ok_or_else(|| usage("<tcp-port> ist kein UTF-8"))?;
+    let text = raw
+        .to_str()
+        .ok_or_else(|| usage("<tcp-port> ist kein UTF-8"))?;
     if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
         return Err(usage("<tcp-port> muss eine Dezimalzahl sein"));
     }
@@ -187,7 +198,9 @@ fn parse_port(raw: &OsStr) -> Result<u16, RelayError> {
 }
 
 fn usage(reason: &str) -> RelayError {
-    RelayError::Usage { reason: reason.to_owned() }
+    RelayError::Usage {
+        reason: reason.to_owned(),
+    }
 }
 
 /// Bindet den Relay-Listener auf `127.0.0.1:<port>`.
@@ -259,18 +272,22 @@ pub fn run_relay(
             }
         };
         let Some(slot) = ConnectionSlot::acquire(&active, max_connections) else {
-            report(&RelayError::ConnectionLimit { max: max_connections });
+            report(&RelayError::ConnectionLimit {
+                max: max_connections,
+            });
             drop(client);
             continue;
         };
         let socket = Arc::clone(&proxy_socket);
         let conn_report = Arc::clone(&report);
-        let spawned = thread::Builder::new().name("harw-relay-conn".to_owned()).spawn(move || {
-            let _slot = slot;
-            if let Err(err) = relay_connection(client, &socket) {
-                conn_report(&err);
-            }
-        });
+        let spawned = thread::Builder::new()
+            .name("harw-relay-conn".to_owned())
+            .spawn(move || {
+                let _slot = slot;
+                if let Err(err) = relay_connection(client, &socket) {
+                    conn_report(&err);
+                }
+            });
         if let Err(source) = spawned {
             report(&RelayError::Thread { source });
         }
@@ -290,12 +307,8 @@ impl ConnectionSlot {
             if current >= max {
                 return None;
             }
-            match active.compare_exchange(
-                current,
-                current + 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
+            match active.compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
                 Ok(_) => return Some(Self(Arc::clone(active))),
                 Err(observed) => current = observed,
             }
@@ -371,7 +384,10 @@ pub fn relay_connection(client: TcpStream, proxy_socket: &Path) -> Result<(), Re
     let mut client_write = client;
     let downstream = io::copy(&mut proxy_read, &mut client_write)
         .map(|_| ())
-        .map_err(|source| RelayError::Copy { direction: RelayDirection::ProxyToClient, source });
+        .map_err(|source| RelayError::Copy {
+            direction: RelayDirection::ProxyToClient,
+            source,
+        });
     half_close_tcp(&client_write);
 
     let upstream = upstream.join().map_err(|_| RelayError::ThreadPanicked)?;
@@ -421,8 +437,13 @@ pub fn run_child(command: &ChildCommand) -> Result<u8, RelayError> {
     let mut child = Command::new(&command.program)
         .args(&command.args)
         .spawn()
-        .map_err(|source| RelayError::Spawn { program: program.clone(), source })?;
-    let status = child.wait().map_err(|source| RelayError::Wait { program, source })?;
+        .map_err(|source| RelayError::Spawn {
+            program: program.clone(),
+            source,
+        })?;
+    let status = child
+        .wait()
+        .map_err(|source| RelayError::Wait { program, source })?;
     Ok(exit_code_from_status(status))
 }
 
@@ -577,10 +598,17 @@ impl fmt::Display for RelayError {
             Self::Bind { addr, source } => write!(f, "Bind auf {addr} fehlgeschlagen: {source}"),
             Self::Accept(source) => write!(f, "accept fehlgeschlagen: {source}"),
             Self::ConnectionLimit { max } => {
-                write!(f, "Verbindung verworfen: Limit von {max} gleichzeitigen Verbindungen")
+                write!(
+                    f,
+                    "Verbindung verworfen: Limit von {max} gleichzeitigen Verbindungen"
+                )
             }
             Self::ProxyConnect { path, source } => {
-                write!(f, "Egress-Proxy {} nicht erreichbar: {source}", path.display())
+                write!(
+                    f,
+                    "Egress-Proxy {} nicht erreichbar: {source}",
+                    path.display()
+                )
             }
             Self::Copy { direction, source } => {
                 write!(f, "Weiterleitung {direction} fehlgeschlagen: {source}")
@@ -591,7 +619,10 @@ impl fmt::Display for RelayError {
                 write!(f, "Kindprozess {program:?} nicht startbar: {source}")
             }
             Self::Wait { program, source } => {
-                write!(f, "Warten auf Kindprozess {program:?} fehlgeschlagen: {source}")
+                write!(
+                    f,
+                    "Warten auf Kindprozess {program:?} fehlgeschlagen: {source}"
+                )
             }
         }
     }
@@ -615,6 +646,7 @@ impl std::error::Error for RelayError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
     use std::sync::mpsc;
@@ -625,15 +657,17 @@ mod tests {
     }
 
     #[test]
-    fn test_from_args_forward_mode_without_separator() {
-        let cfg = RelayConfig::from_args(os(&["1080", "/run/egress.sock"])).expect("gültig");
+    fn test_from_args_forward_mode_without_separator() -> TestResult {
+        let cfg =
+            RelayConfig::from_args(os(&["1080", "/run/egress.sock"])).map_err(ctx("gültig"))?;
         assert_eq!(cfg.port, 1080);
         assert_eq!(cfg.proxy_socket, PathBuf::from("/run/egress.sock"));
         assert_eq!(cfg.command, None);
+        Ok(())
     }
 
     #[test]
-    fn test_from_args_child_mode_passes_argv_verbatim() {
+    fn test_from_args_child_mode_passes_argv_verbatim() -> TestResult {
         let cfg = RelayConfig::from_args(os(&[
             "4444",
             "/run/egress.sock",
@@ -643,10 +677,11 @@ mod tests {
             "a b",
             "$HOME",
         ]))
-        .expect("gültig");
-        let command = cfg.command.expect("Kindmodus");
+        .map_err(ctx("gültig"))?;
+        let command = cfg.command.ok_or(TestError::Missing("Kindmodus"))?;
         assert_eq!(command.program, OsString::from("geckodriver"));
         assert_eq!(command.args, os(&["--", "a b", "$HOME"]));
+        Ok(())
     }
 
     #[test]
@@ -666,7 +701,10 @@ mod tests {
         ];
         for args in cases {
             let result = RelayConfig::from_args(os(args));
-            assert!(matches!(result, Err(RelayError::Usage { .. })), "{args:?}: {result:?}");
+            assert!(
+                matches!(result, Err(RelayError::Usage { .. })),
+                "{args:?}: {result:?}"
+            );
         }
     }
 
@@ -679,65 +717,86 @@ mod tests {
     }
 
     #[test]
-    fn test_run_child_forwards_exit_code() {
+    fn test_run_child_forwards_exit_code() -> TestResult {
         // Laufzeitprüfung: ohne /bin/true bzw. /bin/false ist nichts prüfbar.
         let (true_bin, false_bin) = (Path::new("/bin/true"), Path::new("/bin/false"));
         if !true_bin.exists() || !false_bin.exists() {
             eprintln!("übersprungen: /bin/true oder /bin/false fehlt");
-            return;
+            return Ok(());
         }
-        let ok = ChildCommand { program: true_bin.into(), args: Vec::new() };
-        let fail = ChildCommand { program: false_bin.into(), args: Vec::new() };
-        assert_eq!(run_child(&ok).expect("startbar"), 0);
-        assert_eq!(run_child(&fail).expect("startbar"), 1);
+        let ok = ChildCommand {
+            program: true_bin.into(),
+            args: Vec::new(),
+        };
+        let fail = ChildCommand {
+            program: false_bin.into(),
+            args: Vec::new(),
+        };
+        assert_eq!(run_child(&ok).map_err(ctx("startbar"))?, 0);
+        assert_eq!(run_child(&fail).map_err(ctx("startbar"))?, 1);
+        Ok(())
     }
 
     #[test]
-    fn test_run_child_missing_program_maps_to_127() {
+    fn test_run_child_missing_program_maps_to_127() -> TestResult {
         let missing = ChildCommand {
             program: "/nonexistent/harw-relay-test-binary".into(),
             args: Vec::new(),
         };
-        let err = run_child(&missing).expect_err("existiert nicht");
+        let Err(err) = run_child(&missing) else {
+            return Err(TestError::Unexpected(
+                "existiert nicht: Err erwartet".into(),
+            ));
+        };
         assert!(matches!(err, RelayError::Spawn { .. }), "{err:?}");
         assert_eq!(err.exit_code(), EXIT_CHILD_NOT_FOUND);
+        Ok(())
     }
 
     #[test]
-    fn test_bind_relay_binds_loopback_only() {
-        let port = bind_relay_any_port().local_addr().expect("lokale Adresse").port();
-        let listener = bind_relay(port).expect("freier Port");
-        let addr = listener.local_addr().expect("lokale Adresse");
+    fn test_bind_relay_binds_loopback_only() -> TestResult {
+        let port = bind_relay_any_port()?
+            .local_addr()
+            .map_err(ctx("lokale Adresse"))?
+            .port();
+        let listener = bind_relay(port).map_err(ctx("freier Port"))?;
+        let addr = listener.local_addr().map_err(ctx("lokale Adresse"))?;
         assert_eq!(addr, SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
-        let err = bind_relay(port).expect_err("Port belegt");
+        let Err(err) = bind_relay(port) else {
+            return Err(TestError::Unexpected("Port belegt: Err erwartet".into()));
+        };
         assert!(matches!(err, RelayError::Bind { .. }), "{err:?}");
         assert_eq!(err.exit_code(), EXIT_BIND_FAILED);
+        Ok(())
     }
 
     // Ephemerer Loopback-Listener für Tests (fester Port wäre nicht parallel-sicher).
-    fn bind_relay_any_port() -> TcpListener {
-        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("ephemerer Loopback-Port")
+    fn bind_relay_any_port() -> TestResult<TcpListener> {
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(ctx("ephemerer Loopback-Port"))
     }
 
     // Unix-Socket-Gegenstelle: liest bis EOF und antwortet mit `pong:` + Daten.
-    fn fake_proxy(path: &Path) -> thread::JoinHandle<()> {
-        let listener = UnixListener::bind(path).expect("Unix-Socket binden");
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
+    fn fake_proxy(path: &Path) -> TestResult<thread::JoinHandle<TestResult>> {
+        let listener = UnixListener::bind(path).map_err(ctx("Unix-Socket binden"))?;
+        Ok(thread::spawn(move || {
+            let (mut stream, _) = listener.accept().map_err(ctx("accept"))?;
             let mut received = Vec::new();
-            stream.read_to_end(&mut received).expect("lesen bis EOF");
-            stream.write_all(b"pong:").expect("schreiben");
-            stream.write_all(&received).expect("schreiben");
-        })
+            stream
+                .read_to_end(&mut received)
+                .map_err(ctx("lesen bis EOF"))?;
+            stream.write_all(b"pong:").map_err(ctx("schreiben"))?;
+            stream.write_all(&received).map_err(ctx("schreiben"))?;
+            Ok(())
+        }))
     }
 
     #[test]
-    fn test_run_relay_forwards_with_half_close() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_run_relay_forwards_with_half_close() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let socket = dir.path().join("egress.sock");
-        let proxy = fake_proxy(&socket);
-        let listener = bind_relay_any_port();
-        let addr = listener.local_addr().expect("lokale Adresse");
+        let proxy = fake_proxy(&socket)?;
+        let listener = bind_relay_any_port()?;
+        let addr = listener.local_addr().map_err(ctx("lokale Adresse"))?;
         let (tx, rx) = mpsc::channel::<String>();
         let report: RelayReporter = Arc::new(move |err: &RelayError| {
             // Testkanal; ein geschlossener Empfänger ist hier bedeutungslos.
@@ -746,43 +805,61 @@ mod tests {
         let relay_socket = socket.clone();
         thread::spawn(move || run_relay(listener, &relay_socket, 4, report));
 
-        let mut client = TcpStream::connect(addr).expect("verbinden");
-        client.set_read_timeout(Some(Duration::from_secs(5))).expect("Timeout setzen");
-        client.write_all(b"ping").expect("schreiben");
-        client.shutdown(Shutdown::Write).expect("halb schließen");
+        let mut client = TcpStream::connect(addr).map_err(ctx("verbinden"))?;
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(ctx("Timeout setzen"))?;
+        client.write_all(b"ping").map_err(ctx("schreiben"))?;
+        client
+            .shutdown(Shutdown::Write)
+            .map_err(ctx("halb schließen"))?;
         let mut answer = Vec::new();
-        client.read_to_end(&mut answer).expect("lesen");
+        client.read_to_end(&mut answer).map_err(ctx("lesen"))?;
         assert_eq!(answer, b"pong:ping");
-        proxy.join().expect("Fake-Proxy");
-        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "kein Fehler erwartet");
+        proxy
+            .join()
+            .map_err(|_| TestError::Unexpected("Fake-Proxy: Thread panicked".into()))??;
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "kein Fehler erwartet"
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_relay_connection_missing_proxy_socket_is_error() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_relay_connection_missing_proxy_socket_is_error() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let socket = dir.path().join("missing.sock");
-        let listener = bind_relay_any_port();
-        let addr = listener.local_addr().expect("lokale Adresse");
-        let client = thread::spawn(move || {
-            let mut stream = TcpStream::connect(addr).expect("verbinden");
-            stream.set_read_timeout(Some(Duration::from_secs(5))).expect("Timeout setzen");
+        let listener = bind_relay_any_port()?;
+        let addr = listener.local_addr().map_err(ctx("lokale Adresse"))?;
+        let client = thread::spawn(move || -> TestResult<io::Result<usize>> {
+            let mut stream = TcpStream::connect(addr).map_err(ctx("verbinden"))?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .map_err(ctx("Timeout setzen"))?;
             let mut buf = Vec::new();
-            stream.read_to_end(&mut buf).map(|_| buf.len())
+            Ok(stream.read_to_end(&mut buf).map(|_| buf.len()))
         });
-        let (accepted, _) = listener.accept().expect("accept");
-        let err = relay_connection(accepted, &socket).expect_err("Socket fehlt");
+        let (accepted, _) = listener.accept().map_err(ctx("accept"))?;
+        let Err(err) = relay_connection(accepted, &socket) else {
+            return Err(TestError::Unexpected("Socket fehlt: Err erwartet".into()));
+        };
         assert!(matches!(err, RelayError::ProxyConnect { .. }), "{err:?}");
-        let read = client.join().expect("Client-Thread");
+        let read = client
+            .join()
+            .map_err(|_| TestError::Unexpected("Client-Thread: Thread panicked".into()))??;
         assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+        Ok(())
     }
 
     #[test]
-    fn test_connection_slot_enforces_limit() {
+    fn test_connection_slot_enforces_limit() -> TestResult {
         let active = Arc::new(AtomicUsize::new(0));
-        let first = ConnectionSlot::acquire(&active, 1).expect("frei");
+        let first = ConnectionSlot::acquire(&active, 1).ok_or(TestError::Missing("frei"))?;
         assert!(ConnectionSlot::acquire(&active, 1).is_none());
         drop(first);
         assert!(ConnectionSlot::acquire(&active, 1).is_some());
         assert_eq!(active.load(Ordering::SeqCst), 0);
+        Ok(())
     }
 }

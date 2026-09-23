@@ -1,8 +1,8 @@
 //! Capabilities — was eine Extension DARF.
 
+use harw_authority::SandboxSpec;
 use harw_catalog::AgentSuggestions;
 use harw_context::ContextCeiling;
-use harw_authority::SandboxSpec;
 use harw_types::{SessionId, ToolCallId};
 use jiff::Timestamp;
 use std::future::Future;
@@ -133,6 +133,7 @@ impl std::error::Error for AgentSpawnError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct LegacySpawner {
@@ -156,14 +157,15 @@ mod tests {
     }
 
     #[test]
-    fn legacy_spawner_default_child_completed_calls_child_finished() {
+    fn legacy_spawner_default_child_completed_calls_child_finished() -> TestResult {
         let spawner = LegacySpawner {
             finished: AtomicUsize::new(0),
         };
 
         AgentSpawner::child_completed(&spawner, &SessionId::new(), Timestamp::now())
-            .expect("legacy completion hook should report success");
+            .map_err(ctx("legacy completion hook should report success"))?;
 
         assert_eq!(spawner.finished.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 }

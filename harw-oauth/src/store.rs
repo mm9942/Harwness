@@ -146,23 +146,25 @@ pub fn save_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     fn test_home(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("harw-oauth-store-{name}-{}", std::process::id()))
     }
 
     #[test]
-    fn test_save_token_writes_file_and_returns_ref() {
+    fn test_save_token_writes_file_and_returns_ref() -> TestResult {
         let home = test_home("save");
         let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).expect("create home");
+        std::fs::create_dir_all(&home).map_err(ctx("create home"))?;
 
         let secret = SecretString::new("sk-ant-oat-EXAMPLE".to_owned().into_boxed_str());
-        let secret_ref = save_token(&home, "anthropic", &secret).expect("save");
+        let secret_ref = save_token(&home, "anthropic", &secret).map_err(ctx("save"))?;
 
-        let path = token_path(&home.join("secrets"), "anthropic").expect("safe token path");
+        let path =
+            token_path(&home.join("secrets"), "anthropic").map_err(ctx("safe token path"))?;
         assert!(path.is_file());
-        let stored = std::fs::read(&path).expect("read stored token");
+        let stored = std::fs::read(&path).map_err(ctx("read stored token"))?;
         assert!(
             stored == secret.expose_secret().as_bytes(),
             "stored token bytes mismatch"
@@ -172,31 +174,37 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            let mode = std::fs::metadata(&path)
+                .map_err(ctx("read metadata"))?
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
 
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 
     #[test]
-    fn test_save_token_replaces_existing_file_without_temp_artifacts() {
+    fn test_save_token_replaces_existing_file_without_temp_artifacts() -> TestResult {
         let home = test_home("replace");
         let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).expect("create home");
+        std::fs::create_dir_all(&home).map_err(ctx("create home"))?;
 
         let first = SecretString::new("first-token".to_owned().into_boxed_str());
         let second = SecretString::new("second-token".to_owned().into_boxed_str());
-        save_token(&home, "anthropic", &first).expect("save first token");
-        save_token(&home, "anthropic", &second).expect("save second token");
+        save_token(&home, "anthropic", &first).map_err(ctx("save first token"))?;
+        save_token(&home, "anthropic", &second).map_err(ctx("save second token"))?;
 
-        let path = token_path(&home.join("secrets"), "anthropic").expect("safe token path");
-        let stored = std::fs::read(&path).expect("read stored token");
+        let path =
+            token_path(&home.join("secrets"), "anthropic").map_err(ctx("safe token path"))?;
+        let stored = std::fs::read(&path).map_err(ctx("read stored token"))?;
         assert!(
             stored == second.expose_secret().as_bytes(),
             "stored token bytes mismatch"
         );
-        let entries = std::fs::read_dir(home.join("secrets")).expect("read secrets directory");
+        let entries =
+            std::fs::read_dir(home.join("secrets")).map_err(ctx("read secrets directory"))?;
         assert!(entries.filter_map(Result::ok).all(|entry| {
             !entry
                 .file_name()
@@ -205,6 +213,7 @@ mod tests {
         }));
 
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 
     #[test]
@@ -240,16 +249,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_save_token_rejects_secrets_symlink_outside_home() {
+    fn test_save_token_rejects_secrets_symlink_outside_home() -> TestResult {
         use std::os::unix::fs::symlink;
 
         let home = test_home("symlink-escape");
         let outside = test_home("symlink-outside");
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&outside);
-        std::fs::create_dir_all(&home).expect("create home");
-        std::fs::create_dir_all(&outside).expect("create outside directory");
-        symlink(&outside, home.join("secrets")).expect("create secrets symlink");
+        std::fs::create_dir_all(&home).map_err(ctx("create home"))?;
+        std::fs::create_dir_all(&outside).map_err(ctx("create outside directory"))?;
+        symlink(&outside, home.join("secrets")).map_err(ctx("create secrets symlink"))?;
 
         let secret = SecretString::new("token".to_owned().into_boxed_str());
         let result = save_token(&home, "anthropic", &secret);
@@ -265,5 +274,6 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&outside);
+        Ok(())
     }
 }

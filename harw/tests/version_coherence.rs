@@ -38,6 +38,9 @@
 //!   — für die hier geprüfte Frage (eigene Paketversion je Mitglied) spielt
 //!   das keine Rolle.
 
+mod common;
+
+use common::{TestError, TestResult, ctx};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -50,18 +53,21 @@ const OLD_VERSION: &str = "0.1.0";
 ///
 /// # Panics
 /// Panics if no workspace root is found before reaching the filesystem root.
-fn find_workspace_root(start: &Path) -> PathBuf {
+fn find_workspace_root(start: &Path) -> TestResult<PathBuf> {
     let mut dir = start.to_path_buf();
     loop {
         let candidate = dir.join("Cargo.toml");
         if candidate.exists() {
             let text = fs::read_to_string(&candidate).unwrap_or_default();
             if text.contains("[workspace]") {
-                return dir;
+                return Ok(dir);
             }
         }
         if !dir.pop() {
-            panic!("Could not find workspace root above {}", start.display());
+            return Err(TestError::Unexpected(format!(
+                "Could not find workspace root above {}",
+                start.display()
+            )));
         }
     }
 }
@@ -98,12 +104,18 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
 /// `"foo = 'bar'".parse::<Table>()` in `.../src/lib.rs:38-41`. Das Ergebnis
 /// wird in `toml::Value::Table(..)` gewickelt, damit die bestehenden
 /// `Value::get`/`as_*`-Aufrufe unverändert bleiben.
-fn read_toml(path: &Path) -> toml::Value {
-    let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("Cannot read {}: {e}", path.display()));
+fn read_toml(path: &Path) -> TestResult<toml::Value> {
+    let text = fs::read_to_string(path).map_err(|e| TestError::Context {
+        context: "Cannot read TOML file",
+        source: format!("{}: {e}", path.display()),
+    })?;
     let table = text
         .parse::<toml::Table>()
-        .unwrap_or_else(|e| panic!("Cannot parse {} as TOML: {e}", path.display()));
-    toml::Value::Table(table)
+        .map_err(|e| TestError::Context {
+            context: "Cannot parse TOML file",
+            source: format!("{}: {e}", path.display()),
+        })?;
+    Ok(toml::Value::Table(table))
 }
 
 /// Liest `[workspace.members]` aus der bereits geparsten Wurzel-`Cargo.toml`
@@ -116,22 +128,30 @@ fn read_toml(path: &Path) -> toml::Value {
 /// und `Value::as_str(&self) -> Option<&str>` — siehe
 /// docs.rs/toml/1.1.3/toml/enum.Value.html, Abschnitt "Value Extraction
 /// Methods" / "Indexing Methods".
-fn workspace_member_dirs(root_value: &toml::Value, workspace_root: &Path) -> Vec<PathBuf> {
+fn workspace_member_dirs(
+    root_value: &toml::Value,
+    workspace_root: &Path,
+) -> TestResult<Vec<PathBuf>> {
     let members = root_value
         .get("workspace")
         .and_then(|w| w.get("members"))
         .and_then(toml::Value::as_array)
-        .expect("[workspace] members muss ein Array sein");
+        .ok_or(TestError::Missing(
+            "[workspace] members muss ein Array sein",
+        ))?;
 
     members
         .iter()
         .map(|m| {
-            let name = m
-                .as_str()
-                .unwrap_or_else(|| panic!("[workspace.members]-Eintrag ist kein String: {m:?}"));
-            workspace_root.join(name)
+            m.as_str()
+                .map(|name| workspace_root.join(name))
+                .ok_or_else(|| {
+                    TestError::Unexpected(format!(
+                        "[workspace.members]-Eintrag ist kein String: {m:?}"
+                    ))
+                })
         })
-        .collect()
+        .collect::<TestResult<Vec<PathBuf>>>()
 }
 
 /// Wie ein Mitglied seine eigene Paketversion deklariert.
@@ -154,7 +174,9 @@ enum VersionDecl {
 fn parse_version_decl(package: &toml::Value) -> VersionDecl {
     match package.get("version") {
         Some(toml::Value::String(s)) => VersionDecl::Literal(s.clone()),
-        Some(toml::Value::Table(t)) if t.get("workspace").and_then(toml::Value::as_bool) == Some(true) => {
+        Some(toml::Value::Table(t))
+            if t.get("workspace").and_then(toml::Value::as_bool) == Some(true) =>
+        {
             VersionDecl::WorkspaceInherited
         }
         _ => VersionDecl::Missing,
@@ -170,39 +192,47 @@ struct MemberManifest {
 }
 
 #[test]
-fn slice14_workspace_version_is_consistent() {
+fn slice14_workspace_version_is_consistent() -> TestResult {
     // ── Locate workspace root ────────────────────────────────────────────
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = find_workspace_root(&manifest_dir);
+    let workspace_root = find_workspace_root(&manifest_dir)?;
 
     // ── Parse the workspace root Cargo.toml statically (no `cargo`) ───────
     let root_toml_path = workspace_root.join("Cargo.toml");
-    let root_value = read_toml(&root_toml_path);
+    let root_value = read_toml(&root_toml_path)?;
 
     let root_workspace_version = root_value
         .get("workspace")
         .and_then(|w| w.get("package"))
         .and_then(|p| p.get("version"))
         .and_then(toml::Value::as_str)
-        .expect("[workspace.package.version] fehlt oder ist kein String")
+        .ok_or(TestError::Missing(
+            "[workspace.package.version] fehlt oder ist kein String",
+        ))?
         .to_owned();
 
     // ── Parse every workspace member's own Cargo.toml ─────────────────────
-    let member_dirs = workspace_member_dirs(&root_value, &workspace_root);
+    let member_dirs = workspace_member_dirs(&root_value, &workspace_root)?;
     let mut all_members: Vec<MemberManifest> = Vec::new();
     for dir in &member_dirs {
         let path = dir.join("Cargo.toml");
-        let value = read_toml(&path);
-        let package = value
-            .get("package")
-            .unwrap_or_else(|| panic!("{} hat keinen [package]-Abschnitt", path.display()));
+        let value = read_toml(&path)?;
+        let package = value.get("package").ok_or_else(|| {
+            TestError::Unexpected(format!("{} hat keinen [package]-Abschnitt", path.display()))
+        })?;
         let name = package
             .get("name")
             .and_then(toml::Value::as_str)
-            .unwrap_or_else(|| panic!("{} hat kein [package] name", path.display()))
+            .ok_or_else(|| {
+                TestError::Unexpected(format!("{} hat kein [package] name", path.display()))
+            })?
             .to_owned();
         let version_decl = parse_version_decl(package);
-        all_members.push(MemberManifest { name, path, version_decl });
+        all_members.push(MemberManifest {
+            name,
+            path,
+            version_decl,
+        });
     }
 
     // Collect workspace-owned packages: name is "harw" or starts with "harw-".
@@ -259,23 +289,29 @@ fn slice14_workspace_version_is_consistent() {
     // `Cargo.lock` ist selbst gültiges TOML: eine Folge von `[[package]]`-
     // Tabellen mit (mindestens) `name` und `version`.
     let lock_path = workspace_root.join("Cargo.lock");
-    let lock_value = read_toml(&lock_path);
+    let lock_value = read_toml(&lock_path)?;
     let lock_packages = lock_value
         .get("package")
         .and_then(toml::Value::as_array)
-        .expect("Cargo.lock hat keine [[package]]-Einträge");
+        .ok_or(TestError::Missing(
+            "Cargo.lock hat keine [[package]]-Einträge",
+        ))?;
 
     let mut lock_versions_by_name: HashMap<String, Vec<String>> = HashMap::new();
     for pkg in lock_packages {
         let name = pkg
             .get("name")
             .and_then(toml::Value::as_str)
-            .expect("[[package]]-Eintrag in Cargo.lock ohne name")
+            .ok_or(TestError::Missing(
+                "[[package]]-Eintrag in Cargo.lock ohne name",
+            ))?
             .to_owned();
         let version = pkg
             .get("version")
             .and_then(toml::Value::as_str)
-            .expect("[[package]]-Eintrag in Cargo.lock ohne version")
+            .ok_or(TestError::Missing(
+                "[[package]]-Eintrag in Cargo.lock ohne version",
+            ))?
             .to_owned();
         lock_versions_by_name.entry(name).or_default().push(version);
     }
@@ -284,7 +320,8 @@ fn slice14_workspace_version_is_consistent() {
         .iter()
         .filter_map(|pkg| {
             let versions = lock_versions_by_name.get(&pkg.name);
-            let matches_expected = versions.is_some_and(|vs| vs.iter().any(|v| v == EXPECTED_VERSION));
+            let matches_expected =
+                versions.is_some_and(|vs| vs.iter().any(|v| v == EXPECTED_VERSION));
             if matches_expected {
                 None
             } else {
@@ -301,8 +338,10 @@ fn slice14_workspace_version_is_consistent() {
 
     // ── Assertion 4a: workspace root Cargo.toml contains EXPECTED_VERSION
     // exactly once ─────────────────────────────────────────────────────
-    let root_toml_text =
-        fs::read_to_string(&root_toml_path).unwrap_or_else(|e| panic!("Cannot read {}: {e}", root_toml_path.display()));
+    let root_toml_text = fs::read_to_string(&root_toml_path).map_err(|e| TestError::Context {
+        context: "Cannot read workspace root Cargo.toml",
+        source: format!("{}: {e}", root_toml_path.display()),
+    })?;
 
     let root_occurrences = count_occurrences(&root_toml_text, EXPECTED_VERSION);
     assert_eq!(
@@ -342,6 +381,8 @@ fn slice14_workspace_version_is_consistent() {
          Violations:\n{}",
         old_pin_violations.join("\n")
     );
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -355,34 +396,62 @@ mod unit_tests {
     }
 
     #[test]
-    fn test_parse_version_decl_literal_string() {
+    fn test_parse_version_decl_literal_string() -> TestResult {
         let manifest = toml::Value::Table(
-            "[package]\nname = \"foo\"\nversion = \"0.2.0\"\n".parse::<toml::Table>().unwrap(),
+            "[package]\nname = \"foo\"\nversion = \"0.2.0\"\n"
+                .parse::<toml::Table>()
+                .map_err(ctx("parse manifest"))?,
         );
-        let package = manifest.get("package").unwrap();
-        assert_eq!(parse_version_decl(package), VersionDecl::Literal("0.2.0".to_owned()));
+        let package = manifest
+            .get("package")
+            .ok_or(TestError::Missing("package"))?;
+        assert_eq!(
+            parse_version_decl(package),
+            VersionDecl::Literal("0.2.0".to_owned())
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_parse_version_decl_workspace_inherited() {
+    fn test_parse_version_decl_workspace_inherited() -> TestResult {
         let manifest = toml::Value::Table(
-            "[package]\nname = \"foo\"\nversion.workspace = true\n".parse::<toml::Table>().unwrap(),
+            "[package]\nname = \"foo\"\nversion.workspace = true\n"
+                .parse::<toml::Table>()
+                .map_err(ctx("parse manifest"))?,
         );
-        let package = manifest.get("package").unwrap();
+        let package = manifest
+            .get("package")
+            .ok_or(TestError::Missing("package"))?;
         assert_eq!(parse_version_decl(package), VersionDecl::WorkspaceInherited);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_version_decl_missing_field() {
-        let manifest = toml::Value::Table("[package]\nname = \"foo\"\n".parse::<toml::Table>().unwrap());
-        let package = manifest.get("package").unwrap();
+    fn test_parse_version_decl_missing_field() -> TestResult {
+        let manifest = toml::Value::Table(
+            "[package]\nname = \"foo\"\n"
+                .parse::<toml::Table>()
+                .map_err(ctx("parse manifest"))?,
+        );
+        let package = manifest
+            .get("package")
+            .ok_or(TestError::Missing("package"))?;
         assert_eq!(parse_version_decl(package), VersionDecl::Missing);
+        Ok(())
     }
 
     #[test]
-    fn test_workspace_member_dirs_reads_literal_string_list() {
-        let root = toml::Value::Table("[workspace]\nmembers = [\"a\", \"b\"]\n".parse::<toml::Table>().unwrap());
-        let dirs = workspace_member_dirs(&root, Path::new("/tmp/ws"));
-        assert_eq!(dirs, vec![PathBuf::from("/tmp/ws/a"), PathBuf::from("/tmp/ws/b")]);
+    fn test_workspace_member_dirs_reads_literal_string_list() -> TestResult {
+        let root = toml::Value::Table(
+            "[workspace]\nmembers = [\"a\", \"b\"]\n"
+                .parse::<toml::Table>()
+                .map_err(ctx("parse manifest"))?,
+        );
+        let dirs = workspace_member_dirs(&root, Path::new("/tmp/ws"))?;
+        assert_eq!(
+            dirs,
+            vec![PathBuf::from("/tmp/ws/a"), PathBuf::from("/tmp/ws/b")]
+        );
+        Ok(())
     }
 }

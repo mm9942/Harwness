@@ -77,3 +77,7 @@ pub use read::{
     MAX_READ_BYTES, parse_i64, parse_u64, read_first_line, read_key_values, read_line_fields,
     read_lines, read_to_string,
 };
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

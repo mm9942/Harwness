@@ -562,7 +562,11 @@ fn current_uid() -> Option<u32> {
 /// marker planted by another local user) can only narrow authority, never
 /// widen it silently.
 #[cfg(unix)]
-fn is_trusted_root_candidate(dir: &Path, config: &DiscoveryConfig, current_uid: Option<u32>) -> bool {
+fn is_trusted_root_candidate(
+    dir: &Path,
+    config: &DiscoveryConfig,
+    current_uid: Option<u32>,
+) -> bool {
     use std::os::unix::fs::MetadataExt;
 
     if !has_any_marker(dir, &config.root_markers) {
@@ -792,6 +796,7 @@ fn truncate_utf8_boundary(bytes: Vec<u8>, was_truncated: bool) -> Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use std::fs;
     use tempfile::TempDir;
 
@@ -799,14 +804,15 @@ mod tests {
         DiscoveryConfig::default()
     }
 
-    fn write(dir: &Path, name: &str, content: &str) {
-        fs::write(dir.join(name), content).unwrap();
+    fn write(dir: &Path, name: &str, content: &str) -> TestResult {
+        fs::write(dir.join(name), content).map_err(ctx("Datei schreiben"))?;
+        Ok(())
     }
 
-    fn mkdir(dir: &Path, name: &str) -> PathBuf {
+    fn mkdir(dir: &Path, name: &str) -> TestResult<PathBuf> {
         let p = dir.join(name);
-        fs::create_dir_all(&p).unwrap();
-        p
+        fs::create_dir_all(&p).map_err(ctx("Verzeichnis anlegen"))?;
+        Ok(p)
     }
 
     // ── test_default_config_values ───────────────────────────────────────────
@@ -829,149 +835,181 @@ mod tests {
     // ── test_discover_finds_git_marker_root ──────────────────────────────────
 
     #[test]
-    fn test_discover_finds_git_marker_root() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
+    fn test_discover_finds_git_marker_root() -> TestResult {
+        let tmp = TempDir::new().map_err(ctx("Tempdir anlegen"))?;
+        let root = tmp
+            .path()
+            .canonicalize()
+            .map_err(ctx("Pfad kanonisieren"))?;
 
         // Place .git at root level
-        mkdir(&root, ".git");
+        mkdir(&root, ".git")?;
 
         // cwd is a nested subdirectory
-        let sub = mkdir(&root, "src/nested");
+        let sub = mkdir(&root, "src/nested")?;
 
         let cfg = default_cfg();
-        let ctx = discover_project(&sub, &cfg).unwrap();
-        assert_eq!(ctx.project_root, root);
+        let ctx_result = discover_project(&sub, &cfg).map_err(ctx("Discovery"))?;
+        assert_eq!(ctx_result.project_root, root);
+        Ok(())
     }
 
     // ── test_discover_finds_cargo_toml_root ──────────────────────────────────
 
     #[test]
-    fn test_discover_finds_cargo_toml_root() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
+    fn test_discover_finds_cargo_toml_root() -> TestResult {
+        let tmp = TempDir::new().map_err(ctx("Tempdir anlegen"))?;
+        let root = tmp
+            .path()
+            .canonicalize()
+            .map_err(ctx("Pfad kanonisieren"))?;
 
-        write(&root, "Cargo.toml", "[package]\nname=\"x\"");
+        write(&root, "Cargo.toml", "[package]\nname=\"x\"")?;
 
-        let sub = mkdir(&root, "src");
+        let sub = mkdir(&root, "src")?;
 
         let cfg = DiscoveryConfig::new().with_root_markers(vec!["Cargo.toml".to_string()]);
-        let ctx = discover_project(&sub, &cfg).unwrap();
-        assert_eq!(ctx.project_root, root);
+        let ctx_result = discover_project(&sub, &cfg).map_err(ctx("Discovery"))?;
+        assert_eq!(ctx_result.project_root, root);
+        Ok(())
     }
 
     // ── test_discover_falls_back_to_cwd_without_marker ───────────────────────
 
     #[test]
-    fn test_discover_falls_back_to_cwd_without_marker() {
-        let tmp = TempDir::new().unwrap();
-        let cwd = tmp.path().canonicalize().unwrap();
+    fn test_discover_falls_back_to_cwd_without_marker() -> TestResult {
+        let tmp = TempDir::new().map_err(ctx("Tempdir anlegen"))?;
+        let cwd = tmp
+            .path()
+            .canonicalize()
+            .map_err(ctx("Pfad kanonisieren"))?;
 
         let cfg =
             DiscoveryConfig::new().with_root_markers(vec!["nonexistent-marker-xyz".to_string()]);
-        let ctx = discover_project(&cwd, &cfg).unwrap();
-        assert_eq!(ctx.project_root, cwd);
+        let ctx_result = discover_project(&cwd, &cfg).map_err(ctx("Discovery"))?;
+        assert_eq!(ctx_result.project_root, cwd);
+        Ok(())
     }
 
     // ── test_discover_loads_HARW_md_when_present ─────────────────────────────
 
     #[test]
-    fn test_discover_loads_harw_md_when_present() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
+    fn test_discover_loads_harw_md_when_present() -> TestResult {
+        let tmp = TempDir::new().map_err(ctx("Tempdir anlegen"))?;
+        let root = tmp
+            .path()
+            .canonicalize()
+            .map_err(ctx("Pfad kanonisieren"))?;
 
-        mkdir(&root, ".git");
-        write(&root, "HARW.md", "# Project instructions");
+        mkdir(&root, ".git")?;
+        write(&root, "HARW.md", "# Project instructions")?;
 
         let cfg = default_cfg();
-        let ctx = discover_project(&root, &cfg).unwrap();
+        let ctx_result = discover_project(&root, &cfg).map_err(ctx("Discovery"))?;
 
-        assert_eq!(ctx.docs.len(), 1);
-        assert_eq!(ctx.docs[0].filename, "HARW.md");
-        assert_eq!(ctx.docs[0].content, "# Project instructions");
+        assert_eq!(ctx_result.docs.len(), 1);
+        assert_eq!(ctx_result.docs[0].filename, "HARW.md");
+        assert_eq!(ctx_result.docs[0].content, "# Project instructions");
+        Ok(())
     }
 
     // ── test_discover_prioritizes_HARW_over_AGENTS_in_same_dir ───────────────
 
     #[test]
-    fn test_discover_prioritizes_harw_over_agents_in_same_dir() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
+    fn test_discover_prioritizes_harw_over_agents_in_same_dir() -> TestResult {
+        let tmp = TempDir::new().map_err(ctx("Tempdir anlegen"))?;
+        let root = tmp
+            .path()
+            .canonicalize()
+            .map_err(ctx("Pfad kanonisieren"))?;
 
-        mkdir(&root, ".git");
-        write(&root, "HARW.md", "HARW content");
-        write(&root, "AGENTS.md", "AGENTS content");
+        mkdir(&root, ".git")?;
+        write(&root, "HARW.md", "HARW content")?;
+        write(&root, "AGENTS.md", "AGENTS content")?;
 
         let cfg = default_cfg();
-        let ctx = discover_project(&root, &cfg).unwrap();
+        let ctx_result = discover_project(&root, &cfg).map_err(ctx("Discovery"))?;
 
         // Only one doc per directory; HARW.md is first in the default list
-        assert_eq!(ctx.docs.len(), 1);
-        assert_eq!(ctx.docs[0].filename, "HARW.md");
-        assert_eq!(ctx.docs[0].content, "HARW content");
+        assert_eq!(ctx_result.docs.len(), 1);
+        assert_eq!(ctx_result.docs[0].filename, "HARW.md");
+        assert_eq!(ctx_result.docs[0].content, "HARW content");
+        Ok(())
     }
 
     // ── test_discover_skips_symlinked_instruction_candidate ─────────────────
 
     #[cfg(unix)]
     #[test]
-    fn test_discover_skips_symlinked_instruction_candidate() {
+    fn test_discover_skips_symlinked_instruction_candidate() -> TestResult {
         use std::os::unix::fs::symlink;
 
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        let outside = TempDir::new().unwrap();
+        let tmp = TempDir::new().map_err(ctx("Tempdir anlegen"))?;
+        let root = tmp
+            .path()
+            .canonicalize()
+            .map_err(ctx("Pfad kanonisieren"))?;
+        let outside = TempDir::new().map_err(ctx("Tempdir anlegen"))?;
 
-        mkdir(&root, ".git");
-        write(outside.path(), "outside.md", "outside instructions");
-        symlink(outside.path().join("outside.md"), root.join("HARW.md")).unwrap();
-        write(&root, "AGENTS.md", "local instructions");
+        mkdir(&root, ".git")?;
+        write(outside.path(), "outside.md", "outside instructions")?;
+        symlink(outside.path().join("outside.md"), root.join("HARW.md"))
+            .map_err(ctx("Symlink anlegen"))?;
+        write(&root, "AGENTS.md", "local instructions")?;
 
-        let ctx = discover_project(&root, &default_cfg()).unwrap();
+        let ctx_result = discover_project(&root, &default_cfg()).map_err(ctx("Discovery"))?;
 
-        assert_eq!(ctx.docs.len(), 1);
-        assert_eq!(ctx.docs[0].filename, "AGENTS.md");
-        assert_eq!(ctx.docs[0].content, "local instructions");
+        assert_eq!(ctx_result.docs.len(), 1);
+        assert_eq!(ctx_result.docs[0].filename, "AGENTS.md");
+        assert_eq!(ctx_result.docs[0].content, "local instructions");
+        Ok(())
     }
 
     // ── test_discover_walks_root_to_cwd_order ────────────────────────────────
 
     #[test]
-    fn test_discover_walks_root_to_cwd_order() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
+    fn test_discover_walks_root_to_cwd_order() -> TestResult {
+        let tmp = TempDir::new().map_err(ctx("Tempdir anlegen"))?;
+        let root = tmp
+            .path()
+            .canonicalize()
+            .map_err(ctx("Pfad kanonisieren"))?;
 
-        mkdir(&root, ".git");
-        let mid = mkdir(&root, "mid");
-        let leaf = mkdir(&mid, "leaf");
+        mkdir(&root, ".git")?;
+        let mid = mkdir(&root, "mid")?;
+        let leaf = mkdir(&mid, "leaf")?;
 
-        write(&root, "HARW.md", "root doc");
-        write(&mid, "HARW.md", "mid doc");
-        write(&leaf, "HARW.md", "leaf doc");
+        write(&root, "HARW.md", "root doc")?;
+        write(&mid, "HARW.md", "mid doc")?;
+        write(&leaf, "HARW.md", "leaf doc")?;
 
         let cfg = default_cfg();
-        let ctx = discover_project(&leaf, &cfg).unwrap();
+        let ctx_result = discover_project(&leaf, &cfg).map_err(ctx("Discovery"))?;
 
-        assert_eq!(ctx.docs.len(), 3);
-        assert_eq!(ctx.docs[0].content, "root doc");
-        assert_eq!(ctx.docs[1].content, "mid doc");
-        assert_eq!(ctx.docs[2].content, "leaf doc");
+        assert_eq!(ctx_result.docs.len(), 3);
+        assert_eq!(ctx_result.docs[0].content, "root doc");
+        assert_eq!(ctx_result.docs[1].content, "mid doc");
+        assert_eq!(ctx_result.docs[2].content, "leaf doc");
+        Ok(())
     }
 
     // ── test_discover_respects_max_total_bytes ───────────────────────────────
 
     #[test]
-    fn test_discover_respects_max_total_bytes() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
+    fn test_discover_respects_max_total_bytes() -> TestResult {
+        let tmp = TempDir::new().map_err(ctx("Tempdir anlegen"))?;
+        let root = tmp
+            .path()
+            .canonicalize()
+            .map_err(ctx("Pfad kanonisieren"))?;
 
-        mkdir(&root, ".git");
-        let sub = mkdir(&root, "sub");
+        mkdir(&root, ".git")?;
+        let sub = mkdir(&root, "sub")?;
 
         // Each doc is 100 bytes; set total cap to 150 so only the first loads fully,
         // the second is truncated to cap, and nothing else loads.
-        write(&root, "HARW.md", "A".repeat(100).as_str());
-        write(&sub, "HARW.md", "B".repeat(100).as_str());
+        write(&root, "HARW.md", "A".repeat(100).as_str())?;
+        write(&sub, "HARW.md", "B".repeat(100).as_str())?;
 
         let cfg = DiscoveryConfig {
             max_total_bytes: 150,
@@ -979,39 +1017,46 @@ mod tests {
             ..default_cfg()
         };
 
-        let ctx = discover_project(&sub, &cfg).unwrap();
+        let ctx_result = discover_project(&sub, &cfg).map_err(ctx("Discovery"))?;
 
         // First doc: 100 bytes — within 150 budget.
         // Second doc: would push to 200 — truncated to 50 remaining bytes.
         // Total docs: 2 (first full, second truncated).
-        assert_eq!(ctx.docs.len(), 2);
-        assert_eq!(ctx.docs[0].content.len(), 100);
+        assert_eq!(ctx_result.docs.len(), 2);
+        assert_eq!(ctx_result.docs[0].content.len(), 100);
         // Remaining budget after first: 50 bytes
-        assert_eq!(ctx.docs[1].content.len(), 50);
+        assert_eq!(ctx_result.docs[1].content.len(), 50);
+        Ok(())
     }
 
     // ── test_discover_truncates_at_utf8_boundary ────────────────────────────
 
     #[test]
-    fn test_discover_truncates_at_utf8_boundary() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
+    fn test_discover_truncates_at_utf8_boundary() -> TestResult {
+        let tmp = TempDir::new().map_err(ctx("Tempdir anlegen"))?;
+        let root = tmp
+            .path()
+            .canonicalize()
+            .map_err(ctx("Pfad kanonisieren"))?;
 
-        mkdir(&root, ".git");
-        write(&root, "HARW.md", "abc€tail");
+        mkdir(&root, ".git")?;
+        write(&root, "HARW.md", "abc€tail")?;
 
         let cfg = DiscoveryConfig {
             max_bytes_per_doc: 5,
             ..default_cfg()
         };
 
-        let ctx = discover_project(&root, &cfg).unwrap();
+        let ctx_result = discover_project(&root, &cfg).map_err(ctx("Discovery"))?;
 
-        assert_eq!(ctx.docs.len(), 1);
-        assert_eq!(ctx.docs[0].content, "abc");
-        assert!(ctx.docs[0]
-            .content
-            .is_char_boundary(ctx.docs[0].content.len()));
+        assert_eq!(ctx_result.docs.len(), 1);
+        assert_eq!(ctx_result.docs[0].content, "abc");
+        assert!(
+            ctx_result.docs[0]
+                .content
+                .is_char_boundary(ctx_result.docs[0].content.len())
+        );
+        Ok(())
     }
 
     // ── test_discover_invalid_cwd_returns_error ──────────────────────────────
@@ -1041,106 +1086,130 @@ mod tests {
     // ── test_discover_no_docs_when_none_present ──────────────────────────────
 
     #[test]
-    fn test_discover_no_docs_when_none_present() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        mkdir(&root, ".git");
+    fn test_discover_no_docs_when_none_present() -> TestResult {
+        let tmp = TempDir::new().map_err(ctx("Tempdir anlegen"))?;
+        let root = tmp
+            .path()
+            .canonicalize()
+            .map_err(ctx("Pfad kanonisieren"))?;
+        mkdir(&root, ".git")?;
 
         let cfg = default_cfg();
-        let ctx = discover_project(&root, &cfg).unwrap();
-        assert!(ctx.docs.is_empty());
+        let ctx_result = discover_project(&root, &cfg).map_err(ctx("Discovery"))?;
+        assert!(ctx_result.docs.is_empty());
+        Ok(())
     }
 
     // ── test_discover_cwd_equals_root_when_cwd_has_marker ───────────────────
 
     #[test]
-    fn test_discover_cwd_equals_root_when_cwd_has_marker() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        mkdir(&root, ".git");
+    fn test_discover_cwd_equals_root_when_cwd_has_marker() -> TestResult {
+        let tmp = TempDir::new().map_err(ctx("Tempdir anlegen"))?;
+        let root = tmp
+            .path()
+            .canonicalize()
+            .map_err(ctx("Pfad kanonisieren"))?;
+        mkdir(&root, ".git")?;
 
         let cfg = default_cfg();
-        let ctx = discover_project(&root, &cfg).unwrap();
-        assert_eq!(ctx.project_root, ctx.cwd);
+        let ctx_result = discover_project(&root, &cfg).map_err(ctx("Discovery"))?;
+        assert_eq!(ctx_result.project_root, ctx_result.cwd);
+        Ok(())
     }
 
     // ── W1-07 (F-028/S1): $HOME-Grenze ───────────────────────────────────────
 
     #[test]
-    fn test_home_dir_with_git_is_not_promoted_to_root_for_descendant_cwd() {
+    fn test_home_dir_with_git_is_not_promoted_to_root_for_descendant_cwd() -> TestResult {
         // Simuliert ein Dotfiles-Bare-Repo `~/.git` (oder ein verirrtes
         // `~/package.json`): der Nutzer startet in einem Unterverzeichnis
         // von `$HOME`, ohne eigenen Marker. Ohne die Home-Grenze würde die
         // Suche `$HOME` als Root wählen und damit das gesamte Home
         // beschreib-/ausführbar machen.
-        let home = TempDir::new().unwrap();
-        let home_path = home.path().canonicalize().unwrap();
-        mkdir(&home_path, ".git");
+        let home = TempDir::new().map_err(ctx("Tempdir anlegen"))?;
+        let home_path = home
+            .path()
+            .canonicalize()
+            .map_err(ctx("Pfad kanonisieren"))?;
+        mkdir(&home_path, ".git")?;
 
-        let sub = mkdir(&home_path, "Downloads/tool-xyz");
+        let sub = mkdir(&home_path, "Downloads/tool-xyz")?;
 
         let cfg = DiscoveryConfig {
             home_dir: Some(home_path.clone()),
             ..default_cfg()
         };
 
-        let ctx = discover_project(&sub, &cfg).unwrap();
+        let ctx_result = discover_project(&sub, &cfg).map_err(ctx("Discovery"))?;
 
         // Bestehende Semantik ohne Marker: cwd wird Root.
-        assert_eq!(ctx.project_root, sub);
-        assert_ne!(ctx.project_root, home_path);
+        assert_eq!(ctx_result.project_root, sub);
+        assert_ne!(ctx_result.project_root, home_path);
+        Ok(())
     }
 
     #[test]
-    fn test_home_dir_itself_may_be_root_when_cwd_equals_home() {
+    fn test_home_dir_itself_may_be_root_when_cwd_equals_home() -> TestResult {
         // Startet der Nutzer harw direkt in `$HOME` (cwd == home), gibt es
         // keine engere Wahl als `$HOME` selbst — ein dort liegender Marker
         // wird akzeptiert (mit den normalen Eigentümer-/Rechteprüfungen).
-        let home = TempDir::new().unwrap();
-        let home_path = home.path().canonicalize().unwrap();
-        mkdir(&home_path, ".git");
+        let home = TempDir::new().map_err(ctx("Tempdir anlegen"))?;
+        let home_path = home
+            .path()
+            .canonicalize()
+            .map_err(ctx("Pfad kanonisieren"))?;
+        mkdir(&home_path, ".git")?;
 
         let cfg = DiscoveryConfig {
             home_dir: Some(home_path.clone()),
             ..default_cfg()
         };
 
-        let ctx = discover_project(&home_path, &cfg).unwrap();
-        assert_eq!(ctx.project_root, home_path);
+        let ctx_result = discover_project(&home_path, &cfg).map_err(ctx("Discovery"))?;
+        assert_eq!(ctx_result.project_root, home_path);
+        Ok(())
     }
 
     #[test]
-    fn test_home_dir_none_disables_boundary() {
+    fn test_home_dir_none_disables_boundary() -> TestResult {
         // `with_home_dir(None)` schaltet die Grenze ausdrücklich ab — Marker
         // in `$HOME` verhalten sich dann wie jeder andere Vorfahre.
-        let home = TempDir::new().unwrap();
-        let home_path = home.path().canonicalize().unwrap();
-        mkdir(&home_path, ".git");
-        let sub = mkdir(&home_path, "sub");
+        let home = TempDir::new().map_err(ctx("Tempdir anlegen"))?;
+        let home_path = home
+            .path()
+            .canonicalize()
+            .map_err(ctx("Pfad kanonisieren"))?;
+        mkdir(&home_path, ".git")?;
+        let sub = mkdir(&home_path, "sub")?;
 
         let cfg = DiscoveryConfig::new()
             .with_root_markers(vec![".git".to_string()])
             .with_home_dir(None);
 
-        let ctx = discover_project(&sub, &cfg).unwrap();
-        assert_eq!(ctx.project_root, home_path);
+        let ctx_result = discover_project(&sub, &cfg).map_err(ctx("Discovery"))?;
+        assert_eq!(ctx_result.project_root, home_path);
+        Ok(())
     }
 
     // ── W1-07 (F-028/S1): Eigentümer/Weltschreibbarkeit ──────────────────────
 
     #[cfg(unix)]
     #[test]
-    fn test_world_writable_marker_dir_is_ignored() {
+    fn test_world_writable_marker_dir_is_ignored() -> TestResult {
         use std::os::unix::fs::PermissionsExt;
 
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        mkdir(&root, ".git");
+        let tmp = TempDir::new().map_err(ctx("Tempdir anlegen"))?;
+        let root = tmp
+            .path()
+            .canonicalize()
+            .map_err(ctx("Pfad kanonisieren"))?;
+        mkdir(&root, ".git")?;
         // Simuliert z. B. ein weltbeschreibbares `/tmp`, in das ein anderer
         // lokaler Nutzer einen Marker legen konnte.
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777))
+            .map_err(ctx("Rechte setzen"))?;
 
-        let sub = mkdir(&root, "sub");
+        let sub = mkdir(&root, "sub")?;
 
         // `max_walk_depth: 1` begrenzt die Suche auf `sub` (cwd) und `root`,
         // damit der Test nicht von zufälligen Markern in echten
@@ -1150,62 +1219,75 @@ mod tests {
             ..default_cfg()
         };
 
-        let ctx = discover_project(&sub, &cfg).unwrap();
+        let ctx_result = discover_project(&sub, &cfg).map_err(ctx("Discovery"))?;
 
         // Der weltbeschreibbare Marker-Ordner wird ignoriert; ohne weiteren
         // (vertrauenswürdigen) Marker fällt die Suche auf cwd zurück.
-        assert_eq!(ctx.project_root, sub);
+        assert_eq!(ctx_result.project_root, sub);
 
         // Aufräumen, damit TempDir sich beim Drop löschen lässt (0o777 auf
         // dem Wurzelverzeichnis stört das Aufräumen selbst nicht, aber
         // restriktivere Testumgebungen könnten empfindlich sein).
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .map_err(ctx("Rechte setzen"))?;
+        Ok(())
     }
 
     // ── W1-07 (F-165/S2): einzelne Dokumente überspringen statt abbrechen ───
 
     #[cfg(unix)]
     #[test]
-    fn test_discover_skips_unreadable_doc_and_loads_rest() {
+    fn test_discover_skips_unreadable_doc_and_loads_rest() -> TestResult {
         use std::os::unix::fs::PermissionsExt;
 
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        mkdir(&root, ".git");
-        let mid = mkdir(&root, "mid");
+        let tmp = TempDir::new().map_err(ctx("Tempdir anlegen"))?;
+        let root = tmp
+            .path()
+            .canonicalize()
+            .map_err(ctx("Pfad kanonisieren"))?;
+        mkdir(&root, ".git")?;
+        let mid = mkdir(&root, "mid")?;
 
-        write(&root, "HARW.md", "unreadable");
-        fs::set_permissions(root.join("HARW.md"), fs::Permissions::from_mode(0o000)).unwrap();
-        write(&mid, "HARW.md", "readable mid doc");
+        write(&root, "HARW.md", "unreadable")?;
+        fs::set_permissions(root.join("HARW.md"), fs::Permissions::from_mode(0o000))
+            .map_err(ctx("Rechte setzen"))?;
+        write(&mid, "HARW.md", "readable mid doc")?;
 
-        let ctx = discover_project(&mid, &default_cfg()).unwrap();
+        let ctx_result = discover_project(&mid, &default_cfg()).map_err(ctx("Discovery"))?;
 
         // Das unlesbare Root-Dokument wird übersprungen (kein Abbruch der
         // gesamten Discovery); das Dokument aus `mid` lädt trotzdem.
-        assert_eq!(ctx.docs.len(), 1);
-        assert_eq!(ctx.docs[0].content, "readable mid doc");
+        assert_eq!(ctx_result.docs.len(), 1);
+        assert_eq!(ctx_result.docs[0].content, "readable mid doc");
 
         // Aufräumen, damit TempDir sich beim Drop löschen lässt.
-        fs::set_permissions(root.join("HARW.md"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(root.join("HARW.md"), fs::Permissions::from_mode(0o644))
+            .map_err(ctx("Rechte setzen"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_discover_skips_invalid_utf8_doc_and_loads_rest() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        mkdir(&root, ".git");
-        let mid = mkdir(&root, "mid");
+    fn test_discover_skips_invalid_utf8_doc_and_loads_rest() -> TestResult {
+        let tmp = TempDir::new().map_err(ctx("Tempdir anlegen"))?;
+        let root = tmp
+            .path()
+            .canonicalize()
+            .map_err(ctx("Pfad kanonisieren"))?;
+        mkdir(&root, ".git")?;
+        let mid = mkdir(&root, "mid")?;
 
         // Ungültige UTF-8-Bytes, NICHT am Ende abgeschnitten (kein
         // Truncation-Sonderfall) — muss trotzdem übersprungen statt die
         // Discovery abbrechen zu lassen.
-        fs::write(root.join("HARW.md"), [0x48, 0x41, 0xff, 0xfe, 0x21]).unwrap();
-        write(&mid, "HARW.md", "readable mid doc");
+        fs::write(root.join("HARW.md"), [0x48, 0x41, 0xff, 0xfe, 0x21])
+            .map_err(ctx("Datei schreiben"))?;
+        write(&mid, "HARW.md", "readable mid doc")?;
 
-        let ctx = discover_project(&mid, &default_cfg()).unwrap();
+        let ctx_result = discover_project(&mid, &default_cfg()).map_err(ctx("Discovery"))?;
 
-        assert_eq!(ctx.docs.len(), 1);
-        assert_eq!(ctx.docs[0].content, "readable mid doc");
+        assert_eq!(ctx_result.docs.len(), 1);
+        assert_eq!(ctx_result.docs[0].content, "readable mid doc");
+        Ok(())
     }
 
     // ── with_home_dir builder ─────────────────────────────────────────────────

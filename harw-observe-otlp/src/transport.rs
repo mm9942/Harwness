@@ -50,8 +50,8 @@
 //! ```
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::OtlpError;
 
@@ -183,6 +183,7 @@ impl OtlpTransport for RecordingTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn test_recording_transport_starts_empty() {
@@ -191,14 +192,19 @@ mod tests {
     }
 
     #[test]
-    fn test_recording_transport_records_batches_in_order() {
+    fn test_recording_transport_records_batches_in_order() -> TestResult {
         let transport = RecordingTransport::new();
-        transport.send_batch(b"first").unwrap();
-        transport.send_batch(b"second").unwrap();
+        transport
+            .send_batch(b"first")
+            .map_err(ctx("erster send_batch"))?;
+        transport
+            .send_batch(b"second")
+            .map_err(ctx("zweiter send_batch"))?;
         assert_eq!(
             transport.sent_batches(),
             vec![b"first".to_vec(), b"second".to_vec()]
         );
+        Ok(())
     }
 
     #[test]
@@ -221,9 +227,12 @@ mod tests {
     }
 
     #[test]
-    fn test_recording_transport_usable_through_arc_dyn_otlp_transport() {
+    fn test_recording_transport_usable_through_arc_dyn_otlp_transport() -> TestResult {
         use std::sync::Arc;
         let transport: Arc<dyn OtlpTransport> = Arc::new(RecordingTransport::new());
-        transport.send_batch(b"payload").unwrap();
+        transport
+            .send_batch(b"payload")
+            .map_err(ctx("send_batch über Arc<dyn OtlpTransport>"))?;
+        Ok(())
     }
 }

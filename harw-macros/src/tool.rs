@@ -67,7 +67,9 @@ pub(crate) fn expand_tool(input: &syn::DeriveInput) -> syn::Result<proc_macro2::
     let mut required = Vec::new();
 
     for field in fields {
-        let ident = field.ident.as_ref().expect("named field");
+        let ident = field.ident.as_ref().ok_or_else(|| {
+            syn::Error::new_spanned(field, "derive(Tool) requires every field to be named")
+        })?;
         let name = ident.to_string();
 
         let default = field_default(field)?;
@@ -529,6 +531,7 @@ pub(crate) fn expand_tool_fn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use syn::DeriveInput;
 
     /// Erzeugt eine `#[tool]`-taugliche Beispielfunktion für Expansionstests.
@@ -550,7 +553,7 @@ mod tests {
 
     /// Alle fünf Schlüssel werden gelesen und landen in [`ToolAttr`].
     #[test]
-    fn test_parse_tool_attr_reads_all_supported_keys() {
+    fn test_parse_tool_attr_reads_all_supported_keys() -> TestResult {
         let attr = parse_tool_attr(quote! {
             name = "http.fetch",
             description = "Fetches a page",
@@ -558,7 +561,7 @@ mod tests {
             host_from = "url",
             parallel_safe,
         })
-        .expect("a fully populated attribute must parse");
+        .map_err(ctx("a fully populated attribute must parse"))?;
 
         assert_eq!(attr.name.as_deref(), Some("http.fetch"));
         assert_eq!(attr.description, "Fetches a page");
@@ -571,14 +574,15 @@ mod tests {
             Some("url")
         );
         assert!(attr.parallel_safe);
+        Ok(())
     }
 
     /// Ohne Angaben bleiben die sicherheitsrelevanten Felder fail-closed:
     /// keine Permission und `parallel_safe == false`.
     #[test]
-    fn test_parse_tool_attr_defaults_are_fail_closed() {
+    fn test_parse_tool_attr_defaults_are_fail_closed() -> TestResult {
         let attr = parse_tool_attr(quote! { description = "no keys" })
-            .expect("a minimal attribute must parse");
+            .map_err(ctx("a minimal attribute must parse"))?;
 
         assert!(attr.name.is_none());
         assert!(attr.permission.is_none());
@@ -587,36 +591,42 @@ mod tests {
             !attr.parallel_safe,
             "parallel_safe must default to false so side effects are presumed non-commutative"
         );
+        Ok(())
     }
 
     /// `parallel_safe = false` überschreibt das Flag explizit.
     #[test]
-    fn test_parse_tool_attr_parallel_safe_accepts_explicit_bool() {
+    fn test_parse_tool_attr_parallel_safe_accepts_explicit_bool() -> TestResult {
         let attr = parse_tool_attr(quote! { parallel_safe = false })
-            .expect("explicit bool form must parse");
+            .map_err(ctx("explicit bool form must parse"))?;
         assert!(!attr.parallel_safe);
 
-        let attr =
-            parse_tool_attr(quote! { parallel_safe = true }).expect("explicit bool form must parse");
+        let attr = parse_tool_attr(quote! { parallel_safe = true })
+            .map_err(ctx("explicit bool form must parse"))?;
         assert!(attr.parallel_safe);
+        Ok(())
     }
 
     /// Jeder Tabellenwert wird akzeptiert und auf die erwartete Variante abgebildet.
     #[test]
-    fn test_parse_tool_attr_accepts_every_known_permission() {
+    fn test_parse_tool_attr_accepts_every_known_permission() -> TestResult {
         for (key, variant) in PERMISSION_VALUES {
             let literal = LitStr::new(key, proc_macro2::Span::call_site());
             let resolved = permission_variant(&literal)
-                .unwrap_or_else(|_| panic!("permission {key:?} must resolve"));
+                .map_err(|_| TestError::Unexpected(format!("permission {key:?} must resolve")))?;
             assert_eq!(resolved.to_string(), *variant);
         }
+        Ok(())
     }
 
     /// Unbekannter Permission-String → Fehler, der die erlaubten Werte auflistet.
     #[test]
-    fn test_parse_tool_attr_rejects_unknown_permission() {
-        let error = parse_tool_attr(quote! { permission = "root_access" })
-            .expect_err("an unknown permission must be a macro diagnostic");
+    fn test_parse_tool_attr_rejects_unknown_permission() -> TestResult {
+        let Err(error) = parse_tool_attr(quote! { permission = "root_access" }) else {
+            return Err(TestError::Unexpected(
+                "an unknown permission must be a macro diagnostic".to_owned(),
+            ));
+        };
         let message = error.to_string();
 
         assert!(
@@ -627,73 +637,92 @@ mod tests {
             message.contains("read_workspace") && message.contains("manage_plugins"),
             "message must list the allowed values, got: {message}"
         );
+        Ok(())
     }
 
     /// `read_cargo_registry` ist seit W1-18 eine echte `Permission`-Variante und
     /// muss regulär auf `ReadCargoRegistry` abbilden — Dependency-Quellen-Tools
     /// hängen daran.
     #[test]
-    fn test_parse_tool_attr_accepts_read_cargo_registry() {
-        let parsed = parse_tool_attr(quote! { permission = "read_cargo_registry" })
-            .expect("read_cargo_registry must resolve to a Permission variant");
+    fn test_parse_tool_attr_accepts_read_cargo_registry() -> TestResult {
+        let parsed = parse_tool_attr(quote! { permission = "read_cargo_registry" }).map_err(
+            ctx("read_cargo_registry must resolve to a Permission variant"),
+        )?;
         let permission = parsed
             .permission
             .as_ref()
-            .expect("permission must be present");
+            .ok_or(TestError::Missing("permission must be present"))?;
         assert_eq!(
             permission_variant(permission)
-                .expect("variant lookup must succeed")
+                .map_err(ctx("variant lookup must succeed"))?
                 .to_string(),
             "ReadCargoRegistry"
         );
+        Ok(())
     }
 
     /// `host_from` ohne `permission = "network_access"` ist nur eine halbe Prüfung.
     #[test]
-    fn test_parse_tool_attr_rejects_host_from_without_network_access() {
-        let error = parse_tool_attr(quote! {
+    fn test_parse_tool_attr_rejects_host_from_without_network_access() -> TestResult {
+        let Err(error) = parse_tool_attr(quote! {
             permission = "read_workspace",
             host_from = "url",
-        })
-        .expect_err("host_from without the network permission must be rejected");
+        }) else {
+            return Err(TestError::Unexpected(
+                "host_from without the network permission must be rejected".to_owned(),
+            ));
+        };
         let message = error.to_string();
 
         assert!(
             message.contains("network_access"),
             "message must name the required permission, got: {message}"
         );
+        Ok(())
     }
 
     /// Auch ganz ohne `permission` ist `host_from` unzulässig.
     #[test]
-    fn test_parse_tool_attr_rejects_host_from_without_any_permission() {
-        let error = parse_tool_attr(quote! { host_from = "url" })
-            .expect_err("host_from alone must be rejected");
+    fn test_parse_tool_attr_rejects_host_from_without_any_permission() -> TestResult {
+        let Err(error) = parse_tool_attr(quote! { host_from = "url" }) else {
+            return Err(TestError::Unexpected(
+                "host_from alone must be rejected".to_owned(),
+            ));
+        };
         assert!(error.to_string().contains("network_access"));
+        Ok(())
     }
 
     /// Kein gültiger Bezeichner → Fehler statt Panik in `Ident::new`.
     #[test]
-    fn test_parse_tool_attr_rejects_non_identifier_host_from() {
-        let error = parse_tool_attr(quote! {
+    fn test_parse_tool_attr_rejects_non_identifier_host_from() -> TestResult {
+        let Err(error) = parse_tool_attr(quote! {
             permission = "network_access",
             host_from = "not a field",
-        })
-        .expect_err("a non-identifier field name must be rejected");
+        }) else {
+            return Err(TestError::Unexpected(
+                "a non-identifier field name must be rejected".to_owned(),
+            ));
+        };
         assert!(error.to_string().contains("valid field identifier"));
+        Ok(())
     }
 
     /// Unbekannter Schlüssel → Fehler, der die unterstützten Schlüssel nennt.
     #[test]
-    fn test_parse_tool_attr_rejects_unknown_key() {
-        let error = parse_tool_attr(quote! { retries = 3 })
-            .expect_err("an unknown key must be a macro diagnostic");
+    fn test_parse_tool_attr_rejects_unknown_key() -> TestResult {
+        let Err(error) = parse_tool_attr(quote! { retries = 3 }) else {
+            return Err(TestError::Unexpected(
+                "an unknown key must be a macro diagnostic".to_owned(),
+            ));
+        };
         let message = error.to_string();
 
         assert!(
             message.contains("host_from") && message.contains("parallel_safe"),
             "message must list the supported keys, got: {message}"
         );
+        Ok(())
     }
 
     // ---------------------------------------------------------------------
@@ -702,18 +731,21 @@ mod tests {
 
     /// Der Permission-Prolog steht vor der Deserialisierung der Argumente.
     #[test]
-    fn test_expand_tool_fn_checks_permission_before_deserialization() {
-        let attr = parse_tool_attr(quote! { permission = "read_workspace" }).expect("parses");
+    fn test_expand_tool_fn_checks_permission_before_deserialization() -> TestResult {
+        let attr =
+            parse_tool_attr(quote! { permission = "read_workspace" }).map_err(ctx("parses"))?;
         let expanded = expand_tool_fn(sample_fn(), attr)
-            .expect("a permission-guarded tool must expand")
+            .map_err(ctx("a permission-guarded tool must expand"))?
             .to_string();
 
         let guard = expanded
             .find("require_permission")
-            .expect("expansion must contain the permission prologue");
-        let deserialize = expanded
-            .find("from_value")
-            .expect("expansion must still deserialize the arguments");
+            .ok_or(TestError::Missing(
+                "expansion must contain the permission prologue",
+            ))?;
+        let deserialize = expanded.find("from_value").ok_or(TestError::Missing(
+            "expansion must still deserialize the arguments",
+        ))?;
 
         assert!(
             guard < deserialize,
@@ -721,41 +753,45 @@ mod tests {
         );
         assert!(expanded.contains("Permission :: ReadWorkspace"));
         assert!(expanded.contains("PARALLEL_SAFE : bool = false"));
+        Ok(())
     }
 
     /// Ohne `permission` wird kein Prolog erzeugt und `PERMISSION` ist `None`.
     #[test]
-    fn test_expand_tool_fn_without_permission_emits_no_prologue() {
-        let attr = parse_tool_attr(quote! { description = "plain" }).expect("parses");
+    fn test_expand_tool_fn_without_permission_emits_no_prologue() -> TestResult {
+        let attr = parse_tool_attr(quote! { description = "plain" }).map_err(ctx("parses"))?;
         let expanded = expand_tool_fn(sample_fn(), attr)
-            .expect("an unguarded tool must still expand")
+            .map_err(ctx("an unguarded tool must still expand"))?
             .to_string();
 
         assert!(!expanded.contains("require_permission"));
         assert!(expanded.contains("PERMISSION : :: core :: option :: Option"));
         assert!(expanded.contains(":: core :: option :: Option :: None"));
+        Ok(())
     }
 
     /// Der Host-Prolog liegt nach der Deserialisierung und bricht bei einem
     /// nicht extrahierbaren Host ab, statt einen leeren Host weiterzureichen.
     #[test]
-    fn test_expand_tool_fn_host_prologue_is_fail_closed() {
+    fn test_expand_tool_fn_host_prologue_is_fail_closed() -> TestResult {
         let attr = parse_tool_attr(quote! {
             permission = "network_access",
             host_from = "url",
         })
-        .expect("parses");
+        .map_err(ctx("parses"))?;
         let expanded = expand_tool_fn(sample_fn(), attr)
-            .expect("a host-guarded tool must expand")
+            .map_err(ctx("a host-guarded tool must expand"))?
             .to_string();
 
-        let deserialize = expanded.find("from_value").expect("deserialization");
+        let deserialize = expanded
+            .find("from_value")
+            .ok_or(TestError::Missing("deserialization"))?;
         let host = expanded
             .find("host_from_url")
-            .expect("expansion must extract the host");
+            .ok_or(TestError::Missing("expansion must extract the host"))?;
         let guard = expanded
             .find("require_host_access")
-            .expect("expansion must check host access");
+            .ok_or(TestError::Missing("expansion must check host access"))?;
 
         assert!(deserialize < host, "the host is read out of the arguments");
         assert!(host < guard, "extraction precedes the scope check");
@@ -768,43 +804,51 @@ mod tests {
             "an unparseable URL must return an explicit error"
         );
         assert!(expanded.contains("args . url"));
+        Ok(())
     }
 
     /// `spec()` überschreibt Name und Beschreibung aus den Consts, damit
     /// `tools()` und `executor(name)` nicht auseinanderlaufen können.
     #[test]
-    fn test_expand_tool_fn_spec_overrides_name_and_description() {
+    fn test_expand_tool_fn_spec_overrides_name_and_description() -> TestResult {
         let attr = parse_tool_attr(quote! {
             name = "http.fetch",
             description = "Fetches a page",
         })
-        .expect("parses");
+        .map_err(ctx("parses"))?;
         let expanded = expand_tool_fn(sample_fn(), attr)
-            .expect("expands")
+            .map_err(ctx("expands"))?
             .to_string();
 
         assert!(expanded.contains("const NAME"));
         assert!(expanded.contains("\"http.fetch\""));
         assert!(expanded.contains("< FetchPageArgs > :: tool_spec ()"));
         assert!(
-            expanded.contains("__function . name = :: harw_tools :: ToolName :: new (Self :: NAME)")
+            expanded
+                .contains("__function . name = :: harw_tools :: ToolName :: new (Self :: NAME)")
         );
         assert!(expanded.contains("__function . description"));
+        Ok(())
     }
 
     /// Nicht-`async fn` bleibt ein Makro-Fehler.
     #[test]
-    fn test_expand_tool_fn_rejects_sync_functions() {
+    fn test_expand_tool_fn_rejects_sync_functions() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             fn fetch_page(context: &ToolExecutionContext, args: FetchPageArgs) -> u8 { 0 }
         };
-        let attr = parse_tool_attr(quote! {}).expect("parses");
-        let error = expand_tool_fn(func, attr).expect_err("sync functions must be rejected");
+        let attr = parse_tool_attr(quote! {}).map_err(ctx("parses"))?;
+        let Err(error) = expand_tool_fn(func, attr) else {
+            return Err(TestError::Unexpected(
+                "sync functions must be rejected".to_owned(),
+            ));
+        };
         assert!(error.to_string().contains("async fn"));
+        Ok(())
     }
 
     #[test]
-    fn schema_for_type_emits_supported_literal_defaults() {
+    fn schema_for_type_emits_supported_literal_defaults() -> TestResult {
         let cases: Vec<(Type, syn::Expr, &str)> = vec![
             (syn::parse_quote!(u8), syn::parse_quote!(10), "json ! (10)"),
             (
@@ -821,7 +865,7 @@ mod tests {
 
         for (ty, default, expected_default) in cases {
             let (schema, optional) = schema_for_type(&ty, None, Some(&default))
-                .expect("supported field type must generate a schema");
+                .map_err(ctx("supported field type must generate a schema"))?;
             let schema = schema.to_string();
 
             assert!(!optional);
@@ -829,10 +873,11 @@ mod tests {
             assert!(schema.contains(":: harw_tools :: serde_json :: json !"));
             assert!(schema.contains(expected_default), "schema was: {schema}");
         }
+        Ok(())
     }
 
     #[test]
-    fn option_field_default_is_emitted_and_not_required() {
+    fn option_field_default_is_emitted_and_not_required() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             struct SearchArgs {
                 required: String,
@@ -842,27 +887,32 @@ mod tests {
         };
 
         let expanded = expand_tool(&input)
-            .expect("supported tool arguments must expand")
+            .map_err(ctx("supported tool arguments must expand"))?
             .to_string();
 
         assert!(expanded.contains(
             "default : :: core :: option :: Option :: Some (:: harw_tools :: serde_json :: json ! (25))"
         ));
         assert!(expanded.contains(":: std :: vec ! [\"required\" . to_string ()]"));
+        Ok(())
     }
 
     #[test]
-    fn rejects_default_expressions_that_cannot_be_serialized_safely() {
+    fn rejects_default_expressions_that_cannot_be_serialized_safely() -> TestResult {
         let field: syn::Field = syn::parse_quote! {
             #[tool(default = DEFAULT_PAGE_SIZE)]
             page_size: u8
         };
 
-        let error =
-            field_default(&field).expect_err("non-literal defaults must remain macro diagnostics");
+        let Err(error) = field_default(&field) else {
+            return Err(TestError::Unexpected(
+                "non-literal defaults must remain macro diagnostics".to_owned(),
+            ));
+        };
         assert_eq!(
             error.to_string(),
             "tool default must be a JSON-compatible literal expression"
         );
+        Ok(())
     }
 }

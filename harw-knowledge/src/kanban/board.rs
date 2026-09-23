@@ -195,7 +195,10 @@ pub fn save_board(store: &KnowledgeStore, board: &Board, lanes: &[Lane]) -> Know
 /// let (_board, _lanes) = load_board(&store, &BoardId::new("board-1"))?;
 /// # Ok::<(), harw_knowledge::KnowledgeError>(())
 /// ```
-pub fn load_board(store: &KnowledgeStore, board_id: &BoardId) -> KnowledgeResult<(Board, Vec<Lane>)> {
+pub fn load_board(
+    store: &KnowledgeStore,
+    board_id: &BoardId,
+) -> KnowledgeResult<(Board, Vec<Lane>)> {
     let path = board_toml_path(store, board_id);
     let content = std::fs::read_to_string(&path)?;
     let record: BoardRecord = toml::from_str(&content)?;
@@ -342,9 +345,11 @@ pub fn save_card(
         .insert(STATE_KEY.to_owned(), serde_json::to_value(card.state)?);
     frontmatter.extra.insert(
         WORK_ID_KEY.to_owned(),
-        card.work_id.as_ref().map_or(serde_json::Value::Null, |work_id| {
-            serde_json::Value::String(work_id.as_str().to_owned())
-        }),
+        card.work_id
+            .as_ref()
+            .map_or(serde_json::Value::Null, |work_id| {
+                serde_json::Value::String(work_id.as_str().to_owned())
+            }),
     );
     frontmatter.extra.insert(
         PARENTS_KEY.to_owned(),
@@ -357,16 +362,19 @@ pub fn save_card(
     );
     frontmatter.extra.insert(
         ASSIGNEE_KEY.to_owned(),
-        card.assignee.as_ref().map_or(serde_json::Value::Null, |assignee| {
-            serde_json::Value::String(assignee.as_str().to_owned())
-        }),
+        card.assignee
+            .as_ref()
+            .map_or(serde_json::Value::Null, |assignee| {
+                serde_json::Value::String(assignee.as_str().to_owned())
+            }),
     );
     frontmatter.extra.insert(
         RETRY_COUNT_KEY.to_owned(),
         serde_json::Value::from(card.retry_count),
     );
 
-    let artifact = KnowledgeArtifact::new(id, ArtifactKind::KanbanCard, frontmatter, card.body.clone());
+    let artifact =
+        KnowledgeArtifact::new(id, ArtifactKind::KanbanCard, frontmatter, card.body.clone());
     store.write_artifact(&path, &artifact)?;
     Ok(artifact)
 }
@@ -380,7 +388,11 @@ pub fn save_card(
 /// - [`KnowledgeError::MalformedFrontmatter`]: ein von [`save_card`]
 ///   geschriebenes `extra`-Feld fehlt oder hat den falschen Typ.
 /// - [`KnowledgeError::Json`]: `state` ließ sich nicht aus JSON dekodieren.
-pub fn load_card(store: &KnowledgeStore, board_id: &BoardId, card_id: &CardId) -> KnowledgeResult<Card> {
+pub fn load_card(
+    store: &KnowledgeStore,
+    board_id: &BoardId,
+    card_id: &CardId,
+) -> KnowledgeResult<Card> {
     let path = store.kanban_card_path(board_id.as_str(), card_id.as_str());
     let id = kanban_card_artifact_id(board_id, card_id);
     let artifact = store.read_artifact(&path, id, ArtifactKind::KanbanCard)?;
@@ -421,7 +433,10 @@ pub fn list_cards(store: &KnowledgeStore, board_id: &BoardId) -> KnowledgeResult
 fn card_from_artifact(card_id: &CardId, artifact: &KnowledgeArtifact) -> KnowledgeResult<Card> {
     let extra = &artifact.frontmatter.extra;
     let missing_field = |field: &str| KnowledgeError::MalformedFrontmatter {
-        detail: format!("kanban card {} missing '{field}' in frontmatter extra", artifact.id),
+        detail: format!(
+            "kanban card {} missing '{field}' in frontmatter extra",
+            artifact.id
+        ),
     };
 
     let title = extra
@@ -433,7 +448,9 @@ fn card_from_artifact(card_id: &CardId, artifact: &KnowledgeArtifact) -> Knowled
         .get(LANE_ID_KEY)
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| missing_field(LANE_ID_KEY))?;
-    let state_value = extra.get(STATE_KEY).ok_or_else(|| missing_field(STATE_KEY))?;
+    let state_value = extra
+        .get(STATE_KEY)
+        .ok_or_else(|| missing_field(STATE_KEY))?;
     let state: CardState = serde_json::from_value(state_value.clone())?;
     let work_id = extra
         .get(WORK_ID_KEY)
@@ -479,6 +496,7 @@ fn card_from_artifact(card_id: &CardId, artifact: &KnowledgeArtifact) -> Knowled
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn terminal_cards_are_done_or_archived_only() {
@@ -498,14 +516,15 @@ mod tests {
         assert!(card.is_terminal());
     }
 
-    fn temporary_root(label: &str) -> std::path::PathBuf {
+    fn temporary_root(label: &str) -> TestResult<std::path::PathBuf> {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock is after epoch")
+            .map_err(crate::test_support::ctx("system clock is after epoch"))?
             .as_nanos();
         let root = std::env::temp_dir().join(format!("{label}-{}-{nonce}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("create temporary knowledge root");
-        root
+        std::fs::create_dir_all(&root)
+            .map_err(crate::test_support::ctx("create temporary knowledge root"))?;
+        Ok(root)
     }
 
     fn sample_card(id: &str, lane: &str, state: CardState) -> Card {
@@ -525,8 +544,8 @@ mod tests {
     }
 
     #[test]
-    fn test_save_and_load_board_round_trips_board_and_lanes() {
-        let root = temporary_root("harw-knowledge-kanban-board-roundtrip");
+    fn test_save_and_load_board_round_trips_board_and_lanes() -> TestResult {
+        let root = temporary_root("harw-knowledge-kanban-board-roundtrip")?;
         let store = KnowledgeStore::new(&root);
         let board_id = BoardId::new("board-1");
         let lane_id = LaneId::new("triage");
@@ -543,17 +562,19 @@ mod tests {
             bound_worker: None,
         }];
 
-        save_board(&store, &board, &lanes).expect("save board");
-        let (loaded_board, loaded_lanes) = load_board(&store, &board_id).expect("load board");
+        save_board(&store, &board, &lanes).map_err(crate::test_support::ctx("save board"))?;
+        let (loaded_board, loaded_lanes) =
+            load_board(&store, &board_id).map_err(crate::test_support::ctx("load board"))?;
 
         assert_eq!(loaded_board, board);
         assert_eq!(loaded_lanes, lanes);
-        std::fs::remove_dir_all(root).expect("remove temporary root");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_list_board_ids_returns_only_directories_with_board_toml() {
-        let root = temporary_root("harw-knowledge-kanban-list-boards");
+    fn test_list_board_ids_returns_only_directories_with_board_toml() -> TestResult {
+        let root = temporary_root("harw-knowledge-kanban-list-boards")?;
         let store = KnowledgeStore::new(&root);
         let board = Board {
             id: BoardId::new("board-a"),
@@ -561,31 +582,41 @@ mod tests {
             lanes: Vec::new(),
             visibility: VisibilityScope::SelfOnly,
         };
-        save_board(&store, &board, &[]).expect("save board");
+        save_board(&store, &board, &[]).map_err(crate::test_support::ctx("save board"))?;
         // A stray directory without a board.toml must not appear.
-        std::fs::create_dir_all(store.root().join("kanban").join("boards").join("not-a-board"))
-            .expect("create stray directory");
+        std::fs::create_dir_all(
+            store
+                .root()
+                .join("kanban")
+                .join("boards")
+                .join("not-a-board"),
+        )
+        .map_err(crate::test_support::ctx("create stray directory"))?;
 
-        let ids = list_board_ids(&store).expect("list boards");
+        let ids = list_board_ids(&store).map_err(crate::test_support::ctx("list boards"))?;
 
         assert_eq!(ids, vec![BoardId::new("board-a")]);
-        std::fs::remove_dir_all(root).expect("remove temporary root");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_list_board_ids_on_missing_root_is_empty() {
-        let root = temporary_root("harw-knowledge-kanban-list-boards-missing");
+    fn test_list_board_ids_on_missing_root_is_empty() -> TestResult {
+        let root = temporary_root("harw-knowledge-kanban-list-boards-missing")?;
         let store = KnowledgeStore::new(&root);
 
-        let ids = list_board_ids(&store).expect("missing boards dir is not an error");
+        let ids = list_board_ids(&store).map_err(crate::test_support::ctx(
+            "missing boards dir is not an error",
+        ))?;
 
         assert!(ids.is_empty());
-        std::fs::remove_dir_all(root).expect("remove temporary root");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_save_and_load_card_round_trips_every_field() {
-        let root = temporary_root("harw-knowledge-kanban-card-roundtrip");
+    fn test_save_and_load_card_round_trips_every_field() -> TestResult {
+        let root = temporary_root("harw-knowledge-kanban-card-roundtrip")?;
         let store = KnowledgeStore::new(&root);
         let board_id = BoardId::new("board-1");
         let author = AgentId::new("agent-1");
@@ -595,88 +626,112 @@ mod tests {
         card.assignee = Some(AgentId::new("agent-2"));
         card.tags = vec!["review-required".to_owned()];
         card.retry_count = 2;
-        let now = jiff::Timestamp::from_second(1_700_000_000).expect("valid timestamp");
+        let now = jiff::Timestamp::from_second(1_700_000_000)
+            .map_err(crate::test_support::ctx("valid timestamp"))?;
 
-        save_card(&store, &board_id, &card, &author, now).expect("save card");
-        let loaded = load_card(&store, &board_id, &card.id).expect("load card");
+        save_card(&store, &board_id, &card, &author, now)
+            .map_err(crate::test_support::ctx("save card"))?;
+        let loaded = load_card(&store, &board_id, &card.id)
+            .map_err(crate::test_support::ctx("load card"))?;
 
         assert_eq!(loaded, card);
-        std::fs::remove_dir_all(root).expect("remove temporary root");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_save_card_preserves_created_at_across_updates() {
-        let root = temporary_root("harw-knowledge-kanban-card-preserve-created");
+    fn test_save_card_preserves_created_at_across_updates() -> TestResult {
+        let root = temporary_root("harw-knowledge-kanban-card-preserve-created")?;
         let store = KnowledgeStore::new(&root);
         let board_id = BoardId::new("board-1");
         let author = AgentId::new("agent-1");
         let card = sample_card("card-1", "todo", CardState::Todo);
-        let created = jiff::Timestamp::from_second(1_700_000_000).expect("valid timestamp");
+        let created = jiff::Timestamp::from_second(1_700_000_000)
+            .map_err(crate::test_support::ctx("valid timestamp"))?;
         let updated = created
             .checked_add(jiff::SignedDuration::from_secs(3600))
-            .expect("valid later timestamp");
+            .map_err(crate::test_support::ctx("valid later timestamp"))?;
 
-        let first = save_card(&store, &board_id, &card, &author, created).expect("first save");
+        let first = save_card(&store, &board_id, &card, &author, created)
+            .map_err(crate::test_support::ctx("first save"))?;
         let mut moved = card.clone();
         moved.state = CardState::Ready;
-        let second = save_card(&store, &board_id, &moved, &author, updated).expect("second save");
+        let second = save_card(&store, &board_id, &moved, &author, updated)
+            .map_err(crate::test_support::ctx("second save"))?;
 
         assert_eq!(second.frontmatter.created_at, first.frontmatter.created_at);
         assert_eq!(second.frontmatter.updated_at, updated);
         assert_eq!(second.frontmatter.author_agent_id, author);
-        std::fs::remove_dir_all(root).expect("remove temporary root");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_list_cards_returns_all_cards_sorted_by_id() {
-        let root = temporary_root("harw-knowledge-kanban-list-cards");
+    fn test_list_cards_returns_all_cards_sorted_by_id() -> TestResult {
+        let root = temporary_root("harw-knowledge-kanban-list-cards")?;
         let store = KnowledgeStore::new(&root);
         let board_id = BoardId::new("board-1");
         let author = AgentId::new("agent-1");
         let now = jiff::Timestamp::now();
         let card_b = sample_card("card-b", "todo", CardState::Todo);
         let card_a = sample_card("card-a", "todo", CardState::Todo);
-        save_card(&store, &board_id, &card_b, &author, now).expect("save card b");
-        save_card(&store, &board_id, &card_a, &author, now).expect("save card a");
+        save_card(&store, &board_id, &card_b, &author, now)
+            .map_err(crate::test_support::ctx("save card b"))?;
+        save_card(&store, &board_id, &card_a, &author, now)
+            .map_err(crate::test_support::ctx("save card a"))?;
 
-        let cards = list_cards(&store, &board_id).expect("list cards");
+        let cards =
+            list_cards(&store, &board_id).map_err(crate::test_support::ctx("list cards"))?;
 
         assert_eq!(cards.len(), 2);
         assert_eq!(cards[0].id, CardId::new("card-a"));
         assert_eq!(cards[1].id, CardId::new("card-b"));
-        std::fs::remove_dir_all(root).expect("remove temporary root");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_list_cards_on_board_with_no_cards_dir_is_empty() {
-        let root = temporary_root("harw-knowledge-kanban-list-cards-missing");
+    fn test_list_cards_on_board_with_no_cards_dir_is_empty() -> TestResult {
+        let root = temporary_root("harw-knowledge-kanban-list-cards-missing")?;
         let store = KnowledgeStore::new(&root);
         let board_id = BoardId::new("board-1");
 
-        let cards = list_cards(&store, &board_id).expect("missing cards dir is not an error");
+        let cards = list_cards(&store, &board_id).map_err(crate::test_support::ctx(
+            "missing cards dir is not an error",
+        ))?;
 
         assert!(cards.is_empty());
-        std::fs::remove_dir_all(root).expect("remove temporary root");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_load_card_rejects_a_frontmatter_missing_the_state_extra_key() {
-        let root = temporary_root("harw-knowledge-kanban-card-missing-state");
+    fn test_load_card_rejects_a_frontmatter_missing_the_state_extra_key() -> TestResult {
+        let root = temporary_root("harw-knowledge-kanban-card-missing-state")?;
         let store = KnowledgeStore::new(&root);
         let board_id = BoardId::new("board-1");
         let author = AgentId::new("agent-1");
         let card = sample_card("card-1", "todo", CardState::Todo);
         let now = jiff::Timestamp::now();
-        let artifact = save_card(&store, &board_id, &card, &author, now).expect("save card");
+        let artifact = save_card(&store, &board_id, &card, &author, now)
+            .map_err(crate::test_support::ctx("save card"))?;
         let mut broken = artifact;
         broken.frontmatter.extra.remove(STATE_KEY);
         store
-            .write_artifact(&store.kanban_card_path(board_id.as_str(), card.id.as_str()), &broken)
-            .expect("overwrite with broken frontmatter");
+            .write_artifact(
+                &store.kanban_card_path(board_id.as_str(), card.id.as_str()),
+                &broken,
+            )
+            .map_err(crate::test_support::ctx(
+                "overwrite with broken frontmatter",
+            ))?;
 
-        let error = load_card(&store, &board_id, &card.id).expect_err("missing state must error");
+        let Err(error) = load_card(&store, &board_id, &card.id) else {
+            return Err(TestError::Unexpected("missing state must error".to_owned()));
+        };
 
         assert!(matches!(error, KnowledgeError::MalformedFrontmatter { .. }));
-        std::fs::remove_dir_all(root).expect("remove temporary root");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
     }
 }

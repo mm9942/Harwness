@@ -7,6 +7,10 @@
 //! # Verantwortungsbereich
 //! - Stellt Session-ID, Turn-ID und Sandbox-Spec (Authority-Boundary) bereit.
 //! - Ermöglicht typsicheren Zugriff auf optionale Laufzeit-Services via [`ServiceMap`].
+//! - Trägt optional den [`harw_types::cancel::CancelToken`] des laufenden Turns
+//!   ([`OpContext::with_cancel_token`]/[`OpContext::cancel_token`]), damit
+//!   Operationen (z. B. ein wartendes Kind-Spawn in `harw-core-bridge`) einen
+//!   Turn-Abbruch beobachten können, ohne selbst von `harw-core` abzuhängen.
 //! - Erzeugt selbst KEINE Authority — Authority stammt ausschließlich vom Executor.
 //!
 //! # Schlüsseltypen
@@ -34,6 +38,7 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 
 use harw_authority::SandboxSpec;
+use harw_types::cancel::CancelToken;
 use harw_types::{SessionId, TurnId};
 
 // ── ServiceMap ────────────────────────────────────────────────────────────────
@@ -145,6 +150,12 @@ impl ServiceMap {
 ///   verwenden und dürfen Workspace- oder Berechtigungsdaten NICHT aus der
 ///   `OpInput` übernehmen.
 /// - **`services`**: Optionale Laufzeit-Services (z. B. HTTP-Client, DB-Pool).
+/// - **`cancel`**: Optionaler [`CancelToken`] des laufenden Turns
+///   ([`Self::with_cancel_token`]/[`Self::cancel_token`]). `None`, solange
+///   der Aufrufer keinen gesetzt hat (z. B. der One-Shot-CLI-Pfad ohne
+///   `TurnControl`) — Operationen, die auf einen Abbruch reagieren wollen
+///   (etwa ein wartendes Kind-Spawn), müssen dann selbst auf einen frischen,
+///   nie abgebrochenen Token zurückfallen.
 ///
 /// # Wichtiger Hinweis zur Authority
 /// `OpContext` **erzeugt selbst KEINE Authority**. Die in `sandbox` codierten
@@ -174,6 +185,7 @@ pub struct OpContext {
     turn_id: TurnId,
     sandbox: SandboxSpec,
     services: ServiceMap,
+    cancel: Option<CancelToken>,
 }
 
 impl OpContext {
@@ -209,7 +221,28 @@ impl OpContext {
             turn_id,
             sandbox,
             services,
+            cancel: None,
         }
+    }
+
+    /// Hängt den [`CancelToken`] des laufenden Turns an diesen Kontext (Builder).
+    ///
+    /// # Beschreibung
+    /// Konsumiert `self` und gibt es mit gesetztem Cancel-Token zurück, damit
+    /// Aufrufer es direkt an `OpContext::new(...)` anhängen können. Ohne
+    /// diesen Aufruf bleibt [`Self::cancel_token`] `None` — bestehende
+    /// Konstruktions-Aufrufe bleiben also unverändert gültig.
+    ///
+    /// # Argumente
+    /// - `cancel` (`CancelToken`): der Cancel-Token des Turns, dessen Abbruch
+    ///   diese Operation beobachten soll (siehe `harw-core::turn_loop::TurnControl::cancel_token`).
+    ///
+    /// # Rückgabe
+    /// `Self` mit `cancel_token() == Some(&cancel)`.
+    #[must_use]
+    pub fn with_cancel_token(mut self, cancel: CancelToken) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 
     /// Gibt die Session-ID zurück.
@@ -241,6 +274,23 @@ impl OpContext {
     #[must_use]
     pub fn sandbox(&self) -> &SandboxSpec {
         &self.sandbox
+    }
+
+    /// Gibt den [`CancelToken`] des laufenden Turns zurück, falls einer gesetzt ist.
+    ///
+    /// # Rückgabe
+    /// - `Some(&CancelToken)`: der Aufrufer hat einen über
+    ///   [`Self::with_cancel_token`] angehängt (der Regelfall während eines
+    ///   Modell-Turns, siehe die Fabrik in
+    ///   `harw-runtime::assembly::install_operation_model_tools`).
+    /// - `None`: kein Turn-Cancel-Token verfügbar (z. B. der One-Shot-CLI-Pfad
+    ///   ohne `TurnControl`, oder ein Test-Fixture). Operationen, die einen
+    ///   Abbruchpfad brauchen, müssen dann selbst auf einen frischen, nie
+    ///   abgebrochenen [`CancelToken`] zurückfallen — nicht fail-closed
+    ///   ablehnen, da ein fehlender Cancel-Token kein Autoritätsfehler ist.
+    #[must_use]
+    pub fn cancel_token(&self) -> Option<&CancelToken> {
+        self.cancel.as_ref()
     }
 
     /// Gibt eine Referenz auf den Service vom Typ `S` zurück, falls registriert.

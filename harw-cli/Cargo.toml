@@ -39,6 +39,12 @@ harw-lens = { path = "../harw-lens" }
 # -- sonst baute dieser Befehl einen Index, den `lens.ask` mangels
 # passendem Modell/passender Chunker-Fassung (K43) doch wieder ablehnt.
 harw-tool-lens = { path = "../harw-tool-lens" }
+# `doc.read_pdf` (Design docs/design/doc_read_pdf_design.md): `src/doc_ocr.rs`
+# installiert deren Mistral-OCR-Backend beim Boot eines Laufzeitpfads
+# (`serve`, `chat`/`analyze`, `gateway`), wenn ein Mistral-Provider
+# konfiguriert ist; ohne Installation fällt das Tool selbst auf die lokale
+# `oxidize-pdf`-Extraktion zurück.
+harw-tool-doc = { path = "../harw-tool-doc" }
 harw-operations = { path = "../harw-operations" }
 harw-ops = { path = "../harw-ops" }
 harw-sandbox = { path = "../harw-sandbox" }
@@ -90,6 +96,7 @@ serde_json = "1"
 harw-install = { path = "../harw-install" }
 harw-model-catalog = { path = "../harw-model-catalog" }
 clap_complete = "4.6.7"
+harw-completions = { path = "../harw-completions", features = ["clap-args"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tracing = "0.1.44"
 tikv-jemallocator = { version = "0.7.0", optional = true }

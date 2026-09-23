@@ -168,10 +168,11 @@ mod tests {
 
     /// Der vom Derive erzeugte Typalias ist nutzbar.
     #[test]
-    fn test_result_alias_is_generated() {
+    fn test_result_alias_is_generated() -> crate::test_support::TestResult {
         fn ok() -> DepsToolResult<u8> {
             Ok(7)
         }
-        assert_eq!(ok().expect("Ok-Wert"), 7);
+        assert_eq!(ok().map_err(crate::test_support::ctx("Ok-Wert"))?, 7);
+        Ok(())
     }
 }

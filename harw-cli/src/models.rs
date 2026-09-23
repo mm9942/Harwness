@@ -42,7 +42,7 @@ use toml_edit::value;
 use harw_config::ConfigWriter;
 use harw_provider_http::discovery::{self, DiscoveredModel};
 
-use crate::cli::{InternalAction, ModelsAction};
+use crate::cli::{InternalAction, ModelsAction, OnOff};
 
 /// Monotoner Zähler für kollisionsfreie Temp-Dateinamen innerhalb dieses
 /// Prozesses (Uniqueness kommt letztlich von `create_new`).
@@ -366,9 +366,7 @@ fn run_scan(
                     // Auth-/Endpunkt-Problem (siehe Modul-Doku) — niemals als
                     // "der Live-Stand ist jetzt leer" interpretieren und
                     // dementsprechend nichts löschen.
-                    println!(
-                        "  0 Modelle gemeldet — nichts entfernt; Anmeldung/Endpunkt prüfen."
-                    );
+                    println!("  0 Modelle gemeldet — nichts entfernt; Anmeldung/Endpunkt prüfen.");
                     add_catalog_fallback_models(&profile, name)?;
                     continue;
                 }
@@ -959,7 +957,7 @@ fn run_internal(home: &Path, action: Option<InternalAction>) -> Result<(), Model
             Ok(())
         }
         Some(InternalAction::OpenrouterDefaults { state }) => {
-            let enabled = state == "on";
+            let enabled = state == OnOff::On;
             set_openrouter_defaults(home, enabled)?;
             println!("use_openrouter_defaults = {enabled}");
             Ok(())
@@ -1022,13 +1020,14 @@ fn set_internal_choice(
     provider: Option<&str>,
 ) -> Result<(), ModelsError> {
     mutate_internal_models_table(home, |table| {
-        let sub = ensure_table(table, point.key());
+        let sub = ensure_table(table, point.key())?;
         sub.insert("model", value(model));
         if let Some(provider) = provider {
             sub.insert("provider", value(provider));
         } else {
             sub.remove("provider");
         }
+        Ok(())
     })
 }
 
@@ -1040,9 +1039,10 @@ fn set_internal_main(
     point: harw_config::InternalModelPoint,
 ) -> Result<(), ModelsError> {
     mutate_internal_models_table(home, |table| {
-        let sub = ensure_table(table, point.key());
+        let sub = ensure_table(table, point.key())?;
         sub.remove("model");
         sub.remove("provider");
+        Ok(())
     })
 }
 
@@ -1054,6 +1054,7 @@ fn reset_internal_choice(
 ) -> Result<(), ModelsError> {
     mutate_internal_models_table(home, |table| {
         table.remove(point.key());
+        Ok(())
     })
 }
 
@@ -1061,6 +1062,7 @@ fn reset_internal_choice(
 fn set_openrouter_defaults(home: &Path, enabled: bool) -> Result<(), ModelsError> {
     mutate_internal_models_table(home, |table| {
         table.insert("use_openrouter_defaults", value(enabled));
+        Ok(())
     })
 }
 
@@ -1076,13 +1078,13 @@ fn set_openrouter_defaults(home: &Path, enabled: bool) -> Result<(), ModelsError
 /// `[internal_models]` kein Feld von `PermissionsSection` berührt.
 fn mutate_internal_models_table(
     home: &Path,
-    mutate: impl FnOnce(&mut toml_edit::Table),
+    mutate: impl FnOnce(&mut toml_edit::Table) -> Result<(), ModelsError>,
 ) -> Result<(), ModelsError> {
     let path = global_config_path(home)?;
     let mut doc = open_document(&path)?;
     let root = doc.as_table_mut();
-    let table = ensure_table(root, "internal_models");
-    mutate(table);
+    let table = ensure_table(root, "internal_models")?;
+    mutate(table)?;
     write_atomic(&path, doc.to_string().as_bytes())
 }
 
@@ -1110,14 +1112,27 @@ fn open_document(path: &Path) -> Result<toml_edit::DocumentMut, ModelsError> {
 /// Stellt sicher, dass `table[key]` eine Tabelle ist, und gibt eine
 /// veränderliche Referenz darauf zurück. Minimal nachgebaut aus
 /// `harw_config::writer::ensure_table` (privat in der Schwester-Crate).
-fn ensure_table<'a>(table: &'a mut toml_edit::Table, key: &str) -> &'a mut toml_edit::Table {
+///
+/// # Errors
+/// [`ModelsError::Config`] mit [`harw_config::ConfigError::WriterShapeMismatch`],
+/// falls `table[key]` unmittelbar nach dem Normalisieren auf eine Tabelle
+/// dennoch nicht als Tabelle gelesen werden kann (interner Zustandsfehler).
+fn ensure_table<'a>(
+    table: &'a mut toml_edit::Table,
+    key: &str,
+) -> Result<&'a mut toml_edit::Table, ModelsError> {
     if !matches!(table.get(key), Some(item) if item.is_table()) {
         table.insert(key, toml_edit::Item::Table(toml_edit::Table::new()));
     }
-    match table.get_mut(key).and_then(toml_edit::Item::as_table_mut) {
-        Some(table) => table,
-        None => unreachable!("key {key:?} was just normalised to a table"),
-    }
+    table
+        .get_mut(key)
+        .and_then(toml_edit::Item::as_table_mut)
+        .ok_or_else(|| {
+            ModelsError::from(harw_config::ConfigError::WriterShapeMismatch {
+                key: key.to_owned(),
+                expected: "table",
+            })
+        })
 }
 
 // ---------------------------------------------------------------------
@@ -1130,7 +1145,7 @@ fn ensure_table<'a>(table: &'a mut toml_edit::Table, key: &str) -> &'a mut toml_
 fn set_default_model(home: &Path, id: &str) -> Result<(), ModelsError> {
     let path = global_config_path(home)?;
     let mut writer = ConfigWriter::open(&path)?;
-    writer.set_value("default_model", value(id));
+    writer.set_value("default_model", value(id))?;
     writer.save()?;
     Ok(())
 }
@@ -1187,12 +1202,13 @@ fn write_atomic(path: &Path, content: &[u8]) -> Result<(), ModelsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
-    fn temp_home() -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn temp_home() -> TestResult<(tempfile::TempDir, PathBuf)> {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let home = dir.path().join("harw-home");
-        harw_home::ensure_home(&home).expect("ensure_home");
-        (dir, home)
+        harw_home::ensure_home(&home).map_err(ctx("ensure_home"))?;
+        Ok((dir, home))
     }
 
     #[test]
@@ -1209,18 +1225,18 @@ mod tests {
     }
 
     #[test]
-    fn add_then_delete_changes_only_the_selected_provider_models() {
-        let (_guard, home) = temp_home();
+    fn add_then_delete_changes_only_the_selected_provider_models() -> TestResult {
+        let (_guard, home) = temp_home()?;
         let profile = home.join("profiles/default");
         let providers = profile.join("providers");
         let models = profile.join("models");
-        std::fs::create_dir_all(&providers).expect("providers dir");
-        std::fs::create_dir_all(&models).expect("models dir");
+        std::fs::create_dir_all(&providers).map_err(ctx("providers dir"))?;
+        std::fs::create_dir_all(&models).map_err(ctx("models dir"))?;
         std::fs::write(
             providers.join("acme.toml"),
             "name = \"acme\"\napi = \"openai-chat\"\nbase_url = \"https://api.example.test/v1\"\nauth = \"env:ACME_TOKEN\"\nenabled = true\nmodels = []\n",
         )
-        .expect("provider");
+        .map_err(ctx("provider"))?;
         let live = harw_config::ModelToml {
             id: "model/with-slash".to_owned(),
             name: None,
@@ -1237,24 +1253,25 @@ mod tests {
         let cache_path = models.join(model_filename(&live.id));
         std::fs::write(
             &cache_path,
-            toml::to_string(&live).expect("serialize model"),
+            toml::to_string(&live).map_err(ctx("serialize model"))?,
         )
-        .expect("model cache");
+        .map_err(ctx("model cache"))?;
 
-        add_model(&home, "acme/model/with-slash").expect("add live model");
+        add_model(&home, "acme/model/with-slash").map_err(ctx("add live model"))?;
         let provider: harw_config::ProviderToml = toml::from_str(
-            &std::fs::read_to_string(providers.join("acme.toml")).expect("read provider"),
+            &std::fs::read_to_string(providers.join("acme.toml")).map_err(ctx("read provider"))?,
         )
-        .expect("parse provider");
+        .map_err(ctx("parse provider"))?;
         assert_eq!(provider.models, ["model/with-slash"]);
 
-        delete_model(&home, "acme/model/with-slash").expect("delete model");
+        delete_model(&home, "acme/model/with-slash").map_err(ctx("delete model"))?;
         let provider: harw_config::ProviderToml = toml::from_str(
-            &std::fs::read_to_string(providers.join("acme.toml")).expect("read provider"),
+            &std::fs::read_to_string(providers.join("acme.toml")).map_err(ctx("read provider"))?,
         )
-        .expect("parse provider");
+        .map_err(ctx("parse provider"))?;
         assert!(provider.models.is_empty());
         assert!(!cache_path.exists());
+        Ok(())
     }
 
     #[test]
@@ -1288,10 +1305,10 @@ mod tests {
     }
 
     #[test]
-    fn scan_sync_replaces_live_models_and_removes_only_missing_provider_models() {
-        let (_guard, home) = temp_home();
+    fn scan_sync_replaces_live_models_and_removes_only_missing_provider_models() -> TestResult {
+        let (_guard, home) = temp_home()?;
         let models_dir = home.join("profiles/default/models");
-        std::fs::create_dir_all(&models_dir).expect("models dir");
+        std::fs::create_dir_all(&models_dir).map_err(ctx("models dir"))?;
         let old = harw_config::ModelToml {
             id: "gone".to_owned(),
             name: None,
@@ -1309,13 +1326,16 @@ mod tests {
             provider: "other".to_owned(),
             ..old.clone()
         };
-        std::fs::write(models_dir.join("gone.toml"), toml::to_string(&old).unwrap())
-            .expect("write stale model");
+        std::fs::write(
+            models_dir.join("gone.toml"),
+            toml::to_string(&old).map_err(ctx("serialize stale model"))?,
+        )
+        .map_err(ctx("write stale model"))?;
         std::fs::write(
             models_dir.join("other.toml"),
-            toml::to_string(&other).unwrap(),
+            toml::to_string(&other).map_err(ctx("serialize other provider model"))?,
         )
-        .expect("write other provider model");
+        .map_err(ctx("write other provider model"))?;
 
         let live = DiscoveredModel {
             id: "current".to_owned(),
@@ -1325,31 +1345,33 @@ mod tests {
             supports_tools: Some(true),
         };
         sync_discovered_model_files(&models_dir, "acme", &[live], true, &BTreeMap::new())
-            .expect("sync models");
+            .map_err(ctx("sync models"))?;
 
         assert!(!models_dir.join("gone.toml").exists());
         assert!(models_dir.join("other.toml").exists());
         let current: harw_config::ModelToml = toml::from_str(
-            &std::fs::read_to_string(models_dir.join("current.toml")).expect("read current"),
+            &std::fs::read_to_string(models_dir.join("current.toml"))
+                .map_err(ctx("read current"))?,
         )
-        .expect("parse current");
+        .map_err(ctx("parse current"))?;
         assert_eq!(current.provider, "acme");
         assert_eq!(current.context_window, Some(262_144));
         assert!(current.capabilities.tool_use);
+        Ok(())
     }
 
     #[test]
-    fn scan_sync_updates_the_tui_provider_model_list_without_touching_auth() {
-        let (_guard, home) = temp_home();
+    fn scan_sync_updates_the_tui_provider_model_list_without_touching_auth() -> TestResult {
+        let (_guard, home) = temp_home()?;
         let profile = home.join("profiles/default");
         let providers = profile.join("providers");
-        std::fs::create_dir_all(&providers).expect("providers dir");
+        std::fs::create_dir_all(&providers).map_err(ctx("providers dir"))?;
         let path = providers.join("acme.toml");
         std::fs::write(
             &path,
             "# keep this comment\nname = \"acme\"\napi = \"openai-chat\"\nbase_url = \"https://api.example.test/v1\"\nauth = \"file:/home/test/.harw/secrets/acme.key\"\nmodels = [\"stale\", \"zeta\"]\n",
         )
-        .expect("write provider");
+        .map_err(ctx("write provider"))?;
         let models = [
             DiscoveredModel {
                 id: "zeta".to_owned(),
@@ -1368,30 +1390,32 @@ mod tests {
         ];
 
         sync_provider_model_list(&profile, "acme", &models, true, &BTreeMap::new())
-            .expect("sync provider list");
+            .map_err(ctx("sync provider list"))?;
 
-        let content = std::fs::read_to_string(&path).expect("read provider");
+        let content = std::fs::read_to_string(&path).map_err(ctx("read provider"))?;
         assert!(content.contains("# keep this comment"));
         assert!(content.contains("auth = \"file:/home/test/.harw/secrets/acme.key\""));
-        let provider: harw_config::ProviderToml = toml::from_str(&content).expect("parse provider");
+        let provider: harw_config::ProviderToml =
+            toml::from_str(&content).map_err(ctx("parse provider"))?;
         assert_eq!(provider.models, ["zeta"]);
+        Ok(())
     }
 
     /// Baut das Provider-Datei-Fixture für die `--prune`-Regressionstests:
     /// eine `models`-Auswahl mit einem veralteten und einem noch verwendeten
     /// (protected) Eintrag, plus die passenden `models/*.toml`-Caches.
-    fn prune_fixture(home: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    fn prune_fixture(home: &Path) -> TestResult<(PathBuf, PathBuf, PathBuf, PathBuf)> {
         let profile = home.join("profiles/default");
         let providers = profile.join("providers");
         let models_dir = profile.join("models");
-        std::fs::create_dir_all(&providers).expect("providers dir");
-        std::fs::create_dir_all(&models_dir).expect("models dir");
+        std::fs::create_dir_all(&providers).map_err(ctx("providers dir"))?;
+        std::fs::create_dir_all(&models_dir).map_err(ctx("models dir"))?;
         let provider_path = providers.join("acme.toml");
         std::fs::write(
             &provider_path,
             "name = \"acme\"\napi = \"openai-chat\"\nbase_url = \"https://api.example.test/v1\"\nauth = \"env:ACME_TOKEN\"\nenabled = true\nmodels = [\"stale-model\", \"gpt-5.6-terra\"]\n",
         )
-        .expect("write provider");
+        .map_err(ctx("write provider"))?;
 
         let stale = harw_config::ModelToml {
             id: "stale-model".to_owned(),
@@ -1412,32 +1436,38 @@ mod tests {
         };
         let stale_path = models_dir.join(model_filename(&stale.id));
         let default_path = models_dir.join(model_filename(&default_model.id));
-        std::fs::write(&stale_path, toml::to_string(&stale).unwrap()).expect("stale cache");
-        std::fs::write(&default_path, toml::to_string(&default_model).unwrap())
-            .expect("default cache");
+        std::fs::write(
+            &stale_path,
+            toml::to_string(&stale).map_err(ctx("serialize stale cache"))?,
+        )
+        .map_err(ctx("stale cache"))?;
+        std::fs::write(
+            &default_path,
+            toml::to_string(&default_model).map_err(ctx("serialize default cache"))?,
+        )
+        .map_err(ctx("default cache"))?;
 
-        (profile, provider_path, stale_path, default_path)
+        Ok((profile, provider_path, stale_path, default_path))
     }
 
     #[test]
-    fn test_sync_functions_delete_nothing_when_discovered_is_empty() {
+    fn test_sync_functions_delete_nothing_when_discovered_is_empty() -> TestResult {
         // Regression: ein Provider-Scan, der 0 Modelle meldet (z. B. wegen
         // eines Auth-Problems), darf weder die Auswahl noch den Datei-Cache
         // leerräumen — selbst wenn `--prune` gesetzt ist.
-        let (_guard, home) = temp_home();
-        let (profile, provider_path, stale_path, default_path) = prune_fixture(&home);
+        let (_guard, home) = temp_home()?;
+        let (profile, provider_path, stale_path, default_path) = prune_fixture(&home)?;
         let models_dir = profile.join("models");
         let protected: BTreeMap<String, ProtectionReason> = BTreeMap::new();
 
         sync_provider_model_list(&profile, "acme", &[], true, &protected)
-            .expect("empty sync of provider list must succeed");
+            .map_err(ctx("empty sync of provider list must succeed"))?;
         sync_discovered_model_files(&models_dir, "acme", &[], true, &protected)
-            .expect("empty sync of model files must succeed");
+            .map_err(ctx("empty sync of model files must succeed"))?;
 
-        let provider: harw_config::ProviderToml = toml::from_str(
-            &std::fs::read_to_string(&provider_path).expect("read provider"),
-        )
-        .expect("parse provider");
+        let provider: harw_config::ProviderToml =
+            toml::from_str(&std::fs::read_to_string(&provider_path).map_err(ctx("read provider"))?)
+                .map_err(ctx("parse provider"))?;
         // Bei leerem `discovered` kehrt `sync_provider_model_list` sofort
         // zurück (siehe Funktionskommentar), ohne die Datei anzufassen — die
         // Auswahl bleibt exakt in der Reihenfolge erhalten, in der das
@@ -1445,12 +1475,13 @@ mod tests {
         assert_eq!(provider.models, ["stale-model", "gpt-5.6-terra"]);
         assert!(stale_path.exists());
         assert!(default_path.exists());
+        Ok(())
     }
 
     #[test]
-    fn test_sync_without_prune_adds_live_but_deletes_nothing() {
-        let (_guard, home) = temp_home();
-        let (profile, provider_path, stale_path, default_path) = prune_fixture(&home);
+    fn test_sync_without_prune_adds_live_but_deletes_nothing() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        let (profile, provider_path, stale_path, default_path) = prune_fixture(&home)?;
         let models_dir = profile.join("models");
         let live = [DiscoveredModel {
             id: "new-model".to_owned(),
@@ -1462,27 +1493,30 @@ mod tests {
         let protected: BTreeMap<String, ProtectionReason> = BTreeMap::new();
 
         sync_provider_model_list(&profile, "acme", &live, false, &protected)
-            .expect("sync provider list without prune");
+            .map_err(ctx("sync provider list without prune"))?;
         sync_discovered_model_files(&models_dir, "acme", &live, false, &protected)
-            .expect("sync model files without prune");
+            .map_err(ctx("sync model files without prune"))?;
 
-        let provider: harw_config::ProviderToml = toml::from_str(
-            &std::fs::read_to_string(&provider_path).expect("read provider"),
-        )
-        .expect("parse provider");
+        let provider: harw_config::ProviderToml =
+            toml::from_str(&std::fs::read_to_string(&provider_path).map_err(ctx("read provider"))?)
+                .map_err(ctx("parse provider"))?;
         // Ohne `--prune` schreibt `sync_provider_model_list` die Auswahl
         // nicht zurück (nur "nicht mehr gemeldet"-Meldungen) — die
         // ursprüngliche, unsortierte Fixture-Reihenfolge bleibt erhalten.
         assert_eq!(provider.models, ["stale-model", "gpt-5.6-terra"]);
-        assert!(stale_path.exists(), "ohne --prune bleibt Alt-Cache erhalten");
+        assert!(
+            stale_path.exists(),
+            "ohne --prune bleibt Alt-Cache erhalten"
+        );
         assert!(default_path.exists());
         assert!(models_dir.join(model_filename("new-model")).exists());
+        Ok(())
     }
 
     #[test]
-    fn test_sync_with_prune_removes_unreferenced_but_keeps_protected() {
-        let (_guard, home) = temp_home();
-        let (profile, provider_path, stale_path, default_path) = prune_fixture(&home);
+    fn test_sync_with_prune_removes_unreferenced_but_keeps_protected() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        let (profile, provider_path, stale_path, default_path) = prune_fixture(&home)?;
         let models_dir = profile.join("models");
         let mut protected = BTreeMap::new();
         protected.insert("gpt-5.6-terra".to_owned(), ProtectionReason::InUse);
@@ -1498,18 +1532,21 @@ mod tests {
         }];
 
         sync_provider_model_list(&profile, "acme", &live, true, &protected)
-            .expect("sync provider list with prune");
+            .map_err(ctx("sync provider list with prune"))?;
         sync_discovered_model_files(&models_dir, "acme", &live, true, &protected)
-            .expect("sync model files with prune");
+            .map_err(ctx("sync model files with prune"))?;
 
-        let provider: harw_config::ProviderToml = toml::from_str(
-            &std::fs::read_to_string(&provider_path).expect("read provider"),
-        )
-        .expect("parse provider");
+        let provider: harw_config::ProviderToml =
+            toml::from_str(&std::fs::read_to_string(&provider_path).map_err(ctx("read provider"))?)
+                .map_err(ctx("parse provider"))?;
         assert!(!provider.models.contains(&"stale-model".to_owned()));
         assert!(provider.models.contains(&"gpt-5.6-terra".to_owned()));
-        assert!(!stale_path.exists(), "unreferenziertes Modell wird entfernt");
+        assert!(
+            !stale_path.exists(),
+            "unreferenziertes Modell wird entfernt"
+        );
         assert!(default_path.exists(), "default_model bleibt erhalten");
+        Ok(())
     }
 
     #[test]
@@ -1560,8 +1597,8 @@ mod tests {
     }
 
     #[test]
-    fn test_protected_model_ids_ignores_uia_worker_model_when_its_provider_does_not_match_uia_provider(
-    ) {
+    fn test_protected_model_ids_ignores_uia_worker_model_when_its_provider_does_not_match_uia_provider()
+     {
         // `uia_worker_model` hat kein eigenes Provider-Feld (siehe
         // `harw-config/src/harness_config.rs`: "Der Provider ist hier
         // bewusst nicht separat wählbar — er muss zwingend mit dem
@@ -1615,6 +1652,7 @@ mod tests {
             rate_limit: None,
             max_concurrency: None,
             default_reasoning_effort: None,
+            gateway_identity_headers: false,
         }
     }
 
@@ -1685,16 +1723,16 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_provider_model_list_reports_referenced_reason_in_output() {
-        let (_guard, home) = temp_home();
+    fn test_sync_provider_model_list_reports_referenced_reason_in_output() -> TestResult {
+        let (_guard, home) = temp_home()?;
         let profile = home.join("profiles/default");
         let providers = profile.join("providers");
-        std::fs::create_dir_all(&providers).expect("providers dir");
+        std::fs::create_dir_all(&providers).map_err(ctx("providers dir"))?;
         std::fs::write(
             providers.join("openai.toml"),
             "name = \"openai\"\napi = \"openai-chat\"\nbase_url = \"https://api.openai.com/v1\"\nauth = \"env:OPENAI_TOKEN\"\nmodels = [\"gpt-5.6-terra\"]\n",
         )
-        .expect("write provider");
+        .map_err(ctx("write provider"))?;
         let mut protected = BTreeMap::new();
         protected.insert(
             "gpt-5.6-terra".to_owned(),
@@ -1714,114 +1752,127 @@ mod tests {
         }];
 
         sync_provider_model_list(&profile, "openai", &live, true, &protected)
-            .expect("sync provider list with cross-reference protection");
+            .map_err(ctx("sync provider list with cross-reference protection"))?;
 
         let provider: harw_config::ProviderToml = toml::from_str(
-            &std::fs::read_to_string(providers.join("openai.toml")).expect("read provider"),
+            &std::fs::read_to_string(providers.join("openai.toml"))
+                .map_err(ctx("read provider"))?,
         )
-        .expect("parse provider");
+        .map_err(ctx("parse provider"))?;
         assert_eq!(provider.models, ["gpt-5.6-terra"]);
+        Ok(())
     }
 
     #[test]
     fn test_has_placeholder_base_url_detects_known_placeholder_patterns() {
-        assert!(has_placeholder_base_url(
-            "https://<dein-worker>.example/v1"
-        ));
+        assert!(has_placeholder_base_url("https://<dein-worker>.example/v1"));
         assert!(has_placeholder_base_url("https://example.invalid/v1"));
         assert!(!has_placeholder_base_url("https://api.openai.com/v1"));
     }
 
     #[test]
-    fn test_add_catalog_fallback_models_adds_unconfigured_catalog_ids_without_removing() {
-        let (_guard, home) = temp_home();
+    fn test_add_catalog_fallback_models_adds_unconfigured_catalog_ids_without_removing()
+    -> TestResult {
+        let (_guard, home) = temp_home()?;
         let profile = home.join("profiles/default");
         let providers = profile.join("providers");
-        std::fs::create_dir_all(&providers).expect("providers dir");
+        std::fs::create_dir_all(&providers).map_err(ctx("providers dir"))?;
         std::fs::write(
             providers.join("openai.toml"),
             "name = \"openai\"\napi = \"openai-chat\"\nbase_url = \"https://api.openai.com/v1\"\nauth = \"env:OPENAI_TOKEN\"\nmodels = [\"kept-existing-model\"]\n",
         )
-        .expect("write provider");
+        .map_err(ctx("write provider"))?;
 
-        add_catalog_fallback_models(&profile, "openai").expect("add catalog fallback");
+        add_catalog_fallback_models(&profile, "openai").map_err(ctx("add catalog fallback"))?;
 
         let provider: harw_config::ProviderToml = toml::from_str(
-            &std::fs::read_to_string(providers.join("openai.toml")).expect("read provider"),
+            &std::fs::read_to_string(providers.join("openai.toml"))
+                .map_err(ctx("read provider"))?,
         )
-        .expect("parse provider");
+        .map_err(ctx("parse provider"))?;
         assert!(provider.models.contains(&"kept-existing-model".to_owned()));
         assert!(
             provider.models.len() > 1,
             "Katalog-Modelle für openai müssen additiv ergänzt werden"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_add_catalog_fallback_models_skips_unknown_provider_and_placeholder_base_url() {
-        let (_guard, home) = temp_home();
+    fn test_add_catalog_fallback_models_skips_unknown_provider_and_placeholder_base_url()
+    -> TestResult {
+        let (_guard, home) = temp_home()?;
         let profile = home.join("profiles/default");
         let providers = profile.join("providers");
-        std::fs::create_dir_all(&providers).expect("providers dir");
+        std::fs::create_dir_all(&providers).map_err(ctx("providers dir"))?;
         std::fs::write(
             providers.join("cf-worker.toml"),
             "name = \"cf-worker\"\napi = \"openai-chat\"\nbase_url = \"https://<dein-worker>.example/v1\"\nauth = \"env:CF_TOKEN\"\nmodels = []\n",
         )
-        .expect("write provider");
+        .map_err(ctx("write provider"))?;
         std::fs::write(
             providers.join("ghost.toml"),
             "name = \"ghost\"\napi = \"openai-chat\"\nbase_url = \"https://ghost.example.com/v1\"\nauth = \"env:GHOST_TOKEN\"\nmodels = []\n",
         )
-        .expect("write provider");
+        .map_err(ctx("write provider"))?;
 
         add_catalog_fallback_models(&profile, "cf-worker")
-            .expect("placeholder base_url must not error");
+            .map_err(ctx("placeholder base_url must not error"))?;
         add_catalog_fallback_models(&profile, "ghost")
-            .expect("unknown catalog entry must not error");
+            .map_err(ctx("unknown catalog entry must not error"))?;
 
         let cf_worker: harw_config::ProviderToml = toml::from_str(
-            &std::fs::read_to_string(providers.join("cf-worker.toml")).expect("read provider"),
+            &std::fs::read_to_string(providers.join("cf-worker.toml"))
+                .map_err(ctx("read provider"))?,
         )
-        .expect("parse provider");
+        .map_err(ctx("parse provider"))?;
         assert!(
             cf_worker.models.is_empty(),
             "Platzhalter-base_url darf keine Katalog-Modelle hinzufügen"
         );
 
         let ghost: harw_config::ProviderToml = toml::from_str(
-            &std::fs::read_to_string(providers.join("ghost.toml")).expect("read provider"),
+            &std::fs::read_to_string(providers.join("ghost.toml")).map_err(ctx("read provider"))?,
         )
-        .expect("parse provider");
+        .map_err(ctx("parse provider"))?;
         assert!(
             ghost.models.is_empty(),
             "unbekannter Provider ohne Katalog-Eintrag darf nichts hinzufügen"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_parse_point_rejects_unknown_key_and_lists_valid_ones() {
-        let error = parse_point("does-not-exist").expect_err("unknown point must be rejected");
+    fn test_parse_point_rejects_unknown_key_and_lists_valid_ones() -> TestResult {
+        let result = parse_point("does-not-exist");
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "unknown point must be rejected".into(),
+            ));
+        };
         let message = error.to_string();
         assert!(message.contains("session_title"));
         assert!(message.contains("does-not-exist"));
+        Ok(())
     }
 
     #[test]
-    fn test_set_default_model_round_trips_through_global_config() {
-        let (_guard, home) = temp_home();
-        set_default_model(&home, "gpt-5.4").expect("set default model");
+    fn test_set_default_model_round_trips_through_global_config() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        set_default_model(&home, "gpt-5.4").map_err(ctx("set default model"))?;
 
-        let path = global_config_path(&home).expect("global config path");
-        let writer = ConfigWriter::open(&path).expect("reopen");
+        let path = global_config_path(&home).map_err(ctx("global config path"))?;
+        let writer = ConfigWriter::open(&path).map_err(ctx("reopen"))?;
         assert_eq!(
             writer.get_value("default_model"),
             Some("gpt-5.4".to_owned())
         );
+        Ok(())
     }
 
     #[test]
-    fn test_internal_set_main_reset_round_trip() {
-        let (_guard, home) = temp_home();
+    fn test_internal_set_main_reset_round_trip() -> TestResult {
+        let (_guard, home) = temp_home()?;
         let point = harw_config::InternalModelPoint::Explorer;
 
         set_internal_choice(
@@ -1830,9 +1881,9 @@ mod tests {
             "nvidia/nemotron-3-super-120b-a12b",
             Some("openrouter"),
         )
-        .expect("set internal choice");
-        let path = global_config_path(&home).expect("global config path");
-        let writer = ConfigWriter::open(&path).expect("reopen after set");
+        .map_err(ctx("set internal choice"))?;
+        let path = global_config_path(&home).map_err(ctx("global config path"))?;
+        let writer = ConfigWriter::open(&path).map_err(ctx("reopen after set"))?;
         assert_eq!(
             writer.get_value("internal_models.explorer.model"),
             Some("nvidia/nemotron-3-super-120b-a12b".to_owned())
@@ -1842,32 +1893,34 @@ mod tests {
             Some("openrouter".to_owned())
         );
 
-        set_internal_main(&home, point).expect("force main model");
-        let writer = ConfigWriter::open(&path).expect("reopen after main");
+        set_internal_main(&home, point).map_err(ctx("force main model"))?;
+        let writer = ConfigWriter::open(&path).map_err(ctx("reopen after main"))?;
         assert_eq!(writer.get_value("internal_models.explorer.model"), None);
         assert_eq!(writer.get_value("internal_models.explorer.provider"), None);
 
-        reset_internal_choice(&home, point).expect("reset choice");
-        let content = std::fs::read_to_string(&path).expect("read config after reset");
+        reset_internal_choice(&home, point).map_err(ctx("reset choice"))?;
+        let content = std::fs::read_to_string(&path).map_err(ctx("read config after reset"))?;
         assert!(!content.contains("[internal_models.explorer]"));
+        Ok(())
     }
 
     #[test]
-    fn test_openrouter_defaults_toggle_round_trips() {
-        let (_guard, home) = temp_home();
-        set_openrouter_defaults(&home, false).expect("disable openrouter defaults");
-        let path = global_config_path(&home).expect("global config path");
-        let writer = ConfigWriter::open(&path).expect("reopen");
+    fn test_openrouter_defaults_toggle_round_trips() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        set_openrouter_defaults(&home, false).map_err(ctx("disable openrouter defaults"))?;
+        let path = global_config_path(&home).map_err(ctx("global config path"))?;
+        let writer = ConfigWriter::open(&path).map_err(ctx("reopen"))?;
         assert_eq!(
             writer.get_value("internal_models.use_openrouter_defaults"),
             Some("false".to_owned())
         );
+        Ok(())
     }
 
     #[test]
-    fn test_run_scan_reports_unknown_provider() {
-        let (_guard, home) = temp_home();
-        let error = execute(
+    fn test_run_scan_reports_unknown_provider() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        let result = execute(
             &home,
             Some(ModelsAction::Scan {
                 provider: Some("ghost".to_owned()),
@@ -1875,14 +1928,18 @@ mod tests {
                 free_only: false,
                 prune: false,
             }),
-        )
-        .expect_err("unknown provider must error");
+        );
+        let Err(error) = result else {
+            return Err(TestError::Unexpected("unknown provider must error".into()));
+        };
         assert!(matches!(error, ModelsError::ProviderNotFound { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_run_list_without_providers_succeeds() {
-        let (_guard, home) = temp_home();
-        execute(&home, None).expect("list without providers must still succeed");
+    fn test_run_list_without_providers_succeeds() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        execute(&home, None).map_err(ctx("list without providers must still succeed"))?;
+        Ok(())
     }
 }

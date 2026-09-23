@@ -200,35 +200,47 @@ pub(crate) fn harw_event_channel() -> (HarwEventSender, mpsc::UnboundedReceiver<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     /// Prüft, dass ein über `HarwEventSender::send` geschicktes
     /// `HarwEvent::Submit` unverändert beim Empfänger ankommt.
     #[tokio::test]
-    async fn test_send_submit_empfangen() {
+    async fn test_send_submit_empfangen() -> TestResult {
         let (sender, mut receiver) = harw_event_channel();
         let nachricht = "Hallo, Welt!".to_owned();
 
         sender.send(HarwEvent::Submit(nachricht.clone()));
 
-        let empfangen = receiver.recv().await.expect("Kanal sollte offen sein");
+        let empfangen = receiver
+            .recv()
+            .await
+            .ok_or(TestError::Missing("Kanal sollte offen sein"))?;
         assert_eq!(empfangen, HarwEvent::Submit(nachricht));
+        Ok(())
     }
 
     /// Prüft, dass ein geklonter `HarwEventSender` denselben Kanal verwendet:
     /// Nachrichten beider Sender landen beim selben Empfänger in FIFO-Reihenfolge.
     #[tokio::test]
-    async fn test_clone_sender_gleicher_kanal() {
+    async fn test_clone_sender_gleicher_kanal() -> TestResult {
         let (sender1, mut receiver) = harw_event_channel();
         let sender2 = sender1.clone();
 
         sender1.send(HarwEvent::SystemMessage("erster".to_owned()));
         sender2.send(HarwEvent::Quit);
 
-        let erste = receiver.recv().await.expect("erste Nachricht");
-        let zweite = receiver.recv().await.expect("zweite Nachricht");
+        let erste = receiver
+            .recv()
+            .await
+            .ok_or(TestError::Missing("erste Nachricht"))?;
+        let zweite = receiver
+            .recv()
+            .await
+            .ok_or(TestError::Missing("zweite Nachricht"))?;
 
         assert_eq!(erste, HarwEvent::SystemMessage("erster".to_owned()));
         assert_eq!(zweite, HarwEvent::Quit);
+        Ok(())
     }
 
     /// Prüft, dass ein Sende-Versuch nach Schließen des Empfängers nicht

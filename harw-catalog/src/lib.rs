@@ -707,9 +707,10 @@ impl std::error::Error for CatalogError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use harw_config::{AgentSuggestionsToml, PluginCapabilitiesToml};
     #[test]
-    fn snapshot_keeps_disabled_entries_out_of_agent_context() {
+    fn snapshot_keeps_disabled_entries_out_of_agent_context() -> TestResult {
         let mut config = ResolvedConfig::default();
         config.agents.insert(
             "worker".to_owned(),
@@ -770,16 +771,17 @@ mod tests {
         );
 
         let suggestions = CatalogSnapshot::from_config(&config)
-            .unwrap()
+            .map_err(ctx("from_config"))?
             .suggestions_for_agent("worker")
-            .unwrap();
+            .map_err(ctx("suggestions_for_agent"))?;
         assert_eq!(suggestions.available.len(), 1);
         assert_eq!(suggestions.available[0].name, "review");
         assert_eq!(suggestions.omitted.len(), 2);
+        Ok(())
     }
 
     #[test]
-    fn activation_snapshot_freezes_only_explicit_enabled_agent_suggestions() {
+    fn activation_snapshot_freezes_only_explicit_enabled_agent_suggestions() -> TestResult {
         let mut config = ResolvedConfig::default();
         config.agents.insert(
             "worker".to_owned(),
@@ -829,7 +831,7 @@ mod tests {
         );
 
         let snapshot = CatalogSnapshot::from_config(&config)
-            .unwrap()
+            .map_err(ctx("from_config"))?
             .activation_snapshot(
                 "worker",
                 &[CapabilitySelection {
@@ -837,7 +839,7 @@ mod tests {
                     name: "review".to_owned(),
                 }],
             )
-            .unwrap();
+            .map_err(ctx("activation_snapshot"))?;
         assert_eq!(snapshot.agent, "worker");
         assert_eq!(snapshot.suggestions.available.len(), 2);
         assert_eq!(snapshot.activated.len(), 1);
@@ -845,7 +847,7 @@ mod tests {
         assert_eq!(snapshot.activated[0].tools, ["read"]);
         assert_eq!(snapshot.activated[0].definition_sha256.len(), 64);
 
-        let snapshot = CatalogSnapshot::from_config(&config).unwrap();
+        let snapshot = CatalogSnapshot::from_config(&config).map_err(ctx("from_config"))?;
         assert!(matches!(
             snapshot.activation_snapshot(
                 "worker",
@@ -872,10 +874,11 @@ mod tests {
             ),
             Err(CatalogError::DuplicateCapabilitySelection { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn mcp_runtime_descriptor_requires_a_verified_direct_activation() {
+    fn mcp_runtime_descriptor_requires_a_verified_direct_activation() -> TestResult {
         let mut config = ResolvedConfig::default();
         config.agents.insert(
             "worker".to_owned(),
@@ -912,7 +915,7 @@ mod tests {
                 enabled: true,
             },
         );
-        let catalog = CatalogSnapshot::from_config(&config).unwrap();
+        let catalog = CatalogSnapshot::from_config(&config).map_err(ctx("from_config"))?;
         let mut spawn = catalog
             .activation_snapshot(
                 "worker",
@@ -921,8 +924,10 @@ mod tests {
                     name: "code-search".to_owned(),
                 }],
             )
-            .unwrap();
-        let descriptors = catalog.mcp_runtime_descriptors(&spawn).unwrap();
+            .map_err(ctx("activation_snapshot"))?;
+        let descriptors = catalog
+            .mcp_runtime_descriptors(&spawn)
+            .map_err(ctx("mcp_runtime_descriptors"))?;
         assert_eq!(descriptors.len(), 1);
         assert_eq!(
             descriptors[0].command.as_deref(),
@@ -935,11 +940,12 @@ mod tests {
             catalog.mcp_runtime_descriptors(&spawn),
             Err(CatalogError::StaleCapabilitySnapshot { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn authoring_creates_then_updates_a_skill_atomically() {
-        let temporary = tempfile::tempdir().unwrap();
+    fn authoring_creates_then_updates_a_skill_atomically() -> TestResult {
+        let temporary = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let workspace = SkillWorkspace::new(temporary.path().to_path_buf());
         let created = workspace
             .create(SkillDraft {
@@ -949,7 +955,7 @@ mod tests {
                 tools: vec!["read".to_owned()],
                 mcps: Vec::new(),
             })
-            .unwrap();
+            .map_err(ctx("create"))?;
         assert!(created.enabled);
         let updated = workspace
             .update(
@@ -961,13 +967,14 @@ mod tests {
                     ..SkillUpdate::default()
                 },
             )
-            .unwrap();
+            .map_err(ctx("update"))?;
         assert!(!updated.enabled);
         assert_eq!(
             std::fs::read_to_string(temporary.path().join("skills/rust-review/instructions.md"))
-                .unwrap(),
+                .map_err(ctx("read_to_string"))?,
             "Read tests first."
         );
+        Ok(())
     }
 
     #[test]
@@ -979,8 +986,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_snapshot_freezes_verified_skill_body_and_provenance() {
-        let temporary = tempfile::tempdir().unwrap();
+    fn runtime_snapshot_freezes_verified_skill_body_and_provenance() -> TestResult {
+        let temporary = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let workspace = SkillWorkspace::new(temporary.path().to_path_buf());
         workspace
             .create(SkillDraft {
@@ -990,18 +997,21 @@ mod tests {
                 tools: vec!["read".to_owned()],
                 mcps: vec!["docs".to_owned()],
             })
-            .unwrap();
+            .map_err(ctx("create"))?;
 
-        let snapshot = workspace.runtime_snapshot("review").unwrap();
+        let snapshot = workspace
+            .runtime_snapshot("review")
+            .map_err(ctx("runtime_snapshot"))?;
         assert_eq!(snapshot.instructions, "Read tests first.");
         assert_eq!(snapshot.tools, ["read"]);
         assert_eq!(snapshot.sha256.len(), 64);
         assert!(snapshot.source_path.ends_with("instructions.md"));
+        Ok(())
     }
 
     #[test]
-    fn runtime_snapshot_rejects_instruction_path_escape() {
-        let temporary = tempfile::tempdir().unwrap();
+    fn runtime_snapshot_rejects_instruction_path_escape() -> TestResult {
+        let temporary = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let workspace = SkillWorkspace::new(temporary.path().to_path_buf());
         workspace
             .create(SkillDraft {
@@ -1011,16 +1021,21 @@ mod tests {
                 tools: Vec::new(),
                 mcps: Vec::new(),
             })
-            .unwrap();
+            .map_err(ctx("create"))?;
         std::fs::write(
             temporary.path().join("skills/review/skill.toml"),
             "name = \"review\"\ninstructions_file = \"../escape.md\"\n",
         )
-        .unwrap();
+        .map_err(ctx("write skill.toml"))?;
 
         assert!(matches!(
             workspace.runtime_snapshot("review"),
             Err(CatalogError::InvalidInstructionPath(_))
         ));
+        Ok(())
     }
 }
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

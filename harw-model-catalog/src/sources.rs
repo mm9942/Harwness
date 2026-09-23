@@ -335,6 +335,7 @@ fn json_pointer_present(path: &std::path::Path, pointer: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
     use std::io::Write;
 
     /// Minimal temp-dir helper that cleans up on drop; avoids external deps
@@ -344,7 +345,7 @@ mod tests {
     }
 
     impl TempDir {
-        fn new(tag: &str) -> Self {
+        fn new(tag: &str) -> TestResult<Self> {
             let mut path = std::env::temp_dir();
             let unique = format!(
                 "harw-sources-{tag}-{}-{:p}",
@@ -352,17 +353,15 @@ mod tests {
                 &tag as *const _
             );
             path.push(unique);
-            std::fs::create_dir_all(&path).expect("test setup: create temp dir");
-            Self { path }
+            std::fs::create_dir_all(&path)?;
+            Ok(Self { path })
         }
 
-        fn write(&self, name: &str, contents: &str) -> PathBuf {
+        fn write(&self, name: &str, contents: &str) -> TestResult<PathBuf> {
             let file = self.path.join(name);
-            let mut handle = std::fs::File::create(&file).expect("test setup: create file");
-            handle
-                .write_all(contents.as_bytes())
-                .expect("test setup: write file");
-            file
+            let mut handle = std::fs::File::create(&file)?;
+            handle.write_all(contents.as_bytes())?;
+            Ok(file)
         }
     }
 
@@ -383,17 +382,18 @@ mod tests {
     }
 
     #[test]
-    fn test_embedded_sources_codex_apikey_rule() {
+    fn test_embedded_sources_codex_apikey_rule() -> TestResult {
         let sources = embedded_sources();
         let codex = sources
             .iter()
             .find(|s| s.id == "codex")
-            .expect("codex source present");
+            .ok_or(TestError::Missing("codex source"))?;
         assert_eq!(codex.kind, SourceKind::ApiKey);
         assert_eq!(
             codex.extract,
             ExtractRule::JsonPointer("/OPENAI_API_KEY".to_owned())
         );
+        Ok(())
     }
 
     #[test]
@@ -403,37 +403,41 @@ mod tests {
     }
 
     #[test]
-    fn test_json_pointer_present_true_when_field_exists() {
-        let dir = TempDir::new("present");
-        let file = dir.write("auth.json", r#"{"OPENAI_API_KEY":"sk-xyz"}"#);
+    fn test_json_pointer_present_true_when_field_exists() -> TestResult {
+        let dir = TempDir::new("present")?;
+        let file = dir.write("auth.json", r#"{"OPENAI_API_KEY":"sk-xyz"}"#)?;
         assert!(json_pointer_present(&file, "/OPENAI_API_KEY"));
+        Ok(())
     }
 
     #[test]
-    fn test_json_pointer_present_false_when_field_missing() {
-        let dir = TempDir::new("missing");
-        let file = dir.write("auth.json", r#"{"OTHER":"value"}"#);
+    fn test_json_pointer_present_false_when_field_missing() -> TestResult {
+        let dir = TempDir::new("missing")?;
+        let file = dir.write("auth.json", r#"{"OTHER":"value"}"#)?;
         assert!(!json_pointer_present(&file, "/OPENAI_API_KEY"));
+        Ok(())
     }
 
     #[test]
-    fn test_json_pointer_present_false_when_file_absent() {
-        let dir = TempDir::new("absent");
+    fn test_json_pointer_present_false_when_file_absent() -> TestResult {
+        let dir = TempDir::new("absent")?;
         let file = dir.path.join("does-not-exist.json");
         assert!(!json_pointer_present(&file, "/OPENAI_API_KEY"));
+        Ok(())
     }
 
     #[test]
-    fn test_json_pointer_present_false_on_invalid_json() {
-        let dir = TempDir::new("invalid");
-        let file = dir.write("auth.json", "not json {");
+    fn test_json_pointer_present_false_on_invalid_json() -> TestResult {
+        let dir = TempDir::new("invalid")?;
+        let file = dir.write("auth.json", "not json {")?;
         assert!(!json_pointer_present(&file, "/OPENAI_API_KEY"));
+        Ok(())
     }
 
     #[test]
-    fn test_probe_source_builds_file_json_secret_ref() {
-        let dir = TempDir::new("ref");
-        let file = dir.write("auth.json", r#"{"tokens":{"access_token":"a"}}"#);
+    fn test_probe_source_builds_file_json_secret_ref() -> TestResult {
+        let dir = TempDir::new("ref")?;
+        let file = dir.write("auth.json", r#"{"tokens":{"access_token":"a"}}"#)?;
         let source = CredentialSource {
             id: "codex-oauth".to_owned(),
             provider: "openai".to_owned(),
@@ -445,12 +449,13 @@ mod tests {
         assert!(detected.exists);
         let expected = format!("file-json:{}#/tokens/access_token", file.to_string_lossy());
         assert_eq!(detected.secret_ref, expected);
+        Ok(())
     }
 
     #[test]
-    fn test_probe_source_whole_file_ref() {
-        let dir = TempDir::new("whole");
-        let file = dir.write("token.txt", "secret");
+    fn test_probe_source_whole_file_ref() -> TestResult {
+        let dir = TempDir::new("whole")?;
+        let file = dir.write("token.txt", "secret")?;
         let source = CredentialSource {
             id: "raw".to_owned(),
             provider: "custom".to_owned(),
@@ -464,6 +469,7 @@ mod tests {
             detected.secret_ref,
             format!("file:{}", file.to_string_lossy())
         );
+        Ok(())
     }
 
     #[test]
@@ -487,58 +493,64 @@ mod tests {
     }
 
     #[test]
-    fn test_json_pointer_present_false_when_field_is_null() {
-        let dir = TempDir::new("null-field");
+    fn test_json_pointer_present_false_when_field_is_null() -> TestResult {
+        let dir = TempDir::new("null-field")?;
         let file = dir.write(
             "auth.json",
             r#"{"OPENAI_API_KEY": null, "tokens": {"access_token": "sk-abc"}}"#,
-        );
+        )?;
         assert!(!json_pointer_present(&file, "/OPENAI_API_KEY"));
         assert!(json_pointer_present(&file, "/tokens/access_token"));
+        Ok(())
     }
 
     #[test]
-    fn test_json_pointer_present_false_when_string_is_empty() {
-        let dir = TempDir::new("empty-string");
-        let file = dir.write("auth.json", r#"{"k":""}"#);
+    fn test_json_pointer_present_false_when_string_is_empty() -> TestResult {
+        let dir = TempDir::new("empty-string")?;
+        let file = dir.write("auth.json", r#"{"k":""}"#)?;
         assert!(!json_pointer_present(&file, "/k"));
+        Ok(())
     }
 
     #[test]
-    fn test_json_pointer_present_false_when_value_is_number() {
-        let dir = TempDir::new("number-value");
-        let file = dir.write("auth.json", r#"{"k":42}"#);
+    fn test_json_pointer_present_false_when_value_is_number() -> TestResult {
+        let dir = TempDir::new("number-value")?;
+        let file = dir.write("auth.json", r#"{"k":42}"#)?;
         assert!(!json_pointer_present(&file, "/k"));
+        Ok(())
     }
 
     #[test]
-    fn test_json_pointer_present_false_when_value_is_object() {
-        let dir = TempDir::new("object-value");
-        let file = dir.write("auth.json", r#"{"k":{"nested":"value"}}"#);
+    fn test_json_pointer_present_false_when_value_is_object() -> TestResult {
+        let dir = TempDir::new("object-value")?;
+        let file = dir.write("auth.json", r#"{"k":{"nested":"value"}}"#)?;
         assert!(!json_pointer_present(&file, "/k"));
+        Ok(())
     }
 
     #[test]
-    fn test_json_pointer_present_false_when_value_is_array() {
-        let dir = TempDir::new("array-value");
-        let file = dir.write("auth.json", r#"{"k":["a","b"]}"#);
+    fn test_json_pointer_present_false_when_value_is_array() -> TestResult {
+        let dir = TempDir::new("array-value")?;
+        let file = dir.write("auth.json", r#"{"k":["a","b"]}"#)?;
         assert!(!json_pointer_present(&file, "/k"));
+        Ok(())
     }
 
     #[test]
-    fn test_json_pointer_present_true_when_string_non_empty() {
-        let dir = TempDir::new("non-empty-string");
-        let file = dir.write("auth.json", r#"{"k":"sk-abc"}"#);
+    fn test_json_pointer_present_true_when_string_non_empty() -> TestResult {
+        let dir = TempDir::new("non-empty-string")?;
+        let file = dir.write("auth.json", r#"{"k":"sk-abc"}"#)?;
         assert!(json_pointer_present(&file, "/k"));
+        Ok(())
     }
 
     #[test]
-    fn test_codex_oauth_access_token_is_a_separate_import_source() {
-        let dir = TempDir::new("probe-null-field");
+    fn test_codex_oauth_access_token_is_a_separate_import_source() -> TestResult {
+        let dir = TempDir::new("probe-null-field")?;
         let file = dir.write(
             "auth.json",
             r#"{"OPENAI_API_KEY": null, "tokens": {"access_token": "sk-abc"}}"#,
-        );
+        )?;
 
         let api_key_source = CredentialSource {
             id: "codex".to_owned(),
@@ -552,7 +564,7 @@ mod tests {
         let mut oauth_source = embedded_sources()
             .into_iter()
             .find(|source| source.id == "codex-oauth")
-            .unwrap();
+            .ok_or(TestError::Missing("codex-oauth source"))?;
         assert_eq!(oauth_source.kind, SourceKind::OAuthToken);
         assert_eq!(
             oauth_source.extract,
@@ -560,5 +572,6 @@ mod tests {
         );
         oauth_source.path = file.to_string_lossy().into_owned();
         assert!(probe_source(oauth_source).exists);
+        Ok(())
     }
 }

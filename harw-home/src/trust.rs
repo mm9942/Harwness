@@ -664,19 +664,18 @@ fn untrustable(path: &Path, reason: impl Into<String>) -> HomeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
     use std::os::unix::fs::symlink;
 
     /// Temporäres Verzeichnis, das beim Drop entfernt wird.
     struct TempDir(PathBuf);
 
     impl TempDir {
-        fn new(label: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "harw-home-trust-{label}-{}",
-                uuid::Uuid::now_v7()
-            ));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
+        fn new(label: &str) -> TestResult<Self> {
+            let path = std::env::temp_dir()
+                .join(format!("harw-home-trust-{label}-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir_all(&path)?;
+            Ok(Self(path))
         }
 
         fn path(&self) -> &Path {
@@ -690,79 +689,78 @@ mod tests {
         }
     }
 
-    fn write(path: &Path, contents: &str) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, contents).unwrap();
+    fn write(path: &Path, contents: &str) -> TestResult {
+        let parent = path
+            .parent()
+            .ok_or(TestError::Missing("Path::parent() der Testdatei"))?;
+        std::fs::create_dir_all(parent)?;
+        std::fs::write(path, contents)?;
+        Ok(())
     }
 
     /// Projekt mit einer minimalen, gültigen `.harw`-Struktur.
-    fn project(label: &str) -> TempDir {
-        let dir = TempDir::new(label);
+    fn project(label: &str) -> TestResult<TempDir> {
+        let dir = TempDir::new(label)?;
         write(
             &dir.path().join(".harw/config.toml"),
             "default_provider = \"local\"\n",
-        );
+        )?;
         write(
             &dir.path().join(".harw/providers/local.toml"),
             "name = \"local\"\napi = \"local\"\nbase_url = \"https://localhost\"\n",
-        );
-        dir
+        )?;
+        Ok(dir)
     }
 
     #[test]
-    fn trust_and_untrust_round_trip_with_private_store() {
-        let home = TempDir::new("home");
-        let repo = project("repo");
+    fn trust_and_untrust_round_trip_with_private_store() -> TestResult {
+        let home = TempDir::new("home")?;
+        let repo = project("repo")?;
 
         assert_eq!(
-            project_trust_status(home.path(), repo.path()).unwrap(),
+            project_trust_status(home.path(), repo.path())?,
             TrustStatus::Untrusted
         );
 
-        let record = trust_project(home.path(), repo.path()).unwrap();
-        assert_eq!(
-            record.canonical_root,
-            std::fs::canonicalize(repo.path()).unwrap()
-        );
+        let record = trust_project(home.path(), repo.path())?;
+        assert_eq!(record.canonical_root, std::fs::canonicalize(repo.path())?);
         assert!(is_valid_digest(&record.digest), "{}", record.digest);
+        assert_eq!(record.owner_uid, std::fs::metadata(repo.path())?.uid());
         assert_eq!(
-            record.owner_uid,
-            std::fs::metadata(repo.path()).unwrap().uid()
-        );
-        assert_eq!(
-            project_trust_status(home.path(), repo.path()).unwrap(),
+            project_trust_status(home.path(), repo.path())?,
             TrustStatus::Trusted
         );
 
         let store_path = trusted_projects_path(home.path());
-        let mode = std::fs::metadata(&store_path).unwrap().mode() & 0o777;
+        let mode = std::fs::metadata(&store_path)?.mode() & 0o777;
         assert_eq!(mode, 0o600);
-        let store = TrustStore::load(home.path()).unwrap();
+        let store = TrustStore::load(home.path())?;
         assert_eq!(store.records(), std::slice::from_ref(&record));
 
         // Erneutes Freigeben ersetzt, statt zu duplizieren.
-        trust_project(home.path(), repo.path()).unwrap();
-        assert_eq!(TrustStore::load(home.path()).unwrap().records().len(), 1);
+        trust_project(home.path(), repo.path())?;
+        assert_eq!(TrustStore::load(home.path())?.records().len(), 1);
 
-        assert!(untrust_project(home.path(), repo.path()).unwrap());
+        assert!(untrust_project(home.path(), repo.path())?);
         assert_eq!(
-            project_trust_status(home.path(), repo.path()).unwrap(),
+            project_trust_status(home.path(), repo.path())?,
             TrustStatus::Untrusted
         );
-        assert!(!untrust_project(home.path(), repo.path()).unwrap());
+        assert!(!untrust_project(home.path(), repo.path())?);
+        Ok(())
     }
 
     #[test]
-    fn digest_change_turns_trusted_into_changed() {
-        let home = TempDir::new("home");
-        let repo = project("repo");
-        trust_project(home.path(), repo.path()).unwrap();
+    fn digest_change_turns_trusted_into_changed() -> TestResult {
+        let home = TempDir::new("home")?;
+        let repo = project("repo")?;
+        trust_project(home.path(), repo.path())?;
 
         // Nicht digest-relevante Dateien ändern nichts.
-        write(&repo.path().join(".harw/sessions/log.jsonl"), "{}\n");
-        write(&repo.path().join("README.md"), "hallo\n");
+        write(&repo.path().join(".harw/sessions/log.jsonl"), "{}\n")?;
+        write(&repo.path().join("README.md"), "hallo\n")?;
         assert_eq!(
-            project_trust_status(home.path(), repo.path()).unwrap(),
+            project_trust_status(home.path(), repo.path())?,
             TrustStatus::Trusted
         );
 
@@ -770,131 +768,135 @@ mod tests {
         write(
             &repo.path().join(".harw/providers/local.toml"),
             "name = \"local\"\napi = \"local\"\nbase_url = \"https://evil.example\"\n",
-        );
+        )?;
         assert_eq!(
-            project_trust_status(home.path(), repo.path()).unwrap(),
+            project_trust_status(home.path(), repo.path())?,
             TrustStatus::Changed
         );
 
         // Erneute Freigabe übernimmt den neuen Stand.
-        trust_project(home.path(), repo.path()).unwrap();
+        trust_project(home.path(), repo.path())?;
         assert_eq!(
-            project_trust_status(home.path(), repo.path()).unwrap(),
+            project_trust_status(home.path(), repo.path())?,
             TrustStatus::Trusted
         );
 
         // Neue Dateien in einem Digest-Verzeichnis und `.env` zählen ebenfalls.
-        write(&repo.path().join(".harw/mcps/nested/server.toml"), "name = \"x\"\n");
+        write(
+            &repo.path().join(".harw/mcps/nested/server.toml"),
+            "name = \"x\"\n",
+        )?;
         assert_eq!(
-            project_trust_status(home.path(), repo.path()).unwrap(),
+            project_trust_status(home.path(), repo.path())?,
             TrustStatus::Changed
         );
-        trust_project(home.path(), repo.path()).unwrap();
-        write(&repo.path().join(".harw/.env"), "OPENAI_API_KEY=x\n");
+        trust_project(home.path(), repo.path())?;
+        write(&repo.path().join(".harw/.env"), "OPENAI_API_KEY=x\n")?;
         assert_eq!(
-            project_trust_status(home.path(), repo.path()).unwrap(),
+            project_trust_status(home.path(), repo.path())?,
             TrustStatus::Changed
         );
+        Ok(())
     }
 
     #[test]
-    fn digest_is_independent_of_creation_order() {
-        let first = TempDir::new("order-a");
-        let second = TempDir::new("order-b");
+    fn digest_is_independent_of_creation_order() -> TestResult {
+        let first = TempDir::new("order-a")?;
+        let second = TempDir::new("order-b")?;
         let files = [
             (".harw/agents/a/agent.toml", "name = \"a\"\n"),
             (".harw/agents/a-c.toml", "x\n"),
             (".harw/config.toml", "\n"),
         ];
         for (rel, contents) in files {
-            write(&first.path().join(rel), contents);
+            write(&first.path().join(rel), contents)?;
         }
         for (rel, contents) in files.iter().rev() {
-            write(&second.path().join(rel), contents);
+            write(&second.path().join(rel), contents)?;
         }
         assert_eq!(
-            project_digest(first.path()).unwrap(),
-            project_digest(second.path()).unwrap()
+            project_digest(first.path())?,
+            project_digest(second.path())?
         );
         // Pfad gehört zum Digest: gleicher Inhalt unter anderem Namen weicht ab.
         std::fs::rename(
             second.path().join(".harw/agents/a-c.toml"),
             second.path().join(".harw/agents/a-d.toml"),
-        )
-        .unwrap();
+        )?;
         assert_ne!(
-            project_digest(first.path()).unwrap(),
-            project_digest(second.path()).unwrap()
+            project_digest(first.path())?,
+            project_digest(second.path())?
         );
+        Ok(())
     }
 
     #[test]
-    fn symlinks_inside_harw_are_not_followed() {
-        let home = TempDir::new("home");
-        let outside = TempDir::new("outside");
+    fn symlinks_inside_harw_are_not_followed() -> TestResult {
+        let home = TempDir::new("home")?;
+        let outside = TempDir::new("outside")?;
         write(
             &outside.path().join("evil.toml"),
             "name = \"openai\"\napi = \"openai\"\nbase_url = \"https://evil.example\"\n",
-        );
+        )?;
 
         // Symlink auf eine Datei in einem Digest-Verzeichnis.
-        let repo = project("symlink-file");
+        let repo = project("symlink-file")?;
         symlink(
             outside.path().join("evil.toml"),
             repo.path().join(".harw/providers/openai.toml"),
-        )
-        .unwrap();
+        )?;
         assert!(matches!(
             trust_project(home.path(), repo.path()),
             Err(HomeError::UntrustableProject { .. })
         ));
-        assert!(TrustStore::load(home.path()).unwrap().records().is_empty());
+        assert!(TrustStore::load(home.path())?.records().is_empty());
 
         // Symlink als Einzeldatei (`auth.toml`).
-        let repo = project("symlink-auth");
+        let repo = project("symlink-auth")?;
         symlink(
             outside.path().join("evil.toml"),
             repo.path().join(".harw/auth.toml"),
-        )
-        .unwrap();
+        )?;
         assert!(matches!(
             project_digest(repo.path()),
             Err(HomeError::UntrustableProject { .. })
         ));
 
         // Verzeichnis-Symlink, nach der Freigabe eingeschleust → Changed.
-        let repo = project("symlink-dir");
-        trust_project(home.path(), repo.path()).unwrap();
-        symlink(outside.path(), repo.path().join(".harw/mcps")).unwrap();
+        let repo = project("symlink-dir")?;
+        trust_project(home.path(), repo.path())?;
+        symlink(outside.path(), repo.path().join(".harw/mcps"))?;
         assert_eq!(
-            project_trust_status(home.path(), repo.path()).unwrap(),
+            project_trust_status(home.path(), repo.path())?,
             TrustStatus::Changed
         );
 
         // `.harw` selbst als Symlink.
-        let repo = TempDir::new("symlink-harw");
-        symlink(outside.path(), repo.path().join(".harw")).unwrap();
+        let repo = TempDir::new("symlink-harw")?;
+        symlink(outside.path(), repo.path().join(".harw"))?;
         assert!(matches!(
             project_digest(repo.path()),
             Err(HomeError::UntrustableProject { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn store_with_group_permissions_is_rejected() {
-        let home = TempDir::new("home");
+    fn store_with_group_permissions_is_rejected() -> TestResult {
+        let home = TempDir::new("home")?;
         let path = trusted_projects_path(home.path());
-        std::fs::write(&path, "version = 1\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&path, "version = 1\n")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
         assert!(matches!(
             TrustStore::load(home.path()),
             Err(HomeError::Io { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn store_rejects_malformed_records() {
-        let home = TempDir::new("home");
+    fn store_rejects_malformed_records() -> TestResult {
+        let home = TempDir::new("home")?;
         let path = trusted_projects_path(home.path());
         let valid = format!("blake3:{}", "a".repeat(64));
         let record = |root: &str, digest: &str| {
@@ -904,11 +906,15 @@ mod tests {
             "version = 2\n".to_owned(),
             format!("version = 1\n{}", record("relative", &valid)),
             format!("version = 1\n{}", record("/abs", "sha256:00")),
-            format!("version = 1\n{}{}", record("/abs", &valid), record("/abs", &valid)),
+            format!(
+                "version = 1\n{}{}",
+                record("/abs", &valid),
+                record("/abs", &valid)
+            ),
             format!("version = 1\nunknown = true\n{}", record("/abs", &valid)),
         ];
         for contents in cases {
-            write_atomic(&path, contents.as_bytes(), AtomicWriteOptions::private()).unwrap();
+            write_atomic(&path, contents.as_bytes(), AtomicWriteOptions::private())?;
             assert!(
                 matches!(
                     TrustStore::load(home.path()),
@@ -917,12 +923,14 @@ mod tests {
                 "must reject: {contents}"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn missing_store_is_empty() {
-        let home = TempDir::new("home");
-        let store = TrustStore::load(&home.path().join("not-yet-created")).unwrap();
+    fn missing_store_is_empty() -> TestResult {
+        let home = TempDir::new("home")?;
+        let store = TrustStore::load(&home.path().join("not-yet-created"))?;
         assert!(store.records().is_empty());
+        Ok(())
     }
 }

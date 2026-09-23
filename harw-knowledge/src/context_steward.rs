@@ -352,7 +352,10 @@ impl StewardWindow {
             .map_err(|error| KnowledgeError::StewardWindowInvalid {
                 detail: format!("as_of - {span_days}d ist übergelaufen: {error}"),
             })?;
-        Ok(Self { since, until: as_of })
+        Ok(Self {
+            since,
+            until: as_of,
+        })
     }
 
     /// Baut das empfohlene Standardfenster (siehe
@@ -634,29 +637,37 @@ mod tests {
     use crate::context_proposal::{ContextProposal, ProposalStatus};
     use crate::error::KnowledgeError;
     use crate::model_behavior_proposal::{ModelBehaviorProposal, ProposedModelChange};
+    use crate::test_support::{TestError, TestResult};
 
     use harw_agent_dsl::ids::DefinitionId;
     use harw_model_catalog::descriptor::ToolCallingSupport;
     use harw_types::{ModelId, ProviderId};
 
-    fn program_id() -> DefinitionId {
-        DefinitionId::parse("harwness.context.security-triage@1").expect("valid definition id")
+    fn program_id() -> TestResult<DefinitionId> {
+        DefinitionId::parse("harwness.context.security-triage@1")
+            .map_err(crate::test_support::ctx("valid definition id"))
     }
 
-    fn context_proposal_at(slug: &str, generated_at: jiff::Timestamp) -> ContextProposal {
-        ContextProposal::new(
+    fn context_proposal_at(
+        slug: &str,
+        generated_at: jiff::Timestamp,
+    ) -> TestResult<ContextProposal> {
+        Ok(ContextProposal::new(
             ArtifactId::new(format!("context-proposal/{slug}")),
             "Testvorschlag",
-            program_id(),
+            program_id()?,
             "deadbeef".repeat(8),
             Vec::new(),
             Vec::new(),
             generated_at,
             "heuristic:must-include-promotion@1",
-        )
+        ))
     }
 
-    fn model_behavior_proposal_at(slug: &str, generated_at: jiff::Timestamp) -> ModelBehaviorProposal {
+    fn model_behavior_proposal_at(
+        slug: &str,
+        generated_at: jiff::Timestamp,
+    ) -> ModelBehaviorProposal {
         ModelBehaviorProposal::new(
             ArtifactId::new(format!("model-behavior-proposal/{slug}")),
             "Testvorschlag",
@@ -676,96 +687,126 @@ mod tests {
         jiff::Timestamp::UNIX_EPOCH
     }
 
-    fn far_future() -> jiff::Timestamp {
+    fn far_future() -> TestResult<jiff::Timestamp> {
         epoch()
             .checked_add(jiff::SignedDuration::from_secs(365 * 24 * 60 * 60))
-            .expect("fixture timestamp stays within range")
+            .map_err(crate::test_support::ctx(
+                "fixture timestamp stays within range",
+            ))
     }
 
     /// `StewardWindow::new` rejects `since` after `until`.
     #[test]
-    fn test_window_new_rejects_since_after_until() {
-        let error = StewardWindow::new(far_future(), epoch())
-            .expect_err("since after until must be rejected");
+    fn test_window_new_rejects_since_after_until() -> TestResult {
+        let Err(error) = StewardWindow::new(far_future()?, epoch()) else {
+            return Err(TestError::Unexpected(
+                "since after until must be rejected".to_owned(),
+            ));
+        };
         assert!(matches!(error, KnowledgeError::StewardWindowInvalid { .. }));
+        Ok(())
     }
 
     /// `StewardWindow::trailing` builds `until = as_of` and `since` earlier,
     /// with `contains` behaving as documented.
     #[test]
-    fn test_window_trailing_builds_since_before_until_and_contains_works() {
-        let window = StewardWindow::trailing(far_future(), 7).expect("positive span builds a window");
-        assert_eq!(window.until, far_future());
+    fn test_window_trailing_builds_since_before_until_and_contains_works() -> TestResult {
+        let window = StewardWindow::trailing(far_future()?, 7)
+            .map_err(crate::test_support::ctx("positive span builds a window"))?;
+        assert_eq!(window.until, far_future()?);
         assert!(window.since < window.until);
-        assert!(window.contains(far_future()));
-        assert!(!window.contains(epoch()), "epoch is well outside a 7-day trailing window ending a year later");
+        assert!(window.contains(far_future()?));
+        assert!(
+            !window.contains(epoch()),
+            "epoch is well outside a 7-day trailing window ending a year later"
+        );
+        Ok(())
     }
 
     /// `StewardWindow::trailing` rejects a non-positive span.
     #[test]
-    fn test_window_trailing_rejects_non_positive_span() {
-        let error = StewardWindow::trailing(epoch(), 0).expect_err("zero span must be rejected");
+    fn test_window_trailing_rejects_non_positive_span() -> TestResult {
+        let Err(error) = StewardWindow::trailing(epoch(), 0) else {
+            return Err(TestError::Unexpected(
+                "zero span must be rejected".to_owned(),
+            ));
+        };
         assert!(matches!(error, KnowledgeError::StewardWindowInvalid { .. }));
+        Ok(())
     }
 
     /// `StewardWindow::default_window` uses `DEFAULT_STEWARD_WINDOW_SPAN_DAYS`.
     #[test]
-    fn test_default_window_uses_the_documented_default_span() {
-        let window = StewardWindow::default_window(far_future()).expect("default span builds a window");
+    fn test_default_window_uses_the_documented_default_span() -> TestResult {
+        let window = StewardWindow::default_window(far_future()?)
+            .map_err(crate::test_support::ctx("default span builds a window"))?;
         let explicit =
-            StewardWindow::trailing(far_future(), super::DEFAULT_STEWARD_WINDOW_SPAN_DAYS)
-                .expect("explicit span builds a window");
+            StewardWindow::trailing(far_future()?, super::DEFAULT_STEWARD_WINDOW_SPAN_DAYS)
+                .map_err(crate::test_support::ctx("explicit span builds a window"))?;
         assert_eq!(window, explicit);
+        Ok(())
     }
 
     /// `curate_context_proposals` splits pending-in-window, pending-outside,
     /// and decided correctly.
     #[test]
-    fn test_curate_context_proposals_splits_by_status_and_window() {
-        let window = StewardWindow::new(epoch(), far_future()).expect("valid window");
+    fn test_curate_context_proposals_splits_by_status_and_window() -> TestResult {
+        let window = StewardWindow::new(epoch(), far_future()?)
+            .map_err(crate::test_support::ctx("valid window"))?;
 
-        let in_window = context_proposal_at("in-window", epoch());
-        let mut decided = context_proposal_at("decided", epoch());
-        decided.accept().expect("pending proposal accepts");
+        let in_window = context_proposal_at("in-window", epoch())?;
+        let mut decided = context_proposal_at("decided", epoch())?;
+        decided
+            .accept()
+            .map_err(crate::test_support::ctx("pending proposal accepts"))?;
         let outside_window = context_proposal_at(
             "outside-window",
-            far_future()
+            far_future()?
                 .checked_add(jiff::SignedDuration::from_secs(1))
-                .expect("fixture timestamp stays within range"),
-        );
+                .map_err(crate::test_support::ctx(
+                    "fixture timestamp stays within range",
+                ))?,
+        )?;
 
         let curated = curate_context_proposals(&[in_window, decided, outside_window], &window);
 
         assert_eq!(curated.pending_in_window.len(), 1);
-        assert_eq!(curated.pending_in_window[0].id, ArtifactId::new("context-proposal/in-window"));
+        assert_eq!(
+            curated.pending_in_window[0].id,
+            ArtifactId::new("context-proposal/in-window")
+        );
         assert_eq!(curated.pending_outside_window, 1);
         assert_eq!(curated.decided, 1);
+        Ok(())
     }
 
     /// Determinism: same input, called twice, byte-identical (via `Debug`,
     /// since `CuratedContextProposals` carries no `Serialize`).
     #[test]
-    fn test_curate_context_proposals_is_deterministic() {
-        let window = StewardWindow::new(epoch(), far_future()).expect("valid window");
+    fn test_curate_context_proposals_is_deterministic() -> TestResult {
+        let window = StewardWindow::new(epoch(), far_future()?)
+            .map_err(crate::test_support::ctx("valid window"))?;
         let proposals = vec![
-            context_proposal_at("zzz", epoch()),
-            context_proposal_at("aaa", epoch()),
+            context_proposal_at("zzz", epoch())?,
+            context_proposal_at("aaa", epoch())?,
         ];
 
         let first = format!("{:?}", curate_context_proposals(&proposals, &window));
         let second = format!("{:?}", curate_context_proposals(&proposals, &window));
         assert_eq!(first, second);
+        Ok(())
     }
 
     /// Multiple qualifying proposals come back ordered by
     /// (`target_program`, `id`) — here identical `target_program`, so `id`
     /// alone decides.
     #[test]
-    fn test_curate_context_proposals_orders_by_id_within_the_same_program() {
-        let window = StewardWindow::new(epoch(), far_future()).expect("valid window");
+    fn test_curate_context_proposals_orders_by_id_within_the_same_program() -> TestResult {
+        let window = StewardWindow::new(epoch(), far_future()?)
+            .map_err(crate::test_support::ctx("valid window"))?;
         let proposals = vec![
-            context_proposal_at("zzz", epoch()),
-            context_proposal_at("aaa", epoch()),
+            context_proposal_at("zzz", epoch())?,
+            context_proposal_at("aaa", epoch())?,
         ];
 
         let curated = curate_context_proposals(&proposals, &window);
@@ -781,16 +822,20 @@ mod tests {
                 "context-proposal/zzz".to_owned(),
             ]
         );
+        Ok(())
     }
 
     /// `curate_model_behavior_proposals` splits by status/window and orders
     /// deterministically, mirroring the `ContextProposal` tests above.
     #[test]
-    fn test_curate_model_behavior_proposals_splits_and_orders() {
-        let window = StewardWindow::new(epoch(), far_future()).expect("valid window");
+    fn test_curate_model_behavior_proposals_splits_and_orders() -> TestResult {
+        let window = StewardWindow::new(epoch(), far_future()?)
+            .map_err(crate::test_support::ctx("valid window"))?;
 
         let mut decided = model_behavior_proposal_at("decided", epoch());
-        decided.reject().expect("pending proposal rejects");
+        decided
+            .reject()
+            .map_err(crate::test_support::ctx("pending proposal rejects"))?;
         let proposals = vec![
             model_behavior_proposal_at("zzz", epoch()),
             model_behavior_proposal_at("aaa", epoch()),
@@ -811,32 +856,34 @@ mod tests {
                 "model-behavior-proposal/zzz".to_owned(),
             ]
         );
+        Ok(())
     }
 
     /// `build_steward_digest` combines both domains under one window.
     #[test]
-    fn test_build_steward_digest_combines_both_domains() {
-        let window = StewardWindow::new(epoch(), far_future()).expect("valid window");
+    fn test_build_steward_digest_combines_both_domains() -> TestResult {
+        let window = StewardWindow::new(epoch(), far_future()?)
+            .map_err(crate::test_support::ctx("valid window"))?;
         let digest = build_steward_digest(
-            &[context_proposal_at("example", epoch())],
+            &[context_proposal_at("example", epoch())?],
             &[model_behavior_proposal_at("example", epoch())],
             &window,
         );
         assert_eq!(digest.context_proposals.pending_in_window.len(), 1);
         assert_eq!(digest.model_behavior_proposals.pending_in_window.len(), 1);
+        Ok(())
     }
 
     /// `render_digest_summary` reports the counts from both domains.
     #[test]
-    fn test_render_digest_summary_reports_both_domain_counts() {
-        let window = StewardWindow::new(epoch(), far_future()).expect("valid window");
-        let digest = build_steward_digest(
-            &[context_proposal_at("example", epoch())],
-            &[],
-            &window,
-        );
+    fn test_render_digest_summary_reports_both_domain_counts() -> TestResult {
+        let window = StewardWindow::new(epoch(), far_future()?)
+            .map_err(crate::test_support::ctx("valid window"))?;
+        let digest =
+            build_steward_digest(&[context_proposal_at("example", epoch())?], &[], &window);
         let summary = render_digest_summary(&digest);
         assert!(summary.contains("1 im Fenster offen"));
+        Ok(())
     }
 
     /// `steward_null_counter_registry` registers exactly the three
@@ -846,7 +893,11 @@ mod tests {
     #[test]
     fn test_steward_null_counter_registry_lists_exactly_three_counters_by_name() {
         let registry = steward_null_counter_registry();
-        let names: Vec<&str> = registry.all().iter().map(|counter| counter.name()).collect();
+        let names: Vec<&str> = registry
+            .all()
+            .iter()
+            .map(|counter| counter.name())
+            .collect();
         assert_eq!(
             names,
             vec![
@@ -869,9 +920,10 @@ mod tests {
     /// in der Signatur, also ist das ohnehin durch den Typ erzwungen — dieser
     /// Test macht es trotzdem explizit nachvollziehbar).
     #[test]
-    fn test_curate_functions_do_not_mutate_their_inputs() {
-        let window = StewardWindow::new(epoch(), far_future()).expect("valid window");
-        let proposals = vec![context_proposal_at("example", epoch())];
+    fn test_curate_functions_do_not_mutate_their_inputs() -> TestResult {
+        let window = StewardWindow::new(epoch(), far_future()?)
+            .map_err(crate::test_support::ctx("valid window"))?;
+        let proposals = vec![context_proposal_at("example", epoch())?];
         let before = proposals.clone();
 
         let _curated: CuratedContextProposals = curate_context_proposals(&proposals, &window);
@@ -879,5 +931,6 @@ mod tests {
         assert_eq!(proposals.len(), before.len());
         assert_eq!(proposals[0].status, ProposalStatus::Pending);
         assert_eq!(proposals[0].id, before[0].id);
+        Ok(())
     }
 }

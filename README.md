@@ -129,6 +129,8 @@ cargo run -p harw-cli --
 
 `harw init` creates the local root space. `harw onboard` configures a provider and model. Running `harw` without a subcommand starts the interactive terminal client; passing a prompt runs a one-shot interaction.
 
+Shell completions: `harw completions --install` (detects the shell from `$SHELL`; pass `bash`, `zsh`, `fish`, `elvish` or `powershell` explicitly, add `--dry-run` to preview). Open a new shell afterwards.
+
 Useful commands include:
 
 ```bash

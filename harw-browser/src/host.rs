@@ -298,6 +298,7 @@ mod tests {
     use crate::ids::EffectId;
     use crate::observation::DocumentIdentity;
     use crate::page_bridge::PageBridgeInstallationId;
+    use crate::test_support::{TestResult, ctx};
     use std::sync::Arc;
     use std::task::{Context, Poll, Waker};
 
@@ -428,12 +429,14 @@ mod tests {
     }
 
     #[test]
-    fn test_mock_runtime_capability_probe_resolves() {
+    fn test_mock_runtime_capability_probe_resolves() -> TestResult {
         let runtime: Arc<dyn BrowserRuntime> = Arc::new(MockRuntime {
             id: BrowserSessionId::new(),
             primary_context_id: BrowserContextId::new(),
         });
-        let probe = block_on(runtime.capability_probe()).expect("mock probe always succeeds");
+        let probe =
+            block_on(runtime.capability_probe()).map_err(ctx("mock probe always succeeds"))?;
         assert_eq!(probe.browser_name, "mock");
+        Ok(())
     }
 }

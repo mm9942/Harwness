@@ -278,7 +278,10 @@ mod tests {
     use crate::call::ToolCall;
     use crate::output::ToolOutput;
     use crate::spec::ToolName;
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use crate::test_support::{TestError, TestResult, ctx};
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_types::cancel::CancelToken;
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::path::PathBuf;
@@ -298,12 +301,12 @@ mod tests {
         }
     }
 
-    fn make_ctx(test_id: &str) -> ToolExecutionContext {
+    fn make_ctx(test_id: &str) -> TestResult<ToolExecutionContext> {
         let base = std::env::temp_dir()
             .join("harw_tools_executor_tests")
             .join(test_id);
         let ws = base.join("ws");
-        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&ws).map_err(ctx("Workspace-Verzeichnis anlegen"))?;
         let registry = WorkspaceRegistry::build(
             &base,
             [WorkspaceRegistration {
@@ -312,15 +315,19 @@ mod tests {
                 root: PathBuf::from("ws"),
             }],
         )
-        .unwrap();
+        .map_err(ctx("WorkspaceRegistry::build"))?;
         let binding = registry
             .resolve(&TenantId::from_str("t"), &WorkspaceId::from_str("w"))
-            .unwrap();
+            .map_err(ctx("registry.resolve"))?;
         let spec = SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy(vec![Permission::ReadWorkspace]),
         );
-        ToolExecutionContext::new(SessionId::new(), TurnId::new(), spec)
+        Ok(ToolExecutionContext::new(
+            SessionId::new(),
+            TurnId::new(),
+            spec,
+        ))
     }
 
     #[test]
@@ -336,14 +343,14 @@ mod tests {
     }
 
     #[test]
-    fn test_executor_without_override_still_builds_a_valid_execution_context() {
+    fn test_executor_without_override_still_builds_a_valid_execution_context() -> TestResult {
         // No tokio dependency in this crate: this exercises the same
         // `ToolExecutionContext` construction the async `execute` path would
         // receive, confirming the default method addition changed nothing
         // about how an existing `ToolExecutor` implementer is constructed or
         // invoked (only a new, ignorable trait method was added).
         let executor = NoopExecutor;
-        let ctx = make_ctx("still_constructs_normally");
+        let ctx = make_ctx("still_constructs_normally")?;
         let call = ToolCall {
             id: ToolCallId::new(),
             name: ToolName::new("noop"),
@@ -352,21 +359,23 @@ mod tests {
 
         let future = executor.execute(&ctx, &call);
         drop(future);
+        Ok(())
     }
 
     #[test]
-    fn test_new_context_has_no_cancel_token() {
-        let ctx = make_ctx("new_context_has_no_cancel_token");
+    fn test_new_context_has_no_cancel_token() -> TestResult {
+        let ctx = make_ctx("new_context_has_no_cancel_token")?;
 
         assert!(
             ctx.cancel().is_none(),
             "ToolExecutionContext::new must leave cancel unset"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_with_cancel_attaches_token_and_cancel_reads_it_back() {
-        let ctx = make_ctx("with_cancel_attaches_token").with_cancel(CancelToken::new());
+    fn test_with_cancel_attaches_token_and_cancel_reads_it_back() -> TestResult {
+        let ctx = make_ctx("with_cancel_attaches_token")?.with_cancel(CancelToken::new());
 
         let attached = ctx.cancel();
 
@@ -374,15 +383,17 @@ mod tests {
             attached.is_some(),
             "with_cancel must make cancel() report Some"
         );
+        let token = attached.ok_or(TestError::Missing("attached cancel token"))?;
         assert!(
-            !attached.unwrap().is_cancelled(),
+            !token.is_cancelled(),
             "a freshly attached, uncancelled token must report not-cancelled through the context"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_partial_eq_ignores_cancel_field() {
-        let base = make_ctx("partial_eq_ignores_cancel_field");
+    fn test_partial_eq_ignores_cancel_field() -> TestResult {
+        let base = make_ctx("partial_eq_ignores_cancel_field")?;
         let without_cancel = base.clone();
         let with_cancel = base.with_cancel(CancelToken::new());
 
@@ -390,5 +401,6 @@ mod tests {
             without_cancel, with_cancel,
             "two contexts that differ only in `cancel` (None vs. Some) must still be equal"
         );
+        Ok(())
     }
 }

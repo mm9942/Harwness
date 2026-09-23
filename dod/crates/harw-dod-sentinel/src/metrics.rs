@@ -279,10 +279,11 @@ pub fn record_buffer_utilization(sink: &dyn TelemetrySink, kind: BufferKind, rat
 #[cfg(test)]
 mod tests {
     use super::{
-        BufferKind, permanence_label, record_buffer_utilization, record_degraded_sensors,
-        record_error, record_poll, BUFFER_UTILIZATION, SENSORS_DEGRADED, SENSOR_ERRORS_TOTAL,
-        SENSOR_POLLS_TOTAL,
+        BUFFER_UTILIZATION, BufferKind, SENSOR_ERRORS_TOTAL, SENSOR_POLLS_TOTAL, SENSORS_DEGRADED,
+        permanence_label, record_buffer_utilization, record_degraded_sensors, record_error,
+        record_poll,
     };
+    use crate::test_support::{TestResult, ctx};
     use harw_dod_cap::Permanence;
     use harw_observe::{FieldValue, MetricValue, TelemetrySink};
     use harw_types::SensorId;
@@ -307,9 +308,13 @@ mod tests {
                 .iter()
                 .map(|(name, value)| (name.as_str(), value.clone()))
                 .collect();
+            // `TelemetrySink::record` liefert laut Trait-Signatur (harw-observe,
+            // außerhalb dieser Datei) `()` — kein `?` möglich. Ein vergifteter
+            // Mutex wird hier statt eines Panics über `PoisonError::into_inner`
+            // wiederhergestellt; ein Test-Double darf den Prozess nicht abbrechen.
             self.records
                 .lock()
-                .expect("test mutex not poisoned")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push((key.name, value, labels));
         }
 
@@ -321,11 +326,14 @@ mod tests {
     }
 
     #[test]
-    fn test_record_poll_emits_sensor_label() {
+    fn test_record_poll_emits_sensor_label() -> TestResult {
         let sink = RecordingSink::default();
         record_poll(&sink, &SensorId::from_str("thermal-0"));
 
-        let records = sink.records.lock().expect("test mutex not poisoned");
+        let records = sink
+            .records
+            .lock()
+            .map_err(ctx("test mutex not poisoned"))?;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].0, SENSOR_POLLS_TOTAL.name);
         assert_eq!(records[0].1, MetricValue::Count(1));
@@ -333,14 +341,22 @@ mod tests {
             records[0].2,
             vec![("sensor", FieldValue::Owned("thermal-0".to_owned()))]
         );
+        Ok(())
     }
 
     #[test]
-    fn test_record_error_emits_sensor_and_permanence_labels() {
+    fn test_record_error_emits_sensor_and_permanence_labels() -> TestResult {
         let sink = RecordingSink::default();
-        record_error(&sink, &SensorId::from_str("thermal-0"), Permanence::Permanent);
+        record_error(
+            &sink,
+            &SensorId::from_str("thermal-0"),
+            Permanence::Permanent,
+        );
 
-        let records = sink.records.lock().expect("test mutex not poisoned");
+        let records = sink
+            .records
+            .lock()
+            .map_err(ctx("test mutex not poisoned"))?;
         assert_eq!(records[0].0, SENSOR_ERRORS_TOTAL.name);
         assert_eq!(
             records[0].2,
@@ -349,28 +365,37 @@ mod tests {
                 ("permanence", FieldValue::Str("permanent")),
             ]
         );
+        Ok(())
     }
 
     #[test]
-    fn test_record_degraded_sensors_emits_gauge() {
+    fn test_record_degraded_sensors_emits_gauge() -> TestResult {
         let sink = RecordingSink::default();
         record_degraded_sensors(&sink, 3);
 
-        let records = sink.records.lock().expect("test mutex not poisoned");
+        let records = sink
+            .records
+            .lock()
+            .map_err(ctx("test mutex not poisoned"))?;
         assert_eq!(records[0].0, SENSORS_DEGRADED.name);
         assert_eq!(records[0].1, MetricValue::Gauge(3.0));
         assert!(records[0].2.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_record_buffer_utilization_labels_by_kind() {
+    fn test_record_buffer_utilization_labels_by_kind() -> TestResult {
         let sink = RecordingSink::default();
         record_buffer_utilization(&sink, BufferKind::Events, 0.5);
 
-        let records = sink.records.lock().expect("test mutex not poisoned");
+        let records = sink
+            .records
+            .lock()
+            .map_err(ctx("test mutex not poisoned"))?;
         assert_eq!(records[0].0, BUFFER_UTILIZATION.name);
         assert_eq!(records[0].1, MetricValue::Gauge(0.5));
         assert_eq!(records[0].2, vec![("buffer", FieldValue::Str("events"))]);
+        Ok(())
     }
 
     #[test]

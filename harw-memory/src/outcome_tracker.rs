@@ -490,6 +490,7 @@ pub fn refutation_score(reports: &[OutcomeReport], for_signal: &str) -> u8 {
 mod tests {
     use super::*;
     use crate::epistemic::OutcomeVerdict;
+    use crate::test_support::{TestError, TestResult, ctx};
     use time::{Duration, OffsetDateTime};
 
     // ── Hilfsfunktionen ──────────────────────────────────────────────────────
@@ -560,7 +561,7 @@ mod tests {
     // ── Test 3: Doppel-track ersetzt bestehenden Eintrag ─────────────────────
 
     #[test]
-    fn track_double_replaces() {
+    fn track_double_replaces() -> TestResult {
         let mut tracker = OutcomeTracker::new();
         let deadline1 = now() + Duration::days(1);
         let deadline2 = now() + Duration::days(7);
@@ -576,11 +577,12 @@ mod tests {
         let entry = tracker
             .pending
             .get("sig-dup")
-            .expect("Eintrag muss existieren");
+            .ok_or(TestError::Missing("Eintrag muss existieren"))?;
         assert_eq!(
             entry.deadline, deadline2,
             "zweite Registrierung muss deadline überschreiben"
         );
+        Ok(())
     }
 
     // ── Test 4: overdue findet nur abgelaufene ────────────────────────────────
@@ -710,7 +712,7 @@ mod tests {
     // ── Test 10: JSON-Roundtrip ────────────────────────────────────────────
 
     #[test]
-    fn serde_roundtrip_tracker() {
+    fn serde_roundtrip_tracker() -> TestResult {
         let mut tracker = OutcomeTracker::new();
         let t = now();
 
@@ -722,9 +724,10 @@ mod tests {
             reported_at: t - Duration::days(1),
         });
 
-        let json = serde_json::to_string_pretty(&tracker).expect("Serialisierung muss klappen");
+        let json =
+            serde_json::to_string_pretty(&tracker).map_err(ctx("Serialisierung muss klappen"))?;
         let back: OutcomeTracker =
-            serde_json::from_str(&json).expect("Deserialisierung muss klappen");
+            serde_json::from_str(&json).map_err(ctx("Deserialisierung muss klappen"))?;
 
         assert_eq!(back.pending.len(), tracker.pending.len());
         assert_eq!(back.history.len(), tracker.history.len());
@@ -735,8 +738,9 @@ mod tests {
         let pending_back = back
             .pending
             .get("sig-rt")
-            .expect("pending sig-rt muss vorhanden sein");
+            .ok_or(TestError::Missing("pending sig-rt muss vorhanden sein"))?;
         assert_eq!(pending_back.signal_id, "sig-rt");
         assert_eq!(pending_back.context, "Test-Kontext");
+        Ok(())
     }
 }

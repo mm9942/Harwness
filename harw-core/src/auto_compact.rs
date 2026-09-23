@@ -34,6 +34,13 @@
 //!   Verdichtung nicht — der Overhead eines Compact-Turns (Latenz, Kosten)
 //!   übersteigt den Gewinn.
 //!
+//! Zusätzlich gilt als absolute Obergrenze der Standard-Deckel
+//! [`DEFAULT_ABSOLUTE_CEILING_TOKENS`] (500 000 Input-Tokens): effektive
+//! Budget-Schwelle = `min(70 % Fenster, Deckel)`. Bei Modellen mit kleinem
+//! Fenster (≤ ~714 k) bleibt die relative Schwelle maßgeblich; der Deckel
+//! begrenzt zusätzlich die akkumulierte Input-Nutzung großer Sessions
+//! (langlaufende Orchestrator-Sessions mit sehr großen Fenstern).
+//!
 //! # Vertrauen & Sicherheit
 //!
 //! Die Policy **entscheidet nur**; die eigentliche Verdichtung (Summary durch
@@ -113,7 +120,13 @@ impl CompactDecision {
 
 /// Feste Obergrenze für die Budget-Schwelle unabhängig vom Kontextfenster
 /// (Root-/Sub-Orchestrator-Sessions), siehe [`AutoCompactPolicy::with_absolute_ceiling`].
-pub const DEFAULT_ABSOLUTE_CEILING_TOKENS: u64 = 120_000;
+///
+/// Auto-Compact löst bei 500 000 Input-Tokens aus (Nutzung aus
+/// `last_round_usage.input_tokens` — der einzig verlässliche direkte Blick
+/// auf die tatsächliche Input-Nutzung des Modells). Bei Modellen mit einem
+/// Fenster ≤ ~714 k Tokens greift die relative 70 %-Schwelle zuerst; der
+/// Deckel begrenzt zusätzlich die kumulierte Input-Nutzung langer Sessions.
+pub const DEFAULT_ABSOLUTE_CEILING_TOKENS: u64 = 500_000;
 
 /// Ziel-Token-Zahl für die harte Verdichtung am Beginn eines neuen Auftrags
 /// bei Orchestrator-Sessions, siehe [`AutoCompactPolicy::with_turn_start_target`].
@@ -280,6 +293,7 @@ impl AutoCompactPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn thresholds_derive_from_context_window() {
@@ -335,10 +349,7 @@ mod tests {
     #[test]
     fn task_completed_above_task_end_threshold_triggers() {
         let policy = AutoCompactPolicy::for_context_window(200_000);
-        assert_eq!(
-            policy.decide(60_001, true),
-            CompactDecision::TaskCompleted,
-        );
+        assert_eq!(policy.decide(60_001, true), CompactDecision::TaskCompleted,);
         // Ohne Task-Ende bleibt es unterhalb des Budget-Deckels ruhig.
         assert_eq!(policy.decide(60_001, false), CompactDecision::None);
     }
@@ -352,8 +363,11 @@ mod tests {
     #[test]
     fn saturation_does_not_panic_on_huge_windows() {
         let policy = AutoCompactPolicy::for_context_window(u64::MAX);
-        // Keine Panik, keine Überlauf-Wraps.
-        assert_eq!(policy.decide(u64::MAX, false), CompactDecision::BudgetExceeded);
+        // Keine Panik, keine Überlauf-Wraps.
+        assert_eq!(
+            policy.decide(u64::MAX, false),
+            CompactDecision::BudgetExceeded
+        );
         assert!(policy.compact_threshold_tokens() > 0);
     }
 
@@ -365,21 +379,27 @@ mod tests {
     }
 
     #[test]
+    fn default_ceiling_is_500k_input_tokens() {
+        // Auto-Compact-Deckel: 500 000 Input-Tokens.
+        assert_eq!(DEFAULT_ABSOLUTE_CEILING_TOKENS, 500_000);
+    }
+
+    #[test]
     fn absolute_ceiling_lowers_effective_threshold() {
-        // 1M-Fenster: relative Schwelle 700k, aber Deckel 120k greift zuerst.
+        // 1M-Fenster: relative Schwelle 700k, aber Deckel 500k greift zuerst.
         let policy = AutoCompactPolicy::for_context_window(1_000_000)
             .with_absolute_ceiling(Some(DEFAULT_ABSOLUTE_CEILING_TOKENS));
-        assert_eq!(policy.decide(100_000, false), CompactDecision::None);
+        assert_eq!(policy.decide(500_000, false), CompactDecision::None);
         assert_eq!(
-            policy.decide(120_001, false),
+            policy.decide(500_001, false),
             CompactDecision::BudgetExceeded,
         );
     }
 
     #[test]
     fn absolute_ceiling_above_relative_threshold_has_no_effect() {
-        let policy = AutoCompactPolicy::for_context_window(200_000)
-            .with_absolute_ceiling(Some(500_000));
+        let policy =
+            AutoCompactPolicy::for_context_window(200_000).with_absolute_ceiling(Some(500_000));
         assert_eq!(
             policy.decide(140_001, false),
             CompactDecision::BudgetExceeded,
@@ -399,10 +419,11 @@ mod tests {
     }
 
     #[test]
-    fn policy_serde_roundtrip() {
+    fn policy_serde_roundtrip() -> TestResult {
         let policy = AutoCompactPolicy::for_context_window(200_000);
-        let json = serde_json::to_string(&policy).expect("serialize");
-        let parsed: AutoCompactPolicy = serde_json::from_str(&json).expect("deserialize");
+        let json = serde_json::to_string(&policy).map_err(ctx("serialize"))?;
+        let parsed: AutoCompactPolicy = serde_json::from_str(&json).map_err(ctx("deserialize"))?;
         assert_eq!(policy, parsed);
+        Ok(())
     }
 }

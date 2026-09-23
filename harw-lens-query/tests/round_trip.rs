@@ -10,15 +10,18 @@
 //! `DeterministicEmbedder` — keiner spricht mit einem echten Modell oder
 //! einem echten Netz.
 
+mod common;
+
+use common::{TestError, TestResult, ctx};
 use harw_knowledge::{
     AgentId, ArtifactId, ArtifactKind, Frontmatter, KnowledgeArtifact, KnowledgeIndex,
     VisibilityScope,
 };
 use harw_lens_embed::{DeterministicEmbedder, EmbeddingDescriptor};
-use harw_lens_query::{query_scoped, IndexSelector, QueryError, QueryProvenance, ReadScope};
+use harw_lens_query::{IndexSelector, QueryError, QueryProvenance, ReadScope, query_scoped};
 use harw_lens_source::{
-    build_index, collect_design_docs, collect_palace_documents, CHUNKER_VERSION,
-    DOCS_DESIGN_INDEX, KNOWLEDGE_PALACE_INDEX,
+    CHUNKER_VERSION, DOCS_DESIGN_INDEX, KNOWLEDGE_PALACE_INDEX, build_index, collect_design_docs,
+    collect_palace_documents,
 };
 use harw_lens_types::{CollapsePolicy, EdgeIndex, Locality, Metric, SourceRef};
 
@@ -47,16 +50,16 @@ fn provenance() -> QueryProvenance {
 /// `docs.design` wird gebaut und ist abfragbar; ein Treffer zeigt auf den
 /// richtigen `SourceRef`.
 #[test]
-fn docs_design_round_trip_finds_the_right_source_ref() {
-    let home = tempfile::tempdir().expect("tempdir");
-    let docs_root = tempfile::tempdir().expect("tempdir");
+fn docs_design_round_trip_finds_the_right_source_ref() -> TestResult {
+    let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+    let docs_root = tempfile::tempdir().map_err(ctx("tempdir"))?;
     std::fs::write(
         docs_root.path().join("architecture.md"),
         "# Architecture\n\nThe system has three layers.\n",
     )
-    .expect("write design doc");
+    .map_err(ctx("write design doc"))?;
 
-    let documents = collect_design_docs(docs_root.path()).expect("collects");
+    let documents = collect_design_docs(docs_root.path()).map_err(ctx("collects"))?;
     let embedder = DeterministicEmbedder::new(16);
     build_index(
         home.path(),
@@ -68,7 +71,7 @@ fn docs_design_round_trip_finds_the_right_source_ref() {
         &embedder,
         &descriptor(),
     )
-    .expect("builds");
+    .map_err(ctx("builds"))?;
 
     let selector = IndexSelector::new(DOCS_DESIGN_INDEX, "workspace");
     let scope = ReadScope::single("workspace");
@@ -84,7 +87,7 @@ fn docs_design_round_trip_finds_the_right_source_ref() {
         CollapsePolicy::ByDigest,
         10,
     )
-    .expect("query succeeds");
+    .map_err(ctx("query succeeds"))?;
 
     assert!(!hits.is_empty());
     assert_eq!(
@@ -93,13 +96,14 @@ fn docs_design_round_trip_finds_the_right_source_ref() {
             path: "architecture.md".to_owned()
         }
     );
+    Ok(())
 }
 
 /// `knowledge.palace` wird gebaut und ist abfragbar; ein Treffer zeigt auf
 /// den richtigen `SourceRef`.
 #[test]
-fn knowledge_palace_round_trip_finds_the_right_source_ref() {
-    let home = tempfile::tempdir().expect("tempdir");
+fn knowledge_palace_round_trip_finds_the_right_source_ref() -> TestResult {
+    let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
     let mut index = KnowledgeIndex::new();
     index.insert(KnowledgeArtifact::new(
         ArtifactId::new("palace/deploy-pipeline"),
@@ -120,7 +124,7 @@ fn knowledge_palace_round_trip_finds_the_right_source_ref() {
         &embedder,
         &descriptor(),
     )
-    .expect("builds");
+    .map_err(ctx("builds"))?;
 
     let selector = IndexSelector::new(KNOWLEDGE_PALACE_INDEX, "workspace");
     let scope = ReadScope::single("workspace");
@@ -136,7 +140,7 @@ fn knowledge_palace_round_trip_finds_the_right_source_ref() {
         CollapsePolicy::ByDigest,
         10,
     )
-    .expect("query succeeds");
+    .map_err(ctx("query succeeds"))?;
 
     assert!(!hits.is_empty());
     assert_eq!(
@@ -145,6 +149,7 @@ fn knowledge_palace_round_trip_finds_the_right_source_ref() {
             id: "palace/deploy-pipeline".to_owned()
         }
     );
+    Ok(())
 }
 
 /// Der wichtigste Sicherheitstest dieses Knotens: ein `OperatorOnly`-Artefakt
@@ -153,8 +158,8 @@ fn knowledge_palace_round_trip_finds_the_right_source_ref() {
 /// auffindbar — wohl aber über einen Lesebereich, der `operator-only`
 /// tatsächlich freigibt.
 #[test]
-fn operator_only_artifact_is_unreachable_through_the_workspace_scope() {
-    let home = tempfile::tempdir().expect("tempdir");
+fn operator_only_artifact_is_unreachable_through_the_workspace_scope() -> TestResult {
+    let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
     let mut index = KnowledgeIndex::new();
     index.insert(KnowledgeArtifact::new(
         ArtifactId::new("palace/normal"),
@@ -181,14 +186,14 @@ fn operator_only_artifact_is_unreachable_through_the_workspace_scope() {
         &embedder,
         &descriptor(),
     )
-    .expect("builds");
+    .map_err(ctx("builds"))?;
 
     // A caller scoped to "workspace" only cannot even select the
     // operator-only index: the request is rejected outright, before any
     // disk access -- never a silent empty result.
     let workspace_scope = ReadScope::single("workspace");
     let operator_selector = IndexSelector::new(KNOWLEDGE_PALACE_INDEX, "operator-only");
-    let err = query_scoped(
+    let query_result = query_scoped(
         home.path(),
         &operator_selector,
         &workspace_scope,
@@ -199,8 +204,12 @@ fn operator_only_artifact_is_unreachable_through_the_workspace_scope() {
         &EdgeIndex::default(),
         CollapsePolicy::ByDigest,
         10,
-    )
-    .expect_err("operator-only visibility is outside the workspace scope");
+    );
+    let Err(err) = query_result else {
+        return Err(TestError::Unexpected(
+            "operator-only visibility is outside the workspace scope".to_owned(),
+        ));
+    };
     assert!(matches!(err, QueryError::IndexNotVisible { .. }));
 
     // Even querying the ordinary workspace index directly never turns up the
@@ -219,7 +228,7 @@ fn operator_only_artifact_is_unreachable_through_the_workspace_scope() {
         CollapsePolicy::ByDigest,
         10,
     )
-    .expect("query succeeds");
+    .map_err(ctx("query succeeds"))?;
     assert!(workspace_hits.iter().all(|hit| hit.chunk.source
         != SourceRef::Artifact {
             id: "palace/secret".to_owned()
@@ -239,7 +248,7 @@ fn operator_only_artifact_is_unreachable_through_the_workspace_scope() {
         CollapsePolicy::ByDigest,
         10,
     )
-    .expect("query succeeds");
+    .map_err(ctx("query succeeds"))?;
     assert!(!operator_hits.is_empty());
     assert_eq!(
         operator_hits[0].chunk.source,
@@ -247,6 +256,7 @@ fn operator_only_artifact_is_unreachable_through_the_workspace_scope() {
             id: "palace/secret".to_owned()
         }
     );
+    Ok(())
 }
 
 /// Der Beleg, dass die Manifest-Prüfung über den vorgesehenen öffentlichen
@@ -257,16 +267,16 @@ fn operator_only_artifact_is_unreachable_through_the_workspace_scope() {
 /// genau dem Index, den es durchsuchte -- dieser Zustand war über
 /// `query_scoped`/`query` nicht erreichbar.
 #[test]
-fn query_scoped_rejects_a_query_embedded_with_a_different_model_than_the_index() {
-    let home = tempfile::tempdir().expect("tempdir");
-    let docs_root = tempfile::tempdir().expect("tempdir");
+fn query_scoped_rejects_a_query_embedded_with_a_different_model_than_the_index() -> TestResult {
+    let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+    let docs_root = tempfile::tempdir().map_err(ctx("tempdir"))?;
     std::fs::write(
         docs_root.path().join("architecture.md"),
         "# Architecture\n\nThe system has three layers.\n",
     )
-    .expect("write design doc");
+    .map_err(ctx("write design doc"))?;
 
-    let documents = collect_design_docs(docs_root.path()).expect("collects");
+    let documents = collect_design_docs(docs_root.path()).map_err(ctx("collects"))?;
     let embedder = DeterministicEmbedder::new(16);
     build_index(
         home.path(),
@@ -278,7 +288,7 @@ fn query_scoped_rejects_a_query_embedded_with_a_different_model_than_the_index()
         &embedder,
         &descriptor(),
     )
-    .expect("builds");
+    .map_err(ctx("builds"))?;
 
     let selector = IndexSelector::new(DOCS_DESIGN_INDEX, "workspace");
     let scope = ReadScope::single("workspace");
@@ -287,7 +297,7 @@ fn query_scoped_rejects_a_query_embedded_with_a_different_model_than_the_index()
         chunker_version: CHUNKER_VERSION,
     };
 
-    let err = query_scoped(
+    let query_result = query_scoped(
         home.path(),
         &selector,
         &scope,
@@ -298,10 +308,15 @@ fn query_scoped_rejects_a_query_embedded_with_a_different_model_than_the_index()
         &EdgeIndex::default(),
         CollapsePolicy::ByDigest,
         10,
-    )
-    .expect_err("a query embedded with a different model than the index must be rejected");
+    );
+    let Err(err) = query_result else {
+        return Err(TestError::Unexpected(
+            "a query embedded with a different model than the index must be rejected".to_owned(),
+        ));
+    };
 
     assert!(matches!(err, QueryError::Index(_)));
+    Ok(())
 }
 
 /// Gegentest zum vorherigen: passende Provenienz (dasselbe Modell, mit dem
@@ -309,16 +324,16 @@ fn query_scoped_rejects_a_query_embedded_with_a_different_model_than_the_index()
 /// vorherige nur, dass irgendetwas an dem Aufruf fehlschlägt, nicht dass die
 /// Prüfung modellspezifisch ist.
 #[test]
-fn query_scoped_accepts_a_query_embedded_with_the_same_model_as_the_index() {
-    let home = tempfile::tempdir().expect("tempdir");
-    let docs_root = tempfile::tempdir().expect("tempdir");
+fn query_scoped_accepts_a_query_embedded_with_the_same_model_as_the_index() -> TestResult {
+    let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+    let docs_root = tempfile::tempdir().map_err(ctx("tempdir"))?;
     std::fs::write(
         docs_root.path().join("architecture.md"),
         "# Architecture\n\nThe system has three layers.\n",
     )
-    .expect("write design doc");
+    .map_err(ctx("write design doc"))?;
 
-    let documents = collect_design_docs(docs_root.path()).expect("collects");
+    let documents = collect_design_docs(docs_root.path()).map_err(ctx("collects"))?;
     let embedder = DeterministicEmbedder::new(16);
     build_index(
         home.path(),
@@ -330,7 +345,7 @@ fn query_scoped_accepts_a_query_embedded_with_the_same_model_as_the_index() {
         &embedder,
         &descriptor(),
     )
-    .expect("builds");
+    .map_err(ctx("builds"))?;
 
     let selector = IndexSelector::new(DOCS_DESIGN_INDEX, "workspace");
     let scope = ReadScope::single("workspace");
@@ -351,25 +366,29 @@ fn query_scoped_accepts_a_query_embedded_with_the_same_model_as_the_index() {
         CollapsePolicy::ByDigest,
         10,
     )
-    .expect("provenance matching the index's model must be accepted");
+    .map_err(ctx(
+        "provenance matching the index's model must be accepted",
+    ))?;
 
     assert!(!hits.is_empty());
+    Ok(())
 }
 
 /// Derselbe Fehlertyp, ein anderer Grund: eine abweichende
 /// Zerlegungsfassung verschiebt die Chunk-Grenzen, nicht den Vektorraum --
 /// die Prüfung muss trotzdem greifen.
 #[test]
-fn query_scoped_rejects_a_query_embedded_with_a_different_chunker_version_than_the_index() {
-    let home = tempfile::tempdir().expect("tempdir");
-    let docs_root = tempfile::tempdir().expect("tempdir");
+fn query_scoped_rejects_a_query_embedded_with_a_different_chunker_version_than_the_index()
+-> TestResult {
+    let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+    let docs_root = tempfile::tempdir().map_err(ctx("tempdir"))?;
     std::fs::write(
         docs_root.path().join("architecture.md"),
         "# Architecture\n\nThe system has three layers.\n",
     )
-    .expect("write design doc");
+    .map_err(ctx("write design doc"))?;
 
-    let documents = collect_design_docs(docs_root.path()).expect("collects");
+    let documents = collect_design_docs(docs_root.path()).map_err(ctx("collects"))?;
     let embedder = DeterministicEmbedder::new(16);
     build_index(
         home.path(),
@@ -381,7 +400,7 @@ fn query_scoped_rejects_a_query_embedded_with_a_different_chunker_version_than_t
         &embedder,
         &descriptor(),
     )
-    .expect("builds");
+    .map_err(ctx("builds"))?;
 
     let selector = IndexSelector::new(DOCS_DESIGN_INDEX, "workspace");
     let scope = ReadScope::single("workspace");
@@ -390,7 +409,7 @@ fn query_scoped_rejects_a_query_embedded_with_a_different_chunker_version_than_t
         chunker_version: CHUNKER_VERSION + 1,
     };
 
-    let err = query_scoped(
+    let query_result = query_scoped(
         home.path(),
         &selector,
         &scope,
@@ -401,8 +420,13 @@ fn query_scoped_rejects_a_query_embedded_with_a_different_chunker_version_than_t
         &EdgeIndex::default(),
         CollapsePolicy::ByDigest,
         10,
-    )
-    .expect_err("a query embedded against a different chunker version must be rejected");
+    );
+    let Err(err) = query_result else {
+        return Err(TestError::Unexpected(
+            "a query embedded against a different chunker version must be rejected".to_owned(),
+        ));
+    };
 
     assert!(matches!(err, QueryError::Index(_)));
+    Ok(())
 }

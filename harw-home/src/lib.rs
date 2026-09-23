@@ -51,14 +51,54 @@ pub mod project;
 pub mod scaffold;
 pub mod trust;
 
+#[cfg(test)]
+mod test_support;
+
 pub use bundle::{BundledFile, bundled_files};
 pub use error::{HomeError, HomeResult};
 pub use paths::{
     LayerReport, active_profile_name, active_profile_path, auth_path, config_layers,
     config_layers_report, config_layers_report_at, home_dir, profile_dir,
 };
-pub use project::{ProjectHome, ProjectKind, ProjectRoot, discover_project, project_key, project_settings_dir};
+pub use project::{
+    ProjectHome, ProjectKind, ProjectRoot, discover_project, project_key, project_settings_dir,
+};
 pub use scaffold::{Scaffolded, ensure_home};
 pub use trust::{
     TrustRecord, TrustStatus, TrustStore, project_trust_status, trust_project, untrust_project,
 };
+
+/// Immutable filesystem scope selected at the runtime boundary.
+#[derive(Debug, Clone)]
+pub struct ResolvedHomeContext {
+    pub home: std::path::PathBuf,
+    pub profile_name: String,
+    pub profile_dir: std::path::PathBuf,
+    pub project: ProjectRoot,
+    pub project_home: ProjectHome,
+    pub project_settings_path: std::path::PathBuf,
+}
+
+impl ResolvedHomeContext {
+    /// Bind paths once; consumers must not resolve process environment again.
+    pub fn new(
+        home: &std::path::Path,
+        profile_name: String,
+        project: ProjectRoot,
+    ) -> HomeResult<Self> {
+        let home = std::path::absolute(home).map_err(|error| HomeError::io(home, error))?;
+        let profile_dir = profile_dir(&home, &profile_name)?;
+        let project_settings_path =
+            project_settings_dir(&home, &profile_name, &project_key(&project.root))?
+                .join("settings.toml");
+        let project_home = ProjectHome::at(&project);
+        Ok(Self {
+            home,
+            profile_name,
+            profile_dir,
+            project,
+            project_home,
+            project_settings_path,
+        })
+    }
+}

@@ -119,7 +119,9 @@ pub fn visible_delegation_targets(
 
     let mut targets: Vec<DelegationTarget> = candidates
         .iter()
-        .filter(|(name, role)| can_delegate_to(caller_role, *role, name, allowed_child_orchestrators))
+        .filter(|(name, role)| {
+            can_delegate_to(caller_role, *role, name, allowed_child_orchestrators)
+        })
         .map(|(name, role)| DelegationTarget {
             name: name.clone(),
             role: *role,
@@ -127,9 +129,9 @@ pub fn visible_delegation_targets(
                 AgentRoleId::ChildOrchestrator => DelegationTargetKind::ChildOrchestrator,
                 AgentRoleId::UiaWorker => DelegationTargetKind::UiaWorker,
                 AgentRoleId::AgentSteward => DelegationTargetKind::AgentSteward,
-                AgentRoleId::UserInterface | AgentRoleId::RootOrchestrator | AgentRoleId::Worker => {
-                    DelegationTargetKind::Worker
-                }
+                AgentRoleId::UserInterface
+                | AgentRoleId::RootOrchestrator
+                | AgentRoleId::Worker => DelegationTargetKind::Worker,
             },
         })
         .collect();
@@ -140,6 +142,7 @@ pub fn visible_delegation_targets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     fn candidates() -> Vec<(String, AgentRoleId)> {
         vec![
@@ -150,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn root_orchestrator_sees_worker_and_allowed_child_orchestrator_sorted() {
+    fn root_orchestrator_sees_worker_and_allowed_child_orchestrator_sorted() -> TestResult {
         let targets = visible_delegation_targets(
             AgentRoleId::RootOrchestrator,
             &candidates(),
@@ -163,10 +166,11 @@ mod tests {
             targets
                 .iter()
                 .find(|t| t.name == "alpha-sub")
-                .expect("alpha-sub visible")
+                .ok_or(TestError::Missing("alpha-sub visible"))?
                 .kind,
             DelegationTargetKind::ChildOrchestrator
         );
+        Ok(())
     }
 
     #[test]

@@ -20,6 +20,8 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # `--log`-Grammatik; Version identisch zu `harw-cli`/`harw-sentinel`.
 clap = { version = "4.6.1", features = ["derive"] }
+# `completions`-Unterbefehl (Skriptausgabe und verwaltete Installation).
+harw-completions = { path = "../../../harw-completions", features = ["clap-args"] }
 # Sicherer `SOCK_SEQPACKET`-Unix-Socket ohne `unsafe` (`net`-Feature). Das
 # `event`-Feature liefert `rustix::event::poll`, mit dem `src/source.rs` den
 # `timeout`-Parameter von `FsEventSource::read_events` gegen den echten

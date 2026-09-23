@@ -457,114 +457,130 @@ fn default_mcp_listener_path() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn test_minimal_config_still_parses() {
+    fn test_minimal_config_still_parses() -> TestResult {
         let src = r#"
             default_provider = "anthropic"
             default_model = "claude-sonnet"
         "#;
-        let cfg: HarnessConfig = toml::from_str(src).unwrap();
+        let cfg: HarnessConfig = toml::from_str(src).map_err(ctx("parse minimal config"))?;
         assert_eq!(cfg.logging.level, "info");
         assert_eq!(cfg.tui.theme, "default-dark");
         assert_eq!(cfg.session.retention_days, 90);
         assert_eq!(cfg.mcp_listener.listen_addr, "127.0.0.1:1337");
         assert_eq!(cfg.mcp_listener.path, "/mcp");
+        Ok(())
     }
 
     #[test]
-    fn test_config_version_defaults_and_reads() {
+    fn test_config_version_defaults_and_reads() -> TestResult {
         let without = r#"
             default_provider = "anthropic"
         "#;
-        let cfg: HarnessConfig = toml::from_str(without).unwrap();
+        let cfg: HarnessConfig =
+            toml::from_str(without).map_err(ctx("parse config without version"))?;
         assert_eq!(cfg.config_version, 0);
 
         let with = r#"
             config_version = 3
             default_provider = "anthropic"
         "#;
-        let cfg: HarnessConfig = toml::from_str(with).unwrap();
+        let cfg: HarnessConfig = toml::from_str(with).map_err(ctx("parse config with version"))?;
         assert_eq!(cfg.config_version, 3);
+        Ok(())
     }
 
     #[test]
-    fn test_active_agent_definition_defaults_to_none() {
-        let cfg: HarnessConfig = toml::from_str("default_provider = \"anthropic\"").unwrap();
+    fn test_active_agent_definition_defaults_to_none() -> TestResult {
+        let cfg: HarnessConfig =
+            toml::from_str("default_provider = \"anthropic\"").map_err(ctx("parse config"))?;
 
         assert_eq!(cfg.active_agent_definition, None);
+        Ok(())
     }
 
     #[test]
-    fn test_active_uia_definition_defaults_to_none() {
-        let cfg: HarnessConfig = toml::from_str("default_provider = \"anthropic\"").unwrap();
+    fn test_active_uia_definition_defaults_to_none() -> TestResult {
+        let cfg: HarnessConfig =
+            toml::from_str("default_provider = \"anthropic\"").map_err(ctx("parse config"))?;
         assert_eq!(cfg.active_uia_definition, None);
+        Ok(())
     }
 
     #[test]
-    fn test_active_uia_definition_reads_exact_definition_id() {
+    fn test_active_uia_definition_reads_exact_definition_id() -> TestResult {
         let cfg: HarnessConfig = toml::from_str(
             r#"
                 active_uia_definition = "harwness.agent.terminal-ui@1"
             "#,
         )
-        .unwrap();
+        .map_err(ctx("parse config"))?;
         assert_eq!(
             cfg.active_uia_definition.as_deref(),
             Some("harwness.agent.terminal-ui@1")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_uia_provider_and_model_default_to_none() {
-        let cfg: HarnessConfig = toml::from_str("default_provider = \"anthropic\"").unwrap();
+    fn test_uia_provider_and_model_default_to_none() -> TestResult {
+        let cfg: HarnessConfig =
+            toml::from_str("default_provider = \"anthropic\"").map_err(ctx("parse config"))?;
         assert_eq!(cfg.uia_provider, None);
         assert_eq!(cfg.uia_model, None);
+        Ok(())
     }
 
     #[test]
-    fn test_uia_provider_and_model_read_exact_values() {
+    fn test_uia_provider_and_model_read_exact_values() -> TestResult {
         let cfg: HarnessConfig = toml::from_str(
             r#"
                 uia_provider = "anthropic"
                 uia_model = "claude-x"
             "#,
         )
-        .unwrap();
+        .map_err(ctx("parse config"))?;
         assert_eq!(cfg.uia_provider.as_deref(), Some("anthropic"));
         assert_eq!(cfg.uia_model.as_deref(), Some("claude-x"));
+        Ok(())
     }
 
     #[test]
-    fn test_uia_worker_model_defaults_to_none() {
-        let cfg: HarnessConfig = toml::from_str("default_provider = \"anthropic\"").unwrap();
+    fn test_uia_worker_model_defaults_to_none() -> TestResult {
+        let cfg: HarnessConfig =
+            toml::from_str("default_provider = \"anthropic\"").map_err(ctx("parse config"))?;
         assert_eq!(cfg.uia_worker_model, None);
+        Ok(())
     }
 
     #[test]
-    fn test_uia_worker_model_reads_exact_value() {
+    fn test_uia_worker_model_reads_exact_value() -> TestResult {
         let cfg: HarnessConfig = toml::from_str(
             r#"
                 uia_worker_model = "claude-worker-x"
             "#,
         )
-        .unwrap();
+        .map_err(ctx("parse config"))?;
         assert_eq!(cfg.uia_worker_model.as_deref(), Some("claude-worker-x"));
+        Ok(())
     }
 
     #[test]
-    fn test_active_agent_definition_reads_exact_definition_id() {
+    fn test_active_agent_definition_reads_exact_definition_id() -> TestResult {
         let cfg: HarnessConfig = toml::from_str(
             r#"
                 active_agent_definition = "definition://coding/rust/strict-v1"
             "#,
         )
-        .unwrap();
+        .map_err(ctx("parse config"))?;
 
         assert_eq!(
             cfg.active_agent_definition.as_deref(),
             Some("definition://coding/rust/strict-v1")
         );
+        Ok(())
     }
 
     #[test]
@@ -595,7 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_config_overrides_defaults() {
+    fn test_full_config_overrides_defaults() -> TestResult {
         let src = r#"
             default_provider = "anthropic"
             default_model = "claude-sonnet"
@@ -618,31 +634,35 @@ mod tests {
             workspace = "harwness"
             job_capabilities = ["read_own", "cancel_own"]
         "#;
-        let cfg: HarnessConfig = toml::from_str(src).unwrap();
+        let cfg: HarnessConfig = toml::from_str(src).map_err(ctx("parse full config"))?;
         assert_eq!(cfg.logging.level, "debug");
         assert_eq!(cfg.tui.theme, "light");
         assert!(cfg.mcp_listener.enabled);
         assert_eq!(cfg.mcp_listener.principals.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_submit_own_capability_parses_and_round_trips() {
+    fn test_submit_own_capability_parses_and_round_trips() -> TestResult {
         #[derive(Debug, Deserialize, PartialEq, Serialize)]
         struct CapabilityConfig {
             capability: McpJobCapabilityToml,
         }
 
-        let config: CapabilityConfig = toml::from_str("capability = \"submit_own\"").unwrap();
+        let config: CapabilityConfig =
+            toml::from_str("capability = \"submit_own\"").map_err(ctx("parse capability"))?;
         assert_eq!(config.capability, McpJobCapabilityToml::SubmitOwn);
 
-        let encoded = toml::to_string(&config).unwrap();
+        let encoded = toml::to_string(&config).map_err(ctx("encode capability"))?;
         assert_eq!(encoded, "capability = \"submit_own\"\n");
-        let decoded: CapabilityConfig = toml::from_str(&encoded).unwrap();
+        let decoded: CapabilityConfig =
+            toml::from_str(&encoded).map_err(ctx("decode encoded capability"))?;
         assert_eq!(decoded, config);
+        Ok(())
     }
 
     #[test]
-    fn test_mcp_principal_has_no_default_job_capabilities() {
+    fn test_mcp_principal_has_no_default_job_capabilities() -> TestResult {
         let principal: McpPrincipalToml = toml::from_str(
             r#"
                 id = "mia-local"
@@ -651,34 +671,39 @@ mod tests {
                 workspace = "harwness"
             "#,
         )
-        .unwrap();
+        .map_err(ctx("parse principal"))?;
 
         assert!(principal.job_capabilities.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_tools_mode_research_sections_default_when_absent() {
+    fn test_tools_mode_research_sections_default_when_absent() -> TestResult {
         let cfg: HarnessConfig = toml::from_str(
             r#"
                 default_provider = "anthropic"
             "#,
         )
-        .unwrap();
+        .map_err(ctx("parse config"))?;
 
         assert!(cfg.tools.plan.enabled);
         assert!(cfg.tools.plan.persist);
         assert_eq!(cfg.mode.default, "plan");
         assert_eq!(cfg.research.max_fetch_bytes, 1_048_576);
-        assert_eq!(cfg.permissions, crate::permissions_toml::PermissionsSection::default());
+        assert_eq!(
+            cfg.permissions,
+            crate::permissions_toml::PermissionsSection::default()
+        );
         assert!(cfg.project_root_markers.is_none());
         assert!(cfg.tools.plan.validate().is_ok());
         assert!(cfg.mode.validate().is_ok());
         assert!(cfg.research.validate().is_ok());
         assert!(cfg.permissions.validate().is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_tools_mode_research_sections_load_together() {
+    fn test_tools_mode_research_sections_load_together() -> TestResult {
         let src = r#"
             default_provider = "anthropic"
 
@@ -695,7 +720,7 @@ mod tests {
             network_allow_hosts = ["docs.rs", "crates.io"]
             max_fetch_bytes = 2048
         "#;
-        let cfg: HarnessConfig = toml::from_str(src).unwrap();
+        let cfg: HarnessConfig = toml::from_str(src).map_err(ctx("parse config"))?;
 
         assert!(cfg.tools.plan.enabled);
         assert!(cfg.tools.plan.persist);
@@ -711,10 +736,11 @@ mod tests {
         assert!(cfg.mode.validate().is_ok());
         assert!(cfg.research.validate().is_ok());
         assert!(cfg.permissions.validate().is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_permissions_section_and_project_root_markers_parse_together() {
+    fn test_permissions_section_and_project_root_markers_parse_together() -> TestResult {
         let src = r#"
             default_provider = "anthropic"
             project_root_markers = [".git", ".hg"]
@@ -730,7 +756,7 @@ mod tests {
             [[permissions.deny]]
             tool = "fs.write"
         "#;
-        let cfg: HarnessConfig = toml::from_str(src).unwrap();
+        let cfg: HarnessConfig = toml::from_str(src).map_err(ctx("parse config"))?;
 
         assert_eq!(
             cfg.project_root_markers,
@@ -743,6 +769,7 @@ mod tests {
         assert_eq!(cfg.permissions.deny.len(), 1);
         assert_eq!(cfg.permissions.deny[0].tool, "fs.write");
         assert!(cfg.permissions.validate().is_ok());
+        Ok(())
     }
 
     #[test]
@@ -764,19 +791,20 @@ mod tests {
     }
 
     #[test]
-    fn test_sandbox_section_defaults_when_absent() {
+    fn test_sandbox_section_defaults_when_absent() -> TestResult {
         let cfg: HarnessConfig = toml::from_str(
             r#"
                 default_provider = "anthropic"
             "#,
         )
-        .unwrap();
+        .map_err(ctx("parse config"))?;
         assert!(cfg.sandbox.cargo.is_none());
         assert!(cfg.sandbox.tmux.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_sandbox_cargo_section_parses() {
+    fn test_sandbox_cargo_section_parses() -> TestResult {
         let cfg: HarnessConfig = toml::from_str(
             r#"
                 default_provider = "anthropic"
@@ -788,16 +816,20 @@ mod tests {
                 cargo_home = "/var/cache/harw/cargo"
             "#,
         )
-        .unwrap();
-        let cargo = cfg.sandbox.cargo.unwrap();
+        .map_err(ctx("parse config"))?;
+        let cargo = cfg
+            .sandbox
+            .cargo
+            .ok_or(TestError::Missing("sandbox.cargo"))?;
         assert_eq!(cargo.mode, CargoSandboxModeToml::BuildOffline);
         assert_eq!(cargo.cargo_bin, "/opt/harw/toolchain/bin/cargo");
         assert_eq!(cargo.rustup_home, "/opt/harw/rustup");
         assert_eq!(cargo.cargo_home, "/var/cache/harw/cargo");
+        Ok(())
     }
 
     #[test]
-    fn test_sandbox_tmux_section_parses() {
+    fn test_sandbox_tmux_section_parses() -> TestResult {
         let cfg: HarnessConfig = toml::from_str(
             r#"
                 default_provider = "anthropic"
@@ -807,10 +839,11 @@ mod tests {
                 socket_path = "/tmp/tmux-1000/default"
             "#,
         )
-        .unwrap();
-        let tmux = cfg.sandbox.tmux.unwrap();
+        .map_err(ctx("parse config"))?;
+        let tmux = cfg.sandbox.tmux.ok_or(TestError::Missing("sandbox.tmux"))?;
         assert_eq!(tmux.mode, TmuxOperationModeToml::Inspect);
         assert_eq!(tmux.socket_path, "/tmp/tmux-1000/default");
+        Ok(())
     }
 
     #[test]

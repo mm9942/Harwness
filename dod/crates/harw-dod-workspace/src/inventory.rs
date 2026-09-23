@@ -440,8 +440,7 @@ impl Inventory {
         // derselben Abhängigkeit bleibt erhalten (BTreeSet dedupliziert nur
         // exakt gleiche `(version, source, checksum)`-Tripel), und Herkunft
         // sowie Prüfsumme wandern mit ins Inventar statt verworfen zu werden.
-        let mut dependency_versions: BTreeMap<String, BTreeSet<LockedDependency>> =
-            BTreeMap::new();
+        let mut dependency_versions: BTreeMap<String, BTreeSet<LockedDependency>> = BTreeMap::new();
         for package in &locked {
             if !members.contains(&package.name) {
                 dependency_versions
@@ -731,7 +730,10 @@ mod tests {
         Edge, Inventory, LockedDependency, StructureChange, VersionSeverity,
         classify_version_change,
     };
-    use crate::test_support::{write_lockfile, write_lockfile_with_metadata, write_member, write_root};
+    use crate::test_support::{
+        TestError, TestResult, ctx, write_lockfile, write_lockfile_with_metadata, write_member,
+        write_root,
+    };
     use harw_dod_cap::ReadScope;
     use std::collections::BTreeSet;
     use std::fs;
@@ -747,52 +749,54 @@ mod tests {
         }])
     }
 
-    fn scratch_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "harw-dod-workspace-{}-{label}",
-            std::process::id()
-        ));
+    fn scratch_dir(label: &str) -> TestResult<PathBuf> {
+        let dir =
+            std::env::temp_dir().join(format!("harw-dod-workspace-{}-{label}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("Scratch-Verzeichnis anlegen");
-        dir.canonicalize().expect("Scratch-Verzeichnis kanonisieren")
+        fs::create_dir_all(&dir).map_err(ctx("Scratch-Verzeichnis anlegen"))?;
+        dir.canonicalize()
+            .map_err(ctx("Scratch-Verzeichnis kanonisieren"))
     }
 
     #[test]
-    fn test_read_and_diff_reports_member_added_for_new_member() {
-        let root = scratch_dir("member-added");
-        write_root(&root, &["a"]);
-        write_member(&root, "a", &[], &[]);
-        write_lockfile(&root, &[("a", "0.1.0", false)]);
+    fn test_read_and_diff_reports_member_added_for_new_member() -> TestResult {
+        let root = scratch_dir("member-added")?;
+        write_root(&root, &["a"])?;
+        write_member(&root, "a", &[], &[])?;
+        write_lockfile(&root, &[("a", "0.1.0", false)])?;
         let scope = ReadScope::from_roots([root.clone()]);
 
-        let previous = Inventory::read(&scope, &root).expect("erstes Inventar lesen");
+        let previous = Inventory::read(&scope, &root).map_err(ctx("erstes Inventar lesen"))?;
 
-        write_root(&root, &["a", "b"]);
-        write_member(&root, "b", &[], &[]);
-        write_lockfile(&root, &[("a", "0.1.0", false), ("b", "0.1.0", false)]);
+        write_root(&root, &["a", "b"])?;
+        write_member(&root, "b", &[], &[])?;
+        write_lockfile(&root, &[("a", "0.1.0", false), ("b", "0.1.0", false)])?;
 
-        let current = Inventory::read(&scope, &root).expect("zweites Inventar lesen");
+        let current = Inventory::read(&scope, &root).map_err(ctx("zweites Inventar lesen"))?;
         let changes = current.diff(&previous);
 
         assert_eq!(
             changes,
-            vec![StructureChange::MemberAdded { name: "b".to_owned() }]
+            vec![StructureChange::MemberAdded {
+                name: "b".to_owned()
+            }]
         );
 
         fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_read_and_diff_reports_dependency_added() {
-        let root = scratch_dir("dependency-added");
-        write_root(&root, &["a"]);
-        write_member(&root, "a", &[], &["serde"]);
-        write_lockfile(&root, &[("a", "0.1.0", false), ("serde", "1.0.228", true)]);
+    fn test_read_and_diff_reports_dependency_added() -> TestResult {
+        let root = scratch_dir("dependency-added")?;
+        write_root(&root, &["a"])?;
+        write_member(&root, "a", &[], &["serde"])?;
+        write_lockfile(&root, &[("a", "0.1.0", false), ("serde", "1.0.228", true)])?;
         let scope = ReadScope::from_roots([root.clone()]);
 
-        let previous = Inventory::read(&scope, &root).expect("erstes Inventar lesen");
+        let previous = Inventory::read(&scope, &root).map_err(ctx("erstes Inventar lesen"))?;
 
-        write_member(&root, "a", &[], &["serde", "log"]);
+        write_member(&root, "a", &[], &["serde", "log"])?;
         write_lockfile(
             &root,
             &[
@@ -800,18 +804,21 @@ mod tests {
                 ("serde", "1.0.228", true),
                 ("log", "0.4.22", true),
             ],
-        );
+        )?;
 
-        let current = Inventory::read(&scope, &root).expect("zweites Inventar lesen");
+        let current = Inventory::read(&scope, &root).map_err(ctx("zweites Inventar lesen"))?;
         let changes = current.diff(&previous);
 
-        assert!(changes.contains(&StructureChange::DependencyAdded { name: "log".to_owned() }));
+        assert!(changes.contains(&StructureChange::DependencyAdded {
+            name: "log".to_owned()
+        }));
         assert!(changes.contains(&StructureChange::EdgeAdded {
             from: "a".to_owned(),
             to: "log".to_owned(),
         }));
 
         fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 
     #[test]
@@ -863,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_without_predecessor_reports_no_drift() {
+    fn test_read_without_predecessor_reports_no_drift() -> TestResult {
         // Der wichtigste Test: der erste Lauf hat per Definition kein
         // Vorgänger-Inventar. `Inventory::diff` selbst braucht immer zwei
         // konkrete Inventare — "kein Vorgänger" ist deshalb keine Eigenschaft
@@ -873,36 +880,38 @@ mod tests {
         // Hier belegen wir die dafür nötige Grundlage: ein frisch gelesenes
         // Inventar gegen sich selbst (der einzig sinnvolle Standin für "es
         // gab noch keine Abweichung") meldet nichts.
-        let root = scratch_dir("no-predecessor");
-        write_root(&root, &["a"]);
-        write_member(&root, "a", &[], &["serde"]);
-        write_lockfile(&root, &[("a", "0.1.0", false), ("serde", "1.0.228", true)]);
+        let root = scratch_dir("no-predecessor")?;
+        write_root(&root, &["a"])?;
+        write_member(&root, "a", &[], &["serde"])?;
+        write_lockfile(&root, &[("a", "0.1.0", false), ("serde", "1.0.228", true)])?;
         let scope = ReadScope::from_roots([root.clone()]);
 
-        let current = Inventory::read(&scope, &root).expect("Inventar lesen");
+        let current = Inventory::read(&scope, &root).map_err(ctx("Inventar lesen"))?;
         assert!(current.diff(&current).is_empty());
 
         fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_diff_unchanged_workspace_reports_nothing() {
-        let root = scratch_dir("unchanged");
-        write_root(&root, &["a"]);
-        write_member(&root, "a", &[], &["serde"]);
-        write_lockfile(&root, &[("a", "0.1.0", false), ("serde", "1.0.228", true)]);
+    fn test_diff_unchanged_workspace_reports_nothing() -> TestResult {
+        let root = scratch_dir("unchanged")?;
+        write_root(&root, &["a"])?;
+        write_member(&root, "a", &[], &["serde"])?;
+        write_lockfile(&root, &[("a", "0.1.0", false), ("serde", "1.0.228", true)])?;
         let scope = ReadScope::from_roots([root.clone()]);
 
-        let previous = Inventory::read(&scope, &root).expect("erstes Inventar lesen");
-        let current = Inventory::read(&scope, &root).expect("zweites Inventar lesen");
+        let previous = Inventory::read(&scope, &root).map_err(ctx("erstes Inventar lesen"))?;
+        let current = Inventory::read(&scope, &root).map_err(ctx("zweites Inventar lesen"))?;
 
         assert!(current.diff(&previous).is_empty());
 
         fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_inventory_serde_roundtrip() {
+    fn test_inventory_serde_roundtrip() -> TestResult {
         let mut inventory = Inventory::default();
         inventory.members.insert("harw-dod-workspace".to_owned());
         inventory.edges.insert(Edge {
@@ -918,94 +927,113 @@ mod tests {
             }]),
         );
 
-        let json = serde_json::to_string(&inventory).expect("Inventory serialisiert");
+        let json = serde_json::to_string(&inventory).map_err(ctx("Inventory serialisiert"))?;
         let round_tripped: Inventory =
-            serde_json::from_str(&json).expect("Inventory deserialisiert");
+            serde_json::from_str(&json).map_err(ctx("Inventory deserialisiert"))?;
         assert_eq!(inventory, round_tripped);
+        Ok(())
     }
 
     #[test]
-    fn test_read_root_outside_scope_returns_outside_scope() {
-        let root = scratch_dir("root-outside-scope");
-        write_root(&root, &["a"]);
-        write_member(&root, "a", &[], &[]);
-        write_lockfile(&root, &[("a", "0.1.0", false)]);
+    fn test_read_root_outside_scope_returns_outside_scope() -> TestResult {
+        let root = scratch_dir("root-outside-scope")?;
+        write_root(&root, &["a"])?;
+        write_member(&root, "a", &[], &[])?;
+        write_lockfile(&root, &[("a", "0.1.0", false)])?;
 
         // Bereich zeigt absichtlich auf ein anderes, unbeteiligtes Verzeichnis.
-        let unrelated = scratch_dir("root-outside-scope-unrelated");
+        let unrelated = scratch_dir("root-outside-scope-unrelated")?;
         let scope = ReadScope::from_roots([unrelated.clone()]);
 
-        let err =
-            Inventory::read(&scope, &root).expect_err("Wurzel außerhalb des Bereichs muss scheitern");
+        let Err(err) = Inventory::read(&scope, &root) else {
+            return Err(TestError::Unexpected(
+                "Wurzel außerhalb des Bereichs muss scheitern".to_owned(),
+            ));
+        };
         assert!(matches!(err, super::WorkspaceError::OutsideScope));
 
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&unrelated).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_read_member_manifest_traversal_outside_scope_returns_outside_scope() {
+    fn test_read_member_manifest_traversal_outside_scope_returns_outside_scope() -> TestResult {
         // Scope-Dichtheit: `[workspace].members = ["../evil"]` liegt lexikalisch
         // "unterhalb" der Workspace-Wurzel (Präfix-Treffer vor Auflösung), aber
         // nach Kanonisierung liegt das Ziel außerhalb. Belegt, dass `read`
         // jedes Member-Manifest erst kanonisiert und dann prüft.
-        let parent = scratch_dir("traversal-parent");
+        let parent = scratch_dir("traversal-parent")?;
         let workspace_root = parent.join("workspace_root");
-        fs::create_dir_all(&workspace_root).expect("Workspace-Wurzel anlegen");
-        write_root(&workspace_root, &["../evil"]);
-        write_member(&parent, "evil", &[], &[]);
+        fs::create_dir_all(&workspace_root).map_err(ctx("Workspace-Wurzel anlegen"))?;
+        write_root(&workspace_root, &["../evil"])?;
+        write_member(&parent, "evil", &[], &[])?;
 
         let scope = ReadScope::from_roots([workspace_root.clone()]);
 
-        let err = Inventory::read(&scope, &workspace_root)
-            .expect_err("Member außerhalb des Bereichs (via ../-Traversal) muss scheitern");
+        let Err(err) = Inventory::read(&scope, &workspace_root) else {
+            return Err(TestError::Unexpected(
+                "Member außerhalb des Bereichs (via ../-Traversal) muss scheitern".to_owned(),
+            ));
+        };
         assert!(matches!(err, super::WorkspaceError::OutsideScope));
 
         fs::remove_dir_all(&parent).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_read_malformed_cargo_toml_returns_malformed_source_without_file_content() {
-        let root = scratch_dir("malformed");
-        write_root(&root, &["a"]);
-        fs::create_dir_all(root.join("a")).expect("Member-Verzeichnis anlegen");
+    fn test_read_malformed_cargo_toml_returns_malformed_source_without_file_content() -> TestResult
+    {
+        let root = scratch_dir("malformed")?;
+        write_root(&root, &["a"])?;
+        fs::create_dir_all(root.join("a")).map_err(ctx("Member-Verzeichnis anlegen"))?;
         // Absichtlich kein gültiges TOML; trägt einen eindeutigen Marker, der
         // in keiner Fehlermeldung auftauchen darf.
         fs::write(
             root.join("a").join("Cargo.toml"),
             "THIS-IS-NOT-VALID-TOML :::: UNIQUE_SECRET_MARKER_98765 [[[",
         )
-        .expect("kaputtes Cargo.toml schreiben");
+        .map_err(ctx("kaputtes Cargo.toml schreiben"))?;
         let scope = ReadScope::from_roots([root.clone()]);
 
-        let err = Inventory::read(&scope, &root).expect_err("unlesbares Manifest muss scheitern");
+        let Err(err) = Inventory::read(&scope, &root) else {
+            return Err(TestError::Unexpected(
+                "unlesbares Manifest muss scheitern".to_owned(),
+            ));
+        };
         assert!(matches!(err, super::WorkspaceError::MalformedSource));
         let message = err.to_string();
-        assert_eq!(message, "workspace manifest or lockfile could not be parsed");
+        assert_eq!(
+            message,
+            "workspace manifest or lockfile could not be parsed"
+        );
         assert!(!message.contains("UNIQUE_SECRET_MARKER_98765"));
 
         fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_read_unsupported_member_glob_returns_tool_fault_not_malformed_source() {
+    fn test_read_unsupported_member_glob_returns_tool_fault_not_malformed_source() -> TestResult {
         // `harw_code_graph::resolve_member_dirs` unterstützt ausschließlich
         // das Glob-Muster `<prefix>/*`; `"a*"` ist syntaktisch gültiges Cargo,
         // aber von unserem Auflöser nicht unterstützt — eine
         // Fähigkeitslücke unseres Werkzeugs, kein Befund über den Baum. Der
         // wichtigste Test dieser Reparatur: ein Parserfehler darf nicht als
         // `MalformedSource` erscheinen.
-        let root = scratch_dir("unsupported-glob");
-        fs::create_dir_all(&root).expect("Workspace-Wurzel anlegen");
-        fs::write(
-            root.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"a*\"]\n",
-        )
-        .expect("Wurzel-Cargo.toml mit nicht unterstütztem Glob schreiben");
+        let root = scratch_dir("unsupported-glob")?;
+        fs::create_dir_all(&root).map_err(ctx("Workspace-Wurzel anlegen"))?;
+        fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"a*\"]\n").map_err(ctx(
+            "Wurzel-Cargo.toml mit nicht unterstütztem Glob schreiben",
+        ))?;
         let scope = ReadScope::from_roots([root.clone()]);
 
-        let err = Inventory::read(&scope, &root)
-            .expect_err("nicht unterstütztes Glob-Muster muss scheitern");
+        let Err(err) = Inventory::read(&scope, &root) else {
+            return Err(TestError::Unexpected(
+                "nicht unterstütztes Glob-Muster muss scheitern".to_owned(),
+            ));
+        };
         assert!(
             matches!(err, super::WorkspaceError::ToolFault),
             "ein Werkzeugfehler darf nicht als MalformedSource erscheinen: {err:?}"
@@ -1013,48 +1041,55 @@ mod tests {
         assert!(!matches!(err, super::WorkspaceError::MalformedSource));
 
         fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_read_unsupported_member_glob_message_is_content_free() {
-        let root = scratch_dir("unsupported-glob-message");
-        fs::create_dir_all(&root).expect("Workspace-Wurzel anlegen");
-        fs::write(
-            root.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"a*\"]\n",
-        )
-        .expect("Wurzel-Cargo.toml mit nicht unterstütztem Glob schreiben");
+    fn test_read_unsupported_member_glob_message_is_content_free() -> TestResult {
+        let root = scratch_dir("unsupported-glob-message")?;
+        fs::create_dir_all(&root).map_err(ctx("Workspace-Wurzel anlegen"))?;
+        fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"a*\"]\n").map_err(ctx(
+            "Wurzel-Cargo.toml mit nicht unterstütztem Glob schreiben",
+        ))?;
         let scope = ReadScope::from_roots([root.clone()]);
 
-        let err = Inventory::read(&scope, &root)
-            .expect_err("nicht unterstütztes Glob-Muster muss scheitern");
+        let Err(err) = Inventory::read(&scope, &root) else {
+            return Err(TestError::Unexpected(
+                "nicht unterstütztes Glob-Muster muss scheitern".to_owned(),
+            ));
+        };
         let message = err.to_string();
         assert_eq!(message, "workspace tooling could not process the source");
         assert!(!message.contains("a*"));
         assert!(!message.contains(&root.display().to_string()));
 
         fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_read_missing_workspace_section_returns_malformed_source() {
+    fn test_read_missing_workspace_section_returns_malformed_source() -> TestResult {
         // Ein Baumbefund: das Wurzel-Manifest existiert und ist gültiges
         // TOML, hat aber schlicht keinen `[workspace]`-Abschnitt — eine
         // reine Vorhandensein-Prüfung, unabhängig von unserem Parser-Schema.
-        let root = scratch_dir("no-workspace-section");
-        fs::create_dir_all(&root).expect("Workspace-Wurzel anlegen");
+        let root = scratch_dir("no-workspace-section")?;
+        fs::create_dir_all(&root).map_err(ctx("Workspace-Wurzel anlegen"))?;
         fs::write(
             root.join("Cargo.toml"),
             "[package]\nname = \"not-a-workspace\"\nversion = \"0.1.0\"\n",
         )
-        .expect("Wurzel-Cargo.toml ohne [workspace] schreiben");
+        .map_err(ctx("Wurzel-Cargo.toml ohne [workspace] schreiben"))?;
         let scope = ReadScope::from_roots([root.clone()]);
 
-        let err = Inventory::read(&scope, &root)
-            .expect_err("fehlender [workspace]-Abschnitt muss scheitern");
+        let Err(err) = Inventory::read(&scope, &root) else {
+            return Err(TestError::Unexpected(
+                "fehlender [workspace]-Abschnitt muss scheitern".to_owned(),
+            ));
+        };
         assert!(matches!(err, super::WorkspaceError::MalformedSource));
 
         fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 
     #[test]
@@ -1128,10 +1163,10 @@ mod tests {
     /// Korrektur hätte `BTreeMap<name, version>` eine davon stillschweigend
     /// überschrieben.
     #[test]
-    fn test_read_keeps_all_simultaneously_locked_versions_of_same_dependency_f097() {
-        let root = scratch_dir("multi-version");
-        write_root(&root, &["a"]);
-        write_member(&root, "a", &[], &["libc"]);
+    fn test_read_keeps_all_simultaneously_locked_versions_of_same_dependency_f097() -> TestResult {
+        let root = scratch_dir("multi-version")?;
+        write_root(&root, &["a"])?;
+        write_member(&root, "a", &[], &["libc"])?;
         write_lockfile_with_metadata(
             &root,
             &[
@@ -1149,35 +1184,38 @@ mod tests {
                     Some("bbb"),
                 ),
             ],
-        );
+        )?;
         let scope = ReadScope::from_roots([root.clone()]);
 
-        let inventory = Inventory::read(&scope, &root).expect("Inventar lesen");
+        let inventory = Inventory::read(&scope, &root).map_err(ctx("Inventar lesen"))?;
 
         let libc_versions = inventory
             .dependency_versions
             .get("libc")
-            .expect("libc muss im Inventar auftauchen");
+            .ok_or(TestError::Missing("libc muss im Inventar auftauchen"))?;
         assert_eq!(
             libc_versions.len(),
             2,
             "beide gleichzeitig gesperrten Versionen müssen erhalten bleiben, keine darf verschwinden"
         );
-        let version_strings: BTreeSet<&str> =
-            libc_versions.iter().map(|dep| dep.version.as_str()).collect();
+        let version_strings: BTreeSet<&str> = libc_versions
+            .iter()
+            .map(|dep| dep.version.as_str())
+            .collect();
         assert!(version_strings.contains("0.2.150"));
         assert!(version_strings.contains("0.2.140"));
 
         fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 
     /// F-096, Kernbeleg: `source` und `checksum` aus `Cargo.lock` landen im
     /// Inventar, statt wie vor dieser Korrektur verworfen zu werden.
     #[test]
-    fn test_read_captures_source_and_checksum_f096() {
-        let root = scratch_dir("source-checksum");
-        write_root(&root, &["a"]);
-        write_member(&root, "a", &[], &["serde"]);
+    fn test_read_captures_source_and_checksum_f096() -> TestResult {
+        let root = scratch_dir("source-checksum")?;
+        write_root(&root, &["a"])?;
+        write_member(&root, "a", &[], &["serde"])?;
         write_lockfile_with_metadata(
             &root,
             &[
@@ -1189,16 +1227,19 @@ mod tests {
                     Some("deadbeef"),
                 ),
             ],
-        );
+        )?;
         let scope = ReadScope::from_roots([root.clone()]);
 
-        let inventory = Inventory::read(&scope, &root).expect("Inventar lesen");
+        let inventory = Inventory::read(&scope, &root).map_err(ctx("Inventar lesen"))?;
 
         let serde_versions = inventory
             .dependency_versions
             .get("serde")
-            .expect("serde muss im Inventar auftauchen");
-        let entry = serde_versions.iter().next().expect("genau ein Eintrag erwartet");
+            .ok_or(TestError::Missing("serde muss im Inventar auftauchen"))?;
+        let entry = serde_versions
+            .iter()
+            .next()
+            .ok_or(TestError::Missing("genau ein Eintrag erwartet"))?;
         assert_eq!(
             entry.source.as_deref(),
             Some("registry+https://github.com/rust-lang/crates.io-index")
@@ -1206,6 +1247,7 @@ mod tests {
         assert_eq!(entry.checksum.as_deref(), Some("deadbeef"));
 
         fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 
     /// F-097: eine zusätzliche, gleichzeitig gesperrte Version einer bereits
@@ -1364,20 +1406,17 @@ mod tests {
     /// eine zweite, zusätzliche Version derselben Abhängigkeit taucht im
     /// realen `Cargo.lock` auf und wird über `diff` sichtbar.
     #[test]
-    fn test_read_and_diff_reports_additional_locked_version_end_to_end_f097() {
-        let root = scratch_dir("additional-version-e2e");
-        write_root(&root, &["a"]);
-        write_member(&root, "a", &[], &["libc"]);
+    fn test_read_and_diff_reports_additional_locked_version_end_to_end_f097() -> TestResult {
+        let root = scratch_dir("additional-version-e2e")?;
+        write_root(&root, &["a"])?;
+        write_member(&root, "a", &[], &["libc"])?;
         write_lockfile_with_metadata(
             &root,
-            &[
-                ("a", "0.1.0", None, None),
-                ("libc", "0.2.150", None, None),
-            ],
-        );
+            &[("a", "0.1.0", None, None), ("libc", "0.2.150", None, None)],
+        )?;
         let scope = ReadScope::from_roots([root.clone()]);
 
-        let previous = Inventory::read(&scope, &root).expect("erstes Inventar lesen");
+        let previous = Inventory::read(&scope, &root).map_err(ctx("erstes Inventar lesen"))?;
 
         write_lockfile_with_metadata(
             &root,
@@ -1386,9 +1425,9 @@ mod tests {
                 ("libc", "0.2.150", None, None),
                 ("libc", "0.2.140", None, None),
             ],
-        );
+        )?;
 
-        let current = Inventory::read(&scope, &root).expect("zweites Inventar lesen");
+        let current = Inventory::read(&scope, &root).map_err(ctx("zweites Inventar lesen"))?;
         let changes = current.diff(&previous);
 
         assert_eq!(
@@ -1402,5 +1441,6 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 }

@@ -178,7 +178,9 @@ impl Advisory {
     // Prüft, ob `version` in mindestens einen der betroffenen Bereiche
     // fällt. Rein, total innerhalb dieses Moduls.
     fn matches(&self, version: &Version) -> bool {
-        self.vulnerable_ranges.iter().any(|range| range.matches(version))
+        self.vulnerable_ranges
+            .iter()
+            .any(|range| range.matches(version))
     }
 }
 
@@ -237,8 +239,16 @@ pub fn correlate_advisories(
         .collect();
 
     matches.sort_by(|(pkg_a, adv_a), (pkg_b, adv_b)| {
-        (pkg_a.name.as_str(), pkg_a.version.as_str(), adv_a.id.as_str())
-            .cmp(&(pkg_b.name.as_str(), pkg_b.version.as_str(), adv_b.id.as_str()))
+        (
+            pkg_a.name.as_str(),
+            pkg_a.version.as_str(),
+            adv_a.id.as_str(),
+        )
+            .cmp(&(
+                pkg_b.name.as_str(),
+                pkg_b.version.as_str(),
+                adv_b.id.as_str(),
+            ))
     });
 
     matches
@@ -263,6 +273,7 @@ pub fn correlate_advisories(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     fn pkg(name: &str, version: &str) -> LockedPackage {
         LockedPackage {
@@ -273,23 +284,34 @@ mod tests {
         }
     }
 
-    fn advisory(id: &str, crate_name: &str, ranges: &[&str], severity: Severity) -> Advisory {
-        Advisory {
+    fn advisory(
+        id: &str,
+        crate_name: &str,
+        ranges: &[&str],
+        severity: Severity,
+    ) -> TestResult<Advisory> {
+        let vulnerable_ranges = ranges
+            .iter()
+            .map(|r| VersionReq::parse(r).map_err(ctx("test range parses")))
+            .collect::<TestResult<Vec<_>>>()?;
+        Ok(Advisory {
             id: id.to_owned(),
             crate_name: crate_name.to_owned(),
-            vulnerable_ranges: ranges
-                .iter()
-                .map(|r| VersionReq::parse(r).expect("test range parses"))
-                .collect(),
+            vulnerable_ranges,
             severity,
             summary: "test advisory".to_owned(),
-        }
+        })
     }
 
     #[test]
-    fn test_advisory_matching_built_version_yields_a_finding() {
+    fn test_advisory_matching_built_version_yields_a_finding() -> TestResult {
         let locked = vec![pkg("evil-crate", "1.2.0")];
-        let advisories = vec![advisory("RUSTSEC-0001", "evil-crate", &["<1.3.0"], Severity::High)];
+        let advisories = vec![advisory(
+            "RUSTSEC-0001",
+            "evil-crate",
+            &["<1.3.0"],
+            Severity::High,
+        )?];
 
         let findings = correlate_advisories(&advisories, &locked, Timestamp::UNIX_EPOCH);
 
@@ -299,51 +321,72 @@ mod tests {
         assert_eq!(findings[0].severity, Severity::High);
         assert!(findings[0].summary.contains("evil-crate@1.2.0"));
         assert!(findings[0].summary.contains("RUSTSEC-0001"));
+        Ok(())
     }
 
     #[test]
-    fn test_advisory_not_matching_built_version_yields_no_finding() {
+    fn test_advisory_not_matching_built_version_yields_no_finding() -> TestResult {
         let locked = vec![pkg("safe-crate", "2.0.0")];
-        let advisories = vec![advisory("RUSTSEC-0002", "safe-crate", &["<1.0.0"], Severity::High)];
+        let advisories = vec![advisory(
+            "RUSTSEC-0002",
+            "safe-crate",
+            &["<1.0.0"],
+            Severity::High,
+        )?];
 
         assert!(correlate_advisories(&advisories, &locked, Timestamp::UNIX_EPOCH).is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_1_10_0_does_not_match_range_excluding_1_9_0() {
+    fn test_1_10_0_does_not_match_range_excluding_1_9_0() -> TestResult {
         // Der Test, der einen Zeichenkettenvergleich ausschliesst:
         // "1.10.0" < "1.9.0" ist als String wahr, als Version falsch.
         let locked = vec![pkg("stringy-crate", "1.10.0")];
-        let advisories =
-            vec![advisory("RUSTSEC-0003", "stringy-crate", &["<1.9.0"], Severity::Critical)];
+        let advisories = vec![advisory(
+            "RUSTSEC-0003",
+            "stringy-crate",
+            &["<1.9.0"],
+            Severity::Critical,
+        )?];
 
         assert!(
             correlate_advisories(&advisories, &locked, Timestamp::UNIX_EPOCH).is_empty(),
             "1.10.0 ist neuer als 1.9.0 und darf den Bereich \"<1.9.0\" nicht treffen"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_vulnerable_version_found_even_when_a_safe_version_of_the_same_crate_comes_first() {
+    fn test_vulnerable_version_found_even_when_a_safe_version_of_the_same_crate_comes_first()
+    -> TestResult {
         // `find_locked` allein liefert nur den ersten Treffer (hier: die
         // unverwundbare 2.0.0) — dieser Test belegt, dass der Join trotzdem
         // die weiter unten stehende, tatsächlich verwundbare 1.0.0 findet.
-        let locked = vec![pkg("dual-version-crate", "2.0.0"), pkg("dual-version-crate", "1.0.0")];
-        let advisories =
-            vec![advisory("RUSTSEC-0004", "dual-version-crate", &["<1.5.0"], Severity::Medium)];
+        let locked = vec![
+            pkg("dual-version-crate", "2.0.0"),
+            pkg("dual-version-crate", "1.0.0"),
+        ];
+        let advisories = vec![advisory(
+            "RUSTSEC-0004",
+            "dual-version-crate",
+            &["<1.5.0"],
+            Severity::Medium,
+        )?];
 
         let findings = correlate_advisories(&advisories, &locked, Timestamp::UNIX_EPOCH);
 
         assert_eq!(findings.len(), 1);
         assert!(findings[0].summary.contains("dual-version-crate@1.0.0"));
+        Ok(())
     }
 
     #[test]
-    fn test_result_is_sorted_deterministically() {
+    fn test_result_is_sorted_deterministically() -> TestResult {
         let locked = vec![pkg("zeta-crate", "1.0.0"), pkg("alpha-crate", "1.0.0")];
         let advisories = vec![
-            advisory("RUSTSEC-Z", "zeta-crate", &["<2.0.0"], Severity::Low),
-            advisory("RUSTSEC-A", "alpha-crate", &["<2.0.0"], Severity::Low),
+            advisory("RUSTSEC-Z", "zeta-crate", &["<2.0.0"], Severity::Low)?,
+            advisory("RUSTSEC-A", "alpha-crate", &["<2.0.0"], Severity::Low)?,
         ];
 
         let first = correlate_advisories(&advisories, &locked, Timestamp::UNIX_EPOCH);
@@ -359,14 +402,21 @@ mod tests {
         // identischer Eingabe (die FindingId selbst ist je Aufruf frisch und
         // zufällig, siehe Moduldoku — deshalb Vergleich über den Inhalt).
         assert_eq!(names_first, names_second);
+        Ok(())
     }
 
     #[test]
-    fn test_unparseable_locked_version_is_skipped_without_error() {
+    fn test_unparseable_locked_version_is_skipped_without_error() -> TestResult {
         let locked = vec![pkg("weird-crate", "not-a-version")];
-        let advisories = vec![advisory("RUSTSEC-0005", "weird-crate", &["<9.9.9"], Severity::Low)];
+        let advisories = vec![advisory(
+            "RUSTSEC-0005",
+            "weird-crate",
+            &["<9.9.9"],
+            Severity::Low,
+        )?];
 
         assert!(correlate_advisories(&advisories, &locked, Timestamp::UNIX_EPOCH).is_empty());
+        Ok(())
     }
 
     /// Liefert die Abhängigkeits-Schlüssel (Crate-Namen) aus den
@@ -434,8 +484,15 @@ mod tests {
         // zeilenweise Prüfung genügt für die hier nötige Aussage über
         // Tabellen-Zugehörigkeit von Top-Level-Schlüsseln.
         let manifest = include_str!("../Cargo.toml");
-        const FORBIDDEN: &[&str] =
-            &["reqwest", "hyper", "ureq", "curl", "isahc", "surf", "tokio-tungstenite"];
+        const FORBIDDEN: &[&str] = &[
+            "reqwest",
+            "hyper",
+            "ureq",
+            "curl",
+            "isahc",
+            "surf",
+            "tokio-tungstenite",
+        ];
 
         let keys = runtime_dependency_keys(manifest);
         for needle in FORBIDDEN {
@@ -462,8 +519,7 @@ mod tests {
         // Entscheidung dieser Aufgabe belegt: eine Netz-Crate unter
         // [dev-dependencies] landet nicht im Binary und wird daher nicht
         // als Verstoß gegen "kein Netz im Sentinel" gewertet.
-        let manifest =
-            "[package]\nname = \"fake\"\n\n[dev-dependencies]\nreqwest = \"1\"\n";
+        let manifest = "[package]\nname = \"fake\"\n\n[dev-dependencies]\nreqwest = \"1\"\n";
         let keys = runtime_dependency_keys(manifest);
         assert!(!keys.iter().any(|key| key == "reqwest"));
     }

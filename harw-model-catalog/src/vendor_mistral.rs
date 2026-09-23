@@ -426,6 +426,7 @@ mod tests {
     use super::*;
     use crate::descriptor::ModelLifecycle;
     use crate::observed::Score;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn test_mistral_descriptors_required_models_present() {
@@ -488,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mistral_descriptors_deprecated_models_have_correct_lifecycle() {
+    fn test_mistral_descriptors_deprecated_models_have_correct_lifecycle() -> TestResult {
         // magistral-medium-2509, devstral-2512, open-mistral-nemo-2407 must be Deprecated.
         let deprecated_ids = [
             "magistral-medium-2509",
@@ -497,10 +498,9 @@ mod tests {
         ];
         let descs = mistral_descriptors();
         for id in &deprecated_ids {
-            let entry = descs
-                .iter()
-                .find(|d| d.model == *id)
-                .unwrap_or_else(|| panic!("Expected deprecated model {} not found", id));
+            let entry = descs.iter().find(|d| d.model == *id).ok_or_else(|| {
+                TestError::Unexpected(format!("Expected deprecated model {} not found", id))
+            })?;
             assert_eq!(
                 entry.lifecycle,
                 ModelLifecycle::Deprecated,
@@ -508,10 +508,11 @@ mod tests {
                 id
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_mistral_descriptors_ga_models_have_correct_lifecycle() {
+    fn test_mistral_descriptors_ga_models_have_correct_lifecycle() -> TestResult {
         let ga_ids = [
             "mistral-medium-2604",
             "mistral-small-2603",
@@ -523,10 +524,9 @@ mod tests {
         ];
         let descs = mistral_descriptors();
         for id in &ga_ids {
-            let entry = descs
-                .iter()
-                .find(|d| d.model == *id)
-                .unwrap_or_else(|| panic!("Expected GA model {} not found", id));
+            let entry = descs.iter().find(|d| d.model == *id).ok_or_else(|| {
+                TestError::Unexpected(format!("Expected GA model {} not found", id))
+            })?;
             assert_eq!(
                 entry.lifecycle,
                 ModelLifecycle::Ga,
@@ -534,6 +534,7 @@ mod tests {
                 id
             );
         }
+        Ok(())
     }
 
     #[test]
@@ -600,33 +601,39 @@ mod tests {
     }
 
     #[test]
-    fn test_mistral_large_2512_max_output_tokens() {
+    fn test_mistral_large_2512_max_output_tokens() -> TestResult {
         // mistral-large-2512 declares 4096 max output per research data.
         let descs = mistral_descriptors();
         let large = descs
             .iter()
             .find(|d| d.model == "mistral-large-2512")
-            .unwrap();
+            .ok_or(TestError::Missing("mistral-large-2512 descriptor"))?;
         assert_eq!(large.max_output_tokens, Some(4_096));
+        Ok(())
     }
 
     #[test]
-    fn test_codestral_2508_no_vision() {
+    fn test_codestral_2508_no_vision() -> TestResult {
         // codestral-2508 is text-only.
         let descs = mistral_descriptors();
-        let cs = descs.iter().find(|d| d.model == "codestral-2508").unwrap();
+        let cs = descs
+            .iter()
+            .find(|d| d.model == "codestral-2508")
+            .ok_or(TestError::Missing("codestral-2508 descriptor"))?;
         assert!(!cs.capabilities.image_input);
         assert!(!cs.modalities.contains(Modality::Image));
+        Ok(())
     }
 
     #[test]
-    fn test_mistral_medium_2604_reasoning_effort() {
+    fn test_mistral_medium_2604_reasoning_effort() -> TestResult {
         // mistral-medium-2604 supports reasoning with effort parameter.
         let descs = mistral_descriptors();
         let mm = descs
             .iter()
             .find(|d| d.model == "mistral-medium-2604")
-            .unwrap();
+            .ok_or(TestError::Missing("mistral-medium-2604 descriptor"))?;
         assert_eq!(mm.capabilities.reasoning, ReasoningSupport::Effort);
+        Ok(())
     }
 }

@@ -225,6 +225,7 @@ impl WebToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     /// `Display` nennt das erlaubte Schema, damit die Meldung ohne Quellcode
     /// verständlich ist.
@@ -267,11 +268,15 @@ mod tests {
 
     /// `#[from]` erzeugt die Konvertierung, die `?` für `serde_json` braucht.
     #[test]
-    fn test_from_serde_json_error_maps_to_json_variant() {
-        let parse_error = serde_json::from_str::<serde_json::Value>("{ kein json")
-            .expect_err("ungültiges JSON muss scheitern");
+    fn test_from_serde_json_error_maps_to_json_variant() -> TestResult {
+        let Err(parse_error) = serde_json::from_str::<serde_json::Value>("{ kein json") else {
+            return Err(TestError::Unexpected(
+                "ungültiges JSON muss scheitern".into(),
+            ));
+        };
         let err = WebToolError::from(parse_error);
         assert!(matches!(err, WebToolError::Json(_)));
+        Ok(())
     }
 
     /// `#[from]` erzeugt die Konvertierung, die `?` für `std::io` braucht, und
@@ -324,7 +329,9 @@ mod tests {
         };
         assert!(!err.is_transport());
         assert!(err.to_string().contains("loopback"), "{err}");
-        let unconfigured = WebToolError::NotConfigured { what: "keine Egress-Policy" };
+        let unconfigured = WebToolError::NotConfigured {
+            what: "keine Egress-Policy",
+        };
         assert!(!unconfigured.is_transport());
         assert!(unconfigured.to_string().contains("keine Egress-Policy"));
     }

@@ -223,22 +223,25 @@ fn default_unknown_command_fallback() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn test_parse_telegram_channel_toml() {
+    fn test_parse_telegram_channel_toml() -> TestResult {
         let src = r#"
             [[channel.telegram]]
             id = "telegram:support-bot"
             bot_token_ref = "env:TELEGRAM_SUPPORT_BOT_TOKEN"
         "#;
-        let file: ChannelFileToml = toml::from_str(src).unwrap();
+        let file: ChannelFileToml =
+            toml::from_str(src).map_err(ctx("Telegram-Channel-TOML parsen"))?;
         let flattened = flatten_channel_file(file);
         assert!(flattened.contains_key("telegram:support-bot"));
         let telegram = match flattened.get("telegram:support-bot") {
             Some(ChannelToml::Telegram(telegram)) => telegram,
-            None => panic!("parsed Telegram channel is missing"),
+            None => return Err(TestError::Missing("parsed Telegram channel")),
         };
         assert!(telegram.security.pinned_identities.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -281,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn test_telegram_channel_parses_pinned_identities() {
+    fn test_telegram_channel_parses_pinned_identities() -> TestResult {
         let src = r#"
             [[channel.telegram]]
             id = "telegram:support-bot"
@@ -290,12 +293,14 @@ mod tests {
             [channel.telegram.security]
             pinned_identities = [123456789, -1009876543210]
         "#;
-        let file: ChannelFileToml = toml::from_str(src).unwrap();
+        let file: ChannelFileToml =
+            toml::from_str(src).map_err(ctx("Telegram-Channel-TOML parsen"))?;
         let telegram = &file.channel.telegram[0];
 
         assert_eq!(
             telegram.security.pinned_identities,
             [123456789, -1009876543210]
         );
+        Ok(())
     }
 }

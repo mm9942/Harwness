@@ -114,6 +114,8 @@ pub mod memory;
 pub mod model_behavior_proposal;
 pub mod security;
 pub mod store;
+#[cfg(test)]
+mod test_support;
 pub mod visibility;
 pub mod workbench;
 

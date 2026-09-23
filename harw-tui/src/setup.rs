@@ -1253,6 +1253,7 @@ fn wrap_warning(text: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
     use crossterm::event::KeyModifiers;
 
     /// Erzeugt einen `Press`-Tastenanschlag ohne Modifier.
@@ -1261,7 +1262,7 @@ mod tests {
     }
 
     #[test]
-    fn foundry_endpoint_api_and_deployment_are_explicit() {
+    fn foundry_endpoint_api_and_deployment_are_explicit() -> TestResult {
         for (choice, api, suffix, header) in [
             (0, "openai-chat", "/openai/v1", "api-key"),
             (1, "openai-responses", "/openai/v1", "api-key"),
@@ -1288,7 +1289,7 @@ mod tests {
             assert_eq!(app.stage, SetupStage::Model);
             app.on_paste("production-deployment".into());
             app.on_key(press(KeyCode::Enter));
-            let outcome = app.outcome().unwrap();
+            let outcome = app.outcome().ok_or(TestError::Missing("outcome present"))?;
             assert_eq!(outcome.api, api);
             assert_eq!(
                 outcome.base_url,
@@ -1297,6 +1298,7 @@ mod tests {
             assert_eq!(outcome.model, "production-deployment");
             assert_eq!(outcome.auth_header.as_deref(), Some(header));
         }
+        Ok(())
     }
 
     /// Provider mit API-Key-Auth und zwei Modellen (ohne eingebettete Quellen).
@@ -1341,7 +1343,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apikey_flow_produces_outcome() {
+    fn test_apikey_flow_produces_outcome() -> TestResult {
         let mut app = SetupApp::new(vec![groq_provider(), ollama_provider()]);
         assert_eq!(app.stage(), SetupStage::Provider);
 
@@ -1363,12 +1365,13 @@ mod tests {
         app.on_key(press(KeyCode::Enter));
         assert_eq!(app.stage(), SetupStage::Done);
 
-        let outcome = app.outcome().expect("outcome present");
+        let outcome = app.outcome().ok_or(TestError::Missing("outcome present"))?;
         assert_eq!(outcome.provider_id, "groq");
         assert_eq!(outcome.base_url, "https://api.groq.com/openai/v1");
         assert_eq!(outcome.api, "openai-chat");
         assert_eq!(outcome.model, "llama-3.3-70b");
         assert_eq!(outcome.secret_ref.as_deref(), Some("gsk"));
+        Ok(())
     }
 
     #[test]
@@ -1389,7 +1392,7 @@ mod tests {
     }
 
     #[test]
-    fn test_local_base_url_flow_has_no_secret() {
+    fn test_local_base_url_flow_has_no_secret() -> TestResult {
         let mut app = SetupApp::new(vec![ollama_provider()]);
         app.on_key(press(KeyCode::Enter)); // Provider -> Auth
         app.on_key(press(KeyCode::Enter)); // Confirm endpoint.
@@ -1400,11 +1403,12 @@ mod tests {
         assert_eq!(app.model_options, vec!["llama3".to_owned()]);
         app.on_key(press(KeyCode::Enter)); // Model -> Done
 
-        let outcome = app.outcome().expect("outcome present");
+        let outcome = app.outcome().ok_or(TestError::Missing("outcome present"))?;
         assert_eq!(outcome.provider_id, "ollama");
         assert_eq!(outcome.api, "ollama");
         assert_eq!(outcome.model, "llama3");
         assert_eq!(outcome.secret_ref, None);
+        Ok(())
     }
 
     /// Nativer Anthropic-Provider (Provider-Id `"anthropic"`,
@@ -1522,7 +1526,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_auth_options_skips_to_model() {
+    fn test_no_auth_options_skips_to_model() -> TestResult {
         let provider = ProviderSpec {
             id: "bare".to_owned(),
             name: "Bare".to_owned(),
@@ -1538,9 +1542,10 @@ mod tests {
         app.on_key(press(KeyCode::Enter)); // Confirm endpoint.
         assert_eq!(app.stage(), SetupStage::Model);
         app.on_key(press(KeyCode::Enter)); // Model -> Done
-        let outcome = app.outcome().expect("outcome present");
+        let outcome = app.outcome().ok_or(TestError::Missing("outcome present"))?;
         assert_eq!(outcome.model, "m1");
         assert_eq!(outcome.secret_ref, None);
+        Ok(())
     }
 
     #[test]
@@ -1573,7 +1578,7 @@ mod tests {
     /// Paste in der Auth-Phase füllt den Eingabepuffer und aktiviert den
     /// Editing-Modus. Bug 1 (Bracketed-Paste) + Bug 2 (Eingabefeld).
     #[test]
-    fn test_paste_fills_api_key() {
+    fn test_paste_fills_api_key() -> TestResult {
         let mut app = SetupApp::new(vec![groq_provider()]);
         app.on_key(press(KeyCode::Enter)); // Provider -> Auth
         app.on_key(press(KeyCode::Enter)); // Confirm endpoint.
@@ -1589,8 +1594,9 @@ mod tests {
         app.on_key(press(KeyCode::Enter)); // confirm_auth -> Model
         assert_eq!(app.stage(), SetupStage::Model);
         app.on_key(press(KeyCode::Enter)); // Model -> Done
-        let outcome = app.outcome().expect("outcome present");
+        let outcome = app.outcome().ok_or(TestError::Missing("outcome present"))?;
         assert_eq!(outcome.secret_ref.as_deref(), Some("sk-my-api-key"));
+        Ok(())
     }
 
     /// Paste wird getrimmt — führende/nachgestellte Whitespace werden entfernt.
@@ -1644,7 +1650,7 @@ mod tests {
     /// ihn als `secret_ref`. Bug 3 (OAuth einfügbar).
     /// Contract-Quelle: Redesign-Spec SLICE 1, Punkte d, e, f.
     #[test]
-    fn test_oauth_paste_sets_raw_token() {
+    fn test_oauth_paste_sets_raw_token() -> TestResult {
         let mut app = SetupApp::new(vec![groq_provider()]);
         // Auth-Phase manuell mit OAuth-Option aufsetzen (private Felder sind im
         // selben Modul zugänglich).
@@ -1667,17 +1673,18 @@ mod tests {
         app.on_key(press(KeyCode::Enter));
         assert_eq!(app.stage(), SetupStage::Model);
         app.on_key(press(KeyCode::Enter)); // Model -> Done
-        let outcome = app.outcome().expect("outcome present");
+        let outcome = app.outcome().ok_or(TestError::Missing("outcome present"))?;
         assert_eq!(
             outcome.secret_ref.as_deref(),
             Some("my-oauth-token-xyz"),
             "Raw-Token muss als secret_ref statt des Katalog-Ref übernommen werden"
         );
+        Ok(())
     }
 
     /// OAuth-Option ohne eingefügten Token: `secret_ref` aus dem Katalog als Fallback.
     #[test]
-    fn test_oauth_confirm_without_token_uses_catalog_ref() {
+    fn test_oauth_confirm_without_token_uses_catalog_ref() -> TestResult {
         let mut app = SetupApp::new(vec![groq_provider()]);
         app.stage = SetupStage::Auth;
         app.auth_options = vec![AuthOption::OAuth {
@@ -1695,12 +1702,13 @@ mod tests {
 
         assert_eq!(app.stage(), SetupStage::Model);
         app.on_key(press(KeyCode::Enter)); // -> Done
-        let outcome = app.outcome().expect("outcome present");
+        let outcome = app.outcome().ok_or(TestError::Missing("outcome present"))?;
         assert_eq!(
             outcome.secret_ref.as_deref(),
             Some("env:FALLBACK_TOKEN"),
             "Katalog-Ref muss als Fallback dienen wenn kein Token eingegeben"
         );
+        Ok(())
     }
 
     /// Esc im Editing-Modus leert den Puffer und kehrt in den Navigations-Modus

@@ -302,10 +302,14 @@ impl HostPermitPrompt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
     fn test_default_variant_is_single_execution() {
-        assert_eq!(HostPermitVariant::default(), HostPermitVariant::SingleExecution);
+        assert_eq!(
+            HostPermitVariant::default(),
+            HostPermitVariant::SingleExecution
+        );
     }
 
     #[test]
@@ -317,7 +321,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_prompt_approve_delivers_the_chosen_variant() {
+    async fn test_prompt_approve_delivers_the_chosen_variant() -> TestResult {
         let (prompt, answer) = HostPermitPrompt::new(
             "s1".to_owned(),
             "host-process-worker@1".to_owned(),
@@ -328,15 +332,21 @@ mod tests {
         assert_eq!(prompt.session(), "s1");
         assert_eq!(prompt.command(), "echo hi");
         assert_eq!(prompt.workspace(), Path::new("/workspace"));
-        assert_eq!(prompt.preselected_variant(), HostPermitVariant::SingleExecution);
+        assert_eq!(
+            prompt.preselected_variant(),
+            HostPermitVariant::SingleExecution
+        );
 
         assert!(prompt.approve(HostPermitVariant::SessionLease));
-        let decision = answer.await.expect("responder must deliver an answer");
+        let decision = answer
+            .await
+            .map_err(ctx("responder must deliver an answer"))?;
         assert_eq!(decision, Some(HostPermitVariant::SessionLease));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_prompt_deny_delivers_none() {
+    async fn test_prompt_deny_delivers_none() -> TestResult {
         let (prompt, answer) = HostPermitPrompt::new(
             "s1".to_owned(),
             "host-process-worker@1".to_owned(),
@@ -345,8 +355,11 @@ mod tests {
             HostPermitVariant::SingleExecution,
         );
         assert!(prompt.deny());
-        let decision = answer.await.expect("responder must deliver an answer");
+        let decision = answer
+            .await
+            .map_err(ctx("responder must deliver an answer"))?;
         assert_eq!(decision, None);
+        Ok(())
     }
 
     #[tokio::test]
@@ -359,11 +372,14 @@ mod tests {
             HostPermitVariant::SingleExecution,
         );
         drop(prompt);
-        assert!(answer.await.is_err(), "a dropped prompt must close the oneshot channel");
+        assert!(
+            answer.await.is_err(),
+            "a dropped prompt must close the oneshot channel"
+        );
     }
 
     #[tokio::test]
-    async fn test_channel_delivers_a_sent_prompt() {
+    async fn test_channel_delivers_a_sent_prompt() -> TestResult {
         let (sender, mut receiver) = host_permit_prompt_channel();
         let (prompt, _answer) = HostPermitPrompt::new(
             "s1".to_owned(),
@@ -373,9 +389,16 @@ mod tests {
             HostPermitVariant::SessionLease,
         );
         assert!(sender.send(prompt).is_ok());
-        let received = receiver.recv().await.expect("prompt must arrive");
+        let received = receiver
+            .recv()
+            .await
+            .ok_or(TestError::Missing("prompt must arrive"))?;
         assert_eq!(received.session(), "s1");
-        assert_eq!(received.preselected_variant(), HostPermitVariant::SessionLease);
+        assert_eq!(
+            received.preselected_variant(),
+            HostPermitVariant::SessionLease
+        );
+        Ok(())
     }
 
     #[test]

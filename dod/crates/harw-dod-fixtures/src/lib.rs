@@ -151,7 +151,7 @@ mod macros;
 
 mod fixture_io;
 
-pub use error::{FixturesError, FixturesResult};
+pub use error::{FixturesError, FixturesResult, HarnessResult, HarnessViolation};
 
 // Bewusst **kein** `pub use capture::capture;`: dieser Crate-Wurzel hat mit
 // `pub mod capture;` bereits einen Typ-Namensraum-Eintrag `capture` (das
@@ -216,3 +216,7 @@ mod tests {
         assert_eq!(handle.id().as_str(), super::FIXTURE_SENSOR_ID);
     }
 }
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

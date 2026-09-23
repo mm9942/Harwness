@@ -149,7 +149,10 @@ pub fn todo_to_ready(card: &mut Card, parent_states: &[CardState]) -> KnowledgeR
     if !matches!(card.state, CardState::Todo) {
         return Err(illegal_transition(card, "ready"));
     }
-    if !parent_states.iter().all(|state| matches!(state, CardState::Done)) {
+    if !parent_states
+        .iter()
+        .all(|state| matches!(state, CardState::Done))
+    {
         return Err(illegal_transition(card, "ready (parents not all done)"));
     }
     card.state = CardState::Ready;
@@ -306,6 +309,7 @@ mod tests {
     // ausschließlich über `&mut Card` (siehe Moduldoc), deshalb kein
     // Top-Level-Import.
     use crate::kanban::board::{CardId, LaneId};
+    use crate::test_support::{TestError, TestResult};
     use crate::visibility::VisibilityScope;
 
     fn card(state: CardState) -> Card {
@@ -325,93 +329,142 @@ mod tests {
     }
 
     #[test]
-    fn test_triage_to_todo_succeeds_from_triage() {
+    fn test_triage_to_todo_succeeds_from_triage() -> TestResult {
         let mut c = card(CardState::Triage);
-        triage_to_todo(&mut c).expect("triage -> todo succeeds");
+        triage_to_todo(&mut c).map_err(crate::test_support::ctx("triage -> todo succeeds"))?;
         assert_eq!(c.state, CardState::Todo);
+        Ok(())
     }
 
     #[test]
-    fn test_triage_to_todo_rejects_non_triage_source() {
+    fn test_triage_to_todo_rejects_non_triage_source() -> TestResult {
         let mut c = card(CardState::Done);
-        let error = triage_to_todo(&mut c).expect_err("done -> todo must be illegal");
+        let Err(error) = triage_to_todo(&mut c) else {
+            return Err(TestError::Unexpected(
+                "done -> todo must be illegal".to_owned(),
+            ));
+        };
         assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
-        assert_eq!(c.state, CardState::Done, "a rejected transition must not mutate the card");
+        assert_eq!(
+            c.state,
+            CardState::Done,
+            "a rejected transition must not mutate the card"
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_todo_to_ready_succeeds_when_all_parents_done() {
+    fn test_todo_to_ready_succeeds_when_all_parents_done() -> TestResult {
         let mut c = card(CardState::Todo);
-        todo_to_ready(&mut c, &[CardState::Done, CardState::Done]).expect("all parents done");
+        todo_to_ready(&mut c, &[CardState::Done, CardState::Done])
+            .map_err(crate::test_support::ctx("all parents done"))?;
         assert_eq!(c.state, CardState::Ready);
+        Ok(())
     }
 
     #[test]
-    fn test_todo_to_ready_succeeds_with_no_parents() {
+    fn test_todo_to_ready_succeeds_with_no_parents() -> TestResult {
         let mut c = card(CardState::Todo);
-        todo_to_ready(&mut c, &[]).expect("no parents trivially satisfies the gate");
+        todo_to_ready(&mut c, &[]).map_err(crate::test_support::ctx(
+            "no parents trivially satisfies the gate",
+        ))?;
         assert_eq!(c.state, CardState::Ready);
+        Ok(())
     }
 
     #[test]
-    fn test_todo_to_ready_rejects_when_a_parent_is_not_done() {
+    fn test_todo_to_ready_rejects_when_a_parent_is_not_done() -> TestResult {
         let mut c = card(CardState::Todo);
-        let error = todo_to_ready(&mut c, &[CardState::Done, CardState::Running])
-            .expect_err("an unfinished parent must block readiness");
+        let Err(error) = todo_to_ready(&mut c, &[CardState::Done, CardState::Running]) else {
+            return Err(TestError::Unexpected(
+                "an unfinished parent must block readiness".to_owned(),
+            ));
+        };
         assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
         assert_eq!(c.state, CardState::Todo);
+        Ok(())
     }
 
     #[test]
-    fn test_todo_to_ready_rejects_non_todo_source() {
+    fn test_todo_to_ready_rejects_non_todo_source() -> TestResult {
         let mut c = card(CardState::Triage);
-        let error = todo_to_ready(&mut c, &[]).expect_err("triage -> ready must be illegal");
+        let Err(error) = todo_to_ready(&mut c, &[]) else {
+            return Err(TestError::Unexpected(
+                "triage -> ready must be illegal".to_owned(),
+            ));
+        };
         assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_claim_succeeds_without_approval_when_risk_is_low() {
+    fn test_claim_succeeds_without_approval_when_risk_is_low() -> TestResult {
         let mut c = card(CardState::Ready);
-        claim(&mut c, WorkId::from_str("work-1"), AgentId::new("worker-1"), RiskLevel::Low, None)
-            .expect("low-risk claim needs no approval");
+        claim(
+            &mut c,
+            WorkId::from_str("work-1"),
+            AgentId::new("worker-1"),
+            RiskLevel::Low,
+            None,
+        )
+        .map_err(crate::test_support::ctx("low-risk claim needs no approval"))?;
         assert_eq!(c.state, CardState::Running);
         assert_eq!(c.work_id, Some(WorkId::from_str("work-1")));
         assert_eq!(c.assignee, Some(AgentId::new("worker-1")));
+        Ok(())
     }
 
     #[test]
-    fn test_claim_on_high_risk_lane_without_approval_is_refused() {
+    fn test_claim_on_high_risk_lane_without_approval_is_refused() -> TestResult {
         let mut c = card(CardState::Ready);
-        let error = claim(
+        let Err(error) = claim(
             &mut c,
             WorkId::from_str("work-1"),
             AgentId::new("worker-1"),
             RiskLevel::High,
             None,
-        )
-        .expect_err("high-risk claim without approval must be refused");
-        assert!(matches!(error, KnowledgeError::ClaimRequiresApproval { .. }));
-        assert_eq!(c.state, CardState::Ready, "a refused claim must not mutate the card");
+        ) else {
+            return Err(TestError::Unexpected(
+                "high-risk claim without approval must be refused".to_owned(),
+            ));
+        };
+        assert!(matches!(
+            error,
+            KnowledgeError::ClaimRequiresApproval { .. }
+        ));
+        assert_eq!(
+            c.state,
+            CardState::Ready,
+            "a refused claim must not mutate the card"
+        );
         assert!(c.work_id.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_claim_on_high_risk_lane_with_rejected_proof_is_refused() {
+    fn test_claim_on_high_risk_lane_with_rejected_proof_is_refused() -> TestResult {
         let mut c = card(CardState::Ready);
         let proof = ApprovalProof::new(ReviewDecision::Rejected, AgentId::new("operator-1"));
-        let error = claim(
+        let Err(error) = claim(
             &mut c,
             WorkId::from_str("work-1"),
             AgentId::new("worker-1"),
             RiskLevel::Critical,
             Some(&proof),
-        )
-        .expect_err("a rejected decision must not satisfy the gate");
-        assert!(matches!(error, KnowledgeError::ClaimRequiresApproval { .. }));
+        ) else {
+            return Err(TestError::Unexpected(
+                "a rejected decision must not satisfy the gate".to_owned(),
+            ));
+        };
+        assert!(matches!(
+            error,
+            KnowledgeError::ClaimRequiresApproval { .. }
+        ));
+        Ok(())
     }
 
     #[test]
-    fn test_claim_on_high_risk_lane_with_approved_proof_succeeds() {
+    fn test_claim_on_high_risk_lane_with_approved_proof_succeeds() -> TestResult {
         let mut c = card(CardState::Ready);
         let proof = ApprovalProof::new(ReviewDecision::Approved, AgentId::new("operator-1"));
         claim(
@@ -421,139 +474,206 @@ mod tests {
             RiskLevel::High,
             Some(&proof),
         )
-        .expect("approved proof satisfies the gate");
+        .map_err(crate::test_support::ctx(
+            "approved proof satisfies the gate",
+        ))?;
         assert_eq!(c.state, CardState::Running);
+        Ok(())
     }
 
     #[test]
-    fn test_claim_rejects_non_ready_source() {
+    fn test_claim_rejects_non_ready_source() -> TestResult {
         let mut c = card(CardState::Triage);
-        let error = claim(&mut c, WorkId::from_str("work-1"), AgentId::new("worker-1"), RiskLevel::Low, None)
-            .expect_err("triage -> running must be illegal");
+        let Err(error) = claim(
+            &mut c,
+            WorkId::from_str("work-1"),
+            AgentId::new("worker-1"),
+            RiskLevel::Low,
+            None,
+        ) else {
+            return Err(TestError::Unexpected(
+                "triage -> running must be illegal".to_owned(),
+            ));
+        };
         assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_complete_moves_a_plain_card_to_done() {
+    fn test_complete_moves_a_plain_card_to_done() -> TestResult {
         let mut c = card(CardState::Running);
-        complete(&mut c).expect("complete succeeds");
+        complete(&mut c).map_err(crate::test_support::ctx("complete succeeds"))?;
         assert_eq!(c.state, CardState::Done);
+        Ok(())
     }
 
     #[test]
-    fn test_complete_moves_a_review_required_card_to_blocked_instead_of_done() {
+    fn test_complete_moves_a_review_required_card_to_blocked_instead_of_done() -> TestResult {
         let mut c = card(CardState::Running);
         c.tags.push(REVIEW_REQUIRED_TAG.to_owned());
-        complete(&mut c).expect("complete succeeds");
+        complete(&mut c).map_err(crate::test_support::ctx("complete succeeds"))?;
         assert_eq!(
             c.state,
             CardState::Blocked {
                 reason_kind: BlockKind::ReviewRequired
             }
         );
+        Ok(())
     }
 
     #[test]
-    fn test_complete_rejects_non_running_source() {
+    fn test_complete_rejects_non_running_source() -> TestResult {
         let mut c = card(CardState::Ready);
-        let error = complete(&mut c).expect_err("ready -> done must be illegal");
+        let Err(error) = complete(&mut c) else {
+            return Err(TestError::Unexpected(
+                "ready -> done must be illegal".to_owned(),
+            ));
+        };
         assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_block_moves_running_to_blocked_with_given_reason() {
+    fn test_block_moves_running_to_blocked_with_given_reason() -> TestResult {
         let mut c = card(CardState::Running);
-        block(&mut c, BlockKind::Dependency).expect("block succeeds");
+        block(&mut c, BlockKind::Dependency).map_err(crate::test_support::ctx("block succeeds"))?;
         assert_eq!(
             c.state,
             CardState::Blocked {
                 reason_kind: BlockKind::Dependency
             }
         );
+        Ok(())
     }
 
     #[test]
-    fn test_block_rejects_non_running_source() {
+    fn test_block_rejects_non_running_source() -> TestResult {
         let mut c = card(CardState::Todo);
-        let error = block(&mut c, BlockKind::Transient).expect_err("todo -> blocked must be illegal");
+        let Err(error) = block(&mut c, BlockKind::Transient) else {
+            return Err(TestError::Unexpected(
+                "todo -> blocked must be illegal".to_owned(),
+            ));
+        };
         assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_unblock_moves_blocked_to_ready() {
+    fn test_unblock_moves_blocked_to_ready() -> TestResult {
         let mut c = card(CardState::Blocked {
             reason_kind: BlockKind::NeedsInput,
         });
-        unblock(&mut c).expect("unblock succeeds");
+        unblock(&mut c).map_err(crate::test_support::ctx("unblock succeeds"))?;
         assert_eq!(c.state, CardState::Ready);
+        Ok(())
     }
 
     #[test]
-    fn test_unblock_rejects_non_blocked_source() {
+    fn test_unblock_rejects_non_blocked_source() -> TestResult {
         let mut c = card(CardState::Done);
-        let error = unblock(&mut c).expect_err("done -> ready must be illegal");
+        let Err(error) = unblock(&mut c) else {
+            return Err(TestError::Unexpected(
+                "done -> ready must be illegal".to_owned(),
+            ));
+        };
         assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_reclaim_moves_running_to_ready_and_increments_retry_count() {
+    fn test_reclaim_moves_running_to_ready_and_increments_retry_count() -> TestResult {
         let mut c = card(CardState::Running);
         c.work_id = Some(WorkId::from_str("work-1"));
         c.assignee = Some(AgentId::new("worker-1"));
 
-        let first = reclaim(&mut c).expect("first reclaim succeeds");
+        let first = reclaim(&mut c).map_err(crate::test_support::ctx("first reclaim succeeds"))?;
         assert_eq!(first, 1);
         assert_eq!(c.state, CardState::Ready);
         assert!(c.work_id.is_none());
         assert!(c.assignee.is_none());
 
         // A second claim-then-reclaim cycle keeps counting.
-        claim(&mut c, WorkId::from_str("work-2"), AgentId::new("worker-2"), RiskLevel::Low, None)
-            .expect("re-claim after reclaim");
-        let second = reclaim(&mut c).expect("second reclaim succeeds");
+        claim(
+            &mut c,
+            WorkId::from_str("work-2"),
+            AgentId::new("worker-2"),
+            RiskLevel::Low,
+            None,
+        )
+        .map_err(crate::test_support::ctx("re-claim after reclaim"))?;
+        let second =
+            reclaim(&mut c).map_err(crate::test_support::ctx("second reclaim succeeds"))?;
         assert_eq!(second, 2);
+        Ok(())
     }
 
     #[test]
-    fn test_reclaim_rejects_non_running_source() {
+    fn test_reclaim_rejects_non_running_source() -> TestResult {
         let mut c = card(CardState::Ready);
-        let error = reclaim(&mut c).expect_err("ready -> ready (reclaim) must be illegal");
+        let Err(error) = reclaim(&mut c) else {
+            return Err(TestError::Unexpected(
+                "ready -> ready (reclaim) must be illegal".to_owned(),
+            ));
+        };
         assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_archive_succeeds_from_done_with_no_unresolved_children() {
+    fn test_archive_succeeds_from_done_with_no_unresolved_children() -> TestResult {
         let mut c = card(CardState::Done);
-        archive(&mut c, 0).expect("archive succeeds");
+        archive(&mut c, 0).map_err(crate::test_support::ctx("archive succeeds"))?;
         assert_eq!(c.state, CardState::Archived);
+        Ok(())
     }
 
     #[test]
-    fn test_archive_succeeds_from_blocked_with_no_unresolved_children() {
+    fn test_archive_succeeds_from_blocked_with_no_unresolved_children() -> TestResult {
         let mut c = card(CardState::Blocked {
             reason_kind: BlockKind::Dependency,
         });
-        archive(&mut c, 0).expect("archive succeeds");
+        archive(&mut c, 0).map_err(crate::test_support::ctx("archive succeeds"))?;
         assert_eq!(c.state, CardState::Archived);
+        Ok(())
     }
 
     #[test]
-    fn test_archive_rejects_unresolved_children() {
+    fn test_archive_rejects_unresolved_children() -> TestResult {
         let mut c = card(CardState::Done);
-        let error = archive(&mut c, 2).expect_err("unresolved children must block archival");
+        let Err(error) = archive(&mut c, 2) else {
+            return Err(TestError::Unexpected(
+                "unresolved children must block archival".to_owned(),
+            ));
+        };
         match error {
-            KnowledgeError::ArchiveBlockedByChildren { blocking_children, .. } => {
+            KnowledgeError::ArchiveBlockedByChildren {
+                blocking_children, ..
+            } => {
                 assert_eq!(blocking_children, 2);
             }
-            other => panic!("expected ArchiveBlockedByChildren, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected ArchiveBlockedByChildren, got {other:?}"
+                )));
+            }
         }
-        assert_eq!(c.state, CardState::Done, "a rejected archive must not mutate the card");
+        assert_eq!(
+            c.state,
+            CardState::Done,
+            "a rejected archive must not mutate the card"
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_archive_rejects_non_terminal_source() {
+    fn test_archive_rejects_non_terminal_source() -> TestResult {
         let mut c = card(CardState::Running);
-        let error = archive(&mut c, 0).expect_err("running -> archived must be illegal");
+        let Err(error) = archive(&mut c, 0) else {
+            return Err(TestError::Unexpected(
+                "running -> archived must be illegal".to_owned(),
+            ));
+        };
         assert!(matches!(error, KnowledgeError::IllegalTransition { .. }));
+        Ok(())
     }
 }

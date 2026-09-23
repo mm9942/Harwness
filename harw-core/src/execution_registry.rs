@@ -345,6 +345,7 @@ impl Drop for ExecutionGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestResult;
     use harw_types::WorkId;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -395,50 +396,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_epoch_or_nonce_cannot_cancel_current_execution() {
+    async fn stale_epoch_or_nonce_cannot_cancel_current_execution() -> TestResult {
         let registry = JobExecutionRegistry::new();
         let control = FakeControl::new(false);
-        registry
-            .register(token(2, "current"), control.clone())
-            .unwrap();
+        registry.register(token(2, "current"), control.clone())?;
 
         assert_eq!(
             registry
                 .cancel(&token(1, "current"), Duration::from_millis(1))
-                .await
-                .unwrap(),
+                .await?,
             CancellationResult::Missing
         );
         assert_eq!(
             registry
                 .cancel(&token(2, "stale"), Duration::from_millis(1))
-                .await
-                .unwrap(),
+                .await?,
             CancellationResult::Missing
         );
         assert_eq!(control.graceful.load(Ordering::SeqCst), 0);
         assert_eq!(registry.len(), 1);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn missing_binding_is_nonfatal() {
+    async fn missing_binding_is_nonfatal() -> TestResult {
         let registry = JobExecutionRegistry::new();
         assert_eq!(
             registry
                 .cancel(&token(9, "gone"), Duration::from_millis(1))
-                .await
-                .unwrap(),
+                .await?,
             CancellationResult::Missing
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn graceful_completion_removes_binding() {
+    async fn graceful_completion_removes_binding() -> TestResult {
         let registry = JobExecutionRegistry::new();
         let control = FakeControl::new(false);
-        registry
-            .register(token(3, "graceful"), control.clone())
-            .unwrap();
+        registry.register(token(3, "graceful"), control.clone())?;
         let completion = control.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -447,89 +443,81 @@ mod tests {
         assert_eq!(
             registry
                 .cancel(&token(3, "graceful"), Duration::from_millis(100))
-                .await
-                .unwrap(),
+                .await?,
             CancellationResult::Graceful
         );
         assert_eq!(control.graceful.load(Ordering::SeqCst), 1);
         assert_eq!(control.forced.load(Ordering::SeqCst), 0);
         assert!(registry.is_empty());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn grace_timeout_force_aborts_and_removes_binding() {
+    async fn grace_timeout_force_aborts_and_removes_binding() -> TestResult {
         let registry = JobExecutionRegistry::new();
         let control = FakeControl::new(false);
-        registry
-            .register(token(4, "timeout"), control.clone())
-            .unwrap();
+        registry.register(token(4, "timeout"), control.clone())?;
         assert_eq!(
             registry
                 .cancel(&token(4, "timeout"), Duration::from_millis(2))
-                .await
-                .unwrap(),
+                .await?,
             CancellationResult::ForceAborted
         );
         assert_eq!(control.graceful.load(Ordering::SeqCst), 1);
         assert_eq!(control.forced.load(Ordering::SeqCst), 1);
         assert!(registry.is_empty());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn contains_matches_only_the_exact_token() {
+    async fn contains_matches_only_the_exact_token() -> TestResult {
         let registry = JobExecutionRegistry::new();
         let control = FakeControl::new(false);
-        registry
-            .register(token(2, "current"), control.clone())
-            .unwrap();
+        registry.register(token(2, "current"), control.clone())?;
 
         assert!(registry.contains(&token(2, "current")));
         assert!(!registry.contains(&token(1, "current")));
         assert!(!registry.contains(&token(2, "stale")));
 
-        assert!(registry.unregister(&token(2, "current")).unwrap());
+        assert!(registry.unregister(&token(2, "current"))?);
         assert!(!registry.contains(&token(2, "current")));
+        Ok(())
     }
 
     #[test]
-    fn test_register_guarded_drop_unregisters_exact_token() {
+    fn test_register_guarded_drop_unregisters_exact_token() -> TestResult {
         let registry = Arc::new(JobExecutionRegistry::new());
         let control = FakeControl::new(false);
-        let guard = registry
-            .register_guarded(token(5, "guarded"), control)
-            .unwrap();
+        let guard = registry.register_guarded(token(5, "guarded"), control)?;
         assert!(registry.contains(&token(5, "guarded")));
         assert_eq!(guard.token(), &token(5, "guarded"));
         drop(guard);
         assert!(registry.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_register_guarded_release_reports_presence() {
+    fn test_register_guarded_release_reports_presence() -> TestResult {
         let registry = Arc::new(JobExecutionRegistry::new());
-        let guard = registry
-            .register_guarded(token(6, "release"), FakeControl::new(false))
-            .unwrap();
-        assert!(guard.release().unwrap());
+        let guard = registry.register_guarded(token(6, "release"), FakeControl::new(false))?;
+        assert!(guard.release()?);
         assert!(registry.is_empty());
 
-        let guard = registry
-            .register_guarded(token(7, "gone"), FakeControl::new(false))
-            .unwrap();
-        assert!(registry.unregister(&token(7, "gone")).unwrap());
-        assert!(!guard.release().unwrap());
+        let guard = registry.register_guarded(token(7, "gone"), FakeControl::new(false))?;
+        assert!(registry.unregister(&token(7, "gone"))?);
+        assert!(!guard.release()?);
+        Ok(())
     }
 
     #[test]
-    fn test_register_guarded_rejects_duplicate_token() {
+    fn test_register_guarded_rejects_duplicate_token() -> TestResult {
         let registry = Arc::new(JobExecutionRegistry::new());
-        let _guard = registry
-            .register_guarded(token(8, "dup"), FakeControl::new(false))
-            .unwrap();
+        let _guard = registry.register_guarded(token(8, "dup"), FakeControl::new(false))?;
         assert!(matches!(
             registry.register_guarded(token(8, "dup"), FakeControl::new(false)),
             Err(ExecutionRegistryError::DuplicateToken { epoch: 8, .. })
         ));
         assert_eq!(registry.len(), 1);
+        Ok(())
     }
 }

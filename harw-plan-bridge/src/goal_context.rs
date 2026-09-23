@@ -275,33 +275,38 @@ fn kind_label(kind: PlanNodeKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use crate::testing::{
         InMemoryGoalStore, coding_node, goal_with_open_criterion, seeded_plan_store,
     };
     use harw_plan::goal::GoalAction;
     use harw_plan::{InMemoryPlanStore, PlanNodeStatus};
 
-    fn provider(max_chars: usize) -> GoalContextProvider {
+    fn provider(max_chars: usize) -> TestResult<GoalContextProvider> {
         let goal_store = InMemoryGoalStore::new();
-        if let Err(error) = goal_store.apply(
-            GoalAction::Set {
-                goal: goal_with_open_criterion(),
-            },
-            "operator",
-        ) {
-            panic!("Goal setzen: {error}");
-        }
+        goal_store
+            .apply(
+                GoalAction::Set {
+                    goal: goal_with_open_criterion(),
+                },
+                "operator",
+            )
+            .map_err(ctx("Goal setzen"))?;
         let plan = seeded_plan_store(vec![
             coding_node("t-1", PlanNodeStatus::Ready),
             coding_node("t-2", PlanNodeStatus::Completed),
-        ]);
+        ])?;
 
-        GoalContextProvider::with_max_chars(Arc::new(goal_store), Arc::new(plan), max_chars)
+        Ok(GoalContextProvider::with_max_chars(
+            Arc::new(goal_store),
+            Arc::new(plan),
+            max_chars,
+        ))
     }
 
     #[test]
-    fn test_fragments_contain_goal_open_criteria_ready_nodes_and_coverage() {
-        let fragments = provider(DEFAULT_MAX_CHARS).fragments();
+    fn test_fragments_contain_goal_open_criteria_ready_nodes_and_coverage() -> TestResult {
+        let fragments = provider(DEFAULT_MAX_CHARS)?.fragments();
 
         assert_eq!(fragments.len(), 1);
         let fragment = &fragments[0];
@@ -319,22 +324,24 @@ mod tests {
         assert!(content.contains("## Jetzt ausführbar"), "{content}");
         assert!(content.contains("t-1 [coding]"), "{content}");
         assert!(content.contains("## Abdeckung"), "{content}");
+        Ok(())
     }
 
     #[test]
-    fn test_completed_nodes_are_not_listed_as_ready() {
-        let fragments = provider(DEFAULT_MAX_CHARS).fragments();
+    fn test_completed_nodes_are_not_listed_as_ready() -> TestResult {
+        let fragments = provider(DEFAULT_MAX_CHARS)?.fragments();
         let content = fragments[0].content.as_str();
         assert!(
             !content.contains("t-2 ["),
             "abgeschlossener Knoten gelistet: {content}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_fragments_respect_max_chars() {
+    fn test_fragments_respect_max_chars() -> TestResult {
         let limit = 80;
-        let fragments = provider(limit).fragments();
+        let fragments = provider(limit)?.fragments();
 
         assert_eq!(fragments.len(), 1);
         let content = fragments[0].content.as_str();
@@ -344,39 +351,43 @@ mod tests {
             content.chars().count()
         );
         assert!(content.ends_with('…'), "Kürzung nicht markiert: {content}");
+        Ok(())
     }
 
     #[test]
-    fn test_zero_max_chars_contributes_nothing() {
-        assert!(provider(0).fragments().is_empty());
+    fn test_zero_max_chars_contributes_nothing() -> TestResult {
+        assert!(provider(0)?.fragments().is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_missing_goal_contributes_nothing() {
+    fn test_missing_goal_contributes_nothing() -> TestResult {
         let provider = GoalContextProvider::new(
             Arc::new(InMemoryGoalStore::new()),
             Arc::new(seeded_plan_store(vec![coding_node(
                 "t-1",
                 PlanNodeStatus::Ready,
-            )])),
+            )])?),
         );
         assert!(provider.fragments().is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_missing_plan_contributes_nothing() {
+    fn test_missing_plan_contributes_nothing() -> TestResult {
         let goal_store = InMemoryGoalStore::new();
-        if let Err(error) = goal_store.apply(
-            GoalAction::Set {
-                goal: goal_with_open_criterion(),
-            },
-            "operator",
-        ) {
-            panic!("Goal setzen: {error}");
-        }
+        goal_store
+            .apply(
+                GoalAction::Set {
+                    goal: goal_with_open_criterion(),
+                },
+                "operator",
+            )
+            .map_err(ctx("Goal setzen"))?;
         let provider =
             GoalContextProvider::new(Arc::new(goal_store), Arc::new(InMemoryPlanStore::new()));
         assert!(provider.fragments().is_empty());
+        Ok(())
     }
 
     #[test]

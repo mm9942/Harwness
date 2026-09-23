@@ -139,51 +139,69 @@ fn canonical_socket(path: &Path) -> Result<PathBuf, TmuxProfileError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestError;
+    use crate::test_support::TestResult;
 
     #[test]
-    fn rejects_relative_path() {
-        let err = TmuxSandboxProfile::new(TmuxOperationMode::Inspect, "tmux-socket").unwrap_err();
+    fn rejects_relative_path() -> TestResult {
+        let result = TmuxSandboxProfile::new(TmuxOperationMode::Inspect, "tmux-socket");
+        let Err(err) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, TmuxProfileError::InvalidPath { .. }));
+        Ok(())
     }
 
     #[test]
-    fn rejects_dotdot_path() {
-        let err = TmuxSandboxProfile::new(TmuxOperationMode::Inspect, "/tmp/../etc/tmux-socket")
-            .unwrap_err();
+    fn rejects_dotdot_path() -> TestResult {
+        let result = TmuxSandboxProfile::new(TmuxOperationMode::Inspect, "/tmp/../etc/tmux-socket");
+        let Err(err) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, TmuxProfileError::InvalidPath { .. }));
+        Ok(())
     }
 
     #[test]
-    fn rejects_missing_socket() {
+    fn rejects_missing_socket() -> TestResult {
         let missing = std::env::temp_dir().join(format!(
             "harwness-tmux-missing-{}/socket",
             std::process::id()
         ));
-        let err = TmuxSandboxProfile::new(TmuxOperationMode::Inspect, &missing).unwrap_err();
+        let result = TmuxSandboxProfile::new(TmuxOperationMode::Inspect, &missing);
+        let Err(err) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, TmuxProfileError::Missing { .. }));
+        Ok(())
     }
 
     #[test]
-    fn rejects_non_socket_file() {
+    fn rejects_non_socket_file() -> TestResult {
         let tmp =
             std::env::temp_dir().join(format!("harwness-tmux-notsock-{}", std::process::id()));
-        std::fs::write(&tmp, b"not a socket").unwrap();
-        let err = TmuxSandboxProfile::new(TmuxOperationMode::Inspect, &tmp).unwrap_err();
+        std::fs::write(&tmp, b"not a socket")?;
+        let result = TmuxSandboxProfile::new(TmuxOperationMode::Inspect, &tmp);
+        let Err(err) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, TmuxProfileError::NotSocket { .. }));
         std::fs::remove_file(&tmp).ok();
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn accepts_real_unix_socket() {
+    fn accepts_real_unix_socket() -> TestResult {
         use std::os::unix::net::UnixListener;
         let dir = std::env::temp_dir().join(format!("harwness-tmux-real-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir)?;
         let sock = dir.join("tmux.sock");
-        let _listener = UnixListener::bind(&sock).unwrap();
-        let profile = TmuxSandboxProfile::new(TmuxOperationMode::Inspect, &sock).unwrap();
+        let _listener = UnixListener::bind(&sock)?;
+        let profile = TmuxSandboxProfile::new(TmuxOperationMode::Inspect, &sock)?;
         assert_eq!(profile.mode(), TmuxOperationMode::Inspect);
-        assert_eq!(profile.socket_path(), &sock.canonicalize().unwrap());
+        assert_eq!(profile.socket_path(), &sock.canonicalize()?);
         std::fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 }

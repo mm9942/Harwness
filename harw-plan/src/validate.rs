@@ -379,11 +379,7 @@ fn children_of<'a>(plan: &'a Plan, id: &TaskId) -> Vec<&'a PlanNode> {
 /// Nachweise liegen deshalb nie in der Zukunft.
 ///
 /// Crate-weit geteilt mit `graph::missing_explorations` (eine Frist-Semantik).
-pub(crate) fn is_fresh_finding(
-    evidence: &EvidenceRef,
-    now: OffsetDateTime,
-    ttl_secs: u64,
-) -> bool {
+pub(crate) fn is_fresh_finding(evidence: &EvidenceRef, now: OffsetDateTime, ttl_secs: u64) -> bool {
     if evidence.kind != EvidenceKind::Finding || evidence.attached_at > now {
         return false;
     }
@@ -1176,6 +1172,7 @@ mod tests {
     // `PlanError`, `PlanResult` und `OffsetDateTime` mit; hier folgt nur, was
     // dort nicht sichtbar ist.
     use super::*;
+    use crate::test_support::{TestError, TestResult};
     use crate::types::InvalidationCondition;
     use time::Duration;
 
@@ -1277,22 +1274,25 @@ mod tests {
     // ── Regeln 1–9: bestehende Regeln ────────────────────────────────────────
 
     #[test]
-    fn test_node_missing() {
+    fn test_node_missing() -> TestResult {
         let plan = make_plan(vec![]);
         let action = PlanAction::SetStatus {
             id: TaskId::new("nonexistent"),
             status: PlanNodeStatus::Ready,
             reason: None,
         };
-        let err = validate(&plan, &action).unwrap_err();
+        let Err(err) = validate(&plan, &action) else {
+            return Err(TestError::Unexpected("Fehler erwartet".to_owned()));
+        };
         assert!(
             matches!(err, PlanError::NodeMissing { .. }),
             "Erwartet NodeMissing"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_cycle_detected() {
+    fn test_cycle_detected() -> TestResult {
         // A hängt von B ab; dann B→A würde Zyklus erzeugen
         let mut node_a = make_node("A", PlanNodeStatus::Draft);
         node_a.dependencies = vec![TaskId::new("B")];
@@ -1303,15 +1303,18 @@ mod tests {
             child: TaskId::new("B"),
             parent: TaskId::new("A"),
         };
-        let err = validate(&plan, &action).unwrap_err();
+        let Err(err) = validate(&plan, &action) else {
+            return Err(TestError::Unexpected("Fehler erwartet".to_owned()));
+        };
         assert!(
             matches!(err, PlanError::CycleDetected { .. }),
             "Erwartet CycleDetected"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_illegal_transition() {
+    fn test_illegal_transition() -> TestResult {
         // Draft → Completed ist nicht erlaubt
         let node = make_node("t1", PlanNodeStatus::Draft);
         let plan = make_plan(vec![node]);
@@ -1320,15 +1323,18 @@ mod tests {
             status: PlanNodeStatus::Completed,
             reason: None,
         };
-        let err = validate(&plan, &action).unwrap_err();
+        let Err(err) = validate(&plan, &action) else {
+            return Err(TestError::Unexpected("Fehler erwartet".to_owned()));
+        };
         assert!(
             matches!(err, PlanError::IllegalTransition { .. }),
             "Erwartet IllegalTransition"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_evidence_missing_on_complete() {
+    fn test_evidence_missing_on_complete() -> TestResult {
         // InProgress → Completed ohne Evidence
         let node = make_node("t1", PlanNodeStatus::InProgress);
         let plan = make_plan(vec![node]);
@@ -1337,26 +1343,32 @@ mod tests {
             status: PlanNodeStatus::Completed,
             reason: None,
         };
-        let err = validate(&plan, &action).unwrap_err();
+        let Err(err) = validate(&plan, &action) else {
+            return Err(TestError::Unexpected("Fehler erwartet".to_owned()));
+        };
         assert!(
             matches!(err, PlanError::EvidenceMissing { .. }),
             "Erwartet EvidenceMissing"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_scope_conflict() {
+    fn test_scope_conflict() -> TestResult {
         let existing = make_node("A", PlanNodeStatus::Ready);
         let plan = make_plan(vec![existing]);
 
         let mut new_node = make_node("B", PlanNodeStatus::Draft);
         new_node.write_scope = vec![PathOrSymbol::new("src/A.rs")];
         let action = PlanAction::AddNode { node: new_node };
-        let err = validate(&plan, &action).unwrap_err();
+        let Err(err) = validate(&plan, &action) else {
+            return Err(TestError::Unexpected("Fehler erwartet".to_owned()));
+        };
         assert!(
             matches!(err, PlanError::ScopeConflict { .. }),
             "Erwartet ScopeConflict"
         );
+        Ok(())
     }
 
     #[test]
@@ -1379,17 +1391,20 @@ mod tests {
     }
 
     #[test]
-    fn test_forbidden_scope_overlap() {
+    fn test_forbidden_scope_overlap() -> TestResult {
         let plan = make_plan(vec![]);
         let mut node = make_node("t1", PlanNodeStatus::Draft);
         node.write_scope = vec![PathOrSymbol::new("src/secret.rs")];
         node.forbidden_scope = vec![PathOrSymbol::new("src/secret.rs")];
         let action = PlanAction::AddNode { node };
-        let err = validate(&plan, &action).unwrap_err();
+        let Err(err) = validate(&plan, &action) else {
+            return Err(TestError::Unexpected("Fehler erwartet".to_owned()));
+        };
         assert!(
             matches!(err, PlanError::ForbiddenScopeOverlap { .. }),
             "Erwartet ForbiddenScopeOverlap"
         );
+        Ok(())
     }
 
     #[test]
@@ -1460,7 +1475,7 @@ mod tests {
     }
 
     #[test]
-    fn test_in_progress_transition_rejects_incomplete_dependency() {
+    fn test_in_progress_transition_rejects_incomplete_dependency() -> TestResult {
         let dependency = make_node("dep", PlanNodeStatus::Blocked);
         let mut node = make_node("t1", PlanNodeStatus::Ready);
         node.dependencies = vec![TaskId::new("dep")];
@@ -1471,7 +1486,9 @@ mod tests {
             reason: None,
         };
 
-        let err = validate(&plan, &action).unwrap_err();
+        let Err(err) = validate(&plan, &action) else {
+            return Err(TestError::Unexpected("Fehler erwartet".to_owned()));
+        };
         assert!(
             matches!(
                 &err,
@@ -1482,6 +1499,7 @@ mod tests {
             ),
             "InProgress verlangt abgeschlossene Dependencies, err={err}"
         );
+        Ok(())
     }
 
     /// F-013 §5.1 Punkt 1: ein direkt als `Ready` eingefügter Knoten würde
@@ -1504,16 +1522,19 @@ mod tests {
     }
 
     #[test]
-    fn test_revision_regressed_on_supersede() {
+    fn test_revision_regressed_on_supersede() -> TestResult {
         let plan = make_plan(vec![]); // revision = 1
         let action = PlanAction::Supersede {
             new_parent_revision: RevisionId::new(1),
         };
-        let err = validate(&plan, &action).unwrap_err();
+        let Err(err) = validate(&plan, &action) else {
+            return Err(TestError::Unexpected("Fehler erwartet".to_owned()));
+        };
         assert!(
             matches!(err, PlanError::RevisionRegressed { .. }),
             "Erwartet RevisionRegressed"
         );
+        Ok(())
     }
 
     #[test]
@@ -1548,7 +1569,7 @@ mod tests {
     }
 
     #[test]
-    fn test_invalidate_completed_node_fails() {
+    fn test_invalidate_completed_node_fails() -> TestResult {
         let mut node = make_node("t1", PlanNodeStatus::Completed);
         node.evidence = vec![make_evidence()];
         let plan = make_plan(vec![node]);
@@ -1556,11 +1577,14 @@ mod tests {
             ids: vec![TaskId::new("t1")],
             condition: InvalidationCondition::ManualInvalidate,
         };
-        let err = validate(&plan, &action).unwrap_err();
+        let Err(err) = validate(&plan, &action) else {
+            return Err(TestError::Unexpected("Fehler erwartet".to_owned()));
+        };
         assert!(
             matches!(err, PlanError::InvalidateCompleted { .. }),
             "Erwartet InvalidateCompleted"
         );
+        Ok(())
     }
 
     // ── ID-Hygiene (InvalidId) ───────────────────────────────────────────────
@@ -1714,13 +1738,15 @@ mod tests {
     }
 
     #[test]
-    fn test_expand_rejects_child_scope_outside_parent() {
+    fn test_expand_rejects_child_scope_outside_parent() -> TestResult {
         let plan = make_plan(vec![expand_parent()]);
         let action = PlanAction::Expand {
             parent: TaskId::new("parent"),
             children: vec![expand_child("c1", "src/other.rs")],
         };
-        let err = check(&plan, &action).unwrap_err();
+        let Err(err) = check(&plan, &action) else {
+            return Err(TestError::Unexpected("Fehler erwartet".to_owned()));
+        };
         assert!(
             matches!(
                 &err,
@@ -1729,6 +1755,7 @@ mod tests {
             ),
             "Kind-Scope außerhalb des Parents muss ExpandScopeEscapes liefern, err={err}"
         );
+        Ok(())
     }
 
     #[test]
@@ -1858,7 +1885,7 @@ mod tests {
     // ── Regel 11: Composite-Abschluss ────────────────────────────────────────
 
     #[test]
-    fn test_composite_complete_rejects_open_children() {
+    fn test_composite_complete_rejects_open_children() -> TestResult {
         let mut parent = make_kind_node(
             "parent",
             PlanNodeStatus::InProgress,
@@ -1875,7 +1902,9 @@ mod tests {
             reason: None,
         };
 
-        let err = check(&plan, &action).unwrap_err();
+        let Err(err) = check(&plan, &action) else {
+            return Err(TestError::Unexpected("Fehler erwartet".to_owned()));
+        };
         assert!(
             matches!(
                 &err,
@@ -1884,6 +1913,7 @@ mod tests {
             ),
             "offene Kind-Knoten müssen CompositeIncomplete liefern, err={err}"
         );
+        Ok(())
     }
 
     #[test]
@@ -1953,18 +1983,21 @@ mod tests {
     }
 
     #[test]
-    fn test_coding_node_without_exploration_is_rejected() {
+    fn test_coding_node_without_exploration_is_rejected() -> TestResult {
         let plan = make_plan(vec![make_node("t1", PlanNodeStatus::Draft)]);
         let action = PlanAction::SetStatus {
             id: TaskId::new("t1"),
             status: PlanNodeStatus::Ready,
             reason: None,
         };
-        let err = validate_with(&plan, &action, &exploration_cfg(), now()).unwrap_err();
+        let Err(err) = validate_with(&plan, &action, &exploration_cfg(), now()) else {
+            return Err(TestError::Unexpected("Fehler erwartet".to_owned()));
+        };
         assert!(
             matches!(&err, PlanError::ExplorationRequired { id } if id == &TaskId::new("t1")),
             "Coding-Knoten ohne Exploration muss abgelehnt werden, err={err}"
         );
+        Ok(())
     }
 
     #[test]
@@ -2387,7 +2420,7 @@ mod tests {
     }
 
     #[test]
-    fn test_set_status_cannot_reopen_invalidated() {
+    fn test_set_status_cannot_reopen_invalidated() -> TestResult {
         // Regel 15: `Invalidated → Draft` steht in der Matrix, ist aber
         // reopen-exklusiv.
         let plan = make_plan(vec![make_node("t1", PlanNodeStatus::Invalidated)]);
@@ -2396,11 +2429,14 @@ mod tests {
             status: PlanNodeStatus::Draft,
             reason: Some("Umweg".to_owned()),
         };
-        let err = validate(&plan, &action).unwrap_err();
+        let Err(err) = validate(&plan, &action) else {
+            return Err(TestError::Unexpected("Fehler erwartet".to_owned()));
+        };
         assert!(
             matches!(&err, PlanError::IllegalTransition { to, .. } if to.contains("Reopen")),
             "SetStatus darf den Reopen-Übergang nicht gehen, err={err}"
         );
+        Ok(())
     }
 
     #[test]
@@ -2501,18 +2537,21 @@ mod tests {
     }
 
     #[test]
-    fn test_condense_rejects_wrong_superseded_kind() {
+    fn test_condense_rejects_wrong_superseded_kind() -> TestResult {
         let plan = make_plan(vec![condensable("c1", PlanNodeKind::Coding)]);
         let action = PlanAction::Condense {
             superseded: vec![TaskId::new("c1")],
             replacement: replacement_contract(),
             summary: "Zusammenfassung".to_owned(),
         };
-        let err = validate(&plan, &action).unwrap_err();
+        let Err(err) = validate(&plan, &action) else {
+            return Err(TestError::Unexpected("Fehler erwartet".to_owned()));
+        };
         assert!(
             matches!(&err, PlanError::IllegalTransition { from, .. } if from.contains("Coding")),
             "ein Coding-Knoten ist nicht verdichtbar, err={err}"
         );
+        Ok(())
     }
 
     #[test]
@@ -2532,7 +2571,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condense_rejects_non_contract_replacement() {
+    fn test_condense_rejects_non_contract_replacement() -> TestResult {
         let plan = make_plan(vec![condensable("r1", PlanNodeKind::Research)]);
         let mut replacement = replacement_contract();
         replacement.kind = PlanNodeKind::Coding;
@@ -2541,11 +2580,14 @@ mod tests {
             replacement,
             summary: "Zusammenfassung".to_owned(),
         };
-        let err = validate(&plan, &action).unwrap_err();
+        let Err(err) = validate(&plan, &action) else {
+            return Err(TestError::Unexpected("Fehler erwartet".to_owned()));
+        };
         assert!(
             matches!(&err, PlanError::IllegalTransition { to, .. } if to.contains("Contract")),
             "der Ersatzknoten muss ein Contract sein, err={err}"
         );
+        Ok(())
     }
 
     #[test]
@@ -2652,14 +2694,16 @@ mod tests {
             PlanNodeStatus::Invalidated
         ));
         let plan = make_plan(vec![make_node("t1", PlanNodeStatus::Draft)]);
-        assert!(check(
-            &plan,
-            &PlanAction::Invalidate {
-                ids: vec![TaskId::new("t1")],
-                condition: InvalidationCondition::ManualInvalidate,
-            }
-        )
-        .is_ok());
+        assert!(
+            check(
+                &plan,
+                &PlanAction::Invalidate {
+                    ids: vec![TaskId::new("t1")],
+                    condition: InvalidationCondition::ManualInvalidate,
+                }
+            )
+            .is_ok()
+        );
     }
 
     /// Punkt 3: ein Finding mit Zukunfts-Zeitstempel ist keine frische
@@ -2757,7 +2801,10 @@ mod tests {
         };
 
         assert!(
-            matches!(check(&plan, &edge("done", "draft")), Err(PlanError::NodeSealed { .. })),
+            matches!(
+                check(&plan, &edge("done", "draft")),
+                Err(PlanError::NodeSealed { .. })
+            ),
             "versiegelter Kind-Knoten"
         );
         assert!(
@@ -2811,7 +2858,13 @@ mod tests {
                 },
             );
             assert!(
-                matches!(result, Err(PlanError::InvalidId { field: "PlanId", .. })),
+                matches!(
+                    result,
+                    Err(PlanError::InvalidId {
+                        field: "PlanId",
+                        ..
+                    })
+                ),
                 "{raw:?} war: {result:?}"
             );
         }

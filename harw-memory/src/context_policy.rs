@@ -412,6 +412,7 @@ mod tests {
     use super::*;
     use crate::file_store::FileMemoryStore;
     use crate::short_term::{ShortTermMemory, StmRole};
+    use crate::test_support::{TestResult, ctx};
 
     /// Erzeugt ein eindeutiges temporäres Verzeichnis.
     fn tmp_root(tag: &str) -> std::path::PathBuf {
@@ -424,10 +425,10 @@ mod tests {
     }
 
     /// Erzeugt einen `FileMemoryStore` in einem frischen Temp-Verzeichnis.
-    fn open_store(tag: &str) -> (FileMemoryStore, std::path::PathBuf) {
+    fn open_store(tag: &str) -> TestResult<(FileMemoryStore, std::path::PathBuf)> {
         let root = tmp_root(tag);
-        let store = FileMemoryStore::open(&root).expect("open store");
-        (store, root)
+        let store = FileMemoryStore::open(&root).map_err(ctx("open store"))?;
+        Ok((store, root))
     }
 
     // ── Test 1: Budgets skalieren mit Policy ──────────────────────────────────
@@ -462,32 +463,34 @@ mod tests {
     ///
     /// Spezifikation: `render_turn_context` Schritt 3–6.
     #[test]
-    fn render_returns_all_three_sections() {
-        let (store, root) = open_store("all-sections");
+    fn render_returns_all_three_sections() -> TestResult {
+        let (store, root) = open_store("all-sections")?;
 
         // HOT: Datei schreiben.
-        std::fs::write(root.join("HOT.md"), "Regel A: keine Emojis.\n").unwrap();
+        std::fs::write(root.join("HOT.md"), "Regel A: keine Emojis.\n")
+            .map_err(ctx("HOT.md schreiben"))?;
 
         // WARM: Namespace-Datei schreiben.
-        std::fs::create_dir_all(root.join("warm/project")).unwrap();
+        std::fs::create_dir_all(root.join("warm/project")).map_err(ctx("warm/project anlegen"))?;
         std::fs::write(
             root.join("warm/project/harwness.md"),
             "Harwness-Projektnotiz.\n",
         )
-        .unwrap();
+        .map_err(ctx("warm-Datei schreiben"))?;
 
         // STM: einen Eintrag pushen.
         let stm = ShortTermMemory::new("s-all", 32, 2048);
         stm.push(StmRole::User, 80, "Wie geht das?");
 
-        let ctx =
-            render_turn_context(&store, &stm, ContextPolicy::Balanced, None, &[]).expect("render");
+        let turn_ctx = render_turn_context(&store, &stm, ContextPolicy::Balanced, None, &[])
+            .map_err(ctx("render"))?;
 
-        assert!(!ctx.hot.is_empty(), "hot must not be empty");
-        assert!(!ctx.stm.is_empty(), "stm must not be empty");
-        assert!(!ctx.warm.is_empty(), "warm must not be empty");
+        assert!(!turn_ctx.hot.is_empty(), "hot must not be empty");
+        assert!(!turn_ctx.stm.is_empty(), "stm must not be empty");
+        assert!(!turn_ctx.warm.is_empty(), "warm must not be empty");
 
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // ── Test 3: WARM-Limit wird respektiert ───────────────────────────────────
@@ -497,33 +500,35 @@ mod tests {
     ///
     /// Spezifikation: `ContextBudget::tight().warm_limit == 3`.
     #[test]
-    fn render_respects_warm_limit() {
-        let (store, root) = open_store("warm-limit");
+    fn render_respects_warm_limit() -> TestResult {
+        let (store, root) = open_store("warm-limit")?;
 
         // 5 WARM-Namespaces anlegen.
         for i in 0..5usize {
-            std::fs::write(root.join(format!("warm/ns{i}.md")), format!("Inhalt {i}\n")).unwrap();
+            std::fs::write(root.join(format!("warm/ns{i}.md")), format!("Inhalt {i}\n"))
+                .map_err(ctx("warm-Datei schreiben"))?;
         }
 
         let stm = ShortTermMemory::new("s-wl", 32, 2048);
 
-        let ctx = render_turn_context(
+        let turn_ctx = render_turn_context(
             &store,
             &stm,
             ContextPolicy::TightSelect, // warm_limit = 3
             None,
             &[],
         )
-        .expect("render");
+        .map_err(ctx("render"))?;
 
         assert_eq!(
-            ctx.warm.len(),
+            turn_ctx.warm.len(),
             3,
             "TightSelect warm_limit=3 must cap warm at 3; got {}",
-            ctx.warm.len()
+            turn_ctx.warm.len()
         );
 
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // ── Test 4: HOT wird gekürzt wenn zu groß ─────────────────────────────────
@@ -537,23 +542,23 @@ mod tests {
     ///
     /// Spezifikation: `truncate_hot_to_tokens`, Schritt 3.
     #[test]
-    fn render_hot_truncates_when_too_large() {
-        let (store, root) = open_store("hot-truncate");
+    fn render_hot_truncates_when_too_large() -> TestResult {
+        let (store, root) = open_store("hot-truncate")?;
 
         // 100 Zeilen à 40 Zeichen → 4 000 Bytes → ~1 000 Token-Schätzung.
         // TightSelect hot_tokens_max = 2 000 * 40 / 100 = 800 Tokens → Kürzung nötig.
         let content: String = (0..100)
             .map(|i| format!("Zeile{:03}: {}\n", i, "x".repeat(30)))
             .collect();
-        std::fs::write(root.join("HOT.md"), &content).unwrap();
+        std::fs::write(root.join("HOT.md"), &content).map_err(ctx("HOT.md schreiben"))?;
 
         let stm = ShortTermMemory::new("s-ht", 32, 2048);
 
-        let ctx = render_turn_context(&store, &stm, ContextPolicy::TightSelect, None, &[])
-            .expect("render");
+        let turn_ctx = render_turn_context(&store, &stm, ContextPolicy::TightSelect, None, &[])
+            .map_err(ctx("render"))?;
 
         let original_len = content.len();
-        let rendered_len = ctx.hot.len();
+        let rendered_len = turn_ctx.hot.len();
 
         assert!(
             rendered_len < original_len,
@@ -562,13 +567,14 @@ mod tests {
 
         // Token-Schätzung muss unter hot_tokens_max liegen.
         let hot_tokens_max = 2_000 * 40 / 100; // = 800
-        let rendered_tokens = ctx.hot.len() / 4;
+        let rendered_tokens = turn_ctx.hot.len() / 4;
         assert!(
             rendered_tokens <= hot_tokens_max,
             "hot token estimate {rendered_tokens} must be <= {hot_tokens_max}"
         );
 
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // ── Test 5: Leerer Store → leerer Kontext ─────────────────────────────────
@@ -578,22 +584,23 @@ mod tests {
     ///
     /// Spezifikation: Schritt 6.
     #[test]
-    fn render_empty_store_produces_empty_context() {
-        let (store, root) = open_store("empty");
+    fn render_empty_store_produces_empty_context() -> TestResult {
+        let (store, root) = open_store("empty")?;
         let stm = ShortTermMemory::new("s-empty", 32, 2048);
 
-        let ctx =
-            render_turn_context(&store, &stm, ContextPolicy::Balanced, None, &[]).expect("render");
+        let turn_ctx = render_turn_context(&store, &stm, ContextPolicy::Balanced, None, &[])
+            .map_err(ctx("render"))?;
 
         assert_eq!(
-            ctx.token_estimate, 0,
+            turn_ctx.token_estimate, 0,
             "empty store + empty STM must yield token_estimate 0"
         );
-        assert!(ctx.hot.is_empty());
-        assert!(ctx.stm.is_empty());
-        assert!(ctx.warm.is_empty());
+        assert!(turn_ctx.hot.is_empty());
+        assert!(turn_ctx.stm.is_empty());
+        assert!(turn_ctx.warm.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // ── Test 6: Serde snake_case ──────────────────────────────────────────────
@@ -602,23 +609,26 @@ mod tests {
     ///
     /// Spezifikation: `#[serde(rename_all = "snake_case")]`.
     #[test]
-    fn context_policy_serde_snake_case() {
-        let json =
-            serde_json::to_string(&ContextPolicy::BroadContext).expect("serialize BroadContext");
+    fn context_policy_serde_snake_case() -> TestResult {
+        let json = serde_json::to_string(&ContextPolicy::BroadContext)
+            .map_err(ctx("serialize BroadContext"))?;
         assert_eq!(json, r#""broad_context""#);
 
-        let back: ContextPolicy = serde_json::from_str(&json).expect("deserialize BroadContext");
+        let back: ContextPolicy =
+            serde_json::from_str(&json).map_err(ctx("deserialize BroadContext"))?;
         assert_eq!(back, ContextPolicy::BroadContext);
 
         // Auch die anderen Varianten prüfen.
         assert_eq!(
-            serde_json::to_string(&ContextPolicy::TightSelect).unwrap(),
+            serde_json::to_string(&ContextPolicy::TightSelect)
+                .map_err(ctx("serialize TightSelect"))?,
             r#""tight_select""#
         );
         assert_eq!(
-            serde_json::to_string(&ContextPolicy::Balanced).unwrap(),
+            serde_json::to_string(&ContextPolicy::Balanced).map_err(ctx("serialize Balanced"))?,
             r#""balanced""#
         );
+        Ok(())
     }
 
     // ── Test 7: for_policy stimmt mit Konstanten überein ─────────────────────

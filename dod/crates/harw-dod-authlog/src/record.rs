@@ -62,6 +62,7 @@ pub struct AuthRecord {
 #[cfg(test)]
 mod tests {
     use super::AuthRecord;
+    use crate::test_support::{TestError, TestResult};
     use harw_dod_signals::{Actor, AuthOutcome};
     use jiff::Timestamp;
 
@@ -85,9 +86,14 @@ mod tests {
     }
 
     #[test]
-    fn test_auth_record_uid_and_auid_can_diverge() {
+    fn test_auth_record_uid_and_auid_can_diverge() -> TestResult {
         let record = record();
-        assert_ne!(record.actor.uid, record.actor.auid.expect("auid present"));
+        let auid = record
+            .actor
+            .auid
+            .ok_or(TestError::Missing("auid present"))?;
+        assert_ne!(record.actor.uid, auid);
+        Ok(())
     }
 
     #[test]

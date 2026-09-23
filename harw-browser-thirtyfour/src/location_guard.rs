@@ -67,17 +67,19 @@ where
             return Err(error);
         }
     }
-    tracing::trace!(windows = locations.len(), "browser locations within origin policy");
+    tracing::trace!(
+        windows = locations.len(),
+        "browser locations within origin policy"
+    );
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_browser::error::Error;
-    use harw_browser::policy::{
-        BiDiRequirement, BrowserLimits, OriginPolicy, ProfilePolicy,
-    };
+    use harw_browser::policy::{BiDiRequirement, BrowserLimits, OriginPolicy, ProfilePolicy};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct FakeProbe {
@@ -86,14 +88,15 @@ mod tests {
     }
 
     impl FakeProbe {
-        fn with(locations: &[&str]) -> Self {
-            Self {
-                locations: Ok(locations
-                    .iter()
-                    .map(|value| url::Url::parse(value).expect("valid test url"))
-                    .collect()),
+        fn with(locations: &[&str]) -> TestResult<Self> {
+            let parsed = locations
+                .iter()
+                .map(|value| url::Url::parse(value).map_err(ctx("valid test url")))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Self {
+                locations: Ok(parsed),
                 aborts: AtomicUsize::new(0),
-            }
+            })
         }
     }
 
@@ -113,54 +116,72 @@ mod tests {
         }
     }
 
-    fn request() -> OpenBrowserRequest {
-        OpenBrowserRequest {
-            start_url: url::Url::parse("https://erp.example.com/").expect("valid test url"),
+    fn request() -> TestResult<OpenBrowserRequest> {
+        Ok(OpenBrowserRequest {
+            start_url: url::Url::parse("https://erp.example.com/")
+                .map_err(ctx("valid test url"))?,
             headless: true,
             profile: ProfilePolicy::Ephemeral,
             bidi: BiDiRequirement::NotRequired,
             allowed_origins: OriginPolicy::from_origins(["https://erp.example.com"], true)
-                .expect("valid test policy"),
+                .map_err(ctx("valid test policy"))?,
             authentication_origins: OriginPolicy::from_origins(["https://sso.example.com"], true)
-                .expect("valid test policy"),
+                .map_err(ctx("valid test policy"))?,
             viewport: None,
             limits: BrowserLimits::default(),
-        }
+        })
     }
 
     #[tokio::test]
-    async fn test_enforce_location_policy_allows_policy_and_auth_origins() {
-        let probe = FakeProbe::with(&["https://erp.example.com/inbox", "https://sso.example.com/login"]);
-        enforce_location_policy(&probe, &request())
+    async fn test_enforce_location_policy_allows_policy_and_auth_origins() -> TestResult {
+        let probe = FakeProbe::with(&[
+            "https://erp.example.com/inbox",
+            "https://sso.example.com/login",
+        ])?;
+        enforce_location_policy(&probe, &request()?)
             .await
-            .expect("allowed locations pass");
+            .map_err(ctx("allowed locations pass"))?;
         assert_eq!(probe.aborts.load(Ordering::SeqCst), 0);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_enforce_location_policy_redirect_outside_policy_aborts_session() {
-        let probe = FakeProbe::with(&["https://erp.example.com/", "https://evil.example.net/phish"]);
-        match enforce_location_policy(&probe, &request()).await {
-            Err(Error::OriginNotAllowed { origin }) => assert_eq!(origin, "https://evil.example.net"),
-            other => panic!("expected origin violation, got {other:?}"),
+    async fn test_enforce_location_policy_redirect_outside_policy_aborts_session() -> TestResult {
+        let probe =
+            FakeProbe::with(&["https://erp.example.com/", "https://evil.example.net/phish"])?;
+        match enforce_location_policy(&probe, &request()?).await {
+            Err(Error::OriginNotAllowed { origin }) => {
+                assert_eq!(origin, "https://evil.example.net")
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected origin violation, got {other:?}"
+                )));
+            }
         }
         assert_eq!(probe.aborts.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_enforce_location_policy_file_and_blank_locations_abort_session() {
-        for location in ["file:///etc/passwd", "about:blank", "http://127.0.0.1:4444/session"] {
-            let probe = FakeProbe::with(&[location]);
+    async fn test_enforce_location_policy_file_and_blank_locations_abort_session() -> TestResult {
+        for location in [
+            "file:///etc/passwd",
+            "about:blank",
+            "http://127.0.0.1:4444/session",
+        ] {
+            let probe = FakeProbe::with(&[location])?;
             assert!(
-                enforce_location_policy(&probe, &request()).await.is_err(),
+                enforce_location_policy(&probe, &request()?).await.is_err(),
                 "{location} must be rejected"
             );
             assert_eq!(probe.aborts.load(Ordering::SeqCst), 1, "{location}");
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_enforce_location_policy_unreadable_locations_fail_closed() {
+    async fn test_enforce_location_policy_unreadable_locations_fail_closed() -> TestResult {
         let probe = FakeProbe {
             locations: Err(Error::Timeout {
                 detail: "unused".to_owned(),
@@ -168,9 +189,10 @@ mod tests {
             aborts: AtomicUsize::new(0),
         };
         assert!(matches!(
-            enforce_location_policy(&probe, &request()).await,
+            enforce_location_policy(&probe, &request()?).await,
             Err(Error::CapabilityUnavailable { .. })
         ));
         assert_eq!(probe.aborts.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 }

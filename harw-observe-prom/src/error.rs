@@ -80,6 +80,7 @@ pub enum PromError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     fn io_error() -> std::io::Error {
         std::io::Error::new(std::io::ErrorKind::AddrInUse, "already in use")
@@ -121,10 +122,11 @@ mod tests {
     }
 
     #[test]
-    fn test_prom_result_alias_exists() {
+    fn test_prom_result_alias_exists() -> TestResult {
         fn make() -> PromResult<u8> {
             Ok(1)
         }
-        assert_eq!(make().unwrap(), 1);
+        assert_eq!(make().map_err(ctx("prom result alias"))?, 1);
+        Ok(())
     }
 }

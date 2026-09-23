@@ -205,8 +205,9 @@ impl ProofKey {
     /// assert!(ProofKey::try_from_slice(&[0u8; 31]).is_err());
     /// ```
     pub fn try_from_slice(bytes: &[u8]) -> Result<Self, ProofError> {
-        let array: [u8; blake3::KEY_LEN] =
-            bytes.try_into().map_err(|_| ProofError::InvalidKeyMaterial)?;
+        let array: [u8; blake3::KEY_LEN] = bytes
+            .try_into()
+            .map_err(|_| ProofError::InvalidKeyMaterial)?;
         Ok(Self(array))
     }
 
@@ -404,10 +405,7 @@ impl ProofPolicy {
 fn path_components(path: &str) -> Option<Vec<&str>> {
     let parts: Vec<&str> = path.split('/').collect();
     let valid = parts.iter().all(|part| {
-        !part.is_empty()
-            && *part != "."
-            && *part != ".."
-            && !part.chars().any(char::is_control)
+        !part.is_empty() && *part != "." && *part != ".." && !part.chars().any(char::is_control)
     });
     valid.then_some(parts)
 }
@@ -615,7 +613,9 @@ impl SignedAuthorization {
             return Err(ProofError::TtlOutOfPolicy);
         }
         let latest_issue = now
-            .checked_add(SignedDuration::from_secs(i64::from(policy.effective_skew())))
+            .checked_add(SignedDuration::from_secs(i64::from(
+                policy.effective_skew(),
+            )))
             .map_err(|_| ProofError::TimestampOutOfRange)?;
         if self.issued_at > latest_issue {
             return Err(ProofError::NotYetValid);
@@ -786,12 +786,13 @@ impl VerifiedAuthorization {
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyId, KeyRing, MemoryNonceLedger, NonceLedger, ProofKey, ProofPolicy,
-        SignedAuthorization, WARDEN_PROTOCOL_VERSION,
+        KeyId, KeyRing, MemoryNonceLedger, NonceLedger, ProofKey, ProofPolicy, SignedAuthorization,
+        WARDEN_PROTOCOL_VERSION,
     };
     use crate::action::WardenAction;
     use crate::error::ProofError;
     use crate::stage::EscalationStage;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_types::CgroupId;
     use jiff::Timestamp;
 
@@ -799,36 +800,39 @@ mod tests {
     const KEY_B: [u8; 32] = [0xb2; 32];
     const NONCE: [u8; 16] = [0x42; 16];
 
-    fn cgroup(id: &str) -> CgroupId {
-        CgroupId::try_from_str(id).expect("non-empty id")
+    fn cgroup(id: &str) -> TestResult<CgroupId> {
+        CgroupId::try_from_str(id).map_err(ctx("non-empty id"))
     }
 
-    fn t0() -> Timestamp {
-        Timestamp::new(1_800_000_000, 123_456_789).expect("valid timestamp")
+    fn t0() -> TestResult<Timestamp> {
+        Timestamp::new(1_800_000_000, 123_456_789).map_err(ctx("valid timestamp"))
     }
 
-    fn at(offset_secs: i64) -> Timestamp {
-        Timestamp::new(1_800_000_000 + offset_secs, 123_456_789).expect("valid timestamp")
+    fn at(offset_secs: i64) -> TestResult<Timestamp> {
+        Timestamp::new(1_800_000_000 + offset_secs, 123_456_789).map_err(ctx("valid timestamp"))
     }
 
-    fn key_id(id: &str) -> KeyId {
-        KeyId::new(id).expect("valid key id")
+    fn key_id(id: &str) -> TestResult<KeyId> {
+        KeyId::new(id).map_err(ctx("valid key id"))
     }
 
-    fn ring_with(entries: &[(&str, [u8; 32])]) -> KeyRing {
+    fn ring_with(entries: &[(&str, [u8; 32])]) -> TestResult<KeyRing> {
         let mut ring = KeyRing::new();
         for (id, bytes) in entries {
-            ring.insert(key_id(id), ProofKey::from_bytes(*bytes)).expect("unique id");
+            ring.insert(key_id(id)?, ProofKey::from_bytes(*bytes))
+                .map_err(ctx("unique id"))?;
         }
-        ring
+        Ok(ring)
     }
 
-    fn policy() -> ProofPolicy {
-        ProofPolicy::new(120, 5, vec!["harw.slice".to_owned()]).expect("valid policy")
+    fn policy() -> TestResult<ProofPolicy> {
+        ProofPolicy::new(120, 5, vec!["harw.slice".to_owned()]).map_err(ctx("valid policy"))
     }
 
-    fn freeze(id: &str) -> WardenAction {
-        WardenAction::FreezeCgroup { cgroup: cgroup(id) }
+    fn freeze(id: &str) -> TestResult<WardenAction> {
+        Ok(WardenAction::FreezeCgroup {
+            cgroup: cgroup(id)?,
+        })
     }
 
     fn sign_with(
@@ -838,17 +842,17 @@ mod tests {
         stage: EscalationStage,
         nonce: [u8; 16],
         ttl: u32,
-    ) -> SignedAuthorization {
-        SignedAuthorization::sign(
+    ) -> TestResult<SignedAuthorization> {
+        Ok(SignedAuthorization::sign(
             &ProofKey::from_bytes(key),
-            &key_id(kid),
+            &key_id(kid)?,
             action,
             stage,
             action.cgroup(),
             nonce,
-            t0(),
+            t0()?,
             ttl,
-        )
+        ))
     }
 
     // Ledger, der nur Aufrufe zählt — beweist, ob er erreicht wurde.
@@ -864,290 +868,619 @@ mod tests {
     // -- Roundtrip ---------------------------------------------------------
 
     #[test]
-    fn test_verify_roundtrip_succeeds_and_reports_bound_values() {
-        let action = freeze("harw.slice/job-1");
-        let auth = sign_with(KEY_A, "k1", &action, EscalationStage::RuleTriggered, NONCE, 60);
+    fn test_verify_roundtrip_succeeds_and_reports_bound_values() -> TestResult {
+        let action = freeze("harw.slice/job-1")?;
+        let auth = sign_with(
+            KEY_A,
+            "k1",
+            &action,
+            EscalationStage::RuleTriggered,
+            NONCE,
+            60,
+        )?;
         let ledger = MemoryNonceLedger::new();
         let verified = auth
-            .verify(&ring_with(&[("k1", KEY_A)]), &action, at(10), &policy(), &ledger)
-            .expect("verifies");
+            .verify(
+                &ring_with(&[("k1", KEY_A)])?,
+                &action,
+                at(10)?,
+                &policy()?,
+                &ledger,
+            )
+            .map_err(ctx("verifies"))?;
         assert_eq!(verified.key_id().as_str(), "k1");
         assert_eq!(verified.stage(), EscalationStage::RuleTriggered);
         assert_eq!(verified.cgroup(), action.cgroup());
         assert_eq!(verified.action_digest(), action.binding_digest());
         assert_eq!(verified.nonce(), &NONCE);
-        assert_eq!(verified.issued_at(), t0());
-        assert_eq!(verified.expires_at(), at(60));
-        assert_eq!(ledger.recorded_count().unwrap(), 1);
+        assert_eq!(verified.issued_at(), t0()?);
+        assert_eq!(verified.expires_at(), at(60)?);
+        assert_eq!(ledger.recorded_count().map_err(ctx("recorded_count"))?, 1);
+        Ok(())
     }
 
     #[test]
-    fn test_sign_serde_roundtrip_preserves_mac_validity() {
-        let action = freeze("harw.slice/job-1");
-        let auth = sign_with(KEY_A, "k1", &action, EscalationStage::Escalated, NONCE, 30);
-        let json = serde_json::to_string(&auth).expect("serializes");
-        let back: SignedAuthorization = serde_json::from_str(&json).expect("deserializes");
+    fn test_sign_serde_roundtrip_preserves_mac_validity() -> TestResult {
+        let action = freeze("harw.slice/job-1")?;
+        let auth = sign_with(KEY_A, "k1", &action, EscalationStage::Escalated, NONCE, 30)?;
+        let json = serde_json::to_string(&auth).map_err(ctx("serializes"))?;
+        let back: SignedAuthorization = serde_json::from_str(&json).map_err(ctx("deserializes"))?;
         assert_eq!(back, auth);
         assert_eq!(back.version(), WARDEN_PROTOCOL_VERSION);
-        assert!(back
-            .verify(&ring_with(&[("k1", KEY_A)]), &action, t0(), &policy(), &MemoryNonceLedger::new())
-            .is_ok());
+        assert!(
+            back.verify(
+                &ring_with(&[("k1", KEY_A)])?,
+                &action,
+                t0()?,
+                &policy()?,
+                &MemoryNonceLedger::new()
+            )
+            .is_ok()
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_deserialize_rejects_unknown_field_and_bad_hex() {
-        let action = freeze("harw.slice/job-1");
-        let auth = sign_with(KEY_A, "k1", &action, EscalationStage::Escalated, NONCE, 30);
-        let mut value = serde_json::to_value(&auth).unwrap();
-        value.as_object_mut().unwrap().insert("extra".to_owned(), serde_json::Value::Bool(true));
+    fn test_deserialize_rejects_unknown_field_and_bad_hex() -> TestResult {
+        let action = freeze("harw.slice/job-1")?;
+        let auth = sign_with(KEY_A, "k1", &action, EscalationStage::Escalated, NONCE, 30)?;
+        let mut value = serde_json::to_value(&auth).map_err(ctx("to_value"))?;
+        value
+            .as_object_mut()
+            .ok_or(TestError::Missing("json object"))?
+            .insert("extra".to_owned(), serde_json::Value::Bool(true));
         assert!(serde_json::from_value::<SignedAuthorization>(value).is_err());
 
-        let mut value = serde_json::to_value(&auth).unwrap();
+        let mut value = serde_json::to_value(&auth).map_err(ctx("to_value"))?;
         value["mac"] = serde_json::Value::String("AB".repeat(32));
         assert!(serde_json::from_value::<SignedAuthorization>(value).is_err());
+        Ok(())
     }
 
     // -- falscher Key / Key-ID ----------------------------------------------
 
     #[test]
-    fn test_verify_wrong_key_returns_bad_mac() {
-        let action = freeze("harw.slice/job-1");
-        let auth = sign_with(KEY_B, "k1", &action, EscalationStage::RuleTriggered, NONCE, 60);
-        let err = auth
-            .verify(&ring_with(&[("k1", KEY_A)]), &action, t0(), &policy(), &MemoryNonceLedger::new())
-            .unwrap_err();
+    fn test_verify_wrong_key_returns_bad_mac() -> TestResult {
+        let action = freeze("harw.slice/job-1")?;
+        let auth = sign_with(
+            KEY_B,
+            "k1",
+            &action,
+            EscalationStage::RuleTriggered,
+            NONCE,
+            60,
+        )?;
+        let Err(err) = auth.verify(
+            &ring_with(&[("k1", KEY_A)])?,
+            &action,
+            t0()?,
+            &policy()?,
+            &MemoryNonceLedger::new(),
+        ) else {
+            return Err(TestError::Unexpected(
+                "wrong key must fail verification".to_owned(),
+            ));
+        };
         assert!(matches!(err, ProofError::BadMac));
+        Ok(())
     }
 
     #[test]
-    fn test_verify_unknown_key_id_returns_unknown_key_id() {
-        let action = freeze("harw.slice/job-1");
-        let auth = sign_with(KEY_A, "k9", &action, EscalationStage::RuleTriggered, NONCE, 60);
-        let err = auth
-            .verify(&ring_with(&[("k1", KEY_A)]), &action, t0(), &policy(), &MemoryNonceLedger::new())
-            .unwrap_err();
+    fn test_verify_unknown_key_id_returns_unknown_key_id() -> TestResult {
+        let action = freeze("harw.slice/job-1")?;
+        let auth = sign_with(
+            KEY_A,
+            "k9",
+            &action,
+            EscalationStage::RuleTriggered,
+            NONCE,
+            60,
+        )?;
+        let Err(err) = auth.verify(
+            &ring_with(&[("k1", KEY_A)])?,
+            &action,
+            t0()?,
+            &policy()?,
+            &MemoryNonceLedger::new(),
+        ) else {
+            return Err(TestError::Unexpected(
+                "unknown key id must fail verification".to_owned(),
+            ));
+        };
         assert!(matches!(err, ProofError::UnknownKeyId));
+        Ok(())
     }
 
     // -- Manipulation --------------------------------------------------------
 
     #[test]
-    fn test_verify_tampered_action_returns_action_mismatch() {
-        let signed_for = freeze("harw.slice/job-1");
-        let auth = sign_with(KEY_A, "k1", &signed_for, EscalationStage::Escalated, NONCE, 60);
-        let requested = WardenAction::KillProcessTree { cgroup: cgroup("harw.slice/job-1") };
+    fn test_verify_tampered_action_returns_action_mismatch() -> TestResult {
+        let signed_for = freeze("harw.slice/job-1")?;
+        let auth = sign_with(
+            KEY_A,
+            "k1",
+            &signed_for,
+            EscalationStage::Escalated,
+            NONCE,
+            60,
+        )?;
+        let requested = WardenAction::KillProcessTree {
+            cgroup: cgroup("harw.slice/job-1")?,
+        };
         let ledger = MemoryNonceLedger::new();
-        let err = auth
-            .verify(&ring_with(&[("k1", KEY_A)]), &requested, t0(), &policy(), &ledger)
-            .unwrap_err();
+        let Err(err) = auth.verify(
+            &ring_with(&[("k1", KEY_A)])?,
+            &requested,
+            t0()?,
+            &policy()?,
+            &ledger,
+        ) else {
+            return Err(TestError::Unexpected(
+                "tampered action must fail verification".to_owned(),
+            ));
+        };
         assert!(matches!(err, ProofError::ActionMismatch));
-        assert_eq!(ledger.recorded_count().unwrap(), 0, "rejected request must not consume the nonce");
+        assert_eq!(
+            ledger.recorded_count().map_err(ctx("recorded_count"))?,
+            0,
+            "rejected request must not consume the nonce"
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_verify_tampered_stage_in_wire_returns_bad_mac() {
-        let action = WardenAction::KillProcessTree { cgroup: cgroup("harw.slice/job-1") };
-        let auth = sign_with(KEY_A, "k1", &action, EscalationStage::RuleTriggered, NONCE, 60);
-        let mut value = serde_json::to_value(&auth).unwrap();
-        value["stage"] = serde_json::Value::String("escalated".to_owned());
-        let forged: SignedAuthorization = serde_json::from_value(value).expect("shape is valid");
-        let err = forged
-            .verify(&ring_with(&[("k1", KEY_A)]), &action, t0(), &policy(), &MemoryNonceLedger::new())
-            .unwrap_err();
-        assert!(matches!(err, ProofError::BadMac));
-    }
-
-    #[test]
-    fn test_verify_tampered_cgroup_in_wire_returns_bad_mac() {
-        let action = freeze("harw.slice/job-1");
-        let auth = sign_with(KEY_A, "k1", &action, EscalationStage::RuleTriggered, NONCE, 60);
-        let mut value = serde_json::to_value(&auth).unwrap();
-        value["cgroup"] = serde_json::Value::String("harw.slice/job-2".to_owned());
-        let forged: SignedAuthorization = serde_json::from_value(value).expect("shape is valid");
-        let err = forged
-            .verify(&ring_with(&[("k1", KEY_A)]), &freeze("harw.slice/job-2"), t0(), &policy(), &MemoryNonceLedger::new())
-            .unwrap_err();
-        assert!(matches!(err, ProofError::BadMac));
-    }
-
-    #[test]
-    fn test_verify_signed_stage_too_low_returns_not_admissible() {
-        let action = WardenAction::KillProcessTree { cgroup: cgroup("harw.slice/job-1") };
-        let auth = sign_with(KEY_A, "k1", &action, EscalationStage::RuleTriggered, NONCE, 60);
-        let err = auth
-            .verify(&ring_with(&[("k1", KEY_A)]), &action, t0(), &policy(), &MemoryNonceLedger::new())
-            .unwrap_err();
-        assert!(matches!(err, ProofError::NotAdmissibleAtStage));
-    }
-
-    #[test]
-    fn test_verify_signed_cgroup_differs_from_action_returns_cgroup_mismatch() {
-        let action = freeze("harw.slice/job-1");
-        let auth = SignedAuthorization::sign(
-            &ProofKey::from_bytes(KEY_A),
-            &key_id("k1"),
+    fn test_verify_tampered_stage_in_wire_returns_bad_mac() -> TestResult {
+        let action = WardenAction::KillProcessTree {
+            cgroup: cgroup("harw.slice/job-1")?,
+        };
+        let auth = sign_with(
+            KEY_A,
+            "k1",
             &action,
             EscalationStage::RuleTriggered,
-            &cgroup("harw.slice/job-2"),
             NONCE,
-            t0(),
             60,
-        );
-        let err = auth
-            .verify(&ring_with(&[("k1", KEY_A)]), &action, t0(), &policy(), &MemoryNonceLedger::new())
-            .unwrap_err();
-        assert!(matches!(err, ProofError::CgroupMismatch));
+        )?;
+        let mut value = serde_json::to_value(&auth).map_err(ctx("to_value"))?;
+        value["stage"] = serde_json::Value::String("escalated".to_owned());
+        let forged: SignedAuthorization =
+            serde_json::from_value(value).map_err(ctx("shape is valid"))?;
+        let Err(err) = forged.verify(
+            &ring_with(&[("k1", KEY_A)])?,
+            &action,
+            t0()?,
+            &policy()?,
+            &MemoryNonceLedger::new(),
+        ) else {
+            return Err(TestError::Unexpected(
+                "tampered stage must fail verification".to_owned(),
+            ));
+        };
+        assert!(matches!(err, ProofError::BadMac));
+        Ok(())
     }
 
     #[test]
-    fn test_verify_cgroup_outside_prefix_returns_cgroup_not_allowed() {
-        let ring = ring_with(&[("k1", KEY_A)]);
-        for target in ["user.slice", "harw.slice", "harw.slice2/job", "harw.slice/../user.slice"] {
-            let action = freeze(target);
-            let auth = sign_with(KEY_A, "k1", &action, EscalationStage::RuleTriggered, NONCE, 60);
-            let err = auth
-                .verify(&ring, &action, t0(), &policy(), &MemoryNonceLedger::new())
-                .unwrap_err();
-            assert!(matches!(err, ProofError::CgroupNotAllowed), "target {target}");
+    fn test_verify_tampered_cgroup_in_wire_returns_bad_mac() -> TestResult {
+        let action = freeze("harw.slice/job-1")?;
+        let auth = sign_with(
+            KEY_A,
+            "k1",
+            &action,
+            EscalationStage::RuleTriggered,
+            NONCE,
+            60,
+        )?;
+        let mut value = serde_json::to_value(&auth).map_err(ctx("to_value"))?;
+        value["cgroup"] = serde_json::Value::String("harw.slice/job-2".to_owned());
+        let forged: SignedAuthorization =
+            serde_json::from_value(value).map_err(ctx("shape is valid"))?;
+        let Err(err) = forged.verify(
+            &ring_with(&[("k1", KEY_A)])?,
+            &freeze("harw.slice/job-2")?,
+            t0()?,
+            &policy()?,
+            &MemoryNonceLedger::new(),
+        ) else {
+            return Err(TestError::Unexpected(
+                "tampered cgroup must fail verification".to_owned(),
+            ));
+        };
+        assert!(matches!(err, ProofError::BadMac));
+        Ok(())
+    }
+
+    #[test]
+    fn test_verify_signed_stage_too_low_returns_not_admissible() -> TestResult {
+        let action = WardenAction::KillProcessTree {
+            cgroup: cgroup("harw.slice/job-1")?,
+        };
+        let auth = sign_with(
+            KEY_A,
+            "k1",
+            &action,
+            EscalationStage::RuleTriggered,
+            NONCE,
+            60,
+        )?;
+        let Err(err) = auth.verify(
+            &ring_with(&[("k1", KEY_A)])?,
+            &action,
+            t0()?,
+            &policy()?,
+            &MemoryNonceLedger::new(),
+        ) else {
+            return Err(TestError::Unexpected(
+                "stage too low must fail verification".to_owned(),
+            ));
+        };
+        assert!(matches!(err, ProofError::NotAdmissibleAtStage));
+        Ok(())
+    }
+
+    #[test]
+    fn test_verify_signed_cgroup_differs_from_action_returns_cgroup_mismatch() -> TestResult {
+        let action = freeze("harw.slice/job-1")?;
+        let auth = SignedAuthorization::sign(
+            &ProofKey::from_bytes(KEY_A),
+            &key_id("k1")?,
+            &action,
+            EscalationStage::RuleTriggered,
+            &cgroup("harw.slice/job-2")?,
+            NONCE,
+            t0()?,
+            60,
+        );
+        let Err(err) = auth.verify(
+            &ring_with(&[("k1", KEY_A)])?,
+            &action,
+            t0()?,
+            &policy()?,
+            &MemoryNonceLedger::new(),
+        ) else {
+            return Err(TestError::Unexpected(
+                "cgroup mismatch must fail verification".to_owned(),
+            ));
+        };
+        assert!(matches!(err, ProofError::CgroupMismatch));
+        Ok(())
+    }
+
+    #[test]
+    fn test_verify_cgroup_outside_prefix_returns_cgroup_not_allowed() -> TestResult {
+        let ring = ring_with(&[("k1", KEY_A)])?;
+        for target in [
+            "user.slice",
+            "harw.slice",
+            "harw.slice2/job",
+            "harw.slice/../user.slice",
+        ] {
+            let action = freeze(target)?;
+            let auth = sign_with(
+                KEY_A,
+                "k1",
+                &action,
+                EscalationStage::RuleTriggered,
+                NONCE,
+                60,
+            )?;
+            let Err(err) =
+                auth.verify(&ring, &action, t0()?, &policy()?, &MemoryNonceLedger::new())
+            else {
+                return Err(TestError::Unexpected(format!(
+                    "target {target} must fail verification"
+                )));
+            };
+            assert!(
+                matches!(err, ProofError::CgroupNotAllowed),
+                "target {target}"
+            );
         }
+        Ok(())
     }
 
     // -- Zeitfenster ---------------------------------------------------------
 
     #[test]
-    fn test_verify_expired_returns_expired() {
-        let action = freeze("harw.slice/job-1");
-        let auth = sign_with(KEY_A, "k1", &action, EscalationStage::RuleTriggered, NONCE, 60);
-        let ring = ring_with(&[("k1", KEY_A)]);
-        let err = auth
-            .verify(&ring, &action, at(60), &policy(), &MemoryNonceLedger::new())
-            .unwrap_err();
+    fn test_verify_expired_returns_expired() -> TestResult {
+        let action = freeze("harw.slice/job-1")?;
+        let auth = sign_with(
+            KEY_A,
+            "k1",
+            &action,
+            EscalationStage::RuleTriggered,
+            NONCE,
+            60,
+        )?;
+        let ring = ring_with(&[("k1", KEY_A)])?;
+        let Err(err) = auth.verify(
+            &ring,
+            &action,
+            at(60)?,
+            &policy()?,
+            &MemoryNonceLedger::new(),
+        ) else {
+            return Err(TestError::Unexpected(
+                "expired proof must fail verification".to_owned(),
+            ));
+        };
         assert!(matches!(err, ProofError::Expired));
-        assert!(auth.verify(&ring, &action, at(59), &policy(), &MemoryNonceLedger::new()).is_ok());
+        assert!(
+            auth.verify(
+                &ring,
+                &action,
+                at(59)?,
+                &policy()?,
+                &MemoryNonceLedger::new()
+            )
+            .is_ok()
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_verify_issued_in_future_beyond_skew_returns_not_yet_valid() {
-        let action = freeze("harw.slice/job-1");
-        let auth = sign_with(KEY_A, "k1", &action, EscalationStage::RuleTriggered, NONCE, 60);
-        let ring = ring_with(&[("k1", KEY_A)]);
-        let err = auth
-            .verify(&ring, &action, at(-6), &policy(), &MemoryNonceLedger::new())
-            .unwrap_err();
+    fn test_verify_issued_in_future_beyond_skew_returns_not_yet_valid() -> TestResult {
+        let action = freeze("harw.slice/job-1")?;
+        let auth = sign_with(
+            KEY_A,
+            "k1",
+            &action,
+            EscalationStage::RuleTriggered,
+            NONCE,
+            60,
+        )?;
+        let ring = ring_with(&[("k1", KEY_A)])?;
+        let Err(err) = auth.verify(
+            &ring,
+            &action,
+            at(-6)?,
+            &policy()?,
+            &MemoryNonceLedger::new(),
+        ) else {
+            return Err(TestError::Unexpected(
+                "future-issued proof must fail verification".to_owned(),
+            ));
+        };
         assert!(matches!(err, ProofError::NotYetValid));
-        assert!(auth.verify(&ring, &action, at(-5), &policy(), &MemoryNonceLedger::new()).is_ok());
+        assert!(
+            auth.verify(
+                &ring,
+                &action,
+                at(-5)?,
+                &policy()?,
+                &MemoryNonceLedger::new()
+            )
+            .is_ok()
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_verify_ttl_above_max_or_zero_returns_ttl_out_of_policy() {
-        let action = freeze("harw.slice/job-1");
-        let ring = ring_with(&[("k1", KEY_A)]);
+    fn test_verify_ttl_above_max_or_zero_returns_ttl_out_of_policy() -> TestResult {
+        let action = freeze("harw.slice/job-1")?;
+        let ring = ring_with(&[("k1", KEY_A)])?;
         for ttl in [0, 121, u32::MAX] {
-            let auth = sign_with(KEY_A, "k1", &action, EscalationStage::RuleTriggered, NONCE, ttl);
-            let err = auth
-                .verify(&ring, &action, t0(), &policy(), &MemoryNonceLedger::new())
-                .unwrap_err();
+            let auth = sign_with(
+                KEY_A,
+                "k1",
+                &action,
+                EscalationStage::RuleTriggered,
+                NONCE,
+                ttl,
+            )?;
+            let Err(err) =
+                auth.verify(&ring, &action, t0()?, &policy()?, &MemoryNonceLedger::new())
+            else {
+                return Err(TestError::Unexpected(format!("ttl {ttl} must fail")));
+            };
             assert!(matches!(err, ProofError::TtlOutOfPolicy), "ttl {ttl}");
         }
-        let tight = ProofPolicy::new(30, 0, vec!["harw.slice".to_owned()]).unwrap();
-        let auth = sign_with(KEY_A, "k1", &action, EscalationStage::RuleTriggered, NONCE, 31);
-        assert!(matches!(
-            auth.verify(&ring, &action, t0(), &tight, &MemoryNonceLedger::new()).unwrap_err(),
-            ProofError::TtlOutOfPolicy
-        ));
+        let tight =
+            ProofPolicy::new(30, 0, vec!["harw.slice".to_owned()]).map_err(ctx("valid policy"))?;
+        let auth = sign_with(
+            KEY_A,
+            "k1",
+            &action,
+            EscalationStage::RuleTriggered,
+            NONCE,
+            31,
+        )?;
+        let Err(err) = auth.verify(&ring, &action, t0()?, &tight, &MemoryNonceLedger::new()) else {
+            return Err(TestError::Unexpected(
+                "ttl above tight policy must fail".to_owned(),
+            ));
+        };
+        assert!(matches!(err, ProofError::TtlOutOfPolicy));
+        Ok(())
     }
 
     #[test]
-    fn test_verify_mutated_policy_fields_are_capped() {
-        let action = freeze("harw.slice/job-1");
-        let ring = ring_with(&[("k1", KEY_A)]);
-        let mut loose = policy();
+    fn test_verify_mutated_policy_fields_are_capped() -> TestResult {
+        let action = freeze("harw.slice/job-1")?;
+        let ring = ring_with(&[("k1", KEY_A)])?;
+        let mut loose = policy()?;
         loose.max_ttl_secs = 10_000;
-        let auth = sign_with(KEY_A, "k1", &action, EscalationStage::RuleTriggered, NONCE, 600);
-        assert!(matches!(
-            auth.verify(&ring, &action, t0(), &loose, &MemoryNonceLedger::new()).unwrap_err(),
-            ProofError::TtlOutOfPolicy
-        ));
+        let auth = sign_with(
+            KEY_A,
+            "k1",
+            &action,
+            EscalationStage::RuleTriggered,
+            NONCE,
+            600,
+        )?;
+        let Err(err) = auth.verify(&ring, &action, t0()?, &loose, &MemoryNonceLedger::new()) else {
+            return Err(TestError::Unexpected(
+                "mutated policy must still cap ttl".to_owned(),
+            ));
+        };
+        assert!(matches!(err, ProofError::TtlOutOfPolicy));
+        Ok(())
     }
 
     // -- Replay ---------------------------------------------------------------
 
     #[test]
-    fn test_verify_same_nonce_twice_returns_nonce_replayed() {
-        let action = freeze("harw.slice/job-1");
-        let auth = sign_with(KEY_A, "k1", &action, EscalationStage::RuleTriggered, NONCE, 60);
-        let ring = ring_with(&[("k1", KEY_A)]);
+    fn test_verify_same_nonce_twice_returns_nonce_replayed() -> TestResult {
+        let action = freeze("harw.slice/job-1")?;
+        let auth = sign_with(
+            KEY_A,
+            "k1",
+            &action,
+            EscalationStage::RuleTriggered,
+            NONCE,
+            60,
+        )?;
+        let ring = ring_with(&[("k1", KEY_A)])?;
         let ledger = MemoryNonceLedger::new();
-        assert!(auth.verify(&ring, &action, t0(), &policy(), &ledger).is_ok());
-        let err = auth.verify(&ring, &action, at(1), &policy(), &ledger).unwrap_err();
+        assert!(
+            auth.verify(&ring, &action, t0()?, &policy()?, &ledger)
+                .is_ok()
+        );
+        let Err(err) = auth.verify(&ring, &action, at(1)?, &policy()?, &ledger) else {
+            return Err(TestError::Unexpected(
+                "replayed nonce must fail verification".to_owned(),
+            ));
+        };
         assert!(matches!(err, ProofError::NonceReplayed));
+        Ok(())
     }
 
     #[test]
-    fn test_verify_forged_request_does_not_reach_ledger() {
-        let action = freeze("harw.slice/job-1");
-        let forged = sign_with(KEY_B, "k1", &action, EscalationStage::RuleTriggered, NONCE, 60);
+    fn test_verify_forged_request_does_not_reach_ledger() -> TestResult {
+        let action = freeze("harw.slice/job-1")?;
+        let forged = sign_with(
+            KEY_B,
+            "k1",
+            &action,
+            EscalationStage::RuleTriggered,
+            NONCE,
+            60,
+        )?;
         let ledger = CountingLedger(std::cell::Cell::new(0));
-        assert!(forged
-            .verify(&ring_with(&[("k1", KEY_A)]), &action, t0(), &policy(), &ledger)
-            .is_err());
+        assert!(
+            forged
+                .verify(
+                    &ring_with(&[("k1", KEY_A)])?,
+                    &action,
+                    t0()?,
+                    &policy()?,
+                    &ledger
+                )
+                .is_err()
+        );
         assert_eq!(ledger.0.get(), 0);
+        Ok(())
     }
 
     // -- Version --------------------------------------------------------------
 
     #[test]
-    fn test_verify_unknown_version_returns_unsupported_version() {
-        let action = freeze("harw.slice/job-1");
-        let auth = sign_with(KEY_A, "k1", &action, EscalationStage::RuleTriggered, NONCE, 60);
-        let ring = ring_with(&[("k1", KEY_A)]);
+    fn test_verify_unknown_version_returns_unsupported_version() -> TestResult {
+        let action = freeze("harw.slice/job-1")?;
+        let auth = sign_with(
+            KEY_A,
+            "k1",
+            &action,
+            EscalationStage::RuleTriggered,
+            NONCE,
+            60,
+        )?;
+        let ring = ring_with(&[("k1", KEY_A)])?;
         for version in [1u16, 3] {
-            let mut value = serde_json::to_value(&auth).unwrap();
+            let mut value = serde_json::to_value(&auth).map_err(ctx("to_value"))?;
             value["version"] = serde_json::Value::from(version);
-            let other: SignedAuthorization = serde_json::from_value(value).expect("shape is valid");
-            let err = other
-                .verify(&ring, &action, t0(), &policy(), &MemoryNonceLedger::new())
-                .unwrap_err();
+            let other: SignedAuthorization =
+                serde_json::from_value(value).map_err(ctx("shape is valid"))?;
+            let Err(err) =
+                other.verify(&ring, &action, t0()?, &policy()?, &MemoryNonceLedger::new())
+            else {
+                return Err(TestError::Unexpected(format!(
+                    "version {version} must be rejected"
+                )));
+            };
             assert!(matches!(err, ProofError::UnsupportedVersion(v) if v == version));
         }
+        Ok(())
     }
 
     // -- Key-Rotation -----------------------------------------------------------
 
     #[test]
-    fn test_verify_key_rotation_accepts_old_and_new_until_removed() {
-        let action = freeze("harw.slice/job-1");
-        let mut ring = ring_with(&[("old", KEY_A), ("new", KEY_B)]);
-        let by_old = sign_with(KEY_A, "old", &action, EscalationStage::RuleTriggered, [1; 16], 60);
-        let by_new = sign_with(KEY_B, "new", &action, EscalationStage::RuleTriggered, [2; 16], 60);
+    fn test_verify_key_rotation_accepts_old_and_new_until_removed() -> TestResult {
+        let action = freeze("harw.slice/job-1")?;
+        let mut ring = ring_with(&[("old", KEY_A), ("new", KEY_B)])?;
+        let by_old = sign_with(
+            KEY_A,
+            "old",
+            &action,
+            EscalationStage::RuleTriggered,
+            [1; 16],
+            60,
+        )?;
+        let by_new = sign_with(
+            KEY_B,
+            "new",
+            &action,
+            EscalationStage::RuleTriggered,
+            [2; 16],
+            60,
+        )?;
         let ledger = MemoryNonceLedger::new();
-        assert!(by_old.verify(&ring, &action, t0(), &policy(), &ledger).is_ok());
-        assert!(by_new.verify(&ring, &action, t0(), &policy(), &ledger).is_ok());
+        assert!(
+            by_old
+                .verify(&ring, &action, t0()?, &policy()?, &ledger)
+                .is_ok()
+        );
+        assert!(
+            by_new
+                .verify(&ring, &action, t0()?, &policy()?, &ledger)
+                .is_ok()
+        );
 
-        assert!(ring.remove(&key_id("old")));
-        let by_old_again = sign_with(KEY_A, "old", &action, EscalationStage::RuleTriggered, [3; 16], 60);
-        assert!(matches!(
-            by_old_again.verify(&ring, &action, t0(), &policy(), &ledger).unwrap_err(),
-            ProofError::UnknownKeyId
-        ));
+        assert!(ring.remove(&key_id("old")?));
+        let by_old_again = sign_with(
+            KEY_A,
+            "old",
+            &action,
+            EscalationStage::RuleTriggered,
+            [3; 16],
+            60,
+        )?;
+        let Err(err) = by_old_again.verify(&ring, &action, t0()?, &policy()?, &ledger) else {
+            return Err(TestError::Unexpected(
+                "removed key must fail verification".to_owned(),
+            ));
+        };
+        assert!(matches!(err, ProofError::UnknownKeyId));
         // Ein unter der neuen Key-ID mit dem alten Schlüssel signierter Proof scheitert am MAC.
-        let old_key_new_id = sign_with(KEY_A, "new", &action, EscalationStage::RuleTriggered, [4; 16], 60);
-        assert!(matches!(
-            old_key_new_id.verify(&ring, &action, t0(), &policy(), &ledger).unwrap_err(),
-            ProofError::BadMac
-        ));
+        let old_key_new_id = sign_with(
+            KEY_A,
+            "new",
+            &action,
+            EscalationStage::RuleTriggered,
+            [4; 16],
+            60,
+        )?;
+        let Err(err) = old_key_new_id.verify(&ring, &action, t0()?, &policy()?, &ledger) else {
+            return Err(TestError::Unexpected(
+                "old key under new id must fail MAC".to_owned(),
+            ));
+        };
+        assert!(matches!(err, ProofError::BadMac));
+        Ok(())
     }
 
     // -- Konstruktoren / Hilfstypen -------------------------------------------
 
     #[test]
-    fn test_key_id_new_enforces_grammar() {
+    fn test_key_id_new_enforces_grammar() -> TestResult {
         assert!(KeyId::new("a.B_9-z").is_ok());
         assert!(KeyId::new("").is_err());
         assert!(KeyId::new("x".repeat(65)).is_err());
         assert!(KeyId::new("ü").is_err());
         assert!(serde_json::from_str::<KeyId>("\"has space\"").is_err());
-        assert_eq!(key_id("k1").to_string(), "k1");
+        assert_eq!(key_id("k1")?.to_string(), "k1");
+        Ok(())
     }
 
     #[test]
@@ -1156,23 +1489,28 @@ mod tests {
         let debug = format!("{key:?}");
         assert_eq!(debug, "ProofKey(<redacted>)");
         assert!(!debug.contains("90"));
-        assert!(matches!(ProofKey::try_from_slice(&[0; 33]), Err(ProofError::InvalidKeyMaterial)));
+        assert!(matches!(
+            ProofKey::try_from_slice(&[0; 33]),
+            Err(ProofError::InvalidKeyMaterial)
+        ));
         assert!(ProofKey::try_from_slice(&[0; 32]).is_ok());
     }
 
     #[test]
-    fn test_key_ring_insert_rejects_duplicate_and_debug_lists_only_ids() {
+    fn test_key_ring_insert_rejects_duplicate_and_debug_lists_only_ids() -> TestResult {
         let mut ring = KeyRing::new();
         assert!(ring.is_empty());
-        ring.insert(key_id("k1"), ProofKey::from_bytes(KEY_A)).unwrap();
+        ring.insert(key_id("k1")?, ProofKey::from_bytes(KEY_A))
+            .map_err(ctx("unique id"))?;
         assert!(matches!(
-            ring.insert(key_id("k1"), ProofKey::from_bytes(KEY_B)),
+            ring.insert(key_id("k1")?, ProofKey::from_bytes(KEY_B)),
             Err(ProofError::DuplicateKeyId)
         ));
-        assert!(ring.contains(&key_id("k1")));
+        assert!(ring.contains(&key_id("k1")?));
         assert_eq!(ring.len(), 1);
         assert_eq!(format!("{ring:?}"), "KeyRing { key_ids: [\"k1\"] }");
-        assert!(!ring.remove(&key_id("k2")));
+        assert!(!ring.remove(&key_id("k2")?));
+        Ok(())
     }
 
     #[test]
@@ -1186,42 +1524,55 @@ mod tests {
     }
 
     #[test]
-    fn test_proof_policy_allows_cgroup_compares_components() {
-        let policy = ProofPolicy::new(60, 5, vec!["harw.slice/jobs".to_owned()]).unwrap();
-        assert!(policy.allows_cgroup(&cgroup("harw.slice/jobs/j1")));
-        assert!(policy.allows_cgroup(&cgroup("harw.slice/jobs/j1/sub")));
-        assert!(!policy.allows_cgroup(&cgroup("harw.slice/jobs")));
-        assert!(!policy.allows_cgroup(&cgroup("harw.slice/jobsX/j1")));
-        assert!(!policy.allows_cgroup(&cgroup("harw.slice/jobs//j1")));
-        assert!(!policy.allows_cgroup(&cgroup("harw.slice/jobs/./j1")));
-        let empty = ProofPolicy::new(60, 5, vec![]).unwrap();
-        assert!(!empty.allows_cgroup(&cgroup("harw.slice/jobs/j1")));
+    fn test_proof_policy_allows_cgroup_compares_components() -> TestResult {
+        let policy = ProofPolicy::new(60, 5, vec!["harw.slice/jobs".to_owned()])
+            .map_err(ctx("valid policy"))?;
+        assert!(policy.allows_cgroup(&cgroup("harw.slice/jobs/j1")?));
+        assert!(policy.allows_cgroup(&cgroup("harw.slice/jobs/j1/sub")?));
+        assert!(!policy.allows_cgroup(&cgroup("harw.slice/jobs")?));
+        assert!(!policy.allows_cgroup(&cgroup("harw.slice/jobsX/j1")?));
+        assert!(!policy.allows_cgroup(&cgroup("harw.slice/jobs//j1")?));
+        assert!(!policy.allows_cgroup(&cgroup("harw.slice/jobs/./j1")?));
+        let empty = ProofPolicy::new(60, 5, vec![]).map_err(ctx("valid policy"))?;
+        assert!(!empty.allows_cgroup(&cgroup("harw.slice/jobs/j1")?));
+        Ok(())
     }
 
     #[test]
-    fn test_memory_nonce_ledger_prune_expired_removes_only_old_entries() {
+    fn test_memory_nonce_ledger_prune_expired_removes_only_old_entries() -> TestResult {
         let ledger = MemoryNonceLedger::new();
-        ledger.check_and_record(&[1; 16], at(10)).unwrap();
-        ledger.check_and_record(&[2; 16], at(100)).unwrap();
-        assert_eq!(ledger.prune_expired(at(50)).unwrap(), 1);
-        assert_eq!(ledger.recorded_count().unwrap(), 1);
-        assert!(ledger.check_and_record(&[1; 16], at(200)).is_ok());
+        ledger
+            .check_and_record(&[1; 16], at(10)?)
+            .map_err(ctx("check_and_record"))?;
+        ledger
+            .check_and_record(&[2; 16], at(100)?)
+            .map_err(ctx("check_and_record"))?;
+        assert_eq!(
+            ledger
+                .prune_expired(at(50)?)
+                .map_err(ctx("prune_expired"))?,
+            1
+        );
+        assert_eq!(ledger.recorded_count().map_err(ctx("recorded_count"))?, 1);
+        assert!(ledger.check_and_record(&[1; 16], at(200)?).is_ok());
         assert!(matches!(
-            ledger.check_and_record(&[2; 16], at(200)),
+            ledger.check_and_record(&[2; 16], at(200)?),
             Err(ProofError::NonceReplayed)
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_accessors_return_signed_values() {
-        let action = freeze("harw.slice/job-1");
-        let auth = sign_with(KEY_A, "k1", &action, EscalationStage::Escalated, NONCE, 45);
+    fn test_accessors_return_signed_values() -> TestResult {
+        let action = freeze("harw.slice/job-1")?;
+        let auth = sign_with(KEY_A, "k1", &action, EscalationStage::Escalated, NONCE, 45)?;
         assert_eq!(auth.key_id().as_str(), "k1");
         assert_eq!(auth.action_digest(), action.binding_digest());
         assert_eq!(auth.stage(), EscalationStage::Escalated);
         assert_eq!(auth.cgroup(), action.cgroup());
         assert_eq!(auth.nonce(), &NONCE);
-        assert_eq!(auth.issued_at(), t0());
+        assert_eq!(auth.issued_at(), t0()?);
         assert_eq!(auth.ttl_secs(), 45);
+        Ok(())
     }
 }

@@ -136,6 +136,7 @@ impl BoundedCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use std::time::Duration;
     use tokio::io::{AsyncWriteExt, DuplexStream, duplex};
 
@@ -150,7 +151,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn endless_stdout_is_capped_without_eof() {
+    async fn endless_stdout_is_capped_without_eof() -> TestResult {
         let (stdout_writer, mut stdout_reader) = duplex(64 * 1024);
         // stderr bleibt offen und schweigt: Kappung darf nicht auf EOF warten.
         let (_stderr_writer, mut stderr_reader) = duplex(64 * 1024);
@@ -162,8 +163,8 @@ mod tests {
             capture.drain(&mut stdout_reader, &mut stderr_reader),
         )
         .await
-        .expect("capping must not wait for the writer")
-        .expect("duplex read");
+        .map_err(ctx("capping must not wait for the writer"))?
+        .map_err(ctx("duplex read"))?;
 
         assert_eq!(end, DrainEnd::LimitExceeded);
         assert_eq!(capture.stdout().len(), 1001);
@@ -172,12 +173,16 @@ mod tests {
         assert!(capture.limit_exceeded());
 
         drop(stdout_reader);
-        let written = writer.await.expect("writer task");
-        assert!(written >= 1001, "writer must have produced more than the cap");
+        let written = writer.await.map_err(ctx("writer task"))?;
+        assert!(
+            written >= 1001,
+            "writer must have produced more than the cap"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn stderr_flood_is_capped_while_stdout_stays_silent() {
+    async fn stderr_flood_is_capped_while_stdout_stays_silent() -> TestResult {
         let (_stdout_writer, mut stdout_reader) = duplex(64 * 1024);
         let (stderr_writer, mut stderr_reader) = duplex(64 * 1024);
         let writer = tokio::spawn(flood(stderr_writer, b'e'));
@@ -186,21 +191,28 @@ mod tests {
         let end = capture
             .drain(&mut stdout_reader, &mut stderr_reader)
             .await
-            .expect("duplex read");
+            .map_err(ctx("duplex read"))?;
 
         assert_eq!(end, DrainEnd::LimitExceeded);
         assert_eq!(capture.retained(), 10_001);
         assert_eq!(capture.stderr().len(), 10_001);
         drop(stderr_reader);
-        writer.await.expect("writer task");
+        writer.await.map_err(ctx("writer task"))?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn stdout_and_stderr_share_one_budget() {
+    async fn stdout_and_stderr_share_one_budget() -> TestResult {
         let (mut stdout_writer, mut stdout_reader) = duplex(64 * 1024);
         let (mut stderr_writer, mut stderr_reader) = duplex(64 * 1024);
-        stdout_writer.write_all(&[b'o'; 600]).await.expect("write stdout");
-        stderr_writer.write_all(&[b'e'; 600]).await.expect("write stderr");
+        stdout_writer
+            .write_all(&[b'o'; 600])
+            .await
+            .map_err(ctx("write stdout"))?;
+        stderr_writer
+            .write_all(&[b'e'; 600])
+            .await
+            .map_err(ctx("write stderr"))?;
         drop(stdout_writer);
         drop(stderr_writer);
 
@@ -208,18 +220,25 @@ mod tests {
         let end = capture
             .drain(&mut stdout_reader, &mut stderr_reader)
             .await
-            .expect("duplex read");
+            .map_err(ctx("duplex read"))?;
 
         assert_eq!(end, DrainEnd::LimitExceeded);
         assert_eq!(capture.retained(), 1001);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn output_within_budget_reaches_eof_unchanged() {
+    async fn output_within_budget_reaches_eof_unchanged() -> TestResult {
         let (mut stdout_writer, mut stdout_reader) = duplex(1024);
         let (mut stderr_writer, mut stderr_reader) = duplex(1024);
-        stdout_writer.write_all(b"hello").await.expect("write stdout");
-        stderr_writer.write_all(b"warn").await.expect("write stderr");
+        stdout_writer
+            .write_all(b"hello")
+            .await
+            .map_err(ctx("write stdout"))?;
+        stderr_writer
+            .write_all(b"warn")
+            .await
+            .map_err(ctx("write stderr"))?;
         drop(stdout_writer);
         drop(stderr_writer);
 
@@ -227,36 +246,50 @@ mod tests {
         let end = capture
             .drain(&mut stdout_reader, &mut stderr_reader)
             .await
-            .expect("duplex read");
+            .map_err(ctx("duplex read"))?;
 
         assert_eq!(end, DrainEnd::Eof);
         assert_eq!(capture.stdout(), b"hello");
         assert_eq!(capture.stderr(), b"warn");
-        assert!(!capture.limit_exceeded(), "exactly the limit is not an overflow");
+        assert!(
+            !capture.limit_exceeded(),
+            "exactly the limit is not an overflow"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn zero_budget_caps_on_first_byte() {
+    async fn zero_budget_caps_on_first_byte() -> TestResult {
         let (mut stdout_writer, mut stdout_reader) = duplex(1024);
         let (_stderr_writer, mut stderr_reader) = duplex(1024);
-        stdout_writer.write_all(b"ab").await.expect("write stdout");
+        stdout_writer
+            .write_all(b"ab")
+            .await
+            .map_err(ctx("write stdout"))?;
 
         let mut capture = BoundedCapture::new(0);
         let end = capture
             .drain(&mut stdout_reader, &mut stderr_reader)
             .await
-            .expect("duplex read");
+            .map_err(ctx("duplex read"))?;
 
         assert_eq!(end, DrainEnd::LimitExceeded);
         assert_eq!(capture.stdout(), b"a");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn partial_output_survives_cancelled_drain() {
+    async fn partial_output_survives_cancelled_drain() -> TestResult {
         let (mut stdout_writer, mut stdout_reader) = duplex(1024);
         let (mut stderr_writer, mut stderr_reader) = duplex(1024);
-        stdout_writer.write_all(b"partial-out").await.expect("write stdout");
-        stderr_writer.write_all(b"partial-err").await.expect("write stderr");
+        stdout_writer
+            .write_all(b"partial-out")
+            .await
+            .map_err(ctx("write stdout"))?;
+        stderr_writer
+            .write_all(b"partial-err")
+            .await
+            .map_err(ctx("write stderr"))?;
 
         let mut capture = BoundedCapture::new(64 * 1024);
         // Writer bleiben offen: `drain` endet nur durch das Timeout.
@@ -270,5 +303,6 @@ mod tests {
         assert_eq!(capture.stdout(), b"partial-out");
         assert_eq!(capture.stderr(), b"partial-err");
         drop((stdout_writer, stderr_writer));
+        Ok(())
     }
 }

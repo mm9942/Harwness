@@ -55,19 +55,22 @@ fn default_retries() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
-    fn suggestion_lists_are_optional_and_default_empty() {
-        let agent: AgentToml = toml::from_str("name = \"planner\"\n").unwrap();
+    fn suggestion_lists_are_optional_and_default_empty() -> TestResult {
+        let agent: AgentToml =
+            toml::from_str("name = \"planner\"\n").map_err(ctx("minimales agent.toml parsen"))?;
         assert!(agent.suggestions.skills.is_empty());
         assert!(agent.suggestions.plugins.is_empty());
 
         let agent: AgentToml = toml::from_str(
             "name = \"planner\"\n[suggestions]\nskills = [\"research\"]\nmcps = [\"docs\"]\n",
         )
-        .unwrap();
+        .map_err(ctx("agent.toml mit suggestions parsen"))?;
         assert_eq!(agent.suggestions.skills, ["research"]);
         assert_eq!(agent.suggestions.mcps, ["docs"]);
+        Ok(())
     }
 
     #[test]

@@ -324,25 +324,26 @@ fn remove_path(path: &Path) -> Result<(), InstallError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use std::fs as stdfs;
 
     /// Legt ein eindeutiges temporäres Home-Verzeichnis an.
-    fn temp_home(tag: &str) -> PathBuf {
+    fn temp_home(tag: &str) -> TestResult<PathBuf> {
         let mut base = std::env::temp_dir();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         base.push(format!("harw-uninstall-{tag}-{nanos}"));
-        stdfs::create_dir_all(&base).expect("temp home anlegen");
-        base
+        stdfs::create_dir_all(&base).map_err(ctx("temp home anlegen"))?;
+        Ok(base)
     }
 
     #[test]
-    fn test_plan_state_removes_non_profile_dirs_and_preserves_data() {
-        let home = temp_home("state");
+    fn test_plan_state_removes_non_profile_dirs_and_preserves_data() -> TestResult {
+        let home = temp_home("state")?;
         for d in ["cache", "logs", "profiles", "workspace"] {
-            stdfs::create_dir_all(home.join(d)).expect("dir");
+            stdfs::create_dir_all(home.join(d)).map_err(ctx("dir"))?;
         }
 
         let p = plan(&home, &[UninstallScope::State]);
@@ -355,27 +356,30 @@ mod tests {
         assert!(p.preserved.contains(&home.join("workspace")));
 
         stdfs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_plan_state_with_workspace_does_not_preserve() {
-        let home = temp_home("state-ws");
+    fn test_plan_state_with_workspace_does_not_preserve() -> TestResult {
+        let home = temp_home("state-ws")?;
         for d in ["cache", "profiles", "workspace"] {
-            stdfs::create_dir_all(home.join(d)).expect("dir");
+            stdfs::create_dir_all(home.join(d)).map_err(ctx("dir"))?;
         }
 
         let p = plan(&home, &[UninstallScope::State, UninstallScope::Workspace]);
 
         assert!(p.preserved.is_empty());
         stdfs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_plan_workspace_enumerates_profiles() {
-        let home = temp_home("ws");
+    fn test_plan_workspace_enumerates_profiles() -> TestResult {
+        let home = temp_home("ws")?;
         stdfs::create_dir_all(home.join("profiles").join("default").join("workspace"))
-            .expect("dir");
-        stdfs::create_dir_all(home.join("profiles").join("alt").join("workspace")).expect("dir");
+            .map_err(ctx("dir"))?;
+        stdfs::create_dir_all(home.join("profiles").join("alt").join("workspace"))
+            .map_err(ctx("dir"))?;
 
         let p = plan(&home, &[UninstallScope::Workspace]);
 
@@ -388,17 +392,19 @@ mod tests {
                 .contains(&home.join("profiles").join("alt").join("workspace"))
         );
         stdfs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_plan_binary_targets_local_bin() {
-        let home = temp_home("bin").join(".harw");
+    fn test_plan_binary_targets_local_bin() -> TestResult {
+        let home = temp_home("bin")?.join(".harw");
         let p = plan(&home, &[UninstallScope::Binary]);
-        let os_home = home.parent().expect("parent");
+        let os_home = home.parent().ok_or(TestError::Missing("parent"))?;
         assert!(
             p.removals
                 .contains(&os_home.join(".local").join("bin").join("harw"))
         );
+        Ok(())
     }
 
     #[test]
@@ -426,10 +432,10 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_dry_run_removes_nothing() {
-        let home = temp_home("dry");
+    fn test_execute_dry_run_removes_nothing() -> TestResult {
+        let home = temp_home("dry")?;
         let victim = home.join("cache");
-        stdfs::create_dir_all(&victim).expect("dir");
+        stdfs::create_dir_all(&victim).map_err(ctx("dir"))?;
 
         let p = plan(&home, &[UninstallScope::State]);
         let result = execute(&p, true);
@@ -437,14 +443,15 @@ mod tests {
         assert!(result.is_ok());
         assert!(victim.exists(), "dry-run darf nichts löschen");
         stdfs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_execute_real_removes_dirs() {
-        let home = temp_home("real");
+    fn test_execute_real_removes_dirs() -> TestResult {
+        let home = temp_home("real")?;
         let victim = home.join("cache");
-        stdfs::create_dir_all(&victim).expect("dir");
-        stdfs::create_dir_all(home.join("profiles")).expect("dir");
+        stdfs::create_dir_all(&victim).map_err(ctx("dir"))?;
+        stdfs::create_dir_all(home.join("profiles")).map_err(ctx("dir"))?;
 
         let p = plan(&home, &[UninstallScope::State]);
         let result = execute(&p, false);
@@ -453,16 +460,18 @@ mod tests {
         assert!(!victim.exists(), "cache muss entfernt sein");
         assert!(home.join("profiles").exists(), "profiles bleibt erhalten");
         stdfs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_execute_missing_path_is_ok() {
-        let home = temp_home("missing");
+    fn test_execute_missing_path_is_ok() -> TestResult {
+        let home = temp_home("missing")?;
         stdfs::remove_dir_all(&home).ok();
         let plan = CleanupPlan {
             removals: vec![home.join("does-not-exist")],
             preserved: vec![],
         };
         assert!(execute(&plan, false).is_ok());
+        Ok(())
     }
 }

@@ -125,9 +125,10 @@ impl Lease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn fenced_lease_requires_the_exact_epoch_and_nonce() {
+    fn fenced_lease_requires_the_exact_epoch_and_nonce() -> TestResult {
         let now = Timestamp::now();
         let lease = Lease::acquire_fenced(
             WorkId::from_str("work-1"),
@@ -137,7 +138,7 @@ mod tests {
             4,
             "nonce-current",
         )
-        .unwrap();
+        .map_err(ctx("fenced lease acquisition must succeed"))?;
         assert!(lease.matches_token(&lease.token()));
 
         let mut stale_epoch = lease.token();
@@ -146,20 +147,26 @@ mod tests {
         let mut stale_nonce = lease.token();
         stale_nonce.nonce = "nonce-stale".to_owned();
         assert!(!lease.matches_token(&stale_nonce));
+        Ok(())
     }
 
     #[test]
-    fn lease_rejects_non_positive_ttls() {
+    fn lease_rejects_non_positive_ttls() -> TestResult {
         // Use the upper timestamp bound so calculating `now + ttl` first would
         // produce a time-arithmetic error instead of rejecting the policy.
         let now = Timestamp::MAX;
         for ttl in [SignedDuration::ZERO, SignedDuration::from_secs(-1)] {
-            let error = Lease::acquire(WorkId::from_str("work-1"), "worker-a", now, ttl)
-                .expect_err("non-positive TTL must fail before expiration arithmetic");
+            let Err(error) = Lease::acquire(WorkId::from_str("work-1"), "worker-a", now, ttl)
+            else {
+                return Err(TestError::Unexpected(
+                    "non-positive TTL must fail before expiration arithmetic".to_owned(),
+                ));
+            };
             assert!(matches!(
                 error,
                 JobRuntimeError::LeaseExpired { expired_at, .. } if expired_at == now
             ));
         }
+        Ok(())
     }
 }

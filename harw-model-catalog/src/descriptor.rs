@@ -724,6 +724,7 @@ fn legacy_hardcoded_descriptors() -> Vec<ModelDescriptor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn bootstrap_has_at_least_15() {
@@ -770,40 +771,36 @@ mod tests {
     }
 
     #[test]
-    fn enums_serde_snake_case() {
+    fn enums_serde_snake_case() -> TestResult {
         // ToolCallingSupport::Parallel wird als "parallel" serialisiert.
-        let json = serde_json::to_string(&ToolCallingSupport::Parallel)
-            .expect("Serialisierung fehlgeschlagen");
+        let json = serde_json::to_string(&ToolCallingSupport::Parallel)?;
         assert_eq!(json, "\"parallel\"");
 
-        let json = serde_json::to_string(&ReasoningSupport::Effort)
-            .expect("Serialisierung fehlgeschlagen");
+        let json = serde_json::to_string(&ReasoningSupport::Effort)?;
         assert_eq!(json, "\"effort\"");
 
-        let json = serde_json::to_string(&PromptCachingSupport::Explicit)
-            .expect("Serialisierung fehlgeschlagen");
+        let json = serde_json::to_string(&PromptCachingSupport::Explicit)?;
         assert_eq!(json, "\"explicit\"");
 
-        let json = serde_json::to_string(&StreamingSupport::ServerSent)
-            .expect("Serialisierung fehlgeschlagen");
+        let json = serde_json::to_string(&StreamingSupport::ServerSent)?;
         assert_eq!(json, "\"server_sent\"");
 
-        let json =
-            serde_json::to_string(&ModelLifecycle::Ga).expect("Serialisierung fehlgeschlagen");
+        let json = serde_json::to_string(&ModelLifecycle::Ga)?;
         assert_eq!(json, "\"ga\"");
+        Ok(())
     }
 
     #[test]
-    fn descriptor_roundtrip() {
+    fn descriptor_roundtrip() -> TestResult {
         // Serde-JSON Roundtrip eines vollständigen ModelDescriptor.
         let original = bootstrap_descriptors()
             .into_iter()
             .next()
-            .expect("Mindestens ein Descriptor erwartet");
-        let json = serde_json::to_string(&original).expect("Serialisierung fehlgeschlagen");
-        let restored: ModelDescriptor =
-            serde_json::from_str(&json).expect("Deserialisierung fehlgeschlagen");
+            .ok_or(TestError::Missing("mindestens ein Descriptor"))?;
+        let json = serde_json::to_string(&original)?;
+        let restored: ModelDescriptor = serde_json::from_str(&json)?;
         assert_eq!(original, restored);
+        Ok(())
     }
 
     #[test]

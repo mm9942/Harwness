@@ -237,19 +237,22 @@ pub struct FindingBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
-    fn ts() -> jiff::Timestamp {
-        "2026-08-27T00:00:00Z".parse().unwrap()
+    fn ts() -> TestResult<jiff::Timestamp> {
+        "2026-08-27T00:00:00Z"
+            .parse()
+            .map_err(ctx("Zeitstempel parsen"))
     }
 
-    fn sample_finding() -> ResearchFinding {
-        ResearchFinding {
+    fn sample_finding() -> TestResult<ResearchFinding> {
+        Ok(ResearchFinding {
             question_id: QuestionId::new("q-1"),
             conclusion: "jiff 0.2.32 is current".to_owned(),
             evidence: vec![SourceReference {
                 kind: SourceClass::CargoRegistrySource,
                 locator: "crates.io/crates/jiff".to_owned(),
-                retrieved_at: ts(),
+                retrieved_at: ts()?,
                 digest: None,
                 excerpt: "version 0.2.32".to_owned(),
             }],
@@ -265,39 +268,51 @@ mod tests {
             unresolved_questions: vec![],
             confidence: Confidence::High,
             produced_by: "explorer-1".to_owned(),
-            produced_at: ts(),
-        }
+            produced_at: ts()?,
+        })
     }
 
     #[test]
-    fn test_question_id_roundtrip_and_from_str() {
+    fn test_question_id_roundtrip_and_from_str() -> TestResult {
         let id = QuestionId::new("q-abc");
-        let json = serde_json::to_string(&id).unwrap();
-        let back: QuestionId = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&id).map_err(ctx("QuestionId serialisieren"))?;
+        let back: QuestionId =
+            serde_json::from_str(&json).map_err(ctx("QuestionId deserialisieren"))?;
         assert_eq!(id, back);
 
-        let parsed: QuestionId = "q-abc".parse().unwrap();
+        let parsed: QuestionId = "q-abc".parse().map_err(ctx("QuestionId parsen"))?;
         assert_eq!(parsed.as_str(), "q-abc");
         assert_eq!(parsed.to_string(), "q-abc");
+        Ok(())
     }
 
     #[test]
-    fn test_source_class_serializes_snake_case() {
-        let json = serde_json::to_string(&SourceClass::CargoRegistrySource).unwrap();
+    fn test_source_class_serializes_snake_case() -> TestResult {
+        let json = serde_json::to_string(&SourceClass::CargoRegistrySource)
+            .map_err(ctx("SourceClass serialisieren"))?;
         assert_eq!(json, "\"cargo_registry_source\"");
-        let back: SourceClass = serde_json::from_str(&json).unwrap();
+        let back: SourceClass =
+            serde_json::from_str(&json).map_err(ctx("SourceClass deserialisieren"))?;
         assert_eq!(back, SourceClass::CargoRegistrySource);
+        Ok(())
     }
 
     #[test]
-    fn test_freshness_any_time_and_as_of_roundtrip() {
+    fn test_freshness_any_time_and_as_of_roundtrip() -> TestResult {
         let any = Freshness::AnyTime;
-        let json = serde_json::to_string(&any).unwrap();
-        assert_eq!(serde_json::from_str::<Freshness>(&json).unwrap(), any);
+        let json = serde_json::to_string(&any).map_err(ctx("Freshness serialisieren"))?;
+        assert_eq!(
+            serde_json::from_str::<Freshness>(&json).map_err(ctx("Freshness deserialisieren"))?,
+            any
+        );
 
-        let as_of = Freshness::AsOf(ts());
-        let json = serde_json::to_string(&as_of).unwrap();
-        assert_eq!(serde_json::from_str::<Freshness>(&json).unwrap(), as_of);
+        let as_of = Freshness::AsOf(ts()?);
+        let json = serde_json::to_string(&as_of).map_err(ctx("Freshness serialisieren"))?;
+        assert_eq!(
+            serde_json::from_str::<Freshness>(&json).map_err(ctx("Freshness deserialisieren"))?,
+            as_of
+        );
+        Ok(())
     }
 
     #[test]
@@ -308,34 +323,41 @@ mod tests {
     }
 
     #[test]
-    fn test_research_finding_roundtrip() {
-        let finding = sample_finding();
-        let json = serde_json::to_string(&finding).unwrap();
-        let back: ResearchFinding = serde_json::from_str(&json).unwrap();
+    fn test_research_finding_roundtrip() -> TestResult {
+        let finding = sample_finding()?;
+        let json = serde_json::to_string(&finding).map_err(ctx("ResearchFinding serialisieren"))?;
+        let back: ResearchFinding =
+            serde_json::from_str(&json).map_err(ctx("ResearchFinding deserialisieren"))?;
         assert_eq!(finding, back);
+        Ok(())
     }
 
     #[test]
-    fn test_question_scope_defaults_when_fields_missing() {
-        let scope: QuestionScope = serde_json::from_str("{}").unwrap();
+    fn test_question_scope_defaults_when_fields_missing() -> TestResult {
+        let scope: QuestionScope =
+            serde_json::from_str("{}").map_err(ctx("QuestionScope deserialisieren"))?;
         assert!(scope.paths.is_empty());
         assert!(scope.crates.is_empty());
         assert!(scope.urls.is_empty());
         assert!(scope.sources.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_finding_bundle_defaults_when_fields_missing() {
-        let bundle: FindingBundle = serde_json::from_str("{}").unwrap();
+    fn test_finding_bundle_defaults_when_fields_missing() -> TestResult {
+        let bundle: FindingBundle =
+            serde_json::from_str("{}").map_err(ctx("FindingBundle deserialisieren"))?;
         assert!(bundle.findings.is_empty());
         assert!(bundle.coverage_gaps.is_empty());
 
         let bundle = FindingBundle {
-            findings: vec![sample_finding()],
+            findings: vec![sample_finding()?],
             coverage_gaps: vec!["no docs for feature X".to_owned()],
         };
-        let json = serde_json::to_string(&bundle).unwrap();
-        let back: FindingBundle = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&bundle).map_err(ctx("FindingBundle serialisieren"))?;
+        let back: FindingBundle =
+            serde_json::from_str(&json).map_err(ctx("FindingBundle deserialisieren"))?;
         assert_eq!(bundle, back);
+        Ok(())
     }
 }

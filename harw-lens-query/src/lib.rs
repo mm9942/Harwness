@@ -129,3 +129,7 @@ pub use error::{QueryError, QueryResult};
 pub use query::{query, query_scoped, QueryProvenance};
 pub use resolve::resolve_index;
 pub use selector::{IndexSelector, ReadScope};
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

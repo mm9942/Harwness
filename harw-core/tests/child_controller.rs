@@ -2,6 +2,9 @@
 //! inheritance, depth, and per-parent concurrency ceilings.
 
 use harw_agent_dsl::roles::AgentRoleId;
+use harw_authority::{
+    Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+};
 use harw_catalog::{
     ActivatedCapability, AgentSuggestions, CapabilitySuggestion, SpawnCapabilitySnapshot,
     SuggestionKind,
@@ -14,7 +17,6 @@ use harw_core::{
 use harw_extension_api::{
     AgentSpawnError, AgentSpawner, ExtensionRegistry, ExtensionRegistryBuilder, SpawnInput,
 };
-use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
 use harw_session_store::ChildLeaseStore;
 use harw_types::{
     AgentRole, ApprovalActor, ReasoningEffort, SessionId, TenantId, ToolCallId, WorkspaceId,
@@ -22,6 +24,9 @@ use harw_types::{
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+
+mod common;
+use common::{TestError, TestResult, ctx};
 
 struct EmptyChildRegistry;
 
@@ -147,7 +152,10 @@ impl ChildRegistryFactory for SnapshotChildRegistry {
         let activated = snapshot
             .and_then(|snapshot| snapshot.activated.first())
             .map(|capability| capability.name.clone());
-        *self.seen_activated_name.lock().expect("seen snapshot lock") = activated;
+        *self
+            .seen_activated_name
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = activated;
         Ok(ExtensionRegistryBuilder::default().build())
     }
 
@@ -156,10 +164,10 @@ impl ChildRegistryFactory for SnapshotChildRegistry {
     }
 }
 
-fn test_sandbox(permissions: PermissionSet) -> SandboxSpec {
+fn test_sandbox(permissions: PermissionSet) -> TestResult<SandboxSpec> {
     let harness_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("harw-core has a workspace parent")
+        .ok_or(TestError::Missing("harw-core has a workspace parent"))?
         .to_path_buf();
     let registry = WorkspaceRegistry::build(
         &harness_root,
@@ -169,25 +177,25 @@ fn test_sandbox(permissions: PermissionSet) -> SandboxSpec {
             root: PathBuf::from("harw-core"),
         }],
     )
-    .expect("test workspace is registered");
-    SandboxSpec::from_resolved(
+    .map_err(ctx("test workspace is registered"))?;
+    Ok(SandboxSpec::from_resolved(
         registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("controller-tests"),
             )
-            .expect("test workspace resolves"),
+            .map_err(ctx("test workspace resolves"))?,
         permissions,
-    )
+    ))
 }
 
-fn managed_parent() -> (Arc<Mutex<SessionManager>>, SessionId, SandboxSpec) {
+fn managed_parent() -> TestResult<(Arc<Mutex<SessionManager>>, SessionId, SandboxSpec)> {
     let (events, _receiver) = mpsc::unbounded_channel();
     let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-    let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+    let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
     let parent = manager
         .lock()
-        .expect("manager lock")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .create_governed_session(
             AgentRole::Assistant,
             None,
@@ -207,7 +215,7 @@ fn managed_parent() -> (Arc<Mutex<SessionManager>>, SessionId, SandboxSpec) {
                 ceiling: None,
             },
         );
-    (manager, parent, sandbox)
+    Ok((manager, parent, sandbox))
 }
 
 /// Same governed-parent shape as [`managed_parent`], but admitted under an
@@ -216,13 +224,13 @@ fn managed_parent() -> (Arc<Mutex<SessionManager>>, SessionId, SandboxSpec) {
 /// `harw_agent_dsl::roles::can_spawn` enforcement in `admit()`.
 fn managed_parent_with_organizational_role(
     organizational_role: AgentRoleId,
-) -> (Arc<Mutex<SessionManager>>, SessionId, SandboxSpec) {
+) -> TestResult<(Arc<Mutex<SessionManager>>, SessionId, SandboxSpec)> {
     let (events, _receiver) = mpsc::unbounded_channel();
     let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-    let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+    let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
     let parent = manager
         .lock()
-        .expect("manager lock")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .create_governed_session(
             AgentRole::Assistant,
             None,
@@ -242,7 +250,7 @@ fn managed_parent_with_organizational_role(
                 ceiling: None,
             },
         );
-    (manager, parent, sandbox)
+    Ok((manager, parent, sandbox))
 }
 
 /// Same governed-parent shape as [`managed_parent`], but built through the
@@ -252,10 +260,10 @@ fn managed_parent_with_organizational_role(
 /// that `clamp_child_reasoning_effort` tests are exercising.
 fn managed_parent_with_effort(
     effort: Option<ReasoningEffort>,
-) -> (Arc<Mutex<SessionManager>>, SessionId, SandboxSpec) {
+) -> TestResult<(Arc<Mutex<SessionManager>>, SessionId, SandboxSpec)> {
     let (events, _receiver) = mpsc::unbounded_channel();
     let manager = Arc::new(Mutex::new(SessionManager::new(events.clone())));
-    let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+    let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
     let session = AgentSession::new(
         AgentRole::Assistant,
         None,
@@ -280,10 +288,10 @@ fn managed_parent_with_effort(
     let parent = session.id().clone();
     manager
         .lock()
-        .expect("manager lock")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .restore(session)
-        .expect("parent session inserts cleanly");
-    (manager, parent, sandbox)
+        .map_err(ctx("parent session inserts cleanly"))?;
+    Ok((manager, parent, sandbox))
 }
 
 /// A `worker`-role spawner over the given manager, matching the role wiring
@@ -311,8 +319,8 @@ fn spawn_input(parent_session_id: SessionId) -> SpawnInput {
 }
 
 #[tokio::test]
-async fn managed_spawner_creates_a_governed_child_and_tracks_its_lifecycle() {
-    let (manager, parent, sandbox) = managed_parent();
+async fn managed_spawner_creates_a_governed_child_and_tracks_its_lifecycle() -> TestResult {
+    let (manager, parent, sandbox) = managed_parent()?;
     let spawner = ManagedAgentSpawner::new(manager.clone(), ChildLimits::conservative()).with_role(
         "worker",
         AgentRole::Agent {
@@ -325,19 +333,23 @@ async fn managed_spawner_creates_a_governed_child_and_tracks_its_lifecycle() {
     let child = spawner
         .spawn_child("worker", spawn_input(parent.clone()), sandbox.clone(), None)
         .await
-        .expect("registered role admits governed child");
+        .map_err(ctx("registered role admits governed child"))?;
 
-    let record = spawner.child_record(&child).expect("child is tracked");
+    let record = spawner
+        .child_record(&child)
+        .ok_or(TestError::Missing("child is tracked"))?;
     assert_eq!(record.parent, parent);
     assert_eq!(record.role, "worker");
     assert_eq!(record.depth, 1);
-    let manager_guard = manager.lock().expect("manager lock");
-    let child_session = manager_guard.get(&child).expect("child exists");
+    let manager_guard = manager
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let child_session = manager_guard.get(&child)?;
     assert_eq!(child_session.parent_session_id(), Some(&record.parent));
     assert_eq!(
         child_session
             .spawn_context()
-            .expect("child context")
+            .ok_or(TestError::Missing("child context"))?
             .sandbox,
         sandbox
     );
@@ -347,11 +359,12 @@ async fn managed_spawner_creates_a_governed_child_and_tracks_its_lifecycle() {
 
     spawner.close_child(&child);
     assert!(spawner.child_record(&child).is_none());
+    Ok(())
 }
 
 #[tokio::test]
-async fn managed_spawner_attaches_target_capability_contract_to_child_and_registry() {
-    let (manager, parent, sandbox) = managed_parent();
+async fn managed_spawner_attaches_target_capability_contract_to_child_and_registry() -> TestResult {
+    let (manager, parent, sandbox) = managed_parent()?;
     let snapshot = SpawnCapabilitySnapshot {
         agent: "worker".to_owned(),
         suggestions: AgentSuggestions {
@@ -389,27 +402,29 @@ async fn managed_spawner_attaches_target_capability_contract_to_child_and_regist
     let child = spawner
         .spawn_child("worker", spawn_input(parent), sandbox, None)
         .await
-        .expect("child admitted with target capability contract");
+        .map_err(ctx("child admitted with target capability contract"))?;
     assert_eq!(
         seen_activated_name
             .lock()
-            .expect("seen snapshot lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_deref(),
         Some("rust-review")
     );
-    let manager = manager.lock().expect("manager lock");
+    let manager = manager
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let context = manager
-        .get(&child)
-        .expect("child session")
+        .get(&child)?
         .spawn_context()
-        .expect("trusted child context");
+        .ok_or(TestError::Missing("trusted child context"))?;
     assert_eq!(context.capability_snapshot.as_ref(), Some(&snapshot));
     assert_eq!(context.suggestions.as_ref(), Some(&snapshot.suggestions));
+    Ok(())
 }
 
 #[tokio::test]
-async fn managed_spawner_rejects_unknown_role_escalation_and_limit_bypass() {
-    let (manager, parent, sandbox) = managed_parent();
+async fn managed_spawner_rejects_unknown_role_escalation_and_limit_bypass() -> TestResult {
+    let (manager, parent, sandbox) = managed_parent()?;
     let spawner = ManagedAgentSpawner::new(
         manager,
         ChildLimits {
@@ -427,7 +442,7 @@ async fn managed_spawner_rejects_unknown_role_escalation_and_limit_bypass() {
         Arc::new(EmptyChildRegistry),
     );
 
-    let unknown = spawner
+    let Err(unknown) = spawner
         .spawn_child(
             "unregistered",
             spawn_input(parent.clone()),
@@ -435,38 +450,52 @@ async fn managed_spawner_rejects_unknown_role_escalation_and_limit_bypass() {
             None,
         )
         .await
-        .expect_err("unknown roles are denied");
+    else {
+        return Err(TestError::Unexpected("unknown roles are denied".to_owned()));
+    };
     assert!(unknown.message.contains("not registered"));
 
-    let escalation = spawner
+    let Err(escalation) = spawner
         .spawn_child(
             "worker",
             spawn_input(parent.clone()),
             test_sandbox(PermissionSet::from_policy([
                 Permission::ReadWorkspace,
                 Permission::WriteWorkspace,
-            ])),
+            ]))?,
             None,
         )
         .await
-        .expect_err("child cannot broaden parent permissions");
+    else {
+        return Err(TestError::Unexpected(
+            "child cannot broaden parent permissions".to_owned(),
+        ));
+    };
     assert!(escalation.message.contains("sandbox escalation"));
 
     let child = spawner
         .spawn_child("worker", spawn_input(parent.clone()), sandbox.clone(), None)
         .await
-        .expect("first child fits limit");
-    let limited = spawner
+        .map_err(ctx("first child fits limit"))?;
+    let Err(limited) = spawner
         .spawn_child("worker", spawn_input(parent), sandbox, None)
         .await
-        .expect_err("second active child exceeds parent limit");
+    else {
+        return Err(TestError::Unexpected(
+            "second active child exceeds parent limit".to_owned(),
+        ));
+    };
     assert!(limited.message.contains("active child limit"));
 
     // The record remains usable for later child-result correlation.
     assert_eq!(
-        spawner.child_record(&child).expect("tracked child").depth,
+        spawner
+            .child_record(&child)
+            .ok_or(TestError::Missing("tracked child"))?
+            .depth,
         1
     );
+    Ok(())
 }
 
 /// A session admitted under the `Worker` organizational role (§3 DSL spawn
@@ -476,8 +505,8 @@ async fn managed_spawner_rejects_unknown_role_escalation_and_limit_bypass() {
 /// `ManagedAgentSpawner::admit` enforces `harw_agent_dsl::roles::can_spawn`
 /// as the first authority check, ahead of sandbox/depth/lease checks.
 #[tokio::test]
-async fn admit_rejects_spawn_forbidden_by_organizational_role_matrix() {
-    let (manager, parent, sandbox) = managed_parent_with_organizational_role(AgentRoleId::Worker);
+async fn admit_rejects_spawn_forbidden_by_organizational_role_matrix() -> TestResult {
+    let (manager, parent, sandbox) = managed_parent_with_organizational_role(AgentRoleId::Worker)?;
     let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative()).with_role(
         "worker",
         AgentRole::Agent {
@@ -487,10 +516,14 @@ async fn admit_rejects_spawn_forbidden_by_organizational_role_matrix() {
         Arc::new(EmptyChildRegistry),
     );
 
-    let rejected = spawner
+    let Err(rejected) = spawner
         .spawn_child("worker", spawn_input(parent), sandbox, None)
         .await
-        .expect_err("Worker organizational role must never spawn a Worker child");
+    else {
+        return Err(TestError::Unexpected(
+            "Worker organizational role must never spawn a Worker child".to_owned(),
+        ));
+    };
 
     assert_eq!(
         rejected.message,
@@ -498,6 +531,7 @@ async fn admit_rejects_spawn_forbidden_by_organizational_role_matrix() {
     );
     assert!(!rejected.message.contains("Worker"));
     assert!(!rejected.message.contains("worker"));
+    Ok(())
 }
 
 /// A session admitted under the `UserInterface` organizational role (§3 DSL
@@ -516,9 +550,9 @@ async fn admit_rejects_spawn_forbidden_by_organizational_role_matrix() {
 /// role name modeled on the real `explorer` role, not merely the abstract
 /// `AgentRoleId` pair.
 #[tokio::test]
-async fn admit_rejects_uia_caller_spawning_a_registered_worker_role() {
+async fn admit_rejects_uia_caller_spawning_a_registered_worker_role() -> TestResult {
     let (manager, parent, sandbox) =
-        managed_parent_with_organizational_role(AgentRoleId::UserInterface);
+        managed_parent_with_organizational_role(AgentRoleId::UserInterface)?;
     let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative()).with_role(
         "explorer",
         AgentRole::Agent {
@@ -528,10 +562,14 @@ async fn admit_rejects_uia_caller_spawning_a_registered_worker_role() {
         Arc::new(EmptyChildRegistry),
     );
 
-    let rejected = spawner
+    let Err(rejected) = spawner
         .spawn_child("explorer", spawn_input(parent), sandbox, None)
         .await
-        .expect_err("a UserInterface caller must never spawn a Worker-role child");
+    else {
+        return Err(TestError::Unexpected(
+            "a UserInterface caller must never spawn a Worker-role child".to_owned(),
+        ));
+    };
 
     assert_eq!(
         rejected.message,
@@ -542,6 +580,7 @@ async fn admit_rejects_uia_caller_spawning_a_registered_worker_role() {
     // site, `harw-core/src/child_controller.rs`).
     assert!(!rejected.message.contains("explorer"));
     assert!(!rejected.message.contains("Worker"));
+    Ok(())
 }
 
 /// The fix for the rejection above: `UserInterface` may spawn its own
@@ -560,10 +599,10 @@ async fn admit_rejects_uia_caller_spawning_a_registered_worker_role() {
 /// (`harw-runtime/src/{assembly,children}.rs`), this test documents the
 /// exact admission outcome that registration must produce.
 #[tokio::test]
-async fn admit_allows_uia_caller_spawning_its_uia_worker_specializations() {
+async fn admit_allows_uia_caller_spawning_its_uia_worker_specializations() -> TestResult {
     for role_name in ["uia-explorer", "uia-writer"] {
         let (manager, parent, sandbox) =
-            managed_parent_with_organizational_role(AgentRoleId::UserInterface);
+            managed_parent_with_organizational_role(AgentRoleId::UserInterface)?;
         let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative()).with_role(
             role_name,
             AgentRole::Agent {
@@ -576,27 +615,28 @@ async fn admit_allows_uia_caller_spawning_its_uia_worker_specializations() {
         let child = spawner
             .spawn_child(role_name, spawn_input(parent), sandbox, None)
             .await
-            .unwrap_or_else(|error| {
-                panic!(
+            .map_err(|error| {
+                TestError::Unexpected(format!(
                     "a UserInterface caller must admit its '{role_name}' UiaWorker \
                      specialization: {error:?}"
-                )
-            });
+                ))
+            })?;
 
         assert_eq!(
             spawner
                 .child_record(&child)
-                .expect("admitted child is tracked")
+                .ok_or(TestError::Missing("admitted child is tracked"))?
                 .depth,
             1,
             "role '{role_name}'"
         );
     }
+    Ok(())
 }
 
 #[tokio::test]
-async fn managed_children_run_without_holding_the_session_registry_lock() {
-    let (manager, parent, sandbox) = managed_parent();
+async fn managed_children_run_without_holding_the_session_registry_lock() -> TestResult {
+    let (manager, parent, sandbox) = managed_parent()?;
     let spawner = ManagedAgentSpawner::new(
         manager.clone(),
         ChildLimits {
@@ -618,11 +658,11 @@ async fn managed_children_run_without_holding_the_session_registry_lock() {
     let first = spawner
         .spawn_child("worker", spawn_input(parent.clone()), sandbox.clone(), None)
         .await
-        .expect("first child admitted");
+        .map_err(ctx("first child admitted"))?;
     let second = spawner
         .spawn_child("worker", spawn_input(parent), sandbox, None)
         .await
-        .expect("second child admitted");
+        .map_err(ctx("second child admitted"))?;
     let store = InMemoryStateStore::new();
 
     let (left, right) = tokio::join!(
@@ -630,20 +670,33 @@ async fn managed_children_run_without_holding_the_session_registry_lock() {
         spawner.run_child(&second, &store, TurnInput::user("second")),
     );
     assert!(matches!(
-        left.expect("first child runs").outcome,
+        left.map_err(ctx("first child runs"))?.outcome,
         TurnOutcome::Completed
     ));
     assert!(matches!(
-        right.expect("second child runs").outcome,
+        right.map_err(ctx("second child runs"))?.outcome,
         TurnOutcome::Completed
     ));
-    assert!(manager.lock().expect("manager lock").get(&first).is_ok());
-    assert!(manager.lock().expect("manager lock").get(&second).is_ok());
+    assert!(
+        manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&first)
+            .is_ok()
+    );
+    assert!(
+        manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&second)
+            .is_ok()
+    );
+    Ok(())
 }
 
 #[tokio::test]
-async fn expired_child_is_reaped_with_exact_parent_handoff_correlation() {
-    let (manager, parent, sandbox) = managed_parent();
+async fn expired_child_is_reaped_with_exact_parent_handoff_correlation() -> TestResult {
+    let (manager, parent, sandbox) = managed_parent()?;
     let spawner = ManagedAgentSpawner::new(
         manager.clone(),
         ChildLimits {
@@ -665,10 +718,10 @@ async fn expired_child_is_reaped_with_exact_parent_handoff_correlation() {
     let child = spawner
         .spawn_child("worker", input, sandbox, None)
         .await
-        .expect("child admitted");
+        .map_err(ctx("child admitted"))?;
     let future = jiff::Timestamp::now()
         .checked_add(jiff::SignedDuration::from_secs(2))
-        .expect("future timestamp");
+        .map_err(ctx("future timestamp"))?;
 
     let expired = spawner.reap_expired(future);
     assert_eq!(expired.len(), 1);
@@ -677,16 +730,22 @@ async fn expired_child_is_reaped_with_exact_parent_handoff_correlation() {
     assert_eq!(expired[0].handoff_call_id, expected_call);
     assert_eq!(spawner.active_children_for(&expired[0].parent), 0);
     assert!(matches!(
-        manager.lock().expect("manager lock").get(&child).expect("child session").state(),
+        manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&child)?
+            .state(),
         SessionState::Failed(reason) if reason.contains("lease expired")
     ));
+    Ok(())
 }
 
 #[tokio::test]
-async fn durable_leases_survive_controller_reconciliation_and_close_as_an_audit_record() {
-    let temp = tempfile::tempdir().unwrap();
+async fn durable_leases_survive_controller_reconciliation_and_close_as_an_audit_record()
+-> TestResult {
+    let temp = tempfile::tempdir()?;
     let leases = Arc::new(ChildLeaseStore::new(temp.path()));
-    let (manager, parent, sandbox) = managed_parent();
+    let (manager, parent, sandbox) = managed_parent()?;
     let spawner = ManagedAgentSpawner::new(
         manager,
         ChildLimits {
@@ -709,12 +768,11 @@ async fn durable_leases_survive_controller_reconciliation_and_close_as_an_audit_
     let child = spawner
         .spawn_child("worker", input, sandbox, None)
         .await
-        .expect("durable admission succeeds");
+        .map_err(ctx("durable admission succeeds"))?;
     let record = leases
-        .active()
-        .expect("lease active")
+        .active()?
         .pop()
-        .expect("one lease");
+        .ok_or(TestError::Missing("one lease"))?;
     assert_eq!(record.child, child);
     assert_eq!(record.handoff_call_id, expected_call);
 
@@ -723,27 +781,28 @@ async fn durable_leases_survive_controller_reconciliation_and_close_as_an_audit_
             record
                 .lease_expires_at
                 .checked_add(jiff::SignedDuration::from_secs(1))
-                .expect("future timestamp"),
+                .map_err(ctx("future timestamp"))?,
         )
-        .expect("reconciliation succeeds");
+        .map_err(ctx("reconciliation succeeds"))?;
     assert_eq!(expired.len(), 1);
     assert_eq!(expired[0].child, child);
     assert!(
         spawner
             .reconcile_expired_leases(jiff::Timestamp::now())
-            .expect("second reconciliation succeeds")
+            .map_err(ctx("second reconciliation succeeds"))?
             .is_empty()
     );
 
     spawner
         .close_child_durable(&child, jiff::Timestamp::now())
-        .expect("terminal child is durably completed");
-    assert!(leases.active().expect("active leases readable").is_empty());
+        .map_err(ctx("terminal child is durably completed"))?;
+    assert!(leases.active()?.is_empty());
+    Ok(())
 }
 
 #[tokio::test]
-async fn late_child_completion_after_reap_is_failed_and_never_restored_as_healthy() {
-    let (manager, parent, sandbox) = managed_parent();
+async fn late_child_completion_after_reap_is_failed_and_never_restored_as_healthy() -> TestResult {
+    let (manager, parent, sandbox) = managed_parent()?;
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let spawner = Arc::new(
@@ -770,8 +829,10 @@ async fn late_child_completion_after_reap_is_failed_and_never_restored_as_health
     let child = spawner
         .spawn_child("worker", spawn_input(parent), sandbox, None)
         .await
-        .expect("child admitted");
-    let record = spawner.child_record(&child).expect("child record");
+        .map_err(ctx("child admitted"))?;
+    let record = spawner
+        .child_record(&child)
+        .ok_or(TestError::Missing("child record"))?;
     let entered_wait = entered.notified();
     let running_spawner = spawner.clone();
     let running_child = child.clone();
@@ -791,139 +852,144 @@ async fn late_child_completion_after_reap_is_failed_and_never_restored_as_health
     let future = record
         .lease_expires_at
         .checked_add(jiff::SignedDuration::from_secs(1))
-        .expect("future timestamp");
+        .map_err(ctx("future timestamp"))?;
     assert_eq!(spawner.reap_expired(future).len(), 1);
     assert!(spawner.child_record(&child).is_none());
-    let late = running.await.expect("child task joins");
-    assert!(late.is_err());
-    assert!(
-        late.expect_err("late result rejected")
-            .message
-            .contains("result discarded")
-    );
+    let late = running.await.map_err(ctx("child task joins"))?;
+    let Err(late_error) = late else {
+        return Err(TestError::Unexpected("late result rejected".to_owned()));
+    };
+    assert!(late_error.message.contains("result discarded"));
     assert!(matches!(
-        manager.lock().expect("manager lock").get(&child).expect("restored terminal session").state(),
+        manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&child)?
+            .state(),
         SessionState::Failed(reason) if reason.contains("lease expired")
     ));
     spawner.close_child(&child);
+    Ok(())
 }
 
 // --- `clamp_child_reasoning_effort` (Wave 8: monotone reasoning-effort
 // inheritance clamped/overridden after admission) -------------------------
 
 #[tokio::test]
-async fn test_clamp_child_reasoning_effort_cap_lowers_high_base_to_low() {
-    let (manager, parent, sandbox) = managed_parent_with_effort(Some(ReasoningEffort::High));
+async fn test_clamp_child_reasoning_effort_cap_lowers_high_base_to_low() -> TestResult {
+    let (manager, parent, sandbox) = managed_parent_with_effort(Some(ReasoningEffort::High))?;
     let spawner = worker_spawner(manager.clone());
     let child = spawner
         .spawn_child("worker", spawn_input(parent), sandbox, None)
         .await
-        .expect("child admitted and inherits parent effort");
+        .map_err(ctx("child admitted and inherits parent effort"))?;
     // Addendum F+G: die Admission klammert nicht mehr nur auf das
     // Eltern-Level, sondern zusätzlich auf das Rollengewicht des Kindes
     // (hier `worker_complex`, Default `Medium`) — `min(High, Medium)`.
     assert_eq!(
         manager
             .lock()
-            .expect("manager lock")
-            .get(&child)
-            .expect("child session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&child)?
             .reasoning_effort(),
         Some(ReasoningEffort::Medium)
     );
 
     let effective = spawner
         .clamp_child_reasoning_effort(&child, Some(ReasoningEffort::Low), None)
-        .expect("known child clamps cleanly");
+        .map_err(ctx("known child clamps cleanly"))?;
 
     assert_eq!(effective, Some(ReasoningEffort::Low));
     assert_eq!(
         manager
             .lock()
-            .expect("manager lock")
-            .get(&child)
-            .expect("child session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&child)?
             .reasoning_effort(),
         Some(ReasoningEffort::Low)
     );
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_clamp_child_reasoning_effort_cap_above_low_base_keeps_base() {
-    let (manager, parent, sandbox) = managed_parent_with_effort(Some(ReasoningEffort::Low));
+async fn test_clamp_child_reasoning_effort_cap_above_low_base_keeps_base() -> TestResult {
+    let (manager, parent, sandbox) = managed_parent_with_effort(Some(ReasoningEffort::Low))?;
     let spawner = worker_spawner(manager.clone());
     let child = spawner
         .spawn_child("worker", spawn_input(parent), sandbox, None)
         .await
-        .expect("child admitted and inherits parent effort");
+        .map_err(ctx("child admitted and inherits parent effort"))?;
 
     let effective = spawner
         .clamp_child_reasoning_effort(&child, Some(ReasoningEffort::High), None)
-        .expect("known child clamps cleanly");
+        .map_err(ctx("known child clamps cleanly"))?;
 
     // A cap only ever lowers the effective level; it must never raise it
     // above the inherited base.
     assert_eq!(effective, Some(ReasoningEffort::Low));
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_clamp_child_reasoning_effort_no_cap_keeps_base_unchanged() {
-    let (manager, parent, sandbox) = managed_parent_with_effort(Some(ReasoningEffort::Medium));
+async fn test_clamp_child_reasoning_effort_no_cap_keeps_base_unchanged() -> TestResult {
+    let (manager, parent, sandbox) = managed_parent_with_effort(Some(ReasoningEffort::Medium))?;
     let spawner = worker_spawner(manager.clone());
     let child = spawner
         .spawn_child("worker", spawn_input(parent), sandbox, None)
         .await
-        .expect("child admitted and inherits parent effort");
+        .map_err(ctx("child admitted and inherits parent effort"))?;
 
     let effective = spawner
         .clamp_child_reasoning_effort(&child, None, None)
-        .expect("known child clamps cleanly");
+        .map_err(ctx("known child clamps cleanly"))?;
 
     assert_eq!(effective, Some(ReasoningEffort::Medium));
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_clamp_child_reasoning_effort_no_base_with_cap_falls_back_to_the_default() {
+async fn test_clamp_child_reasoning_effort_no_base_with_cap_falls_back_to_the_default() -> TestResult
+{
     // `managed_parent` builds a parent with no reasoning-effort level set.
     // Addendum F+G: `admit()` no longer leaves the child unset in that case —
     // it unconditionally computes `min(parent.unwrap_or(DEFAULT), role
     // weight)`, so the child still ends up at `DEFAULT_CHILD_REASONING_EFFORT`
     // (`Medium`) here, clamped by the same `worker_complex` weight (`Medium`).
-    let (manager, parent, sandbox) = managed_parent();
+    let (manager, parent, sandbox) = managed_parent()?;
     let spawner = worker_spawner(manager.clone());
     let child = spawner
         .spawn_child("worker", spawn_input(parent), sandbox, None)
         .await
-        .expect("child admitted with no inherited effort");
+        .map_err(ctx("child admitted with no inherited effort"))?;
     assert_eq!(
         manager
             .lock()
-            .expect("manager lock")
-            .get(&child)
-            .expect("child session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&child)?
             .reasoning_effort(),
         Some(ReasoningEffort::Medium)
     );
 
     let effective = spawner
         .clamp_child_reasoning_effort(&child, Some(ReasoningEffort::High), None)
-        .expect("known child clamps cleanly");
+        .map_err(ctx("known child clamps cleanly"))?;
 
     // F-017/E3b: a missing inherited base is not a free pass. Without a base,
     // `DEFAULT_CHILD_REASONING_EFFORT` (`Medium`) stands in for it, and the
     // cap still clamps downward from there — here `min(Medium, High)` keeps
     // `Medium`, so the cap has no further effect but the default is not lost.
     assert_eq!(effective, Some(ReasoningEffort::Medium));
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_clamp_child_reasoning_effort_owner_override_beats_cap_and_base() {
-    let (manager, parent, sandbox) = managed_parent_with_effort(Some(ReasoningEffort::Minimal));
+async fn test_clamp_child_reasoning_effort_owner_override_beats_cap_and_base() -> TestResult {
+    let (manager, parent, sandbox) = managed_parent_with_effort(Some(ReasoningEffort::Minimal))?;
     let spawner = worker_spawner(manager.clone());
     let child = spawner
         .spawn_child("worker", spawn_input(parent), sandbox, None)
         .await
-        .expect("child admitted and inherits parent effort");
+        .map_err(ctx("child admitted and inherits parent effort"))?;
 
     let effective = spawner
         .clamp_child_reasoning_effort(
@@ -931,7 +997,7 @@ async fn test_clamp_child_reasoning_effort_owner_override_beats_cap_and_base() {
             Some(ReasoningEffort::Low),
             Some(ReasoningEffort::High),
         )
-        .expect("known child clamps cleanly");
+        .map_err(ctx("known child clamps cleanly"))?;
 
     // Owner authority deliberately breaks monotonicity: it wins over both the
     // cap and the inherited base, even raising the level above both.
@@ -939,17 +1005,17 @@ async fn test_clamp_child_reasoning_effort_owner_override_beats_cap_and_base() {
     assert_eq!(
         manager
             .lock()
-            .expect("manager lock")
-            .get(&child)
-            .expect("child session")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&child)?
             .reasoning_effort(),
         Some(ReasoningEffort::High)
     );
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_clamp_child_reasoning_effort_unknown_child_returns_err() {
-    let (manager, _parent, _sandbox) = managed_parent();
+async fn test_clamp_child_reasoning_effort_unknown_child_returns_err() -> TestResult {
+    let (manager, _parent, _sandbox) = managed_parent()?;
     let spawner = worker_spawner(manager);
     let unknown = SessionId::new();
 
@@ -957,8 +1023,13 @@ async fn test_clamp_child_reasoning_effort_unknown_child_returns_err() {
 
     match result {
         Err(error) => assert!(error.message.contains("unknown child")),
-        Ok(_) => panic!("clamping an unregistered child must return an error"),
+        Ok(_) => {
+            return Err(TestError::Unexpected(
+                "clamping an unregistered child must return an error".to_owned(),
+            ));
+        }
     }
+    Ok(())
 }
 
 // --- Addendum D: Aufgabenkomplexität aus dem Spawn-Kontext -----------------
@@ -977,8 +1048,8 @@ fn spawn_input_with_context(
 }
 
 #[tokio::test]
-async fn admit_reads_complex_task_complexity_from_spawn_context() {
-    let (manager, parent, sandbox) = managed_parent();
+async fn admit_reads_complex_task_complexity_from_spawn_context() -> TestResult {
+    let (manager, parent, sandbox) = managed_parent()?;
     let spawner = worker_spawner(manager);
 
     let child = spawner
@@ -989,15 +1060,18 @@ async fn admit_reads_complex_task_complexity_from_spawn_context() {
             None,
         )
         .await
-        .expect("registered role admits governed child");
+        .map_err(ctx("registered role admits governed child"))?;
 
-    let record = spawner.child_record(&child).expect("child is tracked");
+    let record = spawner
+        .child_record(&child)
+        .ok_or(TestError::Missing("child is tracked"))?;
     assert_eq!(record.task_complexity, Some(TaskComplexity::Complex));
+    Ok(())
 }
 
 #[tokio::test]
-async fn admit_reads_simple_task_complexity_from_spawn_context() {
-    let (manager, parent, sandbox) = managed_parent();
+async fn admit_reads_simple_task_complexity_from_spawn_context() -> TestResult {
+    let (manager, parent, sandbox) = managed_parent()?;
     let spawner = worker_spawner(manager);
 
     let child = spawner
@@ -1008,22 +1082,28 @@ async fn admit_reads_simple_task_complexity_from_spawn_context() {
             None,
         )
         .await
-        .expect("registered role admits governed child");
+        .map_err(ctx("registered role admits governed child"))?;
 
-    let record = spawner.child_record(&child).expect("child is tracked");
+    let record = spawner
+        .child_record(&child)
+        .ok_or(TestError::Missing("child is tracked"))?;
     assert_eq!(record.task_complexity, Some(TaskComplexity::Simple));
+    Ok(())
 }
 
 #[tokio::test]
-async fn admit_without_complexity_in_context_leaves_task_complexity_none() {
-    let (manager, parent, sandbox) = managed_parent();
+async fn admit_without_complexity_in_context_leaves_task_complexity_none() -> TestResult {
+    let (manager, parent, sandbox) = managed_parent()?;
     let spawner = worker_spawner(manager);
 
     let child = spawner
         .spawn_child("worker", spawn_input(parent), sandbox, None)
         .await
-        .expect("registered role admits governed child");
+        .map_err(ctx("registered role admits governed child"))?;
 
-    let record = spawner.child_record(&child).expect("child is tracked");
+    let record = spawner
+        .child_record(&child)
+        .ok_or(TestError::Missing("child is tracked"))?;
     assert_eq!(record.task_complexity, None);
+    Ok(())
 }

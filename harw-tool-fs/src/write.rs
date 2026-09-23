@@ -218,16 +218,16 @@ impl ToolExecutor for FsWriteExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{Fixture, SECRET, call, render};
+    use crate::test_support::{Fixture, SECRET, TestError, TestResult, call, ctx, render};
     use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
-    fn make_sandbox_with_permissions(root: &Path, permissions: Vec<Permission>) -> SandboxSpec {
+    fn make_sandbox_with_permissions(root: &Path, permissions: Vec<Permission>) -> TestResult<SandboxSpec> {
         let ws_dir = root.join("ws");
-        fs::create_dir_all(&ws_dir).unwrap();
+        fs::create_dir_all(&ws_dir)?;
         let registry = WorkspaceRegistry::build(
             root,
             [WorkspaceRegistration {
@@ -236,11 +236,11 @@ mod tests {
                 root: PathBuf::from("ws"),
             }],
         )
-        .unwrap();
+        .map_err(ctx("registry"))?;
         let binding = registry
             .resolve(&TenantId::from_str("t"), &WorkspaceId::from_str("w"))
-            .unwrap();
-        SandboxSpec::from_resolved(binding, PermissionSet::from_policy(permissions))
+            .map_err(ctx("binding"))?;
+        Ok(SandboxSpec::from_resolved(binding, PermissionSet::from_policy(permissions)))
     }
 
     fn make_ctx(sandbox: SandboxSpec) -> ToolExecutionContext {
@@ -256,102 +256,101 @@ mod tests {
     }
 
     #[test]
-    fn test_fs_write_writes_file_successfully() {
-        let dir = TempDir::new().unwrap();
+    fn test_fs_write_writes_file_successfully() -> TestResult {
+        let dir = TempDir::new()?;
         let ws = dir.path().join("ws");
-        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&ws)?;
 
         let executor = FsWriteExecutor;
-        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::WriteWorkspace]);
+        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::WriteWorkspace])?;
         let ctx = make_ctx(sandbox);
         let call = make_call(serde_json::json!({
             "path": "output.txt",
             "content": "hello from test"
         }));
 
-        let result = executor.write_file(&ctx, &call).unwrap();
+        let result = executor.write_file(&ctx, &call)?;
         match &result {
             ToolOutput::Text { content } => {
                 assert!(content.contains("15"), "expected byte count 15: {content}");
                 assert!(content.contains("output.txt"), "unexpected: {content}");
             }
-            other => panic!("expected text output, got: {other:?}"),
+            other => return Err(TestError::Unexpected(format!("expected text output, got: {other:?}"))),
         }
 
         // Verify the file was actually written
-        let written = fs::read_to_string(ws.join("output.txt")).unwrap();
+        let written = fs::read_to_string(ws.join("output.txt"))?;
         assert_eq!(written, "hello from test");
-        let names: Vec<String> = fs::read_dir(&ws)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
+        let names = fs::read_dir(&ws)?
+            .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect::<std::io::Result<Vec<String>>>()?;
         assert_eq!(
             names,
             vec!["output.txt".to_owned()],
             "temporary write file should be renamed or cleaned up"
         );
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_fs_write_preserves_existing_file_permissions() {
+    fn test_fs_write_preserves_existing_file_permissions() -> TestResult {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new()?;
         let ws = dir.path().join("ws");
-        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&ws)?;
         let target = ws.join("private.txt");
-        fs::write(&target, "old content").unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&target, "old content")?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
 
         let executor = FsWriteExecutor;
-        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::WriteWorkspace]);
+        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::WriteWorkspace])?;
         let ctx = make_ctx(sandbox);
         let call = make_call(serde_json::json!({
             "path": "private.txt",
             "content": "replacement"
         }));
 
-        let result = executor.write_file(&ctx, &call).unwrap();
+        let result = executor.write_file(&ctx, &call)?;
         assert!(matches!(result, ToolOutput::Text { .. }));
-        assert_eq!(fs::read_to_string(&target).unwrap(), "replacement");
-        assert_eq!(
-            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        assert_eq!(fs::read_to_string(&target)?, "replacement");
+        assert_eq!(fs::metadata(&target)?.permissions().mode() & 0o777, 0o600);
+        Ok(())
     }
 
     #[test]
-    fn test_fs_write_denied_when_no_write_permission() {
-        let dir = TempDir::new().unwrap();
+    fn test_fs_write_denied_when_no_write_permission() -> TestResult {
+        let dir = TempDir::new()?;
         let ws = dir.path().join("ws");
-        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&ws)?;
 
         let executor = FsWriteExecutor;
-        let sandbox = make_sandbox_with_permissions(dir.path(), vec![]);
+        let sandbox = make_sandbox_with_permissions(dir.path(), vec![])?;
         let ctx = make_ctx(sandbox);
         let call = make_call(serde_json::json!({
             "path": "any.txt",
             "content": "data"
         }));
 
-        let result = executor.write_file(&ctx, &call).unwrap();
+        let result = executor.write_file(&ctx, &call)?;
         match result {
             ToolOutput::Error { message } => {
                 assert!(message.contains("WriteWorkspace"), "unexpected: {message}");
             }
-            other => panic!("expected error output, got: {other:?}"),
+            other => return Err(TestError::Unexpected(format!("expected error output, got: {other:?}"))),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_fs_write_invalid_args_returns_err() {
-        let dir = TempDir::new().unwrap();
+    fn test_fs_write_invalid_args_returns_err() -> TestResult {
+        let dir = TempDir::new()?;
         let ws = dir.path().join("ws");
-        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&ws)?;
 
         let executor = FsWriteExecutor;
-        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::WriteWorkspace]);
+        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::WriteWorkspace])?;
         let ctx = make_ctx(sandbox);
         // Missing "content"
         let call = make_call(serde_json::json!({ "path": "out.txt" }));
@@ -361,15 +360,16 @@ mod tests {
             matches!(result, Err(ToolsError::InvalidArguments { .. })),
             "expected InvalidArguments, got: {result:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_fs_write_rejects_protected_paths() {
-        let fixture = Fixture::new();
-        fs::create_dir_all(fixture.ws.join(".git/hooks")).unwrap();
-        fs::create_dir_all(fixture.ws.join(".harw")).unwrap();
-        fs::create_dir_all(fixture.ws.join("vendor/lib/.GIT")).unwrap();
-        let ctx = fixture.ctx(vec![Permission::WriteWorkspace]);
+    fn test_fs_write_rejects_protected_paths() -> TestResult {
+        let fixture = Fixture::new()?;
+        fs::create_dir_all(fixture.ws.join(".git/hooks"))?;
+        fs::create_dir_all(fixture.ws.join(".harw"))?;
+        fs::create_dir_all(fixture.ws.join("vendor/lib/.GIT"))?;
+        let ctx = fixture.ctx(vec![Permission::WriteWorkspace])?;
 
         for path in [
             ".git/hooks/pre-commit",
@@ -381,11 +381,13 @@ mod tests {
         ] {
             let args = serde_json::json!({ "path": path, "content": "#!/bin/sh" });
             let call = call("fs.write", args);
-            match FsWriteExecutor.write_file(&ctx, &call).unwrap() {
+            match FsWriteExecutor.write_file(&ctx, &call)? {
                 ToolOutput::Error { message } => {
                     assert!(message.contains("geschützt"), "{path}: {message}");
                 }
-                other => panic!("{path}: expected error, got {other:?}"),
+                other => {
+                    return Err(TestError::Unexpected(format!("{path}: expected error, got {other:?}")));
+                }
             }
         }
         assert!(!fixture.ws.join(".git/hooks/pre-commit").exists());
@@ -395,37 +397,39 @@ mod tests {
         // Ähnliche, aber ungeschützte Namen bleiben schreibbar.
         let call = call("fs.write", serde_json::json!({ "path": ".gitignore", "content": "x" }));
         assert!(matches!(
-            FsWriteExecutor.write_file(&ctx, &call).unwrap(),
+            FsWriteExecutor.write_file(&ctx, &call)?,
             ToolOutput::Text { .. }
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_fs_write_replaces_target_symlink_without_following() {
+    fn test_fs_write_replaces_target_symlink_without_following() -> TestResult {
         use std::os::unix::fs::PermissionsExt;
 
-        let fixture = Fixture::new();
+        let fixture = Fixture::new()?;
         let secret = fixture.outside.join("secret.txt");
-        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
-        fixture.plant_escapes();
-        let ctx = fixture.ctx(vec![Permission::WriteWorkspace]);
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600))?;
+        fixture.plant_escapes()?;
+        let ctx = fixture.ctx(vec![Permission::WriteWorkspace])?;
 
         let call = call("fs.write", serde_json::json!({ "path": "link_file", "content": "neu" }));
-        let output = FsWriteExecutor.write_file(&ctx, &call).unwrap();
+        let output = FsWriteExecutor.write_file(&ctx, &call)?;
         assert!(matches!(output, ToolOutput::Text { .. }), "{output:?}");
-        assert_eq!(fs::read_to_string(&secret).unwrap(), SECRET, "Ziel darf unberührt bleiben");
+        assert_eq!(fs::read_to_string(&secret)?, SECRET, "Ziel darf unberührt bleiben");
         let replaced = fixture.ws.join("link_file");
-        let meta = fs::symlink_metadata(&replaced).unwrap();
+        let meta = fs::symlink_metadata(&replaced)?;
         assert!(meta.file_type().is_file(), "Symlink muss durch Datei ersetzt sein");
-        assert_eq!(fs::read_to_string(&replaced).unwrap(), "neu");
+        assert_eq!(fs::read_to_string(&replaced)?, "neu");
         assert_eq!(meta.permissions().mode() & 0o777, 0o644, "keine Mode-Kopie vom Symlink-Ziel");
+        Ok(())
     }
 
     #[test]
-    fn test_fs_write_rejects_symlinked_parent_and_traversal() {
-        let fixture = Fixture::new();
-        fixture.plant_escapes();
-        let ctx = fixture.ctx(vec![Permission::WriteWorkspace]);
+    fn test_fs_write_rejects_symlinked_parent_and_traversal() -> TestResult {
+        let fixture = Fixture::new()?;
+        fixture.plant_escapes()?;
+        let ctx = fixture.ctx(vec![Permission::WriteWorkspace])?;
 
         let escapes = [
             "link_dir/planted.txt",
@@ -437,29 +441,35 @@ mod tests {
         ];
         for path in escapes {
             let call = call("fs.write", serde_json::json!({ "path": path, "content": "x" }));
-            let output = FsWriteExecutor.write_file(&ctx, &call).unwrap();
+            let output = FsWriteExecutor.write_file(&ctx, &call)?;
             assert!(matches!(output, ToolOutput::Error { .. }), "{path}: {output:?}");
-            assert!(!render(&output).contains(fixture.outside.to_str().unwrap()));
+            let outside = fixture
+                .outside
+                .to_str()
+                .ok_or(TestError::Missing("outside as str"))?;
+            assert!(!render(&output)?.contains(outside));
         }
         assert!(!fixture.outside.join("planted.txt").exists());
         assert!(!fixture.ws.join("planted.txt").exists());
         assert!(!fixture.ws.join("missing").exists(), "Elternverzeichnisse werden nicht angelegt");
+        Ok(())
     }
 
     #[test]
-    fn test_fs_write_race_parent_replaced_by_symlink() {
-        let fixture = Fixture::new();
-        fs::create_dir_all(fixture.ws.join("out")).unwrap();
-        let ctx = fixture.ctx(vec![Permission::WriteWorkspace]);
+    fn test_fs_write_race_parent_replaced_by_symlink() -> TestResult {
+        let fixture = Fixture::new()?;
+        fs::create_dir_all(fixture.ws.join("out"))?;
+        let ctx = fixture.ctx(vec![Permission::WriteWorkspace])?;
         let call = call("fs.write", serde_json::json!({ "path": "out/file.txt", "content": "x" }));
-        let output = FsWriteExecutor.write_file(&ctx, &call).unwrap();
+        let output = FsWriteExecutor.write_file(&ctx, &call)?;
         assert!(matches!(output, ToolOutput::Text { .. }), "{output:?}");
 
         // Wettlauf-Surrogat: Elternverzeichnis gegen Symlink nach außen getauscht.
-        fs::rename(fixture.ws.join("out"), fixture.ws.join("out_old")).unwrap();
-        std::os::unix::fs::symlink(&fixture.outside, fixture.ws.join("out")).unwrap();
-        let output = FsWriteExecutor.write_file(&ctx, &call).unwrap();
+        fs::rename(fixture.ws.join("out"), fixture.ws.join("out_old"))?;
+        std::os::unix::fs::symlink(&fixture.outside, fixture.ws.join("out"))?;
+        let output = FsWriteExecutor.write_file(&ctx, &call)?;
         assert!(matches!(output, ToolOutput::Error { .. }), "{output:?}");
         assert!(!fixture.outside.join("file.txt").exists());
+        Ok(())
     }
 }

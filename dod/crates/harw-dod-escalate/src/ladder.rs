@@ -198,6 +198,7 @@ impl Ladder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_dod_rules::triaged_finding_for_test;
     use harw_types::{CgroupId, FindingId};
 
@@ -207,87 +208,117 @@ mod tests {
     // Fixtur muss sie deshalb direkt setzen können, statt über eine Regel
     // zu gehen. `triaged_finding_for_test` (Feature `test-support`, siehe
     // `harw-dod-rules/src/finding.rs`-Moduldoku) ist genau dafür da.
-    fn triggered_finding(severity: Severity, hardness: Hardness, verdict: Verdict) -> Finding<Triaged> {
-        triaged_finding_for_test(
+    fn triggered_finding(
+        severity: Severity,
+        hardness: Hardness,
+        verdict: Verdict,
+    ) -> TestResult<Finding<Triaged>> {
+        Ok(triaged_finding_for_test(
             "egress-flow",
             FindingKind::RuleTriggered,
             severity,
             hardness,
             "egress flow to evil.example.com:443 is outside the allowed network scope",
             jiff::Timestamp::UNIX_EPOCH,
-            FindingId::try_from_str("ladder-test-finding").expect("non-empty id"),
+            FindingId::try_from_str("ladder-test-finding").map_err(ctx("non-empty id"))?,
             verdict,
-        )
+        ))
     }
 
     // -- Zulässigkeitsmatrix: aufrufen statt nachbauen -----------------------
 
     #[test]
-    fn test_admissible_allows_freeze_from_rule_triggered_and_forbids_kill() {
+    fn test_admissible_allows_freeze_from_rule_triggered_and_forbids_kill() -> TestResult {
         let freeze = WardenAction::FreezeCgroup {
-            cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
+            cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("gültige CgroupId"))?,
         };
         assert!(Ladder::admissible(&freeze, EscalationStage::RuleTriggered));
 
         let kill = WardenAction::KillProcessTree {
-            cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
+            cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("gültige CgroupId"))?,
         };
         assert!(!Ladder::admissible(&kill, EscalationStage::RuleTriggered));
         assert!(Ladder::admissible(&kill, EscalationStage::Escalated));
+        Ok(())
     }
 
     // -- Aufstiegsregel -------------------------------------------------------
 
     #[test]
-    fn test_stage_for_returns_none_for_unconfirmed_verdict() {
-        let finding = triggered_finding(Severity::Critical, Hardness::Observed, Verdict::NeedsReview);
+    fn test_stage_for_returns_none_for_unconfirmed_verdict() -> TestResult {
+        let finding =
+            triggered_finding(Severity::Critical, Hardness::Observed, Verdict::NeedsReview)?;
         assert_eq!(Ladder::stage_for(&finding), None);
+        Ok(())
     }
 
     #[test]
-    fn test_stage_for_returns_rule_triggered_when_not_maximally_severe() {
-        let finding = triggered_finding(Severity::High, Hardness::Observed, Verdict::Confirmed);
-        assert_eq!(Ladder::stage_for(&finding), Some(EscalationStage::RuleTriggered));
+    fn test_stage_for_returns_rule_triggered_when_not_maximally_severe() -> TestResult {
+        let finding = triggered_finding(Severity::High, Hardness::Observed, Verdict::Confirmed)?;
+        assert_eq!(
+            Ladder::stage_for(&finding),
+            Some(EscalationStage::RuleTriggered)
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_stage_for_returns_rule_triggered_when_not_maximally_hard() {
-        let finding = triggered_finding(Severity::Critical, Hardness::Correlated, Verdict::Confirmed);
-        assert_eq!(Ladder::stage_for(&finding), Some(EscalationStage::RuleTriggered));
+    fn test_stage_for_returns_rule_triggered_when_not_maximally_hard() -> TestResult {
+        let finding =
+            triggered_finding(Severity::Critical, Hardness::Correlated, Verdict::Confirmed)?;
+        assert_eq!(
+            Ladder::stage_for(&finding),
+            Some(EscalationStage::RuleTriggered)
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_stage_for_returns_escalated_when_critical_and_observed() {
-        let finding = triggered_finding(Severity::Critical, Hardness::Observed, Verdict::Confirmed);
-        assert_eq!(Ladder::stage_for(&finding), Some(EscalationStage::Escalated));
+    fn test_stage_for_returns_escalated_when_critical_and_observed() -> TestResult {
+        let finding =
+            triggered_finding(Severity::Critical, Hardness::Observed, Verdict::Confirmed)?;
+        assert_eq!(
+            Ladder::stage_for(&finding),
+            Some(EscalationStage::Escalated)
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_stage_for_is_deterministic_for_identical_findings() {
-        let a = triggered_finding(Severity::Critical, Hardness::Observed, Verdict::Confirmed);
-        let b = triggered_finding(Severity::Critical, Hardness::Observed, Verdict::Confirmed);
+    fn test_stage_for_is_deterministic_for_identical_findings() -> TestResult {
+        let a = triggered_finding(Severity::Critical, Hardness::Observed, Verdict::Confirmed)?;
+        let b = triggered_finding(Severity::Critical, Hardness::Observed, Verdict::Confirmed)?;
         assert_eq!(Ladder::stage_for(&a), Ladder::stage_for(&b));
+        Ok(())
     }
 
     // -- `stage_for_or_reject`: die Andockung für `harw-plan-bridge` --------
 
     #[test]
-    fn test_stage_for_or_reject_matches_stage_for_when_escalatable() {
-        let finding = triggered_finding(Severity::Critical, Hardness::Observed, Verdict::Confirmed);
+    fn test_stage_for_or_reject_matches_stage_for_when_escalatable() -> TestResult {
+        let finding =
+            triggered_finding(Severity::Critical, Hardness::Observed, Verdict::Confirmed)?;
         assert!(matches!(
             Ladder::stage_for_or_reject(&finding),
             Ok(EscalationStage::Escalated)
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_stage_for_or_reject_rejects_unescalatable_finding_content_free() {
-        let finding = triggered_finding(Severity::Critical, Hardness::Observed, Verdict::NeedsReview);
-        let err = Ladder::stage_for_or_reject(&finding).unwrap_err();
+    fn test_stage_for_or_reject_rejects_unescalatable_finding_content_free() -> TestResult {
+        let finding =
+            triggered_finding(Severity::Critical, Hardness::Observed, Verdict::NeedsReview)?;
+        let Err(err) = Ladder::stage_for_or_reject(&finding) else {
+            return Err(TestError::Unexpected(
+                "stage_for_or_reject muss ablehnen".to_owned(),
+            ));
+        };
         assert!(matches!(err, EscalateError::NotEscalatable));
         // Inhaltsfrei: keine Ziffern, keine der bekannten ID-Präfixe.
         let text = err.to_string();
         assert!(!text.chars().any(|c| c.is_ascii_digit()));
         assert!(!text.contains("finding-"));
+        Ok(())
     }
 }

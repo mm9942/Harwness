@@ -108,9 +108,7 @@ fn format_usage(snapshot: &SessionStateSnapshot, meta: Option<&SessionMeta>) -> 
     };
     let rounds_line = match meta {
         Some(meta) => format!("Runden: {}", meta.usage_rounds),
-        None => {
-            "Runden: nicht erfasst (Sitzungszustand führt keinen Rundenzähler)".to_owned()
-        }
+        None => "Runden: nicht erfasst (Sitzungszustand führt keinen Rundenzähler)".to_owned(),
     };
     let drift_line = match meta {
         Some(meta) if meta.drift_events.is_empty() => "\nWächter-Ereignisse: keine".to_owned(),
@@ -208,21 +206,20 @@ async fn usage(ctx: &OpContext, _args: UsageArgs) -> Result<OpOutput, OpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
+    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_operations::FromRawArgs;
     use harw_operations::context::ServiceMap;
-    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TokenUsage, TurnId, WorkspaceId};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn test_context() -> (OpContext, std::path::PathBuf) {
+    fn test_context() -> TestResult<(OpContext, std::path::PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "harw-usage-test-{}-{id}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(root.join("ws")).expect("create test workspace");
+        let root =
+            std::env::temp_dir().join(format!("harw-usage-test-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(root.join("ws")).map_err(ctx("create test workspace"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -231,18 +228,18 @@ mod tests {
                 root: std::path::PathBuf::from("ws"),
             }],
         )
-        .expect("build workspace registry");
+        .map_err(ctx("build workspace registry"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .expect("resolve workspace binding");
+            .map_err(ctx("resolve workspace binding"))?;
         let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
-        (
+        Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new()),
             root,
-        )
+        ))
     }
 
     #[test]
@@ -252,15 +249,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn usage_without_state_store_returns_clear_german_message() {
-        let (ctx, root) = test_context();
+    async fn usage_without_state_store_returns_clear_german_message() -> TestResult {
+        let (op_ctx, root) = test_context()?;
 
-        let result = super::usage(&ctx, UsageArgs::default()).await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        let result = super::usage(&op_ctx, UsageArgs::default()).await;
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
 
         match result {
-            Ok(output) => assert_eq!(output.text, NO_STATE_STORE_MESSAGE),
-            Err(error) => panic!("unexpected error: {error}"),
+            Ok(output) => {
+                assert_eq!(output.text, NO_STATE_STORE_MESSAGE);
+                Ok(())
+            }
+            Err(error) => Err(TestError::Unexpected(format!("unexpected error: {error}"))),
         }
     }
 
@@ -319,22 +319,21 @@ mod tests {
     // (`load_or_derive` über ein leeres, temporäres Wurzelverzeichnis ohne
     // Transcript), statt die vielen `SessionMeta`-Felder von Hand zu
     // literalisieren.
-    fn fresh_meta_for_test() -> (harw_session_store::meta::SessionMeta, std::path::PathBuf) {
+    fn fresh_meta_for_test()
+    -> TestResult<(harw_session_store::meta::SessionMeta, std::path::PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "harw-usage-meta-test-{}-{id}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).expect("create test meta root");
+        let root =
+            std::env::temp_dir().join(format!("harw-usage-meta-test-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&root).map_err(ctx("create test meta root"))?;
         let session = SessionId::new();
         let meta = harw_session_store::meta::load_or_derive(&root, &session)
-            .expect("derive fresh meta over an empty root");
-        (meta, root)
+            .map_err(ctx("derive fresh meta over an empty root"))?;
+        Ok((meta, root))
     }
 
     #[test]
-    fn format_usage_with_meta_shows_real_rounds_and_drift_events() {
+    fn format_usage_with_meta_shows_real_rounds_and_drift_events() -> TestResult {
         let snapshot = SessionStateSnapshot {
             version: 1,
             mode: harw_core::InteractionMode::default(),
@@ -343,7 +342,7 @@ mod tests {
             base_activation: empty_activation(),
             activation: empty_activation(),
         };
-        let (mut meta, root) = fresh_meta_for_test();
+        let (mut meta, root) = fresh_meta_for_test()?;
         meta.usage_rounds = 7;
         meta.drift_events
             .insert("repeated_failing_call".to_owned(), 3);
@@ -354,10 +353,11 @@ mod tests {
         assert!(report.contains("Runden: 7"));
         assert!(report.contains("Wächter-Ereignisse:"));
         assert!(report.contains("repeated_failing_call: 3"));
+        Ok(())
     }
 
     #[test]
-    fn format_usage_with_meta_and_no_drift_events_says_so() {
+    fn format_usage_with_meta_and_no_drift_events_says_so() -> TestResult {
         let snapshot = SessionStateSnapshot {
             version: 1,
             mode: harw_core::InteractionMode::default(),
@@ -366,11 +366,12 @@ mod tests {
             base_activation: empty_activation(),
             activation: empty_activation(),
         };
-        let (meta, root) = fresh_meta_for_test();
+        let (meta, root) = fresh_meta_for_test()?;
 
         let report = format_usage(&snapshot, Some(&meta));
         std::fs::remove_dir_all(root).ok();
 
         assert!(report.contains("Wächter-Ereignisse: keine"));
+        Ok(())
     }
 }

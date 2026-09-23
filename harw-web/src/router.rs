@@ -342,7 +342,9 @@ impl WebRouteTable {
 
     // Sucht den vollständigen Eintrag (Adapter + deklarierte Methode).
     fn find_entry(&self, path: &str) -> Option<&WebRoute> {
-        self.routes.iter().find(|route| route.adapter.path() == path)
+        self.routes
+            .iter()
+            .find(|route| route.adapter.path() == path)
     }
 
     /// Sucht eine Route über ihren exakten Pfad.
@@ -396,7 +398,9 @@ impl WebRouteTable {
     /// Iteriert über alle Routen samt deklarierter Methode in
     /// Registrierungsreihenfolge.
     pub fn iter_with_methods(&self) -> impl Iterator<Item = (&WebAdapter, WebMethod)> {
-        self.routes.iter().map(|route| (&route.adapter, route.method))
+        self.routes
+            .iter()
+            .map(|route| (&route.adapter, route.method))
     }
 }
 
@@ -416,6 +420,7 @@ mod tests {
     };
     use crate::authz::StaticUidTierMap;
     use crate::peer::PeerCredentials;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Testoperation mit konfigurierbarer `Surface::Web`-Deklaration.
     struct TierOp {
@@ -446,8 +451,17 @@ mod tests {
             }))
         }
 
-        fn run<'a>(&'a self, _ctx: &'a harw_operations::context::OpContext, _input: OpInput) -> OpFuture<'a> {
-            Box::pin(async { Ok(OpOutput { text: "ok".to_owned(), data: None }) })
+        fn run<'a>(
+            &'a self,
+            _ctx: &'a harw_operations::context::OpContext,
+            _input: OpInput,
+        ) -> OpFuture<'a> {
+            Box::pin(async {
+                Ok(OpOutput {
+                    text: "ok".to_owned(),
+                    data: None,
+                })
+            })
         }
     }
 
@@ -468,8 +482,17 @@ mod tests {
                 busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
-        fn run<'a>(&'a self, _ctx: &'a harw_operations::context::OpContext, _input: OpInput) -> OpFuture<'a> {
-            Box::pin(async { Ok(OpOutput { text: "noop".to_owned(), data: None }) })
+        fn run<'a>(
+            &'a self,
+            _ctx: &'a harw_operations::context::OpContext,
+            _input: OpInput,
+        ) -> OpFuture<'a> {
+            Box::pin(async {
+                Ok(OpOutput {
+                    text: "noop".to_owned(),
+                    data: None,
+                })
+            })
         }
     }
 
@@ -488,7 +511,11 @@ mod tests {
     }
 
     /// Wie [`tier_op`], aber mit frei wählbarer deklarierter Methode.
-    fn method_op(name: &'static str, path: &'static str, method: WebMethod) -> std::sync::Arc<dyn Operation> {
+    fn method_op(
+        name: &'static str,
+        path: &'static str,
+        method: WebMethod,
+    ) -> std::sync::Arc<dyn Operation> {
         std::sync::Arc::new(TierOp {
             name,
             path,
@@ -509,8 +536,16 @@ mod tests {
     /// Baut eine Registry mit je einer Route pro Berechtigungsstufe.
     fn four_tier_registry() -> OperationRegistry {
         let mut registry = OperationRegistry::new();
-        registry.register(tier_op("observer-op", "/api/observer", PermissionTier::Observer));
-        registry.register(tier_op("operator-op", "/api/operator", PermissionTier::Operator));
+        registry.register(tier_op(
+            "observer-op",
+            "/api/observer",
+            PermissionTier::Observer,
+        ));
+        registry.register(tier_op(
+            "operator-op",
+            "/api/operator",
+            PermissionTier::Operator,
+        ));
         registry.register(tier_op(
             "maintainer-op",
             "/api/maintainer",
@@ -527,31 +562,33 @@ mod tests {
     // ── Route ohne OperationMeta ist nicht konstruierbar ──────────────────────
 
     #[test]
-    fn test_route_table_has_no_way_to_add_a_route_without_an_operation() {
+    fn test_route_table_has_no_way_to_add_a_route_without_an_operation() -> TestResult {
         let mut registry = OperationRegistry::new();
         registry.register(std::sync::Arc::new(NoWebSurfaceOp));
-        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
         assert!(
             routes.is_empty(),
             "eine Operation ohne Surface::Web darf keine Route erzeugen — \
              WebRouteTable kennt keinen anderen Weg, eine Route hinzuzufügen"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_empty_registry_yields_empty_route_table() {
+    fn test_empty_registry_yields_empty_route_table() -> TestResult {
         let registry = OperationRegistry::new();
-        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
         assert!(routes.is_empty());
         assert_eq!(routes.len(), 0);
+        Ok(())
     }
 
     #[test]
-    fn test_duplicate_web_path_across_two_operations_is_rejected() {
+    fn test_duplicate_web_path_across_two_operations_is_rejected() -> TestResult {
         let mut registry = OperationRegistry::new();
         registry
             .try_register(tier_op("a", "/api/dup", PermissionTier::Observer))
-            .expect("die erste Operation belegt den Pfad");
+            .map_err(ctx("die erste Operation belegt den Pfad"))?;
         // Die Abwehr sitzt inzwischen eine Ebene früher: nicht erst beim Bau
         // der Routentabelle, sondern schon bei der Registrierung. `register()`
         // panickt bei einer Kollision (wie bereits bei Namens- und
@@ -559,30 +596,36 @@ mod tests {
         //
         // Zwei Operationen auf demselben Pfad sind über HTTP
         // ununterscheidbar -- das muss ein Fehler sein, kein stiller Vorrang.
-        let collision = registry
-            .try_register(tier_op("b", "/api/dup", PermissionTier::Observer))
-            .expect_err("ein doppelt belegter Web-Pfad muss abgelehnt werden");
+        let Err(collision) =
+            registry.try_register(tier_op("b", "/api/dup", PermissionTier::Observer))
+        else {
+            return Err(TestError::Unexpected(
+                "ein doppelt belegter Web-Pfad muss abgelehnt werden".into(),
+            ));
+        };
         assert!(matches!(
             collision,
             harw_operations::registry::RegistryError::WebPathCollision { .. }
         ));
+        Ok(())
     }
 
     // ── kein Web-Weg erreicht eine nicht registrierte Operation ───────────────
 
     #[test]
-    fn test_no_route_found_for_operation_never_registered() {
+    fn test_no_route_found_for_operation_never_registered() -> TestResult {
         let registry = four_tier_registry();
-        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
         assert!(routes.find("/api/never-registered").is_none());
+        Ok(())
     }
 
     // ── Tier-Ablehnungsmatrix ──────────────────────────────────────────────────
 
     #[test]
-    fn test_observer_caller_allowed_on_observer_route() {
+    fn test_observer_caller_allowed_on_observer_route() -> TestResult {
         let registry = four_tier_registry();
-        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
         let authz = StaticUidTierMap::new(vec![(1000, PermissionTier::Observer)]);
         let decision = decide_route(
             &routes,
@@ -592,12 +635,13 @@ mod tests {
             Some(WebMethod::Get),
         );
         assert!(matches!(decision, RouteDecision::Execute { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_observer_caller_denied_on_operator_route() {
+    fn test_observer_caller_denied_on_operator_route() -> TestResult {
         let registry = four_tier_registry();
-        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
         let authz = StaticUidTierMap::new(vec![(1000, PermissionTier::Observer)]);
         let decision = decide_route(
             &routes,
@@ -612,12 +656,13 @@ mod tests {
                 reason: ForbiddenReason::InsufficientTier
             }
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_operator_caller_allowed_on_operator_route() {
+    fn test_operator_caller_allowed_on_operator_route() -> TestResult {
         let registry = four_tier_registry();
-        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
         let authz = StaticUidTierMap::new(vec![(1000, PermissionTier::Operator)]);
         let decision = decide_route(
             &routes,
@@ -627,12 +672,13 @@ mod tests {
             Some(WebMethod::Get),
         );
         assert!(matches!(decision, RouteDecision::Execute { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_operator_caller_denied_on_maintainer_route() {
+    fn test_operator_caller_denied_on_maintainer_route() -> TestResult {
         let registry = four_tier_registry();
-        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
         let authz = StaticUidTierMap::new(vec![(1000, PermissionTier::Operator)]);
         let decision = decide_route(
             &routes,
@@ -647,12 +693,13 @@ mod tests {
                 reason: ForbiddenReason::InsufficientTier
             }
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_maintainer_caller_allowed_on_maintainer_route() {
+    fn test_maintainer_caller_allowed_on_maintainer_route() -> TestResult {
         let registry = four_tier_registry();
-        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
         let authz = StaticUidTierMap::new(vec![(1000, PermissionTier::Maintainer)]);
         let decision = decide_route(
             &routes,
@@ -662,12 +709,13 @@ mod tests {
             Some(WebMethod::Get),
         );
         assert!(matches!(decision, RouteDecision::Execute { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_maintainer_caller_denied_on_owner_route() {
+    fn test_maintainer_caller_denied_on_owner_route() -> TestResult {
         let registry = four_tier_registry();
-        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
         let authz = StaticUidTierMap::new(vec![(1000, PermissionTier::Maintainer)]);
         let decision = decide_route(
             &routes,
@@ -682,12 +730,13 @@ mod tests {
                 reason: ForbiddenReason::InsufficientTier
             }
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_owner_caller_allowed_on_owner_route() {
+    fn test_owner_caller_allowed_on_owner_route() -> TestResult {
         let registry = four_tier_registry();
-        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
         let authz = StaticUidTierMap::new(vec![(1000, PermissionTier::Owner)]);
         let decision = decide_route(
             &routes,
@@ -697,6 +746,7 @@ mod tests {
             Some(WebMethod::Get),
         );
         assert!(matches!(decision, RouteDecision::Execute { .. }));
+        Ok(())
     }
 
     /// Owner ist die höchste Stufe der Totalordnung — es gibt strukturell
@@ -706,9 +756,9 @@ mod tests {
     /// Owner ist deshalb keine höhere Route, sondern ein unbekannter Peer —
     /// dieselbe Ablehnung, die jede andere Stufe ebenfalls treffen kann.
     #[test]
-    fn test_owner_tier_route_denied_for_unknown_peer_instead_of_insufficient_tier() {
+    fn test_owner_tier_route_denied_for_unknown_peer_instead_of_insufficient_tier() -> TestResult {
         let registry = four_tier_registry();
-        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
         let authz = StaticUidTierMap::new(vec![]); // kein Eintrag für irgendeine UID
         let decision = decide_route(
             &routes,
@@ -723,14 +773,15 @@ mod tests {
                 reason: ForbiddenReason::UnknownPeer
             }
         ));
+        Ok(())
     }
 
     // ── NotFound / MethodNotAllowed / ApprovalRequired ────────────────────────
 
     #[test]
-    fn test_unknown_path_yields_not_found() {
+    fn test_unknown_path_yields_not_found() -> TestResult {
         let registry = four_tier_registry();
-        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
         let authz = StaticUidTierMap::with_default(vec![], PermissionTier::Owner);
         let decision = decide_route(
             &routes,
@@ -740,12 +791,13 @@ mod tests {
             Some(WebMethod::Get),
         );
         assert!(matches!(decision, RouteDecision::NotFound));
+        Ok(())
     }
 
     #[test]
-    fn test_wrong_method_yields_method_not_allowed_with_expected_method() {
+    fn test_wrong_method_yields_method_not_allowed_with_expected_method() -> TestResult {
         let registry = four_tier_registry();
-        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
         let authz = StaticUidTierMap::with_default(vec![], PermissionTier::Owner);
         // /api/observer deklariert method: Get; POST muss abgelehnt werden.
         let decision = decide_route(
@@ -761,19 +813,21 @@ mod tests {
                 expected: WebMethod::Get
             }
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_unsupported_http_method_yields_method_not_allowed() {
+    fn test_unsupported_http_method_yields_method_not_allowed() -> TestResult {
         let registry = four_tier_registry();
-        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
         let authz = StaticUidTierMap::with_default(vec![], PermissionTier::Owner);
         let decision = decide_route(&routes, &authz, &peer_with_tier(), "/api/observer", None);
         assert!(matches!(decision, RouteDecision::MethodNotAllowed { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_approval_required_route_is_never_executed_directly() {
+    fn test_approval_required_route_is_never_executed_directly() -> TestResult {
         let mut registry = OperationRegistry::new();
         registry.register(std::sync::Arc::new(TierOp {
             name: "irreversible",
@@ -782,7 +836,7 @@ mod tests {
             method: WebMethod::Post,
             approval: harw_operations::operation::ApprovalPolicy::Always,
         }));
-        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
         let authz = StaticUidTierMap::with_default(vec![], PermissionTier::Owner);
         let decision = decide_route(
             &routes,
@@ -795,73 +849,120 @@ mod tests {
             matches!(decision, RouteDecision::ApprovalRequired { .. }),
             "eine Route mit approval != None darf harw-web nie direkt ausführen"
         );
+        Ok(())
     }
 
     // ── F-031: deklarierte Methode, keine Ableitung ───────────────────────────
 
     #[test]
-    fn test_decide_route_get_on_post_route_yields_method_not_allowed() {
+    fn test_decide_route_get_on_post_route_yields_method_not_allowed() -> TestResult {
         let registry = get_and_post_registry();
-        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
         let authz = StaticUidTierMap::with_default(vec![], PermissionTier::Owner);
-        let decision = decide_route(&routes, &authz, &peer_with_tier(), "/api/write", Some(WebMethod::Get));
+        let decision = decide_route(
+            &routes,
+            &authz,
+            &peer_with_tier(),
+            "/api/write",
+            Some(WebMethod::Get),
+        );
         assert!(
-            matches!(decision, RouteDecision::MethodNotAllowed { expected: WebMethod::Post }),
+            matches!(
+                decision,
+                RouteDecision::MethodNotAllowed {
+                    expected: WebMethod::Post
+                }
+            ),
             "GET darf eine POST-Operation nie erreichen (F-031), erhalten: {decision:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_decide_route_post_on_get_route_yields_method_not_allowed() {
+    fn test_decide_route_post_on_get_route_yields_method_not_allowed() -> TestResult {
         let registry = get_and_post_registry();
-        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
         let authz = StaticUidTierMap::with_default(vec![], PermissionTier::Owner);
-        let decision = decide_route(&routes, &authz, &peer_with_tier(), "/api/read", Some(WebMethod::Post));
+        let decision = decide_route(
+            &routes,
+            &authz,
+            &peer_with_tier(),
+            "/api/read",
+            Some(WebMethod::Post),
+        );
         assert!(matches!(
             decision,
-            RouteDecision::MethodNotAllowed { expected: WebMethod::Get }
+            RouteDecision::MethodNotAllowed {
+                expected: WebMethod::Get
+            }
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_decide_route_correct_method_dispatches_to_declaring_operation() {
+    fn test_decide_route_correct_method_dispatches_to_declaring_operation() -> TestResult {
         let registry = get_and_post_registry();
-        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
         let authz = StaticUidTierMap::with_default(vec![], PermissionTier::Observer);
 
-        let post = decide_route(&routes, &authz, &peer_with_tier(), "/api/write", Some(WebMethod::Post));
+        let post = decide_route(
+            &routes,
+            &authz,
+            &peer_with_tier(),
+            "/api/write",
+            Some(WebMethod::Post),
+        );
         match post {
             RouteDecision::Execute { route, caller_tier } => {
                 assert_eq!(route.operation_name(), "write-op");
                 assert_eq!(caller_tier, PermissionTier::Observer);
             }
-            other => panic!("POST auf POST-Route muss Execute liefern, erhalten: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "POST auf POST-Route muss Execute liefern, erhalten: {other:?}"
+                )));
+            }
         }
 
-        let get = decide_route(&routes, &authz, &peer_with_tier(), "/api/read", Some(WebMethod::Get));
+        let get = decide_route(
+            &routes,
+            &authz,
+            &peer_with_tier(),
+            "/api/read",
+            Some(WebMethod::Get),
+        );
         match get {
             RouteDecision::Execute { route, .. } => assert_eq!(route.operation_name(), "read-op"),
-            other => panic!("GET auf GET-Route muss Execute liefern, erhalten: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "GET auf GET-Route muss Execute liefern, erhalten: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_decide_route_unsupported_method_on_post_route_is_rejected_before_authorization() {
+    fn test_decide_route_unsupported_method_on_post_route_is_rejected_before_authorization()
+    -> TestResult {
         let registry = get_and_post_registry();
-        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
         // Unbekannter Peer: die Methodenprüfung muss trotzdem vorher greifen.
         let authz = StaticUidTierMap::new(vec![]);
         let decision = decide_route(&routes, &authz, &peer_with_tier(), "/api/write", None);
         assert!(matches!(
             decision,
-            RouteDecision::MethodNotAllowed { expected: WebMethod::Post }
+            RouteDecision::MethodNotAllowed {
+                expected: WebMethod::Post
+            }
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_from_registry_takes_method_from_surface_web_declaration() {
+    fn test_from_registry_takes_method_from_surface_web_declaration() -> TestResult {
         let registry = get_and_post_registry();
-        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
         assert_eq!(routes.len(), 2);
         assert_eq!(routes.method_for("/api/read"), Some(WebMethod::Get));
         assert_eq!(routes.method_for("/api/write"), Some(WebMethod::Post));
@@ -872,20 +973,28 @@ mod tests {
             .collect();
         assert_eq!(
             collected,
-            vec![("/api/read", WebMethod::Get), ("/api/write", WebMethod::Post)]
+            vec![
+                ("/api/read", WebMethod::Get),
+                ("/api/write", WebMethod::Post)
+            ]
         );
+        Ok(())
     }
 
     /// Eine mutierende Route mit `approval = None` und `method = Post` ist genau
     /// der F-031-Fall (`/api/analyze`): die Methode kommt aus der Deklaration,
     /// nicht aus einer `readonly`-Heuristik oder dem Approval-Wert.
     #[test]
-    fn test_from_registry_post_without_approval_stays_post() {
+    fn test_from_registry_post_without_approval_stays_post() -> TestResult {
         let mut registry = OperationRegistry::new();
         registry.register(method_op("analyze-like", "/api/analyze", WebMethod::Post));
-        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let routes = WebRouteTable::from_registry(&registry).map_err(ctx("from_registry"))?;
         assert_eq!(routes.method_for("/api/analyze"), Some(WebMethod::Post));
-        assert_eq!(routes.find("/api/analyze").map(|r| r.operation_name()), Some("analyze-like"));
+        assert_eq!(
+            routes.find("/api/analyze").map(|r| r.operation_name()),
+            Some("analyze-like")
+        );
+        Ok(())
     }
 
     #[test]
@@ -901,13 +1010,15 @@ mod tests {
     }
 
     #[test]
-    fn test_method_name_matches_http_and_serde_form() {
+    fn test_method_name_matches_http_and_serde_form() -> TestResult {
         assert_eq!(method_name(WebMethod::Get), "GET");
         assert_eq!(method_name(WebMethod::Post), "POST");
         for method in [WebMethod::Get, WebMethod::Post] {
-            let serialized = serde_json::to_string(&method).unwrap();
+            let serialized =
+                serde_json::to_string(&method).map_err(ctx("serde_json::to_string"))?;
             assert_eq!(serialized, format!("\"{}\"", method_name(method)));
             assert_eq!(parse_web_method(method_name(method)), Some(method));
         }
+        Ok(())
     }
 }

@@ -238,6 +238,7 @@ impl BrowserDiagnostic {
 mod tests {
     use super::*;
     use crate::artifact::ArtifactKind;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn test_severity_critical_less_than_info() {
@@ -332,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn test_browser_diagnostic_serde_json_round_trip() {
+    fn test_browser_diagnostic_serde_json_round_trip() -> TestResult {
         let diagnostic = BrowserDiagnostic::new(
             Severity::Medium,
             DiagnosticSource::Driver,
@@ -342,9 +343,10 @@ mod tests {
         .with_evidence(ArtifactRef::new(ArtifactKind::Text, "text/plain", 8))
         .with_effect(EffectId::new());
 
-        let json = serde_json::to_string(&diagnostic).expect("diagnostic serializes");
+        let json = serde_json::to_string(&diagnostic).map_err(ctx("diagnostic serializes"))?;
         let decoded: BrowserDiagnostic =
-            serde_json::from_str(&json).expect("diagnostic deserializes");
+            serde_json::from_str(&json).map_err(ctx("diagnostic deserializes"))?;
         assert_eq!(decoded, diagnostic);
+        Ok(())
     }
 }

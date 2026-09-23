@@ -42,9 +42,8 @@ impl TranscriptReader {
         // `harw_fsutil::open_nofollow` ersetzt (plattformkorrekt über
         // `rustix::fs::OFlags::NOFOLLOW`).
         #[cfg(unix)]
-        let file =
-            harw_fsutil::open_nofollow(path, harw_fsutil::OpenMode::read_only())
-                .map_err(SessionStoreError::Io)?;
+        let file = harw_fsutil::open_nofollow(path, harw_fsutil::OpenMode::read_only())
+            .map_err(SessionStoreError::Io)?;
         #[cfg(not(unix))]
         let file = {
             let mut options = OpenOptions::new();
@@ -139,6 +138,7 @@ mod tests {
     use super::TranscriptReader;
     use crate::error::SessionStoreError;
     use crate::record::{RecordKind, TranscriptRecord};
+    use crate::test_support::{TestError, TestResult};
 
     fn record() -> TranscriptRecord {
         TranscriptRecord::new(
@@ -152,37 +152,42 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unterminated_final_record_even_when_json_is_complete() {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        let line = record().to_jsonl_line().unwrap();
-        file.write_all(line.trim_end_matches('\n').as_bytes())
-            .unwrap();
+    fn rejects_unterminated_final_record_even_when_json_is_complete() -> TestResult {
+        let mut file = tempfile::NamedTempFile::new()?;
+        let line = record().to_jsonl_line()?;
+        file.write_all(line.trim_end_matches('\n').as_bytes())?;
 
-        let error = TranscriptReader::open(file.path())
-            .unwrap()
-            .next()
-            .expect("the partial record must be observed")
-            .unwrap_err();
+        let Some(result) = TranscriptReader::open(file.path())?.next() else {
+            return Err(TestError::Missing("the partial record must be observed"));
+        };
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "expected the partial record to be rejected".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
             SessionStoreError::CorruptRecord { detail }
                 if detail == "unterminated final JSONL record"
         ));
+        Ok(())
     }
 
     #[test]
-    fn rejects_a_record_that_exceeds_the_maximum_size() {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        file.write_all(&vec![b' '; super::MAX_RECORD_BYTES])
-            .unwrap();
-        file.write_all(b"{}\n").unwrap();
+    fn rejects_a_record_that_exceeds_the_maximum_size() -> TestResult {
+        let mut file = tempfile::NamedTempFile::new()?;
+        file.write_all(&vec![b' '; super::MAX_RECORD_BYTES])?;
+        file.write_all(b"{}\n")?;
 
-        let error = TranscriptReader::open(file.path())
-            .unwrap()
-            .next()
-            .expect("the oversized record must be observed")
-            .unwrap_err();
+        let Some(result) = TranscriptReader::open(file.path())?.next() else {
+            return Err(TestError::Missing("the oversized record must be observed"));
+        };
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "expected the oversized record to be rejected".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
@@ -192,33 +197,40 @@ mod tests {
                     super::MAX_RECORD_BYTES
                 )
         ));
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn rejects_symlink_without_reading_target() {
+    fn rejects_symlink_without_reading_target() -> TestResult {
         use std::os::unix::fs::symlink;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir()?;
         let target = temp.path().join("outside-transcript.jsonl");
         let link = temp.path().join("session.jsonl");
-        std::fs::write(&target, b"not a transcript\n").unwrap();
-        symlink(&target, &link).unwrap();
+        std::fs::write(&target, b"not a transcript\n")?;
+        symlink(&target, &link)?;
 
         let error = match TranscriptReader::open(&link) {
             Err(error) => error,
-            Ok(_) => panic!("expected a symlink rejection"),
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "expected a symlink rejection".to_owned(),
+                ));
+            }
         };
 
         match error {
             SessionStoreError::Io(error) => {
                 assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
             }
-            error => panic!("expected a symlink rejection, got {error:?}"),
+            error => {
+                return Err(TestError::Unexpected(format!(
+                    "expected a symlink rejection, got {error:?}"
+                )));
+            }
         }
-        assert_eq!(
-            std::fs::read_to_string(target).unwrap(),
-            "not a transcript\n"
-        );
+        assert_eq!(std::fs::read_to_string(target)?, "not a transcript\n");
+        Ok(())
     }
 }

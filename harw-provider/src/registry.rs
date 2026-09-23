@@ -261,48 +261,48 @@ mod tests {
     use super::{HashMapProviderRegistry, ProviderRegistry};
     use crate::auth::{ApiKeyConfig, SghAuth};
     use crate::provider::{ProviderBuilder, ProviderRecord};
+    use crate::test_support::TestResult;
     use harw_types::{ProviderId, ProviderName};
 
-    fn record(name: &str, primary: bool) -> ProviderRecord {
+    fn record(name: &str, primary: bool) -> TestResult<ProviderRecord> {
         let builder = ProviderBuilder::new()
             .id(ProviderId::from(name))
             .name(ProviderName::from(name))
-            .base_url(Url::parse("https://api.example.com/v1").unwrap())
+            .base_url(Url::parse("https://api.example.com/v1")?)
             .auth(SghAuth::ApiKey(ApiKeyConfig {
                 api_key: SecretString::new("test-key".to_owned()),
             }));
 
-        if primary {
-            builder.primary().build_record().unwrap()
+        let record = if primary {
+            builder.primary().build_record()?
         } else {
-            builder.build_record().unwrap()
-        }
+            builder.build_record()?
+        };
+        Ok(record)
     }
 
-    fn registry_registered_in(order: &[&str]) -> HashMapProviderRegistry {
+    fn registry_registered_in(order: &[&str]) -> TestResult<HashMapProviderRegistry> {
         let mut registry = HashMapProviderRegistry::default();
-        registry.register(record("primary", true)).unwrap();
+        registry.register(record("primary", true)?)?;
         for name in order {
-            registry.register(record(name, false)).unwrap();
+            registry.register(record(name, false)?)?;
         }
-        registry
+        Ok(registry)
     }
 
     #[test]
-    fn hashmap_failover_order_is_stable_across_registration_orders() {
-        let first = registry_registered_in(&["zeta", "alpha", "middle"]);
-        let second = registry_registered_in(&["middle", "zeta", "alpha"]);
+    fn hashmap_failover_order_is_stable_across_registration_orders() -> TestResult {
+        let first = registry_registered_in(&["zeta", "alpha", "middle"])?;
+        let second = registry_registered_in(&["middle", "zeta", "alpha"])?;
 
         let first_order: Vec<_> = first
-            .resolve_execution_chain()
-            .unwrap()
+            .resolve_execution_chain()?
             .secondaries()
             .iter()
             .map(|provider| provider.name.as_str().to_owned())
             .collect();
         let second_order: Vec<_> = second
-            .resolve_execution_chain()
-            .unwrap()
+            .resolve_execution_chain()?
             .secondaries()
             .iter()
             .map(|provider| provider.name.as_str().to_owned())
@@ -310,5 +310,6 @@ mod tests {
 
         assert_eq!(first_order, ["alpha", "middle", "zeta"]);
         assert_eq!(second_order, first_order);
+        Ok(())
     }
 }

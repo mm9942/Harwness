@@ -1,11 +1,12 @@
 //! Fehlertyp der fanotify-Sonde `harw-probe-fs`.
 //!
 //! # Verantwortungsbereich
-//! [`ProbeError`] ist der eine Fehlertyp dieses Binaries. Er deckt vier
+//! [`ProbeError`] ist der eine Fehlertyp dieses Binaries. Er deckt fünf
 //! Quellen ab: die Landlock-Durchsetzung ([`crate::landlock`]), die
 //! (weiterhin unfertige) fanotify-Quelle ([`crate::source`]), den Sendeweg
-//! zum Sentinel ([`crate::sink`]) und Sensorfehler aus der Sammelschleife
-//! ([`crate::collect`], über `harw_dod_cap::SensorError`). Kommandozeilen-
+//! zum Sentinel ([`crate::sink`]), Sensorfehler aus der Sammelschleife
+//! ([`crate::collect`], über `harw_dod_cap::SensorError`) und den
+//! `completions`-Unterbefehl (über `harw_completions::CompletionError`). Kommandozeilen-
 //! fehler gehören **nicht** hierher — `clap::Error` behandelt `main`
 //! direkt, ohne Umweg über diesen Typ (Muster: `harw-sentinel/src/main.rs`).
 //!
@@ -27,6 +28,8 @@
 //! tragen genau so viel Kontext wie `harw-sentinel::ipc::IpcError::Bind`
 //! (den vom Betreiber selbst konfigurierten Socket-Pfad) — kein
 //! Dateiinhalt, kein vom Host gelesenes Geheimnis.
+//! [`ProbeError::Completions`] trägt höchstens Pfade der Shell-
+//! Konfiguration des aufrufenden Nutzers (Completion-Datei, rc-Datei).
 //!
 //! # Exportierte Typen
 //! [`ProbeError`].
@@ -83,6 +86,13 @@ pub enum ProbeError {
     ///   inhaltsfreie Sensorfehler. Über `std::error::Error::source()`
     ///   verlinkt.
     Sensor(harw_dod_cap::SensorError),
+    /// Der `completions`-Unterbefehl ist gescheitert (Skriptausgabe,
+    /// Installation oder Deinstallation).
+    ///
+    /// # Arguments
+    /// - `source` (`harw_completions::CompletionError`): die zugrunde
+    ///   liegende Ursache. Über `std::error::Error::source()` verlinkt.
+    Completions(harw_completions::CompletionError),
 }
 
 impl fmt::Display for ProbeError {
@@ -104,6 +114,7 @@ impl fmt::Display for ProbeError {
                 write!(f, "failed to encode a security event as JSON: {source}")
             }
             Self::Sensor(source) => write!(f, "sensor error: {source}"),
+            Self::Completions(source) => write!(f, "shell completions failed: {source}"),
         }
     }
 }
@@ -119,6 +130,7 @@ impl std::error::Error for ProbeError {
         match self {
             Self::EventEncodeFailed(source) => Some(source),
             Self::Sensor(source) => Some(source),
+            Self::Completions(source) => Some(source),
             _ => None,
         }
     }
@@ -136,9 +148,16 @@ impl From<serde_json::Error> for ProbeError {
     }
 }
 
+impl From<harw_completions::CompletionError> for ProbeError {
+    fn from(err: harw_completions::CompletionError) -> Self {
+        Self::Completions(err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ProbeError;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn test_landlock_unavailable_display_is_exact() {
@@ -197,11 +216,16 @@ mod tests {
     }
 
     #[test]
-    fn test_from_serde_json_error_wraps_into_event_encode_failed() {
-        let json_err = serde_json::from_str::<serde_json::Value>("{not valid json")
-            .expect_err("deliberately malformed JSON");
+    fn test_from_serde_json_error_wraps_into_event_encode_failed() -> TestResult {
+        let result = serde_json::from_str::<serde_json::Value>("{not valid json");
+        let Err(json_err) = result else {
+            return Err(TestError::Unexpected(
+                "deliberately malformed JSON: Err erwartet".to_owned(),
+            ));
+        };
         let mapped: ProbeError = json_err.into();
         assert!(matches!(mapped, ProbeError::EventEncodeFailed(_)));
         assert!(std::error::Error::source(&mapped).is_some());
+        Ok(())
     }
 }

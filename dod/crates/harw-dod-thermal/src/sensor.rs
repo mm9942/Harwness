@@ -379,6 +379,7 @@ mod tests {
     use jiff::Timestamp;
 
     use super::ThermalSensor;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Das `fixtures/`-Wurzelverzeichnis dieser Crate.
     fn fixtures_root() -> PathBuf {
@@ -402,11 +403,11 @@ mod tests {
     }
 
     #[test]
-    fn test_millicelsius_is_converted_to_celsius() {
+    fn test_millicelsius_is_converted_to_celsius() -> TestResult {
         let sensor = build_sensor(fixtures_root().join("one-zone/tree"));
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("one-zone Fixture muss erfolgreich pollen");
+            .map_err(ctx("one-zone Fixture muss erfolgreich pollen"))?;
 
         assert_eq!(reading.samples.len(), 1);
         // Epsilon-Vergleich statt `assert_eq!` auf `f64`: 45000/1000 = 45.0 ist
@@ -418,28 +419,30 @@ mod tests {
             "45000 Millidegree müssen 45.0 °C ergeben, war {}",
             reading.samples[0].value
         );
+        Ok(())
     }
 
     #[test]
-    fn test_multiple_zones_yield_distinct_metric_labels() {
+    fn test_multiple_zones_yield_distinct_metric_labels() -> TestResult {
         let sensor = build_sensor(fixtures_root().join("multi-zone/tree"));
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("multi-zone Fixture muss erfolgreich pollen");
+            .map_err(ctx("multi-zone Fixture muss erfolgreich pollen"))?;
 
         assert_eq!(reading.samples.len(), 2);
         assert_ne!(
             reading.samples[0].metric, reading.samples[1].metric,
             "zwei Zonen müssen unterschiedliche Metriknamen tragen"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_zone_without_type_file_falls_back_to_directory_name_label() {
+    fn test_zone_without_type_file_falls_back_to_directory_name_label() -> TestResult {
         let sensor = build_sensor(fixtures_root().join("zone-without-type/tree"));
-        let reading = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect("eine Zone ohne type-Datei muss trotzdem gemeldet werden");
+        let reading = sensor.poll(Timestamp::UNIX_EPOCH).map_err(ctx(
+            "eine Zone ohne type-Datei muss trotzdem gemeldet werden",
+        ))?;
 
         assert_eq!(reading.samples.len(), 1);
         assert!(
@@ -447,14 +450,20 @@ mod tests {
             "Ersatzlabel muss den Zonen-Verzeichnisnamen enthalten: {}",
             reading.samples[0].metric
         );
+        Ok(())
     }
 
     #[test]
-    fn test_non_numeric_temp_content_is_malformed_source_without_leaking_content() {
+    fn test_non_numeric_temp_content_is_malformed_source_without_leaking_content() -> TestResult {
         let sensor = build_sensor(fixtures_root().join("malformed/non-numeric"));
-        let err = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect_err("nicht-numerischer Inhalt muss scheitern");
+        let err = match sensor.poll(Timestamp::UNIX_EPOCH) {
+            Err(e) => e,
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "nicht-numerischer Inhalt muss scheitern".into(),
+                ));
+            }
+        };
 
         assert!(matches!(err, SensorError::MalformedSource));
         let rendered = format!("{err}{err:?}");
@@ -462,6 +471,7 @@ mod tests {
             !rendered.contains("not-a-number"),
             "Fehlermeldung darf den gelesenen Inhalt nicht enthalten: {rendered}"
         );
+        Ok(())
     }
 
     /// Der Ordner der echten Pi-Captures (`C-FIXT`, `harw-dod-fixtures`),
@@ -486,14 +496,14 @@ mod tests {
     /// [`harw_dod_cap::scope::AliasRoot`] löst der Sensor die reale
     /// Symlink-Kette auf und liest den echten erfassten Wert.
     #[test]
-    fn test_poll_reads_real_pi_capture_through_alias_scope_regression_f005() {
+    fn test_poll_reads_real_pi_capture_through_alias_scope_regression_f005() -> TestResult {
         let manifest_path = rpi5_captures_dir().join("thermal.json");
         let manifest = harw_dod_fixtures::capture_manifest::load(&manifest_path)
-            .expect("captures/rpi5-6.18/thermal.json muss ladbar sein");
+            .map_err(ctx("captures/rpi5-6.18/thermal.json muss ladbar sein"))?;
 
-        let tmp = tempfile::tempdir().expect("tempdir für die Materialisierung");
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir für die Materialisierung"))?;
         harw_dod_fixtures::capture_manifest::materialize(&manifest, tmp.path())
-            .expect("materialize muss die echte Symlink-Struktur anlegen");
+            .map_err(ctx("materialize muss die echte Symlink-Struktur anlegen"))?;
 
         // Dieselbe Beziehung wie in Produktion (`AliasRoot::sysfs_class`:
         // declared = Klassenpfad, resolved_prefix = `/sys/devices`), nur mit
@@ -502,7 +512,7 @@ mod tests {
         let declared = tmp.path().join("sys/class/thermal");
         let resolved_prefix = tmp.path().join("sys/devices");
         let alias = harw_dod_cap::scope::AliasRoot::new(declared, resolved_prefix)
-            .expect("AliasRoot::new mit Tempdir-Wurzeln");
+            .map_err(ctx("AliasRoot::new mit Tempdir-Wurzeln"))?;
         let scope = ReadScope::from_roots_and_aliases(Vec::new(), [alias]);
         let handle = SensorHandle::new(
             SensorId::from_str("thermal-alias-capture-test"),
@@ -511,9 +521,9 @@ mod tests {
         .bind(scope);
         let sensor = ThermalSensor::from(handle);
 
-        let reading = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect("Alias-Scope muss die reale Pi-Capture über den Symlink lesen");
+        let reading = sensor.poll(Timestamp::UNIX_EPOCH).map_err(ctx(
+            "Alias-Scope muss die reale Pi-Capture über den Symlink lesen",
+        ))?;
 
         assert_eq!(reading.samples.len(), 1);
         assert!(
@@ -521,6 +531,7 @@ mod tests {
             "69950 Millidegree aus der echten Capture müssen 69.95 °C ergeben, war {}",
             reading.samples[0].value
         );
+        Ok(())
     }
 
     harw_dod_fixtures::sensor_suite! {

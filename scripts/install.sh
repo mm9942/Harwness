@@ -245,6 +245,6 @@ cat <<EOF
 
 Harwness installed. Next:
   harw                      # first run launches onboarding, then the chat TUI
-  harw completion zsh       # shell completions (bash|zsh|fish|powershell)
+  harw completions --install    # shell completions (detects \$SHELL; bash|zsh|fish|elvish|powershell)
   harw doctor               # validate config + health checks
 EOF

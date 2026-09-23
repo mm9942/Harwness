@@ -130,23 +130,24 @@ fn display_root(root: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
-    fn temp_home() -> tempfile::TempDir {
-        let home = tempfile::tempdir().expect("create temporary HARW home");
-        harw_home::ensure_home(home.path()).expect("scaffold home");
-        home
+    fn temp_home() -> TestResult<tempfile::TempDir> {
+        let home = tempfile::tempdir().map_err(ctx("create temporary HARW home"))?;
+        harw_home::ensure_home(home.path()).map_err(ctx("scaffold home"))?;
+        Ok(home)
     }
 
-    fn temp_project() -> tempfile::TempDir {
-        let project = tempfile::tempdir().expect("create temporary project directory");
-        std::fs::create_dir(project.path().join(".harw")).expect("create .harw");
-        project
+    fn temp_project() -> TestResult<tempfile::TempDir> {
+        let project = tempfile::tempdir().map_err(ctx("create temporary project directory"))?;
+        std::fs::create_dir(project.path().join(".harw")).map_err(ctx("create .harw"))?;
+        Ok(project)
     }
 
     #[test]
-    fn test_run_trust_then_status_reports_trusted() {
-        let home = temp_home();
-        let project = temp_project();
+    fn test_run_trust_then_status_reports_trusted() -> TestResult {
+        let home = temp_home()?;
+        let project = temp_project()?;
 
         let trust_output = execute(
             home.path(),
@@ -154,7 +155,7 @@ mod tests {
                 path: Some(project.path().to_path_buf()),
             },
         )
-        .expect("trust succeeds");
+        .map_err(ctx("trust succeeds"))?;
         assert!(trust_output.starts_with("trusted: "));
         assert!(trust_output.contains("(digest blake3:"));
 
@@ -164,15 +165,17 @@ mod tests {
                 path: Some(project.path().to_path_buf()),
             },
         )
-        .expect("status succeeds");
-        let canonical = std::fs::canonicalize(project.path()).expect("canonicalize project");
+        .map_err(ctx("status succeeds"))?;
+        let canonical =
+            std::fs::canonicalize(project.path()).map_err(ctx("canonicalize project"))?;
         assert_eq!(status_output, format!("Trusted: {}", canonical.display()));
+        Ok(())
     }
 
     #[test]
-    fn test_run_untrust_unknown_reports_false() {
-        let home = temp_home();
-        let project = temp_project();
+    fn test_run_untrust_unknown_reports_false() -> TestResult {
+        let home = temp_home()?;
+        let project = temp_project()?;
 
         let output = execute(
             home.path(),
@@ -180,9 +183,11 @@ mod tests {
                 path: Some(project.path().to_path_buf()),
             },
         )
-        .expect("untrust of an unknown project still succeeds");
+        .map_err(ctx("untrust of an unknown project still succeeds"))?;
 
-        let canonical = std::fs::canonicalize(project.path()).expect("canonicalize project");
+        let canonical =
+            std::fs::canonicalize(project.path()).map_err(ctx("canonicalize project"))?;
         assert_eq!(output, format!("not trusted: {}", canonical.display()));
+        Ok(())
     }
 }

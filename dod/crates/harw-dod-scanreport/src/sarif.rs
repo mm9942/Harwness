@@ -219,13 +219,14 @@ fn build_event(result: &SarifResult, sensor: &SensorId, now: Timestamp) -> Secur
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn sensor_id() -> SensorId {
         SensorId::from_str("scanreport-0")
     }
 
     #[test]
-    fn test_to_events_maps_one_event_per_result() {
+    fn test_to_events_maps_one_event_per_result() -> TestResult {
         let json = r#"{
             "runs": [
                 {
@@ -236,17 +237,21 @@ mod tests {
                 }
             ]
         }"#;
-        let document: SarifDocument = serde_json::from_str(json).expect("valides SARIF-Fixture");
+        let document: SarifDocument =
+            serde_json::from_str(json).map_err(ctx("valides SARIF-Fixture"))?;
         let events = to_events(&document, &sensor_id(), Timestamp::UNIX_EPOCH);
         assert_eq!(events.len(), 2);
+        Ok(())
     }
 
     #[test]
-    fn test_to_events_empty_runs_yields_no_events() {
+    fn test_to_events_empty_runs_yields_no_events() -> TestResult {
         let json = r#"{"runs": []}"#;
-        let document: SarifDocument = serde_json::from_str(json).expect("valides SARIF-Fixture");
+        let document: SarifDocument =
+            serde_json::from_str(json).map_err(ctx("valides SARIF-Fixture"))?;
         let events = to_events(&document, &sensor_id(), Timestamp::UNIX_EPOCH);
         assert!(events.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -273,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_event_falls_back_on_missing_optional_fields() {
+    fn test_build_event_falls_back_on_missing_optional_fields() -> TestResult {
         let result = SarifResult {
             rule_id: None,
             level: None,
@@ -282,15 +287,16 @@ mod tests {
         };
         let event = build_event(&result, &sensor_id(), Timestamp::UNIX_EPOCH);
         let harw_dod_signals::EventKind::StructureDrift { severity, detail } = event.kind else {
-            panic!("erwartete StructureDrift");
+            return Err(TestError::Unexpected("erwartete StructureDrift".to_owned()));
         };
         assert_eq!(severity, DriftSeverity::Unknown);
         assert!(detail.contains("<ohne Regel>"));
         assert!(detail.contains("<ohne Fundstelle>"));
+        Ok(())
     }
 
     #[test]
-    fn test_build_event_includes_rule_level_and_uri() {
+    fn test_build_event_includes_rule_level_and_uri() -> TestResult {
         let json = r#"{
             "ruleId": "RUST-001",
             "level": "error",
@@ -299,15 +305,17 @@ mod tests {
                 {"physicalLocation": {"artifactLocation": {"uri": "src/main.rs"}}}
             ]
         }"#;
-        let result: SarifResult = serde_json::from_str(json).expect("valides Result-Fixture");
+        let result: SarifResult =
+            serde_json::from_str(json).map_err(ctx("valides Result-Fixture"))?;
         let event = build_event(&result, &sensor_id(), Timestamp::UNIX_EPOCH);
         let harw_dod_signals::EventKind::StructureDrift { severity, detail } = event.kind else {
-            panic!("erwartete StructureDrift");
+            return Err(TestError::Unexpected("erwartete StructureDrift".to_owned()));
         };
         assert_eq!(severity, DriftSeverity::High);
         assert!(detail.contains("RUST-001"));
         assert!(detail.contains("error"));
         assert!(detail.contains("src/main.rs"));
         assert!(detail.contains("unsafe pattern"));
+        Ok(())
     }
 }

@@ -103,20 +103,28 @@ impl ProbeMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::{BpfEventMetadata, BpfLossSnapshot, ProbeMessage, ProbeStamp, TimeMappingConfidence};
+    use super::{
+        BpfEventMetadata, BpfLossSnapshot, ProbeMessage, ProbeStamp, TimeMappingConfidence,
+    };
+    use crate::test_support::{TestResult, ctx};
     use crate::{EventKind, SecurityEvent};
     use harw_types::SensorId;
     use jiff::Timestamp;
 
     #[test]
-    fn event_message_keeps_profile_digest_and_v1_identity_metadata() {
+    fn event_message_keeps_profile_digest_and_v1_identity_metadata() -> TestResult {
         let message = ProbeMessage::Event {
-            stamp: ProbeStamp { profile_id: "selected-services".into(), config_digest: "ab".repeat(32) },
+            stamp: ProbeStamp {
+                profile_id: "selected-services".into(),
+                config_digest: "ab".repeat(32),
+            },
             event: SecurityEvent {
                 sensor: SensorId::from_str("probe-bpf-procmon-0"),
                 observed_at: Timestamp::UNIX_EPOCH,
                 actor: None,
-                kind: EventKind::SensorDegraded { sensor: SensorId::from_str("probe-bpf-procmon-0") },
+                kind: EventKind::SensorDegraded {
+                    sensor: SensorId::from_str("probe-bpf-procmon-0"),
+                },
             },
             metadata: Some(BpfEventMetadata {
                 wire_version: 1,
@@ -133,9 +141,11 @@ mod tests {
             }),
         };
 
-        let encoded = serde_json::to_vec(&message).expect("ProbeMessage serializes");
-        let decoded: ProbeMessage = serde_json::from_slice(&encoded).expect("ProbeMessage round trips");
+        let encoded = serde_json::to_vec(&message).map_err(ctx("ProbeMessage serializes"))?;
+        let decoded: ProbeMessage =
+            serde_json::from_slice(&encoded).map_err(ctx("ProbeMessage round trips"))?;
         assert_eq!(decoded, message);
         assert_eq!(message.stamp().profile_id, "selected-services");
+        Ok(())
     }
 }

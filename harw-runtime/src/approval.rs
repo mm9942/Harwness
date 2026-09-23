@@ -226,9 +226,7 @@ impl ApprovalHandler for AskResolutionPolicy {
         } else {
             None
         };
-        Box::pin(async move {
-            denial.map_or(ApprovalDecision::Allow, ApprovalDecision::Deny)
-        })
+        Box::pin(async move { denial.map_or(ApprovalDecision::Allow, ApprovalDecision::Deny) })
     }
 
     /// [`ApprovalHandlerKind::Other`]: keine der deklarierten Kategorien passt
@@ -362,7 +360,10 @@ impl ApprovalChain {
                 .map(Arc::new),
             config: config_policy,
             config_tools,
-            default: Arc::new(DefaultApprovalPolicy::with_rules(mode.clone(), rules.clone())),
+            default: Arc::new(DefaultApprovalPolicy::with_rules(
+                mode.clone(),
+                rules.clone(),
+            )),
             responder,
             mode,
             rules,
@@ -640,6 +641,7 @@ impl ApprovalChain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
     use harw_config::ResolvedConfig;
     use harw_extension_api::allow_rules::{ApprovalRule, RuleScope};
     use harw_extension_api::{ApprovalDecision, ExtFuture, ToolCall, ToolName};
@@ -652,11 +654,13 @@ mod tests {
     /// `review` hat ohnehin keinen `.await`-Punkt und ist beim ersten `poll`
     /// fertig; `Waker::noop` genügt darum — und das Crate verbietet `unsafe`,
     /// ein handgebauter `RawWaker` wäre hier gar nicht erlaubt.
-    fn block_on<T>(mut future: ExtFuture<'_, T>) -> T {
+    fn block_on<T>(mut future: ExtFuture<'_, T>) -> TestResult<T> {
         let mut cx = Context::from_waker(Waker::noop());
         match future.as_mut().poll(&mut cx) {
-            Poll::Ready(value) => value,
-            Poll::Pending => panic!("review() wurde beim ersten poll nicht fertig"),
+            Poll::Ready(value) => Ok(value),
+            Poll::Pending => Err(TestError::Unexpected(
+                "review() wurde beim ersten poll nicht fertig".into(),
+            )),
         }
     }
 
@@ -730,18 +734,19 @@ mod tests {
     /// Die Config-Politik greift auch dann, wenn die Standardpolitik das
     /// Werkzeug längst durchwinken würde — sonst wäre die Liste zahnlos.
     #[test]
-    fn config_policy_restricts_a_tool_the_default_policy_would_allow() {
+    fn config_policy_restricts_a_tool_the_default_policy_would_allow() -> TestResult {
         let chain = root_chain(&["fs.read"], ApprovalMode::FullAccess);
         let handlers = chain.handlers();
 
         assert!(matches!(
-            block_on(handlers[0].review(&call("fs.read"))),
+            block_on(handlers[0].review(&call("fs.read")))?,
             ApprovalDecision::AskUser(_)
         ));
         assert!(matches!(
-            block_on(handlers[1].review(&call("fs.read"))),
+            block_on(handlers[1].review(&call("fs.read")))?,
             ApprovalDecision::Allow
         ));
+        Ok(())
     }
 
     /// Eine leere Liste erzeugt keinen Handler — kein Rauschen im Snapshot.
@@ -759,7 +764,10 @@ mod tests {
 
     #[test]
     fn config_policy_tools_are_sorted_and_deduplicated() {
-        let chain = root_chain(&["shell.exec", "fs.write", "shell.exec"], ApprovalMode::Delegated);
+        let chain = root_chain(
+            &["shell.exec", "fs.write", "shell.exec"],
+            ApprovalMode::Delegated,
+        );
 
         assert_eq!(
             chain.config_policy_tools(),
@@ -790,7 +798,7 @@ mod tests {
 
     /// G-009: `FullAccess` der Wurzel erreicht das Kind nie.
     #[test]
-    fn a_child_never_inherits_full_access() {
+    fn a_child_never_inherits_full_access() -> TestResult {
         let root = ApprovalChain::for_root(
             &config_with(&["fs.write"]),
             AskResolution::Interactive,
@@ -806,22 +814,24 @@ mod tests {
         // Die Kind-Politik muss die gesenkte Zelle wirklich lesen.
         let handlers = child.handlers();
         assert!(matches!(
-            block_on(handlers[1].review(&call("shell.exec"))),
+            block_on(handlers[1].review(&call("shell.exec")))?,
             ApprovalDecision::AskUser(_)
         ));
+        Ok(())
     }
 
     /// Der strengere Modus bleibt erhalten — eine Absenkung auf `Delegated`
     /// wäre eine Lockerung.
     #[test]
-    fn a_child_keeps_the_stricter_always_ask_mode() {
+    fn a_child_keeps_the_stricter_always_ask_mode() -> TestResult {
         let child = root_chain(&[], ApprovalMode::AlwaysAsk).for_child();
 
         assert_eq!(child.mode().get(), ApprovalMode::AlwaysAsk);
         assert!(matches!(
-            block_on(child.handlers()[0].review(&call("fs.read"))),
+            block_on(child.handlers()[0].review(&call("fs.read")))?,
             ApprovalDecision::AskUser(_)
         ));
+        Ok(())
     }
 
     /// Die Zellen sind entkoppelt: ein `set` läuft in keine Richtung über.
@@ -839,15 +849,16 @@ mod tests {
 
     /// F-018: Die Config-Politik der Wurzel gilt auch im Kind.
     #[test]
-    fn a_child_inherits_the_config_policy() {
+    fn a_child_inherits_the_config_policy() -> TestResult {
         let root = root_chain(&["fs.write"], ApprovalMode::Delegated);
         let child = root.for_child();
 
         assert_eq!(child.config_policy_tools(), vec!["fs.write".to_owned()]);
         assert!(matches!(
-            block_on(child.handlers()[0].review(&call("fs.write"))),
+            block_on(child.handlers()[0].review(&call("fs.write")))?,
             ApprovalDecision::AskUser(_)
         ));
+        Ok(())
     }
 
     /// Kinder fragen niemanden — der Responder wird nicht weitergereicht.
@@ -873,7 +884,7 @@ mod tests {
     /// Prüfbar ist das über die Registry-API: die eingebauten Politiken melden
     /// keinen eigenen `label`, wohl aber unterscheidbares Verhalten.
     #[test]
-    fn install_registers_the_handlers_in_order() {
+    fn install_registers_the_handlers_in_order() -> TestResult {
         let chain = ApprovalChain::for_root(
             // `fs.read` ist in `AUTO_APPROVED_TOOLS`; nur die Config-Politik
             // stellt es unter Vorbehalt.
@@ -890,14 +901,14 @@ mod tests {
         assert_eq!(handlers.len(), 3);
         assert!(
             matches!(
-                block_on(handlers[0].review(&call("fs.read"))),
+                block_on(handlers[0].review(&call("fs.read")))?,
                 ApprovalDecision::AskUser(_)
             ),
             "Platz 0 gehört der Config-Politik"
         );
         assert!(
             matches!(
-                block_on(handlers[1].review(&call("fs.read"))),
+                block_on(handlers[1].review(&call("fs.read")))?,
                 ApprovalDecision::Allow
             ),
             "Platz 1 gehört der Standardpolitik"
@@ -907,6 +918,7 @@ mod tests {
             ApprovalHandlerKind::Interactive,
             "Platz 2 gehört dem Responder"
         );
+        Ok(())
     }
 
     /// `install` hängt an, statt zu ersetzen.
@@ -921,13 +933,17 @@ mod tests {
 
         assert_eq!(handlers.len(), 2);
         assert_eq!(handlers[0].kind(), ApprovalHandlerKind::Interactive);
-        assert_eq!(handlers[1].label(), "unnamed", "die Standardpolitik benennt sich nicht selbst");
+        assert_eq!(
+            handlers[1].label(),
+            "unnamed",
+            "die Standardpolitik benennt sich nicht selbst"
+        );
     }
 
     /// Die Zelle der Wurzel bleibt der Schalter: `set` erreicht die bereits
     /// montierte Politik sofort.
     #[test]
-    fn the_root_mode_cell_stays_the_switch_for_the_installed_policy() {
+    fn the_root_mode_cell_stays_the_switch_for_the_installed_policy() -> TestResult {
         let cell = ApprovalModeCell::new(ApprovalMode::Delegated);
         let chain = ApprovalChain::for_root(
             &config_with(&[]),
@@ -940,18 +956,19 @@ mod tests {
         let handler = Arc::clone(&registry.approval_handlers()[0]);
 
         assert!(matches!(
-            block_on(handler.review(&call("shell.exec"))),
+            block_on(handler.review(&call("shell.exec")))?,
             ApprovalDecision::AskUser(_)
         ));
 
         cell.set(ApprovalMode::FullAccess);
         assert!(
             matches!(
-                block_on(handler.review(&call("shell.exec"))),
+                block_on(handler.review(&call("shell.exec")))?,
                 ApprovalDecision::Allow
             ),
             "die Umschaltung muss die montierte Registry erreichen"
         );
+        Ok(())
     }
 
     /// Z2c-02: Für jede nicht-interaktive Auflösung hängt die Kette genau
@@ -999,7 +1016,7 @@ mod tests {
     /// Der Handler lehnt **genau** die Aufrufe ab, die sonst eine Rückfrage
     /// auslösten — ein pauschales `Deny` würde jeden Werkzeugaufruf treffen.
     #[test]
-    fn the_ask_handler_denies_only_what_would_have_been_asked() {
+    fn the_ask_handler_denies_only_what_would_have_been_asked() -> TestResult {
         let chain = ApprovalChain::for_root(
             &config_with(&[]),
             AskResolution::Fail,
@@ -1013,24 +1030,29 @@ mod tests {
         // `fs.read` steht in `AUTO_APPROVED_TOOLS`: die Standardpolitik sagt
         // `Allow`, also darf auch dieser Handler nicht ablehnen.
         assert!(matches!(
-            block_on(ask.review(&call("fs.read"))),
+            block_on(ask.review(&call("fs.read")))?,
             ApprovalDecision::Allow
         ));
         // `shell.exec` steht nicht darin: die Standardpolitik fragte, und die
         // Frage kann hier niemand beantworten.
-        let decision = block_on(ask.review(&call("shell.exec")));
+        let decision = block_on(ask.review(&call("shell.exec")))?;
         match decision {
             ApprovalDecision::Deny(reason) => {
                 assert!(reason.contains("shell.exec"), "{reason}");
                 assert!(reason.contains("fails the run"), "{reason}");
             }
-            other => panic!("erwartet Deny, war {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Deny, war {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// `FullAccess` fragt nichts — dann lehnt auch die Auflösung nichts ab.
     #[test]
-    fn the_ask_handler_stays_silent_when_nothing_would_be_asked() {
+    fn the_ask_handler_stays_silent_when_nothing_would_be_asked() -> TestResult {
         let chain = ApprovalChain::for_root(
             &config_with(&[]),
             AskResolution::BlockJob,
@@ -1039,16 +1061,17 @@ mod tests {
             AllowRuleSet::new(),
         );
         assert!(matches!(
-            block_on(chain.handlers()[1].review(&call("shell.exec"))),
+            block_on(chain.handlers()[1].review(&call("shell.exec")))?,
             ApprovalDecision::Allow
         ));
+        Ok(())
     }
 
     /// Die Pflichtliste der Konfiguration zieht denselben Handler nach sich —
     /// sonst bliebe ein `require_approval_for`-Werkzeug in einem Lauf ohne
     /// Antwortfläche unbemerkt erlaubt.
     #[test]
-    fn the_ask_handler_also_resolves_the_config_policy_list() {
+    fn the_ask_handler_also_resolves_the_config_policy_list() -> TestResult {
         let chain = ApprovalChain::for_root(
             &config_with(&["fs.read"]),
             AskResolution::RejectTurn,
@@ -1058,14 +1081,15 @@ mod tests {
         );
         // Reihenfolge: Config, Default, Ask.
         assert!(matches!(
-            block_on(chain.handlers()[2].review(&call("fs.read"))),
+            block_on(chain.handlers()[2].review(&call("fs.read")))?,
             ApprovalDecision::Deny(_)
         ));
+        Ok(())
     }
 
     /// Das Kind erbt die Auflösung und liest die **gelöste** Zelle.
     #[test]
-    fn a_child_keeps_the_ask_resolution_over_its_own_cell() {
+    fn a_child_keeps_the_ask_resolution_over_its_own_cell() -> TestResult {
         let root = ApprovalChain::for_root(
             &config_with(&[]),
             AskResolution::Fail,
@@ -1079,13 +1103,14 @@ mod tests {
         // Die Wurzel steht auf `FullAccess`, das Kind auf `Delegated` (G-009):
         // derselbe Aufruf wird deshalb nur im Kind aufgelöst.
         assert!(matches!(
-            block_on(root.handlers()[1].review(&call("shell.exec"))),
+            block_on(root.handlers()[1].review(&call("shell.exec")))?,
             ApprovalDecision::Allow
         ));
         assert!(matches!(
-            block_on(child.handlers()[1].review(&call("shell.exec"))),
+            block_on(child.handlers()[1].review(&call("shell.exec")))?,
             ApprovalDecision::Deny(_)
         ));
+        Ok(())
     }
 
     /// Eine Registry aus den Defaults erhält die regelbewusste
@@ -1114,7 +1139,7 @@ mod tests {
     }
 
     #[test]
-    fn install_over_default_replaces_the_default_with_the_rules_aware_policy() {
+    fn install_over_default_replaces_the_default_with_the_rules_aware_policy() -> TestResult {
         let cell = ApprovalModeCell::new(ApprovalMode::Delegated);
         let rules = AllowRuleSet::new();
         rules.add(ApprovalRule {
@@ -1139,18 +1164,19 @@ mod tests {
         // Default und Ask-Auflösung müssen beide die gleiche Regelmenge sehen;
         // eine regellose Default-Policy würde hier stattdessen AskUser liefern.
         assert!(matches!(
-            block_on(registry.approval_handlers()[0].review(&shell_call("git status --short"))),
+            block_on(registry.approval_handlers()[0].review(&shell_call("git status --short")))?,
             ApprovalDecision::Allow
         ));
         assert!(matches!(
-            block_on(registry.approval_handlers()[1].review(&shell_call("git status --short"))),
+            block_on(registry.approval_handlers()[1].review(&shell_call("git status --short")))?,
             ApprovalDecision::Allow
         ));
+        Ok(())
     }
 
     /// Eine Registry anderer Gestalt bekommt die Grundlinie trotzdem.
     #[test]
-    fn install_over_default_still_adds_the_baseline_to_an_empty_registry() {
+    fn install_over_default_still_adds_the_baseline_to_an_empty_registry() -> TestResult {
         let chain = root_chain(&[], ApprovalMode::Delegated);
         let registry = chain
             .install_over_default(ExtensionRegistryBuilder::default().build())
@@ -1158,9 +1184,10 @@ mod tests {
 
         assert_eq!(registry.approval_handlers().len(), 1);
         assert!(matches!(
-            block_on(registry.approval_handlers()[0].review(&call("shell.exec"))),
+            block_on(registry.approval_handlers()[0].review(&call("shell.exec")))?,
             ApprovalDecision::AskUser(_)
         ));
+        Ok(())
     }
 
     // ── Contract §2/§4: Freigaberegeln in der Kette ──────────────────────────
@@ -1174,7 +1201,7 @@ mod tests {
     /// Eine passende Erlauben-Regel überspringt die Rückfrage der
     /// Standardpolitik, ohne dass die Kette einen zweiten Handler bräuchte.
     #[test]
-    fn review_allow_rule_bypasses_default_policys_ask() {
+    fn review_allow_rule_bypasses_default_policys_ask() -> TestResult {
         let rules = AllowRuleSet::new();
         rules.add(ApprovalRule {
             tool: "shell.exec".to_owned(),
@@ -1191,15 +1218,16 @@ mod tests {
         );
 
         assert!(matches!(
-            block_on(chain.handlers()[0].review(&shell_call("git status --short"))),
+            block_on(chain.handlers()[0].review(&shell_call("git status --short")))?,
             ApprovalDecision::Allow
         ));
+        Ok(())
     }
 
     /// Contract §2: Deny gewinnt über eine passende Allow-Regel und über den
     /// Modus `full` — beides würde ohne die Deny-Regel automatisch freigeben.
     #[test]
-    fn review_deny_rule_beats_allow_rule_and_full_access_mode() {
+    fn review_deny_rule_beats_allow_rule_and_full_access_mode() -> TestResult {
         let rules = AllowRuleSet::new();
         rules.add(ApprovalRule {
             tool: "shell.exec".to_owned(),
@@ -1222,15 +1250,16 @@ mod tests {
         );
 
         assert!(matches!(
-            block_on(chain.handlers()[0].review(&shell_call("git push origin main"))),
+            block_on(chain.handlers()[0].review(&shell_call("git push origin main")))?,
             ApprovalDecision::AskUser(_)
         ));
+        Ok(())
     }
 
     /// Ein Kind teilt exakt die Regelmenge der Wurzel (kein `detached()`):
     /// eine über die Wurzel hinzugefügte Regel wirkt sofort auch im Kind.
     #[test]
-    fn a_child_shares_exactly_the_parents_rule_set() {
+    fn a_child_shares_exactly_the_parents_rule_set() -> TestResult {
         let root = ApprovalChain::for_root(
             &config_with(&[]),
             AskResolution::Interactive,
@@ -1249,19 +1278,20 @@ mod tests {
 
         assert!(
             matches!(
-                block_on(child.handlers()[0].review(&shell_call("git status"))),
+                block_on(child.handlers()[0].review(&shell_call("git status")))?,
                 ApprovalDecision::Allow
             ),
             "das Kind muss dieselbe (geteilte) Regelmenge sehen wie die Wurzel"
         );
         assert_eq!(child.rules().snapshot(), root.rules().snapshot());
+        Ok(())
     }
 
     /// Ein Kind bekommt eine Deny-Regel der Wurzel niemals „geschenkt" weg —
     /// sie wirkt dort genauso einschränkend wie in der Wurzel selbst, auch
     /// unter `FullAccess` (analog zu `a_child_never_inherits_full_access`).
     #[test]
-    fn a_child_never_loses_a_deny_rule_of_the_parent() {
+    fn a_child_never_loses_a_deny_rule_of_the_parent() -> TestResult {
         let rules = AllowRuleSet::new();
         rules.add(ApprovalRule {
             tool: "fs.write".to_owned(),
@@ -1279,9 +1309,10 @@ mod tests {
         let child = root.for_child();
 
         assert!(matches!(
-            block_on(child.handlers()[0].review(&call("fs.write"))),
+            block_on(child.handlers()[0].review(&call("fs.write")))?,
             ApprovalDecision::AskUser(_)
         ));
+        Ok(())
     }
 
     /// Die Ask-Vorhersage (`AskResolutionPolicy::would_ask`) muss dieselbe
@@ -1289,7 +1320,7 @@ mod tests {
     /// interaktiver Einstieg eine per Regel freigegebene Anfrage fälschlich
     /// ablehnen (kein Responder kann sie sonst je beantworten).
     #[test]
-    fn ask_resolution_prediction_honors_an_allow_rule() {
+    fn ask_resolution_prediction_honors_an_allow_rule() -> TestResult {
         let rules = AllowRuleSet::new();
         rules.add(ApprovalRule {
             tool: "shell.exec".to_owned(),
@@ -1306,8 +1337,9 @@ mod tests {
         );
         // Reihenfolge ohne Config-Politik: Default, Ask.
         assert!(matches!(
-            block_on(chain.handlers()[1].review(&shell_call("git status --short"))),
+            block_on(chain.handlers()[1].review(&shell_call("git status --short")))?,
             ApprovalDecision::Allow
         ));
+        Ok(())
     }
 }

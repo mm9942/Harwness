@@ -39,6 +39,7 @@ members = [
     "harw-tool-fs",
     "harw-tool-deps",
     "harw-tool-web",
+    "harw-tool-doc",
     "harw-tool-shell",
     "harw-browser",
     "harw-browser-thirtyfour",
@@ -49,6 +50,7 @@ members = [
     "harw-registry-defaults",
     "harw-tui",
     "harw-cli",
+    "harw-completions",
     "harw",
     # === Ausbauprogramm AW0–AW7: Telemetrie, Kontext, Lens, Control Plane ===
     # (DoD ist ausgelagert nach `dod/` — eigener Cargo-Workspace, eigene
@@ -122,11 +124,6 @@ rustix = "1.1.4"
 
 # Verzeichniseinbettung: Registry-Definitionen als Dateien statt als Rust-Liste.
 include_dir = "0.7.4"
-
-# Versionsvergleich. Ein Versionssprung in einer Abhängigkeit ist ein
-# Sicherheitssignal; ihn als Zeichenkette zu vergleichen verwechselt
-# 0.2.9 mit 0.2.10.
-semver = { version = "1.0.28", features = ["serde"] }
 
 # `forbid` statt `deny`: nicht per `#[allow]` überstimmbar. Die Regel stand
 # vorher als Attribut in jeder Crate einzeln und fehlte deshalb in acht von

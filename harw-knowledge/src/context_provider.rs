@@ -178,10 +178,7 @@ impl<'a> KnowledgeContextProvider<'a> {
     fn fragment_from_hit(&self, hit: &RecallHit, produced_at: jiff::Timestamp) -> Option<Fragment> {
         let artifact = self.index.get(&hit.artifact.id)?;
 
-        let section_name = format!(
-            "{KNOWLEDGE_CONTEXT_NAMESPACE}.{}",
-            kind_slug(artifact.kind)
-        );
+        let section_name = format!("{KNOWLEDGE_CONTEXT_NAMESPACE}.{}", kind_slug(artifact.kind));
         let section = SectionName::try_new(section_name).ok()?;
         let label = FragmentLabel::try_new(artifact.id.as_str()).ok()?;
 
@@ -231,6 +228,7 @@ fn kind_slug(kind: ArtifactKind) -> &'static str {
 mod tests {
     use super::*;
     use crate::artifact::{ArtifactId, Frontmatter, KnowledgeArtifact};
+    use crate::test_support::TestResult;
     use crate::visibility::{AgentId, VisibilityScope};
 
     /// Baut ein Test-Artefakt — dieselbe Fixture-Form wie
@@ -243,14 +241,17 @@ mod tests {
         body: &str,
         links: Vec<ArtifactId>,
     ) -> KnowledgeArtifact {
-        let mut frontmatter =
-            Frontmatter::new(AgentId::new("agent"), visibility, jiff::Timestamp::UNIX_EPOCH);
+        let mut frontmatter = Frontmatter::new(
+            AgentId::new("agent"),
+            visibility,
+            jiff::Timestamp::UNIX_EPOCH,
+        );
         frontmatter.links = links;
         KnowledgeArtifact::new(ArtifactId::new(id), kind, frontmatter, body)
     }
 
     #[test]
-    fn test_operator_only_artifact_absent_without_operator_permission() {
+    fn test_operator_only_artifact_absent_without_operator_permission() -> TestResult {
         let mut index = KnowledgeIndex::new();
         index.insert(artifact(
             "security/critical-vuln",
@@ -264,16 +265,19 @@ mod tests {
         let query = RecallQuery::new("vulnerability", VisibilityScope::SelfOnly);
         let fragments = provider
             .fragments(&query, jiff::Timestamp::UNIX_EPOCH)
-            .expect("query within hard bounds succeeds");
+            .map_err(crate::test_support::ctx(
+                "query within hard bounds succeeds",
+            ))?;
 
         assert!(
             fragments.is_empty(),
             "OperatorOnly-Artefakt wurde ohne Berechtigung zu einem Fragment: {fragments:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_operator_only_artifact_present_with_operator_permission() {
+    fn test_operator_only_artifact_present_with_operator_permission() -> TestResult {
         let mut index = KnowledgeIndex::new();
         index.insert(artifact(
             "security/critical-vuln",
@@ -287,18 +291,21 @@ mod tests {
         let query = RecallQuery::new("vulnerability", VisibilityScope::OperatorOnly);
         let fragments = provider
             .fragments(&query, jiff::Timestamp::UNIX_EPOCH)
-            .expect("query within hard bounds succeeds");
+            .map_err(crate::test_support::ctx(
+                "query within hard bounds succeeds",
+            ))?;
 
         assert_eq!(fragments.len(), 1);
         assert_eq!(fragments[0].label.as_str(), "security/critical-vuln");
         assert_eq!(fragments[0].section.as_str(), "knowledge.security-finding");
+        Ok(())
     }
 
     /// Die AW4-05-Regression an dieser Schicht: ein Artefakt, das nur über
     /// einen Rückverweis erreichbar wäre, rutscht nicht durch, obwohl der
     /// verlinkende Notiz-Text den sichtbaren Treffer trägt.
     #[test]
-    fn test_backlink_only_reachable_note_does_not_leak_through() {
+    fn test_backlink_only_reachable_note_does_not_leak_through() -> TestResult {
         let mut index = KnowledgeIndex::new();
         index.insert(artifact(
             "security/critical-vuln",
@@ -319,7 +326,9 @@ mod tests {
         let query = RecallQuery::new("vulnerability", VisibilityScope::OperatorOnly);
         let fragments = provider
             .fragments(&query, jiff::Timestamp::UNIX_EPOCH)
-            .expect("query within hard bounds succeeds");
+            .map_err(crate::test_support::ctx(
+                "query within hard bounds succeeds",
+            ))?;
 
         let labels: Vec<&str> = fragments.iter().map(|f| f.label.as_str()).collect();
         assert_eq!(
@@ -327,6 +336,7 @@ mod tests {
             vec!["security/critical-vuln"],
             "SelfOnly-Notiz ist über den Rückverweis durchgerutscht: {labels:?}"
         );
+        Ok(())
     }
 
     /// `VisibilityScope::visible_to_caller` (`visibility.rs`) fails closed
@@ -336,7 +346,7 @@ mod tests {
     /// is therefore the only scope this test can use to observe a fragment
     /// actually being produced.
     #[test]
-    fn test_fragment_fields_are_fully_populated() {
+    fn test_fragment_fields_are_fully_populated() -> TestResult {
         let mut index = KnowledgeIndex::new();
         index.insert(artifact(
             "topic/rust-tips",
@@ -349,9 +359,12 @@ mod tests {
         let provider = KnowledgeContextProvider::new(&index);
         let query = RecallQuery::new("borrow", VisibilityScope::OperatorOnly);
         let produced_at = jiff::Timestamp::UNIX_EPOCH;
-        let fragments = provider
-            .fragments(&query, produced_at)
-            .expect("query within hard bounds succeeds");
+        let fragments =
+            provider
+                .fragments(&query, produced_at)
+                .map_err(crate::test_support::ctx(
+                    "query within hard bounds succeeds",
+                ))?;
 
         assert_eq!(fragments.len(), 1);
         let fragment = &fragments[0];
@@ -364,16 +377,20 @@ mod tests {
         assert_ne!(fragment.digest, harw_types::ContentDigest::of(b""));
         assert_eq!(fragment.body, "prefer borrow over clone");
         assert_eq!(fragment.section.as_str(), "knowledge.topic");
+        Ok(())
     }
 
     #[test]
-    fn test_empty_index_contributes_nothing() {
+    fn test_empty_index_contributes_nothing() -> TestResult {
         let index = KnowledgeIndex::new();
         let provider = KnowledgeContextProvider::new(&index);
         let query = RecallQuery::new("anything", VisibilityScope::SelfOnly);
         let fragments = provider
             .fragments(&query, jiff::Timestamp::UNIX_EPOCH)
-            .expect("query within hard bounds succeeds");
+            .map_err(crate::test_support::ctx(
+                "query within hard bounds succeeds",
+            ))?;
         assert!(fragments.is_empty());
+        Ok(())
     }
 }

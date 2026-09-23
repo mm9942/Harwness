@@ -273,7 +273,7 @@ use time::OffsetDateTime;
 use crate::error::{DiagLocation, DslError, DslResult};
 use crate::ids::{DefinitionId, DefinitionRef, Version};
 use crate::layers::DefinitionLayer;
-use crate::merge::{apply_merge_op, MergeOp};
+use crate::merge::{MergeOp, apply_merge_op};
 use crate::resolved::{ResolutionStep, ResolutionTrace};
 
 // ---------------------------------------------------------------------------
@@ -596,13 +596,8 @@ fn apply_exclude_patch(patch: &toml::Table, exclude: &mut Vec<String>) -> DslRes
         return Ok(());
     };
 
-    let mut current = toml::Value::Array(
-        exclude
-            .iter()
-            .cloned()
-            .map(toml::Value::String)
-            .collect(),
-    );
+    let mut current =
+        toml::Value::Array(exclude.iter().cloned().map(toml::Value::String).collect());
 
     if let Some(val) = exclude_patch.get("replace") {
         apply_merge_op(&mut current, MergeOp::Replace { value: val.clone() })?;
@@ -802,7 +797,14 @@ fn resolve_inner(
         .map(|section| (section.name.clone(), section.trust))
         .collect();
 
-    apply_mixins(base_def, sorted, now, &mut sections, &mut exclude, &mut trace_steps)?;
+    apply_mixins(
+        base_def,
+        sorted,
+        now,
+        &mut sections,
+        &mut exclude,
+        &mut trace_steps,
+    )?;
 
     for section in base_def.sections.clone() {
         merge_section(&mut sections, section);
@@ -1267,12 +1269,12 @@ fn section_placeholder_body(name: &str, detail: harw_context::DetailMode) -> Str
 /// dieser Bibliothek ist `detail` eine Neudeklaration ohne vergleichbaren
 /// Basiswert, also gibt es dort nichts, dessen Abweichung meldenswert wäre.
 fn render_section(section: &RawContextSectionSpec) -> String {
-    let detail_suffix = if section.name == "history.tail" && section.detail != harw_context::DetailMode::Summary
-    {
-        format!(", {}", detail_label(section.detail))
-    } else {
-        String::new()
-    };
+    let detail_suffix =
+        if section.name == "history.tail" && section.detail != harw_context::DetailMode::Summary {
+            format!(", {}", detail_label(section.detail))
+        } else {
+            String::new()
+        };
     format!(
         "## {} [{}{}]\n{}",
         section.name,
@@ -1369,31 +1371,32 @@ pub fn render_context_program(program: &ResolvedContextProgramDefinition) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use std::collections::BTreeSet;
 
     fn now() -> OffsetDateTime {
         OffsetDateTime::now_utc()
     }
 
-    fn parse(src: &str) -> RawContextProgramDefinition {
-        toml::from_str(src).expect("fixture TOML should parse")
+    fn parse(src: &str) -> TestResult<RawContextProgramDefinition> {
+        toml::from_str(src).map_err(ctx("fixture TOML should parse"))
     }
 
-    fn id(s: &str) -> DefinitionId {
-        DefinitionId::parse(s).unwrap()
+    fn id(s: &str) -> TestResult<DefinitionId> {
+        Ok(DefinitionId::parse(s)?)
     }
 
     /// Builds a minimal `ContextCeiling` fixture via `serde_json`, avoiding a
     /// direct dependency on `harw-lens-types` (needed only to name
     /// `harw_lens_types::BudgetSpec` for a struct literal) — `admits_program`
     /// never reads `ceiling.budget`, so its exact value is immaterial here.
-    fn ceiling(sections: &[&str], max_trust: &str) -> harw_context::ContextCeiling {
+    fn ceiling(sections: &[&str], max_trust: &str) -> TestResult<harw_context::ContextCeiling> {
         let json = serde_json::json!({
             "sections": sections,
             "max_trust": max_trust,
             "budget": { "total": { "total": 1_000_000 }, "per_section": {} },
         });
-        serde_json::from_value(json).expect("ceiling fixture should deserialize")
+        serde_json::from_value(json).map_err(ctx("ceiling fixture should deserialize"))
     }
 
     // -----------------------------------------------------------------------
@@ -1401,7 +1404,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn full_program_parses() {
+    fn full_program_parses() -> TestResult {
         let src = r#"
 schema = "harwness.context/v1"
 id = "harwness.context.security-triage@1"
@@ -1429,10 +1432,14 @@ name = "plan.current"
 strength = "must-include"
 detail = "references"
 "#;
-        let raw = parse(src);
+        let raw = parse(src)?;
         assert_eq!(raw.schema, "harwness.context/v1");
         assert_eq!(raw.id.name, "security-triage");
-        assert_eq!(raw.extends.as_ref().unwrap().id.name, "base");
+        let extends = raw
+            .extends
+            .as_ref()
+            .ok_or(TestError::Missing("raw.extends"))?;
+        assert_eq!(extends.id.name, "base");
         assert_eq!(raw.mixins.len(), 1);
         assert_eq!(raw.sections.len(), 3);
         assert_eq!(raw.sections[0].name, "goal.invariants");
@@ -1444,6 +1451,7 @@ detail = "references"
         assert_eq!(raw.sections[1].detail, harw_context::DetailMode::Summary);
         assert_eq!(raw.sections[1].trust, harw_context::TrustClass::Data);
         assert_eq!(raw.exclude, vec!["memory.*", "plan.other-clans/**"]);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1451,7 +1459,7 @@ detail = "references"
     // -----------------------------------------------------------------------
 
     #[test]
-    fn resolve_extends_inherits_parent_sections() {
+    fn resolve_extends_inherits_parent_sections() -> TestResult {
         let base = parse(
             r#"
 schema = "harwness.context/v1"
@@ -1461,7 +1469,7 @@ version = "1.0.0"
 [[sections]]
 name = "goal.invariants"
 "#,
-        );
+        )?;
         let child = parse(
             r#"
 schema = "harwness.context/v1"
@@ -1472,32 +1480,35 @@ extends = { id = "harwness.context.base@1" }
 [[sections]]
 name = "history.tail"
 "#,
-        );
+        )?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::BuiltIn, child),
         ];
-        let resolved =
-            resolve_context_program(&id("harwness.context.child@1"), &layers, now()).unwrap();
+        let resolved = resolve_context_program(&id("harwness.context.child@1")?, &layers, now())?;
 
         let names: Vec<&str> = resolved.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["goal.invariants", "history.tail"]);
         assert!(resolved.trace.steps.iter().any(|s| s.kind == "base"));
+        Ok(())
     }
 
     #[test]
-    fn resolve_missing_base_errors() {
-        let id_val = id("harwness.context.nonexistent@1");
+    fn resolve_missing_base_errors() -> TestResult {
+        let id_val = id("harwness.context.nonexistent@1")?;
         let layers: Vec<(DefinitionLayer, RawContextProgramDefinition)> = vec![];
         let result = resolve_context_program(&id_val, &layers, now());
         assert!(matches!(
             result,
-            Err(ContextProgramError::Resolution(DslError::MissingBase { .. }))
+            Err(ContextProgramError::Resolution(
+                DslError::MissingBase { .. }
+            ))
         ));
+        Ok(())
     }
 
     #[test]
-    fn resolve_extends_missing_target_errors() {
+    fn resolve_extends_missing_target_errors() -> TestResult {
         let child = parse(
             r#"
 schema = "harwness.context/v1"
@@ -1505,17 +1516,20 @@ id = "harwness.context.orphan@1"
 version = "1.0.0"
 extends = { id = "harwness.context.nonexistent@1" }
 "#,
-        );
+        )?;
         let layers = vec![(DefinitionLayer::BuiltIn, child)];
-        let result = resolve_context_program(&id("harwness.context.orphan@1"), &layers, now());
+        let result = resolve_context_program(&id("harwness.context.orphan@1")?, &layers, now());
         assert!(matches!(
             result,
-            Err(ContextProgramError::Resolution(DslError::MissingBase { .. }))
+            Err(ContextProgramError::Resolution(
+                DslError::MissingBase { .. }
+            ))
         ));
+        Ok(())
     }
 
     #[test]
-    fn resolve_direct_extends_cycle_errors() {
+    fn resolve_direct_extends_cycle_errors() -> TestResult {
         let cyclic = parse(
             r#"
 schema = "harwness.context/v1"
@@ -1523,13 +1537,16 @@ id = "harwness.context.self-cycle@1"
 version = "1.0.0"
 extends = { id = "harwness.context.self-cycle@1" }
 "#,
-        );
+        )?;
         let layers = vec![(DefinitionLayer::BuiltIn, cyclic)];
-        let result = resolve_context_program(&id("harwness.context.self-cycle@1"), &layers, now());
+        let result = resolve_context_program(&id("harwness.context.self-cycle@1")?, &layers, now());
         assert!(matches!(
             result,
-            Err(ContextProgramError::Resolution(DslError::InheritanceCycle { .. }))
+            Err(ContextProgramError::Resolution(
+                DslError::InheritanceCycle { .. }
+            ))
         ));
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1537,7 +1554,7 @@ extends = { id = "harwness.context.self-cycle@1" }
     // -----------------------------------------------------------------------
 
     #[test]
-    fn resolve_patch_overwrites_targeted_section() {
+    fn resolve_patch_overwrites_targeted_section() -> TestResult {
         let base = parse(
             r#"
 schema = "harwness.context/v1"
@@ -1552,7 +1569,7 @@ detail = "summary"
 [[sections]]
 name = "history.tail"
 "#,
-        );
+        )?;
         let patch_layer = parse(
             r#"
 schema = "harwness.context/v1"
@@ -1564,22 +1581,26 @@ append = [
     { name = "goal.invariants", strength = "must-include", detail = "full", trust = "instruction" },
 ]
 "#,
-        );
+        )?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::Project, patch_layer),
         ];
         let resolved =
-            resolve_context_program(&id("harwness.context.overridden@1"), &layers, now()).unwrap();
+            resolve_context_program(&id("harwness.context.overridden@1")?, &layers, now())?;
 
         // Position preserved (index 0), content overwritten.
         assert_eq!(resolved.sections.len(), 2);
         assert_eq!(resolved.sections[0].name, "goal.invariants");
         assert_eq!(resolved.sections[0].strength, SectionStrength::MustInclude);
         assert_eq!(resolved.sections[0].detail, harw_context::DetailMode::Full);
-        assert_eq!(resolved.sections[0].trust, harw_context::TrustClass::Instruction);
+        assert_eq!(
+            resolved.sections[0].trust,
+            harw_context::TrustClass::Instruction
+        );
         assert_eq!(resolved.sections[1].name, "history.tail");
         assert_eq!(resolved.version.0, semver::Version::new(1, 1, 0));
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1587,7 +1608,7 @@ append = [
     // -----------------------------------------------------------------------
 
     #[test]
-    fn resolve_mixin_adds_section() {
+    fn resolve_mixin_adds_section() -> TestResult {
         let mixin = parse(
             r#"
 schema = "harwness.context.mixin/v1"
@@ -1597,7 +1618,7 @@ version = "1.0.0"
 [[sections]]
 name = "audit.trail"
 "#,
-        );
+        )?;
         let target = parse(
             r#"
 schema = "harwness.context/v1"
@@ -1608,21 +1629,22 @@ mixins = [{ id = "harwness.context.mixin.audit-trail@1" }]
 [[sections]]
 name = "goal.invariants"
 "#,
-        );
+        )?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, mixin),
             (DefinitionLayer::BuiltIn, target),
         ];
         let resolved =
-            resolve_context_program(&id("harwness.context.with-mixin@1"), &layers, now()).unwrap();
+            resolve_context_program(&id("harwness.context.with-mixin@1")?, &layers, now())?;
 
         let names: Vec<&str> = resolved.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["audit.trail", "goal.invariants"]);
         assert!(resolved.trace.steps.iter().any(|s| s.kind == "mixin"));
+        Ok(())
     }
 
     #[test]
-    fn resolve_missing_mixin_errors() {
+    fn resolve_missing_mixin_errors() -> TestResult {
         let target = parse(
             r#"
 schema = "harwness.context/v1"
@@ -1630,13 +1652,16 @@ id = "harwness.context.bad-mixin@1"
 version = "1.0.0"
 mixins = [{ id = "harwness.context.mixin.nonexistent@1" }]
 "#,
-        );
+        )?;
         let layers = vec![(DefinitionLayer::BuiltIn, target)];
-        let result = resolve_context_program(&id("harwness.context.bad-mixin@1"), &layers, now());
+        let result = resolve_context_program(&id("harwness.context.bad-mixin@1")?, &layers, now());
         assert!(matches!(
             result,
-            Err(ContextProgramError::Resolution(DslError::MissingMixin { .. }))
+            Err(ContextProgramError::Resolution(
+                DslError::MissingMixin { .. }
+            ))
         ));
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1644,7 +1669,7 @@ mixins = [{ id = "harwness.context.mixin.nonexistent@1" }]
     // -----------------------------------------------------------------------
 
     #[test]
-    fn admits_program_rejects_section_outside_ceiling() {
+    fn admits_program_rejects_section_outside_ceiling() -> TestResult {
         let target = parse(
             r#"
 schema = "harwness.context/v1"
@@ -1654,21 +1679,22 @@ version = "1.0.0"
 [[sections]]
 name = "plan.other-clans"
 "#,
-        );
+        )?;
         let layers = vec![(DefinitionLayer::BuiltIn, target)];
         let resolved =
-            resolve_context_program(&id("harwness.context.overreaching@1"), &layers, now()).unwrap();
+            resolve_context_program(&id("harwness.context.overreaching@1")?, &layers, now())?;
 
-        let narrow_ceiling = ceiling(&["history.tail"], "data");
+        let narrow_ceiling = ceiling(&["history.tail"], "data")?;
         let result = narrow_ceiling.admits_program(&resolved);
         assert!(matches!(
             result,
             Err(ProgramCeilingViolation::SectionNotAllowed { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn resolve_context_program_within_ceiling_rejects_and_does_not_admit() {
+    fn resolve_context_program_within_ceiling_rejects_and_does_not_admit() -> TestResult {
         let target = parse(
             r#"
 schema = "harwness.context/v1"
@@ -1678,12 +1704,12 @@ version = "1.0.0"
 [[sections]]
 name = "plan.other-clans"
 "#,
-        );
+        )?;
         let layers = vec![(DefinitionLayer::BuiltIn, target)];
-        let narrow_ceiling = ceiling(&["history.tail"], "data");
+        let narrow_ceiling = ceiling(&["history.tail"], "data")?;
 
         let result = resolve_context_program_within_ceiling(
-            &id("harwness.context.overreaching2@1"),
+            &id("harwness.context.overreaching2@1")?,
             &layers,
             &narrow_ceiling,
             now(),
@@ -1692,6 +1718,7 @@ name = "plan.other-clans"
             result,
             Err(ContextProgramError::RejectedByCeiling(_))
         ));
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1699,7 +1726,7 @@ name = "plan.other-clans"
     // -----------------------------------------------------------------------
 
     #[test]
-    fn admits_program_rejects_trust_above_ceiling() {
+    fn admits_program_rejects_trust_above_ceiling() -> TestResult {
         let target = parse(
             r#"
 schema = "harwness.context/v1"
@@ -1710,24 +1737,25 @@ version = "1.0.0"
 name = "goal.invariants"
 trust = "instruction"
 "#,
-        );
+        )?;
         let layers = vec![(DefinitionLayer::BuiltIn, target)];
         let resolved =
-            resolve_context_program(&id("harwness.context.too-trusting@1"), &layers, now()).unwrap();
+            resolve_context_program(&id("harwness.context.too-trusting@1")?, &layers, now())?;
 
         // Ceiling allows the section by name, but caps trust at "data" —
         // strictly below "instruction" by `trust_rank`, not by derived `Ord`
         // (see module doc "Die Vertrauensfalle" in harw_context::fragment).
-        let low_trust_ceiling = ceiling(&["goal.invariants"], "data");
+        let low_trust_ceiling = ceiling(&["goal.invariants"], "data")?;
         let result = low_trust_ceiling.admits_program(&resolved);
         assert!(matches!(
             result,
             Err(ProgramCeilingViolation::TrustExceeded { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn admits_program_accepts_section_within_ceiling() {
+    fn admits_program_accepts_section_within_ceiling() -> TestResult {
         let target = parse(
             r#"
 schema = "harwness.context/v1"
@@ -1738,13 +1766,14 @@ version = "1.0.0"
 name = "history.tail"
 trust = "evidence"
 "#,
-        );
+        )?;
         let layers = vec![(DefinitionLayer::BuiltIn, target)];
         let resolved =
-            resolve_context_program(&id("harwness.context.well-behaved@1"), &layers, now()).unwrap();
+            resolve_context_program(&id("harwness.context.well-behaved@1")?, &layers, now())?;
 
-        let generous_ceiling = ceiling(&["history.tail"], "instruction");
+        let generous_ceiling = ceiling(&["history.tail"], "instruction")?;
         assert_eq!(generous_ceiling.admits_program(&resolved), Ok(()));
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1752,7 +1781,7 @@ trust = "evidence"
     // -----------------------------------------------------------------------
 
     #[test]
-    fn resolve_preserves_section_order_across_extends_and_patch() {
+    fn resolve_preserves_section_order_across_extends_and_patch() -> TestResult {
         let base = parse(
             r#"
 schema = "harwness.context/v1"
@@ -1765,7 +1794,7 @@ name = "a"
 [[sections]]
 name = "b"
 "#,
-        );
+        )?;
         let overlay = parse(
             r#"
 schema = "harwness.context/v1"
@@ -1776,7 +1805,7 @@ extends = { id = "harwness.context.ordered-base@1" }
 [[sections]]
 name = "c"
 "#,
-        );
+        )?;
         let patch_layer = parse(
             r#"
 schema = "harwness.context/v1"
@@ -1786,17 +1815,18 @@ version = "1.1.0"
 [patch.sections]
 append = [{ name = "d" }]
 "#,
-        );
+        )?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::BuiltIn, overlay),
             (DefinitionLayer::Project, patch_layer),
         ];
         let resolved =
-            resolve_context_program(&id("harwness.context.ordered-child@1"), &layers, now()).unwrap();
+            resolve_context_program(&id("harwness.context.ordered-child@1")?, &layers, now())?;
 
         let names: Vec<&str> = resolved.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b", "c", "d"]);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1837,7 +1867,9 @@ unexpected = "nope"
     // different context-program ids never collide, and referencing the same
     // one twice is fully deterministic.
 
-    fn agent_with_context_policy(policy_id: &str) -> crate::executable::ExecutableAgentIr {
+    fn agent_with_context_policy(
+        policy_id: &str,
+    ) -> TestResult<crate::executable::ExecutableAgentIr> {
         let src = format!(
             r#"
 schema = "harwness.agent/v1"
@@ -1850,26 +1882,28 @@ specialization = "snapshot-probe"
 policy = "{policy_id}"
 "#
         );
-        let raw = crate::parse::parse_toml(&src).expect("agent fixture should parse");
-        let agent_id = DefinitionId::parse("harwness.agent.snapshot-probe@1").unwrap();
+        let raw = crate::parse::parse_toml(&src).map_err(ctx("agent fixture should parse"))?;
+        let agent_id = DefinitionId::parse("harwness.agent.snapshot-probe@1")?;
         let layers = vec![(DefinitionLayer::BuiltIn, raw)];
         let resolved = crate::resolve::resolve_definition(&agent_id, &layers, now())
-            .expect("agent fixture should resolve");
-        crate::executable::lower(&resolved).expect("agent fixture should lower")
+            .map_err(ctx("agent fixture should resolve"))?;
+        crate::executable::lower(&resolved).map_err(ctx("agent fixture should lower"))
     }
 
     #[test]
-    fn same_context_program_label_yields_same_snapshot_id() {
-        let ir1 = agent_with_context_policy("harwness.context.security-triage@1");
-        let ir2 = agent_with_context_policy("harwness.context.security-triage@1");
+    fn same_context_program_label_yields_same_snapshot_id() -> TestResult {
+        let ir1 = agent_with_context_policy("harwness.context.security-triage@1")?;
+        let ir2 = agent_with_context_policy("harwness.context.security-triage@1")?;
         assert_eq!(ir1.snapshot_id(), ir2.snapshot_id());
+        Ok(())
     }
 
     #[test]
-    fn changed_context_program_label_yields_different_snapshot_id() {
-        let ir1 = agent_with_context_policy("harwness.context.security-triage@1");
-        let ir2 = agent_with_context_policy("harwness.context.security-triage@2");
+    fn changed_context_program_label_yields_different_snapshot_id() -> TestResult {
+        let ir1 = agent_with_context_policy("harwness.context.security-triage@1")?;
+        let ir2 = agent_with_context_policy("harwness.context.security-triage@2")?;
         assert_ne!(ir1.snapshot_id(), ir2.snapshot_id());
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1877,7 +1911,7 @@ policy = "{policy_id}"
     // -----------------------------------------------------------------------
 
     #[test]
-    fn resolve_exclude_patch_appends_via_shared_merge_op() {
+    fn resolve_exclude_patch_appends_via_shared_merge_op() -> TestResult {
         let base = parse(
             r#"
 schema = "harwness.context/v1"
@@ -1885,7 +1919,7 @@ id = "harwness.context.exclude-base@1"
 version = "1.0.0"
 exclude = ["memory.*"]
 "#,
-        );
+        )?;
         let patch_layer = parse(
             r#"
 schema = "harwness.context/v1"
@@ -1895,28 +1929,31 @@ version = "1.1.0"
 [patch.exclude]
 append = ["secrets/**"]
 "#,
-        );
+        )?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::Project, patch_layer),
         ];
         let resolved =
-            resolve_context_program(&id("harwness.context.exclude-base@1"), &layers, now()).unwrap();
+            resolve_context_program(&id("harwness.context.exclude-base@1")?, &layers, now())?;
 
         assert_eq!(resolved.exclude, vec!["memory.*", "secrets/**"]);
+        Ok(())
     }
 
     #[test]
-    fn ceiling_fixture_helper_builds_expected_set() {
+    fn ceiling_fixture_helper_builds_expected_set() -> TestResult {
         // Sanity check on the test helper itself: proves the BTreeSet content,
         // independent from `admits_program`.
-        let c = ceiling(&["a", "b"], "evidence");
+        let c = ceiling(&["a", "b"], "evidence")?;
         let expected: BTreeSet<harw_context::SectionName> = ["a", "b"]
             .into_iter()
-            .map(|s| harw_context::SectionName::try_new(s).unwrap())
-            .collect();
+            .map(harw_context::SectionName::try_new)
+            .collect::<Result<_, _>>()
+            .map_err(ctx("SectionName::try_new should succeed"))?;
         assert_eq!(c.sections, expected);
         assert_eq!(c.max_trust, harw_context::TrustClass::Evidence);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1925,7 +1962,7 @@ append = ["secrets/**"]
     // -----------------------------------------------------------------------
 
     #[test]
-    fn resolve_rejects_trust_escalation_across_extends() {
+    fn resolve_rejects_trust_escalation_across_extends() -> TestResult {
         let base = parse(
             r#"
 schema = "harwness.context/v1"
@@ -1936,7 +1973,7 @@ version = "1.0.0"
 name = "goal.invariants"
 trust = "data"
 "#,
-        );
+        )?;
         let child = parse(
             r#"
 schema = "harwness.context/v1"
@@ -1948,12 +1985,13 @@ extends = { id = "harwness.context.trust-base@1" }
 name = "goal.invariants"
 trust = "instruction"
 "#,
-        );
+        )?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::BuiltIn, child),
         ];
-        let result = resolve_context_program(&id("harwness.context.trust-child-up@1"), &layers, now());
+        let result =
+            resolve_context_program(&id("harwness.context.trust-child-up@1")?, &layers, now());
 
         match result {
             Err(ContextProgramError::TrustEscalation {
@@ -1966,12 +2004,17 @@ trust = "instruction"
                 assert_eq!(base_trust, harw_context::TrustClass::Data);
                 assert_eq!(declared_trust, harw_context::TrustClass::Instruction);
             }
-            other => panic!("expected TrustEscalation, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected TrustEscalation, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn resolve_rejects_trust_escalation_via_mixin() {
+    fn resolve_rejects_trust_escalation_via_mixin() -> TestResult {
         // The escalation attempt can arrive through a mixin, not only through
         // the child's own `[[sections]]` — the check compares the FINAL
         // per-name trust after mixins AND own sections are merged in, so
@@ -1986,7 +2029,7 @@ version = "1.0.0"
 name = "goal.invariants"
 trust = "data"
 "#,
-        );
+        )?;
         let mixin = parse(
             r#"
 schema = "harwness.context.mixin/v1"
@@ -1997,7 +2040,7 @@ version = "1.0.0"
 name = "goal.invariants"
 trust = "instruction"
 "#,
-        );
+        )?;
         let child = parse(
             r#"
 schema = "harwness.context/v1"
@@ -2006,21 +2049,23 @@ version = "1.0.0"
 extends = { id = "harwness.context.trust-base-mixin@1" }
 mixins = [{ id = "harwness.context.mixin.over-trusting@1" }]
 "#,
-        );
+        )?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::BuiltIn, mixin),
             (DefinitionLayer::BuiltIn, child),
         ];
-        let result = resolve_context_program(&id("harwness.context.trust-child-mixin@1"), &layers, now());
+        let result =
+            resolve_context_program(&id("harwness.context.trust-child-mixin@1")?, &layers, now());
         assert!(matches!(
             result,
             Err(ContextProgramError::TrustEscalation { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn resolve_accepts_trust_reduction_across_extends() {
+    fn resolve_accepts_trust_reduction_across_extends() -> TestResult {
         let base = parse(
             r#"
 schema = "harwness.context/v1"
@@ -2031,7 +2076,7 @@ version = "1.0.0"
 name = "goal.invariants"
 trust = "instruction"
 "#,
-        );
+        )?;
         let child = parse(
             r#"
 schema = "harwness.context/v1"
@@ -2043,15 +2088,16 @@ extends = { id = "harwness.context.trust-base-down@1" }
 name = "goal.invariants"
 trust = "data"
 "#,
-        );
+        )?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::BuiltIn, child),
         ];
         let resolved =
-            resolve_context_program(&id("harwness.context.trust-child-down@1"), &layers, now())
-                .expect("lowering trust across extends must be accepted");
+            resolve_context_program(&id("harwness.context.trust-child-down@1")?, &layers, now())
+                .map_err(ctx("lowering trust across extends must be accepted"))?;
         assert_eq!(resolved.sections[0].trust, harw_context::TrustClass::Data);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2059,7 +2105,7 @@ trust = "data"
     // -----------------------------------------------------------------------
 
     #[test]
-    fn resolve_extends_exclude_floor_is_unremovable() {
+    fn resolve_extends_exclude_floor_is_unremovable() -> TestResult {
         let base = parse(
             r#"
 schema = "harwness.context/v1"
@@ -2067,7 +2113,7 @@ id = "harwness.context.exclude-floor-base@1"
 version = "1.0.0"
 exclude = ["credential.*", "secret.*"]
 "#,
-        );
+        )?;
         let child = parse(
             r#"
 schema = "harwness.context/v1"
@@ -2075,20 +2121,23 @@ id = "harwness.context.exclude-floor-child@1"
 version = "1.0.0"
 extends = { id = "harwness.context.exclude-floor-base@1" }
 "#,
-        );
+        )?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::BuiltIn, child),
         ];
-        let resolved =
-            resolve_context_program(&id("harwness.context.exclude-floor-child@1"), &layers, now())
-                .unwrap();
+        let resolved = resolve_context_program(
+            &id("harwness.context.exclude-floor-child@1")?,
+            &layers,
+            now(),
+        )?;
 
         // The child declares no `exclude` of its own at all, yet the base's
         // floor survives unabridged — there is no mechanism (short of a
         // `patch` on the SAME id, which does not apply across `extends`) that
         // could strike it.
         assert_eq!(resolved.exclude, vec!["credential.*", "secret.*"]);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2097,7 +2146,7 @@ extends = { id = "harwness.context.exclude-floor-base@1" }
     // -----------------------------------------------------------------------
 
     #[test]
-    fn resolve_allows_detail_escalation_across_extends() {
+    fn resolve_allows_detail_escalation_across_extends() -> TestResult {
         // `detail` is deliberately NOT cut: "more text" is not a rights
         // expansion (see the module doc). `plan.toml`/`triage.toml` (AW6-05)
         // rely on exactly this to raise `history.tail` from `summary` to `full`.
@@ -2111,7 +2160,7 @@ version = "1.0.0"
 name = "history.tail"
 detail = "summary"
 "#,
-        );
+        )?;
         let child = parse(
             r#"
 schema = "harwness.context/v1"
@@ -2123,19 +2172,22 @@ extends = { id = "harwness.context.detail-base@1" }
 name = "history.tail"
 detail = "full"
 "#,
-        );
+        )?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::BuiltIn, child),
         ];
         let resolved =
-            resolve_context_program(&id("harwness.context.detail-child@1"), &layers, now())
-                .expect("raising detail across extends is deliberately additive");
+            resolve_context_program(&id("harwness.context.detail-child@1")?, &layers, now())
+                .map_err(ctx(
+                    "raising detail across extends is deliberately additive",
+                ))?;
         assert_eq!(resolved.sections[0].detail, harw_context::DetailMode::Full);
+        Ok(())
     }
 
     #[test]
-    fn resolve_allows_strength_escalation_across_extends() {
+    fn resolve_allows_strength_escalation_across_extends() -> TestResult {
         // `strength` only changes assembly priority for an already-admitted,
         // already trust-checked section — no security reason to cut it.
         let base = parse(
@@ -2148,7 +2200,7 @@ version = "1.0.0"
 name = "repo.tree"
 strength = "normal"
 "#,
-        );
+        )?;
         let child = parse(
             r#"
 schema = "harwness.context/v1"
@@ -2160,19 +2212,22 @@ extends = { id = "harwness.context.strength-base@1" }
 name = "repo.tree"
 strength = "must-include"
 "#,
-        );
+        )?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::BuiltIn, child),
         ];
         let resolved =
-            resolve_context_program(&id("harwness.context.strength-child@1"), &layers, now())
-                .expect("raising strength across extends is deliberately additive");
+            resolve_context_program(&id("harwness.context.strength-child@1")?, &layers, now())
+                .map_err(ctx(
+                    "raising strength across extends is deliberately additive",
+                ))?;
         assert_eq!(resolved.sections[0].strength, SectionStrength::MustInclude);
+        Ok(())
     }
 
     #[test]
-    fn resolve_allows_new_section_with_high_trust_across_extends() {
+    fn resolve_allows_new_section_with_high_trust_across_extends() -> TestResult {
         // A section name the base never declared carries no inherited floor —
         // the base has no opinion on it, so declaring it at any trust class is
         // admissible specialization, not an expansion of a base decision.
@@ -2188,7 +2243,7 @@ version = "1.0.0"
 name = "task.objective"
 trust = "instruction"
 "#,
-        );
+        )?;
         let child = parse(
             r#"
 schema = "harwness.context/v1"
@@ -2200,15 +2255,18 @@ extends = { id = "harwness.context.new-section-base@1" }
 name = "goal.invariants"
 trust = "instruction"
 "#,
-        );
+        )?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::BuiltIn, child),
         ];
         let resolved =
-            resolve_context_program(&id("harwness.context.new-section-child@1"), &layers, now())
-                .expect("a brand-new section name carries no inherited trust ceiling");
+            resolve_context_program(&id("harwness.context.new-section-child@1")?, &layers, now())
+                .map_err(ctx(
+                "a brand-new section name carries no inherited trust ceiling",
+            ))?;
         assert_eq!(resolved.sections.len(), 2);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2220,7 +2278,7 @@ trust = "instruction"
     // -----------------------------------------------------------------------
 
     #[test]
-    fn full_example_from_module_doc_parses() {
+    fn full_example_from_module_doc_parses() -> TestResult {
         let src = r#"
 schema = "harwness.context/v1"
 id = "harwness.context.security-triage@1"
@@ -2254,10 +2312,11 @@ remove = ["history.tail"]
 [patch.exclude]
 append = ["secrets/**"]
 "#;
-        let raw = parse(src);
+        let raw = parse(src)?;
         assert_eq!(raw.sections.len(), 3);
         assert_eq!(raw.exclude, vec!["memory.*", "plan.other-clans/**"]);
         assert!(!raw.patch.is_empty());
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2270,7 +2329,7 @@ append = ["secrets/**"]
     // -----------------------------------------------------------------------
 
     #[test]
-    fn registry_default_base_and_plan_still_resolve_under_trust_cut() {
+    fn registry_default_base_and_plan_still_resolve_under_trust_cut() -> TestResult {
         let base = parse(
             r#"
 schema = "harwness.context/v1"
@@ -2290,7 +2349,7 @@ strength = "must-include"
 detail = "summary"
 trust = "evidence"
 "#,
-        );
+        )?;
         let plan = parse(
             r#"
 schema = "harwness.context/v1"
@@ -2317,20 +2376,25 @@ strength = "must-include"
 detail = "full"
 trust = "evidence"
 "#,
-        );
+        )?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::BuiltIn, plan),
         ];
-        let resolved = resolve_context_program(&id("harwness.context.plan@1"), &layers, now())
-            .expect("plan.toml only raises `detail` (additive), never `trust`, on history.tail");
+        let resolved = resolve_context_program(&id("harwness.context.plan@1")?, &layers, now())
+            .map_err(ctx(
+                "plan.toml only raises `detail` (additive), never `trust`, on history.tail",
+            ))?;
 
         let history = resolved
             .sections
             .iter()
             .find(|s| s.name == "history.tail")
-            .expect("history.tail must survive the extends merge");
+            .ok_or(TestError::Missing(
+                "history.tail must survive the extends merge",
+            ))?;
         assert_eq!(history.detail, harw_context::DetailMode::Full);
         assert_eq!(history.trust, harw_context::TrustClass::Evidence);
+        Ok(())
     }
 }

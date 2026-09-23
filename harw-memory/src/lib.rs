@@ -51,6 +51,7 @@
 //! ```
 
 pub mod capture;
+pub mod consolidation;
 pub mod context_policy;
 pub mod context_provider;
 pub mod context_selector;
@@ -58,7 +59,6 @@ pub mod contradiction_index;
 pub mod detect;
 pub mod epistemic;
 pub mod error;
-pub mod consolidation;
 pub mod extraction;
 pub mod facts;
 pub mod file_index;
@@ -87,7 +87,9 @@ pub use extraction::{
 pub use facts::{Fact, FactScope, FactStore, FactType, redact, slugify};
 pub use file_index::{FileKnowledge, FileKnowledgeIndex};
 pub use file_store::FileMemoryStore;
-pub use promote::{PromotionCandidate, PromotionOutcome, SignalOccurrence, apply_promotion, evaluate_signals};
+pub use promote::{
+    PromotionCandidate, PromotionOutcome, SignalOccurrence, apply_promotion, evaluate_signals,
+};
 pub use store::Memory;
 pub use types::{Entry, MaintenanceReport, RecallQuery, Signal, Stats, Tier};
 pub use workflow::{WorkflowMarker, WorkflowStep};
@@ -95,6 +97,7 @@ pub use workflow::{WorkflowMarker, WorkflowStep};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn tmp_root(tag: &str) -> std::path::PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -106,81 +109,91 @@ mod tests {
     }
 
     #[test]
-    fn open_creates_subdirs() {
+    fn open_creates_subdirs() -> TestResult {
         let root = tmp_root("open");
-        let _store = FileMemoryStore::open(&root).unwrap();
+        let _store = FileMemoryStore::open(&root).map_err(ctx("open"))?;
         for sub in ["warm", "cold", "signals"] {
             assert!(root.join(sub).is_dir(), "expected {sub}/ under root");
         }
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn hot_is_empty_when_no_file() {
+    fn hot_is_empty_when_no_file() -> TestResult {
         let root = tmp_root("hot-empty");
-        let store = FileMemoryStore::open(&root).unwrap();
-        assert_eq!(store.hot().unwrap(), "");
+        let store = FileMemoryStore::open(&root).map_err(ctx("open"))?;
+        assert_eq!(store.hot().map_err(ctx("hot"))?, "");
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn hot_reads_content_when_present() {
+    fn hot_reads_content_when_present() -> TestResult {
         let root = tmp_root("hot-present");
-        let store = FileMemoryStore::open(&root).unwrap();
-        std::fs::write(root.join("HOT.md"), "Regel 1: keine Doppelantworten.\n").unwrap();
-        assert_eq!(store.hot().unwrap(), "Regel 1: keine Doppelantworten.\n");
+        let store = FileMemoryStore::open(&root).map_err(ctx("open"))?;
+        std::fs::write(root.join("HOT.md"), "Regel 1: keine Doppelantworten.\n")
+            .map_err(ctx("HOT.md schreiben"))?;
+        assert_eq!(
+            store.hot().map_err(ctx("hot"))?,
+            "Regel 1: keine Doppelantworten.\n"
+        );
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn hot_overflow_is_rejected() {
+    fn hot_overflow_is_rejected() -> TestResult {
         let root = tmp_root("hot-overflow");
-        let store = FileMemoryStore::open(&root).unwrap();
+        let store = FileMemoryStore::open(&root).map_err(ctx("open"))?;
         let body: String = (0..200).map(|i| format!("Zeile {i}\n")).collect();
-        std::fs::write(root.join("HOT.md"), body).unwrap();
-        assert!(matches!(
-            store.hot().unwrap_err(),
-            MemoryError::TierOverflow { .. }
-        ));
+        std::fs::write(root.join("HOT.md"), body).map_err(ctx("HOT.md schreiben"))?;
+        let Err(err) = store.hot() else {
+            return Err(TestError::Unexpected("hot_overflow: Err erwartet".into()));
+        };
+        assert!(matches!(err, MemoryError::TierOverflow { .. }));
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn record_appends_to_signal_log() {
+    fn record_appends_to_signal_log() -> TestResult {
         let root = tmp_root("record");
-        let store = FileMemoryStore::open(&root).unwrap();
+        let store = FileMemoryStore::open(&root).map_err(ctx("open"))?;
         store
             .record(Signal::Correction {
                 text: "nicht bevormunden".into(),
                 context: Some("session-42".into()),
             })
-            .unwrap();
+            .map_err(ctx("record 1"))?;
         store
             .record(Signal::Correction {
                 text: "keine Emojis".into(),
                 context: None,
             })
-            .unwrap();
-        let content = std::fs::read_to_string(root.join("signals/corrections.jsonl")).unwrap();
+            .map_err(ctx("record 2"))?;
+        let content = std::fs::read_to_string(root.join("signals/corrections.jsonl"))
+            .map_err(ctx("corrections.jsonl lesen"))?;
         assert_eq!(content.lines().count(), 2);
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn recall_filters_by_namespace_and_keywords() {
+    fn recall_filters_by_namespace_and_keywords() -> TestResult {
         let root = tmp_root("recall");
-        let store = FileMemoryStore::open(&root).unwrap();
-        std::fs::create_dir_all(root.join("warm/project")).unwrap();
+        let store = FileMemoryStore::open(&root).map_err(ctx("open"))?;
+        std::fs::create_dir_all(root.join("warm/project")).map_err(ctx("warm/project anlegen"))?;
         std::fs::write(
             root.join("warm/project/harwness.md"),
             "TUI-Fix: Enter darf Popup nicht blockieren.\n",
         )
-        .unwrap();
+        .map_err(ctx("harwness.md schreiben"))?;
         std::fs::write(
             root.join("warm/domain-rust.md"),
             "Nutze `?` statt `unwrap()` in Prod-Pfaden.\n",
         )
-        .unwrap();
+        .map_err(ctx("domain-rust.md schreiben"))?;
         let hits = store
             .recall(RecallQuery {
                 namespace: Some("project/harwness"),
@@ -188,62 +201,70 @@ mod tests {
                 include_cold: false,
                 limit: 10,
             })
-            .unwrap();
+            .map_err(ctx("recall"))?;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].namespace, "project/harwness");
         assert_eq!(hits[0].tier, Tier::Warm);
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn maintain_runs_state_machine_to_db_committed() {
+    fn maintain_runs_state_machine_to_db_committed() -> TestResult {
         let root = tmp_root("maintain");
-        let store = FileMemoryStore::open(&root).unwrap();
+        let store = FileMemoryStore::open(&root).map_err(ctx("open"))?;
         store
             .record(Signal::Reflection {
                 context: "layer".into(),
                 lesson: "Bridge-Crate für Cross-Crate-Getter.".into(),
             })
-            .unwrap();
-        let report = store.maintain().unwrap();
+            .map_err(ctx("record"))?;
+        let report = store.maintain().map_err(ctx("maintain"))?;
         assert_eq!(report.signals_processed, 1);
-        let bytes = std::fs::read(root.join("workflow.json")).unwrap();
-        let marker: WorkflowMarker = serde_json::from_slice(&bytes).unwrap();
+        let bytes =
+            std::fs::read(root.join("workflow.json")).map_err(ctx("workflow.json lesen"))?;
+        let marker: WorkflowMarker =
+            serde_json::from_slice(&bytes).map_err(ctx("workflow.json parsen"))?;
         assert_eq!(marker.step, WorkflowStep::DbCommitted);
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn maintain_is_idempotent_across_runs() {
+    fn maintain_is_idempotent_across_runs() -> TestResult {
         let root = tmp_root("idempotent");
-        let store = FileMemoryStore::open(&root).unwrap();
+        let store = FileMemoryStore::open(&root).map_err(ctx("open"))?;
         store
             .record(Signal::PatternHint {
                 key: "greeting".into(),
                 note: "User grüßt konsistent mit 'moin'.".into(),
             })
-            .unwrap();
-        let first = store.maintain().unwrap();
+            .map_err(ctx("record"))?;
+        let first = store.maintain().map_err(ctx("maintain 1"))?;
         assert_eq!(first.signals_processed, 1);
-        let second = store.maintain().unwrap();
+        let second = store.maintain().map_err(ctx("maintain 2"))?;
         assert_eq!(
             second.signals_processed, 0,
             "already-seen signals must not double-count"
         );
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn stats_reports_counts() {
+    fn stats_reports_counts() -> TestResult {
         let root = tmp_root("stats");
-        let store = FileMemoryStore::open(&root).unwrap();
-        std::fs::write(root.join("HOT.md"), "Regel A\nRegel B\n").unwrap();
-        std::fs::write(root.join("warm/foo.md"), "x\ny\nz\n").unwrap();
-        let s = store.stats().unwrap();
+        let store = FileMemoryStore::open(&root).map_err(ctx("open"))?;
+        std::fs::write(root.join("HOT.md"), "Regel A\nRegel B\n")
+            .map_err(ctx("HOT.md schreiben"))?;
+        std::fs::write(root.join("warm/foo.md"), "x\ny\nz\n")
+            .map_err(ctx("warm/foo.md schreiben"))?;
+        let s = store.stats().map_err(ctx("stats"))?;
         assert_eq!(s.hot_lines, 2);
         assert_eq!(s.warm_namespaces, 1);
         assert_eq!(s.warm_total_lines, 3);
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
@@ -258,3 +279,7 @@ mod tests {
         assert_send_sync::<FileMemoryStore>();
     }
 }
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

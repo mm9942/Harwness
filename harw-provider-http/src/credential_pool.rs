@@ -316,6 +316,7 @@ pub(crate) fn should_failover(error: &ModelError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_config::CredentialEntry;
     use std::collections::BTreeMap;
 
@@ -334,55 +335,56 @@ mod tests {
         auth
     }
 
-    fn entry(secret_ref: &str, priority: u32, label: Option<&str>) -> CredentialEntry {
-        CredentialEntry {
-            secret: secret_ref.parse().expect("valid secret ref"),
+    fn entry(secret_ref: &str, priority: u32, label: Option<&str>) -> TestResult<CredentialEntry> {
+        Ok(CredentialEntry {
+            secret: secret_ref.parse().map_err(ctx("valid secret ref"))?,
             label: label.map(str::to_owned),
             priority,
             base_url: None,
-        }
+        })
     }
 
     #[test]
-    fn test_from_auth_config_returns_none_when_pool_absent() {
+    fn test_from_auth_config_returns_none_when_pool_absent() -> TestResult {
         let auth = AuthConfig::default();
         let env_layer = BTreeMap::new();
-        let pool = CredentialPool::from_auth_config(&auth, "openai", sources(&env_layer), |s| {
-            Ok(s)
-        })
-        .expect("resolves");
+        let pool = CredentialPool::from_auth_config(&auth, "openai", sources(&env_layer), Ok)
+            .map_err(ctx("resolves"))?;
         assert!(pool.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_from_auth_config_resolves_in_priority_order() {
+    fn test_from_auth_config_resolves_in_priority_order() -> TestResult {
         let mut env_layer = BTreeMap::new();
         env_layer.insert("OPENAI_A".to_owned(), "value-a".to_owned());
         env_layer.insert("OPENAI_B".to_owned(), "value-b".to_owned());
         let auth = auth_with_pool(
             "openai",
             vec![
-                entry("env:OPENAI_B", 5, Some("second")),
-                entry("env:OPENAI_A", 0, Some("first")),
+                entry("env:OPENAI_B", 5, Some("second"))?,
+                entry("env:OPENAI_A", 0, Some("first"))?,
             ],
         );
         let pool = CredentialPool::from_auth_config(&auth, "openai", sources(&env_layer), Ok)
-            .expect("resolves")
-            .expect("pool present");
+            .map_err(ctx("resolves"))?
+            .ok_or(TestError::Missing("pool present"))?;
         assert_eq!(pool.len(), 2);
         assert_eq!(pool.entry(0).label, "first");
         assert_eq!(pool.entry(1).label, "second");
+        Ok(())
     }
 
     #[test]
-    fn test_from_auth_config_synthesizes_label_when_missing() {
+    fn test_from_auth_config_synthesizes_label_when_missing() -> TestResult {
         let mut env_layer = BTreeMap::new();
         env_layer.insert("OPENAI_A".to_owned(), "value-a".to_owned());
-        let auth = auth_with_pool("openai", vec![entry("env:OPENAI_A", 0, None)]);
+        let auth = auth_with_pool("openai", vec![entry("env:OPENAI_A", 0, None)?]);
         let pool = CredentialPool::from_auth_config(&auth, "openai", sources(&env_layer), Ok)
-            .expect("resolves")
-            .expect("pool present");
+            .map_err(ctx("resolves"))?
+            .ok_or(TestError::Missing("pool present"))?;
         assert_eq!(pool.entry(0).label, "openai#0");
+        Ok(())
     }
 
     fn cooldown_pool() -> CredentialPool<u32> {

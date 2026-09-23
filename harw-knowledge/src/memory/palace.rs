@@ -168,9 +168,10 @@ pub fn ensure_promotion_reviewed(
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_promotion_reviewed, scan_wikilinks, PalaceNode, PalaceStatus};
+    use super::{PalaceNode, PalaceStatus, ensure_promotion_reviewed, scan_wikilinks};
     use crate::artifact::ArtifactId;
     use crate::error::KnowledgeError;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn test_scan_wikilinks_extracts_targets_and_strips_aliases() {
@@ -185,34 +186,46 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_promotion_reviewed_rejects_unreviewed_promotion() {
-        let error = ensure_promotion_reviewed("runtime", &ArtifactId::new("palace/runtime"), false)
-            .expect_err("unreviewed promotion must be refused");
+    fn test_ensure_promotion_reviewed_rejects_unreviewed_promotion() -> TestResult {
+        let Err(error) =
+            ensure_promotion_reviewed("runtime", &ArtifactId::new("palace/runtime"), false)
+        else {
+            return Err(TestError::Unexpected(
+                "unreviewed promotion must be refused".to_owned(),
+            ));
+        };
         assert!(matches!(error, KnowledgeError::PromotionNotReviewed { .. }));
+        Ok(())
     }
 
     #[test]
     fn test_ensure_promotion_reviewed_accepts_reviewed_promotion() {
-        assert!(ensure_promotion_reviewed("runtime", &ArtifactId::new("palace/runtime"), true).is_ok());
+        assert!(
+            ensure_promotion_reviewed("runtime", &ArtifactId::new("palace/runtime"), true).is_ok()
+        );
     }
 
     /// AW4-05: renaming `Confidence` to `PalaceStatus` must not change the
     /// wire form. Pinned against a literal, not just a round-trip, per the
     /// node's explicit instruction.
     #[test]
-    fn test_palace_status_serializes_identically_to_the_former_confidence_literal() {
+    fn test_palace_status_serializes_identically_to_the_former_confidence_literal() -> TestResult {
         assert_eq!(
-            serde_json::to_string(&PalaceStatus::Established).expect("serializes"),
+            serde_json::to_string(&PalaceStatus::Established)
+                .map_err(crate::test_support::ctx("serializes"))?,
             "\"established\""
         );
         assert_eq!(
-            serde_json::to_string(&PalaceStatus::Provisional).expect("serializes"),
+            serde_json::to_string(&PalaceStatus::Provisional)
+                .map_err(crate::test_support::ctx("serializes"))?,
             "\"provisional\""
         );
         assert_eq!(
-            serde_json::to_string(&PalaceStatus::Superseded).expect("serializes"),
+            serde_json::to_string(&PalaceStatus::Superseded)
+                .map_err(crate::test_support::ctx("serializes"))?,
             "\"superseded\""
         );
+        Ok(())
     }
 
     /// A `PalaceNode` written to disk before the AW4-05 rename still used the
@@ -220,7 +233,7 @@ mod tests {
     /// (also kept). This fixture is byte-for-byte what such a pre-rename
     /// file's JSON projection looked like, and it must keep loading.
     #[test]
-    fn test_palace_node_loads_the_pre_rename_confidence_field_form() {
+    fn test_palace_node_loads_the_pre_rename_confidence_field_form() -> TestResult {
         let legacy_fixture = r#"{
             "id": "palace/deploy-pipeline",
             "title": "Deploy pipeline",
@@ -230,10 +243,12 @@ mod tests {
             "superseded_by": null
         }"#;
 
-        let node: PalaceNode =
-            serde_json::from_str(legacy_fixture).expect("pre-rename fixture still deserializes");
+        let node: PalaceNode = serde_json::from_str(legacy_fixture).map_err(
+            crate::test_support::ctx("pre-rename fixture still deserializes"),
+        )?;
 
         assert_eq!(node.confidence, PalaceStatus::Established);
         assert_eq!(node.id, ArtifactId::new("palace/deploy-pipeline"));
+        Ok(())
     }
 }

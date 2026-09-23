@@ -216,18 +216,13 @@ impl PlanStore for InMemoryPlanStore {
 
         let now = OffsetDateTime::now_utc();
         let first_revision = inner.next_revision;
-        let (candidate, events) = stage_actions(
-            current,
-            actions,
-            actor,
-            &self.config,
-            first_revision,
-            now,
-        )
-        .map_err(|(index, source)| PlanError::BatchActionRejected {
-            index,
-            source: Box::new(source),
-        })?;
+        let (candidate, events) =
+            stage_actions(current, actions, actor, &self.config, first_revision, now).map_err(
+                |(index, source)| PlanError::BatchActionRejected {
+                    index,
+                    source: Box::new(source),
+                },
+            )?;
 
         let revision = candidate.revision;
         inner.plan = Some(candidate);
@@ -269,6 +264,7 @@ mod tests {
     use crate::error::PlanError;
     use crate::ids::{PathOrSymbol, PlanId, TaskId};
     use crate::store::PlanStore;
+    use crate::test_support::TestResult;
     use crate::types::{EvidenceKind, EvidenceRef, PlanNode, PlanNodeKind, PlanNodeStatus};
     use std::sync::Arc;
     use time::OffsetDateTime;
@@ -296,16 +292,15 @@ mod tests {
         }
     }
 
-    fn create_plan(store: &InMemoryPlanStore) {
-        store
-            .apply(
-                PlanAction::Create {
-                    plan_id: PlanId::new("p-test"),
-                    goal: "Testziel".to_owned(),
-                },
-                "orchestrator",
-            )
-            .unwrap();
+    fn create_plan(store: &InMemoryPlanStore) -> TestResult {
+        store.apply(
+            PlanAction::Create {
+                plan_id: PlanId::new("p-test"),
+                goal: "Testziel".to_owned(),
+            },
+            "orchestrator",
+        )?;
+        Ok(())
     }
 
     fn config_with_max_nodes(max_nodes: usize) -> PlanToolConfig {
@@ -316,56 +311,51 @@ mod tests {
     }
 
     #[test]
-    fn test_create_and_inspect() {
+    fn test_create_and_inspect() -> TestResult {
         let store = InMemoryPlanStore::new();
-        create_plan(&store);
-        let plan = store.current().unwrap();
+        create_plan(&store)?;
+        let plan = store.current()?;
         assert_eq!(plan.goal_statement, "Testziel");
         assert_eq!(plan.id, PlanId::new("p-test"));
+        Ok(())
     }
 
     #[test]
-    fn test_apply_chain() {
+    fn test_apply_chain() -> TestResult {
         let store = InMemoryPlanStore::new();
-        create_plan(&store);
+        create_plan(&store)?;
 
         // AddNode
-        store
-            .apply(
-                PlanAction::AddNode {
-                    node: make_node("t1"),
-                },
-                "actor",
-            )
-            .unwrap();
-        let plan = store.current().unwrap();
+        store.apply(
+            PlanAction::AddNode {
+                node: make_node("t1"),
+            },
+            "actor",
+        )?;
+        let plan = store.current()?;
         assert_eq!(plan.nodes.len(), 1);
 
         // AttachEvidence (InProgress erst nötig für Completed)
-        store
-            .apply(
-                PlanAction::SetStatus {
-                    id: TaskId::new("t1"),
-                    status: PlanNodeStatus::Ready,
-                    reason: None,
-                },
-                "actor",
-            )
-            .unwrap();
-        store
-            .apply(
-                PlanAction::SetStatus {
-                    id: TaskId::new("t1"),
-                    status: PlanNodeStatus::InProgress,
-                    reason: None,
-                },
-                "actor",
-            )
-            .unwrap();
+        store.apply(
+            PlanAction::SetStatus {
+                id: TaskId::new("t1"),
+                status: PlanNodeStatus::Ready,
+                reason: None,
+            },
+            "actor",
+        )?;
+        store.apply(
+            PlanAction::SetStatus {
+                id: TaskId::new("t1"),
+                status: PlanNodeStatus::InProgress,
+                reason: None,
+            },
+            "actor",
+        )?;
         // Der Übergang nach InProgress muss den Akteur als Worker festhalten —
         // vor der Zusammenführung der Mutationslogik wurde `actor` hier verworfen.
         assert_eq!(
-            store.current().unwrap().nodes[0]
+            store.current()?.nodes[0]
                 .assignment
                 .as_ref()
                 .map(|assignment| assignment.worker.as_str()),
@@ -380,44 +370,41 @@ mod tests {
             actor: "ci".to_owned(),
             digest: None,
         };
-        store
-            .apply(
-                PlanAction::AttachEvidence {
-                    id: TaskId::new("t1"),
-                    evidence: ev,
-                },
-                "ci",
-            )
-            .unwrap();
+        store.apply(
+            PlanAction::AttachEvidence {
+                id: TaskId::new("t1"),
+                evidence: ev,
+            },
+            "ci",
+        )?;
 
-        store
-            .apply(
-                PlanAction::SetStatus {
-                    id: TaskId::new("t1"),
-                    status: PlanNodeStatus::Completed,
-                    reason: None,
-                },
-                "actor",
-            )
-            .unwrap();
+        store.apply(
+            PlanAction::SetStatus {
+                id: TaskId::new("t1"),
+                status: PlanNodeStatus::Completed,
+                reason: None,
+            },
+            "actor",
+        )?;
 
-        let plan = store.current().unwrap();
+        let plan = store.current()?;
         assert_eq!(plan.nodes[0].status, PlanNodeStatus::Completed);
         assert_eq!(plan.nodes[0].evidence.len(), 1);
 
         // History muss mehrere Events enthalten
-        let hist = store.history(None).unwrap();
+        let hist = store.history(None)?;
         assert!(
             hist.len() >= 5,
             "History hat zu wenig Einträge: {}",
             hist.len()
         );
+        Ok(())
     }
 
     #[test]
-    fn test_second_create_is_rejected_with_plan_exists() {
+    fn test_second_create_is_rejected_with_plan_exists() -> TestResult {
         let store = InMemoryPlanStore::new();
-        create_plan(&store);
+        create_plan(&store)?;
 
         let result = store.apply(
             PlanAction::Create {
@@ -432,11 +419,12 @@ mod tests {
             "ein zweites Create muss fail-closed abgelehnt werden, Ergebnis: {result:?}"
         );
         // Der bestehende Plan bleibt unangetastet, es entsteht kein Event.
-        let plan = store.current().unwrap();
+        let plan = store.current()?;
         assert_eq!(plan.id, PlanId::new("p-test"));
         assert_eq!(plan.goal_statement, "Testziel");
-        assert_eq!(store.history(None).unwrap().len(), 1);
+        assert_eq!(store.history(None)?.len(), 1);
         assert_eq!(store.revision(), RevisionId::new(1));
+        Ok(())
     }
 
     #[test]
@@ -461,17 +449,15 @@ mod tests {
     }
 
     #[test]
-    fn test_configured_store_rejects_node_limit_before_mutation() {
-        let store = InMemoryPlanStore::with_config(config_with_max_nodes(1)).unwrap();
-        create_plan(&store);
-        store
-            .apply(
-                PlanAction::AddNode {
-                    node: make_node("t1"),
-                },
-                "worker",
-            )
-            .unwrap();
+    fn test_configured_store_rejects_node_limit_before_mutation() -> TestResult {
+        let store = InMemoryPlanStore::with_config(config_with_max_nodes(1))?;
+        create_plan(&store)?;
+        store.apply(
+            PlanAction::AddNode {
+                node: make_node("t1"),
+            },
+            "worker",
+        )?;
 
         let result = store.apply(
             PlanAction::AddNode {
@@ -490,9 +476,10 @@ mod tests {
             ),
             "Knotenlimit muss AddNode mit einem typisierten Konfigurationsfehler ablehnen"
         );
-        assert_eq!(store.current().unwrap().nodes.len(), 1);
+        assert_eq!(store.current()?.nodes.len(), 1);
         assert_eq!(store.revision(), RevisionId::new(2));
-        assert_eq!(store.history(None).unwrap().len(), 2);
+        assert_eq!(store.history(None)?.len(), 2);
+        Ok(())
     }
 
     // ── apply_batch ───────────────────────────────────────────────────────
@@ -506,46 +493,45 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_batch_applies_all_actions_with_sequential_revisions() {
+    fn test_apply_batch_applies_all_actions_with_sequential_revisions() -> TestResult {
         let store = InMemoryPlanStore::new();
-        create_plan(&store);
+        create_plan(&store)?;
         let before = store.revision();
 
-        let result = store
-            .apply_batch(
-                &PlanId::new("p-test"),
-                vec![
-                    PlanAction::AddNode {
-                        node: make_node("explore"),
-                    },
-                    PlanAction::AddNode {
-                        node: make_node("impl"),
-                    },
-                    PlanAction::AddDependency {
-                        child: TaskId::new("impl"),
-                        parent: TaskId::new("explore"),
-                    },
-                ],
-                "controller",
-                before,
-            )
-            .unwrap();
+        let result = store.apply_batch(
+            &PlanId::new("p-test"),
+            vec![
+                PlanAction::AddNode {
+                    node: make_node("explore"),
+                },
+                PlanAction::AddNode {
+                    node: make_node("impl"),
+                },
+                PlanAction::AddDependency {
+                    child: TaskId::new("impl"),
+                    parent: TaskId::new("explore"),
+                },
+            ],
+            "controller",
+            before,
+        )?;
 
         assert_eq!(result.events.len(), 3);
         assert_eq!(result.revision, RevisionId::new(before.value() + 3));
         let revisions: Vec<u64> = result.events.iter().map(|e| e.revision.value()).collect();
         assert_eq!(revisions, vec![2, 3, 4]);
         assert_eq!(store.revision(), result.revision);
-        let plan = store.current().unwrap();
+        let plan = store.current()?;
         assert_eq!(plan.nodes.len(), 2);
         assert_eq!(plan.nodes[1].dependencies, vec![TaskId::new("explore")]);
-        assert_eq!(store.history(None).unwrap().len(), 4);
+        assert_eq!(store.history(None)?.len(), 4);
+        Ok(())
     }
 
     #[test]
-    fn test_apply_batch_failure_in_third_action_changes_nothing() {
+    fn test_apply_batch_failure_in_third_action_changes_nothing() -> TestResult {
         let store = InMemoryPlanStore::new();
-        create_plan(&store);
+        create_plan(&store)?;
         let before = store.revision();
 
         let result = store.apply_batch(
@@ -570,24 +556,31 @@ mod tests {
             ),
             "Ergebnis: {result:?}"
         );
-        assert!(store.current().unwrap().nodes.is_empty(), "nichts angewendet");
+        assert!(store.current()?.nodes.is_empty(), "nichts angewendet");
         assert_eq!(store.revision(), before);
-        assert_eq!(store.history(None).unwrap().len(), 1);
+        assert_eq!(store.history(None)?.len(), 1);
 
         // Die Revisionsvergabe ist nicht vorgerückt.
-        let event = store
-            .apply(PlanAction::AddNode { node: make_node("t1") }, "a")
-            .unwrap();
+        let event = store.apply(
+            PlanAction::AddNode {
+                node: make_node("t1"),
+            },
+            "a",
+        )?;
         assert_eq!(event.revision, RevisionId::new(2));
+        Ok(())
     }
 
     #[test]
-    fn test_apply_batch_revision_conflict_changes_nothing() {
+    fn test_apply_batch_revision_conflict_changes_nothing() -> TestResult {
         let store = InMemoryPlanStore::new();
-        create_plan(&store);
-        store
-            .apply(PlanAction::AddNode { node: make_node("t1") }, "a")
-            .unwrap();
+        create_plan(&store)?;
+        store.apply(
+            PlanAction::AddNode {
+                node: make_node("t1"),
+            },
+            "a",
+        )?;
 
         let result = store.apply_batch(
             &PlanId::new("p-test"),
@@ -606,13 +599,14 @@ mod tests {
             ),
             "Ergebnis: {result:?}"
         );
-        assert_eq!(store.current().unwrap().nodes.len(), 1);
+        assert_eq!(store.current()?.nodes.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_apply_batch_other_plan_id_is_plan_not_found() {
+    fn test_apply_batch_other_plan_id_is_plan_not_found() -> TestResult {
         let store = InMemoryPlanStore::new();
-        create_plan(&store);
+        create_plan(&store)?;
 
         let result = store.apply_batch(
             &PlanId::new("p-other"),
@@ -622,13 +616,14 @@ mod tests {
         );
 
         assert!(matches!(result, Err(PlanError::PlanNotFound)));
-        assert_eq!(store.history(None).unwrap().len(), 1);
+        assert_eq!(store.history(None)?.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_apply_batch_rejects_create_inside_batch() {
+    fn test_apply_batch_rejects_create_inside_batch() -> TestResult {
         let store = InMemoryPlanStore::new();
-        create_plan(&store);
+        create_plan(&store)?;
 
         let result = store.apply_batch(
             &PlanId::new("p-test"),
@@ -644,12 +639,13 @@ mod tests {
             result,
             Err(PlanError::BatchActionRejected { index: 0, .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_apply_batch_enforces_node_limit_with_running_count() {
-        let store = InMemoryPlanStore::with_config(config_with_max_nodes(1)).unwrap();
-        create_plan(&store);
+    fn test_apply_batch_enforces_node_limit_with_running_count() -> TestResult {
+        let store = InMemoryPlanStore::with_config(config_with_max_nodes(1))?;
+        create_plan(&store)?;
 
         let result = store.apply_batch(
             &PlanId::new("p-test"),
@@ -676,21 +672,22 @@ mod tests {
             ),
             "Ergebnis: {result:?}"
         );
-        assert!(store.current().unwrap().nodes.is_empty());
+        assert!(store.current()?.nodes.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_apply_batch_empty_is_noop() {
+    fn test_apply_batch_empty_is_noop() -> TestResult {
         let store = InMemoryPlanStore::new();
-        create_plan(&store);
+        create_plan(&store)?;
 
-        let result = store
-            .apply_batch(&PlanId::new("p-test"), Vec::new(), "c", store.revision())
-            .unwrap();
+        let result =
+            store.apply_batch(&PlanId::new("p-test"), Vec::new(), "c", store.revision())?;
 
         assert!(result.events.is_empty());
         assert_eq!(result.revision, RevisionId::new(1));
-        assert_eq!(store.history(None).unwrap().len(), 1);
+        assert_eq!(store.history(None)?.len(), 1);
+        Ok(())
     }
 
     #[test]
@@ -707,25 +704,27 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(PlanError::InvalidId { field: "PlanId", .. })
+            Err(PlanError::InvalidId {
+                field: "PlanId",
+                ..
+            })
         ));
         assert!(matches!(store.current(), Err(PlanError::PlanNotFound)));
     }
 
     #[test]
-    fn test_bind_goal_sets_goal_id_through_store() {
+    fn test_bind_goal_sets_goal_id_through_store() -> TestResult {
         let store = InMemoryPlanStore::new();
-        create_plan(&store);
+        create_plan(&store)?;
 
-        store
-            .apply(
-                PlanAction::BindGoal {
-                    goal_id: "g-1".to_owned(),
-                },
-                "human:mia",
-            )
-            .unwrap();
+        store.apply(
+            PlanAction::BindGoal {
+                goal_id: "g-1".to_owned(),
+            },
+            "human:mia",
+        )?;
 
-        assert_eq!(store.current().unwrap().goal_id.as_deref(), Some("g-1"));
+        assert_eq!(store.current()?.goal_id.as_deref(), Some("g-1"));
+        Ok(())
     }
 }

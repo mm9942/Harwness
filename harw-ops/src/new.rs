@@ -104,21 +104,24 @@ async fn new(_ctx: &OpContext, _args: NewArgs) -> Result<OpOutput, OpError> {
 #[cfg(test)]
 mod tests {
     use super::{NewArgs, new};
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn test_context() -> (OpContext, PathBuf) {
+    fn test_context() -> TestResult<(OpContext, PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "harw-new-test-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(root.join("workspace")).expect("create test workspace");
+        std::fs::create_dir_all(root.join("workspace")).map_err(ctx("create test workspace"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -127,66 +130,69 @@ mod tests {
                 root: PathBuf::from("workspace"),
             }],
         )
-        .expect("build workspace registry");
+        .map_err(ctx("build workspace registry"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("workspace"),
             )
-            .expect("resolve workspace binding");
+            .map_err(ctx("resolve workspace binding"))?;
         let sandbox = SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ReadWorkspace]),
         );
-        (
+        Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new()),
             root,
-        )
+        ))
     }
 
     #[test]
-    fn test_new_args_from_raw_args_joins_tokens_with_space() {
-        let args = NewArgs::from_raw_args(&toks(&["a", "b"]));
-        match args {
-            Ok(a) => assert_eq!(a.title.as_deref(), Some("a b")),
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
-        }
+    fn test_new_args_from_raw_args_joins_tokens_with_space() -> TestResult {
+        let args =
+            NewArgs::from_raw_args(&toks(&["a", "b"])).map_err(ctx("NewArgs::from_raw_args"))?;
+        assert_eq!(args.title.as_deref(), Some("a b"));
+        Ok(())
     }
 
     #[test]
-    fn test_new_args_from_raw_args_empty_tokens_sets_title_none() {
-        let args = NewArgs::from_raw_args(&toks(&[]));
-        match args {
-            Ok(a) => assert!(a.title.is_none()),
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
-        }
+    fn test_new_args_from_raw_args_empty_tokens_sets_title_none() -> TestResult {
+        let args = NewArgs::from_raw_args(&toks(&[])).map_err(ctx("NewArgs::from_raw_args"))?;
+        assert!(args.title.is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn new_without_title_returns_not_available() {
-        let (ctx, root) = test_context();
-        let result = new(&ctx, NewArgs::default()).await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+    async fn new_without_title_returns_not_available() -> TestResult {
+        let (op_ctx, root) = test_context()?;
+        let result = new(&op_ctx, NewArgs::default()).await;
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
 
         assert!(matches!(result, Err(OpError::NotAvailable(_))));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn new_with_title_returns_not_available_without_title_leakage() {
-        let (ctx, root) = test_context();
+    async fn new_with_title_returns_not_available_without_title_leakage() -> TestResult {
+        let (op_ctx, root) = test_context()?;
         let title = "title-must-not-appear-in-error";
         let result = new(
-            &ctx,
+            &op_ctx,
             NewArgs {
                 title: Some(title.to_owned()),
             },
         )
         .await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
 
         match result {
-            Err(OpError::NotAvailable(message)) => assert!(!message.contains(title)),
-            other => panic!("expected NotAvailable, got: {other:?}"),
+            Err(OpError::NotAvailable(message)) => {
+                assert!(!message.contains(title));
+                Ok(())
+            }
+            other => Err(TestError::Unexpected(format!(
+                "expected NotAvailable, got: {other:?}"
+            ))),
         }
     }
 }

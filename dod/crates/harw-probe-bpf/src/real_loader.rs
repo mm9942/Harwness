@@ -62,8 +62,8 @@
 //! let loader = build_real_loader().expect("building the loader never fails");
 //! ```
 
-use harw_dod_bpf::real::RealBpfLoader;
 use harw_dod_bpf::BpfLoader;
+use harw_dod_bpf::real::RealBpfLoader;
 
 use crate::error::ProbeError;
 

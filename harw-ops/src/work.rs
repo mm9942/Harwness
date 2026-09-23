@@ -115,10 +115,13 @@ fn render_work_panel(counts: &[usize; 7]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{WorkArgs, work};
+    use crate::test_support::{TestResult, ctx};
     use crate::testutil::toks;
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_job_runtime::{Budget, Job, JobKind, JobScope, JobState, RetryPolicy, StoredJob};
     use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_session_store::JobStore;
     use harw_types::{ApprovalActor, SessionId, TenantId, TurnId, WorkId, WorkspaceId};
     use jiff::{SignedDuration, Timestamp};
@@ -132,9 +135,9 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}-{}-{id}", std::process::id()))
     }
 
-    fn test_context(store: Option<Arc<JobStore>>) -> (OpContext, PathBuf) {
+    fn test_context(store: Option<Arc<JobStore>>) -> TestResult<(OpContext, PathBuf)> {
         let root = unique_root("harw-work-test");
-        std::fs::create_dir_all(root.join("workspace")).expect("create test workspace");
+        std::fs::create_dir_all(root.join("workspace")).map_err(ctx("create test workspace"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -143,13 +146,13 @@ mod tests {
                 root: PathBuf::from("workspace"),
             }],
         )
-        .expect("build workspace registry");
+        .map_err(ctx("build workspace registry"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("workspace"),
             )
-            .expect("resolve workspace binding");
+            .map_err(ctx("resolve workspace binding"))?;
         let sandbox = SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ReadWorkspace]),
@@ -158,13 +161,13 @@ mod tests {
         if let Some(store) = store {
             services.insert(store);
         }
-        (
+        Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, services),
             root,
-        )
+        ))
     }
 
-    fn admitted_job(id: &str, state: JobState) -> StoredJob {
+    fn admitted_job(id: &str, state: JobState) -> TestResult<StoredJob> {
         let now = Timestamp::now();
         let mut job = Job::new(
             WorkId::from_str(id),
@@ -179,9 +182,10 @@ mod tests {
             now,
         );
         if state == JobState::Ready {
-            job.mark_ready(now).expect("pending job can become ready");
+            job.mark_ready(now)
+                .map_err(ctx("pending job can become ready"))?;
         }
-        StoredJob {
+        Ok(StoredJob {
             job,
             scope: JobScope::new(
                 TenantId::from_str("test-tenant"),
@@ -199,7 +203,7 @@ mod tests {
             cancellation: None,
             revision: 0,
             trace: None,
-        }
+        })
     }
 
     #[test]
@@ -215,50 +219,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn work_without_job_store_returns_not_available() {
-        let (ctx, root) = test_context(None);
+    async fn work_without_job_store_returns_not_available() -> TestResult {
+        let (ctx, root) = test_context(None)?;
         let result = work(&ctx, WorkArgs::default()).await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         assert!(matches!(result, Err(OpError::NotAvailable(_))));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn work_with_empty_store_reports_zero_counts() {
+    async fn work_with_empty_store_reports_zero_counts() -> TestResult {
         let store_root = unique_root("harw-work-empty-store");
         let store = Arc::new(JobStore::new(&store_root));
-        let (ctx, workspace_root) = test_context(Some(store));
+        let (ctx, workspace_root) = test_context(Some(store))?;
         let output = work(&ctx, WorkArgs::default())
             .await
-            .expect("render empty work panel");
+            .map_err(crate::test_support::ctx("render empty work panel"))?;
         let _ = std::fs::remove_dir_all(store_root);
-        std::fs::remove_dir_all(workspace_root).expect("remove test workspace");
+        std::fs::remove_dir_all(workspace_root)
+            .map_err(crate::test_support::ctx("remove test workspace"))?;
 
         assert_eq!(
             output.text,
             "Durable jobs: 0\nPending: 0\nReady: 0\nRunning: 0\nCompleted: 0\nBlocked: 0\nFailed: 0\nCancelled: 0\nApproval and diff-preview data are unavailable in this local command context."
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn work_with_admitted_jobs_reports_total_and_state_counts() {
+    async fn work_with_admitted_jobs_reports_total_and_state_counts() -> TestResult {
         let store_root = unique_root("harw-work-admitted-store");
         let store = Arc::new(JobStore::new(&store_root));
         store
-            .admit(&admitted_job("job-pending", JobState::Pending))
-            .expect("admit pending job");
+            .admit(&admitted_job("job-pending", JobState::Pending)?)
+            .map_err(ctx("admit pending job"))?;
         store
-            .admit(&admitted_job("job-ready", JobState::Ready))
-            .expect("admit ready job");
+            .admit(&admitted_job("job-ready", JobState::Ready)?)
+            .map_err(ctx("admit ready job"))?;
         store
-            .admit(&admitted_job("job-ready-second", JobState::Ready))
-            .expect("admit second ready job");
-        let (ctx, workspace_root) = test_context(Some(store));
+            .admit(&admitted_job("job-ready-second", JobState::Ready)?)
+            .map_err(ctx("admit second ready job"))?;
+        let (ctx, workspace_root) = test_context(Some(store))?;
         let output = work(&ctx, WorkArgs::default())
             .await
-            .expect("render admitted job panel");
-        std::fs::remove_dir_all(store_root).expect("remove job store");
-        std::fs::remove_dir_all(workspace_root).expect("remove test workspace");
+            .map_err(crate::test_support::ctx("render admitted job panel"))?;
+        std::fs::remove_dir_all(store_root)
+            .map_err(crate::test_support::ctx("remove job store"))?;
+        std::fs::remove_dir_all(workspace_root)
+            .map_err(crate::test_support::ctx("remove test workspace"))?;
 
         assert!(output.text.contains("Durable jobs: 3"));
         assert!(output.text.contains("Pending: 1"));
@@ -267,5 +276,6 @@ mod tests {
         assert!(output.text.contains(
             "Approval and diff-preview data are unavailable in this local command context."
         ));
+        Ok(())
     }
 }

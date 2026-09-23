@@ -105,7 +105,9 @@
 //! Rückgabetyp exakt `Vec<harw_context::Fragment>` ist.
 
 use crate::history::ConversationHistory;
-use harw_context::{Fragment, FragmentLabel, FragmentOrigin, FragmentReference, SectionName, Stability, TrustClass};
+use harw_context::{
+    Fragment, FragmentLabel, FragmentOrigin, FragmentReference, SectionName, Stability, TrustClass,
+};
 use harw_lens_types::CostEstimator;
 use harw_protocol::items::TurnItem;
 use harw_types::ItemId;
@@ -272,7 +274,10 @@ pub fn render_history_tail(
         }
     }
 
-    Ok(HistoryTailRender { fragments, loadable })
+    Ok(HistoryTailRender {
+        fragments,
+        loadable,
+    })
 }
 
 /// Extrahiert die `ItemId` eines beliebigen `TurnItem`, unabhängig von der
@@ -350,10 +355,11 @@ fn flatten(parts: &[harw_protocol::items::ContentPart]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_history_tail, HISTORY_TAIL_GUARANTEED_GROUPS};
+    use super::{HISTORY_TAIL_GUARANTEED_GROUPS, render_history_tail};
     use crate::history::ConversationHistory;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_context::TrustClass;
-    use harw_lens_types::{BytesOverFour};
+    use harw_lens_types::BytesOverFour;
     use harw_protocol::ToolCallResult;
     use harw_types::ToolCallId;
 
@@ -382,25 +388,27 @@ mod tests {
     }
 
     #[test]
-    fn test_render_history_tail_short_history_has_no_references() {
+    fn test_render_history_tail_short_history_has_no_references() -> TestResult {
         // 2 Austausche = 4 Gruppen = genau der garantierte Schwanz.
         let history = history_with_exchanges(2);
         let rendered = render_history_tail(&history, jiff::Timestamp::UNIX_EPOCH, &BytesOverFour)
-            .expect("literal section name always validates");
+            .map_err(ctx("literal section name always validates"))?;
 
         assert_eq!(rendered.fragments.len(), 4);
         assert!(rendered.loadable.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_render_history_tail_guarantees_the_last_n_groups_verbatim() {
+    fn test_render_history_tail_guarantees_the_last_n_groups_verbatim() -> TestResult {
         // 6 Austausche = 12 Gruppen; die letzten HISTORY_TAIL_GUARANTEED_GROUPS
         // müssen wörtlich den vollen Text tragen.
         let history = history_with_exchanges(6);
         let rendered = render_history_tail(&history, jiff::Timestamp::UNIX_EPOCH, &BytesOverFour)
-            .expect("literal section name always validates");
+            .map_err(ctx("literal section name always validates"))?;
 
-        let guaranteed = &rendered.fragments[rendered.fragments.len() - HISTORY_TAIL_GUARANTEED_GROUPS..];
+        let guaranteed =
+            &rendered.fragments[rendered.fragments.len() - HISTORY_TAIL_GUARANTEED_GROUPS..];
         assert!(
             guaranteed.iter().any(|f| f.body.contains("answer 5")),
             "the most recent answer must be verbatim in the guaranteed tail"
@@ -412,13 +420,14 @@ mod tests {
                 fragment.body
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_render_history_tail_older_groups_become_cheaper_references() {
+    fn test_render_history_tail_older_groups_become_cheaper_references() -> TestResult {
         let history = history_with_exchanges(6);
         let rendered = render_history_tail(&history, jiff::Timestamp::UNIX_EPOCH, &BytesOverFour)
-            .expect("literal section name always validates");
+            .map_err(ctx("literal section name always validates"))?;
 
         assert_eq!(
             rendered.loadable.len(),
@@ -437,19 +446,24 @@ mod tests {
             oldest_reference.cost,
             oldest_full.cost
         );
+        Ok(())
     }
 
     #[test]
-    fn test_render_history_tail_tool_call_result_pair_stays_one_fragment() {
+    fn test_render_history_tail_tool_call_result_pair_stays_one_fragment() -> TestResult {
         let mut history = ConversationHistory::new();
         history.push_user_text("run the tests");
         let call_id = ToolCallId::new();
         history.push_tool_call(call_id.clone(), "cargo.test", serde_json::json!({}));
-        history.push_tool_result(call_id, ToolCallResult::success(serde_json::json!({"ok": true})), 5);
+        history.push_tool_result(
+            call_id,
+            ToolCallResult::success(serde_json::json!({"ok": true})),
+            5,
+        );
         history.push_assistant_text("tests pass", None);
 
         let rendered = render_history_tail(&history, jiff::Timestamp::UNIX_EPOCH, &BytesOverFour)
-            .expect("literal section name always validates");
+            .map_err(ctx("literal section name always validates"))?;
 
         // 3 Gruppen: user, (call+result), assistant.
         assert_eq!(rendered.fragments.len(), 3);
@@ -457,15 +471,18 @@ mod tests {
             .fragments
             .iter()
             .find(|f| f.body.contains("tool_call") && f.body.contains("tool_result"))
-            .expect("the call/result pair must be rendered as a single fragment");
+            .ok_or(TestError::Missing(
+                "the call/result pair must be rendered as a single fragment",
+            ))?;
         assert!(pair.body.contains("cargo.test"));
+        Ok(())
     }
 
     #[test]
-    fn test_render_history_tail_all_fragments_are_evidence_trust() {
+    fn test_render_history_tail_all_fragments_are_evidence_trust() -> TestResult {
         let history = history_with_exchanges(6);
         let rendered = render_history_tail(&history, jiff::Timestamp::UNIX_EPOCH, &BytesOverFour)
-            .expect("literal section name always validates");
+            .map_err(ctx("literal section name always validates"))?;
 
         for fragment in rendered.fragments.iter().chain(rendered.loadable.iter()) {
             assert_eq!(
@@ -474,15 +491,17 @@ mod tests {
                 "a history fragment must never claim Instruction trust, referenced or not"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_render_history_tail_is_deterministic() {
+    fn test_render_history_tail_is_deterministic() -> TestResult {
         let history = history_with_exchanges(6);
-        let a = render_history_tail(&history, jiff::Timestamp::UNIX_EPOCH, &BytesOverFour).unwrap();
-        let b = render_history_tail(&history, jiff::Timestamp::UNIX_EPOCH, &BytesOverFour).unwrap();
+        let a = render_history_tail(&history, jiff::Timestamp::UNIX_EPOCH, &BytesOverFour)?;
+        let b = render_history_tail(&history, jiff::Timestamp::UNIX_EPOCH, &BytesOverFour)?;
 
         assert_eq!(a, b);
+        Ok(())
     }
 
     /// Determinismus gilt auch für die interne Reihenfolge: zwei Aufrufe mit
@@ -491,23 +510,25 @@ mod tests {
     /// Reihenfolge zwar neu sortiert, aber Tests darauf verlassen können
     /// müssen, dass hier keine zufällige Variation hereinkommt.
     #[test]
-    fn test_render_history_tail_fragment_order_is_stable_across_calls() {
+    fn test_render_history_tail_fragment_order_is_stable_across_calls() -> TestResult {
         let history = history_with_exchanges(4);
-        let a = render_history_tail(&history, jiff::Timestamp::UNIX_EPOCH, &BytesOverFour).unwrap();
-        let b = render_history_tail(&history, jiff::Timestamp::UNIX_EPOCH, &BytesOverFour).unwrap();
+        let a = render_history_tail(&history, jiff::Timestamp::UNIX_EPOCH, &BytesOverFour)?;
+        let b = render_history_tail(&history, jiff::Timestamp::UNIX_EPOCH, &BytesOverFour)?;
 
         let labels_a: Vec<_> = a.fragments.iter().map(|f| f.label.clone()).collect();
         let labels_b: Vec<_> = b.fragments.iter().map(|f| f.label.clone()).collect();
         assert_eq!(labels_a, labels_b);
+        Ok(())
     }
 
     #[test]
-    fn test_render_history_tail_empty_history_yields_empty_render() {
+    fn test_render_history_tail_empty_history_yields_empty_render() -> TestResult {
         let history = ConversationHistory::new();
         let rendered = render_history_tail(&history, jiff::Timestamp::UNIX_EPOCH, &BytesOverFour)
-            .expect("literal section name always validates");
+            .map_err(ctx("literal section name always validates"))?;
 
         assert!(rendered.fragments.is_empty());
         assert!(rendered.loadable.is_empty());
+        Ok(())
     }
 }

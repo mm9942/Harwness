@@ -305,6 +305,7 @@ pub struct RuntimeServicesParts {
 /// `Send + Sync`; typischerweise hinter einem `Arc` geteilt.
 pub struct RuntimeServices {
     parts: RuntimeServicesParts,
+    home_context: Option<Arc<harw_home::ResolvedHomeContext>>,
 }
 
 /// Legt `service` in `map` ab und merkt sich seinen Typnamen in `names`.
@@ -340,7 +341,16 @@ impl RuntimeServices {
     /// Rein synchron; keine Sperren, keine Ein-/Ausgabe.
     #[must_use]
     pub fn new(parts: RuntimeServicesParts) -> Self {
-        Self { parts }
+        Self {
+            parts,
+            home_context: None,
+        }
+    }
+
+    /// Bind the filesystem scope inherited by every operation surface.
+    pub fn with_home_context(mut self, context: Arc<harw_home::ResolvedHomeContext>) -> Self {
+        self.home_context = Some(context);
+        self
     }
 
     /// Das authentifizierte Subjekt dieser Komposition.
@@ -519,6 +529,9 @@ impl RuntimeServices {
     fn assemble(&self, surface: ServiceSurface) -> (ServiceMap, Vec<&'static str>) {
         let mut map = ServiceMap::new();
         let mut names = Vec::new();
+        if let Some(context) = &self.home_context {
+            insert_service(&mut map, &mut names, Arc::clone(context));
+        }
 
         // Frische Registry aus Arc-Klonen: der Typ in der Map ist der konkrete
         // `OperationRegistry`, den `/help` & Co. nachschlagen.
@@ -593,6 +606,7 @@ mod tests {
     use super::{
         PlanServices, RuntimeServices, RuntimeServicesParts, ServiceSurface, insert_service,
     };
+    use crate::test_support::{TestError, TestResult};
     use harw_config::ResolvedConfig;
     use harw_core::{ChildLimits, InMemoryStateStore, ManagedAgentSpawner, SessionManager};
     use harw_extension_api::allow_rules::AllowRuleSet;
@@ -602,8 +616,8 @@ mod tests {
     use harw_operations::session_control::NullSessionController;
     use harw_operations::{ServiceMap, SharedSessionController};
     use harw_plan::{GoalStore, InMemoryGoalStore, InMemoryPlanStore, PlanStore, PlanToolConfig};
-    use harw_provider_http::ProviderLoadRegistry;
     use harw_plan_bridge::FindingStore;
+    use harw_provider_http::ProviderLoadRegistry;
     use harw_sandbox::{ExtraRootsCell, HostPermitSessionRegistry, ProcessPermitLedger};
     use harw_session_store::JobStore;
     use harw_tool_shell::HostPermitHandles;
@@ -934,16 +948,16 @@ mod tests {
     }
 
     #[test]
-    fn the_cell_is_shared_across_surfaces() {
+    fn the_cell_is_shared_across_surfaces() -> TestResult {
         let services = RuntimeServices::new(full_parts());
         let slash = services.service_map(ServiceSurface::Slash);
         let model_tool = services.service_map(ServiceSurface::ModelTool);
         let Some(cell) = slash.get::<ApprovalModeCell>() else {
-            panic!("Slash-Fläche ohne ApprovalModeCell");
+            return Err(TestError::Missing("Slash-Fläche ohne ApprovalModeCell"));
         };
         cell.set(ApprovalMode::FullAccess);
         let Some(other) = model_tool.get::<ApprovalModeCell>() else {
-            panic!("ModelTool-Fläche ohne ApprovalModeCell");
+            return Err(TestError::Missing("ModelTool-Fläche ohne ApprovalModeCell"));
         };
         assert_eq!(
             other.get(),
@@ -951,20 +965,21 @@ mod tests {
             "/permissions im Slash-Pfad muss für das nächste Modell-Werkzeug gelten"
         );
         assert_eq!(services.approval_mode().get(), ApprovalMode::FullAccess);
+        Ok(())
     }
 
     /// Wie [`the_cell_is_shared_across_surfaces`], für die geteilte
     /// [`AllowRuleSet`]: eine über `/permissions` (Slash) angelegte Regel
     /// muss dem nächsten Modell-Werkzeug derselben Sitzung sofort vorliegen.
     #[test]
-    fn the_allow_rule_set_is_shared_across_surfaces() {
+    fn the_allow_rule_set_is_shared_across_surfaces() -> TestResult {
         use harw_extension_api::allow_rules::{ApprovalRule, RuleDecision, RuleScope};
 
         let services = RuntimeServices::new(full_parts());
         let slash = services.service_map(ServiceSurface::Slash);
         let model_tool = services.service_map(ServiceSurface::ModelTool);
         let Some(rules) = slash.get::<AllowRuleSet>() else {
-            panic!("Slash-Fläche ohne AllowRuleSet");
+            return Err(TestError::Missing("Slash-Fläche ohne AllowRuleSet"));
         };
         rules.add(ApprovalRule {
             tool: "shell.exec".to_owned(),
@@ -973,7 +988,7 @@ mod tests {
             scope: RuleScope::Session,
         });
         let Some(other) = model_tool.get::<AllowRuleSet>() else {
-            panic!("ModelTool-Fläche ohne AllowRuleSet");
+            return Err(TestError::Missing("ModelTool-Fläche ohne AllowRuleSet"));
         };
         assert_eq!(
             other.snapshot().len(),
@@ -981,6 +996,7 @@ mod tests {
             "/permissions im Slash-Pfad muss für das nächste Modell-Werkzeug gelten"
         );
         assert_eq!(services.allow_rules().snapshot().len(), 1);
+        Ok(())
     }
 
     #[test]
@@ -1052,7 +1068,7 @@ mod tests {
     /// Ledgers/der Sitzungs-Registry (Plan Teil B3: nur der Zeiger wird
     /// geklont, siehe [`RuntimeServices::service_map`]-Doku).
     #[test]
-    fn host_permit_handles_share_the_same_ledger_arc_across_surfaces() {
+    fn host_permit_handles_share_the_same_ledger_arc_across_surfaces() -> TestResult {
         let handles = test_host_permit_handles();
         let mut parts = full_parts();
         parts.host_permit_handles = Some(Arc::clone(&handles));
@@ -1064,10 +1080,13 @@ mod tests {
             slash.get::<Arc<HostPermitHandles>>(),
             web.get::<Arc<HostPermitHandles>>(),
         ) else {
-            panic!("beide Flächen brauchen HostPermitHandles");
+            return Err(TestError::Missing(
+                "beide Flächen brauchen HostPermitHandles",
+            ));
         };
         assert!(Arc::ptr_eq(&via_slash.ledger, &handles.ledger));
         assert!(Arc::ptr_eq(&via_web.ledger, &handles.ledger));
+        Ok(())
     }
 
     // ── Abgrenzung ────────────────────────────────────────────────────────────
@@ -1109,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn the_registry_of_two_surfaces_is_not_the_same_instance() {
+    fn the_registry_of_two_surfaces_is_not_the_same_instance() -> TestResult {
         let services = RuntimeServices::new(full_parts());
         let slash = services.service_map(ServiceSurface::Slash);
         let web = services.service_map(ServiceSurface::Web);
@@ -1117,44 +1136,48 @@ mod tests {
             slash.get::<OperationRegistry>(),
             web.get::<OperationRegistry>(),
         ) else {
-            panic!("beide Flächen brauchen eine OperationRegistry");
+            return Err(TestError::Missing(
+                "beide Flächen brauchen eine OperationRegistry",
+            ));
         };
         assert!(
             !std::ptr::eq(first, second),
             "jede Fläche bekommt ihre eigene Registry-Instanz"
         );
         assert_eq!(first.len(), second.len());
+        Ok(())
     }
 
     #[test]
-    fn principal_survives_the_round_trip() {
+    fn principal_survives_the_round_trip() -> TestResult {
         let services = RuntimeServices::new(full_parts());
         let map = services.service_map(ServiceSurface::Job);
         let Some(principal) = map.get::<Principal>() else {
-            panic!("Job-Fläche ohne Principal");
+            return Err(TestError::Missing("Job-Fläche ohne Principal"));
         };
         assert_eq!(principal, services.principal());
         assert_eq!(principal.id(), "w2b-04");
+        Ok(())
     }
 
     // ── Accessoren (CONTRACTS-W2d2 §1.1) ─────────────────────────────────────
 
     #[test]
-    fn test_plan_returns_the_parts_plan_services() {
+    fn test_plan_returns_the_parts_plan_services() -> TestResult {
         let parts = full_parts();
-        let expected_findings = parts
-            .plan
-            .as_ref()
-            .map(|plan| Arc::clone(&plan.findings));
+        let expected_findings = parts.plan.as_ref().map(|plan| Arc::clone(&plan.findings));
         let services = RuntimeServices::new(parts);
         let (Some(plan), Some(expected)) = (services.plan(), expected_findings) else {
-            panic!("full_parts() setzt Plan-Dienste, plan() muss sie liefern");
+            return Err(TestError::Missing(
+                "full_parts() setzt Plan-Dienste, plan() muss sie liefern",
+            ));
         };
         assert!(
             Arc::ptr_eq(&plan.findings, &expected),
             "plan() liefert genau den übergebenen Wert, keine Kopie"
         );
         assert!(RuntimeServices::new(minimal_parts()).plan().is_none());
+        Ok(())
     }
 
     #[test]

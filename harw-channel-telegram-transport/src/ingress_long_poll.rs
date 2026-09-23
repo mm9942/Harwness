@@ -353,17 +353,32 @@ mod tests {
         next_offset_after_safe_processing, restart_offset, send_event_with_backoff,
     };
     use crate::TelegramOffsetStore;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_channel::{ChannelId, InboundEvent, PeerId};
 
     #[test]
-    fn safe_processing_advances_to_the_next_update_id() {
-        assert_eq!(next_offset_after_safe_processing(None, 41).unwrap(), 42);
-        assert_eq!(next_offset_after_safe_processing(Some(42), 42).unwrap(), 43);
+    fn safe_processing_advances_to_the_next_update_id() -> TestResult {
+        assert_eq!(
+            next_offset_after_safe_processing(None, 41)
+                .map_err(ctx("advance from no persisted offset"))?,
+            42
+        );
+        assert_eq!(
+            next_offset_after_safe_processing(Some(42), 42)
+                .map_err(ctx("advance from a matching persisted offset"))?,
+            43
+        );
+        Ok(())
     }
 
     #[test]
-    fn offset_never_regresses_for_an_old_response_item() {
-        assert_eq!(next_offset_after_safe_processing(Some(99), 12).unwrap(), 99);
+    fn offset_never_regresses_for_an_old_response_item() -> TestResult {
+        assert_eq!(
+            next_offset_after_safe_processing(Some(99), 12)
+                .map_err(ctx("offset must not regress"))?,
+            99
+        );
+        Ok(())
     }
 
     #[test]
@@ -393,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_update_reads_the_update_id_hint_from_an_otherwise_malformed_payload() {
+    fn decode_update_reads_the_update_id_hint_from_an_otherwise_malformed_payload() -> TestResult {
         // `RawUpdate::message`/`edited_message`/`callback_query` sind alle
         // `#[serde(default)] Option<_>`, weil Telegram-Updatearten, die dieses
         // Schema nicht modelliert (z. B. `poll`, `chat_member`), legitim
@@ -408,8 +423,13 @@ mod tests {
         let (update_id_hint, decoded) = decode_update(poison);
 
         assert_eq!(update_id_hint, Some(77));
-        let error = decoded.expect_err("malformed shape must fail RawUpdate decoding");
+        let Err(error) = decoded else {
+            return Err(TestError::Unexpected(
+                "malformed shape must fail RawUpdate decoding".to_owned(),
+            ));
+        };
         assert!(!error.to_string().contains("not-a-message-object"));
+        Ok(())
     }
 
     #[test]
@@ -423,74 +443,89 @@ mod tests {
     }
 
     #[test]
-    fn poison_update_advances_the_durable_offset_so_the_next_update_gets_processed() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn poison_update_advances_the_durable_offset_so_the_next_update_gets_processed() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let offset_store = TelegramOffsetStore::new(dir.path());
         let mut persisted_offset = None;
 
         // Poison-Update mit lesbarer `update_id=41`.
         advance_offset_past_poison_update(&offset_store, &mut persisted_offset, 41)
-            .expect("advancing past a poison update must not fail");
+            .map_err(ctx("advancing past a poison update must not fail"))?;
 
         assert_eq!(persisted_offset, Some(42));
-        assert_eq!(offset_store.load().unwrap(), Some(42));
+        assert_eq!(
+            offset_store.load().map_err(ctx("offset store load"))?,
+            Some(42)
+        );
 
         // Das nächste, gesund dekodierte Update (id=42) wird ganz normal
         // weiterverarbeitet: der Offset rückt konsistent weiter vor.
-        let next = next_offset_after_safe_processing(persisted_offset, 42).unwrap();
+        let next = next_offset_after_safe_processing(persisted_offset, 42)
+            .map_err(ctx("advance after a poison update"))?;
         assert_eq!(next, 43);
+        Ok(())
     }
 
     #[test]
-    fn poison_update_with_an_invalid_id_leaves_the_offset_unadvanced() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn poison_update_with_an_invalid_id_leaves_the_offset_unadvanced() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let offset_store = TelegramOffsetStore::new(dir.path());
         let mut persisted_offset = Some(10);
 
-        advance_offset_past_poison_update(&offset_store, &mut persisted_offset, -1)
-            .expect("an unusable poison update id must not become a thread-ending error");
+        advance_offset_past_poison_update(&offset_store, &mut persisted_offset, -1).map_err(
+            ctx("an unusable poison update id must not become a thread-ending error"),
+        )?;
 
         assert_eq!(persisted_offset, Some(10));
-        assert_eq!(offset_store.load().unwrap(), None);
+        assert_eq!(offset_store.load().map_err(ctx("offset store load"))?, None);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn full_sink_backs_off_and_retries_instead_of_ending_the_runner() {
+    async fn full_sink_backs_off_and_retries_instead_of_ending_the_runner() -> TestResult {
         let (tx, rx) = mpsc::sync_channel::<InboundEvent>(0);
         let shutdown = LongPollShutdown::default();
 
-        let receiver = std::thread::spawn(move || rx.recv().expect("event eventually arrives"));
+        let receiver = std::thread::spawn(move || rx.recv());
 
         let outcome = send_event_with_backoff(&tx, sample_event(), &shutdown)
             .await
-            .expect("a momentarily full sink must not be a fatal error");
+            .map_err(ctx("a momentarily full sink must not be a fatal error"))?;
         assert!(matches!(outcome, SendOutcome::Sent));
 
-        let received = receiver.join().expect("receiver thread panicked");
+        let received = receiver
+            .join()
+            .map_err(|_| TestError::Unexpected("receiver thread panicked".to_owned()))?
+            .map_err(ctx("event eventually arrives"))?;
         assert_eq!(received.peer.as_str(), "100");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn disconnected_sink_is_reported_as_a_fatal_error() {
+    async fn disconnected_sink_is_reported_as_a_fatal_error() -> TestResult {
         let (tx, rx) = mpsc::sync_channel::<InboundEvent>(1);
         drop(rx);
         let shutdown = LongPollShutdown::default();
 
-        let error = send_event_with_backoff(&tx, sample_event(), &shutdown)
-            .await
-            .expect_err("a disconnected receiver has no recovery");
+        let Err(error) = send_event_with_backoff(&tx, sample_event(), &shutdown).await else {
+            return Err(TestError::Unexpected(
+                "a disconnected receiver has no recovery".to_owned(),
+            ));
+        };
         assert!(error.to_string().contains("local I/O failure"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn shutdown_request_stops_a_full_sink_retry_promptly() {
+    async fn shutdown_request_stops_a_full_sink_retry_promptly() -> TestResult {
         let (tx, _rx) = mpsc::sync_channel::<InboundEvent>(0);
         let shutdown = LongPollShutdown::default();
         shutdown.request_shutdown();
 
         let outcome = send_event_with_backoff(&tx, sample_event(), &shutdown)
             .await
-            .expect("shutdown must not be reported as an error");
+            .map_err(ctx("shutdown must not be reported as an error"))?;
         assert!(matches!(outcome, SendOutcome::ShutdownRequested));
+        Ok(())
     }
 }

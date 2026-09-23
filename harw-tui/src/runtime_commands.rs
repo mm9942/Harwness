@@ -95,7 +95,10 @@ impl std::fmt::Display for ToolToggleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownTool { name } => {
-                write!(f, "unbekanntes Werkzeug '{name}': in dieser Session nicht registriert")
+                write!(
+                    f,
+                    "unbekanntes Werkzeug '{name}': in dieser Session nicht registriert"
+                )
             }
             Self::BeyondCeiling { name } => write!(
                 f,
@@ -162,7 +165,10 @@ mod tests {
     use harw_types::{IngressSurface, PrincipalKind};
 
     fn known() -> Vec<(String, bool)> {
-        vec![("fs.read".to_owned(), true), ("shell.exec".to_owned(), false)]
+        vec![
+            ("fs.read".to_owned(), true),
+            ("shell.exec".to_owned(), false),
+        ]
     }
 
     /// Decke: nichts erlaubt außer `fs.read`.
@@ -181,7 +187,10 @@ mod tests {
             PermissionTier::Maintainer,
         );
         assert_eq!(caller_tier(&p), PermissionTier::Maintainer);
-        assert_eq!(caller_tier(&p.child_of("explorer")), PermissionTier::Operator);
+        assert_eq!(
+            caller_tier(&p.child_of("explorer")),
+            PermissionTier::Operator
+        );
     }
 
     #[test]
@@ -189,14 +198,26 @@ mod tests {
         let expected = Err(ToolToggleError::UnknownTool {
             name: "fs.raed".to_owned(),
         });
-        assert_eq!(validate_tool_toggle(&ceiling(), &known(), "fs.raed", true), expected);
-        assert_eq!(validate_tool_toggle(&ceiling(), &known(), "fs.raed", false), expected);
+        assert_eq!(
+            validate_tool_toggle(&ceiling(), &known(), "fs.raed", true),
+            expected
+        );
+        assert_eq!(
+            validate_tool_toggle(&ceiling(), &known(), "fs.raed", false),
+            expected
+        );
     }
 
     #[test]
     fn test_validate_tool_toggle_disable_known_tool_is_ok() {
-        assert_eq!(validate_tool_toggle(&ceiling(), &known(), "fs.read", false), Ok(()));
-        assert_eq!(validate_tool_toggle(&ceiling(), &known(), "shell.exec", false), Ok(()));
+        assert_eq!(
+            validate_tool_toggle(&ceiling(), &known(), "fs.read", false),
+            Ok(())
+        );
+        assert_eq!(
+            validate_tool_toggle(&ceiling(), &known(), "shell.exec", false),
+            Ok(())
+        );
     }
 
     #[test]
@@ -211,7 +232,10 @@ mod tests {
 
     #[test]
     fn test_validate_tool_toggle_enable_allowed_by_ceiling_is_ok() {
-        assert_eq!(validate_tool_toggle(&ceiling(), &known(), "fs.read", true), Ok(()));
+        assert_eq!(
+            validate_tool_toggle(&ceiling(), &known(), "fs.read", true),
+            Ok(())
+        );
     }
 
     #[test]

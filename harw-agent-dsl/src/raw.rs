@@ -115,9 +115,10 @@ pub type RawPatch = toml::Table;
 #[cfg(test)]
 mod tests {
     use crate::parse::parse_toml;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
-    fn test_parse_minimal_toml() {
+    fn test_parse_minimal_toml() -> TestResult {
         let src = r#"
 schema = "harwness.agent/v1"
 id = "harwness.agent.test-min@1"
@@ -125,16 +126,17 @@ version = "1.0.0"
 role = "worker"
 specialization = "focused-pure-coding"
 "#;
-        let raw = parse_toml(src).unwrap();
+        let raw = parse_toml(src)?;
         assert_eq!(raw.schema, "harwness.agent/v1");
         assert_eq!(raw.role, crate::roles::AgentRoleId::Worker);
         assert_eq!(raw.specialization, "focused-pure-coding");
         assert!(raw.extends.is_none());
         assert!(raw.mixins.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_parse_full_example() {
+    fn test_parse_full_example() -> TestResult {
         // Vollständiges Beispiel aus §8 der DSL-Spec
         let src = r#"
 schema = "harwness.agent/v1"
@@ -175,16 +177,17 @@ max_tool_calls = 40
 max_agent_tool_calls = 4
 max_wall_time_seconds = 1800
 "#;
-        let raw = parse_toml(src).unwrap();
+        let raw = parse_toml(src)?;
         assert_eq!(raw.id.name, "focused-pure-coding");
         assert_eq!(raw.id.namespace, "harwness");
         assert_eq!(raw.version.0.major, 1);
         assert!(raw.extends.is_some());
         assert_eq!(raw.name.as_deref(), Some("Focused Pure Coding Task Agent"));
+        Ok(())
     }
 
     #[test]
-    fn test_reasoning_effort_absent_is_none() {
+    fn test_reasoning_effort_absent_is_none() -> TestResult {
         let src = r#"
 schema = "harwness.agent/v1"
 id = "harwness.agent.test-min@1"
@@ -192,12 +195,13 @@ version = "1.0.0"
 role = "worker"
 specialization = "focused-pure-coding"
 "#;
-        let raw = parse_toml(src).unwrap();
+        let raw = parse_toml(src)?;
         assert!(raw.reasoning_effort.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_reasoning_effort_set_is_read_as_opaque_string() {
+    fn test_reasoning_effort_set_is_read_as_opaque_string() -> TestResult {
         let src = r#"
 schema = "harwness.agent/v1"
 id = "harwness.agent.test-min@1"
@@ -206,12 +210,13 @@ role = "worker"
 specialization = "focused-pure-coding"
 reasoning_effort = "high"
 "#;
-        let raw = parse_toml(src).unwrap();
+        let raw = parse_toml(src)?;
         assert_eq!(raw.reasoning_effort.as_deref(), Some("high"));
+        Ok(())
     }
 
     #[test]
-    fn test_reasoning_effort_rejects_non_string_toml_value() {
+    fn test_reasoning_effort_rejects_non_string_toml_value() -> TestResult {
         // `reasoning_effort` is a typed `Option<String>` field on this raw
         // struct (unlike `BudgetSpec::effort_cap`, which is read leniently
         // from a free `toml::Table`) — a non-string TOML value is a hard
@@ -226,16 +231,19 @@ role = "worker"
 specialization = "focused-pure-coding"
 reasoning_effort = 3
 "#;
-        let error = parse_toml(src).unwrap_err();
+        let Err(error) = parse_toml(src) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         let message = error.to_string();
         assert!(
             message.contains("reasoning_effort") || message.to_lowercase().contains("string"),
             "unexpected error message: {message}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_reasoning_effort_accepts_unknown_label_at_this_layer() {
+    fn test_reasoning_effort_accepts_unknown_label_at_this_layer() -> TestResult {
         // Demonstrates the deliberate design: an unrecognized effort label
         // parses successfully here because validation is deferred to the
         // consumer (see doc comment on `RawAgentDefinition::reasoning_effort`).
@@ -247,7 +255,11 @@ role = "worker"
 specialization = "focused-pure-coding"
 reasoning_effort = "not-a-real-effort-level"
 "#;
-        let raw = parse_toml(src).unwrap();
-        assert_eq!(raw.reasoning_effort.as_deref(), Some("not-a-real-effort-level"));
+        let raw = parse_toml(src)?;
+        assert_eq!(
+            raw.reasoning_effort.as_deref(),
+            Some("not-a-real-effort-level")
+        );
+        Ok(())
     }
 }

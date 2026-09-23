@@ -679,6 +679,7 @@ arc_str_id!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestResult;
     use std::collections::{BTreeMap, HashMap};
 
     // ── helper ──────────────────────────────────────────────────────────────
@@ -697,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn every_identifier_type_rejects_blank_values_from_fallible_apis() {
+    fn every_identifier_type_rejects_blank_values_from_fallible_apis() -> TestResult {
         assert_fallible_apis_reject_blank_ids!(ProviderId);
         assert_fallible_apis_reject_blank_ids!(ProviderName);
         assert_fallible_apis_reject_blank_ids!(ModelId);
@@ -705,22 +706,19 @@ mod tests {
         assert_fallible_apis_reject_blank_ids!(AgentName);
         assert_fallible_apis_reject_blank_ids!(CustomerId);
 
-        assert_eq!(
-            ProviderId::try_from_str(" openai ").unwrap().as_str(),
-            " openai "
-        );
+        assert_eq!(ProviderId::try_from_str(" openai ")?.as_str(), " openai ");
+        Ok(())
     }
 
     #[test]
-    fn deserialization_rejects_blank_identifier_values() {
+    fn deserialization_rejects_blank_identifier_values() -> TestResult {
         assert!(serde_json::from_str::<ProviderId>(r#"""#).is_err());
         assert!(serde_json::from_str::<ModelId>(r#""  \t\n""#).is_err());
         assert_eq!(
-            serde_json::from_str::<ProviderName>(r#""OpenAI""#)
-                .unwrap()
-                .as_str(),
+            serde_json::from_str::<ProviderName>(r#""OpenAI""#)?.as_str(),
             "OpenAI"
         );
+        Ok(())
     }
 
     #[test]

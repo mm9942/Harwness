@@ -27,15 +27,23 @@ pub enum McpError {
     InvalidEndpoint(String),
     InvalidHeader(&'static str),
     Http(reqwest::Error),
-    UnexpectedStatus { status: u16, body: String },
+    UnexpectedStatus {
+        status: u16,
+        body: String,
+    },
     InvalidSessionId,
     InvalidJsonRpc(String),
-    JsonRpcFailure { code: i64, message: String },
+    JsonRpcFailure {
+        code: i64,
+        message: String,
+    },
     Sse(String),
     SseResponseMissing,
     NotInitialized,
     /// Die Antwort überschreitet [`MAX_RESPONSE_BYTES`].
-    ResponseTooLarge { limit: usize },
+    ResponseTooLarge {
+        limit: usize,
+    },
     /// Das aufgerufene Tool meldet `isError: true`. Dies ist ein
     /// fachlicher Fehler des Tools, kein Transport- oder Protokollfehler.
     ToolCallFailed(Vec<McpContent>),
@@ -522,15 +530,24 @@ fn parse_sse_bytes(bytes: &[u8], expected_id: u64) -> McpResult<Value> {
 }
 
 #[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
-    fn parses_tool_page_and_json_rpc_result() {
-        let result = parse_json_rpc_response(json!({"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"docs","description":"Cloudflare docs","inputSchema":{"type":"object"}}],"nextCursor":"next"}}), 1).unwrap();
-        let tools: Vec<McpTool> = serde_json::from_value(result["tools"].clone()).unwrap();
+    fn parses_tool_page_and_json_rpc_result() -> TestResult {
+        let result = parse_json_rpc_response(
+            json!({"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"docs","description":"Cloudflare docs","inputSchema":{"type":"object"}}],"nextCursor":"next"}}),
+            1,
+        )?;
+        let tools: Vec<McpTool> = serde_json::from_value(result["tools"].clone())
+            .map_err(|error| TestError::Unexpected(error.to_string()))?;
         assert_eq!(tools[0].name, "docs");
         assert_eq!(result["nextCursor"], "next");
+        Ok(())
     }
 
     #[test]
@@ -541,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_tool_call_result_maps_content_variants() {
+    fn parse_tool_call_result_maps_content_variants() -> TestResult {
         let result = json!({
             "content": [
                 {"type": "text", "text": "hello"},
@@ -555,7 +572,7 @@ mod tests {
             ],
             "isError": false
         });
-        let content = parse_tool_call_result(result).unwrap();
+        let content = parse_tool_call_result(result)?;
         assert_eq!(content.len(), 4);
         assert!(matches!(&content[0], McpContent::Text { text } if text == "hello"));
         assert!(
@@ -568,13 +585,18 @@ mod tests {
                 assert_eq!(resource.text.as_deref(), Some("abc"));
                 assert_eq!(resource.blob, None);
             }
-            other => panic!("expected Resource content, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Resource content, got {other:?}"
+                )));
+            }
         }
         assert!(matches!(&content[3], McpContent::Unknown));
+        Ok(())
     }
 
     #[test]
-    fn parse_tool_call_result_is_error_yields_tool_call_failed() {
+    fn parse_tool_call_result_is_error_yields_tool_call_failed() -> TestResult {
         let result = json!({
             "content": [{"type": "text", "text": "boom"}],
             "isError": true
@@ -583,15 +605,19 @@ mod tests {
             Err(McpError::ToolCallFailed(content)) => {
                 assert_eq!(content.len(), 1);
                 assert!(matches!(&content[0], McpContent::Text { text } if text == "boom"));
+                Ok(())
             }
-            other => panic!("expected ToolCallFailed, got {other:?}"),
+            other => Err(TestError::Unexpected(format!(
+                "expected ToolCallFailed, got {other:?}"
+            ))),
         }
     }
 
     #[test]
-    fn parse_tool_call_result_missing_content_defaults_to_empty() {
-        let content = parse_tool_call_result(json!({})).unwrap();
+    fn parse_tool_call_result_missing_content_defaults_to_empty() -> TestResult {
+        let content = parse_tool_call_result(json!({}))?;
         assert!(content.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -604,11 +630,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_sse_bytes_extracts_first_json_rpc_event() {
+    fn parse_sse_bytes_extracts_first_json_rpc_event() -> TestResult {
         let sse =
             b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
-        let value = parse_sse_bytes(sse, 1).unwrap();
+        let value = parse_sse_bytes(sse, 1)?;
         assert_eq!(value["ok"], true);
+        Ok(())
     }
 
     #[test]

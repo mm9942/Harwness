@@ -1289,6 +1289,7 @@ pub fn triaged_finding_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_dod_signals::{DriftSeverity, EventKind, SecurityEvent};
     use harw_types::SensorId;
 
@@ -1304,8 +1305,8 @@ mod tests {
     }
 
     // Ein geprüfter Befund einer bekannten Regel (Records verlangen eine).
-    fn checked(id: &str) -> Finding<RuleChecked> {
-        Finding::raw(
+    fn checked(id: &str) -> TestResult<Finding<RuleChecked>> {
+        Ok(Finding::raw(
             "structure-drift",
             FindingKind::RuleTriggered,
             Severity::High,
@@ -1313,10 +1314,10 @@ mod tests {
             "unexpected setuid binary",
             Timestamp::UNIX_EPOCH,
         )
-        .check(FindingId::try_from_str(id).expect("test id is non-empty"))
+        .check(FindingId::try_from_str(id).map_err(ctx("test id is non-empty"))?))
     }
 
-    fn evidence() -> SecurityEvidence {
+    fn evidence() -> TestResult<SecurityEvidence> {
         let event = SecurityEvent {
             sensor: SensorId::from_str("workspace-0"),
             observed_at: Timestamp::UNIX_EPOCH,
@@ -1327,7 +1328,7 @@ mod tests {
             },
         };
         SecurityEvidence::capture(vec![], vec![event], Timestamp::UNIX_EPOCH)
-            .expect("test evidence encodes")
+            .map_err(ctx("test evidence encodes"))
     }
 
     fn verdict_for(
@@ -1359,23 +1360,25 @@ mod tests {
     }
 
     #[test]
-    fn test_check_assigns_given_identity_and_preserves_fields() {
-        let id = FindingId::try_from_str("finding-1").expect("non-empty id");
+    fn test_check_assigns_given_identity_and_preserves_fields() -> TestResult {
+        let id = FindingId::try_from_str("finding-1").map_err(ctx("non-empty id"))?;
         let checked = sample_raw().check(id.clone());
         assert_eq!(checked.id(), &id);
         assert_eq!(checked.rule_id(), "test-rule");
         assert_eq!(checked.severity(), Severity::High);
+        Ok(())
     }
 
     #[test]
-    fn test_triage_preserves_identity_and_sets_verdict_without_digest() {
-        let id = FindingId::try_from_str("finding-2").expect("non-empty id");
+    fn test_triage_preserves_identity_and_sets_verdict_without_digest() -> TestResult {
+        let id = FindingId::try_from_str("finding-2").map_err(ctx("non-empty id"))?;
         let checked = sample_raw().check(id.clone());
         let triaged = triage(checked, Verdict::NeedsReview);
         assert_eq!(triaged.id(), &id);
         assert_eq!(*triaged.verdict(), Verdict::NeedsReview);
         assert_eq!(triaged.summary(), "test summary");
         assert_eq!(triaged.record_digest(), None);
+        Ok(())
     }
 
     #[test]
@@ -1413,17 +1416,22 @@ mod tests {
 
     #[test]
     fn test_known_rule_id_covers_every_rule() {
-        for id in ["egress-flow", "structure-drift", "baseline-deviation", "advisory-correlate"] {
+        for id in [
+            "egress-flow",
+            "structure-drift",
+            "baseline-deviation",
+            "advisory-correlate",
+        ] {
             assert_eq!(known_rule_id(id), Some(id));
         }
         assert_eq!(known_rule_id("test-rule"), None);
     }
 
     #[test]
-    fn test_record_copies_fields_and_is_deterministic() {
-        let finding = checked("finding-r1");
-        let a = finding.record(evidence());
-        let b = finding.record(evidence());
+    fn test_record_copies_fields_and_is_deterministic() -> TestResult {
+        let finding = checked("finding-r1")?;
+        let a = finding.record(evidence()?);
+        let b = finding.record(evidence()?);
         assert_eq!(a.version(), FindingRecord::VERSION);
         assert_eq!(a.finding_id().as_str(), "finding-r1");
         assert_eq!(a.rule_id(), "structure-drift");
@@ -1433,71 +1441,89 @@ mod tests {
         assert_eq!(a.summary(), "unexpected setuid binary");
         assert_eq!(a.evidence().events.len(), 1);
         assert_eq!(a.digest(), b.digest());
+        Ok(())
     }
 
     #[test]
-    fn test_record_digest_differs_for_different_identity() {
-        let a = checked("finding-a").record(evidence());
-        let b = checked("finding-b").record(evidence());
+    fn test_record_digest_differs_for_different_identity() -> TestResult {
+        let a = checked("finding-a")?.record(evidence()?);
+        let b = checked("finding-b")?.record(evidence()?);
         assert_ne!(a.digest(), b.digest());
+        Ok(())
     }
 
     #[test]
-    fn test_triage_record_with_matching_digest_yields_triaged() {
-        let record = checked("finding-t1").record(evidence());
+    fn test_triage_record_with_matching_digest_yields_triaged() -> TestResult {
+        let record = checked("finding-t1")?.record(evidence()?);
         let verdict = verdict_for(
             record.finding_id(),
             record.digest(),
             VerdictClassification::Confirmed,
         );
-        let triaged = triage_record(&record, &verdict).expect("bound verdict accepted");
+        let triaged = triage_record(&record, &verdict).map_err(ctx("bound verdict accepted"))?;
         assert_eq!(triaged.id().as_str(), "finding-t1");
         assert_eq!(*triaged.verdict(), Verdict::Confirmed);
         assert_eq!(triaged.record_digest(), Some(record.digest()));
         // Schwere stammt aus dem Record, nicht aus dem Verdikt (Critical).
         assert_eq!(triaged.severity(), Severity::High);
         assert_eq!(triaged.rule_id(), "structure-drift");
+        Ok(())
     }
 
     #[test]
-    fn test_triage_record_with_wrong_digest_is_rejected() {
-        let record = checked("finding-t2").record(evidence());
+    fn test_triage_record_with_wrong_digest_is_rejected() -> TestResult {
+        let record = checked("finding-t2")?.record(evidence()?);
         let wrong = ContentDigest::of(b"some other record");
         let verdict = verdict_for(record.finding_id(), wrong, VerdictClassification::Benign);
-        let err = triage_record(&record, &verdict).expect_err("unbound verdict rejected");
+        let Err(err) = triage_record(&record, &verdict) else {
+            return Err(TestError::Unexpected(
+                "unbound verdict was accepted".to_owned(),
+            ));
+        };
         assert!(matches!(err, TriageError::VerdictUnbound(_)));
+        Ok(())
     }
 
     #[test]
-    fn test_triage_record_with_wrong_finding_id_is_rejected() {
-        let record = checked("finding-t3").record(evidence());
-        let other = FindingId::try_from_str("finding-other").expect("non-empty id");
+    fn test_triage_record_with_wrong_finding_id_is_rejected() -> TestResult {
+        let record = checked("finding-t3")?.record(evidence()?);
+        let other = FindingId::try_from_str("finding-other").map_err(ctx("non-empty id"))?;
         let verdict = verdict_for(&other, record.digest(), VerdictClassification::Confirmed);
-        let err = triage_record(&record, &verdict).expect_err("foreign finding rejected");
+        let Err(err) = triage_record(&record, &verdict) else {
+            return Err(TestError::Unexpected(
+                "foreign finding was accepted".to_owned(),
+            ));
+        };
         assert!(matches!(err, TriageError::VerdictUnbound(_)));
+        Ok(())
     }
 
     #[test]
-    fn test_triage_record_with_tampered_evidence_is_rejected() {
-        let mut forged = evidence();
+    fn test_triage_record_with_tampered_evidence_is_rejected() -> TestResult {
+        let mut forged = evidence()?;
         // Beleg-Digest passt nicht mehr zum Inhalt (öffentliche Felder).
         forged.digest = ContentDigest::of(b"forged");
-        let record = checked("finding-t4").record(forged);
+        let record = checked("finding-t4")?.record(forged);
         let verdict = verdict_for(
             record.finding_id(),
             record.digest(),
             VerdictClassification::Confirmed,
         );
-        let err = triage_record(&record, &verdict).expect_err("tampered evidence rejected");
+        let Err(err) = triage_record(&record, &verdict) else {
+            return Err(TestError::Unexpected(
+                "tampered evidence was accepted".to_owned(),
+            ));
+        };
         assert!(matches!(
             err,
             TriageError::Record(RecordError::EvidenceDigestMismatch)
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_triage_record_with_empty_rationale_is_rejected() {
-        let record = checked("finding-t5").record(evidence());
+    fn test_triage_record_with_empty_rationale_is_rejected() -> TestResult {
+        let record = checked("finding-t5")?.record(evidence()?);
         let verdict = SecurityVerdict::new(
             record.finding_id().clone(),
             record.digest(),
@@ -1508,66 +1534,78 @@ mod tests {
             "security-triage-test".to_owned(),
             Timestamp::UNIX_EPOCH,
         );
-        let err = triage_record(&record, &verdict).expect_err("invalid verdict rejected");
+        let Err(err) = triage_record(&record, &verdict) else {
+            return Err(TestError::Unexpected(
+                "invalid verdict was accepted".to_owned(),
+            ));
+        };
         assert!(matches!(err, TriageError::VerdictInvalid(_)));
+        Ok(())
     }
 
     #[test]
-    fn test_record_json_roundtrip_preserves_record_and_binding() {
-        let record = checked("finding-j1").record(evidence());
-        let json = serde_json::to_vec(&record).expect("record serializes");
-        let back: FindingRecord = serde_json::from_slice(&json).expect("record deserializes");
+    fn test_record_json_roundtrip_preserves_record_and_binding() -> TestResult {
+        let record = checked("finding-j1")?.record(evidence()?);
+        let json = serde_json::to_vec(&record).map_err(ctx("record serializes"))?;
+        let back: FindingRecord =
+            serde_json::from_slice(&json).map_err(ctx("record deserializes"))?;
         assert_eq!(back, record);
         let verdict = verdict_for(
             back.finding_id(),
             back.digest(),
             VerdictClassification::Suspicious,
         );
-        let triaged = triage_record(&back, &verdict).expect("roundtripped record triages");
+        let triaged = triage_record(&back, &verdict).map_err(ctx("roundtripped record triages"))?;
         assert_eq!(*triaged.verdict(), Verdict::NeedsReview);
+        Ok(())
     }
 
     #[test]
-    fn test_record_deserialize_rejects_tampered_summary() {
-        let record = checked("finding-j2").record(evidence());
-        let mut value = serde_json::to_value(&record).expect("record serializes");
+    fn test_record_deserialize_rejects_tampered_summary() -> TestResult {
+        let record = checked("finding-j2")?.record(evidence()?);
+        let mut value = serde_json::to_value(&record).map_err(ctx("record serializes"))?;
         value["summary"] = serde_json::Value::String("harmless".to_owned());
         let result = serde_json::from_value::<FindingRecord>(value);
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_record_deserialize_rejects_tampered_severity() {
-        let record = checked("finding-j3").record(evidence());
-        let mut value = serde_json::to_value(&record).expect("record serializes");
+    fn test_record_deserialize_rejects_tampered_severity() -> TestResult {
+        let record = checked("finding-j3")?.record(evidence()?);
+        let mut value = serde_json::to_value(&record).map_err(ctx("record serializes"))?;
         value["severity"] = serde_json::Value::String("info".to_owned());
         assert!(serde_json::from_value::<FindingRecord>(value).is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_record_deserialize_rejects_unknown_rule() {
-        let record = checked("finding-j4").record(evidence());
-        let mut value = serde_json::to_value(&record).expect("record serializes");
+    fn test_record_deserialize_rejects_unknown_rule() -> TestResult {
+        let record = checked("finding-j4")?.record(evidence()?);
+        let mut value = serde_json::to_value(&record).map_err(ctx("record serializes"))?;
         value["rule_id"] = serde_json::Value::String("made-up-rule".to_owned());
         assert!(serde_json::from_value::<FindingRecord>(value).is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_record_deserialize_rejects_unknown_field() {
-        let record = checked("finding-j5").record(evidence());
-        let mut value = serde_json::to_value(&record).expect("record serializes");
+    fn test_record_deserialize_rejects_unknown_field() -> TestResult {
+        let record = checked("finding-j5")?.record(evidence()?);
+        let mut value = serde_json::to_value(&record).map_err(ctx("record serializes"))?;
         value["extra"] = serde_json::Value::Bool(true);
         assert!(serde_json::from_value::<FindingRecord>(value).is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_verify_record_rejects_unsupported_version() {
-        let mut record = checked("finding-v1").record(evidence());
+    fn test_verify_record_rejects_unsupported_version() -> TestResult {
+        let mut record = checked("finding-v1")?.record(evidence()?);
         record.version = 2;
         assert!(matches!(
             verify_record(record),
             Err(RecordError::UnsupportedVersion)
         ));
+        Ok(())
     }
 
     #[test]

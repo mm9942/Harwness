@@ -144,6 +144,7 @@ pub(crate) fn map_knowledge_error(error: harw_knowledge::KnowledgeError) -> Plan
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn test_service_missing_display_names_service() {
@@ -209,12 +210,17 @@ mod tests {
     }
 
     #[test]
-    fn test_map_knowledge_error_preserves_io_cause() {
+    fn test_map_knowledge_error_preserves_io_cause() -> TestResult {
         let io = std::io::Error::new(std::io::ErrorKind::NotFound, "weg");
         let mapped = map_knowledge_error(harw_knowledge::KnowledgeError::Io(io));
         match mapped {
             PlanBridgeError::Io(inner) => assert_eq!(inner.kind(), std::io::ErrorKind::NotFound),
-            other => panic!("unerwartete Variante: {other}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "unerwartete Variante: {other}"
+                )));
+            }
         }
+        Ok(())
     }
 }

@@ -306,14 +306,16 @@ impl<'de> Deserialize<'de> for DefinitionRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestResult;
 
     #[test]
-    fn test_parse_valid() {
-        let id = DefinitionId::parse("harwness.agent.focused-pure-coding@1").unwrap();
+    fn test_parse_valid() -> TestResult {
+        let id = DefinitionId::parse("harwness.agent.focused-pure-coding@1")?;
         assert_eq!(id.namespace, "harwness");
         assert_eq!(id.kind, "agent");
         assert_eq!(id.name, "focused-pure-coding");
         assert_eq!(id.major, 1);
+        Ok(())
     }
 
     #[test]
@@ -330,36 +332,41 @@ mod tests {
     }
 
     #[test]
-    fn test_display_roundtrip() {
+    fn test_display_roundtrip() -> TestResult {
         let original = "mia.agent.rust-pqc-worker@2";
-        let id = DefinitionId::parse(original).unwrap();
+        let id = DefinitionId::parse(original)?;
         assert_eq!(id.to_string(), original);
+        Ok(())
     }
 
     #[test]
-    fn test_as_string_matches_display() {
-        let id = DefinitionId::parse("harwness.family.focused-coding@1").unwrap();
+    fn test_as_string_matches_display() -> TestResult {
+        let id = DefinitionId::parse("harwness.family.focused-coding@1")?;
         assert_eq!(id.as_string(), id.to_string());
+        Ok(())
     }
 
     #[test]
-    fn test_from_str_trait() {
-        let id: DefinitionId = "harwness.mixin.rust-coding@1".parse().unwrap();
+    fn test_from_str_trait() -> TestResult {
+        let id: DefinitionId = "harwness.mixin.rust-coding@1".parse()?;
         assert_eq!(id.kind, "mixin");
+        Ok(())
     }
 
     #[test]
-    fn test_try_from_string() {
+    fn test_try_from_string() -> TestResult {
         let s = "harwness.policy.focused-worker@3".to_owned();
-        let id = DefinitionId::try_from(s).unwrap();
+        let id = DefinitionId::try_from(s)?;
         assert_eq!(id.major, 3);
+        Ok(())
     }
 
     #[test]
-    fn test_into_string() {
-        let id = DefinitionId::parse("harwness.agent.worker-base@1").unwrap();
+    fn test_into_string() -> TestResult {
+        let id = DefinitionId::parse("harwness.agent.worker-base@1")?;
         let s: String = id.into();
         assert_eq!(s, "harwness.agent.worker-base@1");
+        Ok(())
     }
 
     #[test]
@@ -381,51 +388,60 @@ mod tests {
     }
 
     #[test]
-    fn test_definition_ref_deserialise_from_string() {
+    fn test_definition_ref_deserialise_from_string() -> TestResult {
         let json = "\"harwness.agent.worker-base@1\"";
-        let r: DefinitionRef = serde_json::from_str(json).unwrap();
+        let r: DefinitionRef = serde_json::from_str(json)?;
         assert_eq!(r.id.name, "worker-base");
         assert!(r.version.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_definition_ref_deserialise_from_table() {
+    fn test_definition_ref_deserialise_from_table() -> TestResult {
         let json = r#"{"id":"harwness.agent.worker-base@1","version":"1.2.0"}"#;
-        let r: DefinitionRef = serde_json::from_str(json).unwrap();
+        let r: DefinitionRef = serde_json::from_str(json)?;
         assert_eq!(r.id.name, "worker-base");
         assert!(r.version.is_some());
-        assert_eq!(r.version.as_ref().unwrap().0.major, 1);
+        let version = r
+            .version
+            .as_ref()
+            .ok_or(crate::test_support::TestError::Missing("r.version"))?;
+        assert_eq!(version.0.major, 1);
+        Ok(())
     }
 
     #[test]
-    fn test_definition_ref_string_form_toml() {
+    fn test_definition_ref_string_form_toml() -> TestResult {
         let toml_str = r#"extends = "harwness.agent.worker-base@1""#;
         #[derive(Deserialize)]
         struct Wrapper {
             extends: DefinitionRef,
         }
-        let w: Wrapper = toml::from_str(toml_str).unwrap();
+        let w: Wrapper = toml::from_str(toml_str)?;
         assert_eq!(w.extends.id.name, "worker-base");
         assert!(w.extends.version.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_definition_ref_table_form_toml() {
+    fn test_definition_ref_table_form_toml() -> TestResult {
         let toml_str = r#"extends = { id = "harwness.agent.worker-base@1", version = "1.2.0" }"#;
         #[derive(Deserialize)]
         struct Wrapper {
             extends: DefinitionRef,
         }
-        let w: Wrapper = toml::from_str(toml_str).unwrap();
+        let w: Wrapper = toml::from_str(toml_str)?;
         assert_eq!(w.extends.id.name, "worker-base");
         assert!(w.extends.version.is_some());
+        Ok(())
     }
 
     #[test]
-    fn test_serde_roundtrip() {
-        let id = DefinitionId::parse("harwness.agent.focused-pure-coding@1").unwrap();
-        let json = serde_json::to_string(&id).unwrap();
-        let recovered: DefinitionId = serde_json::from_str(&json).unwrap();
+    fn test_serde_roundtrip() -> TestResult {
+        let id = DefinitionId::parse("harwness.agent.focused-pure-coding@1")?;
+        let json = serde_json::to_string(&id)?;
+        let recovered: DefinitionId = serde_json::from_str(&json)?;
         assert_eq!(id, recovered);
+        Ok(())
     }
 }

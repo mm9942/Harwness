@@ -164,8 +164,13 @@ pub fn discover_project_with_home_stop(
     // Ein Marker **in** `$HOME` selbst (etwa ein versehentliches `~/.git`)
     // bindet die Sitzung ebenfalls nicht an das Home: sie fällt dann auf das
     // ursprüngliche Arbeitsverzeichnis zurück.
+    // Das System-Temp-Verzeichnis (`/tmp`) ist ebenfalls eine harte Grenze:
+    // dort liegen fremde Arbeitsreste (etwa leere `.git`-Mountpunkte eines
+    // Sandbox-Laufs mit Arbeitswurzel `/tmp`), die sonst jedes Temp-Projekt
+    // an `/tmp` binden und `/tmp/.harw` anlegen würden.
+    let temp_stop = temp_dir_canonical();
     for ancestor in canonical_cwd.ancestors() {
-        if home_stop == Some(ancestor) {
+        if home_stop == Some(ancestor) || temp_stop.as_deref() == Some(ancestor) {
             break;
         }
         for marker in &effective_markers {
@@ -196,6 +201,14 @@ pub fn discover_project_with_home_stop(
     })
 }
 
+/// Kanonisches System-Temp-Verzeichnis als zusätzlicher Such-Stopper und als
+/// unzulässiger Projekt-Root (siehe [`discover_project_with_home_stop`] und
+/// `classify_project_home_root`).
+fn temp_dir_canonical() -> Option<PathBuf> {
+    let temp = std::env::temp_dir();
+    std::fs::canonicalize(&temp).ok()
+}
+
 /// Kanonisches Home-Verzeichnis des aktuellen Benutzers als Such-Stopper.
 ///
 /// Nur für den Vergleich in [`discover_project`]; `None`, wenn `$HOME` nicht
@@ -224,7 +237,8 @@ fn resolve_git_marker(root: PathBuf) -> HomeResult<ProjectRoot> {
     }
 
     if meta.file_type().is_file() {
-        let trust_key = resolve_worktree_trust_key(&root, &git_path).unwrap_or_else(|| root.clone());
+        let trust_key =
+            resolve_worktree_trust_key(&root, &git_path).unwrap_or_else(|| root.clone());
         return Ok(ProjectRoot {
             trust_key,
             root,
@@ -350,7 +364,11 @@ fn sanitize_basename(raw: &str) -> String {
             out.push('-');
         }
     }
-    if out.is_empty() { "root".to_owned() } else { out }
+    if out.is_empty() {
+        "root".to_owned()
+    } else {
+        out
+    }
 }
 
 /// Rohe Bytes eines Pfads für den Hash in [`project_key`].
@@ -473,10 +491,17 @@ fn ensure_root_gitignore(root: &Path) -> HomeResult<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(HomeError::io(&gitignore, error)),
     };
-    if existing.lines().any(|line| matches!(line.trim(), ".harw/" | "/.harw/")) {
+    if existing
+        .lines()
+        .any(|line| matches!(line.trim(), ".harw/" | "/.harw/"))
+    {
         return Ok(());
     }
-    let separator = if existing.is_empty() || existing.ends_with('\n') { "" } else { "\n" };
+    let separator = if existing.is_empty() || existing.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
     let updated = format!("{existing}{separator}{ROOT_GITIGNORE_RULE}\n");
     write_atomic(
         &gitignore,
@@ -492,12 +517,14 @@ fn project_home_without_parent() -> std::io::Error {
     std::io::Error::other("project home directory has no parent path")
 }
 
-/// Lehnt `/` und das kanonisierte `$HOME` als Projekt-Root ab.
+/// Lehnt `/` und das System-Temp-Verzeichnis als Projekt-Root ab.
 // Lehnt `/` als Projekt-Root ab und meldet, ob der Root das Home-Verzeichnis
 // des Benutzers ist (dort dient `~/.harw` als Projekt-Home, ohne `.gitignore`).
 fn classify_project_home_root(root: &Path) -> HomeResult<bool> {
     let canonical_root = std::fs::canonicalize(root).map_err(|error| HomeError::io(root, error))?;
-    if canonical_root == Path::new("/") {
+    if canonical_root == Path::new("/")
+        || temp_dir_canonical().is_some_and(|temp| temp == canonical_root)
+    {
         return Err(HomeError::UnsupportedProjectHomeRoot {
             root: canonical_root,
         });
@@ -572,25 +599,28 @@ pub fn project_settings_dir(home: &Path, profile: &str, key: &str) -> HomeResult
             key: key.to_owned(),
         });
     }
-    Ok(paths::profile_dir(home, profile)?.join("projects").join(key))
+    Ok(paths::profile_dir(home, profile)?
+        .join("projects")
+        .join(key))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
     use std::os::unix::fs::PermissionsExt;
 
     /// Temporäres Verzeichnis, das beim Drop entfernt wird.
     struct TempDir(PathBuf);
 
     impl TempDir {
-        fn new(label: &str) -> Self {
+        fn new(label: &str) -> TestResult<Self> {
             let path = std::env::temp_dir().join(format!(
                 "harw-home-project-{label}-{}",
                 uuid::Uuid::now_v7()
             ));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
+            std::fs::create_dir_all(&path)?;
+            Ok(Self(path))
         }
 
         fn path(&self) -> &Path {
@@ -604,150 +634,168 @@ mod tests {
         }
     }
 
-    fn write(path: &Path, contents: &str) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, contents).unwrap();
+    fn write(path: &Path, contents: &str) -> TestResult {
+        let parent = path
+            .parent()
+            .ok_or(TestError::Missing("Path::parent() der Testdatei"))?;
+        std::fs::create_dir_all(parent)?;
+        std::fs::write(path, contents)?;
+        Ok(())
     }
 
     #[test]
-    fn discover_project_stops_at_home_directory_and_falls_back_to_cwd() {
+    fn discover_project_stops_at_home_directory_and_falls_back_to_cwd() -> TestResult {
         // Ohne Stopper stiege eine markerlose Sitzung in `$HOME` bis `/` auf
         // und lieferte das Home-Verzeichnis selbst als Root — genau der Wert,
         // den `ProjectHome::ensure` fail-closed ablehnt.
-        let home = TempDir::new("home-stopper");
+        let home = TempDir::new("home-stopper")?;
         let work = home.path().join("scratch");
-        std::fs::create_dir_all(&work).unwrap();
-        let canonical_home = std::fs::canonicalize(home.path()).unwrap();
+        std::fs::create_dir_all(&work)?;
+        let canonical_home = std::fs::canonicalize(home.path())?;
 
-        let project =
-            discover_project_with_home_stop(&work, &[], Some(canonical_home.as_path())).unwrap();
+        let project = discover_project_with_home_stop(&work, &[], Some(canonical_home.as_path()))?;
 
-        let expected = std::fs::canonicalize(&work).unwrap();
+        let expected = std::fs::canonicalize(&work)?;
         assert_eq!(project.root, expected);
         assert_eq!(project.kind, ProjectKind::Directory);
+        Ok(())
     }
 
     #[test]
-    fn discover_project_ignores_a_marker_inside_the_home_directory() {
+    fn discover_project_ignores_a_marker_inside_the_home_directory() -> TestResult {
         // Selbst ein versehentliches `~/.git` bindet die Sitzung nicht an das
         // Home-Verzeichnis: die Suche endet vorher, das Arbeitsverzeichnis
         // bleibt der Projekt-Root.
-        let home = TempDir::new("home-marker");
-        std::fs::create_dir_all(home.path().join(".git")).unwrap();
+        let home = TempDir::new("home-marker")?;
+        std::fs::create_dir_all(home.path().join(".git"))?;
         let work = home.path().join("scratch");
-        std::fs::create_dir_all(&work).unwrap();
-        let canonical_home = std::fs::canonicalize(home.path()).unwrap();
+        std::fs::create_dir_all(&work)?;
+        let canonical_home = std::fs::canonicalize(home.path())?;
 
-        let project =
-            discover_project_with_home_stop(&work, &[], Some(canonical_home.as_path())).unwrap();
+        let project = discover_project_with_home_stop(&work, &[], Some(canonical_home.as_path()))?;
 
-        assert_eq!(project.root, std::fs::canonicalize(&work).unwrap());
+        assert_eq!(project.root, std::fs::canonicalize(&work)?);
         assert_eq!(project.kind, ProjectKind::Directory);
+        Ok(())
     }
 
     #[test]
-    fn discover_project_finds_git_dir_from_nested_cwd() {
-        let repo = TempDir::new("git-repo");
-        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+    fn discover_project_finds_git_dir_from_nested_cwd() -> TestResult {
+        let repo = TempDir::new("git-repo")?;
+        std::fs::create_dir_all(repo.path().join(".git"))?;
         let nested = repo.path().join("a/b/c");
-        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&nested)?;
 
-        let project = discover_project(&nested, &[]).unwrap();
+        let project = discover_project(&nested, &[])?;
 
-        let expected_root = std::fs::canonicalize(repo.path()).unwrap();
+        let expected_root = std::fs::canonicalize(repo.path())?;
         assert_eq!(project.root, expected_root);
         assert_eq!(project.trust_key, expected_root);
         assert_eq!(project.kind, ProjectKind::Git);
+        Ok(())
     }
 
     #[test]
-    fn discover_project_maps_worktree_git_file_to_main_repo_trust_key() {
-        let main_repo = TempDir::new("main-repo");
+    fn discover_project_maps_worktree_git_file_to_main_repo_trust_key() -> TestResult {
+        let main_repo = TempDir::new("main-repo")?;
         let git_dir = main_repo.path().join(".git");
         let worktree_gitdir = git_dir.join("worktrees").join("wt1");
-        std::fs::create_dir_all(&worktree_gitdir).unwrap();
-        write(&worktree_gitdir.join("commondir"), "../..\n");
+        std::fs::create_dir_all(&worktree_gitdir)?;
+        write(&worktree_gitdir.join("commondir"), "../..\n")?;
 
-        let worktree = TempDir::new("worktree");
+        let worktree = TempDir::new("worktree")?;
         write(
             &worktree.path().join(".git"),
             &format!("gitdir: {}\n", worktree_gitdir.display()),
-        );
+        )?;
 
-        let project = discover_project(worktree.path(), &[]).unwrap();
+        let project = discover_project(worktree.path(), &[])?;
 
-        let expected_root = std::fs::canonicalize(worktree.path()).unwrap();
-        let expected_trust_key = std::fs::canonicalize(main_repo.path()).unwrap();
+        let expected_root = std::fs::canonicalize(worktree.path())?;
+        let expected_trust_key = std::fs::canonicalize(main_repo.path())?;
         assert_eq!(project.root, expected_root);
         assert_eq!(project.kind, ProjectKind::GitWorktree);
         assert_eq!(project.trust_key, expected_trust_key);
+        Ok(())
     }
 
     #[test]
-    fn discover_project_falls_back_to_root_trust_key_on_unparsable_worktree_pointer() {
-        let worktree = TempDir::new("broken-worktree");
-        write(&worktree.path().join(".git"), "not-a-gitdir-line\n");
+    fn discover_project_falls_back_to_root_trust_key_on_unparsable_worktree_pointer() -> TestResult
+    {
+        let worktree = TempDir::new("broken-worktree")?;
+        write(&worktree.path().join(".git"), "not-a-gitdir-line\n")?;
 
-        let project = discover_project(worktree.path(), &[]).unwrap();
+        let project = discover_project(worktree.path(), &[])?;
 
-        let expected_root = std::fs::canonicalize(worktree.path()).unwrap();
+        let expected_root = std::fs::canonicalize(worktree.path())?;
         assert_eq!(project.kind, ProjectKind::GitWorktree);
         assert_eq!(project.trust_key, expected_root);
+        Ok(())
     }
 
     #[test]
-    fn discover_project_yields_directory_when_no_marker_is_found() {
-        let plain = TempDir::new("plain");
+    fn discover_project_yields_directory_when_no_marker_is_found() -> TestResult {
+        let plain = TempDir::new("plain")?;
 
-        let project = discover_project(plain.path(), &[]).unwrap();
+        let project = discover_project(plain.path(), &[])?;
 
-        let expected_root = std::fs::canonicalize(plain.path()).unwrap();
+        let expected_root = std::fs::canonicalize(plain.path())?;
         assert_eq!(project.root, expected_root);
         assert_eq!(project.trust_key, expected_root);
         assert_eq!(project.kind, ProjectKind::Directory);
+        Ok(())
     }
 
     #[test]
-    fn discover_project_honors_custom_marker() {
-        let repo = TempDir::new("custom-marker-repo");
-        write(&repo.path().join("PROJECT_MARKER"), "");
+    fn discover_project_honors_custom_marker() -> TestResult {
+        let repo = TempDir::new("custom-marker-repo")?;
+        write(&repo.path().join("PROJECT_MARKER"), "")?;
         let nested = repo.path().join("nested");
-        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&nested)?;
 
         let markers = vec!["PROJECT_MARKER".to_owned()];
-        let project = discover_project(&nested, &markers).unwrap();
+        let project = discover_project(&nested, &markers)?;
 
-        let expected_root = std::fs::canonicalize(repo.path()).unwrap();
+        let expected_root = std::fs::canonicalize(repo.path())?;
         assert_eq!(project.root, expected_root);
         assert_eq!(project.trust_key, expected_root);
         assert_eq!(
             project.kind,
             ProjectKind::Marker("PROJECT_MARKER".to_owned())
         );
+        Ok(())
     }
 
     #[test]
-    fn project_key_is_stable_and_sanitized() {
+    fn project_key_is_stable_and_sanitized() -> TestResult {
         let root = Path::new("/home/mia/projects/Beispiel Projekt!");
         let key = project_key(root);
         let again = project_key(root);
         assert_eq!(key, again, "project_key must be deterministic");
         assert!(key.starts_with("Beispiel-Projekt--"), "{key}");
-        let (basename, hash) = key.rsplit_once('-').unwrap();
+        let (basename, hash) = key
+            .rsplit_once('-')
+            .ok_or(TestError::Missing("'-'-Trenner im project_key"))?;
         assert_eq!(hash.len(), 12);
         assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert!(basename.bytes().all(|b| b.is_ascii_alphanumeric()
-            || b == b'-'
-            || b == b'_'));
+        assert!(
+            basename
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        );
+        Ok(())
     }
 
     #[test]
-    fn project_key_caps_basename_length() {
+    fn project_key_caps_basename_length() -> TestResult {
         let long_name = "a".repeat(100);
         let root = Path::new("/tmp").join(&long_name);
         let key = project_key(&root);
-        let (basename, _hash) = key.rsplit_once('-').unwrap();
+        let (basename, _hash) = key
+            .rsplit_once('-')
+            .ok_or(TestError::Missing("'-'-Trenner im project_key"))?;
         assert_eq!(basename.len(), 40);
+        Ok(())
     }
 
     #[test]
@@ -757,8 +805,8 @@ mod tests {
     }
 
     #[test]
-    fn ensure_creates_directories_and_gitignore() {
-        let repo = TempDir::new("ensure-repo");
+    fn ensure_creates_directories_and_gitignore() -> TestResult {
+        let repo = TempDir::new("ensure-repo")?;
         let project = ProjectRoot {
             trust_key: repo.path().to_path_buf(),
             root: repo.path().to_path_buf(),
@@ -766,7 +814,7 @@ mod tests {
         };
         let home = ProjectHome::at(&project);
 
-        home.ensure().unwrap();
+        home.ensure()?;
 
         for dir in [
             &home.dir,
@@ -776,20 +824,21 @@ mod tests {
             &home.state_dir(),
         ] {
             assert!(dir.is_dir(), "{dir:?} must exist");
-            let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+            let mode = std::fs::metadata(dir)?.permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "{dir:?} must be 0700");
         }
 
         let gitignore = repo.path().join(".gitignore");
-        assert_eq!(std::fs::read_to_string(&gitignore).unwrap(), ".harw/\n");
+        assert_eq!(std::fs::read_to_string(&gitignore)?, ".harw/\n");
 
         // Re-run is idempotent and preserves existing rules while adding the
         // one required rule exactly once.
-        std::fs::write(&gitignore, "custom\n").unwrap();
-        home.ensure().unwrap();
-        assert_eq!(std::fs::read_to_string(&gitignore).unwrap(), "custom\n.harw/\n");
-        home.ensure().unwrap();
-        assert_eq!(std::fs::read_to_string(&gitignore).unwrap(), "custom\n.harw/\n");
+        std::fs::write(&gitignore, "custom\n")?;
+        home.ensure()?;
+        assert_eq!(std::fs::read_to_string(&gitignore)?, "custom\n.harw/\n");
+        home.ensure()?;
+        assert_eq!(std::fs::read_to_string(&gitignore)?, "custom\n.harw/\n");
+        Ok(())
     }
 
     #[test]
@@ -807,10 +856,7 @@ mod tests {
             result,
             Err(HomeError::UnsupportedProjectHomeRoot { .. })
         ));
-        assert!(
-            !home.dir.exists(),
-            "must never attempt to create /.harw"
-        );
+        assert!(!home.dir.exists(), "must never attempt to create /.harw");
     }
 
     #[test]
@@ -823,12 +869,13 @@ mod tests {
     }
 
     #[test]
-    fn project_settings_dir_builds_expected_path() {
+    fn project_settings_dir_builds_expected_path() -> TestResult {
         let home = Path::new("/tmp/harw-example-home");
-        let dir = project_settings_dir(home, "default", "beispiel-0123456789ab").unwrap();
+        let dir = project_settings_dir(home, "default", "beispiel-0123456789ab")?;
         assert_eq!(
             dir,
             home.join("profiles/default/projects/beispiel-0123456789ab")
         );
+        Ok(())
     }
 }

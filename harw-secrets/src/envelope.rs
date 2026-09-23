@@ -314,7 +314,11 @@ const fn nonce_len(aead: AeadAlgo) -> usize {
 /// - [`SecretsError::UnsupportedLegacyKem`]: `kem` is a retired pure ML-KEM
 ///   level.
 fn suite_for(kem: KemAlgo, aead: AeadAlgo) -> SecretsResult<Suite> {
-    Ok(Suite::new(kem.hpke_kem()?, Kdf::Shake256, hpke_aead_for(aead)))
+    Ok(Suite::new(
+        kem.hpke_kem()?,
+        Kdf::Shake256,
+        hpke_aead_for(aead),
+    ))
 }
 
 /// Reconstruct the hybrid recipient private key for `kem` from the 32-byte
@@ -405,6 +409,7 @@ mod tests {
     use secrecy::ExposeSecret;
 
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     const PROVENANCE_SEED: [u8; 32] = [0xA5; 32];
     const ROTATED_SEED: [u8; 32] = [0x5A; 32];
@@ -417,26 +422,32 @@ mod tests {
 
     /// Recipient public key exactly as production derives it: root seed ->
     /// per-KEM domain-separated seed -> crypt_guard hybrid key.
-    fn hybrid_public_key(kem: KemAlgo, seed: &[u8; 32]) -> RecipientPublicKey {
+    fn hybrid_public_key(kem: KemAlgo, seed: &[u8; 32]) -> TestResult<RecipientPublicKey> {
         raw_hybrid_public_key(kem, &derive_kem_seed(kem, seed))
     }
 
     /// crypt_guard hybrid key for `seed` used verbatim (no domain separation).
-    fn raw_hybrid_public_key(kem: KemAlgo, seed: &[u8; 32]) -> RecipientPublicKey {
-        RecipientPrivateKey::from_seed_bytes(kem.hpke_kem().expect("hybrid KEM"), seed)
-            .expect("hybrid recipient private key from seed")
+    fn raw_hybrid_public_key(kem: KemAlgo, seed: &[u8; 32]) -> TestResult<RecipientPublicKey> {
+        let public_key = RecipientPrivateKey::from_seed_bytes(kem.hpke_kem()?, seed)
+            .map_err(ctx("hybrid recipient private key from seed"))?
             .public_key()
-            .expect("hybrid recipient public key")
+            .map_err(ctx("hybrid recipient public key"))?;
+        Ok(public_key)
     }
 
-    fn sealed_record_with(kem: KemAlgo, aead: AeadAlgo) -> SecretRecord {
+    fn sealed_record_with(kem: KemAlgo, aead: AeadAlgo) -> TestResult<SecretRecord> {
         let policy = CryptoPolicy { kem, aead };
         let id = SecretId::new();
         let key_version = KeyVersion::initial();
-        let kek_public = hybrid_public_key(kem, &PROVENANCE_SEED);
-        let sealed = seal(&policy, id, key_version, kek_public.as_bytes(), b"api-token")
-            .expect("V2 seal");
-        SecretRecord {
+        let kek_public = hybrid_public_key(kem, &PROVENANCE_SEED)?;
+        let sealed = seal(
+            &policy,
+            id,
+            key_version,
+            kek_public.as_bytes(),
+            b"api-token",
+        )?;
+        Ok(SecretRecord {
             id,
             envelope_format: sealed.envelope_format,
             ciphertext: sealed.ciphertext,
@@ -445,22 +456,22 @@ mod tests {
             kem_algo: sealed.kem_algo,
             aead_algo: sealed.aead_algo,
             key_version,
-        }
+        })
     }
 
-    fn sealed_record(aead: AeadAlgo) -> (Vec<u8>, SecretRecord) {
-        (
+    fn sealed_record(aead: AeadAlgo) -> TestResult<(Vec<u8>, SecretRecord)> {
+        Ok((
             PROVENANCE_SEED.to_vec(),
-            sealed_record_with(CryptoPolicy::strongest().kem, aead),
-        )
+            sealed_record_with(CryptoPolicy::strongest().kem, aead)?,
+        ))
     }
 
     #[test]
-    fn v2_round_trips_for_every_hybrid_kem_and_aead() {
+    fn v2_round_trips_for_every_hybrid_kem_and_aead() -> TestResult {
         for kem in HYBRID_KEMS {
             for aead in AEADS {
-                let record = sealed_record_with(kem, aead);
-                let plaintext = open(&PROVENANCE_SEED, &record).expect("V2 open");
+                let record = sealed_record_with(kem, aead)?;
+                let plaintext = open(&PROVENANCE_SEED, &record)?;
 
                 assert_eq!(plaintext.expose_secret().as_ref(), b"api-token");
                 assert_eq!(record.envelope_format, SecretEnvelopeFormat::DekWrappedV2);
@@ -470,18 +481,19 @@ mod tests {
                 assert_eq!(&record.wrapped_dek[..4], b"CGH3");
                 assert_ne!(record.ciphertext, record.wrapped_dek);
 
-                let wrapper =
-                    HpkeEnvelope::from_bytes(&record.wrapped_dek).expect("decode V2 wrapper");
-                assert_eq!(wrapper.suite().kem(), kem.hpke_kem().expect("hybrid KEM"));
+                let wrapper = HpkeEnvelope::from_bytes(&record.wrapped_dek)
+                    .map_err(ctx("decode V2 wrapper"))?;
+                assert_eq!(wrapper.suite().kem(), kem.hpke_kem()?);
                 assert_eq!(wrapper.suite().kdf(), Kdf::Shake256);
                 assert_eq!(wrapper.suite().aead(), hpke_aead_for(aead));
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn v2_tampering_is_rejected_at_each_layer() {
-        let (seed, record) = sealed_record(AeadAlgo::XChaCha20Poly1305);
+    fn v2_tampering_is_rejected_at_each_layer() -> TestResult {
+        let (seed, record) = sealed_record(AeadAlgo::XChaCha20Poly1305)?;
         for tampered in [
             {
                 let mut value = record.clone();
@@ -501,28 +513,36 @@ mod tests {
         ] {
             assert!(open(&seed, &tampered).is_err());
         }
+        Ok(())
     }
 
     #[test]
-    fn v2_open_rejects_a_record_whose_kem_label_differs_from_the_wrapper_suite() {
-        let (seed, mut record) = sealed_record(AeadAlgo::XChaCha20Poly1305);
+    fn v2_open_rejects_a_record_whose_kem_label_differs_from_the_wrapper_suite() -> TestResult {
+        let (seed, mut record) = sealed_record(AeadAlgo::XChaCha20Poly1305)?;
         record.kem_algo = KemAlgo::MlKem768X25519;
 
         assert!(matches!(
             open(&seed, &record),
-            Err(SecretsError::Open(crypt_guard::pq_hpke::Error::AuthenticationFailed))
+            Err(SecretsError::Open(
+                crypt_guard::pq_hpke::Error::AuthenticationFailed
+            ))
         ));
+        Ok(())
     }
 
     #[test]
-    fn v2_open_with_a_different_kek_seed_fails() {
-        let (_, record) = sealed_record(AeadAlgo::AesGcmSiv);
+    fn v2_open_with_a_different_kek_seed_fails() -> TestResult {
+        let (_, record) = sealed_record(AeadAlgo::AesGcmSiv)?;
 
-        assert!(matches!(open(&ROTATED_SEED, &record), Err(SecretsError::Open(_))));
+        assert!(matches!(
+            open(&ROTATED_SEED, &record),
+            Err(SecretsError::Open(_))
+        ));
+        Ok(())
     }
 
     #[test]
-    fn open_applies_domain_separation_and_rejects_keys_of_the_raw_root_seed() {
+    fn open_applies_domain_separation_and_rejects_keys_of_the_raw_root_seed() -> TestResult {
         for kem in HYBRID_KEMS {
             let policy = CryptoPolicy {
                 kem,
@@ -533,9 +553,14 @@ mod tests {
             // Wrapped for the root seed used verbatim, i.e. without the
             // per-KEM domain separation: the production open path must not
             // find the matching private key.
-            let raw_public = raw_hybrid_public_key(kem, &PROVENANCE_SEED);
-            let sealed = seal(&policy, id, key_version, raw_public.as_bytes(), b"api-token")
-                .expect("seal for the raw root-seed key");
+            let raw_public = raw_hybrid_public_key(kem, &PROVENANCE_SEED)?;
+            let sealed = seal(
+                &policy,
+                id,
+                key_version,
+                raw_public.as_bytes(),
+                b"api-token",
+            )?;
             let record = SecretRecord {
                 id,
                 envelope_format: sealed.envelope_format,
@@ -552,11 +577,12 @@ mod tests {
                 Err(SecretsError::Open(_))
             ));
         }
+        Ok(())
     }
 
     #[test]
-    fn open_rejects_a_kek_seed_that_is_not_32_bytes() {
-        let (_, record) = sealed_record(AeadAlgo::XChaCha20Poly1305);
+    fn open_rejects_a_kek_seed_that_is_not_32_bytes() -> TestResult {
+        let (_, record) = sealed_record(AeadAlgo::XChaCha20Poly1305)?;
 
         for length in [0, 31, 33, 64] {
             assert!(matches!(
@@ -566,12 +592,13 @@ mod tests {
                 ))
             ));
         }
+        Ok(())
     }
 
     #[test]
-    fn seal_rejects_a_public_key_of_a_different_hybrid_kem() {
+    fn seal_rejects_a_public_key_of_a_different_hybrid_kem() -> TestResult {
         let policy = CryptoPolicy::ml_kem_768_p256();
-        let foreign = hybrid_public_key(KemAlgo::MlKem768X25519, &PROVENANCE_SEED);
+        let foreign = hybrid_public_key(KemAlgo::MlKem768X25519, &PROVENANCE_SEED)?;
 
         assert!(matches!(
             seal(
@@ -583,11 +610,12 @@ mod tests {
             ),
             Err(SecretsError::Seal(_))
         ));
+        Ok(())
     }
 
     #[test]
-    fn v2_payload_authentication_failure_uses_the_typed_local_aead_error() {
-        let (seed, mut record) = sealed_record(AeadAlgo::XChaCha20Poly1305);
+    fn v2_payload_authentication_failure_uses_the_typed_local_aead_error() -> TestResult {
+        let (seed, mut record) = sealed_record(AeadAlgo::XChaCha20Poly1305)?;
         let last = record.ciphertext.len() - 1;
         record.ciphertext[last] ^= 1;
 
@@ -595,13 +623,14 @@ mod tests {
             open(&seed, &record),
             Err(SecretsError::PayloadAeadOpen(AeadAlgo::XChaCha20Poly1305))
         ));
+        Ok(())
     }
 
     #[test]
-    fn rewrap_v2_preserves_payload_bytes_and_changes_only_wrapper() {
+    fn rewrap_v2_preserves_payload_bytes_and_changes_only_wrapper() -> TestResult {
         for kem in HYBRID_KEMS {
-            let record = sealed_record_with(kem, AeadAlgo::XChaCha20Poly1305);
-            let rotated_public = hybrid_public_key(kem, &ROTATED_SEED);
+            let record = sealed_record_with(kem, AeadAlgo::XChaCha20Poly1305)?;
+            let rotated_public = hybrid_public_key(kem, &ROTATED_SEED)?;
 
             let mut rotated = record.clone();
             rotated.key_version = record.key_version.next();
@@ -610,28 +639,25 @@ mod tests {
                 &record,
                 rotated_public.as_bytes(),
                 rotated.key_version,
-            )
-            .expect("rewrap V2 DEK");
+            )?;
 
             assert_eq!(rotated.ciphertext, record.ciphertext);
             assert_eq!(rotated.nonce, record.nonce);
             assert_ne!(rotated.wrapped_dek, record.wrapped_dek);
             assert_eq!(
-                open(&ROTATED_SEED, &rotated)
-                    .expect("open rewrapped record")
-                    .expose_secret()
-                    .as_ref(),
+                open(&ROTATED_SEED, &rotated)?.expose_secret().as_ref(),
                 b"api-token"
             );
             assert!(open(&PROVENANCE_SEED, &rotated).is_err());
         }
+        Ok(())
     }
 
     #[test]
-    fn legacy_direct_hpke_records_still_open() {
+    fn legacy_direct_hpke_records_still_open() -> TestResult {
         let policy = CryptoPolicy::ml_kem_768_x25519();
-        let suite = suite_for(policy.kem, policy.aead).expect("hybrid suite");
-        let kek_public = hybrid_public_key(policy.kem, &PROVENANCE_SEED);
+        let suite = suite_for(policy.kem, policy.aead)?;
+        let kek_public = hybrid_public_key(policy.kem, &PROVENANCE_SEED)?;
         let id = SecretId::new();
         let key_version = KeyVersion::initial();
         let envelope = HpkeEnvelope::seal(
@@ -641,7 +667,7 @@ mod tests {
             &v1_record_aad(id, key_version, suite),
             b"legacy-api-token",
         )
-        .expect("seal legacy envelope");
+        .map_err(ctx("seal legacy envelope"))?;
         let record = SecretRecord {
             id,
             envelope_format: SecretEnvelopeFormat::LegacyDirectHpke,
@@ -654,14 +680,11 @@ mod tests {
         };
 
         assert_eq!(
-            open(&PROVENANCE_SEED, &record)
-                .expect("open legacy record")
-                .expose_secret()
-                .as_ref(),
+            open(&PROVENANCE_SEED, &record)?.expose_secret().as_ref(),
             b"legacy-api-token"
         );
 
-        let next_public = hybrid_public_key(policy.kem, &ROTATED_SEED);
+        let next_public = hybrid_public_key(policy.kem, &ROTATED_SEED)?;
         assert!(matches!(
             rewrap_v2(
                 &PROVENANCE_SEED,
@@ -671,6 +694,7 @@ mod tests {
             ),
             Err(SecretsError::PersistenceFormat { .. })
         ));
+        Ok(())
     }
 
     #[test]
@@ -693,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn records_sealed_under_legacy_pure_ml_kem_are_unreadable() {
+    fn records_sealed_under_legacy_pure_ml_kem_are_unreadable() -> TestResult {
         for (legacy, kem, wire) in [
             (KemAlgo::LegacyMlKem512, Kem::MlKem512, "ml_kem_512"),
             (KemAlgo::LegacyMlKem768, Kem::MlKem768, "ml_kem_768"),
@@ -701,7 +725,7 @@ mod tests {
         ] {
             // Ein echter, mit crypt_guard 3.0.1 erzeugter reiner ML-KEM-Umschlag:
             // Das Format wäre dekodierbar, der KEM ist aber nicht mehr zulässig.
-            let keys = generate_recipient_key_pair(kem).expect("pure ML-KEM keypair");
+            let keys = generate_recipient_key_pair(kem).map_err(ctx("pure ML-KEM keypair"))?;
             let suite = Suite::new(kem, Kdf::Shake256, HpkeAead::XChaCha20Poly1305);
             let envelope = HpkeEnvelope::seal(
                 suite,
@@ -710,7 +734,7 @@ mod tests {
                 b"legacy-wrapper-aad",
                 &[0x11; DEK_LEN],
             )
-            .expect("seal pure ML-KEM envelope");
+            .map_err(ctx("seal pure ML-KEM envelope"))?;
             let v2_record = SecretRecord {
                 id: SecretId::new(),
                 envelope_format: SecretEnvelopeFormat::DekWrappedV2,
@@ -735,21 +759,23 @@ mod tests {
                     Err(SecretsError::UnsupportedLegacyKem { algo }) if algo == wire
                 ));
             }
+            let rotated_public = hybrid_public_key(KemAlgo::MlKem1024P384, &ROTATED_SEED)?;
             assert!(matches!(
                 rewrap_v2(
                     &PROVENANCE_SEED,
                     &v2_record,
-                    hybrid_public_key(KemAlgo::MlKem1024P384, &ROTATED_SEED).as_bytes(),
+                    rotated_public.as_bytes(),
                     KeyVersion::initial().next(),
                 ),
                 Err(SecretsError::UnsupportedLegacyKem { algo }) if algo == wire
             ));
         }
+        Ok(())
     }
 
     #[test]
-    fn v2_rejects_invalid_payload_nonce_with_typed_error() {
-        let (seed, mut record) = sealed_record(AeadAlgo::AesGcmSiv);
+    fn v2_rejects_invalid_payload_nonce_with_typed_error() -> TestResult {
+        let (seed, mut record) = sealed_record(AeadAlgo::AesGcmSiv)?;
         record.nonce.pop();
 
         assert!(matches!(
@@ -759,13 +785,14 @@ mod tests {
                 actual: 11,
             })
         ));
+        Ok(())
     }
 
     #[test]
-    fn v2_rejects_a_wrapped_dek_with_invalid_length() {
-        let (seed, mut record) = sealed_record(AeadAlgo::XChaCha20Poly1305);
-        let suite = suite_for(record.kem_algo, record.aead_algo).expect("hybrid suite");
-        let kek_public = hybrid_public_key(record.kem_algo, &PROVENANCE_SEED);
+    fn v2_rejects_a_wrapped_dek_with_invalid_length() -> TestResult {
+        let (seed, mut record) = sealed_record(AeadAlgo::XChaCha20Poly1305)?;
+        let suite = suite_for(record.kem_algo, record.aead_algo)?;
+        let kek_public = hybrid_public_key(record.kem_algo, &PROVENANCE_SEED)?;
         let malformed_dek = [0xC3; DEK_LEN - 1];
         record.wrapped_dek = HpkeEnvelope::seal(
             suite,
@@ -774,12 +801,13 @@ mod tests {
             &wrapper_aad(record.id, record.key_version, suite),
             &malformed_dek,
         )
-        .expect("seal malformed wrapper payload")
+        .map_err(ctx("seal malformed wrapper payload"))?
         .to_bytes();
 
         assert!(matches!(
             open(&seed, &record),
             Err(SecretsError::InvalidDekLength { actual: 31 })
         ));
+        Ok(())
     }
 }

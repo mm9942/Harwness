@@ -114,9 +114,9 @@
 //! weder vor noch nach diesem Knoten existiert im Baum ein lokales
 //! ML-Modell, das ihn bedienen könnte.
 use harw_lens::{
-    DeterministicEmbedder, DimensionCheckedEmbedder, Embedder, EmbeddingCatalog,
+    CHUNKER_VERSION, DeterministicEmbedder, DimensionCheckedEmbedder, Embedder, EmbeddingCatalog,
     EmbeddingDescriptor, EmbeddingRole, HttpEmbedBackend, ModelEntry, QueryProvenance,
-    RemoteEmbedder, CHUNKER_VERSION,
+    RemoteEmbedder,
 };
 use secrecy::SecretString;
 
@@ -344,6 +344,7 @@ pub fn ask_provenance() -> QueryProvenance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
     fn test_ask_provenance_uses_placeholder_model_and_shared_chunker_version() {
@@ -353,13 +354,14 @@ mod tests {
     }
 
     #[test]
-    fn test_ask_embedder_produces_configured_dimensions() {
+    fn test_ask_embedder_produces_configured_dimensions() -> TestResult {
         let embedder = ask_embedder();
         let vectors = embedder
             .embed(&["eine testfrage".to_owned()])
-            .expect("Embedder darf hier nicht fehlschlagen");
+            .map_err(ctx("Embedder darf hier nicht fehlschlagen"))?;
         assert_eq!(vectors.len(), 1);
         assert_eq!(vectors[0].len(), ASK_EMBEDDING_DIMENSIONS);
+        Ok(())
     }
 
     #[test]
@@ -377,14 +379,16 @@ mod tests {
     /// die Vorgabe exakt der deterministische Platzhalter, unverändert
     /// gegenüber dem Stand vor diesem Knoten.
     #[test]
-    fn test_ask_embedder_defaults_to_the_deterministic_placeholder_without_configured_endpoint() {
+    fn test_ask_embedder_defaults_to_the_deterministic_placeholder_without_configured_endpoint()
+    -> TestResult {
         let embedder = ask_embedder();
         let vectors = embedder
             .embed(&["eine testfrage".to_owned()])
-            .expect("Platzhalter-Embedder darf nicht fehlschlagen");
+            .map_err(ctx("Platzhalter-Embedder darf nicht fehlschlagen"))?;
         assert_eq!(vectors[0].len(), ASK_EMBEDDING_DIMENSIONS);
         assert_eq!(embedder.locality(), harw_lens::Locality::Local);
         assert_eq!(ask_provenance().model, ASK_EMBEDDING_MODEL);
+        Ok(())
     }
 
     /// [`remote_ask_config_from`] verlangt **beide** Werte; eine gesetzte
@@ -403,22 +407,21 @@ mod tests {
     /// „nicht gesetzt".
     #[test]
     fn test_remote_ask_config_from_treats_blank_values_as_unset() {
-        assert!(remote_ask_config_from(
-            Some("   ".to_owned()),
-            Some("secret".to_owned())
-        )
-        .is_none());
+        assert!(
+            remote_ask_config_from(Some("   ".to_owned()), Some("secret".to_owned())).is_none()
+        );
     }
 
     /// Sind beide Werte nicht-leer gesetzt, liefert
     /// [`remote_ask_config_from`] sie unverändert zurück.
     #[test]
-    fn test_remote_ask_config_from_returns_both_values_when_configured() {
+    fn test_remote_ask_config_from_returns_both_values_when_configured() -> TestResult {
         let (base_url, _api_key) = remote_ask_config_from(
             Some("http://example.invalid".to_owned()),
             Some("secret".to_owned()),
         )
-        .expect("beide Werte sind gesetzt");
+        .ok_or(TestError::Missing("beide Werte sind gesetzt"))?;
         assert_eq!(base_url, "http://example.invalid");
+        Ok(())
     }
 }

@@ -303,14 +303,15 @@ mod tests {
     use crate::action::WardenAction;
     use crate::error::{MismatchAspect, WardenProtoError};
     use crate::stage::EscalationStage;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_types::{ApprovalActor, CgroupId, FindingId};
 
-    fn cgroup(id: &str) -> CgroupId {
-        CgroupId::try_from_str(id).expect("non-empty id")
+    fn cgroup(id: &str) -> TestResult<CgroupId> {
+        CgroupId::try_from_str(id).map_err(ctx("non-empty id"))
     }
 
-    fn finding(id: &str) -> FindingId {
-        FindingId::try_from_str(id).expect("non-empty id")
+    fn finding(id: &str) -> TestResult<FindingId> {
+        FindingId::try_from_str(id).map_err(ctx("non-empty id"))
     }
 
     fn actor() -> ApprovalActor {
@@ -319,166 +320,212 @@ mod tests {
         }
     }
 
-    fn sample_proof(finding_id: FindingId, action: &WardenAction, stage: EscalationStage) -> AuthorizationProof {
-        AuthorizationProof::new(
+    fn sample_proof(
+        finding_id: FindingId,
+        action: &WardenAction,
+        stage: EscalationStage,
+    ) -> TestResult<AuthorizationProof> {
+        Ok(AuthorizationProof::new(
             finding_id,
             stage,
             actor(),
             jiff::Timestamp::UNIX_EPOCH,
-            action.content_digest().expect("action encodes"),
-        )
+            action.content_digest().map_err(ctx("action encodes"))?,
+        ))
     }
 
     // -- Rundlauf / deny_unknown_fields --------------------------------------
 
     #[test]
-    fn test_serde_roundtrip() {
+    fn test_serde_roundtrip() -> TestResult {
         let action = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
-        let proof = sample_proof(finding("finding-1"), &action, EscalationStage::Escalated);
+        let proof = sample_proof(finding("finding-1")?, &action, EscalationStage::Escalated)?;
 
-        let json = serde_json::to_string(&proof).expect("serializes");
-        let round_tripped: AuthorizationProof = serde_json::from_str(&json).expect("deserializes");
+        let json = serde_json::to_string(&proof).map_err(ctx("serializes"))?;
+        let round_tripped: AuthorizationProof =
+            serde_json::from_str(&json).map_err(ctx("deserializes"))?;
         assert_eq!(round_tripped, proof);
+        Ok(())
     }
 
     #[test]
-    fn test_rejects_unknown_field() {
+    fn test_rejects_unknown_field() -> TestResult {
         let action = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
-        let proof = sample_proof(finding("finding-1"), &action, EscalationStage::RuleTriggered);
-        let mut value = serde_json::to_value(&proof).unwrap();
+        let proof = sample_proof(
+            finding("finding-1")?,
+            &action,
+            EscalationStage::RuleTriggered,
+        )?;
+        let mut value = serde_json::to_value(&proof).map_err(ctx("serializes"))?;
         value
             .as_object_mut()
-            .unwrap()
+            .ok_or(TestError::Missing("proof serializes to a JSON object"))?
             .insert("extra".to_string(), serde_json::Value::Bool(true));
         let result: Result<AuthorizationProof, _> = serde_json::from_value(value);
         assert!(result.is_err());
+        Ok(())
     }
 
     // -- Accessoren -------------------------------------------------------------
 
     #[test]
-    fn test_accessors_return_constructed_values() {
+    fn test_accessors_return_constructed_values() -> TestResult {
         let action = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
-        let f = finding("finding-1");
-        let proof = sample_proof(f.clone(), &action, EscalationStage::Escalated);
+        let f = finding("finding-1")?;
+        let proof = sample_proof(f.clone(), &action, EscalationStage::Escalated)?;
 
         assert_eq!(proof.finding(), &f);
         assert_eq!(proof.stage(), EscalationStage::Escalated);
         assert_eq!(proof.authorized_by(), &actor());
         assert_eq!(proof.authorized_at(), jiff::Timestamp::UNIX_EPOCH);
-        assert_eq!(proof.bound_action(), action.content_digest().unwrap());
+        assert_eq!(
+            proof.bound_action(),
+            action.content_digest().map_err(ctx("action encodes"))?
+        );
+        Ok(())
     }
 
     // -- authorizes: Bindung ---------------------------------------------------
 
     #[test]
-    fn test_authorizes_accepts_matching_finding_and_action() {
+    fn test_authorizes_accepts_matching_finding_and_action() -> TestResult {
         let action = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
-        let f = finding("finding-1");
-        let proof = sample_proof(f.clone(), &action, EscalationStage::RuleTriggered);
+        let f = finding("finding-1")?;
+        let proof = sample_proof(f.clone(), &action, EscalationStage::RuleTriggered)?;
 
         assert!(proof.authorizes(&f, &action).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_authorizes_rejects_different_finding() {
+    fn test_authorizes_rejects_different_finding() -> TestResult {
         let action = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
-        let proof = sample_proof(finding("finding-1"), &action, EscalationStage::RuleTriggered);
+        let proof = sample_proof(
+            finding("finding-1")?,
+            &action,
+            EscalationStage::RuleTriggered,
+        )?;
 
-        let other_finding = finding("finding-2");
-        let err = proof.authorizes(&other_finding, &action).unwrap_err();
+        let other_finding = finding("finding-2")?;
+        let Err(err) = proof.authorizes(&other_finding, &action) else {
+            return Err(TestError::Unexpected(
+                "authorizes must reject a different finding".into(),
+            ));
+        };
         assert!(matches!(
             err,
             WardenProtoError::ProofMismatch(MismatchAspect::Finding)
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_authorizes_rejects_different_action() {
+    fn test_authorizes_rejects_different_action() -> TestResult {
         let bound_action = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
-        let f = finding("finding-1");
-        let proof = sample_proof(f.clone(), &bound_action, EscalationStage::RuleTriggered);
+        let f = finding("finding-1")?;
+        let proof = sample_proof(f.clone(), &bound_action, EscalationStage::RuleTriggered)?;
 
         let different_action = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-2"),
+            cgroup: cgroup("cgroup-2")?,
         };
-        let err = proof.authorizes(&f, &different_action).unwrap_err();
+        let Err(err) = proof.authorizes(&f, &different_action) else {
+            return Err(TestError::Unexpected(
+                "authorizes must reject a different action".into(),
+            ));
+        };
         assert!(matches!(
             err,
             WardenProtoError::ProofMismatch(MismatchAspect::Action)
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_authorizes_rejects_different_action_kind_on_same_cgroup() {
+    fn test_authorizes_rejects_different_action_kind_on_same_cgroup() -> TestResult {
         let bound_action = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
-        let f = finding("finding-1");
-        let proof = sample_proof(f.clone(), &bound_action, EscalationStage::RuleTriggered);
+        let f = finding("finding-1")?;
+        let proof = sample_proof(f.clone(), &bound_action, EscalationStage::RuleTriggered)?;
 
         let different_kind = WardenAction::KillProcessTree {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
-        let err = proof.authorizes(&f, &different_kind).unwrap_err();
+        let Err(err) = proof.authorizes(&f, &different_kind) else {
+            return Err(TestError::Unexpected(
+                "authorizes must reject a different action kind".into(),
+            ));
+        };
         assert!(matches!(
             err,
             WardenProtoError::ProofMismatch(MismatchAspect::Action)
         ));
+        Ok(())
     }
 
     // -- verify: Bindung + Zulässigkeit -----------------------------------------
 
     #[test]
-    fn test_verify_succeeds_when_bound_and_admissible() {
+    fn test_verify_succeeds_when_bound_and_admissible() -> TestResult {
         let action = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
-        let f = finding("finding-1");
-        let proof = sample_proof(f.clone(), &action, EscalationStage::RuleTriggered);
+        let f = finding("finding-1")?;
+        let proof = sample_proof(f.clone(), &action, EscalationStage::RuleTriggered)?;
 
         assert!(proof.verify(&f, &action).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_verify_fails_when_bound_but_not_admissible_at_stage() {
+    fn test_verify_fails_when_bound_but_not_admissible_at_stage() -> TestResult {
         let action = WardenAction::KillProcessTree {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
-        let f = finding("finding-1");
-        let proof = sample_proof(f.clone(), &action, EscalationStage::RuleTriggered);
+        let f = finding("finding-1")?;
+        let proof = sample_proof(f.clone(), &action, EscalationStage::RuleTriggered)?;
 
-        let err = proof.verify(&f, &action).unwrap_err();
+        let Err(err) = proof.verify(&f, &action) else {
+            return Err(TestError::Unexpected(
+                "verify must fail when not admissible at this stage".into(),
+            ));
+        };
         assert!(matches!(err, WardenProtoError::NotAdmissibleAtStage));
+        Ok(())
     }
 
     #[test]
-    fn test_verify_fails_when_admissible_but_not_bound() {
+    fn test_verify_fails_when_admissible_but_not_bound() -> TestResult {
         let action = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
-        let f = finding("finding-1");
-        let proof = sample_proof(f.clone(), &action, EscalationStage::Escalated);
+        let f = finding("finding-1")?;
+        let proof = sample_proof(f.clone(), &action, EscalationStage::Escalated)?;
 
         let unbound_action = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-9"),
+            cgroup: cgroup("cgroup-9")?,
         };
-        let err = proof.verify(&f, &unbound_action).unwrap_err();
+        let Err(err) = proof.verify(&f, &unbound_action) else {
+            return Err(TestError::Unexpected(
+                "verify must fail when the action is not bound".into(),
+            ));
+        };
         assert!(matches!(
             err,
             WardenProtoError::ProofMismatch(MismatchAspect::Action)
         ));
+        Ok(())
     }
 }

@@ -312,6 +312,7 @@ async fn web_crates_io(
 mod tests {
     use super::*;
     use crate::error::WebToolError;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     const SAMPLE: &str = r#"{
         "crate": {
@@ -371,21 +372,22 @@ mod tests {
 
     /// Jede gebaute URL ist https auf crates.io.
     #[test]
-    fn test_crates_io_url_is_always_https_on_crates_io() {
-        let url = crates_io_url("serde").expect("gültige URL");
+    fn test_crates_io_url_is_always_https_on_crates_io() -> TestResult {
+        let url = crates_io_url("serde").ok_or(TestError::Missing("gültige URL"))?;
         assert!(url.starts_with("https://"));
         assert_eq!(
             harw_tools::host_from_url(&url).as_deref(),
             Some(CRATES_IO_HOST)
         );
+        Ok(())
     }
 
     // --- Verdichtung --------------------------------------------------------
 
     /// Die stabile Version, ihre Lizenz und ihre MSRV werden korrekt gewählt.
     #[test]
-    fn test_summarize_picks_max_stable_version_metadata() {
-        let summary = summarize(SAMPLE).expect("gültige Antwort");
+    fn test_summarize_picks_max_stable_version_metadata() -> TestResult {
+        let summary = summarize(SAMPLE).map_err(ctx("gültige Antwort"))?;
 
         assert_eq!(summary.name, "serde");
         assert_eq!(summary.latest_stable.as_deref(), Some("1.0.219"));
@@ -399,12 +401,13 @@ mod tests {
             Some("https://github.com/serde-rs/serde")
         );
         assert!(summary.description.is_some());
+        Ok(())
     }
 
     /// Ohne `max_stable_version` wird die erste stabile, nicht zurückgezogene
     /// Version genommen.
     #[test]
-    fn test_summarize_falls_back_to_first_stable_version() {
+    fn test_summarize_falls_back_to_first_stable_version() -> TestResult {
         let raw = r#"{
             "crate": { "name": "beta-only" },
             "versions": [
@@ -414,30 +417,32 @@ mod tests {
             ]
         }"#;
 
-        let summary = summarize(raw).expect("gültige Antwort");
+        let summary = summarize(raw).map_err(ctx("gültige Antwort"))?;
         assert_eq!(summary.latest_stable.as_deref(), Some("1.3.0"));
         assert_eq!(summary.license.as_deref(), Some("Apache-2.0"));
         assert!(!summary.yanked);
+        Ok(())
     }
 
     /// Ein zurückgezogenes `max_stable_version` wird als solches gemeldet.
     #[test]
-    fn test_summarize_reports_yanked_latest_stable() {
+    fn test_summarize_reports_yanked_latest_stable() -> TestResult {
         let raw = r#"{
             "crate": { "name": "zurueckgezogen", "max_stable_version": "0.9.0" },
             "versions": [ { "num": "0.9.0", "yanked": true, "license": "MIT" } ]
         }"#;
 
-        let summary = summarize(raw).expect("gültige Antwort");
+        let summary = summarize(raw).map_err(ctx("gültige Antwort"))?;
         assert!(summary.yanked, "yanked muss durchgereicht werden");
         assert_eq!(summary.latest_stable.as_deref(), Some("0.9.0"));
+        Ok(())
     }
 
     /// Fehlende optionale Felder werden zu `None`, nicht zu einem Fehler.
     #[test]
-    fn test_summarize_tolerates_missing_optional_fields() {
+    fn test_summarize_tolerates_missing_optional_fields() -> TestResult {
         let raw = r#"{ "crate": { "name": "minimal" } }"#;
-        let summary = summarize(raw).expect("minimale Antwort ist gültig");
+        let summary = summarize(raw).map_err(ctx("minimale Antwort ist gültig"))?;
 
         assert_eq!(summary.name, "minimal");
         assert_eq!(summary.latest_stable, None);
@@ -446,33 +451,42 @@ mod tests {
         assert_eq!(summary.license, None);
         assert_eq!(summary.rust_version, None);
         assert!(!summary.yanked);
+        Ok(())
     }
 
     /// Fehlt `crate.name`, ist die Antwort ungültig.
     #[test]
-    fn test_summarize_rejects_response_without_crate_name() {
-        let err = summarize(r#"{ "crate": {} }"#)
-            .expect_err("ohne crate.name ist die Antwort unbrauchbar");
+    fn test_summarize_rejects_response_without_crate_name() -> TestResult {
+        let Err(err) = summarize(r#"{ "crate": {} }"#) else {
+            return Err(TestError::Unexpected(
+                "ohne crate.name ist die Antwort unbrauchbar".into(),
+            ));
+        };
         assert!(matches!(err, WebToolError::Json(_)), "{err:?}");
+        Ok(())
     }
 
     /// Kaputtes JSON wird als `Json`-Fehler gemeldet.
     #[test]
-    fn test_summarize_rejects_broken_json() {
-        let err = summarize("{ kein json").expect_err("kaputtes JSON muss scheitern");
+    fn test_summarize_rejects_broken_json() -> TestResult {
+        let Err(err) = summarize("{ kein json") else {
+            return Err(TestError::Unexpected("kaputtes JSON muss scheitern".into()));
+        };
         assert!(matches!(err, WebToolError::Json(_)), "{err:?}");
+        Ok(())
     }
 
     /// Die Zusammenfassung serialisiert zu flachem JSON ohne HTML-Reste.
     #[test]
-    fn test_crate_summary_serializes_to_flat_json() {
-        let summary = summarize(SAMPLE).expect("gültige Antwort");
-        let value = serde_json::to_value(&summary).expect("Serialisierung");
+    fn test_crate_summary_serializes_to_flat_json() -> TestResult {
+        let summary = summarize(SAMPLE).map_err(ctx("gültige Antwort"))?;
+        let value = serde_json::to_value(&summary).map_err(ctx("Serialisierung"))?;
 
         assert_eq!(value["name"], "serde");
         assert_eq!(value["latest_stable"], "1.0.219");
         assert_eq!(value["versions_count"], 3);
         assert_eq!(value["yanked"], false);
+        Ok(())
     }
 
     // --- Tool-Deklaration ---------------------------------------------------
@@ -502,19 +516,29 @@ mod tests {
 
     /// `crate_name` ist das einzige Feld und Pflicht.
     #[test]
-    fn test_crates_io_args_schema_requires_crate_name() {
+    fn test_crates_io_args_schema_requires_crate_name() -> TestResult {
         let harw_tools::ToolSpec::Function(spec) = WebCratesIoTool::spec();
         assert_eq!(spec.name.as_str(), "web.crates_io");
-        let required = spec.parameters.required.expect("required-Liste");
+        let required = spec
+            .parameters
+            .required
+            .ok_or(TestError::Missing("required-Liste"))?;
         assert_eq!(required, vec!["crate_name".to_owned()]);
+        Ok(())
     }
 
     // --- Tests, die Netzzugriff bräuchten -----------------------------------
 
     /// Benötigt echten Netzzugriff auf die crates.io-API.
+    ///
+    /// Kein `unimplemented!` mehr (Bible R089/R101/R165): `#[ignore]` hält
+    /// den Test ohnehin aus dem Default-Lauf heraus; würde er dennoch mit
+    /// `--ignored` ausgeführt, meldet er sich als `Err` statt zu paniken.
     #[tokio::test]
     #[ignore = "benötigt echten Netzzugriff auf crates.io"]
-    async fn test_web_crates_io_fetches_live_metadata() {
-        unimplemented!("echter Netzzugriff nicht erlaubt");
+    async fn test_web_crates_io_fetches_live_metadata() -> TestResult {
+        Err(TestError::Unexpected(
+            "echter Netzzugriff nicht erlaubt".to_owned(),
+        ))
     }
 }

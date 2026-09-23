@@ -248,9 +248,9 @@ impl WardenAction {
     #[must_use]
     pub fn reversibility(&self) -> Reversibility {
         match self {
-            Self::FreezeCgroup { .. } | Self::ReleaseCgroup { .. } | Self::IsolateNetwork { .. } => {
-                Reversibility::Reversible
-            }
+            Self::FreezeCgroup { .. }
+            | Self::ReleaseCgroup { .. }
+            | Self::IsolateNetwork { .. } => Reversibility::Reversible,
             Self::KillProcessTree { .. } => Reversibility::Irreversible,
         }
     }
@@ -386,7 +386,9 @@ impl WardenAction {
     pub fn binding_digest(&self) -> ContentDigest {
         let cgroup = self.cgroup().as_str().as_bytes();
         let kind = self.kind_name().as_bytes();
-        let mut buf = Vec::with_capacity(crate::canonical::ACTION_DOMAIN.len() + 16 + kind.len() + cgroup.len());
+        let mut buf = Vec::with_capacity(
+            crate::canonical::ACTION_DOMAIN.len() + 16 + kind.len() + cgroup.len(),
+        );
         buf.extend_from_slice(crate::canonical::ACTION_DOMAIN);
         crate::canonical::put_field(&mut buf, kind);
         crate::canonical::put_field(&mut buf, cgroup);
@@ -398,33 +400,38 @@ impl WardenAction {
 mod tests {
     use super::{ProposedAction, Reversibility, WardenAction};
     use crate::stage::EscalationStage;
+    use crate::test_support::{TestResult, ctx};
     use harw_types::CgroupId;
 
-    fn cgroup(id: &str) -> CgroupId {
-        CgroupId::try_from_str(id).expect("non-empty id")
+    fn cgroup(id: &str) -> TestResult<CgroupId> {
+        CgroupId::try_from_str(id).map_err(ctx("non-empty id"))
     }
 
     // -- Wire-Rundlauf / deny_unknown_fields ---------------------------------
 
     #[test]
-    fn test_proposed_action_serde_roundtrip() {
+    fn test_proposed_action_serde_roundtrip() -> TestResult {
         let action = ProposedAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
-        let json = serde_json::to_string(&action).expect("serializes");
+        let json = serde_json::to_string(&action).map_err(ctx("serializes"))?;
         assert_eq!(json, r#"{"kind":"freeze-cgroup","cgroup":"cgroup-1"}"#);
-        let round_tripped: ProposedAction = serde_json::from_str(&json).expect("deserializes");
+        let round_tripped: ProposedAction =
+            serde_json::from_str(&json).map_err(ctx("deserializes"))?;
         assert_eq!(round_tripped, action);
+        Ok(())
     }
 
     #[test]
-    fn test_warden_action_serde_roundtrip() {
+    fn test_warden_action_serde_roundtrip() -> TestResult {
         let action = WardenAction::IsolateNetwork {
-            cgroup: cgroup("cgroup-2"),
+            cgroup: cgroup("cgroup-2")?,
         };
-        let json = serde_json::to_string(&action).expect("serializes");
-        let round_tripped: WardenAction = serde_json::from_str(&json).expect("deserializes");
+        let json = serde_json::to_string(&action).map_err(ctx("serializes"))?;
+        let round_tripped: WardenAction =
+            serde_json::from_str(&json).map_err(ctx("deserializes"))?;
         assert_eq!(round_tripped, action);
+        Ok(())
     }
 
     #[test]
@@ -444,202 +451,243 @@ mod tests {
     // -- From<ProposedAction> ------------------------------------------------
 
     #[test]
-    fn test_from_proposed_action_preserves_all_fields() {
+    fn test_from_proposed_action_preserves_all_fields() -> TestResult {
         for proposed in [
             ProposedAction::FreezeCgroup {
-                cgroup: cgroup("cgroup-a"),
+                cgroup: cgroup("cgroup-a")?,
             },
             ProposedAction::ReleaseCgroup {
-                cgroup: cgroup("cgroup-b"),
+                cgroup: cgroup("cgroup-b")?,
             },
             ProposedAction::IsolateNetwork {
-                cgroup: cgroup("cgroup-c"),
+                cgroup: cgroup("cgroup-c")?,
             },
             ProposedAction::KillProcessTree {
-                cgroup: cgroup("cgroup-d"),
+                cgroup: cgroup("cgroup-d")?,
             },
         ] {
-            let json_before = serde_json::to_string(&proposed).unwrap();
+            let json_before = serde_json::to_string(&proposed).map_err(ctx("serializes"))?;
             let action: WardenAction = proposed.into();
-            let json_after = serde_json::to_string(&action).unwrap();
+            let json_after = serde_json::to_string(&action).map_err(ctx("serializes"))?;
             assert_eq!(json_before, json_after);
         }
+        Ok(())
     }
 
     // -- audit_name ------------------------------------------------------------
 
     #[test]
-    fn test_audit_name_matches_declared_convention_per_action() {
+    fn test_audit_name_matches_declared_convention_per_action() -> TestResult {
         assert_eq!(
             WardenAction::FreezeCgroup {
-                cgroup: cgroup("c")
+                cgroup: cgroup("c")?
             }
             .audit_name(),
             "warden.freeze_cgroup"
         );
         assert_eq!(
             WardenAction::ReleaseCgroup {
-                cgroup: cgroup("c")
+                cgroup: cgroup("c")?
             }
             .audit_name(),
             "warden.release_cgroup"
         );
         assert_eq!(
             WardenAction::IsolateNetwork {
-                cgroup: cgroup("c")
+                cgroup: cgroup("c")?
             }
             .audit_name(),
             "warden.isolate_network"
         );
         assert_eq!(
             WardenAction::KillProcessTree {
-                cgroup: cgroup("c")
+                cgroup: cgroup("c")?
             }
             .audit_name(),
             "warden.kill_process_tree"
         );
+        Ok(())
     }
 
     // -- Zulässigkeitsmatrix -----------------------------------------------------
 
     #[test]
-    fn test_freeze_and_release_admissible_from_rule_triggered_and_escalated() {
+    fn test_freeze_and_release_admissible_from_rule_triggered_and_escalated() -> TestResult {
         for action in [
             WardenAction::FreezeCgroup {
-                cgroup: cgroup("c"),
+                cgroup: cgroup("c")?,
             },
             WardenAction::ReleaseCgroup {
-                cgroup: cgroup("c"),
+                cgroup: cgroup("c")?,
             },
         ] {
             assert!(action.is_admissible_from(EscalationStage::RuleTriggered));
             assert!(action.is_admissible_from(EscalationStage::Escalated));
         }
+        Ok(())
     }
 
     #[test]
-    fn test_isolate_and_kill_admissible_only_from_escalated() {
+    fn test_isolate_and_kill_admissible_only_from_escalated() -> TestResult {
         for action in [
             WardenAction::IsolateNetwork {
-                cgroup: cgroup("c"),
+                cgroup: cgroup("c")?,
             },
             WardenAction::KillProcessTree {
-                cgroup: cgroup("c"),
+                cgroup: cgroup("c")?,
             },
         ] {
             assert!(!action.is_admissible_from(EscalationStage::RuleTriggered));
             assert!(action.is_admissible_from(EscalationStage::Escalated));
         }
+        Ok(())
     }
 
     // -- Reversibilität -----------------------------------------------------------
 
     #[test]
-    fn test_reversibility_is_exhaustively_marked_per_action() {
+    fn test_reversibility_is_exhaustively_marked_per_action() -> TestResult {
         assert_eq!(
             WardenAction::FreezeCgroup {
-                cgroup: cgroup("c")
+                cgroup: cgroup("c")?
             }
             .reversibility(),
             Reversibility::Reversible
         );
         assert_eq!(
             WardenAction::ReleaseCgroup {
-                cgroup: cgroup("c")
+                cgroup: cgroup("c")?
             }
             .reversibility(),
             Reversibility::Reversible
         );
         assert_eq!(
             WardenAction::IsolateNetwork {
-                cgroup: cgroup("c")
+                cgroup: cgroup("c")?
             }
             .reversibility(),
             Reversibility::Reversible
         );
         assert_eq!(
             WardenAction::KillProcessTree {
-                cgroup: cgroup("c")
+                cgroup: cgroup("c")?
             }
             .reversibility(),
             Reversibility::Irreversible
         );
+        Ok(())
     }
 
     // -- content_digest -------------------------------------------------------
 
     #[test]
-    fn test_content_digest_is_deterministic_for_identical_actions() {
+    fn test_content_digest_is_deterministic_for_identical_actions() -> TestResult {
         let a = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
         let b = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
-        assert_eq!(a.content_digest().unwrap(), b.content_digest().unwrap());
+        assert_eq!(
+            a.content_digest().map_err(ctx("content_digest"))?,
+            b.content_digest().map_err(ctx("content_digest"))?
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_content_digest_differs_for_different_cgroup() {
+    fn test_content_digest_differs_for_different_cgroup() -> TestResult {
         let a = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
         let b = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-2"),
-        };
-        assert_ne!(a.content_digest().unwrap(), b.content_digest().unwrap());
-    }
-
-    #[test]
-    fn test_content_digest_differs_for_different_action_kind_with_same_cgroup() {
-        let freeze = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
-        };
-        let release = WardenAction::ReleaseCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-2")?,
         };
         assert_ne!(
-            freeze.content_digest().unwrap(),
-            release.content_digest().unwrap()
+            a.content_digest().map_err(ctx("content_digest"))?,
+            b.content_digest().map_err(ctx("content_digest"))?
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_content_digest_differs_for_different_action_kind_with_same_cgroup() -> TestResult {
+        let freeze = WardenAction::FreezeCgroup {
+            cgroup: cgroup("cgroup-1")?,
+        };
+        let release = WardenAction::ReleaseCgroup {
+            cgroup: cgroup("cgroup-1")?,
+        };
+        assert_ne!(
+            freeze.content_digest().map_err(ctx("content_digest"))?,
+            release.content_digest().map_err(ctx("content_digest"))?
+        );
+        Ok(())
     }
 
     // -- v2: kind_name / cgroup / binding_digest -----------------------------
 
     #[test]
-    fn test_kind_name_matches_serde_tag_for_every_variant() {
+    fn test_kind_name_matches_serde_tag_for_every_variant() -> TestResult {
         for action in [
-            WardenAction::FreezeCgroup { cgroup: cgroup("c") },
-            WardenAction::ReleaseCgroup { cgroup: cgroup("c") },
-            WardenAction::IsolateNetwork { cgroup: cgroup("c") },
-            WardenAction::KillProcessTree { cgroup: cgroup("c") },
+            WardenAction::FreezeCgroup {
+                cgroup: cgroup("c")?,
+            },
+            WardenAction::ReleaseCgroup {
+                cgroup: cgroup("c")?,
+            },
+            WardenAction::IsolateNetwork {
+                cgroup: cgroup("c")?,
+            },
+            WardenAction::KillProcessTree {
+                cgroup: cgroup("c")?,
+            },
         ] {
-            let value = serde_json::to_value(&action).expect("serializes");
+            let value = serde_json::to_value(&action).map_err(ctx("serializes"))?;
             assert_eq!(value["kind"], action.kind_name());
         }
+        Ok(())
     }
 
     #[test]
-    fn test_cgroup_returns_target_of_every_variant() {
-        let target = cgroup("harw.slice/job-7");
+    fn test_cgroup_returns_target_of_every_variant() -> TestResult {
+        let target = cgroup("harw.slice/job-7")?;
         for action in [
-            WardenAction::FreezeCgroup { cgroup: target.clone() },
-            WardenAction::ReleaseCgroup { cgroup: target.clone() },
-            WardenAction::IsolateNetwork { cgroup: target.clone() },
-            WardenAction::KillProcessTree { cgroup: target.clone() },
+            WardenAction::FreezeCgroup {
+                cgroup: target.clone(),
+            },
+            WardenAction::ReleaseCgroup {
+                cgroup: target.clone(),
+            },
+            WardenAction::IsolateNetwork {
+                cgroup: target.clone(),
+            },
+            WardenAction::KillProcessTree {
+                cgroup: target.clone(),
+            },
         ] {
             assert_eq!(action.cgroup(), &target);
         }
+        Ok(())
     }
 
     #[test]
-    fn test_binding_digest_is_deterministic_and_field_sensitive() {
-        let a = WardenAction::FreezeCgroup { cgroup: cgroup("harw.slice/job-1") };
-        let same = WardenAction::FreezeCgroup { cgroup: cgroup("harw.slice/job-1") };
-        let other_cgroup = WardenAction::FreezeCgroup { cgroup: cgroup("harw.slice/job-2") };
-        let other_kind = WardenAction::KillProcessTree { cgroup: cgroup("harw.slice/job-1") };
+    fn test_binding_digest_is_deterministic_and_field_sensitive() -> TestResult {
+        let a = WardenAction::FreezeCgroup {
+            cgroup: cgroup("harw.slice/job-1")?,
+        };
+        let same = WardenAction::FreezeCgroup {
+            cgroup: cgroup("harw.slice/job-1")?,
+        };
+        let other_cgroup = WardenAction::FreezeCgroup {
+            cgroup: cgroup("harw.slice/job-2")?,
+        };
+        let other_kind = WardenAction::KillProcessTree {
+            cgroup: cgroup("harw.slice/job-1")?,
+        };
         assert_eq!(a.binding_digest(), same.binding_digest());
         assert_ne!(a.binding_digest(), other_cgroup.binding_digest());
         assert_ne!(a.binding_digest(), other_kind.binding_digest());
+        Ok(())
     }
 }

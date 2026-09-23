@@ -1076,45 +1076,47 @@ impl OpenBrowserRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     // Test helper: test inputs are literals, a parse failure is a test bug.
-    fn url(s: &str) -> url::Url {
-        url::Url::parse(s).expect("valid test url")
+    fn url(s: &str) -> TestResult<url::Url> {
+        url::Url::parse(s).map_err(ctx("valid test url"))
     }
 
-    fn policy(origins: &[&str], deny: bool) -> OriginPolicy {
-        OriginPolicy::from_origins(origins, deny).expect("valid test policy")
+    fn policy(origins: &[&str], deny: bool) -> TestResult<OriginPolicy> {
+        OriginPolicy::from_origins(origins, deny).map_err(ctx("valid test policy"))
     }
 
-    fn open_request() -> OpenBrowserRequest {
-        OpenBrowserRequest {
-            start_url: url("https://erp.example.com/login"),
+    fn open_request() -> TestResult<OpenBrowserRequest> {
+        Ok(OpenBrowserRequest {
+            start_url: url("https://erp.example.com/login")?,
             headless: true,
             profile: ProfilePolicy::Persistent {
                 binding: "sales-team".to_owned(),
             },
             bidi: BiDiRequirement::Preferred,
-            allowed_origins: policy(&["https://erp.example.com"], true),
-            authentication_origins: policy(&["https://sso.example.net"], true),
+            allowed_origins: policy(&["https://erp.example.com"], true)?,
+            authentication_origins: policy(&["https://sso.example.net"], true)?,
             viewport: Some(Viewport {
                 width: 1920,
                 height: 1080,
             }),
             limits: BrowserLimits::default(),
-        }
+        })
     }
 
     #[test]
-    fn test_origin_rule_parse_accepts_exact_port_and_wildcard() {
-        let exact = OriginRule::parse("https://ERP.example.com/").expect("exact");
+    fn test_origin_rule_parse_accepts_exact_port_and_wildcard() -> TestResult {
+        let exact = OriginRule::parse("https://ERP.example.com/").map_err(ctx("exact"))?;
         assert_eq!(exact.to_string(), "https://erp.example.com");
         assert_eq!(exact.port(), 443);
-        let port = OriginRule::parse("http://erp.example.com:8080").expect("port");
+        let port = OriginRule::parse("http://erp.example.com:8080").map_err(ctx("port"))?;
         assert_eq!(port.to_string(), "http://erp.example.com:8080");
-        let wildcard = OriginRule::parse("https://*.example.com").expect("wildcard");
+        let wildcard = OriginRule::parse("https://*.example.com").map_err(ctx("wildcard"))?;
         assert!(wildcard.include_subdomains());
-        let v6 = OriginRule::parse("https://[::1]:8443").expect("v6");
+        let v6 = OriginRule::parse("https://[::1]:8443").map_err(ctx("v6"))?;
         assert_eq!(v6.to_string(), "https://[::1]:8443");
+        Ok(())
     }
 
     #[test]
@@ -1137,132 +1139,157 @@ mod tests {
             "https://*.[::1]",
             "https://erp.example.com:99999",
         ] {
-            assert!(OriginRule::parse(bad).is_err(), "rule {bad:?} must be rejected");
+            assert!(
+                OriginRule::parse(bad).is_err(),
+                "rule {bad:?} must be rejected"
+            );
         }
         let long = format!("https://{}.example.com", "a".repeat(MAX_ORIGIN_RULE_BYTES));
         assert!(OriginRule::parse(&long).is_err());
     }
 
     #[test]
-    fn test_is_allowed_exact_origin_match() {
-        let policy = policy(&["https://erp.example.com"], false);
-        assert!(policy.is_allowed(&url("https://erp.example.com/path?x=1")));
-        assert!(policy.is_allowed(&url("https://ERP.EXAMPLE.COM./path")));
-        assert!(policy.is_allowed(&url("https://erp.example.com:443/")));
+    fn test_is_allowed_exact_origin_match() -> TestResult {
+        let policy = policy(&["https://erp.example.com"], false)?;
+        assert!(policy.is_allowed(&url("https://erp.example.com/path?x=1")?));
+        assert!(policy.is_allowed(&url("https://ERP.EXAMPLE.COM./path")?));
+        assert!(policy.is_allowed(&url("https://erp.example.com:443/")?));
+        Ok(())
     }
 
     #[test]
-    fn test_is_allowed_scheme_change_denied() {
-        let policy = policy(&["https://erp.example.com"], false);
-        assert!(!policy.is_allowed(&url("http://erp.example.com/")));
-        assert!(!policy.is_allowed(&url("ws://erp.example.com/")));
-        assert!(!policy.is_allowed(&url("ftp://erp.example.com/")));
+    fn test_is_allowed_scheme_change_denied() -> TestResult {
+        let policy = policy(&["https://erp.example.com"], false)?;
+        assert!(!policy.is_allowed(&url("http://erp.example.com/")?));
+        assert!(!policy.is_allowed(&url("ws://erp.example.com/")?));
+        assert!(!policy.is_allowed(&url("ftp://erp.example.com/")?));
+        Ok(())
     }
 
     #[test]
-    fn test_is_allowed_port_change_denied() {
-        let policy = policy(&["https://erp.example.com"], false);
-        assert!(!policy.is_allowed(&url("https://erp.example.com:8443/")));
-        let with_port = policy_with(&["http://erp.example.com:8080"]);
-        assert!(with_port.is_allowed(&url("http://erp.example.com:8080/")));
-        assert!(!with_port.is_allowed(&url("http://erp.example.com/")));
+    fn test_is_allowed_port_change_denied() -> TestResult {
+        let policy = policy(&["https://erp.example.com"], false)?;
+        assert!(!policy.is_allowed(&url("https://erp.example.com:8443/")?));
+        let with_port = policy_with(&["http://erp.example.com:8080"])?;
+        assert!(with_port.is_allowed(&url("http://erp.example.com:8080/")?));
+        assert!(!with_port.is_allowed(&url("http://erp.example.com/")?));
+        Ok(())
     }
 
-    fn policy_with(origins: &[&str]) -> OriginPolicy {
+    fn policy_with(origins: &[&str]) -> TestResult<OriginPolicy> {
         policy(origins, false)
     }
 
     #[test]
-    fn test_is_allowed_host_change_denied() {
-        let policy = policy(&["https://erp.example.com"], false);
-        assert!(!policy.is_allowed(&url("https://evil.com/")));
-        assert!(!policy.is_allowed(&url("https://erp.example.com.evil.com/")));
-        assert!(!policy.is_allowed(&url("https://evilerp.example.com/")));
+    fn test_is_allowed_host_change_denied() -> TestResult {
+        let policy = policy(&["https://erp.example.com"], false)?;
+        assert!(!policy.is_allowed(&url("https://evil.com/")?));
+        assert!(!policy.is_allowed(&url("https://erp.example.com.evil.com/")?));
+        assert!(!policy.is_allowed(&url("https://evilerp.example.com/")?));
+        Ok(())
     }
 
     #[test]
-    fn test_is_allowed_exact_rule_does_not_admit_subdomains() {
-        let policy = policy(&["https://example.com"], false);
-        assert!(policy.is_allowed(&url("https://example.com/")));
-        assert!(!policy.is_allowed(&url("https://erp.example.com/")));
+    fn test_is_allowed_exact_rule_does_not_admit_subdomains() -> TestResult {
+        let policy = policy(&["https://example.com"], false)?;
+        assert!(policy.is_allowed(&url("https://example.com/")?));
+        assert!(!policy.is_allowed(&url("https://erp.example.com/")?));
+        Ok(())
     }
 
     #[test]
-    fn test_is_allowed_wildcard_rule_admits_strict_subdomains_only() {
-        let policy = policy(&["https://*.example.com"], false);
-        assert!(policy.is_allowed(&url("https://erp.example.com/")));
-        assert!(policy.is_allowed(&url("https://a.b.example.com/")));
-        assert!(!policy.is_allowed(&url("https://example.com/")));
-        assert!(!policy.is_allowed(&url("https://notexample.com/")));
-        assert!(!policy.is_allowed(&url("https://example.com.evil.net/")));
-        assert!(!policy.is_allowed(&url("http://erp.example.com/")));
+    fn test_is_allowed_wildcard_rule_admits_strict_subdomains_only() -> TestResult {
+        let policy = policy(&["https://*.example.com"], false)?;
+        assert!(policy.is_allowed(&url("https://erp.example.com/")?));
+        assert!(policy.is_allowed(&url("https://a.b.example.com/")?));
+        assert!(!policy.is_allowed(&url("https://example.com/")?));
+        assert!(!policy.is_allowed(&url("https://notexample.com/")?));
+        assert!(!policy.is_allowed(&url("https://example.com.evil.net/")?));
+        assert!(!policy.is_allowed(&url("http://erp.example.com/")?));
+        Ok(())
     }
 
     #[test]
-    fn test_is_allowed_credentials_in_url_denied() {
-        let policy = policy(&["https://erp.example.com"], false);
-        assert!(!policy.is_allowed(&url("https://user:pw@erp.example.com/")));
-        assert!(!policy.is_allowed(&url("https://user@erp.example.com/")));
+    fn test_is_allowed_credentials_in_url_denied() -> TestResult {
+        let policy = policy(&["https://erp.example.com"], false)?;
+        assert!(!policy.is_allowed(&url("https://user:pw@erp.example.com/")?));
+        assert!(!policy.is_allowed(&url("https://user@erp.example.com/")?));
+        Ok(())
     }
 
     #[test]
-    fn test_is_allowed_hostless_and_non_web_schemes_denied() {
-        let policy = policy(&["https://example.com"], false);
-        assert!(!policy.is_allowed(&url("data:text/plain,hello")));
-        assert!(!policy.is_allowed(&url("about:blank")));
-        assert!(!policy.is_allowed(&url("file:///etc/passwd")));
+    fn test_is_allowed_hostless_and_non_web_schemes_denied() -> TestResult {
+        let policy = policy(&["https://example.com"], false)?;
+        assert!(!policy.is_allowed(&url("data:text/plain,hello")?));
+        assert!(!policy.is_allowed(&url("about:blank")?));
+        assert!(!policy.is_allowed(&url("file:///etc/passwd")?));
+        Ok(())
     }
 
     #[test]
-    fn test_is_allowed_private_hosts_vetoed_even_when_listed() {
+    fn test_is_allowed_private_hosts_vetoed_even_when_listed() -> TestResult {
         let cases = [
             ("http://127.0.0.1:8080", "http://127.0.0.1:8080/"),
             ("http://192.168.1.5", "http://192.168.1.5/"),
-            ("http://169.254.169.254", "http://169.254.169.254/latest/meta-data"),
+            (
+                "http://169.254.169.254",
+                "http://169.254.169.254/latest/meta-data",
+            ),
             ("http://100.64.0.1", "http://100.64.0.1/"),
             ("http://0.0.0.0", "http://0.0.0.0/"),
             ("http://[::1]", "http://[::1]/"),
             ("http://[fd00::1]", "http://[fd00::1]/"),
             ("http://[fe80::1]", "http://[fe80::1]/"),
             ("http://[::ffff:10.0.0.1]", "http://[::ffff:10.0.0.1]/"),
-            ("http://[64:ff9b::a9fe:a9fe]", "http://[64:ff9b::a9fe:a9fe]/"),
+            (
+                "http://[64:ff9b::a9fe:a9fe]",
+                "http://[64:ff9b::a9fe:a9fe]/",
+            ),
             ("http://localhost:8080", "http://localhost:8080/"),
             ("http://localhost.", "http://localhost./"),
             ("http://*.app.localhost", "http://x.app.localhost/"),
         ];
         for (rule, target) in cases {
-            let vetoed = policy(&[rule], true);
-            assert!(!vetoed.is_allowed(&url(target)), "{target} must be vetoed");
-            let open = policy(&[rule], false);
-            assert!(open.is_allowed(&url(target)), "{target} must match {rule} without veto");
+            let vetoed = policy(&[rule], true)?;
+            assert!(!vetoed.is_allowed(&url(target)?), "{target} must be vetoed");
+            let open = policy(&[rule], false)?;
+            assert!(
+                open.is_allowed(&url(target)?),
+                "{target} must match {rule} without veto"
+            );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_is_allowed_public_ip_literal_exact_only() {
-        let policy = policy(&["https://93.184.216.34"], true);
-        assert!(policy.is_allowed(&url("https://93.184.216.34/")));
-        assert!(!policy.is_allowed(&url("https://93.184.216.35/")));
+    fn test_is_allowed_public_ip_literal_exact_only() -> TestResult {
+        let policy = policy(&["https://93.184.216.34"], true)?;
+        assert!(policy.is_allowed(&url("https://93.184.216.34/")?));
+        assert!(!policy.is_allowed(&url("https://93.184.216.35/")?));
+        Ok(())
     }
 
     #[test]
-    fn test_check_returns_origin_not_allowed_without_path() {
-        let policy = policy(&["https://erp.example.com"], true);
-        let error = policy
-            .check(&url("https://evil.com/secret?token=1"))
-            .expect_err("must be denied");
+    fn test_check_returns_origin_not_allowed_without_path() -> TestResult {
+        let policy = policy(&["https://erp.example.com"], true)?;
+        let result = policy.check(&url("https://evil.com/secret?token=1")?);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected("must be denied".to_owned()));
+        };
         match error {
             Error::OriginNotAllowed { origin } => assert_eq!(origin, "https://evil.com"),
-            other => panic!("unexpected error {other}"),
+            other => return Err(TestError::Unexpected(format!("unexpected error {other}"))),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_origin_policy_default_denies_everything() {
+    fn test_origin_policy_default_denies_everything() -> TestResult {
         let policy = OriginPolicy::default();
         assert!(policy.is_empty());
         assert!(policy.deny_private_networks());
-        assert!(!policy.is_allowed(&url("https://example.com/")));
+        assert!(!policy.is_allowed(&url("https://example.com/")?));
+        Ok(())
     }
 
     #[test]
@@ -1275,22 +1302,27 @@ mod tests {
     }
 
     #[test]
-    fn test_origin_policy_new_deduplicates_rules() {
-        let rule = OriginRule::parse("https://a.example").expect("rule");
-        let policy = OriginPolicy::new(vec![rule.clone(), rule], true).expect("policy");
+    fn test_origin_policy_new_deduplicates_rules() -> TestResult {
+        let rule = OriginRule::parse("https://a.example").map_err(ctx("rule"))?;
+        let policy = OriginPolicy::new(vec![rule.clone(), rule], true).map_err(ctx("policy"))?;
         assert_eq!(policy.origins(), vec!["https://a.example".to_owned()]);
+        Ok(())
     }
 
     #[test]
-    fn test_origin_policy_with_private_network_veto_tightens() {
-        let policy = policy(&["http://10.0.0.1"], false).with_private_network_veto();
-        assert!(!policy.is_allowed(&url("http://10.0.0.1/")));
+    fn test_origin_policy_with_private_network_veto_tightens() -> TestResult {
+        let policy = policy(&["http://10.0.0.1"], false)?.with_private_network_veto();
+        assert!(!policy.is_allowed(&url("http://10.0.0.1/")?));
+        Ok(())
     }
 
     #[test]
-    fn test_origin_policy_serde_round_trip_and_strictness() {
-        let policy = policy(&["https://*.example.com", "http://erp.example.com:8080"], true);
-        let json = serde_json::to_value(&policy).expect("serializes");
+    fn test_origin_policy_serde_round_trip_and_strictness() -> TestResult {
+        let policy = policy(
+            &["https://*.example.com", "http://erp.example.com:8080"],
+            true,
+        )?;
+        let json = serde_json::to_value(&policy).map_err(ctx("serializes"))?;
         assert_eq!(
             json,
             serde_json::json!({
@@ -1298,7 +1330,7 @@ mod tests {
                 "deny_private_networks": true
             })
         );
-        let decoded: OriginPolicy = serde_json::from_value(json).expect("deserializes");
+        let decoded: OriginPolicy = serde_json::from_value(json).map_err(ctx("deserializes"))?;
         assert_eq!(decoded, policy);
 
         let unknown = serde_json::json!({"allow": [], "deny_private_networks": true, "extra": 1});
@@ -1306,6 +1338,7 @@ mod tests {
         let bare_host =
             serde_json::json!({"allow": ["example.com"], "deny_private_networks": true});
         assert!(serde_json::from_value::<OriginPolicy>(bare_host).is_err());
+        Ok(())
     }
 
     #[test]
@@ -1337,10 +1370,11 @@ mod tests {
     }
 
     #[test]
-    fn test_browser_limits_serde_rejects_out_of_range_and_unknown_fields() {
+    fn test_browser_limits_serde_rejects_out_of_range_and_unknown_fields() -> TestResult {
         let limits = BrowserLimits::default();
-        let mut json = serde_json::to_value(limits).expect("serializes");
-        let decoded: BrowserLimits = serde_json::from_value(json.clone()).expect("deserializes");
+        let mut json = serde_json::to_value(limits).map_err(ctx("serializes"))?;
+        let decoded: BrowserLimits =
+            serde_json::from_value(json.clone()).map_err(ctx("deserializes"))?;
         assert_eq!(decoded, limits);
 
         json["max_wait_ms"] = serde_json::json!(HARD_MAX_WAIT_MS + 1);
@@ -1348,17 +1382,19 @@ mod tests {
         json["max_wait_ms"] = serde_json::json!(1_000);
         json["unbounded"] = serde_json::json!(true);
         assert!(serde_json::from_value::<BrowserLimits>(json).is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_browser_limits_check_url_len() {
+    fn test_browser_limits_check_url_len() -> TestResult {
         let limits = BrowserLimits::default().with_max_url_bytes(30);
-        assert!(limits.check_url_len(&url("https://a.example/")).is_ok());
+        assert!(limits.check_url_len(&url("https://a.example/")?).is_ok());
         assert!(
             limits
-                .check_url_len(&url("https://a.example/a-very-long-path-over-limit"))
+                .check_url_len(&url("https://a.example/a-very-long-path-over-limit")?)
                 .is_err()
         );
+        Ok(())
     }
 
     #[test]
@@ -1367,7 +1403,10 @@ mod tests {
             let policy = ProfilePolicy::Persistent {
                 binding: bad.to_owned(),
             };
-            assert!(policy.validate().is_err(), "binding {bad:?} must be rejected");
+            assert!(
+                policy.validate().is_err(),
+                "binding {bad:?} must be rejected"
+            );
         }
         let ok = ProfilePolicy::Persistent {
             binding: "sales-team_1.v2".to_owned(),
@@ -1377,7 +1416,14 @@ mod tests {
 
     #[test]
     fn test_viewport_validate_bounds() {
-        assert!(Viewport { width: 1, height: 1 }.validate().is_ok());
+        assert!(
+            Viewport {
+                width: 1,
+                height: 1
+            }
+            .validate()
+            .is_ok()
+        );
         assert!(
             Viewport {
                 width: MAX_VIEWPORT_DIMENSION + 1,
@@ -1389,53 +1435,59 @@ mod tests {
     }
 
     #[test]
-    fn test_open_browser_request_validate_accepts_allowed_start() {
-        assert!(open_request().validate().is_ok());
+    fn test_open_browser_request_validate_accepts_allowed_start() -> TestResult {
+        assert!(open_request()?.validate().is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_open_browser_request_validate_rejects_authentication_origin_as_start() {
-        let mut request = open_request();
-        request.start_url = url("https://sso.example.net/login");
+    fn test_open_browser_request_validate_rejects_authentication_origin_as_start() -> TestResult {
+        let mut request = open_request()?;
+        request.start_url = url("https://sso.example.net/login")?;
         assert!(matches!(
             request.validate(),
             Err(Error::OriginNotAllowed { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_open_browser_request_navigation_vs_observed_location() {
-        let request = open_request();
-        let sso = url("https://sso.example.net/authorize");
+    fn test_open_browser_request_navigation_vs_observed_location() -> TestResult {
+        let request = open_request()?;
+        let sso = url("https://sso.example.net/authorize")?;
         assert!(request.check_navigation_target(&sso).is_err());
         assert!(request.check_observed_location(&sso).is_ok());
-        let evil = url("https://evil.example.org/");
+        let evil = url("https://evil.example.org/")?;
         assert!(request.check_navigation_target(&evil).is_err());
         assert!(request.check_observed_location(&evil).is_err());
         assert!(
             request
-                .check_navigation_target(&url("https://erp.example.com/next"))
+                .check_navigation_target(&url("https://erp.example.com/next")?)
                 .is_ok()
         );
+        Ok(())
     }
 
     #[test]
-    fn test_open_browser_request_serde_round_trip_and_unknown_field_rejected() {
-        let request = open_request();
-        let mut json = serde_json::to_value(&request).expect("request serializes");
+    fn test_open_browser_request_serde_round_trip_and_unknown_field_rejected() -> TestResult {
+        let request = open_request()?;
+        let mut json = serde_json::to_value(&request).map_err(ctx("request serializes"))?;
         let decoded: OpenBrowserRequest =
-            serde_json::from_value(json.clone()).expect("request deserializes");
+            serde_json::from_value(json.clone()).map_err(ctx("request deserializes"))?;
         assert_eq!(decoded, request);
 
         json["upload_root"] = serde_json::json!("/home");
         assert!(serde_json::from_value::<OpenBrowserRequest>(json).is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_profile_policy_ephemeral_serde_json_round_trip() {
+    fn test_profile_policy_ephemeral_serde_json_round_trip() -> TestResult {
         let policy = ProfilePolicy::Ephemeral;
-        let json = serde_json::to_string(&policy).expect("policy serializes");
-        let decoded: ProfilePolicy = serde_json::from_str(&json).expect("policy deserializes");
+        let json = serde_json::to_string(&policy).map_err(ctx("policy serializes"))?;
+        let decoded: ProfilePolicy =
+            serde_json::from_str(&json).map_err(ctx("policy deserializes"))?;
         assert_eq!(decoded, policy);
+        Ok(())
     }
 }

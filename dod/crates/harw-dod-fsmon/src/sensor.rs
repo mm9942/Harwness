@@ -122,7 +122,11 @@ impl FsMonSensor {
     /// );
     /// ```
     #[must_use]
-    pub fn new(handle: SensorHandle<Bound>, source: Box<dyn FsEventSource>, proc_root: PathBuf) -> Self {
+    pub fn new(
+        handle: SensorHandle<Bound>,
+        source: Box<dyn FsEventSource>,
+        proc_root: PathBuf,
+    ) -> Self {
         Self {
             handle,
             source,
@@ -162,7 +166,13 @@ impl Sensor for FsMonSensor {
 
         let mut events = Vec::with_capacity(raw_events.len());
         for raw in &raw_events {
-            match shape_event(raw, self.handle.scope(), &self.proc_root, self.handle.id(), now) {
+            match shape_event(
+                raw,
+                self.handle.scope(),
+                &self.proc_root,
+                self.handle.id(),
+                now,
+            ) {
                 Ok(Some(event)) => events.push(event),
                 Ok(None) => {}
                 Err(_) => {
@@ -191,19 +201,26 @@ mod tests {
 
     use super::FsMonSensor;
     use crate::raw::{FixtureFsEventSource, RawFsEvent};
+    use crate::test_support::{TestResult, ctx};
 
     fn handle_for(scope: ReadScope) -> SensorHandle<harw_dod_cap::Bound> {
-        SensorHandle::new(SensorId::from_str("fsmon-test"), Capability::WatchFilesystem).bind(scope)
+        SensorHandle::new(
+            SensorId::from_str("fsmon-test"),
+            Capability::WatchFilesystem,
+        )
+        .bind(scope)
     }
 
     #[test]
     fn test_capability_is_watch_filesystem() {
-        let handle = handle_for(ReadScope::from_roots([Path::new("/srv/data").to_path_buf()]));
+        let handle = handle_for(ReadScope::from_roots(
+            [Path::new("/srv/data").to_path_buf()],
+        ));
         assert_eq!(handle.capability(), Capability::WatchFilesystem);
     }
 
     #[test]
-    fn test_poll_shapes_fixture_events_into_security_events() {
+    fn test_poll_shapes_fixture_events_into_security_events() -> TestResult {
         let scope = ReadScope::from_roots([Path::new("/srv/data").to_path_buf()]);
         let source = FixtureFsEventSource::new(vec![RawFsEvent {
             mask: 0x08,
@@ -215,15 +232,19 @@ mod tests {
 
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("Fixture-Quelle scheitert nie");
+            .map_err(ctx("Fixture-Quelle scheitert nie"))?;
 
         assert_eq!(reading.samples.len(), 0);
         assert_eq!(reading.events.len(), 1);
-        assert!(matches!(reading.events[0].kind, EventKind::FileWrite { .. }));
+        assert!(matches!(
+            reading.events[0].kind,
+            EventKind::FileWrite { .. }
+        ));
+        Ok(())
     }
 
     #[test]
-    fn test_poll_drops_events_outside_scope() {
+    fn test_poll_drops_events_outside_scope() -> TestResult {
         let scope = ReadScope::from_roots([Path::new("/srv/data").to_path_buf()]);
         let source = FixtureFsEventSource::new(vec![RawFsEvent {
             mask: 0x08,
@@ -235,16 +256,17 @@ mod tests {
 
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("Formung selbst schlägt hier nicht fehl");
+            .map_err(ctx("Formung selbst schlägt hier nicht fehl"))?;
 
         assert!(reading.events.is_empty());
+        Ok(())
     }
 
     /// Vor dieser Korrektur ließ ein einzelnes nicht interpretierbares
     /// Ereignis den gesamten Abruf scheitern — jetzt wird es stillschweigend
     /// übersprungen, ohne dass `poll` einen Fehler zurückgibt.
     #[test]
-    fn test_poll_skips_unrecognized_event_shape_instead_of_failing() {
+    fn test_poll_skips_unrecognized_event_shape_instead_of_failing() -> TestResult {
         let scope = ReadScope::from_roots([Path::new("/srv/data").to_path_buf()]);
         let source = FixtureFsEventSource::new(vec![RawFsEvent {
             mask: 0x01, // FAN_ACCESS: kein Schreibzugriff, nicht interpretierbar
@@ -254,18 +276,19 @@ mod tests {
         }]);
         let sensor = FsMonSensor::new(handle_for(scope), Box::new(source), PathBuf::from("/proc"));
 
-        let reading = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect("eine einzelne nicht interpretierbare Ereignisform darf den Abruf nicht scheitern lassen");
+        let reading = sensor.poll(Timestamp::UNIX_EPOCH).map_err(ctx(
+            "eine einzelne nicht interpretierbare Ereignisform darf den Abruf nicht scheitern lassen",
+        ))?;
 
         assert!(reading.events.is_empty());
+        Ok(())
     }
 
     /// Kernbeleg der Korrektur: ein nicht interpretierbares Ereignis darf
     /// nicht auch die anderen, gültig geformten Ereignisse derselben Charge
     /// mit verwerfen.
     #[test]
-    fn test_poll_reports_valid_event_alongside_a_skipped_unrecognized_one() {
+    fn test_poll_reports_valid_event_alongside_a_skipped_unrecognized_one() -> TestResult {
         let scope = ReadScope::from_roots([Path::new("/srv/data").to_path_buf()]);
         let source = FixtureFsEventSource::new(vec![
             RawFsEvent {
@@ -283,16 +306,20 @@ mod tests {
         ]);
         let sensor = FsMonSensor::new(handle_for(scope), Box::new(source), PathBuf::from("/proc"));
 
-        let reading = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect("das gültige Ereignis darf den Abruf nicht scheitern lassen");
+        let reading = sensor.poll(Timestamp::UNIX_EPOCH).map_err(ctx(
+            "das gültige Ereignis darf den Abruf nicht scheitern lassen",
+        ))?;
 
         assert_eq!(
             reading.events.len(),
             1,
             "genau das gültige Ereignis muss ankommen, das übersprungene nicht"
         );
-        assert!(matches!(reading.events[0].kind, EventKind::FileWrite { .. }));
+        assert!(matches!(
+            reading.events[0].kind,
+            EventKind::FileWrite { .. }
+        ));
+        Ok(())
     }
 
     #[test]

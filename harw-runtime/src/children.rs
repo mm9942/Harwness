@@ -136,9 +136,10 @@ pub fn max_concurrent_instances_for_role(
     role: &str,
     definitions: &HashMap<String, ExecutableAgentIr>,
 ) -> usize {
-    let organizational_role = definitions
-        .get(role)
-        .map_or(harw_agent_dsl::roles::AgentRoleId::Worker, ExecutableAgentIr::role);
+    let organizational_role = definitions.get(role).map_or(
+        harw_agent_dsl::roles::AgentRoleId::Worker,
+        ExecutableAgentIr::role,
+    );
     if organizational_role == harw_agent_dsl::roles::AgentRoleId::UiaWorker {
         1
     } else {
@@ -420,7 +421,10 @@ impl RuntimeChildRegistryFactory {
     /// - `profile_agents_dir` (`Option<std::path::PathBuf>`): typischerweise
     ///   `profile_dir(home, profile_name).ok().map(|dir| dir.join("agents"))`.
     #[must_use]
-    pub fn with_profile_agents_dir(mut self, profile_agents_dir: Option<std::path::PathBuf>) -> Self {
+    pub fn with_profile_agents_dir(
+        mut self,
+        profile_agents_dir: Option<std::path::PathBuf>,
+    ) -> Self {
         self.profile_agents_dir = profile_agents_dir;
         self
     }
@@ -458,7 +462,10 @@ impl RuntimeChildRegistryFactory {
     ///   Konfiguration, aus der auch [`resolve_internal_models_for_children`]
     ///   gespeist wird.
     #[must_use]
-    pub fn with_reasoning_effort_config(mut self, config: Arc<harw_config::ResolvedConfig>) -> Self {
+    pub fn with_reasoning_effort_config(
+        mut self,
+        config: Arc<harw_config::ResolvedConfig>,
+    ) -> Self {
         self.reasoning_effort_config = Some(config);
         self
     }
@@ -499,7 +506,11 @@ impl RuntimeChildRegistryFactory {
     /// - `model` (`Option<String>`): die Modell-ID des effektiven
     ///   Hauptmodells dieser Fabrik, oder `None`.
     #[must_use]
-    pub fn with_main_model_selection(mut self, provider: Option<String>, model: Option<String>) -> Self {
+    pub fn with_main_model_selection(
+        mut self,
+        provider: Option<String>,
+        model: Option<String>,
+    ) -> Self {
         self.main_model_selection = Some((provider, model));
         self
     }
@@ -565,7 +576,10 @@ impl RuntimeChildRegistryFactory {
     fn reasoning_effort_defaults_for_point(
         &self,
         point: InternalModelPoint,
-    ) -> (Option<harw_types::ReasoningEffort>, Option<harw_types::ReasoningEffort>) {
+    ) -> (
+        Option<harw_types::ReasoningEffort>,
+        Option<harw_types::ReasoningEffort>,
+    ) {
         let Some(config) = self.reasoning_effort_config.as_deref() else {
             return (None, None);
         };
@@ -610,14 +624,21 @@ impl RuntimeChildRegistryFactory {
     /// Gemeinsame Hilfsfunktion für [`ChildRegistryFactory::model_for`] und
     /// [`ChildRegistryFactory::model_for_task`], damit beide dieselbe
     /// Pinning-Logik nutzen und nicht auseinanderlaufen.
-    fn pinned_model_for_point(&self, role: &str, point: InternalModelPoint) -> Arc<dyn ModelProvider> {
+    fn pinned_model_for_point(
+        &self,
+        role: &str,
+        point: InternalModelPoint,
+    ) -> Arc<dyn ModelProvider> {
         let Some(resolved) = self.internal_models.get(&point) else {
             return Arc::clone(&self.model);
         };
         if resolved.is_main_model() {
             return Arc::clone(&self.model);
         }
-        let provider_id = resolved.provider.as_deref().map(harw_types::ProviderId::from);
+        let provider_id = resolved
+            .provider
+            .as_deref()
+            .map(harw_types::ProviderId::from);
         let model_id = resolved.model.as_deref().map(harw_types::ModelId::from);
         tracing::debug!(
             role,
@@ -669,7 +690,10 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             // unbekannte Rolle scheitert oben bereits an `profile_for_role`,
             // eine bekannte Rolle ohne eingebaute Definition (repo-lokal)
             // bleibt bewusst `None` — kein Rollen-Regelwerk ohne Rolle.
-            organizational_role: self.builtin_definitions.get(role).map(ExecutableAgentIr::role),
+            organizational_role: self
+                .builtin_definitions
+                .get(role)
+                .map(ExecutableAgentIr::role),
             ..IdentityOverrides::default()
         };
         // Eine Kette je Kind: `for_child` löst die Modus-Zelle
@@ -691,19 +715,20 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         // `self.sandbox_profile`/`self.host_permit_wiring` — ohne
         // [`Self::with_host_permits`] bleiben das `SandboxProfile::Strict`/
         // `None` und das Verhalten ist bit-identisch zu vorher.
-        let assembled = assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits(
-            profile,
-            &self.project,
-            overrides,
-            child_chain.mode().clone(),
-            &profile.required_permissions(),
-            None,
-            &self.sandbox_profile,
-            self.host_permit_wiring.clone(),
-        )
-        .map_err(|error| AgentSpawnError {
-            message: format!("could not assemble child registry for role '{role}': {error}"),
-        })?;
+        let assembled =
+            assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits(
+                profile,
+                &self.project,
+                overrides,
+                child_chain.mode().clone(),
+                &profile.required_permissions(),
+                None,
+                &self.sandbox_profile,
+                self.host_permit_wiring.clone(),
+            )
+            .map_err(|error| AgentSpawnError {
+                message: format!("could not assemble child registry for role '{role}': {error}"),
+            })?;
         // `install_over_default`, nicht `install`:
         // `assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits`
         // hat die `DefaultApprovalPolicy` über `child_chain.mode()` bereits
@@ -826,7 +851,10 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
     fn reasoning_effort_defaults_for_role(
         &self,
         role: &str,
-    ) -> (Option<harw_types::ReasoningEffort>, Option<harw_types::ReasoningEffort>) {
+    ) -> (
+        Option<harw_types::ReasoningEffort>,
+        Option<harw_types::ReasoningEffort>,
+    ) {
         let Some(point) = internal_point_for_role(role) else {
             return (None, None);
         };
@@ -849,7 +877,10 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         &self,
         role: &str,
         complexity: Option<harw_core::TaskComplexity>,
-    ) -> (Option<harw_types::ReasoningEffort>, Option<harw_types::ReasoningEffort>) {
+    ) -> (
+        Option<harw_types::ReasoningEffort>,
+        Option<harw_types::ReasoningEffort>,
+    ) {
         if let Some(point) = internal_point_for_role(role) {
             return self.reasoning_effort_defaults_for_point(point);
         }
@@ -927,7 +958,10 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         })?;
         let overrides = IdentityOverrides {
             agent_name: Some(role.to_owned()),
-            organizational_role: self.builtin_definitions.get(role).map(ExecutableAgentIr::role),
+            organizational_role: self
+                .builtin_definitions
+                .get(role)
+                .map(ExecutableAgentIr::role),
             ..IdentityOverrides::default()
         };
         let child_chain = self.chain.for_child();
@@ -1001,13 +1035,13 @@ impl AgentSpawner for DeferredManagedSpawner {
         suggestions: Option<harw_catalog::AgentSuggestions>,
     ) -> SpawnFuture<'a> {
         Box::pin(async move {
-            let spawner = self
-                .slot
-                .get()
-                .and_then(Weak::upgrade)
-                .ok_or_else(|| AgentSpawnError {
-                    message: "managed child spawner is not available".to_owned(),
-                })?;
+            let spawner =
+                self.slot
+                    .get()
+                    .and_then(Weak::upgrade)
+                    .ok_or_else(|| AgentSpawnError {
+                        message: "managed child spawner is not available".to_owned(),
+                    })?;
             spawner.spawn_child(role, input, sandbox, suggestions).await
         })
     }
@@ -1046,6 +1080,7 @@ impl AgentSpawner for DeferredManagedSpawner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn internal_point_for_role_maps_explorer() {
@@ -1146,13 +1181,13 @@ mod tests {
 
     /// Die gesenkten eingebauten Rollen einer leeren Konfiguration — dieselbe
     /// Quelle, die `assembly.rs::build_spawner` für `definitions` benutzt.
-    fn builtin_definitions() -> HashMap<String, ExecutableAgentIr> {
-        builtin_agent_definitions(&HashMap::new()).expect("eingebaute Rollen senken")
+    fn builtin_definitions() -> TestResult<HashMap<String, ExecutableAgentIr>> {
+        builtin_agent_definitions(&HashMap::new()).map_err(ctx("eingebaute Rollen senken"))
     }
 
     #[test]
-    fn max_concurrent_instances_for_role_caps_the_entire_uia_worker_family_at_one() {
-        let definitions = builtin_definitions();
+    fn max_concurrent_instances_for_role_caps_the_entire_uia_worker_family_at_one() -> TestResult {
+        let definitions = builtin_definitions()?;
         for role in [
             role_names::UIA_WORKER,
             role_names::UIA_EXPLORER,
@@ -1165,11 +1200,12 @@ mod tests {
                 "role {role} (AgentRoleId::UiaWorker) must never fan out beyond one instance"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn max_concurrent_instances_for_role_leaves_other_roles_unbounded() {
-        let definitions = builtin_definitions();
+    fn max_concurrent_instances_for_role_leaves_other_roles_unbounded() -> TestResult {
+        let definitions = builtin_definitions()?;
         for role in [
             role_names::EXPLORER,
             role_names::PLANNER,
@@ -1183,6 +1219,7 @@ mod tests {
                 "role {role} must not be capped by the uia-worker singleton rule"
             );
         }
+        Ok(())
     }
 
     // -------------------------------------------------------------------
@@ -1211,8 +1248,14 @@ mod tests {
         )
     }
 
-    fn test_provider_toml(default_reasoning_effort: Option<&str>) -> harw_config::ProviderToml {
-        harw_config::ProviderToml {
+    fn test_provider_toml(
+        default_reasoning_effort: Option<&str>,
+    ) -> TestResult<harw_config::ProviderToml> {
+        let default_reasoning_effort = default_reasoning_effort
+            .map(|label| label.parse())
+            .transpose()
+            .map_err(ctx("test fixture uses a valid ReasoningEffort label"))?;
+        Ok(harw_config::ProviderToml {
             name: "acme".to_owned(),
             api: "openai-chat".to_owned(),
             base_url: "https://example.invalid/v1".to_owned(),
@@ -1226,16 +1269,19 @@ mod tests {
             rate_limit: None,
             max_concurrency: None,
             originator: None,
-            default_reasoning_effort: default_reasoning_effort.map(|label| {
-                label
-                    .parse()
-                    .expect("test fixture uses a valid ReasoningEffort label")
-            }),
-        }
+            default_reasoning_effort,
+            gateway_identity_headers: false,
+        })
     }
 
-    fn test_model_toml(default_reasoning_effort: Option<&str>) -> harw_config::ModelToml {
-        harw_config::ModelToml {
+    fn test_model_toml(
+        default_reasoning_effort: Option<&str>,
+    ) -> TestResult<harw_config::ModelToml> {
+        let default_reasoning_effort = default_reasoning_effort
+            .map(|label| label.parse())
+            .transpose()
+            .map_err(ctx("test fixture uses a valid ReasoningEffort label"))?;
+        Ok(harw_config::ModelToml {
             id: "acme-model".to_owned(),
             name: None,
             provider: "acme".to_owned(),
@@ -1246,12 +1292,8 @@ mod tests {
             reasoning: false,
             input_types: Vec::new(),
             capabilities: Default::default(),
-            default_reasoning_effort: default_reasoning_effort.map(|label| {
-                label
-                    .parse()
-                    .expect("test fixture uses a valid ReasoningEffort label")
-            }),
-        }
+            default_reasoning_effort,
+        })
     }
 
     /// Baut eine Fabrik mit genau einer aufgelösten internen Modellstelle
@@ -1260,14 +1302,14 @@ mod tests {
     fn factory_with_worker_complex_effort_defaults(
         provider_effort: Option<&str>,
         model_effort: Option<&str>,
-    ) -> RuntimeChildRegistryFactory {
+    ) -> TestResult<RuntimeChildRegistryFactory> {
         let mut config = harw_config::ResolvedConfig::default();
         config
             .providers
-            .insert("acme".to_owned(), test_provider_toml(provider_effort));
+            .insert("acme".to_owned(), test_provider_toml(provider_effort)?);
         config
             .models
-            .insert("acme-model".to_owned(), test_model_toml(model_effort));
+            .insert("acme-model".to_owned(), test_model_toml(model_effort)?);
 
         let chain = test_chain(&config);
         let mut internal_models = HashMap::new();
@@ -1281,57 +1323,64 @@ mod tests {
             },
         );
 
-        RuntimeChildRegistryFactory::new(
+        Ok(RuntimeChildRegistryFactory::new(
             test_project(),
             Arc::new(harw_core::EchoModelProvider::new("echo")),
             chain,
         )
-        .expect("factory builds")
+        .map_err(ctx("factory builds"))?
         .with_internal_models(internal_models)
-        .with_reasoning_effort_config(Arc::new(config))
+        .with_reasoning_effort_config(Arc::new(config)))
     }
 
     #[test]
-    fn reasoning_effort_defaults_for_role_task_uses_worker_complex_point_for_agent_steward() {
+    fn reasoning_effort_defaults_for_role_task_uses_worker_complex_point_for_agent_steward()
+    -> TestResult {
         // `agent-steward` maps directly to `InternalModelPoint::WorkerComplex`
         // (see `internal_point_for_role_maps_agent_steward_to_worker_complex`),
         // so it exercises the point-lookup path without needing to guess a
         // `TaskComplexity`.
-        let factory = factory_with_worker_complex_effort_defaults(Some("high"), Some("low"));
+        let factory = factory_with_worker_complex_effort_defaults(Some("high"), Some("low"))?;
         let (provider_default, model_default) =
             factory.reasoning_effort_defaults_for_role_task(role_names::AGENT_STEWARD, None);
         assert_eq!(provider_default, Some(harw_types::ReasoningEffort::High));
         assert_eq!(model_default, Some(harw_types::ReasoningEffort::Low));
+        Ok(())
     }
 
     #[test]
-    fn reasoning_effort_defaults_for_role_task_selects_worker_complex_for_complex_worker() {
-        let factory = factory_with_worker_complex_effort_defaults(Some("xhigh"), None);
+    fn reasoning_effort_defaults_for_role_task_selects_worker_complex_for_complex_worker()
+    -> TestResult {
+        let factory = factory_with_worker_complex_effort_defaults(Some("xhigh"), None)?;
         let (provider_default, model_default) = factory.reasoning_effort_defaults_for_role_task(
             role_names::EXECUTOR,
             Some(harw_core::TaskComplexity::Complex),
         );
         assert_eq!(provider_default, Some(harw_types::ReasoningEffort::Xhigh));
         assert_eq!(model_default, None);
+        Ok(())
     }
 
     #[test]
-    fn reasoning_effort_defaults_for_role_task_yields_none_for_worker_simple_when_only_complex_is_configured() {
+    fn reasoning_effort_defaults_for_role_task_yields_none_for_worker_simple_when_only_complex_is_configured()
+    -> TestResult {
         // Only `WorkerComplex` was given a resolved model in the fixture —
         // `WorkerSimple` stays unresolved, so a simple-complexity worker must
         // fall through to (None, None), not accidentally inherit the
         // complex-tier defaults.
-        let factory = factory_with_worker_complex_effort_defaults(Some("xhigh"), Some("xhigh"));
+        let factory = factory_with_worker_complex_effort_defaults(Some("xhigh"), Some("xhigh"))?;
         let (provider_default, model_default) = factory.reasoning_effort_defaults_for_role_task(
             role_names::EXECUTOR,
             Some(harw_core::TaskComplexity::Simple),
         );
         assert_eq!(provider_default, None);
         assert_eq!(model_default, None);
+        Ok(())
     }
 
     #[test]
-    fn reasoning_effort_defaults_for_role_task_yields_none_without_reasoning_effort_config() {
+    fn reasoning_effort_defaults_for_role_task_yields_none_without_reasoning_effort_config()
+    -> TestResult {
         let chain = test_chain(&harw_config::ResolvedConfig::default());
         let mut internal_models = HashMap::new();
         internal_models.insert(
@@ -1348,26 +1397,28 @@ mod tests {
             Arc::new(harw_core::EchoModelProvider::new("echo")),
             chain,
         )
-        .expect("factory builds")
+        .map_err(ctx("factory builds"))?
         .with_internal_models(internal_models);
         // `with_reasoning_effort_config` was never called.
         let (provider_default, model_default) =
             factory.reasoning_effort_defaults_for_role_task(role_names::AGENT_STEWARD, None);
         assert_eq!(provider_default, None);
         assert_eq!(model_default, None);
+        Ok(())
     }
 
     #[test]
-    fn reasoning_effort_defaults_for_role_task_yields_none_for_main_model_fallback() {
+    fn reasoning_effort_defaults_for_role_task_yields_none_for_main_model_fallback() -> TestResult {
         // A role with no builtin `TaskComplexity`-mapped point and no
         // internal-model-point override falls back to the parent's main
         // model — whose provider/model id this factory does not track (see
         // field doc on `reasoning_effort_config`).
-        let factory = factory_with_worker_complex_effort_defaults(Some("high"), Some("high"));
+        let factory = factory_with_worker_complex_effort_defaults(Some("high"), Some("high"))?;
         let (provider_default, model_default) =
             factory.reasoning_effort_defaults_for_role_task(role_names::PLANNER, None);
         assert_eq!(provider_default, None);
         assert_eq!(model_default, None);
+        Ok(())
     }
 
     // -------------------------------------------------------------------
@@ -1381,7 +1432,7 @@ mod tests {
     /// liefert) über der übergebenen Config.
     fn factory_with_explorer_main_model_fallback(
         config: harw_config::ResolvedConfig,
-    ) -> RuntimeChildRegistryFactory {
+    ) -> TestResult<RuntimeChildRegistryFactory> {
         let chain = test_chain(&config);
         let mut internal_models = HashMap::new();
         internal_models.insert(
@@ -1393,19 +1444,19 @@ mod tests {
                 source: harw_config::InternalModelSource::MainModel,
             },
         );
-        RuntimeChildRegistryFactory::new(
+        Ok(RuntimeChildRegistryFactory::new(
             test_project(),
             Arc::new(harw_core::EchoModelProvider::new("echo")),
             chain,
         )
-        .expect("factory builds")
+        .map_err(ctx("factory builds"))?
         .with_internal_models(internal_models)
-        .with_reasoning_effort_config(Arc::new(config))
+        .with_reasoning_effort_config(Arc::new(config)))
     }
 
     #[test]
     fn reasoning_effort_defaults_for_role_uses_provider_default_for_main_model_fallback_without_selection()
-     {
+    -> TestResult {
         // Ohne `with_main_model_selection` leitet der Hauptmodell-Fallback
         // Provider/Modell aus `config.harness.default_provider`/
         // `default_model` ab — derselbe Default, den die Hauptfabrik trägt.
@@ -1413,17 +1464,18 @@ mod tests {
         config.harness.default_provider = Some("acme".to_owned());
         config
             .providers
-            .insert("acme".to_owned(), test_provider_toml(Some("high")));
-        let factory = factory_with_explorer_main_model_fallback(config);
+            .insert("acme".to_owned(), test_provider_toml(Some("high"))?);
+        let factory = factory_with_explorer_main_model_fallback(config)?;
         let (provider_default, model_default) =
             factory.reasoning_effort_defaults_for_role(role_names::EXPLORER);
         assert_eq!(provider_default, Some(harw_types::ReasoningEffort::High));
         assert_eq!(model_default, None);
+        Ok(())
     }
 
     #[test]
     fn reasoning_effort_defaults_for_role_uses_model_default_for_main_model_fallback_when_provider_has_none()
-     {
+    -> TestResult {
         // `with_main_model_selection` liefert eine ausdrückliche Auswahl (wie
         // die UIA-Worker-Fabrik sie über `uia_provider`/`uia_worker_model`
         // setzt): der Provider ist konfiguriert, trägt aber kein
@@ -1431,22 +1483,24 @@ mod tests {
         let mut config = harw_config::ResolvedConfig::default();
         config
             .providers
-            .insert("acme".to_owned(), test_provider_toml(None));
+            .insert("acme".to_owned(), test_provider_toml(None)?);
         config
             .models
-            .insert("acme-model".to_owned(), test_model_toml(Some("low")));
-        let factory = factory_with_explorer_main_model_fallback(config)
+            .insert("acme-model".to_owned(), test_model_toml(Some("low"))?);
+        let factory = factory_with_explorer_main_model_fallback(config)?
             .with_main_model_selection(Some("acme".to_owned()), Some("acme-model".to_owned()));
         let (provider_default, model_default) =
             factory.reasoning_effort_defaults_for_role(role_names::EXPLORER);
         assert_eq!(provider_default, None);
         assert_eq!(model_default, Some(harw_types::ReasoningEffort::Low));
+        Ok(())
     }
 
     #[test]
-    fn reasoning_effort_defaults_for_role_yields_none_for_unknown_main_model_provider_and_model() {
+    fn reasoning_effort_defaults_for_role_yields_none_for_unknown_main_model_provider_and_model()
+    -> TestResult {
         let config = harw_config::ResolvedConfig::default();
-        let factory = factory_with_explorer_main_model_fallback(config).with_main_model_selection(
+        let factory = factory_with_explorer_main_model_fallback(config)?.with_main_model_selection(
             Some("missing-provider".to_owned()),
             Some("missing-model".to_owned()),
         );
@@ -1454,6 +1508,7 @@ mod tests {
             factory.reasoning_effort_defaults_for_role(role_names::EXPLORER);
         assert_eq!(provider_default, None);
         assert_eq!(model_default, None);
+        Ok(())
     }
 
     // -------------------------------------------------------------------
@@ -1462,7 +1517,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn with_host_permits_defaults_to_strict_and_none_without_call() {
+    fn with_host_permits_defaults_to_strict_and_none_without_call() -> TestResult {
         let config = harw_config::ResolvedConfig::default();
         let chain = test_chain(&config);
         let factory = RuntimeChildRegistryFactory::new(
@@ -1470,13 +1525,17 @@ mod tests {
             Arc::new(harw_core::EchoModelProvider::new("echo")),
             chain,
         )
-        .expect("factory builds");
-        assert_eq!(factory.sandbox_profile, harw_sandbox::SandboxProfile::Strict);
+        .map_err(ctx("factory builds"))?;
+        assert_eq!(
+            factory.sandbox_profile,
+            harw_sandbox::SandboxProfile::Strict
+        );
         assert!(factory.host_permit_wiring.is_none());
+        Ok(())
     }
 
     #[test]
-    fn with_host_permits_stores_sandbox_profile_and_wiring_when_called() {
+    fn with_host_permits_stores_sandbox_profile_and_wiring_when_called() -> TestResult {
         let config = harw_config::ResolvedConfig::default();
         let chain = test_chain(&config);
         let ledger = Arc::new(harw_sandbox::ProcessPermitLedger::default());
@@ -1495,10 +1554,11 @@ mod tests {
             Arc::new(harw_core::EchoModelProvider::new("echo")),
             chain,
         )
-        .expect("factory builds")
+        .map_err(ctx("factory builds"))?
         .with_host_permits(harw_sandbox::SandboxProfile::Host, Some(wiring));
 
         assert_eq!(factory.sandbox_profile, harw_sandbox::SandboxProfile::Host);
         assert!(factory.host_permit_wiring.is_some());
+        Ok(())
     }
 }

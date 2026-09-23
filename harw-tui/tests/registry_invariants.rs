@@ -14,6 +14,9 @@ use harw_tui::{
 };
 use std::collections::BTreeMap;
 
+mod common;
+use common::{TestError, TestResult, ctx};
+
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
 /// Builds a fresh OperationRegistry populated by `harw_ops::register_all`.
@@ -41,9 +44,9 @@ fn tui_operator_ctx() -> DispatchContext {
 /// A missing entry causes "command exists but TUI can't see it" — the primary
 /// bug class this suite guards against.
 #[test]
-fn every_op_with_command_surface_appears_in_tui_registry() {
+fn every_op_with_command_surface_appears_in_tui_registry() -> TestResult {
     let ops = build_ops();
-    let tui = CommandRegistry::built_in();
+    let tui = CommandRegistry::built_in().map_err(ctx("built_in"))?;
 
     for op in ops.iter() {
         let meta = op.meta();
@@ -60,6 +63,7 @@ fn every_op_with_command_surface_appears_in_tui_registry() {
             }
         }
     }
+    Ok(())
 }
 
 // ── Test 2 ────────────────────────────────────────────────────────────────────
@@ -72,7 +76,7 @@ fn every_op_with_command_surface_appears_in_tui_registry() {
 /// - alias used by two different ops
 /// - alias of op A equals the primary name of op B (and A ≠ B)
 #[test]
-fn alias_uniqueness_across_all_ops() {
+fn alias_uniqueness_across_all_ops() -> TestResult {
     let ops = build_ops();
 
     // First pass: collect all primary names.
@@ -92,22 +96,22 @@ fn alias_uniqueness_across_all_ops() {
             // Check: alias must not equal a *different* op's primary name.
             if let Some(&other_name) = name_to_op.get(&alias_s) {
                 if other_name != meta.name {
-                    panic!(
+                    return Err(TestError::Unexpected(format!(
                         "alias '{alias}' of op '{}' clashes with the primary command \
                          name of op '{other_name}'",
                         meta.name,
-                    );
+                    )));
                 }
             }
 
             // Check: alias must not already be claimed by a different op.
             match alias_owner.get(&alias_s).copied() {
                 Some(prev) if prev != meta.name => {
-                    panic!(
+                    return Err(TestError::Unexpected(format!(
                         "alias '{alias}' is claimed by both op '{prev}' and op '{}' — \
                          aliases must be globally unique across the op set",
                         meta.name,
-                    );
+                    )));
                 }
                 _ => {
                     alias_owner.insert(alias_s, meta.name);
@@ -115,6 +119,7 @@ fn alias_uniqueness_across_all_ops() {
             }
         }
     }
+    Ok(())
 }
 
 // ── Test 3 ────────────────────────────────────────────────────────────────────
@@ -135,20 +140,21 @@ fn alias_uniqueness_across_all_ops() {
 /// assertions accordingly or relax to `.is_some()`.
 // No #[ignore] needed — the prefix heuristic is implemented and exercised below.
 #[test]
-fn unknown_command_returns_suggestion_for_near_miss_typo() {
-    let registry = CommandRegistry::built_in();
+fn unknown_command_returns_suggestion_for_near_miss_typo() -> TestResult {
+    let registry = CommandRegistry::built_in().map_err(common::ctx("built_in"))?;
     let ctx = tui_operator_ctx();
 
     // "modl" — first char 'm', nearest-length match among 'm'-prefixed ops is "model".
-    let err_modl = registry
-        .dispatch(
-            ctx,
-            Invocation::Command {
-                name: "modl".to_owned(),
-                raw_args: vec![],
-            },
-        )
-        .unwrap_err();
+    let result_modl = registry.dispatch(
+        ctx,
+        Invocation::Command {
+            name: "modl".to_owned(),
+            raw_args: vec![],
+        },
+    );
+    let Err(err_modl) = result_modl else {
+        return Err(TestError::Unexpected("Err erwartet".into()));
+    };
 
     match &err_modl {
         CommandError::UnknownCommand { suggestion, input } => {
@@ -163,19 +169,24 @@ fn unknown_command_returns_suggestion_for_near_miss_typo() {
                  update this assertion"
             );
         }
-        other => panic!("expected UnknownCommand, got: {other:?}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "expected UnknownCommand, got: {other:?}"
+            )));
+        }
     }
 
     // "providr" — first char 'p', nearest-length to "provider" (len 8 vs 7 → diff 1).
-    let err_providr = registry
-        .dispatch(
-            ctx,
-            Invocation::Command {
-                name: "providr".to_owned(),
-                raw_args: vec![],
-            },
-        )
-        .unwrap_err();
+    let result_providr = registry.dispatch(
+        ctx,
+        Invocation::Command {
+            name: "providr".to_owned(),
+            raw_args: vec![],
+        },
+    );
+    let Err(err_providr) = result_providr else {
+        return Err(TestError::Unexpected("Err erwartet".into()));
+    };
 
     match &err_providr {
         CommandError::UnknownCommand { suggestion, input } => {
@@ -186,8 +197,13 @@ fn unknown_command_returns_suggestion_for_near_miss_typo() {
                  got None"
             );
         }
-        other => panic!("expected UnknownCommand, got: {other:?}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "expected UnknownCommand, got: {other:?}"
+            )));
+        }
     }
+    Ok(())
 }
 
 // ── Test 4 ────────────────────────────────────────────────────────────────────
@@ -201,19 +217,19 @@ fn unknown_command_returns_suggestion_for_near_miss_typo() {
 /// category. This test only asserts the three known Model-category ops are
 /// correctly tagged.
 #[test]
-fn model_ops_carry_category_model() {
+fn model_ops_carry_category_model() -> TestResult {
     let ops = build_ops();
 
     for expected_name in ["model", "provider", "effort"] {
         let op = ops
             .iter()
             .find(|o| o.meta().name == expected_name)
-            .unwrap_or_else(|| {
-                panic!(
+            .ok_or_else(|| {
+                TestError::Unexpected(format!(
                     "op '{expected_name}' not found in OperationRegistry — \
                      was it removed from harw_ops::register_all?"
-                )
-            });
+                ))
+            })?;
         assert_eq!(
             op.meta().category,
             OperationCategory::Model,
@@ -222,6 +238,7 @@ fn model_ops_carry_category_model() {
             op.meta().category,
         );
     }
+    Ok(())
 }
 
 // ── Test 5 ────────────────────────────────────────────────────────────────────
@@ -233,9 +250,9 @@ fn model_ops_carry_category_model() {
 /// - their underlying ops have at least one alias registered
 ///   (model → "m", provider → "p", effort → "reasoning")
 #[test]
-fn model_provider_effort_all_present_and_have_aliases() {
+fn model_provider_effort_all_present_and_have_aliases() -> TestResult {
     let ops = build_ops();
-    let tui = CommandRegistry::built_in();
+    let tui = CommandRegistry::built_in().map_err(ctx("built_in"))?;
 
     // Expected: (op-name, at-least-one-alias)
     let expected: &[(&str, &str)] = &[("model", "m"), ("provider", "p"), ("effort", "reasoning")];
@@ -248,10 +265,9 @@ fn model_provider_effort_all_present_and_have_aliases() {
         );
 
         // The underlying op must carry the known alias.
-        let op = ops
-            .iter()
-            .find(|o| o.meta().name == name)
-            .unwrap_or_else(|| panic!("OperationRegistry missing op '{name}'"));
+        let op = ops.iter().find(|o| o.meta().name == name).ok_or_else(|| {
+            TestError::Unexpected(format!("OperationRegistry missing op '{name}'"))
+        })?;
 
         let has_alias = op.meta().aliases.contains(&expected_alias);
         assert!(
@@ -268,6 +284,7 @@ fn model_provider_effort_all_present_and_have_aliases() {
             "op '{name}' has no aliases in OperationMeta — expected at least '{expected_alias}'"
         );
     }
+    Ok(())
 }
 
 // ── Test 6 ────────────────────────────────────────────────────────────────────
@@ -283,9 +300,9 @@ fn model_provider_effort_all_present_and_have_aliases() {
 ///
 /// Both are bugs. The informative failure message names both counts.
 #[test]
-fn tui_registry_and_operation_registry_agree_on_count() {
+fn tui_registry_and_operation_registry_agree_on_count() -> TestResult {
     let ops = build_ops();
-    let tui = CommandRegistry::built_in();
+    let tui = CommandRegistry::built_in().map_err(ctx("built_in"))?;
 
     // Count Surface::Command declarations across all ops.
     let op_command_surface_count: usize = ops
@@ -303,6 +320,7 @@ fn tui_registry_and_operation_registry_agree_on_count() {
          Likely cause: a new op's Surface::Command path failed CommandName::parse (e.g. \
          contains '/' sub-segments) and was silently skipped in from_operation_registry."
     );
+    Ok(())
 }
 
 // ── Test 7 (bonus) ───────────────────────────────────────────────────────────
@@ -471,8 +489,8 @@ fn all_registered_ops_are_reachable_by_name() {
 /// from Surface::Command paths. If stripping ever breaks, names would be
 /// prefixed with '/' and `classify_input` would never match them.
 #[test]
-fn tui_spec_names_have_no_leading_slash() {
-    let tui = CommandRegistry::built_in();
+fn tui_spec_names_have_no_leading_slash() -> TestResult {
+    let tui = CommandRegistry::built_in().map_err(ctx("built_in"))?;
     for spec in tui.specs() {
         assert!(
             !spec.name.as_str().starts_with('/'),
@@ -481,4 +499,5 @@ fn tui_spec_names_have_no_leading_slash() {
             spec.name.as_str(),
         );
     }
+    Ok(())
 }

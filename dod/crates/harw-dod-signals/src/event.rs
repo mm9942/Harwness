@@ -285,18 +285,19 @@ pub struct SecurityEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn digest() -> ContentDigest {
         ContentDigest::of(b"/usr/bin/curl --data secret=redacted")
     }
 
     #[test]
-    fn test_event_kind_process_exec_json_is_stable() {
+    fn test_event_kind_process_exec_json_is_stable() -> TestResult {
         let kind = EventKind::ProcessExec {
             path: "/usr/bin/curl".to_owned(),
             argv_digest: digest(),
         };
-        let json = serde_json::to_string(&kind).expect("EventKind serializes");
+        let json = serde_json::to_string(&kind).map_err(ctx("EventKind serializes"))?;
         assert_eq!(
             json,
             format!(
@@ -304,70 +305,77 @@ mod tests {
                 digest = digest()
             )
         );
+        Ok(())
     }
 
     #[test]
-    fn test_event_kind_file_write_json_is_stable() {
+    fn test_event_kind_file_write_json_is_stable() -> TestResult {
         let kind = EventKind::FileWrite {
             path: "/etc/shadow".to_owned(),
         };
         assert_eq!(
-            serde_json::to_string(&kind).expect("EventKind serializes"),
+            serde_json::to_string(&kind).map_err(ctx("EventKind serializes"))?,
             r#"{"kind":"file-write","path":"/etc/shadow"}"#
         );
+        Ok(())
     }
 
     #[test]
-    fn test_event_kind_egress_flow_json_is_stable() {
+    fn test_event_kind_egress_flow_json_is_stable() -> TestResult {
         let kind = EventKind::EgressFlow {
             destination: "198.51.100.7".to_owned(),
             port: 443,
         };
         assert_eq!(
-            serde_json::to_string(&kind).expect("EventKind serializes"),
+            serde_json::to_string(&kind).map_err(ctx("EventKind serializes"))?,
             r#"{"kind":"egress-flow","destination":"198.51.100.7","port":443}"#
         );
+        Ok(())
     }
 
     #[test]
-    fn test_event_kind_listener_opened_json_is_stable() {
+    fn test_event_kind_listener_opened_json_is_stable() -> TestResult {
         let kind = EventKind::ListenerOpened { port: 8080 };
         assert_eq!(
-            serde_json::to_string(&kind).expect("EventKind serializes"),
+            serde_json::to_string(&kind).map_err(ctx("EventKind serializes"))?,
             r#"{"kind":"listener-opened","port":8080}"#
         );
+        Ok(())
     }
 
     #[test]
-    fn test_event_kind_auth_event_json_is_stable() {
+    fn test_event_kind_auth_event_json_is_stable() -> TestResult {
         let kind = EventKind::AuthEvent {
             outcome: AuthOutcome::Success,
         };
         assert_eq!(
-            serde_json::to_string(&kind).expect("EventKind serializes"),
+            serde_json::to_string(&kind).map_err(ctx("EventKind serializes"))?,
             r#"{"kind":"auth-event","outcome":"success"}"#
         );
+        Ok(())
     }
 
     #[test]
-    fn test_event_kind_structure_drift_json_is_stable() {
+    fn test_event_kind_structure_drift_json_is_stable() -> TestResult {
         let kind = EventKind::StructureDrift {
             severity: DriftSeverity::High,
             detail: "unexpected setuid binary in workspace".to_owned(),
         };
         assert_eq!(
-            serde_json::to_string(&kind).expect("EventKind serializes"),
+            serde_json::to_string(&kind).map_err(ctx("EventKind serializes"))?,
             r#"{"kind":"structure-drift","severity":"high","detail":"unexpected setuid binary in workspace"}"#
         );
+        Ok(())
     }
 
     #[test]
-    fn test_event_kind_structure_drift_without_severity_still_deserializes() {
+    fn test_event_kind_structure_drift_without_severity_still_deserializes() -> TestResult {
         // Die Bestandsform aus der Zeit vor dem strukturierten Feld. Sie muss
         // lesbar bleiben und auf `Unknown` fallen — nicht auf `Low`.
         let legacy = r#"{"kind":"structure-drift","detail":"neues Workspace-Member: a"}"#;
 
-        let kind: EventKind = serde_json::from_str(legacy).expect("Bestandsform bleibt lesbar");
+        let kind: EventKind =
+            serde_json::from_str(legacy).map_err(ctx("Bestandsform bleibt lesbar"))?;
 
         assert!(matches!(
             kind,
@@ -376,17 +384,19 @@ mod tests {
                 ..
             }
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_event_kind_sensor_degraded_json_is_stable() {
+    fn test_event_kind_sensor_degraded_json_is_stable() -> TestResult {
         let kind = EventKind::SensorDegraded {
             sensor: SensorId::from_str("thermal-0"),
         };
         assert_eq!(
-            serde_json::to_string(&kind).expect("EventKind serializes"),
+            serde_json::to_string(&kind).map_err(ctx("EventKind serializes"))?,
             r#"{"kind":"sensor-degraded","sensor":"thermal-0"}"#
         );
+        Ok(())
     }
 
     fn event() -> SecurityEvent {
@@ -405,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn test_security_event_deserialize_accepts_well_formed_static_fixture() {
+    fn test_security_event_deserialize_accepts_well_formed_static_fixture() -> TestResult {
         let fixture: &'static str = r#"{
             "sensor": "authlog-0",
             "observed_at": "1970-01-01T00:00:00Z",
@@ -413,12 +423,13 @@ mod tests {
             "kind": {"kind": "auth-event", "outcome": "failure"}
         }"#;
         let parsed: SecurityEvent =
-            serde_json::from_str(fixture).expect("fixture deserializes");
+            serde_json::from_str(fixture).map_err(ctx("fixture deserializes"))?;
         assert_eq!(parsed, event());
+        Ok(())
     }
 
     #[test]
-    fn test_security_event_deserialize_rejects_unknown_field() {
+    fn test_security_event_deserialize_rejects_unknown_field() -> TestResult {
         let fixture: &'static str = r#"{
             "sensor": "authlog-0",
             "observed_at": "1970-01-01T00:00:00Z",
@@ -427,15 +438,20 @@ mod tests {
             "unexpected": true
         }"#;
         assert!(serde_json::from_str::<SecurityEvent>(fixture).is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_actor_auid_can_diverge_from_uid_after_privilege_escalation() {
+    fn test_actor_auid_can_diverge_from_uid_after_privilege_escalation() -> TestResult {
         let actor = Actor {
             uid: 0,
             auid: Some(1000),
             cgroup: None,
         };
-        assert_ne!(actor.uid, actor.auid.expect("auid present"));
+        assert_ne!(
+            actor.uid,
+            actor.auid.ok_or(TestError::Missing("auid present"))?
+        );
+        Ok(())
     }
 }

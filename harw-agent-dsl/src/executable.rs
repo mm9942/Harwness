@@ -930,9 +930,10 @@ impl SpawnContract {
     /// a child orchestrator.
     #[must_use]
     pub fn permits_child_orchestrator(&self, role_name: &str) -> bool {
-        self.child_orchestrators.iter().any(|allowed| allowed == role_name)
+        self.child_orchestrators
+            .iter()
+            .any(|allowed| allowed == role_name)
     }
-
 }
 
 impl BudgetSpec {
@@ -1478,19 +1479,22 @@ mod tests {
     use crate::ids::{DefinitionId, Version};
     use crate::resolved::{ResolutionTrace, ResolvedAgentDefinition};
     use crate::roles::AgentRoleId;
+    use crate::test_support::{TestError, TestResult, ctx};
 
-    fn make_id(s: &str) -> DefinitionId {
-        DefinitionId::parse(s).unwrap()
+    fn make_id(s: &str) -> TestResult<DefinitionId> {
+        Ok(DefinitionId::parse(s)?)
     }
 
-    fn make_version(s: &str) -> Version {
-        Version(semver::Version::parse(s).unwrap())
+    fn make_version(s: &str) -> TestResult<Version> {
+        Ok(Version(
+            semver::Version::parse(s).map_err(ctx("semver::Version::parse should succeed"))?,
+        ))
     }
 
-    fn base_resolved(specialization: &str) -> ResolvedAgentDefinition {
-        ResolvedAgentDefinition {
-            id: make_id("harwness.agent.test-worker@1"),
-            version: make_version("1.0.0"),
+    fn base_resolved(specialization: &str) -> TestResult<ResolvedAgentDefinition> {
+        Ok(ResolvedAgentDefinition {
+            id: make_id("harwness.agent.test-worker@1")?,
+            version: make_version("1.0.0")?,
             role: AgentRoleId::Worker,
             specialization: specialization.to_owned(),
             name: None,
@@ -1501,7 +1505,7 @@ mod tests {
             },
             trace: ResolutionTrace { steps: vec![] },
             config: toml::Table::new(),
-        }
+        })
     }
 
     /// Wie [`base_resolved`], aber mit gesetztem `reasoning_effort` — für
@@ -1510,26 +1514,28 @@ mod tests {
     fn base_resolved_with_reasoning_effort(
         specialization: &str,
         reasoning_effort: Option<&str>,
-    ) -> ResolvedAgentDefinition {
-        ResolvedAgentDefinition {
+    ) -> TestResult<ResolvedAgentDefinition> {
+        Ok(ResolvedAgentDefinition {
             reasoning_effort: reasoning_effort.map(str::to_owned),
-            ..base_resolved(specialization)
-        }
+            ..base_resolved(specialization)?
+        })
     }
 
     #[test]
-    fn test_lower_produces_ir_with_matching_id_and_role() {
-        let resolved = base_resolved("test-worker");
-        let ir = lower(&resolved).expect("lower should succeed");
-        assert_eq!(ir.id, make_id("harwness.agent.test-worker@1"));
+    fn test_lower_produces_ir_with_matching_id_and_role() -> TestResult {
+        let resolved = base_resolved("test-worker")?;
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
+        assert_eq!(ir.id, make_id("harwness.agent.test-worker@1")?);
         assert_eq!(ir.role, AgentRoleId::Worker);
+        Ok(())
     }
 
     #[test]
-    fn test_lower_carries_specialization_through() {
-        let resolved = base_resolved("focused-pure-coding");
-        let ir = lower(&resolved).expect("lower should succeed");
+    fn test_lower_carries_specialization_through() -> TestResult {
+        let resolved = base_resolved("focused-pure-coding")?;
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
         assert_eq!(ir.specialization, "focused-pure-coding");
+        Ok(())
     }
 
     #[test]
@@ -1543,34 +1549,36 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_maps_none_context_policy_when_absent() {
-        let resolved = base_resolved("my-worker");
-        let ir = lower(&resolved).expect("lower should succeed");
+    fn test_lower_maps_none_context_policy_when_absent() -> TestResult {
+        let resolved = base_resolved("my-worker")?;
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
         assert!(ir.context_program.context_policy.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_lower_maps_context_program_table_policy() {
-        let mut resolved = base_resolved("configured-worker");
+    fn test_lower_maps_context_program_table_policy() -> TestResult {
+        let mut resolved = base_resolved("configured-worker")?;
         resolved.config = toml::from_str(
             r#"
             [context_program]
             policy = "strict-isolation"
             "#,
         )
-        .expect("fixture config should parse");
+        .map_err(ctx("fixture config should parse"))?;
 
-        let ir = lower(&resolved).expect("lower should succeed");
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
 
         assert_eq!(
             ir.context_program().context_policy(),
             Some("strict-isolation")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_lower_preserves_supported_executable_config() {
-        let mut resolved = base_resolved("configured-worker");
+    fn test_lower_preserves_supported_executable_config() -> TestResult {
+        let mut resolved = base_resolved("configured-worker")?;
         resolved.config = toml::from_str(
             r#"
             spawn = { workspace_hint = "workspace-a" }
@@ -1581,9 +1589,9 @@ mod tests {
             return = { validators = ["schema.v1", "redact.secrets"] }
             "#,
         )
-        .expect("fixture config should parse");
+        .map_err(ctx("fixture config should parse"))?;
 
-        let ir = lower(&resolved).expect("lower should succeed");
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
 
         assert_eq!(
             ir.spawn_contract.workspace_hint.as_deref(),
@@ -1602,41 +1610,46 @@ mod tests {
             ir.return_pipeline.validators,
             ["schema.v1", "redact.secrets"]
         );
+        Ok(())
     }
 
     #[test]
-    fn lower_carries_exact_child_orchestrator_grants() {
-        let mut resolved = base_resolved("manager");
+    fn lower_carries_exact_child_orchestrator_grants() -> TestResult {
+        let mut resolved = base_resolved("manager")?;
         resolved.config = toml::toml! {
             [spawn]
             child_orchestrators = ["specialist", "reviewer"]
         };
 
-        let ir = lower(&resolved).expect("spawn grant lowers");
+        let ir = lower(&resolved).map_err(ctx("spawn grant lowers"))?;
         assert!(ir.spawn_contract().permits_child_orchestrator("specialist"));
         assert!(ir.spawn_contract().permits_child_orchestrator("reviewer"));
         assert!(!ir.spawn_contract().permits_child_orchestrator("other"));
+        Ok(())
     }
 
     #[test]
-    fn test_lower_populates_tool_surface_from_admitted_forbidden() {
+    fn test_lower_populates_tool_surface_from_admitted_forbidden() -> TestResult {
         // In this wave, tool surface fields are absent from ResolvedAgentDefinition.
         // The IR defaults to empty vecs; confirm no panic and correct defaults.
-        let resolved = base_resolved("my-worker");
-        let ir = lower(&resolved).expect("lower should succeed");
+        let resolved = base_resolved("my-worker")?;
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
         assert!(ir.tool_surface.admitted.is_empty());
         assert!(ir.tool_surface.forbidden.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_lower_returns_parse_error_when_specialization_empty() {
-        let resolved = base_resolved("");
+    fn test_lower_returns_parse_error_when_specialization_empty() -> TestResult {
+        let resolved = base_resolved("")?;
         let result = lower(&resolved);
         assert!(
             result.is_err(),
             "lower should fail when specialization is empty"
         );
-        let err = result.unwrap_err();
+        let Err(err) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(
             matches!(err, DslError::Parse(_)),
             "error should be DslError::Parse, got: {err}"
@@ -1646,25 +1659,27 @@ mod tests {
             msg.contains("specialization"),
             "error message should mention 'specialization', got: {msg}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_lower_carries_authority_through_unchanged() {
-        let mut resolved = base_resolved("x");
+    fn test_lower_carries_authority_through_unchanged() -> TestResult {
+        let mut resolved = base_resolved("x")?;
         resolved.authority = AuthorityCeiling {
             capabilities: vec![
                 "process.spawn.sandboxed".to_owned(),
                 "filesystem.read".to_owned(),
             ],
         };
-        let ir = lower(&resolved).expect("lower should succeed");
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
         assert_eq!(ir.authority, resolved.authority);
+        Ok(())
     }
 
     #[test]
-    fn test_lower_carries_trace_through_unchanged() {
+    fn test_lower_carries_trace_through_unchanged() -> TestResult {
         use crate::resolved::ResolutionStep;
-        let mut resolved = base_resolved("my-worker");
+        let mut resolved = base_resolved("my-worker")?;
         resolved.trace = ResolutionTrace {
             steps: vec![ResolutionStep {
                 source: "harwness.agent.worker-base@1".to_owned(),
@@ -1672,41 +1687,45 @@ mod tests {
                 applied_at: time::OffsetDateTime::now_utc(),
             }],
         };
-        let ir = lower(&resolved).expect("lower should succeed");
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
         assert_eq!(ir.trace.steps.len(), 1);
         assert_eq!(ir.trace.steps[0].source, "harwness.agent.worker-base@1");
+        Ok(())
     }
 
     #[test]
-    fn test_lower_role_orchestrator_is_preserved() {
-        let mut resolved = base_resolved("orchestrator-spec");
+    fn test_lower_role_orchestrator_is_preserved() -> TestResult {
+        let mut resolved = base_resolved("orchestrator-spec")?;
         resolved.role = AgentRoleId::RootOrchestrator;
-        resolved.id = make_id("harwness.agent.root-orch@2");
-        let ir = lower(&resolved).expect("lower should succeed");
+        resolved.id = make_id("harwness.agent.root-orch@2")?;
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
         assert_eq!(ir.role, AgentRoleId::RootOrchestrator);
+        Ok(())
     }
 
     #[test]
-    fn test_lifecycle_machine_defaults_to_no_pause_no_rerun() {
-        let resolved = base_resolved("basic");
-        let ir = lower(&resolved).expect("lower should succeed");
+    fn test_lifecycle_machine_defaults_to_no_pause_no_rerun() -> TestResult {
+        let resolved = base_resolved("basic")?;
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
         assert!(!ir.lifecycle_machine.allow_pause);
         assert!(!ir.lifecycle_machine.allow_rerun);
+        Ok(())
     }
 
     #[test]
-    fn test_return_pipeline_defaults_to_empty_validators() {
-        let resolved = base_resolved("basic");
-        let ir = lower(&resolved).expect("lower should succeed");
+    fn test_return_pipeline_defaults_to_empty_validators() -> TestResult {
+        let resolved = base_resolved("basic")?;
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
         assert!(ir.return_pipeline.validators.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn snapshot_id_is_deterministic_across_lower_calls() {
+    fn snapshot_id_is_deterministic_across_lower_calls() -> TestResult {
         // Lower the same ResolvedAgentDefinition twice; both SnapshotIds must be equal.
-        let resolved = base_resolved("determinism-check");
-        let ir1 = lower(&resolved).expect("first lower should succeed");
-        let ir2 = lower(&resolved).expect("second lower should succeed");
+        let resolved = base_resolved("determinism-check")?;
+        let ir1 = lower(&resolved).map_err(ctx("first lower should succeed"))?;
+        let ir2 = lower(&resolved).map_err(ctx("second lower should succeed"))?;
         assert_eq!(
             ir1.snapshot_id(),
             ir2.snapshot_id(),
@@ -1722,79 +1741,81 @@ mod tests {
             ir1.snapshot_id.0.chars().all(|c| c.is_ascii_hexdigit()),
             "SnapshotId should be lowercase hex"
         );
+        Ok(())
     }
 
     #[test]
-    fn snapshot_id_changes_when_role_changes() {
+    fn snapshot_id_changes_when_role_changes() -> TestResult {
         // Two defs differing only in role must produce different SnapshotIds.
-        let mut resolved_worker = base_resolved("role-test");
+        let mut resolved_worker = base_resolved("role-test")?;
         resolved_worker.role = AgentRoleId::Worker;
-        resolved_worker.id = make_id("harwness.agent.role-test-worker@1");
+        resolved_worker.id = make_id("harwness.agent.role-test-worker@1")?;
 
-        let mut resolved_orch = base_resolved("role-test");
+        let mut resolved_orch = base_resolved("role-test")?;
         resolved_orch.role = AgentRoleId::RootOrchestrator;
-        resolved_orch.id = make_id("harwness.agent.role-test-orch@1");
+        resolved_orch.id = make_id("harwness.agent.role-test-orch@1")?;
 
-        let ir_worker = lower(&resolved_worker).expect("worker lower should succeed");
-        let ir_orch = lower(&resolved_orch).expect("orch lower should succeed");
+        let ir_worker = lower(&resolved_worker).map_err(ctx("worker lower should succeed"))?;
+        let ir_orch = lower(&resolved_orch).map_err(ctx("orch lower should succeed"))?;
 
         assert_ne!(
             ir_worker.snapshot_id(),
             ir_orch.snapshot_id(),
             "Different roles must yield different SnapshotIds"
         );
+        Ok(())
     }
 
     #[test]
-    fn snapshot_id_accessor_matches_field() {
-        let resolved = base_resolved("accessor-test");
-        let ir = lower(&resolved).expect("lower should succeed");
+    fn snapshot_id_accessor_matches_field() -> TestResult {
+        let resolved = base_resolved("accessor-test")?;
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
         assert_eq!(ir.snapshot_id(), ir.snapshot_id.clone());
+        Ok(())
     }
 
     #[test]
-    fn snapshot_id_serde_round_trip_confirms_same_identity() {
+    fn snapshot_id_serde_round_trip_confirms_same_identity() -> TestResult {
         // Der wichtigste Test: Serialize -> JSON -> ReferencedSnapshotId ->
         // confirm() muss dieselbe Identität zurückliefern wie das Original.
-        let resolved = base_resolved("serde-roundtrip");
-        let ir = lower(&resolved).expect("lower should succeed");
+        let resolved = base_resolved("serde-roundtrip")?;
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
         let original = ir.snapshot_id();
 
-        let json = serde_json::to_string(&original).expect("SnapshotId must serialize");
+        let json = serde_json::to_string(&original).map_err(ctx("SnapshotId must serialize"))?;
         #[derive(serde::Deserialize)]
         struct Wire {
             domain: String,
             digest: String,
         }
-        let wire: Wire = serde_json::from_str(&json).expect("wire form must deserialize");
+        let wire: Wire = serde_json::from_str(&json).map_err(ctx("wire form must deserialize"))?;
         assert_eq!(
             wire.domain, SNAPSHOT_HASH_DOMAIN,
             "serialized form must carry the current hash-domain version"
         );
 
         let referenced = ReferencedSnapshotId::parse(wire.domain, wire.digest)
-            .expect("well-formed wire values must parse");
-        let confirmed = referenced
-            .confirm(&original)
-            .expect("a serde round trip must not change the identity");
+            .map_err(ctx("well-formed wire values must parse"))?;
+        let confirmed = referenced.confirm(&original).ok_or(TestError::Unexpected(
+            "a serde round trip must not change the identity".into(),
+        ))?;
         assert_eq!(
             confirmed, original,
             "confirmed identity must equal the original SnapshotId"
         );
+        Ok(())
     }
 
     #[test]
-    fn referenced_snapshot_id_from_other_domain_is_recognizable_and_unconfirmed() {
-        let resolved = base_resolved("foreign-domain");
-        let ir = lower(&resolved).expect("lower should succeed");
+    fn referenced_snapshot_id_from_other_domain_is_recognizable_and_unconfirmed() -> TestResult {
+        let resolved = base_resolved("foreign-domain")?;
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
         let computed = ir.snapshot_id();
 
         // Gleicher Digest-Text, aber eine ältere Domänenfassung behauptet.
-        let foreign = ReferencedSnapshotId::parse(
-            "harwness.executable-ir.snapshot/v2",
-            computed.to_string(),
-        )
-        .expect("well-formed digest must parse regardless of domain");
+        let foreign =
+            ReferencedSnapshotId::parse("harwness.executable-ir.snapshot/v2", computed.to_string())
+                .map_err(ctx("well-formed digest must parse regardless of domain"))?;
 
         assert!(
             !foreign.is_current_domain(),
@@ -1804,20 +1825,27 @@ mod tests {
             foreign.confirm(&computed).is_none(),
             "a reference from a foreign hash-domain must never confirm, even with a matching digest"
         );
+        Ok(())
     }
 
     #[test]
-    fn snapshot_id_stable_across_repeated_lowering_via_referenced_confirm() {
+    fn snapshot_id_stable_across_repeated_lowering_via_referenced_confirm() -> TestResult {
         // Stabilität über wiederholtes Absenken bleibt auch über den
         // Referenz/Bestätigungs-Weg erhalten, nicht nur bei direktem Vergleich.
-        let resolved = base_resolved("repeated-lowering");
-        let first = lower(&resolved).expect("first lower should succeed").snapshot_id();
-        let second = lower(&resolved).expect("second lower should succeed").snapshot_id();
-        let third = lower(&resolved).expect("third lower should succeed").snapshot_id();
+        let resolved = base_resolved("repeated-lowering")?;
+        let first = lower(&resolved)
+            .map_err(ctx("first lower should succeed"))?
+            .snapshot_id();
+        let second = lower(&resolved)
+            .map_err(ctx("second lower should succeed"))?
+            .snapshot_id();
+        let third = lower(&resolved)
+            .map_err(ctx("third lower should succeed"))?
+            .snapshot_id();
 
         let referenced_from_first =
             ReferencedSnapshotId::parse(SNAPSHOT_HASH_DOMAIN, first.to_string())
-                .expect("digest from a real SnapshotId is always well-formed");
+                .map_err(ctx("digest from a real SnapshotId is always well-formed"))?;
 
         assert_eq!(
             referenced_from_first.confirm(&second),
@@ -1825,6 +1853,7 @@ mod tests {
             "a reference to a stable digest must confirm identically across repeated lowerings"
         );
         assert!(referenced_from_first.confirm(&second).is_some());
+        Ok(())
     }
 
     #[test]
@@ -1855,19 +1884,20 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_id_display_is_hex_string() {
-        let resolved = base_resolved("display-test");
-        let ir = lower(&resolved).expect("lower should succeed");
+    fn snapshot_id_display_is_hex_string() -> TestResult {
+        let resolved = base_resolved("display-test")?;
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
         let displayed = ir.snapshot_id.to_string();
         assert_eq!(displayed, ir.snapshot_id.0);
+        Ok(())
     }
 
     #[test]
-    fn integrity_bearing_fields_are_read_only_through_public_api() {
-        let ir = lower(&base_resolved("read-only-test")).expect("lower should succeed");
+    fn integrity_bearing_fields_are_read_only_through_public_api() -> TestResult {
+        let ir = lower(&base_resolved("read-only-test")?).map_err(ctx("lower should succeed"))?;
         let original_snapshot = ir.snapshot_id();
 
-        assert_eq!(ir.id(), &make_id("harwness.agent.test-worker@1"));
+        assert_eq!(ir.id(), &make_id("harwness.agent.test-worker@1")?);
         assert_eq!(ir.role(), AgentRoleId::Worker);
         assert_eq!(ir.specialization(), "read-only-test");
         assert_eq!(ir.authority().capabilities, ["filesystem.read"]);
@@ -1881,6 +1911,7 @@ mod tests {
         // The content fields are private, so callers cannot mutate them through
         // these borrowed views and leave `original_snapshot` stale.
         assert_eq!(ir.snapshot_id(), original_snapshot);
+        Ok(())
     }
 
     /// Vollständige TOML-Fixture mit allen in Wave W1-27 ergänzten Feldern.
@@ -1918,16 +1949,16 @@ mod tests {
     "#;
 
     /// Parst eine TOML-Fixture in die freiformige Config-Tabelle.
-    fn parse_config(src: &str) -> toml::Table {
-        toml::from_str(src).expect("fixture config should parse")
+    fn parse_config(src: &str) -> TestResult<toml::Table> {
+        toml::from_str(src).map_err(ctx("fixture config should parse"))
     }
 
     #[test]
-    fn test_lower_maps_full_read_only_child_contract() {
-        let mut resolved = base_resolved("explorer");
-        resolved.config = parse_config(READ_ONLY_CHILD_TOML);
+    fn test_lower_maps_full_read_only_child_contract() -> TestResult {
+        let mut resolved = base_resolved("explorer")?;
+        resolved.config = parse_config(READ_ONLY_CHILD_TOML)?;
 
-        let ir = lower(&resolved).expect("lower should succeed");
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
 
         // SpawnContract inkl. Budget und Tiefe.
         assert_eq!(ir.spawn_contract().workspace_hint(), Some("workspace-a"));
@@ -1939,7 +1970,7 @@ mod tests {
         let budget = ir
             .spawn_contract()
             .budget()
-            .expect("budget section should lower to Some");
+            .ok_or(TestError::Missing("budget section should lower to Some"))?;
         assert_eq!(budget.max_tokens(), Some(120_000));
         assert_eq!(budget.max_tool_calls(), Some(64));
         assert_eq!(budget.max_wall_secs(), Some(900));
@@ -1980,11 +2011,12 @@ mod tests {
             ir.tool_surface().forbidden(),
             ["fs.write", "shell.exec"].as_slice()
         );
+        Ok(())
     }
 
     #[test]
-    fn test_lower_leaves_new_fields_unset_for_empty_config() {
-        let ir = lower(&base_resolved("bare")).expect("lower should succeed");
+    fn test_lower_leaves_new_fields_unset_for_empty_config() -> TestResult {
+        let ir = lower(&base_resolved("bare")?).map_err(ctx("lower should succeed"))?;
 
         assert!(ir.spawn_contract().budget().is_none());
         assert_eq!(ir.spawn_contract().max_depth(), None);
@@ -1992,14 +2024,15 @@ mod tests {
         assert!(ir.context_program().exclude().is_empty());
         assert_eq!(ir.lifecycle_machine().max_attempts(), None);
         assert_eq!(ir.return_pipeline().contract(), None);
+        Ok(())
     }
 
     #[test]
-    fn test_lower_rejects_malformed_budget_values_without_panicking() {
+    fn test_lower_rejects_malformed_budget_values_without_panicking() -> TestResult {
         // Negative und überlaufende Ganzzahlen sowie falsche Typen sind keine
         // gültigen Budgets: sie werden wie „nicht gesetzt" behandelt, statt
         // einen Wert zu erfinden oder zu panieren.
-        let mut resolved = base_resolved("malformed-budget");
+        let mut resolved = base_resolved("malformed-budget")?;
         resolved.config = parse_config(
             r#"
             [spawn]
@@ -2011,15 +2044,14 @@ mod tests {
             max_wall_secs = "sehr lange"
             effort_cap = 3
             "#,
-        );
+        )?;
 
-        let ir = lower(&resolved).expect("lower should succeed");
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
 
         assert_eq!(ir.spawn_contract().max_depth(), None);
-        let budget = ir
-            .spawn_contract()
-            .budget()
-            .expect("declared budget section stays Some even when unusable");
+        let budget = ir.spawn_contract().budget().ok_or(TestError::Missing(
+            "declared budget section stays Some even when unusable",
+        ))?;
         assert_eq!(
             budget.max_tokens(),
             None,
@@ -2032,22 +2064,23 @@ mod tests {
         );
         assert_eq!(budget.max_wall_secs(), None);
         assert_eq!(budget.effort_cap(), None);
+        Ok(())
     }
 
     #[test]
-    fn snapshot_id_changes_when_budget_max_tokens_changes() {
+    fn snapshot_id_changes_when_budget_max_tokens_changes() -> TestResult {
         // Zwei IRs, die sich ausschließlich in spawn.budget.max_tokens
         // unterscheiden, dürfen niemals dieselbe Adresse tragen.
-        let mut low = base_resolved("budget-sensitivity");
-        low.config = parse_config(READ_ONLY_CHILD_TOML);
+        let mut low = base_resolved("budget-sensitivity")?;
+        low.config = parse_config(READ_ONLY_CHILD_TOML)?;
 
-        let mut high = base_resolved("budget-sensitivity");
+        let mut high = base_resolved("budget-sensitivity")?;
         high.config = parse_config(
             &READ_ONLY_CHILD_TOML.replace("max_tokens = 120000", "max_tokens = 120001"),
-        );
+        )?;
 
-        let ir_low = lower(&low).expect("lower should succeed");
-        let ir_high = lower(&high).expect("lower should succeed");
+        let ir_low = lower(&low).map_err(ctx("lower should succeed"))?;
+        let ir_high = lower(&high).map_err(ctx("lower should succeed"))?;
 
         assert_eq!(
             ir_low
@@ -2068,21 +2101,22 @@ mod tests {
             ir_high.snapshot_id(),
             "a different token budget is different content and must hash differently"
         );
+        Ok(())
     }
 
     #[test]
-    fn snapshot_id_distinguishes_absent_budget_from_empty_budget() {
+    fn snapshot_id_distinguishes_absent_budget_from_empty_budget() -> TestResult {
         // Eine deklarierte, aber leere [spawn.budget]-Sektion ist eine andere
         // Aussage als eine fehlende Sektion — das Präsenz-Byte muss das zeigen.
-        let mut absent = base_resolved("budget-presence");
+        let mut absent = base_resolved("budget-presence")?;
         absent.config = parse_config(
             r#"
             [spawn]
             workspace_hint = "w"
             "#,
-        );
+        )?;
 
-        let mut empty = base_resolved("budget-presence");
+        let mut empty = base_resolved("budget-presence")?;
         empty.config = parse_config(
             r#"
             [spawn]
@@ -2090,10 +2124,10 @@ mod tests {
 
             [spawn.budget]
             "#,
-        );
+        )?;
 
-        let ir_absent = lower(&absent).expect("lower should succeed");
-        let ir_empty = lower(&empty).expect("lower should succeed");
+        let ir_absent = lower(&absent).map_err(ctx("lower should succeed"))?;
+        let ir_empty = lower(&empty).map_err(ctx("lower should succeed"))?;
 
         assert!(ir_absent.spawn_contract().budget().is_none());
         assert!(ir_empty.spawn_contract().budget().is_some());
@@ -2102,92 +2136,96 @@ mod tests {
             ir_empty.snapshot_id(),
             "declared-but-empty budget must not alias with an absent budget"
         );
+        Ok(())
     }
 
     #[test]
-    fn snapshot_id_changes_when_return_contract_changes() {
-        let mut with_contract = base_resolved("contract-sensitivity");
+    fn snapshot_id_changes_when_return_contract_changes() -> TestResult {
+        let mut with_contract = base_resolved("contract-sensitivity")?;
         with_contract.config = parse_config(
             r#"
             [return]
             contract = "harwness.return.research-finding@1"
             "#,
-        );
+        )?;
 
-        let without_contract = base_resolved("contract-sensitivity");
+        let without_contract = base_resolved("contract-sensitivity")?;
 
-        let ir_with = lower(&with_contract).expect("lower should succeed");
-        let ir_without = lower(&without_contract).expect("lower should succeed");
+        let ir_with = lower(&with_contract).map_err(ctx("lower should succeed"))?;
+        let ir_without = lower(&without_contract).map_err(ctx("lower should succeed"))?;
 
         assert_ne!(
             ir_with.snapshot_id(),
             ir_without.snapshot_id(),
             "the return contract is part of the addressed content"
         );
+        Ok(())
     }
 
     #[test]
-    fn snapshot_id_changes_when_lifecycle_max_attempts_changes() {
-        let mut two = base_resolved("attempt-sensitivity");
+    fn snapshot_id_changes_when_lifecycle_max_attempts_changes() -> TestResult {
+        let mut two = base_resolved("attempt-sensitivity")?;
         two.config = parse_config(
             r#"
             [lifecycle]
             max_attempts = 2
             "#,
-        );
+        )?;
 
-        let mut three = base_resolved("attempt-sensitivity");
+        let mut three = base_resolved("attempt-sensitivity")?;
         three.config = parse_config(
             r#"
             [lifecycle]
             max_attempts = 3
             "#,
-        );
+        )?;
 
-        let ir_two = lower(&two).expect("lower should succeed");
-        let ir_three = lower(&three).expect("lower should succeed");
+        let ir_two = lower(&two).map_err(ctx("lower should succeed"))?;
+        let ir_three = lower(&three).map_err(ctx("lower should succeed"))?;
 
         assert_ne!(ir_two.snapshot_id(), ir_three.snapshot_id());
+        Ok(())
     }
 
     #[test]
-    fn snapshot_id_changes_when_context_selectors_are_reordered() {
+    fn snapshot_id_changes_when_context_selectors_are_reordered() -> TestResult {
         // must_include wird nicht normalisiert; die Reihenfolge ist Inhalt und
         // muss daher den Digest beeinflussen.
-        let mut forward = base_resolved("selector-order");
+        let mut forward = base_resolved("selector-order")?;
         forward.config = parse_config(
             r#"
             [context]
             must_include = ["a.md", "b.md"]
             "#,
-        );
+        )?;
 
-        let mut reversed = base_resolved("selector-order");
+        let mut reversed = base_resolved("selector-order")?;
         reversed.config = parse_config(
             r#"
             [context]
             must_include = ["b.md", "a.md"]
             "#,
-        );
+        )?;
 
-        let ir_forward = lower(&forward).expect("lower should succeed");
-        let ir_reversed = lower(&reversed).expect("lower should succeed");
+        let ir_forward = lower(&forward).map_err(ctx("lower should succeed"))?;
+        let ir_reversed = lower(&reversed).map_err(ctx("lower should succeed"))?;
 
         assert_ne!(
             ir_forward.snapshot_id(),
             ir_reversed.snapshot_id(),
             "unnormalized list order must not be erased by the digest"
         );
+        Ok(())
     }
 
     #[test]
-    fn snapshot_id_is_deterministic_for_extended_config() {
+    fn snapshot_id_is_deterministic_for_extended_config() -> TestResult {
         // Unveränderte Config über zwei lower()-Aufrufe → identische Adresse.
-        let mut resolved = base_resolved("determinism-extended");
-        resolved.config = parse_config(READ_ONLY_CHILD_TOML);
+        let mut resolved = base_resolved("determinism-extended")?;
+        resolved.config = parse_config(READ_ONLY_CHILD_TOML)?;
 
-        let first = lower(&resolved).expect("first lower should succeed");
-        let second = lower(&resolved).expect("second lower should succeed");
+        let first = lower(&resolved).map_err(ctx("first lower should succeed"))?;
+        let second = lower(&resolved).map_err(ctx("second lower should succeed"))?;
 
         assert_eq!(
             first.snapshot_id(),
@@ -2195,18 +2233,22 @@ mod tests {
             "identical extended config must produce an identical SnapshotId"
         );
         assert_eq!(first.snapshot_id.0.len(), 64);
+        Ok(())
     }
 
     #[test]
-    fn changed_content_gets_a_new_snapshot_id() {
-        let unchanged = lower(&base_resolved("mutation-test")).expect("lower should succeed");
-        let changed = lower(&base_resolved("changed-mutation-test")).expect("lower should succeed");
+    fn changed_content_gets_a_new_snapshot_id() -> TestResult {
+        let unchanged =
+            lower(&base_resolved("mutation-test")?).map_err(ctx("lower should succeed"))?;
+        let changed =
+            lower(&base_resolved("changed-mutation-test")?).map_err(ctx("lower should succeed"))?;
 
         assert_ne!(
             unchanged.snapshot_id(),
             changed.snapshot_id(),
             "content changes must never retain an old snapshot ID"
         );
+        Ok(())
     }
 
     // -------------------------------------------------------------------
@@ -2219,13 +2261,13 @@ mod tests {
     /// a direct dependency on `harw-lens-types` (needed only to name
     /// `harw_lens_types::BudgetSpec` for a struct literal) — the budget is
     /// never consulted by `admits_program`, so its exact value is immaterial.
-    fn permissive_ceiling(sections: &[&str]) -> harw_context::ContextCeiling {
+    fn permissive_ceiling(sections: &[&str]) -> TestResult<harw_context::ContextCeiling> {
         let json = serde_json::json!({
             "sections": sections,
             "max_trust": "instruction",
             "budget": { "total": { "total": 1_000_000 }, "per_section": {} },
         });
-        serde_json::from_value(json).expect("ceiling fixture should deserialize")
+        serde_json::from_value(json).map_err(ctx("ceiling fixture should deserialize"))
     }
 
     fn context_section(
@@ -2244,19 +2286,19 @@ mod tests {
         id_str: &str,
         sections: Vec<crate::context_program::RawContextSectionSpec>,
         exclude: Vec<String>,
-    ) -> crate::context_program::ResolvedContextProgramDefinition {
-        crate::context_program::ResolvedContextProgramDefinition {
-            id: make_id(id_str),
-            version: make_version("1.0.0"),
+    ) -> TestResult<crate::context_program::ResolvedContextProgramDefinition> {
+        Ok(crate::context_program::ResolvedContextProgramDefinition {
+            id: make_id(id_str)?,
+            version: make_version("1.0.0")?,
             sections,
             exclude,
             trace: ResolutionTrace { steps: vec![] },
-        }
+        })
     }
 
     #[test]
-    fn from_resolved_program_maps_must_include_sections_only() {
-        let ceiling = permissive_ceiling(&["goal.invariants", "history.tail"]);
+    fn from_resolved_program_maps_must_include_sections_only() -> TestResult {
+        let ceiling = permissive_ceiling(&["goal.invariants", "history.tail"])?;
         let program = resolved_program(
             "harwness.context.mapping-test@1",
             vec![
@@ -2270,10 +2312,10 @@ mod tests {
                 ),
             ],
             vec!["memory.*".to_owned()],
-        );
+        )?;
 
         let cp = ContextProgram::from_resolved_program(&program, &ceiling)
-            .expect("program should be admitted");
+            .map_err(ctx("program should be admitted"))?;
 
         assert_eq!(
             cp.must_include().to_vec(),
@@ -2282,11 +2324,12 @@ mod tests {
         );
         assert_eq!(cp.exclude().to_vec(), vec!["memory.*".to_owned()]);
         assert_eq!(cp.context_policy(), Some("harwness.context.mapping-test@1"));
+        Ok(())
     }
 
     #[test]
-    fn from_resolved_program_rejects_section_outside_ceiling() {
-        let ceiling = permissive_ceiling(&["history.tail"]);
+    fn from_resolved_program_rejects_section_outside_ceiling() -> TestResult {
+        let ceiling = permissive_ceiling(&["history.tail"])?;
         let program = resolved_program(
             "harwness.context.overreaching@1",
             vec![context_section(
@@ -2294,17 +2337,18 @@ mod tests {
                 crate::context_program::SectionStrength::Normal,
             )],
             vec![],
-        );
+        )?;
 
         let result = ContextProgram::from_resolved_program(&program, &ceiling);
         assert!(
             result.is_err(),
             "a program requiring a section outside the ceiling must be rejected, not silently pruned"
         );
+        Ok(())
     }
 
     #[test]
-    fn from_resolved_program_same_program_same_snapshot_changed_program_differs() {
+    fn from_resolved_program_same_program_same_snapshot_changed_program_differs() -> TestResult {
         // Proves the guarantee this follow-up must not break (see
         // `crate::context_program`, "Das Programm bleibt Teil der SnapshotId"):
         // the same resolved context program yields the same SnapshotId; a
@@ -2313,7 +2357,7 @@ mod tests {
         // this test recomputes the digest directly (bypassing the cached
         // `ir.snapshot_id`, which `lower()` only ever sets once) to observe the
         // effect of swapping in a freshly-built `ContextProgram`.
-        let ceiling = permissive_ceiling(&["goal.invariants", "history.tail"]);
+        let ceiling = permissive_ceiling(&["goal.invariants", "history.tail"])?;
 
         let program_a = resolved_program(
             "harwness.context.snap-a@1",
@@ -2322,7 +2366,7 @@ mod tests {
                 crate::context_program::SectionStrength::MustInclude,
             )],
             vec![],
-        );
+        )?;
         let program_b = resolved_program(
             "harwness.context.snap-b@1",
             vec![context_section(
@@ -2330,16 +2374,17 @@ mod tests {
                 crate::context_program::SectionStrength::MustInclude,
             )],
             vec![],
-        );
+        )?;
 
         let cp_a1 = ContextProgram::from_resolved_program(&program_a, &ceiling)
-            .expect("program_a should be admitted");
+            .map_err(ctx("program_a should be admitted"))?;
         let cp_a2 = ContextProgram::from_resolved_program(&program_a, &ceiling)
-            .expect("program_a should be admitted");
+            .map_err(ctx("program_a should be admitted"))?;
         let cp_b = ContextProgram::from_resolved_program(&program_b, &ceiling)
-            .expect("program_b should be admitted");
+            .map_err(ctx("program_b should be admitted"))?;
 
-        let mut ir = lower(&base_resolved("snapshot-target")).expect("lower should succeed");
+        let mut ir =
+            lower(&base_resolved("snapshot-target")?).map_err(ctx("lower should succeed"))?;
 
         ir.context_program = cp_a1;
         let snap_a1 = compute_snapshot_id(&ir);
@@ -2358,6 +2403,7 @@ mod tests {
             snap_a1, snap_b,
             "a changed resolved context program must yield a different SnapshotId"
         );
+        Ok(())
     }
 
     // -------------------------------------------------------------------
@@ -2379,8 +2425,9 @@ mod tests {
     }
 
     #[test]
-    fn from_resolved_program_carries_detail_mode_for_every_section_regardless_of_strength() {
-        let ceiling = permissive_ceiling(&["goal.invariants", "history.tail", "plan.current"]);
+    fn from_resolved_program_carries_detail_mode_for_every_section_regardless_of_strength()
+    -> TestResult {
+        let ceiling = permissive_ceiling(&["goal.invariants", "history.tail", "plan.current"])?;
         let program = resolved_program(
             "harwness.context.detail-test@1",
             vec![
@@ -2401,10 +2448,10 @@ mod tests {
                 ),
             ],
             vec![],
-        );
+        )?;
 
         let cp = ContextProgram::from_resolved_program(&program, &ceiling)
-            .expect("program should be admitted");
+            .map_err(ctx("program should be admitted"))?;
 
         let details: Vec<(&str, harw_context::DetailMode)> = cp
             .section_detail()
@@ -2422,30 +2469,32 @@ mod tests {
             "section_detail must carry every section (including Normal-strength ones) \
              in declaration order, unlike must_include which filters by strength"
         );
+        Ok(())
     }
 
     #[test]
-    fn lower_from_config_path_never_populates_section_detail() {
+    fn lower_from_config_path_never_populates_section_detail() -> TestResult {
         // The `[context]`/`[context_program]` free-form config path (used by
         // `lower`) has no per-section detail grammar; only
         // `from_resolved_program` (declared `harwness.context.<name>@<v>`
         // programs) can populate `section_detail`.
-        let mut resolved = base_resolved("config-path-worker");
+        let mut resolved = base_resolved("config-path-worker")?;
         resolved.config = parse_config(
             r#"
             [context]
             must_include = ["mission.md"]
             "#,
-        );
-        let ir = lower(&resolved).expect("lower should succeed");
+        )?;
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
         assert!(ir.context_program().section_detail().is_empty());
+        Ok(())
     }
 
     #[test]
-    fn snapshot_id_changes_when_only_a_section_detail_mode_changes() {
+    fn snapshot_id_changes_when_only_a_section_detail_mode_changes() -> TestResult {
         // Two programs identical except for one section's DetailMode must
         // never alias to the same SnapshotId.
-        let ceiling = permissive_ceiling(&["history.tail"]);
+        let ceiling = permissive_ceiling(&["history.tail"])?;
 
         let program_summary = resolved_program(
             "harwness.context.detail-sensitivity@1",
@@ -2455,7 +2504,7 @@ mod tests {
                 harw_context::DetailMode::Summary,
             )],
             vec![],
-        );
+        )?;
         let program_full = resolved_program(
             "harwness.context.detail-sensitivity@1",
             vec![context_section_with_detail(
@@ -2464,14 +2513,15 @@ mod tests {
                 harw_context::DetailMode::Full,
             )],
             vec![],
-        );
+        )?;
 
         let cp_summary = ContextProgram::from_resolved_program(&program_summary, &ceiling)
-            .expect("program should be admitted");
+            .map_err(ctx("program should be admitted"))?;
         let cp_full = ContextProgram::from_resolved_program(&program_full, &ceiling)
-            .expect("program should be admitted");
+            .map_err(ctx("program should be admitted"))?;
 
-        let mut ir = lower(&base_resolved("detail-sensitivity-target")).expect("lower should succeed");
+        let mut ir = lower(&base_resolved("detail-sensitivity-target")?)
+            .map_err(ctx("lower should succeed"))?;
 
         ir.context_program = cp_summary;
         let snap_summary = compute_snapshot_id(&ir);
@@ -2483,15 +2533,16 @@ mod tests {
             snap_summary, snap_full,
             "a changed DetailMode on an otherwise identical section must change the SnapshotId"
         );
+        Ok(())
     }
 
     #[test]
-    fn snapshot_id_is_stable_across_repeated_lowering_with_section_detail_present() {
+    fn snapshot_id_is_stable_across_repeated_lowering_with_section_detail_present() -> TestResult {
         // Mirrors `snapshot_id_is_deterministic_across_lower_calls` but with a
         // populated `section_detail`, proving repeated lowering stays stable
         // for the new field too (not just a fixed literal digest, per the
         // node's brief: no golden hash-value test exists in this module).
-        let ceiling = permissive_ceiling(&["history.tail"]);
+        let ceiling = permissive_ceiling(&["history.tail"])?;
         let program = resolved_program(
             "harwness.context.stability-check@1",
             vec![context_section_with_detail(
@@ -2500,15 +2551,17 @@ mod tests {
                 harw_context::DetailMode::References,
             )],
             vec![],
-        );
+        )?;
         let cp = ContextProgram::from_resolved_program(&program, &ceiling)
-            .expect("program should be admitted");
+            .map_err(ctx("program should be admitted"))?;
 
-        let mut ir1 = lower(&base_resolved("stability-check")).expect("lower should succeed");
+        let mut ir1 =
+            lower(&base_resolved("stability-check")?).map_err(ctx("lower should succeed"))?;
         ir1.context_program = cp.clone();
         let snap1 = compute_snapshot_id(&ir1);
 
-        let mut ir2 = lower(&base_resolved("stability-check")).expect("lower should succeed");
+        let mut ir2 =
+            lower(&base_resolved("stability-check")?).map_err(ctx("lower should succeed"))?;
         ir2.context_program = cp;
         let snap2 = compute_snapshot_id(&ir2);
 
@@ -2516,6 +2569,7 @@ mod tests {
             snap1, snap2,
             "identical section_detail content must produce an identical SnapshotId across repeated lowering"
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2524,29 +2578,35 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_lower_passes_through_absent_reasoning_effort() {
-        let resolved = base_resolved_with_reasoning_effort("worker", None);
-        let ir = lower(&resolved).expect("lower should succeed");
+    fn test_lower_passes_through_absent_reasoning_effort() -> TestResult {
+        let resolved = base_resolved_with_reasoning_effort("worker", None)?;
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
         assert_eq!(ir.reasoning_effort(), None);
+        Ok(())
     }
 
     #[test]
-    fn test_lower_passes_through_set_reasoning_effort() {
-        let resolved = base_resolved_with_reasoning_effort("worker", Some("high"));
-        let ir = lower(&resolved).expect("lower should succeed");
+    fn test_lower_passes_through_set_reasoning_effort() -> TestResult {
+        let resolved = base_resolved_with_reasoning_effort("worker", Some("high"))?;
+        let ir = lower(&resolved).map_err(ctx("lower should succeed"))?;
         assert_eq!(ir.reasoning_effort(), Some("high"));
+        Ok(())
     }
 
     #[test]
-    fn test_snapshot_id_differs_when_reasoning_effort_differs() {
-        let ir1 = lower(&base_resolved_with_reasoning_effort("worker", Some("low")))
-            .expect("lower should succeed");
-        let ir2 = lower(&base_resolved_with_reasoning_effort("worker", Some("high")))
-            .expect("lower should succeed");
+    fn test_snapshot_id_differs_when_reasoning_effort_differs() -> TestResult {
+        let ir1 = lower(&base_resolved_with_reasoning_effort("worker", Some("low"))?)
+            .map_err(ctx("lower should succeed"))?;
+        let ir2 = lower(&base_resolved_with_reasoning_effort(
+            "worker",
+            Some("high"),
+        )?)
+        .map_err(ctx("lower should succeed"))?;
         assert_ne!(
             ir1.snapshot_id(),
             ir2.snapshot_id(),
             "reasoning_effort participates in the content hash (v5)"
         );
+        Ok(())
     }
 }

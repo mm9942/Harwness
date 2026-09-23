@@ -1,7 +1,7 @@
 //! JSON-RPC-2.0-inspiriertes Envelope-Format für Transport über Channels
 //! (stdio, WebSocket, IPC).
 
-use serde::{de::Deserializer, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Deserializer};
 use serde_json::Value;
 
 const CURRENT_PROTOCOL_MAJOR: u32 = 1;
@@ -181,9 +181,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
-    fn inbound_envelopes_require_jsonrpc_2_0() {
+    fn inbound_envelopes_require_jsonrpc_2_0() -> TestResult {
         let request = r#"{"id":"1","method":"turn.submit","params":{}}"#;
         assert!(serde_json::from_str::<RequestEnvelope>(request).is_err());
 
@@ -191,8 +192,10 @@ mod tests {
         assert!(serde_json::from_str::<RequestEnvelope>(wrong).is_err());
 
         let notification = r#"{"jsonrpc":"2.0","method":"event.turn","params":{}}"#;
-        let parsed = serde_json::from_str::<NotificationEnvelope>(notification).unwrap();
+        let parsed = serde_json::from_str::<NotificationEnvelope>(notification)
+            .map_err(ctx("Notification-Envelope parsen"))?;
         assert_eq!(parsed.jsonrpc, "2.0");
+        Ok(())
     }
 
     #[test]
@@ -220,16 +223,19 @@ mod tests {
     }
 
     #[test]
-    fn inbound_requests_require_a_supported_protocol_version() {
+    fn inbound_requests_require_a_supported_protocol_version() -> TestResult {
         let without_protocol = r#"{"jsonrpc":"2.0","id":"1","method":"turn.submit","params":{}}"#;
         assert!(serde_json::from_str::<RequestEnvelope>(without_protocol).is_err());
 
         let supported = r#"{"jsonrpc":"2.0","id":"1","method":"turn.submit","params":{},"protocol":{"major":1,"minor":7}}"#;
-        let parsed = serde_json::from_str::<RequestEnvelope>(supported).unwrap();
+        let parsed = serde_json::from_str::<RequestEnvelope>(supported).map_err(ctx(
+            "Request-Envelope mit unterstützter Protokollversion parsen",
+        ))?;
         assert_eq!(parsed.protocol.major, 1);
         assert_eq!(parsed.protocol.minor, 7);
 
         let unsupported = r#"{"jsonrpc":"2.0","id":"1","method":"turn.submit","params":{},"protocol":{"major":2,"minor":0}}"#;
         assert!(serde_json::from_str::<RequestEnvelope>(unsupported).is_err());
+        Ok(())
     }
 }

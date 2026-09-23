@@ -214,14 +214,15 @@ pub fn build_root_model_with_registry_and_resolver(
                     ));
                 }
             };
-            let (provider, registry) = harw_provider_http::build_provider_with_load_registry_and_home(
-                effective_config,
-                spec.home.as_path(),
-                resolver,
-            )
-            .map_err(|error| RuntimeError::Provider {
-                detail: error.to_string(),
-            })?;
+            let (provider, registry) =
+                harw_provider_http::build_provider_with_load_registry_and_home(
+                    effective_config,
+                    spec.home.as_path(),
+                    resolver,
+                )
+                .map_err(|error| RuntimeError::Provider {
+                    detail: error.to_string(),
+                })?;
             Ok((Arc::from(provider), registry))
         }
     }
@@ -543,7 +544,11 @@ impl UiaDefaultRouteProvider {
     ///
     /// # Returns
     /// Einen fertig konfigurierten `UiaDefaultRouteProvider`.
-    fn new(inner: Arc<dyn ModelProvider>, default_provider_id: ProviderId, default_model_id: ModelId) -> Self {
+    fn new(
+        inner: Arc<dyn ModelProvider>,
+        default_provider_id: ProviderId,
+        default_model_id: ModelId,
+    ) -> Self {
         Self {
             inner,
             default_provider_id,
@@ -722,6 +727,7 @@ impl ModelProvider for UnusableModelProvider {
 mod tests {
     use super::*;
     use crate::spec::EntryKind;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_config::{HarnessConfig, OriginAllowlistToml, ProviderToml};
     use harw_core::{ModelRequest, ModelResponse};
     use harw_extension_api::types::LoadedInstructions;
@@ -777,6 +783,7 @@ mod tests {
                 max_concurrency: None,
                 originator: None,
                 default_reasoning_effort: None,
+                gateway_identity_headers: false,
             },
         );
         config
@@ -802,6 +809,7 @@ mod tests {
                 max_concurrency: None,
                 originator: None,
                 default_reasoning_effort: None,
+                gateway_identity_headers: false,
             },
         );
     }
@@ -848,32 +856,33 @@ mod tests {
         )
     }
 
-    fn respond(provider: &dyn ModelProvider) -> ModelResponse {
+    fn respond(provider: &dyn ModelProvider) -> TestResult<ModelResponse> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
-            .expect("current-thread runtime");
+            .map_err(ctx("current-thread runtime"))?;
         runtime
             .block_on(provider.respond(empty_request()))
-            .expect("echo response")
+            .map_err(ctx("echo response"))
     }
 
     #[test]
-    fn echo_source_answers_with_its_reply() {
+    fn echo_source_answers_with_its_reply() -> TestResult {
         let spec = spec_for(Path::new("/nonexistent-home"));
         let model = build_root_model(
             &spec,
             &ResolvedConfig::default(),
             ModelSource::Echo("echo: hallo".to_owned()),
         )
-        .expect("echo provider");
+        .map_err(ctx("echo provider"))?;
 
-        let response = respond(model.as_ref());
+        let response = respond(model.as_ref())?;
         assert_eq!(response.message.as_deref(), Some("echo: hallo"));
         assert!(response.is_final());
+        Ok(())
     }
 
     #[test]
-    fn override_source_is_passed_through_unchanged() {
+    fn override_source_is_passed_through_unchanged() -> TestResult {
         let spec = spec_for(Path::new("/nonexistent-home"));
         let provided: Arc<dyn ModelProvider> = Arc::new(EchoModelProvider::new("bereitgestellt"));
         let model = build_root_model(
@@ -881,20 +890,22 @@ mod tests {
             &ResolvedConfig::default(),
             ModelSource::Override(Arc::clone(&provided)),
         )
-        .expect("override provider");
+        .map_err(ctx("override provider"))?;
 
         assert!(Arc::ptr_eq(&provided, &model));
         assert_eq!(
-            respond(model.as_ref()).message.as_deref(),
+            respond(model.as_ref())?.message.as_deref(),
             Some("bereitgestellt")
         );
+        Ok(())
     }
 
     #[test]
-    fn configured_source_builds_the_loopback_provider() {
+    fn configured_source_builds_the_loopback_provider() -> TestResult {
         let spec = spec_for(Path::new("/nonexistent-home"));
         build_root_model(&spec, &loopback_config(), ModelSource::Configured)
-            .expect("configured provider");
+            .map_err(ctx("configured provider"))?;
+        Ok(())
     }
 
     /// F-046-style Verhalten: ohne jeden nutzbaren Provider/jedes nutzbare
@@ -902,29 +913,34 @@ mod tests {
     /// tatsächlich ein Modell-Aufruf versucht wird, nicht beim Bau des
     /// Root-Modells.
     #[test]
-    fn configured_source_without_any_usable_provider_starts_and_fails_only_on_a_model_call() {
+    fn configured_source_without_any_usable_provider_starts_and_fails_only_on_a_model_call()
+    -> TestResult {
         let spec = spec_for(Path::new("/nonexistent-home"));
         let model = build_root_model(&spec, &ResolvedConfig::default(), ModelSource::Configured)
-            .expect("a config without any usable provider must still start");
+            .map_err(ctx("a config without any usable provider must still start"))?;
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
-            .expect("current-thread runtime");
-        let error = runtime
-            .block_on(model.respond(empty_request()))
-            .expect_err("a model call must fail clearly when nothing is configured");
+            .map_err(ctx("current-thread runtime"))?;
+        let Err(error) = runtime.block_on(model.respond(empty_request())) else {
+            return Err(TestError::Unexpected(
+                "a model call must fail clearly when nothing is configured".into(),
+            ));
+        };
         assert!(matches!(
             error,
             harw_core::ModelError::RequestFailed(ref message)
                 if message.contains("no usable model/provider is configured")
         ));
+        Ok(())
     }
 
     /// F-046-Regression: ein hängender `default_provider` darf den Start
     /// nicht abbrechen, solange ein anderer, katalogisierter Provider
     /// tatsächlich nutzbar ist.
     #[test]
-    fn configured_source_falls_back_to_first_usable_catalog_model_when_default_is_dangling() {
+    fn configured_source_falls_back_to_first_usable_catalog_model_when_default_is_dangling()
+    -> TestResult {
         let spec = spec_for(Path::new("/nonexistent-home"));
         let mut config = loopback_config();
         config.harness.default_provider = Some("gpt-5.6-terra-provider".to_owned());
@@ -946,8 +962,10 @@ mod tests {
             },
         );
 
-        build_root_model(&spec, &config, ModelSource::Configured)
-            .expect("a dangling default must fall back to the usable catalog model");
+        build_root_model(&spec, &config, ModelSource::Configured).map_err(ctx(
+            "a dangling default must fall back to the usable catalog model",
+        ))?;
+        Ok(())
     }
 
     #[test]
@@ -960,52 +978,62 @@ mod tests {
     }
 
     #[test]
-    fn resolve_default_model_ignores_a_disabled_default_provider() {
+    fn resolve_default_model_ignores_a_disabled_default_provider() -> TestResult {
         let mut config = loopback_config();
         config
             .providers
             .get_mut("local")
-            .expect("provider")
+            .ok_or(TestError::Missing("provider"))?
             .enabled = false;
 
         assert!(matches!(
             resolve_default_model(&config),
             DefaultModelResolution::NoneUsable
         ));
+        Ok(())
     }
 
     #[test]
-    fn configured_source_rejects_a_non_loopback_plaintext_endpoint() {
+    fn configured_source_rejects_a_non_loopback_plaintext_endpoint() -> TestResult {
         let spec = spec_for(Path::new("/nonexistent-home"));
         let mut config = loopback_config();
         config
             .providers
             .get_mut("local")
-            .expect("provider")
+            .ok_or(TestError::Missing("provider"))?
             .base_url = "http://provider.example/v1".to_owned();
 
         let Err(error) = build_root_model(&spec, &config, ModelSource::Configured) else {
-            panic!("plaintext http to a remote host must not build a provider");
+            return Err(TestError::Unexpected(
+                "plaintext http to a remote host must not build a provider".into(),
+            ));
         };
         assert!(matches!(error, RuntimeError::Provider { .. }), "{error}");
+        Ok(())
     }
 
     #[test]
-    fn file_credentials_outside_home_secrets_fail_closed() {
+    fn file_credentials_outside_home_secrets_fail_closed() -> TestResult {
         let spec = spec_for(Path::new("/nonexistent-home"));
         let mut config = loopback_config();
-        let provider = config.providers.get_mut("local").expect("provider");
+        let provider = config
+            .providers
+            .get_mut("local")
+            .ok_or(TestError::Missing("provider"))?;
         provider.auth_header = Some("bearer".to_owned());
         provider.auth = Some(harw_config::SecretRef::File("/etc/hostname".to_owned()));
 
         let Err(error) = build_root_model(&spec, &config, ModelSource::Configured) else {
-            panic!("a file: credential outside <home>/secrets must not resolve");
+            return Err(TestError::Unexpected(
+                "a file: credential outside <home>/secrets must not resolve".into(),
+            ));
         };
         assert!(matches!(error, RuntimeError::Provider { .. }), "{error}");
         assert!(
             !error.to_string().contains("/etc/hostname"),
             "der Fehlertext darf die Referenz nicht im Klartext nennen: {error}"
         );
+        Ok(())
     }
 
     #[test]
@@ -1027,7 +1055,7 @@ mod tests {
     // ── resolve_uia_model / build_uia_model ─────────────────────────────
 
     #[test]
-    fn resolve_uia_model_prefers_the_configured_pair_when_usable() {
+    fn resolve_uia_model_prefers_the_configured_pair_when_usable() -> TestResult {
         let mut config = loopback_config();
         config.harness.uia_provider = Some("local".to_owned());
         config.harness.uia_model = Some("uia-model".to_owned());
@@ -1036,19 +1064,22 @@ mod tests {
             UiaModelResolution::Explicit { provider, model } => {
                 assert_eq!(provider, "local");
                 assert_eq!(model, "uia-model");
+                Ok(())
             }
-            UiaModelResolution::UsesDefault => panic!("expected an explicit uia pair"),
+            UiaModelResolution::UsesDefault => Err(TestError::Unexpected(
+                "expected an explicit uia pair".into(),
+            )),
         }
     }
 
     #[test]
-    fn resolve_uia_model_falls_back_to_default_when_uia_provider_is_disabled() {
+    fn resolve_uia_model_falls_back_to_default_when_uia_provider_is_disabled() -> TestResult {
         let mut config = loopback_config();
         insert_loopback_provider(&mut config, "uia-only");
         config
             .providers
             .get_mut("uia-only")
-            .expect("provider")
+            .ok_or(TestError::Missing("provider"))?
             .enabled = false;
         config.harness.uia_provider = Some("uia-only".to_owned());
         config.harness.uia_model = Some("uia-model".to_owned());
@@ -1057,6 +1088,7 @@ mod tests {
             resolve_uia_model(&config),
             UiaModelResolution::UsesDefault
         ));
+        Ok(())
     }
 
     #[test]
@@ -1071,16 +1103,17 @@ mod tests {
     }
 
     #[test]
-    fn build_uia_model_returns_the_default_tree_model_unchanged_for_echo_source() {
+    fn build_uia_model_returns_the_default_tree_model_unchanged_for_echo_source() -> TestResult {
         let spec = spec_for(Path::new("/nonexistent-home"));
         let config = loopback_config();
         let default_tree_model: Arc<dyn ModelProvider> =
             Arc::new(EchoModelProvider::new("echo: hallo"));
 
         let uia_model = build_uia_model(&spec, &config, false, &default_tree_model)
-            .expect("echo/override path never fails to build");
+            .map_err(ctx("echo/override path never fails to build"))?;
 
         assert!(Arc::ptr_eq(&default_tree_model, &uia_model));
+        Ok(())
     }
 
     /// Beweistest: `uia_provider` weicht von `default_provider` ab — der
@@ -1090,14 +1123,15 @@ mod tests {
     /// leere zusätzliche Registry — es gibt nichts Neues zu registrieren,
     /// weil kein zweiter HTTP-Client entstanden ist.
     #[test]
-    fn build_uia_model_explicit_branch_wraps_the_default_router_without_building_a_second_one() {
+    fn build_uia_model_explicit_branch_wraps_the_default_router_without_building_a_second_one()
+    -> TestResult {
         let spec = spec_for(Path::new("/nonexistent-home"));
         let mut config = two_provider_config();
         config.harness.uia_provider = Some("local-b".to_owned());
         config.harness.uia_model = Some("local-b-model".to_owned());
 
         let default_tree_model = build_root_model(&spec, &config, ModelSource::Configured)
-            .expect("default provider (local-a) must build");
+            .map_err(ctx("default provider (local-a) must build"))?;
         let (uia_model, uia_registry) = build_uia_model_with_registry_and_resolver(
             &spec,
             &config,
@@ -1105,7 +1139,9 @@ mod tests {
             &default_tree_model,
             None,
         )
-        .expect("explicit uia branch must not fail — no client is built");
+        .map_err(ctx(
+            "explicit uia branch must not fail — no client is built",
+        ))?;
 
         assert!(
             !Arc::ptr_eq(&default_tree_model, &uia_model),
@@ -1117,6 +1153,7 @@ mod tests {
             "the explicit uia branch must not build a second HTTP client/registry entry — the \
              default router already registers every enabled provider"
         );
+        Ok(())
     }
 
     /// Beweistest: eine Anfrage ohne eigene `provider_id`/`model_id` über den
@@ -1126,20 +1163,20 @@ mod tests {
     /// ähnlich scheitern; ein `RequestFailed` mit einer Meldung, die auf
     /// einen fehlenden Provider hindeutet, wäre ein Fehlschlag dieses Tests.
     #[test]
-    fn build_uia_model_explicit_branch_routes_default_requests_to_the_uia_provider() {
+    fn build_uia_model_explicit_branch_routes_default_requests_to_the_uia_provider() -> TestResult {
         let spec = spec_for(Path::new("/nonexistent-home"));
         let mut config = two_provider_config();
         config.harness.uia_provider = Some("local-b".to_owned());
         config.harness.uia_model = Some("local-b-model".to_owned());
 
         let default_tree_model = build_root_model(&spec, &config, ModelSource::Configured)
-            .expect("default provider (local-a) must build");
+            .map_err(ctx("default provider (local-a) must build"))?;
         let uia_model = build_uia_model(&spec, &config, true, &default_tree_model)
-            .expect("explicit uia branch must not fail");
+            .map_err(ctx("explicit uia branch must not fail"))?;
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
-            .expect("current-thread runtime");
+            .map_err(ctx("current-thread runtime"))?;
         // Kein eigener provider_id/model_id im Request — muss auf die
         // UIA-Standardroute (local-b) fallen, nicht auf local-a und nicht
         // auf einen unbekannten Provider.
@@ -1152,6 +1189,7 @@ mod tests {
                  'local-b', which is registered in the default router: {message}"
             );
         }
+        Ok(())
     }
 
     /// Beweistest: eine Anfrage mit **eigener** `provider_id` wird respektiert
@@ -1159,20 +1197,23 @@ mod tests {
     /// (`/uia-model switch`, `SessionController::apply_to_session`) nicht
     /// überschreiben, im Unterschied zu [`PinnedModelProvider`].
     #[test]
-    fn build_uia_model_explicit_branch_respects_an_already_set_provider_id() {
+    fn build_uia_model_explicit_branch_respects_an_already_set_provider_id() -> TestResult {
         let spec = spec_for(Path::new("/nonexistent-home"));
         let mut config = two_provider_config();
         config.harness.uia_provider = Some("local-b".to_owned());
         config.harness.uia_model = Some("local-b-model".to_owned());
 
         let default_tree_model = build_root_model(&spec, &config, ModelSource::Configured)
-            .expect("default provider (local-a) must build");
+            .map_err(ctx("default provider (local-a) must build"))?;
         let uia_model = build_uia_model(&spec, &config, true, &default_tree_model)
-            .expect("explicit uia branch must not fail");
+            .map_err(ctx("explicit uia branch must not fail"))?;
 
+        // `enable_all`: der unerreichbare Loopback-Provider liefert einen
+        // Transportfehler, den der `RetryingProvider` mit Backoff wiederholt.
         let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
-            .expect("current-thread runtime");
+            .map_err(ctx("current-thread runtime"))?;
         // Live-Auswahl auf "local-a" gesetzt — die UIA-Standardroute
         // ("local-b") darf das nicht überschreiben.
         let request = empty_request().with_provider_id(Some(ProviderId::from("local-a")));
@@ -1185,6 +1226,7 @@ mod tests {
                  overwritten by the uia default route: {message}"
             );
         }
+        Ok(())
     }
 
     // ── resolve_uia_worker_model / build_uia_worker_model ───────────────
@@ -1218,7 +1260,7 @@ mod tests {
     }
 
     #[test]
-    fn build_uia_worker_model_pins_only_model_id_never_provider_id() {
+    fn build_uia_worker_model_pins_only_model_id_never_provider_id() -> TestResult {
         let mut config = loopback_config();
         config.harness.uia_worker_model = Some("local-model".to_owned());
         config
@@ -1236,20 +1278,23 @@ mod tests {
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
-            .expect("current-thread runtime");
+            .map_err(ctx("current-thread runtime"))?;
         let caller_provider_id = ProviderId::from("whatever-the-caller-already-set");
         let request = empty_request().with_provider_id(Some(caller_provider_id.clone()));
         runtime
             .block_on(worker_model.respond(request))
-            .expect("recording provider never fails");
+            .map_err(ctx("recording provider never fails"))?;
 
-        let recorded = recorder.last().expect("request must have been forwarded");
+        let recorded = recorder
+            .last()
+            .ok_or(TestError::Missing("request must have been forwarded"))?;
         assert_eq!(recorded.model_id, Some(ModelId::from("local-model")));
         assert_eq!(
             recorded.provider_id,
             Some(caller_provider_id),
             "provider_id must pass through untouched — only model_id may be pinned"
         );
+        Ok(())
     }
 
     #[test]

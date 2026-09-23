@@ -152,10 +152,11 @@ fn default_max_expand_depth() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn test_plan_section_defaults_from_empty_toml() {
-        let section: PlanSection = toml::from_str("").unwrap();
+    fn test_plan_section_defaults_from_empty_toml() -> TestResult {
+        let section: PlanSection = toml::from_str("").map_err(ctx("empty toml parses"))?;
         assert!(section.enabled);
         assert!(section.persist);
         assert!(!section.require_for_complex_work);
@@ -169,16 +170,18 @@ mod tests {
         assert_eq!(section.exploration_ttl_secs, 86_400);
         assert_eq!(section.max_expand_depth, 3);
         assert_eq!(section, PlanSection::default());
+        Ok(())
     }
 
     #[test]
-    fn test_tools_section_defaults_when_absent() {
-        let tools: ToolsSection = toml::from_str("").unwrap();
+    fn test_tools_section_defaults_when_absent() -> TestResult {
+        let tools: ToolsSection = toml::from_str("").map_err(ctx("empty toml parses"))?;
         assert_eq!(tools.plan, PlanSection::default());
+        Ok(())
     }
 
     #[test]
-    fn test_plan_section_full_toml_round_trip() {
+    fn test_plan_section_full_toml_round_trip() -> TestResult {
         let src = r#"
             enabled = true
             persist = true
@@ -190,7 +193,7 @@ mod tests {
             exploration_ttl_secs = 120
             max_expand_depth = 5
         "#;
-        let section: PlanSection = toml::from_str(src).unwrap();
+        let section: PlanSection = toml::from_str(src).map_err(ctx("valid toml parses"))?;
         assert!(section.enabled);
         assert!(section.persist);
         assert!(section.require_for_complex_work);
@@ -204,31 +207,39 @@ mod tests {
         assert_eq!(section.exploration_ttl_secs, 120);
         assert_eq!(section.max_expand_depth, 5);
 
-        let encoded = toml::to_string(&section).unwrap();
-        let decoded: PlanSection = toml::from_str(&encoded).unwrap();
+        let encoded = toml::to_string(&section).map_err(ctx("section serializes"))?;
+        let decoded: PlanSection =
+            toml::from_str(&encoded).map_err(ctx("serialized toml parses"))?;
         assert_eq!(decoded, section);
+        Ok(())
     }
 
     #[test]
-    fn test_tools_plan_nested_table_round_trip() {
+    fn test_tools_plan_nested_table_round_trip() -> TestResult {
         let src = r#"
             [plan]
             enabled = true
             max_nodes = 10
         "#;
-        let tools: ToolsSection = toml::from_str(src).unwrap();
+        let tools: ToolsSection = toml::from_str(src).map_err(ctx("valid toml parses"))?;
         assert!(tools.plan.enabled);
         assert_eq!(tools.plan.max_nodes, 10);
+        Ok(())
     }
 
     #[test]
-    fn test_plan_section_rejects_unknown_field() {
+    fn test_plan_section_rejects_unknown_field() -> TestResult {
         let src = r#"
             enabled = true
             enalbed = true
         "#;
-        let error = toml::from_str::<PlanSection>(src).unwrap_err();
+        let Err(error) = toml::from_str::<PlanSection>(src) else {
+            return Err(TestError::Unexpected(
+                "unknown field must be rejected".into(),
+            ));
+        };
         assert!(error.to_string().contains("unknown field"));
+        Ok(())
     }
 
     #[test]
@@ -241,33 +252,44 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rejects_zero_max_nodes() {
+    fn test_validate_rejects_zero_max_nodes() -> TestResult {
         let section = PlanSection {
             max_nodes: 0,
             ..Default::default()
         };
-        let error = section.validate().unwrap_err();
+        let Err(error) = section.validate() else {
+            return Err(TestError::Unexpected("zero max_nodes must fail".into()));
+        };
         assert!(error.contains("max_nodes"));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_zero_max_expand_depth() {
+    fn test_validate_rejects_zero_max_expand_depth() -> TestResult {
         let section = PlanSection {
             max_expand_depth: 0,
             ..Default::default()
         };
-        let error = section.validate().unwrap_err();
+        let Err(error) = section.validate() else {
+            return Err(TestError::Unexpected(
+                "zero max_expand_depth must fail".into(),
+            ));
+        };
         assert!(error.contains("max_expand_depth"));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_unknown_exploration_node_kind() {
+    fn test_validate_rejects_unknown_exploration_node_kind() -> TestResult {
         let section = PlanSection {
             require_exploration_for: vec!["not_a_real_kind".to_owned()],
             ..Default::default()
         };
-        let error = section.validate().unwrap_err();
+        let Err(error) = section.validate() else {
+            return Err(TestError::Unexpected("unknown node kind must fail".into()));
+        };
         assert!(error.contains("not_a_real_kind"));
+        Ok(())
     }
 
     #[test]

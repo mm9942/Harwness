@@ -327,7 +327,9 @@ impl Sensor for MemorySensor {
 /// `pairs` fehlt, oder wenn [`parse_meminfo_value`] seinen Wert ablehnt. Der
 /// nicht passende Zeileninhalt erscheint nie in der Fehlermeldung —
 /// [`SensorError::MalformedSource`] ist inhaltsfrei.
-fn select_known_fields(pairs: &[(String, String)]) -> Result<Vec<(&'static str, u64)>, SensorError> {
+fn select_known_fields(
+    pairs: &[(String, String)],
+) -> Result<Vec<(&'static str, u64)>, SensorError> {
     KNOWN_FIELDS
         .iter()
         .map(|&(key, metric)| {
@@ -388,9 +390,9 @@ fn parse_meminfo_value(raw: &str) -> Result<u64, SensorError> {
 
     match unit {
         None => Ok(value),
-        Some(suffix) if suffix == KIB_UNIT_SUFFIX => {
-            value.checked_mul(BYTES_PER_KIB).ok_or(SensorError::MalformedSource)
-        }
+        Some(suffix) if suffix == KIB_UNIT_SUFFIX => value
+            .checked_mul(BYTES_PER_KIB)
+            .ok_or(SensorError::MalformedSource),
         Some(_) => Err(SensorError::MalformedSource),
     }
 }
@@ -398,6 +400,7 @@ fn parse_meminfo_value(raw: &str) -> Result<u64, SensorError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn pairs_from(entries: &[(&str, &str)]) -> Vec<(String, String)> {
         entries
@@ -407,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_known_fields_maps_middle_of_file_value_correctly() {
+    fn test_select_known_fields_maps_middle_of_file_value_correctly() -> TestResult {
         // MemAvailable steht hier absichtlich nicht an erster Stelle — der
         // Test belegt, dass die Zuordnung über den Schlüssel erfolgt, nicht
         // über die Zeilenposition.
@@ -421,17 +424,21 @@ mod tests {
             ("SwapFree", "1048574 kB"),
         ]);
 
-        let fields = select_known_fields(&pairs).expect("vollständige Felder müssen geparst werden");
+        let fields = select_known_fields(&pairs)
+            .map_err(ctx("vollständige Felder müssen geparst werden"))?;
 
         let mem_available = fields
             .iter()
             .find(|(metric, _)| *metric == "mem_available_bytes")
-            .expect("mem_available_bytes muss enthalten sein");
+            .ok_or(TestError::Missing(
+                "mem_available_bytes muss enthalten sein",
+            ))?;
         assert_eq!(mem_available.1, 9_321_236 * 1024);
+        Ok(())
     }
 
     #[test]
-    fn test_select_known_fields_ignores_unknown_lines() {
+    fn test_select_known_fields_ignores_unknown_lines() -> TestResult {
         let pairs = pairs_from(&[
             ("MemTotal", "1024 kB"),
             ("MemFree", "512 kB"),
@@ -442,12 +449,14 @@ mod tests {
             ("Dirty", "128 kB"),
         ]);
 
-        let fields = select_known_fields(&pairs).expect("unbekannte Zeilen dürfen nicht scheitern");
+        let fields =
+            select_known_fields(&pairs).map_err(ctx("unbekannte Zeilen dürfen nicht scheitern"))?;
         assert_eq!(fields.len(), MAX_CARDINALITY);
+        Ok(())
     }
 
     #[test]
-    fn test_select_known_fields_rejects_missing_known_key() {
+    fn test_select_known_fields_rejects_missing_known_key() -> TestResult {
         // SwapFree fehlt vollständig (z. B. weil ihre Zeile keinen ':' trug
         // und deshalb schon von read_key_values übersprungen wurde).
         let pairs = pairs_from(&[
@@ -457,56 +466,94 @@ mod tests {
             ("SwapTotal", "0 kB"),
         ]);
 
-        let err = select_known_fields(&pairs).expect_err("fehlender Schlüssel muss scheitern");
+        let Err(err) = select_known_fields(&pairs) else {
+            return Err(TestError::Unexpected(
+                "fehlender Schlüssel muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
+        Ok(())
     }
 
     #[test]
-    fn test_select_known_fields_rejects_empty_input() {
+    fn test_select_known_fields_rejects_empty_input() -> TestResult {
         let pairs: Vec<(String, String)> = Vec::new();
-        let err = select_known_fields(&pairs).expect_err("leere Paarliste muss scheitern");
+        let Err(err) = select_known_fields(&pairs) else {
+            return Err(TestError::Unexpected(
+                "leere Paarliste muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_meminfo_value_converts_kib_to_bytes() {
-        assert_eq!(parse_meminfo_value("16316360 kB").unwrap(), 16_316_360 * 1024);
+    fn test_parse_meminfo_value_converts_kib_to_bytes() -> TestResult {
+        assert_eq!(
+            parse_meminfo_value("16316360 kB").map_err(ctx("gültiger Wert mit kB-Einheit"))?,
+            16_316_360 * 1024
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_parse_meminfo_value_handles_value_without_unit_suffix() {
+    fn test_parse_meminfo_value_handles_value_without_unit_suffix() -> TestResult {
         // Der wichtigste Robustheitsfall für die Einheitenbehandlung: eine
         // Zeile ohne " kB" (wie "HugePages_Total: 0" in einem echten
         // /proc/meminfo) darf nicht scheitern und wird unverändert, ohne
         // Multiplikation, übernommen.
-        assert_eq!(parse_meminfo_value("0").unwrap(), 0);
-        assert_eq!(parse_meminfo_value("42").unwrap(), 42);
+        assert_eq!(
+            parse_meminfo_value("0").map_err(ctx("Wert ohne Einheit"))?,
+            0
+        );
+        assert_eq!(
+            parse_meminfo_value("42").map_err(ctx("Wert ohne Einheit"))?,
+            42
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_parse_meminfo_value_rejects_non_numeric_content_without_leaking_it() {
-        let err = parse_meminfo_value("not-a-number kB")
-            .expect_err("nicht-numerischer Wert muss scheitern");
+    fn test_parse_meminfo_value_rejects_non_numeric_content_without_leaking_it() -> TestResult {
+        let Err(err) = parse_meminfo_value("not-a-number kB") else {
+            return Err(TestError::Unexpected(
+                "nicht-numerischer Wert muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
         assert!(!err.to_string().contains("not-a-number"));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_meminfo_value_rejects_unknown_unit_suffix() {
-        let err = parse_meminfo_value("1024 MB").expect_err("unbekannte Einheit muss scheitern");
+    fn test_parse_meminfo_value_rejects_unknown_unit_suffix() -> TestResult {
+        let Err(err) = parse_meminfo_value("1024 MB") else {
+            return Err(TestError::Unexpected(
+                "unbekannte Einheit muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_meminfo_value_rejects_empty_value() {
-        let err = parse_meminfo_value("").expect_err("leerer Wert muss scheitern");
+    fn test_parse_meminfo_value_rejects_empty_value() -> TestResult {
+        let Err(err) = parse_meminfo_value("") else {
+            return Err(TestError::Unexpected("leerer Wert muss scheitern".into()));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_meminfo_value_rejects_too_many_fields() {
-        let err = parse_meminfo_value("1 2 kB").expect_err("zu viele Felder müssen scheitern");
+    fn test_parse_meminfo_value_rejects_too_many_fields() -> TestResult {
+        let Err(err) = parse_meminfo_value("1 2 kB") else {
+            return Err(TestError::Unexpected(
+                "zu viele Felder müssen scheitern".into(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
+        Ok(())
     }
 
     #[test]

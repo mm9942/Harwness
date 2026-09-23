@@ -100,43 +100,55 @@ mod tests {
     use std::str::FromStr;
 
     use super::{KeyVersion, SecretId, SecretIdParseError};
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn secret_id_display_from_str_round_trip_is_stable() {
+    fn secret_id_display_from_str_round_trip_is_stable() -> TestResult {
         let id = SecretId::new();
         let text = id.to_string();
 
-        assert_eq!(SecretId::from_str(&text).unwrap(), id);
-        assert_eq!(SecretId::parse(&text).unwrap(), id);
+        assert_eq!(
+            SecretId::from_str(&text).map_err(ctx("SecretId::from_str"))?,
+            id
+        );
+        assert_eq!(SecretId::parse(&text).map_err(ctx("SecretId::parse"))?, id);
+        Ok(())
     }
 
     #[test]
-    fn secret_id_parse_rejects_invalid_text_without_retaining_it() {
+    fn secret_id_parse_rejects_invalid_text_without_retaining_it() -> TestResult {
         let malformed = "not-a-secret-id";
-        let error = SecretId::from_str(malformed).unwrap_err();
+        let Err(error) = SecretId::from_str(malformed) else {
+            return Err(TestError::Unexpected(
+                "Err erwartet (malformed secret id)".into(),
+            ));
+        };
 
         assert_eq!(error, SecretIdParseError);
         assert_eq!(error.to_string(), "invalid secret id");
         assert!(!format!("{error:?}").contains(malformed));
+        Ok(())
     }
 
     #[test]
-    fn secret_id_serde_round_trip_is_stable() {
+    fn secret_id_serde_round_trip_is_stable() -> TestResult {
         let id = SecretId::new();
-        let encoded = serde_json::to_string(&id).unwrap();
-        let decoded: SecretId = serde_json::from_str(&encoded).unwrap();
+        let encoded = serde_json::to_string(&id)?;
+        let decoded: SecretId = serde_json::from_str(&encoded)?;
 
         assert_eq!(decoded, id);
-        assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+        assert_eq!(serde_json::to_string(&decoded)?, encoded);
+        Ok(())
     }
 
     #[test]
-    fn key_version_serde_round_trip_is_stable() {
+    fn key_version_serde_round_trip_is_stable() -> TestResult {
         let version = KeyVersion::initial().next();
-        let encoded = serde_json::to_string(&version).unwrap();
-        let decoded: KeyVersion = serde_json::from_str(&encoded).unwrap();
+        let encoded = serde_json::to_string(&version)?;
+        let decoded: KeyVersion = serde_json::from_str(&encoded)?;
 
         assert_eq!(decoded, version);
-        assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+        assert_eq!(serde_json::to_string(&decoded)?, encoded);
+        Ok(())
     }
 }

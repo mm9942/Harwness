@@ -106,11 +106,11 @@
 //! Keine. [`run_rules`] liefert kein `Result`, und diese Funktion meldet nur
 //! — sie bricht bei keiner Befundzahl ab.
 
+use harw_authority::NetworkScope;
 use harw_dod_rules::rule::RuleContext;
 use harw_dod_rules::{FindingKind, run_rules};
 use harw_dod_signals::SecurityEvidence;
 use harw_observe::{FieldValue, MetricValue, TelemetrySink};
-use harw_authority::NetworkScope;
 use jiff::Timestamp;
 
 /// Label-Feldname für die auslösende Regel ([`harw_dod_rules::Rule::id`]).
@@ -190,7 +190,11 @@ const fn finding_kind_label(kind: FindingKind) -> &'static str {
 /// let reported = harw_sentinel::findings::report_findings(&NullSink, &evidence, Timestamp::UNIX_EPOCH);
 /// assert_eq!(reported, 0);
 /// ```
-pub fn report_findings(sink: &dyn TelemetrySink, evidence: &SecurityEvidence, now: Timestamp) -> usize {
+pub fn report_findings(
+    sink: &dyn TelemetrySink,
+    evidence: &SecurityEvidence,
+    now: Timestamp,
+) -> usize {
     let scope = NetworkScope::empty();
     let ctx = RuleContext {
         now,
@@ -216,7 +220,10 @@ pub fn report_findings(sink: &dyn TelemetrySink, evidence: &SecurityEvidence, no
             MetricValue::Count(1),
             &[
                 (RULE_LABEL, FieldValue::Str(finding.rule_id())),
-                (KIND_LABEL, FieldValue::Str(finding_kind_label(finding.kind()))),
+                (
+                    KIND_LABEL,
+                    FieldValue::Str(finding_kind_label(finding.kind())),
+                ),
             ],
         );
     }
@@ -227,6 +234,7 @@ pub fn report_findings(sink: &dyn TelemetrySink, evidence: &SecurityEvidence, no
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use harw_dod_signals::{DriftSeverity, EventKind, SecurityEvent};
     use harw_types::SensorId;
 
@@ -247,29 +255,40 @@ mod tests {
     /// `crate::poll_once` jeden Zyklus aufruft) — nicht nur aus einem
     /// Doctest oder einem Test innerhalb von `harw-dod-rules` selbst.
     #[test]
-    fn test_report_findings_calls_run_rules_from_a_production_path() {
+    fn test_report_findings_calls_run_rules_from_a_production_path() -> TestResult {
         let evidence =
             SecurityEvidence::capture(vec![], vec![structure_drift_event()], Timestamp::UNIX_EPOCH)
-                .expect("well-formed content always encodes");
+                .map_err(ctx("well-formed content always encodes"))?;
 
         let reported = report_findings(&harw_observe::NullSink, &evidence, Timestamp::UNIX_EPOCH);
 
-        assert_eq!(reported, 1, "the structure-drift event must trigger exactly one finding");
+        assert_eq!(
+            reported, 1,
+            "the structure-drift event must trigger exactly one finding"
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_report_findings_with_an_empty_buffer_yields_neither_finding_nor_panic() {
+    fn test_report_findings_with_an_empty_buffer_yields_neither_finding_nor_panic() -> TestResult {
         let evidence = SecurityEvidence::capture(vec![], vec![], Timestamp::UNIX_EPOCH)
-            .expect("empty content always encodes");
+            .map_err(ctx("empty content always encodes"))?;
 
         let reported = report_findings(&harw_observe::NullSink, &evidence, Timestamp::UNIX_EPOCH);
 
-        assert_eq!(reported, 0, "an empty evidence buffer must report zero findings, not an error");
+        assert_eq!(
+            reported, 0,
+            "an empty evidence buffer must report zero findings, not an error"
+        );
+        Ok(())
     }
 
     #[test]
     fn test_finding_kind_label_is_exhaustive_and_stable() {
-        assert_eq!(finding_kind_label(FindingKind::RuleTriggered), "rule-triggered");
+        assert_eq!(
+            finding_kind_label(FindingKind::RuleTriggered),
+            "rule-triggered"
+        );
         assert_eq!(finding_kind_label(FindingKind::Anomaly), "anomaly");
     }
 }

@@ -53,10 +53,13 @@ pub enum ResearchError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn test_empty_field_display_names_field() {
-        let err = ResearchError::EmptyField { field: "question_id" };
+        let err = ResearchError::EmptyField {
+            field: "question_id",
+        };
         assert_eq!(err.to_string(), "field 'question_id' must not be empty");
     }
 
@@ -72,11 +75,16 @@ mod tests {
     }
 
     #[test]
-    fn test_json_from_conversion_and_source() {
-        let json_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+    fn test_json_from_conversion_and_source() -> TestResult {
+        let Err(json_err) = serde_json::from_str::<serde_json::Value>("not json") else {
+            return Err(TestError::Unexpected(
+                "expected an Err from invalid JSON".into(),
+            ));
+        };
         let err: ResearchError = json_err.into();
         assert!(matches!(err, ResearchError::Json(_)));
         assert!(std::error::Error::source(&err).is_some());
+        Ok(())
     }
 
     #[test]

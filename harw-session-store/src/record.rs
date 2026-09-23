@@ -121,6 +121,7 @@ impl TranscriptRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
     use harw_types::ThreadRef;
 
     fn valid_json() -> serde_json::Value {
@@ -135,34 +136,44 @@ mod tests {
     }
 
     #[test]
-    fn deserialization_rejects_null_payload() {
+    fn deserialization_rejects_null_payload() -> TestResult {
         let mut value = valid_json();
         value["payload"] = serde_json::Value::Null;
 
-        let error = TranscriptRecord::from_jsonl_line(&value.to_string()).unwrap_err();
+        let Err(error) = TranscriptRecord::from_jsonl_line(&value.to_string()) else {
+            return Err(TestError::Unexpected(
+                "expected a null payload to be rejected".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
             SessionStoreError::CorruptRecord { detail } if detail.contains("payload must not be null")
         ));
+        Ok(())
     }
 
     #[test]
-    fn deserialization_preserves_session_id_validation() {
+    fn deserialization_preserves_session_id_validation() -> TestResult {
         let mut value = valid_json();
         value["session_id"] = serde_json::Value::String(String::new());
 
-        let error = TranscriptRecord::from_jsonl_line(&value.to_string()).unwrap_err();
+        let Err(error) = TranscriptRecord::from_jsonl_line(&value.to_string()) else {
+            return Err(TestError::Unexpected(
+                "expected an empty session_id to be rejected".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
             SessionStoreError::CorruptRecord { detail }
                 if detail.contains("SessionId must not be empty or whitespace-only")
         ));
+        Ok(())
     }
 
     #[test]
-    fn valid_record_still_round_trips() {
+    fn valid_record_still_round_trips() -> TestResult {
         let record = TranscriptRecord::new(
             SessionId::from_str("session-a"),
             ThreadRef::from_str("root"),
@@ -172,8 +183,9 @@ mod tests {
             serde_json::json!({ "text": "hello" }),
         );
 
-        let decoded = TranscriptRecord::from_jsonl_line(&record.to_jsonl_line().unwrap()).unwrap();
+        let decoded = TranscriptRecord::from_jsonl_line(&record.to_jsonl_line()?)?;
 
         assert_eq!(decoded, record);
+        Ok(())
     }
 }

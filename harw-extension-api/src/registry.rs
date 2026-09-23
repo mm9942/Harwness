@@ -197,7 +197,10 @@ impl ExtensionRegistry {
     /// assert_eq!(registry.context_provider_namespace("plan"), None);
     /// ```
     #[must_use]
-    pub fn context_provider_namespace(&self, namespace: &str) -> Option<(&'static str, TrustClass)> {
+    pub fn context_provider_namespace(
+        &self,
+        namespace: &str,
+    ) -> Option<(&'static str, TrustClass)> {
         self.context_provider_namespaces.get(namespace).copied()
     }
 
@@ -323,7 +326,10 @@ impl std::fmt::Debug for ExtensionRegistryBuilder {
             .field("approval_handlers", &self.approval_handlers.len())
             .field("turn_observers", &self.turn_observers.len())
             .field("spawner", &self.spawner.is_some())
-            .field("claimed_namespaces", &self.context_provider_namespaces.len())
+            .field(
+                "claimed_namespaces",
+                &self.context_provider_namespaces.len(),
+            )
             .finish()
     }
 }
@@ -535,8 +541,9 @@ pub fn empty_extension_registry() -> ExtensionRegistry {
 
 #[cfg(test)]
 mod tests {
-    use crate::{ContextFragment, TurnInputContext};
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
+    use crate::{ContextFragment, TurnInputContext};
     use harw_tools::{FunctionToolSpec, JsonSchema, ToolExecutor, ToolName, ToolSpec};
     use std::future::Future;
     use std::pin::Pin;
@@ -639,7 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn context_provider_declared_accepts_distinct_namespaces() {
+    fn context_provider_declared_accepts_distinct_namespaces() -> TestResult {
         let registry = ExtensionRegistry::builder()
             .context_provider_declared(
                 "Plan",
@@ -648,7 +655,7 @@ mod tests {
                     max_trust: TrustClass::Evidence,
                 }),
             )
-            .expect("plan namespace registers")
+            .map_err(ctx("plan namespace registers"))?
             .context_provider_declared(
                 "Memory",
                 Arc::new(FixedDeclaredProvider {
@@ -656,7 +663,7 @@ mod tests {
                     max_trust: TrustClass::Data,
                 }),
             )
-            .expect("memory namespace registers")
+            .map_err(ctx("memory namespace registers"))?
             .build();
 
         assert_eq!(registry.context_providers().len(), 2);
@@ -664,13 +671,14 @@ mod tests {
             registry.context_provider_namespace("plan"),
             Some(("Plan", TrustClass::Evidence))
         );
+        Ok(())
     }
 
     /// Kern der Nachzugsprüfung: ein zweiter Provider unter demselben
     /// Namensraum wird zur Laufzeit abgelehnt — kein stiller Vorrang, keine
     /// stille Überschreibung.
     #[test]
-    fn context_provider_declared_rejects_duplicate_namespace() {
+    fn context_provider_declared_rejects_duplicate_namespace() -> TestResult {
         let builder = ExtensionRegistry::builder()
             .context_provider_declared(
                 "Plan",
@@ -679,17 +687,19 @@ mod tests {
                     max_trust: TrustClass::Evidence,
                 }),
             )
-            .expect("first claim succeeds");
+            .map_err(ctx("first claim succeeds"))?;
 
-        let error = builder
-            .context_provider_declared(
-                "RoguePlan",
-                Arc::new(FixedDeclaredProvider {
-                    namespace: "plan",
-                    max_trust: TrustClass::Instruction,
-                }),
-            )
-            .expect_err("second claim of the same namespace must be rejected");
+        let Err(error) = builder.context_provider_declared(
+            "RoguePlan",
+            Arc::new(FixedDeclaredProvider {
+                namespace: "plan",
+                max_trust: TrustClass::Instruction,
+            }),
+        ) else {
+            return Err(TestError::Unexpected(
+                "second claim of the same namespace must be rejected".into(),
+            ));
+        };
 
         match error {
             ContextProviderRegistrationError::NamespaceAlreadyClaimed {
@@ -701,8 +711,13 @@ mod tests {
                 assert_eq!(existing_provider, "Plan");
                 assert_eq!(new_provider, "RoguePlan");
             }
-            other => panic!("unexpected error: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "unexpected error: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// Die abgelehnte Registrierung darf die bestehende nicht überschreiben:
@@ -711,7 +726,7 @@ mod tests {
     /// zweite Registrierung, die `self` konsumiert und verwirft), muss
     /// weiterhin den ursprünglichen Provider zeigen.
     #[test]
-    fn context_provider_declared_rejected_duplicate_does_not_overwrite_existing() {
+    fn context_provider_declared_rejected_duplicate_does_not_overwrite_existing() -> TestResult {
         let registry = ExtensionRegistry::builder()
             .context_provider_declared(
                 "Plan",
@@ -720,7 +735,7 @@ mod tests {
                     max_trust: TrustClass::Evidence,
                 }),
             )
-            .expect("first claim succeeds")
+            .map_err(ctx("first claim succeeds"))?
             .build();
 
         assert_eq!(
@@ -729,32 +744,36 @@ mod tests {
             "the accepted first registration must be exactly what a rejected \
              duplicate registration would have tried to overwrite"
         );
+        Ok(())
     }
 
     #[test]
-    fn context_provider_declared_rejects_blank_namespace() {
-        let error = ExtensionRegistry::builder()
-            .context_provider_declared(
-                "Blank",
-                Arc::new(FixedDeclaredProvider {
-                    namespace: "   ",
-                    max_trust: TrustClass::Data,
-                }),
-            )
-            .expect_err("blank namespace must be rejected");
+    fn context_provider_declared_rejects_blank_namespace() -> TestResult {
+        let Err(error) = ExtensionRegistry::builder().context_provider_declared(
+            "Blank",
+            Arc::new(FixedDeclaredProvider {
+                namespace: "   ",
+                max_trust: TrustClass::Data,
+            }),
+        ) else {
+            return Err(TestError::Unexpected(
+                "blank namespace must be rejected".into(),
+            ));
+        };
         assert!(matches!(
             error,
             ContextProviderRegistrationError::NamespaceBlank {
                 provider_name: "Blank"
             }
         ));
+        Ok(())
     }
 
     /// Positivkontrolle, passend zur Moduldoku: eine `Instruction`-Behauptung
     /// wird nicht abgelehnt, weil es dafür keinen Vergleichsmaßstab gibt —
     /// die Prüfung lehnt ausschließlich Namensraum-Probleme ab.
     #[test]
-    fn context_provider_declared_accepts_instruction_trust_without_ceiling_check() {
+    fn context_provider_declared_accepts_instruction_trust_without_ceiling_check() -> TestResult {
         let registry = ExtensionRegistry::builder()
             .context_provider_declared(
                 "System",
@@ -763,12 +782,13 @@ mod tests {
                     max_trust: TrustClass::Instruction,
                 }),
             )
-            .expect("no ceiling exists to reject this claim")
+            .map_err(ctx("no ceiling exists to reject this claim"))?
             .build();
         assert_eq!(
             registry.context_provider_namespace("system"),
             Some(("System", TrustClass::Instruction))
         );
+        Ok(())
     }
 
     #[test]
@@ -784,14 +804,14 @@ mod tests {
     /// `context_provider_declared` — inklusive Ablehnung eines Konflikts,
     /// der über den jeweils *anderen* Weg zuerst beansprucht wurde.
     #[test]
-    fn context_provider_no_registration_path_bypasses_the_namespace_check() {
+    fn context_provider_no_registration_path_bypasses_the_namespace_check() -> TestResult {
         // Erst über den (früher ungeprüften) `context_provider`-Weg.
         let builder = ExtensionRegistry::builder()
             .context_provider(Arc::new(FixedDeclaredProvider {
                 namespace: "plan",
                 max_trust: TrustClass::Evidence,
             }))
-            .expect("first claim via context_provider succeeds");
+            .map_err(ctx("first claim via context_provider succeeds"))?;
 
         // Ein zweiter Provider versucht denselben Namensraum über
         // `context_provider` erneut zu beanspruchen: muss scheitern.
@@ -799,9 +819,12 @@ mod tests {
             namespace: "plan",
             max_trust: TrustClass::Data,
         };
-        let rejected = builder
-            .context_provider(Arc::new(error_same_path))
-            .expect_err("context_provider must reject a duplicate namespace, not just context_provider_declared");
+        let Err(rejected) = builder.context_provider(Arc::new(error_same_path)) else {
+            return Err(TestError::Unexpected(
+                "context_provider must reject a duplicate namespace, not just context_provider_declared"
+                    .into(),
+            ));
+        };
         assert!(matches!(
             rejected,
             ContextProviderRegistrationError::NamespaceAlreadyClaimed { .. }
@@ -816,51 +839,62 @@ mod tests {
                 namespace: "plan",
                 max_trust: TrustClass::Evidence,
             }))
-            .expect("first claim via context_provider succeeds");
-        let cross_path_rejected = builder
-            .context_provider_declared(
-                "RoguePlan",
-                Arc::new(FixedDeclaredProvider {
-                    namespace: "plan",
-                    max_trust: TrustClass::Instruction,
-                }),
-            )
-            .expect_err("context_provider_declared must see the namespace claimed via context_provider");
+            .map_err(ctx("first claim via context_provider succeeds"))?;
+        let Err(cross_path_rejected) = builder.context_provider_declared(
+            "RoguePlan",
+            Arc::new(FixedDeclaredProvider {
+                namespace: "plan",
+                max_trust: TrustClass::Instruction,
+            }),
+        ) else {
+            return Err(TestError::Unexpected(
+                "context_provider_declared must see the namespace claimed via context_provider"
+                    .into(),
+            ));
+        };
         assert!(matches!(
             cross_path_rejected,
             ContextProviderRegistrationError::NamespaceAlreadyClaimed { .. }
         ));
+        Ok(())
     }
 
     /// `context_provider` lehnt jetzt auch einen leeren Namensraum ab —
     /// dieselbe Prüfung wie `context_provider_declared`.
     #[test]
-    fn context_provider_rejects_blank_namespace() {
-        let error = ExtensionRegistry::builder()
-            .context_provider(Arc::new(FixedDeclaredProvider {
+    fn context_provider_rejects_blank_namespace() -> TestResult {
+        let Err(error) =
+            ExtensionRegistry::builder().context_provider(Arc::new(FixedDeclaredProvider {
                 namespace: "   ",
                 max_trust: TrustClass::Data,
             }))
-            .expect_err("context_provider must reject a blank namespace");
+        else {
+            return Err(TestError::Unexpected(
+                "context_provider must reject a blank namespace".into(),
+            ));
+        };
         assert!(matches!(
             error,
             ContextProviderRegistrationError::NamespaceBlank { .. }
         ));
+        Ok(())
     }
 
     /// Der Vorgabewert von `ContextProvider::max_trust` ist nachweislich die
     /// niedrigste Klasse: ein Provider, der ihn nicht überschreibt, landet
     /// in der Introspektion mit `TrustClass::Data`.
     #[test]
-    fn context_provider_default_max_trust_is_the_lowest_class() {
+    fn context_provider_default_max_trust_is_the_lowest_class() -> TestResult {
         let registry = ExtensionRegistry::builder()
             .context_provider(Arc::new(UndeclaredProvider))
-            .expect("undeclared provider registers under its default namespace")
+            .map_err(ctx(
+                "undeclared provider registers under its default namespace",
+            ))?
             .build();
 
         let (_, max_trust) = registry
             .context_provider_namespace(UndeclaredProvider.namespace())
-            .expect("default namespace must be registered");
+            .ok_or(TestError::Missing("default namespace must be registered"))?;
         assert_eq!(
             max_trust,
             TrustClass::Data,
@@ -875,6 +909,7 @@ mod tests {
                 && TrustClass::Data.trust_rank() < TrustClass::Instruction.trust_rank(),
             "TrustClass::Data must be the lowest class for this default to be meaningful"
         );
+        Ok(())
     }
 
     /// Ein bestehender Anbieter ohne eigene Angaben (weder `namespace()` noch
@@ -882,22 +917,25 @@ mod tests {
     /// weiterhin erfolgreich — die neue Prüfung bricht keinen Provider, der
     /// von der Ergänzung nichts weiß.
     #[test]
-    fn context_provider_undeclared_provider_still_registers() {
+    fn context_provider_undeclared_provider_still_registers() -> TestResult {
         let registry = ExtensionRegistry::builder()
             .context_provider(Arc::new(UndeclaredProvider))
-            .expect("a provider without its own namespace()/max_trust() must still register")
+            .map_err(ctx(
+                "a provider without its own namespace()/max_trust() must still register",
+            ))?
             .build();
         assert_eq!(registry.context_providers().len(), 1);
         assert!(
             !UndeclaredProvider.namespace().is_empty(),
             "the default namespace (the Rust type name) must never be blank"
         );
+        Ok(())
     }
 
     /// Der bestehende, deklarierte Registrierungsweg bleibt unverändert
     /// nutzbar, jetzt über dieselbe gemeinsame Prüfung wie `context_provider`.
     #[test]
-    fn context_provider_declared_path_still_works() {
+    fn context_provider_declared_path_still_works() -> TestResult {
         let registry = ExtensionRegistry::builder()
             .context_provider_declared(
                 "Fixed",
@@ -906,20 +944,21 @@ mod tests {
                     max_trust: TrustClass::Instruction,
                 }),
             )
-            .expect("declared registration succeeds")
+            .map_err(ctx("declared registration succeeds"))?
             .build();
         assert_eq!(registry.context_providers().len(), 1);
         assert_eq!(
             registry.context_provider_namespace("fixed"),
             Some(("Fixed", TrustClass::Instruction))
         );
+        Ok(())
     }
 
     /// `into_builder` muss Provider und Namensräume unverändert erhalten --
     /// ein Roundtrip `build().into_builder().build()` darf keine registrierte
     /// Angabe verlieren oder verändern.
     #[test]
-    fn into_builder_roundtrip_preserves_providers_and_namespaces() {
+    fn into_builder_roundtrip_preserves_providers_and_namespaces() -> TestResult {
         let registry = ExtensionRegistry::builder()
             .tool_provider(Arc::new(NamedToolProvider {
                 tool_name: "tools.roundtrip",
@@ -931,7 +970,7 @@ mod tests {
                     max_trust: TrustClass::Evidence,
                 }),
             )
-            .expect("plan namespace registers")
+            .map_err(ctx("plan namespace registers"))?
             .build();
 
         let rebuilt = registry.into_builder().build();
@@ -949,13 +988,14 @@ mod tests {
             Some(("Plan", TrustClass::Evidence)),
             "into_builder must carry the namespace claim table through unchanged"
         );
+        Ok(())
     }
 
     /// `into_builder` erlaubt es, weitere Provider anzuhängen, bevor erneut
     /// gebaut wird -- und die Namensraum-Prüfung wirkt dabei weiterhin gegen
     /// die aus der ursprünglichen Registry übernommenen Namensräume.
     #[test]
-    fn into_builder_still_enforces_namespace_check_for_new_providers() {
+    fn into_builder_still_enforces_namespace_check_for_new_providers() -> TestResult {
         let registry = ExtensionRegistry::builder()
             .context_provider_declared(
                 "Plan",
@@ -964,23 +1004,26 @@ mod tests {
                     max_trust: TrustClass::Evidence,
                 }),
             )
-            .expect("plan namespace registers")
+            .map_err(ctx("plan namespace registers"))?
             .build();
 
-        let error = registry
-            .into_builder()
-            .context_provider_declared(
-                "RoguePlan",
-                Arc::new(FixedDeclaredProvider {
-                    namespace: "plan",
-                    max_trust: TrustClass::Instruction,
-                }),
-            )
-            .expect_err("the namespace claim carried over from the built registry must still be enforced");
+        let Err(error) = registry.into_builder().context_provider_declared(
+            "RoguePlan",
+            Arc::new(FixedDeclaredProvider {
+                namespace: "plan",
+                max_trust: TrustClass::Instruction,
+            }),
+        ) else {
+            return Err(TestError::Unexpected(
+                "the namespace claim carried over from the built registry must still be enforced"
+                    .into(),
+            ));
+        };
 
         assert!(matches!(
             error,
             ContextProviderRegistrationError::NamespaceAlreadyClaimed { .. }
         ));
+        Ok(())
     }
 }

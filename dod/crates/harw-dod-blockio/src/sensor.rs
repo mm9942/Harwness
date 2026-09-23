@@ -321,7 +321,8 @@ impl Sensor for BlockioSensor {
 
         let mut samples = Vec::with_capacity(named.len() * FIELD_METRICS.len());
         for (device, stat_path) in &named {
-            let rows = harw_dod_readfs::read_line_fields(scope, stat_path).map_err(map_readfs_err)?;
+            let rows =
+                harw_dod_readfs::read_line_fields(scope, stat_path).map_err(map_readfs_err)?;
             let fields = map_stat_fields(&rows)?;
             let label = sanitize_device_label(device);
 
@@ -533,6 +534,7 @@ mod tests {
     use jiff::Timestamp;
 
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Das `fixtures/`-Wurzelverzeichnis dieser Crate.
     fn fixtures_root() -> PathBuf {
@@ -557,21 +559,23 @@ mod tests {
     }
 
     #[test]
-    fn test_map_stat_fields_maps_middle_column_not_just_the_first() {
+    fn test_map_stat_fields_maps_middle_column_not_just_the_first() -> TestResult {
         let rows = rows_from(&[
             "1234", "56", "78901", "2345", "6789", "12", "34567", "890", "0", "1111", "2222",
         ]);
-        let fields = map_stat_fields(&rows).expect("elf wohlgeformte Felder müssen gelingen");
+        let fields =
+            map_stat_fields(&rows).map_err(ctx("elf wohlgeformte Felder müssen gelingen"))?;
 
         // "write_ios" ist das fünfte gemeldete Feld (Index 4) — der Wert aus
         // der Mitte der Zeile, nicht der erste oder letzte.
         assert_eq!(fields[4], ("write_ios", 6789));
         assert_eq!(fields[0], ("read_ios", 1234));
         assert_eq!(fields[10], ("time_in_queue_ms", 2222));
+        Ok(())
     }
 
     #[test]
-    fn test_map_stat_fields_accepts_seventeen_fields_not_just_eleven() {
+    fn test_map_stat_fields_accepts_seventeen_fields_not_just_eleven() -> TestResult {
         // Der wichtigste Robustheitsfall: ein Kernel ab 4.18/5.5 hängt sechs
         // weitere Spalten (Discard, Flush) an. Der Parser darf daran nicht
         // scheitern.
@@ -580,43 +584,69 @@ mod tests {
             "100", "5", "600", "70", "9", "800",
         ]);
         let fields =
-            map_stat_fields(&rows).expect("siebzehn Felder dürfen nicht scheitern");
+            map_stat_fields(&rows).map_err(ctx("siebzehn Felder dürfen nicht scheitern"))?;
         assert_eq!(fields.len(), FIELD_METRICS.len());
         assert_eq!(fields[16], ("flush_ticks_ms", 800));
+        Ok(())
     }
 
     #[test]
-    fn test_map_stat_fields_accepts_minimum_eleven_fields() {
-        let rows = rows_from(&[
-            "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11",
-        ]);
-        let fields = map_stat_fields(&rows).expect("elf Felder sind die historische Untergrenze");
+    fn test_map_stat_fields_accepts_minimum_eleven_fields() -> TestResult {
+        let rows = rows_from(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"]);
+        let fields =
+            map_stat_fields(&rows).map_err(ctx("elf Felder sind die historische Untergrenze"))?;
         assert_eq!(fields.len(), 11);
+        Ok(())
     }
 
     #[test]
-    fn test_map_stat_fields_rejects_too_few_fields_without_leaking_content() {
+    fn test_map_stat_fields_rejects_too_few_fields_without_leaking_content() -> TestResult {
         let rows = rows_from(&["1", "2", "3"]);
-        let err = map_stat_fields(&rows).expect_err("drei Felder unterschreiten die Untergrenze");
+        let Err(err) = map_stat_fields(&rows) else {
+            return Err(TestError::Unexpected(
+                "drei Felder unterschreiten die Untergrenze".to_owned(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
         assert!(!err.to_string().contains("1 2 3"));
+        Ok(())
     }
 
     #[test]
-    fn test_map_stat_fields_rejects_non_numeric_field_without_leaking_content() {
+    fn test_map_stat_fields_rejects_non_numeric_field_without_leaking_content() -> TestResult {
         let rows = rows_from(&[
-            "1", "2", "not-a-number", "4", "5", "6", "7", "8", "9", "10", "11",
+            "1",
+            "2",
+            "not-a-number",
+            "4",
+            "5",
+            "6",
+            "7",
+            "8",
+            "9",
+            "10",
+            "11",
         ]);
-        let err = map_stat_fields(&rows).expect_err("nicht-numerischer Wert muss scheitern");
+        let Err(err) = map_stat_fields(&rows) else {
+            return Err(TestError::Unexpected(
+                "nicht-numerischer Wert muss scheitern".to_owned(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
         assert!(!err.to_string().contains("not-a-number"));
+        Ok(())
     }
 
     #[test]
-    fn test_map_stat_fields_rejects_empty_rows() {
+    fn test_map_stat_fields_rejects_empty_rows() -> TestResult {
         let rows: Vec<Vec<String>> = Vec::new();
-        let err = map_stat_fields(&rows).expect_err("leere Zeilenliste muss scheitern");
+        let Err(err) = map_stat_fields(&rows) else {
+            return Err(TestError::Unexpected(
+                "leere Zeilenliste muss scheitern".to_owned(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
+        Ok(())
     }
 
     // ---- Rauschenfilterung (`is_noise_device`) ----
@@ -669,44 +699,50 @@ mod tests {
     // ---- Fixture-gestützte Verhaltensprüfungen ----
 
     #[test]
-    fn test_single_device_fixture_reports_eleven_samples() {
+    fn test_single_device_fixture_reports_eleven_samples() -> TestResult {
         let sensor = build_sensor(fixtures_root().join("single-device/tree"));
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("single-device Fixture muss erfolgreich pollen");
+            .map_err(ctx("single-device Fixture muss erfolgreich pollen"))?;
         assert_eq!(reading.samples.len(), 11);
         assert!(reading.samples.iter().all(|s| s.metric.ends_with("_sda")));
+        Ok(())
     }
 
     #[test]
-    fn test_seventeen_fields_fixture_is_read_not_rejected() {
+    fn test_seventeen_fields_fixture_is_read_not_rejected() -> TestResult {
         let sensor = build_sensor(fixtures_root().join("seventeen-fields/tree"));
-        let reading = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect("eine Zeile mit siebzehn Feldern darf nicht abgewiesen werden");
+        let reading = sensor.poll(Timestamp::UNIX_EPOCH).map_err(ctx(
+            "eine Zeile mit siebzehn Feldern darf nicht abgewiesen werden",
+        ))?;
         assert_eq!(reading.samples.len(), 17);
+        Ok(())
     }
 
     #[test]
-    fn test_multi_device_fixture_excludes_loop_noise_device() {
+    fn test_multi_device_fixture_excludes_loop_noise_device() -> TestResult {
         let sensor = build_sensor(fixtures_root().join("multi-device/tree"));
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("multi-device Fixture muss erfolgreich pollen");
+            .map_err(ctx("multi-device Fixture muss erfolgreich pollen"))?;
 
         assert!(
-            reading.samples.iter().all(|s| !s.metric.ends_with("_loop0")),
+            reading
+                .samples
+                .iter()
+                .all(|s| !s.metric.ends_with("_loop0")),
             "kein Sample darf vom ausgeschlossenen Loop-Gerät stammen: {:?}",
             reading.samples
         );
+        Ok(())
     }
 
     #[test]
-    fn test_multi_device_fixture_excludes_partitions_but_keeps_whole_disks() {
+    fn test_multi_device_fixture_excludes_partitions_but_keeps_whole_disks() -> TestResult {
         let sensor = build_sensor(fixtures_root().join("multi-device/tree"));
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("multi-device Fixture muss erfolgreich pollen");
+            .map_err(ctx("multi-device Fixture muss erfolgreich pollen"))?;
 
         assert!(
             reading.samples.iter().all(|s| !s.metric.ends_with("_sda1")),
@@ -734,35 +770,40 @@ mod tests {
             "das Ganzgerät nvme0n1 muss gemeldet werden: {:?}",
             reading.samples
         );
+        Ok(())
     }
 
     #[test]
-    fn test_poll_is_deterministic_for_same_now_on_multi_device_fixture() {
+    fn test_poll_is_deterministic_for_same_now_on_multi_device_fixture() -> TestResult {
         let sensor = build_sensor(fixtures_root().join("multi-device/tree"));
         let first = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("erster Poll muss gelingen");
+            .map_err(ctx("erster Poll muss gelingen"))?;
         let second = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("zweiter Poll muss gelingen");
+            .map_err(ctx("zweiter Poll muss gelingen"))?;
         assert_eq!(
             first, second,
             "zwei Polls mit demselben injizierten now müssen identisch sein"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_poll_returns_source_unavailable_when_only_noise_devices_present() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(dir.path().join("loop0")).expect("loop0 dir");
+    fn test_poll_returns_source_unavailable_when_only_noise_devices_present() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        std::fs::create_dir_all(dir.path().join("loop0")).map_err(ctx("loop0 dir"))?;
         std::fs::write(dir.path().join("loop0/stat"), "1 2 3 4 5 6 7 8 9 10 11\n")
-            .expect("loop0 stat schreiben");
+            .map_err(ctx("loop0 stat schreiben"))?;
 
         let sensor = build_sensor(dir.path().to_path_buf());
-        let err = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect_err("ein Baum mit ausschließlich Rauschgeräten darf kein Ok liefern");
+        let Err(err) = sensor.poll(Timestamp::UNIX_EPOCH) else {
+            return Err(TestError::Unexpected(
+                "ein Baum mit ausschließlich Rauschgeräten darf kein Ok liefern".to_owned(),
+            ));
+        };
         assert!(matches!(err, SensorError::SourceUnavailable));
+        Ok(())
     }
 
     /// Der Ordner der echten Pi-Captures (`C-FIXT`, `harw-dod-fixtures`),
@@ -786,19 +827,19 @@ mod tests {
     /// verfügbaren Blockgeräte-Capture, unabhängig vom konkreten
     /// Klassennamen.
     #[test]
-    fn test_poll_reads_real_pi_capture_through_alias_scope_regression_f005() {
+    fn test_poll_reads_real_pi_capture_through_alias_scope_regression_f005() -> TestResult {
         let manifest_path = rpi5_captures_dir().join("block.json");
         let manifest = harw_dod_fixtures::capture_manifest::load(&manifest_path)
-            .expect("captures/rpi5-6.18/block.json muss ladbar sein");
+            .map_err(ctx("captures/rpi5-6.18/block.json muss ladbar sein"))?;
 
-        let tmp = tempfile::tempdir().expect("tempdir für die Materialisierung");
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir für die Materialisierung"))?;
         harw_dod_fixtures::capture_manifest::materialize(&manifest, tmp.path())
-            .expect("materialize muss die echte Symlink-Struktur anlegen");
+            .map_err(ctx("materialize muss die echte Symlink-Struktur anlegen"))?;
 
         let declared = tmp.path().join("sys/class/block");
         let resolved_prefix = tmp.path().join("sys/devices");
         let alias = harw_dod_cap::scope::AliasRoot::new(declared, resolved_prefix)
-            .expect("AliasRoot::new mit Tempdir-Wurzeln");
+            .map_err(ctx("AliasRoot::new mit Tempdir-Wurzeln"))?;
         let scope = ReadScope::from_roots_and_aliases(Vec::new(), [alias]);
         let handle = SensorHandle::new(
             SensorId::from_str("blockio-alias-capture-test"),
@@ -807,9 +848,9 @@ mod tests {
         .bind(scope);
         let sensor = BlockioSensor::from(handle);
 
-        let reading = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect("Alias-Scope muss die reale Pi-Capture über den Symlink lesen");
+        let reading = sensor.poll(Timestamp::UNIX_EPOCH).map_err(ctx(
+            "Alias-Scope muss die reale Pi-Capture über den Symlink lesen",
+        ))?;
 
         assert_eq!(reading.samples.len(), FIELD_METRICS.len());
         assert!(
@@ -820,5 +861,6 @@ mod tests {
             "alle Samples müssen das Gerätelabel der echten Capture tragen: {:?}",
             reading.samples
         );
+        Ok(())
     }
 }

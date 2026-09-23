@@ -84,6 +84,7 @@ pub struct BrowserObservation {
 mod tests {
     use super::*;
     use crate::artifact::ArtifactKind;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn test_document_identity_new_as_str_round_trip() {
@@ -104,11 +105,11 @@ mod tests {
     }
 
     #[test]
-    fn test_browser_observation_field_round_trip() {
+    fn test_browser_observation_field_round_trip() -> TestResult {
         let session_id = BrowserSessionId::new();
         let context_id = BrowserContextId::new();
         let revision = BrowserObservationRevision::initial();
-        let url = url::Url::parse("https://example.com/page").expect("valid url");
+        let url = url::Url::parse("https://example.com/page").map_err(ctx("valid url"))?;
         let event_cursor = BrowserEventCursor::zero();
         let element = ObservedElement::new("ref-1", "button");
         let artifact = ArtifactRef::new(ArtifactKind::Screenshot, "image/png", 128);
@@ -134,10 +135,11 @@ mod tests {
         assert_eq!(observation.elements, vec![element]);
         assert_eq!(observation.artifacts, vec![artifact]);
         assert_eq!(observation.event_cursor, event_cursor);
+        Ok(())
     }
 
     #[test]
-    fn test_browser_observation_serde_json_round_trip() {
+    fn test_browser_observation_serde_json_round_trip() -> TestResult {
         let mut attributes = std::collections::BTreeMap::new();
         attributes.insert("data-testid".to_owned(), "submit".to_owned());
 
@@ -157,7 +159,7 @@ mod tests {
             session_id: BrowserSessionId::new(),
             context_id: BrowserContextId::new(),
             revision: BrowserObservationRevision::initial().next(),
-            url: url::Url::parse("https://example.com/checkout").expect("valid url"),
+            url: url::Url::parse("https://example.com/checkout").map_err(ctx("valid url"))?,
             title: "Checkout".to_owned(),
             document_identity: DocumentIdentity::new("doc-42"),
             elements: vec![element],
@@ -165,20 +167,23 @@ mod tests {
             event_cursor: BrowserEventCursor::zero().next(),
         };
 
-        let json = serde_json::to_string(&observation).expect("observation serializes");
+        let json = serde_json::to_string(&observation).map_err(ctx("observation serializes"))?;
         let decoded: BrowserObservation =
-            serde_json::from_str(&json).expect("observation deserializes");
+            serde_json::from_str(&json).map_err(ctx("observation deserializes"))?;
         assert_eq!(decoded, observation);
+        Ok(())
     }
 
     #[test]
-    fn test_observation_mode_dom_selection_serde_json_round_trip() {
+    fn test_observation_mode_dom_selection_serde_json_round_trip() -> TestResult {
         let mode = ObservationMode::DomSelection {
             selector: Selector::Css("main > article".to_owned()),
         };
-        let json = serde_json::to_string(&mode).expect("mode serializes");
-        let decoded: ObservationMode = serde_json::from_str(&json).expect("mode deserializes");
+        let json = serde_json::to_string(&mode).map_err(ctx("mode serializes"))?;
+        let decoded: ObservationMode =
+            serde_json::from_str(&json).map_err(ctx("mode deserializes"))?;
         assert_eq!(decoded, mode);
+        Ok(())
     }
 
     #[test]
@@ -194,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bounding_box_equality_and_serde_json_round_trip() {
+    fn test_bounding_box_equality_and_serde_json_round_trip() -> TestResult {
         let a = BoundingBox {
             x: 0.0,
             y: 0.0,
@@ -209,9 +214,11 @@ mod tests {
         };
         assert_eq!(a, b);
 
-        let json = serde_json::to_string(&a).expect("bounding box serializes");
-        let decoded: BoundingBox = serde_json::from_str(&json).expect("bounding box deserializes");
+        let json = serde_json::to_string(&a).map_err(ctx("bounding box serializes"))?;
+        let decoded: BoundingBox =
+            serde_json::from_str(&json).map_err(ctx("bounding box deserializes"))?;
         assert_eq!(decoded, a);
+        Ok(())
     }
 
     #[test]

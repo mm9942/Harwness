@@ -256,7 +256,9 @@ pub async fn list_models(
         }
     };
 
-    let client = crate::http_client();
+    let client = crate::http_client().map_err(|error| DiscoveryError::Network {
+        detail: error.to_string(),
+    })?;
 
     if provider.api == "anthropic-messages" {
         // `codex_route` ist für diese `api` immer `None` (siehe
@@ -266,10 +268,13 @@ pub async fn list_models(
 
     let mut request = client.get(&url).timeout(DISCOVERY_TIMEOUT);
     if let Some(route) = &codex_route {
-        let codex_headers = route.headers(&client).await.map_err(|_| DiscoveryError::Auth {
-            status: 401,
-            detail: "Codex login unavailable; run `codex login` and retry".into(),
-        })?;
+        let codex_headers = route
+            .headers(&client)
+            .await
+            .map_err(|_| DiscoveryError::Auth {
+                status: 401,
+                detail: "Codex login unavailable; run `codex login` and retry".into(),
+            })?;
         request = request
             .query(&[("client_version", env!("CARGO_PKG_VERSION"))])
             .headers(codex_headers);
@@ -535,19 +540,21 @@ fn parse_one_model(entry: &Value) -> Option<DiscoveredModel> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use serde_json::json;
 
     #[test]
-    fn codex_models_use_backend_slugs_without_invented_prices() {
+    fn codex_models_use_backend_slugs_without_invented_prices() -> TestResult {
         let models = parse_codex_models_response(&json!({"models":[
             {"slug":"gpt-test","context_window":400000}, {"slug":""}, {"id":"wrong-shape"}
         ]}))
-        .unwrap();
+        .map_err(ctx("Codex models response parsen"))?;
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "gpt-test");
         assert_eq!(models[0].context_length, Some(400000));
         assert_eq!(models[0].input_price_per_mtok, None);
         assert!(parse_codex_models_response(&json!({"data":[]})).is_err());
+        Ok(())
     }
 
     #[test]
@@ -562,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_models_response_openrouter_pricing_converts_to_per_million() {
+    fn test_parse_models_response_openrouter_pricing_converts_to_per_million() -> TestResult {
         let body = json!({"data": [{
             "id": "nvidia/nemotron-3.5-lightning",
             "context_length": 262_144,
@@ -574,9 +581,16 @@ mod tests {
         let model = &models[0];
         assert_eq!(model.id, "nvidia/nemotron-3.5-lightning");
         assert_eq!(model.context_length, Some(262_144));
-        assert!((model.input_price_per_mtok.unwrap() - 0.08).abs() < 1e-9);
-        assert!((model.output_price_per_mtok.unwrap() - 0.2).abs() < 1e-9);
+        let input_price = model
+            .input_price_per_mtok
+            .ok_or(TestError::Missing("input_price_per_mtok"))?;
+        assert!((input_price - 0.08).abs() < 1e-9);
+        let output_price = model
+            .output_price_per_mtok
+            .ok_or(TestError::Missing("output_price_per_mtok"))?;
+        assert!((output_price - 0.2).abs() < 1e-9);
         assert_eq!(model.supports_tools, Some(true));
+        Ok(())
     }
 
     #[test]

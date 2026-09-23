@@ -130,14 +130,15 @@ pub enum TurnEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use serde_json::json;
 
     /// Prüft Tag, vollständige Wire-Form, Roundtrip und Ablehnung eines
     /// unbekannten `type`-Werts für `ChildSpawned`.
     #[test]
-    fn child_spawned_roundtrips_with_snake_case_tag_and_rejects_unknown_type() {
-        let turn_id = TurnId::try_from_str("turn-1").expect("gültige TurnId");
-        let child = SessionId::try_from_str("child-1").expect("gültige SessionId");
+    fn child_spawned_roundtrips_with_snake_case_tag_and_rejects_unknown_type() -> TestResult {
+        let turn_id = TurnId::try_from_str("turn-1").map_err(ctx("gültige TurnId"))?;
+        let child = SessionId::try_from_str("child-1").map_err(ctx("gültige SessionId"))?;
         let event = TurnEvent::ChildSpawned {
             turn_id: turn_id.clone(),
             child: child.clone(),
@@ -145,7 +146,7 @@ mod tests {
             question: Some("Wie sieht X aus?".to_string()),
         };
 
-        let value = serde_json::to_value(&event).expect("Event serialisiert");
+        let value = serde_json::to_value(&event).map_err(ctx("Event serialisiert"))?;
         assert_eq!(
             value,
             json!({
@@ -157,7 +158,8 @@ mod tests {
             })
         );
 
-        let restored: TurnEvent = serde_json::from_value(value).expect("Event deserialisiert");
+        let restored: TurnEvent =
+            serde_json::from_value(value).map_err(ctx("Event deserialisiert"))?;
         match restored {
             TurnEvent::ChildSpawned {
                 turn_id: got_turn_id,
@@ -170,7 +172,11 @@ mod tests {
                 assert_eq!(role, "explorer");
                 assert_eq!(question, Some("Wie sieht X aus?".to_string()));
             }
-            other => panic!("unerwartete Variante: {other:?}"),
+            other => {
+                return Err(crate::test_support::TestError::Unexpected(format!(
+                    "unerwartete Variante: {other:?}"
+                )));
+            }
         }
 
         let malformed = json!({
@@ -181,14 +187,15 @@ mod tests {
             "question": null,
         });
         assert!(serde_json::from_value::<TurnEvent>(malformed).is_err());
+        Ok(())
     }
 
     /// Prüft Tag, vollständige Wire-Form, Roundtrip und Ablehnung eines
     /// unbekannten `type`-Werts für `ChildProgress`.
     #[test]
-    fn child_progress_roundtrips_with_snake_case_tag_and_rejects_unknown_type() {
-        let turn_id = TurnId::try_from_str("turn-2").expect("gültige TurnId");
-        let child = SessionId::try_from_str("child-2").expect("gültige SessionId");
+    fn child_progress_roundtrips_with_snake_case_tag_and_rejects_unknown_type() -> TestResult {
+        let turn_id = TurnId::try_from_str("turn-2").map_err(ctx("gültige TurnId"))?;
+        let child = SessionId::try_from_str("child-2").map_err(ctx("gültige SessionId"))?;
         let event = TurnEvent::ChildProgress {
             turn_id: turn_id.clone(),
             child: child.clone(),
@@ -196,7 +203,7 @@ mod tests {
             tokens: 1234,
         };
 
-        let value = serde_json::to_value(&event).expect("Event serialisiert");
+        let value = serde_json::to_value(&event).map_err(ctx("Event serialisiert"))?;
         assert_eq!(
             value,
             json!({
@@ -208,7 +215,8 @@ mod tests {
             })
         );
 
-        let restored: TurnEvent = serde_json::from_value(value).expect("Event deserialisiert");
+        let restored: TurnEvent =
+            serde_json::from_value(value).map_err(ctx("Event deserialisiert"))?;
         match restored {
             TurnEvent::ChildProgress {
                 turn_id: got_turn_id,
@@ -221,7 +229,11 @@ mod tests {
                 assert_eq!(tool_calls, 3);
                 assert_eq!(tokens, 1234);
             }
-            other => panic!("unerwartete Variante: {other:?}"),
+            other => {
+                return Err(crate::test_support::TestError::Unexpected(format!(
+                    "unerwartete Variante: {other:?}"
+                )));
+            }
         }
 
         let malformed = json!({
@@ -232,14 +244,15 @@ mod tests {
             "tokens": 1234,
         });
         assert!(serde_json::from_value::<TurnEvent>(malformed).is_err());
+        Ok(())
     }
 
     /// Prüft Tag, vollständige Wire-Form, Roundtrip und Ablehnung eines
     /// unbekannten `type`-Werts für `ChildCompleted`.
     #[test]
-    fn child_completed_roundtrips_with_snake_case_tag_and_rejects_unknown_type() {
-        let turn_id = TurnId::try_from_str("turn-3").expect("gültige TurnId");
-        let child = SessionId::try_from_str("child-3").expect("gültige SessionId");
+    fn child_completed_roundtrips_with_snake_case_tag_and_rejects_unknown_type() -> TestResult {
+        let turn_id = TurnId::try_from_str("turn-3").map_err(ctx("gültige TurnId"))?;
+        let child = SessionId::try_from_str("child-3").map_err(ctx("gültige SessionId"))?;
         let event = TurnEvent::ChildCompleted {
             turn_id: turn_id.clone(),
             child: child.clone(),
@@ -247,7 +260,7 @@ mod tests {
             duration_ms: 42,
         };
 
-        let value = serde_json::to_value(&event).expect("Event serialisiert");
+        let value = serde_json::to_value(&event).map_err(ctx("Event serialisiert"))?;
         assert_eq!(
             value,
             json!({
@@ -259,7 +272,8 @@ mod tests {
             })
         );
 
-        let restored: TurnEvent = serde_json::from_value(value).expect("Event deserialisiert");
+        let restored: TurnEvent =
+            serde_json::from_value(value).map_err(ctx("Event deserialisiert"))?;
         match restored {
             TurnEvent::ChildCompleted {
                 turn_id: got_turn_id,
@@ -272,7 +286,11 @@ mod tests {
                 assert_eq!(outcome, "completed");
                 assert_eq!(duration_ms, 42);
             }
-            other => panic!("unerwartete Variante: {other:?}"),
+            other => {
+                return Err(crate::test_support::TestError::Unexpected(format!(
+                    "unerwartete Variante: {other:?}"
+                )));
+            }
         }
 
         let malformed = json!({
@@ -283,19 +301,20 @@ mod tests {
             "duration_ms": 42,
         });
         assert!(serde_json::from_value::<TurnEvent>(malformed).is_err());
+        Ok(())
     }
 
     /// Prüft Tag, vollständige Wire-Form, Roundtrip und Ablehnung eines
     /// unbekannten `type`-Werts für `PlanUpdated`.
     #[test]
-    fn plan_updated_roundtrips_with_snake_case_tag_and_rejects_unknown_type() {
+    fn plan_updated_roundtrips_with_snake_case_tag_and_rejects_unknown_type() -> TestResult {
         let event = TurnEvent::PlanUpdated {
             plan_id: "plan-1".to_string(),
             revision: 7,
             summary: "Schritt 3 hinzugefügt".to_string(),
         };
 
-        let value = serde_json::to_value(&event).expect("Event serialisiert");
+        let value = serde_json::to_value(&event).map_err(ctx("Event serialisiert"))?;
         assert_eq!(
             value,
             json!({
@@ -306,7 +325,8 @@ mod tests {
             })
         );
 
-        let restored: TurnEvent = serde_json::from_value(value).expect("Event deserialisiert");
+        let restored: TurnEvent =
+            serde_json::from_value(value).map_err(ctx("Event deserialisiert"))?;
         match restored {
             TurnEvent::PlanUpdated {
                 plan_id,
@@ -317,7 +337,11 @@ mod tests {
                 assert_eq!(revision, 7);
                 assert_eq!(summary, "Schritt 3 hinzugefügt");
             }
-            other => panic!("unerwartete Variante: {other:?}"),
+            other => {
+                return Err(crate::test_support::TestError::Unexpected(format!(
+                    "unerwartete Variante: {other:?}"
+                )));
+            }
         }
 
         let malformed = json!({
@@ -327,17 +351,18 @@ mod tests {
             "summary": "Schritt 3 hinzugefügt",
         });
         assert!(serde_json::from_value::<TurnEvent>(malformed).is_err());
+        Ok(())
     }
 
     /// Prüft Tag, vollständige Wire-Form, Roundtrip und Ablehnung eines
     /// unbekannten `type`-Werts für `ModeChanged`.
     #[test]
-    fn mode_changed_roundtrips_with_snake_case_tag_and_rejects_unknown_type() {
+    fn mode_changed_roundtrips_with_snake_case_tag_and_rejects_unknown_type() -> TestResult {
         let event = TurnEvent::ModeChanged {
             mode: "plan".to_string(),
         };
 
-        let value = serde_json::to_value(&event).expect("Event serialisiert");
+        let value = serde_json::to_value(&event).map_err(ctx("Event serialisiert"))?;
         assert_eq!(
             value,
             json!({
@@ -346,12 +371,17 @@ mod tests {
             })
         );
 
-        let restored: TurnEvent = serde_json::from_value(value).expect("Event deserialisiert");
+        let restored: TurnEvent =
+            serde_json::from_value(value).map_err(ctx("Event deserialisiert"))?;
         match restored {
             TurnEvent::ModeChanged { mode } => {
                 assert_eq!(mode, "plan");
             }
-            other => panic!("unerwartete Variante: {other:?}"),
+            other => {
+                return Err(crate::test_support::TestError::Unexpected(format!(
+                    "unerwartete Variante: {other:?}"
+                )));
+            }
         }
 
         let malformed = json!({
@@ -359,5 +389,6 @@ mod tests {
             "mode": "plan",
         });
         assert!(serde_json::from_value::<TurnEvent>(malformed).is_err());
+        Ok(())
     }
 }

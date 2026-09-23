@@ -108,12 +108,12 @@ use harw_agent_dsl::raw::RawAgentDefinition;
 use harw_agent_dsl::resolve::resolve_definition;
 use harw_agent_dsl::roles::AgentRoleId;
 use harw_agent_dsl::{ExecutableAgentIr, lower};
+use harw_authority::PermissionSet;
 use harw_extension_api::contributors::ToolProvider;
 use harw_extension_api::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput,
     ToolSpec,
 };
-use harw_authority::PermissionSet;
 use harw_tools::{AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType};
 use serde::Deserialize;
 
@@ -2276,9 +2276,11 @@ impl ToolProvider for UiaSelfDocumentToolProvider {
             return None;
         }
         match name.as_str() {
-            "uia_self.update_document" => Some(std::sync::Arc::new(UiaSelfUpdateDocumentExecutor {
-                agent_dir: self.agent_dir.clone(),
-            })),
+            "uia_self.update_document" => {
+                Some(std::sync::Arc::new(UiaSelfUpdateDocumentExecutor {
+                    agent_dir: self.agent_dir.clone(),
+                }))
+            }
             _ => None,
         }
     }
@@ -2365,6 +2367,7 @@ impl ToolProvider for AgentDefinitionToolProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_authority::Permission;
 
     fn empty_ceiling(role: AgentRoleId) -> DefinitionAuthorCeiling {
@@ -2396,11 +2399,16 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_definition_toml_rejects_unparsable_source() {
+    fn test_validate_definition_toml_rejects_unparsable_source() -> TestResult {
         match validate_definition_toml("not = [valid") {
             Validated::Err(errors) => assert!(!errors.is_empty()),
-            Validated::Ok { .. } => panic!("expected a validation error"),
+            Validated::Ok { .. } => {
+                return Err(TestError::Unexpected(
+                    "expected a validation error".to_owned(),
+                ));
+            }
         }
+        Ok(())
     }
 
     #[test]
@@ -2451,7 +2459,7 @@ mod tests {
     }
 
     #[test]
-    fn test_agents_write_definition_rejects_author_elevation_without_touching_disk() {
+    fn test_agents_write_definition_rejects_author_elevation_without_touching_disk() -> TestResult {
         let ceiling = empty_ceiling(AgentRoleId::UserInterface);
         let executor = AgentsWriteDefinitionExecutor {
             project_agents_dir: None,
@@ -2489,15 +2497,27 @@ contract = "harwness.return.research-finding@1"
             ToolOutput::Json { content } => {
                 assert_eq!(content["ok"], serde_json::json!(false));
                 assert_eq!(content["written"], serde_json::json!(false));
-                let errors = content["errors"].as_array().unwrap();
-                assert!(errors[0].as_str().unwrap().contains("authority elevation"));
+                let errors = content["errors"]
+                    .as_array()
+                    .ok_or(TestError::Missing("errors ist ein Array"))?;
+                assert!(
+                    errors[0]
+                        .as_str()
+                        .ok_or(TestError::Missing("errors[0] ist ein String"))?
+                        .contains("authority elevation")
+                );
             }
-            other => panic!("expected a json error output, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected a json error output, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_agents_write_definition_rejects_invalid_slug_without_touching_disk() {
+    fn test_agents_write_definition_rejects_invalid_slug_without_touching_disk() -> TestResult {
         let ceiling = empty_ceiling(AgentRoleId::RootOrchestrator);
         let executor = AgentsWriteDefinitionExecutor {
             project_agents_dir: None,
@@ -2516,12 +2536,17 @@ contract = "harwness.return.research-finding@1"
         let output = executor.write(&call);
         match output {
             ToolOutput::Error { message } => assert!(message.contains("gültiger Name")),
-            other => panic!("expected an error output, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected an error output, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_agents_write_definition_run_scope_requires_run_id() {
+    fn test_agents_write_definition_run_scope_requires_run_id() -> TestResult {
         let ceiling = empty_ceiling(AgentRoleId::RootOrchestrator);
         let executor = AgentsWriteDefinitionExecutor {
             project_agents_dir: None,
@@ -2540,8 +2565,13 @@ contract = "harwness.return.research-finding@1"
         let output = executor.write(&call);
         match output {
             ToolOutput::Error { message } => assert!(message.contains("run_id")),
-            other => panic!("expected an error output, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected an error output, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
@@ -2572,7 +2602,7 @@ contract = "harwness.return.research-finding@1"
     }
 
     #[test]
-    fn test_build_agent_toml_no_longer_embeds_identity_field() {
+    fn test_build_agent_toml_no_longer_embeds_identity_field() -> TestResult {
         let raw = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -2590,14 +2620,15 @@ admitted = []
 contract = "harwness.return.research-finding@1"
 "#,
         )
-        .expect("parse fixture definition");
+        .map_err(ctx("parse fixture definition"))?;
         let agent_toml = build_agent_toml(&raw);
         assert!(!agent_toml.contains("identity"));
         assert!(agent_toml.contains("role = \"user-interface\""));
+        Ok(())
     }
 
     #[test]
-    fn test_commit_uia_bundle_writes_identity_md_when_present() {
+    fn test_commit_uia_bundle_writes_identity_md_when_present() -> TestResult {
         let directory = std::env::temp_dir().join(format!(
             "harw-agent-def-tools-commit-with-identity-{}-{}",
             std::process::id(),
@@ -2612,16 +2643,18 @@ contract = "harwness.return.research-finding@1"
             "warm",
             "# Nutzerkontext",
         )
-        .expect("commit uia bundle");
+        .map_err(ctx("commit uia bundle"))?;
         assert_eq!(
-            std::fs::read_to_string(directory.join("identity.md")).unwrap(),
+            std::fs::read_to_string(directory.join("identity.md"))
+                .map_err(ctx("identity.md lesen"))?,
             "Ich bin Test."
         );
-        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::remove_dir_all(&directory).map_err(ctx("Verzeichnis entfernen"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_commit_uia_bundle_omits_identity_md_when_absent() {
+    fn test_commit_uia_bundle_omits_identity_md_when_absent() -> TestResult {
         let directory = std::env::temp_dir().join(format!(
             "harw-agent-def-tools-commit-without-identity-{}-{}",
             std::process::id(),
@@ -2636,9 +2669,10 @@ contract = "harwness.return.research-finding@1"
             "warm",
             "# Nutzerkontext",
         )
-        .expect("commit uia bundle");
+        .map_err(ctx("commit uia bundle"))?;
         assert!(!directory.join("identity.md").exists());
-        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::remove_dir_all(&directory).map_err(ctx("Verzeichnis entfernen"))?;
+        Ok(())
     }
 
     #[test]
@@ -2653,7 +2687,7 @@ contract = "harwness.return.research-finding@1"
     }
 
     #[test]
-    fn test_update_document_rejects_secret_pattern() {
+    fn test_update_document_rejects_secret_pattern() -> TestResult {
         let executor = UiaSelfUpdateDocumentExecutor {
             agent_dir: std::env::temp_dir(),
         };
@@ -2671,18 +2705,23 @@ contract = "harwness.return.research-finding@1"
             ToolOutput::Json { content } => {
                 assert_eq!(content["ok"], serde_json::json!(false));
             }
-            other => panic!("expected a json error output, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected a json error output, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_update_document_writes_identity_target() {
+    fn test_update_document_writes_identity_target() -> TestResult {
         let directory = std::env::temp_dir().join(format!(
             "harw-agent-def-tools-self-doc-identity-{}-{}",
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::create_dir_all(&directory).map_err(ctx("Verzeichnis anlegen"))?;
         let executor = UiaSelfUpdateDocumentExecutor {
             agent_dir: directory.clone(),
         };
@@ -2698,23 +2737,29 @@ contract = "harwness.return.research-finding@1"
         let output = executor.write(&call);
         match output {
             ToolOutput::Json { content } => assert_eq!(content["ok"], serde_json::json!(true)),
-            other => panic!("expected a json success output, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected a json success output, got {other:?}"
+                )));
+            }
         }
         assert_eq!(
-            std::fs::read_to_string(directory.join("identity.md")).unwrap(),
+            std::fs::read_to_string(directory.join("identity.md"))
+                .map_err(ctx("identity.md lesen"))?,
             "Ich bin Emily."
         );
-        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::remove_dir_all(&directory).map_err(ctx("Verzeichnis entfernen"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_update_document_writes_user_target() {
+    fn test_update_document_writes_user_target() -> TestResult {
         let directory = std::env::temp_dir().join(format!(
             "harw-agent-def-tools-self-doc-user-{}-{}",
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::create_dir_all(&directory).map_err(ctx("Verzeichnis anlegen"))?;
         let executor = UiaSelfUpdateDocumentExecutor {
             agent_dir: directory.clone(),
         };
@@ -2729,21 +2774,22 @@ contract = "harwness.return.research-finding@1"
         };
         let output = executor.write(&call);
         assert_eq!(
-            std::fs::read_to_string(directory.join("USER.md")).unwrap(),
+            std::fs::read_to_string(directory.join("USER.md")).map_err(ctx("USER.md lesen"))?,
             "Name: Mia"
         );
         assert!(matches!(output, ToolOutput::Json { .. }));
-        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::remove_dir_all(&directory).map_err(ctx("Verzeichnis entfernen"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_update_document_writes_personality_target() {
+    fn test_update_document_writes_personality_target() -> TestResult {
         let directory = std::env::temp_dir().join(format!(
             "harw-agent-def-tools-self-doc-personality-{}-{}",
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::create_dir_all(&directory).map_err(ctx("Verzeichnis anlegen"))?;
         let executor = UiaSelfUpdateDocumentExecutor {
             agent_dir: directory.clone(),
         };
@@ -2758,21 +2804,23 @@ contract = "harwness.return.research-finding@1"
         };
         let output = executor.write(&call);
         assert_eq!(
-            std::fs::read_to_string(directory.join("Personality.md")).unwrap(),
+            std::fs::read_to_string(directory.join("Personality.md"))
+                .map_err(ctx("Personality.md lesen"))?,
             "warm, knapp"
         );
         assert!(matches!(output, ToolOutput::Json { .. }));
-        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::remove_dir_all(&directory).map_err(ctx("Verzeichnis entfernen"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_update_document_never_escapes_agent_dir() {
+    fn test_update_document_never_escapes_agent_dir() -> TestResult {
         let directory = std::env::temp_dir().join(format!(
             "harw-agent-def-tools-self-doc-scope-{}-{}",
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::create_dir_all(&directory).map_err(ctx("Verzeichnis anlegen"))?;
         let executor = UiaSelfUpdateDocumentExecutor {
             agent_dir: directory.clone(),
         };
@@ -2791,10 +2839,18 @@ contract = "harwness.return.research-finding@1"
         let output = executor.write(&call);
         match output {
             ToolOutput::Error { message } => assert!(message.contains("unbekanntes target")),
-            other => panic!("expected an error output, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected an error output, got {other:?}"
+                )));
+            }
         }
-        assert!(!directory.parent().unwrap().join("escape").exists());
-        std::fs::remove_dir_all(&directory).unwrap();
+        let parent = directory
+            .parent()
+            .ok_or(TestError::Missing("directory hat ein Elternverzeichnis"))?;
+        assert!(!parent.join("escape").exists());
+        std::fs::remove_dir_all(&directory).map_err(ctx("Verzeichnis entfernen"))?;
+        Ok(())
     }
 
     #[test]

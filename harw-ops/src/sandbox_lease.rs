@@ -96,7 +96,7 @@ const SANDBOX_LEASE_DENIED_MSG: &str =
 /// - `reason` (`Option<String>`): Pflicht (nicht-leer) bei `action =
 ///   "request"`; auf der Command-Fläche immer `None` (der Vertrag reserviert
 ///   `request` bewusst für das Model-Tool, siehe Moduldoku).
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, harw_macros::OpArgs)]
 pub struct SandboxLeaseArgs {
     /// `"request"` (Vorgabe für die JSON-Flächen) | `"status"` (Vorgabe für
     /// ein bares `/sandbox-lease`) | `"revoke"`.
@@ -318,7 +318,9 @@ async fn handle_request(ctx: &OpContext, reason: Option<&str>) -> Result<OpOutpu
             // Sandbox-Deaktivierung“, 2026-09-21): gilt damit auch für jede
             // Kind-Session (z. B. `uia-shell-worker`, `host-process-worker`),
             // nicht nur für `session_id` selbst.
-            handles.registry.mark_global_approval(HOST_SESSION_LEASE_TTL);
+            handles
+                .registry
+                .mark_global_approval(HOST_SESSION_LEASE_TTL);
             Ok(OpOutput::from(format!(
                 "Sandbox-Lease erteilt für {} Stunden; shell.exec läuft jetzt auf dem Host \
                  (für diese harw-Sitzung inkl. aller Kind-Agenten).",
@@ -343,6 +345,7 @@ async fn handle_request(ctx: &OpContext, reason: Option<&str>) -> Result<OpOutpu
 #[cfg(test)]
 mod tests {
     use super::{SandboxLeaseArgs, sandbox_lease};
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
     use harw_authority::{
         Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
@@ -358,12 +361,14 @@ mod tests {
 
     /// Baut einen `OpContext` mit frischem temporärem Workspace, optional mit
     /// registrierten `Arc<HostPermitHandles>`.
-    fn test_context(handles: Option<Arc<HostPermitHandles>>) -> (OpContext, PathBuf) {
+    fn test_context(handles: Option<Arc<HostPermitHandles>>) -> TestResult<(OpContext, PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir()
-            .join(format!("harw-sandbox-lease-test-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(root.join("workspace")).expect("create test workspace");
+        let root = std::env::temp_dir().join(format!(
+            "harw-sandbox-lease-test-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("workspace")).map_err(ctx("create test workspace"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -372,13 +377,13 @@ mod tests {
                 root: PathBuf::from("workspace"),
             }],
         )
-        .expect("build workspace registry");
+        .map_err(ctx("build workspace registry"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("workspace"),
             )
-            .expect("resolve workspace binding");
+            .map_err(ctx("resolve workspace binding"))?;
         let mut services = ServiceMap::new();
         if let Some(handles) = handles {
             services.insert(handles);
@@ -392,7 +397,7 @@ mod tests {
             ),
             services,
         );
-        (ctx, root)
+        Ok((ctx, root))
     }
 
     /// Frische Handles mit leerem Ledger/Registry, optional mit angehängtem
@@ -417,121 +422,141 @@ mod tests {
     // ── Argument-Parsing ───────────────────────────────────────────────────
 
     #[test]
-    fn test_sandbox_lease_args_from_raw_args_bare_defaults_to_status() {
-        let parsed = SandboxLeaseArgs::from_raw_args(&toks(&[])).expect("parse");
+    fn test_sandbox_lease_args_from_raw_args_bare_defaults_to_status() -> TestResult {
+        let parsed = SandboxLeaseArgs::from_raw_args(&toks(&[])).map_err(ctx("parse"))?;
         assert_eq!(parsed.action.as_deref(), Some("status"));
         assert_eq!(parsed.reason, None);
+        Ok(())
     }
 
     #[test]
-    fn test_sandbox_lease_args_from_raw_args_recognizes_revoke() {
-        let parsed = SandboxLeaseArgs::from_raw_args(&toks(&["revoke"])).expect("parse");
+    fn test_sandbox_lease_args_from_raw_args_recognizes_revoke() -> TestResult {
+        let parsed = SandboxLeaseArgs::from_raw_args(&toks(&["revoke"])).map_err(ctx("parse"))?;
         assert_eq!(parsed.action.as_deref(), Some("revoke"));
         assert_eq!(parsed.reason, None);
+        Ok(())
     }
 
     #[test]
-    fn test_sandbox_lease_args_from_raw_args_recognizes_status() {
-        let parsed = SandboxLeaseArgs::from_raw_args(&toks(&["status"])).expect("parse");
+    fn test_sandbox_lease_args_from_raw_args_recognizes_status() -> TestResult {
+        let parsed = SandboxLeaseArgs::from_raw_args(&toks(&["status"])).map_err(ctx("parse"))?;
         assert_eq!(parsed.action.as_deref(), Some("status"));
+        Ok(())
     }
 
     // ── status ─────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn sandbox_lease_status_without_handles_is_not_available() {
-        let (ctx, root) = test_context(None);
+    async fn sandbox_lease_status_without_handles_is_not_available() -> TestResult {
+        let (ctx, root) = test_context(None)?;
         let result = sandbox_lease(&ctx, args("status", None)).await;
         std::fs::remove_dir_all(&root).ok();
         match result {
             Err(OpError::NotAvailable(message)) => {
                 assert!(message.contains("Host-Freigaben"), "{message}");
             }
-            other => panic!("expected NotAvailable, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn sandbox_lease_status_is_off_by_default() {
+    async fn sandbox_lease_status_is_off_by_default() -> TestResult {
         let handles = fresh_handles(None);
-        let (ctx, root) = test_context(Some(Arc::clone(&handles)));
+        let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
         let output = sandbox_lease(&ctx, args("status", None))
             .await
-            .expect("status must not fail");
+            .map_err(crate::test_support::ctx("status must not fail"))?;
         std::fs::remove_dir_all(&root).ok();
         assert!(output.text.contains("aus"), "{}", output.text);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn sandbox_lease_status_reports_active_session_lease() {
+    async fn sandbox_lease_status_reports_active_session_lease() -> TestResult {
         let handles = fresh_handles(None);
-        let (ctx, root) = test_context(Some(Arc::clone(&handles)));
+        let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
         handles
             .registry
             .mark_session_approved(ctx.session_id().as_str(), Duration::from_secs(600));
 
         let output = sandbox_lease(&ctx, args("status", None))
             .await
-            .expect("status must not fail");
+            .map_err(crate::test_support::ctx("status must not fail"))?;
         std::fs::remove_dir_all(&root).ok();
         assert!(output.text.contains("aktiv"), "{}", output.text);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn sandbox_lease_status_reports_single_use() {
+    async fn sandbox_lease_status_reports_single_use() -> TestResult {
         let handles = fresh_handles(None);
-        let (ctx, root) = test_context(Some(Arc::clone(&handles)));
+        let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
         handles
             .registry
             .mark_single_use(ctx.session_id().as_str().to_owned());
 
         let output = sandbox_lease(&ctx, args("status", None))
             .await
-            .expect("status must not fail");
+            .map_err(crate::test_support::ctx("status must not fail"))?;
         std::fs::remove_dir_all(&root).ok();
         assert!(output.text.contains("Einmalfreigabe"), "{}", output.text);
+        Ok(())
     }
 
     /// `status` muss auch eine prozessweite Freigabe melden, die eine ganz
     /// andere Session-ID gesetzt hat (z. B. die Root-Session über
     /// `/sandbox-lease request`) — nicht nur eine sitzungseigene.
     #[tokio::test]
-    async fn sandbox_lease_status_reports_active_global_lease_for_a_different_session() {
+    async fn sandbox_lease_status_reports_active_global_lease_for_a_different_session() -> TestResult
+    {
         let handles = fresh_handles(None);
-        let (ctx, root) = test_context(Some(Arc::clone(&handles)));
-        handles.registry.mark_global_approval(Duration::from_secs(600));
+        let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
+        handles
+            .registry
+            .mark_global_approval(Duration::from_secs(600));
 
         let output = sandbox_lease(&ctx, args("status", None))
             .await
-            .expect("status must not fail");
+            .map_err(crate::test_support::ctx("status must not fail"))?;
         std::fs::remove_dir_all(&root).ok();
         assert!(
             output.text.contains("aktiv"),
             "a global approval set by a different session must still show as active: {}",
             output.text
         );
+        Ok(())
     }
 
     // ── revoke ─────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn sandbox_lease_revoke_clears_an_active_lease_and_is_idempotent() {
+    async fn sandbox_lease_revoke_clears_an_active_lease_and_is_idempotent() -> TestResult {
         let handles = fresh_handles(None);
-        let (ctx, root) = test_context(Some(Arc::clone(&handles)));
+        let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
         handles
             .registry
             .mark_session_approved(ctx.session_id().as_str(), Duration::from_secs(600));
 
         let first = sandbox_lease(&ctx, args("revoke", None))
             .await
-            .expect("revoke must not fail");
+            .map_err(crate::test_support::ctx("revoke must not fail"))?;
         assert!(first.text.contains("widerrufen"), "{}", first.text);
-        assert!(!handles.registry.is_session_approved(ctx.session_id().as_str()));
+        assert!(
+            !handles
+                .registry
+                .is_session_approved(ctx.session_id().as_str())
+        );
 
         // Zweiter Aufruf ist ein No-Op statt eines Fehlers.
         let second = sandbox_lease(&ctx, args("revoke", None)).await;
         std::fs::remove_dir_all(&root).ok();
         assert!(second.is_ok());
+        Ok(())
     }
 
     /// Beweist die eigentliche Behebung dieses Auftrags: `revoke` muss auch
@@ -540,15 +565,17 @@ mod tests {
     /// Lease für jede Kind-Session aktiv, selbst nach einem Widerruf durch
     /// die Root-Session.
     #[tokio::test]
-    async fn sandbox_lease_revoke_clears_the_global_lease_for_every_session() {
+    async fn sandbox_lease_revoke_clears_the_global_lease_for_every_session() -> TestResult {
         let handles = fresh_handles(None);
-        let (ctx, root) = test_context(Some(Arc::clone(&handles)));
-        handles.registry.mark_global_approval(Duration::from_secs(600));
+        let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
+        handles
+            .registry
+            .mark_global_approval(Duration::from_secs(600));
         assert!(handles.registry.is_session_approved("some-child-session"));
 
         let output = sandbox_lease(&ctx, args("revoke", None))
             .await
-            .expect("revoke must not fail");
+            .map_err(crate::test_support::ctx("revoke must not fail"))?;
         std::fs::remove_dir_all(&root).ok();
 
         assert!(output.text.contains("widerrufen"), "{}", output.text);
@@ -557,34 +584,42 @@ mod tests {
             "revoke must clear the global approval for every session id, not just the caller's"
         );
         assert_eq!(handles.registry.global_approval_remaining(), None);
+        Ok(())
     }
 
     // ── request ────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn sandbox_lease_request_requires_a_non_empty_reason() {
+    async fn sandbox_lease_request_requires_a_non_empty_reason() -> TestResult {
         let handles = fresh_handles(None);
-        let (ctx, root) = test_context(Some(Arc::clone(&handles)));
+        let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
         let result = sandbox_lease(&ctx, args("request", Some("   "))).await;
         std::fs::remove_dir_all(&root).ok();
         assert!(matches!(result, Err(OpError::InvalidArguments(_))));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn sandbox_lease_request_without_handles_is_not_available() {
-        let (ctx, root) = test_context(None);
+    async fn sandbox_lease_request_without_handles_is_not_available() -> TestResult {
+        let (ctx, root) = test_context(None)?;
         let result = sandbox_lease(&ctx, args("request", Some("brauche cargo"))).await;
         std::fs::remove_dir_all(&root).ok();
         match result {
             Err(OpError::NotAvailable(message)) => {
                 assert!(message.contains("Host-Freigaben"), "{message}");
             }
-            other => panic!("expected NotAvailable, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn sandbox_lease_request_reuses_an_already_active_global_lease_without_prompting() {
+    async fn sandbox_lease_request_reuses_an_already_active_global_lease_without_prompting()
+    -> TestResult {
         // Kein Sender angehängt -- ein Prompt-Versuch würde fehlschlagen, also
         // beweist ein Erfolg hier, dass kein Prompt gesendet wurde. Die
         // "bereits aktiv"-Prüfung in `handle_request` fragt ausdrücklich die
@@ -592,23 +627,29 @@ mod tests {
         // Freigabe (`mark_session_approved`) reicht dafür seit dieser
         // Behebung nicht mehr aus, weil `request` selbst keine mehr setzt.
         let handles = fresh_handles(None);
-        let (ctx, root) = test_context(Some(Arc::clone(&handles)));
-        handles.registry.mark_global_approval(Duration::from_secs(600));
+        let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
+        handles
+            .registry
+            .mark_global_approval(Duration::from_secs(600));
 
         let output = sandbox_lease(&ctx, args("request", Some("brauche cargo")))
             .await
-            .expect("an already active global lease must succeed without a prompt");
+            .map_err(crate::test_support::ctx(
+                "an already active global lease must succeed without a prompt",
+            ))?;
         std::fs::remove_dir_all(&root).ok();
         assert!(output.text.contains("bereits aktiv"), "{}", output.text);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn sandbox_lease_request_without_a_prompt_channel_is_denied() {
+    async fn sandbox_lease_request_without_a_prompt_channel_is_denied() -> TestResult {
         let handles = fresh_handles(None);
-        let (ctx, root) = test_context(Some(Arc::clone(&handles)));
+        let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
         let result = sandbox_lease(&ctx, args("request", Some("brauche cargo"))).await;
         std::fs::remove_dir_all(&root).ok();
         assert!(matches!(result, Err(OpError::Execution(_))));
+        Ok(())
     }
 
     /// Beweist die eigentliche Behebung dieses Auftrags: eine über
@@ -617,55 +658,90 @@ mod tests {
     /// anfragende Session selbst.
     #[tokio::test]
     async fn sandbox_lease_request_session_lease_answer_marks_global_approval_visible_to_any_session()
-     {
+    -> TestResult {
         let (sender, mut receiver) = host_permit_prompt_channel();
         let handles = fresh_handles(Some(sender));
-        let (ctx, root) = test_context(Some(Arc::clone(&handles)));
+        let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
 
         let responder = tokio::spawn(async move {
-            let prompt = receiver.recv().await.expect("prompt must arrive");
-            assert!(prompt.approve(HostPermitVariant::SessionLease));
+            let prompt = receiver
+                .recv()
+                .await
+                .ok_or(TestError::Missing("prompt must arrive"))?;
+            if !prompt.approve(HostPermitVariant::SessionLease) {
+                return Err(TestError::Unexpected(
+                    "prompt.approve returned false".to_owned(),
+                ));
+            }
+            Ok(())
         });
 
         let output = sandbox_lease(&ctx, args("request", Some("brauche cargo")))
             .await
-            .expect("an approved session lease must succeed");
-        responder.await.expect("responder task must not panic");
+            .map_err(crate::test_support::ctx(
+                "an approved session lease must succeed",
+            ))?;
+        responder
+            .await
+            .map_err(crate::test_support::ctx("responder task must not panic"))??;
         std::fs::remove_dir_all(&root).ok();
 
         assert!(output.text.contains("erteilt"), "{}", output.text);
-        assert!(handles.registry.is_session_approved(ctx.session_id().as_str()));
         assert!(
-            handles.registry.is_session_approved("a-completely-different-child-session"),
+            handles
+                .registry
+                .is_session_approved(ctx.session_id().as_str())
+        );
+        assert!(
+            handles
+                .registry
+                .is_session_approved("a-completely-different-child-session"),
             "a sandbox-lease grant must cover every session id of this harw process, \
              not only the one that requested it"
         );
         assert!(handles.registry.global_approval_remaining().is_some());
+        Ok(())
     }
 
     /// Wie oben, für `SingleExecution`: die Einmalfreigabe muss den nächsten
     /// `shell.exec`-Aufruf **jeder** Session dieses Prozesses abdecken.
     #[tokio::test]
     async fn sandbox_lease_request_single_execution_answer_marks_global_single_use_visible_to_any_session()
-     {
+    -> TestResult {
         let (sender, mut receiver) = host_permit_prompt_channel();
         let handles = fresh_handles(Some(sender));
-        let (ctx, root) = test_context(Some(Arc::clone(&handles)));
+        let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
 
         let responder = tokio::spawn(async move {
-            let prompt = receiver.recv().await.expect("prompt must arrive");
-            assert!(prompt.approve(HostPermitVariant::SingleExecution));
+            let prompt = receiver
+                .recv()
+                .await
+                .ok_or(TestError::Missing("prompt must arrive"))?;
+            if !prompt.approve(HostPermitVariant::SingleExecution) {
+                return Err(TestError::Unexpected(
+                    "prompt.approve returned false".to_owned(),
+                ));
+            }
+            Ok(())
         });
 
         let output = sandbox_lease(&ctx, args("request", Some("brauche cargo")))
             .await
-            .expect("an approved single execution must succeed");
-        responder.await.expect("responder task must not panic");
+            .map_err(crate::test_support::ctx(
+                "an approved single execution must succeed",
+            ))?;
+        responder
+            .await
+            .map_err(crate::test_support::ctx("responder task must not panic"))??;
         std::fs::remove_dir_all(&root).ok();
 
         assert!(output.text.contains("Einmalige"), "{}", output.text);
         assert!(handles.registry.has_single_use(ctx.session_id().as_str()));
-        assert!(!handles.registry.is_session_approved(ctx.session_id().as_str()));
+        assert!(
+            !handles
+                .registry
+                .is_session_approved(ctx.session_id().as_str())
+        );
         assert!(
             handles.registry.has_global_single_use(),
             "the single-execution grant must be visible as a global single-use approval"
@@ -673,40 +749,61 @@ mod tests {
         // Verbraucht durch eine ganz andere Session-ID, wie es ein
         // Kind-Agent tun würde -- beweist, dass die Freigabe prozessweit und
         // nicht sitzungseigen ist.
-        assert!(handles.registry.take_single_use("a-completely-different-child-session"));
+        assert!(
+            handles
+                .registry
+                .take_single_use("a-completely-different-child-session")
+        );
         assert!(!handles.registry.has_global_single_use());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn sandbox_lease_request_denied_answer_is_an_error() {
+    async fn sandbox_lease_request_denied_answer_is_an_error() -> TestResult {
         let (sender, mut receiver) = host_permit_prompt_channel();
         let handles = fresh_handles(Some(sender));
-        let (ctx, root) = test_context(Some(Arc::clone(&handles)));
+        let (ctx, root) = test_context(Some(Arc::clone(&handles)))?;
 
         let responder = tokio::spawn(async move {
-            let prompt = receiver.recv().await.expect("prompt must arrive");
-            assert!(prompt.deny());
+            let prompt = receiver
+                .recv()
+                .await
+                .ok_or(TestError::Missing("prompt must arrive"))?;
+            if !prompt.deny() {
+                return Err(TestError::Unexpected(
+                    "prompt.deny returned false".to_owned(),
+                ));
+            }
+            Ok(())
         });
 
         let result = sandbox_lease(&ctx, args("request", Some("brauche cargo"))).await;
-        responder.await.expect("responder task must not panic");
+        responder
+            .await
+            .map_err(crate::test_support::ctx("responder task must not panic"))??;
         std::fs::remove_dir_all(&root).ok();
 
         assert!(matches!(result, Err(OpError::Execution(_))));
+        Ok(())
     }
 
     // ── unbekannte Aktion ──────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn sandbox_lease_unknown_action_is_rejected() {
-        let (ctx, root) = test_context(None);
+    async fn sandbox_lease_unknown_action_is_rejected() -> TestResult {
+        let (ctx, root) = test_context(None)?;
         let result = sandbox_lease(&ctx, args("frobnicate", None)).await;
         std::fs::remove_dir_all(&root).ok();
         match result {
             Err(OpError::InvalidArguments(message)) => {
                 assert!(message.contains("frobnicate"), "{message}");
             }
-            other => panic!("expected InvalidArguments, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected InvalidArguments, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 }

@@ -150,3 +150,7 @@ pub mod scope;
 
 pub use ask_tool::{LensAskArgs, LensAskTool};
 pub use provider::LensToolProvider;
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

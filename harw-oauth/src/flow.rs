@@ -205,6 +205,7 @@ pub async fn exchange_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn test_authorize_url_contains_pkce_and_state() {
@@ -232,38 +233,49 @@ mod tests {
     }
 
     #[test]
-    fn test_callback_state_must_match_expected_state() {
+    fn test_callback_state_must_match_expected_state() -> TestResult {
         assert!(validate_callback_state("expected", "expected").is_ok());
 
-        let error = validate_callback_state("pasted", "expected").unwrap_err();
+        let Err(error) = validate_callback_state("pasted", "expected") else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert_eq!(
             error.to_string(),
             "malformed callback input: callback state does not match expected state"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_callback_state_is_required() {
-        let missing_state = validate_callback_state("", "expected").unwrap_err();
+    fn test_callback_state_is_required() -> TestResult {
+        let Err(missing_state) = validate_callback_state("", "expected") else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert_eq!(
             missing_state.to_string(),
             "malformed callback input: missing callback state"
         );
 
-        let missing_expected = validate_callback_state("pasted", "").unwrap_err();
+        let Err(missing_expected) = validate_callback_state("pasted", "") else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert_eq!(
             missing_expected.to_string(),
             "malformed callback input: missing expected callback state"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_callback_state_errors_do_not_include_state_values() {
-        let error = validate_callback_state("secret-pasted-state", "secret-expected-state")
-            .unwrap_err()
-            .to_string();
+    fn test_callback_state_errors_do_not_include_state_values() -> TestResult {
+        let Err(error) = validate_callback_state("secret-pasted-state", "secret-expected-state")
+        else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        let error = error.to_string();
         assert!(!error.contains("secret-pasted-state"));
         assert!(!error.contains("secret-expected-state"));
+        Ok(())
     }
 
     #[test]

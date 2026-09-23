@@ -251,6 +251,7 @@ impl Principal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestResult;
 
     const KINDS: [PrincipalKind; 4] = [
         PrincipalKind::Human,
@@ -285,12 +286,8 @@ mod tests {
     fn approval_actor_table_covers_every_kind_and_surface() {
         for kind in KINDS {
             for surface in SURFACES {
-                let principal = Principal::trusted_ingress(
-                    kind,
-                    "client-7",
-                    surface,
-                    PermissionTier::Owner,
-                );
+                let principal =
+                    Principal::trusted_ingress(kind, "client-7", surface, PermissionTier::Owner);
                 let expected = match (kind, surface) {
                     (PrincipalKind::Human, IngressSurface::Tui) => operator("local-tui"),
                     (PrincipalKind::Human, IngressSurface::Cli) => operator("local-cli"),
@@ -340,7 +337,11 @@ mod tests {
             for surface in SURFACES {
                 let principal =
                     Principal::trusted_ingress(kind, "mia", surface, PermissionTier::Owner);
-                assert_eq!(principal.actor_id(), None, "kind={kind:?} surface={surface:?}");
+                assert_eq!(
+                    principal.actor_id(),
+                    None,
+                    "kind={kind:?} surface={surface:?}"
+                );
             }
         }
     }
@@ -441,26 +442,27 @@ mod tests {
     }
 
     #[test]
-    fn permission_tier_serde_uses_snake_case_names() {
+    fn permission_tier_serde_uses_snake_case_names() -> TestResult {
         let names = ["observer", "operator", "maintainer", "owner"];
         for (tier, name) in TIERS.iter().zip(names) {
-            let json = serde_json::to_string(tier).unwrap();
+            let json = serde_json::to_string(tier)?;
             assert_eq!(json, format!("\"{name}\""));
-            let back: PermissionTier = serde_json::from_str(&json).unwrap();
+            let back: PermissionTier = serde_json::from_str(&json)?;
             assert_eq!(back, *tier);
         }
         assert!(serde_json::from_str::<PermissionTier>("\"Owner\"").is_err());
+        Ok(())
     }
 
     #[test]
-    fn principal_serializes_all_fields_snake_case() {
+    fn principal_serializes_all_fields_snake_case() -> TestResult {
         let p = Principal::trusted_ingress(
             PrincipalKind::Channel,
             "peer",
             IngressSurface::JobWorker,
             PermissionTier::Observer,
         );
-        let value = serde_json::to_value(&p).unwrap();
+        let value = serde_json::to_value(&p)?;
         assert_eq!(
             value,
             serde_json::json!({
@@ -470,5 +472,6 @@ mod tests {
                 "tier": "observer",
             })
         );
+        Ok(())
     }
 }

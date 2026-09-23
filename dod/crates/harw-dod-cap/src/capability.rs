@@ -34,16 +34,7 @@
 /// Rechtematrix, kein freier String. Jede der vierzehn Varianten entspricht
 /// genau einer Sensor-Crate im AW0-Ausbauprogramm.
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    serde::Serialize,
-    serde::Deserialize,
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum Capability {
@@ -182,70 +173,110 @@ impl Capability {
 #[cfg(test)]
 mod tests {
     use super::{Capability, CapabilityClass};
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn test_class_read_sysfs_thermal_is_unprivileged() {
-        assert_eq!(Capability::ReadSysfsThermal.class(), CapabilityClass::Unprivileged);
+        assert_eq!(
+            Capability::ReadSysfsThermal.class(),
+            CapabilityClass::Unprivileged
+        );
     }
 
     #[test]
     fn test_class_read_proc_stat_is_unprivileged() {
-        assert_eq!(Capability::ReadProcStat.class(), CapabilityClass::Unprivileged);
+        assert_eq!(
+            Capability::ReadProcStat.class(),
+            CapabilityClass::Unprivileged
+        );
     }
 
     #[test]
     fn test_class_read_proc_meminfo_is_unprivileged() {
-        assert_eq!(Capability::ReadProcMeminfo.class(), CapabilityClass::Unprivileged);
+        assert_eq!(
+            Capability::ReadProcMeminfo.class(),
+            CapabilityClass::Unprivileged
+        );
     }
 
     #[test]
     fn test_class_read_sysfs_block_is_unprivileged() {
-        assert_eq!(Capability::ReadSysfsBlock.class(), CapabilityClass::Unprivileged);
+        assert_eq!(
+            Capability::ReadSysfsBlock.class(),
+            CapabilityClass::Unprivileged
+        );
     }
 
     #[test]
     fn test_class_read_proc_net_dev_is_unprivileged() {
-        assert_eq!(Capability::ReadProcNetDev.class(), CapabilityClass::Unprivileged);
+        assert_eq!(
+            Capability::ReadProcNetDev.class(),
+            CapabilityClass::Unprivileged
+        );
     }
 
     #[test]
     fn test_class_read_sysfs_drm_is_unprivileged() {
-        assert_eq!(Capability::ReadSysfsDrm.class(), CapabilityClass::Unprivileged);
+        assert_eq!(
+            Capability::ReadSysfsDrm.class(),
+            CapabilityClass::Unprivileged
+        );
     }
 
     #[test]
     fn test_class_read_cgroup_v2_is_unprivileged() {
-        assert_eq!(Capability::ReadCgroupV2.class(), CapabilityClass::Unprivileged);
+        assert_eq!(
+            Capability::ReadCgroupV2.class(),
+            CapabilityClass::Unprivileged
+        );
     }
 
     #[test]
     fn test_class_read_proc_net_is_unprivileged() {
-        assert_eq!(Capability::ReadProcNet.class(), CapabilityClass::Unprivileged);
+        assert_eq!(
+            Capability::ReadProcNet.class(),
+            CapabilityClass::Unprivileged
+        );
     }
 
     #[test]
     fn test_class_read_journal_is_unprivileged() {
-        assert_eq!(Capability::ReadJournal.class(), CapabilityClass::Unprivileged);
+        assert_eq!(
+            Capability::ReadJournal.class(),
+            CapabilityClass::Unprivileged
+        );
     }
 
     #[test]
     fn test_class_read_audit_netlink_is_netlink() {
-        assert_eq!(Capability::ReadAuditNetlink.class(), CapabilityClass::Netlink);
+        assert_eq!(
+            Capability::ReadAuditNetlink.class(),
+            CapabilityClass::Netlink
+        );
     }
 
     #[test]
     fn test_class_read_scan_reports_is_unprivileged() {
-        assert_eq!(Capability::ReadScanReports.class(), CapabilityClass::Unprivileged);
+        assert_eq!(
+            Capability::ReadScanReports.class(),
+            CapabilityClass::Unprivileged
+        );
     }
 
     #[test]
     fn test_class_read_workspace_graph_is_unprivileged() {
-        assert_eq!(Capability::ReadWorkspaceGraph.class(), CapabilityClass::Unprivileged);
+        assert_eq!(
+            Capability::ReadWorkspaceGraph.class(),
+            CapabilityClass::Unprivileged
+        );
     }
 
     #[test]
     fn test_class_watch_filesystem_is_file_watch() {
-        assert_eq!(Capability::WatchFilesystem.class(), CapabilityClass::FileWatch);
+        assert_eq!(
+            Capability::WatchFilesystem.class(),
+            CapabilityClass::FileWatch
+        );
     }
 
     #[test]
@@ -272,7 +303,10 @@ mod tests {
             Capability::LoadBpfProgram,
         ];
         for cap in all {
-            assert!(!cap.probe().is_empty(), "probe() muss nicht-leer sein: {cap:?}");
+            assert!(
+                !cap.probe().is_empty(),
+                "probe() muss nicht-leer sein: {cap:?}"
+            );
         }
     }
 
@@ -282,10 +316,12 @@ mod tests {
     }
 
     #[test]
-    fn test_serde_roundtrip_uses_kebab_case() {
-        let json = serde_json::to_string(&Capability::ReadAuditNetlink).expect("serialize");
+    fn test_serde_roundtrip_uses_kebab_case() -> TestResult {
+        let json =
+            serde_json::to_string(&Capability::ReadAuditNetlink).map_err(ctx("serialize"))?;
         assert_eq!(json, "\"read-audit-netlink\"");
-        let back: Capability = serde_json::from_str(&json).expect("deserialize");
+        let back: Capability = serde_json::from_str(&json).map_err(ctx("deserialize"))?;
         assert_eq!(back, Capability::ReadAuditNetlink);
+        Ok(())
     }
 }

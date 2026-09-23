@@ -484,14 +484,15 @@ fn sanitize_label(raw: &str) -> String {
 mod tests {
     use std::path::PathBuf;
 
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_dod_cap::{Capability, ReadScope, SensorError, SensorHandle};
     use harw_dod_signals::Sensor;
     use harw_types::SensorId;
     use jiff::Timestamp;
 
     use super::{
-        cap_and_sort_interfaces, parse_one_interface_row, sanitize_label, NetCountersSensor,
-        FIELD_METRICS, MAX_CARDINALITY, MAX_INTERFACES,
+        FIELD_METRICS, MAX_CARDINALITY, MAX_INTERFACES, NetCountersSensor, cap_and_sort_interfaces,
+        parse_one_interface_row, sanitize_label,
     };
 
     /// Das `fixtures/`-Wurzelverzeichnis dieser Crate.
@@ -532,12 +533,10 @@ mod tests {
     // ---- parse_one_interface_row ----
 
     #[test]
-    fn test_parse_one_interface_row_maps_middle_column_not_just_the_first() {
-        let fields = fields_from(
-            "eth0: 500000 4000 1 2 0 0 0 3 600000 4500 0 1 0 0 0 0",
-        );
-        let (name, values) =
-            parse_one_interface_row(&fields).expect("wohlgeformte Zeile muss geparst werden");
+    fn test_parse_one_interface_row_maps_middle_column_not_just_the_first() -> TestResult {
+        let fields = fields_from("eth0: 500000 4000 1 2 0 0 0 3 600000 4500 0 1 0 0 0 0");
+        let (name, values) = parse_one_interface_row(&fields)
+            .map_err(ctx("wohlgeformte Zeile muss geparst werden"))?;
 
         assert_eq!(name, "eth0");
         // tx_bytes (Index 8) ist ein Wert aus der Mitte der Zeile, nicht der
@@ -545,23 +544,25 @@ mod tests {
         // stimmt und nicht zufällig, weil Position 0 zufällig passt.
         assert_eq!(values[8], 600_000);
         assert_eq!(values[0], 500_000);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_one_interface_row_splits_colon_attached_to_name() {
+    fn test_parse_one_interface_row_splits_colon_attached_to_name() -> TestResult {
         // Der Normalfall: der Doppelpunkt klebt am Namen, aber ein
         // Leerzeichen trennt ihn vom ersten Zahlenwert.
         let fields = fields_from("lo: 733258 5340 0 0 0 0 0 0 733258 5340 0 0 0 0 0 0");
-        let (name, values) =
-            parse_one_interface_row(&fields).expect("wohlgeformte Zeile muss geparst werden");
+        let (name, values) = parse_one_interface_row(&fields)
+            .map_err(ctx("wohlgeformte Zeile muss geparst werden"))?;
 
         assert_eq!(name, "lo");
         assert_eq!(values.len(), 16);
         assert_eq!(values[0], 733_258);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_one_interface_row_splits_colon_glued_to_first_value() {
+    fn test_parse_one_interface_row_splits_colon_glued_to_first_value() -> TestResult {
         // Der Grenzfall: ein langer Schnittstellenname plus ein erster
         // Zählerwert, der die volle Spaltenbreite ausfüllt, lässt den Kernel
         // ohne trennendes Leerzeichen formatieren — Name, Doppelpunkt und
@@ -569,63 +570,80 @@ mod tests {
         let mut fields = vec!["veryverylongifname0:12345678".to_owned()];
         fields.extend(fields_from("4000 1 2 0 0 0 3 600000 4500 0 1 0 0 0 0"));
 
-        let (name, values) =
-            parse_one_interface_row(&fields).expect("glued Doppelpunkt muss getrennt werden");
+        let (name, values) = parse_one_interface_row(&fields)
+            .map_err(ctx("glued Doppelpunkt muss getrennt werden"))?;
 
         assert_eq!(name, "veryverylongifname0");
         assert_eq!(values[0], 12_345_678);
         assert_eq!(values[8], 600_000);
         assert_eq!(values.len(), 16);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_one_interface_row_accepts_extra_trailing_columns() {
+    fn test_parse_one_interface_row_accepts_extra_trailing_columns() -> TestResult {
         // Der wichtigste Robustheitsfall: ein künftiger Kernel hängt weitere
         // Spalten an. Der Parser darf daran nicht scheitern.
-        let fields = fields_from(
-            "eth0: 500000 4000 1 2 0 0 0 3 600000 4500 0 1 0 0 0 0 999 888",
-        );
-        let (_, values) =
-            parse_one_interface_row(&fields).expect("zusätzliche Spalten dürfen nicht scheitern");
+        let fields = fields_from("eth0: 500000 4000 1 2 0 0 0 3 600000 4500 0 1 0 0 0 0 999 888");
+        let (_, values) = parse_one_interface_row(&fields)
+            .map_err(ctx("zusätzliche Spalten dürfen nicht scheitern"))?;
         assert_eq!(values.len(), 18);
         assert_eq!(values[8], 600_000);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_one_interface_row_rejects_too_few_columns() {
+    fn test_parse_one_interface_row_rejects_too_few_columns() -> TestResult {
         let fields = fields_from("lo: 1 2 3");
-        let err = parse_one_interface_row(&fields)
-            .expect_err("zu wenige Spalten müssen scheitern");
+        let Err(err) = parse_one_interface_row(&fields) else {
+            return Err(TestError::Unexpected(
+                "zu wenige Spalten müssen scheitern".into(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_one_interface_row_rejects_non_numeric_field_without_leaking_content() {
+    fn test_parse_one_interface_row_rejects_non_numeric_field_without_leaking_content() -> TestResult
+    {
         let fields = fields_from("eth0: 1 not-a-number 3 4 0 0 0 0 5 6 0 0");
-        let err = parse_one_interface_row(&fields)
-            .expect_err("nicht-numerischer Wert muss scheitern");
+        let Err(err) = parse_one_interface_row(&fields) else {
+            return Err(TestError::Unexpected(
+                "nicht-numerischer Wert muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
         let rendered = format!("{err}{err:?}");
         assert!(
             !rendered.contains("not-a-number"),
             "Fehlermeldung darf den gelesenen Inhalt nicht enthalten: {rendered}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_parse_one_interface_row_rejects_missing_colon() {
+    fn test_parse_one_interface_row_rejects_missing_colon() -> TestResult {
         let fields = fields_from("eth0 1 2 3 4 5 6 7 8 9 10 11 12");
-        let err = parse_one_interface_row(&fields)
-            .expect_err("eine Zeile ohne Doppelpunkt muss scheitern");
+        let Err(err) = parse_one_interface_row(&fields) else {
+            return Err(TestError::Unexpected(
+                "eine Zeile ohne Doppelpunkt muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_one_interface_row_rejects_empty_name() {
+    fn test_parse_one_interface_row_rejects_empty_name() -> TestResult {
         let fields = fields_from(": 1 2 3 4 5 6 7 8 9 10 11 12");
-        let err = parse_one_interface_row(&fields)
-            .expect_err("ein leerer Schnittstellenname muss scheitern");
+        let Err(err) = parse_one_interface_row(&fields) else {
+            return Err(TestError::Unexpected(
+                "ein leerer Schnittstellenname muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
+        Ok(())
     }
 
     // ---- cap_and_sort_interfaces ----
@@ -704,52 +722,56 @@ mod tests {
     // ---- Fixture-gestützte Prüfungen ----
 
     #[test]
-    fn test_multi_interface_fixture_orders_samples_alphabetically_by_interface() {
+    fn test_multi_interface_fixture_orders_samples_alphabetically_by_interface() -> TestResult {
         let sensor = build_sensor(fixtures_root().join("multi-interface/tree"));
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("multi-interface Fixture muss erfolgreich pollen");
+            .map_err(ctx("multi-interface Fixture muss erfolgreich pollen"))?;
 
         assert_eq!(reading.samples.len(), 16);
         assert!(reading.samples[0].metric.ends_with("_eth0"));
         assert!(reading.samples[8].metric.ends_with("_lo"));
+        Ok(())
     }
 
     #[test]
-    fn test_many_interfaces_fixture_enforces_cardinality_cap() {
+    fn test_many_interfaces_fixture_enforces_cardinality_cap() -> TestResult {
         let sensor = build_sensor(fixtures_root().join("many-interfaces/tree"));
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("many-interfaces Fixture muss erfolgreich pollen");
+            .map_err(ctx("many-interfaces Fixture muss erfolgreich pollen"))?;
 
         assert_eq!(reading.samples.len(), MAX_CARDINALITY);
         assert!(reading.samples.iter().any(|s| s.metric.ends_with("_if00")));
         assert!(!reading.samples.iter().any(|s| s.metric.ends_with("_if16")));
+        Ok(())
     }
 
     #[test]
-    fn test_poll_is_deterministic_for_same_now() {
+    fn test_poll_is_deterministic_for_same_now() -> TestResult {
         let sensor = build_sensor(fixtures_root().join("multi-interface/tree"));
         let first = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("erster Poll muss gelingen");
+            .map_err(ctx("erster Poll muss gelingen"))?;
         let second = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("zweiter Poll muss gelingen");
+            .map_err(ctx("zweiter Poll muss gelingen"))?;
         assert_eq!(first, second);
+        Ok(())
     }
 
     /// Der wichtigste Test dieser Crate: kein serialisiertes Feld darf eine
     /// Adresse oder einen Port tragen (siehe `crate`-Moduldoku, Abschnitt
     /// „Was dieser Sensor ausdrücklich NICHT meldet").
     #[test]
-    fn test_serialized_reading_never_contains_address_or_port_pattern() {
+    fn test_serialized_reading_never_contains_address_or_port_pattern() -> TestResult {
         let sensor = build_sensor(fixtures_root().join("multi-interface/tree"));
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("multi-interface Fixture muss erfolgreich pollen");
+            .map_err(ctx("multi-interface Fixture muss erfolgreich pollen"))?;
 
-        let json = serde_json::to_string(&reading.samples).expect("HostSample serialisiert");
+        let json =
+            serde_json::to_string(&reading.samples).map_err(ctx("HostSample serialisiert"))?;
         assert!(
             !contains_ipv4_like_pattern(&json),
             "IPv4-artiges Adressmuster im serialisierten Ergebnis gefunden: {json}"
@@ -768,6 +790,7 @@ mod tests {
                 sample.metric
             );
         }
+        Ok(())
     }
 
     /// Sucht `haystack` nach einem IPv4-artigen Muster ab: vier durch `.`

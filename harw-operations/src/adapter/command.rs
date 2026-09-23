@@ -340,7 +340,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, OnceLock};
 
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
 
     use super::CommandAdapter;
@@ -350,6 +352,7 @@ mod tests {
         ApprovalPolicy, BusyAvailability, CommandVisibility, OpFuture, OpInput, OpOutput,
         Operation, OperationCategory, OperationDomain, OperationMeta, PermissionTier, Surface,
     };
+    use crate::test_support::{TestError, TestResult, ctx};
 
     // ── test helpers ─────────────────────────────────────────────────────────
 
@@ -357,7 +360,7 @@ mod tests {
     ///
     /// Verwendet einen atomaren Zähler für Thread-sichere, eindeutige
     /// Verzeichnisnamen, sodass parallele Tests nicht kollidieren.
-    fn make_test_ctx() -> (OpContext, PathBuf) {
+    fn make_test_ctx() -> TestResult<(OpContext, PathBuf)> {
         static CTX_COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = CTX_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = std::env::temp_dir().join(format!(
@@ -365,7 +368,8 @@ mod tests {
             std::process::id(),
             id
         ));
-        std::fs::create_dir_all(tmp.join("ws")).unwrap();
+        std::fs::create_dir_all(tmp.join("ws"))
+            .map_err(ctx("Test-Workspace-Verzeichnis anlegen"))?;
         let registry = WorkspaceRegistry::build(
             &tmp,
             [WorkspaceRegistration {
@@ -374,19 +378,19 @@ mod tests {
                 root: PathBuf::from("ws"),
             }],
         )
-        .unwrap();
+        .map_err(ctx("WorkspaceRegistry bauen"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .unwrap();
+            .map_err(ctx("Workspace auflösen"))?;
         let sandbox = SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ReadWorkspace]),
         );
         let ctx = OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new());
-        (ctx, tmp)
+        Ok((ctx, tmp))
     }
 
     // ── test-op fixtures ──────────────────────────────────────────────────────
@@ -637,43 +641,50 @@ mod tests {
     // ── dispatch tests ────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_dispatch_passes_raw_args_to_operation() {
+    async fn test_dispatch_passes_raw_args_to_operation() -> TestResult {
         let op: Arc<dyn Operation> = Arc::new(ArgCountOp);
         let adapters = CommandAdapter::from_operation(Arc::clone(&op));
-        let (ctx, tmp) = make_test_ctx();
+        let (ctx, tmp) = make_test_ctx()?;
         let args = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
         let result = adapters[0].dispatch(&ctx, args).await;
         std::fs::remove_dir_all(tmp).ok();
         match result {
             Ok(out) => assert_eq!(out.text, "3", "raw_args.len() soll 3 sein"),
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
+            Err(e) => return Err(TestError::Unexpected(format!("Unerwarteter Fehler: {e}"))),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_dispatch_passes_empty_raw_args() {
+    async fn test_dispatch_passes_empty_raw_args() -> TestResult {
         let op: Arc<dyn Operation> = Arc::new(ArgCountOp);
         let adapters = CommandAdapter::from_operation(Arc::clone(&op));
-        let (ctx, tmp) = make_test_ctx();
+        let (ctx, tmp) = make_test_ctx()?;
         let result = adapters[0].dispatch(&ctx, vec![]).await;
         std::fs::remove_dir_all(tmp).ok();
         match result {
             Ok(out) => assert_eq!(out.text, "0"),
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
+            Err(e) => return Err(TestError::Unexpected(format!("Unerwarteter Fehler: {e}"))),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_dispatch_propagates_invalid_arguments_error() {
+    async fn test_dispatch_propagates_invalid_arguments_error() -> TestResult {
         let op: Arc<dyn Operation> = Arc::new(InvalidArgsOp);
         let adapters = CommandAdapter::from_operation(Arc::clone(&op));
-        let (ctx, tmp) = make_test_ctx();
+        let (ctx, tmp) = make_test_ctx()?;
         let result = adapters[0].dispatch(&ctx, vec![]).await;
         std::fs::remove_dir_all(tmp).ok();
         match result {
             Err(OpError::InvalidArguments(_)) => {}
-            other => panic!("Erwartet OpError::InvalidArguments, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Erwartet OpError::InvalidArguments, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     // ── accessor tests ────────────────────────────────────────────────────────

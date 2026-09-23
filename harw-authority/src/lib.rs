@@ -16,6 +16,9 @@ use harw_types::{TenantId, WorkspaceId};
 use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+#[cfg(test)]
+mod test_support;
+
 /// The complete, deliberately fixed permission vocabulary.
 ///
 /// New variants must be added to [`Self::ALL`] explicitly.  The exhaustive
@@ -1317,7 +1320,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_rejects_requests_outside_its_validated_policy() {
+    fn bootstrap_rejects_requests_outside_its_validated_policy() -> test_support::TestResult {
         let bootstrap = PolicyBootstrap::from_test_toml(
             r#"
 schema_version = 1
@@ -1325,7 +1328,7 @@ permissions = ["read_workspace"]
 network_targets = ["docs.rs"]
 "#,
         )
-        .expect("test policy is structurally valid");
+        .map_err(test_support::ctx("test policy is structurally valid"))?;
         let workspace = test_workspace();
 
         let request = PermissionRequest::from_permissions([
@@ -1336,10 +1339,12 @@ network_targets = ["docs.rs"]
             bootstrap.issue(workspace, &request),
             Err(AuthorityError::RequestExceedsPolicy { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn snapshot_requires_re_evaluation_and_cannot_restore_old_policy_rights() {
+    fn snapshot_requires_re_evaluation_and_cannot_restore_old_policy_rights()
+    -> test_support::TestResult {
         let permissive = PolicyBootstrap::from_test_toml(
             r#"
 schema_version = 1
@@ -1347,7 +1352,7 @@ permissions = ["read_workspace", "execute_process"]
 network_targets = []
 "#,
         )
-        .expect("test policy is structurally valid");
+        .map_err(test_support::ctx("test policy is structurally valid"))?;
         let context = permissive
             .issue(
                 test_workspace(),
@@ -1356,7 +1361,7 @@ network_targets = []
                     Permission::ExecuteProcess,
                 ]),
             )
-            .expect("policy grants request");
+            .map_err(test_support::ctx("policy grants request"))?;
         let snapshot = context.snapshot();
 
         let restrictive = PolicyBootstrap::from_test_toml(
@@ -1366,11 +1371,12 @@ permissions = ["read_workspace"]
 network_targets = []
 "#,
         )
-        .expect("test policy is structurally valid");
+        .map_err(test_support::ctx("test policy is structurally valid"))?;
         assert!(matches!(
             restrictive.reissue(test_workspace(), &snapshot),
             Err(AuthorityError::RequestExceedsPolicy { .. })
         ));
+        Ok(())
     }
 
     #[test]

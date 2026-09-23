@@ -32,8 +32,8 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::error::MemoryError;
 use crate::MemoryResult;
+use crate::error::MemoryError;
 
 /// Rechte-Bits für `<memories_root>/files/index.json`.
 const INDEX_FILE_MODE: u32 = 0o600;
@@ -210,7 +210,8 @@ fn rust_symbol(trimmed: &str) -> Option<String> {
         let rest = rest.trim_start();
         // "impl<...> X" → das Generics-Präfix überspringen.
         let rest = if rest.starts_with('<') {
-            rest.find('>').map_or(rest, |pos| rest[pos + 1..].trim_start())
+            rest.find('>')
+                .map_or(rest, |pos| rest[pos + 1..].trim_start())
         } else {
             rest
         };
@@ -418,7 +419,10 @@ impl FileKnowledgeIndex {
             }
             Some(existing) => {
                 let read_count = existing.read_count.saturating_add(1);
-                *existing = FileKnowledge { read_count, ..entry };
+                *existing = FileKnowledge {
+                    read_count,
+                    ..entry
+                };
             }
             None => index.entries.push(entry),
         }
@@ -477,7 +481,10 @@ impl FileKnowledgeIndex {
                 (score > 0).then_some((score, entry))
             })
             .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.read_count.cmp(&a.1.read_count)));
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.read_count.cmp(&a.1.read_count))
+        });
         scored.truncate(limit);
         Ok(scored.into_iter().map(|(_, e)| e).collect())
     }
@@ -507,14 +514,13 @@ fn score_entry(entry: &FileKnowledge, lowered_keywords: &[String]) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn tmp_root(tag: &str) -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "harw-file-index-{tag}-{}-{id}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("harw-file-index-{tag}-{}-{id}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         root
     }
@@ -541,10 +547,14 @@ mod tests {
 
     #[test]
     fn extract_file_knowledge_rust_summary_and_symbols() {
-        let content = "//! Modul-Doku erste Zeile.\n\npub fn foo() {}\npub struct Bar;\nimpl Bar {}\n";
+        let content =
+            "//! Modul-Doku erste Zeile.\n\npub fn foo() {}\npub struct Bar;\nimpl Bar {}\n";
         let knowledge = extract_file_knowledge("src/lib.rs", content, &now());
         assert_eq!(knowledge.language.as_deref(), Some("rust"));
-        assert_eq!(knowledge.summary.as_deref(), Some("Modul-Doku erste Zeile."));
+        assert_eq!(
+            knowledge.summary.as_deref(),
+            Some("Modul-Doku erste Zeile.")
+        );
         assert_eq!(knowledge.symbols, vec!["foo".to_owned(), "Bar".to_owned()]);
         assert_eq!(knowledge.read_count, 1);
         assert_eq!(knowledge.size_bytes, content.len() as u64);
@@ -571,64 +581,82 @@ mod tests {
     // -- FileKnowledgeIndex --------------------------------------------------
 
     #[test]
-    fn upsert_same_digest_increments_read_count() {
+    fn upsert_same_digest_increments_read_count() -> TestResult {
         let root = tmp_root("upsert-same-digest");
-        let index = FileKnowledgeIndex::open(&root).unwrap();
+        let index = FileKnowledgeIndex::open(&root).map_err(ctx("open"))?;
         let first = extract_file_knowledge("src/a.rs", "pub fn a() {}\n", &now());
-        index.upsert(first.clone()).unwrap();
+        index.upsert(first.clone()).map_err(ctx("upsert first"))?;
         let second = extract_file_knowledge("src/a.rs", "pub fn a() {}\n", &now());
-        index.upsert(second).unwrap();
-        let stored = index.get("src/a.rs").unwrap().unwrap();
+        index.upsert(second).map_err(ctx("upsert second"))?;
+        let stored = index
+            .get("src/a.rs")
+            .map_err(ctx("get src/a.rs"))?
+            .ok_or(TestError::Missing("src/a.rs"))?;
         assert_eq!(stored.read_count, 2);
         assert_eq!(stored.digest, first.digest);
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn upsert_different_digest_replaces_fields_and_bumps_read_count() {
+    fn upsert_different_digest_replaces_fields_and_bumps_read_count() -> TestResult {
         let root = tmp_root("upsert-diff-digest");
-        let index = FileKnowledgeIndex::open(&root).unwrap();
+        let index = FileKnowledgeIndex::open(&root).map_err(ctx("open"))?;
         index
-            .upsert(extract_file_knowledge("src/a.rs", "pub fn a() {}\n", &now()))
-            .unwrap();
+            .upsert(extract_file_knowledge(
+                "src/a.rs",
+                "pub fn a() {}\n",
+                &now(),
+            ))
+            .map_err(ctx("upsert first"))?;
         index
             .upsert(extract_file_knowledge(
                 "src/a.rs",
                 "pub fn a() {}\npub fn b() {}\n",
                 &now(),
             ))
-            .unwrap();
-        let stored = index.get("src/a.rs").unwrap().unwrap();
+            .map_err(ctx("upsert second"))?;
+        let stored = index
+            .get("src/a.rs")
+            .map_err(ctx("get src/a.rs"))?
+            .ok_or(TestError::Missing("src/a.rs"))?;
         assert_eq!(stored.read_count, 2);
         assert_eq!(stored.symbols, vec!["a".to_owned(), "b".to_owned()]);
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn upsert_evicts_oldest_last_seen_beyond_cap() {
+    fn upsert_evicts_oldest_last_seen_beyond_cap() -> TestResult {
         let root = tmp_root("upsert-eviction");
-        let index = FileKnowledgeIndex::open(&root).unwrap();
+        let index = FileKnowledgeIndex::open(&root).map_err(ctx("open"))?;
         let base = OffsetDateTime::now_utc();
         for i in 0..(FILE_INDEX_MAX_ENTRIES + 5) {
             let ts = (base + time::Duration::seconds(i as i64))
                 .format(&Rfc3339)
-                .unwrap();
+                .map_err(ctx("timestamp formatieren"))?;
             let mut entry = extract_file_knowledge(&format!("f{i}.rs"), "pub fn x() {}\n", &ts);
             entry.digest = format!("digest-{i}");
-            index.upsert(entry).unwrap();
+            index.upsert(entry).map_err(ctx("upsert"))?;
         }
-        let all = index.list().unwrap();
+        let all = index.list().map_err(ctx("list"))?;
         assert_eq!(all.len(), FILE_INDEX_MAX_ENTRIES);
         // Die fünf ältesten (f0..f4) wurden verdrängt.
-        assert!(index.get("f0.rs").unwrap().is_none());
-        assert!(index.get(&format!("f{}.rs", FILE_INDEX_MAX_ENTRIES + 4)).unwrap().is_some());
+        assert!(index.get("f0.rs").map_err(ctx("get f0.rs"))?.is_none());
+        assert!(
+            index
+                .get(&format!("f{}.rs", FILE_INDEX_MAX_ENTRIES + 4))
+                .map_err(ctx("get letzter Eintrag"))?
+                .is_some()
+        );
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn search_ranks_by_score_then_read_count() {
+    fn search_ranks_by_score_then_read_count() -> TestResult {
         let root = tmp_root("search-ranking");
-        let index = FileKnowledgeIndex::open(&root).unwrap();
+        let index = FileKnowledgeIndex::open(&root).map_err(ctx("open"))?;
         // Beide Einträge erzielen identischen Score (Treffer in path, summary
         // und einem Symbol) — Sortierung muss dann über read_count entscheiden.
         let mut low = extract_file_knowledge(
@@ -637,19 +665,22 @@ mod tests {
             &now(),
         );
         low.read_count = 1;
-        index.upsert(low).unwrap();
+        index.upsert(low).map_err(ctx("upsert low"))?;
         let mut high = extract_file_knowledge(
             "src/session_b.rs",
             "//! Session Info.\npub fn session_two() {}\n",
             &now(),
         );
         high.read_count = 9;
-        index.upsert(high).unwrap();
+        index.upsert(high).map_err(ctx("upsert high"))?;
 
-        let hits = index.search(&["session".to_owned()], 10).unwrap();
+        let hits = index
+            .search(&["session".to_owned()], 10)
+            .map_err(ctx("search"))?;
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].path, "src/session_b.rs");
         assert_eq!(hits[0].read_count, 9);
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 }

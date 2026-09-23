@@ -165,9 +165,9 @@ impl IndexError {
             // `ManifestMismatch` zurueck. Kein Panic, sondern ein
             // konservativer Fallback.
             harw_lens_types::LensTypesError::InvalidSpan { .. }
-            | harw_lens_types::LensTypesError::SpanOutOfBounds { .. } => Self::ManifestMismatch {
-                field: "unknown",
-            },
+            | harw_lens_types::LensTypesError::SpanOutOfBounds { .. } => {
+                Self::ManifestMismatch { field: "unknown" }
+            }
         }
     }
 }
@@ -175,6 +175,7 @@ impl IndexError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn test_index_error_display_manifest_mismatch() {
@@ -205,7 +206,10 @@ mod tests {
         let err = IndexError::IndexNotFound {
             name: "my-index".to_owned(),
         };
-        assert_eq!(err.to_string(), "no index named 'my-index' exists in the store");
+        assert_eq!(
+            err.to_string(),
+            "no index named 'my-index' exists in the store"
+        );
     }
 
     #[test]
@@ -214,7 +218,10 @@ mod tests {
             expected: 8,
             actual: 4,
         };
-        assert_eq!(err.to_string(), "embedding dimension mismatch: expected 8, got 4");
+        assert_eq!(
+            err.to_string(),
+            "embedding dimension mismatch: expected 8, got 4"
+        );
     }
 
     #[test]
@@ -240,9 +247,14 @@ mod tests {
     }
 
     #[test]
-    fn test_index_error_from_serde() {
-        let serde_err = serde_json::from_str::<u32>("not json").unwrap_err();
+    fn test_index_error_from_serde() -> TestResult {
+        let Err(serde_err) = serde_json::from_str::<u32>("not json") else {
+            return Err(TestError::Unexpected(
+                "serde_json::from_str sollte an ungültigem JSON scheitern".into(),
+            ));
+        };
         let err: IndexError = serde_err.into();
         assert!(matches!(err, IndexError::Serde(_)));
+        Ok(())
     }
 }

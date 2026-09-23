@@ -11,7 +11,7 @@ use harw_authority::{EgressTarget, NetworkScope};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::rule::{normalize_host, NetRule};
+use crate::rule::{NetRule, normalize_host};
 
 /// Ein inspizierbarer Netzplan.
 ///
@@ -187,48 +187,53 @@ fn wire_targets(scope: &NetworkScope) -> Vec<EgressTarget> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     // Baut einen `NetworkScope` über dessen öffentlichen `serde`-Wire-Vertrag
     // (siehe `plan_for_scope`-Dokumentation): der einzige Weg, aus dieser
     // Crate einen Bereich mit `Host`- oder `Cidr`-Einträgen zu bauen, weil
     // `NetworkScope` dafür keine öffentliche Konstruktormethode anbietet.
-    fn scope_of(entries: &[&str]) -> NetworkScope {
+    fn scope_of(entries: &[&str]) -> TestResult<NetworkScope> {
         serde_json::from_value(serde_json::json!({ "allow_hosts": entries }))
-            .expect("valid scope wire fixture")
+            .map_err(ctx("valid scope wire fixture"))
     }
 
-    fn addr(literal: &str) -> IpAddr {
-        literal.parse().expect("valid IP literal in test fixture")
+    fn addr(literal: &str) -> TestResult<IpAddr> {
+        literal
+            .parse()
+            .map_err(ctx("valid IP literal in test fixture"))
     }
 
     #[test]
-    fn test_plan_for_scope_empty_scope_allows_nothing() {
+    fn test_plan_for_scope_empty_scope_allows_nothing() -> TestResult {
         let plan = plan_for_scope(&NetworkScope::empty());
 
         assert!(plan.rules.is_empty());
         assert!(!plan.allows_host("docs.rs"));
         assert!(!plan.allows_host("anything.at.all"));
-        assert!(!plan.allows_addr(addr("10.0.0.1")));
+        assert!(!plan.allows_addr(addr("10.0.0.1")?));
+        Ok(())
     }
 
     #[test]
-    fn test_plan_for_scope_cidr_target_becomes_allow_cidr_rule() {
-        let scope = scope_of(&["10.0.0.0/8"]);
+    fn test_plan_for_scope_cidr_target_becomes_allow_cidr_rule() -> TestResult {
+        let scope = scope_of(&["10.0.0.0/8"])?;
         let plan = plan_for_scope(&scope);
 
         assert_eq!(
             plan.rules,
             vec![NetRule::AllowCidr {
-                cidr: "10.0.0.0/8".parse().expect("valid CIDR literal")
+                cidr: "10.0.0.0/8".parse().map_err(ctx("valid CIDR literal"))?
             }]
         );
-        assert!(plan.allows_addr(addr("10.1.2.3")));
-        assert!(!plan.allows_addr(addr("11.0.0.0")));
+        assert!(plan.allows_addr(addr("10.1.2.3")?));
+        assert!(!plan.allows_addr(addr("11.0.0.0")?));
+        Ok(())
     }
 
     #[test]
-    fn test_plan_for_scope_host_and_dns_suffix_targets_are_distinguished() {
-        let scope = scope_of(&["=api.example.com", "docs.rs"]);
+    fn test_plan_for_scope_host_and_dns_suffix_targets_are_distinguished() -> TestResult {
+        let scope = scope_of(&["=api.example.com", "docs.rs"])?;
         let plan = plan_for_scope(&scope);
 
         assert_eq!(
@@ -252,24 +257,26 @@ mod tests {
         assert!(plan.allows_host("docs.rs"));
         assert!(plan.allows_host("static.docs.rs"));
         assert!(!plan.allows_host("evildocs.rs"));
+        Ok(())
     }
 
     #[test]
-    fn test_net_plan_serde_roundtrip() {
+    fn test_net_plan_serde_roundtrip() -> TestResult {
         let plan = NetPlan {
             rules: vec![
                 NetRule::AllowHost {
                     host: "api.example.com".to_owned(),
                 },
                 NetRule::AllowCidr {
-                    cidr: "10.0.0.0/8".parse().expect("valid CIDR literal"),
+                    cidr: "10.0.0.0/8".parse().map_err(ctx("valid CIDR literal"))?,
                 },
             ],
         };
 
-        let json = serde_json::to_string(&plan).expect("plan serializes");
-        let restored: NetPlan = serde_json::from_str(&json).expect("plan deserializes");
+        let json = serde_json::to_string(&plan).map_err(ctx("plan serializes"))?;
+        let restored: NetPlan = serde_json::from_str(&json).map_err(ctx("plan deserializes"))?;
         assert_eq!(plan, restored);
+        Ok(())
     }
 
     #[test]
@@ -280,17 +287,18 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_for_scope_is_deterministic_for_equal_scopes() {
-        let first = scope_of(&["docs.rs", "=api.example.com", "10.0.0.0/8"]);
+    fn test_plan_for_scope_is_deterministic_for_equal_scopes() -> TestResult {
+        let first = scope_of(&["docs.rs", "=api.example.com", "10.0.0.0/8"])?;
         // Andere Eingabereihenfolge, gleicher Bereich (die zugrunde
         // liegende `BTreeSet` sortiert intern) — muss denselben Plan mit
         // derselben Regelreihenfolge ergeben.
-        let second = scope_of(&["10.0.0.0/8", "=api.example.com", "docs.rs"]);
+        let second = scope_of(&["10.0.0.0/8", "=api.example.com", "docs.rs"])?;
 
         let plan_a = plan_for_scope(&first);
         let plan_b = plan_for_scope(&second);
 
         assert_eq!(plan_a, plan_b);
         assert_eq!(plan_a.rules, plan_b.rules);
+        Ok(())
     }
 }

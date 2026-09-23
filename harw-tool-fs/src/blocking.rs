@@ -36,24 +36,25 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     #[tokio::test]
-    async fn arbeit_laeuft_nicht_auf_dem_runtime_thread() {
+    async fn arbeit_laeuft_nicht_auf_dem_runtime_thread() -> TestResult {
         let caller = std::thread::current().id();
         let output = run_blocking("fs.test", move || {
             let worker = std::thread::current().id();
             Ok(ToolOutput::text(if worker == caller { "gleich" } else { "anders" }))
         })
-        .await
-        .expect("job");
+        .await?;
         match output {
             ToolOutput::Text { content } => assert_eq!(content, "anders"),
-            other => panic!("unexpected: {other:?}"),
+            other => return Err(TestError::Unexpected(format!("unexpected: {other:?}"))),
         }
+        Ok(())
     }
 
     #[test]
-    fn ohne_runtime_wird_direkt_ausgefuehrt() {
+    fn ohne_runtime_wird_direkt_ausgefuehrt() -> TestResult {
         use std::task::{Context, Poll, Waker};
 
         assert!(tokio::runtime::Handle::try_current().is_err());
@@ -62,8 +63,15 @@ mod tests {
         let mut future = std::pin::pin!(run_blocking("fs.test", job));
         match future.as_mut().poll(&mut cx) {
             Poll::Ready(Ok(ToolOutput::Text { content })) => assert_eq!(content, "ok"),
-            Poll::Ready(other) => panic!("unexpected: {other:?}"),
-            Poll::Pending => panic!("ohne Runtime muss das Ergebnis sofort bereitstehen"),
+            Poll::Ready(other) => {
+                return Err(TestError::Unexpected(format!("unexpected: {other:?}")));
+            }
+            Poll::Pending => {
+                return Err(TestError::Unexpected(
+                    "ohne Runtime muss das Ergebnis sofort bereitstehen".to_string(),
+                ));
+            }
         }
+        Ok(())
     }
 }

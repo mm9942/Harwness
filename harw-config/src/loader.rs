@@ -218,6 +218,7 @@ fn read_optional_file(path: &Path) -> ConfigResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -226,212 +227,301 @@ mod tests {
 
     static NEXT_TEST_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
-    fn test_directory() -> PathBuf {
+    fn test_directory() -> TestResult<PathBuf> {
         let unique = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
             "harw-config-loader-{}-{unique}",
             std::process::id()
         ));
-        std::fs::create_dir_all(&directory).unwrap();
-        directory
+        std::fs::create_dir_all(&directory).map_err(ctx("Testverzeichnis anlegen"))?;
+        Ok(directory)
     }
 
     #[test]
-    fn system_prompt_rejects_absolute_configured_path() {
-        let error = load_system_prompt(Path::new("agents/planner"), Some("/etc/passwd"))
-            .expect_err("absolute configured system paths must be rejected");
+    fn system_prompt_rejects_absolute_configured_path() -> TestResult {
+        let Err(error) = load_system_prompt(Path::new("agents/planner"), Some("/etc/passwd"))
+        else {
+            return Err(TestError::Unexpected(
+                "absolute configured system paths must be rejected".into(),
+            ));
+        };
 
         assert!(matches!(error, ConfigError::Invalid(message) if message.contains("system_file")));
+        Ok(())
     }
 
     #[test]
-    fn skill_instructions_reject_parent_traversal() {
-        let error = load_skill_instructions(Path::new("skills/review"), Some("../secret.md"))
-            .expect_err("parent traversal in configured skill paths must be rejected");
+    fn skill_instructions_reject_parent_traversal() -> TestResult {
+        let Err(error) = load_skill_instructions(Path::new("skills/review"), Some("../secret.md"))
+        else {
+            return Err(TestError::Unexpected(
+                "parent traversal in configured skill paths must be rejected".into(),
+            ));
+        };
 
         assert!(
             matches!(error, ConfigError::Invalid(message) if message.contains("instructions_file"))
         );
+        Ok(())
     }
 
     #[test]
-    fn configured_file_path_rejects_nested_parent_traversal() {
-        let error = configured_file_path(
+    fn configured_file_path_rejects_nested_parent_traversal() -> TestResult {
+        let Err(error) = configured_file_path(
             Path::new("agents/planner"),
             "prompts/../../secret.md",
             "system_file",
-        )
-        .expect_err("parent traversal must be rejected regardless of its position");
+        ) else {
+            return Err(TestError::Unexpected(
+                "parent traversal must be rejected regardless of its position".into(),
+            ));
+        };
 
         assert!(matches!(error, ConfigError::Invalid(message) if message.contains("system_file")));
+        Ok(())
     }
 
     #[test]
-    fn configured_file_path_allows_relative_nested_path() {
-        let directory = test_directory();
+    fn configured_file_path_allows_relative_nested_path() -> TestResult {
+        let directory = test_directory()?;
         let prompts = directory.join("prompts");
-        fs::create_dir(&prompts).unwrap();
+        fs::create_dir(&prompts).map_err(ctx("prompts-Verzeichnis anlegen"))?;
 
-        let path = configured_file_path(&directory, "prompts/system.md", "system_file")
-            .expect("relative paths within the base directory should be accepted");
+        let path = configured_file_path(&directory, "prompts/system.md", "system_file").map_err(
+            ctx("relative paths within the base directory should be accepted"),
+        )?;
 
         assert_eq!(path, prompts.join("system.md"));
-        fs::remove_dir_all(&directory).unwrap();
+        fs::remove_dir_all(&directory).map_err(ctx("Testverzeichnis entfernen"))?;
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn system_prompt_rejects_symlink_that_escapes_agent_directory() {
-        let agent_directory = test_directory();
-        let outside_directory = test_directory();
-        fs::write(outside_directory.join("goal.md"), "outside agent root").unwrap();
-        symlink(&outside_directory, agent_directory.join("escape")).unwrap();
+    fn system_prompt_rejects_symlink_that_escapes_agent_directory() -> TestResult {
+        let agent_directory = test_directory()?;
+        let outside_directory = test_directory()?;
+        fs::write(outside_directory.join("goal.md"), "outside agent root")
+            .map_err(ctx("Datei außerhalb des Agentenverzeichnisses schreiben"))?;
+        symlink(&outside_directory, agent_directory.join("escape"))
+            .map_err(ctx("Symlink anlegen"))?;
 
-        let error = load_system_prompt(&agent_directory, Some("escape/goal.md"))
-            .expect_err("a system prompt symlink must not escape its agent directory");
+        let Err(error) = load_system_prompt(&agent_directory, Some("escape/goal.md")) else {
+            return Err(TestError::Unexpected(
+                "a system prompt symlink must not escape its agent directory".into(),
+            ));
+        };
 
         assert!(matches!(error, ConfigError::Invalid(message) if message.contains("system_file")));
-        fs::remove_dir_all(&agent_directory).unwrap();
-        fs::remove_dir_all(&outside_directory).unwrap();
+        fs::remove_dir_all(&agent_directory).map_err(ctx("Agentenverzeichnis entfernen"))?;
+        fs::remove_dir_all(&outside_directory).map_err(ctx("externes Verzeichnis entfernen"))?;
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn skill_instructions_reject_symlinked_missing_file_outside_skill_directory() {
-        let skill_directory = test_directory();
-        let outside_directory = test_directory();
-        symlink(&outside_directory, skill_directory.join("escape")).unwrap();
+    fn skill_instructions_reject_symlinked_missing_file_outside_skill_directory() -> TestResult {
+        let skill_directory = test_directory()?;
+        let outside_directory = test_directory()?;
+        symlink(&outside_directory, skill_directory.join("escape"))
+            .map_err(ctx("Symlink anlegen"))?;
 
-        let error = load_skill_instructions(&skill_directory, Some("escape/missing.md"))
-            .expect_err("an optional file through an escaping symlink must be rejected");
+        let Err(error) = load_skill_instructions(&skill_directory, Some("escape/missing.md"))
+        else {
+            return Err(TestError::Unexpected(
+                "an optional file through an escaping symlink must be rejected".into(),
+            ));
+        };
 
         assert!(
             matches!(error, ConfigError::Invalid(message) if message.contains("instructions_file"))
         );
-        fs::remove_dir_all(&skill_directory).unwrap();
-        fs::remove_dir_all(&outside_directory).unwrap();
+        fs::remove_dir_all(&skill_directory).map_err(ctx("Skill-Verzeichnis entfernen"))?;
+        fs::remove_dir_all(&outside_directory).map_err(ctx("externes Verzeichnis entfernen"))?;
+        Ok(())
     }
 
     #[test]
-    fn load_uia_identity_missing_file_returns_empty() {
-        let directory = test_directory();
-        assert!(load_uia_identity(&directory).unwrap().is_empty());
-        fs::remove_dir(directory).unwrap();
+    fn load_uia_identity_missing_file_returns_empty() -> TestResult {
+        let directory = test_directory()?;
+        assert!(
+            load_uia_identity(&directory)
+                .map_err(ctx("identity.md laden"))?
+                .is_empty()
+        );
+        fs::remove_dir(directory).map_err(ctx("Testverzeichnis entfernen"))?;
+        Ok(())
     }
 
     #[test]
-    fn load_uia_identity_present_returns_content() {
-        let directory = test_directory();
-        fs::write(directory.join("identity.md"), "Ich bin Emily.").unwrap();
-        assert_eq!(load_uia_identity(&directory).unwrap(), "Ich bin Emily.");
-        fs::remove_dir_all(directory).unwrap();
+    fn load_uia_identity_present_returns_content() -> TestResult {
+        let directory = test_directory()?;
+        fs::write(directory.join("identity.md"), "Ich bin Emily.")
+            .map_err(ctx("identity.md schreiben"))?;
+        assert_eq!(
+            load_uia_identity(&directory).map_err(ctx("identity.md laden"))?,
+            "Ich bin Emily."
+        );
+        fs::remove_dir_all(directory).map_err(ctx("Testverzeichnis entfernen"))?;
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn load_uia_identity_rejects_path_traversal_via_escaping_symlink() {
-        let agent_directory = test_directory();
-        let outside_directory = test_directory();
-        fs::write(outside_directory.join("identity.md"), "outside agent root").unwrap();
-        symlink(&outside_directory, agent_directory.join("identity.md")).unwrap();
+    fn load_uia_identity_rejects_path_traversal_via_escaping_symlink() -> TestResult {
+        let agent_directory = test_directory()?;
+        let outside_directory = test_directory()?;
+        fs::write(outside_directory.join("identity.md"), "outside agent root")
+            .map_err(ctx("Datei außerhalb des Agentenverzeichnisses schreiben"))?;
+        symlink(&outside_directory, agent_directory.join("identity.md"))
+            .map_err(ctx("Symlink anlegen"))?;
 
-        let error = load_uia_identity(&agent_directory)
-            .expect_err("an identity.md symlink must not escape its agent directory");
+        let Err(error) = load_uia_identity(&agent_directory) else {
+            return Err(TestError::Unexpected(
+                "an identity.md symlink must not escape its agent directory".into(),
+            ));
+        };
 
         assert!(matches!(error, ConfigError::Invalid(message) if message.contains("identity.md")));
-        fs::remove_dir_all(&agent_directory).unwrap();
-        fs::remove_dir_all(&outside_directory).unwrap();
+        fs::remove_dir_all(&agent_directory).map_err(ctx("Agentenverzeichnis entfernen"))?;
+        fs::remove_dir_all(&outside_directory).map_err(ctx("externes Verzeichnis entfernen"))?;
+        Ok(())
     }
 
     #[test]
-    fn uia_personalization_includes_identity_fragment_when_present() {
-        let directory = test_directory();
-        fs::write(directory.join("identity.md"), "Ich bin Emily.").unwrap();
+    fn uia_personalization_includes_identity_fragment_when_present() -> TestResult {
+        let directory = test_directory()?;
+        fs::write(directory.join("identity.md"), "Ich bin Emily.")
+            .map_err(ctx("identity.md schreiben"))?;
 
-        let fragments = load_uia_personalization(&directory).expect("load UIA files");
+        let fragments = load_uia_personalization(&directory).map_err(ctx("load UIA files"))?;
         assert_eq!(fragments.len(), 1);
         assert!(fragments[0].contains("UIA-Identität"));
         assert!(fragments[0].contains("Ich bin Emily."));
-        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(directory).map_err(ctx("Testverzeichnis entfernen"))?;
+        Ok(())
     }
 
     #[test]
-    fn uia_personalization_omits_identity_fragment_when_absent() {
-        let directory = test_directory();
-        fs::write(directory.join("Personality.md"), "warm and concise").unwrap();
+    fn uia_personalization_omits_identity_fragment_when_absent() -> TestResult {
+        let directory = test_directory()?;
+        fs::write(directory.join("Personality.md"), "warm and concise")
+            .map_err(ctx("Personality.md schreiben"))?;
 
-        let fragments = load_uia_personalization(&directory).expect("load UIA files");
+        let fragments = load_uia_personalization(&directory).map_err(ctx("load UIA files"))?;
         assert_eq!(fragments.len(), 1);
-        assert!(!fragments.iter().any(|fragment| fragment.contains("UIA-Identität")));
-        fs::remove_dir_all(directory).unwrap();
+        assert!(
+            !fragments
+                .iter()
+                .any(|fragment| fragment.contains("UIA-Identität"))
+        );
+        fs::remove_dir_all(directory).map_err(ctx("Testverzeichnis entfernen"))?;
+        Ok(())
     }
 
     #[test]
-    fn uia_personalization_keeps_personality_and_user_context_separate() {
-        let directory = test_directory();
-        fs::write(directory.join("Personality.md"), "warm and concise").unwrap();
-        fs::write(directory.join("USER.md"), "prefers German").unwrap();
+    fn uia_personalization_keeps_personality_and_user_context_separate() -> TestResult {
+        let directory = test_directory()?;
+        fs::write(directory.join("Personality.md"), "warm and concise")
+            .map_err(ctx("Personality.md schreiben"))?;
+        fs::write(directory.join("USER.md"), "prefers German").map_err(ctx("USER.md schreiben"))?;
 
-        let fragments = load_uia_personalization(&directory).expect("load UIA files");
+        let fragments = load_uia_personalization(&directory).map_err(ctx("load UIA files"))?;
         assert_eq!(fragments.len(), 2);
         assert!(fragments[0].contains("UIA-Persönlichkeit"));
         assert!(fragments[0].contains("warm and concise"));
         assert!(fragments[1].contains("Nutzerkontext"));
         assert!(fragments[1].contains("prefers German"));
-        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(directory).map_err(ctx("Testverzeichnis entfernen"))?;
+        Ok(())
     }
 
     #[test]
-    fn uia_user_name_reads_only_an_explicit_name_field() {
-        let directory = test_directory();
-        fs::write(directory.join("USER.md"), "# Nutzerkontext\n- Name: Mia\nprefers German").unwrap();
+    fn uia_user_name_reads_only_an_explicit_name_field() -> TestResult {
+        let directory = test_directory()?;
+        fs::write(
+            directory.join("USER.md"),
+            "# Nutzerkontext\n- Name: Mia\nprefers German",
+        )
+        .map_err(ctx("USER.md schreiben"))?;
 
-        assert_eq!(load_uia_user_name(&directory).unwrap().as_deref(), Some("Mia"));
-        fs::remove_dir_all(directory).unwrap();
+        assert_eq!(
+            load_uia_user_name(&directory)
+                .map_err(ctx("USER.md laden"))?
+                .as_deref(),
+            Some("Mia")
+        );
+        fs::remove_dir_all(directory).map_err(ctx("Testverzeichnis entfernen"))?;
+        Ok(())
     }
 
     #[test]
-    fn uia_user_name_reads_a_markdown_emphasized_name_field() {
-        let directory = test_directory();
-        fs::write(directory.join("USER.md"), "# Nutzerprofil: Mia\n\n- **Name:** Mia").unwrap();
+    fn uia_user_name_reads_a_markdown_emphasized_name_field() -> TestResult {
+        let directory = test_directory()?;
+        fs::write(
+            directory.join("USER.md"),
+            "# Nutzerprofil: Mia\n\n- **Name:** Mia",
+        )
+        .map_err(ctx("USER.md schreiben"))?;
 
-        assert_eq!(load_uia_user_name(&directory).unwrap().as_deref(), Some("Mia"));
-        fs::remove_dir_all(directory).unwrap();
+        assert_eq!(
+            load_uia_user_name(&directory)
+                .map_err(ctx("USER.md laden"))?
+                .as_deref(),
+            Some("Mia")
+        );
+        fs::remove_dir_all(directory).map_err(ctx("Testverzeichnis entfernen"))?;
+        Ok(())
     }
 
     #[test]
-    fn uia_user_name_ignores_unstructured_context() {
-        let directory = test_directory();
-        fs::write(directory.join("USER.md"), "Mia prefers German").unwrap();
+    fn uia_user_name_ignores_unstructured_context() -> TestResult {
+        let directory = test_directory()?;
+        fs::write(directory.join("USER.md"), "Mia prefers German")
+            .map_err(ctx("USER.md schreiben"))?;
 
-        assert_eq!(load_uia_user_name(&directory).unwrap(), None);
-        fs::remove_dir_all(directory).unwrap();
+        assert_eq!(
+            load_uia_user_name(&directory).map_err(ctx("USER.md laden"))?,
+            None
+        );
+        fs::remove_dir_all(directory).map_err(ctx("Testverzeichnis entfernen"))?;
+        Ok(())
     }
 
     #[test]
-    fn uia_personalization_allows_missing_files() {
-        let directory = test_directory();
-        assert!(load_uia_personalization(&directory).unwrap().is_empty());
-        fs::remove_dir(directory).unwrap();
+    fn uia_personalization_allows_missing_files() -> TestResult {
+        let directory = test_directory()?;
+        assert!(
+            load_uia_personalization(&directory)
+                .map_err(ctx("UIA-Personalisierung laden"))?
+                .is_empty()
+        );
+        fs::remove_dir(directory).map_err(ctx("Testverzeichnis entfernen"))?;
+        Ok(())
     }
 
     #[test]
-    fn loader_allows_missing_optional_file() {
-        let directory = test_directory();
+    fn loader_allows_missing_optional_file() -> TestResult {
+        let directory = test_directory()?;
         let content = load_system_prompt(&directory, Some("missing.md"))
-            .expect("a missing optional system prompt should be empty");
+            .map_err(ctx("a missing optional system prompt should be empty"))?;
 
         assert!(content.is_empty());
-        std::fs::remove_dir(&directory).unwrap();
+        std::fs::remove_dir(&directory).map_err(ctx("Testverzeichnis entfernen"))?;
+        Ok(())
     }
 
     #[test]
-    fn loader_reports_non_not_found_read_errors() {
-        let directory = test_directory();
-        let error = load_skill_instructions(&directory, Some("."))
-            .expect_err("reading a directory must report the I/O error");
+    fn loader_reports_non_not_found_read_errors() -> TestResult {
+        let directory = test_directory()?;
+        let Err(error) = load_skill_instructions(&directory, Some(".")) else {
+            return Err(TestError::Unexpected(
+                "reading a directory must report the I/O error".into(),
+            ));
+        };
 
         assert!(matches!(error, ConfigError::ReadFailed { .. }));
-        std::fs::remove_dir(&directory).unwrap();
+        std::fs::remove_dir(&directory).map_err(ctx("Testverzeichnis entfernen"))?;
+        Ok(())
     }
 }

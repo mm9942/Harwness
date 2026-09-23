@@ -63,5 +63,7 @@ pub mod raw;
 pub mod resolve;
 pub mod resolved;
 pub mod roles;
+#[cfg(test)]
+mod test_support;
 
 pub use executable::{ExecutableAgentIr, lower};

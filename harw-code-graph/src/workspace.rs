@@ -154,7 +154,9 @@ impl<'de> Deserialize<'de> for RawVersion {
         let value = toml::Value::deserialize(deserializer)?;
         match value {
             toml::Value::String(literal) => Ok(RawVersion::Literal(literal)),
-            toml::Value::Table(table) if table.get("workspace") == Some(&toml::Value::Boolean(true)) => {
+            toml::Value::Table(table)
+                if table.get("workspace") == Some(&toml::Value::Boolean(true)) =>
+            {
                 Ok(RawVersion::WorkspaceInherited)
             }
             other => Err(serde::de::Error::custom(format!(
@@ -257,8 +259,7 @@ impl WorkspaceGraph {
         }
         let level_map = compute_levels(&self.crates)?;
         let max_level = level_map.values().copied().max().unwrap_or(0);
-        let mut levels: Vec<Vec<&CrateNode>> =
-            (0..=max_level).map(|_| Vec::new()).collect();
+        let mut levels: Vec<Vec<&CrateNode>> = (0..=max_level).map(|_| Vec::new()).collect();
         for node in &self.crates {
             let level = level_map.get(&node.name).copied().unwrap_or(0);
             levels[level as usize].push(node);
@@ -474,25 +475,32 @@ fn compute_levels(crates: &[CrateNode]) -> CodeGraphResult<HashMap<String, u32>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
-    fn scratch_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("harw-code-graph-{}-{label}", std::process::id()));
+    fn scratch_dir(label: &str) -> TestResult<PathBuf> {
+        let dir =
+            std::env::temp_dir().join(format!("harw-code-graph-{}-{label}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("Scratch-Verzeichnis anlegen");
-        dir
+        fs::create_dir_all(&dir).map_err(ctx("Scratch-Verzeichnis anlegen"))?;
+        Ok(dir)
     }
 
-    fn write_crate(root: &Path, name: &str, deps: &[&str]) {
-        write_crate_with_version_line(root, name, deps, "version = \"0.1.0\"");
+    fn write_crate(root: &Path, name: &str, deps: &[&str]) -> TestResult {
+        write_crate_with_version_line(root, name, deps, "version = \"0.1.0\"")
     }
 
     /// Wie [`write_crate`], erlaubt aber, die `version`-Zeile (oder ihr
     /// Fehlen, per leerer Zeichenkette) frei vorzugeben — damit sich alle
     /// drei gültigen Formen sowie unbekannte Formen als Fixture nachbauen
     /// lassen.
-    fn write_crate_with_version_line(root: &Path, name: &str, deps: &[&str], version_line: &str) {
+    fn write_crate_with_version_line(
+        root: &Path,
+        name: &str,
+        deps: &[&str],
+        version_line: &str,
+    ) -> TestResult {
         let dir = root.join(name);
-        fs::create_dir_all(&dir).expect("Crate-Verzeichnis anlegen");
+        fs::create_dir_all(&dir).map_err(ctx("Crate-Verzeichnis anlegen"))?;
         let mut deps_section = String::new();
         for dep in deps {
             deps_section.push_str(&format!("{dep} = {{ path = \"../{dep}\" }}\n"));
@@ -500,29 +508,33 @@ mod tests {
         let manifest = format!(
             "[package]\nname = \"{name}\"\n{version_line}\n\n[dependencies]\n{deps_section}"
         );
-        fs::write(dir.join("Cargo.toml"), manifest).expect("Member-Cargo.toml schreiben");
+        fs::write(dir.join("Cargo.toml"), manifest).map_err(ctx("Member-Cargo.toml schreiben"))?;
+        Ok(())
     }
 
-    fn write_root(root: &Path, members: &[&str]) {
+    fn write_root(root: &Path, members: &[&str]) -> TestResult {
         let members_toml = members
             .iter()
             .map(|member| format!("\"{member}\""))
             .collect::<Vec<_>>()
             .join(", ");
         let manifest = format!("[workspace]\nmembers = [{members_toml}]\n");
-        fs::write(root.join("Cargo.toml"), manifest).expect("Wurzel-Cargo.toml schreiben");
+        fs::write(root.join("Cargo.toml"), manifest).map_err(ctx("Wurzel-Cargo.toml schreiben"))?;
+        Ok(())
     }
 
     #[test]
-    fn topological_levels_orders_leaf_first_for_a_b_c_chain() {
-        let root = scratch_dir("levels");
-        write_crate(&root, "a", &[]);
-        write_crate(&root, "b", &["a"]);
-        write_crate(&root, "c", &["b"]);
-        write_root(&root, &["a", "b", "c"]);
+    fn topological_levels_orders_leaf_first_for_a_b_c_chain() -> TestResult {
+        let root = scratch_dir("levels")?;
+        write_crate(&root, "a", &[])?;
+        write_crate(&root, "b", &["a"])?;
+        write_crate(&root, "c", &["b"])?;
+        write_root(&root, &["a", "b", "c"])?;
 
-        let graph = WorkspaceGraph::load(&root).expect("Workspace laden");
-        let levels = graph.topological_levels().expect("Ebenen berechnen");
+        let graph = WorkspaceGraph::load(&root).map_err(ctx("Workspace laden"))?;
+        let levels = graph
+            .topological_levels()
+            .map_err(ctx("Ebenen berechnen"))?;
 
         let level_names: Vec<Vec<&str>> = levels
             .iter()
@@ -530,7 +542,9 @@ mod tests {
             .collect();
         assert_eq!(level_names, vec![vec!["a"], vec!["b"], vec!["c"]]);
 
-        let node_a = graph.get("a").expect("Crate a gefunden");
+        let node_a = graph
+            .get("a")
+            .ok_or(TestError::Missing("Crate a gefunden"))?;
         assert!(node_a.is_leaf);
         assert_eq!(node_a.level, 0);
 
@@ -538,36 +552,40 @@ mod tests {
         assert_eq!(consumers.len(), 1);
         assert_eq!(consumers[0].name, "b");
 
-        let order = graph.leaf_first_order().expect("Leaf-first-Reihenfolge");
+        let order = graph
+            .leaf_first_order()
+            .map_err(ctx("Leaf-first-Reihenfolge"))?;
         let order_names: Vec<&str> = order.iter().map(|node| node.name.as_str()).collect();
         assert_eq!(order_names, vec!["a", "b", "c"]);
 
         fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 
     #[test]
-    fn topological_levels_detects_cycle() {
-        let root = scratch_dir("cycle");
-        write_crate(&root, "a", &["b"]);
-        write_crate(&root, "b", &["a"]);
-        write_root(&root, &["a", "b"]);
+    fn topological_levels_detects_cycle() -> TestResult {
+        let root = scratch_dir("cycle")?;
+        write_crate(&root, "a", &["b"])?;
+        write_crate(&root, "b", &["a"])?;
+        write_root(&root, &["a", "b"])?;
 
         let result = WorkspaceGraph::load(&root);
         assert!(matches!(result, Err(CodeGraphError::CycleDetected { .. })));
 
         fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 
     #[test]
-    fn subgraph_includes_only_transitive_internal_deps() {
-        let root = scratch_dir("subgraph");
-        write_crate(&root, "a", &[]);
-        write_crate(&root, "b", &["a"]);
-        write_crate(&root, "c", &[]);
-        write_root(&root, &["a", "b", "c"]);
+    fn subgraph_includes_only_transitive_internal_deps() -> TestResult {
+        let root = scratch_dir("subgraph")?;
+        write_crate(&root, "a", &[])?;
+        write_crate(&root, "b", &["a"])?;
+        write_crate(&root, "c", &[])?;
+        write_root(&root, &["a", "b", "c"])?;
 
-        let graph = WorkspaceGraph::load(&root).expect("Workspace laden");
-        let sub = graph.subgraph("b").expect("Teilgraph bauen");
+        let graph = WorkspaceGraph::load(&root).map_err(ctx("Workspace laden"))?;
+        let sub = graph.subgraph("b").map_err(ctx("Teilgraph bauen"))?;
         let mut names: Vec<&str> = sub.crates.iter().map(|node| node.name.as_str()).collect();
         names.sort();
         assert_eq!(names, vec!["a", "b"]);
@@ -578,55 +596,68 @@ mod tests {
         ));
 
         fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 
     #[test]
-    fn load_reads_version_workspace_true() {
+    fn load_reads_version_workspace_true() -> TestResult {
         // Der wichtigste Regressionstest: vor der Reparatur scheiterte
         // `WorkspaceGraph::load` an genau dieser Form, weil `version` als
         // `Option<String>` deklariert war.
-        let root = scratch_dir("version-workspace-true");
-        write_crate_with_version_line(&root, "a", &[], "version.workspace = true");
-        write_root(&root, &["a"]);
+        let root = scratch_dir("version-workspace-true")?;
+        write_crate_with_version_line(&root, "a", &[], "version.workspace = true")?;
+        write_root(&root, &["a"])?;
 
-        let graph = WorkspaceGraph::load(&root).expect("Workspace mit version.workspace=true laden");
-        let node_a = graph.get("a").expect("Crate a gefunden");
+        let graph = WorkspaceGraph::load(&root)
+            .map_err(ctx("Workspace mit version.workspace=true laden"))?;
+        let node_a = graph
+            .get("a")
+            .ok_or(TestError::Missing("Crate a gefunden"))?;
         assert_eq!(node_a.version, "0.0.0");
 
         fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 
     #[test]
-    fn load_reads_literal_version_string() {
-        let root = scratch_dir("version-literal");
-        write_crate_with_version_line(&root, "a", &[], "version = \"0.2.0\"");
-        write_root(&root, &["a"]);
+    fn load_reads_literal_version_string() -> TestResult {
+        let root = scratch_dir("version-literal")?;
+        write_crate_with_version_line(&root, "a", &[], "version = \"0.2.0\"")?;
+        write_root(&root, &["a"])?;
 
-        let graph = WorkspaceGraph::load(&root).expect("Workspace mit wörtlicher Version laden");
-        let node_a = graph.get("a").expect("Crate a gefunden");
+        let graph =
+            WorkspaceGraph::load(&root).map_err(ctx("Workspace mit wörtlicher Version laden"))?;
+        let node_a = graph
+            .get("a")
+            .ok_or(TestError::Missing("Crate a gefunden"))?;
         assert_eq!(node_a.version, "0.2.0");
 
         fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 
     #[test]
-    fn load_reads_missing_version_as_default() {
-        let root = scratch_dir("version-missing");
-        write_crate_with_version_line(&root, "a", &[], "");
-        write_root(&root, &["a"]);
+    fn load_reads_missing_version_as_default() -> TestResult {
+        let root = scratch_dir("version-missing")?;
+        write_crate_with_version_line(&root, "a", &[], "")?;
+        write_root(&root, &["a"])?;
 
-        let graph = WorkspaceGraph::load(&root).expect("Workspace ohne version-Feld laden");
-        let node_a = graph.get("a").expect("Crate a gefunden");
+        let graph =
+            WorkspaceGraph::load(&root).map_err(ctx("Workspace ohne version-Feld laden"))?;
+        let node_a = graph
+            .get("a")
+            .ok_or(TestError::Missing("Crate a gefunden"))?;
         assert_eq!(node_a.version, "0.0.0");
 
         fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 
     #[test]
-    fn load_rejects_unknown_version_form() {
-        let root = scratch_dir("version-unknown");
-        write_crate_with_version_line(&root, "a", &[], "version = { workspace = false }");
-        write_root(&root, &["a"]);
+    fn load_rejects_unknown_version_form() -> TestResult {
+        let root = scratch_dir("version-unknown")?;
+        write_crate_with_version_line(&root, "a", &[], "version = { workspace = false }")?;
+        write_root(&root, &["a"])?;
 
         let result = WorkspaceGraph::load(&root);
         assert!(
@@ -635,10 +666,11 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 
     #[test]
-    fn load_reads_real_workspace_with_member_count_from_manifest() {
+    fn load_reads_real_workspace_with_member_count_from_manifest() -> TestResult {
         // Lädt den tatsächlichen Repo-Workspace statt eines konstruierten
         // Fixtures. Die bisherigen Tests konstruierten sich stets einen
         // Workspace in der (inzwischen überholten) wörtlichen Versionsform
@@ -654,38 +686,45 @@ mod tests {
         // bleibt die Erwartung an die Quelle der Wahrheit gebunden, statt an
         // eine Momentaufnahme.
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let workspace_root = manifest_dir
-            .parent()
-            .expect("übergeordnetes Workspace-Verzeichnis von harw-code-graph");
+        let workspace_root = manifest_dir.parent().ok_or(TestError::Missing(
+            "übergeordnetes Workspace-Verzeichnis von harw-code-graph",
+        ))?;
 
         let root_content = fs::read_to_string(workspace_root.join("Cargo.toml"))
-            .expect("Wurzel-Cargo.toml lesen");
+            .map_err(ctx("Wurzel-Cargo.toml lesen"))?;
         let root_manifest: RawRootManifest =
-            toml::from_str(&root_content).expect("Wurzel-Cargo.toml parsen");
+            toml::from_str(&root_content).map_err(ctx("Wurzel-Cargo.toml parsen"))?;
         let member_patterns = root_manifest
             .workspace
-            .expect("[workspace]-Abschnitt in der Wurzel-Cargo.toml")
+            .ok_or(TestError::Missing(
+                "[workspace]-Abschnitt in der Wurzel-Cargo.toml",
+            ))?
             .members
             .unwrap_or_default();
-        let expected_member_dirs = resolve_member_dirs(workspace_root, &member_patterns)
-            .expect("Member-Verzeichnisse aus der Wurzel-Cargo.toml auflösen");
+        let expected_member_dirs = resolve_member_dirs(workspace_root, &member_patterns).map_err(
+            ctx("Member-Verzeichnisse aus der Wurzel-Cargo.toml auflösen"),
+        )?;
         let expected_count = expected_member_dirs.len();
 
-        let graph = WorkspaceGraph::load(workspace_root).expect("echten Workspace laden");
+        let graph = WorkspaceGraph::load(workspace_root).map_err(ctx("echten Workspace laden"))?;
         assert_eq!(
             graph.crates.len(),
             expected_count,
             "erwartete {expected_count} Workspace-Member (aus Cargo.toml), gefunden: {:?}",
-            graph.crates.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()
+            graph
+                .crates
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
         );
 
         // Laden allein hätte den `crypt_guard`-Fehlklassifikationsfehler
         // (Pfad-Abhängigkeit außerhalb des Workspace fälschlich als intern
         // gezählt) nicht gefangen — der schlägt erst hier zu, wenn Kahn
         // versucht, den Graphen topologisch zu sortieren.
-        let levels = graph
-            .topological_levels()
-            .expect("echten Workspace topologisch sortieren, kein falscher Zyklus");
+        let levels = graph.topological_levels().map_err(ctx(
+            "echten Workspace topologisch sortieren, kein falscher Zyklus",
+        ))?;
         let sorted_names: HashSet<&str> = levels
             .iter()
             .flatten()
@@ -697,7 +736,9 @@ mod tests {
             "alle {expected_count} Member müssen in genau einer Ebene auftauchen"
         );
 
-        let secrets = graph.get("harw-secrets").expect("harw-secrets gefunden");
+        let secrets = graph
+            .get("harw-secrets")
+            .ok_or(TestError::Missing("harw-secrets gefunden"))?;
         assert!(
             secrets.external_deps.iter().any(|dep| dep == "crypt_guard"),
             "crypt_guard zeigt per path auf ein Sibling-Repo außerhalb des Workspace und muss extern klassifiziert werden, gefunden: {:?}",
@@ -707,39 +748,43 @@ mod tests {
             !secrets.deps.iter().any(|dep| dep == "crypt_guard"),
             "crypt_guard darf nicht als interne Abhängigkeit gezählt werden"
         );
+        Ok(())
     }
 
     #[test]
-    fn load_treats_path_dependency_outside_workspace_as_external() {
+    fn load_treats_path_dependency_outside_workspace_as_external() -> TestResult {
         // Nachbau des `crypt_guard`-Befunds in Miniatur: `b` hat neben der
         // echten internen Abhängigkeit `a` eine `path`-Abhängigkeit auf ein
         // Verzeichnis, das kein Workspace-Member ist.
-        let root = scratch_dir("path-dep-outside-workspace");
-        write_crate(&root, "a", &[]);
+        let root = scratch_dir("path-dep-outside-workspace")?;
+        write_crate(&root, "a", &[])?;
         let b_dir = root.join("b");
-        fs::create_dir_all(&b_dir).expect("Crate-Verzeichnis b anlegen");
+        fs::create_dir_all(&b_dir).map_err(ctx("Crate-Verzeichnis b anlegen"))?;
         fs::write(
             b_dir.join("Cargo.toml"),
             "[package]\nname = \"b\"\nversion = \"0.1.0\"\n\n[dependencies]\na = { path = \"../a\" }\nexternal-lib = { path = \"../../external-lib\" }\n",
         )
-        .expect("Cargo.toml von b schreiben");
-        write_root(&root, &["a", "b"]);
+        .map_err(ctx("Cargo.toml von b schreiben"))?;
+        write_root(&root, &["a", "b"])?;
 
-        let graph = WorkspaceGraph::load(&root).expect("Workspace laden");
-        let node_b = graph.get("b").expect("Crate b gefunden");
+        let graph = WorkspaceGraph::load(&root).map_err(ctx("Workspace laden"))?;
+        let node_b = graph
+            .get("b")
+            .ok_or(TestError::Missing("Crate b gefunden"))?;
         assert_eq!(node_b.deps, vec!["a".to_owned()]);
         assert_eq!(node_b.external_deps, vec!["external-lib".to_owned()]);
 
         let levels = graph
             .topological_levels()
-            .expect("darf keinen falschen Zyklus melden");
+            .map_err(ctx("darf keinen falschen Zyklus melden"))?;
         assert_eq!(levels.len(), 2, "a auf Ebene 0, b auf Ebene 1");
 
         fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 
     #[test]
-    fn topological_levels_reports_member_missing_for_unknown_edge_instead_of_cycle() {
+    fn topological_levels_reports_member_missing_for_unknown_edge_instead_of_cycle() -> TestResult {
         // Direkt konstruierter Graph mit einer Kante auf einen Namen, der
         // als Knoten nicht existiert. Das darf NICHT als `CycleDetected`
         // erscheinen — genau diese Verwechslung führte `xtask gates` beim
@@ -765,9 +810,12 @@ mod tests {
         let result = graph.topological_levels();
         match result {
             Err(CodeGraphError::MemberMissing { name }) => assert_eq!(name, "ghost"),
-            other => panic!(
-                "eine Kante auf einen unbekannten Namen muss MemberMissing melden, kein CycleDetected: {other:?}"
-            ),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "eine Kante auf einen unbekannten Namen muss MemberMissing melden, kein CycleDetected: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 }

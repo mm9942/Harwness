@@ -63,6 +63,7 @@ use harw_project_discovery::{
 };
 use harw_sandbox::{HostPermitSessionRegistry, ProcessPermitLedger, SandboxProfile};
 use harw_tool_deps::DepsToolProvider;
+use harw_tool_doc::DocToolProvider;
 use harw_tool_fs::FsToolProvider;
 use harw_tool_lens::LensToolProvider;
 use harw_tool_shell::{HostPermitPromptSender, HostPermitVariant, ShellToolProvider};
@@ -313,6 +314,16 @@ const FS_FULL_TOOLS: &[&str] = &[
 /// und die Begründung bei [`RegistryProfile::MemoryStewardship`].
 const MEMORY_STEWARDSHIP_TOOLS: &[&str] = FS_FULL_TOOLS;
 
+/// Das eine Werkzeug von `harw-tool-doc` (`DocToolProvider`, Anbindung W3):
+/// liest eine PDF-Datei aus dem Workspace seitenweise als Text/Markdown —
+/// Mistral OCR, wenn ein Mistral-Provider konfiguriert ist, sonst lokale
+/// Extraktion über `oxidize-pdf`. `fs.read` liest PDFs nicht sinnvoll (Binär-
+/// statt Textinhalt); `doc.read_pdf` ergänzt deshalb jedes Profil, das einen
+/// lesenden `FsToolProvider` registriert — dieselbe Berechtigung
+/// (`Permission::ReadWorkspace`) wie `fs.read`, siehe
+/// [`crate::authority::tool_permission`].
+pub(crate) const DOC_TOOLS: &[&str] = &["doc.read_pdf"];
+
 /// Die Werkzeuge von `harw-tool-deps`, in Provider-Reihenfolge.
 const DEPS_TOOLS: &[&str] = &[
     "deps.graph",
@@ -496,20 +507,22 @@ pub(crate) const BROWSER_TOOLS: &[&str] = &[
 /// Hand gepflegt und bewarb Werkzeuge, die das Kind gar nicht besaß.
 ///
 /// # Varianten
-/// - `Full` — voller Coding-Satz: `fs.*`, `shell.exec` (ohne Browser, W5 RD).
+/// - `Full` — voller Coding-Satz: `fs.*`, `doc.read_pdf`, `shell.exec` (ohne
+///   Browser, W5 RD).
 /// - `ShellExecution` — ausschließlich `shell.exec`; kein Dateisystem-Werkzeug.
 /// - `ReadOnlyExplore` — ausschließlich lesend.
 /// - `Research` — **nur** `web.*` (W5 RD, Annahme A5): kein `fs.*`, kein
-///   `deps.*`, damit die einzige Rolle mit Netz keine Workspace-Daten lesen und
-///   hinaustragen kann. Netz-Scope aus `[network].researcher_web_hosts`
+///   `doc.read_pdf`, kein `deps.*`, damit die einzige Rolle mit Netz keine
+///   Workspace-Daten lesen und hinaustragen kann. Netz-Scope aus
+///   `[network].researcher_web_hosts`
 ///   ([`crate::research_web::researcher_web_policy`]).
 /// - `Planning` — `ReadOnlyExplore` plus `lens.ask` (Plan-/Goal-Operationen
 ///   bewirbt es nicht: das Kind besitzt dafür keinen Executor).
 /// - `MemoryStewardship` — genau `fs.*` (alle sechs Werkzeuge, inklusive
-///   `fs.write`), aber **kein** `shell.exec` und kein `web.*`. Einzige
-///   eingebaute Rolle: [`role_names::MEMORY_STEWARD`] (siehe deren
-///   Begründung bei [`RegistryProfile::MemoryStewardship`] unten für den
-///   Grund, warum `Full` dafür zu weit wäre).
+///   `fs.write`) plus `doc.read_pdf`, aber **kein** `shell.exec` und kein
+///   `web.*`. Einzige eingebaute Rolle: [`role_names::MEMORY_STEWARD`]
+///   (siehe deren Begründung bei [`RegistryProfile::MemoryStewardship`]
+///   unten für den Grund, warum `Full` dafür zu weit wäre).
 /// - `NoTools` — registriert und bewirbt gar nichts.
 ///
 /// # Warum `NoTools` und nicht `ReadOnlyExplore` für die Triage-Rollen
@@ -550,13 +563,15 @@ pub(crate) const BROWSER_TOOLS: &[&str] = &[
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistryProfile {
-    /// Voller Coding-Satz: fs.*, shell.exec. Browser nur über expliziten Grant.
+    /// Voller Coding-Satz: fs.*, doc.read_pdf, shell.exec. Browser nur über
+    /// expliziten Grant.
     Full,
     /// Dedizierter Prozessworker: ausschließlich `shell.exec`. Das Profil ist
     /// absichtlich kein Fallback und erhält weder `fs.write` noch lesende
     /// Workspace-Werkzeuge.
     ShellExecution,
-    /// Ausschließlich lesend: fs.read/list/search/glob/grep + deps.*.
+    /// Ausschließlich lesend: fs.read/list/search/glob/grep + doc.read_pdf +
+    /// deps.*.
     ReadOnlyExplore,
     /// Nur web.* — kein Workspace-Lesen (A5); Netz nur über
     /// `[network].researcher_web_hosts`.
@@ -569,8 +584,9 @@ pub enum RegistryProfile {
     /// = []`), etwa die vier `security-*-triage`-Rollen (siehe
     /// [`role_names::SECURITY_EGRESS_TRIAGE`] u. a.).
     NoTools,
-    /// Genau `fs.*` (alle sechs Werkzeuge, inklusive `fs.write`) — kein
-    /// `shell.exec`, kein `web.*`, kein `deps.*`, kein `lens.ask`.
+    /// Genau `fs.*` (alle sechs Werkzeuge, inklusive `fs.write`) plus
+    /// `doc.read_pdf` — kein `shell.exec`, kein `web.*`, kein `deps.*`, kein
+    /// `lens.ask`.
     ///
     /// # Warum dieses Profil existiert (Memory v3, §5.3)
     /// [`role_names::MEMORY_STEWARD`] konsolidiert Projektgedächtnis-Fakten
@@ -586,12 +602,12 @@ pub enum RegistryProfile {
     /// wie `Full` untrennbar zu bündeln.
     MemoryStewardship,
     /// Schnellhelfer der UIA (Addendum I, korrigiert REG-DE): lesender
-    /// Workspace-Zugriff (`FS_READ_ONLY_TOOLS`) plus `shell.exec`
-    /// (`SHELL_TOOLS`, läuft wie überall über Sandbox+Freigabe) plus
-    /// ausschließlich `web.fetch` plus ausschließlich `browser.open`
-    /// (Nutzerentscheidung, siehe [`UIA_QUICK_HELPER_BROWSER_TOOLS`]) — kein
-    /// `fs.write`, kein `deps.*`, kein `lens.ask`, keine der übrigen sechs
-    /// `browser.*`-Werkzeuge.
+    /// Workspace-Zugriff (`FS_READ_ONLY_TOOLS`) plus `doc.read_pdf`
+    /// (`DOC_TOOLS`) plus `shell.exec` (`SHELL_TOOLS`, läuft wie überall über
+    /// Sandbox+Freigabe) plus ausschließlich `web.fetch` plus ausschließlich
+    /// `browser.open` (Nutzerentscheidung, siehe
+    /// [`UIA_QUICK_HELPER_BROWSER_TOOLS`]) — kein `fs.write`, kein `deps.*`,
+    /// kein `lens.ask`, keine der übrigen sechs `browser.*`-Werkzeuge.
     ///
     /// # Warum dieses Profil existiert (Addendum I)
     /// [`role_names::UIA_WORKER`] war zuvor auf [`RegistryProfile::Research`]
@@ -614,8 +630,8 @@ pub enum RegistryProfile {
     /// `close`) bleiben verboten, siehe
     /// `harw-registry-defaults/tests/role_rights_matrix.rs`.
     UiaQuickHelper,
-    /// Der lesende `fs.*`-Kern ([`FS_READ_ONLY_TOOLS`]) plus die
-    /// Agentendefinitions-Werkzeuge von
+    /// Der lesende `fs.*`-Kern ([`FS_READ_ONLY_TOOLS`]) plus `doc.read_pdf`
+    /// ([`DOC_TOOLS`]) plus die Agentendefinitions-Werkzeuge von
     /// `crate::agent_definition_tools::AgentDefinitionToolProvider`
     /// ([`AGENT_DEFINITION_TOOLS`]) — kein `fs.write`, kein `shell.exec`,
     /// kein `web.*`, kein `deps.*`, kein `lens.ask`.
@@ -634,8 +650,9 @@ pub enum RegistryProfile {
     /// Agenten-Werkzeuge schreiben darf.
     AgentStewardship,
     /// Read-only Erkundungsspezialisierung der UIA: [`FS_READ_ONLY_TOOLS`]
-    /// plus [`UIA_QUICK_HELPER_WEB_TOOLS`] (`web.fetch`) — kein `fs.write`,
-    /// kein `shell.exec`, kein `deps.*`, kein `lens.ask`.
+    /// plus [`DOC_TOOLS`] (`doc.read_pdf`) plus [`UIA_QUICK_HELPER_WEB_TOOLS`]
+    /// (`web.fetch`) — kein `fs.write`, kein `shell.exec`, kein `deps.*`,
+    /// kein `lens.ask`.
     ///
     /// # Warum dieses Profil existiert
     /// Die Spawn-Matrix (`harw-agent-dsl/src/roles.rs::can_spawn`) lässt die
@@ -653,8 +670,8 @@ pub enum RegistryProfile {
     UiaExplorer,
     /// Schreibende Erkundungsspezialisierung der UIA: [`UiaExplorer`] plus
     /// `fs.write` (alle sechs `fs.*`-Werkzeuge, [`FS_FULL_TOOLS`]) plus
-    /// [`UIA_QUICK_HELPER_WEB_TOOLS`] — kein `shell.exec`, kein `deps.*`,
-    /// kein `lens.ask`.
+    /// [`DOC_TOOLS`] (`doc.read_pdf`) plus [`UIA_QUICK_HELPER_WEB_TOOLS`] —
+    /// kein `shell.exec`, kein `deps.*`, kein `lens.ask`.
     ///
     /// # Warum dieses Profil existiert
     /// Dieselbe Begründung wie bei [`RegistryProfile::UiaExplorer`]: ein
@@ -664,8 +681,8 @@ pub enum RegistryProfile {
     /// `agents/uia-writer.toml` und [`role_names::UIA_WRITER`].
     UiaWriter,
     /// Host-Shell-Spezialisierung der UIA: [`FS_READ_ONLY_TOOLS`] plus
-    /// [`SHELL_TOOLS`] — kein `fs.write`, kein `web.*`, kein `deps.*`, kein
-    /// `lens.ask`.
+    /// [`DOC_TOOLS`] (`doc.read_pdf`) plus [`SHELL_TOOLS`] — kein `fs.write`,
+    /// kein `web.*`, kein `deps.*`, kein `lens.ask`.
     ///
     /// # Warum dieses Profil existiert
     /// Dieselbe Begründung wie bei [`RegistryProfile::UiaExplorer`]/
@@ -803,12 +820,14 @@ impl RegistryProfile {
         match self {
             RegistryProfile::Full => FS_FULL_TOOLS
                 .iter()
+                .chain(DOC_TOOLS.iter())
                 .chain(SHELL_TOOLS.iter())
                 .copied()
                 .collect(),
             RegistryProfile::ShellExecution => SHELL_TOOLS.to_vec(),
             RegistryProfile::ReadOnlyExplore => FS_READ_ONLY_TOOLS
                 .iter()
+                .chain(DOC_TOOLS.iter())
                 .chain(DEPS_TOOLS.iter())
                 .copied()
                 .collect(),
@@ -818,6 +837,7 @@ impl RegistryProfile {
             // bekommt.
             RegistryProfile::Planning => FS_READ_ONLY_TOOLS
                 .iter()
+                .chain(DOC_TOOLS.iter())
                 .chain(DEPS_TOOLS.iter())
                 .chain(LENS_TOOLS.iter())
                 .copied()
@@ -827,16 +847,22 @@ impl RegistryProfile {
             // Siehe die Begründung bei `RegistryProfile::NoTools`: keine
             // Werkzeuge registriert, keine beworben.
             RegistryProfile::NoTools => Vec::new(),
-            // Alle sechs `fs.*`-Werkzeuge (inklusive `fs.write`), aber kein
-            // `shell.exec` — siehe die Begründung bei
-            // `RegistryProfile::MemoryStewardship`.
-            RegistryProfile::MemoryStewardship => MEMORY_STEWARDSHIP_TOOLS.to_vec(),
+            // Alle sechs `fs.*`-Werkzeuge (inklusive `fs.write`) plus
+            // `doc.read_pdf`, aber kein `shell.exec` — siehe die Begründung
+            // bei `RegistryProfile::MemoryStewardship`.
+            RegistryProfile::MemoryStewardship => MEMORY_STEWARDSHIP_TOOLS
+                .iter()
+                .chain(DOC_TOOLS.iter())
+                .copied()
+                .collect(),
             // Schnellhelfer der UIA (Addendum I): lesender fs.*-Kern plus
-            // `shell.exec` plus ausschließlich `web.fetch` plus
-            // ausschließlich `browser.open` (Nutzerentscheidung) — siehe die
-            // Begründung bei `RegistryProfile::UiaQuickHelper`.
+            // `doc.read_pdf` plus `shell.exec` plus ausschließlich
+            // `web.fetch` plus ausschließlich `browser.open`
+            // (Nutzerentscheidung) — siehe die Begründung bei
+            // `RegistryProfile::UiaQuickHelper`.
             RegistryProfile::UiaQuickHelper => FS_READ_ONLY_TOOLS
                 .iter()
+                .chain(DOC_TOOLS.iter())
                 .chain(SHELL_TOOLS.iter())
                 .chain(UIA_QUICK_HELPER_WEB_TOOLS.iter())
                 .chain(UIA_QUICK_HELPER_BROWSER_TOOLS.iter())
@@ -854,31 +880,36 @@ impl RegistryProfile {
             // den tatsächlichen Laufzeitzustand.
             RegistryProfile::AgentStewardship => FS_READ_ONLY_TOOLS
                 .iter()
+                .chain(DOC_TOOLS.iter())
                 .chain(AGENT_DEFINITION_TOOLS.iter())
                 .copied()
                 .collect(),
             // Read-only Erkundungsspezialisierung der UIA (siehe die
             // Begründung bei `RegistryProfile::UiaExplorer`): lesender
-            // fs.*-Kern plus ausschließlich `web.fetch` — kein `deps.*`.
+            // fs.*-Kern plus `doc.read_pdf` plus ausschließlich `web.fetch`
+            // — kein `deps.*`.
             RegistryProfile::UiaExplorer => FS_READ_ONLY_TOOLS
                 .iter()
+                .chain(DOC_TOOLS.iter())
                 .chain(UIA_QUICK_HELPER_WEB_TOOLS.iter())
                 .copied()
                 .collect(),
             // Schreibende Erkundungsspezialisierung der UIA (siehe die
             // Begründung bei `RegistryProfile::UiaWriter`): alle sechs
-            // fs.*-Werkzeuge (inklusive `fs.write`) plus ausschließlich
-            // `web.fetch` — kein `deps.*`, kein `shell.exec`.
+            // fs.*-Werkzeuge (inklusive `fs.write`) plus `doc.read_pdf` plus
+            // ausschließlich `web.fetch` — kein `deps.*`, kein `shell.exec`.
             RegistryProfile::UiaWriter => FS_FULL_TOOLS
                 .iter()
+                .chain(DOC_TOOLS.iter())
                 .chain(UIA_QUICK_HELPER_WEB_TOOLS.iter())
                 .copied()
                 .collect(),
             // Host-Shell-Spezialisierung der UIA (siehe die Begründung bei
             // `RegistryProfile::UiaShellWorker`): lesender fs.*-Kern plus
-            // `shell.exec` — kein `web.*`, kein `deps.*`.
+            // `doc.read_pdf` plus `shell.exec` — kein `web.*`, kein `deps.*`.
             RegistryProfile::UiaShellWorker => FS_READ_ONLY_TOOLS
                 .iter()
+                .chain(DOC_TOOLS.iter())
                 .chain(SHELL_TOOLS.iter())
                 .copied()
                 .collect(),
@@ -1405,21 +1436,25 @@ fn profile_tool_providers(
         Arc::new(provider)
     };
     // Der read-only Anteil ist für drei Profile identisch: der gefilterte
-    // FS-Provider plus der vollständig lesende Deps-Provider.
+    // FS-Provider plus der lesende Doc-Provider (`doc.read_pdf`, Anbindung
+    // W3 — dieselbe Berechtigung wie `fs.read`, siehe `DOC_TOOLS`) plus der
+    // vollständig lesende Deps-Provider.
     fn read_only_base() -> Vec<Arc<dyn ToolProvider>> {
         let filesystem: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
             Arc::new(FsToolProvider::default()),
             FS_READ_ONLY_TOOLS,
         ));
+        let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
         let dependencies: Arc<dyn ToolProvider> = Arc::new(DepsToolProvider::new());
-        vec![filesystem, dependencies]
+        vec![filesystem, doc, dependencies]
     }
 
     match profile {
         RegistryProfile::Full => {
             let filesystem: Arc<dyn ToolProvider> = Arc::new(FsToolProvider::default());
+            let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
             let shell = build_shell_provider(sandbox_profile);
-            vec![filesystem, shell]
+            vec![filesystem, doc, shell]
         }
         RegistryProfile::ShellExecution => vec![build_shell_provider(sandbox_profile)],
         RegistryProfile::ReadOnlyExplore => read_only_base(),
@@ -1443,26 +1478,30 @@ fn profile_tool_providers(
         // Keine Provider: siehe die Begründung bei `RegistryProfile::NoTools`.
         RegistryProfile::NoTools => Vec::new(),
         // Der volle, ungefilterte `FsToolProvider` (alle sechs `fs.*`, inklusive
-        // `fs.write`) — aber kein `ShellToolProvider`. Siehe die Begründung bei
+        // `fs.write`) plus der lesende Doc-Provider — aber kein
+        // `ShellToolProvider`. Siehe die Begründung bei
         // `RegistryProfile::MemoryStewardship`.
         RegistryProfile::MemoryStewardship => {
             let filesystem: Arc<dyn ToolProvider> = Arc::new(FsToolProvider::default());
-            vec![filesystem]
+            let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
+            vec![filesystem, doc]
         }
         // Schnellhelfer der UIA (Addendum I): gefilterter, lesender
-        // FS-Provider + voller Shell-Provider (Sandbox+Freigabe greifen wie
-        // überall) + auf `web.fetch` gefilterter Web-Provider.
+        // FS-Provider + lesender Doc-Provider + voller Shell-Provider
+        // (Sandbox+Freigabe greifen wie überall) + auf `web.fetch`
+        // gefilterter Web-Provider.
         RegistryProfile::UiaQuickHelper => {
             let filesystem: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
                 Arc::new(FsToolProvider::default()),
                 FS_READ_ONLY_TOOLS,
             ));
+            let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
             let shell = build_shell_provider(sandbox_profile);
             let web: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
                 Arc::new(WebToolProvider::new()),
                 UIA_QUICK_HELPER_WEB_TOOLS,
             ));
-            vec![filesystem, shell, web]
+            vec![filesystem, doc, shell, web]
         }
         // `agent-steward` (Addendum K + Nachtrag K/K2/K3): gefilterter,
         // lesender FS-Provider + der Agentendefinitions-Provider, dessen
@@ -1485,6 +1524,7 @@ fn profile_tool_providers(
                 Arc::new(FsToolProvider::default()),
                 FS_READ_ONLY_TOOLS,
             ));
+            let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
             let agent_definitions: Arc<dyn ToolProvider> = Arc::new(
                 crate::agent_definition_tools::AgentDefinitionToolProvider::new(
                     agent_definition_access.project_agents_dir,
@@ -1493,39 +1533,43 @@ fn profile_tool_providers(
                     agent_definition_access.ceiling,
                 ),
             );
-            vec![filesystem, agent_definitions]
+            vec![filesystem, doc, agent_definitions]
         }
         // Read-only Erkundungsspezialisierung der UIA: gefilterter, lesender
-        // FS-Provider + auf `web.fetch` gefilterter Web-Provider — siehe die
-        // Begründung bei `RegistryProfile::UiaExplorer`.
+        // FS-Provider + lesender Doc-Provider + auf `web.fetch` gefilterter
+        // Web-Provider — siehe die Begründung bei
+        // `RegistryProfile::UiaExplorer`.
         RegistryProfile::UiaExplorer => {
             let filesystem: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
                 Arc::new(FsToolProvider::default()),
                 FS_READ_ONLY_TOOLS,
             ));
+            let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
             let web: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
                 Arc::new(WebToolProvider::new()),
                 UIA_QUICK_HELPER_WEB_TOOLS,
             ));
-            vec![filesystem, web]
+            vec![filesystem, doc, web]
         }
         // Schreibende Erkundungsspezialisierung der UIA: voller, ungefilterter
-        // FS-Provider (alle sechs `fs.*`, inklusive `fs.write`) + auf
-        // `web.fetch` gefilterter Web-Provider — kein `ShellToolProvider`.
-        // Siehe die Begründung bei `RegistryProfile::UiaWriter`.
+        // FS-Provider (alle sechs `fs.*`, inklusive `fs.write`) + lesender
+        // Doc-Provider + auf `web.fetch` gefilterter Web-Provider — kein
+        // `ShellToolProvider`. Siehe die Begründung bei
+        // `RegistryProfile::UiaWriter`.
         RegistryProfile::UiaWriter => {
             let filesystem: Arc<dyn ToolProvider> = Arc::new(FsToolProvider::default());
+            let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
             let web: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
                 Arc::new(WebToolProvider::new()),
                 UIA_QUICK_HELPER_WEB_TOOLS,
             ));
-            vec![filesystem, web]
+            vec![filesystem, doc, web]
         }
         // Host-Shell-Spezialisierung der UIA: gefilterter, lesender
-        // FS-Provider + Shell-Provider — anders als `build_shell_provider`
-        // in den übrigen Zweigen hängt dieser Zweig ausdrücklich
-        // `SandboxProfile::Host` an, nicht das von der Runtime übergebene
-        // `sandbox_profile` — siehe die Begründung bei
+        // FS-Provider + lesender Doc-Provider + Shell-Provider — anders als
+        // `build_shell_provider` in den übrigen Zweigen hängt dieser Zweig
+        // ausdrücklich `SandboxProfile::Host` an, nicht das von der Runtime
+        // übergebene `sandbox_profile` — siehe die Begründung bei
         // `RegistryProfile::UiaShellWorker`. Ledger und Sitzungs-Registry
         // hängt `build_shell_provider` immer an, sobald `host_permits`
         // übergeben wurde (unabhängig vom Profil); für dieses `Host`-Profil
@@ -1535,8 +1579,9 @@ fn profile_tool_providers(
                 Arc::new(FsToolProvider::default()),
                 FS_READ_ONLY_TOOLS,
             ));
+            let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
             let shell = build_shell_provider(&SandboxProfile::Host);
-            vec![filesystem, shell]
+            vec![filesystem, doc, shell]
         }
     }
 }
@@ -2138,6 +2183,7 @@ pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_
     let allowed: Vec<&'static str> = if profile == RegistryProfile::AgentStewardship {
         FS_READ_ONLY_TOOLS
             .iter()
+            .chain(DOC_TOOLS.iter())
             .chain(agent_definition_tool_names_for_access(Some(&agent_definition_access)).iter())
             .copied()
             .filter(|tool| tool_permission(tool).is_some_and(|needed| granted.contains(needed)))
@@ -2209,6 +2255,7 @@ pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Sammelt die tatsächlich registrierten Tool-Namen einer Registry.
     fn registered_names(assembled: &AssembledRegistry) -> Vec<String> {
@@ -2221,13 +2268,14 @@ mod tests {
             .collect()
     }
 
-    fn assemble(profile: RegistryProfile) -> AssembledRegistry {
-        let cwd = std::env::current_dir().expect("cwd");
-        assemble_registry(profile, cwd, IdentityOverrides::default()).expect("assemble")
+    fn assemble(profile: RegistryProfile) -> TestResult<AssembledRegistry> {
+        let cwd = std::env::current_dir().map_err(ctx("cwd"))?;
+        assemble_registry(profile, cwd, IdentityOverrides::default()).map_err(ctx("assemble"))
     }
 
     #[test]
-    fn test_registered_tool_names_matches_actually_registered_tools_for_every_profile() {
+    fn test_registered_tool_names_matches_actually_registered_tools_for_every_profile() -> TestResult
+    {
         for profile in RegistryProfile::ALL {
             // `AgentStewardship` ist die einzige Ausnahme (Nachtrag K3): ohne
             // `AgentDefinitionAccess` (der Standardpfad über `assemble()`
@@ -2253,7 +2301,7 @@ mod tests {
             if *profile == RegistryProfile::UiaQuickHelper {
                 continue;
             }
-            let assembled = assemble(*profile);
+            let assembled = assemble(*profile)?;
             let expected: Vec<String> = profile
                 .registered_tool_names()
                 .iter()
@@ -2265,6 +2313,7 @@ mod tests {
                 "{profile:?}: die statische Liste muss der Registry entsprechen"
             );
         }
+        Ok(())
     }
 
     /// Nutzerentscheidung: `RegistryProfile::UiaQuickHelper::registered_tool_names()`
@@ -2277,8 +2326,8 @@ mod tests {
     /// Werkzeugmenge ohne `browser.open` — dieser Test macht das explizit,
     /// statt es stillschweigend an der Ausnahme oben hängen zu lassen.
     #[test]
-    fn test_uia_quick_helper_does_not_yet_build_a_runtime_browser_provider() {
-        let assembled = assemble(RegistryProfile::UiaQuickHelper);
+    fn test_uia_quick_helper_does_not_yet_build_a_runtime_browser_provider() -> TestResult {
+        let assembled = assemble(RegistryProfile::UiaQuickHelper)?;
         let registered = registered_names(&assembled);
         assert!(
             !registered.iter().any(|tool| tool == "browser.open"),
@@ -2292,6 +2341,7 @@ mod tests {
                 .contains(&"browser.open"),
             "die statische Liste muss browser.open weiterhin bewerben"
         );
+        Ok(())
     }
 
     /// Nachtrag K3: ohne eine gesetzte [`AgentDefinitionAccess`] registriert
@@ -2300,16 +2350,18 @@ mod tests {
     /// `RegistryProfile::AgentStewardship::registered_tool_names()` weiterhin
     /// die volle Vertrags-Obermenge zurückgibt (siehe der Test oben).
     #[test]
-    fn test_agent_stewardship_registers_only_read_and_list_without_access() {
-        let assembled = assemble(RegistryProfile::AgentStewardship);
+    fn test_agent_stewardship_registers_only_read_and_list_without_access() -> TestResult {
+        let assembled = assemble(RegistryProfile::AgentStewardship)?;
         let mut expected: Vec<String> = FS_READ_ONLY_TOOLS
             .iter()
+            .chain(DOC_TOOLS.iter())
             .map(|name| (*name).to_owned())
             .collect();
         expected.push("agents.validate".to_owned());
         expected.push("agents.list_proposals".to_owned());
         assert_eq!(registered_names(&assembled), expected);
         assert_eq!(assembled.identity.tools_available, expected);
+        Ok(())
     }
 
     /// Nachtrag K3: mit einer gesetzten Decke und `DefinitionWriteMode::Commit`
@@ -2317,13 +2369,13 @@ mod tests {
     /// Werkzeugmenge, die `agent-steward.toml` admittiert (siehe
     /// `tests/tool_admission_coverage.rs`).
     #[test]
-    fn test_agent_stewardship_registers_all_six_tools_with_a_commit_ceiling() {
+    fn test_agent_stewardship_registers_all_six_tools_with_a_commit_ceiling() -> TestResult {
         use crate::agent_definition_tools::DefinitionAuthorCeiling;
         use harw_agent_dsl::roles::AgentRoleId;
 
-        let cwd = std::env::current_dir().expect("cwd");
-        let project =
-            discover_project(&cwd, &DiscoveryConfig::default()).expect("Discovery im Workspace");
+        let cwd = std::env::current_dir().map_err(ctx("cwd"))?;
+        let project = discover_project(&cwd, &DiscoveryConfig::default())
+            .map_err(ctx("Discovery im Workspace"))?;
         let access = AgentDefinitionAccess {
             project_agents_dir: Some(project.project_root.join(".harw").join("agents")),
             profile_agents_dir: None,
@@ -2344,20 +2396,22 @@ mod tests {
             ApprovalModeCell::default(),
             Some(access),
         )
-        .expect("assemble");
+        .map_err(ctx("assemble"))?;
 
         let mut expected: Vec<String> = FS_READ_ONLY_TOOLS
             .iter()
+            .chain(DOC_TOOLS.iter())
             .map(|name| (*name).to_owned())
             .collect();
         expected.extend(AGENT_DEFINITION_TOOLS.iter().map(|name| (*name).to_owned()));
         assert_eq!(registered_names(&assembled), expected);
         assert_eq!(assembled.identity.tools_available, expected);
+        Ok(())
     }
 
     #[test]
-    fn test_read_only_explore_exposes_exact_tool_set() {
-        let assembled = assemble(RegistryProfile::ReadOnlyExplore);
+    fn test_read_only_explore_exposes_exact_tool_set() -> TestResult {
+        let assembled = assemble(RegistryProfile::ReadOnlyExplore)?;
         assert_eq!(
             registered_names(&assembled),
             vec![
@@ -2366,6 +2420,7 @@ mod tests {
                 "fs.search",
                 "fs.glob",
                 "fs.grep",
+                "doc.read_pdf",
                 "deps.graph",
                 "deps.locked",
                 "deps.source_read",
@@ -2373,20 +2428,22 @@ mod tests {
                 "deps.source_list",
             ]
         );
+        Ok(())
     }
 
     /// A5: Die einzige Rolle mit Netz registriert **nur** `web.*` — kein
     /// `fs.*`, kein `deps.*`, also nichts, womit sie Workspace-Daten lesen und
     /// über `web.fetch` hinaustragen könnte.
     #[test]
-    fn test_research_profile_registers_only_the_web_tools() {
-        let assembled = assemble(RegistryProfile::Research);
+    fn test_research_profile_registers_only_the_web_tools() -> TestResult {
+        let assembled = assemble(RegistryProfile::Research)?;
         let names = registered_names(&assembled);
         let expected: Vec<String> = WEB_TOOLS.iter().map(|tool| (*tool).to_owned()).collect();
         assert_eq!(names, expected);
         assert!(!names.iter().any(|name| name.starts_with("fs.")));
         assert!(!names.iter().any(|name| name.starts_with("deps.")));
         assert_eq!(assembled.identity.tools_available, expected);
+        Ok(())
     }
 
     #[test]
@@ -2464,6 +2521,7 @@ mod tests {
                 "fs.search",
                 "fs.glob",
                 "fs.grep",
+                "doc.read_pdf",
                 "deps.graph",
                 "deps.locked"
             ]
@@ -2482,12 +2540,13 @@ mod tests {
     }
 
     #[test]
-    fn test_assemble_registry_for_sandbox_registers_and_advertises_only_granted_tools() {
+    fn test_assemble_registry_for_sandbox_registers_and_advertises_only_granted_tools() -> TestResult
+    {
         use harw_authority::Permission;
 
-        let cwd = std::env::current_dir().expect("cwd");
-        let project =
-            discover_project(&cwd, &DiscoveryConfig::default()).expect("Discovery im Workspace");
+        let cwd = std::env::current_dir().map_err(ctx("cwd"))?;
+        let project = discover_project(&cwd, &DiscoveryConfig::default())
+            .map_err(ctx("Discovery im Workspace"))?;
         let granted = PermissionSet::from_policy([Permission::ReadWorkspace]);
         let assembled = assemble_registry_for_sandbox(
             RegistryProfile::ReadOnlyExplore,
@@ -2496,7 +2555,7 @@ mod tests {
             ApprovalModeCell::default(),
             &granted,
         )
-        .expect("assemble");
+        .map_err(ctx("assemble"))?;
 
         let expected: Vec<String> = RegistryProfile::ReadOnlyExplore
             .tool_names_for(&granted)
@@ -2522,14 +2581,16 @@ mod tests {
             ApprovalModeCell::default(),
             &granted,
         )
-        .expect("assemble");
+        .map_err(ctx("assemble"))?;
         assert!(research.registry.tool_providers().is_empty());
         assert!(research.identity.tools_available.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_planning_profile_registers_read_only_tools_and_does_not_advertise_plan_or_goal() {
-        let assembled = assemble(RegistryProfile::Planning);
+    fn test_planning_profile_registers_read_only_tools_and_does_not_advertise_plan_or_goal()
+    -> TestResult {
+        let assembled = assemble(RegistryProfile::Planning)?;
         // Registriert werden die read-only Provider von `ReadOnlyExplore`
         // plus `lens.ask` — der einzige Grund, warum `Planning` sich
         // überhaupt vom read-only Kern unterscheidet (siehe `LENS_TOOLS`).
@@ -2555,13 +2616,14 @@ mod tests {
                 .tools_available
                 .contains(&"goal".to_owned())
         );
+        Ok(())
     }
 
     #[test]
-    fn test_only_planner_profile_registers_lens_ask() {
+    fn test_only_planner_profile_registers_lens_ask() -> TestResult {
         // `LensToolProvider` erscheint in der zusammengestellten Registry —
         // der Beleg, dass Lens jetzt einen echten Konsumenten hat.
-        let planning = assemble(RegistryProfile::Planning);
+        let planning = assemble(RegistryProfile::Planning)?;
         assert!(registered_names(&planning).contains(&"lens.ask".to_owned()));
         assert!(
             planning
@@ -2577,7 +2639,7 @@ mod tests {
             .iter()
             .filter(|p| **p != RegistryProfile::Planning)
         {
-            let assembled = assemble(*profile);
+            let assembled = assemble(*profile)?;
             assert!(
                 !registered_names(&assembled).contains(&"lens.ask".to_owned()),
                 "{profile:?} darf lens.ask nicht registrieren"
@@ -2590,12 +2652,13 @@ mod tests {
                 "{profile:?} darf lens.ask nicht bewerben"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_read_only_profiles_never_expose_write_or_shell_tools() {
+    fn test_read_only_profiles_never_expose_write_or_shell_tools() -> TestResult {
         for profile in RegistryProfile::ALL.iter().filter(|p| p.is_read_only()) {
-            let assembled = assemble(*profile);
+            let assembled = assemble(*profile)?;
             let names = registered_names(&assembled);
             for forbidden in ["fs.write", "shell.exec"] {
                 assert!(
@@ -2611,10 +2674,11 @@ mod tests {
                 );
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_identity_advertises_exactly_the_profile_tool_names() {
+    fn test_identity_advertises_exactly_the_profile_tool_names() -> TestResult {
         for profile in RegistryProfile::ALL {
             // `AgentStewardship` ist auch hier die einzige Ausnahme (Nachtrag
             // K3, wie bei `test_registered_tool_names_matches_actually_
@@ -2641,7 +2705,7 @@ mod tests {
             if *profile == RegistryProfile::UiaQuickHelper {
                 continue;
             }
-            let assembled = assemble(*profile);
+            let assembled = assemble(*profile)?;
             let expected: Vec<String> = profile
                 .tool_names()
                 .iter()
@@ -2652,22 +2716,24 @@ mod tests {
                 "{profile:?}: der Prompt darf nur Profil-Werkzeuge bewerben"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_identity_uses_profile_role_description_by_default() {
+    fn test_identity_uses_profile_role_description_by_default() -> TestResult {
         for profile in RegistryProfile::ALL {
-            let assembled = assemble(*profile);
+            let assembled = assemble(*profile)?;
             assert_eq!(
                 assembled.identity.role_description,
                 profile.role_description()
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_identity_overrides_replace_name_role_and_context() {
-        let cwd = std::env::current_dir().expect("cwd");
+    fn test_identity_overrides_replace_name_role_and_context() -> TestResult {
+        let cwd = std::env::current_dir().map_err(ctx("cwd"))?;
         let assembled = assemble_registry(
             RegistryProfile::ReadOnlyExplore,
             cwd,
@@ -2678,7 +2744,7 @@ mod tests {
                 organizational_role: None,
             },
         )
-        .expect("assemble");
+        .map_err(ctx("assemble"))?;
 
         assert_eq!(assembled.identity.agent_name, "explorer-3");
         assert_eq!(assembled.identity.role_description, "focused explorer");
@@ -2686,6 +2752,7 @@ mod tests {
             assembled.identity.extra_context,
             vec!["Antworte nur mit JSON."]
         );
+        Ok(())
     }
 
     /// Legt ein leeres Projektverzeichnis unter `std::env::temp_dir()` an und
@@ -2695,19 +2762,19 @@ mod tests {
     /// Der Name ist über Prozess-ID und Nanosekunden eindeutig — kein
     /// gemeinsamer Zähler, kein anderer geteilter Zustand, damit parallel
     /// laufende Tests einander nicht sehen.
-    fn make_temp_project(tag: &str) -> PathBuf {
+    fn make_temp_project(tag: &str) -> TestResult<PathBuf> {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("Systemzeit liegt vor der Unix-Epoche")
+            .map_err(ctx("Systemzeit liegt vor der Unix-Epoche"))?
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
             "harw-registry-defaults-{tag}-{}-{unique}",
             std::process::id()
         ));
-        std::fs::create_dir_all(&root).expect("Projektverzeichnis anlegen");
+        std::fs::create_dir_all(&root).map_err(ctx("Projektverzeichnis anlegen"))?;
         std::fs::write(root.join("Cargo.toml"), b"[package]\nname = \"tmp\"\n")
-            .expect("Projektmarker schreiben");
-        root
+            .map_err(ctx("Projektmarker schreiben"))?;
+        Ok(root)
     }
 
     /// Der Kern von G-071: Zwei Montagen über demselben [`ProjectContext`]
@@ -2719,17 +2786,17 @@ mod tests {
     /// ausdrücklich) — beide Montagen gelingen trotzdem und liefern denselben
     /// Kontext. Eine verborgene Re-Discovery könnte das nicht.
     #[test]
-    fn test_assemble_registry_for_project_never_runs_discovery_again() {
-        let root = make_temp_project("no-rediscovery");
+    fn test_assemble_registry_for_project_never_runs_discovery_again() -> TestResult {
+        let root = make_temp_project("no-rediscovery")?;
 
-        let project =
-            discover_project(&root, &DiscoveryConfig::default()).expect("Discovery im Tempdir");
+        let project = discover_project(&root, &DiscoveryConfig::default())
+            .map_err(ctx("Discovery im Tempdir"))?;
         assert_eq!(
             project.project_root, project.cwd,
             "der Marker liegt im Wurzelverzeichnis selbst"
         );
 
-        std::fs::remove_dir_all(&root).expect("Projektverzeichnis entfernen");
+        std::fs::remove_dir_all(&root).map_err(ctx("Projektverzeichnis entfernen"))?;
         assert!(
             discover_project(&root, &DiscoveryConfig::default()).is_err(),
             "nach dem Löschen muss jede erneute Discovery scheitern — sonst \
@@ -2743,14 +2810,14 @@ mod tests {
             IdentityOverrides::default(),
             mode.clone(),
         )
-        .expect("erste Montage kommt ohne Discovery aus");
+        .map_err(ctx("erste Montage kommt ohne Discovery aus"))?;
         let second = assemble_registry_for_project(
             RegistryProfile::ReadOnlyExplore,
             &project,
             IdentityOverrides::default(),
             mode.clone(),
         )
-        .expect("zweite Montage kommt ohne Discovery aus");
+        .map_err(ctx("zweite Montage kommt ohne Discovery aus"))?;
 
         assert_eq!(first.project.project_root, project.project_root);
         assert_eq!(second.project.project_root, project.project_root);
@@ -2758,6 +2825,7 @@ mod tests {
         assert_eq!(registered_names(&first), registered_names(&second));
         assert_eq!(first.registry.approval_handlers().len(), 1);
         assert_eq!(second.registry.approval_handlers().len(), 1);
+        Ok(())
     }
 
     #[test]
@@ -2842,8 +2910,10 @@ mod tests {
             profile_for_role(role_names::UIA_SHELL_WORKER),
             Some(RegistryProfile::UiaShellWorker)
         );
-        let advertised: BTreeSet<&str> =
-            RegistryProfile::UiaShellWorker.tool_names().into_iter().collect();
+        let advertised: BTreeSet<&str> = RegistryProfile::UiaShellWorker
+            .tool_names()
+            .into_iter()
+            .collect();
         let expected: BTreeSet<&str> = [
             "shell.exec",
             "fs.read",
@@ -2851,6 +2921,7 @@ mod tests {
             "fs.search",
             "fs.glob",
             "fs.grep",
+            "doc.read_pdf",
         ]
         .into_iter()
         .collect();
@@ -2933,15 +3004,16 @@ mod tests {
     }
 
     #[test]
-    fn test_no_tools_profile_registers_and_advertises_nothing() {
+    fn test_no_tools_profile_registers_and_advertises_nothing() -> TestResult {
         // Der eigentliche Zweck von `NoTools` (siehe Begründung bei
         // `RegistryProfile::NoTools`): eine Rolle mit `[tools].admitted = []`
         // darf kein Werkzeug im System-Prompt-Inventar sehen, das sie nicht
         // aufrufen darf.
-        let assembled = assemble(RegistryProfile::NoTools);
+        let assembled = assemble(RegistryProfile::NoTools)?;
         assert!(registered_names(&assembled).is_empty());
         assert!(assembled.identity.tools_available.is_empty());
         assert!(RegistryProfile::NoTools.is_read_only());
+        Ok(())
     }
 
     /// Fängt genau den Befund dieses Knotens ab, falls er sich wiederholt:
@@ -3013,6 +3085,10 @@ mod tests {
 
     mod permits_wiring {
         use super::*;
+        // Aliasiert, weil jeder Test unten seine `ToolExecutionContext` lokal
+        // `ctx` nennt (siehe `make_ctx`) — das würde die Hilfsfunktion
+        // `crate::test_support::ctx` sonst nach dem `let ctx = …` verdecken.
+        use crate::test_support::ctx as with_ctx;
         use harw_authority::{Permission, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
         use harw_tools::{ToolCall, ToolExecutionContext, ToolOutput};
         use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
@@ -3021,9 +3097,12 @@ mod tests {
         /// Baut eine eigenständige Workspace-Sandbox (unabhängig vom
         /// `ProjectContext`, den `discover_project` liefert) mit genau dem
         /// übergebenen Rechtesatz.
-        fn make_sandbox(dir: &std::path::Path, permissions: Vec<Permission>) -> SandboxSpec {
+        fn make_sandbox(
+            dir: &std::path::Path,
+            permissions: Vec<Permission>,
+        ) -> TestResult<SandboxSpec> {
             let ws_subdir = dir.join("project");
-            std::fs::create_dir_all(&ws_subdir).expect("project subdir must be created");
+            std::fs::create_dir_all(&ws_subdir).map_err(ctx("project subdir must be created"))?;
             let registry = WorkspaceRegistry::build(
                 dir,
                 [WorkspaceRegistration {
@@ -3032,14 +3111,17 @@ mod tests {
                     root: ws_subdir,
                 }],
             )
-            .expect("registry build must succeed");
+            .map_err(ctx("registry build must succeed"))?;
             let binding = registry
                 .resolve(
                     &TenantId::from_str("test-tenant"),
                     &WorkspaceId::from_str("project"),
                 )
-                .expect("resolve must succeed");
-            SandboxSpec::from_resolved(binding, PermissionSet::from_policy(permissions))
+                .map_err(ctx("resolve must succeed"))?;
+            Ok(SandboxSpec::from_resolved(
+                binding,
+                PermissionSet::from_policy(permissions),
+            ))
         }
 
         fn make_ctx(sandbox: SandboxSpec) -> ToolExecutionContext {
@@ -3077,9 +3159,9 @@ mod tests {
             sandbox_profile: &SandboxProfile,
             host_permits: Option<HostPermitWiring>,
             project_root: &std::path::Path,
-        ) -> Arc<dyn ToolExecutor> {
+        ) -> TestResult<Arc<dyn ToolExecutor>> {
             let project = discover_project(project_root, &DiscoveryConfig::default())
-                .expect("Discovery im Tempdir");
+                .map_err(ctx("Discovery im Tempdir"))?;
             let granted = PermissionSet::from_policy([Permission::ExecuteProcess]);
             let assembled = assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits(
                 RegistryProfile::ShellExecution,
@@ -3091,13 +3173,15 @@ mod tests {
                 sandbox_profile,
                 host_permits,
             )
-            .expect("assemble must succeed");
+            .map_err(ctx("assemble must succeed"))?;
             assembled
                 .registry
                 .tool_providers()
                 .iter()
                 .find_map(|provider| provider.executor(&ToolName::new("shell.exec")))
-                .expect("shell.exec executor must be registered for ShellExecution")
+                .ok_or(TestError::Missing(
+                    "shell.exec executor must be registered for ShellExecution",
+                ))
         }
 
         /// Wie [`shell_executor_for`], aber für
@@ -3111,13 +3195,11 @@ mod tests {
         fn uia_shell_worker_executor_for(
             host_permits: Option<HostPermitWiring>,
             project_root: &std::path::Path,
-        ) -> Arc<dyn ToolExecutor> {
+        ) -> TestResult<Arc<dyn ToolExecutor>> {
             let project = discover_project(project_root, &DiscoveryConfig::default())
-                .expect("Discovery im Tempdir");
-            let granted = PermissionSet::from_policy([
-                Permission::ReadWorkspace,
-                Permission::ExecuteProcess,
-            ]);
+                .map_err(ctx("Discovery im Tempdir"))?;
+            let granted =
+                PermissionSet::from_policy([Permission::ReadWorkspace, Permission::ExecuteProcess]);
             let assembled = assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits(
                 RegistryProfile::UiaShellWorker,
                 &project,
@@ -3128,13 +3210,15 @@ mod tests {
                 &SandboxProfile::Strict,
                 host_permits,
             )
-            .expect("assemble must succeed");
+            .map_err(ctx("assemble must succeed"))?;
             assembled
                 .registry
                 .tool_providers()
                 .iter()
                 .find_map(|provider| provider.executor(&ToolName::new("shell.exec")))
-                .expect("shell.exec executor must be registered for UiaShellWorker")
+                .ok_or(TestError::Missing(
+                    "shell.exec executor must be registered for UiaShellWorker",
+                ))
         }
 
         /// `RegistryProfile::UiaShellWorker` trägt `SandboxProfile::Host` immer
@@ -3142,17 +3226,18 @@ mod tests {
         /// übergibt — und lehnt deshalb ohne Ledger jede Ausführung ab
         /// (fail-closed).
         #[tokio::test]
-        async fn test_uia_shell_worker_always_carries_host_profile_and_denies_without_ledger() {
-            let project_root = make_temp_project("uia-shell-worker-no-ledger");
-            let executor = uia_shell_worker_executor_for(None, &project_root);
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess]));
+        async fn test_uia_shell_worker_always_carries_host_profile_and_denies_without_ledger()
+        -> TestResult {
+            let project_root = make_temp_project("uia-shell-worker-no-ledger")?;
+            let executor = uia_shell_worker_executor_for(None, &project_root)?;
+            let tmp = tempfile::tempdir().map_err(with_ctx("tempdir"))?;
+            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess])?);
             let call = make_call("echo must_not_run");
 
             let output = executor
                 .execute(&ctx, &call)
                 .await
-                .expect("execute must not return Err");
+                .map_err(with_ctx("execute must not return Err"))?;
 
             match output {
                 ToolOutput::Error { message } => {
@@ -3162,29 +3247,34 @@ mod tests {
                          sandbox_profile passed to assembly was Strict, got: {message:?}"
                     );
                 }
-                other => panic!("expected Error output without permits, got: {other:?}"),
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "expected Error output without permits, got: {other:?}"
+                    )));
+                }
             }
+            Ok(())
         }
 
         /// Mit Ledger, aber ohne Sitzungszustimmung bleibt `uia-shell-worker`
         /// ebenfalls fail-closed.
         #[tokio::test]
-        async fn test_uia_shell_worker_denies_without_session_approval() {
-            let project_root = make_temp_project("uia-shell-worker-no-approval");
+        async fn test_uia_shell_worker_denies_without_session_approval() -> TestResult {
+            let project_root = make_temp_project("uia-shell-worker-no-approval")?;
             let ledger = Arc::new(ProcessPermitLedger::default());
             let registry = Arc::new(HostPermitSessionRegistry::default());
             let executor = uia_shell_worker_executor_for(
                 Some(wiring_with_closed_channel(ledger, registry)),
                 &project_root,
-            );
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess]));
+            )?;
+            let tmp = tempfile::tempdir().map_err(with_ctx("tempdir"))?;
+            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess])?);
             let call = make_call("echo must_not_run");
 
             let output = executor
                 .execute(&ctx, &call)
                 .await
-                .expect("execute must not return Err");
+                .map_err(with_ctx("execute must not return Err"))?;
 
             match output {
                 ToolOutput::Error { message } => {
@@ -3194,22 +3284,27 @@ mod tests {
                          missing approval, got: {message:?}"
                     );
                 }
-                other => panic!("expected Error output without session approval, got: {other:?}"),
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "expected Error output without session approval, got: {other:?}"
+                    )));
+                }
             }
+            Ok(())
         }
 
         #[tokio::test]
-        async fn test_and_permits_none_denies_host_execution() {
-            let project_root = make_temp_project("permits-none");
-            let executor = shell_executor_for(&SandboxProfile::Host, None, &project_root);
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess]));
+        async fn test_and_permits_none_denies_host_execution() -> TestResult {
+            let project_root = make_temp_project("permits-none")?;
+            let executor = shell_executor_for(&SandboxProfile::Host, None, &project_root)?;
+            let tmp = tempfile::tempdir().map_err(with_ctx("tempdir"))?;
+            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess])?);
             let call = make_call("echo must_not_run");
 
             let output = executor
                 .execute(&ctx, &call)
                 .await
-                .expect("execute must not return Err");
+                .map_err(with_ctx("execute must not return Err"))?;
 
             match output {
                 ToolOutput::Error { message } => {
@@ -3218,28 +3313,33 @@ mod tests {
                         "without host_permits the Host profile must fail closed, got: {message:?}"
                     );
                 }
-                other => panic!("expected Error output without permits, got: {other:?}"),
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "expected Error output without permits, got: {other:?}"
+                    )));
+                }
             }
+            Ok(())
         }
 
         #[tokio::test]
-        async fn test_and_permits_configured_but_session_not_approved_denies() {
-            let project_root = make_temp_project("permits-no-approval");
+        async fn test_and_permits_configured_but_session_not_approved_denies() -> TestResult {
+            let project_root = make_temp_project("permits-no-approval")?;
             let ledger = Arc::new(ProcessPermitLedger::default());
             let registry = Arc::new(HostPermitSessionRegistry::default());
             let executor = shell_executor_for(
                 &SandboxProfile::Host,
                 Some(wiring_with_closed_channel(ledger, registry)),
                 &project_root,
-            );
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess]));
+            )?;
+            let tmp = tempfile::tempdir().map_err(with_ctx("tempdir"))?;
+            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess])?);
             let call = make_call("echo must_not_run");
 
             let output = executor
                 .execute(&ctx, &call)
                 .await
-                .expect("execute must not return Err");
+                .map_err(with_ctx("execute must not return Err"))?;
 
             match output {
                 ToolOutput::Error { message } => {
@@ -3249,13 +3349,19 @@ mod tests {
                          missing approval, got: {message:?}"
                     );
                 }
-                other => panic!("expected Error output without session approval, got: {other:?}"),
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "expected Error output without session approval, got: {other:?}"
+                    )));
+                }
             }
+            Ok(())
         }
 
         #[tokio::test]
-        async fn test_and_permits_configured_and_session_approved_passes_permit_boundary() {
-            let project_root = make_temp_project("permits-approved");
+        async fn test_and_permits_configured_and_session_approved_passes_permit_boundary()
+        -> TestResult {
+            let project_root = make_temp_project("permits-approved")?;
             let ledger = Arc::new(ProcessPermitLedger::default());
             let registry = Arc::new(HostPermitSessionRegistry::default());
             let executor = shell_executor_for(
@@ -3265,16 +3371,16 @@ mod tests {
                     Arc::clone(&registry),
                 )),
                 &project_root,
-            );
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess]));
+            )?;
+            let tmp = tempfile::tempdir().map_err(with_ctx("tempdir"))?;
+            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess])?);
             registry.mark_session_approved(ctx.session_id().as_str(), Duration::from_secs(60));
             let call = make_call("echo host_ok");
 
             let output = executor
                 .execute(&ctx, &call)
                 .await
-                .expect("execute must not return Err");
+                .map_err(with_ctx("execute must not return Err"))?;
 
             // Der Permit-Grenzfehler darf nach der Zustimmung nicht mehr
             // auftreten; ein verbleibender Fehler darf nur noch von der
@@ -3289,10 +3395,12 @@ mod tests {
                 }
                 ToolOutput::Json { .. } | ToolOutput::Text { .. } => {}
             }
+            Ok(())
         }
 
         #[tokio::test]
-        async fn test_and_permits_without_active_approval_runs_in_sandbox_for_non_host_profile() {
+        async fn test_and_permits_without_active_approval_runs_in_sandbox_for_non_host_profile()
+        -> TestResult {
             // Der Registry-Eintrag wird jetzt auch an ein
             // `SandboxProfile::Strict`-Provider gehängt (Nutzerwunsch „volle
             // Sandbox-Deaktivierung“ — siehe `build_shell_provider`), aber
@@ -3301,22 +3409,22 @@ mod tests {
             // deshalb nie mit einer Permit-Fehlermeldung scheitern (der
             // Ledger wird für Strict nie befragt, nur die Registry — und die
             // meldet hier keine Freigabe).
-            let project_root = make_temp_project("permits-strict-no-approval");
+            let project_root = make_temp_project("permits-strict-no-approval")?;
             let ledger = Arc::new(ProcessPermitLedger::default());
             let registry = Arc::new(HostPermitSessionRegistry::default());
             let executor = shell_executor_for(
                 &SandboxProfile::Strict,
                 Some(wiring_with_closed_channel(ledger, registry)),
                 &project_root,
-            );
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess]));
+            )?;
+            let tmp = tempfile::tempdir().map_err(with_ctx("tempdir"))?;
+            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess])?);
             let call = make_call("echo strict_mode_ok");
 
             let output = executor
                 .execute(&ctx, &call)
                 .await
-                .expect("execute must not return Err");
+                .map_err(with_ctx("execute must not return Err"))?;
 
             match &output {
                 ToolOutput::Error { message } => {
@@ -3336,6 +3444,7 @@ mod tests {
                 }
                 ToolOutput::Text { .. } => {}
             }
+            Ok(())
         }
 
         /// Beweist die eigentliche Behebung dieses Auftrags: ein
@@ -3347,8 +3456,9 @@ mod tests {
         /// `determine_effective_host` für Strict immer `false` lieferte, egal
         /// welche Freigabe in der Registry stand.
         #[tokio::test]
-        async fn test_and_permits_with_active_session_approval_runs_on_host_for_strict_profile() {
-            let project_root = make_temp_project("permits-strict-approved");
+        async fn test_and_permits_with_active_session_approval_runs_on_host_for_strict_profile()
+        -> TestResult {
+            let project_root = make_temp_project("permits-strict-approved")?;
             let ledger = Arc::new(ProcessPermitLedger::default());
             let registry = Arc::new(HostPermitSessionRegistry::default());
             let executor = shell_executor_for(
@@ -3358,16 +3468,16 @@ mod tests {
                     Arc::clone(&registry),
                 )),
                 &project_root,
-            );
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess]));
+            )?;
+            let tmp = tempfile::tempdir().map_err(with_ctx("tempdir"))?;
+            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess])?);
             registry.mark_session_approved(ctx.session_id().as_str(), Duration::from_secs(60));
             let call = make_call("echo strict_lease_ok");
 
             let output = executor
                 .execute(&ctx, &call)
                 .await
-                .expect("execute must not return Err");
+                .map_err(with_ctx("execute must not return Err"))?;
 
             match &output {
                 ToolOutput::Json { content } => {
@@ -3377,10 +3487,13 @@ mod tests {
                          shell.exec call on the host, got: {content}"
                     );
                 }
-                other => panic!(
-                    "expected a successful host-executed JSON output, got: {other:?}"
-                ),
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "expected a successful host-executed JSON output, got: {other:?}"
+                    )));
+                }
             }
+            Ok(())
         }
 
         /// Beweist die eigentliche Ergänzung dieses Auftrags: `HostPermitWiring`
@@ -3394,17 +3507,20 @@ mod tests {
         /// die Ausführung die Permit-Grenze passieren.
         #[tokio::test]
         async fn test_prompt_sender_reaches_shell_provider_and_a_live_approval_passes_the_permit_boundary()
-        {
-            let project_root = make_temp_project("permits-prompt-sender-wired");
+        -> TestResult {
+            let project_root = make_temp_project("permits-prompt-sender-wired")?;
             let ledger = Arc::new(ProcessPermitLedger::default());
             let registry = Arc::new(HostPermitSessionRegistry::default());
             let (sender, mut receiver) = harw_tool_shell::host_permit_prompt_channel();
             let wiring = HostPermitWiring::new(ledger, registry, sender)
                 .with_preselected_variant(HostPermitVariant::SingleExecution);
-            let executor = shell_executor_for(&SandboxProfile::Host, Some(wiring), &project_root);
+            let executor = shell_executor_for(&SandboxProfile::Host, Some(wiring), &project_root)?;
 
-            let approver = tokio::spawn(async move {
-                let prompt = receiver.recv().await.expect("prompt must arrive at the receiver");
+            let approver: tokio::task::JoinHandle<TestResult> = tokio::spawn(async move {
+                let prompt = receiver
+                    .recv()
+                    .await
+                    .ok_or(TestError::Missing("prompt must arrive at the receiver"))?;
                 assert_eq!(
                     prompt.preselected_variant(),
                     HostPermitVariant::SingleExecution,
@@ -3414,17 +3530,20 @@ mod tests {
                     prompt.approve(HostPermitVariant::SingleExecution),
                     "the approval must reach the waiting ShellExecutor"
                 );
+                Ok(())
             });
 
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess]));
+            let tmp = tempfile::tempdir().map_err(with_ctx("tempdir"))?;
+            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess])?);
             let call = make_call("echo prompt_sender_wired");
 
             let output = executor
                 .execute(&ctx, &call)
                 .await
-                .expect("execute must not return Err");
-            approver.await.expect("approver task must not panic");
+                .map_err(with_ctx("execute must not return Err"))?;
+            approver
+                .await
+                .map_err(with_ctx("approver task must not panic"))??;
 
             match &output {
                 ToolOutput::Error { message } => {
@@ -3436,6 +3555,7 @@ mod tests {
                 }
                 ToolOutput::Json { .. } | ToolOutput::Text { .. } => {}
             }
+            Ok(())
         }
     }
 }

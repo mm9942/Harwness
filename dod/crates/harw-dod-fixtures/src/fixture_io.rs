@@ -171,6 +171,7 @@ pub(crate) fn reading_to_json(reading: &SensorReading) -> FixturesResult<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_types::SensorId;
 
     fn sample_reading() -> SensorReading {
@@ -186,39 +187,57 @@ mod tests {
     }
 
     #[test]
-    fn test_write_then_read_round_trips_reading() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_write_then_read_round_trips_reading() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         write_expected(dir.path(), Timestamp::UNIX_EPOCH, &sample_reading())
-            .expect("write_expected muss gelingen");
+            .map_err(ctx("write_expected muss gelingen"))?;
 
-        let parsed = read_expected(dir.path()).expect("read_expected muss gelingen");
+        let parsed = read_expected(dir.path()).map_err(ctx("read_expected muss gelingen"))?;
         assert_eq!(parsed.now, Timestamp::UNIX_EPOCH);
         assert_eq!(parsed.reading.into_reading(), sample_reading());
+        Ok(())
     }
 
     #[test]
-    fn test_read_expected_missing_file_is_io_error() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let err = read_expected(dir.path()).expect_err("fehlende Datei muss scheitern");
+    fn test_read_expected_missing_file_is_io_error() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let err = match read_expected(dir.path()) {
+            Err(e) => e,
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "fehlende Datei muss scheitern".into(),
+                ));
+            }
+        };
         assert!(matches!(err, crate::error::FixturesError::Io(_)));
+        Ok(())
     }
 
     #[test]
-    fn test_read_expected_rejects_unknown_field() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_read_expected_rejects_unknown_field() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         std::fs::write(
             dir.path().join(EXPECT_FILE_NAME),
             r#"{"now":"1970-01-01T00:00:00Z","reading":{"samples":[],"events":[]},"extra":true}"#,
         )
-        .expect("write");
+        .map_err(ctx("write"))?;
 
-        let err = read_expected(dir.path()).expect_err("unbekanntes Feld muss scheitern");
+        let err = match read_expected(dir.path()) {
+            Err(e) => e,
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "unbekanntes Feld muss scheitern".into(),
+                ));
+            }
+        };
         assert!(matches!(err, crate::error::FixturesError::Json(_)));
+        Ok(())
     }
 
     #[test]
-    fn test_reading_to_json_contains_metric_name() {
-        let json = reading_to_json(&sample_reading()).expect("serialisiert");
+    fn test_reading_to_json_contains_metric_name() -> TestResult {
+        let json = reading_to_json(&sample_reading()).map_err(ctx("serialisiert"))?;
         assert!(json.contains("temperature_celsius"));
+        Ok(())
     }
 }

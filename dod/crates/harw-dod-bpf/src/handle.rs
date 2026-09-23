@@ -140,6 +140,7 @@ impl BpfHandle {
 mod tests {
     use super::BpfHandle;
     use crate::spec::BpfProgramKind;
+    use crate::test_support::{TestError, TestResult};
     use harw_types::SensorId;
 
     #[test]
@@ -156,30 +157,51 @@ mod tests {
 
     #[test]
     fn test_new_assigns_distinct_ids_across_calls() {
-        let a = BpfHandle::new(SensorId::from_str("s"), BpfProgramKind::KProbe, "do_sys_open");
-        let b = BpfHandle::new(SensorId::from_str("s"), BpfProgramKind::KProbe, "do_sys_open");
+        let a = BpfHandle::new(
+            SensorId::from_str("s"),
+            BpfProgramKind::KProbe,
+            "do_sys_open",
+        );
+        let b = BpfHandle::new(
+            SensorId::from_str("s"),
+            BpfProgramKind::KProbe,
+            "do_sys_open",
+        );
         assert_ne!(a.id(), b.id());
     }
 
     #[test]
-    fn test_new_assigns_distinct_ids_under_concurrent_construction() {
-        let handles: Vec<BpfHandle> = std::thread::scope(|scope| {
+    fn test_new_assigns_distinct_ids_under_concurrent_construction() -> TestResult {
+        let handles: Vec<BpfHandle> = std::thread::scope(|scope| -> TestResult<Vec<BpfHandle>> {
             let threads: Vec<_> = (0..8)
                 .map(|_| {
                     scope.spawn(|| {
-                        BpfHandle::new(SensorId::from_str("s"), BpfProgramKind::SocketFilter, "eth0")
+                        BpfHandle::new(
+                            SensorId::from_str("s"),
+                            BpfProgramKind::SocketFilter,
+                            "eth0",
+                        )
                     })
                 })
                 .collect();
             threads
                 .into_iter()
-                .map(|t| t.join().expect("handle-construction thread must not panic"))
+                .map(|t| {
+                    t.join().map_err(|_| {
+                        TestError::Unexpected("handle-construction thread panicked".into())
+                    })
+                })
                 .collect()
-        });
+        })?;
 
         let mut ids: Vec<u64> = handles.iter().map(BpfHandle::id).collect();
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), handles.len(), "all concurrently created ids must be distinct");
+        assert_eq!(
+            ids.len(),
+            handles.len(),
+            "all concurrently created ids must be distinct"
+        );
+        Ok(())
     }
 }

@@ -185,14 +185,18 @@ impl NetworkIsolator for UnimplementedNetworkIsolator {
 #[cfg(test)]
 mod tests {
     use super::UnimplementedNetworkIsolator;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_dod_warden::{NetworkIsolator, WardenError};
     use harw_types::CgroupId;
 
     #[test]
-    fn test_isolate_always_fails_without_touching_the_network() {
+    fn test_isolate_always_fails_without_touching_the_network() -> TestResult {
         let isolator = UnimplementedNetworkIsolator::new();
-        let cgroup = CgroupId::try_from_str("cgroup-1").expect("non-empty id");
-        let err = isolator.isolate(&cgroup).unwrap_err();
+        let cgroup = CgroupId::try_from_str("cgroup-1").map_err(ctx("non-empty id"))?;
+        let Err(err) = isolator.isolate(&cgroup) else {
+            return Err(TestError::Unexpected("isolate must always fail".to_owned()));
+        };
         assert!(matches!(err, WardenError::Io(_)));
+        Ok(())
     }
 }

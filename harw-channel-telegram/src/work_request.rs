@@ -438,7 +438,12 @@ impl WorkRequestStore {
     /// (see module docs' "Audit" section). Best-effort: a journal write
     /// failure is logged, never returned, since the durable lifecycle
     /// mutation this audits has already succeeded.
-    fn record_command_audit(&self, action: &'static str, now: Timestamp, record: &WorkRequestRecord) {
+    fn record_command_audit(
+        &self,
+        action: &'static str,
+        now: Timestamp,
+        record: &WorkRequestRecord,
+    ) {
         let body = serde_json::json!({
             "event": "channel.command",
             "action": action,
@@ -498,9 +503,14 @@ fn transition_action(next: WorkRequestState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_authority::{WorkspaceRegistration, WorkspaceRegistry};
 
-    fn registry(tenant: &TenantId, workspace: &WorkspaceId, root: &Path) -> WorkspaceRegistry {
+    fn registry(
+        tenant: &TenantId,
+        workspace: &WorkspaceId,
+        root: &Path,
+    ) -> TestResult<WorkspaceRegistry> {
         WorkspaceRegistry::build(
             root,
             [WorkspaceRegistration {
@@ -509,16 +519,16 @@ mod tests {
                 root: PathBuf::from("."),
             }],
         )
-        .expect("registry builds")
+        .map_err(ctx("registry builds"))
     }
 
     #[test]
-    fn submit_resolves_workspace_and_persists_requested_state() {
-        let harness = tempfile::tempdir().expect("harness dir");
-        let store_dir = tempfile::tempdir().expect("store dir");
+    fn submit_resolves_workspace_and_persists_requested_state() -> TestResult {
+        let harness = tempfile::tempdir().map_err(ctx("harness dir"))?;
+        let store_dir = tempfile::tempdir().map_err(ctx("store dir"))?;
         let tenant = TenantId::from_str("ops");
         let workspace = WorkspaceId::from_str("ops-room");
-        let registry = registry(&tenant, &workspace, harness.path());
+        let registry = registry(&tenant, &workspace, harness.path())?;
         let store = WorkRequestStore::new(store_dir.path());
 
         let record = store
@@ -533,23 +543,29 @@ mod tests {
                 &registry,
                 Timestamp::now(),
             )
-            .expect("submit succeeds");
+            .map_err(ctx("submit succeeds"))?;
 
         assert_eq!(record.state, WorkRequestState::Requested);
         assert_eq!(record.workspace, workspace);
         assert_eq!(record.task_digest, task_digest("fix the failing test"));
         assert_eq!(
-            store.get(&record.work_id).unwrap().unwrap().work_id,
+            store
+                .get(&record.work_id)
+                .map_err(ctx("get record"))?
+                .ok_or(TestError::Missing("record"))?
+                .work_id,
             record.work_id
         );
+        Ok(())
     }
 
     #[test]
-    fn submit_fails_closed_for_unresolved_workspace_alias() {
-        let harness = tempfile::tempdir().expect("harness dir");
-        let store_dir = tempfile::tempdir().expect("store dir");
+    fn submit_fails_closed_for_unresolved_workspace_alias() -> TestResult {
+        let harness = tempfile::tempdir().map_err(ctx("harness dir"))?;
+        let store_dir = tempfile::tempdir().map_err(ctx("store dir"))?;
         let tenant = TenantId::from_str("ops");
-        let registry = WorkspaceRegistry::build(harness.path(), []).expect("empty registry");
+        let registry =
+            WorkspaceRegistry::build(harness.path(), []).map_err(ctx("empty registry"))?;
         let store = WorkRequestStore::new(store_dir.path());
 
         let result = store.submit(
@@ -568,15 +584,16 @@ mod tests {
             result,
             Err(TelegramChannelError::WorkspaceUnresolved { alias, .. }) if alias == "unknown-room"
         ));
+        Ok(())
     }
 
     #[test]
-    fn submit_rejects_whitespace_role() {
-        let harness = tempfile::tempdir().expect("harness dir");
-        let store_dir = tempfile::tempdir().expect("store dir");
+    fn submit_rejects_whitespace_role() -> TestResult {
+        let harness = tempfile::tempdir().map_err(ctx("harness dir"))?;
+        let store_dir = tempfile::tempdir().map_err(ctx("store dir"))?;
         let tenant = TenantId::from_str("ops");
         let workspace = WorkspaceId::from_str("ops-room");
-        let registry = registry(&tenant, &workspace, harness.path());
+        let registry = registry(&tenant, &workspace, harness.path())?;
         let store = WorkRequestStore::new(store_dir.path());
 
         let result = store.submit(
@@ -595,15 +612,16 @@ mod tests {
             result,
             Err(TelegramChannelError::InvalidWorkRequestRole { role }) if role == "not a role"
         ));
+        Ok(())
     }
 
     #[test]
-    fn full_lifecycle_review_approve_reports_launch_not_yet_available() {
-        let harness = tempfile::tempdir().expect("harness dir");
-        let store_dir = tempfile::tempdir().expect("store dir");
+    fn full_lifecycle_review_approve_reports_launch_not_yet_available() -> TestResult {
+        let harness = tempfile::tempdir().map_err(ctx("harness dir"))?;
+        let store_dir = tempfile::tempdir().map_err(ctx("store dir"))?;
         let tenant = TenantId::from_str("ops");
         let workspace = WorkspaceId::from_str("ops-room");
-        let registry = registry(&tenant, &workspace, harness.path());
+        let registry = registry(&tenant, &workspace, harness.path())?;
         let store = WorkRequestStore::new(store_dir.path());
         let now = Timestamp::now();
 
@@ -619,30 +637,41 @@ mod tests {
                 &registry,
                 now,
             )
-            .expect("submit");
+            .map_err(ctx("submit"))?;
 
-        let review = store.review(&record.work_id, now).expect("review");
+        let review = store.review(&record.work_id, now).map_err(ctx("review"))?;
         assert!(review.contains("ops-room"));
         assert_eq!(
-            store.get(&record.work_id).unwrap().unwrap().state,
+            store
+                .get(&record.work_id)
+                .map_err(ctx("get record"))?
+                .ok_or(TestError::Missing("record"))?
+                .state,
             WorkRequestState::UnderReview
         );
 
-        let approve = store.approve(&record.work_id, now).expect("approve");
+        let approve = store
+            .approve(&record.work_id, now)
+            .map_err(ctx("approve"))?;
         assert!(approve.contains("not yet available"));
         assert_eq!(
-            store.get(&record.work_id).unwrap().unwrap().state,
+            store
+                .get(&record.work_id)
+                .map_err(ctx("get record"))?
+                .ok_or(TestError::Missing("record"))?
+                .state,
             WorkRequestState::Approved
         );
+        Ok(())
     }
 
     #[test]
-    fn deny_after_approve_is_an_invalid_transition() {
-        let harness = tempfile::tempdir().expect("harness dir");
-        let store_dir = tempfile::tempdir().expect("store dir");
+    fn deny_after_approve_is_an_invalid_transition() -> TestResult {
+        let harness = tempfile::tempdir().map_err(ctx("harness dir"))?;
+        let store_dir = tempfile::tempdir().map_err(ctx("store dir"))?;
         let tenant = TenantId::from_str("ops");
         let workspace = WorkspaceId::from_str("ops-room");
-        let registry = registry(&tenant, &workspace, harness.path());
+        let registry = registry(&tenant, &workspace, harness.path())?;
         let store = WorkRequestStore::new(store_dir.path());
         let now = Timestamp::now();
 
@@ -658,24 +687,27 @@ mod tests {
                 &registry,
                 now,
             )
-            .expect("submit");
-        store.review(&record.work_id, now).expect("review");
-        store.approve(&record.work_id, now).expect("approve");
+            .map_err(ctx("submit"))?;
+        store.review(&record.work_id, now).map_err(ctx("review"))?;
+        store
+            .approve(&record.work_id, now)
+            .map_err(ctx("approve"))?;
 
         let result = store.deny(&record.work_id, now);
         assert!(matches!(
             result,
             Err(TelegramChannelError::WorkRequestInvalidTransition { from, .. }) if from == "approved"
         ));
+        Ok(())
     }
 
     #[test]
-    fn cancel_after_approve_succeeds() {
-        let harness = tempfile::tempdir().expect("harness dir");
-        let store_dir = tempfile::tempdir().expect("store dir");
+    fn cancel_after_approve_succeeds() -> TestResult {
+        let harness = tempfile::tempdir().map_err(ctx("harness dir"))?;
+        let store_dir = tempfile::tempdir().map_err(ctx("store dir"))?;
         let tenant = TenantId::from_str("ops");
         let workspace = WorkspaceId::from_str("ops-room");
-        let registry = registry(&tenant, &workspace, harness.path());
+        let registry = registry(&tenant, &workspace, harness.path())?;
         let store = WorkRequestStore::new(store_dir.path());
         let now = Timestamp::now();
 
@@ -691,21 +723,28 @@ mod tests {
                 &registry,
                 now,
             )
-            .expect("submit");
-        store.review(&record.work_id, now).expect("review");
-        store.approve(&record.work_id, now).expect("approve");
+            .map_err(ctx("submit"))?;
+        store.review(&record.work_id, now).map_err(ctx("review"))?;
+        store
+            .approve(&record.work_id, now)
+            .map_err(ctx("approve"))?;
 
-        let cancelled = store.cancel(&record.work_id, now).expect("cancel");
+        let cancelled = store.cancel(&record.work_id, now).map_err(ctx("cancel"))?;
         assert!(cancelled.starts_with("Cancelled"));
         assert_eq!(
-            store.get(&record.work_id).unwrap().unwrap().state,
+            store
+                .get(&record.work_id)
+                .map_err(ctx("get record"))?
+                .ok_or(TestError::Missing("record"))?
+                .state,
             WorkRequestState::Cancelled
         );
+        Ok(())
     }
 
     #[test]
-    fn unknown_work_id_is_reported_not_found() {
-        let store_dir = tempfile::tempdir().expect("store dir");
+    fn unknown_work_id_is_reported_not_found() -> TestResult {
+        let store_dir = tempfile::tempdir().map_err(ctx("store dir"))?;
         let store = WorkRequestStore::new(store_dir.path());
         let missing = WorkId::from_str("missing-work-id");
 
@@ -713,10 +752,11 @@ mod tests {
             store.review(&missing, Timestamp::now()),
             Err(TelegramChannelError::WorkRequestNotFound { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn launch_sandboxed_worker_reports_not_yet_available() {
+    fn launch_sandboxed_worker_reports_not_yet_available() -> TestResult {
         let record = WorkRequestRecord {
             work_id: WorkId::new(),
             channel: ChannelId::from_str("telegram:ops"),
@@ -735,5 +775,6 @@ mod tests {
             launch_sandboxed_worker(&record),
             Err(TelegramChannelError::LaunchNotYetAvailable { work_id }) if work_id == record.work_id
         ));
+        Ok(())
     }
 }

@@ -150,6 +150,7 @@ fn rejected(reason: impl Into<String>) -> TelegramTransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
     const PDF: &[u8] = b"%PDF-1.7\n";
@@ -159,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_signature_and_keeps_safe_metadata() {
+    fn accepts_signature_and_keeps_safe_metadata() -> TestResult {
         let attachment = intake(64, "image/png")
             .validate(
                 Some(PNG.len() as u64),
@@ -167,80 +168,106 @@ mod tests {
                 Some("/tmp/telegram/image.png"),
                 PNG.to_vec(),
             )
-            .expect("PNG signature should be accepted");
+            .map_err(ctx("PNG signature should be accepted"))?;
 
         assert_eq!(attachment.bytes(), PNG);
         assert_eq!(attachment.sniffed_mime(), "image/png");
         assert_eq!(attachment.file_name(), Some("image.png"));
+        Ok(())
     }
 
     #[test]
-    fn rejects_declared_oversize_before_content_validation() {
-        let error = intake(PNG.len(), "image/png")
-            .validate(Some((PNG.len() + 1) as u64), None, None, Vec::new())
-            .expect_err("declared oversize must be rejected before download");
+    fn rejects_declared_oversize_before_content_validation() -> TestResult {
+        let Err(error) = intake(PNG.len(), "image/png").validate(
+            Some((PNG.len() + 1) as u64),
+            None,
+            None,
+            Vec::new(),
+        ) else {
+            return Err(TestError::Unexpected(
+                "declared oversize must be rejected before download".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
             TelegramTransportError::AttachmentRejected { .. }
         ));
+        Ok(())
     }
 
     #[test]
-    fn rejects_actual_oversize_after_download() {
-        let error = intake(PNG.len() - 1, "image/png")
-            .validate(Some((PNG.len() - 1) as u64), None, None, PNG.to_vec())
-            .expect_err("actual oversize must be rejected");
+    fn rejects_actual_oversize_after_download() -> TestResult {
+        let Err(error) = intake(PNG.len() - 1, "image/png").validate(
+            Some((PNG.len() - 1) as u64),
+            None,
+            None,
+            PNG.to_vec(),
+        ) else {
+            return Err(TestError::Unexpected(
+                "actual oversize must be rejected".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
             TelegramTransportError::AttachmentRejected { .. }
         ));
+        Ok(())
     }
 
     #[test]
-    fn rejects_reported_mime_mismatch() {
-        let error = intake(64, "image/png")
-            .validate(
-                Some(PDF.len() as u64),
-                Some("image/png"),
-                None,
-                PDF.to_vec(),
-            )
-            .expect_err("reported MIME must not override sniffed MIME");
+    fn rejects_reported_mime_mismatch() -> TestResult {
+        let Err(error) = intake(64, "image/png").validate(
+            Some(PDF.len() as u64),
+            Some("image/png"),
+            None,
+            PDF.to_vec(),
+        ) else {
+            return Err(TestError::Unexpected(
+                "reported MIME must not override sniffed MIME".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
             TelegramTransportError::AttachmentRejected { .. }
         ));
+        Ok(())
     }
 
     #[test]
-    fn rejects_sniffed_mime_outside_allowlist() {
-        let error = intake(64, "image/png")
-            .validate(
-                Some(PDF.len() as u64),
-                Some("application/pdf"),
-                None,
-                PDF.to_vec(),
-            )
-            .expect_err("sniffed MIME must be allowlisted");
+    fn rejects_sniffed_mime_outside_allowlist() -> TestResult {
+        let Err(error) = intake(64, "image/png").validate(
+            Some(PDF.len() as u64),
+            Some("application/pdf"),
+            None,
+            PDF.to_vec(),
+        ) else {
+            return Err(TestError::Unexpected(
+                "sniffed MIME must be allowlisted".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
             TelegramTransportError::AttachmentRejected { .. }
         ));
+        Ok(())
     }
 
     #[test]
-    fn rejects_empty_attachment() {
-        let error = intake(64, "image/png")
-            .validate(Some(0), None, None, Vec::new())
-            .expect_err("empty attachments must be rejected");
+    fn rejects_empty_attachment() -> TestResult {
+        let Err(error) = intake(64, "image/png").validate(Some(0), None, None, Vec::new()) else {
+            return Err(TestError::Unexpected(
+                "empty attachments must be rejected".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
             TelegramTransportError::AttachmentRejected { .. }
         ));
+        Ok(())
     }
 }

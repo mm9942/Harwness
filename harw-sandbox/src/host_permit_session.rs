@@ -499,8 +499,7 @@ impl HostPermitSessionRegistry {
         let Ok(state) = self.state.lock() else {
             return false;
         };
-        state.global_single_use
-            || state.single_use.iter().any(|existing| existing == session)
+        state.global_single_use || state.single_use.iter().any(|existing| existing == session)
     }
 
     /// Entfernt sowohl die Sitzungsfreigabe (siehe
@@ -799,7 +798,10 @@ impl HostPermitSessionRegistry {
 /// Entfernt eine bereits abgelaufene globale Freigabe aus `state`, ohne die
 /// Sperre erneut zu nehmen (der Aufrufer hält sie bereits).
 fn cleanup_global_approval(state: &mut RegistryState, now: Instant) {
-    if state.global_approval.is_some_and(|expires_at| expires_at <= now) {
+    if state
+        .global_approval
+        .is_some_and(|expires_at| expires_at <= now)
+    {
         state.global_approval = None;
     }
 }
@@ -810,6 +812,7 @@ mod tests {
     use crate::process_permit::{
         HostApprovalScope, ProcessEnvironment, ProcessPermitLedger, request_for_workspace,
     };
+    use crate::test_support::{TestError, TestResult};
     use std::path::Path;
 
     fn request(session: &str, command: &str) -> ProcessPermitRequest {
@@ -825,14 +828,20 @@ mod tests {
     // Kein Feld von `ProcessPermitId` ist außerhalb von `process_permit.rs`
     // sichtbar; Tests holen sich echte Kennungen deshalb über den echten
     // Ledger statt sie zu konstruieren.
-    fn issue(ledger: &ProcessPermitLedger, request: &ProcessPermitRequest) -> ProcessPermitId {
+    fn issue(
+        ledger: &ProcessPermitLedger,
+        request: &ProcessPermitRequest,
+    ) -> TestResult<ProcessPermitId> {
         ledger
             .issue_after_local_approval(
                 request.clone(),
                 HostApprovalScope::SessionLease,
                 Duration::from_secs(60),
             )
-            .expect("issuing a valid host request must succeed")
+            .map_err(|e| TestError::Context {
+                context: "issuing a valid host request must succeed",
+                source: e.to_string(),
+            })
     }
 
     #[test]
@@ -876,32 +885,34 @@ mod tests {
     }
 
     #[test]
-    fn test_remembered_permit_is_found_only_for_identical_request() {
+    fn test_remembered_permit_is_found_only_for_identical_request() -> TestResult {
         let ledger = ProcessPermitLedger::default();
         let registry = HostPermitSessionRegistry::default();
         let req = request("s1", "echo hi");
         assert_eq!(registry.lookup_permit(&req), None);
-        let id = issue(&ledger, &req);
+        let id = issue(&ledger, &req)?;
         registry.remember_permit(req.clone(), id);
         assert_eq!(registry.lookup_permit(&req), Some(id));
 
         let other = request("s1", "echo bye");
         assert_eq!(registry.lookup_permit(&other), None);
+        Ok(())
     }
 
     #[test]
-    fn test_forget_session_clears_approval_and_returns_removed_ids() {
+    fn test_forget_session_clears_approval_and_returns_removed_ids() -> TestResult {
         let ledger = ProcessPermitLedger::default();
         let registry = HostPermitSessionRegistry::default();
         registry.mark_session_approved("s1", Duration::from_secs(60));
         let req = request("s1", "echo hi");
-        let id = issue(&ledger, &req);
+        let id = issue(&ledger, &req)?;
         registry.remember_permit(req.clone(), id);
 
         let removed = registry.forget_session("s1");
         assert_eq!(removed, vec![id]);
         assert!(!registry.is_session_approved("s1"));
         assert_eq!(registry.lookup_permit(&req), None);
+        Ok(())
     }
 
     #[test]
@@ -971,14 +982,17 @@ mod tests {
     }
 
     #[test]
-    fn test_session_approval_remaining_some_before_expiry() {
+    fn test_session_approval_remaining_some_before_expiry() -> TestResult {
         let registry = HostPermitSessionRegistry::default();
         registry.mark_session_approved("s1", Duration::from_secs(60));
         let remaining = registry
             .session_approval_remaining("s1")
-            .expect("a freshly approved session must have remaining time");
+            .ok_or(TestError::Missing(
+                "a freshly approved session's remaining time",
+            ))?;
         assert!(remaining <= Duration::from_secs(60));
         assert!(remaining > Duration::from_secs(0));
+        Ok(())
     }
 
     #[test]
@@ -1005,15 +1019,18 @@ mod tests {
     }
 
     #[test]
-    fn test_global_approval_remaining_none_without_approval_and_some_after() {
+    fn test_global_approval_remaining_none_without_approval_and_some_after() -> TestResult {
         let registry = HostPermitSessionRegistry::default();
         assert_eq!(registry.global_approval_remaining(), None);
         registry.mark_global_approval(Duration::from_secs(60));
         let remaining = registry
             .global_approval_remaining()
-            .expect("a freshly marked global approval must have remaining time");
+            .ok_or(TestError::Missing(
+                "a freshly marked global approval's remaining time",
+            ))?;
         assert!(remaining <= Duration::from_secs(60));
         assert!(remaining > Duration::from_secs(0));
+        Ok(())
     }
 
     #[test]
@@ -1128,17 +1145,20 @@ mod tests {
     }
 
     #[test]
-    fn test_session_approval_remaining_is_the_max_of_session_own_and_global() {
+    fn test_session_approval_remaining_is_the_max_of_session_own_and_global() -> TestResult {
         let registry = HostPermitSessionRegistry::default();
         registry.mark_session_approved("s1", Duration::from_millis(20));
         registry.mark_global_approval(Duration::from_secs(60));
 
         let remaining = registry
             .session_approval_remaining("s1")
-            .expect("either the session-own or the global approval must be active");
+            .ok_or(TestError::Missing(
+                "either the session-own or the global approval",
+            ))?;
         assert!(
             remaining > Duration::from_millis(20),
             "the longer global approval must win over the shorter session-own one: {remaining:?}"
         );
+        Ok(())
     }
 }

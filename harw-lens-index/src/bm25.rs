@@ -75,7 +75,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use harw_lens_rank::{bm25_scores, Bm25Params};
+use harw_lens_rank::{Bm25Params, bm25_scores};
 use harw_lens_store::LensStore;
 use harw_lens_types::{Chunk, IndexManifest, Ranked};
 
@@ -182,7 +182,10 @@ impl Bm25Index {
             })
             .collect();
 
-        Self { manifest, documents }
+        Self {
+            manifest,
+            documents,
+        }
     }
 
     /// Die Anzahl indizierter Dokumente.
@@ -281,7 +284,11 @@ impl VectorIndex for Bm25Index {
         let text = query.text.as_ref().ok_or(IndexError::MissingText)?;
         let query_terms = tokenize(text);
 
-        let doc_tokens: Vec<&[String]> = self.documents.iter().map(|doc| doc.tokens.as_slice()).collect();
+        let doc_tokens: Vec<&[String]> = self
+            .documents
+            .iter()
+            .map(|doc| doc.tokens.as_slice())
+            .collect();
         let scores = bm25_scores(&doc_tokens, &query_terms, Bm25Params::default());
 
         let mut scored: Vec<Ranked> = self
@@ -315,6 +322,7 @@ fn tokenize(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_lens_types::{ByteSpan, ChunkDigest, Locality, Metric, SourceRef};
     use harw_types::ContentDigest;
 
@@ -329,46 +337,49 @@ mod tests {
         }
     }
 
-    fn chunk(text: &str) -> Chunk {
-        Chunk {
+    fn chunk(text: &str) -> TestResult<Chunk> {
+        Ok(Chunk {
             digest: ChunkDigest(ContentDigest::of(text.as_bytes())),
             source: SourceRef::File {
                 path: "a.txt".to_owned(),
             },
-            span: ByteSpan::new(0, text.len()).expect("valid span"),
+            span: ByteSpan::new(0, text.len()).map_err(ctx("valid span"))?,
             text: text.to_owned(),
-        }
+        })
     }
 
     #[test]
-    fn test_search_doc_with_term_outranks_doc_without() {
+    fn test_search_doc_with_term_outranks_doc_without() -> TestResult {
         let manifest = manifest_with(1);
         let index = Bm25Index::build(
             manifest.clone(),
-            vec![chunk("relevant term here"), chunk("nothing matches")],
+            vec![chunk("relevant term here")?, chunk("nothing matches")?],
         );
         let query = Query {
             embedding: None,
             text: Some("relevant".to_owned()),
             manifest,
         };
-        let hits = index.search(&query, 10).expect("compatible manifest");
+        let hits = index
+            .search(&query, 10)
+            .map_err(ctx("compatible manifest"))?;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].chunk.text, "relevant term here");
+        Ok(())
     }
 
     #[test]
-    fn test_search_rare_term_scores_higher_than_frequent_term() {
+    fn test_search_rare_term_scores_higher_than_frequent_term() -> TestResult {
         let manifest = manifest_with(1);
         // "beta" appears in every document (df = 5); "alpha" appears only in
         // the first (df = 1). Every document has the same token length, so
         // the length-normalization term is identical for both queries.
         let chunks = vec![
-            chunk("alpha beta"),
-            chunk("beta gamma"),
-            chunk("beta delta"),
-            chunk("beta epsilon"),
-            chunk("beta zeta"),
+            chunk("alpha beta")?,
+            chunk("beta gamma")?,
+            chunk("beta delta")?,
+            chunk("beta epsilon")?,
+            chunk("beta zeta")?,
         ];
         let index = Bm25Index::build(manifest.clone(), chunks);
 
@@ -385,27 +396,28 @@ mod tests {
 
         let rare_score = index
             .search(&rare_query, 10)
-            .expect("compatible manifest")
+            .map_err(ctx("compatible manifest"))?
             .into_iter()
             .find(|hit| hit.chunk.text == "alpha beta")
-            .expect("alpha matches the first document")
+            .ok_or(TestError::Missing("alpha matches the first document"))?
             .score;
         let frequent_score = index
             .search(&frequent_query, 10)
-            .expect("compatible manifest")
+            .map_err(ctx("compatible manifest"))?
             .into_iter()
             .find(|hit| hit.chunk.text == "alpha beta")
-            .expect("beta matches every document")
+            .ok_or(TestError::Missing("beta matches every document"))?
             .score;
 
         assert!(
             rare_score > frequent_score,
             "rare term score {rare_score} should exceed frequent term score {frequent_score}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_search_on_empty_index_returns_empty_list_not_error() {
+    fn test_search_on_empty_index_returns_empty_list_not_error() -> TestResult {
         let manifest = manifest_with(1);
         let index = Bm25Index::build(manifest.clone(), Vec::new());
         let query = Query {
@@ -413,14 +425,17 @@ mod tests {
             text: Some("anything".to_owned()),
             manifest,
         };
-        let hits = index.search(&query, 10).expect("empty index is not an error");
+        let hits = index
+            .search(&query, 10)
+            .map_err(ctx("empty index is not an error"))?;
         assert!(hits.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_search_with_empty_query_text_returns_empty_list_not_error() {
+    fn test_search_with_empty_query_text_returns_empty_list_not_error() -> TestResult {
         let manifest = manifest_with(1);
-        let index = Bm25Index::build(manifest.clone(), vec![chunk("match term")]);
+        let index = Bm25Index::build(manifest.clone(), vec![chunk("match term")?]);
         let query = Query {
             embedding: None,
             text: Some("   ".to_owned()),
@@ -428,14 +443,15 @@ mod tests {
         };
         let hits = index
             .search(&query, 10)
-            .expect("whitespace-only text tokenizes to an empty query");
+            .map_err(ctx("whitespace-only text tokenizes to an empty query"))?;
         assert!(hits.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_search_rejects_chunker_version_mismatch_before_computing() {
+    fn test_search_rejects_chunker_version_mismatch_before_computing() -> TestResult {
         let manifest = manifest_with(1);
-        let index = Bm25Index::build(manifest.clone(), vec![chunk("match term")]);
+        let index = Bm25Index::build(manifest.clone(), vec![chunk("match term")?]);
         let mut query_manifest = manifest;
         query_manifest.chunker_version = 2;
         let query = Query {
@@ -443,21 +459,24 @@ mod tests {
             text: Some("match".to_owned()),
             manifest: query_manifest,
         };
-        let err = index
-            .search(&query, 10)
-            .expect_err("chunker_version mismatch is rejected");
+        let Err(err) = index.search(&query, 10) else {
+            return Err(TestError::Unexpected(
+                "chunker_version mismatch is rejected".to_owned(),
+            ));
+        };
         assert!(matches!(
             err,
             IndexError::ManifestMismatch {
                 field: "chunker_version"
             }
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_search_ignores_model_mismatch_because_bm25_has_no_model() {
+    fn test_search_ignores_model_mismatch_because_bm25_has_no_model() -> TestResult {
         let manifest = manifest_with(1);
-        let index = Bm25Index::build(manifest.clone(), vec![chunk("match term")]);
+        let index = Bm25Index::build(manifest.clone(), vec![chunk("match term")?]);
         let mut query_manifest = manifest;
         query_manifest.model = "some-other-model".to_owned();
         let query = Query {
@@ -467,53 +486,63 @@ mod tests {
         };
         let hits = index
             .search(&query, 10)
-            .expect("model is irrelevant for Bm25Index");
+            .map_err(ctx("model is irrelevant for Bm25Index"))?;
         assert_eq!(hits.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_search_without_text_returns_missing_text() {
+    fn test_search_without_text_returns_missing_text() -> TestResult {
         let manifest = manifest_with(1);
-        let index = Bm25Index::build(manifest.clone(), vec![chunk("match term")]);
+        let index = Bm25Index::build(manifest.clone(), vec![chunk("match term")?]);
         let query = Query {
             embedding: None,
             text: None,
             manifest,
         };
-        let err = index.search(&query, 10).expect_err("missing text");
+        let Err(err) = index.search(&query, 10) else {
+            return Err(TestError::Unexpected("missing text".to_owned()));
+        };
         assert!(matches!(err, IndexError::MissingText));
+        Ok(())
     }
 
     #[test]
-    fn test_search_is_deterministic_on_repeated_calls_with_tied_scores() {
+    fn test_search_is_deterministic_on_repeated_calls_with_tied_scores() -> TestResult {
         let manifest = manifest_with(1);
         // Same multiset of terms in both documents => identical BM25 score
         // for the query term, but different digests (different text).
-        let index = Bm25Index::build(manifest.clone(), vec![chunk("cat dog"), chunk("dog cat")]);
+        let index = Bm25Index::build(manifest.clone(), vec![chunk("cat dog")?, chunk("dog cat")?]);
         let query = Query {
             embedding: None,
             text: Some("cat".to_owned()),
             manifest,
         };
-        let first = index.search(&query, 10).expect("compatible manifest");
-        let second = index.search(&query, 10).expect("compatible manifest");
+        let first = index
+            .search(&query, 10)
+            .map_err(ctx("compatible manifest"))?;
+        let second = index
+            .search(&query, 10)
+            .map_err(ctx("compatible manifest"))?;
         let first_order: Vec<_> = first.iter().map(|r| r.chunk.digest).collect();
         let second_order: Vec<_> = second.iter().map(|r| r.chunk.digest).collect();
         assert_eq!(first_order, second_order);
         assert_eq!(first.len(), 2);
         assert!((first[0].score - first[1].score).abs() < 1e-9);
+        Ok(())
     }
 
     #[test]
-    fn test_len_and_is_empty() {
+    fn test_len_and_is_empty() -> TestResult {
         let manifest = manifest_with(1);
         let empty = Bm25Index::build(manifest.clone(), Vec::new());
         assert!(empty.is_empty());
         assert_eq!(empty.len(), 0);
 
-        let one = Bm25Index::build(manifest, vec![chunk("x")]);
+        let one = Bm25Index::build(manifest, vec![chunk("x")?]);
         assert!(!one.is_empty());
         assert_eq!(one.len(), 1);
+        Ok(())
     }
 
     #[test]
@@ -539,21 +568,28 @@ mod tests {
     }
 
     #[test]
-    fn test_save_and_load_roundtrip_rebuilds_equivalent_index() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let store = LensStore::open(dir.path()).expect("open store");
+    fn test_save_and_load_roundtrip_rebuilds_equivalent_index() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("temp dir"))?;
+        let store = LensStore::open(dir.path()).map_err(ctx("open store"))?;
         let manifest = manifest_with(1);
-        let index = Bm25Index::build(manifest, vec![chunk("hallo welt"), chunk("noch ein chunk")]);
-        index.save(&store, "roundtrip-bm25").expect("save");
-        let loaded = Bm25Index::load(&store, "roundtrip-bm25").expect("load");
+        let index = Bm25Index::build(
+            manifest,
+            vec![chunk("hallo welt")?, chunk("noch ein chunk")?],
+        );
+        index.save(&store, "roundtrip-bm25").map_err(ctx("save"))?;
+        let loaded = Bm25Index::load(&store, "roundtrip-bm25").map_err(ctx("load"))?;
         assert_eq!(loaded, index);
+        Ok(())
     }
 
     #[test]
-    fn test_load_missing_index_returns_index_not_found() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let store = LensStore::open(dir.path()).expect("open store");
-        let err = Bm25Index::load(&store, "does-not-exist").expect_err("missing index");
+    fn test_load_missing_index_returns_index_not_found() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("temp dir"))?;
+        let store = LensStore::open(dir.path()).map_err(ctx("open store"))?;
+        let Err(err) = Bm25Index::load(&store, "does-not-exist") else {
+            return Err(TestError::Unexpected("missing index".to_owned()));
+        };
         assert!(matches!(err, IndexError::IndexNotFound { .. }));
+        Ok(())
     }
 }

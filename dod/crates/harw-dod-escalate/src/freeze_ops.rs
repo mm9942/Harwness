@@ -77,7 +77,10 @@ use crate::ladder::Ladder;
 /// let expired = reconcile_expired_freezes(&store, Timestamp::now()).unwrap();
 /// assert!(expired.is_empty());
 /// ```
-pub fn reconcile_expired_freezes(store: &FreezeStore, now: Timestamp) -> EscalateResult<Vec<Freeze>> {
+pub fn reconcile_expired_freezes(
+    store: &FreezeStore,
+    now: Timestamp,
+) -> EscalateResult<Vec<Freeze>> {
     Ok(store.reconcile_expired(now)?)
 }
 
@@ -250,6 +253,7 @@ pub fn authorize_stage_gated(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_dod_rules::{FindingKind, Verdict, triaged_finding_for_test};
     use harw_dod_signals::{Hardness, Severity};
     use harw_dod_warden_proto::EscalationStage;
@@ -260,17 +264,22 @@ mod tests {
     // direkt setzen können, um `Ladder::stage_for`s `Escalated`-Schwelle zu
     // erreichen. `triaged_finding_for_test` (Feature `test-support`, siehe
     // `harw-dod-rules/src/finding.rs`-Moduldoku) ist genau dafür da.
-    fn finding_with(severity: Severity, hardness: Hardness, verdict: Verdict) -> Finding<Triaged> {
-        triaged_finding_for_test(
+    fn finding_with(
+        severity: Severity,
+        hardness: Hardness,
+        verdict: Verdict,
+    ) -> TestResult<Finding<Triaged>> {
+        let id = FindingId::try_from_str("freeze-ops-test-finding").map_err(ctx("non-empty id"))?;
+        Ok(triaged_finding_for_test(
             "egress-flow",
             FindingKind::RuleTriggered,
             severity,
             hardness,
             "egress flow to evil.example.com:443 is outside the allowed network scope",
             jiff::Timestamp::UNIX_EPOCH,
-            FindingId::try_from_str("freeze-ops-test-finding").expect("non-empty id"),
+            id,
             verdict,
-        )
+        ))
     }
 
     fn actor() -> ApprovalActor {
@@ -280,94 +289,109 @@ mod tests {
     }
 
     #[test]
-    fn test_authorize_freeze_rejects_non_freeze_action() {
-        let temp = tempfile::tempdir().unwrap();
+    fn test_authorize_freeze_rejects_non_freeze_action() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = FreezeStore::new(temp.path());
-        let finding = finding_with(Severity::High, Hardness::Observed, Verdict::Confirmed);
+        let finding = finding_with(Severity::High, Hardness::Observed, Verdict::Confirmed)?;
         let proposed = Action::propose(ProposedAction::ReleaseCgroup {
-            cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
+            cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?,
         });
 
-        let err = authorize_freeze(&store, &finding, proposed, actor(), Timestamp::UNIX_EPOCH)
-            .unwrap_err();
+        let Err(err) = authorize_freeze(&store, &finding, proposed, actor(), Timestamp::UNIX_EPOCH)
+        else {
+            return Err(TestError::Unexpected("Err erwartet".to_owned()));
+        };
         assert!(matches!(err, EscalateError::NotAFreezeAction));
-        assert!(store.active().unwrap().is_empty());
+        assert!(store.active().map_err(ctx("active"))?.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_authorize_freeze_succeeds_and_persists_the_record() {
-        let temp = tempfile::tempdir().unwrap();
+    fn test_authorize_freeze_succeeds_and_persists_the_record() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = FreezeStore::new(temp.path());
-        let finding = finding_with(Severity::High, Hardness::Observed, Verdict::Confirmed);
+        let finding = finding_with(Severity::High, Hardness::Observed, Verdict::Confirmed)?;
         let proposed = Action::propose(ProposedAction::FreezeCgroup {
-            cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
+            cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?,
         });
 
         let authorized =
             authorize_freeze(&store, &finding, proposed, actor(), Timestamp::UNIX_EPOCH)
-                .expect("confirmed, rule-triggered finding authorizes a freeze");
+                .map_err(ctx("confirmed, rule-triggered finding authorizes a freeze"))?;
 
-        assert_eq!(store.active().unwrap().len(), 1);
-        assert!(authorized
-            .request()
-            .proof
-            .verify(finding.id(), &authorized.request().action)
-            .is_ok());
+        assert_eq!(store.active().map_err(ctx("active"))?.len(), 1);
+        assert!(
+            authorized
+                .request()
+                .proof
+                .verify(finding.id(), &authorized.request().action)
+                .is_ok()
+        );
+        Ok(())
     }
 
     /// Der Audit-Eintrag steht vor dem Fehlerpfad: eine Autorisierung, die
     /// scheitert, weil der Befund keine Stufe rechtfertigt, hinterlässt
     /// trotzdem ihren Freeze-Datensatz.
     #[test]
-    fn test_a_failing_authorization_still_leaves_its_audit_entry() {
-        let temp = tempfile::tempdir().unwrap();
+    fn test_a_failing_authorization_still_leaves_its_audit_entry() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = FreezeStore::new(temp.path());
         // `FalsePositive` sorgt dafür, dass `Ladder::stage_for` `None`
         // liefert und `authorize_freeze` mit `NotEscalatable` scheitert —
         // aber erst NACHDEM der Freeze-Datensatz bereits geschrieben wurde.
-        let finding = finding_with(Severity::Critical, Hardness::Observed, Verdict::FalsePositive);
+        let finding = finding_with(
+            Severity::Critical,
+            Hardness::Observed,
+            Verdict::FalsePositive,
+        )?;
         let proposed = Action::propose(ProposedAction::FreezeCgroup {
-            cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
+            cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?,
         });
 
-        let err = authorize_freeze(&store, &finding, proposed, actor(), Timestamp::UNIX_EPOCH)
-            .unwrap_err();
+        let Err(err) = authorize_freeze(&store, &finding, proposed, actor(), Timestamp::UNIX_EPOCH)
+        else {
+            return Err(TestError::Unexpected("Err erwartet".to_owned()));
+        };
 
         assert!(matches!(err, EscalateError::NotEscalatable));
         assert_eq!(
-            store.active().unwrap().len(),
+            store.active().map_err(ctx("active"))?.len(),
             1,
             "the freeze record must survive the downstream authorization failure"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_authorize_release_rejects_non_release_action() {
-        let temp = tempfile::tempdir().unwrap();
+    fn test_authorize_release_rejects_non_release_action() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = FreezeStore::new(temp.path());
-        let finding = finding_with(Severity::High, Hardness::Observed, Verdict::Confirmed);
+        let finding = finding_with(Severity::High, Hardness::Observed, Verdict::Confirmed)?;
         let proposed = Action::propose(ProposedAction::FreezeCgroup {
-            cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
+            cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?,
         });
 
-        let err = authorize_release(
+        let Err(err) = authorize_release(
             &store,
             &finding,
             proposed,
             actor(),
             Timestamp::UNIX_EPOCH,
             Timestamp::UNIX_EPOCH,
-        )
-        .unwrap_err();
+        ) else {
+            return Err(TestError::Unexpected("Err erwartet".to_owned()));
+        };
         assert!(matches!(err, EscalateError::NotAReleaseAction));
+        Ok(())
     }
 
     #[test]
-    fn test_authorize_release_resolves_an_active_freeze_and_authorizes() {
-        let temp = tempfile::tempdir().unwrap();
+    fn test_authorize_release_resolves_an_active_freeze_and_authorizes() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = FreezeStore::new(temp.path());
-        let cgroup = CgroupId::try_from_str("cgroup-1").unwrap();
-        let finding = finding_with(Severity::High, Hardness::Observed, Verdict::Confirmed);
+        let cgroup = CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?;
+        let finding = finding_with(Severity::High, Hardness::Observed, Verdict::Confirmed)?;
         store
             .freeze(&Freeze {
                 cgroup: cgroup.clone(),
@@ -375,7 +399,7 @@ mod tests {
                 frozen_at: Timestamp::UNIX_EPOCH,
                 expires_at: None,
             })
-            .unwrap();
+            .map_err(ctx("freeze"))?;
 
         let proposed = Action::propose(ProposedAction::ReleaseCgroup { cgroup });
         let (authorized, resolution) = authorize_release(
@@ -386,74 +410,93 @@ mod tests {
             Timestamp::UNIX_EPOCH,
             Timestamp::UNIX_EPOCH,
         )
-        .expect("an active freeze resolves and the release authorizes");
+        .map_err(ctx("an active freeze resolves and the release authorizes"))?;
 
-        assert!(store.active().unwrap().is_empty());
+        assert!(store.active().map_err(ctx("active"))?.is_empty());
         assert_eq!(resolution.freeze.finding, *finding.id());
-        assert!(authorized
-            .request()
-            .proof
-            .verify(finding.id(), &authorized.request().action)
-            .is_ok());
+        assert!(
+            authorized
+                .request()
+                .proof
+                .verify(finding.id(), &authorized.request().action)
+                .is_ok()
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_authorize_stage_gated_requires_escalated_for_kill() {
-        let finding = finding_with(Severity::High, Hardness::Observed, Verdict::Confirmed);
+    fn test_authorize_stage_gated_requires_escalated_for_kill() -> TestResult {
+        let finding = finding_with(Severity::High, Hardness::Observed, Verdict::Confirmed)?;
         let proposed = Action::propose(ProposedAction::KillProcessTree {
-            cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
+            cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?,
         });
 
-        let err = authorize_stage_gated(&finding, proposed, actor(), Timestamp::UNIX_EPOCH)
-            .unwrap_err();
+        let Err(err) = authorize_stage_gated(&finding, proposed, actor(), Timestamp::UNIX_EPOCH)
+        else {
+            return Err(TestError::Unexpected("Err erwartet".to_owned()));
+        };
         assert!(matches!(err, EscalateError::NotAdmissibleAtStage));
+        Ok(())
     }
 
     #[test]
-    fn test_authorize_stage_gated_succeeds_for_kill_when_escalated() {
-        let finding = finding_with(Severity::Critical, Hardness::Observed, Verdict::Confirmed);
-        assert_eq!(Ladder::stage_for(&finding), Some(EscalationStage::Escalated));
+    fn test_authorize_stage_gated_succeeds_for_kill_when_escalated() -> TestResult {
+        let finding = finding_with(Severity::Critical, Hardness::Observed, Verdict::Confirmed)?;
+        assert_eq!(
+            Ladder::stage_for(&finding),
+            Some(EscalationStage::Escalated)
+        );
         let proposed = Action::propose(ProposedAction::KillProcessTree {
-            cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
+            cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("cgroup id"))?,
         });
 
         let authorized = authorize_stage_gated(&finding, proposed, actor(), Timestamp::UNIX_EPOCH)
-            .expect("critical + observed reaches Escalated, which admits KillProcessTree");
-        assert!(authorized
-            .request()
-            .proof
-            .verify(finding.id(), &authorized.request().action)
-            .is_ok());
+            .map_err(ctx(
+                "critical + observed reaches Escalated, which admits KillProcessTree",
+            ))?;
+        assert!(
+            authorized
+                .request()
+                .proof
+                .verify(finding.id(), &authorized.request().action)
+                .is_ok()
+        );
+        Ok(())
     }
 
     // -- Rekonziliation ---------------------------------------------------------
 
     #[test]
-    fn test_reconcile_expired_freezes_lifts_a_due_freeze_and_spares_an_indefinite_one() {
-        let temp = tempfile::tempdir().unwrap();
+    fn test_reconcile_expired_freezes_lifts_a_due_freeze_and_spares_an_indefinite_one() -> TestResult
+    {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = FreezeStore::new(temp.path());
         let now = Timestamp::UNIX_EPOCH
             .checked_add(jiff::SignedDuration::from_secs(3600))
-            .unwrap();
+            .map_err(ctx("checked_add"))?;
 
         let due = Freeze {
-            cgroup: CgroupId::try_from_str("cgroup-due").unwrap(),
-            finding: harw_types::FindingId::try_from_str("finding-1").unwrap(),
+            cgroup: CgroupId::try_from_str("cgroup-due").map_err(ctx("cgroup id"))?,
+            finding: harw_types::FindingId::try_from_str("finding-1").map_err(ctx("finding id"))?,
             frozen_at: Timestamp::UNIX_EPOCH,
-            expires_at: Some(now.checked_sub(jiff::SignedDuration::from_secs(1)).unwrap()),
+            expires_at: Some(
+                now.checked_sub(jiff::SignedDuration::from_secs(1))
+                    .map_err(ctx("checked_sub"))?,
+            ),
         };
         let indefinite = Freeze {
-            cgroup: CgroupId::try_from_str("cgroup-indefinite").unwrap(),
-            finding: harw_types::FindingId::try_from_str("finding-2").unwrap(),
+            cgroup: CgroupId::try_from_str("cgroup-indefinite").map_err(ctx("cgroup id"))?,
+            finding: harw_types::FindingId::try_from_str("finding-2").map_err(ctx("finding id"))?,
             frozen_at: Timestamp::UNIX_EPOCH,
             expires_at: None,
         };
-        store.freeze(&due).unwrap();
-        store.freeze(&indefinite).unwrap();
+        store.freeze(&due).map_err(ctx("freeze"))?;
+        store.freeze(&indefinite).map_err(ctx("freeze"))?;
 
-        let expired = reconcile_expired_freezes(&store, now).unwrap();
+        let expired = reconcile_expired_freezes(&store, now).map_err(ctx("reconcile"))?;
 
         assert_eq!(expired, vec![due]);
-        assert_eq!(store.active().unwrap(), vec![indefinite]);
+        assert_eq!(store.active().map_err(ctx("active"))?, vec![indefinite]);
+        Ok(())
     }
 }

@@ -150,23 +150,29 @@ impl Default for FirefoxHostConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
-    fn test_firefox_host_config_new_is_fail_closed() {
+    fn test_firefox_host_config_new_is_fail_closed() -> TestResult {
         let config = FirefoxHostConfig::new();
         assert!(config.geckodriver_pin().is_none());
         assert!(config.launcher().is_none());
         assert_eq!(
-            config.journal_policy().expect("default policy").capacity(),
+            config
+                .journal_policy()
+                .map_err(ctx("default policy"))?
+                .capacity(),
             DEFAULT_JOURNAL_CAPACITY
         );
+        Ok(())
     }
 
     #[test]
-    fn test_firefox_host_config_with_geckodriver_pin_is_retained() {
+    fn test_firefox_host_config_with_geckodriver_pin_is_retained() -> TestResult {
         let pin = GeckodriverPin::new(PathBuf::from("/opt/geckodriver"), &"b".repeat(64))
-            .expect("valid pin");
+            .map_err(ctx("valid pin"))?;
         let config = FirefoxHostConfig::new().with_geckodriver_pin(pin.clone());
         assert_eq!(config.geckodriver_pin(), Some(&pin));
+        Ok(())
     }
 }

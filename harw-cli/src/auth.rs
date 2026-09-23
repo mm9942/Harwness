@@ -24,9 +24,9 @@ pub fn run(home_override: Option<PathBuf>, action: AuthAction) -> Result<(), Str
     crate::home::ensure_home(&home).map_err(|error| error.to_string())?;
 
     match action {
-        AuthAction::Login { provider } => login(&home, &provider),
-        AuthAction::Token { provider } => token(&home, &provider),
-        AuthAction::Import { source } => import(&source),
+        AuthAction::Login { provider } => login(&home, provider.as_str()),
+        AuthAction::Token { provider } => token(&home, provider.as_str()),
+        AuthAction::Import { source } => import(source.as_str()),
         AuthAction::Status => status(&home),
     }
 }

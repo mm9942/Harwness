@@ -158,7 +158,11 @@ pub struct ListAllRanker;
 impl RecallRanker for ListAllRanker {
     /// Ranks every candidate with an identical score, in the order the
     /// caller passed them (already sorted by id in [`search_with`]).
-    fn rank(&self, _query: &RecallQuery, candidates: &[&KnowledgeArtifact]) -> Vec<RankedCandidate> {
+    fn rank(
+        &self,
+        _query: &RecallQuery,
+        candidates: &[&KnowledgeArtifact],
+    ) -> Vec<RankedCandidate> {
         (0..candidates.len())
             .map(|index| RankedCandidate { index, score: 0.0 })
             .collect()
@@ -267,7 +271,12 @@ fn verify_no_steward_domain_leak(hits: &[RecallHit], query: &RecallQuery) {
             hit.artifact.kind,
             ArtifactKind::ContextProposal | ArtifactKind::ModelBehaviorProposal
         );
-        if is_steward_domain && !hit.artifact.visibility.visible_to_caller(&query.caller_scope) {
+        if is_steward_domain
+            && !hit
+                .artifact
+                .visibility
+                .visible_to_caller(&query.caller_scope)
+        {
             crate::context_steward::STEWARD_LEAK_VIOLATION.violated(&harw_observe::NullSink, &[]);
         }
     }
@@ -368,6 +377,7 @@ mod tests {
     use super::{ListAllRanker, search, search_with};
     use crate::artifact::{ArtifactId, ArtifactKind, Frontmatter, KnowledgeArtifact, RecallQuery};
     use crate::index::KnowledgeIndex;
+    use crate::test_support::TestResult;
     use crate::visibility::{AgentId, VisibilityScope};
 
     /// Build a test artifact with a fixed author/timestamp and the given
@@ -380,8 +390,11 @@ mod tests {
         body: &str,
         links: Vec<ArtifactId>,
     ) -> KnowledgeArtifact {
-        let mut frontmatter =
-            Frontmatter::new(AgentId::new("agent"), visibility, jiff::Timestamp::UNIX_EPOCH);
+        let mut frontmatter = Frontmatter::new(
+            AgentId::new("agent"),
+            visibility,
+            jiff::Timestamp::UNIX_EPOCH,
+        );
         frontmatter.links = links;
         KnowledgeArtifact::new(ArtifactId::new(id), kind, frontmatter, body)
     }
@@ -389,7 +402,8 @@ mod tests {
     /// The literal AW4-05 ask: a `SecurityFinding` marked `OperatorOnly`
     /// must not come back for a caller without operator permission.
     #[test]
-    fn test_operator_only_security_finding_absent_from_recall_without_operator_permission() {
+    fn test_operator_only_security_finding_absent_from_recall_without_operator_permission()
+    -> TestResult {
         let mut index = KnowledgeIndex::new();
         index.insert(artifact(
             "security/critical-vuln",
@@ -400,15 +414,17 @@ mod tests {
         ));
 
         let query = RecallQuery::new("vulnerability", VisibilityScope::SelfOnly);
-        let result = search(&index, &query).expect("bounded recall query succeeds");
+        let result = search(&index, &query)
+            .map_err(crate::test_support::ctx("bounded recall query succeeds"))?;
 
         assert!(result.hits.is_empty());
+        Ok(())
     }
 
     /// The counterpart: the same `OperatorOnly` finding must come back for a
     /// caller that does hold operator scope.
     #[test]
-    fn test_operator_only_security_finding_present_with_operator_permission() {
+    fn test_operator_only_security_finding_present_with_operator_permission() -> TestResult {
         let mut index = KnowledgeIndex::new();
         index.insert(artifact(
             "security/critical-vuln",
@@ -419,13 +435,15 @@ mod tests {
         ));
 
         let query = RecallQuery::new("vulnerability", VisibilityScope::OperatorOnly);
-        let result = search(&index, &query).expect("bounded recall query succeeds");
+        let result = search(&index, &query)
+            .map_err(crate::test_support::ctx("bounded recall query succeeds"))?;
 
         assert_eq!(result.hits.len(), 1);
         assert_eq!(
             result.hits[0].artifact.id,
             ArtifactId::new("security/critical-vuln")
         );
+        Ok(())
     }
 
     /// AW4-05's actual finding: before the `expand_backlinks` fix, a `SelfOnly`
@@ -437,7 +455,7 @@ mod tests {
     /// this because the note only ever surfaces via the link graph, not via
     /// a keyword match on its own body.
     #[test]
-    fn test_backlink_expansion_does_not_leak_a_self_only_note() {
+    fn test_backlink_expansion_does_not_leak_a_self_only_note() -> TestResult {
         let mut index = KnowledgeIndex::new();
         index.insert(artifact(
             "security/critical-vuln",
@@ -455,7 +473,8 @@ mod tests {
         ));
 
         let query = RecallQuery::new("vulnerability", VisibilityScope::OperatorOnly);
-        let result = search(&index, &query).expect("bounded recall query succeeds");
+        let result = search(&index, &query)
+            .map_err(crate::test_support::ctx("bounded recall query succeeds"))?;
 
         let ids: Vec<ArtifactId> = result
             .hits
@@ -463,6 +482,7 @@ mod tests {
             .map(|hit| hit.artifact.id.clone())
             .collect();
         assert_eq!(ids, vec![ArtifactId::new("security/critical-vuln")]);
+        Ok(())
     }
 
     /// AW5-09: a `ContextProposal` artifact stored with
@@ -472,14 +492,15 @@ mod tests {
     /// exercised through a real `ContextProposal::to_artifact` embedding
     /// rather than the generic `artifact()` test fixture above.
     #[test]
-    fn test_context_proposal_visibility_follows_recommended_visibility() {
+    fn test_context_proposal_visibility_follows_recommended_visibility() -> TestResult {
         use crate::context_proposal::{ContextProposal, RECOMMENDED_VISIBILITY};
         use harw_agent_dsl::ids::DefinitionId;
 
         let proposal = ContextProposal::new(
             ArtifactId::new("context-proposal/promote-history-tail"),
             "history.tail wiederholt über Budget ausgelassen",
-            DefinitionId::parse("harwness.context.base@1").expect("valid definition id"),
+            DefinitionId::parse("harwness.context.base@1")
+                .map_err(crate::test_support::ctx("valid definition id"))?,
             "deadbeef".repeat(8),
             Vec::new(),
             Vec::new(),
@@ -493,14 +514,14 @@ mod tests {
         );
         let artifact = proposal
             .to_artifact(frontmatter)
-            .expect("proposal embeds into an artifact");
+            .map_err(crate::test_support::ctx("proposal embeds into an artifact"))?;
 
         let mut index = KnowledgeIndex::new();
         index.insert(artifact);
 
         let unauthorized = RecallQuery::new("", VisibilityScope::SelfOnly);
         let denied = search_with(&index, &unauthorized, &ListAllRanker)
-            .expect("bounded recall query succeeds");
+            .map_err(crate::test_support::ctx("bounded recall query succeeds"))?;
         assert!(
             denied.hits.is_empty(),
             "a ContextProposal must not be visible without operator permission"
@@ -508,7 +529,7 @@ mod tests {
 
         let authorized = RecallQuery::new("", VisibilityScope::OperatorOnly);
         let granted = search_with(&index, &authorized, &ListAllRanker)
-            .expect("bounded recall query succeeds");
+            .map_err(crate::test_support::ctx("bounded recall query succeeds"))?;
         assert_eq!(
             granted.hits.len(),
             1,
@@ -518,12 +539,13 @@ mod tests {
             granted.hits[0].artifact.id,
             ArtifactId::new("context-proposal/promote-history-tail")
         );
+        Ok(())
     }
 
     /// `ListAllRanker` returns every visibility-filtered candidate — unlike
     /// `KeywordRanker`, which returns nothing for an empty query text.
     #[test]
-    fn test_list_all_ranker_returns_every_candidate_for_an_empty_query() {
+    fn test_list_all_ranker_returns_every_candidate_for_an_empty_query() -> TestResult {
         let mut index = KnowledgeIndex::new();
         index.insert(artifact(
             "topic/a",
@@ -542,16 +564,17 @@ mod tests {
 
         let query = RecallQuery::new("", VisibilityScope::OperatorOnly);
 
-        let keyword_result =
-            search_with(&index, &query, &super::KeywordRanker).expect("query succeeds");
+        let keyword_result = search_with(&index, &query, &super::KeywordRanker)
+            .map_err(crate::test_support::ctx("query succeeds"))?;
         assert!(
             keyword_result.hits.is_empty(),
             "KeywordRanker yields nothing for an empty query text"
         );
 
-        let list_all_result =
-            search_with(&index, &query, &ListAllRanker).expect("query succeeds");
+        let list_all_result = search_with(&index, &query, &ListAllRanker)
+            .map_err(crate::test_support::ctx("query succeeds"))?;
         assert_eq!(list_all_result.hits.len(), 2);
+        Ok(())
     }
 
     /// White-box drive of `steward_leak_violation_total` (AW6-08): the
@@ -564,11 +587,13 @@ mod tests {
     /// counter exists to catch.
     #[test]
     fn test_verify_no_steward_domain_leak_fires_on_a_hand_built_violation() {
+        use super::RecallHit;
         use crate::context_steward::{STEWARD_COUNTER_LOCK, STEWARD_LEAK_VIOLATION};
         use crate::index::ArtifactRef;
-        use super::RecallHit;
 
-        let _guard = STEWARD_COUNTER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = STEWARD_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let before = STEWARD_LEAK_VIOLATION.count();
 
         let leaking_hit = RecallHit {
@@ -598,11 +623,13 @@ mod tests {
     /// regression test already covers the general case).
     #[test]
     fn test_verify_no_steward_domain_leak_ignores_non_steward_kinds() {
+        use super::RecallHit;
         use crate::context_steward::{STEWARD_COUNTER_LOCK, STEWARD_LEAK_VIOLATION};
         use crate::index::ArtifactRef;
-        use super::RecallHit;
 
-        let _guard = STEWARD_COUNTER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = STEWARD_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let before = STEWARD_LEAK_VIOLATION.count();
 
         let unrelated_hit = RecallHit {

@@ -207,6 +207,7 @@ impl BpfProgramSpec {
 mod tests {
     use super::{BpfProgramKind, BpfProgramSource, BpfProgramSpec};
     use crate::error::BpfError;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_types::SensorId;
     use std::borrow::Cow;
 
@@ -221,35 +222,45 @@ mod tests {
 
     #[test]
     fn test_new_stores_all_fields_exactly() {
-        let spec = sample_spec(BpfProgramSource::Embedded(Cow::Borrowed(b"\0asm".as_slice())));
+        let spec = sample_spec(BpfProgramSource::Embedded(Cow::Borrowed(
+            b"\0asm".as_slice(),
+        )));
         assert_eq!(spec.sensor, SensorId::from_str("procmon-0"));
         assert_eq!(spec.kind, BpfProgramKind::Tracepoint);
         assert_eq!(spec.attach_point, "syscalls:sys_enter_execve");
     }
 
     #[test]
-    fn test_resolve_embedded_returns_the_same_bytes_without_copying() {
+    fn test_resolve_embedded_returns_the_same_bytes_without_copying() -> TestResult {
         let source = BpfProgramSource::Embedded(Cow::Borrowed(b"\0asm".as_slice()));
-        let resolved = source.resolve().expect("embedded source always resolves");
+        let resolved = source
+            .resolve()
+            .map_err(ctx("embedded source always resolves"))?;
         assert_eq!(resolved.as_ref(), b"\0asm");
         assert!(matches!(resolved, Cow::Borrowed(_)));
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_path_reads_file_contents() {
-        let dir = tempfile::tempdir().expect("tempdir for program body");
+    fn test_resolve_path_reads_file_contents() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir for program body"))?;
         let file_path = dir.path().join("program.bpf.o");
-        std::fs::write(&file_path, b"bytecode-bytes").expect("write fixture program body");
+        std::fs::write(&file_path, b"bytecode-bytes").map_err(ctx("write fixture program body"))?;
 
         let source = BpfProgramSource::Path(file_path);
-        let resolved = source.resolve().expect("existing file resolves");
+        let resolved = source.resolve().map_err(ctx("existing file resolves"))?;
         assert_eq!(resolved.as_ref(), b"bytecode-bytes");
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_path_missing_file_returns_io_error() {
-        let source = BpfProgramSource::Path(std::path::PathBuf::from("/nonexistent/does-not-exist.o"));
-        let err = source.resolve().expect_err("missing file must fail");
+    fn test_resolve_path_missing_file_returns_io_error() -> TestResult {
+        let source =
+            BpfProgramSource::Path(std::path::PathBuf::from("/nonexistent/does-not-exist.o"));
+        let Err(err) = source.resolve() else {
+            return Err(TestError::Unexpected("missing file must fail".to_owned()));
+        };
         assert!(matches!(err, BpfError::Io(_)));
+        Ok(())
     }
 }

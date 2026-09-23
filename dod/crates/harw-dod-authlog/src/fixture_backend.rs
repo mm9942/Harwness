@@ -135,14 +135,24 @@ impl AuthBackend for FixtureAuthBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use harw_dod_signals::{Actor, AuthOutcome};
 
-    fn record(second: i64, uid: u32, auid: Option<u32>, outcome: AuthOutcome) -> AuthRecord {
-        AuthRecord {
-            observed_at: Timestamp::new(second, 0).expect("gültiger Zeitstempel"),
-            actor: Actor { uid, auid, cgroup: None },
+    fn record(
+        second: i64,
+        uid: u32,
+        auid: Option<u32>,
+        outcome: AuthOutcome,
+    ) -> TestResult<AuthRecord> {
+        Ok(AuthRecord {
+            observed_at: Timestamp::new(second, 0).map_err(ctx("gültiger Zeitstempel"))?,
+            actor: Actor {
+                uid,
+                auid,
+                cgroup: None,
+            },
             outcome,
-        }
+        })
     }
 
     #[test]
@@ -159,95 +169,104 @@ mod tests {
     }
 
     #[test]
-    fn test_read_events_returns_success_and_failure_outcomes_unchanged() {
+    fn test_read_events_returns_success_and_failure_outcomes_unchanged() -> TestResult {
         let backend = FixtureAuthBackend::new(
             vec![
-                record(1, 1000, Some(1000), AuthOutcome::Success),
-                record(2, 1000, Some(1000), AuthOutcome::Failure),
+                record(1, 1000, Some(1000), AuthOutcome::Success)?,
+                record(2, 1000, Some(1000), AuthOutcome::Failure)?,
             ],
             Capability::ReadJournal,
         );
         let events = backend
             .read_events(Timestamp::UNIX_EPOCH)
-            .expect("Fixture scheitert nie");
+            .map_err(ctx("Fixture scheitert nie"))?;
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].outcome, AuthOutcome::Success);
         assert_eq!(events[1].outcome, AuthOutcome::Failure);
+        Ok(())
     }
 
     #[test]
-    fn test_read_events_preserves_auid_sentinel_normalization() {
+    fn test_read_events_preserves_auid_sentinel_normalization() -> TestResult {
         let backend = FixtureAuthBackend::new(
-            vec![record(1, 0, None, AuthOutcome::Success)],
+            vec![record(1, 0, None, AuthOutcome::Success)?],
             Capability::ReadJournal,
         );
         let events = backend
             .read_events(Timestamp::UNIX_EPOCH)
-            .expect("Fixture scheitert nie");
+            .map_err(ctx("Fixture scheitert nie"))?;
         assert_eq!(events[0].actor.auid, None);
+        Ok(())
     }
 
     #[test]
-    fn test_read_events_preserves_auid_zero() {
+    fn test_read_events_preserves_auid_zero() -> TestResult {
         let backend = FixtureAuthBackend::new(
-            vec![record(1, 0, Some(0), AuthOutcome::Success)],
+            vec![record(1, 0, Some(0), AuthOutcome::Success)?],
             Capability::ReadJournal,
         );
         let events = backend
             .read_events(Timestamp::UNIX_EPOCH)
-            .expect("Fixture scheitert nie");
+            .map_err(ctx("Fixture scheitert nie"))?;
         assert_eq!(events[0].actor.auid, Some(0));
+        Ok(())
     }
 
     #[test]
-    fn test_read_events_sudo_case_keeps_uid_and_auid_separate() {
+    fn test_read_events_sudo_case_keeps_uid_and_auid_separate() -> TestResult {
         let backend = FixtureAuthBackend::new(
-            vec![record(1, 0, Some(1000), AuthOutcome::Success)],
+            vec![record(1, 0, Some(1000), AuthOutcome::Success)?],
             Capability::ReadAuditNetlink,
         );
         let events = backend
             .read_events(Timestamp::UNIX_EPOCH)
-            .expect("Fixture scheitert nie");
+            .map_err(ctx("Fixture scheitert nie"))?;
         assert_eq!(events[0].actor.uid, 0);
         assert_eq!(events[0].actor.auid, Some(1000));
+        Ok(())
     }
 
     #[test]
-    fn test_read_events_filters_by_since() {
+    fn test_read_events_filters_by_since() -> TestResult {
         let backend = FixtureAuthBackend::new(
             vec![
-                record(1000, 1000, Some(1000), AuthOutcome::Success),
-                record(2000, 1000, Some(1000), AuthOutcome::Success),
+                record(1000, 1000, Some(1000), AuthOutcome::Success)?,
+                record(2000, 1000, Some(1000), AuthOutcome::Success)?,
             ],
             Capability::ReadJournal,
         );
-        let since = Timestamp::new(1500, 0).expect("gültiger Zeitstempel");
-        let events = backend.read_events(since).expect("Fixture scheitert nie");
+        let since = Timestamp::new(1500, 0).map_err(ctx("gültiger Zeitstempel"))?;
+        let events = backend
+            .read_events(since)
+            .map_err(ctx("Fixture scheitert nie"))?;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].observed_at.as_second(), 2000);
+        Ok(())
     }
 
     #[test]
-    fn test_read_events_returns_same_records_on_repeated_calls() {
+    fn test_read_events_returns_same_records_on_repeated_calls() -> TestResult {
         let backend = FixtureAuthBackend::new(
-            vec![record(1, 1000, Some(1000), AuthOutcome::Success)],
+            vec![record(1, 1000, Some(1000), AuthOutcome::Success)?],
             Capability::ReadJournal,
         );
         let first = backend
             .read_events(Timestamp::UNIX_EPOCH)
-            .expect("erster Aufruf");
+            .map_err(ctx("erster Aufruf"))?;
         let second = backend
             .read_events(Timestamp::UNIX_EPOCH)
-            .expect("zweiter Aufruf");
+            .map_err(ctx("zweiter Aufruf"))?;
         assert_eq!(first, second);
+        Ok(())
     }
 
     #[test]
-    fn test_read_events_empty_fixture_returns_empty_vec() {
+    fn test_read_events_empty_fixture_returns_empty_vec() -> TestResult {
         let backend = FixtureAuthBackend::new(Vec::<AuthRecord>::new(), Capability::ReadJournal);
         let events = backend
             .read_events(Timestamp::UNIX_EPOCH)
-            .expect("Fixture scheitert nie");
+            .map_err(ctx("Fixture scheitert nie"))?;
         assert!(events.is_empty());
+        Ok(())
     }
 }

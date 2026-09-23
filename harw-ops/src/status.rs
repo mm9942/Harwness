@@ -49,8 +49,8 @@
 use std::sync::Arc;
 
 use harw_macros::operation;
-use harw_operations::{OpContext, OpError, OpOutput};
 use harw_operations::session_control::SharedSessionController;
+use harw_operations::{OpContext, OpError, OpOutput};
 use harw_tool_shell::HostPermitHandles;
 
 /// Leerer Argument-Container für die `/status`-Operation.
@@ -62,7 +62,7 @@ use harw_tool_shell::HostPermitHandles;
 ///
 /// # Spec-Referenz
 /// Plan v2 — `/status` Meta-Definition.
-#[derive(Default, serde::Deserialize, harw_macros::FromRawArgs)]
+#[derive(Default, serde::Deserialize, harw_macros::FromRawArgs, harw_macros::OpArgs)]
 pub struct StatusArgs {}
 
 /// Gibt den aktuellen Session- und Turn-Status zurück.
@@ -176,8 +176,7 @@ async fn status(ctx: &OpContext, _args: StatusArgs) -> Result<OpOutput, OpError>
     // `global_approval_remaining` nötig.
     if let Some(handles) = ctx.service::<Arc<HostPermitHandles>>() {
         let session_id = ctx.session_id().as_str();
-        let label = if let Some(remaining) =
-            handles.registry.session_approval_remaining(session_id)
+        let label = if let Some(remaining) = handles.registry.session_approval_remaining(session_id)
         {
             format!("aktiv (noch {} min)", remaining.as_secs().div_ceil(60))
         } else if handles.registry.has_single_use(session_id) {
@@ -196,10 +195,13 @@ async fn status(ctx: &OpContext, _args: StatusArgs) -> Result<OpOutput, OpError>
 #[cfg(test)]
 mod tests {
     use super::{StatusArgs, status};
+    use crate::test_support::{TestResult, ctx};
     use crate::testutil::toks;
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_operations::context::ServiceMap;
     use harw_operations::{FromRawArgs, NullSessionController, OpContext, SessionController};
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_provider_http::{ProviderLoadControl, ProviderLoadRegistry, ProviderLoadStatus};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::sync::Arc;
@@ -235,13 +237,13 @@ mod tests {
         active_provider: Option<&str>,
         registry: Option<ProviderLoadRegistry>,
         host_permit_handles: Option<Arc<harw_tool_shell::HostPermitHandles>>,
-    ) -> (OpContext, std::path::PathBuf) {
+    ) -> TestResult<(OpContext, std::path::PathBuf)> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp =
             std::env::temp_dir().join(format!("harw-status-test-{}-{}", std::process::id(), id));
-        std::fs::create_dir_all(tmp.join("ws")).unwrap();
+        std::fs::create_dir_all(tmp.join("ws")).map_err(ctx("create test workspace"))?;
         let ws_registry = WorkspaceRegistry::build(
             &tmp,
             [WorkspaceRegistration {
@@ -250,13 +252,13 @@ mod tests {
                 root: std::path::PathBuf::from("ws"),
             }],
         )
-        .expect("WorkspaceRegistry::build");
+        .map_err(ctx("WorkspaceRegistry::build"))?;
         let binding = ws_registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .expect("resolve binding");
+            .map_err(ctx("resolve binding"))?;
         let sandbox = SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ReadWorkspace]),
@@ -266,7 +268,7 @@ mod tests {
         let ctrl = NullSessionController::new();
         if let Some(provider) = active_provider {
             ctrl.set_active_provider(provider.to_owned())
-                .expect("NullSessionController::set_active_provider");
+                .map_err(ctx("NullSessionController::set_active_provider"))?;
         }
         services.insert(Arc::new(ctrl) as harw_operations::SharedSessionController);
         if let Some(registry) = registry {
@@ -277,22 +279,25 @@ mod tests {
         }
 
         let ctx = OpContext::new(SessionId::new(), TurnId::new(), sandbox, services);
-        (ctx, tmp)
+        Ok((ctx, tmp))
     }
 
     #[tokio::test]
-    async fn status_omits_concurrency_line_without_a_load_registry() {
-        let (ctx, _tmp) = make_test_ctx(Some("openai"), None, None);
-        let output = status(&ctx, StatusArgs {}).await.expect("status must not fail");
+    async fn status_omits_concurrency_line_without_a_load_registry() -> TestResult {
+        let (ctx, _tmp) = make_test_ctx(Some("openai"), None, None)?;
+        let output = status(&ctx, StatusArgs {})
+            .await
+            .map_err(crate::test_support::ctx("status must not fail"))?;
         assert!(
             !output.text.contains("Provider-Concurrency"),
             "no registry registered — must not fabricate a status line: {}",
             output.text
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn status_shows_concurrency_line_when_registry_has_the_active_provider() {
+    async fn status_shows_concurrency_line_when_registry_has_the_active_provider() -> TestResult {
         let mut registry: ProviderLoadRegistry = ProviderLoadRegistry::new();
         registry.insert(
             "openai".to_owned(),
@@ -304,9 +309,11 @@ mod tests {
                 recent_rate_limited: 2,
             })),
         );
-        let (ctx, _tmp) = make_test_ctx(Some("openai"), Some(registry), None);
+        let (ctx, _tmp) = make_test_ctx(Some("openai"), Some(registry), None)?;
 
-        let output = status(&ctx, StatusArgs {}).await.expect("status must not fail");
+        let output = status(&ctx, StatusArgs {})
+            .await
+            .map_err(crate::test_support::ctx("status must not fail"))?;
         assert!(
             output.text.contains("Provider-Concurrency: 4"),
             "expected max_concurrency in status text: {}",
@@ -322,10 +329,11 @@ mod tests {
             "expected recent_rate_limited in status text: {}",
             output.text
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn status_omits_concurrency_line_when_registry_lacks_the_active_provider() {
+    async fn status_omits_concurrency_line_when_registry_lacks_the_active_provider() -> TestResult {
         let mut registry: ProviderLoadRegistry = ProviderLoadRegistry::new();
         registry.insert(
             "anthropic".to_owned(),
@@ -338,14 +346,17 @@ mod tests {
             })),
         );
         // Active provider is "openai", registry only has "anthropic".
-        let (ctx, _tmp) = make_test_ctx(Some("openai"), Some(registry), None);
+        let (ctx, _tmp) = make_test_ctx(Some("openai"), Some(registry), None)?;
 
-        let output = status(&ctx, StatusArgs {}).await.expect("status must not fail");
+        let output = status(&ctx, StatusArgs {})
+            .await
+            .map_err(crate::test_support::ctx("status must not fail"))?;
         assert!(
             !output.text.contains("Provider-Concurrency"),
             "registry has no entry for the active provider: {}",
             output.text
         );
+        Ok(())
     }
 
     // ── Welle 2 (Plan Teil B5) — Host-Lease-Zeile ─────────────────────────────
@@ -360,58 +371,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_omits_host_lease_line_without_handles() {
-        let (ctx, _tmp) = make_test_ctx(None, None, None);
-        let output = status(&ctx, StatusArgs {}).await.expect("status must not fail");
+    async fn status_omits_host_lease_line_without_handles() -> TestResult {
+        let (ctx, _tmp) = make_test_ctx(None, None, None)?;
+        let output = status(&ctx, StatusArgs {})
+            .await
+            .map_err(crate::test_support::ctx("status must not fail"))?;
         assert!(
             !output.text.contains("Host-Lease"),
             "no handles registered — must not fabricate a status line: {}",
             output.text
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn status_shows_host_lease_off_with_handles_but_no_approval() {
+    async fn status_shows_host_lease_off_with_handles_but_no_approval() -> TestResult {
         let handles = fresh_host_permit_handles();
-        let (ctx, _tmp) = make_test_ctx(None, None, Some(handles));
-        let output = status(&ctx, StatusArgs {}).await.expect("status must not fail");
+        let (ctx, _tmp) = make_test_ctx(None, None, Some(handles))?;
+        let output = status(&ctx, StatusArgs {})
+            .await
+            .map_err(crate::test_support::ctx("status must not fail"))?;
         assert!(
             output.text.contains("Host-Lease: aus"),
             "expected an 'aus' host-lease line: {}",
             output.text
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn status_shows_host_lease_active_with_remaining_minutes() {
+    async fn status_shows_host_lease_active_with_remaining_minutes() -> TestResult {
         let handles = fresh_host_permit_handles();
-        let (ctx, _tmp) = make_test_ctx(None, None, Some(Arc::clone(&handles)));
+        let (ctx, _tmp) = make_test_ctx(None, None, Some(Arc::clone(&handles)))?;
         handles
             .registry
             .mark_session_approved(ctx.session_id().as_str(), Duration::from_secs(600));
 
-        let output = status(&ctx, StatusArgs {}).await.expect("status must not fail");
+        let output = status(&ctx, StatusArgs {})
+            .await
+            .map_err(crate::test_support::ctx("status must not fail"))?;
         assert!(
             output.text.contains("Host-Lease: aktiv"),
             "expected an active host-lease line: {}",
             output.text
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn status_shows_host_lease_single_use() {
+    async fn status_shows_host_lease_single_use() -> TestResult {
         let handles = fresh_host_permit_handles();
-        let (ctx, _tmp) = make_test_ctx(None, None, Some(Arc::clone(&handles)));
+        let (ctx, _tmp) = make_test_ctx(None, None, Some(Arc::clone(&handles)))?;
         handles
             .registry
             .mark_single_use(ctx.session_id().as_str().to_owned());
 
-        let output = status(&ctx, StatusArgs {}).await.expect("status must not fail");
+        let output = status(&ctx, StatusArgs {})
+            .await
+            .map_err(crate::test_support::ctx("status must not fail"))?;
         assert!(
             output.text.contains("Host-Lease: Einmalfreigabe"),
             "expected a single-use host-lease line: {}",
             output.text
         );
+        Ok(())
     }
 
     /// Welle 2 setzte `mark_session_approved` mit der eigenen Session-ID
@@ -421,19 +444,23 @@ mod tests {
     /// anzeigen wie eine sitzungseigene — auch für eine Session, die selbst
     /// nie über `mark_session_approved` zugestimmt hat.
     #[tokio::test]
-    async fn status_shows_host_lease_active_for_a_global_approval_from_a_different_session() {
+    async fn status_shows_host_lease_active_for_a_global_approval_from_a_different_session()
+    -> TestResult {
         let handles = fresh_host_permit_handles();
-        let (ctx, _tmp) = make_test_ctx(None, None, Some(Arc::clone(&handles)));
+        let (ctx, _tmp) = make_test_ctx(None, None, Some(Arc::clone(&handles)))?;
         handles
             .registry
             .mark_global_approval(Duration::from_secs(600));
 
-        let output = status(&ctx, StatusArgs {}).await.expect("status must not fail");
+        let output = status(&ctx, StatusArgs {})
+            .await
+            .map_err(crate::test_support::ctx("status must not fail"))?;
         assert!(
             output.text.contains("Host-Lease: aktiv"),
             "a process-wide global approval must show as active even for a session that \
              never approved itself: {}",
             output.text
         );
+        Ok(())
     }
 }

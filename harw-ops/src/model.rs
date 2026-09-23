@@ -48,8 +48,8 @@
 //! ```
 
 use harw_macros::operation;
-use harw_operations::{OpContext, OpError, OpOutput};
 use harw_operations::session_control::UiaSelection;
+use harw_operations::{OpContext, OpError, OpOutput};
 
 // Öffentlicher Re-Export: `crate::config_util` ist `pub(crate)`, deshalb ist
 // dieser `pub use` der öffentliche Pfad, über den `harw-tui`-Tests (und
@@ -560,10 +560,7 @@ fn handle_uia_model_switch(ctx: &OpContext, target: String) -> Result<OpOutput, 
 ///
 /// # Spec
 /// harwness Plan v2 — UIA-spezifische gepinnte Provider-/Modell-Auswahl.
-fn format_uia_show(
-    selection: &UiaSelection,
-    config: &harw_config::ResolvedConfig,
-) -> String {
+fn format_uia_show(selection: &UiaSelection, config: &harw_config::ResolvedConfig) -> String {
     let model_line = match selection.model() {
         Some(id) => {
             let display = configured_model(config, id)
@@ -581,10 +578,7 @@ fn format_uia_show(
     format!("{model_line}\n{provider_line}")
 }
 
-fn format_uia_list(
-    selection: &UiaSelection,
-    config: &harw_config::ResolvedConfig,
-) -> String {
+fn format_uia_list(selection: &UiaSelection, config: &harw_config::ResolvedConfig) -> String {
     let active_model = selection.model();
     let active_provider = selection.provider();
     let mut models: Vec<_> = config.models.values().collect();
@@ -656,7 +650,7 @@ fn format_uia_list(
     domain = "catalog_config",
     permission = "operator",
     category = "model",
-    command(path = "/uia-model", visibility = "tui_only"),
+    command(path = "/uia-model", visibility = "tui_only")
 )]
 async fn uia_model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError> {
     let action = args.action.as_deref().unwrap_or("show");
@@ -809,7 +803,10 @@ fn handle_uia_worker_model_switch(
 ///
 /// # Rückgabe
 /// Fertig formatierter `String`.
-fn format_uia_worker_show(uia_provider: Option<&str>, config: &harw_config::ResolvedConfig) -> String {
+fn format_uia_worker_show(
+    uia_provider: Option<&str>,
+    config: &harw_config::ResolvedConfig,
+) -> String {
     let model_line = match config.harness.uia_worker_model.as_deref() {
         Some(id) => {
             let display = configured_model(config, id)
@@ -829,7 +826,10 @@ fn format_uia_worker_show(uia_provider: Option<&str>, config: &harw_config::Reso
 /// Formatiert das `/uia-worker-model list`-Sub-Kommando: Katalog gefiltert
 /// auf den effektiven UIA-Provider, "aktiv" markiert anhand
 /// `config.harness.uia_worker_model` (siehe [`format_uia_worker_show`]).
-fn format_uia_worker_list(uia_provider: Option<&str>, config: &harw_config::ResolvedConfig) -> String {
+fn format_uia_worker_list(
+    uia_provider: Option<&str>,
+    config: &harw_config::ResolvedConfig,
+) -> String {
     let active_model = config.harness.uia_worker_model.as_deref();
     let mut models: Vec<_> = config.models.values().collect();
     models.sort_by(|left, right| left.id.cmp(&right.id));
@@ -908,7 +908,7 @@ fn format_uia_worker_list(uia_provider: Option<&str>, config: &harw_config::Reso
     domain = "catalog_config",
     permission = "operator",
     category = "model",
-    command(path = "/uia-worker-model", visibility = "tui_only"),
+    command(path = "/uia-worker-model", visibility = "tui_only")
 )]
 async fn uia_worker_model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError> {
     let action = args.action.as_deref().unwrap_or("show");
@@ -961,12 +961,15 @@ async fn uia_worker_model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, 
 #[cfg(test)]
 mod tests {
     use super::{ModelArgs, configured_model};
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_operations::{
         FromRawArgs, NullSessionController, OpContext, OpError, SessionController,
         SharedSessionController, context::ServiceMap,
     };
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::sync::Arc;
 
@@ -1021,13 +1024,13 @@ mod tests {
     fn make_test_ctx(
         ctrl: Option<SharedSessionController>,
         config: Option<Arc<harw_config::ResolvedConfig>>,
-    ) -> (OpContext, std::path::PathBuf) {
+    ) -> TestResult<(OpContext, std::path::PathBuf)> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp =
             std::env::temp_dir().join(format!("harw-model-test-{}-{}", std::process::id(), id));
-        std::fs::create_dir_all(tmp.join("ws")).unwrap();
+        std::fs::create_dir_all(tmp.join("ws")).map_err(ctx("create test workspace"))?;
         let registry = WorkspaceRegistry::build(
             &tmp,
             [WorkspaceRegistration {
@@ -1036,13 +1039,13 @@ mod tests {
                 root: std::path::PathBuf::from("ws"),
             }],
         )
-        .expect("WorkspaceRegistry::build");
+        .map_err(ctx("WorkspaceRegistry::build"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .expect("resolve binding");
+            .map_err(ctx("resolve binding"))?;
         let sandbox = SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ReadWorkspace]),
@@ -1055,7 +1058,7 @@ mod tests {
             services.insert(config);
         }
         let ctx = OpContext::new(SessionId::new(), TurnId::new(), sandbox, services);
-        (ctx, tmp)
+        Ok((ctx, tmp))
     }
 
     /// Baut eine [`harw_config::ResolvedConfig`] mit zwei vollständig
@@ -1080,6 +1083,7 @@ mod tests {
                 max_concurrency: None,
                 originator: None,
                 default_reasoning_effort: None,
+                gateway_identity_headers: false,
             }
         }
         fn model(model_id: &str, provider_name: &str) -> harw_config::ModelToml {
@@ -1119,40 +1123,44 @@ mod tests {
     // ── FromRawArgs ───────────────────────────────────────────────────────────
 
     #[test]
-    fn test_model_args_from_raw_args_list_sets_action() {
+    fn test_model_args_from_raw_args_list_sets_action() -> TestResult {
         let args = ModelArgs::from_raw_args(&toks(&["list"]));
         match args {
             Ok(a) => assert_eq!(a.action.as_deref(), Some("list")),
-            Err(e) => panic!("Unexpected error: {e}"),
+            Err(e) => return Err(TestError::Unexpected(format!("Unexpected error: {e}"))),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_model_args_from_raw_args_empty_tokens_sets_action_none() {
+    fn test_model_args_from_raw_args_empty_tokens_sets_action_none() -> TestResult {
         let args = ModelArgs::from_raw_args(&toks(&[]));
         match args {
             Ok(a) => assert!(a.action.is_none()),
-            Err(e) => panic!("Unexpected error: {e}"),
+            Err(e) => return Err(TestError::Unexpected(format!("Unexpected error: {e}"))),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_model_args_switch_with_id_sets_target() {
+    fn test_model_args_switch_with_id_sets_target() -> TestResult {
         let args = ModelArgs::from_raw_args(&toks(&["switch", "gpt-5"]))
-            .expect("from_raw_args must not fail");
+            .map_err(ctx("from_raw_args must not fail"))?;
         assert_eq!(args.action.as_deref(), Some("switch"));
         assert_eq!(args.target.as_deref(), Some("gpt-5"));
+        Ok(())
     }
 
     #[test]
-    fn test_model_args_bare_switch_has_no_target() {
-        let args =
-            ModelArgs::from_raw_args(&toks(&["switch"])).expect("from_raw_args must not fail");
+    fn test_model_args_bare_switch_has_no_target() -> TestResult {
+        let args = ModelArgs::from_raw_args(&toks(&["switch"]))
+            .map_err(ctx("from_raw_args must not fail"))?;
         assert_eq!(args.action.as_deref(), Some("switch"));
         assert!(
             args.target.is_none(),
             "bare 'switch' must produce no target"
         );
+        Ok(())
     }
 
     // ── Task D: Unknown subcommand rejected ───────────────────────────────────
@@ -1163,9 +1171,9 @@ mod tests {
     /// # Spec
     /// harwness Plan v2 — Task D.
     #[tokio::test]
-    async fn model_unknown_subcommand_rejected() {
+    async fn model_unknown_subcommand_rejected() -> TestResult {
         let ctrl: SharedSessionController = Arc::new(NullSessionController::new());
-        let (ctx, _tmp) = make_test_ctx(Some(ctrl), None);
+        let (ctx, _tmp) = make_test_ctx(Some(ctrl), None)?;
         let args = ModelArgs {
             action: Some("frobnicate".to_owned()),
             target: None,
@@ -1183,8 +1191,13 @@ mod tests {
                     "message must list valid subcommands: {msg}"
                 );
             }
-            other => panic!("Expected InvalidArguments, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Expected InvalidArguments, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     // ── Task A: show reports live active model ────────────────────────────────
@@ -1195,22 +1208,24 @@ mod tests {
     /// # Spec
     /// harwness Plan v2 — Task A, Task E test 3.
     #[tokio::test]
-    async fn model_show_reports_active_when_set() {
+    async fn model_show_reports_active_when_set() -> TestResult {
         let ctrl = Arc::new(NullSessionController::new());
         ctrl.set_active_model("gpt-5".to_owned())
-            .expect("set_active_model must succeed");
+            .map_err(ctx("set_active_model must succeed"))?;
         ctrl.set_active_provider("openai".to_owned())
-            .expect("set_active_provider must succeed");
+            .map_err(ctx("set_active_provider must succeed"))?;
 
         let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
-        let (ctx, _tmp) = make_test_ctx(Some(shared), None);
+        let (ctx, _tmp) = make_test_ctx(Some(shared), None)?;
 
         let args = ModelArgs {
             action: Some("show".to_owned()),
             target: None,
             value: None,
         };
-        let result = super::model(&ctx, args).await.expect("show must not fail");
+        let result = super::model(&ctx, args)
+            .await
+            .map_err(crate::test_support::ctx("show must not fail"))?;
         assert!(
             result.text.contains("gpt-5"),
             "show output must contain active model id: {}",
@@ -1226,6 +1241,7 @@ mod tests {
             "show output must contain active provider: {}",
             result.text
         );
+        Ok(())
     }
 
     // ── Task B: list marks current and compatibility ──────────────────────────
@@ -1238,12 +1254,12 @@ mod tests {
     /// # Spec
     /// harwness Plan v2 — Task B, Task E test 4.
     #[test]
-    fn model_list_marks_current_and_compatibility() {
+    fn model_list_marks_current_and_compatibility() -> TestResult {
         let ctrl = Arc::new(NullSessionController::new());
         ctrl.set_active_model("gpt-5".to_owned())
-            .expect("set_active_model must succeed");
+            .map_err(ctx("set_active_model must succeed"))?;
         ctrl.set_active_provider("openai".to_owned())
-            .expect("set_active_provider must succeed");
+            .map_err(ctx("set_active_provider must succeed"))?;
 
         let mut config = harw_config::ResolvedConfig::default();
         for (key, id, provider) in [
@@ -1287,15 +1303,16 @@ mod tests {
             text.contains("other-provider"),
             "list output must contain 'other-provider' label: {text}"
         );
+        Ok(())
     }
 
     #[test]
-    fn effective_uia_selection_prefers_live_uia_and_never_generic_state() {
+    fn effective_uia_selection_prefers_live_uia_and_never_generic_state() -> TestResult {
         let ctrl = Arc::new(NullSessionController::new());
         ctrl.set_active_provider("generic-provider".to_owned())
-            .expect("generic provider selection must succeed");
+            .map_err(ctx("generic provider selection must succeed"))?;
         ctrl.set_active_model("generic-model".to_owned())
-            .expect("generic model selection must succeed");
+            .map_err(ctx("generic model selection must succeed"))?;
 
         let mut config = harw_config::ResolvedConfig::default();
         config.harness.default_provider = Some("default-provider".to_owned());
@@ -1312,16 +1329,18 @@ mod tests {
             Some("live-uia-provider".to_owned()),
             Some("live-uia-model".to_owned()),
         ))
-        .expect("UIA selection must succeed");
+        .map_err(ctx("UIA selection must succeed"))?;
         let live = super::effective_uia_selection(Some(&shared), &config);
         assert_eq!(live.provider(), Some("live-uia-provider"));
         assert_eq!(live.model(), Some("live-uia-model"));
         assert_ne!(live.provider(), Some("generic-provider"));
         assert_ne!(live.model(), Some("generic-model"));
+        Ok(())
     }
 
     #[test]
-    fn effective_uia_selection_does_not_revive_a_cleared_model_after_provider_switch() {
+    fn effective_uia_selection_does_not_revive_a_cleared_model_after_provider_switch() -> TestResult
+    {
         let ctrl = Arc::new(NullSessionController::new());
         let mut config = harw_config::ResolvedConfig::default();
         config.harness.uia_provider = Some("kimi".to_owned());
@@ -1331,12 +1350,13 @@ mod tests {
             Some("fireworks".to_owned()),
             None,
         ))
-        .expect("UIA provider switch must succeed");
+        .map_err(ctx("UIA provider switch must succeed"))?;
 
         let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
         let selection = super::effective_uia_selection(Some(&shared), &config);
         assert_eq!(selection.provider(), Some("fireworks"));
         assert_eq!(selection.model(), None);
+        Ok(())
     }
 
     // ── Welle 2 (2d), Teil 1: atomarer Provider+Modell-Wechsel via Delegation ──
@@ -1358,19 +1378,20 @@ mod tests {
     /// aktive — die zentrale Verhaltensänderung dieses Knotens gegenüber der
     /// vorherigen Provider-Mismatch-Ablehnung.
     #[test]
-    fn model_switch_to_different_provider_switches_both_atomically() {
+    fn model_switch_to_different_provider_switches_both_atomically() -> TestResult {
         let ctrl = Arc::new(NullSessionController::new());
         ctrl.set_active_provider("provider-a".to_owned())
-            .expect("seed active provider");
+            .map_err(ctx("seed active provider"))?;
         ctrl.set_active_model("model-a".to_owned())
-            .expect("seed active model");
+            .map_err(ctx("seed active model"))?;
 
         let config = Arc::new(two_provider_config());
         let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
-        let (ctx, _tmp) = make_test_ctx(Some(shared), Some(config));
+        let (ctx, _tmp) = make_test_ctx(Some(shared), Some(config))?;
 
-        let output = super::handle_switch_core(&ctx, "model-b".to_owned(), |_, _| None)
-            .expect("switching to a different provider's model must succeed");
+        let output = super::handle_switch_core(&ctx, "model-b".to_owned(), |_, _| None).map_err(
+            crate::test_support::ctx("switching to a different provider's model must succeed"),
+        )?;
         assert!(
             output.text.contains("model-b"),
             "confirmation must mention the new model: {}",
@@ -1388,23 +1409,24 @@ mod tests {
             Some("model-b"),
             "model must have switched to the requested target"
         );
+        Ok(())
     }
 
     /// UIA-Achse von [`model_switch_to_different_provider_switches_both_atomically`]:
     /// `/uia-model switch <id>` muss die UIA-Auswahl (Provider+Modell) atomar
     /// wechseln, ohne die generische `active_*`-Achse zu berühren.
     #[test]
-    fn uia_model_switch_to_different_provider_switches_both_atomically() {
+    fn uia_model_switch_to_different_provider_switches_both_atomically() -> TestResult {
         let ctrl = Arc::new(NullSessionController::new());
         ctrl.set_uia_selection(harw_operations::session_control::UiaSelection::new(
             Some("provider-a".to_owned()),
             Some("model-a".to_owned()),
         ))
-        .expect("seed UIA selection");
+        .map_err(ctx("seed UIA selection"))?;
 
         let config = Arc::new(two_provider_config());
         let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
-        let (ctx, _tmp) = make_test_ctx(Some(shared), Some(config));
+        let (ctx, _tmp) = make_test_ctx(Some(shared), Some(config))?;
 
         let output = crate::provider::handle_uia_switch_core(
             &ctx,
@@ -1412,7 +1434,9 @@ mod tests {
             Some("model-b".to_owned()),
             |_, _| None,
         )
-        .expect("switching the UIA to a different provider's model must succeed");
+        .map_err(crate::test_support::ctx(
+            "switching the UIA to a different provider's model must succeed",
+        ))?;
         assert!(
             output.text.contains("model-b"),
             "confirmation must mention the new UIA model: {}",
@@ -1426,6 +1450,7 @@ mod tests {
             "UIA provider must have switched atomically alongside the UIA model"
         );
         assert_eq!(after.model.as_deref(), Some("model-b"));
+        Ok(())
     }
 
     /// Ein `/model switch` auf ein Modell, dessen Provider deaktiviert ist,
@@ -1436,23 +1461,25 @@ mod tests {
     /// Controller überhaupt berührt wird — kein `HARW_HOME`-Zugriff nötig,
     /// weil `persist` nie erreicht wird.
     #[tokio::test]
-    async fn model_switch_to_disabled_target_provider_is_atomic_on_failure() {
+    async fn model_switch_to_disabled_target_provider_is_atomic_on_failure() -> TestResult {
         let ctrl = Arc::new(NullSessionController::new());
         ctrl.set_active_provider("provider-a".to_owned())
-            .expect("seed active provider");
+            .map_err(ctx("seed active provider"))?;
         ctrl.set_active_model("model-a".to_owned())
-            .expect("seed active model");
+            .map_err(ctx("seed active model"))?;
 
         let mut config = two_provider_config();
         config
             .providers
             .get_mut("provider-b")
-            .expect("provider-b must exist in the test fixture")
+            .ok_or(TestError::Missing(
+                "provider-b must exist in the test fixture",
+            ))?
             .enabled = false;
         let config = Arc::new(config);
 
         let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
-        let (ctx, _tmp) = make_test_ctx(Some(shared), Some(config));
+        let (ctx, _tmp) = make_test_ctx(Some(shared), Some(config))?;
 
         let before = ctrl.snapshot();
 
@@ -1465,9 +1492,11 @@ mod tests {
 
         match result {
             Err(OpError::InvalidArguments(_)) => {}
-            other => panic!(
-                "Expected InvalidArguments for a disabled target provider, got: {other:?}"
-            ),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Expected InvalidArguments for a disabled target provider, got: {other:?}"
+                )));
+            }
         }
 
         let after = ctrl.snapshot();
@@ -1479,6 +1508,7 @@ mod tests {
             before.active_model, after.active_model,
             "a failed switch must not change the active model"
         );
+        Ok(())
     }
 
     // ── Welle 2 (2d), Teil 2: `/uia-worker-model` ──────────────────────────────
@@ -1488,20 +1518,19 @@ mod tests {
     /// fails before any persistence is attempted, so no `HARW_HOME` isolation
     /// is needed.
     #[test]
-    fn handle_uia_worker_model_switch_rejects_a_model_from_a_different_provider() {
+    fn handle_uia_worker_model_switch_rejects_a_model_from_a_different_provider() -> TestResult {
         let ctrl = Arc::new(NullSessionController::new());
         ctrl.set_uia_selection(harw_operations::session_control::UiaSelection::new(
             Some("provider-a".to_owned()),
             None,
         ))
-        .expect("seed effective UIA provider");
+        .map_err(ctx("seed effective UIA provider"))?;
 
         let config = Arc::new(two_provider_config());
         let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
-        let (ctx, _tmp) = make_test_ctx(Some(shared), Some(config));
+        let (ctx, _tmp) = make_test_ctx(Some(shared), Some(config))?;
 
-        let result =
-            super::handle_uia_worker_model_switch(&ctx, "model-b".to_owned(), |_| None);
+        let result = super::handle_uia_worker_model_switch(&ctx, "model-b".to_owned(), |_| None);
 
         match result {
             Err(OpError::InvalidArguments(msg)) => {
@@ -1510,8 +1539,13 @@ mod tests {
                     "message must name both the rejected model and the effective UIA provider: {msg}"
                 );
             }
-            other => panic!("Expected InvalidArguments, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Expected InvalidArguments, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// A compatible switch must persist `uia_worker_model` and confirm with
@@ -1522,22 +1556,24 @@ mod tests {
     /// doc comment) rather than the real, `HARW_HOME`-resolving
     /// `persist_uia_worker_model`, so this test never touches the filesystem.
     #[test]
-    fn handle_uia_worker_model_switch_persists_and_confirms() {
+    fn handle_uia_worker_model_switch_persists_and_confirms() -> TestResult {
         let ctrl = Arc::new(NullSessionController::new());
         ctrl.set_uia_selection(harw_operations::session_control::UiaSelection::new(
             Some("provider-a".to_owned()),
             Some("model-a".to_owned()),
         ))
-        .expect("seed UIA selection");
+        .map_err(ctx("seed UIA selection"))?;
 
         let config = Arc::new(two_provider_config());
         let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
-        let (ctx, _tmp) = make_test_ctx(Some(shared), Some(config));
+        let (ctx, _tmp) = make_test_ctx(Some(shared), Some(config))?;
 
         let before = ctrl.uia_selection();
 
         let output = super::handle_uia_worker_model_switch(&ctx, "model-a".to_owned(), |_| None)
-            .expect("switching to a compatible UIA worker model must succeed");
+            .map_err(crate::test_support::ctx(
+                "switching to a compatible UIA worker model must succeed",
+            ))?;
 
         assert!(
             output.text.contains("für die nächste Sitzung"),
@@ -1556,6 +1592,7 @@ mod tests {
             before, after,
             "handle_uia_worker_model_switch must never mutate live SessionController state"
         );
+        Ok(())
     }
 
     /// `/uia-worker-model show` must report `config.harness.uia_worker_model`
@@ -1563,20 +1600,22 @@ mod tests {
     /// seeded on the controller to prove it does not leak into the
     /// worker-model output, which has no live counterpart of its own.
     #[tokio::test]
-    async fn uia_worker_model_show_reports_config_value_without_a_live_override() {
+    async fn uia_worker_model_show_reports_config_value_without_a_live_override() -> TestResult {
         let ctrl = Arc::new(NullSessionController::new());
         ctrl.set_uia_selection(harw_operations::session_control::UiaSelection::new(
             Some("provider-a".to_owned()),
             Some("model-b".to_owned()),
         ))
-        .expect("seed live UIA selection (must not leak into the worker-model show)");
+        .map_err(ctx(
+            "seed live UIA selection (must not leak into the worker-model show)",
+        ))?;
 
         let mut config = two_provider_config();
         config.harness.uia_worker_model = Some("model-a".to_owned());
         let config = Arc::new(config);
 
         let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
-        let (ctx, _tmp) = make_test_ctx(Some(shared), Some(config));
+        let (ctx, _tmp) = make_test_ctx(Some(shared), Some(config))?;
 
         let args = ModelArgs {
             action: Some("show".to_owned()),
@@ -1585,7 +1624,7 @@ mod tests {
         };
         let result = super::uia_worker_model(&ctx, args)
             .await
-            .expect("show must not fail");
+            .map_err(crate::test_support::ctx("show must not fail"))?;
 
         assert!(
             result.text.contains("model-a"),
@@ -1597,5 +1636,6 @@ mod tests {
             "show must not leak the live generic UIA model selection: {}",
             result.text
         );
+        Ok(())
     }
 }

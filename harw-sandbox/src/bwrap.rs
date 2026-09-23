@@ -510,9 +510,11 @@ impl BwrapLauncher {
             ]);
         }
         if let Some(profile) = &self.cargo_profile {
-            let sandbox_cargo_dir = Path::new(SANDBOX_CARGO_PATH)
-                .parent()
-                .expect("fixed sandbox cargo path has a parent");
+            let sandbox_cargo_dir = Path::new(SANDBOX_CARGO_PATH).parent().ok_or_else(|| {
+                SandboxError::FixedPathWithoutParent {
+                    path: PathBuf::from(SANDBOX_CARGO_PATH),
+                }
+            })?;
             if matches!(profile.mode(), CargoExecutionMode::Fetch)
                 && (relay.is_none() || sandbox.network_scope().is_empty())
             {
@@ -534,10 +536,7 @@ impl BwrapLauncher {
                 OsString::from(SANDBOX_CARGO_HOME),
                 OsString::from("--setenv"),
                 OsString::from("PATH"),
-                OsString::from(format!(
-                    "{}:{cargo_path_tail}",
-                    sandbox_cargo_dir.display()
-                )),
+                OsString::from(format!("{}:{cargo_path_tail}", sandbox_cargo_dir.display())),
             ]);
             if profile.mode().offline() {
                 args.extend([
@@ -554,7 +553,9 @@ impl BwrapLauncher {
                 &mut args,
                 Path::new(SANDBOX_TMUX_SOCKET_PATH)
                     .parent()
-                    .expect("fixed tmux socket path has a parent"),
+                    .ok_or_else(|| SandboxError::FixedPathWithoutParent {
+                        path: PathBuf::from(SANDBOX_TMUX_SOCKET_PATH),
+                    })?,
             )?;
             args.push(if socket_writable {
                 OsString::from("--bind")
@@ -595,13 +596,16 @@ impl BwrapLauncher {
             ]);
         }
         if let Some(profile) = &self.cargo_profile {
-            let cargo_dir = profile
-                .cargo_bin()
-                .parent()
-                .expect("canonical executable has a parent");
-            let sandbox_cargo_dir = Path::new(SANDBOX_CARGO_PATH)
-                .parent()
-                .expect("fixed sandbox cargo path has a parent");
+            let cargo_dir = profile.cargo_bin().parent().ok_or_else(|| {
+                SandboxError::FixedPathWithoutParent {
+                    path: profile.cargo_bin().to_path_buf(),
+                }
+            })?;
+            let sandbox_cargo_dir = Path::new(SANDBOX_CARGO_PATH).parent().ok_or_else(|| {
+                SandboxError::FixedPathWithoutParent {
+                    path: PathBuf::from(SANDBOX_CARGO_PATH),
+                }
+            })?;
             append_destination_dirs(&mut args, sandbox_cargo_dir)?;
             args.extend([
                 OsString::from("--ro-bind"),
@@ -1144,12 +1148,13 @@ mod tests {
     // `WorkspaceRegistry`) leben in harw-authority, nicht in dieser Crate:
     // harw-sandbox re-exportiert bewusst keine Authority-Typen (siehe
     // `crate`-Doku in `src/lib.rs`).
+    use crate::test_support::{TestError, TestResult};
     use harw_authority::{PermissionSet, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{TenantId, WorkspaceId};
 
-    fn sandbox(permissions: PermissionSet) -> SandboxSpec {
+    fn sandbox(permissions: PermissionSet) -> TestResult<SandboxSpec> {
         let root = std::env::temp_dir().join(format!("harwness-bwrap-{}", std::process::id()));
-        std::fs::create_dir_all(root.join("workspace")).unwrap();
+        std::fs::create_dir_all(root.join("workspace"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -1157,17 +1162,14 @@ mod tests {
                 workspace: WorkspaceId::from_str("workspace"),
                 root: PathBuf::from("workspace"),
             }],
-        )
-        .unwrap();
-        SandboxSpec::from_resolved(
-            registry
-                .resolve(
-                    &TenantId::from_str("tenant"),
-                    &WorkspaceId::from_str("workspace"),
-                )
-                .unwrap(),
+        )?;
+        Ok(SandboxSpec::from_resolved(
+            registry.resolve(
+                &TenantId::from_str("tenant"),
+                &WorkspaceId::from_str("workspace"),
+            )?,
             permissions,
-        )
+        ))
     }
 
     fn strings(plan: &BwrapCommandPlan) -> Vec<String> {
@@ -1178,40 +1180,38 @@ mod tests {
     }
 
     #[test]
-    fn readonly_plan_has_no_network_or_workspace_write_mount() {
+    fn readonly_plan_has_no_network_or_workspace_write_mount() -> TestResult {
+        let spec = sandbox(PermissionSet::from_policy([
+            Permission::ReadWorkspace,
+            Permission::ExecuteProcess,
+        ]))?;
         let plan = BwrapLauncher::default()
-            .plan(
-                &sandbox(PermissionSet::from_policy([
-                    Permission::ReadWorkspace,
-                    Permission::ExecuteProcess,
-                ])),
-                &[OsString::from("/bin/true")],
-            )
-            .unwrap();
+            .plan(&spec, &[OsString::from("/bin/true")])
+            .map_err(TestError::Sandbox)?;
         let args = strings(&plan);
         assert!(args.contains(&"--unshare-all".to_owned()));
         assert!(!args.contains(&"--share-net".to_owned()));
         assert!(args.contains(&"--ro-bind".to_owned()));
+        Ok(())
     }
 
     #[test]
-    fn writable_networked_plan_requires_each_explicit_permission() {
+    fn writable_networked_plan_requires_each_explicit_permission() -> TestResult {
         // W5 N-SBX: `NetworkAccess` teilt den Host-netns nicht mehr.
+        let spec = sandbox(PermissionSet::from_policy([
+            Permission::ReadWorkspace,
+            Permission::WriteWorkspace,
+            Permission::ExecuteProcess,
+            Permission::NetworkAccess,
+        ]))?;
         let plan = BwrapLauncher::default()
-            .plan(
-                &sandbox(PermissionSet::from_policy([
-                    Permission::ReadWorkspace,
-                    Permission::WriteWorkspace,
-                    Permission::ExecuteProcess,
-                    Permission::NetworkAccess,
-                ])),
-                &[OsString::from("/bin/true")],
-            )
-            .unwrap();
+            .plan(&spec, &[OsString::from("/bin/true")])
+            .map_err(TestError::Sandbox)?;
         let args = strings(&plan);
         assert!(args.contains(&"--unshare-net".to_owned()));
         assert!(!args.contains(&"--share-net".to_owned()));
         assert!(args.contains(&"--bind".to_owned()));
+        Ok(())
     }
 
     fn relay_spec() -> RelaySpec {
@@ -1222,7 +1222,7 @@ mod tests {
         }
     }
 
-    fn networked_sandbox() -> SandboxSpec {
+    fn networked_sandbox() -> TestResult<SandboxSpec> {
         sandbox(PermissionSet::from_policy([
             Permission::ReadWorkspace,
             Permission::ExecuteProcess,
@@ -1294,29 +1294,26 @@ mod tests {
     // }
 
     #[test]
-    fn plan_without_extra_roots_binds_only_the_primary_workspace() {
+    fn plan_without_extra_roots_binds_only_the_primary_workspace() -> TestResult {
         let base = sandbox(PermissionSet::from_policy([
             Permission::ReadWorkspace,
             Permission::ExecuteProcess,
-        ]));
+        ]))?;
         let primary = base.workspace().canonical_root().to_path_buf();
 
         let plan = BwrapLauncher::default()
             .plan(&base, &[OsString::from("/bin/true")])
-            .unwrap();
+            .map_err(TestError::Sandbox)?;
         let args = strings(&plan);
 
+        let primary_str = primary
+            .to_str()
+            .ok_or(TestError::Missing("primary workspace path as UTF-8"))?;
         assert_eq!(
-            count_window(
-                &args,
-                &[
-                    "--ro-bind",
-                    primary.to_str().unwrap(),
-                    primary.to_str().unwrap()
-                ]
-            ),
+            count_window(&args, &["--ro-bind", primary_str, primary_str]),
             1
         );
+        Ok(())
     }
 
     #[test]
@@ -1331,11 +1328,12 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_network_none_unshares_net_without_proxy() {
+    fn test_plan_network_none_unshares_net_without_proxy() -> TestResult {
+        let spec = networked_sandbox()?;
         let args = strings(
             &BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
-                .plan(&networked_sandbox(), &[OsString::from("/bin/true")])
-                .unwrap(),
+                .plan(&spec, &[OsString::from("/bin/true")])
+                .map_err(TestError::Sandbox)?,
         );
         assert_eq!(args.iter().filter(|a| *a == "--unshare-net").count(), 1);
         assert!(!args.contains(&"--share-net".to_owned()));
@@ -1343,18 +1341,17 @@ mod tests {
         assert!(!args.contains(&SANDBOX_RELAY_PATH.to_owned()));
         assert!(!args.contains(&SANDBOX_PROXY_SOCKET_PATH.to_owned()));
         assert!(args.contains(&"--die-with-parent".to_owned()));
+        Ok(())
     }
 
     #[test]
-    fn test_plan_proxy_only_binds_exactly_socket_and_sets_all_proxy() {
+    fn test_plan_proxy_only_binds_exactly_socket_and_sets_all_proxy() -> TestResult {
+        let spec = networked_sandbox()?;
         let args = strings(
             &BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
                 .with_network_mode(NetworkMode::ProxyOnly(relay_spec()))
-                .plan(
-                    &networked_sandbox(),
-                    &[OsString::from("/bin/echo"), OsString::from("hi")],
-                )
-                .unwrap(),
+                .plan(&spec, &[OsString::from("/bin/echo"), OsString::from("hi")])
+                .map_err(TestError::Sandbox)?,
         );
         assert!(args.contains(&"--die-with-parent".to_owned()));
         assert!(args.contains(&"--unshare-net".to_owned()));
@@ -1395,7 +1392,10 @@ mod tests {
             ),
             1
         );
-        let separator = args.iter().position(|a| a == "--").unwrap();
+        let separator = args
+            .iter()
+            .position(|a| a == "--")
+            .ok_or(TestError::Missing("'--' separator in args"))?;
         assert_eq!(
             &args[separator + 1..],
             &[
@@ -1408,22 +1408,33 @@ mod tests {
             ]
         );
         // ALL_PROXY muss nach `--clearenv` gesetzt werden, sonst wäre es gelöscht.
-        let clearenv = args.iter().position(|a| a == "--clearenv").unwrap();
-        let all_proxy = args.iter().position(|a| a == "ALL_PROXY").unwrap();
+        let clearenv = args
+            .iter()
+            .position(|a| a == "--clearenv")
+            .ok_or(TestError::Missing("'--clearenv' in args"))?;
+        let all_proxy = args
+            .iter()
+            .position(|a| a == "ALL_PROXY")
+            .ok_or(TestError::Missing("'ALL_PROXY' in args"))?;
         assert!(clearenv < all_proxy && all_proxy < separator);
+        Ok(())
     }
 
     #[test]
-    fn test_plan_proxy_only_without_network_access_is_denied() {
+    fn test_plan_proxy_only_without_network_access_is_denied() -> TestResult {
+        let spec = execute_sandbox()?;
         let error = BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
             .with_network_mode(NetworkMode::ProxyOnly(relay_spec()))
-            .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
-            .unwrap_err();
+            .plan(&spec, &[OsString::from("/bin/true")]);
+        let Err(error) = error else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(error, SandboxError::NetworkModeNotGranted));
+        Ok(())
     }
 
     #[test]
-    fn test_plan_proxy_only_rejects_invalid_relay_spec() {
+    fn test_plan_proxy_only_rejects_invalid_relay_spec() -> TestResult {
         let cases = [
             (
                 RelaySpec {
@@ -1462,19 +1473,23 @@ mod tests {
             ),
         ];
         for (spec, expected) in cases {
-            let error = BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
+            let networked = networked_sandbox()?;
+            let result = BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
                 .with_network_mode(NetworkMode::ProxyOnly(spec))
-                .plan(&networked_sandbox(), &[OsString::from("/bin/true")])
-                .unwrap_err();
+                .plan(&networked, &[OsString::from("/bin/true")]);
+            let Err(error) = result else {
+                return Err(TestError::Unexpected("Err erwartet".into()));
+            };
             assert!(
                 matches!(error, SandboxError::InvalidRelaySpec { field, .. } if field == expected),
                 "expected InvalidRelaySpec({expected}), got {error:?}"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_plan_never_shares_net_in_any_combination() {
+    fn test_plan_never_shares_net_in_any_combination() -> TestResult {
         let optional = [
             Permission::ReadWorkspace,
             Permission::WriteWorkspace,
@@ -1497,7 +1512,7 @@ mod tests {
                 if execute {
                     granted.push(Permission::ExecuteProcess);
                 }
-                let spec = sandbox(PermissionSet::from_policy(granted));
+                let spec = sandbox(PermissionSet::from_policy(granted))?;
                 for mode in &modes {
                     for size in sizes {
                         let mut launcher = BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
@@ -1523,21 +1538,21 @@ mod tests {
         }
         // 64 Masken mit ExecuteProcess × 2 Größen × None + 32 mit NetworkAccess × 2 × ProxyOnly.
         assert_eq!(planned, 64 * 2 + 32 * 2);
+        Ok(())
     }
 
     #[test]
     #[ignore = "startet /bin/sleep als Host-Prozess; Laufzeit-Erkennung im Test"]
-    fn test_sandbox_child_drop_kills_and_reaps_process() {
+    fn test_sandbox_child_drop_kills_and_reaps_process() -> TestResult {
         let sleep = Path::new("/bin/sleep");
         if !sleep.is_file() {
             eprintln!("übersprungen: /bin/sleep fehlt");
-            return;
+            return Ok(());
         }
         let child = Command::new(sleep)
             .arg("300")
             .stdin(Stdio::null())
-            .spawn()
-            .unwrap();
+            .spawn()?;
         let guard = SandboxChild::new(child, sleep);
         let proc_entry = PathBuf::from(format!("/proc/{}", guard.id()));
         assert!(proc_entry.exists());
@@ -1546,49 +1561,53 @@ mod tests {
         // Nach kill + wait ist der Prozess eingesammelt: kein /proc-Eintrag mehr.
         assert!(!proc_entry.exists());
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        Ok(())
     }
 
     #[test]
     #[ignore = "startet /bin/echo als Host-Prozess; Laufzeit-Erkennung im Test"]
-    fn test_spawn_pipes_output_and_wait_collects_status() {
+    fn test_spawn_pipes_output_and_wait_collects_status() -> TestResult {
         use std::io::Read;
         let echo = Path::new("/bin/echo");
         if !echo.is_file() {
             eprintln!("übersprungen: /bin/echo fehlt");
-            return;
+            return Ok(());
         }
         // `/bin/echo` statt bwrap: druckt den Argumentvektor des Plans.
         let launcher = BwrapLauncher::new(echo.to_path_buf());
+        let spec = execute_sandbox()?;
         let plan = launcher
-            .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
-            .unwrap();
-        let mut child = launcher.spawn(&plan).unwrap();
-        let mut stdout = child.take_stdout().unwrap();
+            .plan(&spec, &[OsString::from("/bin/true")])
+            .map_err(TestError::Sandbox)?;
+        let mut child = launcher.spawn(&plan).map_err(TestError::Sandbox)?;
+        let mut stdout = child
+            .take_stdout()
+            .ok_or(TestError::Missing("child stdout"))?;
         assert!(child.take_stdout().is_none());
         assert!(child.take_stderr().is_some());
         let mut output = String::new();
-        stdout.read_to_string(&mut output).unwrap();
+        stdout.read_to_string(&mut output)?;
         assert!(output.contains("--unshare-net"));
-        assert!(child.wait().unwrap().success());
+        assert!(child.wait()?.success());
         // Wiederholtes Warten liefert denselben Status; Drop tötet nicht mehr.
-        assert!(child.wait().unwrap().success());
+        assert!(child.wait()?.success());
+        Ok(())
     }
 
     #[tokio::test]
     #[ignore = "startet /bin/sleep als Host-Prozess; Laufzeit-Erkennung im Test"]
-    async fn wait_or_cancel_kills_and_reaps_long_running_process_on_cancel() {
+    async fn wait_or_cancel_kills_and_reaps_long_running_process_on_cancel() -> TestResult {
         use harw_types::cancel::{CancelReason, CancelToken};
 
         let sleep = Path::new("/bin/sleep");
         if !sleep.is_file() {
             eprintln!("übersprungen: /bin/sleep fehlt");
-            return;
+            return Ok(());
         }
         let child = Command::new(sleep)
             .arg("300")
             .stdin(Stdio::null())
-            .spawn()
-            .unwrap();
+            .spawn()?;
         let mut guard = SandboxChild::new(child, sleep);
         let proc_entry = PathBuf::from(format!("/proc/{}", guard.id()));
         assert!(proc_entry.exists());
@@ -1601,48 +1620,50 @@ mod tests {
         });
 
         let started = std::time::Instant::now();
-        let result = guard.wait_or_cancel(&cancel).await.unwrap();
+        let result = guard.wait_or_cancel(&cancel).await?;
         assert!(result.is_none(), "cancel must yield None, got {result:?}");
         // Nach Kill + Wait ist der Prozess eingesammelt: kein /proc-Eintrag mehr.
         assert!(!proc_entry.exists());
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
         // `Drop` darf den bereits eingesammelten Prozess nicht erneut töten.
         drop(guard);
+        Ok(())
     }
 
     #[tokio::test]
     #[ignore = "startet /bin/true als Host-Prozess; Laufzeit-Erkennung im Test"]
-    async fn wait_or_cancel_returns_exit_status_without_cancel() {
+    async fn wait_or_cancel_returns_exit_status_without_cancel() -> TestResult {
         use harw_types::cancel::CancelToken;
 
         let true_bin = Path::new("/bin/true");
         if !true_bin.is_file() {
             eprintln!("übersprungen: /bin/true fehlt");
-            return;
+            return Ok(());
         }
-        let child = Command::new(true_bin).stdin(Stdio::null()).spawn().unwrap();
+        let child = Command::new(true_bin).stdin(Stdio::null()).spawn()?;
         let mut guard = SandboxChild::new(child, true_bin);
         let cancel = CancelToken::new();
 
-        let status = guard.wait_or_cancel(&cancel).await.unwrap();
+        let status = guard.wait_or_cancel(&cancel).await?;
         assert!(
             status.is_some_and(|status| status.success()),
             "expected Some(success), got {status:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn process_start_is_denied_without_execute_permission() {
-        let error = BwrapLauncher::default()
-            .plan(
-                &sandbox(PermissionSet::from_policy([Permission::ReadWorkspace])),
-                &[OsString::from("/bin/true")],
-            )
-            .unwrap_err();
+    fn process_start_is_denied_without_execute_permission() -> TestResult {
+        let spec = sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
+        let result = BwrapLauncher::default().plan(&spec, &[OsString::from("/bin/true")]);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(error, SandboxError::ProcessExecutionDenied));
+        Ok(())
     }
 
-    fn execute_sandbox() -> SandboxSpec {
+    fn execute_sandbox() -> TestResult<SandboxSpec> {
         sandbox(PermissionSet::from_policy([
             Permission::ReadWorkspace,
             Permission::ExecuteProcess,
@@ -1650,19 +1671,20 @@ mod tests {
     }
 
     #[test]
-    fn tmpfs_size_directly_precedes_tmpfs_action() {
-        let size = NonZeroU64::new(268_435_456).unwrap();
+    fn tmpfs_size_directly_precedes_tmpfs_action() -> TestResult {
+        let size = NonZeroU64::new(268_435_456).ok_or(TestError::Missing("non-zero tmpfs size"))?;
         let launcher = BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap")).with_tmpfs_size(size);
         assert_eq!(launcher.tmpfs_size(), Some(size));
+        let spec = execute_sandbox()?;
         let args = strings(
             &launcher
-                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
-                .unwrap(),
+                .plan(&spec, &[OsString::from("/bin/true")])
+                .map_err(TestError::Sandbox)?,
         );
         let tmpfs = args
             .iter()
             .position(|argument| argument == "--tmpfs")
-            .unwrap();
+            .ok_or(TestError::Missing("'--tmpfs' in args"))?;
         // bwrap(1): `--size` gilt nur für die unmittelbar folgende `--tmpfs`-Aktion.
         assert_eq!(args[tmpfs - 2], "--size");
         assert_eq!(args[tmpfs - 1], "268435456");
@@ -1671,18 +1693,21 @@ mod tests {
             args.iter().filter(|argument| *argument == "--size").count(),
             1
         );
+        Ok(())
     }
 
     #[test]
-    fn plan_without_tmpfs_size_has_no_size_option() {
+    fn plan_without_tmpfs_size_has_no_size_option() -> TestResult {
         let launcher = BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"));
         assert_eq!(launcher.tmpfs_size(), None);
+        let spec = execute_sandbox()?;
         let args = strings(
             &launcher
-                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
-                .unwrap(),
+                .plan(&spec, &[OsString::from("/bin/true")])
+                .map_err(TestError::Sandbox)?,
         );
         assert!(!args.contains(&"--size".to_owned()));
+        Ok(())
     }
 
     #[test]
@@ -1699,10 +1724,14 @@ mod tests {
     }
 
     #[test]
-    fn discover_returns_only_trusted_fixed_candidates() {
+    fn discover_returns_only_trusted_fixed_candidates() -> TestResult {
         match BwrapLauncher::discover() {
             Ok(launcher) => {
-                assert!(BWRAP_CANDIDATES.contains(&launcher.executable().to_str().unwrap()));
+                let executable_str = launcher
+                    .executable()
+                    .to_str()
+                    .ok_or(TestError::Missing("launcher executable as UTF-8"))?;
+                assert!(BWRAP_CANDIDATES.contains(&executable_str));
                 assert!(check_pinned_executable(launcher.executable()).is_ok());
             }
             Err(error) => {
@@ -1714,6 +1743,7 @@ mod tests {
                 );
             }
         }
+        Ok(())
     }
 
     #[test]
@@ -1745,16 +1775,16 @@ mod tests {
     }
 
     #[test]
-    fn user_owned_executable_is_not_trusted() {
+    fn user_owned_executable_is_not_trusted() -> TestResult {
         let directory =
             std::env::temp_dir().join(format!("harwness-bwrap-fake-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::create_dir_all(&directory)?;
         let fake = directory.join("bwrap");
-        std::fs::write(&fake, b"#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        if std::fs::metadata(&fake).unwrap().uid() == 0 {
+        std::fs::write(&fake, b"#!/bin/sh\nexit 0\n")?;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))?;
+        if std::fs::metadata(&fake)?.uid() == 0 {
             eprintln!("übersprungen: Test läuft als root, Eigentümerprüfung nicht beobachtbar");
-            return;
+            return Ok(());
         }
         assert_eq!(
             check_pinned_executable(&fake),
@@ -1764,7 +1794,8 @@ mod tests {
             BwrapLauncher::find_pinned_executable(&[fake.as_path()]),
             None
         );
-        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::remove_dir_all(&directory)?;
+        Ok(())
     }
 
     #[test]
@@ -1783,90 +1814,88 @@ mod tests {
     }
 
     #[test]
-    fn spawn_rejects_relative_executable() {
+    fn spawn_rejects_relative_executable() -> TestResult {
+        let spec = execute_sandbox()?;
         let plan = BwrapLauncher::default()
-            .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
-            .unwrap();
-        let error = BwrapLauncher::new(PathBuf::from("bwrap"))
-            .spawn(&plan)
-            .unwrap_err();
+            .plan(&spec, &[OsString::from("/bin/true")])
+            .map_err(TestError::Sandbox)?;
+        let result = BwrapLauncher::new(PathBuf::from("bwrap")).spawn(&plan);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(
             error,
             SandboxError::SandboxProcessSpawn { ref reason, .. } if reason.contains("absolute")
         ));
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn tmux_profile_binds_socket_readonly_in_inspect_mode() {
+    fn tmux_profile_binds_socket_readonly_in_inspect_mode() -> TestResult {
         use std::os::unix::net::UnixListener;
         let dir = std::env::temp_dir().join(format!(
             "harwness-bwrap-tmux-inspect-{}",
             std::process::id()
         ));
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir)?;
         let sock = dir.join("tmux.sock");
-        let _listener = UnixListener::bind(&sock).unwrap();
-        let profile =
-            crate::TmuxSandboxProfile::new(crate::TmuxOperationMode::Inspect, &sock).unwrap();
+        let _listener = UnixListener::bind(&sock)?;
+        let profile = crate::TmuxSandboxProfile::new(crate::TmuxOperationMode::Inspect, &sock)?;
         let launcher =
             BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap")).with_tmux_profile(profile);
+        let spec = execute_sandbox()?;
         let args = strings(
             &launcher
-                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
-                .unwrap(),
+                .plan(&spec, &[OsString::from("/bin/true")])
+                .map_err(TestError::Sandbox)?,
         );
+        let sock_str = sock
+            .to_str()
+            .ok_or(TestError::Missing("tmux socket path as UTF-8"))?;
         // Socket wird ge-binded (ro-bind im Inspect-Modus)
         assert_eq!(
-            count_window(
-                &args,
-                &[
-                    "--ro-bind",
-                    sock.to_str().unwrap(),
-                    SANDBOX_TMUX_SOCKET_PATH
-                ]
-            ),
+            count_window(&args, &["--ro-bind", sock_str, SANDBOX_TMUX_SOCKET_PATH]),
             1,
             "tmux socket must be bound read-only in inspect mode: {args:?}"
         );
         // Kein --bind fuer den Socket
         assert_eq!(
-            count_window(
-                &args,
-                &["--bind", sock.to_str().unwrap(), SANDBOX_TMUX_SOCKET_PATH]
-            ),
+            count_window(&args, &["--bind", sock_str, SANDBOX_TMUX_SOCKET_PATH]),
             0
         );
         std::fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn tmux_profile_binds_socket_writable_in_write_mode() {
+    fn tmux_profile_binds_socket_writable_in_write_mode() -> TestResult {
         use std::os::unix::net::UnixListener;
         let dir =
             std::env::temp_dir().join(format!("harwness-bwrap-tmux-write-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir)?;
         let sock = dir.join("tmux-write.sock");
-        let _listener = UnixListener::bind(&sock).unwrap();
-        let profile =
-            crate::TmuxSandboxProfile::new(crate::TmuxOperationMode::Write, &sock).unwrap();
+        let _listener = UnixListener::bind(&sock)?;
+        let profile = crate::TmuxSandboxProfile::new(crate::TmuxOperationMode::Write, &sock)?;
         let launcher =
             BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap")).with_tmux_profile(profile);
+        let spec = execute_sandbox()?;
         let args = strings(
             &launcher
-                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
-                .unwrap(),
+                .plan(&spec, &[OsString::from("/bin/true")])
+                .map_err(TestError::Sandbox)?,
         );
+        let sock_str = sock
+            .to_str()
+            .ok_or(TestError::Missing("tmux socket path as UTF-8"))?;
         assert_eq!(
-            count_window(
-                &args,
-                &["--bind", sock.to_str().unwrap(), SANDBOX_TMUX_SOCKET_PATH]
-            ),
+            count_window(&args, &["--bind", sock_str, SANDBOX_TMUX_SOCKET_PATH]),
             1,
             "tmux socket must be bound writable in write mode: {args:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 
     #[test]
@@ -1878,15 +1907,17 @@ mod tests {
     // ---- C1: HostPathBinding / BwrapLauncher::with_host_path ----
 
     #[test]
-    fn from_env_reads_real_process_path_when_set() {
+    fn from_env_reads_real_process_path_when_set() -> TestResult {
         if let Ok(expected) = std::env::var("PATH") {
             if expected.is_empty() {
                 assert_eq!(HostPathBinding::from_env(), None);
             } else {
-                let binding = HostPathBinding::from_env().expect("PATH is set and non-empty");
+                let binding = HostPathBinding::from_env()
+                    .ok_or(TestError::Missing("PATH is set and non-empty"))?;
                 assert_eq!(binding.path, expected);
             }
         }
+        Ok(())
     }
 
     #[test]
@@ -1902,18 +1933,19 @@ mod tests {
     }
 
     #[test]
-    fn plan_with_host_path_binds_each_directory_and_sets_full_path() {
+    fn plan_with_host_path_binds_each_directory_and_sets_full_path() -> TestResult {
         let binding = HostPathBinding {
             path: "/opt/tool-a/bin:/opt/tool-b/bin".to_owned(),
             home: Some(PathBuf::from("/home/tester")),
             rustup_home: None,
             cargo_home: None,
         };
+        let spec = execute_sandbox()?;
         let args = strings(
             &BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
                 .with_host_path(binding)
-                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
-                .unwrap(),
+                .plan(&spec, &[OsString::from("/bin/true")])
+                .map_err(TestError::Sandbox)?,
         );
         assert_eq!(
             count_window(
@@ -1941,11 +1973,12 @@ mod tests {
         );
         // HOME bleibt unverändert im Sandbox-tmpfs (Plan Teil C1).
         assert_eq!(count_window(&args, &["--setenv", "HOME", "/tmp/home"]), 1);
+        Ok(())
     }
 
     #[test]
-    fn plan_with_host_path_excludes_root_home_stdlib_and_workspace_entries() {
-        let base = execute_sandbox();
+    fn plan_with_host_path_excludes_root_home_stdlib_and_workspace_entries() -> TestResult {
+        let base = execute_sandbox()?;
         let workspace = base.workspace().canonical_root().to_path_buf();
         let nested_workspace_dir = workspace.join("node_modules/.bin");
         let binding = HostPathBinding {
@@ -1961,7 +1994,7 @@ mod tests {
             &BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
                 .with_host_path(binding)
                 .plan(&base, &[OsString::from("/bin/true")])
-                .unwrap(),
+                .map_err(TestError::Sandbox)?,
         );
         assert_eq!(
             count_window(&args, &["--ro-bind-try", "/", "/"]),
@@ -1978,21 +2011,23 @@ mod tests {
             1,
             "{args:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn plan_with_host_path_dedupes_repeated_entries() {
+    fn plan_with_host_path_dedupes_repeated_entries() -> TestResult {
         let binding = HostPathBinding {
             path: "/opt/tool/bin:/opt/tool/bin:/opt/tool/bin".to_owned(),
             home: None,
             rustup_home: None,
             cargo_home: None,
         };
+        let spec = execute_sandbox()?;
         let args = strings(
             &BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
                 .with_host_path(binding)
-                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
-                .unwrap(),
+                .plan(&spec, &[OsString::from("/bin/true")])
+                .map_err(TestError::Sandbox)?,
         );
         assert_eq!(
             count_window(&args, &["--ro-bind-try", "/opt/tool/bin", "/opt/tool/bin"]),
@@ -2006,21 +2041,23 @@ mod tests {
             1,
             "{args:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn plan_with_host_path_binds_rustup_and_cargo_home_when_cargo_bin_in_path() {
+    fn plan_with_host_path_binds_rustup_and_cargo_home_when_cargo_bin_in_path() -> TestResult {
         let binding = HostPathBinding {
             path: "/home/tester/.cargo/bin:/usr/bin".to_owned(),
             home: Some(PathBuf::from("/home/tester")),
             rustup_home: None,
             cargo_home: None,
         };
+        let spec = execute_sandbox()?;
         let args = strings(
             &BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
                 .with_host_path(binding)
-                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
-                .unwrap(),
+                .plan(&spec, &[OsString::from("/bin/true")])
+                .map_err(TestError::Sandbox)?,
         );
         assert_eq!(
             count_window(
@@ -2047,10 +2084,7 @@ mod tests {
             "{args:?}"
         );
         assert_eq!(
-            count_window(
-                &args,
-                &["--setenv", "RUSTUP_HOME", "/home/tester/.rustup"]
-            ),
+            count_window(&args, &["--setenv", "RUSTUP_HOME", "/home/tester/.rustup"]),
             1,
             "{args:?}"
         );
@@ -2059,46 +2093,48 @@ mod tests {
             1,
             "{args:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn plan_with_host_path_without_cargo_bin_in_path_skips_rustup_and_cargo_home() {
+    fn plan_with_host_path_without_cargo_bin_in_path_skips_rustup_and_cargo_home() -> TestResult {
         let binding = HostPathBinding {
             path: "/usr/bin:/opt/tool/bin".to_owned(),
             home: Some(PathBuf::from("/home/tester")),
             rustup_home: None,
             cargo_home: None,
         };
+        let spec = execute_sandbox()?;
         let args = strings(
             &BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
                 .with_host_path(binding)
-                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
-                .unwrap(),
+                .plan(&spec, &[OsString::from("/bin/true")])
+                .map_err(TestError::Sandbox)?,
         );
         assert!(
             !args.iter().any(|a| a == "/home/tester/.rustup"),
             "{args:?}"
         );
-        assert!(
-            !args.iter().any(|a| a == "/home/tester/.cargo"),
-            "{args:?}"
-        );
+        assert!(!args.iter().any(|a| a == "/home/tester/.cargo"), "{args:?}");
         assert!(!args.iter().any(|a| a == "RUSTUP_HOME"), "{args:?}");
+        Ok(())
     }
 
     #[test]
-    fn plan_with_host_path_prefers_explicit_rustup_and_cargo_home_over_home_derived() {
+    fn plan_with_host_path_prefers_explicit_rustup_and_cargo_home_over_home_derived() -> TestResult
+    {
         let binding = HostPathBinding {
             path: "/custom/cargo/bin:/usr/bin".to_owned(),
             home: Some(PathBuf::from("/home/tester")),
             rustup_home: Some(PathBuf::from("/custom/rustup")),
             cargo_home: Some(PathBuf::from("/custom/cargo")),
         };
+        let spec = execute_sandbox()?;
         let args = strings(
             &BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
                 .with_host_path(binding)
-                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
-                .unwrap(),
+                .plan(&spec, &[OsString::from("/bin/true")])
+                .map_err(TestError::Sandbox)?,
         );
         assert_eq!(
             count_window(&args, &["--setenv", "RUSTUP_HOME", "/custom/rustup"]),
@@ -2114,14 +2150,12 @@ mod tests {
             !args.iter().any(|a| a == "/home/tester/.rustup"),
             "{args:?}"
         );
-        assert!(
-            !args.iter().any(|a| a == "/home/tester/.cargo"),
-            "{args:?}"
-        );
+        assert!(!args.iter().any(|a| a == "/home/tester/.cargo"), "{args:?}");
+        Ok(())
     }
 
     #[test]
-    fn plan_with_host_path_and_cargo_profile_gives_cargo_profile_precedence() {
+    fn plan_with_host_path_and_cargo_profile_gives_cargo_profile_precedence() -> TestResult {
         let dir = std::env::temp_dir().join(format!(
             "harwness-bwrap-host-path-cargo-{}",
             std::process::id()
@@ -2129,20 +2163,19 @@ mod tests {
         let bin_dir = dir.join("bin");
         let rustup_home = dir.join("rustup");
         let cargo_home = dir.join("cargo");
-        std::fs::create_dir_all(&bin_dir).unwrap();
-        std::fs::create_dir_all(&rustup_home).unwrap();
-        std::fs::create_dir_all(&cargo_home).unwrap();
+        std::fs::create_dir_all(&bin_dir)?;
+        std::fs::create_dir_all(&rustup_home)?;
+        std::fs::create_dir_all(&cargo_home)?;
         let cargo_bin = bin_dir.join("cargo");
-        std::fs::write(&cargo_bin, b"#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&cargo_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&cargo_bin, b"#!/bin/sh\nexit 0\n")?;
+        std::fs::set_permissions(&cargo_bin, std::fs::Permissions::from_mode(0o755))?;
 
         let profile = crate::CargoSandboxProfile::new(
             crate::CargoExecutionMode::Inspect,
             &cargo_bin,
             &rustup_home,
             &cargo_home,
-        )
-        .unwrap();
+        )?;
 
         let binding = HostPathBinding {
             path: "/home/tester/.cargo/bin:/usr/bin".to_owned(),
@@ -2151,12 +2184,13 @@ mod tests {
             cargo_home: None,
         };
 
+        let spec = execute_sandbox()?;
         let args = strings(
             &BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
                 .with_cargo_profile(profile)
                 .with_host_path(binding)
-                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
-                .unwrap(),
+                .plan(&spec, &[OsString::from("/bin/true")])
+                .map_err(TestError::Sandbox)?,
         );
 
         // Das Cargo-Profil hat Vorrang: genau eine RUSTUP_HOME/CARGO_HOME-
@@ -2186,14 +2220,13 @@ mod tests {
             !args.iter().any(|a| a == "/home/tester/.rustup"),
             "{args:?}"
         );
-        assert!(
-            !args.iter().any(|a| a == "/home/tester/.cargo"),
-            "{args:?}"
-        );
+        assert!(!args.iter().any(|a| a == "/home/tester/.cargo"), "{args:?}");
         // PATH: Cargo-bin der Sandbox vorangestellt, dahinter der volle
         // Host-PATH (C1: "bei gesetztem cargo_profile: dessen bin-Dir
         // voranstellen wie heute").
-        let sandbox_cargo_dir = Path::new(SANDBOX_CARGO_PATH).parent().unwrap();
+        let sandbox_cargo_dir = Path::new(SANDBOX_CARGO_PATH)
+            .parent()
+            .ok_or(TestError::Missing("SANDBOX_CARGO_PATH parent"))?;
         let expected_path = format!(
             "{}:/home/tester/.cargo/bin:/usr/bin",
             sandbox_cargo_dir.display()
@@ -2205,6 +2238,7 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 
     // ---- Zusatzauftrag: echte Prozessidentität in der Sandbox ----
@@ -2218,12 +2252,13 @@ mod tests {
     }
 
     #[test]
-    fn plan_with_identity_sets_uid_gid_and_unshare_user_in_valid_order() {
+    fn plan_with_identity_sets_uid_gid_and_unshare_user_in_valid_order() -> TestResult {
+        let spec = execute_sandbox()?;
         let args = strings(
             &BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
                 .with_identity(4242, 4343)
-                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
-                .unwrap(),
+                .plan(&spec, &[OsString::from("/bin/true")])
+                .map_err(TestError::Sandbox)?,
         );
         assert_eq!(count_window(&args, &["--uid", "4242"]), 1, "{args:?}");
         assert_eq!(count_window(&args, &["--gid", "4343"]), 1, "{args:?}");
@@ -2234,19 +2269,30 @@ mod tests {
         );
         // bwrap(1): `--uid`/`--gid` verlangen ein explizites `--unshare-user`;
         // es muss vor beiden stehen, damit bwrap den Start nicht ablehnt.
-        let unshare_user = args.iter().position(|a| a == "--unshare-user").unwrap();
-        let uid_flag = args.iter().position(|a| a == "--uid").unwrap();
-        let gid_flag = args.iter().position(|a| a == "--gid").unwrap();
+        let unshare_user = args
+            .iter()
+            .position(|a| a == "--unshare-user")
+            .ok_or(TestError::Missing("'--unshare-user' in args"))?;
+        let uid_flag = args
+            .iter()
+            .position(|a| a == "--uid")
+            .ok_or(TestError::Missing("'--uid' in args"))?;
+        let gid_flag = args
+            .iter()
+            .position(|a| a == "--gid")
+            .ok_or(TestError::Missing("'--gid' in args"))?;
         assert!(unshare_user < uid_flag, "{args:?}");
         assert!(unshare_user < gid_flag, "{args:?}");
+        Ok(())
     }
 
     #[test]
-    fn plan_uses_resolved_process_identity_by_default() {
+    fn plan_uses_resolved_process_identity_by_default() -> TestResult {
+        let spec = execute_sandbox()?;
         let args = strings(
             &BwrapLauncher::default()
-                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
-                .unwrap(),
+                .plan(&spec, &[OsString::from("/bin/true")])
+                .map_err(TestError::Sandbox)?,
         );
         match resolve_process_identity() {
             Some((uid, gid)) => {
@@ -2268,14 +2314,16 @@ mod tests {
                 assert!(!args.contains(&"--unshare-user".to_owned()), "{args:?}");
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn plan_binds_etc_nss_files_for_every_profile() {
+    fn plan_binds_etc_nss_files_for_every_profile() -> TestResult {
+        let spec = execute_sandbox()?;
         let args = strings(
             &BwrapLauncher::default()
-                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
-                .unwrap(),
+                .plan(&spec, &[OsString::from("/bin/true")])
+                .map_err(TestError::Sandbox)?,
         );
         for nss_file in ["/etc/passwd", "/etc/group", "/etc/nsswitch.conf"] {
             assert_eq!(
@@ -2285,14 +2333,16 @@ mod tests {
             );
         }
         assert_eq!(count_window(&args, &["--dir", "/etc"]), 1, "{args:?}");
+        Ok(())
     }
 
     #[test]
-    fn plan_user_and_logname_match_host_username_resolution() {
+    fn plan_user_and_logname_match_host_username_resolution() -> TestResult {
+        let spec = execute_sandbox()?;
         let args = strings(
             &BwrapLauncher::default()
-                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
-                .unwrap(),
+                .plan(&spec, &[OsString::from("/bin/true")])
+                .map_err(TestError::Sandbox)?,
         );
         match host_username() {
             Some(name) => {
@@ -2312,5 +2362,6 @@ mod tests {
                 assert!(!args.contains(&"LOGNAME".to_owned()), "{args:?}");
             }
         }
+        Ok(())
     }
 }

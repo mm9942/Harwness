@@ -139,18 +139,16 @@ pub fn apply_merge_op(current: &mut toml::Value, op: MergeOp) -> Result<(), DslE
 /// # Fehler
 /// - [`DslError::UnknownMergeOp`]: wenn `val` kein Array ist.
 fn require_array(val: &mut toml::Value) -> Result<&mut Vec<toml::Value>, DslError> {
-    if !val.is_array() {
-        let type_name = val.type_str().to_owned();
-        return Err(DslError::UnknownMergeOp {
-            name: format!("Array-Operation auf Nicht-Array-Typ '{type_name}'"),
-        });
-    }
-    Ok(val.as_array_mut().unwrap())
+    let type_name = val.type_str().to_owned();
+    val.as_array_mut().ok_or_else(|| DslError::UnknownMergeOp {
+        name: format!("Array-Operation auf Nicht-Array-Typ '{type_name}'"),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     fn str_val(s: &str) -> toml::Value {
         toml::Value::String(s.to_owned())
@@ -161,76 +159,77 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_op() {
+    fn test_replace_op() -> TestResult {
         let mut val = str_val("alt");
         apply_merge_op(
             &mut val,
             MergeOp::Replace {
                 value: str_val("neu"),
             },
-        )
-        .unwrap();
+        )?;
         assert_eq!(val, str_val("neu"));
+        Ok(())
     }
 
     #[test]
-    fn test_append_op_on_array() {
+    fn test_append_op_on_array() -> TestResult {
         let mut val = arr(&["a", "b"]);
         apply_merge_op(
             &mut val,
             MergeOp::Append {
                 values: vec![str_val("c")],
             },
-        )
-        .unwrap();
-        assert_eq!(val.as_array().unwrap().len(), 3);
-        assert_eq!(val.as_array().unwrap()[2], str_val("c"));
+        )?;
+        let items = val.as_array().ok_or(TestError::Missing("val as array"))?;
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[2], str_val("c"));
+        Ok(())
     }
 
     #[test]
-    fn test_prepend_op_on_array() {
+    fn test_prepend_op_on_array() -> TestResult {
         let mut val = arr(&["b", "c"]);
         apply_merge_op(
             &mut val,
             MergeOp::Prepend {
                 values: vec![str_val("a")],
             },
-        )
-        .unwrap();
-        let items = val.as_array().unwrap();
+        )?;
+        let items = val.as_array().ok_or(TestError::Missing("val as array"))?;
         assert_eq!(items[0], str_val("a"));
         assert_eq!(items.len(), 3);
+        Ok(())
     }
 
     #[test]
-    fn test_remove_op() {
+    fn test_remove_op() -> TestResult {
         let mut val = arr(&["web-search", "file-read", "web-fetch"]);
         apply_merge_op(
             &mut val,
             MergeOp::Remove {
                 values: vec![str_val("web-search"), str_val("web-fetch")],
             },
-        )
-        .unwrap();
-        let items = val.as_array().unwrap();
+        )?;
+        let items = val.as_array().ok_or(TestError::Missing("val as array"))?;
         assert_eq!(items.len(), 1);
         assert_eq!(items[0], str_val("file-read"));
+        Ok(())
     }
 
     #[test]
-    fn test_intersect_op_on_array() {
+    fn test_intersect_op_on_array() -> TestResult {
         let mut val = arr(&["a", "b", "c", "d"]);
         apply_merge_op(
             &mut val,
             MergeOp::Intersect {
                 values: vec![str_val("b"), str_val("d"), str_val("e")],
             },
-        )
-        .unwrap();
-        let items = val.as_array().unwrap();
+        )?;
+        let items = val.as_array().ok_or(TestError::Missing("val as array"))?;
         assert_eq!(items.len(), 2);
         assert!(items.contains(&str_val("b")));
         assert!(items.contains(&str_val("d")));
+        Ok(())
     }
 
     #[test]
@@ -246,15 +245,15 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_on_array_works() {
+    fn test_replace_on_array_works() -> TestResult {
         let mut val = arr(&["a"]);
         apply_merge_op(
             &mut val,
             MergeOp::Replace {
                 value: toml::Value::Integer(42),
             },
-        )
-        .unwrap();
+        )?;
         assert_eq!(val, toml::Value::Integer(42));
+        Ok(())
     }
 }

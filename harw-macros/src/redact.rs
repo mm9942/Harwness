@@ -202,32 +202,41 @@ pub(crate) fn expand_redact(input: &DeriveInput) -> syn::Result<TokenStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn expand_rejects_enum() {
+    fn expand_rejects_enum() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             enum Foo { A, B }
         };
-        let err = expand_redact(&input).expect_err("enums must be rejected");
+        let Err(err) = expand_redact(&input) else {
+            return Err(TestError::Unexpected("enums must be rejected".to_owned()));
+        };
         assert!(err.to_string().contains("structs"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_tuple_struct() {
+    fn expand_rejects_tuple_struct() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             struct Foo(String);
         };
-        let err = expand_redact(&input).expect_err("tuple structs must be rejected");
+        let Err(err) = expand_redact(&input) else {
+            return Err(TestError::Unexpected(
+                "tuple structs must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("Tuple-Struct"));
+        Ok(())
     }
 
     #[test]
-    fn expand_accepts_unit_struct() {
+    fn expand_accepts_unit_struct() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             struct Foo;
         };
         let tokens = expand_redact(&input)
-            .expect("unit structs must expand")
+            .map_err(ctx("unit structs must expand"))?
             .to_string();
         assert!(tokens.contains("impl :: harw_observe :: Redact for Foo"));
         // Die Ausgabe `Foo {}` entsteht erst zur **Laufzeit** aus
@@ -236,47 +245,59 @@ mod tests {
         // tatsächlich emittiert: die Formatvorlage und den Namensliteral.
         assert!(tokens.contains("\"{} {{}}\""));
         assert!(tokens.contains("\"Foo\""));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_unknown_field_attribute() {
+    fn expand_rejects_unknown_field_attribute() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             struct Foo {
                 #[redact(bogus)]
                 a: String,
             }
         };
-        let err = expand_redact(&input).expect_err("unknown redact keys must be rejected");
+        let Err(err) = expand_redact(&input) else {
+            return Err(TestError::Unexpected(
+                "unknown redact keys must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("unbekanntes redact-Attribut"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_conflicting_field_attributes() {
+    fn expand_rejects_conflicting_field_attributes() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             struct Foo {
                 #[redact(show, hash)]
                 a: String,
             }
         };
-        let err = expand_redact(&input).expect_err("conflicting redact keys must be rejected");
+        let Err(err) = expand_redact(&input) else {
+            return Err(TestError::Unexpected(
+                "conflicting redact keys must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("widersprüchliche"));
+        Ok(())
     }
 
     #[test]
-    fn expand_omits_fields_without_attribute() {
+    fn expand_omits_fields_without_attribute() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             struct Foo {
                 secret: String,
             }
         };
         let tokens = expand_redact(&input)
-            .expect("struct without attributes must expand")
+            .map_err(ctx("struct without attributes must expand"))?
             .to_string();
         assert!(!tokens.contains("secret"));
+        Ok(())
     }
 
     #[test]
-    fn expand_show_uses_display_and_field_name() {
+    fn expand_show_uses_display_and_field_name() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             struct Foo {
                 #[redact(show)]
@@ -284,16 +305,17 @@ mod tests {
             }
         };
         let tokens = expand_redact(&input)
-            .expect("show field must expand")
+            .map_err(ctx("show field must expand"))?
             .to_string();
         // Der Feldname wird als eigenes String-Literal-Argument übergeben,
         // nicht in das Format-Literal selbst eingebacken.
         assert!(tokens.contains("\"clan\""));
         assert!(tokens.contains("self . clan"));
+        Ok(())
     }
 
     #[test]
-    fn expand_hash_uses_blake3_and_truncates() {
+    fn expand_hash_uses_blake3_and_truncates() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             struct Foo {
                 #[redact(hash)]
@@ -301,12 +323,13 @@ mod tests {
             }
         };
         let tokens = expand_redact(&input)
-            .expect("hash field must expand")
+            .map_err(ctx("hash field must expand"))?
             .to_string();
         assert!(tokens.contains(":: blake3 :: hash"));
         assert!(tokens.contains("to_hex"));
         assert!(tokens.contains("take"));
         assert!(tokens.contains("16"));
         assert!(tokens.contains("self . token"));
+        Ok(())
     }
 }

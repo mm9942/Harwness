@@ -86,6 +86,7 @@ impl EscalationStage {
 #[cfg(test)]
 mod tests {
     use super::EscalationStage;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn test_ordering_places_rule_triggered_below_escalated() {
@@ -94,23 +95,26 @@ mod tests {
     }
 
     #[test]
-    fn test_serde_roundtrip_uses_kebab_case() {
-        let json = serde_json::to_string(&EscalationStage::RuleTriggered).expect("serializes");
+    fn test_serde_roundtrip_uses_kebab_case() -> TestResult {
+        let json =
+            serde_json::to_string(&EscalationStage::RuleTriggered).map_err(ctx("serializes"))?;
         assert_eq!(json, "\"rule-triggered\"");
         let round_tripped: EscalationStage =
-            serde_json::from_str(&json).expect("deserializes");
+            serde_json::from_str(&json).map_err(ctx("deserializes"))?;
         assert_eq!(round_tripped, EscalationStage::RuleTriggered);
 
-        let json = serde_json::to_string(&EscalationStage::Escalated).expect("serializes");
+        let json = serde_json::to_string(&EscalationStage::Escalated).map_err(ctx("serializes"))?;
         assert_eq!(json, "\"escalated\"");
+        Ok(())
     }
 
     #[test]
-    fn test_wire_name_matches_serde_form() {
+    fn test_wire_name_matches_serde_form() -> TestResult {
         for stage in [EscalationStage::RuleTriggered, EscalationStage::Escalated] {
-            let json = serde_json::to_string(&stage).expect("serializes");
+            let json = serde_json::to_string(&stage).map_err(ctx("serializes"))?;
             assert_eq!(json, format!("\"{}\"", stage.wire_name()));
         }
+        Ok(())
     }
 
     #[test]

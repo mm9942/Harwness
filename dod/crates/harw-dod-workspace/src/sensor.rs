@@ -286,68 +286,75 @@ fn describe(change: &StructureChange) -> String {
 mod tests {
     use super::WorkspaceDriftSensor;
     use crate::inventory::Inventory;
-    use crate::test_support::{write_lockfile, write_member, write_root};
+    use crate::test_support::{
+        TestError, TestResult, ctx, write_lockfile, write_member, write_root,
+    };
     use harw_dod_cap::{Bound, Capability, ReadScope, SensorHandle};
     use harw_dod_signals::{DriftSeverity, EventKind, Sensor};
     use harw_types::SensorId;
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    fn scratch_dir(label: &str) -> PathBuf {
+    fn scratch_dir(label: &str) -> TestResult<PathBuf> {
         let dir = std::env::temp_dir().join(format!(
             "harw-dod-workspace-sensor-{}-{label}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("Scratch-Verzeichnis anlegen");
-        dir.canonicalize().expect("Scratch-Verzeichnis kanonisieren")
+        fs::create_dir_all(&dir).map_err(ctx("Scratch-Verzeichnis anlegen"))?;
+        dir.canonicalize()
+            .map_err(ctx("Scratch-Verzeichnis kanonisieren"))
     }
 
     fn bound_handle(root: &Path) -> SensorHandle<Bound> {
         let scope = ReadScope::from_roots([root.to_path_buf()]);
-        SensorHandle::new(SensorId::from_str("workspace-drift-test"), Capability::ReadWorkspaceGraph)
-            .bind(scope)
+        SensorHandle::new(
+            SensorId::from_str("workspace-drift-test"),
+            Capability::ReadWorkspaceGraph,
+        )
+        .bind(scope)
     }
 
     #[test]
-    fn test_poll_without_baseline_reports_no_drift() {
+    fn test_poll_without_baseline_reports_no_drift() -> TestResult {
         // Der wichtigste Test dieses Knotens: ohne Vorgänger-Inventar meldet
         // der Sensor nichts, obwohl der Workspace durchaus Member und
         // Abhängigkeiten enthält.
-        let root = scratch_dir("first-run");
-        write_root(&root, &["a"]);
-        write_member(&root, "a", &[], &["serde"]);
-        write_lockfile(&root, &[("a", "0.1.0", false), ("serde", "1.0.228", true)]);
+        let root = scratch_dir("first-run")?;
+        write_root(&root, &["a"])?;
+        write_member(&root, "a", &[], &["serde"])?;
+        write_lockfile(&root, &[("a", "0.1.0", false), ("serde", "1.0.228", true)])?;
 
         let sensor = WorkspaceDriftSensor::new(bound_handle(&root), root.clone(), None);
         let reading = sensor
             .poll(jiff::Timestamp::UNIX_EPOCH)
-            .expect("erster Poll darf nicht scheitern");
+            .map_err(ctx("erster Poll darf nicht scheitern"))?;
 
         assert!(reading.events.is_empty());
         assert!(reading.samples.is_empty());
 
         fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_poll_with_baseline_reports_structure_drift_event_for_new_member() {
-        let root = scratch_dir("second-run");
-        write_root(&root, &["a"]);
-        write_member(&root, "a", &[], &[]);
-        write_lockfile(&root, &[("a", "0.1.0", false)]);
+    fn test_poll_with_baseline_reports_structure_drift_event_for_new_member() -> TestResult {
+        let root = scratch_dir("second-run")?;
+        write_root(&root, &["a"])?;
+        write_member(&root, "a", &[], &[])?;
+        write_lockfile(&root, &[("a", "0.1.0", false)])?;
 
         let scope = ReadScope::from_roots([root.clone()]);
-        let baseline = Inventory::read(&scope, &root).expect("Baseline-Inventar lesen");
+        let baseline = Inventory::read(&scope, &root).map_err(ctx("Baseline-Inventar lesen"))?;
 
-        write_root(&root, &["a", "b"]);
-        write_member(&root, "b", &[], &[]);
-        write_lockfile(&root, &[("a", "0.1.0", false), ("b", "0.1.0", false)]);
+        write_root(&root, &["a", "b"])?;
+        write_member(&root, "b", &[], &[])?;
+        write_lockfile(&root, &[("a", "0.1.0", false), ("b", "0.1.0", false)])?;
 
         let sensor = WorkspaceDriftSensor::new(bound_handle(&root), root.clone(), Some(baseline));
         let reading = sensor
             .poll(jiff::Timestamp::UNIX_EPOCH)
-            .expect("zweiter Poll darf nicht scheitern");
+            .map_err(ctx("zweiter Poll darf nicht scheitern"))?;
 
         assert_eq!(reading.events.len(), 1);
         match &reading.events[0].kind {
@@ -357,9 +364,14 @@ mod tests {
                 // nicht aus dem Text abgeleitet.
                 assert_eq!(*severity, DriftSeverity::Medium);
             }
-            other => panic!("erwartetes StructureDrift-Ereignis, bekam: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartetes StructureDrift-Ereignis, bekam: {other:?}"
+                )));
+            }
         }
 
         fs::remove_dir_all(&root).ok();
+        Ok(())
     }
 }

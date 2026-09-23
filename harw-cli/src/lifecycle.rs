@@ -612,10 +612,11 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn health_evidence_observes_default_cli_composition() {
-        let home = tempfile::tempdir().expect("create temporary HARW home");
+    fn health_evidence_observes_default_cli_composition() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temporary HARW home"))?;
         // A bare home (no `config.toml`) never carries `[policy]
         // .require_approval_for`, so `ApprovalChain::snapshot` never emits a
         // `ConfigPolicy` entry (`harw-runtime/src/approval.rs::for_root`) —
@@ -626,9 +627,10 @@ mod tests {
             home.path().join("config.toml"),
             "[policy]\nrequire_approval_for = [\"shell.exec\"]\n",
         )
-        .expect("write policy config into temporary HARW home");
+        .map_err(ctx("write policy config into temporary HARW home"))?;
 
-        let evidence = runtime_composition_evidence(home.path()).expect("assemble CLI composition");
+        let evidence =
+            runtime_composition_evidence(home.path()).map_err(ctx("assemble CLI composition"))?;
 
         // Die Liste ist bewusst vollständig ausgeschrieben und nicht auf eine
         // Mindestmenge geprüft: eine Änderung der Werkzeugfläche der Standard-
@@ -684,7 +686,9 @@ mod tests {
         // feature into this binary, even though the CLI has no such feature.
         let with_browser: HashSet<&str> = base.union(&browser).copied().collect();
 
-        let advertised = evidence.advertised_tools.expect("advertised tool evidence");
+        let advertised = evidence
+            .advertised_tools
+            .ok_or(TestError::Missing("advertised tool evidence"))?;
         let advertised: HashSet<&str> = advertised.iter().map(String::as_str).collect();
         assert!(
             advertised == base || advertised == with_browser,
@@ -692,22 +696,28 @@ mod tests {
         );
         assert_eq!(evidence.has_trusted_spawn_context, Some(true));
         assert_eq!(evidence.has_approval_boundary, Some(true));
+        Ok(())
     }
 
     #[test]
-    fn update_check_reports_unavailable_without_creating_version_state() {
-        let home = tempfile::tempdir().expect("create temporary HARW home");
+    fn update_check_reports_unavailable_without_creating_version_state() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temporary HARW home"))?;
 
-        let error = update(Some(home.path().to_path_buf()), true)
-            .expect_err("update check must fail without a remote checker");
+        let result = update(Some(home.path().to_path_buf()), true);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "update check must fail without a remote checker".into(),
+            ));
+        };
 
         assert!(error.contains("kein Remote-Update-Checker ist konfiguriert"));
         assert!(!home.path().join("version.json").exists());
+        Ok(())
     }
 
     #[test]
-    fn update_check_leaves_existing_version_state_unchanged() {
-        let home = tempfile::tempdir().expect("create temporary HARW home");
+    fn update_check_leaves_existing_version_state_unchanged() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temporary HARW home"))?;
         let checker = UpdateChecker::new(home.path());
         checker
             .write(&harw_install::VersionInfo {
@@ -715,18 +725,23 @@ mod tests {
                 last_checked_at: jiff::Timestamp::now(),
                 dismissed_version: Some("1.2.2".to_owned()),
             })
-            .expect("write existing version state");
+            .map_err(ctx("write existing version state"))?;
         let version_path = home.path().join("version.json");
-        let before = std::fs::read(&version_path).expect("read existing version state");
+        let before = std::fs::read(&version_path).map_err(ctx("read existing version state"))?;
 
-        let error = update(Some(home.path().to_path_buf()), true)
-            .expect_err("update check must fail without a remote checker");
+        let result = update(Some(home.path().to_path_buf()), true);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "update check must fail without a remote checker".into(),
+            ));
+        };
 
         assert!(error.contains("kein Remote-Update-Checker ist konfiguriert"));
         assert_eq!(
-            std::fs::read(version_path).expect("read version state after failed check"),
+            std::fs::read(version_path).map_err(ctx("read version state after failed check"))?,
             before
         );
+        Ok(())
     }
 
     /// A chain carrying both the config policy and the default policy, in
@@ -878,13 +893,14 @@ mod tests {
     }
 
     #[test]
-    fn test_write_systemd_units_writes_one_file_per_service() {
-        let dir = tempfile::tempdir().expect("create temporary unit root");
+    fn test_write_systemd_units_writes_one_file_per_service() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("create temporary unit root"))?;
         let unit_dir = dir.path().join("systemd").join("user");
         let manager = harw_install::service_systemd::SystemdServiceManager::new();
         let specs = service_specs(Path::new("/usr/bin/harw"), Path::new("/srv/harw"));
 
-        let written = write_systemd_units(&unit_dir, &manager, &specs).expect("write units");
+        let written =
+            write_systemd_units(&unit_dir, &manager, &specs).map_err(ctx("write units"))?;
 
         assert_eq!(
             written,
@@ -893,37 +909,45 @@ mod tests {
                 unit_dir.join("harw-gateway.service")
             ]
         );
-        let serve = std::fs::read_to_string(&written[0]).expect("read serve unit");
+        let serve = std::fs::read_to_string(&written[0]).map_err(ctx("read serve unit"))?;
         assert_eq!(serve, manager.render_unit(&specs[0]));
-        let gateway = std::fs::read_to_string(&written[1]).expect("read gateway unit");
+        let gateway = std::fs::read_to_string(&written[1]).map_err(ctx("read gateway unit"))?;
         assert!(gateway.contains("ExecStart=/usr/bin/harw gateway\n"));
+        Ok(())
     }
 
     #[test]
-    fn test_systemd_user_unit_dir_prefers_absolute_xdg_config_home() {
+    fn test_systemd_user_unit_dir_prefers_absolute_xdg_config_home() -> TestResult {
         let dir = systemd_user_unit_dir(
             Some(OsString::from("/xdg/config")),
             Some(OsString::from("/home/tester")),
         )
-        .expect("unit dir from XDG_CONFIG_HOME");
+        .map_err(ctx("unit dir from XDG_CONFIG_HOME"))?;
         assert_eq!(dir, PathBuf::from("/xdg/config/systemd/user"));
+        Ok(())
     }
 
     #[test]
-    fn test_systemd_user_unit_dir_ignores_relative_xdg_and_falls_back_to_home() {
+    fn test_systemd_user_unit_dir_ignores_relative_xdg_and_falls_back_to_home() -> TestResult {
         let dir = systemd_user_unit_dir(
             Some(OsString::from("relative")),
             Some(OsString::from("/home/tester")),
         )
-        .expect("unit dir from HOME");
+        .map_err(ctx("unit dir from HOME"))?;
         assert_eq!(dir, PathBuf::from("/home/tester/.config/systemd/user"));
+        Ok(())
     }
 
     #[test]
-    fn test_systemd_user_unit_dir_without_home_is_error() {
-        let error = systemd_user_unit_dir(None, Some(OsString::new()))
-            .expect_err("no usable environment must fail");
+    fn test_systemd_user_unit_dir_without_home_is_error() -> TestResult {
+        let result = systemd_user_unit_dir(None, Some(OsString::new()));
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "no usable environment must fail".into(),
+            ));
+        };
         assert!(error.contains("HOME"), "{error}");
+        Ok(())
     }
 
     #[test]

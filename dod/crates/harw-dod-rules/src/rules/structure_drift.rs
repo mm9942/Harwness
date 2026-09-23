@@ -56,6 +56,7 @@ impl Rule for StructureDriftRule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use harw_dod_signals::{HostSample, SensorId};
     use jiff::Timestamp;
     use std::borrow::Cow;
@@ -84,17 +85,20 @@ mod tests {
     }
 
     #[test]
-    fn test_known_metric_does_not_trigger() {
-        let baseline = Baseline::new("cpu-load", "cpu-load", 0.0, 100.0).unwrap();
+    fn test_known_metric_does_not_trigger() -> TestResult {
+        let baseline =
+            Baseline::new("cpu-load", "cpu-load", 0.0, 100.0).map_err(ctx("gültige Baseline"))?;
         let samples = vec![sample("cpu-load")];
         let scope = NetworkScope::empty();
         let ctx = ctx_with(&samples, &[baseline], &scope);
         assert!(StructureDriftRule.evaluate(&ctx).is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_unknown_metric_triggers_structure_drift() {
-        let baseline = Baseline::new("cpu-load", "cpu-load", 0.0, 100.0).unwrap();
+    fn test_unknown_metric_triggers_structure_drift() -> TestResult {
+        let baseline =
+            Baseline::new("cpu-load", "cpu-load", 0.0, 100.0).map_err(ctx("gültige Baseline"))?;
         let samples = vec![sample("disk-queue")];
         let scope = NetworkScope::empty();
         let ctx = ctx_with(&samples, &[baseline], &scope);
@@ -104,21 +108,25 @@ mod tests {
         assert_eq!(findings[0].kind, FindingKind::Anomaly);
         assert_eq!(findings[0].severity, Severity::Low);
         assert!(findings[0].summary.contains("disk-queue"));
+        Ok(())
     }
 
     #[test]
-    fn test_only_one_finding_per_unknown_metric() {
-        let baseline = Baseline::new("cpu-load", "cpu-load", 0.0, 100.0).unwrap();
+    fn test_only_one_finding_per_unknown_metric() -> TestResult {
+        let baseline =
+            Baseline::new("cpu-load", "cpu-load", 0.0, 100.0).map_err(ctx("gültige Baseline"))?;
         let samples = vec![sample("disk-queue"), sample("disk-queue")];
         let scope = NetworkScope::empty();
         let ctx = ctx_with(&samples, &[baseline], &scope);
 
         assert_eq!(StructureDriftRule.evaluate(&ctx).len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_known_and_unknown_metrics_together() {
-        let baseline = Baseline::new("cpu-load", "cpu-load", 0.0, 100.0).unwrap();
+    fn test_known_and_unknown_metrics_together() -> TestResult {
+        let baseline =
+            Baseline::new("cpu-load", "cpu-load", 0.0, 100.0).map_err(ctx("gültige Baseline"))?;
         let samples = vec![sample("cpu-load"), sample("disk-queue")];
         let scope = NetworkScope::empty();
         let ctx = ctx_with(&samples, &[baseline], &scope);
@@ -126,5 +134,6 @@ mod tests {
         let findings = StructureDriftRule.evaluate(&ctx);
         assert_eq!(findings.len(), 1);
         assert!(findings[0].summary.contains("disk-queue"));
+        Ok(())
     }
 }

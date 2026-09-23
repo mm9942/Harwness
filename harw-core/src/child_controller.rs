@@ -46,6 +46,15 @@
 //! (`JobAdmissionService::submit_queued_async` in `harw-core::admission`) zu
 //! wählen, statt bei Kapazitätsdruck hart abzulehnen.
 //!
+//! Für einen Fan-out innerhalb **dieses** Controllers (z. B. mehrere parallele
+//! `explore`-Kind-Aufrufe desselben Elternteils, deren Anzahl
+//! `max_active_children_per_parent` überschreiten kann) gibt es dasselbe
+//! Muster lokal: [`ManagedAgentSpawner::admit_or_wait`] /
+//! [`ManagedAgentSpawner::spawn_child_or_wait`] wiederholen nur eine
+//! [`AdmitRejection::Capacity`]-Ablehnung, gewickelt in `Notify` statt einer
+//! separaten Warteschlange — [`ManagedAgentSpawner::admit`] selbst lehnt
+//! Kapazitätsdruck unverändert sofort ab.
+//!
 //! # Nebenläufigkeit
 //! `ManagedAgentSpawner` ist `Send + Sync`. Alle Sperren sind `std::sync::Mutex`
 //! und werden **nie** über ein `.await` gehalten. [`ManagedAgentSpawner::admit`]
@@ -82,6 +91,7 @@ use crate::session_manager::SessionManager;
 use crate::state_store::StateStore;
 use crate::turn_loop::{TurnInput, TurnOutcome, run_turn, run_turn_durable};
 use harw_agent_dsl::executable::{BudgetSpec, ContextProgram, ExecutableAgentIr, SectionDetail};
+use harw_authority::SandboxSpec;
 use harw_catalog::{AgentSuggestions, SpawnCapabilitySnapshot};
 use harw_context::{ContextBudgetSpec, ContextCeiling, SectionName, TrustClass};
 use harw_extension_api::{
@@ -89,7 +99,7 @@ use harw_extension_api::{
 };
 use harw_observe::TraceContext;
 use harw_protocol::items::{ContentPart, TurnItem};
-use harw_authority::SandboxSpec;
+use harw_protocol::{AgentOrchestrationEvent, AgentOrchestrationStatus};
 use harw_session_store::{ApprovalStore, ChildLeaseRecord, ChildLeaseStore};
 use harw_types::{AgentRole, ReasoningEffort, SessionId, ToolCallId};
 use jiff::{SignedDuration, Timestamp};
@@ -642,6 +652,13 @@ pub enum ChildStatus {
     Cancelled,
 }
 
+/// Receives bounded lifecycle snapshots after controller locks have been
+/// released. Implementations may persist, forward, or fan out the event but
+/// must not make scheduling decisions inside the controller.
+pub trait OrchestrationObserver: Send + Sync {
+    fn on_orchestration_event(&self, event: AgentOrchestrationEvent);
+}
+
 impl ChildStatus {
     /// Liefert das stabile, maschinenlesbare Label dieses Status.
     ///
@@ -891,7 +908,10 @@ impl TaskComplexity {
     /// anderen Wert trägt.
     #[must_use]
     pub fn from_spawn_context(context: &serde_json::Value) -> Option<Self> {
-        match context.get("complexity").and_then(serde_json::Value::as_str) {
+        match context
+            .get("complexity")
+            .and_then(serde_json::Value::as_str)
+        {
             Some("simple") => Some(Self::Simple),
             Some("complex") => Some(Self::Complex),
             _ => None,
@@ -1329,6 +1349,20 @@ pub struct ManagedAgentSpawner {
     /// (Rolle + Anweisung, whitespace-normalisiert, kleingeschrieben) —
     /// erkennt eine doppelt vergebene Delegation (Addendum F+G).
     recent_delegation_hashes: Mutex<BTreeMap<String, VecDeque<u64>>>,
+    /// Optional sink for user-safe lifecycle snapshots. Invocation happens
+    /// only after the active/cancellation/manager locks are released.
+    orchestration_observer: Option<Arc<dyn OrchestrationObserver>>,
+    /// Woken every time a slot in `active` is freed (`release_in_memory`,
+    /// `reap_expired`, `reap_expired_durable` — every path that removes an
+    /// entry from `active`). Lets [`Self::admit_or_wait`] wait for capacity
+    /// instead of failing outright when
+    /// `active_for_parent >= limits.max_active_children_per_parent` (four
+    /// parallel `explore` calls against a limit of two used to fail two of
+    /// them hard; see module docs). `notify_waiters` only wakes tasks already
+    /// waiting, so every waiter re-registers via `Notified::enable` before
+    /// re-checking admission, the same lost-wakeup-safe pattern as
+    /// `admission::SubmissionLimiter::freed`, plus a bounded fallback sleep.
+    freed: tokio::sync::Notify,
 }
 
 /// Anzahl der pro Elternteil vorgehaltenen Delegations-Brief-Hashes
@@ -1344,6 +1378,50 @@ const CHILD_OVER_BUDGET_SIMPLE_TOKENS: u64 = 60_000;
 /// [`TaskComplexity::Complex`] oder ohne eingestufte Komplexität
 /// (Addendum F+G).
 const CHILD_OVER_BUDGET_COMPLEX_TOKENS: u64 = 250_000;
+
+/// Distinguishes why [`ManagedAgentSpawner::admit_inner`] rejected an
+/// admission, without either side parsing the other's message text.
+///
+/// # Description
+/// [`ManagedAgentSpawner::admit_or_wait`] only ever retries a `Capacity`
+/// rejection (`active_for_parent >= limits.max_active_children_per_parent`);
+/// every `Other` rejection — unknown role, spawn-matrix denial, sandbox
+/// escalation, depth, lease/registry failure, poisoned lock, ... — is
+/// surfaced on the very first attempt, exactly as
+/// [`ManagedAgentSpawner::admit`] already did before this distinction
+/// existed. The wrapped [`AgentSpawnError`] carries the same message in both
+/// variants; [`ManagedAgentSpawner::admit`] discards the variant and returns
+/// it unchanged, so its public behavior is unaffected.
+enum AdmitRejection {
+    /// The parent is already at
+    /// [`ChildLimits::max_active_children_per_parent`]. The only rejection
+    /// [`ManagedAgentSpawner::admit_or_wait`] waits out.
+    Capacity(AgentSpawnError),
+    /// Any rejection other than the active-child-per-parent limit. Returned
+    /// immediately by [`ManagedAgentSpawner::admit_or_wait`], never retried.
+    Other(AgentSpawnError),
+}
+
+impl AdmitRejection {
+    /// Unwraps either variant into the plain [`AgentSpawnError`] `admit`'s
+    /// callers have always seen; the message is never altered.
+    fn into_error(self) -> AgentSpawnError {
+        match self {
+            Self::Capacity(error) | Self::Other(error) => error,
+        }
+    }
+}
+
+impl From<AgentSpawnError> for AdmitRejection {
+    /// Every `?`-propagated [`AgentSpawnError`] inside
+    /// [`ManagedAgentSpawner::admit_inner`] that is not the explicit
+    /// capacity check becomes [`AdmitRejection::Other`] — the capacity
+    /// rejection is always constructed explicitly as
+    /// [`AdmitRejection::Capacity`], never through this conversion.
+    fn from(error: AgentSpawnError) -> Self {
+        Self::Other(error)
+    }
+}
 
 /// Verlängert eine noch nicht abgelaufene Kind-Lease auf `now +
 /// lease_seconds`, sofern das mehr ist als der aktuell eingetragene Wert.
@@ -1392,12 +1470,63 @@ fn renew_active_lease(
 struct ActiveLeaseProgressObserver {
     active: Arc<Mutex<BTreeMap<String, ChildRecord>>>,
     lease_seconds: i64,
+    orchestration_observer: Option<Arc<dyn OrchestrationObserver>>,
 }
 
 impl crate::guard::ProgressObserver for ActiveLeaseProgressObserver {
     fn on_progress(&self, session_id: &SessionId) {
-        renew_active_lease(&self.active, self.lease_seconds, session_id, Timestamp::now());
+        renew_active_lease(
+            &self.active,
+            self.lease_seconds,
+            session_id,
+            Timestamp::now(),
+        );
+        // The turn-loop calls this after every model round and tool result.
+        // Snapshot under the registry lock, then notify after releasing it so
+        // a durable/UI observer can never re-enter controller locking.
+        let snapshot = self.active.lock().ok().and_then(|active| {
+            let record = active.get(session_id.as_str())?.clone();
+            let root = ManagedAgentSpawner::root_from_active(&active, session_id)?;
+            Some((root, record))
+        });
+        if let (Some(observer), Some((root, record))) = (&self.orchestration_observer, snapshot) {
+            emit_orchestration_event(
+                observer,
+                root,
+                &record,
+                None,
+                AgentOrchestrationStatus::Progress,
+            );
+        }
     }
+}
+
+/// Builds one user-safe lifecycle observation. Callers must invoke this only
+/// after releasing controller locks; observers are allowed to persist or fan
+/// out synchronously.
+fn emit_orchestration_event(
+    observer: &Arc<dyn OrchestrationObserver>,
+    root_session_id: SessionId,
+    record: &ChildRecord,
+    task: Option<String>,
+    status: AgentOrchestrationStatus,
+) {
+    observer.on_orchestration_event(AgentOrchestrationEvent {
+        schema_version: AgentOrchestrationEvent::CURRENT_SCHEMA_VERSION,
+        event_id: Uuid::new_v4().to_string(),
+        root_session_id,
+        parent_session_id: record.parent.clone(),
+        child_session_id: record.child.clone(),
+        turn_id: None,
+        role: record.role.clone(),
+        depth: record.depth,
+        task: AgentOrchestrationEvent::bounded_detail(task),
+        status,
+        usage: None,
+        duration_ms: None,
+        progress: None,
+        detail: None,
+    });
 }
 
 /// Normalisiert einen Delegations-Auftragstext für den Duplikat-Vergleich:
@@ -1433,6 +1562,36 @@ fn hash_delegation_brief(normalized: &str) -> u64 {
 }
 
 impl ManagedAgentSpawner {
+    fn root_from_active(
+        active: &BTreeMap<String, ChildRecord>,
+        session: &SessionId,
+    ) -> Option<SessionId> {
+        let mut cursor = session.clone();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            if !seen.insert(cursor.as_str().to_owned()) {
+                return None;
+            }
+            match active.get(cursor.as_str()) {
+                Some(record) => cursor = record.parent.clone(),
+                None => return Some(cursor),
+            }
+        }
+    }
+
+    fn observe_orchestration(
+        &self,
+        root_session_id: SessionId,
+        record: &ChildRecord,
+        task: Option<String>,
+        status: AgentOrchestrationStatus,
+    ) {
+        let Some(observer) = &self.orchestration_observer else {
+            return;
+        };
+        emit_orchestration_event(observer, root_session_id, record, task, status);
+    }
+
     #[must_use]
     pub fn new(manager: Arc<Mutex<SessionManager>>, limits: ChildLimits) -> Self {
         Self {
@@ -1451,7 +1610,17 @@ impl ManagedAgentSpawner {
             guard_policy: crate::guard::GuardPolicy::default(),
             pitfall_advisor: None,
             recent_delegation_hashes: Mutex::new(BTreeMap::new()),
+            orchestration_observer: None,
+            freed: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Installs the runtime-owned lifecycle sink. The controller retains no
+    /// persistence dependency; a runtime can attach a StateStore-backed sink.
+    #[must_use]
+    pub fn with_orchestration_observer(mut self, observer: Arc<dyn OrchestrationObserver>) -> Self {
+        self.orchestration_observer = Some(observer);
+        self
     }
 
     /// Setzt die Rollengewichte für die Kind-Effort-Klammerung.
@@ -1644,6 +1813,7 @@ impl ManagedAgentSpawner {
         Arc::new(ActiveLeaseProgressObserver {
             active: Arc::clone(&self.active),
             lease_seconds: self.limits.lease_seconds,
+            orchestration_observer: self.orchestration_observer.clone(),
         })
     }
 
@@ -1655,8 +1825,25 @@ impl ManagedAgentSpawner {
     /// (cancelled), tombstones and the child session in the manager. Lock
     /// failures are logged; use [`Self::release_child`] to observe them.
     pub fn close_child(&self, child: &SessionId) {
-        if let Err(error) = self.release_in_memory(child) {
-            tracing::warn!(child = %child, error = %error, "child_close.release_failed");
+        let root = self.root_for(child);
+        match self.release_in_memory(child) {
+            Ok(Some(record)) => {
+                if let Some(root) = root {
+                    let status = match record.status {
+                        ChildStatus::Completed => AgentOrchestrationStatus::Completed,
+                        ChildStatus::Failed => AgentOrchestrationStatus::Failed,
+                        ChildStatus::Cancelled => AgentOrchestrationStatus::Cancelled,
+                        ChildStatus::Paused => AgentOrchestrationStatus::Paused,
+                        ChildStatus::Running => AgentOrchestrationStatus::Running,
+                        ChildStatus::Admitted => AgentOrchestrationStatus::Cancelled,
+                    };
+                    self.observe_orchestration(root, &record, None, status);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(child = %child, error = %error, "child_close.release_failed");
+            }
         }
     }
 
@@ -1677,7 +1864,20 @@ impl ManagedAgentSpawner {
                 Self::reject(format!("could not complete child lease: {error}"))
             })?;
         }
-        self.release_in_memory(child).map(|_| ())
+        let root = self.root_for(child);
+        let released = self.release_in_memory(child)?;
+        if let (Some(root), Some(record)) = (root, released.as_ref()) {
+            let status = match record.status {
+                ChildStatus::Completed => AgentOrchestrationStatus::Completed,
+                ChildStatus::Failed => AgentOrchestrationStatus::Failed,
+                ChildStatus::Cancelled => AgentOrchestrationStatus::Cancelled,
+                ChildStatus::Paused => AgentOrchestrationStatus::Paused,
+                ChildStatus::Running => AgentOrchestrationStatus::Running,
+                ChildStatus::Admitted => AgentOrchestrationStatus::Cancelled,
+            };
+            self.observe_orchestration(root, record, None, status);
+        }
+        Ok(())
     }
 
     /// Gibt ein admittiertes Kind vollständig frei.
@@ -1724,6 +1924,9 @@ impl ManagedAgentSpawner {
     /// # }
     /// ```
     pub fn release_child(&self, child: &SessionId) -> Result<Option<ChildRecord>, AgentSpawnError> {
+        // Snapshot the root while the record is still in the admission tree;
+        // `release_in_memory` deliberately removes it before returning.
+        let root = self.root_for(child);
         let record = self.release_in_memory(child)?;
         if let (Some(lease_store), Some(record)) = (&self.lease_store, record.as_ref()) {
             lease_store.complete(child, Timestamp::now()).map_err(|error| {
@@ -1732,6 +1935,17 @@ impl ManagedAgentSpawner {
                 ))
             })?;
             tracing::info!(child = %child, status = record.status.as_str(), "child_release.lease_closed");
+        }
+        if let (Some(root), Some(record)) = (root, record.as_ref()) {
+            let status = match record.status {
+                ChildStatus::Completed => AgentOrchestrationStatus::Completed,
+                ChildStatus::Failed => AgentOrchestrationStatus::Failed,
+                ChildStatus::Cancelled => AgentOrchestrationStatus::Cancelled,
+                ChildStatus::Paused => AgentOrchestrationStatus::Paused,
+                ChildStatus::Running => AgentOrchestrationStatus::Running,
+                ChildStatus::Admitted => AgentOrchestrationStatus::Cancelled,
+            };
+            self.observe_orchestration(root, record, None, status);
         }
         Ok(record)
     }
@@ -1922,7 +2136,8 @@ impl ManagedAgentSpawner {
             .filter(|(_, parent)| parent.registered)
             .map(|(id, _)| id.clone())
             .collect();
-        let active_ids: BTreeSet<&str> = records.iter().map(|(child, _, _)| child.as_str()).collect();
+        let active_ids: BTreeSet<&str> =
+            records.iter().map(|(child, _, _)| child.as_str()).collect();
 
         let mut candidates: Vec<SessionId> = Vec::new();
         {
@@ -2087,6 +2302,15 @@ impl ManagedAgentSpawner {
                 "child_release.in_memory",
             );
         }
+        if record.is_some() {
+            // A parent's active-child slot only actually frees when an
+            // `active` entry is removed (a tombstone alone does not — it was
+            // already gone from `active`). Wakes every `admit_or_wait`
+            // waiter; each re-checks admission itself, so a wakeup that
+            // turns out to be for a different parent just costs one extra
+            // poll, never an incorrect admission.
+            self.freed.notify_waiters();
+        }
         Ok(record)
     }
 
@@ -2212,7 +2436,11 @@ impl ManagedAgentSpawner {
     /// Nebenläufigkeit). Sicher aus jedem Thread aufrufbar.
     #[must_use]
     pub fn max_concurrent_instances_for_role(&self, role: &str) -> usize {
-        match self.roles.get(role).map(|definition| definition.organizational_role) {
+        match self
+            .roles
+            .get(role)
+            .map(|definition| definition.organizational_role)
+        {
             Some(harw_agent_dsl::roles::AgentRoleId::UiaWorker) => 1,
             _ => usize::MAX,
         }
@@ -2450,6 +2678,74 @@ impl ManagedAgentSpawner {
         records
     }
 
+    /// Lists every admitted descendant of `parent` in parent-before-child
+    /// order. This is the read counterpart to [`Self::owns_descendant`] for
+    /// `/agent list`; it exposes only the caller's own tree.
+    #[must_use]
+    pub fn list_descendants_for(&self, parent: &SessionId) -> Vec<ChildRecord> {
+        let Ok(active) = self.active.lock() else {
+            return Vec::new();
+        };
+        let mut pending = vec![parent.clone()];
+        let mut seen = std::collections::HashSet::new();
+        let mut descendants = Vec::new();
+        while let Some(current) = pending.pop() {
+            let mut children = active
+                .values()
+                .filter(|record| record.parent == current)
+                .cloned()
+                .collect::<Vec<_>>();
+            children.sort_by_key(|record| std::cmp::Reverse(record.admitted_at));
+            for child in children.into_iter().rev() {
+                if seen.insert(child.child.as_str().to_owned()) {
+                    pending.push(child.child.clone());
+                    descendants.push(child);
+                }
+            }
+        }
+        descendants
+    }
+
+    /// Returns whether `target` is an admitted descendant of `ancestor`.
+    ///
+    /// This is the controller-owned authority check for product surfaces such
+    /// as `/agent stop`: a caller may address any node in its own subtree, but
+    /// can never use a guessed sibling or foreign session id. The lookup is
+    /// read-only and cycle-safe even if a malformed restored registry were to
+    /// contain a parent loop.
+    #[must_use]
+    pub fn owns_descendant(&self, ancestor: &SessionId, target: &SessionId) -> bool {
+        let Ok(active) = self.active.lock() else {
+            return false;
+        };
+        let mut cursor = target.as_str().to_owned();
+        let mut seen = std::collections::HashSet::new();
+        while seen.insert(cursor.clone()) {
+            let Some(record) = active.get(&cursor) else {
+                return false;
+            };
+            if &record.parent == ancestor {
+                return true;
+            }
+            cursor = record.parent.as_str().to_owned();
+        }
+        false
+    }
+
+    /// Resolves the root session that owns `session`'s active subtree.
+    ///
+    /// A root is the first parent absent from the admitted-child registry;
+    /// this covers both manager-owned roots and the explicitly registered
+    /// external TUI/CLI root without adding mutable lineage to
+    /// [`SpawnContext`]. `None` means the registry is poisoned or a parent
+    /// cycle exists. The loop guard makes malformed restored
+    /// parent cycles fail closed.
+    #[must_use]
+    pub fn root_for(&self, session: &SessionId) -> Option<SessionId> {
+        let active = self.active.lock().ok()?;
+        Self::root_from_active(&active, session)
+    }
+
     /// Requests cooperative cancellation of an admitted child's in-flight
     /// turn without reaping its lease or removing its admission record.
     ///
@@ -2493,7 +2789,11 @@ impl ManagedAgentSpawner {
     ///
     /// # Concurrency
     /// Kurze, nacheinander genommene Sperren; idempotent.
-    pub fn request_cancellation_with_reason(&self, child: &SessionId, reason: CancelReason) -> bool {
+    pub fn request_cancellation_with_reason(
+        &self,
+        child: &SessionId,
+        reason: CancelReason,
+    ) -> bool {
         if self.child_record(child).is_none() {
             return false;
         }
@@ -2540,6 +2840,13 @@ impl ManagedAgentSpawner {
             })
             .collect::<Vec<_>>();
         self.mark_expired(&expired);
+        if !expired.is_empty() {
+            // Each expired child freed its parent's active-child slot; see
+            // `release_in_memory`'s `self.freed.notify_waiters()` for why
+            // this wakes `admit_or_wait` waiters rather than requiring them
+            // to sleep out their full retry window.
+            self.freed.notify_waiters();
+        }
         expired
     }
 
@@ -2572,6 +2879,11 @@ impl ManagedAgentSpawner {
             }
         }
         self.mark_expired(&expired);
+        if !expired.is_empty() {
+            // See `reap_expired`: each claimed lease freed its parent's
+            // active-child slot.
+            self.freed.notify_waiters();
+        }
         Ok(expired)
     }
 
@@ -3138,6 +3450,9 @@ impl ManagedAgentSpawner {
         // `release_in_memory` liest den Status in derselben Reihenfolge und setzt
         // nur dann einen Freigabe-Tombstone, wenn ein Lauf die Session halten kann.
         let previous_status = self.mark_running(child)?;
+        if let (Some(root), Some(record)) = (self.root_for(child), self.child_record(child)) {
+            self.observe_orchestration(root, &record, None, AgentOrchestrationStatus::Running);
+        }
         let session = match self.manager.lock() {
             Ok(mut manager) => manager.remove(child),
             Err(_) => {
@@ -3147,7 +3462,9 @@ impl ManagedAgentSpawner {
         };
         let Some(session) = session else {
             self.set_status(child, previous_status);
-            return Err(Self::reject(format!("child session {child} is not available")));
+            return Err(Self::reject(format!(
+                "child session {child} is not available"
+            )));
         };
         let mut running = RunningSession {
             spawner: self,
@@ -3468,7 +3785,8 @@ impl ManagedAgentSpawner {
             .map(String::as_str)
             .chain(program.section_detail().iter().map(SectionDetail::name))
             .find(|name| {
-                !SectionName::try_new(*name).is_ok_and(|section| ceiling.sections.contains(&section))
+                !SectionName::try_new(*name)
+                    .is_ok_and(|section| ceiling.sections.contains(&section))
             })
             .map(|name| {
                 format!("declared section '{name}' is not part of the child's context ceiling")
@@ -3570,7 +3888,10 @@ impl ManagedAgentSpawner {
                         })?;
                     (
                         external_root.spawn_context.organizational_role,
-                        external_root.spawn_context.allowed_child_orchestrators.clone(),
+                        external_root
+                            .spawn_context
+                            .allowed_child_orchestrators
+                            .clone(),
                         0,
                     )
                 }
@@ -3597,6 +3918,13 @@ impl ManagedAgentSpawner {
         Ok(targets.into_iter().map(|target| target.name).collect())
     }
 
+    /// Admits a child. Unchanged public behavior and error messages — a thin
+    /// wrapper over [`Self::admit_inner`] that discards the
+    /// capacity-vs-other distinction [`Self::admit_or_wait`] needs.
+    ///
+    /// # Errors
+    /// See [`Self::admit_inner`]; the returned [`AgentSpawnError`] is
+    /// byte-identical either way.
     fn admit(
         &self,
         role_name: &str,
@@ -3604,6 +3932,32 @@ impl ManagedAgentSpawner {
         sandbox: SandboxSpec,
         suggestions: Option<AgentSuggestions>,
     ) -> Result<SessionId, AgentSpawnError> {
+        self.admit_inner(role_name, input, sandbox, suggestions)
+            .map_err(AdmitRejection::into_error)
+    }
+
+    /// Core admission logic (role, spawn-matrix, capacity, sandbox, depth,
+    /// registry, lease, cancellation wiring). Identical to what `admit` did
+    /// before [`Self::admit_or_wait`] was added, in every respect except its
+    /// error type, which distinguishes a
+    /// capacity rejection (`active_for_parent >=
+    /// limits.max_active_children_per_parent`) from every other rejection so
+    /// [`Self::admit_or_wait`] can retry only the former (development task:
+    /// four parallel `explore` calls against a per-parent limit of two used
+    /// to hard-fail two of them instead of queueing).
+    ///
+    /// # Errors
+    /// [`AdmitRejection::Capacity`] exactly when the active-child-per-parent
+    /// limit is reached; [`AdmitRejection::Other`] for every other rejection
+    /// (unknown role, spawn-matrix denial, sandbox escalation, depth,
+    /// lease/registry failure, poisoned lock, ...).
+    fn admit_inner(
+        &self,
+        role_name: &str,
+        input: SpawnInput,
+        sandbox: SandboxSpec,
+        suggestions: Option<AgentSuggestions>,
+    ) -> Result<SessionId, AdmitRejection> {
         let definition = self
             .roles
             .get(role_name)
@@ -3686,9 +4040,9 @@ impl ManagedAgentSpawner {
             // caller, target category, registered definition, or which of
             // the two predicates failed — a sibling/hidden sub-orchestrator
             // must stay unobservable either way.
-            return Err(Self::reject(
+            return Err(AdmitRejection::Other(Self::reject(
                 "no delegation capability is available for this request",
-            ));
+            )));
         }
 
         // Addendum F+G: doppelte Delegation erkennen — nicht blockieren, nur
@@ -3737,10 +4091,10 @@ impl ManagedAgentSpawner {
             .filter(|record| record.parent == input.parent_session_id)
             .count();
         if active_for_parent >= self.limits.max_active_children_per_parent {
-            return Err(Self::reject(format!(
+            return Err(AdmitRejection::Capacity(Self::reject(format!(
                 "parent {} reached its active child limit of {}",
                 input.parent_session_id, self.limits.max_active_children_per_parent
-            )));
+            ))));
         }
 
         sandbox
@@ -3763,12 +4117,13 @@ impl ManagedAgentSpawner {
         // zweiter, separater Prüfschritt wäre eine Lücke, die vergessen
         // werden könnte.
         if let Some(ir) = executable_ir {
-            if let Some(violation) =
-                Self::describe_context_program_ceiling_violation(&child_ceiling, ir.context_program())
-            {
-                return Err(Self::reject(format!(
+            if let Some(violation) = Self::describe_context_program_ceiling_violation(
+                &child_ceiling,
+                ir.context_program(),
+            ) {
+                return Err(AdmitRejection::Other(Self::reject(format!(
                     "child context program escalation rejected: {violation}"
-                )));
+                ))));
             }
         }
         // Wave 8: Reasoning-Effort wird monoton vom Parent geerbt (Kind ≤ Parent).
@@ -3792,9 +4147,9 @@ impl ManagedAgentSpawner {
             .get(input.parent_session_id.as_str())
             .map_or(self.limits.max_depth, |parent| parent.depth_ceiling);
         if depth > inherited_depth_ceiling {
-            return Err(Self::reject(format!(
+            return Err(AdmitRejection::Other(Self::reject(format!(
                 "child depth {depth} exceeds maximum {inherited_depth_ceiling}"
-            )));
+            ))));
         }
         // Die Decke, die dieses Kind seinerseits an seine Nachkommen weitergibt.
         // Die Verschärfungsrichtung bleibt unverändert: die eigene IR schneidet
@@ -3825,7 +4180,9 @@ impl ManagedAgentSpawner {
                 .tool_providers()
                 .iter()
                 .flat_map(|provider| provider.tools())
-                .filter(|spec| parent_activation.is_tool_enabled(&harw_tools::ToolName::new(spec.name())))
+                .filter(|spec| {
+                    parent_activation.is_tool_enabled(&harw_tools::ToolName::new(spec.name()))
+                })
                 .map(|spec| spec.name().to_string())
                 .collect(),
             Err(_) => BTreeSet::new(),
@@ -3850,7 +4207,9 @@ impl ManagedAgentSpawner {
                 &parent_grant,
             )?;
         if self.limits.lease_seconds <= 0 {
-            return Err(Self::reject("child lease duration must be positive"));
+            return Err(AdmitRejection::Other(Self::reject(
+                "child lease duration must be positive",
+            )));
         }
         let admitted_at = Timestamp::now();
         let lease_expires_at = admitted_at
@@ -3949,8 +4308,9 @@ impl ManagedAgentSpawner {
                 ))
             })?;
             // 200_000: Default-Kontextfenster laut Addendum D, unabhängig vom
-            // tatsächlich aktiven Modell — der feste Deckel (s. u.) greift bei
-            // jedem realen Fenster ohnehin zuerst.
+            // tatsächlich aktiven Modell — die relative 70 %-Schwelle bleibt
+            // für reale Fenster maßgeblich; der feste Deckel (s. u.) begrenzt
+            // zusätzlich die kumulierte Input-Nutzung langer Sessions (Standard: 500 000).
             let base_policy = crate::auto_compact::AutoCompactPolicy::for_context_window(200_000)
                 .with_absolute_ceiling(Some(crate::auto_compact::DEFAULT_ABSOLUTE_CEILING_TOKENS));
             let policy = match definition.organizational_role {
@@ -4006,7 +4366,8 @@ impl ManagedAgentSpawner {
             let (provider_default, model_default) = definition
                 .registry_factory
                 .reasoning_effort_defaults_for_role_task(role_name, task_complexity);
-            let agent_default = executable_ir.and_then(harw_agent_dsl::executable::ExecutableAgentIr::reasoning_effort);
+            let agent_default = executable_ir
+                .and_then(harw_agent_dsl::executable::ExecutableAgentIr::reasoning_effort);
             let resolved_default = resolve_child_default_reasoning_effort(
                 provider_default,
                 model_default,
@@ -4019,6 +4380,13 @@ impl ManagedAgentSpawner {
                 child_session.set_reasoning_effort(Some(effective));
             }
         }
+        // Der Root wird aus dem bereits admittierten Parent-Teilbaum gelesen,
+        // bevor das neue Kind eingefügt wird. Damit ist die Event-Korrelation
+        // für externe wie manager-eigene Wurzeln exakt und braucht kein Feld
+        // auf SpawnContext.
+        let root_session_id = Self::root_from_active(&active, &input.parent_session_id)
+            .ok_or_else(|| Self::reject("child parent lineage contains a cycle"))?;
+        let task = input.instructions.clone();
         let record = ChildRecord {
             child: child.clone(),
             parent: input.parent_session_id,
@@ -4037,9 +4405,9 @@ impl ManagedAgentSpawner {
         if let Some(lease_store) = &self.lease_store {
             if let Err(error) = lease_store.admit(&record.durable_lease()) {
                 let _ = manager.remove(&child);
-                return Err(Self::reject(format!(
+                return Err(AdmitRejection::Other(Self::reject(format!(
                     "could not durably admit child lease: {error}"
-                )));
+                ))));
             }
         }
         // A-CHILD: das Kind erbt einen von seinem Elternteil abgeleiteten
@@ -4050,6 +4418,7 @@ impl ManagedAgentSpawner {
         // `child_cancel_token`-Aufrufs (der dieselbe Sperre erneut nähme).
         // Der Elternschlüssel wird vor dem Verschieben von `record` in
         // `active` geklont, da `record` danach nicht mehr lesbar ist.
+        let event_record = record.clone();
         let parent_key = record.parent.as_str().to_owned();
         active.insert(child.as_str().to_owned(), record);
         let child_cancel = if let Some(parent_token) = cancellations.get(&parent_key) {
@@ -4069,7 +4438,158 @@ impl ManagedAgentSpawner {
                 .child()
         };
         cancellations.insert(child.as_str().to_owned(), child_cancel);
+        // Never invoke runtime code while controller locks are live: an
+        // observer may persist synchronously or inspect the tree.
+        drop(cancellations);
+        drop(active);
+        drop(manager);
+        self.observe_orchestration(
+            root_session_id,
+            &event_record,
+            task,
+            AgentOrchestrationStatus::Admitted,
+        );
         Ok(child)
+    }
+
+    /// Admits a child, waiting for capacity instead of rejecting outright
+    /// when the parent is at [`ChildLimits::max_active_children_per_parent`].
+    ///
+    /// # Description
+    /// Fixes the four-parallel-`explore` regression: with a per-parent limit
+    /// of two, two of four concurrent [`Self::admit`] calls used to fail
+    /// hard with "reached its active child limit". This wraps
+    /// [`Self::admit_inner`] the way `admission::SubmissionLimiter`'s
+    /// `wait_before_retry` wraps `JobAdmissionService::submit` for the
+    /// analogous job-admission rate limiter: one attempt is made
+    /// immediately, and only [`AdmitRejection::Capacity`] is retried.
+    /// [`AdmitRejection::Other`] — unknown role, spawn-matrix denial,
+    /// sandbox escalation, depth, lease/registry failure, poisoned lock,
+    /// ... — is returned unchanged on the very first attempt, exactly as
+    /// [`Self::admit`] always has.
+    ///
+    /// Each retry creates and [enables](tokio::sync::Notify::notified) a
+    /// fresh [`Self::freed`] waiter *before* re-checking admission (the same
+    /// order [`Self::release_in_memory`] relies on to guarantee a release
+    /// landing between the failed check and the `.await` is still observed —
+    /// `notify_waiters` does not remember a notification for a waiter
+    /// created afterward). A bounded sleep (at most 500ms, less if `max_wait`
+    /// is about to elapse) races alongside that wait regardless, so even a
+    /// theoretically missed wakeup costs at most one extra poll, never a
+    /// hang.
+    ///
+    /// # Arguments
+    /// - `role_name`, `input`, `sandbox`, `suggestions`: identical to
+    ///   [`Self::admit`]; `input`/`sandbox`/`suggestions` are cloned once per
+    ///   retry attempt (the original caller's clone is never mutated).
+    /// - `max_wait` (`std::time::Duration`): upper bound on the total time
+    ///   spent waiting across every retry, starting from this call. Once it
+    ///   elapses while still at capacity, the exact
+    ///   [`AdmitRejection::Capacity`] error the next attempt would have
+    ///   produced is returned.
+    /// - `cancel` (`&CancelToken`): observed between attempts (not during
+    ///   `admit_inner` itself, which never awaits). A token cancelled while
+    ///   waiting ends the wait immediately with a distinct message — never
+    ///   confusable with the capacity message, so a caller can match on
+    ///   `error.message.contains(...)` to tell the two apart if it must.
+    ///
+    /// # Returns
+    /// `Ok(SessionId)` of the newly admitted child — identical in shape to
+    /// [`Self::admit`]'s success case.
+    ///
+    /// # Errors
+    /// - Any [`AdmitRejection::Other`] rejection from the first attempt,
+    ///   unchanged.
+    /// - The original capacity [`AgentSpawnError`] once `max_wait` elapses.
+    /// - An [`AgentSpawnError`] naming the cancellation if `cancel` is
+    ///   cancelled before a slot freed.
+    ///
+    /// # Concurrency
+    /// Requires a Tokio runtime (`tokio::select!`, `tokio::time::sleep`,
+    /// [`tokio::sync::Notify`]). Runs entirely on the calling task — unlike
+    /// `JobAdmissionService::submit_queued_async`, no background task is
+    /// spawned, because callers such as the parallel `explore` fan-out in
+    /// `harw-core-bridge::agent_tool` already run each spawn attempt on its
+    /// own task and want to `.await` this call directly rather than poll a
+    /// `oneshot::Receiver`.
+    pub async fn admit_or_wait(
+        &self,
+        role_name: &str,
+        input: SpawnInput,
+        sandbox: SandboxSpec,
+        suggestions: Option<AgentSuggestions>,
+        max_wait: Duration,
+        cancel: &CancelToken,
+    ) -> Result<SessionId, AgentSpawnError> {
+        let deadline = tokio::time::Instant::now() + max_wait;
+        loop {
+            // Registered *before* the admission attempt below: if a release
+            // notifies between this attempt's capacity check and the
+            // `tokio::select!` awaiting `notified`, the notification is
+            // still observed (see the method doc and `Self::freed`).
+            let notified = self.freed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.admit_inner(
+                role_name,
+                input.clone(),
+                sandbox.clone(),
+                suggestions.clone(),
+            ) {
+                Ok(child) => return Ok(child),
+                Err(AdmitRejection::Other(error)) => return Err(error),
+                Err(AdmitRejection::Capacity(error)) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        return Err(error);
+                    }
+                    let sleep_for = deadline
+                        .saturating_duration_since(now)
+                        .min(Duration::from_millis(500));
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => {
+                            return Err(Self::reject(format!(
+                                "waiting for parent {}'s child capacity was cancelled before a slot freed",
+                                input.parent_session_id
+                            )));
+                        }
+                        () = notified.as_mut() => {}
+                        () = tokio::time::sleep(sleep_for) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`Self::admit_or_wait`] followed by [`Self::guard_child`] — the
+    /// capacity-waiting counterpart to [`Self::spawn_child_guarded`], for
+    /// callers that want a [`ChildGuard`] without an unguarded window
+    /// between admission and the guard taking ownership of the slot.
+    ///
+    /// # Arguments
+    /// See [`Self::admit_or_wait`].
+    ///
+    /// # Returns
+    /// The new child's [`ChildGuard`].
+    ///
+    /// # Errors
+    /// See [`Self::admit_or_wait`].
+    ///
+    /// # Concurrency
+    /// See [`Self::admit_or_wait`].
+    pub async fn spawn_child_or_wait(
+        &self,
+        role_name: &str,
+        input: SpawnInput,
+        sandbox: SandboxSpec,
+        suggestions: Option<AgentSuggestions>,
+        max_wait: Duration,
+        cancel: &CancelToken,
+    ) -> Result<ChildGuard<'_>, AgentSpawnError> {
+        self.admit_or_wait(role_name, input, sandbox, suggestions, max_wait, cancel)
+            .await
+            .map(|child| self.guard_child(child))
     }
 }
 
@@ -4109,15 +4629,16 @@ mod tests {
     use crate::model::{EchoModelProvider, ModelFuture, ModelRequest, ModelResponse};
     use crate::session::AgentSession;
     use crate::state_store::InMemoryStateStore;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_agent_dsl::authority::AuthorityCeiling;
     use harw_agent_dsl::executable::lower;
     use harw_agent_dsl::parse::parse_toml;
     use harw_agent_dsl::resolved::{ResolutionTrace, ResolvedAgentDefinition};
+    use harw_authority::{Permission, PermissionSet, WorkspaceRegistration, WorkspaceRegistry};
     use harw_context::SectionName;
     use harw_extension_api::{
         ApprovalDecision, ApprovalHandler, ExtFuture, ExtensionRegistryBuilder,
     };
-    use harw_authority::{Permission, PermissionSet, WorkspaceRegistration, WorkspaceRegistry};
     use harw_tools::{ToolCall, ToolName};
     use harw_types::{ApprovalActor, ItemId, TenantId, TokenUsage, WorkspaceId};
     use std::path::PathBuf;
@@ -4409,7 +4930,7 @@ mod tests {
 
     /// Lowert eine Test-Agent-IR aus einem TOML-Fragment (Sektionen `[spawn]`,
     /// `[spawn.budget]`, `[lifecycle]`, `[tools]`).
-    fn test_agent_ir(sections: &str) -> ExecutableAgentIr {
+    fn test_agent_ir(sections: &str) -> TestResult<ExecutableAgentIr> {
         let raw = parse_toml(&format!(
             r#"
 schema = "harwness.agent/v1"
@@ -4420,7 +4941,7 @@ specialization = "child-controller-test"
 {sections}
 "#
         ))
-        .expect("test agent definition must parse");
+        .map_err(ctx("test agent definition must parse"))?;
         let resolved = ResolvedAgentDefinition {
             id: raw.id,
             version: raw.version,
@@ -4433,13 +4954,13 @@ specialization = "child-controller-test"
             trace: ResolutionTrace { steps: Vec::new() },
             config: raw.tables,
         };
-        lower(&resolved).expect("test agent definition must lower")
+        lower(&resolved).map_err(ctx("test agent definition must lower"))
     }
 
-    fn test_sandbox(permissions: PermissionSet) -> SandboxSpec {
+    fn test_sandbox(permissions: PermissionSet) -> TestResult<SandboxSpec> {
         let harness_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
-            .expect("harw-core has a workspace parent")
+            .ok_or(TestError::Missing("harw-core has a workspace parent"))?
             .to_path_buf();
         let registry = WorkspaceRegistry::build(
             &harness_root,
@@ -4449,16 +4970,16 @@ specialization = "child-controller-test"
                 root: PathBuf::from("harw-core"),
             }],
         )
-        .expect("test workspace is registered");
-        SandboxSpec::from_resolved(
+        .map_err(ctx("test workspace is registered"))?;
+        Ok(SandboxSpec::from_resolved(
             registry
                 .resolve(
                     &TenantId::from_str("test-tenant"),
                     &WorkspaceId::from_str("external-root-controller-tests"),
                 )
-                .expect("test workspace resolves"),
+                .map_err(ctx("test workspace resolves"))?,
             permissions,
-        )
+        ))
     }
 
     fn external_root_context(
@@ -4494,6 +5015,24 @@ specialization = "child-controller-test"
         )
     }
 
+    /// Wie [`worker_spawner`], aber mit frei wählbaren [`ChildLimits`] — für
+    /// die `admit_or_wait`-Tests, die einen engen
+    /// `max_active_children_per_parent`-Deckel (typischerweise `1`) brauchen,
+    /// um Kapazitätsdruck ohne acht parallele Kinder zu erzwingen.
+    fn worker_spawner_with_limits(
+        manager: Arc<Mutex<SessionManager>>,
+        limits: ChildLimits,
+    ) -> ManagedAgentSpawner {
+        ManagedAgentSpawner::new(manager, limits).with_role(
+            "worker",
+            AgentRole::Agent {
+                name: "worker".to_owned(),
+            },
+            harw_agent_dsl::roles::AgentRoleId::Worker,
+            Arc::new(EmptyChildRegistry),
+        )
+    }
+
     fn spawn_input(parent_session_id: SessionId) -> SpawnInput {
         SpawnInput {
             parent_session_id,
@@ -4513,13 +5052,13 @@ specialization = "child-controller-test"
         }
     }
 
-    fn spawner_with_admitted_child() -> (ManagedAgentSpawner, SessionId) {
+    fn spawner_with_admitted_child() -> TestResult<(ManagedAgentSpawner, SessionId)> {
         spawner_with_admitted_child_and_lease_store(None)
     }
 
     fn spawner_with_admitted_child_and_lease_store(
         lease_store: Option<Arc<ChildLeaseStore>>,
-    ) -> (ManagedAgentSpawner, SessionId) {
+    ) -> TestResult<(ManagedAgentSpawner, SessionId)> {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events.clone())));
         let child_session = AgentSession::new(
@@ -4533,9 +5072,9 @@ specialization = "child-controller-test"
         let child = child_session.id().clone();
         manager
             .lock()
-            .expect("test session manager lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .restore(child_session)
-            .expect("test child session restores");
+            .map_err(ctx("test child session restores"))?;
 
         let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative());
         let spawner = if let Some(lease_store) = lease_store.as_ref() {
@@ -4562,23 +5101,26 @@ specialization = "child-controller-test"
         if let Some(lease_store) = lease_store {
             lease_store
                 .admit(&record.durable_lease())
-                .expect("test lease admission persists");
+                .map_err(ctx("test lease admission persists"))?;
         }
         spawner
             .active
             .lock()
-            .expect("test child registry lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(child.as_str().to_owned(), record);
-        (spawner, child)
+        Ok((spawner, child))
     }
 
     #[test]
-    fn child_final_assistant_text_returns_the_newest_response() {
-        let (spawner, child) = spawner_with_admitted_child();
-        let mut manager = spawner.manager.lock().expect("test session manager lock");
+    fn child_final_assistant_text_returns_the_newest_response() -> TestResult {
+        let (spawner, child) = spawner_with_admitted_child()?;
+        let mut manager = spawner
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let history = manager
             .get_mut(&child)
-            .expect("admitted child session exists")
+            .map_err(ctx("admitted child session exists"))?
             .history_mut();
         history.push_assistant_text("intermediate response", None);
         history.push_user_text("continue");
@@ -4588,77 +5130,85 @@ specialization = "child-controller-test"
         assert_eq!(
             spawner
                 .child_final_assistant_text(&child)
-                .expect("completed child text is available"),
+                .map_err(ctx("completed child text is available"))?,
             "completed child response"
         );
+        Ok(())
     }
 
     #[test]
-    fn child_final_assistant_text_rejects_unknown_child() {
-        let (spawner, _child) = spawner_with_admitted_child();
-        let error = spawner
-            .child_final_assistant_text(&SessionId::new())
-            .expect_err("unknown child must be rejected");
+    fn child_final_assistant_text_rejects_unknown_child() -> TestResult {
+        let (spawner, _child) = spawner_with_admitted_child()?;
+        let Err(error) = spawner.child_final_assistant_text(&SessionId::new()) else {
+            return Err(TestError::Unexpected(
+                "unknown child must be rejected".to_owned(),
+            ));
+        };
 
         assert!(error.message.contains("is not admitted"));
+        Ok(())
     }
 
     #[test]
-    fn child_final_assistant_text_rejects_child_without_assistant_response() {
-        let (spawner, child) = spawner_with_admitted_child();
+    fn child_final_assistant_text_rejects_child_without_assistant_response() -> TestResult {
+        let (spawner, child) = spawner_with_admitted_child()?;
         spawner
             .manager
             .lock()
-            .expect("test session manager lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get_mut(&child)
-            .expect("admitted child session exists")
+            .map_err(ctx("admitted child session exists"))?
             .history_mut()
             .push_user_text("work on this");
 
-        let error = spawner
-            .child_final_assistant_text(&child)
-            .expect_err("child without an assistant response must be rejected");
+        let Err(error) = spawner.child_final_assistant_text(&child) else {
+            return Err(TestError::Unexpected(
+                "child without an assistant response must be rejected".to_owned(),
+            ));
+        };
 
         assert!(error.message.contains("no assistant response text"));
+        Ok(())
     }
 
     #[test]
-    fn child_completed_durably_records_completion_before_releasing_admission() {
-        let temporary_directory = tempfile::tempdir().expect("temporary lease directory");
+    fn child_completed_durably_records_completion_before_releasing_admission() -> TestResult {
+        let temporary_directory = tempfile::tempdir().map_err(ctx("temporary lease directory"))?;
         let lease_store = Arc::new(ChildLeaseStore::new(temporary_directory.path()));
         let (spawner, child) =
-            spawner_with_admitted_child_and_lease_store(Some(lease_store.clone()));
+            spawner_with_admitted_child_and_lease_store(Some(lease_store.clone()))?;
         let record = spawner
             .child_record(&child)
-            .expect("test child is admitted");
+            .ok_or(TestError::Missing("test child is admitted"))?;
         let completed_at = Timestamp::now();
 
         AgentSpawner::child_completed(&spawner, &child, completed_at)
-            .expect("durable child completion succeeds");
+            .map_err(ctx("durable child completion succeeds"))?;
 
         assert!(spawner.child_record(&child).is_none());
         assert!(
             lease_store
                 .active()
-                .expect("active leases are readable")
+                .map_err(ctx("active leases are readable"))?
                 .is_empty()
         );
         let completion_path = lease_store
             .root()
             .join(format!("{}.completed.json", child.as_str()));
         let completion: harw_session_store::ChildLeaseCompletionRecord = serde_json::from_slice(
-            &std::fs::read(completion_path).expect("completion record is written"),
+            &std::fs::read(completion_path).map_err(ctx("completion record is written"))?,
         )
-        .expect("completion record is valid JSON");
+        .map_err(ctx("completion record is valid JSON"))?;
         assert_eq!(completion.lease, record.durable_lease());
         assert_eq!(completion.completed_at, completed_at);
+        Ok(())
     }
 
     #[test]
-    fn external_root_parent_admits_a_child_without_a_manager_mirror() {
+    fn external_root_parent_admits_a_child_without_a_manager_mirror() -> TestResult {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent = SessionId::new();
         let spawner = worker_spawner(manager.clone())
             .with_external_root_parent(
@@ -4670,17 +5220,21 @@ specialization = "child-controller-test"
                 Some(ReasoningEffort::Medium),
                 SessionActivation::default(),
             )
-            .expect("trusted external root registers during construction");
+            .map_err(ctx("trusted external root registers during construction"))?;
 
         let child = spawner
             .admit("worker", spawn_input(parent.clone()), sandbox, None)
-            .expect("registered external root admits a direct child");
+            .map_err(ctx("registered external root admits a direct child"))?;
 
-        let record = spawner.child_record(&child).expect("child is tracked");
+        let record = spawner
+            .child_record(&child)
+            .ok_or(TestError::Missing("child is tracked"))?;
         assert_eq!(record.parent, parent);
         assert_eq!(record.depth, 1);
-        let manager = manager.lock().expect("manager lock");
-        let child_session = manager.get(&child).expect("child is manager-owned");
+        let manager = manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let child_session = manager.get(&child).map_err(ctx("child is manager-owned"))?;
         assert_eq!(child_session.parent_session_id(), Some(&record.parent));
         assert_eq!(
             child_session.reasoning_effort(),
@@ -4689,19 +5243,20 @@ specialization = "child-controller-test"
         assert_eq!(
             child_session
                 .spawn_context()
-                .expect("child has trusted context")
+                .ok_or(TestError::Missing("child has trusted context"))?
                 .approval_actor,
             Some(ApprovalActor::Operator {
                 id: "external-root-operator".to_owned(),
             })
         );
+        Ok(())
     }
 
     #[test]
-    fn external_root_parent_rejects_unknown_parent_ids() {
+    fn external_root_parent_rejects_unknown_parent_ids() -> TestResult {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let spawner = worker_spawner(manager)
             .with_external_root_parent(
                 SessionId::new(),
@@ -4712,20 +5267,24 @@ specialization = "child-controller-test"
                 None,
                 SessionActivation::default(),
             )
-            .expect("trusted external root registers during construction");
+            .map_err(ctx("trusted external root registers during construction"))?;
 
-        let error = spawner
-            .admit("worker", spawn_input(SessionId::new()), sandbox, None)
-            .expect_err("unregistered parent must be denied");
+        let Err(error) = spawner.admit("worker", spawn_input(SessionId::new()), sandbox, None)
+        else {
+            return Err(TestError::Unexpected(
+                "unregistered parent must be denied".to_owned(),
+            ));
+        };
 
         assert!(error.message.contains("unknown child parent"));
+        Ok(())
     }
 
     #[test]
-    fn external_root_parent_rejects_sandbox_escalation() {
+    fn external_root_parent_rejects_sandbox_escalation() -> TestResult {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let parent_sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let parent_sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent = SessionId::new();
         let spawner = worker_spawner(manager)
             .with_external_root_parent(
@@ -4737,28 +5296,31 @@ specialization = "child-controller-test"
                 None,
                 SessionActivation::default(),
             )
-            .expect("trusted external root registers during construction");
+            .map_err(ctx("trusted external root registers during construction"))?;
 
-        let error = spawner
-            .admit(
-                "worker",
-                spawn_input(parent),
-                test_sandbox(PermissionSet::from_policy([
-                    Permission::ReadWorkspace,
-                    Permission::WriteWorkspace,
-                ])),
-                None,
-            )
-            .expect_err("external root cannot escalate a child sandbox");
+        let Err(error) = spawner.admit(
+            "worker",
+            spawn_input(parent),
+            test_sandbox(PermissionSet::from_policy([
+                Permission::ReadWorkspace,
+                Permission::WriteWorkspace,
+            ]))?,
+            None,
+        ) else {
+            return Err(TestError::Unexpected(
+                "external root cannot escalate a child sandbox".to_owned(),
+            ));
+        };
 
         assert!(error.message.contains("child sandbox escalation rejected"));
+        Ok(())
     }
 
     #[test]
-    fn external_root_parent_enforces_the_role_spawn_matrix() {
+    fn external_root_parent_enforces_the_role_spawn_matrix() -> TestResult {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent = SessionId::new();
         let spawner = worker_spawner(manager)
             .with_external_root_parent(
@@ -4767,13 +5329,19 @@ specialization = "child-controller-test"
                 None,
                 SessionActivation::default(),
             )
-            .expect("trusted external root registers during construction");
+            .map_err(ctx("trusted external root registers during construction"))?;
 
-        let error = spawner
-            .admit("worker", spawn_input(parent), sandbox, None)
-            .expect_err("worker roots cannot spawn durable workers");
+        let Err(error) = spawner.admit("worker", spawn_input(parent), sandbox, None) else {
+            return Err(TestError::Unexpected(
+                "worker roots cannot spawn durable workers".to_owned(),
+            ));
+        };
 
-        assert_eq!(error.message, "no delegation capability is available for this request");
+        assert_eq!(
+            error.message,
+            "no delegation capability is available for this request"
+        );
+        Ok(())
     }
 
     // --- W2-16: `ChildLimits`-Ableitung ------------------------------------
@@ -4816,7 +5384,7 @@ specialization = "child-controller-test"
         allow_pause: bool,
         children: usize,
         mut registry: impl FnMut() -> ExtensionRegistry,
-    ) -> (ManagedAgentSpawner, Vec<SessionId>) {
+    ) -> TestResult<(ManagedAgentSpawner, Vec<SessionId>)> {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events.clone())));
         let spawner = ManagedAgentSpawner::new(Arc::clone(&manager), ChildLimits::conservative())
@@ -4832,8 +5400,8 @@ specialization = "child-controller-test"
         let admitted_at = Timestamp::now();
         let lease_expires_at = admitted_at
             .checked_add(SignedDuration::from_secs(300))
-            .expect("test lease does not overflow");
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+            .map_err(ctx("test lease does not overflow"))?;
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let mut ids = Vec::with_capacity(children);
         for _ in 0..children {
             let session = AgentSession::new(
@@ -4851,13 +5419,13 @@ specialization = "child-controller-test"
             let child = session.id().clone();
             manager
                 .lock()
-                .expect("test session manager lock")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .restore(session)
-                .expect("test child session restores");
+                .map_err(ctx("test child session restores"))?;
             spawner
                 .active
                 .lock()
-                .expect("test child registry lock")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(
                     child.as_str().to_owned(),
                     ChildRecord {
@@ -4879,11 +5447,11 @@ specialization = "child-controller-test"
             spawner
                 .cancellations
                 .lock()
-                .expect("test cancellation registry lock")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(child.as_str().to_owned(), CancelToken::new());
             ids.push(child);
         }
-        (spawner, ids)
+        Ok((spawner, ids))
     }
 
     /// Wie [`runnable_children`], aber mit **einer Rolle je Kind** statt
@@ -4899,7 +5467,7 @@ specialization = "child-controller-test"
         allow_pause: bool,
         roles: &[(&str, harw_agent_dsl::roles::AgentRoleId)],
         mut registry: impl FnMut() -> ExtensionRegistry,
-    ) -> (ManagedAgentSpawner, Vec<SessionId>) {
+    ) -> TestResult<(ManagedAgentSpawner, Vec<SessionId>)> {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events.clone())));
         let mut spawner =
@@ -4923,8 +5491,8 @@ specialization = "child-controller-test"
         let admitted_at = Timestamp::now();
         let lease_expires_at = admitted_at
             .checked_add(SignedDuration::from_secs(300))
-            .expect("test lease does not overflow");
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+            .map_err(ctx("test lease does not overflow"))?;
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let mut ids = Vec::with_capacity(roles.len());
         for (role_name, organizational_role) in roles {
             let session = AgentSession::new(
@@ -4939,13 +5507,13 @@ specialization = "child-controller-test"
             let child = session.id().clone();
             manager
                 .lock()
-                .expect("test session manager lock")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .restore(session)
-                .expect("test child session restores");
+                .map_err(ctx("test child session restores"))?;
             spawner
                 .active
                 .lock()
-                .expect("test child registry lock")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(
                     child.as_str().to_owned(),
                     ChildRecord {
@@ -4967,11 +5535,11 @@ specialization = "child-controller-test"
             spawner
                 .cancellations
                 .lock()
-                .expect("test cancellation registry lock")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(child.as_str().to_owned(), CancelToken::new());
             ids.push(child);
         }
-        (spawner, ids)
+        Ok((spawner, ids))
     }
 
     fn empty_registry() -> ExtensionRegistry {
@@ -4982,7 +5550,7 @@ specialization = "child-controller-test"
         spawner
             .manager
             .lock()
-            .expect("test session manager lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(child)
             .is_ok()
     }
@@ -4990,13 +5558,13 @@ specialization = "child-controller-test"
     // --- W2-17: Budget-Durchsetzung ---------------------------------------
 
     #[tokio::test]
-    async fn wall_time_budget_cancels_cooperatively_and_returns_the_session() {
+    async fn wall_time_budget_cancels_cooperatively_and_returns_the_session() -> TestResult {
         let (spawner, children) =
-            runnable_children(Arc::new(HangingChildRegistry), true, 1, empty_registry);
+            runnable_children(Arc::new(HangingChildRegistry), true, 1, empty_registry)?;
         let child = children[0].clone();
         let store = InMemoryStateStore::new();
 
-        let error = spawner
+        let Err(error) = spawner
             .run_child_with_budget(
                 &child,
                 &store,
@@ -5008,7 +5576,11 @@ specialization = "child-controller-test"
                 },
             )
             .await
-            .expect_err("an elapsed wall-time budget must reject the run");
+        else {
+            return Err(TestError::Unexpected(
+                "an elapsed wall-time budget must reject the run".to_owned(),
+            ));
+        };
 
         assert!(
             error
@@ -5021,10 +5593,11 @@ specialization = "child-controller-test"
             child_is_manager_owned(&spawner, &child),
             "the cooperatively cancelled child must be back in the session manager"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn tool_call_budget_violation_reports_a_machine_readable_message() {
+    async fn tool_call_budget_violation_reports_a_machine_readable_message() -> TestResult {
         let (spawner, children) = runnable_children(
             Arc::new(EchoChildRegistry {
                 reply: "worker complete",
@@ -5032,13 +5605,16 @@ specialization = "child-controller-test"
             true,
             1,
             empty_registry,
-        );
+        )?;
         let child = children[0].clone();
         {
-            let mut manager = spawner.manager.lock().expect("test session manager lock");
+            let mut manager = spawner
+                .manager
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let history = manager
                 .get_mut(&child)
-                .expect("admitted child session exists")
+                .map_err(ctx("admitted child session exists"))?
                 .history_mut();
             for _ in 0..3 {
                 history.push_tool_call(ToolCallId::new(), "fs.read", serde_json::Value::Null);
@@ -5046,7 +5622,7 @@ specialization = "child-controller-test"
         }
         let store = InMemoryStateStore::new();
 
-        let error = spawner
+        let Err(error) = spawner
             .run_child_with_budget(
                 &child,
                 &store,
@@ -5058,16 +5634,21 @@ specialization = "child-controller-test"
                 },
             )
             .await
-            .expect_err("an exceeded tool-call budget must reject the run");
+        else {
+            return Err(TestError::Unexpected(
+                "an exceeded tool-call budget must reject the run".to_owned(),
+            ));
+        };
 
         assert_eq!(
             error.message,
             "budget_exceeded: tool_calls (limit=1, used=3)"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn a_run_inside_its_tool_call_budget_succeeds() {
+    async fn a_run_inside_its_tool_call_budget_succeeds() -> TestResult {
         let (spawner, children) = runnable_children(
             Arc::new(EchoChildRegistry {
                 reply: "worker complete",
@@ -5075,7 +5656,7 @@ specialization = "child-controller-test"
             true,
             1,
             empty_registry,
-        );
+        )?;
         let child = children[0].clone();
         let store = InMemoryStateStore::new();
 
@@ -5092,10 +5673,11 @@ specialization = "child-controller-test"
                 },
             )
             .await
-            .expect("a child inside its budget must complete");
+            .map_err(ctx("a child inside its budget must complete"))?;
 
         assert_eq!(result.child, child);
         assert!(matches!(result.outcome, TurnOutcome::Completed));
+        Ok(())
     }
 
     // --- W2-18: Fan-out ----------------------------------------------------
@@ -5167,7 +5749,7 @@ specialization = "child-controller-test"
     }
 
     #[tokio::test]
-    async fn run_children_returns_results_in_request_order() {
+    async fn run_children_returns_results_in_request_order() -> TestResult {
         let (spawner, children) = runnable_children(
             Arc::new(EchoChildRegistry {
                 reply: "worker complete",
@@ -5175,7 +5757,7 @@ specialization = "child-controller-test"
             true,
             3,
             empty_registry,
-        );
+        )?;
         let store = InMemoryStateStore::new();
 
         let results = spawner
@@ -5189,16 +5771,17 @@ specialization = "child-controller-test"
 
         assert_eq!(results.len(), 3);
         for (position, result) in results.into_iter().enumerate() {
-            let run = result.expect("every child of the wave completes");
+            let run = result.map_err(ctx("every child of the wave completes"))?;
             assert_eq!(
                 run.child, children[position],
                 "result slot {position} must carry the child requested at that position"
             );
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn run_children_with_max_parallel_one_serialises_the_wave() {
+    async fn run_children_with_max_parallel_one_serialises_the_wave() -> TestResult {
         let inflight = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let (spawner, children) = runnable_children(
@@ -5209,7 +5792,7 @@ specialization = "child-controller-test"
             true,
             3,
             empty_registry,
-        );
+        )?;
         let store = InMemoryStateStore::new();
 
         let results = spawner
@@ -5228,6 +5811,7 @@ specialization = "child-controller-test"
             1,
             "max_parallel = 1 must never have two child turns in flight"
         );
+        Ok(())
     }
 
     /// Beweist die UiaWorker-Fan-out-Deckelung (Nutzerauftrag: `analyze(max_parallel:
@@ -5237,7 +5821,7 @@ specialization = "child-controller-test"
     /// trotzdem auf `1` deckeln, obwohl `max_parallel = 4` angefordert wird und
     /// zwei der drei Anfragen für sich unbeschränkt wären.
     #[tokio::test]
-    async fn run_children_caps_uia_worker_wave_to_one_regardless_of_max_parallel() {
+    async fn run_children_caps_uia_worker_wave_to_one_regardless_of_max_parallel() -> TestResult {
         let inflight = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let (spawner, children) = runnable_children_with_roles(
@@ -5252,7 +5836,7 @@ specialization = "child-controller-test"
                 ("worker", harw_agent_dsl::roles::AgentRoleId::Worker),
             ],
             empty_registry,
-        );
+        )?;
         let store = InMemoryStateStore::new();
 
         let results = spawner
@@ -5272,6 +5856,7 @@ specialization = "child-controller-test"
             "a wave containing a uia-worker request must serialise, \
              even though max_parallel = 4 and the sibling roles are unbounded"
         );
+        Ok(())
     }
 
     /// Regressionsschutz für die UiaWorker-Deckelung: eine Welle **ohne** jede
@@ -5279,7 +5864,7 @@ specialization = "child-controller-test"
     /// [`ManagedAgentSpawner::effective_fanout_slots`] darf Nicht-UiaWorker-Wellen
     /// nicht fälschlich auf `1` klemmen.
     #[tokio::test]
-    async fn run_children_without_uia_worker_role_stays_unbounded_at_max_parallel() {
+    async fn run_children_without_uia_worker_role_stays_unbounded_at_max_parallel() -> TestResult {
         let inflight = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let (spawner, children) = runnable_children_with_roles(
@@ -5290,12 +5875,18 @@ specialization = "child-controller-test"
             true,
             &[
                 ("worker", harw_agent_dsl::roles::AgentRoleId::Worker),
-                ("agent-steward", harw_agent_dsl::roles::AgentRoleId::AgentSteward),
+                (
+                    "agent-steward",
+                    harw_agent_dsl::roles::AgentRoleId::AgentSteward,
+                ),
                 ("worker", harw_agent_dsl::roles::AgentRoleId::Worker),
-                ("agent-steward", harw_agent_dsl::roles::AgentRoleId::AgentSteward),
+                (
+                    "agent-steward",
+                    harw_agent_dsl::roles::AgentRoleId::AgentSteward,
+                ),
             ],
             empty_registry,
-        );
+        )?;
         let store = InMemoryStateStore::new();
 
         let results = spawner
@@ -5313,10 +5904,11 @@ specialization = "child-controller-test"
             "a wave without any uia-worker request must not be serialised by the \
              uia-worker cap"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn run_children_actually_overlaps_child_turns() {
+    async fn run_children_actually_overlaps_child_turns() -> TestResult {
         let inflight = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let (spawner, children) = runnable_children(
@@ -5327,7 +5919,7 @@ specialization = "child-controller-test"
             true,
             3,
             empty_registry,
-        );
+        )?;
         let store = InMemoryStateStore::new();
 
         let results = spawner
@@ -5344,10 +5936,11 @@ specialization = "child-controller-test"
             peak.load(Ordering::SeqCst) >= 2,
             "the session-manager lock must not serialise independent child turns"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn run_children_any_terminal_cancels_the_remaining_children() {
+    async fn run_children_any_terminal_cancels_the_remaining_children() -> TestResult {
         // Das erste Kind antwortet sofort, die beiden anderen nie — ohne
         // AnyTerminal-Abbruch würde die Welle hängen.
         struct FirstWinsRegistry {
@@ -5384,7 +5977,7 @@ specialization = "child-controller-test"
             true,
             3,
             empty_registry,
-        );
+        )?;
         let store = InMemoryStateStore::new();
 
         let results = spawner
@@ -5397,20 +5990,27 @@ specialization = "child-controller-test"
             .await;
 
         assert_eq!(results.len(), 3);
-        let winner = results[0].as_ref().expect("the first child wins the wave");
+        let Ok(winner) = results[0].as_ref() else {
+            return Err(TestError::Unexpected(
+                "the first child wins the wave".to_owned(),
+            ));
+        };
         assert_eq!(winner.child, children[0]);
         for position in [1_usize, 2] {
-            let error = results[position]
-                .as_ref()
-                .expect_err("a cancelled sibling must not report a result");
+            let Err(error) = results[position].as_ref() else {
+                return Err(TestError::Unexpected(
+                    "a cancelled sibling must not report a result".to_owned(),
+                ));
+            };
             assert_eq!(error.message, CANCELLED_BY_SIBLING);
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn run_children_returns_an_empty_wave_unchanged() {
+    async fn run_children_returns_an_empty_wave_unchanged() -> TestResult {
         let (spawner, _children) =
-            runnable_children(Arc::new(EmptyChildRegistry), true, 0, empty_registry);
+            runnable_children(Arc::new(EmptyChildRegistry), true, 0, empty_registry)?;
         let store = InMemoryStateStore::new();
 
         let results = spawner
@@ -5418,25 +6018,30 @@ specialization = "child-controller-test"
             .await;
 
         assert!(results.is_empty());
+        Ok(())
     }
 
     // --- W2-19: IR-gesteuerte Kind-Konfiguration ---------------------------
 
     #[tokio::test]
-    async fn a_child_forbidden_to_pause_fails_closed_on_a_paused_turn() {
+    async fn a_child_forbidden_to_pause_fails_closed_on_a_paused_turn() -> TestResult {
         let (spawner, children) =
             runnable_children(Arc::new(ToolCallingChildRegistry), false, 1, || {
                 ExtensionRegistryBuilder::default()
                     .approval_handler(Arc::new(AskUserApproval))
                     .build()
-            });
+            })?;
         let child = children[0].clone();
         let store = InMemoryStateStore::new();
 
-        let error = spawner
+        let Err(error) = spawner
             .run_child(&child, &store, TurnInput::user("work"))
             .await
-            .expect_err("a pause-forbidden child must not report a waiting outcome");
+        else {
+            return Err(TestError::Unexpected(
+                "a pause-forbidden child must not report a waiting outcome".to_owned(),
+            ));
+        };
 
         assert_eq!(
             error.message,
@@ -5446,34 +6051,38 @@ specialization = "child-controller-test"
             child_is_manager_owned(&spawner, &child),
             "the rejected child session must still be restored regularly"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn a_child_allowed_to_pause_reports_the_waiting_outcome() {
+    async fn a_child_allowed_to_pause_reports_the_waiting_outcome() -> TestResult {
         let (spawner, children) =
             runnable_children(Arc::new(ToolCallingChildRegistry), true, 1, || {
                 ExtensionRegistryBuilder::default()
                     .approval_handler(Arc::new(AskUserApproval))
                     .build()
-            });
+            })?;
         let child = children[0].clone();
         let store = InMemoryStateStore::new();
 
         let result = spawner
             .run_child(&child, &store, TurnInput::user("work"))
             .await
-            .expect("a pause-permitted child may report a waiting outcome");
+            .map_err(ctx("a pause-permitted child may report a waiting outcome"))?;
 
         assert!(matches!(
             result.outcome,
             TurnOutcome::AwaitingApproval { .. }
         ));
+        Ok(())
     }
 
-    fn ir_spawner(ir: ExecutableAgentIr) -> (ManagedAgentSpawner, SessionId, SandboxSpec) {
+    fn ir_spawner(
+        ir: ExecutableAgentIr,
+    ) -> TestResult<(ManagedAgentSpawner, SessionId, SandboxSpec)> {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent = SessionId::new();
         let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative())
             .with_role(
@@ -5493,12 +6102,12 @@ specialization = "child-controller-test"
                 None,
                 SessionActivation::default(),
             )
-            .expect("trusted external root registers during construction");
-        (spawner, parent, sandbox)
+            .map_err(ctx("trusted external root registers during construction"))?;
+        Ok((spawner, parent, sandbox))
     }
 
     #[test]
-    fn admit_carries_the_agent_ir_budget_pause_lock_and_tool_surface() {
+    fn admit_carries_the_agent_ir_budget_pause_lock_and_tool_surface() -> TestResult {
         let (spawner, parent, sandbox) = ir_spawner(test_agent_ir(
             r#"
 [spawn.budget]
@@ -5513,13 +6122,15 @@ allow_pause = true
 [tools]
 admitted = ["fs.read"]
 "#,
-        ));
+        )?)?;
 
         let child = spawner
             .admit("worker", spawn_input(parent), sandbox, None)
-            .expect("the IR-governed child is admitted");
+            .map_err(ctx("the IR-governed child is admitted"))?;
 
-        let record = spawner.child_record(&child).expect("child is tracked");
+        let record = spawner
+            .child_record(&child)
+            .ok_or(TestError::Missing("child is tracked"))?;
         assert!(record.allow_pause);
         assert_eq!(
             spawner.child_budget(&child),
@@ -5531,8 +6142,11 @@ admitted = ["fs.read"]
             })
         );
 
-        let manager = spawner.manager.lock().expect("test session manager lock");
-        let session = manager.get(&child).expect("child is manager-owned");
+        let manager = spawner
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session = manager.get(&child).map_err(ctx("child is manager-owned"))?;
         assert!(
             session
                 .activation()
@@ -5544,13 +6158,14 @@ admitted = ["fs.read"]
                 .is_tool_enabled(&ToolName::new("fs.write"))
         );
         assert!(session.executable_snapshot_id().is_some());
+        Ok(())
     }
 
     #[test]
-    fn admit_defaults_to_a_pause_lock_without_an_agent_ir() {
+    fn admit_defaults_to_a_pause_lock_without_an_agent_ir() -> TestResult {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent = SessionId::new();
         let spawner = worker_spawner(manager)
             .with_external_root_parent(
@@ -5562,18 +6177,21 @@ admitted = ["fs.read"]
                 None,
                 SessionActivation::default(),
             )
-            .expect("trusted external root registers during construction");
+            .map_err(ctx("trusted external root registers during construction"))?;
 
         let child = spawner
             .admit("worker", spawn_input(parent), sandbox, None)
-            .expect("child admitted");
+            .map_err(ctx("child admitted"))?;
 
-        let record = spawner.child_record(&child).expect("child is tracked");
+        let record = spawner
+            .child_record(&child)
+            .ok_or(TestError::Missing("child is tracked"))?;
         assert!(
             !record.allow_pause,
             "without a lifecycle statement the controller stays fail-closed"
         );
         assert_eq!(spawner.child_budget(&child), Some(AgentBudget::default()));
+        Ok(())
     }
 
     /// Baut einen Spawner für die einzige zweistufige Kette, die die
@@ -5587,10 +6205,10 @@ admitted = ["fs.read"]
     /// `admit_propagates_the_root_trace_id_across_a_grandchild`).
     fn two_hop_spawner(
         manager_ir: ExecutableAgentIr,
-    ) -> (ManagedAgentSpawner, SessionId, SandboxSpec) {
+    ) -> TestResult<(ManagedAgentSpawner, SessionId, SandboxSpec)> {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events.clone())));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let root_session = AgentSession::new(
             AgentRole::Agent {
                 name: "root".to_owned(),
@@ -5604,15 +6222,17 @@ admitted = ["fs.read"]
                 sandbox.clone(),
                 harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
             );
-            context.allowed_child_orchestrators.push("manager".to_owned());
+            context
+                .allowed_child_orchestrators
+                .push("manager".to_owned());
             context
         });
         let root = root_session.id().clone();
         manager
             .lock()
-            .expect("test session manager lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .restore(root_session)
-            .expect("root session restores");
+            .map_err(ctx("root session restores"))?;
 
         let spawner = ManagedAgentSpawner::new(Arc::clone(&manager), ChildLimits::conservative())
             .with_role(
@@ -5631,19 +6251,21 @@ admitted = ["fs.read"]
                 harw_agent_dsl::roles::AgentRoleId::Worker,
                 Arc::new(EmptyChildRegistry),
             );
-        (spawner, root, sandbox)
+        Ok((spawner, root, sandbox))
     }
 
     #[test]
-    fn child_orchestrator_spawn_requires_an_exact_parent_grant() {
+    fn child_orchestrator_spawn_requires_an_exact_parent_grant() -> TestResult {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let root = SessionId::new();
         let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative())
             .with_role(
                 "specialist",
-                AgentRole::Agent { name: "specialist".to_owned() },
+                AgentRole::Agent {
+                    name: "specialist".to_owned(),
+                },
                 harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator,
                 Arc::new(EmptyChildRegistry),
             )
@@ -5656,16 +6278,22 @@ admitted = ["fs.read"]
                 None,
                 SessionActivation::default(),
             )
-            .expect("external root registers");
+            .map_err(ctx("external root registers"))?;
 
-        let error = spawner
-            .admit("specialist", spawn_input(root), sandbox, None)
-            .expect_err("a missing exact grant must deny child orchestration");
-        assert_eq!(error.message, "no delegation capability is available for this request");
+        let Err(error) = spawner.admit("specialist", spawn_input(root), sandbox, None) else {
+            return Err(TestError::Unexpected(
+                "a missing exact grant must deny child orchestration".to_owned(),
+            ));
+        };
+        assert_eq!(
+            error.message,
+            "no delegation capability is available for this request"
+        );
+        Ok(())
     }
 
     #[test]
-    fn a_role_that_forbids_grandchildren_is_still_admissible_as_a_child() {
+    fn a_role_that_forbids_grandchildren_is_still_admissible_as_a_child() -> TestResult {
         // `max_depth = 0` heißt „diese Rolle darf keine Kinder erzeugen" — es
         // heißt nicht, dass sie selbst nicht als Kind laufen darf. Genau daran
         // scheiterten die `security-*-triage`-Rollen.
@@ -5674,22 +6302,27 @@ admitted = ["fs.read"]
 [spawn]
 max_depth = 0
 "#,
-        ));
+        )?)?;
 
         let child = spawner
             .admit("worker", spawn_input(parent), sandbox, None)
-            .expect("a role that forbids its own children is still admissible as a child");
+            .map_err(ctx(
+                "a role that forbids its own children is still admissible as a child",
+            ))?;
 
-        let record = spawner.child_record(&child).expect("child is tracked");
+        let record = spawner
+            .child_record(&child)
+            .ok_or(TestError::Missing("child is tracked"))?;
         assert_eq!(record.depth, 1);
         assert_eq!(
             record.depth_ceiling, 1,
             "max_depth = 0 auf Tiefe 1 deckelt die Nachkommen auf Tiefe 1 — also keine"
         );
+        Ok(())
     }
 
     #[test]
-    fn the_agent_ir_can_only_tighten_the_depth_limit() {
+    fn the_agent_ir_can_only_tighten_the_depth_limit() -> TestResult {
         // Verschärfen: `max_depth = 0` am Elternteil verbietet den Enkel,
         // obwohl die Controller-Grenze (4) ihn zuließe.
         let (spawner, root, sandbox) = two_hop_spawner(test_agent_ir(
@@ -5697,13 +6330,15 @@ max_depth = 0
 [spawn]
 max_depth = 0
 "#,
-        ));
+        )?)?;
         let child = spawner
             .admit("manager", spawn_input(root), sandbox.clone(), None)
-            .expect("the depth-0 role is itself admissible");
-        let error = spawner
-            .admit("worker", spawn_input(child), sandbox, None)
-            .expect_err("a parent contract of max_depth = 0 forbids any grandchild");
+            .map_err(ctx("the depth-0 role is itself admissible"))?;
+        let Err(error) = spawner.admit("worker", spawn_input(child), sandbox, None) else {
+            return Err(TestError::Unexpected(
+                "a parent contract of max_depth = 0 forbids any grandchild".to_owned(),
+            ));
+        };
         assert_eq!(error.message, "child depth 2 exceeds maximum 1");
 
         // Erweitern: `max_depth = 99` hebt nichts an — die geerbte Decke bleibt
@@ -5713,32 +6348,33 @@ max_depth = 0
 [spawn]
 max_depth = 99
 "#,
-        ));
+        )?)?;
         let child = spawner
             .admit("manager", spawn_input(root), sandbox.clone(), None)
-            .expect("depth 1 is inside the conservative limit");
+            .map_err(ctx("depth 1 is inside the conservative limit"))?;
         assert_eq!(
             spawner
                 .child_record(&child)
-                .expect("child is tracked")
+                .ok_or(TestError::Missing("child is tracked"))?
                 .depth_ceiling,
             ChildLimits::conservative().max_depth,
             "an IR value above the controller limit must not raise the inherited ceiling"
         );
         let grandchild = spawner
             .admit("worker", spawn_input(child), sandbox, None)
-            .expect("depth 2 is inside the conservative limit");
+            .map_err(ctx("depth 2 is inside the conservative limit"))?;
         assert_eq!(
             spawner
                 .child_record(&grandchild)
-                .expect("grandchild is tracked")
+                .ok_or(TestError::Missing("grandchild is tracked"))?
                 .depth,
             2
         );
+        Ok(())
     }
 
     #[test]
-    fn the_agent_ir_cannot_raise_the_controller_depth_limit() {
+    fn the_agent_ir_cannot_raise_the_controller_depth_limit() -> TestResult {
         // `max_depth = 99` in der Definition darf die konservative Grenze
         // nicht anheben — die Admission auf Tiefe 1 gelingt trotzdem, weil
         // `min(4, 99) = 4`.
@@ -5747,33 +6383,36 @@ max_depth = 99
 [spawn]
 max_depth = 99
 "#,
-        ));
+        )?)?;
 
         let child = spawner
             .admit("worker", spawn_input(parent), sandbox, None)
-            .expect("depth 1 is inside the conservative limit");
+            .map_err(ctx("depth 1 is inside the conservative limit"))?;
 
         assert_eq!(
             spawner
                 .child_record(&child)
-                .expect("child is tracked")
+                .ok_or(TestError::Missing("child is tracked"))?
                 .depth,
             1
         );
+        Ok(())
     }
 
     #[test]
-    fn an_unknown_effort_cap_rejects_the_admission_fail_closed() {
+    fn an_unknown_effort_cap_rejects_the_admission_fail_closed() -> TestResult {
         let (spawner, parent, sandbox) = ir_spawner(test_agent_ir(
             r#"
 [spawn.budget]
 effort_cap = "ludicrous"
 "#,
-        ));
+        )?)?;
 
-        let error = spawner
-            .admit("worker", spawn_input(parent), sandbox, None)
-            .expect_err("an unknown effort label must not fall back to a default");
+        let Err(error) = spawner.admit("worker", spawn_input(parent), sandbox, None) else {
+            return Err(TestError::Unexpected(
+                "an unknown effort label must not fall back to a default".to_owned(),
+            ));
+        };
 
         assert!(
             error
@@ -5782,22 +6421,28 @@ effort_cap = "ludicrous"
             "unexpected message: {}",
             error.message
         );
+        Ok(())
     }
 
     // --- AW1-01b: Trace-Vererbung -------------------------------------------
 
-    fn test_trace(trace_id: &str, span_id: &str) -> TraceContext {
-        TraceContext::new(trace_id.to_owned(), span_id.to_owned()).expect("test trace is valid hex")
+    fn test_trace(trace_id: &str, span_id: &str) -> TestResult<TraceContext> {
+        TraceContext::new(trace_id.to_owned(), span_id.to_owned())
+            .map_err(ctx("test trace is valid hex"))
     }
 
     // --- AW2-02: Kontext-Decken-Vererbung ------------------------------------
 
-    fn test_ceiling(sections: &[&str], max_trust: TrustClass, budget_total: u32) -> ContextCeiling {
-        ContextCeiling {
+    fn test_ceiling(
+        sections: &[&str],
+        max_trust: TrustClass,
+        budget_total: u32,
+    ) -> TestResult<ContextCeiling> {
+        Ok(ContextCeiling {
             sections: sections
                 .iter()
-                .map(|name| SectionName::try_new(*name).expect("valid section name"))
-                .collect(),
+                .map(|name| SectionName::try_new(*name).map_err(ctx("valid section name")))
+                .collect::<TestResult<_>>()?,
             max_trust,
             budget: ContextBudgetSpec {
                 total: harw_lens_types::BudgetSpec {
@@ -5805,16 +6450,16 @@ effort_cap = "ludicrous"
                 },
                 per_section: BTreeMap::new(),
             },
-        }
+        })
     }
 
     #[test]
-    fn admit_inherits_the_parents_trace_id_but_assigns_a_fresh_span_id() {
+    fn admit_inherits_the_parents_trace_id_but_assigns_a_fresh_span_id() -> TestResult {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent = SessionId::new();
-        let parent_trace = test_trace(&"a".repeat(32), &"b".repeat(16));
+        let parent_trace = test_trace(&"a".repeat(32), &"b".repeat(16))?;
         let mut parent_context = external_root_context(
             sandbox.clone(),
             harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
@@ -5827,21 +6472,24 @@ effort_cap = "ludicrous"
                 None,
                 SessionActivation::default(),
             )
-            .expect("trusted external root registers during construction");
+            .map_err(ctx("trusted external root registers during construction"))?;
 
         let child = spawner
             .admit("worker", spawn_input(parent), sandbox, None)
-            .expect("child is admitted with an inherited trace");
+            .map_err(ctx("child is admitted with an inherited trace"))?;
 
-        let manager = spawner.manager.lock().expect("test session manager lock");
+        let manager = spawner
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let child_trace = manager
             .get(&child)
-            .expect("child is manager-owned")
+            .map_err(ctx("child is manager-owned"))?
             .spawn_context()
-            .expect("child has a trusted spawn context")
+            .ok_or(TestError::Missing("child has a trusted spawn context"))?
             .trace
             .clone()
-            .expect("child inherits a trace from its parent");
+            .ok_or(TestError::Missing("child inherits a trace from its parent"))?;
 
         assert_eq!(
             child_trace.trace_id, parent_trace.trace_id,
@@ -5856,13 +6504,14 @@ effort_cap = "ludicrous"
             Some(parent_trace.span_id.as_str()),
             "the child's parent_span_id must point at the parent's own span_id"
         );
+        Ok(())
     }
 
     #[test]
-    fn admit_gives_a_traceless_parent_a_traceless_child() {
+    fn admit_gives_a_traceless_parent_a_traceless_child() -> TestResult {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent = SessionId::new();
         let spawner = worker_spawner(manager)
             .with_external_root_parent(
@@ -5874,27 +6523,31 @@ effort_cap = "ludicrous"
                 None,
                 SessionActivation::default(),
             )
-            .expect("trusted external root registers during construction");
+            .map_err(ctx("trusted external root registers during construction"))?;
 
         let child = spawner
             .admit("worker", spawn_input(parent), sandbox, None)
-            .expect("child is admitted");
+            .map_err(ctx("child is admitted"))?;
 
-        let manager = spawner.manager.lock().expect("test session manager lock");
+        let manager = spawner
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let child_context = manager
             .get(&child)
-            .expect("child is manager-owned")
+            .map_err(ctx("child is manager-owned"))?
             .spawn_context()
-            .expect("child has a trusted spawn context");
+            .ok_or(TestError::Missing("child has a trusted spawn context"))?;
 
         assert!(
             child_context.trace.is_none(),
             "a parent without a trace must not hand its child a fabricated root trace"
         );
+        Ok(())
     }
 
     #[test]
-    fn admit_propagates_the_root_trace_id_across_a_grandchild() {
+    fn admit_propagates_the_root_trace_id_across_a_grandchild() -> TestResult {
         // A manager-owned root (RootOrchestrator) admits a "manager" child
         // (ChildOrchestrator), which in turn admits a "worker" grandchild
         // (Worker) — the only two-hop path the §3 spawn matrix allows. The
@@ -5905,8 +6558,8 @@ effort_cap = "ludicrous"
         // admission hop is involved.
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events.clone())));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
-        let root_trace = test_trace(&"c".repeat(32), &"d".repeat(16));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
+        let root_trace = test_trace(&"c".repeat(32), &"d".repeat(16))?;
         let root_context = SpawnContext {
             sandbox: sandbox.clone(),
             suggestions: None,
@@ -5929,9 +6582,9 @@ effort_cap = "ludicrous"
         let root = root_session.id().clone();
         manager
             .lock()
-            .expect("test session manager lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .restore(root_session)
-            .expect("root session restores");
+            .map_err(ctx("root session restores"))?;
 
         let spawner = ManagedAgentSpawner::new(Arc::clone(&manager), ChildLimits::conservative())
             .with_role(
@@ -5953,35 +6606,40 @@ effort_cap = "ludicrous"
 
         let child = spawner
             .admit("manager", spawn_input(root), sandbox.clone(), None)
-            .expect("child is admitted with an inherited trace");
+            .map_err(ctx("child is admitted with an inherited trace"))?;
         let grandchild = spawner
             .admit("worker", spawn_input(child), sandbox, None)
-            .expect("grandchild is admitted with an inherited trace");
+            .map_err(ctx("grandchild is admitted with an inherited trace"))?;
 
-        let manager = manager.lock().expect("test session manager lock");
+        let manager = manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let grandchild_trace = manager
             .get(&grandchild)
-            .expect("grandchild is manager-owned")
+            .map_err(ctx("grandchild is manager-owned"))?
             .spawn_context()
-            .expect("grandchild has a trusted spawn context")
+            .ok_or(TestError::Missing("grandchild has a trusted spawn context"))?
             .trace
             .clone()
-            .expect("grandchild inherits a trace across two admission hops");
+            .ok_or(TestError::Missing(
+                "grandchild inherits a trace across two admission hops",
+            ))?;
 
         assert_eq!(
             grandchild_trace.trace_id, root_trace.trace_id,
             "the grandchild must still carry the root's trace_id two hops down"
         );
+        Ok(())
     }
 
     #[test]
-    fn admit_inherits_the_parents_cut_context_ceiling_when_the_child_requests_none() {
+    fn admit_inherits_the_parents_cut_context_ceiling_when_the_child_requests_none() -> TestResult {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent = SessionId::new();
         let parent_ceiling =
-            test_ceiling(&["history.tail", "plan.current"], TrustClass::Evidence, 750);
+            test_ceiling(&["history.tail", "plan.current"], TrustClass::Evidence, 750)?;
         let mut parent_context = external_root_context(
             sandbox.clone(),
             harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
@@ -5994,41 +6652,49 @@ effort_cap = "ludicrous"
                 None,
                 SessionActivation::default(),
             )
-            .expect("trusted external root registers during construction");
+            .map_err(ctx("trusted external root registers during construction"))?;
 
         let child = spawner
             .admit("worker", spawn_input(parent), sandbox, None)
-            .expect("a child requesting no ceiling of its own is always admissible");
+            .map_err(ctx(
+                "a child requesting no ceiling of its own is always admissible",
+            ))?;
 
-        let manager = spawner.manager.lock().expect("test session manager lock");
+        let manager = spawner
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let child_ceiling = manager
             .get(&child)
-            .expect("child is manager-owned")
+            .map_err(ctx("child is manager-owned"))?
             .spawn_context()
-            .expect("child has a trusted spawn context")
+            .ok_or(TestError::Missing("child has a trusted spawn context"))?
             .ceiling
             .clone()
-            .expect("child inherits a ceiling from its parent");
+            .ok_or(TestError::Missing(
+                "child inherits a ceiling from its parent",
+            ))?;
 
         assert_eq!(
             child_ceiling, parent_ceiling,
             "a child that requests no ceiling of its own must inherit its parent's, unchanged"
         );
+        Ok(())
     }
 
     #[test]
-    fn admit_rejects_a_child_that_requests_a_section_outside_the_parents_ceiling() {
+    fn admit_rejects_a_child_that_requests_a_section_outside_the_parents_ceiling() -> TestResult {
         // The most important AW2-02 test: an over-reaching request must be
         // refused outright, not silently narrowed to fit.
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent = SessionId::new();
         let mut parent_context = external_root_context(
             sandbox.clone(),
             harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
         );
-        parent_context.ceiling = Some(test_ceiling(&["history.tail"], TrustClass::Evidence, 500));
+        parent_context.ceiling = Some(test_ceiling(&["history.tail"], TrustClass::Evidence, 500)?);
         let spawner = worker_spawner(manager)
             .with_external_root_parent(
                 parent.clone(),
@@ -6036,42 +6702,44 @@ effort_cap = "ludicrous"
                 None,
                 SessionActivation::default(),
             )
-            .expect("trusted external root registers during construction");
+            .map_err(ctx("trusted external root registers during construction"))?;
 
         let requested = test_ceiling(
             &["history.tail", "secrets.vault"],
             TrustClass::Evidence,
             500,
-        );
-        let error = spawner
-            .admit(
-                "worker",
-                spawn_input_requesting(parent, requested),
-                sandbox,
-                None,
-            )
-            .expect_err(
-                "a child must never be granted a section its parent's ceiling does not carry",
-            );
+        )?;
+        let Err(error) = spawner.admit(
+            "worker",
+            spawn_input_requesting(parent, requested),
+            sandbox,
+            None,
+        ) else {
+            return Err(TestError::Unexpected(
+                "a child must never be granted a section its parent's ceiling does not carry"
+                    .to_owned(),
+            ));
+        };
 
         assert!(
             error.message.contains("secrets.vault"),
             "the rejection must name the exact offending section, got: {}",
             error.message
         );
+        Ok(())
     }
 
     // --- Folgeknoten zu AW2-01/AW2-02: `ContextProgram` je Sitzung ----------
 
     #[test]
-    fn admit_binds_the_roles_declared_context_program_to_the_child_session() {
+    fn admit_binds_the_roles_declared_context_program_to_the_child_session() -> TestResult {
         // Der wichtigste Test dieses Knotens: eine Rolle, deren Agent-IR ein
         // `[context]`-Programm deklariert, muss dieses Programm tatsächlich
         // auf ihrer Sitzung tragen — nicht bloß eine IR mit einem gefüllten
         // Feld haben, das nirgends ankommt.
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent = SessionId::new();
         let mut parent_context = external_root_context(
             sandbox.clone(),
@@ -6081,13 +6749,13 @@ effort_cap = "ludicrous"
             &["history.tail", "plan.current"],
             TrustClass::Evidence,
             750,
-        ));
+        )?);
         let ir = test_agent_ir(
             r#"
 [context]
 must_include = ["history.tail"]
 "#,
-        );
+        )?;
         let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative())
             .with_role(
                 "worker",
@@ -6103,23 +6771,29 @@ must_include = ["history.tail"]
                 None,
                 SessionActivation::default(),
             )
-            .expect("trusted external root registers during construction");
+            .map_err(ctx("trusted external root registers during construction"))?;
 
         let child = spawner
             .admit("worker", spawn_input(parent), sandbox, None)
-            .expect("a program that fits within the cut ceiling is admissible");
+            .map_err(ctx(
+                "a program that fits within the cut ceiling is admissible",
+            ))?;
 
-        let manager = spawner.manager.lock().expect("test session manager lock");
-        let session = manager.get(&child).expect("child is manager-owned");
+        let manager = spawner
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session = manager.get(&child).map_err(ctx("child is manager-owned"))?;
         assert_eq!(
             session.context_program(),
             Some(ir.context_program()),
             "the child session must carry exactly the program its role declared"
         );
+        Ok(())
     }
 
     #[test]
-    fn admit_leaves_context_program_none_for_a_role_without_one() {
+    fn admit_leaves_context_program_none_for_a_role_without_one() -> TestResult {
         // Eine Rolle ohne `[context]`-Tabelle verhält sich exakt unverändert:
         // `context_program()` bleibt `None`, egal ob die IR sonst Politik
         // trägt (hier: Tool-Surface).
@@ -6128,40 +6802,46 @@ must_include = ["history.tail"]
 [tools]
 admitted = ["fs.read"]
 "#,
-        ));
+        )?)?;
 
         let child = spawner
             .admit("worker", spawn_input(parent), sandbox, None)
-            .expect("child without a declared context program is still admitted");
+            .map_err(ctx(
+                "child without a declared context program is still admitted",
+            ))?;
 
-        let manager = spawner.manager.lock().expect("test session manager lock");
-        let session = manager.get(&child).expect("child is manager-owned");
+        let manager = spawner
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session = manager.get(&child).map_err(ctx("child is manager-owned"))?;
         assert!(
             session.context_program().is_none(),
             "a role without a declared [context] table must not gain one along the way"
         );
+        Ok(())
     }
 
     #[test]
-    fn admit_rejects_a_declared_context_program_that_widens_the_cut_ceiling() {
+    fn admit_rejects_a_declared_context_program_that_widens_the_cut_ceiling() -> TestResult {
         // Ein Programm darf die Decke nie erweitern: hier verlangt es
         // `secrets.vault`, das die (bereits geschnittene) Kind-Decke nicht
         // enthält.
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent = SessionId::new();
         let mut parent_context = external_root_context(
             sandbox.clone(),
             harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
         );
-        parent_context.ceiling = Some(test_ceiling(&["history.tail"], TrustClass::Evidence, 500));
+        parent_context.ceiling = Some(test_ceiling(&["history.tail"], TrustClass::Evidence, 500)?);
         let ir = test_agent_ir(
             r#"
 [context]
 must_include = ["secrets.vault"]
 "#,
-        );
+        )?;
         let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative())
             .with_role(
                 "worker",
@@ -6177,13 +6857,19 @@ must_include = ["secrets.vault"]
                 None,
                 SessionActivation::default(),
             )
-            .expect("trusted external root registers during construction");
+            .map_err(ctx("trusted external root registers during construction"))?;
 
-        let active_before = spawner.active.lock().expect("active lock").len();
+        let active_before = spawner
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
 
-        let error = spawner
-            .admit("worker", spawn_input(parent), sandbox, None)
-            .expect_err("a declared program must never widen the child's cut context ceiling");
+        let Err(error) = spawner.admit("worker", spawn_input(parent), sandbox, None) else {
+            return Err(TestError::Unexpected(
+                "a declared program must never widen the child's cut context ceiling".to_owned(),
+            ));
+        };
 
         assert!(
             error.message.contains("secrets.vault"),
@@ -6193,46 +6879,52 @@ must_include = ["secrets.vault"]
 
         // Belegt, dass kein Kind mit dem überzogenen Programm entstanden ist —
         // die Ablehnung darf keine halbfertige Sitzung hinterlassen.
-        let active_after = spawner.active.lock().expect("active lock").len();
+        let active_after = spawner
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
         assert_eq!(
             active_before, active_after,
             "a rejected context-program escalation must not leave a partially admitted child behind"
         );
+        Ok(())
     }
 
     #[test]
-    fn cut_ceiling_is_idempotent() {
+    fn cut_ceiling_is_idempotent() -> TestResult {
         let parent = test_ceiling(
             &["history.tail", "plan.current"],
             TrustClass::Instruction,
             1_000,
-        );
-        let requested = test_ceiling(&["history.tail"], TrustClass::Evidence, 400);
+        )?;
+        let requested = test_ceiling(&["history.tail"], TrustClass::Evidence, 400)?;
 
         let once = ManagedAgentSpawner::cut_ceiling(Some(&parent), Some(&requested))
-            .expect("the requested ceiling fits within the parent's");
+            .map_err(ctx("the requested ceiling fits within the parent's"))?;
         let twice = ManagedAgentSpawner::cut_ceiling(Some(&once), Some(&once))
-            .expect("a ceiling already cut against itself must still fit");
+            .map_err(ctx("a ceiling already cut against itself must still fit"))?;
 
         assert_eq!(
             once, twice,
             "cutting an already-cut ceiling again must be a no-op"
         );
+        Ok(())
     }
 
     #[test]
-    fn admit_grandchild_ceiling_never_exceeds_the_roots_ceiling() {
+    fn admit_grandchild_ceiling_never_exceeds_the_roots_ceiling() -> TestResult {
         // Same manager-owned root/manager-child/worker-grandchild shape as
         // `admit_propagates_the_root_trace_id_across_a_grandchild` above —
         // the only two-hop path the §3 spawn matrix allows.
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events.clone())));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let root_ceiling = test_ceiling(
             &["history.tail", "plan.current"],
             TrustClass::Instruction,
             1_000,
-        );
+        )?;
         let root_context = SpawnContext {
             sandbox: sandbox.clone(),
             suggestions: None,
@@ -6255,9 +6947,9 @@ must_include = ["secrets.vault"]
         let root = root_session.id().clone();
         manager
             .lock()
-            .expect("test session manager lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .restore(root_session)
-            .expect("root session restores");
+            .map_err(ctx("root session restores"))?;
 
         let spawner = ManagedAgentSpawner::new(Arc::clone(&manager), ChildLimits::conservative())
             .with_role(
@@ -6277,7 +6969,7 @@ must_include = ["secrets.vault"]
                 Arc::new(EmptyChildRegistry),
             );
 
-        let child_request = test_ceiling(&["history.tail"], TrustClass::Evidence, 400);
+        let child_request = test_ceiling(&["history.tail"], TrustClass::Evidence, 400)?;
         let child = spawner
             .admit(
                 "manager",
@@ -6285,9 +6977,9 @@ must_include = ["secrets.vault"]
                 sandbox.clone(),
                 None,
             )
-            .expect("child is admitted with a narrower ceiling");
+            .map_err(ctx("child is admitted with a narrower ceiling"))?;
 
-        let grandchild_request = test_ceiling(&["history.tail"], TrustClass::Data, 100);
+        let grandchild_request = test_ceiling(&["history.tail"], TrustClass::Data, 100)?;
         let grandchild = spawner
             .admit(
                 "worker",
@@ -6295,24 +6987,30 @@ must_include = ["secrets.vault"]
                 sandbox,
                 None,
             )
-            .expect("grandchild is admitted with a narrower ceiling still");
+            .map_err(ctx("grandchild is admitted with a narrower ceiling still"))?;
 
-        let manager = manager.lock().expect("test session manager lock");
+        let manager = manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let grandchild_ceiling = manager
             .get(&grandchild)
-            .expect("grandchild is manager-owned")
+            .map_err(ctx("grandchild is manager-owned"))?
             .spawn_context()
-            .expect("grandchild has a trusted spawn context")
+            .ok_or(TestError::Missing("grandchild has a trusted spawn context"))?
             .ceiling
             .clone()
-            .expect("grandchild inherits a ceiling across two admission hops");
+            .ok_or(TestError::Missing(
+                "grandchild inherits a ceiling across two admission hops",
+            ))?;
 
         assert_eq!(
             grandchild_ceiling, grandchild_request,
             "the grandchild's own narrower request must be exactly what it ends up with"
         );
         assert!(
-            grandchild_ceiling.sections.is_subset(&root_ceiling.sections),
+            grandchild_ceiling
+                .sections
+                .is_subset(&root_ceiling.sections),
             "the grandchild must never see a section the root ceiling didn't already carry"
         );
         assert!(
@@ -6327,10 +7025,11 @@ must_include = ["secrets.vault"]
             grandchild_ceiling, root_ceiling,
             "this test is only meaningful if real narrowing happened along the way"
         );
+        Ok(())
     }
 
     #[test]
-    fn admit_cuts_the_ceiling_alongside_the_sandbox_in_one_admission() {
+    fn admit_cuts_the_ceiling_alongside_the_sandbox_in_one_admission() -> TestResult {
         // Proves the "same step" promise directly: one successful admission,
         // both the sandbox and the ceiling checked from its one result.
         let (events, _receiver) = mpsc::unbounded_channel();
@@ -6338,8 +7037,8 @@ must_include = ["secrets.vault"]
         let parent_sandbox = test_sandbox(PermissionSet::from_policy([
             Permission::ReadWorkspace,
             Permission::WriteWorkspace,
-        ]));
-        let child_sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        ]))?;
+        let child_sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent = SessionId::new();
         let mut parent_context = external_root_context(
             parent_sandbox.clone(),
@@ -6349,8 +7048,8 @@ must_include = ["secrets.vault"]
             &["history.tail", "plan.current"],
             TrustClass::Instruction,
             1_000,
-        ));
-        let requested_ceiling = test_ceiling(&["history.tail"], TrustClass::Evidence, 200);
+        )?);
+        let requested_ceiling = test_ceiling(&["history.tail"], TrustClass::Evidence, 200)?;
         let spawner = worker_spawner(manager)
             .with_external_root_parent(
                 parent.clone(),
@@ -6358,7 +7057,7 @@ must_include = ["secrets.vault"]
                 None,
                 SessionActivation::default(),
             )
-            .expect("trusted external root registers during construction");
+            .map_err(ctx("trusted external root registers during construction"))?;
 
         let child = spawner
             .admit(
@@ -6367,17 +7066,25 @@ must_include = ["secrets.vault"]
                 child_sandbox,
                 None,
             )
-            .expect("a narrower sandbox and a narrower ceiling are both admissible together");
+            .map_err(ctx(
+                "a narrower sandbox and a narrower ceiling are both admissible together",
+            ))?;
 
-        let manager = spawner.manager.lock().expect("test session manager lock");
+        let manager = spawner
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let child_context = manager
             .get(&child)
-            .expect("child is manager-owned")
+            .map_err(ctx("child is manager-owned"))?
             .spawn_context()
-            .expect("child has a trusted spawn context");
+            .ok_or(TestError::Missing("child has a trusted spawn context"))?;
 
         assert!(
-            child_context.sandbox.ensure_child_of(&parent_sandbox).is_ok(),
+            child_context
+                .sandbox
+                .ensure_child_of(&parent_sandbox)
+                .is_ok(),
             "the child's sandbox must be a valid narrowing of the parent's"
         );
         assert_eq!(
@@ -6385,22 +7092,23 @@ must_include = ["secrets.vault"]
             Some(requested_ceiling),
             "the child's ceiling must be cut in the very same admission that narrows the sandbox"
         );
+        Ok(())
     }
 
     #[test]
-    fn admit_rejecting_a_ceiling_escalation_leaves_no_partial_child_behind() {
+    fn admit_rejecting_a_ceiling_escalation_leaves_no_partial_child_behind() -> TestResult {
         // The sandbox check above the ceiling cut already passed by the time
         // the ceiling is checked; this proves that a ceiling rejection still
         // aborts the whole admission — no observable intermediate state.
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent = SessionId::new();
         let mut parent_context = external_root_context(
             sandbox.clone(),
             harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
         );
-        parent_context.ceiling = Some(test_ceiling(&["history.tail"], TrustClass::Data, 100));
+        parent_context.ceiling = Some(test_ceiling(&["history.tail"], TrustClass::Data, 100)?);
         let spawner = worker_spawner(manager)
             .with_external_root_parent(
                 parent.clone(),
@@ -6408,11 +7116,15 @@ must_include = ["secrets.vault"]
                 None,
                 SessionActivation::default(),
             )
-            .expect("trusted external root registers during construction");
+            .map_err(ctx("trusted external root registers during construction"))?;
 
-        let active_before = spawner.active.lock().expect("active lock").len();
+        let active_before = spawner
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
 
-        let escalating_request = test_ceiling(&["history.tail"], TrustClass::Instruction, 100);
+        let escalating_request = test_ceiling(&["history.tail"], TrustClass::Instruction, 100)?;
         let result = spawner.admit(
             "worker",
             spawn_input_requesting(parent, escalating_request),
@@ -6424,11 +7136,16 @@ must_include = ["secrets.vault"]
             result.is_err(),
             "a wider requested ceiling must be rejected outright"
         );
-        let active_after = spawner.active.lock().expect("active lock").len();
+        let active_after = spawner
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
         assert_eq!(
             active_before, active_after,
             "a rejected ceiling escalation must not leave a partially admitted child behind"
         );
+        Ok(())
     }
 
     /// AW2-02 Attacker-Fixture: eine Kinddefinition, die eine höhere
@@ -6461,7 +7178,7 @@ max_trust = "instruction"
 "#;
 
     #[test]
-    fn context_escalation_attacker_fixture_is_rejected() {
+    fn context_escalation_attacker_fixture_is_rejected() -> TestResult {
         assert!(
             CONTEXT_ESCALATION_ATTACKER_TOML.contains("max_trust = \"instruction\""),
             "fixture drifted from what this test actually exercises"
@@ -6469,13 +7186,13 @@ max_trust = "instruction"
 
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent = SessionId::new();
         let mut parent_context = external_root_context(
             sandbox.clone(),
             harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
         );
-        parent_context.ceiling = Some(test_ceiling(&["history.tail"], TrustClass::Evidence, 500));
+        parent_context.ceiling = Some(test_ceiling(&["history.tail"], TrustClass::Evidence, 500)?);
         let spawner = worker_spawner(manager)
             .with_external_root_parent(
                 parent.clone(),
@@ -6483,35 +7200,37 @@ max_trust = "instruction"
                 None,
                 SessionActivation::default(),
             )
-            .expect("trusted external root registers during construction");
+            .map_err(ctx("trusted external root registers during construction"))?;
 
         // Die von der Fixture beschriebene Forderung, in Rust nachgebaut
         // (siehe Doc-Kommentar oben): dieselben Sektionen, aber
         // `max_trust = "instruction"` statt der vom Elternteil erlaubten
         // `Evidence`-Obergrenze.
-        let attacker_ceiling = test_ceiling(&["history.tail"], TrustClass::Instruction, 500);
+        let attacker_ceiling = test_ceiling(&["history.tail"], TrustClass::Instruction, 500)?;
 
-        let error = spawner
-            .admit(
-                "worker",
-                spawn_input_requesting(parent, attacker_ceiling),
-                sandbox,
-                None,
-            )
-            .expect_err(
-                "a child must never be admitted with a higher max_trust than its parent's ceiling",
-            );
+        let Err(error) = spawner.admit(
+            "worker",
+            spawn_input_requesting(parent, attacker_ceiling),
+            sandbox,
+            None,
+        ) else {
+            return Err(TestError::Unexpected(
+                "a child must never be admitted with a higher max_trust than its parent's ceiling"
+                    .to_owned(),
+            ));
+        };
 
         assert!(
             error.message.contains("max_trust"),
             "the rejection must name the violated aspect (max_trust), got: {}",
             error.message
         );
+        Ok(())
     }
 
     #[test]
-    fn durable_lease_carries_the_inherited_trace_into_the_child_lease_record() {
-        let trace = test_trace(&"e".repeat(32), &"f".repeat(16));
+    fn durable_lease_carries_the_inherited_trace_into_the_child_lease_record() -> TestResult {
+        let trace = test_trace(&"e".repeat(32), &"f".repeat(16))?;
         let now = Timestamp::now();
         let record = ChildRecord {
             child: SessionId::new(),
@@ -6536,17 +7255,18 @@ max_trust = "instruction"
             Some(trace),
             "durable_lease must carry the record's inherited trace, not drop it"
         );
+        Ok(())
     }
 
     #[test]
-    fn admit_with_a_lease_store_persists_the_inherited_trace_to_disk() {
-        let temporary_directory = tempfile::tempdir().expect("temporary lease directory");
+    fn admit_with_a_lease_store_persists_the_inherited_trace_to_disk() -> TestResult {
+        let temporary_directory = tempfile::tempdir().map_err(ctx("temporary lease directory"))?;
         let lease_store = Arc::new(ChildLeaseStore::new(temporary_directory.path()));
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent = SessionId::new();
-        let parent_trace = test_trace(&"1".repeat(32), &"2".repeat(16));
+        let parent_trace = test_trace(&"1".repeat(32), &"2".repeat(16))?;
         let mut parent_context = external_root_context(
             sandbox.clone(),
             harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
@@ -6560,23 +7280,25 @@ max_trust = "instruction"
                 None,
                 SessionActivation::default(),
             )
-            .expect("trusted external root registers during construction");
+            .map_err(ctx("trusted external root registers during construction"))?;
 
         spawner
             .admit("worker", spawn_input(parent), sandbox, None)
-            .expect("child is admitted and its lease is durably recorded");
+            .map_err(ctx("child is admitted and its lease is durably recorded"))?;
 
-        let active_leases = lease_store.active().expect("active leases are readable");
+        let active_leases = lease_store
+            .active()
+            .map_err(ctx("active leases are readable"))?;
         assert_eq!(active_leases.len(), 1);
-        let persisted_trace = active_leases[0]
-            .trace
-            .clone()
-            .expect("the durable lease on disk carries the inherited trace");
+        let persisted_trace = active_leases[0].trace.clone().ok_or(TestError::Missing(
+            "the durable lease on disk carries the inherited trace",
+        ))?;
         assert_eq!(persisted_trace.trace_id, parent_trace.trace_id);
         assert_eq!(
             persisted_trace.parent_span_id.as_deref(),
             Some(parent_trace.span_id.as_str())
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -6589,10 +7311,10 @@ max_trust = "instruction"
     fn ir_spawner_with_parent_activation(
         ir: ExecutableAgentIr,
         parent_activation: SessionActivation,
-    ) -> (ManagedAgentSpawner, SessionId, SandboxSpec) {
+    ) -> TestResult<(ManagedAgentSpawner, SessionId, SandboxSpec)> {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent = SessionId::new();
         let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative())
             .with_role(
@@ -6612,13 +7334,13 @@ max_trust = "instruction"
                 None,
                 parent_activation,
             )
-            .expect("trusted external root registers during construction");
-        (spawner, parent, sandbox)
+            .map_err(ctx("trusted external root registers during construction"))?;
+        Ok((spawner, parent, sandbox))
     }
 
     /// Die Tool-Oberfläche einer Rolle, die `fs.read` **und** `shell.exec`
     /// zulässt — genug, um einen fehlenden Schnitt sichtbar zu machen.
-    fn read_and_exec_ir() -> ExecutableAgentIr {
+    fn read_and_exec_ir() -> TestResult<ExecutableAgentIr> {
         test_agent_ir(
             r#"
 [tools]
@@ -6628,20 +7350,23 @@ admitted = ["fs.read", "shell.exec"]
     }
 
     #[test]
-    fn child_activation_is_cut_with_the_parent_activation() {
+    fn child_activation_is_cut_with_the_parent_activation() -> TestResult {
         let mut parent_activation = SessionActivation::new(ToolProfile::Full);
         parent_activation.disable_tool(ToolName::new("shell.exec"));
         let (spawner, parent, sandbox) =
-            ir_spawner_with_parent_activation(read_and_exec_ir(), parent_activation);
+            ir_spawner_with_parent_activation(read_and_exec_ir()?, parent_activation)?;
 
         let child = spawner
             .admit("worker", spawn_input(parent), sandbox, None)
-            .expect("the child is admitted");
+            .map_err(ctx("the child is admitted"))?;
 
-        let manager = spawner.manager.lock().expect("test session manager lock");
+        let manager = spawner
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let activation = manager
             .get(&child)
-            .expect("child is manager-owned")
+            .map_err(ctx("child is manager-owned"))?
             .activation();
         assert!(
             activation.is_tool_enabled(&ToolName::new("fs.read")),
@@ -6651,10 +7376,11 @@ admitted = ["fs.read", "shell.exec"]
             !activation.is_tool_enabled(&ToolName::new("shell.exec")),
             "die Rolle lässt shell.exec zu, der Elternteil nicht — der Schnitt entscheidet"
         );
+        Ok(())
     }
 
     #[test]
-    fn parent_activation_cut_survives_a_later_mode_switch() {
+    fn parent_activation_cut_survives_a_later_mode_switch() -> TestResult {
         // Der Schnitt ist eine Autoritätsgrenze, kein Laufzeit-Override: er
         // liegt in der Basis und muss deshalb jeden `set_mode` überleben.
         // `Work` ist der schärfste Fall — `ToolProfile::Full` ohne
@@ -6662,14 +7388,19 @@ admitted = ["fs.read", "shell.exec"]
         let mut parent_activation = SessionActivation::new(ToolProfile::Full);
         parent_activation.disable_tool(ToolName::new("shell.exec"));
         let (spawner, parent, sandbox) =
-            ir_spawner_with_parent_activation(read_and_exec_ir(), parent_activation);
+            ir_spawner_with_parent_activation(read_and_exec_ir()?, parent_activation)?;
 
         let child = spawner
             .admit("worker", spawn_input(parent), sandbox, None)
-            .expect("the child is admitted");
+            .map_err(ctx("the child is admitted"))?;
 
-        let mut manager = spawner.manager.lock().expect("test session manager lock");
-        let child_session = manager.get_mut(&child).expect("child is manager-owned");
+        let mut manager = spawner
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let child_session = manager
+            .get_mut(&child)
+            .map_err(ctx("child is manager-owned"))?;
         child_session.set_mode(crate::mode::InteractionMode::Work);
         assert!(
             !child_session
@@ -6689,10 +7420,11 @@ admitted = ["fs.read", "shell.exec"]
                 .is_tool_enabled(&ToolName::new("fs.read")),
             "was Elternteil und Rolle erlauben, bleibt auch in Work offen"
         );
+        Ok(())
     }
 
     #[test]
-    fn grandchild_activation_inherits_the_whole_intersection_chain() {
+    fn grandchild_activation_inherits_the_whole_intersection_chain() -> TestResult {
         // Die Wurzel ist hier bewusst **manager-eigen**: nur so ist sie für
         // `parent_depth` auflösbar, und nur so belegt der Test die zweite
         // Bezugsquelle des Schnitts — bei einem Kind eines Kindes ist der
@@ -6700,7 +7432,7 @@ admitted = ["fs.read", "shell.exec"]
         // `AgentSession::activation()` liest.
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events.clone())));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
 
         let mut root_activation = SessionActivation::new(ToolProfile::Full);
         root_activation.disable_tool(ToolName::new("shell.exec"));
@@ -6717,16 +7449,18 @@ admitted = ["fs.read", "shell.exec"]
                 sandbox.clone(),
                 harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
             );
-            context.allowed_child_orchestrators.push("middle".to_owned());
+            context
+                .allowed_child_orchestrators
+                .push("middle".to_owned());
             context
         })
         .with_activation(root_activation);
         let root = root_session.id().clone();
         manager
             .lock()
-            .expect("test session manager lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .restore(root_session)
-            .expect("test root session restores");
+            .map_err(ctx("test root session restores"))?;
 
         let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative())
             .with_role(
@@ -6736,7 +7470,7 @@ admitted = ["fs.read", "shell.exec"]
                 },
                 harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator,
                 Arc::new(IrChildRegistry {
-                    ir: read_and_exec_ir(),
+                    ir: read_and_exec_ir()?,
                 }),
             )
             .with_role(
@@ -6746,22 +7480,27 @@ admitted = ["fs.read", "shell.exec"]
                 },
                 harw_agent_dsl::roles::AgentRoleId::Worker,
                 Arc::new(IrChildRegistry {
-                    ir: read_and_exec_ir(),
+                    ir: read_and_exec_ir()?,
                 }),
             );
 
         let middle = spawner
             .admit("middle", spawn_input(root), sandbox.clone(), None)
-            .expect("the child orchestrator is admitted");
+            .map_err(ctx("the child orchestrator is admitted"))?;
         let grandchild = spawner
             .admit("worker", spawn_input(middle.clone()), sandbox, None)
-            .expect("the grandchild is admitted below the child orchestrator");
+            .map_err(ctx(
+                "the grandchild is admitted below the child orchestrator",
+            ))?;
 
-        let manager = spawner.manager.lock().expect("test session manager lock");
+        let manager = spawner
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for (label, session_id) in [("Kind", &middle), ("Enkel", &grandchild)] {
             let activation = manager
                 .get(session_id)
-                .expect("session is manager-owned")
+                .map_err(ctx("session is manager-owned"))?
                 .activation();
             assert!(
                 activation.is_tool_enabled(&ToolName::new("fs.read")),
@@ -6772,13 +7511,14 @@ admitted = ["fs.read", "shell.exec"]
                 "{label}: das Verbot der Wurzel wirkt transitiv nach unten"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn parent_activation_cut_also_applies_without_an_agent_ir() {
+    fn parent_activation_cut_also_applies_without_an_agent_ir() -> TestResult {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent = SessionId::new();
         // Ohne IR bleibt die Kind-Aktivierung sonst auf `ToolProfile::Full`
         // stehen (Befund E1) — auch dieser Pfad muss geschnitten werden.
@@ -6795,27 +7535,31 @@ admitted = ["fs.read", "shell.exec"]
                 None,
                 parent_activation,
             )
-            .expect("trusted external root registers during construction");
+            .map_err(ctx("trusted external root registers during construction"))?;
 
         let child = spawner
             .admit("worker", spawn_input(parent), sandbox, None)
-            .expect("the child is admitted");
+            .map_err(ctx("the child is admitted"))?;
 
-        let manager = spawner.manager.lock().expect("test session manager lock");
+        let manager = spawner
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let activation = manager
             .get(&child)
-            .expect("child is manager-owned")
+            .map_err(ctx("child is manager-owned"))?
             .activation();
         assert!(!activation.is_tool_enabled(&ToolName::new("shell.exec")));
         assert!(!activation.is_context_enabled("workspace_files"));
         assert!(activation.is_tool_enabled(&ToolName::new("fs.read")));
+        Ok(())
     }
 
     #[test]
-    fn effort_clamp_without_an_inherited_base_falls_back_to_the_default() {
+    fn effort_clamp_without_an_inherited_base_falls_back_to_the_default() -> TestResult {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent = SessionId::new();
         let spawner = worker_spawner(manager)
             .with_external_root_parent(
@@ -6829,11 +7573,11 @@ admitted = ["fs.read", "shell.exec"]
                 None,
                 SessionActivation::default(),
             )
-            .expect("trusted external root registers during construction");
+            .map_err(ctx("trusted external root registers during construction"))?;
 
         let capped = spawner
             .admit("worker", spawn_input(parent.clone()), sandbox.clone(), None)
-            .expect("first child is admitted");
+            .map_err(ctx("first child is admitted"))?;
         // Seit Addendum F+G liefert `RoleEffortWeights` auch ohne geerbte
         // Eltern-Basis ein Rollengewicht (Default: `worker_complex` = Medium
         // für einen `Worker` ohne bekannte Komplexität) — die Erwartung wird
@@ -6847,9 +7591,9 @@ admitted = ["fs.read", "shell.exec"]
             spawner
                 .manager
                 .lock()
-                .expect("test session manager lock")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&capped)
-                .expect("child is manager-owned")
+                .map_err(ctx("child is manager-owned"))?
                 .reasoning_effort(),
             Some(expected_role_weight),
             "ohne Eltern-Level erbt das Kind bei der Admission das Rollengewicht aus RoleEffortWeights::default()"
@@ -6857,25 +7601,26 @@ admitted = ["fs.read", "shell.exec"]
         assert_eq!(
             spawner
                 .clamp_child_reasoning_effort(&capped, Some(ReasoningEffort::Low), None)
-                .expect("known child clamps cleanly"),
+                .map_err(ctx("known child clamps cleanly"))?,
             Some(ReasoningEffort::Low),
             "der Deckel der Agent-IR greift jetzt auch ohne geerbte Basis"
         );
 
         let uncapped = spawner
             .admit("worker", spawn_input(parent), sandbox, None)
-            .expect("second child is admitted");
+            .map_err(ctx("second child is admitted"))?;
         assert_eq!(
             spawner
                 .clamp_child_reasoning_effort(&uncapped, None, None)
-                .expect("known child clamps cleanly"),
+                .map_err(ctx("known child clamps cleanly"))?,
             Some(DEFAULT_CHILD_REASONING_EFFORT),
             "ohne Deckel und ohne Basis gilt der Default, nicht der Provider-Default"
         );
+        Ok(())
     }
 
     #[test]
-    fn admit_uses_provider_default_reasoning_effort_over_role_weight() {
+    fn admit_uses_provider_default_reasoning_effort_over_role_weight() -> TestResult {
         // Welle 8: Provider > Modell > Agent > Rolle. Der Rollen-Standard für
         // `Worker` ohne bekannte Komplexität ist `Medium`
         // ([`RoleEffortWeights::default`]); ein Provider-Default `Xhigh`
@@ -6884,7 +7629,7 @@ admitted = ["fs.read", "shell.exec"]
         // überschreiben.
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent = SessionId::new();
         let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative())
             .with_role(
@@ -6907,30 +7652,31 @@ admitted = ["fs.read", "shell.exec"]
                 Some(ReasoningEffort::Xhigh),
                 SessionActivation::default(),
             )
-            .expect("trusted external root registers during construction");
+            .map_err(ctx("trusted external root registers during construction"))?;
 
         let child = spawner
             .admit("worker", spawn_input(parent), sandbox, None)
-            .expect("child is admitted");
+            .map_err(ctx("child is admitted"))?;
 
         assert_eq!(
             spawner
                 .manager
                 .lock()
-                .expect("test session manager lock")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&child)
-                .expect("child is manager-owned")
+                .map_err(ctx("child is manager-owned"))?
                 .reasoning_effort(),
             Some(ReasoningEffort::Xhigh),
             "provider default (Xhigh) must win over the Worker role weight (Medium)"
         );
+        Ok(())
     }
 
     #[test]
-    fn admit_falls_back_to_role_weight_when_provider_and_model_are_silent() {
+    fn admit_falls_back_to_role_weight_when_provider_and_model_are_silent() -> TestResult {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent = SessionId::new();
         let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative())
             .with_role(
@@ -6953,11 +7699,11 @@ admitted = ["fs.read", "shell.exec"]
                 Some(ReasoningEffort::Xhigh),
                 SessionActivation::default(),
             )
-            .expect("trusted external root registers during construction");
+            .map_err(ctx("trusted external root registers during construction"))?;
 
         let child = spawner
             .admit("worker", spawn_input(parent), sandbox, None)
-            .expect("child is admitted");
+            .map_err(ctx("child is admitted"))?;
 
         let expected_role_weight = RoleEffortWeights::default().for_child(
             harw_agent_dsl::roles::AgentRoleId::Worker,
@@ -6968,18 +7714,19 @@ admitted = ["fs.read", "shell.exec"]
             spawner
                 .manager
                 .lock()
-                .expect("test session manager lock")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&child)
-                .expect("child is manager-owned")
+                .map_err(ctx("child is manager-owned"))?
                 .reasoning_effort(),
             Some(expected_role_weight),
             "without a provider/model default, the role weight remains the floor"
         );
+        Ok(())
     }
 
     #[test]
-    fn effort_clamp_owner_override_still_beats_the_default_base() {
-        let (spawner, child) = spawner_with_admitted_child();
+    fn effort_clamp_owner_override_still_beats_the_default_base() -> TestResult {
+        let (spawner, child) = spawner_with_admitted_child()?;
 
         let effective = spawner
             .clamp_child_reasoning_effort(
@@ -6987,9 +7734,10 @@ admitted = ["fs.read", "shell.exec"]
                 Some(ReasoningEffort::Minimal),
                 Some(ReasoningEffort::High),
             )
-            .expect("known child clamps cleanly");
+            .map_err(ctx("known child clamps cleanly"))?;
 
         assert_eq!(effective, Some(ReasoningEffort::High));
+        Ok(())
     }
 
     // ── parent_organizational_role ──────────────────────────────────────
@@ -7001,32 +7749,36 @@ admitted = ["fs.read", "shell.exec"]
     fn install_child_record(spawner: &ManagedAgentSpawner, parent: SessionId) -> SessionId {
         let child = SessionId::new();
         let now = Timestamp::now();
-        spawner.active.lock().expect("test child registry lock").insert(
-            child.as_str().to_owned(),
-            ChildRecord {
-                child: child.clone(),
-                parent,
-                handoff_call_id: ToolCallId::new(),
-                role: "worker".to_owned(),
-                depth: 1,
-                admitted_at: now,
-                lease_expires_at: now,
-                budget: AgentBudget::default(),
-                allow_pause: false,
-                depth_ceiling: ChildLimits::conservative().max_depth,
-                trace: None,
-                status: ChildStatus::Admitted,
-                task_complexity: None,
-            },
-        );
+        spawner
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                child.as_str().to_owned(),
+                ChildRecord {
+                    child: child.clone(),
+                    parent,
+                    handoff_call_id: ToolCallId::new(),
+                    role: "worker".to_owned(),
+                    depth: 1,
+                    admitted_at: now,
+                    lease_expires_at: now,
+                    budget: AgentBudget::default(),
+                    allow_pause: false,
+                    depth_ceiling: ChildLimits::conservative().max_depth,
+                    trace: None,
+                    status: ChildStatus::Admitted,
+                    task_complexity: None,
+                },
+            );
         child
     }
 
     #[test]
-    fn test_parent_organizational_role_manager_owned_parent_returns_role() {
+    fn test_parent_organizational_role_manager_owned_parent_returns_role() -> TestResult {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events.clone())));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent_session = AgentSession::new(
             AgentRole::Agent {
                 name: "root".to_owned(),
@@ -7042,9 +7794,9 @@ admitted = ["fs.read", "shell.exec"]
         let parent_id = parent_session.id().clone();
         manager
             .lock()
-            .expect("test session manager lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .restore(parent_session)
-            .expect("parent session restores");
+            .map_err(ctx("parent session restores"))?;
 
         let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative());
         let child = install_child_record(&spawner, parent_id);
@@ -7053,10 +7805,12 @@ admitted = ["fs.read", "shell.exec"]
             spawner.parent_organizational_role(&child),
             Some(harw_agent_dsl::roles::AgentRoleId::UserInterface)
         );
+        Ok(())
     }
 
     #[test]
-    fn test_parent_organizational_role_manager_parent_without_spawn_context_returns_none() {
+    fn test_parent_organizational_role_manager_parent_without_spawn_context_returns_none()
+    -> TestResult {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events.clone())));
         // No `.with_spawn_context(...)`: a manager-owned parent that never
@@ -7072,21 +7826,22 @@ admitted = ["fs.read", "shell.exec"]
         let parent_id = parent_session.id().clone();
         manager
             .lock()
-            .expect("test session manager lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .restore(parent_session)
-            .expect("parent session restores");
+            .map_err(ctx("parent session restores"))?;
 
         let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative());
         let child = install_child_record(&spawner, parent_id);
 
         assert_eq!(spawner.parent_organizational_role(&child), None);
+        Ok(())
     }
 
     #[test]
-    fn test_parent_organizational_role_external_root_parent_returns_role() {
+    fn test_parent_organizational_role_external_root_parent_returns_role() -> TestResult {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
-        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
         let parent = SessionId::new();
         let spawner = worker_spawner(manager)
             .with_external_root_parent(
@@ -7098,31 +7853,248 @@ admitted = ["fs.read", "shell.exec"]
                 None,
                 SessionActivation::default(),
             )
-            .expect("trusted external root registers during construction");
+            .map_err(ctx("trusted external root registers during construction"))?;
 
         let child = spawner
             .admit("worker", spawn_input(parent), sandbox, None)
-            .expect("registered external root admits a direct child");
+            .map_err(ctx("registered external root admits a direct child"))?;
 
         assert_eq!(
             spawner.parent_organizational_role(&child),
             Some(harw_agent_dsl::roles::AgentRoleId::RootOrchestrator)
         );
+        Ok(())
     }
 
     #[test]
-    fn test_parent_organizational_role_orphaned_parent_returns_none() {
+    fn test_parent_organizational_role_orphaned_parent_returns_none() -> TestResult {
         // `spawner_with_admitted_child` records a random, never-registered
         // parent and registers no external root parent either.
-        let (spawner, child) = spawner_with_admitted_child();
+        let (spawner, child) = spawner_with_admitted_child()?;
 
         assert_eq!(spawner.parent_organizational_role(&child), None);
+        Ok(())
     }
 
     #[test]
-    fn test_parent_organizational_role_unknown_child_returns_none() {
-        let (spawner, _child) = spawner_with_admitted_child();
+    fn test_parent_organizational_role_unknown_child_returns_none() -> TestResult {
+        let (spawner, _child) = spawner_with_admitted_child()?;
 
         assert_eq!(spawner.parent_organizational_role(&SessionId::new()), None);
+        Ok(())
+    }
+
+    // ── admit_or_wait / spawn_child_or_wait ────────────────────────────────
+
+    /// Baut einen [`ManagedAgentSpawner`] mit genau einem Kapazitäts-Slot je
+    /// Elternteil (`max_active_children_per_parent = 1`) — der `explore`-
+    /// Regressionsfall (mehrere parallele Kind-Aufrufe desselben Elternteils)
+    /// mit dem kleinstmöglichen Deckel.
+    fn single_slot_spawner() -> TestResult<(Arc<ManagedAgentSpawner>, SessionId, SandboxSpec)> {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
+        let parent = SessionId::new();
+        let limits = ChildLimits {
+            max_active_children_per_parent: 1,
+            ..ChildLimits::conservative()
+        };
+        let spawner = worker_spawner_with_limits(manager, limits)
+            .with_external_root_parent(
+                parent.clone(),
+                external_root_context(
+                    sandbox.clone(),
+                    harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+                ),
+                None,
+                SessionActivation::default(),
+            )
+            .map_err(ctx("trusted external root registers during construction"))?;
+        Ok((Arc::new(spawner), parent, sandbox))
+    }
+
+    #[tokio::test]
+    async fn test_admit_or_wait_waits_and_succeeds_after_release() -> TestResult {
+        let (spawner, parent, sandbox) = single_slot_spawner()?;
+        let first_child = spawner
+            .admit("worker", spawn_input(parent.clone()), sandbox.clone(), None)
+            .map_err(ctx("the single slot admits the first child"))?;
+
+        let waiter_spawner = Arc::clone(&spawner);
+        let waiter_parent = parent.clone();
+        let waiter_sandbox = sandbox.clone();
+        let handle = tokio::spawn(async move {
+            let cancel = CancelToken::new();
+            waiter_spawner
+                .admit_or_wait(
+                    "worker",
+                    spawn_input(waiter_parent),
+                    waiter_sandbox,
+                    None,
+                    std::time::Duration::from_secs(5),
+                    &cancel,
+                )
+                .await
+        });
+
+        // Let the waiter make its first (rejected) attempt and reach the
+        // `tokio::select!` awaiting `freed.notified()` before the slot frees.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        spawner
+            .release_child(&first_child)
+            .map_err(ctx("releasing the first child frees the only slot"))?;
+
+        // Bounded well under the 500ms fallback sleep inside `admit_or_wait`:
+        // this only passes if `release_in_memory`'s `notify_waiters()`
+        // actually woke the waiter, not the periodic poll.
+        let second_child = tokio::time::timeout(std::time::Duration::from_millis(300), handle)
+            .await
+            .map_err(ctx(
+                "admit_or_wait must be woken by the release notification, not time out",
+            ))?
+            .map_err(ctx("waiter task must not panic"))?
+            .map_err(ctx(
+                "capacity frees, so the second admission must eventually succeed",
+            ))?;
+
+        assert_ne!(second_child, first_child);
+        assert!(spawner.child_record(&second_child).is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_admit_or_wait_times_out_with_unchanged_capacity_error() -> TestResult {
+        let (spawner, parent, sandbox) = single_slot_spawner()?;
+        let _first_child = spawner
+            .admit("worker", spawn_input(parent.clone()), sandbox.clone(), None)
+            .map_err(ctx("the single slot admits the first child"))?;
+
+        // The immediate rejection `admit` itself would give — `admit_or_wait`
+        // must return this exact message once it gives up, byte-identical.
+        let Err(direct_rejection) =
+            spawner.admit("worker", spawn_input(parent.clone()), sandbox.clone(), None)
+        else {
+            return Err(TestError::Unexpected(
+                "admit itself must still reject immediately at capacity".to_owned(),
+            ));
+        };
+
+        let cancel = CancelToken::new();
+        let Err(waited_rejection) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            spawner.admit_or_wait(
+                "worker",
+                spawn_input(parent),
+                sandbox,
+                None,
+                std::time::Duration::from_millis(120),
+                &cancel,
+            ),
+        )
+        .await
+        .map_err(ctx(
+            "admit_or_wait must give up once max_wait elapses, not hang",
+        ))?
+        else {
+            return Err(TestError::Unexpected(
+                "capacity never frees in this test".to_owned(),
+            ));
+        };
+
+        assert_eq!(waited_rejection.message, direct_rejection.message);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_admit_or_wait_cancellation_returns_promptly() -> TestResult {
+        let (spawner, parent, sandbox) = single_slot_spawner()?;
+        let first_child = spawner
+            .admit("worker", spawn_input(parent.clone()), sandbox.clone(), None)
+            .map_err(ctx("the single slot admits the first child"))?;
+
+        let cancel = CancelToken::new();
+        let waiter_spawner = Arc::clone(&spawner);
+        let waiter_cancel = cancel.clone();
+        let waiter_parent = parent.clone();
+        let waiter_sandbox = sandbox.clone();
+        let handle = tokio::spawn(async move {
+            waiter_spawner
+                .admit_or_wait(
+                    "worker",
+                    spawn_input(waiter_parent),
+                    waiter_sandbox,
+                    None,
+                    std::time::Duration::from_secs(30),
+                    &waiter_cancel,
+                )
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancel.cancel(CancelReason::User);
+
+        let Err(rejection) = tokio::time::timeout(std::time::Duration::from_millis(300), handle)
+            .await
+            .map_err(ctx(
+                "cancellation must end the wait promptly, not time out at max_wait (30s)",
+            ))?
+            .map_err(ctx("waiter task must not panic"))?
+        else {
+            return Err(TestError::Unexpected(
+                "a cancelled wait must not admit a child".to_owned(),
+            ));
+        };
+
+        assert!(
+            rejection.message.contains("cancelled"),
+            "cancellation rejection must name cancellation, not capacity: {}",
+            rejection.message
+        );
+        // The first child's own slot is untouched by the second caller's
+        // cancellation — cancellation only abandons the *waiting* attempt.
+        assert!(spawner.child_record(&first_child).is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_admit_or_wait_returns_non_capacity_rejection_immediately() -> TestResult {
+        // Reuses the depth-limit fixture from
+        // `the_agent_ir_can_only_tighten_the_depth_limit`: `max_depth = 0` on
+        // the admitted "manager" forbids any grandchild — a rejection that
+        // has nothing to do with capacity and so must never be retried.
+        let (spawner, root, sandbox) = two_hop_spawner(test_agent_ir(
+            r#"
+[spawn]
+max_depth = 0
+"#,
+        )?)?;
+        let child = spawner
+            .admit("manager", spawn_input(root), sandbox.clone(), None)
+            .map_err(ctx("the depth-0 role is itself admissible"))?;
+
+        let cancel = CancelToken::new();
+        let Err(rejection) = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            spawner.admit_or_wait(
+                "worker",
+                spawn_input(child),
+                sandbox,
+                None,
+                std::time::Duration::from_secs(30),
+                &cancel,
+            ),
+        )
+        .await
+        .map_err(ctx(
+            "a non-capacity rejection must return immediately, not wait out max_wait (30s)",
+        ))?
+        else {
+            return Err(TestError::Unexpected(
+                "a parent contract of max_depth = 0 forbids any grandchild".to_owned(),
+            ));
+        };
+
+        assert_eq!(rejection.message, "child depth 2 exceeds maximum 1");
+        Ok(())
     }
 }

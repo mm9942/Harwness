@@ -371,6 +371,7 @@ impl SensorHealth {
 #[cfg(test)]
 mod tests {
     use super::{DegradeReason, RetryPolicy, SensorHealth};
+    use crate::test_support::{TestError, TestResult};
     use harw_dod_cap::Permanence;
     use jiff::{SignedDuration, Timestamp};
 
@@ -440,11 +441,7 @@ mod tests {
             failures: 1,
             next_attempt: Timestamp::UNIX_EPOCH,
         };
-        let next = retrying.advance(
-            Err(Permanence::Transient),
-            Timestamp::UNIX_EPOCH,
-            policy(5),
-        );
+        let next = retrying.advance(Err(Permanence::Transient), Timestamp::UNIX_EPOCH, policy(5));
         assert!(matches!(next, SensorHealth::Retrying { failures: 2, .. }));
     }
 
@@ -454,11 +451,7 @@ mod tests {
             failures: 4,
             next_attempt: Timestamp::UNIX_EPOCH,
         };
-        let next = retrying.advance(
-            Err(Permanence::Transient),
-            Timestamp::UNIX_EPOCH,
-            policy(5),
-        );
+        let next = retrying.advance(Err(Permanence::Transient), Timestamp::UNIX_EPOCH, policy(5));
         assert_eq!(
             next,
             SensorHealth::Degraded {
@@ -480,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn test_next_attempt_is_now_plus_backoff() {
+    fn test_next_attempt_is_now_plus_backoff() -> TestResult {
         let backoff = SignedDuration::from_secs(30);
         let next = SensorHealth::Bound.advance(
             Err(Permanence::Transient),
@@ -488,12 +481,15 @@ mod tests {
             RetryPolicy::new(5, backoff),
         );
         let SensorHealth::Retrying { next_attempt, .. } = next else {
-            panic!("expected Retrying state");
+            return Err(TestError::Unexpected("expected Retrying state".into()));
         };
         assert_eq!(
             next_attempt,
-            Timestamp::UNIX_EPOCH.checked_add(backoff).expect("in range")
+            Timestamp::UNIX_EPOCH
+                .checked_add(backoff)
+                .ok_or(TestError::Missing("in range"))?
         );
+        Ok(())
     }
 
     #[test]
@@ -510,21 +506,25 @@ mod tests {
     }
 
     #[test]
-    fn test_is_due_false_before_next_attempt_and_true_after() {
+    fn test_is_due_false_before_next_attempt_and_true_after() -> TestResult {
         let next_attempt = Timestamp::UNIX_EPOCH
             .checked_add(SignedDuration::from_secs(30))
-            .expect("in range");
+            .ok_or(TestError::Missing("in range"))?;
         let retrying = SensorHealth::Retrying {
             failures: 1,
             next_attempt,
         };
         assert!(!retrying.is_due(Timestamp::UNIX_EPOCH));
         assert!(retrying.is_due(next_attempt));
+        Ok(())
     }
 
     #[test]
     fn test_degrade_reason_display_is_human_readable() {
-        assert_eq!(DegradeReason::Permanent.to_string(), "permanent sensor error");
+        assert_eq!(
+            DegradeReason::Permanent.to_string(),
+            "permanent sensor error"
+        );
         assert_eq!(
             DegradeReason::RetriesExhausted { attempts: 5 }.to_string(),
             "retry budget exhausted after 5 attempt(s)"

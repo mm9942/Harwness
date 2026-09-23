@@ -90,6 +90,9 @@ pub mod registry;
 mod service_macro;
 pub mod session_control;
 
+#[cfg(test)]
+mod test_support;
+
 // ── Re-Exporte der Kern-Typen ─────────────────────────────────────────────────
 
 pub use args::{

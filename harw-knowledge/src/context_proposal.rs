@@ -492,7 +492,8 @@ impl ContextProposal {
     /// has already been decided.
     fn transition_to(&mut self, to: ProposalStatus) -> KnowledgeResult<()> {
         if self.status != ProposalStatus::Pending {
-            crate::context_steward::STEWARD_REDECISION_VIOLATION.violated(&harw_observe::NullSink, &[]);
+            crate::context_steward::STEWARD_REDECISION_VIOLATION
+                .violated(&harw_observe::NullSink, &[]);
             return Err(KnowledgeError::ProposalNotPending {
                 id: self.id.to_string(),
                 status: format!("{:?}", self.status),
@@ -811,21 +812,23 @@ mod tests {
     };
     use crate::artifact::{ArtifactId, ArtifactKind, Frontmatter};
     use crate::error::KnowledgeError;
+    use crate::test_support::{TestError, TestResult};
     use crate::visibility::{AgentId, VisibilityScope};
 
     use harw_agent_dsl::context_program::SectionStrength;
     use harw_agent_dsl::ids::DefinitionId;
     use harw_context::OmissionReason;
 
-    fn program_id() -> DefinitionId {
-        DefinitionId::parse("harwness.context.security-triage@1").expect("valid definition id")
+    fn program_id() -> TestResult<DefinitionId> {
+        DefinitionId::parse("harwness.context.security-triage@1")
+            .map_err(crate::test_support::ctx("valid definition id"))
     }
 
-    fn sample_proposal() -> ContextProposal {
-        ContextProposal::new(
+    fn sample_proposal() -> TestResult<ContextProposal> {
+        Ok(ContextProposal::new(
             ArtifactId::new("context-proposal/example"),
             "Beispielvorschlag",
-            program_id(),
+            program_id()?,
             "deadbeef".repeat(8),
             vec![ProposedChange::ChangeSectionStrength {
                 section_name: "history.tail".to_owned(),
@@ -834,16 +837,17 @@ mod tests {
             Vec::new(),
             jiff::Timestamp::UNIX_EPOCH,
             "heuristic:must-include-promotion@1",
-        )
+        ))
     }
 
     /// Rundlauf über serde; unbekanntes Feld wird abgelehnt (K19).
     #[test]
-    fn test_serde_roundtrip_and_deny_unknown_fields() {
-        let proposal = sample_proposal();
-        let json = serde_json::to_string(&proposal).expect("proposal serializes");
-        let restored: ContextProposal =
-            serde_json::from_str(&json).expect("proposal deserializes");
+    fn test_serde_roundtrip_and_deny_unknown_fields() -> TestResult {
+        let proposal = sample_proposal()?;
+        let json = serde_json::to_string(&proposal)
+            .map_err(crate::test_support::ctx("proposal serializes"))?;
+        let restored: ContextProposal = serde_json::from_str(&json)
+            .map_err(crate::test_support::ctx("proposal deserializes"))?;
 
         assert_eq!(restored.id, proposal.id);
         assert_eq!(restored.title, proposal.title);
@@ -851,23 +855,25 @@ mod tests {
         assert_eq!(restored.status, proposal.status);
         assert_eq!(restored.changes, proposal.changes);
 
-        let mut value: serde_json::Value = serde_json::from_str(&json).expect("value parses");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&json).map_err(crate::test_support::ctx("value parses"))?;
         value
             .as_object_mut()
-            .expect("proposal is a JSON object")
+            .ok_or(TestError::Missing("proposal is a JSON object"))?
             .insert("unexpected_field".to_owned(), serde_json::json!(true));
         let rejected: Result<ContextProposal, _> = serde_json::from_str(&value.to_string());
         assert!(
             rejected.is_err(),
             "ein unbekanntes Feld muss die Deserialisierung ablehnen"
         );
+        Ok(())
     }
 
     /// Rundlauf über `KnowledgeArtifact` (die durable Einbettung), zusätzlich
     /// zum reinen Serde-Rundlauf oben.
     #[test]
-    fn test_artifact_roundtrip_preserves_kind_and_id() {
-        let proposal = sample_proposal();
+    fn test_artifact_roundtrip_preserves_kind_and_id() -> TestResult {
+        let proposal = sample_proposal()?;
         let frontmatter = Frontmatter::new(
             AgentId::new("system"),
             RECOMMENDED_VISIBILITY,
@@ -876,18 +882,20 @@ mod tests {
         let artifact = proposal
             .clone()
             .to_artifact(frontmatter)
-            .expect("proposal embeds into an artifact");
+            .map_err(crate::test_support::ctx("proposal embeds into an artifact"))?;
         assert_eq!(artifact.kind, ArtifactKind::ContextProposal);
 
-        let restored =
-            ContextProposal::from_artifact(&artifact).expect("artifact parses back into a proposal");
+        let restored = ContextProposal::from_artifact(&artifact).map_err(
+            crate::test_support::ctx("artifact parses back into a proposal"),
+        )?;
         assert_eq!(restored.id, proposal.id);
         assert_eq!(restored.changes, proposal.changes);
+        Ok(())
     }
 
     /// `from_artifact` weist ein Artefakt mit dem falschen `kind` ab.
     #[test]
-    fn test_from_artifact_rejects_kind_mismatch() {
+    fn test_from_artifact_rejects_kind_mismatch() -> TestResult {
         use crate::artifact::KnowledgeArtifact;
 
         let frontmatter = Frontmatter::new(
@@ -902,14 +910,18 @@ mod tests {
             "{}",
         );
 
-        let error = ContextProposal::from_artifact(&wrong_kind)
-            .expect_err("wrong artifact kind must be rejected");
+        let Err(error) = ContextProposal::from_artifact(&wrong_kind) else {
+            return Err(TestError::Unexpected(
+                "wrong artifact kind must be rejected".to_owned(),
+            ));
+        };
         assert!(matches!(error, KnowledgeError::ArtifactKindMismatch { .. }));
+        Ok(())
     }
 
     /// Determinismus: gleiche Eingabe → byte-gleicher Vorschlag, zweimal.
     #[test]
-    fn test_heuristic_is_deterministic_byte_for_byte() {
+    fn test_heuristic_is_deterministic_byte_for_byte() -> TestResult {
         let window = ContextObservationWindow {
             omissions: vec![
                 ObservedOmission {
@@ -930,31 +942,37 @@ mod tests {
             ],
         };
 
-        let build = || {
+        let build = || -> TestResult<ContextProposal> {
             propose_must_include_promotions(
                 ArtifactId::new("context-proposal/deterministic"),
-                program_id(),
+                program_id()?,
                 "deadbeef".repeat(8),
                 &window,
                 jiff::Timestamp::UNIX_EPOCH,
                 "heuristic:must-include-promotion@1",
                 Vec::new(),
             )
-            .expect("threshold reached (2 + 1 = 3)")
+            .ok_or(TestError::Missing("threshold reached (2 + 1 = 3)"))
         };
 
-        let first = serde_json::to_vec(&build()).expect("first proposal serializes");
-        let second = serde_json::to_vec(&build()).expect("second proposal serializes");
-        assert_eq!(first, second, "identical input must produce byte-identical output");
+        let first = serde_json::to_vec(&build()?)
+            .map_err(crate::test_support::ctx("first proposal serializes"))?;
+        let second = serde_json::to_vec(&build()?)
+            .map_err(crate::test_support::ctx("second proposal serializes"))?;
+        assert_eq!(
+            first, second,
+            "identical input must produce byte-identical output"
+        );
+        Ok(())
     }
 
     /// Die Heuristik schlägt bei leerer Beobachtung nichts vor.
     #[test]
-    fn test_heuristic_proposes_nothing_from_empty_observation() {
+    fn test_heuristic_proposes_nothing_from_empty_observation() -> TestResult {
         let empty = ContextObservationWindow::default();
         let proposal = propose_must_include_promotions(
             ArtifactId::new("context-proposal/empty"),
-            program_id(),
+            program_id()?,
             "deadbeef".repeat(8),
             &empty,
             jiff::Timestamp::UNIX_EPOCH,
@@ -962,11 +980,12 @@ mod tests {
             Vec::new(),
         );
         assert!(proposal.is_none(), "kein Vorschlag aus dem Nichts");
+        Ok(())
     }
 
     /// Unterhalb der Schwelle: ebenfalls kein Vorschlag.
     #[test]
-    fn test_heuristic_below_threshold_proposes_nothing() {
+    fn test_heuristic_below_threshold_proposes_nothing() -> TestResult {
         let window = ContextObservationWindow {
             omissions: vec![ObservedOmission {
                 section_name: "history.tail".to_owned(),
@@ -976,7 +995,7 @@ mod tests {
         };
         let proposal = propose_must_include_promotions(
             ArtifactId::new("context-proposal/below-threshold"),
-            program_id(),
+            program_id()?,
             "deadbeef".repeat(8),
             &window,
             jiff::Timestamp::UNIX_EPOCH,
@@ -984,11 +1003,12 @@ mod tests {
             Vec::new(),
         );
         assert!(proposal.is_none());
+        Ok(())
     }
 
     /// Eine Auslassung aus einem anderen Grund als `OverBudget` zählt nicht.
     #[test]
-    fn test_heuristic_ignores_non_over_budget_reasons() {
+    fn test_heuristic_ignores_non_over_budget_reasons() -> TestResult {
         let window = ContextObservationWindow {
             omissions: vec![ObservedOmission {
                 section_name: "plan.current".to_owned(),
@@ -998,7 +1018,7 @@ mod tests {
         };
         let proposal = propose_must_include_promotions(
             ArtifactId::new("context-proposal/ignored-reason"),
-            program_id(),
+            program_id()?,
             "deadbeef".repeat(8),
             &window,
             jiff::Timestamp::UNIX_EPOCH,
@@ -1006,11 +1026,12 @@ mod tests {
             Vec::new(),
         );
         assert!(proposal.is_none());
+        Ok(())
     }
 
     /// Mehrere qualifizierende Sektionen erscheinen sortiert nach Namen.
     #[test]
-    fn test_heuristic_orders_multiple_qualifying_sections_by_name() {
+    fn test_heuristic_orders_multiple_qualifying_sections_by_name() -> TestResult {
         let window = ContextObservationWindow {
             omissions: vec![
                 ObservedOmission {
@@ -1027,32 +1048,35 @@ mod tests {
         };
         let proposal = propose_must_include_promotions(
             ArtifactId::new("context-proposal/ordered"),
-            program_id(),
+            program_id()?,
             "deadbeef".repeat(8),
             &window,
             jiff::Timestamp::UNIX_EPOCH,
             "heuristic:must-include-promotion@1",
             Vec::new(),
         )
-        .expect("both sections reach the threshold");
+        .ok_or(TestError::Missing("both sections reach the threshold"))?;
 
         let names: Vec<&str> = proposal
             .changes
             .iter()
             .map(|change| match change {
                 ProposedChange::ChangeSectionStrength { section_name, .. } => {
-                    section_name.as_str()
+                    Ok(section_name.as_str())
                 }
-                other => panic!("unexpected change variant: {other:?}"),
+                other => Err(TestError::Unexpected(format!(
+                    "unexpected change variant: {other:?}"
+                ))),
             })
-            .collect();
+            .collect::<TestResult<Vec<&str>>>()?;
         assert_eq!(names, vec!["aaa.first", "zzz.last"]);
+        Ok(())
     }
 
     /// Ein Vorschlag ist ohne Blick in den Code beurteilbar: die Belege
     /// kommen mit, unverändert durchgereicht.
     #[test]
-    fn test_evidence_flows_through_to_the_produced_proposal() {
+    fn test_evidence_flows_through_to_the_produced_proposal() -> TestResult {
         use harw_plan::{EvidenceKind, EvidenceRef};
 
         // `harw_plan::testing::fixture_time()` liefert deterministisch
@@ -1076,47 +1100,58 @@ mod tests {
         };
         let proposal = propose_must_include_promotions(
             ArtifactId::new("context-proposal/with-evidence"),
-            program_id(),
+            program_id()?,
             "deadbeef".repeat(8),
             &window,
             jiff::Timestamp::UNIX_EPOCH,
             "heuristic:must-include-promotion@1",
             evidence,
         )
-        .expect("threshold reached");
+        .ok_or(TestError::Missing("threshold reached"))?;
 
         assert_eq!(proposal.evidence.len(), 1);
         assert_eq!(
             proposal.evidence[0].locator,
             "context-observation:history.tail:over-budget"
         );
+        Ok(())
     }
 
     /// `accept`/`reject` markieren nur den Status — sie sind terminal.
     #[test]
-    fn test_accept_marks_status_and_is_terminal() {
-        let mut proposal = sample_proposal();
+    fn test_accept_marks_status_and_is_terminal() -> TestResult {
+        let mut proposal = sample_proposal()?;
         assert_eq!(proposal.status, ProposalStatus::Pending);
 
-        proposal.accept().expect("pending proposal accepts");
+        proposal
+            .accept()
+            .map_err(crate::test_support::ctx("pending proposal accepts"))?;
         assert_eq!(proposal.status, ProposalStatus::Accepted);
 
-        let error = proposal
-            .accept()
-            .expect_err("an already-decided proposal must not accept again");
+        let Err(error) = proposal.accept() else {
+            return Err(TestError::Unexpected(
+                "an already-decided proposal must not accept again".to_owned(),
+            ));
+        };
         assert!(matches!(error, KnowledgeError::ProposalNotPending { .. }));
 
-        let error = proposal
-            .reject()
-            .expect_err("an already-decided proposal must not flip to rejected either");
+        let Err(error) = proposal.reject() else {
+            return Err(TestError::Unexpected(
+                "an already-decided proposal must not flip to rejected either".to_owned(),
+            ));
+        };
         assert!(matches!(error, KnowledgeError::ProposalNotPending { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_reject_marks_status() {
-        let mut proposal = sample_proposal();
-        proposal.reject().expect("pending proposal rejects");
+    fn test_reject_marks_status() -> TestResult {
+        let mut proposal = sample_proposal()?;
+        proposal
+            .reject()
+            .map_err(crate::test_support::ctx("pending proposal rejects"))?;
         assert_eq!(proposal.status, ProposalStatus::Rejected);
+        Ok(())
     }
 
     /// Es gibt keinen Weg, einen Vorschlag anzuwenden: `ContextProposal`
@@ -1129,15 +1164,20 @@ mod tests {
     /// nachweisbar daran, dass jedes andere Feld vor und nach dem Aufruf
     /// identisch bleibt.
     #[test]
-    fn test_accept_never_touches_any_context_program_definition() {
-        let mut proposal = sample_proposal();
+    fn test_accept_never_touches_any_context_program_definition() -> TestResult {
+        let mut proposal = sample_proposal()?;
         let before_changes = proposal.changes.clone();
         let before_target = proposal.target_program.clone();
         let before_snapshot = proposal.target_snapshot_digest.clone();
 
-        proposal.accept().expect("pending proposal accepts");
+        proposal
+            .accept()
+            .map_err(crate::test_support::ctx("pending proposal accepts"))?;
 
-        assert_eq!(proposal.changes, before_changes, "accept darf `changes` nicht verändern");
+        assert_eq!(
+            proposal.changes, before_changes,
+            "accept darf `changes` nicht verändern"
+        );
         assert_eq!(
             proposal.target_program, before_target,
             "accept darf `target_program` nicht verändern"
@@ -1147,6 +1187,7 @@ mod tests {
             "accept darf `target_snapshot_digest` nicht verändern"
         );
         assert_eq!(proposal.status, ProposalStatus::Accepted);
+        Ok(())
     }
 
     /// Deciding an already-decided proposal — the real, production-reached
@@ -1154,19 +1195,28 @@ mod tests {
     /// `/context-proposal accept|reject <id>`) — trips
     /// `steward_redecision_violation_total` (AW6-08).
     #[test]
-    fn test_redeciding_a_proposal_trips_the_steward_redecision_counter() {
+    fn test_redeciding_a_proposal_trips_the_steward_redecision_counter() -> TestResult {
         use crate::context_steward::{STEWARD_COUNTER_LOCK, STEWARD_REDECISION_VIOLATION};
 
-        let _guard = STEWARD_COUNTER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = STEWARD_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let before = STEWARD_REDECISION_VIOLATION.count();
-        let mut proposal = sample_proposal();
-        proposal.accept().expect("first decision succeeds");
+        let mut proposal = sample_proposal()?;
+        proposal
+            .accept()
+            .map_err(crate::test_support::ctx("first decision succeeds"))?;
 
-        let error = proposal.accept().expect_err("a second decision must fail");
+        let Err(error) = proposal.accept() else {
+            return Err(TestError::Unexpected(
+                "a second decision must fail".to_owned(),
+            ));
+        };
         assert!(matches!(error, KnowledgeError::ProposalNotPending { .. }));
         assert!(
             STEWARD_REDECISION_VIOLATION.count() > before,
             "deciding an already-decided proposal must trip the counter"
         );
+        Ok(())
     }
 }

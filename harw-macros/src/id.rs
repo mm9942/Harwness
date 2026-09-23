@@ -370,50 +370,69 @@ pub(crate) fn expand_harw_id(input: &DeriveInput) -> syn::Result<TokenStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn expand_rejects_enum() {
+    fn expand_rejects_enum() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             pub enum Foo { A, B }
         };
-        let err = expand_harw_id(&input).expect_err("enums must be rejected");
+        let Err(err) = expand_harw_id(&input) else {
+            return Err(TestError::Unexpected("enums must be rejected".to_owned()));
+        };
         assert!(err.to_string().contains("structs"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_named_struct() {
+    fn expand_rejects_named_struct() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             pub struct Foo { value: String }
         };
-        let err = expand_harw_id(&input).expect_err("named structs must be rejected");
+        let Err(err) = expand_harw_id(&input) else {
+            return Err(TestError::Unexpected(
+                "named structs must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("Tuple-Struct"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_multiple_fields() {
+    fn expand_rejects_multiple_fields() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             pub struct Foo(String, String);
         };
-        let err = expand_harw_id(&input).expect_err("multi-field tuple structs must be rejected");
+        let Err(err) = expand_harw_id(&input) else {
+            return Err(TestError::Unexpected(
+                "multi-field tuple structs must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("genau einem Feld"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_non_string_field() {
+    fn expand_rejects_non_string_field() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             pub struct Foo(u64);
         };
-        let err = expand_harw_id(&input).expect_err("non-String fields must be rejected");
+        let Err(err) = expand_harw_id(&input) else {
+            return Err(TestError::Unexpected(
+                "non-String fields must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("String"));
+        Ok(())
     }
 
     #[test]
-    fn expand_accepts_basic_tuple_struct_with_defaults() {
+    fn expand_accepts_basic_tuple_struct_with_defaults() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             pub struct Foo(String);
         };
         let tokens = expand_harw_id(&input)
-            .expect("valid tuple struct must expand")
+            .map_err(ctx("valid tuple struct must expand"))?
             .to_string();
 
         assert!(tokens.contains("fn try_new"));
@@ -426,80 +445,96 @@ mod tests {
         assert!(tokens.contains("impl :: core :: cmp :: PartialEq < str > for Foo"));
         assert!(tokens.contains("impl :: core :: cmp :: PartialEq < & str > for Foo"));
         assert!(
-            tokens.contains("impl :: core :: cmp :: PartialEq < :: std :: string :: String > for Foo")
+            tokens.contains(
+                "impl :: core :: cmp :: PartialEq < :: std :: string :: String > for Foo"
+            )
         );
         // Default error path and ctor.
         assert!(tokens.contains("crate :: error :: InvalidId"));
         assert!(tokens.contains(":: empty"));
         // Without #[harw_id(infallible)] no compatibility constructor is emitted.
         assert!(!tokens.contains("fn new ("));
+        Ok(())
     }
 
     #[test]
-    fn expand_infallible_attribute_adds_compat_constructor() {
+    fn expand_infallible_attribute_adds_compat_constructor() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[harw_id(infallible)]
             pub struct Foo(String);
         };
         let tokens = expand_harw_id(&input)
-            .expect("infallible attribute must expand")
+            .map_err(ctx("infallible attribute must expand"))?
             .to_string();
         assert!(tokens.contains("fn new ("));
         assert!(tokens.contains("Kompatibilitätskonstruktor"));
+        Ok(())
     }
 
     #[test]
-    fn expand_no_serde_attribute_is_accepted_without_codegen_effect() {
+    fn expand_no_serde_attribute_is_accepted_without_codegen_effect() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[harw_id(no_serde)]
             pub struct Foo(String);
         };
         let with_no_serde = expand_harw_id(&input)
-            .expect("no_serde attribute must be accepted")
+            .map_err(ctx("no_serde attribute must be accepted"))?
             .to_string();
 
         let plain_input: DeriveInput = syn::parse_quote! {
             pub struct Foo(String);
         };
         let plain = expand_harw_id(&plain_input)
-            .expect("plain struct must expand")
+            .map_err(ctx("plain struct must expand"))?
             .to_string();
 
         assert_eq!(with_no_serde, plain);
+        Ok(())
     }
 
     #[test]
-    fn expand_custom_error_and_ctor_attributes_are_used() {
+    fn expand_custom_error_and_ctor_attributes_are_used() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[harw_id(error = "my_crate::error::MyError", ctor = "custom_empty")]
             pub struct Foo(String);
         };
         let tokens = expand_harw_id(&input)
-            .expect("custom error/ctor must expand")
+            .map_err(ctx("custom error/ctor must expand"))?
             .to_string();
 
         assert!(tokens.contains("my_crate :: error :: MyError"));
         assert!(tokens.contains(":: custom_empty"));
         assert!(!tokens.contains("crate :: error :: InvalidId"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_unknown_attribute_key() {
+    fn expand_rejects_unknown_attribute_key() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[harw_id(bogus)]
             pub struct Foo(String);
         };
-        let err = expand_harw_id(&input).expect_err("unknown attribute keys must be rejected");
+        let Err(err) = expand_harw_id(&input) else {
+            return Err(TestError::Unexpected(
+                "unknown attribute keys must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("unbekanntes harw_id-Attribut"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_invalid_error_path() {
+    fn expand_rejects_invalid_error_path() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[harw_id(error = "not a path!!")]
             pub struct Foo(String);
         };
-        let err = expand_harw_id(&input).expect_err("invalid error path must be rejected");
+        let Err(err) = expand_harw_id(&input) else {
+            return Err(TestError::Unexpected(
+                "invalid error path must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("gültiger Pfad"));
+        Ok(())
     }
 }

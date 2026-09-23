@@ -90,7 +90,8 @@ pub(crate) fn validate_name(
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_name, ContextError};
+    use super::{ContextError, validate_name};
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn test_validate_name_rejects_empty_value() {
@@ -117,11 +118,12 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_name_accepts_plain_name() {
+    fn test_validate_name_accepts_plain_name() -> TestResult {
         assert_eq!(
-            validate_name("section", "history.tail").unwrap(),
+            validate_name("section", "history.tail").map_err(ctx("valid name"))?,
             "history.tail"
         );
+        Ok(())
     }
 
     #[test]

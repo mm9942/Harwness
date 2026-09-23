@@ -118,37 +118,39 @@ impl AuditSource for FixtureAuditSource {
 mod tests {
     use super::{AuditSource, FixtureAuditSource};
     use crate::record::RawRecord;
+    use crate::test_support::TestResult;
     use std::time::Duration;
 
     #[test]
-    fn test_fixture_audit_source_returns_inserted_records() {
+    fn test_fixture_audit_source_returns_inserted_records() -> TestResult {
         let inserted = vec![
             RawRecord::new("type=SYSCALL auid=1000"),
             RawRecord::new("type=USER_AUTH auid=0"),
         ];
         let source = FixtureAuditSource::new(inserted.clone());
 
-        let read = source
-            .read_records(Duration::from_millis(1))
-            .expect("Fixture scheitert nie");
+        let read = source.read_records(Duration::from_millis(1))?;
 
         assert_eq!(read, inserted);
+        Ok(())
     }
 
     #[test]
-    fn test_fixture_audit_source_returns_same_records_on_repeated_calls() {
+    fn test_fixture_audit_source_returns_same_records_on_repeated_calls() -> TestResult {
         let source = FixtureAuditSource::new([RawRecord::new("type=SYSCALL")]);
 
-        let first = source.read_records(Duration::ZERO).expect("erster Aufruf");
-        let second = source.read_records(Duration::ZERO).expect("zweiter Aufruf");
+        let first = source.read_records(Duration::ZERO)?;
+        let second = source.read_records(Duration::ZERO)?;
 
         assert_eq!(first, second);
+        Ok(())
     }
 
     #[test]
-    fn test_fixture_audit_source_empty_fixture_returns_empty_vec() {
+    fn test_fixture_audit_source_empty_fixture_returns_empty_vec() -> TestResult {
         let source = FixtureAuditSource::new(Vec::<RawRecord>::new());
-        let read = source.read_records(Duration::ZERO).expect("Fixture scheitert nie");
+        let read = source.read_records(Duration::ZERO)?;
         assert!(read.is_empty());
+        Ok(())
     }
 }

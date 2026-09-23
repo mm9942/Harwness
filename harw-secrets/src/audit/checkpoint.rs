@@ -153,17 +153,20 @@ impl CheckpointLog {
         self.head = checkpoint_hash(&checkpoint);
         self.checkpoints.push(checkpoint);
 
-        Ok(self
-            .checkpoints
-            .last()
-            .expect("checkpoint was appended before borrowing it"))
+        // `push` just grew the vector by one, so `len() - 1` is always a
+        // valid index; no `unwrap`/`expect` needed to reach it (Bible R087).
+        let last_index = self.checkpoints.len() - 1;
+        Ok(&self.checkpoints[last_index])
     }
 
     /// Confirm `event_count` values are strictly increasing across checkpoints
     /// (§4.3 step 3). Reports the first non-increasing index.
     pub fn check_monotonic(&self) -> AuditResult<()> {
         for (i, pair) in self.checkpoints.windows(2).enumerate() {
-            if pair[1].event_count <= pair[0].event_count {
+            // `windows(2)` always yields two-element slices; the pattern keeps
+            // the access index-free (Bible R109).
+            let [previous, next] = pair else { continue };
+            if next.event_count <= previous.event_count {
                 return Err(AuditError::NonMonotonicCheckpoint {
                     index: (i + 1) as u64,
                 });
@@ -290,45 +293,61 @@ impl<'a> Cursor<'a> {
     }
 
     fn take(&mut self, len: usize) -> AuditResult<&'a [u8]> {
-        if len > self.remaining() {
-            return Err(malformed_persisted_checkpoints(
-                "checkpoint file record is truncated",
-            ));
-        }
-        let slice = &self.data[self.pos..self.pos + len];
-        self.pos += len;
+        // `checked_add` + `get(range)` instead of `pos + len` / `data[pos..pos+len]`:
+        // neither the addition nor the slicing can panic here, regardless of what
+        // an attacker-controlled length prefix inside the file claims (Bible R109).
+        let end = self.pos.checked_add(len).ok_or_else(|| {
+            malformed_persisted_checkpoints("checkpoint file record length overflows")
+        })?;
+        let slice = self.data.get(self.pos..end).ok_or_else(|| {
+            malformed_persisted_checkpoints("checkpoint file record is truncated")
+        })?;
+        self.pos = end;
         Ok(slice)
     }
 
     fn take_u32_be(&mut self) -> AuditResult<u32> {
         let b = self.take(4)?;
-        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+        // `try_into` instead of indexing `b[0]..b[3]`: `take(4)` already
+        // guarantees a 4-byte slice, but the conversion stays panic-free even if
+        // that invariant is ever broken by a future edit (Bible R109).
+        let array: [u8; 4] = b
+            .try_into()
+            .map_err(|_| malformed_persisted_checkpoints("checkpoint file record is truncated"))?;
+        Ok(u32::from_be_bytes(array))
     }
 
     fn take_u64_be(&mut self) -> AuditResult<u64> {
         let b = self.take(8)?;
-        Ok(u64::from_be_bytes([
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        ]))
+        let array: [u8; 8] = b
+            .try_into()
+            .map_err(|_| malformed_persisted_checkpoints("checkpoint file record is truncated"))?;
+        Ok(u64::from_be_bytes(array))
     }
 
     fn take_i32_be(&mut self) -> AuditResult<i32> {
         let b = self.take(4)?;
-        Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+        let array: [u8; 4] = b
+            .try_into()
+            .map_err(|_| malformed_persisted_checkpoints("checkpoint file record is truncated"))?;
+        Ok(i32::from_be_bytes(array))
     }
 
     fn take_i64_be(&mut self) -> AuditResult<i64> {
         let b = self.take(8)?;
-        Ok(i64::from_be_bytes([
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        ]))
+        let array: [u8; 8] = b
+            .try_into()
+            .map_err(|_| malformed_persisted_checkpoints("checkpoint file record is truncated"))?;
+        Ok(i64::from_be_bytes(array))
     }
 
     fn take_hash(&mut self) -> AuditResult<[u8; 32]> {
         let b = self.take(32)?;
-        let mut out = [0u8; 32];
-        out.copy_from_slice(b);
-        Ok(out)
+        // `try_into` instead of `copy_from_slice` (which panics on a length
+        // mismatch): `take(32)` already guarantees 32 bytes, but this stays
+        // panic-free even if that invariant is ever broken later (Bible R109).
+        b.try_into()
+            .map_err(|_| malformed_persisted_checkpoints("checkpoint file record is truncated"))
     }
 
     /// Ein `u64`-längenpräfigiertes Feld. Die Länge wird von `take` gegen die
@@ -522,62 +541,55 @@ pub fn load_and_verify_persisted_checkpoints(
 mod tests {
     use crypt_guard::{
         kem::backend::OsRng,
-        sign::{ml_dsa::MlDsa65Impl, SignAlgorithm},
+        sign::{SignAlgorithm, ml_dsa::MlDsa65Impl},
     };
 
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
-    fn signing_keypair() -> (SecretBox<[u8]>, Vec<u8>) {
+    fn signing_keypair() -> TestResult<(SecretBox<[u8]>, Vec<u8>)> {
         let mut rng = OsRng;
         let (signing_key, verification_key) =
-            MlDsa65Impl::keypair(&mut rng).expect("generate ML-DSA-65 test keypair");
+            MlDsa65Impl::keypair(&mut rng).map_err(ctx("generate ML-DSA-65 test keypair"))?;
 
-        (
+        Ok((
             SecretBox::new(signing_key.as_bytes().to_vec().into_boxed_slice()),
             verification_key.as_bytes().to_vec(),
-        )
+        ))
     }
 
     #[test]
-    fn emitted_checkpoint_round_trips_through_mldsa_verification() {
-        let (signing_seed, verification_key) = signing_keypair();
+    fn emitted_checkpoint_round_trips_through_mldsa_verification() -> TestResult {
+        let (signing_seed, verification_key) = signing_keypair()?;
         let mut checkpoints = CheckpointLog::new();
 
-        let checkpoint = checkpoints
-            .emit([0xA5; 32], 4, &signing_seed)
-            .expect("emit signed checkpoint")
-            .clone();
+        let checkpoint = checkpoints.emit([0xA5; 32], 4, &signing_seed)?.clone();
 
-        checkpoints
-            .verify_signature(&checkpoint, &verification_key)
-            .expect("verify ML-DSA-65 checkpoint signature");
-        checkpoints.verify_chain().expect("verify checkpoint chain");
+        checkpoints.verify_signature(&checkpoint, &verification_key)?;
+        checkpoints.verify_chain()?;
         assert_eq!(checkpoints.chain_head(), checkpoint_hash(&checkpoint));
+        Ok(())
     }
 
     #[test]
-    fn tampered_checkpoint_is_rejected_fail_closed() {
-        let (signing_seed, verification_key) = signing_keypair();
+    fn tampered_checkpoint_is_rejected_fail_closed() -> TestResult {
+        let (signing_seed, verification_key) = signing_keypair()?;
         let mut checkpoints = CheckpointLog::new();
-        let mut checkpoint = checkpoints
-            .emit([0x5A; 32], 9, &signing_seed)
-            .expect("emit signed checkpoint")
-            .clone();
+        let mut checkpoint = checkpoints.emit([0x5A; 32], 9, &signing_seed)?.clone();
         checkpoint.chain_head_hash[0] ^= 0x01;
 
         assert!(matches!(
             checkpoints.verify_signature(&checkpoint, &verification_key),
             Err(AuditError::InvalidCheckpointSignature { event_count: 9 })
         ));
+        Ok(())
     }
 
     #[test]
-    fn emit_rejects_non_monotonic_event_counts_without_advancing_the_chain() {
-        let (signing_seed, _) = signing_keypair();
+    fn emit_rejects_non_monotonic_event_counts_without_advancing_the_chain() -> TestResult {
+        let (signing_seed, _) = signing_keypair()?;
         let mut checkpoints = CheckpointLog::new();
-        checkpoints
-            .emit([0x11; 32], 3, &signing_seed)
-            .expect("emit first checkpoint");
+        checkpoints.emit([0x11; 32], 3, &signing_seed)?;
         let head = checkpoints.chain_head();
 
         assert!(matches!(
@@ -586,18 +598,15 @@ mod tests {
         ));
         assert_eq!(checkpoints.len(), 1);
         assert_eq!(checkpoints.chain_head(), head);
+        Ok(())
     }
 
     #[test]
-    fn verify_chain_reports_tampered_predecessor_hash() {
-        let (signing_seed, _) = signing_keypair();
+    fn verify_chain_reports_tampered_predecessor_hash() -> TestResult {
+        let (signing_seed, _) = signing_keypair()?;
         let mut checkpoints = CheckpointLog::new();
-        checkpoints
-            .emit([0x11; 32], 3, &signing_seed)
-            .expect("emit first checkpoint");
-        checkpoints
-            .emit([0x22; 32], 6, &signing_seed)
-            .expect("emit second checkpoint");
+        checkpoints.emit([0x11; 32], 3, &signing_seed)?;
+        checkpoints.emit([0x22; 32], 6, &signing_seed)?;
 
         let expected = checkpoint_hash(&checkpoints.checkpoints[0]);
         checkpoints.checkpoints[1].prev_checkpoint_hash = [0xA5; 32];
@@ -610,6 +619,7 @@ mod tests {
                 found: actual_found,
             }) if actual_expected == expected && actual_found == [0xA5; 32]
         ));
+        Ok(())
     }
 
     fn temp_path(label: &str) -> std::path::PathBuf {
@@ -642,13 +652,11 @@ mod tests {
         out
     }
 
-    fn two_checkpoint_log(signing_seed: &SecretBox<[u8]>) -> CheckpointLog {
+    fn two_checkpoint_log(signing_seed: &SecretBox<[u8]>) -> TestResult<CheckpointLog> {
         let mut log = CheckpointLog::new();
-        log.emit([0x11; 32], 3, signing_seed)
-            .expect("emit first checkpoint");
-        log.emit([0x22; 32], 6, signing_seed)
-            .expect("emit second checkpoint");
-        log
+        log.emit([0x11; 32], 3, signing_seed)?;
+        log.emit([0x22; 32], 6, signing_seed)?;
+        Ok(log)
     }
 
     #[test]
@@ -662,15 +670,13 @@ mod tests {
     }
 
     #[test]
-    fn intact_persisted_checkpoints_load_and_verify_without_a_key() {
-        let (signing_seed, _verification_key) = signing_keypair();
-        let log = two_checkpoint_log(&signing_seed);
+    fn intact_persisted_checkpoints_load_and_verify_without_a_key() -> TestResult {
+        let (signing_seed, _verification_key) = signing_keypair()?;
+        let log = two_checkpoint_log(&signing_seed)?;
         let path = temp_path("intact-no-key");
-        std::fs::write(&path, encode_persisted_checkpoints(log.checkpoints()))
-            .expect("write test checkpoint file");
+        std::fs::write(&path, encode_persisted_checkpoints(log.checkpoints()))?;
 
-        let status = load_and_verify_persisted_checkpoints(&path, 6, None)
-            .expect("structurally intact checkpoints load without a key");
+        let status = load_and_verify_persisted_checkpoints(&path, 6, None)?;
 
         assert_eq!(
             status,
@@ -680,19 +686,17 @@ mod tests {
             }
         );
         let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     #[test]
-    fn intact_persisted_checkpoints_verify_signatures_with_the_right_key() {
-        let (signing_seed, verification_key) = signing_keypair();
-        let log = two_checkpoint_log(&signing_seed);
+    fn intact_persisted_checkpoints_verify_signatures_with_the_right_key() -> TestResult {
+        let (signing_seed, verification_key) = signing_keypair()?;
+        let log = two_checkpoint_log(&signing_seed)?;
         let path = temp_path("intact-with-key");
-        std::fs::write(&path, encode_persisted_checkpoints(log.checkpoints()))
-            .expect("write test checkpoint file");
+        std::fs::write(&path, encode_persisted_checkpoints(log.checkpoints()))?;
 
-        let status =
-            load_and_verify_persisted_checkpoints(&path, 6, Some(&verification_key))
-                .expect("intact, correctly signed checkpoints verify");
+        let status = load_and_verify_persisted_checkpoints(&path, 6, Some(&verification_key))?;
 
         assert_eq!(
             status,
@@ -702,39 +706,46 @@ mod tests {
             }
         );
         let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     #[test]
-    fn wrong_verification_key_is_rejected_fail_closed() {
-        let (signing_seed, _matching_key) = signing_keypair();
-        let (_other_seed, mismatched_key) = signing_keypair();
-        let log = two_checkpoint_log(&signing_seed);
+    fn wrong_verification_key_is_rejected_fail_closed() -> TestResult {
+        let (signing_seed, _matching_key) = signing_keypair()?;
+        let (_other_seed, mismatched_key) = signing_keypair()?;
+        let log = two_checkpoint_log(&signing_seed)?;
         let path = temp_path("wrong-key");
-        std::fs::write(&path, encode_persisted_checkpoints(log.checkpoints()))
-            .expect("write test checkpoint file");
+        std::fs::write(&path, encode_persisted_checkpoints(log.checkpoints()))?;
 
-        let error = load_and_verify_persisted_checkpoints(&path, 6, Some(&mismatched_key))
-            .expect_err("a mismatched verification key must not verify");
+        let Err(error) = load_and_verify_persisted_checkpoints(&path, 6, Some(&mismatched_key))
+        else {
+            return Err(TestError::Unexpected(
+                "Err erwartet (mismatched verification key)".into(),
+            ));
+        };
         assert!(matches!(
             error,
             AuditError::InvalidCheckpointSignature { event_count: 3 }
         ));
         let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     #[test]
-    fn checkpoint_beyond_the_audit_log_length_is_reported() {
-        let (signing_seed, _) = signing_keypair();
-        let log = two_checkpoint_log(&signing_seed);
+    fn checkpoint_beyond_the_audit_log_length_is_reported() -> TestResult {
+        let (signing_seed, _) = signing_keypair()?;
+        let log = two_checkpoint_log(&signing_seed)?;
         let path = temp_path("beyond-log");
-        std::fs::write(&path, encode_persisted_checkpoints(log.checkpoints()))
-            .expect("write test checkpoint file");
+        std::fs::write(&path, encode_persisted_checkpoints(log.checkpoints()))?;
 
         // The second checkpoint claims event_count = 6; an audit log that
         // only reached event 5 means the log was truncated after that
         // checkpoint was signed.
-        let error = load_and_verify_persisted_checkpoints(&path, 5, None)
-            .expect_err("a checkpoint beyond the log length must not verify");
+        let Err(error) = load_and_verify_persisted_checkpoints(&path, 5, None) else {
+            return Err(TestError::Unexpected(
+                "Err erwartet (checkpoint beyond log length)".into(),
+            ));
+        };
         assert!(matches!(
             error,
             AuditError::CheckpointBeyondLog {
@@ -743,14 +754,14 @@ mod tests {
             }
         ));
         let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     #[test]
-    fn non_monotonic_event_counts_are_reported() {
-        let (signing_seed, _) = signing_keypair();
+    fn non_monotonic_event_counts_are_reported() -> TestResult {
+        let (signing_seed, _) = signing_keypair()?;
         let mut log = CheckpointLog::new();
-        log.emit([0x11; 32], 5, &signing_seed)
-            .expect("emit first checkpoint");
+        log.emit([0x11; 32], 5, &signing_seed)?;
         let first = log.checkpoints()[0].clone();
 
         // `CheckpointLog::emit` itself refuses a non-increasing event_count
@@ -766,89 +777,93 @@ mod tests {
         second.prev_checkpoint_hash = checkpoint_hash(&first);
 
         let path = temp_path("non-monotonic");
-        std::fs::write(&path, encode_persisted_checkpoints(&[first, second]))
-            .expect("write test checkpoint file");
+        std::fs::write(&path, encode_persisted_checkpoints(&[first, second]))?;
 
-        let error = load_and_verify_persisted_checkpoints(&path, u64::MAX, None)
-            .expect_err("non-increasing event_count values must not verify");
+        let Err(error) = load_and_verify_persisted_checkpoints(&path, u64::MAX, None) else {
+            return Err(TestError::Unexpected(
+                "Err erwartet (non-increasing event_count)".into(),
+            ));
+        };
         assert!(matches!(
             error,
             AuditError::NonMonotonicCheckpoint { index: 1 }
         ));
         let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     #[test]
-    fn truncated_checkpoint_file_is_a_load_error_not_a_crash_or_intact() {
-        let (signing_seed, _) = signing_keypair();
-        let log = two_checkpoint_log(&signing_seed);
+    fn truncated_checkpoint_file_is_a_load_error_not_a_crash_or_intact() -> TestResult {
+        let (signing_seed, _) = signing_keypair()?;
+        let log = two_checkpoint_log(&signing_seed)?;
         let bytes = encode_persisted_checkpoints(log.checkpoints());
         let truncated = &bytes[..bytes.len() / 2];
         let path = temp_path("truncated");
-        std::fs::write(&path, truncated).expect("write truncated test checkpoint file");
+        std::fs::write(&path, truncated)?;
 
         assert!(matches!(
             load_and_verify_persisted_checkpoints(&path, u64::MAX, None),
             Err(AuditError::Io(_))
         ));
         let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     #[test]
-    fn bad_checkpoint_header_is_a_load_error() {
+    fn bad_checkpoint_header_is_a_load_error() -> TestResult {
         let path = temp_path("bad-header");
-        std::fs::write(&path, b"not-a-checkpoint-file-at-all").expect("write garbage");
+        std::fs::write(&path, b"not-a-checkpoint-file-at-all")?;
 
         assert!(matches!(
             load_and_verify_persisted_checkpoints(&path, u64::MAX, None),
             Err(AuditError::Io(_))
         ));
         let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     #[test]
-    fn trailing_bytes_after_declared_checkpoint_count_are_a_load_error() {
-        let (signing_seed, _) = signing_keypair();
-        let log = two_checkpoint_log(&signing_seed);
+    fn trailing_bytes_after_declared_checkpoint_count_are_a_load_error() -> TestResult {
+        let (signing_seed, _) = signing_keypair()?;
+        let log = two_checkpoint_log(&signing_seed)?;
         let mut bytes = encode_persisted_checkpoints(log.checkpoints());
         bytes.extend_from_slice(b"trailing-garbage");
         let path = temp_path("trailing");
-        std::fs::write(&path, &bytes).expect("write test checkpoint file with trailing bytes");
+        std::fs::write(&path, &bytes)?;
 
         assert!(matches!(
             load_and_verify_persisted_checkpoints(&path, u64::MAX, None),
             Err(AuditError::Io(_))
         ));
         let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     #[test]
-    fn empty_valid_checkpoint_file_is_intact_with_zero_checkpoints() {
+    fn empty_valid_checkpoint_file_is_intact_with_zero_checkpoints() -> TestResult {
         let path = temp_path("empty");
-        std::fs::write(&path, encode_persisted_checkpoints(&[]))
-            .expect("write empty test checkpoint file");
+        std::fs::write(&path, encode_persisted_checkpoints(&[]))?;
 
         assert_eq!(
-            load_and_verify_persisted_checkpoints(&path, 0, None)
-                .expect("an empty checkpoint file is intact"),
+            load_and_verify_persisted_checkpoints(&path, 0, None)?,
             PersistedCheckpointStatus::Intact {
                 checkpoint_count: 0,
                 signatures_checked: false,
             }
         );
         let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_checkpoint_symlink_is_refused_not_dereferenced() {
-        let (signing_seed, _) = signing_keypair();
-        let log = two_checkpoint_log(&signing_seed);
+    fn a_checkpoint_symlink_is_refused_not_dereferenced() -> TestResult {
+        let (signing_seed, _) = signing_keypair()?;
+        let log = two_checkpoint_log(&signing_seed)?;
         let target = temp_path("symlink-target");
-        std::fs::write(&target, encode_persisted_checkpoints(log.checkpoints()))
-            .expect("write symlink target");
+        std::fs::write(&target, encode_persisted_checkpoints(log.checkpoints()))?;
         let link = temp_path("symlink-link");
-        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+        std::os::unix::fs::symlink(&target, &link)?;
 
         assert!(matches!(
             load_and_verify_persisted_checkpoints(&link, u64::MAX, None),
@@ -856,5 +871,6 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&target);
         let _ = std::fs::remove_file(&link);
+        Ok(())
     }
 }

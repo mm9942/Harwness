@@ -41,10 +41,14 @@
 //! gehören sie dort ergänzt — eine dokumentierte, keine übersehene Lücke.
 //!
 //! # Fehler
-//! Keine: die lokal-vertraute Decke entsteht aus
+//! [`root_ceiling`] selbst ist unfehlbar (`ContextCeiling`, kein `Result`):
+//! die lokal-vertraute Decke entsteht aus
 //! [`harw_context::ceiling::ROOT_CONTEXT_SECTIONS`] und
 //! `LOCAL_ROOT_BUDGET_TOTAL`, die geschlossene Decke aus Literalen dieser
-//! Funktion.
+//! Funktion. Eine ungültige Sektionskonstante (Vertragsbruch von
+//! `harw-context`) wird nicht mehr per `expect` paniken gelassen, sondern
+//! still übersprungen und mit `tracing::warn!` protokolliert (Bible
+//! R087/R165).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -106,17 +110,27 @@ const LOCAL_ROOT_BUDGET_TOTAL: u32 = 1_000_000;
 pub fn root_ceiling(policy: CeilingPolicy) -> ContextCeiling {
     match policy {
         CeilingPolicy::LocalRoot => ContextCeiling {
-            // Ein einzelnes `expect` über alle Namen statt eines je Name: die
+            // Kein `expect` mehr über alle Namen (Bible R087/R165): die
             // Literale sind konstant und nicht leer (harw-context prüft dies
-            // selbst in `test_root_context_sections_are_valid_unique_and_contain_legacy_v1`);
-            // ein Fehlschlag hier wäre ein Vertragsbruch von `harw-context`,
-            // kein Laufzeitzustand dieser Datei.
+            // selbst in `test_root_context_sections_are_valid_unique_and_contain_legacy_v1`),
+            // ein Fehlschlag hier wäre also ein Vertragsbruch von
+            // `harw-context`, kein Laufzeitzustand dieser Datei — deshalb
+            // still übersprungen und geloggt statt paniken zu lassen.
             sections: ROOT_CONTEXT_SECTIONS
                 .iter()
                 .copied()
-                .map(SectionName::try_new)
-                .collect::<Result<_, _>>()
-                .expect("ROOT_CONTEXT_SECTIONS are valid section names by construction"),
+                .filter_map(|name| match SectionName::try_new(name) {
+                    Ok(section) => Some(section),
+                    Err(error) => {
+                        tracing::warn!(
+                            name,
+                            %error,
+                            "runtime.ceiling.invalid_root_section_skipped"
+                        );
+                        None
+                    }
+                })
+                .collect(),
             max_trust: TrustClass::Instruction,
             budget: ContextBudgetSpec {
                 total: harw_lens_types::BudgetSpec {
@@ -140,6 +154,7 @@ pub fn root_ceiling(policy: CeilingPolicy) -> ContextCeiling {
 mod tests {
     use super::*;
     use crate::spec::EntryKind;
+    use crate::test_support::{TestResult, ctx};
 
     const ALL_ENTRIES: [EntryKind; 11] = [
         EntryKind::Tui,
@@ -155,8 +170,8 @@ mod tests {
         EntryKind::GatewayDream,
     ];
 
-    fn section(name: &str) -> SectionName {
-        SectionName::try_new(name).expect("test section name is valid")
+    fn section(name: &str) -> TestResult<SectionName> {
+        SectionName::try_new(name).map_err(ctx("test section name is valid"))
     }
 
     #[test]
@@ -169,31 +184,35 @@ mod tests {
     }
 
     #[test]
-    fn local_root_ceiling_carries_exactly_root_context_sections_including_legacy_v1() {
+    fn local_root_ceiling_carries_exactly_root_context_sections_including_legacy_v1() -> TestResult
+    {
         let ceiling = root_ceiling(CeilingPolicy::LocalRoot);
-        let expected: BTreeSet<SectionName> =
-            ROOT_CONTEXT_SECTIONS.iter().map(|name| section(name)).collect();
+        let expected: BTreeSet<SectionName> = ROOT_CONTEXT_SECTIONS
+            .iter()
+            .map(|name| section(name))
+            .collect::<TestResult<_>>()?;
         assert_eq!(ceiling.sections, expected);
         assert!(
             ceiling
                 .sections
-                .contains(&section(harw_context::ceiling::LEGACY_V1_SECTION))
+                .contains(&section(harw_context::ceiling::LEGACY_V1_SECTION)?)
         );
         assert!(
             ceiling
                 .sections
-                .contains(&section(harw_core::HISTORY_TAIL_SECTION))
+                .contains(&section(harw_core::HISTORY_TAIL_SECTION)?)
         );
         for name in ["task.objective", "task.read_scope", "new.trigger_return"] {
-            assert!(ceiling.sections.contains(&section(name)), "{name}");
+            assert!(ceiling.sections.contains(&section(name)?), "{name}");
         }
         assert_eq!(ceiling.sections.len(), ROOT_CONTEXT_SECTIONS.len());
         assert_eq!(ceiling.max_trust, TrustClass::Instruction);
         assert_eq!(ceiling.budget.total.total, LOCAL_ROOT_BUDGET_TOTAL);
+        Ok(())
     }
 
     #[test]
-    fn local_root_ceiling_excludes_credentials_and_foreign_transcripts() {
+    fn local_root_ceiling_excludes_credentials_and_foreign_transcripts() -> TestResult {
         let ceiling = root_ceiling(CeilingPolicy::LocalRoot);
         for name in [
             "credential.tokens",
@@ -205,8 +224,9 @@ mod tests {
             "knowledge.candidates",
             "diff.changeset",
         ] {
-            assert!(!ceiling.sections.contains(&section(name)), "{name}");
+            assert!(!ceiling.sections.contains(&section(name)?), "{name}");
         }
+        Ok(())
     }
 
     #[test]

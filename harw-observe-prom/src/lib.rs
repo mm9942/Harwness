@@ -102,3 +102,7 @@ mod sink;
 pub use endpoint::{BindAddr, PromEndpoint};
 pub use error::{PromError, PromResult};
 pub use sink::PromSink;
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

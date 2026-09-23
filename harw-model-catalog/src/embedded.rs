@@ -35,16 +35,19 @@ struct Catalog {
 pub fn embedded_catalog() -> Vec<ProviderSpec> {
     match toml::from_str::<Catalog>(EMBEDDED) {
         Ok(catalog) => catalog.provider,
-        Err(error) => {
-            debug_assert!(false, "eingebettetes providers.toml parst nicht: {error}");
-            Vec::new()
-        }
+        // Diese Crate hat keine `tracing`-Abhängigkeit (Cargo.toml geprüft),
+        // daher hier ersatzlos kein Logging statt `debug_assert!(false, …)`
+        // (Bible R087/R165: kein Panic, auch nicht in Debug-Builds). Der
+        // Release-Fallback (leere Liste) bleibt unverändert; Parsbarkeit ist
+        // über `embedded_catalog_parses_and_is_nonempty` abgedeckt.
+        Err(_error) => Vec::new(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn embedded_catalog_parses_and_is_nonempty() {
@@ -65,12 +68,19 @@ mod tests {
     }
 
     #[test]
-    fn embedded_catalog_has_current_snapshot() {
+    fn embedded_catalog_has_current_snapshot() -> TestResult {
         let catalog = embedded_catalog();
-        let openai = catalog.iter().find(|p| p.id == "openai").unwrap();
+        let openai = catalog
+            .iter()
+            .find(|p| p.id == "openai")
+            .ok_or(TestError::Missing("openai provider"))?;
         assert!(openai.models.iter().any(|id| id == "gpt-6-astra"));
-        let cloudflare = catalog.iter().find(|p| p.id == "cloudflare").unwrap();
+        let cloudflare = catalog
+            .iter()
+            .find(|p| p.id == "cloudflare")
+            .ok_or(TestError::Missing("cloudflare provider"))?;
         assert!(!cloudflare.models.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -97,20 +107,25 @@ mod tests {
     }
 
     #[test]
-    fn embedded_catalog_zai_has_glm_4_6() {
+    fn embedded_catalog_zai_has_glm_4_6() -> TestResult {
         let cat = embedded_catalog();
-        let zai = cat.iter().find(|p| p.id == "zai").expect("zai present");
+        let zai = cat
+            .iter()
+            .find(|p| p.id == "zai")
+            .ok_or(TestError::Missing("zai provider"))?;
         assert_eq!(zai.default_model.as_deref(), Some("glm-4.6"));
         assert!(zai.models.iter().any(|m| m == "glm-4.6"));
+        Ok(())
     }
 
     #[test]
-    fn embedded_catalog_moonshot_has_kimi() {
+    fn embedded_catalog_moonshot_has_kimi() -> TestResult {
         let cat = embedded_catalog();
         let m = cat
             .iter()
             .find(|p| p.id == "moonshot")
-            .expect("moonshot present");
+            .ok_or(TestError::Missing("moonshot provider"))?;
         assert!(m.models.iter().any(|x| x == "kimi-k2.7-code"));
+        Ok(())
     }
 }

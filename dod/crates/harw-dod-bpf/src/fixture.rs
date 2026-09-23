@@ -187,7 +187,11 @@ impl BpfLoader for FixtureBpfLoader {
     ///
     /// # Errors
     /// Keine — schlägt nie fehl.
-    fn read_events(&self, _handle: &BpfHandle, _timeout: Duration) -> Result<Vec<RawBpfEvent>, BpfError> {
+    fn read_events(
+        &self,
+        _handle: &BpfHandle,
+        _timeout: Duration,
+    ) -> Result<Vec<RawBpfEvent>, BpfError> {
         let mut queue = self
             .events
             .lock()
@@ -203,6 +207,7 @@ mod tests {
     use crate::event::RawBpfEvent;
     use crate::loader::BpfLoader;
     use crate::spec::{BpfProgramKind, BpfProgramSource, BpfProgramSpec};
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_types::SensorId;
     use std::borrow::Cow;
     use std::time::Duration;
@@ -226,48 +231,65 @@ mod tests {
     }
 
     #[test]
-    fn test_load_with_capability_succeeds_and_carries_spec_fields() {
+    fn test_load_with_capability_succeeds_and_carries_spec_fields() -> TestResult {
         let loader = FixtureBpfLoader::new(Vec::new());
         let spec = sample_spec();
-        let handle = loader.load(&spec).expect("fixture loader with capability succeeds");
+        let handle = loader
+            .load(&spec)
+            .map_err(ctx("fixture loader with capability succeeds"))?;
         assert_eq!(handle.sensor(), &spec.sensor);
         assert_eq!(handle.kind(), spec.kind);
         assert_eq!(handle.attach_point(), spec.attach_point);
+        Ok(())
     }
 
     #[test]
-    fn test_load_without_capability_returns_capability_unavailable() {
+    fn test_load_without_capability_returns_capability_unavailable() -> TestResult {
         let loader = FixtureBpfLoader::without_capability();
-        let err = loader.load(&sample_spec()).expect_err("must fail without capability");
+        let result = loader.load(&sample_spec());
+        let Err(err) = result else {
+            return Err(TestError::Unexpected("must fail without capability".into()));
+        };
         assert!(matches!(err, BpfError::CapabilityUnavailable));
+        Ok(())
     }
 
     #[test]
-    fn test_read_events_returns_exactly_the_configured_events() {
+    fn test_read_events_returns_exactly_the_configured_events() -> TestResult {
         let events = vec![sample_event(1), sample_event(2)];
         let loader = FixtureBpfLoader::new(events.clone());
-        let handle = loader.load(&sample_spec()).expect("fixture loader with capability succeeds");
+        let handle = loader
+            .load(&sample_spec())
+            .map_err(ctx("fixture loader with capability succeeds"))?;
 
         let read_back = loader
             .read_events(&handle, Duration::from_millis(0))
-            .expect("fixture read_events never fails");
+            .map_err(ctx("fixture read_events never fails"))?;
         assert_eq!(read_back, events);
+        Ok(())
     }
 
     #[test]
-    fn test_read_events_drains_the_queue_so_a_second_call_is_empty() {
+    fn test_read_events_drains_the_queue_so_a_second_call_is_empty() -> TestResult {
         let loader = FixtureBpfLoader::new(vec![sample_event(1)]);
-        let handle = loader.load(&sample_spec()).expect("fixture loader with capability succeeds");
+        let handle = loader
+            .load(&sample_spec())
+            .map_err(ctx("fixture loader with capability succeeds"))?;
 
-        let first = loader.read_events(&handle, Duration::from_millis(0)).unwrap();
+        let first = loader
+            .read_events(&handle, Duration::from_millis(0))
+            .map_err(ctx("read_events"))?;
         assert_eq!(first.len(), 1);
 
-        let second = loader.read_events(&handle, Duration::from_millis(0)).unwrap();
+        let second = loader
+            .read_events(&handle, Duration::from_millis(0))
+            .map_err(ctx("read_events"))?;
         assert!(second.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_without_capability_read_events_is_always_empty() {
+    fn test_without_capability_read_events_is_always_empty() -> TestResult {
         let loader = FixtureBpfLoader::without_capability();
         // `read_events` selbst kennt keine Berechtigungsprüfung — nur `load`
         // meldet `CapabilityUnavailable`. Ein Aufrufer, der `read_events`
@@ -278,7 +300,10 @@ mod tests {
             BpfProgramKind::Tracepoint,
             "syscalls:sys_enter_execve",
         );
-        let events = loader.read_events(&handle, Duration::from_millis(0)).unwrap();
+        let events = loader
+            .read_events(&handle, Duration::from_millis(0))
+            .map_err(ctx("read_events"))?;
         assert!(events.is_empty());
+        Ok(())
     }
 }

@@ -844,30 +844,31 @@ impl JobStore {
             }
             record.lease = None;
             record.lease_epoch = record.lease_epoch.saturating_add(1);
-            let retry_scheduled_for = match record.job.record_failure(now) {
-                Ok(delay) => Some(now.checked_add(delay).map_err(|error| {
-                    SessionStoreError::JobRuntime {
-                        work_id: work_id.clone(),
-                        detail: error.to_string(),
+            let retry_scheduled_for =
+                match record.job.record_failure(now) {
+                    Ok(delay) => Some(now.checked_add(delay).map_err(|error| {
+                        SessionStoreError::JobRuntime {
+                            work_id: work_id.clone(),
+                            detail: error.to_string(),
+                        }
+                    })?),
+                    Err(JobRuntimeError::RetryExhausted { .. }) => {
+                        record.completion = Some(JobCompletion {
+                            completed_at: now,
+                            outcome: JobOutcome::Failed {
+                                reason: "worker lease expired and retry budget is exhausted"
+                                    .to_owned(),
+                            },
+                        });
+                        None
                     }
-                })?),
-                Err(JobRuntimeError::RetryExhausted { .. }) => {
-                    record.completion = Some(JobCompletion {
-                        completed_at: now,
-                        outcome: JobOutcome::Failed {
-                            reason: "worker lease expired and retry budget is exhausted"
-                                .to_owned(),
-                        },
-                    });
-                    None
-                }
-                Err(error) => {
-                    return Err(SessionStoreError::JobRuntime {
-                        work_id: work_id.clone(),
-                        detail: error.to_string(),
-                    });
-                }
-            };
+                    Err(error) => {
+                        return Err(SessionStoreError::JobRuntime {
+                            work_id: work_id.clone(),
+                            detail: error.to_string(),
+                        });
+                    }
+                };
             if let Some(not_before) = retry_scheduled_for {
                 record.not_before = not_before;
             }
@@ -905,10 +906,7 @@ impl JobStore {
         match serde_json::from_slice::<StoredJob>(&bytes) {
             Ok(record) if Some(record.job.id.as_str()) == expected => Some(record),
             Ok(_) => {
-                self.quarantine_listed_record(
-                    path,
-                    "record id does not match its canonical path",
-                );
+                self.quarantine_listed_record(path, "record id does not match its canonical path");
                 None
             }
             Err(error) => {
@@ -1293,20 +1291,27 @@ fn unlock<T>(lock: File, result: SessionStoreResult<T>) -> SessionStoreResult<T>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_job_runtime::{Budget, Job, JobKind, RetryPolicy};
     use harw_observe::TraceContext;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, PoisonError};
 
     #[derive(Default)]
     struct RecordingSink(Mutex<Vec<JobLifecycleEvent>>);
 
     impl JobEventSink for RecordingSink {
         fn publish(&self, event: JobLifecycleEvent) {
-            self.0.lock().unwrap().push(event);
+            // Trait-Signatur liefert `()`; ein vergifteter Mutex darf in
+            // Tests trotzdem nicht paniken, deshalb wird der Guard aus dem
+            // `PoisonError` zurückgewonnen statt `.unwrap()` aufzurufen.
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(event);
         }
     }
 
-    fn record(id: &str) -> StoredJob {
+    fn record(id: &str) -> TestResult<StoredJob> {
         let now = Timestamp::now();
         let mut job = Job::new(
             WorkId::from_str(id),
@@ -1320,8 +1325,9 @@ mod tests {
             },
             now,
         );
-        job.mark_ready(now).unwrap();
-        StoredJob {
+        job.mark_ready(now)
+            .map_err(ctx("mark_ready on a fresh job"))?;
+        Ok(StoredJob {
             job,
             scope: harw_job_runtime::JobScope::new(
                 harw_types::TenantId::from_str("test-tenant"),
@@ -1339,7 +1345,7 @@ mod tests {
             cancellation: None,
             revision: 0,
             trace: None,
-        }
+        })
     }
 
     fn sample_trace() -> TraceContext {
@@ -1351,72 +1357,71 @@ mod tests {
     }
 
     #[test]
-    fn admitted_job_with_trace_context_roundtrips_through_the_real_store_path() {
-        let temp = tempfile::tempdir().unwrap();
+    fn admitted_job_with_trace_context_roundtrips_through_the_real_store_path() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = JobStore::new(temp.path());
         let admitted = StoredJob {
             trace: Some(sample_trace()),
-            ..record("work-traced")
+            ..record("work-traced")?
         };
 
-        store.admit(&admitted).unwrap();
+        store.admit(&admitted)?;
 
-        let persisted = store.get(&WorkId::from_str("work-traced")).unwrap();
+        let persisted = store.get(&WorkId::from_str("work-traced"))?;
         assert_eq!(persisted, admitted);
         assert_eq!(persisted.trace, Some(sample_trace()));
+        Ok(())
     }
 
     #[test]
-    fn admitted_job_without_trace_context_roundtrips_through_the_real_store_path() {
-        let temp = tempfile::tempdir().unwrap();
+    fn admitted_job_without_trace_context_roundtrips_through_the_real_store_path() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = JobStore::new(temp.path());
-        let admitted = record("work-untraced");
+        let admitted = record("work-untraced")?;
         assert_eq!(admitted.trace, None);
 
-        store.admit(&admitted).unwrap();
+        store.admit(&admitted)?;
 
-        let persisted = store.get(&WorkId::from_str("work-untraced")).unwrap();
+        let persisted = store.get(&WorkId::from_str("work-untraced"))?;
         assert_eq!(persisted, admitted);
         assert_eq!(persisted.trace, None);
+        Ok(())
     }
 
     #[test]
-    fn a_stale_worker_cannot_complete_after_reconciliation_and_reclaim() {
-        let temp = tempfile::tempdir().unwrap();
+    fn a_stale_worker_cannot_complete_after_reconciliation_and_reclaim() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = JobStore::new(temp.path());
-        store.admit(&record("work-1")).unwrap();
+        store.admit(&record("work-1")?)?;
         let now = Timestamp::now();
-        let first = store
-            .claim(
-                &WorkId::from_str("work-1"),
-                &ClaimRequest {
-                    worker_id: "worker-a".to_owned(),
-                    lease_ttl: SignedDuration::from_secs(1),
-                    now,
-                },
-            )
-            .unwrap();
-        let after_expiry = now.checked_add(SignedDuration::from_secs(2)).unwrap();
+        let first = store.claim(
+            &WorkId::from_str("work-1"),
+            &ClaimRequest {
+                worker_id: "worker-a".to_owned(),
+                lease_ttl: SignedDuration::from_secs(1),
+                now,
+            },
+        )?;
+        let after_expiry = now
+            .checked_add(SignedDuration::from_secs(2))
+            .map_err(ctx("now + 2s"))?;
         assert_eq!(
             store
-                .reconcile_expired(after_expiry, 100, None)
-                .unwrap()
+                .reconcile_expired(after_expiry, 100, None)?
                 .expired
                 .len(),
             1
         );
-        let second = store
-            .claim(
-                &WorkId::from_str("work-1"),
-                &ClaimRequest {
-                    worker_id: "worker-b".to_owned(),
-                    lease_ttl: SignedDuration::from_secs(60),
-                    now: after_expiry
-                        .checked_add(SignedDuration::from_secs(2))
-                        .unwrap(),
-                },
-            )
-            .unwrap();
+        let second = store.claim(
+            &WorkId::from_str("work-1"),
+            &ClaimRequest {
+                worker_id: "worker-b".to_owned(),
+                lease_ttl: SignedDuration::from_secs(60),
+                now: after_expiry
+                    .checked_add(SignedDuration::from_secs(2))
+                    .map_err(ctx("after_expiry + 2s"))?,
+            },
+        )?;
         assert!(second.token.epoch > first.token.epoch);
         assert!(matches!(
             store.complete(
@@ -1431,39 +1436,38 @@ mod tests {
             ),
             Err(SessionStoreError::LeaseTokenMismatch { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn cancellation_fences_a_running_lease_and_keeps_scope_immutable() {
-        let temp = tempfile::tempdir().unwrap();
+    fn cancellation_fences_a_running_lease_and_keeps_scope_immutable() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = JobStore::new(temp.path());
-        let admitted = record("work-cancel");
+        let admitted = record("work-cancel")?;
         let scope = admitted.scope.clone();
-        store.admit(&admitted).unwrap();
+        store.admit(&admitted)?;
         let now = Timestamp::now();
-        let claim = store
-            .claim(
-                &WorkId::from_str("work-cancel"),
-                &ClaimRequest {
-                    worker_id: "worker-a".to_owned(),
-                    lease_ttl: SignedDuration::from_secs(60),
-                    now,
+        let claim = store.claim(
+            &WorkId::from_str("work-cancel"),
+            &ClaimRequest {
+                worker_id: "worker-a".to_owned(),
+                lease_ttl: SignedDuration::from_secs(60),
+                now,
+            },
+        )?;
+        let cancelled_at = now
+            .checked_add(SignedDuration::from_secs(1))
+            .map_err(ctx("now + 1s"))?;
+        let transition = store.cancel(
+            &WorkId::from_str("work-cancel"),
+            &CancelRequest {
+                cancelled_at,
+                cancelled_by: ApprovalActor::Operator {
+                    id: "operator-a".to_owned(),
                 },
-            )
-            .unwrap();
-        let cancelled_at = now.checked_add(SignedDuration::from_secs(1)).unwrap();
-        let transition = store
-            .cancel(
-                &WorkId::from_str("work-cancel"),
-                &CancelRequest {
-                    cancelled_at,
-                    cancelled_by: ApprovalActor::Operator {
-                        id: "operator-a".to_owned(),
-                    },
-                    reason: "operator stopped the task".to_owned(),
-                },
-            )
-            .unwrap();
+                reason: "operator stopped the task".to_owned(),
+            },
+        )?;
         assert_eq!(transition.previous_state, JobState::Running);
         assert_eq!(transition.prior_lease, Some(claim.lease.clone()));
         assert_eq!(claim.scope, scope);
@@ -1472,7 +1476,7 @@ mod tests {
             JobOutcome::Cancelled { .. }
         ));
 
-        let persisted = store.get(&WorkId::from_str("work-cancel")).unwrap();
+        let persisted = store.get(&WorkId::from_str("work-cancel"))?;
         assert_eq!(persisted.scope, scope);
         assert_eq!(persisted.job.state, JobState::Cancelled);
         assert!(persisted.lease.is_none());
@@ -1492,76 +1496,78 @@ mod tests {
             }),
             Err(SessionStoreError::LeaseTokenMismatch { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn cancellation_accepts_pending_and_ready_jobs_without_a_lease() {
-        let temp = tempfile::tempdir().unwrap();
+    fn cancellation_accepts_pending_and_ready_jobs_without_a_lease() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = JobStore::new(temp.path());
         let now = Timestamp::now();
-        let mut pending = record("work-pending");
+        let mut pending = record("work-pending")?;
         pending.job.state = JobState::Pending;
-        store.admit(&pending).unwrap();
-        store.admit(&record("work-ready")).unwrap();
+        store.admit(&pending)?;
+        store.admit(&record("work-ready")?)?;
 
         for work_id in ["work-pending", "work-ready"] {
-            let transition = store
-                .cancel(
-                    &WorkId::from_str(work_id),
-                    &CancelRequest {
-                        cancelled_at: now,
-                        cancelled_by: ApprovalActor::Operator {
-                            id: "operator-a".to_owned(),
-                        },
-                        reason: "superseded".to_owned(),
+            let transition = store.cancel(
+                &WorkId::from_str(work_id),
+                &CancelRequest {
+                    cancelled_at: now,
+                    cancelled_by: ApprovalActor::Operator {
+                        id: "operator-a".to_owned(),
                     },
-                )
-                .unwrap();
+                    reason: "superseded".to_owned(),
+                },
+            )?;
             assert!(matches!(
                 transition.previous_state,
                 JobState::Pending | JobState::Ready
             ));
             assert!(transition.prior_lease.is_none());
-            let persisted = store.get(&WorkId::from_str(work_id)).unwrap();
+            let persisted = store.get(&WorkId::from_str(work_id))?;
             assert_eq!(persisted.job.state, JobState::Cancelled);
             assert_eq!(persisted.lease_epoch, 0);
         }
+        Ok(())
     }
 
     #[test]
-    fn durable_transitions_publish_only_redacted_state_and_revision() {
-        let temp = tempfile::tempdir().unwrap();
+    fn durable_transitions_publish_only_redacted_state_and_revision() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let sink = Arc::new(RecordingSink::default());
         let store = JobStore::new_with_event_sink(temp.path(), sink.clone());
         let work_id = WorkId::from_str("work-events");
-        store.admit(&record(work_id.as_str())).unwrap();
+        store.admit(&record(work_id.as_str())?)?;
         let now = Timestamp::now();
 
-        let claim = store
-            .claim(
-                &work_id,
-                &ClaimRequest {
-                    worker_id: "worker-a".to_owned(),
-                    lease_ttl: SignedDuration::from_secs(60),
-                    now,
+        let claim = store.claim(
+            &work_id,
+            &ClaimRequest {
+                worker_id: "worker-a".to_owned(),
+                lease_ttl: SignedDuration::from_secs(60),
+                now,
+            },
+        )?;
+        let completed_at = now
+            .checked_add(SignedDuration::from_secs(1))
+            .map_err(ctx("now + 1s"))?;
+        store.complete(
+            &work_id,
+            &CompleteRequest {
+                token: claim.token,
+                completed_at,
+                outcome: JobOutcome::Succeeded {
+                    result: serde_json::json!({"secret": "must-not-publish"}),
                 },
-            )
-            .unwrap();
-        let completed_at = now.checked_add(SignedDuration::from_secs(1)).unwrap();
-        store
-            .complete(
-                &work_id,
-                &CompleteRequest {
-                    token: claim.token,
-                    completed_at,
-                    outcome: JobOutcome::Succeeded {
-                        result: serde_json::json!({"secret": "must-not-publish"}),
-                    },
-                },
-            )
-            .unwrap();
+            },
+        )?;
 
-        let events = sink.0.lock().unwrap().clone();
+        let events = sink
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         assert_eq!(
             events,
             vec![
@@ -1577,49 +1583,52 @@ mod tests {
                 },
             ]
         );
-        let encoded = serde_json::to_string(&events).unwrap();
+        let encoded = serde_json::to_string(&events)?;
         assert!(!encoded.contains("secret"));
         assert!(!encoded.contains("worker-a"));
+        Ok(())
     }
 
     #[test]
-    fn cancellation_and_reconciliation_publish_terminal_and_retry_states() {
-        let temp = tempfile::tempdir().unwrap();
+    fn cancellation_and_reconciliation_publish_terminal_and_retry_states() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let sink = Arc::new(RecordingSink::default());
         let store = JobStore::new_with_event_sink(temp.path(), sink.clone());
         let cancelled_id = WorkId::from_str("work-cancel-event");
-        store.admit(&record(cancelled_id.as_str())).unwrap();
-        store
-            .cancel(
-                &cancelled_id,
-                &CancelRequest {
-                    cancelled_at: Timestamp::now(),
-                    cancelled_by: ApprovalActor::Operator {
-                        id: "operator-a".to_owned(),
-                    },
-                    reason: "stop".to_owned(),
+        store.admit(&record(cancelled_id.as_str())?)?;
+        store.cancel(
+            &cancelled_id,
+            &CancelRequest {
+                cancelled_at: Timestamp::now(),
+                cancelled_by: ApprovalActor::Operator {
+                    id: "operator-a".to_owned(),
                 },
-            )
-            .unwrap();
+                reason: "stop".to_owned(),
+            },
+        )?;
 
         let expired_id = WorkId::from_str("work-reconcile-event");
-        store.admit(&record(expired_id.as_str())).unwrap();
+        store.admit(&record(expired_id.as_str())?)?;
         let started = Timestamp::now();
-        store
-            .claim(
-                &expired_id,
-                &ClaimRequest {
-                    worker_id: "worker-b".to_owned(),
-                    lease_ttl: SignedDuration::from_secs(1),
-                    now: started,
-                },
-            )
-            .unwrap();
-        let after_expiry = started.checked_add(SignedDuration::from_secs(2)).unwrap();
-        let expired = store.reconcile_expired(after_expiry, 100, None).unwrap();
+        store.claim(
+            &expired_id,
+            &ClaimRequest {
+                worker_id: "worker-b".to_owned(),
+                lease_ttl: SignedDuration::from_secs(1),
+                now: started,
+            },
+        )?;
+        let after_expiry = started
+            .checked_add(SignedDuration::from_secs(2))
+            .map_err(ctx("started + 2s"))?;
+        let expired = store.reconcile_expired(after_expiry, 100, None)?;
         assert_eq!(expired.expired.len(), 1);
 
-        let events = sink.0.lock().unwrap().clone();
+        let events = sink
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         assert_eq!(events[0].state, JobState::Cancelled);
         assert_eq!(events[0].revision, 1);
         assert_eq!(events[1].state, JobState::Running);
@@ -1627,76 +1636,80 @@ mod tests {
         assert_eq!(events[2].state, JobState::Ready);
         assert_eq!(events[2].revision, 2);
         assert!(events.windows(2).skip(1).all(|pair| pair[1].revision > 0));
+        Ok(())
     }
 
     #[test]
-    fn sync_parent_directory_reports_a_missing_directory_without_panicking() {
-        let temp = tempfile::tempdir().unwrap();
+    fn sync_parent_directory_reports_a_missing_directory_without_panicking() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let missing = temp.path().join("does-not-exist");
 
         assert!(matches!(
             sync_parent_directory(&missing),
             Err(SessionStoreError::Io(_))
         ));
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn list_skips_symlinked_json_records() {
+    fn list_skips_symlinked_json_records() -> TestResult {
         use std::os::unix::fs::symlink;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir()?;
         let store = JobStore::new(temp.path());
-        store.admit(&record("work-regular")).unwrap();
+        store.admit(&record("work-regular")?)?;
 
         let external = temp.path().join("external.json");
-        std::fs::write(&external, b"not a durable job").unwrap();
-        symlink(&external, store.records_dir().join("work-linked.json")).unwrap();
+        std::fs::write(&external, b"not a durable job")?;
+        symlink(&external, store.records_dir().join("work-linked.json"))?;
 
-        let page = store.list(&JobListQuery::default()).unwrap();
+        let page = store.list(&JobListQuery::default())?;
 
         assert_eq!(page.jobs.len(), 1);
         assert_eq!(page.jobs[0].job.id, WorkId::from_str("work-regular"));
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn get_rejects_a_symlinked_job_record_without_reading_its_target() {
+    fn get_rejects_a_symlinked_job_record_without_reading_its_target() -> TestResult {
         use std::os::unix::fs::symlink;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir()?;
         let store = JobStore::new(temp.path());
         let work_id = WorkId::from_str("work-linked-read");
-        store.admit(&record(work_id.as_str())).unwrap();
+        store.admit(&record(work_id.as_str())?)?;
 
-        let path = store.record_path(&work_id).unwrap();
-        std::fs::remove_file(&path).unwrap();
+        let path = store.record_path(&work_id)?;
+        std::fs::remove_file(&path)?;
         let external = temp.path().join("external-record.json");
-        let external_record = record("work-linked-read");
-        let external_bytes = serde_json::to_vec(&external_record).unwrap();
-        std::fs::write(&external, &external_bytes).unwrap();
-        symlink(&external, &path).unwrap();
+        let external_record = record("work-linked-read")?;
+        let external_bytes = serde_json::to_vec(&external_record)?;
+        std::fs::write(&external, &external_bytes)?;
+        symlink(&external, &path)?;
 
         assert!(matches!(store.get(&work_id), Err(SessionStoreError::Io(_))));
-        assert_eq!(std::fs::read(&external).unwrap(), external_bytes);
+        assert_eq!(std::fs::read(&external)?, external_bytes);
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn mutation_rejects_a_symlinked_job_record_without_overwriting_its_target() {
+    fn mutation_rejects_a_symlinked_job_record_without_overwriting_its_target() -> TestResult {
         use std::os::unix::fs::symlink;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir()?;
         let store = JobStore::new(temp.path());
         let work_id = WorkId::from_str("work-linked-mutate");
-        store.admit(&record(work_id.as_str())).unwrap();
+        store.admit(&record(work_id.as_str())?)?;
 
-        let path = store.record_path(&work_id).unwrap();
-        std::fs::remove_file(&path).unwrap();
+        let path = store.record_path(&work_id)?;
+        std::fs::remove_file(&path)?;
         let external = temp.path().join("external-record.json");
         let external_bytes = b"untrusted record target".to_vec();
-        std::fs::write(&external, &external_bytes).unwrap();
-        symlink(&external, &path).unwrap();
+        std::fs::write(&external, &external_bytes)?;
+        symlink(&external, &path)?;
 
         assert!(matches!(
             store.cancel(
@@ -1711,74 +1724,73 @@ mod tests {
             ),
             Err(SessionStoreError::Io(_))
         ));
-        assert_eq!(std::fs::read(&external).unwrap(), external_bytes);
+        assert_eq!(std::fs::read(&external)?, external_bytes);
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn admit_rejects_a_symlinked_lock_sidecar_without_following_its_target() {
+    fn admit_rejects_a_symlinked_lock_sidecar_without_following_its_target() -> TestResult {
         use std::os::unix::fs::symlink;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir()?;
         let store = JobStore::new(temp.path());
-        store.ensure_root().unwrap();
+        store.ensure_root()?;
         let work_id = WorkId::from_str("work-linked-lock");
         let lock_path = store.locks_dir().join("work-linked-lock.lock");
         let external = temp.path().join("external.lock");
         let external_bytes = b"untrusted lock target".to_vec();
-        std::fs::write(&external, &external_bytes).unwrap();
-        symlink(&external, &lock_path).unwrap();
+        std::fs::write(&external, &external_bytes)?;
+        symlink(&external, &lock_path)?;
 
         assert!(matches!(
-            store.admit(&record(work_id.as_str())),
+            store.admit(&record(work_id.as_str())?),
             Err(SessionStoreError::Io(_))
         ));
-        assert_eq!(std::fs::read(&external).unwrap(), external_bytes);
-        assert!(!store.record_path(&work_id).unwrap().exists());
+        assert_eq!(std::fs::read(&external)?, external_bytes);
+        assert!(!store.record_path(&work_id)?.exists());
+        Ok(())
     }
 
-    fn blocked_record(id: &str) -> StoredJob {
-        let mut job = record(id);
+    fn blocked_record(id: &str) -> TestResult<StoredJob> {
+        let mut job = record(id)?;
         job.job.state = JobState::Blocked;
-        job
+        Ok(job)
     }
 
-    fn terminal_record(id: &str, state: JobState, attempts: u32) -> StoredJob {
-        let mut job = record(id);
+    fn terminal_record(id: &str, state: JobState, attempts: u32) -> TestResult<StoredJob> {
+        let mut job = record(id)?;
         job.job.state = state;
         job.job.attempts = attempts;
-        job
+        Ok(job)
     }
 
     #[test]
-    fn unblock_moves_a_blocked_job_to_ready_and_persists_the_approval_sidecar() {
-        let temp = tempfile::tempdir().unwrap();
+    fn unblock_moves_a_blocked_job_to_ready_and_persists_the_approval_sidecar() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = JobStore::new(temp.path());
         let work_id = WorkId::from_str("work-approve");
-        store.admit(&blocked_record(work_id.as_str())).unwrap();
+        store.admit(&blocked_record(work_id.as_str())?)?;
         let now = Timestamp::now();
 
-        let event = store
-            .unblock(
-                &work_id,
-                now,
-                ApprovalActor::Operator {
-                    id: "operator-a".to_owned(),
-                },
-                Some("looks fine".to_owned()),
-            )
-            .unwrap();
+        let event = store.unblock(
+            &work_id,
+            now,
+            ApprovalActor::Operator {
+                id: "operator-a".to_owned(),
+            },
+            Some("looks fine".to_owned()),
+        )?;
 
         assert_eq!(event.state, JobState::Ready);
-        let persisted = store.get(&work_id).unwrap();
+        let persisted = store.get(&work_id)?;
         assert_eq!(persisted.job.state, JobState::Ready);
         assert!(persisted.lease.is_none());
         assert!(persisted.completion.is_none());
 
         let approval = store
-            .get_approval(&work_id)
-            .unwrap()
-            .expect("approval sidecar recorded");
+            .get_approval(&work_id)?
+            .ok_or(TestError::Missing("approval sidecar recorded"))?;
         assert_eq!(approval.work_id, work_id);
         assert_eq!(approval.note.as_deref(), Some("looks fine"));
         assert_eq!(approval.revision, event.revision);
@@ -1786,268 +1798,264 @@ mod tests {
             approval.approved_by,
             ApprovalActor::Operator { ref id } if id == "operator-a"
         ));
+        Ok(())
     }
 
     #[test]
-    fn get_approval_returns_none_for_a_job_that_was_never_approved() {
-        let temp = tempfile::tempdir().unwrap();
+    fn get_approval_returns_none_for_a_job_that_was_never_approved() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = JobStore::new(temp.path());
         let work_id = WorkId::from_str("work-never-approved");
-        store.admit(&record(work_id.as_str())).unwrap();
+        store.admit(&record(work_id.as_str())?)?;
 
-        assert_eq!(store.get_approval(&work_id).unwrap(), None);
+        assert_eq!(store.get_approval(&work_id)?, None);
+        Ok(())
     }
 
     #[test]
-    fn unblock_fails_for_a_job_that_is_not_blocked_and_writes_no_sidecar() {
-        let temp = tempfile::tempdir().unwrap();
+    fn unblock_fails_for_a_job_that_is_not_blocked_and_writes_no_sidecar() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = JobStore::new(temp.path());
         let work_id = WorkId::from_str("work-not-blocked");
-        store.admit(&record(work_id.as_str())).unwrap();
+        store.admit(&record(work_id.as_str())?)?;
 
-        let error = store
-            .unblock(
-                &work_id,
-                Timestamp::now(),
-                ApprovalActor::Operator {
-                    id: "operator-a".to_owned(),
-                },
-                None,
-            )
-            .unwrap_err();
+        let result = store.unblock(
+            &work_id,
+            Timestamp::now(),
+            ApprovalActor::Operator {
+                id: "operator-a".to_owned(),
+            },
+            None,
+        );
 
-        assert!(matches!(error, SessionStoreError::JobNotBlocked { .. }));
-        assert_eq!(store.get_approval(&work_id).unwrap(), None);
+        assert!(matches!(
+            result,
+            Err(SessionStoreError::JobNotBlocked { .. })
+        ));
+        assert_eq!(store.get_approval(&work_id)?, None);
+        Ok(())
     }
 
     #[test]
-    fn deny_blocked_cancels_a_blocked_job_with_actor_and_reason() {
-        let temp = tempfile::tempdir().unwrap();
+    fn deny_blocked_cancels_a_blocked_job_with_actor_and_reason() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = JobStore::new(temp.path());
         let work_id = WorkId::from_str("work-deny-blocked");
-        store.admit(&blocked_record(work_id.as_str())).unwrap();
+        store.admit(&blocked_record(work_id.as_str())?)?;
 
-        let transition = store
-            .deny_blocked(
-                &work_id,
-                &CancelRequest {
-                    cancelled_at: Timestamp::now(),
-                    cancelled_by: ApprovalActor::Operator {
-                        id: "operator-a".to_owned(),
-                    },
-                    reason: "not safe to proceed".to_owned(),
+        let transition = store.deny_blocked(
+            &work_id,
+            &CancelRequest {
+                cancelled_at: Timestamp::now(),
+                cancelled_by: ApprovalActor::Operator {
+                    id: "operator-a".to_owned(),
                 },
-            )
-            .unwrap();
+                reason: "not safe to proceed".to_owned(),
+            },
+        )?;
 
         assert_eq!(transition.previous_state, JobState::Blocked);
-        let persisted = store.get(&work_id).unwrap();
+        let persisted = store.get(&work_id)?;
         assert_eq!(persisted.job.state, JobState::Cancelled);
         assert!(matches!(
             persisted.cancellation,
             Some(JobCancellation { ref reason, .. }) if reason == "not safe to proceed"
         ));
+        Ok(())
     }
 
     #[test]
-    fn deny_blocked_rejects_a_job_that_is_not_blocked() {
-        let temp = tempfile::tempdir().unwrap();
+    fn deny_blocked_rejects_a_job_that_is_not_blocked() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = JobStore::new(temp.path());
         let work_id = WorkId::from_str("work-deny-not-blocked");
-        store.admit(&record(work_id.as_str())).unwrap();
+        store.admit(&record(work_id.as_str())?)?;
 
-        let error = store
-            .deny_blocked(
-                &work_id,
-                &CancelRequest {
-                    cancelled_at: Timestamp::now(),
-                    cancelled_by: ApprovalActor::Operator {
-                        id: "operator-a".to_owned(),
-                    },
-                    reason: "not safe to proceed".to_owned(),
+        let result = store.deny_blocked(
+            &work_id,
+            &CancelRequest {
+                cancelled_at: Timestamp::now(),
+                cancelled_by: ApprovalActor::Operator {
+                    id: "operator-a".to_owned(),
                 },
-            )
-            .unwrap_err();
-
-        assert!(matches!(error, SessionStoreError::JobNotDeniable { .. }));
-    }
-
-    #[test]
-    fn deny_blocked_rejects_an_empty_reason_before_touching_the_store() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = JobStore::new(temp.path());
-        let work_id = WorkId::from_str("work-deny-empty-reason");
-        store.admit(&blocked_record(work_id.as_str())).unwrap();
-
-        let error = store
-            .deny_blocked(
-                &work_id,
-                &CancelRequest {
-                    cancelled_at: Timestamp::now(),
-                    cancelled_by: ApprovalActor::Operator {
-                        id: "operator-a".to_owned(),
-                    },
-                    reason: "   ".to_owned(),
-                },
-            )
-            .unwrap_err();
+                reason: "not safe to proceed".to_owned(),
+            },
+        );
 
         assert!(matches!(
-            error,
-            SessionStoreError::InvalidJobCancellationReason
+            result,
+            Err(SessionStoreError::JobNotDeniable { .. })
         ));
-        assert_eq!(store.get(&work_id).unwrap().job.state, JobState::Blocked);
+        Ok(())
     }
 
     #[test]
-    fn retry_requeues_a_failed_job_and_increments_attempts() {
-        let temp = tempfile::tempdir().unwrap();
+    fn deny_blocked_rejects_an_empty_reason_before_touching_the_store() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-deny-empty-reason");
+        store.admit(&blocked_record(work_id.as_str())?)?;
+
+        let result = store.deny_blocked(
+            &work_id,
+            &CancelRequest {
+                cancelled_at: Timestamp::now(),
+                cancelled_by: ApprovalActor::Operator {
+                    id: "operator-a".to_owned(),
+                },
+                reason: "   ".to_owned(),
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(SessionStoreError::InvalidJobCancellationReason)
+        ));
+        assert_eq!(store.get(&work_id)?.job.state, JobState::Blocked);
+        Ok(())
+    }
+
+    #[test]
+    fn retry_requeues_a_failed_job_and_increments_attempts() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = JobStore::new(temp.path());
         let work_id = WorkId::from_str("work-retry-failed");
-        store
-            .admit(&terminal_record(work_id.as_str(), JobState::Failed, 1))
-            .unwrap();
+        store.admit(&terminal_record(work_id.as_str(), JobState::Failed, 1)?)?;
 
-        let event = store
-            .retry(
-                &work_id,
-                &RetryRequest {
-                    retried_at: Timestamp::now(),
-                    retried_by: ApprovalActor::Operator {
-                        id: "operator-a".to_owned(),
-                    },
+        let event = store.retry(
+            &work_id,
+            &RetryRequest {
+                retried_at: Timestamp::now(),
+                retried_by: ApprovalActor::Operator {
+                    id: "operator-a".to_owned(),
                 },
-            )
-            .unwrap();
+            },
+        )?;
 
         assert_eq!(event.state, JobState::Ready);
-        let persisted = store.get(&work_id).unwrap();
+        let persisted = store.get(&work_id)?;
         assert_eq!(persisted.job.state, JobState::Ready);
         assert_eq!(persisted.job.attempts, 2);
         assert!(persisted.completion.is_none());
         assert!(persisted.cancellation.is_none());
+        Ok(())
     }
 
     #[test]
-    fn retry_requeues_a_cancelled_job() {
-        let temp = tempfile::tempdir().unwrap();
+    fn retry_requeues_a_cancelled_job() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = JobStore::new(temp.path());
         let work_id = WorkId::from_str("work-retry-cancelled");
-        store
-            .admit(&terminal_record(work_id.as_str(), JobState::Cancelled, 0))
-            .unwrap();
+        store.admit(&terminal_record(work_id.as_str(), JobState::Cancelled, 0)?)?;
 
-        let event = store
-            .retry(
-                &work_id,
-                &RetryRequest {
-                    retried_at: Timestamp::now(),
-                    retried_by: ApprovalActor::Operator {
-                        id: "operator-a".to_owned(),
-                    },
+        let event = store.retry(
+            &work_id,
+            &RetryRequest {
+                retried_at: Timestamp::now(),
+                retried_by: ApprovalActor::Operator {
+                    id: "operator-a".to_owned(),
                 },
-            )
-            .unwrap();
+            },
+        )?;
 
         assert_eq!(event.state, JobState::Ready);
-        assert_eq!(store.get(&work_id).unwrap().job.attempts, 1);
+        assert_eq!(store.get(&work_id)?.job.attempts, 1);
+        Ok(())
     }
 
     #[test]
-    fn retry_rejects_a_job_that_is_not_failed_or_cancelled() {
-        let temp = tempfile::tempdir().unwrap();
+    fn retry_rejects_a_job_that_is_not_failed_or_cancelled() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = JobStore::new(temp.path());
         let work_id = WorkId::from_str("work-retry-ready");
-        store.admit(&record(work_id.as_str())).unwrap();
+        store.admit(&record(work_id.as_str())?)?;
 
-        let error = store
-            .retry(
-                &work_id,
-                &RetryRequest {
-                    retried_at: Timestamp::now(),
-                    retried_by: ApprovalActor::Operator {
-                        id: "operator-a".to_owned(),
-                    },
+        let result = store.retry(
+            &work_id,
+            &RetryRequest {
+                retried_at: Timestamp::now(),
+                retried_by: ApprovalActor::Operator {
+                    id: "operator-a".to_owned(),
                 },
-            )
-            .unwrap_err();
+            },
+        );
 
-        assert!(matches!(error, SessionStoreError::JobNotRetryable { .. }));
+        assert!(matches!(
+            result,
+            Err(SessionStoreError::JobNotRetryable { .. })
+        ));
+        Ok(())
     }
 
     #[test]
-    fn retry_returns_a_typed_error_and_does_not_requeue_once_the_limit_is_exhausted() {
-        let temp = tempfile::tempdir().unwrap();
+    fn retry_returns_a_typed_error_and_does_not_requeue_once_the_limit_is_exhausted() -> TestResult
+    {
+        let temp = tempfile::tempdir()?;
         let store = JobStore::new(temp.path());
         let work_id = WorkId::from_str("work-retry-exhausted");
         // `record()`'s fixture policy has max_attempts: 2.
-        store
-            .admit(&terminal_record(work_id.as_str(), JobState::Failed, 2))
-            .unwrap();
+        store.admit(&terminal_record(work_id.as_str(), JobState::Failed, 2)?)?;
 
-        let error = store
-            .retry(
-                &work_id,
-                &RetryRequest {
-                    retried_at: Timestamp::now(),
-                    retried_by: ApprovalActor::Operator {
-                        id: "operator-a".to_owned(),
-                    },
+        let result = store.retry(
+            &work_id,
+            &RetryRequest {
+                retried_at: Timestamp::now(),
+                retried_by: ApprovalActor::Operator {
+                    id: "operator-a".to_owned(),
                 },
-            )
-            .unwrap_err();
+            },
+        );
 
         assert!(matches!(
-            error,
-            SessionStoreError::JobRetryLimitExhausted {
+            result,
+            Err(SessionStoreError::JobRetryLimitExhausted {
                 attempts: 2,
                 max_attempts: 2,
                 ..
-            }
+            })
         ));
         // The job must still be exactly as it was — no silent requeue.
-        let persisted = store.get(&work_id).unwrap();
+        let persisted = store.get(&work_id)?;
         assert_eq!(persisted.job.state, JobState::Failed);
         assert_eq!(persisted.job.attempts, 2);
+        Ok(())
     }
 
     #[test]
-    fn retry_advances_the_fencing_epoch_so_a_stale_token_cannot_complete_the_new_attempt() {
-        let temp = tempfile::tempdir().unwrap();
+    fn retry_advances_the_fencing_epoch_so_a_stale_token_cannot_complete_the_new_attempt()
+    -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = JobStore::new(temp.path());
         let work_id = WorkId::from_str("work-retry-fencing");
-        let mut stale = terminal_record(work_id.as_str(), JobState::Failed, 1);
+        let mut stale = terminal_record(work_id.as_str(), JobState::Failed, 1)?;
         // Simulate the epoch the job carried from its prior (now-stale) lease.
         stale.lease_epoch = 5;
-        store.admit(&stale).unwrap();
+        store.admit(&stale)?;
 
-        store
-            .retry(
-                &work_id,
-                &RetryRequest {
-                    retried_at: Timestamp::now(),
-                    retried_by: ApprovalActor::Operator {
-                        id: "operator-a".to_owned(),
-                    },
+        store.retry(
+            &work_id,
+            &RetryRequest {
+                retried_at: Timestamp::now(),
+                retried_by: ApprovalActor::Operator {
+                    id: "operator-a".to_owned(),
                 },
-            )
-            .unwrap();
+            },
+        )?;
 
-        let after_retry = store.get(&work_id).unwrap();
+        let after_retry = store.get(&work_id)?;
         assert!(after_retry.lease_epoch > 5);
 
         // A fresh claim must issue a token beyond the pre-retry epoch, so a
         // worker still holding a token minted under epoch 5 can never match.
-        let claim = store
-            .claim(
-                &work_id,
-                &ClaimRequest {
-                    worker_id: "worker-a".to_owned(),
-                    lease_ttl: SignedDuration::from_secs(60),
-                    now: Timestamp::now(),
-                },
-            )
-            .unwrap();
+        let claim = store.claim(
+            &work_id,
+            &ClaimRequest {
+                worker_id: "worker-a".to_owned(),
+                lease_ttl: SignedDuration::from_secs(60),
+                now: Timestamp::now(),
+            },
+        )?;
         assert!(claim.token.epoch > 5);
+        Ok(())
     }
 }

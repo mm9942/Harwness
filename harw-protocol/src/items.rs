@@ -187,6 +187,7 @@ pub struct ErrorItem {
 #[cfg(test)]
 mod tests {
     use super::{OpaqueReasoning, ResultTrust, ToolCallResult, ToolResultItem, TurnItem};
+    use crate::test_support::{TestError, TestResult, ctx};
     use serde_json::json;
 
     #[test]
@@ -195,16 +196,23 @@ mod tests {
     }
 
     #[test]
-    fn test_result_trust_wire_names_are_snake_case() {
-        assert_eq!(serde_json::to_value(ResultTrust::Untrusted).unwrap(), json!("untrusted"));
-        assert_eq!(serde_json::to_value(ResultTrust::Runtime).unwrap(), json!("runtime"));
+    fn test_result_trust_wire_names_are_snake_case() -> TestResult {
+        assert_eq!(
+            serde_json::to_value(ResultTrust::Untrusted).map_err(ctx("serializes"))?,
+            json!("untrusted")
+        );
+        assert_eq!(
+            serde_json::to_value(ResultTrust::Runtime).map_err(ctx("serializes"))?,
+            json!("runtime")
+        );
         assert!(serde_json::from_value::<ResultTrust>(json!("trusted")).is_err());
+        Ok(())
     }
 
     /// A transcript line written before W3 has no `trust` field and must stay
     /// readable; it is read fail-closed as `Untrusted`.
     #[test]
-    fn test_tool_result_item_deserializes_legacy_item_without_trust_as_untrusted() {
+    fn test_tool_result_item_deserializes_legacy_item_without_trust_as_untrusted() -> TestResult {
         let legacy = json!({
             "type": "tool_result",
             "id": "item-1",
@@ -213,7 +221,8 @@ mod tests {
             "duration_ms": 7,
         });
 
-        let item: TurnItem = serde_json::from_value(legacy).expect("legacy item stays readable");
+        let item: TurnItem =
+            serde_json::from_value(legacy).map_err(ctx("legacy item stays readable"))?;
 
         match item {
             TurnItem::ToolResult(result) => {
@@ -221,30 +230,38 @@ mod tests {
                 assert_eq!(result.duration_ms, 7);
                 assert_eq!(result.result, ToolCallResult::success(json!({"ok": true})));
             }
-            other => panic!("expected a tool result, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected a tool result, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_tool_result_item_roundtrip_legacy_to_new_keeps_trust_explicit() {
+    fn test_tool_result_item_roundtrip_legacy_to_new_keeps_trust_explicit() -> TestResult {
         let legacy = json!({
             "id": "item-2",
             "call_id": "call-2",
             "result": {"status": "error", "message": "denied"},
             "duration_ms": 0,
         });
-        let item: ToolResultItem = serde_json::from_value(legacy).expect("legacy item stays readable");
+        let item: ToolResultItem =
+            serde_json::from_value(legacy).map_err(ctx("legacy item stays readable"))?;
 
-        let rewritten = serde_json::to_value(&item).expect("item serializes");
+        let rewritten = serde_json::to_value(&item).map_err(ctx("item serializes"))?;
         assert_eq!(rewritten["trust"], json!("untrusted"));
 
-        let reread: ToolResultItem = serde_json::from_value(rewritten).expect("new item reads back");
+        let reread: ToolResultItem =
+            serde_json::from_value(rewritten).map_err(ctx("new item reads back"))?;
         assert_eq!(reread.trust, ResultTrust::Untrusted);
         assert_eq!(reread.result, ToolCallResult::error("denied"));
+        Ok(())
     }
 
     #[test]
-    fn test_tool_result_item_roundtrip_preserves_runtime_trust() {
+    fn test_tool_result_item_roundtrip_preserves_runtime_trust() -> TestResult {
         let value = json!({
             "id": "item-3",
             "call_id": "call-3",
@@ -252,10 +269,11 @@ mod tests {
             "duration_ms": 1,
             "trust": "runtime",
         });
-        let item: ToolResultItem = serde_json::from_value(value).expect("new item reads");
+        let item: ToolResultItem = serde_json::from_value(value).map_err(ctx("new item reads"))?;
         assert_eq!(item.trust, ResultTrust::Runtime);
-        let back = serde_json::to_value(&item).expect("item serializes");
+        let back = serde_json::to_value(&item).map_err(ctx("item serializes"))?;
         assert_eq!(back["trust"], json!("runtime"));
+        Ok(())
     }
 
     #[test]
@@ -272,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn test_opaque_reasoning_serde_roundtrip_preserves_blocks_verbatim() {
+    fn test_opaque_reasoning_serde_roundtrip_preserves_blocks_verbatim() -> TestResult {
         let reasoning = OpaqueReasoning {
             provider: "anthropic".to_owned(),
             model: "claude-opus-5".to_owned(),
@@ -281,10 +299,12 @@ mod tests {
                 json!({"type": "redacted_thinking", "data": "opaque"}),
             ],
         };
-        let json = serde_json::to_value(&reasoning).expect("reasoning serializes");
+        let json = serde_json::to_value(&reasoning).map_err(ctx("reasoning serializes"))?;
         assert_eq!(json["blocks"][1]["data"], json!("opaque"));
-        let back: OpaqueReasoning = serde_json::from_value(json).expect("reasoning deserializes");
+        let back: OpaqueReasoning =
+            serde_json::from_value(json).map_err(ctx("reasoning deserializes"))?;
         assert_eq!(back, reasoning);
+        Ok(())
     }
 
     #[test]
@@ -294,23 +314,25 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_result_uses_an_explicit_success_wire_shape() {
+    fn tool_call_result_uses_an_explicit_success_wire_shape() -> TestResult {
         let result = ToolCallResult::success(json!({"temperature": 20}));
 
         assert_eq!(
-            serde_json::to_value(result).expect("tool outcome serializes"),
+            serde_json::to_value(result).map_err(ctx("tool outcome serializes"))?,
             json!({"status": "success", "value": {"temperature": 20}})
         );
+        Ok(())
     }
 
     #[test]
-    fn tool_call_result_uses_an_explicit_error_wire_shape() {
+    fn tool_call_result_uses_an_explicit_error_wire_shape() -> TestResult {
         let result = ToolCallResult::error("tool unavailable");
 
         assert_eq!(
-            serde_json::to_value(result).expect("tool outcome serializes"),
+            serde_json::to_value(result).map_err(ctx("tool outcome serializes"))?,
             json!({"status": "error", "message": "tool unavailable"})
         );
+        Ok(())
     }
 
     #[test]

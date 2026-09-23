@@ -897,8 +897,7 @@ fn invalidate_actions(
     let open: Vec<TaskId> = ids
         .iter()
         .filter(|id| {
-            !find_node(snapshot, id)
-                .is_some_and(|node| node.status == PlanNodeStatus::Invalidated)
+            !find_node(snapshot, id).is_some_and(|node| node.status == PlanNodeStatus::Invalidated)
         })
         .cloned()
         .collect();
@@ -1142,6 +1141,7 @@ mod tests {
         EVIDENCE_ATTACHED_TOTAL, EXPLORE_INSERTED_TOTAL, GOAL_AGE_DAYS, GOAL_COVERAGE,
         INVALIDATIONS_TOTAL, PROPOSALS_PENDING, RECONCILE_STEPS_TOTAL,
     };
+    use crate::test_support::{TestError, TestResult};
     use crate::testing::{
         InMemoryGoalStore, RecordingSink, coding_node, covered_goal_fixture, exploration_config,
         node_with, plan_with, research_node, sample_finding,
@@ -1177,8 +1177,8 @@ mod tests {
     }
 
     #[test]
-    fn test_finding_becomes_attach_evidence_on_the_matching_node() {
-        let plan = plan_with(vec![research_node("q-1", PlanNodeStatus::InProgress)]);
+    fn test_finding_becomes_attach_evidence_on_the_matching_node() -> TestResult {
+        let plan = plan_with(vec![research_node("q-1", PlanNodeStatus::InProgress)])?;
         let findings = vec![sample_finding("q-1", &[])];
         let config = permissive_config();
 
@@ -1190,15 +1190,20 @@ mod tests {
                 assert_eq!(evidence.kind, EvidenceKind::Finding);
                 assert_eq!(evidence.locator, "p-test/research/q-1.md");
             }
-            other => panic!("erwartet AttachEvidence, bekommen: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet AttachEvidence, bekommen: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_finding_matches_a_research_node_by_objective() {
+    fn test_finding_matches_a_research_node_by_objective() -> TestResult {
         let mut node = research_node("r-1", PlanNodeStatus::InProgress);
         node.objective = "Beantworte q-42 für die Bridge".to_owned();
-        let plan = plan_with(vec![node]);
+        let plan = plan_with(vec![node])?;
         let findings = vec![sample_finding("q-42", &[])];
         let config = permissive_config();
 
@@ -1208,11 +1213,12 @@ mod tests {
             steps.first(),
             Some(ReconcileStep::AttachEvidence { task, .. }) if task == &TaskId::new("r-1")
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_finding_with_open_questions_on_a_completed_node_asks_the_model() {
-        let plan = plan_with(vec![research_node("q-1", PlanNodeStatus::Completed)]);
+    fn test_finding_with_open_questions_on_a_completed_node_asks_the_model() -> TestResult {
+        let plan = plan_with(vec![research_node("q-1", PlanNodeStatus::Completed)])?;
         let findings = vec![sample_finding("q-1", &["Gilt das auch für Edition 2024?"])];
         let config = permissive_config();
 
@@ -1228,13 +1234,18 @@ mod tests {
                 assert!(prompt.contains("invalidiert"));
                 assert!(prompt.contains("Edition 2024"));
             }
-            None => panic!("erwartet AskModel, bekommen: {steps:?}"),
+            None => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet AskModel, bekommen: {steps:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_finding_with_open_questions_on_an_open_node_asks_nothing() {
-        let plan = plan_with(vec![research_node("q-1", PlanNodeStatus::InProgress)]);
+    fn test_finding_with_open_questions_on_an_open_node_asks_nothing() -> TestResult {
+        let plan = plan_with(vec![research_node("q-1", PlanNodeStatus::InProgress)])?;
         let findings = vec![sample_finding("q-1", &["noch offen"])];
         let config = permissive_config();
 
@@ -1246,11 +1257,12 @@ mod tests {
                 .any(|step| matches!(step, ReconcileStep::AskModel { .. })),
             "unerwarteter AskModel: {steps:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_coding_node_without_exploration_gets_an_explore_inserted() {
-        let plan = plan_with(vec![coding_node("t-1", PlanNodeStatus::Draft)]);
+    fn test_coding_node_without_exploration_gets_an_explore_inserted() -> TestResult {
+        let plan = plan_with(vec![coding_node("t-1", PlanNodeStatus::Draft)])?;
         let config = exploration_config();
 
         let steps = PlanController::reconcile(input(&plan, &[], &[], &config, None));
@@ -1267,13 +1279,18 @@ mod tests {
                 assert_eq!(node.read_scope, plan.nodes[0].write_scope);
                 assert!(node.write_scope.is_empty());
             }
-            other => panic!("erwartet InsertExplore, bekommen: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet InsertExplore, bekommen: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_node_missing_exploration_is_not_admitted_as_a_job() {
-        let plan = plan_with(vec![coding_node("t-1", PlanNodeStatus::Draft)]);
+    fn test_node_missing_exploration_is_not_admitted_as_a_job() -> TestResult {
+        let plan = plan_with(vec![coding_node("t-1", PlanNodeStatus::Draft)])?;
         let config = exploration_config();
 
         let steps = PlanController::reconcile(input(&plan, &[], &[], &config, None));
@@ -1284,10 +1301,11 @@ mod tests {
                 .any(|step| matches!(step, ReconcileStep::AdmitJobs { .. })),
             "Knoten ohne Exploration wurde admittiert: {steps:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_existing_explore_node_is_not_duplicated() {
+    fn test_existing_explore_node_is_not_duplicated() -> TestResult {
         let mut explore = research_node("t-1-explore", PlanNodeStatus::Draft);
         explore.kind = PlanNodeKind::Explore;
         // The explore node must already be wired up as `t-1`'s dependency
@@ -1299,7 +1317,7 @@ mod tests {
         // would reintroduce the silent-deadlock G-038 was written to avoid.
         let mut coding = coding_node("t-1", PlanNodeStatus::Draft);
         coding.dependencies = vec![TaskId::new("t-1-explore")];
-        let plan = plan_with(vec![coding, explore]);
+        let plan = plan_with(vec![coding, explore])?;
         let config = exploration_config();
 
         let steps = PlanController::reconcile(input(&plan, &[], &[], &config, None));
@@ -1310,10 +1328,11 @@ mod tests {
                 .any(|step| matches!(step, ReconcileStep::InsertExplore { .. })),
             "Exploration doppelt vorgeschlagen: {steps:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_three_research_nodes_with_overlapping_read_scope_propose_condense() {
+    fn test_three_research_nodes_with_overlapping_read_scope_propose_condense() -> TestResult {
         let nodes = ["r-1", "r-2", "r-3"]
             .into_iter()
             .map(|id| {
@@ -1322,7 +1341,7 @@ mod tests {
                 node
             })
             .collect();
-        let plan = plan_with(nodes);
+        let plan = plan_with(nodes)?;
         let config = permissive_config();
 
         let steps = PlanController::reconcile(input(&plan, &[], &[], &config, None));
@@ -1338,12 +1357,17 @@ mod tests {
                 );
                 assert!(reason.contains("verdichte"));
             }
-            other => panic!("erwartet ProposeCondense, bekommen: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet ProposeCondense, bekommen: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_two_overlapping_research_nodes_are_below_the_condense_threshold() {
+    fn test_two_overlapping_research_nodes_are_below_the_condense_threshold() -> TestResult {
         let nodes = ["r-1", "r-2"]
             .into_iter()
             .map(|id| {
@@ -1352,7 +1376,7 @@ mod tests {
                 node
             })
             .collect();
-        let plan = plan_with(nodes);
+        let plan = plan_with(nodes)?;
         let config = permissive_config();
 
         let steps = PlanController::reconcile(input(&plan, &[], &[], &config, None));
@@ -1363,11 +1387,12 @@ mod tests {
                 .any(|step| matches!(step, ReconcileStep::ProposeCondense { .. })),
             "unter der Schwelle verdichtet: {steps:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_ready_coding_node_is_proposed_for_job_admission() {
-        let plan = plan_with(vec![coding_node("t-1", PlanNodeStatus::Ready)]);
+    fn test_ready_coding_node_is_proposed_for_job_admission() -> TestResult {
+        let plan = plan_with(vec![coding_node("t-1", PlanNodeStatus::Ready)])?;
         let config = permissive_config();
 
         let steps = PlanController::reconcile(input(&plan, &[], &[], &config, None));
@@ -1379,13 +1404,18 @@ mod tests {
             Some(ReconcileStep::AdmitJobs { ids }) => {
                 assert_eq!(ids, &vec![TaskId::new("t-1")]);
             }
-            other => panic!("erwartet AdmitJobs, bekommen: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet AdmitJobs, bekommen: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_ready_research_node_is_marked_ready_not_admitted() {
-        let plan = plan_with(vec![research_node("r-1", PlanNodeStatus::Draft)]);
+    fn test_ready_research_node_is_marked_ready_not_admitted() -> TestResult {
+        let plan = plan_with(vec![research_node("r-1", PlanNodeStatus::Draft)])?;
         let config = permissive_config();
 
         let steps = PlanController::reconcile(input(&plan, &[], &[], &config, None));
@@ -1402,15 +1432,16 @@ mod tests {
                 .any(|step| matches!(step, ReconcileStep::AdmitJobs { .. })),
             "Research-Knoten wurde als Job admittiert: {steps:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_coarse_draft_node_is_proposed_for_expansion() {
+    fn test_coarse_draft_node_is_proposed_for_expansion() -> TestResult {
         let mut node = coding_node("t-big", PlanNodeStatus::Draft);
         node.write_scope = (0..COARSE_WRITE_SCOPE)
             .map(|index| PathOrSymbol::new(format!("src/mod_{index}.rs")))
             .collect();
-        let plan = plan_with(vec![node]);
+        let plan = plan_with(vec![node])?;
         let config = permissive_config();
 
         let steps = PlanController::reconcile(input(&plan, &[], &[], &config, None));
@@ -1422,15 +1453,16 @@ mod tests {
             )),
             "erwartet ProposeExpand: {steps:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_composite_with_only_completed_children_is_marked_ready() {
+    fn test_composite_with_only_completed_children_is_marked_ready() -> TestResult {
         let mut composite = node_with("c-1", PlanNodeKind::Composite, PlanNodeStatus::Draft);
         composite.write_scope = vec![PathOrSymbol::new("src/c.rs")];
         let mut child = coding_node("c-1-a", PlanNodeStatus::Completed);
         child.parent = Some(TaskId::new("c-1"));
-        let plan = plan_with(vec![composite, child]);
+        let plan = plan_with(vec![composite, child])?;
         let config = permissive_config();
 
         let steps = PlanController::reconcile(input(&plan, &[], &[], &config, None));
@@ -1442,17 +1474,18 @@ mod tests {
             )),
             "erwartet MarkReady für Composite: {steps:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_completed_job_produces_job_evidence() {
+    fn test_completed_job_produces_job_evidence() -> TestResult {
         let mut node = coding_node("t-1", PlanNodeStatus::InProgress);
         node.assignment = Some(Assignment {
             worker: "worker-1".to_owned(),
             attempt: 0,
             job: Some("work-abc".to_owned()),
         });
-        let plan = plan_with(vec![node]);
+        let plan = plan_with(vec![node])?;
         let jobs = vec![("work-abc".to_owned(), JobState::Completed)];
         let config = permissive_config();
 
@@ -1467,19 +1500,24 @@ mod tests {
                 assert_eq!(evidence.kind, EvidenceKind::Job);
                 assert_eq!(evidence.locator, "work-abc");
             }
-            other => panic!("erwartet Job-Evidenz, bekommen: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Job-Evidenz, bekommen: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_failed_job_invalidates_the_node() {
+    fn test_failed_job_invalidates_the_node() -> TestResult {
         let mut node = coding_node("t-1", PlanNodeStatus::InProgress);
         node.assignment = Some(Assignment {
             worker: "worker-1".to_owned(),
             attempt: 0,
             job: Some("work-fail".to_owned()),
         });
-        let plan = plan_with(vec![node]);
+        let plan = plan_with(vec![node])?;
         let jobs = vec![("work-fail".to_owned(), JobState::Failed)];
         let config = permissive_config();
 
@@ -1493,28 +1531,34 @@ mod tests {
                 assert_eq!(ids, &vec![TaskId::new("t-1")]);
                 assert!(matches!(condition, InvalidationCondition::ManualInvalidate));
             }
-            other => panic!("erwartet Invalidate, bekommen: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Invalidate, bekommen: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_running_job_produces_no_step() {
+    fn test_running_job_produces_no_step() -> TestResult {
         let mut node = coding_node("t-1", PlanNodeStatus::InProgress);
         node.assignment = Some(Assignment {
             worker: "worker-1".to_owned(),
             attempt: 0,
             job: Some("work-run".to_owned()),
         });
-        let plan = plan_with(vec![node]);
+        let plan = plan_with(vec![node])?;
         let jobs = vec![("work-run".to_owned(), JobState::Running)];
         let config = permissive_config();
 
         let steps = PlanController::reconcile(input(&plan, &[], &jobs, &config, None));
         assert!(steps.is_empty(), "unerwartete Schritte: {steps:?}");
+        Ok(())
     }
 
     #[test]
-    fn test_reconcile_is_deterministic_across_two_runs() {
+    fn test_reconcile_is_deterministic_across_two_runs() -> TestResult {
         let nodes = vec![
             {
                 let mut node = research_node("r-3", PlanNodeStatus::Completed);
@@ -1540,7 +1584,7 @@ mod tests {
                 node
             },
         ];
-        let plan = plan_with(nodes);
+        let plan = plan_with(nodes)?;
         let findings = vec![sample_finding("r-1", &["offen"])];
         let config = permissive_config();
 
@@ -1549,11 +1593,12 @@ mod tests {
 
         assert_eq!(first, second, "reconcile ist nicht deterministisch");
         assert!(!first.is_empty(), "der Test prüft eine leere Folge");
+        Ok(())
     }
 
     #[test]
-    fn test_goal_with_all_criteria_met_is_only_proposed() {
-        let (plan, goal) = covered_goal_fixture();
+    fn test_goal_with_all_criteria_met_is_only_proposed() -> TestResult {
+        let (plan, goal) = covered_goal_fixture()?;
         let config = permissive_config();
 
         let steps = PlanController::reconcile(input(&plan, &[], &[], &config, Some(&goal)));
@@ -1565,11 +1610,12 @@ mod tests {
             )),
             "erwartet GoalStatus-Vorschlag: {steps:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_goal_without_criteria_is_never_declared_achieved() {
-        let (plan, mut goal) = covered_goal_fixture();
+    fn test_goal_without_criteria_is_never_declared_achieved() -> TestResult {
+        let (plan, mut goal) = covered_goal_fixture()?;
         goal.acceptance_criteria.clear();
         let config = permissive_config();
 
@@ -1581,11 +1627,12 @@ mod tests {
                 .any(|step| matches!(step, ReconcileStep::GoalStatus { .. })),
             "Goal ohne Kriterien wurde für erreicht erklärt: {steps:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_goal_with_violated_invariant_is_not_proposed() {
-        let (plan, mut goal) = covered_goal_fixture();
+    fn test_goal_with_violated_invariant_is_not_proposed() -> TestResult {
+        let (plan, mut goal) = covered_goal_fixture()?;
         goal.invariants.push(Invariant {
             id: "inv-unbelegt".to_owned(),
             statement: "niemals belegt".to_owned(),
@@ -1603,10 +1650,11 @@ mod tests {
                 .any(|step| matches!(step, ReconcileStep::GoalStatus { .. })),
             "verletzte Invariante ignoriert: {steps:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_apply_does_not_apply_goal_status_but_returns_it() {
+    fn test_apply_does_not_apply_goal_status_but_returns_it() -> TestResult {
         let store = InMemoryPlanStore::new();
         if let Err(error) = store.apply(
             PlanAction::Create {
@@ -1615,7 +1663,7 @@ mod tests {
             },
             "test",
         ) {
-            panic!("Plan anlegen: {error}");
+            return Err(TestError::Unexpected(format!("Plan anlegen: {error}")));
         }
         let goal_store = InMemoryGoalStore::new();
         let steps = vec![ReconcileStep::GoalStatus {
@@ -1626,16 +1674,19 @@ mod tests {
         let bound: &dyn GoalStore = &goal_store;
         let (events, deferred) = match PlanController::apply(&steps, &store, Some(bound), "test") {
             Ok(result) => result,
-            Err(error) => panic!("apply schlug fehl: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!("apply schlug fehl: {error}")));
+            }
         };
 
         assert!(events.is_empty(), "GoalStatus wurde angewandt: {events:?}");
         assert_eq!(deferred, steps);
         assert_eq!(goal_store.revision(), 0, "Goal-Store wurde mutiert");
+        Ok(())
     }
 
     #[test]
-    fn test_apply_rejects_goal_status_without_a_goal_store() {
+    fn test_apply_rejects_goal_status_without_a_goal_store() -> TestResult {
         let store = InMemoryPlanStore::new();
         let steps = vec![ReconcileStep::GoalStatus {
             status: GoalStatus::Achieved,
@@ -1644,12 +1695,17 @@ mod tests {
 
         match PlanController::apply(&steps, &store, None, "test") {
             Err(PlanBridgeError::GoalUnbound) => {}
-            other => panic!("erwartet GoalUnbound, bekommen: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet GoalUnbound, bekommen: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_apply_defers_proposals_and_admissions() {
+    fn test_apply_defers_proposals_and_admissions() -> TestResult {
         let store = InMemoryPlanStore::new();
         let steps = vec![
             ReconcileStep::AdmitJobs {
@@ -1670,15 +1726,18 @@ mod tests {
 
         let (events, deferred) = match PlanController::apply(&steps, &store, None, "test") {
             Ok(result) => result,
-            Err(error) => panic!("apply schlug fehl: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!("apply schlug fehl: {error}")));
+            }
         };
 
         assert!(events.is_empty());
         assert_eq!(deferred, steps);
+        Ok(())
     }
 
     #[test]
-    fn test_apply_attaches_evidence_and_completes_on_job_evidence() {
+    fn test_apply_attaches_evidence_and_completes_on_job_evidence() -> TestResult {
         let store = InMemoryPlanStore::new();
         if let Err(error) = store.apply(
             PlanAction::Create {
@@ -1687,12 +1746,12 @@ mod tests {
             },
             "test",
         ) {
-            panic!("Plan anlegen: {error}");
+            return Err(TestError::Unexpected(format!("Plan anlegen: {error}")));
         }
         let mut node = coding_node("t-1", PlanNodeStatus::Draft);
         node.assignment = None;
         if let Err(error) = store.apply(PlanAction::AddNode { node }, "test") {
-            panic!("Knoten anlegen: {error}");
+            return Err(TestError::Unexpected(format!("Knoten anlegen: {error}")));
         }
         for status in [PlanNodeStatus::Ready, PlanNodeStatus::InProgress] {
             if let Err(error) = store.apply(
@@ -1703,7 +1762,9 @@ mod tests {
                 },
                 "test",
             ) {
-                panic!("Status {status:?} setzen: {error}");
+                return Err(TestError::Unexpected(format!(
+                    "Status {status:?} setzen: {error}"
+                )));
             }
         }
 
@@ -1720,21 +1781,28 @@ mod tests {
 
         let (events, deferred) = match PlanController::apply(&steps, &store, None, "test") {
             Ok(result) => result,
-            Err(error) => panic!("apply schlug fehl: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!("apply schlug fehl: {error}")));
+            }
         };
         assert_eq!(events.len(), 2, "erwartet AttachEvidence + SetStatus");
         assert!(deferred.is_empty());
 
         let plan = match store.current() {
             Ok(plan) => plan,
-            Err(error) => panic!("current schlug fehl: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "current schlug fehl: {error}"
+                )));
+            }
         };
         assert_eq!(plan.nodes[0].status, PlanNodeStatus::Completed);
         assert_eq!(plan.nodes[0].evidence.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_apply_inserts_the_explore_node_and_its_dependency_edge() {
+    fn test_apply_inserts_the_explore_node_and_its_dependency_edge() -> TestResult {
         let store = InMemoryPlanStore::new();
         if let Err(error) = store.apply(
             PlanAction::Create {
@@ -1743,7 +1811,7 @@ mod tests {
             },
             "test",
         ) {
-            panic!("Plan anlegen: {error}");
+            return Err(TestError::Unexpected(format!("Plan anlegen: {error}")));
         }
         let target = coding_node("t-1", PlanNodeStatus::Draft);
         if let Err(error) = store.apply(
@@ -1752,7 +1820,7 @@ mod tests {
             },
             "test",
         ) {
-            panic!("Knoten anlegen: {error}");
+            return Err(TestError::Unexpected(format!("Knoten anlegen: {error}")));
         }
 
         let steps = vec![ReconcileStep::InsertExplore {
@@ -1762,23 +1830,30 @@ mod tests {
 
         let (events, _deferred) = match PlanController::apply(&steps, &store, None, "test") {
             Ok(result) => result,
-            Err(error) => panic!("apply schlug fehl: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!("apply schlug fehl: {error}")));
+            }
         };
         assert_eq!(events.len(), 2, "erwartet AddNode + AddDependency");
 
         let plan = match store.current() {
             Ok(plan) => plan,
-            Err(error) => panic!("current schlug fehl: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "current schlug fehl: {error}"
+                )));
+            }
         };
         let target_node = match plan.nodes.iter().find(|node| node.id == TaskId::new("t-1")) {
             Some(node) => node,
-            None => panic!("Zielknoten verschwunden"),
+            None => return Err(TestError::Unexpected("Zielknoten verschwunden".into())),
         };
         assert_eq!(target_node.dependencies, vec![TaskId::new("t-1-explore")]);
+        Ok(())
     }
 
     #[test]
-    fn test_reconcile_input_carries_no_hidden_clock() {
+    fn test_reconcile_input_carries_no_hidden_clock() -> TestResult {
         // Zwei verschiedene `now`-Werte müssen sich in der Ausgabe
         // niederschlagen — sonst käme die Zeit von woanders her.
         let mut node = coding_node("t-1", PlanNodeStatus::InProgress);
@@ -1787,7 +1862,7 @@ mod tests {
             attempt: 0,
             job: Some("work-x".to_owned()),
         });
-        let plan = plan_with(vec![node]);
+        let plan = plan_with(vec![node])?;
         let jobs = vec![("work-x".to_owned(), JobState::Completed)];
         let config = permissive_config();
 
@@ -1809,20 +1884,22 @@ mod tests {
         });
 
         assert_ne!(early, late);
+        Ok(())
     }
 
     #[test]
-    fn test_reconcile_observed_emits_reconcile_steps_total_with_step_labels() {
-        let plan = plan_with(vec![research_node("r-1", PlanNodeStatus::Draft)]);
+    fn test_reconcile_observed_emits_reconcile_steps_total_with_step_labels() -> TestResult {
+        let plan = plan_with(vec![research_node("r-1", PlanNodeStatus::Draft)])?;
         let config = permissive_config();
         let sink = RecordingSink::new();
 
-        let steps = PlanController::reconcile_observed(
-            input(&plan, &[], &[], &config, None),
-            Some(&sink),
-        );
+        let steps =
+            PlanController::reconcile_observed(input(&plan, &[], &[], &config, None), Some(&sink));
 
-        assert!(!steps.is_empty(), "Fixture sollte mindestens einen Schritt erzeugen");
+        assert!(
+            !steps.is_empty(),
+            "Fixture sollte mindestens einen Schritt erzeugen"
+        );
         let recorded = sink.values_for(RECONCILE_STEPS_TOTAL.name);
         assert_eq!(recorded.len(), steps.len());
         for record in &recorded {
@@ -1830,22 +1907,24 @@ mod tests {
             assert_eq!(record.labels.len(), 1);
             assert_eq!(record.labels[0].0.as_str(), "step");
         }
+        Ok(())
     }
 
     #[test]
-    fn test_reconcile_observed_emits_proposals_pending() {
-        let plan = plan_with(vec![coding_node("t-1", PlanNodeStatus::Draft)]);
+    fn test_reconcile_observed_emits_proposals_pending() -> TestResult {
+        let plan = plan_with(vec![coding_node("t-1", PlanNodeStatus::Draft)])?;
         let config = exploration_config();
         let sink = RecordingSink::new();
 
         PlanController::reconcile_observed(input(&plan, &[], &[], &config, None), Some(&sink));
 
         assert_eq!(sink.values_for(PROPOSALS_PENDING.name).len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_reconcile_observed_emits_goal_age_and_coverage_only_when_goal_is_bound() {
-        let (plan, goal) = covered_goal_fixture();
+    fn test_reconcile_observed_emits_goal_age_and_coverage_only_when_goal_is_bound() -> TestResult {
+        let (plan, goal) = covered_goal_fixture()?;
         let config = permissive_config();
         let sink = RecordingSink::new();
 
@@ -1867,20 +1946,23 @@ mod tests {
         );
         assert!(sink_without_goal.values_for(GOAL_AGE_DAYS.name).is_empty());
         assert!(sink_without_goal.values_for(GOAL_COVERAGE.name).is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_reconcile_observed_without_a_sink_emits_nothing_and_still_returns_steps() {
-        let plan = plan_with(vec![research_node("r-1", PlanNodeStatus::Draft)]);
+    fn test_reconcile_observed_without_a_sink_emits_nothing_and_still_returns_steps() -> TestResult
+    {
+        let plan = plan_with(vec![research_node("r-1", PlanNodeStatus::Draft)])?;
         let config = permissive_config();
 
         let steps = PlanController::reconcile_observed(input(&plan, &[], &[], &config, None), None);
 
         assert!(!steps.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_apply_observed_emits_evidence_attached_total_on_job_evidence() {
+    fn test_apply_observed_emits_evidence_attached_total_on_job_evidence() -> TestResult {
         let store = InMemoryPlanStore::new();
         if let Err(error) = store.apply(
             PlanAction::Create {
@@ -1889,12 +1971,12 @@ mod tests {
             },
             "test",
         ) {
-            panic!("Plan anlegen: {error}");
+            return Err(TestError::Unexpected(format!("Plan anlegen: {error}")));
         }
         let mut node = coding_node("t-1", PlanNodeStatus::Draft);
         node.assignment = None;
         if let Err(error) = store.apply(PlanAction::AddNode { node }, "test") {
-            panic!("Knoten anlegen: {error}");
+            return Err(TestError::Unexpected(format!("Knoten anlegen: {error}")));
         }
         for status in [PlanNodeStatus::Ready, PlanNodeStatus::InProgress] {
             if let Err(error) = store.apply(
@@ -1905,7 +1987,9 @@ mod tests {
                 },
                 "test",
             ) {
-                panic!("Status {status:?} setzen: {error}");
+                return Err(TestError::Unexpected(format!(
+                    "Status {status:?} setzen: {error}"
+                )));
             }
         }
         let steps = vec![ReconcileStep::AttachEvidence {
@@ -1920,18 +2004,22 @@ mod tests {
         }];
         let sink = RecordingSink::new();
 
-        if let Err(error) = PlanController::apply_observed(&steps, &store, None, "test", Some(&sink))
+        if let Err(error) =
+            PlanController::apply_observed(&steps, &store, None, "test", Some(&sink))
         {
-            panic!("apply_observed schlug fehl: {error}");
+            return Err(TestError::Unexpected(format!(
+                "apply_observed schlug fehl: {error}"
+            )));
         }
 
         assert_eq!(sink.values_for(EVIDENCE_ATTACHED_TOTAL.name).len(), 1);
         assert!(sink.values_for(INVALIDATIONS_TOTAL.name).is_empty());
         assert!(sink.values_for(EXPLORE_INSERTED_TOTAL.name).is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_apply_observed_emits_invalidations_total_on_a_failed_job() {
+    fn test_apply_observed_emits_invalidations_total_on_a_failed_job() -> TestResult {
         let store = InMemoryPlanStore::new();
         if let Err(error) = store.apply(
             PlanAction::Create {
@@ -1940,7 +2028,7 @@ mod tests {
             },
             "test",
         ) {
-            panic!("Plan anlegen: {error}");
+            return Err(TestError::Unexpected(format!("Plan anlegen: {error}")));
         }
         if let Err(error) = store.apply(
             PlanAction::AddNode {
@@ -1948,7 +2036,7 @@ mod tests {
             },
             "test",
         ) {
-            panic!("Knoten anlegen: {error}");
+            return Err(TestError::Unexpected(format!("Knoten anlegen: {error}")));
         }
         let steps = vec![ReconcileStep::Invalidate {
             ids: vec![TaskId::new("t-1")],
@@ -1956,16 +2044,20 @@ mod tests {
         }];
         let sink = RecordingSink::new();
 
-        if let Err(error) = PlanController::apply_observed(&steps, &store, None, "test", Some(&sink))
+        if let Err(error) =
+            PlanController::apply_observed(&steps, &store, None, "test", Some(&sink))
         {
-            panic!("apply_observed schlug fehl: {error}");
+            return Err(TestError::Unexpected(format!(
+                "apply_observed schlug fehl: {error}"
+            )));
         }
 
         assert_eq!(sink.values_for(INVALIDATIONS_TOTAL.name).len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_apply_observed_without_a_sink_still_applies_but_emits_nothing() {
+    fn test_apply_observed_without_a_sink_still_applies_but_emits_nothing() -> TestResult {
         let store = InMemoryPlanStore::new();
         if let Err(error) = store.apply(
             PlanAction::Create {
@@ -1974,7 +2066,7 @@ mod tests {
             },
             "test",
         ) {
-            panic!("Plan anlegen: {error}");
+            return Err(TestError::Unexpected(format!("Plan anlegen: {error}")));
         }
         if let Err(error) = store.apply(
             PlanAction::AddNode {
@@ -1982,19 +2074,24 @@ mod tests {
             },
             "test",
         ) {
-            panic!("Knoten anlegen: {error}");
+            return Err(TestError::Unexpected(format!("Knoten anlegen: {error}")));
         }
         let steps = vec![ReconcileStep::Invalidate {
             ids: vec![TaskId::new("t-1")],
             condition: InvalidationCondition::ManualInvalidate,
         }];
 
-        let (events, deferred) = match PlanController::apply_observed(&steps, &store, None, "test", None)
-        {
-            Ok(result) => result,
-            Err(error) => panic!("apply_observed schlug fehl: {error}"),
-        };
+        let (events, deferred) =
+            match PlanController::apply_observed(&steps, &store, None, "test", None) {
+                Ok(result) => result,
+                Err(error) => {
+                    return Err(TestError::Unexpected(format!(
+                        "apply_observed schlug fehl: {error}"
+                    )));
+                }
+            };
         assert_eq!(events.len(), 1);
         assert!(deferred.is_empty());
+        Ok(())
     }
 }

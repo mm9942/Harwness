@@ -149,11 +149,12 @@ pub fn load_seed(provenance: &KekProvenance) -> SecretsResult<SecretBox<[u8]>> {
 /// - [`SecretsError::KekUnavailable`]: der Wert ist kein gültiges UTF-8 oder
 ///   nicht genau 32 Bytes lang. Der Wert selbst erscheint in keiner Meldung.
 fn env_seed_from_os_value(var: &str, value: &OsStr) -> SecretsResult<SecretBox<[u8]>> {
-    let seed =
-        std::str::from_utf8(value.as_encoded_bytes()).map_err(|_| SecretsError::KekUnavailable {
+    let seed = std::str::from_utf8(value.as_encoded_bytes()).map_err(|_| {
+        SecretsError::KekUnavailable {
             kind: "env-seed".to_owned(),
             reason: format!("environment variable '{var}' is not valid UTF-8"),
-        })?;
+        }
+    })?;
     if seed.len() != 32 {
         return Err(SecretsError::KekUnavailable {
             kind: "env-seed".to_owned(),
@@ -221,7 +222,15 @@ fn load_key_file_seed(path: &Path) -> SecretsResult<SecretBox<[u8]>> {
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn load_key_file_seed(path: &Path) -> SecretsResult<SecretBox<[u8]>> {
     check_key_file_permissions(path)?;
-    unreachable!("unsupported-platform key-file validation always fails closed")
+    // `check_key_file_permissions` liefert auf dieser Plattform immer `Err`
+    // (kein verifizierter No-Follow-/Rechte-Check verfügbar); dieser Zweig
+    // bleibt aus Fail-Closed-Gründen ein expliziter Fehler statt sich auf
+    // die Unerreichbarkeit durch das `?` oben zu verlassen.
+    Err(SecretsError::KekUnavailable {
+        kind: "key-file".to_owned(),
+        reason: "key-file KEK loading requires verified no-follow and permission validation"
+            .to_owned(),
+    })
 }
 
 /// Load the configured KEK seed once and deterministically derive its paired
@@ -298,7 +307,9 @@ pub fn derive_secret_key(
     seed: &SecretBox<[u8]>,
 ) -> SecretsResult<SecretBox<[u8]>> {
     let (private_key, _) = derive_recipient(policy, seed)?;
-    Ok(SecretBox::new(private_key.as_seed_bytes().to_vec().into_boxed_slice()))
+    Ok(SecretBox::new(
+        private_key.as_seed_bytes().to_vec().into_boxed_slice(),
+    ))
 }
 
 /// Derive the 32-byte hybrid recipient seed of `kem` from the root KEK seed.
@@ -365,93 +376,93 @@ mod tests {
     use secrecy::ExposeSecret;
 
     use crate::policy::{AeadAlgo, KemAlgo};
+    use crate::test_support::{TestError, TestResult, ctx};
 
     use super::*;
 
-    fn temp_seed_path() -> PathBuf {
+    fn temp_seed_path() -> TestResult<PathBuf> {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock is after UNIX_EPOCH")
+            .map_err(ctx("system clock is after UNIX_EPOCH"))?
             .as_nanos();
-        std::env::temp_dir().join(format!("harwness-kek-seed-{}-{nonce}", std::process::id()))
+        Ok(std::env::temp_dir().join(format!("harwness-kek-seed-{}-{nonce}", std::process::id())))
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
-    fn key_file_loads_exactly_32_raw_bytes() {
-        let path = temp_seed_path();
+    fn key_file_loads_exactly_32_raw_bytes() -> TestResult {
+        let path = temp_seed_path()?;
         let seed = [0xA5; 32];
-        std::fs::write(&path, seed).expect("write temporary seed");
+        std::fs::write(&path, seed)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
 
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .expect("set temporary seed permissions");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         }
 
-        let loaded =
-            load_seed(&KekProvenance::KeyFile { path: path.clone() }).expect("load key-file seed");
+        let loaded = load_seed(&KekProvenance::KeyFile { path: path.clone() })?;
         assert_eq!(loaded.expose_secret().as_ref(), seed.as_slice());
-        std::fs::remove_file(path).expect("remove temporary seed");
+        std::fs::remove_file(path)?;
+        Ok(())
     }
 
     #[test]
-    fn key_file_rejects_wrong_length() {
-        let path = temp_seed_path();
-        std::fs::write(&path, [0u8; 31]).expect("write temporary seed");
+    fn key_file_rejects_wrong_length() -> TestResult {
+        let path = temp_seed_path()?;
+        std::fs::write(&path, [0u8; 31])?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
 
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .expect("set temporary seed permissions");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         }
 
         assert!(matches!(
             load_seed(&KekProvenance::KeyFile { path: path.clone() }),
             Err(SecretsError::KekUnavailable { .. })
         ));
-        std::fs::remove_file(path).expect("remove temporary seed");
+        std::fs::remove_file(path)?;
+        Ok(())
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
-    fn key_file_rejects_a_symlink_instead_of_following_it() {
+    fn key_file_rejects_a_symlink_instead_of_following_it() -> TestResult {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
-        let target = temp_seed_path();
-        let link = temp_seed_path();
-        std::fs::write(&target, [0xC3; 32]).expect("write temporary seed target");
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
-            .expect("set temporary seed target permissions");
-        symlink(&target, &link).expect("create temporary seed symlink");
+        let target = temp_seed_path()?;
+        let link = temp_seed_path()?;
+        std::fs::write(&target, [0xC3; 32])?;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))?;
+        symlink(&target, &link)?;
 
         assert!(matches!(
             load_seed(&KekProvenance::KeyFile { path: link.clone() }),
             Err(SecretsError::Io(_))
         ));
 
-        std::fs::remove_file(link).expect("remove temporary seed symlink");
-        std::fs::remove_file(target).expect("remove temporary seed target");
+        std::fs::remove_file(link)?;
+        std::fs::remove_file(target)?;
+        Ok(())
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
-    fn key_file_rejects_group_or_other_permissions_from_opened_handle() {
+    fn key_file_rejects_group_or_other_permissions_from_opened_handle() -> TestResult {
         use std::os::unix::fs::PermissionsExt;
 
-        let path = temp_seed_path();
-        std::fs::write(&path, [0x6D; 32]).expect("write temporary seed");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
-            .expect("set unsafe temporary seed permissions");
+        let path = temp_seed_path()?;
+        std::fs::write(&path, [0x6D; 32])?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
 
         assert!(matches!(
             load_seed(&KekProvenance::KeyFile { path: path.clone() }),
             Err(SecretsError::UnsafeKeyFilePermissions { mode, .. }) if mode & 0o777 == 0o640
         ));
 
-        std::fs::remove_file(path).expect("remove temporary seed");
+        std::fs::remove_file(path)?;
+        Ok(())
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -466,15 +477,16 @@ mod tests {
     }
 
     #[test]
-    fn test_env_seed_from_os_value_loads_exactly_32_utf8_bytes() {
+    fn test_env_seed_from_os_value_loads_exactly_32_utf8_bytes() -> TestResult {
         let value = OsString::from("12345678901234567890123456789012");
 
-        let loaded = env_seed_from_os_value("HARWNESS_TEST_KEK", &value).expect("load env seed");
+        let loaded = env_seed_from_os_value("HARWNESS_TEST_KEK", &value)?;
 
         assert_eq!(
             loaded.expose_secret().as_ref(),
             b"12345678901234567890123456789012".as_slice()
         );
+        Ok(())
     }
 
     #[test]
@@ -514,18 +526,20 @@ mod tests {
     }
 
     #[test]
-    fn exact_32_byte_secret_validator_places_secret_in_secret_box() {
-        let secret = secret_box_from_exact_32_bytes("os-keyring", vec![0x7E; 32])
-            .expect("32-byte secret is accepted");
+    fn exact_32_byte_secret_validator_places_secret_in_secret_box() -> TestResult {
+        let secret = secret_box_from_exact_32_bytes("os-keyring", vec![0x7E; 32])?;
 
         assert_eq!(secret.expose_secret().as_ref(), [0x7E; 32].as_slice());
+        Ok(())
     }
 
     #[test]
-    fn exact_32_byte_secret_validator_rejects_wrong_length_without_reporting_secret() {
-        let error = match secret_box_from_exact_32_bytes("os-keyring", vec![0x42; 31]) {
-            Err(error) => error,
-            Ok(_) => panic!("31-byte secret is rejected"),
+    fn exact_32_byte_secret_validator_rejects_wrong_length_without_reporting_secret() -> TestResult
+    {
+        let Err(error) = secret_box_from_exact_32_bytes("os-keyring", vec![0x42; 31]) else {
+            return Err(TestError::Unexpected(
+                "Err erwartet (31-byte secret is rejected)".into(),
+            ));
         };
 
         assert!(matches!(
@@ -534,6 +548,7 @@ mod tests {
                 if kind == "os-keyring"
                     && reason == "expected exactly 32 bytes, found 31"
         ));
+        Ok(())
     }
 
     #[cfg(not(feature = "keyring"))]
@@ -564,19 +579,20 @@ mod tests {
 
     /// crypt_guard public key for the domain-separated per-KEM seed, i.e. what
     /// production derivation must produce.
-    fn crypt_guard_public_key(policy: &CryptoPolicy, seed: &[u8; 32]) -> Vec<u8> {
+    fn crypt_guard_public_key(policy: &CryptoPolicy, seed: &[u8; 32]) -> TestResult<Vec<u8>> {
         crypt_guard_raw_public_key(policy, &derive_kem_seed(policy.kem, seed))
     }
 
     /// crypt_guard public key for `seed` used verbatim, without harw's domain
     /// separation (control value only).
-    fn crypt_guard_raw_public_key(policy: &CryptoPolicy, seed: &[u8; 32]) -> Vec<u8> {
-        RecipientPrivateKey::from_seed_bytes(policy.kem.hpke_kem().expect("hybrid KEM"), seed)
-            .expect("hybrid recipient private key from seed")
+    fn crypt_guard_raw_public_key(policy: &CryptoPolicy, seed: &[u8; 32]) -> TestResult<Vec<u8>> {
+        let public_key = RecipientPrivateKey::from_seed_bytes(policy.kem.hpke_kem()?, seed)
+            .map_err(ctx("hybrid recipient private key from seed"))?
             .public_key()
-            .expect("hybrid recipient public key")
+            .map_err(ctx("hybrid recipient public key"))?
             .as_bytes()
-            .to_vec()
+            .to_vec();
+        Ok(public_key)
     }
 
     fn hex(bytes: &[u8]) -> String {
@@ -584,17 +600,17 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_derivation_is_stable_for_a_seed_and_policy() {
+    fn deterministic_derivation_is_stable_for_a_seed_and_policy() -> TestResult {
         let policy = CryptoPolicy::ml_kem_768_x25519();
         let seed = test_seed(0xA5);
 
-        let public_first = derive_public_key(&policy, &seed).expect("derive first public key");
-        let secret_first = derive_secret_key(&policy, &seed).expect("derive first secret key");
-        let public_second = derive_public_key(&policy, &seed).expect("derive second public key");
-        let secret_second = derive_secret_key(&policy, &seed).expect("derive second secret key");
+        let public_first = derive_public_key(&policy, &seed)?;
+        let secret_first = derive_secret_key(&policy, &seed)?;
+        let public_second = derive_public_key(&policy, &seed)?;
+        let secret_second = derive_secret_key(&policy, &seed)?;
 
         assert!(!public_first.is_empty());
-        assert_eq!(public_first, crypt_guard_public_key(&policy, &[0xA5; 32]));
+        assert_eq!(public_first, crypt_guard_public_key(&policy, &[0xA5; 32])?);
         // The secret key is the domain-separated per-KEM seed, never the root
         // KEK seed.
         assert_eq!(
@@ -604,52 +620,45 @@ mod tests {
         assert_ne!(secret_first.expose_secret().as_ref(), [0xA5; 32].as_slice());
         assert_eq!(public_first, public_second);
         assert_eq!(secret_first.expose_secret(), secret_second.expose_secret());
+        Ok(())
     }
 
     #[test]
-    fn changing_the_seed_changes_derived_key_material() {
+    fn changing_the_seed_changes_derived_key_material() -> TestResult {
         let policy = CryptoPolicy::ml_kem_768_p256();
         let first_seed = test_seed(0x11);
         let second_seed = test_seed(0x22);
 
         assert_ne!(
-            derive_public_key(&policy, &first_seed).expect("derive first public key"),
-            derive_public_key(&policy, &second_seed).expect("derive second public key"),
+            derive_public_key(&policy, &first_seed)?,
+            derive_public_key(&policy, &second_seed)?,
         );
         assert_ne!(
-            derive_secret_key(&policy, &first_seed)
-                .expect("derive first secret key")
-                .expose_secret(),
-            derive_secret_key(&policy, &second_seed)
-                .expect("derive second secret key")
-                .expose_secret(),
+            derive_secret_key(&policy, &first_seed)?.expose_secret(),
+            derive_secret_key(&policy, &second_seed)?.expose_secret(),
         );
+        Ok(())
     }
 
     #[test]
-    fn every_hybrid_kem_policy_derives_stable_hpke_material() {
+    fn every_hybrid_kem_policy_derives_stable_hpke_material() -> TestResult {
         let seed = test_seed(0x5A);
         let mut public_keys = Vec::new();
 
         for policy in hybrid_policies() {
-            let public = derive_public_key(&policy, &seed).expect("derive public key");
-            let secret = derive_secret_key(&policy, &seed).expect("derive secret key");
+            let public = derive_public_key(&policy, &seed)?;
+            let secret = derive_secret_key(&policy, &seed)?;
 
             assert!(!public.is_empty());
-            assert_eq!(public, crypt_guard_public_key(&policy, &[0x5A; 32]));
+            assert_eq!(public, crypt_guard_public_key(&policy, &[0x5A; 32])?);
             assert_eq!(
                 secret.expose_secret().as_ref(),
                 derive_kem_seed(policy.kem, &[0x5A; 32]).as_slice()
             );
-            assert_eq!(
-                public,
-                derive_public_key(&policy, &seed).expect("re-derive public key")
-            );
+            assert_eq!(public, derive_public_key(&policy, &seed)?);
             assert_eq!(
                 secret.expose_secret(),
-                derive_secret_key(&policy, &seed)
-                    .expect("re-derive secret key")
-                    .expose_secret()
+                derive_secret_key(&policy, &seed)?.expose_secret()
             );
             public_keys.push(public);
         }
@@ -660,6 +669,7 @@ mod tests {
         assert_ne!(public_keys[0], public_keys[1]);
         assert_ne!(public_keys[0], public_keys[2]);
         assert_ne!(public_keys[1], public_keys[2]);
+        Ok(())
     }
 
     /// `ML_KEM_768_PUBLIC_KEY_BYTES` is `pub(crate)` in crypt_guard
@@ -668,13 +678,13 @@ mod tests {
     const ML_KEM_768_PUBLIC_KEY_BYTES: usize = 1_184;
 
     #[test]
-    fn ml_kem_768_p256_and_x25519_do_not_share_the_ml_kem_key() {
+    fn ml_kem_768_p256_and_x25519_do_not_share_the_ml_kem_key() -> TestResult {
         let seed = test_seed(0x5A);
         let p256_policy = CryptoPolicy::ml_kem_768_p256();
         let x25519_policy = CryptoPolicy::ml_kem_768_x25519();
 
-        let p256 = derive_public_key(&p256_policy, &seed).expect("derive P-256 public key");
-        let x25519 = derive_public_key(&x25519_policy, &seed).expect("derive X25519 public key");
+        let p256 = derive_public_key(&p256_policy, &seed)?;
+        let x25519 = derive_public_key(&x25519_policy, &seed)?;
 
         assert_eq!(p256.len(), ML_KEM_768_PUBLIC_KEY_BYTES + 65);
         assert_eq!(x25519.len(), ML_KEM_768_PUBLIC_KEY_BYTES + 32);
@@ -685,25 +695,20 @@ mod tests {
         );
 
         // Determinism is preserved.
-        assert_eq!(
-            p256,
-            derive_public_key(&p256_policy, &seed).expect("re-derive P-256 public key")
-        );
-        assert_eq!(
-            x25519,
-            derive_public_key(&x25519_policy, &seed).expect("re-derive X25519 public key")
-        );
+        assert_eq!(p256, derive_public_key(&p256_policy, &seed)?);
+        assert_eq!(x25519, derive_public_key(&x25519_policy, &seed)?);
 
         // Control: without the domain separation crypt_guard 3.0.1 expands the
         // root seed to the same ML-KEM-768 key for both variants.
-        let raw_p256 = crypt_guard_raw_public_key(&p256_policy, &[0x5A; 32]);
-        let raw_x25519 = crypt_guard_raw_public_key(&x25519_policy, &[0x5A; 32]);
+        let raw_p256 = crypt_guard_raw_public_key(&p256_policy, &[0x5A; 32])?;
+        let raw_x25519 = crypt_guard_raw_public_key(&x25519_policy, &[0x5A; 32])?;
         assert_eq!(
             raw_p256[..ML_KEM_768_PUBLIC_KEY_BYTES],
             raw_x25519[..ML_KEM_768_PUBLIC_KEY_BYTES]
         );
         assert_ne!(p256, raw_p256);
         assert_ne!(x25519, raw_x25519);
+        Ok(())
     }
 
     /// Fixed 32-byte seed shared by both known-answer tests.
@@ -742,38 +747,39 @@ mod tests {
     const BLESS_ENV: &str = "HARW_BLESS";
 
     #[test]
-    fn hybrid_public_key_derivation_matches_blessed_known_answers() {
+    fn hybrid_public_key_derivation_matches_blessed_known_answers() -> TestResult {
         let seed = SecretBox::new(KAT_SEED.to_vec().into_boxed_slice());
-        let actual: String = hybrid_policies()
-            .iter()
-            .map(|policy| {
-                let public = derive_public_key(policy, &seed).expect("derive KAT public key");
-                format!(
-                    "{} {}\n",
-                    policy.kem.wire_name(),
-                    hex(&crate::audit::chain::sha256(&public))
-                )
-            })
-            .collect();
+        let mut actual = String::new();
+        for policy in hybrid_policies().iter() {
+            let public = derive_public_key(policy, &seed)?;
+            actual.push_str(&format!(
+                "{} {}\n",
+                policy.kem.wire_name(),
+                hex(&crate::audit::chain::sha256(&public))
+            ));
+        }
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(KEM_KAT_FIXTURE);
 
         if std::env::var_os(BLESS_ENV).is_some_and(|value| value == "1") {
-            std::fs::create_dir_all(path.parent().expect("fixture directory"))
-                .expect("create KEM KAT fixture directory");
-            std::fs::write(&path, &actual).expect("write blessed KEM KAT fixture");
-            return;
+            let parent = path
+                .parent()
+                .ok_or(TestError::Missing("KEM KAT fixture directory"))?;
+            std::fs::create_dir_all(parent)?;
+            std::fs::write(&path, &actual)?;
+            return Ok(());
         }
 
         let expected = match std::fs::read_to_string(&path) {
             Ok(expected) => expected,
-            Err(error) => panic!(
-                "KEM known-answer fixture '{}' is missing or unreadable ({error}). \
-                 Bless it once, after reviewing the crypt_guard pin, with \
-                 `{BLESS_ENV}=1 cargo test -p harw-secrets \
-                 hybrid_public_key_derivation_matches_blessed_known_answers`, \
-                 then commit the file.",
-                path.display()
-            ),
+            Err(error) => {
+                return Err(TestError::Context {
+                    context: "KEM known-answer fixture is missing or unreadable; bless it once, \
+                        after reviewing the crypt_guard pin, with `HARW_BLESS=1 cargo test -p \
+                        harw-secrets hybrid_public_key_derivation_matches_blessed_known_answers`, \
+                        then commit the file",
+                    source: format!("{}: {error}", path.display()),
+                });
+            }
         };
         assert_eq!(
             expected.trim_end(),
@@ -781,6 +787,7 @@ mod tests {
             "hybrid public-key derivation changed (crypt_guard upgrade or harw domain \
              separation): every persisted secret store would become unreadable"
         );
+        Ok(())
     }
 
     #[test]
@@ -828,44 +835,41 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
-    fn loaded_kek_material_constructs_native_hpke_material() {
-        let seed_path = temp_seed_path();
-        std::fs::write(&seed_path, [0x3C; 32]).expect("write temporary seed");
+    fn loaded_kek_material_constructs_native_hpke_material() -> TestResult {
+        let seed_path = temp_seed_path()?;
+        std::fs::write(&seed_path, [0x3C; 32])?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
 
-            std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o600))
-                .expect("set temporary seed permissions");
+            std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o600))?;
         }
 
         let policy = CryptoPolicy::strongest();
         let provenance = KekProvenance::KeyFile {
             path: seed_path.clone(),
         };
-        let first_material =
-            load_kek_material(&policy, &provenance).expect("derive first configured KEK material");
-        let second_material =
-            load_kek_material(&policy, &provenance).expect("derive second configured KEK material");
+        let first_material = load_kek_material(&policy, &provenance)?;
+        let second_material = load_kek_material(&policy, &provenance)?;
         assert_eq!(
-            derive_public_key(&policy, &test_seed(0x3C)).expect("derive native public key"),
-            derive_public_key(&policy, &test_seed(0x3C)).expect("re-derive native public key")
+            derive_public_key(&policy, &test_seed(0x3C))?,
+            derive_public_key(&policy, &test_seed(0x3C))?
         );
         drop((first_material, second_material));
 
-        std::fs::remove_file(seed_path).expect("remove temporary seed");
+        std::fs::remove_file(seed_path)?;
+        Ok(())
     }
 
     #[test]
-    fn loading_kek_material_rejects_an_invalid_configured_seed() {
-        let path = temp_seed_path();
-        std::fs::write(&path, [0u8; 31]).expect("write temporary invalid seed");
+    fn loading_kek_material_rejects_an_invalid_configured_seed() -> TestResult {
+        let path = temp_seed_path()?;
+        std::fs::write(&path, [0u8; 31])?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
 
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .expect("set temporary seed permissions");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         }
 
         assert!(matches!(
@@ -876,6 +880,7 @@ mod tests {
             Err(SecretsError::KekUnavailable { .. })
         ));
 
-        std::fs::remove_file(path).expect("remove temporary invalid seed");
+        std::fs::remove_file(path)?;
+        Ok(())
     }
 }

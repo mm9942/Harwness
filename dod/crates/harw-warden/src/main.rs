@@ -165,7 +165,8 @@ use error::WardenBinError;
 /// initialisiert `tracing` und delegiert an [`run`].
 ///
 /// # Returns
-/// `ExitCode::SUCCESS` nur bei `--help`/`--version`. Jeder andere Pfad ist
+/// `ExitCode::SUCCESS` nur bei `--help`/`--version` oder nach erfolgreichem
+/// `completions`. Jeder andere Pfad ist
 /// `ExitCode::FAILURE` — `run` selbst kehrt nie mit `Ok` zurück (siehe
 /// dessen Doku): ein Durchsetzer, dessen Annahmeschleife endet, hat seine
 /// eine Aufgabe nicht mehr erfüllen können.
@@ -244,7 +245,8 @@ fn init_tracing(level: cli::LogLevel) {
 /// - `cli` (`cli::Cli`): die geparste Kommandozeile.
 ///
 /// # Returns
-/// Kehrt nie mit `Ok` zurück — [`ipc::serve_forever`] kehrt nur zurück,
+/// `Ok(())` nur nach dem Unterkommando `completions`. Sonst kehrt diese
+/// Funktion nie mit `Ok` zurück — [`ipc::serve_forever`] kehrt nur zurück,
 /// wenn die Annahmeschleife endgültig endet, was diese Funktion als
 /// [`WardenBinError::IpcAcceptLoopTerminated`] meldet.
 ///
@@ -256,7 +258,22 @@ fn init_tracing(level: cli::LogLevel) {
 /// [`WardenBinError::LandlockUnavailable`]: siehe [`landlock`].
 /// [`WardenBinError::IpcAcceptLoopTerminated`]: die Annahmeschleife hat sich
 /// endgültig beendet.
+/// [`WardenBinError::Completions`]: das Unterkommando `completions` ist
+/// fehlgeschlagen.
 fn run(cli: Cli) -> Result<(), WardenBinError> {
+    // `completions` läuft vor jedem systemd-, Landlock- oder Socket-Schritt:
+    // es schreibt nur ein Skript (bzw. installiert es) und beendet sich.
+    if let Some(harw_completions::CompletionsSubcommand::Completions(args)) = &cli.command {
+        harw_completions::run_completions(
+            &mut <Cli as clap::CommandFactory>::command(),
+            "harw-warden",
+            args,
+            &harw_completions::HomeEnv::from_process(),
+            &mut std::io::stdout().lock(),
+        )?;
+        return Ok(());
+    }
+
     let listen_fd = systemd::acquire_listen_socket()?;
     tracing::info!("systemd listen socket acquired");
 
@@ -311,3 +328,7 @@ mod tests {
     // bei `harw-sentinel`/`harw-probe-fs` ungetestet (siehe dessen
     // Moduldoku).
 }
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

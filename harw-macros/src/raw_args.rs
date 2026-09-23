@@ -715,7 +715,10 @@ fn expand_enum(input: &DeriveInput, data: &syn::DataEnum) -> syn::Result<proc_ma
         // einwortigen Varianten sind kebab und snake identisch — ohne
         // Deduplizierung entstünde ein doppeltes Literal im Or-Pattern.
         let mut literals: Vec<String> = Vec::with_capacity(2 + aliases.len());
-        for candidate in [kebab.clone(), snake_case(&name)].into_iter().chain(aliases) {
+        for candidate in [kebab.clone(), snake_case(&name)]
+            .into_iter()
+            .chain(aliases)
+        {
             if !literals.contains(&candidate) {
                 literals.push(candidate);
             }
@@ -850,22 +853,26 @@ fn expand_enum(input: &DeriveInput, data: &syn::DataEnum) -> syn::Result<proc_ma
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use syn::DeriveInput;
 
     // ── Helfer ────────────────────────────────────────────────────────────────
 
     /// Expandiert und liefert den Token-Strom als String.
-    fn expand_ok(input: &DeriveInput) -> String {
-        expand_from_raw_args(input)
-            .expect("Expansion muss gelingen")
-            .to_string()
+    fn expand_ok(input: &DeriveInput) -> TestResult<String> {
+        Ok(expand_from_raw_args(input)
+            .map_err(ctx("Expansion muss gelingen"))?
+            .to_string())
     }
 
     /// Expandiert und liefert die Fehlermeldung.
-    fn expand_err(input: &DeriveInput) -> String {
-        expand_from_raw_args(input)
-            .expect_err("Expansion muss fehlschlagen")
-            .to_string()
+    fn expand_err(input: &DeriveInput) -> TestResult<String> {
+        let Err(error) = expand_from_raw_args(input) else {
+            return Err(TestError::Unexpected(
+                "Expansion muss fehlschlagen".to_owned(),
+            ));
+        };
+        Ok(error.to_string())
     }
 
     /// Entfernt jeden Leerraum, damit Code-Form-Zusicherungen unabhängig von der
@@ -928,17 +935,18 @@ mod tests {
     // ── Variantenauswahl ─────────────────────────────────────────────────────
 
     #[test]
-    fn test_enum_variant_matches_kebab_and_snake_case() {
-        let expanded = squeeze(&expand_ok(&plan_args()));
+    fn test_enum_variant_matches_kebab_and_snake_case() -> TestResult {
+        let expanded = squeeze(&expand_ok(&plan_args())?);
         assert!(
             expanded.contains(r#"Some("add-criterion"|"add_criterion")"#),
             "kebab- und snake_case-Token müssen im selben Or-Pattern stehen: {expanded}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_enum_single_word_variant_emits_token_only_once() {
-        let expanded = squeeze(&expand_ok(&plan_args()));
+    fn test_enum_single_word_variant_emits_token_only_once() -> TestResult {
+        let expanded = squeeze(&expand_ok(&plan_args())?);
         // `Ready` ist in kebab und snake identisch — ohne Deduplizierung würde
         // `unreachable_patterns` anschlagen.
         assert!(
@@ -949,20 +957,22 @@ mod tests {
             !expanded.contains(r#""ready"|"ready""#),
             "Literal wurde nicht dedupliziert: {expanded}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_enum_alias_is_accepted_as_extra_token() {
-        let expanded = squeeze(&expand_ok(&plan_args()));
+    fn test_enum_alias_is_accepted_as_extra_token() -> TestResult {
+        let expanded = squeeze(&expand_ok(&plan_args())?);
         assert!(
             expanded.contains(r#"Some("inspect"|"ls")"#),
             "Alias fehlt im Or-Pattern: {expanded}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_enum_head_comparison_is_case_insensitive() {
-        let expanded = expand_ok(&plan_args());
+    fn test_enum_head_comparison_is_case_insensitive() -> TestResult {
+        let expanded = expand_ok(&plan_args())?;
         // Der Kopf wird kleingeschrieben, die Pattern-Literale sind bereits klein.
         assert!(
             expanded.contains("to_lowercase"),
@@ -972,10 +982,11 @@ mod tests {
             !expanded.contains(r#""Create""#),
             "Pattern-Literal wurde nicht kleingeschrieben: {expanded}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_enum_alias_is_lowercased_at_expansion_time() {
+    fn test_enum_alias_is_lowercased_at_expansion_time() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[raw(subcommand)]
             enum E {
@@ -983,18 +994,19 @@ mod tests {
                 Inspect,
             }
         };
-        let expanded = squeeze(&expand_ok(&input));
+        let expanded = squeeze(&expand_ok(&input)?);
         assert!(
             expanded.contains(r#"Some("inspect"|"ls")"#),
             "Alias wurde nicht kleingeschrieben: {expanded}"
         );
+        Ok(())
     }
 
     // ── Feldverteilung relativ zum Rest ──────────────────────────────────────
 
     #[test]
-    fn test_enum_nth_is_zero_based_relative_to_rest() {
-        let expanded = squeeze(&expand_ok(&plan_args()));
+    fn test_enum_nth_is_zero_based_relative_to_rest() -> TestResult {
+        let expanded = squeeze(&expand_ok(&plan_args())?);
         // `nth = 0` im Enum meint das Token direkt nach dem Subcommand.
         assert!(
             expanded.contains("nth_optional(__harw_rest,0usize)"),
@@ -1014,31 +1026,34 @@ mod tests {
             !expanded.contains("nth_optional(tokens,"),
             "Enum-Felder dürfen nicht auf den vollen Slice zeigen: {expanded}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_enum_join_from_uses_rest_slice() {
-        let expanded = squeeze(&expand_ok(&plan_args()));
+    fn test_enum_join_from_uses_rest_slice() -> TestResult {
+        let expanded = squeeze(&expand_ok(&plan_args())?);
         assert!(
             expanded.contains("join_from(__harw_rest,1usize)"),
             "join_from muss auf __harw_rest zeigen: {expanded}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_enum_join_uses_rest_slice() {
-        let expanded = squeeze(&expand_ok(&plan_args()));
+    fn test_enum_join_uses_rest_slice() -> TestResult {
+        let expanded = squeeze(&expand_ok(&plan_args())?);
         assert!(
             expanded.contains("join_all_optional(__harw_rest)"),
             "join muss auf __harw_rest zeigen: {expanded}"
         );
+        Ok(())
     }
 
     // ── Unit-Varianten ───────────────────────────────────────────────────────
 
     #[test]
-    fn test_enum_unit_variant_ignores_extra_tokens() {
-        let expanded = squeeze(&expand_ok(&plan_args()));
+    fn test_enum_unit_variant_ignores_extra_tokens() -> TestResult {
+        let expanded = squeeze(&expand_ok(&plan_args())?);
         // Unit-Varianten konstruieren ohne Token-Prüfung — `/plan ready --verbose`
         // darf nicht scheitern.
         assert!(
@@ -1049,13 +1064,14 @@ mod tests {
             !expanded.contains("require_empty"),
             "Unit-Variante darf überzählige Tokens nicht ablehnen: {expanded}"
         );
+        Ok(())
     }
 
     // ── Usage-Meldungen ──────────────────────────────────────────────────────
 
     #[test]
-    fn test_enum_unknown_subcommand_lists_all_subcommands_alphabetically() {
-        let expanded = expand_ok(&plan_args());
+    fn test_enum_unknown_subcommand_lists_all_subcommands_alphabetically() -> TestResult {
+        let expanded = expand_ok(&plan_args())?;
         assert!(
             expanded.contains("unbekannter Subcommand `{}`; erwartet eines von: {}"),
             "Fehlertext für unbekannten Subcommand fehlt: {expanded}"
@@ -1065,32 +1081,35 @@ mod tests {
             expanded.contains(r#""add-criterion, create, inspect, ready, status""#),
             "Subcommand-Liste fehlt oder ist unsortiert: {expanded}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_enum_missing_subcommand_lists_all_subcommands() {
-        let expanded = expand_ok(&plan_args());
+    fn test_enum_missing_subcommand_lists_all_subcommands() -> TestResult {
+        let expanded = expand_ok(&plan_args())?;
         assert!(
             expanded.contains(
                 r#""kein Subcommand angegeben; erwartet eines von: add-criterion, create, inspect, ready, status""#
             ),
             "Fehlertext für fehlenden Subcommand fehlt: {expanded}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_enum_usage_list_excludes_aliases() {
-        let expanded = expand_ok(&plan_args());
+    fn test_enum_usage_list_excludes_aliases() -> TestResult {
+        let expanded = expand_ok(&plan_args())?;
         assert!(
             !expanded.contains("inspect, ls"),
             "Aliase dürfen nicht in der Usage-Liste stehen: {expanded}"
         );
+        Ok(())
     }
 
     // ── default_subcommand ───────────────────────────────────────────────────
 
     #[test]
-    fn test_enum_default_subcommand_handles_empty_input() {
+    fn test_enum_default_subcommand_handles_empty_input() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[raw(subcommand)]
             enum ModeArgs {
@@ -1099,7 +1118,7 @@ mod tests {
                 Set { #[raw(nth = 0)] value: Option<String> },
             }
         };
-        let expanded = squeeze(&expand_ok(&input));
+        let expanded = squeeze(&expand_ok(&input)?);
         assert!(
             expanded.contains("Option::None=>::core::result::Result::Ok(Self::Show)"),
             "leerer Input muss die Default-Variante liefern: {expanded}"
@@ -1108,10 +1127,11 @@ mod tests {
             !expanded.contains("keinSubcommandangegeben"),
             "mit default_subcommand darf kein Usage-Fehler erzeugt werden: {expanded}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_enum_default_subcommand_with_fields_gets_empty_rest() {
+    fn test_enum_default_subcommand_with_fields_gets_empty_rest() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[raw(subcommand)]
             enum GoalArgs {
@@ -1119,7 +1139,7 @@ mod tests {
                 Show { #[raw(join_from = 0)] filter: Option<String> },
             }
         };
-        let expanded = squeeze(&expand_ok(&input));
+        let expanded = squeeze(&expand_ok(&input)?);
         assert!(
             expanded.contains("Option::None=>::core::result::Result::Ok(Self::Show{"),
             "Default-Variante mit Feldern fehlt: {expanded}"
@@ -1128,10 +1148,11 @@ mod tests {
             expanded.contains("join_from(__harw_rest,0usize)"),
             "Default-Variante muss ebenfalls __harw_rest nutzen: {expanded}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_enum_two_default_subcommands_is_error() {
+    fn test_enum_two_default_subcommands_is_error() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[raw(subcommand)]
             enum E {
@@ -1142,15 +1163,16 @@ mod tests {
             }
         };
         assert_eq!(
-            expand_err(&input),
+            expand_err(&input)?,
             "höchstens eine Variante darf #[raw(default_subcommand)] tragen; gefunden: Show, List"
         );
+        Ok(())
     }
 
     // ── Compile-Fehler im Enum-Pfad ──────────────────────────────────────────
 
     #[test]
-    fn test_enum_tuple_variant_is_error() {
+    fn test_enum_tuple_variant_is_error() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[raw(subcommand)]
             enum E {
@@ -1158,38 +1180,41 @@ mod tests {
             }
         };
         assert_eq!(
-            expand_err(&input),
+            expand_err(&input)?,
             "FromRawArgs unterstützt nur Unit- und Struct-Varianten; die Tupel-Variante `Create` ist nicht erlaubt"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_enum_without_subcommand_attribute_is_error() {
+    fn test_enum_without_subcommand_attribute_is_error() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             enum E {
                 Ready,
             }
         };
         assert_eq!(
-            expand_err(&input),
+            expand_err(&input)?,
             "FromRawArgs an einem Enum verlangt #[raw(subcommand)] am Enum selbst"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_enum_without_variants_is_error() {
+    fn test_enum_without_variants_is_error() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[raw(subcommand)]
             enum E {}
         };
         assert_eq!(
-            expand_err(&input),
+            expand_err(&input)?,
             "FromRawArgs verlangt mindestens eine Variante am #[raw(subcommand)]-Enum"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_enum_duplicate_subcommand_token_is_error() {
+    fn test_enum_duplicate_subcommand_token_is_error() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[raw(subcommand)]
             enum E {
@@ -1199,13 +1224,14 @@ mod tests {
             }
         };
         assert_eq!(
-            expand_err(&input),
+            expand_err(&input)?,
             "doppelter Subcommand-Token `ready`: Variante `Start` kollidiert mit Variante `Ready`"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_enum_alias_with_whitespace_is_error() {
+    fn test_enum_alias_with_whitespace_is_error() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[raw(subcommand)]
             enum E {
@@ -1213,15 +1239,16 @@ mod tests {
                 AddCriterion,
             }
         };
-        let err = expand_err(&input);
+        let err = expand_err(&input)?;
         assert!(
             err.contains("darf keine Leerzeichen enthalten"),
             "unerwartete Meldung: {err}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_enum_unknown_variant_key_is_error() {
+    fn test_enum_unknown_variant_key_is_error() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[raw(subcommand)]
             enum E {
@@ -1229,15 +1256,16 @@ mod tests {
                 Ready,
             }
         };
-        let err = expand_err(&input);
+        let err = expand_err(&input)?;
         assert!(
             err.contains("unbekanntes oder ungültiges raw-Attribut an Variante: `rename`"),
             "unerwartete Meldung: {err}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_enum_multiple_required_per_variant_is_error() {
+    fn test_enum_multiple_required_per_variant_is_error() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[raw(subcommand)]
             enum E {
@@ -1250,13 +1278,14 @@ mod tests {
             }
         };
         assert_eq!(
-            expand_err(&input),
+            expand_err(&input)?,
             "höchstens ein Feld darf #[raw(required)] tragen in Variante `Create`; gefunden: a, b"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_enum_field_wrong_type_is_error() {
+    fn test_enum_field_wrong_type_is_error() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[raw(subcommand)]
             enum E {
@@ -1266,11 +1295,12 @@ mod tests {
                 },
             }
         };
-        assert_eq!(expand_err(&input), "#[raw(nth)] verlangt Option<String>");
+        assert_eq!(expand_err(&input)?, "#[raw(nth)] verlangt Option<String>");
+        Ok(())
     }
 
     #[test]
-    fn test_enum_field_missing_attribute_is_error() {
+    fn test_enum_field_missing_attribute_is_error() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[raw(subcommand)]
             enum E {
@@ -1280,13 +1310,14 @@ mod tests {
             }
         };
         assert_eq!(
-            expand_err(&input),
+            expand_err(&input)?,
             "Feld 'id' hat kein #[raw(...)]-Attribut; erwartet eines von first, join, join_from = N, nth = N, required"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_enum_conflicting_field_attributes_is_error() {
+    fn test_enum_conflicting_field_attributes_is_error() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[raw(subcommand)]
             enum E {
@@ -1297,15 +1328,16 @@ mod tests {
             }
         };
         assert_eq!(
-            expand_err(&input),
+            expand_err(&input)?,
             "widersprüchliche #[raw(...)]-Attribute an Feld 'id': first, join_from = 2"
         );
+        Ok(())
     }
 
     // ── Struct-Pfad: Rückwärtskompatibilität + join_from ─────────────────────
 
     #[test]
-    fn test_struct_modes_reference_full_token_slice() {
+    fn test_struct_modes_reference_full_token_slice() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             struct SkillsArgs {
                 #[raw(first)]
@@ -1316,7 +1348,7 @@ mod tests {
                 all: Option<String>,
             }
         };
-        let expanded = squeeze(&expand_ok(&input));
+        let expanded = squeeze(&expand_ok(&input)?);
         assert!(expanded.contains("first_optional(tokens)"), "{expanded}");
         assert!(
             expanded.contains("nth_optional(tokens,1usize)"),
@@ -1327,10 +1359,11 @@ mod tests {
             !expanded.contains("__harw_rest"),
             "Struct-Pfad darf keinen Rest-Slice erzeugen: {expanded}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_struct_join_from_is_supported_and_zero_based() {
+    fn test_struct_join_from_is_supported_and_zero_based() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             struct Args {
                 #[raw(first)]
@@ -1341,23 +1374,24 @@ mod tests {
                 everything: Option<String>,
             }
         };
-        let expanded = squeeze(&expand_ok(&input));
+        let expanded = squeeze(&expand_ok(&input)?);
         assert!(expanded.contains("join_from(tokens,1usize)"), "{expanded}");
         assert!(
             expanded.contains("join_from(tokens,0usize)"),
             "join_from = 0 muss im Struct-Pfad erlaubt sein: {expanded}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_struct_nth_zero_is_error_and_explains_enum_semantics() {
+    fn test_struct_nth_zero_is_error_and_explains_enum_semantics() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             struct Args {
                 #[raw(nth = 0)]
                 id: Option<String>,
             }
         };
-        let err = expand_err(&input);
+        let err = expand_err(&input)?;
         assert!(
             err.contains("#[raw(nth = 0)] ist im Struct-Pfad nicht erlaubt"),
             "unerwartete Meldung: {err}"
@@ -1366,10 +1400,11 @@ mod tests {
             err.contains("0-basiert relativ zu den Tokens nach dem Subcommand"),
             "der Semantik-Unterschied muss im Fehlertext stehen: {err}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_struct_with_subcommand_attribute_is_error() {
+    fn test_struct_with_subcommand_attribute_is_error() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[raw(subcommand)]
             struct Args {
@@ -1378,72 +1413,77 @@ mod tests {
             }
         };
         assert_eq!(
-            expand_err(&input),
+            expand_err(&input)?,
             "#[raw(subcommand)] ist nur an Enums erlaubt; Structs verteilen ihre Tokens direkt über die Feld-Attribute"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_struct_tuple_shape_is_error() {
+    fn test_struct_tuple_shape_is_error() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             struct Args(String);
         };
         assert_eq!(
-            expand_err(&input),
+            expand_err(&input)?,
             "FromRawArgs verlangt ein Struct mit benannten Feldern"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_struct_without_fields_expands_to_empty_constructor() {
+    fn test_struct_without_fields_expands_to_empty_constructor() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             struct Args {}
         };
-        let expanded = squeeze(&expand_ok(&input));
+        let expanded = squeeze(&expand_ok(&input)?);
         assert!(expanded.contains("Ok(Self{})"), "{expanded}");
+        Ok(())
     }
 
     #[test]
-    fn test_struct_required_wraps_value_in_some() {
+    fn test_struct_required_wraps_value_in_some() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             struct Args {
                 #[raw(required)]
                 id: Option<String>,
             }
         };
-        let expanded = squeeze(&expand_ok(&input));
+        let expanded = squeeze(&expand_ok(&input)?);
         // Der Feldtyp ist Option<String>, `require_first` liefert String — der
         // Wert muss deshalb in Some(...) verpackt werden.
         assert!(
-            expanded
-                .contains(r#"Some(::harw_operations::args::require_first(tokens,"id")?)"#),
+            expanded.contains(r#"Some(::harw_operations::args::require_first(tokens,"id")?)"#),
             "{expanded}"
         );
+        Ok(())
     }
 
     // ── Container-Diagnosen ──────────────────────────────────────────────────
 
     #[test]
-    fn test_unknown_container_key_is_error() {
+    fn test_unknown_container_key_is_error() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[raw(subcommands)]
             enum E { Ready }
         };
-        let err = expand_err(&input);
+        let err = expand_err(&input)?;
         assert!(
             err.contains("unbekanntes oder ungültiges raw-Attribut am Typ: `subcommands`"),
             "unerwartete Meldung: {err}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_union_is_error() {
+    fn test_union_is_error() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             union U { a: u32 }
         };
         assert_eq!(
-            expand_err(&input),
+            expand_err(&input)?,
             "FromRawArgs unterstützt nur Structs mit benannten Feldern und #[raw(subcommand)]-Enums"
         );
+        Ok(())
     }
 }

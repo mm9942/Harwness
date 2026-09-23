@@ -164,6 +164,7 @@ impl WorkerCancellationSink for RegistryWorkerCancellationSink {
 mod tests {
     use super::*;
 
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_core::{DurableJobRunner, ExecutionControl};
     use harw_job_runtime::{Budget, Job, JobKind, JobOutcome, JobScope, RetryPolicy, StoredJob};
     use harw_session_store::{CancelRequest, ClaimRequest, JobStore};
@@ -173,7 +174,7 @@ mod tests {
     use tokio::sync::{oneshot, watch};
 
     #[tokio::test]
-    async fn unavailable_when_no_execution_is_bound() {
+    async fn unavailable_when_no_execution_is_bound() -> TestResult {
         let executions = Arc::new(JobExecutionRegistry::new());
         let sink = RegistryWorkerCancellationSink::new(executions);
         let now = Timestamp::now();
@@ -185,11 +186,12 @@ mod tests {
             1,
             "nonce",
         )
-        .unwrap();
+        .map_err(ctx("acquire_fenced"))?;
         assert_eq!(
             sink.request_worker_cancellation(&WorkId::from_str("w"), &lease),
             WorkerCancellationStatus::Unavailable
         );
+        Ok(())
     }
 
     struct FakeControl {
@@ -227,7 +229,7 @@ mod tests {
         }
     }
 
-    fn record(id: &str) -> StoredJob {
+    fn record(id: &str) -> TestResult<StoredJob> {
         let now = Timestamp::now();
         let mut job = Job::new(
             WorkId::from_str(id),
@@ -241,8 +243,8 @@ mod tests {
             },
             now,
         );
-        job.mark_ready(now).expect("new job is pending");
-        StoredJob {
+        job.mark_ready(now).map_err(ctx("new job is pending"))?;
+        Ok(StoredJob {
             job,
             scope: JobScope::new(
                 TenantId::from_str("tenant"),
@@ -260,14 +262,16 @@ mod tests {
             cancellation: None,
             revision: 0,
             trace: None,
-        }
+        })
     }
 
     #[tokio::test]
-    async fn durable_cancellation_reaches_registered_execution() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn durable_cancellation_reaches_registered_execution() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempfile::tempdir()"))?;
         let store = Arc::new(JobStore::new(temp.path()));
-        store.admit(&record("work-cancel")).unwrap();
+        store
+            .admit(&record("work-cancel")?)
+            .map_err(ctx("admit work-cancel"))?;
         let work_id = WorkId::from_str("work-cancel");
         let executions = Arc::new(JobExecutionRegistry::new());
         let runner = DurableJobRunner::new(store.clone(), executions.clone());
@@ -303,7 +307,7 @@ mod tests {
                 .await
         });
 
-        let _token = claimed_rx.await.expect("claim reached operation");
+        let _token = claimed_rx.await.map_err(ctx("claim reached operation"))?;
         let transition = store
             .cancel(
                 &work_id,
@@ -315,11 +319,11 @@ mod tests {
                     reason: "operator stop".to_owned(),
                 },
             )
-            .expect("durable cancellation");
+            .map_err(ctx("durable cancellation"))?;
         let prior = transition
             .prior_lease
             .as_ref()
-            .expect("running lease was fenced");
+            .ok_or(TestError::Missing("running lease was fenced"))?;
 
         let sink =
             RegistryWorkerCancellationSink::with_grace(executions.clone(), Duration::from_secs(1));
@@ -334,5 +338,6 @@ mod tests {
         assert_eq!(control.graceful.load(Ordering::SeqCst), 1);
 
         let _ = run.await;
+        Ok(())
     }
 }

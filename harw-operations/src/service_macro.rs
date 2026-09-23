@@ -217,6 +217,7 @@ mod tests {
         OperationMeta, PermissionTier,
     };
     use crate::registry::{OperationRegistry, RegistryError};
+    use crate::test_support::{TestError, TestResult, ctx};
     use std::any::Any;
     use std::sync::OnceLock;
 
@@ -256,12 +257,12 @@ mod tests {
     }
 
     #[test]
-    fn require_service_returns_not_available_when_missing() {
-        let ctx = DummyCtx {
+    fn require_service_returns_not_available_when_missing() -> TestResult {
+        let dummy_ctx = DummyCtx {
             services: ServiceMap::new(),
         };
 
-        let result = fetch_dummy_value(&ctx);
+        let result = fetch_dummy_value(&dummy_ctx);
         match result {
             Err(OpError::NotAvailable(msg)) => {
                 assert!(
@@ -273,8 +274,13 @@ mod tests {
                     "Fehlermeldung sollte das require_service!-Template enthalten, war: {msg}"
                 );
             }
-            other => panic!("erwartete Err(OpError::NotAvailable(_)), erhielt: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartete Err(OpError::NotAvailable(_)), erhielt: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     // ── Fixtures für `operations!` / `try_operations!` ────────────────────────
@@ -303,7 +309,11 @@ mod tests {
         }
 
         fn run<'a>(&'a self, _ctx: &'a crate::context::OpContext, _input: OpInput) -> OpFuture<'a> {
-            unimplemented!("DummyOp::run wird in service_macro-Tests nicht aufgerufen")
+            Box::pin(async {
+                Err(OpError::Execution(
+                    "DummyOp::run wird in service_macro-Tests nicht aufgerufen".to_owned(),
+                ))
+            })
         }
     }
 
@@ -330,7 +340,11 @@ mod tests {
         }
 
         fn run<'a>(&'a self, _ctx: &'a crate::context::OpContext, _input: OpInput) -> OpFuture<'a> {
-            unimplemented!("FixedNameOp::run wird in service_macro-Tests nicht aufgerufen")
+            Box::pin(async {
+                Err(OpError::Execution(
+                    "FixedNameOp::run wird in service_macro-Tests nicht aufgerufen".to_owned(),
+                ))
+            })
         }
     }
 
@@ -359,15 +373,16 @@ mod tests {
     }
 
     #[test]
-    fn try_operations_macro_registers_all_ops() {
+    fn try_operations_macro_registers_all_ops() -> TestResult {
         fn build() -> Result<OperationRegistry, RegistryError> {
             let mut registry = OperationRegistry::new();
             try_operations![registry; FixedNameOp, DummyOp { name: "second" }];
             Ok(registry)
         }
 
-        let registry = build().expect("keine Kollision erwartet");
+        let registry = build().map_err(ctx("keine Kollision erwartet"))?;
         assert_eq!(registry.len(), 2);
+        Ok(())
     }
 
     #[test]

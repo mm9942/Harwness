@@ -17,11 +17,14 @@
 //! `405`-Statuszeile. Der positive Dispatch wird über
 //! [`harw_web::router::decide_route`] belegt.
 
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use common::{TestError, TestResult, ctx};
 use harw_operations::context::OpContext;
 use harw_operations::operation::{
     ApprovalPolicy, BusyAvailability, OpFuture, OpInput, OpOutput, Operation, OperationCategory,
@@ -113,10 +116,10 @@ async fn read_head(stream: &mut UnixStream) -> String {
 
 /// Schickt eine Anfrage `method path` (mit optionalem JSON-Rumpf) an den
 /// Server unter `socket` und liefert den Antwortkopf als Text.
-async fn request_head(socket: &Path, method: &str, path: &str, body: &str) -> String {
+async fn request_head(socket: &Path, method: &str, path: &str, body: &str) -> TestResult<String> {
     let mut stream = UnixStream::connect(socket)
         .await
-        .expect("Testserver lauscht am Tempdir-Socket");
+        .map_err(ctx("Testserver lauscht am Tempdir-Socket"))?;
     let raw = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -124,8 +127,8 @@ async fn request_head(socket: &Path, method: &str, path: &str, body: &str) -> St
     stream
         .write_all(raw.as_bytes())
         .await
-        .expect("Anfrage auf frischen Socket schreibbar");
-    read_head(&mut stream).await
+        .map_err(ctx("Anfrage auf frischen Socket schreibbar"))?;
+    Ok(read_head(&mut stream).await)
 }
 
 /// Liefert den Wert des Kopfes `name` (case-insensitiv) aus einem Antwortkopf.
@@ -145,70 +148,97 @@ fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
 async fn run_against_server(
     registry: &OperationRegistry,
     requests: &[(&'static str, &'static str, &'static str)],
-) -> Vec<String> {
-    let dir = tempfile::tempdir().expect("Tempdir für den Test-Socket anlegbar");
+) -> TestResult<Vec<String>> {
+    let dir = tempfile::tempdir().map_err(ctx("Tempdir für den Test-Socket anlegbar"))?;
     let socket = dir.path().join("m.sock");
-    let routes = WebRouteTable::from_registry(registry).expect("Routentabelle baubar");
+    let routes = WebRouteTable::from_registry(registry).map_err(ctx("Routentabelle baubar"))?;
     // Jede hier geschickte Anfrage muss vor `Execute` abgelehnt werden; ein
-    // Aufruf der Fabrik ist ein F-031-Regressionsbefund.
-    let context_factory: Arc<WebContextFactory> =
-        Arc::new(|_peer: &PeerCredentials, _tier: PermissionTier| -> OpContext {
+    // Aufruf der Fabrik ist ein F-031-Regressionsbefund. `OpContext` lässt
+    // sich ohne eine echte `SandboxSpec` (`harw-authority`, bewusst keine
+    // Abhängigkeit von `harw-web`, siehe Moduldoku oben und Ledger W1-11)
+    // nicht als neutraler Dummy-Rückgabewert bauen — dieser `unreachable!`
+    // bleibt deshalb unverändert stehen (siehe Abschlussbericht dieses
+    // Umbau-Auftrags: R089-Ausnahme, keine neue Abhängigkeit erlaubt).
+    let context_factory: Arc<WebContextFactory> = Arc::new(
+        |_peer: &PeerCredentials, _tier: PermissionTier| -> OpContext {
             unreachable!("abgelehnte Methode darf nie bis zur Ausführung gelangen")
-        });
+        },
+    );
     let server = BoundWebServer::bind(
         WebServerConfig {
             socket_path: socket.clone(),
         },
         routes,
-        Arc::new(StaticUidTierMap::with_default(vec![], PermissionTier::Owner)),
+        Arc::new(StaticUidTierMap::with_default(
+            vec![],
+            PermissionTier::Owner,
+        )),
         context_factory,
-        Arc::new(WebEventBus::new(8).expect("Kapazität > 0")),
+        Arc::new(WebEventBus::new(8).map_err(ctx("Kapazität > 0"))?),
     )
     .await
-    .expect("Tempdir-Socket bindbar");
+    .map_err(ctx("Tempdir-Socket bindbar"))?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let client = async {
         let mut heads = Vec::with_capacity(requests.len());
         for (method, path, body) in requests {
-            heads.push(request_head(&socket, method, path, body).await);
+            heads.push(request_head(&socket, method, path, body).await?);
         }
-        shutdown_tx.send(true).expect("Server hält den Empfänger");
-        heads
+        shutdown_tx
+            .send(true)
+            .map_err(ctx("Server hält den Empfänger"))?;
+        Ok::<Vec<String>, TestError>(heads)
     };
     let (served, heads) = tokio::time::timeout(TEST_DEADLINE, async {
         tokio::join!(server.serve_until(shutdown_rx), client)
     })
     .await
-    .expect("Server endet nach Shutdown-Signal");
+    .map_err(ctx("Server endet nach Shutdown-Signal"))?;
     assert!(served.is_ok(), "serve_until muss sauber enden");
     heads
 }
 
 #[tokio::test]
-async fn test_get_on_post_route_yields_405_with_allow_post_and_never_runs() {
+async fn test_get_on_post_route_yields_405_with_allow_post_and_never_runs() -> TestResult {
     let runs = Arc::new(AtomicUsize::new(0));
     let registry = registry(&runs);
-    let heads = run_against_server(&registry, &[("GET", "/api/write", "")]).await;
-    let head = &heads[0];
-    assert!(head.starts_with("HTTP/1.1 405"), "erwartet 405, erhalten: {head:?}");
+    let heads = run_against_server(&registry, &[("GET", "/api/write", "")]).await?;
+    let head = heads
+        .first()
+        .ok_or(TestError::Missing("Antwortkopf für die GET-Anfrage"))?;
+    assert!(
+        head.starts_with("HTTP/1.1 405"),
+        "erwartet 405, erhalten: {head:?}"
+    );
     assert_eq!(header_value(head, "allow"), Some("POST"));
-    assert_eq!(runs.load(Ordering::SeqCst), 0, "GET darf eine POST-Operation nie ausführen");
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        0,
+        "GET darf eine POST-Operation nie ausführen"
+    );
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_post_on_get_route_yields_405_with_allow_get_and_never_runs() {
+async fn test_post_on_get_route_yields_405_with_allow_get_and_never_runs() -> TestResult {
     let runs = Arc::new(AtomicUsize::new(0));
     let registry = registry(&runs);
-    let heads = run_against_server(&registry, &[("POST", "/api/read", "{}")]).await;
-    let head = &heads[0];
-    assert!(head.starts_with("HTTP/1.1 405"), "erwartet 405, erhalten: {head:?}");
+    let heads = run_against_server(&registry, &[("POST", "/api/read", "{}")]).await?;
+    let head = heads
+        .first()
+        .ok_or(TestError::Missing("Antwortkopf für die POST-Anfrage"))?;
+    assert!(
+        head.starts_with("HTTP/1.1 405"),
+        "erwartet 405, erhalten: {head:?}"
+    );
     assert_eq!(header_value(head, "allow"), Some("GET"));
     assert_eq!(runs.load(Ordering::SeqCst), 0);
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_head_and_options_are_never_mapped_onto_routes() {
+async fn test_head_and_options_are_never_mapped_onto_routes() -> TestResult {
     let runs = Arc::new(AtomicUsize::new(0));
     let registry = registry(&runs);
     let heads = run_against_server(
@@ -221,41 +251,63 @@ async fn test_head_and_options_are_never_mapped_onto_routes() {
             ("DELETE", "/api/write", ""),
         ],
     )
-    .await;
+    .await?;
     let expected_allow = ["POST", "POST", "GET", "GET", "POST"];
     for (head, allow) in heads.iter().zip(expected_allow) {
-        assert!(head.starts_with("HTTP/1.1 405"), "erwartet 405, erhalten: {head:?}");
+        assert!(
+            head.starts_with("HTTP/1.1 405"),
+            "erwartet 405, erhalten: {head:?}"
+        );
         assert_eq!(header_value(head, "allow"), Some(allow), "Kopf: {head:?}");
     }
     assert_eq!(runs.load(Ordering::SeqCst), 0);
+    Ok(())
 }
 
 #[test]
-fn test_route_table_from_registry_takes_declared_method() {
+fn test_route_table_from_registry_takes_declared_method() -> TestResult {
     let runs = Arc::new(AtomicUsize::new(0));
-    let routes = WebRouteTable::from_registry(&registry(&runs)).expect("Routentabelle baubar");
+    let routes =
+        WebRouteTable::from_registry(&registry(&runs)).map_err(ctx("Routentabelle baubar"))?;
     assert_eq!(routes.method_for("/api/write"), Some(WebMethod::Post));
     assert_eq!(routes.method_for("/api/read"), Some(WebMethod::Get));
-    assert_eq!(harw_web::WebMethod::Post, WebMethod::Post, "harw_web re-exportiert den Vertragstyp");
+    assert_eq!(
+        harw_web::WebMethod::Post,
+        WebMethod::Post,
+        "harw_web re-exportiert den Vertragstyp"
+    );
+    Ok(())
 }
 
 #[test]
-fn test_correct_method_is_dispatched_to_declaring_operation() {
+fn test_correct_method_is_dispatched_to_declaring_operation() -> TestResult {
     let runs = Arc::new(AtomicUsize::new(0));
-    let routes = WebRouteTable::from_registry(&registry(&runs)).expect("Routentabelle baubar");
+    let routes =
+        WebRouteTable::from_registry(&registry(&runs)).map_err(ctx("Routentabelle baubar"))?;
     let authz = StaticUidTierMap::with_default(vec![], PermissionTier::Observer);
     let peer = PeerCredentials::new(1, 1000, 1000);
 
     match decide_route(&routes, &authz, &peer, "/api/write", Some(WebMethod::Post)) {
         RouteDecision::Execute { route, .. } => assert_eq!(route.operation_name(), "write-op"),
-        other => panic!("POST auf POST-Route muss Execute liefern, erhalten: {other:?}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "POST auf POST-Route muss Execute liefern, erhalten: {other:?}"
+            )));
+        }
     }
     match decide_route(&routes, &authz, &peer, "/api/read", Some(WebMethod::Get)) {
         RouteDecision::Execute { route, .. } => assert_eq!(route.operation_name(), "read-op"),
-        other => panic!("GET auf GET-Route muss Execute liefern, erhalten: {other:?}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "GET auf GET-Route muss Execute liefern, erhalten: {other:?}"
+            )));
+        }
     }
     assert!(matches!(
         decide_route(&routes, &authz, &peer, "/api/write", Some(WebMethod::Get)),
-        RouteDecision::MethodNotAllowed { expected: WebMethod::Post }
+        RouteDecision::MethodNotAllowed {
+            expected: WebMethod::Post
+        }
     ));
+    Ok(())
 }

@@ -593,37 +593,40 @@ fn output_error(source: std::io::Error) -> ResumeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use std::fs::File;
     use std::time::Duration;
 
-    fn session(id: &str, modified_after_epoch: u64) -> DiscoveredSession {
-        DiscoveredSession {
-            id: SessionId::try_from(id.to_owned()).expect("test session ID is valid"),
+    fn session(id: &str, modified_after_epoch: u64) -> TestResult<DiscoveredSession> {
+        Ok(DiscoveredSession {
+            id: SessionId::try_from(id.to_owned()).map_err(ctx("test session ID is valid"))?,
             path: PathBuf::from(format!("{id}.jsonl")),
             modified_at: SystemTime::UNIX_EPOCH + Duration::from_secs(modified_after_epoch),
             meta: None,
-        }
+        })
     }
 
     fn session_with_meta(
         id: &str,
         modified_after_epoch: u64,
         meta: SessionMeta,
-    ) -> DiscoveredSession {
-        DiscoveredSession {
+    ) -> TestResult<DiscoveredSession> {
+        let base = session(id, modified_after_epoch)?;
+        Ok(DiscoveredSession {
             meta: Some(meta),
-            ..session(id, modified_after_epoch)
-        }
+            ..base
+        })
     }
 
-    fn fresh_meta(id: &str) -> SessionMeta {
+    fn fresh_meta(id: &str) -> TestResult<SessionMeta> {
         meta_at(id, jiff::Timestamp::now())
     }
 
-    fn meta_at(id: &str, last_opened_at: jiff::Timestamp) -> SessionMeta {
-        SessionMeta {
+    fn meta_at(id: &str, last_opened_at: jiff::Timestamp) -> TestResult<SessionMeta> {
+        Ok(SessionMeta {
             version: harw_session_store::meta::SESSION_META_VERSION,
-            session_id: SessionId::try_from(id.to_owned()).expect("test session ID is valid"),
+            session_id: SessionId::try_from(id.to_owned())
+                .map_err(ctx("test session ID is valid"))?,
             title: None,
             title_source: harw_session_store::meta::TitleSource::None,
             created_at: last_opened_at,
@@ -636,18 +639,20 @@ mod tests {
             usage_rounds: 0,
             total_usage: harw_types::TokenUsage::default(),
             drift_events: std::collections::BTreeMap::new(),
-        }
+        })
     }
 
     #[test]
-    fn discovery_lists_only_regular_jsonl_files_and_sorts_deterministically() {
-        let directory = tempfile::tempdir().expect("temporary sessions directory");
-        File::create(directory.path().join("first.jsonl")).expect("first transcript");
-        File::create(directory.path().join("second.jsonl")).expect("second transcript");
-        File::create(directory.path().join("ignored.txt")).expect("unrelated file");
-        fs::create_dir(directory.path().join("directory.jsonl")).expect("jsonl-looking directory");
+    fn discovery_lists_only_regular_jsonl_files_and_sorts_deterministically() -> TestResult {
+        let directory = tempfile::tempdir().map_err(ctx("temporary sessions directory"))?;
+        File::create(directory.path().join("first.jsonl")).map_err(ctx("first transcript"))?;
+        File::create(directory.path().join("second.jsonl")).map_err(ctx("second transcript"))?;
+        File::create(directory.path().join("ignored.txt")).map_err(ctx("unrelated file"))?;
+        fs::create_dir(directory.path().join("directory.jsonl"))
+            .map_err(ctx("jsonl-looking directory"))?;
 
-        let discovered = discover_sessions(directory.path()).expect("discover transcripts");
+        let discovered =
+            discover_sessions(directory.path()).map_err(ctx("discover transcripts"))?;
         assert_eq!(discovered.len(), 2);
         assert!(discovered.iter().all(|item| item.path.is_file()));
         assert!(
@@ -657,75 +662,85 @@ mod tests {
         );
 
         let mut tied = vec![
-            session("zeta", 42),
-            session("alpha", 42),
-            session("newest", 43),
+            session("zeta", 42)?,
+            session("alpha", 42)?,
+            session("newest", 43)?,
         ];
         sort_sessions(&mut tied);
         assert_eq!(
             tied.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
             vec!["newest", "alpha", "zeta"]
         );
+        Ok(())
     }
 
     #[test]
-    fn discovery_rejects_malformed_jsonl_filename_stems() {
-        let directory = tempfile::tempdir().expect("temporary sessions directory");
-        File::create(directory.path().join("   .jsonl")).expect("malformed transcript name");
+    fn discovery_rejects_malformed_jsonl_filename_stems() -> TestResult {
+        let directory = tempfile::tempdir().map_err(ctx("temporary sessions directory"))?;
+        File::create(directory.path().join("   .jsonl"))
+            .map_err(ctx("malformed transcript name"))?;
 
-        let error = discover_sessions(directory.path()).expect_err("blank stem must fail closed");
+        let result = discover_sessions(directory.path());
+        let Err(error) = result else {
+            return Err(TestError::Unexpected("blank stem must fail closed".into()));
+        };
         assert!(matches!(error, ResumeError::InvalidSessionFilename { .. }));
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn discovery_ignores_symlinked_jsonl_transcripts() {
+    fn discovery_ignores_symlinked_jsonl_transcripts() -> TestResult {
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().expect("temporary sessions directory");
+        let directory = tempfile::tempdir().map_err(ctx("temporary sessions directory"))?;
         let sessions_dir = directory.path().join("sessions");
-        fs::create_dir(&sessions_dir).expect("sessions directory");
+        fs::create_dir(&sessions_dir).map_err(ctx("sessions directory"))?;
         let target = directory.path().join("target.jsonl");
-        File::create(&target).expect("transcript target");
-        symlink(&target, sessions_dir.join("linked-111.jsonl")).expect("symlink transcript");
+        File::create(&target).map_err(ctx("transcript target"))?;
+        symlink(&target, sessions_dir.join("linked-111.jsonl"))
+            .map_err(ctx("symlink transcript"))?;
 
         assert!(
             discover_sessions(&sessions_dir)
-                .expect("discover transcripts")
+                .map_err(ctx("discover transcripts"))?
                 .is_empty()
         );
+        Ok(())
     }
 
     #[test]
-    fn discovery_and_resolution_selects_a_unique_prefix() {
-        let directory = tempfile::tempdir().expect("temporary sessions directory");
-        File::create(directory.path().join("alpha-111.jsonl")).expect("first transcript");
-        File::create(directory.path().join("bravo-222.jsonl")).expect("second transcript");
+    fn discovery_and_resolution_selects_a_unique_prefix() -> TestResult {
+        let directory = tempfile::tempdir().map_err(ctx("temporary sessions directory"))?;
+        File::create(directory.path().join("alpha-111.jsonl")).map_err(ctx("first transcript"))?;
+        File::create(directory.path().join("bravo-222.jsonl")).map_err(ctx("second transcript"))?;
 
         assert_eq!(
             discover_and_resolve_session(directory.path(), "brav")
-                .expect("unique transcript prefix resolves"),
-            SessionId::try_from("bravo-222".to_owned()).expect("test session ID is valid")
+                .map_err(ctx("unique transcript prefix resolves"))?,
+            SessionId::try_from("bravo-222".to_owned()).map_err(ctx("test session ID is valid"))?
         );
+        Ok(())
     }
 
     #[test]
-    fn selector_accepts_exact_ids_and_unique_prefixes() {
-        let sessions = vec![session("alpha-111", 2), session("bravo-222", 1)];
+    fn selector_accepts_exact_ids_and_unique_prefixes() -> TestResult {
+        let sessions = vec![session("alpha-111", 2)?, session("bravo-222", 1)?];
 
         assert_eq!(
-            resolve_session_selector(&sessions, "alpha-111").expect("exact match"),
+            resolve_session_selector(&sessions, "alpha-111").map_err(ctx("exact match"))?,
             sessions[0].id
         );
         assert_eq!(
-            resolve_session_selector(&sessions, "brav").expect("unique prefix"),
+            resolve_session_selector(&sessions, "brav").map_err(ctx("unique prefix"))?,
             sessions[1].id
         );
+        Ok(())
     }
 
     #[test]
-    fn selector_fails_closed_for_empty_unknown_and_ambiguous_values() {
-        let sessions = vec![session("alpha-111", 2), session("alpha-222", 1)];
+    fn selector_fails_closed_for_empty_unknown_and_ambiguous_values() -> TestResult {
+        let sessions = vec![session("alpha-111", 2)?, session("alpha-222", 1)?];
 
         assert!(matches!(
             resolve_session_selector(&sessions, "  "),
@@ -739,60 +754,67 @@ mod tests {
             resolve_session_selector(&sessions, "alpha"),
             Err(ResumeError::AmbiguousSelector { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn interactive_selection_cancels_on_blank_input() {
-        let sessions = vec![session("alpha-111", 1)];
+    fn interactive_selection_cancels_on_blank_input() -> TestResult {
+        let sessions = vec![session("alpha-111", 1)?];
         assert_eq!(
-            resolve_interactive_selection(&sessions, " \n").expect("blank is cancellation"),
+            resolve_interactive_selection(&sessions, " \n")
+                .map_err(ctx("blank is cancellation"))?,
             None
         );
+        Ok(())
     }
 
     #[test]
-    fn prompt_cancels_cleanly_at_eof() {
-        let sessions = vec![session("alpha-111", 1)];
+    fn prompt_cancels_cleanly_at_eof() -> TestResult {
+        let sessions = vec![session("alpha-111", 1)?];
         let mut input = std::io::Cursor::new(Vec::<u8>::new());
         let mut output = Vec::new();
 
         assert_eq!(
-            prompt_for_session(&sessions, &mut input, &mut output).expect("EOF is cancellation"),
+            prompt_for_session(&sessions, &mut input, &mut output)
+                .map_err(ctx("EOF is cancellation"))?,
             None
         );
         assert!(
             String::from_utf8(output)
-                .expect("picker output is utf-8")
+                .map_err(ctx("picker output is utf-8"))?
                 .contains("alpha-111")
         );
+        Ok(())
     }
 
     // -- Schritt 7: Sortierung nach `meta.last_opened_at` ----------------
 
     #[test]
-    fn sort_prefers_meta_last_opened_at_over_stale_mtime() {
+    fn sort_prefers_meta_last_opened_at_over_stale_mtime() -> TestResult {
         // `older` hat die neuere `mtime`, aber der Sidecar sagt, sie wurde
         // vor langer Zeit zuletzt geöffnet — `newer` ist im Sidecar frischer,
         // trotz älterer `mtime`. Die Sortierung muss dem Sidecar folgen.
         let long_ago = jiff::Timestamp::UNIX_EPOCH;
         let just_now = jiff::Timestamp::now();
-        let older = session_with_meta("older-by-meta", 1_000, meta_at("older-by-meta", long_ago));
-        let newer = session_with_meta("newer-by-meta", 10, meta_at("newer-by-meta", just_now));
+        let older = session_with_meta("older-by-meta", 1_000, meta_at("older-by-meta", long_ago)?)?;
+        let newer = session_with_meta("newer-by-meta", 10, meta_at("newer-by-meta", just_now)?)?;
 
         let mut sessions = vec![older, newer];
         sort_sessions(&mut sessions);
 
         assert_eq!(sessions[0].id.as_str(), "newer-by-meta");
         assert_eq!(sessions[1].id.as_str(), "older-by-meta");
+        Ok(())
     }
 
     #[test]
-    fn sort_falls_back_to_mtime_without_meta() {
-        let mut sessions = vec![session("old", 10), session("new", 20)];
+    fn sort_falls_back_to_mtime_without_meta() -> TestResult {
+        let mut sessions = vec![session("old", 10)?, session("new", 20)?];
         sort_sessions(&mut sessions);
 
         assert_eq!(sessions[0].id.as_str(), "new");
         assert_eq!(sessions[1].id.as_str(), "old");
+        Ok(())
     }
 
     // -- Schritt 7: Projektfilter -----------------------------------------
@@ -803,59 +825,64 @@ mod tests {
     // `ProfileResumeSelector::available_sessions` (`chat.rs`) weiterhin nutzt.
 
     #[test]
-    fn session_matches_project_shows_untagged_sessions_only_without_a_current_project() {
-        let session_without_project = session_with_meta("x", 1, fresh_meta("x"));
+    fn session_matches_project_shows_untagged_sessions_only_without_a_current_project() -> TestResult
+    {
+        let session_without_project = session_with_meta("x", 1, fresh_meta("x")?)?;
         assert!(session_matches_project(&session_without_project, None));
         assert!(!session_matches_project(
             &session_without_project,
             Some("harwness-abc123")
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_session_matches_project_tagged_session_with_different_key_does_not_match() {
-        let mut meta = fresh_meta("tagged");
+    fn test_session_matches_project_tagged_session_with_different_key_does_not_match() -> TestResult
+    {
+        let mut meta = fresh_meta("tagged")?;
         meta.project_key = Some("harwness-abc123".to_owned());
-        let tagged_session = session_with_meta("tagged", 1, meta);
+        let tagged_session = session_with_meta("tagged", 1, meta)?;
 
         assert!(!session_matches_project(
             &tagged_session,
             Some("harwness-different")
         ));
         assert!(!session_matches_project(&tagged_session, None));
+        Ok(())
     }
 
     #[test]
-    fn test_session_matches_project_tagged_session_with_same_key_matches() {
-        let mut meta = fresh_meta("tagged");
+    fn test_session_matches_project_tagged_session_with_same_key_matches() -> TestResult {
+        let mut meta = fresh_meta("tagged")?;
         meta.project_key = Some("harwness-abc123".to_owned());
-        let tagged_session = session_with_meta("tagged", 1, meta);
+        let tagged_session = session_with_meta("tagged", 1, meta)?;
 
         assert!(session_matches_project(
             &tagged_session,
             Some("harwness-abc123")
         ));
+        Ok(())
     }
 
     // -- Backfill fehlender `project_key`s aus dem Transcript --------------
 
     #[test]
-    fn backfill_project_key_tags_session_from_repeated_project_paths_in_transcript() {
-        let sessions_dir = tempfile::tempdir().expect("temporary sessions directory");
+    fn backfill_project_key_tags_session_from_repeated_project_paths_in_transcript() -> TestResult {
+        let sessions_dir = tempfile::tempdir().map_err(ctx("temporary sessions directory"))?;
         // Nicht unter `/tmp` anlegen: `BACKFILL_IGNORED_PREFIXES` verwirft
         // genau solche Pfade als Kandidaten (Rauschen aus Editor-/Build-Tools),
         // also braucht dieser Test einen Projekt-Root außerhalb davon.
         let project_dir = tempfile::Builder::new()
             .prefix("harw-backfill-project-")
             .tempdir_in(env!("CARGO_MANIFEST_DIR"))
-            .expect("temporary project directory outside /tmp");
-        fs::create_dir(project_dir.path().join(".git")).expect("fake git marker");
+            .map_err(ctx("temporary project directory outside /tmp"))?;
+        fs::create_dir(project_dir.path().join(".git")).map_err(ctx("fake git marker"))?;
         let src_dir = project_dir.path().join("harw-core").join("src");
-        fs::create_dir_all(&src_dir).expect("project source directory");
+        fs::create_dir_all(&src_dir).map_err(ctx("project source directory"))?;
         let file_a = src_dir.join("lib.rs");
         let file_b = src_dir.join("state_store.rs");
 
-        let id = SessionId::try_from("backfill-hit".to_owned()).expect("valid session id");
+        let id = SessionId::try_from("backfill-hit".to_owned()).map_err(ctx("valid session id"))?;
         let store = harw_session_store::store::TranscriptStore::new(sessions_dir.path());
         let thread = harw_types::ThreadRef::from_str("root");
         // Reale Transcript-Datensätze tragen `session_id`/`thread`/`sequence`
@@ -875,7 +902,7 @@ mod tests {
                     "arguments": { "path": file_a.display().to_string() },
                 }),
             ))
-            .expect("append fake tool_call record for file_a");
+            .map_err(ctx("append fake tool_call record for file_a"))?;
         store
             .append(&harw_session_store::record::TranscriptRecord::new(
                 id.clone(),
@@ -888,7 +915,7 @@ mod tests {
                     "output": format!("read {} and {}", file_a.display(), file_b.display()),
                 }),
             ))
-            .expect("append fake tool_result record referencing both files");
+            .map_err(ctx("append fake tool_result record referencing both files"))?;
         store
             .append(&harw_session_store::record::TranscriptRecord::new(
                 id.clone(),
@@ -901,12 +928,13 @@ mod tests {
                     "arguments": { "path": file_b.display().to_string() },
                 }),
             ))
-            .expect("append fake tool_call record for file_b");
+            .map_err(ctx("append fake tool_call record for file_b"))?;
         let transcript_path = store
             .transcript_path(&id)
-            .expect("transcript path for a valid session id");
+            .map_err(ctx("transcript path for a valid session id"))?;
 
-        let meta = meta::load_or_derive(sessions_dir.path(), &id).expect("derive fresh meta");
+        let meta =
+            meta::load_or_derive(sessions_dir.path(), &id).map_err(ctx("derive fresh meta"))?;
         assert_eq!(meta.project_key, None);
         let mut session = DiscoveredSession {
             id: id.clone(),
@@ -917,12 +945,13 @@ mod tests {
 
         backfill_project_key(sessions_dir.path(), &mut session);
 
-        let expected_root = fs::canonicalize(project_dir.path()).expect("canonical project root");
+        let expected_root =
+            fs::canonicalize(project_dir.path()).map_err(ctx("canonical project root"))?;
         let expected_key = harw_home::project::project_key(&expected_root);
         let updated_meta = session
             .meta
             .as_ref()
-            .expect("meta stays present after backfill");
+            .ok_or(TestError::Missing("meta stays present after backfill"))?;
         assert_eq!(
             updated_meta.project_key.as_deref(),
             Some(expected_key.as_str())
@@ -930,14 +959,17 @@ mod tests {
 
         // Erneutes `load_or_derive` bestätigt, dass der Sidecar persistiert wurde.
         let reloaded =
-            meta::load_or_derive(sessions_dir.path(), &id).expect("reload persisted meta");
+            meta::load_or_derive(sessions_dir.path(), &id).map_err(ctx("reload persisted meta"))?;
         assert_eq!(reloaded.project_key.as_deref(), Some(expected_key.as_str()));
+        Ok(())
     }
 
     #[test]
-    fn backfill_project_key_leaves_session_untagged_when_only_ignored_paths_are_present() {
-        let sessions_dir = tempfile::tempdir().expect("temporary sessions directory");
-        let id = SessionId::try_from("backfill-miss".to_owned()).expect("valid session id");
+    fn backfill_project_key_leaves_session_untagged_when_only_ignored_paths_are_present()
+    -> TestResult {
+        let sessions_dir = tempfile::tempdir().map_err(ctx("temporary sessions directory"))?;
+        let id =
+            SessionId::try_from("backfill-miss".to_owned()).map_err(ctx("valid session id"))?;
         let store = harw_session_store::store::TranscriptStore::new(sessions_dir.path());
         // Siehe Kommentar im Hit-Test oben: echte Transcript-Datensätze
         // brauchen `session_id`/`thread`/`sequence`, sonst scheitert
@@ -954,12 +986,15 @@ mod tests {
                     "arguments": { "path": "/tmp/scratch/output.txt" },
                 }),
             ))
-            .expect("append fake tool_call record with only an ignored path");
+            .map_err(ctx(
+                "append fake tool_call record with only an ignored path",
+            ))?;
         let transcript_path = store
             .transcript_path(&id)
-            .expect("transcript path for a valid session id");
+            .map_err(ctx("transcript path for a valid session id"))?;
 
-        let meta = meta::load_or_derive(sessions_dir.path(), &id).expect("derive fresh meta");
+        let meta =
+            meta::load_or_derive(sessions_dir.path(), &id).map_err(ctx("derive fresh meta"))?;
         let mut session = DiscoveredSession {
             id: id.clone(),
             path: transcript_path,
@@ -973,9 +1008,10 @@ mod tests {
             session
                 .meta
                 .as_ref()
-                .expect("meta stays present")
+                .ok_or(TestError::Missing("meta stays present"))?
                 .project_key,
             None
         );
+        Ok(())
     }
 }

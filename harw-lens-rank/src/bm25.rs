@@ -223,8 +223,15 @@ mod tests {
 
     #[test]
     fn test_bm25_scores_doc_with_term_outranks_doc_without() {
-        let docs = vec![doc(&["relevant", "term", "here"]), doc(&["nothing", "matches"])];
-        let scores = bm25_scores(&slices(&docs), &[doc(&["relevant"])[0].clone()], Bm25Params::default());
+        let docs = vec![
+            doc(&["relevant", "term", "here"]),
+            doc(&["nothing", "matches"]),
+        ];
+        let scores = bm25_scores(
+            &slices(&docs),
+            &[doc(&["relevant"])[0].clone()],
+            Bm25Params::default(),
+        );
         assert!(scores[0] > 0.0);
         assert_eq!(scores[1], 0.0);
     }
@@ -242,8 +249,16 @@ mod tests {
             doc(&["beta", "zeta"]),
         ];
         let doc_slices = slices(&docs);
-        let rare = bm25_scores(&doc_slices, &[doc(&["alpha"])[0].clone()], Bm25Params::default());
-        let frequent = bm25_scores(&doc_slices, &[doc(&["beta"])[0].clone()], Bm25Params::default());
+        let rare = bm25_scores(
+            &doc_slices,
+            &[doc(&["alpha"])[0].clone()],
+            Bm25Params::default(),
+        );
+        let frequent = bm25_scores(
+            &doc_slices,
+            &[doc(&["beta"])[0].clone()],
+            Bm25Params::default(),
+        );
         assert!(
             rare[0] > frequent[0],
             "rare term score {} should exceed frequent term score {}",
@@ -255,14 +270,22 @@ mod tests {
     #[test]
     fn test_bm25_scores_result_length_matches_doc_count() {
         let docs = vec![doc(&["a"]), doc(&["b"]), doc(&["c"])];
-        let scores = bm25_scores(&slices(&docs), &[doc(&["a"])[0].clone()], Bm25Params::default());
+        let scores = bm25_scores(
+            &slices(&docs),
+            &[doc(&["a"])[0].clone()],
+            Bm25Params::default(),
+        );
         assert_eq!(scores.len(), 3);
     }
 
     #[test]
     fn test_bm25_scores_is_order_aligned_with_input_docs() {
         let docs = vec![doc(&["nothing"]), doc(&["needle"]), doc(&["nothing"])];
-        let scores = bm25_scores(&slices(&docs), &[doc(&["needle"])[0].clone()], Bm25Params::default());
+        let scores = bm25_scores(
+            &slices(&docs),
+            &[doc(&["needle"])[0].clone()],
+            Bm25Params::default(),
+        );
         assert_eq!(scores[0], 0.0);
         assert!(scores[1] > 0.0);
         assert_eq!(scores[2], 0.0);
@@ -271,7 +294,11 @@ mod tests {
     #[test]
     fn test_bm25_scores_custom_params_change_result() {
         let docs = vec![doc(&["term", "term", "term"]), doc(&["term"])];
-        let default_scores = bm25_scores(&slices(&docs), &[doc(&["term"])[0].clone()], Bm25Params::default());
+        let default_scores = bm25_scores(
+            &slices(&docs),
+            &[doc(&["term"])[0].clone()],
+            Bm25Params::default(),
+        );
         let flattened_scores = bm25_scores(
             &slices(&docs),
             &[doc(&["term"])[0].clone()],

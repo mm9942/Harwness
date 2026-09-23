@@ -28,8 +28,8 @@ enabled = true
 pub fn run(home_override: Option<PathBuf>, action: McpAction) -> Result<(), String> {
     let home = resolve_home(home_override)?;
     match action {
-        McpAction::Setup { server } => setup(&home, &server),
-        McpAction::Check { server } => check(&home, &server),
+        McpAction::Setup { server } => setup(&home, server.as_str()),
+        McpAction::Check { server } => check(&home, server.as_str()),
     }
 }
 

@@ -126,3 +126,7 @@ pub use finding::{Finding, FindingKind, Raw, RuleChecked, Triaged, Verdict, tria
 pub use finding::triaged_finding_for_test;
 pub use rule::{Rule, RuleContext};
 pub use rules::{BaselineDeviationRule, EgressFlowRule, StructureDriftRule};
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

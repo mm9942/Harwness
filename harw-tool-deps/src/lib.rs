@@ -92,32 +92,81 @@ pub use source_tool::{
 /// Subprozess.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_tools::{ToolCall, ToolExecutionContext, ToolName};
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
+    use std::fmt;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    /// Test-Fehlertyp dieses Crates: ersetzt panic!/unwrap/expect in Tests
+    /// (Bible R087/R165/R182).
+    ///
+    /// Fehler eines Tests; jeder Fehlschlag wird als `Err` zurückgegeben statt
+    /// zu paniken.
+    pub(crate) enum TestError {
+        /// Ein erwarteter Wert fehlte (`Option` war `None`).
+        Missing(&'static str),
+        /// Ein Ergebnis hatte eine unerwartete Form.
+        Unexpected(String),
+        /// Ein Fehler mit Kontext (ersetzt `expect("…")`).
+        Context {
+            context: &'static str,
+            source: String,
+        },
+    }
+
+    pub(crate) type TestResult<T = ()> = Result<T, TestError>;
+
+    impl fmt::Display for TestError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Missing(what) => write!(f, "erwarteter Wert fehlt: {what}"),
+                Self::Unexpected(message) => write!(f, "unerwartetes Ergebnis: {message}"),
+                Self::Context { context, source } => write!(f, "{context}: {source}"),
+            }
+        }
+    }
+
+    impl fmt::Debug for TestError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fmt::Display::fmt(self, f)
+        }
+    }
+
+    impl std::error::Error for TestError {}
+
+    /// Hilfsfunktion: übersetzt `.expect("…")` in `.map_err(ctx("…"))?` und
+    /// behält die ursprüngliche Kontextmeldung.
+    pub(crate) fn ctx<E: fmt::Display>(context: &'static str) -> impl FnOnce(E) -> TestError {
+        move |error| TestError::Context {
+            context,
+            source: error.to_string(),
+        }
+    }
 
     /// Legt ein frisches, leeres Scratch-Verzeichnis für ein Label an.
     ///
     /// Der Prozess-PID im Namen trennt parallele Testläufe, das Label die
     /// Tests innerhalb eines Laufs — jedes Label darf deshalb nur einmal
     /// vorkommen.
-    pub(crate) fn scratch_dir(label: &str) -> PathBuf {
+    pub(crate) fn scratch_dir(label: &str) -> TestResult<PathBuf> {
         let dir =
             std::env::temp_dir().join(format!("harw-tool-deps-{}-{label}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("Scratch-Verzeichnis anlegen");
-        dir
+        fs::create_dir_all(&dir).map_err(ctx("Scratch-Verzeichnis anlegen"))?;
+        Ok(dir)
     }
 
     /// Baut einen Ausführungskontext, dessen Workspace `<harness>/ws` ist.
     pub(crate) fn sandbox_context(
         harness_root: &Path,
         permissions: Vec<Permission>,
-    ) -> ToolExecutionContext {
+    ) -> TestResult<ToolExecutionContext> {
         let workspace_dir = harness_root.join("ws");
-        fs::create_dir_all(&workspace_dir).expect("Workspace-Verzeichnis anlegen");
+        fs::create_dir_all(&workspace_dir).map_err(ctx("Workspace-Verzeichnis anlegen"))?;
 
         let registry = WorkspaceRegistry::build(
             harness_root,
@@ -127,13 +176,17 @@ pub(crate) mod test_support {
                 root: PathBuf::from("ws"),
             }],
         )
-        .expect("Workspace-Registry bauen");
+        .map_err(ctx("Workspace-Registry bauen"))?;
         let binding = registry
             .resolve(&TenantId::from_str("t"), &WorkspaceId::from_str("w"))
-            .expect("Workspace auflösen");
+            .map_err(ctx("Workspace auflösen"))?;
         let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::from_policy(permissions));
 
-        ToolExecutionContext::new(SessionId::new(), TurnId::new(), sandbox)
+        Ok(ToolExecutionContext::new(
+            SessionId::new(),
+            TurnId::new(),
+            sandbox,
+        ))
     }
 
     /// Baut einen Tool-Aufruf mit den angegebenen JSON-Argumenten.
@@ -146,36 +199,41 @@ pub(crate) mod test_support {
     }
 
     /// Führt ein Future auf einer Einzel-Thread-Runtime aus.
-    pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
+    pub(crate) fn block_on<F: std::future::Future>(future: F) -> TestResult<F::Output> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
-            .expect("Tokio-Runtime bauen")
-            .block_on(future)
+            .map_err(ctx("Tokio-Runtime bauen"))?;
+        Ok(runtime.block_on(future))
     }
 
     /// Legt unter `<harness>/ws` einen Mini-Workspace `a -> b -> c` an und
     /// liefert `(harness_root, workspace_root)`.
-    pub(crate) fn mini_workspace(label: &str) -> (PathBuf, PathBuf) {
-        let harness = scratch_dir(label);
+    pub(crate) fn mini_workspace(label: &str) -> TestResult<(PathBuf, PathBuf)> {
+        let harness = scratch_dir(label)?;
         let workspace = harness.join("ws");
-        fs::create_dir_all(&workspace).expect("Workspace-Verzeichnis anlegen");
+        fs::create_dir_all(&workspace).map_err(ctx("Workspace-Verzeichnis anlegen"))?;
 
-        write_member(&workspace, "a", &[], &["serde"]);
-        write_member(&workspace, "b", &["a"], &[]);
-        write_member(&workspace, "c", &["b"], &[]);
+        write_member(&workspace, "a", &[], &["serde"])?;
+        write_member(&workspace, "b", &["a"], &[])?;
+        write_member(&workspace, "c", &["b"], &[])?;
         fs::write(
             workspace.join("Cargo.toml"),
             "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\n",
         )
-        .expect("Wurzel-Manifest schreiben");
+        .map_err(ctx("Wurzel-Manifest schreiben"))?;
 
-        (harness, workspace)
+        Ok((harness, workspace))
     }
 
     /// Schreibt ein Member-Manifest mit internen (`path`) und externen Deps.
-    fn write_member(workspace: &Path, name: &str, internal: &[&str], external: &[&str]) {
+    fn write_member(
+        workspace: &Path,
+        name: &str,
+        internal: &[&str],
+        external: &[&str],
+    ) -> TestResult {
         let dir = workspace.join(name);
-        fs::create_dir_all(&dir).expect("Member-Verzeichnis anlegen");
+        fs::create_dir_all(&dir).map_err(ctx("Member-Verzeichnis anlegen"))?;
 
         let mut dependencies = String::new();
         for dep in internal {
@@ -187,11 +245,12 @@ pub(crate) mod test_support {
         let manifest = format!(
             "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n\n[dependencies]\n{dependencies}"
         );
-        fs::write(dir.join("Cargo.toml"), manifest).expect("Member-Manifest schreiben");
+        fs::write(dir.join("Cargo.toml"), manifest).map_err(ctx("Member-Manifest schreiben"))?;
+        Ok(())
     }
 
     /// Schreibt eine `Cargo.lock` mit einem externen und einem Path-Paket.
-    pub(crate) fn write_lockfile(workspace: &Path) {
+    pub(crate) fn write_lockfile(workspace: &Path) -> TestResult {
         let content = r#"
 version = 4
 
@@ -205,6 +264,7 @@ checksum = "abc123"
 name = "harw-types"
 version = "0.2.0"
 "#;
-        fs::write(workspace.join("Cargo.lock"), content).expect("Cargo.lock schreiben");
+        fs::write(workspace.join("Cargo.lock"), content).map_err(ctx("Cargo.lock schreiben"))?;
+        Ok(())
     }
 }

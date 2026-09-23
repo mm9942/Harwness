@@ -34,6 +34,8 @@ pub mod policy;
 pub mod session;
 pub mod session_manager;
 pub mod state_store;
+#[cfg(test)]
+mod test_support;
 pub mod testing;
 pub mod turn_loop;
 
@@ -49,15 +51,17 @@ pub use auto_compact::{
 pub use capture::{ToolOutcome, ToolOutcomeObserver, ToolOutcomeStatus};
 pub use child_controller::{
     AgentBudget, BudgetDimension, ChildLimits, ChildRecord, ChildRegistryFactory, ChildRunResult,
-    ExpiredChild, FanoutRequest, JoinSemantics, ManagedAgentSpawner, ParentGrant,
-    RoleEffortWeights, TaskComplexity,
+    ExpiredChild, FanoutRequest, JoinSemantics, ManagedAgentSpawner, OrchestrationObserver,
+    ParentGrant, RoleEffortWeights, TaskComplexity,
 };
 pub use compaction::{
-    compact_session, deterministic_pass, CompactionObserver, CompactionOutcome, CompactionPlan,
-    SUMMARY_MARKER,
+    CompactionObserver, CompactionOutcome, CompactionPlan, SUMMARY_MARKER, compact_session,
+    deterministic_pass,
 };
 pub use context_budget::{ContextAssembly, ContextBudget};
-pub use delegation_visibility::{DelegationTarget, DelegationTargetKind, visible_delegation_targets};
+pub use delegation_visibility::{
+    DelegationTarget, DelegationTargetKind, visible_delegation_targets,
+};
 pub use durable_job_runner::{DurableJobRunner, DurableJobRunnerError};
 pub use error::{CoreError, CoreResult};
 pub use execution_registry::{
@@ -69,10 +73,13 @@ pub use guard::{
 };
 pub use harw_protocol::ToolCallResult;
 pub use history::{ConversationHistory, ModelMessage};
-pub use history_tail::{render_history_tail, HistoryTailRender, HISTORY_TAIL_GUARANTEED_GROUPS, HISTORY_TAIL_SECTION};
+pub use history_tail::{
+    HISTORY_TAIL_GUARANTEED_GROUPS, HISTORY_TAIL_SECTION, HistoryTailRender, render_history_tail,
+};
 pub use mode::InteractionMode;
 pub use model::{
     EchoModelProvider, ModelError, ModelFuture, ModelProvider, ModelRequest, ModelResponse,
+    RequestIdentity,
 };
 pub use one_shot::{OneShotError, complete_text};
 pub use pinned_model::PinnedModelProvider;

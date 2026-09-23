@@ -812,6 +812,7 @@ mod tests {
     use crate::error::KnowledgeError;
     use crate::index::KnowledgeIndex;
     use crate::memory::recall::{ListAllRanker, search_with};
+    use crate::test_support::{TestError, TestResult};
     use crate::visibility::{AgentId, VisibilityScope};
 
     use harw_model_catalog::descriptor::ToolCallingSupport;
@@ -848,11 +849,12 @@ mod tests {
 
     /// Rundlauf über serde; unbekanntes Feld wird abgelehnt (K19).
     #[test]
-    fn test_serde_roundtrip_and_deny_unknown_fields() {
+    fn test_serde_roundtrip_and_deny_unknown_fields() -> TestResult {
         let proposal = sample_proposal();
-        let json = serde_json::to_string(&proposal).expect("proposal serializes");
-        let restored: ModelBehaviorProposal =
-            serde_json::from_str(&json).expect("proposal deserializes");
+        let json = serde_json::to_string(&proposal)
+            .map_err(crate::test_support::ctx("proposal serializes"))?;
+        let restored: ModelBehaviorProposal = serde_json::from_str(&json)
+            .map_err(crate::test_support::ctx("proposal deserializes"))?;
 
         assert_eq!(restored.id, proposal.id);
         assert_eq!(restored.title, proposal.title);
@@ -860,22 +862,24 @@ mod tests {
         assert_eq!(restored.status, proposal.status);
         assert_eq!(restored.changes, proposal.changes);
 
-        let mut value: serde_json::Value = serde_json::from_str(&json).expect("value parses");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&json).map_err(crate::test_support::ctx("value parses"))?;
         value
             .as_object_mut()
-            .expect("proposal is a JSON object")
+            .ok_or(TestError::Missing("proposal is a JSON object"))?
             .insert("unexpected_field".to_owned(), serde_json::json!(true));
         let rejected: Result<ModelBehaviorProposal, _> = serde_json::from_str(&value.to_string());
         assert!(
             rejected.is_err(),
             "ein unbekanntes Feld muss die Deserialisierung ablehnen"
         );
+        Ok(())
     }
 
     /// Rundlauf über `KnowledgeArtifact` (die durable Einbettung), zusätzlich
     /// zum reinen Serde-Rundlauf oben.
     #[test]
-    fn test_artifact_roundtrip_preserves_kind_and_id() {
+    fn test_artifact_roundtrip_preserves_kind_and_id() -> TestResult {
         let proposal = sample_proposal();
         let frontmatter = Frontmatter::new(
             AgentId::new("system"),
@@ -885,18 +889,20 @@ mod tests {
         let artifact = proposal
             .clone()
             .to_artifact(frontmatter)
-            .expect("proposal embeds into an artifact");
+            .map_err(crate::test_support::ctx("proposal embeds into an artifact"))?;
         assert_eq!(artifact.kind, ArtifactKind::ModelBehaviorProposal);
 
-        let restored = ModelBehaviorProposal::from_artifact(&artifact)
-            .expect("artifact parses back into a proposal");
+        let restored = ModelBehaviorProposal::from_artifact(&artifact).map_err(
+            crate::test_support::ctx("artifact parses back into a proposal"),
+        )?;
         assert_eq!(restored.id, proposal.id);
         assert_eq!(restored.changes, proposal.changes);
+        Ok(())
     }
 
     /// `from_artifact` weist ein Artefakt mit dem falschen `kind` ab.
     #[test]
-    fn test_from_artifact_rejects_kind_mismatch() {
+    fn test_from_artifact_rejects_kind_mismatch() -> TestResult {
         use crate::artifact::KnowledgeArtifact;
 
         let frontmatter = Frontmatter::new(
@@ -911,14 +917,18 @@ mod tests {
             "{}",
         );
 
-        let error = ModelBehaviorProposal::from_artifact(&wrong_kind)
-            .expect_err("wrong artifact kind must be rejected");
+        let Err(error) = ModelBehaviorProposal::from_artifact(&wrong_kind) else {
+            return Err(TestError::Unexpected(
+                "wrong artifact kind must be rejected".to_owned(),
+            ));
+        };
         assert!(matches!(error, KnowledgeError::ArtifactKindMismatch { .. }));
+        Ok(())
     }
 
     /// Determinismus: gleiche Eingabe → byte-gleicher Vorschlag, zweimal.
     #[test]
-    fn test_heuristic_is_deterministic_byte_for_byte() {
+    fn test_heuristic_is_deterministic_byte_for_byte() -> TestResult {
         let window = ModelBehaviorObservationWindow {
             observations: vec![qualifying_observation()],
         };
@@ -931,12 +941,15 @@ mod tests {
             )
         };
 
-        let first = serde_json::to_vec(&build()).expect("first proposal list serializes");
-        let second = serde_json::to_vec(&build()).expect("second proposal list serializes");
+        let first = serde_json::to_vec(&build())
+            .map_err(crate::test_support::ctx("first proposal list serializes"))?;
+        let second = serde_json::to_vec(&build())
+            .map_err(crate::test_support::ctx("second proposal list serializes"))?;
         assert_eq!(
             first, second,
             "identical input must produce byte-identical output"
         );
+        Ok(())
     }
 
     /// Die Heuristik schlägt bei leerer Beobachtung nichts vor.
@@ -971,8 +984,7 @@ mod tests {
     #[test]
     fn test_heuristic_above_score_threshold_proposes_nothing() {
         let mut observation = qualifying_observation();
-        observation.tool_schema_reliability =
-            Score::clamp(super::TOOL_SCHEMA_UNRELIABLE_THRESHOLD);
+        observation.tool_schema_reliability = Score::clamp(super::TOOL_SCHEMA_UNRELIABLE_THRESHOLD);
         let window = ModelBehaviorObservationWindow {
             observations: vec![observation],
         };
@@ -1021,8 +1033,14 @@ mod tests {
         );
 
         assert_eq!(proposals.len(), 2);
-        assert_eq!(proposals[0].target_provider, ProviderId::from("alpha-vendor"));
-        assert_eq!(proposals[1].target_provider, ProviderId::from("zeta-vendor"));
+        assert_eq!(
+            proposals[0].target_provider,
+            ProviderId::from("alpha-vendor")
+        );
+        assert_eq!(
+            proposals[1].target_provider,
+            ProviderId::from("zeta-vendor")
+        );
     }
 
     /// Ein Vorschlag ist ohne Blick in den Code beurteilbar: die Belege
@@ -1060,35 +1078,45 @@ mod tests {
 
     /// `accept`/`reject` markieren nur den Status — sie sind terminal.
     #[test]
-    fn test_accept_marks_status_and_is_terminal() {
+    fn test_accept_marks_status_and_is_terminal() -> TestResult {
         let mut proposal = sample_proposal();
         assert_eq!(proposal.status, ProposalStatus::Pending);
 
-        proposal.accept().expect("pending proposal accepts");
+        proposal
+            .accept()
+            .map_err(crate::test_support::ctx("pending proposal accepts"))?;
         assert_eq!(proposal.status, ProposalStatus::Accepted);
 
-        let error = proposal
-            .accept()
-            .expect_err("an already-decided proposal must not accept again");
+        let Err(error) = proposal.accept() else {
+            return Err(TestError::Unexpected(
+                "an already-decided proposal must not accept again".to_owned(),
+            ));
+        };
         assert!(matches!(
             error,
             KnowledgeError::ModelProposalNotPending { .. }
         ));
 
-        let error = proposal
-            .reject()
-            .expect_err("an already-decided proposal must not flip to rejected either");
+        let Err(error) = proposal.reject() else {
+            return Err(TestError::Unexpected(
+                "an already-decided proposal must not flip to rejected either".to_owned(),
+            ));
+        };
         assert!(matches!(
             error,
             KnowledgeError::ModelProposalNotPending { .. }
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_reject_marks_status() {
+    fn test_reject_marks_status() -> TestResult {
         let mut proposal = sample_proposal();
-        proposal.reject().expect("pending proposal rejects");
+        proposal
+            .reject()
+            .map_err(crate::test_support::ctx("pending proposal rejects"))?;
         assert_eq!(proposal.status, ProposalStatus::Rejected);
+        Ok(())
     }
 
     /// Es gibt keinen Weg, einen Vorschlag anzuwenden: `ModelBehaviorProposal`
@@ -1097,14 +1125,16 @@ mod tests {
     /// liest oder schreibt einen `ModelDescriptor`. Dieser Test beweist die
     /// eine Hälfte davon strukturell: `accept` ändert nichts außer `status`.
     #[test]
-    fn test_accept_never_touches_any_model_descriptor() {
+    fn test_accept_never_touches_any_model_descriptor() -> TestResult {
         let mut proposal = sample_proposal();
         let before_changes = proposal.changes.clone();
         let before_provider = proposal.target_provider.clone();
         let before_model = proposal.target_model.clone();
         let before_digest = proposal.target_descriptor_digest.clone();
 
-        proposal.accept().expect("pending proposal accepts");
+        proposal
+            .accept()
+            .map_err(crate::test_support::ctx("pending proposal accepts"))?;
 
         assert_eq!(
             proposal.changes, before_changes,
@@ -1123,6 +1153,7 @@ mod tests {
             "accept darf `target_descriptor_digest` nicht verändern"
         );
         assert_eq!(proposal.status, ProposalStatus::Accepted);
+        Ok(())
     }
 
     /// Die Sichtbarkeitsregel greift: ein `ModelBehaviorProposal`, gespeichert
@@ -1130,7 +1161,7 @@ mod tests {
     /// ohne Operator-Berechtigung nicht sichtbar — auch nicht über einen
     /// Rückverweis-Sprung (K35) — und für einen Operator-Aufrufer sichtbar.
     #[test]
-    fn test_visibility_follows_recommended_visibility_including_backlink_hop() {
+    fn test_visibility_follows_recommended_visibility_including_backlink_hop() -> TestResult {
         let proposal = sample_proposal();
         let frontmatter = Frontmatter::new(
             AgentId::new("system"),
@@ -1139,7 +1170,7 @@ mod tests {
         );
         let mut proposal_artifact = proposal
             .to_artifact(frontmatter)
-            .expect("proposal embeds into an artifact");
+            .map_err(crate::test_support::ctx("proposal embeds into an artifact"))?;
 
         // Ein `SelfOnly`-Notiz-Artefakt, das per Backlink auf den Vorschlag
         // verweist — der K35-Fall: der Rückverweis darf keine der beiden
@@ -1164,7 +1195,7 @@ mod tests {
 
         let unauthorized = crate::artifact::RecallQuery::new("", VisibilityScope::SelfOnly);
         let denied = search_with(&index, &unauthorized, &ListAllRanker)
-            .expect("bounded recall query succeeds");
+            .map_err(crate::test_support::ctx("bounded recall query succeeds"))?;
         assert!(
             denied.hits.is_empty(),
             "ein ModelBehaviorProposal darf ohne Operator-Berechtigung nicht sichtbar sein"
@@ -1172,7 +1203,7 @@ mod tests {
 
         let authorized = crate::artifact::RecallQuery::new("", VisibilityScope::OperatorOnly);
         let granted = search_with(&index, &authorized, &ListAllRanker)
-            .expect("bounded recall query succeeds");
+            .map_err(crate::test_support::ctx("bounded recall query succeeds"))?;
         let visible_ids: Vec<ArtifactId> = granted
             .hits
             .iter()
@@ -1182,5 +1213,6 @@ mod tests {
             visible_ids.contains(&proposal_artifact.id),
             "derselbe ModelBehaviorProposal muss für einen Operator-Aufrufer sichtbar sein"
         );
+        Ok(())
     }
 }

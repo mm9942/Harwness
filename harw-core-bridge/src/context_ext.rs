@@ -71,14 +71,17 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_core::{ChildLimits, InMemoryStateStore, ManagedAgentSpawner, SessionManager};
     use harw_operations::context::{OpContext, ServiceMap};
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
 
     use super::OpContextCoreExt;
+    use crate::test_support::{TestError, TestResult, ctx};
 
-    fn context_with_services(services: ServiceMap) -> (OpContext, PathBuf) {
+    fn context_with_services(services: ServiceMap) -> TestResult<(OpContext, PathBuf)> {
         static CONTEXT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
         let id = CONTEXT_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -87,7 +90,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(root.join("workspace"))
-            .expect("test workspace directory must be creatable");
+            .map_err(ctx("test workspace directory must be creatable"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -96,26 +99,26 @@ mod tests {
                 root: PathBuf::from("workspace"),
             }],
         )
-        .expect("test workspace registration must be valid");
+        .map_err(ctx("test workspace registration must be valid"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("workspace"),
             )
-            .expect("registered test workspace must resolve");
+            .map_err(ctx("registered test workspace must resolve"))?;
 
         let sandbox = SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ReadWorkspace]),
         );
-        (
+        Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, services),
             root,
-        )
+        ))
     }
 
     #[test]
-    fn paired_registration_retains_the_exact_trusted_arcs() {
+    fn paired_registration_retains_the_exact_trusted_arcs() -> TestResult {
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
         let managed_spawner = Arc::new(ManagedAgentSpawner::new(
             Arc::new(std::sync::Mutex::new(SessionManager::new(event_tx))),
@@ -130,19 +133,26 @@ mod tests {
             Arc::clone(&state_store),
         );
 
-        let registered_spawner = services
-            .get::<Arc<ManagedAgentSpawner>>()
-            .expect("paired registration must store the managed spawner");
-        let registered_store = services
-            .get::<Arc<dyn harw_core::StateStore>>()
-            .expect("paired registration must store the state store");
+        let registered_spawner =
+            services
+                .get::<Arc<ManagedAgentSpawner>>()
+                .ok_or(TestError::Missing(
+                    "paired registration must store the managed spawner",
+                ))?;
+        let registered_store =
+            services
+                .get::<Arc<dyn harw_core::StateStore>>()
+                .ok_or(TestError::Missing(
+                    "paired registration must store the state store",
+                ))?;
 
         assert!(Arc::ptr_eq(registered_spawner, &managed_spawner));
         assert!(Arc::ptr_eq(registered_store, &state_store));
+        Ok(())
     }
 
     #[test]
-    fn paired_registration_preserves_unrelated_services() {
+    fn paired_registration_preserves_unrelated_services() -> TestResult {
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
         let managed_spawner = Arc::new(ManagedAgentSpawner::new(
             Arc::new(std::sync::Mutex::new(SessionManager::new(event_tx))),
@@ -164,10 +174,11 @@ mod tests {
         );
         assert!(services.get::<Arc<ManagedAgentSpawner>>().is_some());
         assert!(services.get::<Arc<dyn harw_core::StateStore>>().is_some());
+        Ok(())
     }
 
     #[test]
-    fn context_getters_return_the_exact_registered_arcs() {
+    fn context_getters_return_the_exact_registered_arcs() -> TestResult {
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
         let managed_spawner = Arc::new(ManagedAgentSpawner::new(
             Arc::new(std::sync::Mutex::new(SessionManager::new(event_tx))),
@@ -180,17 +191,18 @@ mod tests {
             Arc::clone(&managed_spawner),
             Arc::clone(&state_store),
         );
-        let (context, root) = context_with_services(services);
+        let (context, root) = context_with_services(services)?;
 
-        let registered_spawner = context
-            .managed_spawner()
-            .expect("registered managed spawner must be retrievable");
-        let registered_store = context
-            .state_store()
-            .expect("registered state store must be retrievable");
+        let registered_spawner = context.managed_spawner().ok_or(TestError::Missing(
+            "registered managed spawner must be retrievable",
+        ))?;
+        let registered_store = context.state_store().ok_or(TestError::Missing(
+            "registered state store must be retrievable",
+        ))?;
         std::fs::remove_dir_all(root).ok();
 
         assert!(Arc::ptr_eq(&registered_spawner, &managed_spawner));
         assert!(Arc::ptr_eq(&registered_store, &state_store));
+        Ok(())
     }
 }

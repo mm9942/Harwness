@@ -84,9 +84,14 @@ impl LogLevel {
     name = "harw-warden",
     bin_name = "harw-warden",
     version,
-    about = "Durchsetzer-Binary: nimmt Anfragen am systemd-Socket entgegen, reicht sie an harw-dod-warden weiter."
+    about = "Durchsetzer-Binary: nimmt Anfragen am systemd-Socket entgegen, reicht sie an harw-dod-warden weiter.",
+    subcommand_negates_reqs = true
 )]
 pub struct Cli {
+    /// Optionales Unterkommando; ohne es läuft das Binary normal.
+    #[command(subcommand)]
+    pub command: Option<harw_completions::CompletionsSubcommand>,
+
     /// Log-Stufe für `tracing`. Siehe [`LogLevel`] für die Begründung, warum
     /// ein ungültiger Wert hier ein Fehler ist statt einer stillen
     /// Voreinstellung.
@@ -104,7 +109,8 @@ pub struct Cli {
 mod tests {
     use clap::Parser as _;
 
-    use super::{Cli, LogLevel, DEFAULT_CGROUP_ROOT};
+    use super::{Cli, DEFAULT_CGROUP_ROOT, LogLevel};
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn test_log_level_as_filter_directive_matches_every_variant() {
@@ -116,19 +122,24 @@ mod tests {
     }
 
     #[test]
-    fn test_defaults_are_used_when_omitted() {
-        let cli = Cli::try_parse_from(["harw-warden"]).expect("no required args");
+    fn test_defaults_are_used_when_omitted() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-warden"]).map_err(ctx("no required args"))?;
         assert_eq!(cli.log, LogLevel::Info);
-        assert_eq!(cli.cgroup_root, std::path::PathBuf::from(DEFAULT_CGROUP_ROOT));
+        assert_eq!(
+            cli.cgroup_root,
+            std::path::PathBuf::from(DEFAULT_CGROUP_ROOT)
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_log_accepts_every_documented_value() {
+    fn test_log_accepts_every_documented_value() -> TestResult {
         for value in ["trace", "debug", "info", "warn", "error"] {
             let cli = Cli::try_parse_from(["harw-warden", "--log", value])
-                .unwrap_or_else(|err| panic!("expected {value} to parse, got {err}"));
+                .map_err(ctx("expected value to parse"))?;
             assert_eq!(cli.log.as_filter_directive(), value);
         }
+        Ok(())
     }
 
     #[test]
@@ -141,9 +152,13 @@ mod tests {
     }
 
     #[test]
-    fn test_cgroup_root_override_is_honoured() {
+    fn test_cgroup_root_override_is_honoured() -> TestResult {
         let cli = Cli::try_parse_from(["harw-warden", "--cgroup-root", "/tmp/fixture-cgroup"])
-            .expect("valid override");
-        assert_eq!(cli.cgroup_root, std::path::PathBuf::from("/tmp/fixture-cgroup"));
+            .map_err(ctx("valid override"))?;
+        assert_eq!(
+            cli.cgroup_root,
+            std::path::PathBuf::from("/tmp/fixture-cgroup")
+        );
+        Ok(())
     }
 }

@@ -281,8 +281,16 @@ async fn export(_ctx: &OpContext, args: ExportArgs) -> Result<OpOutput, OpError>
         Some(path) => format!(
             "Export angefordert: Datei {path} (Format: {}, Werkzeugaufrufe: {}, Reasoning-Summary: {}{max_chars_suffix}).",
             args.format.marker_name(),
-            if args.include_tool_calls { "ja" } else { "nein" },
-            if args.include_reasoning_summary { "ja" } else { "nein" },
+            if args.include_tool_calls {
+                "ja"
+            } else {
+                "nein"
+            },
+            if args.include_reasoning_summary {
+                "ja"
+            } else {
+                "nein"
+            },
         ),
         None => format!(
             "Export angefordert: Zielauswahl folgt (Format: {}, Zwischenablage/Datei/abbrechen{max_chars_suffix}).",
@@ -298,18 +306,19 @@ async fn export(_ctx: &OpContext, args: ExportArgs) -> Result<OpOutput, OpError>
 #[cfg(test)]
 mod tests {
     use super::{ExportArgs, ExportFormat, export};
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
-    use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
     use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn test_context() -> OpContext {
+    fn test_context() -> TestResult<OpContext> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root =
             std::env::temp_dir().join(format!("harw-export-test-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(root.join("workspace")).expect("create test workspace");
+        std::fs::create_dir_all(root.join("workspace")).map_err(ctx("create test workspace"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -318,190 +327,245 @@ mod tests {
                 root: std::path::PathBuf::from("workspace"),
             }],
         )
-        .expect("build workspace registry");
+        .map_err(ctx("build workspace registry"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("workspace"),
             )
-            .expect("resolve workspace binding");
-        OpContext::new(
+            .map_err(ctx("resolve workspace binding"))?;
+        Ok(OpContext::new(
             SessionId::new(),
             TurnId::new(),
             SandboxSpec::from_resolved(binding, PermissionSet::empty()),
             ServiceMap::new(),
-        )
+        ))
     }
 
     #[test]
-    fn test_export_args_from_raw_args_defaults_to_markdown_with_tools_and_no_path() {
-        let args = ExportArgs::from_raw_args(&toks(&[])).expect("parse");
+    fn test_export_args_from_raw_args_defaults_to_markdown_with_tools_and_no_path() -> TestResult {
+        let args = ExportArgs::from_raw_args(&toks(&[])).map_err(ctx("parse"))?;
         assert_eq!(args, ExportArgs::default());
         assert_eq!(args.format, ExportFormat::Markdown);
         assert!(args.include_tool_calls);
         assert!(!args.include_reasoning_summary);
         assert!(args.path.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_export_args_json_without_new_fields_remains_compatible() {
+    fn test_export_args_json_without_new_fields_remains_compatible() -> TestResult {
         let args: ExportArgs = serde_json::from_value(serde_json::json!({
             "include_tool_calls": false,
             "path": "/tmp/legacy.md"
         }))
-        .expect("deserialize legacy arguments");
+        .map_err(ctx("deserialize legacy arguments"))?;
         assert_eq!(args.format, ExportFormat::Markdown);
         assert!(!args.include_tool_calls);
         assert!(!args.include_reasoning_summary);
         assert_eq!(args.path.as_deref(), Some("/tmp/legacy.md"));
+        Ok(())
     }
 
     #[test]
-    fn test_export_args_from_raw_args_parses_all_formats_and_canonicalizes_md() {
+    fn test_export_args_from_raw_args_parses_all_formats_and_canonicalizes_md() -> TestResult {
         let markdown = ExportArgs::from_raw_args(&toks(&["--format", "markdown"]))
-            .expect("parse markdown");
+            .map_err(ctx("parse markdown"))?;
         assert_eq!(markdown.format, ExportFormat::Markdown);
 
-        let md = ExportArgs::from_raw_args(&toks(&["--format", "md"]))
-            .expect("parse md");
+        let md = ExportArgs::from_raw_args(&toks(&["--format", "md"])).map_err(ctx("parse md"))?;
         assert_eq!(md.format, ExportFormat::Markdown);
 
-        let json = ExportArgs::from_raw_args(&toks(&["--format", "json"]))
-            .expect("parse json");
+        let json =
+            ExportArgs::from_raw_args(&toks(&["--format", "json"])).map_err(ctx("parse json"))?;
         assert_eq!(json.format, ExportFormat::Json);
+        Ok(())
     }
 
     #[test]
-    fn test_export_args_from_raw_args_parses_tools_flag() {
-        let args = ExportArgs::from_raw_args(&toks(&["--tools"])).expect("parse");
+    fn test_export_args_from_raw_args_parses_tools_flag() -> TestResult {
+        let args = ExportArgs::from_raw_args(&toks(&["--tools"])).map_err(ctx("parse"))?;
         assert!(args.include_tool_calls);
         assert!(args.path.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_export_args_from_raw_args_parses_explicit_tool_opt_out() {
-        let args = ExportArgs::from_raw_args(&toks(&["--no-tools"])).expect("parse");
+    fn test_export_args_from_raw_args_parses_explicit_tool_opt_out() -> TestResult {
+        let args = ExportArgs::from_raw_args(&toks(&["--no-tools"])).map_err(ctx("parse"))?;
         assert!(!args.include_tool_calls);
 
-        let args = ExportArgs::from_raw_args(&toks(&["--no-tools", "--tools"])).expect("parse");
+        let args =
+            ExportArgs::from_raw_args(&toks(&["--no-tools", "--tools"])).map_err(ctx("parse"))?;
         assert!(args.include_tool_calls);
+        Ok(())
     }
 
     #[test]
-    fn test_export_args_from_raw_args_only_accepts_safe_reasoning_summary() {
-        let args = ExportArgs::from_raw_args(&toks(&["--reasoning-summary"])).expect("parse");
+    fn test_export_args_from_raw_args_only_accepts_safe_reasoning_summary() -> TestResult {
+        let args =
+            ExportArgs::from_raw_args(&toks(&["--reasoning-summary"])).map_err(ctx("parse"))?;
         assert!(args.include_reasoning_summary);
 
         let result = ExportArgs::from_raw_args(&toks(&["--reasoning"]));
         assert!(matches!(result, Err(OpError::InvalidArguments(_))));
+        Ok(())
     }
 
     #[test]
-    fn test_export_args_from_raw_args_parses_datei_with_path() {
-        let args = ExportArgs::from_raw_args(&toks(&["--datei", "/tmp/export.md"])).expect("parse");
+    fn test_export_args_from_raw_args_parses_datei_with_path() -> TestResult {
+        let args = ExportArgs::from_raw_args(&toks(&["--datei", "/tmp/export.md"]))
+            .map_err(ctx("parse"))?;
         assert_eq!(args.path.as_deref(), Some("/tmp/export.md"));
+        Ok(())
     }
 
     #[test]
-    fn test_export_args_from_raw_args_defaults_max_chars_to_none() {
-        let args = ExportArgs::from_raw_args(&toks(&[])).expect("parse");
+    fn test_export_args_from_raw_args_defaults_max_chars_to_none() -> TestResult {
+        let args = ExportArgs::from_raw_args(&toks(&[])).map_err(ctx("parse"))?;
         assert_eq!(args.max_chars, None);
+        Ok(())
     }
 
     #[test]
-    fn test_export_args_from_raw_args_parses_valid_max_chars() {
-        let args = ExportArgs::from_raw_args(&toks(&["--max-chars", "20000"])).expect("parse");
+    fn test_export_args_from_raw_args_parses_valid_max_chars() -> TestResult {
+        let args =
+            ExportArgs::from_raw_args(&toks(&["--max-chars", "20000"])).map_err(ctx("parse"))?;
         assert_eq!(args.max_chars, Some(20000));
+        Ok(())
     }
 
     #[test]
-    fn test_export_args_from_raw_args_rejects_zero_max_chars() {
+    fn test_export_args_from_raw_args_rejects_zero_max_chars() -> TestResult {
         let result = ExportArgs::from_raw_args(&toks(&["--max-chars", "0"]));
         match result {
             Err(OpError::InvalidArguments(message)) => assert!(message.contains("--max-chars")),
-            other => panic!("expected invalid arguments, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected invalid arguments, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_export_args_from_raw_args_rejects_negative_max_chars() {
+    fn test_export_args_from_raw_args_rejects_negative_max_chars() -> TestResult {
         let result = ExportArgs::from_raw_args(&toks(&["--max-chars", "-5"]));
         assert!(matches!(result, Err(OpError::InvalidArguments(_))));
+        Ok(())
     }
 
     #[test]
-    fn test_export_args_from_raw_args_rejects_non_numeric_max_chars() {
+    fn test_export_args_from_raw_args_rejects_non_numeric_max_chars() -> TestResult {
         let result = ExportArgs::from_raw_args(&toks(&["--max-chars", "abc"]));
         match result {
             Err(OpError::InvalidArguments(message)) => assert!(message.contains("--max-chars")),
-            other => panic!("expected invalid arguments, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected invalid arguments, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_export_args_from_raw_args_max_chars_without_value_is_invalid() {
+    fn test_export_args_from_raw_args_max_chars_without_value_is_invalid() -> TestResult {
         let result = ExportArgs::from_raw_args(&toks(&["--max-chars"]));
         match result {
             Err(OpError::InvalidArguments(message)) => assert!(message.contains("--max-chars")),
-            other => panic!("expected invalid arguments, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected invalid arguments, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_export_args_from_raw_args_accepts_both_flags_in_either_order() {
-        let args = ExportArgs::from_raw_args(&toks(&["--datei", "/tmp/x.md", "--tools"])).expect("parse");
+    fn test_export_args_from_raw_args_accepts_both_flags_in_either_order() -> TestResult {
+        let args = ExportArgs::from_raw_args(&toks(&["--datei", "/tmp/x.md", "--tools"]))
+            .map_err(ctx("parse"))?;
         assert!(args.include_tool_calls);
         assert_eq!(args.path.as_deref(), Some("/tmp/x.md"));
 
-        let args = ExportArgs::from_raw_args(&toks(&["--tools", "--datei", "/tmp/y.md"])).expect("parse");
+        let args = ExportArgs::from_raw_args(&toks(&["--tools", "--datei", "/tmp/y.md"]))
+            .map_err(ctx("parse"))?;
         assert!(args.include_tool_calls);
         assert_eq!(args.path.as_deref(), Some("/tmp/y.md"));
+        Ok(())
     }
 
     #[test]
-    fn test_export_args_from_raw_args_datei_without_path_is_invalid() {
+    fn test_export_args_from_raw_args_datei_without_path_is_invalid() -> TestResult {
         let result = ExportArgs::from_raw_args(&toks(&["--datei"]));
         match result {
             Err(OpError::InvalidArguments(message)) => assert!(message.contains("--datei")),
-            other => panic!("expected invalid arguments, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected invalid arguments, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_export_args_from_raw_args_format_without_value_is_invalid() {
+    fn test_export_args_from_raw_args_format_without_value_is_invalid() -> TestResult {
         let result = ExportArgs::from_raw_args(&toks(&["--format"]));
         match result {
             Err(OpError::InvalidArguments(message)) => assert!(message.contains("--format")),
-            other => panic!("expected invalid arguments, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected invalid arguments, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_export_args_from_raw_args_rejects_unknown_format() {
+    fn test_export_args_from_raw_args_rejects_unknown_format() -> TestResult {
         let result = ExportArgs::from_raw_args(&toks(&["--format", "xml"]));
         match result {
             Err(OpError::InvalidArguments(message)) => {
                 assert!(message.contains("xml"));
                 assert!(message.contains("markdown"));
             }
-            other => panic!("expected invalid arguments, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected invalid arguments, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_export_args_from_raw_args_rejects_unknown_token() {
+    fn test_export_args_from_raw_args_rejects_unknown_token() -> TestResult {
         let result = ExportArgs::from_raw_args(&toks(&["--wat"]));
         match result {
             Err(OpError::InvalidArguments(message)) => assert!(message.contains("--wat")),
-            other => panic!("expected invalid arguments, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected invalid arguments, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn export_without_path_returns_request_marker_with_null_path() {
-        let ctx = test_context();
-        let output = export(&ctx, ExportArgs::default()).await.expect("export");
-        let data = output.data.expect("data marker must be present");
+    async fn export_without_path_returns_request_marker_with_null_path() -> TestResult {
+        let ctx = test_context()?;
+        let output = export(&ctx, ExportArgs::default())
+            .await
+            .map_err(crate::test_support::ctx("export"))?;
+        let data = output
+            .data
+            .ok_or(TestError::Missing("data marker must be present"))?;
         assert_eq!(data["kind"], serde_json::json!("export.request"));
         assert_eq!(data["format"], serde_json::json!("markdown"));
         assert_eq!(data["include_tool_calls"], serde_json::json!(true));
@@ -510,24 +574,30 @@ mod tests {
         assert!(data.get("max_chars").is_none());
         assert!(output.text.contains("Zielauswahl"));
         assert!(output.text.contains("markdown"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn export_with_max_chars_returns_marker_with_max_chars_key() {
-        let ctx = test_context();
+    async fn export_with_max_chars_returns_marker_with_max_chars_key() -> TestResult {
+        let ctx = test_context()?;
         let args = ExportArgs {
             max_chars: Some(20_000),
             ..ExportArgs::default()
         };
-        let output = export(&ctx, args).await.expect("export");
-        let data = output.data.expect("data marker must be present");
+        let output = export(&ctx, args)
+            .await
+            .map_err(crate::test_support::ctx("export"))?;
+        let data = output
+            .data
+            .ok_or(TestError::Missing("data marker must be present"))?;
         assert_eq!(data["max_chars"], serde_json::json!(20_000));
         assert!(output.text.contains("20000"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn export_with_path_and_tools_returns_matching_marker() {
-        let ctx = test_context();
+    async fn export_with_path_and_tools_returns_matching_marker() -> TestResult {
+        let ctx = test_context()?;
         let args = ExportArgs {
             format: ExportFormat::Json,
             include_tool_calls: true,
@@ -535,8 +605,12 @@ mod tests {
             path: Some("/tmp/export.md".to_owned()),
             max_chars: None,
         };
-        let output = export(&ctx, args).await.expect("export");
-        let data = output.data.expect("data marker must be present");
+        let output = export(&ctx, args)
+            .await
+            .map_err(crate::test_support::ctx("export"))?;
+        let data = output
+            .data
+            .ok_or(TestError::Missing("data marker must be present"))?;
         assert_eq!(data["kind"], serde_json::json!("export.request"));
         assert_eq!(data["format"], serde_json::json!("json"));
         assert_eq!(data["include_tool_calls"], serde_json::json!(true));
@@ -545,5 +619,6 @@ mod tests {
         assert!(output.text.contains("/tmp/export.md"));
         assert!(output.text.contains("json"));
         assert!(output.text.contains("ja"));
+        Ok(())
     }
 }

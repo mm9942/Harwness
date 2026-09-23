@@ -50,13 +50,16 @@ use crate::activation::ToolProfile;
 ///
 /// Jeder Eintrag ist ein Werkzeugname, der den Workspace bzw. die bereits
 /// entpackten Abhängigkeitsquellen ausschließlich liest. Kein Eintrag darf
-/// schreiben, Prozesse starten oder ins Netz gehen.
+/// schreiben, Prozesse starten oder ins Netz gehen. `doc.read_pdf` liest
+/// PDFs aus dem Workspace unter derselben Berechtigung wie `fs.read`
+/// (`Permission::ReadWorkspace`).
 const EXPLORE_TOOLS: &[&str] = &[
     "fs.read",
     "fs.list",
     "fs.search",
     "fs.glob",
     "fs.grep",
+    "doc.read_pdf",
     "deps.graph",
     "deps.locked",
     "deps.source_read",
@@ -80,6 +83,7 @@ const PLAN_TOOLS: &[&str] = &[
     "fs.search",
     "fs.glob",
     "fs.grep",
+    "doc.read_pdf",
     "deps.graph",
     "deps.locked",
     "deps.source_read",
@@ -189,6 +193,41 @@ pub enum InteractionMode {
 }
 
 impl InteractionMode {
+    /// Alle Modi in kanonischer Reihenfolge.
+    ///
+    /// # Beschreibung
+    /// Maßgebliche Aufzählung für Oberflächen, die die Modusliste anzeigen
+    /// oder prüfen (z. B. die CLI-Validierung von `--mode` und
+    /// Shell-Completions) — damit keine zweite Liste außerhalb von
+    /// `harw-core` gepflegt werden muss.
+    pub const ALL: [InteractionMode; 5] = [
+        Self::Chat,
+        Self::Plan,
+        Self::Explore,
+        Self::Work,
+        Self::Shell,
+    ];
+
+    /// Liefert die kanonischen Namen aller Modi (siehe [`Self::as_str`]).
+    ///
+    /// # Returns
+    /// Einen Iterator über `"chat"`, `"plan"`, `"explore"`, `"work"`,
+    /// `"shell"` in der Reihenfolge von [`Self::ALL`].
+    ///
+    /// # Nebenläufigkeit
+    /// Reine Berechnung ohne Allokation.
+    ///
+    /// # Beispiele
+    /// ```rust
+    /// use harw_core::mode::InteractionMode;
+    ///
+    /// let names: Vec<&str> = InteractionMode::names().collect();
+    /// assert_eq!(names, ["chat", "plan", "explore", "work", "shell"]);
+    /// ```
+    pub fn names() -> impl Iterator<Item = &'static str> {
+        Self::ALL.into_iter().map(|mode| mode.as_str())
+    }
+
     /// Liefert das Tool-Profil für die [`SessionActivation`][crate::activation::SessionActivation].
     ///
     /// # Beschreibung
@@ -408,6 +447,7 @@ fn is_known_permission(permission: Permission) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     const ALL_MODES: [InteractionMode; 5] = [
         InteractionMode::Chat,
@@ -484,14 +524,15 @@ mod tests {
     }
 
     #[test]
-    fn test_as_str_matches_serde_wire_form() {
+    fn test_as_str_matches_serde_wire_form() -> TestResult {
         for mode in ALL_MODES {
-            let json = serde_json::to_string(&mode).expect("Modus ist serialisierbar");
+            let json = serde_json::to_string(&mode).map_err(ctx("Modus ist serialisierbar"))?;
             assert_eq!(json, format!("\"{}\"", mode.as_str()));
             let parsed: InteractionMode =
-                serde_json::from_str(&json).expect("Modus ist deserialisierbar");
+                serde_json::from_str(&json).map_err(ctx("Modus ist deserialisierbar"))?;
             assert_eq!(parsed, mode);
         }
+        Ok(())
     }
 
     #[test]
@@ -523,10 +564,10 @@ mod tests {
     }
 
     #[test]
-    fn test_explore_tools_exclude_every_mutating_tool() {
+    fn test_explore_tools_exclude_every_mutating_tool() -> TestResult {
         let explore = InteractionMode::Explore
             .allowed_tools()
-            .expect("Explore hat eine Positivliste");
+            .ok_or(TestError::Missing("Explore hat eine Positivliste"))?;
         for forbidden in [
             "fs.write",
             "shell.exec",
@@ -542,16 +583,71 @@ mod tests {
         }
         assert!(explore.contains(&"fs.read"));
         assert!(explore.contains(&"deps.source_read"));
+        assert!(explore.contains(&"doc.read_pdf"));
+        Ok(())
     }
 
     #[test]
-    fn test_plan_tools_extend_explore_tools() {
+    fn test_explore_tools_exact_list() {
+        // Hält die vollständige Positivliste fest, statt nur Ausschnitte zu
+        // prüfen — ein neuer Eintrag (z. B. ein weiteres Lesewerkzeug) muss
+        // hier bewusst nachgezogen werden.
+        let expected: &[&str] = &[
+            "fs.read",
+            "fs.list",
+            "fs.search",
+            "fs.glob",
+            "fs.grep",
+            "doc.read_pdf",
+            "deps.graph",
+            "deps.locked",
+            "deps.source_read",
+            "deps.source_search",
+            "deps.source_list",
+            "status",
+            "ps",
+            "diff",
+        ];
+        assert_eq!(InteractionMode::Explore.allowed_tools(), Some(expected));
+    }
+
+    #[test]
+    fn test_plan_tools_exact_list() {
+        let expected: &[&str] = &[
+            "fs.read",
+            "fs.list",
+            "fs.search",
+            "fs.glob",
+            "fs.grep",
+            "doc.read_pdf",
+            "deps.graph",
+            "deps.locked",
+            "deps.source_read",
+            "deps.source_search",
+            "deps.source_list",
+            "status",
+            "ps",
+            "diff",
+            "plan",
+            "goal",
+            "web.fetch",
+            "web.docs_rs",
+            "web.crates_io",
+            "explore",
+            "research_deps",
+            "research_web",
+        ];
+        assert_eq!(InteractionMode::Plan.allowed_tools(), Some(expected));
+    }
+
+    #[test]
+    fn test_plan_tools_extend_explore_tools() -> TestResult {
         let explore = InteractionMode::Explore
             .allowed_tools()
-            .expect("Explore hat eine Positivliste");
+            .ok_or(TestError::Missing("Explore hat eine Positivliste"))?;
         let plan = InteractionMode::Plan
             .allowed_tools()
-            .expect("Plan hat eine Positivliste");
+            .ok_or(TestError::Missing("Plan hat eine Positivliste"))?;
         for name in explore {
             assert!(
                 plan.contains(name),
@@ -575,6 +671,7 @@ mod tests {
             "Plan bleibt mutationsfrei"
         );
         assert_eq!(plan.len(), explore.len() + 8);
+        Ok(())
     }
 
     #[test]
@@ -625,7 +722,10 @@ mod tests {
             InteractionMode::Shell.permission_ceiling(),
             InteractionMode::Work.permission_ceiling()
         );
-        assert_eq!(InteractionMode::Shell.permission_ceiling(), all_permissions());
+        assert_eq!(
+            InteractionMode::Shell.permission_ceiling(),
+            all_permissions()
+        );
     }
 
     #[test]

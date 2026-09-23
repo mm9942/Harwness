@@ -149,3 +149,7 @@ pub use error::{AuthlogError, AuthlogResult};
 pub use fixture_backend::FixtureAuthBackend;
 pub use record::AuthRecord;
 pub use sensor::AuthlogSensor;
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

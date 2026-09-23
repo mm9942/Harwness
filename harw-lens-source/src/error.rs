@@ -138,9 +138,10 @@ pub enum SourceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
-    fn test_source_error_display_embedder_count_mismatch() {
+    fn test_source_error_display_embedder_count_mismatch() -> TestResult {
         let err = SourceError::EmbedderCountMismatch {
             expected: 3,
             actual: 1,
@@ -149,10 +150,11 @@ mod tests {
             err.to_string(),
             "embedder returned 1 vector(s) for 3 requested text(s)"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_source_error_display_missing_embedding() {
+    fn test_source_error_display_missing_embedding() -> TestResult {
         let err = SourceError::MissingEmbedding {
             digest: "deadbeef".to_owned(),
         };
@@ -160,31 +162,39 @@ mod tests {
             err.to_string(),
             "chunk deadbeef has neither a cached nor a freshly computed embedding"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_source_error_from_io() {
+    fn test_source_error_from_io() -> TestResult {
         let io_err = std::io::Error::other("boom");
         let err: SourceError = io_err.into();
         assert!(matches!(err, SourceError::Io(_)));
+        Ok(())
     }
 
     #[test]
-    fn test_source_error_from_serde() {
-        let serde_err = serde_json::from_str::<u32>("not json").unwrap_err();
+    fn test_source_error_from_serde() -> TestResult {
+        let Err(serde_err) = serde_json::from_str::<u32>("not json") else {
+            return Err(TestError::Unexpected(
+                "expected serde_json::from_str to fail on invalid JSON".to_owned(),
+            ));
+        };
         let err: SourceError = serde_err.into();
         assert!(matches!(err, SourceError::Serde(_)));
+        Ok(())
     }
 
     #[test]
-    fn test_source_error_from_home() {
+    fn test_source_error_from_home() -> TestResult {
         let home_err = harw_home::HomeError::NoHomeDirectory;
         let err: SourceError = home_err.into();
         assert!(matches!(err, SourceError::Home(_)));
+        Ok(())
     }
 
     #[test]
-    fn test_source_error_display_operator_only_remote_embed() {
+    fn test_source_error_display_operator_only_remote_embed() -> TestResult {
         let err = SourceError::OperatorOnlyRemoteEmbed {
             index_name: "knowledge.palace".to_owned(),
         };
@@ -193,5 +203,6 @@ mod tests {
             "index 'knowledge.palace': the operator-only visibility bucket was given a \
              remote-locality embedder; operator-only material must only ever be embedded locally"
         );
+        Ok(())
     }
 }

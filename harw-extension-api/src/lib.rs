@@ -40,3 +40,7 @@ pub use types::{
     ContextFragment, LoadedInstructions, TurnInputContext, TurnStartInput, TurnStopInput,
 };
 pub use v1_compat::fragment_from_v1;
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

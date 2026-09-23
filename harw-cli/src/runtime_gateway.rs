@@ -291,6 +291,7 @@ fn config_has_usable_provider(config: &harw_config::ResolvedConfig) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_core::InMemoryStateStore;
 
     #[test]
@@ -324,9 +325,9 @@ mod tests {
     /// Präfix `"gateway: "` liefern — nie still auf Echo zurückfallen
     /// (Befund G-048).
     #[test]
-    fn test_gateway_assembly_without_provider_config_returns_err_not_echo() {
-        let home = tempfile::tempdir().expect("tempdir home");
-        let cwd = tempfile::tempdir().expect("tempdir cwd");
+    fn test_gateway_assembly_without_provider_config_returns_err_not_echo() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir home"))?;
+        let cwd = tempfile::tempdir().map_err(ctx("tempdir cwd"))?;
         let principal = channel_principal(GatewayEntry::Dream, "unused-peer");
         let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
 
@@ -340,12 +341,15 @@ mod tests {
         );
 
         let Err(error) = result else {
-            panic!("a tempdir home without provider config must not build an assembly");
+            return Err(TestError::Unexpected(
+                "a tempdir home without provider config must not build an assembly".into(),
+            ));
         };
         assert!(
             error.starts_with("gateway: "),
             "error must carry the \"gateway: \" prefix, got: {error}"
         );
+        Ok(())
     }
 
     /// Ein Home mit genau einem, aber **deaktivierten** Provider — dieselbe
@@ -355,20 +359,21 @@ mod tests {
     /// ohne Provider-Datei: ein deaktivierter Provider darf nie als
     /// „vorhandene Konfiguration" zählen.
     #[test]
-    fn test_gateway_assembly_with_only_a_disabled_provider_returns_err_not_echo() {
-        let home = tempfile::tempdir().expect("tempdir home");
-        let cwd = tempfile::tempdir().expect("tempdir cwd");
+    fn test_gateway_assembly_with_only_a_disabled_provider_returns_err_not_echo() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir home"))?;
+        let cwd = tempfile::tempdir().map_err(ctx("tempdir cwd"))?;
         std::fs::write(
             home.path().join("config.toml"),
             "default_provider = \"seeded\"\ndefault_model = \"seeded-model\"\n",
         )
-        .expect("write config.toml");
-        std::fs::create_dir_all(home.path().join("providers")).expect("create providers dir");
+        .map_err(ctx("write config.toml"))?;
+        std::fs::create_dir_all(home.path().join("providers"))
+            .map_err(ctx("create providers dir"))?;
         std::fs::write(
             home.path().join("providers").join("seeded.toml"),
             "name = \"seeded\"\napi = \"openai-chat\"\nbase_url = \"https://example.test/v1\"\nenabled = false\n",
         )
-        .expect("write disabled provider");
+        .map_err(ctx("write disabled provider"))?;
         let principal = channel_principal(GatewayEntry::Dream, "unused-peer");
         let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
 
@@ -382,7 +387,9 @@ mod tests {
         );
 
         let Err(error) = result else {
-            panic!("a home with only a disabled provider must not build an assembly");
+            return Err(TestError::Unexpected(
+                "a home with only a disabled provider must not build an assembly".into(),
+            ));
         };
         assert!(
             error.starts_with("gateway: "),
@@ -392,6 +399,7 @@ mod tests {
             !error.contains("Echo"),
             "mount error must not describe an echo fallback, got: {error}"
         );
+        Ok(())
     }
 
     #[test]
@@ -399,10 +407,9 @@ mod tests {
         let mut config = harw_config::ResolvedConfig::default();
         config.harness.default_provider = Some("plain".to_owned());
         config.harness.default_model = Some("model".to_owned());
-        config.providers.insert(
-            "plain".to_owned(),
-            enabled_provider_toml("plain", true),
-        );
+        config
+            .providers
+            .insert("plain".to_owned(), enabled_provider_toml("plain", true));
 
         assert!(config_has_usable_provider(&config));
     }
@@ -412,10 +419,9 @@ mod tests {
         let mut config = harw_config::ResolvedConfig::default();
         config.harness.default_provider = Some("seeded".to_owned());
         config.harness.default_model = Some("seeded-model".to_owned());
-        config.providers.insert(
-            "seeded".to_owned(),
-            enabled_provider_toml("seeded", false),
-        );
+        config
+            .providers
+            .insert("seeded".to_owned(), enabled_provider_toml("seeded", false));
 
         assert!(!config_has_usable_provider(&config));
     }
@@ -425,10 +431,9 @@ mod tests {
         let mut config = harw_config::ResolvedConfig::default();
         config.harness.default_provider = Some("missing".to_owned());
         config.harness.default_model = Some("missing-model".to_owned());
-        config.providers.insert(
-            "catalog".to_owned(),
-            enabled_provider_toml("catalog", true),
-        );
+        config
+            .providers
+            .insert("catalog".to_owned(), enabled_provider_toml("catalog", true));
         config.models.insert(
             "catalog-model".to_owned(),
             harw_config::ModelToml {
@@ -451,7 +456,9 @@ mod tests {
 
     #[test]
     fn config_has_usable_provider_false_for_an_entirely_empty_config() {
-        assert!(!config_has_usable_provider(&harw_config::ResolvedConfig::default()));
+        assert!(!config_has_usable_provider(
+            &harw_config::ResolvedConfig::default()
+        ));
     }
 
     /// Minimaler `ProviderToml`-Testfixture mit explizit gesetztem `enabled`.
@@ -471,6 +478,7 @@ mod tests {
             max_concurrency: None,
             originator: None,
             default_reasoning_effort: None,
+            gateway_identity_headers: false,
         }
     }
 }

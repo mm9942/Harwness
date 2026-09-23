@@ -102,19 +102,22 @@ pub struct OtlpConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
-    fn test_deserialize_minimal_config_applies_defaults() {
+    fn test_deserialize_minimal_config_applies_defaults() -> TestResult {
         let json = r#"{
             "endpoint": "http://127.0.0.1:4318/v1/metrics",
             "resource_service_name": "harw-sentinel"
         }"#;
-        let config: OtlpConfig = serde_json::from_str(json).unwrap();
+        let config: OtlpConfig =
+            serde_json::from_str(json).map_err(ctx("Config deserialisieren"))?;
         assert_eq!(config.endpoint, "http://127.0.0.1:4318/v1/metrics");
         assert_eq!(config.resource_service_name, "harw-sentinel");
         assert!(config.headers.is_empty());
         assert_eq!(config.batch_size, 100);
         assert_eq!(config.max_buffer, 10_000);
+        Ok(())
     }
 
     #[test]
@@ -136,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_full_config_round_trips_through_serialize() {
+    fn test_deserialize_full_config_round_trips_through_serialize() -> TestResult {
         let config = OtlpConfig {
             endpoint: "http://127.0.0.1:4318/v1/metrics".to_owned(),
             headers: vec![HeaderEntry {
@@ -147,8 +150,10 @@ mod tests {
             max_buffer: 500,
             resource_service_name: "harw-sentinel".to_owned(),
         };
-        let json = serde_json::to_string(&config).unwrap();
-        let back: OtlpConfig = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&config).map_err(ctx("Config serialisieren"))?;
+        let back: OtlpConfig =
+            serde_json::from_str(&json).map_err(ctx("Config deserialisieren"))?;
         assert_eq!(config, back);
+        Ok(())
     }
 }

@@ -64,13 +64,14 @@ pub(crate) fn expand_agent(
 #[cfg(test)]
 mod agent_tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn accepts_supported_fields_once() {
+    fn accepts_supported_fields_once() -> TestResult {
         let args = parse_agent_args(quote! {
             name = "worker", role = "coding", description = "bounded task"
         })
-        .expect("supported agent fields should parse");
+        .map_err(ctx("supported agent fields should parse"))?;
 
         assert_eq!(
             args.name.as_ref().map(LitStr::value),
@@ -84,40 +85,53 @@ mod agent_tests {
             args.description.as_ref().map(LitStr::value),
             Some("bounded task".to_owned())
         );
+        Ok(())
     }
 
     #[test]
-    fn rejects_unknown_field() {
-        let error = parse_agent_args(quote!(model = "gpt-5"))
-            .expect_err("unknown agent fields must be rejected");
+    fn rejects_unknown_field() -> TestResult {
+        let Err(error) = parse_agent_args(quote!(model = "gpt-5")) else {
+            return Err(TestError::Unexpected(
+                "unknown agent fields must be rejected".to_owned(),
+            ));
+        };
         assert!(
             error
                 .to_string()
                 .contains("unknown `agent` attribute field")
         );
+        Ok(())
     }
 
     #[test]
-    fn rejects_duplicate_field() {
-        let error = parse_agent_args(quote!(name = "one", name = "two"))
-            .expect_err("duplicate agent fields must be rejected");
+    fn rejects_duplicate_field() -> TestResult {
+        let Err(error) = parse_agent_args(quote!(name = "one", name = "two")) else {
+            return Err(TestError::Unexpected(
+                "duplicate agent fields must be rejected".to_owned(),
+            ));
+        };
         assert!(
             error
                 .to_string()
                 .contains("duplicate `agent` attribute field `name`")
         );
+        Ok(())
     }
 
     #[test]
-    fn rejects_non_function_items() {
+    fn rejects_non_function_items() -> TestResult {
         let item: syn::Item = syn::parse_quote!(
             struct Worker;
         );
-        let error = expand_agent(item, AgentArgs::default())
-            .expect_err("agent must only annotate functions");
+        let Err(error) = expand_agent(item, AgentArgs::default()) else {
+            return Err(TestError::Unexpected(
+                "agent must only annotate functions".to_owned(),
+            ));
+        };
         assert_eq!(
             error.to_string(),
             "#[agent] may only be applied to a function"
         );
+        Ok(())
     }
 }

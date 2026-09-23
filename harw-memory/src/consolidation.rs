@@ -181,8 +181,14 @@ pub fn plan_consolidation(existing: &[Fact], incoming: &[Fact]) -> Consolidation
     for inc in incoming {
         let candidate = find_same_name(existing, &matched, inc)
             .map(|f| (f, MergeReason::SameName))
-            .or_else(|| find_similar_description(existing, &matched, inc).map(|f| (f, MergeReason::SimilarDescription)))
-            .or_else(|| find_same_source_and_type(existing, &matched, inc).map(|f| (f, MergeReason::SameSourceAndType)));
+            .or_else(|| {
+                find_similar_description(existing, &matched, inc)
+                    .map(|f| (f, MergeReason::SimilarDescription))
+            })
+            .or_else(|| {
+                find_same_source_and_type(existing, &matched, inc)
+                    .map(|f| (f, MergeReason::SameSourceAndType))
+            });
 
         if let Some((exist, reason)) = candidate {
             matched.insert(exist.name.clone());
@@ -224,7 +230,11 @@ pub fn plan_consolidation(existing: &[Fact], incoming: &[Fact]) -> Consolidation
 
 /// Sucht in `existing` den ersten noch nicht gematchten Fakt mit
 /// `name == inc.name`.
-fn find_same_name<'a>(existing: &'a [Fact], matched: &HashSet<String>, inc: &Fact) -> Option<&'a Fact> {
+fn find_same_name<'a>(
+    existing: &'a [Fact],
+    matched: &HashSet<String>,
+    inc: &Fact,
+) -> Option<&'a Fact> {
     existing
         .iter()
         .find(|e| !matched.contains(&e.name) && e.name == inc.name)
@@ -252,7 +262,9 @@ fn find_same_source_and_type<'a>(
     inc: &Fact,
 ) -> Option<&'a Fact> {
     existing.iter().find(|e| {
-        !matched.contains(&e.name) && e.fact_type == inc.fact_type && slices_overlap(&e.sources, &inc.sources)
+        !matched.contains(&e.name)
+            && e.fact_type == inc.fact_type
+            && slices_overlap(&e.sources, &inc.sources)
     })
 }
 
@@ -311,7 +323,11 @@ fn jaccard_similarity(a: &str, b: &str) -> f64 {
 /// `created` ist das Minimum beider (der wahre Ursprung bleibt erhalten);
 /// `scope` bleibt `target.scope`.
 fn merge_facts(target: &Fact, other: &Fact) -> Fact {
-    let newer = if other.updated >= target.updated { other } else { target };
+    let newer = if other.updated >= target.updated {
+        other
+    } else {
+        target
+    };
     let mut sources = target.sources.clone();
     for s in &other.sources {
         if !sources.contains(s) {
@@ -358,7 +374,10 @@ fn merge_facts(target: &Fact, other: &Fact) -> Fact {
 /// [`FactStore::write_index`] wird unverändert durchgereicht — bereits
 /// geschriebene/gelöschte Fakten aus demselben Plan bleiben dabei wirksam
 /// (kein Rollback).
-pub fn apply_plan(store: &FactStore, plan: &ConsolidationPlan) -> MemoryResult<ConsolidationReport> {
+pub fn apply_plan(
+    store: &FactStore,
+    plan: &ConsolidationPlan,
+) -> MemoryResult<ConsolidationReport> {
     for fact in &plan.updates {
         store.write(fact)?;
     }
@@ -497,7 +516,10 @@ impl ConsolidationBaseline {
     #[must_use]
     pub fn from_facts(facts: &[Fact]) -> Self {
         Self {
-            digests: facts.iter().map(|f| (f.name.clone(), fact_digest(f))).collect(),
+            digests: facts
+                .iter()
+                .map(|f| (f.name.clone(), fact_digest(f)))
+                .collect(),
         }
     }
 
@@ -533,8 +555,12 @@ impl ConsolidationBaseline {
             context: "consolidation baseline schreiben",
             source: e,
         })?;
-        harw_fsutil::write_atomic(&path, &payload, harw_fsutil::AtomicWriteOptions::with_mode(0o600))
-            .map_err(|e| MemoryError::Io { path, source: e })
+        harw_fsutil::write_atomic(
+            &path,
+            &payload,
+            harw_fsutil::AtomicWriteOptions::with_mode(0o600),
+        )
+        .map_err(|e| MemoryError::Io { path, source: e })
     }
 
     /// Liefert die Namen aller Fakten in `current`, deren Digest von dieser
@@ -707,7 +733,10 @@ impl ConsolidationLock {
     /// Legt `path` exklusiv an (`O_EXCL`-artig über `create_new`) und
     /// schreibt PID plus Zeitstempel hinein.
     fn create_exclusive(path: &Path) -> io::Result<()> {
-        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
         let created = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .unwrap_or_else(|_| "unknown".to_owned());
@@ -757,6 +786,7 @@ impl Drop for ConsolidationLock {
 mod tests {
     use super::*;
     use crate::facts::{FactScope, FactStore, FactType};
+    use crate::test_support::{TestResult, ctx};
     use time::Duration;
 
     fn tmp_root(tag: &str) -> PathBuf {
@@ -799,7 +829,10 @@ mod tests {
         incoming_fact.confidence = 0.9;
         incoming_fact.sources = vec!["session:new".to_owned()];
 
-        let plan = plan_consolidation(std::slice::from_ref(&existing_fact), std::slice::from_ref(&incoming_fact));
+        let plan = plan_consolidation(
+            std::slice::from_ref(&existing_fact),
+            std::slice::from_ref(&incoming_fact),
+        );
 
         assert_eq!(plan.merges.len(), 1);
         assert_eq!(plan.merges[0].reason, MergeReason::SameName);
@@ -807,7 +840,10 @@ mod tests {
         assert_eq!(plan.updates.len(), 1);
         let merged = &plan.updates[0];
         assert_eq!(merged.name, "tui-approval-arming");
-        assert_eq!(merged.description, "neue Beschreibung", "neuerer Text muss gewinnen");
+        assert_eq!(
+            merged.description, "neue Beschreibung",
+            "neuerer Text muss gewinnen"
+        );
         assert_eq!(merged.confidence, 0.9, "confidence ist das Maximum");
         assert_eq!(merged.sources.len(), 2, "sources werden vereinigt");
         assert!(plan.conflicts.is_empty());
@@ -828,7 +864,10 @@ mod tests {
             "Regel B\n",
         );
 
-        let plan = plan_consolidation(std::slice::from_ref(&existing_fact), std::slice::from_ref(&incoming_fact));
+        let plan = plan_consolidation(
+            std::slice::from_ref(&existing_fact),
+            std::slice::from_ref(&incoming_fact),
+        );
 
         assert_eq!(plan.merges.len(), 1);
         assert_eq!(plan.merges[0].reason, MergeReason::SimilarDescription);
@@ -848,7 +887,10 @@ mod tests {
             "Regel B\n",
         );
 
-        let plan = plan_consolidation(std::slice::from_ref(&existing_fact), std::slice::from_ref(&incoming_fact));
+        let plan = plan_consolidation(
+            std::slice::from_ref(&existing_fact),
+            std::slice::from_ref(&incoming_fact),
+        );
 
         assert!(plan.merges.is_empty());
         assert_eq!(plan.updates.len(), 1);
@@ -877,9 +919,15 @@ mod tests {
         incoming_fact.confidence = 0.7;
         incoming_fact.fact_type = FactType::Pitfall;
 
-        let plan = plan_consolidation(std::slice::from_ref(&existing_fact), std::slice::from_ref(&incoming_fact));
+        let plan = plan_consolidation(
+            std::slice::from_ref(&existing_fact),
+            std::slice::from_ref(&incoming_fact),
+        );
 
-        assert!(plan.merges.is_empty(), "widerspruechliche Fakten duerfen nicht gemergt werden");
+        assert!(
+            plan.merges.is_empty(),
+            "widerspruechliche Fakten duerfen nicht gemergt werden"
+        );
         assert_eq!(plan.conflicts.len(), 1);
         assert_eq!(plan.conflicts[0].left, "merge-policy-existing");
         assert_eq!(plan.conflicts[0].right, "merge-policy-incoming");
@@ -892,9 +940,9 @@ mod tests {
     // -- apply_plan --------------------------------------------------------
 
     #[test]
-    fn apply_plan_writes_updates_and_rewrites_index() {
+    fn apply_plan_writes_updates_and_rewrites_index() -> TestResult {
         let root = tmp_root("apply-write");
-        let store = FactStore::open(&root, FactScope::Project).unwrap();
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("store öffnen"))?;
         let f = fact("apply-target", "Beschreibung", "Text\n");
 
         let plan = ConsolidationPlan {
@@ -908,25 +956,38 @@ mod tests {
             conflicts: Vec::new(),
         };
 
-        let report = apply_plan(&store, &plan).unwrap();
+        let report = apply_plan(&store, &plan).map_err(ctx("plan anwenden"))?;
         assert_eq!(report.merged, 1);
         assert_eq!(report.written, 1);
         assert_eq!(report.deleted, 0);
         assert_eq!(report.conflicts, 0);
 
-        assert!(store.read("apply-target").unwrap().is_some());
-        let index = fs::read_to_string(root.join("MEMORY.md")).unwrap();
+        assert!(
+            store
+                .read("apply-target")
+                .map_err(ctx("fakt lesen"))?
+                .is_some()
+        );
+        let index = fs::read_to_string(root.join("MEMORY.md")).map_err(ctx("index lesen"))?;
         assert!(index.contains("apply-target"));
 
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn apply_plan_deletes_and_rewrites_index() {
+    fn apply_plan_deletes_and_rewrites_index() -> TestResult {
         let root = tmp_root("apply-delete");
-        let store = FactStore::open(&root, FactScope::Project).unwrap();
-        store.write(&fact("to-delete", "Beschreibung", "Text\n")).unwrap();
-        assert!(store.read("to-delete").unwrap().is_some());
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("store öffnen"))?;
+        store
+            .write(&fact("to-delete", "Beschreibung", "Text\n"))
+            .map_err(ctx("fakt schreiben"))?;
+        assert!(
+            store
+                .read("to-delete")
+                .map_err(ctx("fakt lesen"))?
+                .is_some()
+        );
 
         let plan = ConsolidationPlan {
             merges: Vec::new(),
@@ -934,14 +995,20 @@ mod tests {
             deletions: vec!["to-delete".to_owned()],
             conflicts: Vec::new(),
         };
-        let report = apply_plan(&store, &plan).unwrap();
+        let report = apply_plan(&store, &plan).map_err(ctx("plan anwenden"))?;
         assert_eq!(report.deleted, 1);
-        assert!(store.read("to-delete").unwrap().is_none());
+        assert!(
+            store
+                .read("to-delete")
+                .map_err(ctx("fakt lesen"))?
+                .is_none()
+        );
 
-        let index = fs::read_to_string(root.join("MEMORY.md")).unwrap();
+        let index = fs::read_to_string(root.join("MEMORY.md")).map_err(ctx("index lesen"))?;
         assert!(!index.contains("to-delete"));
 
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // -- steward_prompt ------------------------------------------------
@@ -988,7 +1055,11 @@ mod tests {
         let mut b = a.clone();
         b.updated += Duration::days(5);
         b.created -= Duration::days(5);
-        assert_eq!(fact_digest(&a), fact_digest(&b), "reines Zeitstempel-Touch darf den Digest nicht ändern");
+        assert_eq!(
+            fact_digest(&a),
+            fact_digest(&b),
+            "reines Zeitstempel-Touch darf den Digest nicht ändern"
+        );
         a.body.push_str("geaendert");
         assert_ne!(fact_digest(&a), fact_digest(&b));
     }
@@ -1015,63 +1086,75 @@ mod tests {
     }
 
     #[test]
-    fn baseline_read_write_round_trips() {
+    fn baseline_read_write_round_trips() -> TestResult {
         let root = tmp_root("baseline-roundtrip");
-        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&root).map_err(ctx("root anlegen"))?;
 
-        let empty = ConsolidationBaseline::read(&root).unwrap();
-        assert!(empty.digests.is_empty(), "fehlende Baseline-Datei liefert leere Baseline");
+        let empty = ConsolidationBaseline::read(&root).map_err(ctx("baseline lesen"))?;
+        assert!(
+            empty.digests.is_empty(),
+            "fehlende Baseline-Datei liefert leere Baseline"
+        );
 
         let facts = vec![fact("a", "A", "Text A\n"), fact("b", "B", "Text B\n")];
         let baseline = ConsolidationBaseline::from_facts(&facts);
-        baseline.write(&root).unwrap();
+        baseline.write(&root).map_err(ctx("baseline schreiben"))?;
 
-        let read_back = ConsolidationBaseline::read(&root).unwrap();
+        let read_back = ConsolidationBaseline::read(&root).map_err(ctx("baseline lesen"))?;
         assert_eq!(read_back, baseline);
         assert_eq!(read_back.digests.len(), 2);
 
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // -- ConsolidationLock -------------------------------------------------
 
     #[test]
-    fn lock_prevents_second_acquire() {
+    fn lock_prevents_second_acquire() -> TestResult {
         let root = tmp_root("lock-double");
-        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&root).map_err(ctx("root anlegen"))?;
 
-        let first = ConsolidationLock::try_acquire(&root).unwrap();
+        let first = ConsolidationLock::try_acquire(&root).map_err(ctx("erstes lock"))?;
         let second = ConsolidationLock::try_acquire(&root);
         assert!(matches!(second, Err(MemoryError::LockContention { .. })));
 
-        first.release().unwrap();
+        first.release().map_err(ctx("lock freigeben"))?;
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn lock_takes_over_expired_lock() {
+    fn lock_takes_over_expired_lock() -> TestResult {
         let root = tmp_root("lock-expired");
-        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&root).map_err(ctx("root anlegen"))?;
         let lock_path = root.join(LOCK_FILE_NAME);
         let stale_ts = OffsetDateTime::now_utc() - Duration::minutes(45);
         fs::write(
             &lock_path,
-            format!("pid=999999\ncreated={}\n", stale_ts.format(&Rfc3339).unwrap()),
+            format!(
+                "pid=999999\ncreated={}\n",
+                stale_ts
+                    .format(&Rfc3339)
+                    .map_err(ctx("zeitstempel formatieren"))?
+            ),
         )
-        .unwrap();
+        .map_err(ctx("lock-datei schreiben"))?;
 
-        let lock = ConsolidationLock::try_acquire(&root).unwrap();
-        lock.release().unwrap();
+        let lock = ConsolidationLock::try_acquire(&root).map_err(ctx("lock erwerben"))?;
+        lock.release().map_err(ctx("lock freigeben"))?;
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn lock_release_is_idempotent_after_manual_removal() {
+    fn lock_release_is_idempotent_after_manual_removal() -> TestResult {
         let root = tmp_root("lock-release-idempotent");
-        fs::create_dir_all(&root).unwrap();
-        let lock = ConsolidationLock::try_acquire(&root).unwrap();
-        fs::remove_file(root.join(LOCK_FILE_NAME)).unwrap();
+        fs::create_dir_all(&root).map_err(ctx("root anlegen"))?;
+        let lock = ConsolidationLock::try_acquire(&root).map_err(ctx("lock erwerben"))?;
+        fs::remove_file(root.join(LOCK_FILE_NAME)).map_err(ctx("lock-datei entfernen"))?;
         assert!(lock.release().is_ok());
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 }

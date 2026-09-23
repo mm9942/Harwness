@@ -158,14 +158,15 @@ mod sink;
 #[cfg(test)]
 mod push_only_guard;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser as _;
+use harw_authority::{EgressTarget, NetworkScope};
+use harw_completions::CompletionsSubcommand;
 use harw_dod_bpf::BpfProgramSource;
 use harw_dod_signals::Sensor;
-use harw_authority::{EgressTarget, NetworkScope};
 use harw_types::SensorId;
 
 use cli::{Cli, LogLevel};
@@ -184,6 +185,8 @@ use error::ProbeError;
 /// unerreichbar, siehe Moduldoku „Stand der eBPF-Bindung"). `ExitCode::FAILURE`
 /// bei jedem Fehlerpfad — Kommandozeile, Landlock-Schranke, fehlender
 /// eBPF-Loader, fehlender Sentinel.
+/// Der `completions`-Unterbefehl endet mit `ExitCode::SUCCESS` bzw.
+/// `ExitCode::FAILURE`, bevor Socket, Landlock oder Sensoren angefasst werden.
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -202,7 +205,31 @@ fn main() -> ExitCode {
 
     init_tracing(cli.log);
 
-    match run(cli) {
+    // `completions` läuft vor jedem Socket-, Landlock- oder BPF-Schritt.
+    if let Some(CompletionsSubcommand::Completions(args)) = cli.command.as_ref() {
+        return match run_completions(args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                tracing::error!(error = %err, "harw-probe-bpf completions failed");
+                eprintln!("harw-probe-bpf: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // `clap` erzwingt `--sentinel-socket` ohne Unterbefehl bereits
+    // (`required = true`); diese Prüfung ist nur die defensive Entpackung
+    // des `Option` (siehe `cli`-Moduldoku).
+    let Some(sentinel_socket) = cli.sentinel_socket.clone() else {
+        let err = <Cli as clap::CommandFactory>::command().error(
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "the following required argument was not provided: --sentinel-socket <PATH>",
+        );
+        eprint!("{err}");
+        return ExitCode::FAILURE;
+    };
+
+    match run(cli, &sentinel_socket) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             tracing::error!(error = %err, "harw-probe-bpf exiting");
@@ -240,6 +267,31 @@ fn init_tracing(level: LogLevel) {
         .init();
 }
 
+/// Führt den `completions`-Unterbefehl aus.
+///
+/// # Description
+/// Schreibt das Completion-Skript nach stdout oder installiert bzw. entfernt
+/// es (siehe `harw_completions::run_completions`). Berührt weder Socket
+/// noch Landlock noch eBPF.
+///
+/// # Arguments
+/// - `args` (`&harw_completions::CompletionsArgs`): die geparsten
+///   Unterbefehls-Argumente.
+///
+/// # Errors
+/// [`error::ProbeError::Completions`], wenn Erzeugung, Installation oder das
+/// Schreiben nach stdout scheitert.
+fn run_completions(args: &harw_completions::CompletionsArgs) -> Result<(), ProbeError> {
+    harw_completions::run_completions(
+        &mut <Cli as clap::CommandFactory>::command(),
+        "harw-probe-bpf",
+        args,
+        &harw_completions::HomeEnv::from_process(),
+        &mut std::io::stdout().lock(),
+    )?;
+    Ok(())
+}
+
 /// Führt den eigentlichen Sondenbetrieb aus.
 ///
 /// # Description
@@ -258,6 +310,7 @@ fn init_tracing(level: LogLevel) {
 ///
 /// # Arguments
 /// - `cli` (`cli::Cli`): die geparste Kommandozeile.
+/// - `sentinel_socket` (`&Path`): der bereits entpackte `--sentinel-socket`.
 ///
 /// # Errors
 /// [`error::ProbeError::SentinelConnectFailed`] wenn der Sentinel nicht
@@ -267,9 +320,9 @@ fn init_tracing(level: LogLevel) {
 /// Ladeteil scheitert — etwa auf einem Host ohne `CAP_BPF` oder mit einem
 /// Objekt, das dem in `RealBpfLoader`s Moduldoku beschriebenen Vertrag nicht
 /// folgt.
-fn run(cli: Cli) -> Result<(), ProbeError> {
-    let sink = sink::build_sentinel_sink(&cli.sentinel_socket)?;
-    tracing::info!(path = %cli.sentinel_socket.display(), "connected to sentinel");
+fn run(cli: Cli, sentinel_socket: &Path) -> Result<(), ProbeError> {
+    let sink = sink::build_sentinel_sink(sentinel_socket)?;
+    tracing::info!(path = %sentinel_socket.display(), "connected to sentinel");
 
     let fs_roots = fs_scope_roots(&cli);
     landlock::enforce_fs_scope(&fs_roots)?;
@@ -366,11 +419,7 @@ fn program_source(path: Option<PathBuf>) -> BpfProgramSource {
 /// meldet — siehe [`cli`]-Moduldoku für die Begründung, warum
 /// `Host`/`DnsSuffix`-Ziele hier nicht angeboten werden.
 fn network_scope(cidrs: &[ipnet::IpNet]) -> NetworkScope {
-    let targets: Vec<EgressTarget> = cidrs
-        .iter()
-        .cloned()
-        .map(EgressTarget::Cidr)
-        .collect();
+    let targets: Vec<EgressTarget> = cidrs.iter().cloned().map(EgressTarget::Cidr).collect();
     NetworkScope::from_targets(targets)
 }
 
@@ -388,56 +437,85 @@ mod tests {
     // echtes Landlock bindet oder echtes eBPF lädt.
 
     use super::{fs_scope_roots, network_scope, program_source};
+    use crate::test_support::{TestResult, ctx};
     use harw_dod_bpf::BpfProgramSource;
     use ipnet::IpNet;
     use std::path::PathBuf;
 
-    fn minimal_cli() -> super::Cli {
+    fn minimal_cli() -> TestResult<super::Cli> {
         use clap::Parser as _;
-        super::Cli::try_parse_from(["harw-probe-bpf", "--sentinel-socket", "/run/harw-sentinel.sock"])
-            .expect("minimal valid arguments")
+        super::Cli::try_parse_from([
+            "harw-probe-bpf",
+            "--sentinel-socket",
+            "/run/harw-sentinel.sock",
+        ])
+        .map_err(ctx("minimal valid arguments"))
     }
 
     #[test]
     fn test_program_source_defaults_to_embedded_placeholder_when_no_path_given() {
-        assert!(matches!(program_source(None), BpfProgramSource::Embedded(_)));
+        assert!(matches!(
+            program_source(None),
+            BpfProgramSource::Embedded(_)
+        ));
     }
 
     #[test]
     fn test_program_source_uses_path_when_given() {
         let path = PathBuf::from("/opt/harw/procmon.bpf.o");
-        assert!(matches!(program_source(Some(path)), BpfProgramSource::Path(_)));
+        assert!(matches!(
+            program_source(Some(path)),
+            BpfProgramSource::Path(_)
+        ));
     }
 
     #[test]
-    fn test_fs_scope_roots_is_empty_without_configured_program_paths() {
-        let cli = minimal_cli();
+    fn test_fs_scope_roots_is_empty_without_configured_program_paths() -> TestResult {
+        let cli = minimal_cli()?;
         assert!(fs_scope_roots(&cli).is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_fs_scope_roots_collects_parent_directories_of_configured_paths() {
-        let mut cli = minimal_cli();
+    fn test_fs_scope_roots_collects_parent_directories_of_configured_paths() -> TestResult {
+        let mut cli = minimal_cli()?;
         cli.exec_program_path = Some(PathBuf::from("/opt/harw/bpf/exec.o"));
         cli.tcp_v4_program_path = Some(PathBuf::from("/opt/harw/bpf/flow.o"));
 
         let roots = fs_scope_roots(&cli);
-        assert_eq!(roots, vec![PathBuf::from("/opt/harw/bpf"), PathBuf::from("/opt/harw/bpf")]);
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/opt/harw/bpf"),
+                PathBuf::from("/opt/harw/bpf")
+            ]
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_network_scope_is_empty_without_configured_cidrs() {
-        let cli = minimal_cli();
+    fn test_network_scope_is_empty_without_configured_cidrs() -> TestResult {
+        let _cli = minimal_cli()?;
         let scope = network_scope(&[]);
         assert!(!scope.allows_addr(std::net::IpAddr::from([127, 0, 0, 1])));
+        Ok(())
     }
 
     #[test]
-    fn test_network_scope_allows_a_configured_cidr() {
-        let mut cli = minimal_cli();
-        let cidrs = vec!["10.0.0.0/24".parse::<IpNet>().expect("valid test CIDR literal")];
+    fn test_network_scope_allows_a_configured_cidr() -> TestResult {
+        let _cli = minimal_cli()?;
+        let cidrs = vec![
+            "10.0.0.0/24"
+                .parse::<IpNet>()
+                .map_err(ctx("valid test CIDR literal"))?,
+        ];
         let scope = network_scope(&cidrs);
         assert!(scope.allows_addr(std::net::IpAddr::from([10, 0, 0, 5])));
         assert!(!scope.allows_addr(std::net::IpAddr::from([203, 0, 113, 9])));
+        Ok(())
     }
 }
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

@@ -107,7 +107,7 @@ use jiff::{SignedDuration, Timestamp};
 
 use harw_channel::{Admission, ChannelAdapter, InboundEvent, PairingStore, SessionKey};
 use harw_channel_telegram::{
-    ThrottleNotice, TelegramChannel, TelegramChannelConfig, TopicMode, WorkRequestStore,
+    TelegramChannel, TelegramChannelConfig, ThrottleNotice, TopicMode, WorkRequestStore,
 };
 use harw_channel_telegram_transport::{
     AdmittedEventConsumer, LongPollConfig, LongPollShutdown, RendererConfig, TelegramClient,
@@ -323,18 +323,18 @@ impl GatewayTelegramConsumer {
                     now,
                 )
                 .map(|record| format!("Requested {} (state: requested)", record.work_id)),
-            TelegramCommand::Review { work_id } => self
-                .work_requests
-                .review(&WorkId::from_str(work_id), now),
-            TelegramCommand::Approve { work_id } => self
-                .work_requests
-                .approve(&WorkId::from_str(work_id), now),
-            TelegramCommand::Deny { work_id } => self
-                .work_requests
-                .deny(&WorkId::from_str(work_id), now),
-            TelegramCommand::Cancel { work_id } => self
-                .work_requests
-                .cancel(&WorkId::from_str(work_id), now),
+            TelegramCommand::Review { work_id } => {
+                self.work_requests.review(&WorkId::from_str(work_id), now)
+            }
+            TelegramCommand::Approve { work_id } => {
+                self.work_requests.approve(&WorkId::from_str(work_id), now)
+            }
+            TelegramCommand::Deny { work_id } => {
+                self.work_requests.deny(&WorkId::from_str(work_id), now)
+            }
+            TelegramCommand::Cancel { work_id } => {
+                self.work_requests.cancel(&WorkId::from_str(work_id), now)
+            }
         };
 
         let markdown = match reply {
@@ -660,6 +660,17 @@ fn open_gateway_secret_resolver(
         &preliminary_config,
     )
     .map_err(|error| format!("gateway: {error}"))?;
+    // `doc.read_pdf` (docs/design/doc_read_pdf_design.md §W4): Telegram- und
+    // Dream-Montage teilen sich diesen einen Resolver (siehe
+    // `mount_gateway_assembly`), daher genügt eine Installation hier für
+    // beide Gateway-Kanäle; nie fatal für den Gateway-Start.
+    crate::doc_ocr::install_doc_ocr(
+        &preliminary_config,
+        Some(home),
+        resolver
+            .as_ref()
+            .map(|resolver| resolver as &dyn harw_provider_http::SecretResolver),
+    );
     Ok(resolver.map(|resolver| Arc::new(resolver) as GatewaySecretResolver))
 }
 
@@ -1982,6 +1993,7 @@ fn render_dream_report(job_id: &str, at: &Timestamp, idle: Duration, reflection:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn append_user_transcript_item(
         root: &Path,
@@ -1989,19 +2001,25 @@ mod tests {
         thread: ThreadRef,
         sequence: u64,
         text: &str,
-    ) {
+    ) -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text(text);
-        let item = history.items().first().unwrap();
+        let item = history
+            .items()
+            .first()
+            .ok_or(TestError::Missing("history has a turn item"))?;
         let record = harw_session_store::TranscriptRecord::new(
             session_id.clone(),
             thread,
             sequence,
             Timestamp::now(),
             RecordKind::Item,
-            serde_json::to_value(item).unwrap(),
+            serde_json::to_value(item).map_err(ctx("serialize transcript item"))?,
         );
-        TranscriptStore::new(root).append(&record).unwrap();
+        TranscriptStore::new(root)
+            .append(&record)
+            .map_err(ctx("append transcript record"))?;
+        Ok(())
     }
 
     /// Bildet den Fehlerpfad von [`run`] ohne Prozess-Globalzustand ab: `run`
@@ -2009,15 +2027,17 @@ mod tests {
     /// Ein Home ohne Provider-Konfiguration muss dort mit `Err` enden, statt
     /// wie früher still einen Echo-Provider zu montieren (G-048).
     #[test]
-    fn test_gateway_run_without_provider_fails_instead_of_echo() {
-        let home = tempfile::tempdir().unwrap();
-        let cwd = tempfile::tempdir().unwrap();
+    fn test_gateway_run_without_provider_fails_instead_of_echo() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("temp home"))?;
+        let cwd = tempfile::tempdir().map_err(ctx("temp cwd"))?;
         let sessions_root = home.path().join("sessions");
 
         let result = mount_gateway_assembly(home.path(), cwd.path(), &sessions_root);
 
         let Err(error) = result else {
-            panic!("a home without provider config must not mount a gateway runtime");
+            return Err(TestError::Unexpected(
+                "a home without provider config must not mount a gateway runtime".into(),
+            ));
         };
         assert!(
             error.starts_with("gateway: "),
@@ -2027,6 +2047,7 @@ mod tests {
             !error.contains("Echo"),
             "mount error must not describe an echo fallback, got: {error}"
         );
+        Ok(())
     }
 
     #[test]
@@ -2041,21 +2062,24 @@ mod tests {
     }
 
     #[test]
-    fn scan_workbench_counts_only_scope_dirs() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn scan_workbench_counts_only_scope_dirs() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("temp dir"))?;
         let store = KnowledgeStore::new(tmp.path());
         let bench = tmp.path().join("workbench");
-        std::fs::create_dir_all(bench.join("session:a")).unwrap();
-        std::fs::create_dir_all(bench.join("project:harwness")).unwrap();
-        std::fs::write(bench.join("stray.md"), b"x").unwrap();
+        std::fs::create_dir_all(bench.join("session:a")).map_err(ctx("create session dir"))?;
+        std::fs::create_dir_all(bench.join("project:harwness"))
+            .map_err(ctx("create project dir"))?;
+        std::fs::write(bench.join("stray.md"), b"x").map_err(ctx("write stray file"))?;
         assert_eq!(scan_workbench(&store), 2);
+        Ok(())
     }
 
     #[test]
-    fn scan_workbench_missing_dir_is_zero() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn scan_workbench_missing_dir_is_zero() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("temp dir"))?;
         let store = KnowledgeStore::new(tmp.path());
         assert_eq!(scan_workbench(&store), 0);
+        Ok(())
     }
 
     #[test]
@@ -2097,8 +2121,8 @@ mod tests {
     }
 
     #[test]
-    fn dream_context_uses_durable_conversation_and_excludes_gateway_dreams() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn dream_context_uses_durable_conversation_and_excludes_gateway_dreams() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("temp dir"))?;
         let interactive = SessionId::from_str("interactive-session");
         append_user_transcript_item(
             tmp.path(),
@@ -2106,7 +2130,7 @@ mod tests {
             ThreadRef::from_str("cli:interactive-session"),
             0,
             "offener Faden: sichere Transkripte",
-        );
+        )?;
 
         let dream = dream_session_id("dream-20260718T081500");
         append_user_transcript_item(
@@ -2115,16 +2139,17 @@ mod tests {
             dream_thread_for_session(&dream),
             0,
             "DIESER TRAUM DARF NICHT ZURUECK IN DEN PROMPT",
-        );
+        )?;
 
-        let context = build_recent_dream_context(tmp.path()).unwrap();
+        let context = build_recent_dream_context(tmp.path()).map_err(ctx("build dream context"))?;
         assert!(context.contains("offener Faden: sichere Transkripte"));
         assert!(!context.contains("DIESER TRAUM DARF NICHT ZURUECK IN DEN PROMPT"));
+        Ok(())
     }
 
     #[test]
-    fn dream_context_ignores_corrupt_unrelated_transcript_without_error_text() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn dream_context_ignores_corrupt_unrelated_transcript_without_error_text() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("temp dir"))?;
         let session = SessionId::from_str("healthy-session");
         append_user_transcript_item(
             tmp.path(),
@@ -2132,18 +2157,20 @@ mod tests {
             ThreadRef::from_str("cli:healthy-session"),
             0,
             "nur der valide Verlauf",
-        );
-        std::fs::write(tmp.path().join("unrelated.jsonl"), b"not json\n").unwrap();
+        )?;
+        std::fs::write(tmp.path().join("unrelated.jsonl"), b"not json\n")
+            .map_err(ctx("write unrelated file"))?;
 
-        let context = build_recent_dream_context(tmp.path()).unwrap();
+        let context = build_recent_dream_context(tmp.path()).map_err(ctx("build dream context"))?;
         assert!(context.contains("nur der valide Verlauf"));
         assert!(!context.contains("not json"));
         assert!(!context.contains("CorruptRecord"));
+        Ok(())
     }
 
     #[test]
-    fn dream_context_fails_closed_when_record_limit_is_exceeded() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn dream_context_fails_closed_when_record_limit_is_exceeded() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("temp dir"))?;
         let session = SessionId::from_str("long-session");
         for sequence in 0..=DREAM_CONTEXT_MAX_RECORDS as u64 {
             append_user_transcript_item(
@@ -2152,18 +2179,22 @@ mod tests {
                 ThreadRef::from_str("cli:long-session"),
                 sequence,
                 "bounded",
-            );
+            )?;
         }
 
-        assert_eq!(
-            build_recent_dream_context(tmp.path()).unwrap_err(),
-            DREAM_CONTEXT_SAFETY_VIOLATION
-        );
+        let result = build_recent_dream_context(tmp.path());
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "the record limit must fail closed".into(),
+            ));
+        };
+        assert_eq!(error, DREAM_CONTEXT_SAFETY_VIOLATION);
+        Ok(())
     }
 
     #[test]
-    fn dream_context_fails_closed_when_rendered_bytes_exceed_limit() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn dream_context_fails_closed_when_rendered_bytes_exceed_limit() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("temp dir"))?;
         let session = SessionId::from_str("large-session");
         let text = "x".repeat(DREAM_CONTEXT_MAX_BYTES);
         append_user_transcript_item(
@@ -2172,17 +2203,21 @@ mod tests {
             ThreadRef::from_str("cli:large-session"),
             0,
             &text,
-        );
+        )?;
 
-        assert_eq!(
-            build_recent_dream_context(tmp.path()).unwrap_err(),
-            DREAM_CONTEXT_SAFETY_VIOLATION
-        );
+        let result = build_recent_dream_context(tmp.path());
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "the byte limit must fail closed".into(),
+            ));
+        };
+        assert_eq!(error, DREAM_CONTEXT_SAFETY_VIOLATION);
+        Ok(())
     }
 
     #[test]
-    fn dream_context_fails_closed_on_transcript_provenance_mismatch() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn dream_context_fails_closed_on_transcript_provenance_mismatch() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("temp dir"))?;
         let expected = SessionId::from_str("expected-session");
         let mismatched = harw_session_store::TranscriptRecord::new(
             SessionId::from_str("other-session"),
@@ -2195,44 +2230,54 @@ mod tests {
         std::fs::write(
             TranscriptStore::new(tmp.path())
                 .transcript_path(&expected)
-                .unwrap(),
-            mismatched.to_jsonl_line().unwrap(),
+                .map_err(ctx("transcript path"))?,
+            mismatched
+                .to_jsonl_line()
+                .map_err(ctx("render mismatched record"))?,
         )
-        .unwrap();
+        .map_err(ctx("write mismatched transcript"))?;
 
-        assert_eq!(
-            build_recent_dream_context(tmp.path()).unwrap_err(),
-            DREAM_CONTEXT_SAFETY_VIOLATION
-        );
+        let result = build_recent_dream_context(tmp.path());
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "a provenance mismatch must fail closed".into(),
+            ));
+        };
+        assert_eq!(error, DREAM_CONTEXT_SAFETY_VIOLATION);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn dream_state_store_persists_to_its_profile_transcript_root() {
-        let tmp = tempfile::tempdir().unwrap();
+    async fn dream_state_store_persists_to_its_profile_transcript_root() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("temp dir"))?;
         let session = dream_session_id("dream-20260718T081500");
         let store = build_dream_state_store(tmp.path());
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("persist this dream turn");
-        let item = history.items().first().unwrap();
+        let item = history
+            .items()
+            .first()
+            .ok_or(TestError::Missing("history has a turn item"))?;
 
         harw_core::StateStore::save_turn(&store, &session, item)
             .await
-            .unwrap();
+            .map_err(ctx("persist dream turn"))?;
 
         let transcripts = TranscriptStore::new(tmp.path());
         let records = transcripts
             .reader(&session)
-            .unwrap()
+            .map_err(ctx("open dream transcript"))?
             .collect::<harw_session_store::SessionStoreResult<Vec<_>>>()
-            .unwrap();
+            .map_err(ctx("read dream transcript"))?;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].thread, dream_thread_for_session(&session));
         assert!(
             transcripts
                 .transcript_path(&session)
-                .unwrap()
+                .map_err(ctx("transcript path"))?
                 .starts_with(tmp.path())
         );
+        Ok(())
     }
 
     #[test]
@@ -2268,8 +2313,8 @@ mod tests {
     }
 
     #[test]
-    fn review_gated_reflection_is_written_only_to_report() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn review_gated_reflection_is_written_only_to_report() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("temp dir"))?;
         let store = KnowledgeStore::new(tmp.path());
         let now = Timestamp::now();
         let reflection = "nur im Bericht";
@@ -2281,14 +2326,15 @@ mod tests {
             Duration::from_secs(20 * 60),
             reflection,
         )
-        .unwrap();
+        .map_err(ctx("write review-gated dream report"))?;
 
-        let report = std::fs::read_to_string(report_path).unwrap();
+        let report = std::fs::read_to_string(report_path).map_err(ctx("read report"))?;
         assert!(report.contains("review-gated"));
         assert!(report.contains(reflection));
 
         let agent = harw_knowledge::AgentId::new("gateway");
         assert!(!store.diary_path(&agent, "2026-07-15").exists());
+        Ok(())
     }
 
     #[test]
@@ -2303,7 +2349,7 @@ mod tests {
     }
 
     #[test]
-    fn telegram_ingress_requires_a_resolved_non_secret_credential_reference() {
+    fn telegram_ingress_requires_a_resolved_non_secret_credential_reference() -> TestResult {
         let file: harw_config::ChannelFileToml = toml::from_str(
             r#"
 [[channel.telegram]]
@@ -2314,7 +2360,7 @@ bot_token_ref = "env:TELEGRAM_TEST_TOKEN"
 pinned_identities = [123456789]
 "#,
         )
-        .unwrap();
+        .map_err(ctx("parse channel file"))?;
         let config = ResolvedConfig {
             channels: harw_config::channel_toml::flatten_channel_file(file),
             ..Default::default()
@@ -2326,6 +2372,7 @@ pinned_identities = [123456789]
         assert!(diagnostic.contains("fail closed"));
         assert!(diagnostic.contains("credential"));
         assert!(!diagnostic.contains("TELEGRAM_TEST_TOKEN"));
+        Ok(())
     }
 
     #[test]
@@ -2385,25 +2432,27 @@ pinned_identities = [123456789]
     /// gemeinsamer Zähler ohne Sperre wäre zwischen parallelen Tests flüchtig.
     static AUDIT_CHAIN_BREAK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn write_gateway_test_kek(home: &Path) -> PathBuf {
+    fn write_gateway_test_kek(home: &Path) -> TestResult<PathBuf> {
         let path = home.join("test.kek");
-        std::fs::write(&path, b"01234567890123456789012345678901").unwrap();
+        std::fs::write(&path, b"01234567890123456789012345678901")
+            .map_err(ctx("write test KEK"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .map_err(ctx("restrict test KEK permissions"))?;
         }
-        path
+        Ok(path)
     }
 
-    fn gateway_sealed_provider_config(key_path: &Path) -> ResolvedConfig {
+    fn gateway_sealed_provider_config(key_path: &Path) -> TestResult<ResolvedConfig> {
         let mut config = ResolvedConfig::default();
         config.providers.insert(
             "sealed".to_owned(),
             toml::from_str::<harw_config::ProviderToml>(
                 "name = \"sealed\"\napi = \"openai-compatible\"\nbase_url = \"https://example.test\"\nauth = \"secrets:provider-token\"\n",
             )
-            .unwrap(),
+            .map_err(ctx("parse test provider"))?,
         );
         config.auth.kek = Some(harw_config::KekConfig {
             provenance: harw_config::KekProvenance::KeyFile,
@@ -2411,7 +2460,7 @@ pinned_identities = [123456789]
             keyring_entry: None,
             env_seed_var: None,
         });
-        config
+        Ok(config)
     }
 
     /// Der wichtigste Test dieses Knotens: die geprüfte Kette ist die
@@ -2420,15 +2469,16 @@ pinned_identities = [123456789]
     /// an derselben Wurzel geschrieben wurde, muss über
     /// [`run_configured_secret_store_audit_chain_tick`] sichtbar werden.
     #[tokio::test]
-    async fn audit_chain_tick_reads_the_persisted_disk_file_not_an_in_memory_chain() {
-        let home = tempfile::tempdir().unwrap();
-        let key_path = write_gateway_test_kek(home.path());
+    async fn audit_chain_tick_reads_the_persisted_disk_file_not_an_in_memory_chain() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("temp home"))?;
+        let key_path = write_gateway_test_kek(home.path())?;
         {
             let policy = harw_secrets::CryptoPolicy::strongest();
             let provenance = harw_secrets::KekProvenance::KeyFile {
                 path: key_path.clone(),
             };
-            let key_material = harw_secrets::load_kek_material(&policy, &provenance).unwrap();
+            let key_material = harw_secrets::load_kek_material(&policy, &provenance)
+                .map_err(ctx("load test KEK material"))?;
             let mut store = harw_secrets::SecretStore::with_key_material(
                 home.path().join("sealed-secrets"),
                 policy,
@@ -2442,9 +2492,9 @@ pinned_identities = [123456789]
                     "provider authentication",
                     &secrecy_08::SecretBox::new(b"gateway-test-token".to_vec().into_boxed_slice()),
                 )
-                .expect("seal test token");
+                .map_err(ctx("seal test token"))?;
         }
-        let config = Arc::new(gateway_sealed_provider_config(&key_path));
+        let config = Arc::new(gateway_sealed_provider_config(&key_path)?);
 
         let outcome = run_configured_secret_store_audit_chain_tick(home.path(), &config).await;
 
@@ -2458,28 +2508,39 @@ pinned_identities = [123456789]
                     "the disk-persisted chain must show the mutation made by the earlier instance"
                 );
             }
-            other => panic!("expected an intact persisted chain, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected an intact persisted chain, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// Eine fehlende `audit.log` ist kein Kettenbruch: der Zähler bleibt bei
     /// null, und die Meldung lautet „nichts protokolliert", nicht
     /// „unversehrt".
     #[tokio::test]
-    async fn audit_chain_tick_reports_absent_for_a_never_mutated_configured_store() {
-        let home = tempfile::tempdir().unwrap();
-        let key_path = write_gateway_test_kek(home.path());
-        let config = Arc::new(gateway_sealed_provider_config(&key_path));
+    async fn audit_chain_tick_reports_absent_for_a_never_mutated_configured_store() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("temp home"))?;
+        let key_path = write_gateway_test_kek(home.path())?;
+        let config = Arc::new(gateway_sealed_provider_config(&key_path)?);
 
         let outcome = run_configured_secret_store_audit_chain_tick(home.path(), &config).await;
 
         let report = match outcome {
             AuditChainTickOutcome::Checked(result) => describe_audit_chain_check(&result),
-            other => panic!("expected a checked outcome, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected a checked outcome, got {other:?}"
+                )));
+            }
         };
         assert_eq!(report, AuditChainCheckReport::Absent);
 
-        let _lock = AUDIT_CHAIN_BREAK_TEST_LOCK.lock().unwrap();
+        let _lock = AUDIT_CHAIN_BREAK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = AUDIT_CHAIN_BREAK.count();
         apply_audit_chain_check_report(report, &harw_observe::NullSink);
         assert_eq!(
@@ -2487,19 +2548,21 @@ pinned_identities = [123456789]
             before,
             "an absent chain must never increment the break counter"
         );
+        Ok(())
     }
 
     /// Ohne konfigurierten Geheimnisspeicher scheitert der Tick nicht — er
     /// meldet ehrlich, dass nichts geprüft wurde, statt „unversehrt"
     /// vorzutäuschen.
     #[tokio::test]
-    async fn audit_chain_tick_reports_nothing_configured_without_a_secret_store() {
-        let home = tempfile::tempdir().unwrap();
+    async fn audit_chain_tick_reports_nothing_configured_without_a_secret_store() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("temp home"))?;
         let config = Arc::new(ResolvedConfig::default());
 
         let outcome = run_configured_secret_store_audit_chain_tick(home.path(), &config).await;
 
         assert!(matches!(outcome, AuditChainTickOutcome::NothingConfigured));
+        Ok(())
     }
 
     /// Ein aktivierter Provider mit `secrets:`-Referenz, aber ohne
@@ -2507,15 +2570,15 @@ pinned_identities = [123456789]
     /// [`AuditChainTickOutcome::OpenFailed`], niemals stillschweigend als
     /// „geprüft" gezählt, und ohne den Geheimnisnamen in der Meldung.
     #[tokio::test]
-    async fn audit_chain_tick_fails_closed_without_leaking_when_kek_is_missing() {
-        let home = tempfile::tempdir().unwrap();
+    async fn audit_chain_tick_fails_closed_without_leaking_when_kek_is_missing() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("temp home"))?;
         let mut raw_config = ResolvedConfig::default();
         raw_config.providers.insert(
             "sealed".to_owned(),
             toml::from_str::<harw_config::ProviderToml>(
                 "name = \"sealed\"\napi = \"openai-compatible\"\nbase_url = \"https://example.test\"\nauth = \"secrets:provider-token\"\n",
             )
-            .unwrap(),
+            .map_err(ctx("parse test provider"))?,
         );
         let config = Arc::new(raw_config);
 
@@ -2526,23 +2589,29 @@ pinned_identities = [123456789]
                 assert!(reason.contains("requires a configured KEK"));
                 assert!(!reason.contains("provider-token"));
             }
-            other => panic!("expected OpenFailed, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected OpenFailed, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// Ein Lesefehler (hier: eine abgeschnittene Datei) meldet sich als
     /// [`AuditChainCheckReport::Unreadable`] — weder als Bruch noch als
     /// unversehrt, und ohne den Zähler zu erhöhen.
     #[tokio::test]
-    async fn audit_chain_tick_reports_unreadable_neither_as_broken_nor_as_intact() {
-        let home = tempfile::tempdir().unwrap();
-        let key_path = write_gateway_test_kek(home.path());
+    async fn audit_chain_tick_reports_unreadable_neither_as_broken_nor_as_intact() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("temp home"))?;
+        let key_path = write_gateway_test_kek(home.path())?;
         {
             let policy = harw_secrets::CryptoPolicy::strongest();
             let provenance = harw_secrets::KekProvenance::KeyFile {
                 path: key_path.clone(),
             };
-            let key_material = harw_secrets::load_kek_material(&policy, &provenance).unwrap();
+            let key_material = harw_secrets::load_kek_material(&policy, &provenance)
+                .map_err(ctx("load test KEK material"))?;
             let mut store = harw_secrets::SecretStore::with_key_material(
                 home.path().join("sealed-secrets"),
                 policy,
@@ -2556,28 +2625,39 @@ pinned_identities = [123456789]
                     "provider authentication",
                     &secrecy_08::SecretBox::new(b"gateway-test-token".to_vec().into_boxed_slice()),
                 )
-                .expect("seal test token");
+                .map_err(ctx("seal test token"))?;
         }
         let audit_log_path = home.path().join("sealed-secrets").join("audit.log");
-        let bytes = std::fs::read(&audit_log_path).unwrap();
-        std::fs::write(&audit_log_path, &bytes[..bytes.len() / 2]).unwrap();
-        let config = Arc::new(gateway_sealed_provider_config(&key_path));
+        let bytes = std::fs::read(&audit_log_path).map_err(ctx("read audit log"))?;
+        std::fs::write(&audit_log_path, &bytes[..bytes.len() / 2])
+            .map_err(ctx("truncate audit log"))?;
+        let config = Arc::new(gateway_sealed_provider_config(&key_path)?);
 
         let outcome = run_configured_secret_store_audit_chain_tick(home.path(), &config).await;
 
         let report = match outcome {
             AuditChainTickOutcome::Checked(result) => describe_audit_chain_check(&result),
-            other => panic!("expected a checked outcome, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected a checked outcome, got {other:?}"
+                )));
+            }
         };
         match &report {
             AuditChainCheckReport::Unreadable(reason) => {
                 assert!(!reason.contains("provider-token"));
                 assert!(!reason.contains("gateway-test-token"));
             }
-            other => panic!("expected an unreadable report, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected an unreadable report, got {other:?}"
+                )));
+            }
         }
 
-        let _lock = AUDIT_CHAIN_BREAK_TEST_LOCK.lock().unwrap();
+        let _lock = AUDIT_CHAIN_BREAK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = AUDIT_CHAIN_BREAK.count();
         apply_audit_chain_check_report(report, &harw_observe::NullSink);
         assert_eq!(
@@ -2585,10 +2665,11 @@ pinned_identities = [123456789]
             before,
             "an unreadable chain is neither intact nor broken and must not increment the counter"
         );
+        Ok(())
     }
 
     #[test]
-    fn describe_audit_chain_check_reports_a_detected_break_visibly() {
+    fn describe_audit_chain_check_reports_a_detected_break_visibly() -> TestResult {
         let result: AuditResult<PersistedChainStatus> = Err(AuditError::ChainBroken {
             index: 3,
             expected: [0u8; 32],
@@ -2602,8 +2683,13 @@ pinned_identities = [123456789]
                 assert!(message.contains("AUDIT CHAIN BREAK"));
                 assert!(message.contains('3'));
             }
-            other => panic!("expected a broken report, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected a broken report, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
@@ -2630,7 +2716,7 @@ pinned_identities = [123456789]
     }
 
     #[test]
-    fn describe_audit_chain_check_reports_an_io_error_as_unreadable() {
+    fn describe_audit_chain_check_reports_an_io_error_as_unreadable() -> TestResult {
         let result: AuditResult<PersistedChainStatus> = Err(AuditError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "audit log file has an unrecognized header",
@@ -2640,8 +2726,13 @@ pinned_identities = [123456789]
             AuditChainCheckReport::Unreadable(reason) => {
                 assert!(reason.contains("unrecognized header"));
             }
-            other => panic!("expected an unreadable report, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected an unreadable report, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// Beweist, dass nur [`AuditChainCheckReport::Broken`] `AUDIT_CHAIN_BREAK`
@@ -2650,7 +2741,9 @@ pinned_identities = [123456789]
     /// Prozess-Exit).
     #[test]
     fn apply_audit_chain_check_report_increments_only_on_a_detected_break() {
-        let _lock = AUDIT_CHAIN_BREAK_TEST_LOCK.lock().unwrap();
+        let _lock = AUDIT_CHAIN_BREAK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = AUDIT_CHAIN_BREAK.count();
 
         apply_audit_chain_check_report(AuditChainCheckReport::Absent, &harw_observe::NullSink);
@@ -2676,43 +2769,45 @@ pinned_identities = [123456789]
     /// `secrets:`-Referenz ist (`config.toml`, `providers/sealed.toml`,
     /// `models/model.toml`). Mit `Some(key_path)` kommt eine `auth.toml` mit
     /// `[kek]`-Key-File-Provenance hinzu; mit `None` fehlt das KEK.
-    fn write_gateway_sealed_provider_home(home: &Path, key_path: Option<&Path>) {
+    fn write_gateway_sealed_provider_home(home: &Path, key_path: Option<&Path>) -> TestResult {
         std::fs::write(
             home.join("config.toml"),
             "default_provider = \"sealed\"\ndefault_model = \"model\"\n",
         )
-        .unwrap();
-        std::fs::create_dir_all(home.join("providers")).unwrap();
+        .map_err(ctx("write config.toml"))?;
+        std::fs::create_dir_all(home.join("providers")).map_err(ctx("create providers dir"))?;
         std::fs::write(
             home.join("providers").join("sealed.toml"),
             "name = \"sealed\"\napi = \"openai-chat\"\nbase_url = \"https://example.test/v1\"\nauth = \"secrets:provider-token\"\n",
         )
-        .unwrap();
-        std::fs::create_dir_all(home.join("models")).unwrap();
+        .map_err(ctx("write sealed provider"))?;
+        std::fs::create_dir_all(home.join("models")).map_err(ctx("create models dir"))?;
         std::fs::write(
             home.join("models").join("model.toml"),
             "id = \"model\"\nprovider = \"sealed\"\n",
         )
-        .unwrap();
+        .map_err(ctx("write model"))?;
         if let Some(key_path) = key_path {
             let key_file = key_path.to_string_lossy().into_owned();
             std::fs::write(
                 home.join("auth.toml"),
                 format!("[kek]\nprovenance = \"key_file\"\nkey_file_path = {key_file:?}\n"),
             )
-            .unwrap();
+            .map_err(ctx("write auth.toml"))?;
         }
+        Ok(())
     }
 
     /// Versiegelt `provider-token` im Store `<home>/sealed-secrets` unter dem
     /// Test-KEK — derselbe Pfad und dieselbe Provenienz, die
     /// `crate::secret_store::open_configured_secret_resolver` öffnet.
-    fn seal_gateway_test_provider_token(home: &Path, key_path: &Path) {
+    fn seal_gateway_test_provider_token(home: &Path, key_path: &Path) -> TestResult {
         let policy = harw_secrets::CryptoPolicy::strongest();
         let provenance = harw_secrets::KekProvenance::KeyFile {
             path: key_path.to_path_buf(),
         };
-        let key_material = harw_secrets::load_kek_material(&policy, &provenance).unwrap();
+        let key_material = harw_secrets::load_kek_material(&policy, &provenance)
+            .map_err(ctx("load test KEK material"))?;
         let mut store = harw_secrets::SecretStore::with_key_material(
             home.join("sealed-secrets"),
             policy,
@@ -2726,7 +2821,8 @@ pinned_identities = [123456789]
                 "provider authentication",
                 &secrecy_08::SecretBox::new(b"gateway-mount-token".to_vec().into_boxed_slice()),
             )
-            .expect("seal test token");
+            .map_err(ctx("seal test token"))?;
+        Ok(())
     }
 
     /// Regression B3/G2: ein aktivierter Provider mit `secrets:`-Credential,
@@ -2737,22 +2833,25 @@ pinned_identities = [123456789]
     /// eigenem Principal. Kein Netz: der Provider wird nur gebaut, nie
     /// angefragt.
     #[test]
-    fn test_mount_gateway_assembly_sealed_secret_provider_resolves_with_kek() {
-        let home = tempfile::tempdir().unwrap();
-        let cwd = tempfile::tempdir().unwrap();
-        let key_path = write_gateway_test_kek(home.path());
-        seal_gateway_test_provider_token(home.path(), &key_path);
-        write_gateway_sealed_provider_home(home.path(), Some(&key_path));
+    fn test_mount_gateway_assembly_sealed_secret_provider_resolves_with_kek() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("temp home"))?;
+        let cwd = tempfile::tempdir().map_err(ctx("temp cwd"))?;
+        let key_path = write_gateway_test_kek(home.path())?;
+        seal_gateway_test_provider_token(home.path(), &key_path)?;
+        write_gateway_sealed_provider_home(home.path(), Some(&key_path))?;
         let sessions_root = home.path().join("sessions");
 
-        let assemblies = match mount_gateway_assembly(home.path(), cwd.path(), &sessions_root) {
+        let result = mount_gateway_assembly(home.path(), cwd.path(), &sessions_root);
+        let assemblies = match result {
             Ok(assemblies) => assemblies,
             Err(error) => {
                 assert!(
                     !error.contains("sealed secret") && !error.contains("secret resolver failed"),
                     "a configured KEK must let the sealed provider credential resolve, got: {error}"
                 );
-                panic!("sealed-secret provider with a configured KEK must mount, got: {error}");
+                return Err(TestError::Unexpected(format!(
+                    "sealed-secret provider with a configured KEK must mount, got: {error}"
+                )));
             }
         };
 
@@ -2774,20 +2873,23 @@ pinned_identities = [123456789]
         let dream_rights = assemblies.dream.rights_snapshot();
         assert_eq!(dream_rights.entry, harw_runtime::EntryKind::GatewayDream);
         assert_eq!(dream_rights.principal.id(), "gateway-dream");
+        Ok(())
     }
 
     /// G2 Negativfall: derselbe `secrets:`-Provider ohne `[kek]` muss die
     /// Montage mit dem exakten, geheimnisfreien Text aus
     /// `crate::secret_store::open_configured_secret_resolver` abbrechen.
     #[test]
-    fn test_mount_gateway_assembly_sealed_secret_provider_without_kek_returns_err() {
-        let home = tempfile::tempdir().unwrap();
-        let cwd = tempfile::tempdir().unwrap();
-        write_gateway_sealed_provider_home(home.path(), None);
+    fn test_mount_gateway_assembly_sealed_secret_provider_without_kek_returns_err() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("temp home"))?;
+        let cwd = tempfile::tempdir().map_err(ctx("temp cwd"))?;
+        write_gateway_sealed_provider_home(home.path(), None)?;
         let sessions_root = home.path().join("sessions");
 
         let Err(error) = mount_gateway_assembly(home.path(), cwd.path(), &sessions_root) else {
-            panic!("a sealed-secret provider without a KEK must not mount");
+            return Err(TestError::Unexpected(
+                "a sealed-secret provider without a KEK must not mount".into(),
+            ));
         };
 
         assert!(
@@ -2795,49 +2897,52 @@ pinned_identities = [123456789]
             "unexpected mount error: {error}"
         );
         assert!(!error.contains("provider-token"));
+        Ok(())
     }
 
     /// Ohne aktivierten `secrets:`-Provider öffnet der Gateway keinen
     /// versiegelten Speicher und verlangt kein KEK (G4-Hilfsfunktion).
     #[test]
-    fn test_open_gateway_secret_resolver_without_sealed_provider_returns_none() {
-        let home = tempfile::tempdir().unwrap();
-        let cwd = tempfile::tempdir().unwrap();
+    fn test_open_gateway_secret_resolver_without_sealed_provider_returns_none() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("temp home"))?;
+        let cwd = tempfile::tempdir().map_err(ctx("temp cwd"))?;
         let principal = channel_principal(GatewayEntry::Dream, "");
 
         let resolver =
             open_gateway_secret_resolver(GatewayEntry::Dream, home.path(), cwd.path(), &principal)
-                .expect("an empty home has no sealed provider and needs no KEK");
+                .map_err(ctx("an empty home has no sealed provider and needs no KEK"))?;
 
         assert!(resolver.is_none());
+        Ok(())
     }
 
     /// Legt eine Gateway-Konfiguration mit zwei Providern an: `"plain"`
     /// (`env:`, `default_provider`) und `"sealed"` (`secrets:`, aktiviert,
     /// aber nie ausgewählt, ohne `[kek]`).
-    fn write_gateway_home_with_unused_sealed_provider(home: &Path) {
+    fn write_gateway_home_with_unused_sealed_provider(home: &Path) -> TestResult {
         std::fs::write(
             home.join("config.toml"),
             "default_provider = \"plain\"\ndefault_model = \"model\"\n",
         )
-        .unwrap();
-        std::fs::create_dir_all(home.join("providers")).unwrap();
+        .map_err(ctx("write config.toml"))?;
+        std::fs::create_dir_all(home.join("providers")).map_err(ctx("create providers dir"))?;
         std::fs::write(
             home.join("providers").join("plain.toml"),
             "name = \"plain\"\napi = \"openai-chat\"\nbase_url = \"https://example.test/v1\"\nauth = \"env:GATEWAY_TEST_PLAIN_TOKEN\"\n",
         )
-        .unwrap();
+        .map_err(ctx("write plain provider"))?;
         std::fs::write(
             home.join("providers").join("sealed.toml"),
             "name = \"sealed\"\napi = \"openai-chat\"\nbase_url = \"https://example.test/v1\"\nauth = \"secrets:provider-token\"\n",
         )
-        .unwrap();
-        std::fs::create_dir_all(home.join("models")).unwrap();
+        .map_err(ctx("write sealed provider"))?;
+        std::fs::create_dir_all(home.join("models")).map_err(ctx("create models dir"))?;
         std::fs::write(
             home.join("models").join("model.toml"),
             "id = \"model\"\nprovider = \"plain\"\n",
         )
-        .unwrap();
+        .map_err(ctx("write model"))?;
+        Ok(())
     }
 
     /// Kernverhalten dieses Reports: ein aktivierter, aber vom Gateway nicht
@@ -2845,18 +2950,24 @@ pinned_identities = [123456789]
     /// blockieren — der aktive `default_provider` (`"plain"`, `env:`)
     /// bestimmt allein, ob ein KEK verlangt wird.
     #[test]
-    fn test_open_gateway_secret_resolver_ignores_unused_sealed_provider_without_kek() {
-        let home = tempfile::tempdir().unwrap();
-        let cwd = tempfile::tempdir().unwrap();
-        write_gateway_home_with_unused_sealed_provider(home.path());
+    fn test_open_gateway_secret_resolver_ignores_unused_sealed_provider_without_kek() -> TestResult
+    {
+        let home = tempfile::tempdir().map_err(ctx("temp home"))?;
+        let cwd = tempfile::tempdir().map_err(ctx("temp cwd"))?;
+        write_gateway_home_with_unused_sealed_provider(home.path())?;
         let principal = channel_principal(GatewayEntry::Dream, "");
 
-        let resolver =
-            open_gateway_secret_resolver(GatewayEntry::Dream, home.path(), cwd.path(), &principal)
-                .expect(
-                    "an unused sealed provider without a KEK must not block the active plain provider",
-                );
+        let resolver = open_gateway_secret_resolver(
+            GatewayEntry::Dream,
+            home.path(),
+            cwd.path(),
+            &principal,
+        )
+        .map_err(ctx(
+            "an unused sealed provider without a KEK must not block the active plain provider",
+        ))?;
 
         assert!(resolver.is_none());
+        Ok(())
     }
 }

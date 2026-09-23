@@ -54,3 +54,7 @@ pub use error::{OAuthError, OAuthResult};
 pub use flow::{authorize_url, client_id, exchange_code, redirect_uri, scopes, split_callback};
 pub use pkce::{PkcePair, challenge_from_verifier, generate_pkce};
 pub use store::save_token;
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

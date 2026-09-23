@@ -42,3 +42,7 @@ pub use host_permit_prompt::{
     HostPermitVariant, SANDBOX_LEASE_WORKER_DEFINITION, host_permit_prompt_channel,
 };
 pub use limits::{ShellLimits, ShellLimitsError};
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

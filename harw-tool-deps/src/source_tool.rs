@@ -999,37 +999,37 @@ pub(crate) fn error_output(tool: &str, error: &DepsToolError) -> ToolOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::scratch_dir;
+    use crate::test_support::{TestError, TestResult, ctx, scratch_dir};
 
     /// Legt ein Fixture-`CARGO_HOME` mit einem Crate `demo-1.0.0` an.
-    fn registry_fixture(label: &str) -> (PathBuf, RegistryAccess, PathBuf) {
-        let cargo_home = scratch_dir(label);
+    fn registry_fixture(label: &str) -> TestResult<(PathBuf, RegistryAccess, PathBuf)> {
+        let cargo_home = scratch_dir(label)?;
         let crate_dir = cargo_home
             .join("registry")
             .join("src")
             .join("index.crates.io-testhash")
             .join("demo-1.0.0");
-        fs::create_dir_all(crate_dir.join("src")).expect("Crate-Fixture anlegen");
+        fs::create_dir_all(crate_dir.join("src")).map_err(ctx("Crate-Fixture anlegen"))?;
         fs::write(
             crate_dir.join("Cargo.toml"),
             "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n",
         )
-        .expect("Manifest schreiben");
+        .map_err(ctx("Manifest schreiben"))?;
         fs::write(
             crate_dir.join("src").join("lib.rs"),
             "pub fn parse() -> u8 {\n    7\n}\n// parse helper\n",
         )
-        .expect("lib.rs schreiben");
+        .map_err(ctx("lib.rs schreiben"))?;
         let access = RegistryAccess::with_home(cargo_home.clone());
-        (cargo_home, access, crate_dir)
+        Ok((cargo_home, access, crate_dir))
     }
 
     #[test]
-    fn test_read_source_file_returns_exact_content() {
-        let (home, access, _) = registry_fixture("read-ok");
+    fn test_read_source_file_returns_exact_content() -> TestResult {
+        let (home, access, _) = registry_fixture("read-ok")?;
 
         let file = read_source_file(&access, "demo", "1.0.0", Path::new("src/lib.rs"), None)
-            .expect("Datei lesbar");
+            .map_err(ctx("Datei lesbar"))?;
 
         assert_eq!(file.crate_name, "demo");
         assert_eq!(file.version, "1.0.0");
@@ -1041,11 +1041,12 @@ mod tests {
         assert_eq!(file.bytes as usize, file.content.len());
 
         fs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_read_source_file_rejects_parent_traversal() {
-        let (home, access, _) = registry_fixture("read-traversal");
+    fn test_read_source_file_rejects_parent_traversal() -> TestResult {
+        let (home, access, _) = registry_fixture("read-traversal")?;
 
         let result = read_source_file(
             &access,
@@ -1061,22 +1062,23 @@ mod tests {
         );
 
         fs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_read_source_file_rejects_crate_boundary_escape() {
-        let cargo_home = scratch_dir("read-crate-boundary");
+    fn test_read_source_file_rejects_crate_boundary_escape() -> TestResult {
+        let cargo_home = scratch_dir("read-crate-boundary")?;
         let index_dir = cargo_home
             .join("registry")
             .join("src")
             .join("index.crates.io-testhash");
-        fs::create_dir_all(index_dir.join("demo-1.0.0")).expect("Crate 1 anlegen");
-        fs::create_dir_all(index_dir.join("nachbar-2.0.0")).expect("Crate 2 anlegen");
+        fs::create_dir_all(index_dir.join("demo-1.0.0")).map_err(ctx("Crate 1 anlegen"))?;
+        fs::create_dir_all(index_dir.join("nachbar-2.0.0")).map_err(ctx("Crate 2 anlegen"))?;
         fs::write(
             index_dir.join("nachbar-2.0.0").join("Cargo.toml"),
             "x = 1\n",
         )
-        .expect("Nachbar-Manifest schreiben");
+        .map_err(ctx("Nachbar-Manifest schreiben"))?;
         let access = RegistryAccess::with_home(cargo_home.clone());
 
         // Bleibt innerhalb der Registry-Wurzel, verlässt aber das angefragte Crate.
@@ -1094,19 +1096,20 @@ mod tests {
         );
 
         fs::remove_dir_all(&cargo_home).ok();
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_read_source_file_rejects_symlink_out_of_registry() {
-        let (home, access, crate_dir) = registry_fixture("read-symlink");
+    fn test_read_source_file_rejects_symlink_out_of_registry() -> TestResult {
+        let (home, access, crate_dir) = registry_fixture("read-symlink")?;
 
         // Ziel liegt außerhalb der Registry, aber innerhalb des Scratch-Baums,
         // damit der Test ohne Zugriff auf echte Systemdateien auskommt.
         let outside = home.join("geheim.txt");
-        fs::write(&outside, "streng geheim\n").expect("Zieldatei anlegen");
+        fs::write(&outside, "streng geheim\n").map_err(ctx("Zieldatei anlegen"))?;
         std::os::unix::fs::symlink(&outside, crate_dir.join("src").join("escape.rs"))
-            .expect("Symlink anlegen");
+            .map_err(ctx("Symlink anlegen"))?;
 
         let result = read_source_file(&access, "demo", "1.0.0", Path::new("src/escape.rs"), None);
 
@@ -1116,31 +1119,33 @@ mod tests {
         );
 
         fs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_read_source_file_accepts_symlink_inside_registry() {
-        let (home, access, crate_dir) = registry_fixture("read-symlink-inside");
+    fn test_read_source_file_accepts_symlink_inside_registry() -> TestResult {
+        let (home, access, crate_dir) = registry_fixture("read-symlink-inside")?;
 
         std::os::unix::fs::symlink(
             crate_dir.join("src").join("lib.rs"),
             crate_dir.join("src").join("alias.rs"),
         )
-        .expect("Symlink anlegen");
+        .map_err(ctx("Symlink anlegen"))?;
 
         let file = read_source_file(&access, "demo", "1.0.0", Path::new("src/alias.rs"), None)
-            .expect("Symlink innerhalb der Registry bleibt erlaubt");
+            .map_err(ctx("Symlink innerhalb der Registry bleibt erlaubt"))?;
         assert!(file.content.contains("pub fn parse()"));
 
         fs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_read_source_file_rejects_oversized_file() {
-        let (home, access, crate_dir) = registry_fixture("read-too-large");
+    fn test_read_source_file_rejects_oversized_file() -> TestResult {
+        let (home, access, crate_dir) = registry_fixture("read-too-large")?;
         fs::write(crate_dir.join("src").join("big.rs"), "x".repeat(4096))
-            .expect("große Datei schreiben");
+            .map_err(ctx("große Datei schreiben"))?;
 
         let result = read_source_file(
             &access,
@@ -1155,17 +1160,22 @@ mod tests {
                 assert_eq!(path, "src/big.rs");
                 assert_eq!(limit, 1024);
             }
-            other => panic!("FileTooLarge erwartet, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "FileTooLarge erwartet, war: {other:?}"
+                )));
+            }
         }
 
         fs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_read_source_file_rejects_non_utf8() {
-        let (home, access, crate_dir) = registry_fixture("read-not-utf8");
+    fn test_read_source_file_rejects_non_utf8() -> TestResult {
+        let (home, access, crate_dir) = registry_fixture("read-not-utf8")?;
         fs::write(crate_dir.join("src").join("blob.rs"), [0xffu8, 0xfe, 0x00])
-            .expect("Binärdatei schreiben");
+            .map_err(ctx("Binärdatei schreiben"))?;
 
         let result = read_source_file(&access, "demo", "1.0.0", Path::new("src/blob.rs"), None);
 
@@ -1175,11 +1185,12 @@ mod tests {
         );
 
         fs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_read_source_file_reports_missing_crate() {
-        let (home, access, _) = registry_fixture("read-missing-crate");
+    fn test_read_source_file_reports_missing_crate() -> TestResult {
+        let (home, access, _) = registry_fixture("read-missing-crate")?;
 
         let result = read_source_file(&access, "nicht-da", "9.9.9", Path::new("src/lib.rs"), None);
 
@@ -1194,6 +1205,7 @@ mod tests {
         );
 
         fs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[test]
@@ -1209,10 +1221,11 @@ mod tests {
     }
 
     #[test]
-    fn test_search_source_finds_matches_with_file_and_line() {
-        let (home, access, _) = registry_fixture("search-hit");
+    fn test_search_source_finds_matches_with_file_and_line() -> TestResult {
+        let (home, access, _) = registry_fixture("search-hit")?;
 
-        let outcome = search_source(&access, "demo", "1.0.0", "parse", None).expect("Suche läuft");
+        let outcome =
+            search_source(&access, "demo", "1.0.0", "parse", None).map_err(ctx("Suche läuft"))?;
 
         assert!(!outcome.truncated);
         assert_eq!(outcome.matches.len(), 2, "zwei Zeilen enthalten 'parse'");
@@ -1221,33 +1234,35 @@ mod tests {
         assert_eq!(outcome.matches[1].line, 4);
 
         fs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_search_source_truncates_at_max_matches() {
-        let (home, access, crate_dir) = registry_fixture("search-truncate");
+    fn test_search_source_truncates_at_max_matches() -> TestResult {
+        let (home, access, crate_dir) = registry_fixture("search-truncate")?;
         let many = (0..50)
             .map(|index| format!("// treffer {index}\n"))
             .collect::<String>();
-        fs::write(crate_dir.join("src").join("many.rs"), many).expect("Datei schreiben");
+        fs::write(crate_dir.join("src").join("many.rs"), many).map_err(ctx("Datei schreiben"))?;
 
-        let outcome =
-            search_source(&access, "demo", "1.0.0", "treffer", Some(5)).expect("Suche läuft");
+        let outcome = search_source(&access, "demo", "1.0.0", "treffer", Some(5))
+            .map_err(ctx("Suche läuft"))?;
 
         assert_eq!(outcome.matches.len(), 5);
         assert!(outcome.truncated, "Kappung muss gemeldet werden");
 
         fs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_search_source_ignores_unsupported_extensions() {
-        let (home, access, crate_dir) = registry_fixture("search-extension");
+    fn test_search_source_ignores_unsupported_extensions() -> TestResult {
+        let (home, access, crate_dir) = registry_fixture("search-extension")?;
         fs::write(crate_dir.join("src").join("data.json"), "einhorn\n")
-            .expect("JSON-Datei schreiben");
+            .map_err(ctx("JSON-Datei schreiben"))?;
 
         let outcome =
-            search_source(&access, "demo", "1.0.0", "einhorn", None).expect("Suche läuft");
+            search_source(&access, "demo", "1.0.0", "einhorn", None).map_err(ctx("Suche läuft"))?;
 
         assert!(
             outcome.matches.is_empty(),
@@ -1256,20 +1271,22 @@ mod tests {
         );
 
         fs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_search_source_never_follows_symlinks() {
-        let (home, access, crate_dir) = registry_fixture("search-symlink");
+    fn test_search_source_never_follows_symlinks() -> TestResult {
+        let (home, access, crate_dir) = registry_fixture("search-symlink")?;
         let outside_dir = home.join("draußen");
-        fs::create_dir_all(&outside_dir).expect("Außenverzeichnis anlegen");
-        fs::write(outside_dir.join("secret.rs"), "geheimnis\n").expect("Zieldatei anlegen");
+        fs::create_dir_all(&outside_dir).map_err(ctx("Außenverzeichnis anlegen"))?;
+        fs::write(outside_dir.join("secret.rs"), "geheimnis\n")
+            .map_err(ctx("Zieldatei anlegen"))?;
         std::os::unix::fs::symlink(&outside_dir, crate_dir.join("verlinkt"))
-            .expect("Verzeichnis-Symlink anlegen");
+            .map_err(ctx("Verzeichnis-Symlink anlegen"))?;
 
-        let outcome =
-            search_source(&access, "demo", "1.0.0", "geheimnis", None).expect("Suche läuft");
+        let outcome = search_source(&access, "demo", "1.0.0", "geheimnis", None)
+            .map_err(ctx("Suche läuft"))?;
 
         assert!(
             outcome.matches.is_empty(),
@@ -1278,31 +1295,34 @@ mod tests {
         );
 
         fs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_search_source_skips_oversized_file_and_counts_it() {
-        let (home, access, crate_dir) = registry_fixture("search-oversized");
+    fn test_search_source_skips_oversized_file_and_counts_it() -> TestResult {
+        let (home, access, crate_dir) = registry_fixture("search-oversized")?;
         fs::write(
             crate_dir.join("src").join("huge.rs"),
             "nadel\n".repeat((DEFAULT_MAX_SOURCE_BYTES as usize / 6) + 10),
         )
-        .expect("große Datei schreiben");
+        .map_err(ctx("große Datei schreiben"))?;
 
-        let outcome = search_source(&access, "demo", "1.0.0", "nadel", None).expect("Suche läuft");
+        let outcome =
+            search_source(&access, "demo", "1.0.0", "nadel", None).map_err(ctx("Suche läuft"))?;
 
         assert!(outcome.matches.is_empty());
         assert_eq!(outcome.skipped_files, 1, "Auslassung muss gezählt werden");
 
         fs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_list_source_lists_one_level() {
-        let (home, access, _) = registry_fixture("list-root");
+    fn test_list_source_lists_one_level() -> TestResult {
+        let (home, access, _) = registry_fixture("list-root")?;
 
         let (entries, truncated) =
-            list_source(&access, "demo", "1.0.0", Path::new(".")).expect("Wurzel listbar");
+            list_source(&access, "demo", "1.0.0", Path::new(".")).map_err(ctx("Wurzel listbar"))?;
 
         assert!(!truncated);
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
@@ -1317,11 +1337,12 @@ mod tests {
         assert_eq!(src.size, None);
 
         fs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_list_source_rejects_traversal() {
-        let (home, access, _) = registry_fixture("list-traversal");
+    fn test_list_source_rejects_traversal() -> TestResult {
+        let (home, access, _) = registry_fixture("list-traversal")?;
 
         let result = list_source(&access, "demo", "1.0.0", Path::new("../.."));
 
@@ -1331,11 +1352,12 @@ mod tests {
         );
 
         fs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_list_source_rejects_file_path() {
-        let (home, access, _) = registry_fixture("list-file");
+    fn test_list_source_rejects_file_path() -> TestResult {
+        let (home, access, _) = registry_fixture("list-file")?;
 
         let result = list_source(&access, "demo", "1.0.0", Path::new("Cargo.toml"));
 
@@ -1345,6 +1367,7 @@ mod tests {
         );
 
         fs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[test]

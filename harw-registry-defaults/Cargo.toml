@@ -19,6 +19,9 @@ harw-project-discovery = { path = "../harw-project-discovery" }
 # eingebauten Rollen und Werkzeugfilter nach gewährten Rechten (W5 RD).
 harw-sandbox = { path = "../harw-sandbox" }
 harw-tool-deps = { path = "../harw-tool-deps" }
+# `doc.read_pdf` (Anbindung W3): lesendes PDF-Werkzeug, erscheint überall, wo
+# ein lesender `FsToolProvider` registriert wird (siehe `profile::DOC_TOOLS`).
+harw-tool-doc = { version = "0.3.0", path = "../harw-tool-doc" }
 harw-tool-fs = { path = "../harw-tool-fs" }
 harw-tool-lens = { path = "../harw-tool-lens" }
 harw-tool-shell = { path = "../harw-tool-shell" }

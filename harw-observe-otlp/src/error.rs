@@ -88,6 +88,7 @@ pub enum OtlpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
     fn test_otlp_error_display_timestamp_out_of_range() {
@@ -110,13 +111,17 @@ mod tests {
     }
 
     #[test]
-    fn test_otlp_error_from_json_error_and_source_is_some() {
+    fn test_otlp_error_from_json_error_and_source_is_some() -> TestResult {
         use std::error::Error as _;
-        let json_err = serde_json::from_str::<serde_json::Value>("{not json")
-            .expect_err("malformed JSON must fail to parse");
+        let Err(json_err) = serde_json::from_str::<serde_json::Value>("{not json") else {
+            return Err(TestError::Unexpected(
+                "malformed JSON must fail to parse".to_owned(),
+            ));
+        };
         let err: OtlpError = json_err.into();
         assert!(matches!(err, OtlpError::Json(_)));
         assert!(err.source().is_some());
+        Ok(())
     }
 
     #[test]
@@ -127,10 +132,14 @@ mod tests {
     }
 
     #[test]
-    fn test_otlp_result_alias_exists() {
+    fn test_otlp_result_alias_exists() -> TestResult {
         fn make() -> OtlpResult<u8> {
             Ok(1)
         }
-        assert_eq!(make().unwrap(), 1);
+        assert_eq!(
+            make().map_err(ctx("OtlpResult alias always succeeds here"))?,
+            1
+        );
+        Ok(())
     }
 }

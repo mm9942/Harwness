@@ -84,8 +84,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use harw_lens::{Embedder, Metric};
 use harw_knowledge::{KnowledgeIndex, KnowledgeStore};
+use harw_lens::{Embedder, Metric};
 
 use crate::cli::LensAction;
 
@@ -109,7 +109,9 @@ const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 pub fn run(home_override: Option<PathBuf>, action: Option<LensAction>) -> Result<(), String> {
     match action.unwrap_or(LensAction::Status) {
         LensAction::Status => cmd_status(home_override),
-        LensAction::Build { source, force } => cmd_build(home_override, source, force),
+        LensAction::Build { source, force } => {
+            cmd_build(home_override, source.map(|s| s.as_str().to_owned()), force)
+        }
     }
 }
 
@@ -143,7 +145,11 @@ fn parse_source(raw: Option<&str>) -> Result<Option<Source>, String> {
 }
 
 /// Führt `harw lens build`/`harw lens build --source <name>` aus.
-fn cmd_build(home_override: Option<PathBuf>, source: Option<String>, force: bool) -> Result<(), String> {
+fn cmd_build(
+    home_override: Option<PathBuf>,
+    source: Option<String>,
+    force: bool,
+) -> Result<(), String> {
     let home = crate::home::resolve_home(home_override)?;
     crate::home::ensure_home(&home).map_err(|error| error.to_string())?;
     let requested = parse_source(source.as_deref())?;
@@ -202,10 +208,15 @@ fn build_docs_source(
     locality: harw_lens::Locality,
     force: bool,
 ) -> Result<bool, String> {
-    let cwd = std::env::current_dir().map_err(|error| format!("Arbeitsverzeichnis nicht lesbar: {error}"))?;
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("Arbeitsverzeichnis nicht lesbar: {error}"))?;
     let docs_root = cwd.join("docs");
-    let documents = harw_lens::collect_design_docs(&docs_root)
-        .map_err(|error| format!("{}: Design-Dokumente einlesen: {error}", harw_lens::DOCS_DESIGN_INDEX))?;
+    let documents = harw_lens::collect_design_docs(&docs_root).map_err(|error| {
+        format!(
+            "{}: Design-Dokumente einlesen: {error}",
+            harw_lens::DOCS_DESIGN_INDEX
+        )
+    })?;
 
     if documents.is_empty() {
         println!(
@@ -217,7 +228,11 @@ fn build_docs_source(
     }
 
     if force {
-        force_clear(home, harw_lens::DOCS_DESIGN_INDEX, harw_lens::DEFAULT_VISIBILITY)?;
+        force_clear(
+            home,
+            harw_lens::DOCS_DESIGN_INDEX,
+            harw_lens::DEFAULT_VISIBILITY,
+        )?;
     }
 
     let reports = harw_lens::build(
@@ -230,7 +245,12 @@ fn build_docs_source(
         embedder,
         descriptor,
     )
-    .map_err(|error| format!("{}: Bau fehlgeschlagen: {error}", harw_lens::DOCS_DESIGN_INDEX))?;
+    .map_err(|error| {
+        format!(
+            "{}: Bau fehlgeschlagen: {error}",
+            harw_lens::DOCS_DESIGN_INDEX
+        )
+    })?;
     print_reports(&reports);
     Ok(true)
 }
@@ -259,7 +279,11 @@ fn build_knowledge_source(
     }
 
     if force {
-        force_clear(home, harw_lens::KNOWLEDGE_PALACE_INDEX, harw_lens::DEFAULT_VISIBILITY)?;
+        force_clear(
+            home,
+            harw_lens::KNOWLEDGE_PALACE_INDEX,
+            harw_lens::DEFAULT_VISIBILITY,
+        )?;
         force_clear(
             home,
             harw_lens::KNOWLEDGE_PALACE_INDEX,
@@ -277,7 +301,12 @@ fn build_knowledge_source(
         embedder,
         descriptor,
     )
-    .map_err(|error| format!("{}: Bau fehlgeschlagen: {error}", harw_lens::KNOWLEDGE_PALACE_INDEX))?;
+    .map_err(|error| {
+        format!(
+            "{}: Bau fehlgeschlagen: {error}",
+            harw_lens::KNOWLEDGE_PALACE_INDEX
+        )
+    })?;
     print_reports(&reports);
     Ok(true)
 }
@@ -297,7 +326,11 @@ fn print_reports(reports: &[harw_lens::IndexBuildReport]) {
     for report in reports {
         println!(
             "  {} @ {}: {} Chunks ({} neu eingebettet, {} aus dem Cache übernommen)",
-            report.index_name, report.visibility, report.chunk_count, report.embedded_count, report.reused_count
+            report.index_name,
+            report.visibility,
+            report.chunk_count,
+            report.embedded_count,
+            report.reused_count
         );
     }
 }
@@ -306,14 +339,18 @@ fn print_reports(reports: &[harw_lens::IndexBuildReport]) {
 /// Datenträger -- siehe den `//!`-Block dieses Moduls, Abschnitt
 /// „`--force`", für die vollständige Begründung.
 fn force_clear(home: &Path, index_name: &str, visibility: &str) -> Result<(), String> {
-    let store_root =
-        harw_home::paths::visibility_index_dir(home, visibility).map_err(|error| error.to_string())?;
+    let store_root = harw_home::paths::visibility_index_dir(home, visibility)
+        .map_err(|error| error.to_string())?;
     let lens_store_root = harw_home::paths::lens_store_dir(&store_root);
-    for name in [index_name.to_owned(), format!("{index_name}.embedding-cache")] {
+    for name in [
+        index_name.to_owned(),
+        format!("{index_name}.embedding-cache"),
+    ] {
         let dir = lens_store_root.join("index").join(&name);
         if dir.exists() {
-            std::fs::remove_dir_all(&dir)
-                .map_err(|error| format!("Index-Verzeichnis {} entfernen: {error}", dir.display()))?;
+            std::fs::remove_dir_all(&dir).map_err(|error| {
+                format!("Index-Verzeichnis {} entfernen: {error}", dir.display())
+            })?;
         }
     }
     Ok(())
@@ -403,22 +440,31 @@ fn format_age(elapsed: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn test_parse_source_accepts_known_names() {
-        assert_eq!(parse_source(None).unwrap(), None);
-        assert_eq!(parse_source(Some("docs")).unwrap(), Some(Source::Docs));
+    fn test_parse_source_accepts_known_names() -> TestResult {
+        assert_eq!(parse_source(None).map_err(ctx("parse None"))?, None);
         assert_eq!(
-            parse_source(Some("knowledge")).unwrap(),
+            parse_source(Some("docs")).map_err(ctx("parse docs"))?,
+            Some(Source::Docs)
+        );
+        assert_eq!(
+            parse_source(Some("knowledge")).map_err(ctx("parse knowledge"))?,
             Some(Source::Knowledge)
         );
+        Ok(())
     }
 
     #[test]
-    fn test_parse_source_rejects_unknown_name() {
+    fn test_parse_source_rejects_unknown_name() -> TestResult {
         let result = parse_source(Some("nonsense"));
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("nonsense"));
+        let Err(message) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        assert!(message.contains("nonsense"));
+        Ok(())
     }
 
     #[test]
@@ -439,20 +485,21 @@ mod tests {
     }
 
     #[test]
-    fn test_cmd_build_and_status_round_trip_with_deterministic_embedder() {
+    fn test_cmd_build_and_status_round_trip_with_deterministic_embedder() -> TestResult {
         // Kein Netzwerk, kein `harw_tool_lens::provenance`-Aufruf (der würde
         // die reale Prozessumgebung lesen): dieser Test übt stattdessen
         // direkt `harw_lens::build`/`index_status` an denselben Pfaden, die
         // `cmd_build`/`cmd_status` auflösen, um die Pfadkonvention selbst zu
         // belegen (siehe den `//!`-Block dieses Moduls, Abschnitt „Wo
         // Indizes liegen").
-        let home = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let docs_root = home.path().join("docs-src");
-        std::fs::create_dir_all(&docs_root).expect("docs-src anlegen");
+        std::fs::create_dir_all(&docs_root).map_err(ctx("docs-src anlegen"))?;
         std::fs::write(docs_root.join("intro.md"), "# Intro\n\nEin Testabsatz.\n")
-            .expect("intro.md schreiben");
+            .map_err(ctx("intro.md schreiben"))?;
 
-        let documents = harw_lens::collect_design_docs(&docs_root).expect("liest Dokumente");
+        let documents =
+            harw_lens::collect_design_docs(&docs_root).map_err(ctx("liest Dokumente"))?;
         assert_eq!(documents.len(), 1);
 
         let embedder = harw_lens::DeterministicEmbedder::new(8);
@@ -467,7 +514,7 @@ mod tests {
             harw_lens::DOCS_DESIGN_INDEX,
             harw_lens::DEFAULT_VISIBILITY,
         )
-        .expect("kein Fehler vor dem Bau");
+        .map_err(ctx("kein Fehler vor dem Bau"))?;
         assert_eq!(before, None);
 
         harw_lens::build(
@@ -480,26 +527,28 @@ mod tests {
             &embedder,
             &descriptor,
         )
-        .expect("baut");
+        .map_err(ctx("baut"))?;
 
         let after = harw_lens::index_status(
             home.path(),
             harw_lens::DOCS_DESIGN_INDEX,
             harw_lens::DEFAULT_VISIBILITY,
         )
-        .expect("kein Fehler nach dem Bau")
-        .expect("Index existiert nach dem Bau");
+        .map_err(ctx("kein Fehler nach dem Bau"))?
+        .ok_or(TestError::Missing("Index existiert nach dem Bau"))?;
         assert_eq!(after.chunk_count, 1);
         assert_eq!(after.model, "test-model");
+        Ok(())
     }
 
     #[test]
-    fn test_force_clear_removes_index_directory_and_is_idempotent_when_absent() {
-        let home = tempfile::tempdir().expect("tempdir");
+    fn test_force_clear_removes_index_directory_and_is_idempotent_when_absent() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
 
         // Ohne vorherigen Bau ist dies ein No-Op, kein Fehler.
-        force_clear(home.path(), "docs.design", harw_lens::DEFAULT_VISIBILITY)
-            .expect("Löschen eines nie gebauten Index darf nicht fehlschlagen");
+        force_clear(home.path(), "docs.design", harw_lens::DEFAULT_VISIBILITY).map_err(ctx(
+            "Löschen eines nie gebauten Index darf nicht fehlschlagen",
+        ))?;
 
         let documents = vec![harw_lens::RawDocument {
             source: harw_lens::SourceRef::File {
@@ -524,17 +573,19 @@ mod tests {
             &embedder,
             &descriptor,
         )
-        .expect("baut");
-        assert!(harw_lens::index_status(
-            home.path(),
-            harw_lens::DOCS_DESIGN_INDEX,
-            harw_lens::DEFAULT_VISIBILITY
-        )
-        .expect("liest")
-        .is_some());
+        .map_err(ctx("baut"))?;
+        assert!(
+            harw_lens::index_status(
+                home.path(),
+                harw_lens::DOCS_DESIGN_INDEX,
+                harw_lens::DEFAULT_VISIBILITY
+            )
+            .map_err(ctx("liest"))?
+            .is_some()
+        );
 
         force_clear(home.path(), "docs.design", harw_lens::DEFAULT_VISIBILITY)
-            .expect("Löschen eines vorhandenen Index muss gelingen");
+            .map_err(ctx("Löschen eines vorhandenen Index muss gelingen"))?;
 
         assert_eq!(
             harw_lens::index_status(
@@ -542,8 +593,9 @@ mod tests {
                 harw_lens::DOCS_DESIGN_INDEX,
                 harw_lens::DEFAULT_VISIBILITY
             )
-            .expect("liest"),
+            .map_err(ctx("liest"))?,
             None
         );
+        Ok(())
     }
 }

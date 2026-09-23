@@ -479,22 +479,23 @@ mod tests {
         RESEARCHER_DEPS_CHILD, RESEARCHER_WEB_CHILD, ResearchArgs, ResearchDepsOperation,
         ResearchWebOperation, parse_source_class, resolve_sources,
     };
+    use crate::test_support::{TestResult, ctx};
     use crate::testutil::toks;
+    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_operations::context::ServiceMap;
     use harw_operations::{FromRawArgs, OpContext, OpError, Operation, Surface};
     use harw_registry_defaults::profile::role_names;
     use harw_research::SourceClass;
-    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Baut einen minimalen [`OpContext`] mit leerer [`ServiceMap`].
-    fn test_context() -> (OpContext, std::path::PathBuf) {
+    fn test_context() -> TestResult<(OpContext, std::path::PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root =
             std::env::temp_dir().join(format!("harw-research-test-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(root.join("ws")).expect("Test-Workspace anlegen");
+        std::fs::create_dir_all(root.join("ws")).map_err(ctx("Test-Workspace anlegen"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -503,18 +504,18 @@ mod tests {
                 root: std::path::PathBuf::from("ws"),
             }],
         )
-        .expect("Workspace-Registry bauen");
+        .map_err(ctx("Workspace-Registry bauen"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .expect("Workspace-Binding auflösen");
+            .map_err(ctx("Workspace-Binding auflösen"))?;
         let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
-        (
+        Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new()),
             root,
-        )
+        ))
     }
 
     /// Liest den `child_name` der `AgentTool`-Fläche einer Operation.
@@ -526,25 +527,23 @@ mod tests {
     }
 
     #[test]
-    fn test_research_args_from_raw_args_joins_tokens_into_question() {
-        match ResearchArgs::from_raw_args(&toks(&["welche", "MSRV", "hat", "serde"])) {
-            Ok(args) => {
-                assert_eq!(args.question.as_deref(), Some("welche MSRV hat serde"));
-                assert!(args.crates.is_empty());
-                assert!(args.urls.is_empty());
-                assert!(args.sources.is_empty());
-                assert!(args.task.is_none());
-            }
-            Err(error) => panic!("unerwarteter Fehler: {error}"),
-        }
+    fn test_research_args_from_raw_args_joins_tokens_into_question() -> TestResult {
+        let args = ResearchArgs::from_raw_args(&toks(&["welche", "MSRV", "hat", "serde"]))
+            .map_err(ctx("ResearchArgs::from_raw_args"))?;
+        assert_eq!(args.question.as_deref(), Some("welche MSRV hat serde"));
+        assert!(args.crates.is_empty());
+        assert!(args.urls.is_empty());
+        assert!(args.sources.is_empty());
+        assert!(args.task.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_research_args_from_raw_args_empty_tokens_yields_no_question() {
-        match ResearchArgs::from_raw_args(&toks(&[])) {
-            Ok(args) => assert!(args.question.is_none()),
-            Err(error) => panic!("unerwarteter Fehler: {error}"),
-        }
+    fn test_research_args_from_raw_args_empty_tokens_yields_no_question() -> TestResult {
+        let args =
+            ResearchArgs::from_raw_args(&toks(&[])).map_err(ctx("ResearchArgs::from_raw_args"))?;
+        assert!(args.question.is_none());
+        Ok(())
     }
 
     #[test]
@@ -570,20 +569,20 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_sources_falls_back_when_none_requested() {
-        match resolve_sources(&[], super::DEPS_DEFAULT_SOURCES) {
-            Ok(sources) => assert_eq!(sources, super::DEPS_DEFAULT_SOURCES.to_vec()),
-            Err(error) => panic!("unerwarteter Fehler: {error}"),
-        }
+    fn test_resolve_sources_falls_back_when_none_requested() -> TestResult {
+        let sources =
+            resolve_sources(&[], super::DEPS_DEFAULT_SOURCES).map_err(ctx("resolve_sources"))?;
+        assert_eq!(sources, super::DEPS_DEFAULT_SOURCES.to_vec());
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_sources_uses_requested_values_in_order() {
+    fn test_resolve_sources_uses_requested_values_in_order() -> TestResult {
         let requested = toks(&["web", "docs"]);
-        match resolve_sources(&requested, super::DEPS_DEFAULT_SOURCES) {
-            Ok(sources) => assert_eq!(sources, vec![SourceClass::Web, SourceClass::OfficialDocs]),
-            Err(error) => panic!("unerwarteter Fehler: {error}"),
-        }
+        let sources = resolve_sources(&requested, super::DEPS_DEFAULT_SOURCES)
+            .map_err(ctx("resolve_sources"))?;
+        assert_eq!(sources, vec![SourceClass::Web, SourceClass::OfficialDocs]);
+        Ok(())
     }
 
     #[test]
@@ -627,10 +626,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_research_deps_without_spawner_is_not_available() {
-        let (ctx, root) = test_context();
+    async fn test_research_deps_without_spawner_is_not_available() -> TestResult {
+        let (op_ctx, root) = test_context()?;
         let result = super::research_deps(
-            &ctx,
+            &op_ctx,
             ResearchArgs {
                 question: Some("welche MSRV hat serde".to_owned()),
                 ..ResearchArgs::default()
@@ -643,22 +642,24 @@ mod tests {
             matches!(result, Err(OpError::NotAvailable(_))),
             "ohne Agent-Spawner muss /research-deps fail-closed sein, war: {result:?}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_research_web_without_question_is_invalid_arguments() {
-        let (ctx, root) = test_context();
-        let result = super::research_web(&ctx, ResearchArgs::default()).await;
+    async fn test_research_web_without_question_is_invalid_arguments() -> TestResult {
+        let (op_ctx, root) = test_context()?;
+        let result = super::research_web(&op_ctx, ResearchArgs::default()).await;
         std::fs::remove_dir_all(root).ok();
 
         assert!(matches!(result, Err(OpError::InvalidArguments(_))));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_research_web_with_unknown_source_is_invalid_arguments() {
-        let (ctx, root) = test_context();
+    async fn test_research_web_with_unknown_source_is_invalid_arguments() -> TestResult {
+        let (op_ctx, root) = test_context()?;
         let result = super::research_web(
-            &ctx,
+            &op_ctx,
             ResearchArgs {
                 question: Some("was ist neu in Rust 2024".to_owned()),
                 sources: toks(&["bananas"]),
@@ -672,5 +673,6 @@ mod tests {
             matches!(result, Err(OpError::InvalidArguments(_))),
             "eine unbekannte Quellklasse darf nicht still zur Vorgabe werden, war: {result:?}"
         );
+        Ok(())
     }
 }

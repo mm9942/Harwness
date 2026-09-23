@@ -57,7 +57,9 @@ use harw_plan::admission::{
     validate_patch,
 };
 use harw_plan::{Criterion, PlanNodeKind, PlanStore, TaskId, VerificationStep};
-use harw_plan_bridge::{JobAdmissionTemplate, PlanBridgeError, PlanJobBridge, offset_from_timestamp};
+use harw_plan_bridge::{
+    JobAdmissionTemplate, PlanBridgeError, PlanJobBridge, offset_from_timestamp,
+};
 use harw_protocol::{SessionEvent, TurnEvent};
 use harw_registry_defaults::profile::{IdentityOverrides, RegistryProfile};
 use harw_runtime::{RuntimeAssembly, RuntimeNarrowing};
@@ -1039,8 +1041,12 @@ async fn execute_plan_node_claim(
     );
 
     let outcome = execute_turn(claim, plan_node_prompt(&payload), model, control, setup).await;
-    let outcome =
-        enforce_patch_admission(&payload.contract, &workspace_root, &before_snapshot, outcome);
+    let outcome = enforce_patch_admission(
+        &payload.contract,
+        &workspace_root,
+        &before_snapshot,
+        outcome,
+    );
 
     report_plan_node_outcome(&services, &payload.task_id, &work_id, outcome, &admission)
 }
@@ -2250,6 +2256,7 @@ impl ExecutionControl for WorkerExecutionControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_authority::{WorkspaceRegistration, WorkspaceRegistry};
     use harw_core::{EchoModelProvider, JobExecutionRegistry, RecordingModelProvider};
     use harw_job_runtime::{Job, StoredJob};
@@ -2259,18 +2266,19 @@ mod tests {
 
     // ── Fixtures ──────────────────────────────────────────────────────────
 
-    fn temp_dir() -> tempfile::TempDir {
-        match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(error) => panic!("temp directory: {error}"),
-        }
+    fn temp_dir() -> TestResult<tempfile::TempDir> {
+        tempfile::tempdir().map_err(ctx("temp directory"))
     }
 
-    fn ready_record(id: &str, input: serde_json::Value) -> StoredJob {
+    fn ready_record(id: &str, input: serde_json::Value) -> TestResult<StoredJob> {
         ready_record_of_kind(id, JobKind::Worker, input)
     }
 
-    fn ready_record_of_kind(id: &str, kind: JobKind, input: serde_json::Value) -> StoredJob {
+    fn ready_record_of_kind(
+        id: &str,
+        kind: JobKind,
+        input: serde_json::Value,
+    ) -> TestResult<StoredJob> {
         let now = Timestamp::now();
         let mut job = Job::new(
             WorkId::from_str(id),
@@ -2284,10 +2292,8 @@ mod tests {
             },
             now,
         );
-        if let Err(error) = job.mark_ready(now) {
-            panic!("mark_ready: {error}");
-        }
-        StoredJob {
+        job.mark_ready(now).map_err(ctx("mark_ready"))?;
+        Ok(StoredJob {
             job,
             scope: JobScope::new(
                 TenantId::from_str("tenant"),
@@ -2305,53 +2311,46 @@ mod tests {
             cancellation: None,
             revision: 0,
             trace: None,
-        }
+        })
     }
 
-    fn admit(store: &JobStore, record: &StoredJob) {
-        if let Err(error) = store.admit(record) {
-            panic!("admit: {error}");
-        }
+    fn admit(store: &JobStore, record: &StoredJob) -> TestResult {
+        store.admit(record).map_err(ctx("admit"))?;
+        Ok(())
     }
 
-    fn completion_of(store: &JobStore, id: &str) -> JobOutcome {
-        let stored = match store.get(&WorkId::from_str(id)) {
-            Ok(stored) => stored,
-            Err(error) => panic!("get '{id}': {error}"),
-        };
+    fn completion_of(store: &JobStore, id: &str) -> TestResult<JobOutcome> {
+        let stored = store.get(&WorkId::from_str(id)).map_err(ctx("get job"))?;
         match stored.completion {
-            Some(completion) => completion.outcome,
-            None => panic!("job '{id}' has no completion record"),
+            Some(completion) => Ok(completion.outcome),
+            None => Err(TestError::Unexpected(format!(
+                "job '{id}' has no completion record"
+            ))),
         }
     }
 
     // Builds a real workspace binding under `root/workspace`.
-    fn sandbox_with(root: &Path, permissions: &[Permission]) -> SandboxSpec {
+    fn sandbox_with(root: &Path, permissions: &[Permission]) -> TestResult<SandboxSpec> {
         let workspace_root = root.join("workspace");
-        if let Err(error) = std::fs::create_dir_all(&workspace_root) {
-            panic!("create workspace: {error}");
-        }
+        std::fs::create_dir_all(&workspace_root).map_err(ctx("create workspace"))?;
         let tenant = TenantId::from_str("tenant");
         let workspace = WorkspaceId::from_str("workspace");
-        let registry = match WorkspaceRegistry::build(
+        let registry = WorkspaceRegistry::build(
             root,
             [WorkspaceRegistration {
                 tenant: tenant.clone(),
                 workspace: workspace.clone(),
                 root: PathBuf::from("workspace"),
             }],
-        ) {
-            Ok(registry) => registry,
-            Err(error) => panic!("workspace registry: {error}"),
-        };
-        let binding = match registry.resolve(&tenant, &workspace) {
-            Ok(binding) => binding,
-            Err(error) => panic!("resolve workspace: {error}"),
-        };
-        SandboxSpec::from_resolved(
+        )
+        .map_err(ctx("workspace registry"))?;
+        let binding = registry
+            .resolve(&tenant, &workspace)
+            .map_err(ctx("resolve workspace"))?;
+        Ok(SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy(permissions.iter().copied()),
-        )
+        ))
     }
 
     fn contract_for(task: &str, allowed: &[PathRule]) -> MutationContract {
@@ -2365,11 +2364,11 @@ mod tests {
     }
 
     // The exact payload shape `PlanJobBridge::admit_ready_nodes` writes.
-    fn plan_node_input(task: Option<&str>, contract: &MutationContract) -> serde_json::Value {
-        let contract_value = match serde_json::to_value(contract) {
-            Ok(value) => value,
-            Err(error) => panic!("serialize contract: {error}"),
-        };
+    fn plan_node_input(
+        task: Option<&str>,
+        contract: &MutationContract,
+    ) -> TestResult<serde_json::Value> {
+        let contract_value = serde_json::to_value(contract).map_err(ctx("serialize contract"))?;
         let mut object = serde_json::Map::new();
         object.insert("plan_id".to_owned(), serde_json::json!("p-test"));
         if let Some(task) = task {
@@ -2382,7 +2381,7 @@ mod tests {
         object.insert("read_scope".to_owned(), serde_json::json!(["src"]));
         object.insert("write_scope".to_owned(), serde_json::json!(["src/lib.rs"]));
         object.insert("forbidden_scope".to_owned(), serde_json::json!([]));
-        serde_json::Value::Object(object)
+        Ok(serde_json::Value::Object(object))
     }
 
     // Die Einreicher-Menge passend zu `ready_record` (Operator `operator`).
@@ -2392,34 +2391,30 @@ mod tests {
 
     // Worker-Kontext mit Temp-Home (`harw_home::ensure_home`) und Temp-cwd
     // unter `root`; Transkripte liegen direkt unter `root`.
-    fn job_context(root: &Path) -> Arc<JobWorkerContext> {
-        Arc::new(JobWorkerContext {
+    fn job_context(root: &Path) -> TestResult<Arc<JobWorkerContext>> {
+        Ok(Arc::new(JobWorkerContext {
             transcript_root: root.to_path_buf(),
             configured_submitters: operator_submitters(),
-            runtime_root: Some(runtime_root_under(root)),
-        })
+            runtime_root: Some(runtime_root_under(root)?),
+        }))
     }
 
     // Legt Home und cwd der Job-Runtime unter `root` an.
-    fn runtime_root_under(root: &Path) -> JobRuntimeRoot {
+    fn runtime_root_under(root: &Path) -> TestResult<JobRuntimeRoot> {
         let home = root.join("runtime-home");
         let cwd = root.join("runtime-cwd");
-        if let Err(error) = harw_home::ensure_home(&home) {
-            panic!("scaffold home: {error}");
-        }
-        if let Err(error) = std::fs::create_dir_all(&cwd) {
-            panic!("create cwd: {error}");
-        }
-        JobRuntimeRoot { home, cwd }
+        harw_home::ensure_home(&home).map_err(ctx("scaffold home"))?;
+        std::fs::create_dir_all(&cwd).map_err(ctx("create cwd"))?;
+        Ok(JobRuntimeRoot { home, cwd })
     }
 
-    fn plan_services(root: &Path, permissions: &[Permission]) -> Arc<PlanNodeServices> {
+    fn plan_services(root: &Path, permissions: &[Permission]) -> TestResult<Arc<PlanNodeServices>> {
         let plan: Arc<dyn PlanStore> = Arc::new(InMemoryPlanStore::new());
-        Arc::new(PlanNodeServices::new(
+        Ok(Arc::new(PlanNodeServices::new(
             plan,
-            sandbox_with(root, permissions),
+            sandbox_with(root, permissions)?,
             "test-runtime".to_owned(),
-        ))
+        )))
     }
 
     // ── Kind dispatch ─────────────────────────────────────────────────────
@@ -2449,55 +2444,63 @@ mod tests {
     // ── Payload parsing ───────────────────────────────────────────────────
 
     #[test]
-    fn test_plan_node_payload_parse_rejects_a_missing_task_id() {
+    fn test_plan_node_payload_parse_rejects_a_missing_task_id() -> TestResult {
         let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned())]);
-        let error = match PlanNodePayload::parse(&plan_node_input(None, &contract)) {
-            Ok(_) => panic!("a payload without 'task_id' must not parse"),
-            Err(error) => error,
+        let result = PlanNodePayload::parse(&plan_node_input(None, &contract)?);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "a payload without 'task_id' must not parse".into(),
+            ));
         };
         assert!(error.contains("task_id"), "unclear message: {error}");
         assert!(error.contains("missing"), "unclear message: {error}");
+        Ok(())
     }
 
     #[test]
-    fn test_plan_node_payload_parse_accepts_a_bridge_payload() {
+    fn test_plan_node_payload_parse_accepts_a_bridge_payload() -> TestResult {
         let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned())]);
-        let payload = match PlanNodePayload::parse(&plan_node_input(Some("t-1"), &contract)) {
-            Ok(payload) => payload,
-            Err(error) => panic!("bridge payload must parse: {error}"),
-        };
+        let payload = PlanNodePayload::parse(&plan_node_input(Some("t-1"), &contract)?)
+            .map_err(ctx("bridge payload must parse"))?;
         assert_eq!(payload.task_id, TaskId::new("t-1"));
         assert_eq!(payload.plan_id, "p-test");
         assert_eq!(payload.plan_revision, 2);
         assert_eq!(payload.objective, "do the thing");
         assert_eq!(payload.write_scope, vec!["src/lib.rs".to_owned()]);
         assert_eq!(payload.contract.allowed_paths.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_plan_node_payload_parse_rejects_a_contract_for_another_task() {
+    fn test_plan_node_payload_parse_rejects_a_contract_for_another_task() -> TestResult {
         let contract = contract_for("t-other", &[PathRule::Exact("src/lib.rs".to_owned())]);
-        let error = match PlanNodePayload::parse(&plan_node_input(Some("t-1"), &contract)) {
-            Ok(_) => panic!("a contract naming another task must not parse"),
-            Err(error) => error,
+        let result = PlanNodePayload::parse(&plan_node_input(Some("t-1"), &contract)?);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "a contract naming another task must not parse".into(),
+            ));
         };
         assert!(error.contains("t-other"), "unclear message: {error}");
+        Ok(())
     }
 
     #[test]
-    fn test_plan_node_payload_parse_rejects_a_non_object_input() {
-        let error = match PlanNodePayload::parse(&serde_json::json!("just a string")) {
-            Ok(_) => panic!("a non-object payload must not parse"),
-            Err(error) => error,
+    fn test_plan_node_payload_parse_rejects_a_non_object_input() -> TestResult {
+        let result = PlanNodePayload::parse(&serde_json::json!("just a string"));
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "a non-object payload must not parse".into(),
+            ));
         };
         assert!(error.contains("object"), "unclear message: {error}");
+        Ok(())
     }
 
     // ── Authority derivation ──────────────────────────────────────────────
 
     #[test]
-    fn test_derive_plan_node_sandbox_reduces_to_read_and_write_only() {
-        let dir = temp_dir();
+    fn test_derive_plan_node_sandbox_reduces_to_read_and_write_only() -> TestResult {
+        let dir = temp_dir()?;
         let inherited = sandbox_with(
             dir.path(),
             &[
@@ -2506,62 +2509,61 @@ mod tests {
                 Permission::ExecuteProcess,
                 Permission::NetworkAccess,
             ],
-        );
+        )?;
         let contract = contract_for("t-1", &[PathRule::DirectoryPrefix("src".to_owned())]);
 
-        let derived =
-            match derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Coding, true) {
-                Ok(derived) => derived,
-                Err(error) => panic!("derivation must succeed: {error}"),
-            };
+        let derived = derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Coding, true)
+            .map_err(ctx("derivation must succeed"))?;
 
         assert!(derived.permissions().contains(Permission::ReadWorkspace));
         assert!(derived.permissions().contains(Permission::WriteWorkspace));
         assert!(!derived.permissions().contains(Permission::ExecuteProcess));
         assert!(!derived.permissions().contains(Permission::NetworkAccess));
         assert!(derived.ensure_child_of(&inherited).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_derive_plan_node_sandbox_without_write_scope_keeps_only_read() {
-        let dir = temp_dir();
+    fn test_derive_plan_node_sandbox_without_write_scope_keeps_only_read() -> TestResult {
+        let dir = temp_dir()?;
         let inherited = sandbox_with(
             dir.path(),
             &[Permission::ReadWorkspace, Permission::WriteWorkspace],
-        );
+        )?;
         let contract = contract_for("t-1", &[]);
 
-        let derived =
-            match derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Coding, false) {
-                Ok(derived) => derived,
-                Err(error) => panic!("derivation must succeed: {error}"),
-            };
+        let derived = derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Coding, false)
+            .map_err(ctx("derivation must succeed"))?;
         assert!(derived.permissions().contains(Permission::ReadWorkspace));
         assert!(!derived.permissions().contains(Permission::WriteWorkspace));
+        Ok(())
     }
 
     #[test]
-    fn test_derive_plan_node_sandbox_rejects_a_write_scope_beyond_the_inherited_sandbox() {
-        let dir = temp_dir();
+    fn test_derive_plan_node_sandbox_rejects_a_write_scope_beyond_the_inherited_sandbox()
+    -> TestResult {
+        let dir = temp_dir()?;
         // The job may only read; the contract demands writing.
-        let inherited = sandbox_with(dir.path(), &[Permission::ReadWorkspace]);
+        let inherited = sandbox_with(dir.path(), &[Permission::ReadWorkspace])?;
         let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned())]);
 
-        let error =
-            match derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Coding, true) {
-                Ok(_) => panic!("a contract may never widen the inherited sandbox"),
-                Err(error) => error,
-            };
+        let result = derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Coding, true);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "a contract may never widen the inherited sandbox".into(),
+            ));
+        };
         assert!(error.contains("WriteWorkspace"), "unclear message: {error}");
+        Ok(())
     }
 
     #[test]
-    fn test_derive_plan_node_sandbox_rejects_a_write_scope_escaping_the_workspace() {
-        let dir = temp_dir();
+    fn test_derive_plan_node_sandbox_rejects_a_write_scope_escaping_the_workspace() -> TestResult {
+        let dir = temp_dir()?;
         let inherited = sandbox_with(
             dir.path(),
             &[Permission::ReadWorkspace, Permission::WriteWorkspace],
-        );
+        )?;
         for escaping in [
             PathRule::Exact("../outside.rs".to_owned()),
             PathRule::DirectoryPrefix("/etc".to_owned()),
@@ -2570,39 +2572,42 @@ mod tests {
         ] {
             let pattern = rule_pattern(&escaping).to_owned();
             let contract = contract_for("t-1", &[escaping]);
-            match derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Coding, true) {
-                Ok(_) => panic!("write scope '{pattern}' must be rejected"),
-                Err(error) => assert!(
-                    error.contains("leaves the workspace"),
-                    "unclear message for '{pattern}': {error}"
-                ),
-            }
+            let result =
+                derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Coding, true);
+            let Err(error) = result else {
+                return Err(TestError::Unexpected(format!(
+                    "write scope '{pattern}' must be rejected"
+                )));
+            };
+            assert!(
+                error.contains("leaves the workspace"),
+                "unclear message for '{pattern}': {error}"
+            );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_derive_plan_node_sandbox_research_node_drops_write() {
-        let dir = temp_dir();
+    fn test_derive_plan_node_sandbox_research_node_drops_write() -> TestResult {
+        let dir = temp_dir()?;
         let inherited = sandbox_with(
             dir.path(),
             &[Permission::ReadWorkspace, Permission::WriteWorkspace],
-        );
+        )?;
         // The contract asks for writing, but a research node never writes.
         let contract = contract_for("t-1", &[PathRule::DirectoryPrefix("src".to_owned())]);
 
-        let derived =
-            match derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Research, true) {
-                Ok(derived) => derived,
-                Err(error) => panic!("derivation must succeed: {error}"),
-            };
+        let derived = derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Research, true)
+            .map_err(ctx("derivation must succeed"))?;
         assert!(derived.permissions().contains(Permission::ReadWorkspace));
         assert!(!derived.permissions().contains(Permission::WriteWorkspace));
         assert!(derived.ensure_child_of(&inherited).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_derive_plan_node_sandbox_never_exceeds_inherited() {
-        let dir = temp_dir();
+    fn test_derive_plan_node_sandbox_never_exceeds_inherited() -> TestResult {
+        let dir = temp_dir()?;
         let inherited = sandbox_with(
             dir.path(),
             &[
@@ -2612,7 +2617,7 @@ mod tests {
                 Permission::NetworkAccess,
                 Permission::ReadSecrets,
             ],
-        );
+        )?;
         let kinds = [
             PlanNodeKind::Research,
             PlanNodeKind::Explore,
@@ -2630,11 +2635,8 @@ mod tests {
         for kind in kinds {
             for may_write in [false, true] {
                 for contract in [&write_contract, &read_contract] {
-                    let derived =
-                        match derive_plan_node_sandbox(&inherited, contract, kind, may_write) {
-                            Ok(derived) => derived,
-                            Err(error) => panic!("derivation for {kind:?} must succeed: {error}"),
-                        };
+                    let derived = derive_plan_node_sandbox(&inherited, contract, kind, may_write)
+                        .map_err(ctx("derivation must succeed"))?;
                     assert!(
                         derived.permissions().is_subset_of(inherited.permissions()),
                         "{kind:?}/{may_write}: result exceeds the inherited sandbox"
@@ -2660,6 +2662,7 @@ mod tests {
                 }
             }
         }
+        Ok(())
     }
 
     #[test]
@@ -2709,17 +2712,20 @@ mod tests {
     // ── Approval handling ─────────────────────────────────────────────────
 
     #[test]
-    fn test_paused_turn_outcome_fails_a_plan_node_on_awaiting_approval() {
+    fn test_paused_turn_outcome_fails_a_plan_node_on_awaiting_approval() -> TestResult {
         let paused = TurnOutcome::AwaitingApproval {
             call_id: ToolCallId::from_str("call-1"),
             request: ItemId::from_str("item-1"),
         };
         let JobOutcome::Failed { reason } = paused_turn_outcome(&paused, PauseDisposition::Failed)
         else {
-            panic!("an approval request must fail a plan-node job");
+            return Err(TestError::Unexpected(
+                "an approval request must fail a plan-node job".into(),
+            ));
         };
         assert!(reason.contains("call-1"), "unclear message: {reason}");
         assert!(reason.contains("no user"), "unclear message: {reason}");
+        Ok(())
     }
 
     #[test]
@@ -2750,18 +2756,14 @@ mod tests {
     // ── Patch admission (Befund K36) ─────────────────────────────────────
 
     #[test]
-    fn test_snapshot_workspace_finds_every_file_below_the_root() {
-        let temp = temp_dir();
+    fn test_snapshot_workspace_finds_every_file_below_the_root() -> TestResult {
+        let temp = temp_dir()?;
         let workspace_root = temp.path().to_path_buf();
-        if let Err(error) = std::fs::create_dir_all(workspace_root.join("src")) {
-            panic!("create src: {error}");
-        }
-        if let Err(error) = std::fs::write(workspace_root.join("src/lib.rs"), "fn main() {}") {
-            panic!("write lib.rs: {error}");
-        }
-        if let Err(error) = std::fs::write(workspace_root.join("outside.rs"), "// unrelated") {
-            panic!("write outside.rs: {error}");
-        }
+        std::fs::create_dir_all(workspace_root.join("src")).map_err(ctx("create src"))?;
+        std::fs::write(workspace_root.join("src/lib.rs"), "fn main() {}")
+            .map_err(ctx("write lib.rs"))?;
+        std::fs::write(workspace_root.join("outside.rs"), "// unrelated")
+            .map_err(ctx("write outside.rs"))?;
 
         let snapshot = snapshot_workspace(&workspace_root);
         assert_eq!(
@@ -2770,13 +2772,15 @@ mod tests {
             "der ganze Workspace muss erfasst werden, nicht nur die erlaubten Pfade \
              (Befund K36: die Sandbox schneidet nicht auf Pfadebene)"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_snapshot_workspace_of_a_missing_root_is_empty() {
-        let temp = temp_dir();
+    fn test_snapshot_workspace_of_a_missing_root_is_empty() -> TestResult {
+        let temp = temp_dir()?;
         let missing = temp.path().join("does-not-exist");
         assert!(snapshot_workspace(&missing).is_empty());
+        Ok(())
     }
 
     #[test]
@@ -2869,30 +2873,27 @@ mod tests {
     }
 
     #[test]
-    fn test_enforce_patch_admission_passes_through_a_non_succeeded_outcome() {
-        let temp = temp_dir();
+    fn test_enforce_patch_admission_passes_through_a_non_succeeded_outcome() -> TestResult {
+        let temp = temp_dir()?;
         let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned())]);
         let outcome = JobOutcome::Blocked {
             reason: "irrelevant".to_owned(),
         };
-        let result =
-            enforce_patch_admission(&contract, temp.path(), &BTreeMap::new(), outcome);
+        let result = enforce_patch_admission(&contract, temp.path(), &BTreeMap::new(), outcome);
         assert!(matches!(result, JobOutcome::Blocked { reason } if reason == "irrelevant"));
+        Ok(())
     }
 
     #[test]
-    fn test_enforce_patch_admission_admits_a_write_inside_scope() {
-        let temp = temp_dir();
+    fn test_enforce_patch_admission_admits_a_write_inside_scope() -> TestResult {
+        let temp = temp_dir()?;
         let workspace_root = temp.path().to_path_buf();
-        if let Err(error) = std::fs::create_dir_all(workspace_root.join("src")) {
-            panic!("create src: {error}");
-        }
+        std::fs::create_dir_all(workspace_root.join("src")).map_err(ctx("create src"))?;
         let contract = contract_for("t-1", &[PathRule::DirectoryPrefix("src".to_owned())]);
         let before = snapshot_workspace(&workspace_root);
 
-        if let Err(error) = std::fs::write(workspace_root.join("src/lib.rs"), "fn main() {}") {
-            panic!("write lib.rs: {error}");
-        }
+        std::fs::write(workspace_root.join("src/lib.rs"), "fn main() {}")
+            .map_err(ctx("write lib.rs"))?;
 
         let outcome = JobOutcome::Succeeded {
             result: serde_json::json!({"assistant": "done"}),
@@ -2902,58 +2903,58 @@ mod tests {
             matches!(result, JobOutcome::Succeeded { .. }),
             "ein Schreibvorgang innerhalb des Vertrags darf nicht abgelehnt werden: {result:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_enforce_patch_admission_rejects_a_write_outside_scope() {
-        let temp = temp_dir();
+    fn test_enforce_patch_admission_rejects_a_write_outside_scope() -> TestResult {
+        let temp = temp_dir()?;
         let workspace_root = temp.path().to_path_buf();
-        if let Err(error) = std::fs::create_dir_all(workspace_root.join("src")) {
-            panic!("create src: {error}");
-        }
+        std::fs::create_dir_all(workspace_root.join("src")).map_err(ctx("create src"))?;
         // Nur `src/lib.rs` ist erlaubt; der Schnappschuss deckt trotzdem den
         // ganzen Workspace ab (Befund K36), sonst bliebe ein Schreibvorgang
         // außerhalb der erlaubten Datei unsichtbar.
         let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned())]);
         let before = snapshot_workspace(&workspace_root);
 
-        if let Err(error) = std::fs::write(workspace_root.join("src/rogue.rs"), "// nope") {
-            panic!("write rogue.rs: {error}");
-        }
+        std::fs::write(workspace_root.join("src/rogue.rs"), "// nope")
+            .map_err(ctx("write rogue.rs"))?;
 
         let outcome = JobOutcome::Succeeded {
             result: serde_json::json!({"assistant": "done"}),
         };
         let result = enforce_patch_admission(&contract, &workspace_root, &before, outcome);
         let JobOutcome::Failed { reason } = result else {
-            panic!("ein Verstoß gegen den Mutationsvertrag muss den Job scheitern lassen");
+            return Err(TestError::Unexpected(
+                "ein Verstoß gegen den Mutationsvertrag muss den Job scheitern lassen".into(),
+            ));
         };
         assert!(
             reason.contains("rogue.rs"),
             "der typisierte Verstoß muss im Grund benannt sein: {reason}"
         );
+        Ok(())
     }
 
     // ── Ready-node admission (Befund K37) ────────────────────────────────
 
     #[test]
-    fn test_admit_newly_ready_nodes_admits_a_dependent_after_completion() {
-        let temp = temp_dir();
+    fn test_admit_newly_ready_nodes_admits_a_dependent_after_completion() -> TestResult {
+        let temp = temp_dir()?;
         let node_a = harw_plan::plan_node!("t-1", write: ["src/t-1.rs"]);
         let node_b = harw_plan::plan_node!("t-2", deps: ["t-1"], write: ["src/t-2.rs"]);
 
         let plan = InMemoryPlanStore::new();
-        if let Err(error) = plan.apply(
+        plan.apply(
             PlanAction::Create {
                 plan_id: PlanId::new("p-test"),
                 goal: "test goal".to_owned(),
             },
             "test",
-        ) {
-            panic!("create plan: {error}");
-        }
+        )
+        .map_err(ctx("create plan"))?;
         let expected_rev = plan.revision();
-        if let Err(error) = plan.apply_batch(
+        plan.apply_batch(
             &PlanId::new("p-test"),
             vec![
                 PlanAction::AddNode { node: node_a },
@@ -2961,9 +2962,8 @@ mod tests {
             ],
             "test",
             expected_rev,
-        ) {
-            panic!("add nodes: {error}");
-        }
+        )
+        .map_err(ctx("add nodes"))?;
         let plan: Arc<dyn PlanStore> = Arc::new(plan);
 
         let jobs = Arc::new(JobStore::new(temp.path()));
@@ -2988,22 +2988,20 @@ mod tests {
 
         // Nur `t-1` hat keine offenen Dependencies und wird admittiert; `t-2`
         // bleibt vorerst blockiert.
-        let admitted = match PlanJobBridge::admit_ready_nodes(
+        let admitted = PlanJobBridge::admit_ready_nodes(
             plan.as_ref(),
             jobs.as_ref(),
             &initial_template,
             "test-runtime",
-        ) {
-            Ok(admitted) => admitted,
-            Err(error) => panic!("admit_ready_nodes: {error}"),
-        };
+        )
+        .map_err(ctx("admit_ready_nodes"))?;
         assert_eq!(admitted.len(), 1);
         let (task, work_id) = admitted[0].clone();
         assert_eq!(task, TaskId::new("t-1"));
 
         let services = PlanNodeServices::new(
             Arc::clone(&plan),
-            sandbox_with(temp.path(), &[Permission::ReadWorkspace]),
+            sandbox_with(temp.path(), &[Permission::ReadWorkspace])?,
             "test-runtime".to_owned(),
         );
         let admission = ReadyNodeAdmission {
@@ -3028,65 +3026,63 @@ mod tests {
         );
         assert!(matches!(outcome, JobOutcome::Succeeded { .. }));
 
-        let snapshot = match plan.current() {
-            Ok(snapshot) => snapshot,
-            Err(error) => panic!("current: {error}"),
-        };
-        let node_a_after = match snapshot.nodes.iter().find(|node| node.id == TaskId::new("t-1"))
-        {
-            Some(node) => node,
-            None => panic!("t-1 fehlt im Plan"),
-        };
+        let snapshot = plan.current().map_err(ctx("current"))?;
+        let node_a_after = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id == TaskId::new("t-1"))
+            .ok_or(TestError::Missing("t-1 fehlt im Plan"))?;
         assert_eq!(node_a_after.status, PlanNodeStatus::Completed);
 
-        let node_b_after = match snapshot.nodes.iter().find(|node| node.id == TaskId::new("t-2"))
-        {
-            Some(node) => node,
-            None => panic!("t-2 fehlt im Plan"),
-        };
+        let node_b_after = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id == TaskId::new("t-2"))
+            .ok_or(TestError::Missing("t-2 fehlt im Plan"))?;
         assert_eq!(
             node_b_after.status,
             PlanNodeStatus::InProgress,
             "t-2 muss nach Abschluss von t-1 automatisch admittiert werden"
         );
-        let assigned_job = match &node_b_after.assignment {
-            Some(assignment) => match &assignment.job {
-                Some(job) => job.clone(),
-                None => panic!("t-2 hat keine Job-Zuweisung"),
-            },
-            None => panic!("t-2 hat kein Assignment"),
-        };
-        if let Err(error) = jobs.get(&WorkId::from_str(assigned_job.as_str())) {
-            panic!("der für t-2 admittierte Job muss im Job-Speicher stehen: {error}");
-        }
+        let assignment = node_b_after
+            .assignment
+            .as_ref()
+            .ok_or(TestError::Missing("t-2 hat kein Assignment"))?;
+        let assigned_job = assignment
+            .job
+            .clone()
+            .ok_or(TestError::Missing("t-2 hat keine Job-Zuweisung"))?;
+        jobs.get(&WorkId::from_str(assigned_job.as_str()))
+            .map_err(ctx(
+                "der für t-2 admittierte Job muss im Job-Speicher stehen",
+            ))?;
+        Ok(())
     }
 
     #[test]
-    fn test_admit_newly_ready_nodes_is_best_effort_when_no_node_becomes_ready() {
+    fn test_admit_newly_ready_nodes_is_best_effort_when_no_node_becomes_ready() -> TestResult {
         // Ein einzelner Knoten ohne Nachfolger: `admit_ready_nodes` meldet
         // `NoReadyNodes` — das darf `report_plan_node_outcome` nicht scheitern
         // lassen, es ist der Normalfall am Ende eines Plans.
-        let temp = temp_dir();
+        let temp = temp_dir()?;
         let node_a = harw_plan::plan_node!("t-1", write: ["src/t-1.rs"]);
         let plan = InMemoryPlanStore::new();
-        if let Err(error) = plan.apply(
+        plan.apply(
             PlanAction::Create {
                 plan_id: PlanId::new("p-test"),
                 goal: "test goal".to_owned(),
             },
             "test",
-        ) {
-            panic!("create plan: {error}");
-        }
+        )
+        .map_err(ctx("create plan"))?;
         let expected_rev = plan.revision();
-        if let Err(error) = plan.apply_batch(
+        plan.apply_batch(
             &PlanId::new("p-test"),
             vec![PlanAction::AddNode { node: node_a }],
             "test",
             expected_rev,
-        ) {
-            panic!("add node: {error}");
-        }
+        )
+        .map_err(ctx("add node"))?;
         let plan: Arc<dyn PlanStore> = Arc::new(plan);
 
         let jobs = Arc::new(JobStore::new(temp.path()));
@@ -3108,20 +3104,18 @@ mod tests {
             RepoRevision("sha".to_owned()),
             Timestamp::now(),
         );
-        let admitted = match PlanJobBridge::admit_ready_nodes(
+        let admitted = PlanJobBridge::admit_ready_nodes(
             plan.as_ref(),
             jobs.as_ref(),
             &template,
             "test-runtime",
-        ) {
-            Ok(admitted) => admitted,
-            Err(error) => panic!("admit_ready_nodes: {error}"),
-        };
+        )
+        .map_err(ctx("admit_ready_nodes"))?;
         let (task, work_id) = admitted[0].clone();
 
         let services = PlanNodeServices::new(
             Arc::clone(&plan),
-            sandbox_with(temp.path(), &[Permission::ReadWorkspace]),
+            sandbox_with(temp.path(), &[Permission::ReadWorkspace])?,
             "test-runtime".to_owned(),
         );
         let admission = ReadyNodeAdmission {
@@ -3144,60 +3138,67 @@ mod tests {
             &admission,
         );
         assert!(matches!(outcome, JobOutcome::Succeeded { .. }));
+        Ok(())
     }
 
     // ── Worker loop ───────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_run_job_worker_once_completes_a_ready_job_with_durable_assistant_text() {
-        let temp = temp_dir();
+    async fn test_run_job_worker_once_completes_a_ready_job_with_durable_assistant_text()
+    -> TestResult {
+        let temp = temp_dir()?;
         let store = Arc::new(JobStore::new(temp.path()));
         admit(
             &store,
-            &ready_record("ready-job", serde_json::json!({"prompt": "hello"})),
-        );
+            &ready_record("ready-job", serde_json::json!({"prompt": "hello"}))?,
+        )?;
         let completed = run_job_worker_once(
             Arc::clone(&store),
             Arc::new(JobExecutionRegistry::new()),
             Arc::new(EchoModelProvider::new("done")),
             None,
-            job_context(temp.path()),
+            job_context(temp.path())?,
         )
         .await;
         assert_eq!(completed, 1);
-        let JobOutcome::Succeeded { result } = completion_of(&store, "ready-job") else {
-            panic!("ready job should durably succeed");
+        let JobOutcome::Succeeded { result } = completion_of(&store, "ready-job")? else {
+            return Err(TestError::Unexpected(
+                "ready job should durably succeed".into(),
+            ));
         };
         assert_eq!(result["assistant"], "done");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_run_job_worker_once_blocks_malformed_input_without_calling_model() {
-        let temp = temp_dir();
+    async fn test_run_job_worker_once_blocks_malformed_input_without_calling_model() -> TestResult {
+        let temp = temp_dir()?;
         let store = Arc::new(JobStore::new(temp.path()));
         admit(
             &store,
-            &ready_record("bad-input", serde_json::json!({"prompt": "  "})),
-        );
+            &ready_record("bad-input", serde_json::json!({"prompt": "  "}))?,
+        )?;
         let provider = Arc::new(RecordingModelProvider::new());
         run_job_worker_once(
             Arc::clone(&store),
             Arc::new(JobExecutionRegistry::new()),
             Arc::clone(&provider) as Arc<dyn ModelProvider>,
             None,
-            job_context(temp.path()),
+            job_context(temp.path())?,
         )
         .await;
         assert!(provider.recorded().is_empty());
         assert!(matches!(
-            completion_of(&store, "bad-input"),
+            completion_of(&store, "bad-input")?,
             JobOutcome::Blocked { .. }
         ));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_run_job_worker_once_blocks_a_plan_node_without_task_id_without_calling_model() {
-        let temp = temp_dir();
+    async fn test_run_job_worker_once_blocks_a_plan_node_without_task_id_without_calling_model()
+    -> TestResult {
+        let temp = temp_dir()?;
         let store = Arc::new(JobStore::new(temp.path()));
         let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned())]);
         admit(
@@ -3205,21 +3206,21 @@ mod tests {
             &ready_record_of_kind(
                 "plan-job",
                 JobKind::Custom(PLAN_NODE_JOB_KIND.to_owned()),
-                plan_node_input(None, &contract),
-            ),
-        );
+                plan_node_input(None, &contract)?,
+            )?,
+        )?;
         let provider = Arc::new(RecordingModelProvider::new());
         let services = plan_services(
             temp.path(),
             &[Permission::ReadWorkspace, Permission::WriteWorkspace],
-        );
+        )?;
 
         let completed = run_job_worker_once(
             Arc::clone(&store),
             Arc::new(JobExecutionRegistry::new()),
             Arc::clone(&provider) as Arc<dyn ModelProvider>,
             Some(services),
-            job_context(temp.path()),
+            job_context(temp.path())?,
         )
         .await;
 
@@ -3228,15 +3229,18 @@ mod tests {
             provider.recorded().is_empty(),
             "a malformed plan payload must never reach the model"
         );
-        let JobOutcome::Blocked { reason } = completion_of(&store, "plan-job") else {
-            panic!("a plan job without 'task_id' must block");
+        let JobOutcome::Blocked { reason } = completion_of(&store, "plan-job")? else {
+            return Err(TestError::Unexpected(
+                "a plan job without 'task_id' must block".into(),
+            ));
         };
         assert!(reason.contains("task_id"), "unclear message: {reason}");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_run_job_worker_once_blocks_a_plan_node_without_plan_services() {
-        let temp = temp_dir();
+    async fn test_run_job_worker_once_blocks_a_plan_node_without_plan_services() -> TestResult {
+        let temp = temp_dir()?;
         let store = Arc::new(JobStore::new(temp.path()));
         let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned())]);
         admit(
@@ -3244,9 +3248,9 @@ mod tests {
             &ready_record_of_kind(
                 "orphan-plan-job",
                 JobKind::Custom(PLAN_NODE_JOB_KIND.to_owned()),
-                plan_node_input(Some("t-1"), &contract),
-            ),
-        );
+                plan_node_input(Some("t-1"), &contract)?,
+            )?,
+        )?;
         let provider = Arc::new(RecordingModelProvider::new());
 
         run_job_worker_once(
@@ -3254,20 +3258,23 @@ mod tests {
             Arc::new(JobExecutionRegistry::new()),
             Arc::clone(&provider) as Arc<dyn ModelProvider>,
             None,
-            job_context(temp.path()),
+            job_context(temp.path())?,
         )
         .await;
 
         assert!(provider.recorded().is_empty());
-        let JobOutcome::Blocked { reason } = completion_of(&store, "orphan-plan-job") else {
-            panic!("a plan job without plan services must block, never be skipped");
+        let JobOutcome::Blocked { reason } = completion_of(&store, "orphan-plan-job")? else {
+            return Err(TestError::Unexpected(
+                "a plan job without plan services must block, never be skipped".into(),
+            ));
         };
         assert_eq!(reason, MISSING_PLAN_SERVICES);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_run_job_worker_once_blocks_a_plan_node_missing_from_the_plan() {
-        let temp = temp_dir();
+    async fn test_run_job_worker_once_blocks_a_plan_node_missing_from_the_plan() -> TestResult {
+        let temp = temp_dir()?;
         let store = Arc::new(JobStore::new(temp.path()));
         let contract = contract_for("t-ghost", &[PathRule::Exact("src/lib.rs".to_owned())]);
         admit(
@@ -3275,30 +3282,31 @@ mod tests {
             &ready_record_of_kind(
                 "ghost-plan-job",
                 JobKind::Custom(PLAN_NODE_JOB_KIND.to_owned()),
-                plan_node_input(Some("t-ghost"), &contract),
-            ),
-        );
+                plan_node_input(Some("t-ghost"), &contract)?,
+            )?,
+        )?;
         let provider = Arc::new(RecordingModelProvider::new());
-        let services = plan_services(temp.path(), &[Permission::ReadWorkspace]);
+        let services = plan_services(temp.path(), &[Permission::ReadWorkspace])?;
 
         run_job_worker_once(
             Arc::clone(&store),
             Arc::new(JobExecutionRegistry::new()),
             Arc::clone(&provider) as Arc<dyn ModelProvider>,
             Some(services),
-            job_context(temp.path()),
+            job_context(temp.path())?,
         )
         .await;
 
         assert!(provider.recorded().is_empty());
         assert!(matches!(
-            completion_of(&store, "ghost-plan-job"),
+            completion_of(&store, "ghost-plan-job")?,
             JobOutcome::Blocked { .. }
         ));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_job_execution_registry_uses_the_exact_fenced_token() {
+    async fn test_job_execution_registry_uses_the_exact_fenced_token() -> TestResult {
         use std::time::Duration;
 
         let control = WorkerExecutionControl::new();
@@ -3313,15 +3321,15 @@ mod tests {
         // und bereits ein Trait-Objekt als Argument verlangen — die
         // Unsized-Coercion käme zu spät.
         let control_dyn: Arc<dyn harw_core::ExecutionControl> = control.clone();
-        if let Err(error) = registry.register(token.clone(), control_dyn) {
-            panic!("register: {error}");
-        }
+        registry
+            .register(token.clone(), control_dyn)
+            .map_err(ctx("register"))?;
         assert!(registry.contains(&token));
         control.signal_completion();
-        let cancelled = match registry.cancel(&token, Duration::from_millis(1)).await {
-            Ok(result) => result,
-            Err(error) => panic!("cancel: {error}"),
-        };
+        let cancelled = registry
+            .cancel(&token, Duration::from_millis(1))
+            .await
+            .map_err(ctx("cancel"))?;
         assert_eq!(cancelled, harw_core::CancellationResult::Graceful);
         assert!(!registry.contains(&token));
         assert!(!registry.contains(&harw_job_runtime::LeaseToken {
@@ -3329,6 +3337,7 @@ mod tests {
             epoch: 8,
             nonce: "nonce".to_owned(),
         }));
+        Ok(())
     }
 
     // ── Summary rendering ─────────────────────────────────────────────────
@@ -3347,12 +3356,10 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_node_prompt_states_the_scopes_and_forbids_asking() {
+    fn test_plan_node_prompt_states_the_scopes_and_forbids_asking() -> TestResult {
         let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned())]);
-        let payload = match PlanNodePayload::parse(&plan_node_input(Some("t-1"), &contract)) {
-            Ok(payload) => payload,
-            Err(error) => panic!("bridge payload must parse: {error}"),
-        };
+        let payload = PlanNodePayload::parse(&plan_node_input(Some("t-1"), &contract)?)
+            .map_err(ctx("bridge payload must parse"))?;
         let prompt = plan_node_prompt(&payload);
         assert!(prompt.contains("plan node 't-1'"), "prompt: {prompt}");
         assert!(prompt.contains("src/lib.rs"), "prompt: {prompt}");
@@ -3360,18 +3367,19 @@ mod tests {
             prompt.contains("do not ask for approval"),
             "prompt: {prompt}"
         );
+        Ok(())
     }
 
     // ── Runtime assembly (W2d-2 J1) ───────────────────────────────────────
 
     #[tokio::test]
-    async fn test_prompt_job_without_runtime_root_is_blocked_before_model_call() {
-        let temp = temp_dir();
+    async fn test_prompt_job_without_runtime_root_is_blocked_before_model_call() -> TestResult {
+        let temp = temp_dir()?;
         let store = Arc::new(JobStore::new(temp.path()));
         admit(
             &store,
-            &ready_record("homeless-job", serde_json::json!({"prompt": "hello"})),
-        );
+            &ready_record("homeless-job", serde_json::json!({"prompt": "hello"}))?,
+        )?;
         let provider = Arc::new(RecordingModelProvider::new());
         let context = Arc::new(JobWorkerContext {
             transcript_root: temp.path().to_path_buf(),
@@ -3393,65 +3401,61 @@ mod tests {
             provider.recorded().is_empty(),
             "a worker without a HARW home must never reach the model"
         );
-        let JobOutcome::Blocked { reason } = completion_of(&store, "homeless-job") else {
-            panic!("a prompt job without a runtime root must block");
+        let JobOutcome::Blocked { reason } = completion_of(&store, "homeless-job")? else {
+            return Err(TestError::Unexpected(
+                "a prompt job without a runtime root must block".into(),
+            ));
         };
         assert_eq!(reason, "job runtime requires a HARW home");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_prompt_job_session_id_is_durable_job_id() {
-        let temp = temp_dir();
+    async fn test_prompt_job_session_id_is_durable_job_id() -> TestResult {
+        let temp = temp_dir()?;
         let store = Arc::new(JobStore::new(temp.path()));
         admit(
             &store,
-            &ready_record("session-job", serde_json::json!({"prompt": "hello"})),
-        );
+            &ready_record("session-job", serde_json::json!({"prompt": "hello"}))?,
+        )?;
 
         let completed = run_job_worker_once(
             Arc::clone(&store),
             Arc::new(JobExecutionRegistry::new()),
             Arc::new(EchoModelProvider::new("durable answer")),
             None,
-            job_context(temp.path()),
+            job_context(temp.path())?,
         )
         .await;
 
         assert_eq!(completed, 1);
         assert!(matches!(
-            completion_of(&store, "session-job"),
+            completion_of(&store, "session-job")?,
             JobOutcome::Succeeded { .. }
         ));
         // Der Verlauf liegt unter genau der Wurzel-Session-id `durable-job-<id>`,
         // die die Montage registriert und `new_root_session` akzeptiert hat.
-        let history = match job_state_store(temp.path())
+        let history = job_state_store(temp.path())
             .load_history(&SessionId::from_str("durable-job-session-job"))
             .await
-        {
-            Ok(history) => history,
-            Err(error) => panic!("load durable job history: {error}"),
-        };
+            .map_err(ctx("load durable job history"))?;
         assert_eq!(last_assistant_text(&history), "durable answer");
+        Ok(())
     }
 
     #[test]
-    fn test_plan_node_job_registry_is_narrowed_to_readonly_for_research() {
-        let temp = temp_dir();
+    fn test_plan_node_job_registry_is_narrowed_to_readonly_for_research() -> TestResult {
+        let temp = temp_dir()?;
         let inherited = sandbox_with(
             temp.path(),
             &[Permission::ReadWorkspace, Permission::WriteWorkspace],
-        );
+        )?;
         // The contract asks for writing, but a research node never writes.
         let contract = contract_for("t-1", &[PathRule::DirectoryPrefix("src".to_owned())]);
-        let payload = match PlanNodePayload::parse(&plan_node_input(Some("t-1"), &contract)) {
-            Ok(payload) => payload,
-            Err(error) => panic!("bridge payload must parse: {error}"),
-        };
-        let derived =
-            match derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Research, true) {
-                Ok(derived) => derived,
-                Err(error) => panic!("derivation must succeed: {error}"),
-            };
+        let payload = PlanNodePayload::parse(&plan_node_input(Some("t-1"), &contract)?)
+            .map_err(ctx("bridge payload must parse"))?;
+        let derived = derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Research, true)
+            .map_err(ctx("derivation must succeed"))?;
 
         let (entry, narrowing) = plan_node_narrowing(&payload, PlanNodeKind::Research, &derived);
         assert_eq!(
@@ -3464,8 +3468,8 @@ mod tests {
         assert_eq!(narrowing.registry_profile, RegistryProfile::ReadOnlyExplore);
         assert!(!narrowing.permissions.contains(Permission::WriteWorkspace));
 
-        let runtime = runtime_root_under(temp.path());
-        let assembly = match job_assembly(JobAssemblyInputs {
+        let runtime = runtime_root_under(temp.path())?;
+        let assembly = job_assembly(JobAssemblyInputs {
             entry,
             home: &runtime.home,
             cwd: derived.workspace().canonical_root(),
@@ -3475,10 +3479,8 @@ mod tests {
             job_store: Arc::new(JobStore::new(temp.path())),
             model: Arc::new(EchoModelProvider::new("x")),
             narrowing: Some(narrowing),
-        }) {
-            Ok(assembly) => assembly,
-            Err(error) => panic!("narrowed plan-node assembly must build: {error}"),
-        };
+        })
+        .map_err(ctx("narrowed plan-node assembly must build"))?;
 
         let tools = assembly.rights_snapshot().tools;
         assert!(
@@ -3501,6 +3503,7 @@ mod tests {
         // principal's `PermissionTier` (now `Observer`, see `job_principal`)
         // to gate.
         assert_eq!(assembly.operations().iter().count(), 0);
+        Ok(())
     }
 
     // ── Workspace-root check (W2d-2 J1-F) ─────────────────────────────────
@@ -3512,50 +3515,47 @@ mod tests {
         relative: &str,
         tenant: &str,
         permissions: &[Permission],
-    ) -> SandboxSpec {
-        if let Err(error) = std::fs::create_dir_all(harness_root.join(relative)) {
-            panic!("create workspace '{relative}': {error}");
-        }
+    ) -> TestResult<SandboxSpec> {
+        std::fs::create_dir_all(harness_root.join(relative)).map_err(ctx("create workspace"))?;
         let tenant = TenantId::from_str(tenant);
         let workspace = WorkspaceId::from_str("workspace");
-        let registry = match WorkspaceRegistry::build(
+        let registry = WorkspaceRegistry::build(
             harness_root,
             [WorkspaceRegistration {
                 tenant: tenant.clone(),
                 workspace: workspace.clone(),
                 root: PathBuf::from(relative),
             }],
-        ) {
-            Ok(registry) => registry,
-            Err(error) => panic!("workspace registry: {error}"),
-        };
-        let binding = match registry.resolve(&tenant, &workspace) {
-            Ok(binding) => binding,
-            Err(error) => panic!("resolve workspace: {error}"),
-        };
-        SandboxSpec::from_resolved(
+        )
+        .map_err(ctx("workspace registry"))?;
+        let binding = registry
+            .resolve(&tenant, &workspace)
+            .map_err(ctx("resolve workspace"))?;
+        Ok(SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy(permissions.iter().copied()),
-        )
+        ))
     }
 
     #[test]
-    fn test_ensure_same_workspace_root_rejects_parent_root() {
-        let temp = temp_dir();
+    fn test_ensure_same_workspace_root_rejects_parent_root() -> TestResult {
+        let temp = temp_dir()?;
         // The derived (contract) sandbox is bound to the child directory; the
         // assembly bound its parent — a wider directory, even with fewer rights.
         let read_write = [Permission::ReadWorkspace, Permission::WriteWorkspace];
-        let derived = sandbox_bound_to(temp.path(), "workspace", "tenant", &read_write);
+        let derived = sandbox_bound_to(temp.path(), "workspace", "tenant", &read_write)?;
         let read_only = [Permission::ReadWorkspace];
-        let assembled = sandbox_bound_to(temp.path(), ".", "job-plan-node", &read_only);
+        let assembled = sandbox_bound_to(temp.path(), ".", "job-plan-node", &read_only)?;
         assert_ne!(
             assembled.workspace().canonical_root(),
             derived.workspace().canonical_root()
         );
 
-        let reason = match ensure_same_workspace_root(&assembled, &derived) {
-            Ok(()) => panic!("a parent root must never pass as the derived workspace"),
-            Err(reason) => reason,
+        let result = ensure_same_workspace_root(&assembled, &derived);
+        let Err(reason) = result else {
+            return Err(TestError::Unexpected(
+                "a parent root must never pass as the derived workspace".into(),
+            ));
         };
         assert!(
             reason.starts_with("plan node workspace root mismatch: assembly bound "),
@@ -3565,26 +3565,29 @@ mod tests {
             reason.contains(&derived.workspace().canonical_root().display().to_string()),
             "the required root must be named: {reason}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_ensure_same_workspace_root_accepts_identical_root() {
-        let temp = temp_dir();
+    fn test_ensure_same_workspace_root_accepts_identical_root() -> TestResult {
+        let temp = temp_dir()?;
         // Different tenant alias and permissions, same canonical root: the
         // check is about the bound directory only.
         let read_only = [Permission::ReadWorkspace];
-        let derived = sandbox_bound_to(temp.path(), "workspace", "tenant", &read_only);
-        let assembled = sandbox_bound_to(temp.path(), "workspace", "job-plan-node", &read_only);
+        let derived = sandbox_bound_to(temp.path(), "workspace", "tenant", &read_only)?;
+        let assembled = sandbox_bound_to(temp.path(), "workspace", "job-plan-node", &read_only)?;
 
         assert_eq!(ensure_same_workspace_root(&assembled, &derived), Ok(()));
+        Ok(())
     }
 
     // ── Assembly failure reasons never leak paths (R3) ─────────────────────
 
     #[test]
-    fn test_assemble_job_turn_prompt_assembly_failure_reason_is_fixed_and_path_free() {
-        let temp = temp_dir();
-        let runtime = runtime_root_under(temp.path());
+    fn test_assemble_job_turn_prompt_assembly_failure_reason_is_fixed_and_path_free() -> TestResult
+    {
+        let temp = temp_dir()?;
+        let runtime = runtime_root_under(temp.path())?;
         // A cwd that does not exist fails project discovery
         // (`harw_project_discovery::DiscoveryError::InvalidCwd`), whose
         // `Display` names the offending path verbatim — exactly the detail
@@ -3607,9 +3610,10 @@ mod tests {
             None,
         );
 
-        let reason = match result {
-            Ok(_) => panic!("assembly against a missing cwd must fail"),
-            Err(reason) => reason,
+        let Err(reason) = result else {
+            return Err(TestError::Unexpected(
+                "assembly against a missing cwd must fail".into(),
+            ));
         };
         assert_eq!(reason, RUNTIME_ASSEMBLY_FAILED_REASON);
         assert!(
@@ -3620,17 +3624,18 @@ mod tests {
             !reason.contains("does-not-exist"),
             "the reason must not name the cwd path: {reason}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_plan_node_under_a_marked_parent_directory_binds_the_workspace_root() {
-        let temp = temp_dir();
+    async fn test_plan_node_under_a_marked_parent_directory_binds_the_workspace_root() -> TestResult
+    {
+        let temp = temp_dir()?;
         // A project marker *above* the inherited workspace (`<temp>/workspace`):
         // `discover_project` resolves `<temp>` as the project root. Since R0-F
         // the narrowing binds the sandbox to `<temp>/workspace` regardless.
-        if let Err(error) = std::fs::write(temp.path().join("Cargo.toml"), "[workspace]\n") {
-            panic!("write project marker: {error}");
-        }
+        std::fs::write(temp.path().join("Cargo.toml"), "[workspace]\n")
+            .map_err(ctx("write project marker"))?;
         let store = Arc::new(JobStore::new(temp.path()));
         let contract = contract_for("t-1", &[]);
         admit(
@@ -3638,19 +3643,18 @@ mod tests {
             &ready_record_of_kind(
                 "marked-parent-job",
                 JobKind::Custom(PLAN_NODE_JOB_KIND.to_owned()),
-                plan_node_input(Some("t-1"), &contract),
-            ),
-        );
+                plan_node_input(Some("t-1"), &contract)?,
+            )?,
+        )?;
         let plan = InMemoryPlanStore::new();
-        if let Err(error) = plan.apply(
+        plan.apply(
             PlanAction::Create {
                 plan_id: PlanId::new("p-test"),
                 goal: "test goal".to_owned(),
             },
             "test",
-        ) {
-            panic!("create plan: {error}");
-        }
+        )
+        .map_err(ctx("create plan"))?;
         // C-PLAN: `AddNode` now accepts only `Draft` nodes
         // (`harw-plan/src/validate.rs::validate_add_node`). Insert the node as
         // `Draft` (the fixture default) and move it to `Ready` via the
@@ -3660,7 +3664,7 @@ mod tests {
         node.kind = PlanNodeKind::Research;
         let node_id = node.id.clone();
         let expected_rev = plan.revision();
-        if let Err(error) = plan.apply_batch(
+        plan.apply_batch(
             &PlanId::new("p-test"),
             vec![
                 PlanAction::AddNode { node },
@@ -3672,11 +3676,10 @@ mod tests {
             ],
             "test",
             expected_rev,
-        ) {
-            panic!("add node: {error}");
-        }
+        )
+        .map_err(ctx("add node"))?;
         let plan: Arc<dyn PlanStore> = Arc::new(plan);
-        let inherited = sandbox_with(temp.path(), &[Permission::ReadWorkspace]);
+        let inherited = sandbox_with(temp.path(), &[Permission::ReadWorkspace])?;
         let services = Arc::new(PlanNodeServices::new(
             plan,
             inherited.clone(),
@@ -3689,7 +3692,7 @@ mod tests {
             Arc::new(JobExecutionRegistry::new()),
             Arc::clone(&provider) as Arc<dyn ModelProvider>,
             Some(services),
-            job_context(temp.path()),
+            job_context(temp.path())?,
         )
         .await;
 
@@ -3698,7 +3701,7 @@ mod tests {
             !provider.recorded().is_empty(),
             "a plan node below a marked parent directory must now reach the model"
         );
-        match completion_of(&store, "marked-parent-job") {
+        match completion_of(&store, "marked-parent-job")? {
             JobOutcome::Failed { reason } | JobOutcome::Blocked { reason } => assert!(
                 !reason.starts_with("plan node workspace root mismatch")
                     && !reason.starts_with("could not assemble the job runtime"),
@@ -3710,22 +3713,18 @@ mod tests {
         // The bound root itself: the same narrowing the worker uses binds the
         // assembly's sandbox (and spawn context) to exactly the derived root,
         // while project discovery still stops at the marked parent.
-        let payload = match PlanNodePayload::parse(&plan_node_input(Some("t-1"), &contract)) {
-            Ok(payload) => payload,
-            Err(error) => panic!("bridge payload must parse: {error}"),
-        };
+        let payload = PlanNodePayload::parse(&plan_node_input(Some("t-1"), &contract)?)
+            .map_err(ctx("bridge payload must parse"))?;
         let derived =
-            match derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Research, false) {
-                Ok(derived) => derived,
-                Err(error) => panic!("derivation must succeed: {error}"),
-            };
+            derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Research, false)
+                .map_err(ctx("derivation must succeed"))?;
         let (entry, narrowing) = plan_node_narrowing(&payload, PlanNodeKind::Research, &derived);
         assert_eq!(
             narrowing.workspace_root.as_deref(),
             Some(derived.workspace().canonical_root())
         );
-        let runtime = runtime_root_under(temp.path());
-        let assembly = match job_assembly(JobAssemblyInputs {
+        let runtime = runtime_root_under(temp.path())?;
+        let assembly = job_assembly(JobAssemblyInputs {
             entry,
             home: &runtime.home,
             cwd: derived.workspace().canonical_root(),
@@ -3735,14 +3734,12 @@ mod tests {
             job_store: Arc::new(JobStore::new(temp.path())),
             model: Arc::new(EchoModelProvider::new("x")),
             narrowing: Some(narrowing),
-        }) {
-            Ok(assembly) => assembly,
-            Err(error) => panic!("plan-node assembly below a marked parent must build: {error}"),
-        };
-        let canonical_temp = match temp.path().canonicalize() {
-            Ok(path) => path,
-            Err(error) => panic!("canonicalize temp: {error}"),
-        };
+        })
+        .map_err(ctx("plan-node assembly below a marked parent must build"))?;
+        let canonical_temp = temp
+            .path()
+            .canonicalize()
+            .map_err(ctx("canonicalize temp"))?;
         assert_eq!(assembly.project().project_root, canonical_temp);
         assert_eq!(
             assembly.sandbox().workspace().canonical_root(),
@@ -3761,12 +3758,14 @@ mod tests {
             ensure_same_workspace_root(assembly.sandbox(), &derived),
             Ok(())
         );
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod prompt_claim_guard_tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use harw_core::{EchoModelProvider, RecordingModelProvider};
@@ -3776,11 +3775,8 @@ mod prompt_claim_guard_tests {
 
     // ── Fixtures ──────────────────────────────────────────────────────────
 
-    fn temp_dir() -> tempfile::TempDir {
-        match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(error) => panic!("temp directory: {error}"),
-        }
+    fn temp_dir() -> TestResult<tempfile::TempDir> {
+        tempfile::tempdir().map_err(ctx("temp directory"))
     }
 
     fn operator_scope() -> JobScope {
@@ -3793,7 +3789,12 @@ mod prompt_claim_guard_tests {
         )
     }
 
-    fn record(id: &str, input: serde_json::Value, budget: Budget, scope: JobScope) -> StoredJob {
+    fn record(
+        id: &str,
+        input: serde_json::Value,
+        budget: Budget,
+        scope: JobScope,
+    ) -> TestResult<StoredJob> {
         let now = Timestamp::now();
         let mut job = Job::new(
             WorkId::from_str(id),
@@ -3807,10 +3808,8 @@ mod prompt_claim_guard_tests {
             },
             now,
         );
-        if let Err(error) = job.mark_ready(now) {
-            panic!("mark_ready: {error}");
-        }
-        StoredJob {
+        job.mark_ready(now).map_err(ctx("mark_ready"))?;
+        Ok(StoredJob {
             job,
             scope,
             input,
@@ -3822,35 +3821,38 @@ mod prompt_claim_guard_tests {
             cancellation: None,
             revision: 0,
             trace: None,
-        }
+        })
     }
 
-    fn admit(store: &JobStore, record: &StoredJob) {
-        if let Err(error) = store.admit(record) {
-            panic!("admit: {error}");
-        }
+    fn admit(store: &JobStore, record: &StoredJob) -> TestResult {
+        store.admit(record).map_err(ctx("admit"))?;
+        Ok(())
     }
 
-    fn failure_reason(store: &JobStore, id: &str) -> String {
-        let stored = match store.get(&WorkId::from_str(id)) {
-            Ok(stored) => stored,
-            Err(error) => panic!("get '{id}': {error}"),
-        };
+    fn failure_reason(store: &JobStore, id: &str) -> TestResult<String> {
+        let stored = store.get(&WorkId::from_str(id)).map_err(ctx("get job"))?;
         match stored.completion.map(|completion| completion.outcome) {
-            Some(JobOutcome::Failed { reason }) => reason,
-            other => panic!("job '{id}' must have failed, got {other:?}"),
+            Some(JobOutcome::Failed { reason }) => Ok(reason),
+            other => Err(TestError::Unexpected(format!(
+                "job '{id}' must have failed, got {other:?}"
+            ))),
         }
     }
 
-    async fn run_once(store: &Arc<JobStore>, root: &Path, provider: Arc<dyn ModelProvider>) {
+    async fn run_once(
+        store: &Arc<JobStore>,
+        root: &Path,
+        provider: Arc<dyn ModelProvider>,
+    ) -> TestResult {
         run_job_worker_once(
             Arc::clone(store),
             Arc::new(JobExecutionRegistry::new()),
             provider,
             None,
-            job_context_with_submitters(root, operator_submitters()),
+            job_context_with_submitters(root, operator_submitters())?,
         )
         .await;
+        Ok(())
     }
 
     // Die Einreicher-Menge passend zu `operator_scope` (Operator `operator`).
@@ -3863,35 +3865,30 @@ mod prompt_claim_guard_tests {
     fn job_context_with_submitters(
         root: &Path,
         configured_submitters: Arc<BTreeSet<String>>,
-    ) -> Arc<JobWorkerContext> {
+    ) -> TestResult<Arc<JobWorkerContext>> {
         let home = root.join("runtime-home");
         let cwd = root.join("runtime-cwd");
-        if let Err(error) = harw_home::ensure_home(&home) {
-            panic!("scaffold home: {error}");
-        }
-        if let Err(error) = std::fs::create_dir_all(&cwd) {
-            panic!("create cwd: {error}");
-        }
-        Arc::new(JobWorkerContext {
+        harw_home::ensure_home(&home).map_err(ctx("scaffold home"))?;
+        std::fs::create_dir_all(&cwd).map_err(ctx("create cwd"))?;
+        Ok(Arc::new(JobWorkerContext {
             transcript_root: root.to_path_buf(),
             configured_submitters,
             runtime_root: Some(JobRuntimeRoot { home, cwd }),
-        })
+        }))
     }
 
     // Claimt einen zugelassenen Job als dieser Worker (`WORKER_ID`).
-    fn claim_as_worker(store: &JobStore, id: &str) -> JobClaim {
-        match store.claim(
-            &WorkId::from_str(id),
-            &ClaimRequest {
-                worker_id: WORKER_ID.to_owned(),
-                lease_ttl: SignedDuration::from_secs(LEASE_TTL_SECONDS),
-                now: Timestamp::now(),
-            },
-        ) {
-            Ok(claim) => claim,
-            Err(error) => panic!("claim '{id}': {error}"),
-        }
+    fn claim_as_worker(store: &JobStore, id: &str) -> TestResult<JobClaim> {
+        store
+            .claim(
+                &WorkId::from_str(id),
+                &ClaimRequest {
+                    worker_id: WORKER_ID.to_owned(),
+                    lease_ttl: SignedDuration::from_secs(LEASE_TTL_SECONDS),
+                    now: Timestamp::now(),
+                },
+            )
+            .map_err(ctx("claim"))
     }
 
     fn empty_request() -> harw_core::ModelRequest {
@@ -3944,8 +3941,9 @@ mod prompt_claim_guard_tests {
     // ── Scope ─────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_prompt_job_with_input_addressing_another_workspace_fails_without_model_call() {
-        let temp = temp_dir();
+    async fn test_prompt_job_with_input_addressing_another_workspace_fails_without_model_call()
+    -> TestResult {
+        let temp = temp_dir()?;
         let store = Arc::new(JobStore::new(temp.path()));
         admit(
             &store,
@@ -3954,8 +3952,8 @@ mod prompt_claim_guard_tests {
                 serde_json::json!({"task": "summarize", "workspace": "other-workspace"}),
                 Budget::unbounded(),
                 operator_scope(),
-            ),
-        );
+            )?,
+        )?;
         admit(
             &store,
             &record(
@@ -3963,8 +3961,8 @@ mod prompt_claim_guard_tests {
                 serde_json::json!({"task": "summarize", "scope": {"tenant": "other-tenant"}}),
                 Budget::unbounded(),
                 operator_scope(),
-            ),
-        );
+            )?,
+        )?;
         let provider = Arc::new(RecordingModelProvider::new());
 
         run_once(
@@ -3972,25 +3970,26 @@ mod prompt_claim_guard_tests {
             temp.path(),
             Arc::clone(&provider) as Arc<dyn ModelProvider>,
         )
-        .await;
+        .await?;
 
         assert!(
             provider.recorded().is_empty(),
             "a scope mismatch must never reach the model"
         );
         for id in ["foreign-workspace", "foreign-scope"] {
-            let reason = failure_reason(&store, id);
+            let reason = failure_reason(&store, id)?;
             assert!(reason.starts_with("scope:"), "{id}: {reason}");
             assert!(
                 !reason.contains("other-"),
                 "reason must not echo input: {reason}"
             );
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_prompt_job_with_matching_declared_scope_still_runs() {
-        let temp = temp_dir();
+    async fn test_prompt_job_with_matching_declared_scope_still_runs() -> TestResult {
+        let temp = temp_dir()?;
         let store = Arc::new(JobStore::new(temp.path()));
         admit(
             &store,
@@ -4003,8 +4002,8 @@ mod prompt_claim_guard_tests {
                 }),
                 Budget::unbounded(),
                 operator_scope(),
-            ),
-        );
+            )?,
+        )?;
         let provider = Arc::new(RecordingModelProvider::new());
 
         run_once(
@@ -4012,22 +4011,23 @@ mod prompt_claim_guard_tests {
             temp.path(),
             Arc::clone(&provider) as Arc<dyn ModelProvider>,
         )
-        .await;
+        .await?;
 
         assert_eq!(provider.recorded().len(), 1);
-        let stored = match store.get(&WorkId::from_str("matching-scope")) {
-            Ok(stored) => stored,
-            Err(error) => panic!("get: {error}"),
-        };
+        let stored = store
+            .get(&WorkId::from_str("matching-scope"))
+            .map_err(ctx("get"))?;
         assert!(matches!(
             stored.completion.map(|completion| completion.outcome),
             Some(JobOutcome::Succeeded { .. })
         ));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_prompt_job_from_a_channel_peer_or_malformed_scope_fails_without_model_call() {
-        let temp = temp_dir();
+    async fn test_prompt_job_from_a_channel_peer_or_malformed_scope_fails_without_model_call()
+    -> TestResult {
+        let temp = temp_dir()?;
         let store = Arc::new(JobStore::new(temp.path()));
         admit(
             &store,
@@ -4043,8 +4043,8 @@ mod prompt_claim_guard_tests {
                         peer: PeerId::from_str("peer"),
                     },
                 ),
-            ),
-        );
+            )?,
+        )?;
         admit(
             &store,
             &record(
@@ -4060,8 +4060,8 @@ mod prompt_claim_guard_tests {
                         id: "operator".to_owned(),
                     },
                 ),
-            ),
-        );
+            )?,
+        )?;
         let provider = Arc::new(RecordingModelProvider::new());
 
         run_once(
@@ -4069,18 +4069,19 @@ mod prompt_claim_guard_tests {
             temp.path(),
             Arc::clone(&provider) as Arc<dyn ModelProvider>,
         )
-        .await;
+        .await?;
 
         assert!(provider.recorded().is_empty());
         for id in ["channel-peer", "padded-workspace"] {
-            let reason = failure_reason(&store, id);
+            let reason = failure_reason(&store, id)?;
             assert!(reason.starts_with("scope:"), "{id}: {reason}");
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_prompt_claim_held_by_another_worker_fails_without_model_call() {
-        let temp = temp_dir();
+    async fn test_prompt_claim_held_by_another_worker_fails_without_model_call() -> TestResult {
+        let temp = temp_dir()?;
         let store = JobStore::new(temp.path());
         admit(
             &store,
@@ -4089,19 +4090,18 @@ mod prompt_claim_guard_tests {
                 serde_json::json!({"task": "summarize"}),
                 Budget::unbounded(),
                 operator_scope(),
-            ),
-        );
-        let claim = match store.claim(
-            &WorkId::from_str("foreign-lease"),
-            &ClaimRequest {
-                worker_id: "some-other-worker".to_owned(),
-                lease_ttl: SignedDuration::from_secs(LEASE_TTL_SECONDS),
-                now: Timestamp::now(),
-            },
-        ) {
-            Ok(claim) => claim,
-            Err(error) => panic!("claim: {error}"),
-        };
+            )?,
+        )?;
+        let claim = store
+            .claim(
+                &WorkId::from_str("foreign-lease"),
+                &ClaimRequest {
+                    worker_id: "some-other-worker".to_owned(),
+                    lease_ttl: SignedDuration::from_secs(LEASE_TTL_SECONDS),
+                    now: Timestamp::now(),
+                },
+            )
+            .map_err(ctx("claim"))?;
         let provider = Arc::new(RecordingModelProvider::new());
 
         let outcome = execute_prompt_claim(
@@ -4110,20 +4110,25 @@ mod prompt_claim_guard_tests {
             Arc::clone(&provider) as Arc<dyn ModelProvider>,
             Arc::new(JobStore::new(temp.path())),
             WorkerExecutionControl::new(),
-            &job_context_with_submitters(temp.path(), operator_submitters()),
+            &*job_context_with_submitters(temp.path(), operator_submitters())?,
         )
         .await;
 
         assert!(provider.recorded().is_empty());
         match outcome {
             JobOutcome::Failed { reason } => assert!(reason.starts_with("scope:"), "{reason}"),
-            other => panic!("a foreign claim must fail, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "a foreign claim must fail, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_check_prompt_claim_scope_rejects_unconfigured_submitter() {
-        let temp = temp_dir();
+    fn test_check_prompt_claim_scope_rejects_unconfigured_submitter() -> TestResult {
+        let temp = temp_dir()?;
         let store = JobStore::new(temp.path());
         let input = serde_json::json!({"task": "summarize"});
         admit(
@@ -4133,9 +4138,9 @@ mod prompt_claim_guard_tests {
                 input.clone(),
                 Budget::unbounded(),
                 operator_scope(),
-            ),
-        );
-        let claim = claim_as_worker(&store, "unconfigured");
+            )?,
+        )?;
+        let claim = claim_as_worker(&store, "unconfigured")?;
 
         for submitters in [
             BTreeSet::new(),
@@ -4149,11 +4154,12 @@ mod prompt_claim_guard_tests {
                 "submitters: {submitters:?}"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_check_prompt_claim_scope_accepts_configured_submitter() {
-        let temp = temp_dir();
+    fn test_check_prompt_claim_scope_accepts_configured_submitter() -> TestResult {
+        let temp = temp_dir()?;
         let store = JobStore::new(temp.path());
         let input = serde_json::json!({"task": "summarize"});
         admit(
@@ -4163,20 +4169,22 @@ mod prompt_claim_guard_tests {
                 input.clone(),
                 Budget::unbounded(),
                 operator_scope(),
-            ),
-        );
-        let claim = claim_as_worker(&store, "configured");
+            )?,
+        )?;
+        let claim = claim_as_worker(&store, "configured")?;
         let submitters = BTreeSet::from(["alpha".to_owned(), "operator".to_owned()]);
 
         assert_eq!(
             check_prompt_claim_scope(&claim, &input, &submitters),
             Ok(())
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_run_job_worker_once_unconfigured_submitter_fails_without_model_call() {
-        let temp = temp_dir();
+    async fn test_run_job_worker_once_unconfigured_submitter_fails_without_model_call() -> TestResult
+    {
+        let temp = temp_dir()?;
         let store = Arc::new(JobStore::new(temp.path()));
         admit(
             &store,
@@ -4185,8 +4193,8 @@ mod prompt_claim_guard_tests {
                 serde_json::json!({"prompt": "hello"}),
                 Budget::unbounded(),
                 operator_scope(),
-            ),
-        );
+            )?,
+        )?;
         let provider = Arc::new(RecordingModelProvider::new());
 
         let completed = run_job_worker_once(
@@ -4197,7 +4205,7 @@ mod prompt_claim_guard_tests {
             job_context_with_submitters(
                 temp.path(),
                 Arc::new(BTreeSet::from(["someone-else".to_owned()])),
-            ),
+            )?,
         )
         .await;
 
@@ -4208,16 +4216,17 @@ mod prompt_claim_guard_tests {
             "an unconfigured submitter must never reach the model"
         );
         assert_eq!(
-            failure_reason(&store, "removed-principal"),
+            failure_reason(&store, "removed-principal")?,
             "scope: Einreicher ist kein konfigurierter MCP-Principal"
         );
+        Ok(())
     }
 
     // ── Budget ────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_prompt_job_over_its_token_budget_fails_with_a_budget_reason() {
-        let temp = temp_dir();
+    async fn test_prompt_job_over_its_token_budget_fails_with_a_budget_reason() -> TestResult {
+        let temp = temp_dir()?;
         let store = Arc::new(JobStore::new(temp.path()));
         admit(
             &store,
@@ -4230,8 +4239,8 @@ mod prompt_claim_guard_tests {
                     max_tool_calls: None,
                 },
                 operator_scope(),
-            ),
-        );
+            )?,
+        )?;
 
         // `EchoModelProvider` meldet je Aufruf mindestens 1 Input- und 1
         // Output-Token (`approx(..).max(1)`), also mehr als das Limit 1.
@@ -4240,15 +4249,16 @@ mod prompt_claim_guard_tests {
             temp.path(),
             Arc::new(EchoModelProvider::new("done")),
         )
-        .await;
+        .await?;
 
-        let reason = failure_reason(&store, "token-overrun");
+        let reason = failure_reason(&store, "token-overrun")?;
         assert!(reason.starts_with("budget:"), "{reason}");
         assert!(reason.contains("tokens"), "{reason}");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_token_ledger_refuses_every_model_round_after_an_overrun() {
+    async fn test_token_ledger_refuses_every_model_round_after_an_overrun() -> TestResult {
         let inner = Arc::new(FixedUsageProvider {
             calls: AtomicUsize::new(0),
             tokens_per_call: 10,
@@ -4273,7 +4283,9 @@ mod prompt_claim_guard_tests {
             "20 tokens exceed the limit of 15"
         );
         let Some(reason) = ledger.exceeded() else {
-            panic!("the overrun must close the ledger");
+            return Err(TestError::Unexpected(
+                "the overrun must close the ledger".into(),
+            ));
         };
         assert!(reason.starts_with("budget:"), "{reason}");
         assert!(budgeted.respond(empty_request()).await.is_err());
@@ -4282,6 +4294,7 @@ mod prompt_claim_guard_tests {
             2,
             "a closed ledger must never reach the inner provider"
         );
+        Ok(())
     }
 
     #[tokio::test]
@@ -4310,8 +4323,8 @@ mod prompt_claim_guard_tests {
     }
 
     #[tokio::test]
-    async fn test_prompt_job_over_its_wall_clock_budget_fails_and_stops_the_turn() {
-        let temp = temp_dir();
+    async fn test_prompt_job_over_its_wall_clock_budget_fails_and_stops_the_turn() -> TestResult {
+        let temp = temp_dir()?;
         let store = Arc::new(JobStore::new(temp.path()));
         admit(
             &store,
@@ -4324,8 +4337,8 @@ mod prompt_claim_guard_tests {
                     max_tool_calls: None,
                 },
                 operator_scope(),
-            ),
-        );
+            )?,
+        )?;
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = Arc::new(NeverRespondingProvider {
             calls: Arc::clone(&calls),
@@ -4336,9 +4349,14 @@ mod prompt_claim_guard_tests {
             run_once(&store, temp.path(), provider),
         )
         .await;
-        assert!(finished.is_ok(), "the wall-clock budget must end the job");
+        let Ok(run_result) = finished else {
+            return Err(TestError::Unexpected(
+                "the wall-clock budget must end the job".into(),
+            ));
+        };
+        run_result?;
 
-        let reason = failure_reason(&store, "wall-overrun");
+        let reason = failure_reason(&store, "wall-overrun")?;
         assert!(reason.starts_with("budget:"), "{reason}");
         assert!(reason.contains("wall-clock"), "{reason}");
         let calls_at_failure = calls.load(Ordering::SeqCst);
@@ -4349,6 +4367,7 @@ mod prompt_claim_guard_tests {
             calls_at_failure,
             "the aborted turn must not call the model again"
         );
+        Ok(())
     }
 
     #[test]
@@ -4376,44 +4395,38 @@ mod prompt_claim_guard_tests {
     }
 
     #[test]
-    fn test_prompt_wall_allowance_is_bounded_by_budget_and_lease() {
+    fn test_prompt_wall_allowance_is_bounded_by_budget_and_lease() -> TestResult {
         let now = Timestamp::now();
-        let lease = match Lease::acquire(
+        let lease = Lease::acquire(
             WorkId::from_str("wall"),
             WORKER_ID,
             now,
             SignedDuration::from_secs(120),
-        ) {
-            Ok(lease) => lease,
-            Err(error) => panic!("lease: {error}"),
-        };
+        )
+        .map_err(ctx("lease"))?;
         let budget = |wall: SignedDuration| Budget {
             max_tokens: Some(1),
             max_wall: Some(wall),
             max_tool_calls: Some(1),
         };
 
-        let short = match prompt_wall_allowance(
+        let short = prompt_wall_allowance(
             &budget(SignedDuration::from_secs(10)),
             &BudgetUsage::default(),
             &lease,
             now,
-        ) {
-            Ok(allowance) => allowance,
-            Err(reason) => panic!("{reason}"),
-        };
+        )
+        .map_err(TestError::Unexpected)?;
         assert_eq!(short.duration, std::time::Duration::from_secs(10));
         assert!(short.reason.starts_with("budget:"), "{}", short.reason);
 
-        let long = match prompt_wall_allowance(
+        let long = prompt_wall_allowance(
             &budget(SignedDuration::from_secs(600)),
             &BudgetUsage::default(),
             &lease,
             now,
-        ) {
-            Ok(allowance) => allowance,
-            Err(reason) => panic!("{reason}"),
-        };
+        )
+        .map_err(TestError::Unexpected)?;
         assert_eq!(
             long.duration,
             std::time::Duration::from_secs((120 - PROMPT_LEASE_COMMIT_MARGIN_SECONDS) as u64)
@@ -4436,5 +4449,6 @@ mod prompt_claim_guard_tests {
             lease.expires_at,
         );
         assert!(matches!(expired, Err(ref reason) if reason.starts_with("lease:")));
+        Ok(())
     }
 }

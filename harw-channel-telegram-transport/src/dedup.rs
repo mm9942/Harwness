@@ -54,11 +54,14 @@ impl DedupWindow {
         }
 
         if state.order.len() == self.capacity {
-            let evicted = state
-                .order
-                .pop_front()
-                .expect("full dedup window has an oldest identifier");
-            state.ids.remove(&evicted);
+            // `order.len() == self.capacity` und `self.capacity > 0` (siehe
+            // frühe Rückkehr oben) garantieren gemeinsam ein nicht-leeres
+            // `order`; `pop_front()` liefert trotzdem `Option`, damit hier
+            // ohne `.expect()` (Bible R087) ausgekommen wird — ein `None`
+            // ließe die Eviction schlicht entfallen, statt zu paniken.
+            if let Some(evicted) = state.order.pop_front() {
+                state.ids.remove(&evicted);
+            }
         }
 
         state.order.push_back(update_id);

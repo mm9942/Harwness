@@ -545,6 +545,7 @@ impl PromotionScore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use time::{Duration, OffsetDateTime};
 
     /// Erzeugt ein minimales `EpistemicSignal` für Tests.
@@ -569,38 +570,41 @@ mod tests {
 
     // 1. Serde: Provenance-Variante → snake_case-Tag
     #[test]
-    fn provenance_kebab_serde() {
+    fn provenance_kebab_serde() -> TestResult {
         let p = Provenance::UserCorrection {
             session_id: "s1".to_owned(),
             replaces: Some("old-id".to_owned()),
         };
-        let json = serde_json::to_string(&p).expect("serialize");
+        let json = serde_json::to_string(&p).map_err(ctx("serialize"))?;
         assert!(
             json.contains("\"user_correction\""),
             "erwarteter Tag 'user_correction' fehlt in: {json}"
         );
-        let back: Provenance = serde_json::from_str(&json).expect("deserialize");
+        let back: Provenance = serde_json::from_str(&json).map_err(ctx("deserialize"))?;
         assert_eq!(back, p);
+        Ok(())
     }
 
     // 2. Serde: Validity::Expired Roundtrip
     #[test]
-    fn validity_expired_serde() {
+    fn validity_expired_serde() -> TestResult {
         let v = Validity::Expired;
-        let json = serde_json::to_string(&v).expect("serialize");
-        let back: Validity = serde_json::from_str(&json).expect("deserialize");
+        let json = serde_json::to_string(&v).map_err(ctx("serialize"))?;
+        let back: Validity = serde_json::from_str(&json).map_err(ctx("deserialize"))?;
         assert_eq!(back, v);
+        Ok(())
     }
 
     // 3. Serde: MemoryScope::Project Roundtrip
     #[test]
-    fn scope_project_serde() {
+    fn scope_project_serde() -> TestResult {
         let s = MemoryScope::Project {
             id: "harwness".to_owned(),
         };
-        let json = serde_json::to_string(&s).expect("serialize");
-        let back: MemoryScope = serde_json::from_str(&json).expect("deserialize");
+        let json = serde_json::to_string(&s).map_err(ctx("serialize"))?;
+        let back: MemoryScope = serde_json::from_str(&json).map_err(ctx("deserialize"))?;
         assert_eq!(back, s);
+        Ok(())
     }
 
     // 4. Hohe salience + confirmations + correction → total >= 80
@@ -739,7 +743,7 @@ mod tests {
 
     // 11. Vollständiges EpistemicSignal JSON-Roundtrip
     #[test]
-    fn signal_serde_roundtrip() {
+    fn signal_serde_roundtrip() -> TestResult {
         let now = OffsetDateTime::now_utc();
         let sig = EpistemicSignal {
             id: "roundtrip-1".to_owned(),
@@ -761,8 +765,8 @@ mod tests {
             salience: 90,
         };
 
-        let json = serde_json::to_string_pretty(&sig).expect("serialize");
-        let back: EpistemicSignal = serde_json::from_str(&json).expect("deserialize");
+        let json = serde_json::to_string_pretty(&sig).map_err(ctx("serialize"))?;
+        let back: EpistemicSignal = serde_json::from_str(&json).map_err(ctx("deserialize"))?;
 
         assert_eq!(back.id, sig.id);
         assert_eq!(back.statement, sig.statement);
@@ -775,6 +779,7 @@ mod tests {
         assert_eq!(back.contradictions, sig.contradictions);
         assert_eq!(back.outcome, sig.outcome);
         assert_eq!(back.scope, sig.scope);
+        Ok(())
     }
 
     // 12. Confidence-Ordnung

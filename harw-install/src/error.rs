@@ -545,6 +545,7 @@ pub type PathResult<T> = Result<T, PathError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     fn io_err() -> std::io::Error {
         std::io::Error::new(std::io::ErrorKind::NotFound, "fehlt")
@@ -591,14 +592,20 @@ mod tests {
     }
 
     #[test]
-    fn test_update_error_display_and_from_serde() {
-        let serde_err = serde_json::from_str::<u32>("nope").unwrap_err();
+    fn test_update_error_display_and_from_serde() -> TestResult {
+        let parse_result = serde_json::from_str::<u32>("nope");
+        let Err(serde_err) = parse_result else {
+            return Err(TestError::Unexpected(
+                "ungültiges JSON muss als Err geparst werden".to_owned(),
+            ));
+        };
         let e: UpdateError = serde_err.into();
         assert!(
             e.to_string()
                 .starts_with("Versionsdaten nicht lesbar (JSON):")
         );
         assert!(e.source().is_some());
+        Ok(())
     }
 
     #[test]
@@ -614,14 +621,20 @@ mod tests {
     }
 
     #[test]
-    fn test_migration_error_from_toml() {
-        let toml_err = "a = = 1".parse::<toml_edit::DocumentMut>().unwrap_err();
+    fn test_migration_error_from_toml() -> TestResult {
+        let parse_result = "a = = 1".parse::<toml_edit::DocumentMut>();
+        let Err(toml_err) = parse_result else {
+            return Err(TestError::Unexpected(
+                "ungültiges TOML muss als Err geparst werden".to_owned(),
+            ));
+        };
         let e: MigrationError = toml_err.into();
         assert!(
             e.to_string()
                 .starts_with("Konfiguration nicht lesbar (TOML):")
         );
         assert!(e.source().is_some());
+        Ok(())
     }
 
     #[test]

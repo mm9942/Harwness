@@ -1295,12 +1295,16 @@ fn pause_label(outcome: &TurnOutcome) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use harw_agent_dsl::roles::AgentRoleId;
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_core::{
         InMemoryStateStore, ModelFuture, ModelRequest, ModelResponse, SpawnContext, run_turn,
     };
@@ -1308,7 +1312,6 @@ mod tests {
         ExtensionRegistry, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName,
         ToolOutput, ToolProvider, ToolSpec,
     };
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_tools::serde_json::{Value, json};
     use harw_tools::{FunctionToolSpec, JsonSchema};
     use harw_types::{AgentRole, ApprovalActor, TenantId, WorkspaceId};
@@ -1420,7 +1423,7 @@ mod tests {
     // ── Fixtures ─────────────────────────────────────────────────────────────
 
     /// Sandbox auf einem eindeutigen Temp-Verzeichnis (Muster aus `app.rs`).
-    fn test_sandbox() -> SandboxSpec {
+    fn test_sandbox() -> TestResult<SandboxSpec> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -1441,26 +1444,23 @@ mod tests {
                 workspace: WorkspaceId::from_str("workspace"),
                 root: PathBuf::from("workspace"),
             }],
-        );
-        let Ok(registry) = registry else {
-            panic!("workspace registry must build for the approval tests");
-        };
-        let binding = registry.resolve(
-            &TenantId::from_str("tui-approval-test"),
-            &WorkspaceId::from_str("workspace"),
-        );
-        let Ok(binding) = binding else {
-            panic!("test workspace must resolve");
-        };
-        SandboxSpec::from_resolved(
+        )
+        .map_err(ctx("workspace registry must build for the approval tests"))?;
+        let binding = registry
+            .resolve(
+                &TenantId::from_str("tui-approval-test"),
+                &WorkspaceId::from_str("workspace"),
+            )
+            .map_err(ctx("test workspace must resolve"))?;
+        Ok(SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ReadWorkspace, Permission::WriteWorkspace]),
-        )
+        ))
     }
 
-    fn test_spawn_context() -> SpawnContext {
-        SpawnContext {
-            sandbox: test_sandbox(),
+    fn test_spawn_context() -> TestResult<SpawnContext> {
+        Ok(SpawnContext {
+            sandbox: test_sandbox()?,
             suggestions: None,
             capability_snapshot: None,
             approval_actor: Some(ApprovalActor::Operator {
@@ -1472,14 +1472,14 @@ mod tests {
             trace: None,
             // Generic fixture — not exercising context-ceiling propagation.
             ceiling: None,
-        }
+        })
     }
 
     /// Baut eine Session mit dem Zähl-Werkzeug und dem übergebenen Handler.
     fn test_session(
         handler: &Arc<TuiApprovalHandler>,
         executions: &Arc<AtomicUsize>,
-    ) -> AgentSession {
+    ) -> TestResult<AgentSession> {
         // Methodensyntax, nicht `Arc::clone(handler)`: bei der UFCS-Form würde
         // der Typparameter aus dem erwarteten Typ inferiert (`T = dyn
         // ApprovalHandler`) und bereits ein `&Arc<dyn ApprovalHandler>`
@@ -1496,8 +1496,10 @@ mod tests {
         // sendet best-effort (`let _ = tx.send(..)`), ein geschlossener Kanal
         // ist damit unschädlich und für diese Tests bedeutungslos.
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        AgentSession::new(AgentRole::Assistant, None, registry, event_tx)
-            .with_spawn_context(test_spawn_context())
+        Ok(
+            AgentSession::new(AgentRole::Assistant, None, registry, event_tx)
+                .with_spawn_context(test_spawn_context()?),
+        )
     }
 
     fn write_call(path: &str) -> Value {
@@ -1507,9 +1509,9 @@ mod tests {
     /// Baut eine [`PendingApproval`] mit einem weit in der Zukunft liegenden
     /// `timeout_at` — für Tests, die den Treiber unabhängig von der
     /// kernseitigen Ablauffrist beobachten wollen.
-    fn test_pending_approval(path: &str) -> PendingApproval {
+    fn test_pending_approval(path: &str) -> TestResult<PendingApproval> {
         let requested_at = jiff::Timestamp::now();
-        PendingApproval {
+        Ok(PendingApproval {
             call: ToolCall {
                 id: ToolCallId::new(),
                 name: ToolName::new(WRITE_TOOL),
@@ -1522,8 +1524,8 @@ mod tests {
             requested_at,
             timeout_at: requested_at
                 .checked_add(jiff::SignedDuration::from_secs(3600))
-                .expect("one hour from now stays in range"),
-        }
+                .map_err(ctx("one hour from now stays in range"))?,
+        })
     }
 
     /// Treibt den Turn und beantwortet dabei jede eintreffende Frage.
@@ -1608,7 +1610,7 @@ mod tests {
     /// W1-08: `review` fragt nach einer Entscheidung, hat dabei aber **keinen**
     /// Seiteneffekt — kein Prompt, kein Eintrag in der Rückkanal-Tabelle.
     #[tokio::test]
-    async fn test_review_in_scope_call_asks_user_without_side_effects() {
+    async fn test_review_in_scope_call_asks_user_without_side_effects() -> TestResult {
         let (handler, mut prompts) = TuiApprovalHandler::with_scope(ApprovalScope::AllTools);
         let call = ToolCall {
             id: ToolCallId::new(),
@@ -1619,7 +1621,9 @@ mod tests {
         let decision = handler.review(&call).await;
 
         let ApprovalDecision::AskUser(request) = decision else {
-            panic!("an in-scope call must ask the user");
+            return Err(TestError::Unexpected(
+                "an in-scope call must ask the user".into(),
+            ));
         };
         assert!(
             prompts.try_recv().is_err(),
@@ -1627,6 +1631,7 @@ mod tests {
         );
         assert!(!handler.has_pending(&request));
         assert_eq!(handler.pending_len(), 0);
+        Ok(())
     }
 
     /// Mehrfaches `review` (Handler-Aggregation im Kern, Vorprüfung mehrerer
@@ -1651,20 +1656,25 @@ mod tests {
     /// Der Treiber stellt die Frage aus dem Pausenzustand nach — genau einmal,
     /// auch wenn `review` sie nicht geöffnet hat.
     #[tokio::test]
-    async fn test_driver_opens_the_prompt_that_review_no_longer_opens() {
+    async fn test_driver_opens_the_prompt_that_review_no_longer_opens() -> TestResult {
         let (handler, mut prompts) = TuiApprovalHandler::with_scope(ApprovalScope::AllTools);
         let driver = ApprovalDriver::new(Arc::clone(&handler));
-        let pending = test_pending_approval("a.txt");
+        let pending = test_pending_approval("a.txt")?;
 
         // Der erste Poll öffnet die Frage; danach wartet der Treiber auf die
         // Antwort (der Zeitablauf hier ist nur das Poll-Signal, nicht der
         // Freigabe-Timeout des Handlers).
         let mut resolve = Box::pin(driver.resolve(&pending));
         let polled = tokio::time::timeout(Duration::from_millis(50), &mut resolve).await;
-        assert!(polled.is_err(), "ohne Antwort darf der Treiber nicht fertig werden");
+        assert!(
+            polled.is_err(),
+            "ohne Antwort darf der Treiber nicht fertig werden"
+        );
 
         let Ok(prompt) = prompts.try_recv() else {
-            panic!("der Treiber muss die Frage nachstellen");
+            return Err(TestError::Unexpected(
+                "der Treiber muss die Frage nachstellen".into(),
+            ));
         };
         assert_eq!(prompt.tool_name(), WRITE_TOOL);
         assert!(prompt.arguments_json().contains("a.txt"));
@@ -1673,21 +1683,22 @@ mod tests {
         let resolution = resolve.await;
         assert!(matches!(resolution, ApprovalResolution::Approve));
         assert!(prompts.try_recv().is_err(), "genau eine Frage, nicht zwei");
+        Ok(())
     }
 
     /// Eine bereits zu `timeout_at` abgelaufene Pause wird sofort als
     /// Zeitablauf abgelehnt — ohne eine neue Frage zu öffnen und ohne eine
     /// frische Wartezeit zu eröffnen (Interaktionsvertrag §4.4).
     #[tokio::test]
-    async fn test_resolve_denies_immediately_when_the_core_deadline_already_passed() {
+    async fn test_resolve_denies_immediately_when_the_core_deadline_already_passed() -> TestResult {
         let (handler, mut prompts) = TuiApprovalHandler::with_scope(ApprovalScope::AllTools);
         let driver = ApprovalDriver::new(Arc::clone(&handler));
-        let mut pending = test_pending_approval("a.txt");
+        let mut pending = test_pending_approval("a.txt")?;
         // `timeout_at` liegt bereits in der Vergangenheit.
         pending.timeout_at = pending
             .requested_at
             .checked_sub(jiff::SignedDuration::from_secs(1))
-            .expect("one second before requested_at stays in range");
+            .map_err(ctx("one second before requested_at stays in range"))?;
 
         let resolution = driver.resolve(&pending).await;
 
@@ -1696,6 +1707,7 @@ mod tests {
             prompts.try_recv().is_err(),
             "eine bereits abgelaufene Pause darf keine neue Frage öffnen"
         );
+        Ok(())
     }
 
     #[tokio::test]
@@ -1731,7 +1743,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_await_resolution_treats_a_dropped_prompt_as_rejection() {
+    async fn test_await_resolution_treats_a_dropped_prompt_as_rejection() -> TestResult {
         let (handler, mut prompts) = TuiApprovalHandler::with_scope(ApprovalScope::AllTools);
         let request = ItemId::new();
         let call = ToolCall {
@@ -1742,20 +1754,23 @@ mod tests {
         assert!(handler.open_prompt(&request, &call));
 
         let Ok(prompt) = prompts.try_recv() else {
-            panic!("the prompt must be queued");
+            return Err(TestError::Unexpected("the prompt must be queued".into()));
         };
         drop(prompt); // UI schließt die Frage ohne Antwort.
 
         let resolution = handler.await_resolution(&request).await;
 
         let ApprovalResolution::Reject { reason } = resolution else {
-            panic!("a dropped prompt must never approve");
+            return Err(TestError::Unexpected(
+                "a dropped prompt must never approve".into(),
+            ));
         };
         assert_eq!(reason, REASON_ANSWER_DROPPED);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_await_resolution_rejects_after_the_timeout_elapses() {
+    async fn test_await_resolution_rejects_after_the_timeout_elapses() -> TestResult {
         let (handler, mut prompts) = TuiApprovalHandler::with_scope_and_timeout(
             ApprovalScope::AllTools,
             Duration::from_millis(20),
@@ -1774,31 +1789,35 @@ mod tests {
         let resolution = handler.await_resolution(&request).await;
 
         let ApprovalResolution::Reject { reason } = resolution else {
-            panic!("a timed-out prompt must never approve");
+            return Err(TestError::Unexpected(
+                "a timed-out prompt must never approve".into(),
+            ));
         };
         assert_eq!(reason, harw_core::APPROVAL_TIMEOUT_REASON);
+        Ok(())
     }
 
     /// `DEFAULT_APPROVAL_TIMEOUT` (TUI-Fallback) muss mit der kernseitigen
     /// Politik übereinstimmen — sonst driften zwei „Vorgabe"-Fristen
     /// auseinander, obwohl der Kern längst die einzige Quelle sein soll.
     #[test]
-    fn test_default_approval_timeout_matches_the_core_policy() {
+    fn test_default_approval_timeout_matches_the_core_policy() -> TestResult {
         let tui_default_secs =
-            i64::try_from(DEFAULT_APPROVAL_TIMEOUT.as_secs()).expect("300 fits in i64");
+            i64::try_from(DEFAULT_APPROVAL_TIMEOUT.as_secs()).map_err(ctx("300 fits in i64"))?;
         assert_eq!(
             jiff::SignedDuration::from_secs(tui_default_secs),
             harw_core::DEFAULT_APPROVAL_TIMEOUT
         );
+        Ok(())
     }
 
     // ── Treiber: Freigabe / Ablehnung ────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_approved_call_runs_the_tool_and_completes_the_turn() {
+    async fn test_approved_call_runs_the_tool_and_completes_the_turn() -> TestResult {
         let executions = Arc::new(AtomicUsize::new(0));
         let (handler, mut prompts) = TuiApprovalHandler::with_scope(ApprovalScope::AllTools);
-        let mut session = test_session(&handler, &executions);
+        let mut session = test_session(&handler, &executions)?;
         let store = InMemoryStateStore::new();
         let model = ScriptedModel::new(vec![
             ScriptedModel::tool_response(WRITE_TOOL, write_call("a.txt")),
@@ -1808,7 +1827,9 @@ mod tests {
 
         let Ok(outcome) = run_turn(&mut session, &model, &store, TurnInput::user("write a")).await
         else {
-            panic!("the first turn leg must reach the approval pause");
+            return Err(TestError::Unexpected(
+                "the first turn leg must reach the approval pause".into(),
+            ));
         };
         assert!(matches!(outcome, TurnOutcome::AwaitingApproval { .. }));
 
@@ -1824,7 +1845,7 @@ mod tests {
         .await;
 
         let Ok(final_outcome) = result else {
-            panic!("an approved turn must finish");
+            return Err(TestError::Unexpected("an approved turn must finish".into()));
         };
         assert!(matches!(final_outcome, TurnOutcome::Completed));
         assert_eq!(asked, 1);
@@ -1833,13 +1854,14 @@ mod tests {
             1,
             "an approved tool must run exactly once"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_rejected_call_ends_the_turn_without_running_the_tool() {
+    async fn test_rejected_call_ends_the_turn_without_running_the_tool() -> TestResult {
         let executions = Arc::new(AtomicUsize::new(0));
         let (handler, mut prompts) = TuiApprovalHandler::with_scope(ApprovalScope::AllTools);
-        let mut session = test_session(&handler, &executions);
+        let mut session = test_session(&handler, &executions)?;
         let store = InMemoryStateStore::new();
         let model = ScriptedModel::new(vec![
             ScriptedModel::tool_response(WRITE_TOOL, write_call("a.txt")),
@@ -1849,7 +1871,9 @@ mod tests {
 
         let Ok(outcome) = run_turn(&mut session, &model, &store, TurnInput::user("write a")).await
         else {
-            panic!("the first turn leg must reach the approval pause");
+            return Err(TestError::Unexpected(
+                "the first turn leg must reach the approval pause".into(),
+            ));
         };
 
         let (result, asked) = drive_answering(
@@ -1866,7 +1890,9 @@ mod tests {
         .await;
 
         let Ok(final_outcome) = result else {
-            panic!("a rejected turn must still finish cleanly");
+            return Err(TestError::Unexpected(
+                "a rejected turn must still finish cleanly".into(),
+            ));
         };
         assert!(matches!(final_outcome, TurnOutcome::Completed));
         assert_eq!(asked, 1);
@@ -1875,14 +1901,16 @@ mod tests {
             0,
             "a rejected tool must never run"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_closed_prompt_channel_counts_as_rejection_and_still_ends_the_turn() {
+    async fn test_closed_prompt_channel_counts_as_rejection_and_still_ends_the_turn() -> TestResult
+    {
         // Der wichtigste Test dieser Datei: keine UI ⇒ keine Freigabe.
         let executions = Arc::new(AtomicUsize::new(0));
         let (handler, prompts) = TuiApprovalHandler::with_scope(ApprovalScope::AllTools);
-        let mut session = test_session(&handler, &executions);
+        let mut session = test_session(&handler, &executions)?;
         let store = InMemoryStateStore::new();
         let model = ScriptedModel::new(vec![
             ScriptedModel::tool_response(WRITE_TOOL, write_call("a.txt")),
@@ -1894,7 +1922,9 @@ mod tests {
 
         let Ok(outcome) = run_turn(&mut session, &model, &store, TurnInput::user("write a")).await
         else {
-            panic!("the turn must survive a dead prompt channel");
+            return Err(TestError::Unexpected(
+                "the turn must survive a dead prompt channel".into(),
+            ));
         };
 
         // Der Handler hat inline abgelehnt (`Deny`), der Turn ist deshalb gar
@@ -1909,13 +1939,14 @@ mod tests {
         // Und auch der Treiber selbst hätte eine Pause abgelehnt:
         let resolution = handler.await_resolution(&ItemId::new()).await;
         assert!(matches!(resolution, ApprovalResolution::Reject { .. }));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_prompt_dropped_mid_turn_rejects_and_ends_the_turn() {
+    async fn test_prompt_dropped_mid_turn_rejects_and_ends_the_turn() -> TestResult {
         let executions = Arc::new(AtomicUsize::new(0));
         let (handler, mut prompts) = TuiApprovalHandler::with_scope(ApprovalScope::AllTools);
-        let mut session = test_session(&handler, &executions);
+        let mut session = test_session(&handler, &executions)?;
         let store = InMemoryStateStore::new();
         let model = ScriptedModel::new(vec![
             ScriptedModel::tool_response(WRITE_TOOL, write_call("a.txt")),
@@ -1925,7 +1956,9 @@ mod tests {
 
         let Ok(outcome) = run_turn(&mut session, &model, &store, TurnInput::user("write a")).await
         else {
-            panic!("the first turn leg must reach the approval pause");
+            return Err(TestError::Unexpected(
+                "the first turn leg must reach the approval pause".into(),
+            ));
         };
 
         // `answers` ist leer ⇒ die Frage wird fallengelassen.
@@ -1941,20 +1974,23 @@ mod tests {
         .await;
 
         let Ok(final_outcome) = result else {
-            panic!("a dropped prompt must still end the turn");
+            return Err(TestError::Unexpected(
+                "a dropped prompt must still end the turn".into(),
+            ));
         };
         assert!(matches!(final_outcome, TurnOutcome::Completed));
         assert_eq!(asked, 1);
         assert_eq!(executions.load(Ordering::SeqCst), 0);
+        Ok(())
     }
 
     // ── Treiber: Schleife ────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_two_approvals_in_one_turn_both_run_through_the_loop() {
+    async fn test_two_approvals_in_one_turn_both_run_through_the_loop() -> TestResult {
         let executions = Arc::new(AtomicUsize::new(0));
         let (handler, mut prompts) = TuiApprovalHandler::with_scope(ApprovalScope::AllTools);
-        let mut session = test_session(&handler, &executions);
+        let mut session = test_session(&handler, &executions)?;
         let store = InMemoryStateStore::new();
         let model = ScriptedModel::new(vec![
             ScriptedModel::tool_response(WRITE_TOOL, write_call("first.txt")),
@@ -1966,7 +2002,9 @@ mod tests {
         let Ok(outcome) =
             run_turn(&mut session, &model, &store, TurnInput::user("write both")).await
         else {
-            panic!("the first turn leg must reach the approval pause");
+            return Err(TestError::Unexpected(
+                "the first turn leg must reach the approval pause".into(),
+            ));
         };
 
         let (result, asked) = drive_answering(
@@ -1984,7 +2022,9 @@ mod tests {
         .await;
 
         let Ok(final_outcome) = result else {
-            panic!("both approvals must drive the turn to completion");
+            return Err(TestError::Unexpected(
+                "both approvals must drive the turn to completion".into(),
+            ));
         };
         assert!(matches!(final_outcome, TurnOutcome::Completed));
         assert_eq!(asked, 2, "the loop must ask a second time, not just once");
@@ -1993,20 +2033,23 @@ mod tests {
             2,
             "both approved writes must run"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_resume_limit_trips_and_reports_a_clear_error() {
+    async fn test_resume_limit_trips_and_reports_a_clear_error() -> TestResult {
         let executions = Arc::new(AtomicUsize::new(0));
         let (handler, mut prompts) = TuiApprovalHandler::with_scope(ApprovalScope::AllTools);
-        let mut session = test_session(&handler, &executions);
+        let mut session = test_session(&handler, &executions)?;
         let store = InMemoryStateStore::new();
         let model = LoopingToolModel;
         let driver = ApprovalDriver::with_max_resumes(Arc::clone(&handler), 3);
 
         let Ok(outcome) = run_turn(&mut session, &model, &store, TurnInput::user("loop")).await
         else {
-            panic!("the first turn leg must reach the approval pause");
+            return Err(TestError::Unexpected(
+                "the first turn leg must reach the approval pause".into(),
+            ));
         };
 
         // Jede Frage wird abgelehnt; das Modell fragt trotzdem erneut.
@@ -2028,10 +2071,14 @@ mod tests {
         .await;
 
         let Err(error) = result else {
-            panic!("an endlessly pausing turn must not spin forever");
+            return Err(TestError::Unexpected(
+                "an endlessly pausing turn must not spin forever".into(),
+            ));
         };
         let ApprovalDriverError::ResumeLimitExceeded { limit, last_pause } = error else {
-            panic!("the limit must be reported as its own error variant");
+            return Err(TestError::Unexpected(
+                "the limit must be reported as its own error variant".into(),
+            ));
         };
         assert_eq!(limit, 3);
         assert_eq!(last_pause, "awaiting approval");
@@ -2047,6 +2094,7 @@ mod tests {
             0,
             "no rejected tool may run"
         );
+        Ok(())
     }
 
     // ── Fehlerdarstellung ────────────────────────────────────────────────────
@@ -2121,15 +2169,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_child_result_without_a_driver_is_an_error_result_not_a_hang() {
+    async fn test_child_result_without_a_driver_is_an_error_result_not_a_hang() -> TestResult {
         let store = InMemoryStateStore::new();
         let result =
             ApprovalDriver::child_result(None, &SessionId::new(), "reviewer", &store).await;
 
         let ToolCallResult::Error { message } = result else {
-            panic!("a missing child driver must produce an error result");
+            return Err(TestError::Unexpected(
+                "a missing child driver must produce an error result".into(),
+            ));
         };
         assert!(message.contains("reviewer"));
+        Ok(())
     }
 
     #[tokio::test]
@@ -2148,10 +2199,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_child_pause_resumes_the_parent_turn_through_the_same_loop() {
+    async fn test_child_pause_resumes_the_parent_turn_through_the_same_loop() -> TestResult {
         let executions = Arc::new(AtomicUsize::new(0));
         let (handler, _prompts) = TuiApprovalHandler::new();
-        let mut session = test_session(&handler, &executions);
+        let mut session = test_session(&handler, &executions)?;
         let store = InMemoryStateStore::new();
         let model = ScriptedModel::new(vec![ModelResponse::text("parent turn resumed")]);
         let driver = ApprovalDriver::new(Arc::clone(&handler));
@@ -2178,10 +2229,13 @@ mod tests {
             .await;
 
         let Ok(final_outcome) = result else {
-            panic!("a returning child must drive the parent turn to completion");
+            return Err(TestError::Unexpected(
+                "a returning child must drive the parent turn to completion".into(),
+            ));
         };
         assert!(matches!(final_outcome, TurnOutcome::Completed));
         assert_eq!(children.calls.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 
     // ── Konstruktion ─────────────────────────────────────────────────────────
@@ -2195,7 +2249,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handler_debug_output_never_contains_arguments() {
+    fn test_handler_debug_output_never_contains_arguments() -> TestResult {
         let (handler, mut prompts) = TuiApprovalHandler::with_scope(ApprovalScope::AllTools);
         let request = ItemId::new();
         let call = ToolCall {
@@ -2206,7 +2260,7 @@ mod tests {
         assert!(handler.open_prompt(&request, &call));
 
         let Ok(prompt) = prompts.try_recv() else {
-            panic!("the prompt must be queued");
+            return Err(TestError::Unexpected("the prompt must be queued".into()));
         };
         let rendered = format!("{prompt:?}");
         assert!(
@@ -2215,5 +2269,6 @@ mod tests {
         );
         assert!(rendered.contains(WRITE_TOOL));
         assert!(format!("{handler:?}").contains("AllTools"));
+        Ok(())
     }
 }

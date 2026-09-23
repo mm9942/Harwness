@@ -164,14 +164,17 @@ impl AnthropicMessagesProvider {
     /// # Returns
     /// Einen einsatzbereiten [`AnthropicMessagesProvider`] mit
     /// [`DEFAULT_MAX_TOKENS`].
-    #[must_use]
+    ///
+    /// # Errors
+    /// [`super::HttpProviderError::ClientBuild`] aus [`super::http_client`],
+    /// wenn der geteilte `reqwest::Client` nicht gebaut werden kann.
     pub fn new(
         messages_url: impl Into<String>,
         model: impl Into<String>,
         credential: AnthropicCredential,
-    ) -> Self {
-        Self {
-            client: super::http_client(),
+    ) -> super::HttpProviderResult<Self> {
+        Ok(Self {
+            client: super::http_client()?,
             messages_url: messages_url.into(),
             provider_id: "anthropic".to_owned(),
             model: model.into(),
@@ -182,7 +185,7 @@ impl AnthropicMessagesProvider {
             rate_limiter: std::sync::Arc::new(crate::rate_limiter::ProviderRateLimiter::new(None)),
             concurrency_limiter: None,
             credential_pool: None,
-        }
+        })
     }
 
     /// Baut einen Provider aus Basis-URL + Modell + Credential.
@@ -190,12 +193,14 @@ impl AnthropicMessagesProvider {
     /// # Description
     /// Setzt die Endpoint-URL über [`anthropic_messages_url`] zusammen (inkl.
     /// Trailing-Slash- und doppel-`/v1`-Normalisierung).
-    #[must_use]
+    ///
+    /// # Errors
+    /// Siehe [`Self::new`].
     pub fn from_base(
         base_url: &str,
         model: impl Into<String>,
         credential: AnthropicCredential,
-    ) -> Self {
+    ) -> super::HttpProviderResult<Self> {
         Self::new(anthropic_messages_url(base_url), model, credential)
     }
 
@@ -843,7 +848,8 @@ impl AnthropicMessagesProvider {
     ) -> Result<ModelResponse, ModelError> {
         let (credential, messages_url) = self.request_target(credential_idx);
         let model = self.selected_model(&request)?;
-        let strategy = crate::cache_strategy::resolve_cache_strategy(&self.provider_id, model, None);
+        let strategy =
+            crate::cache_strategy::resolve_cache_strategy(&self.provider_id, model, None);
         let mut wire = build_messages_body(model, self.max_tokens, &request);
         crate::cache_strategy::apply_messages_cache_control(&mut wire, strategy);
         tracing::debug!(
@@ -1054,6 +1060,7 @@ impl crate::ProviderLoadControl for AnthropicMessagesProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn request_with_ids(model_id: Option<&str>, provider_id: Option<&str>) -> ModelRequest {
         ModelRequest {
@@ -1070,48 +1077,67 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         }
     }
 
-    fn test_provider() -> AnthropicMessagesProvider {
+    fn test_provider() -> TestResult<AnthropicMessagesProvider> {
         AnthropicMessagesProvider::new(
             "https://example.test/v1/messages",
             "configured-model",
             AnthropicCredential::ApiKey(SecretString::new("sk-secret".into())),
         )
+        .map_err(ctx("AnthropicMessagesProvider::new"))
     }
 
     #[test]
-    fn test_parse_anthropic_custom_headers_accepts_gateway_headers() {
+    fn test_parse_anthropic_custom_headers_accepts_gateway_headers() -> TestResult {
         let headers = parse_anthropic_custom_headers(
             "cf-aig-authorization: Bearer gateway-token, cf-aig-metadata: tenant=test",
         )
-        .expect("valid gateway headers");
+        .map_err(ctx("valid gateway headers"))?;
 
         assert_eq!(headers.len(), 2);
         assert_eq!(headers[0].0.as_str(), "cf-aig-authorization");
-        assert_eq!(headers[0].1.to_str().unwrap(), "Bearer gateway-token");
+        assert_eq!(
+            headers[0].1.to_str().map_err(ctx("header value to_str"))?,
+            "Bearer gateway-token"
+        );
         assert_eq!(headers[1].0.as_str(), "cf-aig-metadata");
-        assert_eq!(headers[1].1.to_str().unwrap(), "tenant=test");
+        assert_eq!(
+            headers[1].1.to_str().map_err(ctx("header value to_str"))?,
+            "tenant=test"
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_parse_anthropic_custom_headers_rejects_malformed_entry_redacted() {
-        let error = parse_anthropic_custom_headers("cf-aig-authorization").unwrap_err();
+    fn test_parse_anthropic_custom_headers_rejects_malformed_entry_redacted() -> TestResult {
+        let Err(error) = parse_anthropic_custom_headers("cf-aig-authorization") else {
+            return Err(TestError::Unexpected(
+                "malformed header entry must be rejected".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
             ModelError::RequestFailed(message)
                 if message == INVALID_CUSTOM_HEADERS_ERROR
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_anthropic_custom_headers_rejects_crlf_injection_without_echoing_value() {
+    fn test_parse_anthropic_custom_headers_rejects_crlf_injection_without_echoing_value()
+    -> TestResult {
         let malicious_value = "Bearer gateway-token\r\nX-Injected: true";
-        let error =
+        let Err(error) =
             parse_anthropic_custom_headers(&format!("cf-aig-authorization: {malicious_value}"))
-                .unwrap_err();
+        else {
+            return Err(TestError::Unexpected(
+                "CRLF-injected header entry must be rejected".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
@@ -1120,43 +1146,51 @@ mod tests {
                     && !message.contains("gateway-token")
                     && !message.contains("X-Injected")
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_selected_model_uses_requested_model_for_compatible_provider() {
-        let provider = test_provider();
+    fn test_selected_model_uses_requested_model_for_compatible_provider() -> TestResult {
+        let provider = test_provider()?;
         let request = request_with_ids(Some("requested-model"), Some("anthropic"));
 
         assert_eq!(
-            provider.selected_model(&request).unwrap(),
+            provider
+                .selected_model(&request)
+                .map_err(ctx("selected_model"))?,
             "requested-model"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_provider_uses_default_bounded_request_timeout() {
-        let provider = test_provider();
+    fn test_provider_uses_default_bounded_request_timeout() -> TestResult {
+        let provider = test_provider()?;
 
         assert_eq!(
             provider.request_timeout,
             super::super::DEFAULT_REQUEST_TIMEOUT
         );
+        Ok(())
     }
 
     #[test]
-    fn test_selected_model_preserves_configured_default_for_empty_identifiers() {
-        let provider = test_provider();
+    fn test_selected_model_preserves_configured_default_for_empty_identifiers() -> TestResult {
+        let provider = test_provider()?;
         let request = request_with_ids(Some(""), Some(""));
 
         assert_eq!(
-            provider.selected_model(&request).unwrap(),
+            provider
+                .selected_model(&request)
+                .map_err(ctx("selected_model"))?,
             "configured-model"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_selected_model_rejects_provider_mismatch() {
-        let provider = test_provider();
+    fn test_selected_model_rejects_provider_mismatch() -> TestResult {
+        let provider = test_provider()?;
         let request = request_with_ids(Some("requested-model"), Some("openai"));
 
         assert!(matches!(
@@ -1164,6 +1198,7 @@ mod tests {
             Err(ModelError::RequestFailed(message))
                 if message.contains("openai") && message.contains("anthropic")
         ));
+        Ok(())
     }
 
     #[test]
@@ -1199,7 +1234,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_messages_body_shape() {
+    fn test_build_messages_body_shape() -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Hi there");
         let request = ModelRequest {
@@ -1216,6 +1251,7 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
 
         let body = build_messages_body("claude-sonnet-5", 1024, &request);
@@ -1231,7 +1267,7 @@ mod tests {
         let messages = body
             .get("messages")
             .and_then(Value::as_array)
-            .expect("messages array");
+            .ok_or(TestError::Missing("messages array"))?;
         assert_eq!(messages.len(), 1);
         assert_eq!(
             messages[0].get("role").and_then(Value::as_str),
@@ -1241,6 +1277,7 @@ mod tests {
             messages[0].get("content").and_then(Value::as_str),
             Some("Hi there")
         );
+        Ok(())
     }
 
     #[test]
@@ -1261,6 +1298,7 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
         let body = build_messages_body("m", 256, &request);
         assert!(body.get("system").is_none());
@@ -1284,6 +1322,7 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
 
         let body = build_messages_body("claude-opus-4-8", 1024, &request);
@@ -1309,6 +1348,7 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
 
         let body = build_messages_body("anthropic-deployment-alias", 1024, &request);
@@ -1335,6 +1375,7 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
 
         let body = build_messages_body("claude-opus-4-8", 1024, &request);
@@ -1361,6 +1402,7 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         }
     }
 
@@ -1477,7 +1519,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_messages_body_includes_tools_when_present() {
+    fn test_build_messages_body_includes_tools_when_present() -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("weather?");
         let request = ModelRequest {
@@ -1494,13 +1536,14 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
 
         let body = build_messages_body("claude-sonnet-5", 256, &request);
         let tools = body
             .get("tools")
             .and_then(Value::as_array)
-            .expect("tools array");
+            .ok_or(TestError::Missing("tools array"))?;
         assert_eq!(tools.len(), 1);
         assert_eq!(
             tools[0].get("name").and_then(Value::as_str),
@@ -1517,12 +1560,14 @@ mod tests {
                 .and_then(Value::as_str),
             Some("object")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_build_messages_body_sanitizes_dotted_tool_name_in_tools_and_history() {
+    fn test_build_messages_body_sanitizes_dotted_tool_name_in_tools_and_history() -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
-        let call_id = harw_types::ToolCallId::try_from_str("call-1").expect("valid call id");
+        let call_id =
+            harw_types::ToolCallId::try_from_str("call-1").map_err(ctx("valid call id"))?;
         history.push_tool_call(call_id, "fs.read", serde_json::json!({"path": "/tmp"}));
         let dotted_tool = ToolSpec::Function(harw_tools::FunctionToolSpec {
             name: ToolName::new("fs.read"),
@@ -1547,6 +1592,7 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
 
         let body = build_messages_body("claude-sonnet-5", 256, &request);
@@ -1554,7 +1600,7 @@ mod tests {
         let tools = body
             .get("tools")
             .and_then(Value::as_array)
-            .expect("tools array");
+            .ok_or(TestError::Missing("tools array"))?;
         assert_eq!(
             tools[0].get("name").and_then(Value::as_str),
             Some("fs_read")
@@ -1563,12 +1609,12 @@ mod tests {
         let messages = body
             .get("messages")
             .and_then(Value::as_array)
-            .expect("messages array");
+            .ok_or(TestError::Missing("messages array"))?;
         let tool_use_block = messages[0]
             .get("content")
             .and_then(Value::as_array)
             .and_then(|content| content.first())
-            .expect("tool_use content block");
+            .ok_or(TestError::Missing("tool_use content block"))?;
         assert_eq!(
             tool_use_block.get("type").and_then(Value::as_str),
             Some("tool_use")
@@ -1577,6 +1623,7 @@ mod tests {
             tool_use_block.get("name").and_then(Value::as_str),
             Some("fs_read")
         );
+        Ok(())
     }
 
     #[test]
@@ -1597,13 +1644,14 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
         let body = build_messages_body("m", 256, &request);
         assert!(body.get("tools").is_none());
     }
 
     #[test]
-    fn test_build_messages_body_maps_tool_call_to_tool_use_block() {
+    fn test_build_messages_body_maps_tool_call_to_tool_use_block() -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
         history.push_tool_call(
             harw_types::ToolCallId::from_str("call_1"),
@@ -1624,12 +1672,13 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
         let body = build_messages_body("m", 256, &request);
         let messages = body
             .get("messages")
             .and_then(Value::as_array)
-            .expect("messages");
+            .ok_or(TestError::Missing("messages"))?;
         assert_eq!(messages.len(), 1);
         assert_eq!(
             messages[0].get("role").and_then(Value::as_str),
@@ -1638,7 +1687,7 @@ mod tests {
         let content = messages[0]
             .get("content")
             .and_then(Value::as_array)
-            .expect("content array");
+            .ok_or(TestError::Missing("content array"))?;
         assert_eq!(
             content[0].get("type").and_then(Value::as_str),
             Some("tool_use")
@@ -1655,10 +1704,11 @@ mod tests {
                 .and_then(Value::as_str),
             Some("Paris")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_build_messages_body_maps_tool_result_ok_to_tool_result_block() {
+    fn test_build_messages_body_maps_tool_result_ok_to_tool_result_block() -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
         history.push_tool_result(
             harw_types::ToolCallId::from_str("call_1"),
@@ -1679,12 +1729,13 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
         let body = build_messages_body("m", 256, &request);
         let messages = body
             .get("messages")
             .and_then(Value::as_array)
-            .expect("messages");
+            .ok_or(TestError::Missing("messages"))?;
         assert_eq!(
             messages[0].get("role").and_then(Value::as_str),
             Some("user")
@@ -1692,7 +1743,7 @@ mod tests {
         let content = messages[0]
             .get("content")
             .and_then(Value::as_array)
-            .expect("content array");
+            .ok_or(TestError::Missing("content array"))?;
         assert_eq!(
             content[0].get("type").and_then(Value::as_str),
             Some("tool_result")
@@ -1702,10 +1753,11 @@ mod tests {
             Some("call_1")
         );
         assert!(content[0].get("is_error").is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_build_messages_body_maps_tool_result_err_sets_is_error() {
+    fn test_build_messages_body_maps_tool_result_err_sets_is_error() -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
         history.push_tool_result(
             harw_types::ToolCallId::from_str("call_1"),
@@ -1726,16 +1778,17 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
         let body = build_messages_body("m", 256, &request);
         let messages = body
             .get("messages")
             .and_then(Value::as_array)
-            .expect("messages");
+            .ok_or(TestError::Missing("messages"))?;
         let content = messages[0]
             .get("content")
             .and_then(Value::as_array)
-            .expect("content array");
+            .ok_or(TestError::Missing("content array"))?;
         assert_eq!(
             content[0].get("content").and_then(Value::as_str),
             Some("boom")
@@ -1744,10 +1797,12 @@ mod tests {
             content[0].get("is_error").and_then(Value::as_bool),
             Some(true)
         );
+        Ok(())
     }
 
     #[test]
-    fn test_build_messages_body_groups_parallel_tool_calls_and_results_alternate_roles() {
+    fn test_build_messages_body_groups_parallel_tool_calls_and_results_alternate_roles()
+    -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
         history.push_tool_call(
             harw_types::ToolCallId::from_str("call_a"),
@@ -1783,12 +1838,13 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
         let body = build_messages_body("m", 256, &request);
         let messages = body
             .get("messages")
             .and_then(Value::as_array)
-            .expect("messages");
+            .ok_or(TestError::Missing("messages"))?;
 
         // one grouped assistant message, one grouped user (tool_result) message.
         assert_eq!(messages.len(), 2);
@@ -1800,7 +1856,7 @@ mod tests {
         let assistant_content = messages[0]
             .get("content")
             .and_then(Value::as_array)
-            .expect("assistant content array");
+            .ok_or(TestError::Missing("assistant content array"))?;
         assert_eq!(assistant_content.len(), 2);
         assert_eq!(
             assistant_content[0].get("type").and_then(Value::as_str),
@@ -1822,7 +1878,7 @@ mod tests {
         let user_content = messages[1]
             .get("content")
             .and_then(Value::as_array)
-            .expect("user content array");
+            .ok_or(TestError::Missing("user content array"))?;
         assert_eq!(user_content.len(), 2);
         assert_eq!(
             user_content[0].get("type").and_then(Value::as_str),
@@ -1836,10 +1892,11 @@ mod tests {
             user_content[1].get("tool_use_id").and_then(Value::as_str),
             Some("call_b")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_build_messages_body_grouped_tool_result_keeps_is_error_flag() {
+    fn test_build_messages_body_grouped_tool_result_keeps_is_error_flag() -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
         history.push_tool_call(
             harw_types::ToolCallId::from_str("call_a"),
@@ -1875,25 +1932,27 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
         let body = build_messages_body("m", 256, &request);
         let messages = body
             .get("messages")
             .and_then(Value::as_array)
-            .expect("messages");
+            .ok_or(TestError::Missing("messages"))?;
         let user_content = messages[1]
             .get("content")
             .and_then(Value::as_array)
-            .expect("user content array");
+            .ok_or(TestError::Missing("user content array"))?;
         assert!(user_content[0].get("is_error").is_none());
         assert_eq!(
             user_content[1].get("is_error").and_then(Value::as_bool),
             Some(true)
         );
+        Ok(())
     }
 
     #[test]
-    fn test_build_messages_body_assistant_text_message_does_not_absorb_tool_use() {
+    fn test_build_messages_body_assistant_text_message_does_not_absorb_tool_use() -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
         history.push_assistant_text("here you go", None);
         history.push_tool_call(
@@ -1915,12 +1974,13 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         };
         let body = build_messages_body("m", 256, &request);
         let messages = body
             .get("messages")
             .and_then(Value::as_array)
-            .expect("messages");
+            .ok_or(TestError::Missing("messages"))?;
 
         // Text message keeps a string `content`; the tool_use block must land in
         // a separate, new assistant message rather than being appended to it.
@@ -1929,7 +1989,12 @@ mod tests {
             messages[0].get("role").and_then(Value::as_str),
             Some("assistant")
         );
-        assert!(messages[0].get("content").expect("content").is_string());
+        assert!(
+            messages[0]
+                .get("content")
+                .ok_or(TestError::Missing("content"))?
+                .is_string()
+        );
 
         assert_eq!(
             messages[1].get("role").and_then(Value::as_str),
@@ -1938,15 +2003,16 @@ mod tests {
         let content = messages[1]
             .get("content")
             .and_then(Value::as_array)
-            .expect("content array");
+            .ok_or(TestError::Missing("content array"))?;
         assert_eq!(
             content[0].get("type").and_then(Value::as_str),
             Some("tool_use")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_extract_anthropic_tool_calls_parses_tool_use_blocks() {
+    fn test_extract_anthropic_tool_calls_parses_tool_use_blocks() -> TestResult {
         let body = serde_json::json!({
             "content": [
                 { "type": "text", "text": "Let me check." },
@@ -1958,7 +2024,7 @@ mod tests {
                 }
             ]
         });
-        let calls = extract_anthropic_tool_calls(&body).expect("valid tool-use input");
+        let calls = extract_anthropic_tool_calls(&body).map_err(ctx("valid tool-use input"))?;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id.as_str(), "toolu_01");
         assert_eq!(calls[0].name.as_str(), "get_weather");
@@ -1966,16 +2032,18 @@ mod tests {
             calls[0].arguments.get("location").and_then(Value::as_str),
             Some("Paris")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_extract_anthropic_tool_calls_empty_when_no_tool_use() {
+    fn test_extract_anthropic_tool_calls_empty_when_no_tool_use() -> TestResult {
         let body = serde_json::json!({ "content": [{ "type": "text", "text": "hi" }] });
         assert!(
             extract_anthropic_tool_calls(&body)
-                .expect("no tool-use blocks")
+                .map_err(ctx("no tool-use blocks"))?
                 .is_empty()
         );
+        Ok(())
     }
 
     #[test]
@@ -2088,7 +2156,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_anthropic_tool_calls_accepts_empty_object_input() {
+    fn test_extract_anthropic_tool_calls_accepts_empty_object_input() -> TestResult {
         let body = serde_json::json!({
             "content": [{
                 "type": "tool_use",
@@ -2098,7 +2166,8 @@ mod tests {
             }]
         });
 
-        let calls = extract_anthropic_tool_calls(&body).expect("empty object is valid input");
+        let calls =
+            extract_anthropic_tool_calls(&body).map_err(ctx("empty object is valid input"))?;
         assert_eq!(calls.len(), 1);
         assert!(
             calls[0]
@@ -2106,10 +2175,11 @@ mod tests {
                 .as_object()
                 .is_some_and(|object| object.is_empty())
         );
+        Ok(())
     }
 
     #[test]
-    fn anthropic_credential_headers_are_marked_sensitive() {
+    fn anthropic_credential_headers_are_marked_sensitive() -> TestResult {
         let secret = "sk-ant-sensitive-header-value";
         for (credential, header_name) in [
             (
@@ -2125,32 +2195,39 @@ mod tests {
                 "authorization",
             ),
         ] {
-            let builder = super::super::http_client().post("https://api.anthropic.com/v1/messages");
+            let builder = super::super::http_client()
+                .map_err(ctx("http_client"))?
+                .post("https://api.anthropic.com/v1/messages");
             let request = apply_anthropic_credential(builder, &credential)
-                .expect("credential header")
+                .map_err(ctx("credential header"))?
                 .build()
-                .expect("request builds");
-            let value = request.headers().get(header_name).expect(header_name);
+                .map_err(ctx("request builds"))?;
+            let value = request
+                .headers()
+                .get(header_name)
+                .ok_or(TestError::Missing(header_name))?;
             assert!(value.is_sensitive(), "{header_name}");
             assert!(!format!("{:?}", request.headers()).contains(secret));
         }
+        Ok(())
     }
 
     #[test]
-    fn official_anthropic_host_matches_default_base_url() {
+    fn official_anthropic_host_matches_default_base_url() -> TestResult {
         assert_eq!(
             reqwest::Url::parse(DEFAULT_ANTHROPIC_BASE_URL)
-                .expect("default base URL")
+                .map_err(ctx("default base URL"))?
                 .host_str(),
             Some(ANTHROPIC_API_HOST)
         );
+        Ok(())
     }
 
     // ── Nebenläufigkeit & Rate-Limit-Sichtbarkeit (W6b-Parität für Anthropic) ──
 
     #[test]
-    fn set_max_concurrency_applies_immediately_to_available_permits() {
-        let mut provider = test_provider();
+    fn set_max_concurrency_applies_immediately_to_available_permits() -> TestResult {
+        let mut provider = test_provider()?;
         provider.configure_concurrency(None);
 
         assert!(
@@ -2160,15 +2237,17 @@ mod tests {
         let status = crate::ProviderLoadControl::provider_status(&provider);
         assert_eq!(status.max_concurrency, Some(2));
         assert_eq!(status.available_permits, 2);
+        Ok(())
     }
 
     #[test]
-    fn provider_load_control_reports_false_without_configured_limiter() {
-        let provider = test_provider();
+    fn provider_load_control_reports_false_without_configured_limiter() -> TestResult {
+        let provider = test_provider()?;
         assert!(!crate::ProviderLoadControl::set_max_concurrency(
             &provider,
             Some(2)
         ));
+        Ok(())
     }
 
     /// Startet einen Mock-HTTP-Server, der pro Verbindung einen eigenen
@@ -2180,33 +2259,35 @@ mod tests {
     /// private Test-Fixture von `lib.rs` hat.
     fn mock_anthropic_concurrency_probe_server(
         request_count: usize,
-    ) -> (
+    ) -> TestResult<(
         String,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        std::thread::JoinHandle<()>,
-    ) {
+        std::thread::JoinHandle<TestResult>,
+    )> {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::thread;
 
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("bind mock server"))?;
         let base_url = format!(
             "http://{}/v1/messages",
-            listener.local_addr().expect("mock address")
+            listener.local_addr().map_err(ctx("mock address"))?
         );
         let in_flight = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let peak_for_thread = Arc::clone(&peak);
-        let handle = thread::spawn(move || {
+        let handle = thread::spawn(move || -> TestResult {
             let mut connection_handles = Vec::with_capacity(request_count);
             for _ in 0..request_count {
-                let (mut stream, _) = listener.accept().expect("accept mock request");
+                let (mut stream, _) = listener.accept().map_err(ctx("accept mock request"))?;
                 let in_flight = Arc::clone(&in_flight);
                 let peak = Arc::clone(&peak_for_thread);
-                connection_handles.push(thread::spawn(move || {
+                connection_handles.push(thread::spawn(move || -> TestResult {
                     let mut request_buffer = [0_u8; 4096];
-                    let _read = stream.read(&mut request_buffer).expect("read mock request");
+                    let _read = stream
+                        .read(&mut request_buffer)
+                        .map_err(ctx("read mock request"))?;
                     let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(current, Ordering::SeqCst);
                     // Künstliche Latenz, damit gleichzeitig eingehende
@@ -2221,29 +2302,36 @@ mod tests {
                     );
                     stream
                         .write_all(headers.as_bytes())
-                        .expect("write mock response headers");
-                    stream.write_all(body).expect("write mock response body");
+                        .map_err(ctx("write mock response headers"))?;
+                    stream
+                        .write_all(body)
+                        .map_err(ctx("write mock response body"))?;
+                    Ok(())
                 }));
             }
             for handle in connection_handles {
-                handle.join().expect("mock connection handler completes");
+                handle.join().map_err(|_| {
+                    TestError::Unexpected("mock connection handler panicked".to_owned())
+                })??;
             }
+            Ok(())
         });
-        (base_url, peak, handle)
+        Ok((base_url, peak, handle))
     }
 
     #[tokio::test]
-    async fn respond_honors_max_concurrency_hard_cap() {
+    async fn respond_honors_max_concurrency_hard_cap() -> TestResult {
         const MAX_CONCURRENCY: usize = 2;
         const REQUEST_COUNT: usize = 5;
 
-        let (base_url, peak, server) = mock_anthropic_concurrency_probe_server(REQUEST_COUNT);
+        let (base_url, peak, server) = mock_anthropic_concurrency_probe_server(REQUEST_COUNT)?;
 
         let mut provider = AnthropicMessagesProvider::new(
             base_url,
             "configured-model",
             AnthropicCredential::ApiKey(SecretString::new("sk-secret".into())),
-        );
+        )
+        .map_err(ctx("AnthropicMessagesProvider::new"))?;
         provider.configure_concurrency(Some(MAX_CONCURRENCY));
         let provider = Arc::new(provider);
 
@@ -2254,61 +2342,77 @@ mod tests {
                 provider
                     .respond(request_with_ids(None, None))
                     .await
-                    .expect("mock anthropic response parses")
+                    .map(|_| ())
+                    .map_err(ctx("mock anthropic response parses"))
             }));
         }
         for handle in handles {
-            handle.await.expect("respond task completes");
+            handle.await.map_err(ctx("respond task completes"))??;
         }
-        server.join().expect("mock server completes");
+        server
+            .join()
+            .map_err(|_| TestError::Unexpected("mock server thread panicked".to_owned()))??;
 
         assert!(
             peak.load(std::sync::atomic::Ordering::SeqCst) <= MAX_CONCURRENCY,
             "observed more than {MAX_CONCURRENCY} requests in flight simultaneously"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn respond_records_rate_limited_count_on_429() {
+    async fn respond_records_rate_limited_count_on_429() -> TestResult {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::thread;
 
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("bind mock server"))?;
         let base_url = format!(
             "http://{}/v1/messages",
-            listener.local_addr().expect("mock address")
+            listener.local_addr().map_err(ctx("mock address"))?
         );
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept mock request");
+        let server = thread::spawn(move || -> TestResult {
+            let (mut stream, _) = listener.accept().map_err(ctx("accept mock request"))?;
             let mut request_buffer = [0_u8; 4096];
-            let _read = stream.read(&mut request_buffer).expect("read mock request");
-            let body = br#"{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}"#;
+            let _read = stream
+                .read(&mut request_buffer)
+                .map_err(ctx("read mock request"))?;
+            let body =
+                br#"{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}"#;
             let headers = format!(
                 "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nretry-after: 1\r\n\r\n",
                 body.len()
             );
             stream
                 .write_all(headers.as_bytes())
-                .expect("write mock response headers");
-            stream.write_all(body).expect("write mock response body");
+                .map_err(ctx("write mock response headers"))?;
+            stream
+                .write_all(body)
+                .map_err(ctx("write mock response body"))?;
+            Ok(())
         });
 
         let provider = AnthropicMessagesProvider::new(
             base_url,
             "configured-model",
             AnthropicCredential::ApiKey(SecretString::new("sk-secret".into())),
-        );
+        )
+        .map_err(ctx("AnthropicMessagesProvider::new"))?;
 
         assert_eq!(provider.rate_limiter_handle().rate_limited_count(), 0);
-        let error = provider
-            .respond(request_with_ids(None, None))
-            .await
-            .expect_err("429 must surface as an error");
+        let response = provider.respond(request_with_ids(None, None)).await;
+        let Err(error) = response else {
+            return Err(TestError::Unexpected(
+                "429 must surface as an error".to_owned(),
+            ));
+        };
         assert!(matches!(error, ModelError::RateLimited { .. }));
         assert_eq!(provider.rate_limiter_handle().rate_limited_count(), 1);
 
-        server.join().expect("mock server completes");
-    }
+        server
+            .join()
+            .map_err(|_| TestError::Unexpected("mock server thread panicked".to_owned()))??;
 
+        Ok(())
+    }
 }

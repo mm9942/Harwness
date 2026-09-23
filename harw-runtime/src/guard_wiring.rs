@@ -34,7 +34,9 @@
 use std::sync::{Arc, OnceLock};
 
 use harw_config::ResolvedConfig;
-use harw_core::{DriftEvent, DriftObserver, GuardPolicy, ManagedAgentSpawner, PitfallAdvisor, RoleEffortWeights};
+use harw_core::{
+    DriftEvent, DriftObserver, GuardPolicy, ManagedAgentSpawner, PitfallAdvisor, RoleEffortWeights,
+};
 use harw_memory::{Fact, FactStore, FactType};
 use harw_types::ReasoningEffort;
 
@@ -155,8 +157,12 @@ fn argument_matches(haystack: &str, arguments: &serde_json::Value) -> bool {
         serde_json::Value::String(text) => {
             !text.is_empty() && haystack.contains(&text.to_ascii_lowercase())
         }
-        serde_json::Value::Array(items) => items.iter().any(|item| argument_matches(haystack, item)),
-        serde_json::Value::Number(_) | serde_json::Value::Bool(_) | serde_json::Value::Null => false,
+        serde_json::Value::Array(items) => {
+            items.iter().any(|item| argument_matches(haystack, item))
+        }
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_) | serde_json::Value::Null => {
+            false
+        }
     }
 }
 
@@ -187,7 +193,9 @@ pub fn guard_policy_from_config(config: &ResolvedConfig) -> GuardPolicy {
     let default = GuardPolicy::default();
     GuardPolicy {
         enabled: toml.enabled.unwrap_or(default.enabled),
-        repeated_failure_warn: toml.repeated_failure_warn.unwrap_or(default.repeated_failure_warn),
+        repeated_failure_warn: toml
+            .repeated_failure_warn
+            .unwrap_or(default.repeated_failure_warn),
         repeated_failure_abort: toml
             .repeated_failure_abort
             .unwrap_or(default.repeated_failure_abort),
@@ -248,7 +256,11 @@ pub fn role_effort_weights_from_config(config: &ResolvedConfig) -> RoleEffortWei
 
 /// Parst ein einzelnes `[reasoning]`-Feld, fällt bei `None` oder ungültigem
 /// Label auf `default` zurück (`field` nur für die Warnung).
-fn parse_effort_field(label: Option<&str>, default: ReasoningEffort, field: &str) -> ReasoningEffort {
+fn parse_effort_field(
+    label: Option<&str>,
+    default: ReasoningEffort,
+    field: &str,
+) -> ReasoningEffort {
     let Some(label) = label else {
         return default;
     };
@@ -427,12 +439,8 @@ mod resolve_default_reasoning_effort_tests {
 
     #[test]
     fn test_agent_overrides_role() {
-        let result = resolve_default_reasoning_effort(
-            None,
-            None,
-            Some("high"),
-            Some(ReasoningEffort::Low),
-        );
+        let result =
+            resolve_default_reasoning_effort(None, None, Some("high"), Some(ReasoningEffort::Low));
         assert_eq!(result, Some(ReasoningEffort::High));
     }
 

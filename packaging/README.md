@@ -26,6 +26,17 @@ brew install --build-from-source ./packaging/harw.rb
 After install:
 
 ```sh
-harw completion zsh  > "${fpath[1]}/_harw"     # zsh
-harw completion bash > /etc/bash_completion.d/harw
+harw completions --install              # shell detected from $SHELL
+harw completions zsh --install          # zsh (oh-my-zsh custom/completions or ~/.local/share/zsh/site-functions)
+harw completions bash --install         # bash (~/.local/share/bash-completion/completions/harw)
+harw completions fish --install         # fish (~/.config/fish/completions/harw.fish)
+harw completions zsh --install --dry-run   # show what would change, touch nothing
+harw completions zsh --uninstall        # remove harw-managed scripts, rc blocks and caches
+harw completions zsh --install --all-binaries   # also the DoD binaries found on $PATH
+harw completions zsh > _harw            # still prints the script to stdout
 ```
+
+Re-running `--install` replaces older harw-managed installations (legacy
+paths, stale `.zcompdump*` caches, old rc blocks) instead of stacking them.
+Open a new shell afterwards (e.g. `exec zsh`). `elvish` and `powershell` are
+supported too. `harw completion` remains as a hidden alias.

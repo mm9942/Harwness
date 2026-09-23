@@ -113,7 +113,11 @@ pub fn resolve_loginuid(proc_root: &Path, pid: u32) -> Option<u32> {
     let raw = harw_dod_readfs::read_first_line(&scope, &path).ok()?;
     let value: u32 = raw.trim().parse().ok()?;
 
-    if value == LOGINUID_UNSET { None } else { Some(value) }
+    if value == LOGINUID_UNSET {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 #[cfg(test)]
@@ -121,56 +125,63 @@ mod tests {
     use std::fs;
 
     use super::{LOGINUID_UNSET, resolve_loginuid};
+    use crate::test_support::{TestResult, ctx};
 
-    fn write_loginuid(root: &std::path::Path, pid: u32, content: &str) {
+    fn write_loginuid(root: &std::path::Path, pid: u32, content: &str) -> TestResult {
         let pid_dir = root.join(pid.to_string());
-        fs::create_dir_all(&pid_dir).expect("pid dir anlegen");
-        fs::write(pid_dir.join("loginuid"), content).expect("loginuid schreiben");
+        fs::create_dir_all(&pid_dir).map_err(ctx("pid dir anlegen"))?;
+        fs::write(pid_dir.join("loginuid"), content).map_err(ctx("loginuid schreiben"))?;
+        Ok(())
     }
 
     /// Der wichtigste Test dieser Crate: `4294967295` ist "nicht gesetzt",
     /// keine gültige UID.
     #[test]
-    fn test_resolve_loginuid_unset_sentinel_is_none() {
-        let root = tempfile::tempdir().expect("tempdir");
-        write_loginuid(root.path(), 100, "4294967295\n");
+    fn test_resolve_loginuid_unset_sentinel_is_none() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        write_loginuid(root.path(), 100, "4294967295\n")?;
 
         assert_eq!(resolve_loginuid(root.path(), 100), None);
         assert_eq!(LOGINUID_UNSET, 4_294_967_295);
+        Ok(())
     }
 
     /// Abgrenzung zum vorigen Fall: `0` ist eine gültige, gesetzte UID (root),
     /// nicht der Sonderfall "nicht gesetzt".
     #[test]
-    fn test_resolve_loginuid_zero_is_some_zero() {
-        let root = tempfile::tempdir().expect("tempdir");
-        write_loginuid(root.path(), 200, "0\n");
+    fn test_resolve_loginuid_zero_is_some_zero() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        write_loginuid(root.path(), 200, "0\n")?;
 
         assert_eq!(resolve_loginuid(root.path(), 200), Some(0));
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_loginuid_ordinary_value_is_some() {
-        let root = tempfile::tempdir().expect("tempdir");
-        write_loginuid(root.path(), 300, "1000\n");
+    fn test_resolve_loginuid_ordinary_value_is_some() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        write_loginuid(root.path(), 300, "1000\n")?;
 
         assert_eq!(resolve_loginuid(root.path(), 300), Some(1000));
+        Ok(())
     }
 
     /// Ein bereits beendeter Prozess hinterlässt kein `/proc/<pid>/loginuid`
     /// mehr — das ist `None`, kein Fehler.
     #[test]
-    fn test_resolve_loginuid_missing_file_is_none_not_error() {
-        let root = tempfile::tempdir().expect("tempdir");
+    fn test_resolve_loginuid_missing_file_is_none_not_error() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
         // Kein Verzeichnis für die PID angelegt.
         assert_eq!(resolve_loginuid(root.path(), 999), None);
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_loginuid_malformed_content_is_none() {
-        let root = tempfile::tempdir().expect("tempdir");
-        write_loginuid(root.path(), 400, "nicht-numerisch\n");
+    fn test_resolve_loginuid_malformed_content_is_none() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        write_loginuid(root.path(), 400, "nicht-numerisch\n")?;
 
         assert_eq!(resolve_loginuid(root.path(), 400), None);
+        Ok(())
     }
 }

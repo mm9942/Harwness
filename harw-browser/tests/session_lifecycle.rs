@@ -7,10 +7,13 @@
 //! observation, policy, selector, session, wait) stays consistent together,
 //! not just in isolation.
 
+mod common;
+
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use async_trait::async_trait;
+use common::{TestError, TestResult, ctx};
 
 use harw_browser::action::{ActionOutcome, ActionRequest, BrowserAction};
 use harw_browser::artifact::{ArtifactKind, ArtifactRef};
@@ -70,11 +73,13 @@ impl BrowserRuntime for MockRuntime {
         context_id: &BrowserContextId,
         _mode: ObservationMode,
     ) -> Result<BrowserObservation> {
+        // `Error::UrlParse` wraps `url::ParseError` via `From`, so `?` converts it.
+        let url = url::Url::parse("https://erp.example.com/dashboard")?;
         Ok(BrowserObservation {
             session_id: self.session_id,
             context_id: *context_id,
             revision: BrowserObservationRevision::initial().next(),
-            url: url::Url::parse("https://erp.example.com/dashboard").expect("valid static url"),
+            url,
             title: "Dashboard".to_owned(),
             document_identity: DocumentIdentity::new("doc-lifecycle"),
             elements: vec![ObservedElement::new("ref-submit", "button")],
@@ -169,13 +174,13 @@ impl BrowserRuntime for MockRuntime {
 }
 
 #[test]
-fn test_full_session_lifecycle_round_trips_across_modules() {
+fn test_full_session_lifecycle_round_trips_across_modules() -> TestResult {
     // 1. Build an open request gated by an origin policy, and confirm the
     //    policy allows the intended start URL before "opening" the session.
     let allowed_origins = OriginPolicy::from_origins(["https://erp.example.com"], true)
-        .expect("valid allowed-origins policy");
+        .map_err(ctx("valid allowed-origins policy"))?;
     let open_request = OpenBrowserRequest {
-        start_url: url::Url::parse("https://erp.example.com/login").expect("valid url"),
+        start_url: url::Url::parse("https://erp.example.com/login").map_err(ctx("valid url"))?,
         headless: true,
         profile: ProfilePolicy::Persistent {
             binding: "sales-team".to_owned(),
@@ -194,9 +199,10 @@ fn test_full_session_lifecycle_round_trips_across_modules() {
 
     // The request itself is a protocol-boundary type; confirm it survives a
     // JSON round trip before it would be handed to a real host implementation.
-    let open_request_json = serde_json::to_string(&open_request).expect("open request serializes");
+    let open_request_json =
+        serde_json::to_string(&open_request).map_err(ctx("open request serializes"))?;
     let decoded_open_request: OpenBrowserRequest =
-        serde_json::from_str(&open_request_json).expect("open request deserializes");
+        serde_json::from_str(&open_request_json).map_err(ctx("open request deserializes"))?;
     assert_eq!(decoded_open_request, open_request);
 
     // 2. Stand up a mock runtime wrapped in the public session handle, as a
@@ -223,39 +229,43 @@ fn test_full_session_lifecycle_round_trips_across_modules() {
     )
     .with_expected_revision(BrowserObservationRevision::initial());
 
-    let outcome = block_on(handle.act(action_request)).expect("mock act always succeeds");
+    let outcome = block_on(handle.act(action_request)).map_err(ctx("mock act always succeeds"))?;
     assert!(outcome.confirmed);
     assert_eq!(outcome.diagnostics.len(), 1);
     assert_eq!(outcome.diagnostics[0].effect_id, Some(outcome.effect_id));
 
-    let outcome_json = serde_json::to_string(&outcome).expect("outcome serializes");
+    let outcome_json = serde_json::to_string(&outcome).map_err(ctx("outcome serializes"))?;
     let decoded_outcome: ActionOutcome =
-        serde_json::from_str(&outcome_json).expect("outcome deserializes");
+        serde_json::from_str(&outcome_json).map_err(ctx("outcome deserializes"))?;
     assert_eq!(decoded_outcome, outcome);
 
     // 4. Observe the resulting page state and confirm the observation
     //    round-trips through JSON, matching the revision the action advanced to.
     let observation = block_on(handle.observe(&context_id, ObservationMode::PageSummary))
-        .expect("mock observe always succeeds");
+        .map_err(ctx("mock observe always succeeds"))?;
     assert_eq!(
         observation.revision,
-        outcome.new_revision.expect("act set a new revision")
+        outcome
+            .new_revision
+            .ok_or(TestError::Missing("act set a new revision"))?
     );
 
-    let observation_json = serde_json::to_string(&observation).expect("observation serializes");
+    let observation_json =
+        serde_json::to_string(&observation).map_err(ctx("observation serializes"))?;
     let decoded_observation: BrowserObservation =
-        serde_json::from_str(&observation_json).expect("observation deserializes");
+        serde_json::from_str(&observation_json).map_err(ctx("observation deserializes"))?;
     assert_eq!(decoded_observation, observation);
 
     // 5. Drain events since the observation's cursor and confirm the envelope
     //    (carrying a real timestamp) round-trips through JSON.
-    let events = block_on(handle.events(observation.event_cursor)).expect("mock events succeeds");
+    let events =
+        block_on(handle.events(observation.event_cursor)).map_err(ctx("mock events succeeds"))?;
     assert_eq!(events.len(), 1);
     assert!(matches!(events[0].event, BrowserEvent::Navigation { .. }));
 
-    let events_json = serde_json::to_string(&events).expect("events serialize");
+    let events_json = serde_json::to_string(&events).map_err(ctx("events serialize"))?;
     let decoded_events: Vec<EventEnvelope> =
-        serde_json::from_str(&events_json).expect("events deserialize");
+        serde_json::from_str(&events_json).map_err(ctx("events deserialize"))?;
     assert_eq!(decoded_events, events);
 
     // 6. Wait for a follow-up condition and close the session.
@@ -264,8 +274,9 @@ fn test_full_session_lifecycle_round_trips_across_modules() {
         WaitCondition::NavigationComplete,
         WaitTimeout::from_millis(1000),
     ))
-    .expect("mock wait always succeeds");
+    .map_err(ctx("mock wait always succeeds"))?;
     assert!(wait_outcome.satisfied);
 
     assert!(block_on(handle.close()).is_ok());
+    Ok(())
 }

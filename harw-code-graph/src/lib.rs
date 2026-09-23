@@ -49,3 +49,7 @@ pub use error::{CodeGraphError, CodeGraphResult};
 pub use lockfile::{LockedPackage, find_locked, parse_lockfile};
 pub use registry_locator::RegistrySourceLocator;
 pub use workspace::{CrateNode, WorkspaceGraph};
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

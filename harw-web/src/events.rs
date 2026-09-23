@@ -300,7 +300,10 @@ impl WebEventBus {
         // führt selbst keine Logik aus, die während des Locks paniken kann;
         // ein vergifteter Lock wird defensiv wie ein frischer behandelt statt
         // den Aufrufer mit einem zweiten Fehlerpfad zu belasten.
-        let mut inner = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let event = WebEvent {
             sequence: inner.next_sequence,
             kind,
@@ -353,6 +356,7 @@ impl WebEventSubscription {
 mod tests {
     use super::{WebEvent, WebEventBus, WebEventKind, WebEventReceiveError};
     use crate::error::WebError;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_context::TrustClass;
 
     fn completed(name: &str) -> WebEventKind {
@@ -367,40 +371,47 @@ mod tests {
     /// Herkunft trägt `Data`, nicht irgendeine andere Klasse — siehe
     /// Moduldokumentation „Warum die Vorgabe die niedrigste Klasse ist".
     #[test]
-    fn test_operation_completed_without_known_origin_defaults_to_data() {
+    fn test_operation_completed_without_known_origin_defaults_to_data() -> TestResult {
         let json = serde_json::json!({
             "type": "operation_completed",
             "operation": "noop",
             "ok": true,
         });
-        let kind: WebEventKind = serde_json::from_value(json).unwrap();
+        let kind: WebEventKind = serde_json::from_value(json).map_err(ctx("kind deserializes"))?;
         match kind {
             WebEventKind::OperationCompleted { trust, .. } => {
                 assert_eq!(trust, TrustClass::Data);
             }
-            other => panic!("Erwartet OperationCompleted, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Erwartet OperationCompleted, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// Eine deklarierte Klasse kommt unverändert durch — die Durchreichung
     /// ist additiv, keine Ersetzung.
     #[test]
-    fn test_operation_completed_declared_trust_class_round_trips() {
+    fn test_operation_completed_declared_trust_class_round_trips() -> TestResult {
         let kind = WebEventKind::OperationCompleted {
             operation: "noop".to_owned(),
             ok: true,
             trust: TrustClass::Evidence,
         };
-        let json = serde_json::to_value(&kind).unwrap();
-        let decoded: WebEventKind = serde_json::from_value(json).unwrap();
+        let json = serde_json::to_value(&kind).map_err(ctx("kind serializes"))?;
+        let decoded: WebEventKind =
+            serde_json::from_value(json).map_err(ctx("kind deserializes"))?;
         assert_eq!(kind, decoded);
+        Ok(())
     }
 
     /// Ein Bestandsdatensatz ganz ohne das neue Feld bleibt lesbar
     /// (`#[serde(default)]`), unabhängig davon, welche anderen Felder
     /// gesetzt sind.
     #[test]
-    fn test_legacy_record_without_trust_field_remains_readable() {
+    fn test_legacy_record_without_trust_field_remains_readable() -> TestResult {
         let json = serde_json::json!({
             "sequence": 7,
             "kind": {
@@ -409,15 +420,20 @@ mod tests {
                 "ok": false,
             },
         });
-        let event: WebEvent = serde_json::from_value(json).unwrap();
+        let event: WebEvent = serde_json::from_value(json).map_err(ctx("event deserializes"))?;
         assert_eq!(event.sequence, 7);
         match event.kind {
             WebEventKind::OperationCompleted { trust, ok, .. } => {
                 assert_eq!(trust, TrustClass::Data);
                 assert!(!ok);
             }
-            other => panic!("Erwartet OperationCompleted, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Erwartet OperationCompleted, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// Ein unbekanntes Feld im Wire-Typ wird abgewiesen
@@ -443,33 +459,35 @@ mod tests {
     }
 
     #[test]
-    fn test_publish_sequence_starts_at_one_and_increments() {
-        let bus = WebEventBus::new(8).unwrap();
+    fn test_publish_sequence_starts_at_one_and_increments() -> TestResult {
+        let bus = WebEventBus::new(8).map_err(ctx("bus construction"))?;
         let first = bus.publish(completed("a"));
         let second = bus.publish(completed("b"));
         let third = bus.publish(completed("c"));
         assert_eq!(first.sequence, 1);
         assert_eq!(second.sequence, 2);
         assert_eq!(third.sequence, 3);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_subscriber_receives_events_in_sequence_order() {
-        let bus = WebEventBus::new(8).unwrap();
+    async fn test_subscriber_receives_events_in_sequence_order() -> TestResult {
+        let bus = WebEventBus::new(8).map_err(ctx("bus construction"))?;
         let mut subscription = bus.subscribe();
         bus.publish(completed("a"));
         bus.publish(completed("b"));
-        let first = subscription.recv().await.unwrap();
-        let second = subscription.recv().await.unwrap();
+        let first = subscription.recv().await.map_err(ctx("recv first"))?;
+        let second = subscription.recv().await.map_err(ctx("recv second"))?;
         assert_eq!(first.sequence, 1);
         assert_eq!(second.sequence, 2);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_slow_subscriber_sees_a_visible_gap_via_lagged() {
+    async fn test_slow_subscriber_sees_a_visible_gap_via_lagged() -> TestResult {
         // Kapazität 2: ein drittes Ereignis vor dem ersten `recv()` verdrängt
         // das älteste — der Abonnent MUSS das an `Lagged` erkennen können.
-        let bus = WebEventBus::new(2).unwrap();
+        let bus = WebEventBus::new(2).map_err(ctx("bus construction"))?;
         let mut subscription = bus.subscribe();
         bus.publish(completed("a"));
         bus.publish(completed("b"));
@@ -477,44 +495,52 @@ mod tests {
 
         match subscription.recv().await {
             Err(WebEventReceiveError::Lagged { skipped }) => assert_eq!(skipped, 1),
-            other => panic!("Erwartet Lagged, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Erwartet Lagged, war: {other:?}"
+                )));
+            }
         }
-        let next = subscription.recv().await.unwrap();
+        let next = subscription.recv().await.map_err(ctx("recv next"))?;
         // Die Lücke ist sichtbar: die nächste erhaltene Sequenznummer ist 2,
         // nicht 1 — der Client kann daraus ableiten, dass er das Ereignis
         // mit sequence == 1 nie gesehen hat.
         assert_eq!(next.sequence, 2);
+        Ok(())
     }
 
     #[test]
-    fn test_subscriber_count_reflects_active_and_dropped_subscriptions() {
-        let bus = WebEventBus::new(4).unwrap();
+    fn test_subscriber_count_reflects_active_and_dropped_subscriptions() -> TestResult {
+        let bus = WebEventBus::new(4).map_err(ctx("bus construction"))?;
         assert_eq!(bus.subscriber_count(), 0);
         let subscription = bus.subscribe();
         assert_eq!(bus.subscriber_count(), 1);
         drop(subscription);
         assert_eq!(bus.subscriber_count(), 0);
+        Ok(())
     }
 
     #[test]
-    fn test_publish_without_subscribers_still_advances_sequence() {
-        let bus = WebEventBus::new(4).unwrap();
+    fn test_publish_without_subscribers_still_advances_sequence() -> TestResult {
+        let bus = WebEventBus::new(4).map_err(ctx("bus construction"))?;
         let first = bus.publish(completed("a"));
         let second = bus.publish(completed("b"));
         assert_eq!(first.sequence, 1);
         assert_eq!(second.sequence, 2);
+        Ok(())
     }
 
     #[test]
-    fn test_web_event_to_sse_frame_has_data_prefix_and_blank_line() {
+    fn test_web_event_to_sse_frame_has_data_prefix_and_blank_line() -> TestResult {
         let event = WebEvent {
             sequence: 7,
             kind: WebEventKind::Heartbeat,
         };
-        let frame = event.to_sse_frame().unwrap();
+        let frame = event.to_sse_frame().map_err(ctx("to_sse_frame"))?;
         assert!(frame.starts_with("data: "));
         assert!(frame.ends_with("\n\n"));
         assert!(frame.contains("\"sequence\":7"));
+        Ok(())
     }
 
     #[test]

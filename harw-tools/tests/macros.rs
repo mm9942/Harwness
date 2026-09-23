@@ -1,8 +1,13 @@
 //! Integration test exercising the `#[derive(Tool)]` and `#[tool]` macros
 //! against the real `harw_tools` types.
 
+mod common;
+
+use common::{TestError, TestResult, ctx};
+use harw_authority::{
+    Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+};
 use harw_macros::{Tool, tool};
-use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
 use harw_tools::{
     JsonSchemaType, ToolCall, ToolExecutionContext, ToolExecutor, ToolName, ToolOutput, ToolSpec,
     ToolsError,
@@ -28,7 +33,7 @@ struct SearchArgs {
 }
 
 #[test]
-fn derive_tool_builds_spec() {
+fn derive_tool_builds_spec() -> TestResult {
     let ToolSpec::Function(spec) = SearchArgs::tool_spec();
     assert_eq!(spec.name.as_str(), "search");
     assert_eq!(spec.description, "Search docs");
@@ -37,7 +42,10 @@ fn derive_tool_builds_spec() {
     let params = &spec.parameters;
     assert_eq!(params.schema_type, Some(JsonSchemaType::Object));
 
-    let props = params.properties.as_ref().expect("properties");
+    let props = params
+        .properties
+        .as_ref()
+        .ok_or(TestError::Missing("properties"))?;
     assert_eq!(
         props["query"].schema_type,
         Some(JsonSchemaType::String),
@@ -50,13 +58,21 @@ fn derive_tool_builds_spec() {
     assert_eq!(props["top_k"].schema_type, Some(JsonSchemaType::Integer));
     assert_eq!(props["tags"].schema_type, Some(JsonSchemaType::Array));
     assert_eq!(
-        props["tags"].items.as_ref().unwrap().schema_type,
+        props["tags"]
+            .items
+            .as_ref()
+            .ok_or(TestError::Missing("tags.items"))?
+            .schema_type,
         Some(JsonSchemaType::String)
     );
 
     // `query` is required; `top_k` (default) and `tags` (Option) are not.
-    let required = params.required.as_ref().expect("required");
+    let required = params
+        .required
+        .as_ref()
+        .ok_or(TestError::Missing("required"))?;
     assert_eq!(required, &vec!["query".to_string()]);
+    Ok(())
 }
 
 #[derive(Tool, Deserialize)]
@@ -79,7 +95,7 @@ async fn fetch_invoice(
 }
 
 #[test]
-fn tool_attr_builds_executor() {
+fn tool_attr_builds_executor() -> TestResult {
     assert_eq!(FetchInvoiceTool::NAME, "fetch_invoice");
     assert_eq!(FetchInvoiceTool::DESCRIPTION, "Fetches invoice");
 
@@ -90,18 +106,23 @@ fn tool_attr_builds_executor() {
     };
 
     let executor = FetchInvoiceTool;
-    let out =
-        futures_lite_block_on(executor.execute(&test_execution_context(), &call)).expect("ok");
+    let out = futures_lite_block_on(executor.execute(&test_execution_context()?, &call))
+        .map_err(ctx("ok"))?;
     match out {
         ToolOutput::Text { content } => assert_eq!(content, "invoice 42"),
-        other => panic!("unexpected output: {other:?}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "unexpected output: {other:?}"
+            )));
+        }
     }
+    Ok(())
 }
 
-fn test_execution_context() -> ToolExecutionContext {
+fn test_execution_context() -> TestResult<ToolExecutionContext> {
     let harness_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("harw-tools has a workspace parent")
+        .ok_or(TestError::Missing("harw-tools has a workspace parent"))?
         .to_path_buf();
     let registry = WorkspaceRegistry::build(
         &harness_root,
@@ -111,17 +132,21 @@ fn test_execution_context() -> ToolExecutionContext {
             root: PathBuf::from("harw-tools"),
         }],
     )
-    .expect("test workspace is registered");
+    .map_err(ctx("test workspace is registered"))?;
     let sandbox = SandboxSpec::from_resolved(
         registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("tools-tests"),
             )
-            .expect("test workspace resolves"),
+            .map_err(ctx("test workspace resolves"))?,
         PermissionSet::from_policy([Permission::ReadWorkspace]),
     );
-    ToolExecutionContext::new(SessionId::new(), TurnId::new(), sandbox)
+    Ok(ToolExecutionContext::new(
+        SessionId::new(),
+        TurnId::new(),
+        sandbox,
+    ))
 }
 
 /// Tiny dependency-free block_on so the test needs no async runtime.

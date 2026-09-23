@@ -127,7 +127,9 @@
 //! assert!(matches!(reference.check_digest(changed), DigestStatus::Changed { .. }));
 //! ```
 
-use crate::fragment::{Fragment, FragmentLabel, FragmentOrigin, SectionName, Stability, TrustClass};
+use crate::fragment::{
+    Fragment, FragmentLabel, FragmentOrigin, SectionName, Stability, TrustClass,
+};
 
 /// Ein Verweis auf ein Fragment, statt des Fragments selbst.
 ///
@@ -336,7 +338,10 @@ pub enum DigestStatus {
 #[cfg(test)]
 mod tests {
     use super::{DigestStatus, FragmentReference};
-    use crate::fragment::{Fragment, FragmentLabel, FragmentOrigin, SectionName, Stability, TrustClass};
+    use crate::fragment::{
+        Fragment, FragmentLabel, FragmentOrigin, SectionName, Stability, TrustClass,
+    };
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_lens_types::{BytesOverFour, CostEstimator};
 
     fn origin() -> FragmentOrigin {
@@ -347,23 +352,23 @@ mod tests {
         }
     }
 
-    fn long_fragment() -> Fragment {
+    fn long_fragment() -> TestResult<Fragment> {
         let body = "the quick brown fox jumps over the lazy dog. ".repeat(80);
-        Fragment {
-            label: FragmentLabel::try_new("turn-7").unwrap(),
-            section: SectionName::try_new("history.tail").unwrap(),
+        Ok(Fragment {
+            label: FragmentLabel::try_new("turn-7").map_err(ctx("valid fragment label"))?,
+            section: SectionName::try_new("history.tail").map_err(ctx("valid section name"))?,
             trust: TrustClass::Evidence,
             stability: Stability::Stable,
             origin: origin(),
             cost: BytesOverFour.estimate(&body),
             digest: harw_types::ContentDigest::of(body.as_bytes()),
             body,
-        }
+        })
     }
 
     #[test]
-    fn test_from_fragment_copies_every_field_except_body() {
-        let fragment = long_fragment();
+    fn test_from_fragment_copies_every_field_except_body() -> TestResult {
+        let fragment = long_fragment()?;
         let reference = FragmentReference::from_fragment(&fragment);
 
         assert_eq!(reference.label, fragment.label);
@@ -373,14 +378,15 @@ mod tests {
         assert_eq!(reference.origin, fragment.origin);
         assert_eq!(reference.full_cost, fragment.cost);
         assert_eq!(reference.digest, fragment.digest);
+        Ok(())
     }
 
     /// Kern-Zusage des Knotens: ein Verweis kostet nachweislich weniger als
     /// das vollständige Fragment — gemessen mit demselben Schätzer, nicht
     /// nur behauptet.
     #[test]
-    fn test_reference_render_costs_less_than_full_body_with_same_estimator() {
-        let fragment = long_fragment();
+    fn test_reference_render_costs_less_than_full_body_with_same_estimator() -> TestResult {
+        let fragment = long_fragment()?;
         let reference = FragmentReference::from_fragment(&fragment);
 
         let full_cost = BytesOverFour.estimate(&fragment.body);
@@ -393,22 +399,32 @@ mod tests {
         // Das Preisschild selbst bleibt unverändert der volle Preis — sonst
         // wüsste der Agent nicht, wofür er sich entscheidet.
         assert_eq!(reference.full_cost, full_cost);
+        Ok(())
     }
 
     /// Der Verweis genügt zur Beurteilung: alle Felder, die die Moduldoku als
     /// notwendig begründet, tauchen im gerenderten Text auf.
     #[test]
-    fn test_display_contains_every_field_needed_to_judge_whether_to_load() {
-        let fragment = long_fragment();
+    fn test_display_contains_every_field_needed_to_judge_whether_to_load() -> TestResult {
+        let fragment = long_fragment()?;
         let reference = FragmentReference::from_fragment(&fragment);
         let rendered = reference.to_string();
 
-        assert!(rendered.contains("history.tail"), "section missing: {rendered}");
+        assert!(
+            rendered.contains("history.tail"),
+            "section missing: {rendered}"
+        );
         assert!(rendered.contains("turn-7"), "label missing: {rendered}");
         assert!(rendered.contains("Evidence"), "trust missing: {rendered}");
         assert!(rendered.contains("Stable"), "stability missing: {rendered}");
-        assert!(rendered.contains("harw-core::history"), "origin missing: {rendered}");
-        assert!(rendered.contains("context.load"), "load hint missing: {rendered}");
+        assert!(
+            rendered.contains("harw-core::history"),
+            "origin missing: {rendered}"
+        );
+        assert!(
+            rendered.contains("context.load"),
+            "load hint missing: {rendered}"
+        );
         assert!(
             rendered.contains(&fragment.cost.0.to_string()),
             "cost missing: {rendered}"
@@ -417,11 +433,12 @@ mod tests {
             rendered.contains(&fragment.digest.to_string()),
             "digest missing: {rendered}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_display_does_not_leak_the_body() {
-        let fragment = long_fragment();
+    fn test_display_does_not_leak_the_body() -> TestResult {
+        let fragment = long_fragment()?;
         let reference = FragmentReference::from_fragment(&fragment);
         let rendered = reference.to_string();
 
@@ -429,20 +446,25 @@ mod tests {
             !rendered.contains("quick brown fox"),
             "a reference must never leak the body it stands in for"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_check_digest_reports_unchanged_for_matching_digest() {
-        let fragment = long_fragment();
+    fn test_check_digest_reports_unchanged_for_matching_digest() -> TestResult {
+        let fragment = long_fragment()?;
         let reference = FragmentReference::from_fragment(&fragment);
 
-        assert_eq!(reference.check_digest(fragment.digest), DigestStatus::Unchanged);
+        assert_eq!(
+            reference.check_digest(fragment.digest),
+            DigestStatus::Unchanged
+        );
+        Ok(())
     }
 
     /// Ein Verweis auf geänderten Inhalt wird erkannt.
     #[test]
-    fn test_check_digest_reports_changed_for_different_digest() {
-        let fragment = long_fragment();
+    fn test_check_digest_reports_changed_for_different_digest() -> TestResult {
+        let fragment = long_fragment()?;
         let reference = FragmentReference::from_fragment(&fragment);
         let changed = harw_types::ContentDigest::of(b"a completely different body");
 
@@ -451,45 +473,53 @@ mod tests {
                 assert_eq!(expected, fragment.digest);
                 assert_eq!(found, changed);
             }
-            DigestStatus::Unchanged => panic!("expected a Changed status for a different digest"),
+            DigestStatus::Unchanged => {
+                return Err(TestError::Unexpected(
+                    "expected a Changed status for a different digest".to_owned(),
+                ));
+            }
         }
+        Ok(())
     }
 
     /// Determinismus: zweimal aus demselben Fragment projiziert, byteweise
     /// identisches Ergebnis — keine Systemuhr, keine Zufallszahl.
     #[test]
-    fn test_from_fragment_is_deterministic() {
-        let fragment = long_fragment();
+    fn test_from_fragment_is_deterministic() -> TestResult {
+        let fragment = long_fragment()?;
         let a = FragmentReference::from_fragment(&fragment);
         let b = FragmentReference::from_fragment(&fragment);
 
         assert_eq!(a, b);
         assert_eq!(a.to_string(), b.to_string());
+        Ok(())
     }
 
     #[test]
-    fn test_fragment_reference_serde_roundtrip() {
-        let fragment = long_fragment();
+    fn test_fragment_reference_serde_roundtrip() -> TestResult {
+        let fragment = long_fragment()?;
         let reference = FragmentReference::from_fragment(&fragment);
 
-        let json = serde_json::to_string(&reference).expect("reference must serialize");
+        let json = serde_json::to_string(&reference).map_err(ctx("reference must serialize"))?;
         let restored: FragmentReference =
-            serde_json::from_str(&json).expect("reference must deserialize");
+            serde_json::from_str(&json).map_err(ctx("reference must deserialize"))?;
         assert_eq!(reference, restored);
+        Ok(())
     }
 
     #[test]
-    fn test_fragment_reference_deserialize_rejects_unknown_field() {
-        let fragment = long_fragment();
+    fn test_fragment_reference_deserialize_rejects_unknown_field() -> TestResult {
+        let fragment = long_fragment()?;
         let reference = FragmentReference::from_fragment(&fragment);
         let mut value =
-            serde_json::to_value(&reference).expect("reference must serialize to value");
+            serde_json::to_value(&reference).map_err(ctx("reference must serialize to value"))?;
         value
             .as_object_mut()
-            .expect("reference serializes to an object")
+            .ok_or(TestError::Missing("reference serializes to an object"))?
             .insert("unexpected".to_owned(), serde_json::json!(true));
 
         let result: Result<FragmentReference, _> = serde_json::from_value(value);
         assert!(result.is_err());
+        Ok(())
     }
 }

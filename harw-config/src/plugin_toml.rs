@@ -40,16 +40,18 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
-    fn plugin_manifest_defaults_to_enabled() {
+    fn plugin_manifest_defaults_to_enabled() -> TestResult {
         let plugin: PluginToml = toml::from_str(
             "name = \"review\"\nversion = \"1.0.0\"\n[capabilities]\nskills = [\"code-review\"]\n",
         )
-        .unwrap();
+        .map_err(ctx("well-formed plugin manifest must parse"))?;
 
         assert!(plugin.enabled);
         assert_eq!(plugin.capabilities.skills, ["code-review"]);
+        Ok(())
     }
 
     #[test]

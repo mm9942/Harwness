@@ -245,10 +245,16 @@ pub fn parse_exec_v1(event: &WireEvent) -> Result<ExecEventV1, ProcmonError> {
         return Err(ProcmonError::MalformedEvent);
     }
     let comm = read_fixed_c_str(&event.payload, 0, 16).map_err(|_| ProcmonError::MalformedEvent)?;
-    let path_len_bytes: [u8; 2] = event.payload[16..18].try_into().map_err(|_| ProcmonError::MalformedEvent)?;
+    let path_len_bytes: [u8; 2] = event.payload[16..18]
+        .try_into()
+        .map_err(|_| ProcmonError::MalformedEvent)?;
     let path_len = usize::from(u16::from_le_bytes(path_len_bytes));
-    let path_end = 18usize.checked_add(path_len).ok_or(ProcmonError::MalformedEvent)?;
-    if path_end != event.payload.len() { return Err(ProcmonError::MalformedEvent); }
+    let path_end = 18usize
+        .checked_add(path_len)
+        .ok_or(ProcmonError::MalformedEvent)?;
+    if path_end != event.payload.len() {
+        return Err(ProcmonError::MalformedEvent);
+    }
     let (path, path_capture) = if event.flags & EXEC_PATH_UNAVAILABLE != 0 {
         if path_len != 0 {
             return Err(ProcmonError::MalformedEvent);
@@ -265,13 +271,22 @@ pub fn parse_exec_v1(event: &WireEvent) -> Result<ExecEventV1, ProcmonError> {
             ExecutablePathCapture::Captured,
         )
     };
-    Ok(ExecEventV1 { task: event.task, comm, path, path_capture, argv: ArgvCapture::NotCollected })
+    Ok(ExecEventV1 {
+        task: event.task,
+        comm,
+        path,
+        path_capture,
+        argv: ArgvCapture::NotCollected,
+    })
 }
 
 /// Parse the empty v1 exit body.  The task/cgroup identity belongs to the
 /// common header and is captured at `sched_process_exit` in task context.
 pub fn parse_process_exit_v1(event: &WireEvent) -> Result<ProcessExitEventV1, ProcmonError> {
-    if event.event_type != WireEventType::ProcessExit || !event.payload.is_empty() || event.flags != 0 {
+    if event.event_type != WireEventType::ProcessExit
+        || !event.payload.is_empty()
+        || event.flags != 0
+    {
         return Err(ProcmonError::MalformedEvent);
     }
     Ok(ProcessExitEventV1 { task: event.task })
@@ -312,15 +327,18 @@ pub fn parse_exec_payload(payload: &[u8]) -> Result<ExecEvent, ProcmonError> {
     let pid = read_u32_le(payload, PID_OFFSET).map_err(|_| ProcmonError::MalformedEvent)?;
     let ppid = read_u32_le(payload, PPID_OFFSET).map_err(|_| ProcmonError::MalformedEvent)?;
     let uid = read_u32_le(payload, UID_OFFSET).map_err(|_| ProcmonError::MalformedEvent)?;
-    let comm = read_fixed_c_str(payload, COMM_OFFSET, COMM_LEN).map_err(|_| ProcmonError::MalformedEvent)?;
-    let filename =
-        read_fixed_c_str(payload, FILENAME_OFFSET, FILENAME_LEN).map_err(|_| ProcmonError::MalformedEvent)?;
+    let comm = read_fixed_c_str(payload, COMM_OFFSET, COMM_LEN)
+        .map_err(|_| ProcmonError::MalformedEvent)?;
+    let filename = read_fixed_c_str(payload, FILENAME_OFFSET, FILENAME_LEN)
+        .map_err(|_| ProcmonError::MalformedEvent)?;
 
     // `argv` ist der Rest von `payload` — eine geliehene Teilansicht, nie
     // kopiert oder gespeichert. `ContentDigest::of` hasht die Bytes und gibt
     // einen 32-Byte-Digest zurück; danach existiert keine Ansicht der rohen
     // `argv`-Bytes mehr.
-    let argv = payload.get(ARGV_OFFSET..).ok_or(ProcmonError::MalformedEvent)?;
+    let argv = payload
+        .get(ARGV_OFFSET..)
+        .ok_or(ProcmonError::MalformedEvent)?;
     let argv_digest = ContentDigest::of(argv);
 
     Ok(ExecEvent {
@@ -335,37 +353,66 @@ pub fn parse_exec_payload(payload: &[u8]) -> Result<ExecEvent, ProcmonError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_exec_payload, parse_exec_v1, ArgvCapture, ExecutablePathCapture, ARGV_OFFSET, COMM_LEN, EXEC_PATH_TRUNCATED, FILENAME_LEN};
+    use super::{
+        ARGV_OFFSET, ArgvCapture, COMM_LEN, EXEC_PATH_TRUNCATED, ExecutablePathCapture,
+        FILENAME_LEN, parse_exec_payload, parse_exec_v1,
+    };
     use crate::error::ProcmonError;
-    use harw_types::ContentDigest;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_dod_bpf::{TaskIdentity, WireEvent, WireEventType};
+    use harw_types::ContentDigest;
 
     #[test]
-    fn v1_exec_has_explicit_path_length_and_never_fabricates_argv_evidence() {
+    fn v1_exec_has_explicit_path_length_and_never_fabricates_argv_evidence() -> TestResult {
         let mut payload = vec![0; 18];
         payload[..4].copy_from_slice(b"bash");
         payload[16..18].copy_from_slice(&8u16.to_le_bytes());
         payload.extend_from_slice(b"/bin/bash");
-        let event = WireEvent { event_type: WireEventType::Exec, flags: EXEC_PATH_TRUNCATED, ktime_ns: 1, sequence: 1, task: TaskIdentity { tgid: 1, pid: 2, ppid: 3, uid: 4, cgroup_id: 5 }, payload };
-        let parsed = parse_exec_v1(&event).unwrap();
+        let event = WireEvent {
+            event_type: WireEventType::Exec,
+            flags: EXEC_PATH_TRUNCATED,
+            ktime_ns: 1,
+            sequence: 1,
+            task: TaskIdentity {
+                tgid: 1,
+                pid: 2,
+                ppid: 3,
+                uid: 4,
+                cgroup_id: 5,
+            },
+            payload,
+        };
+        let parsed = parse_exec_v1(&event).map_err(ctx("well-formed fixture buffer"))?;
         assert_eq!(parsed.path.as_deref(), Some("/bin/bash"));
-        assert_eq!(parsed.path_capture, ExecutablePathCapture::PossiblyTruncated);
+        assert_eq!(
+            parsed.path_capture,
+            ExecutablePathCapture::PossiblyTruncated
+        );
         assert_eq!(parsed.argv, ArgvCapture::NotCollected);
+        Ok(())
     }
 
     #[test]
-    fn v1_exit_keeps_the_exiting_tasks_identity_without_fabricating_exec_fields() {
+    fn v1_exit_keeps_the_exiting_tasks_identity_without_fabricating_exec_fields() -> TestResult {
         let event = WireEvent {
             event_type: WireEventType::ProcessExit,
             flags: 0,
             ktime_ns: 1,
             sequence: 2,
-            task: TaskIdentity { tgid: 7, pid: 8, ppid: 6, uid: 1000, cgroup_id: 99 },
+            task: TaskIdentity {
+                tgid: 7,
+                pid: 8,
+                ppid: 6,
+                uid: 1000,
+                cgroup_id: 99,
+            },
             payload: vec![],
         };
-        let parsed = super::parse_process_exit_v1(&event).unwrap();
+        let parsed =
+            super::parse_process_exit_v1(&event).map_err(ctx("well-formed fixture buffer"))?;
         assert_eq!(parsed.task.pid, 8);
         assert_eq!(parsed.task.cgroup_id, 99);
+        Ok(())
     }
 
     /// Baut einen wohlgeformten `payload`-Puffer aus seinen Feldern.
@@ -374,7 +421,14 @@ mod tests {
     /// [`FILENAME_LEN`] Byte breit sein (mit Füllbytes oder vollständig
     /// ausfüllend) — genau wie ein reales eBPF-Programm ein festes Feld
     /// schreiben würde.
-    fn build_payload(pid: u32, ppid: u32, uid: u32, comm: &[u8], filename: &[u8], argv: &[u8]) -> Vec<u8> {
+    fn build_payload(
+        pid: u32,
+        ppid: u32,
+        uid: u32,
+        comm: &[u8],
+        filename: &[u8],
+        argv: &[u8],
+    ) -> Vec<u8> {
         assert_eq!(comm.len(), COMM_LEN);
         assert_eq!(filename.len(), FILENAME_LEN);
 
@@ -404,22 +458,23 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_exec_payload_decodes_a_well_formed_buffer() {
+    fn test_parse_exec_payload_decodes_a_well_formed_buffer() -> TestResult {
         let comm = nul_terminated_field(b"sshd", COMM_LEN);
         let filename = nul_terminated_field(b"/usr/sbin/sshd", FILENAME_LEN);
         let payload = build_payload(4_242, 1, 0, &comm, &filename, b"-D\0-e\0none");
 
-        let event = parse_exec_payload(&payload).expect("well-formed payload must parse");
+        let event = parse_exec_payload(&payload).map_err(ctx("well-formed payload must parse"))?;
         assert_eq!(event.pid, 4_242);
         assert_eq!(event.ppid, 1);
         assert_eq!(event.uid, 0);
         assert_eq!(event.comm, "sshd");
         assert_eq!(event.filename, "/usr/sbin/sshd");
         assert_eq!(event.argv_digest, ContentDigest::of(b"-D\0-e\0none"));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_exec_payload_honors_byte_order_for_a_multi_byte_pid() {
+    fn test_parse_exec_payload_honors_byte_order_for_a_multi_byte_pid() -> TestResult {
         // `pid` und `ppid` über 255 brauchen mindestens zwei Bytes — ein
         // Wert unter 256 könnte eine vertauschte Byte-Reihenfolge nicht
         // erkennen (siehe `harw-dod-bpf`-Testmuster).
@@ -427,60 +482,65 @@ mod tests {
         let filename = nul_terminated_field(b"/bin/x", FILENAME_LEN);
         let payload = build_payload(70_000, 300, 1_000, &comm, &filename, b"");
 
-        let event = parse_exec_payload(&payload).expect("well-formed payload must parse");
+        let event = parse_exec_payload(&payload).map_err(ctx("well-formed payload must parse"))?;
         assert_eq!(event.pid, 70_000);
         assert_eq!(event.ppid, 300);
         assert_eq!(event.uid, 1_000);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_exec_payload_comm_fills_field_completely_without_terminator() {
+    fn test_parse_exec_payload_comm_fills_field_completely_without_terminator() -> TestResult {
         let comm = buffer_filling_field(b'c', COMM_LEN);
         let filename = nul_terminated_field(b"/bin/true", FILENAME_LEN);
         let payload = build_payload(1, 0, 0, &comm, &filename, b"");
 
-        let event = parse_exec_payload(&payload).expect("well-formed payload must parse");
+        let event = parse_exec_payload(&payload).map_err(ctx("well-formed payload must parse"))?;
         assert_eq!(event.comm.len(), COMM_LEN);
         assert_eq!(event.comm, "c".repeat(COMM_LEN));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_exec_payload_filename_fills_field_completely_without_terminator() {
+    fn test_parse_exec_payload_filename_fills_field_completely_without_terminator() -> TestResult {
         let comm = nul_terminated_field(b"x", COMM_LEN);
         let filename = buffer_filling_field(b'f', FILENAME_LEN);
         let payload = build_payload(1, 0, 0, &comm, &filename, b"");
 
-        let event = parse_exec_payload(&payload).expect("well-formed payload must parse");
+        let event = parse_exec_payload(&payload).map_err(ctx("well-formed payload must parse"))?;
         assert_eq!(event.filename.len(), FILENAME_LEN);
         assert_eq!(event.filename, "f".repeat(FILENAME_LEN));
+        Ok(())
     }
 
     #[test]
-    fn test_same_argv_yields_same_digest() {
+    fn test_same_argv_yields_same_digest() -> TestResult {
         let comm = nul_terminated_field(b"a", COMM_LEN);
         let filename = nul_terminated_field(b"/bin/a", FILENAME_LEN);
         let a = parse_exec_payload(&build_payload(1, 0, 0, &comm, &filename, b"--flag=value"))
-            .expect("well-formed payload must parse");
+            .map_err(ctx("well-formed payload must parse"))?;
         let b = parse_exec_payload(&build_payload(2, 0, 0, &comm, &filename, b"--flag=value"))
-            .expect("well-formed payload must parse");
+            .map_err(ctx("well-formed payload must parse"))?;
 
         assert_eq!(a.argv_digest, b.argv_digest);
+        Ok(())
     }
 
     #[test]
-    fn test_different_argv_yields_different_digest() {
+    fn test_different_argv_yields_different_digest() -> TestResult {
         let comm = nul_terminated_field(b"a", COMM_LEN);
         let filename = nul_terminated_field(b"/bin/a", FILENAME_LEN);
         let a = parse_exec_payload(&build_payload(1, 0, 0, &comm, &filename, b"--flag=one"))
-            .expect("well-formed payload must parse");
+            .map_err(ctx("well-formed payload must parse"))?;
         let b = parse_exec_payload(&build_payload(1, 0, 0, &comm, &filename, b"--flag=two"))
-            .expect("well-formed payload must parse");
+            .map_err(ctx("well-formed payload must parse"))?;
 
         assert_ne!(a.argv_digest, b.argv_digest);
+        Ok(())
     }
 
     #[test]
-    fn test_argv_bytes_never_appear_in_debug_output_of_the_result() {
+    fn test_argv_bytes_never_appear_in_debug_output_of_the_result() -> TestResult {
         // Der wichtigste Test dieser Crate: eine Kommandozeile mit einem
         // eingebetteten Geheimnis darf an keiner Stelle des Ergebnisses
         // auftauchen — nicht als Feld, nicht über `Debug`. Geprüft über die
@@ -491,7 +551,7 @@ mod tests {
         let filename = nul_terminated_field(b"/usr/bin/curl", FILENAME_LEN);
         let payload = build_payload(1, 0, 0, &comm, &filename, secret);
 
-        let event = parse_exec_payload(&payload).expect("well-formed payload must parse");
+        let event = parse_exec_payload(&payload).map_err(ctx("well-formed payload must parse"))?;
         let debug_output = format!("{event:?}");
 
         assert!(!debug_output.contains("SuperSecretSharedToken123"));
@@ -499,30 +559,53 @@ mod tests {
         // Auch der Digest selbst (Hex-Text) darf den Klartext nicht enthalten
         // — trivial für einen kryptografischen Hash, aber ein struktureller
         // Regressionsschutz, sollte sich das jemals ändern.
-        assert!(!event.argv_digest.to_string().contains("SuperSecretSharedToken123"));
+        assert!(
+            !event
+                .argv_digest
+                .to_string()
+                .contains("SuperSecretSharedToken123")
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_parse_exec_payload_too_short_buffer_returns_malformed_event_without_panicking() {
-        let err = parse_exec_payload(&[1, 2, 3]).expect_err("a 3-byte buffer is far too short");
+    fn test_parse_exec_payload_too_short_buffer_returns_malformed_event_without_panicking()
+    -> TestResult {
+        let Err(err) = parse_exec_payload(&[1, 2, 3]) else {
+            return Err(TestError::Unexpected(
+                "a 3-byte buffer is far too short".into(),
+            ));
+        };
         assert!(matches!(err, ProcmonError::MalformedEvent));
         // Inhaltsfrei: die Meldung ist ein fester String, kann die Rohbytes
         // strukturell nicht enthalten.
         assert_eq!(err.to_string(), "process-exec payload buffer is malformed");
+        Ok(())
     }
 
     #[test]
-    fn test_parse_exec_payload_empty_buffer_returns_malformed_event_without_panicking() {
-        let err = parse_exec_payload(&[]).expect_err("an empty buffer must not panic");
+    fn test_parse_exec_payload_empty_buffer_returns_malformed_event_without_panicking() -> TestResult
+    {
+        let Err(err) = parse_exec_payload(&[]) else {
+            return Err(TestError::Unexpected(
+                "an empty buffer must not panic".into(),
+            ));
+        };
         assert!(matches!(err, ProcmonError::MalformedEvent));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_exec_payload_one_byte_short_of_filename_returns_malformed_event() {
+    fn test_parse_exec_payload_one_byte_short_of_filename_returns_malformed_event() -> TestResult {
         // `ARGV_OFFSET - 1` Byte: das `filename`-Feld reicht gerade nicht
         // vollständig in den Puffer.
         let payload = vec![0u8; ARGV_OFFSET - 1];
-        let err = parse_exec_payload(&payload).expect_err("truncated filename field must fail");
+        let Err(err) = parse_exec_payload(&payload) else {
+            return Err(TestError::Unexpected(
+                "truncated filename field must fail".into(),
+            ));
+        };
         assert!(matches!(err, ProcmonError::MalformedEvent));
+        Ok(())
     }
 }

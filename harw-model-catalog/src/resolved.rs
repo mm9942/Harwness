@@ -40,10 +40,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::descriptor::{bootstrap_descriptors, ModelDescriptor};
-use crate::observed::{bootstrap_observations, ObservedModelBehavior};
-use crate::router::{pick, Candidate, ModelRole};
-use crate::runtime::{profile_for, ModelRuntimeProfile};
+use crate::descriptor::{ModelDescriptor, bootstrap_descriptors};
+use crate::observed::{ObservedModelBehavior, bootstrap_observations};
+use crate::router::{Candidate, ModelRole, pick};
+use crate::runtime::{ModelRuntimeProfile, profile_for};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ResolvedModel
@@ -304,12 +304,11 @@ pub fn pick_role_from_ids(role: ModelRole, model_ids: &[&str]) -> Option<Resolve
         .map(ResolvedModel::as_candidate)
         .collect();
 
-    pick(role, &candidates).map(|winner| {
+    pick(role, &candidates).and_then(|winner| {
         resolved_models
             .iter()
             .find(|m| m.descriptor.model == winner.descriptor.model)
-            .expect("winner muss in resolved_models liegen")
-            .clone()
+            .cloned()
     })
 }
 
@@ -323,15 +322,17 @@ mod tests {
     use crate::descriptor::bootstrap_descriptors;
     use crate::observed::Score;
     use crate::router::ModelRole;
+    use crate::test_support::{TestError, TestResult};
 
     // Test 1: Bekanntes Modell liefert Some.
     #[test]
-    fn resolve_known_model_returns_some() {
+    fn resolve_known_model_returns_some() -> TestResult {
         let result = resolve("gpt-5");
         assert!(result.is_some(), "resolve(\"gpt-5\") muss Some liefern");
-        let model = result.unwrap();
+        let model = result.ok_or(TestError::Missing("gpt-5 resolved model"))?;
         assert_eq!(model.descriptor.model, "gpt-5");
         assert_eq!(model.descriptor.provider, "openai");
+        Ok(())
     }
 
     // Test 2: Unbekanntes Modell liefert None.
@@ -345,61 +346,69 @@ mod tests {
     }
 
     #[test]
-    fn resolve_from_prefers_configured_descriptor_over_bootstrap() {
+    fn resolve_from_prefers_configured_descriptor_over_bootstrap() -> TestResult {
         let mut configured = bootstrap_descriptors()
             .into_iter()
             .find(|descriptor| descriptor.model == "gpt-5")
-            .expect("gpt-5 muss im Bootstrap-Katalog sein");
+            .ok_or(TestError::Missing("gpt-5 in bootstrap catalog"))?;
         configured.provider = crate::descriptor::ProviderId::from("configured-openai");
 
-        let resolved = resolve_from("gpt-5", std::iter::once(&configured))
-            .expect("konfigurierter Descriptor muss auflösbar sein");
+        let resolved = resolve_from("gpt-5", std::iter::once(&configured)).ok_or(
+            TestError::Missing("konfigurierter Descriptor muss auflösbar sein"),
+        )?;
 
         assert_eq!(resolved.descriptor.provider, "configured-openai");
+        Ok(())
     }
 
     #[test]
-    fn resolve_from_uses_bootstrap_only_when_configured_descriptor_does_not_match() {
+    fn resolve_from_uses_bootstrap_only_when_configured_descriptor_does_not_match() -> TestResult {
         let bootstrap = bootstrap_descriptors();
         let configured = bootstrap
             .first()
-            .expect("Bootstrap-Katalog muss mindestens einen Descriptor enthalten");
+            .ok_or(TestError::Missing("mindestens ein Bootstrap-Descriptor"))?;
         let fallback = bootstrap
             .iter()
             .find(|descriptor| descriptor.model != configured.model)
-            .expect("Bootstrap-Katalog muss unterschiedliche Descriptoren enthalten");
+            .ok_or(TestError::Missing(
+                "unterschiedliche Bootstrap-Descriptoren",
+            ))?;
         assert_ne!(configured.model, fallback.model);
 
-        let resolved = resolve_from(fallback.model.as_str(), std::iter::once(configured))
-            .expect("Fallback-Descriptor muss aus dem Bootstrap-Katalog auflösbar sein");
+        let resolved = resolve_from(fallback.model.as_str(), std::iter::once(configured)).ok_or(
+            TestError::Missing("Fallback-Descriptor muss aus dem Bootstrap-Katalog auflösbar sein"),
+        )?;
 
         assert_eq!(resolved.descriptor.model, fallback.model);
         assert_eq!(resolved.descriptor.provider, fallback.provider);
+        Ok(())
     }
 
     #[test]
-    fn resolve_from_uses_first_matching_configured_descriptor_deterministically() {
+    fn resolve_from_uses_first_matching_configured_descriptor_deterministically() -> TestResult {
         let bootstrap = bootstrap_descriptors();
         let mut first = bootstrap
             .iter()
             .find(|descriptor| descriptor.model == "gpt-5")
-            .expect("gpt-5 muss im Bootstrap-Katalog sein")
+            .ok_or(TestError::Missing("gpt-5 in bootstrap catalog"))?
             .clone();
         let mut second = first.clone();
         first.provider = crate::descriptor::ProviderId::from("first-provider");
         second.provider = crate::descriptor::ProviderId::from("second-provider");
 
-        let resolved = resolve_from("gpt-5", [&first, &second])
-            .expect("erster konfigurierter Descriptor muss auflösbar sein");
+        let resolved = resolve_from("gpt-5", [&first, &second]).ok_or(TestError::Missing(
+            "erster konfigurierter Descriptor muss auflösbar sein",
+        ))?;
 
         assert_eq!(resolved.descriptor.provider, "first-provider");
+        Ok(())
     }
 
     // Test 3: Fallback auf Bootstrap-Observation wenn keine kuratierten Werte vorhanden.
     // Da bootstrap_observations alle 15 Modelle abdeckt, testen wir den Fallback
     // via resolve_from mit einem synthetischen Descriptor, der kein Bootstrap-Pendant hat.
     #[test]
-    fn resolve_unknown_falls_back_to_bootstrap_observed() {
+    fn resolve_unknown_falls_back_to_bootstrap_observed() -> TestResult {
         use crate::descriptor::{
             AgentFeatureSet, Modality, ModalitySet, ModelCapabilities, ModelLifecycle,
             PromptCachingSupport, ReasoningSupport, StreamingSupport, StructuredOutputSupport,
@@ -428,7 +437,7 @@ mod tests {
 
         let result = resolve_from("synthetic-model-xyz", std::iter::once(&synthetic));
         assert!(result.is_some(), "resolve_from muss Some liefern");
-        let model = result.unwrap();
+        let model = result.ok_or(TestError::Missing("resolved synthetic model"))?;
 
         // Observation muss Bootstrap-Score sein (alle HALF, updated_at None).
         assert_eq!(
@@ -469,6 +478,7 @@ mod tests {
             model.observed.evidence.is_empty(),
             "evidence muss leer sein"
         );
+        Ok(())
     }
 
     // Test 4: resolve_all_bootstrap liefert gleich viele Einträge wie bootstrap_descriptors.
@@ -499,7 +509,7 @@ mod tests {
 
     // Test 6: Unbekannte IDs werden ignoriert; nur bekannte wirken.
     #[test]
-    fn pick_role_ignores_unknown_ids() {
+    fn pick_role_ignores_unknown_ids() -> TestResult {
         let with_unknown = pick_role_from_ids(
             ModelRole::FocusedCodingWorker,
             &["gpt-5", "unknown-model-xyz", "nope"],
@@ -511,17 +521,20 @@ mod tests {
             with_unknown.is_some(),
             "sollte Some liefern wenn >= 1 bekanntes Modell"
         );
+        let with_unknown = with_unknown.ok_or(TestError::Missing("with_unknown result"))?;
+        let without_unknown =
+            without_unknown.ok_or(TestError::Missing("without_unknown result"))?;
         assert_eq!(
-            with_unknown.unwrap().descriptor.model,
-            without_unknown.unwrap().descriptor.model,
+            with_unknown.descriptor.model, without_unknown.descriptor.model,
             "Unbekannte IDs dürfen das Ergebnis nicht beeinflussen"
         );
+        Ok(())
     }
 
     // Test 7: as_candidate projiziert Referenzen korrekt.
     #[test]
-    fn as_candidate_projects_refs() {
-        let model = resolve("gpt-5").expect("gpt-5 muss im Bootstrap-Katalog sein");
+    fn as_candidate_projects_refs() -> TestResult {
+        let model = resolve("gpt-5").ok_or(TestError::Missing("gpt-5 in bootstrap catalog"))?;
         let candidate = model.as_candidate();
         assert_eq!(
             candidate.descriptor.model, "gpt-5",
@@ -531,6 +544,7 @@ mod tests {
             candidate.descriptor.provider, "openai",
             "as_candidate muss descriptor.provider korrekt projizieren"
         );
+        Ok(())
     }
 
     // Provider-Ids, deren `default_model` bewusst nicht über resolve() auflösbar ist.
@@ -575,15 +589,15 @@ mod tests {
 
     // Test 8: Serde JSON Roundtrip eines ResolvedModel.
     #[test]
-    fn resolved_serde_roundtrip() {
-        let original =
-            resolve("claude-opus-4-8").expect("claude-opus-4-8 muss im Bootstrap-Katalog sein");
-        let json = serde_json::to_string(&original).expect("Serialisierung muss erfolgreich sein");
-        let restored: ResolvedModel =
-            serde_json::from_str(&json).expect("Deserialisierung muss erfolgreich sein");
+    fn resolved_serde_roundtrip() -> TestResult {
+        let original = resolve("claude-opus-4-8")
+            .ok_or(TestError::Missing("claude-opus-4-8 in bootstrap catalog"))?;
+        let json = serde_json::to_string(&original)?;
+        let restored: ResolvedModel = serde_json::from_str(&json)?;
         assert_eq!(
             original, restored,
             "ResolvedModel Serde-Roundtrip muss verlustfrei sein (§16 Inv. 6)"
         );
+        Ok(())
     }
 }

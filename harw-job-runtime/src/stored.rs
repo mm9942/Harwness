@@ -202,7 +202,11 @@ impl StoredJob {
     ///     let _ = record.reclaim(now, |_holder| false);
     /// }
     /// ```
-    pub fn reclaim<F>(&mut self, now: Timestamp, is_holder_alive: F) -> JobRuntimeResult<ReclaimOutcome>
+    pub fn reclaim<F>(
+        &mut self,
+        now: Timestamp,
+        is_holder_alive: F,
+    ) -> JobRuntimeResult<ReclaimOutcome>
     where
         F: FnOnce(&str) -> bool,
     {
@@ -241,6 +245,7 @@ impl StoredJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::{Budget, Job, JobKind, RetryPolicy};
     use harw_types::WorkId;
     use jiff::SignedDuration;
@@ -265,7 +270,7 @@ mod tests {
 
     /// Builds a `StoredJob` with the given `trace`, otherwise identical to
     /// every other fixture in this module — isolates the field under test.
-    fn record(trace: Option<TraceContext>) -> StoredJob {
+    fn record(trace: Option<TraceContext>) -> TestResult<StoredJob> {
         let now = Timestamp::now();
         let mut job = Job::new(
             WorkId::from_str("work-1"),
@@ -279,8 +284,9 @@ mod tests {
             },
             now,
         );
-        job.mark_ready(now).expect("new job admits into ready");
-        StoredJob {
+        job.mark_ready(now)
+            .map_err(ctx("new job admits into ready"))?;
+        Ok(StoredJob {
             job,
             scope: scope(),
             input: serde_json::json!({"task": "review"}),
@@ -292,32 +298,46 @@ mod tests {
             cancellation: None,
             revision: 0,
             trace,
-        }
+        })
     }
 
     /// Builds a `StoredJob` whose job is actually `Running` under a fenced
     /// lease at `epoch`, so reclaim tests exercise a realistic pre-state.
-    fn claimed_record(now: Timestamp, ttl: SignedDuration, holder: &str, epoch: u64) -> StoredJob {
-        let mut record = record(None); // job.state == Ready already
+    fn claimed_record(
+        now: Timestamp,
+        ttl: SignedDuration,
+        holder: &str,
+        epoch: u64,
+    ) -> TestResult<StoredJob> {
+        let mut record = record(None)?; // job.state == Ready already
         let _ = record
             .job
             .claim(holder, now, ttl)
-            .expect("job claims into running");
-        let lease = Lease::acquire_fenced(record.job.id.clone(), holder, now, ttl, epoch, "nonce-under-test")
-            .expect("fenced lease acquires");
+            .map_err(ctx("job claims into running"))?;
+        let lease = Lease::acquire_fenced(
+            record.job.id.clone(),
+            holder,
+            now,
+            ttl,
+            epoch,
+            "nonce-under-test",
+        )
+        .map_err(ctx("fenced lease acquires"))?;
         record.lease_epoch = epoch;
         record.lease = Some(lease);
-        record
+        Ok(record)
     }
 
     #[test]
-    fn reclaim_fails_when_no_lease_is_present() {
-        let mut record = record(None); // job.state == Ready, lease == None
+    fn reclaim_fails_when_no_lease_is_present() -> TestResult {
+        let mut record = record(None)?; // job.state == Ready, lease == None
         let now = Timestamp::now();
 
-        let error = record
-            .reclaim(now, |_holder| false)
-            .expect_err("reclaim without an active lease must fail");
+        let Err(error) = record.reclaim(now, |_holder| false) else {
+            return Err(TestError::Unexpected(
+                "reclaim without an active lease must fail".into(),
+            ));
+        };
 
         assert!(matches!(
             error,
@@ -326,47 +346,70 @@ mod tests {
                 ..
             }
         ));
+        Ok(())
     }
 
     #[test]
-    fn reclaim_refuses_a_lease_that_has_not_expired_yet() {
+    fn reclaim_refuses_a_lease_that_has_not_expired_yet() -> TestResult {
         let now = Timestamp::now();
-        let mut record = claimed_record(now, SignedDuration::from_secs(60), "worker-a", 1);
+        let mut record = claimed_record(now, SignedDuration::from_secs(60), "worker-a", 1)?;
         let before = record.clone();
 
-        let error = record
-            .reclaim(now, |_holder| false) // holder liveness is irrelevant here
-            .expect_err("a still-valid lease must not be reclaimed");
+        // holder liveness is irrelevant here
+        let Err(error) = record.reclaim(now, |_holder| false) else {
+            return Err(TestError::Unexpected(
+                "a still-valid lease must not be reclaimed".into(),
+            ));
+        };
 
         assert!(matches!(error, JobRuntimeError::LeaseContended { .. }));
-        assert_eq!(record, before, "a rejected reclaim must not mutate the record");
+        assert_eq!(
+            record, before,
+            "a rejected reclaim must not mutate the record"
+        );
+        Ok(())
     }
 
     #[test]
-    fn reclaim_refuses_an_expired_lease_whose_holder_is_still_alive() {
+    fn reclaim_refuses_an_expired_lease_whose_holder_is_still_alive() -> TestResult {
         let now = Timestamp::now();
-        let mut record = claimed_record(now, SignedDuration::from_secs(1), "worker-a", 1);
-        let later = now.checked_add(SignedDuration::from_secs(2)).unwrap();
+        let mut record = claimed_record(now, SignedDuration::from_secs(1), "worker-a", 1)?;
+        let later = now
+            .checked_add(SignedDuration::from_secs(2))
+            .map_err(ctx("later timestamp in range"))?;
         let before = record.clone();
 
-        let error = record
-            .reclaim(later, |_holder| true) // live but slow: must not be reclaimed
-            .expect_err("a live-but-slow holder must not be reclaimed");
+        // live but slow: must not be reclaimed
+        let Err(error) = record.reclaim(later, |_holder| true) else {
+            return Err(TestError::Unexpected(
+                "a live-but-slow holder must not be reclaimed".into(),
+            ));
+        };
 
         assert!(matches!(error, JobRuntimeError::LeaseContended { .. }));
-        assert_eq!(record, before, "a rejected reclaim must not mutate the record");
+        assert_eq!(
+            record, before,
+            "a rejected reclaim must not mutate the record"
+        );
+        Ok(())
     }
 
     #[test]
-    fn reclaim_requeues_an_expired_lease_whose_holder_is_dead() {
+    fn reclaim_requeues_an_expired_lease_whose_holder_is_dead() -> TestResult {
         let now = Timestamp::now();
-        let mut record = claimed_record(now, SignedDuration::from_secs(1), "worker-a", 1);
-        let old_token = record.lease.as_ref().unwrap().token();
-        let later = now.checked_add(SignedDuration::from_secs(2)).unwrap();
+        let mut record = claimed_record(now, SignedDuration::from_secs(1), "worker-a", 1)?;
+        let old_token = record
+            .lease
+            .as_ref()
+            .ok_or(TestError::Missing("lease on claimed record"))?
+            .token();
+        let later = now
+            .checked_add(SignedDuration::from_secs(2))
+            .map_err(ctx("later timestamp in range"))?;
 
         let outcome = record
             .reclaim(later, |_holder| false)
-            .expect("an orphaned expired lease must be reclaimable");
+            .map_err(ctx("an orphaned expired lease must be reclaimable"))?;
 
         assert_eq!(outcome, ReclaimOutcome::Requeued);
         assert_eq!(record.job.state, JobState::Ready);
@@ -376,39 +419,49 @@ mod tests {
             record.lease_epoch > old_token.epoch,
             "fencing must advance the epoch past the reclaimed lease's token"
         );
+        Ok(())
     }
 
     #[test]
-    fn reclaim_moves_to_failed_once_the_retry_policy_is_exhausted() {
+    fn reclaim_moves_to_failed_once_the_retry_policy_is_exhausted() -> TestResult {
         let now = Timestamp::now();
-        let mut record = claimed_record(now, SignedDuration::from_secs(1), "worker-a", 1);
+        let mut record = claimed_record(now, SignedDuration::from_secs(1), "worker-a", 1)?;
         record.job.retry = RetryPolicy {
             max_attempts: 1,
             base_delay: SignedDuration::from_secs(1),
             factor: 2.0,
             max_delay: SignedDuration::from_secs(10),
         };
-        let later = now.checked_add(SignedDuration::from_secs(2)).unwrap();
+        let later = now
+            .checked_add(SignedDuration::from_secs(2))
+            .map_err(ctx("later timestamp in range"))?;
 
-        let outcome = record
-            .reclaim(later, |_holder| false)
-            .expect("reclaim itself succeeds even when the policy is exhausted");
+        let outcome = record.reclaim(later, |_holder| false).map_err(ctx(
+            "reclaim itself succeeds even when the policy is exhausted",
+        ))?;
 
         assert_eq!(outcome, ReclaimOutcome::Exhausted);
         assert_eq!(record.job.state, JobState::Failed);
         assert!(record.lease.is_none());
+        Ok(())
     }
 
     #[test]
-    fn reclaim_fencing_epoch_prevents_the_old_token_from_matching_a_future_lease() {
+    fn reclaim_fencing_epoch_prevents_the_old_token_from_matching_a_future_lease() -> TestResult {
         let now = Timestamp::now();
-        let mut record = claimed_record(now, SignedDuration::from_secs(1), "worker-a", 5);
-        let stale_token = record.lease.as_ref().unwrap().token();
-        let later = now.checked_add(SignedDuration::from_secs(2)).unwrap();
+        let mut record = claimed_record(now, SignedDuration::from_secs(1), "worker-a", 5)?;
+        let stale_token = record
+            .lease
+            .as_ref()
+            .ok_or(TestError::Missing("lease on claimed record"))?
+            .token();
+        let later = now
+            .checked_add(SignedDuration::from_secs(2))
+            .map_err(ctx("later timestamp in range"))?;
 
         record
             .reclaim(later, |_holder| false)
-            .expect("orphaned lease reclaims");
+            .map_err(ctx("orphaned lease reclaims"))?;
 
         // Any subsequent claim must be issued at an epoch beyond the one the
         // stranded holder still carries, so its stale token can never match
@@ -424,39 +477,43 @@ mod tests {
             next_epoch,
             "nonce-after-reclaim",
         )
-        .expect("a fresh lease can be issued after reclaim");
+        .map_err(ctx("a fresh lease can be issued after reclaim"))?;
         assert!(!next_lease.matches_token(&stale_token));
+        Ok(())
     }
 
     #[test]
-    fn stored_job_with_trace_context_roundtrips_through_serde() {
-        let original = record(Some(sample_trace()));
+    fn stored_job_with_trace_context_roundtrips_through_serde() -> TestResult {
+        let original = record(Some(sample_trace()))?;
 
-        let json = serde_json::to_string(&original).expect("serializes");
-        let decoded: StoredJob = serde_json::from_str(&json).expect("deserializes");
+        let json = serde_json::to_string(&original).map_err(ctx("serializes"))?;
+        let decoded: StoredJob = serde_json::from_str(&json).map_err(ctx("deserializes"))?;
 
         assert_eq!(decoded, original);
+        Ok(())
     }
 
     #[test]
-    fn stored_job_without_trace_context_roundtrips_through_serde() {
-        let original = record(None);
+    fn stored_job_without_trace_context_roundtrips_through_serde() -> TestResult {
+        let original = record(None)?;
 
-        let json = serde_json::to_string(&original).expect("serializes");
-        let decoded: StoredJob = serde_json::from_str(&json).expect("deserializes");
+        let json = serde_json::to_string(&original).map_err(ctx("serializes"))?;
+        let decoded: StoredJob = serde_json::from_str(&json).map_err(ctx("deserializes"))?;
 
         assert_eq!(decoded, original);
         assert_eq!(decoded.trace, None);
+        Ok(())
     }
 
     #[test]
-    fn a_stored_job_without_trace_omits_the_field_from_its_json() {
-        let json = serde_json::to_string(&record(None)).expect("serializes");
+    fn a_stored_job_without_trace_omits_the_field_from_its_json() -> TestResult {
+        let json = serde_json::to_string(&record(None)?).map_err(ctx("serializes"))?;
 
         assert!(
             !json.contains("\"trace\""),
             "a None trace must be absent, not serialized as `\"trace\":null`: {json}"
         );
+        Ok(())
     }
 
     /// The most important test in this module: a `StoredJob` written to disk
@@ -465,7 +522,7 @@ mod tests {
     /// `record(None)`, so it independently pins the pre-trace file format
     /// rather than testing today's serializer against itself.
     #[test]
-    fn a_pre_trace_stored_job_file_still_deserializes_with_no_trace() {
+    fn a_pre_trace_stored_job_file_still_deserializes_with_no_trace() -> TestResult {
         let legacy = r#"{
             "job": {
                 "id": "work-legacy",
@@ -510,10 +567,11 @@ mod tests {
         }"#;
 
         let decoded: StoredJob = serde_json::from_str(legacy)
-            .expect("a pre-trace StoredJob file must still deserialize");
+            .map_err(ctx("a pre-trace StoredJob file must still deserialize"))?;
 
         assert_eq!(decoded.trace, None);
         assert_eq!(decoded.job.id, WorkId::from_str("work-legacy"));
         assert_eq!(decoded.revision, 0);
+        Ok(())
     }
 }

@@ -122,6 +122,7 @@ pub fn rrf_fuse(lists: &[Vec<Ranked>], k: f32) -> Vec<Ranked> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
     use harw_lens_types::{ByteSpan, Chunk, SourceRef};
     use harw_types::ContentDigest;
 
@@ -177,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rrf_fuse_consensus_document_beats_single_top_rank() {
+    fn test_rrf_fuse_consensus_document_beats_single_top_rank() -> TestResult {
         let consensus = ranked("consensus", 0.1);
         let single = ranked("single", 0.1);
         let filler_one = ranked("filler-one", 0.1);
@@ -194,14 +195,15 @@ mod tests {
         let consensus_score = fused
             .iter()
             .find(|r| r.chunk.digest == consensus.chunk.digest)
-            .expect("consensus present")
-            .score;
+            .map(|r| r.score)
+            .ok_or(TestError::Missing("consensus in fused"))?;
         let single_score = fused
             .iter()
             .find(|r| r.chunk.digest == single.chunk.digest)
-            .expect("single present")
-            .score;
+            .map(|r| r.score)
+            .ok_or(TestError::Missing("single in fused"))?;
 
         assert!(consensus_score > single_score);
+        Ok(())
     }
 }

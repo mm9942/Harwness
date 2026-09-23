@@ -113,6 +113,7 @@ pub async fn complete_text(
 mod tests {
     use super::*;
     use crate::model::{ModelFuture, ModelResponse};
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Stub-Provider für die Tests dieses Moduls: liefert `reply`
     /// unverändert zurück, unabhängig vom eingehenden `ModelRequest`.
@@ -132,49 +133,56 @@ mod tests {
         }
     }
 
-    fn runtime() -> tokio::runtime::Runtime {
+    fn runtime() -> TestResult<tokio::runtime::Runtime> {
         tokio::runtime::Builder::new_current_thread()
             .build()
-            .expect("current-thread runtime")
+            .map_err(ctx("current-thread runtime"))
     }
 
     #[test]
-    fn complete_text_trims_and_returns_the_model_text() {
+    fn complete_text_trims_and_returns_the_model_text() -> TestResult {
         let provider = StubProvider {
             reply: Ok("  Hallo Welt  ".to_owned()),
         };
 
-        let text = runtime()
+        let text = runtime()?
             .block_on(complete_text(&provider, "m", "system", "user", 16))
-            .expect("stub reply succeeds");
+            .map_err(ctx("stub reply succeeds"))?;
 
         assert_eq!(text, "Hallo Welt");
+        Ok(())
     }
 
     #[test]
-    fn complete_text_propagates_model_errors() {
+    fn complete_text_propagates_model_errors() -> TestResult {
         let provider = StubProvider { reply: Err(()) };
 
-        let error = runtime()
-            .block_on(complete_text(&provider, "m", "system", "user", 16))
-            .expect_err("stub failure propagates");
+        let outcome =
+            runtime()?.block_on(complete_text(&provider, "m", "system", "user", 16));
+        let Err(error) = outcome else {
+            return Err(TestError::Unexpected("stub failure propagates".into()));
+        };
 
         assert!(matches!(
             error,
             OneShotError::Model(ModelError::RequestFailed(_))
         ));
+        Ok(())
     }
 
     #[test]
-    fn complete_text_rejects_a_blank_response() {
+    fn complete_text_rejects_a_blank_response() -> TestResult {
         let provider = StubProvider {
             reply: Ok("   \n\t  ".to_owned()),
         };
 
-        let error = runtime()
-            .block_on(complete_text(&provider, "m", "system", "user", 16))
-            .expect_err("blank response is rejected");
+        let outcome =
+            runtime()?.block_on(complete_text(&provider, "m", "system", "user", 16));
+        let Err(error) = outcome else {
+            return Err(TestError::Unexpected("blank response is rejected".into()));
+        };
 
         assert!(matches!(error, OneShotError::EmptyResponse));
+        Ok(())
     }
 }

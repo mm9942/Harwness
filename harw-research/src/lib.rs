@@ -58,9 +58,13 @@ pub use error::{ResearchError, ResearchResult};
 pub use return_envelope::{
     ReturnEnvelope, ReturnOutcome, envelope_with_finding, parse_return_envelope,
 };
-pub use schema::{finding_json_schema, finding_schema_prompt};
+pub use schema::{finding_json_schema, finding_schema_prompt, finding_schema_prompt_with_example};
 pub use types::{
     Confidence, FindingBundle, Freshness, QuestionId, QuestionScope, ResearchFinding,
     ResearchQuestion, SourceClass, SourceReference, VersionReference,
 };
 pub use validate::{parse_and_validate, parse_finding, validate_finding};
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

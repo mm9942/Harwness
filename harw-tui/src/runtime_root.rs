@@ -71,8 +71,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use ratatui::text::Line;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use time::OffsetDateTime;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use harw_core::{AgentSession, ModelProvider, StateStore};
 use harw_extension_api::ApprovalHandler;
@@ -80,9 +80,7 @@ use harw_operations::SharedSessionController;
 use harw_operations::adapter::CommandAdapter;
 use harw_operations::session_control::UiaSelection;
 use harw_protocol::events::{SessionEvent, TurnEvent};
-use harw_runtime::{
-    RootSession, RuntimeAssembly, RuntimeAssemblyBuilder, ServiceSurface,
-};
+use harw_runtime::{RootSession, RuntimeAssembly, RuntimeAssemblyBuilder, ServiceSurface};
 use harw_session_store::meta::{self, SessionMeta};
 use harw_types::{Clock, SessionId, SystemClock};
 
@@ -152,7 +150,13 @@ fn tui_greeting(
                 .filter(|value| !value.trim().is_empty())
         })
         .unwrap_or_else(|| "da".to_owned());
-    tui_greeting_at(project_root, uia_definition, &user, provider_info, OffsetDateTime::now_utc())
+    tui_greeting_at(
+        project_root,
+        uia_definition,
+        &user,
+        provider_info,
+        OffsetDateTime::now_utc(),
+    )
 }
 
 /// Liest den optionalen Anzeigenamen der aktiven UIA aus ihrer `USER.md`.
@@ -550,16 +554,36 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
         resume.as_ref().map(|r| r.session_store_root.as_path()),
         verbose_tools,
     )?;
-    let history = match runtime.block_on(assembly.state_store().load_history(session.id())) {
-        Ok(history) => history,
+    let hydration =
+        match runtime.block_on(session.hydrate_from_store(assembly.state_store().as_ref())) {
+            Ok(hydration) => hydration,
+            Err(error) => {
+                // Die Wurzelsitzung wurde bereits erzeugt (`build_root_runtime`);
+                // ihr Ende wird gemeldet, bevor der Fehler propagiert.
+                assembly.close_session(assembly.root_session_id());
+                return Err(TuiError::Core(format!(
+                    "durable history load failed: {error}"
+                )));
+            }
+        };
+    let _ = hydration;
+    let historic_agents = match runtime.block_on(
+        assembly
+            .state_store()
+            .load_agent_orchestration(session.id()),
+    ) {
+        Ok(events) => events,
         Err(error) => {
-            // Die Wurzelsitzung wurde bereits erzeugt (`build_root_runtime`);
-            // ihr Ende wird gemeldet, bevor der Fehler propagiert.
             assembly.close_session(assembly.root_session_id());
-            return Err(TuiError::Core(format!("durable history load failed: {error}")));
+            return Err(TuiError::Core(format!(
+                "durable orchestration load failed: {error}"
+            )));
         }
     };
+    let history = session.history().clone();
     install_loaded_history(&mut session, &mut app, history);
+    app.set_active_mode(session.mode());
+    app.set_historic_agent_events(historic_agents);
     let uia_user_name = active_uia_user_name(&assembly);
     app.push_lines(vec![Line::from(tui_greeting(
         app.project_root(),
@@ -661,6 +685,23 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
                                 assembly: next_assembly,
                                 runtime: next_runtime,
                             } = next;
+                            // Ein Wechsel verwirft die bisherige Session aus
+                            // dem Gateway. Ihren Modus, ihre Aktivierung und
+                            // aggregierte Nutzung deshalb vor dem Austausch
+                            // dauerhaft festhalten.
+                            if let Err(error) = gateway.persist_state().await {
+                                tracing::error!(
+                                    session_id = %current.root_session_id(),
+                                    %error,
+                                    "tui.session.persist_before_resume_failed"
+                                );
+                                push_system_text(
+                                    &mut app,
+                                    &format!("Could not persist the current session before resume: {error}"),
+                                );
+                                frame_req.schedule_frame();
+                                continue;
+                            }
                             gateway.replace(
                                 next_runtime.session,
                                 Arc::clone(next_assembly.state_store()),
@@ -693,8 +734,15 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
     });
     // `guard` stellt das Terminal zurück, auch im Fehlerfall.
     drop(guard);
+    let persistence = runtime.block_on(gateway.persist_state());
     current.close_session(current.root_session_id());
-    result
+    match (result, persistence) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) => Err(TuiError::Core(format!(
+            "could not persist session state on exit: {error}"
+        ))),
+    }
 }
 
 /// Klont einen [`TuiApprovalHandler`]-Zeiger als Trait-Objekt.
@@ -784,11 +832,12 @@ fn build_root_runtime(
     // die Montage gebaut wurde (E1.2). Eine fremde Verdrahtung trüge einen
     // anderen `Arc`, dessen Ereignisse nirgends in dieser Montage ankommen.
     let slash_services = assembly.services().service_map(ServiceSurface::Slash);
-    let belongs_to_assembly = slash_services
-        .get::<SharedSessionController>()
-        .is_some_and(|installed| {
-            std::ptr::addr_eq(Arc::as_ptr(installed), Arc::as_ptr(&controller))
-        });
+    let belongs_to_assembly =
+        slash_services
+            .get::<SharedSessionController>()
+            .is_some_and(|installed| {
+                std::ptr::addr_eq(Arc::as_ptr(installed), Arc::as_ptr(&controller))
+            });
     if !belongs_to_assembly {
         return Err(TuiError::Core(
             "wiring does not belong to this assembly".to_owned(),
@@ -846,6 +895,7 @@ fn build_root_runtime(
         assembly.memory().cloned(),
     )
     .with_runtime(Arc::clone(assembly))
+    .with_home(&assembly.spec().home)
     .with_verbose_tools(verbose_tools)
     .with_session_controller(controller)
     .with_project_root(assembly.project().project_root.display().to_string())
@@ -923,16 +973,19 @@ async fn resume_session(
         .factory
         .assemble(Some(selected))
         .map_err(|error| format!("Could not assemble session: {error}"))?;
-    let mut runtime =
-        build_root_runtime(
-            &assembly,
-            wiring,
-            Some(resume.session_store_root.as_path()),
-            verbose_tools,
-        )
-        .map_err(|error| format!("Could not start session: {error}"))?;
-    let history = match assembly.state_store().load_history(runtime.session.id()).await {
-        Ok(history) => history,
+    let mut runtime = build_root_runtime(
+        &assembly,
+        wiring,
+        Some(resume.session_store_root.as_path()),
+        verbose_tools,
+    )
+    .map_err(|error| format!("Could not start session: {error}"))?;
+    let hydration = match runtime
+        .session
+        .hydrate_from_store(assembly.state_store().as_ref())
+        .await
+    {
+        Ok(hydration) => hydration,
         Err(error) => {
             // Die Sitzung wurde bereits erzeugt; ihr Ende wird gemeldet, bevor
             // sie verworfen wird.
@@ -940,7 +993,22 @@ async fn resume_session(
             return Err(format!("durable history load failed: {error}"));
         }
     };
+    let _ = hydration;
+    let historic_agents = match assembly
+        .state_store()
+        .load_agent_orchestration(runtime.session.id())
+        .await
+    {
+        Ok(events) => events,
+        Err(error) => {
+            assembly.close_session(assembly.root_session_id());
+            return Err(format!("durable orchestration load failed: {error}"));
+        }
+    };
+    let history = runtime.session.history().clone();
     install_loaded_history(&mut runtime.session, &mut runtime.app, history);
+    runtime.app.set_active_mode(runtime.session.mode());
+    runtime.app.set_historic_agent_events(historic_agents);
     let uia_user_name = active_uia_user_name(&assembly);
     runtime.app.push_lines(vec![Line::from(tui_greeting(
         runtime.app.project_root(),
@@ -1008,7 +1076,10 @@ fn session_entry_from_meta(id: SessionId, session_meta: &SessionMeta) -> Session
 
 // Hängt mehrzeiligen Systemtext als eine Zelle mit einer Zeile je Textzeile an.
 fn push_system_text(app: &mut ChatApp, text: &str) {
-    let lines = text.lines().map(|line| Line::from(line.to_owned())).collect();
+    let lines = text
+        .lines()
+        .map(|line| Line::from(line.to_owned()))
+        .collect();
     app.push_lines(lines);
 }
 
@@ -1052,6 +1123,13 @@ impl ResumableGateway {
         self.store = store;
         self.model = model;
     }
+
+    /// Speichert den vollständigen, versionierten Zustand der aktiven
+    /// Sitzung. Der Verlauf bleibt weiterhin im Turn-Loop append-only; diese
+    /// Methode sichert die dazugehörige Projektion für Start, Resume und Exit.
+    async fn persist_state(&self) -> harw_core::state_store::StateStoreResult<()> {
+        self.session.persist_state(self.store.as_ref()).await
+    }
 }
 
 impl crate::gateway::ChatGateway for ResumableGateway {
@@ -1076,6 +1154,7 @@ impl crate::gateway::ChatGateway for ResumableGateway {
 mod tests {
     use super::*;
 
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_core::InteractionMode;
     use harw_operations::SessionController;
     use harw_runtime::{
@@ -1090,20 +1169,20 @@ mod tests {
         project: std::path::PathBuf,
     }
 
-    fn fixture() -> Fixture {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn fixture() -> TestResult<Fixture> {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let home = dir.path().join("home");
         let project = dir.path().join("project");
-        std::fs::create_dir_all(&home).expect("home");
-        std::fs::create_dir_all(&project).expect("project");
+        std::fs::create_dir_all(&home).map_err(ctx("home"))?;
+        std::fs::create_dir_all(&project).map_err(ctx("project"))?;
         // Projekt-Marker, damit die Projekterkennung genau hier stehen bleibt.
-        std::fs::write(project.join("Cargo.toml"), "[workspace]\n").expect("marker");
-        write_fixture_uia(&home);
-        Fixture {
+        std::fs::write(project.join("Cargo.toml"), "[workspace]\n").map_err(ctx("marker"))?;
+        write_fixture_uia(&home)?;
+        Ok(Fixture {
             _dir: dir,
             home,
             project,
-        }
+        })
     }
 
     /// Legt eine minimale, gültige UIA (`role = "user-interface"`) im
@@ -1121,20 +1200,21 @@ mod tests {
     /// Profil-`config.toml` mit offener `[mcp_listener]`-Tabelle nicht ans
     /// Ende angehängt werden darf. Layout spiegelt exakt
     /// `harw-runtime/src/assembly.rs`s eigenes `write_fixture_uia`.
-    fn write_fixture_uia(home: &std::path::Path) {
+    fn write_fixture_uia(home: &std::path::Path) -> TestResult {
         let profile_dir = home.join("profiles").join("default");
         let agent_dir = profile_dir.join("agents").join("fixture-uia");
-        std::fs::create_dir_all(&agent_dir).expect("fixture uia dir");
+        std::fs::create_dir_all(&agent_dir).map_err(ctx("fixture uia dir"))?;
         std::fs::write(
             agent_dir.join("definition.toml"),
             "schema = \"harwness.agent/v1\"\nid = \"harwness.agent.fixture-uia@1\"\nversion = \"1.0.0\"\nrole = \"user-interface\"\nspecialization = \"terminal-ui\"\n",
         )
-        .expect("fixture uia definition");
+        .map_err(ctx("fixture uia definition"))?;
         std::fs::write(
             profile_dir.join("config.toml"),
             "active_uia_definition = \"harwness.agent.fixture-uia@1\"\n",
         )
-        .expect("fixture profile config");
+        .map_err(ctx("fixture profile config"))?;
+        Ok(())
     }
 
     /// Builder einer Echo-Montage mit Einstieg `Tui`.
@@ -1169,18 +1249,18 @@ mod tests {
     fn tui_assembly(
         fixture: &Fixture,
         mode_override: Option<InteractionMode>,
-    ) -> (Arc<RuntimeAssembly>, TuiSessionWiring) {
+    ) -> TestResult<(Arc<RuntimeAssembly>, TuiSessionWiring)> {
         let wiring = TuiSessionWiring::new();
         let assembly = wiring
             .install(tui_builder(fixture, mode_override))
             .build()
-            .expect("tui echo assembly builds with wiring installed");
-        (Arc::new(assembly), wiring)
+            .map_err(ctx("tui echo assembly builds with wiring installed"))?;
+        Ok((Arc::new(assembly), wiring))
     }
 
     #[test]
-    fn test_tui_session_wiring_install_sets_controller_and_events() {
-        let fixture = fixture();
+    fn test_tui_session_wiring_install_sets_controller_and_events() -> TestResult {
+        let fixture = fixture()?;
 
         // Ohne Verdrahtung fehlt der Ereigniskanal, den `BuiltinRoles` braucht.
         let bare = tui_builder(&fixture, None).build();
@@ -1189,26 +1269,30 @@ mod tests {
             "a Tui assembly without session events must fail closed"
         );
 
-        let (assembly, wiring) = tui_assembly(&fixture, None);
+        let (assembly, wiring) = tui_assembly(&fixture, None)?;
         let services = assembly.services().service_map(ServiceSurface::Slash);
         let installed = services
             .get::<SharedSessionController>()
-            .expect("the slash surface carries the installed controller");
+            .ok_or(TestError::Missing(
+                "the slash surface carries the installed controller",
+            ))?;
         assert!(std::ptr::addr_eq(
             Arc::as_ptr(installed),
             Arc::as_ptr(&wiring.controller)
         ));
         assert!(!wiring.events_tx.is_closed());
+        Ok(())
     }
 
     #[test]
-    fn test_build_root_runtime_mounts_responder_in_chain() {
-        let fixture = fixture();
-        let (assembly, wiring) = tui_assembly(&fixture, None);
+    fn test_build_root_runtime_mounts_responder_in_chain() -> TestResult {
+        let fixture = fixture()?;
+        let (assembly, wiring) = tui_assembly(&fixture, None)?;
         let controller = Arc::clone(&wiring.controller);
         let chain_before = assembly.rights_snapshot().approval_chain;
 
-        let runtime = build_root_runtime(&assembly, wiring, None, false).expect("root runtime builds");
+        let runtime = build_root_runtime(&assembly, wiring, None, false)
+            .map_err(ctx("root runtime builds"))?;
 
         let chain_after = assembly.rights_snapshot().approval_chain;
         assert_eq!(chain_after.len(), chain_before.len() + 1);
@@ -1232,6 +1316,7 @@ mod tests {
             uia_selection_from_config(assembly.config()),
             "the root controller must receive the effective persisted UIA selection"
         );
+        Ok(())
     }
 
     #[test]
@@ -1251,21 +1336,23 @@ mod tests {
     }
 
     #[test]
-    fn test_build_root_runtime_applies_mode_override() {
-        let fixture = fixture();
-        let (assembly, wiring) = tui_assembly(&fixture, Some(InteractionMode::Plan));
+    fn test_build_root_runtime_applies_mode_override() -> TestResult {
+        let fixture = fixture()?;
+        let (assembly, wiring) = tui_assembly(&fixture, Some(InteractionMode::Plan))?;
 
-        let runtime = build_root_runtime(&assembly, wiring, None, false).expect("root runtime builds");
+        let runtime = build_root_runtime(&assembly, wiring, None, false)
+            .map_err(ctx("root runtime builds"))?;
 
         assert_eq!(runtime.session.mode(), InteractionMode::Plan);
         assert_eq!(runtime.app.active_mode(), InteractionMode::Plan);
+        Ok(())
     }
 
     #[test]
-    fn test_build_root_runtime_rejects_foreign_wiring() {
-        let fixture = fixture();
-        let (assembly_a, _wiring_a) = tui_assembly(&fixture, None);
-        let (_assembly_b, wiring_b) = tui_assembly(&fixture, None);
+    fn test_build_root_runtime_rejects_foreign_wiring() -> TestResult {
+        let fixture = fixture()?;
+        let (assembly_a, _wiring_a) = tui_assembly(&fixture, None)?;
+        let (_assembly_b, wiring_b) = tui_assembly(&fixture, None)?;
 
         // `wiring_b` wurde in die Slash-`ServiceMap` von `assembly_b` gelegt,
         // nicht in die von `assembly_a`; der Bau muss fail-closed ablehnen,
@@ -1274,15 +1361,24 @@ mod tests {
         let result = build_root_runtime(&assembly_a, wiring_b, None, false);
 
         match result {
-            Ok(_) => panic!("expected TuiError::Core for foreign wiring, got Ok"),
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "expected TuiError::Core for foreign wiring, got Ok".into(),
+                ));
+            }
             Err(TuiError::Core(message)) => {
                 assert!(
                     message.contains("does not belong"),
                     "unexpected error message: {message}"
                 );
             }
-            Err(other) => panic!("expected TuiError::Core for foreign wiring, got {other:?}"),
+            Err(other) => {
+                return Err(TestError::Unexpected(format!(
+                    "expected TuiError::Core for foreign wiring, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     use harw_session_store::TitleSource;
@@ -1359,71 +1455,93 @@ mod tests {
     /// [`session_entries`] liest jeden Sidecar über `meta::load_or_derive` und
     /// baut daraus die Anzeige-Einträge des Pickers.
     #[test]
-    fn test_session_entries_reads_saved_sidecars() {
-        let temp = tempfile::tempdir().expect("tempdir");
+    fn test_session_entries_reads_saved_sidecars() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let meta_a = meta_with("session-a", Some("Alpha"), 5, None, None);
         let meta_b = meta_with("session-b", Some("Beta"), 0, None, None);
-        meta::save(temp.path(), &meta_a).expect("save a");
-        meta::save(temp.path(), &meta_b).expect("save b");
+        meta::save(temp.path(), &meta_a).map_err(ctx("save a"))?;
+        meta::save(temp.path(), &meta_b).map_err(ctx("save b"))?;
 
         let entries = session_entries(
             temp.path(),
-            vec![SessionId::from_str("session-a"), SessionId::from_str("session-b")],
+            vec![
+                SessionId::from_str("session-a"),
+                SessionId::from_str("session-b"),
+            ],
         );
 
         assert_eq!(entries.len(), 2);
-        assert!(entries.iter().any(|entry| entry.title == "Alpha" && entry.turns == Some(5)));
-        assert!(entries.iter().any(|entry| entry.title == "Beta" && entry.turns.is_none()));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.title == "Alpha" && entry.turns == Some(5))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.title == "Beta" && entry.turns.is_none())
+        );
+        Ok(())
     }
 
     /// Ohne fortsetzbare Sitzungen liefert [`session_entries`] eine leere
     /// Liste (der Picker zeigt dafür selbst seinen Leerzustand) — Schritt 7,
     /// "Verhalten ohne Sessions".
     #[test]
-    fn test_session_entries_of_empty_ids_is_empty() {
-        let temp = tempfile::tempdir().expect("tempdir");
+    fn test_session_entries_of_empty_ids_is_empty() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
 
         let entries = session_entries(temp.path(), Vec::new());
 
         assert!(entries.is_empty());
+        Ok(())
     }
 
     /// Eine Sitzungs-ID, die nicht einmal adressierbar ist (z. B. durch einen
     /// Ableitungsfehler), wird übersprungen statt den gesamten Picker leer zu
     /// machen oder zu paniken.
     #[test]
-    fn test_session_entries_skips_unaddressable_session_id() {
-        let temp = tempfile::tempdir().expect("tempdir");
+    fn test_session_entries_skips_unaddressable_session_id() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
 
         let entries = session_entries(temp.path(), vec![SessionId::from_str("../escape")]);
 
         assert!(entries.is_empty());
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod greeting_tests {
     use super::tui_greeting_at;
+    use crate::test_support::{TestResult, ctx};
     use time::{Date, Month, PrimitiveDateTime, Time};
 
     #[test]
-    fn greeting_uses_workspace_user_date_and_time() {
+    fn greeting_uses_workspace_user_date_and_time() -> TestResult {
         let now = PrimitiveDateTime::new(
-            Date::from_calendar_date(2026, Month::September, 14).unwrap(),
-            Time::from_hms(19, 5, 0).unwrap(),
+            Date::from_calendar_date(2026, Month::September, 14).map_err(ctx("date"))?,
+            Time::from_hms(19, 5, 0).map_err(ctx("time"))?,
         )
         .assume_utc();
-        let greeting = tui_greeting_at("/work/Harwness", Some("harwness.agent.emily-ui"), "Mia", None, now);
+        let greeting = tui_greeting_at(
+            "/work/Harwness",
+            Some("harwness.agent.emily-ui"),
+            "Mia",
+            None,
+            now,
+        );
         assert!(greeting.starts_with("emily-ui: Guten Abend, Mia!"));
         assert!(greeting.contains("»Harwness«"));
         assert!(greeting.contains("2026-09-14 19:05 UTC"));
+        Ok(())
     }
 
     #[test]
-    fn greeting_prefers_the_explicit_user_profile_name() {
+    fn greeting_prefers_the_explicit_user_profile_name() -> TestResult {
         let now = PrimitiveDateTime::new(
-            Date::from_calendar_date(2026, Month::September, 14).unwrap(),
-            Time::from_hms(11, 4, 0).unwrap(),
+            Date::from_calendar_date(2026, Month::September, 14).map_err(ctx("date"))?,
+            Time::from_hms(11, 4, 0).map_err(ctx("time"))?,
         )
         .assume_utc();
 
@@ -1436,13 +1554,14 @@ mod greeting_tests {
         );
 
         assert!(greeting.starts_with("terminal-ui@1: Guten Morgen, Mia!"));
+        Ok(())
     }
 
     #[test]
-    fn greeting_includes_provider_and_model_when_available() {
+    fn greeting_includes_provider_and_model_when_available() -> TestResult {
         let now = PrimitiveDateTime::new(
-            Date::from_calendar_date(2026, Month::September, 14).unwrap(),
-            Time::from_hms(10, 0, 0).unwrap(),
+            Date::from_calendar_date(2026, Month::September, 14).map_err(ctx("date"))?,
+            Time::from_hms(10, 0, 0).map_err(ctx("time"))?,
         )
         .assume_utc();
         let greeting = tui_greeting_at(
@@ -1453,13 +1572,14 @@ mod greeting_tests {
             now,
         );
         assert!(greeting.contains("Provider: anthropic · Modell: claude-sonnet"));
+        Ok(())
     }
 
     #[test]
-    fn greeting_omits_provider_info_when_none() {
+    fn greeting_omits_provider_info_when_none() -> TestResult {
         let now = PrimitiveDateTime::new(
-            Date::from_calendar_date(2026, Month::September, 14).unwrap(),
-            Time::from_hms(10, 0, 0).unwrap(),
+            Date::from_calendar_date(2026, Month::September, 14).map_err(ctx("date"))?,
+            Time::from_hms(10, 0, 0).map_err(ctx("time"))?,
         )
         .assume_utc();
         let greeting = tui_greeting_at(
@@ -1471,5 +1591,6 @@ mod greeting_tests {
         );
         assert!(!greeting.contains("Provider:"));
         assert!(!greeting.contains("Modell:"));
+        Ok(())
     }
 }

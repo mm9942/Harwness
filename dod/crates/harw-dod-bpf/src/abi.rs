@@ -85,21 +85,30 @@ pub struct WireEvent {
 
 fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16, BpfError> {
     let end = offset.checked_add(2).ok_or(BpfError::MalformedEvent)?;
-    let value: [u8; 2] = bytes.get(offset..end).ok_or(BpfError::MalformedEvent)?.try_into()
+    let value: [u8; 2] = bytes
+        .get(offset..end)
+        .ok_or(BpfError::MalformedEvent)?
+        .try_into()
         .map_err(|_| BpfError::MalformedEvent)?;
     Ok(u16::from_le_bytes(value))
 }
 
 fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32, BpfError> {
     let end = offset.checked_add(4).ok_or(BpfError::MalformedEvent)?;
-    let value: [u8; 4] = bytes.get(offset..end).ok_or(BpfError::MalformedEvent)?.try_into()
+    let value: [u8; 4] = bytes
+        .get(offset..end)
+        .ok_or(BpfError::MalformedEvent)?
+        .try_into()
         .map_err(|_| BpfError::MalformedEvent)?;
     Ok(u32::from_le_bytes(value))
 }
 
 fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64, BpfError> {
     let end = offset.checked_add(8).ok_or(BpfError::MalformedEvent)?;
-    let value: [u8; 8] = bytes.get(offset..end).ok_or(BpfError::MalformedEvent)?.try_into()
+    let value: [u8; 8] = bytes
+        .get(offset..end)
+        .ok_or(BpfError::MalformedEvent)?
+        .try_into()
         .map_err(|_| BpfError::MalformedEvent)?;
     Ok(u64::from_le_bytes(value))
 }
@@ -108,13 +117,15 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64, BpfError> {
 /// record length mismatch, and contradictory payload lengths are rejected;
 /// accepting a prefix would make a future ABI silently look valid.
 pub fn parse_wire_event(bytes: &[u8]) -> Result<WireEvent, BpfError> {
-    if bytes.len() < WIRE_HEADER_LEN_V1 || bytes.get(MAGIC_OFFSET..4) != Some(WIRE_MAGIC.as_slice()) {
+    if bytes.len() < WIRE_HEADER_LEN_V1 || bytes.get(MAGIC_OFFSET..4) != Some(WIRE_MAGIC.as_slice())
+    {
         return Err(BpfError::MalformedEvent);
     }
     if read_u16_le(bytes, VERSION_OFFSET)? != WIRE_VERSION_V1 {
         return Err(BpfError::UnsupportedWireVersion);
     }
-    let record_len = usize::try_from(read_u32_le(bytes, LENGTH_OFFSET)?).map_err(|_| BpfError::MalformedEvent)?;
+    let record_len = usize::try_from(read_u32_le(bytes, LENGTH_OFFSET)?)
+        .map_err(|_| BpfError::MalformedEvent)?;
     if record_len != bytes.len() || record_len < WIRE_HEADER_LEN_V1 {
         return Err(BpfError::MalformedEvent);
     }
@@ -127,7 +138,9 @@ pub fn parse_wire_event(bytes: &[u8]) -> Result<WireEvent, BpfError> {
     }
 
     Ok(WireEvent {
-        event_type: WireEventType::try_from(*bytes.get(TYPE_OFFSET).ok_or(BpfError::MalformedEvent)?)?,
+        event_type: WireEventType::try_from(
+            *bytes.get(TYPE_OFFSET).ok_or(BpfError::MalformedEvent)?,
+        )?,
         flags: *bytes.get(FLAGS_OFFSET).ok_or(BpfError::MalformedEvent)?,
         ktime_ns: read_u64_le(bytes, KTIME_OFFSET)?,
         sequence: read_u64_le(bytes, SEQUENCE_OFFSET)?,
@@ -144,15 +157,20 @@ pub fn parse_wire_event(bytes: &[u8]) -> Result<WireEvent, BpfError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_wire_event, TaskIdentity, WireEventType, WIRE_HEADER_LEN_V1, WIRE_MAGIC, WIRE_VERSION_V1};
+    use super::{
+        TaskIdentity, WIRE_HEADER_LEN_V1, WIRE_MAGIC, WIRE_VERSION_V1, WireEventType,
+        parse_wire_event,
+    };
     use crate::BpfError;
+    use crate::test_support::{TestResult, ctx};
 
     fn record(kind: u8, payload: &[u8]) -> Vec<u8> {
         let mut bytes = vec![0; WIRE_HEADER_LEN_V1];
         bytes[0..4].copy_from_slice(&WIRE_MAGIC);
         bytes[4..6].copy_from_slice(&WIRE_VERSION_V1.to_le_bytes());
         bytes[6] = kind;
-        bytes[8..12].copy_from_slice(&(WIRE_HEADER_LEN_V1 as u32 + payload.len() as u32).to_le_bytes());
+        bytes[8..12]
+            .copy_from_slice(&(WIRE_HEADER_LEN_V1 as u32 + payload.len() as u32).to_le_bytes());
         bytes[12..20].copy_from_slice(&42u64.to_le_bytes());
         bytes[20..28].copy_from_slice(&7u64.to_le_bytes());
         bytes[28..32].copy_from_slice(&10u32.to_le_bytes());
@@ -166,35 +184,55 @@ mod tests {
     }
 
     #[test]
-    fn parses_explicit_v1_tcp_connect_layout() {
-        let event = parse_wire_event(&record(3, b"tcp")).unwrap();
+    fn parses_explicit_v1_tcp_connect_layout() -> TestResult {
+        let event = parse_wire_event(&record(3, b"tcp")).map_err(ctx("parse_wire_event"))?;
         assert_eq!(event.event_type, WireEventType::TcpConnect);
         assert_eq!(event.ktime_ns, 42);
-        assert_eq!(event.task, TaskIdentity { tgid: 10, pid: 11, ppid: 9, uid: 1000, cgroup_id: 77 });
+        assert_eq!(
+            event.task,
+            TaskIdentity {
+                tgid: 10,
+                pid: 11,
+                ppid: 9,
+                uid: 1000,
+                cgroup_id: 77
+            }
+        );
         assert_eq!(event.payload, b"tcp");
+        Ok(())
     }
 
     #[test]
-    fn v1_carries_a_global_sequence_and_rejects_nonzero_reserved_bytes() {
+    fn v1_carries_a_global_sequence_and_rejects_nonzero_reserved_bytes() -> TestResult {
         let mut bytes = record(2, b"");
         // The production ABI reserves bytes 54..56 so that an incompatible
         // producer cannot silently look like v1.  Sequence 99 is deliberately
         // distinct from the monotonic timestamp above.
         bytes[20..28].copy_from_slice(&99u64.to_le_bytes());
-        let event = parse_wire_event(&bytes).unwrap();
+        let event = parse_wire_event(&bytes).map_err(ctx("parse_wire_event"))?;
         assert_eq!(event.sequence, 99);
 
         bytes[54] = 1;
-        assert!(matches!(parse_wire_event(&bytes), Err(BpfError::MalformedEvent)));
+        assert!(matches!(
+            parse_wire_event(&bytes),
+            Err(BpfError::MalformedEvent)
+        ));
+        Ok(())
     }
 
     #[test]
     fn rejects_unknown_version_and_length_mismatch() {
         let mut version = record(1, &[]);
         version[4..6].copy_from_slice(&2u16.to_le_bytes());
-        assert!(matches!(parse_wire_event(&version), Err(BpfError::UnsupportedWireVersion)));
+        assert!(matches!(
+            parse_wire_event(&version),
+            Err(BpfError::UnsupportedWireVersion)
+        ));
         let mut length = record(1, &[]);
         length[8..12].copy_from_slice(&99u32.to_le_bytes());
-        assert!(matches!(parse_wire_event(&length), Err(BpfError::MalformedEvent)));
+        assert!(matches!(
+            parse_wire_event(&length),
+            Err(BpfError::MalformedEvent)
+        ));
     }
 }

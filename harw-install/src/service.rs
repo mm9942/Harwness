@@ -242,6 +242,7 @@ impl ServiceManager for UnsupportedServiceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     fn spec() -> ServiceSpec {
         ServiceSpec {
@@ -302,23 +303,27 @@ mod tests {
     }
 
     #[test]
-    fn test_unsupported_install_returns_unsupported_error() {
+    fn test_unsupported_install_returns_unsupported_error() -> TestResult {
         let mgr = UnsupportedServiceManager::new();
-        let err = mgr.install(&spec()).unwrap_err();
+        let Err(err) = mgr.install(&spec()) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, ServiceError::Unsupported { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_unsupported_status_and_uninstall_return_unsupported() {
+    fn test_unsupported_status_and_uninstall_return_unsupported() -> TestResult {
         let mgr = UnsupportedServiceManager::new();
-        assert!(matches!(
-            mgr.status("harw").unwrap_err(),
-            ServiceError::Unsupported { .. }
-        ));
-        assert!(matches!(
-            mgr.uninstall("harw").unwrap_err(),
-            ServiceError::Unsupported { .. }
-        ));
+        let Err(status_err) = mgr.status("harw") else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        assert!(matches!(status_err, ServiceError::Unsupported { .. }));
+        let Err(uninstall_err) = mgr.uninstall("harw") else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        assert!(matches!(uninstall_err, ServiceError::Unsupported { .. }));
+        Ok(())
     }
 
     #[test]

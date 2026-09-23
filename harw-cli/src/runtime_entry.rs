@@ -273,6 +273,18 @@ pub(crate) fn configured_secret_resolver(
 ) -> Result<Option<Arc<dyn harw_provider_http::SecretResolver + Send + Sync>>, String> {
     let resolver =
         crate::secret_store::open_configured_secret_resolver_for_active_provider(home, config)?;
+    // `doc.read_pdf` (docs/design/doc_read_pdf_design.md §W4): dieser Wrapper
+    // ist der eine Ort, an dem sowohl `chat`/TUI (`chat.rs`) als auch `harw
+    // analyze` (`main.rs::cmd_analyze`) ihren Secret-Resolver für einen
+    // konfigurierten Provider öffnen; installiert hier statt an jeder
+    // Aufrufstelle einzeln, ohne die Laufzeitpfade sonst zu ändern.
+    crate::doc_ocr::install_doc_ocr(
+        config,
+        Some(home),
+        resolver
+            .as_ref()
+            .map(|resolver| resolver as &dyn harw_provider_http::SecretResolver),
+    );
     Ok(resolver.map(|resolver| {
         Arc::new(resolver) as Arc<dyn harw_provider_http::SecretResolver + Send + Sync>
     }))
@@ -320,6 +332,7 @@ pub(crate) fn doctor_assembly(home: &Path, cwd: &Path) -> Result<RuntimeAssembly
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_types::{IngressSurface, PermissionTier, PrincipalKind, SessionId, ThreadRef};
     use tempfile::TempDir;
 
@@ -356,21 +369,22 @@ mod tests {
     }
 
     #[test]
-    fn test_profile_sessions_root_creates_directory() {
-        let home = TempDir::new().expect("home tempdir");
+    fn test_profile_sessions_root_creates_directory() -> TestResult {
+        let home = TempDir::new().map_err(ctx("home tempdir"))?;
 
-        let sessions_root =
-            profile_sessions_root(home.path()).expect("sessions root resolves and is created");
+        let sessions_root = profile_sessions_root(home.path())
+            .map_err(ctx("sessions root resolves and is created"))?;
 
         assert!(sessions_root.is_dir(), "{}", sessions_root.display());
         assert!(sessions_root.ends_with("sessions"));
         assert!(sessions_root.starts_with(home.path()));
+        Ok(())
     }
 
     #[test]
-    fn test_build_assembly_local_echo_succeeds() {
-        let home = TempDir::new().expect("home tempdir");
-        let cwd = TempDir::new().expect("cwd tempdir");
+    fn test_build_assembly_local_echo_succeeds() -> TestResult {
+        let home = TempDir::new().map_err(ctx("home tempdir"))?;
+        let cwd = TempDir::new().map_err(ctx("cwd tempdir"))?;
 
         let spec = runtime_spec(
             EntryKind::LocalEcho,
@@ -378,8 +392,8 @@ mod tests {
             cwd.path(),
             test_principal(),
         );
-        let sessions_root =
-            profile_sessions_root(home.path()).expect("sessions root resolves and is created");
+        let sessions_root = profile_sessions_root(home.path())
+            .map_err(ctx("sessions root resolves and is created"))?;
         let state_store = transcript_state_store(&sessions_root, test_thread_for_session);
         let stores = RuntimeStores {
             state_store,
@@ -390,23 +404,25 @@ mod tests {
         let assembly = build_assembly(spec, ModelSource::Echo("x".to_owned()), stores, None);
 
         assert!(assembly.is_ok(), "{:?}", assembly.err());
+        Ok(())
     }
 
     #[test]
-    fn test_local_principal_cli_sets_human_operator_tier_and_kernel_uid() {
+    fn test_local_principal_cli_sets_human_operator_tier_and_kernel_uid() -> TestResult {
         let principal = local_principal(IngressSurface::Cli);
 
         assert_eq!(principal.kind(), PrincipalKind::Human);
         assert_eq!(principal.surface(), IngressSurface::Cli);
         assert_eq!(principal.tier(), PermissionTier::Operator);
         let id = principal.id();
-        let raw_uid = id.strip_prefix("uid:").expect(
+        let raw_uid = id.strip_prefix("uid:").ok_or(TestError::Missing(
             "local_principal id must carry the kernel-witnessed uid under the 'uid:' prefix",
-        );
+        ))?;
         assert!(
             raw_uid.parse::<u32>().is_ok(),
             "expected a numeric uid suffix, got '{id}'"
         );
+        Ok(())
     }
 
     #[test]
@@ -420,14 +436,15 @@ mod tests {
     }
 
     #[test]
-    fn test_configured_secret_resolver_without_sealed_provider_returns_none() {
+    fn test_configured_secret_resolver_without_sealed_provider_returns_none() -> TestResult {
         let config = ResolvedConfig::default();
-        let home = TempDir::new().expect("home tempdir");
+        let home = TempDir::new().map_err(ctx("home tempdir"))?;
 
         let resolver = configured_secret_resolver(home.path(), &config)
-            .expect("no sealed provider must not require a KEK");
+            .map_err(ctx("no sealed provider must not require a KEK"))?;
 
         assert!(resolver.is_none());
+        Ok(())
     }
 
     /// F-046-Regression: ein *anderer*, von diesem Lauf nicht als
@@ -435,42 +452,45 @@ mod tests {
     /// kein KEK verlangen — sonst würde ein unbenutzter, versiegelter
     /// Provider jeden lokalen Einstieg blockieren.
     #[test]
-    fn test_configured_secret_resolver_ignores_an_unused_sealed_provider_without_a_kek() {
+    fn test_configured_secret_resolver_ignores_an_unused_sealed_provider_without_a_kek()
+    -> TestResult {
         let mut config = ResolvedConfig::default();
         config.providers.insert(
             "sealed".to_owned(),
             toml::from_str::<harw_config::ProviderToml>(
                 "name = \"sealed\"\napi = \"openai-compatible\"\nbase_url = \"https://example.test\"\nauth = \"secrets:provider-token\"\n",
             )
-            .expect("valid test provider"),
+            .map_err(ctx("valid test provider"))?,
         );
         config.providers.insert(
             "plain".to_owned(),
             toml::from_str::<harw_config::ProviderToml>(
                 "name = \"plain\"\napi = \"openai-compatible\"\nbase_url = \"https://example.test\"\nauth = \"env:PLAIN_TOKEN\"\n",
             )
-            .expect("valid test provider"),
+            .map_err(ctx("valid test provider"))?,
         );
         config.harness.default_provider = Some("plain".to_owned());
-        let home = TempDir::new().expect("home tempdir");
+        let home = TempDir::new().map_err(ctx("home tempdir"))?;
 
         let resolver = configured_secret_resolver(home.path(), &config)
-            .expect("an unused sealed provider must not require a KEK");
+            .map_err(ctx("an unused sealed provider must not require a KEK"))?;
 
         assert!(resolver.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_doctor_assembly_succeeds_with_empty_home() {
-        let home = TempDir::new().expect("home tempdir");
-        let cwd = TempDir::new().expect("cwd tempdir");
+    fn test_doctor_assembly_succeeds_with_empty_home() -> TestResult {
+        let home = TempDir::new().map_err(ctx("home tempdir"))?;
+        let cwd = TempDir::new().map_err(ctx("cwd tempdir"))?;
 
         let assembly = doctor_assembly(home.path(), cwd.path())
-            .expect("doctor assembly must build against an empty temp home");
+            .map_err(ctx("doctor assembly must build against an empty temp home"))?;
 
         let snapshot = assembly.rights_snapshot();
         assert_eq!(snapshot.entry, EntryKind::Doctor);
         assert_eq!(snapshot.principal.surface(), IngressSurface::Cli);
         assert_eq!(snapshot.principal.tier(), PermissionTier::Operator);
+        Ok(())
     }
 }

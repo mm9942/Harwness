@@ -96,7 +96,10 @@ impl EgressPolicy {
             .collect::<Result<Vec<String>, EgressError>>()?;
         normalized.sort();
         normalized.dedup();
-        Ok(Self { allow_hosts: normalized, allow_private })
+        Ok(Self {
+            allow_hosts: normalized,
+            allow_private,
+        })
     }
 
     /// Die normalisierten, sortierten Allowlist-Einträge.
@@ -236,12 +239,20 @@ impl EgressPolicy {
     // der Namen aus der Anfrage-URI erhält.
     pub(crate) fn check_host(&self, host: &str) -> Result<(), EgressError> {
         if !self.allow_private && EgressHost::Domain(host.to_owned()).is_loopback() {
-            return Err(EgressError::LocalHostName { host: host.to_owned() });
+            return Err(EgressError::LocalHostName {
+                host: host.to_owned(),
+            });
         }
-        if self.allow_hosts.iter().any(|allowed| host_matches_suffix(allowed, host)) {
+        if self
+            .allow_hosts
+            .iter()
+            .any(|allowed| host_matches_suffix(allowed, host))
+        {
             Ok(())
         } else {
-            Err(EgressError::HostNotAllowed { host: host.to_owned() })
+            Err(EgressError::HostNotAllowed {
+                host: host.to_owned(),
+            })
         }
     }
 }
@@ -270,7 +281,10 @@ fn len_le(len: usize) -> [u8; 8] {
 }
 
 fn invalid(entry: &str, reason: &'static str) -> EgressError {
-    EgressError::InvalidAllowEntry { entry: entry.to_owned(), reason }
+    EgressError::InvalidAllowEntry {
+        entry: entry.to_owned(),
+        reason,
+    }
 }
 
 // Normalisiert einen Allowlist-Eintrag, siehe `EgressPolicy::new`.
@@ -281,7 +295,10 @@ fn normalize_allow_entry(entry: &str) -> Result<String, EgressError> {
     if let Ok(ip) = entry.parse::<IpAddr>() {
         return Ok(ip.to_string());
     }
-    if let Some(inner) = entry.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+    if let Some(inner) = entry
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
         return inner
             .parse::<Ipv6Addr>()
             .map(|v6| IpAddr::V6(v6).to_string())
@@ -294,7 +311,10 @@ fn normalize_allow_entry(entry: &str) -> Result<String, EgressError> {
         .chars()
         .all(|c| !c.is_ascii() || c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'));
     if !plain {
-        return Err(invalid(entry, "nur Hostnamen, IP-Adressen oder DNS-Suffixe sind erlaubt"));
+        return Err(invalid(
+            entry,
+            "nur Hostnamen, IP-Adressen oder DNS-Suffixe sind erlaubt",
+        ));
     }
     if entry.starts_with('.') {
         return Err(invalid(entry, "führender Punkt"));
@@ -327,22 +347,37 @@ fn normalize_domain_entry(entry: &str, domain: &str) -> Result<String, EgressErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use harw_sandbox::egress::EgressUrlError;
 
-    fn policy(hosts: &[&str], allow_private: bool) -> EgressPolicy {
+    fn policy(hosts: &[&str], allow_private: bool) -> TestResult<EgressPolicy> {
         let hosts = hosts.iter().map(|h| (*h).to_owned()).collect();
-        EgressPolicy::new(hosts, allow_private).expect("gültige Test-Policy")
+        EgressPolicy::new(hosts, allow_private).map_err(ctx("gültige Test-Policy"))
     }
 
     #[test]
-    fn test_new_normalizes_sorts_and_dedups() {
-        let entries = ["Docs.RS.", "crates.io", "docs.rs", "[::1]", "0x7f.1", "Bücher.de"];
-        let p = policy(&entries, true);
+    fn test_new_normalizes_sorts_and_dedups() -> TestResult {
+        let entries = [
+            "Docs.RS.",
+            "crates.io",
+            "docs.rs",
+            "[::1]",
+            "0x7f.1",
+            "Bücher.de",
+        ];
+        let p = policy(&entries, true)?;
         assert_eq!(
             p.allow_hosts(),
-            ["127.0.0.1", "::1", "crates.io", "docs.rs", "xn--bcher-kva.de"]
+            [
+                "127.0.0.1",
+                "::1",
+                "crates.io",
+                "docs.rs",
+                "xn--bcher-kva.de"
+            ]
         );
         assert!(p.allow_private());
+        Ok(())
     }
 
     #[test]
@@ -372,18 +407,19 @@ mod tests {
     }
 
     #[test]
-    fn test_check_url_backslash_at_targets_evil_host() {
-        let p = policy(&["docs.rs"], false);
+    fn test_check_url_backslash_at_targets_evil_host() -> TestResult {
+        let p = policy(&["docs.rs"], false)?;
         let result = p.check_url("https://evil.com\\@docs.rs/");
         assert!(
             matches!(&result, Err(EgressError::HostNotAllowed { host }) if host == "evil.com"),
             "{result:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_check_url_rejects_userinfo() {
-        let p = policy(&["docs.rs", "evil.com"], false);
+    fn test_check_url_rejects_userinfo() -> TestResult {
+        let p = policy(&["docs.rs", "evil.com"], false)?;
         let urls = [
             "https://user:pw@docs.rs/",
             "https://docs.rs:443@evil.com/",
@@ -392,21 +428,36 @@ mod tests {
         for url in urls {
             let result = p.check_url(url);
             assert!(
-                matches!(result, Err(EgressError::InvalidUrl(EgressUrlError::UserinfoPresent))),
+                matches!(
+                    result,
+                    Err(EgressError::InvalidUrl(EgressUrlError::UserinfoPresent))
+                ),
                 "{url}: {result:?}"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_check_url_rejects_private_ip_literals_even_if_allowlisted() {
-        let p = policy(&["10.0.0.1", "127.0.0.1", "169.254.169.254", "::ffff:127.0.0.1"], false);
+    fn test_check_url_rejects_private_ip_literals_even_if_allowlisted() -> TestResult {
+        let p = policy(
+            &[
+                "10.0.0.1",
+                "127.0.0.1",
+                "169.254.169.254",
+                "::ffff:127.0.0.1",
+            ],
+            false,
+        )?;
         let cases = [
             ("http://10.0.0.1/", AddrClass::Private),
             ("http://127.0.0.1:8080/", AddrClass::Loopback),
             ("http://0x7f.1/", AddrClass::Loopback),
             ("http://2130706433/", AddrClass::Loopback),
-            ("http://169.254.169.254/latest/meta-data/", AddrClass::CloudMetadata),
+            (
+                "http://169.254.169.254/latest/meta-data/",
+                AddrClass::CloudMetadata,
+            ),
             ("http://[::ffff:127.0.0.1]/", AddrClass::Loopback),
             ("http://[64:ff9b::a9fe:a9fe]/", AddrClass::CloudMetadata),
         ];
@@ -418,29 +469,41 @@ mod tests {
             );
             assert!(denied, "{url}: {result:?}");
         }
+        Ok(())
     }
 
     #[test]
-    fn test_check_url_private_ip_literal_with_allow_private() {
-        let p = policy(&["10.0.0.1"], true);
-        let url = p.check_url("http://10.0.0.1:8080/v1").expect("erlaubt");
+    fn test_check_url_private_ip_literal_with_allow_private() -> TestResult {
+        let p = policy(&["10.0.0.1"], true)?;
+        let url = p
+            .check_url("http://10.0.0.1:8080/v1")
+            .map_err(ctx("erlaubt"))?;
         assert_eq!(url.port(), 8080);
         // Metadaten bleiben auch mit `allow_private` gesperrt.
-        let meta = policy(&["169.254.169.254"], true).check_url("http://169.254.169.254/");
+        let meta = policy(&["169.254.169.254"], true)?.check_url("http://169.254.169.254/");
         let meta_denied = matches!(
             meta,
-            Err(EgressError::AddressDenied { class: AddrClass::CloudMetadata, .. })
+            Err(EgressError::AddressDenied {
+                class: AddrClass::CloudMetadata,
+                ..
+            })
         );
         assert!(meta_denied, "{meta:?}");
         // Ein nicht gelistetes, erlaubtes IP-Literal scheitert an der Allowlist.
         let other = p.check_url("http://10.0.0.2/");
         assert!(matches!(other, Err(EgressError::HostNotAllowed { .. })));
+        Ok(())
     }
 
     #[test]
-    fn test_check_url_host_suffix_boundaries() {
-        let p = policy(&["docs.rs"], false);
-        assert_eq!(p.check_url("https://docs.rs/").expect("exakt").host_str(), "docs.rs");
+    fn test_check_url_host_suffix_boundaries() -> TestResult {
+        let p = policy(&["docs.rs"], false)?;
+        assert_eq!(
+            p.check_url("https://docs.rs/")
+                .map_err(ctx("exakt"))?
+                .host_str(),
+            "docs.rs"
+        );
         assert!(p.check_url("https://static.docs.rs/a").is_ok());
         assert!(p.check_url("HTTPS://STATIC.DOCS.RS./a").is_ok());
         let urls = [
@@ -450,41 +513,53 @@ mod tests {
         ];
         for url in urls {
             let result = p.check_url(url);
-            assert!(matches!(result, Err(EgressError::HostNotAllowed { .. })), "{url}: {result:?}");
+            assert!(
+                matches!(result, Err(EgressError::HostNotAllowed { .. })),
+                "{url}: {result:?}"
+            );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_check_url_empty_allowlist_denies_everything() {
-        let p = policy(&[], true);
+    fn test_check_url_empty_allowlist_denies_everything() -> TestResult {
+        let p = policy(&[], true)?;
         let result = p.check_url("https://docs.rs/");
         assert!(matches!(result, Err(EgressError::HostNotAllowed { .. })));
+        Ok(())
     }
 
     #[test]
-    fn test_check_url_localhost_requires_allow_private() {
-        let strict = policy(&["localhost"], false);
+    fn test_check_url_localhost_requires_allow_private() -> TestResult {
+        let strict = policy(&["localhost"], false)?;
         let result = strict.check_url("http://api.localhost:3000/");
-        assert!(matches!(result, Err(EgressError::LocalHostName { .. })), "{result:?}");
-        let open = policy(&["localhost"], true);
+        assert!(
+            matches!(result, Err(EgressError::LocalHostName { .. })),
+            "{result:?}"
+        );
+        let open = policy(&["localhost"], true)?;
         assert!(open.check_url("http://api.localhost:3000/").is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_check_url_rejects_non_http_scheme() {
-        let p = policy(&["docs.rs"], false);
+    fn test_check_url_rejects_non_http_scheme() -> TestResult {
+        let p = policy(&["docs.rs"], false)?;
         let result = p.check_url("file:///etc/passwd");
         let unsupported = matches!(
             result,
-            Err(EgressError::InvalidUrl(EgressUrlError::UnsupportedScheme(_)))
+            Err(EgressError::InvalidUrl(EgressUrlError::UnsupportedScheme(
+                _
+            )))
         );
         assert!(unsupported, "{result:?}");
+        Ok(())
     }
 
     #[test]
-    fn test_check_addr_class_matrix() {
-        let strict = policy(&[], false);
-        let open = policy(&[], true);
+    fn test_check_addr_class_matrix() -> TestResult {
+        let strict = policy(&[], false)?;
+        let open = policy(&[], true)?;
         let cases = [
             ("8.8.8.8:443", true, true),
             ("[2606:4700:4700::1111]:443", true, true),
@@ -506,34 +581,43 @@ mod tests {
             ("[2002:a00:1::]:80", false, false),
         ];
         for (raw, strict_ok, open_ok) in cases {
-            let addr: SocketAddr = raw.parse().expect("gültige Socket-Adresse");
+            let addr: SocketAddr = raw.parse().map_err(ctx("gültige Socket-Adresse"))?;
             assert_eq!(strict.check_addr(addr).is_ok(), strict_ok, "strict {raw}");
             assert_eq!(open.check_addr(addr).is_ok(), open_ok, "open {raw}");
         }
+        Ok(())
     }
 
     #[test]
-    fn test_digest_is_stable_under_normalization() {
-        let a = policy(&["docs.rs", "crates.io", "static.crates.io"], false);
-        let b = policy(&["STATIC.crates.io.", "Docs.RS", "crates.io", "docs.rs"], false);
+    fn test_digest_is_stable_under_normalization() -> TestResult {
+        let a = policy(&["docs.rs", "crates.io", "static.crates.io"], false)?;
+        let b = policy(
+            &["STATIC.crates.io.", "Docs.RS", "crates.io", "docs.rs"],
+            false,
+        )?;
         assert_eq!(a, b);
         assert_eq!(a.digest(), b.digest());
         assert_eq!(a.digest(), a.clone().digest());
+        Ok(())
     }
 
     #[test]
-    fn test_digest_distinguishes_policies() {
-        let base = policy(&["docs.rs"], false);
-        assert_ne!(base.digest(), policy(&["docs.rs"], true).digest());
-        assert_ne!(base.digest(), policy(&["crates.io"], false).digest());
-        assert_ne!(base.digest(), policy(&[], false).digest());
+    fn test_digest_distinguishes_policies() -> TestResult {
+        let base = policy(&["docs.rs"], false)?;
+        assert_ne!(base.digest(), policy(&["docs.rs"], true)?.digest());
+        assert_ne!(base.digest(), policy(&["crates.io"], false)?.digest());
+        assert_ne!(base.digest(), policy(&[], false)?.digest());
         // Längenpräfixe: gleiche Konkatenation, andere Einträge.
-        assert_ne!(policy(&["ab", "c"], false).digest(), policy(&["a", "bc"], false).digest());
+        assert_ne!(
+            policy(&["ab", "c"], false)?.digest(),
+            policy(&["a", "bc"], false)?.digest()
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_digest_matches_documented_encoding() {
-        let p = policy(&["docs.rs"], true);
+    fn test_digest_matches_documented_encoding() -> TestResult {
+        let p = policy(&["docs.rs"], true)?;
         let mut expected = Vec::new();
         expected.extend_from_slice(b"harw:egress-policy:v1\0");
         expected.push(1);
@@ -541,5 +625,6 @@ mod tests {
         expected.extend_from_slice(&7_u64.to_le_bytes());
         expected.extend_from_slice(b"docs.rs");
         assert_eq!(p.digest(), *blake3::hash(&expected).as_bytes());
+        Ok(())
     }
 }

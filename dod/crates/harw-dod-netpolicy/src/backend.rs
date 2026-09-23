@@ -123,6 +123,7 @@ impl NetBackend for InspectBackend {
 mod tests {
     use super::*;
     use crate::rule::NetRule;
+    use crate::test_support::{TestResult, ctx};
 
     fn sample_plan() -> NetPlan {
         NetPlan {
@@ -154,14 +155,19 @@ mod tests {
     }
 
     #[test]
-    fn test_inspect_backend_records_multiple_applications_in_order() {
+    fn test_inspect_backend_records_multiple_applications_in_order() -> TestResult {
         let backend = InspectBackend::new();
         let first = NetPlan { rules: vec![] };
         let second = sample_plan();
 
-        backend.apply(&first).expect("InspectBackend never fails");
-        backend.apply(&second).expect("InspectBackend never fails");
+        backend
+            .apply(&first)
+            .map_err(ctx("InspectBackend never fails"))?;
+        backend
+            .apply(&second)
+            .map_err(ctx("InspectBackend never fails"))?;
 
         assert_eq!(backend.recorded_plans(), vec![first, second]);
+        Ok(())
     }
 }

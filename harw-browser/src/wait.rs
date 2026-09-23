@@ -290,6 +290,7 @@ impl WaitOutcome {
 mod tests {
     use super::*;
     use crate::selector::Selector;
+    use crate::test_support::{TestResult, ctx};
     use std::time::Duration;
 
     #[test]
@@ -302,7 +303,10 @@ mod tests {
 
     #[test]
     fn test_wait_timeout_from_millis_clamps_to_hard_ceiling() {
-        assert_eq!(WaitTimeout::from_millis(u64::MAX).millis(), HARD_MAX_WAIT_MS);
+        assert_eq!(
+            WaitTimeout::from_millis(u64::MAX).millis(),
+            HARD_MAX_WAIT_MS
+        );
     }
 
     #[test]
@@ -310,7 +314,9 @@ mod tests {
         assert!(WaitTimeout::try_from_millis(0).is_err());
         assert!(WaitTimeout::try_from_millis(HARD_MAX_WAIT_MS + 1).is_err());
         assert_eq!(
-            WaitTimeout::try_from_millis(HARD_MAX_WAIT_MS).map(|t| t.millis()).ok(),
+            WaitTimeout::try_from_millis(HARD_MAX_WAIT_MS)
+                .map(|t| t.millis())
+                .ok(),
             Some(HARD_MAX_WAIT_MS)
         );
     }
@@ -324,11 +330,12 @@ mod tests {
     }
 
     #[test]
-    fn test_wait_timeout_serde_is_integer_millis_and_bounded() {
+    fn test_wait_timeout_serde_is_integer_millis_and_bounded() -> TestResult {
         let timeout = WaitTimeout::from_millis(2500);
-        let json = serde_json::to_value(timeout).expect("timeout serializes");
+        let json = serde_json::to_value(timeout).map_err(ctx("timeout serializes"))?;
         assert_eq!(json, serde_json::json!(2500));
-        let decoded: WaitTimeout = serde_json::from_value(json).expect("timeout deserializes");
+        let decoded: WaitTimeout =
+            serde_json::from_value(json).map_err(ctx("timeout deserializes"))?;
         assert_eq!(decoded, timeout);
         assert!(serde_json::from_value::<WaitTimeout>(serde_json::json!(0)).is_err());
         assert!(
@@ -338,11 +345,18 @@ mod tests {
             serde_json::from_value::<WaitTimeout>(serde_json::json!({"secs": 1, "nanos": 0}))
                 .is_err()
         );
+        Ok(())
     }
 
     #[test]
     fn test_wait_condition_deserialize_rejects_custom_script() {
-        for tag in ["CustomScript", "custom_script", "Script", "script", "EvaluateScript"] {
+        for tag in [
+            "CustomScript",
+            "custom_script",
+            "Script",
+            "script",
+            "EvaluateScript",
+        ] {
             let json = serde_json::json!({ tag: { "predicate": "fetch('https://evil')" } });
             assert!(
                 serde_json::from_value::<WaitCondition>(json).is_err(),
@@ -424,14 +438,16 @@ mod tests {
     }
 
     #[test]
-    fn test_wait_outcome_serde_json_round_trip_with_element_target() {
+    fn test_wait_outcome_serde_json_round_trip_with_element_target() -> TestResult {
         let outcome = WaitOutcome::new(
             false,
             4000,
             WaitCondition::ElementClickable(Target::new(Selector::TestId("submit".to_owned()))),
         );
-        let json = serde_json::to_string(&outcome).expect("outcome serializes");
-        let decoded: WaitOutcome = serde_json::from_str(&json).expect("outcome deserializes");
+        let json = serde_json::to_string(&outcome).map_err(ctx("outcome serializes"))?;
+        let decoded: WaitOutcome =
+            serde_json::from_str(&json).map_err(ctx("outcome deserializes"))?;
         assert_eq!(decoded, outcome);
+        Ok(())
     }
 }

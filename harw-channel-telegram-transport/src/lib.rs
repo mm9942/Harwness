@@ -47,3 +47,7 @@ pub use media::{AttachmentIntake, DownloadedAttachment};
 pub use mirror::TelegramMirrorTransport;
 pub use offset::TelegramOffsetStore;
 pub use render::{RendererConfig, TelegramRenderer};
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

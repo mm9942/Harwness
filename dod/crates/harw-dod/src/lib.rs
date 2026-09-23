@@ -380,3 +380,7 @@ pub use harw_dod_procmon::{DEFAULT_READ_TIMEOUT, ExecEvent, ProcmonError, Procmo
 /// `harw-sandbox` ohnehin bereits vorliegen.
 #[cfg(feature = "privileged")]
 pub use harw_dod_flow::{Direction, FlowError, FlowEvent, FlowResult, Protocol, observe, parse_flow_payload, to_security_event};
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

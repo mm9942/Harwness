@@ -248,31 +248,33 @@ mod tests {
     use crate::artifact::ArtifactId;
     use crate::error::KnowledgeError;
     use crate::memory::palace::PalaceStatus;
+    use crate::test_support::{TestError, TestResult};
 
     use harw_dod_signals::{Hardness, SecurityEvidence, Severity};
     use jiff::Timestamp;
 
-    fn evidence() -> SecurityEvidence {
+    fn evidence() -> TestResult<SecurityEvidence> {
         SecurityEvidence::capture(vec![], vec![], Timestamp::UNIX_EPOCH)
-            .expect("empty evidence always encodes")
+            .map_err(crate::test_support::ctx("empty evidence always encodes"))
     }
 
     #[test]
-    fn test_security_finding_new_carries_the_given_severity_and_evidence() {
+    fn test_security_finding_new_carries_the_given_severity_and_evidence() -> TestResult {
         let finding = SecurityFinding::new(
             ArtifactId::new("security/example"),
             "example finding",
             Severity::Critical,
-            evidence(),
+            evidence()?,
         );
 
         assert_eq!(finding.severity, Severity::Critical);
-        assert_eq!(finding.evidence, evidence());
+        assert_eq!(finding.evidence, evidence()?);
         assert!(finding.tags.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_baseline_new_starts_provisional() {
+    fn test_baseline_new_starts_provisional() -> TestResult {
         let baseline = Baseline::new(
             ArtifactId::new("baseline/example"),
             "example baseline",
@@ -280,14 +282,15 @@ mod tests {
             0.0,
             100.0,
             Hardness::Observed,
-            evidence(),
+            evidence()?,
         );
 
         assert_eq!(baseline.status, PalaceStatus::Provisional);
+        Ok(())
     }
 
     #[test]
-    fn test_baseline_promotion_without_review_is_rejected() {
+    fn test_baseline_promotion_without_review_is_rejected() -> TestResult {
         let mut baseline = Baseline::new(
             ArtifactId::new("baseline/example"),
             "example baseline",
@@ -295,19 +298,22 @@ mod tests {
             0.0,
             100.0,
             Hardness::Observed,
-            evidence(),
+            evidence()?,
         );
 
-        let error = baseline
-            .promote_to_established(false)
-            .expect_err("unreviewed promotion must be refused");
+        let Err(error) = baseline.promote_to_established(false) else {
+            return Err(TestError::Unexpected(
+                "unreviewed promotion must be refused".to_owned(),
+            ));
+        };
 
         assert!(matches!(error, KnowledgeError::PromotionNotReviewed { .. }));
         assert_eq!(baseline.status, PalaceStatus::Provisional);
+        Ok(())
     }
 
     #[test]
-    fn test_baseline_promotion_with_review_becomes_established() {
+    fn test_baseline_promotion_with_review_becomes_established() -> TestResult {
         let mut baseline = Baseline::new(
             ArtifactId::new("baseline/example"),
             "example baseline",
@@ -315,20 +321,21 @@ mod tests {
             0.0,
             100.0,
             Hardness::Observed,
-            evidence(),
+            evidence()?,
         );
 
         baseline
             .promote_to_established(true)
-            .expect("reviewed promotion succeeds");
+            .map_err(crate::test_support::ctx("reviewed promotion succeeds"))?;
 
         assert_eq!(baseline.status, PalaceStatus::Established);
+        Ok(())
     }
 
     /// The new path a `Baseline` takes to reach `harw-dod-rules`' rule
     /// engine: a conversion, not a reexport (see module doc).
     #[test]
-    fn test_to_rule_baseline_carries_evidence_and_status_across() {
+    fn test_to_rule_baseline_carries_evidence_and_status_across() -> TestResult {
         let mut baseline = Baseline::new(
             ArtifactId::new("baseline/example"),
             "example baseline",
@@ -336,11 +343,11 @@ mod tests {
             0.0,
             100.0,
             Hardness::Observed,
-            evidence(),
+            evidence()?,
         );
         baseline
             .promote_to_established(true)
-            .expect("reviewed promotion succeeds");
+            .map_err(crate::test_support::ctx("reviewed promotion succeeds"))?;
 
         let rule_baseline = baseline.to_rule_baseline();
 
@@ -349,11 +356,12 @@ mod tests {
         assert_eq!(rule_baseline.metric, "cpu-load");
         assert_eq!(rule_baseline.min, 0.0);
         assert_eq!(rule_baseline.max, 100.0);
-        assert_eq!(rule_baseline.evidence, evidence());
+        assert_eq!(rule_baseline.evidence, evidence()?);
         assert_eq!(
             rule_baseline.status,
             harw_dod_rules::baseline::PalaceStatus::Established
         );
+        Ok(())
     }
 
     /// `PalaceStatus` (the lifecycle) must never collapse into a graded
@@ -361,7 +369,7 @@ mod tests {
     /// lifecycle phases maps to its own, distinct
     /// `harw_dod_rules::baseline::PalaceStatus` variant, one-for-one.
     #[test]
-    fn test_to_rule_baseline_maps_all_three_statuses_distinctly() {
+    fn test_to_rule_baseline_maps_all_three_statuses_distinctly() -> TestResult {
         let provisional = Baseline::new(
             ArtifactId::new("baseline/a"),
             "a",
@@ -369,7 +377,7 @@ mod tests {
             0.0,
             100.0,
             Hardness::Observed,
-            evidence(),
+            evidence()?,
         )
         .to_rule_baseline()
         .status;
@@ -381,11 +389,11 @@ mod tests {
             0.0,
             100.0,
             Hardness::Observed,
-            evidence(),
+            evidence()?,
         );
         established_source
             .promote_to_established(true)
-            .expect("reviewed promotion succeeds");
+            .map_err(crate::test_support::ctx("reviewed promotion succeeds"))?;
         let established = established_source.to_rule_baseline().status;
 
         let mut superseded_source = Baseline::new(
@@ -395,7 +403,7 @@ mod tests {
             0.0,
             100.0,
             Hardness::Observed,
-            evidence(),
+            evidence()?,
         );
         superseded_source.status = PalaceStatus::Superseded;
         let superseded = superseded_source.to_rule_baseline().status;
@@ -412,5 +420,6 @@ mod tests {
             superseded,
             harw_dod_rules::baseline::PalaceStatus::Superseded
         );
+        Ok(())
     }
 }

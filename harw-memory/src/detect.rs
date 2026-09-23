@@ -81,6 +81,7 @@ pub fn detect_correction(text: &str, context: Option<String>) -> Option<Signal> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn detects_english_correction_no_thats_not_right() {
@@ -108,11 +109,17 @@ mod tests {
     }
 
     #[test]
-    fn attaches_context_verbatim() {
-        let s = detect_correction("Nicht so, bitte anders.", Some("turn-42".into())).unwrap();
+    fn attaches_context_verbatim() -> TestResult {
+        let s = detect_correction("Nicht so, bitte anders.", Some("turn-42".into()))
+            .ok_or(TestError::Missing("Correction-Signal"))?;
         match s {
             Signal::Correction { context, .. } => assert_eq!(context.as_deref(), Some("turn-42")),
-            _ => panic!("expected Correction"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Correction, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 }

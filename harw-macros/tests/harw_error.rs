@@ -1,6 +1,9 @@
 use harw_macros::HarwError;
 use std::error::Error;
 
+mod common;
+use common::{TestResult, ctx};
+
 type SessionId = u64;
 
 #[derive(HarwError, Debug)]
@@ -48,9 +51,10 @@ fn from_and_source() {
 }
 
 #[test]
-fn result_alias_exists() {
+fn result_alias_exists() -> TestResult {
     fn ok() -> CoreResult<u8> {
         Ok(1)
     }
-    assert_eq!(ok().unwrap(), 1);
+    assert_eq!(ok().map_err(ctx("result alias must resolve"))?, 1);
+    Ok(())
 }

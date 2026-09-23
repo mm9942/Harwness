@@ -104,8 +104,7 @@ use std::sync::Arc;
 use crate::context::OpContext;
 use crate::error::OpError;
 use crate::operation::{
-    ApprovalPolicy, OpInput, OpOutput, Operation, OperationMeta, PermissionTier, Surface,
-    WebMethod,
+    ApprovalPolicy, OpInput, OpOutput, Operation, OperationMeta, PermissionTier, Surface, WebMethod,
 };
 
 /// Adapter, der eine [`Operation`] als HTTP-Route für `harw-web` exponiert.
@@ -484,7 +483,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, OnceLock};
 
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
 
     use super::WebAdapter;
@@ -495,9 +496,10 @@ mod tests {
         Operation, OperationCategory, OperationDomain, OperationMeta, PermissionTier, Surface,
         WebMethod,
     };
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Erstellt einen minimalen [`OpContext`] für Tests.
-    fn make_test_ctx() -> (OpContext, PathBuf) {
+    fn make_test_ctx() -> TestResult<(OpContext, PathBuf)> {
         static CTX_COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = CTX_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = std::env::temp_dir().join(format!(
@@ -505,7 +507,8 @@ mod tests {
             std::process::id(),
             id
         ));
-        std::fs::create_dir_all(tmp.join("ws")).unwrap();
+        std::fs::create_dir_all(tmp.join("ws"))
+            .map_err(ctx("Test-Workspace-Verzeichnis anlegen"))?;
         let registry = WorkspaceRegistry::build(
             &tmp,
             [WorkspaceRegistration {
@@ -514,19 +517,19 @@ mod tests {
                 root: PathBuf::from("ws"),
             }],
         )
-        .unwrap();
+        .map_err(ctx("WorkspaceRegistry bauen"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .unwrap();
+            .map_err(ctx("Workspace auflösen"))?;
         let sandbox = SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ReadWorkspace]),
         );
         let ctx = OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new());
-        (ctx, tmp)
+        Ok((ctx, tmp))
     }
 
     struct NoSurfaceOp;
@@ -751,28 +754,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_invoke_passes_json_args_to_operation() {
+    async fn test_invoke_passes_json_args_to_operation() -> TestResult {
         let op: Arc<dyn Operation> = Arc::new(EchoXOp);
         let adapters = WebAdapter::from_operation(op);
-        let (ctx, tmp) = make_test_ctx();
+        let (ctx, tmp) = make_test_ctx()?;
         let args = serde_json::json!({ "x": "hallo-welt" });
         let result = adapters[0].invoke(&ctx, args).await;
         std::fs::remove_dir_all(tmp).ok();
-        let out = result.expect("Erwartet Ok");
+        let Ok(out) = result else {
+            return Err(TestError::Unexpected("Erwartet Ok".into()));
+        };
         assert_eq!(out.text, "hallo-welt");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_invoke_propagates_execution_error() {
+    async fn test_invoke_propagates_execution_error() -> TestResult {
         let op: Arc<dyn Operation> = Arc::new(AlwaysErrOp);
         let adapters = WebAdapter::from_operation(op);
-        let (ctx, tmp) = make_test_ctx();
+        let (ctx, tmp) = make_test_ctx()?;
         let result = adapters[0].invoke(&ctx, serde_json::Value::Null).await;
         std::fs::remove_dir_all(tmp).ok();
         match result {
             Err(OpError::Execution(msg)) => assert_eq!(msg, "simulierter Fehler"),
-            other => panic!("Erwartet OpError::Execution, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Erwartet OpError::Execution, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]

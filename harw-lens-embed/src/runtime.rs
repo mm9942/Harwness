@@ -52,18 +52,20 @@ pub struct RuntimeProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
-    fn test_runtime_profile_parses_from_toml() {
+    fn test_runtime_profile_parses_from_toml() -> TestResult {
         let toml_src = r#"
             backend = "onnx-local"
             locality = "local"
             batch_size = 32
         "#;
-        let profile: RuntimeProfile = toml::from_str(toml_src).expect("parses");
+        let profile: RuntimeProfile = toml::from_str(toml_src).map_err(ctx("parses"))?;
         assert_eq!(profile.backend, "onnx-local");
         assert_eq!(profile.locality, Locality::Local);
         assert_eq!(profile.batch_size, 32);
+        Ok(())
     }
 
     #[test]

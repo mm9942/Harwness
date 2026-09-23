@@ -94,7 +94,8 @@ use jiff::Timestamp;
 // Kompilierfehler — das Gegenteil (ein fehlender Import) wäre einer, daher
 // die bewusst vollständige Liste.
 use landlock::{
-    ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, RestrictionStatus, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
+    ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, RestrictionStatus,
+    Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
 };
 
 /// Kennung, unter der dieses Binary seine eigene Landlock-Selbstbeschränkung
@@ -252,7 +253,11 @@ pub fn restrict_self(roots: &[SandboxRoot]) -> SandboxOutcome {
             // `Copy` ist, ist hier bewusst nicht vorausgesetzt.
             let no_new_privs = status.no_new_privs;
             let outcome = classify(status);
-            tracing::info!(?outcome, no_new_privs, "landlock self-restriction attempted");
+            tracing::info!(
+                ?outcome,
+                no_new_privs,
+                "landlock self-restriction attempted"
+            );
             outcome
         }
         Err(error) => {
@@ -363,8 +368,10 @@ pub fn default_roots(
 #[cfg(test)]
 mod tests {
     use super::{
-        default_roots, landlock_degraded_event, SandboxOutcome, SandboxRoot, LANDLOCK_STATUS_SENSOR_ID,
+        LANDLOCK_STATUS_SENSOR_ID, SandboxOutcome, SandboxRoot, default_roots,
+        landlock_degraded_event,
     };
+    use crate::test_support::{TestError, TestResult};
     use harw_dod_signals::EventKind;
     use std::path::PathBuf;
 
@@ -381,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn test_default_roots_marks_only_home_as_writable() {
+    fn test_default_roots_marks_only_home_as_writable() -> TestResult {
         let roots = default_roots(
             &PathBuf::from("/proc"),
             &PathBuf::from("/sys/class/thermal"),
@@ -393,18 +400,25 @@ mod tests {
         );
         assert_eq!(roots.len(), 7);
         assert_eq!(roots.iter().filter(|r| r.writable).count(), 1);
-        assert!(roots.last().expect("seven roots").writable);
+        assert!(
+            roots
+                .last()
+                .ok_or(TestError::Missing("seven roots"))?
+                .writable
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_landlock_degraded_event_carries_the_sentinel_landlock_sensor_id() {
+    fn test_landlock_degraded_event_carries_the_sentinel_landlock_sensor_id() -> TestResult {
         let event = landlock_degraded_event(jiff::Timestamp::UNIX_EPOCH);
         assert_eq!(event.sensor.as_str(), LANDLOCK_STATUS_SENSOR_ID);
         assert!(event.actor.is_none());
         let EventKind::SensorDegraded { sensor } = &event.kind else {
-            panic!("expected SensorDegraded");
+            return Err(TestError::Unexpected("expected SensorDegraded".to_owned()));
         };
         assert_eq!(sensor.as_str(), LANDLOCK_STATUS_SENSOR_ID);
+        Ok(())
     }
 
     #[test]

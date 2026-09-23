@@ -73,6 +73,11 @@ pub mod validate;
 // laufen ausschließlich über `PlanStore::apply`.
 mod mutation;
 
+// Crate-interner Test-Fehlertyp (Bible R087/R165/R182). Ergänzt `testing`
+// (siehe dortiger Modulkopf), das öffentlich bleibt und unverändert ist.
+#[cfg(test)]
+mod test_support;
+
 // ── Re-Exports der Kerntypen ────────────────────────────────────────────────
 // Damit Aufrufer `harw_plan::PlanNode` statt `harw_plan::types::PlanNode`
 // schreiben können. Die Modulpfade bleiben zusätzlich öffentlich.

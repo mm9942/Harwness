@@ -231,6 +231,7 @@ fn map_netlink_error(err: NetlinkError) -> AuthlogError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_dod_netlink::{FixtureAuditSource, RawRecord};
 
     fn backend_with(records: Vec<RawRecord>) -> AuditBackend {
@@ -244,31 +245,33 @@ mod tests {
     }
 
     #[test]
-    fn test_read_events_successful_login_yields_success_outcome() {
+    fn test_read_events_successful_login_yields_success_outcome() -> TestResult {
         let backend = backend_with(vec![RawRecord::new(
             "type=USER_LOGIN msg=audit(1699999999.000:1): auid=1000 uid=1000 success=yes",
         )]);
         let events = backend
             .read_events(Timestamp::UNIX_EPOCH)
-            .expect("wohlgeformter Record");
+            .map_err(ctx("wohlgeformter Record"))?;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].outcome, AuthOutcome::Success);
+        Ok(())
     }
 
     #[test]
-    fn test_read_events_failed_login_yields_failure_outcome() {
+    fn test_read_events_failed_login_yields_failure_outcome() -> TestResult {
         let backend = backend_with(vec![RawRecord::new(
             "type=USER_LOGIN msg=audit(1699999999.000:1): auid=1000 uid=1000 success=no",
         )]);
         let events = backend
             .read_events(Timestamp::UNIX_EPOCH)
-            .expect("wohlgeformter Record");
+            .map_err(ctx("wohlgeformter Record"))?;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].outcome, AuthOutcome::Failure);
+        Ok(())
     }
 
     #[test]
-    fn test_read_events_auid_sentinel_max_value_is_none() {
+    fn test_read_events_auid_sentinel_max_value_is_none() -> TestResult {
         // Der wichtigste Test dieser Crate zusammen mit dem sudo-Fall unten:
         // 4294967295 (u32::MAX, -1 als u32) heißt "keine Anmelde-UID
         // gesetzt" und muss None ergeben.
@@ -277,12 +280,13 @@ mod tests {
         )]);
         let events = backend
             .read_events(Timestamp::UNIX_EPOCH)
-            .expect("wohlgeformter Record");
+            .map_err(ctx("wohlgeformter Record"))?;
         assert_eq!(events[0].actor.auid, None);
+        Ok(())
     }
 
     #[test]
-    fn test_read_events_auid_zero_is_some_zero() {
+    fn test_read_events_auid_zero_is_some_zero() -> TestResult {
         // Abgrenzung zum Sentinelwert: auid=0 ist root, der sich tatsächlich
         // angemeldet hat, kein "nicht gesetzt".
         let backend = backend_with(vec![RawRecord::new(
@@ -290,12 +294,13 @@ mod tests {
         )]);
         let events = backend
             .read_events(Timestamp::UNIX_EPOCH)
-            .expect("wohlgeformter Record");
+            .map_err(ctx("wohlgeformter Record"))?;
         assert_eq!(events[0].actor.auid, Some(0));
+        Ok(())
     }
 
     #[test]
-    fn test_read_events_sudo_case_keeps_uid_and_auid_separate() {
+    fn test_read_events_sudo_case_keeps_uid_and_auid_separate() -> TestResult {
         // Der Test, der die Crate rechtfertigt: uid=0 (root durch sudo),
         // auid=1000 (wer die Kette wirklich ausgelöst hat) — beide Werte
         // erscheinen getrennt, und auid ist der, der nicht null ist.
@@ -304,92 +309,109 @@ mod tests {
         )]);
         let events = backend
             .read_events(Timestamp::UNIX_EPOCH)
-            .expect("wohlgeformter Record");
+            .map_err(ctx("wohlgeformter Record"))?;
         assert_eq!(events[0].actor.uid, 0);
         assert_eq!(events[0].actor.auid, Some(1000));
-        assert_ne!(events[0].actor.auid.expect("auid present"), 0);
+        assert_ne!(
+            events[0]
+                .actor
+                .auid
+                .ok_or(TestError::Missing("auid present"))?,
+            0
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_read_events_skips_records_without_success_field() {
+    fn test_read_events_skips_records_without_success_field() -> TestResult {
         let backend = backend_with(vec![RawRecord::new(
             "type=SYSCALL msg=audit(1699999999.000:1): auid=1000 uid=1000",
         )]);
         let events = backend
             .read_events(Timestamp::UNIX_EPOCH)
-            .expect("wohlgeformter Record ohne success wird übersprungen");
+            .map_err(ctx("wohlgeformter Record ohne success wird übersprungen"))?;
         assert!(events.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_read_events_filters_by_since() {
+    fn test_read_events_filters_by_since() -> TestResult {
         let backend = backend_with(vec![
-            RawRecord::new(
-                "type=USER_LOGIN msg=audit(1000.000:1): auid=1000 uid=1000 success=yes",
-            ),
-            RawRecord::new(
-                "type=USER_LOGIN msg=audit(2000.000:2): auid=1000 uid=1000 success=yes",
-            ),
+            RawRecord::new("type=USER_LOGIN msg=audit(1000.000:1): auid=1000 uid=1000 success=yes"),
+            RawRecord::new("type=USER_LOGIN msg=audit(2000.000:2): auid=1000 uid=1000 success=yes"),
         ]);
-        let since = Timestamp::new(1500, 0).expect("gültiger Zeitstempel");
-        let events = backend.read_events(since).expect("wohlgeformte Records");
+        let since = Timestamp::new(1500, 0).map_err(ctx("gültiger Zeitstempel"))?;
+        let events = backend
+            .read_events(since)
+            .map_err(ctx("wohlgeformte Records"))?;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].observed_at.as_second(), 2000);
+        Ok(())
     }
 
     #[test]
-    fn test_read_events_malformed_record_yields_malformed_source() {
-        let backend = backend_with(vec![RawRecord::new(
-            "type=USER_LOGIN auid=not-a-number",
-        )]);
-        let err = backend
-            .read_events(Timestamp::UNIX_EPOCH)
-            .expect_err("nicht-numerischer auid muss scheitern");
+    fn test_read_events_malformed_record_yields_malformed_source() -> TestResult {
+        let backend = backend_with(vec![RawRecord::new("type=USER_LOGIN auid=not-a-number")]);
+        let Err(err) = backend.read_events(Timestamp::UNIX_EPOCH) else {
+            return Err(TestError::Unexpected(
+                "nicht-numerischer auid muss scheitern".into(),
+            ));
+        };
         assert!(matches!(
             err,
             AuthlogError::Sensor(SensorError::MalformedSource)
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_read_events_missing_uid_yields_malformed_source() {
+    fn test_read_events_missing_uid_yields_malformed_source() -> TestResult {
         let backend = backend_with(vec![RawRecord::new(
             "type=USER_LOGIN msg=audit(1699999999.000:1): auid=1000 success=yes",
         )]);
-        let err = backend
-            .read_events(Timestamp::UNIX_EPOCH)
-            .expect_err("fehlendes uid-Feld muss scheitern");
+        let Err(err) = backend.read_events(Timestamp::UNIX_EPOCH) else {
+            return Err(TestError::Unexpected(
+                "fehlendes uid-Feld muss scheitern".into(),
+            ));
+        };
         assert!(matches!(
             err,
             AuthlogError::Sensor(SensorError::MalformedSource)
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_read_events_missing_timestamp_yields_malformed_source() {
+    fn test_read_events_missing_timestamp_yields_malformed_source() -> TestResult {
         let backend = backend_with(vec![RawRecord::new(
             "type=USER_LOGIN auid=1000 uid=1000 success=yes",
         )]);
-        let err = backend
-            .read_events(Timestamp::UNIX_EPOCH)
-            .expect_err("fehlender Zeitstempel muss scheitern");
+        let Err(err) = backend.read_events(Timestamp::UNIX_EPOCH) else {
+            return Err(TestError::Unexpected(
+                "fehlender Zeitstempel muss scheitern".into(),
+            ));
+        };
         assert!(matches!(
             err,
             AuthlogError::Sensor(SensorError::MalformedSource)
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_error_message_never_contains_username_hostname_or_terminal() {
+    fn test_error_message_never_contains_username_hostname_or_terminal() -> TestResult {
         let backend = backend_with(vec![RawRecord::new(
             r#"type=USER_LOGIN acct="alice" hostname=workstation42 terminal=pts/3 auid=not-a-number"#,
         )]);
-        let err = backend
-            .read_events(Timestamp::UNIX_EPOCH)
-            .expect_err("kaputter Record muss scheitern");
+        let Err(err) = backend.read_events(Timestamp::UNIX_EPOCH) else {
+            return Err(TestError::Unexpected(
+                "kaputter Record muss scheitern".into(),
+            ));
+        };
         let message = err.to_string();
         assert!(!message.contains("alice"));
         assert!(!message.contains("workstation42"));
         assert!(!message.contains("pts/3"));
+        Ok(())
     }
 }

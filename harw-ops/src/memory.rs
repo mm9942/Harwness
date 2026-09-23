@@ -190,12 +190,13 @@ fn project_memories_root(ctx: &OpContext) -> Result<PathBuf, OpError> {
         .and_then(|config| config.harness.project_root_markers)
         .unwrap_or_default();
     let cwd = ctx.sandbox().workspace().canonical_root();
-    let project = harw_home::discover_project(cwd, &markers)
-        .map_err(|error| OpError::Execution(format!("Projekt-Erkennung fehlgeschlagen: {error}")))?;
+    let project = harw_home::discover_project(cwd, &markers).map_err(|error| {
+        OpError::Execution(format!("Projekt-Erkennung fehlgeschlagen: {error}"))
+    })?;
     let project_home = harw_home::ProjectHome::at(&project);
-    project_home
-        .ensure()
-        .map_err(|error| OpError::Execution(format!("Projekt-Home anlegen fehlgeschlagen: {error}")))?;
+    project_home.ensure().map_err(|error| {
+        OpError::Execution(format!("Projekt-Home anlegen fehlgeschlagen: {error}"))
+    })?;
     Ok(project_home.memories_dir())
 }
 
@@ -290,7 +291,9 @@ fn unique_slug(store: &FactStore, base: &str, body: &str) -> Result<String, OpEr
             // würde derselbe erneut aufgezeichnete Text nie als „identisch"
             // erkannt und bekäme bei jedem Aufruf einen neuen Suffix statt
             // denselben Fakt zu aktualisieren.
-            Some(existing) if existing.body.trim_end_matches('\n') == body.trim_end_matches('\n') => {
+            Some(existing)
+                if existing.body.trim_end_matches('\n') == body.trim_end_matches('\n') =>
+            {
                 return Ok(candidate);
             }
             Some(_) => candidate = format!("{base}-{suffix}"),
@@ -330,8 +333,9 @@ fn record_fact(ctx: &OpContext, scope: FactScope, text: &str) -> Result<OpOutput
         FactScope::Project => project_memories_root(ctx)?,
         FactScope::Global => global_memories_root()?,
     };
-    let store = FactStore::open(&root, scope)
-        .map_err(|error| OpError::Execution(format!("Fakt-Speicher öffnen fehlgeschlagen: {error}")))?;
+    let store = FactStore::open(&root, scope).map_err(|error| {
+        OpError::Execution(format!("Fakt-Speicher öffnen fehlgeschlagen: {error}"))
+    })?;
     let base = slugify(trimmed);
     let name = unique_slug(&store, &base, trimmed)?;
     let now = time::OffsetDateTime::now_utc();
@@ -389,7 +393,10 @@ fn render_fact_recall(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpEr
     }
 
     if hits.is_empty() {
-        return Ok(OpOutput::from(format!("Keine Treffer für: {}", tail.join(" "))));
+        return Ok(OpOutput::from(format!(
+            "Keine Treffer für: {}",
+            tail.join(" ")
+        )));
     }
     let mut buf = format!("{} Treffer:\n", hits.len());
     for (scope, fact) in &hits {
@@ -415,26 +422,26 @@ fn render_fact_recall(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpEr
 /// übersprungen).
 fn forget_fact(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpError> {
     let Some(name) = tail.first() else {
-        return Err(OpError::InvalidArguments("/memory forget <name>".to_owned()));
+        return Err(OpError::InvalidArguments(
+            "/memory forget <name>".to_owned(),
+        ));
     };
 
     let mut deleted_from = Vec::new();
     if let Ok(root) = project_memories_root(ctx) {
         if let Ok(store) = FactStore::open(&root, FactScope::Project) {
-            if store
-                .delete(name)
-                .map_err(|error| OpError::Execution(format!("Fakt löschen fehlgeschlagen (Projekt): {error}")))?
-            {
+            if store.delete(name).map_err(|error| {
+                OpError::Execution(format!("Fakt löschen fehlgeschlagen (Projekt): {error}"))
+            })? {
                 deleted_from.push("Projekt");
             }
         }
     }
     if let Ok(root) = global_memories_root() {
         if let Ok(store) = FactStore::open(&root, FactScope::Global) {
-            if store
-                .delete(name)
-                .map_err(|error| OpError::Execution(format!("Fakt löschen fehlgeschlagen (Global): {error}")))?
-            {
+            if store.delete(name).map_err(|error| {
+                OpError::Execution(format!("Fakt löschen fehlgeschlagen (Global): {error}"))
+            })? {
                 deleted_from.push("Global");
             }
         }
@@ -501,7 +508,9 @@ fn consolidate_dispatch(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, Op
 /// [`OpError::Execution`] bei Lock-/I/O-/Serde-Fehlern der beteiligten
 /// [`FactStore`]/`IncomingStore`/`ConsolidationBaseline`-Aufrufe.
 fn run_consolidate(root: &Path, scope: FactScope) -> Result<OpOutput, OpError> {
-    use harw_memory::consolidation::{ConsolidationBaseline, ConsolidationLock, apply_plan, plan_consolidation, steward_prompt};
+    use harw_memory::consolidation::{
+        ConsolidationBaseline, ConsolidationLock, apply_plan, plan_consolidation, steward_prompt,
+    };
     use harw_memory::{IncomingStore, MemoryError};
 
     let lock = match ConsolidationLock::try_acquire(root) {
@@ -512,26 +521,31 @@ fn run_consolidate(root: &Path, scope: FactScope) -> Result<OpOutput, OpError> {
             )));
         }
         Err(error) => {
-            return Err(OpError::Execution(format!("Konsolidierungs-Lock fehlgeschlagen: {error}")));
+            return Err(OpError::Execution(format!(
+                "Konsolidierungs-Lock fehlgeschlagen: {error}"
+            )));
         }
     };
 
     let outcome = (|| -> Result<String, OpError> {
-        let incoming_store = IncomingStore::open(root)
-            .map_err(|error| OpError::Execution(format!("Incoming-Speicher öffnen fehlgeschlagen: {error}")))?;
-        let fact_store = FactStore::open(root, scope)
-            .map_err(|error| OpError::Execution(format!("Fakt-Speicher öffnen fehlgeschlagen: {error}")))?;
+        let incoming_store = IncomingStore::open(root).map_err(|error| {
+            OpError::Execution(format!("Incoming-Speicher öffnen fehlgeschlagen: {error}"))
+        })?;
+        let fact_store = FactStore::open(root, scope).map_err(|error| {
+            OpError::Execution(format!("Fakt-Speicher öffnen fehlgeschlagen: {error}"))
+        })?;
 
-        let baseline = ConsolidationBaseline::read(root)
-            .map_err(|error| OpError::Execution(format!("Baseline lesen fehlgeschlagen: {error}")))?;
-        let existing_before = fact_store
-            .list()
-            .map_err(|error| OpError::Execution(format!("Bestehende Fakten lesen fehlgeschlagen: {error}")))?;
+        let baseline = ConsolidationBaseline::read(root).map_err(|error| {
+            OpError::Execution(format!("Baseline lesen fehlgeschlagen: {error}"))
+        })?;
+        let existing_before = fact_store.list().map_err(|error| {
+            OpError::Execution(format!("Bestehende Fakten lesen fehlgeschlagen: {error}"))
+        })?;
         let changed_since_baseline = baseline.diff(&existing_before);
 
-        let taken = incoming_store
-            .take_all()
-            .map_err(|error| OpError::Execution(format!("Kandidaten übernehmen fehlgeschlagen: {error}")))?;
+        let taken = incoming_store.take_all().map_err(|error| {
+            OpError::Execution(format!("Kandidaten übernehmen fehlgeschlagen: {error}"))
+        })?;
         if taken.is_empty() {
             return Ok(format!(
                 "Konsolidierung ({scope}): keine Kandidaten in facts/_incoming/ — nichts zu tun. \
@@ -542,8 +556,11 @@ fn run_consolidate(root: &Path, scope: FactScope) -> Result<OpOutput, OpError> {
         let candidate_count = taken.len();
 
         let plan = plan_consolidation(&existing_before, &taken);
-        let affected_names: std::collections::HashSet<&str> =
-            plan.merges.iter().map(|merge| merge.target.as_str()).collect();
+        let affected_names: std::collections::HashSet<&str> = plan
+            .merges
+            .iter()
+            .map(|merge| merge.target.as_str())
+            .collect();
         let affected: Vec<Fact> = existing_before
             .into_iter()
             .filter(|fact| affected_names.contains(fact.name.as_str()))
@@ -551,22 +568,31 @@ fn run_consolidate(root: &Path, scope: FactScope) -> Result<OpOutput, OpError> {
         let merges = plan.merges.len();
         let conflicts = plan.conflicts.len();
 
-        let report = apply_plan(&fact_store, &plan)
-            .map_err(|error| OpError::Execution(format!("Plan anwenden fehlgeschlagen: {error}")))?;
+        let report = apply_plan(&fact_store, &plan).map_err(|error| {
+            OpError::Execution(format!("Plan anwenden fehlgeschlagen: {error}"))
+        })?;
 
-        let existing_after = fact_store
-            .list()
-            .map_err(|error| OpError::Execution(format!("Fakten nach Anwendung lesen fehlgeschlagen: {error}")))?;
+        let existing_after = fact_store.list().map_err(|error| {
+            OpError::Execution(format!(
+                "Fakten nach Anwendung lesen fehlgeschlagen: {error}"
+            ))
+        })?;
         ConsolidationBaseline::from_facts(&existing_after)
             .write(root)
-            .map_err(|error| OpError::Execution(format!("Baseline schreiben fehlgeschlagen: {error}")))?;
+            .map_err(|error| {
+                OpError::Execution(format!("Baseline schreiben fehlgeschlagen: {error}"))
+            })?;
 
         let index = fs::read_to_string(root.join("MEMORY.md")).unwrap_or_default();
         let prompt = steward_prompt(&index, &taken, &affected, &changed_since_baseline);
         let affected_names_display = if affected.is_empty() {
             "keine".to_owned()
         } else {
-            affected.iter().map(|fact| fact.name.as_str()).collect::<Vec<_>>().join(", ")
+            affected
+                .iter()
+                .map(|fact| fact.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         };
 
         Ok(format!(
@@ -598,30 +624,35 @@ mod tests {
     use super::{
         MemoryArgs, MemoryOperation, parse_memory_scope_flags, truncate_description, unique_slug,
     };
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
     use harw_memory::{Fact, FactScope, FactStore, FactType};
     use harw_operations::operation::{CommandVisibility, Surface};
     use harw_operations::{FromRawArgs, OpError, Operation};
 
     #[test]
-    fn from_raw_args_no_tokens_uses_default_sub() {
-        let a = MemoryArgs::from_raw_args(&toks(&[])).unwrap();
+    fn from_raw_args_no_tokens_uses_default_sub() -> TestResult {
+        let a = MemoryArgs::from_raw_args(&toks(&[])).map_err(ctx("from_raw_args"))?;
         assert!(a.sub.is_none());
         assert!(a.tail.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn from_raw_args_captures_sub_and_tail() {
-        let a = MemoryArgs::from_raw_args(&toks(&["recall", "popup", "enter"])).unwrap();
+    fn from_raw_args_captures_sub_and_tail() -> TestResult {
+        let a = MemoryArgs::from_raw_args(&toks(&["recall", "popup", "enter"]))
+            .map_err(ctx("from_raw_args"))?;
         assert_eq!(a.sub.as_deref(), Some("recall"));
         assert_eq!(a.tail, vec!["popup".to_owned(), "enter".to_owned()]);
+        Ok(())
     }
 
     #[test]
-    fn from_raw_args_maintain_has_no_tail() {
-        let a = MemoryArgs::from_raw_args(&toks(&["maintain"])).unwrap();
+    fn from_raw_args_maintain_has_no_tail() -> TestResult {
+        let a = MemoryArgs::from_raw_args(&toks(&["maintain"])).map_err(ctx("from_raw_args"))?;
         assert_eq!(a.sub.as_deref(), Some("maintain"));
         assert!(a.tail.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -645,36 +676,49 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_memory_scope_flags_defaults_to_project() {
+    fn test_parse_memory_scope_flags_defaults_to_project() -> TestResult {
         let (positional, scope) =
-            parse_memory_scope_flags(&toks(&["hallo", "welt"]), FactScope::Project).unwrap();
+            parse_memory_scope_flags(&toks(&["hallo", "welt"]), FactScope::Project)
+                .map_err(ctx("parse_memory_scope_flags"))?;
         assert_eq!(positional, vec!["hallo".to_owned(), "welt".to_owned()]);
         assert_eq!(scope, FactScope::Project);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_memory_scope_flags_reads_global() {
+    fn test_parse_memory_scope_flags_reads_global() -> TestResult {
         let (positional, scope) =
-            parse_memory_scope_flags(&toks(&["hallo", "--global"]), FactScope::Project).unwrap();
+            parse_memory_scope_flags(&toks(&["hallo", "--global"]), FactScope::Project)
+                .map_err(ctx("parse_memory_scope_flags"))?;
         assert_eq!(positional, vec!["hallo".to_owned()]);
         assert_eq!(scope, FactScope::Global);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_memory_scope_flags_rejects_conflicting_flags() {
+    fn test_parse_memory_scope_flags_rejects_conflicting_flags() -> TestResult {
         let result =
             parse_memory_scope_flags(&toks(&["--project", "--global"]), FactScope::Project);
         match result {
-            Err(OpError::InvalidArguments(message)) => assert!(message.contains("widersprüchliche")),
-            other => panic!("expected invalid arguments, got {other:?}"),
+            Err(OpError::InvalidArguments(message)) => {
+                assert!(message.contains("widersprüchliche"))
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected invalid arguments, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_parse_memory_scope_flags_repeating_same_flag_is_not_a_conflict() {
+    fn test_parse_memory_scope_flags_repeating_same_flag_is_not_a_conflict() -> TestResult {
         let (_positional, scope) =
-            parse_memory_scope_flags(&toks(&["--project", "--project"]), FactScope::Global).unwrap();
+            parse_memory_scope_flags(&toks(&["--project", "--project"]), FactScope::Global)
+                .map_err(ctx("parse_memory_scope_flags"))?;
         assert_eq!(scope, FactScope::Project);
+        Ok(())
     }
 
     #[test]
@@ -690,13 +734,13 @@ mod tests {
         assert_eq!(truncated.chars().count(), 81);
     }
 
-    fn temp_fact_store(label: &str) -> (tempfile::TempDir, FactStore) {
+    fn temp_fact_store(label: &str) -> TestResult<(tempfile::TempDir, FactStore)> {
         let dir = tempfile::Builder::new()
             .prefix(&format!("harw-memory-facts-{label}-"))
             .tempdir()
-            .expect("tempdir");
-        let store = FactStore::open(dir.path(), FactScope::Project).expect("open store");
-        (dir, store)
+            .map_err(ctx("tempdir"))?;
+        let store = FactStore::open(dir.path(), FactScope::Project).map_err(ctx("open store"))?;
+        Ok((dir, store))
     }
 
     fn sample_fact(name: &str, body: &str) -> Fact {
@@ -716,40 +760,51 @@ mod tests {
     }
 
     #[test]
-    fn test_unique_slug_returns_base_when_free() {
-        let (_dir, store) = temp_fact_store("free");
-        let name = unique_slug(&store, "mein-fakt", "Text A").expect("resolve slug");
+    fn test_unique_slug_returns_base_when_free() -> TestResult {
+        let (_dir, store) = temp_fact_store("free")?;
+        let name = unique_slug(&store, "mein-fakt", "Text A").map_err(ctx("resolve slug"))?;
         assert_eq!(name, "mein-fakt");
+        Ok(())
     }
 
     #[test]
-    fn test_unique_slug_returns_base_when_identical_body_already_exists() {
-        let (_dir, store) = temp_fact_store("identical");
-        store.write(&sample_fact("mein-fakt", "Text A")).expect("seed fact");
-        let name = unique_slug(&store, "mein-fakt", "Text A").expect("resolve slug");
+    fn test_unique_slug_returns_base_when_identical_body_already_exists() -> TestResult {
+        let (_dir, store) = temp_fact_store("identical")?;
+        store
+            .write(&sample_fact("mein-fakt", "Text A"))
+            .map_err(ctx("seed fact"))?;
+        let name = unique_slug(&store, "mein-fakt", "Text A").map_err(ctx("resolve slug"))?;
         assert_eq!(name, "mein-fakt", "identical content re-uses the same slug");
+        Ok(())
     }
 
     #[test]
-    fn test_unique_slug_appends_suffix_on_content_collision() {
-        let (_dir, store) = temp_fact_store("collision");
-        store.write(&sample_fact("mein-fakt", "Text A")).expect("seed fact");
-        let name = unique_slug(&store, "mein-fakt", "Text B, komplett anders").expect("resolve slug");
+    fn test_unique_slug_appends_suffix_on_content_collision() -> TestResult {
+        let (_dir, store) = temp_fact_store("collision")?;
+        store
+            .write(&sample_fact("mein-fakt", "Text A"))
+            .map_err(ctx("seed fact"))?;
+        let name = unique_slug(&store, "mein-fakt", "Text B, komplett anders")
+            .map_err(ctx("resolve slug"))?;
         assert_eq!(name, "mein-fakt-2");
+        Ok(())
     }
 
     #[test]
-    fn test_record_fact_and_forget_round_trip_via_fact_store_directly() {
+    fn test_record_fact_and_forget_round_trip_via_fact_store_directly() -> TestResult {
         // Deckt den Fakt-Store-Teil des Rundlaufs ab (Schreiben, Lesen,
         // Löschen), ohne `harw_home`/Projekt-Erkennung zu berühren — das
         // übernehmen `project_memories_root`/`global_memories_root`, die
         // bewusst nicht gegen einen echten `$HOME` getestet werden (siehe
         // `permissions.rs`-Tests für die Begründung).
-        let (_dir, store) = temp_fact_store("round-trip");
+        let (_dir, store) = temp_fact_store("round-trip")?;
         let fact = sample_fact("mein-fakt", "Ein Beispieltext für den Fakt-Speicher.");
-        store.write(&fact).expect("write fact");
+        store.write(&fact).map_err(ctx("write fact"))?;
 
-        let read_back = store.read("mein-fakt").expect("read").expect("fact must exist");
+        let read_back = store
+            .read("mein-fakt")
+            .map_err(ctx("read"))?
+            .ok_or(TestError::Missing("fact must exist"))?;
         // `FactStore::write` normalisiert jeden nicht-leeren Body auf genau
         // einen abschließenden Zeilenumbruch (harw-memory/src/facts.rs::
         // to_markdown) — dieselbe Konvention, die harw-memory's eigener
@@ -759,9 +814,15 @@ mod tests {
         // Bytegleichheit ohne diese Normalisierung.
         assert_eq!(read_back.body, format!("{}\n", fact.body));
 
-        let deleted = store.delete("mein-fakt").expect("delete");
+        let deleted = store.delete("mein-fakt").map_err(ctx("delete"))?;
         assert!(deleted);
-        assert!(store.read("mein-fakt").expect("read after delete").is_none());
+        assert!(
+            store
+                .read("mein-fakt")
+                .map_err(ctx("read after delete"))?
+                .is_none()
+        );
+        Ok(())
     }
 
     // -- run_consolidate ---------------------------------------------------
@@ -771,55 +832,76 @@ mod tests {
     // testbar, ohne `harw_home`/Projekt-Erkennung zu berühren (vgl. Kommentar
     // bei `test_record_fact_and_forget_round_trip_via_fact_store_directly`).
 
-    fn tmp_consolidate_root(tag: &str) -> tempfile::TempDir {
+    fn tmp_consolidate_root(tag: &str) -> TestResult<tempfile::TempDir> {
         tempfile::Builder::new()
             .prefix(&format!("harw-memory-consolidate-{tag}-"))
             .tempdir()
-            .expect("tempdir")
+            .map_err(ctx("tempdir"))
     }
 
     #[test]
-    fn run_consolidate_reports_nothing_to_do_without_candidates() {
-        let dir = tmp_consolidate_root("empty");
-        let out = super::run_consolidate(dir.path(), FactScope::Project).expect("run_consolidate");
+    fn run_consolidate_reports_nothing_to_do_without_candidates() -> TestResult {
+        let dir = tmp_consolidate_root("empty")?;
+        let out = super::run_consolidate(dir.path(), FactScope::Project)
+            .map_err(ctx("run_consolidate"))?;
         assert!(out.text.contains("nichts zu tun"), "text was: {}", out.text);
         assert!(out.text.contains("Fakt(en) seit letzter Baseline geändert"));
+        Ok(())
     }
 
     #[test]
-    fn run_consolidate_merges_candidate_into_existing_fact_and_reports_missing_steward() {
-        let dir = tmp_consolidate_root("merge");
-        let store = FactStore::open(dir.path(), FactScope::Project).expect("open fact store");
+    fn run_consolidate_merges_candidate_into_existing_fact_and_reports_missing_steward()
+    -> TestResult {
+        let dir = tmp_consolidate_root("merge")?;
+        let store =
+            FactStore::open(dir.path(), FactScope::Project).map_err(ctx("open fact store"))?;
         let mut existing = sample_fact("tui-approval-arming", "alte Beschreibung");
         existing.sources = vec!["session:old".to_owned()];
-        store.write(&existing).expect("seed existing fact");
+        store.write(&existing).map_err(ctx("seed existing fact"))?;
 
-        let incoming = harw_memory::extraction::IncomingStore::open(dir.path()).expect("open incoming store");
+        let incoming = harw_memory::extraction::IncomingStore::open(dir.path())
+            .map_err(ctx("open incoming store"))?;
         let mut candidate = sample_fact("tui-approval-arming", "neue Beschreibung");
         candidate.sources = vec!["session:new".to_owned()];
         // Explizit später als `existing.updated`, damit `merge_facts` deterministisch
         // die neuere Beschreibung wählt (siehe `consolidation.rs`s eigene Tests).
         candidate.updated = existing.updated + time::Duration::seconds(1);
-        incoming.write_candidates(&[candidate]).expect("write candidate");
+        incoming
+            .write_candidates(&[candidate])
+            .map_err(ctx("write candidate"))?;
 
-        let out = super::run_consolidate(dir.path(), FactScope::Project).expect("run_consolidate");
+        let out = super::run_consolidate(dir.path(), FactScope::Project)
+            .map_err(ctx("run_consolidate"))?;
 
         assert!(out.text.contains("Merges: 1"), "text was: {}", out.text);
-        assert!(out.text.contains("memory-steward"), "muss auf den fehlenden Agentenlauf hinweisen");
+        assert!(
+            out.text.contains("memory-steward"),
+            "muss auf den fehlenden Agentenlauf hinweisen"
+        );
         assert!(out.text.contains("FEHLT"));
 
         // Kandidat wurde konsumiert, Fakt wurde verschmolzen (neuere Beschreibung gewinnt).
-        assert!(incoming.list().expect("list incoming").is_empty());
-        let merged = store.read("tui-approval-arming").expect("read merged").expect("must exist");
+        assert!(incoming.list().map_err(ctx("list incoming"))?.is_empty());
+        let merged = store
+            .read("tui-approval-arming")
+            .map_err(ctx("read merged"))?
+            .ok_or(TestError::Missing("must exist"))?;
         assert_eq!(merged.description, "neue Beschreibung");
 
         // Baseline wurde geschrieben und deckt den frisch verschmolzenen Fakt ab.
-        let baseline = harw_memory::consolidation::ConsolidationBaseline::read(dir.path()).expect("read baseline");
+        let baseline = harw_memory::consolidation::ConsolidationBaseline::read(dir.path())
+            .map_err(ctx("read baseline"))?;
         assert!(baseline.digests.contains_key("tui-approval-arming"));
 
         // Zweiter Lauf ohne neue Kandidaten: nichts zu tun, keine weiteren Änderungen seit Baseline.
-        let second = super::run_consolidate(dir.path(), FactScope::Project).expect("second run_consolidate");
+        let second = super::run_consolidate(dir.path(), FactScope::Project)
+            .map_err(ctx("second run_consolidate"))?;
         assert!(second.text.contains("nichts zu tun"));
-        assert!(second.text.contains("0 Fakt(en) seit letzter Baseline geändert"));
+        assert!(
+            second
+                .text
+                .contains("0 Fakt(en) seit letzter Baseline geändert")
+        );
+        Ok(())
     }
 }

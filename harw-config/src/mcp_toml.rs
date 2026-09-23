@@ -41,27 +41,30 @@ pub enum McpTransportToml {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
-    fn parses_disabled_http_server_metadata() {
+    fn parses_disabled_http_server_metadata() -> TestResult {
         let server: McpServerToml = toml::from_str(
             "name = \"docs\"\ntransport = \"http\"\nurl = \"https://example.invalid/mcp\"\n",
         )
-        .unwrap();
+        .map_err(ctx("MCP-TOML parsen"))?;
 
         assert_eq!(server.transport, McpTransportToml::StreamableHttp);
         assert!(!server.enabled);
+        Ok(())
     }
 
     #[test]
-    fn serializes_the_explicit_streamable_http_transport_name() {
+    fn serializes_the_explicit_streamable_http_transport_name() -> TestResult {
         let server: McpServerToml = toml::from_str(
             "name = \"workflow\"\ntransport = \"streamable_http\"\nurl = \"https://mcp.example.test\"\nenabled = true\n",
         )
-        .unwrap();
+        .map_err(ctx("MCP-TOML parsen"))?;
         assert_eq!(server.transport, McpTransportToml::StreamableHttp);
-        let encoded = toml::to_string(&server).unwrap();
+        let encoded = toml::to_string(&server).map_err(ctx("MCP-TOML serialisieren"))?;
         assert!(encoded.contains("transport = \"streamable_http\""));
+        Ok(())
     }
 
     #[test]

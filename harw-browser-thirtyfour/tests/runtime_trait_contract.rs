@@ -1,3 +1,6 @@
+mod common;
+
+use common::{TestError, TestResult};
 use harw_browser::host::BrowserHost;
 use harw_browser_thirtyfour::{FIREFOX_BIDI_BINDING_ID, FirefoxHost, FirefoxHostConfig};
 use std::path::{Path, PathBuf};
@@ -10,12 +13,16 @@ fn firefox_host_satisfies_the_browser_host_concurrency_contract() {
 }
 
 #[test]
-fn browser_host_implementation_preserves_constructor_and_config_access() {
-    let config = FirefoxHostConfig::new()
-        .with_firefox_binary(PathBuf::from("/opt/firefox/firefox"));
+fn browser_host_implementation_preserves_constructor_and_config_access() -> TestResult {
+    let config =
+        FirefoxHostConfig::new().with_firefox_binary(PathBuf::from("/opt/firefox/firefox"));
     let host = match FirefoxHost::new(config) {
         Ok(host) => host,
-        Err(error) => panic!("deterministic host construction failed: {error}"),
+        Err(error) => {
+            return Err(TestError::Unexpected(format!(
+                "deterministic host construction failed: {error}"
+            )));
+        }
     };
 
     assert_eq!(
@@ -27,4 +34,5 @@ fn browser_host_implementation_preserves_constructor_and_config_access() {
         FirefoxHost::binding_metadata().binding_id,
         FIREFOX_BIDI_BINDING_ID
     );
+    Ok(())
 }

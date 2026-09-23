@@ -890,8 +890,10 @@ impl HistoryCell for GoalCell {
         let text_width = width.saturating_sub(prefix_len).max(1);
         let mut lines: Vec<Line<'static>> = Vec::new();
 
-        let statement_preview =
-            sanitize_inline(&truncate_chars(&self.statement, GOAL_STATEMENT_PREVIEW_CHARS));
+        let statement_preview = sanitize_inline(&truncate_chars(
+            &self.statement,
+            GOAL_STATEMENT_PREVIEW_CHARS,
+        ));
         let header_text = format!("Ziel: {statement_preview}");
         let header_style = style::selected_style(theme);
         let wrapped_header = wrap_plain(&header_text, text_width);
@@ -1237,6 +1239,9 @@ pub(crate) type SharedToolCell = Arc<Mutex<ToolCell>>;
 /// - `fs.search`/`fs.grep` → `Search("<Muster>" in <Pfad oder .>)`.
 /// - `fs.list`/`fs.glob` → `List(<Pfad>)`.
 /// - `fs.write` → `Write(<Pfad>)`.
+/// - `doc.read_pdf` → `ReadPdf(<Pfad>)`, bzw. `ReadPdf(<Pfad>, Seiten
+///   <Bereich>)` wenn das Argument `pages` gesetzt ist (dieselbe
+///   Darstellungsform wie `fs.read`, nur mit optionalem Seitenbereich).
 /// - `transfer_to_<rolle>` → `Agent(<rolle>)`.
 /// - alles andere → `name(schlüssel: wert, …)` mit den ersten bis zu drei
 ///   **skalaren** Argumenten (Zeichenketten in Anführungszeichen, auf 40
@@ -1262,7 +1267,9 @@ pub(crate) fn tool_label(call: &ToolCall) -> String {
     let tool_name = call.name.as_str();
     let object = call.arguments.as_object();
     let str_arg = |key: &str| -> Option<&str> {
-        object.and_then(|entries| entries.get(key)).and_then(|v| v.as_str())
+        object
+            .and_then(|entries| entries.get(key))
+            .and_then(|v| v.as_str())
     };
 
     match tool_name {
@@ -1279,6 +1286,13 @@ pub(crate) fn tool_label(call: &ToolCall) -> String {
         ),
         "fs.list" | "fs.glob" => format!("List({})", str_arg("path").unwrap_or("")),
         "fs.write" => format!("Write({})", str_arg("path").unwrap_or("")),
+        "doc.read_pdf" => {
+            let path = str_arg("path").unwrap_or("");
+            match str_arg("pages") {
+                Some(pages) if !pages.is_empty() => format!("ReadPdf({path}, Seiten {pages})"),
+                _ => format!("ReadPdf({path})"),
+            }
+        }
         other if other.len() > "transfer_to_".len() && other.starts_with("transfer_to_") => {
             format!("Agent({})", &other["transfer_to_".len()..])
         }
@@ -1317,6 +1331,28 @@ fn unknown_tool_label(call: &ToolCall) -> String {
         parts.push(format!("{key}: {rendered}"));
     }
     format!("{tool_name}({})", parts.join(", "))
+}
+
+/// Extrahiert den Seitenangaben-Teil aus der Kopfzeile eines
+/// `doc.read_pdf`-Ergebnisses (`"{path} — Seiten X–Y von N
+/// (Mistral OCR|lokal)"`), zur Nutzung als Erfolgs-Zusammenfassung anstelle
+/// von „N Zeilen" (siehe [`ToolCell::apply_success`]). Rein
+/// zeichenbasiert über [`str::find`], kein Parser.
+///
+/// # Argumente
+/// - `header` (`&str`): die erste Zeile des `doc.read_pdf`-Ergebnistexts.
+///
+/// # Rückgabe
+/// `Some("Seiten X–Y von N (…)")` wenn die Kopfzeile das Teilwort
+/// `"Seiten "` enthält, sonst `None` (dann greift die generische Vorschau).
+fn parse_read_pdf_page_summary(header: &str) -> Option<String> {
+    let idx = header.find("Seiten ")?;
+    let tail = header[idx..].trim();
+    if tail.is_empty() {
+        None
+    } else {
+        Some(tail.to_owned())
+    }
 }
 
 /// Formatiert eine kompakte JSON-Zeichenkette mit Einzügen.
@@ -1452,6 +1488,11 @@ impl ToolCell {
     ///   sonst der JSON-Form), keine `preview`-Zeilen.
     /// - `fs.search`/`fs.grep`: `summary = Some("N Treffer")` (Länge von
     ///   `matches`/`results`, sonst `0`).
+    /// - `doc.read_pdf`: `summary` aus dem Seitenangaben-Teil der Kopfzeile
+    ///   (`"Seiten X–Y von N (…)"`), wenn diese das erwartete Muster enthält
+    ///   (siehe [`parse_read_pdf_page_summary`]) — dann keine `preview`-Zeilen,
+    ///   analog zu `fs.read`. Sonst (Kopfzeile nicht parsebar) `summary =
+    ///   None` und eine generische Vorschau wie im Fallback-Zweig unten.
     /// - alle anderen Werkzeuge: `summary = None`, `preview` die ersten drei
     ///   Zeilen einer kompakten Klartext-Darstellung (Zeichenketten
     ///   unverändert, Objekte als `schlüssel: wert`-Zeilen).
@@ -1494,8 +1535,11 @@ impl ToolCell {
                 let stdout = value.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
                 let stderr = value.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
 
-                let all_lines: Vec<String> =
-                    stdout.lines().chain(stderr.lines()).map(str::to_owned).collect();
+                let all_lines: Vec<String> = stdout
+                    .lines()
+                    .chain(stderr.lines())
+                    .map(str::to_owned)
+                    .collect();
                 let non_empty: Vec<String> = all_lines
                     .iter()
                     .filter(|line| !line.trim().is_empty())
@@ -1512,7 +1556,11 @@ impl ToolCell {
                 } else {
                     Some(format!("exit {exit_code}"))
                 };
-                self.preview = non_empty.iter().take(TOOL_CELL_COLLAPSED_LINES).cloned().collect();
+                self.preview = non_empty
+                    .iter()
+                    .take(TOOL_CELL_COLLAPSED_LINES)
+                    .cloned()
+                    .collect();
                 self.hidden_lines = non_empty.len().saturating_sub(self.preview.len());
                 self.full_output = all_lines;
             }
@@ -1522,7 +1570,10 @@ impl ToolCell {
                     .and_then(|v| v.as_str())
                     .or_else(|| value.get("text").and_then(|v| v.as_str()));
                 let (line_count, lines) = match text {
-                    Some(t) => (t.lines().count(), t.lines().map(str::to_owned).collect::<Vec<_>>()),
+                    Some(t) => (
+                        t.lines().count(),
+                        t.lines().map(str::to_owned).collect::<Vec<_>>(),
+                    ),
                     None => {
                         let rendered = value.to_string();
                         let lines: Vec<String> = rendered.lines().map(str::to_owned).collect();
@@ -1533,6 +1584,32 @@ impl ToolCell {
                 self.summary = Some(format!("{line_count} Zeilen"));
                 self.preview = Vec::new();
                 self.hidden_lines = 0;
+                self.full_output = lines;
+            }
+            "doc.read_pdf" => {
+                let text = value
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| value.get("text").and_then(|v| v.as_str()));
+                let lines: Vec<String> = match text {
+                    Some(t) => t.lines().map(str::to_owned).collect(),
+                    None => value.to_string().lines().map(str::to_owned).collect(),
+                };
+                self.state = ToolState::Succeeded;
+                self.summary = lines
+                    .first()
+                    .and_then(|header| parse_read_pdf_page_summary(header));
+                if self.summary.is_some() {
+                    self.preview = Vec::new();
+                    self.hidden_lines = 0;
+                } else {
+                    self.preview = lines
+                        .iter()
+                        .take(TOOL_CELL_COLLAPSED_LINES)
+                        .cloned()
+                        .collect();
+                    self.hidden_lines = lines.len().saturating_sub(self.preview.len());
+                }
                 self.full_output = lines;
             }
             "fs.search" | "fs.grep" => {
@@ -1565,7 +1642,11 @@ impl ToolCell {
                 } else {
                     lines.push(value.to_string());
                 }
-                self.preview = lines.iter().take(TOOL_CELL_COLLAPSED_LINES).cloned().collect();
+                self.preview = lines
+                    .iter()
+                    .take(TOOL_CELL_COLLAPSED_LINES)
+                    .cloned()
+                    .collect();
                 self.hidden_lines = lines.len().saturating_sub(self.preview.len());
                 self.full_output = lines;
             }
@@ -1886,14 +1967,15 @@ impl ToolGroupCell {
     /// - `tool_name` (`&str`): der zu prüfende Werkzeugname.
     ///
     /// # Rückgabe
-    /// `true` für `fs.read`, `fs.search`, `fs.grep`, `fs.list`, `fs.glob`;
-    /// sonst `false` (z. B. `shell.exec`, `fs.write`, unbekannte Werkzeuge —
-    /// jeder Aufruf mit Seiteneffekten oder unbekanntem Verhalten bleibt
-    /// eine eigene, einzeln sichtbare Zelle).
+    /// `true` für `fs.read`, `fs.search`, `fs.grep`, `fs.list`, `fs.glob`,
+    /// `doc.read_pdf` (ebenfalls ein reines Lesewerkzeug); sonst `false`
+    /// (z. B. `shell.exec`, `fs.write`, unbekannte Werkzeuge — jeder Aufruf
+    /// mit Seiteneffekten oder unbekanntem Verhalten bleibt eine eigene,
+    /// einzeln sichtbare Zelle).
     pub(crate) fn accepts(tool_name: &str) -> bool {
         matches!(
             tool_name,
-            "fs.read" | "fs.search" | "fs.grep" | "fs.list" | "fs.glob"
+            "fs.read" | "fs.search" | "fs.grep" | "fs.list" | "fs.glob" | "doc.read_pdf"
         )
     }
 
@@ -1908,7 +1990,7 @@ impl ToolGroupCell {
                 continue;
             };
             match guard.tool_name.as_str() {
-                "fs.read" => tally.read += 1,
+                "fs.read" | "doc.read_pdf" => tally.read += 1,
                 "fs.search" | "fs.grep" => tally.search += 1,
                 "fs.list" | "fs.glob" => tally.list += 1,
                 _ => {}
@@ -2014,7 +2096,7 @@ impl ToolGroupCell {
 /// Ergebnis von [`ToolGroupCell::tally`]: Zählung je Kategorie und Status.
 #[derive(Debug, Default, Clone, Copy)]
 struct ToolGroupTally {
-    /// Zahl der `fs.read`-Zellen.
+    /// Zahl der `fs.read`-/`doc.read_pdf`-Zellen.
     read: usize,
     /// Zahl der `fs.search`/`fs.grep`-Zellen.
     search: usize,
@@ -2039,6 +2121,7 @@ impl HistoryCell for ToolGroupCell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use harw_plan::ids::{PathOrSymbol, PlanId, RevisionId, TaskId};
     use harw_plan::{PlanNode, PlanNodeKind};
     use time::OffsetDateTime;
@@ -2498,7 +2581,10 @@ mod tests {
         };
         let lines = cell.display_lines(80, style::Theme::Dark);
         assert_eq!(lines[0].spans[0].style, styled);
-        assert_eq!(lines_to_strings(&lines), vec!["⟨ESC⟩diff    zeile".to_owned()]);
+        assert_eq!(
+            lines_to_strings(&lines),
+            vec!["⟨ESC⟩diff    zeile".to_owned()]
+        );
     }
 
     /// Assistenten-Text: sichtbarer Text bleibt, OSC-52-Nutzlast verschwindet.
@@ -2699,7 +2785,10 @@ mod tests {
     /// ergeben die vorgesehenen Klartext-Label, niemals rohes JSON.
     #[test]
     fn test_tool_label_fs_tools() {
-        let read = make_tool_call("fs.read", harw_tools::serde_json::json!({ "path": "src/app.rs" }));
+        let read = make_tool_call(
+            "fs.read",
+            harw_tools::serde_json::json!({ "path": "src/app.rs" }),
+        );
         assert_eq!(tool_label(&read), "Read(src/app.rs)");
 
         let write = make_tool_call(
@@ -2720,8 +2809,32 @@ mod tests {
         );
         assert_eq!(tool_label(&search), "Search(\"TODO\" in src)");
 
-        let grep = make_tool_call("fs.grep", harw_tools::serde_json::json!({ "pattern": "TODO" }));
+        let grep = make_tool_call(
+            "fs.grep",
+            harw_tools::serde_json::json!({ "pattern": "TODO" }),
+        );
         assert_eq!(tool_label(&grep), "Search(\"TODO\" in .)");
+    }
+
+    /// `doc.read_pdf` ergibt `ReadPdf(<Pfad>)` ohne `pages`-Argument bzw.
+    /// `ReadPdf(<Pfad>, Seiten <Bereich>)` mit gesetztem `pages`-Argument —
+    /// dieselbe Darstellungsform wie `fs.read`, ergänzt um den Seitenbereich.
+    #[test]
+    fn test_tool_label_doc_read_pdf() {
+        let without_pages = make_tool_call(
+            "doc.read_pdf",
+            harw_tools::serde_json::json!({ "path": "docs/report.pdf" }),
+        );
+        assert_eq!(tool_label(&without_pages), "ReadPdf(docs/report.pdf)");
+
+        let with_pages = make_tool_call(
+            "doc.read_pdf",
+            harw_tools::serde_json::json!({ "path": "docs/report.pdf", "pages": "2-5" }),
+        );
+        assert_eq!(
+            tool_label(&with_pages),
+            "ReadPdf(docs/report.pdf, Seiten 2-5)"
+        );
     }
 
     /// `transfer_to_<rolle>` ergibt `Agent(<rolle>)`.
@@ -2762,7 +2875,10 @@ mod tests {
     /// Zusammenfassung, höchstens drei Vorschauzeilen, Rest gezählt.
     #[test]
     fn test_tool_cell_complete_shell_success_previews_three_lines() {
-        let call = make_tool_call("shell.exec", harw_tools::serde_json::json!({ "command": "ls" }));
+        let call = make_tool_call(
+            "shell.exec",
+            harw_tools::serde_json::json!({ "command": "ls" }),
+        );
         let mut cell = ToolCell::started(&call);
         let result = harw_protocol::items::ToolCallResult::success(harw_tools::serde_json::json!({
             "exit_code": 0,
@@ -2779,7 +2895,9 @@ mod tests {
         let lines = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
         assert!(lines[0].starts_with("● Bash(ls) · 42ms"), "war: {lines:?}");
         assert!(
-            lines.iter().any(|l| l.contains("+1 Zeilen (ctrl+o zum Ausklappen)")),
+            lines
+                .iter()
+                .any(|l| l.contains("+1 Zeilen (ctrl+o zum Ausklappen)")),
             "war: {lines:?}"
         );
     }
@@ -2832,7 +2950,10 @@ mod tests {
     /// Vorschau — kein „ausgeblendet“-Hinweis mehr.
     #[test]
     fn test_tool_cell_expanded_shows_all_output_lines() {
-        let call = make_tool_call("shell.exec", harw_tools::serde_json::json!({ "command": "ls" }));
+        let call = make_tool_call(
+            "shell.exec",
+            harw_tools::serde_json::json!({ "command": "ls" }),
+        );
         let mut cell = ToolCell::started(&call);
         let result = harw_protocol::items::ToolCallResult::success(harw_tools::serde_json::json!({
             "exit_code": 0,
@@ -2854,7 +2975,10 @@ mod tests {
     /// Vorschauzeilen (nur die Zusammenfassung).
     #[test]
     fn test_tool_cell_complete_fs_read_counts_lines() {
-        let call = make_tool_call("fs.read", harw_tools::serde_json::json!({ "path": "a.txt" }));
+        let call = make_tool_call(
+            "fs.read",
+            harw_tools::serde_json::json!({ "path": "a.txt" }),
+        );
         let mut cell = ToolCell::started(&call);
         let result = harw_protocol::items::ToolCallResult::success(harw_tools::serde_json::json!({
             "content": "zeile1\nzeile2\nzeile3",
@@ -2884,7 +3008,10 @@ mod tests {
     /// Setzt eine Freigabe-Notiz; sie erscheint gedimmt in der Kopfzeile.
     #[test]
     fn test_tool_cell_set_approval_note_appears_in_header() {
-        let call = make_tool_call("shell.exec", harw_tools::serde_json::json!({ "command": "ls" }));
+        let call = make_tool_call(
+            "shell.exec",
+            harw_tools::serde_json::json!({ "command": "ls" }),
+        );
         let mut cell = ToolCell::started(&call);
         cell.set_approval_note("✓ freigegeben");
 
@@ -2895,7 +3022,10 @@ mod tests {
     /// Ein ANSI-Escape in `stdout` erreicht nie den gerenderten Buffer.
     #[test]
     fn test_tool_cell_sanitizes_hostile_stdout() {
-        let call = make_tool_call("shell.exec", harw_tools::serde_json::json!({ "command": "ls" }));
+        let call = make_tool_call(
+            "shell.exec",
+            harw_tools::serde_json::json!({ "command": "ls" }),
+        );
         let mut cell = ToolCell::started(&call);
         let hostile = "\u{1b}[31mROT\u{1b}[0m";
         let result = harw_protocol::items::ToolCallResult::success(harw_tools::serde_json::json!({
@@ -2913,7 +3043,10 @@ mod tests {
     /// Läuft der Aufruf noch (`Running`), zeigt die Zelle keine Dauer an.
     #[test]
     fn test_tool_cell_running_state_has_no_duration() {
-        let call = make_tool_call("shell.exec", harw_tools::serde_json::json!({ "command": "ls" }));
+        let call = make_tool_call(
+            "shell.exec",
+            harw_tools::serde_json::json!({ "command": "ls" }),
+        );
         let cell = ToolCell::started(&call);
         assert_eq!(cell.state, ToolState::Running);
         assert_eq!(cell.duration_ms, None);
@@ -2938,15 +3071,32 @@ mod tests {
         }));
         cell.complete(&result, 2);
 
-        let compact = lines_to_strings(&cell.display_lines_with(80, style::Theme::Dark, ToolVerbosity::Compact));
-        let verbose = lines_to_strings(&cell.display_lines_with(80, style::Theme::Dark, ToolVerbosity::Verbose));
+        let compact = lines_to_strings(&cell.display_lines_with(
+            80,
+            style::Theme::Dark,
+            ToolVerbosity::Compact,
+        ));
+        let verbose = lines_to_strings(&cell.display_lines_with(
+            80,
+            style::Theme::Dark,
+            ToolVerbosity::Verbose,
+        ));
 
-        assert!(!compact.join("\n").contains("timeout_secs"), "war: {compact:?}");
-        assert!(verbose.join("\n").contains("timeout_secs"), "war: {verbose:?}");
+        assert!(
+            !compact.join("\n").contains("timeout_secs"),
+            "war: {compact:?}"
+        );
+        assert!(
+            verbose.join("\n").contains("timeout_secs"),
+            "war: {verbose:?}"
+        );
         assert!(verbose.join("\n").contains("30"), "war: {verbose:?}");
         // Verbose verhält sich wie ausgeklappt: alle vier Ausgabezeilen da.
         for line in ["eins", "zwei", "drei", "vier"] {
-            assert!(verbose.iter().any(|l| l.contains(line)), "Zeile {line} fehlt: {verbose:?}");
+            assert!(
+                verbose.iter().any(|l| l.contains(line)),
+                "Zeile {line} fehlt: {verbose:?}"
+            );
         }
     }
 
@@ -2965,12 +3115,12 @@ mod tests {
 
     /// Die eingeklappte Gruppen-Sammelzeile nennt die Zahl je Kategorie.
     #[test]
-    fn test_tool_group_cell_collapsed_summary_counts_categories() {
+    fn test_tool_group_cell_collapsed_summary_counts_categories() -> TestResult {
         let mut group = ToolGroupCell::new();
 
         let read_call = make_tool_call("fs.read", harw_tools::serde_json::json!({ "path": "a" }));
         let read_cell = Arc::new(Mutex::new(ToolCell::started(&read_call)));
-        read_cell.lock().unwrap().complete(
+        read_cell.lock().map_err(ctx("Mutex vergiftet"))?.complete(
             &harw_protocol::items::ToolCallResult::success(
                 harw_tools::serde_json::json!({ "content": "x" }),
             ),
@@ -2980,12 +3130,15 @@ mod tests {
 
         let read_call_2 = make_tool_call("fs.read", harw_tools::serde_json::json!({ "path": "b" }));
         let read_cell_2 = Arc::new(Mutex::new(ToolCell::started(&read_call_2)));
-        read_cell_2.lock().unwrap().complete(
-            &harw_protocol::items::ToolCallResult::success(
-                harw_tools::serde_json::json!({ "content": "y" }),
-            ),
-            1,
-        );
+        read_cell_2
+            .lock()
+            .map_err(ctx("Mutex vergiftet"))?
+            .complete(
+                &harw_protocol::items::ToolCallResult::success(
+                    harw_tools::serde_json::json!({ "content": "y" }),
+                ),
+                1,
+            );
         group.push(Arc::clone(&read_cell_2));
 
         let search_call = make_tool_call(
@@ -2993,12 +3146,15 @@ mod tests {
             harw_tools::serde_json::json!({ "pattern": "TODO" }),
         );
         let search_cell = Arc::new(Mutex::new(ToolCell::started(&search_call)));
-        search_cell.lock().unwrap().complete(
-            &harw_protocol::items::ToolCallResult::success(
-                harw_tools::serde_json::json!({ "matches": [] }),
-            ),
-            1,
-        );
+        search_cell
+            .lock()
+            .map_err(ctx("Mutex vergiftet"))?
+            .complete(
+                &harw_protocol::items::ToolCallResult::success(
+                    harw_tools::serde_json::json!({ "matches": [] }),
+                ),
+                1,
+            );
         group.push(search_cell);
 
         let lines = lines_to_strings(&group.display_lines(80, style::Theme::Dark));
@@ -3014,17 +3170,21 @@ mod tests {
         let expanded = lines_to_strings(&group.display_lines(80, style::Theme::Dark)).join("\n");
         assert!(expanded.contains("Read(a)"), "war: {expanded:?}");
         assert!(expanded.contains("Read(b)"), "war: {expanded:?}");
-        assert!(expanded.contains("Search(\"TODO\" in .)"), "war: {expanded:?}");
+        assert!(
+            expanded.contains("Search(\"TODO\" in .)"),
+            "war: {expanded:?}"
+        );
+        Ok(())
     }
 
     /// Ist eine der gruppierten Zellen fehlgeschlagen, färbt sich der
     /// Statuspunkt rot und die Sammelzeile nennt die Fehlerzahl.
     #[test]
-    fn test_tool_group_cell_reports_failure_count() {
+    fn test_tool_group_cell_reports_failure_count() -> TestResult {
         let mut group = ToolGroupCell::new();
         let ok_call = make_tool_call("fs.read", harw_tools::serde_json::json!({ "path": "a" }));
         let ok_cell = Arc::new(Mutex::new(ToolCell::started(&ok_call)));
-        ok_cell.lock().unwrap().complete(
+        ok_cell.lock().map_err(ctx("Mutex vergiftet"))?.complete(
             &harw_protocol::items::ToolCallResult::success(
                 harw_tools::serde_json::json!({ "content": "x" }),
             ),
@@ -3034,13 +3194,14 @@ mod tests {
 
         let bad_call = make_tool_call("fs.read", harw_tools::serde_json::json!({ "path": "b" }));
         let bad_cell = Arc::new(Mutex::new(ToolCell::started(&bad_call)));
-        bad_cell
-            .lock()
-            .unwrap()
-            .complete(&harw_protocol::items::ToolCallResult::error("nicht gefunden"), 1);
+        bad_cell.lock().map_err(ctx("Mutex vergiftet"))?.complete(
+            &harw_protocol::items::ToolCallResult::error("nicht gefunden"),
+            1,
+        );
         group.push(bad_cell);
 
         let joined = lines_to_strings(&group.display_lines(80, style::Theme::Dark)).join("\n");
         assert!(joined.contains("1 fehlgeschlagen"), "war: {joined:?}");
+        Ok(())
     }
 }

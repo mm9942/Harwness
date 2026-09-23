@@ -101,6 +101,9 @@ mod traced;
 mod util;
 mod warden_actions;
 
+#[cfg(test)]
+mod test_support;
+
 /// Derive `Display`, `std::error::Error` and `From` for an error enum.
 ///
 /// Per-variant attributes:

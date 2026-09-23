@@ -463,6 +463,7 @@ mod tests {
     };
     use crate::file_store::FileMemoryStore;
     use crate::short_term::{ShortTermMemory, StmRole};
+    use crate::test_support::{TestResult, ctx};
     use time::{Duration, OffsetDateTime};
 
     // ── Hilfsfunktionen ───────────────────────────────────────────────────────
@@ -475,11 +476,11 @@ mod tests {
     }
 
     /// Öffnet einen frischen `FileMemoryStore` in einem neuen Temp-Verzeichnis.
-    fn open_store(tag: &str) -> (FileMemoryStore, std::path::PathBuf) {
+    fn open_store(tag: &str) -> TestResult<(FileMemoryStore, std::path::PathBuf)> {
         let root = tmp_root(tag);
         let _ = std::fs::remove_dir_all(&root);
-        let store = FileMemoryStore::open(&root).expect("open store");
-        (store, root)
+        let store = FileMemoryStore::open(&root).map_err(ctx("open store"))?;
+        Ok((store, root))
     }
 
     /// Erzeugt ein minimales, gültiges `EpistemicSignal`.
@@ -521,12 +522,14 @@ mod tests {
     ///
     /// Spezifikation: `#[serde(rename_all = "snake_case")]` auf `SelectionRole`.
     #[test]
-    fn role_serde_snake_case() {
-        let json = serde_json::to_string(&SelectionRole::FocusedCodingWorker).expect("serialize");
+    fn role_serde_snake_case() -> TestResult {
+        let json =
+            serde_json::to_string(&SelectionRole::FocusedCodingWorker).map_err(ctx("serialize"))?;
         assert_eq!(json, r#""focused_coding_worker""#);
 
-        let back: SelectionRole = serde_json::from_str(&json).expect("deserialize");
+        let back: SelectionRole = serde_json::from_str(&json).map_err(ctx("deserialize"))?;
         assert_eq!(back, SelectionRole::FocusedCodingWorker);
+        Ok(())
     }
 
     // ── Test 2: Leere Eingabe → leere Selektion ───────────────────────────────
@@ -536,8 +539,8 @@ mod tests {
     ///
     /// Spezifikation: Schritt 2–5 von `select_for_turn`.
     #[test]
-    fn empty_input_produces_empty_selection() {
-        let (store, root) = open_store("empty");
+    fn empty_input_produces_empty_selection() -> TestResult {
+        let (store, root) = open_store("empty")?;
         let stm = ShortTermMemory::new("s-empty", 32, 2048);
         let now = OffsetDateTime::now_utc();
 
@@ -548,7 +551,7 @@ mod tests {
             default_request(SelectionRole::Orchestrator),
             now,
         )
-        .expect("select");
+        .map_err(ctx("select"))?;
 
         assert_eq!(result.scanned_signals, 0, "scanned_signals muss 0 sein");
         assert!(
@@ -556,6 +559,7 @@ mod tests {
             "selected_signals muss leer sein"
         );
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // ── Test 3: Orchestrator-Cap bei 20 ──────────────────────────────────────
@@ -565,8 +569,8 @@ mod tests {
     ///
     /// Spezifikation: Schritt 4, Orchestrator → cap 20.
     #[test]
-    fn role_orchestrator_caps_at_20() {
-        let (store, root) = open_store("orch-cap");
+    fn role_orchestrator_caps_at_20() -> TestResult {
+        let (store, root) = open_store("orch-cap")?;
         let stm = ShortTermMemory::new("s-orch", 32, 2048);
         let now = OffsetDateTime::now_utc();
 
@@ -582,7 +586,7 @@ mod tests {
             default_request(SelectionRole::Orchestrator),
             now,
         )
-        .expect("select");
+        .map_err(ctx("select"))?;
 
         assert!(
             result.selected_signals.len() <= 20,
@@ -591,6 +595,7 @@ mod tests {
         );
         assert_eq!(result.scanned_signals, 30, "scanned_signals muss 30 sein");
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // ── Test 4: Scout-Cap bei 4 ───────────────────────────────────────────────
@@ -600,8 +605,8 @@ mod tests {
     ///
     /// Spezifikation: Schritt 4, Scout → cap 4.
     #[test]
-    fn role_scout_caps_at_4() {
-        let (store, root) = open_store("scout-cap");
+    fn role_scout_caps_at_4() -> TestResult {
+        let (store, root) = open_store("scout-cap")?;
         let stm = ShortTermMemory::new("s-scout", 32, 2048);
         let now = OffsetDateTime::now_utc();
 
@@ -616,7 +621,7 @@ mod tests {
             default_request(SelectionRole::Scout),
             now,
         )
-        .expect("select");
+        .map_err(ctx("select"))?;
 
         assert!(
             result.selected_signals.len() <= 4,
@@ -624,6 +629,7 @@ mod tests {
             result.selected_signals.len()
         );
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // ── Test 5: min_promotion_score filtert niedrige Scores aus ───────────────
@@ -633,8 +639,8 @@ mod tests {
     ///
     /// Spezifikation: Schritt 2.
     #[test]
-    fn min_promotion_score_filters() {
-        let (store, root) = open_store("min-score");
+    fn min_promotion_score_filters() -> TestResult {
+        let (store, root) = open_store("min-score")?;
         let stm = ShortTermMemory::new("s-score", 32, 2048);
         let now = OffsetDateTime::now_utc();
 
@@ -647,7 +653,7 @@ mod tests {
         let mut req = default_request(SelectionRole::Orchestrator);
         req.min_promotion_score = Some(50); // schließt "low" aus.
 
-        let result = select_for_turn(&store, &stm, &signals, req, now).expect("select");
+        let result = select_for_turn(&store, &stm, &signals, req, now).map_err(ctx("select"))?;
 
         assert_eq!(result.scanned_signals, 2);
         assert_eq!(
@@ -660,6 +666,7 @@ mod tests {
             "Selektiertes Signal muss 'high' sein"
         );
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // ── Test 6: Refuted Signals werden ausgeschlossen ─────────────────────────
@@ -669,8 +676,8 @@ mod tests {
     ///
     /// Spezifikation: Schritt 3b.
     #[test]
-    fn refuted_signals_excluded() {
-        let (store, root) = open_store("refuted");
+    fn refuted_signals_excluded() -> TestResult {
+        let (store, root) = open_store("refuted")?;
         let stm = ShortTermMemory::new("s-refuted", 32, 2048);
         let now = OffsetDateTime::now_utc();
 
@@ -687,7 +694,7 @@ mod tests {
             default_request(SelectionRole::Orchestrator),
             now,
         )
-        .expect("select");
+        .map_err(ctx("select"))?;
 
         assert_eq!(result.scanned_signals, 2);
         assert!(
@@ -698,6 +705,7 @@ mod tests {
             "Refuted-Signal darf nicht selektiert werden"
         );
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // ── Test 7: Expired Signals werden ausgeschlossen ─────────────────────────
@@ -707,8 +715,8 @@ mod tests {
     ///
     /// Spezifikation: Schritt 3a.
     #[test]
-    fn expired_signals_excluded() {
-        let (store, root) = open_store("expired");
+    fn expired_signals_excluded() -> TestResult {
+        let (store, root) = open_store("expired")?;
         let stm = ShortTermMemory::new("s-expired", 32, 2048);
         let now = OffsetDateTime::now_utc();
 
@@ -733,7 +741,7 @@ mod tests {
             default_request(SelectionRole::Orchestrator),
             now,
         )
-        .expect("select");
+        .map_err(ctx("select"))?;
 
         assert_eq!(result.scanned_signals, 3);
         assert!(
@@ -754,6 +762,7 @@ mod tests {
             "Nur 'valid' darf selektiert werden"
         );
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // ── Test 8: Signals absteigend nach Score sortiert ────────────────────────
@@ -763,8 +772,8 @@ mod tests {
     ///
     /// Spezifikation: Schritt 5.
     #[test]
-    fn selected_signals_sorted_by_score_desc() {
-        let (store, root) = open_store("sorted");
+    fn selected_signals_sorted_by_score_desc() -> TestResult {
+        let (store, root) = open_store("sorted")?;
         let stm = ShortTermMemory::new("s-sorted", 32, 2048);
         let now = OffsetDateTime::now_utc();
 
@@ -783,7 +792,7 @@ mod tests {
             default_request(SelectionRole::Orchestrator),
             now,
         )
-        .expect("select");
+        .map_err(ctx("select"))?;
 
         assert_eq!(result.selected_signals.len(), 3);
 
@@ -805,6 +814,7 @@ mod tests {
             "Erstes Signal muss 'high' sein"
         );
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // ── Test 9: Convenience-Funktion delegiert korrekt ────────────────────────
@@ -814,8 +824,8 @@ mod tests {
     ///
     /// Spezifikation: `select_for_turn_no_signals`.
     #[test]
-    fn select_for_turn_no_signals_delegates() {
-        let (store, root) = open_store("no-signals");
+    fn select_for_turn_no_signals_delegates() -> TestResult {
+        let (store, root) = open_store("no-signals")?;
         let stm = ShortTermMemory::new("s-nosig", 32, 2048);
         stm.push(StmRole::User, 80, "Testnachricht");
         let now = OffsetDateTime::now_utc();
@@ -837,9 +847,10 @@ mod tests {
             min_promotion_score: None,
         };
 
-        let res_direct = select_for_turn(&store, &stm, &[], req_a, now).expect("select direct");
-        let res_convenience =
-            select_for_turn_no_signals(&store, &stm, req_b, now).expect("select no-signals");
+        let res_direct =
+            select_for_turn(&store, &stm, &[], req_a, now).map_err(ctx("select direct"))?;
+        let res_convenience = select_for_turn_no_signals(&store, &stm, req_b, now)
+            .map_err(ctx("select no-signals"))?;
 
         assert_eq!(res_direct.scanned_signals, res_convenience.scanned_signals);
         assert_eq!(
@@ -852,6 +863,7 @@ mod tests {
             res_convenience.base.token_estimate
         );
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // ── Test 10: STM-Salience-Schwelle wird vor dem Rendering angewandt ──────
@@ -859,8 +871,8 @@ mod tests {
     /// Prüft, dass STM-Einträge unterhalb der Schwelle weder den gerenderten
     /// Kontext noch dessen Budgetauswahl beeinflussen.
     #[test]
-    fn min_stm_salience_filters_before_rendering() {
-        let (store, root) = open_store("min-stm-salience");
+    fn min_stm_salience_filters_before_rendering() -> TestResult {
+        let (store, root) = open_store("min-stm-salience")?;
         let stm = ShortTermMemory::new("s-min-stm-salience", 32, 2048);
         stm.push(StmRole::User, 80, "high-salience-older");
         stm.push(StmRole::Tool, 10, "low-salience");
@@ -869,8 +881,8 @@ mod tests {
         let mut request = default_request(SelectionRole::Verifier);
         request.min_stm_salience = 50;
 
-        let result =
-            select_for_turn(&store, &stm, &[], request, OffsetDateTime::now_utc()).expect("select");
+        let result = select_for_turn(&store, &stm, &[], request, OffsetDateTime::now_utc())
+            .map_err(ctx("select"))?;
 
         assert_eq!(
             result.base.stm,
@@ -879,5 +891,6 @@ mod tests {
         assert!(!result.base.stm.contains("low-salience"));
         assert_eq!(result.base.token_estimate, result.base.stm.len() / 4);
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 }

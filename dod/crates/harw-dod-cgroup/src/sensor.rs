@@ -674,6 +674,7 @@ mod tests {
         CgroupSensor, MAX_CARDINALITY, MAX_CGROUPS, cap_and_sort_cgroups, is_child_cgroup_dir,
         sanitize_label,
     };
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Das `fixtures/`-Wurzelverzeichnis dieser Crate.
     fn fixtures_root() -> PathBuf {
@@ -683,11 +684,8 @@ mod tests {
     /// Baut einen `CgroupSensor`, dessen `ReadScope` genau `root` umfasst.
     fn build_sensor(root: PathBuf) -> CgroupSensor {
         let scope = ReadScope::from_roots([root]);
-        let handle = SensorHandle::new(
-            SensorId::from_str("cgroup-test"),
-            Capability::ReadCgroupV2,
-        )
-        .bind(scope);
+        let handle = SensorHandle::new(SensorId::from_str("cgroup-test"), Capability::ReadCgroupV2)
+            .bind(scope);
         CgroupSensor::from(handle)
     }
 
@@ -742,26 +740,27 @@ mod tests {
     }
 
     #[test]
-    fn test_unlimited_memory_max_is_reported_not_malformed() {
+    fn test_unlimited_memory_max_is_reported_not_malformed() -> TestResult {
         let sensor = build_sensor(fixtures_root().join("unlimited-memory/tree"));
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("memory.max = \"max\" darf keinen Fehler auslösen");
+            .map_err(ctx("memory.max = \"max\" darf keinen Fehler auslösen"))?;
 
         let unlimited = reading
             .samples
             .iter()
             .find(|s| s.metric.starts_with("memory_max_bytes_"))
-            .expect("memory_max_bytes-Sample muss vorhanden sein");
+            .ok_or(TestError::Missing("memory_max_bytes-Sample"))?;
         assert!(
             (unlimited.value - u64::MAX as f64).abs() < 1.0,
             "memory.max = \"max\" muss als u64::MAX gemeldet werden, war {}",
             unlimited.value
         );
+        Ok(())
     }
 
     #[test]
-    fn test_result_never_contains_process_information() {
+    fn test_result_never_contains_process_information() -> TestResult {
         // Belegt die Nebenläufigkeits-/Redaktions-Auflage: kein
         // Prozessname, keine Kommandozeile, keine PID-Liste im
         // serialisierten Ergebnis — dieser Sensor liest `cgroup.procs`
@@ -769,24 +768,25 @@ mod tests {
         let sensor = build_sensor(fixtures_root().join("typical/tree"));
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("typical Fixture muss erfolgreich pollen");
-        let json = serde_json::to_string(&reading.samples).expect("Samples serialisieren");
+            .map_err(ctx("typical Fixture muss erfolgreich pollen"))?;
+        let json = serde_json::to_string(&reading.samples).map_err(ctx("Samples serialisieren"))?;
 
         assert!(!json.contains("cgroup.procs"));
         assert!(!json.contains("\"pid\""));
         assert!(!json.contains("\"cmdline\""));
         assert!(!json.contains("\"comm\""));
+        Ok(())
     }
 
     #[test]
-    fn test_missing_controller_file_skips_only_that_metric() {
+    fn test_missing_controller_file_skips_only_that_metric() -> TestResult {
         // Eine cgroup, für die nur der `memory`-Controller aktiviert ist
         // (nur `memory.current` vorhanden), darf trotzdem gemeldet werden —
         // ohne die drei fehlenden Metriken zu erfinden.
         let sensor = build_sensor(fixtures_root().join("many-cgroups/tree"));
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("many-cgroups Fixture muss erfolgreich pollen");
+            .map_err(ctx("many-cgroups Fixture muss erfolgreich pollen"))?;
 
         assert!(
             reading
@@ -796,19 +796,20 @@ mod tests {
             "many-cgroups-Fixture trägt nur memory.current je cgroup"
         );
         assert_eq!(reading.samples.len(), MAX_CGROUPS);
+        Ok(())
     }
 
     #[test]
-    fn test_is_child_cgroup_dir_true_for_directory_false_for_control_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(dir.path().join("system.slice")).expect("system.slice");
+    fn test_is_child_cgroup_dir_true_for_directory_false_for_control_file() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        std::fs::create_dir_all(dir.path().join("system.slice")).map_err(ctx("system.slice"))?;
         std::fs::write(
             dir.path().join("system.slice/cgroup.controllers"),
             "cpu memory pids\n",
         )
-        .expect("cgroup.controllers schreiben");
+        .map_err(ctx("cgroup.controllers schreiben"))?;
         std::fs::write(dir.path().join("cpu.stat"), "usage_usec 1\n")
-            .expect("cpu.stat der Wurzel schreiben");
+            .map_err(ctx("cpu.stat der Wurzel schreiben"))?;
 
         let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
         assert!(is_child_cgroup_dir(
@@ -816,10 +817,11 @@ mod tests {
             &dir.path().join("system.slice")
         ));
         assert!(!is_child_cgroup_dir(&scope, &dir.path().join("cpu.stat")));
+        Ok(())
     }
 
     #[test]
-    fn test_poll_finds_real_slices_despite_root_control_files_regression_f095() {
+    fn test_poll_finds_real_slices_despite_root_control_files_regression_f095() -> TestResult {
         // Regressionstest für F-095: `fixtures/root-control-files-crowd-out-
         // children/tree` enthält 17 echte cgroup-v2-Kontrolldateien der
         // Bereichswurzel (alle alphabetisch vor "s"/"u") neben genau zwei
@@ -828,14 +830,18 @@ mod tests {
         // unbereinigten Kandidaten die ersten `MAX_CGROUPS` (16) alphabetisch
         // gewählt — ausschließlich Kontrolldateien der Wurzel, `system.slice`/
         // `user.slice` wären nie erreicht worden.
-        let sensor = build_sensor(
-            fixtures_root().join("root-control-files-crowd-out-children/tree"),
-        );
-        let reading = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect("echte Kind-cgroups müssen trotz vieler Wurzel-Kontrolldateien gefunden werden");
+        let sensor =
+            build_sensor(fixtures_root().join("root-control-files-crowd-out-children/tree"));
+        let reading = sensor.poll(Timestamp::UNIX_EPOCH).map_err(ctx(
+            "echte Kind-cgroups müssen trotz vieler Wurzel-Kontrolldateien gefunden werden",
+        ))?;
 
-        assert_eq!(reading.samples.len(), 2, "genau je eine memory_current_bytes-Probe pro echter cgroup: {:?}", reading.samples);
+        assert_eq!(
+            reading.samples.len(),
+            2,
+            "genau je eine memory_current_bytes-Probe pro echter cgroup: {:?}",
+            reading.samples
+        );
         assert!(
             reading
                 .samples
@@ -852,6 +858,7 @@ mod tests {
             "user.slice darf nicht von Wurzel-Kontrolldateien verdrängt werden: {:?}",
             reading.samples
         );
+        Ok(())
     }
 
     harw_dod_fixtures::sensor_suite! {

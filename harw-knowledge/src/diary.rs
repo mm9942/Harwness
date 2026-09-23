@@ -24,7 +24,7 @@ use jiff::{SignedDuration, Timestamp};
 
 use crate::artifact::{ArtifactId, ArtifactKind, Frontmatter, KnowledgeArtifact};
 use crate::error::KnowledgeResult;
-use crate::store::{parse_frontmatter, KnowledgeStore};
+use crate::store::{KnowledgeStore, parse_frontmatter};
 use crate::visibility::{AgentId, VisibilityScope};
 
 /// Why a diary entry was appended rather than edited in place.
@@ -237,7 +237,11 @@ pub fn read_day(
         return Ok(None);
     }
     let id = diary_artifact_id(agent_id, date);
-    Ok(Some(store.read_artifact(&path, id, ArtifactKind::DiaryEntry)?))
+    Ok(Some(store.read_artifact(
+        &path,
+        id,
+        ArtifactKind::DiaryEntry,
+    )?))
 }
 
 /// Ergebnis eines `gc`-Laufs: welche Tagesdateien in welche Monats-Rollups
@@ -353,7 +357,15 @@ pub fn gc(
     for (date, path) in eligible {
         let year_month = date[..MONTH_PREFIX_LEN].to_owned();
         let rollup_path = store.diary_rollup_path(agent_id, &year_month);
-        roll_day_into_month(store, agent_id, &date, &year_month, &path, &rollup_path, now)?;
+        roll_day_into_month(
+            store,
+            agent_id,
+            &date,
+            &year_month,
+            &path,
+            &rollup_path,
+            now,
+        )?;
         std::fs::remove_file(&path)?;
 
         report.rolled_up_days.push(date);
@@ -430,15 +442,17 @@ fn roll_day_into_month(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
-    fn temporary_root(label: &str) -> PathBuf {
+    fn temporary_root(label: &str) -> TestResult<PathBuf> {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock is after epoch")
+            .map_err(crate::test_support::ctx("system clock is after epoch"))?
             .as_nanos();
         let root = std::env::temp_dir().join(format!("{label}-{}-{nonce}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("create temporary knowledge root");
-        root
+        std::fs::create_dir_all(&root)
+            .map_err(crate::test_support::ctx("create temporary knowledge root"))?;
+        Ok(root)
     }
 
     fn entry(agent: &AgentId, at: Timestamp, trigger: DiaryTrigger, body: &str) -> DiaryEntry {
@@ -452,138 +466,187 @@ mod tests {
     }
 
     #[test]
-    fn test_append_creates_a_day_file_with_frontmatter_and_header() {
-        let root = temporary_root("harw-knowledge-diary-append-new");
+    fn test_append_creates_a_day_file_with_frontmatter_and_header() -> TestResult {
+        let root = temporary_root("harw-knowledge-diary-append-new")?;
         let store = KnowledgeStore::new(&root);
         let agent = AgentId::new("agent-1");
-        let at = Timestamp::from_second(1_700_000_000).expect("valid timestamp");
+        let at = Timestamp::from_second(1_700_000_000)
+            .map_err(crate::test_support::ctx("valid timestamp"))?;
 
-        let artifact = append(&store, &entry(&agent, at, DiaryTrigger::EndOfSession, "Erster Eintrag."))
-            .expect("append creates a fresh day file");
+        let artifact = append(
+            &store,
+            &entry(&agent, at, DiaryTrigger::EndOfSession, "Erster Eintrag."),
+        )
+        .map_err(crate::test_support::ctx("append creates a fresh day file"))?;
 
         assert!(artifact.body.contains("### "));
         assert!(artifact.body.contains("end-of-session"));
         assert!(artifact.body.contains("Erster Eintrag."));
         assert_eq!(
-            artifact.frontmatter.extra.get("entry_count").and_then(|v| v.as_u64()),
+            artifact
+                .frontmatter
+                .extra
+                .get("entry_count")
+                .and_then(|v| v.as_u64()),
             Some(1)
         );
         assert!(store.diary_path(&agent, &day_key(at)).is_file());
 
-        std::fs::remove_dir_all(root).expect("remove temporary root");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_append_is_additive_within_the_same_day_and_bumps_entry_count() {
-        let root = temporary_root("harw-knowledge-diary-append-additive");
+    fn test_append_is_additive_within_the_same_day_and_bumps_entry_count() -> TestResult {
+        let root = temporary_root("harw-knowledge-diary-append-additive")?;
         let store = KnowledgeStore::new(&root);
         let agent = AgentId::new("agent-1");
-        let morning = Timestamp::from_second(1_700_000_000).expect("valid timestamp");
+        let morning = Timestamp::from_second(1_700_000_000)
+            .map_err(crate::test_support::ctx("valid timestamp"))?;
         let evening = morning
             .checked_add(SignedDuration::from_secs(3600))
-            .expect("same-day offset");
+            .map_err(crate::test_support::ctx("same-day offset"))?;
 
-        append(&store, &entry(&agent, morning, DiaryTrigger::Manual, "Erstens.")).expect("first append");
+        append(
+            &store,
+            &entry(&agent, morning, DiaryTrigger::Manual, "Erstens."),
+        )
+        .map_err(crate::test_support::ctx("first append"))?;
         let artifact = append(
             &store,
             &entry(&agent, evening, DiaryTrigger::Compaction, "Zweitens."),
         )
-        .expect("second append");
+        .map_err(crate::test_support::ctx("second append"))?;
 
         assert!(artifact.body.contains("Erstens."));
         assert!(artifact.body.contains("Zweitens."));
         assert_eq!(
-            artifact.frontmatter.extra.get("entry_count").and_then(|v| v.as_u64()),
+            artifact
+                .frontmatter
+                .extra
+                .get("entry_count")
+                .and_then(|v| v.as_u64()),
             Some(2)
         );
 
-        std::fs::remove_dir_all(root).expect("remove temporary root");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_read_day_returns_none_for_a_day_that_never_happened() {
-        let root = temporary_root("harw-knowledge-diary-read-missing");
+    fn test_read_day_returns_none_for_a_day_that_never_happened() -> TestResult {
+        let root = temporary_root("harw-knowledge-diary-read-missing")?;
         let store = KnowledgeStore::new(&root);
         let agent = AgentId::new("agent-1");
 
-        let result = read_day(&store, &agent, "2020-01-01").expect("missing day is not an error");
+        let result = read_day(&store, &agent, "2020-01-01")
+            .map_err(crate::test_support::ctx("missing day is not an error"))?;
 
         assert!(result.is_none());
-        std::fs::remove_dir_all(root).expect("remove temporary root");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_read_day_returns_the_written_artifact() {
-        let root = temporary_root("harw-knowledge-diary-read-hit");
+    fn test_read_day_returns_the_written_artifact() -> TestResult {
+        let root = temporary_root("harw-knowledge-diary-read-hit")?;
         let store = KnowledgeStore::new(&root);
         let agent = AgentId::new("agent-1");
-        let at = Timestamp::from_second(1_700_000_000).expect("valid timestamp");
-        append(&store, &entry(&agent, at, DiaryTrigger::DreamReflection, "Muster erkannt.")).expect("append");
+        let at = Timestamp::from_second(1_700_000_000)
+            .map_err(crate::test_support::ctx("valid timestamp"))?;
+        append(
+            &store,
+            &entry(&agent, at, DiaryTrigger::DreamReflection, "Muster erkannt."),
+        )
+        .map_err(crate::test_support::ctx("append"))?;
 
         let day = read_day(&store, &agent, &day_key(at))
-            .expect("read succeeds")
-            .expect("day exists");
+            .map_err(crate::test_support::ctx("read succeeds"))?
+            .ok_or(TestError::Missing("day exists"))?;
 
         assert!(day.body.contains("dream-reflection"));
         assert!(day.body.contains("Muster erkannt."));
-        std::fs::remove_dir_all(root).expect("remove temporary root");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_gc_rolls_up_old_days_and_removes_the_source_file() {
-        let root = temporary_root("harw-knowledge-diary-gc-rollup");
+    fn test_gc_rolls_up_old_days_and_removes_the_source_file() -> TestResult {
+        let root = temporary_root("harw-knowledge-diary-gc-rollup")?;
         let store = KnowledgeStore::new(&root);
         let agent = AgentId::new("agent-1");
-        let now = Timestamp::from_second(1_700_000_000).expect("valid now");
+        let now =
+            Timestamp::from_second(1_700_000_000).map_err(crate::test_support::ctx("valid now"))?;
         let old = now
             .checked_sub(SignedDuration::from_secs(200 * 86_400))
-            .expect("far past timestamp");
-        append(&store, &entry(&agent, old, DiaryTrigger::EndOfSession, "Alter Eintrag.")).expect("append old day");
+            .map_err(crate::test_support::ctx("far past timestamp"))?;
+        append(
+            &store,
+            &entry(&agent, old, DiaryTrigger::EndOfSession, "Alter Eintrag."),
+        )
+        .map_err(crate::test_support::ctx("append old day"))?;
         let old_path = store.diary_path(&agent, &day_key(old));
         assert!(old_path.is_file());
 
-        let report = gc(&store, &agent, now, DEFAULT_DIARY_RETENTION_DAYS).expect("gc succeeds");
+        let report = gc(&store, &agent, now, DEFAULT_DIARY_RETENTION_DAYS)
+            .map_err(crate::test_support::ctx("gc succeeds"))?;
 
         assert_eq!(report.rolled_up_days, vec![day_key(old)]);
         assert_eq!(report.touched_months.len(), 1);
-        assert!(!old_path.is_file(), "the rolled-up day file must be removed");
+        assert!(
+            !old_path.is_file(),
+            "the rolled-up day file must be removed"
+        );
 
         let year_month = day_key(old)[..7].to_owned();
         let rollup_path = store.diary_rollup_path(&agent, &year_month);
-        let rollup_content = std::fs::read_to_string(&rollup_path).expect("rollup file exists");
+        let rollup_content = std::fs::read_to_string(&rollup_path)
+            .map_err(crate::test_support::ctx("rollup file exists"))?;
         assert!(rollup_content.contains("Alter Eintrag."));
         assert!(rollup_content.contains(&format!("## {}", day_key(old))));
 
-        std::fs::remove_dir_all(root).expect("remove temporary root");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_gc_accumulates_multiple_days_into_the_same_monthly_rollup() {
-        let root = temporary_root("harw-knowledge-diary-gc-accumulate");
+    fn test_gc_accumulates_multiple_days_into_the_same_monthly_rollup() -> TestResult {
+        let root = temporary_root("harw-knowledge-diary-gc-accumulate")?;
         let store = KnowledgeStore::new(&root);
         let agent = AgentId::new("agent-1");
-        let now = Timestamp::from_second(1_700_000_000).expect("valid now");
+        let now =
+            Timestamp::from_second(1_700_000_000).map_err(crate::test_support::ctx("valid now"))?;
         let day_a = now
             .checked_sub(SignedDuration::from_secs(200 * 86_400))
-            .expect("far past timestamp a");
+            .map_err(crate::test_support::ctx("far past timestamp a"))?;
         let day_b = day_a
             .checked_add(SignedDuration::from_secs(86_400))
-            .expect("far past timestamp b, same month");
-        append(&store, &entry(&agent, day_a, DiaryTrigger::Manual, "Tag A.")).expect("append day a");
-        append(&store, &entry(&agent, day_b, DiaryTrigger::Manual, "Tag B.")).expect("append day b");
+            .map_err(crate::test_support::ctx("far past timestamp b, same month"))?;
+        append(
+            &store,
+            &entry(&agent, day_a, DiaryTrigger::Manual, "Tag A."),
+        )
+        .map_err(crate::test_support::ctx("append day a"))?;
+        append(
+            &store,
+            &entry(&agent, day_b, DiaryTrigger::Manual, "Tag B."),
+        )
+        .map_err(crate::test_support::ctx("append day b"))?;
 
-        let report = gc(&store, &agent, now, DEFAULT_DIARY_RETENTION_DAYS).expect("gc succeeds");
+        let report = gc(&store, &agent, now, DEFAULT_DIARY_RETENTION_DAYS)
+            .map_err(crate::test_support::ctx("gc succeeds"))?;
 
         assert_eq!(report.rolled_up_days.len(), 2);
         assert_eq!(report.touched_months.len(), 1);
         let year_month = &report.touched_months[0];
-        let rollup_content =
-            std::fs::read_to_string(store.diary_rollup_path(&agent, year_month)).expect("rollup exists");
+        let rollup_content = std::fs::read_to_string(store.diary_rollup_path(&agent, year_month))
+            .map_err(crate::test_support::ctx("rollup exists"))?;
         assert!(rollup_content.contains("Tag A."));
         assert!(rollup_content.contains("Tag B."));
         assert_eq!(
             {
-                let (frontmatter, _) = parse_frontmatter(&rollup_content).expect("parses");
+                let (frontmatter, _) = parse_frontmatter(&rollup_content)
+                    .map_err(crate::test_support::ctx("parses"))?;
                 frontmatter
                     .extra
                     .get("entry_count")
@@ -593,36 +656,49 @@ mod tests {
             2
         );
 
-        std::fs::remove_dir_all(root).expect("remove temporary root");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_gc_leaves_recent_days_untouched() {
-        let root = temporary_root("harw-knowledge-diary-gc-recent");
+    fn test_gc_leaves_recent_days_untouched() -> TestResult {
+        let root = temporary_root("harw-knowledge-diary-gc-recent")?;
         let store = KnowledgeStore::new(&root);
         let agent = AgentId::new("agent-1");
-        let now = Timestamp::from_second(1_700_000_000).expect("valid now");
-        append(&store, &entry(&agent, now, DiaryTrigger::Manual, "Heute.")).expect("append today");
+        let now =
+            Timestamp::from_second(1_700_000_000).map_err(crate::test_support::ctx("valid now"))?;
+        append(&store, &entry(&agent, now, DiaryTrigger::Manual, "Heute."))
+            .map_err(crate::test_support::ctx("append today"))?;
 
-        let report = gc(&store, &agent, now, DEFAULT_DIARY_RETENTION_DAYS).expect("gc succeeds");
+        let report = gc(&store, &agent, now, DEFAULT_DIARY_RETENTION_DAYS)
+            .map_err(crate::test_support::ctx("gc succeeds"))?;
 
         assert!(report.rolled_up_days.is_empty());
         assert!(store.diary_path(&agent, &day_key(now)).is_file());
 
-        std::fs::remove_dir_all(root).expect("remove temporary root");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_gc_on_a_missing_agent_directory_is_a_no_op() {
-        let root = temporary_root("harw-knowledge-diary-gc-missing");
+    fn test_gc_on_a_missing_agent_directory_is_a_no_op() -> TestResult {
+        let root = temporary_root("harw-knowledge-diary-gc-missing")?;
         let store = KnowledgeStore::new(&root);
         let agent = AgentId::new("never-wrote-anything");
 
-        let report = gc(&store, &agent, Timestamp::now(), DEFAULT_DIARY_RETENTION_DAYS)
-            .expect("gc on a missing directory succeeds as a no-op");
+        let report = gc(
+            &store,
+            &agent,
+            Timestamp::now(),
+            DEFAULT_DIARY_RETENTION_DAYS,
+        )
+        .map_err(crate::test_support::ctx(
+            "gc on a missing directory succeeds as a no-op",
+        ))?;
 
         assert!(report.rolled_up_days.is_empty());
         assert!(report.touched_months.is_empty());
-        std::fs::remove_dir_all(root).expect("remove temporary root");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
     }
 }

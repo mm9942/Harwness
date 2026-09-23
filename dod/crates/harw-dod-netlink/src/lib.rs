@@ -80,6 +80,8 @@ pub mod record;
 #[cfg(target_os = "linux")]
 pub mod socket;
 pub mod source;
+#[cfg(test)]
+mod test_support;
 
 pub use error::NetlinkError;
 pub use record::{AuditFields, RawRecord, parse_record};

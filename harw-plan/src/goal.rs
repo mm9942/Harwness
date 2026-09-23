@@ -371,7 +371,9 @@ const GOAL_STATUS_MATRIX: &[(GoalStatus, GoalStatus)] = &[
 
 /// Prüft, ob ein Goal-Statusübergang laut Matrix legal ist.
 fn is_legal_goal_transition(from: GoalStatus, to: GoalStatus) -> bool {
-    GOAL_STATUS_MATRIX.iter().any(|&(f, t)| f == from && t == to)
+    GOAL_STATUS_MATRIX
+        .iter()
+        .any(|&(f, t)| f == from && t == to)
 }
 
 /// Prüft einen `SetStatus`-Übergang: Matrix, Kriterien-Voraussetzung, Actor-Policy.
@@ -452,7 +454,11 @@ fn validate_status_transition(
 /// # Errors
 /// - [`PlanError::GoalNotFound`], [`PlanError::GoalTransitionReserved`],
 ///   [`PlanError::ActorNotAuthorized`], [`PlanError::InvalidId`] — siehe Regeln oben.
-pub fn validate_goal_action(goal: Option<&Goal>, action: &GoalAction, actor: &str) -> PlanResult<()> {
+pub fn validate_goal_action(
+    goal: Option<&Goal>,
+    action: &GoalAction,
+    actor: &str,
+) -> PlanResult<()> {
     match action {
         GoalAction::Set { goal: new_goal } => {
             if new_goal.statement.trim().is_empty() {
@@ -562,9 +568,9 @@ fn verification_satisfied_by(step: &VerificationStep, evidence: &[&EvidenceRef])
         VerificationStep::Command { cmd, .. } => evidence.iter().any(|e| {
             matches!(e.kind, EvidenceKind::CargoTest | EvidenceKind::Clippy) && &e.locator == cmd
         }),
-        VerificationStep::Artifact { path } => evidence
-            .iter()
-            .any(|e| matches!(e.kind, EvidenceKind::Diff | EvidenceKind::Job) && &e.locator == path),
+        VerificationStep::Artifact { path } => evidence.iter().any(|e| {
+            matches!(e.kind, EvidenceKind::Diff | EvidenceKind::Job) && &e.locator == path
+        }),
         VerificationStep::TraceEvent { name } => evidence
             .iter()
             .any(|e| e.kind == EvidenceKind::TraceSpan && &e.locator == name),
@@ -668,6 +674,7 @@ pub fn evaluate_goal(goal: &Goal, plan: &Plan) -> GoalReport {
 mod tests {
     use super::*;
     use crate::ids::PathOrSymbol;
+    use crate::test_support::{TestError, TestResult};
     use crate::types::{PlanNode, PlanNodeKind};
 
     /// Baut ein minimales Goal mit genau einem Akzeptanzkriterium (ohne
@@ -732,14 +739,15 @@ mod tests {
     }
 
     #[test]
-    fn test_goal_id_display_and_from_str_roundtrip() {
-        let id: GoalId = "goal-1".parse().unwrap();
+    fn test_goal_id_display_and_from_str_roundtrip() -> TestResult {
+        let id: GoalId = "goal-1".parse()?;
         assert_eq!(id.as_str(), "goal-1");
         assert_eq!(id.to_string(), "goal-1");
+        Ok(())
     }
 
     #[test]
-    fn test_goal_status_snake_case_serialization() {
+    fn test_goal_status_snake_case_serialization() -> TestResult {
         let cases = [
             (GoalStatus::Draft, "\"draft\""),
             (GoalStatus::Active, "\"active\""),
@@ -749,15 +757,21 @@ mod tests {
             (GoalStatus::Superseded, "\"superseded\""),
         ];
         for (status, expected) in cases {
-            let json = serde_json::to_string(&status).unwrap();
-            assert_eq!(json, expected, "Status {:?} serialisiert nicht korrekt", status);
+            let json = serde_json::to_string(&status)?;
+            assert_eq!(
+                json, expected,
+                "Status {:?} serialisiert nicht korrekt",
+                status
+            );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_goal_action_op_tag_serialization() {
-        let json = serde_json::to_string(&GoalAction::Inspect).unwrap();
+    fn test_goal_action_op_tag_serialization() -> TestResult {
+        let json = serde_json::to_string(&GoalAction::Inspect)?;
         assert!(json.contains("\"op\":\"inspect\""), "op-Tag fehlt: {json}");
+        Ok(())
     }
 
     #[test]
@@ -769,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_goal_action_set_rejects_empty_statement() {
+    fn test_validate_goal_action_set_rejects_empty_statement() -> TestResult {
         let mut goal = make_goal(GoalStatus::Draft);
         goal.statement = "   ".to_owned();
         let action = GoalAction::Set { goal };
@@ -779,8 +793,13 @@ mod tests {
                 assert_eq!(field, "statement");
                 assert_eq!(value, "   ");
             }
-            other => panic!("Erwartet InvalidId{{field: \"statement\", ..}}, bekam {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Erwartet InvalidId{{field: \"statement\", ..}}, bekam {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
@@ -817,7 +836,10 @@ mod tests {
                 let expected_legal = legal_pairs.contains(&(from, to));
 
                 if expected_legal {
-                    assert!(result.is_ok(), "{from:?} -> {to:?} sollte legal sein, war {result:?}");
+                    assert!(
+                        result.is_ok(),
+                        "{from:?} -> {to:?} sollte legal sein, war {result:?}"
+                    );
                 } else {
                     assert!(
                         matches!(result, Err(PlanError::GoalTransitionReserved { .. })),

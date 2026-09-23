@@ -24,7 +24,10 @@ pub struct ModelPickerOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Stage { Providers, Models }
+enum Stage {
+    Providers,
+    Models,
+}
 
 struct PickerApp {
     providers: Vec<ModelPickerProvider>,
@@ -35,28 +38,56 @@ struct PickerApp {
 
 impl PickerApp {
     fn new(mut providers: Vec<ModelPickerProvider>) -> Self {
-        for provider in &mut providers { provider.models.sort(); provider.models.dedup(); }
-        Self { providers, provider_index: 0, model_index: 0, stage: Stage::Providers }
+        for provider in &mut providers {
+            provider.models.sort();
+            provider.models.dedup();
+        }
+        Self {
+            providers,
+            provider_index: 0,
+            model_index: 0,
+            stage: Stage::Providers,
+        }
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Option<ModelPickerOutcome> {
         match self.stage {
             Stage::Providers => match key.code {
                 KeyCode::Up => self.provider_index = self.provider_index.saturating_sub(1),
-                KeyCode::Down => if self.provider_index + 1 < self.providers.len() { self.provider_index += 1; },
-                KeyCode::Enter | KeyCode::Right if !self.providers.is_empty() => { self.stage = Stage::Models; self.model_index = 0; },
+                KeyCode::Down => {
+                    if self.provider_index + 1 < self.providers.len() {
+                        self.provider_index += 1;
+                    }
+                }
+                KeyCode::Enter | KeyCode::Right if !self.providers.is_empty() => {
+                    self.stage = Stage::Models;
+                    self.model_index = 0;
+                }
                 _ => {}
             },
             Stage::Models => {
                 let provider = self.providers.get_mut(self.provider_index)?;
                 match key.code {
                     KeyCode::Up => self.model_index = self.model_index.saturating_sub(1),
-                    KeyCode::Down => if self.model_index + 1 < provider.models.len() { self.model_index += 1; },
-                    KeyCode::Char(' ') => if let Some(model) = provider.models.get(self.model_index) {
-                        if !provider.selected.remove(model) { provider.selected.insert(model.clone()); }
-                    },
+                    KeyCode::Down => {
+                        if self.model_index + 1 < provider.models.len() {
+                            self.model_index += 1;
+                        }
+                    }
+                    KeyCode::Char(' ') => {
+                        if let Some(model) = provider.models.get(self.model_index) {
+                            if !provider.selected.remove(model) {
+                                provider.selected.insert(model.clone());
+                            }
+                        }
+                    }
                     KeyCode::Left => self.stage = Stage::Providers,
-                    KeyCode::Enter => return Some(ModelPickerOutcome { provider: provider.id.clone(), models: provider.selected.iter().cloned().collect() }),
+                    KeyCode::Enter => {
+                        return Some(ModelPickerOutcome {
+                            provider: provider.id.clone(),
+                            models: provider.selected.iter().cloned().collect(),
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -65,16 +96,26 @@ impl PickerApp {
     }
 }
 
-pub fn run_model_picker(providers: Vec<ModelPickerProvider>) -> Result<Option<ModelPickerOutcome>, TuiError> {
+pub fn run_model_picker(
+    providers: Vec<ModelPickerProvider>,
+) -> Result<Option<ModelPickerOutcome>, TuiError> {
     let mut app = PickerApp::new(providers);
     let mut terminal = TerminalGuard::enter()?;
     let result = loop {
         draw(&mut terminal, &app)?;
-        if !event::poll(Duration::from_millis(100))? { continue; }
+        if !event::poll(Duration::from_millis(100))? {
+            continue;
+        }
         if let Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Release { continue; }
-            if key.code == KeyCode::Esc { break Ok(None); }
-            if let Some(outcome) = app.on_key(key) { break Ok(Some(outcome)); }
+            if key.kind == KeyEventKind::Release {
+                continue;
+            }
+            if key.code == KeyCode::Esc {
+                break Ok(None);
+            }
+            if let Some(outcome) = app.on_key(key) {
+                break Ok(Some(outcome));
+            }
         }
     };
     drop(terminal);
@@ -109,14 +150,24 @@ fn draw(terminal: &mut TerminalGuard, app: &PickerApp) -> Result<(), TuiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
     use crossterm::event::KeyModifiers;
-    fn key(code: KeyCode) -> KeyEvent { KeyEvent::new(code, KeyModifiers::NONE) }
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
     #[test]
-    fn space_toggles_and_enter_confirms() {
-        let mut app = PickerApp::new(vec![ModelPickerProvider { id: "p".into(), models: vec!["a".into()], selected: BTreeSet::new() }]);
+    fn space_toggles_and_enter_confirms() -> TestResult {
+        let mut app = PickerApp::new(vec![ModelPickerProvider {
+            id: "p".into(),
+            models: vec!["a".into()],
+            selected: BTreeSet::new(),
+        }]);
         app.on_key(key(KeyCode::Enter));
         app.on_key(key(KeyCode::Char(' ')));
-        let outcome = app.on_key(key(KeyCode::Enter)).expect("confirmed");
+        let outcome = app
+            .on_key(key(KeyCode::Enter))
+            .ok_or(TestError::Missing("confirmed"))?;
         assert_eq!(outcome.models, ["a"]);
+        Ok(())
     }
 }

@@ -261,7 +261,9 @@ pub fn parse_unit(text: &str) -> ParsedUnit {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        sections[index].1.push((key.trim().to_owned(), value.trim().to_owned()));
+        sections[index]
+            .1
+            .push((key.trim().to_owned(), value.trim().to_owned()));
     }
 
     ParsedUnit { sections }
@@ -284,7 +286,8 @@ pub fn capability_set(value: &str) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{capability_set, parse_unit, UNIT_CLASSES};
+    use super::{UNIT_CLASSES, capability_set, parse_unit};
+    use crate::test_support::{TestError, TestResult};
 
     const SENTINEL: &str = include_str!("../../deploy/systemd/harw-sentinel.service");
     const PROBE_FS: &str = include_str!("../../deploy/systemd/harw-probe-fs.service");
@@ -293,20 +296,22 @@ mod tests {
     const WARDEN_SOCKET: &str = include_str!("../../deploy/systemd/harw-warden.socket");
 
     /// Ordnet jeder [`UNIT_CLASSES`]-Klasse ihren eingebetteten Unit-Text zu.
-    fn service_text(service_file: &str) -> &'static str {
+    fn service_text(service_file: &str) -> TestResult<&'static str> {
         match service_file {
-            "harw-sentinel.service" => SENTINEL,
-            "harw-probe-fs.service" => PROBE_FS,
-            "harw-probe-bpf.service" => PROBE_BPF,
-            "harw-warden.service" => WARDEN_SERVICE,
-            other => panic!("kein eingebetteter Unit-Text für {other}"),
+            "harw-sentinel.service" => Ok(SENTINEL),
+            "harw-probe-fs.service" => Ok(PROBE_FS),
+            "harw-probe-bpf.service" => Ok(PROBE_BPF),
+            "harw-warden.service" => Ok(WARDEN_SERVICE),
+            other => Err(TestError::Unexpected(format!(
+                "kein eingebetteter Unit-Text für {other}"
+            ))),
         }
     }
 
     #[test]
-    fn test_every_service_unit_is_syntactically_well_formed() {
+    fn test_every_service_unit_is_syntactically_well_formed() -> TestResult {
         for class in UNIT_CLASSES {
-            let parsed = parse_unit(service_text(class.service_file));
+            let parsed = parse_unit(service_text(class.service_file)?);
             assert!(
                 parsed.has_section("Unit"),
                 "{} fehlt [Unit]",
@@ -323,6 +328,7 @@ mod tests {
                 class.service_file
             );
         }
+        Ok(())
     }
 
     #[test]
@@ -333,11 +339,14 @@ mod tests {
     }
 
     #[test]
-    fn test_every_unit_grants_exactly_the_capabilities_of_its_class() {
+    fn test_every_unit_grants_exactly_the_capabilities_of_its_class() -> TestResult {
         for class in UNIT_CLASSES {
-            let parsed = parse_unit(service_text(class.service_file));
-            let expected: std::collections::BTreeSet<String> =
-                class.expected_capabilities.iter().map(|s| (*s).to_owned()).collect();
+            let parsed = parse_unit(service_text(class.service_file)?);
+            let expected: std::collections::BTreeSet<String> = class
+                .expected_capabilities
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect();
 
             let bounding = parsed
                 .last_value("Service", "CapabilityBoundingSet")
@@ -359,17 +368,18 @@ mod tests {
                 class.service_file
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_no_unit_grants_a_capability_outside_its_class() {
+    fn test_no_unit_grants_a_capability_outside_its_class() -> TestResult {
         // Eigenständig von der Gleichheitsprüfung oben: prüft explizit die
         // Teilmengenbeziehung, damit ein künftiger Tippfehler (eine
         // zusätzliche Fähigkeit neben der erwarteten) hier unabhängig
         // auffällt, selbst wenn jemand die Gleichheitsprüfung oben
         // versehentlich lockert.
         for class in UNIT_CLASSES {
-            let parsed = parse_unit(service_text(class.service_file));
+            let parsed = parse_unit(service_text(class.service_file)?);
             let expected: std::collections::BTreeSet<&str> =
                 class.expected_capabilities.iter().copied().collect();
 
@@ -387,14 +397,17 @@ mod tests {
                 }
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_warden_restricts_address_families_without_inet() {
+    fn test_warden_restricts_address_families_without_inet() -> TestResult {
         let parsed = parse_unit(WARDEN_SERVICE);
         let value = parsed
             .last_value("Service", "RestrictAddressFamilies")
-            .expect("harw-warden.service muss RestrictAddressFamilies= setzen");
+            .ok_or(TestError::Missing(
+                "harw-warden.service muss RestrictAddressFamilies= setzen",
+            ))?;
         let families = capability_set(value);
         assert!(
             !families.contains("AF_INET") && !families.contains("AF_INET6"),
@@ -404,6 +417,7 @@ mod tests {
             families.contains("AF_UNIX"),
             "harw-warden.service muss mindestens AF_UNIX zulassen (sein einziger Transport)"
         );
+        Ok(())
     }
 
     #[test]
@@ -421,7 +435,9 @@ mod tests {
     fn test_warden_socket_unit_uses_sequential_packet() {
         let parsed = parse_unit(WARDEN_SOCKET);
         assert!(
-            parsed.last_value("Socket", "ListenSequentialPacket").is_some(),
+            parsed
+                .last_value("Socket", "ListenSequentialPacket")
+                .is_some(),
             "harw-warden::ipc erwartet einen SOCK_SEQPACKET-Socket, keinen Stream-/Datagram-Socket"
         );
     }
@@ -481,7 +497,11 @@ mod tests {
     fn test_unit_classes_reference_distinct_binaries() {
         let binaries: std::collections::BTreeSet<&str> =
             UNIT_CLASSES.iter().map(|class| class.binary).collect();
-        assert_eq!(binaries.len(), UNIT_CLASSES.len(), "jede Klasse muss ein eigenes Binary nennen");
+        assert_eq!(
+            binaries.len(),
+            UNIT_CLASSES.len(),
+            "jede Klasse muss ein eigenes Binary nennen"
+        );
     }
 
     #[test]

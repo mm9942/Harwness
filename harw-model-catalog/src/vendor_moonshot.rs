@@ -507,6 +507,7 @@ pub fn moonshot_observations() -> Vec<ObservedModelBehavior> {
 mod tests {
     use super::*;
     use crate::descriptor::{Modality, ModelLifecycle};
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn kimi_k2_6_is_present() {
@@ -540,14 +541,19 @@ mod tests {
     }
 
     #[test]
-    fn deprecated_preview_ids_have_deprecated_lifecycle() {
+    fn deprecated_preview_ids_have_deprecated_lifecycle() -> TestResult {
         // kimi-k2-turbo-preview and kimi-k2-0905-preview deprecated per 2026-05-25
         let descs = moonshot_descriptors();
         for id in &["kimi-k2-turbo-preview", "kimi-k2-0905-preview"] {
             let entry = descs
                 .iter()
                 .find(|d| d.model.as_str() == *id)
-                .unwrap_or_else(|| panic!("Modell '{}' fehlt in moonshot_descriptors()", id));
+                .ok_or_else(|| {
+                    TestError::Unexpected(format!(
+                        "Modell '{}' fehlt in moonshot_descriptors()",
+                        id
+                    ))
+                })?;
             assert_eq!(
                 entry.lifecycle,
                 ModelLifecycle::Deprecated,
@@ -555,10 +561,11 @@ mod tests {
                 id
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn all_deprecated_k2_ids_are_deprecated() {
+    fn all_deprecated_k2_ids_are_deprecated() -> TestResult {
         // All five K2-era deprecated IDs must carry Deprecated lifecycle
         let deprecated_ids = [
             "kimi-k2-turbo-preview",
@@ -572,7 +579,7 @@ mod tests {
             let entry = descs
                 .iter()
                 .find(|d| d.model.as_str() == *id)
-                .unwrap_or_else(|| panic!("Modell '{}' fehlt", id));
+                .ok_or_else(|| TestError::Unexpected(format!("Modell '{}' fehlt", id)))?;
             assert_eq!(
                 entry.lifecycle,
                 ModelLifecycle::Deprecated,
@@ -580,6 +587,7 @@ mod tests {
                 id
             );
         }
+        Ok(())
     }
 
     #[test]
@@ -700,20 +708,28 @@ mod tests {
     }
 
     #[test]
-    fn kimi_k2_6_is_ga_with_tool_calling() {
+    fn kimi_k2_6_is_ga_with_tool_calling() -> TestResult {
         let descs = moonshot_descriptors();
-        let k26 = descs.iter().find(|d| d.model == "kimi-k2.6").unwrap();
+        let k26 = descs
+            .iter()
+            .find(|d| d.model == "kimi-k2.6")
+            .ok_or(TestError::Missing("kimi-k2.6 descriptor"))?;
         assert_eq!(k26.lifecycle, ModelLifecycle::Ga);
         assert_eq!(k26.capabilities.tool_calling, ToolCallingSupport::Parallel);
         assert!(k26.capabilities.parallel_tools);
+        Ok(())
     }
 
     #[test]
-    fn kimi_k2_7_code_always_on_reasoning() {
+    fn kimi_k2_7_code_always_on_reasoning() -> TestResult {
         // Thinking mode is always on for kimi-k2.7-code → ReasoningSupport::Trace
         let descs = moonshot_descriptors();
-        let k27 = descs.iter().find(|d| d.model == "kimi-k2.7-code").unwrap();
+        let k27 = descs
+            .iter()
+            .find(|d| d.model == "kimi-k2.7-code")
+            .ok_or(TestError::Missing("kimi-k2.7-code descriptor"))?;
         assert_eq!(k27.capabilities.reasoning, ReasoningSupport::Trace);
         assert_eq!(k27.lifecycle, ModelLifecycle::Ga);
+        Ok(())
     }
 }

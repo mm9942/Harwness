@@ -403,7 +403,10 @@ impl NullCounterRegistry {
     /// ```
     #[must_use]
     pub fn snapshot(&self) -> Vec<(&'static str, u64)> {
-        self.counters.iter().map(|c| (c.name(), c.count())).collect()
+        self.counters
+            .iter()
+            .map(|c| (c.name(), c.count()))
+            .collect()
     }
 
     /// Die Zähler, die über null stehen. Leer heißt: keine Verletzung.
@@ -510,6 +513,7 @@ mod tests {
 
     use super::*;
     use crate::metric::{Cardinality, MetricKind, Unit};
+    use crate::test_support::{TestError, TestResult};
 
     const EXAMPLE_KEY: MetricKey = MetricKey {
         name: "example_invariant_violation_total",
@@ -587,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn test_assert_all_zero_names_counter_count_and_invariant() {
+    fn test_assert_all_zero_names_counter_count_and_invariant() -> TestResult {
         static COUNTER: NullCounter = NullCounter::new(&EXAMPLE_KEY, EXAMPLE_INVARIANT);
         let sink = RecordingSink::default();
         COUNTER.violated(&sink, &[]);
@@ -596,7 +600,9 @@ mod tests {
         registry.register(&COUNTER);
 
         let Err(err) = assert_all_zero(&registry) else {
-            panic!("expected assert_all_zero to report the violated counter");
+            return Err(TestError::Unexpected(
+                "expected assert_all_zero to report the violated counter".to_owned(),
+            ));
         };
         let ObserveError::NullCounterViolated {
             name,
@@ -604,7 +610,9 @@ mod tests {
             invariant,
         } = err
         else {
-            panic!("expected ObserveError::NullCounterViolated");
+            return Err(TestError::Unexpected(
+                "expected ObserveError::NullCounterViolated".to_owned(),
+            ));
         };
         assert_eq!(name, "example_invariant_violation_total");
         assert_eq!(count, 1);
@@ -616,6 +624,7 @@ mod tests {
                  invariant: {EXAMPLE_INVARIANT}"
             )
         );
+        Ok(())
     }
 
     #[test]
@@ -657,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn test_null_counter_violated_is_thread_safe_under_concurrent_increments() {
+    fn test_null_counter_violated_is_thread_safe_under_concurrent_increments() -> TestResult {
         static COUNTER: NullCounter = NullCounter::new(&EXAMPLE_KEY, EXAMPLE_INVARIANT);
         let sink: Arc<dyn TelemetrySink> = Arc::new(RecordingSink::default());
 
@@ -673,9 +682,12 @@ mod tests {
             .collect();
 
         for handle in handles {
-            handle.join().unwrap();
+            handle
+                .join()
+                .map_err(|_| TestError::Unexpected("worker thread panicked".to_owned()))?;
         }
 
         assert_eq!(COUNTER.count(), 200);
+        Ok(())
     }
 }

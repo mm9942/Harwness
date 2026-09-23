@@ -36,15 +36,17 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use harw_authority::{Permission, PermissionSet};
 use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_project_discovery::{DiscoveryConfig, discover_project};
 use harw_registry_defaults::authority::{AuthorityReducer, authority_reducer_for_role};
 use harw_registry_defaults::embedded_agents::builtin_agent_definitions;
 use harw_registry_defaults::profile::{
-    IdentityOverrides, RegistryProfile, assemble_registry_for_sandbox, profile_for_role,
-    role_names,
+    IdentityOverrides, RegistryProfile, assemble_registry_for_sandbox, profile_for_role, role_names,
 };
-use harw_authority::{Permission, PermissionSet};
+
+mod common;
+use common::{TestError, TestResult, ctx};
 
 /// Alle sieben Rechte in fester Reihenfolge (Bitposition = Index).
 const PERMISSIONS: [Permission; 7] = [
@@ -86,16 +88,36 @@ fn every_permission_subset() -> Vec<PermissionSet> {
 /// Erwartete Rollentabelle: Rolle → (Profil, Reducer).
 fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer)> {
     vec![
-        (role_names::ROOT_ORCHESTRATOR, RegistryProfile::Planning, AuthorityReducer::ReadRegistry),
-        (role_names::EXPLORER, RegistryProfile::ReadOnlyExplore, AuthorityReducer::ReadRegistry),
+        (
+            role_names::ROOT_ORCHESTRATOR,
+            RegistryProfile::Planning,
+            AuthorityReducer::ReadRegistry,
+        ),
+        (
+            role_names::EXPLORER,
+            RegistryProfile::ReadOnlyExplore,
+            AuthorityReducer::ReadRegistry,
+        ),
         (
             role_names::RESEARCHER_DEPS,
             RegistryProfile::ReadOnlyExplore,
             AuthorityReducer::ReadRegistry,
         ),
-        (role_names::ANALYST, RegistryProfile::ReadOnlyExplore, AuthorityReducer::ReadRegistry),
-        (role_names::PLANNER, RegistryProfile::Planning, AuthorityReducer::ReadRegistry),
-        (role_names::RESEARCHER_WEB, RegistryProfile::Research, AuthorityReducer::ReadNetwork),
+        (
+            role_names::ANALYST,
+            RegistryProfile::ReadOnlyExplore,
+            AuthorityReducer::ReadRegistry,
+        ),
+        (
+            role_names::PLANNER,
+            RegistryProfile::Planning,
+            AuthorityReducer::ReadRegistry,
+        ),
+        (
+            role_names::RESEARCHER_WEB,
+            RegistryProfile::Research,
+            AuthorityReducer::ReadNetwork,
+        ),
         (
             role_names::SECURITY_EGRESS_TRIAGE,
             RegistryProfile::NoTools,
@@ -121,7 +143,11 @@ fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer
         // für `MEMORY_STEWARD`, `UIA_WORKER` und `EXECUTOR`; die Reducer
         // unten stimmen mit dort überein (siehe Doku bei
         // `authority_reducer_for_role`).
-        (role_names::EXECUTOR, RegistryProfile::ShellExecution, AuthorityReducer::ReadOnly),
+        (
+            role_names::EXECUTOR,
+            RegistryProfile::ShellExecution,
+            AuthorityReducer::ReadOnly,
+        ),
         (
             role_names::MEMORY_STEWARD,
             RegistryProfile::MemoryStewardship,
@@ -132,12 +158,20 @@ fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer
         // (`RegistryProfile::Research`), sondern
         // `RegistryProfile::UiaQuickHelper` mit dem `executor`-Muster als
         // Reducer-Ausnahme (siehe `authority_reducer_for_role`).
-        (role_names::UIA_WORKER, RegistryProfile::UiaQuickHelper, AuthorityReducer::ReadOnly),
+        (
+            role_names::UIA_WORKER,
+            RegistryProfile::UiaQuickHelper,
+            AuthorityReducer::ReadOnly,
+        ),
         // Addendum K: `agent-steward` ist die einzige Rolle mit
         // `RegistryProfile::AgentStewardship`, ebenfalls mit dem
         // `executor`-Muster als Reducer-Ausnahme (siehe
         // `authority_reducer_for_role`).
-        (role_names::AGENT_STEWARD, RegistryProfile::AgentStewardship, AuthorityReducer::ReadOnly),
+        (
+            role_names::AGENT_STEWARD,
+            RegistryProfile::AgentStewardship,
+            AuthorityReducer::ReadOnly,
+        ),
         // Host-Shell-Spezialisierung der UIA: `RegistryProfile::UiaShellWorker`
         // mit dem `executor`-Muster als Reducer-Ausnahme (siehe
         // `authority_reducer_for_role`).
@@ -149,10 +183,18 @@ fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer
         // Read-only Erkundungsspezialisierung der UIA: `RegistryProfile::
         // UiaExplorer` mit dem `uia-worker`-Muster als Reducer-Ausnahme
         // (siehe `authority_reducer_for_role`).
-        (role_names::UIA_EXPLORER, RegistryProfile::UiaExplorer, AuthorityReducer::ReadOnly),
+        (
+            role_names::UIA_EXPLORER,
+            RegistryProfile::UiaExplorer,
+            AuthorityReducer::ReadOnly,
+        ),
         // Schreibende Erkundungsspezialisierung der UIA: `RegistryProfile::
         // UiaWriter` mit demselben Reducer-Muster.
-        (role_names::UIA_WRITER, RegistryProfile::UiaWriter, AuthorityReducer::ReadOnly),
+        (
+            role_names::UIA_WRITER,
+            RegistryProfile::UiaWriter,
+            AuthorityReducer::ReadOnly,
+        ),
     ]
 }
 
@@ -165,19 +207,27 @@ fn test_role_table_matches_profile_and_reducer_for_every_builtin_role() {
 
     for (role, profile, reducer) in table {
         assert_eq!(profile_for_role(role), Some(profile), "{role}: Profil");
-        assert_eq!(authority_reducer_for_role(role), Some(reducer), "{role}: Reducer");
+        assert_eq!(
+            authority_reducer_for_role(role),
+            Some(reducer),
+            "{role}: Reducer"
+        );
     }
 }
 
 #[test]
-fn test_profile_by_permission_matrix_never_registers_ungranted_tools() {
+fn test_profile_by_permission_matrix_never_registers_ungranted_tools() -> TestResult {
     for profile in RegistryProfile::ALL {
         for granted in every_permission_subset() {
             let tools = profile.tool_names_for(&granted);
             for tool in &tools {
-                let needed = harw_registry_defaults::tool_permission(tool)
-                    .unwrap_or_else(|| panic!("{profile:?}: {tool} ohne bekanntes Recht"));
-                assert!(granted.contains(needed), "{profile:?}: {tool} ohne {needed:?}");
+                let needed = harw_registry_defaults::tool_permission(tool).ok_or(
+                    TestError::Unexpected(format!("{profile:?}: {tool} ohne bekanntes Recht")),
+                )?;
+                assert!(
+                    granted.contains(needed),
+                    "{profile:?}: {tool} ohne {needed:?}"
+                );
                 // Nutzerentscheidung: einzige Ausnahme ist `browser.open`
                 // unter `UiaQuickHelper` — alle übrigen sechs
                 // `browser.*`-Werkzeuge bleiben für jedes Profil ohne Grant.
@@ -219,7 +269,10 @@ fn test_profile_by_permission_matrix_never_registers_ungranted_tools() {
                 "{profile:?}: shell.exec"
             );
             if tools.iter().any(|tool| tool.starts_with("deps.source_")) {
-                assert!(granted.contains(Permission::ReadCargoRegistry), "{profile:?}");
+                assert!(
+                    granted.contains(Permission::ReadCargoRegistry),
+                    "{profile:?}"
+                );
             }
             if tools.iter().any(|tool| tool.starts_with("web.")) {
                 // `Research` führt alle drei `web.*`-Werkzeuge; `UiaQuickHelper`
@@ -242,6 +295,7 @@ fn test_profile_by_permission_matrix_never_registers_ungranted_tools() {
             }
         }
     }
+    Ok(())
 }
 
 #[test]
@@ -250,7 +304,10 @@ fn test_role_by_permission_matrix_after_reducer() {
         for parent in every_permission_subset() {
             let child = reducer.reduce(&parent);
             assert!(child.is_subset_of(&parent), "{role}: Reducer gewährt Neues");
-            assert!(child.is_subset_of(&reducer.ceiling()), "{role}: über der Obergrenze");
+            assert!(
+                child.is_subset_of(&reducer.ceiling()),
+                "{role}: über der Obergrenze"
+            );
             for forbidden in [
                 Permission::WriteWorkspace,
                 Permission::ExecuteProcess,
@@ -284,7 +341,9 @@ fn test_role_by_permission_matrix_after_reducer() {
                 sees_source,
                 parent.contains(Permission::ReadCargoRegistry)
                     && reducer == AuthorityReducer::ReadRegistry
-                    && profile.registered_tool_names().contains(&"deps.source_read"),
+                    && profile
+                        .registered_tool_names()
+                        .contains(&"deps.source_read"),
                 "{role}: deps.source_* genau dann, wenn der Elternteil ReadCargoRegistry trägt"
             );
         }
@@ -292,15 +351,17 @@ fn test_role_by_permission_matrix_after_reducer() {
 }
 
 #[test]
-fn test_role_tomls_never_admit_write_shell_or_browser_and_researcher_web_is_web_only() {
+fn test_role_tomls_never_admit_write_shell_or_browser_and_researcher_web_is_web_only() -> TestResult
+{
     let roles: HashMap<String, harw_agent_dsl::ExecutableAgentIr> =
-        builtin_agent_definitions(&HashMap::new())
-            .expect("eingebaute Rollendefinitionen müssen sich auflösen lassen");
+        builtin_agent_definitions(&HashMap::new()).map_err(ctx(
+            "eingebaute Rollendefinitionen müssen sich auflösen lassen",
+        ))?;
 
     for role in role_names::ALL {
-        let ir = roles
-            .get(*role)
-            .unwrap_or_else(|| panic!("Rolle {role} fehlt in den aufgelösten Definitionen"));
+        let ir = roles.get(*role).ok_or(TestError::Unexpected(format!(
+            "Rolle {role} fehlt in den aufgelösten Definitionen"
+        )))?;
         // Dieselbe berechnete Bedingung wie
         // `harw_registry_defaults::authority::tests::
         // test_authority_reducer_for_role_covers_every_role_and_bounds_its_profile`
@@ -311,11 +372,13 @@ fn test_role_tomls_never_admit_write_shell_or_browser_and_researcher_web_is_web_
         // das der `AuthorityReducer` ihrer Rolle nie trägt, weil sie es über
         // ihre feste Profilzuweisung bei der Registry-Montage bekommen (siehe
         // `authority_reducer_for_role`), nicht über den Reducer.
-        let profile = profile_for_role(role).expect("eingebaute Rolle braucht ein Profil");
-        let reducer =
-            authority_reducer_for_role(role).expect("eingebaute Rolle braucht einen Reducer");
-        let is_documented_gated_exception =
-            !profile.required_permissions().is_subset_of(&reducer.ceiling());
+        let profile = profile_for_role(role)
+            .ok_or(TestError::Missing("eingebaute Rolle braucht ein Profil"))?;
+        let reducer = authority_reducer_for_role(role)
+            .ok_or(TestError::Missing("eingebaute Rolle braucht einen Reducer"))?;
+        let is_documented_gated_exception = !profile
+            .required_permissions()
+            .is_subset_of(&reducer.ceiling());
         let admitted = ir.tool_surface().admitted();
         for tool in admitted {
             // Nutzerentscheidung: `uia-worker` darf `browser.open` benutzen —
@@ -327,7 +390,8 @@ fn test_role_tomls_never_admit_write_shell_or_browser_and_researcher_web_is_web_
             if tool == "browser.open" && *role == role_names::UIA_WORKER {
                 continue;
             }
-            if is_documented_gated_exception && profile.registered_tool_names().contains(&tool.as_str())
+            if is_documented_gated_exception
+                && profile.registered_tool_names().contains(&tool.as_str())
             {
                 // Erwartete, dokumentierte Ausnahme — siehe oben. Jedes
                 // übrige `browser.*`-Werkzeug gehört zu keinem Profil (W5 RD),
@@ -344,7 +408,7 @@ fn test_role_tomls_never_admit_write_shell_or_browser_and_researcher_web_is_web_
 
     let web = roles
         .get(role_names::RESEARCHER_WEB)
-        .expect("researcher-web ist eingebaut");
+        .ok_or(TestError::Missing("researcher-web ist eingebaut"))?;
     let admitted: BTreeSet<&str> = web
         .tool_surface()
         .admitted()
@@ -374,8 +438,12 @@ fn test_role_tomls_never_admit_write_shell_or_browser_and_researcher_web_is_web_
         "deps.source_search",
         "deps.source_list",
     ] {
-        assert!(forbidden.contains(tool), "researcher-web muss {tool} ausdrücklich verbieten");
+        assert!(
+            forbidden.contains(tool),
+            "researcher-web muss {tool} ausdrücklich verbieten"
+        );
     }
+    Ok(())
 }
 
 /// Die lesenden `fs.*`-Werkzeuge, wie `RegistryProfile::AgentStewardship`
@@ -383,6 +451,11 @@ fn test_role_tomls_never_admit_write_shell_or_browser_and_researcher_web_is_web_
 /// (`pub(crate)`, hier deshalb als eigene Kopie, wie schon in
 /// `harw-registry-defaults/src/profile.rs::test_read_only_explore_exposes_exact_tool_set`).
 const FS_READ_ONLY: &[&str] = &["fs.read", "fs.list", "fs.search", "fs.glob", "fs.grep"];
+
+/// Das lesende Doc-Werkzeug, wie `RegistryProfile::AgentStewardship` es
+/// registriert — dieselbe Liste wie `crate::profile::DOC_TOOLS` (`pub(crate)`,
+/// hier deshalb als eigene Kopie, wie schon bei [`FS_READ_ONLY`]).
+const DOC_READ_ONLY: &[&str] = &["doc.read_pdf"];
 
 /// Erwartete beworbene/registrierte Werkzeuge unter `granted` — für jedes
 /// Profil außer `AgentStewardship` und `UiaQuickHelper` unverändert
@@ -411,9 +484,8 @@ fn expected_tool_names(profile: RegistryProfile, granted: &PermissionSet) -> Vec
     if profile == RegistryProfile::AgentStewardship {
         let raw: Vec<&'static str> = FS_READ_ONLY
             .iter()
-            .chain(
-                harw_registry_defaults::agent_definition_tool_names_for_access(None).iter(),
-            )
+            .chain(DOC_READ_ONLY.iter())
+            .chain(harw_registry_defaults::agent_definition_tool_names_for_access(None).iter())
             .copied()
             .collect();
         return raw
@@ -433,14 +505,18 @@ fn expected_tool_names(profile: RegistryProfile, granted: &PermissionSet) -> Vec
             .map(|tool| tool.to_owned())
             .collect();
     }
-    profile.tool_names_for(granted).iter().map(|name| (*name).to_owned()).collect()
+    profile
+        .tool_names_for(granted)
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect()
 }
 
 #[test]
-fn test_assembled_registry_matches_the_matrix_for_every_profile_and_permission_set() {
-    let cwd = std::env::current_dir().expect("cwd");
+fn test_assembled_registry_matches_the_matrix_for_every_profile_and_permission_set() -> TestResult {
+    let cwd = std::env::current_dir().map_err(ctx("cwd"))?;
     let project = discover_project(&cwd, &DiscoveryConfig::default())
-        .expect("Discovery im Crate-Verzeichnis");
+        .map_err(ctx("Discovery im Crate-Verzeichnis"))?;
 
     for profile in RegistryProfile::ALL {
         for granted in every_permission_subset() {
@@ -451,7 +527,7 @@ fn test_assembled_registry_matches_the_matrix_for_every_profile_and_permission_s
                 ApprovalModeCell::default(),
                 &granted,
             )
-            .expect("assemble");
+            .map_err(ctx("assemble"))?;
             let registered: Vec<String> = assembled
                 .registry
                 .tool_providers()
@@ -464,4 +540,5 @@ fn test_assembled_registry_matches_the_matrix_for_every_profile_and_permission_s
             assert_eq!(assembled.identity.tools_available, expected, "{profile:?}");
         }
     }
+    Ok(())
 }

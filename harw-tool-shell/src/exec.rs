@@ -45,20 +45,28 @@
 //! - stdout/stderr werden streamend mit gemeinsamem Budget gelesen; bei Überschreitung wird
 //!   `bwrap` per SIGKILL beendet (`--die-with-parent` + PID-Namespace räumen den Baum ab),
 //!   Teilausgabe bleibt bei Kappung und Timeout erhalten (F-060).
+//! - Host-Ausführung ([`ShellExecutor::run_host_command`], Plan Teil B1) läuft, wenn
+//!   `setsid` (util-linux) auffindbar ist, zusätzlich über `setsid --wait /bin/sh -c
+//!   <command>` statt `/bin/sh -c <command>` direkt: das löst den Befehl aus harws
+//!   Sitzung und Controlling-Terminal ([`host_shell_argv`], [`resolve_setsid`]) —
+//!   ein Kind, das `/dev/tty` öffnet (git, Pager,
+//!   Fortschrittsbalken), kann dann nicht mehr die Terminalmodi der harw-TUI
+//!   (z. B. Maus-Reporting) verändern. Ohne `setsid` bleibt der bisherige Pfad
+//!   unverändert (`tracing::debug!` einmalig).
 
 use crate::capture::{BoundedCapture, DrainEnd};
 use crate::host_permit_prompt::{HostPermitPrompt, HostPermitPromptSender, HostPermitVariant};
 use crate::limits::{ShellLimits, ShellLimitsError, launch_command};
-use harw_extension_api::contributors::ToolProvider;
 use harw_authority::{Permission, SandboxSpec};
+use harw_extension_api::contributors::ToolProvider;
 use harw_sandbox::{
     BwrapLauncher, HostApprovalScope, HostPathBinding, HostPermitSessionRegistry,
     ProcessEnvironment, ProcessPermitLedger, ProcessPermitRequest, SandboxProfile,
 };
 use harw_tools::{
+    ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolOutput, ToolsError,
     schema::{AdditionalProperties, JsonSchema, JsonSchemaType},
     spec::{FunctionToolSpec, ToolName, ToolSpec},
-    ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolOutput, ToolsError,
 };
 use harw_types::cancel::CancelToken;
 use serde::Deserialize;
@@ -68,9 +76,9 @@ use std::{
     ffi::OsString,
     fmt, io,
     num::NonZeroU64,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 use tokio::process::{Child, Command as TokioCommand};
@@ -85,6 +93,13 @@ const TRUNCATION_MARKER: &str = "\n[...truncated...]";
 /// Obergrenze für das Einsammeln des Exit-Status nach SIGKILL. `kill_on_drop` bleibt
 /// als Rückfallebene, falls der Kernel den Prozess nicht rechtzeitig freigibt.
 const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Feste Suchpfade für `setsid` (util-linux), geprüft vor der `PATH`-Suche in
+/// [`find_setsid`]. Anders als [`crate::limits::PRLIMIT_CANDIDATES`] fällt die
+/// Suche zusätzlich auf `PATH` zurück ([`std::env::split_paths`]): `setsid`
+/// dient nur der Sitzungs-Trennung des Host-Befehls von harws eigenem
+/// Terminal, nicht der Durchsetzung sicherheitskritischer Grenzen wie
+/// `bwrap`/`prlimit`, für die `PATH` bewusst nie ausgewertet wird.
+const SETSID_FIXED_CANDIDATES: [&str; 2] = ["/usr/bin/setsid", "/bin/setsid"];
 /// Einzige heute existierende Worker-Definition, die [`SandboxProfile::Host`]
 /// aktiviert (siehe `harw-registry-defaults/agents/host-process-worker.toml`).
 /// Sobald ein zweiter Host-fähiger Worker entsteht, muss dieser Konstante ein
@@ -220,7 +235,10 @@ struct ShellExecArgs {
     /// The shell command to execute via `/bin/sh -c`.
     command: String,
     /// Optional per-call timeout override. Clamped to the provider's configured maximum.
-    #[serde(default, deserialize_with = "harw_extension_api::lenient::lenient_opt_u64")]
+    #[serde(
+        default,
+        deserialize_with = "harw_extension_api::lenient::lenient_opt_u64"
+    )]
     timeout_secs: Option<u64>,
 }
 
@@ -443,7 +461,8 @@ impl ShellExecutor {
             );
         }
 
-        self.prompt_for_authorization(ledger, registry, request).await
+        self.prompt_for_authorization(ledger, registry, request)
+            .await
     }
 
     /// Fragt — wenn ein Kanal angehängt ist — über [`HostPermitPrompt`] nach
@@ -496,9 +515,10 @@ impl ShellExecutor {
             registry.mark_session_approved(request.session.clone(), HOST_SESSION_LEASE_TTL);
         }
         let (scope, ttl) = match variant {
-            HostPermitVariant::SingleExecution => {
-                (HostApprovalScope::SingleExecution, HOST_SINGLE_EXECUTION_TTL)
-            }
+            HostPermitVariant::SingleExecution => (
+                HostApprovalScope::SingleExecution,
+                HOST_SINGLE_EXECUTION_TTL,
+            ),
             HostPermitVariant::SessionLease => {
                 (HostApprovalScope::SessionLease, HOST_SESSION_LEASE_TTL)
             }
@@ -559,7 +579,8 @@ impl ShellExecutor {
         session_id: &str,
     ) -> Result<bool, String> {
         if self.sandbox_profile.is_host() {
-            self.authorize_host_command(args, sandbox, session_id).await?;
+            self.authorize_host_command(args, sandbox, session_id)
+                .await?;
             return Ok(true);
         }
 
@@ -616,10 +637,16 @@ impl ShellExecutor {
     ) -> Result<ToolOutput, ToolsError> {
         let effective_timeout = self.effective_timeout(args)?;
 
-        let effective_host = match self.determine_effective_host(args, sandbox, session_id).await {
+        let effective_host = match self
+            .determine_effective_host(args, sandbox, session_id)
+            .await
+        {
             Ok(effective_host) => effective_host,
             Err(message) => {
-                warn!(session_id, "shell.exec denied: host permit authorization failed");
+                warn!(
+                    session_id,
+                    "shell.exec denied: host permit authorization failed"
+                );
                 return Ok(ToolOutput::error(message));
             }
         };
@@ -717,19 +744,25 @@ impl ShellExecutor {
     /// approval from the [`HostPermitSessionRegistry`] for any other
     /// profile) — this method performs no authorization check itself.
     ///
-    /// Builds `/bin/sh -c <command>` with `current_dir` set to the sandbox's
+    /// Builds `/bin/sh -c <command>` — or, if `setsid` (util-linux) is
+    /// resolvable via [`resolve_setsid`], `setsid --wait /bin/sh -c <command>`
+    /// via [`host_shell_argv`] — with `current_dir` set to the sandbox's
     /// canonical workspace root, the harness's own environment fully
-    /// inherited (no `env_clear`, unlike the `bwrap` path), stdin `/dev/null`
-    /// and its own process group (`process_group(0)`) — this isolates the
-    /// host command from harw's own process group (e.g. terminal signals)
-    /// the same way the `bwrap` path's PID namespace isolates its process
-    /// tree, and lets [`terminate`] kill it independently. `prlimit` limits
-    /// are applied through the same [`crate::limits::launch_command`]
-    /// mechanism the `bwrap` path uses ([`Self::resolve_limits`]); if
-    /// `prlimit` is unavailable and `require_rlimits == false`, the host
-    /// command runs deliberately without rlimits, exactly like the `bwrap`
-    /// path's fallback (only the tmpfs limit does not apply here, because
-    /// there is no `bwrap` `/tmp` in the host path).
+    /// inherited (no `env_clear`, unlike the `bwrap` path), and stdin
+    /// `/dev/null`. Process-group/session isolation depends on whether
+    /// `setsid` was found: without it, `process_group(0)` isolates the host
+    /// command from harw's own process group (e.g. terminal signals), same as
+    /// before; with it, `process_group(0)` is deliberately **not** set so
+    /// `setsid` execs `/bin/sh` in place instead of forking — see the `//`
+    /// comment at the `process_group` call site for the full reasoning and
+    /// why [`terminate`] still kills the whole command tree unmodified in
+    /// both cases. `prlimit` limits are applied through the same
+    /// [`crate::limits::launch_command`] mechanism the `bwrap` path uses
+    /// ([`Self::resolve_limits`]); if `prlimit` is unavailable and
+    /// `require_rlimits == false`, the host command runs deliberately without
+    /// rlimits, exactly like the `bwrap` path's fallback (only the tmpfs
+    /// limit does not apply here, because there is no `bwrap` `/tmp` in the
+    /// host path).
     ///
     /// Timeout, cancel-race, output truncation and [`terminate`] all run
     /// through [`Self::spawn_and_collect`] — the same helper the `bwrap` path
@@ -773,17 +806,44 @@ impl ShellExecutor {
             );
         }
 
-        let sh = PathBuf::from("/bin/sh");
-        let shell_args = [OsString::from("-c"), OsString::from(&args.command)];
-        let launch = launch_command(prlimit.as_deref(), &self.limits, &sh, &shell_args);
+        let setsid = resolve_setsid();
+        let (program, shell_args) = host_shell_argv(setsid, &args.command);
+        let launch = launch_command(prlimit.as_deref(), &self.limits, &program, &shell_args);
 
         let mut command = TokioCommand::new(&launch.program);
         command.args(&launch.args);
         command.current_dir(sandbox.workspace().canonical_root());
-        // Eigene Prozessgruppe, analog zur eigenen Prozessbaum-Isolation des
-        // bwrap-Pfads (PID-Namespace + `--die-with-parent`): trennt den Host-Befehl
-        // von harws eigener Prozessgruppe, unabhängig von ihr per `terminate` tötbar.
-        command.process_group(0);
+        // Prozessgruppen-/Sitzungs-Isolation des Host-Befehls von harws eigenem
+        // Terminal. Zwei Fälle, je nachdem ob `setsid` gefunden wurde
+        // (`host_shell_argv`):
+        //
+        // - MIT setsid: `process_group(0)` wird hier BEWUSST NICHT gesetzt. Das
+        //   util-linux-`setsid` forkt nur dann einen Enkelprozess (und wartet
+        //   dank `--wait` auf ihn), wenn es selbst bereits Prozessgruppenführer
+        //   ist (`getpgrp() == getpid()`). Ohne `process_group(0)` erbt der
+        //   direkte Kindprozess (der spätere `setsid`) harws Prozessgruppe
+        //   (deren pgid == harws eigene PID ist, nicht die des Kindes) — er ist
+        //   also KEIN Gruppenführer. `setsid` ruft daraufhin `setsid(2)` auf
+        //   sich selbst auf und `exec`t `/bin/sh` an derselben PID weiter, statt
+        //   zu forken: diese eine PID wird Sitzungs- UND Gruppenführer einer
+        //   neuen, von harws Terminal vollständig gelösten Sitzung (kein
+        //   Controlling-Terminal mehr — `open("/dev/tty")` scheitert dort mit
+        //   ENXIO, das eigentliche Ziel dieses Fixes). `terminate()` killt
+        //   unverändert genau diese eine PID (`child.start_kill()`), die damit
+        //   weiterhin die Spitze des gesamten Kommandobaums ist — kein Änderung
+        //   an `terminate()` nötig.
+        //   Würde hier stattdessen `process_group(0)` gesetzt, wäre der direkte
+        //   Kindprozess bereits Gruppenführer, `setsid` würde also forken und
+        //   (dank `--wait`) auf den Enkel warten; `terminate()` träfe dann nur
+        //   den wartenden Elternprozess, während `/bin/sh` in seiner eigenen,
+        //   neuen Sitzung als Waise weiterliefe — exakt das Leck, das dieser Fix
+        //   beheben soll. Deshalb bewusst vermieden.
+        // - OHNE setsid (Fallback, unverändertes Verhalten): `process_group(0)`
+        //   wie bisher, trennt den Host-Befehl zumindest von harws eigener
+        //   Prozessgruppe (keine Sitzungs-Trennung, `/dev/tty` bleibt erreichbar).
+        if setsid.is_none() {
+            command.process_group(0);
+        }
         // Umgebung wird bewusst NICHT gecleart (kein `env_clear`): der Host-Pfad erbt
         // den vollen zsh-Kontext des Nutzers (PATH/HOME/CARGO_HOME/…), im Unterschied
         // zum hermetischen bwrap-Pfad.
@@ -856,7 +916,9 @@ impl ShellExecutor {
                     }
                 }
             }
-            None => tokio::time::timeout_at(deadline, capture.drain(&mut stdout, &mut stderr)).await,
+            None => {
+                tokio::time::timeout_at(deadline, capture.drain(&mut stdout, &mut stderr)).await
+            }
         };
 
         let status = match drained {
@@ -908,7 +970,11 @@ impl ShellExecutor {
                     Err(_elapsed) => {
                         terminate(&mut child).await;
                         warn!(timeout_secs = effective_timeout, "shell.exec timed out");
-                        return Ok(self.timeout_output(effective_timeout, &capture, executed_on_host));
+                        return Ok(self.timeout_output(
+                            effective_timeout,
+                            &capture,
+                            executed_on_host,
+                        ));
                     }
                 }
             }
@@ -992,6 +1058,107 @@ impl ShellExecutor {
     }
 }
 
+/// Löst `setsid` (util-linux) einmalig pro Prozess auf und merkt das Ergebnis.
+///
+/// # Description
+/// Prüft zuerst [`SETSID_FIXED_CANDIDATES`], danach jeden Eintrag von `PATH`
+/// ([`find_setsid_in_path`]). `None` wird genau einmal mit
+/// [`tracing::debug!`] begründet — dank [`OnceLock`] läuft die Suche (und
+/// damit auch das Log) nur beim ersten Aufruf.
+///
+/// # Returns
+/// `Some(path)` zum ersten gefundenen ausführbaren `setsid`, sonst `None`.
+///
+/// # Concurrency
+/// `Send + Sync`; sicher von mehreren Tasks gleichzeitig aufrufbar, die
+/// zugrundeliegende Suche läuft dank `OnceLock` nur einmal.
+fn resolve_setsid() -> Option<&'static Path> {
+    static SETSID_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    SETSID_PATH.get_or_init(find_setsid).as_deref()
+}
+
+/// Sucht `setsid` an [`SETSID_FIXED_CANDIDATES`], dann in `PATH`. Reine
+/// Auflösungslogik ohne `OnceLock`-Caching, damit [`resolve_setsid`] die
+/// Suche über `get_or_init` einmalig anstoßen kann.
+fn find_setsid() -> Option<PathBuf> {
+    let fixed = SETSID_FIXED_CANDIDATES.map(Path::new);
+    if let Some(found) = find_setsid_in(&fixed) {
+        return Some(found);
+    }
+    match find_setsid_in_path() {
+        Some(found) => Some(found),
+        None => {
+            debug!(
+                "shell.exec: setsid not found (fixed paths or PATH); host commands stay in \
+                 harw's own session (no /dev/tty isolation from this run)"
+            );
+            None
+        }
+    }
+}
+
+/// Prüft `candidates` der Reihe nach und liefert den ersten, der eine
+/// ausführbare reguläre Datei ist. Kein `PATH`-Zugriff — reine
+/// Kandidatenliste, deshalb ohne Spawn unit-testbar (z. B. mit einem
+/// garantiert nicht existierenden Pfad).
+fn find_setsid_in(candidates: &[&Path]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .find(|candidate| is_executable_file(candidate))
+        .map(|candidate| candidate.to_path_buf())
+}
+
+/// Durchsucht `PATH` (in Reihenfolge) nach einer ausführbaren `setsid`-Datei.
+/// Fehlt `PATH` oder ist es leer, liefert dies `None`.
+fn find_setsid_in_path() -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join("setsid"))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+/// `true`, wenn `path` eine reguläre Datei mit mindestens einem
+/// Ausführ-Bit (owner/group/other) ist. Ein fehlender Pfad oder ein
+/// `stat`-Fehler zählt als `false`, nie als Panic.
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+/// Baut das argv für den Host-Shell-Start (Plan Teil B1, Sitzungs-Trennung).
+///
+/// # Description
+/// Mit `setsid`: `<setsid> --wait /bin/sh -c <command>` — `--wait` lässt
+/// `setsid` blockieren, bis das gestartete Programm beendet ist, und gibt
+/// dessen Exit-Status weiter, sodass [`ShellExecutor::spawn_and_collect`]
+/// Timing und Exit-Code unverändert erhält. Ohne `setsid`: `/bin/sh -c
+/// <command>`, byte-identisch zum bisherigen Verhalten.
+///
+/// Reine Funktion ohne Prozessstart — unit-testbar ohne Spawn.
+///
+/// # Returns
+/// `(program, args)`: absoluter Programmpfad und die vollständige
+/// Argumentliste (ohne `program` selbst), in der Reihenfolge, in der sie an
+/// `TokioCommand::args` übergeben werden.
+fn host_shell_argv(setsid: Option<&Path>, command: &str) -> (PathBuf, Vec<OsString>) {
+    match setsid {
+        Some(setsid) => (
+            setsid.to_path_buf(),
+            vec![
+                OsString::from("--wait"),
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from(command),
+            ],
+        ),
+        None => (
+            PathBuf::from("/bin/sh"),
+            vec![OsString::from("-c"), OsString::from(command)],
+        ),
+    }
+}
+
 /// Setzt die Standard-Streams für den Sandbox-Start: stdin `/dev/null` (nie das geerbte
 /// Terminal), stdout/stderr als Pipes, SIGKILL beim Drop des `Child`.
 fn configure_stdio(command: &mut TokioCommand) -> &mut TokioCommand {
@@ -1002,10 +1169,22 @@ fn configure_stdio(command: &mut TokioCommand) -> &mut TokioCommand {
         .kill_on_drop(true)
 }
 
-/// Beendet den direkten Kindprozess (`prlimit` hat sich per `exec` durch `bwrap` ersetzt)
-/// per SIGKILL und sammelt den Exit-Status ein. `bwrap --die-with-parent` und der
-/// PID-Namespace beenden daraufhin den gesamten Sandbox-Prozessbaum, auch per
-/// `setsid`/`nohup` abgekoppelte Nachfahren.
+/// Beendet den direkten Kindprozess (`prlimit` hat sich per `exec` durch `bwrap` bzw.
+/// `setsid`/`/bin/sh` ersetzt) per SIGKILL und sammelt den Exit-Status ein.
+///
+/// Im `bwrap`-Pfad beenden `--die-with-parent` und der PID-Namespace daraufhin den
+/// gesamten Sandbox-Prozessbaum, auch per `setsid`/`nohup` abgekoppelte Nachfahren. Im
+/// Host-Pfad ohne `bwrap` ([`ShellExecutor::run_host_command`]) ist die direkte
+/// Kind-PID durch die bewusste Wahl an der `process_group`-Aufrufstelle dort immer die
+/// Spitze des Kommandobaums — mit gefundenem `setsid` die `exec`te `/bin/sh`-PID der
+/// neuen Sitzung, ohne `setsid` die `process_group(0)`-Gruppenführer-PID von `/bin/sh`
+/// selbst — deshalb bleibt diese Funktion unverändert bei einem einzelnen SIGKILL statt
+/// einer Prozessgruppen-weiten Signalisierung.
+///
+/// Nur SIGKILL: Ein vorgelagertes SIGTERM (kurze Gnadenfrist vor SIGKILL) bräuchte eine
+/// Signalauswahl jenseits von [`tokio::process::Child::start_kill`] (immer SIGKILL) —
+/// dafür gibt es in diesem `forbid(unsafe_code)`-Crate ohne neue Abhängigkeit (kein
+/// `nix`/`libc`) keinen sicheren Weg, also bleibt es bei SIGKILL.
 async fn terminate(child: &mut Child) -> Option<ExitStatus> {
     if let Err(err) = child.start_kill() {
         warn!(error = %err, "shell.exec kill failed");
@@ -1453,10 +1632,14 @@ impl ToolProvider for ShellToolProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use crate::test_support::{TestError, TestResult, ctx};
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_tools::{ToolCall, ToolExecutionContext};
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::OnceLock;
     use tempfile::TempDir;
@@ -1464,14 +1647,14 @@ mod tests {
 
     // ── Test helpers ───────────────────────────────────────────────────────────
 
-    fn make_temp_workspace() -> TempDir {
-        tempfile::tempdir().expect("tempdir creation must succeed in tests")
+    fn make_temp_workspace() -> TestResult<TempDir> {
+        tempfile::tempdir().map_err(ctx("tempdir creation must succeed in tests"))
     }
 
-    fn make_sandbox(dir: &TempDir, permissions: Vec<Permission>) -> SandboxSpec {
+    fn make_sandbox(dir: &TempDir, permissions: Vec<Permission>) -> TestResult<SandboxSpec> {
         let harness_root = dir.path().to_path_buf();
         let ws_subdir = harness_root.join("project");
-        fs::create_dir_all(&ws_subdir).expect("project subdir must be created");
+        fs::create_dir_all(&ws_subdir).map_err(ctx("project subdir must be created"))?;
 
         let registry = WorkspaceRegistry::build(
             &harness_root,
@@ -1481,16 +1664,19 @@ mod tests {
                 root: ws_subdir,
             }],
         )
-        .expect("registry build must succeed");
+        .map_err(ctx("registry build must succeed"))?;
 
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("project"),
             )
-            .expect("resolve must succeed");
+            .map_err(ctx("resolve must succeed"))?;
 
-        SandboxSpec::from_resolved(binding, PermissionSet::from_policy(permissions))
+        Ok(SandboxSpec::from_resolved(
+            binding,
+            PermissionSet::from_policy(permissions),
+        ))
     }
 
     fn make_ctx(sandbox: SandboxSpec) -> ToolExecutionContext {
@@ -1693,13 +1879,91 @@ mod tests {
         );
     }
 
+    // ── setsid-Detach (Host-Pfad, Plan Teil B1 Ergänzung) ───────────────────────
+
+    #[test]
+    fn test_host_shell_argv_with_setsid_wraps_wait_and_bin_sh() {
+        let setsid = Path::new("/usr/bin/setsid");
+
+        let (program, args) = host_shell_argv(Some(setsid), "echo hi");
+
+        assert_eq!(program, PathBuf::from("/usr/bin/setsid"));
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--wait"),
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from("echo hi"),
+            ],
+            "with setsid the command must be wrapped in `setsid --wait /bin/sh -c <cmd>` \
+             so exit status/timing still propagate to spawn_and_collect"
+        );
+    }
+
+    #[test]
+    fn test_host_shell_argv_without_setsid_is_unchanged_bin_sh_dash_c() {
+        let (program, args) = host_shell_argv(None, "echo hi");
+
+        assert_eq!(program, PathBuf::from("/bin/sh"));
+        assert_eq!(
+            args,
+            vec![OsString::from("-c"), OsString::from("echo hi")],
+            "without setsid the argv must stay byte-identical to the pre-fix host path"
+        );
+    }
+
+    #[test]
+    fn test_find_setsid_in_returns_none_for_nonexistent_explicit_path() {
+        let missing = Path::new("/nonexistent/definitely-not-here/setsid");
+
+        assert_eq!(
+            find_setsid_in(&[missing]),
+            None,
+            "a candidate path that does not exist must never resolve"
+        );
+    }
+
+    #[test]
+    fn test_find_setsid_in_finds_an_executable_regular_file() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let fake_setsid = dir.path().join("setsid");
+        fs::write(&fake_setsid, b"#!/bin/sh\nexec \"$@\"\n").map_err(ctx("write fake setsid"))?;
+        fs::set_permissions(&fake_setsid, std::fs::Permissions::from_mode(0o755))
+            .map_err(ctx("chmod fake setsid executable"))?;
+        let missing = dir.path().join("does-not-exist");
+
+        // Non-existent candidates before the real one must be skipped, not error.
+        assert_eq!(
+            find_setsid_in(&[missing.as_path(), fake_setsid.as_path()]),
+            Some(fake_setsid)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_setsid_in_skips_non_executable_file() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let not_executable = dir.path().join("setsid");
+        fs::write(&not_executable, b"not a program").map_err(ctx("write file"))?;
+        fs::set_permissions(&not_executable, std::fs::Permissions::from_mode(0o644))
+            .map_err(ctx("chmod without exec bits"))?;
+
+        assert_eq!(
+            find_setsid_in(&[not_executable.as_path()]),
+            None,
+            "a regular file without any execute bit must not resolve"
+        );
+        Ok(())
+    }
+
     // ── Pure Tests ohne Sandbox (W1-03) ────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_configure_stdio_sets_stdin_to_dev_null() {
+    async fn test_configure_stdio_sets_stdin_to_dev_null() -> TestResult {
         if !Path::new("/proc/self/fd/0").exists() || !Path::new("/bin/sh").exists() {
             eprintln!("übersprungen: /proc oder /bin/sh fehlt, stdin-Ziel nicht beobachtbar");
-            return;
+            return Ok(());
         }
         // Absichtlich ohne bwrap: prüft genau die Stream-Konfiguration, die der
         // Sandbox-Start verwendet.
@@ -1707,23 +1971,33 @@ mod tests {
         command.args(["-c", "readlink /proc/self/fd/0"]);
         let mut child = configure_stdio(&mut command)
             .spawn()
-            .expect("spawn /bin/sh");
-        let mut stdout = child.stdout.take().expect("stdout piped");
-        let mut stderr = child.stderr.take().expect("stderr piped");
+            .map_err(ctx("spawn /bin/sh"))?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or(TestError::Missing("stdout piped"))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or(TestError::Missing("stderr piped"))?;
         let mut capture = BoundedCapture::new(4096);
         let end = capture
             .drain(&mut stdout, &mut stderr)
             .await
-            .expect("read child output");
-        let status = child.wait().await.expect("wait child");
+            .map_err(ctx("read child output"))?;
+        let status = child.wait().await.map_err(ctx("wait child"))?;
 
         assert_eq!(end, DrainEnd::Eof);
         assert!(status.success(), "readlink must succeed: {status:?}");
-        assert_eq!(String::from_utf8_lossy(capture.stdout()).trim(), "/dev/null");
+        assert_eq!(
+            String::from_utf8_lossy(capture.stdout()).trim(),
+            "/dev/null"
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_completed_output_marks_output_limit_kill_as_truncated() {
+    fn test_completed_output_marks_output_limit_kill_as_truncated() -> TestResult {
         let executor = ShellExecutor {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             max_output_bytes: 16,
@@ -1744,12 +2018,17 @@ mod tests {
                 assert_eq!(content["truncated"], true);
                 assert_eq!(content["killed_by_output_limit"], true);
             }
-            other => panic!("expected Json output, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Json output, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_timeout_output_keeps_partial_output_within_budget() {
+    async fn test_timeout_output_keeps_partial_output_within_budget() -> TestResult {
         let executor = ShellExecutor {
             timeout_secs: 1,
             max_output_bytes: 8 + TRUNCATION_MARKER.len(),
@@ -1767,7 +2046,7 @@ mod tests {
         writer
             .write_all(b"partial-output-longer-than-budget")
             .await
-            .expect("write");
+            .map_err(ctx("write"))?;
         let mut capture = BoundedCapture::new(executor.max_output_bytes);
         let _ = tokio::time::timeout(
             Duration::from_millis(50),
@@ -1782,14 +2061,19 @@ mod tests {
                 assert!(message.contains("truncated: true"), "{message}");
                 assert!(!message.contains("longer-than-budget"), "{message}");
             }
-            other => panic!("expected Error output, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Error output, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_exec_invalid_limits_fail_closed_before_spawn() {
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+    async fn test_exec_invalid_limits_fail_closed_before_spawn() -> TestResult {
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let executor = ShellExecutor {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
@@ -1810,32 +2094,43 @@ mod tests {
             timeout_secs: None,
         };
 
-        match executor.run_command(&args, &sandbox, "test-session", None).await.expect("run") {
+        match executor
+            .run_command(&args, &sandbox, "test-session", None)
+            .await
+            .map_err(ctx("run"))?
+        {
             ToolOutput::Error { message } => {
                 assert!(message.contains("resource limits"), "{message}");
                 assert!(message.contains("nofile"), "{message}");
             }
-            other => panic!("invalid limits must not spawn, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "invalid limits must not spawn, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_exec_permission_denied() {
-        let tmp = make_temp_workspace();
+    async fn test_exec_permission_denied() -> TestResult {
+        let tmp = make_temp_workspace()?;
         // No ExecuteProcess permission
-        let sandbox = make_sandbox(&tmp, vec![Permission::ReadWorkspace]);
+        let sandbox = make_sandbox(&tmp, vec![Permission::ReadWorkspace])?;
         let ctx = make_ctx(sandbox);
         let call = make_call("echo should_not_run");
 
         let provider = ShellToolProvider::new();
         let executor = provider
             .executor(&ToolName::new(TOOL_NAME))
-            .expect("executor must be returned");
+            .ok_or(TestError::Missing("executor"))?;
 
         let output = executor
             .execute(&ctx, &call)
             .await
-            .expect("execute must not return Err even when denied");
+            .map_err(crate::test_support::ctx(
+                "execute must not return Err even when denied",
+            ))?;
 
         match output {
             ToolOutput::Error { message } => {
@@ -1844,8 +2139,13 @@ mod tests {
                     "denial message must mention the missing permission, got: {message:?}"
                 );
             }
-            other => panic!("expected Error output for denied permission, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Error output for denied permission, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     // ── Sandbox-Integrationstests (brauchen bwrap + prlimit + userns) ─────────
@@ -1894,7 +2194,7 @@ mod tests {
     macro_rules! sandbox_test {
         ($name:ident, $required:ident, $body:ident) => {
             #[tokio::test]
-            async fn $name() {
+            async fn $name() -> TestResult {
                 if !sandbox_runtime_available() {
                     eprintln!(
                         "übersprungen: {}: bwrap/prlimit/userns nicht startbar \
@@ -1902,38 +2202,42 @@ mod tests {
                         stringify!($name),
                         stringify!($required)
                     );
-                    return;
+                    return Ok(());
                 }
-                $body().await;
+                $body().await
             }
 
             #[tokio::test]
             #[ignore = "requires bwrap+userns"]
-            async fn $required() {
+            async fn $required() -> TestResult {
                 assert!(
                     sandbox_runtime_available(),
                     "bwrap+prlimit+userns müssen für diesen Test startbar sein"
                 );
-                $body().await;
+                $body().await
             }
         };
     }
 
-    async fn run_with(provider: &ShellToolProvider, call: &ToolCall) -> ToolOutput {
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+    async fn run_with(provider: &ShellToolProvider, call: &ToolCall) -> TestResult<ToolOutput> {
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ctx = make_ctx(sandbox);
         let executor = provider
             .executor(&ToolName::new(TOOL_NAME))
-            .expect("executor must be returned for shell.exec");
+            .ok_or(TestError::Missing("executor for shell.exec"))?;
         executor
             .execute(&ctx, call)
             .await
-            .expect("execute must not return Err")
+            .map_err(crate::test_support::ctx("execute must not return Err"))
     }
 
-    async fn echo_returns_stdout() {
-        let output = run_with(&ShellToolProvider::new(), &make_call("echo hello_from_shell")).await;
+    async fn echo_returns_stdout() -> TestResult {
+        let output = run_with(
+            &ShellToolProvider::new(),
+            &make_call("echo hello_from_shell"),
+        )
+        .await?;
 
         match output {
             ToolOutput::Json { content } => {
@@ -1949,8 +2253,13 @@ mod tests {
                 );
                 assert_eq!(content["killed_by_output_limit"], false);
             }
-            other => panic!("expected Json output, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Json output, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
     sandbox_test!(
         test_exec_echo_returns_stdout,
@@ -1958,7 +2267,7 @@ mod tests {
         echo_returns_stdout
     );
 
-    async fn timeout_reports_error_with_partial_output() {
+    async fn timeout_reports_error_with_partial_output() -> TestResult {
         // Provider with 1-second timeout; per-call override also 1s
         let provider = ShellToolProvider {
             timeout_secs: 1,
@@ -1975,7 +2284,7 @@ mod tests {
         let call = make_call_with_timeout("echo partial_before_timeout; sleep 5", 1);
         let started = std::time::Instant::now();
 
-        let output = run_with(&provider, &call).await;
+        let output = run_with(&provider, &call).await?;
 
         assert!(
             started.elapsed() < Duration::from_secs(4),
@@ -1992,8 +2301,13 @@ mod tests {
                     "partial output must survive the timeout, got: {message:?}"
                 );
             }
-            other => panic!("expected Error output for timeout, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Error output for timeout, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
     sandbox_test!(
         test_exec_timeout,
@@ -2001,16 +2315,21 @@ mod tests {
         timeout_reports_error_with_partial_output
     );
 
-    async fn nonzero_exit_is_reported() {
-        let output = run_with(&ShellToolProvider::new(), &make_call("false")).await;
+    async fn nonzero_exit_is_reported() -> TestResult {
+        let output = run_with(&ShellToolProvider::new(), &make_call("false")).await?;
 
         match output {
             ToolOutput::Json { content } => {
                 let exit_code = content["exit_code"].as_i64().unwrap_or(0);
                 assert_ne!(exit_code, 0, "false must return a nonzero exit code");
             }
-            other => panic!("expected Json output even for nonzero exit, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Json output even for nonzero exit, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
     sandbox_test!(
         test_exec_nonzero_exit,
@@ -2018,8 +2337,12 @@ mod tests {
         nonzero_exit_is_reported
     );
 
-    async fn stderr_is_captured() {
-        let output = run_with(&ShellToolProvider::new(), &make_call("echo error_output >&2")).await;
+    async fn stderr_is_captured() -> TestResult {
+        let output = run_with(
+            &ShellToolProvider::new(),
+            &make_call("echo error_output >&2"),
+        )
+        .await?;
 
         match output {
             ToolOutput::Json { content } => {
@@ -2029,8 +2352,13 @@ mod tests {
                     "stderr must be captured, got: {stderr:?}"
                 );
             }
-            other => panic!("expected Json output, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Json output, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
     sandbox_test!(
         test_exec_stderr_captured,
@@ -2038,7 +2366,7 @@ mod tests {
         stderr_is_captured
     );
 
-    async fn small_output_over_cap_is_truncated() {
+    async fn small_output_over_cap_is_truncated() -> TestResult {
         // The cap leaves room for a marker plus a truncated stdout prefix.
         let provider = ShellToolProvider {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
@@ -2055,7 +2383,7 @@ mod tests {
         // Generate more than the configured output cap.
         let call = make_call("echo 'this_is_a_longer_string_than_ten_bytes'");
 
-        match run_with(&provider, &call).await {
+        match run_with(&provider, &call).await? {
             ToolOutput::Json { content } => {
                 assert_eq!(
                     content["truncated"], true,
@@ -2067,8 +2395,13 @@ mod tests {
                     "truncation marker must appear in stdout, got: {stdout:?}"
                 );
             }
-            other => panic!("expected Json output, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Json output, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
     sandbox_test!(
         test_exec_output_truncation,
@@ -2076,7 +2409,7 @@ mod tests {
         small_output_over_cap_is_truncated
     );
 
-    async fn endless_output_is_capped_and_killed() {
+    async fn endless_output_is_capped_and_killed() -> TestResult {
         let provider = ShellToolProvider {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             max_output_bytes: 1024,
@@ -2091,7 +2424,7 @@ mod tests {
         };
         let started = std::time::Instant::now();
 
-        let output = run_with(&provider, &make_call("yes")).await;
+        let output = run_with(&provider, &make_call("yes")).await?;
 
         assert!(
             started.elapsed() < Duration::from_secs(DEFAULT_TIMEOUT_SECS / 2),
@@ -2106,8 +2439,13 @@ mod tests {
                 assert!(stdout.len() + stderr.len() <= 1024, "budget must hold");
                 assert!(stdout.starts_with("y\ny\n"), "got: {stdout:?}");
             }
-            other => panic!("expected Json output, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Json output, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
     sandbox_test!(
         test_exec_endless_output_is_capped_and_killed,
@@ -2115,7 +2453,7 @@ mod tests {
         endless_output_is_capped_and_killed
     );
 
-    async fn stdin_is_closed_inside_sandbox() {
+    async fn stdin_is_closed_inside_sandbox() -> TestResult {
         let provider = ShellToolProvider {
             timeout_secs: 10,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
@@ -2131,14 +2469,19 @@ mod tests {
         // Mit geerbtem Terminal-stdin würde `cat` bis zum Timeout blockieren.
         let call = make_call("cat; echo stdin_reached_eof");
 
-        match run_with(&provider, &call).await {
+        match run_with(&provider, &call).await? {
             ToolOutput::Json { content } => {
                 assert_eq!(content["exit_code"], 0);
                 let stdout = content["stdout"].as_str().unwrap_or("");
                 assert_eq!(stdout.trim(), "stdin_reached_eof");
             }
-            other => panic!("expected Json output, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Json output, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
     sandbox_test!(
         test_exec_stdin_is_closed,
@@ -2146,10 +2489,10 @@ mod tests {
         stdin_is_closed_inside_sandbox
     );
 
-    async fn rlimits_and_tmpfs_size_apply_inside_sandbox() {
+    async fn rlimits_and_tmpfs_size_apply_inside_sandbox() -> TestResult {
         let call = make_call("cat /proc/self/limits; df -B1 /tmp");
 
-        match run_with(&ShellToolProvider::new(), &call).await {
+        match run_with(&ShellToolProvider::new(), &call).await? {
             ToolOutput::Json { content } => {
                 assert_eq!(content["exit_code"], 0, "{content}");
                 let stdout = content["stdout"].as_str().unwrap_or("");
@@ -2164,21 +2507,30 @@ mod tests {
                     let line = stdout
                         .lines()
                         .find(|line| line.starts_with(label))
-                        .unwrap_or_else(|| panic!("missing limit line {label}: {stdout}"));
+                        .ok_or_else(|| {
+                            TestError::Unexpected(format!("missing limit line {label}: {stdout}"))
+                        })?;
                     let fields: Vec<&str> = line[label.len()..].split_whitespace().collect();
                     assert_eq!(fields[..2], [value, value], "soft=hard for {label}: {line}");
                 }
                 let tmpfs = stdout
                     .lines()
                     .find(|line| line.trim_end().ends_with("/tmp"))
-                    .unwrap_or_else(|| panic!("missing df line for /tmp: {stdout}"));
+                    .ok_or_else(|| {
+                        TestError::Unexpected(format!("missing df line for /tmp: {stdout}"))
+                    })?;
                 assert!(
                     tmpfs.split_whitespace().nth(1) == Some("268435456"),
                     "tmpfs /tmp must be limited to 256 MiB: {tmpfs}"
                 );
             }
-            other => panic!("expected Json output, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Json output, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
     sandbox_test!(
         test_exec_rlimits_and_tmpfs_size_apply,
@@ -2203,11 +2555,11 @@ mod tests {
         }
     }
 
-    async fn cancel_during_run_kills_process_and_returns_cancelled() {
+    async fn cancel_during_run_kills_process_and_returns_cancelled() -> TestResult {
         use harw_types::cancel::CancelReason;
 
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         // Long timeout so the timeout path can never win the race against cancel.
         let executor = plain_executor(30);
         let args = ShellExecArgs {
@@ -2225,7 +2577,9 @@ mod tests {
         let result = executor
             .run_command(&args, &sandbox, "cancel-session", Some(&cancel))
             .await;
-        canceller.await.expect("canceller task must not panic");
+        canceller
+            .await
+            .map_err(ctx("canceller task must not panic"))?;
 
         assert!(
             started.elapsed() < KILL_REAP_TIMEOUT + Duration::from_secs(5),
@@ -2238,6 +2592,7 @@ mod tests {
             "a cancelled run_command must return Err(ToolsError::Cancelled) instead of \
              a timeout ToolOutput, got: {result:?}"
         );
+        Ok(())
     }
     sandbox_test!(
         test_exec_cancel_kills_process_and_returns_cancelled,
@@ -2245,11 +2600,11 @@ mod tests {
         cancel_during_run_kills_process_and_returns_cancelled
     );
 
-    async fn cancel_none_behaves_exactly_as_before() {
+    async fn cancel_none_behaves_exactly_as_before() -> TestResult {
         // Regression guard: `cancel: None` must leave today's plain
         // `timeout_at`-only behavior untouched — no race, no `Cancelled` path.
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let executor = plain_executor(DEFAULT_TIMEOUT_SECS);
         let args = ShellExecArgs {
             command: "echo cancel_none_ok".to_owned(),
@@ -2259,8 +2614,9 @@ mod tests {
         match executor
             .run_command(&args, &sandbox, "no-cancel-session", None)
             .await
-            .expect("run_command must not return Err for a plain, uncancelled command")
-        {
+            .map_err(ctx(
+                "run_command must not return Err for a plain, uncancelled command",
+            ))? {
             ToolOutput::Json { content } => {
                 assert_eq!(content["exit_code"], 0, "echo must exit with 0");
                 let stdout = content["stdout"].as_str().unwrap_or("");
@@ -2269,10 +2625,13 @@ mod tests {
                     "stdout must contain echoed string, got: {stdout:?}"
                 );
             }
-            other => panic!(
-                "expected Json output for cancel=None, got: {other:?}"
-            ),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Json output for cancel=None, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
     sandbox_test!(
         test_exec_cancel_none_behaves_as_before,
@@ -2283,11 +2642,11 @@ mod tests {
     // ── Host-Pfad-Tests (Plan `recursive-cooking-lobster.md` Teil B1) ──────
 
     #[tokio::test]
-    async fn test_determine_effective_host_strict_without_registry_is_false() {
+    async fn test_determine_effective_host_strict_without_registry_is_false() -> TestResult {
         // Kein Registry angehängt: fällt auf den (unveränderten) bwrap-Pfad
         // zurück, unabhängig von der Sitzung.
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let executor = plain_executor(DEFAULT_TIMEOUT_SECS);
         let args = ShellExecArgs {
             command: "echo hi".to_owned(),
@@ -2297,16 +2656,18 @@ mod tests {
         let effective_host = executor
             .determine_effective_host(&args, &sandbox, "s1")
             .await
-            .expect("must not error without a registry");
+            .map_err(ctx("must not error without a registry"))?;
         assert!(!effective_host);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_determine_effective_host_strict_with_registry_but_no_approval_is_false() {
+    async fn test_determine_effective_host_strict_with_registry_but_no_approval_is_false()
+    -> TestResult {
         // Registry angehängt, aber weder Sitzungs- noch Einmalfreigabe für
         // diese Sitzung: bleibt beim bwrap-Pfad.
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let registry = Arc::new(HostPermitSessionRegistry::default());
         let mut executor = plain_executor(DEFAULT_TIMEOUT_SECS);
         executor.host_permit_registry = Some(Arc::clone(&registry));
@@ -2318,14 +2679,15 @@ mod tests {
         let effective_host = executor
             .determine_effective_host(&args, &sandbox, "s1")
             .await
-            .expect("must not error");
+            .map_err(ctx("must not error"))?;
         assert!(!effective_host);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_determine_effective_host_strict_with_session_lease_is_true() {
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+    async fn test_determine_effective_host_strict_with_session_lease_is_true() -> TestResult {
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let registry = Arc::new(HostPermitSessionRegistry::default());
         registry.mark_session_approved("s1", Duration::from_secs(60));
         let mut executor = plain_executor(DEFAULT_TIMEOUT_SECS);
@@ -2338,14 +2700,19 @@ mod tests {
         let effective_host = executor
             .determine_effective_host(&args, &sandbox, "s1")
             .await
-            .expect("must not error");
-        assert!(effective_host, "an active session lease must authorize the host path");
+            .map_err(ctx("must not error"))?;
+        assert!(
+            effective_host,
+            "an active session lease must authorize the host path"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_determine_effective_host_single_use_approval_is_consumed_exactly_once() {
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+    async fn test_determine_effective_host_single_use_approval_is_consumed_exactly_once()
+    -> TestResult {
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let registry = Arc::new(HostPermitSessionRegistry::default());
         registry.mark_single_use("s1".to_owned());
         let mut executor = plain_executor(DEFAULT_TIMEOUT_SECS);
@@ -2358,27 +2725,32 @@ mod tests {
         let first = executor
             .determine_effective_host(&args, &sandbox, "s1")
             .await
-            .expect("must not error");
-        assert!(first, "the pending single-use approval must authorize the first call");
+            .map_err(ctx("must not error"))?;
+        assert!(
+            first,
+            "the pending single-use approval must authorize the first call"
+        );
 
         let second = executor
             .determine_effective_host(&args, &sandbox, "s1")
             .await
-            .expect("must not error");
+            .map_err(ctx("must not error"))?;
         assert!(
             !second,
             "a single-use approval must be consumed after exactly one call"
         );
         assert!(!registry.has_single_use("s1"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_determine_effective_host_session_lease_preserves_pending_single_use() {
+    async fn test_determine_effective_host_session_lease_preserves_pending_single_use() -> TestResult
+    {
         // Vertrag: eine Einmal-Freigabe wird nur verbraucht, wenn keine
         // Sitzungsfreigabe besteht — die Sitzungsfreigabe muss also Vortritt
         // haben, ohne die Einmal-Freigabe anzutasten.
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let registry = Arc::new(HostPermitSessionRegistry::default());
         registry.mark_session_approved("s1", Duration::from_secs(60));
         registry.mark_single_use("s1".to_owned());
@@ -2392,23 +2764,24 @@ mod tests {
         let effective_host = executor
             .determine_effective_host(&args, &sandbox, "s1")
             .await
-            .expect("must not error");
+            .map_err(ctx("must not error"))?;
         assert!(effective_host);
         assert!(
             registry.has_single_use("s1"),
             "a session lease must satisfy the call without consuming a pending single-use approval"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_strict_profile_with_session_lease_runs_directly_on_the_host() {
+    async fn test_strict_profile_with_session_lease_runs_directly_on_the_host() -> TestResult {
         // Kein `sandbox_test!`-Guard nötig: der Host-Pfad läuft nie über
         // bwrap, muss also auch ohne installiertes bwrap erfolgreich sein —
         // das allein ist hier schon ein Beleg, dass tatsächlich der
         // Host-Pfad lief (bwrap setzt HOME immer fest auf `/tmp/home`, siehe
         // unten für den expliziten Gegen-Test).
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ctx = make_ctx(sandbox);
         let call = make_call("pwd");
 
@@ -2420,38 +2793,44 @@ mod tests {
             .with_host_permit_registry(Arc::clone(&registry));
         let executor = provider
             .executor(&ToolName::new(TOOL_NAME))
-            .expect("executor must be returned");
+            .ok_or(TestError::Missing("executor"))?;
 
         let output = executor
             .execute(&ctx, &call)
             .await
-            .expect("execute must not return Err");
+            .map_err(crate::test_support::ctx("execute must not return Err"))?;
 
         match output {
             ToolOutput::Json { content } => {
-                assert_eq!(content["exit_code"], 0, "pwd must succeed on the host, got: {content}");
+                assert_eq!(
+                    content["exit_code"], 0,
+                    "pwd must succeed on the host, got: {content}"
+                );
                 assert_eq!(
                     content["executed_on"], "host",
                     "the JSON output must mark this call as host-executed: {content}"
                 );
                 let stdout = content["stdout"].as_str().unwrap_or("").trim();
-                let expected = sandbox_root(&tmp);
+                let expected = sandbox_root(&tmp)?;
                 assert_eq!(
                     Path::new(stdout),
                     expected.as_path(),
                     "pwd must report the sandbox's canonical workspace root as cwd"
                 );
             }
-            other => panic!(
-                "expected Json output for host execution via session lease, got: {other:?}"
-            ),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Json output for host execution via session lease, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_strict_profile_single_use_approval_runs_on_host_exactly_once() {
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+    async fn test_strict_profile_single_use_approval_runs_on_host_exactly_once() -> TestResult {
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ctx = make_ctx(sandbox);
         let call = make_call("echo single_use_ok");
 
@@ -2463,18 +2842,22 @@ mod tests {
             .with_host_permit_registry(Arc::clone(&registry));
         let executor = provider
             .executor(&ToolName::new(TOOL_NAME))
-            .expect("executor must be returned");
+            .ok_or(TestError::Missing("executor"))?;
 
         let first = executor
             .execute(&ctx, &call)
             .await
-            .expect("execute must not return Err");
+            .map_err(crate::test_support::ctx("execute must not return Err"))?;
         match first {
             ToolOutput::Json { content } => {
                 assert_eq!(content["exit_code"], 0, "{content}");
                 assert_eq!(content["executed_on"], "host", "{content}");
             }
-            other => panic!("expected Json output for the single-use host call, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Json output for the single-use host call, got: {other:?}"
+                )));
+            }
         }
         assert!(
             !registry.has_single_use(ctx.session_id().as_str()),
@@ -2488,16 +2871,17 @@ mod tests {
         let second = executor
             .execute(&ctx, &call)
             .await
-            .expect("execute must not return Err");
+            .map_err(crate::test_support::ctx("execute must not return Err"))?;
         if let ToolOutput::Json { content } = second {
             assert!(
                 content.get("executed_on").is_none(),
                 "the single-use approval must not still authorize a second host call: {content}"
             );
         }
+        Ok(())
     }
 
-    async fn strict_without_any_approval_runs_via_bwrap() {
+    async fn strict_without_any_approval_runs_via_bwrap() -> TestResult {
         // Ohne jede Registry-Freigabe bleibt Strict beim unveränderten
         // bwrap-Pfad: bwrap setzt `HOME` in jedem Fall fest auf `/tmp/home`
         // (siehe `harw_sandbox::bwrap`), was der echte Host-`$HOME` so gut
@@ -2507,7 +2891,7 @@ mod tests {
             &ShellToolProvider::new().with_sandbox_profile(SandboxProfile::Strict),
             &make_call("echo $HOME"),
         )
-        .await;
+        .await?;
 
         match output {
             ToolOutput::Json { content } => {
@@ -2523,10 +2907,13 @@ mod tests {
                      got: {stdout:?}"
                 );
             }
-            other => panic!(
-                "expected Json output for strict profile without approval, got: {other:?}"
-            ),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Json output for strict profile without approval, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
     sandbox_test!(
         test_exec_strict_without_any_approval_runs_via_bwrap,
@@ -2537,22 +2924,21 @@ mod tests {
     // ── Permit-/Profil-Tests ───────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_host_profile_without_ledger_is_denied() {
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+    async fn test_host_profile_without_ledger_is_denied() -> TestResult {
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ctx = make_ctx(sandbox);
         let call = make_call("echo should_not_run");
 
-        let provider = ShellToolProvider::default()
-            .with_sandbox_profile(SandboxProfile::Host);
+        let provider = ShellToolProvider::default().with_sandbox_profile(SandboxProfile::Host);
         let executor = provider
             .executor(&ToolName::new(TOOL_NAME))
-            .expect("executor must be returned");
+            .ok_or(TestError::Missing("executor"))?;
 
         let output = executor
             .execute(&ctx, &call)
             .await
-            .expect("execute must not return Err");
+            .map_err(crate::test_support::ctx("execute must not return Err"))?;
 
         match output {
             ToolOutput::Error { message } => {
@@ -2561,16 +2947,21 @@ mod tests {
                     "expected permit denial, got: {message:?}"
                 );
             }
-            other => panic!("expected Error output for host without ledger, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Error output for host without ledger, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_host_profile_with_ledger_but_without_session_approval_is_denied() {
+    async fn test_host_profile_with_ledger_but_without_session_approval_is_denied() -> TestResult {
         // Ledger und Registry sind konfiguriert, aber die Sitzung hat der
         // lokalen UI noch nicht zugestimmt: fail-closed.
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ctx = make_ctx(sandbox);
         let call = make_call("echo should_not_run");
 
@@ -2582,12 +2973,12 @@ mod tests {
             .with_host_permit_registry(registry);
         let executor = provider
             .executor(&ToolName::new(TOOL_NAME))
-            .expect("executor must be returned");
+            .ok_or(TestError::Missing("executor"))?;
 
         let output = executor
             .execute(&ctx, &call)
             .await
-            .expect("execute must not return Err");
+            .map_err(crate::test_support::ctx("execute must not return Err"))?;
 
         match output {
             ToolOutput::Error { message } => {
@@ -2596,18 +2987,23 @@ mod tests {
                     "expected local-approval denial, got: {message:?}"
                 );
             }
-            other => panic!("expected Error output without session approval, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Error output without session approval, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_host_profile_with_session_approval_authorizes_via_real_ledger() {
+    async fn test_host_profile_with_session_approval_authorizes_via_real_ledger() -> TestResult {
         // Nach einer (simulierten) lokalen UI-Zustimmung für die Sitzung muss
         // `authorize_host_command` tatsächlich über den echten Ledger einen
         // neuen Permit ausstellen und autorisieren, statt nur dessen
         // Existenz zu prüfen.
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ctx = make_ctx(sandbox);
         let call = make_call("echo host_ok");
 
@@ -2621,12 +3017,12 @@ mod tests {
             .with_host_permit_registry(Arc::clone(&registry));
         let executor = provider
             .executor(&ToolName::new(TOOL_NAME))
-            .expect("executor must be returned");
+            .ok_or(TestError::Missing("executor"))?;
 
         let output = executor
             .execute(&ctx, &call)
             .await
-            .expect("execute must not return Err");
+            .map_err(crate::test_support::ctx("execute must not return Err"))?;
 
         // Die Permit-Prüfung muss durchlaufen sein: eine verbleibende
         // Fehlermeldung darf nur noch vom fehlenden Bubblewrap-Binary in der
@@ -2648,46 +3044,46 @@ mod tests {
             session: ctx.session_id().as_str().to_owned(),
             worker_definition: HOST_WORKER_DEFINITION.to_owned(),
             command: "echo host_ok".to_owned(),
-            workspace: sandbox_root(&tmp),
+            workspace: sandbox_root(&tmp)?,
             environment: ProcessEnvironment::LocalHost,
         };
         let remembered_id = registry
             .lookup_permit(&request)
-            .expect("permit must have been remembered after issuance");
+            .ok_or(TestError::Missing("permit remembered after issuance"))?;
         assert!(ledger.authorize(remembered_id, &request).is_ok());
+        Ok(())
     }
 
     // Baut denselben kanonischen Workspace-Pfad wie `make_sandbox`, damit der
     // in einem Test unabhängig zusammengesetzte `ProcessPermitRequest` genau
     // dem entspricht, den `authorize_host_command` tatsächlich verwendet.
-    fn sandbox_root(dir: &TempDir) -> PathBuf {
+    fn sandbox_root(dir: &TempDir) -> TestResult<PathBuf> {
         dir.path()
             .join("project")
             .canonicalize()
-            .expect("project subdir must be canonicalizable")
+            .map_err(ctx("project subdir must be canonicalizable"))
     }
 
     #[tokio::test]
-    async fn test_strict_profile_without_ledger_still_works() {
+    async fn test_strict_profile_without_ledger_still_works() -> TestResult {
         // Strict-Profil ohne Ledger: Sandbox ist die Grenze, nicht der Permit.
         // Dies darf nicht fehlschlagen, weil der Ledger fehlt.
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ctx = make_ctx(sandbox);
         let call = make_call("echo strict_mode_ok");
 
-        let provider = ShellToolProvider::default()
-            .with_sandbox_profile(SandboxProfile::Strict);
+        let provider = ShellToolProvider::default().with_sandbox_profile(SandboxProfile::Strict);
         let executor = provider
             .executor(&ToolName::new(TOOL_NAME))
-            .expect("executor must be returned");
+            .ok_or(TestError::Missing("executor"))?;
 
         // Wir prüfen nur, dass nicht mit einem Permit-Fehler abgelehnt wird;
         // ein Sandbox-Setup-Fehler (kein bwrap) ist hier nicht der Punkt.
         let output = executor
             .execute(&ctx, &call)
             .await
-            .expect("execute must not return Err");
+            .map_err(crate::test_support::ctx("execute must not return Err"))?;
 
         // Die Ausgabe darf eine Sandbox-Fehlermeldung sein, aber keine
         // Permit-Fehlermeldung.
@@ -2700,12 +3096,12 @@ mod tests {
             }
             ToolOutput::Json { .. } | ToolOutput::Text { .. } => {}
         }
+        Ok(())
     }
 
     #[test]
     fn test_provider_with_sandbox_profile_builder() {
-        let provider = ShellToolProvider::default()
-            .with_sandbox_profile(SandboxProfile::Strict);
+        let provider = ShellToolProvider::default().with_sandbox_profile(SandboxProfile::Strict);
         assert!(provider.sandbox_profile.is_strict());
         assert!(provider.permit_ledger.is_none());
     }
@@ -2713,8 +3109,7 @@ mod tests {
     #[test]
     fn test_provider_with_permit_ledger_builder() {
         let ledger = Arc::new(ProcessPermitLedger::default());
-        let provider = ShellToolProvider::default()
-            .with_permit_ledger(ledger);
+        let provider = ShellToolProvider::default().with_permit_ledger(ledger);
         assert!(provider.permit_ledger.is_some());
     }
 
@@ -2746,13 +3141,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_authorize_host_command_reuses_remembered_permit_after_session_approval_expires() {
+    async fn test_authorize_host_command_reuses_remembered_permit_after_session_approval_expires()
+    -> TestResult {
         // Die Sitzungszustimmung selbst darf verfallen (kurze TTL), ohne dass
         // ein bereits ausgestellter, gemerkter Permit für exakt denselben
         // Antrag verloren geht: `authorize_host_command` prüft `lookup_permit`
         // zuerst und braucht dann keine erneute Zustimmung.
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ledger = Arc::new(ProcessPermitLedger::default());
         let registry = Arc::new(HostPermitSessionRegistry::default());
         registry.mark_session_approved("s1", Duration::from_millis(20));
@@ -2761,7 +3157,10 @@ mod tests {
         let args = args_for("echo repeat_me");
 
         assert!(
-            executor.authorize_host_command(&args, &sandbox, "s1").await.is_ok(),
+            executor
+                .authorize_host_command(&args, &sandbox, "s1")
+                .await
+                .is_ok(),
             "first call must succeed via a fresh local-approval issuance"
         );
 
@@ -2772,19 +3171,24 @@ mod tests {
         );
 
         assert!(
-            executor.authorize_host_command(&args, &sandbox, "s1").await.is_ok(),
+            executor
+                .authorize_host_command(&args, &sandbox, "s1")
+                .await
+                .is_ok(),
             "an identical repeated request must succeed via the remembered permit, \
              without requiring a fresh session approval"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_authorize_host_command_different_commands_same_session_both_succeed() {
+    async fn test_authorize_host_command_different_commands_same_session_both_succeed() -> TestResult
+    {
         // Eine einmalige Sitzungszustimmung deckt beliebig viele
         // *unterschiedliche* Befehlstexte derselben Sitzung ab; jeder bekommt
         // seinen eigenen, getrennt gemerkten Permit.
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ledger = Arc::new(ProcessPermitLedger::default());
         let registry = Arc::new(HostPermitSessionRegistry::default());
         registry.mark_session_approved("s1", Duration::from_secs(60));
@@ -2793,41 +3197,53 @@ mod tests {
         let first = args_for("echo first_command");
         let second = args_for("echo second_command");
 
-        assert!(executor.authorize_host_command(&first, &sandbox, "s1").await.is_ok());
-        assert!(executor.authorize_host_command(&second, &sandbox, "s1").await.is_ok());
+        assert!(
+            executor
+                .authorize_host_command(&first, &sandbox, "s1")
+                .await
+                .is_ok()
+        );
+        assert!(
+            executor
+                .authorize_host_command(&second, &sandbox, "s1")
+                .await
+                .is_ok()
+        );
 
         let first_request = ProcessPermitRequest {
             session: "s1".to_owned(),
             worker_definition: HOST_WORKER_DEFINITION.to_owned(),
             command: first.command.clone(),
-            workspace: sandbox_root(&tmp),
+            workspace: sandbox_root(&tmp)?,
             environment: ProcessEnvironment::LocalHost,
         };
         let second_request = ProcessPermitRequest {
             session: "s1".to_owned(),
             worker_definition: HOST_WORKER_DEFINITION.to_owned(),
             command: second.command.clone(),
-            workspace: sandbox_root(&tmp),
+            workspace: sandbox_root(&tmp)?,
             environment: ProcessEnvironment::LocalHost,
         };
         let first_id = registry
             .lookup_permit(&first_request)
-            .expect("first command must have a remembered permit");
+            .ok_or(TestError::Missing("first command permit"))?;
         let second_id = registry
             .lookup_permit(&second_request)
-            .expect("second command must have a remembered permit");
+            .ok_or(TestError::Missing("second command permit"))?;
         assert_ne!(
             first_id, second_id,
             "distinct command texts must remember distinct permit ids"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_authorize_host_command_different_session_does_not_reuse_remembered_permit() {
+    async fn test_authorize_host_command_different_session_does_not_reuse_remembered_permit()
+    -> TestResult {
         // Ein für Sitzung `s1` gemerkter Permit darf nicht für eine andere
         // Sitzung `s2` gefunden werden, selbst bei identischem Befehlstext.
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ledger = Arc::new(ProcessPermitLedger::default());
         let registry = Arc::new(HostPermitSessionRegistry::default());
         registry.mark_session_approved("s1", Duration::from_secs(60));
@@ -2835,23 +3251,29 @@ mod tests {
         let executor = host_executor(&ledger, &registry);
         let args = args_for("echo shared_command_text");
 
-        assert!(executor.authorize_host_command(&args, &sandbox, "s1").await.is_ok());
+        assert!(
+            executor
+                .authorize_host_command(&args, &sandbox, "s1")
+                .await
+                .is_ok()
+        );
 
         let result = executor.authorize_host_command(&args, &sandbox, "s2").await;
         assert!(
             result.is_err(),
             "session s2 has no approval and must not benefit from session s1's remembered permit"
         );
+        Ok(())
     }
 
     // ── authorize_host_command: neue Frage über den Fragekanal ─────────────
 
     #[tokio::test]
-    async fn test_authorize_host_command_prompts_and_grants_single_execution() {
+    async fn test_authorize_host_command_prompts_and_grants_single_execution() -> TestResult {
         // Weder gemerkter Permit noch Sitzungsphase, aber ein Kanal ist
         // angehängt: die Anfrage muss fragen und bei Zustimmung durchgehen.
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ledger = Arc::new(ProcessPermitLedger::default());
         let registry = Arc::new(HostPermitSessionRegistry::default());
         let (sender, mut receiver) = crate::host_permit_prompt::host_permit_prompt_channel();
@@ -2861,27 +3283,38 @@ mod tests {
         let args = args_for("echo prompted_ok");
 
         let responder = tokio::spawn(async move {
-            let prompt = receiver.recv().await.expect("prompt must arrive");
+            let prompt = receiver.recv().await.ok_or(TestError::Missing("prompt"))?;
             assert_eq!(prompt.session(), "s1");
             assert_eq!(prompt.command(), "echo prompted_ok");
-            assert_eq!(prompt.preselected_variant(), HostPermitVariant::SingleExecution);
+            assert_eq!(
+                prompt.preselected_variant(),
+                HostPermitVariant::SingleExecution
+            );
             assert!(prompt.approve(HostPermitVariant::SingleExecution));
+            Ok::<(), TestError>(())
         });
 
         let result = executor.authorize_host_command(&args, &sandbox, "s1").await;
-        responder.await.expect("responder task must not panic");
+        responder
+            .await
+            .map_err(ctx("responder task must not panic"))??;
 
-        assert!(result.is_ok(), "an approved prompt must authorize the command: {result:?}");
+        assert!(
+            result.is_ok(),
+            "an approved prompt must authorize the command: {result:?}"
+        );
         assert!(
             !registry.is_session_approved("s1"),
             "a single-execution approval must never open a session-wide phase"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_authorize_host_command_prompts_and_session_lease_covers_next_call() {
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+    async fn test_authorize_host_command_prompts_and_session_lease_covers_next_call() -> TestResult
+    {
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ledger = Arc::new(ProcessPermitLedger::default());
         let registry = Arc::new(HostPermitSessionRegistry::default());
         let (sender, mut receiver) = crate::host_permit_prompt::host_permit_prompt_channel();
@@ -2892,23 +3325,37 @@ mod tests {
         let second = args_for("echo second");
 
         let responder = tokio::spawn(async move {
-            let prompt = receiver.recv().await.expect("prompt must arrive");
+            let prompt = receiver.recv().await.ok_or(TestError::Missing("prompt"))?;
             assert!(prompt.approve(HostPermitVariant::SessionLease));
+            Ok::<(), TestError>(())
         });
 
-        assert!(executor.authorize_host_command(&first, &sandbox, "s1").await.is_ok());
-        responder.await.expect("responder task must not panic");
+        assert!(
+            executor
+                .authorize_host_command(&first, &sandbox, "s1")
+                .await
+                .is_ok()
+        );
+        responder
+            .await
+            .map_err(ctx("responder task must not panic"))??;
         assert!(registry.is_session_approved("s1"));
 
         // Der zweite, abweichende Befehl derselben Sitzung darf ohne erneute
         // Frage durchgehen — die Phase wurde bereits eingetragen.
-        assert!(executor.authorize_host_command(&second, &sandbox, "s1").await.is_ok());
+        assert!(
+            executor
+                .authorize_host_command(&second, &sandbox, "s1")
+                .await
+                .is_ok()
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_authorize_host_command_prompt_denial_fails_closed() {
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+    async fn test_authorize_host_command_prompt_denial_fails_closed() -> TestResult {
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ledger = Arc::new(ProcessPermitLedger::default());
         let registry = Arc::new(HostPermitSessionRegistry::default());
         let (sender, mut receiver) = crate::host_permit_prompt::host_permit_prompt_channel();
@@ -2918,21 +3365,23 @@ mod tests {
         let args = args_for("rm -rf /");
 
         tokio::spawn(async move {
-            let prompt = receiver.recv().await.expect("prompt must arrive");
-            assert!(prompt.deny());
+            if let Some(prompt) = receiver.recv().await {
+                assert!(prompt.deny());
+            }
         });
 
         let result = executor.authorize_host_command(&args, &sandbox, "s1").await;
         assert!(result.is_err(), "an explicit denial must fail closed");
         assert!(!registry.is_session_approved("s1"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_authorize_host_command_without_any_channel_fails_closed() {
+    async fn test_authorize_host_command_without_any_channel_fails_closed() -> TestResult {
         // Kein Ledger/Registry-Zustand und kein Fragekanal: fail-closed ohne
         // dass je etwas gesendet wird (kein Empfänger existiert überhaupt).
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ledger = Arc::new(ProcessPermitLedger::default());
         let registry = Arc::new(HostPermitSessionRegistry::default());
         let executor = host_executor(&ledger, &registry);
@@ -2943,12 +3392,13 @@ mod tests {
             result.is_err_and(|message| message.contains("requires local UI approval")),
             "no channel attached must fail closed with the UI-approval message"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_authorize_host_command_dropped_prompt_fails_closed() {
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+    async fn test_authorize_host_command_dropped_prompt_fails_closed() -> TestResult {
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ledger = Arc::new(ProcessPermitLedger::default());
         let registry = Arc::new(HostPermitSessionRegistry::default());
         let (sender, mut receiver) = crate::host_permit_prompt::host_permit_prompt_channel();
@@ -2958,18 +3408,20 @@ mod tests {
         let args = args_for("echo should_not_run");
 
         tokio::spawn(async move {
-            let _prompt = receiver.recv().await.expect("prompt must arrive");
-            // Bewusst ohne Antwort fallengelassen.
+            if let Some(_prompt) = receiver.recv().await {
+                // Bewusst ohne Antwort fallengelassen.
+            }
         });
 
         let result = executor.authorize_host_command(&args, &sandbox, "s1").await;
         assert!(result.is_err(), "a dropped prompt must fail closed");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_authorize_host_command_timeout_fails_closed() {
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+    async fn test_authorize_host_command_timeout_fails_closed() -> TestResult {
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ledger = Arc::new(ProcessPermitLedger::default());
         let registry = Arc::new(HostPermitSessionRegistry::default());
         let (sender, mut receiver) = crate::host_permit_prompt::host_permit_prompt_channel();
@@ -2980,19 +3432,21 @@ mod tests {
         let args = args_for("echo should_not_run");
 
         let _keep_open = tokio::spawn(async move {
-            let prompt = receiver.recv().await.expect("prompt must arrive");
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            drop(prompt);
+            if let Some(prompt) = receiver.recv().await {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                drop(prompt);
+            }
         });
 
         let result = executor.authorize_host_command(&args, &sandbox, "s1").await;
         assert!(result.is_err(), "an elapsed timeout must fail closed");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_authorize_host_command_closed_channel_fails_closed() {
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+    async fn test_authorize_host_command_closed_channel_fails_closed() -> TestResult {
+        let tmp = make_temp_workspace()?;
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess])?;
         let ledger = Arc::new(ProcessPermitLedger::default());
         let registry = Arc::new(HostPermitSessionRegistry::default());
         let (sender, receiver) = crate::host_permit_prompt::host_permit_prompt_channel();
@@ -3007,5 +3461,6 @@ mod tests {
             result.is_err_and(|message| message.contains("requires local UI approval")),
             "a closed receiver must fail closed with the UI-approval message"
         );
+        Ok(())
     }
 }

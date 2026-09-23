@@ -69,18 +69,18 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use harw_authority::{AuthorityError, SandboxSpec, WorkspaceBinding, WorkspaceRegistry};
 use harw_job_runtime::{
     Budget, BudgetKind, Job, JobKind, JobRuntimeError, JobScope, RetryPolicy, StoredJob,
 };
-use harw_authority::{AuthorityError, SandboxSpec, WorkspaceBinding, WorkspaceRegistry};
 use harw_sandbox::SandboxError;
 use harw_session_store::{JobStore, SessionStoreError};
 use harw_types::{ApprovalActor, ContentDigest, TenantId, WorkId, WorkspaceId};
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::{Notify, oneshot};
 use tracing::{debug, info, warn};
-use tokio::sync::{oneshot, Notify};
 
 /// Maximum length of an [`IdempotencyKey`] in bytes.
 pub const IDEMPOTENCY_KEY_MAX_LEN: usize = 128;
@@ -184,9 +184,7 @@ impl IdempotencyKey {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
         {
-            return Err(JobAdmissionError::InvalidIdempotencyKey {
-                length: raw.len(),
-            });
+            return Err(JobAdmissionError::InvalidIdempotencyKey { length: raw.len() });
         }
         Ok(Self(raw.to_owned()))
     }
@@ -404,7 +402,8 @@ impl<P: JobAdmissionPolicy> JobAdmissionService<P> {
 
         let id = match &options.idempotency_key {
             Some(key) => {
-                let id = idempotent_work_id(scope.tenant(), scope.workspace(), scope.submitter(), key);
+                let id =
+                    idempotent_work_id(scope.tenant(), scope.workspace(), scope.submitter(), key);
                 match self.store.get(&id) {
                     Ok(existing) => {
                         return duplicate_of(existing, &scope, &resolved.kind, &task);
@@ -419,7 +418,13 @@ impl<P: JobAdmissionPolicy> JobAdmissionService<P> {
         let limiter_key = (context.tenant().clone(), context.submitter().clone());
         self.limiter.try_acquire(&limiter_key, now)?;
 
-        let mut job = Job::new(id.clone(), resolved.kind.clone(), budget, resolved.retry, now);
+        let mut job = Job::new(
+            id.clone(),
+            resolved.kind.clone(),
+            budget,
+            resolved.retry,
+            now,
+        );
         if let Err(error) = job.mark_ready(now) {
             self.limiter.release(&limiter_key, now);
             return Err(error.into());
@@ -446,7 +451,9 @@ impl<P: JobAdmissionPolicy> JobAdmissionService<P> {
                     disposition: AdmissionDisposition::Admitted,
                 })
             }
-            Err(SessionStoreError::JobAlreadyExists { .. }) if options.idempotency_key.is_some() => {
+            Err(SessionStoreError::JobAlreadyExists { .. })
+                if options.idempotency_key.is_some() =>
+            {
                 // Lost a race against an identical concurrent submission.
                 self.limiter.release(&limiter_key, now);
                 let existing = self.store.get(&id)?;
@@ -562,7 +569,12 @@ impl<P: JobAdmissionPolicy + 'static> JobAdmissionService<P> {
                     let outcome = loop {
                         service.limiter.wait_before_retry(last_retry_after).await;
                         let attempt = service
-                            .submit_async(intent.clone(), options.clone(), context.clone(), Timestamp::now())
+                            .submit_async(
+                                intent.clone(),
+                                options.clone(),
+                                context.clone(),
+                                Timestamp::now(),
+                            )
                             .await;
                         match attempt {
                             Err(JobAdmissionError::RateLimited { retry_after }) => {
@@ -635,7 +647,10 @@ fn effective_budget(
     let Some(requested) = requested else {
         return Ok(ceiling.clone());
     };
-    if requested.max_wall.is_some_and(|wall| wall <= SignedDuration::ZERO) {
+    if requested
+        .max_wall
+        .is_some_and(|wall| wall <= SignedDuration::ZERO)
+    {
         return Err(JobAdmissionError::InvalidBudget {
             kind: BudgetKind::WallTime,
         });
@@ -870,7 +885,10 @@ impl fmt::Display for JobAdmissionError {
             }
             Self::InvalidBudget { kind } => write!(f, "requested {kind:?} budget must be positive"),
             Self::RateLimited { retry_after } => {
-                write!(f, "submission rate limit reached; retry after {retry_after}")
+                write!(
+                    f,
+                    "submission rate limit reached; retry after {retry_after}"
+                )
             }
             Self::LimiterUnavailable => f.write_str("submission rate limiter is unavailable"),
             Self::JobRuntime(v) => write!(f, "job could not be made ready: {v}"),
@@ -918,6 +936,7 @@ impl From<JobRuntimeError> for JobAdmissionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_authority::{PermissionSet, WorkspaceRegistration};
     use harw_types::{ChannelId, PeerId};
     use std::path::Path;
@@ -948,7 +967,7 @@ mod tests {
         }
     }
 
-    fn service_with(root: &Path, ceiling: Budget) -> JobAdmissionService<Policy> {
+    fn service_with(root: &Path, ceiling: Budget) -> TestResult<JobAdmissionService<Policy>> {
         let tenant = TenantId::from_str("tenant");
         let workspace = WorkspaceId::from_str("safe");
         let registry = WorkspaceRegistry::build(
@@ -959,15 +978,15 @@ mod tests {
                 root: root.to_path_buf(),
             }],
         )
-        .expect("registry");
-        JobAdmissionService::new(
+        .map_err(ctx("registry"))?;
+        Ok(JobAdmissionService::new(
             Arc::new(JobStore::new(root)),
             Arc::new(registry),
             Policy { ceiling },
-        )
+        ))
     }
 
-    fn service(root: &Path) -> JobAdmissionService<Policy> {
+    fn service(root: &Path) -> TestResult<JobAdmissionService<Policy>> {
         service_with(root, Budget::unbounded())
     }
 
@@ -995,11 +1014,11 @@ mod tests {
         }
     }
 
-    fn keyed(key: &str) -> SubmitOptions {
-        SubmitOptions {
-            idempotency_key: Some(IdempotencyKey::parse(key).expect("valid key")),
+    fn keyed(key: &str) -> TestResult<SubmitOptions> {
+        Ok(SubmitOptions {
+            idempotency_key: Some(IdempotencyKey::parse(key).map_err(ctx("valid key"))?),
             requested_budget: None,
-        }
+        })
     }
 
     #[test]
@@ -1011,38 +1030,49 @@ mod tests {
     }
 
     #[test]
-    fn admission_generates_identity_and_scope() {
-        let root = tempdir().expect("tempdir");
-        let record = service(root.path())
+    fn admission_generates_identity_and_scope() -> TestResult {
+        let root = tempdir().map_err(ctx("tempdir"))?;
+        let record = service(root.path())?
             .admit(
                 intent(serde_json::json!({"prompt":"hi"})),
                 &context(),
                 Timestamp::now(),
             )
-            .expect("admit");
+            .map_err(ctx("admit"))?;
         assert!(!record.job.id.as_str().is_empty());
         assert_eq!(record.scope.tenant().as_str(), "tenant");
         assert_eq!(record.scope.workspace().as_str(), "safe");
+        Ok(())
     }
 
     #[test]
-    fn test_submit_persists_ready_job() {
-        let root = tempdir().expect("tempdir");
-        let svc = service(root.path());
+    fn test_submit_persists_ready_job() -> TestResult {
+        let root = tempdir().map_err(ctx("tempdir"))?;
+        let svc = service(root.path())?;
         let outcome = svc
-            .submit(intent(Value::Null), &SubmitOptions::default(), &context(), Timestamp::now())
-            .expect("submit");
+            .submit(
+                intent(Value::Null),
+                &SubmitOptions::default(),
+                &context(),
+                Timestamp::now(),
+            )
+            .map_err(ctx("submit"))?;
         assert_eq!(outcome.disposition, AdmissionDisposition::Admitted);
         assert_eq!(
-            svc.store().get(&outcome.record.job.id).expect("stored").job.state,
+            svc.store()
+                .get(&outcome.record.job.id)
+                .map_err(ctx("stored"))?
+                .job
+                .state,
             harw_job_runtime::JobState::Ready
         );
+        Ok(())
     }
 
     #[test]
-    fn traversal_and_nested_authority_are_rejected() {
-        let root = tempdir().expect("tempdir");
-        let svc = service(root.path());
+    fn traversal_and_nested_authority_are_rejected() -> TestResult {
+        let root = tempdir().map_err(ctx("tempdir"))?;
+        let svc = service(root.path())?;
         assert!(matches!(
             svc.admit(
                 JobIntent {
@@ -1078,40 +1108,70 @@ mod tests {
             // job is still refused — only the error taxonomy moved.
             Err(JobAdmissionError::Workspace(_))
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_submit_same_idempotency_key_returns_same_job() {
-        let root = tempdir().expect("tempdir");
-        let svc = service(root.path());
+    fn test_submit_same_idempotency_key_returns_same_job() -> TestResult {
+        let root = tempdir().map_err(ctx("tempdir"))?;
+        let svc = service(root.path())?;
         let task = serde_json::json!({"prompt": "same"});
         let first = svc
-            .submit(intent(task.clone()), &keyed("node-1"), &context(), Timestamp::now())
-            .expect("first submit");
+            .submit(
+                intent(task.clone()),
+                &keyed("node-1")?,
+                &context(),
+                Timestamp::now(),
+            )
+            .map_err(ctx("first submit"))?;
         let second = svc
-            .submit(intent(task), &keyed("node-1"), &context(), Timestamp::now())
-            .expect("second submit");
+            .submit(
+                intent(task),
+                &keyed("node-1")?,
+                &context(),
+                Timestamp::now(),
+            )
+            .map_err(ctx("second submit"))?;
         assert_eq!(first.disposition, AdmissionDisposition::Admitted);
         assert_eq!(second.disposition, AdmissionDisposition::Duplicate);
         assert_eq!(first.record.job.id, second.record.job.id);
-        assert!(first.record.job.id.as_str().starts_with(IDEMPOTENT_WORK_ID_PREFIX));
+        assert!(
+            first
+                .record
+                .job
+                .id
+                .as_str()
+                .starts_with(IDEMPOTENT_WORK_ID_PREFIX)
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_submit_same_key_with_different_task_conflicts() {
-        let root = tempdir().expect("tempdir");
-        let svc = service(root.path());
-        svc.submit(intent(serde_json::json!({"a": 1})), &keyed("k"), &context(), Timestamp::now())
-            .expect("first submit");
+    fn test_submit_same_key_with_different_task_conflicts() -> TestResult {
+        let root = tempdir().map_err(ctx("tempdir"))?;
+        let svc = service(root.path())?;
+        svc.submit(
+            intent(serde_json::json!({"a": 1})),
+            &keyed("k")?,
+            &context(),
+            Timestamp::now(),
+        )
+        .map_err(ctx("first submit"))?;
         assert!(matches!(
-            svc.submit(intent(serde_json::json!({"a": 2})), &keyed("k"), &context(), Timestamp::now()),
+            svc.submit(
+                intent(serde_json::json!({"a": 2})),
+                &keyed("k")?,
+                &context(),
+                Timestamp::now()
+            ),
             Err(JobAdmissionError::IdempotencyConflict { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_idempotent_work_id_is_scoped_by_submitter() {
-        let key = IdempotencyKey::parse("shared").expect("key");
+    fn test_idempotent_work_id_is_scoped_by_submitter() -> TestResult {
+        let key = IdempotencyKey::parse("shared").map_err(ctx("key"))?;
         let tenant = TenantId::from_str("tenant");
         let workspace = WorkspaceId::from_str("safe");
         let a = idempotent_work_id(&tenant, &workspace, operator_context("a").submitter(), &key);
@@ -1121,6 +1181,7 @@ mod tests {
             a,
             idempotent_work_id(&tenant, &workspace, operator_context("a").submitter(), &key)
         );
+        Ok(())
     }
 
     #[test]
@@ -1135,25 +1196,32 @@ mod tests {
     }
 
     #[test]
-    fn test_submit_rate_limits_per_submitter_and_skips_duplicates() {
-        let root = tempdir().expect("tempdir");
-        let svc = service(root.path()).with_limits(
-            AdmissionLimits::new(2, SignedDuration::from_secs(60)).expect("limits"),
+    fn test_submit_rate_limits_per_submitter_and_skips_duplicates() -> TestResult {
+        let root = tempdir().map_err(ctx("tempdir"))?;
+        let svc = service(root.path())?.with_limits(
+            AdmissionLimits::new(2, SignedDuration::from_secs(60))
+                .ok_or(TestError::Missing("limits"))?,
         );
         let now = Timestamp::now();
         let alice = operator_context("alice");
-        svc.submit(intent(Value::Null), &keyed("one"), &alice, now)
-            .expect("first");
-        svc.submit(intent(Value::Null), &keyed("one"), &alice, now)
-            .expect("duplicate is not charged");
+        svc.submit(intent(Value::Null), &keyed("one")?, &alice, now)
+            .map_err(ctx("first"))?;
+        svc.submit(intent(Value::Null), &keyed("one")?, &alice, now)
+            .map_err(ctx("duplicate is not charged"))?;
         svc.submit(intent(Value::Null), &SubmitOptions::default(), &alice, now)
-            .expect("second");
+            .map_err(ctx("second"))?;
         assert!(matches!(
             svc.submit(intent(Value::Null), &SubmitOptions::default(), &alice, now),
             Err(JobAdmissionError::RateLimited { .. })
         ));
-        svc.submit(intent(Value::Null), &SubmitOptions::default(), &operator_context("bob"), now)
-            .expect("other submitter has its own window");
+        svc.submit(
+            intent(Value::Null),
+            &SubmitOptions::default(),
+            &operator_context("bob"),
+            now,
+        )
+        .map_err(ctx("other submitter has its own window"))?;
+        Ok(())
     }
 
     #[test]
@@ -1167,14 +1235,14 @@ mod tests {
     }
 
     #[test]
-    fn test_submit_budget_may_only_tighten_the_ceiling() {
-        let root = tempdir().expect("tempdir");
+    fn test_submit_budget_may_only_tighten_the_ceiling() -> TestResult {
+        let root = tempdir().map_err(ctx("tempdir"))?;
         let ceiling = Budget {
             max_tokens: Some(100),
             max_wall: Some(SignedDuration::from_secs(60)),
             max_tool_calls: None,
         };
-        let svc = service_with(root.path(), ceiling);
+        let svc = service_with(root.path(), ceiling)?;
         let over = SubmitOptions {
             idempotency_key: None,
             requested_budget: Some(Budget {
@@ -1199,31 +1267,41 @@ mod tests {
         };
         let outcome = svc
             .submit(intent(Value::Null), &under, &context(), Timestamp::now())
-            .expect("tighter budget");
+            .map_err(ctx("tighter budget"))?;
         assert_eq!(outcome.record.job.budget.max_tokens, Some(50));
         assert_eq!(
             outcome.record.job.budget.max_wall,
             Some(SignedDuration::from_secs(60))
         );
         assert_eq!(outcome.record.job.budget.max_tool_calls, Some(3));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_submit_async_admits_on_blocking_pool() {
-        let root = tempdir().expect("tempdir");
-        let svc = Arc::new(service(root.path()));
+    async fn test_submit_async_admits_on_blocking_pool() -> TestResult {
+        let root = tempdir().map_err(ctx("tempdir"))?;
+        let svc = Arc::new(service(root.path())?);
         let outcome = svc
-            .submit_async(intent(Value::Null), keyed("async"), context(), Timestamp::now())
+            .submit_async(
+                intent(Value::Null),
+                keyed("async")?,
+                context(),
+                Timestamp::now(),
+            )
             .await
-            .expect("async submit");
+            .map_err(ctx("async submit"))?;
         assert_eq!(outcome.disposition, AdmissionDisposition::Admitted);
+        Ok(())
     }
 
     // ── SubmissionLimiter::wait_before_retry / Notify wake ──────────────────
 
     #[tokio::test]
-    async fn test_wait_before_retry_wakes_early_on_release() {
-        let key: SubmitterKey = (TenantId::from_str("tenant"), ApprovalActor::Operator { id: "op".into() });
+    async fn test_wait_before_retry_wakes_early_on_release() -> TestResult {
+        let key: SubmitterKey = (
+            TenantId::from_str("tenant"),
+            ApprovalActor::Operator { id: "op".into() },
+        );
 
         // Shared so `release()` (called from this task) reaches the same
         // `Notify` that the spawned task's `wait_before_retry` awaits on.
@@ -1237,13 +1315,14 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         limiter.release(&key, Timestamp::now());
-        waiter.await.expect("waiter task does not panic");
+        waiter.await.map_err(ctx("waiter task does not panic"))?;
 
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "release() must wake wait_before_retry long before the 30s retry_after elapses, took {:?}",
             started.elapsed()
         );
+        Ok(())
     }
 
     #[tokio::test]
@@ -1277,9 +1356,9 @@ mod tests {
     // ── JobAdmissionService::submit_queued_async ────────────────────────────
 
     #[tokio::test]
-    async fn test_submit_queued_async_admits_immediately_when_capacity_is_free() {
-        let root = tempdir().expect("tempdir");
-        let svc = Arc::new(service(root.path()));
+    async fn test_submit_queued_async_admits_immediately_when_capacity_is_free() -> TestResult {
+        let root = tempdir().map_err(ctx("tempdir"))?;
+        let svc = Arc::new(service(root.path())?);
         let outcome = svc
             .submit_queued_async(
                 intent(Value::Null),
@@ -1289,20 +1368,25 @@ mod tests {
                 std::time::Duration::from_secs(5),
             )
             .await
-            .expect("first attempt succeeds outright");
+            .map_err(ctx("first attempt succeeds outright"))?;
 
         match outcome {
             QueuedAdmission::Admitted(admission) => {
                 assert_eq!(admission.disposition, AdmissionDisposition::Admitted);
             }
-            QueuedAdmission::Queued { .. } => panic!("free capacity must not be queued"),
+            QueuedAdmission::Queued { .. } => {
+                return Err(TestError::Unexpected(
+                    "free capacity must not be queued".to_owned(),
+                ));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_submit_queued_async_returns_non_rate_limit_errors_immediately() {
-        let root = tempdir().expect("tempdir");
-        let svc = Arc::new(service(root.path()));
+    async fn test_submit_queued_async_returns_non_rate_limit_errors_immediately() -> TestResult {
+        let root = tempdir().map_err(ctx("tempdir"))?;
+        let svc = Arc::new(service(root.path())?);
         let result = svc
             .submit_queued_async(
                 JobIntent {
@@ -1320,17 +1404,26 @@ mod tests {
         // an unbound workspace is refused during workspace resolution, so the
         // error variant is `Workspace`, not `Sandbox`.
         assert!(matches!(result, Err(JobAdmissionError::Workspace(_))));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_submit_queued_async_queues_and_resolves_once_capacity_frees() {
-        let root = tempdir().expect("tempdir");
-        let svc = Arc::new(service(root.path()).with_limits(
-            AdmissionLimits::new(1, SignedDuration::from_millis(150)).expect("limits"),
-        ));
+    async fn test_submit_queued_async_queues_and_resolves_once_capacity_frees() -> TestResult {
+        let root = tempdir().map_err(ctx("tempdir"))?;
+        let svc = Arc::new(
+            service(root.path())?.with_limits(
+                AdmissionLimits::new(1, SignedDuration::from_millis(150))
+                    .ok_or(TestError::Missing("limits"))?,
+            ),
+        );
         let alice = operator_context("queue-resolves");
-        svc.submit(intent(Value::Null), &SubmitOptions::default(), &alice, Timestamp::now())
-            .expect("fills the single-slot window");
+        svc.submit(
+            intent(Value::Null),
+            &SubmitOptions::default(),
+            &alice,
+            Timestamp::now(),
+        )
+        .map_err(ctx("fills the single-slot window"))?;
 
         let queued = svc
             .submit_queued_async(
@@ -1341,36 +1434,53 @@ mod tests {
                 std::time::Duration::from_secs(5),
             )
             .await
-            .expect("second attempt is rejected only by rate limiting");
+            .map_err(ctx("second attempt is rejected only by rate limiting"))?;
 
         let QueuedAdmission::Queued {
             estimated_retry_after,
             result,
         } = queued
         else {
-            panic!("an exhausted window must be queued, not rejected outright");
+            return Err(TestError::Unexpected(
+                "an exhausted window must be queued, not rejected outright".to_owned(),
+            ));
         };
         assert!(estimated_retry_after > SignedDuration::ZERO);
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), result)
             .await
-            .expect("background retry finishes well within the window + margin")
-            .expect("the sender side is not dropped without sending");
+            .map_err(ctx(
+                "background retry finishes well within the window + margin",
+            ))?
+            .map_err(ctx("the sender side is not dropped without sending"))?;
         match outcome {
             Ok(admission) => assert_eq!(admission.disposition, AdmissionDisposition::Admitted),
-            Err(error) => panic!("expected the retry to succeed once the window elapsed: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "expected the retry to succeed once the window elapsed: {error}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_submit_queued_async_gives_up_after_max_wait() {
-        let root = tempdir().expect("tempdir");
-        let svc = Arc::new(service(root.path()).with_limits(
-            AdmissionLimits::new(1, SignedDuration::from_secs(30)).expect("limits"),
-        ));
+    async fn test_submit_queued_async_gives_up_after_max_wait() -> TestResult {
+        let root = tempdir().map_err(ctx("tempdir"))?;
+        let svc = Arc::new(
+            service(root.path())?.with_limits(
+                AdmissionLimits::new(1, SignedDuration::from_secs(30))
+                    .ok_or(TestError::Missing("limits"))?,
+            ),
+        );
         let alice = operator_context("queue-timeout");
-        svc.submit(intent(Value::Null), &SubmitOptions::default(), &alice, Timestamp::now())
-            .expect("fills the single-slot window for the whole test");
+        svc.submit(
+            intent(Value::Null),
+            &SubmitOptions::default(),
+            &alice,
+            Timestamp::now(),
+        )
+        .map_err(ctx("fills the single-slot window for the whole test"))?;
 
         let queued = svc
             .submit_queued_async(
@@ -1381,10 +1491,12 @@ mod tests {
                 std::time::Duration::from_millis(80),
             )
             .await
-            .expect("second attempt is rejected only by rate limiting");
+            .map_err(ctx("second attempt is rejected only by rate limiting"))?;
 
         let QueuedAdmission::Queued { result, .. } = queued else {
-            panic!("an exhausted window must be queued, not rejected outright");
+            return Err(TestError::Unexpected(
+                "an exhausted window must be queued, not rejected outright".to_owned(),
+            ));
         };
 
         // The 30s window never naturally frees within this test. Repeatedly
@@ -1401,16 +1513,22 @@ mod tests {
             );
             for _ in 0..60 {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                waker_service.limiter.release(&unrelated_key, Timestamp::now());
+                waker_service
+                    .limiter
+                    .release(&unrelated_key, Timestamp::now());
             }
         });
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), result)
             .await
-            .expect("the retry loop must give up once max_wait elapses")
-            .expect("the sender side is not dropped without sending");
+            .map_err(ctx("the retry loop must give up once max_wait elapses"))?
+            .map_err(ctx("the sender side is not dropped without sending"))?;
         waker.abort();
 
-        assert!(matches!(outcome, Err(JobAdmissionError::RateLimited { .. })));
+        assert!(matches!(
+            outcome,
+            Err(JobAdmissionError::RateLimited { .. })
+        ));
+        Ok(())
     }
 }

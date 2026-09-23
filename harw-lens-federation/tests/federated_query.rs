@@ -8,16 +8,19 @@
 //! `DeterministicEmbedder`; keiner spricht mit einem echten Modell oder einem
 //! echten Netz.
 
+mod common;
+
+use common::{TestError, TestResult, ctx};
 use harw_knowledge::{
     AgentId, ArtifactId, ArtifactKind, Frontmatter, KnowledgeArtifact, KnowledgeIndex,
     VisibilityScope,
 };
 use harw_lens_embed::{DeterministicEmbedder, EmbeddingDescriptor};
-use harw_lens_federation::{federated_query, FederationError, SkipReason};
+use harw_lens_federation::{FederationError, SkipReason, federated_query};
 use harw_lens_query::{IndexSelector, QueryError, QueryProvenance, ReadScope};
 use harw_lens_source::{
-    build_index, collect_design_docs, collect_palace_documents, CHUNKER_VERSION,
-    DOCS_DESIGN_INDEX, KNOWLEDGE_PALACE_INDEX,
+    CHUNKER_VERSION, DOCS_DESIGN_INDEX, KNOWLEDGE_PALACE_INDEX, build_index, collect_design_docs,
+    collect_palace_documents,
 };
 use harw_lens_types::{CollapsePolicy, EdgeIndex, Locality, Metric, SourceRef};
 
@@ -45,14 +48,18 @@ fn provenance(model: &str) -> QueryProvenance {
 /// demselben `model`. Beide Texte teilen den Suchbegriff `"pipeline"`, damit
 /// eine föderierte Abfrage nach diesem Begriff Treffer aus **beiden** Indizes
 /// liefert.
-fn build_two_workspace_indices(home: &std::path::Path, embedder: &DeterministicEmbedder, model: &str) {
-    let docs_root = tempfile::tempdir().expect("tempdir");
+fn build_two_workspace_indices(
+    home: &std::path::Path,
+    embedder: &DeterministicEmbedder,
+    model: &str,
+) -> TestResult {
+    let docs_root = tempfile::tempdir().map_err(ctx("tempdir"))?;
     std::fs::write(
         docs_root.path().join("architecture.md"),
         "# Architecture\n\nThe deployment pipeline has three stages.\n",
     )
-    .expect("write design doc");
-    let documents = collect_design_docs(docs_root.path()).expect("collects design docs");
+    .map_err(ctx("write design doc"))?;
+    let documents = collect_design_docs(docs_root.path()).map_err(ctx("collects design docs"))?;
     build_index(
         home,
         DOCS_DESIGN_INDEX,
@@ -63,7 +70,7 @@ fn build_two_workspace_indices(home: &std::path::Path, embedder: &DeterministicE
         embedder,
         &descriptor(),
     )
-    .expect("builds docs.design");
+    .map_err(ctx("builds docs.design"))?;
 
     let mut index = KnowledgeIndex::new();
     index.insert(KnowledgeArtifact::new(
@@ -83,16 +90,17 @@ fn build_two_workspace_indices(home: &std::path::Path, embedder: &DeterministicE
         embedder,
         &descriptor(),
     )
-    .expect("builds knowledge.palace");
+    .map_err(ctx("builds knowledge.palace"))?;
+    Ok(())
 }
 
 /// Grundzusage: eine Föderation über zwei kompatible, sichtbare Indizes
 /// liefert Treffer aus beiden, über RRF verschmolzen.
 #[test]
-fn federated_query_fuses_hits_from_both_indices() {
-    let home = tempfile::tempdir().expect("tempdir");
+fn federated_query_fuses_hits_from_both_indices() -> TestResult {
+    let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
     let embedder = DeterministicEmbedder::new(16);
-    build_two_workspace_indices(home.path(), &embedder, "test-model");
+    build_two_workspace_indices(home.path(), &embedder, "test-model")?;
 
     let selectors = [
         IndexSelector::new(DOCS_DESIGN_INDEX, "workspace"),
@@ -113,7 +121,7 @@ fn federated_query_fuses_hits_from_both_indices() {
         10,
         60.0,
     )
-    .expect("federated query succeeds");
+    .map_err(ctx("federated query succeeds"))?;
 
     assert_eq!(outcome.queried.len(), 2);
     assert!(outcome.skipped.is_empty());
@@ -125,15 +133,16 @@ fn federated_query_fuses_hits_from_both_indices() {
         == SourceRef::Artifact {
             id: "palace/deploy-pipeline".to_owned()
         }));
+    Ok(())
 }
 
 /// Determinismus: dieselbe Frage, dieselben Indizes, dieselbe Provenienz ->
 /// dieselbe Reihenfolge, zweimal.
 #[test]
-fn federated_query_is_deterministic_across_repeated_calls() {
-    let home = tempfile::tempdir().expect("tempdir");
+fn federated_query_is_deterministic_across_repeated_calls() -> TestResult {
+    let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
     let embedder = DeterministicEmbedder::new(16);
-    build_two_workspace_indices(home.path(), &embedder, "test-model");
+    build_two_workspace_indices(home.path(), &embedder, "test-model")?;
 
     let selectors = [
         IndexSelector::new(DOCS_DESIGN_INDEX, "workspace"),
@@ -155,16 +164,17 @@ fn federated_query_is_deterministic_across_repeated_calls() {
             10,
             60.0,
         )
-        .expect("federated query succeeds")
+        .map_err(ctx("federated query succeeds"))
     };
 
-    let first = run();
-    let second = run();
+    let first = run()?;
+    let second = run()?;
 
     let first_order: Vec<_> = first.fused.iter().map(|r| r.chunk.digest).collect();
     let second_order: Vec<_> = second.fused.iter().map(|r| r.chunk.digest).collect();
     assert_eq!(first_order, second_order);
     assert_eq!(first.queried, second.queried);
+    Ok(())
 }
 
 /// Der wichtigste Sicherheitstest dieses Knotens: eine Föderation, die einen
@@ -172,10 +182,10 @@ fn federated_query_is_deterministic_across_repeated_calls() {
 /// nie ein stillschweigend gekürztes Ergebnis über die übrigen, sichtbaren
 /// Indizes.
 #[test]
-fn federated_query_aborts_entirely_when_one_selector_is_outside_read_scope() {
-    let home = tempfile::tempdir().expect("tempdir");
+fn federated_query_aborts_entirely_when_one_selector_is_outside_read_scope() -> TestResult {
+    let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
     let embedder = DeterministicEmbedder::new(16);
-    build_two_workspace_indices(home.path(), &embedder, "test-model");
+    build_two_workspace_indices(home.path(), &embedder, "test-model")?;
 
     let selectors = [
         IndexSelector::new(DOCS_DESIGN_INDEX, "workspace"),
@@ -185,7 +195,7 @@ fn federated_query_aborts_entirely_when_one_selector_is_outside_read_scope() {
     ];
     let scope = ReadScope::single("workspace");
 
-    let err = federated_query(
+    let result = federated_query(
         home.path(),
         &selectors,
         &scope,
@@ -197,13 +207,18 @@ fn federated_query_aborts_entirely_when_one_selector_is_outside_read_scope() {
         CollapsePolicy::ByDigest,
         10,
         60.0,
-    )
-    .expect_err("a selector outside the read scope must abort the whole federation");
+    );
+    let Err(err) = result else {
+        return Err(TestError::Unexpected(
+            "a selector outside the read scope must abort the whole federation".to_owned(),
+        ));
+    };
 
     assert!(matches!(
         err,
         FederationError::Query(QueryError::IndexNotVisible { .. })
     ));
+    Ok(())
 }
 
 /// Die physische Sichtbarkeitstrennung hält auch über die Föderation hinweg:
@@ -211,8 +226,8 @@ fn federated_query_aborts_entirely_when_one_selector_is_outside_read_scope() {
 /// `workspace`-Lesebereich weder einzeln noch föderiert erreichbar, wohl aber
 /// über einen Lesebereich, der `operator-only` tatsächlich freigibt.
 #[test]
-fn federated_query_keeps_operator_only_index_invisible_to_workspace_scope() {
-    let home = tempfile::tempdir().expect("tempdir");
+fn federated_query_keeps_operator_only_index_invisible_to_workspace_scope() -> TestResult {
+    let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
     let embedder = DeterministicEmbedder::new(16);
 
     let mut index = KnowledgeIndex::new();
@@ -233,12 +248,12 @@ fn federated_query_keeps_operator_only_index_invisible_to_workspace_scope() {
         &embedder,
         &descriptor(),
     )
-    .expect("builds knowledge.palace");
+    .map_err(ctx("builds knowledge.palace"))?;
 
     let selectors = [IndexSelector::new(KNOWLEDGE_PALACE_INDEX, "operator-only")];
 
     let workspace_scope = ReadScope::single("workspace");
-    let err = federated_query(
+    let result = federated_query(
         home.path(),
         &selectors,
         &workspace_scope,
@@ -250,8 +265,12 @@ fn federated_query_keeps_operator_only_index_invisible_to_workspace_scope() {
         CollapsePolicy::ByDigest,
         10,
         60.0,
-    )
-    .expect_err("operator-only visibility is outside the workspace scope");
+    );
+    let Err(err) = result else {
+        return Err(TestError::Unexpected(
+            "operator-only visibility is outside the workspace scope".to_owned(),
+        ));
+    };
     assert!(matches!(
         err,
         FederationError::Query(QueryError::IndexNotVisible { .. })
@@ -271,8 +290,11 @@ fn federated_query_keeps_operator_only_index_invisible_to_workspace_scope() {
         10,
         60.0,
     )
-    .expect("a caller actually scoped to operator-only can reach it");
+    .map_err(ctx(
+        "a caller actually scoped to operator-only can reach it",
+    ))?;
     assert!(!outcome.fused.is_empty());
+    Ok(())
 }
 
 /// Ein Index mit abweichendem Modell wird nicht mitfusioniert -- über den
@@ -281,10 +303,10 @@ fn federated_query_keeps_operator_only_index_invisible_to_workspace_scope() {
 /// dabei nicht ab: die übrigen, kompatiblen Indizes liefern weiterhin ein
 /// Ergebnis, und `skipped` macht den Ausschluss sichtbar.
 #[test]
-fn federated_query_skips_index_with_incompatible_model_without_aborting() {
-    let home = tempfile::tempdir().expect("tempdir");
+fn federated_query_skips_index_with_incompatible_model_without_aborting() -> TestResult {
+    let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
     let embedder = DeterministicEmbedder::new(16);
-    build_two_workspace_indices(home.path(), &embedder, "test-model");
+    build_two_workspace_indices(home.path(), &embedder, "test-model")?;
 
     // knowledge.palace wird zusaetzlich mit einem abweichenden Modell
     // ueberschrieben -- derselbe Indexname, aber ein Manifest, das nicht mehr
@@ -307,7 +329,7 @@ fn federated_query_skips_index_with_incompatible_model_without_aborting() {
         &embedder,
         &descriptor(),
     )
-    .expect("rebuilds knowledge.palace with a different model");
+    .map_err(ctx("rebuilds knowledge.palace with a different model"))?;
 
     let selectors = [
         IndexSelector::new(DOCS_DESIGN_INDEX, "workspace"),
@@ -328,9 +350,14 @@ fn federated_query_skips_index_with_incompatible_model_without_aborting() {
         10,
         60.0,
     )
-    .expect("the federation itself must not abort over one incompatible index");
+    .map_err(ctx(
+        "the federation itself must not abort over one incompatible index",
+    ))?;
 
-    assert_eq!(outcome.queried, vec![IndexSelector::new(DOCS_DESIGN_INDEX, "workspace")]);
+    assert_eq!(
+        outcome.queried,
+        vec![IndexSelector::new(DOCS_DESIGN_INDEX, "workspace")]
+    );
     assert_eq!(outcome.skipped.len(), 1);
     assert_eq!(
         outcome.skipped[0].selector,
@@ -345,4 +372,5 @@ fn federated_query_skips_index_with_incompatible_model_without_aborting() {
         != SourceRef::Artifact {
             id: "palace/deploy-pipeline".to_owned()
         }));
+    Ok(())
 }

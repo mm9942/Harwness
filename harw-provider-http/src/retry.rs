@@ -457,6 +457,7 @@ impl<P: ModelProvider> ModelProvider for RetryingProvider<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use harw_core::cancel::CancelReason;
 
     fn policy() -> RetryPolicy {
@@ -557,13 +558,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_thread_sleeper_sleep_completes() {
+    async fn test_thread_sleeper_sleep_completes() -> TestResult {
         let started = std::time::Instant::now();
         ThreadSleeper
             .sleep(Duration::from_millis(20))
             .await
-            .expect("timer thread available");
+            .map_err(ctx("timer thread available"))?;
         assert!(started.elapsed() >= Duration::from_millis(20));
+        Ok(())
     }
 
     #[test]

@@ -127,6 +127,7 @@ fn destination_allowed(scope: &NetworkScope, destination: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestResult;
     use harw_dod_signals::SecurityEvent;
     use harw_types::SensorId;
     use jiff::Timestamp;
@@ -143,10 +144,7 @@ mod tests {
         }
     }
 
-    fn ctx_with<'a>(
-        events: &'a [SecurityEvent],
-        scope: &'a NetworkScope,
-    ) -> RuleContext<'a> {
+    fn ctx_with<'a>(events: &'a [SecurityEvent], scope: &'a NetworkScope) -> RuleContext<'a> {
         RuleContext {
             now: Timestamp::UNIX_EPOCH,
             samples: &[],
@@ -180,30 +178,30 @@ mod tests {
     }
 
     #[test]
-    fn test_address_inside_cidr_scope_does_not_trigger() {
+    fn test_address_inside_cidr_scope_does_not_trigger() -> TestResult {
         // `NetworkScope` bietet keinen anderen öffentlichen Konstruktor für
         // ein `Cidr`-Ziel als seine `Deserialize`-Implementierung (siehe
         // `harw_authority`-Moduldoku zu `EgressTarget`).
-        let scope: NetworkScope =
-            serde_json::from_str(r#"{"allow_hosts":["203.0.113.0/24"]}"#)
-                .expect("NetworkScope liest ein Cidr-Ziel");
+        let scope: NetworkScope = serde_json::from_str(r#"{"allow_hosts":["203.0.113.0/24"]}"#)
+            .map_err(crate::test_support::ctx("NetworkScope liest ein Cidr-Ziel"))?;
         let events = vec![event("203.0.113.7", 443)];
         let ctx = ctx_with(&events, &scope);
 
         assert!(EgressFlowRule.evaluate(&ctx).is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_address_outside_cidr_scope_triggers_a_finding() {
-        let scope: NetworkScope =
-            serde_json::from_str(r#"{"allow_hosts":["203.0.113.0/24"]}"#)
-                .expect("NetworkScope liest ein Cidr-Ziel");
+    fn test_address_outside_cidr_scope_triggers_a_finding() -> TestResult {
+        let scope: NetworkScope = serde_json::from_str(r#"{"allow_hosts":["203.0.113.0/24"]}"#)
+            .map_err(crate::test_support::ctx("NetworkScope liest ein Cidr-Ziel"))?;
         let events = vec![event("198.51.100.5", 8080)];
         let ctx = ctx_with(&events, &scope);
 
         let findings = EgressFlowRule.evaluate(&ctx);
         assert_eq!(findings.len(), 1);
         assert!(findings[0].summary.contains("198.51.100.5:8080"));
+        Ok(())
     }
 
     #[test]

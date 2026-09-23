@@ -237,3 +237,7 @@ pub use error::{OtlpError, OtlpResult};
 pub use http_transport::HttpTransport;
 pub use sink::{OTLP_PROTECTED_NAMESPACE_BLOCKED, OtlpSink};
 pub use transport::{OtlpTransport, RecordingTransport};
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

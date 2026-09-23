@@ -250,18 +250,34 @@ pub struct TcpConnectEventV1 {
 }
 
 pub fn parse_tcp_connect_v1(event: &WireEvent) -> Result<TcpConnectEventV1, FlowError> {
-    if event.event_type != WireEventType::TcpConnect || event.flags != 0 || event.payload.len() != 19 {
+    if event.event_type != WireEventType::TcpConnect
+        || event.flags != 0
+        || event.payload.len() != 19
+    {
         return Err(FlowError::MalformedEvent);
     }
     let family = event.payload[0];
-    let remote_port = u16::from_be_bytes(event.payload[1..3].try_into().map_err(|_| FlowError::MalformedEvent)?);
-    let addr: [u8; 16] = event.payload[3..19].try_into().map_err(|_| FlowError::MalformedEvent)?;
+    let remote_port = u16::from_be_bytes(
+        event.payload[1..3]
+            .try_into()
+            .map_err(|_| FlowError::MalformedEvent)?,
+    );
+    let addr: [u8; 16] = event.payload[3..19]
+        .try_into()
+        .map_err(|_| FlowError::MalformedEvent)?;
     let remote_addr = match family {
-        4 if addr[4..].iter().all(|byte| *byte == 0) => IpAddr::V4(Ipv4Addr::from([addr[0], addr[1], addr[2], addr[3]])),
+        4 if addr[4..].iter().all(|byte| *byte == 0) => {
+            IpAddr::V4(Ipv4Addr::from([addr[0], addr[1], addr[2], addr[3]]))
+        }
         6 => IpAddr::V6(Ipv6Addr::from(addr)),
         _ => return Err(FlowError::MalformedEvent),
     };
-    Ok(TcpConnectEventV1 { task: event.task, sequence: event.sequence, remote_addr, remote_port })
+    Ok(TcpConnectEventV1 {
+        task: event.task,
+        sequence: event.sequence,
+        remote_addr,
+        remote_port,
+    })
 }
 
 /// Liest den Port aus dem Flow-Payload — **Network Byte Order (Big-Endian)**,
@@ -362,9 +378,15 @@ pub fn parse_flow_payload(payload: &[u8]) -> Result<FlowEvent, FlowError> {
 
     let pid = read_u32_le(payload, PID_OFFSET).map_err(|_| FlowError::MalformedEvent)?;
     let uid = read_u32_le(payload, UID_OFFSET).map_err(|_| FlowError::MalformedEvent)?;
-    let protocol_byte = *payload.get(PROTOCOL_OFFSET).ok_or(FlowError::MalformedEvent)?;
-    let direction_byte = *payload.get(DIRECTION_OFFSET).ok_or(FlowError::MalformedEvent)?;
-    let family_byte = *payload.get(FAMILY_OFFSET).ok_or(FlowError::MalformedEvent)?;
+    let protocol_byte = *payload
+        .get(PROTOCOL_OFFSET)
+        .ok_or(FlowError::MalformedEvent)?;
+    let direction_byte = *payload
+        .get(DIRECTION_OFFSET)
+        .ok_or(FlowError::MalformedEvent)?;
+    let family_byte = *payload
+        .get(FAMILY_OFFSET)
+        .ok_or(FlowError::MalformedEvent)?;
 
     let protocol = Protocol::from_byte(protocol_byte)?;
     let direction = Direction::from_byte(direction_byte)?;
@@ -383,21 +405,36 @@ pub fn parse_flow_payload(payload: &[u8]) -> Result<FlowEvent, FlowError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Direction, Protocol, ADDR_OFFSET, PAYLOAD_LEN};
+    use super::{ADDR_OFFSET, Direction, PAYLOAD_LEN, Protocol};
     use crate::error::FlowError;
     use crate::event::parse_flow_payload;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_dod_bpf::{TaskIdentity, WireEvent, WireEventType};
 
     #[test]
-    fn v1_tcp_connect_keeps_initiating_task_and_ipv6_port() {
+    fn v1_tcp_connect_keeps_initiating_task_and_ipv6_port() -> TestResult {
         let mut payload = vec![6, 0x20, 0xfb];
         payload.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
-        let event = WireEvent { event_type: WireEventType::TcpConnect, flags: 0, ktime_ns: 1, sequence: 1, task: TaskIdentity { tgid: 9, pid: 10, ppid: 8, uid: 1000, cgroup_id: 77 }, payload };
-        let parsed = super::parse_tcp_connect_v1(&event).unwrap();
+        let event = WireEvent {
+            event_type: WireEventType::TcpConnect,
+            flags: 0,
+            ktime_ns: 1,
+            sequence: 1,
+            task: TaskIdentity {
+                tgid: 9,
+                pid: 10,
+                ppid: 8,
+                uid: 1000,
+                cgroup_id: 77,
+            },
+            payload,
+        };
+        let parsed = super::parse_tcp_connect_v1(&event).map_err(ctx("v1 tcp-connect parses"))?;
         assert_eq!(parsed.task.cgroup_id, 77);
         assert_eq!(parsed.sequence, 1);
         assert_eq!(parsed.remote_port, 8443);
         assert_eq!(parsed.remote_addr, IpAddr::V6(Ipv6Addr::LOCALHOST));
+        Ok(())
     }
 
     /// Baut einen wohlgeformten 32-Byte-Payload von Hand, ohne die
@@ -425,30 +462,33 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_flow_payload_decodes_a_well_formed_ipv4_tcp_outbound_payload() {
+    fn test_parse_flow_payload_decodes_a_well_formed_ipv4_tcp_outbound_payload() -> TestResult {
         let bytes = well_formed_payload(4_242, 1_000, 0, 1, 0, 443, &[198, 51, 100, 7]);
 
-        let event = parse_flow_payload(&bytes).expect("well-formed payload must parse");
+        let event = parse_flow_payload(&bytes).map_err(ctx("well-formed payload must parse"))?;
         assert_eq!(event.pid, 4_242);
         assert_eq!(event.uid, 1_000);
         assert_eq!(event.protocol, Protocol::Tcp);
         assert_eq!(event.direction, Direction::Outbound);
         assert_eq!(event.remote_port, 443);
         assert_eq!(event.remote_addr.to_string(), "198.51.100.7");
+        Ok(())
     }
 
     #[test]
-    fn test_parse_flow_payload_reads_port_in_network_byte_order() {
+    fn test_parse_flow_payload_reads_port_in_network_byte_order() -> TestResult {
         // 4444 = 0x115C — über 255, damit eine vertauschte Byte-Reihenfolge
         // (die LE-Deutung ergäbe 0x5C11 = 23569) nicht unentdeckt bliebe.
         let bytes = well_formed_payload(1, 0, 1, 1, 0, 4_444, &[10, 0, 0, 1]);
-        let event = parse_flow_payload(&bytes).expect("well-formed payload must parse");
+        let event = parse_flow_payload(&bytes).map_err(ctx("well-formed payload must parse"))?;
         assert_eq!(event.remote_port, 4_444);
         assert_eq!(event.protocol, Protocol::Udp);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_flow_payload_distinguishes_ipv4_and_ipv6_by_family_byte_not_length() {
+    fn test_parse_flow_payload_distinguishes_ipv4_and_ipv6_by_family_byte_not_length() -> TestResult
+    {
         // Beide Puffer haben exakt dieselbe Länge (PAYLOAD_LEN) — der
         // einzige Unterschied ist das Familienbyte an Offset 10.
         let v4 = well_formed_payload(1, 0, 0, 1, 0, 80, &[192, 0, 2, 1]);
@@ -459,59 +499,84 @@ mod tests {
             1,
             1,
             80,
-            &[
-                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-            ],
+            &[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
         );
         assert_eq!(v4.len(), v6.len(), "beide Puffer müssen gleich lang sein");
 
-        let v4_event = parse_flow_payload(&v4).expect("ipv4 payload must parse");
-        let v6_event = parse_flow_payload(&v6).expect("ipv6 payload must parse");
+        let v4_event = parse_flow_payload(&v4).map_err(ctx("ipv4 payload must parse"))?;
+        let v6_event = parse_flow_payload(&v6).map_err(ctx("ipv6 payload must parse"))?;
 
         assert!(v4_event.remote_addr.is_ipv4());
         assert_eq!(v4_event.remote_addr.to_string(), "192.0.2.1");
         assert!(v6_event.remote_addr.is_ipv6());
         assert_eq!(v6_event.remote_addr.to_string(), "2001:db8::1");
+        Ok(())
     }
 
     #[test]
-    fn test_parse_flow_payload_ignores_bytes_beyond_the_fixed_layout() {
+    fn test_parse_flow_payload_ignores_bytes_beyond_the_fixed_layout() -> TestResult {
         let mut bytes = well_formed_payload(1, 0, 0, 1, 0, 22, &[203, 0, 113, 5]);
         // Simuliert ein erzeugendes Programm, das (fälschlich oder nicht)
         // zusätzliche Bytes anhängt — etwa mitgeschnittene Verbindungsdaten.
         bytes.extend_from_slice(b"HARW-FLOW-PAYLOAD-CANARY-CONTENT");
 
-        let event = parse_flow_payload(&bytes).expect("payload with trailing bytes must still parse");
+        let event = parse_flow_payload(&bytes)
+            .map_err(ctx("payload with trailing bytes must still parse"))?;
         let rendered = format!("{event:?}");
         assert!(!rendered.contains("HARW-FLOW-PAYLOAD-CANARY-CONTENT"));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_flow_payload_too_short_buffer_returns_malformed_event_without_panicking() {
-        let err = parse_flow_payload(&[1, 2, 3]).expect_err("a 3-byte buffer is far too short");
+    fn test_parse_flow_payload_too_short_buffer_returns_malformed_event_without_panicking()
+    -> TestResult {
+        let outcome = parse_flow_payload(&[1, 2, 3]);
+        let Err(err) = outcome else {
+            return Err(TestError::Unexpected(
+                "a 3-byte buffer is far too short".to_owned(),
+            ));
+        };
         assert!(matches!(err, FlowError::MalformedEvent));
         // Inhaltsfrei: die Meldung ist ein fester String, kann die Rohbytes
         // strukturell nicht enthalten.
         assert_eq!(err.to_string(), "flow event payload is malformed");
+        Ok(())
     }
 
     #[test]
-    fn test_parse_flow_payload_empty_buffer_returns_malformed_event_without_panicking() {
-        let err = parse_flow_payload(&[]).expect_err("an empty buffer must not panic");
+    fn test_parse_flow_payload_empty_buffer_returns_malformed_event_without_panicking() -> TestResult
+    {
+        let outcome = parse_flow_payload(&[]);
+        let Err(err) = outcome else {
+            return Err(TestError::Unexpected(
+                "an empty buffer must not panic".to_owned(),
+            ));
+        };
         assert!(matches!(err, FlowError::MalformedEvent));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_flow_payload_unknown_protocol_byte_returns_malformed_event() {
+    fn test_parse_flow_payload_unknown_protocol_byte_returns_malformed_event() -> TestResult {
         let bytes = well_formed_payload(1, 0, 9, 1, 0, 22, &[127, 0, 0, 1]);
-        let err = parse_flow_payload(&bytes).expect_err("protocol byte 9 is unknown");
+        let outcome = parse_flow_payload(&bytes);
+        let Err(err) = outcome else {
+            return Err(TestError::Unexpected(
+                "protocol byte 9 is unknown".to_owned(),
+            ));
+        };
         assert!(matches!(err, FlowError::MalformedEvent));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_flow_payload_unknown_family_byte_returns_malformed_event() {
+    fn test_parse_flow_payload_unknown_family_byte_returns_malformed_event() -> TestResult {
         let bytes = well_formed_payload(1, 0, 0, 1, 9, 22, &[127, 0, 0, 1]);
-        let err = parse_flow_payload(&bytes).expect_err("family byte 9 is unknown");
+        let outcome = parse_flow_payload(&bytes);
+        let Err(err) = outcome else {
+            return Err(TestError::Unexpected("family byte 9 is unknown".to_owned()));
+        };
         assert!(matches!(err, FlowError::MalformedEvent));
+        Ok(())
     }
 }

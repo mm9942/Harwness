@@ -581,6 +581,7 @@ fn extract_canonical_block<'a>(raw: &'a str, path: &Path) -> Result<&'a str, Pla
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_research::{QuestionId, SourceClass, SourceReference, VersionReference};
 
     fn timestamp() -> jiff::Timestamp {
@@ -619,12 +620,11 @@ mod tests {
         }
     }
 
-    fn temp_store(label: &str) -> (FindingStore, tempfile::TempDir) {
-        let dir = match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(error) => panic!("Temp-Verzeichnis für '{label}' anlegen: {error}"),
-        };
-        (FindingStore::new(dir.path().join("plans")), dir)
+    fn temp_store(label: &str) -> TestResult<(FindingStore, tempfile::TempDir)> {
+        let dir = tempfile::tempdir().map_err(|error| {
+            TestError::Unexpected(format!("Temp-Verzeichnis für '{label}' anlegen: {error}"))
+        })?;
+        Ok((FindingStore::new(dir.path().join("plans")), dir))
     }
 
     #[test]
@@ -682,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn test_path_for_never_escapes_the_root() {
+    fn test_path_for_never_escapes_the_root() -> TestResult {
         let store = FindingStore::new("/srv/plans");
         let path = store.path_for("../../root", "../../../etc/shadow");
 
@@ -703,41 +703,37 @@ mod tests {
         );
         // Und zwischen Root und Datei liegen exakt drei Segmente:
         // <plan_id>/research/<question_id>.md
-        let relative = match path.strip_prefix("/srv/plans") {
-            Ok(relative) => relative,
-            Err(error) => panic!("strip_prefix schlug fehl: {error}"),
-        };
+        let relative = path
+            .strip_prefix("/srv/plans")
+            .map_err(ctx("strip_prefix schlug fehl"))?;
         assert_eq!(relative.components().count(), 3);
+        Ok(())
     }
 
     #[test]
-    fn test_write_then_read_roundtrips_the_finding() {
-        let (store, _dir) = temp_store("roundtrip");
+    fn test_write_then_read_roundtrips_the_finding() -> TestResult {
+        let (store, _dir) = temp_store("roundtrip")?;
         let original = finding("q-1");
 
-        let path = match store.write("p-1", &original) {
-            Ok(path) => path,
-            Err(error) => panic!("write schlug fehl: {error}"),
-        };
+        let path = store
+            .write("p-1", &original)
+            .map_err(ctx("write schlug fehl"))?;
         assert!(path.exists());
 
-        let restored = match store.read("p-1", "q-1") {
-            Ok(restored) => restored,
-            Err(error) => panic!("read schlug fehl: {error}"),
-        };
+        let restored = store.read("p-1", "q-1").map_err(ctx("read schlug fehl"))?;
         assert_eq!(restored, original);
+        Ok(())
     }
 
     #[test]
-    fn test_write_with_malicious_ids_stays_inside_the_root() {
-        let (store, _dir) = temp_store("malicious");
+    fn test_write_with_malicious_ids_stays_inside_the_root() -> TestResult {
+        let (store, _dir) = temp_store("malicious")?;
         let mut hostile = finding("../../../etc/passwd");
         hostile.question_id = QuestionId::new("../../../etc/passwd");
 
-        let path = match store.write("../../outside", &hostile) {
-            Ok(path) => path,
-            Err(error) => panic!("write schlug fehl: {error}"),
-        };
+        let path = store
+            .write("../../outside", &hostile)
+            .map_err(ctx("write schlug fehl"))?;
         assert!(
             path.starts_with(store.root()),
             "Artefakt liegt außerhalb des Roots: {}",
@@ -745,19 +741,16 @@ mod tests {
         );
 
         // Und es ist unter denselben (sanitisierten) IDs wieder lesbar.
-        let restored = match store.read("../../outside", "../../../etc/passwd") {
-            Ok(restored) => restored,
-            Err(error) => panic!("read schlug fehl: {error}"),
-        };
+        let restored = store
+            .read("../../outside", "../../../etc/passwd")
+            .map_err(ctx("read schlug fehl"))?;
         assert_eq!(restored.question_id, hostile.question_id);
+        Ok(())
     }
 
     #[test]
-    fn test_document_contains_frontmatter_and_readable_body() {
-        let document = match render_document(&finding("q-1")) {
-            Ok(document) => document,
-            Err(error) => panic!("render schlug fehl: {error}"),
-        };
+    fn test_document_contains_frontmatter_and_readable_body() -> TestResult {
+        let document = render_document(&finding("q-1")).map_err(ctx("render schlug fehl"))?;
         assert!(document.starts_with("---\n"));
         assert!(document.contains("question_id: 'q-1'"));
         assert!(document.contains("confidence: high"));
@@ -767,30 +760,33 @@ mod tests {
         assert!(document.contains("## Constraints"));
         assert!(document.contains(JSON_BEGIN));
         assert!(document.contains(JSON_END));
+        Ok(())
     }
 
     #[test]
-    fn test_read_reports_schema_mismatch_without_canonical_block() {
-        let (store, _dir) = temp_store("broken");
+    fn test_read_reports_schema_mismatch_without_canonical_block() -> TestResult {
+        let (store, _dir) = temp_store("broken")?;
         let path = store.path_for("p-1", "q-broken");
         if let Some(parent) = path.parent() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
-                panic!("Verzeichnis anlegen: {error}");
-            }
+            std::fs::create_dir_all(parent).map_err(ctx("Verzeichnis anlegen"))?;
         }
-        if let Err(error) = std::fs::write(&path, "---\nquestion_id: 'q'\n---\n\nnur Prosa\n") {
-            panic!("Datei schreiben: {error}");
-        }
+        std::fs::write(&path, "---\nquestion_id: 'q'\n---\n\nnur Prosa\n")
+            .map_err(ctx("Datei schreiben"))?;
 
         match store.read("p-1", "q-broken") {
             Err(PlanBridgeError::Research(ResearchError::SchemaMismatch { .. })) => {}
-            other => panic!("erwartet SchemaMismatch, bekommen: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet SchemaMismatch, bekommen: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_write_rejects_a_finding_that_violates_the_contract() {
-        let (store, _dir) = temp_store("invalid");
+    fn test_write_rejects_a_finding_that_violates_the_contract() -> TestResult {
+        let (store, _dir) = temp_store("invalid")?;
         let mut invalid = finding("q-1");
         invalid.conclusion = "   ".to_owned();
 
@@ -798,32 +794,34 @@ mod tests {
             Err(PlanBridgeError::Research(ResearchError::EmptyField { field })) => {
                 assert_eq!(field, "conclusion");
             }
-            other => panic!("erwartet EmptyField, bekommen: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_list_is_sorted_and_empty_for_an_unknown_plan() {
-        let (store, _dir) = temp_store("list");
-        assert!(match store.list("p-unknown") {
-            Ok(ids) => ids.is_empty(),
-            Err(error) => panic!("list schlug fehl: {error}"),
-        });
-
-        for id in ["q-c", "q-a", "q-b"] {
-            if let Err(error) = store.write("p-1", &finding(id)) {
-                panic!("write schlug fehl: {error}");
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet EmptyField, bekommen: {other:?}"
+                )));
             }
         }
-        match store.list("p-1") {
-            Ok(ids) => assert_eq!(ids, vec!["q-a", "q-b", "q-c"]),
-            Err(error) => panic!("list schlug fehl: {error}"),
-        }
+        Ok(())
     }
 
     #[test]
-    fn test_evidence_for_uses_the_relative_locator_and_production_time() {
-        let (store, _dir) = temp_store("evidence");
+    fn test_list_is_sorted_and_empty_for_an_unknown_plan() -> TestResult {
+        let (store, _dir) = temp_store("list")?;
+        let ids = store.list("p-unknown").map_err(ctx("list schlug fehl"))?;
+        assert!(ids.is_empty());
+
+        for id in ["q-c", "q-a", "q-b"] {
+            store
+                .write("p-1", &finding(id))
+                .map_err(ctx("write schlug fehl"))?;
+        }
+        let ids = store.list("p-1").map_err(ctx("list schlug fehl"))?;
+        assert_eq!(ids, vec!["q-a", "q-b", "q-c"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_evidence_for_uses_the_relative_locator_and_production_time() -> TestResult {
+        let (store, _dir) = temp_store("evidence")?;
         let source = finding("q-1");
         let evidence = store.evidence_for("p-1", &source, "runtime");
 
@@ -831,6 +829,7 @@ mod tests {
         assert_eq!(evidence.locator, "p-1/research/q-1.md");
         assert_eq!(evidence.actor, "runtime");
         assert_eq!(evidence.attached_at, offset_from_timestamp(timestamp()));
+        Ok(())
     }
 
     #[test]

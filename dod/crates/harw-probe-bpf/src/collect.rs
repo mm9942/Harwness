@@ -133,12 +133,12 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use harw_authority::NetworkScope;
+    use harw_dod_bpf::BpfProgramSource;
     use harw_dod_bpf::event::RawBpfEvent;
     use harw_dod_bpf::fixture::FixtureBpfLoader;
-    use harw_dod_bpf::BpfProgramSource;
     use harw_dod_cap::{Bound, Capability, ReadScope, SensorError, SensorHandle};
     use harw_dod_signals::{EventKind, SecurityEvent, Sensor, SensorReading};
-    use harw_authority::NetworkScope;
     use harw_types::{ContentDigest, SensorId};
     use jiff::Timestamp;
 
@@ -146,6 +146,7 @@ mod tests {
     use crate::error::ProbeError;
     use crate::sensors::{build_flow_sensor, build_procmon_sensor};
     use crate::sink::EventSink;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Test-Senke: zeichnet jedes gesendete Ereignis auf, statt es zu
     /// übertragen. Öffnet keinen Socket.
@@ -158,7 +159,7 @@ mod tests {
         fn send(&self, event: &SecurityEvent) -> Result<(), ProbeError> {
             self.sent
                 .lock()
-                .expect("test mutex is never poisoned")
+                .map_err(|_| ProbeError::SentinelSendFailed)?
                 .push(event.clone());
             Ok(())
         }
@@ -202,31 +203,41 @@ mod tests {
     }
 
     #[test]
-    fn test_run_once_forwards_every_event_from_every_sensor_to_the_sink() {
+    fn test_run_once_forwards_every_event_from_every_sensor_to_the_sink() -> TestResult {
         let sensors = vec![
-            static_sensor("probe-bpf-procmon-0", vec![sample_event("probe-bpf-procmon-0")]),
+            static_sensor(
+                "probe-bpf-procmon-0",
+                vec![sample_event("probe-bpf-procmon-0")],
+            ),
             static_sensor("probe-bpf-flow-0", vec![sample_event("probe-bpf-flow-0")]),
         ];
         let sink = RecordingSink::default();
 
-        let sent = run_once(&sensors, &sink, Timestamp::UNIX_EPOCH).expect("static sensors never fail");
+        let sent = run_once(&sensors, &sink, Timestamp::UNIX_EPOCH)
+            .map_err(ctx("static sensors never fail"))?;
 
         assert_eq!(sent, 2);
-        let recorded = sink.sent.lock().expect("test mutex is never poisoned");
+        let recorded = sink
+            .sent
+            .lock()
+            .map_err(ctx("test mutex is never poisoned"))?;
         assert_eq!(recorded.len(), 2);
+        Ok(())
     }
 
     #[test]
-    fn test_run_once_forwards_zero_events_for_sensors_with_no_reading() {
+    fn test_run_once_forwards_zero_events_for_sensors_with_no_reading() -> TestResult {
         let sensors = vec![static_sensor("probe-bpf-procmon-0", Vec::new())];
         let sink = RecordingSink::default();
 
-        let sent = run_once(&sensors, &sink, Timestamp::UNIX_EPOCH).expect("static sensor never fails");
+        let sent = run_once(&sensors, &sink, Timestamp::UNIX_EPOCH)
+            .map_err(ctx("static sensor never fails"))?;
         assert_eq!(sent, 0);
+        Ok(())
     }
 
     #[test]
-    fn test_run_once_stops_at_the_first_sink_error() {
+    fn test_run_once_stops_at_the_first_sink_error() -> TestResult {
         struct FailingSink;
         impl EventSink for FailingSink {
             fn send(&self, _event: &SecurityEvent) -> Result<(), ProbeError> {
@@ -234,15 +245,22 @@ mod tests {
             }
         }
 
-        let sensors = vec![static_sensor("probe-bpf-procmon-0", vec![sample_event("probe-bpf-procmon-0")])];
+        let sensors = vec![static_sensor(
+            "probe-bpf-procmon-0",
+            vec![sample_event("probe-bpf-procmon-0")],
+        )];
 
-        let err = run_once(&sensors, &FailingSink, Timestamp::UNIX_EPOCH)
-            .expect_err("a sink failure must propagate");
+        let Err(err) = run_once(&sensors, &FailingSink, Timestamp::UNIX_EPOCH) else {
+            return Err(TestError::Unexpected(
+                "a sink failure must propagate".into(),
+            ));
+        };
         assert!(matches!(err, ProbeError::SentinelSendFailed));
+        Ok(())
     }
 
     #[test]
-    fn test_run_once_propagates_a_sensor_error() {
+    fn test_run_once_propagates_a_sensor_error() -> TestResult {
         #[derive(Debug)]
         struct FailingSensor {
             handle: SensorHandle<Bound>,
@@ -261,8 +279,11 @@ mod tests {
         let sensors: Vec<Arc<dyn Sensor>> = vec![Arc::new(FailingSensor { handle })];
         let sink = RecordingSink::default();
 
-        let err = run_once(&sensors, &sink, Timestamp::UNIX_EPOCH).expect_err("sensor error must propagate");
+        let Err(err) = run_once(&sensors, &sink, Timestamp::UNIX_EPOCH) else {
+            return Err(TestError::Unexpected("sensor error must propagate".into()));
+        };
         assert!(matches!(err, ProbeError::Sensor(SensorError::OutsideScope)));
+        Ok(())
     }
 
     /// Ein Sensor, der zweimal einen transienten Fehler liefert und danach
@@ -289,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_forever_retries_transient_errors_and_stops_on_a_permanent_one() {
+    fn test_run_forever_retries_transient_errors_and_stops_on_a_permanent_one() -> TestResult {
         let handle = SensorHandle::new(SensorId::from_str("flaky-0"), Capability::LoadBpfProgram)
             .bind(ReadScope::from_roots(Vec::<std::path::PathBuf>::new()));
         let sensors: Vec<Arc<dyn Sensor>> = vec![Arc::new(FlakySensor {
@@ -298,8 +319,13 @@ mod tests {
         })];
         let sink = RecordingSink::default();
 
-        let err = run_forever(&sensors, &sink).expect_err("a permanent error must terminate the loop");
+        let Err(err) = run_forever(&sensors, &sink) else {
+            return Err(TestError::Unexpected(
+                "a permanent error must terminate the loop".into(),
+            ));
+        };
         assert!(matches!(err, ProbeError::Sensor(SensorError::OutsideScope)));
+        Ok(())
     }
 
     /// Der wichtigste Integrationstest dieser Crate: beide geerbten
@@ -308,7 +334,8 @@ mod tests {
     /// `crate::sensors`-Moduldoku, mein Urteil zur
     /// Schnittstellen-Unstimmigkeit.
     #[test]
-    fn test_run_once_carries_both_inherited_sources_through_with_distinguishable_sensor_ids() {
+    fn test_run_once_carries_both_inherited_sources_through_with_distinguishable_sensor_ids()
+    -> TestResult {
         let procmon_payload = {
             let mut payload = Vec::new();
             payload.extend_from_slice(&4_242u32.to_le_bytes()); // pid
@@ -352,36 +379,45 @@ mod tests {
             SensorId::from_str("probe-bpf-procmon-0"),
             placeholder.clone(),
         )
-        .expect("fixture loader with capability always succeeds");
+        .map_err(ctx("fixture loader with capability always succeeds"))?;
         let flow_sensor = build_flow_sensor(
             Box::new(flow_loader),
             SensorId::from_str("probe-bpf-flow-0"),
             placeholder,
             NetworkScope::empty(),
         )
-        .expect("fixture loader with capability always succeeds");
+        .map_err(ctx("fixture loader with capability always succeeds"))?;
 
         let sensors: Vec<Arc<dyn Sensor>> = vec![Arc::new(procmon_sensor), Arc::new(flow_sensor)];
         let sink = RecordingSink::default();
 
-        let sent = run_once(&sensors, &sink, Timestamp::UNIX_EPOCH).expect("both fixture sensors never fail");
+        let sent = run_once(&sensors, &sink, Timestamp::UNIX_EPOCH)
+            .map_err(ctx("both fixture sensors never fail"))?;
         assert_eq!(sent, 2);
 
-        let recorded = sink.sent.lock().expect("test mutex is never poisoned");
+        let recorded = sink
+            .sent
+            .lock()
+            .map_err(ctx("test mutex is never poisoned"))?;
         assert_eq!(recorded.len(), 2);
 
         let procmon_event = recorded
             .iter()
             .find(|event| event.sensor == SensorId::from_str("probe-bpf-procmon-0"))
-            .expect("the procmon event carries the procmon sensor id");
+            .ok_or(TestError::Missing(
+                "the procmon event carries the procmon sensor id",
+            ))?;
         assert!(matches!(procmon_event.kind, EventKind::ProcessExec { .. }));
 
         let flow_event = recorded
             .iter()
             .find(|event| event.sensor == SensorId::from_str("probe-bpf-flow-0"))
-            .expect("the flow event carries the flow sensor id");
+            .ok_or(TestError::Missing(
+                "the flow event carries the flow sensor id",
+            ))?;
         assert!(matches!(flow_event.kind, EventKind::EgressFlow { .. }));
 
         assert_ne!(procmon_event.sensor, flow_event.sensor);
+        Ok(())
     }
 }

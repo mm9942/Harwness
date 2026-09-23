@@ -83,11 +83,7 @@ impl Score {
     /// assert!(Score::new(101).is_none());
     /// ```
     pub const fn new(v: u8) -> Option<Self> {
-        if v <= 100 {
-            Some(Self(v))
-        } else {
-            None
-        }
+        if v <= 100 { Some(Self(v)) } else { None }
     }
 
     /// Erstellt einen `Score` und sättigt `v` auf 100 falls nötig.
@@ -290,6 +286,7 @@ pub fn bootstrap_observations() -> Vec<ObservedModelBehavior> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestResult;
 
     #[test]
     fn score_new_clamps_range() {
@@ -333,12 +330,12 @@ mod tests {
     }
 
     #[test]
-    fn observation_serde_roundtrip() {
+    fn observation_serde_roundtrip() -> TestResult {
         let original = ObservedModelBehavior::bootstrap("openai", "gpt-5");
-        let json = serde_json::to_string(&original).expect("Serialisierung fehlgeschlagen");
-        let restored: ObservedModelBehavior =
-            serde_json::from_str(&json).expect("Deserialisierung fehlgeschlagen");
+        let json = serde_json::to_string(&original)?;
+        let restored: ObservedModelBehavior = serde_json::from_str(&json)?;
         assert_eq!(original, restored);
+        Ok(())
     }
 
     #[test]

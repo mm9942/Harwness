@@ -12,10 +12,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use harw_authority::{Permission, PermissionSet};
 use harw_core::mode::InteractionMode;
 use harw_extension_api::contributors::ApprovalHandlerKind;
 use harw_registry_defaults::profile::RegistryProfile;
-use harw_authority::{Permission, PermissionSet};
 use harw_types::{ApprovalActor, Principal, ReasoningEffort};
 
 /// Art des Einstiegs in die Runtime.
@@ -548,7 +548,11 @@ mod tests {
             EntryKind::JobPlanNode,
         ];
         for kind in ALL {
-            assert_eq!(kind.profile().project_context, local.contains(&kind), "{kind:?}");
+            assert_eq!(
+                kind.profile().project_context,
+                local.contains(&kind),
+                "{kind:?}"
+            );
         }
         // Jeder Einstieg mit geschlossener Decke bekommt keinen Projektkontext.
         for kind in ALL {

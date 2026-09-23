@@ -43,11 +43,13 @@ use harw_agent_dsl::roles::{AgentRoleId, can_spawn};
 use harw_registry_defaults::embedded_agents::builtin_agent_definitions;
 use harw_registry_defaults::profile::role_names;
 
+mod common;
+use common::{TestError, TestResult, ctx};
+
 /// Resolves the embedded builtin role definitions with no local overrides —
 /// identical helper shape to `tool_admission_coverage.rs::resolved_roles`.
-fn resolved_roles() -> HashMap<String, harw_agent_dsl::ExecutableAgentIr> {
-    builtin_agent_definitions(&HashMap::new())
-        .expect("builtin role definitions must resolve")
+fn resolved_roles() -> TestResult<HashMap<String, harw_agent_dsl::ExecutableAgentIr>> {
+    builtin_agent_definitions(&HashMap::new()).map_err(ctx("builtin role definitions must resolve"))
 }
 
 /// The builtin roles that `/explore` and `/research-web` hand every caller
@@ -61,13 +63,13 @@ const PLAIN_ROLES_UIA_MUST_NOT_REACH: &[&str] = &[role_names::EXPLORER, role_nam
 /// (the pre-fix behavior of `harw-ops/src/{explore,research}.rs`) is exactly
 /// the design conflict this test suite now guards against regressing.
 #[test]
-fn test_plain_explore_and_research_roles_are_worker_and_denied_to_uia() {
-    let roles = resolved_roles();
+fn test_plain_explore_and_research_roles_are_worker_and_denied_to_uia() -> TestResult {
+    let roles = resolved_roles()?;
 
     for role_name in PLAIN_ROLES_UIA_MUST_NOT_REACH {
-        let ir = roles
-            .get(*role_name)
-            .unwrap_or_else(|| panic!("builtin role '{role_name}' must be registered"));
+        let ir = roles.get(*role_name).ok_or(TestError::Unexpected(format!(
+            "builtin role '{role_name}' must be registered"
+        )))?;
         assert_eq!(
             ir.role(),
             AgentRoleId::Worker,
@@ -78,6 +80,7 @@ fn test_plain_explore_and_research_roles_are_worker_and_denied_to_uia() {
             "a UserInterface caller must never be able to spawn '{role_name}'"
         );
     }
+    Ok(())
 }
 
 /// The fix: `uia-explorer` and `uia-writer` resolve to organizational role
@@ -98,13 +101,13 @@ fn test_plain_explore_and_research_roles_are_worker_and_denied_to_uia() {
 /// — intentionally, per the task's instruction to write it against the
 /// contractual names rather than skip it.
 #[test]
-fn test_uia_explorer_and_uia_writer_are_uia_worker_and_allowed_for_uia() {
-    let roles = resolved_roles();
+fn test_uia_explorer_and_uia_writer_are_uia_worker_and_allowed_for_uia() -> TestResult {
+    let roles = resolved_roles()?;
 
     for role_name in [role_names::UIA_EXPLORER, role_names::UIA_WRITER] {
-        let ir = roles
-            .get(role_name)
-            .unwrap_or_else(|| panic!("builtin role '{role_name}' must be registered"));
+        let ir = roles.get(role_name).ok_or(TestError::Unexpected(format!(
+            "builtin role '{role_name}' must be registered"
+        )))?;
         assert_eq!(
             ir.role(),
             AgentRoleId::UiaWorker,
@@ -115,4 +118,5 @@ fn test_uia_explorer_and_uia_writer_are_uia_worker_and_allowed_for_uia() {
             "a UserInterface caller must be able to spawn '{role_name}'"
         );
     }
+    Ok(())
 }

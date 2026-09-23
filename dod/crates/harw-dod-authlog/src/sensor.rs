@@ -307,10 +307,7 @@ impl Sensor for AuthlogSensor {
         let since = now
             .saturating_sub(self.lookback)
             .unwrap_or(jiff::Timestamp::MIN);
-        let records = self
-            .backend
-            .read_events(since)
-            .map_err(into_sensor_error)?;
+        let records = self.backend.read_events(since).map_err(into_sensor_error)?;
 
         let events = records
             .into_iter()
@@ -348,6 +345,7 @@ mod tests {
     use super::*;
     use crate::fixture_backend::FixtureAuthBackend;
     use crate::record::AuthRecord;
+    use crate::test_support::{TestResult, ctx};
     use harw_dod_cap::{Capability, ReadScope};
     use harw_dod_signals::{Actor, AuthOutcome};
     use harw_types::SensorId;
@@ -357,16 +355,21 @@ mod tests {
             .bind(ReadScope::from_roots(Vec::<std::path::PathBuf>::new()))
     }
 
-    fn auth_record(second: i64, uid: u32, auid: Option<u32>, outcome: AuthOutcome) -> AuthRecord {
-        AuthRecord {
-            observed_at: Timestamp::new(second, 0).expect("gültiger Zeitstempel"),
+    fn auth_record(
+        second: i64,
+        uid: u32,
+        auid: Option<u32>,
+        outcome: AuthOutcome,
+    ) -> TestResult<AuthRecord> {
+        Ok(AuthRecord {
+            observed_at: Timestamp::new(second, 0).map_err(ctx("gültiger Zeitstempel"))?,
             actor: Actor {
                 uid,
                 auid,
                 cgroup: None,
             },
             outcome,
-        }
+        })
     }
 
     #[test]
@@ -382,18 +385,18 @@ mod tests {
     }
 
     #[test]
-    fn test_poll_maps_auth_record_to_auth_event_with_empty_samples() {
+    fn test_poll_maps_auth_record_to_auth_event_with_empty_samples() -> TestResult {
         let sensor = AuthlogSensor::new(
             handle_with(Capability::ReadAuditNetlink),
             Box::new(FixtureAuthBackend::new(
-                vec![auth_record(1, 0, Some(1000), AuthOutcome::Success)],
+                vec![auth_record(1, 0, Some(1000), AuthOutcome::Success)?],
                 Capability::ReadAuditNetlink,
             )),
         );
 
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("Fixture scheitert nie");
+            .map_err(ctx("Fixture scheitert nie"))?;
         assert!(reading.samples.is_empty());
         assert_eq!(reading.events.len(), 1);
 
@@ -404,60 +407,68 @@ mod tests {
                 outcome: AuthOutcome::Success
             }
         ));
-        let actor = event.actor.as_ref().expect("actor muss gesetzt sein");
+        let actor = event
+            .actor
+            .as_ref()
+            .ok_or(crate::test_support::TestError::Missing(
+                "actor muss gesetzt sein",
+            ))?;
         assert_eq!(actor.uid, 0);
         assert_eq!(actor.auid, Some(1000));
+        Ok(())
     }
 
     #[test]
-    fn test_poll_computes_since_from_now_minus_lookback() {
+    fn test_poll_computes_since_from_now_minus_lookback() -> TestResult {
         // Ein Record knapp außerhalb des Rückschaufensters darf nicht
         // erscheinen; einer knapp innerhalb schon.
         let sensor = AuthlogSensor::with_lookback(
             handle_with(Capability::ReadAuditNetlink),
             Box::new(FixtureAuthBackend::new(
                 vec![
-                    auth_record(1_000, 1000, Some(1000), AuthOutcome::Success),
-                    auth_record(1_101, 1000, Some(1000), AuthOutcome::Success),
+                    auth_record(1_000, 1000, Some(1000), AuthOutcome::Success)?,
+                    auth_record(1_101, 1000, Some(1000), AuthOutcome::Success)?,
                 ],
                 Capability::ReadAuditNetlink,
             )),
             Duration::from_secs(100),
         );
 
-        let now = Timestamp::new(1_200, 0).expect("gültiger Zeitstempel");
-        let reading = sensor.poll(now).expect("Fixture scheitert nie");
+        let now = Timestamp::new(1_200, 0).map_err(ctx("gültiger Zeitstempel"))?;
+        let reading = sensor.poll(now).map_err(ctx("Fixture scheitert nie"))?;
         // since = now - 100 = 1100: der erste Record (1000) fällt heraus,
         // der zweite (1101) bleibt.
         assert_eq!(reading.events.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_poll_two_calls_with_same_now_are_deterministic() {
+    fn test_poll_two_calls_with_same_now_are_deterministic() -> TestResult {
         let sensor = AuthlogSensor::new(
             handle_with(Capability::ReadJournal),
             Box::new(FixtureAuthBackend::new(
-                vec![auth_record(1, 0, None, AuthOutcome::Failure)],
+                vec![auth_record(1, 0, None, AuthOutcome::Failure)?],
                 Capability::ReadJournal,
             )),
         );
 
         let first = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("erster Poll");
+            .map_err(ctx("erster Poll"))?;
         let second = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("zweiter Poll");
+            .map_err(ctx("zweiter Poll"))?;
         assert_eq!(first, second);
+        Ok(())
     }
 
     #[test]
-    fn test_poll_overlapping_windows_yield_duplicate_events_by_design() {
+    fn test_poll_overlapping_windows_yield_duplicate_events_by_design() -> TestResult {
         // Dokumentiert die Kehrseite eines großzügigen Rückschaufensters:
         // zwei Polls, deren Fenster sich überlappen, sehen denselben Record
         // zweimal — der Verbraucher muss entdoppeln.
         let backend = FixtureAuthBackend::new(
-            vec![auth_record(1_000, 1000, Some(1000), AuthOutcome::Success)],
+            vec![auth_record(1_000, 1000, Some(1000), AuthOutcome::Success)?],
             Capability::ReadAuditNetlink,
         );
         let sensor = AuthlogSensor::with_lookback(
@@ -467,14 +478,15 @@ mod tests {
         );
 
         let first_poll = sensor
-            .poll(Timestamp::new(1_050, 0).expect("gültiger Zeitstempel"))
-            .expect("erster Poll");
+            .poll(Timestamp::new(1_050, 0).map_err(ctx("gültiger Zeitstempel"))?)
+            .map_err(ctx("erster Poll"))?;
         let second_poll = sensor
-            .poll(Timestamp::new(1_100, 0).expect("gültiger Zeitstempel"))
-            .expect("zweiter Poll");
+            .poll(Timestamp::new(1_100, 0).map_err(ctx("gültiger Zeitstempel"))?)
+            .map_err(ctx("zweiter Poll"))?;
 
         assert_eq!(first_poll.events.len(), 1);
         assert_eq!(second_poll.events.len(), 1);
         assert_eq!(first_poll.events[0], second_poll.events[0]);
+        Ok(())
     }
 }

@@ -322,7 +322,11 @@ mod tests {
 
     /// Tabelle: (Beschreibung, Eingabe, erwartete `sanitize_display`-Ausgabe).
     const DISPLAY_TABLE: &[(&str, &str, &str)] = &[
-        ("CSI Farbe", "\u{1b}[31mROT\u{1b}[0m normal", "⟨ESC⟩ROT⟨ESC⟩ normal"),
+        (
+            "CSI Farbe",
+            "\u{1b}[31mROT\u{1b}[0m normal",
+            "⟨ESC⟩ROT⟨ESC⟩ normal",
+        ),
         ("CSI Cursor", "a\u{1b}[2J\u{1b}[1;1Hb", "a⟨ESC⟩⟨ESC⟩b"),
         ("CSI privat", "\u{1b}[?1049hx", "⟨ESC⟩x"),
         ("OSC 52 mit BEL", "a\u{1b}]52;c;ZXZpbA==\u{07}b", "a⟨ESC⟩b"),
@@ -339,7 +343,11 @@ mod tests {
         ("ESC c Reset", "x\u{1b}cy", "x⟨ESC⟩y"),
         ("ESC nF Zeichensatz", "\u{1b}(Bz", "⟨ESC⟩z"),
         // Unvollständige Sequenzen verstecken nie den Rest des Textes.
-        ("OSC ohne Terminator", "a\u{1b}]0;rest bleibt", "a⟨U+001B⟩]0;rest bleibt"),
+        (
+            "OSC ohne Terminator",
+            "a\u{1b}]0;rest bleibt",
+            "a⟨U+001B⟩]0;rest bleibt",
+        ),
         ("CSI am Ende", "a\u{1b}[", "a⟨U+001B⟩["),
         ("CSI mit Nicht-ASCII", "\u{1b}[3ä", "⟨U+001B⟩[3ä"),
         ("ESC am Ende", "z\u{1b}", "z⟨U+001B⟩"),
@@ -352,22 +360,42 @@ mod tests {
         ("C1 NEL", "a\u{85}b", "a⟨U+0085⟩b"),
         // Bidi
         ("RLO", "rm -rf \u{202e}txt.exe", "rm -rf ⟨U+202E⟩txt.exe"),
-        ("LRE/RLE/PDF/LRO", "\u{202a}\u{202b}\u{202c}\u{202d}", "⟨U+202A⟩⟨U+202B⟩⟨U+202C⟩⟨U+202D⟩"),
-        ("Isolates", "\u{2066}a\u{2067}b\u{2068}c\u{2069}", "⟨U+2066⟩a⟨U+2067⟩b⟨U+2068⟩c⟨U+2069⟩"),
+        (
+            "LRE/RLE/PDF/LRO",
+            "\u{202a}\u{202b}\u{202c}\u{202d}",
+            "⟨U+202A⟩⟨U+202B⟩⟨U+202C⟩⟨U+202D⟩",
+        ),
+        (
+            "Isolates",
+            "\u{2066}a\u{2067}b\u{2068}c\u{2069}",
+            "⟨U+2066⟩a⟨U+2067⟩b⟨U+2068⟩c⟨U+2069⟩",
+        ),
         ("LRM/RLM", "a\u{200e}b\u{200f}", "a⟨U+200E⟩b⟨U+200F⟩"),
         ("ALM", "a\u{061c}b", "a⟨U+061C⟩b"),
         // Zero-Width
-        ("ZWSP/ZWNJ/ZWJ", "s\u{200b}u\u{200c}d\u{200d}o", "s⟨U+200B⟩u⟨U+200C⟩d⟨U+200D⟩o"),
+        (
+            "ZWSP/ZWNJ/ZWJ",
+            "s\u{200b}u\u{200c}d\u{200d}o",
+            "s⟨U+200B⟩u⟨U+200C⟩d⟨U+200D⟩o",
+        ),
         ("Word Joiner", "a\u{2060}b", "a⟨U+2060⟩b"),
         ("BOM", "\u{feff}text", "⟨U+FEFF⟩text"),
-        ("Tag-Zeichen", "ok\u{e0041}\u{e007f}", "ok⟨U+E0041⟩⟨U+E007F⟩"),
+        (
+            "Tag-Zeichen",
+            "ok\u{e0041}\u{e007f}",
+            "ok⟨U+E0041⟩⟨U+E007F⟩",
+        ),
         ("Zeilentrenner", "a\u{2028}b", "a⟨U+2028⟩b"),
         // Erlaubtes
         ("Zeilenumbruch bleibt", "a\nb", "a\nb"),
         ("CRLF", "a\r\nb", "a\nb"),
         ("CR allein", "a\rb", "a\nb"),
         ("Tab", "a\tb", "a    b"),
-        ("Unicode unverändert", "Grüße 🎉 日本語 — ✓", "Grüße 🎉 日本語 — ✓"),
+        (
+            "Unicode unverändert",
+            "Grüße 🎉 日本語 — ✓",
+            "Grüße 🎉 日本語 — ✓",
+        ),
     ];
 
     #[test]

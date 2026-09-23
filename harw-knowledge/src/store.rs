@@ -302,84 +302,101 @@ pub fn render_frontmatter(frontmatter: &Frontmatter, body: &str) -> KnowledgeRes
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestResult;
 
-    fn temporary_root(label: &str) -> PathBuf {
+    fn temporary_root(label: &str) -> TestResult<PathBuf> {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock is after epoch")
+            .map_err(crate::test_support::ctx("system clock is after epoch"))?
             .as_nanos();
         let root = std::env::temp_dir().join(format!("{label}-{}-{nonce}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("create temporary root");
-        root
+        std::fs::create_dir_all(&root)
+            .map_err(crate::test_support::ctx("create temporary root"))?;
+        Ok(root)
     }
 
     #[test]
-    fn write_atomic_replaces_an_existing_regular_file() {
-        let root = temporary_root("harw-knowledge-atomic-replace");
+    fn write_atomic_replaces_an_existing_regular_file() -> TestResult {
+        let root = temporary_root("harw-knowledge-atomic-replace")?;
         let path = root.join("artifact.md");
-        std::fs::write(&path, "old contents").expect("write original artifact");
+        std::fs::write(&path, "old contents")
+            .map_err(crate::test_support::ctx("write original artifact"))?;
 
-        write_atomic(&path, "new contents").expect("replace regular artifact");
+        write_atomic(&path, "new contents")
+            .map_err(crate::test_support::ctx("replace regular artifact"))?;
 
         assert_eq!(
-            std::fs::read_to_string(&path).expect("read replaced artifact"),
+            std::fs::read_to_string(&path)
+                .map_err(crate::test_support::ctx("read replaced artifact"))?,
             "new contents"
         );
-        std::fs::remove_dir_all(root).expect("remove temporary root");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn temp_creation_skips_preexisting_files_and_symlinks_without_writing_through_them() {
-        let root = temporary_root("harw-knowledge-atomic-symlink");
+    fn temp_creation_skips_preexisting_files_and_symlinks_without_writing_through_them()
+    -> TestResult {
+        let root = temporary_root("harw-knowledge-atomic-symlink")?;
         let path = root.join("artifact.md");
         let redirected = root.join("redirected.md");
         let first_sequence = 41;
         let existing_temp = tmp_sibling(&path, first_sequence);
         let linked_temp = tmp_sibling(&path, first_sequence + 1);
         std::fs::write(&existing_temp, "must remain unchanged")
-            .expect("write pre-existing staging file");
-        std::fs::write(&redirected, "must remain unchanged").expect("write redirected artifact");
-        std::os::unix::fs::symlink(&redirected, &linked_temp).expect("create staging symlink");
+            .map_err(crate::test_support::ctx("write pre-existing staging file"))?;
+        std::fs::write(&redirected, "must remain unchanged")
+            .map_err(crate::test_support::ctx("write redirected artifact"))?;
+        std::os::unix::fs::symlink(&redirected, &linked_temp)
+            .map_err(crate::test_support::ctx("create staging symlink"))?;
 
-        let (created_temp, file) = create_temp_sibling(&path, first_sequence)
-            .expect("allocate staging file after symlink collision");
+        let (created_temp, file) = create_temp_sibling(&path, first_sequence).map_err(
+            crate::test_support::ctx("allocate staging file after symlink collision"),
+        )?;
         drop(file);
 
         assert_ne!(created_temp, existing_temp);
         assert_ne!(created_temp, linked_temp);
         assert_eq!(
-            std::fs::read_to_string(&existing_temp).expect("read pre-existing staging file"),
+            std::fs::read_to_string(&existing_temp)
+                .map_err(crate::test_support::ctx("read pre-existing staging file"))?,
             "must remain unchanged"
         );
         assert_eq!(
-            std::fs::read_to_string(&redirected).expect("read redirected artifact"),
+            std::fs::read_to_string(&redirected)
+                .map_err(crate::test_support::ctx("read redirected artifact"))?,
             "must remain unchanged"
         );
         assert!(
             std::fs::symlink_metadata(&linked_temp)
-                .expect("inspect staging symlink")
+                .map_err(crate::test_support::ctx("inspect staging symlink"))?
                 .file_type()
                 .is_symlink()
         );
 
-        std::fs::remove_file(created_temp).expect("remove owned staging file");
-        std::fs::remove_file(existing_temp).expect("remove pre-existing staging file");
-        std::fs::remove_file(linked_temp).expect("remove staging symlink");
-        std::fs::remove_dir_all(root).expect("remove temporary root");
+        std::fs::remove_file(created_temp)
+            .map_err(crate::test_support::ctx("remove owned staging file"))?;
+        std::fs::remove_file(existing_temp)
+            .map_err(crate::test_support::ctx("remove pre-existing staging file"))?;
+        std::fs::remove_file(linked_temp)
+            .map_err(crate::test_support::ctx("remove staging symlink"))?;
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn write_atomic_removes_its_staging_file_when_rename_fails() {
-        let root = temporary_root("harw-knowledge-atomic-cleanup");
+    fn write_atomic_removes_its_staging_file_when_rename_fails() -> TestResult {
+        let root = temporary_root("harw-knowledge-atomic-cleanup")?;
         let destination_directory = root.join("artifact.md");
-        std::fs::create_dir(&destination_directory).expect("create destination directory");
+        std::fs::create_dir(&destination_directory)
+            .map_err(crate::test_support::ctx("create destination directory"))?;
 
         assert!(write_atomic(&destination_directory, "new contents").is_err());
 
         let temporary_entries = std::fs::read_dir(&root)
-            .expect("read temporary root")
+            .map_err(crate::test_support::ctx("read temporary root"))?
             .filter_map(Result::ok)
             .filter(|entry| {
                 entry
@@ -390,6 +407,7 @@ mod tests {
             .count();
         assert_eq!(temporary_entries, 0);
 
-        std::fs::remove_dir_all(root).expect("remove temporary root");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove temporary root"))?;
+        Ok(())
     }
 }

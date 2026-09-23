@@ -589,9 +589,9 @@ impl DoctorCheck for KekFilePermsCheck {
                 "kein dateibasierter KEK konfiguriert — Berechtigungsprüfung nicht anwendbar"
                     .to_owned(),
             ),
-            KekFilePermsEvidence::Ok { path } => {
-                CheckOutcome::Ok(format!("KEK-Schlüsseldatei-Berechtigungen sicher (0600): {path}"))
-            }
+            KekFilePermsEvidence::Ok { path } => CheckOutcome::Ok(format!(
+                "KEK-Schlüsseldatei-Berechtigungen sicher (0600): {path}"
+            )),
             KekFilePermsEvidence::Unsafe { path, reason } => CheckOutcome::Fail(format!(
                 "KEK-Schlüsseldatei '{path}' hat unsichere Berechtigungen: {reason}"
             )),
@@ -671,6 +671,7 @@ pub fn run_all(checks: &[Box<dyn DoctorCheck>]) -> Vec<(String, CheckOutcome)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     /// Ein Test-Check, der ein festes Ergebnis liefert.
     struct FixedCheck {
@@ -699,12 +700,17 @@ mod tests {
     }
 
     #[test]
-    fn test_check_outcome_matches_pattern() {
+    fn test_check_outcome_matches_pattern() -> TestResult {
         let outcome = CheckOutcome::Warn("x".to_owned());
         match outcome {
             CheckOutcome::Warn(msg) => assert_eq!(msg, "x"),
-            other => panic!("erwartete Warn, erhielt {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartete Warn, erhielt {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
@@ -739,17 +745,18 @@ mod tests {
     }
 
     #[test]
-    fn default_checks_report_missing_runtime_evidence_as_unknown() {
+    fn default_checks_report_missing_runtime_evidence_as_unknown() -> TestResult {
         let checks = default_checks(Path::new("/tmp/harw-doctor-test"));
-        let result = checks
+        let check = checks
             .iter()
             .find(|check| check.id() == "runtime/tool-boundaries")
-            .expect("default checks include the runtime boundary check")
-            .run();
+            .ok_or(TestError::Missing("runtime boundary check"))?;
+        let result = check.run();
 
         assert!(
             matches!(result, CheckOutcome::Warn(message) if message.contains("nicht konfiguriert"))
         );
+        Ok(())
     }
 
     #[test]
@@ -758,12 +765,17 @@ mod tests {
     }
 
     #[test]
-    fn test_home_exists_check_missing_fails() {
+    fn test_home_exists_check_missing_fails() -> TestResult {
         let check = HomeExistsCheck::new(Path::new("/nonexistent/harw/home/xyz"));
         match check.run() {
             CheckOutcome::Fail(_) => {}
-            other => panic!("erwartete Fail, erhielt {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartete Fail, erhielt {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]

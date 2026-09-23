@@ -25,6 +25,10 @@
 // Intern: die eine Fassung des Eltern-fsync, von allen vier Stores benutzt.
 mod durability;
 
+// Test-Fehlertyp (Bible R087/R165/R182): ersetzt panic!/unwrap/expect in Unit-Tests.
+#[cfg(test)]
+mod test_support;
+
 pub mod approval;
 pub mod child_lease;
 pub mod error;
@@ -35,9 +39,7 @@ pub mod reader;
 pub mod record;
 pub mod store;
 
-pub use approval::{
-    ApprovalRecord, ApprovalResolutionRecord, ApprovalStore, DEFAULT_APPROVAL_TTL,
-};
+pub use approval::{ApprovalRecord, ApprovalResolutionRecord, ApprovalStore, DEFAULT_APPROVAL_TTL};
 pub use child_lease::{ChildLeaseCompletionRecord, ChildLeaseRecord, ChildLeaseStore};
 pub use error::{SessionStoreError, SessionStoreResult};
 pub use freeze::{Freeze, FreezeResolution, FreezeResolutionOutcome, FreezeStore};
@@ -46,7 +48,7 @@ pub use job_store::{
     JobEventSink, JobLifecycleEvent, JobListQuery, JobPage, JobStore, NoopJobEventSink,
     RenewalRequest, RetryRequest,
 };
-pub use meta::{SessionMeta, TitleSource, SESSION_META_VERSION};
+pub use meta::{SESSION_META_VERSION, SessionMeta, TitleSource};
 pub use reader::TranscriptReader;
 pub use record::{RecordKind, TranscriptRecord};
 pub use store::TranscriptStore;

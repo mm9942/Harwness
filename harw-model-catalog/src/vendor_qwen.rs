@@ -1029,6 +1029,7 @@ pub fn qwen_observations() -> Vec<ObservedModelBehavior> {
 mod tests {
     use super::*;
     use crate::observed::Score;
+    use crate::test_support::{TestError, TestResult};
 
     /// Substantielle Qwen-Modell-Menge muss vorhanden sein.
     #[test]
@@ -1172,29 +1173,31 @@ mod tests {
 
     /// qwen3.6-max-preview muss als Preview markiert sein.
     #[test]
-    fn preview_model_has_preview_lifecycle() {
+    fn preview_model_has_preview_lifecycle() -> TestResult {
         let d = qwen_descriptors()
             .into_iter()
             .find(|d| d.model == "qwen3.6-max-preview")
-            .expect("qwen3.6-max-preview fehlt im Katalog");
+            .ok_or(TestError::Missing("qwen3.6-max-preview descriptor"))?;
         assert_eq!(
             d.lifecycle,
             ModelLifecycle::Preview,
             "qwen3.6-max-preview sollte Preview-Lifecycle haben"
         );
+        Ok(())
     }
 
     /// qwen-long-latest hat das größte Kontextfenster (10M).
     #[test]
-    fn qwen_long_has_10m_context() {
+    fn qwen_long_has_10m_context() -> TestResult {
         let d = qwen_descriptors()
             .into_iter()
             .find(|d| d.model == "qwen-long-latest")
-            .expect("qwen-long-latest fehlt im Katalog");
+            .ok_or(TestError::Missing("qwen-long-latest descriptor"))?;
         assert_eq!(
             d.context_window, 10_000_000,
             "qwen-long-latest sollte 10M Kontext haben"
         );
+        Ok(())
     }
 
     /// Modelle mit image_input=true müssen Modality::Image enthalten.
@@ -1237,11 +1240,11 @@ mod tests {
 
     /// text-embedding-v4 hat kein Tool-Calling und kein Streaming.
     #[test]
-    fn embedding_model_has_no_tool_calling() {
+    fn embedding_model_has_no_tool_calling() -> TestResult {
         let d = qwen_descriptors()
             .into_iter()
             .find(|d| d.model == "text-embedding-v4")
-            .expect("text-embedding-v4 fehlt im Katalog");
+            .ok_or(TestError::Missing("text-embedding-v4 descriptor"))?;
         assert_eq!(
             d.capabilities.tool_calling,
             ToolCallingSupport::None,
@@ -1252,5 +1255,6 @@ mod tests {
             StreamingSupport::None,
             "text-embedding-v4 sollte kein Streaming haben"
         );
+        Ok(())
     }
 }

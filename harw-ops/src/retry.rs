@@ -72,10 +72,13 @@ async fn retry(ctx: &OpContext, args: RetryArgs) -> Result<OpOutput, OpError> {
 #[cfg(test)]
 mod tests {
     use super::{RetryArgs, retry};
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_job_runtime::{Budget, Job, JobKind, JobScope, JobState, RetryPolicy, StoredJob};
     use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_session_store::JobStore;
     use harw_types::{ApprovalActor, SessionId, TenantId, TurnId, WorkId, WorkspaceId};
     use jiff::{SignedDuration, Timestamp};
@@ -84,12 +87,14 @@ mod tests {
         atomic::{AtomicU64, Ordering},
     };
 
-    fn make_test_ctx(with_store: bool) -> (OpContext, std::path::PathBuf, Option<Arc<JobStore>>) {
+    fn make_test_ctx(
+        with_store: bool,
+    ) -> TestResult<(OpContext, std::path::PathBuf, Option<Arc<JobStore>>)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root =
             std::env::temp_dir().join(format!("harw-retry-test-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(root.join("ws")).expect("create test workspace");
+        std::fs::create_dir_all(root.join("ws")).map_err(ctx("create test workspace"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -98,13 +103,13 @@ mod tests {
                 root: std::path::PathBuf::from("ws"),
             }],
         )
-        .expect("build workspace registry");
+        .map_err(ctx("build workspace registry"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .expect("resolve workspace binding");
+            .map_err(ctx("resolve workspace binding"))?;
         let sandbox = SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ReadWorkspace]),
@@ -114,11 +119,11 @@ mod tests {
         if let Some(store) = &store {
             services.insert(Arc::clone(store));
         }
-        (
+        Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, services),
             root,
             store,
-        )
+        ))
     }
 
     fn job_in_state(id: &str, state: JobState, attempts: u32) -> StoredJob {
@@ -159,26 +164,33 @@ mod tests {
     }
 
     #[test]
-    fn test_retry_args_from_raw_args_sets_work_id() {
-        let args = RetryArgs::from_raw_args(&toks(&["work-42"])).unwrap();
+    fn test_retry_args_from_raw_args_sets_work_id() -> TestResult {
+        let args = RetryArgs::from_raw_args(&toks(&["work-42"]))
+            .map_err(ctx("RetryArgs::from_raw_args"))?;
         assert_eq!(args.work_id.as_deref(), Some("work-42"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn retry_without_work_id_returns_invalid_arguments() {
-        let (ctx, root, _) = make_test_ctx(false);
+    async fn retry_without_work_id_returns_invalid_arguments() -> TestResult {
+        let (ctx, root, _) = make_test_ctx(false)?;
         let result = retry(&ctx, RetryArgs::default()).await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         match result {
             Err(OpError::InvalidArguments(message)) => assert!(message.contains("work_id")),
-            other => panic!("expected InvalidArguments, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected InvalidArguments, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn retry_without_job_store_returns_not_available() {
-        let (ctx, root, _) = make_test_ctx(false);
+    async fn retry_without_job_store_returns_not_available() -> TestResult {
+        let (ctx, root, _) = make_test_ctx(false)?;
         let result = retry(
             &ctx,
             RetryArgs {
@@ -186,22 +198,27 @@ mod tests {
             },
         )
         .await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         match result {
             Err(OpError::NotAvailable(message)) => assert!(message.contains("job store")),
-            other => panic!("expected NotAvailable, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn retry_requeues_a_failed_job_and_reports_ready_state() {
-        let (ctx, root, store) = make_test_ctx(true);
-        let store = store.expect("test context includes job store");
+    async fn retry_requeues_a_failed_job_and_reports_ready_state() -> TestResult {
+        let (ctx, root, store) = make_test_ctx(true)?;
+        let store = store.ok_or(TestError::Missing("test context includes job store"))?;
         let work_id = WorkId::from_str("work-retry");
         store
             .admit(&job_in_state(work_id.as_str(), JobState::Failed, 1))
-            .expect("admit failed job");
+            .map_err(crate::test_support::ctx("admit failed job"))?;
 
         let output = retry(
             &ctx,
@@ -210,23 +227,26 @@ mod tests {
             },
         )
         .await
-        .expect("retry requeues the failed job");
-        let persisted = store.get(&work_id).expect("read requeued job");
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        .map_err(crate::test_support::ctx("retry requeues the failed job"))?;
+        let persisted = store
+            .get(&work_id)
+            .map_err(crate::test_support::ctx("read requeued job"))?;
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         assert_eq!(persisted.job.state, JobState::Ready);
         assert_eq!(persisted.job.attempts, 2);
         assert!(output.text.contains(work_id.as_str()));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn retry_fails_for_a_job_that_is_not_failed_or_cancelled() {
-        let (ctx, root, store) = make_test_ctx(true);
-        let store = store.expect("test context includes job store");
+    async fn retry_fails_for_a_job_that_is_not_failed_or_cancelled() -> TestResult {
+        let (ctx, root, store) = make_test_ctx(true)?;
+        let store = store.ok_or(TestError::Missing("test context includes job store"))?;
         let work_id = WorkId::from_str("work-not-retryable");
         store
             .admit(&job_in_state(work_id.as_str(), JobState::Ready, 0))
-            .expect("admit ready job");
+            .map_err(crate::test_support::ctx("admit ready job"))?;
 
         let result = retry(
             &ctx,
@@ -235,19 +255,20 @@ mod tests {
             },
         )
         .await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         assert!(matches!(result, Err(OpError::Execution(_))));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn retry_fails_once_the_retry_limit_is_exhausted_and_does_not_requeue() {
-        let (ctx, root, store) = make_test_ctx(true);
-        let store = store.expect("test context includes job store");
+    async fn retry_fails_once_the_retry_limit_is_exhausted_and_does_not_requeue() -> TestResult {
+        let (ctx, root, store) = make_test_ctx(true)?;
+        let store = store.ok_or(TestError::Missing("test context includes job store"))?;
         let work_id = WorkId::from_str("work-retry-exhausted");
         store
             .admit(&job_in_state(work_id.as_str(), JobState::Failed, 2))
-            .expect("admit exhausted failed job");
+            .map_err(crate::test_support::ctx("admit exhausted failed job"))?;
 
         let result = retry(
             &ctx,
@@ -256,11 +277,18 @@ mod tests {
             },
         )
         .await;
-        let persisted = store.get(&work_id).expect("read job after failed retry");
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        let persisted = store
+            .get(&work_id)
+            .map_err(crate::test_support::ctx("read job after failed retry"))?;
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         assert!(matches!(result, Err(OpError::Execution(_))));
-        assert_eq!(persisted.job.state, JobState::Failed, "must not requeue silently");
+        assert_eq!(
+            persisted.job.state,
+            JobState::Failed,
+            "must not requeue silently"
+        );
         assert_eq!(persisted.job.attempts, 2);
+        Ok(())
     }
 }

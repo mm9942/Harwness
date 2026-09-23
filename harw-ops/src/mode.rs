@@ -80,8 +80,7 @@ use serde_json::{Value, json};
 /// Das ist kein Fehler der Operation, sondern eine unvollständige
 /// Zusammenstellung der Laufzeit: ohne Controller gibt es keinen Adressaten für
 /// den Wunsch. Die Antwort sagt das, statt einen Wechsel zu behaupten.
-pub(crate) const NO_CONTROLLER: &str =
-    "In dieser Laufzeit ist kein SessionController registriert — der Modus kann \
+pub(crate) const NO_CONTROLLER: &str = "In dieser Laufzeit ist kein SessionController registriert — der Modus kann \
      weder gelesen noch gewechselt werden. Die Oberfläche muss einen \
      `Arc<dyn SessionController>` in die ServiceMap legen.";
 
@@ -278,20 +277,21 @@ fn map_control_error(error: SessionControlError) -> OpError {
 #[cfg(test)]
 mod tests {
     use super::{ModeArgs, ModeOperation};
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
+    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_core::InteractionMode;
     use harw_operations::context::ServiceMap;
     use harw_operations::{FromRawArgs, OpContext, OpError, Operation, Surface};
-    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Baut einen minimalen [`OpContext`] mit leerer [`ServiceMap`].
-    fn test_context() -> (OpContext, std::path::PathBuf) {
+    fn test_context() -> TestResult<(OpContext, std::path::PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!("harw-mode-test-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(root.join("ws")).expect("Test-Workspace anlegen");
+        std::fs::create_dir_all(root.join("ws")).map_err(ctx("Test-Workspace anlegen"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -300,18 +300,18 @@ mod tests {
                 root: std::path::PathBuf::from("ws"),
             }],
         )
-        .expect("Workspace-Registry bauen");
+        .map_err(ctx("Workspace-Registry bauen"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .expect("Workspace-Binding auflösen");
+            .map_err(ctx("Workspace-Binding auflösen"))?;
         let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
-        (
+        Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new()),
             root,
-        )
+        ))
     }
 
     /// Führt `/mode` aus und liefert den Bericht als JSON.
@@ -320,38 +320,34 @@ mod tests {
     /// Der Null-Controller zeichnet den Wunsch auf und gibt ihn im Snapshot
     /// zurück — genau das, was die Operation von einer echten Oberfläche
     /// erwartet, ohne eine TUI zu brauchen.
-    async fn run(args: ModeArgs) -> serde_json::Value {
-        let (ctx, root) = test_context_with_controller();
-        let result = super::mode(&ctx, args).await;
+    async fn run(args: ModeArgs) -> TestResult<serde_json::Value> {
+        let (op_ctx, root) = test_context_with_controller()?;
+        let result = super::mode(&op_ctx, args).await;
         std::fs::remove_dir_all(root).ok();
 
-        let output = match result {
-            Ok(output) => output,
-            Err(error) => panic!("/mode darf hier nicht fehlschlagen: {error}"),
-        };
-        match serde_json::from_str(&output.text) {
-            Ok(value) => value,
-            Err(error) => panic!("/mode-Ausgabe ist kein JSON: {error}"),
-        }
+        let output = result.map_err(|error| {
+            TestError::Unexpected(format!("/mode darf hier nicht fehlschlagen: {error}"))
+        })?;
+        serde_json::from_str(&output.text).map_err(ctx("/mode-Ausgabe ist kein JSON"))
     }
 
     /// Baut einen [`OpContext`] mit einem [`NullSessionController`] in der
     /// [`ServiceMap`].
-    fn test_context_with_controller() -> (OpContext, std::path::PathBuf) {
-        let (ctx, root) = test_context();
+    fn test_context_with_controller() -> TestResult<(OpContext, std::path::PathBuf)> {
+        let (op_ctx, root) = test_context()?;
         let controller: harw_operations::SharedSessionController =
             std::sync::Arc::new(harw_operations::session_control::NullSessionController::new());
         let mut services = ServiceMap::new();
         services.insert(controller);
-        (
+        Ok((
             OpContext::new(
-                ctx.session_id().clone(),
-                ctx.turn_id().clone(),
-                ctx.sandbox().clone(),
+                op_ctx.session_id().clone(),
+                op_ctx.turn_id().clone(),
+                op_ctx.sandbox().clone(),
                 services,
             ),
             root,
-        )
+        ))
     }
 
     #[test]
@@ -360,15 +356,14 @@ mod tests {
     }
 
     #[test]
-    fn test_mode_args_from_raw_args_without_tokens_is_show() {
-        match ModeArgs::from_raw_args(&toks(&[])) {
-            Ok(args) => assert_eq!(args, ModeArgs::Show),
-            Err(error) => panic!("unerwarteter Fehler: {error}"),
-        }
+    fn test_mode_args_from_raw_args_without_tokens_is_show() -> TestResult {
+        let args = ModeArgs::from_raw_args(&toks(&[])).map_err(ctx("ModeArgs::from_raw_args"))?;
+        assert_eq!(args, ModeArgs::Show);
+        Ok(())
     }
 
     #[test]
-    fn test_mode_args_from_raw_args_parses_every_subcommand() {
+    fn test_mode_args_from_raw_args_parses_every_subcommand() -> TestResult {
         for (token, expected) in [
             ("show", ModeArgs::Show),
             ("chat", ModeArgs::Chat),
@@ -377,23 +372,27 @@ mod tests {
             ("work", ModeArgs::Work),
             ("shell", ModeArgs::Shell),
         ] {
-            match ModeArgs::from_raw_args(&toks(&[token])) {
-                Ok(args) => assert_eq!(args, expected, "Subcommand '{token}'"),
-                Err(error) => panic!("Subcommand '{token}' schlug fehl: {error}"),
-            }
+            let args = ModeArgs::from_raw_args(&toks(&[token])).map_err(|error| {
+                TestError::Unexpected(format!("Subcommand '{token}' schlug fehl: {error}"))
+            })?;
+            assert_eq!(args, expected, "Subcommand '{token}'");
         }
+        Ok(())
     }
 
     #[test]
-    fn test_mode_args_from_raw_args_rejects_unknown_subcommand() {
+    fn test_mode_args_from_raw_args_rejects_unknown_subcommand() -> TestResult {
         match ModeArgs::from_raw_args(&toks(&["turbo"])) {
             Err(OpError::InvalidArguments(message)) => {
                 assert!(
                     message.contains("explore"),
                     "die Meldung muss die gültigen Subcommands nennen: {message}"
                 );
+                Ok(())
             }
-            other => panic!("erwartet InvalidArguments, war: {other:?}"),
+            other => Err(TestError::Unexpected(format!(
+                "erwartet InvalidArguments, war: {other:?}"
+            ))),
         }
     }
 
@@ -441,33 +440,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mode_show_before_any_switch_reports_unknown_mode() {
+    async fn test_mode_show_before_any_switch_reports_unknown_mode() -> TestResult {
         // Ein Controller ist da, hat aber nie einen Modus gesehen. Die Antwort
         // muss das zugeben statt `"chat"` zu erfinden — der Nutzer schließt aus
         // dem Modus auf Werkzeug- und Sandbox-Grenzen.
-        let report = run(ModeArgs::Show).await;
+        let report = run(ModeArgs::Show).await?;
         assert_eq!(report["action"], serde_json::json!("show"));
         assert_eq!(report["mode"], serde_json::Value::Null);
         assert_eq!(report["known"], serde_json::json!(false));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_mode_show_without_a_controller_is_an_error_not_an_empty_report() {
+    async fn test_mode_show_without_a_controller_is_an_error_not_an_empty_report() -> TestResult {
         // Ohne Controller gibt es keinen Adressaten. Ein beschönigendes
         // „unbekannt" wäre die falsche Auskunft: der wahre Befund ist
         // „nicht anschließbar".
-        let (ctx, root) = test_context();
-        let result = super::mode(&ctx, ModeArgs::Show).await;
+        let (op_ctx, root) = test_context()?;
+        let result = super::mode(&op_ctx, ModeArgs::Show).await;
         std::fs::remove_dir_all(root).ok();
         assert!(
             matches!(result, Err(OpError::NotAvailable(_))),
             "ohne Controller muss /mode fehlschlagen, war: {result:?}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_mode_switch_requests_the_mode_and_says_when_it_applies() {
-        let report = run(ModeArgs::Explore).await;
+    async fn test_mode_switch_requests_the_mode_and_says_when_it_applies() -> TestResult {
+        let report = run(ModeArgs::Explore).await?;
         assert_eq!(report["action"], serde_json::json!("switch"));
         assert_eq!(report["mode"], serde_json::json!("explore"));
         assert_eq!(
@@ -483,37 +484,37 @@ mod tests {
                 .is_some_and(|note| note.contains("Turn-Grenze")),
             "die Antwort muss sagen, wann der Wechsel wirkt: {report}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_mode_switch_is_visible_in_the_following_show() {
+    async fn test_mode_switch_is_visible_in_the_following_show() -> TestResult {
         // Der eigentliche Beweis, dass die Kette geschlossen ist: erst
         // wechseln, dann anzeigen — der Controller hat den Modus behalten.
-        let (ctx, root) = test_context_with_controller();
-        let switched = super::mode(&ctx, ModeArgs::Explore).await;
+        let (op_ctx, root) = test_context_with_controller()?;
+        let switched = super::mode(&op_ctx, ModeArgs::Explore).await;
         assert!(switched.is_ok(), "Wechsel schlug fehl: {switched:?}");
 
-        let shown = super::mode(&ctx, ModeArgs::Show).await;
+        let shown = super::mode(&op_ctx, ModeArgs::Show).await;
         std::fs::remove_dir_all(root).ok();
 
-        let output = match shown {
-            Ok(output) => output,
-            Err(error) => panic!("/mode show darf nicht fehlschlagen: {error}"),
-        };
-        let report: serde_json::Value = match serde_json::from_str(&output.text) {
-            Ok(value) => value,
-            Err(error) => panic!("/mode-Ausgabe ist kein JSON: {error}"),
-        };
+        let output = shown.map_err(|error| {
+            TestError::Unexpected(format!("/mode show darf nicht fehlschlagen: {error}"))
+        })?;
+        let report: serde_json::Value =
+            serde_json::from_str(&output.text).map_err(ctx("/mode-Ausgabe ist kein JSON"))?;
         assert_eq!(report["mode"], serde_json::json!("explore"));
         assert_eq!(report["known"], serde_json::json!(true));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_mode_lists_all_available_modes() {
-        let report = run(ModeArgs::Show).await;
+    async fn test_mode_lists_all_available_modes() -> TestResult {
+        let report = run(ModeArgs::Show).await?;
         assert_eq!(
             report["available_modes"],
             serde_json::json!(["chat", "plan", "explore", "work", "shell"])
         );
+        Ok(())
     }
 }

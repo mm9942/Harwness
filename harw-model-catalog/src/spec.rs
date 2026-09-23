@@ -166,9 +166,10 @@ pub struct ProviderSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestResult;
 
     #[test]
-    fn test_provider_api_kebab_case_serde() {
+    fn test_provider_api_kebab_case_serde() -> TestResult {
         // Jede Variante muss kebab-case serialisieren und wieder zurückparsen.
         let cases = [
             (ProviderApi::OpenAiResponses, "\"openai-responses\""),
@@ -177,43 +178,45 @@ mod tests {
             (ProviderApi::Ollama, "\"ollama\""),
         ];
         for (variant, expected) in cases {
-            let json = serde_json::to_string(&variant).expect("serialize ProviderApi");
+            let json = serde_json::to_string(&variant)?;
             assert_eq!(json, expected);
-            let back: ProviderApi = serde_json::from_str(&json).expect("deserialize ProviderApi");
+            let back: ProviderApi = serde_json::from_str(&json)?;
             assert_eq!(back, variant);
         }
+        Ok(())
     }
 
     #[test]
-    fn test_auth_method_tagged_serde() {
+    fn test_auth_method_tagged_serde() -> TestResult {
         let auth = AuthMethod::ApiKey {
             env_vars: vec!["OPENAI_API_KEY".to_owned(), "OPENAI_KEY".to_owned()],
         };
-        let json = serde_json::to_string(&auth).expect("serialize AuthMethod");
+        let json = serde_json::to_string(&auth)?;
         assert!(
             json.contains("\"method\":\"api-key\""),
             "tag present: {json}"
         );
         assert!(json.contains("OPENAI_API_KEY"));
-        let back: AuthMethod = serde_json::from_str(&json).expect("deserialize AuthMethod");
+        let back: AuthMethod = serde_json::from_str(&json)?;
         assert_eq!(back, auth);
+        Ok(())
     }
 
     #[test]
-    fn test_auth_method_unit_variants_tagged_serde() {
+    fn test_auth_method_unit_variants_tagged_serde() -> TestResult {
         let local = AuthMethod::LocalBaseUrl;
-        let json = serde_json::to_string(&local).expect("serialize LocalBaseUrl");
+        let json = serde_json::to_string(&local)?;
         assert_eq!(json, "{\"method\":\"local-base-url\"}");
-        let back: AuthMethod = serde_json::from_str(&json).expect("deserialize LocalBaseUrl");
+        let back: AuthMethod = serde_json::from_str(&json)?;
         assert_eq!(back, local);
 
-        let custom: AuthMethod =
-            serde_json::from_str("{\"method\":\"custom\"}").expect("deserialize custom");
+        let custom: AuthMethod = serde_json::from_str("{\"method\":\"custom\"}")?;
         assert_eq!(custom, AuthMethod::Custom);
+        Ok(())
     }
 
     #[test]
-    fn test_provider_spec_toml_roundtrip() {
+    fn test_provider_spec_toml_roundtrip() -> TestResult {
         let original = ProviderSpec {
             id: "openai".to_owned(),
             name: "OpenAI".to_owned(),
@@ -226,13 +229,14 @@ mod tests {
             featured: true,
             models: vec!["gpt-4o".to_owned(), "gpt-4o-mini".to_owned()],
         };
-        let serialized = toml::to_string(&original).expect("serialize ProviderSpec to TOML");
-        let back: ProviderSpec = toml::from_str(&serialized).expect("parse ProviderSpec from TOML");
+        let serialized = toml::to_string(&original)?;
+        let back: ProviderSpec = toml::from_str(&serialized)?;
         assert_eq!(back, original);
+        Ok(())
     }
 
     #[test]
-    fn test_provider_spec_toml_defaults() {
+    fn test_provider_spec_toml_defaults() -> TestResult {
         // Nur Pflichtfelder gesetzt; alle #[serde(default)]-Felder greifen.
         let toml = r#"
             id = "ollama"
@@ -240,12 +244,13 @@ mod tests {
             base_url = "http://localhost:11434"
             api = "ollama"
         "#;
-        let spec: ProviderSpec = toml::from_str(toml).expect("parse minimal ProviderSpec");
+        let spec: ProviderSpec = toml::from_str(toml)?;
         assert_eq!(spec.id, "ollama");
         assert_eq!(spec.api, ProviderApi::Ollama);
         assert!(spec.auth.is_empty());
         assert_eq!(spec.default_model, None);
         assert!(!spec.featured);
         assert!(spec.models.is_empty());
+        Ok(())
     }
 }

@@ -64,35 +64,42 @@ mod tests {
     use std::error::Error as _;
 
     use super::{SentinelError, SentinelResult};
+    use crate::test_support::{TestError, TestResult};
 
     // Erzeugt einen echten `SignalsError` für die Tests, ohne die
     // Digestbildung selbst anzustoßen: der `#[from]`-Pfad verhält sich
     // unabhängig davon, welcher Aufrufer ihn auslöst.
-    fn sample_signals_error() -> harw_dod_signals::SignalsError {
-        let json_err = serde_json::from_str::<serde_json::Value>("not json")
-            .expect_err("deliberately malformed JSON must fail to parse");
-        harw_dod_signals::SignalsError::from(json_err)
+    fn sample_signals_error() -> TestResult<harw_dod_signals::SignalsError> {
+        let Err(json_err) = serde_json::from_str::<serde_json::Value>("not json") else {
+            return Err(TestError::Unexpected(
+                "deliberately malformed JSON must fail to parse".into(),
+            ));
+        };
+        Ok(harw_dod_signals::SignalsError::from(json_err))
     }
 
     #[test]
-    fn test_evidence_display_includes_prefix_and_inner_message() {
-        let err = SentinelError::from(sample_signals_error());
+    fn test_evidence_display_includes_prefix_and_inner_message() -> TestResult {
+        let err = SentinelError::from(sample_signals_error()?);
         let display = err.to_string();
         assert!(display.starts_with("failed to freeze sentinel buffer contents into evidence:"));
+        Ok(())
     }
 
     #[test]
-    fn test_evidence_source_returns_inner_error() {
-        let err: SentinelError = sample_signals_error().into();
+    fn test_evidence_source_returns_inner_error() -> TestResult {
+        let err: SentinelError = sample_signals_error()?.into();
         assert!(err.source().is_some());
+        Ok(())
     }
 
     #[test]
-    fn test_sentinel_result_alias_carries_sentinel_error() {
-        fn always_fails() -> SentinelResult<()> {
-            Err(SentinelError::from(sample_signals_error()))
+    fn test_sentinel_result_alias_carries_sentinel_error() -> TestResult {
+        fn always_fails(signals_error: harw_dod_signals::SignalsError) -> SentinelResult<()> {
+            Err(SentinelError::from(signals_error))
         }
 
-        assert!(always_fails().is_err());
+        assert!(always_fails(sample_signals_error()?).is_err());
+        Ok(())
     }
 }

@@ -105,6 +105,7 @@ fn provider_toml_from(spec: &ProviderSpec) -> ProviderToml {
         max_concurrency: None,
         originator: None,
         default_reasoning_effort: None,
+        gateway_identity_headers: false,
     }
 }
 
@@ -138,25 +139,26 @@ fn env_auth_ref(spec: &ProviderSpec) -> Option<SecretRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
-    fn temporary_profile() -> PathBuf {
+    fn temporary_profile() -> TestResult<PathBuf> {
         let dir = std::env::temp_dir().join(format!(
             "harw-seed-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .expect("Systemzeit nach 1970")
+                .map_err(ctx("Systemzeit nach 1970"))?
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&dir).expect("temporäres Profil anlegen");
-        dir
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
     }
 
     #[test]
-    fn test_seed_writes_one_file_per_catalog_provider() {
-        let profile = temporary_profile();
+    fn test_seed_writes_one_file_per_catalog_provider() -> TestResult {
+        let profile = temporary_profile()?;
 
-        let written = seed_profile_providers(&profile).expect("seed providers");
+        let written = seed_profile_providers(&profile)?;
 
         assert_eq!(written.len(), crate::embedded_catalog().len());
         for spec in crate::embedded_catalog() {
@@ -170,101 +172,107 @@ mod tests {
             );
         }
 
-        std::fs::remove_dir_all(&profile).expect("Aufräumen");
+        std::fs::remove_dir_all(&profile)?;
+        Ok(())
     }
 
     #[test]
-    fn test_every_seeded_provider_is_disabled_and_carries_no_literal_key() {
-        let profile = temporary_profile();
+    fn test_every_seeded_provider_is_disabled_and_carries_no_literal_key() -> TestResult {
+        let profile = temporary_profile()?;
 
-        seed_profile_providers(&profile).expect("seed providers");
+        seed_profile_providers(&profile)?;
 
         for spec in crate::embedded_catalog() {
-            let path = profile
-                .join("providers")
-                .join(format!("{}.toml", spec.id));
-            let provider: ProviderToml =
-                toml::from_str(&std::fs::read_to_string(&path).expect("Datei lesbar"))
-                    .expect("als ProviderToml parsebar");
+            let path = profile.join("providers").join(format!("{}.toml", spec.id));
+            let provider: ProviderToml = toml::from_str(&std::fs::read_to_string(&path)?)?;
             assert!(!provider.enabled, "{} darf nicht aktiv sein", spec.id);
-            assert!(provider.api_key.is_none(), "{} trägt einen Klartextschlüssel", spec.id);
-            provider
-                .validate()
-                .unwrap_or_else(|error| panic!("{}: {error}", spec.id));
+            assert!(
+                provider.api_key.is_none(),
+                "{} trägt einen Klartextschlüssel",
+                spec.id
+            );
+            provider.validate().map_err(|error| TestError::Context {
+                context: "provider validate fehlgeschlagen",
+                source: format!("{}: {error}", spec.id),
+            })?;
         }
 
-        std::fs::remove_dir_all(&profile).expect("Aufräumen");
+        std::fs::remove_dir_all(&profile)?;
+        Ok(())
     }
 
     #[test]
-    fn test_seeded_api_key_provider_gets_env_reference() {
-        let profile = temporary_profile();
+    fn test_seeded_api_key_provider_gets_env_reference() -> TestResult {
+        let profile = temporary_profile()?;
 
-        seed_profile_providers(&profile).expect("seed providers");
+        seed_profile_providers(&profile)?;
 
-        let anthropic: ProviderToml = toml::from_str(
-            &std::fs::read_to_string(profile.join("providers").join("anthropic.toml"))
-                .expect("anthropic.toml lesbar"),
-        )
-        .expect("parsebar");
+        let anthropic: ProviderToml = toml::from_str(&std::fs::read_to_string(
+            profile.join("providers").join("anthropic.toml"),
+        )?)?;
 
         assert_eq!(anthropic.api, "anthropic-messages");
         assert!(matches!(anthropic.auth, Some(SecretRef::Env(_))));
         assert!(!anthropic.models.is_empty());
 
-        std::fs::remove_dir_all(&profile).expect("Aufräumen");
+        std::fs::remove_dir_all(&profile)?;
+        Ok(())
     }
 
     /// Lokale und manuell einzurichtende Provider haben keine Umgebungsvariable,
     /// auf die sich eine Referenz sinnvoll beziehen könnte.
     #[test]
-    fn test_local_and_custom_providers_are_seeded_without_auth() {
-        let profile = temporary_profile();
+    fn test_local_and_custom_providers_are_seeded_without_auth() -> TestResult {
+        let profile = temporary_profile()?;
 
-        seed_profile_providers(&profile).expect("seed providers");
+        seed_profile_providers(&profile)?;
 
         for id in ["ollama", "lmstudio", "custom", "cf-worker"] {
-            let provider: ProviderToml = toml::from_str(
-                &std::fs::read_to_string(profile.join("providers").join(format!("{id}.toml")))
-                    .expect("Datei lesbar"),
-            )
-            .expect("parsebar");
-            assert!(provider.auth.is_none(), "{id} sollte keine auth-Referenz tragen");
+            let provider: ProviderToml = toml::from_str(&std::fs::read_to_string(
+                profile.join("providers").join(format!("{id}.toml")),
+            )?)?;
+            assert!(
+                provider.auth.is_none(),
+                "{id} sollte keine auth-Referenz tragen"
+            );
         }
 
-        std::fs::remove_dir_all(&profile).expect("Aufräumen");
+        std::fs::remove_dir_all(&profile)?;
+        Ok(())
     }
 
     #[test]
-    fn test_seed_never_overwrites_an_existing_provider_file() {
-        let profile = temporary_profile();
+    fn test_seed_never_overwrites_an_existing_provider_file() -> TestResult {
+        let profile = temporary_profile()?;
         let providers = profile.join("providers");
-        std::fs::create_dir_all(&providers).expect("providers anlegen");
+        std::fs::create_dir_all(&providers)?;
         let mine = providers.join("openai.toml");
         let contents = "name = \"openai\"\napi = \"openai-responses\"\nbase_url = \"https://example.invalid/v1\"\nenabled = true\n";
-        std::fs::write(&mine, contents).expect("eigene Fassung schreiben");
+        std::fs::write(&mine, contents)?;
 
-        let written = seed_profile_providers(&profile).expect("seed providers");
+        let written = seed_profile_providers(&profile)?;
 
         assert!(!written.contains(&mine));
         assert_eq!(
-            std::fs::read_to_string(&mine).expect("lesbar"),
+            std::fs::read_to_string(&mine)?,
             contents,
             "eine vorhandene Provider-Datei darf nie überschrieben werden"
         );
 
-        std::fs::remove_dir_all(&profile).expect("Aufräumen");
+        std::fs::remove_dir_all(&profile)?;
+        Ok(())
     }
 
     #[test]
-    fn test_rerun_writes_nothing() {
-        let profile = temporary_profile();
+    fn test_rerun_writes_nothing() -> TestResult {
+        let profile = temporary_profile()?;
 
-        seed_profile_providers(&profile).expect("erster Lauf");
-        let second = seed_profile_providers(&profile).expect("zweiter Lauf");
+        seed_profile_providers(&profile)?;
+        let second = seed_profile_providers(&profile)?;
 
         assert!(second.is_empty());
 
-        std::fs::remove_dir_all(&profile).expect("Aufräumen");
+        std::fs::remove_dir_all(&profile)?;
+        Ok(())
     }
 }

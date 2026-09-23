@@ -137,18 +137,19 @@ pub(crate) const COMPACT_HINT: &str = "Verdichtung läuft automatisch beim Errei
 #[cfg(test)]
 mod tests {
     use super::CompactArgs;
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
-    use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
     use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn test_context() -> (OpContext, std::path::PathBuf) {
+    fn test_context() -> TestResult<(OpContext, std::path::PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root =
             std::env::temp_dir().join(format!("harw-compact-test-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(root.join("ws")).expect("create test workspace");
+        std::fs::create_dir_all(root.join("ws")).map_err(ctx("create test workspace"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -157,67 +158,71 @@ mod tests {
                 root: std::path::PathBuf::from("ws"),
             }],
         )
-        .expect("build workspace registry");
+        .map_err(ctx("build workspace registry"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .expect("resolve workspace binding");
+            .map_err(ctx("resolve workspace binding"))?;
         let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
-        (
+        Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new()),
             root,
-        )
+        ))
     }
 
     #[test]
-    fn test_compact_args_from_raw_args_joins_tokens_with_space() {
-        let args = CompactArgs::from_raw_args(&toks(&["a", "b"]));
-        match args {
-            Ok(a) => assert_eq!(a.instruction.as_deref(), Some("a b")),
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
-        }
+    fn test_compact_args_from_raw_args_joins_tokens_with_space() -> TestResult {
+        let args = CompactArgs::from_raw_args(&toks(&["a", "b"]))
+            .map_err(ctx("CompactArgs::from_raw_args"))?;
+        assert_eq!(args.instruction.as_deref(), Some("a b"));
+        Ok(())
     }
 
     #[test]
-    fn test_compact_args_from_raw_args_empty_tokens_sets_instruction_none() {
-        let args = CompactArgs::from_raw_args(&toks(&[]));
-        match args {
-            Ok(a) => assert!(a.instruction.is_none()),
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
-        }
+    fn test_compact_args_from_raw_args_empty_tokens_sets_instruction_none() -> TestResult {
+        let args =
+            CompactArgs::from_raw_args(&toks(&[])).map_err(ctx("CompactArgs::from_raw_args"))?;
+        assert!(args.instruction.is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn compact_without_hint_returns_not_available() {
-        let (ctx, root) = test_context();
+    async fn compact_without_hint_returns_not_available() -> TestResult {
+        let (op_ctx, root) = test_context()?;
 
-        let result = super::compact(&ctx, CompactArgs::default()).await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        let result = super::compact(&op_ctx, CompactArgs::default()).await;
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
 
         assert!(
             matches!(result, Err(OpError::NotAvailable(message)) if message == super::COMPACT_HINT)
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn compact_with_hint_returns_not_available_without_echoing_hint() {
-        let (ctx, root) = test_context();
+    async fn compact_with_hint_returns_not_available_without_echoing_hint() -> TestResult {
+        let (op_ctx, root) = test_context()?;
         let hint = "sensitive instruction that must not leak";
 
         let result = super::compact(
-            &ctx,
+            &op_ctx,
             CompactArgs {
                 instruction: Some(hint.to_owned()),
             },
         )
         .await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
 
         match result {
-            Err(OpError::NotAvailable(message)) => assert!(!message.contains(hint)),
-            other => panic!("expected NotAvailable, got: {other:?}"),
+            Err(OpError::NotAvailable(message)) => {
+                assert!(!message.contains(hint));
+                Ok(())
+            }
+            other => Err(TestError::Unexpected(format!(
+                "expected NotAvailable, got: {other:?}"
+            ))),
         }
     }
 }

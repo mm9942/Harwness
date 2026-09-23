@@ -125,7 +125,11 @@ pub struct IndexStatus {
 /// }
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub fn index_status(home: &Path, index_name: &str, visibility: &str) -> SourceResult<Option<IndexStatus>> {
+pub fn index_status(
+    home: &Path,
+    index_name: &str,
+    visibility: &str,
+) -> SourceResult<Option<IndexStatus>> {
     let store_root = harw_home::paths::visibility_index_dir(home, visibility)?;
     let store = LensStore::open(&store_root)?;
 
@@ -153,10 +157,11 @@ pub fn index_status(home: &Path, index_name: &str, visibility: &str) -> SourceRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
     use harw_lens_embed::{DeterministicEmbedder, EmbeddingDescriptor};
     use harw_lens_types::{Locality as Loc, SourceRef};
 
-    use crate::{build_index, RawDocument, DEFAULT_VISIBILITY};
+    use crate::{DEFAULT_VISIBILITY, RawDocument, build_index};
 
     fn descriptor() -> EmbeddingDescriptor {
         EmbeddingDescriptor {
@@ -167,16 +172,16 @@ mod tests {
     }
 
     #[test]
-    fn test_index_status_returns_none_for_never_built_index() {
-        let home = tempfile::tempdir().expect("tempdir");
-        let status = index_status(home.path(), "docs.design", DEFAULT_VISIBILITY)
-            .expect("no error for a missing index");
+    fn test_index_status_returns_none_for_never_built_index() -> TestResult {
+        let home = tempfile::tempdir()?;
+        let status = index_status(home.path(), "docs.design", DEFAULT_VISIBILITY)?;
         assert_eq!(status, None);
+        Ok(())
     }
 
     #[test]
-    fn test_index_status_reports_model_locality_and_chunk_count_after_build() {
-        let home = tempfile::tempdir().expect("tempdir");
+    fn test_index_status_reports_model_locality_and_chunk_count_after_build() -> TestResult {
+        let home = tempfile::tempdir()?;
         let documents = vec![RawDocument {
             source: SourceRef::File {
                 path: "intro.md".to_owned(),
@@ -194,12 +199,10 @@ mod tests {
             Metric::Cosine,
             &embedder,
             &descriptor(),
-        )
-        .expect("builds");
+        )?;
 
-        let status = index_status(home.path(), "docs.design", DEFAULT_VISIBILITY)
-            .expect("reads")
-            .expect("index exists after build");
+        let status = index_status(home.path(), "docs.design", DEFAULT_VISIBILITY)?
+            .ok_or(TestError::Missing("index exists after build"))?;
         assert_eq!(status.index_name, "docs.design");
         assert_eq!(status.visibility, DEFAULT_VISIBILITY);
         assert_eq!(status.model, "test-model");
@@ -208,12 +211,14 @@ mod tests {
         assert_eq!(status.dimension, Some(8));
         assert!(status.chunk_count > 0);
         assert!(status.modified.is_some());
+        Ok(())
     }
 
     #[test]
-    fn test_index_status_rejects_invalid_visibility_name() {
-        let home = tempfile::tempdir().expect("tempdir");
+    fn test_index_status_rejects_invalid_visibility_name() -> TestResult {
+        let home = tempfile::tempdir()?;
         let result = index_status(home.path(), "docs.design", "../escape");
         assert!(matches!(result, Err(crate::SourceError::Home(_))));
+        Ok(())
     }
 }

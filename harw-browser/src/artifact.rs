@@ -128,6 +128,7 @@ impl ArtifactRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn test_new_sets_fields_and_no_uri() {
@@ -153,19 +154,23 @@ mod tests {
     }
 
     #[test]
-    fn test_artifact_ref_serde_json_round_trip_without_uri() {
+    fn test_artifact_ref_serde_json_round_trip_without_uri() -> TestResult {
         let artifact = ArtifactRef::new(ArtifactKind::Html, "text/html", 2048);
-        let json = serde_json::to_string(&artifact).expect("artifact serializes");
-        let decoded: ArtifactRef = serde_json::from_str(&json).expect("artifact deserializes");
+        let json = serde_json::to_string(&artifact).map_err(ctx("artifact serializes"))?;
+        let decoded: ArtifactRef =
+            serde_json::from_str(&json).map_err(ctx("artifact deserializes"))?;
         assert_eq!(decoded, artifact);
+        Ok(())
     }
 
     #[test]
-    fn test_artifact_ref_serde_json_round_trip_with_uri() {
+    fn test_artifact_ref_serde_json_round_trip_with_uri() -> TestResult {
         let artifact = ArtifactRef::new(ArtifactKind::Screenshot, "image/png", 4096)
             .with_uri("file:///tmp/shot.png");
-        let json = serde_json::to_string(&artifact).expect("artifact serializes");
-        let decoded: ArtifactRef = serde_json::from_str(&json).expect("artifact deserializes");
+        let json = serde_json::to_string(&artifact).map_err(ctx("artifact serializes"))?;
+        let decoded: ArtifactRef =
+            serde_json::from_str(&json).map_err(ctx("artifact deserializes"))?;
         assert_eq!(decoded, artifact);
+        Ok(())
     }
 }

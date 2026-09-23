@@ -231,11 +231,13 @@ impl AuthConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn test_secretref_fromstr_env_ok() {
-        let r: SecretRef = "env:OPENAI_API_KEY".parse().unwrap();
+    fn test_secretref_fromstr_env_ok() -> TestResult {
+        let r: SecretRef = "env:OPENAI_API_KEY".parse().map_err(ctx("parse env ref"))?;
         assert_eq!(r, SecretRef::Env("OPENAI_API_KEY".to_owned()));
+        Ok(())
     }
 
     #[test]
@@ -251,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn test_auth_config_parses_toml() {
+    fn test_auth_config_parses_toml() -> TestResult {
         let toml_src = r#"
             [kek]
             provenance = "key_file"
@@ -260,17 +262,18 @@ mod tests {
             [credentials]
             openai-default = "env:OPENAI_API_KEY"
         "#;
-        let cfg: AuthConfig = toml::from_str(toml_src).unwrap();
+        let cfg: AuthConfig = toml::from_str(toml_src).map_err(ctx("parse toml"))?;
         assert_eq!(
             cfg.credentials.get("openai-default"),
             Some(&SecretRef::Env("OPENAI_API_KEY".to_owned()))
         );
+        Ok(())
     }
 
     #[test]
-    fn test_secretref_filejson_roundtrip() {
+    fn test_secretref_filejson_roundtrip() -> TestResult {
         let raw = "file-json:/etc/creds.json#/providers/openai/key";
-        let parsed: SecretRef = raw.parse().unwrap();
+        let parsed: SecretRef = raw.parse().map_err(ctx("parse file-json ref"))?;
         assert_eq!(
             parsed,
             SecretRef::FileJson {
@@ -280,6 +283,7 @@ mod tests {
         );
         assert_eq!(parsed.as_ref_string(), raw);
         assert_eq!(parsed.to_string(), raw);
+        Ok(())
     }
 
     #[test]
@@ -295,8 +299,10 @@ mod tests {
     }
 
     #[test]
-    fn test_secretref_filejson_splits_at_first_hash() {
-        let parsed: SecretRef = "file-json:/a/b.json#/x#y".parse().unwrap();
+    fn test_secretref_filejson_splits_at_first_hash() -> TestResult {
+        let parsed: SecretRef = "file-json:/a/b.json#/x#y"
+            .parse()
+            .map_err(ctx("parse file-json ref"))?;
         assert_eq!(
             parsed,
             SecretRef::FileJson {
@@ -304,10 +310,11 @@ mod tests {
                 pointer: "/x#y".to_owned(),
             }
         );
+        Ok(())
     }
 
     #[test]
-    fn test_auth_config_parses_credential_pool() {
+    fn test_auth_config_parses_credential_pool() -> TestResult {
         let toml_src = r#"
             [[credential_pool.openai]]
             secret = "env:OPENAI_API_KEY"
@@ -318,8 +325,11 @@ mod tests {
             [[credential_pool.openai]]
             secret = "file-json:/etc/creds.json#/openai/key"
         "#;
-        let cfg: AuthConfig = toml::from_str(toml_src).unwrap();
-        let pool = cfg.credential_pool.get("openai").unwrap();
+        let cfg: AuthConfig = toml::from_str(toml_src).map_err(ctx("parse toml"))?;
+        let pool = cfg
+            .credential_pool
+            .get("openai")
+            .ok_or(TestError::Missing("credential_pool.openai"))?;
         assert_eq!(pool.len(), 2);
         assert_eq!(pool[0].secret, SecretRef::Env("OPENAI_API_KEY".to_owned()));
         assert_eq!(pool[0].label.as_deref(), Some("primary"));
@@ -337,6 +347,7 @@ mod tests {
         );
         assert_eq!(pool[1].priority, 0);
         assert!(pool[1].label.is_none());
+        Ok(())
     }
 
     #[test]
@@ -361,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn test_credential_pool_ordered_sorts_ascending_by_priority() {
+    fn test_credential_pool_ordered_sorts_ascending_by_priority() -> TestResult {
         let toml_src = r#"
             [[credential_pool.openai]]
             secret = "env:OPENAI_KEY_HIGH_PRIORITY_NUMBER"
@@ -373,7 +384,7 @@ mod tests {
             [[credential_pool.openai]]
             secret = "env:OPENAI_KEY_DEFAULT_B"
         "#;
-        let cfg: AuthConfig = toml::from_str(toml_src).unwrap();
+        let cfg: AuthConfig = toml::from_str(toml_src).map_err(ctx("parse toml"))?;
         let ordered = cfg.credential_pool_ordered("openai");
         // Aufsteigend nach priority (0 vor 10); bei Gleichstand (0 == 0)
         // gewinnt die Datei-Reihenfolge (A vor B) — stabile Sortierung.
@@ -388,6 +399,7 @@ mod tests {
                 "env:OPENAI_KEY_HIGH_PRIORITY_NUMBER".to_owned(),
             ]
         );
+        Ok(())
     }
 
     #[test]

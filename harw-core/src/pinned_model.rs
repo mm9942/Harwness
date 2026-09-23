@@ -116,6 +116,7 @@ impl ModelProvider for PinnedModelProvider {
 mod tests {
     use super::*;
     use crate::history::ConversationHistory;
+    use crate::test_support::{TestError, TestResult};
     use crate::testing::RecordingModelProvider;
     use harw_extension_api::LoadedInstructions;
 
@@ -128,7 +129,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pinned_model_provider_sets_pinned_ids() {
+    async fn test_pinned_model_provider_sets_pinned_ids() -> TestResult {
         let recorder = RecordingModelProvider::new();
         let inner: Arc<dyn ModelProvider> = Arc::new(recorder.clone());
         let pinned_provider = ProviderId::from("openrouter");
@@ -141,15 +142,18 @@ mod tests {
         assert!(provider.is_pinned());
 
         let request = make_request();
-        let _ = provider.respond(request).await.unwrap();
+        let _ = provider.respond(request).await?;
 
-        let recorded = recorder.last().expect("request must have been forwarded");
+        let recorded = recorder
+            .last()
+            .ok_or(TestError::Missing("request must have been forwarded"))?;
         assert_eq!(recorded.model_id, Some(pinned_model));
         assert_eq!(recorded.provider_id, Some(pinned_provider));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_pinned_model_provider_unpinned_passes_through_unchanged() {
+    async fn test_pinned_model_provider_unpinned_passes_through_unchanged() -> TestResult {
         let recorder = RecordingModelProvider::new();
         let inner: Arc<dyn ModelProvider> = Arc::new(recorder.clone());
         let provider = PinnedModelProvider::new(inner, None, None);
@@ -159,10 +163,13 @@ mod tests {
         assert!(request.model_id.is_none());
         assert!(request.provider_id.is_none());
 
-        let _ = provider.respond(request).await.unwrap();
+        let _ = provider.respond(request).await?;
 
-        let recorded = recorder.last().expect("request must have been forwarded");
+        let recorded = recorder
+            .last()
+            .ok_or(TestError::Missing("request must have been forwarded"))?;
         assert!(recorded.model_id.is_none());
         assert!(recorded.provider_id.is_none());
+        Ok(())
     }
 }

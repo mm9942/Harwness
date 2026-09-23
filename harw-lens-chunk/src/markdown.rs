@@ -158,6 +158,7 @@ fn is_fence_delimiter(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     fn file_source() -> SourceRef {
         SourceRef::File {
@@ -165,7 +166,7 @@ mod tests {
         }
     }
 
-    fn assert_gapless(text: &str, chunks: &[Chunk]) {
+    fn assert_gapless(text: &str, chunks: &[Chunk]) -> TestResult {
         assert!(!chunks.is_empty(), "expected at least one chunk");
         assert_eq!(chunks[0].span.start, 0);
         for pair in chunks.windows(2) {
@@ -174,11 +175,14 @@ mod tests {
                 "chunks must be contiguous without gaps or overlap"
             );
         }
-        let last = chunks.last().expect("checked non-empty above");
+        let last = chunks
+            .last()
+            .ok_or(TestError::Missing("checked non-empty above"))?;
         assert_eq!(last.span.end, text.len());
         for chunk in chunks {
             assert_eq!(&text[chunk.span.start..chunk.span.end], chunk.text);
         }
+        Ok(())
     }
 
     #[test]
@@ -195,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_markdown_splits_at_headings() {
+    fn test_chunk_markdown_splits_at_headings() -> TestResult {
         let text = "Vorspann.\n\n# Erste\n\nText A.\n\n## Zweite\n\nText B.\n";
         let chunks = chunk_markdown(&file_source(), text);
         assert_eq!(chunks.len(), 3);
@@ -203,7 +207,8 @@ mod tests {
         assert!(chunks[1].text.starts_with("# Erste"));
         assert!(chunks[1].text.contains("Text A."));
         assert!(chunks[2].text.starts_with("## Zweite"));
-        assert_gapless(text, &chunks);
+        assert_gapless(text, &chunks)?;
+        Ok(())
     }
 
     #[test]
@@ -215,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_markdown_code_block_spanning_heading_marker_stays_whole() {
+    fn test_chunk_markdown_code_block_spanning_heading_marker_stays_whole() -> TestResult {
         // The '#' line inside the fence looks like a heading but must not
         // split the code block.
         let text = "# Titel\n\n```bash\n# this looks like a heading\necho hi\n```\n\n## Nächste\n";
@@ -226,14 +231,16 @@ mod tests {
         assert!(chunks[0].text.contains("echo hi"));
         assert!(chunks[0].text.trim_end().ends_with("```"));
         assert!(chunks[1].text.starts_with("## Nächste"));
-        assert_gapless(text, &chunks);
+        assert_gapless(text, &chunks)?;
+        Ok(())
     }
 
     #[test]
-    fn test_chunk_markdown_byte_spans_cover_text_without_gaps() {
+    fn test_chunk_markdown_byte_spans_cover_text_without_gaps() -> TestResult {
         let text = "# A\n\ntext\n\n# B\n\nmore\n\n### C\nend";
         let chunks = chunk_markdown(&file_source(), text);
-        assert_gapless(text, &chunks);
+        assert_gapless(text, &chunks)?;
+        Ok(())
     }
 
     #[test]

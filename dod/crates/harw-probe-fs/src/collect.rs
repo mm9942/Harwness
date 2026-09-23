@@ -67,7 +67,11 @@ use crate::sink::EventSink;
 /// - [`ProbeError::Sensor`]: wenn `sensor.poll` scheitert.
 /// - Der Fehler von [`EventSink::send`]: wenn das Senden eines Ereignisses
 ///   scheitert.
-pub fn run_once(sensor: &FsMonSensor, sink: &dyn EventSink, now: Timestamp) -> Result<usize, ProbeError> {
+pub fn run_once(
+    sensor: &FsMonSensor,
+    sink: &dyn EventSink,
+    now: Timestamp,
+) -> Result<usize, ProbeError> {
     let reading = sensor.poll(now)?;
     for event in &reading.events {
         sink.send(event)?;
@@ -126,6 +130,7 @@ mod tests {
     use super::run_once;
     use crate::error::ProbeError;
     use crate::sink::EventSink;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Test-Senke: zeichnet jedes gesendete Ereignis auf, statt es zu
     /// übertragen. Öffnet keinen Socket.
@@ -136,21 +141,32 @@ mod tests {
 
     impl EventSink for RecordingSink {
         fn send(&self, event: &SecurityEvent) -> Result<(), ProbeError> {
+            // Ein vergifteter Test-Mutex zeigt an, dass ein vorheriger Aufruf
+            // in diesem Thread bereits gescheitert ist; das entspricht
+            // semantisch einem fehlgeschlagenen Sendeversuch.
             self.sent
                 .lock()
-                .expect("test mutex is never poisoned")
+                .map_err(|_| ProbeError::SentinelSendFailed)?
                 .push(event.clone());
             Ok(())
         }
     }
 
     fn sensor_with(scope: ReadScope, events: Vec<RawFsEvent>) -> FsMonSensor {
-        let handle = SensorHandle::new(SensorId::from_str("fsmon-test"), Capability::WatchFilesystem).bind(scope);
-        FsMonSensor::new(handle, Box::new(FixtureFsEventSource::new(events)), PathBuf::from("/proc"))
+        let handle = SensorHandle::new(
+            SensorId::from_str("fsmon-test"),
+            Capability::WatchFilesystem,
+        )
+        .bind(scope);
+        FsMonSensor::new(
+            handle,
+            Box::new(FixtureFsEventSource::new(events)),
+            PathBuf::from("/proc"),
+        )
     }
 
     #[test]
-    fn test_run_once_forwards_every_event_from_the_source_to_the_sink() {
+    fn test_run_once_forwards_every_event_from_the_source_to_the_sink() -> TestResult {
         let scope = ReadScope::from_roots([PathBuf::from("/srv/data")]);
         let sensor = sensor_with(
             scope,
@@ -163,16 +179,21 @@ mod tests {
         );
         let sink = RecordingSink::default();
 
-        let sent = run_once(&sensor, &sink, Timestamp::UNIX_EPOCH).expect("fixture source never fails");
+        let sent = run_once(&sensor, &sink, Timestamp::UNIX_EPOCH)
+            .map_err(ctx("fixture source never fails"))?;
 
         assert_eq!(sent, 1);
-        let recorded = sink.sent.lock().expect("test mutex is never poisoned");
+        let recorded = sink
+            .sent
+            .lock()
+            .map_err(ctx("test mutex is never poisoned"))?;
         assert_eq!(recorded.len(), 1);
         assert!(matches!(recorded[0].kind, EventKind::FileWrite { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_run_once_drops_an_event_outside_the_read_scope() {
+    fn test_run_once_drops_an_event_outside_the_read_scope() -> TestResult {
         let scope = ReadScope::from_roots([PathBuf::from("/srv/data")]);
         let sensor = sensor_with(
             scope,
@@ -185,27 +206,37 @@ mod tests {
         );
         let sink = RecordingSink::default();
 
-        let sent = run_once(&sensor, &sink, Timestamp::UNIX_EPOCH).expect("shaping itself does not fail here");
+        let sent = run_once(&sensor, &sink, Timestamp::UNIX_EPOCH)
+            .map_err(ctx("shaping itself does not fail here"))?;
 
         assert_eq!(sent, 0);
-        assert!(sink.sent.lock().expect("test mutex is never poisoned").is_empty());
+        assert!(
+            sink.sent
+                .lock()
+                .map_err(ctx("test mutex is never poisoned"))?
+                .is_empty()
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_run_once_forwards_zero_events_for_an_empty_fixture() {
+    fn test_run_once_forwards_zero_events_for_an_empty_fixture() -> TestResult {
         let scope = ReadScope::from_roots([PathBuf::from("/srv/data")]);
         let sensor = sensor_with(scope, vec![]);
         let sink = RecordingSink::default();
 
-        let sent = run_once(&sensor, &sink, Timestamp::UNIX_EPOCH).expect("empty fixture never fails");
+        let sent = run_once(&sensor, &sink, Timestamp::UNIX_EPOCH)
+            .map_err(ctx("empty fixture never fails"))?;
         assert_eq!(sent, 0);
+        Ok(())
     }
 
     #[test]
-    fn test_run_once_forwarded_event_carries_no_file_content() {
-        let dir = tempfile::tempdir().expect("tempdir for fixture target");
+    fn test_run_once_forwarded_event_carries_no_file_content() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir for fixture target"))?;
         let secret_path = dir.path().join("secret.txt");
-        std::fs::write(&secret_path, b"TOP-SECRET-CONTENT-1234").expect("write fixture file");
+        std::fs::write(&secret_path, b"TOP-SECRET-CONTENT-1234")
+            .map_err(ctx("write fixture file"))?;
 
         let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
         let sensor = sensor_with(
@@ -219,16 +250,21 @@ mod tests {
         );
         let sink = RecordingSink::default();
 
-        run_once(&sensor, &sink, Timestamp::UNIX_EPOCH).expect("fixture source never fails");
+        run_once(&sensor, &sink, Timestamp::UNIX_EPOCH)
+            .map_err(ctx("fixture source never fails"))?;
 
-        let recorded = sink.sent.lock().expect("test mutex is never poisoned");
+        let recorded = sink
+            .sent
+            .lock()
+            .map_err(ctx("test mutex is never poisoned"))?;
         assert_eq!(recorded.len(), 1);
-        let json = serde_json::to_string(&recorded[0]).expect("SecurityEvent serializes");
+        let json = serde_json::to_string(&recorded[0]).map_err(ctx("SecurityEvent serializes"))?;
         assert!(!json.contains("TOP-SECRET-CONTENT-1234"));
+        Ok(())
     }
 
     #[test]
-    fn test_run_once_stops_at_the_first_sink_error() {
+    fn test_run_once_stops_at_the_first_sink_error() -> TestResult {
         struct FailingSink;
         impl EventSink for FailingSink {
             fn send(&self, _event: &SecurityEvent) -> Result<(), ProbeError> {
@@ -247,8 +283,12 @@ mod tests {
             }],
         );
 
-        let err = run_once(&sensor, &FailingSink, Timestamp::UNIX_EPOCH)
-            .expect_err("a sink failure must propagate");
+        let Err(err) = run_once(&sensor, &FailingSink, Timestamp::UNIX_EPOCH) else {
+            return Err(TestError::Unexpected(
+                "a sink failure must propagate".into(),
+            ));
+        };
         assert!(matches!(err, ProbeError::SentinelSendFailed));
+        Ok(())
     }
 }

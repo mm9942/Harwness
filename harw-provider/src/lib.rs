@@ -31,6 +31,8 @@ pub mod openai;
 pub mod provider;
 pub mod registry;
 pub mod slots;
+#[cfg(test)]
+mod test_support;
 
 // ===== Error surface =====
 pub use error::{ProviderError, ProviderFailure, ProviderResult};
@@ -93,25 +95,24 @@ pub use provider::{
 
 // ===== Registry surface =====
 pub use registry::{
-    provider_registry, provider_registry_read, provider_registry_write, register_provider,
-    resolve_primary_provider, resolve_provider, resolve_provider_chain,
-    resolve_secondary_providers, unregister_provider, HashMapProviderRegistry, ProviderRegistry,
-    VecProviderRegistry, PROVIDERS,
+    HashMapProviderRegistry, PROVIDERS, ProviderRegistry, VecProviderRegistry, provider_registry,
+    provider_registry_read, provider_registry_write, register_provider, resolve_primary_provider,
+    resolve_provider, resolve_provider_chain, resolve_secondary_providers, unregister_provider,
 };
 
 // ===== Chain / override surface =====
 pub use chain::{
-    resolve_provider_chain_with_override, AgentProviderOverride, ResolvedProviderChain, VecOp,
+    AgentProviderOverride, ResolvedProviderChain, VecOp, resolve_provider_chain_with_override,
 };
 
 // ===== Invocation surface =====
 pub use invocation::{
-    invoke_primary, invoke_with_failover, InvocationRequest, InvocationResponse, ProviderInvoker,
+    InvocationRequest, InvocationResponse, ProviderInvoker, invoke_primary, invoke_with_failover,
 };
 
 // ===== Macro output targets (Note 12 §18) =====
 pub use slots::{
-    install_model_definition, install_provider_definition, ModelDefinitionSpec, ProviderDefinition,
+    ModelDefinitionSpec, ProviderDefinition, install_model_definition, install_provider_definition,
 };
 
 // Re-export the shared ID newtypes so downstream code can stay on a single path.

@@ -131,3 +131,7 @@ pub use error::{FsMonError, FsMonResult};
 pub use raw::{FixtureFsEventSource, FsEventSource, RawFsEvent};
 pub use sensor::FsMonSensor;
 pub use shape::shape_event;
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

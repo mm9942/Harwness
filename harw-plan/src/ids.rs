@@ -209,9 +209,7 @@ impl PartialEq<String> for PlanId {
 /// let id: TaskId = "task-42".parse().unwrap();
 /// assert_eq!(id.as_str(), "task-42");
 /// ```
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, harw_macros::HarwId,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, harw_macros::HarwId)]
 // `infallible` erhaelt den unvalidierten `new(impl Into<String>)`, den der
 // Bestand ueberall benutzt. `try_new` kommt zusaetzlich dazu und weist leere
 // oder nur aus Steuerzeichen bestehende Bezeichner ab — das Derive liefert
@@ -219,7 +217,6 @@ impl PartialEq<String> for PlanId {
 // brechen.
 #[harw_id(infallible, error = "crate::error::PlanError", ctor = "empty_id")]
 pub struct TaskId(String);
-
 
 /// Monoton steigende Revisionskennung eines Plans.
 ///
@@ -460,9 +457,7 @@ impl FromStr for PathOrSymbol {
 /// let c = ContractRef::new("PlanStore::apply");
 /// assert_eq!(c.as_str(), "PlanStore::apply");
 /// ```
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, harw_macros::HarwId,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, harw_macros::HarwId)]
 // `infallible` erhaelt den unvalidierten `new(impl Into<String>)`, den der
 // Bestand ueberall benutzt. `try_new` kommt zusaetzlich dazu und weist leere
 // oder nur aus Steuerzeichen bestehende Bezeichner ab — das Derive liefert
@@ -471,10 +466,10 @@ impl FromStr for PathOrSymbol {
 #[harw_id(infallible, error = "crate::error::PlanError", ctor = "empty_id")]
 pub struct ContractRef(String);
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
     use crate::types::PlanNode;
 
     /// Ein `PlanNode`, wie ihn ein Plan aus der Newtype-Ära auf Platte hat:
@@ -499,29 +494,31 @@ mod tests {
         "updated_at": "1970-01-01T00:00:00Z"
     }"#;
 
-    /// Hilft den Tests ohne `unwrap()`/`expect()` aus.
-    fn ok_or_panic<T, E: fmt::Display>(result: Result<T, E>, context: &str) -> T {
-        match result {
-            Ok(value) => value,
-            Err(error) => panic!("{context}: {error}"),
-        }
+    /// Hilft den Tests ohne `unwrap()`/`expect()` aus (Bible R087/R165).
+    fn ok_or_err<T, E: fmt::Display>(result: Result<T, E>, context: &'static str) -> TestResult<T> {
+        result.map_err(|error| TestError::Context {
+            context,
+            source: error.to_string(),
+        })
     }
 
     #[test]
-    fn test_plan_id_newtype_roundtrip() {
+    fn test_plan_id_newtype_roundtrip() -> TestResult {
         let id = PlanId::new("plan-abc");
-        let json = ok_or_panic(serde_json::to_string(&id), "PlanId serialisieren");
-        let back: PlanId = ok_or_panic(serde_json::from_str(&json), "PlanId deserialisieren");
+        let json = ok_or_err(serde_json::to_string(&id), "PlanId serialisieren")?;
+        let back: PlanId = ok_or_err(serde_json::from_str(&json), "PlanId deserialisieren")?;
         assert_eq!(id, back);
         assert_eq!(back.as_str(), "plan-abc");
+        Ok(())
     }
 
     #[test]
-    fn test_revision_id_from_str() {
-        let r: RevisionId = ok_or_panic("42".parse(), "RevisionId parsen");
+    fn test_revision_id_from_str() -> TestResult {
+        let r: RevisionId = ok_or_err("42".parse(), "RevisionId parsen")?;
         assert_eq!(r.value(), 42);
         assert_eq!(r.next().value(), 43);
         assert!(r > RevisionId::new(0));
+        Ok(())
     }
 
     // ── PathOrSymbol: Serde-Kompatibilität ──────────────────────────────────
@@ -531,11 +528,11 @@ mod tests {
     /// lesbar bleiben und als `Path(_)` ankommen. Schlägt er fehl, ist jede
     /// bestehende `plan.json` und jede `history.jsonl` unlesbar geworden.
     #[test]
-    fn legacy_plan_json_with_plain_string_scopes_stays_readable() {
-        let node: PlanNode = ok_or_panic(
+    fn legacy_plan_json_with_plain_string_scopes_stays_readable() -> TestResult {
+        let node: PlanNode = ok_or_err(
             serde_json::from_str(LEGACY_PLAN_NODE_JSON),
             "Alt-Plan mit String-Scopes deserialisieren",
-        );
+        )?;
 
         assert_eq!(
             node.write_scope,
@@ -564,20 +561,21 @@ mod tests {
 
         // Rückrichtung: erneut serialisiert steht dort wieder ein schlichter
         // String — ein Alt-Leser bleibt lesefähig.
-        let value = ok_or_panic(serde_json::to_value(&node), "PlanNode serialisieren");
+        let value = ok_or_err(serde_json::to_value(&node), "PlanNode serialisieren")?;
         assert_eq!(
             value.get("write_scope"),
             Some(&serde_json::json!(["src/lib.rs"])),
             "Path-Einträge müssen als schlichte Strings zurückgeschrieben werden"
         );
+        Ok(())
     }
 
     #[test]
-    fn legacy_scope_list_of_plain_strings_deserializes_as_path() {
-        let scopes: Vec<PathOrSymbol> = ok_or_panic(
+    fn legacy_scope_list_of_plain_strings_deserializes_as_path() -> TestResult {
+        let scopes: Vec<PathOrSymbol> = ok_or_err(
             serde_json::from_str(r#"["src/lib.rs", "src/", "src/**/*.rs", "TraitName"]"#),
             "Scope-Liste deserialisieren",
-        );
+        )?;
 
         assert_eq!(scopes.len(), 4);
         for scope in &scopes {
@@ -586,34 +584,36 @@ mod tests {
                 "{scope:?} muss Path sein — auch ein Eintrag ohne / und ."
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn path_variant_serializes_as_plain_string() {
-        let json = ok_or_panic(
+    fn path_variant_serializes_as_plain_string() -> TestResult {
+        let json = ok_or_err(
             serde_json::to_string(&PathOrSymbol::new("src/lib.rs")),
             "Path serialisieren",
-        );
+        )?;
         assert_eq!(json, "\"src/lib.rs\"", "Wire-Form des Newtypes bleibt");
+        Ok(())
     }
 
     #[test]
-    fn symbol_roundtrip_is_lossless() {
+    fn symbol_roundtrip_is_lossless() -> TestResult {
         let original = PathOrSymbol::symbol("src/store.rs", "PlanStore");
-        let json = ok_or_panic(serde_json::to_string(&original), "Symbol serialisieren");
-        let back: PathOrSymbol =
-            ok_or_panic(serde_json::from_str(&json), "Symbol deserialisieren");
+        let json = ok_or_err(serde_json::to_string(&original), "Symbol serialisieren")?;
+        let back: PathOrSymbol = ok_or_err(serde_json::from_str(&json), "Symbol deserialisieren")?;
 
         assert_eq!(back, original, "Symbol-Roundtrip muss verlustfrei sein");
         assert_eq!(back.symbol_name(), Some("PlanStore"));
         assert_eq!(back.as_str(), "src/store.rs");
 
-        let value = ok_or_panic(serde_json::to_value(&original), "Symbol als Value");
+        let value = ok_or_err(serde_json::to_value(&original), "Symbol als Value")?;
         assert_eq!(
             value,
             serde_json::json!({"path": "src/store.rs", "symbol": "PlanStore"}),
             "Symbol serialisiert als Objekt, nicht als String"
         );
+        Ok(())
     }
 
     // ── PathOrSymbol: unveränderte Semantik der Bestandsmethoden ────────────
@@ -648,36 +648,59 @@ mod tests {
     }
 
     #[test]
-    fn from_str_never_infers_a_symbol() {
-        let parsed: PathOrSymbol = ok_or_panic("src/lib.rs::PlanStore".parse(), "parse");
+    fn from_str_never_infers_a_symbol() -> TestResult {
+        let parsed: PathOrSymbol = ok_or_err("src/lib.rs::PlanStore".parse(), "parse")?;
         assert_eq!(
             parsed,
             PathOrSymbol::Path("src/lib.rs::PlanStore".to_owned()),
             "`::` darf nicht als Symbol-Trenner gedeutet werden"
         );
+        Ok(())
     }
 
     // ── PlanId-Grammatik (F-013, G-032) ─────────────────────────────────────
 
     #[test]
-    fn test_plan_id_parse_accepts_existing_ids() {
+    fn test_plan_id_parse_accepts_existing_ids() -> TestResult {
         for raw in [
-            "p-1", "plan-abc", "p-test", "restart", "update-rollback", "plan-cli",
-            "plan-analyze", "0", "a",
+            "p-1",
+            "plan-abc",
+            "p-test",
+            "restart",
+            "update-rollback",
+            "plan-cli",
+            "plan-analyze",
+            "0",
+            "a",
         ] {
-            let id = ok_or_panic(PlanId::parse(raw), raw);
+            let id = ok_or_err(PlanId::parse(raw), raw)?;
             assert_eq!(id.as_str(), raw);
             assert!(id.is_valid());
         }
         let max = "a".repeat(PLAN_ID_MAX_LEN);
         assert!(PlanId::parse(&max).is_ok(), "64 Zeichen sind erlaubt");
+        Ok(())
     }
 
     #[test]
     fn test_plan_id_parse_rejects_traversal_and_separators() {
         for raw in [
-            "", "..", ".", "../x", "../../etc", "a/b", "/abs", "a\\b", "a.b", "-lead",
-            "a b", "a\tb", "a\nb", "a\0b", "p_1", "P-1",
+            "",
+            "..",
+            ".",
+            "../x",
+            "../../etc",
+            "a/b",
+            "/abs",
+            "a\\b",
+            "a.b",
+            "-lead",
+            "a b",
+            "a\tb",
+            "a\nb",
+            "a\0b",
+            "p_1",
+            "P-1",
         ] {
             let result = PlanId::parse(raw);
             assert!(
@@ -696,8 +719,17 @@ mod tests {
     fn test_plan_id_parse_rejects_unicode() {
         // Kyrillisches а (Homoglyph), Bidi-Override, Zeilentrenner, Umlaut,
         // Fullwidth-Solidus.
-        for raw in ["p-\u{0430}", "p\u{202E}1", "p\u{2028}1", "plän", "a\u{FF0F}b"] {
-            assert!(PlanId::parse(raw).is_err(), "{raw:?} muss abgewiesen werden");
+        for raw in [
+            "p-\u{0430}",
+            "p\u{202E}1",
+            "p\u{2028}1",
+            "plän",
+            "a\u{FF0F}b",
+        ] {
+            assert!(
+                PlanId::parse(raw).is_err(),
+                "{raw:?} muss abgewiesen werden"
+            );
         }
     }
 

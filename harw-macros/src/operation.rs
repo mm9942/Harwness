@@ -44,7 +44,12 @@ use syn::{FnArg, ItemFn, LitStr, Type, spanned::Spanned};
 /// zurückfallen; einer, der nur dort steht, ist gar nicht deklarierbar — das
 /// Makro weist ihn ab. Beide Richtungen scheitern also sichtbar, sobald jemand
 /// den Reducer tatsächlich benutzt.
-const KNOWN_AUTHORITY_REDUCERS: &[&str] = &["reduce_to_read_only", "reduce_to_read_execute", "reduce_to_read_registry", "reduce_to_read_network"];
+const KNOWN_AUTHORITY_REDUCERS: &[&str] = &[
+    "reduce_to_read_only",
+    "reduce_to_read_execute",
+    "reduce_to_read_registry",
+    "reduce_to_read_network",
+];
 
 /// All parsed attribute arguments for `#[operation]`, collected into a single struct
 /// so that `expand_operation` does not exceed Clippy's argument-count limit.
@@ -124,9 +129,7 @@ pub(crate) struct OperationArgs {
 ///
 /// # Design-doc reference
 /// Spec section: "API-Design des Makros" in the `harw-macros` extension brief.
-pub(crate) fn parse_operation_args(
-    attr: proc_macro2::TokenStream,
-) -> syn::Result<OperationArgs> {
+pub(crate) fn parse_operation_args(attr: proc_macro2::TokenStream) -> syn::Result<OperationArgs> {
     let mut op_name: Option<LitStr> = None;
     let mut op_summary: Option<LitStr> = None;
     let mut op_domain: Option<LitStr> = None;
@@ -404,8 +407,8 @@ pub(crate) fn expand_operation(
         });
 
     // --- Build category token (explicit or derived from domain) --------------
-    let category_tokens = match op_category.as_ref().map(|l| l.value()) {
-        Some(v) => match v.as_str() {
+    let category_tokens = match op_category.as_ref() {
+        Some(lit) => match lit.value().as_str() {
             "model" => quote! { ::harw_operations::OperationCategory::Model },
             "agent" => quote! { ::harw_operations::OperationCategory::Agent },
             "session" => quote! { ::harw_operations::OperationCategory::Session },
@@ -414,7 +417,7 @@ pub(crate) fn expand_operation(
             "misc" => quote! { ::harw_operations::OperationCategory::Misc },
             other => {
                 return Err(syn::Error::new_spanned(
-                    op_category.as_ref().unwrap(),
+                    lit,
                     format!(
                         "unknown `category` value `{other}`; expected one of: model, agent, session, system, knowledge, misc"
                     ),
@@ -860,6 +863,7 @@ fn map_web_method(lit: &LitStr) -> syn::Result<proc_macro2::TokenStream> {
 #[cfg(test)]
 mod operation_tests {
     use super::{expand_operation, parse_operation_args};
+    use crate::test_support::{TestError, TestResult, ctx};
     use quote::quote;
     use syn::ItemFn;
 
@@ -874,7 +878,7 @@ mod operation_tests {
 
     /// Expandiert eine minimale Operation mit dem übergebenen Argument-Typ und
     /// gibt den normalisierten Token-Strom zurück.
-    fn expand_with_args_type(args_type: proc_macro2::TokenStream) -> String {
+    fn expand_with_args_type(args_type: proc_macro2::TokenStream) -> TestResult<String> {
         let func: ItemFn = syn::parse_quote! {
             async fn demo_op(ctx: &OpContext, args: #args_type) -> Result<OpOutput, OpError> {
                 let _ = (ctx, args);
@@ -885,28 +889,27 @@ mod operation_tests {
             name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
             model_tool(readonly)
         };
-        let Ok(args) = parse_operation_args(attr) else {
-            panic!("die Attribut-Schlüssel sind gültig und müssen parsen");
-        };
-        let Ok(tokens) = expand_operation(func, args) else {
-            panic!("eine gültige Operation muss expandieren");
-        };
-        normalize(&tokens)
+        let args = parse_operation_args(attr)
+            .map_err(ctx("die Attribut-Schlüssel sind gültig und müssen parsen"))?;
+        let tokens =
+            expand_operation(func, args).map_err(ctx("eine gültige Operation muss expandieren"))?;
+        Ok(normalize(&tokens))
     }
 
     #[test]
-    fn expand_operation_emits_args_schema_field() {
-        let flat = expand_with_args_type(quote!(DemoArgs));
+    fn expand_operation_emits_args_schema_field() -> TestResult {
+        let flat = expand_with_args_type(quote!(DemoArgs))?;
 
         assert!(
             flat.contains("args_schema:"),
             "das erzeugte OperationMeta muss das Feld `args_schema` setzen"
         );
+        Ok(())
     }
 
     #[test]
-    fn expand_operation_binds_args_schema_through_the_probe() {
-        let flat = expand_with_args_type(quote!(DemoArgs));
+    fn expand_operation_binds_args_schema_through_the_probe() -> TestResult {
+        let flat = expand_with_args_type(quote!(DemoArgs))?;
 
         assert!(
             flat.contains("::harw_operations::operation::ArgsSchemaProbe::<DemoArgs>::new()"),
@@ -916,11 +919,12 @@ mod operation_tests {
             flat.contains("probe.harw_args_schema()"),
             "das Schema muss über die Sonde aufgelöst werden"
         );
+        Ok(())
     }
 
     #[test]
-    fn expand_operation_imports_both_probe_branches() {
-        let flat = expand_with_args_type(quote!(DemoArgs));
+    fn expand_operation_imports_both_probe_branches() -> TestResult {
+        let flat = expand_with_args_type(quote!(DemoArgs))?;
 
         assert!(
             flat.contains("DerivedArgsSchemaas_"),
@@ -930,22 +934,24 @@ mod operation_tests {
             flat.contains("NoArgsSchemaas_"),
             "ohne den Rückfall-Zweig bräche jeder Args-Typ ohne OpArgs-Derive"
         );
+        Ok(())
     }
 
     #[test]
-    fn expand_operation_never_names_the_op_args_trait_directly() {
-        let flat = expand_with_args_type(quote!(DemoArgs));
+    fn expand_operation_never_names_the_op_args_trait_directly() -> TestResult {
+        let flat = expand_with_args_type(quote!(DemoArgs))?;
 
         assert!(
             !flat.contains("asOpArgsSchema>::json_schema"),
             "eine unbedingte Trait-Qualifizierung würde Args-Typen ohne \
              OpArgs-Derive brechen"
         );
+        Ok(())
     }
 
     #[test]
-    fn expand_operation_probe_follows_a_path_qualified_args_type() {
-        let flat = expand_with_args_type(quote!(crate::args::PlanArgs));
+    fn expand_operation_probe_follows_a_path_qualified_args_type() -> TestResult {
+        let flat = expand_with_args_type(quote!(crate::args::PlanArgs))?;
 
         assert!(
             flat.contains(
@@ -953,10 +959,11 @@ mod operation_tests {
             ),
             "auch ein pfadqualifizierter Argument-Typ muss übernommen werden"
         );
+        Ok(())
     }
 
     #[test]
-    fn expand_operation_rejects_non_async_fn() {
+    fn expand_operation_rejects_non_async_fn() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             fn demo_op(ctx: &OpContext, args: DemoArgs) -> Result<OpOutput, OpError> {
                 let _ = (ctx, args);
@@ -966,46 +973,46 @@ mod operation_tests {
         let attr = quote! {
             name = "demo", summary = "Demo.", domain = "misc", permission = "observer"
         };
-        let Ok(args) = parse_operation_args(attr) else {
-            panic!("die Attribut-Schlüssel sind gültig und müssen parsen");
-        };
+        let args = parse_operation_args(attr)
+            .map_err(ctx("die Attribut-Schlüssel sind gültig und müssen parsen"))?;
         let Err(error) = expand_operation(func, args) else {
-            panic!("eine nicht-async fn muss abgewiesen werden");
+            return Err(TestError::Unexpected(
+                "eine nicht-async fn muss abgewiesen werden".to_owned(),
+            ));
         };
 
         assert_eq!(error.to_string(), "#[operation] requires an `async fn`");
+        Ok(())
     }
 
     /// Expandiert eine minimale Operation mit dem übergebenen rohen
     /// `#[operation(...)]`-Attribut-Tokenstrom (statt der festen
     /// `model_tool(readonly)`-Variante aus [`expand_with_args_type`]).
-    fn expand_with_attr(attr: proc_macro2::TokenStream) -> String {
+    fn expand_with_attr(attr: proc_macro2::TokenStream) -> TestResult<String> {
         let func: ItemFn = syn::parse_quote! {
             async fn demo_op(ctx: &OpContext, args: DemoArgs) -> Result<OpOutput, OpError> {
                 let _ = (ctx, args);
                 Ok(OpOutput { text: String::new() })
             }
         };
-        let Ok(args) = parse_operation_args(attr) else {
-            panic!("die Attribut-Schlüssel sind gültig und müssen parsen");
-        };
-        let Ok(tokens) = expand_operation(func, args) else {
-            panic!("eine gültige Operation muss expandieren");
-        };
-        normalize(&tokens)
+        let args = parse_operation_args(attr)
+            .map_err(ctx("die Attribut-Schlüssel sind gültig und müssen parsen"))?;
+        let tokens =
+            expand_operation(func, args).map_err(ctx("eine gültige Operation muss expandieren"))?;
+        Ok(normalize(&tokens))
     }
 
     #[test]
-    fn expand_operation_web_with_path_only_fails_missing_method() {
+    fn expand_operation_web_with_path_only_fails_missing_method() -> TestResult {
         // W3/C-OPS, F-031: `method` no longer defaults from `readonly` — a
         // `web(...)` without it must fail to expand with a clear message.
         let attr = quote! {
             name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
             web(path = "/api/demo")
         };
-        let Ok(args) = parse_operation_args(attr) else {
-            panic!("`web(path = ...)` ohne `method` muss beim Parsen noch durchgehen");
-        };
+        let args = parse_operation_args(attr).map_err(ctx(
+            "`web(path = ...)` ohne `method` muss beim Parsen noch durchgehen",
+        ))?;
         let func: ItemFn = syn::parse_quote! {
             async fn demo_op(ctx: &OpContext, args: DemoArgs) -> Result<OpOutput, OpError> {
                 let _ = (ctx, args);
@@ -1013,45 +1020,49 @@ mod operation_tests {
             }
         };
         let Err(error) = expand_operation(func, args) else {
-            panic!("`web(...)` ohne `method` muss beim Expandieren fehlschlagen");
+            return Err(TestError::Unexpected(
+                "`web(...)` ohne `method` muss beim Expandieren fehlschlagen".to_owned(),
+            ));
         };
         assert_eq!(
             error.to_string(),
             "`web(...)` requires a `method = \"get\"` or `method = \"post\"` key"
         );
+        Ok(())
     }
 
     #[test]
-    fn expand_operation_web_method_and_approval_are_honored() {
+    fn expand_operation_web_method_and_approval_are_honored() -> TestResult {
         let flat = expand_with_attr(quote! {
             name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
             web(path = "/api/demo", method = "post", approval = "always")
-        });
+        })?;
 
         assert!(flat.contains("method:::harw_operations::operation::WebMethod::Post"));
         assert!(flat.contains("approval:::harw_operations::ApprovalPolicy::Always"));
+        Ok(())
     }
 
     #[test]
-    fn expand_operation_web_method_get_is_honored() {
+    fn expand_operation_web_method_get_is_honored() -> TestResult {
         let flat = expand_with_attr(quote! {
             name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
             web(path = "/api/demo", method = "get")
-        });
+        })?;
 
         assert!(flat.contains("method:::harw_operations::operation::WebMethod::Get"));
         assert!(flat.contains("approval:::harw_operations::ApprovalPolicy::None"));
+        Ok(())
     }
 
     #[test]
-    fn expand_operation_web_rejects_unknown_method_value() {
+    fn expand_operation_web_rejects_unknown_method_value() -> TestResult {
         let attr = quote! {
             name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
             web(path = "/api/demo", method = "put")
         };
-        let Ok(args) = parse_operation_args(attr) else {
-            panic!("`method = \"put\"` muss beim Parsen noch durchgehen");
-        };
+        let args = parse_operation_args(attr)
+            .map_err(ctx("`method = \"put\"` muss beim Parsen noch durchgehen"))?;
         let func: ItemFn = syn::parse_quote! {
             async fn demo_op(ctx: &OpContext, args: DemoArgs) -> Result<OpOutput, OpError> {
                 let _ = (ctx, args);
@@ -1059,24 +1070,25 @@ mod operation_tests {
             }
         };
         let Err(error) = expand_operation(func, args) else {
-            panic!("ein unbekannter `method`-Wert muss beim Expandieren fehlschlagen");
+            return Err(TestError::Unexpected(
+                "ein unbekannter `method`-Wert muss beim Expandieren fehlschlagen".to_owned(),
+            ));
         };
         assert!(
-            error
-                .to_string()
-                .contains("unknown `method` value `put`"),
+            error.to_string().contains("unknown `method` value `put`"),
             "unerwartete Fehlermeldung: {error}"
         );
+        Ok(())
     }
 
     #[test]
-    fn expand_operation_web_coexists_with_command_and_model_tool() {
+    fn expand_operation_web_coexists_with_command_and_model_tool() -> TestResult {
         let flat = expand_with_attr(quote! {
             name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
             command(path = "/demo", visibility = "tui_only"),
             model_tool(readonly, approval = "none"),
             web(path = "/api/demo", method = "get", approval = "none")
-        });
+        })?;
 
         // Alle drei Flächen müssen nebeneinander im `surfaces`-Vec landen — keine
         // ersetzt eine andere.
@@ -1084,17 +1096,18 @@ mod operation_tests {
         assert!(flat.contains("::harw_operations::Surface::ModelTool{readonly:true"));
         assert!(flat.contains("::harw_operations::Surface::Web{path:\"/api/demo\""));
         assert!(flat.contains("method:::harw_operations::operation::WebMethod::Get"));
+        Ok(())
     }
 
     #[test]
-    fn parse_operation_args_web_requires_path_at_expand_time() {
+    fn parse_operation_args_web_requires_path_at_expand_time() -> TestResult {
         let attr = quote! {
             name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
             web(method = "get")
         };
-        let Ok(args) = parse_operation_args(attr) else {
-            panic!("`web(method = ...)` ohne `path` muss beim Parsen noch durchgehen");
-        };
+        let args = parse_operation_args(attr).map_err(ctx(
+            "`web(method = ...)` ohne `path` muss beim Parsen noch durchgehen",
+        ))?;
         let func: ItemFn = syn::parse_quote! {
             async fn demo_op(ctx: &OpContext, args: DemoArgs) -> Result<OpOutput, OpError> {
                 let _ = (ctx, args);
@@ -1102,20 +1115,26 @@ mod operation_tests {
             }
         };
         let Err(error) = expand_operation(func, args) else {
-            panic!("`web(...)` ohne `path` muss beim Expandieren fehlschlagen");
+            return Err(TestError::Unexpected(
+                "`web(...)` ohne `path` muss beim Expandieren fehlschlagen".to_owned(),
+            ));
         };
-        assert_eq!(error.to_string(), "`web(...)` requires a `path = \"...\"` key");
+        assert_eq!(
+            error.to_string(),
+            "`web(...)` requires a `path = \"...\"` key"
+        );
+        Ok(())
     }
 
     #[test]
-    fn parse_operation_args_web_requires_method_at_expand_time() {
+    fn parse_operation_args_web_requires_method_at_expand_time() -> TestResult {
         let attr = quote! {
             name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
             web(path = "/api/demo")
         };
-        let Ok(args) = parse_operation_args(attr) else {
-            panic!("`web(path = ...)` ohne `method` muss beim Parsen noch durchgehen");
-        };
+        let args = parse_operation_args(attr).map_err(ctx(
+            "`web(path = ...)` ohne `method` muss beim Parsen noch durchgehen",
+        ))?;
         let func: ItemFn = syn::parse_quote! {
             async fn demo_op(ctx: &OpContext, args: DemoArgs) -> Result<OpOutput, OpError> {
                 let _ = (ctx, args);
@@ -1123,21 +1142,26 @@ mod operation_tests {
             }
         };
         let Err(error) = expand_operation(func, args) else {
-            panic!("`web(...)` ohne `method` muss beim Expandieren fehlschlagen");
+            return Err(TestError::Unexpected(
+                "`web(...)` ohne `method` muss beim Expandieren fehlschlagen".to_owned(),
+            ));
         };
         assert_eq!(
             error.to_string(),
             "`web(...)` requires a `method = \"get\"` or `method = \"post\"` key"
         );
+        Ok(())
     }
 
     #[test]
-    fn parse_operation_args_rejects_unknown_web_key() {
+    fn parse_operation_args_rejects_unknown_web_key() -> TestResult {
         let Err(error) = parse_operation_args(quote! {
             name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
             web(bogus = "x")
         }) else {
-            panic!("ein unbekannter `web`-Schlüssel muss abgewiesen werden");
+            return Err(TestError::Unexpected(
+                "ein unbekannter `web`-Schlüssel muss abgewiesen werden".to_owned(),
+            ));
         };
 
         assert!(
@@ -1145,17 +1169,20 @@ mod operation_tests {
                 .to_string()
                 .contains("unsupported `operation` `web` key")
         );
+        Ok(())
     }
 
     #[test]
-    fn parse_operation_args_web_rejects_readonly_key() {
+    fn parse_operation_args_web_rejects_readonly_key() -> TestResult {
         // W3/C-OPS, F-031: `readonly` was removed from `web(...)`'s grammar —
         // the HTTP method is no longer derivable from a readonly flag.
         let Err(error) = parse_operation_args(quote! {
             name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
             web(path = "/api/demo", readonly)
         }) else {
-            panic!("`web(readonly)` muss seit F-031 abgewiesen werden");
+            return Err(TestError::Unexpected(
+                "`web(readonly)` muss seit F-031 abgewiesen werden".to_owned(),
+            ));
         };
 
         assert!(
@@ -1164,29 +1191,31 @@ mod operation_tests {
                 .contains("unsupported `operation` `web` key"),
             "unerwartete Fehlermeldung: {error}"
         );
+        Ok(())
     }
 
     // ── `command(...)` `busy` sub-key ────────────────────────────────────────
 
     #[test]
-    fn expand_operation_command_busy_immediate_is_honored() {
+    fn expand_operation_command_busy_immediate_is_honored() -> TestResult {
         let flat = expand_with_attr(quote! {
             name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
             command(path = "/demo", visibility = "tui_only", busy = "immediate")
-        });
+        })?;
 
         assert!(
             flat.contains("busy:::harw_operations::operation::BusyAvailability::Immediate"),
             "`busy = \"immediate\"` muss auf BusyAvailability::Immediate abgebildet werden"
         );
+        Ok(())
     }
 
     #[test]
-    fn expand_operation_command_busy_deferred_is_honored() {
+    fn expand_operation_command_busy_deferred_is_honored() -> TestResult {
         let flat = expand_with_attr(quote! {
             name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
             command(path = "/demo", visibility = "tui_only", busy = "deferred")
-        });
+        })?;
 
         assert!(
             flat.contains(
@@ -1194,14 +1223,15 @@ mod operation_tests {
             ),
             "`busy = \"deferred\"` muss auf BusyAvailability::DeferredUntilTurnEnd abgebildet werden"
         );
+        Ok(())
     }
 
     #[test]
-    fn expand_operation_without_busy_key_defaults_to_deferred() {
+    fn expand_operation_without_busy_key_defaults_to_deferred() -> TestResult {
         let flat = expand_with_attr(quote! {
             name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
             command(path = "/demo", visibility = "tui_only")
-        });
+        })?;
 
         assert!(
             flat.contains(
@@ -1209,17 +1239,18 @@ mod operation_tests {
             ),
             "ein fehlender `busy`-Schlüssel muss auf den Default DeferredUntilTurnEnd fallen"
         );
+        Ok(())
     }
 
     #[test]
-    fn expand_operation_rejects_unknown_busy_value() {
+    fn expand_operation_rejects_unknown_busy_value() -> TestResult {
         let attr = quote! {
             name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
             command(path = "/demo", visibility = "tui_only", busy = "invalid-wert")
         };
-        let Ok(args) = parse_operation_args(attr) else {
-            panic!("`busy = \"invalid-wert\"` muss beim Parsen noch durchgehen");
-        };
+        let args = parse_operation_args(attr).map_err(ctx(
+            "`busy = \"invalid-wert\"` muss beim Parsen noch durchgehen",
+        ))?;
         let func: ItemFn = syn::parse_quote! {
             async fn demo_op(ctx: &OpContext, args: DemoArgs) -> Result<OpOutput, OpError> {
                 let _ = (ctx, args);
@@ -1227,21 +1258,26 @@ mod operation_tests {
             }
         };
         let Err(error) = expand_operation(func, args) else {
-            panic!("ein unbekannter `busy`-Wert muss beim Expandieren fehlschlagen");
+            return Err(TestError::Unexpected(
+                "ein unbekannter `busy`-Wert muss beim Expandieren fehlschlagen".to_owned(),
+            ));
         };
         assert_eq!(
             error.to_string(),
             "busy muss 'immediate' oder 'deferred' sein, war: 'invalid-wert'"
         );
+        Ok(())
     }
 
     #[test]
-    fn parse_operation_args_rejects_unknown_command_key() {
+    fn parse_operation_args_rejects_unknown_command_key() -> TestResult {
         let Err(error) = parse_operation_args(quote! {
             name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
             command(path = "/demo", bogus = "x")
         }) else {
-            panic!("ein unbekannter `command`-Schlüssel muss abgewiesen werden");
+            return Err(TestError::Unexpected(
+                "ein unbekannter `command`-Schlüssel muss abgewiesen werden".to_owned(),
+            ));
         };
 
         assert!(
@@ -1250,12 +1286,15 @@ mod operation_tests {
                 .contains("unsupported `operation` `command` key"),
             "unerwartete Fehlermeldung: {error}"
         );
+        Ok(())
     }
 
     #[test]
-    fn parse_operation_args_rejects_unknown_top_level_key() {
+    fn parse_operation_args_rejects_unknown_top_level_key() -> TestResult {
         let Err(error) = parse_operation_args(quote!(unknown = "x")) else {
-            panic!("ein unbekannter Schlüssel muss abgewiesen werden");
+            return Err(TestError::Unexpected(
+                "ein unbekannter Schlüssel muss abgewiesen werden".to_owned(),
+            ));
         };
 
         assert!(
@@ -1263,5 +1302,6 @@ mod operation_tests {
                 .to_string()
                 .contains("unsupported `operation` attribute key")
         );
+        Ok(())
     }
 }

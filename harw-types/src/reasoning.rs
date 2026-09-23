@@ -84,25 +84,15 @@ impl ReasoningEffort {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestResult;
 
     #[test]
-    fn test_from_str_accepts_known_values() {
-        assert_eq!(
-            "low".parse::<ReasoningEffort>().unwrap(),
-            ReasoningEffort::Low
-        );
-        assert_eq!(
-            "HIGH".parse::<ReasoningEffort>().unwrap(),
-            ReasoningEffort::High
-        );
-        assert_eq!(
-            "XHIGH".parse::<ReasoningEffort>().unwrap(),
-            ReasoningEffort::Xhigh
-        );
-        assert_eq!(
-            "max".parse::<ReasoningEffort>().unwrap(),
-            ReasoningEffort::Max
-        );
+    fn test_from_str_accepts_known_values() -> TestResult {
+        assert_eq!("low".parse::<ReasoningEffort>()?, ReasoningEffort::Low);
+        assert_eq!("HIGH".parse::<ReasoningEffort>()?, ReasoningEffort::High);
+        assert_eq!("XHIGH".parse::<ReasoningEffort>()?, ReasoningEffort::Xhigh);
+        assert_eq!("max".parse::<ReasoningEffort>()?, ReasoningEffort::Max);
+        Ok(())
     }
 
     #[test]
@@ -111,7 +101,7 @@ mod tests {
     }
 
     #[test]
-    fn test_display_round_trips_through_from_str() {
+    fn test_display_round_trips_through_from_str() -> TestResult {
         for effort in [
             ReasoningEffort::Minimal,
             ReasoningEffort::Low,
@@ -121,28 +111,24 @@ mod tests {
             ReasoningEffort::Max,
         ] {
             let text = effort.to_string();
-            assert_eq!(text.parse::<ReasoningEffort>().unwrap(), effort);
+            assert_eq!(text.parse::<ReasoningEffort>()?, effort);
         }
+        Ok(())
     }
 
     #[test]
-    fn test_serde_uses_stable_snake_case_wire_values() {
+    fn test_serde_uses_stable_snake_case_wire_values() -> TestResult {
+        assert_eq!(serde_json::to_string(&ReasoningEffort::Xhigh)?, "\"xhigh\"");
+        assert_eq!(serde_json::to_string(&ReasoningEffort::Max)?, "\"max\"");
         assert_eq!(
-            serde_json::to_string(&ReasoningEffort::Xhigh).unwrap(),
-            "\"xhigh\""
-        );
-        assert_eq!(
-            serde_json::to_string(&ReasoningEffort::Max).unwrap(),
-            "\"max\""
-        );
-        assert_eq!(
-            serde_json::from_str::<ReasoningEffort>("\"xhigh\"").unwrap(),
+            serde_json::from_str::<ReasoningEffort>("\"xhigh\"")?,
             ReasoningEffort::Xhigh
         );
         assert_eq!(
-            serde_json::from_str::<ReasoningEffort>("\"max\"").unwrap(),
+            serde_json::from_str::<ReasoningEffort>("\"max\"")?,
             ReasoningEffort::Max
         );
+        Ok(())
     }
 
     #[test]

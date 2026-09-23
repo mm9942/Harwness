@@ -235,7 +235,11 @@ impl ProcmonSensor {
     /// let _sensor = ProcmonSensor::new(handle, Box::new(loader), bpf_handle);
     /// ```
     #[must_use]
-    pub fn new(handle: SensorHandle<Bound>, loader: Box<dyn BpfLoader>, bpf_handle: BpfHandle) -> Self {
+    pub fn new(
+        handle: SensorHandle<Bound>,
+        loader: Box<dyn BpfLoader>,
+        bpf_handle: BpfHandle,
+    ) -> Self {
         Self::with_timeout(handle, loader, bpf_handle, DEFAULT_READ_TIMEOUT)
     }
 
@@ -407,12 +411,13 @@ fn procmon_error_to_sensor_error(err: ProcmonError) -> SensorError {
 
 #[cfg(test)]
 mod tests {
-    use super::{bpf_error_to_sensor_error, procmon_error_to_sensor_error, ProcmonSensor};
+    use super::{ProcmonSensor, bpf_error_to_sensor_error, procmon_error_to_sensor_error};
     use crate::error::ProcmonError;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_dod_bpf::event::RawBpfEvent;
     use harw_dod_bpf::fixture::FixtureBpfLoader;
     use harw_dod_bpf::{BpfError, BpfLoader, BpfProgramKind, BpfProgramSource, BpfProgramSpec};
-    use harw_dod_cap::{Bound, Capability, ReadScope, SensorHandle, SensorError};
+    use harw_dod_cap::{Bound, Capability, ReadScope, SensorError, SensorHandle};
     use harw_dod_signals::{EventKind, Sensor};
     use harw_types::{ContentDigest, SensorId};
     use jiff::Timestamp;
@@ -438,7 +443,14 @@ mod tests {
     /// Baut ein wohlgeformtes `payload` für ein Prozessstart-Ereignis, wie
     /// es `crate::event::parse_exec_payload` erwartet (siehe dortige Doku
     /// für das Byte-Layout).
-    fn exec_payload(pid: u32, ppid: u32, uid: u32, comm: &str, filename: &str, argv: &[u8]) -> Vec<u8> {
+    fn exec_payload(
+        pid: u32,
+        ppid: u32,
+        uid: u32,
+        comm: &str,
+        filename: &str,
+        argv: &[u8],
+    ) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(&pid.to_le_bytes());
         payload.extend_from_slice(&ppid.to_le_bytes());
@@ -465,39 +477,45 @@ mod tests {
         }
     }
 
-    fn build_sensor(events: Vec<RawBpfEvent>) -> ProcmonSensor {
+    fn build_sensor(events: Vec<RawBpfEvent>) -> TestResult<ProcmonSensor> {
         let loader = FixtureBpfLoader::new(events);
         let bpf_handle = loader
             .load(&sample_spec())
-            .expect("fixture loader with capability always succeeds");
-        ProcmonSensor::new(handle_with(Capability::LoadBpfProgram), Box::new(loader), bpf_handle)
+            .map_err(ctx("fixture loader with capability always succeeds"))?;
+        Ok(ProcmonSensor::new(
+            handle_with(Capability::LoadBpfProgram),
+            Box::new(loader),
+            bpf_handle,
+        ))
     }
 
     #[test]
-    fn test_handle_returns_bound_handle_with_load_bpf_program_capability() {
-        let sensor = build_sensor(Vec::new());
+    fn test_handle_returns_bound_handle_with_load_bpf_program_capability() -> TestResult {
+        let sensor = build_sensor(Vec::new())?;
         assert_eq!(sensor.handle().capability(), Capability::LoadBpfProgram);
+        Ok(())
     }
 
     #[test]
-    fn test_poll_with_no_events_returns_empty_reading() {
-        let sensor = build_sensor(Vec::new());
+    fn test_poll_with_no_events_returns_empty_reading() -> TestResult {
+        let sensor = build_sensor(Vec::new())?;
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("fixture-backed sensor never fails");
+            .map_err(ctx("fixture-backed sensor never fails"))?;
         assert!(reading.samples.is_empty());
         assert!(reading.events.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_poll_maps_exec_event_to_security_event_process_exec() {
-        let observed_at = Timestamp::new(1_700_000_000, 0).expect("gültiger Zeitstempel");
+    fn test_poll_maps_exec_event_to_security_event_process_exec() -> TestResult {
+        let observed_at = Timestamp::new(1_700_000_000, 0).map_err(ctx("gültiger Zeitstempel"))?;
         let payload = exec_payload(4_242, 1, 0, "sshd", "/usr/sbin/sshd", b"-D\0-e");
-        let sensor = build_sensor(vec![raw_event(4_242, "sshd", observed_at, payload)]);
+        let sensor = build_sensor(vec![raw_event(4_242, "sshd", observed_at, payload)])?;
 
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("fixture-backed sensor never fails");
+            .map_err(ctx("fixture-backed sensor never fails"))?;
         assert!(reading.samples.is_empty());
         assert_eq!(reading.events.len(), 1);
 
@@ -507,7 +525,10 @@ mod tests {
         assert_eq!(event.observed_at, observed_at);
         assert_ne!(event.observed_at, Timestamp::UNIX_EPOCH);
 
-        let actor = event.actor.as_ref().expect("ProcessExec trägt einen Actor");
+        let actor = event
+            .actor
+            .as_ref()
+            .ok_or(TestError::Missing("ProcessExec trägt einen Actor"))?;
         assert_eq!(actor.uid, 0);
         assert_eq!(actor.auid, None);
 
@@ -516,28 +537,42 @@ mod tests {
                 assert_eq!(path, "/usr/sbin/sshd");
                 assert_eq!(*argv_digest, ContentDigest::of(b"-D\0-e"));
             }
-            other => panic!("expected EventKind::ProcessExec, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected EventKind::ProcessExec, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_poll_propagates_malformed_payload_as_malformed_source() {
-        let sensor = build_sensor(vec![raw_event(1, "x", Timestamp::UNIX_EPOCH, vec![1, 2, 3])]);
-        let err = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect_err("zu kurzes payload muss scheitern");
+    fn test_poll_propagates_malformed_payload_as_malformed_source() -> TestResult {
+        let sensor = build_sensor(vec![raw_event(
+            1,
+            "x",
+            Timestamp::UNIX_EPOCH,
+            vec![1, 2, 3],
+        )])?;
+        let Err(err) = sensor.poll(Timestamp::UNIX_EPOCH) else {
+            return Err(TestError::Unexpected(
+                "zu kurzes payload muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
+        Ok(())
     }
 
     #[test]
-    fn test_poll_two_independently_built_sensors_with_same_now_yield_identical_readings() {
+    fn test_poll_two_independently_built_sensors_with_same_now_yield_identical_readings()
+    -> TestResult {
         // `FixtureBpfLoader::read_events` entleert seine Warteschlange —
         // ein zweiter Poll auf demselben Sensor ist bewusst nicht
         // idempotent (siehe Moduldoku, Abschnitt „Determinismus trotz
         // drainendem Lader"). Determinismus bedeutet hier: zwei unabhängig
         // konstruierte Sensoren mit identischem Ereignisinhalt liefern bei
         // gleichem `now` dasselbe Ergebnis.
-        let observed_at = Timestamp::new(1_000, 0).expect("gültiger Zeitstempel");
+        let observed_at = Timestamp::new(1_000, 0).map_err(ctx("gültiger Zeitstempel"))?;
         let make_events = || {
             vec![raw_event(
                 7,
@@ -547,28 +582,30 @@ mod tests {
             )]
         };
 
-        let first = build_sensor(make_events())
+        let first = build_sensor(make_events())?
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("erster Poll");
-        let second = build_sensor(make_events())
+            .map_err(ctx("erster Poll"))?;
+        let second = build_sensor(make_events())?
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("zweiter Poll, unabhängige Sensor-Instanz");
+            .map_err(ctx("zweiter Poll, unabhängige Sensor-Instanz"))?;
 
         assert_eq!(first, second);
+        Ok(())
     }
 
     #[test]
-    fn test_poll_argv_bytes_never_appear_in_the_resulting_reading() {
+    fn test_poll_argv_bytes_never_appear_in_the_resulting_reading() -> TestResult {
         let secret = b"--password=SuperSecretSharedToken123!";
         let payload = exec_payload(1, 0, 0, "curl", "/usr/bin/curl", secret);
-        let sensor = build_sensor(vec![raw_event(1, "curl", Timestamp::UNIX_EPOCH, payload)]);
+        let sensor = build_sensor(vec![raw_event(1, "curl", Timestamp::UNIX_EPOCH, payload)])?;
 
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("fixture-backed sensor never fails");
+            .map_err(ctx("fixture-backed sensor never fails"))?;
         let debug_output = format!("{reading:?}");
         assert!(!debug_output.contains("SuperSecretSharedToken123"));
         assert!(!debug_output.contains("--password="));
+        Ok(())
     }
 
     #[test]
@@ -590,7 +627,10 @@ mod tests {
     #[test]
     fn test_bpf_error_to_sensor_error_maps_io_to_io() {
         let source = std::io::Error::other("boom");
-        assert!(matches!(bpf_error_to_sensor_error(BpfError::Io(source)), SensorError::Io(_)));
+        assert!(matches!(
+            bpf_error_to_sensor_error(BpfError::Io(source)),
+            SensorError::Io(_)
+        ));
     }
 
     #[test]

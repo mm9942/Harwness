@@ -686,7 +686,9 @@ pub(crate) fn expand_warden_actions(input: TokenStream) -> syn::Result<TokenStre
         if !seen_actions.insert(action_name.clone()) {
             return Err(syn::Error::new_spanned(
                 &action.ident,
-                format!("Aktion `{action_name}` ist in dieser Deklaration bereits doppelt vergeben"),
+                format!(
+                    "Aktion `{action_name}` ist in dieser Deklaration bereits doppelt vergeben"
+                ),
             ));
         }
 
@@ -717,8 +719,11 @@ pub(crate) fn expand_warden_actions(input: TokenStream) -> syn::Result<TokenStre
         }
     }
 
-    let variant_definitions: Vec<TokenStream> =
-        parsed.actions.iter().map(action_variant_definition).collect();
+    let variant_definitions: Vec<TokenStream> = parsed
+        .actions
+        .iter()
+        .map(action_variant_definition)
+        .collect();
 
     let from_arms: Vec<TokenStream> = parsed
         .actions
@@ -901,17 +906,21 @@ pub(crate) fn expand_warden_actions(input: TokenStream) -> syn::Result<TokenStre
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
-    fn parse_ok(tokens: TokenStream) -> String {
-        expand_warden_actions(tokens)
-            .expect("declaration must expand")
-            .to_string()
+    fn parse_ok(tokens: TokenStream) -> TestResult<String> {
+        Ok(expand_warden_actions(tokens)
+            .map_err(ctx("declaration must expand"))?
+            .to_string())
     }
 
-    fn parse_err(tokens: TokenStream) -> String {
-        expand_warden_actions(tokens)
-            .expect_err("declaration must be rejected")
-            .to_string()
+    fn parse_err(tokens: TokenStream) -> TestResult<String> {
+        let Err(error) = expand_warden_actions(tokens) else {
+            return Err(TestError::Unexpected(
+                "declaration must be rejected".to_owned(),
+            ));
+        };
+        Ok(error.to_string())
     }
 
     fn valid_declaration() -> TokenStream {
@@ -937,22 +946,29 @@ mod tests {
     // -- classify_field_type -------------------------------------------------
 
     #[test]
-    fn classify_field_type_accepts_every_allowed_id_type() {
+    fn classify_field_type_accepts_every_allowed_id_type() -> TestResult {
         for name in ALLOWED_ID_TYPES {
-            let ty: Type = syn::parse_str(&format!("harw_types::{name}")).expect("parses");
+            let ty: Type = syn::parse_str(&format!("harw_types::{name}")).map_err(ctx("parses"))?;
             assert!(
-                matches!(classify_field_type(&ty), Ok(FieldKind::Scalar(ScalarKind::Id))),
+                matches!(
+                    classify_field_type(&ty),
+                    Ok(FieldKind::Scalar(ScalarKind::Id))
+                ),
                 "must accept {name}"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn classify_field_type_accepts_every_allowed_integer_type_and_bool() {
+    fn classify_field_type_accepts_every_allowed_integer_type_and_bool() -> TestResult {
         for name in ALLOWED_INTEGER_TYPES {
-            let ty: Type = syn::parse_str(name).expect("parses");
+            let ty: Type = syn::parse_str(name).map_err(ctx("parses"))?;
             assert!(
-                matches!(classify_field_type(&ty), Ok(FieldKind::Scalar(ScalarKind::Integer))),
+                matches!(
+                    classify_field_type(&ty),
+                    Ok(FieldKind::Scalar(ScalarKind::Integer))
+                ),
                 "must accept {name}"
             );
         }
@@ -961,6 +977,7 @@ mod tests {
             classify_field_type(&ty),
             Ok(FieldKind::Scalar(ScalarKind::Bool))
         ));
+        Ok(())
     }
 
     #[test]
@@ -973,25 +990,39 @@ mod tests {
     }
 
     #[test]
-    fn classify_field_type_rejects_string() {
+    fn classify_field_type_rejects_string() -> TestResult {
         let ty: Type = syn::parse_quote!(String);
-        let err = classify_field_type(&ty).expect_err("String must be rejected");
-        assert!(err.to_string().contains("insbesondere `String` ist nicht erlaubt"));
+        let Err(err) = classify_field_type(&ty) else {
+            return Err(TestError::Unexpected("String must be rejected".to_owned()));
+        };
+        assert!(
+            err.to_string()
+                .contains("insbesondere `String` ist nicht erlaubt")
+        );
+        Ok(())
     }
 
     #[test]
-    fn classify_field_type_rejects_vec_of_string() {
+    fn classify_field_type_rejects_vec_of_string() -> TestResult {
         let ty: Type = syn::parse_quote!(Vec<String>);
-        let err = classify_field_type(&ty).expect_err("Vec<String> must be rejected");
+        let Err(err) = classify_field_type(&ty) else {
+            return Err(TestError::Unexpected(
+                "Vec<String> must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("Positivliste"));
+        Ok(())
     }
 
     #[test]
-    fn classify_field_type_rejects_type_outside_allowlist() {
+    fn classify_field_type_rejects_type_outside_allowlist() -> TestResult {
         let ty: Type = syn::parse_quote!(f64);
-        let err = classify_field_type(&ty).expect_err("f64 must be rejected");
+        let Err(err) = classify_field_type(&ty) else {
+            return Err(TestError::Unexpected("f64 must be rejected".to_owned()));
+        };
         assert!(err.to_string().contains("Positivliste"));
         assert!(!err.to_string().contains("insbesondere `String`"));
+        Ok(())
     }
 
     // -- to_kebab_case --------------------------------------------------------
@@ -1005,29 +1036,32 @@ mod tests {
     // -- expand_warden_actions: Fehlerfälle ------------------------------------
 
     #[test]
-    fn expand_rejects_empty_declaration() {
-        let err = parse_err(quote! {});
+    fn expand_rejects_empty_declaration() -> TestResult {
+        let err = parse_err(quote! {})?;
         assert!(err.contains("darf keine leere Deklaration sein"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_declaration_without_any_action() {
+    fn expand_rejects_declaration_without_any_action() -> TestResult {
         let err = parse_err(quote! {
             authorization_proof = test_support::FakeProof;
-        });
+        })?;
         assert!(err.contains("erfordert mindestens eine Aktion"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_missing_authorization_proof_keyword() {
+    fn expand_rejects_missing_authorization_proof_keyword() -> TestResult {
         let err = parse_err(quote! {
             bogus = test_support::FakeProof;
-        });
+        })?;
         assert!(err.contains("authorization_proof = <Pfad>;"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_action_without_admissible_from() {
+    fn expand_rejects_action_without_admissible_from() -> TestResult {
         let err = parse_err(quote! {
             authorization_proof = test_support::FakeProof;
 
@@ -1035,13 +1069,14 @@ mod tests {
                 cgroup: harw_types::CgroupId,
                 audit = "warden.freeze_cgroup",
             }
-        });
+        })?;
         assert!(err.contains("kein `admissible_from: [...]`"));
         assert!(err.contains("Lücke in der Eskalationsleiter"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_action_without_audit() {
+    fn expand_rejects_action_without_audit() -> TestResult {
         let err = parse_err(quote! {
             authorization_proof = test_support::FakeProof;
 
@@ -1049,13 +1084,14 @@ mod tests {
                 cgroup: harw_types::CgroupId,
                 admissible_from: [Escalated],
             }
-        });
+        })?;
         assert!(err.contains("kein `audit = \"...\"`"));
         assert!(err.contains("Eingriff ohne Spur"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_empty_audit_name() {
+    fn expand_rejects_empty_audit_name() -> TestResult {
         let err = parse_err(quote! {
             authorization_proof = test_support::FakeProof;
 
@@ -1064,12 +1100,13 @@ mod tests {
                 admissible_from: [Escalated],
                 audit = "",
             }
-        });
+        })?;
         assert!(err.contains("darf nicht leer sein"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_duplicate_admissible_from() {
+    fn expand_rejects_duplicate_admissible_from() -> TestResult {
         let err = parse_err(quote! {
             authorization_proof = test_support::FakeProof;
 
@@ -1079,12 +1116,13 @@ mod tests {
                 admissible_from: [RuleTriggered],
                 audit = "warden.freeze_cgroup",
             }
-        });
+        })?;
         assert!(err.contains("`admissible_from` doppelt angegeben"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_duplicate_audit() {
+    fn expand_rejects_duplicate_audit() -> TestResult {
         let err = parse_err(quote! {
             authorization_proof = test_support::FakeProof;
 
@@ -1094,12 +1132,13 @@ mod tests {
                 audit = "warden.freeze_cgroup",
                 audit = "warden.freeze_cgroup_again",
             }
-        });
+        })?;
         assert!(err.contains("`audit` doppelt angegeben"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_duplicate_tool_schema() {
+    fn expand_rejects_duplicate_tool_schema() -> TestResult {
         let err = parse_err(quote! {
             authorization_proof = test_support::FakeProof;
             tool_schema = harw_tools::ToolSpec;
@@ -1110,12 +1149,13 @@ mod tests {
                 admissible_from: [Escalated],
                 audit = "warden.freeze_cgroup",
             }
-        });
+        })?;
         assert!(err.contains("`tool_schema` doppelt angegeben"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_string_field() {
+    fn expand_rejects_string_field() -> TestResult {
         let err = parse_err(quote! {
             authorization_proof = test_support::FakeProof;
 
@@ -1124,12 +1164,13 @@ mod tests {
                 admissible_from: [Escalated],
                 audit = "warden.run_command",
             }
-        });
+        })?;
         assert!(err.contains("insbesondere `String` ist nicht erlaubt"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_duplicate_action_name() {
+    fn expand_rejects_duplicate_action_name() -> TestResult {
         let err = parse_err(quote! {
             authorization_proof = test_support::FakeProof;
 
@@ -1143,12 +1184,13 @@ mod tests {
                 admissible_from: [RuleTriggered],
                 audit = "warden.freeze_cgroup_again",
             }
-        });
+        })?;
         assert!(err.contains("bereits doppelt vergeben"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_duplicate_field_name() {
+    fn expand_rejects_duplicate_field_name() -> TestResult {
         let err = parse_err(quote! {
             authorization_proof = test_support::FakeProof;
 
@@ -1158,16 +1200,17 @@ mod tests {
                 admissible_from: [Escalated],
                 audit = "warden.freeze_cgroup",
             }
-        });
+        })?;
         assert!(err.contains("Feld `cgroup`"));
         assert!(err.contains("bereits doppelt vergeben"));
+        Ok(())
     }
 
     // -- expand_warden_actions: Positivfall -------------------------------------
 
     #[test]
-    fn expand_accepts_valid_declaration_and_generates_all_five_items() {
-        let tokens = parse_ok(valid_declaration());
+    fn expand_accepts_valid_declaration_and_generates_all_five_items() -> TestResult {
+        let tokens = parse_ok(valid_declaration())?;
 
         assert!(tokens.contains("pub enum WardenAction"));
         assert!(tokens.contains("pub enum ProposedAction"));
@@ -1188,10 +1231,11 @@ mod tests {
         // der Variantenname, den das Makro wirklich emittiert.
         assert!(tokens.contains("FreezeCgroup"));
         assert!(tokens.contains("strict : true"));
+        Ok(())
     }
 
     #[test]
-    fn expand_accepts_vec_field_for_multi_target_actions() {
+    fn expand_accepts_vec_field_for_multi_target_actions() -> TestResult {
         let tokens = parse_ok(quote! {
             authorization_proof = test_support::FakeProof;
             tool_schema = harw_tools::ToolSpec;
@@ -1202,13 +1246,14 @@ mod tests {
                 admissible_from: [Escalated],
                 audit = "warden.isolate_cgroups",
             }
-        });
+        })?;
         assert!(tokens.contains("cgroups : Vec < harw_types :: CgroupId >"));
         assert!(tokens.contains("JsonSchemaType :: Array"));
+        Ok(())
     }
 
     #[test]
-    fn expand_allows_empty_admissible_from_and_generates_unreachable_false() {
+    fn expand_allows_empty_admissible_from_and_generates_unreachable_false() -> TestResult {
         let tokens = parse_ok(quote! {
             authorization_proof = test_support::FakeProof;
 
@@ -1217,8 +1262,9 @@ mod tests {
                 admissible_from: [],
                 audit = "warden.never_admissible",
             }
-        });
+        })?;
         assert!(tokens.contains("NeverAdmissible { .. } => false"));
+        Ok(())
     }
 
     // -- expand_warden_actions: `tool_schema` abwählbar --------------------------
@@ -1228,7 +1274,8 @@ mod tests {
     /// Stelle, während die übrigen vier Erzeugnisse unverändert entstehen
     /// (siehe Moduldoku, Abschnitt „tool_schema").
     #[test]
-    fn expand_without_tool_schema_never_mentions_harw_tools_but_keeps_the_other_four_products() {
+    fn expand_without_tool_schema_never_mentions_harw_tools_but_keeps_the_other_four_products()
+    -> TestResult {
         let tokens = parse_ok(quote! {
             authorization_proof = test_support::FakeProof;
 
@@ -1244,9 +1291,12 @@ mod tests {
                 admissible_from: [Escalated],
                 audit = "warden.kill_process_tree",
             }
-        });
+        })?;
 
-        assert!(!tokens.contains("harw_tools"), "no token may name harw_tools: {tokens}");
+        assert!(
+            !tokens.contains("harw_tools"),
+            "no token may name harw_tools: {tokens}"
+        );
         assert!(!tokens.contains("tool_schema"));
 
         // Die vier übrigen Erzeugnisse plus die Zulässigkeitsmatrix bleiben
@@ -1267,13 +1317,15 @@ mod tests {
         // `kill-process-tree` erzeugt serde zur Laufzeit aus `rename_all`; der
         // Variantenname ist das, was dieses Makro emittiert.
         assert!(tokens.contains("KillProcessTree"));
+        Ok(())
     }
 
     /// Die Zulässigkeitsmatrix und die vier übrigen Erzeugnisse sind mit und
     /// ohne `tool_schema` byteidentisch — nur das `tool_schema()`-Impl wird
     /// angehängt, sonst ändert sich nichts an der Ausgabe.
     #[test]
-    fn expand_with_and_without_tool_schema_share_identical_output_for_the_other_five_items() {
+    fn expand_with_and_without_tool_schema_share_identical_output_for_the_other_five_items()
+    -> TestResult {
         let without = parse_ok(quote! {
             authorization_proof = test_support::FakeProof;
 
@@ -1282,7 +1334,7 @@ mod tests {
                 admissible_from: [Escalated],
                 audit = "warden.freeze_cgroup",
             }
-        });
+        })?;
         let with = parse_ok(quote! {
             authorization_proof = test_support::FakeProof;
             tool_schema = harw_tools::ToolSpec;
@@ -1292,10 +1344,12 @@ mod tests {
                 admissible_from: [Escalated],
                 audit = "warden.freeze_cgroup",
             }
-        });
+        })?;
 
         let marker = "impl ProposedAction";
-        let split_at = with.find(marker).expect("tool_schema impl must be appended");
+        let split_at = with
+            .find(marker)
+            .ok_or(TestError::Missing("tool_schema impl must be appended"))?;
         // `trim_end`: `TokenStream::to_string()` hängt je nach Endstück ein
         // Leerzeichen an. Der Unterschied ist ein Formatierungsartefakt, kein
         // Unterschied in der Ausgabe -- ihn zu vergleichen prüfte `quote`,
@@ -1307,5 +1361,6 @@ mod tests {
         );
         assert!(with.contains(marker));
         assert!(!without.contains(marker));
+        Ok(())
     }
 }

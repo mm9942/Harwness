@@ -114,11 +114,19 @@ mod tests {
     use std::error::Error as _;
 
     use super::EscalateError;
+    use crate::test_support::{TestError, TestResult};
     use harw_dod_warden_proto::WardenProtoError;
     use harw_session_store::SessionStoreError;
 
-    fn sample_json_error() -> serde_json::Error {
-        serde_json::from_str::<serde_json::Value>("not json").unwrap_err()
+    /// Liefert einen echten `serde_json`-Fehler (ersetzt das frühere
+    /// `.unwrap_err()`): ungültiges JSON muss beim Parsen scheitern.
+    fn sample_json_error() -> TestResult<serde_json::Error> {
+        let Err(err) = serde_json::from_str::<serde_json::Value>("not json") else {
+            return Err(TestError::Unexpected(
+                "ungültiges JSON muss einen Fehler liefern".into(),
+            ));
+        };
+        Ok(err)
     }
 
     #[test]
@@ -148,17 +156,20 @@ mod tests {
     }
 
     #[test]
-    fn test_from_wrapped_variants_are_content_free_but_keep_source() {
-        let action_encoding: EscalateError =
-            WardenProtoError::from(sample_json_error()).into();
+    fn test_from_wrapped_variants_are_content_free_but_keep_source() -> TestResult {
+        let action_encoding: EscalateError = WardenProtoError::from(sample_json_error()?).into();
         assert_eq!(
             action_encoding.to_string(),
             "failed to encode the proposed action for content-addressed binding"
         );
         assert!(action_encoding.source().is_some());
 
-        let store: EscalateError = SessionStoreError::from(sample_json_error()).into();
-        assert_eq!(store.to_string(), "underlying freeze store operation failed");
+        let store: EscalateError = SessionStoreError::from(sample_json_error()?).into();
+        assert_eq!(
+            store.to_string(),
+            "underlying freeze store operation failed"
+        );
         assert!(store.source().is_some());
+        Ok(())
     }
 }

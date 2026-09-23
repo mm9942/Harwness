@@ -91,10 +91,7 @@ mod tests {
     #[test]
     fn test_from_sensor_error_delegates_display() {
         let err: NetlinkError = SensorError::SourceUnavailable.into();
-        assert_eq!(
-            err.to_string(),
-            "sensor source is unavailable on this host"
-        );
+        assert_eq!(err.to_string(), "sensor source is unavailable on this host");
     }
 
     #[test]

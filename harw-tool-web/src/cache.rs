@@ -46,8 +46,10 @@
 //! ```
 
 use crate::error::{WebToolError, WebToolResult};
-use harw_fsutil::{AtomicWriteOptions, OpenMode, ensure_private_regular, open_nofollow, write_atomic};
 use harw_authority::{EgressTarget, NetworkScope};
+use harw_fsutil::{
+    AtomicWriteOptions, OpenMode, ensure_private_regular, open_nofollow, write_atomic,
+};
 use harw_tools::ToolExecutionContext;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, DirBuilder, Permissions};
@@ -331,7 +333,10 @@ impl CacheEntry {
 pub fn entry_matches(entry: &CacheEntry, key_hex: &str, request_url: &str) -> bool {
     entry.format_version == CACHE_FORMAT_VERSION
         && entry.key == key_hex
-        && entry.chain.first().is_some_and(|first| first == request_url)
+        && entry
+            .chain
+            .first()
+            .is_some_and(|first| first == request_url)
 }
 
 /// Aktuelle Unix-Zeit in Sekunden; vor der Epoche `0`.
@@ -466,13 +471,21 @@ pub fn write_cache_entry(base: &Path, path: &Path, entry: &CacheEntry) -> WebToo
         )));
     }
     let payload = serde_json::to_vec(entry)?;
-    write_atomic(path, &payload, AtomicWriteOptions { mode: 0o600, fsync_dir: false })?;
+    write_atomic(
+        path,
+        &payload,
+        AtomicWriteOptions {
+            mode: 0o600,
+            fsync_dir: false,
+        },
+    )?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_egress::EgressPolicy;
     use tempfile::TempDir;
 
@@ -489,20 +502,20 @@ mod tests {
         }
     }
 
-    fn policy(hosts: &[&str], allow_private: bool) -> EgressPolicy {
+    fn policy(hosts: &[&str], allow_private: bool) -> TestResult<EgressPolicy> {
         let hosts = hosts.iter().map(|host| (*host).to_owned()).collect();
-        EgressPolicy::new(hosts, allow_private).expect("gültige Policy")
+        EgressPolicy::new(hosts, allow_private).map_err(ctx("gültige Policy"))
     }
 
     /// F-035: der Schlüssel hängt am Policy-Digest.
     #[test]
-    fn test_cache_key_changes_with_policy_digest() {
+    fn test_cache_key_changes_with_policy_digest() -> TestResult {
         let scope = CacheScope::new("t", "w", &NetworkScope::from_hosts(["docs.rs".into()]));
         let url = "https://docs.rs/serde/";
-        let strict = policy(&["docs.rs"], false);
-        let reordered = policy(&["crates.io", "DOCS.rs"], false);
-        let wider = policy(&["docs.rs", "crates.io"], false);
-        let private = policy(&["docs.rs"], true);
+        let strict = policy(&["docs.rs"], false)?;
+        let reordered = policy(&["crates.io", "DOCS.rs"], false)?;
+        let wider = policy(&["docs.rs", "crates.io"], false)?;
+        let private = policy(&["docs.rs"], true)?;
 
         let base = cache_key(&strict.digest(), &scope, url);
         assert_ne!(base, cache_key(&wider.digest(), &scope, url));
@@ -513,102 +526,142 @@ mod tests {
             "Normalisierung der Policy darf den Schlüssel nicht ändern"
         );
         assert_eq!(base, cache_key(&strict.digest(), &scope, url));
+        Ok(())
     }
 
     /// F-035: der Schlüssel hängt an Mandant, Workspace, Netz-Scope und URL.
     #[test]
-    fn test_cache_key_changes_with_scope_and_url() {
-        let digest = policy(&["docs.rs"], false).digest();
+    fn test_cache_key_changes_with_scope_and_url() -> TestResult {
+        let digest = policy(&["docs.rs"], false)?.digest();
         let net = NetworkScope::from_hosts(["docs.rs".into()]);
         let url = "https://docs.rs/";
         let base = cache_key(&digest, &CacheScope::new("t", "w", &net), url);
 
-        assert_ne!(base, cache_key(&digest, &CacheScope::new("t2", "w", &net), url));
-        assert_ne!(base, cache_key(&digest, &CacheScope::new("t", "w2", &net), url));
         assert_ne!(
             base,
-            cache_key(&digest, &CacheScope::new("t", "w", &NetworkScope::empty()), url)
+            cache_key(&digest, &CacheScope::new("t2", "w", &net), url)
         );
-        assert_ne!(base, cache_key(&digest, &CacheScope::new("t", "w", &net), "https://docs.rs/x"));
+        assert_ne!(
+            base,
+            cache_key(&digest, &CacheScope::new("t", "w2", &net), url)
+        );
+        assert_ne!(
+            base,
+            cache_key(
+                &digest,
+                &CacheScope::new("t", "w", &NetworkScope::empty()),
+                url
+            )
+        );
+        assert_ne!(
+            base,
+            cache_key(
+                &digest,
+                &CacheScope::new("t", "w", &net),
+                "https://docs.rs/x"
+            )
+        );
         // Längenpräfixe: ("ab","c") und ("a","bc") kollidieren nicht.
-        assert_ne!(CacheScope::new("ab", "c", &net), CacheScope::new("a", "bc", &net));
+        assert_ne!(
+            CacheScope::new("ab", "c", &net),
+            CacheScope::new("a", "bc", &net)
+        );
+        Ok(())
     }
 
     /// Pfad liegt unter `<base>/web` und ist 64 Hex-Zeichen lang.
     #[test]
-    fn test_cache_path_is_hex_json_below_web_subdir() {
+    fn test_cache_path_is_hex_json_below_web_subdir() -> TestResult {
         let path = cache_path(Path::new("/h/.harw/cache"), &[0xab; 32]);
         assert!(path.starts_with("/h/.harw/cache/web"));
-        let stem = path.file_stem().and_then(|s| s.to_str()).expect("Name");
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or(TestError::Missing("Name"))?;
         assert_eq!(stem, "ab".repeat(32));
+        Ok(())
     }
 
     /// Schreiben und Lesen sind invers; Rechte sind privat.
     #[test]
-    fn test_write_then_read_cache_entry_round_trips_with_private_modes() {
-        let dir = TempDir::new().expect("Tempdir");
+    fn test_write_then_read_cache_entry_round_trips_with_private_modes() -> TestResult {
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
         let key = [7u8; 32];
         let path = cache_path(dir.path(), &key);
         let entry = sample_entry(&to_hex(&key), "https://docs.rs/");
 
-        write_cache_entry(dir.path(), &path, &entry).expect("schreiben");
-        let loaded = read_cache_entry(&path).expect("lesen").expect("vorhanden");
+        write_cache_entry(dir.path(), &path, &entry).map_err(ctx("schreiben"))?;
+        let loaded = read_cache_entry(&path)
+            .map_err(ctx("lesen"))?
+            .ok_or(TestError::Missing("vorhanden"))?;
         assert_eq!(loaded, entry);
 
-        let file_mode = fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+        let file_mode = fs::metadata(&path)
+            .map_err(ctx("meta"))?
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(file_mode, 0o600);
         let dir_mode = fs::metadata(cache_subdir(dir.path()))
-            .expect("meta")
+            .map_err(ctx("meta"))?
             .permissions()
             .mode()
             & 0o777;
         assert_eq!(dir_mode, 0o700);
+        Ok(())
     }
 
     /// Fehlender Eintrag ist kein Fehler.
     #[test]
-    fn test_read_cache_entry_missing_file_is_none() {
-        let dir = TempDir::new().expect("Tempdir");
+    fn test_read_cache_entry_missing_file_is_none() -> TestResult {
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
         let path = cache_path(dir.path(), &[1; 32]);
-        assert_eq!(read_cache_entry(&path).expect("kein Fehler"), None);
+        assert_eq!(read_cache_entry(&path).map_err(ctx("kein Fehler"))?, None);
+        Ok(())
     }
 
     /// F-062: ein gruppen-/weltlesbarer (untergeschobener) Eintrag wird abgelehnt.
     #[test]
-    fn test_read_cache_entry_rejects_non_private_file() {
-        let dir = TempDir::new().expect("Tempdir");
+    fn test_read_cache_entry_rejects_non_private_file() -> TestResult {
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
         let key = [2u8; 32];
         let path = cache_path(dir.path(), &key);
         let entry = sample_entry(&to_hex(&key), "https://docs.rs/");
-        fs::create_dir_all(cache_subdir(dir.path())).expect("dir");
-        fs::write(&path, serde_json::to_vec(&entry).expect("json")).expect("write");
-        fs::set_permissions(&path, Permissions::from_mode(0o644)).expect("chmod");
+        fs::create_dir_all(cache_subdir(dir.path())).map_err(ctx("dir"))?;
+        fs::write(&path, serde_json::to_vec(&entry).map_err(ctx("json"))?).map_err(ctx("write"))?;
+        fs::set_permissions(&path, Permissions::from_mode(0o644)).map_err(ctx("chmod"))?;
 
-        let err = read_cache_entry(&path).expect_err("0644 muss abgelehnt werden");
+        let Err(err) = read_cache_entry(&path) else {
+            return Err(TestError::Unexpected("0644 muss abgelehnt werden".into()));
+        };
         assert!(matches!(err, WebToolError::Io(_)), "{err:?}");
+        Ok(())
     }
 
     /// Ein symlinkter Eintrag wird nicht gelesen.
     #[test]
-    fn test_read_cache_entry_rejects_symlink() {
+    fn test_read_cache_entry_rejects_symlink() -> TestResult {
         use std::os::unix::fs::symlink;
 
-        let dir = TempDir::new().expect("Tempdir");
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
         let path = cache_path(dir.path(), &[3; 32]);
-        fs::create_dir_all(cache_subdir(dir.path())).expect("dir");
+        fs::create_dir_all(cache_subdir(dir.path())).map_err(ctx("dir"))?;
         let outside = dir.path().join("fremd.json");
-        fs::write(&outside, "{}").expect("write");
-        symlink(&outside, &path).expect("symlink");
+        fs::write(&outside, "{}").map_err(ctx("write"))?;
+        symlink(&outside, &path).map_err(ctx("symlink"))?;
 
-        let err = read_cache_entry(&path).expect_err("Symlink");
+        let Err(err) = read_cache_entry(&path) else {
+            return Err(TestError::Unexpected("Err erwartet: Symlink".into()));
+        };
         assert!(matches!(err, WebToolError::Io(_)), "{err:?}");
+        Ok(())
     }
 
     /// Kaputtes JSON und alte Formate melden `CacheCorrupt`.
     #[test]
-    fn test_read_cache_entry_reports_corrupt_and_legacy_content() {
-        let dir = TempDir::new().expect("Tempdir");
-        fs::create_dir_all(cache_subdir(dir.path())).expect("dir");
+    fn test_read_cache_entry_reports_corrupt_and_legacy_content() -> TestResult {
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
+        fs::create_dir_all(cache_subdir(dir.path())).map_err(ctx("dir"))?;
         for (index, content) in [
             "{ kein json",
             r#"{"url":"https://docs.rs/","etag":null,"fetched_at":0,"content_type":"text/html","body":""}"#,
@@ -617,35 +670,48 @@ mod tests {
         .enumerate()
         {
             let path = cache_path(dir.path(), &[u8::try_from(index).unwrap_or(0) + 10; 32]);
-            write_atomic(&path, content.as_bytes(), AtomicWriteOptions::private()).expect("write");
-            let err = read_cache_entry(&path).expect_err("korrupt");
+            write_atomic(&path, content.as_bytes(), AtomicWriteOptions::private())
+                .map_err(ctx("write"))?;
+            let Err(err) = read_cache_entry(&path) else {
+                return Err(TestError::Unexpected("Err erwartet: korrupt".into()));
+            };
             assert!(matches!(err, WebToolError::CacheCorrupt { .. }), "{err:?}");
         }
+        Ok(())
     }
 
     /// Ein Ziel außerhalb von `<base>/web` wird nicht beschrieben.
     #[test]
-    fn test_write_cache_entry_rejects_path_outside_cache_dir() {
-        let dir = TempDir::new().expect("Tempdir");
+    fn test_write_cache_entry_rejects_path_outside_cache_dir() -> TestResult {
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
         let outside = dir.path().join("x.json");
         let entry = sample_entry("00", "https://docs.rs/");
-        let err = write_cache_entry(dir.path(), &outside, &entry).expect_err("außerhalb");
+        let Err(err) = write_cache_entry(dir.path(), &outside, &entry) else {
+            return Err(TestError::Unexpected("Err erwartet: außerhalb".into()));
+        };
         assert!(matches!(err, WebToolError::Io(_)), "{err:?}");
         assert!(!outside.exists());
+        Ok(())
     }
 
     /// Zu offene Verzeichnisrechte werden auf 0700 zurückgesetzt.
     #[test]
-    fn test_write_cache_entry_tightens_cache_dir_mode() {
-        let dir = TempDir::new().expect("Tempdir");
+    fn test_write_cache_entry_tightens_cache_dir_mode() -> TestResult {
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
         let web = cache_subdir(dir.path());
-        fs::create_dir_all(&web).expect("dir");
-        fs::set_permissions(&web, Permissions::from_mode(0o755)).expect("chmod");
+        fs::create_dir_all(&web).map_err(ctx("dir"))?;
+        fs::set_permissions(&web, Permissions::from_mode(0o755)).map_err(ctx("chmod"))?;
         let key = [4u8; 32];
         let entry = sample_entry(&to_hex(&key), "https://docs.rs/");
-        write_cache_entry(dir.path(), &cache_path(dir.path(), &key), &entry).expect("schreiben");
-        let mode = fs::metadata(&web).expect("meta").permissions().mode() & 0o777;
+        write_cache_entry(dir.path(), &cache_path(dir.path(), &key), &entry)
+            .map_err(ctx("schreiben"))?;
+        let mode = fs::metadata(&web)
+            .map_err(ctx("meta"))?
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o700);
+        Ok(())
     }
 
     /// `entry_matches` verlangt Version, Schlüssel und Anfrage-URL.

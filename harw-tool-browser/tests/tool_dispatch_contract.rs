@@ -2,6 +2,9 @@
 //! ownership, budgets, re-validation, observed-location post-check and
 //! session-end cleanup (W5 B-TOOL).
 
+mod common;
+
+use common::{TestError, TestResult, ctx};
 use std::collections::HashMap;
 use std::future::Future;
 use std::str::FromStr;
@@ -39,59 +42,68 @@ const OWNER_B: &str = "harness-session-b";
 
 // ── Fixtures (tests may use expect: a failure is a fixture bug) ─────────────
 
-fn url(text: &str) -> url::Url {
-    url::Url::parse(text).expect("fixture URL is valid")
+fn url(text: &str) -> TestResult<url::Url> {
+    url::Url::parse(text).map_err(ctx("fixture URL is valid"))
 }
 
-fn numbered<T: FromStr>(n: u64) -> T
-where
-    T::Err: std::fmt::Debug,
-{
-    T::from_str(&format!("00000000-0000-4000-8000-{n:012}")).expect("fixture UUID is valid")
+fn numbered<T: FromStr>(n: u64) -> Result<T, T::Err> {
+    T::from_str(&format!("00000000-0000-4000-8000-{n:012}"))
 }
 
+// Mutex-Poisoning ist hier kein Fataler Zustand: die Test-Fixtures geben den
+// Guard auch nach einer Poisonierung zurück statt zu paniken (Bible R087/R165).
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().expect("fixture lock is healthy")
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn tools_with(limits: BrowserLimits) -> (Arc<FakeHost>, BrowserToolSet) {
+fn tools_with(limits: BrowserLimits) -> TestResult<(Arc<FakeHost>, BrowserToolSet)> {
     let host = Arc::new(FakeHost::default());
     let grant = BrowserOpenGrant::ephemeral(
-        OriginPolicy::from_origins(["https://erp.example.com"], true).expect("valid policy"),
-        OriginPolicy::from_origins(["https://sso.example.org"], true).expect("valid policy"),
+        OriginPolicy::from_origins(["https://erp.example.com"], true)
+            .map_err(ctx("valid policy"))?,
+        OriginPolicy::from_origins(["https://sso.example.org"], true)
+            .map_err(ctx("valid policy"))?,
     )
     .with_limits(limits);
     let tools = BrowserToolSet::with_open_policy(
         Arc::clone(&host) as Arc<dyn BrowserHost>,
         BrowserOpenPolicy::grant(grant),
     );
-    (host, tools)
+    Ok((host, tools))
 }
 
-fn tools() -> (Arc<FakeHost>, BrowserToolSet) {
+fn tools() -> TestResult<(Arc<FakeHost>, BrowserToolSet)> {
     tools_with(BrowserLimits::default())
 }
 
-fn run(tools: &BrowserToolSet, owner: &str, request: BrowserToolRequest) -> harw_browser::Result<BrowserToolResponse> {
+fn run(
+    tools: &BrowserToolSet,
+    owner: &str,
+    request: BrowserToolRequest,
+) -> harw_browser::Result<BrowserToolResponse> {
     let prepared = tools.prepare(request)?;
     block_on(tools.dispatch(owner, prepared))
 }
 
-fn open(tools: &BrowserToolSet, owner: &str) -> (BrowserSessionId, BrowserContextId) {
+fn open(tools: &BrowserToolSet, owner: &str) -> TestResult<(BrowserSessionId, BrowserContextId)> {
     let response = run(
         tools,
         owner,
         BrowserToolRequest::Open(OpenRequest {
-            start_url: url("https://erp.example.com/inbox"),
+            start_url: url("https://erp.example.com/inbox")?,
             headless: true,
             bidi: BiDiRequirement::Preferred,
             viewport: None,
         }),
     )
-    .expect("open succeeds");
+    .map_err(ctx("open succeeds"))?;
     match response {
-        BrowserToolResponse::Open(open) => (open.session_id, open.primary_context_id),
-        other => panic!("expected open response, got {other:?}"),
+        BrowserToolResponse::Open(open) => Ok((open.session_id, open.primary_context_id)),
+        other => Err(TestError::Unexpected(format!(
+            "expected open response, got {other:?}"
+        ))),
     }
 }
 
@@ -103,7 +115,11 @@ fn observe(session_id: BrowserSessionId, context_id: BrowserContextId) -> Browse
     })
 }
 
-fn act(session_id: BrowserSessionId, context_id: BrowserContextId, action: BrowserAction) -> BrowserToolRequest {
+fn act(
+    session_id: BrowserSessionId,
+    context_id: BrowserContextId,
+    action: BrowserAction,
+) -> BrowserToolRequest {
     BrowserToolRequest::Act(ActRequest {
         session_id,
         request: ActionRequest::new(context_id, action)
@@ -120,9 +136,9 @@ fn click() -> BrowserAction {
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[test]
-fn test_dispatch_open_binds_session_and_routes_all_operations() {
-    let (host, tools) = tools();
-    let (session_id, context_id) = open(&tools, OWNER_A);
+fn test_dispatch_open_binds_session_and_routes_all_operations() -> TestResult {
+    let (host, tools) = tools()?;
+    let (session_id, context_id) = open(&tools, OWNER_A)?;
     assert_eq!(tools.owned_sessions(OWNER_A), [session_id]);
 
     let revision = BrowserObservationRevision::initial().next();
@@ -131,11 +147,18 @@ fn test_dispatch_open_binds_session_and_routes_all_operations() {
         name: Some("Save".to_owned()),
     });
 
-    match run(&tools, OWNER_A, observe(session_id, context_id)).expect("observe succeeds") {
+    match run(&tools, OWNER_A, observe(session_id, context_id)).map_err(ctx("observe succeeds"))? {
         BrowserToolResponse::Observe(response) => {
-            assert_eq!(response.observation.url, url("https://erp.example.com/inbox"));
+            assert_eq!(
+                response.observation.url,
+                url("https://erp.example.com/inbox")?
+            );
         }
-        other => panic!("expected observe response, got {other:?}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "expected observe response, got {other:?}"
+            )));
+        }
     }
 
     match run(
@@ -148,15 +171,23 @@ fn test_dispatch_open_binds_session_and_routes_all_operations() {
             revision,
         }),
     )
-    .expect("find succeeds")
+    .map_err(ctx("find succeeds"))?
     {
         BrowserToolResponse::Find(response) => assert_eq!(response.element.tag, "button"),
-        other => panic!("expected find response, got {other:?}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "expected find response, got {other:?}"
+            )));
+        }
     }
 
-    match run(&tools, OWNER_A, act(session_id, context_id, click())).expect("act succeeds") {
+    match run(&tools, OWNER_A, act(session_id, context_id, click())).map_err(ctx("act succeeds"))? {
         BrowserToolResponse::Act(response) => assert!(response.outcome.confirmed),
-        other => panic!("expected act response, got {other:?}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "expected act response, got {other:?}"
+            )));
+        }
     }
 
     match run(
@@ -169,10 +200,14 @@ fn test_dispatch_open_binds_session_and_routes_all_operations() {
             timeout: WaitTimeout::from_millis(3_000),
         }),
     )
-    .expect("wait succeeds")
+    .map_err(ctx("wait succeeds"))?
     {
         BrowserToolResponse::Wait(response) => assert!(response.outcome.satisfied),
-        other => panic!("expected wait response, got {other:?}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "expected wait response, got {other:?}"
+            )));
+        }
     }
 
     match run(
@@ -183,15 +218,29 @@ fn test_dispatch_open_binds_session_and_routes_all_operations() {
             since: BrowserEventCursor::zero().next(),
         }),
     )
-    .expect("events succeed")
+    .map_err(ctx("events succeed"))?
     {
         BrowserToolResponse::Events(response) => assert!(response.events.is_empty()),
-        other => panic!("expected events response, got {other:?}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "expected events response, got {other:?}"
+            )));
+        }
     }
 
-    match run(&tools, OWNER_A, BrowserToolRequest::Close(CloseRequest { session_id })).expect("close succeeds") {
+    match run(
+        &tools,
+        OWNER_A,
+        BrowserToolRequest::Close(CloseRequest { session_id }),
+    )
+    .map_err(ctx("close succeeds"))?
+    {
         BrowserToolResponse::Close(response) => assert_eq!(response.session_id, session_id),
-        other => panic!("expected close response, got {other:?}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "expected close response, got {other:?}"
+            )));
+        }
     }
 
     let shared = &host.shared;
@@ -199,17 +248,25 @@ fn test_dispatch_open_binds_session_and_routes_all_operations() {
     assert_eq!(lock(&shared.acts).len(), 1);
     assert_eq!(
         *lock(&shared.waits),
-        [(context_id, WaitCondition::NetworkQuiescence { idle_ms: 250 }, 3_000)]
+        [(
+            context_id,
+            WaitCondition::NetworkQuiescence { idle_ms: 250 },
+            3_000
+        )]
     );
-    assert_eq!(*lock(&shared.events_since), [BrowserEventCursor::zero().next()]);
+    assert_eq!(
+        *lock(&shared.events_since),
+        [BrowserEventCursor::zero().next()]
+    );
     assert_eq!(*lock(&shared.closed), [session_id]);
     assert!(tools.owned_sessions(OWNER_A).is_empty());
+    Ok(())
 }
 
 #[test]
-fn test_dispatch_rejects_foreign_session_without_host_lookup() {
-    let (host, tools) = tools();
-    let (session_id, context_id) = open(&tools, OWNER_A);
+fn test_dispatch_rejects_foreign_session_without_host_lookup() -> TestResult {
+    let (host, tools) = tools()?;
+    let (session_id, context_id) = open(&tools, OWNER_A)?;
 
     for request in [
         observe(session_id, context_id),
@@ -219,7 +276,11 @@ fn test_dispatch_rejects_foreign_session_without_host_lookup() {
             since: BrowserEventCursor::zero(),
         }),
     ] {
-        let error = run(&tools, OWNER_B, request).expect_err("foreign owner must be rejected");
+        let Err(error) = run(&tools, OWNER_B, request) else {
+            return Err(TestError::Unexpected(
+                "foreign owner must be rejected: Err erwartet".into(),
+            ));
+        };
         assert!(
             matches!(error, Error::SessionNotFound { session_id: rejected } if rejected == session_id),
             "{error}"
@@ -228,128 +289,185 @@ fn test_dispatch_rejects_foreign_session_without_host_lookup() {
 
     assert!(lock(&host.shared.session_lookups).is_empty());
     assert!(lock(&host.shared.acts).is_empty());
+    Ok(())
 }
 
 #[test]
-fn test_dispatch_close_by_foreign_owner_is_rejected_and_session_stays_open() {
-    let (host, tools) = tools();
-    let (session_id, context_id) = open(&tools, OWNER_A);
+fn test_dispatch_close_by_foreign_owner_is_rejected_and_session_stays_open() -> TestResult {
+    let (host, tools) = tools()?;
+    let (session_id, context_id) = open(&tools, OWNER_A)?;
 
-    let error = run(&tools, OWNER_B, BrowserToolRequest::Close(CloseRequest { session_id }))
-        .expect_err("foreign close must be rejected");
+    let Err(error) = run(
+        &tools,
+        OWNER_B,
+        BrowserToolRequest::Close(CloseRequest { session_id }),
+    ) else {
+        return Err(TestError::Unexpected(
+            "foreign close must be rejected: Err erwartet".into(),
+        ));
+    };
 
     assert!(matches!(error, Error::SessionNotFound { .. }));
     assert!(lock(&host.shared.closed).is_empty());
     assert!(run(&tools, OWNER_A, observe(session_id, context_id)).is_ok());
+    Ok(())
 }
 
 #[test]
-fn test_dispatch_act_budget_exhausted() {
-    let (host, tools) = tools_with(BrowserLimits::default().with_max_actions_per_session(2));
-    let (session_id, context_id) = open(&tools, OWNER_A);
+fn test_dispatch_act_budget_exhausted() -> TestResult {
+    let (host, tools) = tools_with(BrowserLimits::default().with_max_actions_per_session(2))?;
+    let (session_id, context_id) = open(&tools, OWNER_A)?;
 
-    assert!(run(&tools, OWNER_A, act(session_id, context_id, BrowserAction::Reload)).is_ok());
-    assert!(run(&tools, OWNER_A, act(session_id, context_id, BrowserAction::Reload)).is_ok());
-    let error = run(&tools, OWNER_A, act(session_id, context_id, BrowserAction::Reload))
-        .expect_err("third action exceeds the budget");
+    assert!(
+        run(
+            &tools,
+            OWNER_A,
+            act(session_id, context_id, BrowserAction::Reload)
+        )
+        .is_ok()
+    );
+    assert!(
+        run(
+            &tools,
+            OWNER_A,
+            act(session_id, context_id, BrowserAction::Reload)
+        )
+        .is_ok()
+    );
+    let Err(error) = run(
+        &tools,
+        OWNER_A,
+        act(session_id, context_id, BrowserAction::Reload),
+    ) else {
+        return Err(TestError::Unexpected(
+            "third action exceeds the budget: Err erwartet".into(),
+        ));
+    };
 
     assert!(
         matches!(&error, Error::InvalidArgument { detail } if detail.contains("budget")),
         "{error}"
     );
     assert_eq!(lock(&host.shared.acts).len(), 2);
+    Ok(())
 }
 
 #[test]
-fn test_dispatch_act_navigation_outside_grant_rejected_without_consuming_budget() {
-    let (host, tools) = tools_with(BrowserLimits::default().with_max_actions_per_session(1));
-    let (session_id, context_id) = open(&tools, OWNER_A);
+fn test_dispatch_act_navigation_outside_grant_rejected_without_consuming_budget() -> TestResult {
+    let (host, tools) = tools_with(BrowserLimits::default().with_max_actions_per_session(1))?;
+    let (session_id, context_id) = open(&tools, OWNER_A)?;
 
-    let error = run(
+    let Err(error) = run(
         &tools,
         OWNER_A,
         act(
             session_id,
             context_id,
             BrowserAction::Navigate {
-                url: url("https://evil.example.net/"),
+                url: url("https://evil.example.net/")?,
             },
         ),
-    )
-    .expect_err("navigation outside the grant is rejected");
+    ) else {
+        return Err(TestError::Unexpected(
+            "navigation outside the grant is rejected: Err erwartet".into(),
+        ));
+    };
     assert!(matches!(error, Error::OriginNotAllowed { .. }), "{error}");
 
-    let error = run(
+    let Err(error) = run(
         &tools,
         OWNER_A,
         act(
             session_id,
             context_id,
             BrowserAction::Navigate {
-                url: url("https://sso.example.org/login"),
+                url: url("https://sso.example.org/login")?,
             },
         ),
-    )
-    .expect_err("authentication origins are never navigation targets");
+    ) else {
+        return Err(TestError::Unexpected(
+            "authentication origins are never navigation targets: Err erwartet".into(),
+        ));
+    };
     assert!(matches!(error, Error::OriginNotAllowed { .. }), "{error}");
 
-    assert!(run(&tools, OWNER_A, act(session_id, context_id, BrowserAction::Reload)).is_ok());
+    assert!(
+        run(
+            &tools,
+            OWNER_A,
+            act(session_id, context_id, BrowserAction::Reload)
+        )
+        .is_ok()
+    );
     assert_eq!(lock(&host.shared.acts).len(), 1);
+    Ok(())
 }
 
 #[test]
-fn test_dispatch_act_observed_location_breach_closes_session() {
-    let (host, tools) = tools();
-    let (session_id, context_id) = open(&tools, OWNER_A);
-    *lock(&host.shared.redirect_on_act) = Some(url("https://evil.example.net/phish"));
+fn test_dispatch_act_observed_location_breach_closes_session() -> TestResult {
+    let (host, tools) = tools()?;
+    let (session_id, context_id) = open(&tools, OWNER_A)?;
+    *lock(&host.shared.redirect_on_act) = Some(url("https://evil.example.net/phish")?);
 
-    let error = run(&tools, OWNER_A, act(session_id, context_id, click()))
-        .expect_err("leaving the granted origins is a breach");
+    let Err(error) = run(&tools, OWNER_A, act(session_id, context_id, click())) else {
+        return Err(TestError::Unexpected(
+            "leaving the granted origins is a breach: Err erwartet".into(),
+        ));
+    };
 
     assert!(matches!(error, Error::OriginNotAllowed { .. }), "{error}");
     assert_eq!(*lock(&host.shared.closed), [session_id]);
     assert!(tools.owned_sessions(OWNER_A).is_empty());
-    let error = run(&tools, OWNER_A, observe(session_id, context_id))
-        .expect_err("a breached session is gone");
+    let Err(error) = run(&tools, OWNER_A, observe(session_id, context_id)) else {
+        return Err(TestError::Unexpected(
+            "a breached session is gone: Err erwartet".into(),
+        ));
+    };
     assert!(matches!(error, Error::SessionNotFound { .. }));
+    Ok(())
 }
 
 #[test]
-fn test_dispatch_act_accepts_authentication_origin_as_observed_location() {
-    let (host, tools) = tools();
-    let (session_id, context_id) = open(&tools, OWNER_A);
-    *lock(&host.shared.redirect_on_act) = Some(url("https://sso.example.org/login"));
+fn test_dispatch_act_accepts_authentication_origin_as_observed_location() -> TestResult {
+    let (host, tools) = tools()?;
+    let (session_id, context_id) = open(&tools, OWNER_A)?;
+    *lock(&host.shared.redirect_on_act) = Some(url("https://sso.example.org/login")?);
 
     assert!(run(&tools, OWNER_A, act(session_id, context_id, click())).is_ok());
     assert!(lock(&host.shared.closed).is_empty());
+    Ok(())
 }
 
 #[test]
-fn test_dispatch_open_rejects_start_location_outside_grant() {
-    let (host, tools) = tools();
-    *lock(&host.shared.open_redirect) = Some(url("https://evil.example.net/"));
+fn test_dispatch_open_rejects_start_location_outside_grant() -> TestResult {
+    let (host, tools) = tools()?;
+    *lock(&host.shared.open_redirect) = Some(url("https://evil.example.net/")?);
 
-    let error = run(
+    let Err(error) = run(
         &tools,
         OWNER_A,
         BrowserToolRequest::Open(OpenRequest {
-            start_url: url("https://erp.example.com/"),
+            start_url: url("https://erp.example.com/")?,
             headless: true,
             bidi: BiDiRequirement::NotRequired,
             viewport: None,
         }),
-    )
-    .expect_err("redirected start location is a breach");
+    ) else {
+        return Err(TestError::Unexpected(
+            "redirected start location is a breach: Err erwartet".into(),
+        ));
+    };
 
     assert!(matches!(error, Error::OriginNotAllowed { .. }), "{error}");
     assert_eq!(lock(&host.shared.closed).len(), 1);
     assert!(tools.owned_sessions(OWNER_A).is_empty());
+    Ok(())
 }
 
 #[test]
-fn test_dispatch_revalidates_with_session_limits() {
-    let (host, tools) = tools_with(BrowserLimits::default().with_max_text_bytes(8));
-    let (session_id, context_id) = open(&tools, OWNER_A);
+fn test_dispatch_revalidates_with_session_limits() -> TestResult {
+    let (host, tools) = tools_with(BrowserLimits::default().with_max_text_bytes(8))?;
+    let (session_id, context_id) = open(&tools, OWNER_A)?;
     let request = act(
         session_id,
         context_id,
@@ -359,23 +477,32 @@ fn test_dispatch_revalidates_with_session_limits() {
         },
     );
 
-    let direct = tools.prepare(request.clone()).expect_err("tool set prepares with grant limits");
+    let Err(direct) = tools.prepare(request.clone()) else {
+        return Err(TestError::Unexpected(
+            "tool set prepares with grant limits: Err erwartet".into(),
+        ));
+    };
     assert!(matches!(direct, Error::InvalidArgument { .. }));
 
-    let loose = prepare_browser_call(request).expect("default limits admit 16 bytes");
-    let error = block_on(tools.dispatch(OWNER_A, loose)).expect_err("session limits apply at dispatch");
+    let loose = prepare_browser_call(request).map_err(ctx("default limits admit 16 bytes"))?;
+    let Err(error) = block_on(tools.dispatch(OWNER_A, loose)) else {
+        return Err(TestError::Unexpected(
+            "session limits apply at dispatch: Err erwartet".into(),
+        ));
+    };
     assert!(matches!(error, Error::InvalidArgument { .. }), "{error}");
     assert!(lock(&host.shared.acts).is_empty());
+    Ok(())
 }
 
 #[test]
-fn test_close_sessions_owned_by_closes_only_that_owners_sessions() {
-    let (host, tools) = tools();
-    let (a1, _) = open(&tools, OWNER_A);
-    let (a2, _) = open(&tools, OWNER_A);
-    let (b1, b1_context) = open(&tools, OWNER_B);
+fn test_close_sessions_owned_by_closes_only_that_owners_sessions() -> TestResult {
+    let (host, tools) = tools()?;
+    let (a1, _) = open(&tools, OWNER_A)?;
+    let (a2, _) = open(&tools, OWNER_A)?;
+    let (b1, b1_context) = open(&tools, OWNER_B)?;
 
-    let closed = block_on(tools.close_sessions_owned_by(OWNER_A)).expect("closes succeed");
+    let closed = block_on(tools.close_sessions_owned_by(OWNER_A)).map_err(ctx("closes succeed"))?;
 
     assert_eq!(closed, 2);
     let mut closed_ids = lock(&host.shared.closed).clone();
@@ -386,18 +513,22 @@ fn test_close_sessions_owned_by_closes_only_that_owners_sessions() {
     assert!(tools.owned_sessions(OWNER_A).is_empty());
     assert_eq!(tools.owned_sessions(OWNER_B), [b1]);
     assert!(run(&tools, OWNER_B, observe(b1, b1_context)).is_ok());
+    Ok(())
 }
 
 #[test]
-fn test_revoke_sessions_owned_by_blocks_further_use() {
-    let (host, tools) = tools();
-    let (session_id, context_id) = open(&tools, OWNER_A);
+fn test_revoke_sessions_owned_by_blocks_further_use() -> TestResult {
+    let (host, tools) = tools()?;
+    let (session_id, context_id) = open(&tools, OWNER_A)?;
 
     assert_eq!(tools.revoke_sessions_owned_by(OWNER_A), [session_id]);
 
-    let error = run(&tools, OWNER_A, observe(session_id, context_id)).expect_err("revoked");
+    let Err(error) = run(&tools, OWNER_A, observe(session_id, context_id)) else {
+        return Err(TestError::Unexpected("revoked: Err erwartet".into()));
+    };
     assert!(matches!(error, Error::SessionNotFound { .. }));
     assert!(lock(&host.shared.closed).is_empty());
+    Ok(())
 }
 
 // ── Fake host / runtime ─────────────────────────────────────────────────────
@@ -430,11 +561,21 @@ struct FakeRuntime {
 
 #[async_trait]
 impl BrowserHost for FakeHost {
-    async fn open(&self, request: OpenBrowserRequest) -> harw_browser::Result<BrowserSessionHandle> {
+    async fn open(
+        &self,
+        request: OpenBrowserRequest,
+    ) -> harw_browser::Result<BrowserSessionHandle> {
         let n = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = numbered::<BrowserSessionId>(n).map_err(|source| Error::InvalidArgument {
+            detail: format!("Test-Fixture-UUID (Session) ungültig: {source}"),
+        })?;
+        let context =
+            numbered::<BrowserContextId>(1_000 + n).map_err(|source| Error::InvalidArgument {
+                detail: format!("Test-Fixture-UUID (Context) ungültig: {source}"),
+            })?;
         let runtime = Arc::new(FakeRuntime {
-            id: numbered(n),
-            context: numbered(1_000 + n),
+            id,
+            context,
             shared: Arc::clone(&self.shared),
         });
         let landed = lock(&self.shared.open_redirect)
@@ -476,9 +617,12 @@ impl BrowserRuntime for FakeRuntime {
         context_id: &BrowserContextId,
         _mode: ObservationMode,
     ) -> harw_browser::Result<BrowserObservation> {
-        let location = lock(&self.shared.location)
-            .clone()
-            .unwrap_or_else(|| url("about:blank"));
+        let location = match lock(&self.shared.location).clone() {
+            Some(existing) => existing,
+            // "about:blank" ist eine feste, immer gültige URL; ein Parsefehler
+            // hier wäre ein Bug in dieser Konstante, kein Laufzeitfehler.
+            None => url::Url::parse("about:blank")?,
+        };
         Ok(BrowserObservation {
             session_id: self.id,
             context_id: *context_id,

@@ -48,14 +48,14 @@ use std::sync::Mutex;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use crate::MemoryResult;
 use crate::consolidation::{
-    ConsolidationLock, ConsolidationReport, Conflict, apply_plan, plan_consolidation,
+    Conflict, ConsolidationLock, ConsolidationReport, apply_plan, plan_consolidation,
 };
 use crate::error::MemoryError;
 use crate::extraction::{ExtractionError, IncomingStore};
 use crate::facts::{Fact, FactScope, FactStore, FactType, redact, slugify};
 use crate::file_index::{FileKnowledgeIndex, extract_file_knowledge};
-use crate::MemoryResult;
 
 /// Marker im `fs.read`-Ausgabetext für gekürzte Ausgaben (siehe
 /// `harw-tool-fs/src/read.rs`). Solche Ausgaben enthalten nicht den vollen
@@ -119,7 +119,8 @@ fn truncate_bytes_utf8_safe(s: &str, max_bytes: usize) -> String {
 
 /// Formatiert `ts` als RFC 3339.
 fn format_rfc3339(ts: OffsetDateTime) -> String {
-    ts.format(&Rfc3339).unwrap_or_else(|_| ts.unix_timestamp().to_string())
+    ts.format(&Rfc3339)
+        .unwrap_or_else(|_| ts.unix_timestamp().to_string())
 }
 
 /// Aktueller Zeitpunkt als RFC 3339.
@@ -213,12 +214,16 @@ fn match_key(tool_name: &str, arguments: &serde_json::Value) -> String {
 /// wurde; `None` bei Erfolg oder wenn `output_text` kein JSON dieser Form ist.
 fn shell_exec_failure_text(output_text: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(output_text).ok()?;
-    let exit_code = value.get("exit_code").and_then(serde_json::Value::as_i64).unwrap_or(0);
+    let exit_code = value
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
     let stdout = value.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
     let stderr = value.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
     let combined = format!("{stdout}\n{stderr}");
-    let looks_failed =
-        combined.contains("error[E") || combined.contains("FAILED") || combined.contains("panicked at");
+    let looks_failed = combined.contains("error[E")
+        || combined.contains("FAILED")
+        || combined.contains("panicked at");
     if exit_code != 0 || looks_failed {
         Some(if combined.trim().is_empty() {
             format!("shell.exec exit_code={exit_code}")
@@ -304,8 +309,8 @@ impl ProjectMemoryCapture {
     /// Fehler von [`FileKnowledgeIndex::open`]/[`IncomingStore::open`].
     pub fn open(memories_root: &Path) -> MemoryResult<Self> {
         let file_index = FileKnowledgeIndex::open(memories_root)?;
-        let incoming =
-            IncomingStore::open(memories_root).map_err(|e| extraction_to_memory(e, memories_root))?;
+        let incoming = IncomingStore::open(memories_root)
+            .map_err(|e| extraction_to_memory(e, memories_root))?;
         Ok(Self {
             memories_root: memories_root.to_path_buf(),
             file_index,
@@ -404,7 +409,13 @@ impl ProjectMemoryCapture {
     /// sofern er nicht vorübergehend ist (siehe [`is_transient_error`]) und
     /// noch keine identische Signatur für diesen Vergleichsschlüssel offen
     /// ist (Dedup innerhalb der Session).
-    fn record_failure(&self, session_id: &str, tool_name: &str, arguments: &serde_json::Value, error_text: &str) {
+    fn record_failure(
+        &self,
+        session_id: &str,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        error_text: &str,
+    ) {
         if is_transient_error(error_text) {
             return;
         }
@@ -436,7 +447,12 @@ impl ProjectMemoryCapture {
     /// Sucht den jüngsten offenen Fehlschlag mit passendem
     /// [`match_key`] und schreibt bei Erfolg einen Pitfall-Kandidaten (mit
     /// „Funktionierte mit") in den Incoming-Speicher.
-    fn try_resolve_pending(&self, session_id: &str, tool_name: &str, arguments: &serde_json::Value) {
+    fn try_resolve_pending(
+        &self,
+        session_id: &str,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) {
         let key = match_key(tool_name, arguments);
         let resolved = {
             let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
@@ -494,7 +510,10 @@ impl ProjectMemoryCapture {
     pub fn flush_session(&self, session_id: &str) {
         let pending = {
             let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-            sessions.remove(session_id).map(|s| s.pending_failures).unwrap_or_default()
+            sessions
+                .remove(session_id)
+                .map(|s| s.pending_failures)
+                .unwrap_or_default()
         };
         if pending.is_empty() {
             return;
@@ -551,7 +570,10 @@ fn pitfall_fact(
 
 /// Durchsucht `value` rekursiv nach Objekten mit `conclusion: String` und
 /// `evidence: Array` (Fund-Form), sammelt sie in `out`.
-fn collect_finding_objects(value: &serde_json::Value, out: &mut Vec<serde_json::Map<String, serde_json::Value>>) {
+fn collect_finding_objects(
+    value: &serde_json::Value,
+    out: &mut Vec<serde_json::Map<String, serde_json::Value>>,
+) {
     match value {
         serde_json::Value::Object(map) => {
             if is_finding_shape(map) {
@@ -579,13 +601,20 @@ fn is_finding_shape(map: &serde_json::Map<String, serde_json::Value>) -> bool {
 
 /// Baut einen `Fact`-Kandidaten (`FactType::Fact`) aus einem Fund-Objekt,
 /// `None` bei Konfidenz `low`/unbekannt oder ohne Belege.
-fn finding_to_fact(obj: &serde_json::Map<String, serde_json::Value>, session_id: &str) -> Option<Fact> {
+fn finding_to_fact(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    session_id: &str,
+) -> Option<Fact> {
     let _ = session_id; // Findings tragen ausschließlich evidence[].locator als sources.
     let conclusion = obj.get("conclusion")?.as_str()?.trim();
     if conclusion.is_empty() {
         return None;
     }
-    let confidence = match obj.get("confidence").and_then(|v| v.as_str()).map(str::to_lowercase) {
+    let confidence = match obj
+        .get("confidence")
+        .and_then(|v| v.as_str())
+        .map(str::to_lowercase)
+    {
         Some(ref s) if s == "medium" => 0.6_f32,
         Some(ref s) if s == "high" => 0.8_f32,
         Some(ref s) if s == "verified" => 0.95_f32,
@@ -606,7 +635,10 @@ fn finding_to_fact(obj: &serde_json::Map<String, serde_json::Value>, session_id:
         return None;
     }
 
-    let produced_by = obj.get("produced_by").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let produced_by = obj
+        .get("produced_by")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
     let constraints: Vec<String> = string_array(obj.get("constraints"));
     let unresolved: Vec<String> = string_array(obj.get("unresolved_questions"));
 
@@ -635,7 +667,11 @@ fn finding_to_fact(obj: &serde_json::Map<String, serde_json::Value>, session_id:
         updated: now,
         confidence,
         sources,
-        tags: vec!["auto".to_owned(), "finding".to_owned(), produced_by.to_owned()],
+        tags: vec![
+            "auto".to_owned(),
+            "finding".to_owned(),
+            produced_by.to_owned(),
+        ],
         body,
     })
 }
@@ -644,7 +680,12 @@ fn finding_to_fact(obj: &serde_json::Map<String, serde_json::Value>, session_id:
 fn string_array(value: Option<&serde_json::Value>) -> Vec<String> {
     value
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(str::to_owned).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_owned)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -689,7 +730,11 @@ fn write_last_consolidation_marker(memories_root: &Path, now: OffsetDateTime) ->
 
 /// Hängt `conflicts` an `<memories>/facts/_conflicts.json` an (liest die
 /// bestehende JSON-Liste, ergänzt, schreibt atomar zurück).
-fn write_conflicts(memories_root: &Path, conflicts: &[Conflict], now: OffsetDateTime) -> MemoryResult<()> {
+fn write_conflicts(
+    memories_root: &Path,
+    conflicts: &[Conflict],
+    now: OffsetDateTime,
+) -> MemoryResult<()> {
     let path = conflicts_path(memories_root);
     let mut existing: Vec<serde_json::Value> = match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
@@ -756,7 +801,9 @@ fn run_consolidation(memories_root: &Path) -> MemoryResult<ConsolidationReport> 
     let fact_store = FactStore::open(memories_root, FactScope::Project)?;
     let now = OffsetDateTime::now_utc();
 
-    let pending = incoming_store.list().map_err(|e| extraction_to_memory(e, memories_root))?;
+    let pending = incoming_store
+        .list()
+        .map_err(|e| extraction_to_memory(e, memories_root))?;
     if pending.is_empty() {
         if should_run_daily_decay(memories_root, now)? {
             fact_store.decay(DECAY_MAX_UNUSED_DAYS, now)?;
@@ -766,7 +813,9 @@ fn run_consolidation(memories_root: &Path) -> MemoryResult<ConsolidationReport> 
         return Ok(ConsolidationReport::default());
     }
 
-    let taken = incoming_store.take_all().map_err(|e| extraction_to_memory(e, memories_root))?;
+    let taken = incoming_store
+        .take_all()
+        .map_err(|e| extraction_to_memory(e, memories_root))?;
     let existing = fact_store.list()?;
     let plan = plan_consolidation(&existing, &taken);
 
@@ -787,11 +836,13 @@ fn run_consolidation(memories_root: &Path) -> MemoryResult<ConsolidationReport> 
 mod tests {
     use super::*;
     use crate::facts::FactStore;
+    use crate::test_support::{TestResult, ctx};
 
     fn tmp_root(tag: &str) -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!("harw-capture-{tag}-{}-{id}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("harw-capture-{tag}-{}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         root
     }
@@ -799,9 +850,9 @@ mod tests {
     // -- Lektionen -----------------------------------------------------
 
     #[test]
-    fn error_then_success_creates_single_pitfall_candidate_with_both_args() {
+    fn error_then_success_creates_single_pitfall_candidate_with_both_args() -> TestResult {
         let root = tmp_root("lessons-resolve");
-        let capture = ProjectMemoryCapture::open(&root).unwrap();
+        let capture = ProjectMemoryCapture::open(&root).map_err(ctx("Capture öffnen"))?;
         let fail_args = serde_json::json!({"path": "src/lib.rs"});
         capture.record_tool_outcome(
             "sess-1",
@@ -813,8 +864,9 @@ mod tests {
         let ok_args = serde_json::json!({"path": "src/lib.rs", "fixed": true});
         capture.record_tool_outcome("sess-1", "cargo.check", &ok_args, false, "ok");
 
-        let incoming = crate::extraction::IncomingStore::open(&root).unwrap();
-        let candidates = incoming.list().unwrap();
+        let incoming =
+            crate::extraction::IncomingStore::open(&root).map_err(ctx("IncomingStore öffnen"))?;
+        let candidates = incoming.list().map_err(ctx("Kandidaten auflisten"))?;
         assert_eq!(candidates.len(), 1);
         let fact = &candidates[0];
         assert_eq!(fact.fact_type, crate::facts::FactType::Pitfall);
@@ -823,12 +875,13 @@ mod tests {
         assert!(fact.body.contains("fixed"));
         assert_eq!(fact.confidence, 0.5);
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn transient_error_is_never_recorded_as_lesson() {
+    fn transient_error_is_never_recorded_as_lesson() -> TestResult {
         let root = tmp_root("lessons-transient");
-        let capture = ProjectMemoryCapture::open(&root).unwrap();
+        let capture = ProjectMemoryCapture::open(&root).map_err(ctx("Capture öffnen"))?;
         capture.record_tool_outcome(
             "sess-2",
             "http.fetch",
@@ -838,15 +891,22 @@ mod tests {
         );
         capture.flush_session("sess-2");
 
-        let incoming = crate::extraction::IncomingStore::open(&root).unwrap();
-        assert!(incoming.list().unwrap().is_empty());
+        let incoming =
+            crate::extraction::IncomingStore::open(&root).map_err(ctx("IncomingStore öffnen"))?;
+        assert!(
+            incoming
+                .list()
+                .map_err(ctx("Kandidaten auflisten"))?
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn flush_session_writes_unresolved_failure_with_lower_confidence() {
+    fn flush_session_writes_unresolved_failure_with_lower_confidence() -> TestResult {
         let root = tmp_root("lessons-flush");
-        let capture = ProjectMemoryCapture::open(&root).unwrap();
+        let capture = ProjectMemoryCapture::open(&root).map_err(ctx("Capture öffnen"))?;
         capture.record_tool_outcome(
             "sess-3",
             "cargo.check",
@@ -856,20 +916,22 @@ mod tests {
         );
         capture.flush_session("sess-3");
 
-        let incoming = crate::extraction::IncomingStore::open(&root).unwrap();
-        let candidates = incoming.list().unwrap();
+        let incoming =
+            crate::extraction::IncomingStore::open(&root).map_err(ctx("IncomingStore öffnen"))?;
+        let candidates = incoming.list().map_err(ctx("Kandidaten auflisten"))?;
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].confidence, 0.35);
         assert!(!candidates[0].body.contains("Funktionierte mit"));
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // -- Recherche-Funde -------------------------------------------------
 
     #[test]
-    fn medium_confidence_finding_with_evidence_creates_fact_candidate() {
+    fn medium_confidence_finding_with_evidence_creates_fact_candidate() -> TestResult {
         let root = tmp_root("finding-medium");
-        let capture = ProjectMemoryCapture::open(&root).unwrap();
+        let capture = ProjectMemoryCapture::open(&root).map_err(ctx("Capture öffnen"))?;
         let output = serde_json::json!({
             "conclusion": "jiff 0.2 ist die aktuelle Version",
             "evidence": [{"locator": "crates.io/crates/jiff", "kind": "cargo_registry_source"}],
@@ -877,40 +939,64 @@ mod tests {
             "produced_by": "explorer-1"
         })
         .to_string();
-        capture.record_tool_outcome("sess-4", "research-deps", &serde_json::json!({}), false, &output);
+        capture.record_tool_outcome(
+            "sess-4",
+            "research-deps",
+            &serde_json::json!({}),
+            false,
+            &output,
+        );
 
-        let incoming = crate::extraction::IncomingStore::open(&root).unwrap();
-        let candidates = incoming.list().unwrap();
+        let incoming =
+            crate::extraction::IncomingStore::open(&root).map_err(ctx("IncomingStore öffnen"))?;
+        let candidates = incoming.list().map_err(ctx("Kandidaten auflisten"))?;
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].fact_type, crate::facts::FactType::Fact);
         assert_eq!(candidates[0].confidence, 0.6);
-        assert_eq!(candidates[0].sources, vec!["crates.io/crates/jiff".to_owned()]);
+        assert_eq!(
+            candidates[0].sources,
+            vec!["crates.io/crates/jiff".to_owned()]
+        );
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn low_confidence_finding_is_ignored() {
+    fn low_confidence_finding_is_ignored() -> TestResult {
         let root = tmp_root("finding-low");
-        let capture = ProjectMemoryCapture::open(&root).unwrap();
+        let capture = ProjectMemoryCapture::open(&root).map_err(ctx("Capture öffnen"))?;
         let output = serde_json::json!({
             "conclusion": "unklar",
             "evidence": [{"locator": "web:example.com"}],
             "confidence": "low"
         })
         .to_string();
-        capture.record_tool_outcome("sess-5", "research-web", &serde_json::json!({}), false, &output);
+        capture.record_tool_outcome(
+            "sess-5",
+            "research-web",
+            &serde_json::json!({}),
+            false,
+            &output,
+        );
 
-        let incoming = crate::extraction::IncomingStore::open(&root).unwrap();
-        assert!(incoming.list().unwrap().is_empty());
+        let incoming =
+            crate::extraction::IncomingStore::open(&root).map_err(ctx("IncomingStore öffnen"))?;
+        assert!(
+            incoming
+                .list()
+                .map_err(ctx("Kandidaten auflisten"))?
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // -- consolidate_project_memories -----------------------------------
 
     #[test]
-    fn consolidate_moves_incoming_candidates_into_facts() {
+    fn consolidate_moves_incoming_candidates_into_facts() -> TestResult {
         let root = tmp_root("consolidate");
-        let capture = ProjectMemoryCapture::open(&root).unwrap();
+        let capture = ProjectMemoryCapture::open(&root).map_err(ctx("Capture öffnen"))?;
         let output = serde_json::json!({
             "conclusion": "harw-fsutil erzwingt symlinkfestes Öffnen",
             "evidence": [{"locator": "file:harw-fsutil/src/open.rs"}],
@@ -920,16 +1006,24 @@ mod tests {
         .to_string();
         capture.record_tool_outcome("sess-6", "explore", &serde_json::json!({}), false, &output);
 
-        let report = consolidate_project_memories(&root).unwrap();
+        let report = consolidate_project_memories(&root).map_err(ctx("Konsolidierung"))?;
         assert_eq!(report.written, 1);
 
-        let incoming = crate::extraction::IncomingStore::open(&root).unwrap();
-        assert!(incoming.list().unwrap().is_empty());
+        let incoming =
+            crate::extraction::IncomingStore::open(&root).map_err(ctx("IncomingStore öffnen"))?;
+        assert!(
+            incoming
+                .list()
+                .map_err(ctx("Kandidaten auflisten"))?
+                .is_empty()
+        );
 
-        let store = FactStore::open(&root, crate::facts::FactScope::Project).unwrap();
-        let facts = store.list().unwrap();
+        let store = FactStore::open(&root, crate::facts::FactScope::Project)
+            .map_err(ctx("FactStore öffnen"))?;
+        let facts = store.list().map_err(ctx("Facts auflisten"))?;
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].fact_type, crate::facts::FactType::Fact);
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 }

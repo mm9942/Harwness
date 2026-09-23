@@ -39,7 +39,7 @@ use std::sync::Arc;
 const DEFAULT_REASON: &str = "cancelled through /cancel";
 
 /// Eingabe-Argumente für die `cancel`-Operation.
-#[derive(Default, serde::Deserialize, harw_macros::FromRawArgs)]
+#[derive(Debug, Default, serde::Deserialize, harw_macros::FromRawArgs, harw_macros::OpArgs)]
 pub struct CancelArgs {
     /// Die abzubrechende `WorkId`.
     #[serde(default)]
@@ -100,10 +100,13 @@ async fn cancel(ctx: &OpContext, args: CancelArgs) -> Result<OpOutput, OpError> 
 #[cfg(test)]
 mod tests {
     use super::{CancelArgs, DEFAULT_REASON, cancel};
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_job_runtime::{Budget, Job, JobKind, JobScope, JobState, RetryPolicy, StoredJob};
     use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_session_store::JobStore;
     use harw_types::{ApprovalActor, SessionId, TenantId, TurnId, WorkId, WorkspaceId};
     use jiff::{SignedDuration, Timestamp};
@@ -112,12 +115,14 @@ mod tests {
         atomic::{AtomicU64, Ordering},
     };
 
-    fn make_test_ctx(with_store: bool) -> (OpContext, std::path::PathBuf, Option<Arc<JobStore>>) {
+    fn make_test_ctx(
+        with_store: bool,
+    ) -> TestResult<(OpContext, std::path::PathBuf, Option<Arc<JobStore>>)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root =
             std::env::temp_dir().join(format!("harw-cancel-test-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(root.join("ws")).expect("create test workspace");
+        std::fs::create_dir_all(root.join("ws")).map_err(ctx("create test workspace"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -126,13 +131,13 @@ mod tests {
                 root: std::path::PathBuf::from("ws"),
             }],
         )
-        .expect("build workspace registry");
+        .map_err(ctx("build workspace registry"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .expect("resolve workspace binding");
+            .map_err(ctx("resolve workspace binding"))?;
         let sandbox = SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ReadWorkspace]),
@@ -142,14 +147,14 @@ mod tests {
         if let Some(store) = &store {
             services.insert(Arc::clone(store));
         }
-        (
+        Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, services),
             root,
             store,
-        )
+        ))
     }
 
-    fn admitted_job(id: &str) -> StoredJob {
+    fn admitted_job(id: &str) -> TestResult<StoredJob> {
         let now = Timestamp::now();
         let mut job = Job::new(
             WorkId::from_str(id),
@@ -163,8 +168,9 @@ mod tests {
             },
             now,
         );
-        job.mark_ready(now).expect("new job can become ready");
-        StoredJob {
+        job.mark_ready(now)
+            .map_err(ctx("new job can become ready"))?;
+        Ok(StoredJob {
             job,
             scope: JobScope::new(
                 TenantId::from_str("test-tenant"),
@@ -182,31 +188,38 @@ mod tests {
             cancellation: None,
             revision: 0,
             trace: None,
-        }
+        })
     }
 
     #[test]
-    fn test_cancel_args_from_raw_args_splits_work_id_and_reason() {
-        let args = CancelArgs::from_raw_args(&toks(&["work-1", "no", "longer", "needed"])).unwrap();
+    fn test_cancel_args_from_raw_args_splits_work_id_and_reason() -> TestResult {
+        let args = CancelArgs::from_raw_args(&toks(&["work-1", "no", "longer", "needed"]))
+            .map_err(ctx("CancelArgs::from_raw_args"))?;
         assert_eq!(args.work_id.as_deref(), Some("work-1"));
         assert_eq!(args.reason.as_deref(), Some("no longer needed"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn cancel_without_work_id_returns_invalid_arguments() {
-        let (ctx, root, _) = make_test_ctx(false);
+    async fn cancel_without_work_id_returns_invalid_arguments() -> TestResult {
+        let (ctx, root, _) = make_test_ctx(false)?;
         let result = cancel(&ctx, CancelArgs::default()).await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         match result {
             Err(OpError::InvalidArguments(message)) => assert!(message.contains("work_id")),
-            other => panic!("expected InvalidArguments, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected InvalidArguments, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn cancel_without_job_store_returns_not_available() {
-        let (ctx, root, _) = make_test_ctx(false);
+    async fn cancel_without_job_store_returns_not_available() -> TestResult {
+        let (ctx, root, _) = make_test_ctx(false)?;
         let result = cancel(
             &ctx,
             CancelArgs {
@@ -215,22 +228,27 @@ mod tests {
             },
         )
         .await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         match result {
             Err(OpError::NotAvailable(message)) => assert!(message.contains("job store")),
-            other => panic!("expected NotAvailable, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn cancel_cancels_admitted_job_with_a_default_reason_when_none_given() {
-        let (ctx, root, store) = make_test_ctx(true);
-        let store = store.expect("test context includes job store");
+    async fn cancel_cancels_admitted_job_with_a_default_reason_when_none_given() -> TestResult {
+        let (ctx, root, store) = make_test_ctx(true)?;
+        let store = store.ok_or(TestError::Missing("test context includes job store"))?;
         let work_id = WorkId::from_str("work-cancel");
         store
-            .admit(&admitted_job(work_id.as_str()))
-            .expect("admit job");
+            .admit(&admitted_job(work_id.as_str())?)
+            .map_err(crate::test_support::ctx("admit job"))?;
 
         let output = cancel(
             &ctx,
@@ -240,31 +258,34 @@ mod tests {
             },
         )
         .await
-        .expect("cancel admitted job");
-        let persisted = store.get(&work_id).expect("read cancelled job");
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        .map_err(crate::test_support::ctx("cancel admitted job"))?;
+        let persisted = store
+            .get(&work_id)
+            .map_err(crate::test_support::ctx("read cancelled job"))?;
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         assert_eq!(persisted.job.state, JobState::Cancelled);
         assert_eq!(
             persisted
                 .cancellation
                 .as_ref()
-                .expect("cancellation recorded")
+                .ok_or(TestError::Missing("cancellation recorded"))?
                 .reason,
             DEFAULT_REASON
         );
         assert!(output.text.contains(work_id.as_str()));
         assert!(output.text.contains(&persisted.revision.to_string()));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn cancel_uses_the_given_reason_when_provided() {
-        let (ctx, root, store) = make_test_ctx(true);
-        let store = store.expect("test context includes job store");
+    async fn cancel_uses_the_given_reason_when_provided() -> TestResult {
+        let (ctx, root, store) = make_test_ctx(true)?;
+        let store = store.ok_or(TestError::Missing("test context includes job store"))?;
         let work_id = WorkId::from_str("work-cancel-reason");
         store
-            .admit(&admitted_job(work_id.as_str()))
-            .expect("admit job");
+            .admit(&admitted_job(work_id.as_str())?)
+            .map_err(crate::test_support::ctx("admit job"))?;
 
         cancel(
             &ctx,
@@ -274,17 +295,20 @@ mod tests {
             },
         )
         .await
-        .expect("cancel admitted job");
-        let persisted = store.get(&work_id).expect("read cancelled job");
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        .map_err(crate::test_support::ctx("cancel admitted job"))?;
+        let persisted = store
+            .get(&work_id)
+            .map_err(crate::test_support::ctx("read cancelled job"))?;
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         assert_eq!(
             persisted
                 .cancellation
                 .as_ref()
-                .expect("cancellation recorded")
+                .ok_or(TestError::Missing("cancellation recorded"))?
                 .reason,
             "superseded by newer job"
         );
+        Ok(())
     }
 }

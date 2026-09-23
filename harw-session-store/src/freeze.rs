@@ -254,12 +254,12 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
+use crate::error::{SessionStoreError, SessionStoreResult};
+use crate::store::{persist_noclobber, quarantine_file};
 use fs4::FileExt;
 use harw_types::{CgroupId, FindingId};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
-use crate::error::{SessionStoreError, SessionStoreResult};
-use crate::store::{persist_noclobber, quarantine_file};
 
 /// One durable record: which cgroup was frozen, for which finding, when, and
 /// (optionally) when the freeze auto-lifts.
@@ -898,12 +898,8 @@ impl FreezeStore {
     // Quarantäne verschoben (`error!`, sicherheitsrelevant) und übersprungen.
     fn load_scanned(&self, path: &Path, state: &str) -> SessionStoreResult<Option<Freeze>> {
         let detail = match read_freeze(path) {
-            Ok(freeze) => match self.path(
-                &freeze.cgroup,
-                &freeze.finding,
-                freeze.frozen_at,
-                state,
-            ) {
+            Ok(freeze) => match self.path(&freeze.cgroup, &freeze.finding, freeze.frozen_at, state)
+            {
                 Ok(expected) if expected == path => return Ok(Some(freeze)),
                 Ok(_) => "freeze file name does not match its key".to_owned(),
                 Err(error) => error.to_string(),
@@ -1078,6 +1074,7 @@ fn encode_frozen_at(frozen_at: Timestamp) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use jiff::SignedDuration;
 
     #[cfg(unix)]
@@ -1092,209 +1089,259 @@ mod tests {
         }
     }
 
-    fn root_entries(store: &FreezeStore) -> Vec<String> {
-        std::fs::read_dir(store.root())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect()
+    fn root_entries(store: &FreezeStore) -> TestResult<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(store.root())? {
+            names.push(entry?.file_name().to_string_lossy().into_owned());
+        }
+        Ok(names)
     }
 
     #[test]
-    fn a_freeze_is_written_and_read_back() {
-        let temp = tempfile::tempdir().unwrap();
+    fn a_freeze_is_written_and_read_back() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = FreezeStore::new(temp.path());
         let record = freeze("cgroup-1", "finding-1", Timestamp::now());
 
-        store.freeze(&record).unwrap();
+        store.freeze(&record)?;
 
-        assert_eq!(store.active().unwrap(), vec![record]);
+        assert_eq!(store.active()?, vec![record]);
+        Ok(())
     }
 
     #[test]
-    fn two_freezes_on_the_same_cgroup_with_different_findings_coexist() {
-        let temp = tempfile::tempdir().unwrap();
+    fn two_freezes_on_the_same_cgroup_with_different_findings_coexist() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = FreezeStore::new(temp.path());
         let now = Timestamp::now();
         let memory_finding = freeze("cgroup-shared", "finding-memory", now);
         let network_finding = freeze(
             "cgroup-shared",
             "finding-network",
-            now.checked_add(SignedDuration::from_secs(1)).unwrap(),
+            now.checked_add(SignedDuration::from_secs(1))
+                .map_err(ctx("now + 1s"))?,
         );
 
-        store.freeze(&memory_finding).unwrap();
-        store.freeze(&network_finding).unwrap();
+        store.freeze(&memory_finding)?;
+        store.freeze(&network_finding)?;
 
-        let mut active = store.active().unwrap();
+        let mut active = store.active()?;
         active.sort_by(|left, right| left.finding.as_str().cmp(right.finding.as_str()));
         assert_eq!(active, vec![memory_finding, network_finding]);
+        Ok(())
     }
 
     /// The test that carries the keying decision: a `CgroupId` the kernel
     /// has recycled must not inherit an old, already-resolved freeze record
     /// for the same (cgroup, finding) pair.
     #[test]
-    fn a_reused_cgroup_id_does_not_run_into_an_old_resolved_record() {
-        let temp = tempfile::tempdir().unwrap();
+    fn a_reused_cgroup_id_does_not_run_into_an_old_resolved_record() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = FreezeStore::new(temp.path());
         let old_frozen_at = Timestamp::now();
         let old = freeze("cgroup-reused", "finding-reused", old_frozen_at);
-        store.freeze(&old).unwrap();
-        let old_resolution = store
-            .resolve(&old.cgroup, &old.finding, old_frozen_at, Timestamp::now())
-            .unwrap();
+        store.freeze(&old)?;
+        let old_resolution =
+            store.resolve(&old.cgroup, &old.finding, old_frozen_at, Timestamp::now())?;
 
         // Time passes; the kernel recycles `cgroup-reused` for an unrelated
         // process that trips the *same kind* of finding.
-        let new_frozen_at = old_frozen_at.checked_add(SignedDuration::from_secs(3600)).unwrap();
+        let new_frozen_at = old_frozen_at
+            .checked_add(SignedDuration::from_secs(3600))
+            .map_err(ctx("old_frozen_at + 3600s"))?;
         let new = freeze("cgroup-reused", "finding-reused", new_frozen_at);
 
         // Must not be rejected as a duplicate of the old, resolved freeze.
-        store.freeze(&new).unwrap();
+        store.freeze(&new)?;
 
-        assert_eq!(store.active().unwrap(), vec![new]);
+        assert_eq!(store.active()?, vec![new]);
         // The old resolution is untouched — the new freeze did not merge
         // into or overwrite it.
         assert_eq!(old_resolution.freeze, old);
         assert_eq!(old_resolution.freeze.frozen_at, old_frozen_at);
+        Ok(())
     }
 
     #[test]
-    fn resolving_a_freeze_leaves_exactly_one_file_for_its_key() {
-        let temp = tempfile::tempdir().unwrap();
+    fn resolving_a_freeze_leaves_exactly_one_file_for_its_key() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = FreezeStore::new(temp.path());
         let record = freeze("cgroup-1", "finding-1", Timestamp::now());
-        store.freeze(&record).unwrap();
+        store.freeze(&record)?;
 
-        store
-            .resolve(&record.cgroup, &record.finding, record.frozen_at, Timestamp::now())
-            .unwrap();
+        store.resolve(
+            &record.cgroup,
+            &record.finding,
+            record.frozen_at,
+            Timestamp::now(),
+        )?;
 
-        let matching: Vec<String> = root_entries(&store)
+        let matching: Vec<String> = root_entries(&store)?
             .into_iter()
             .filter(|name| name.starts_with("cgroup-1.finding-1."))
             .collect();
-        assert_eq!(matching.len(), 1, "expected exactly one file, found {matching:?}");
+        assert_eq!(
+            matching.len(),
+            1,
+            "expected exactly one file, found {matching:?}"
+        );
         assert!(matching[0].ends_with(".resolved.json"));
+        Ok(())
     }
 
     #[test]
-    fn reconcile_expired_resolves_due_freezes_and_leaves_others_active() {
-        let temp = tempfile::tempdir().unwrap();
+    fn reconcile_expired_resolves_due_freezes_and_leaves_others_active() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = FreezeStore::new(temp.path());
         let now = Timestamp::now();
 
         let due = Freeze {
-            expires_at: Some(now.checked_sub(SignedDuration::from_secs(1)).unwrap()),
+            expires_at: Some(
+                now.checked_sub(SignedDuration::from_secs(1))
+                    .map_err(ctx("now - 1s"))?,
+            ),
             ..freeze(
                 "cgroup-due",
                 "finding-1",
-                now.checked_sub(SignedDuration::from_secs(120)).unwrap(),
+                now.checked_sub(SignedDuration::from_secs(120))
+                    .map_err(ctx("now - 120s"))?,
             )
         };
         let not_yet_due = Freeze {
-            expires_at: Some(now.checked_add(SignedDuration::from_secs(3600)).unwrap()),
+            expires_at: Some(
+                now.checked_add(SignedDuration::from_secs(3600))
+                    .map_err(ctx("now + 3600s"))?,
+            ),
             ..freeze("cgroup-bounded-future", "finding-1", now)
         };
         let never_expires = freeze("cgroup-indefinite", "finding-1", now);
-        store.freeze(&due).unwrap();
-        store.freeze(&not_yet_due).unwrap();
-        store.freeze(&never_expires).unwrap();
+        store.freeze(&due)?;
+        store.freeze(&not_yet_due)?;
+        store.freeze(&never_expires)?;
 
-        let expired = store.reconcile_expired(now).unwrap();
+        let expired = store.reconcile_expired(now)?;
 
         assert_eq!(expired, vec![due]);
-        let mut still_active = store.active().unwrap();
+        let mut still_active = store.active()?;
         still_active.sort_by(|left, right| left.cgroup.as_str().cmp(right.cgroup.as_str()));
         // Alphabetisch: `cgroup-bounded-future` (= `not_yet_due`) steht vor
         // `cgroup-indefinite` (= `never_expires`). Die Erwartung stand zuvor
         // in Einfügereihenfolge, obwohl der Test selbst sortiert.
         assert_eq!(still_active, vec![not_yet_due, never_expires]);
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn active_and_resolve_ignore_a_symlinked_active_file() {
-        let temp = tempfile::tempdir().unwrap();
+    fn active_and_resolve_ignore_a_symlinked_active_file() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = FreezeStore::new(temp.path());
-        std::fs::create_dir_all(store.root()).unwrap();
+        std::fs::create_dir_all(store.root())?;
         let linked = freeze("cgroup-linked", "finding-linked", Timestamp::now());
         let target = temp.path().join("outside-active.json");
-        std::fs::write(&target, serde_json::to_vec(&linked).unwrap()).unwrap();
-        let link_path = store.active_path(&linked.cgroup, &linked.finding, linked.frozen_at).unwrap();
-        symlink(&target, &link_path).unwrap();
+        std::fs::write(&target, serde_json::to_vec(&linked)?)?;
+        let link_path =
+            store.active_path(&linked.cgroup, &linked.finding, linked.frozen_at)?;
+        symlink(&target, &link_path)?;
 
-        assert!(store.active().unwrap().is_empty());
+        assert!(store.active()?.is_empty());
         assert!(matches!(
-            store.resolve(&linked.cgroup, &linked.finding, linked.frozen_at, Timestamp::now()),
+            store.resolve(
+                &linked.cgroup,
+                &linked.finding,
+                linked.frozen_at,
+                Timestamp::now()
+            ),
             Err(SessionStoreError::FreezeNotFound { .. })
         ));
-        assert!(std::fs::symlink_metadata(&link_path)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&link_path)?
+                .file_type()
+                .is_symlink()
+        );
         assert!(target.exists());
+        Ok(())
     }
 
     #[test]
-    fn no_temp_file_remains_after_a_freeze_and_a_resolve() {
-        let temp = tempfile::tempdir().unwrap();
+    fn no_temp_file_remains_after_a_freeze_and_a_resolve() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = FreezeStore::new(temp.path());
         let record = freeze("cgroup-1", "finding-1", Timestamp::now());
-        store.freeze(&record).unwrap();
-        store
-            .resolve(&record.cgroup, &record.finding, record.frozen_at, Timestamp::now())
-            .unwrap();
+        store.freeze(&record)?;
+        store.resolve(
+            &record.cgroup,
+            &record.finding,
+            record.frozen_at,
+            Timestamp::now(),
+        )?;
 
-        for name in root_entries(&store) {
+        for name in root_entries(&store)? {
             assert!(
                 name == ".lock" || name.ends_with(".json"),
                 "unexpected leftover file: {name}"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn reconcile_expired_is_idempotent_for_the_same_store_and_now() {
-        let temp = tempfile::tempdir().unwrap();
+    fn reconcile_expired_is_idempotent_for_the_same_store_and_now() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = FreezeStore::new(temp.path());
         let now = Timestamp::now();
         let due = Freeze {
-            expires_at: Some(now.checked_sub(SignedDuration::from_secs(1)).unwrap()),
-            ..freeze("cgroup-1", "finding-1", now.checked_sub(SignedDuration::from_secs(60)).unwrap())
+            expires_at: Some(
+                now.checked_sub(SignedDuration::from_secs(1))
+                    .map_err(ctx("now - 1s"))?,
+            ),
+            ..freeze(
+                "cgroup-1",
+                "finding-1",
+                now.checked_sub(SignedDuration::from_secs(60))
+                    .map_err(ctx("now - 60s"))?,
+            )
         };
-        store.freeze(&due).unwrap();
+        store.freeze(&due)?;
 
-        let first = store.reconcile_expired(now).unwrap();
-        let second = store.reconcile_expired(now).unwrap();
+        let first = store.reconcile_expired(now)?;
+        let second = store.reconcile_expired(now)?;
 
         assert_eq!(first, vec![due]);
         assert!(second.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn reconcile_expired_is_deterministic_given_the_same_injected_now() {
-        let now = "2026-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
-        let frozen_at = now.checked_sub(SignedDuration::from_secs(60)).unwrap();
-        let expires_at = now.checked_sub(SignedDuration::from_secs(1)).unwrap();
-        let build = |root: &Path| {
+    fn reconcile_expired_is_deterministic_given_the_same_injected_now() -> TestResult {
+        let now = "2026-01-01T00:00:00Z"
+            .parse::<Timestamp>()
+            .map_err(ctx("parse fixed now"))?;
+        let frozen_at = now
+            .checked_sub(SignedDuration::from_secs(60))
+            .map_err(ctx("now - 60s"))?;
+        let expires_at = now
+            .checked_sub(SignedDuration::from_secs(1))
+            .map_err(ctx("now - 1s"))?;
+        let build = |root: &Path| -> TestResult<FreezeStore> {
             let store = FreezeStore::new(root);
             let due = Freeze {
                 expires_at: Some(expires_at),
                 ..freeze("cgroup-1", "finding-1", frozen_at)
             };
-            store.freeze(&due).unwrap();
-            store
+            store.freeze(&due)?;
+            Ok(store)
         };
 
-        let temp_a = tempfile::tempdir().unwrap();
-        let temp_b = tempfile::tempdir().unwrap();
-        let store_a = build(temp_a.path());
-        let store_b = build(temp_b.path());
+        let temp_a = tempfile::tempdir()?;
+        let temp_b = tempfile::tempdir()?;
+        let store_a = build(temp_a.path())?;
+        let store_b = build(temp_b.path())?;
 
-        let result_a = store_a.reconcile_expired(now).unwrap();
-        let result_b = store_b.reconcile_expired(now).unwrap();
+        let result_a = store_a.reconcile_expired(now)?;
+        let result_b = store_b.reconcile_expired(now)?;
 
         assert_eq!(result_a, result_b);
+        Ok(())
     }
 }

@@ -252,13 +252,13 @@ impl SecurityEvidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use harw_types::SensorId;
 
     /// 64 Hex-Zeichen — ein syntaktisch gültiger, inhaltlich beliebiger
     /// Digest für Fixtures, die keinen echten `ContentDigest::of`-Aufruf
     /// brauchen.
-    const ZERO_DIGEST: &str =
-        "0000000000000000000000000000000000000000000000000000000000000000";
+    const ZERO_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
     fn sample(metric: &'static str, value: f64) -> HostSample {
         HostSample {
@@ -290,17 +290,21 @@ mod tests {
     }
 
     #[test]
-    fn test_capture_digest_is_deterministic_for_same_order() {
-        let samples = vec![sample("cpu_util_percent", 1.0), sample("mem_used_bytes", 2.0)];
+    fn test_capture_digest_is_deterministic_for_same_order() -> TestResult {
+        let samples = vec![
+            sample("cpu_util_percent", 1.0),
+            sample("mem_used_bytes", 2.0),
+        ];
         let a = SecurityEvidence::capture(samples.clone(), vec![], Timestamp::UNIX_EPOCH)
-            .expect("capture succeeds");
+            .map_err(ctx("capture succeeds"))?;
         let b = SecurityEvidence::capture(samples, vec![], Timestamp::UNIX_EPOCH)
-            .expect("capture succeeds");
+            .map_err(ctx("capture succeeds"))?;
         assert_eq!(a.digest, b.digest);
+        Ok(())
     }
 
     #[test]
-    fn test_capture_digest_differs_for_reordered_samples() {
+    fn test_capture_digest_differs_for_reordered_samples() -> TestResult {
         let first = sample("cpu_util_percent", 1.0);
         let second = sample("mem_used_bytes", 2.0);
 
@@ -309,28 +313,27 @@ mod tests {
             vec![],
             Timestamp::UNIX_EPOCH,
         )
-        .expect("capture succeeds");
-        let reversed = SecurityEvidence::capture(
-            vec![second, first],
-            vec![],
-            Timestamp::UNIX_EPOCH,
-        )
-        .expect("capture succeeds");
+        .map_err(ctx("capture succeeds"))?;
+        let reversed =
+            SecurityEvidence::capture(vec![second, first], vec![], Timestamp::UNIX_EPOCH)
+                .map_err(ctx("capture succeeds"))?;
 
         assert_ne!(forward.digest, reversed.digest);
+        Ok(())
     }
 
     #[test]
-    fn test_capture_preserves_samples_and_events_unchanged() {
+    fn test_capture_preserves_samples_and_events_unchanged() -> TestResult {
         let samples = vec![sample("cpu_util_percent", 1.0)];
         let evidence = SecurityEvidence::capture(samples.clone(), vec![], Timestamp::UNIX_EPOCH)
-            .expect("capture succeeds");
+            .map_err(ctx("capture succeeds"))?;
         assert_eq!(evidence.samples, samples);
         assert_eq!(evidence.captured_at, Timestamp::UNIX_EPOCH);
+        Ok(())
     }
 
     #[test]
-    fn test_security_evidence_deserialize_accepts_well_formed_static_fixture() {
+    fn test_security_evidence_deserialize_accepts_well_formed_static_fixture() -> TestResult {
         let fixture: &'static str = r#"{
             "digest": "0000000000000000000000000000000000000000000000000000000000000000",
             "captured_at": "1970-01-01T00:00:00Z",
@@ -338,10 +341,11 @@ mod tests {
             "events": []
         }"#;
         let parsed: SecurityEvidence =
-            serde_json::from_str(fixture).expect("fixture deserializes");
+            serde_json::from_str(fixture).map_err(ctx("fixture deserializes"))?;
         assert_eq!(parsed.digest.to_string(), ZERO_DIGEST);
         assert_eq!(parsed.samples.len(), 0);
         assert_eq!(parsed.events.len(), 0);
+        Ok(())
     }
 
     #[test]

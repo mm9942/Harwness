@@ -59,20 +59,22 @@ pub struct EmbeddingSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
-    fn test_embedding_spec_parses_from_toml() {
+    fn test_embedding_spec_parses_from_toml() -> TestResult {
         let toml_src = r#"
             name = "local-minilm-l6-v2"
             dimensions = 384
             metric = "cosine"
             max_input_chars = 2048
         "#;
-        let spec: EmbeddingSpec = toml::from_str(toml_src).expect("parses");
+        let spec: EmbeddingSpec = toml::from_str(toml_src).map_err(ctx("parses"))?;
         assert_eq!(spec.name, "local-minilm-l6-v2");
         assert_eq!(spec.dimensions, 384);
         assert_eq!(spec.metric, Metric::Cosine);
         assert_eq!(spec.max_input_chars, 2048);
+        Ok(())
     }
 
     #[test]

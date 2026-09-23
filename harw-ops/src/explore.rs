@@ -3,7 +3,7 @@
 //! # Verantwortungsbereich
 //! Implementiert die `explore`-Operation gemäß AP W4-02. Die Operation baut aus
 //! den Argumenten eine [`ResearchQuestion`], hängt das erwartete Antwortformat
-//! ([`finding_schema_prompt`]) an den Turn-Input des Kindes und fährt **genau
+//! ([`finding_schema_prompt_with_example`]) an den Turn-Input des Kindes und fährt **genau
 //! einen** Kind-Lauf über [`fanout_children`]. Das Ergebnis wird gegen den
 //! `ResearchFinding`-Vertrag validiert und — sofern ein Finding-Store, ein
 //! Plan-Store und ein Ziel-Knoten (`task`) vorhanden sind — als Artefakt
@@ -74,7 +74,7 @@ use harw_plan_bridge::OpContextPlanExt;
 use harw_registry_defaults::profile::role_names;
 use harw_research::{
     Freshness, QuestionId, QuestionScope, ResearchFinding, ResearchQuestion, SourceClass,
-    finding_schema_prompt,
+    finding_schema_prompt_with_example,
 };
 use serde_json::{Value, json};
 
@@ -238,7 +238,9 @@ pub(crate) fn question_slug(prefix: &str, question: &str) -> String {
 ///
 /// # Beschreibung
 /// Die Nutzlast trägt zwei Felder: die serialisierte [`ResearchQuestion`] und
-/// das Antwortformat aus [`finding_schema_prompt`]. `fanout_children` reicht
+/// das Antwortformat aus [`finding_schema_prompt_with_example`] — mit der
+/// `question_id` der Frage vorbefüllt, damit das Kind sie nicht erfinden
+/// muss. `fanout_children` reicht
 /// diesen Wert sowohl als `SpawnInput::context` als auch — als kompakter
 /// JSON-String — als Turn-Input an das Kind weiter; das Kind sieht das Schema
 /// damit ohne zusätzlichen Kanal.
@@ -261,7 +263,7 @@ pub(crate) fn child_payload(question: &ResearchQuestion) -> Result<Value, OpErro
     })?;
     Ok(json!({
         "question": encoded,
-        "response_format": finding_schema_prompt(),
+        "response_format": finding_schema_prompt_with_example(question.id.as_str()),
     }))
 }
 
@@ -553,11 +555,12 @@ async fn explore(ctx: &OpContext, args: ExploreArgs) -> Result<OpOutput, OpError
 #[cfg(test)]
 mod tests {
     use super::{EXPLORER_CHILD, ExploreArgs, ExploreOperation, question_slug};
+    use crate::test_support::{TestResult, ctx};
     use crate::testutil::toks;
+    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_operations::context::ServiceMap;
     use harw_operations::{FromRawArgs, OpContext, OpError, Operation, Surface};
     use harw_registry_defaults::profile::role_names;
-    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -565,12 +568,12 @@ mod tests {
     ///
     /// Der zweite Rückgabewert ist das Wurzelverzeichnis, das der Test wieder
     /// entfernen muss.
-    fn test_context() -> (OpContext, std::path::PathBuf) {
+    fn test_context() -> TestResult<(OpContext, std::path::PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root =
             std::env::temp_dir().join(format!("harw-explore-test-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(root.join("ws")).expect("Test-Workspace anlegen");
+        std::fs::create_dir_all(root.join("ws")).map_err(ctx("Test-Workspace anlegen"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -579,39 +582,37 @@ mod tests {
                 root: std::path::PathBuf::from("ws"),
             }],
         )
-        .expect("Workspace-Registry bauen");
+        .map_err(ctx("Workspace-Registry bauen"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .expect("Workspace-Binding auflösen");
+            .map_err(ctx("Workspace-Binding auflösen"))?;
         let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
-        (
+        Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new()),
             root,
-        )
+        ))
     }
 
     #[test]
-    fn test_explore_args_from_raw_args_joins_all_tokens_into_question() {
-        match ExploreArgs::from_raw_args(&toks(&["wo", "liegt", "der", "Spawner"])) {
-            Ok(args) => {
-                assert_eq!(args.question.as_deref(), Some("wo liegt der Spawner"));
-                assert!(args.scope.is_empty());
-                assert!(args.expected_output.is_none());
-                assert!(args.task.is_none());
-            }
-            Err(error) => panic!("unerwarteter Fehler: {error}"),
-        }
+    fn test_explore_args_from_raw_args_joins_all_tokens_into_question() -> TestResult {
+        let args = ExploreArgs::from_raw_args(&toks(&["wo", "liegt", "der", "Spawner"]))
+            .map_err(ctx("ExploreArgs::from_raw_args"))?;
+        assert_eq!(args.question.as_deref(), Some("wo liegt der Spawner"));
+        assert!(args.scope.is_empty());
+        assert!(args.expected_output.is_none());
+        assert!(args.task.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_explore_args_from_raw_args_empty_tokens_yields_no_question() {
-        match ExploreArgs::from_raw_args(&toks(&[])) {
-            Ok(args) => assert!(args.question.is_none()),
-            Err(error) => panic!("unerwarteter Fehler: {error}"),
-        }
+    fn test_explore_args_from_raw_args_empty_tokens_yields_no_question() -> TestResult {
+        let args =
+            ExploreArgs::from_raw_args(&toks(&[])).map_err(ctx("ExploreArgs::from_raw_args"))?;
+        assert!(args.question.is_none());
+        Ok(())
     }
 
     #[test]
@@ -682,11 +683,9 @@ mod tests {
     }
 
     #[test]
-    fn test_explore_budget_hint_is_parsable_and_matches_declaration() {
-        let budget = match harw_core_bridge::parse_budget_hint(super::SINGLE_CHILD_BUDGET) {
-            Ok(budget) => budget,
-            Err(error) => panic!("Budget-Label ist ungültig: {error}"),
-        };
+    fn test_explore_budget_hint_is_parsable_and_matches_declaration() -> TestResult {
+        let budget = harw_core_bridge::parse_budget_hint(super::SINGLE_CHILD_BUDGET)
+            .map_err(ctx("Budget-Label ist ungültig"))?;
         assert_eq!(budget.max_tokens, Some(60_000));
         assert_eq!(budget.max_tool_calls, Some(40));
         assert_eq!(budget.max_wall_time_ms, Some(180_000));
@@ -697,13 +696,14 @@ mod tests {
             _ => None,
         });
         assert_eq!(declared, Some(super::SINGLE_CHILD_BUDGET));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_explore_without_spawner_is_not_available() {
-        let (ctx, root) = test_context();
+    async fn test_explore_without_spawner_is_not_available() -> TestResult {
+        let (op_ctx, root) = test_context()?;
         let result = super::explore(
-            &ctx,
+            &op_ctx,
             ExploreArgs {
                 question: Some("wo liegt der Spawner".to_owned()),
                 ..ExploreArgs::default()
@@ -716,25 +716,27 @@ mod tests {
             matches!(result, Err(OpError::NotAvailable(_))),
             "ohne Agent-Spawner muss /explore fail-closed sein, war: {result:?}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_explore_without_question_is_invalid_arguments() {
-        let (ctx, root) = test_context();
-        let result = super::explore(&ctx, ExploreArgs::default()).await;
+    async fn test_explore_without_question_is_invalid_arguments() -> TestResult {
+        let (op_ctx, root) = test_context()?;
+        let result = super::explore(&op_ctx, ExploreArgs::default()).await;
         std::fs::remove_dir_all(root).ok();
 
         assert!(
             matches!(result, Err(OpError::InvalidArguments(_))),
             "eine leere Frage muss abgewiesen werden, war: {result:?}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_explore_with_blank_question_is_invalid_arguments() {
-        let (ctx, root) = test_context();
+    async fn test_explore_with_blank_question_is_invalid_arguments() -> TestResult {
+        let (op_ctx, root) = test_context()?;
         let result = super::explore(
-            &ctx,
+            &op_ctx,
             ExploreArgs {
                 question: Some("   ".to_owned()),
                 ..ExploreArgs::default()
@@ -744,5 +746,6 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
 
         assert!(matches!(result, Err(OpError::InvalidArguments(_))));
+        Ok(())
     }
 }

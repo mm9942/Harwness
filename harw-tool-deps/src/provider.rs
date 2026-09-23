@@ -51,9 +51,11 @@ harw_tools::tool_provider! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{block_on, sandbox_context, scratch_dir, tool_call};
-    use harw_extension_api::contributors::ToolProvider as _;
+    use crate::test_support::{
+        TestError, TestResult, block_on, ctx, sandbox_context, scratch_dir, tool_call,
+    };
     use harw_authority::Permission;
+    use harw_extension_api::contributors::ToolProvider as _;
     use harw_tools::{ToolName, ToolOutput};
     use std::collections::HashSet;
     use std::fs;
@@ -142,15 +144,15 @@ mod tests {
     /// Ohne `ReadCargoRegistry` verweigert `deps.source_read` den Dienst —
     /// bevor irgendein Pfad angefasst wird.
     #[test]
-    fn test_source_read_denies_without_read_cargo_registry() {
-        let harness = scratch_dir("provider-denied");
-        fs::create_dir_all(harness.join("ws")).expect("Workspace anlegen");
-        let context = sandbox_context(&harness, vec![Permission::ReadWorkspace]);
+    fn test_source_read_denies_without_read_cargo_registry() -> TestResult {
+        let harness = scratch_dir("provider-denied")?;
+        fs::create_dir_all(harness.join("ws")).map_err(ctx("Workspace anlegen"))?;
+        let context = sandbox_context(&harness, vec![Permission::ReadWorkspace])?;
 
         let provider = DepsToolProvider::new();
         let executor = provider
             .executor(&ToolName::new("deps.source_read"))
-            .expect("Executor vorhanden");
+            .ok_or(TestError::Missing("Executor vorhanden"))?;
         let call = tool_call(
             "deps.source_read",
             serde_json::json!({
@@ -160,25 +162,30 @@ mod tests {
             }),
         );
 
-        let output = block_on(executor.execute(&context, &call)).expect("Tool läuft");
+        let output = block_on(executor.execute(&context, &call))?.map_err(ctx("Tool läuft"))?;
 
         match output {
             ToolOutput::Error { message } => assert!(
                 message.contains("ReadCargoRegistry"),
                 "die fehlende Berechtigung muss benannt werden, war: {message}"
             ),
-            other => panic!("Fehlerausgabe erwartet, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Fehlerausgabe erwartet, war: {other:?}"
+                )));
+            }
         }
 
         fs::remove_dir_all(&harness).ok();
+        Ok(())
     }
 
     /// Dasselbe für `deps.source_search` und `deps.source_list`.
     #[test]
-    fn test_source_search_and_list_deny_without_read_cargo_registry() {
-        let harness = scratch_dir("provider-denied-two");
-        fs::create_dir_all(harness.join("ws")).expect("Workspace anlegen");
-        let context = sandbox_context(&harness, vec![Permission::ReadWorkspace]);
+    fn test_source_search_and_list_deny_without_read_cargo_registry() -> TestResult {
+        let harness = scratch_dir("provider-denied-two")?;
+        fs::create_dir_all(harness.join("ws")).map_err(ctx("Workspace anlegen"))?;
+        let context = sandbox_context(&harness, vec![Permission::ReadWorkspace])?;
         let provider = DepsToolProvider::new();
 
         for (name, arguments) in [
@@ -200,20 +207,25 @@ mod tests {
         ] {
             let executor = provider
                 .executor(&ToolName::new(name))
-                .expect("Executor vorhanden");
+                .ok_or(TestError::Missing("Executor vorhanden"))?;
             let call = tool_call(name, arguments);
-            let output = block_on(executor.execute(&context, &call)).expect("Tool läuft");
+            let output = block_on(executor.execute(&context, &call))?.map_err(ctx("Tool läuft"))?;
 
             match output {
                 ToolOutput::Error { message } => assert!(
                     message.contains("ReadCargoRegistry"),
                     "{name}: die fehlende Berechtigung muss benannt werden, war: {message}"
                 ),
-                other => panic!("{name}: Fehlerausgabe erwartet, war: {other:?}"),
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "{name}: Fehlerausgabe erwartet, war: {other:?}"
+                    )));
+                }
             }
         }
 
         fs::remove_dir_all(&harness).ok();
+        Ok(())
     }
 
     /// Der Provider ist zustandslos: `new()` und `default()` sind gleichwertig.

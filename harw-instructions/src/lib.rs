@@ -18,3 +18,7 @@ pub mod baseline;
 pub mod trust_boundary;
 pub use baseline::{AgentIdentity, BaselineInstructionsProvider};
 pub use trust_boundary::{context_blocks_section, DATA_BLOCK_NOTICE};
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

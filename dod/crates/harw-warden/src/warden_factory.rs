@@ -56,6 +56,7 @@ pub fn build_production_warden(cgroup_root: &Path) -> Warden {
 #[cfg(test)]
 mod tests {
     use super::build_production_warden;
+    use crate::test_support::{TestResult, ctx};
     use harw_dod_warden::WardenOutcome;
     use harw_dod_warden_proto::{
         AuthorizationProof, EscalationStage, ProposedAction, WardenAction, WardenActionRequest,
@@ -64,7 +65,8 @@ mod tests {
     use harw_types::{ApprovalActor, CgroupId, FindingId};
 
     #[test]
-    fn test_production_warden_denies_inadmissible_action_without_touching_the_filesystem() {
+    fn test_production_warden_denies_inadmissible_action_without_touching_the_filesystem()
+    -> TestResult {
         // `/nonexistent-harw-warden-mock-root` wird nie geöffnet: die Aktion
         // ist bereits an der Nachprüfung (KillProcessTree ist ab
         // `RuleTriggered` nicht zulässig) abgelehnt, bevor
@@ -74,9 +76,9 @@ mod tests {
             build_production_warden(std::path::Path::new("/nonexistent-harw-warden-mock-root"));
 
         let action = WardenAction::KillProcessTree {
-            cgroup: CgroupId::try_from_str("cgroup-1").expect("non-empty id"),
+            cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("non-empty id"))?,
         };
-        let finding = FindingId::try_from_str("finding-1").expect("non-empty id");
+        let finding = FindingId::try_from_str("finding-1").map_err(ctx("non-empty id"))?;
         let proof = AuthorizationProof::new(
             finding.clone(),
             EscalationStage::RuleTriggered,
@@ -84,32 +86,35 @@ mod tests {
                 id: "operator-1".to_string(),
             },
             jiff::Timestamp::UNIX_EPOCH,
-            action.content_digest().expect("action encodes"),
+            action.content_digest().map_err(ctx("action encodes"))?,
         );
         let request = WardenActionRequest::new(
             ProposedAction::KillProcessTree {
-                cgroup: CgroupId::try_from_str("cgroup-1").expect("non-empty id"),
+                cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("non-empty id"))?,
             },
             proof,
         );
 
         let outcome = warden.handle(&finding, &request);
         assert!(matches!(outcome, WardenOutcome::Denied(_)));
+        Ok(())
     }
 
     /// Deckt den im Auftrag verlangten Test „eine Anfrage geht unverändert
     /// an `Warden::handle`; die Antwort ist inhaltsfrei" ab — ohne Socket,
     /// direkt gegen den produktiv verdrahteten Warden.
     #[test]
-    fn test_request_reaches_warden_handle_unmodified_and_the_wire_response_is_content_free() {
+    fn test_request_reaches_warden_handle_unmodified_and_the_wire_response_is_content_free()
+    -> TestResult {
         let warden =
             build_production_warden(std::path::Path::new("/nonexistent-harw-warden-mock-root"));
 
         let action = WardenAction::KillProcessTree {
-            cgroup: CgroupId::try_from_str("very-identifiable-cgroup-name").expect("non-empty id"),
+            cgroup: CgroupId::try_from_str("very-identifiable-cgroup-name")
+                .map_err(ctx("non-empty id"))?,
         };
-        let finding =
-            FindingId::try_from_str("very-identifiable-finding-name").expect("non-empty id");
+        let finding = FindingId::try_from_str("very-identifiable-finding-name")
+            .map_err(ctx("non-empty id"))?;
         let proof = AuthorizationProof::new(
             finding.clone(),
             EscalationStage::RuleTriggered,
@@ -117,12 +122,12 @@ mod tests {
                 id: "operator-1".to_string(),
             },
             jiff::Timestamp::UNIX_EPOCH,
-            action.content_digest().expect("action encodes"),
+            action.content_digest().map_err(ctx("action encodes"))?,
         );
         let request = WardenActionRequest::new(
             ProposedAction::KillProcessTree {
                 cgroup: CgroupId::try_from_str("very-identifiable-cgroup-name")
-                    .expect("non-empty id"),
+                    .map_err(ctx("non-empty id"))?,
             },
             proof,
         );
@@ -133,10 +138,13 @@ mod tests {
         // die Bibliothek setzt das durch, dieses Binary darf es nicht
         // umgehen).
         let outcome = warden.handle(&finding, &request);
-        let response = outcome.to_wire().expect("Denied maps to WardenResponse");
-        let json = serde_json::to_string(&response).expect("serializes");
+        let response = outcome
+            .to_wire()
+            .map_err(ctx("Denied maps to WardenResponse"))?;
+        let json = serde_json::to_string(&response).map_err(ctx("serializes"))?;
 
         assert!(!json.contains("very-identifiable"));
         assert!(matches!(response, WardenResponse::Denied { .. }));
+        Ok(())
     }
 }

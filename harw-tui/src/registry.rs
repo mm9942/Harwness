@@ -353,12 +353,21 @@ impl CommandRegistry {
     /// hard-coded list of 8 specs and keeps the TUI's known-command set in sync with
     /// the runtime's dispatch table automatically.
     ///
-    /// Backward-compatible: callers continue to use `CommandRegistry::built_in()` with
-    /// the same return type and semantics.
+    /// Callers receive a `Result`: collisions in the built-in op-set are reported as
+    /// [`TuiRegistryError`] instead of panicking (Bible R087/R165 — no panics on a
+    /// data-dependent failure path, even one that "must not" occur by construction).
     ///
     /// # Returns
-    /// A [`CommandRegistry`] containing one [`CommandSpec`] per `Surface::Command`
-    /// declaration across all 17 built-in operations.
+    /// - `Ok(CommandRegistry)`: one [`CommandSpec`] per `Surface::Command` declaration
+    ///   across all built-in operations, with aliases wired in.
+    /// - `Err(TuiRegistryError)`: a collision was detected in the built-in op-set — by
+    ///   construction this must not happen, and an `Err` here indicates a programming
+    ///   error in `harw-ops`.
+    ///
+    /// # Errors
+    /// - [`TuiRegistryError::DuplicateCommandName`] / [`TuiRegistryError::DuplicateCommandPath`] /
+    ///   [`TuiRegistryError::AliasCollision`]: propagated unchanged from
+    ///   [`Self::from_operation_registry`].
     ///
     /// # Concurrency
     /// The underlying [`harw_operations::registry::OperationRegistry`] is a short-lived
@@ -368,41 +377,14 @@ impl CommandRegistry {
     /// ```rust
     /// use harw_tui::CommandRegistry;
     ///
-    /// let registry = CommandRegistry::built_in();
+    /// let registry = CommandRegistry::built_in()?;
     /// assert!(registry.specs().len() >= 15);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    /// Builds the built-in command registry driven by [`harw_ops::register_all`].
-    ///
-    /// # Description
-    /// Creates a fresh [`harw_operations::registry::OperationRegistry`], populates it
-    /// via [`harw_ops::register_all`], and delegates to [`Self::from_operation_registry`].
-    /// Panics if the built-in op-set contains any name or alias collision — by construction
-    /// it must not, and a panic here indicates a programming error in `harw-ops`.
-    ///
-    /// # Returns
-    /// A [`CommandRegistry`] containing one [`CommandSpec`] per `Surface::Command`
-    /// declaration across all built-in operations, with aliases wired in.
-    ///
-    /// # Panics
-    /// Panics if [`Self::from_operation_registry`] returns an error (collision in built-in ops).
-    ///
-    /// # Concurrency
-    /// The underlying [`harw_operations::registry::OperationRegistry`] is a short-lived
-    /// local value; this function is safe to call from any thread.
-    ///
-    /// # Examples
-    /// ```rust
-    /// use harw_tui::CommandRegistry;
-    ///
-    /// let registry = CommandRegistry::built_in();
-    /// assert!(registry.specs().len() >= 15);
-    /// ```
-    #[must_use]
-    pub fn built_in() -> Self {
+    pub fn built_in() -> Result<Self, TuiRegistryError> {
         let mut ops = harw_operations::registry::OperationRegistry::new();
         harw_ops::register_all(&mut ops);
         Self::from_operation_registry(&ops)
-            .expect("built-in op-set must have no name or alias collisions")
     }
 
     /// Builds the dispatch catalog directly from the TUI's command adapters.
@@ -664,6 +646,7 @@ fn map_domain(d: harw_operations::operation::OperationDomain) -> CommandDomain {
 mod tests {
     use super::*;
     use crate::classify_input;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_operations::adapter::CommandAdapter;
 
     fn context(
@@ -686,41 +669,49 @@ mod tests {
     }
 
     #[test]
-    fn canonical_command_resolves_by_name() {
+    fn canonical_command_resolves_by_name() -> TestResult {
         // The "h" alias was present only in the old hard-coded built_in(). The
         // new implementation derives specs from the operation contract, which
         // carries no alias declarations. Verify the canonical name still resolves.
-        let registry = CommandRegistry::built_in();
+        let registry = CommandRegistry::built_in().map_err(ctx("built_in"))?;
         assert_eq!(
             registry.find("help").map(|spec| spec.name.as_str()),
             Some("help"),
             "help command must be findable by its canonical name"
         );
+        Ok(())
     }
 
     #[test]
-    fn registry_enforces_permission_before_dispatch() {
-        let registry = CommandRegistry::built_in();
-        let invocation = classify_input("/new").unwrap();
-        let error = registry
-            .dispatch(
-                context(
-                    PermissionTier::Observer,
-                    InvocationSurface::Tui,
-                    CapabilitySet::default(),
-                ),
-                invocation,
-            )
-            .unwrap_err();
+    fn registry_enforces_permission_before_dispatch() -> TestResult {
+        let registry = CommandRegistry::built_in().map_err(ctx("built_in"))?;
+        let invocation = classify_input("/new").map_err(ctx("classify_input"))?;
+        let Err(error) = registry.dispatch(
+            context(
+                PermissionTier::Observer,
+                InvocationSurface::Tui,
+                CapabilitySet::default(),
+            ),
+            invocation,
+        ) else {
+            return Err(TestError::Unexpected(
+                "dispatch below required tier must be rejected".into(),
+            ));
+        };
 
         assert!(matches!(
             error,
             CommandError::PermissionDenied { command, required: PermissionTier::Operator, .. }
                 if command == "new"
         ));
+        Ok(())
     }
 
-    fn protected_spec(name: &str, alias: &str, permission: PermissionTier) -> CommandSpec {
+    fn protected_spec(
+        name: &str,
+        alias: &str,
+        permission: PermissionTier,
+    ) -> TestResult<CommandSpec> {
         CommandSpec::new(
             name,
             [alias],
@@ -729,31 +720,33 @@ mod tests {
             OutputSurface::Inline,
             CommandDomain::Misc,
         )
-        .expect("test spec must be valid")
+        .map_err(ctx("test spec must be valid"))
     }
 
     #[test]
-    fn test_dispatch_rejects_tier_below_operation_requirement() {
+    fn test_dispatch_rejects_tier_below_operation_requirement() -> TestResult {
         let registry = CommandRegistry::new(vec![protected_spec(
             "maint",
             "mt",
             PermissionTier::Maintainer,
-        )]);
+        )?]);
         let invocation = Invocation::Command {
             name: "maint".to_owned(),
             raw_args: vec![],
         };
 
-        let denied = registry
-            .dispatch(
-                context(
-                    PermissionTier::Operator,
-                    InvocationSurface::Tui,
-                    CapabilitySet::default(),
-                ),
-                invocation.clone(),
-            )
-            .unwrap_err();
+        let Err(denied) = registry.dispatch(
+            context(
+                PermissionTier::Operator,
+                InvocationSurface::Tui,
+                CapabilitySet::default(),
+            ),
+            invocation.clone(),
+        ) else {
+            return Err(TestError::Unexpected(
+                "dispatch below required tier must be rejected".into(),
+            ));
+        };
         assert_eq!(
             denied,
             CommandError::PermissionDenied {
@@ -772,19 +765,22 @@ mod tests {
                 ),
                 invocation,
             )
-            .expect("caller at exactly the required tier must be admitted");
+            .map_err(ctx("caller at exactly the required tier must be admitted"))?;
         let CommandAction::Command(spec, args) = &admitted else {
-            panic!("expected an admitted command action, got {admitted:?}");
+            return Err(TestError::Unexpected(format!(
+                "expected an admitted command action, got {admitted:?}"
+            )));
         };
         assert_eq!(spec.name.as_str(), "maint");
         assert!(args.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_find_prefers_canonical_name_over_earlier_alias() {
+    fn test_find_prefers_canonical_name_over_earlier_alias() -> TestResult {
         let registry = CommandRegistry::new(vec![
-            protected_spec("first", "second", PermissionTier::Observer),
-            protected_spec("second", "sec", PermissionTier::Owner),
+            protected_spec("first", "second", PermissionTier::Observer)?,
+            protected_spec("second", "sec", PermissionTier::Owner)?,
         ]);
         assert_eq!(
             registry.find("second").map(|spec| spec.permission),
@@ -795,10 +791,11 @@ mod tests {
             registry.find("sec").map(|spec| spec.name.as_str()),
             Some("second")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_from_command_adapters_carries_adapter_permission_and_aliases() {
+    fn test_from_command_adapters_carries_adapter_permission_and_aliases() -> TestResult {
         let ops = ops_registry();
         let adapters: Vec<CommandAdapter> = ops
             .iter()
@@ -806,37 +803,47 @@ mod tests {
             .collect();
         let registry = CommandRegistry::from_command_adapters(&adapters);
 
-        let model = registry.find("m").expect("alias 'm' must resolve");
+        let model = registry
+            .find("m")
+            .ok_or(TestError::Missing("alias 'm' must resolve"))?;
         assert_eq!(model.name.as_str(), "model");
         assert_eq!(model.permission, PermissionTier::Operator);
         assert_eq!(model.scope, CommandScope::TuiOnly);
-        assert!(CommandRegistry::from_command_adapters(&[]).specs().is_empty());
+        assert!(
+            CommandRegistry::from_command_adapters(&[])
+                .specs()
+                .is_empty()
+        );
+        Ok(())
     }
 
     #[test]
-    fn registry_rejects_tui_only_commands_from_channels() {
-        let registry = CommandRegistry::built_in();
-        let invocation = classify_input("/attach p:42").unwrap();
+    fn registry_rejects_tui_only_commands_from_channels() -> TestResult {
+        let registry = CommandRegistry::built_in().map_err(ctx("built_in"))?;
+        let invocation = classify_input("/attach p:42").map_err(ctx("classify_input"))?;
         // attach declares permission = operator; use Operator so the permission
         // check passes and the TuiOnly scope check is reached.
-        let error = registry
-            .dispatch(
-                context(
-                    PermissionTier::Operator,
-                    InvocationSurface::Channel,
-                    CapabilitySet::default(),
-                ),
-                invocation,
-            )
-            .unwrap_err();
+        let Err(error) = registry.dispatch(
+            context(
+                PermissionTier::Operator,
+                InvocationSurface::Channel,
+                CapabilitySet::default(),
+            ),
+            invocation,
+        ) else {
+            return Err(TestError::Unexpected(
+                "tui-only command from a channel must be rejected".into(),
+            ));
+        };
 
         assert!(matches!(error, CommandError::TuiOnlyCommand { command } if command == "attach"));
+        Ok(())
     }
 
     #[test]
-    fn shell_needs_operator_and_surface_appropriate_capability() {
-        let registry = CommandRegistry::built_in();
-        let invocation = classify_input("! rg TODO").unwrap();
+    fn shell_needs_operator_and_surface_appropriate_capability() -> TestResult {
+        let registry = CommandRegistry::built_in().map_err(ctx("built_in"))?;
+        let invocation = classify_input("! rg TODO").map_err(ctx("classify_input"))?;
 
         let local = registry.dispatch(
             context(
@@ -862,6 +869,7 @@ mod tests {
                 capability: "channel.allow_shell"
             })
         ));
+        Ok(())
     }
 
     // ── from_operation_registry tests ────────────────────────────────────────
@@ -871,23 +879,24 @@ mod tests {
     /// All 18 ops have a `Surface::Command`; this test uses ≥15 to tolerate any
     /// future ops that expose only a `ModelTool` surface.
     #[test]
-    fn test_from_operation_registry_produces_expected_command_count() {
+    fn test_from_operation_registry_produces_expected_command_count() -> TestResult {
         let ops = ops_registry();
         let registry = CommandRegistry::from_operation_registry(&ops)
-            .expect("built-in ops must produce a collision-free registry");
+            .map_err(ctx("built-in ops must produce a collision-free registry"))?;
         assert!(
             registry.specs().len() >= 15,
             "expected at least 15 command specs from 18 ops, got {}",
             registry.specs().len()
         );
+        Ok(())
     }
 
     /// Test 2: no spec name starts with '/'.
     #[test]
-    fn test_from_operation_registry_names_have_no_leading_slash() {
+    fn test_from_operation_registry_names_have_no_leading_slash() -> TestResult {
         let ops = ops_registry();
         let registry = CommandRegistry::from_operation_registry(&ops)
-            .expect("built-in ops must produce a collision-free registry");
+            .map_err(ctx("built-in ops must produce a collision-free registry"))?;
         for spec in registry.specs() {
             assert!(
                 !spec.name.as_str().starts_with('/'),
@@ -895,14 +904,15 @@ mod tests {
                 spec.name.as_str()
             );
         }
+        Ok(())
     }
 
     /// Test 3: /model and /provider produce specs named "model" and "provider".
     #[test]
-    fn test_from_operation_registry_includes_model_and_provider() {
+    fn test_from_operation_registry_includes_model_and_provider() -> TestResult {
         let ops = ops_registry();
         let registry = CommandRegistry::from_operation_registry(&ops)
-            .expect("built-in ops must produce a collision-free registry");
+            .map_err(ctx("built-in ops must produce a collision-free registry"))?;
         assert!(
             registry.find("model").is_some(),
             "expected a 'model' command spec"
@@ -911,16 +921,17 @@ mod tests {
             registry.find("provider").is_some(),
             "expected a 'provider' command spec"
         );
+        Ok(())
     }
 
     /// Test 4: `built_in()` produces the same specs as `from_operation_registry` on a
     /// freshly-populated registry.
     #[test]
-    fn test_built_in_matches_from_operation_registry() {
-        let via_built_in = CommandRegistry::built_in();
+    fn test_built_in_matches_from_operation_registry() -> TestResult {
+        let via_built_in = CommandRegistry::built_in().map_err(ctx("built_in"))?;
         let ops = ops_registry();
         let via_from = CommandRegistry::from_operation_registry(&ops)
-            .expect("built-in ops must produce a collision-free registry");
+            .map_err(ctx("built-in ops must produce a collision-free registry"))?;
 
         assert_eq!(
             via_built_in.specs().len(),
@@ -936,34 +947,41 @@ mod tests {
                 spec.name.as_str()
             );
         }
+        Ok(())
     }
 
     /// Test 5: /model operation is declared TuiOnly → its spec must have TuiOnly scope.
     #[test]
-    fn test_from_operation_registry_maps_tui_only_visibility() {
+    fn test_from_operation_registry_maps_tui_only_visibility() -> TestResult {
         let ops = ops_registry();
         let registry = CommandRegistry::from_operation_registry(&ops)
-            .expect("built-in ops must produce a collision-free registry");
-        let model_spec = registry.find("model").expect("'model' spec must exist");
+            .map_err(ctx("built-in ops must produce a collision-free registry"))?;
+        let model_spec = registry
+            .find("model")
+            .ok_or(TestError::Missing("'model' spec must exist"))?;
         assert_eq!(
             model_spec.scope,
             CommandScope::TuiOnly,
             "'/model' declares tui_only visibility; scope must be TuiOnly"
         );
+        Ok(())
     }
 
     /// Test 6: /model operation declares permission = operator → its spec must reflect that.
     #[test]
-    fn test_from_operation_registry_maps_permission_tier_operator() {
+    fn test_from_operation_registry_maps_permission_tier_operator() -> TestResult {
         let ops = ops_registry();
         let registry = CommandRegistry::from_operation_registry(&ops)
-            .expect("built-in ops must produce a collision-free registry");
-        let model_spec = registry.find("model").expect("'model' spec must exist");
+            .map_err(ctx("built-in ops must produce a collision-free registry"))?;
+        let model_spec = registry
+            .find("model")
+            .ok_or(TestError::Missing("'model' spec must exist"))?;
         assert_eq!(
             model_spec.permission,
             PermissionTier::Operator,
             "'/model' declares permission=operator; spec must require Operator tier"
         );
+        Ok(())
     }
 
     /// Test 7: aliases from OperationMeta reach CommandSpec and are findable via find().
@@ -972,77 +990,77 @@ mod tests {
     /// and `/effort` declares `aliases = ["reasoning"]`. All three must be discoverable
     /// via the short alias, and the returned spec must carry the canonical name.
     #[test]
-    fn aliases_from_operation_meta_reach_commandspec() {
+    fn aliases_from_operation_meta_reach_commandspec() -> TestResult {
         let ops = ops_registry();
         let registry = CommandRegistry::from_operation_registry(&ops)
-            .expect("built-in ops must produce a collision-free registry");
+            .map_err(ctx("built-in ops must produce a collision-free registry"))?;
 
         // "m" must resolve and its canonical name must be "model".
-        let m_spec = registry.find("m");
-        assert!(
-            m_spec.is_some(),
-            "alias 'm' must be findable in the command registry"
-        );
+        let m_spec = registry.find("m").ok_or(TestError::Missing(
+            "alias 'm' must be findable in the command registry",
+        ))?;
         assert_eq!(
-            m_spec.unwrap().name.as_str(),
+            m_spec.name.as_str(),
             "model",
             "alias 'm' must map to the canonical 'model' command"
         );
 
         // "p" must resolve and its canonical name must be "provider".
-        let p_spec = registry.find("p");
-        assert!(
-            p_spec.is_some(),
-            "alias 'p' must be findable in the command registry"
-        );
+        let p_spec = registry.find("p").ok_or(TestError::Missing(
+            "alias 'p' must be findable in the command registry",
+        ))?;
         assert_eq!(
-            p_spec.unwrap().name.as_str(),
+            p_spec.name.as_str(),
             "provider",
             "alias 'p' must map to the canonical 'provider' command"
         );
 
         // "reasoning" must resolve and its canonical name must be "effort".
-        let r_spec = registry.find("reasoning");
-        assert!(
-            r_spec.is_some(),
-            "alias 'reasoning' must be findable in the command registry"
-        );
+        let r_spec = registry.find("reasoning").ok_or(TestError::Missing(
+            "alias 'reasoning' must be findable in the command registry",
+        ))?;
         assert_eq!(
-            r_spec.unwrap().name.as_str(),
+            r_spec.name.as_str(),
             "effort",
             "alias 'reasoning' must map to the canonical 'effort' command"
         );
+        Ok(())
     }
 
     /// Test 8: `from_operation_registry` copies `OperationMeta::busy` into
     /// `CommandSpec::busy` — both for an operation that opts into `Immediate`
     /// (`/model`) and one that keeps the `DeferredUntilTurnEnd` default (`/new`).
     #[test]
-    fn test_from_operation_registry_maps_busy_availability() {
+    fn test_from_operation_registry_maps_busy_availability() -> TestResult {
         let ops = ops_registry();
         let registry = CommandRegistry::from_operation_registry(&ops)
-            .expect("built-in ops must produce a collision-free registry");
+            .map_err(ctx("built-in ops must produce a collision-free registry"))?;
 
-        let model_spec = registry.find("model").expect("'model' spec must exist");
+        let model_spec = registry
+            .find("model")
+            .ok_or(TestError::Missing("'model' spec must exist"))?;
         assert_eq!(
             model_spec.busy,
             harw_operations::operation::BusyAvailability::Immediate,
             "'/model' declares busy=\"immediate\"; spec must carry Immediate"
         );
 
-        let new_spec = registry.find("new").expect("'new' spec must exist");
+        let new_spec = registry
+            .find("new")
+            .ok_or(TestError::Missing("'new' spec must exist"))?;
         assert_eq!(
             new_spec.busy,
             harw_operations::operation::BusyAvailability::DeferredUntilTurnEnd,
             "'/new' does not declare busy; spec must carry the DeferredUntilTurnEnd default"
         );
+        Ok(())
     }
 
     /// Test 9: `from_command_adapters` copies `OperationMeta::busy` into
     /// `CommandSpec::busy` — mirrors the `from_operation_registry` coverage above
     /// for the adapter-driven constructor used by `command_exec`.
     #[test]
-    fn test_from_command_adapters_maps_busy_availability() {
+    fn test_from_command_adapters_maps_busy_availability() -> TestResult {
         let ops = ops_registry();
         let adapters: Vec<CommandAdapter> = ops
             .iter()
@@ -1050,19 +1068,24 @@ mod tests {
             .collect();
         let registry = CommandRegistry::from_command_adapters(&adapters);
 
-        let model_spec = registry.find("model").expect("'model' spec must exist");
+        let model_spec = registry
+            .find("model")
+            .ok_or(TestError::Missing("'model' spec must exist"))?;
         assert_eq!(
             model_spec.busy,
             harw_operations::operation::BusyAvailability::Immediate,
             "'/model' declares busy=\"immediate\"; adapter-derived spec must carry Immediate"
         );
 
-        let new_spec = registry.find("new").expect("'new' spec must exist");
+        let new_spec = registry
+            .find("new")
+            .ok_or(TestError::Missing("'new' spec must exist"))?;
         assert_eq!(
             new_spec.busy,
             harw_operations::operation::BusyAvailability::DeferredUntilTurnEnd,
             "'/new' does not declare busy; adapter-derived spec must carry the \
              DeferredUntilTurnEnd default"
         );
+        Ok(())
     }
 }

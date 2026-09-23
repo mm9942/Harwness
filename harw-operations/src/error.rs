@@ -76,6 +76,7 @@ impl std::error::Error for OpError {
 #[cfg(test)]
 mod tests {
     use super::OpError;
+    use crate::test_support::{TestError, TestResult};
     use std::error::Error;
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -235,7 +236,7 @@ mod tests {
     // ── Result<_, OpError> ergonomics ─────────────────────────────────────────
 
     #[test]
-    fn test_op_error_usable_as_result_err_variant() {
+    fn test_op_error_usable_as_result_err_variant() -> TestResult {
         fn always_fail() -> Result<(), OpError> {
             Err(OpError::Execution("simulated".to_owned()))
         }
@@ -243,7 +244,12 @@ mod tests {
         assert!(result.is_err());
         match result {
             Err(OpError::Execution(msg)) => assert_eq!(msg, "simulated"),
-            other => panic!("unerwartetes Ergebnis: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "unerwartetes Ergebnis: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 }

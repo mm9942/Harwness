@@ -62,6 +62,20 @@
 //! trotzdem immer in Leaf-first-Reihenfolge **angelegt**, weil `AddNode` keine
 //! unbekannten Abhängigkeiten akzeptiert.
 //!
+//! # Ohne `Cargo.toml`
+//! Fehlt `<root>/Cargo.toml`, wird [`WorkspaceGraph::load`] gar nicht erst
+//! aufgerufen — [`synthesize_directory_graph`] baut stattdessen einen
+//! synthetischen Graphen: ein [`CrateNode`] je direktem Unterverzeichnis der
+//! Wurzel (versteckte Verzeichnisse und eine feste Rauschliste wie `target`
+//! oder `node_modules` ausgenommen), alle auf Ebene 0 ohne hergeleitete
+//! Abhängigkeitskanten — `bottom_up` wird dadurch zu einer einzigen Welle.
+//! Ohne qualifizierendes Unterverzeichnis entsteht genau ein Pseudo-Knoten für
+//! die Wurzel selbst. Das macht `/analyze` in jedem Nicht-Rust-Projekt
+//! nutzbar, statt am internen `CodeGraphError::ManifestMissing`
+//! durchzuschlagen. Existiert `Cargo.toml`, bleibt der bisherige
+//! [`WorkspaceGraph::load`]-Pfad unverändert, inklusive echter Fehler bei
+//! einem kaputten oder unvollständigen Cargo-Workspace.
+//!
 //! # Schlüsseltypen
 //! - [`AnalyzeArgs`] — Argument-Container mit Flag-Parsing auf der
 //!   Command-Fläche.
@@ -91,7 +105,8 @@
 //! assert_eq!(args.crate_name.as_deref(), Some("harw-core"));
 //! ```
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use harw_code_graph::{CrateNode, WorkspaceGraph};
 use harw_core::child_controller::JoinSemantics;
@@ -267,6 +282,120 @@ fn parse_max_parallel(raw: &str) -> Result<usize, OpError> {
     Ok(value)
 }
 
+// ── Graph ohne Cargo.toml ────────────────────────────────────────────────────
+
+/// Verzeichnisnamen, die nie als Pseudo-Crate gezählt werden.
+///
+/// Feste Ausschlussliste für gängige Build-/Abhängigkeits-Artefakte, die auch
+/// in einem Nicht-Rust-Projekt im Wurzelverzeichnis liegen können. Versteckte
+/// Verzeichnisse (führendes `.`, siehe [`synthesize_directory_graph`]) deckt
+/// diese Liste bewusst nicht ab — dafür reicht der Namenstest allein.
+const SYNTHETIC_EXCLUDED_DIRS: [&str; 6] = [
+    "target",
+    "node_modules",
+    "dist",
+    "build",
+    "vendor",
+    "__pycache__",
+];
+
+/// Baut einen [`WorkspaceGraph`] für ein Wurzelverzeichnis ohne `Cargo.toml`.
+///
+/// # Beschreibung
+/// Liest die direkten Unterverzeichnisse von `root` (nicht rekursiv);
+/// unterhalb liegende Verzeichnisse werden nicht betrachtet. Übersprungen
+/// werden Verzeichnisse mit führendem `.` (deckt `.git`, `.harw`, `.claude`,
+/// `.codex`, `.venv` einheitlich ab) sowie [`SYNTHETIC_EXCLUDED_DIRS`]. Für
+/// jedes verbleibende Unterverzeichnis entsteht ein synthetischer
+/// [`CrateNode`] auf Ebene 0 ohne hergeleitete Abhängigkeitskanten — ein
+/// ehrlicher Stand für ein Projekt ohne bekannte interne Abhängigkeiten.
+/// Gibt es kein qualifizierendes Unterverzeichnis (ein flaches Projekt, z. B.
+/// ein Ordner voller Markdown-Dateien), entsteht genau ein Pseudo-Crate für
+/// `root` selbst.
+///
+/// # Argumente
+/// - `root` (`&Path`): die Workspace-Wurzel; muss als Verzeichnis lesbar
+///   sein.
+///
+/// # Rückgabe
+/// Ein [`WorkspaceGraph`] mit mindestens einem Pseudo-[`CrateNode`].
+///
+/// # Errors
+/// - [`OpError::Execution`]: `root` ist nicht als Verzeichnis lesbar, oder
+///   ein einzelner Verzeichniseintrag ist nicht auflösbar. Kein Panic in
+///   beiden Fällen.
+fn synthesize_directory_graph(root: &Path) -> Result<WorkspaceGraph, OpError> {
+    let entries = fs::read_dir(root).map_err(|error| {
+        OpError::Execution(format!(
+            "Verzeichnis '{}' ist ohne 'Cargo.toml' auch nicht als einfaches \
+             Verzeichnis lesbar: {error}",
+            root.display()
+        ))
+    })?;
+
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            OpError::Execution(format!(
+                "Verzeichniseintrag unterhalb von '{}' nicht lesbar: {error}",
+                root.display()
+            ))
+        })?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') || SYNTHETIC_EXCLUDED_DIRS.contains(&name) {
+            continue;
+        }
+        subdirs.push(path);
+    }
+    subdirs.sort();
+
+    let crates: Vec<CrateNode> = if subdirs.is_empty() {
+        vec![pseudo_crate_node(root.to_path_buf())]
+    } else {
+        subdirs.into_iter().map(pseudo_crate_node).collect()
+    };
+
+    Ok(WorkspaceGraph {
+        root: root.to_path_buf(),
+        crates,
+    })
+}
+
+/// Baut einen einzelnen Pseudo-[`CrateNode`] für [`synthesize_directory_graph`].
+///
+/// # Beschreibung
+/// `name` ist der Basisname von `dir`, Rückfall `"project"`, falls er nicht
+/// ermittelbar ist (z. B. Wurzelpfad `/`). `manifest_path` bleibt bewusst
+/// leer — das markiert den Knoten als synthetisch, ausgewertet in
+/// [`analysis_question`]. `deps`/`dev_deps`/`build_deps`/`external_deps`
+/// bleiben leer und `level` auf `0`: ohne geparste Manifeste sind keine
+/// Abhängigkeiten bekannt.
+fn pseudo_crate_node(dir: PathBuf) -> CrateNode {
+    let name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| "project".to_owned());
+    CrateNode {
+        name,
+        version: "0.0.0".to_owned(),
+        manifest_path: PathBuf::new(),
+        dir,
+        deps: Vec::new(),
+        dev_deps: Vec::new(),
+        build_deps: Vec::new(),
+        external_deps: Vec::new(),
+        is_leaf: true,
+        level: 0,
+    }
+}
+
 // ── Plan-Bausteine ───────────────────────────────────────────────────────────
 
 /// Bildet den Plan-Knoten-Bezeichner eines Crates.
@@ -369,11 +498,18 @@ fn analysis_question(
             consumer_names.join(", ")
         )
     };
+    // Pseudo-Crates aus `synthesize_directory_graph` tragen keine
+    // `manifest_path` — dann ist "Verzeichnis" die ehrliche Bezeichnung.
+    let noun = if crate_node.manifest_path.as_os_str().is_empty() {
+        "Verzeichnis"
+    } else {
+        "Crate"
+    };
 
     ResearchQuestion {
         id: QuestionId::new(node_id(&crate_node.name)),
         question: format!(
-            "Analysiere das Crate `{name}` (Version {version}, Ebene {level}) vollständig und \
+            "Analysiere das {noun} `{name}` (Version {version}, Ebene {level}) vollständig und \
              liefere genau diese fünf Punkte:\n\
              1. Öffentliche API: jedes `pub`-Item mit Signatur, gruppiert nach Modul, und wofür \
                 es da ist.\n\
@@ -889,11 +1025,15 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
     let max_parallel = args.max_parallel.unwrap_or(DEFAULT_MAX_PARALLEL).max(1);
 
     let workspace_root = ctx.sandbox().workspace().canonical_root();
-    let full_graph = WorkspaceGraph::load(workspace_root).map_err(|error| {
-        OpError::Execution(format!(
-            "Workspace-Graph konnte nicht geladen werden: {error}"
-        ))
-    })?;
+    let full_graph = if workspace_root.join("Cargo.toml").is_file() {
+        WorkspaceGraph::load(workspace_root).map_err(|error| {
+            OpError::Execution(format!(
+                "Workspace-Graph konnte nicht geladen werden: {error}"
+            ))
+        })?
+    } else {
+        synthesize_directory_graph(workspace_root)?
+    };
     let graph = match args.crate_name.as_deref() {
         Some(name) => full_graph.subgraph(name).map_err(|error| {
             OpError::Execution(format!("Teilgraph für '{name}' nicht bildbar: {error}"))
@@ -1118,7 +1258,9 @@ mod tests {
         AnalyzeArgs, AnalyzeOperation, cell_plan_for_wave, load_organization, node_id,
         parse_max_parallel, plan_wave, wave_batches,
     };
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
+    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_code_graph::CrateNode;
     use harw_core::child_controller::JoinSemantics;
     use harw_operations::context::ServiceMap;
@@ -1132,7 +1274,6 @@ mod tests {
         DEFAULT_ORGANIZATION_ID, RESEARCH_CLAN_ID, ResolvedOrganization, clan_cell,
         default_organization,
     };
-    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1140,36 +1281,38 @@ mod tests {
     /// Legt ein Mini-Workspace-Fixture an: `b` hängt von `a` ab.
     ///
     /// Erwartete Leaf-first-Reihenfolge: `a`, dann `b`.
-    fn mini_workspace(dir: &std::path::Path) {
-        let write = |path: PathBuf, content: &str| {
+    fn mini_workspace(dir: &std::path::Path) -> TestResult {
+        let write = |path: PathBuf, content: &str| -> TestResult {
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).expect("Verzeichnis anlegen");
+                std::fs::create_dir_all(parent).map_err(ctx("Verzeichnis anlegen"))?;
             }
-            std::fs::write(path, content).expect("Manifest schreiben");
+            std::fs::write(path, content).map_err(ctx("Manifest schreiben"))?;
+            Ok(())
         };
         write(
             dir.join("Cargo.toml"),
             "[workspace]\nmembers = [\"a\", \"b\"]\n",
-        );
+        )?;
         write(
             dir.join("a/Cargo.toml"),
             "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
-        );
+        )?;
         write(
             dir.join("b/Cargo.toml"),
             "[package]\nname = \"b\"\nversion = \"0.1.0\"\n\n[dependencies]\na = { path = \"../a\" }\n",
-        );
+        )?;
+        Ok(())
     }
 
     /// Baut einen [`OpContext`], dessen Sandbox auf ein Mini-Workspace zeigt.
-    fn workspace_context() -> (OpContext, PathBuf) {
+    fn workspace_context() -> TestResult<(OpContext, PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root =
             std::env::temp_dir().join(format!("harw-analyze-test-{}-{id}", std::process::id()));
         let workspace = root.join("ws");
-        std::fs::create_dir_all(&workspace).expect("Test-Workspace anlegen");
-        mini_workspace(&workspace);
+        std::fs::create_dir_all(&workspace).map_err(ctx("Test-Workspace anlegen"))?;
+        mini_workspace(&workspace)?;
 
         let registry = WorkspaceRegistry::build(
             &root,
@@ -1179,18 +1322,18 @@ mod tests {
                 root: PathBuf::from("ws"),
             }],
         )
-        .expect("Workspace-Registry bauen");
+        .map_err(ctx("Workspace-Registry bauen"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .expect("Workspace-Binding auflösen");
+            .map_err(ctx("Workspace-Binding auflösen"))?;
         let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
-        (
+        Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new()),
             root,
-        )
+        ))
     }
 
     #[test]
@@ -1203,35 +1346,54 @@ mod tests {
     }
 
     #[test]
-    fn test_analyze_args_from_raw_args_takes_first_free_token_as_crate() {
+    fn test_analyze_args_from_raw_args_takes_first_free_token_as_crate() -> TestResult {
         match AnalyzeArgs::from_raw_args(&toks(&["harw-core"])) {
             Ok(args) => assert_eq!(args.crate_name.as_deref(), Some("harw-core")),
-            Err(error) => panic!("unerwarteter Fehler: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "unerwarteter Fehler: {error}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_analyze_args_from_raw_args_parses_flags_in_any_order() {
+    fn test_analyze_args_from_raw_args_parses_flags_in_any_order() -> TestResult {
         match AnalyzeArgs::from_raw_args(&toks(&["--dry-run", "harw-core", "--top-down"])) {
             Ok(args) => {
                 assert_eq!(args.dry_run, Some(true));
                 assert_eq!(args.bottom_up, Some(false));
                 assert_eq!(args.crate_name.as_deref(), Some("harw-core"));
             }
-            Err(error) => panic!("unerwarteter Fehler: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "unerwarteter Fehler: {error}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_analyze_args_from_raw_args_parses_max_parallel_both_forms() {
+    fn test_analyze_args_from_raw_args_parses_max_parallel_both_forms() -> TestResult {
         match AnalyzeArgs::from_raw_args(&toks(&["--max-parallel", "8"])) {
             Ok(args) => assert_eq!(args.max_parallel, Some(8)),
-            Err(error) => panic!("unerwarteter Fehler: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "unerwarteter Fehler: {error}"
+                )));
+            }
         }
         match AnalyzeArgs::from_raw_args(&toks(&["--max-parallel=3"])) {
             Ok(args) => assert_eq!(args.max_parallel, Some(3)),
-            Err(error) => panic!("unerwarteter Fehler: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "unerwarteter Fehler: {error}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
@@ -1283,8 +1445,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_analyze_dry_run_lists_nodes_in_leaf_first_order() {
-        let (ctx, root) = workspace_context();
+    async fn test_analyze_dry_run_lists_nodes_in_leaf_first_order() -> TestResult {
+        let (ctx, root) = workspace_context()?;
         let result = super::analyze(
             &ctx,
             AnalyzeArgs {
@@ -1297,11 +1459,19 @@ mod tests {
 
         let output = match result {
             Ok(output) => output,
-            Err(error) => panic!("Dry-Run darf nicht fehlschlagen: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "Dry-Run darf nicht fehlschlagen: {error}"
+                )));
+            }
         };
         let report: serde_json::Value = match serde_json::from_str(&output.text) {
             Ok(value) => value,
-            Err(error) => panic!("Dry-Run-Ausgabe ist kein JSON: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "Dry-Run-Ausgabe ist kein JSON: {error}"
+                )));
+            }
         };
 
         assert_eq!(report["dry_run"], serde_json::json!(true));
@@ -1320,11 +1490,12 @@ mod tests {
             serde_json::json!([node_id("a")]),
             "b muss von a abhängen"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_analyze_dry_run_for_single_crate_uses_subgraph() {
-        let (ctx, root) = workspace_context();
+    async fn test_analyze_dry_run_for_single_crate_uses_subgraph() -> TestResult {
+        let (ctx, root) = workspace_context()?;
         let result = super::analyze(
             &ctx,
             AnalyzeArgs {
@@ -1338,19 +1509,28 @@ mod tests {
 
         let output = match result {
             Ok(output) => output,
-            Err(error) => panic!("Dry-Run darf nicht fehlschlagen: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "Dry-Run darf nicht fehlschlagen: {error}"
+                )));
+            }
         };
         let report: serde_json::Value = match serde_json::from_str(&output.text) {
             Ok(value) => value,
-            Err(error) => panic!("Dry-Run-Ausgabe ist kein JSON: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "Dry-Run-Ausgabe ist kein JSON: {error}"
+                )));
+            }
         };
         assert_eq!(report["crate_count"], serde_json::json!(1));
         assert_eq!(report["leaf_first"], serde_json::json!([node_id("a")]));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_analyze_without_plan_store_is_not_available() {
-        let (ctx, root) = workspace_context();
+    async fn test_analyze_without_plan_store_is_not_available() -> TestResult {
+        let (ctx, root) = workspace_context()?;
         let result = super::analyze(&ctx, AnalyzeArgs::default()).await;
         std::fs::remove_dir_all(root).ok();
 
@@ -1358,11 +1538,16 @@ mod tests {
             matches!(result, Err(OpError::NotAvailable(_))),
             "ohne Plan-Store muss /analyze fail-closed sein, war: {result:?}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_analyze_on_non_workspace_root_is_execution_error() {
-        let (ctx, root) = empty_context();
+    async fn test_analyze_on_flat_non_rust_root_synthesizes_a_single_pseudo_crate() -> TestResult {
+        // Seit dem Nicht-Rust-Rückfall (Teil 2) scheitert `/analyze` ohne
+        // `Cargo.toml` nicht mehr — `empty_context()` hat weder ein Manifest
+        // noch qualifizierende Unterverzeichnisse, also entsteht genau ein
+        // Pseudo-Crate für die Wurzel selbst (Fixture-Basisname "ws").
+        let (ctx, root) = empty_context()?;
         let result = super::analyze(
             &ctx,
             AnalyzeArgs {
@@ -1373,20 +1558,165 @@ mod tests {
         .await;
         std::fs::remove_dir_all(root).ok();
 
-        assert!(
-            matches!(result, Err(OpError::Execution(_))),
-            "ohne Workspace-Manifest muss der Graph-Ladefehler durchschlagen, war: {result:?}"
+        let output = match result {
+            Ok(output) => output,
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "Nicht-Rust-Rückfall darf nicht fehlschlagen: {error}"
+                )));
+            }
+        };
+        let report: serde_json::Value = match serde_json::from_str(&output.text) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "Ausgabe ist kein JSON: {error}"
+                )));
+            }
+        };
+
+        assert_eq!(report["crate_count"], serde_json::json!(1));
+        assert_eq!(report["leaf_first"], serde_json::json!([node_id("ws")]));
+        assert_eq!(
+            report["waves"][0]["nodes"][0]["dependencies"],
+            serde_json::json!([]),
+            "Pseudo-Crates tragen keine hergeleiteten Abhängigkeiten"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_analyze_on_non_rust_root_synthesizes_one_pseudo_crate_per_subdir() -> TestResult {
+        let (ctx, root) = directory_context(&["backend", "frontend"])?;
+        let result = super::analyze(
+            &ctx,
+            AnalyzeArgs {
+                dry_run: Some(true),
+                ..AnalyzeArgs::default()
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(root).ok();
+
+        let output = match result {
+            Ok(output) => output,
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "Nicht-Rust-Rückfall darf nicht fehlschlagen: {error}"
+                )));
+            }
+        };
+        let report: serde_json::Value = match serde_json::from_str(&output.text) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "Ausgabe ist kein JSON: {error}"
+                )));
+            }
+        };
+
+        assert_eq!(report["crate_count"], serde_json::json!(2));
+        assert_eq!(
+            report["leaf_first"],
+            serde_json::json!([node_id("backend"), node_id("frontend")]),
+            "beide Pseudo-Crates liegen auf Ebene 0 und werden alphabetisch sortiert"
+        );
+        assert_eq!(
+            report["waves"].as_array().map(|waves| waves.len()),
+            Some(1),
+            "ohne hergeleitete Abhängigkeiten bleibt es eine einzige Welle"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_analyze_on_non_rust_root_excludes_noise_directories() -> TestResult {
+        let (ctx, root) = directory_context(&[".git", "target", "node_modules", "src"])?;
+        let result = super::analyze(
+            &ctx,
+            AnalyzeArgs {
+                dry_run: Some(true),
+                ..AnalyzeArgs::default()
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(root).ok();
+
+        let output = match result {
+            Ok(output) => output,
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "Nicht-Rust-Rückfall darf nicht fehlschlagen: {error}"
+                )));
+            }
+        };
+        let report: serde_json::Value = match serde_json::from_str(&output.text) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "Ausgabe ist kein JSON: {error}"
+                )));
+            }
+        };
+
+        assert_eq!(
+            report["crate_count"],
+            serde_json::json!(1),
+            "nur 'src' darf als Pseudo-Crate zählen, .git/target/node_modules nicht"
+        );
+        assert_eq!(report["leaf_first"], serde_json::json!([node_id("src")]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_analyze_on_root_with_cargo_toml_still_uses_the_real_graph_load_path() -> TestResult
+    {
+        // Regressionsschutz: mit `Cargo.toml` bleibt der echte
+        // `WorkspaceGraph::load`-Pfad unverändert — erkennbar an der realen
+        // internen Abhängigkeit a→b, die der synthetische Rückfall nie
+        // herleitet (dessen Pseudo-Crates tragen immer leere `deps`).
+        let (ctx, root) = workspace_context()?;
+        let result = super::analyze(
+            &ctx,
+            AnalyzeArgs {
+                dry_run: Some(true),
+                ..AnalyzeArgs::default()
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(root).ok();
+
+        let output = match result {
+            Ok(output) => output,
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "Dry-Run darf nicht fehlschlagen: {error}"
+                )));
+            }
+        };
+        let report: serde_json::Value = match serde_json::from_str(&output.text) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "Dry-Run-Ausgabe ist kein JSON: {error}"
+                )));
+            }
+        };
+
+        assert_eq!(report["crate_count"], serde_json::json!(2));
+        assert_eq!(
+            report["waves"][1]["nodes"][0]["dependencies"],
+            serde_json::json!([node_id("a")]),
+            "die reale Abhängigkeit a→b beweist, dass Cargo.toml geparst wurde"
+        );
+        Ok(())
     }
 
     // ── Zell-gesteuerter Fan-out ─────────────────────────────────────────────
 
     /// Löst die eingebaute Organisation auf; ein Fehler ist ein Defekt der TOML-Datei.
-    fn organization() -> ResolvedOrganization {
-        match default_organization() {
-            Ok(organization) => organization,
-            Err(error) => panic!("die eingebaute Organisation muss auflösen: {error}"),
-        }
+    fn organization() -> TestResult<ResolvedOrganization> {
+        default_organization().map_err(ctx("die eingebaute Organisation muss auflösen"))
     }
 
     /// Baut einen Plan-Knoten mit gegebener ID und Schreibbereich.
@@ -1446,20 +1776,27 @@ mod tests {
     }
 
     #[test]
-    fn test_load_organization_yields_the_embedded_default_organization() {
+    fn test_load_organization_yields_the_embedded_default_organization() -> TestResult {
         match load_organization() {
             Some(organization) => {
                 assert_eq!(organization.id.as_string(), DEFAULT_ORGANIZATION_ID)
             }
-            None => panic!("die eingebaute Organisation muss ladbar sein"),
+            None => {
+                return Err(TestError::Unexpected(
+                    "die eingebaute Organisation muss ladbar sein".to_owned(),
+                ));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_node_id_falls_into_the_research_clan_scope() {
-        let organization = organization();
+    fn test_node_id_falls_into_the_research_clan_scope() -> TestResult {
+        let organization = organization()?;
         let Some((clan, cell)) = clan_cell(&organization, RESEARCH_CLAN_ID) else {
-            panic!("der Research-Clan muss eine Zelle haben");
+            return Err(TestError::Unexpected(
+                "der Research-Clan muss eine Zelle haben".to_owned(),
+            ));
         };
         assert_eq!(node_id("harw-core"), "research-harw-core");
         assert!(
@@ -1470,13 +1807,16 @@ mod tests {
             ScopeMatcher::matches_glob(&cell.members_from_plan, &node_id("harw-core")),
             "der Knotenname muss auf das Mitgliedermuster der Zelle passen"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_research_cell_selects_exactly_the_research_nodes() {
-        let organization = organization();
+    fn test_research_cell_selects_exactly_the_research_nodes() -> TestResult {
+        let organization = organization()?;
         let Some((clan, cell)) = clan_cell(&organization, RESEARCH_CLAN_ID) else {
-            panic!("der Research-Clan muss eine Zelle haben");
+            return Err(TestError::Unexpected(
+                "der Research-Clan muss eine Zelle haben".to_owned(),
+            ));
         };
         let plan = plan_with(vec![
             plan_node("research-a", &[]),
@@ -1486,7 +1826,11 @@ mod tests {
 
         let resolved = match CellPlan::from_cell(cell, Some(clan), &plan) {
             Ok(resolved) => resolved,
-            Err(error) => panic!("die Zelle muss auflösen: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "die Zelle muss auflösen: {error}"
+                )));
+            }
         };
 
         assert_eq!(
@@ -1496,13 +1840,16 @@ mod tests {
         );
         assert_eq!(resolved.role, RESEARCH_CLAN_ID);
         assert_eq!(resolved.join, JoinSemantics::AllTerminal);
+        Ok(())
     }
 
     #[test]
-    fn test_required_write_partition_splits_overlapping_write_scopes() {
-        let organization = organization();
+    fn test_required_write_partition_splits_overlapping_write_scopes() -> TestResult {
+        let organization = organization()?;
         let Some((clan, cell)) = clan_cell(&organization, RESEARCH_CLAN_ID) else {
-            panic!("der Research-Clan muss eine Zelle haben");
+            return Err(TestError::Unexpected(
+                "der Research-Clan muss eine Zelle haben".to_owned(),
+            ));
         };
 
         let overlapping = plan_with(vec![
@@ -1511,7 +1858,11 @@ mod tests {
         ]);
         let resolved = match CellPlan::from_cell(cell, Some(clan), &overlapping) {
             Ok(resolved) => resolved,
-            Err(error) => panic!("die Zelle muss auflösen: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "die Zelle muss auflösen: {error}"
+                )));
+            }
         };
         assert_eq!(
             resolved.batches.len(),
@@ -1526,10 +1877,15 @@ mod tests {
         ]);
         let resolved = match CellPlan::from_cell(cell, Some(clan), &disjoint) {
             Ok(resolved) => resolved,
-            Err(error) => panic!("die Zelle muss auflösen: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "die Zelle muss auflösen: {error}"
+                )));
+            }
         };
         assert_eq!(resolved.batches.len(), 1, "disjunkte Pfade laufen zusammen");
         assert_eq!(resolved.batches[0].len(), 2);
+        Ok(())
     }
 
     #[test]
@@ -1604,8 +1960,8 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_wave_with_the_research_cell_covers_every_crate() {
-        let organization = organization();
+    fn test_plan_wave_with_the_research_cell_covers_every_crate() -> TestResult {
+        let organization = organization()?;
         let cell = clan_cell(&organization, RESEARCH_CLAN_ID);
         let crates = [crate_node("a", 0), crate_node("b", 0)];
         let level: Vec<&CrateNode> = crates.iter().collect();
@@ -1626,14 +1982,15 @@ mod tests {
             .map(|node| node.name.as_str())
             .collect();
         assert_eq!(names, vec!["a", "b"]);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_analyze_dry_run_reports_the_cell_and_its_batches() {
+    async fn test_analyze_dry_run_reports_the_cell_and_its_batches() -> TestResult {
         // Der Kontext hat keinen Agent-Spawner: würde der Dry-Run ein Kind
         // starten, käme `OpError::NotAvailable` zurück. `Ok` ist damit der
         // Beweis, dass kein Kind gestartet wurde.
-        let (ctx, root) = workspace_context();
+        let (ctx, root) = workspace_context()?;
         let result = super::analyze(
             &ctx,
             AnalyzeArgs {
@@ -1646,11 +2003,19 @@ mod tests {
 
         let output = match result {
             Ok(output) => output,
-            Err(error) => panic!("Dry-Run darf nicht fehlschlagen: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "Dry-Run darf nicht fehlschlagen: {error}"
+                )));
+            }
         };
         let report: serde_json::Value = match serde_json::from_str(&output.text) {
             Ok(value) => value,
-            Err(error) => panic!("Dry-Run-Ausgabe ist kein JSON: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "Dry-Run-Ausgabe ist kein JSON: {error}"
+                )));
+            }
         };
 
         assert_eq!(report["dry_run"], serde_json::json!(true));
@@ -1675,17 +2040,18 @@ mod tests {
             report["leaf_first"],
             serde_json::json!([node_id("a"), node_id("b")])
         );
+        Ok(())
     }
 
     /// Kontext ohne Workspace-Manifest — für den Fehlerpfad des Graph-Ladens.
-    fn empty_context() -> (OpContext, PathBuf) {
+    fn empty_context() -> TestResult<(OpContext, PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "harw-analyze-empty-test-{}-{id}",
             std::process::id()
         ));
-        std::fs::create_dir_all(root.join("ws")).expect("Test-Workspace anlegen");
+        std::fs::create_dir_all(root.join("ws")).map_err(ctx("Test-Workspace anlegen"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -1694,17 +2060,53 @@ mod tests {
                 root: PathBuf::from("ws"),
             }],
         )
-        .expect("Workspace-Registry bauen");
+        .map_err(ctx("Workspace-Registry bauen"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .expect("Workspace-Binding auflösen");
+            .map_err(ctx("Workspace-Binding auflösen"))?;
         let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
-        (
+        Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new()),
             root,
+        ))
+    }
+
+    /// Kontext ohne Workspace-Manifest, mit den gegebenen direkten
+    /// Unterverzeichnissen der Workspace-Wurzel — für den Nicht-Rust-Rückfall
+    /// von `synthesize_directory_graph`.
+    fn directory_context(subdirs: &[&str]) -> TestResult<(OpContext, PathBuf)> {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("harw-analyze-dir-test-{}-{id}", std::process::id()));
+        let workspace = root.join("ws");
+        std::fs::create_dir_all(&workspace).map_err(ctx("Test-Workspace anlegen"))?;
+        for subdir in subdirs {
+            std::fs::create_dir_all(workspace.join(subdir))
+                .map_err(ctx("Unterverzeichnis anlegen"))?;
+        }
+        let registry = WorkspaceRegistry::build(
+            &root,
+            [WorkspaceRegistration {
+                tenant: TenantId::from_str("test-tenant"),
+                workspace: WorkspaceId::from_str("ws"),
+                root: PathBuf::from("ws"),
+            }],
         )
+        .map_err(ctx("Workspace-Registry bauen"))?;
+        let binding = registry
+            .resolve(
+                &TenantId::from_str("test-tenant"),
+                &WorkspaceId::from_str("ws"),
+            )
+            .map_err(ctx("Workspace-Binding auflösen"))?;
+        let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
+        Ok((
+            OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new()),
+            root,
+        ))
     }
 }

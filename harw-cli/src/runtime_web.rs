@@ -232,6 +232,7 @@ pub(crate) fn narrow_web_sandbox(root: &SandboxSpec, tier: PermissionTier) -> Sa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_authority::Permission;
 
     const ALL_TIERS: [PermissionTier; 4] = [
@@ -252,23 +253,25 @@ mod tests {
         }
     }
 
-    fn web_root(dir: &Path) -> SandboxSpec {
-        harw_runtime::root_sandbox(EntryKind::Web, dir).expect("temp dir binds as workspace root")
+    fn web_root(dir: &Path) -> TestResult<SandboxSpec> {
+        harw_runtime::root_sandbox(EntryKind::Web, dir)
+            .map_err(ctx("temp dir binds as workspace root"))
     }
 
     #[test]
-    fn test_narrow_web_sandbox_observer_has_only_read_workspace() {
-        let dir = tempfile::TempDir::new().expect("temp dir");
-        let sandbox = narrow_web_sandbox(&web_root(dir.path()), PermissionTier::Observer);
+    fn test_narrow_web_sandbox_observer_has_only_read_workspace() -> TestResult {
+        let dir = tempfile::TempDir::new().map_err(ctx("temp dir"))?;
+        let sandbox = narrow_web_sandbox(&web_root(dir.path())?, PermissionTier::Observer);
         assert!(sandbox.permissions().contains(Permission::ReadWorkspace));
         assert!(!sandbox.permissions().contains(Permission::WriteWorkspace));
         assert!(!sandbox.permissions().contains(Permission::ExecuteProcess));
+        Ok(())
     }
 
     #[test]
-    fn test_narrow_web_sandbox_never_exceeds_root_permissions() {
-        let dir = tempfile::TempDir::new().expect("temp dir");
-        let root = web_root(dir.path());
+    fn test_narrow_web_sandbox_never_exceeds_root_permissions() -> TestResult {
+        let dir = tempfile::TempDir::new().map_err(ctx("temp dir"))?;
+        let root = web_root(dir.path())?;
         for tier in ALL_TIERS {
             let narrowed = narrow_web_sandbox(&root, tier);
             assert!(
@@ -282,27 +285,29 @@ mod tests {
                 "{tier:?} exceeds its tier ceiling"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_web_spec_is_web_entry_with_owner_principal() {
-        let home = tempfile::TempDir::new().expect("temp home");
-        let cwd = tempfile::TempDir::new().expect("temp cwd");
+    fn test_web_spec_is_web_entry_with_owner_principal() -> TestResult {
+        let home = tempfile::TempDir::new().map_err(ctx("temp home"))?;
+        let cwd = tempfile::TempDir::new().map_err(ctx("temp cwd"))?;
         let spec = web_spec(home.path(), cwd.path(), 1000);
         assert_eq!(spec.entry, EntryKind::Web);
         assert_eq!(spec.home, home.path());
         assert_eq!(spec.cwd, cwd.path());
         assert_eq!(spec.principal.tier(), PermissionTier::Owner);
         assert_eq!(spec.principal.id(), "uid:1000");
+        Ok(())
     }
 
     // Kein Netz, kein Provider: `ModelSource::Echo` und ein leeres
     // Temp-Home ohne `config.toml` (gleiche Annahme wie
     // `runtime_entry::tests::test_build_assembly_local_echo_succeeds`).
     #[test]
-    fn test_web_assembly_without_home_config_builds_with_approval_store() {
-        let home = tempfile::TempDir::new().expect("temp home");
-        let cwd = tempfile::TempDir::new().expect("temp cwd");
+    fn test_web_assembly_without_home_config_builds_with_approval_store() -> TestResult {
+        let home = tempfile::TempDir::new().map_err(ctx("temp home"))?;
+        let cwd = tempfile::TempDir::new().map_err(ctx("temp cwd"))?;
         let store = Arc::new(ApprovalStore::new(home.path()));
         let assembly = web_assembly(
             home.path(),
@@ -311,15 +316,19 @@ mod tests {
             Some(Arc::clone(&store)),
             None,
         )
-        .expect("web assembly builds from an empty home");
-        let held = assembly.approval_store().expect("approval store is kept");
+        .map_err(ctx("web assembly builds from an empty home"))?;
+        let held = assembly
+            .approval_store()
+            .ok_or(TestError::Missing("approval store is kept"))?;
         assert!(Arc::ptr_eq(held, &store));
+        Ok(())
     }
 
     #[test]
-    fn test_web_thread_for_session_prefixes_web() {
-        let session = SessionId::try_from_str("abc-123").expect("valid session id");
+    fn test_web_thread_for_session_prefixes_web() -> TestResult {
+        let session = SessionId::try_from_str("abc-123").map_err(ctx("valid session id"))?;
         let thread = web_thread_for_session(&session);
         assert_eq!(thread.as_str(), "web:abc-123");
+        Ok(())
     }
 }

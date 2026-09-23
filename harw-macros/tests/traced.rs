@@ -12,6 +12,9 @@
 
 use harw_macros::{Redact, traced};
 
+mod common;
+use common::{TestError, TestResult};
+
 /// Argument type carrying a `Redact` implementation via the sibling
 /// `#[derive(Redact)]` macro (AW0-02), so `#[traced(fields(...))]` has a
 /// legitimate `Redact`-implementing type to call.
@@ -42,7 +45,7 @@ async fn traced_async_add(a: TracedNum, b: TracedNum) -> i32 {
 }
 
 #[test]
-fn traced_async_fn_executes_and_returns_value() {
+fn traced_async_fn_executes_and_returns_value() -> TestResult {
     use std::future::Future;
     use std::pin::pin;
     use std::task::{Context, Poll, Waker};
@@ -55,8 +58,13 @@ fn traced_async_fn_executes_and_returns_value() {
     let mut cx = Context::from_waker(waker);
     match fut.poll(&mut cx) {
         Poll::Ready(v) => assert_eq!(v, 5),
-        Poll::Pending => panic!("async body has no internal .await; must resolve on first poll"),
+        Poll::Pending => {
+            return Err(TestError::Unexpected(
+                "async body has no internal .await; must resolve on first poll".to_owned(),
+            ));
+        }
     }
+    Ok(())
 }
 
 // ── bare `#[traced]` (no attribute arguments) — defaults must compile ───────

@@ -233,6 +233,7 @@ impl Job {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn job() -> Job {
         Job::new(
@@ -250,46 +251,52 @@ mod tests {
     }
 
     #[test]
-    fn claimed_job_executes_and_completes() {
+    fn claimed_job_executes_and_completes() -> TestResult {
         let now = Timestamp::now();
         let mut job = job();
-        job.mark_ready(now).unwrap();
+        job.mark_ready(now).map_err(ctx("mark_ready succeeds"))?;
         let lease = job
             .claim("worker-a", now, SignedDuration::from_secs(30))
-            .unwrap();
+            .map_err(ctx("claim succeeds"))?;
         job.execute_with(&lease, now, |job| job.charge_tokens(4))
-            .unwrap();
+            .map_err(ctx("execute_with succeeds"))?;
         assert_eq!(job.state, JobState::Completed);
         assert_eq!(job.usage.tokens, 4);
+        Ok(())
     }
 
     #[test]
-    fn failed_execution_returns_to_ready_for_retry() {
+    fn failed_execution_returns_to_ready_for_retry() -> TestResult {
         let now = Timestamp::now();
         let mut job = job();
-        job.mark_ready(now).unwrap();
+        job.mark_ready(now).map_err(ctx("mark_ready succeeds"))?;
         let lease = job
             .claim("worker-a", now, SignedDuration::from_secs(30))
-            .unwrap();
-        let error = job
-            .execute_with(&lease, now, |_| {
-                Err(JobRuntimeError::RetryExhausted { attempts: 0 })
-            })
-            .unwrap_err();
+            .map_err(ctx("claim succeeds"))?;
+        let Err(error) = job.execute_with(&lease, now, |_| {
+            Err(JobRuntimeError::RetryExhausted { attempts: 0 })
+        }) else {
+            return Err(TestError::Unexpected("execute_with must fail".into()));
+        };
         assert!(matches!(
             error,
             JobRuntimeError::RetryExhausted { attempts: 0 }
         ));
         assert_eq!(job.state, JobState::Ready);
         assert_eq!(job.attempts, 1);
+        Ok(())
     }
 
     #[test]
-    fn completion_requires_a_running_job_without_mutating_it() {
+    fn completion_requires_a_running_job_without_mutating_it() -> TestResult {
         let mut job = job();
         let previous_updated_at = job.updated_at;
 
-        let error = job.complete(Timestamp::now()).unwrap_err();
+        let Err(error) = job.complete(Timestamp::now()) else {
+            return Err(TestError::Unexpected(
+                "complete must fail on a pending job".into(),
+            ));
+        };
 
         assert!(matches!(
             error,
@@ -301,14 +308,19 @@ mod tests {
         ));
         assert_eq!(job.state, JobState::Pending);
         assert_eq!(job.updated_at, previous_updated_at);
+        Ok(())
     }
 
     #[test]
-    fn recording_failure_requires_a_running_job_without_mutating_it() {
+    fn recording_failure_requires_a_running_job_without_mutating_it() -> TestResult {
         let mut job = job();
         let previous_updated_at = job.updated_at;
 
-        let error = job.record_failure(Timestamp::now()).unwrap_err();
+        let Err(error) = job.record_failure(Timestamp::now()) else {
+            return Err(TestError::Unexpected(
+                "record_failure must fail on a pending job".into(),
+            ));
+        };
 
         assert!(matches!(
             error,
@@ -321,10 +333,11 @@ mod tests {
         assert_eq!(job.state, JobState::Pending);
         assert_eq!(job.attempts, 0);
         assert_eq!(job.updated_at, previous_updated_at);
+        Ok(())
     }
 
     #[test]
-    fn terminal_transitions_reject_every_non_running_state_without_mutation() {
+    fn terminal_transitions_reject_every_non_running_state_without_mutation() -> TestResult {
         let non_running_states = [
             JobState::Pending,
             JobState::Ready,
@@ -339,7 +352,11 @@ mod tests {
             completion.state = state;
             let completion_updated_at = completion.updated_at;
 
-            let completion_error = completion.complete(Timestamp::now()).unwrap_err();
+            let Err(completion_error) = completion.complete(Timestamp::now()) else {
+                return Err(TestError::Unexpected(format!(
+                    "complete must fail for state {state:?}"
+                )));
+            };
 
             assert!(matches!(
                 completion_error,
@@ -357,7 +374,11 @@ mod tests {
             failure.state = state;
             let failure_updated_at = failure.updated_at;
 
-            let failure_error = failure.record_failure(Timestamp::now()).unwrap_err();
+            let Err(failure_error) = failure.record_failure(Timestamp::now()) else {
+                return Err(TestError::Unexpected(format!(
+                    "record_failure must fail for state {state:?}"
+                )));
+            };
 
             assert!(matches!(
                 failure_error,
@@ -371,5 +392,6 @@ mod tests {
             assert_eq!(failure.attempts, 0);
             assert_eq!(failure.updated_at, failure_updated_at);
         }
+        Ok(())
     }
 }

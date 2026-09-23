@@ -338,9 +338,8 @@ fn tool_line_relevant(line: &str) -> bool {
 /// Endung (`foo.rs`, `bar.toml`) aussieht.
 fn has_file_extension(line: &str) -> bool {
     line.split_whitespace().any(|token| {
-        let token = token.trim_matches(|c: char| {
-            !c.is_ascii_alphanumeric() && c != '.' && c != '_' && c != '-'
-        });
+        let token = token
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '_' && c != '-');
         token.rsplit_once('.').is_some_and(|(stem, ext)| {
             !stem.is_empty()
                 && !ext.is_empty()
@@ -518,18 +517,16 @@ fn build_fact_from_value(
     let body_raw = obj.get("body").and_then(|v| v.as_str()).unwrap_or("");
     let body = redact(body_raw);
 
-    let confidence_raw = obj.get("confidence").and_then(serde_json::Value::as_f64).unwrap_or(0.8);
+    let confidence_raw = obj
+        .get("confidence")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.8);
     let confidence = confidence_raw.clamp(0.0, 1.0) as f32;
 
     let mut sources: Vec<String> = obj
         .get("sources")
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|s| s.as_str())
-                .map(redact)
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(|s| s.as_str()).map(redact).collect())
         .unwrap_or_default();
     if sources.is_empty() {
         sources.push(default_source.to_owned());
@@ -538,12 +535,7 @@ fn build_fact_from_value(
     let tags: Vec<String> = obj
         .get("tags")
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|s| s.as_str())
-                .map(redact)
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(|s| s.as_str()).map(redact).collect())
         .unwrap_or_default();
 
     Some(Fact {
@@ -748,8 +740,8 @@ impl IncomingStore {
 
     fn write_state(&self, state: &BTreeSet<String>) -> Result<(), ExtractionError> {
         let path = self.state_path();
-        let bytes = serde_json::to_vec_pretty(state)
-            .map_err(|source| ExtractionError::Json { source })?;
+        let bytes =
+            serde_json::to_vec_pretty(state).map_err(|source| ExtractionError::Json { source })?;
         harw_fsutil::write_atomic(
             &path,
             &bytes,
@@ -771,7 +763,10 @@ fn incoming_dir(root: &Path) -> PathBuf {
 fn candidate_to_markdown(fact: &Fact) -> String {
     let mut fm = String::new();
     fm.push_str(&format!("name: {}\n", fact.name));
-    fm.push_str(&format!("description: {}\n", json_scalar(&fact.description)));
+    fm.push_str(&format!(
+        "description: {}\n",
+        json_scalar(&fact.description)
+    ));
     fm.push_str(&format!("type: {}\n", fact.fact_type.as_str()));
     fm.push_str(&format!("scope: {}\n", fact.scope.as_str()));
     fm.push_str(&format!("created: {}\n", format_rfc3339(fact.created)));
@@ -875,15 +870,14 @@ fn parse_rfc3339(raw: &str) -> Option<OffsetDateTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use time::Duration;
 
     fn tmp_root(tag: &str) -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "harw-extraction-{tag}-{}-{id}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("harw-extraction-{tag}-{}-{id}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         root
     }
@@ -942,7 +936,10 @@ mod tests {
 
         let selected = select_sessions(&candidates, &already_done, now, &policy);
 
-        assert_eq!(selected, vec!["valid-newer".to_owned(), "valid-older".to_owned()]);
+        assert_eq!(
+            selected,
+            vec!["valid-newer".to_owned(), "valid-older".to_owned()]
+        );
     }
 
     // -- build_input --------------------------------------------------------
@@ -998,7 +995,7 @@ mod tests {
     // -- parse_response -----------------------------------------------------
 
     #[test]
-    fn parse_response_extracts_json_from_codefence() {
+    fn parse_response_extracts_json_from_codefence() -> TestResult {
         let response = "Hier ist das Ergebnis:\n```json\n{\"facts\": [{\"name\": \"Test Fakt\", \
              \"description\": \"Eine Beschreibung\", \"type\": \"fact\", \"body\": \"Text\", \
              \"confidence\": 0.9, \"sources\": [\"session:abc\"]}]}\n```\nDanke.";
@@ -1010,14 +1007,15 @@ mod tests {
             OffsetDateTime::now_utc(),
             "sess-1",
         )
-        .unwrap();
+        .map_err(ctx("parse_response"))?;
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].name, "test-fakt");
         assert_eq!(facts[0].sources, vec!["session:abc".to_owned()]);
+        Ok(())
     }
 
     #[test]
-    fn parse_response_tolerates_garbage_fields_and_defaults_source() {
+    fn parse_response_tolerates_garbage_fields_and_defaults_source() -> TestResult {
         let response = r#"{"facts": [{"name": "x", "description": "y", "confidence": "not-a-number", "unknown_field": 123}]}"#;
         let policy = ExtractionPolicy::default();
         let facts = parse_response(
@@ -1027,15 +1025,16 @@ mod tests {
             OffsetDateTime::now_utc(),
             "sess-2",
         )
-        .unwrap();
+        .map_err(ctx("parse_response"))?;
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].fact_type, FactType::Fact);
         assert_eq!(facts[0].confidence, 0.8);
         assert_eq!(facts[0].sources, vec!["session:sess-2".to_owned()]);
+        Ok(())
     }
 
     #[test]
-    fn parse_response_skips_broken_entries_but_keeps_valid_ones() {
+    fn parse_response_skips_broken_entries_but_keeps_valid_ones() -> TestResult {
         let response = r#"{"facts": [
             {"description": "kein Name"},
             {"name": "kaputter-typ", "description": "x", "type": "unsinn"},
@@ -1050,16 +1049,17 @@ mod tests {
             OffsetDateTime::now_utc(),
             "sess-3",
         )
-        .unwrap();
+        .map_err(ctx("parse_response"))?;
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].name, "gueltig");
         assert_eq!(facts[0].fact_type, FactType::Decision);
         // confidence wurde auf 1.0 geklemmt
         assert_eq!(facts[0].confidence, 1.0);
+        Ok(())
     }
 
     #[test]
-    fn parse_response_limits_to_max_facts_per_session() {
+    fn parse_response_limits_to_max_facts_per_session() -> TestResult {
         let items: Vec<String> = (0..10)
             .map(|i| format!("{{\"name\": \"fakt-{i}\", \"description\": \"Beschreibung {i}\"}}"))
             .collect();
@@ -1075,12 +1075,13 @@ mod tests {
             OffsetDateTime::now_utc(),
             "sess-4",
         )
-        .unwrap();
+        .map_err(ctx("parse_response"))?;
         assert_eq!(facts.len(), 3);
+        Ok(())
     }
 
     #[test]
-    fn parse_response_redacts_secrets_in_description_and_body() {
+    fn parse_response_redacts_secrets_in_description_and_body() -> TestResult {
         let response = r#"{"facts": [{"name": "geheim", "description": "token=sk-abcdefghijklmnopqrstuvwxyz1234", "body": "api_key = sk-abcdefghijklmnopqrstuvwxyz1234"}]}"#;
         let policy = ExtractionPolicy::default();
         let facts = parse_response(
@@ -1090,24 +1091,31 @@ mod tests {
             OffsetDateTime::now_utc(),
             "sess-5",
         )
-        .unwrap();
+        .map_err(ctx("parse_response"))?;
         assert_eq!(facts.len(), 1);
-        assert!(!facts[0].description.contains("sk-abcdefghijklmnopqrstuvwxyz1234"));
+        assert!(
+            !facts[0]
+                .description
+                .contains("sk-abcdefghijklmnopqrstuvwxyz1234")
+        );
         assert!(!facts[0].body.contains("sk-abcdefghijklmnopqrstuvwxyz1234"));
+        Ok(())
     }
 
     #[test]
-    fn parse_response_without_json_returns_error() {
+    fn parse_response_without_json_returns_error() -> TestResult {
         let policy = ExtractionPolicy::default();
-        let err = parse_response(
+        let Err(err) = parse_response(
             "kein JSON hier",
             &policy,
             FactScope::Project,
             OffsetDateTime::now_utc(),
             "sess-6",
-        )
-        .unwrap_err();
+        ) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, ExtractionError::NoJsonFound));
+        Ok(())
     }
 
     // -- prompts --------------------------------------------------------
@@ -1138,13 +1146,15 @@ mod tests {
     }
 
     #[test]
-    fn incoming_store_roundtrip_write_list_take_all() {
+    fn incoming_store_roundtrip_write_list_take_all() -> TestResult {
         let root = tmp_root("roundtrip");
-        let store = IncomingStore::open(&root).unwrap();
+        let store = IncomingStore::open(&root).map_err(ctx("open store"))?;
         let fact = sample_fact("kandidat-eins");
-        store.write_candidates(std::slice::from_ref(&fact)).unwrap();
+        store
+            .write_candidates(std::slice::from_ref(&fact))
+            .map_err(ctx("write_candidates"))?;
 
-        let listed = store.list().unwrap();
+        let listed = store.list().map_err(ctx("list"))?;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, "kandidat-eins");
         assert_eq!(listed[0].description, fact.description);
@@ -1153,30 +1163,36 @@ mod tests {
         assert_eq!(listed[0].tags, fact.tags);
         assert_eq!(listed[0].fact_type, FactType::Decision);
 
-        let taken = store.take_all().unwrap();
+        let taken = store.take_all().map_err(ctx("take_all"))?;
         assert_eq!(taken.len(), 1);
         assert_eq!(taken[0].name, "kandidat-eins");
 
-        let after_take = store.list().unwrap();
+        let after_take = store.list().map_err(ctx("list"))?;
         assert!(after_take.is_empty());
 
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn incoming_store_marker_roundtrip() {
+    fn incoming_store_marker_roundtrip() -> TestResult {
         let root = tmp_root("marker");
-        let store = IncomingStore::open(&root).unwrap();
+        let store = IncomingStore::open(&root).map_err(ctx("open store"))?;
 
         assert!(!store.is_session_done("sess-a"));
-        store.mark_session_done("sess-a").unwrap();
+        store
+            .mark_session_done("sess-a")
+            .map_err(ctx("mark_session_done"))?;
         assert!(store.is_session_done("sess-a"));
         assert!(!store.is_session_done("sess-b"));
 
         // idempotent
-        store.mark_session_done("sess-a").unwrap();
+        store
+            .mark_session_done("sess-a")
+            .map_err(ctx("mark_session_done"))?;
         assert!(store.is_session_done("sess-a"));
 
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 }

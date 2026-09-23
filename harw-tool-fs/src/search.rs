@@ -28,8 +28,8 @@ use crate::tree::{
     HARD_MAX_RESULTS, MAX_OUTPUT_BYTES, MAX_SCAN_FILE_BYTES, StopReason, WalkOptions, Workspace,
     normalize_relative, open_file_in, read_bounded, truncate_line, walk_tree,
 };
-use harw_fsutil::EntryType;
 use harw_authority::Permission;
+use harw_fsutil::EntryType;
 use harw_tools::{
     ToolCall, ToolOutput,
     error::ToolsError,
@@ -223,13 +223,12 @@ impl FsSearchExecutor {
             .min(self.max_matches)
             .clamp(1, HARD_MAX_RESULTS);
 
-        let opened = Workspace::open(ctx.sandbox().workspace().canonical_root()).and_then(
-            |workspace| {
+        let opened =
+            Workspace::open(ctx.sandbox().workspace().canonical_root()).and_then(|workspace| {
                 let start = workspace.open_any(&start_rel)?;
                 let is_dir = start.metadata()?.is_dir();
                 Ok((workspace, start, is_dir))
-            },
-        );
+            });
         let (workspace, start, is_dir) = match opened {
             Ok(opened) => opened,
             Err(err) => {
@@ -329,16 +328,21 @@ impl ToolExecutor for FsSearchExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{Fixture, SECRET, call, render};
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use crate::test_support::{Fixture, SECRET, TestError, TestResult, call, ctx, render};
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
-    fn make_sandbox_with_permissions(root: &Path, permissions: Vec<Permission>) -> SandboxSpec {
+    fn make_sandbox_with_permissions(
+        root: &Path,
+        permissions: Vec<Permission>,
+    ) -> TestResult<SandboxSpec> {
         let ws_dir = root.join("ws");
-        fs::create_dir_all(&ws_dir).unwrap();
+        fs::create_dir_all(&ws_dir)?;
         let registry = WorkspaceRegistry::build(
             root,
             [WorkspaceRegistration {
@@ -347,11 +351,14 @@ mod tests {
                 root: PathBuf::from("ws"),
             }],
         )
-        .unwrap();
+        .map_err(ctx("registry"))?;
         let binding = registry
             .resolve(&TenantId::from_str("t"), &WorkspaceId::from_str("w"))
-            .unwrap();
-        SandboxSpec::from_resolved(binding, PermissionSet::from_policy(permissions))
+            .map_err(ctx("binding"))?;
+        Ok(SandboxSpec::from_resolved(
+            binding,
+            PermissionSet::from_policy(permissions),
+        ))
     }
 
     fn make_ctx(sandbox: SandboxSpec) -> ToolExecutionContext {
@@ -367,69 +374,86 @@ mod tests {
     }
 
     #[test]
-    fn test_fs_search_finds_matches() {
-        let dir = TempDir::new().unwrap();
+    fn test_fs_search_finds_matches() -> TestResult {
+        let dir = TempDir::new()?;
         let ws = dir.path().join("ws");
-        fs::create_dir_all(&ws).unwrap();
-        fs::write(ws.join("code.rs"), "fn hello() {}\nfn world() {}\n").unwrap();
-        fs::write(ws.join("other.txt"), "no match here\n").unwrap();
+        fs::create_dir_all(&ws)?;
+        fs::write(ws.join("code.rs"), "fn hello() {}\nfn world() {}\n")?;
+        fs::write(ws.join("other.txt"), "no match here\n")?;
 
         let executor = FsSearchExecutor {
             max_matches: DEFAULT_MAX_MATCHES,
             max_depth: DEFAULT_MAX_DEPTH,
         };
-        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace]);
+        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace])?;
         let ctx = make_ctx(sandbox);
         let call = make_call(serde_json::json!({ "query": "hello" }));
 
-        let result = executor.search_files(&ctx, &call).unwrap();
+        let result = executor.search_files(&ctx, &call)?;
         match result {
             ToolOutput::Json { content } => {
-                let arr = content["matches"].as_array().expect("should be array");
+                let arr = content["matches"]
+                    .as_array()
+                    .ok_or(TestError::Missing("matches should be array"))?;
                 assert!(!arr.is_empty(), "expected at least one match");
-                assert_eq!(first_path(&content), "code.rs");
+                assert_eq!(first_path(&content)?, "code.rs");
                 let first = &arr[0];
-                assert_eq!(first["line"].as_u64().unwrap(), 1);
-                assert!(first["text"].as_str().unwrap().contains("hello"));
+                assert_eq!(first["line"].as_u64().ok_or(TestError::Missing("line"))?, 1);
+                assert!(
+                    first["text"]
+                        .as_str()
+                        .ok_or(TestError::Missing("text"))?
+                        .contains("hello")
+                );
             }
-            other => panic!("expected json output, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected json output, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_fs_search_denied_when_no_read_permission() {
-        let dir = TempDir::new().unwrap();
+    fn test_fs_search_denied_when_no_read_permission() -> TestResult {
+        let dir = TempDir::new()?;
         let ws = dir.path().join("ws");
-        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&ws)?;
 
         let executor = FsSearchExecutor {
             max_matches: DEFAULT_MAX_MATCHES,
             max_depth: DEFAULT_MAX_DEPTH,
         };
-        let sandbox = make_sandbox_with_permissions(dir.path(), vec![]);
+        let sandbox = make_sandbox_with_permissions(dir.path(), vec![])?;
         let ctx = make_ctx(sandbox);
         let call = make_call(serde_json::json!({ "query": "anything" }));
 
-        let result = executor.search_files(&ctx, &call).unwrap();
+        let result = executor.search_files(&ctx, &call)?;
         match result {
             ToolOutput::Error { message } => {
                 assert!(message.contains("ReadWorkspace"), "unexpected: {message}");
             }
-            other => panic!("expected error output, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected error output, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_fs_search_invalid_args_returns_err() {
-        let dir = TempDir::new().unwrap();
+    fn test_fs_search_invalid_args_returns_err() -> TestResult {
+        let dir = TempDir::new()?;
         let ws = dir.path().join("ws");
-        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&ws)?;
 
         let executor = FsSearchExecutor {
             max_matches: DEFAULT_MAX_MATCHES,
             max_depth: DEFAULT_MAX_DEPTH,
         };
-        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace]);
+        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace])?;
         let ctx = make_ctx(sandbox);
         // Missing "query"
         let call = make_call(serde_json::json!({ "path": "." }));
@@ -439,45 +463,55 @@ mod tests {
             matches!(result, Err(ToolsError::InvalidArguments { .. })),
             "expected InvalidArguments, got: {result:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_fs_search_empty_result_when_no_match() {
-        let dir = TempDir::new().unwrap();
+    fn test_fs_search_empty_result_when_no_match() -> TestResult {
+        let dir = TempDir::new()?;
         let ws = dir.path().join("ws");
-        fs::create_dir_all(&ws).unwrap();
-        fs::write(ws.join("plain.txt"), "no match here at all\n").unwrap();
+        fs::create_dir_all(&ws)?;
+        fs::write(ws.join("plain.txt"), "no match here at all\n")?;
 
         let executor = FsSearchExecutor {
             max_matches: DEFAULT_MAX_MATCHES,
             max_depth: DEFAULT_MAX_DEPTH,
         };
-        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace]);
+        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace])?;
         let ctx = make_ctx(sandbox);
         let call = make_call(serde_json::json!({ "query": "xyzzy_not_present" }));
 
-        let result = executor.search_files(&ctx, &call).unwrap();
+        let result = executor.search_files(&ctx, &call)?;
         match result {
             ToolOutput::Json { content } => {
-                let arr = content["matches"].as_array().expect("should be array");
+                let arr = content["matches"]
+                    .as_array()
+                    .ok_or(TestError::Missing("matches should be array"))?;
                 assert!(arr.is_empty(), "expected no matches");
                 assert!(content.get("stopped").is_none());
             }
-            other => panic!("expected json output, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected json output, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
-    fn first_path(content: &serde_json::Value) -> &str {
-        content["matches"][0]["path"].as_str().expect("path")
+    fn first_path(content: &serde_json::Value) -> TestResult<&str> {
+        content["matches"][0]["path"]
+            .as_str()
+            .ok_or(TestError::Missing("path"))
     }
 
     fn search(
         fixture: &Fixture,
         executor: &FsSearchExecutor,
         args: serde_json::Value,
-    ) -> ToolOutput {
-        let ctx = fixture.ctx(vec![Permission::ReadWorkspace]);
-        executor.search_files(&ctx, &call("fs.search", args)).unwrap()
+    ) -> TestResult<ToolOutput> {
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
+        Ok(executor.search_files(&ctx, &call("fs.search", args))?)
     }
 
     const DEFAULT_EXECUTOR: FsSearchExecutor = FsSearchExecutor {
@@ -486,41 +520,65 @@ mod tests {
     };
 
     #[test]
-    fn test_fs_search_does_not_follow_symlinks_out_of_workspace() {
-        let fixture = Fixture::new();
-        fixture.plant_escapes();
-        fs::write(fixture.ws.join("nested/own.txt"), "TOPSECRET-lookalike").unwrap();
+    fn test_fs_search_does_not_follow_symlinks_out_of_workspace() -> TestResult {
+        let fixture = Fixture::new()?;
+        fixture.plant_escapes()?;
+        fs::write(fixture.ws.join("nested/own.txt"), "TOPSECRET-lookalike")?;
 
         // Vorher: `link_dir` wurde betreten und `outside/secret.txt` gelesen.
-        let output = search(&fixture, &DEFAULT_EXECUTOR, serde_json::json!({ "query": SECRET }));
+        let output = search(
+            &fixture,
+            &DEFAULT_EXECUTOR,
+            serde_json::json!({ "query": SECRET }),
+        )?;
         let ToolOutput::Json { content } = &output else {
-            panic!("expected json output, got: {output:?}");
+            return Err(TestError::Unexpected(format!(
+                "expected json output, got: {output:?}"
+            )));
         };
         let paths: Vec<&str> = content["matches"]
             .as_array()
-            .unwrap()
+            .ok_or(TestError::Missing("matches should be array"))?
             .iter()
-            .map(|m| m["path"].as_str().unwrap())
-            .collect();
-        assert_eq!(paths, vec!["nested/own.txt"], "Symlink-Ziele dürfen nicht gelesen werden");
-        assert!(content.get("stopped").is_none(), "Schleifen müssen terminieren: {content}");
+            .map(|m| m["path"].as_str().ok_or(TestError::Missing("path")))
+            .collect::<TestResult<Vec<&str>>>()?;
+        assert_eq!(
+            paths,
+            vec!["nested/own.txt"],
+            "Symlink-Ziele dürfen nicht gelesen werden"
+        );
+        assert!(
+            content.get("stopped").is_none(),
+            "Schleifen müssen terminieren: {content}"
+        );
 
-        for path in ["link_dir", "link_file", "loop", "nested/up", "link_dir/deep", "../outside"] {
+        for path in [
+            "link_dir",
+            "link_file",
+            "loop",
+            "nested/up",
+            "link_dir/deep",
+            "../outside",
+        ] {
             let output = search(
                 &fixture,
                 &DEFAULT_EXECUTOR,
                 serde_json::json!({ "query": "", "path": path }),
+            )?;
+            assert!(
+                matches!(output, ToolOutput::Error { .. }),
+                "{path}: {output:?}"
             );
-            assert!(matches!(output, ToolOutput::Error { .. }), "{path}: {output:?}");
-            assert!(!render(&output).contains(SECRET), "{path}");
+            assert!(!render(&output)?.contains(SECRET), "{path}");
         }
+        Ok(())
     }
 
     #[test]
-    fn test_fs_search_single_file_start_and_hard_result_limit() {
-        let fixture = Fixture::new();
+    fn test_fs_search_single_file_start_and_hard_result_limit() -> TestResult {
+        let fixture = Fixture::new()?;
         let lines: String = (0..1200).map(|i| format!("hit {i}\n")).collect();
-        fs::write(fixture.ws.join("many.txt"), lines).unwrap();
+        fs::write(fixture.ws.join("many.txt"), lines)?;
         let executor = FsSearchExecutor {
             max_matches: usize::MAX,
             max_depth: usize::MAX,
@@ -530,66 +588,105 @@ mod tests {
             &fixture,
             &executor,
             serde_json::json!({ "query": "hit", "path": "many.txt", "max_matches": 5000 }),
-        );
+        )?;
         let ToolOutput::Json { content } = output else {
-            panic!("expected json output");
+            return Err(TestError::Unexpected("expected json output".to_owned()));
         };
-        assert_eq!(content["matches"].as_array().unwrap().len(), HARD_MAX_RESULTS);
+        assert_eq!(
+            content["matches"]
+                .as_array()
+                .ok_or(TestError::Missing("matches should be array"))?
+                .len(),
+            HARD_MAX_RESULTS
+        );
         assert_eq!(content["stopped"], "result_limit");
+        Ok(())
     }
 
     #[test]
-    fn test_fs_search_output_limit_and_line_truncation() {
-        let fixture = Fixture::new();
+    fn test_fs_search_output_limit_and_line_truncation() -> TestResult {
+        let fixture = Fixture::new()?;
         let long_line = format!("needle {}\n", "x".repeat(10_000));
-        fs::write(fixture.ws.join("wide.txt"), long_line.repeat(200)).unwrap();
+        fs::write(fixture.ws.join("wide.txt"), long_line.repeat(200))?;
         let executor = FsSearchExecutor {
             max_matches: HARD_MAX_RESULTS,
             max_depth: DEFAULT_MAX_DEPTH,
         };
-        let output = search(&fixture, &executor, serde_json::json!({ "query": "needle" }));
+        let output = search(
+            &fixture,
+            &executor,
+            serde_json::json!({ "query": "needle" }),
+        )?;
         let ToolOutput::Json { content } = output else {
-            panic!("expected json output");
+            return Err(TestError::Unexpected("expected json output".to_owned()));
         };
         assert_eq!(content["stopped"], "output_limit");
-        let matches = content["matches"].as_array().unwrap();
+        let matches = content["matches"]
+            .as_array()
+            .ok_or(TestError::Missing("matches should be array"))?;
         assert!(!matches.is_empty());
         for m in matches {
-            assert!(m["text"].as_str().unwrap().len() <= crate::tree::MAX_LINE_BYTES + 3);
+            assert!(
+                m["text"].as_str().ok_or(TestError::Missing("text"))?.len()
+                    <= crate::tree::MAX_LINE_BYTES + 3
+            );
         }
-        assert!(serde_json::to_string(&content).unwrap().len() <= MAX_OUTPUT_BYTES + 1024);
+        assert!(serde_json::to_string(&content)?.len() <= MAX_OUTPUT_BYTES + 1024);
+        Ok(())
     }
 
     #[test]
-    fn test_fs_search_skips_oversized_files() {
-        let fixture = Fixture::new();
-        fs::write(fixture.ws.join("small.txt"), "needle\n").unwrap();
-        let mut big = fs::File::create(fixture.ws.join("big.log")).unwrap();
-        std::io::Write::write_all(&mut big, b"needle\n").unwrap();
-        big.set_len(MAX_SCAN_FILE_BYTES + 1).unwrap();
+    fn test_fs_search_skips_oversized_files() -> TestResult {
+        let fixture = Fixture::new()?;
+        fs::write(fixture.ws.join("small.txt"), "needle\n")?;
+        let mut big = fs::File::create(fixture.ws.join("big.log"))?;
+        std::io::Write::write_all(&mut big, b"needle\n")?;
+        big.set_len(MAX_SCAN_FILE_BYTES + 1)?;
 
-        let output = search(&fixture, &DEFAULT_EXECUTOR, serde_json::json!({ "query": "needle" }));
+        let output = search(
+            &fixture,
+            &DEFAULT_EXECUTOR,
+            serde_json::json!({ "query": "needle" }),
+        )?;
         let ToolOutput::Json { content } = output else {
-            panic!("expected json output");
+            return Err(TestError::Unexpected("expected json output".to_owned()));
         };
-        assert_eq!(content["matches"].as_array().unwrap().len(), 1);
-        assert_eq!(first_path(&content), "small.txt");
+        assert_eq!(
+            content["matches"]
+                .as_array()
+                .ok_or(TestError::Missing("matches should be array"))?
+                .len(),
+            1
+        );
+        assert_eq!(first_path(&content)?, "small.txt");
         assert_eq!(content["skipped_files"], 1);
+        Ok(())
     }
 
     #[test]
-    fn test_fs_search_skips_hard_excluded_dirs_only() {
-        let fixture = Fixture::new();
-        fs::create_dir_all(fixture.ws.join("target")).unwrap();
-        fs::create_dir_all(fixture.ws.join("node_modules/pkg")).unwrap();
-        fs::write(fixture.ws.join("target/out.txt"), "needle").unwrap();
-        fs::write(fixture.ws.join("node_modules/pkg/i.js"), "needle").unwrap();
-        fs::write(fixture.ws.join("src.txt"), "needle").unwrap();
-        let output = search(&fixture, &DEFAULT_EXECUTOR, serde_json::json!({ "query": "needle" }));
+    fn test_fs_search_skips_hard_excluded_dirs_only() -> TestResult {
+        let fixture = Fixture::new()?;
+        fs::create_dir_all(fixture.ws.join("target"))?;
+        fs::create_dir_all(fixture.ws.join("node_modules/pkg"))?;
+        fs::write(fixture.ws.join("target/out.txt"), "needle")?;
+        fs::write(fixture.ws.join("node_modules/pkg/i.js"), "needle")?;
+        fs::write(fixture.ws.join("src.txt"), "needle")?;
+        let output = search(
+            &fixture,
+            &DEFAULT_EXECUTOR,
+            serde_json::json!({ "query": "needle" }),
+        )?;
         let ToolOutput::Json { content } = output else {
-            panic!("expected json output");
+            return Err(TestError::Unexpected("expected json output".to_owned()));
         };
-        assert_eq!(content["matches"].as_array().unwrap().len(), 1);
-        assert_eq!(first_path(&content), "src.txt");
+        assert_eq!(
+            content["matches"]
+                .as_array()
+                .ok_or(TestError::Missing("matches should be array"))?
+                .len(),
+            1
+        );
+        assert_eq!(first_path(&content)?, "src.txt");
+        Ok(())
     }
 }

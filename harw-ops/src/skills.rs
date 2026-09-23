@@ -196,19 +196,20 @@ async fn skills(ctx: &OpContext, args: SkillsArgs) -> Result<OpOutput, OpError> 
 #[cfg(test)]
 mod tests {
     use super::{SkillsArgs, SkillsOperation};
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
+    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_operations::operation::{CommandVisibility, Surface};
     use harw_operations::{FromRawArgs, OpContext, OpError, Operation, context::ServiceMap};
-    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn test_context() -> (OpContext, std::path::PathBuf) {
+    fn test_context() -> TestResult<(OpContext, std::path::PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root =
             std::env::temp_dir().join(format!("harw-skills-test-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(root.join("ws")).expect("create test workspace");
+        std::fs::create_dir_all(root.join("ws")).map_err(ctx("create test workspace"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -217,55 +218,46 @@ mod tests {
                 root: std::path::PathBuf::from("ws"),
             }],
         )
-        .expect("build workspace registry");
+        .map_err(ctx("build workspace registry"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .expect("resolve workspace binding");
+            .map_err(ctx("resolve workspace binding"))?;
         let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
-        (
+        Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new()),
             root,
-        )
+        ))
     }
 
     #[test]
-    fn test_skills_args_from_raw_args_sets_action() {
-        let args = SkillsArgs::from_raw_args(&toks(&["list"]));
-        match args {
-            Ok(a) => {
-                assert_eq!(a.action.as_deref(), Some("list"));
-                assert!(a.target.is_none());
-            }
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
-        }
+    fn test_skills_args_from_raw_args_sets_action() -> TestResult {
+        let args = SkillsArgs::from_raw_args(&toks(&["list"]))
+            .map_err(ctx("SkillsArgs::from_raw_args"))?;
+        assert_eq!(args.action.as_deref(), Some("list"));
+        assert!(args.target.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_skills_args_from_raw_args_activate_preserves_target() {
-        let args = SkillsArgs::from_raw_args(&toks(&["activate", "my-skill"]));
-        match args {
-            Ok(a) => {
-                assert_eq!(a.action.as_deref(), Some("activate"));
-                assert_eq!(a.target.as_deref(), Some("my-skill"));
-                assert!(a.value.is_none());
-            }
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
-        }
+    fn test_skills_args_from_raw_args_activate_preserves_target() -> TestResult {
+        let args = SkillsArgs::from_raw_args(&toks(&["activate", "my-skill"]))
+            .map_err(ctx("SkillsArgs::from_raw_args"))?;
+        assert_eq!(args.action.as_deref(), Some("activate"));
+        assert_eq!(args.target.as_deref(), Some("my-skill"));
+        assert!(args.value.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_skills_args_from_raw_args_empty_tokens_sets_action_none() {
-        let args = SkillsArgs::from_raw_args(&toks(&[]));
-        match args {
-            Ok(a) => {
-                assert!(a.action.is_none());
-                assert!(a.target.is_none());
-            }
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
-        }
+    fn test_skills_args_from_raw_args_empty_tokens_sets_action_none() -> TestResult {
+        let args =
+            SkillsArgs::from_raw_args(&toks(&[])).map_err(ctx("SkillsArgs::from_raw_args"))?;
+        assert!(args.action.is_none());
+        assert!(args.target.is_none());
+        Ok(())
     }
 
     #[test]
@@ -289,8 +281,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skills_default_and_list_return_not_available() {
-        let (ctx, root) = test_context();
+    async fn skills_default_and_list_return_not_available() -> TestResult {
+        let (ctx, root) = test_context()?;
         let expected = "skill catalog integration is not available";
         assert!(matches!(
             super::skills(&ctx, SkillsArgs::default()).await,
@@ -300,16 +292,17 @@ mod tests {
             super::skills(&ctx, SkillsArgs { action: Some("list".to_owned()), target: None, value: None }).await,
             Err(OpError::NotAvailable(message)) if message == expected
         ));
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn skills_list_with_config_service_reports_configured_skills() {
+    async fn skills_list_with_config_service_reports_configured_skills() -> TestResult {
         use harw_config::SkillToml;
         use harw_operations::context::ServiceMap;
         use std::sync::Arc;
 
-        let (mut ctx, root) = test_context();
+        let (mut ctx, root) = test_context()?;
         let mut config = harw_config::ResolvedConfig::default();
         config.skills.insert(
             "review".to_owned(),
@@ -332,17 +325,23 @@ mod tests {
         );
 
         let result = super::skills(&ctx, SkillsArgs::default()).await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         match result {
             Ok(output) => assert!(output.text.contains("review")),
-            other => panic!("expected Ok listing, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Ok listing, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn skills_target_bearing_action_returns_not_available_without_input_leakage() {
-        let (ctx, root) = test_context();
+    async fn skills_target_bearing_action_returns_not_available_without_input_leakage() -> TestResult
+    {
+        let (ctx, root) = test_context()?;
         let action = "activate";
         let target = "secret-skill-target";
         let value = "secret-value";
@@ -355,7 +354,7 @@ mod tests {
             },
         )
         .await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         match result {
             Err(OpError::NotAvailable(message)) => {
@@ -364,7 +363,12 @@ mod tests {
                 assert!(!message.contains(target));
                 assert!(!message.contains(value));
             }
-            other => panic!("expected NotAvailable, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 }

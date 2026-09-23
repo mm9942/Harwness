@@ -117,6 +117,16 @@ pub enum WardenBinError {
     /// beendet sich deshalb mit einem Fehlschlag statt regulär.
     #[msg("die IPC-Annahmeschleife hat sich endgültig beendet; dieser Prozess kann keine weitere Anfrage mehr annehmen")]
     IpcAcceptLoopTerminated,
+
+    /// Das Unterkommando `completions` ist fehlgeschlagen (läuft vor jedem
+    /// systemd-, Landlock- oder Socket-Schritt).
+    ///
+    /// # Arguments
+    /// - `0` (`harw_completions::CompletionError`): die zugrunde liegende
+    ///   Ursache (Shell nicht erkennbar, fremde Zieldatei, I/O-Fehler).
+    #[msg("shell completions failed: {0}")]
+    #[from]
+    Completions(harw_completions::CompletionError),
 }
 
 /// Formatiert `WardenBinError` über seine [`std::fmt::Display`]-Meldung.

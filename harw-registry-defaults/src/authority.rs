@@ -66,8 +66,8 @@ use harw_authority::{Permission, PermissionSet};
 
 use crate::profile::{
     AGENT_DEFINITION_LIST_TOOLS, AGENT_DEFINITION_READ_TOOLS, AGENT_DEFINITION_WRITE_TOOLS,
-    BROWSER_TOOLS, DEPS_SOURCE_TOOLS, DEPS_WORKSPACE_TOOLS, FS_READ_ONLY_TOOLS, LENS_TOOLS,
-    SHELL_TOOLS, WEB_TOOLS, role_names,
+    BROWSER_TOOLS, DEPS_SOURCE_TOOLS, DEPS_WORKSPACE_TOOLS, DOC_TOOLS, FS_READ_ONLY_TOOLS,
+    LENS_TOOLS, SHELL_TOOLS, WEB_TOOLS, role_names,
 };
 
 /// Kennung des Reducers „nur Workspace lesen“.
@@ -334,6 +334,8 @@ pub fn authority_reducer_for_role(role: &str) -> Option<AuthorityReducer> {
 /// - `fs.read/list/search/glob/grep` → `ReadWorkspace`
 ///   (`harw-tool-fs/src/{read.rs:97,list.rs:107,search.rs:191,glob.rs:114,grep.rs:256}`),
 ///   `fs.write` → `WriteWorkspace` (`write.rs:115`).
+/// - `doc.read_pdf` → `ReadWorkspace` (`harw-tool-doc/src/tool.rs`, dieselbe
+///   Berechtigung wie `fs.read`: Datei muss innerhalb des Workspace liegen).
 /// - `shell.exec` → `ExecuteProcess` (`harw-tool-shell/src/exec.rs:574`).
 /// - `deps.graph`, `deps.locked` → `ReadWorkspace`, `deps.source_*` →
 ///   `ReadCargoRegistry` (`harw-tool-deps/src/{graph_tool.rs:195,
@@ -374,6 +376,7 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
     } else if listed(SHELL_TOOLS) {
         Some(Permission::ExecuteProcess)
     } else if listed(FS_READ_ONLY_TOOLS)
+        || listed(DOC_TOOLS)
         || listed(DEPS_WORKSPACE_TOOLS)
         || listed(LENS_TOOLS)
         || listed(AGENT_DEFINITION_READ_TOOLS)
@@ -515,7 +518,8 @@ mod tests {
     }
 
     #[test]
-    fn test_authority_reducer_for_role_covers_every_role_and_bounds_its_profile() {
+    fn test_authority_reducer_for_role_covers_every_role_and_bounds_its_profile()
+    -> crate::test_support::TestResult {
         // `memory-steward` (WriteWorkspace), `executor` (ExecuteProcess),
         // `uia-worker` (ExecuteProcess + NetworkAccess, Addendum I),
         // `agent-steward` (WriteWorkspace, Addendum K), `uia-explorer`
@@ -537,10 +541,16 @@ mod tests {
             role_names::UIA_SHELL_WORKER,
         ];
         for role in role_names::ALL {
-            let reducer = authority_reducer_for_role(role)
-                .unwrap_or_else(|| panic!("eingebaute Rolle {role} ohne Reducer"));
-            let profile = crate::profile::profile_for_role(role)
-                .unwrap_or_else(|| panic!("eingebaute Rolle {role} ohne Profil"));
+            let reducer = authority_reducer_for_role(role).ok_or(
+                crate::test_support::TestError::Unexpected(format!(
+                    "eingebaute Rolle {role} ohne Reducer"
+                )),
+            )?;
+            let profile = crate::profile::profile_for_role(role).ok_or(
+                crate::test_support::TestError::Unexpected(format!(
+                    "eingebaute Rolle {role} ohne Profil"
+                )),
+            )?;
             if exempt_from_subset_bound.contains(role) {
                 continue;
             }
@@ -584,5 +594,6 @@ mod tests {
             authority_reducer_for_role(role_names::UIA_SHELL_WORKER),
             Some(AuthorityReducer::ReadOnly)
         );
+        Ok(())
     }
 }

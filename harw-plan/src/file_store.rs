@@ -49,8 +49,8 @@ use crate::actions::{PlanAction, PlanEvent};
 use crate::config::PlanToolConfig;
 use crate::error::{PlanError, PlanResult};
 use crate::ids::{PlanId, RevisionId};
-use crate::store::{PlanRevision, PlanStore, check_batch_target, stage_actions};
 use crate::mutation::apply_mutation;
+use crate::store::{PlanRevision, PlanStore, check_batch_target, stage_actions};
 use crate::types::{Plan, PlanNodeStatus};
 
 /// Höchstens neun History-Ereignisse müssen nach einem Checkpoint nachgespielt werden.
@@ -516,8 +516,7 @@ impl FilePlanStore {
                 continue;
             }
             let dir_name = entry.file_name();
-            let Some(plan_id) = dir_name.to_str().and_then(|name| PlanId::parse(name).ok())
-            else {
+            let Some(plan_id) = dir_name.to_str().and_then(|name| PlanId::parse(name).ok()) else {
                 warn!(
                     dir = %entry.path().display(),
                     "Plan-Verzeichnis mit ungültigem Namen wird ignoriert"
@@ -727,15 +726,18 @@ impl FilePlanStore {
         let is_checkpoint_interval = candidate.revision.value() % CHECKPOINT_INTERVAL == 0;
         candidate.revision.value() == 1
             || is_checkpoint_interval
-            || events.iter().any(|event| matches!(
-                &event.action,
-                PlanAction::SetStatus {
-                    status: PlanNodeStatus::Completed
-                        | PlanNodeStatus::Superseded
-                        | PlanNodeStatus::Invalidated,
-                    ..
-                } | PlanAction::Invalidate { .. } | PlanAction::Supersede { .. }
-            ))
+            || events.iter().any(|event| {
+                matches!(
+                    &event.action,
+                    PlanAction::SetStatus {
+                        status: PlanNodeStatus::Completed
+                            | PlanNodeStatus::Superseded
+                            | PlanNodeStatus::Invalidated,
+                        ..
+                    } | PlanAction::Invalidate { .. }
+                        | PlanAction::Supersede { .. }
+                )
+            })
     }
 
     /// Entfernt nach einem erfolgreich veröffentlichten Checkpoint alle älteren
@@ -752,8 +754,13 @@ impl FilePlanStore {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            let revision = name.strip_prefix("rev-")
-                .and_then(|value| value.strip_suffix(".json").or_else(|| value.strip_suffix(".seal")))
+            let revision = name
+                .strip_prefix("rev-")
+                .and_then(|value| {
+                    value
+                        .strip_suffix(".json")
+                        .or_else(|| value.strip_suffix(".seal"))
+                })
                 .and_then(|value| value.parse::<u64>().ok());
             if revision.is_some_and(|revision| revision != keep.value()) {
                 std::fs::remove_file(entry.path())?;
@@ -797,7 +804,6 @@ impl FilePlanStore {
         Self::compact_checkpoints(root, &candidate.id, candidate.revision)?;
         Ok(Some(link))
     }
-
 }
 
 impl PlanStore for FilePlanStore {
@@ -992,12 +998,13 @@ mod tests {
     use crate::config::{PlanToolConfig, PlanToolConfigError};
     use crate::ids::{PathOrSymbol, PlanId, TaskId};
     use crate::store::PlanStore;
+    use crate::test_support::{TestError, TestResult};
     use crate::types::{PlanNode, PlanNodeKind, PlanNodeStatus};
     use tempfile::TempDir;
     use time::OffsetDateTime;
 
-    fn make_store(dir: &TempDir) -> FilePlanStore {
-        FilePlanStore::new(dir.path()).unwrap()
+    fn make_store(dir: &TempDir) -> TestResult<FilePlanStore> {
+        Ok(FilePlanStore::new(dir.path())?)
     }
 
     fn config_with_max_nodes(max_nodes: usize) -> PlanToolConfig {
@@ -1031,29 +1038,25 @@ mod tests {
     }
 
     #[test]
-    fn test_persist_and_reload_roundtrip() {
-        let dir = TempDir::new().unwrap();
-        let store = make_store(&dir);
+    fn test_persist_and_reload_roundtrip() -> TestResult {
+        let dir = TempDir::new()?;
+        let store = make_store(&dir)?;
 
-        store
-            .apply(
-                PlanAction::Create {
-                    plan_id: PlanId::new("p-1"),
-                    goal: "Persistenz-Ziel".to_owned(),
-                },
-                "orchestrator",
-            )
-            .unwrap();
-        store
-            .apply(
-                PlanAction::AddNode {
-                    node: make_node("t1"),
-                },
-                "a",
-            )
-            .unwrap();
+        store.apply(
+            PlanAction::Create {
+                plan_id: PlanId::new("p-1"),
+                goal: "Persistenz-Ziel".to_owned(),
+            },
+            "orchestrator",
+        )?;
+        store.apply(
+            PlanAction::AddNode {
+                node: make_node("t1"),
+            },
+            "a",
+        )?;
 
-        let plan = store.current().unwrap();
+        let plan = store.current()?;
         assert_eq!(plan.nodes.len(), 1);
         assert_eq!(plan.goal_statement, "Persistenz-Ziel");
 
@@ -1061,134 +1064,125 @@ mod tests {
         // beim Neustart aus history.jsonl rekonstruiert.
         let checkpoint = dir.path().join("plans").join("p-1").join("rev-1.json");
         assert!(checkpoint.exists(), "initialer Checkpoint fehlt");
-        assert!(!dir.path().join("plans").join("p-1").join("rev-2.json").exists());
+        assert!(
+            !dir.path()
+                .join("plans")
+                .join("p-1")
+                .join("rev-2.json")
+                .exists()
+        );
         drop(store);
-        let reloaded = make_store(&dir);
-        assert_eq!(reloaded.current().unwrap().id, plan.id);
-        assert_eq!(reloaded.current().unwrap().nodes.len(), 1);
+        let reloaded = make_store(&dir)?;
+        assert_eq!(reloaded.current()?.id, plan.id);
+        assert_eq!(reloaded.current()?.nodes.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_history_append_only() {
-        let dir = TempDir::new().unwrap();
-        let store = make_store(&dir);
+    fn test_history_append_only() -> TestResult {
+        let dir = TempDir::new()?;
+        let store = make_store(&dir)?;
 
-        store
-            .apply(
-                PlanAction::Create {
-                    plan_id: PlanId::new("p-2"),
-                    goal: "History".to_owned(),
-                },
-                "o",
-            )
-            .unwrap();
-        store
-            .apply(
-                PlanAction::AddNode {
-                    node: make_node("t1"),
-                },
-                "a",
-            )
-            .unwrap();
-        store
-            .apply(
-                PlanAction::SetStatus {
-                    id: TaskId::new("t1"),
-                    status: PlanNodeStatus::Ready,
-                    reason: None,
-                },
-                "a",
-            )
-            .unwrap();
+        store.apply(
+            PlanAction::Create {
+                plan_id: PlanId::new("p-2"),
+                goal: "History".to_owned(),
+            },
+            "o",
+        )?;
+        store.apply(
+            PlanAction::AddNode {
+                node: make_node("t1"),
+            },
+            "a",
+        )?;
+        store.apply(
+            PlanAction::SetStatus {
+                id: TaskId::new("t1"),
+                status: PlanNodeStatus::Ready,
+                reason: None,
+            },
+            "a",
+        )?;
 
-        let hist = store.history(None).unwrap();
+        let hist = store.history(None)?;
         assert!(hist.len() >= 3, "History muss mindestens 3 Einträge haben");
 
         // History-Datei muss existieren und Zeilen enthalten
         let hist_path = dir.path().join("plans").join("p-2").join("history.jsonl");
         assert!(hist_path.exists(), "history.jsonl fehlt");
-        let content = std::fs::read_to_string(&hist_path).unwrap();
+        let content = std::fs::read_to_string(&hist_path)?;
         let line_count = content.lines().filter(|l| !l.trim().is_empty()).count();
         assert!(
             line_count >= 3,
             "history.jsonl hat zu wenig Zeilen: {}",
             line_count
         );
+        Ok(())
     }
 
     #[test]
-    fn test_staged_write_via_tmp_rename() {
-        let dir = TempDir::new().unwrap();
+    fn test_staged_write_via_tmp_rename() -> TestResult {
+        let dir = TempDir::new()?;
         let target = dir.path().join("test.json");
 
-        FilePlanStore::stage_atomic_write(&target, b"{\"ok\":true}")
-            .unwrap()
-            .commit()
-            .unwrap();
+        FilePlanStore::stage_atomic_write(&target, b"{\"ok\":true}")?.commit()?;
         assert!(target.exists(), "Zieldatei fehlt nach staged write");
 
         // Keine staging-Datei darf nach dem Commit zurückbleiben.
-        let leftovers = std::fs::read_dir(dir.path())
-            .unwrap()
+        let leftovers = std::fs::read_dir(dir.path())?
             .filter_map(Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
             .count();
         assert_eq!(leftovers, 0, "Tmp-Datei wurde nicht entfernt");
 
         // Inhalt korrekt
-        let content = std::fs::read(&target).unwrap();
+        let content = std::fs::read(&target)?;
         assert_eq!(content, b"{\"ok\":true}");
+        Ok(())
     }
 
     #[test]
-    fn test_restart_loads_plan_history_and_next_revision() {
-        let dir = TempDir::new().unwrap();
+    fn test_restart_loads_plan_history_and_next_revision() -> TestResult {
+        let dir = TempDir::new()?;
         {
-            let store = make_store(&dir);
-            store
-                .apply(
-                    PlanAction::Create {
-                        plan_id: PlanId::new("restart"),
-                        goal: "restart-safe".to_owned(),
-                    },
-                    "orchestrator",
-                )
-                .unwrap();
-            store
-                .apply(
-                    PlanAction::AddNode {
-                        node: make_node("t1"),
-                    },
-                    "worker",
-                )
-                .unwrap();
-        }
-
-        let reloaded = make_store(&dir);
-        assert_eq!(reloaded.current().unwrap().nodes.len(), 1);
-        assert_eq!(reloaded.history(None).unwrap().len(), 2);
-        assert_eq!(
-            reloaded
-                .apply(PlanAction::Inspect, "worker")
-                .unwrap()
-                .revision,
-            RevisionId::new(3)
-        );
-    }
-
-    #[test]
-    fn test_second_create_is_rejected_with_plan_exists() {
-        let dir = TempDir::new().unwrap();
-        let store = make_store(&dir);
-        store
-            .apply(
+            let store = make_store(&dir)?;
+            store.apply(
                 PlanAction::Create {
-                    plan_id: PlanId::new("p-erst"),
-                    goal: "erster Plan".to_owned(),
+                    plan_id: PlanId::new("restart"),
+                    goal: "restart-safe".to_owned(),
                 },
                 "orchestrator",
-            )
-            .unwrap();
+            )?;
+            store.apply(
+                PlanAction::AddNode {
+                    node: make_node("t1"),
+                },
+                "worker",
+            )?;
+        }
+
+        let reloaded = make_store(&dir)?;
+        assert_eq!(reloaded.current()?.nodes.len(), 1);
+        assert_eq!(reloaded.history(None)?.len(), 2);
+        assert_eq!(
+            reloaded.apply(PlanAction::Inspect, "worker")?.revision,
+            RevisionId::new(3)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_second_create_is_rejected_with_plan_exists() -> TestResult {
+        let dir = TempDir::new()?;
+        let store = make_store(&dir)?;
+        store.apply(
+            PlanAction::Create {
+                plan_id: PlanId::new("p-erst"),
+                goal: "erster Plan".to_owned(),
+            },
+            "orchestrator",
+        )?;
 
         let result = store.apply(
             PlanAction::Create {
@@ -1202,32 +1196,31 @@ mod tests {
             matches!(&result, Err(PlanError::PlanExists { id }) if id == &PlanId::new("p-erst")),
             "ein zweites Create muss fail-closed abgelehnt werden, Ergebnis: {result:?}"
         );
-        assert_eq!(store.current().unwrap().id, PlanId::new("p-erst"));
+        assert_eq!(store.current()?.id, PlanId::new("p-erst"));
         assert!(
             !dir.path().join("plans").join("p-zweit").exists(),
             "das abgelehnte Create darf kein Plan-Verzeichnis anlegen"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_create_after_reload_is_rejected_with_plan_exists() {
-        let dir = TempDir::new().unwrap();
+    fn test_create_after_reload_is_rejected_with_plan_exists() -> TestResult {
+        let dir = TempDir::new()?;
         {
-            let store = make_store(&dir);
-            store
-                .apply(
-                    PlanAction::Create {
-                        plan_id: PlanId::new("p-durable"),
-                        goal: "überlebt den Neustart".to_owned(),
-                    },
-                    "orchestrator",
-                )
-                .unwrap();
+            let store = make_store(&dir)?;
+            store.apply(
+                PlanAction::Create {
+                    plan_id: PlanId::new("p-durable"),
+                    goal: "überlebt den Neustart".to_owned(),
+                },
+                "orchestrator",
+            )?;
         }
 
         // Nach dem Neustart ist der Plan geladen — ein Create würde ihn sonst
         // still überschreiben.
-        let reloaded = make_store(&dir);
+        let reloaded = make_store(&dir)?;
         let result = reloaded.apply(
             PlanAction::Create {
                 plan_id: PlanId::new("p-durable"),
@@ -1240,24 +1233,26 @@ mod tests {
             matches!(&result, Err(PlanError::PlanExists { id }) if id == &PlanId::new("p-durable")),
             "Create nach Reload muss abgelehnt werden, Ergebnis: {result:?}"
         );
-        assert_eq!(
-            reloaded.current().unwrap().goal_statement,
-            "überlebt den Neustart"
-        );
-        assert_eq!(reloaded.history(None).unwrap().len(), 1);
+        assert_eq!(reloaded.current()?.goal_statement, "überlebt den Neustart");
+        assert_eq!(reloaded.history(None)?.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_failed_history_write_does_not_commit_memory_or_revision_file() {
-        let dir = TempDir::new().unwrap();
+    fn test_failed_history_write_does_not_commit_memory_or_revision_file() -> TestResult {
+        let dir = TempDir::new()?;
         let history_path = dir
             .path()
             .join("plans")
             .join("p-rollback")
             .join("history.jsonl");
-        std::fs::create_dir_all(history_path.parent().unwrap()).unwrap();
-        std::fs::create_dir(&history_path).unwrap();
-        let store = make_store(&dir);
+        std::fs::create_dir_all(
+            history_path
+                .parent()
+                .ok_or(TestError::Missing("history_path hat Elternverzeichnis"))?,
+        )?;
+        std::fs::create_dir(&history_path)?;
+        let store = make_store(&dir)?;
 
         let result = store.apply(
             PlanAction::Create {
@@ -1276,29 +1271,28 @@ mod tests {
                 .join("rev-1.json")
                 .exists()
         );
+        Ok(())
     }
 
     #[test]
-    fn test_failed_history_append_does_not_publish_update_snapshot() {
-        let dir = TempDir::new().unwrap();
-        let store = make_store(&dir);
-        store
-            .apply(
-                PlanAction::Create {
-                    plan_id: PlanId::new("update-rollback"),
-                    goal: "must keep revision one".to_owned(),
-                },
-                "orchestrator",
-            )
-            .unwrap();
+    fn test_failed_history_append_does_not_publish_update_snapshot() -> TestResult {
+        let dir = TempDir::new()?;
+        let store = make_store(&dir)?;
+        store.apply(
+            PlanAction::Create {
+                plan_id: PlanId::new("update-rollback"),
+                goal: "must keep revision one".to_owned(),
+            },
+            "orchestrator",
+        )?;
 
         let history_path = dir
             .path()
             .join("plans")
             .join("update-rollback")
             .join("history.jsonl");
-        std::fs::remove_file(&history_path).unwrap();
-        std::fs::create_dir(&history_path).unwrap();
+        std::fs::remove_file(&history_path)?;
+        std::fs::create_dir(&history_path)?;
 
         let result = store.apply(
             PlanAction::AddNode {
@@ -1309,7 +1303,7 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(store.revision(), RevisionId::new(1));
-        assert!(store.current().unwrap().nodes.is_empty());
+        assert!(store.current()?.nodes.is_empty());
         assert!(
             !dir.path()
                 .join("plans")
@@ -1318,11 +1312,12 @@ mod tests {
                 .exists(),
             "ein fehlgeschlagener History-Append darf keinen Update-Snapshot veröffentlichen"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_with_config_rejects_disabled_tool_before_creating_store_root() {
-        let dir = TempDir::new().unwrap();
+    fn test_with_config_rejects_disabled_tool_before_creating_store_root() -> TestResult {
+        let dir = TempDir::new()?;
         let root = dir.path().join("disabled-store");
 
         let result = FilePlanStore::with_config(&root, PlanToolConfig::default());
@@ -1338,29 +1333,26 @@ mod tests {
             !root.exists(),
             "deaktivierte Konfiguration darf kein Wurzelverzeichnis anlegen"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_configured_store_rejects_node_limit_before_durable_write() {
-        let dir = TempDir::new().unwrap();
-        let store = FilePlanStore::with_config(dir.path(), config_with_max_nodes(1)).unwrap();
-        store
-            .apply(
-                PlanAction::Create {
-                    plan_id: PlanId::new("node-limit"),
-                    goal: "enforce node limit".to_owned(),
-                },
-                "orchestrator",
-            )
-            .unwrap();
-        store
-            .apply(
-                PlanAction::AddNode {
-                    node: make_node("t1"),
-                },
-                "worker",
-            )
-            .unwrap();
+    fn test_configured_store_rejects_node_limit_before_durable_write() -> TestResult {
+        let dir = TempDir::new()?;
+        let store = FilePlanStore::with_config(dir.path(), config_with_max_nodes(1))?;
+        store.apply(
+            PlanAction::Create {
+                plan_id: PlanId::new("node-limit"),
+                goal: "enforce node limit".to_owned(),
+            },
+            "orchestrator",
+        )?;
+        store.apply(
+            PlanAction::AddNode {
+                node: make_node("t1"),
+            },
+            "worker",
+        )?;
 
         let result = store.apply(
             PlanAction::AddNode {
@@ -1379,7 +1371,7 @@ mod tests {
             ),
             "Knotenlimit muss AddNode mit einem typisierten Konfigurationsfehler ablehnen"
         );
-        assert_eq!(store.current().unwrap().nodes.len(), 1);
+        assert_eq!(store.current()?.nodes.len(), 1);
         assert_eq!(store.revision(), RevisionId::new(2));
         assert!(
             !dir.path()
@@ -1389,16 +1381,17 @@ mod tests {
                 .exists(),
             "abgelehnte Aktion darf keinen Snapshot schreiben"
         );
-        assert_eq!(store.history(None).unwrap().len(), 2);
+        assert_eq!(store.history(None)?.len(), 2);
+        Ok(())
     }
 
     // ── Pfad-Traversal (F-013, G-032) ──────────────────────────────────────
 
     #[test]
-    fn test_create_with_traversal_id_writes_nothing_outside_store() {
-        let dir = TempDir::new().unwrap();
+    fn test_create_with_traversal_id_writes_nothing_outside_store() -> TestResult {
+        let dir = TempDir::new()?;
         let root = dir.path().join("store");
-        let store = FilePlanStore::new(&root).unwrap();
+        let store = FilePlanStore::new(&root)?;
 
         for raw in ["../escape", "../../etc", "a/b", "/abs", ".."] {
             let result = store.apply(
@@ -1409,71 +1402,76 @@ mod tests {
                 "model:x",
             );
             assert!(
-                matches!(result, Err(PlanError::InvalidId { field: "PlanId", .. })),
+                matches!(
+                    result,
+                    Err(PlanError::InvalidId {
+                        field: "PlanId",
+                        ..
+                    })
+                ),
                 "{raw:?} war: {result:?}"
             );
         }
         assert!(!dir.path().join("escape").exists(), "kein Write außerhalb");
         assert!(matches!(store.current(), Err(PlanError::PlanNotFound)));
-        let entries = std::fs::read_dir(dir.path()).unwrap().count();
+        let entries = std::fs::read_dir(dir.path())?.count();
         assert_eq!(entries, 1, "nur das Store-Verzeichnis existiert");
+        Ok(())
     }
 
     #[test]
-    fn test_load_ignores_directories_with_invalid_plan_id() {
-        let dir = TempDir::new().unwrap();
+    fn test_load_ignores_directories_with_invalid_plan_id() -> TestResult {
+        let dir = TempDir::new()?;
         let bogus = dir.path().join("plans").join("Bad_Name");
-        std::fs::create_dir_all(&bogus).unwrap();
-        std::fs::write(bogus.join("rev-9.json"), b"{}").unwrap();
+        std::fs::create_dir_all(&bogus)?;
+        std::fs::write(bogus.join("rev-9.json"), b"{}")?;
 
-        let store = make_store(&dir);
+        let store = make_store(&dir)?;
 
         assert!(matches!(store.current(), Err(PlanError::PlanNotFound)));
+        Ok(())
     }
 
     // ── Siegel (Integrität beim Laden) ─────────────────────────────────────
 
-    fn seeded_store(dir: &TempDir, id: &str) -> FilePlanStore {
-        let store = make_store(dir);
-        store
-            .apply(
-                PlanAction::Create {
-                    plan_id: PlanId::new(id),
-                    goal: "Siegel".to_owned(),
-                },
-                "o",
-            )
-            .unwrap();
-        store
-            .apply(
-                PlanAction::AddNode {
-                    node: make_node("t1"),
-                },
-                "a",
-            )
-            .unwrap();
-        store
+    fn seeded_store(dir: &TempDir, id: &str) -> TestResult<FilePlanStore> {
+        let store = make_store(dir)?;
+        store.apply(
+            PlanAction::Create {
+                plan_id: PlanId::new(id),
+                goal: "Siegel".to_owned(),
+            },
+            "o",
+        )?;
+        store.apply(
+            PlanAction::AddNode {
+                node: make_node("t1"),
+            },
+            "a",
+        )?;
+        Ok(store)
     }
 
     #[test]
-    fn test_seal_is_written_and_reload_verifies() {
-        let dir = TempDir::new().unwrap();
-        drop(seeded_store(&dir, "p-seal"));
+    fn test_seal_is_written_and_reload_verifies() -> TestResult {
+        let dir = TempDir::new()?;
+        drop(seeded_store(&dir, "p-seal")?);
         let plan_dir = dir.path().join("plans").join("p-seal");
         assert!(plan_dir.join("rev-1.seal").exists());
         assert!(!plan_dir.join("rev-2.seal").exists());
 
-        let reloaded = make_store(&dir);
-        assert_eq!(reloaded.current().unwrap().nodes.len(), 1);
+        let reloaded = make_store(&dir)?;
+        assert_eq!(reloaded.current()?.nodes.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_manipulated_snapshot_is_rejected_on_load() {
-        let dir = TempDir::new().unwrap();
-        drop(seeded_store(&dir, "p-tamper"));
+    fn test_manipulated_snapshot_is_rejected_on_load() -> TestResult {
+        let dir = TempDir::new()?;
+        drop(seeded_store(&dir, "p-tamper")?);
         let snapshot = dir.path().join("plans").join("p-tamper").join("rev-1.json");
         // Die Bytes ändern, ohne das passende Siegel neu zu berechnen.
-        std::fs::write(&snapshot, b"{\"tampered\":true}").unwrap();
+        std::fs::write(&snapshot, b"{\"tampered\":true}")?;
 
         let result = FilePlanStore::new(dir.path());
 
@@ -1481,24 +1479,32 @@ mod tests {
             matches!(result, Err(PlanError::SealMismatch { .. })),
             "manipulierter Snapshot muss abgewiesen werden"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_manipulated_checkpoint_seal_is_rejected_on_load() {
-        let dir = TempDir::new().unwrap();
-        drop(seeded_store(&dir, "p-seal-tamper"));
-        let seal_path = dir.path().join("plans").join("p-seal-tamper").join("rev-1.seal");
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&seal_path).unwrap()).unwrap();
+    fn test_manipulated_checkpoint_seal_is_rejected_on_load() -> TestResult {
+        let dir = TempDir::new()?;
+        drop(seeded_store(&dir, "p-seal-tamper")?);
+        let seal_path = dir
+            .path()
+            .join("plans")
+            .join("p-seal-tamper")
+            .join("rev-1.seal");
+        let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&seal_path)?)?;
         value["chain"] = serde_json::json!("00");
-        std::fs::write(&seal_path, serde_json::to_vec(&value).unwrap()).unwrap();
-        assert!(matches!(FilePlanStore::new(dir.path()), Err(PlanError::SealMismatch { .. })));
+        std::fs::write(&seal_path, serde_json::to_vec(&value)?)?;
+        assert!(matches!(
+            FilePlanStore::new(dir.path()),
+            Err(PlanError::SealMismatch { .. })
+        ));
+        Ok(())
     }
 
     #[test]
-    fn test_checkpoint_without_seal_loads_as_legacy() {
-        let dir = TempDir::new().unwrap();
-        drop(seeded_store(&dir, "p-legacy-seal"));
+    fn test_checkpoint_without_seal_loads_as_legacy() -> TestResult {
+        let dir = TempDir::new()?;
+        drop(seeded_store(&dir, "p-legacy-seal")?);
         // A single retained checkpoint has no predecessor seal that could mark
         // the directory as sealed. This intentionally remains compatible with
         // pre-seal stores; the next checkpoint writes a fresh seal.
@@ -1507,108 +1513,120 @@ mod tests {
                 .join("plans")
                 .join("p-legacy-seal")
                 .join("rev-1.seal"),
-        )
-        .unwrap();
+        )?;
         assert!(FilePlanStore::new(dir.path()).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_legacy_unsealed_plan_loads_and_is_sealed_on_next_write() {
-        let dir = TempDir::new().unwrap();
-        drop(seeded_store(&dir, "p-legacy"));
+    fn test_legacy_unsealed_plan_loads_and_is_sealed_on_next_write() -> TestResult {
+        let dir = TempDir::new()?;
+        drop(seeded_store(&dir, "p-legacy")?);
         let plan_dir = dir.path().join("plans").join("p-legacy");
-        std::fs::remove_file(plan_dir.join("rev-1.seal")).unwrap();
+        std::fs::remove_file(plan_dir.join("rev-1.seal"))?;
 
-        let legacy = make_store(&dir);
-        assert_eq!(legacy.current().unwrap().nodes.len(), 1, "Legacy lädt");
-        legacy
-            .apply(
-                PlanAction::AddNode {
-                    node: make_node("t2"),
-                },
-                "a",
-            )
-            .unwrap();
+        let legacy = make_store(&dir)?;
+        assert_eq!(legacy.current()?.nodes.len(), 1, "Legacy lädt");
+        legacy.apply(
+            PlanAction::AddNode {
+                node: make_node("t2"),
+            },
+            "a",
+        )?;
         // Checkpoints are periodic; the next checkpoint re-establishes sealing.
         for index in 3..=10 {
-            legacy.apply(PlanAction::Inspect, "a").unwrap();
+            legacy.apply(PlanAction::Inspect, "a")?;
             if index == 10 {
-                assert!(plan_dir.join("rev-10.seal").exists(), "Checkpoint versiegelt");
+                assert!(
+                    plan_dir.join("rev-10.seal").exists(),
+                    "Checkpoint versiegelt"
+                );
             }
         }
 
-        let reloaded = make_store(&dir);
-        assert_eq!(reloaded.current().unwrap().nodes.len(), 2);
+        let reloaded = make_store(&dir)?;
+        assert_eq!(reloaded.current()?.nodes.len(), 2);
+        Ok(())
     }
 
     #[test]
-    fn test_checkpoint_compacts_snapshots_and_replays_history() {
-        let dir = TempDir::new().unwrap();
-        let store = make_store(&dir);
-        store.apply(PlanAction::Create { plan_id: PlanId::new("compact"), goal: "checkpoint".to_owned() }, "o").unwrap();
+    fn test_checkpoint_compacts_snapshots_and_replays_history() -> TestResult {
+        let dir = TempDir::new()?;
+        let store = make_store(&dir)?;
+        store.apply(
+            PlanAction::Create {
+                plan_id: PlanId::new("compact"),
+                goal: "checkpoint".to_owned(),
+            },
+            "o",
+        )?;
         for _ in 2..=10 {
-            store.apply(PlanAction::Inspect, "o").unwrap();
+            store.apply(PlanAction::Inspect, "o")?;
         }
         let plan_dir = dir.path().join("plans").join("compact");
         assert!(plan_dir.join("rev-10.json").exists());
         assert!(plan_dir.join("rev-10.seal").exists());
-        assert!(!plan_dir.join("rev-1.json").exists(), "alter Checkpoint wird kompakt entfernt");
-        store.apply(PlanAction::Inspect, "o").unwrap();
+        assert!(
+            !plan_dir.join("rev-1.json").exists(),
+            "alter Checkpoint wird kompakt entfernt"
+        );
+        store.apply(PlanAction::Inspect, "o")?;
         drop(store);
-        let reloaded = make_store(&dir);
+        let reloaded = make_store(&dir)?;
         assert_eq!(reloaded.revision(), RevisionId::new(11));
-        assert_eq!(reloaded.history(None).unwrap().len(), 11);
+        assert_eq!(reloaded.history(None)?.len(), 11);
+        Ok(())
     }
 
     // ── apply_batch (persistent) ───────────────────────────────────────────
 
-    fn history_lines(dir: &TempDir, id: &str) -> usize {
-        std::fs::read_to_string(dir.path().join("plans").join(id).join("history.jsonl"))
-            .unwrap()
+    fn history_lines(dir: &TempDir, id: &str) -> TestResult<usize> {
+        let content =
+            std::fs::read_to_string(dir.path().join("plans").join(id).join("history.jsonl"))?;
+        Ok(content
             .lines()
             .filter(|line| !line.trim().is_empty())
-            .count()
+            .count())
     }
 
     #[test]
-    fn test_apply_batch_persists_one_snapshot_and_all_events() {
-        let dir = TempDir::new().unwrap();
-        let store = seeded_store(&dir, "p-batch");
+    fn test_apply_batch_persists_one_snapshot_and_all_events() -> TestResult {
+        let dir = TempDir::new()?;
+        let store = seeded_store(&dir, "p-batch")?;
 
-        let result = store
-            .apply_batch(
-                &PlanId::new("p-batch"),
-                vec![
-                    PlanAction::AddNode {
-                        node: make_node("t2"),
-                    },
-                    PlanAction::AddDependency {
-                        child: TaskId::new("t2"),
-                        parent: TaskId::new("t1"),
-                    },
-                ],
-                "controller",
-                RevisionId::new(2),
-            )
-            .unwrap();
+        let result = store.apply_batch(
+            &PlanId::new("p-batch"),
+            vec![
+                PlanAction::AddNode {
+                    node: make_node("t2"),
+                },
+                PlanAction::AddDependency {
+                    child: TaskId::new("t2"),
+                    parent: TaskId::new("t1"),
+                },
+            ],
+            "controller",
+            RevisionId::new(2),
+        )?;
 
         assert_eq!(result.revision, RevisionId::new(4));
-        assert_eq!(history_lines(&dir, "p-batch"), 4);
+        assert_eq!(history_lines(&dir, "p-batch")?, 4);
         let plan_dir = dir.path().join("plans").join("p-batch");
         assert!(!plan_dir.join("rev-4.json").exists());
         assert!(plan_dir.join("rev-1.json").exists());
 
-        let reloaded = make_store(&dir);
-        let plan = reloaded.current().unwrap();
+        let reloaded = make_store(&dir)?;
+        let plan = reloaded.current()?;
         assert_eq!(plan.revision, RevisionId::new(4));
         assert_eq!(plan.nodes.len(), 2);
-        assert_eq!(reloaded.history(None).unwrap().len(), 4);
+        assert_eq!(reloaded.history(None)?.len(), 4);
+        Ok(())
     }
 
     #[test]
-    fn test_apply_batch_failure_in_third_action_writes_nothing() {
-        let dir = TempDir::new().unwrap();
-        let store = seeded_store(&dir, "p-atomic");
+    fn test_apply_batch_failure_in_third_action_writes_nothing() -> TestResult {
+        let dir = TempDir::new()?;
+        let store = seeded_store(&dir, "p-atomic")?;
 
         let result = store.apply_batch(
             &PlanId::new("p-atomic"),
@@ -1639,18 +1657,22 @@ mod tests {
             "war: {result:?}"
         );
         assert_eq!(store.revision(), RevisionId::new(2));
-        assert_eq!(store.current().unwrap().nodes.len(), 1);
-        assert_eq!(history_lines(&dir, "p-atomic"), 2);
+        assert_eq!(store.current()?.nodes.len(), 1);
+        assert_eq!(history_lines(&dir, "p-atomic")?, 2);
         let plan_dir = dir.path().join("plans").join("p-atomic");
         for name in ["rev-3.json", "rev-4.json", "rev-5.json", "rev-5.seal"] {
-            assert!(!plan_dir.join(name).exists(), "{name} darf nicht existieren");
+            assert!(
+                !plan_dir.join(name).exists(),
+                "{name} darf nicht existieren"
+            );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_apply_batch_revision_conflict_writes_nothing() {
-        let dir = TempDir::new().unwrap();
-        let store = seeded_store(&dir, "p-conflict");
+    fn test_apply_batch_revision_conflict_writes_nothing() -> TestResult {
+        let dir = TempDir::new()?;
+        let store = seeded_store(&dir, "p-conflict")?;
 
         let result = store.apply_batch(
             &PlanId::new("p-conflict"),
@@ -1659,10 +1681,8 @@ mod tests {
             RevisionId::new(1),
         );
 
-        assert!(matches!(
-            result,
-            Err(PlanError::RevisionConflict { .. })
-        ));
-        assert_eq!(history_lines(&dir, "p-conflict"), 2);
+        assert!(matches!(result, Err(PlanError::RevisionConflict { .. })));
+        assert_eq!(history_lines(&dir, "p-conflict")?, 2);
+        Ok(())
     }
 }

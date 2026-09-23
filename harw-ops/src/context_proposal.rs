@@ -49,12 +49,12 @@
 
 use std::sync::Arc;
 
+use harw_knowledge::KnowledgeStore;
 use harw_knowledge::artifact::{ArtifactId, ArtifactKind, KnowledgeArtifact, RecallQuery};
 use harw_knowledge::context_proposal::ContextProposal;
 use harw_knowledge::index::KnowledgeIndex;
 use harw_knowledge::memory::recall::{ListAllRanker, search_with};
 use harw_knowledge::visibility::VisibilityScope;
-use harw_knowledge::KnowledgeStore;
 use harw_macros::operation;
 use harw_operations::{OpContext, OpError, OpOutput};
 
@@ -101,10 +101,7 @@ impl harw_operations::FromRawArgs for ContextProposalArgs {
     permission = "operator",
     command(path = "/context-proposal", visibility = "channel_parity")
 )]
-async fn context_proposal(
-    ctx: &OpContext,
-    args: ContextProposalArgs,
-) -> Result<OpOutput, OpError> {
+async fn context_proposal(ctx: &OpContext, args: ContextProposalArgs) -> Result<OpOutput, OpError> {
     let store = ctx
         .service::<Arc<KnowledgeStore>>()
         .cloned()
@@ -135,8 +132,9 @@ fn proposals_query() -> RecallQuery {
 /// über `ListAllRanker` (nicht `KeywordRanker` — die Anfrage hat bewusst
 /// leeren Text, siehe `ListAllRanker`s Moduldoku in `harw-knowledge`).
 fn list_visible_artifacts(store: &KnowledgeStore) -> Result<Vec<KnowledgeArtifact>, OpError> {
-    let index = KnowledgeIndex::rebuild(store)
-        .map_err(|error| OpError::Execution(format!("Knowledge-Index-Aufbau fehlgeschlagen: {error}")))?;
+    let index = KnowledgeIndex::rebuild(store).map_err(|error| {
+        OpError::Execution(format!("Knowledge-Index-Aufbau fehlgeschlagen: {error}"))
+    })?;
     let query = proposals_query();
     let result = search_with(&index, &query, &ListAllRanker)
         .map_err(|error| OpError::Execution(format!("Recall fehlgeschlagen: {error}")))?;
@@ -157,7 +155,10 @@ fn list_visible_artifacts(store: &KnowledgeStore) -> Result<Vec<KnowledgeArtifac
 /// [`OpError::InvalidArguments`], wenn keine Id übergeben wurde oder kein
 /// sichtbares Artefakt mit dieser Id existiert (nicht unterscheidbar von
 /// „existiert, aber nicht sichtbar" — fail-closed, kein Informationsleck).
-fn find_visible_artifact(store: &KnowledgeStore, tail: &[String]) -> Result<KnowledgeArtifact, OpError> {
+fn find_visible_artifact(
+    store: &KnowledgeStore,
+    tail: &[String],
+) -> Result<KnowledgeArtifact, OpError> {
     let id = tail.first().ok_or_else(|| {
         OpError::InvalidArguments("/context-proposal <view|accept|reject> <id>".to_owned())
     })?;
@@ -184,10 +185,15 @@ fn proposal_slug(id: &ArtifactId) -> ArtifactId {
 fn render_list(store: &KnowledgeStore) -> Result<OpOutput, OpError> {
     let artifacts = list_visible_artifacts(store)?;
     if artifacts.is_empty() {
-        return Ok(OpOutput::from("Keine Kontextprogramm-Vorschläge.".to_owned()));
+        return Ok(OpOutput::from(
+            "Keine Kontextprogramm-Vorschläge.".to_owned(),
+        ));
     }
 
-    let mut buf = format!("{} Kontextprogramm-Vorschlag/Vorschläge:\n", artifacts.len());
+    let mut buf = format!(
+        "{} Kontextprogramm-Vorschlag/Vorschläge:\n",
+        artifacts.len()
+    );
     for artifact in &artifacts {
         let status = ContextProposal::from_artifact(artifact)
             .map(|proposal| format!("{:?}", proposal.status))
@@ -199,8 +205,9 @@ fn render_list(store: &KnowledgeStore) -> Result<OpOutput, OpError> {
 
 fn render_view(store: &KnowledgeStore, tail: &[String]) -> Result<OpOutput, OpError> {
     let artifact = find_visible_artifact(store, tail)?;
-    let proposal = ContextProposal::from_artifact(&artifact)
-        .map_err(|error| OpError::Execution(format!("Vorschlag konnte nicht gelesen werden: {error}")))?;
+    let proposal = ContextProposal::from_artifact(&artifact).map_err(|error| {
+        OpError::Execution(format!("Vorschlag konnte nicht gelesen werden: {error}"))
+    })?;
     Ok(OpOutput::from(render_proposal(&proposal)))
 }
 
@@ -237,8 +244,9 @@ fn render_proposal(proposal: &ContextProposal) -> String {
 /// an keiner Stelle ein Kontextprogramm gelesen oder geschrieben.
 fn decide(store: &KnowledgeStore, tail: &[String], accept: bool) -> Result<OpOutput, OpError> {
     let mut artifact = find_visible_artifact(store, tail)?;
-    let mut proposal = ContextProposal::from_artifact(&artifact)
-        .map_err(|error| OpError::Execution(format!("Vorschlag konnte nicht gelesen werden: {error}")))?;
+    let mut proposal = ContextProposal::from_artifact(&artifact).map_err(|error| {
+        OpError::Execution(format!("Vorschlag konnte nicht gelesen werden: {error}"))
+    })?;
 
     let transition = if accept {
         proposal.accept()
@@ -255,7 +263,11 @@ fn decide(store: &KnowledgeStore, tail: &[String], accept: bool) -> Result<OpOut
 
     let updated_artifact = proposal
         .to_artifact(artifact.frontmatter)
-        .map_err(|error| OpError::Execution(format!("Vorschlag konnte nicht serialisiert werden: {error}")))?;
+        .map_err(|error| {
+            OpError::Execution(format!(
+                "Vorschlag konnte nicht serialisiert werden: {error}"
+            ))
+        })?;
     let slug = proposal_slug(&updated_artifact.id);
     store
         .write_artifact(&store.context_proposal_path(&slug), &updated_artifact)
@@ -273,29 +285,35 @@ mod tests {
         ContextProposalArgs, decide, find_visible_artifact, list_visible_artifacts, render_list,
         render_view,
     };
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
-    use harw_knowledge::context_proposal::{ContextProposal, ProposalStatus, RECOMMENDED_VISIBILITY};
+    use harw_knowledge::context_proposal::{
+        ContextProposal, ProposalStatus, RECOMMENDED_VISIBILITY,
+    };
     use harw_knowledge::{AgentId, ArtifactId, Frontmatter, KnowledgeStore};
     use harw_operations::operation::{CommandVisibility, Surface};
     use harw_operations::{FromRawArgs, Operation};
 
     use harw_agent_dsl::ids::DefinitionId;
 
-    fn temporary_store(label: &str) -> KnowledgeStore {
+    fn temporary_store(label: &str) -> TestResult<KnowledgeStore> {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock is after epoch")
+            .map_err(ctx("system clock is after epoch"))?
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("harw-ops-context-proposal-{label}-{}-{nonce}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("create temporary knowledge root");
-        KnowledgeStore::new(&root)
+        let root = std::env::temp_dir().join(format!(
+            "harw-ops-context-proposal-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).map_err(ctx("create temporary knowledge root"))?;
+        Ok(KnowledgeStore::new(&root))
     }
 
-    fn write_sample_proposal(store: &KnowledgeStore, slug: &str) -> ArtifactId {
+    fn write_sample_proposal(store: &KnowledgeStore, slug: &str) -> TestResult<ArtifactId> {
         let proposal = ContextProposal::new(
             ArtifactId::new(format!("context-proposal/{slug}")),
             "Testvorschlag",
-            DefinitionId::parse("harwness.context.base@1").expect("valid definition id"),
+            DefinitionId::parse("harwness.context.base@1").map_err(ctx("valid definition id"))?,
             "deadbeef".repeat(8),
             Vec::new(),
             Vec::new(),
@@ -309,27 +327,31 @@ mod tests {
         );
         let artifact = proposal
             .to_artifact(frontmatter)
-            .expect("proposal embeds into an artifact");
+            .map_err(ctx("proposal embeds into an artifact"))?;
         store
-            .write_artifact(&store.context_proposal_path(&ArtifactId::new(slug)), &artifact)
-            .expect("write sample proposal");
-        ArtifactId::new(format!("context-proposal/{slug}"))
+            .write_artifact(
+                &store.context_proposal_path(&ArtifactId::new(slug)),
+                &artifact,
+            )
+            .map_err(ctx("write sample proposal"))?;
+        Ok(ArtifactId::new(format!("context-proposal/{slug}")))
     }
 
     #[test]
-    fn from_raw_args_no_tokens_uses_default_sub() {
-        let args = ContextProposalArgs::from_raw_args(&toks(&[])).expect("parses");
+    fn from_raw_args_no_tokens_uses_default_sub() -> TestResult {
+        let args = ContextProposalArgs::from_raw_args(&toks(&[])).map_err(ctx("parses"))?;
         assert!(args.sub.is_none());
         assert!(args.tail.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn from_raw_args_captures_sub_and_tail() {
-        let args =
-            ContextProposalArgs::from_raw_args(&toks(&["view", "context-proposal/example"]))
-                .expect("parses");
+    fn from_raw_args_captures_sub_and_tail() -> TestResult {
+        let args = ContextProposalArgs::from_raw_args(&toks(&["view", "context-proposal/example"]))
+            .map_err(ctx("parses"))?;
         assert_eq!(args.sub.as_deref(), Some("view"));
         assert_eq!(args.tail, vec!["context-proposal/example".to_owned()]);
+        Ok(())
     }
 
     #[test]
@@ -354,36 +376,46 @@ mod tests {
     }
 
     #[test]
-    fn list_is_empty_for_a_fresh_store() {
-        let store = temporary_store("empty-list");
-        let output = render_list(&store).expect("list succeeds on an empty store");
+    fn list_is_empty_for_a_fresh_store() -> TestResult {
+        let store = temporary_store("empty-list")?;
+        let output = render_list(&store).map_err(ctx("list succeeds on an empty store"))?;
         assert_eq!(output.text, "Keine Kontextprogramm-Vorschläge.");
         std::fs::remove_dir_all(store.root()).ok();
+        Ok(())
     }
 
     #[test]
-    fn list_and_view_find_a_written_proposal() {
-        let store = temporary_store("list-view");
-        let id = write_sample_proposal(&store, "example");
+    fn list_and_view_find_a_written_proposal() -> TestResult {
+        let store = temporary_store("list-view")?;
+        let id = write_sample_proposal(&store, "example")?;
 
-        let listed = list_visible_artifacts(&store).expect("list succeeds");
+        let listed = list_visible_artifacts(&store).map_err(ctx("list succeeds"))?;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, id);
 
-        let view = render_view(&store, &[id.to_string()]).expect("view succeeds");
+        let view = render_view(&store, &[id.to_string()]).map_err(ctx("view succeeds"))?;
         assert!(view.text.contains("Testvorschlag"));
         assert!(view.text.contains("Pending"));
 
         std::fs::remove_dir_all(store.root()).ok();
+        Ok(())
     }
 
     #[test]
-    fn view_with_an_unknown_id_is_invalid_arguments() {
-        let store = temporary_store("view-unknown");
-        let error = find_visible_artifact(&store, &["context-proposal/nope".to_owned()])
-            .expect_err("an unknown id must be rejected");
-        assert!(matches!(error, harw_operations::OpError::InvalidArguments(_)));
+    fn view_with_an_unknown_id_is_invalid_arguments() -> TestResult {
+        let store = temporary_store("view-unknown")?;
+        let result = find_visible_artifact(&store, &["context-proposal/nope".to_owned()]);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "an unknown id must be rejected".to_owned(),
+            ));
+        };
+        assert!(matches!(
+            error,
+            harw_operations::OpError::InvalidArguments(_)
+        ));
         std::fs::remove_dir_all(store.root()).ok();
+        Ok(())
     }
 
     /// Die Prüffläche: `accept` markiert den Vorschlag, ändert aber
@@ -391,14 +423,14 @@ mod tests {
     /// nicht nur über den Typ: außer der einen Vorschlag-Datei entsteht,
     /// verschwindet oder ändert sich keine einzige Datei im Store.
     #[test]
-    fn accept_marks_the_proposal_and_touches_no_other_file() {
-        let store = temporary_store("accept-marks-only");
-        let id = write_sample_proposal(&store, "example");
+    fn accept_marks_the_proposal_and_touches_no_other_file() -> TestResult {
+        let store = temporary_store("accept-marks-only")?;
+        let id = write_sample_proposal(&store, "example")?;
 
         let before: std::collections::BTreeSet<std::path::PathBuf> = walk_files(store.root());
         assert_eq!(before.len(), 1, "genau eine Datei vor dem Entscheid");
 
-        let output = decide(&store, &[id.to_string()], true).expect("accept succeeds");
+        let output = decide(&store, &[id.to_string()], true).map_err(ctx("accept succeeds"))?;
         assert!(output.text.contains("Accepted"));
         assert!(output.text.contains("Kein Kontextprogramm wurde geändert"));
 
@@ -409,40 +441,48 @@ mod tests {
         );
 
         let artifact = find_visible_artifact(&store, &[id.to_string()])
-            .expect("the accepted proposal is still visible and findable");
-        let proposal =
-            ContextProposal::from_artifact(&artifact).expect("accepted proposal still parses");
+            .map_err(ctx("the accepted proposal is still visible and findable"))?;
+        let proposal = ContextProposal::from_artifact(&artifact)
+            .map_err(ctx("accepted proposal still parses"))?;
         assert_eq!(proposal.status, ProposalStatus::Accepted);
 
         std::fs::remove_dir_all(store.root()).ok();
+        Ok(())
     }
 
     #[test]
-    fn reject_marks_the_proposal() {
-        let store = temporary_store("reject-marks");
-        let id = write_sample_proposal(&store, "example");
+    fn reject_marks_the_proposal() -> TestResult {
+        let store = temporary_store("reject-marks")?;
+        let id = write_sample_proposal(&store, "example")?;
 
-        decide(&store, &[id.to_string()], false).expect("reject succeeds");
+        decide(&store, &[id.to_string()], false).map_err(ctx("reject succeeds"))?;
 
-        let artifact =
-            find_visible_artifact(&store, &[id.to_string()]).expect("proposal still visible");
-        let proposal = ContextProposal::from_artifact(&artifact).expect("proposal still parses");
+        let artifact = find_visible_artifact(&store, &[id.to_string()])
+            .map_err(ctx("proposal still visible"))?;
+        let proposal =
+            ContextProposal::from_artifact(&artifact).map_err(ctx("proposal still parses"))?;
         assert_eq!(proposal.status, ProposalStatus::Rejected);
 
         std::fs::remove_dir_all(store.root()).ok();
+        Ok(())
     }
 
     #[test]
-    fn deciding_twice_is_an_execution_error() {
-        let store = temporary_store("decide-twice");
-        let id = write_sample_proposal(&store, "example");
+    fn deciding_twice_is_an_execution_error() -> TestResult {
+        let store = temporary_store("decide-twice")?;
+        let id = write_sample_proposal(&store, "example")?;
 
-        decide(&store, &[id.to_string()], true).expect("first decision succeeds");
-        let error = decide(&store, &[id.to_string()], false)
-            .expect_err("a second decision on the same proposal must fail");
+        decide(&store, &[id.to_string()], true).map_err(ctx("first decision succeeds"))?;
+        let result = decide(&store, &[id.to_string()], false);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "a second decision on the same proposal must fail".to_owned(),
+            ));
+        };
         assert!(matches!(error, harw_operations::OpError::Execution(_)));
 
         std::fs::remove_dir_all(store.root()).ok();
+        Ok(())
     }
 
     fn walk_files(root: &std::path::Path) -> std::collections::BTreeSet<std::path::PathBuf> {

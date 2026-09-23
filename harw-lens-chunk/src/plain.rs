@@ -201,6 +201,7 @@ fn align_boundary(text: &str, start: usize, raw_end: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     fn file_source() -> SourceRef {
         SourceRef::File {
@@ -208,7 +209,7 @@ mod tests {
         }
     }
 
-    fn assert_gapless_with_overlap(text: &str, chunks: &[Chunk]) {
+    fn assert_gapless_with_overlap(text: &str, chunks: &[Chunk]) -> TestResult {
         assert!(!chunks.is_empty(), "expected at least one chunk");
         assert_eq!(chunks[0].span.start, 0);
         for pair in chunks.windows(2) {
@@ -221,11 +222,14 @@ mod tests {
                 "windows must make forward progress"
             );
         }
-        let last = chunks.last().expect("checked non-empty above");
+        let last = chunks
+            .last()
+            .ok_or(TestError::Missing("checked non-empty above"))?;
         assert_eq!(last.span.end, text.len());
         for chunk in chunks {
             assert_eq!(&text[chunk.span.start..chunk.span.end], chunk.text);
         }
+        Ok(())
     }
 
     #[test]
@@ -264,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_plain_never_splits_multibyte_characters() {
+    fn test_chunk_plain_never_splits_multibyte_characters() -> TestResult {
         // Contains umlauts (2-byte) and an emoji (4-byte).
         let text = "Müller sagt Grüße 😀 über die Straße nach München und züruck 🎉 mit Freunden";
         for target in [5usize, 10, 17, 30] {
@@ -273,32 +277,36 @@ mod tests {
                 assert!(text.is_char_boundary(chunk.span.start));
                 assert!(text.is_char_boundary(chunk.span.end));
             }
-            assert_gapless_with_overlap(text, &chunks);
+            assert_gapless_with_overlap(text, &chunks)?;
         }
+        Ok(())
     }
 
     #[test]
-    fn test_chunk_plain_zero_target_bytes_is_clamped_and_terminates() {
+    fn test_chunk_plain_zero_target_bytes_is_clamped_and_terminates() -> TestResult {
         let text = "ab cd ef";
         let chunks = chunk_plain(&file_source(), text, 0, 0);
         assert!(!chunks.is_empty());
-        assert_gapless_with_overlap(text, &chunks);
+        assert_gapless_with_overlap(text, &chunks)?;
+        Ok(())
     }
 
     #[test]
-    fn test_chunk_plain_overlap_greater_than_target_is_clamped() {
+    fn test_chunk_plain_overlap_greater_than_target_is_clamped() -> TestResult {
         let text = "ab cd ef gh ij kl mn op";
         // overlap_bytes far exceeds target_bytes; must still terminate and progress.
         let chunks = chunk_plain(&file_source(), text, 4, 1000);
         assert!(!chunks.is_empty());
-        assert_gapless_with_overlap(text, &chunks);
+        assert_gapless_with_overlap(text, &chunks)?;
+        Ok(())
     }
 
     #[test]
-    fn test_chunk_plain_byte_spans_cover_text_with_overlap() {
+    fn test_chunk_plain_byte_spans_cover_text_with_overlap() -> TestResult {
         let text = "Absatz eins mit mehreren Wörtern.\n\nAbsatz zwei mit weiteren Wörtern.\n\nAbsatz drei.";
         let chunks = chunk_plain(&file_source(), text, 30, 10);
-        assert_gapless_with_overlap(text, &chunks);
+        assert_gapless_with_overlap(text, &chunks)?;
+        Ok(())
     }
 
     #[test]

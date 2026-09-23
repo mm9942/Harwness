@@ -110,15 +110,16 @@ pub(crate) fn frame_channel() -> (FrameRequester, tokio::sync::mpsc::UnboundedRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     /// Prüft, dass `schedule_frame` ein Signal sofort über `try_recv` lesbar macht.
     #[test]
-    fn test_schedule_frame_liefert_signal() {
+    fn test_schedule_frame_liefert_signal() -> TestResult {
         // Tokio-Runtime wird für `frame_channel` (unbounded_channel) nicht
         // benötigt — nur für `tokio::spawn`. Der Kanal selbst ist sync-nutzbar.
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
-            .expect("Runtime");
+            .map_err(ctx("Runtime"))?;
         let _guard = rt.enter();
 
         let (requester, mut rx) = frame_channel();
@@ -129,14 +130,15 @@ mod tests {
             Ok(()),
             "schedule_frame() muss sofort ein () auf den Kanal senden"
         );
+        Ok(())
     }
 
     /// Prüft, dass ohne Aufruf kein Signal im Kanal liegt.
     #[test]
-    fn test_kein_signal_ohne_schedule() {
+    fn test_kein_signal_ohne_schedule() -> TestResult {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
-            .expect("Runtime");
+            .map_err(ctx("Runtime"))?;
         let _guard = rt.enter();
 
         let (_requester, mut rx) = frame_channel();
@@ -145,14 +147,15 @@ mod tests {
             rx.try_recv().is_err(),
             "Ohne schedule_frame() darf kein Signal im Kanal sein"
         );
+        Ok(())
     }
 
     /// Prüft, dass mehrere Klone desselben Requesters auf denselben Kanal senden.
     #[test]
-    fn test_klone_teilen_kanal() {
+    fn test_klone_teilen_kanal() -> TestResult {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
-            .expect("Runtime");
+            .map_err(ctx("Runtime"))?;
         let _guard = rt.enter();
 
         let (requester, mut rx) = frame_channel();
@@ -168,5 +171,6 @@ mod tests {
             "Beide Klone müssen je ein Signal senden"
         );
         assert!(rx.try_recv().is_err(), "Kein drittes Signal erwartet");
+        Ok(())
     }
 }

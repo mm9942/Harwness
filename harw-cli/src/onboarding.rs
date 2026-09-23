@@ -222,6 +222,7 @@ Weiteres das Hauptmodell; änderbar mit `harw models internal`."
         max_concurrency: None,
         originator: None,
         default_reasoning_effort: None,
+        gateway_identity_headers: false,
     };
     let providers_dir = profile.join("providers");
     create_dir_all(&providers_dir)?;
@@ -354,6 +355,7 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
         max_concurrency: None,
         originator: None,
         default_reasoning_effort: None,
+        gateway_identity_headers: false,
     };
     let providers_dir = profile.join("providers");
     create_dir_all(&providers_dir)?;
@@ -388,7 +390,10 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
     // damit sie im `/model`-Picker erscheinen. Eine bereits vorhandene Datei
     // (z. B. durch `harw models scan` angereichert) wird nicht überschrieben —
     // "Never delete anything" gilt auch für schon vorhandene Anreicherungen.
-    for extra_id in models_list.iter().filter(|id| id.as_str() != model_id.as_str()) {
+    for extra_id in models_list
+        .iter()
+        .filter(|id| id.as_str() != model_id.as_str())
+    {
         let extra_path = models_dir.join(model_filename(extra_id));
         if extra_path.exists() {
             continue;
@@ -720,9 +725,10 @@ fn write_file(path: &PathBuf, content: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[tokio::test]
-    async fn persisted_foundry_setup_sends_correct_wire_request_after_reload() {
+    async fn persisted_foundry_setup_sends_correct_wire_request_after_reload() -> TestResult {
         use std::io::{Read, Write};
         for (api, header, base, path, response) in [
             (
@@ -754,17 +760,21 @@ mod tests {
                 r#"{"content":[{"type":"text","text":"OK"}]}"#,
             ),
         ] {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let endpoint = format!("http://{}{base}", listener.local_addr().unwrap());
-            let server = std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").map_err(ctx("bind listener"))?;
+            let endpoint = format!(
+                "http://{}{base}",
+                listener.local_addr().map_err(ctx("listener local_addr"))?
+            );
+            let server = std::thread::spawn(move || -> TestResult {
+                let (mut stream, _) = listener.accept().map_err(ctx("accept connection"))?;
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                    .unwrap();
+                    .map_err(ctx("set_read_timeout"))?;
                 let mut bytes = Vec::new();
                 let mut buffer = [0; 4096];
                 let (end, length) = loop {
-                    let n = stream.read(&mut buffer).unwrap();
+                    let n = stream.read(&mut buffer).map_err(ctx("stream read"))?;
                     assert!(n > 0);
                     bytes.extend_from_slice(&buffer[..n]);
                     if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
@@ -772,9 +782,9 @@ mod tests {
                         let length: usize = headers
                             .lines()
                             .find_map(|l| l.strip_prefix("content-length: "))
-                            .unwrap()
+                            .ok_or(TestError::Missing("content-length header"))?
                             .parse()
-                            .unwrap();
+                            .map_err(ctx("parse content-length"))?;
                         assert!(headers.starts_with(&format!("post {path} http/1.1")));
                         if header == "bearer" {
                             assert!(headers.contains("authorization: bearer test-resource-key"));
@@ -787,17 +797,24 @@ mod tests {
                     }
                 };
                 while bytes.len() < end + length {
-                    let n = stream.read(&mut buffer).unwrap();
+                    let n = stream.read(&mut buffer).map_err(ctx("stream read"))?;
                     assert!(n > 0);
                     bytes.extend_from_slice(&buffer[..n]);
                 }
-                let body: serde_json::Value =
-                    serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes[end..end + length])
+                    .map_err(ctx("parse body json"))?;
                 assert_eq!(body["model"], "production-deployment");
-                write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", response.len(), response).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                )
+                .map_err(ctx("write response"))?;
+                Ok(())
             });
-            let home = tempfile::tempdir().unwrap();
-            harw_home::ensure_home(home.path()).unwrap();
+            let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+            harw_home::ensure_home(home.path()).map_err(ctx("ensure_home"))?;
             let outcome = harw_tui::SetupOutcome {
                 provider_id: "foundry".into(),
                 base_url: endpoint,
@@ -806,11 +823,11 @@ mod tests {
                 secret_ref: Some("test-resource-key".into()),
                 auth_header: Some(header.into()),
             };
-            persist_outcome(home.path(), &outcome).unwrap();
-            let layers = harw_home::config_layers(home.path()).unwrap();
-            let config = harw_config::discover_config(&layers).unwrap();
-            let provider =
-                harw_provider_http::build_provider_with_home(&config, home.path(), None).unwrap();
+            persist_outcome(home.path(), &outcome).map_err(ctx("persist_outcome"))?;
+            let layers = harw_home::config_layers(home.path()).map_err(ctx("config_layers"))?;
+            let config = harw_config::discover_config(&layers).map_err(ctx("discover_config"))?;
+            let provider = harw_provider_http::build_provider_with_home(&config, home.path(), None)
+                .map_err(ctx("build_provider_with_home"))?;
             let result = provider
                 .respond(harw_core::ModelRequest {
                     system_prompt: String::new(),
@@ -828,18 +845,22 @@ mod tests {
                     max_output_tokens: None,
                     tool_result_max_bytes: None,
                     cancel: None,
+                    identity: None,
                 })
                 .await
-                .unwrap();
+                .map_err(ctx("provider respond"))?;
             assert_eq!(result.message.as_deref(), Some("OK"));
-            server.join().unwrap();
+            server
+                .join()
+                .map_err(|_| TestError::Unexpected("server thread panicked".into()))??;
         }
+        Ok(())
     }
 
     #[test]
-    fn setup_with_namespaced_model_survives_reload_and_repeat() {
-        let home = tempfile::tempdir().unwrap();
-        harw_home::ensure_home(home.path()).unwrap();
+    fn setup_with_namespaced_model_survives_reload_and_repeat() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        harw_home::ensure_home(home.path()).map_err(ctx("ensure_home"))?;
         let outcome = harw_tui::SetupOutcome {
             provider_id: "cloudflare".into(),
             base_url: "https://example.test/v1".into(),
@@ -848,11 +869,11 @@ mod tests {
             secret_ref: Some("env:CLOUDFLARE_API_TOKEN".into()),
             auth_header: None,
         };
-        persist_outcome(home.path(), &outcome).unwrap();
-        persist_outcome(home.path(), &outcome).unwrap();
-        let layers = harw_home::config_layers(home.path()).unwrap();
-        let config = harw_config::discover_config(&layers).unwrap();
-        config.validate().unwrap();
+        persist_outcome(home.path(), &outcome).map_err(ctx("persist_outcome"))?;
+        persist_outcome(home.path(), &outcome).map_err(ctx("persist_outcome (repeat)"))?;
+        let layers = harw_home::config_layers(home.path()).map_err(ctx("config_layers"))?;
+        let config = harw_config::discover_config(&layers).map_err(ctx("discover_config"))?;
+        config.validate().map_err(ctx("config validate"))?;
         assert!(config.harness.onboarding.seen.is_complete());
         assert_eq!(
             config.harness.default_model.as_deref(),
@@ -872,17 +893,20 @@ mod tests {
             .unwrap_or_default();
         want_models.sort();
         assert_eq!(got_models, want_models);
-        assert!(config.providers["cloudflare"]
-            .models
-            .contains(&outcome.model));
-        let auth = load_auth(&harw_home::auth_path(home.path())).unwrap();
+        assert!(
+            config.providers["cloudflare"]
+                .models
+                .contains(&outcome.model)
+        );
+        let auth = load_auth(&harw_home::auth_path(home.path())).map_err(ctx("load_auth"))?;
         assert_eq!(auth.credential_pool["cloudflare"].len(), 1);
         assert_ne!(model_filename("a/b"), model_filename("a%2Fb"));
         assert!(!model_filename("../../escape").contains('/'));
+        Ok(())
     }
 
     #[test]
-    fn test_run_wizard_noninteractive_writes_provider_model_and_config() {
+    fn test_run_wizard_noninteractive_writes_provider_model_and_config() -> TestResult {
         // Test-Isolation: eindeutiger Temp-Pfad über process::id().
         let home = std::env::temp_dir().join(format!(
             "harw-onboarding-test-{}-{}",
@@ -892,11 +916,11 @@ mod tests {
         // Vorherige Reste entfernen (best effort).
         let _ = std::fs::remove_dir_all(&home);
 
-        harw_home::ensure_home(&home).expect("ensure_home");
-        run_wizard_with_interaction_mode(&home, false).expect("run_wizard");
+        harw_home::ensure_home(&home).map_err(ctx("ensure_home"))?;
+        run_wizard_with_interaction_mode(&home, false).map_err(ctx("run_wizard"))?;
 
         let profile_name = harw_home::active_profile_name(&home);
-        let profile = harw_home::profile_dir(&home, &profile_name).expect("profile_dir");
+        let profile = harw_home::profile_dir(&home, &profile_name).map_err(ctx("profile_dir"))?;
 
         assert!(
             profile.join("providers").join("openai.toml").exists(),
@@ -907,8 +931,8 @@ mod tests {
             "models/gpt-5.4.toml sollte existieren"
         );
 
-        let layers = harw_home::config_layers(&home).expect("config_layers");
-        let resolved = harw_config::discover_config(&layers).expect("discover_config");
+        let layers = harw_home::config_layers(&home).map_err(ctx("config_layers"))?;
+        let resolved = harw_config::discover_config(&layers).map_err(ctx("discover_config"))?;
         assert!(
             resolved.harness.onboarding.seen.is_complete(),
             "onboarding.seen sollte vollständig sein"
@@ -917,10 +941,11 @@ mod tests {
         assert_eq!(resolved.harness.default_model.as_deref(), Some("gpt-5.4"));
 
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 
     #[test]
-    fn write_secret_file_accepts_safe_provider_name() {
+    fn write_secret_file_accepts_safe_provider_name() -> TestResult {
         let home = std::env::temp_dir().join(format!(
             "harw-onboarding-test-{}-safe-provider",
             std::process::id()
@@ -928,20 +953,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
 
         let secret_ref = write_secret_file(&home, "openai_compat-1", "test-key")
-            .expect("safe provider name should be accepted");
+            .map_err(ctx("safe provider name should be accepted"))?;
         let key_path = home.join("secrets/openai_compat-1.key");
 
         assert_eq!(
-            std::fs::read_to_string(&key_path).expect("read key"),
+            std::fs::read_to_string(&key_path).map_err(ctx("read key"))?,
             "test-key"
         );
         assert!(secret_ref.to_string().starts_with("file:"));
 
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 
     #[test]
-    fn write_secret_file_rejects_traversal_and_unsafe_provider_names() {
+    fn write_secret_file_rejects_traversal_and_unsafe_provider_names() -> TestResult {
         let home = std::env::temp_dir().join(format!(
             "harw-onboarding-test-{}-unsafe-provider",
             std::process::id()
@@ -957,8 +983,12 @@ mod tests {
             "bad.name",
             "bad\nname",
         ] {
-            let error = write_secret_file(&home, provider_name, "must-not-write")
-                .expect_err("unsafe provider name should be rejected");
+            let result = write_secret_file(&home, provider_name, "must-not-write");
+            let Err(error) = result else {
+                return Err(TestError::Unexpected(
+                    "unsafe provider name should be rejected".into(),
+                ));
+            };
             assert!(
                 error.starts_with("ungültiger Provider-Name:"),
                 "unexpected user-safe error: {error}"
@@ -971,11 +1001,12 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn write_secret_file_creates_secret_with_mode_600_from_the_start() {
+    fn write_secret_file_creates_secret_with_mode_600_from_the_start() -> TestResult {
         use std::os::unix::fs::PermissionsExt as _;
 
         let home = std::env::temp_dir().join(format!(
@@ -984,20 +1015,21 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&home);
 
-        write_secret_file(&home, "mode-check", "secret").expect("write secret");
+        write_secret_file(&home, "mode-check", "secret").map_err(ctx("write secret"))?;
         let mode = std::fs::metadata(home.join("secrets/mode-check.key"))
-            .expect("secret metadata")
+            .map_err(ctx("secret metadata"))?
             .permissions()
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
 
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn write_secret_file_replaces_destination_symlink_without_following_it() {
+    fn write_secret_file_replaces_destination_symlink_without_following_it() -> TestResult {
         use std::os::unix::fs::symlink;
 
         let home = std::env::temp_dir().join(format!(
@@ -1006,30 +1038,32 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&home);
         let secrets_dir = home.join("secrets");
-        std::fs::create_dir_all(&secrets_dir).expect("create secrets directory");
+        std::fs::create_dir_all(&secrets_dir).map_err(ctx("create secrets directory"))?;
         let outside = home.join("outside.key");
-        std::fs::write(&outside, "must remain unchanged").expect("write outside sentinel");
-        symlink(&outside, secrets_dir.join("symlink-check.key")).expect("create key symlink");
+        std::fs::write(&outside, "must remain unchanged").map_err(ctx("write outside sentinel"))?;
+        symlink(&outside, secrets_dir.join("symlink-check.key"))
+            .map_err(ctx("create key symlink"))?;
 
-        write_secret_file(&home, "symlink-check", "new secret").expect("replace symlink");
+        write_secret_file(&home, "symlink-check", "new secret").map_err(ctx("replace symlink"))?;
 
         assert_eq!(
-            std::fs::read_to_string(&outside).expect("read outside sentinel"),
+            std::fs::read_to_string(&outside).map_err(ctx("read outside sentinel"))?,
             "must remain unchanged"
         );
         assert_eq!(
             std::fs::read_to_string(secrets_dir.join("symlink-check.key"))
-                .expect("read replacement secret"),
+                .map_err(ctx("read replacement secret"))?,
             "new secret"
         );
         assert!(
             !std::fs::symlink_metadata(secrets_dir.join("symlink-check.key"))
-                .expect("replacement metadata")
+                .map_err(ctx("replacement metadata"))?
                 .file_type()
                 .is_symlink()
         );
 
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 
     // ── Task: volle Katalog-Modell-Liste nach Onboarding ─────────────────────
@@ -1039,13 +1073,13 @@ mod tests {
     /// dafür je eine `models/<id>.toml` anlegen, und das gewählte Modell bleibt
     /// `default_model`.
     #[test]
-    fn persist_outcome_populates_full_catalog_model_list_for_anthropic() {
+    fn persist_outcome_populates_full_catalog_model_list_for_anthropic() -> TestResult {
         let home = std::env::temp_dir().join(format!(
             "harw-onboarding-test-{}-anthropic-full-catalog",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&home);
-        harw_home::ensure_home(&home).expect("ensure_home");
+        harw_home::ensure_home(&home).map_err(ctx("ensure_home"))?;
 
         let outcome = harw_tui::SetupOutcome {
             provider_id: "anthropic".into(),
@@ -1055,10 +1089,10 @@ mod tests {
             secret_ref: Some("env:ANTHROPIC_API_KEY".into()),
             auth_header: None,
         };
-        persist_outcome(&home, &outcome).expect("persist_outcome");
+        persist_outcome(&home, &outcome).map_err(ctx("persist_outcome"))?;
 
         let profile_name = harw_home::active_profile_name(&home);
-        let profile = harw_home::profile_dir(&home, &profile_name).expect("profile_dir");
+        let profile = harw_home::profile_dir(&home, &profile_name).map_err(ctx("profile_dir"))?;
 
         let expected_models = harw_model_catalog::embedded_catalog()
             .into_iter()
@@ -1070,8 +1104,8 @@ mod tests {
             "test fixture assumption: anthropic catalog entry has models"
         );
 
-        let layers = harw_home::config_layers(&home).expect("config_layers");
-        let config = harw_config::discover_config(&layers).expect("discover_config");
+        let layers = harw_home::config_layers(&home).map_err(ctx("config_layers"))?;
+        let config = harw_config::discover_config(&layers).map_err(ctx("discover_config"))?;
         let mut got_models = config.providers["anthropic"].models.clone();
         got_models.sort();
         let mut want_models = expected_models.clone();
@@ -1094,6 +1128,7 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 
     /// Katalog-Einträge mit Platzhalter-`base_url` (hier `cf-worker`,
@@ -1101,13 +1136,13 @@ mod tests {
     /// automatisch aufblähen — nur das im Setup gewählte Modell landet in
     /// `providers/<id>.toml`.
     #[test]
-    fn persist_outcome_skips_catalog_expansion_for_placeholder_base_url_provider() {
+    fn persist_outcome_skips_catalog_expansion_for_placeholder_base_url_provider() -> TestResult {
         let home = std::env::temp_dir().join(format!(
             "harw-onboarding-test-{}-cfworker-placeholder",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&home);
-        harw_home::ensure_home(&home).expect("ensure_home");
+        harw_home::ensure_home(&home).map_err(ctx("ensure_home"))?;
 
         // Der Katalog-Eintrag "cf-worker" hat absichtlich einen nicht-leeren
         // `models`-Array *und* eine Platzhalter-`base_url` — genau der Fall, den
@@ -1130,10 +1165,10 @@ mod tests {
             secret_ref: Some("env:CF_WORKER_TOKEN".into()),
             auth_header: None,
         };
-        persist_outcome(&home, &outcome).expect("persist_outcome");
+        persist_outcome(&home, &outcome).map_err(ctx("persist_outcome"))?;
 
-        let layers = harw_home::config_layers(&home).expect("config_layers");
-        let config = harw_config::discover_config(&layers).expect("discover_config");
+        let layers = harw_home::config_layers(&home).map_err(ctx("config_layers"))?;
+        let config = harw_config::discover_config(&layers).map_err(ctx("discover_config"))?;
         assert_eq!(
             config.providers["cf-worker"].models,
             vec![outcome.model.clone()],
@@ -1141,28 +1176,28 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 
     /// Ein bereits vorhandenes `models/<id>.toml` (z. B. durch `harw models
     /// scan` angereichert) darf beim Auffüllen der Katalog-Modell-Liste nicht
     /// überschrieben werden.
     #[test]
-    fn persist_outcome_does_not_overwrite_existing_catalog_model_file() {
+    fn persist_outcome_does_not_overwrite_existing_catalog_model_file() -> TestResult {
         let home = std::env::temp_dir().join(format!(
             "harw-onboarding-test-{}-anthropic-preserve",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&home);
-        harw_home::ensure_home(&home).expect("ensure_home");
+        harw_home::ensure_home(&home).map_err(ctx("ensure_home"))?;
 
         let profile_name = harw_home::active_profile_name(&home);
-        let profile = harw_home::profile_dir(&home, &profile_name).expect("profile_dir");
+        let profile = harw_home::profile_dir(&home, &profile_name).map_err(ctx("profile_dir"))?;
         let models_dir = profile.join("models");
-        std::fs::create_dir_all(&models_dir).expect("create models dir");
+        std::fs::create_dir_all(&models_dir).map_err(ctx("create models dir"))?;
         let preseeded_path = models_dir.join(model_filename("claude-sonnet-5"));
-        let preseeded_marker =
-            "id = \"claude-sonnet-5\"\nprovider = \"anthropic\"\nname = \"Enriched by harw models scan\"\n";
-        std::fs::write(&preseeded_path, preseeded_marker).expect("preseed model file");
+        let preseeded_marker = "id = \"claude-sonnet-5\"\nprovider = \"anthropic\"\nname = \"Enriched by harw models scan\"\n";
+        std::fs::write(&preseeded_path, preseeded_marker).map_err(ctx("preseed model file"))?;
 
         let outcome = harw_tui::SetupOutcome {
             provider_id: "anthropic".into(),
@@ -1172,14 +1207,16 @@ mod tests {
             secret_ref: Some("env:ANTHROPIC_API_KEY".into()),
             auth_header: None,
         };
-        persist_outcome(&home, &outcome).expect("persist_outcome");
+        persist_outcome(&home, &outcome).map_err(ctx("persist_outcome"))?;
 
-        let after = std::fs::read_to_string(&preseeded_path).expect("read preseeded model file");
+        let after =
+            std::fs::read_to_string(&preseeded_path).map_err(ctx("read preseeded model file"))?;
         assert_eq!(
             after, preseeded_marker,
             "pre-existing model file must not be overwritten"
         );
 
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 }

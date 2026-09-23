@@ -448,6 +448,7 @@ fn source_sort_key(source: &SourceRef) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestResult;
     use harw_knowledge::{AgentId, ArtifactId, Frontmatter, KnowledgeArtifact};
 
     fn frontmatter(scope: VisibilityScope) -> Frontmatter {
@@ -455,16 +456,20 @@ mod tests {
     }
 
     #[test]
-    fn test_visibility_of_scope_maps_operator_only_to_operator_bucket() {
+    fn test_visibility_of_scope_maps_operator_only_to_operator_bucket() -> TestResult {
         assert_eq!(
             visibility_of_scope(&VisibilityScope::OperatorOnly),
             OPERATOR_ONLY_VISIBILITY
         );
+        Ok(())
     }
 
     #[test]
-    fn test_visibility_of_scope_maps_every_other_scope_to_default_bucket() {
-        assert_eq!(visibility_of_scope(&VisibilityScope::SelfOnly), DEFAULT_VISIBILITY);
+    fn test_visibility_of_scope_maps_every_other_scope_to_default_bucket() -> TestResult {
+        assert_eq!(
+            visibility_of_scope(&VisibilityScope::SelfOnly),
+            DEFAULT_VISIBILITY
+        );
         assert_eq!(
             visibility_of_scope(&VisibilityScope::DescendantTree),
             DEFAULT_VISIBILITY
@@ -473,23 +478,25 @@ mod tests {
             visibility_of_scope(&VisibilityScope::ExplicitlyGranted(Vec::new())),
             DEFAULT_VISIBILITY
         );
+        Ok(())
     }
 
     #[test]
-    fn test_collect_design_docs_missing_root_returns_empty_list() {
+    fn test_collect_design_docs_missing_root_returns_empty_list() -> TestResult {
         let root = std::path::Path::new("/does/not/exist/harw-lens-source-test");
-        assert_eq!(collect_design_docs(root).expect("no error"), Vec::new());
+        assert_eq!(collect_design_docs(root)?, Vec::new());
+        Ok(())
     }
 
     #[test]
-    fn test_collect_design_docs_reads_markdown_files_recursively_and_sorted() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("b.md"), "second").expect("write b.md");
-        std::fs::create_dir(dir.path().join("nested")).expect("mkdir nested");
-        std::fs::write(dir.path().join("nested/a.md"), "first").expect("write nested/a.md");
-        std::fs::write(dir.path().join("ignore.txt"), "not markdown").expect("write ignore.txt");
+    fn test_collect_design_docs_reads_markdown_files_recursively_and_sorted() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("b.md"), "second")?;
+        std::fs::create_dir(dir.path().join("nested"))?;
+        std::fs::write(dir.path().join("nested/a.md"), "first")?;
+        std::fs::write(dir.path().join("ignore.txt"), "not markdown")?;
 
-        let documents = collect_design_docs(dir.path()).expect("collects");
+        let documents = collect_design_docs(dir.path())?;
         assert_eq!(documents.len(), 2);
         assert_eq!(
             documents[0].source,
@@ -504,10 +511,11 @@ mod tests {
             }
         );
         assert_eq!(documents[0].visibility, DEFAULT_VISIBILITY);
+        Ok(())
     }
 
     #[test]
-    fn test_collect_palace_documents_filters_to_palace_kind_only() {
+    fn test_collect_palace_documents_filters_to_palace_kind_only() -> TestResult {
         let mut index = KnowledgeIndex::new();
         index.insert(KnowledgeArtifact::new(
             ArtifactId::new("palace/a"),
@@ -531,10 +539,11 @@ mod tests {
                 id: "palace/a".to_owned()
             }
         );
+        Ok(())
     }
 
     #[test]
-    fn test_collect_palace_documents_maps_operator_only_visibility() {
+    fn test_collect_palace_documents_maps_operator_only_visibility() -> TestResult {
         let mut index = KnowledgeIndex::new();
         index.insert(KnowledgeArtifact::new(
             ArtifactId::new("palace/secret"),
@@ -546,10 +555,11 @@ mod tests {
         let documents = collect_palace_documents(&index);
         assert_eq!(documents.len(), 1);
         assert_eq!(documents[0].visibility, OPERATOR_ONLY_VISIBILITY);
+        Ok(())
     }
 
     #[test]
-    fn test_collect_palace_documents_is_sorted_by_artifact_id() {
+    fn test_collect_palace_documents_is_sorted_by_artifact_id() -> TestResult {
         let mut index = KnowledgeIndex::new();
         index.insert(KnowledgeArtifact::new(
             ArtifactId::new("palace/zebra"),
@@ -566,13 +576,17 @@ mod tests {
 
         let documents = collect_palace_documents(&index);
         assert_eq!(
-            documents.iter().map(|d| d.text.as_str()).collect::<Vec<_>>(),
+            documents
+                .iter()
+                .map(|d| d.text.as_str())
+                .collect::<Vec<_>>(),
             vec!["a", "z"]
         );
+        Ok(())
     }
 
     #[test]
-    fn test_collect_diary_documents_filters_to_diary_kind_only() {
+    fn test_collect_diary_documents_filters_to_diary_kind_only() -> TestResult {
         let mut index = KnowledgeIndex::new();
         index.insert(KnowledgeArtifact::new(
             ArtifactId::new("diary/a"),
@@ -596,10 +610,11 @@ mod tests {
                 id: "diary/a".to_owned()
             }
         );
+        Ok(())
     }
 
     #[test]
-    fn test_collect_diary_documents_maps_operator_only_visibility() {
+    fn test_collect_diary_documents_maps_operator_only_visibility() -> TestResult {
         let mut index = KnowledgeIndex::new();
         index.insert(KnowledgeArtifact::new(
             ArtifactId::new("diary/secret"),
@@ -611,10 +626,11 @@ mod tests {
         let documents = collect_diary_documents(&index);
         assert_eq!(documents.len(), 1);
         assert_eq!(documents[0].visibility, OPERATOR_ONLY_VISIBILITY);
+        Ok(())
     }
 
     #[test]
-    fn test_collect_diary_documents_is_sorted_by_artifact_id() {
+    fn test_collect_diary_documents_is_sorted_by_artifact_id() -> TestResult {
         let mut index = KnowledgeIndex::new();
         index.insert(KnowledgeArtifact::new(
             ArtifactId::new("diary/zebra"),
@@ -631,26 +647,31 @@ mod tests {
 
         let documents = collect_diary_documents(&index);
         assert_eq!(
-            documents.iter().map(|d| d.text.as_str()).collect::<Vec<_>>(),
+            documents
+                .iter()
+                .map(|d| d.text.as_str())
+                .collect::<Vec<_>>(),
             vec!["a", "z"]
         );
+        Ok(())
     }
 
     #[test]
-    fn test_collect_rust_sources_missing_root_returns_empty_list() {
+    fn test_collect_rust_sources_missing_root_returns_empty_list() -> TestResult {
         let root = std::path::Path::new("/does/not/exist/harw-lens-source-rust-test");
-        assert_eq!(collect_rust_sources(root).expect("no error"), Vec::new());
+        assert_eq!(collect_rust_sources(root)?, Vec::new());
+        Ok(())
     }
 
     #[test]
-    fn test_collect_rust_sources_reads_rust_files_recursively_and_sorted() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("b.rs"), "fn b() {}\n").expect("write b.rs");
-        std::fs::create_dir(dir.path().join("nested")).expect("mkdir nested");
-        std::fs::write(dir.path().join("nested/a.rs"), "fn a() {}\n").expect("write nested/a.rs");
-        std::fs::write(dir.path().join("ignore.md"), "not rust").expect("write ignore.md");
+    fn test_collect_rust_sources_reads_rust_files_recursively_and_sorted() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("b.rs"), "fn b() {}\n")?;
+        std::fs::create_dir(dir.path().join("nested"))?;
+        std::fs::write(dir.path().join("nested/a.rs"), "fn a() {}\n")?;
+        std::fs::write(dir.path().join("ignore.md"), "not rust")?;
 
-        let documents = collect_rust_sources(dir.path()).expect("collects");
+        let documents = collect_rust_sources(dir.path())?;
         assert_eq!(documents.len(), 2);
         assert_eq!(
             documents[0].source,
@@ -665,17 +686,17 @@ mod tests {
             }
         );
         assert_eq!(documents[0].visibility, DEFAULT_VISIBILITY);
+        Ok(())
     }
 
     #[test]
-    fn test_collect_rust_sources_skips_target_directory() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("lib.rs"), "fn lib() {}\n").expect("write lib.rs");
-        std::fs::create_dir(dir.path().join("target")).expect("mkdir target");
-        std::fs::write(dir.path().join("target/generated.rs"), "fn gen() {}\n")
-            .expect("write target/generated.rs");
+    fn test_collect_rust_sources_skips_target_directory() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("lib.rs"), "fn lib() {}\n")?;
+        std::fs::create_dir(dir.path().join("target"))?;
+        std::fs::write(dir.path().join("target/generated.rs"), "fn gen() {}\n")?;
 
-        let documents = collect_rust_sources(dir.path()).expect("collects");
+        let documents = collect_rust_sources(dir.path())?;
         assert_eq!(documents.len(), 1);
         assert_eq!(
             documents[0].source,
@@ -683,5 +704,6 @@ mod tests {
                 path: "lib.rs".to_owned()
             }
         );
+        Ok(())
     }
 }

@@ -274,14 +274,15 @@ static BUNDLED_FILES: &[BundledFile] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     /// Jede Datei unter `assets/` muss im Bundle stehen — sonst läge sie im
     /// Repo, käme aber nie beim Nutzer an.
     #[test]
-    fn test_every_asset_file_is_embedded() {
+    fn test_every_asset_file_is_embedded() -> TestResult {
         let assets = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
         let mut on_disk = Vec::new();
-        collect_files(&assets, &assets, &mut on_disk);
+        collect_files(&assets, &assets, &mut on_disk)?;
         on_disk.sort();
 
         let mut embedded: Vec<String> = bundled_files()
@@ -290,20 +291,31 @@ mod tests {
             .collect();
         embedded.sort();
 
-        assert_eq!(on_disk, embedded, "assets/ und BUNDLED_FILES laufen auseinander");
+        assert_eq!(
+            on_disk, embedded,
+            "assets/ und BUNDLED_FILES laufen auseinander"
+        );
+        Ok(())
     }
 
-    fn collect_files(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
-        let entries = std::fs::read_dir(dir).expect("assets-Verzeichnis lesbar");
+    fn collect_files(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut Vec<String>,
+    ) -> TestResult {
+        let entries = std::fs::read_dir(dir).map_err(ctx("assets-Verzeichnis lesbar"))?;
         for entry in entries {
-            let path = entry.expect("Verzeichniseintrag lesbar").path();
+            let path = entry.map_err(ctx("Verzeichniseintrag lesbar"))?.path();
             if path.is_dir() {
-                collect_files(root, &path, out);
+                collect_files(root, &path, out)?;
             } else {
-                let relative = path.strip_prefix(root).expect("Pfad liegt unter assets");
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(ctx("Pfad liegt unter assets"))?;
                 out.push(relative.to_string_lossy().replace('\\', "/"));
             }
         }
+        Ok(())
     }
 
     #[test]
@@ -318,15 +330,19 @@ mod tests {
     }
 
     #[test]
-    fn test_bundled_agent_toml_parses_and_declares_no_uia_role() {
+    fn test_bundled_agent_toml_parses_and_declares_no_uia_role() -> TestResult {
         let mut agents = 0;
         for file in bundled_files() {
             if !file.relative_path.ends_with("/agent.toml") {
                 continue;
             }
             agents += 1;
-            let agent: harw_config::AgentToml = toml::from_str(file.contents)
-                .unwrap_or_else(|error| panic!("{}: {error}", file.relative_path));
+            let agent: harw_config::AgentToml = toml::from_str(file.contents).map_err(|error| {
+                crate::test_support::TestError::Unexpected(format!(
+                    "{}: {error}",
+                    file.relative_path
+                ))
+            })?;
             assert_ne!(
                 agent.role, "user-interface",
                 "{} darf keine UIA sein — die entsteht pro Nutzer über `harw uia new`",
@@ -334,26 +350,32 @@ mod tests {
             );
         }
         assert_eq!(agents, 17, "das Bundle liefert 17 Agentendefinitionen");
+        Ok(())
     }
 
     #[test]
-    fn test_bundled_skill_toml_parses() {
+    fn test_bundled_skill_toml_parses() -> TestResult {
         let mut skills = 0;
         for file in bundled_files() {
             if !file.relative_path.ends_with("/skill.toml") {
                 continue;
             }
             skills += 1;
-            toml::from_str::<harw_config::SkillToml>(file.contents)
-                .unwrap_or_else(|error| panic!("{}: {error}", file.relative_path));
+            toml::from_str::<harw_config::SkillToml>(file.contents).map_err(|error| {
+                crate::test_support::TestError::Unexpected(format!(
+                    "{}: {error}",
+                    file.relative_path
+                ))
+            })?;
         }
         assert_eq!(skills, 8, "das Bundle liefert 8 Skills");
+        Ok(())
     }
 
     /// Ein Agent, der auf einen nicht mitgelieferten Skill verweist, wäre beim
     /// Nutzer sofort kaputt.
     #[test]
-    fn test_every_referenced_skill_ships_with_the_bundle() {
+    fn test_every_referenced_skill_ships_with_the_bundle() -> TestResult {
         let available: Vec<String> = bundled_files()
             .iter()
             .filter_map(|file| {
@@ -369,7 +391,7 @@ mod tests {
                 continue;
             }
             let agent: harw_config::AgentToml =
-                toml::from_str(file.contents).expect("agent.toml parst");
+                toml::from_str(file.contents).map_err(ctx("agent.toml parst"))?;
             for skill in &agent.skills {
                 assert!(
                     available.contains(skill),
@@ -378,6 +400,7 @@ mod tests {
                 );
             }
         }
+        Ok(())
     }
 
     #[test]

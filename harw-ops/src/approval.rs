@@ -70,8 +70,7 @@ use harw_session_store::error::SessionStoreError;
 use harw_types::{Clock, ItemId, Principal, ReviewDecision, SessionId, SystemClock};
 use harw_web::peer::PeerCredentials;
 use harw_web::security::{
-    ApprovalActorResolver, ApprovalCaller, SecurityError, list_pending_approvals,
-    resolve_approval,
+    ApprovalActorResolver, ApprovalCaller, SecurityError, list_pending_approvals, resolve_approval,
 };
 
 /// Höchstzahl der von `approval.pending` gelieferten Anfragen.
@@ -337,10 +336,7 @@ impl harw_operations::FromRawArgs for ApprovalResolveArgs {
     permission = "operator",
     web(path = "/api/approval-resolve", method = "post", approval = "none")
 )]
-async fn approval_resolve(
-    ctx: &OpContext,
-    args: ApprovalResolveArgs,
-) -> Result<OpOutput, OpError> {
+async fn approval_resolve(ctx: &OpContext, args: ApprovalResolveArgs) -> Result<OpOutput, OpError> {
     let store = approval_store(ctx)?;
     let principal = ctx.service::<Principal>().ok_or_else(|| {
         OpError::NotAvailable(
@@ -386,12 +382,14 @@ async fn approval_resolve(
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalPendingArgs, ApprovalResolveArgs, PENDING_LIMIT, approval_pending,
-        approval_resolve,
+        ApprovalPendingArgs, ApprovalResolveArgs, PENDING_LIMIT, approval_pending, approval_resolve,
     };
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_session_store::approval::{ApprovalRecord, ApprovalStore};
     use harw_types::{
         ApprovalActor, Clock, IngressSurface, ItemId, PermissionTier, Principal, PrincipalKind,
@@ -419,9 +417,11 @@ mod tests {
         Timestamp::constant(ISSUED_SECS, 0)
     }
 
-    fn at_offset(offset: SignedDuration) -> Timestamp {
+    fn at_offset(offset: SignedDuration) -> TestResult<Timestamp> {
         // Testhilfe: 1.7e9 s plus Minuten liegt sicher im Wertebereich.
-        issued_at().checked_add(offset).expect("timestamp in range")
+        issued_at()
+            .checked_add(offset)
+            .map_err(ctx("timestamp in range"))
     }
 
     fn unique_root(prefix: &str) -> PathBuf {
@@ -440,9 +440,9 @@ mod tests {
         clock: Option<Timestamp>,
     }
 
-    fn test_context(services_in: Services) -> (OpContext, PathBuf) {
+    fn test_context(services_in: Services) -> TestResult<(OpContext, PathBuf)> {
         let root = unique_root("harw-ops-approval-test");
-        std::fs::create_dir_all(root.join("ws")).expect("create test workspace");
+        std::fs::create_dir_all(root.join("ws")).map_err(ctx("create test workspace"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -451,13 +451,13 @@ mod tests {
                 root: PathBuf::from("ws"),
             }],
         )
-        .expect("build workspace registry");
+        .map_err(ctx("build workspace registry"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .expect("resolve workspace binding");
+            .map_err(ctx("resolve workspace binding"))?;
         let sandbox = SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ReadWorkspace]),
@@ -479,10 +479,10 @@ mod tests {
             let clock: Arc<dyn Clock> = Arc::new(FixedClock(now));
             services.insert(clock);
         }
-        (
+        Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, services),
             root,
-        )
+        ))
     }
 
     fn web_principal() -> Principal {
@@ -500,7 +500,12 @@ mod tests {
         }
     }
 
-    fn issue_pending(store: &ApprovalStore, session: &str, request: &str, issued: Timestamp) {
+    fn issue_pending(
+        store: &ApprovalStore,
+        session: &str,
+        request: &str,
+        issued: Timestamp,
+    ) -> TestResult {
         store
             .issue(&ApprovalRecord {
                 request: ItemId::from_str(request),
@@ -509,11 +514,14 @@ mod tests {
                 actor: owner(),
                 issued_at: issued,
             })
-            .expect("issue pending approval");
+            .map_err(ctx("issue pending approval"))
     }
 
     fn resolver_owner() -> Arc<dyn ApprovalActorResolver> {
-        Arc::new(StaticUidApprovalActorMap::new(vec![(1000, "owner".to_owned())]))
+        Arc::new(StaticUidApprovalActorMap::new(vec![(
+            1000,
+            "owner".to_owned(),
+        )]))
     }
 
     fn approve_args(request: &str) -> ApprovalResolveArgs {
@@ -547,14 +555,20 @@ mod tests {
     }
 
     #[test]
-    fn test_approval_resolve_args_from_raw_args_is_rejected() {
-        let error = ApprovalResolveArgs::from_raw_args(&toks(&[])).unwrap_err();
+    fn test_approval_resolve_args_from_raw_args_is_rejected() -> TestResult {
+        let result = ApprovalResolveArgs::from_raw_args(&toks(&[]));
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "from_raw_args must be rejected".to_owned(),
+            ));
+        };
         assert!(matches!(error, OpError::InvalidArguments(_)));
+        Ok(())
     }
 
     /// Ein vom Client mitgeschicktes `resolved_at`/`actor` hat kein Zielfeld.
     #[test]
-    fn test_approval_resolve_args_ignore_client_time_and_actor() {
+    fn test_approval_resolve_args_ignore_client_time_and_actor() -> TestResult {
         let json = serde_json::json!({
             "session": "session-1",
             "request": "approval-1",
@@ -562,71 +576,96 @@ mod tests {
             "resolved_at": "1970-01-01T00:00:00Z",
             "actor": {"kind": "operator", "id": "attacker"},
         });
-        let args: ApprovalResolveArgs = serde_json::from_value(json).expect("deserializes");
+        let args: ApprovalResolveArgs =
+            serde_json::from_value(json).map_err(ctx("deserializes"))?;
         assert_eq!(args.session.as_str(), "session-1");
         assert_eq!(args.decision, ReviewDecision::Approved);
         assert!(!format!("{args:?}").contains("1970"));
         assert!(!format!("{args:?}").contains("attacker"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_approval_pending_without_store_returns_not_available() {
-        let (ctx, root) = test_context(Services::default());
+    async fn test_approval_pending_without_store_returns_not_available() -> TestResult {
+        let (ctx, root) = test_context(Services::default())?;
         let result = approval_pending(&ctx, ApprovalPendingArgs::default()).await;
         std::fs::remove_dir_all(root).ok();
         assert!(matches!(result, Err(OpError::NotAvailable(_))));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_approval_pending_with_empty_store_reports_none_open() {
+    async fn test_approval_pending_with_empty_store_reports_none_open() -> TestResult {
         let store_root = unique_root("harw-ops-approval-empty-store");
         let store = Arc::new(ApprovalStore::new(&store_root));
         let (ctx, ws_root) = test_context(Services {
             store: Some(store),
             ..Services::default()
-        });
+        })?;
         let output = approval_pending(&ctx, ApprovalPendingArgs::default())
             .await
-            .expect("list succeeds on empty store");
+            .map_err(crate::test_support::ctx("list succeeds on empty store"))?;
         cleanup(&store_root, ws_root);
         assert_eq!(output.text, "Keine offenen Genehmigungsanfragen.");
-        let data = output.data.expect("structured payload");
+        let data = output
+            .data
+            .ok_or(TestError::Missing("structured payload"))?;
         assert_eq!(data["pending"], serde_json::json!([]));
         assert_eq!(data["limit"], serde_json::json!(PENDING_LIMIT));
+        Ok(())
     }
 
     /// `pending_all`-Ausgabe: sortiert nach `issued_at`, ohne abgelaufene und
     /// aufgelöste Anfragen, als `data.pending`.
     #[tokio::test]
-    async fn test_approval_pending_lists_open_requests_from_pending_all() {
+    async fn test_approval_pending_lists_open_requests_from_pending_all() -> TestResult {
         let store_root = unique_root("harw-ops-approval-list-store");
         let store = Arc::new(ApprovalStore::new(&store_root));
-        let now = at_offset(SignedDuration::from_mins(40));
-        issue_pending(&store, "session-1", "stale", issued_at());
-        issue_pending(&store, "session-1", "later", at_offset(SignedDuration::from_mins(20)));
-        issue_pending(&store, "session-2", "earlier", at_offset(SignedDuration::from_mins(15)));
-        issue_pending(&store, "session-1", "done", at_offset(SignedDuration::from_mins(25)));
+        let now = at_offset(SignedDuration::from_mins(40))?;
+        issue_pending(&store, "session-1", "stale", issued_at())?;
+        issue_pending(
+            &store,
+            "session-1",
+            "later",
+            at_offset(SignedDuration::from_mins(20))?,
+        )?;
+        issue_pending(
+            &store,
+            "session-2",
+            "earlier",
+            at_offset(SignedDuration::from_mins(15))?,
+        )?;
+        issue_pending(
+            &store,
+            "session-1",
+            "done",
+            at_offset(SignedDuration::from_mins(25))?,
+        )?;
 
-        let (resolve_ctx, ws_resolve) = test_context(web_services(&store, now));
+        let (resolve_ctx, ws_resolve) = test_context(web_services(&store, now))?;
         approval_resolve(&resolve_ctx, approve_args("done"))
             .await
-            .expect("resolve 'done'");
+            .map_err(crate::test_support::ctx("resolve 'done'"))?;
 
         let (ctx, ws_root) = test_context(Services {
             store: Some(Arc::clone(&store)),
             clock: Some(now),
             ..Services::default()
-        });
+        })?;
         let output = approval_pending(&ctx, ApprovalPendingArgs::default())
             .await
-            .expect("list succeeds");
+            .map_err(crate::test_support::ctx("list succeeds"))?;
         std::fs::remove_dir_all(ws_resolve).ok();
         cleanup(&store_root, ws_root);
 
         assert!(output.text.contains("2 offene"));
         assert!(!output.text.contains("stale"));
-        let data = output.data.expect("structured payload");
-        let pending = data["pending"].as_array().expect("pending array");
+        let data = output
+            .data
+            .ok_or(TestError::Missing("structured payload"))?;
+        let pending = data["pending"]
+            .as_array()
+            .ok_or(TestError::Missing("pending array"))?;
         let requests: Vec<&str> = pending
             .iter()
             .filter_map(|record| record["request"].as_str())
@@ -637,92 +676,116 @@ mod tests {
             pending[0]["actor"],
             serde_json::json!({"kind": "operator", "id": "owner"})
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_approval_resolve_without_approval_store_returns_not_available() {
-        let (ctx, root) = test_context(Services::default());
+    async fn test_approval_resolve_without_approval_store_returns_not_available() -> TestResult {
+        let (ctx, root) = test_context(Services::default())?;
         let result = approval_resolve(&ctx, approve_args("approval-1")).await;
         std::fs::remove_dir_all(root).ok();
         assert!(matches!(result, Err(OpError::NotAvailable(_))));
+        Ok(())
     }
 
     /// Ohne Principal-Service gibt es keinen Actor — abgelehnt, Speicher
     /// unberührt, auch wenn Peer und Resolver vorhanden sind.
     #[tokio::test]
-    async fn test_approval_resolve_without_principal_is_rejected() {
+    async fn test_approval_resolve_without_principal_is_rejected() -> TestResult {
         let store_root = unique_root("harw-ops-approval-no-principal");
         let store = Arc::new(ApprovalStore::new(&store_root));
-        issue_pending(&store, "session-1", "approval-1", issued_at());
-        let mut services = web_services(&store, at_offset(SignedDuration::from_mins(1)));
+        issue_pending(&store, "session-1", "approval-1", issued_at())?;
+        let mut services = web_services(&store, at_offset(SignedDuration::from_mins(1))?);
         services.principal = None;
-        let (ctx, ws_root) = test_context(services);
+        let (ctx, ws_root) = test_context(services)?;
 
         let result = approval_resolve(&ctx, approve_args("approval-1")).await;
         let resolution = store
-            .resolution(&SessionId::from_str("session-1"), &ItemId::from_str("approval-1"))
-            .expect("readable");
+            .resolution(
+                &SessionId::from_str("session-1"),
+                &ItemId::from_str("approval-1"),
+            )
+            .map_err(crate::test_support::ctx("readable"))?;
         cleanup(&store_root, ws_root);
 
         match result {
             Err(OpError::NotAvailable(message)) => assert!(message.contains("kein Principal")),
-            other => panic!("expected NotAvailable(kein Principal), got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable(kein Principal), got: {other:?}"
+                )));
+            }
         }
         assert_eq!(resolution, None);
+        Ok(())
     }
 
     /// Ein Principal ohne `actor_id()` (Kind-Agent) wird abgelehnt.
     #[tokio::test]
-    async fn test_approval_resolve_principal_without_actor_is_rejected() {
+    async fn test_approval_resolve_principal_without_actor_is_rejected() -> TestResult {
         let store_root = unique_root("harw-ops-approval-child-principal");
         let store = Arc::new(ApprovalStore::new(&store_root));
-        issue_pending(&store, "session-1", "approval-1", issued_at());
-        let mut services = web_services(&store, at_offset(SignedDuration::from_mins(1)));
+        issue_pending(&store, "session-1", "approval-1", issued_at())?;
+        let mut services = web_services(&store, at_offset(SignedDuration::from_mins(1))?);
         services.principal = Some(web_principal().child_of("explorer"));
-        let (ctx, ws_root) = test_context(services);
+        let (ctx, ws_root) = test_context(services)?;
 
         let result = approval_resolve(&ctx, approve_args("approval-1")).await;
         let resolution = store
-            .resolution(&SessionId::from_str("session-1"), &ItemId::from_str("approval-1"))
-            .expect("readable");
+            .resolution(
+                &SessionId::from_str("session-1"),
+                &ItemId::from_str("approval-1"),
+            )
+            .map_err(crate::test_support::ctx("readable"))?;
         cleanup(&store_root, ws_root);
 
         match result {
             Err(OpError::NotAvailable(message)) => {
                 assert!(message.contains("darf keine Genehmigungsanfrage auflösen"));
             }
-            other => panic!("expected NotAvailable(no actor), got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable(no actor), got: {other:?}"
+                )));
+            }
         }
         assert_eq!(resolution, None);
+        Ok(())
     }
 
     /// Web-Principal ohne `PeerCredentials` — kein authentifizierter Peer.
     #[tokio::test]
-    async fn test_approval_resolve_web_principal_without_peer_credentials_is_rejected() {
+    async fn test_approval_resolve_web_principal_without_peer_credentials_is_rejected() -> TestResult
+    {
         let store_root = unique_root("harw-ops-approval-no-peer-store");
         let store = Arc::new(ApprovalStore::new(&store_root));
-        issue_pending(&store, "session-1", "approval-1", issued_at());
-        let mut services = web_services(&store, at_offset(SignedDuration::from_mins(1)));
+        issue_pending(&store, "session-1", "approval-1", issued_at())?;
+        let mut services = web_services(&store, at_offset(SignedDuration::from_mins(1))?);
         services.peer = None;
-        let (ctx, ws_root) = test_context(services);
+        let (ctx, ws_root) = test_context(services)?;
 
         let result = approval_resolve(&ctx, approve_args("approval-1")).await;
         cleanup(&store_root, ws_root);
 
         match result {
             Err(OpError::NotAvailable(message)) => assert!(message.contains("Peer-Credentials")),
-            other => panic!("expected NotAvailable mentioning Peer-Credentials, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable mentioning Peer-Credentials, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_approval_resolve_rejects_a_peer_unknown_to_the_resolver() {
+    async fn test_approval_resolve_rejects_a_peer_unknown_to_the_resolver() -> TestResult {
         let store_root = unique_root("harw-ops-approval-unknown-peer-store");
         let store = Arc::new(ApprovalStore::new(&store_root));
-        issue_pending(&store, "session-1", "approval-1", issued_at());
-        let mut services = web_services(&store, at_offset(SignedDuration::from_mins(1)));
+        issue_pending(&store, "session-1", "approval-1", issued_at())?;
+        let mut services = web_services(&store, at_offset(SignedDuration::from_mins(1))?);
         services.peer = Some(PeerCredentials::new(1, 9999, 9999));
-        let (ctx, ws_root) = test_context(services);
+        let (ctx, ws_root) = test_context(services)?;
 
         let result = approval_resolve(&ctx, approve_args("approval-1")).await;
         cleanup(&store_root, ws_root);
@@ -731,19 +794,24 @@ mod tests {
             Err(OpError::NotAvailable(message)) => {
                 assert!(message.contains("keinem Genehmiger zugeordnet"));
             }
-            other => panic!("expected NotAvailable(unknown approver), got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable(unknown approver), got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// `resolved_at` stammt aus der injizierten Serveruhr; `data` trägt
     /// `id`, `session`, `decision`, `resolved_at`, `actor`.
     #[tokio::test]
-    async fn test_approval_resolve_uses_server_clock_and_returns_json_data() {
+    async fn test_approval_resolve_uses_server_clock_and_returns_json_data() -> TestResult {
         let store_root = unique_root("harw-ops-approval-resolve-store");
         let store = Arc::new(ApprovalStore::new(&store_root));
-        issue_pending(&store, "session-1", "approval-1", issued_at());
-        let now = at_offset(SignedDuration::from_mins(7));
-        let (ctx, ws_root) = test_context(web_services(&store, now));
+        issue_pending(&store, "session-1", "approval-1", issued_at())?;
+        let now = at_offset(SignedDuration::from_mins(7))?;
+        let (ctx, ws_root) = test_context(web_services(&store, now))?;
 
         let args = ApprovalResolveArgs {
             decision: ReviewDecision::ApprovedOnce,
@@ -752,11 +820,16 @@ mod tests {
         };
         let output = approval_resolve(&ctx, args)
             .await
-            .expect("resolution succeeds for the confirmed web approver");
+            .map_err(crate::test_support::ctx(
+                "resolution succeeds for the confirmed web approver",
+            ))?;
         let durable = store
-            .resolution(&SessionId::from_str("session-1"), &ItemId::from_str("approval-1"))
-            .expect("readable")
-            .expect("durable resolution");
+            .resolution(
+                &SessionId::from_str("session-1"),
+                &ItemId::from_str("approval-1"),
+            )
+            .map_err(crate::test_support::ctx("readable"))?
+            .ok_or(TestError::Missing("durable resolution"))?;
         cleanup(&store_root, ws_root);
 
         assert!(output.text.contains("approval-1"));
@@ -764,70 +837,94 @@ mod tests {
         assert!(output.text.contains("owner"));
         assert_eq!(durable.resolved_at, now);
 
-        let data = output.data.expect("structured payload");
+        let data = output
+            .data
+            .ok_or(TestError::Missing("structured payload"))?;
         let expected = serde_json::json!({
             "id": "approval-1",
             "session": "session-1",
             "decision": "approved_once",
-            "resolved_at": serde_json::to_value(now).expect("timestamp serializes"),
+            "resolved_at": serde_json::to_value(now)
+                .map_err(crate::test_support::ctx("timestamp serializes"))?,
             "actor": {"kind": "operator", "id": "owner"},
         });
         assert_eq!(data, expected);
+        Ok(())
     }
 
     /// Abgelaufene Anfrage (Serveruhr ≥ `issued_at` + 30 min) → Fehler.
     #[tokio::test]
-    async fn test_approval_resolve_expired_request_is_rejected() {
+    async fn test_approval_resolve_expired_request_is_rejected() -> TestResult {
         let store_root = unique_root("harw-ops-approval-expired-store");
         let store = Arc::new(ApprovalStore::new(&store_root));
-        issue_pending(&store, "session-1", "approval-1", issued_at());
-        let (ctx, ws_root) =
-            test_context(web_services(&store, at_offset(SignedDuration::from_mins(30))));
+        issue_pending(&store, "session-1", "approval-1", issued_at())?;
+        let (ctx, ws_root) = test_context(web_services(
+            &store,
+            at_offset(SignedDuration::from_mins(30))?,
+        ))?;
 
         let result = approval_resolve(&ctx, approve_args("approval-1")).await;
         let resolution = store
-            .resolution(&SessionId::from_str("session-1"), &ItemId::from_str("approval-1"))
-            .expect("readable");
+            .resolution(
+                &SessionId::from_str("session-1"),
+                &ItemId::from_str("approval-1"),
+            )
+            .map_err(crate::test_support::ctx("readable"))?;
         cleanup(&store_root, ws_root);
 
         match result {
             Err(OpError::InvalidArguments(message)) => assert!(message.contains("abgelaufen")),
-            other => panic!("expected InvalidArguments(abgelaufen), got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected InvalidArguments(abgelaufen), got: {other:?}"
+                )));
+            }
         }
         assert_eq!(resolution, None);
+        Ok(())
     }
 
     /// Eine zweite Bestätigung derselben Anfrage wird abgewiesen, nicht
     /// überschrieben.
     #[tokio::test]
-    async fn test_approval_resolve_rejects_a_second_confirmation_of_the_same_request() {
+    async fn test_approval_resolve_rejects_a_second_confirmation_of_the_same_request() -> TestResult
+    {
         let store_root = unique_root("harw-ops-approval-twice-store");
         let store = Arc::new(ApprovalStore::new(&store_root));
-        issue_pending(&store, "session-1", "approval-1", issued_at());
-        let now = at_offset(SignedDuration::from_mins(1));
+        issue_pending(&store, "session-1", "approval-1", issued_at())?;
+        let now = at_offset(SignedDuration::from_mins(1))?;
 
-        let (ctx_first, ws_root_first) = test_context(web_services(&store, now));
+        let (ctx_first, ws_root_first) = test_context(web_services(&store, now))?;
         approval_resolve(&ctx_first, approve_args("approval-1"))
             .await
-            .expect("first resolution succeeds");
+            .map_err(crate::test_support::ctx("first resolution succeeds"))?;
 
-        let (ctx_second, ws_root_second) = test_context(web_services(&store, now));
-        let replay = approval_resolve(
+        let (ctx_second, ws_root_second) = test_context(web_services(&store, now))?;
+        let result = approval_resolve(
             &ctx_second,
             ApprovalResolveArgs {
                 decision: ReviewDecision::Rejected,
                 ..approve_args("approval-1")
             },
         )
-        .await
-        .unwrap_err();
+        .await;
 
         std::fs::remove_dir_all(ws_root_first).ok();
         cleanup(&store_root, ws_root_second);
 
+        let Err(replay) = result else {
+            return Err(TestError::Unexpected(
+                "a second confirmation must be rejected".to_owned(),
+            ));
+        };
         match replay {
             OpError::InvalidArguments(message) => assert!(message.contains("bereits aufgelöst")),
-            other => panic!("expected InvalidArguments(bereits aufgelöst), got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected InvalidArguments(bereits aufgelöst), got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 }

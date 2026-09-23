@@ -595,13 +595,14 @@ impl ActionOutcome {
 mod tests {
     use super::*;
     use crate::policy::DEFAULT_MAX_TEXT_BYTES;
+    use crate::test_support::{TestResult, ctx};
 
     fn target(id: &str) -> Target {
         Target::new(Selector::Id(id.to_owned()))
     }
 
-    fn target_json() -> serde_json::Value {
-        serde_json::to_value(target("file-input")).expect("target serializes")
+    fn target_json() -> TestResult<serde_json::Value> {
+        serde_json::to_value(target("file-input")).map_err(ctx("target serializes"))
     }
 
     #[test]
@@ -657,15 +658,16 @@ mod tests {
     }
 
     #[test]
-    fn test_navigation_target_only_for_navigate() {
-        let url = url::Url::parse("https://example.com/").expect("valid url in test");
+    fn test_navigation_target_only_for_navigate() -> TestResult {
+        let url = url::Url::parse("https://example.com/").map_err(ctx("valid url in test"))?;
         let navigate = BrowserAction::Navigate { url: url.clone() };
         assert_eq!(navigate.navigation_target(), Some(&url));
         assert_eq!(BrowserAction::Reload.navigation_target(), None);
+        Ok(())
     }
 
     #[test]
-    fn test_browser_action_serde_json_round_trip() {
+    fn test_browser_action_serde_json_round_trip() -> TestResult {
         let actions = vec![
             BrowserAction::Click {
                 target: Target::new(Selector::Css("button.submit".to_owned())),
@@ -675,55 +677,67 @@ mod tests {
                 key: "Enter".to_owned(),
             },
             BrowserAction::Navigate {
-                url: url::Url::parse("https://example.com/page").expect("valid url in test"),
+                url: url::Url::parse("https://example.com/page")
+                    .map_err(ctx("valid url in test"))?,
             },
             BrowserAction::Reload,
         ];
         for action in actions {
-            let json = serde_json::to_string(&action).expect("action serializes");
-            let decoded: BrowserAction = serde_json::from_str(&json).expect("action deserializes");
+            let json = serde_json::to_string(&action).map_err(ctx("action serializes"))?;
+            let decoded: BrowserAction =
+                serde_json::from_str(&json).map_err(ctx("action deserializes"))?;
             assert_eq!(decoded, action);
         }
+        Ok(())
     }
 
     #[test]
-    fn test_browser_action_deserialize_rejects_upload_variant() {
+    fn test_browser_action_deserialize_rejects_upload_variant() -> TestResult {
         for tag in ["Upload", "upload", "UploadFile", "FileUpload"] {
             let json = serde_json::json!({
-                tag: { "target": target_json(), "file_path": "/home/user/.ssh/id_ed25519" }
+                tag: { "target": target_json()?, "file_path": "/home/user/.ssh/id_ed25519" }
             });
             assert!(
                 serde_json::from_value::<BrowserAction>(json).is_err(),
                 "variant {tag} must not be representable"
             );
         }
+        Ok(())
     }
 
     #[test]
     fn test_browser_action_deserialize_rejects_script_variants() {
-        for tag in ["Script", "script", "CustomScript", "ExecuteScript", "Evaluate"] {
+        for tag in [
+            "Script",
+            "script",
+            "CustomScript",
+            "ExecuteScript",
+            "Evaluate",
+        ] {
             let json = serde_json::json!({ tag: { "script": "fetch('https://evil')" } });
             assert!(serde_json::from_value::<BrowserAction>(json).is_err());
         }
     }
 
     #[test]
-    fn test_browser_action_deserialize_rejects_unknown_fields() {
+    fn test_browser_action_deserialize_rejects_unknown_fields() -> TestResult {
         let json = serde_json::json!({
-            "Click": { "target": target_json(), "file_path": "/etc/passwd" }
+            "Click": { "target": target_json()?, "file_path": "/etc/passwd" }
         });
         assert!(serde_json::from_value::<BrowserAction>(json).is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_action_request_deserialize_rejects_unknown_fields() {
+    fn test_action_request_deserialize_rejects_unknown_fields() -> TestResult {
         let request = ActionRequest::new(BrowserContextId::new(), BrowserAction::Reload);
-        let mut json = serde_json::to_value(&request).expect("request serializes");
+        let mut json = serde_json::to_value(&request).map_err(ctx("request serializes"))?;
         let decoded: ActionRequest =
-            serde_json::from_value(json.clone()).expect("request deserializes");
+            serde_json::from_value(json.clone()).map_err(ctx("request deserializes"))?;
         assert_eq!(decoded, request);
         json["allowed_origins"] = serde_json::json!(["https://evil.example"]);
         assert!(serde_json::from_value::<ActionRequest>(json).is_err());
+        Ok(())
     }
 
     #[test]
@@ -796,7 +810,11 @@ mod tests {
     #[test]
     fn test_validate_rejects_bad_key_and_scroll() {
         let limits = BrowserLimits::default();
-        for key in [String::new(), "a".repeat(MAX_KEY_BYTES + 1), "\u{7}".to_owned()] {
+        for key in [
+            String::new(),
+            "a".repeat(MAX_KEY_BYTES + 1),
+            "\u{7}".to_owned(),
+        ] {
             let action = BrowserAction::KeyPress { target: None, key };
             assert!(action.validate(&limits).is_err());
         }
@@ -815,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_navigate_scheme_and_length() {
+    fn test_validate_navigate_scheme_and_length() -> TestResult {
         let limits = BrowserLimits::default().with_max_url_bytes(40);
         for bad in [
             "file:///etc/passwd",
@@ -824,14 +842,15 @@ mod tests {
             "https://example.com/this/path/is/definitely/too/long",
         ] {
             let action = BrowserAction::Navigate {
-                url: url::Url::parse(bad).expect("valid url in test"),
+                url: url::Url::parse(bad).map_err(ctx("valid url in test"))?,
             };
             assert!(action.validate(&limits).is_err(), "{bad} must be rejected");
         }
         let ok = BrowserAction::Navigate {
-            url: url::Url::parse("https://example.com/").expect("valid url in test"),
+            url: url::Url::parse("https://example.com/").map_err(ctx("valid url in test"))?,
         };
         assert!(ok.validate(&limits).is_ok());
+        Ok(())
     }
 
     #[test]
@@ -847,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    fn test_action_request_serde_json_round_trip() {
+    fn test_action_request_serde_json_round_trip() -> TestResult {
         let request = ActionRequest::new(
             BrowserContextId::new(),
             BrowserAction::Submit {
@@ -856,13 +875,15 @@ mod tests {
         )
         .with_expected_revision(BrowserObservationRevision::initial());
 
-        let json = serde_json::to_string(&request).expect("request serializes");
-        let decoded: ActionRequest = serde_json::from_str(&json).expect("request deserializes");
+        let json = serde_json::to_string(&request).map_err(ctx("request serializes"))?;
+        let decoded: ActionRequest =
+            serde_json::from_str(&json).map_err(ctx("request deserializes"))?;
         assert_eq!(decoded, request);
+        Ok(())
     }
 
     #[test]
-    fn test_action_outcome_serde_json_round_trip_with_diagnostics() {
+    fn test_action_outcome_serde_json_round_trip_with_diagnostics() -> TestResult {
         let diagnostic = BrowserDiagnostic::new(
             crate::diagnostic::Severity::Low,
             crate::diagnostic::DiagnosticSource::Selector,
@@ -874,8 +895,10 @@ mod tests {
         outcome.confirmed = true;
         outcome.diagnostics.push(diagnostic);
 
-        let json = serde_json::to_string(&outcome).expect("outcome serializes");
-        let decoded: ActionOutcome = serde_json::from_str(&json).expect("outcome deserializes");
+        let json = serde_json::to_string(&outcome).map_err(ctx("outcome serializes"))?;
+        let decoded: ActionOutcome =
+            serde_json::from_str(&json).map_err(ctx("outcome deserializes"))?;
         assert_eq!(decoded, outcome);
+        Ok(())
     }
 }

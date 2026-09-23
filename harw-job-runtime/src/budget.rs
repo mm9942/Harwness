@@ -172,21 +172,18 @@ impl Budget {
 /// Whole seconds of a duration, clamped at zero (for human-readable errors).
 fn secs_u64(d: SignedDuration) -> u64 {
     let s = d.as_secs();
-    if s < 0 {
-        0
-    } else {
-        s as u64
-    }
+    if s < 0 { 0 } else { s as u64 }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Budget, BudgetUsage};
     use crate::error::JobRuntimeError;
+    use crate::test_support::{TestError, TestResult, ctx};
     use jiff::SignedDuration;
 
     #[test]
-    fn charge_wall_rejects_negative_full_second_without_mutating_usage() {
+    fn charge_wall_rejects_negative_full_second_without_mutating_usage() -> TestResult {
         let budget = Budget::unbounded();
         let mut usage = BudgetUsage {
             tokens: 12,
@@ -196,9 +193,11 @@ mod tests {
         let original_usage = usage.clone();
         let duration = SignedDuration::from_secs(-1);
 
-        let error = budget
-            .charge_wall(&mut usage, duration)
-            .expect_err("negative wall charges must be rejected");
+        let Err(error) = budget.charge_wall(&mut usage, duration) else {
+            return Err(TestError::Unexpected(
+                "negative wall charges must be rejected".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
@@ -207,10 +206,11 @@ mod tests {
             } if captured == duration
         ));
         assert_eq!(usage, original_usage);
+        Ok(())
     }
 
     #[test]
-    fn charge_wall_rejects_negative_sub_second_without_mutating_usage() {
+    fn charge_wall_rejects_negative_sub_second_without_mutating_usage() -> TestResult {
         let budget = Budget::unbounded();
         let mut usage = BudgetUsage {
             tokens: 12,
@@ -220,9 +220,11 @@ mod tests {
         let original_usage = usage.clone();
         let duration = SignedDuration::from_millis(-1);
 
-        let error = budget
-            .charge_wall(&mut usage, duration)
-            .expect_err("negative wall charges must be rejected");
+        let Err(error) = budget.charge_wall(&mut usage, duration) else {
+            return Err(TestError::Unexpected(
+                "negative wall charges must be rejected".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
@@ -231,20 +233,22 @@ mod tests {
             } if captured == duration
         ));
         assert_eq!(usage, original_usage);
+        Ok(())
     }
 
     #[test]
-    fn charge_wall_accepts_zero_and_positive_durations() {
+    fn charge_wall_accepts_zero_and_positive_durations() -> TestResult {
         let budget = Budget::unbounded();
         let mut usage = BudgetUsage::default();
 
         budget
             .charge_wall(&mut usage, SignedDuration::ZERO)
-            .expect("zero wall charge must be accepted");
+            .map_err(ctx("zero wall charge must be accepted"))?;
         budget
             .charge_wall(&mut usage, SignedDuration::from_millis(1500))
-            .expect("positive wall charge must be accepted");
+            .map_err(ctx("positive wall charge must be accepted"))?;
 
         assert_eq!(usage.wall, SignedDuration::from_millis(1500));
+        Ok(())
     }
 }

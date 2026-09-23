@@ -314,13 +314,16 @@ fn parse_http_endpoint(endpoint: &str) -> Result<Uri, OtlpError> {
     }
 }
 
-fn build_headers(entries: &[crate::config::HeaderEntry]) -> Result<Vec<(HeaderName, HeaderValue)>, OtlpError> {
+fn build_headers(
+    entries: &[crate::config::HeaderEntry],
+) -> Result<Vec<(HeaderName, HeaderValue)>, OtlpError> {
     entries
         .iter()
         .map(|entry| {
-            let name = HeaderName::from_bytes(entry.name.as_bytes()).map_err(|error| OtlpError::Send {
-                reason: format!("invalid header name {:?}: {error}", entry.name),
-            })?;
+            let name =
+                HeaderName::from_bytes(entry.name.as_bytes()).map_err(|error| OtlpError::Send {
+                    reason: format!("invalid header name {:?}: {error}", entry.name),
+                })?;
             let value = HeaderValue::from_str(&entry.value).map_err(|error| OtlpError::Send {
                 reason: format!("invalid header value for header {:?}: {error}", entry.name),
             })?;
@@ -338,6 +341,7 @@ mod tests {
 
     use super::*;
     use crate::config::HeaderEntry;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn test_config(endpoint: &str) -> OtlpConfig {
         OtlpConfig {
@@ -355,9 +359,13 @@ mod tests {
     // vollständige Anfrage (Kopf + `Content-Length`-Rumpf) und reicht die
     // rohen Anfragebytes über den Kanal zurück, damit der aufrufende Test sie
     // prüfen kann.
-    fn spawn_single_request_server(status_line: &'static str) -> (String, mpsc::Receiver<Vec<u8>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener binds");
-        let addr = listener.local_addr().expect("bound listener has an address");
+    fn spawn_single_request_server(
+        status_line: &'static str,
+    ) -> TestResult<(String, mpsc::Receiver<Vec<u8>>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("test listener binds"))?;
+        let addr = listener
+            .local_addr()
+            .map_err(ctx("bound listener has an address"))?;
         let (tx, rx) = mpsc::channel();
 
         thread::spawn(move || {
@@ -390,11 +398,13 @@ mod tests {
             let _ = tx.send(received);
         });
 
-        (format!("http://{addr}/v1/metrics"), rx)
+        Ok((format!("http://{addr}/v1/metrics"), rx))
     }
 
     fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        haystack.windows(needle.len()).position(|window| window == needle)
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
     }
 
     fn content_length_of(header_bytes: &[u8]) -> usize {
@@ -417,11 +427,14 @@ mod tests {
     }
 
     #[test]
-    fn test_new_rejects_https_endpoint_instead_of_downgrading() {
+    fn test_new_rejects_https_endpoint_instead_of_downgrading() -> TestResult {
         let config = test_config("https://collector.example/v1/metrics");
-        let error = HttpTransport::new(&config).expect_err("https:// must be refused");
+        let Err(error) = HttpTransport::new(&config) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(error, OtlpError::Send { .. }));
         assert!(error.to_string().contains("https"));
+        Ok(())
     }
 
     #[test]
@@ -457,66 +470,84 @@ mod tests {
     }
 
     #[test]
-    fn test_send_batch_posts_payload_to_local_listener() {
-        let (endpoint, received) =
-            spawn_single_request_server("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    fn test_send_batch_posts_payload_to_local_listener() -> TestResult {
+        let (endpoint, received) = spawn_single_request_server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
         let config = test_config(&endpoint);
-        let transport = HttpTransport::new(&config).expect("transport builds");
+        let transport = HttpTransport::new(&config).map_err(ctx("transport builds"))?;
 
         let result = transport.send_batch(b"{\"resourceMetrics\":[]}");
         assert!(result.is_ok(), "{result:?}");
 
         let request_bytes = received
             .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("server observed a request");
+            .map_err(ctx("server observed a request"))?;
         let request = String::from_utf8_lossy(&request_bytes);
-        assert!(request.starts_with("POST /v1/metrics HTTP/1.1"), "{request}");
-        assert!(request.to_ascii_lowercase().contains("content-type: application/json"));
+        assert!(
+            request.starts_with("POST /v1/metrics HTTP/1.1"),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("content-type: application/json")
+        );
         assert!(request.ends_with("{\"resourceMetrics\":[]}"));
+        Ok(())
     }
 
     #[test]
-    fn test_send_batch_includes_configured_headers() {
-        let (endpoint, received) =
-            spawn_single_request_server("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    fn test_send_batch_includes_configured_headers() -> TestResult {
+        let (endpoint, received) = spawn_single_request_server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
         let mut config = test_config(&endpoint);
         config.headers = vec![HeaderEntry {
             name: "X-Test-Header".to_owned(),
             value: "test-value".to_owned(),
         }];
-        let transport = HttpTransport::new(&config).expect("transport builds");
+        let transport = HttpTransport::new(&config).map_err(ctx("transport builds"))?;
 
-        transport.send_batch(b"{}").expect("send succeeds");
+        transport.send_batch(b"{}").map_err(ctx("send succeeds"))?;
 
         let request_bytes = received
             .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("server observed a request");
+            .map_err(ctx("server observed a request"))?;
         let request = String::from_utf8_lossy(&request_bytes);
         assert!(request.contains("x-test-header: test-value"), "{request}");
+        Ok(())
     }
 
     #[test]
-    fn test_send_batch_reports_non_success_status_as_send_error() {
-        let (endpoint, _received) =
-            spawn_single_request_server("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    fn test_send_batch_reports_non_success_status_as_send_error() -> TestResult {
+        let (endpoint, _received) = spawn_single_request_server(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
         let config = test_config(&endpoint);
-        let transport = HttpTransport::new(&config).expect("transport builds");
+        let transport = HttpTransport::new(&config).map_err(ctx("transport builds"))?;
 
-        let error = transport.send_batch(b"{}").expect_err("non-2xx must be an error");
+        let Err(error) = transport.send_batch(b"{}") else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(error, OtlpError::Send { .. }));
         assert!(error.to_string().contains("503"));
+        Ok(())
     }
 
     #[test]
-    fn test_send_batch_reports_connection_refused_as_send_error() {
+    fn test_send_batch_reports_connection_refused_as_send_error() -> TestResult {
         // Port 0 never accepts connections; nothing is bound here on purpose
         // -- this stays within "no real network connection", it simply never
         // establishes one.
         let config = test_config("http://127.0.0.1:1/v1/metrics");
-        let transport = HttpTransport::new(&config).expect("transport builds");
+        let transport = HttpTransport::new(&config).map_err(ctx("transport builds"))?;
 
-        let error = transport.send_batch(b"{}").expect_err("unreachable endpoint must error");
+        let Err(error) = transport.send_batch(b"{}") else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(error, OtlpError::Send { .. }));
+        Ok(())
     }
 
     #[test]
@@ -526,26 +557,29 @@ mod tests {
     }
 
     #[test]
-    fn test_http_transport_usable_through_arc_dyn_otlp_transport() {
+    fn test_http_transport_usable_through_arc_dyn_otlp_transport() -> TestResult {
         use std::sync::Arc;
-        let (endpoint, _received) =
-            spawn_single_request_server("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let (endpoint, _received) = spawn_single_request_server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
         let config = test_config(&endpoint);
         let transport: Arc<dyn OtlpTransport> =
-            Arc::new(HttpTransport::new(&config).expect("transport builds"));
+            Arc::new(HttpTransport::new(&config).map_err(ctx("transport builds"))?);
         assert!(transport.send_batch(b"{}").is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_debug_output_omits_header_values() {
+    fn test_debug_output_omits_header_values() -> TestResult {
         let mut config = test_config("http://127.0.0.1:4318/v1/metrics");
         config.headers = vec![HeaderEntry {
             name: "Authorization".to_owned(),
             value: "Bearer super-secret-token".to_owned(),
         }];
-        let transport = HttpTransport::new(&config).expect("transport builds");
+        let transport = HttpTransport::new(&config).map_err(ctx("transport builds"))?;
         let debug = format!("{transport:?}");
         assert!(!debug.contains("super-secret-token"), "{debug}");
         assert!(debug.contains("header_count"), "{debug}");
+        Ok(())
     }
 }

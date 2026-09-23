@@ -833,6 +833,7 @@ impl GoalStore for FileGoalStore {
 mod tests {
     use super::*;
     use crate::goal::{GoalId, GoalPatch, GoalStatus, Invariant};
+    use crate::test_support::TestResult;
     use crate::types::{Criterion, VerificationStep};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -869,49 +870,34 @@ mod tests {
         }
     }
 
-    /// Wendet eine Aktion an und bricht mit klarer Meldung ab, wenn sie
-    /// fehlschlägt — Ersatz für das projektweit verbotene `unwrap()`.
-    fn apply_ok(store: &dyn GoalStore, action: GoalAction, actor: &str) -> GoalEvent {
-        match store.apply(action, actor) {
-            Ok(event) => event,
-            Err(error) => panic!("Aktion muss gelingen, war: {error}"),
-        }
+    /// Wendet eine Aktion an und gibt bei Fehlschlag `Err` zurück — Ersatz
+    /// für das projektweit verbotene `unwrap()`/`panic!` (Bible R087/R165).
+    fn apply_ok(store: &dyn GoalStore, action: GoalAction, actor: &str) -> TestResult<GoalEvent> {
+        Ok(store.apply(action, actor)?)
     }
 
-    /// Liest das aktuelle Ziel oder bricht ab.
-    fn current_ok(store: &dyn GoalStore) -> Goal {
-        match store.current() {
-            Ok(goal) => goal,
-            Err(error) => panic!("current() muss ein Ziel liefern, war: {error}"),
-        }
+    /// Liest das aktuelle Ziel oder gibt `Err` zurück.
+    fn current_ok(store: &dyn GoalStore) -> TestResult<Goal> {
+        Ok(store.current()?)
     }
 
-    /// Liest die History oder bricht ab.
-    fn history_ok(store: &dyn GoalStore, since: Option<u64>) -> Vec<GoalEvent> {
-        match store.history(since) {
-            Ok(events) => events,
-            Err(error) => panic!("history() muss gelingen, war: {error}"),
-        }
+    /// Liest die History oder gibt `Err` zurück.
+    fn history_ok(store: &dyn GoalStore, since: Option<u64>) -> TestResult<Vec<GoalEvent>> {
+        Ok(store.history(since)?)
     }
 
-    /// Legt ein Temp-Verzeichnis an oder bricht ab.
-    fn temp_dir() -> TempDir {
-        match TempDir::new() {
-            Ok(dir) => dir,
-            Err(error) => panic!("Temp-Verzeichnis anlegen: {error}"),
-        }
+    /// Legt ein Temp-Verzeichnis an oder gibt `Err` zurück.
+    fn temp_dir() -> TestResult<TempDir> {
+        Ok(TempDir::new()?)
     }
 
-    /// Öffnet einen `FileGoalStore` auf `dir` oder bricht ab.
-    fn file_store(dir: &TempDir) -> FileGoalStore {
-        match FileGoalStore::new(dir.path()) {
-            Ok(store) => store,
-            Err(error) => panic!("FileGoalStore öffnen: {error}"),
-        }
+    /// Öffnet einen `FileGoalStore` auf `dir` oder gibt `Err` zurück.
+    fn file_store(dir: &TempDir) -> TestResult<FileGoalStore> {
+        Ok(FileGoalStore::new(dir.path())?)
     }
 
     /// Setzt ein aktives Ziel und liefert den Store zurück.
-    fn seeded_memory_store() -> InMemoryGoalStore {
+    fn seeded_memory_store() -> TestResult<InMemoryGoalStore> {
         let store = InMemoryGoalStore::new();
         apply_ok(
             &store,
@@ -919,17 +905,17 @@ mod tests {
                 goal: make_goal(GoalStatus::Active),
             },
             "human:mia",
-        );
-        store
+        )?;
+        Ok(store)
     }
 
     // ── InMemoryGoalStore ────────────────────────────────────────────────────
 
     #[test]
-    fn test_apply_set_roundtrips_through_current() {
-        let store = seeded_memory_store();
+    fn test_apply_set_roundtrips_through_current() -> TestResult {
+        let store = seeded_memory_store()?;
 
-        let goal = current_ok(&store);
+        let goal = current_ok(&store)?;
         assert_eq!(goal.id, GoalId::new("g-test"));
         assert_eq!(goal.statement, "Goal-Store fertigstellen");
         assert_eq!(
@@ -939,20 +925,22 @@ mod tests {
         assert_eq!(goal.acceptance_criteria.len(), 1);
         assert_eq!(goal.invariants.len(), 1);
         assert_eq!(goal.status, GoalStatus::Active);
+        Ok(())
     }
 
     #[test]
-    fn test_current_before_any_set_returns_goal_not_found() {
+    fn test_current_before_any_set_returns_goal_not_found() -> TestResult {
         let store = InMemoryGoalStore::new();
 
         assert!(matches!(store.current(), Err(PlanError::GoalNotFound)));
         assert_eq!(store.revision(), 0);
-        assert!(history_ok(&store, None).is_empty());
+        assert!(history_ok(&store, None)?.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_apply_increments_revision_by_exactly_one_per_action() {
-        let store = seeded_memory_store();
+    fn test_apply_increments_revision_by_exactly_one_per_action() -> TestResult {
+        let store = seeded_memory_store()?;
         assert_eq!(store.revision(), 1);
 
         let second = apply_ok(
@@ -964,45 +952,47 @@ mod tests {
                 },
             },
             "human:mia",
-        );
+        )?;
         assert_eq!(second.revision, 2);
         assert_eq!(store.revision(), 2);
 
-        let third = apply_ok(&store, GoalAction::Inspect, "human:mia");
+        let third = apply_ok(&store, GoalAction::Inspect, "human:mia")?;
         assert_eq!(third.revision, 3);
-        assert_eq!(current_ok(&store).revision, 3);
+        assert_eq!(current_ok(&store)?.revision, 3);
+        Ok(())
     }
 
     #[test]
-    fn test_history_returns_all_events_and_filters_from_since() {
-        let store = seeded_memory_store();
-        apply_ok(&store, GoalAction::Inspect, "human:mia");
+    fn test_history_returns_all_events_and_filters_from_since() -> TestResult {
+        let store = seeded_memory_store()?;
+        apply_ok(&store, GoalAction::Inspect, "human:mia")?;
         apply_ok(
             &store,
             GoalAction::Condense {
                 summary: "verdichtet".to_owned(),
             },
             "human:mia",
-        );
+        )?;
 
-        let all = history_ok(&store, None);
+        let all = history_ok(&store, None)?;
         assert_eq!(all.len(), 3);
         assert_eq!(
             all.iter().map(|event| event.revision).collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
 
-        let tail = history_ok(&store, Some(2));
+        let tail = history_ok(&store, Some(2))?;
         assert_eq!(
             tail.iter().map(|event| event.revision).collect::<Vec<_>>(),
             vec![2, 3],
             "history(Some(n)) muss ab n einschließlich liefern"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_apply_model_actor_cannot_declare_achieved_and_leaves_goal_untouched() {
-        let store = seeded_memory_store();
+    fn test_apply_model_actor_cannot_declare_achieved_and_leaves_goal_untouched() -> TestResult {
+        let store = seeded_memory_store()?;
 
         let result = store.apply(
             GoalAction::SetStatus {
@@ -1016,7 +1006,7 @@ mod tests {
             matches!(result, Err(PlanError::ActorNotAuthorized { .. })),
             "ein Modell-Akteur darf Achieved nicht erklären, Ergebnis: {result:?}"
         );
-        let goal = current_ok(&store);
+        let goal = current_ok(&store)?;
         assert_eq!(
             goal.status,
             GoalStatus::Active,
@@ -1027,15 +1017,16 @@ mod tests {
             "der abgelehnte Versuch darf die Revision nicht erhöhen"
         );
         assert_eq!(
-            history_ok(&store, None).len(),
+            history_ok(&store, None)?.len(),
             1,
             "der abgelehnte Versuch darf keinen History-Eintrag erzeugen"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_apply_human_actor_may_declare_achieved() {
-        let store = seeded_memory_store();
+    fn test_apply_human_actor_may_declare_achieved() -> TestResult {
+        let store = seeded_memory_store()?;
 
         let event = apply_ok(
             &store,
@@ -1044,16 +1035,17 @@ mod tests {
                 reason: None,
             },
             "human:mia",
-        );
+        )?;
 
         assert_eq!(event.revision, 2);
-        assert_eq!(current_ok(&store).status, GoalStatus::Achieved);
+        assert_eq!(current_ok(&store)?.status, GoalStatus::Achieved);
+        Ok(())
     }
 
     #[test]
-    fn test_apply_refine_never_removes_acceptance_criteria() {
-        let store = seeded_memory_store();
-        let before = current_ok(&store);
+    fn test_apply_refine_never_removes_acceptance_criteria() -> TestResult {
+        let store = seeded_memory_store()?;
+        let before = current_ok(&store)?;
 
         apply_ok(
             &store,
@@ -1066,9 +1058,9 @@ mod tests {
                 },
             },
             "human:mia",
-        );
+        )?;
 
-        let after = current_ok(&store);
+        let after = current_ok(&store)?;
         assert_eq!(after.statement, "neuer Wortlaut");
         assert_eq!(
             after.acceptance_criteria.len(),
@@ -1080,6 +1072,7 @@ mod tests {
             after.acceptance_criteria[0].description,
             before.acceptance_criteria[0].description
         );
+        Ok(())
     }
 
     #[test]
@@ -1112,9 +1105,9 @@ mod tests {
     // ── FileGoalStore ────────────────────────────────────────────────────────
 
     #[test]
-    fn test_apply_writes_snapshot_and_history_files() {
-        let dir = temp_dir();
-        let store = file_store(&dir);
+    fn test_apply_writes_snapshot_and_history_files() -> TestResult {
+        let dir = temp_dir()?;
+        let store = file_store(&dir)?;
 
         apply_ok(
             &store,
@@ -1122,17 +1115,14 @@ mod tests {
                 goal: make_goal(GoalStatus::Active),
             },
             "human:mia",
-        );
+        )?;
 
         let snapshot = dir.path().join("rev-1.json");
         assert!(snapshot.exists(), "Snapshot fehlt: {snapshot:?}");
         let history_file = dir.path().join("history.jsonl");
         assert!(history_file.exists(), "history.jsonl fehlt");
 
-        let content = match std::fs::read_to_string(&history_file) {
-            Ok(content) => content,
-            Err(error) => panic!("history.jsonl lesen: {error}"),
-        };
+        let content = std::fs::read_to_string(&history_file)?;
         assert_eq!(
             content
                 .lines()
@@ -1141,28 +1131,26 @@ mod tests {
             1
         );
 
-        let leftovers = match std::fs::read_dir(dir.path()) {
-            Ok(entries) => entries
-                .filter_map(Result::ok)
-                .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
-                .count(),
-            Err(error) => panic!("Verzeichnis lesen: {error}"),
-        };
+        let leftovers = std::fs::read_dir(dir.path())?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .count();
         assert_eq!(leftovers, 0, "Tmp-Datei wurde nicht entfernt");
+        Ok(())
     }
 
     #[test]
-    fn test_new_reloads_goal_and_revision_from_the_same_directory() {
-        let dir = temp_dir();
+    fn test_new_reloads_goal_and_revision_from_the_same_directory() -> TestResult {
+        let dir = temp_dir()?;
         {
-            let store = file_store(&dir);
+            let store = file_store(&dir)?;
             apply_ok(
                 &store,
                 GoalAction::Set {
                     goal: make_goal(GoalStatus::Active),
                 },
                 "human:mia",
-            );
+            )?;
             apply_ok(
                 &store,
                 GoalAction::AddCriterion {
@@ -1172,11 +1160,11 @@ mod tests {
                     },
                 },
                 "human:mia",
-            );
+            )?;
         }
 
-        let reloaded = file_store(&dir);
-        let goal = current_ok(&reloaded);
+        let reloaded = file_store(&dir)?;
+        let goal = current_ok(&reloaded)?;
         assert_eq!(goal.statement, "Goal-Store fertigstellen");
         assert_eq!(
             goal.acceptance_criteria.len(),
@@ -1188,59 +1176,62 @@ mod tests {
             2,
             "die Revision darf nicht zurückfallen"
         );
-        assert_eq!(history_ok(&reloaded, None).len(), 2);
+        assert_eq!(history_ok(&reloaded, None)?.len(), 2);
         assert_eq!(
-            apply_ok(&reloaded, GoalAction::Inspect, "human:mia").revision,
+            apply_ok(&reloaded, GoalAction::Inspect, "human:mia")?.revision,
             3,
             "nach dem Reload muss die nächste Revision fortsetzen, nicht neu beginnen"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_current_before_any_set_returns_goal_not_found_on_disk_store() {
-        let dir = temp_dir();
-        let store = file_store(&dir);
+    fn test_current_before_any_set_returns_goal_not_found_on_disk_store() -> TestResult {
+        let dir = temp_dir()?;
+        let store = file_store(&dir)?;
 
         assert!(matches!(store.current(), Err(PlanError::GoalNotFound)));
         assert_eq!(store.revision(), 0);
-        assert!(history_ok(&store, None).is_empty());
+        assert!(history_ok(&store, None)?.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_history_filters_from_since_on_disk_store() {
-        let dir = temp_dir();
-        let store = file_store(&dir);
+    fn test_history_filters_from_since_on_disk_store() -> TestResult {
+        let dir = temp_dir()?;
+        let store = file_store(&dir)?;
         apply_ok(
             &store,
             GoalAction::Set {
                 goal: make_goal(GoalStatus::Active),
             },
             "human:mia",
-        );
-        apply_ok(&store, GoalAction::Inspect, "human:mia");
-        apply_ok(&store, GoalAction::Inspect, "human:mia");
+        )?;
+        apply_ok(&store, GoalAction::Inspect, "human:mia")?;
+        apply_ok(&store, GoalAction::Inspect, "human:mia")?;
 
-        assert_eq!(history_ok(&store, None).len(), 3);
+        assert_eq!(history_ok(&store, None)?.len(), 3);
         assert_eq!(
-            history_ok(&store, Some(3))
+            history_ok(&store, Some(3))?
                 .iter()
                 .map(|event| event.revision)
                 .collect::<Vec<_>>(),
             vec![3]
         );
+        Ok(())
     }
 
     #[test]
-    fn test_apply_model_actor_rejection_writes_nothing_to_disk() {
-        let dir = temp_dir();
-        let store = file_store(&dir);
+    fn test_apply_model_actor_rejection_writes_nothing_to_disk() -> TestResult {
+        let dir = temp_dir()?;
+        let store = file_store(&dir)?;
         apply_ok(
             &store,
             GoalAction::Set {
                 goal: make_goal(GoalStatus::Active),
             },
             "human:mia",
-        );
+        )?;
 
         let result = store.apply(
             GoalAction::SetStatus {
@@ -1254,10 +1245,10 @@ mod tests {
             matches!(result, Err(PlanError::ActorNotAuthorized { .. })),
             "ein Modell-Akteur darf Achieved nicht erklären, Ergebnis: {result:?}"
         );
-        assert_eq!(current_ok(&store).status, GoalStatus::Active);
+        assert_eq!(current_ok(&store)?.status, GoalStatus::Active);
         assert_eq!(store.revision(), 1);
         assert_eq!(
-            history_ok(&store, None).len(),
+            history_ok(&store, None)?.len(),
             1,
             "der abgelehnte Versuch darf keine History-Zeile schreiben"
         );
@@ -1267,22 +1258,23 @@ mod tests {
         );
 
         // Auch ein Neustart darf den abgelehnten Versuch nicht sichtbar machen.
-        let reloaded = file_store(&dir);
-        assert_eq!(current_ok(&reloaded).status, GoalStatus::Active);
+        let reloaded = file_store(&dir)?;
+        assert_eq!(current_ok(&reloaded)?.status, GoalStatus::Active);
         assert_eq!(reloaded.revision(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_apply_refine_never_removes_acceptance_criteria_on_disk_store() {
-        let dir = temp_dir();
-        let store = file_store(&dir);
+    fn test_apply_refine_never_removes_acceptance_criteria_on_disk_store() -> TestResult {
+        let dir = temp_dir()?;
+        let store = file_store(&dir)?;
         apply_ok(
             &store,
             GoalAction::Set {
                 goal: make_goal(GoalStatus::Active),
             },
             "human:mia",
-        );
+        )?;
 
         apply_ok(
             &store,
@@ -1293,10 +1285,10 @@ mod tests {
                 },
             },
             "human:mia",
-        );
+        )?;
 
-        let reloaded = file_store(&dir);
-        let goal = current_ok(&reloaded);
+        let reloaded = file_store(&dir)?;
+        let goal = current_ok(&reloaded)?;
         assert_eq!(goal.statement, "verdichtetes Ziel");
         assert_eq!(
             goal.acceptance_criteria.len(),
@@ -1304,71 +1296,62 @@ mod tests {
             "Refine darf ein Ziel nie stillschweigend schrumpfen (philosophy.md §5)"
         );
         assert_eq!(goal.invariants.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_apply_set_preserves_created_at_across_a_replacing_set() {
-        let dir = temp_dir();
-        let store = file_store(&dir);
+    fn test_apply_set_preserves_created_at_across_a_replacing_set() -> TestResult {
+        let dir = temp_dir()?;
+        let store = file_store(&dir)?;
         apply_ok(
             &store,
             GoalAction::Set {
                 goal: make_goal(GoalStatus::Draft),
             },
             "human:mia",
-        );
-        let created_at = current_ok(&store).created_at;
+        )?;
+        let created_at = current_ok(&store)?.created_at;
 
         let mut replacement = make_goal(GoalStatus::Active);
         replacement.statement = "ersetztes Ziel".to_owned();
-        apply_ok(&store, GoalAction::Set { goal: replacement }, "human:mia");
+        apply_ok(&store, GoalAction::Set { goal: replacement }, "human:mia")?;
 
-        let goal = current_ok(&store);
+        let goal = current_ok(&store)?;
         assert_eq!(goal.statement, "ersetztes Ziel");
         assert_eq!(goal.revision, 2);
         assert_eq!(
             goal.created_at, created_at,
             "created_at markiert den Beginn der Zielverfolgung und darf ein Set überdauern"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_stage_atomic_write_publishes_content_and_removes_the_temp_file() {
-        let dir = temp_dir();
+    fn test_stage_atomic_write_publishes_content_and_removes_the_temp_file() -> TestResult {
+        let dir = temp_dir()?;
         let target = dir.path().join("rev-7.json");
 
-        let staged = match FileGoalStore::stage_atomic_write(&target, b"{\"ok\":true}") {
-            Ok(staged) => staged,
-            Err(error) => panic!("stage_atomic_write: {error}"),
-        };
-        if let Err(error) = staged.commit() {
-            panic!("commit: {error}");
-        }
+        let staged = FileGoalStore::stage_atomic_write(&target, b"{\"ok\":true}")?;
+        staged.commit()?;
 
         assert!(target.exists(), "Zieldatei fehlt nach staged write");
-        match std::fs::read(&target) {
-            Ok(content) => assert_eq!(content, b"{\"ok\":true}"),
-            Err(error) => panic!("Zieldatei lesen: {error}"),
-        }
-        let leftovers = match std::fs::read_dir(dir.path()) {
-            Ok(entries) => entries
-                .filter_map(Result::ok)
-                .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
-                .count(),
-            Err(error) => panic!("Verzeichnis lesen: {error}"),
-        };
+        let content = std::fs::read(&target)?;
+        assert_eq!(content, b"{\"ok\":true}");
+        let leftovers = std::fs::read_dir(dir.path())?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .count();
         assert_eq!(leftovers, 0, "Tmp-Datei wurde nicht entfernt");
+        Ok(())
     }
 
     #[test]
-    fn test_apply_discards_the_snapshot_when_the_history_append_fails() {
-        let dir = temp_dir();
+    fn test_apply_discards_the_snapshot_when_the_history_append_fails() -> TestResult {
+        let dir = temp_dir()?;
         // Ein Verzeichnis an der Stelle der history.jsonl lässt den Append
         // scheitern — ohne den Store selbst zu verbiegen.
-        if let Err(error) = std::fs::create_dir(dir.path().join("history.jsonl")) {
-            panic!("history.jsonl als Verzeichnis anlegen: {error}");
-        }
-        let store = file_store(&dir);
+        std::fs::create_dir(dir.path().join("history.jsonl"))?;
+        let store = file_store(&dir)?;
 
         let result = store.apply(
             GoalAction::Set {
@@ -1387,34 +1370,33 @@ mod tests {
             !dir.path().join("rev-1.json").exists(),
             "ein fehlgeschlagener History-Append darf keinen Snapshot veröffentlichen"
         );
+        Ok(())
     }
 
     // ── Integritätssiegel ──────────────────────────────────────────────────
 
     #[test]
-    fn test_file_goal_store_rejects_manipulated_snapshot_on_open() {
-        let dir = temp_dir();
+    fn test_file_goal_store_rejects_manipulated_snapshot_on_open() -> TestResult {
+        let dir = temp_dir()?;
         {
-            let store = file_store(&dir);
+            let store = file_store(&dir)?;
             apply_ok(
                 &store,
                 GoalAction::Set {
                     goal: make_goal(GoalStatus::Active),
                 },
                 "human:mia",
-            );
+            )?;
         }
         assert!(dir.path().join("rev-1.seal").exists(), "Siegel geschrieben");
         let snapshot = dir.path().join("rev-1.json");
-        let original = match std::fs::read_to_string(&snapshot) {
-            Ok(content) => content,
-            Err(error) => panic!("Snapshot lesen: {error}"),
-        };
+        let original = std::fs::read_to_string(&snapshot)?;
         let tampered = original.replace("\"active\"", "\"achieved\"");
-        assert_ne!(original, tampered, "Testaufbau: Status muss im Snapshot stehen");
-        if let Err(error) = std::fs::write(&snapshot, tampered) {
-            panic!("Snapshot schreiben: {error}");
-        }
+        assert_ne!(
+            original, tampered,
+            "Testaufbau: Status muss im Snapshot stehen"
+        );
+        std::fs::write(&snapshot, tampered)?;
 
         let result = FileGoalStore::new(dir.path());
 
@@ -1422,36 +1404,36 @@ mod tests {
             matches!(result, Err(PlanError::SealMismatch { .. })),
             "manipuliertes Ziel muss beim Öffnen abgewiesen werden"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_file_goal_store_legacy_without_seal_opens_and_seals_next_write() {
-        let dir = temp_dir();
+    fn test_file_goal_store_legacy_without_seal_opens_and_seals_next_write() -> TestResult {
+        let dir = temp_dir()?;
         {
-            let store = file_store(&dir);
+            let store = file_store(&dir)?;
             apply_ok(
                 &store,
                 GoalAction::Set {
                     goal: make_goal(GoalStatus::Active),
                 },
                 "human:mia",
-            );
+            )?;
         }
-        if let Err(error) = std::fs::remove_file(dir.path().join("rev-1.seal")) {
-            panic!("Siegel entfernen: {error}");
-        }
+        std::fs::remove_file(dir.path().join("rev-1.seal"))?;
 
-        let legacy = file_store(&dir);
-        assert_eq!(current_ok(&legacy).revision, 1);
+        let legacy = file_store(&dir)?;
+        assert_eq!(current_ok(&legacy)?.revision, 1);
         apply_ok(
             &legacy,
             GoalAction::Set {
                 goal: make_goal(GoalStatus::Active),
             },
             "human:mia",
-        );
+        )?;
         assert!(dir.path().join("rev-2.seal").exists());
         drop(legacy);
-        assert_eq!(current_ok(&file_store(&dir)).revision, 2);
+        assert_eq!(current_ok(&file_store(&dir)?)?.revision, 2);
+        Ok(())
     }
 }

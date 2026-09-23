@@ -66,3 +66,7 @@ Aufruf: cargo xtask <befehl> [argumente]
 
   gates    Struktur- und Berechtigungsprüfungen über den Abhängigkeitsgraphen
   webui    Typerzeugung und statischer Export der Control Plane";
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

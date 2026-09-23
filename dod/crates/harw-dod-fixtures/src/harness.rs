@@ -10,11 +10,17 @@
 //! damit sie wie gewöhnlicher Rust-Code lesbar, testbar und dokumentierbar
 //! bleibt.
 //!
-//! Jede Funktion **paniert** bei einer verletzten Prüfung (über `assert!`/
-//! `panic!`), statt einen `Result` zurückzugeben — das ist die Form, die
-//! `#[test]`-Funktionen erwarten. Ein Aufrufer außerhalb eines Tests (z. B.
-//! ein eigenes Diagnosewerkzeug) kann jede Funktion trotzdem direkt rufen und
-//! den Panic selbst über `std::panic::catch_unwind` einfangen — genau so
+//! Jede Funktion gibt bei einer verletzten Prüfung ein
+//! `Err(`[`crate::error::HarnessViolation`]`)` zurück, statt zu paniken
+//! (Bible R087/R089: Prüf-Helfer dürfen nicht paniken). `#[test]`-Funktionen
+//! akzeptieren `-> Result<(), E>` mit `E: std::fmt::Debug` genauso wie `()`,
+//! deshalb erzeugt [`crate::sensor_suite!`] für jede Prüfung einen dünnen
+//! `#[test]`-Wrapper mit dieser Rückgabeform. Einzige Ausnahme:
+//! [`assert_adversarial_survives`] fängt intern eine Sensor-Panik über
+//! `std::panic::catch_unwind` ab — das Abfangen selbst ist kein Paniken,
+//! sondern übersetzt eine gefangene Panik in ein `Err`. Ein Aufrufer
+//! außerhalb eines Tests (z. B. ein eigenes Diagnosewerkzeug) kann jede
+//! Funktion trotzdem direkt rufen und das `Err` selbst behandeln — genau so
 //! belegt diese Crate ihre eigenen roten Zweige (siehe `tests/` im
 //! Quellbaum).
 //!
@@ -27,9 +33,11 @@
 //! dieser Funktionen tut.
 //!
 //! # Fehler
-//! Kein `Result`; siehe oben. Interne Lese-/Schreibfehler auf den
-//! Fixture-Dateien werden über `panic!` mit einer erklärenden Meldung
-//! gemeldet, nie stillschweigend verschluckt.
+//! [`crate::error::HarnessViolation`] — jede `assert_*`-Funktion gibt bei
+//! einer verletzten Prüfung oder einem internen Lese-/Schreibfehler auf den
+//! Fixture-Dateien ein `Err(HarnessViolation)` mit vollem Kontext zurück
+//! (Fall-Pfad, `Capability`, Grund, ggf. gerenderter Quellfehler), nie
+//! stillschweigend verschluckt und nie als Panic.
 //!
 //! # Bereichsdichtheit vs. leerer Bereich — zwei Behauptungen (K48)
 //! [`assert_scope_containment`] einerseits und [`assert_scope_tightness`]/
@@ -76,6 +84,7 @@ use harw_dod_signals::{EventKind, Sensor, SensorReading};
 use jiff::Timestamp;
 
 use crate::build_handle;
+use crate::error::{HarnessResult, HarnessViolation};
 use crate::fixture_io::{read_expected, reading_to_json};
 
 /// Textmarkierung, die [`assert_content_freedom`] in eine Arbeitskopie des
@@ -184,12 +193,14 @@ pub enum EmptyScopeExpectation {
 /// - `fixtures_root` (`&Path`): das `fixtures/`-Wurzelverzeichnis.
 ///
 /// # Returns
-/// `()` — kein normaler Fixture-Fall verletzt die Prüfung.
+/// `Ok(())` — kein normaler Fixture-Fall verletzt die Prüfung.
 ///
-/// # Panics
-/// Wenn kein normaler Fixture-Fall existiert, ein Poll fehlschlägt, zwei
-/// Polls mit gleichem `now` unterschiedliche Ergebnisse liefern, oder das
-/// Ergebnis von `expect.json` abweicht.
+/// # Errors
+/// - [`HarnessViolation::Check`]: kein normaler Fixture-Fall existiert, zwei
+///   Polls mit gleichem `now` liefern unterschiedliche Ergebnisse, oder das
+///   Ergebnis weicht von `expect.json` ab.
+/// - [`HarnessViolation::Setup`]: `expect.json` ist unlesbar, oder ein Poll
+///   ist mit einem Fremdfehler gescheitert.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -202,52 +213,78 @@ pub enum EmptyScopeExpectation {
 /// #         Ok(harw_dod_signals::SensorReading::default())
 /// #     }
 /// # }
-/// harw_dod_fixtures::harness::assert_determinism(
+/// let _ = harw_dod_fixtures::harness::assert_determinism(
 ///     Demo,
 ///     Capability::ReadSysfsThermal,
 ///     std::path::Path::new("fixtures"),
 /// );
 /// ```
-pub fn assert_determinism<S, F>(build: F, capability: Capability, fixtures_root: &Path)
+pub fn assert_determinism<S, F>(
+    build: F,
+    capability: Capability,
+    fixtures_root: &Path,
+) -> HarnessResult
 where
     S: Sensor,
     F: Fn(SensorHandle<Bound>) -> S,
 {
     let cases = list_normal_cases(fixtures_root);
-    assert!(
-        !cases.is_empty(),
-        "kein normaler Fixture-Fall unter {}: mindestens ein <fall>/tree + <fall>/expect.json wird für die Determinismus-Prüfung gebraucht",
-        fixtures_root.display()
-    );
+    if cases.is_empty() {
+        return Err(HarnessViolation::Check {
+            case: fixtures_root.display().to_string(),
+            capability,
+            reason: "kein normaler Fixture-Fall: mindestens ein <fall>/tree + <fall>/expect.json wird für die Determinismus-Prüfung gebraucht".to_owned(),
+        });
+    }
 
     for case in cases {
-        let expected = read_expected(&case).unwrap_or_else(|e| {
-            panic!("Fall {}: expect.json unlesbar: {e}", case.display())
-        });
+        let expected = read_expected(&case).map_err(|e| HarnessViolation::Setup {
+            case: case.display().to_string(),
+            capability,
+            reason: "expect.json unlesbar".to_owned(),
+            source: e.to_string(),
+        })?;
         let scope = ReadScope::from_roots([case.join("tree")]);
         let sensor = build(build_handle(capability, scope));
 
-        let first = sensor.poll(expected.now).unwrap_or_else(|e| {
-            panic!("Fall {}: erster Poll fehlgeschlagen: {e}", case.display())
-        });
-        let second = sensor.poll(expected.now).unwrap_or_else(|e| {
-            panic!("Fall {}: zweiter Poll fehlgeschlagen: {e}", case.display())
-        });
-        assert_eq!(
-            first,
-            second,
-            "Fall {}: zwei Polls mit demselben injizierten now ergaben unterschiedliche SensorReadings — Determinismus verletzt",
-            case.display()
-        );
+        let first = sensor
+            .poll(expected.now)
+            .map_err(|e| HarnessViolation::Setup {
+                case: case.display().to_string(),
+                capability,
+                reason: "erster Poll fehlgeschlagen".to_owned(),
+                source: e.to_string(),
+            })?;
+        let second = sensor
+            .poll(expected.now)
+            .map_err(|e| HarnessViolation::Setup {
+                case: case.display().to_string(),
+                capability,
+                reason: "zweiter Poll fehlgeschlagen".to_owned(),
+                source: e.to_string(),
+            })?;
+        if first != second {
+            return Err(HarnessViolation::Check {
+                case: case.display().to_string(),
+                capability,
+                reason: format!(
+                    "zwei Polls mit demselben injizierten now ergaben unterschiedliche SensorReadings — Determinismus verletzt: {first:?} != {second:?}"
+                ),
+            });
+        }
 
         let expected_reading = expected.reading.into_reading();
-        assert_eq!(
-            first,
-            expected_reading,
-            "Fall {}: SensorReading weicht von expect.json ab",
-            case.display()
-        );
+        if first != expected_reading {
+            return Err(HarnessViolation::Check {
+                case: case.display().to_string(),
+                capability,
+                reason: format!(
+                    "SensorReading weicht von expect.json ab: erhalten {first:?}, erwartet {expected_reading:?}"
+                ),
+            });
+        }
     }
+    Ok(())
 }
 
 /// Prüfung 2 — Inhaltsfreiheit.
@@ -267,53 +304,80 @@ where
 /// Siehe [`assert_determinism`].
 ///
 /// # Returns
-/// `()` — kein normaler Fixture-Fall verletzt die Prüfung.
+/// `Ok(())` — kein normaler Fixture-Fall verletzt die Prüfung.
 ///
-/// # Panics
-/// Wenn kein normaler Fixture-Fall existiert, die Kanarienkopie nicht
-/// angelegt werden kann, oder [`CONTENT_CANARY`] im Poll-Ergebnis erscheint.
+/// # Errors
+/// - [`HarnessViolation::Check`]: kein normaler Fixture-Fall existiert, oder
+///   [`CONTENT_CANARY`] erscheint im Poll-Ergebnis.
+/// - [`HarnessViolation::Setup`]: `expect.json` ist unlesbar, die
+///   Kanarienkopie kann nicht angelegt werden, das Kopieren des
+///   Fixture-Baums schlägt fehl, oder die Kanarienmarkierung lässt sich
+///   nicht schreiben.
 ///
 /// # Examples
 /// Siehe [`assert_determinism`] für den Aufbau des `build`-Arguments;
 /// `assert_content_freedom` wird identisch aufgerufen.
-pub fn assert_content_freedom<S, F>(build: F, capability: Capability, fixtures_root: &Path)
+pub fn assert_content_freedom<S, F>(
+    build: F,
+    capability: Capability,
+    fixtures_root: &Path,
+) -> HarnessResult
 where
     S: Sensor,
     F: Fn(SensorHandle<Bound>) -> S,
 {
     let cases = list_normal_cases(fixtures_root);
-    assert!(
-        !cases.is_empty(),
-        "kein normaler Fixture-Fall unter {}: mindestens ein Fall wird für die Inhaltsfreiheits-Prüfung gebraucht",
-        fixtures_root.display()
-    );
+    if cases.is_empty() {
+        return Err(HarnessViolation::Check {
+            case: fixtures_root.display().to_string(),
+            capability,
+            reason: "kein normaler Fixture-Fall: mindestens ein Fall wird für die Inhaltsfreiheits-Prüfung gebraucht".to_owned(),
+        });
+    }
 
     for case in cases {
-        let expected = read_expected(&case).unwrap_or_else(|e| {
-            panic!("Fall {}: expect.json unlesbar: {e}", case.display())
-        });
+        let expected = read_expected(&case).map_err(|e| HarnessViolation::Setup {
+            case: case.display().to_string(),
+            capability,
+            reason: "expect.json unlesbar".to_owned(),
+            source: e.to_string(),
+        })?;
 
-        let canary_copy = tempfile::tempdir().unwrap_or_else(|e| {
-            panic!("Fall {}: Kanarienkopie: temp-Verzeichnis fehlgeschlagen: {e}", case.display())
-        });
-        copy_tree(&case.join("tree"), canary_copy.path()).unwrap_or_else(|e| {
-            panic!("Fall {}: Kopieren des Fixture-Baums fehlgeschlagen: {e}", case.display())
-        });
-        inject_content_canary(canary_copy.path()).unwrap_or_else(|e| {
-            panic!("Fall {}: Kanarienmarkierung schreiben fehlgeschlagen: {e}", case.display())
-        });
+        let canary_copy = tempfile::tempdir().map_err(|e| HarnessViolation::Setup {
+            case: case.display().to_string(),
+            capability,
+            reason: "Kanarienkopie: temp-Verzeichnis fehlgeschlagen".to_owned(),
+            source: e.to_string(),
+        })?;
+        copy_tree(&case.join("tree"), canary_copy.path()).map_err(|e| HarnessViolation::Setup {
+            case: case.display().to_string(),
+            capability,
+            reason: "Kopieren des Fixture-Baums fehlgeschlagen".to_owned(),
+            source: e.to_string(),
+        })?;
+        inject_content_canary(canary_copy.path()).map_err(|e| HarnessViolation::Setup {
+            case: case.display().to_string(),
+            capability,
+            reason: "Kanarienmarkierung schreiben fehlgeschlagen".to_owned(),
+            source: e.to_string(),
+        })?;
 
         let scope = ReadScope::from_roots([canary_copy.path().to_path_buf()]);
         let sensor = build(build_handle(capability, scope));
         let outcome = sensor.poll(expected.now);
         let rendered = render_outcome(&outcome);
 
-        assert!(
-            !rendered.contains(CONTENT_CANARY),
-            "Fall {}: Rohtext der Quelle (Kanarienmarkierung) im Poll-Ergebnis gefunden — Inhaltsfreiheit verletzt: {rendered}",
-            case.display()
-        );
+        if rendered.contains(CONTENT_CANARY) {
+            return Err(HarnessViolation::Check {
+                case: case.display().to_string(),
+                capability,
+                reason: format!(
+                    "Rohtext der Quelle (Kanarienmarkierung) im Poll-Ergebnis gefunden — Inhaltsfreiheit verletzt: {rendered}"
+                ),
+            });
+        }
     }
+    Ok(())
 }
 
 /// Prüfung 3a — Bereichsdichtheit (Containment).
@@ -352,59 +416,80 @@ where
 /// - `fixtures_root` (`&Path`): das `fixtures/`-Wurzelverzeichnis.
 ///
 /// # Returns
-/// `()` — kein normaler Fixture-Fall verletzt die Prüfung.
+/// `Ok(())` — kein normaler Fixture-Fall verletzt die Prüfung.
 ///
-/// # Panics
-/// Wenn kein normaler Fixture-Fall existiert, die Arbeitskopie nicht
-/// angelegt werden kann, oder ein Poll gegen die leere Probe-Wurzel ein
-/// nicht-leeres `SensorReading` liefert.
+/// # Errors
+/// - [`HarnessViolation::Check`]: kein normaler Fixture-Fall existiert, oder
+///   ein Poll gegen die leere Probe-Wurzel ein nicht-leeres `SensorReading`
+///   liefert.
+/// - [`HarnessViolation::Setup`]: die Arbeitskopie kann nicht angelegt
+///   werden.
 ///
 /// # Examples
 /// Siehe [`assert_determinism`] für den Aufbau des `build`-Arguments;
 /// `assert_scope_containment` wird identisch aufgerufen.
-pub fn assert_scope_containment<S, F>(build: F, capability: Capability, fixtures_root: &Path)
+pub fn assert_scope_containment<S, F>(
+    build: F,
+    capability: Capability,
+    fixtures_root: &Path,
+) -> HarnessResult
 where
     S: Sensor,
     F: Fn(SensorHandle<Bound>) -> S,
 {
     let cases = list_normal_cases(fixtures_root);
-    assert!(
-        !cases.is_empty(),
-        "kein normaler Fixture-Fall unter {}: mindestens ein Fall wird für die Bereichsdichtheit-Prüfung gebraucht",
-        fixtures_root.display()
-    );
+    if cases.is_empty() {
+        return Err(HarnessViolation::Check {
+            case: fixtures_root.display().to_string(),
+            capability,
+            reason: "kein normaler Fixture-Fall: mindestens ein Fall wird für die Bereichsdichtheit-Prüfung gebraucht".to_owned(),
+        });
+    }
 
     for case in cases {
-        let probe = tempfile::tempdir().unwrap_or_else(|e| {
-            panic!("Fall {}: Probe-Kopie: temp-Verzeichnis fehlgeschlagen: {e}", case.display())
-        });
+        let probe = tempfile::tempdir().map_err(|e| HarnessViolation::Setup {
+            case: case.display().to_string(),
+            capability,
+            reason: "Probe-Kopie: temp-Verzeichnis fehlgeschlagen".to_owned(),
+            source: e.to_string(),
+        })?;
         let tree_copy = probe.path().join("tree");
-        copy_tree(&case.join("tree"), &tree_copy).unwrap_or_else(|e| {
-            panic!("Fall {}: Kopieren des Fixture-Baums fehlgeschlagen: {e}", case.display())
-        });
+        copy_tree(&case.join("tree"), &tree_copy).map_err(|e| HarnessViolation::Setup {
+            case: case.display().to_string(),
+            capability,
+            reason: "Kopieren des Fixture-Baums fehlgeschlagen".to_owned(),
+            source: e.to_string(),
+        })?;
 
         let empty_root = tree_copy.join(SCOPE_CONTAINMENT_PROBE_DIR);
-        std::fs::create_dir_all(&empty_root).unwrap_or_else(|e| {
-            panic!(
-                "Fall {}: leere Probe-Wurzel {} anlegen fehlgeschlagen: {e}",
-                case.display(),
+        std::fs::create_dir_all(&empty_root).map_err(|e| HarnessViolation::Setup {
+            case: case.display().to_string(),
+            capability,
+            reason: format!(
+                "leere Probe-Wurzel {} anlegen fehlgeschlagen",
                 empty_root.display()
-            )
-        });
+            ),
+            source: e.to_string(),
+        })?;
 
         let scope = ReadScope::from_roots([empty_root]);
         let sensor = build(build_handle(capability, scope));
         let result = sensor.poll(Timestamp::UNIX_EPOCH);
 
         if let Ok(reading) = &result {
-            assert!(
-                reading.samples.is_empty() && reading.events.is_empty(),
-                "Fall {}: ein ReadScope auf ein echt leeres Unterverzeichnis von tree/ lieferte ein nicht-leeres SensorReading ({reading:?}) — der Sensor hat Daten außerhalb seines Bereichs gelesen (im selben Baum liegen die echten Quelldateien dieses Falls)",
-                case.display()
-            );
+            if !(reading.samples.is_empty() && reading.events.is_empty()) {
+                return Err(HarnessViolation::Check {
+                    case: case.display().to_string(),
+                    capability,
+                    reason: format!(
+                        "ein ReadScope auf ein echt leeres Unterverzeichnis von tree/ lieferte ein nicht-leeres SensorReading ({reading:?}) — der Sensor hat Daten außerhalb seines Bereichs gelesen (im selben Baum liegen die echten Quelldateien dieses Falls)"
+                    ),
+                });
+            }
         }
         // Jedes Err(...) gilt als bestanden — siehe Funktionsdoku.
     }
+    Ok(())
 }
 
 /// Prüfung 3b, Ausprägung [`EmptyScopeExpectation::SourceUnavailableIsError`].
@@ -428,29 +513,43 @@ where
 /// - `capability` (`Capability`): siehe [`assert_determinism`].
 ///
 /// # Returns
-/// `()` — der Sensor meldet `SourceUnavailable` für einen leeren Bereich.
+/// `Ok(())` — der Sensor meldet `SourceUnavailable` für einen leeren
+/// Bereich.
 ///
-/// # Panics
-/// Wenn das Ergebnis nicht `Err(SensorError::SourceUnavailable)` ist.
+/// # Errors
+/// - [`HarnessViolation::Check`]: das Ergebnis ist nicht
+///   `Err(SensorError::SourceUnavailable)`.
+/// - [`HarnessViolation::Setup`]: das leere Testverzeichnis kann nicht
+///   angelegt werden.
 ///
 /// # Examples
 /// Siehe [`assert_determinism`] für den Aufbau des `build`-Arguments; diese
 /// Funktion braucht kein `fixtures_root`.
-pub fn assert_scope_tightness<S, F>(build: F, capability: Capability)
+pub fn assert_scope_tightness<S, F>(build: F, capability: Capability) -> HarnessResult
 where
     S: Sensor,
     F: Fn(SensorHandle<Bound>) -> S,
 {
-    let empty = tempfile::tempdir()
-        .unwrap_or_else(|e| panic!("leeres Verzeichnis für Scope-Dichtheit-Prüfung: {e}"));
+    let empty = tempfile::tempdir().map_err(|e| HarnessViolation::Setup {
+        case: "<leeres Verzeichnis für Scope-Dichtheit-Prüfung>".to_owned(),
+        capability,
+        reason: "leeres Verzeichnis anlegen fehlgeschlagen".to_owned(),
+        source: e.to_string(),
+    })?;
     let scope = ReadScope::from_roots([empty.path().to_path_buf()]);
     let sensor = build(build_handle(capability, scope));
 
     let result = sensor.poll(Timestamp::UNIX_EPOCH);
-    assert!(
-        matches!(result, Err(SensorError::SourceUnavailable)),
-        "ein Sensor mit leerem ReadScope muss Err(SourceUnavailable) melden, nicht {result:?} — sonst liest er am Bereich vorbei an den echten Host"
-    );
+    if !matches!(result, Err(SensorError::SourceUnavailable)) {
+        return Err(HarnessViolation::Check {
+            case: empty.path().display().to_string(),
+            capability,
+            reason: format!(
+                "ein Sensor mit leerem ReadScope muss Err(SourceUnavailable) melden, nicht {result:?} — sonst liest er am Bereich vorbei an den echten Host"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Prüfung 3b, Ausprägung [`EmptyScopeExpectation::EmptySourceIsNormal`].
@@ -473,39 +572,58 @@ where
 /// - `capability` (`Capability`): siehe [`assert_determinism`].
 ///
 /// # Returns
-/// `()` — der Sensor meldet `Ok(SensorReading::default())` für einen leeren
-/// Bereich.
+/// `Ok(())` — der Sensor meldet `Ok(SensorReading::default())` für einen
+/// leeren Bereich.
 ///
-/// # Panics
-/// Wenn das Ergebnis nicht exakt `Ok(SensorReading { samples: vec![],
-/// events: vec![] })` ist — also bei jedem `Err(...)` und bei jedem `Ok(...)`
-/// mit mindestens einem Sample oder Event.
+/// # Errors
+/// - [`HarnessViolation::Check`]: das Ergebnis ist nicht exakt
+///   `Ok(SensorReading { samples: vec![], events: vec![] })` — also bei
+///   jedem `Err(...)` und bei jedem `Ok(...)` mit mindestens einem Sample
+///   oder Event.
+/// - [`HarnessViolation::Setup`]: das leere Testverzeichnis kann nicht
+///   angelegt werden.
 ///
 /// # Examples
 /// Siehe [`assert_determinism`] für den Aufbau des `build`-Arguments; diese
 /// Funktion braucht kein `fixtures_root`.
-pub fn assert_empty_scope_is_ok<S, F>(build: F, capability: Capability)
+pub fn assert_empty_scope_is_ok<S, F>(build: F, capability: Capability) -> HarnessResult
 where
     S: Sensor,
     F: Fn(SensorHandle<Bound>) -> S,
 {
-    let empty = tempfile::tempdir()
-        .unwrap_or_else(|e| panic!("leeres Verzeichnis für Prüfung 'leere Quelle ist normal': {e}"));
+    let empty = tempfile::tempdir().map_err(|e| HarnessViolation::Setup {
+        case: "<leeres Verzeichnis für Prüfung 'leere Quelle ist normal'>".to_owned(),
+        capability,
+        reason: "leeres Verzeichnis anlegen fehlgeschlagen".to_owned(),
+        source: e.to_string(),
+    })?;
     let scope = ReadScope::from_roots([empty.path().to_path_buf()]);
     let sensor = build(build_handle(capability, scope));
 
     let result = sensor.poll(Timestamp::UNIX_EPOCH);
     match result {
         Ok(reading) => {
-            assert!(
-                reading.samples.is_empty() && reading.events.is_empty(),
-                "ein Sensor, der 'leere Quelle ist normal' erklärt (EmptyScopeExpectation::EmptySourceIsNormal), muss bei leerem ReadScope Ok(SensorReading::default()) liefern, nicht {reading:?} — erfundene Werte ohne echte Quelle sind ebenso ein Fehler wie ein gemeldeter Err"
-            );
+            if !(reading.samples.is_empty() && reading.events.is_empty()) {
+                return Err(HarnessViolation::Check {
+                    case: empty.path().display().to_string(),
+                    capability,
+                    reason: format!(
+                        "ein Sensor, der 'leere Quelle ist normal' erklärt (EmptyScopeExpectation::EmptySourceIsNormal), muss bei leerem ReadScope Ok(SensorReading::default()) liefern, nicht {reading:?} — erfundene Werte ohne echte Quelle sind ebenso ein Fehler wie ein gemeldeter Err"
+                    ),
+                });
+            }
         }
-        Err(err) => panic!(
-            "ein Sensor, der 'leere Quelle ist normal' erklärt (EmptyScopeExpectation::EmptySourceIsNormal), muss bei leerem ReadScope Ok(SensorReading::default()) liefern, nicht Err({err:?})"
-        ),
+        Err(err) => {
+            return Err(HarnessViolation::Check {
+                case: empty.path().display().to_string(),
+                capability,
+                reason: format!(
+                    "ein Sensor, der 'leere Quelle ist normal' erklärt (EmptyScopeExpectation::EmptySourceIsNormal), muss bei leerem ReadScope Ok(SensorReading::default()) liefern, nicht Err({err:?})"
+                ),
+            });
+        }
     }
+    Ok(())
 }
 
 /// Prüfung 4 — Redaktion.
@@ -525,35 +643,49 @@ where
 /// Siehe [`assert_determinism`].
 ///
 /// # Returns
-/// `()` — kein normaler Fixture-Fall verletzt die Prüfung.
+/// `Ok(())` — kein normaler Fixture-Fall verletzt die Prüfung.
 ///
-/// # Panics
-/// Wenn kein normaler Fixture-Fall existiert oder der rohe `tree/`-Pfad im
-/// Poll-Ergebnis erscheint.
+/// # Errors
+/// - [`HarnessViolation::Check`]: kein normaler Fixture-Fall existiert, oder
+///   der rohe `tree/`-Pfad erscheint im Poll-Ergebnis.
+/// - [`HarnessViolation::Setup`]: `expect.json` ist unlesbar, oder `tree/`
+///   lässt sich nicht kanonisieren.
 ///
 /// # Examples
 /// Siehe [`assert_determinism`] für den Aufbau des `build`-Arguments;
 /// `assert_redaction` wird identisch aufgerufen.
-pub fn assert_redaction<S, F>(build: F, capability: Capability, fixtures_root: &Path)
+pub fn assert_redaction<S, F>(
+    build: F,
+    capability: Capability,
+    fixtures_root: &Path,
+) -> HarnessResult
 where
     S: Sensor,
     F: Fn(SensorHandle<Bound>) -> S,
 {
     let cases = list_normal_cases(fixtures_root);
-    assert!(
-        !cases.is_empty(),
-        "kein normaler Fixture-Fall unter {}: mindestens ein Fall wird für die Redaktions-Prüfung gebraucht",
-        fixtures_root.display()
-    );
+    if cases.is_empty() {
+        return Err(HarnessViolation::Check {
+            case: fixtures_root.display().to_string(),
+            capability,
+            reason: "kein normaler Fixture-Fall: mindestens ein Fall wird für die Redaktions-Prüfung gebraucht".to_owned(),
+        });
+    }
 
     for case in cases {
-        let expected = read_expected(&case).unwrap_or_else(|e| {
-            panic!("Fall {}: expect.json unlesbar: {e}", case.display())
-        });
+        let expected = read_expected(&case).map_err(|e| HarnessViolation::Setup {
+            case: case.display().to_string(),
+            capability,
+            reason: "expect.json unlesbar".to_owned(),
+            source: e.to_string(),
+        })?;
         let tree = case.join("tree");
-        let canonical = tree.canonicalize().unwrap_or_else(|e| {
-            panic!("Fall {}: tree/ kanonisieren fehlgeschlagen: {e}", case.display())
-        });
+        let canonical = tree.canonicalize().map_err(|e| HarnessViolation::Setup {
+            case: case.display().to_string(),
+            capability,
+            reason: "tree/ kanonisieren fehlgeschlagen".to_owned(),
+            source: e.to_string(),
+        })?;
 
         let scope = ReadScope::from_roots([canonical.clone()]);
         let sensor = build(build_handle(capability, scope));
@@ -561,12 +693,17 @@ where
         let rendered = render_outcome(&outcome);
 
         let raw_path = canonical.to_string_lossy().into_owned();
-        assert!(
-            !rendered.contains(raw_path.as_str()),
-            "Fall {}: roher, absoluter Host-Pfad '{raw_path}' im Poll-Ergebnis gefunden — Redaktion verletzt: {rendered}",
-            case.display()
-        );
+        if rendered.contains(raw_path.as_str()) {
+            return Err(HarnessViolation::Check {
+                case: case.display().to_string(),
+                capability,
+                reason: format!(
+                    "roher, absoluter Host-Pfad '{raw_path}' im Poll-Ergebnis gefunden — Redaktion verletzt: {rendered}"
+                ),
+            });
+        }
     }
+    Ok(())
 }
 
 /// Prüfung 5 — Kardinalität.
@@ -593,11 +730,14 @@ where
 ///   Obergrenze verschiedener Labelkombinationen **je Poll**.
 ///
 /// # Returns
-/// `()` — kein normaler Fixture-Fall überschreitet `max_cardinality`.
+/// `Ok(())` — kein normaler Fixture-Fall überschreitet `max_cardinality`.
 ///
-/// # Panics
-/// Wenn kein normaler Fixture-Fall existiert oder ein Fall mehr als
-/// `max_cardinality` verschiedene Labelkombinationen erzeugt.
+/// # Errors
+/// - [`HarnessViolation::Check`]: kein normaler Fixture-Fall existiert, oder
+///   ein Fall mehr als `max_cardinality` verschiedene Labelkombinationen
+///   erzeugt.
+/// - [`HarnessViolation::Setup`]: `expect.json` ist unlesbar, oder der Poll
+///   ist mit einem Fremdfehler gescheitert.
 ///
 /// # Examples
 /// Siehe [`assert_determinism`] für den Aufbau des `build`-Arguments.
@@ -606,34 +746,50 @@ pub fn assert_cardinality<S, F>(
     capability: Capability,
     fixtures_root: &Path,
     max_cardinality: usize,
-) where
+) -> HarnessResult
+where
     S: Sensor,
     F: Fn(SensorHandle<Bound>) -> S,
 {
     let cases = list_normal_cases(fixtures_root);
-    assert!(
-        !cases.is_empty(),
-        "kein normaler Fixture-Fall unter {}: mindestens ein Fall wird für die Kardinalitäts-Prüfung gebraucht",
-        fixtures_root.display()
-    );
+    if cases.is_empty() {
+        return Err(HarnessViolation::Check {
+            case: fixtures_root.display().to_string(),
+            capability,
+            reason: "kein normaler Fixture-Fall: mindestens ein Fall wird für die Kardinalitäts-Prüfung gebraucht".to_owned(),
+        });
+    }
 
     for case in cases {
-        let expected = read_expected(&case).unwrap_or_else(|e| {
-            panic!("Fall {}: expect.json unlesbar: {e}", case.display())
-        });
+        let expected = read_expected(&case).map_err(|e| HarnessViolation::Setup {
+            case: case.display().to_string(),
+            capability,
+            reason: "expect.json unlesbar".to_owned(),
+            source: e.to_string(),
+        })?;
         let scope = ReadScope::from_roots([case.join("tree")]);
         let sensor = build(build_handle(capability, scope));
-        let reading = sensor.poll(expected.now).unwrap_or_else(|e| {
-            panic!("Fall {}: Poll fehlgeschlagen: {e}", case.display())
-        });
+        let reading = sensor
+            .poll(expected.now)
+            .map_err(|e| HarnessViolation::Setup {
+                case: case.display().to_string(),
+                capability,
+                reason: "Poll fehlgeschlagen".to_owned(),
+                source: e.to_string(),
+            })?;
 
         let distinct = distinct_label_count(&reading);
-        assert!(
-            distinct <= max_cardinality,
-            "Fall {}: {distinct} verschiedene Labelkombinationen überschreiten die deklarierte Cardinality {max_cardinality}",
-            case.display()
-        );
+        if distinct > max_cardinality {
+            return Err(HarnessViolation::Check {
+                case: case.display().to_string(),
+                capability,
+                reason: format!(
+                    "{distinct} verschiedene Labelkombinationen überschreiten die deklarierte Cardinality {max_cardinality}"
+                ),
+            });
+        }
     }
+    Ok(())
 }
 
 /// Prüfung 6 — Fehlerfall.
@@ -652,27 +808,35 @@ pub fn assert_cardinality<S, F>(
 /// auf `fixtures_root/malformed/`.
 ///
 /// # Returns
-/// `()` — jeder Fall unter `malformed/` verletzt die Prüfung nicht.
+/// `Ok(())` — jeder Fall unter `malformed/` verletzt die Prüfung nicht.
 ///
-/// # Panics
-/// Wenn `fixtures_root/malformed/` keinen Fall enthält, ein Fall nicht mit
-/// `Err(SensorError::MalformedSource)` scheitert, oder die Fehlermeldung
-/// Dateiinhalt des Falls enthält.
+/// # Errors
+/// [`HarnessViolation::Check`]: `fixtures_root/malformed/` enthält keinen
+/// Fall, ein Fall scheitert nicht mit `Err(SensorError::MalformedSource)`,
+/// oder die Fehlermeldung enthält Dateiinhalt des Falls.
 ///
 /// # Examples
 /// Siehe [`assert_determinism`] für den Aufbau des `build`-Arguments.
-pub fn assert_error_case<S, F>(build: F, capability: Capability, fixtures_root: &Path)
+pub fn assert_error_case<S, F>(
+    build: F,
+    capability: Capability,
+    fixtures_root: &Path,
+) -> HarnessResult
 where
     S: Sensor,
     F: Fn(SensorHandle<Bound>) -> S,
 {
     let malformed_root = fixtures_root.join("malformed");
     let cases = list_subdirs(&malformed_root);
-    assert!(
-        !cases.is_empty(),
-        "fixtures/malformed unter {} muss mindestens einen Fall enthalten (Prüfung 'Fehlerfall')",
-        malformed_root.display()
-    );
+    if cases.is_empty() {
+        return Err(HarnessViolation::Check {
+            case: malformed_root.display().to_string(),
+            capability,
+            reason:
+                "fixtures/malformed muss mindestens einen Fall enthalten (Prüfung 'Fehlerfall')"
+                    .to_owned(),
+        });
+    }
 
     for case in cases {
         let raw_contents = collect_file_contents(&case);
@@ -680,23 +844,28 @@ where
         let sensor = build(build_handle(capability, scope));
         let result = sensor.poll(Timestamp::UNIX_EPOCH);
 
-        assert!(
-            matches!(result, Err(SensorError::MalformedSource)),
-            "Fall {}: erwartet Err(MalformedSource), erhalten {result:?}",
-            case.display()
-        );
+        if !matches!(result, Err(SensorError::MalformedSource)) {
+            return Err(HarnessViolation::Check {
+                case: case.display().to_string(),
+                capability,
+                reason: format!("erwartet Err(MalformedSource), erhalten {result:?}"),
+            });
+        }
 
         if let Err(err) = &result {
             let rendered = format!("{err}{err:?}");
             for content in &raw_contents {
-                assert!(
-                    !rendered.contains(content.as_str()),
-                    "Fall {}: Fehlermeldung enthält Dateiinhalt des Falls — Inhaltsfreiheit im Fehlerfall verletzt",
-                    case.display()
-                );
+                if rendered.contains(content.as_str()) {
+                    return Err(HarnessViolation::Check {
+                        case: case.display().to_string(),
+                        capability,
+                        reason: "Fehlermeldung enthält Dateiinhalt des Falls — Inhaltsfreiheit im Fehlerfall verletzt".to_owned(),
+                    });
+                }
             }
         }
     }
+    Ok(())
 }
 
 /// Zusätzliche, optionale Prüfung — Adversarial.
@@ -714,37 +883,54 @@ where
 /// `fixtures_root/adversarial/`.
 ///
 /// # Returns
-/// `()` — kein Fall unter `adversarial/` löst einen Panic aus (oder das
+/// `Ok(())` — kein Fall unter `adversarial/` löst einen Panic aus (oder das
 /// Verzeichnis fehlt).
 ///
-/// # Panics
-/// Wenn `poll()` für einen Fall unter `adversarial/` paniert.
+/// # Errors
+/// [`HarnessViolation::Check`]: `poll()` ist für einen Fall unter
+/// `adversarial/` paniert. Die Panik selbst wird intern über
+/// `std::panic::catch_unwind` abgefangen (das Abfangen ist kein Paniken) und
+/// in dieses `Err` übersetzt; die Nutzlast wird, soweit möglich, als Text in
+/// den Grund übernommen.
 ///
 /// # Examples
 /// Siehe [`assert_determinism`] für den Aufbau des `build`-Arguments.
-pub fn assert_adversarial_survives<S, F>(build: F, capability: Capability, fixtures_root: &Path)
+pub fn assert_adversarial_survives<S, F>(
+    build: F,
+    capability: Capability,
+    fixtures_root: &Path,
+) -> HarnessResult
 where
     S: Sensor,
     F: Fn(SensorHandle<Bound>) -> S,
 {
     let adversarial_root = fixtures_root.join("adversarial");
     if !adversarial_root.is_dir() {
-        return;
+        return Ok(());
     }
 
     for case in list_subdirs(&adversarial_root) {
         let scope = ReadScope::from_roots([case.clone()]);
         let sensor = build(build_handle(capability, scope));
 
+        // Fängt eine Sensor-Panik ab, statt sie durchzulassen — das
+        // Abfangen selbst ist kein Paniken, sondern übersetzt die Panik in
+        // ein Err(HarnessViolation) (siehe Funktionsdoku).
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             sensor.poll(Timestamp::UNIX_EPOCH)
         }));
-        assert!(
-            outcome.is_ok(),
-            "Fall {}: poll() ist paniert — ein adversarial erzeugter Baum darf niemals einen Panic auslösen",
-            case.display()
-        );
+        if let Err(payload) = outcome {
+            return Err(HarnessViolation::Check {
+                case: case.display().to_string(),
+                capability,
+                reason: format!(
+                    "poll() ist paniert — ein adversarial erzeugter Baum darf niemals einen Panic auslösen: {}",
+                    panic_payload_message(&payload)
+                ),
+            });
+        }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -766,8 +952,8 @@ fn list_normal_cases(fixtures_root: &Path) -> Vec<PathBuf> {
 
 /// Listet alle direkten Unterverzeichnisse von `dir`, sortiert. Liefert eine
 /// leere Liste, wenn `dir` nicht existiert oder nicht lesbar ist — das ist
-/// bei den Aufrufstellen hier kein Fehler, sondern führt zu einer eigenen,
-/// aussagekräftigen `assert!`-Meldung.
+/// bei den Aufrufstellen hier kein interner Fehler, sondern führt zu einem
+/// eigenen, aussagekräftigen `Err(HarnessViolation::Check)`.
 fn list_subdirs(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -779,6 +965,21 @@ fn list_subdirs(dir: &Path) -> Vec<PathBuf> {
         .collect();
     dirs.sort();
     dirs
+}
+
+/// Rendert die Nutzlast einer über `std::panic::catch_unwind` gefangenen
+/// Panik als Text, für [`assert_adversarial_survives`]. `panic!` legt die
+/// Nutzlast meist als `&'static str` oder `String` ab; beide Formen werden
+/// abgedeckt, jede andere Nutzlast bekommt eine neutrale Platzhalter-Meldung
+/// (kein `unwrap`/`expect`, damit dieser Helfer selbst nicht paniken kann).
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.to_owned()
+    } else {
+        "<Panic-Nutzlast unbekannten Typs>".to_owned()
+    }
 }
 
 /// Rendert ein Poll-Ergebnis als durchsuchbaren Text: die kompakte
@@ -893,6 +1094,7 @@ mod tests {
     use jiff::Timestamp;
 
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     // ---- eine minimal korrekte Beispielimplementierung ----
 
@@ -944,13 +1146,19 @@ mod tests {
         }
     }
 
-    fn write_case(fixtures_root: &Path, name: &str, value_content: &str, reading: &SensorReading) {
+    fn write_case(
+        fixtures_root: &Path,
+        name: &str,
+        value_content: &str,
+        reading: &SensorReading,
+    ) -> TestResult<()> {
         let case = fixtures_root.join(name);
         let tree = case.join("tree");
-        std::fs::create_dir_all(&tree).expect("tree/ anlegen");
-        std::fs::write(tree.join("value"), value_content).expect("value schreiben");
+        std::fs::create_dir_all(&tree).map_err(ctx("tree/ anlegen"))?;
+        std::fs::write(tree.join("value"), value_content).map_err(ctx("value schreiben"))?;
         crate::fixture_io::write_expected(&case, Timestamp::UNIX_EPOCH, reading)
-            .expect("expect.json schreiben");
+            .map_err(ctx("expect.json schreiben"))?;
+        Ok(())
     }
 
     fn good_reading(value: f64) -> SensorReading {
@@ -966,32 +1174,41 @@ mod tests {
     }
 
     #[test]
-    fn test_good_sensor_passes_all_eight_checks() {
-        let root = tempfile::tempdir().expect("tempdir");
-        write_case(root.path(), "typical", "45000\n", &good_reading(45000.0));
+    fn test_good_sensor_passes_all_eight_checks() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        write_case(root.path(), "typical", "45000\n", &good_reading(45000.0))?;
         std::fs::create_dir_all(root.path().join("malformed/not-a-number"))
-            .expect("malformed dir");
+            .map_err(ctx("malformed dir"))?;
         std::fs::write(
             root.path().join("malformed/not-a-number/value"),
             "not-a-number\n",
         )
-        .expect("malformed value");
+        .map_err(ctx("malformed value"))?;
         std::fs::create_dir_all(root.path().join("adversarial/overflow"))
-            .expect("adversarial dir");
+            .map_err(ctx("adversarial dir"))?;
         std::fs::write(
             root.path().join("adversarial/overflow/value"),
             "-99999999999999999999999999\n",
         )
-        .expect("adversarial value");
+        .map_err(ctx("adversarial value"))?;
 
-        assert_determinism(GoodSensor::from, Capability::ReadProcStat, root.path());
-        assert_content_freedom(GoodSensor::from, Capability::ReadProcStat, root.path());
-        assert_scope_containment(GoodSensor::from, Capability::ReadProcStat, root.path());
-        assert_scope_tightness(GoodSensor::from, Capability::ReadProcStat);
-        assert_redaction(GoodSensor::from, Capability::ReadProcStat, root.path());
-        assert_cardinality(GoodSensor::from, Capability::ReadProcStat, root.path(), 4);
-        assert_error_case(GoodSensor::from, Capability::ReadProcStat, root.path());
-        assert_adversarial_survives(GoodSensor::from, Capability::ReadProcStat, root.path());
+        assert_determinism(GoodSensor::from, Capability::ReadProcStat, root.path())
+            .map_err(ctx("assert_determinism"))?;
+        assert_content_freedom(GoodSensor::from, Capability::ReadProcStat, root.path())
+            .map_err(ctx("assert_content_freedom"))?;
+        assert_scope_containment(GoodSensor::from, Capability::ReadProcStat, root.path())
+            .map_err(ctx("assert_scope_containment"))?;
+        assert_scope_tightness(GoodSensor::from, Capability::ReadProcStat)
+            .map_err(ctx("assert_scope_tightness"))?;
+        assert_redaction(GoodSensor::from, Capability::ReadProcStat, root.path())
+            .map_err(ctx("assert_redaction"))?;
+        assert_cardinality(GoodSensor::from, Capability::ReadProcStat, root.path(), 4)
+            .map_err(ctx("assert_cardinality"))?;
+        assert_error_case(GoodSensor::from, Capability::ReadProcStat, root.path())
+            .map_err(ctx("assert_error_case"))?;
+        assert_adversarial_survives(GoodSensor::from, Capability::ReadProcStat, root.path())
+            .map_err(ctx("assert_adversarial_survives"))?;
+        Ok(())
     }
 
     // ---- je ein absichtlich fehlerhafter Beispielsensor pro Prüfung ----
@@ -1034,17 +1251,20 @@ mod tests {
     }
 
     #[test]
-    fn test_bad_determinism_sensor_fails_determinism_check() {
-        let root = tempfile::tempdir().expect("tempdir");
-        write_case(root.path(), "typical", "1\n", &good_reading(1.0));
+    fn test_bad_determinism_sensor_fails_determinism_check() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        write_case(root.path(), "typical", "1\n", &good_reading(1.0))?;
 
-        let result = std::panic::catch_unwind(|| {
-            assert_determinism(BadDeterminismSensor::from, Capability::ReadProcStat, root.path());
-        });
+        let result = assert_determinism(
+            BadDeterminismSensor::from,
+            Capability::ReadProcStat,
+            root.path(),
+        );
         assert!(
             result.is_err(),
             "ein nicht-deterministischer Sensor muss die Determinismus-Prüfung zum Scheitern bringen"
         );
+        Ok(())
     }
 
     #[derive(Debug)]
@@ -1087,8 +1307,8 @@ mod tests {
     }
 
     #[test]
-    fn test_bad_content_free_sensor_fails_content_freedom_check() {
-        let root = tempfile::tempdir().expect("tempdir");
+    fn test_bad_content_free_sensor_fails_content_freedom_check() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
         write_case(
             root.path(),
             "typical",
@@ -1105,15 +1325,18 @@ mod tests {
                     },
                 }],
             },
-        );
+        )?;
 
-        let result = std::panic::catch_unwind(|| {
-            assert_content_freedom(BadContentFreeSensor::from, Capability::ReadProcStat, root.path());
-        });
+        let result = assert_content_freedom(
+            BadContentFreeSensor::from,
+            Capability::ReadProcStat,
+            root.path(),
+        );
         assert!(
             result.is_err(),
             "ein Sensor, der Rohtext der Quelle übernimmt, muss die Inhaltsfreiheits-Prüfung zum Scheitern bringen"
         );
+        Ok(())
     }
 
     #[derive(Debug)]
@@ -1149,9 +1372,7 @@ mod tests {
 
     #[test]
     fn test_always_ok_sensor_fails_scope_tightness_check() {
-        let result = std::panic::catch_unwind(|| {
-            assert_scope_tightness(AlwaysOkSensor::from, Capability::ReadProcStat);
-        });
+        let result = assert_scope_tightness(AlwaysOkSensor::from, Capability::ReadProcStat);
         assert!(
             result.is_err(),
             "ein Sensor, der auch bei leerem ReadScope Ok(...) liefert, muss die Scope-Dichtheit-Prüfung zum Scheitern bringen"
@@ -1197,22 +1418,20 @@ mod tests {
     }
 
     #[test]
-    fn test_bad_redaction_sensor_fails_redaction_check() {
-        let root = tempfile::tempdir().expect("tempdir");
-        write_case(
-            root.path(),
-            "typical",
-            "1\n",
-            &SensorReading::default(),
-        );
+    fn test_bad_redaction_sensor_fails_redaction_check() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        write_case(root.path(), "typical", "1\n", &SensorReading::default())?;
 
-        let result = std::panic::catch_unwind(|| {
-            assert_redaction(BadRedactionSensor::from, Capability::ReadProcStat, root.path());
-        });
+        let result = assert_redaction(
+            BadRedactionSensor::from,
+            Capability::ReadProcStat,
+            root.path(),
+        );
         assert!(
             result.is_err(),
             "ein Sensor, der den rohen Scope-Pfad emittiert, muss die Redaktions-Prüfung zum Scheitern bringen"
         );
+        Ok(())
     }
 
     #[derive(Debug)]
@@ -1250,17 +1469,21 @@ mod tests {
     }
 
     #[test]
-    fn test_bad_cardinality_sensor_fails_cardinality_check() {
-        let root = tempfile::tempdir().expect("tempdir");
-        write_case(root.path(), "typical", "1\n", &SensorReading::default());
+    fn test_bad_cardinality_sensor_fails_cardinality_check() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        write_case(root.path(), "typical", "1\n", &SensorReading::default())?;
 
-        let result = std::panic::catch_unwind(|| {
-            assert_cardinality(BadCardinalitySensor::from, Capability::ReadProcStat, root.path(), 5);
-        });
+        let result = assert_cardinality(
+            BadCardinalitySensor::from,
+            Capability::ReadProcStat,
+            root.path(),
+            5,
+        );
         assert!(
             result.is_err(),
             "ein Sensor mit fünfzig Labelkombinationen muss die Kardinalitäts-Prüfung bei max_cardinality=5 zum Scheitern bringen"
         );
+        Ok(())
     }
 
     #[derive(Debug)]
@@ -1287,19 +1510,22 @@ mod tests {
     }
 
     #[test]
-    fn test_bad_error_mapping_sensor_fails_error_case_check() {
-        let root = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(root.path().join("malformed/any")).expect("malformed dir");
+    fn test_bad_error_mapping_sensor_fails_error_case_check() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        std::fs::create_dir_all(root.path().join("malformed/any")).map_err(ctx("malformed dir"))?;
         std::fs::write(root.path().join("malformed/any/value"), "irrelevant\n")
-            .expect("malformed value");
+            .map_err(ctx("malformed value"))?;
 
-        let result = std::panic::catch_unwind(|| {
-            assert_error_case(BadErrorMappingSensor::from, Capability::ReadProcStat, root.path());
-        });
+        let result = assert_error_case(
+            BadErrorMappingSensor::from,
+            Capability::ReadProcStat,
+            root.path(),
+        );
         assert!(
             result.is_err(),
             "ein Sensor, der nie MalformedSource meldet, muss die Fehlerfall-Prüfung zum Scheitern bringen"
         );
+        Ok(())
     }
 
     #[derive(Debug)]
@@ -1319,30 +1545,44 @@ mod tests {
         }
 
         fn poll(&self, _now: Timestamp) -> Result<SensorReading, SensorError> {
+            // Absichtliche Panik (Bible-Ausnahme, nicht entfernt): genau das
+            // muss [`assert_adversarial_survives`] über ihr internes
+            // `std::panic::catch_unwind` abfangen und als
+            // `Err(HarnessViolation)` melden — dieser Test belegt diesen
+            // roten Zweig.
             panic!("dieser Sensor paniert immer — genau das prüft assert_adversarial_survives");
         }
     }
 
     #[test]
-    fn test_panicking_sensor_fails_adversarial_survives_check() {
-        let root = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(root.path().join("adversarial/weird")).expect("adversarial dir");
-        std::fs::write(root.path().join("adversarial/weird/value"), "x").expect("value");
+    fn test_panicking_sensor_fails_adversarial_survives_check() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        std::fs::create_dir_all(root.path().join("adversarial/weird"))
+            .map_err(ctx("adversarial dir"))?;
+        std::fs::write(root.path().join("adversarial/weird/value"), "x").map_err(ctx("value"))?;
 
-        let result = std::panic::catch_unwind(|| {
-            assert_adversarial_survives(PanicsOnAnythingSensor::from, Capability::ReadProcStat, root.path());
-        });
+        // Kein äußeres catch_unwind mehr nötig: assert_adversarial_survives
+        // fängt die Sensor-Panik bereits intern ab und übersetzt sie in ein
+        // Err(HarnessViolation), statt sie durchzulassen.
+        let result = assert_adversarial_survives(
+            PanicsOnAnythingSensor::from,
+            Capability::ReadProcStat,
+            root.path(),
+        );
         assert!(
             result.is_err(),
             "ein Sensor, der auf einem adversarial-Baum paniert, muss die Adversarial-Prüfung zum Scheitern bringen"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_assert_adversarial_survives_is_noop_without_directory() {
-        let root = tempfile::tempdir().expect("tempdir");
-        // Kein adversarial/-Verzeichnis vorhanden: darf nicht panieren.
-        assert_adversarial_survives(GoodSensor::from, Capability::ReadProcStat, root.path());
+    fn test_assert_adversarial_survives_is_noop_without_directory() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        // Kein adversarial/-Verzeichnis vorhanden: muss Ok(()) liefern.
+        assert_adversarial_survives(GoodSensor::from, Capability::ReadProcStat, root.path())
+            .map_err(ctx("assert_adversarial_survives"))?;
+        Ok(())
     }
 
     #[test]
@@ -1424,26 +1664,31 @@ mod tests {
     }
 
     #[test]
-    fn test_leaking_sensor_fails_scope_containment_check() {
-        let root = tempfile::tempdir().expect("tempdir");
-        write_case(root.path(), "typical", "45000\n", &good_reading(45000.0));
+    fn test_leaking_sensor_fails_scope_containment_check() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        write_case(root.path(), "typical", "45000\n", &good_reading(45000.0))?;
 
-        let result = std::panic::catch_unwind(|| {
-            assert_scope_containment(LeaksParentDirSensor::from, Capability::ReadProcStat, root.path());
-        });
+        let result = assert_scope_containment(
+            LeaksParentDirSensor::from,
+            Capability::ReadProcStat,
+            root.path(),
+        );
         assert!(
             result.is_err(),
             "ein Sensor, der Dateien oberhalb seiner Bereichswurzel liest, muss die Bereichsdichtheit-Prüfung zum Scheitern bringen"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_good_sensor_passes_scope_containment_check() {
-        let root = tempfile::tempdir().expect("tempdir");
-        write_case(root.path(), "typical", "45000\n", &good_reading(45000.0));
+    fn test_good_sensor_passes_scope_containment_check() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        write_case(root.path(), "typical", "45000\n", &good_reading(45000.0))?;
         // GoodSensor liest ausschliesslich über scope.roots()/scope selbst —
         // muss unabhaengig von der erklaerten EmptyScopeExpectation bestehen.
-        assert_scope_containment(GoodSensor::from, Capability::ReadProcStat, root.path());
+        assert_scope_containment(GoodSensor::from, Capability::ReadProcStat, root.path())
+            .map_err(ctx("assert_scope_containment"))?;
+        Ok(())
     }
 
     // ---- Prüfung 3b, Ausprägung EmptySourceIsNormal — K48 ----
@@ -1494,18 +1739,26 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_source_is_normal_sensor_passes_empty_scope_is_ok_check() {
-        assert_empty_scope_is_ok(EmptySourceIsNormalSensor::from, Capability::ReadProcStat);
+    fn test_empty_source_is_normal_sensor_passes_empty_scope_is_ok_check() -> TestResult {
+        assert_empty_scope_is_ok(EmptySourceIsNormalSensor::from, Capability::ReadProcStat)
+            .map_err(ctx("assert_empty_scope_is_ok"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_empty_source_is_normal_sensor_passes_scope_containment_check() {
-        let root = tempfile::tempdir().expect("tempdir");
-        write_case(root.path(), "typical", "45000\n", &good_reading(45000.0));
+    fn test_empty_source_is_normal_sensor_passes_scope_containment_check() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        write_case(root.path(), "typical", "45000\n", &good_reading(45000.0))?;
         // Bereichsdichtheit gilt unabhaengig von der erklaerten
         // EmptyScopeExpectation — auch fuer einen Sensor der Ausprägung
         // EmptySourceIsNormal.
-        assert_scope_containment(EmptySourceIsNormalSensor::from, Capability::ReadProcStat, root.path());
+        assert_scope_containment(
+            EmptySourceIsNormalSensor::from,
+            Capability::ReadProcStat,
+            root.path(),
+        )
+        .map_err(ctx("assert_scope_containment"))?;
+        Ok(())
     }
 
     #[test]
@@ -1513,9 +1766,7 @@ mod tests {
         // GoodSensor erklaert (implizit) "leere Quelle ist ein Fehler" und
         // meldet SourceUnavailable; gegen die Gegenausprägung geprüft, muss
         // das durchfallen.
-        let result = std::panic::catch_unwind(|| {
-            assert_empty_scope_is_ok(GoodSensor::from, Capability::ReadProcStat);
-        });
+        let result = assert_empty_scope_is_ok(GoodSensor::from, Capability::ReadProcStat);
         assert!(
             result.is_err(),
             "ein Sensor, der bei leerer Quelle einen Fehler meldet, darf die Prüfung 'leere Quelle ist normal' nicht bestehen"
@@ -1557,9 +1808,10 @@ mod tests {
 
     #[test]
     fn test_fabricated_values_sensor_fails_empty_scope_is_ok_check() {
-        let result = std::panic::catch_unwind(|| {
-            assert_empty_scope_is_ok(FabricatesValuesOnEmptyScopeSensor::from, Capability::ReadProcStat);
-        });
+        let result = assert_empty_scope_is_ok(
+            FabricatesValuesOnEmptyScopeSensor::from,
+            Capability::ReadProcStat,
+        );
         assert!(
             result.is_err(),
             "ein Sensor, der bei leerem ReadScope erfundene Werte liefert, muss die Prüfung 'leere Quelle ist normal' zum Scheitern bringen"

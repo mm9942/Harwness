@@ -137,6 +137,7 @@ fn fresh_ledger() -> (Arc<ProcessPermitLedger>, Arc<HostPermitSessionRegistry>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ctx;
     use harw_sandbox::HostApprovalScope;
     use std::time::Duration;
 
@@ -175,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_revoke_on_a_fresh_ledger_removes_nothing() {
+    fn test_run_revoke_on_a_fresh_ledger_removes_nothing() -> crate::test_support::TestResult {
         let (ledger, registry) = fresh_ledger();
         registry.mark_session_approved("s1", Duration::from_secs(1));
         let request = harw_sandbox::request_for_workspace(
@@ -191,7 +192,7 @@ mod tests {
                 HostApprovalScope::SessionLease,
                 Duration::from_secs(60),
             )
-            .expect("issuing a valid request must succeed");
+            .map_err(ctx("issuing a valid request must succeed"))?;
         registry.remember_permit(request, id);
 
         // Ein *anderer* frischer Ledger (wie ihn `print_revoke` tatsächlich
@@ -203,5 +204,6 @@ mod tests {
         // Der ursprüngliche Ledger/Registry trägt die Zustimmung dagegen
         // weiterhin.
         assert!(registry.is_session_approved("s1"));
+        Ok(())
     }
 }

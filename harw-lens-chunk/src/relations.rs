@@ -128,16 +128,17 @@ pub fn suggest_relations(chunks: &[Chunk]) -> Vec<(ChunkDigest, ChunkDigest, Edg
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_lens_types::{ByteSpan, SourceRef};
     use harw_types::ContentDigest;
 
-    fn chunk(text: &str, source: SourceRef, start: usize) -> Chunk {
-        Chunk {
+    fn chunk(text: &str, source: SourceRef, start: usize) -> TestResult<Chunk> {
+        Ok(Chunk {
             digest: ChunkDigest(ContentDigest::of(text.as_bytes())),
             source,
-            span: ByteSpan::new(start, start + text.len()).expect("valid span"),
+            span: ByteSpan::new(start, start + text.len()).map_err(ctx("valid span"))?,
             text: text.to_owned(),
-        }
+        })
     }
 
     fn file(path: &str) -> SourceRef {
@@ -152,39 +153,36 @@ mod tests {
     }
 
     #[test]
-    fn test_suggest_relations_single_chunk_yields_no_edges() {
-        let chunks = vec![chunk("a", file("a.txt"), 0)];
+    fn test_suggest_relations_single_chunk_yields_no_edges() -> TestResult {
+        let chunks = vec![chunk("a", file("a.txt"), 0)?];
         assert_eq!(suggest_relations(&chunks), Vec::new());
+        Ok(())
     }
 
     #[test]
-    fn test_suggest_relations_links_consecutive_chunks_of_same_source() {
-        let chunks = vec![
-            chunk("a", file("a.txt"), 0),
-            chunk("b", file("a.txt"), 1),
-        ];
+    fn test_suggest_relations_links_consecutive_chunks_of_same_source() -> TestResult {
+        let chunks = vec![chunk("a", file("a.txt"), 0)?, chunk("b", file("a.txt"), 1)?];
         let edges = suggest_relations(&chunks);
         assert_eq!(
             edges,
             vec![(chunks[0].digest, chunks[1].digest, EdgeKind::References)]
         );
+        Ok(())
     }
 
     #[test]
-    fn test_suggest_relations_does_not_link_chunks_of_different_sources() {
-        let chunks = vec![
-            chunk("a", file("a.txt"), 0),
-            chunk("b", file("b.txt"), 0),
-        ];
+    fn test_suggest_relations_does_not_link_chunks_of_different_sources() -> TestResult {
+        let chunks = vec![chunk("a", file("a.txt"), 0)?, chunk("b", file("b.txt"), 0)?];
         assert_eq!(suggest_relations(&chunks), Vec::new());
+        Ok(())
     }
 
     #[test]
-    fn test_suggest_relations_anchor_links_to_non_adjacent_sibling() {
+    fn test_suggest_relations_anchor_links_to_non_adjacent_sibling() -> TestResult {
         let chunks = vec![
-            chunk("head", file("src/lib.rs"), 0),
-            chunk("fn a", file("src/lib.rs"), 4),
-            chunk("fn b", file("src/lib.rs"), 8),
+            chunk("head", file("src/lib.rs"), 0)?,
+            chunk("fn a", file("src/lib.rs"), 4)?,
+            chunk("fn b", file("src/lib.rs"), 8)?,
         ];
         let edges = suggest_relations(&chunks);
         // Adjacent pairs (0,1) and (1,2), plus the anchor-to-non-adjacent (0,2).
@@ -192,18 +190,22 @@ mod tests {
         assert!(edges.contains(&(chunks[0].digest, chunks[1].digest, EdgeKind::References)));
         assert!(edges.contains(&(chunks[1].digest, chunks[2].digest, EdgeKind::References)));
         assert!(edges.contains(&(chunks[0].digest, chunks[2].digest, EdgeKind::References)));
+        Ok(())
     }
 
     #[test]
-    fn test_suggest_relations_never_proposes_contradicts_or_superseded_by() {
+    fn test_suggest_relations_never_proposes_contradicts_or_superseded_by() -> TestResult {
         let chunks = vec![
-            chunk("head", file("src/lib.rs"), 0),
-            chunk("fn a", file("src/lib.rs"), 4),
-            chunk("fn b", file("src/lib.rs"), 8),
-            chunk("other doc", file("other.md"), 0),
+            chunk("head", file("src/lib.rs"), 0)?,
+            chunk("fn a", file("src/lib.rs"), 4)?,
+            chunk("fn b", file("src/lib.rs"), 8)?,
+            chunk("other doc", file("other.md"), 0)?,
         ];
         let edges = suggest_relations(&chunks);
-        assert!(!edges.is_empty(), "sanity: this fixture should produce edges");
+        assert!(
+            !edges.is_empty(),
+            "sanity: this fixture should produce edges"
+        );
         // `EdgeKind` has no `SupersededBy` variant at all, so it is
         // structurally impossible to propose one; this loop documents and
         // enforces the other half of the guarantee.
@@ -213,26 +215,34 @@ mod tests {
                 "suggest_relations must never propose EdgeKind::Contradicts"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_suggest_relations_resets_anchor_per_source_run() {
+    fn test_suggest_relations_resets_anchor_per_source_run() -> TestResult {
         let chunks = vec![
-            chunk("a1", file("a.txt"), 0),
-            chunk("a2", file("a.txt"), 2),
-            chunk("a3", file("a.txt"), 4),
-            chunk("b1", file("b.txt"), 0),
-            chunk("b2", file("b.txt"), 2),
-            chunk("b3", file("b.txt"), 4),
+            chunk("a1", file("a.txt"), 0)?,
+            chunk("a2", file("a.txt"), 2)?,
+            chunk("a3", file("a.txt"), 4)?,
+            chunk("b1", file("b.txt"), 0)?,
+            chunk("b2", file("b.txt"), 2)?,
+            chunk("b3", file("b.txt"), 4)?,
         ];
         let edges = suggest_relations(&chunks);
         // No cross-source edges at all.
         for (a, b, _) in &edges {
-            let a_chunk = chunks.iter().find(|c| c.digest == *a).expect("known digest");
-            let b_chunk = chunks.iter().find(|c| c.digest == *b).expect("known digest");
+            let a_chunk = chunks
+                .iter()
+                .find(|c| c.digest == *a)
+                .ok_or(TestError::Missing("known digest"))?;
+            let b_chunk = chunks
+                .iter()
+                .find(|c| c.digest == *b)
+                .ok_or(TestError::Missing("known digest"))?;
             assert_eq!(a_chunk.source, b_chunk.source);
         }
         // Each run of 3 produces 2 adjacent + 1 anchor edge = 3 edges; two runs = 6.
         assert_eq!(edges.len(), 6);
+        Ok(())
     }
 }

@@ -57,6 +57,7 @@ pub enum DefinitionLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestResult;
 
     #[test]
     fn test_ordering_ascending() {
@@ -70,11 +71,12 @@ mod tests {
     }
 
     #[test]
-    fn test_serde_snake_case() {
-        let json = serde_json::to_string(&DefinitionLayer::UserGlobal).unwrap();
+    fn test_serde_snake_case() -> TestResult {
+        let json = serde_json::to_string(&DefinitionLayer::UserGlobal)?;
         assert_eq!(json, "\"user_global\"");
-        let back: DefinitionLayer = serde_json::from_str(&json).unwrap();
+        let back: DefinitionLayer = serde_json::from_str(&json)?;
         assert_eq!(back, DefinitionLayer::UserGlobal);
+        Ok(())
     }
 
     #[test]

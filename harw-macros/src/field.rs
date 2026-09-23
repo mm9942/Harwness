@@ -89,36 +89,61 @@ pub(crate) fn expand_field(input: TokenStream) -> syn::Result<TokenStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn validate_field_name_rejects_empty() {
-        let err = validate_field_name("").expect_err("empty name must be rejected");
+    fn validate_field_name_rejects_empty() -> TestResult {
+        let Err(err) = validate_field_name("") else {
+            return Err(TestError::Unexpected(
+                "empty name must be rejected".to_owned(),
+            ));
+        };
         assert!(err.contains("darf nicht leer sein"));
+        Ok(())
     }
 
     #[test]
-    fn validate_field_name_rejects_uppercase() {
-        let err = validate_field_name("Child.Admitted").expect_err("uppercase must be rejected");
+    fn validate_field_name_rejects_uppercase() -> TestResult {
+        let Err(err) = validate_field_name("Child.Admitted") else {
+            return Err(TestError::Unexpected(
+                "uppercase must be rejected".to_owned(),
+            ));
+        };
         assert!(err.contains("ungültiges Zeichen"));
+        Ok(())
     }
 
     #[test]
-    fn validate_field_name_rejects_leading_dot() {
-        let err = validate_field_name(".child").expect_err("leading dot must be rejected");
+    fn validate_field_name_rejects_leading_dot() -> TestResult {
+        let Err(err) = validate_field_name(".child") else {
+            return Err(TestError::Unexpected(
+                "leading dot must be rejected".to_owned(),
+            ));
+        };
         assert!(err.contains("beginnen oder enden"));
+        Ok(())
     }
 
     #[test]
-    fn validate_field_name_rejects_trailing_dot() {
-        let err = validate_field_name("child.").expect_err("trailing dot must be rejected");
+    fn validate_field_name_rejects_trailing_dot() -> TestResult {
+        let Err(err) = validate_field_name("child.") else {
+            return Err(TestError::Unexpected(
+                "trailing dot must be rejected".to_owned(),
+            ));
+        };
         assert!(err.contains("beginnen oder enden"));
+        Ok(())
     }
 
     #[test]
-    fn validate_field_name_rejects_double_dot() {
-        let err =
-            validate_field_name("child..admitted").expect_err("double dot must be rejected");
+    fn validate_field_name_rejects_double_dot() -> TestResult {
+        let Err(err) = validate_field_name("child..admitted") else {
+            return Err(TestError::Unexpected(
+                "double dot must be rejected".to_owned(),
+            ));
+        };
         assert!(err.contains("aufeinanderfolgenden Punkte"));
+        Ok(())
     }
 
     #[test]
@@ -135,20 +160,26 @@ mod tests {
     }
 
     #[test]
-    fn expand_field_rejects_invalid_value() {
+    fn expand_field_rejects_invalid_value() -> TestResult {
         let input: TokenStream = quote! { "" };
-        let err = expand_field(input).expect_err("empty literal must be rejected");
+        let Err(err) = expand_field(input) else {
+            return Err(TestError::Unexpected(
+                "empty literal must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("darf nicht leer sein"));
+        Ok(())
     }
 
     #[test]
-    fn expand_field_accepts_valid_value() {
+    fn expand_field_accepts_valid_value() -> TestResult {
         let input: TokenStream = quote! { "child.admitted" };
         let tokens = expand_field(input)
-            .expect("valid literal must expand")
+            .map_err(ctx("valid literal must expand"))?
             .to_string();
         assert!(tokens.contains("FieldName"));
         assert!(tokens.contains("from_static_unchecked"));
         assert!(tokens.contains("\"child.admitted\""));
+        Ok(())
     }
 }

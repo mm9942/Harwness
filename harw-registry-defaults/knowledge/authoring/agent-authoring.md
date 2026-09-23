@@ -92,7 +92,7 @@ name = "My Read-Only Worker"
 description = "Liest und fasst zusammen, ohne zu schreiben."
 
 [tools]
-admitted = ["fs.read", "fs.list", "fs.search", "fs.glob", "fs.grep"]
+admitted = ["fs.read", "fs.list", "fs.search", "fs.glob", "fs.grep", "doc.read_pdf"]
 forbidden = ["fs.write", "shell.exec"]
 
 [spawn]

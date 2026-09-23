@@ -302,8 +302,7 @@ mod tests {
     #[test]
     fn test_is_disjoint_from_false_for_deliberately_constructed_overlap() {
         let security = ceiling(&["security.sensor.read", "security.verdict.propose"]);
-        let attacker_shaped_other_family =
-            ceiling(&["security.sensor.read", "filesystem.write"]);
+        let attacker_shaped_other_family = ceiling(&["security.sensor.read", "filesystem.write"]);
         assert!(
             !security.is_disjoint_from(&attacker_shaped_other_family),
             "zwei Universen, die 'security.sensor.read' teilen, muessen als NICHT disjunkt gelten"

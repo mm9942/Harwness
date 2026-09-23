@@ -126,6 +126,7 @@ pub fn can_spawn(caller: AgentRoleId, target: AgentRoleId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestResult;
 
     /// Überprüft die vollständige 4×4 Spawn-Matrix gegen §3-Tabelle.
     #[test]
@@ -245,17 +246,19 @@ mod tests {
     }
 
     #[test]
-    fn test_serde_kebab_case() {
-        let json = serde_json::to_string(&AgentRoleId::RootOrchestrator).unwrap();
+    fn test_serde_kebab_case() -> TestResult {
+        let json = serde_json::to_string(&AgentRoleId::RootOrchestrator)?;
         assert_eq!(json, "\"root-orchestrator\"");
-        let back: AgentRoleId = serde_json::from_str(&json).unwrap();
+        let back: AgentRoleId = serde_json::from_str(&json)?;
         assert_eq!(back, AgentRoleId::RootOrchestrator);
+        Ok(())
     }
 
     #[test]
-    fn test_worker_role_serde() {
-        let json = serde_json::to_string(&AgentRoleId::Worker).unwrap();
+    fn test_worker_role_serde() -> TestResult {
+        let json = serde_json::to_string(&AgentRoleId::Worker)?;
         assert_eq!(json, "\"worker\"");
+        Ok(())
     }
 
     /// Verankert das Bedrohungsmodell von Knoten AW6-01 (Security-Familie,
@@ -299,7 +302,10 @@ mod tests {
     /// `Worker` mehr (ersetzt den Exklusivitäts-Mechanismus aus Addendum I).
     #[test]
     fn test_can_spawn_uia_to_uia_worker_ok() {
-        assert!(can_spawn(AgentRoleId::UserInterface, AgentRoleId::UiaWorker));
+        assert!(can_spawn(
+            AgentRoleId::UserInterface,
+            AgentRoleId::UiaWorker
+        ));
     }
 
     /// UiaWorker darf von niemandem außer der UIA gespawnt werden.

@@ -656,6 +656,7 @@ fn unlock<T>(lock: File, result: ChannelResult<T>) -> ChannelResult<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use jiff::SignedDuration;
     use std::sync::Arc;
 
@@ -682,138 +683,187 @@ mod tests {
     }
 
     #[test]
-    fn test_redeem_once_binds_peer_to_tenant() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_redeem_once_binds_peer_to_tenant() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = PairingStore::new(dir.path());
         let ch = channel_a();
         let now = ts();
         let code = store
             .issue_code(&ch, &tenant_ops(), b"seed12345", now)
-            .unwrap();
-        let binding = store.redeem_once(&ch, &code, &peer("100"), now).unwrap();
+            .map_err(ctx("issue_code"))?;
+        let binding = store
+            .redeem_once(&ch, &code, &peer("100"), now)
+            .map_err(ctx("redeem_once"))?;
         assert_eq!(binding.tenant, tenant_ops());
         assert_eq!(binding.peer, peer("100"));
         assert_eq!(
-            store.lookup_binding(&ch, &peer("100")).unwrap(),
+            store
+                .lookup_binding(&ch, &peer("100"))
+                .map_err(ctx("lookup_binding"))?,
             Some(tenant_ops())
         );
+        Ok(())
     }
 
     #[test]
-    fn test_expired_code_rejected() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_expired_code_rejected() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = PairingStore::new(dir.path());
         let ch = channel_a();
         let now = ts();
         let code = store
             .issue_code(&ch, &tenant_ops(), b"seed12345", now)
-            .unwrap();
-        let later = now.checked_add(SignedDuration::from_secs(16 * 60)).unwrap();
+            .map_err(ctx("issue_code"))?;
+        let later = now
+            .checked_add(SignedDuration::from_secs(16 * 60))
+            .map_err(ctx("checked_add"))?;
         let result = store.redeem_once(&ch, &code, &peer("100"), later);
         assert!(matches!(result, Err(ChannelError::PairingExpired { .. })));
+        Ok(())
     }
 
     #[test]
-    fn test_already_redeemed_rejected_sequentially() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_already_redeemed_rejected_sequentially() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = PairingStore::new(dir.path());
         let ch = channel_a();
         let now = ts();
         let code = store
             .issue_code(&ch, &tenant_ops(), b"seed12345", now)
-            .unwrap();
-        store.redeem_once(&ch, &code, &peer("100"), now).unwrap();
+            .map_err(ctx("issue_code"))?;
+        store
+            .redeem_once(&ch, &code, &peer("100"), now)
+            .map_err(ctx("redeem_once"))?;
         let second = store.redeem_once(&ch, &code, &peer("101"), now);
         assert!(matches!(
             second,
             Err(ChannelError::PairingAlreadyRedeemed { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_cross_channel_code_rejected() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_cross_channel_code_rejected() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = PairingStore::new(dir.path());
         let now = ts();
         let code = store
             .issue_code(&channel_a(), &tenant_ops(), b"seed12345", now)
-            .unwrap();
+            .map_err(ctx("issue_code"))?;
         let result = store.redeem_once(&channel_b(), &code, &peer("100"), now);
         assert!(matches!(result, Err(ChannelError::PairingInvalid { .. })));
+        Ok(())
     }
 
     #[test]
-    fn test_concurrent_double_redeem_single_winner() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_concurrent_double_redeem_single_winner() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = Arc::new(PairingStore::new(dir.path()));
         let ch = channel_a();
         let now = ts();
         let code = store
             .issue_code(&ch, &tenant_ops(), b"seed12345", now)
-            .unwrap();
+            .map_err(ctx("issue_code"))?;
 
         let mut results: Vec<ChannelResult<PairingRecord>> = Vec::new();
-        std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for n in 0..8u32 {
-                let store = Arc::clone(&store);
-                let ch = ch.clone();
-                let code = code.clone();
-                handles.push(
-                    scope.spawn(move || {
+        let scope_result: TestResult =
+            std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for n in 0..8u32 {
+                    let store = Arc::clone(&store);
+                    let ch = ch.clone();
+                    let code = code.clone();
+                    handles.push(scope.spawn(move || {
                         store.redeem_once(&ch, &code, &peer(&format!("2{n:02}")), now)
-                    }),
-                );
-            }
-            for handle in handles {
-                results.push(handle.join().unwrap());
-            }
-        });
+                    }));
+                }
+                for handle in handles {
+                    let outcome = handle
+                        .join()
+                        .map_err(|_| TestError::Unexpected("Test-Thread ist paniced".to_owned()))?;
+                    results.push(outcome);
+                }
+                Ok(())
+            });
+        scope_result?;
 
         let winners = results.iter().filter(|r| r.is_ok()).count();
         let losers = results.iter().filter(|r| r.is_err()).count();
         assert_eq!(winners, 1);
         assert_eq!(losers, 7);
+        Ok(())
     }
 
     #[test]
-    fn test_revoke_hides_binding() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_revoke_hides_binding() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = PairingStore::new(dir.path());
         let ch = channel_a();
         let now = ts();
         let code = store
             .issue_code(&ch, &tenant_ops(), b"seed12345", now)
-            .unwrap();
-        store.redeem_once(&ch, &code, &peer("100"), now).unwrap();
-        store.revoke(&ch, &peer("100"), now).unwrap();
-        assert_eq!(store.lookup_binding(&ch, &peer("100")).unwrap(), None);
+            .map_err(ctx("issue_code"))?;
+        store
+            .redeem_once(&ch, &code, &peer("100"), now)
+            .map_err(ctx("redeem_once"))?;
+        store
+            .revoke(&ch, &peer("100"), now)
+            .map_err(ctx("revoke"))?;
+        assert_eq!(
+            store
+                .lookup_binding(&ch, &peer("100"))
+                .map_err(ctx("lookup_binding"))?,
+            None
+        );
 
         let missing = store.revoke(&ch, &peer("999"), now);
         assert!(matches!(
             missing,
             Err(ChannelError::PairingBindingNotFound { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_claim_once_dedups_replays() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_claim_once_dedups_replays() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = PairingStore::new(dir.path());
         let ch = channel_a();
         let now = ts();
-        assert!(store.claim_once(&ch, "42", now).unwrap());
-        assert!(!store.claim_once(&ch, "42", now).unwrap());
-        assert!(store.claim_once(&ch, "43", now).unwrap());
+        assert!(
+            store
+                .claim_once(&ch, "42", now)
+                .map_err(ctx("claim_once"))?
+        );
+        assert!(
+            !store
+                .claim_once(&ch, "42", now)
+                .map_err(ctx("claim_once"))?
+        );
+        assert!(
+            store
+                .claim_once(&ch, "43", now)
+                .map_err(ctx("claim_once"))?
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_claim_once_is_channel_scoped() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_claim_once_is_channel_scoped() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = PairingStore::new(dir.path());
         let now = ts();
-        assert!(store.claim_once(&channel_a(), "42", now).unwrap());
-        assert!(store.claim_once(&channel_b(), "42", now).unwrap());
+        assert!(
+            store
+                .claim_once(&channel_a(), "42", now)
+                .map_err(ctx("claim_once"))?
+        );
+        assert!(
+            store
+                .claim_once(&channel_b(), "42", now)
+                .map_err(ctx("claim_once"))?
+        );
+        Ok(())
     }
 
     #[test]
@@ -831,37 +881,57 @@ mod tests {
     }
 
     #[test]
-    fn test_restart_safety_survives_store_recreation() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_restart_safety_survives_store_recreation() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let ch = channel_a();
         let now = ts();
 
         let store1 = PairingStore::new(dir.path());
         let code = store1
             .issue_code(&ch, &tenant_ops(), b"seed12345", now)
-            .unwrap();
-        store1.redeem_once(&ch, &code, &peer("100"), now).unwrap();
-        store1.claim_once(&ch, "99", now).unwrap();
+            .map_err(ctx("issue_code"))?;
+        store1
+            .redeem_once(&ch, &code, &peer("100"), now)
+            .map_err(ctx("redeem_once"))?;
+        store1
+            .claim_once(&ch, "99", now)
+            .map_err(ctx("claim_once"))?;
 
         // A different peer is paired then revoked; revocation must survive restart.
         let code2 = store1
             .issue_code(&ch, &tenant_ops(), b"other6789", now)
-            .unwrap();
-        store1.redeem_once(&ch, &code2, &peer("200"), now).unwrap();
-        store1.revoke(&ch, &peer("200"), now).unwrap();
+            .map_err(ctx("issue_code"))?;
+        store1
+            .redeem_once(&ch, &code2, &peer("200"), now)
+            .map_err(ctx("redeem_once"))?;
+        store1
+            .revoke(&ch, &peer("200"), now)
+            .map_err(ctx("revoke"))?;
 
         drop(store1);
         let store2 = PairingStore::new(dir.path());
 
         assert_eq!(
-            store2.lookup_binding(&ch, &peer("100")).unwrap(),
+            store2
+                .lookup_binding(&ch, &peer("100"))
+                .map_err(ctx("lookup_binding"))?,
             Some(tenant_ops())
         );
-        assert_eq!(store2.lookup_binding(&ch, &peer("200")).unwrap(), None);
+        assert_eq!(
+            store2
+                .lookup_binding(&ch, &peer("200"))
+                .map_err(ctx("lookup_binding"))?,
+            None
+        );
         assert!(matches!(
             store2.redeem_once(&ch, &code, &peer("101"), now),
             Err(ChannelError::PairingAlreadyRedeemed { .. })
         ));
-        assert!(!store2.claim_once(&ch, "99", now).unwrap());
+        assert!(
+            !store2
+                .claim_once(&ch, "99", now)
+                .map_err(ctx("claim_once"))?
+        );
+        Ok(())
     }
 }

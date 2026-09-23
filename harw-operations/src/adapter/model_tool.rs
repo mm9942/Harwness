@@ -581,22 +581,25 @@ mod tests {
         OpOutput, Operation, OperationCategory, OperationDomain, OperationMeta, PermissionTier,
         Surface,
     };
+    use crate::test_support::{TestError, TestResult, ctx};
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_extension_api::contributors::ToolProvider;
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_tools::{
         AdditionalProperties, JsonSchema, JsonSchemaType, ToolCall, ToolExecutionContext, ToolName,
         ToolOutput, ToolSpec, ToolsError,
     };
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, OnceLock};
 
     // ── Test helpers ──────────────────────────────────────────────────────────
 
     /// Erstellt einen minimalen `OpContext` für Tests.
     /// Verwendet `AtomicU64` für eindeutige temporäre Verzeichnisse bei Parallel-Tests.
-    fn make_test_ctx() -> (OpContext, PathBuf) {
+    fn make_test_ctx() -> TestResult<(OpContext, PathBuf)> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTX_COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = CTX_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -605,7 +608,8 @@ mod tests {
             std::process::id(),
             id
         ));
-        std::fs::create_dir_all(tmp.join("ws")).unwrap();
+        std::fs::create_dir_all(tmp.join("ws"))
+            .map_err(ctx("Test-Workspace-Verzeichnis anlegen"))?;
         let registry = WorkspaceRegistry::build(
             &tmp,
             [WorkspaceRegistration {
@@ -614,19 +618,19 @@ mod tests {
                 root: PathBuf::from("ws"),
             }],
         )
-        .unwrap();
+        .map_err(ctx("WorkspaceRegistry bauen"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .unwrap();
+            .map_err(ctx("Workspace auflösen"))?;
         let sandbox = SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ReadWorkspace]),
         );
         let ctx = OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new());
-        (ctx, tmp)
+        Ok((ctx, tmp))
     }
 
     // ── Fixture operations ────────────────────────────────────────────────────
@@ -900,40 +904,43 @@ mod tests {
     // ── Test 2: from_operation mit readonly=true, approval=None → Some ────────
 
     #[test]
-    fn test_from_operation_readonly_true_approval_none_returns_some_with_correct_flags() {
+    fn test_from_operation_readonly_true_approval_none_returns_some_with_correct_flags()
+    -> TestResult {
         let op: Arc<dyn Operation> = Arc::new(ReadonlyModelToolOp);
         let adapter = ModelToolAdapter::from_operation(op);
-        let adapter = adapter.expect("Erwartet Some bei Op mit ModelTool-Surface");
+        let adapter = adapter.ok_or(TestError::Missing("Some bei Op mit ModelTool-Surface"))?;
         assert!(adapter.readonly(), "readonly sollte true sein");
         assert_eq!(
             adapter.approval(),
             ApprovalPolicy::None,
             "approval sollte None sein"
         );
+        Ok(())
     }
 
     // ── Test 3: from_operation mit readonly=false, approval=Always ────────────
 
     #[test]
-    fn test_from_operation_readonly_false_approval_always_returns_correct_flags() {
+    fn test_from_operation_readonly_false_approval_always_returns_correct_flags() -> TestResult {
         let op: Arc<dyn Operation> = Arc::new(WritingModelToolOp);
         let adapter = ModelToolAdapter::from_operation(op)
-            .expect("Erwartet Some bei Op mit ModelTool-Surface");
+            .ok_or(TestError::Missing("Some bei Op mit ModelTool-Surface"))?;
         assert!(!adapter.readonly(), "readonly sollte false sein");
         assert_eq!(
             adapter.approval(),
             ApprovalPolicy::Always,
             "approval sollte Always sein"
         );
+        Ok(())
     }
 
     // ── Test 4: from_operation mit gemischten Surfaces → ModelTool-Info wird verwendet
 
     #[test]
-    fn test_from_operation_mixed_surfaces_uses_model_tool_info() {
+    fn test_from_operation_mixed_surfaces_uses_model_tool_info() -> TestResult {
         let op: Arc<dyn Operation> = Arc::new(MixedSurfaceOp);
         let adapter = ModelToolAdapter::from_operation(op)
-            .expect("Erwartet Some bei Op mit gemischten Surfaces");
+            .ok_or(TestError::Missing("Some bei Op mit gemischten Surfaces"))?;
         // Die ModelTool-Surface ist readonly=true, approval=None
         assert!(
             adapter.readonly(),
@@ -944,74 +951,85 @@ mod tests {
             ApprovalPolicy::None,
             "approval sollte None sein (aus ModelTool-Surface)"
         );
+        Ok(())
     }
 
     // ── Test 5: tool_name() == OperationMeta::name ────────────────────────────
 
     #[test]
-    fn test_tool_name_equals_operation_meta_name() {
+    fn test_tool_name_equals_operation_meta_name() -> TestResult {
         let op: Arc<dyn Operation> = Arc::new(ReadonlyModelToolOp);
-        let adapter = ModelToolAdapter::from_operation(op).expect("Erwartet Some");
+        let adapter = ModelToolAdapter::from_operation(op).ok_or(TestError::Missing("Some"))?;
         assert_eq!(adapter.tool_name(), "readonly-tool");
+        Ok(())
     }
 
     #[test]
-    fn test_tool_name_equals_operation_meta_name_mixed() {
+    fn test_tool_name_equals_operation_meta_name_mixed() -> TestResult {
         let op: Arc<dyn Operation> = Arc::new(MixedSurfaceOp);
-        let adapter = ModelToolAdapter::from_operation(op).expect("Erwartet Some");
+        let adapter = ModelToolAdapter::from_operation(op).ok_or(TestError::Missing("Some"))?;
         assert_eq!(adapter.tool_name(), "mixed-surface");
+        Ok(())
     }
 
     // ── Test 6: description() == OperationMeta::summary ──────────────────────
 
     #[test]
-    fn test_description_equals_operation_meta_summary() {
+    fn test_description_equals_operation_meta_summary() -> TestResult {
         let op: Arc<dyn Operation> = Arc::new(ReadonlyModelToolOp);
-        let adapter = ModelToolAdapter::from_operation(op).expect("Erwartet Some");
+        let adapter = ModelToolAdapter::from_operation(op).ok_or(TestError::Missing("Some"))?;
         assert_eq!(adapter.description(), "Lesende Modell-Tool-Operation.");
+        Ok(())
     }
 
     #[test]
-    fn test_description_equals_operation_meta_summary_writing() {
+    fn test_description_equals_operation_meta_summary_writing() -> TestResult {
         let op: Arc<dyn Operation> = Arc::new(WritingModelToolOp);
-        let adapter = ModelToolAdapter::from_operation(op).expect("Erwartet Some");
+        let adapter = ModelToolAdapter::from_operation(op).ok_or(TestError::Missing("Some"))?;
         assert_eq!(adapter.description(), "Schreibende Modell-Tool-Operation.");
+        Ok(())
     }
 
     // ── Test 7: invoke reicht JSON durch ──────────────────────────────────────
 
     #[tokio::test]
-    async fn test_invoke_passes_json_args_to_operation() {
+    async fn test_invoke_passes_json_args_to_operation() -> TestResult {
         let op: Arc<dyn Operation> = Arc::new(EchoXOp);
-        let adapter = ModelToolAdapter::from_operation(op).expect("Erwartet Some");
-        let (ctx, tmp) = make_test_ctx();
+        let adapter = ModelToolAdapter::from_operation(op).ok_or(TestError::Missing("Some"))?;
+        let (ctx, tmp) = make_test_ctx()?;
         let args = serde_json::json!({ "x": "hallo-welt" });
         let result = adapter.invoke(&ctx, args).await;
         std::fs::remove_dir_all(tmp).ok();
-        let out = result.expect("Erwartet Ok");
+        let Ok(out) = result else {
+            return Err(TestError::Unexpected("Erwartet Ok".into()));
+        };
         assert_eq!(
             out.text, "hallo-welt",
             "invoke sollte json_args['x'] weitergeben"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_invoke_with_missing_x_key_returns_empty_string() {
+    async fn test_invoke_with_missing_x_key_returns_empty_string() -> TestResult {
         let op: Arc<dyn Operation> = Arc::new(EchoXOp);
-        let adapter = ModelToolAdapter::from_operation(op).expect("Erwartet Some");
-        let (ctx, tmp) = make_test_ctx();
+        let adapter = ModelToolAdapter::from_operation(op).ok_or(TestError::Missing("Some"))?;
+        let (ctx, tmp) = make_test_ctx()?;
         let args = serde_json::json!({});
         let result = adapter.invoke(&ctx, args).await;
         std::fs::remove_dir_all(tmp).ok();
-        let out = result.expect("Erwartet Ok");
+        let Ok(out) = result else {
+            return Err(TestError::Unexpected("Erwartet Ok".into()));
+        };
         assert_eq!(
             out.text, "",
             "invoke ohne 'x'-Schlüssel sollte leeren String liefern"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_invoke_raw_args_are_empty() {
+    async fn test_invoke_raw_args_are_empty() -> TestResult {
         // Prüft, dass raw_args leer sind (indirekt: EchoXOp ignoriert raw_args,
         // aber eine Op, die raw_args.len() ausgibt, würde 0 zurückgeben).
         struct CountRawArgsOp;
@@ -1044,21 +1062,24 @@ mod tests {
         }
 
         let op: Arc<dyn Operation> = Arc::new(CountRawArgsOp);
-        let adapter = ModelToolAdapter::from_operation(op).expect("Erwartet Some");
-        let (ctx, tmp) = make_test_ctx();
+        let adapter = ModelToolAdapter::from_operation(op).ok_or(TestError::Missing("Some"))?;
+        let (ctx, tmp) = make_test_ctx()?;
         let result = adapter.invoke(&ctx, serde_json::Value::Null).await;
         std::fs::remove_dir_all(tmp).ok();
-        let out = result.expect("Erwartet Ok");
+        let Ok(out) = result else {
+            return Err(TestError::Unexpected("Erwartet Ok".into()));
+        };
         assert_eq!(out.text, "0", "raw_args müssen bei invoke leer sein");
+        Ok(())
     }
 
     // ── Test 8: invoke propagiert OpError::Execution ─────────────────────────
 
     #[tokio::test]
-    async fn test_invoke_propagates_execution_error() {
+    async fn test_invoke_propagates_execution_error() -> TestResult {
         let op: Arc<dyn Operation> = Arc::new(AlwaysErrOp);
-        let adapter = ModelToolAdapter::from_operation(op).expect("Erwartet Some");
-        let (ctx, tmp) = make_test_ctx();
+        let adapter = ModelToolAdapter::from_operation(op).ok_or(TestError::Missing("Some"))?;
+        let (ctx, tmp) = make_test_ctx()?;
         let result = adapter.invoke(&ctx, serde_json::Value::Null).await;
         std::fs::remove_dir_all(tmp).ok();
         match result {
@@ -1068,17 +1089,24 @@ mod tests {
                     "Fehlermeldung sollte weitergeleitet werden"
                 );
             }
-            other => panic!("Erwartet OpError::Execution, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Erwartet OpError::Execution, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     // ── Zusatz: operation() liefert Zugriff auf die zugrunde liegende Op ──────
 
     #[test]
-    fn test_operation_accessor_returns_arc_with_correct_meta() {
+    fn test_operation_accessor_returns_arc_with_correct_meta() -> TestResult {
         let op: Arc<dyn Operation> = Arc::new(ReadonlyModelToolOp);
-        let adapter = ModelToolAdapter::from_operation(Arc::clone(&op)).expect("Erwartet Some");
+        let adapter =
+            ModelToolAdapter::from_operation(Arc::clone(&op)).ok_or(TestError::Missing("Some"))?;
         assert_eq!(adapter.operation().meta().name, "readonly-tool");
+        Ok(())
     }
 
     // ── Compile-Zeit: ModelToolAdapter ist Send + Sync ────────────────────────
@@ -1119,7 +1147,7 @@ mod tests {
     }
 
     #[test]
-    fn test_model_tool_schema_for_status_without_fallback_returns_known_schema() {
+    fn test_model_tool_schema_for_status_without_fallback_returns_known_schema() -> TestResult {
         let schema = model_tool_schema_for("status", None);
 
         assert_eq!(schema.schema_type, Some(JsonSchemaType::Object));
@@ -1131,21 +1159,27 @@ mod tests {
         assert!(
             schema
                 .properties
-                .expect("status behält sein geschlossenes Schema")
+                .ok_or(TestError::Missing(
+                    "status behält sein geschlossenes Schema"
+                ))?
                 .is_empty(),
             "status hat keine Argumente"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_model_tool_schema_for_stop_without_fallback_returns_known_schema() {
+    fn test_model_tool_schema_for_stop_without_fallback_returns_known_schema() -> TestResult {
         let schema = model_tool_schema_for("stop", None);
 
-        let properties = schema.properties.expect("stop behält sein Schema");
+        let properties = schema
+            .properties
+            .ok_or(TestError::Missing("stop behält sein Schema"))?;
         assert_eq!(
             properties.get("job_id").map(|s| &s.schema_type),
             Some(&Some(JsonSchemaType::String))
         );
+        Ok(())
     }
 
     #[test]
@@ -1188,24 +1222,46 @@ mod tests {
 
     /// Baut einen Provider über genau eine Operation und gibt das Schema
     /// zurück, das er für sie veröffentlicht.
-    fn published_parameters(op: Arc<dyn Operation>) -> JsonSchema {
+    ///
+    /// Der `context_factory`-Abschluss darf laut Vertrag der Schema-Entdeckung
+    /// (`ToolProvider::tools`) nie aufgerufen werden. Da die Abschlusssignatur
+    /// `Fn(&ToolExecutionContext) -> OpContext` (aus `ModelToolProvider::new`,
+    /// Produktionscode) kein `Result` zulässt, dient statt einer Panik ein
+    /// `AtomicBool`-Kanarienvogel: der Abschluss setzt ihn und liefert einen
+    /// neutralen `OpContext` aus der übergebenen Authority zurück; anschließend
+    /// prüft ein `assert!`, dass der Kanarienvogel nie gesetzt wurde.
+    fn published_parameters(op: Arc<dyn Operation>) -> TestResult<JsonSchema> {
         let name = op.meta().name;
-        let provider = ModelToolProvider::new(vec![op], |_| -> OpContext {
-            panic!("schema discovery must not construct execution authority")
+        let factory_called = Arc::new(AtomicBool::new(false));
+        let observed_called = Arc::clone(&factory_called);
+        let provider = ModelToolProvider::new(vec![op], move |authority| -> OpContext {
+            observed_called.store(true, Ordering::Relaxed);
+            OpContext::new(
+                authority.session_id().clone(),
+                authority.turn_id().clone(),
+                authority.sandbox().clone(),
+                ServiceMap::new(),
+            )
         });
         let specs = provider.tools();
+        assert!(
+            !factory_called.load(Ordering::Relaxed),
+            "schema discovery must not construct execution authority"
+        );
         let Some(spec) = specs.iter().find(|spec| spec.name() == name) else {
-            panic!("Tool `{name}` muss veröffentlicht werden");
+            return Err(TestError::Unexpected(format!(
+                "Tool `{name}` muss veröffentlicht werden"
+            )));
         };
         let ToolSpec::Function(function) = spec;
-        function.parameters.clone()
+        Ok(function.parameters.clone())
     }
 
     #[test]
-    fn provider_publishes_closed_schema_for_operation_with_args_schema() {
+    fn provider_publishes_closed_schema_for_operation_with_args_schema() -> TestResult {
         let op =
             named_model_tool_op_with_schema("plan", Some(<PlanArgs as OpArgsSchema>::json_schema));
-        let parameters = published_parameters(op);
+        let parameters = published_parameters(op)?;
 
         assert_eq!(
             parameters,
@@ -1219,70 +1275,82 @@ mod tests {
         );
         assert_eq!(parameters.required, Some(vec!["action".to_owned()]));
         let Some(properties) = parameters.properties else {
-            panic!("ein geschlossenes Schema nennt seine erlaubten Felder");
+            return Err(TestError::Missing(
+                "ein geschlossenes Schema nennt seine erlaubten Felder",
+            ));
         };
         assert!(properties.contains_key("action"));
         assert!(
             properties.contains_key("title"),
             "das Modell muss die Feldnamen erfahren statt sie zu raten"
         );
+        Ok(())
     }
 
     #[test]
-    fn operation_meta_args_schema_is_the_source_of_the_published_schema() {
+    fn operation_meta_args_schema_is_the_source_of_the_published_schema() -> TestResult {
         let op =
             named_model_tool_op_with_schema("plan", Some(<PlanArgs as OpArgsSchema>::json_schema));
         let Some(build_schema) = op.meta().args_schema else {
-            panic!("die Operation trägt ein Argument-Schema");
+            return Err(TestError::Missing(
+                "die Operation trägt ein Argument-Schema",
+            ));
         };
 
         assert_eq!(
             build_schema(),
-            published_parameters(Arc::clone(&op)),
+            published_parameters(Arc::clone(&op))?,
             "veröffentlicht wird exakt `meta.args_schema`"
         );
+        Ok(())
     }
 
     #[test]
-    fn provider_prefers_args_schema_over_hardcoded_name_match() {
+    fn provider_prefers_args_schema_over_hardcoded_name_match() -> TestResult {
         // `stop` hat einen bekannten `match`-Arm — das mitgebrachte Schema
         // muss ihn trotzdem schlagen.
         let op =
             named_model_tool_op_with_schema("stop", Some(<PlanArgs as OpArgsSchema>::json_schema));
-        let parameters = published_parameters(op);
+        let parameters = published_parameters(op)?;
 
         assert_eq!(parameters, custom_plan_schema());
         let Some(properties) = parameters.properties else {
-            panic!("ein geschlossenes Schema nennt seine erlaubten Felder");
+            return Err(TestError::Missing(
+                "ein geschlossenes Schema nennt seine erlaubten Felder",
+            ));
         };
         assert!(
             !properties.contains_key("job_id"),
             "der Namens-`match` darf ein mitgebrachtes Schema nicht überschreiben"
         );
+        Ok(())
     }
 
     #[test]
-    fn provider_falls_back_to_name_match_without_args_schema() {
+    fn provider_falls_back_to_name_match_without_args_schema() -> TestResult {
         // Eine Operation ohne `OpArgs` behält ihr bekanntes Schema, statt auf
         // das offene Objekt zu fallen.
-        let parameters = published_parameters(named_model_tool_op("stop"));
+        let parameters = published_parameters(named_model_tool_op("stop"))?;
 
         assert_eq!(
             parameters.additional_properties,
             Some(Box::new(AdditionalProperties::Bool(false)))
         );
         let Some(properties) = parameters.properties else {
-            panic!("`stop` behält sein geschlossenes Schema");
+            return Err(TestError::Missing(
+                "`stop` behält sein geschlossenes Schema",
+            ));
         };
         assert_eq!(
             properties.get("job_id").map(|schema| &schema.schema_type),
             Some(&Some(JsonSchemaType::String))
         );
+        Ok(())
     }
 
     #[test]
-    fn provider_keeps_open_object_for_unknown_operation_without_args_schema() {
-        let parameters = published_parameters(named_model_tool_op("future-tool"));
+    fn provider_keeps_open_object_for_unknown_operation_without_args_schema() -> TestResult {
+        let parameters = published_parameters(named_model_tool_op("future-tool"))?;
 
         assert_eq!(parameters.schema_type, Some(JsonSchemaType::Object));
         assert_eq!(
@@ -1291,6 +1359,7 @@ mod tests {
             "dokumentiertes Rückfallverhalten bleibt unverändert"
         );
         assert!(parameters.properties.is_none());
+        Ok(())
     }
 
     #[test]
@@ -1300,11 +1369,23 @@ mod tests {
             named_model_tool_op("stop"),
             named_model_tool_op("future-tool"),
         ];
-        let provider = ModelToolProvider::new(operations, |_| -> OpContext {
-            panic!("schema discovery must not construct execution authority")
+        let factory_called = Arc::new(AtomicBool::new(false));
+        let observed_called = Arc::clone(&factory_called);
+        let provider = ModelToolProvider::new(operations, move |authority| -> OpContext {
+            observed_called.store(true, Ordering::Relaxed);
+            OpContext::new(
+                authority.session_id().clone(),
+                authority.turn_id().clone(),
+                authority.sandbox().clone(),
+                ServiceMap::new(),
+            )
         });
 
         let specs = provider.tools();
+        assert!(
+            !factory_called.load(Ordering::Relaxed),
+            "schema discovery must not construct execution authority"
+        );
         assert_eq!(specs.len(), 3);
 
         let closed_count = specs
@@ -1323,7 +1404,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_filters_surfaces_and_emits_exact_or_compatible_schemas() {
+    fn provider_filters_surfaces_and_emits_exact_or_compatible_schemas() -> TestResult {
         let operations: Vec<Arc<dyn Operation>> = vec![
             Arc::new(NoSurfaceOp),
             named_model_tool_op("status"),
@@ -1332,11 +1413,23 @@ mod tests {
             named_model_tool_op("stop"),
             named_model_tool_op("future-tool"),
         ];
-        let provider = ModelToolProvider::new(operations, |_| -> OpContext {
-            panic!("schema discovery must not construct execution authority")
+        let factory_called = Arc::new(AtomicBool::new(false));
+        let observed_called = Arc::clone(&factory_called);
+        let provider = ModelToolProvider::new(operations, move |authority| -> OpContext {
+            observed_called.store(true, Ordering::Relaxed);
+            OpContext::new(
+                authority.session_id().clone(),
+                authority.turn_id().clone(),
+                authority.sandbox().clone(),
+                ServiceMap::new(),
+            )
         });
 
         let specs = provider.tools();
+        assert!(
+            !factory_called.load(Ordering::Relaxed),
+            "schema discovery must not construct execution authority"
+        );
         assert_eq!(specs.len(), 5);
 
         let expected_properties = [
@@ -1356,7 +1449,7 @@ mod tests {
             let spec = specs
                 .iter()
                 .find(|spec| spec.name() == name)
-                .expect("known model tool must be published");
+                .ok_or(TestError::Missing("known model tool must be published"))?;
             let ToolSpec::Function(function) = spec;
             assert!(!function.strict);
             assert_eq!(
@@ -1372,7 +1465,9 @@ mod tests {
                 .parameters
                 .properties
                 .as_ref()
-                .expect("closed schema must declare its allowed properties");
+                .ok_or(TestError::Missing(
+                    "closed schema must declare its allowed properties",
+                ))?;
             assert_eq!(properties.len(), expected_properties.len());
             for (property_name, property_type) in expected_properties {
                 assert_eq!(
@@ -1387,7 +1482,7 @@ mod tests {
         let fallback = specs
             .iter()
             .find(|spec| spec.name() == "future-tool")
-            .expect("future model tool must be published");
+            .ok_or(TestError::Missing("future model tool must be published"))?;
         let ToolSpec::Function(fallback) = fallback;
         assert_eq!(
             fallback.parameters.schema_type,
@@ -1403,11 +1498,12 @@ mod tests {
             provider.approval_policy(&ToolName::new("stop")),
             Some(ApprovalPolicy::None)
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn provider_propagates_only_factory_derived_authority() {
-        let (trusted_ctx, tmp) = make_test_ctx();
+    async fn provider_propagates_only_factory_derived_authority() -> TestResult {
+        let (trusted_ctx, tmp) = make_test_ctx()?;
         let execution_context = ToolExecutionContext::new(
             trusted_ctx.session_id().clone(),
             trusted_ctx.turn_id().clone(),
@@ -1437,7 +1533,7 @@ mod tests {
         );
         let executor = provider
             .executor(&ToolName::new("authority-echo"))
-            .expect("model tool executor exists");
+            .ok_or(TestError::Missing("model tool executor exists"))?;
         let call = ToolCall {
             id: ToolCallId::new(),
             name: ToolName::new("authority-echo"),
@@ -1452,33 +1548,43 @@ mod tests {
         let output = executor
             .execute(&execution_context, &call)
             .await
-            .expect("operation succeeds");
+            .map_err(ctx("operation succeeds"))?;
         std::fs::remove_dir_all(tmp).ok();
         match output {
             ToolOutput::Text { content } => assert_eq!(content, expected),
-            other => panic!("expected text output, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected text output, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn provider_rejects_non_object_arguments_before_context_creation() {
+    async fn provider_rejects_non_object_arguments_before_context_creation() -> TestResult {
         let factory_calls = Arc::new(AtomicUsize::new(0));
         let observed_calls = Arc::clone(&factory_calls);
         let provider = ModelToolProvider::new(
             vec![Arc::new(ReadonlyModelToolOp) as Arc<dyn Operation>],
-            move |_| -> OpContext {
+            move |authority| -> OpContext {
                 observed_calls.fetch_add(1, Ordering::Relaxed);
-                panic!("invalid arguments must not reach the context factory")
+                OpContext::new(
+                    authority.session_id().clone(),
+                    authority.turn_id().clone(),
+                    authority.sandbox().clone(),
+                    ServiceMap::new(),
+                )
             },
         );
         let executor = provider
             .executor(&ToolName::new("readonly-tool"))
-            .expect("model tool executor exists");
-        let (ctx, tmp) = make_test_ctx();
+            .ok_or(TestError::Missing("model tool executor exists"))?;
+        let (op_ctx, tmp) = make_test_ctx()?;
         let execution_context = ToolExecutionContext::new(
-            ctx.session_id().clone(),
-            ctx.turn_id().clone(),
-            ctx.sandbox().clone(),
+            op_ctx.session_id().clone(),
+            op_ctx.turn_id().clone(),
+            op_ctx.sandbox().clone(),
         );
         let call = ToolCall {
             id: ToolCallId::new(),
@@ -1486,23 +1592,30 @@ mod tests {
             arguments: serde_json::json!(["not", "an", "object"]),
         };
 
-        let error = executor
-            .execute(&execution_context, &call)
-            .await
-            .expect_err("array arguments must be rejected");
+        let result = executor.execute(&execution_context, &call).await;
         std::fs::remove_dir_all(tmp).ok();
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "array arguments must be rejected".into(),
+            ));
+        };
         assert_eq!(factory_calls.load(Ordering::Relaxed), 0);
         match error {
             ToolsError::InvalidArguments { name, reason } => {
                 assert_eq!(name, "readonly-tool");
                 assert!(reason.contains("JSON object"));
             }
-            other => panic!("expected typed invalid-arguments error, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected typed invalid-arguments error, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn provider_converts_operation_error_to_typed_tools_error() {
+    async fn provider_converts_operation_error_to_typed_tools_error() -> TestResult {
         let provider = ModelToolProvider::new(
             vec![Arc::new(AlwaysErrOp) as Arc<dyn Operation>],
             |authority| {
@@ -1516,12 +1629,12 @@ mod tests {
         );
         let executor = provider
             .executor(&ToolName::new("always-err"))
-            .expect("model tool executor exists");
-        let (ctx, tmp) = make_test_ctx();
+            .ok_or(TestError::Missing("model tool executor exists"))?;
+        let (op_ctx, tmp) = make_test_ctx()?;
         let execution_context = ToolExecutionContext::new(
-            ctx.session_id().clone(),
-            ctx.turn_id().clone(),
-            ctx.sandbox().clone(),
+            op_ctx.session_id().clone(),
+            op_ctx.turn_id().clone(),
+            op_ctx.sandbox().clone(),
         );
         let call = ToolCall {
             id: ToolCallId::new(),
@@ -1529,16 +1642,21 @@ mod tests {
             arguments: serde_json::json!({}),
         };
 
-        let error = executor
-            .execute(&execution_context, &call)
-            .await
-            .expect_err("operation must fail");
+        let result = executor.execute(&execution_context, &call).await;
         std::fs::remove_dir_all(tmp).ok();
+        let Err(error) = result else {
+            return Err(TestError::Unexpected("operation must fail".into()));
+        };
         match error {
             ToolsError::ExecutionFailed(message) => {
                 assert!(message.contains("simulierter Fehler"));
             }
-            other => panic!("expected typed execution error, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected typed execution error, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 }

@@ -241,24 +241,30 @@ async fn deps_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{block_on, mini_workspace, sandbox_context, tool_call};
+    use crate::test_support::{
+        TestError, TestResult, block_on, ctx, mini_workspace, sandbox_context, tool_call,
+    };
     use harw_authority::Permission;
     use harw_tools::ToolExecutor as _;
     use std::fs;
 
     #[test]
-    fn test_graph_as_json_reports_levels_and_leaf_flags() {
-        let (harness, workspace) = mini_workspace("graph-json");
-        let graph = WorkspaceGraph::load(&workspace).expect("Workspace laden");
+    fn test_graph_as_json_reports_levels_and_leaf_flags() -> TestResult {
+        let (harness, workspace) = mini_workspace("graph-json")?;
+        let graph = WorkspaceGraph::load(&workspace).map_err(ctx("Workspace laden"))?;
 
-        let value = graph_as_json(&graph).expect("JSON-Projektion");
+        let value = graph_as_json(&graph).map_err(ctx("JSON-Projektion"))?;
 
-        let levels = value["levels"].as_array().expect("levels ist ein Array");
+        let levels = value["levels"]
+            .as_array()
+            .ok_or(TestError::Missing("levels ist ein Array"))?;
         assert_eq!(levels.len(), 3, "a -> b -> c ergibt drei Ebenen");
         assert_eq!(levels[0][0], "a");
         assert_eq!(levels[2][0], "c");
 
-        let crates = value["crates"].as_array().expect("crates ist ein Array");
+        let crates = value["crates"]
+            .as_array()
+            .ok_or(TestError::Missing("crates ist ein Array"))?;
         assert_eq!(crates.len(), 3);
         assert_eq!(crates[0]["name"], "a", "crates sind nach Name sortiert");
         assert_eq!(crates[0]["is_leaf"], true);
@@ -267,15 +273,18 @@ mod tests {
         assert_eq!(crates[2]["level"], 2);
 
         fs::remove_dir_all(&harness).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_graph_as_json_lists_external_deps() {
-        let (harness, workspace) = mini_workspace("graph-external");
-        let graph = WorkspaceGraph::load(&workspace).expect("Workspace laden");
+    fn test_graph_as_json_lists_external_deps() -> TestResult {
+        let (harness, workspace) = mini_workspace("graph-external")?;
+        let graph = WorkspaceGraph::load(&workspace).map_err(ctx("Workspace laden"))?;
 
-        let value = graph_as_json(&graph).expect("JSON-Projektion");
-        let crates = value["crates"].as_array().expect("crates ist ein Array");
+        let value = graph_as_json(&graph).map_err(ctx("JSON-Projektion"))?;
+        let crates = value["crates"]
+            .as_array()
+            .ok_or(TestError::Missing("crates ist ein Array"))?;
 
         assert_eq!(
             crates[0]["external_deps"][0], "serde",
@@ -283,69 +292,89 @@ mod tests {
         );
 
         fs::remove_dir_all(&harness).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_deps_graph_tool_returns_json_by_default() {
-        let (harness, _) = mini_workspace("graph-tool-json");
-        let context = sandbox_context(&harness, vec![Permission::ReadWorkspace]);
+    fn test_deps_graph_tool_returns_json_by_default() -> TestResult {
+        let (harness, _) = mini_workspace("graph-tool-json")?;
+        let context = sandbox_context(&harness, vec![Permission::ReadWorkspace])?;
         let call = tool_call("deps.graph", serde_json::json!({}));
 
-        let output = block_on(DepsGraphTool.execute(&context, &call)).expect("Tool läuft");
+        let output =
+            block_on(DepsGraphTool.execute(&context, &call))?.map_err(ctx("Tool läuft"))?;
 
         match output {
             ToolOutput::Json { content } => {
                 assert!(content["levels"].is_array());
                 assert!(content["crates"].is_array());
             }
-            other => panic!("JSON-Ausgabe erwartet, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "JSON-Ausgabe erwartet, war: {other:?}"
+                )));
+            }
         }
 
         fs::remove_dir_all(&harness).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_deps_graph_tool_returns_text_projection() {
-        let (harness, _) = mini_workspace("graph-tool-text");
-        let context = sandbox_context(&harness, vec![Permission::ReadWorkspace]);
+    fn test_deps_graph_tool_returns_text_projection() -> TestResult {
+        let (harness, _) = mini_workspace("graph-tool-text")?;
+        let context = sandbox_context(&harness, vec![Permission::ReadWorkspace])?;
         let call = tool_call("deps.graph", serde_json::json!({ "format": "text" }));
 
-        let output = block_on(DepsGraphTool.execute(&context, &call)).expect("Tool läuft");
+        let output =
+            block_on(DepsGraphTool.execute(&context, &call))?.map_err(ctx("Tool läuft"))?;
 
         match output {
             ToolOutput::Text { content } => {
                 assert!(content.starts_with("Ebene 0: a"), "war: {content}");
                 assert!(content.contains("Ebene 2: c"), "war: {content}");
             }
-            other => panic!("Text-Ausgabe erwartet, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Text-Ausgabe erwartet, war: {other:?}"
+                )));
+            }
         }
 
         fs::remove_dir_all(&harness).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_deps_graph_tool_rejects_unknown_format() {
-        let (harness, _) = mini_workspace("graph-tool-format");
-        let context = sandbox_context(&harness, vec![Permission::ReadWorkspace]);
+    fn test_deps_graph_tool_rejects_unknown_format() -> TestResult {
+        let (harness, _) = mini_workspace("graph-tool-format")?;
+        let context = sandbox_context(&harness, vec![Permission::ReadWorkspace])?;
         let call = tool_call("deps.graph", serde_json::json!({ "format": "yaml" }));
 
-        let output = block_on(DepsGraphTool.execute(&context, &call)).expect("Tool läuft");
+        let output =
+            block_on(DepsGraphTool.execute(&context, &call))?.map_err(ctx("Tool läuft"))?;
 
         match output {
             ToolOutput::Error { message } => assert!(message.contains("yaml"), "war: {message}"),
-            other => panic!("Fehlerausgabe erwartet, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Fehlerausgabe erwartet, war: {other:?}"
+                )));
+            }
         }
 
         fs::remove_dir_all(&harness).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_deps_graph_tool_rejects_root_outside_workspace() {
-        let (harness, _) = mini_workspace("graph-tool-escape");
-        let context = sandbox_context(&harness, vec![Permission::ReadWorkspace]);
+    fn test_deps_graph_tool_rejects_root_outside_workspace() -> TestResult {
+        let (harness, _) = mini_workspace("graph-tool-escape")?;
+        let context = sandbox_context(&harness, vec![Permission::ReadWorkspace])?;
         let call = tool_call("deps.graph", serde_json::json!({ "root": "../.." }));
 
-        let output = block_on(DepsGraphTool.execute(&context, &call)).expect("Tool läuft");
+        let output =
+            block_on(DepsGraphTool.execute(&context, &call))?.map_err(ctx("Tool läuft"))?;
 
         assert!(
             matches!(output, ToolOutput::Error { .. }),
@@ -353,25 +382,32 @@ mod tests {
         );
 
         fs::remove_dir_all(&harness).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_deps_graph_tool_denies_without_read_workspace() {
-        let (harness, _) = mini_workspace("graph-tool-denied");
-        let context = sandbox_context(&harness, Vec::new());
+    fn test_deps_graph_tool_denies_without_read_workspace() -> TestResult {
+        let (harness, _) = mini_workspace("graph-tool-denied")?;
+        let context = sandbox_context(&harness, Vec::new())?;
         let call = tool_call("deps.graph", serde_json::json!({}));
 
-        let output = block_on(DepsGraphTool.execute(&context, &call)).expect("Tool läuft");
+        let output =
+            block_on(DepsGraphTool.execute(&context, &call))?.map_err(ctx("Tool läuft"))?;
 
         match output {
             ToolOutput::Error { message } => assert!(
                 message.contains("ReadWorkspace"),
                 "fehlende Permission muss benannt werden, war: {message}"
             ),
-            other => panic!("Fehlerausgabe erwartet, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Fehlerausgabe erwartet, war: {other:?}"
+                )));
+            }
         }
 
         fs::remove_dir_all(&harness).ok();
+        Ok(())
     }
 
     #[test]

@@ -125,7 +125,8 @@ impl WardenRequest {
         if self.version != WARDEN_PROTOCOL_VERSION {
             return Err(ProofError::UnsupportedVersion(self.version));
         }
-        self.authorization.verify(ring, &self.action, now, policy, ledger)
+        self.authorization
+            .verify(ring, &self.action, now, policy, ledger)
     }
 }
 
@@ -280,103 +281,114 @@ pub enum WardenResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{WardenActionAudit, WardenActionRequest, WardenReply, WardenRequest, WardenResponse};
-    use crate::error::ProofError;
-    use crate::signed::{KeyId, KeyRing, MemoryNonceLedger, ProofKey, ProofPolicy, SignedAuthorization};
+    use super::{
+        WardenActionAudit, WardenActionRequest, WardenReply, WardenRequest, WardenResponse,
+    };
     use crate::action::{ProposedAction, WardenAction};
     use crate::denial::Denial;
+    use crate::error::ProofError;
     use crate::proof::AuthorizationProof;
+    use crate::signed::{
+        KeyId, KeyRing, MemoryNonceLedger, ProofKey, ProofPolicy, SignedAuthorization,
+    };
     use crate::stage::EscalationStage;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_types::{ApprovalActor, CgroupId, FindingId};
 
-    fn cgroup(id: &str) -> CgroupId {
-        CgroupId::try_from_str(id).expect("non-empty id")
+    fn cgroup(id: &str) -> TestResult<CgroupId> {
+        CgroupId::try_from_str(id).map_err(ctx("non-empty id"))
     }
 
-    fn sample_proof(action: &WardenAction) -> AuthorizationProof {
-        AuthorizationProof::new(
-            FindingId::try_from_str("finding-1").unwrap(),
+    fn sample_proof(action: &WardenAction) -> TestResult<AuthorizationProof> {
+        Ok(AuthorizationProof::new(
+            FindingId::try_from_str("finding-1").map_err(ctx("finding-1 id"))?,
             EscalationStage::RuleTriggered,
             ApprovalActor::Operator {
                 id: "operator-1".to_string(),
             },
             jiff::Timestamp::UNIX_EPOCH,
-            action.content_digest().unwrap(),
-        )
+            action.content_digest().map_err(ctx("content digest"))?,
+        ))
     }
 
     // -- WardenActionRequest --------------------------------------------------
 
     #[test]
-    fn test_request_new_converts_proposed_action_and_keeps_proof() {
+    fn test_request_new_converts_proposed_action_and_keeps_proof() -> TestResult {
         let proposed = ProposedAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
         let action: WardenAction = proposed.clone().into();
-        let proof = sample_proof(&action);
+        let proof = sample_proof(&action)?;
 
         let request = WardenActionRequest::new(proposed, proof.clone());
         assert_eq!(request.action, action);
         assert_eq!(request.proof, proof);
+        Ok(())
     }
 
     #[test]
-    fn test_request_serde_roundtrip() {
+    fn test_request_serde_roundtrip() -> TestResult {
         let proposed = ProposedAction::IsolateNetwork {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
         let action: WardenAction = proposed.clone().into();
-        let proof = sample_proof(&action);
+        let proof = sample_proof(&action)?;
         let request = WardenActionRequest::new(proposed, proof);
 
-        let json = serde_json::to_string(&request).expect("serializes");
+        let json = serde_json::to_string(&request).map_err(ctx("serializes"))?;
         let round_tripped: WardenActionRequest =
-            serde_json::from_str(&json).expect("deserializes");
+            serde_json::from_str(&json).map_err(ctx("deserializes"))?;
         assert_eq!(round_tripped.action, request.action);
         assert_eq!(round_tripped.proof, request.proof);
+        Ok(())
     }
 
     #[test]
-    fn test_request_rejects_unknown_field() {
+    fn test_request_rejects_unknown_field() -> TestResult {
         let proposed = ProposedAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
         let action: WardenAction = proposed.clone().into();
-        let proof = sample_proof(&action);
+        let proof = sample_proof(&action)?;
         let request = WardenActionRequest::new(proposed, proof);
 
-        let mut value = serde_json::to_value(&request).unwrap();
+        let mut value = serde_json::to_value(&request).map_err(ctx("to_value"))?;
         value
             .as_object_mut()
-            .unwrap()
+            .ok_or(TestError::Missing("json object"))?
             .insert("extra".to_string(), serde_json::Value::Bool(true));
         let result: Result<WardenActionRequest, _> = serde_json::from_value(value);
         assert!(result.is_err());
+        Ok(())
     }
 
     // -- WardenActionAudit ------------------------------------------------------
 
     #[test]
-    fn test_audit_records_declared_name_per_action() {
+    fn test_audit_records_declared_name_per_action() -> TestResult {
         let freeze = WardenActionAudit::for_action(WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         });
         assert_eq!(freeze.audit_name, "warden.freeze_cgroup");
 
         let kill = WardenActionAudit::for_action(WardenAction::KillProcessTree {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         });
         assert_eq!(kill.audit_name, "warden.kill_process_tree");
+        Ok(())
     }
 
     #[test]
-    fn test_audit_serde_roundtrip() {
+    fn test_audit_serde_roundtrip() -> TestResult {
         let audit = WardenActionAudit::for_action(WardenAction::ReleaseCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         });
-        let json = serde_json::to_string(&audit).expect("serializes");
-        let round_tripped: WardenActionAudit = serde_json::from_str(&json).expect("deserializes");
+        let json = serde_json::to_string(&audit).map_err(ctx("serializes"))?;
+        let round_tripped: WardenActionAudit =
+            serde_json::from_str(&json).map_err(ctx("deserializes"))?;
         assert_eq!(round_tripped, audit);
+        Ok(())
     }
 
     #[test]
@@ -389,129 +401,148 @@ mod tests {
     // -- WardenResponse -----------------------------------------------------------
 
     #[test]
-    fn test_response_executed_serde_roundtrip() {
+    fn test_response_executed_serde_roundtrip() -> TestResult {
         let audit = WardenActionAudit::for_action(WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         });
         let response = WardenResponse::Executed { audit };
-        let json = serde_json::to_string(&response).expect("serializes");
+        let json = serde_json::to_string(&response).map_err(ctx("serializes"))?;
         assert!(json.contains("\"outcome\":\"executed\""));
-        let round_tripped: WardenResponse = serde_json::from_str(&json).expect("deserializes");
+        let round_tripped: WardenResponse =
+            serde_json::from_str(&json).map_err(ctx("deserializes"))?;
         match round_tripped {
             WardenResponse::Executed { audit } => {
                 assert_eq!(audit.audit_name, "warden.freeze_cgroup");
             }
-            WardenResponse::Denied { .. } => panic!("expected Executed"),
+            WardenResponse::Denied { .. } => {
+                return Err(TestError::Unexpected("expected Executed".into()));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_response_denied_serde_roundtrip() {
+    fn test_response_denied_serde_roundtrip() -> TestResult {
         let response = WardenResponse::Denied {
             reason: Denial::NotAdmissibleAtStage,
         };
-        let json = serde_json::to_string(&response).expect("serializes");
+        let json = serde_json::to_string(&response).map_err(ctx("serializes"))?;
         assert!(json.contains("\"outcome\":\"denied\""));
         assert!(json.contains("\"not-admissible-at-stage\""));
-        let round_tripped: WardenResponse = serde_json::from_str(&json).expect("deserializes");
+        let round_tripped: WardenResponse =
+            serde_json::from_str(&json).map_err(ctx("deserializes"))?;
         match round_tripped {
             WardenResponse::Denied { reason } => assert_eq!(reason, Denial::NotAdmissibleAtStage),
-            WardenResponse::Executed { .. } => panic!("expected Denied"),
+            WardenResponse::Executed { .. } => {
+                return Err(TestError::Unexpected("expected Denied".into()));
+            }
         }
+        Ok(())
     }
 
     // -- v2: WardenRequest / WardenReply ---------------------------------------
 
-    fn v2_request() -> WardenRequest {
+    fn v2_request() -> TestResult<WardenRequest> {
         let action = WardenAction::FreezeCgroup {
-            cgroup: cgroup("harw.slice/job-1"),
+            cgroup: cgroup("harw.slice/job-1")?,
         };
         let auth = SignedAuthorization::sign(
             &ProofKey::from_bytes([3; 32]),
-            &KeyId::new("k1").unwrap(),
+            &KeyId::new("k1").map_err(ctx("key id k1"))?,
             &action,
             EscalationStage::RuleTriggered,
             action.cgroup(),
             [9; 16],
-            jiff::Timestamp::from_second(1_800_000_000).unwrap(),
+            jiff::Timestamp::from_second(1_800_000_000).map_err(ctx("timestamp"))?,
             60,
         );
-        WardenRequest::new(action, auth)
+        Ok(WardenRequest::new(action, auth))
     }
 
-    fn v2_ring() -> KeyRing {
+    fn v2_ring() -> TestResult<KeyRing> {
         let mut ring = KeyRing::new();
-        ring.insert(KeyId::new("k1").unwrap(), ProofKey::from_bytes([3; 32]))
-            .unwrap();
-        ring
+        ring.insert(
+            KeyId::new("k1").map_err(ctx("key id k1"))?,
+            ProofKey::from_bytes([3; 32]),
+        )
+        .map_err(ctx("insert key"))?;
+        Ok(ring)
     }
 
-    fn v2_policy() -> ProofPolicy {
-        ProofPolicy::new(60, 5, vec!["harw.slice".to_owned()]).unwrap()
+    fn v2_policy() -> TestResult<ProofPolicy> {
+        ProofPolicy::new(60, 5, vec!["harw.slice".to_owned()]).map_err(ctx("proof policy"))
     }
 
     #[test]
-    fn test_warden_request_serde_roundtrip_and_verify() {
-        let request = v2_request();
-        let json = serde_json::to_vec(&request).expect("serializes");
-        let back: WardenRequest = serde_json::from_slice(&json).expect("deserializes");
+    fn test_warden_request_serde_roundtrip_and_verify() -> TestResult {
+        let request = v2_request()?;
+        let json = serde_json::to_vec(&request).map_err(ctx("serializes"))?;
+        let back: WardenRequest = serde_json::from_slice(&json).map_err(ctx("deserializes"))?;
         assert_eq!(back, request);
         let verified = back
             .verify(
-                &v2_ring(),
-                jiff::Timestamp::from_second(1_800_000_010).unwrap(),
-                &v2_policy(),
+                &v2_ring()?,
+                jiff::Timestamp::from_second(1_800_000_010).map_err(ctx("timestamp"))?,
+                &v2_policy()?,
                 &MemoryNonceLedger::new(),
             )
-            .expect("verifies");
+            .map_err(ctx("verifies"))?;
         assert_eq!(verified.stage(), EscalationStage::RuleTriggered);
+        Ok(())
     }
 
     #[test]
-    fn test_warden_request_verify_rejects_envelope_version() {
-        let mut request = v2_request();
+    fn test_warden_request_verify_rejects_envelope_version() -> TestResult {
+        let mut request = v2_request()?;
         request.version = 1;
-        let err = request
-            .verify(
-                &v2_ring(),
-                jiff::Timestamp::from_second(1_800_000_010).unwrap(),
-                &v2_policy(),
-                &MemoryNonceLedger::new(),
-            )
-            .unwrap_err();
+        let result = request.verify(
+            &v2_ring()?,
+            jiff::Timestamp::from_second(1_800_000_010).map_err(ctx("timestamp"))?,
+            &v2_policy()?,
+            &MemoryNonceLedger::new(),
+        );
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "verify erfolgreich, Fehler erwartet".into(),
+            ));
+        };
         assert!(matches!(err, ProofError::UnsupportedVersion(1)));
+        Ok(())
     }
 
     #[test]
-    fn test_warden_request_peek_version_tolerates_unknown_fields() {
+    fn test_warden_request_peek_version_tolerates_unknown_fields() -> TestResult {
         assert_eq!(
-            WardenRequest::peek_version(br#"{"version":3,"future":true}"#).unwrap(),
+            WardenRequest::peek_version(br#"{"version":3,"future":true}"#)
+                .map_err(ctx("peek_version"))?,
             3
         );
         // v1-Hülle ohne `version`-Feld ist nicht lesbar.
         assert!(WardenRequest::peek_version(br#"{"finding":"f","request":{}}"#).is_err());
         assert!(WardenRequest::peek_version(b"not json").is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_warden_request_rejects_unknown_field() {
-        let request = v2_request();
-        let mut value = serde_json::to_value(&request).unwrap();
+    fn test_warden_request_rejects_unknown_field() -> TestResult {
+        let request = v2_request()?;
+        let mut value = serde_json::to_value(&request).map_err(ctx("to_value"))?;
         value
             .as_object_mut()
-            .unwrap()
+            .ok_or(TestError::Missing("json object"))?
             .insert("finding".to_owned(), serde_json::Value::from("f-1"));
         assert!(serde_json::from_value::<WardenRequest>(value).is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_warden_reply_new_sets_version_and_roundtrips() {
+    fn test_warden_reply_new_sets_version_and_roundtrips() -> TestResult {
         let reply = WardenReply::new(WardenResponse::Denied {
             reason: Denial::UnsupportedVersion,
         });
         assert_eq!(reply.version, 2);
-        let json = serde_json::to_string(&reply).unwrap();
-        let back: WardenReply = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&reply).map_err(ctx("serializes"))?;
+        let back: WardenReply = serde_json::from_str(&json).map_err(ctx("deserializes"))?;
         assert_eq!(back.version, 2);
         assert!(matches!(
             back.outcome,
@@ -519,6 +550,7 @@ mod tests {
                 reason: Denial::UnsupportedVersion
             }
         ));
+        Ok(())
     }
 
     #[test]

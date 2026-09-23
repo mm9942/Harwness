@@ -6,8 +6,11 @@
 
 use std::net::IpAddr;
 
-use harw_dod_netpolicy::plan_for_scope;
 use harw_authority::NetworkScope;
+use harw_dod_netpolicy::plan_for_scope;
+
+mod common;
+use common::{TestResult, ctx};
 
 // Baut einen `NetworkScope` über dessen öffentlichen `serde`-Wire-Vertrag
 // (siehe `harw_authority::EgressTarget`s `Serialize`/`Deserialize`-Kommentar
@@ -16,9 +19,9 @@ use harw_authority::NetworkScope;
 // einzige Weg, aus einer anderen Crate einen Bereich mit `Host`- oder
 // `Cidr`-Einträgen zu bauen, weil `NetworkScope` dafür keine öffentliche
 // Konstruktormethode anbietet.
-fn scope_of(entries: &[&str]) -> NetworkScope {
+fn scope_of(entries: &[&str]) -> TestResult<NetworkScope> {
     serde_json::from_value(serde_json::json!({ "allow_hosts": entries }))
-        .expect("valid scope wire fixture")
+        .map_err(ctx("valid scope wire fixture"))
 }
 
 // Repräsentative Sonden je Bereich: Namen, von denen einige vom jeweiligen
@@ -40,7 +43,7 @@ const PROBE_HOSTS: &[&str] = &[
     "",
 ];
 
-fn probe_addrs() -> Vec<IpAddr> {
+fn probe_addrs() -> TestResult<Vec<IpAddr>> {
     [
         "10.1.2.3",
         "10.255.255.255",
@@ -53,26 +56,30 @@ fn probe_addrs() -> Vec<IpAddr> {
         "::1",
     ]
     .into_iter()
-    .map(|literal| literal.parse().expect("valid IP literal in test fixture"))
-    .collect()
+    .map(|literal| {
+        literal
+            .parse::<IpAddr>()
+            .map_err(ctx("valid IP literal in test fixture"))
+    })
+    .collect::<TestResult<Vec<IpAddr>>>()
 }
 
 // Die fünf konstruierten Bereiche, gegen die beide Eigenschaftstests unten
 // laufen: leer, reine `DnsSuffix`-Liste, ein einzelnes `Host`-Ziel, reine
 // `Cidr`-Bereiche, und eine Mischung aus allen drei Zielarten.
-fn constructed_scopes() -> Vec<NetworkScope> {
-    vec![
+fn constructed_scopes() -> TestResult<Vec<NetworkScope>> {
+    Ok(vec![
         NetworkScope::empty(),
         NetworkScope::from_hosts(["docs.rs".to_owned(), "crates.io".to_owned()]),
-        scope_of(&["=api.example.com"]),
-        scope_of(&["10.0.0.0/8", "192.168.1.0/24"]),
-        scope_of(&["example.com", "=other.example.com", "2001:db8::/32"]),
-    ]
+        scope_of(&["=api.example.com"])?,
+        scope_of(&["10.0.0.0/8", "192.168.1.0/24"])?,
+        scope_of(&["example.com", "=other.example.com", "2001:db8::/32"])?,
+    ])
 }
 
 #[test]
-fn test_property_plan_never_allows_more_than_scope() {
-    for (index, scope) in constructed_scopes().iter().enumerate() {
+fn test_property_plan_never_allows_more_than_scope() -> TestResult {
+    for (index, scope) in constructed_scopes()?.iter().enumerate() {
         let plan = plan_for_scope(scope);
 
         for host in PROBE_HOSTS {
@@ -84,7 +91,7 @@ fn test_property_plan_never_allows_more_than_scope() {
             }
         }
 
-        for addr in probe_addrs() {
+        for addr in probe_addrs()? {
             if plan.allows_addr(addr) {
                 assert!(
                     scope.allows_addr(addr),
@@ -93,10 +100,11 @@ fn test_property_plan_never_allows_more_than_scope() {
             }
         }
     }
+    Ok(())
 }
 
 #[test]
-fn test_property_plan_and_scope_agree_exactly_on_probes() {
+fn test_property_plan_and_scope_agree_exactly_on_probes() -> TestResult {
     // Stärkere Prüfung als die reine Teilmengen-Eigenschaft oben: für jede
     // Sonde stimmen Plan und Bereich exakt überein, nicht nur einseitig.
     // Das gilt, weil `plan_for_scope` jede Zielart verlustfrei kopiert
@@ -104,13 +112,18 @@ fn test_property_plan_and_scope_agree_exactly_on_probes() {
     // dieselbe Vergleichsregel wie `NetworkScope` implementieren (siehe die
     // Moduldoc von `harw_dod_netpolicy`, Abschnitt „Ein zweites,
     // unabhängiges Kopplungsrisiko").
-    for scope in &constructed_scopes() {
+    for scope in &constructed_scopes()? {
         let plan = plan_for_scope(scope);
         for host in PROBE_HOSTS {
             assert_eq!(plan.allows_host(host), scope.allows(host), "host {host:?}");
         }
-        for addr in probe_addrs() {
-            assert_eq!(plan.allows_addr(addr), scope.allows_addr(addr), "addr {addr}");
+        for addr in probe_addrs()? {
+            assert_eq!(
+                plan.allows_addr(addr),
+                scope.allows_addr(addr),
+                "addr {addr}"
+            );
         }
     }
+    Ok(())
 }

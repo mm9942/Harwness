@@ -127,9 +127,14 @@ impl LogLevel {
     name = "harw-sentinel",
     bin_name = "harw-sentinel",
     version,
-    about = "Unprivilegierte Sammelstelle: ruft Sensoren, führt den Degradationsautomaten, puffert."
+    about = "Unprivilegierte Sammelstelle: ruft Sensoren, führt den Degradationsautomaten, puffert.",
+    subcommand_negates_reqs = true
 )]
 pub struct Cli {
+    /// Optionales Unterkommando; ohne es läuft das Binary normal.
+    #[command(subcommand)]
+    pub command: Option<harw_completions::CompletionsSubcommand>,
+
     /// Log-Stufe für `tracing`. Siehe [`LogLevel`] für die Begründung, warum
     /// ein ungültiger Wert hier ein Fehler ist statt einer stillen
     /// Voreinstellung.
@@ -195,6 +200,7 @@ mod tests {
     use clap::Parser as _;
 
     use super::{Cli, LogLevel};
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
     fn test_log_level_as_filter_directive_matches_every_variant() {
@@ -206,20 +212,23 @@ mod tests {
     }
 
     #[test]
-    fn test_log_defaults_to_info_when_omitted() {
-        let cli = Cli::try_parse_from(["harw-sentinel"]).expect("no required args");
+    fn test_log_defaults_to_info_when_omitted() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no required args"))?;
         assert_eq!(cli.log, LogLevel::Info);
         assert!(!cli.once);
         assert_eq!(cli.interval_secs, super::DEFAULT_INTERVAL_SECS);
+        Ok(())
     }
 
     #[test]
-    fn test_log_accepts_every_documented_value() {
+    fn test_log_accepts_every_documented_value() -> TestResult {
         for value in ["trace", "debug", "info", "warn", "error"] {
-            let cli = Cli::try_parse_from(["harw-sentinel", "--log", value])
-                .unwrap_or_else(|err| panic!("expected {value} to parse, got {err}"));
+            let cli = Cli::try_parse_from(["harw-sentinel", "--log", value]).map_err(|err| {
+                TestError::Unexpected(format!("expected {value} to parse, got {err}"))
+            })?;
             assert_eq!(cli.log.as_filter_directive(), value);
         }
+        Ok(())
     }
 
     #[test]
@@ -232,75 +241,100 @@ mod tests {
     }
 
     #[test]
-    fn test_workspace_root_defaults_to_current_directory_marker() {
-        let cli = Cli::try_parse_from(["harw-sentinel"]).expect("no required args");
+    fn test_workspace_root_defaults_to_current_directory_marker() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no required args"))?;
         assert_eq!(cli.workspace_root, std::path::PathBuf::from("."));
+        Ok(())
     }
 
     #[test]
-    fn test_socket_override_is_honoured() {
+    fn test_socket_override_is_honoured() -> TestResult {
         let cli = Cli::try_parse_from(["harw-sentinel", "--socket", "/tmp/custom.sock"])
-            .expect("valid override");
-        assert_eq!(cli.socket, Some(std::path::PathBuf::from("/tmp/custom.sock")));
+            .map_err(ctx("valid override"))?;
+        assert_eq!(
+            cli.socket,
+            Some(std::path::PathBuf::from("/tmp/custom.sock"))
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_proc_root_defaults_to_the_declared_constant() {
-        let cli = Cli::try_parse_from(["harw-sentinel"]).expect("no required args");
-        assert_eq!(cli.proc_root, std::path::PathBuf::from(super::DEFAULT_PROC_ROOT));
+    fn test_proc_root_defaults_to_the_declared_constant() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no required args"))?;
+        assert_eq!(
+            cli.proc_root,
+            std::path::PathBuf::from(super::DEFAULT_PROC_ROOT)
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_thermal_root_defaults_to_the_declared_constant() {
-        let cli = Cli::try_parse_from(["harw-sentinel"]).expect("no required args");
+    fn test_thermal_root_defaults_to_the_declared_constant() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no required args"))?;
         assert_eq!(
             cli.thermal_root,
             std::path::PathBuf::from(super::DEFAULT_THERMAL_ROOT)
         );
+        Ok(())
     }
 
     #[test]
-    fn test_blockio_root_defaults_to_the_declared_constant() {
-        let cli = Cli::try_parse_from(["harw-sentinel"]).expect("no required args");
+    fn test_blockio_root_defaults_to_the_declared_constant() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no required args"))?;
         assert_eq!(
             cli.blockio_root,
             std::path::PathBuf::from(super::DEFAULT_BLOCKIO_ROOT)
         );
+        Ok(())
     }
 
     #[test]
-    fn test_blockio_root_override_is_honoured() {
+    fn test_blockio_root_override_is_honoured() -> TestResult {
         let cli = Cli::try_parse_from(["harw-sentinel", "--blockio-root", "/tmp/fixture-block"])
-            .expect("valid override");
-        assert_eq!(cli.blockio_root, std::path::PathBuf::from("/tmp/fixture-block"));
+            .map_err(ctx("valid override"))?;
+        assert_eq!(
+            cli.blockio_root,
+            std::path::PathBuf::from("/tmp/fixture-block")
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_gpu_root_defaults_to_the_declared_constant() {
-        let cli = Cli::try_parse_from(["harw-sentinel"]).expect("no required args");
-        assert_eq!(cli.gpu_root, std::path::PathBuf::from(super::DEFAULT_GPU_ROOT));
+    fn test_gpu_root_defaults_to_the_declared_constant() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no required args"))?;
+        assert_eq!(
+            cli.gpu_root,
+            std::path::PathBuf::from(super::DEFAULT_GPU_ROOT)
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_gpu_root_override_is_honoured() {
+    fn test_gpu_root_override_is_honoured() -> TestResult {
         let cli = Cli::try_parse_from(["harw-sentinel", "--gpu-root", "/tmp/fixture-drm"])
-            .expect("valid override");
+            .map_err(ctx("valid override"))?;
         assert_eq!(cli.gpu_root, std::path::PathBuf::from("/tmp/fixture-drm"));
+        Ok(())
     }
 
     #[test]
-    fn test_cgroup_root_defaults_to_the_declared_constant() {
-        let cli = Cli::try_parse_from(["harw-sentinel"]).expect("no required args");
+    fn test_cgroup_root_defaults_to_the_declared_constant() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no required args"))?;
         assert_eq!(
             cli.cgroup_root,
             std::path::PathBuf::from(super::DEFAULT_CGROUP_ROOT)
         );
+        Ok(())
     }
 
     #[test]
-    fn test_cgroup_root_override_is_honoured() {
+    fn test_cgroup_root_override_is_honoured() -> TestResult {
         let cli = Cli::try_parse_from(["harw-sentinel", "--cgroup-root", "/tmp/fixture-cgroup"])
-            .expect("valid override");
-        assert_eq!(cli.cgroup_root, std::path::PathBuf::from("/tmp/fixture-cgroup"));
+            .map_err(ctx("valid override"))?;
+        assert_eq!(
+            cli.cgroup_root,
+            std::path::PathBuf::from("/tmp/fixture-cgroup")
+        );
+        Ok(())
     }
 }

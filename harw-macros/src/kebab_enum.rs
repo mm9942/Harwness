@@ -242,8 +242,8 @@ fn to_kebab_case(ident: &str) -> String {
             let prev_is_upper = i > 0 && chars[i - 1].is_uppercase();
             let next_is_lower = i + 1 < chars.len() && chars[i + 1].is_lowercase();
 
-            let starts_new_word = !current.is_empty()
-                && (prev_is_lower_or_digit || (prev_is_upper && next_is_lower));
+            let starts_new_word =
+                !current.is_empty() && (prev_is_lower_or_digit || (prev_is_upper && next_is_lower));
             if starts_new_word {
                 words.push(std::mem::take(&mut current));
             }
@@ -416,6 +416,7 @@ pub(crate) fn expand_kebab_enum(input: &DeriveInput) -> syn::Result<TokenStream>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
     fn kebab_case_converts_simple_pascal_case() {
@@ -443,37 +444,52 @@ mod tests {
     }
 
     #[test]
-    fn expand_rejects_non_enum() {
+    fn expand_rejects_non_enum() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             pub struct Foo(String);
         };
-        let err = expand_kebab_enum(&input).expect_err("non-enum input must be rejected");
+        let Err(err) = expand_kebab_enum(&input) else {
+            return Err(TestError::Unexpected(
+                "non-enum input must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("enums"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_enum_without_variants() {
+    fn expand_rejects_enum_without_variants() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             pub enum Foo {}
         };
-        let err = expand_kebab_enum(&input).expect_err("empty enums must be rejected");
+        let Err(err) = expand_kebab_enum(&input) else {
+            return Err(TestError::Unexpected(
+                "empty enums must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("mindestens eine Variante"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_non_unit_variant() {
+    fn expand_rejects_non_unit_variant() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             pub enum Foo {
                 A,
                 B(String),
             }
         };
-        let err = expand_kebab_enum(&input).expect_err("tuple variants must be rejected");
+        let Err(err) = expand_kebab_enum(&input) else {
+            return Err(TestError::Unexpected(
+                "tuple variants must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("ausschließlich Unit-Varianten"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_duplicate_normalized_names() {
+    fn expand_rejects_duplicate_normalized_names() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             pub enum Foo {
                 AddCriterion,
@@ -481,34 +497,49 @@ mod tests {
                 Other,
             }
         };
-        let err = expand_kebab_enum(&input).expect_err("colliding kebab names must be rejected");
+        let Err(err) = expand_kebab_enum(&input) else {
+            return Err(TestError::Unexpected(
+                "colliding kebab names must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("denselben kebab-Namen"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_unknown_enum_level_attribute() {
+    fn expand_rejects_unknown_enum_level_attribute() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[kebab_enum(bogus)]
             pub enum Foo { A }
         };
-        let err = expand_kebab_enum(&input).expect_err("unknown enum-level keys must be rejected");
+        let Err(err) = expand_kebab_enum(&input) else {
+            return Err(TestError::Unexpected(
+                "unknown enum-level keys must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("unbekanntes kebab_enum-Attribut"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_unknown_variant_level_attribute() {
+    fn expand_rejects_unknown_variant_level_attribute() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             pub enum Foo {
                 #[kebab_enum(bogus)]
                 A,
             }
         };
-        let err = expand_kebab_enum(&input).expect_err("unknown variant-level keys must be rejected");
+        let Err(err) = expand_kebab_enum(&input) else {
+            return Err(TestError::Unexpected(
+                "unknown variant-level keys must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("unbekanntes kebab_enum-Attribut"));
+        Ok(())
     }
 
     #[test]
-    fn expand_default_expansion_contains_expected_items() {
+    fn expand_default_expansion_contains_expected_items() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             pub enum AddCriterion {
                 AddCriterion,
@@ -516,7 +547,7 @@ mod tests {
             }
         };
         let tokens = expand_kebab_enum(&input)
-            .expect("valid enum must expand")
+            .map_err(ctx("valid enum must expand"))?
             .to_string();
 
         assert!(tokens.contains("ALL"));
@@ -528,10 +559,11 @@ mod tests {
         // Default error path and ctor.
         assert!(tokens.contains("crate :: error :: InvalidId"));
         assert!(tokens.contains(":: unknown_variant"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rename_overrides_canonical_name() {
+    fn expand_rename_overrides_canonical_name() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             pub enum Foo {
                 #[kebab_enum(rename = "super-admin")]
@@ -539,33 +571,40 @@ mod tests {
             }
         };
         let tokens = expand_kebab_enum(&input)
-            .expect("renamed variant must expand")
+            .map_err(ctx("renamed variant must expand"))?
             .to_string();
         assert!(tokens.contains("\"super-admin\""));
         assert!(!tokens.contains("\"maintainer\""));
+        Ok(())
     }
 
     #[test]
-    fn expand_custom_error_and_ctor_attributes_are_used() {
+    fn expand_custom_error_and_ctor_attributes_are_used() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[kebab_enum(error = "my_crate::error::MyError", ctor = "custom_unknown")]
             pub enum Foo { A }
         };
         let tokens = expand_kebab_enum(&input)
-            .expect("custom error/ctor must expand")
+            .map_err(ctx("custom error/ctor must expand"))?
             .to_string();
         assert!(tokens.contains("my_crate :: error :: MyError"));
         assert!(tokens.contains(":: custom_unknown"));
         assert!(!tokens.contains("crate :: error :: InvalidId"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_invalid_error_path() {
+    fn expand_rejects_invalid_error_path() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[kebab_enum(error = "not a path!!")]
             pub enum Foo { A }
         };
-        let err = expand_kebab_enum(&input).expect_err("invalid error path must be rejected");
+        let Err(err) = expand_kebab_enum(&input) else {
+            return Err(TestError::Unexpected(
+                "invalid error path must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("gültiger Pfad"));
+        Ok(())
     }
 }

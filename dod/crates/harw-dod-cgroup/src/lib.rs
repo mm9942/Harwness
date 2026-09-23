@@ -231,3 +231,7 @@
 pub mod sensor;
 
 pub use sensor::CgroupSensor;
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

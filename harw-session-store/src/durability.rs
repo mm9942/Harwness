@@ -97,21 +97,24 @@ pub(crate) fn sync_parent_directory(parent: &Path) -> SessionStoreResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestResult;
 
     #[test]
-    fn sync_parent_directory_reports_a_missing_directory_without_panicking() {
-        let temp = tempfile::tempdir().expect("temp dir");
+    fn sync_parent_directory_reports_a_missing_directory_without_panicking() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let missing = temp.path().join("does-not-exist");
 
         assert!(matches!(
             sync_parent_directory(&missing),
             Err(SessionStoreError::Io(_))
         ));
+        Ok(())
     }
 
     #[test]
-    fn sync_parent_directory_succeeds_on_an_existing_directory() {
-        let temp = tempfile::tempdir().expect("temp dir");
+    fn sync_parent_directory_succeeds_on_an_existing_directory() -> TestResult {
+        let temp = tempfile::tempdir()?;
         assert!(sync_parent_directory(temp.path()).is_ok());
+        Ok(())
     }
 }

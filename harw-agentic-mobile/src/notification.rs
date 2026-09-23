@@ -58,14 +58,15 @@ fn human_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::{TestResult, ctx};
     use crate::{CandidateKind, CleanupCandidate, CleanupProposal};
 
     use super::*;
 
     #[test]
-    fn notification_is_an_approval_prompt_not_a_delete_prompt() {
+    fn notification_is_an_approval_prompt_not_a_delete_prompt() -> TestResult {
         let proposal = CleanupProposal::new(
-            ProposalId::parse("p1").unwrap(),
+            ProposalId::parse("p1").map_err(ctx("Proposal-Id parsen"))?,
             CleanupCandidate {
                 document_ref: "content://test/1".into(),
                 display_name: "backup.zip".into(),
@@ -74,7 +75,7 @@ mod tests {
                 explanation: "Seit einem Jahr nicht verwendet.".into(),
             },
         )
-        .unwrap();
+        .map_err(ctx("Cleanup-Proposal erstellen"))?;
         let notification = ApprovalNotification::from(&proposal);
 
         assert_eq!(notification.title, "Aufräumvorschlag");
@@ -87,5 +88,6 @@ mod tests {
             ]
         );
         assert!(notification.body.contains("2.0 MB"));
+        Ok(())
     }
 }

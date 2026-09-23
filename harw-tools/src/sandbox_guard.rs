@@ -156,7 +156,11 @@ pub fn require_host_access(
     host: &str,
     tool_name: &str,
 ) -> Option<ToolOutput> {
-    if !ctx.sandbox().permissions().contains(Permission::NetworkAccess) {
+    if !ctx
+        .sandbox()
+        .permissions()
+        .contains(Permission::NetworkAccess)
+    {
         return Some(ToolOutput::error(format!(
             "Tool '{tool_name}' benötigt Permission NetworkAccess"
         )));
@@ -215,6 +219,7 @@ pub fn host_from_url(url: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::executor::ToolExecutionContext;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_authority::{
         NetworkScope, Permission, PermissionSet, SandboxSpec, WorkspaceRegistration,
         WorkspaceRegistry,
@@ -225,12 +230,15 @@ mod tests {
     /// Creates a temporary directory under `std::env::temp_dir()` scoped to this test run,
     /// builds a [`SandboxSpec`] with the given permissions, and returns both so the caller
     /// can keep the directory alive for the duration of the test.
-    fn make_sandbox(test_id: &str, permissions: Vec<Permission>) -> (PathBuf, SandboxSpec) {
+    fn make_sandbox(
+        test_id: &str,
+        permissions: Vec<Permission>,
+    ) -> TestResult<(PathBuf, SandboxSpec)> {
         let base = std::env::temp_dir()
             .join("harw_sandbox_guard_tests")
             .join(test_id);
         let ws = base.join("ws");
-        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&ws).map_err(ctx("Sandbox-Verzeichnis anlegen"))?;
         let registry = WorkspaceRegistry::build(
             &base,
             [WorkspaceRegistration {
@@ -239,12 +247,12 @@ mod tests {
                 root: PathBuf::from("ws"),
             }],
         )
-        .unwrap();
+        .map_err(ctx("WorkspaceRegistry bauen"))?;
         let binding = registry
             .resolve(&TenantId::from_str("t"), &WorkspaceId::from_str("w"))
-            .unwrap();
+            .map_err(ctx("Workspace auflösen"))?;
         let spec = SandboxSpec::from_resolved(binding, PermissionSet::from_policy(permissions));
-        (base, spec)
+        Ok((base, spec))
     }
 
     /// Wie [`make_sandbox`], setzt zusätzlich einen echten, eingeschränkten
@@ -257,12 +265,12 @@ mod tests {
         test_id: &str,
         permissions: Vec<Permission>,
         allowed_hosts: Vec<&str>,
-    ) -> (PathBuf, SandboxSpec) {
+    ) -> TestResult<(PathBuf, SandboxSpec)> {
         let base = std::env::temp_dir()
             .join("harw_sandbox_guard_tests")
             .join(test_id);
         let ws = base.join("ws");
-        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&ws).map_err(ctx("Sandbox-Verzeichnis anlegen"))?;
         let registry = WorkspaceRegistry::build(
             &base,
             [WorkspaceRegistration {
@@ -271,16 +279,16 @@ mod tests {
                 root: PathBuf::from("ws"),
             }],
         )
-        .unwrap();
+        .map_err(ctx("WorkspaceRegistry bauen"))?;
         let binding = registry
             .resolve(&TenantId::from_str("t"), &WorkspaceId::from_str("w"))
-            .unwrap();
+            .map_err(ctx("Workspace auflösen"))?;
         let spec = SandboxSpec::from_resolved_for_test(
             binding,
             PermissionSet::from_policy(permissions),
             NetworkScope::from_hosts(allowed_hosts.into_iter().map(str::to_owned)),
         );
-        (base, spec)
+        Ok((base, spec))
     }
 
     fn make_ctx(spec: SandboxSpec) -> ToolExecutionContext {
@@ -289,8 +297,8 @@ mod tests {
 
     /// Granted permission → `None` so callers may proceed.
     #[test]
-    fn test_require_permission_returns_none_when_granted() {
-        let (_base, spec) = make_sandbox("none_when_granted", vec![Permission::ReadWorkspace]);
+    fn test_require_permission_returns_none_when_granted() -> TestResult {
+        let (_base, spec) = make_sandbox("none_when_granted", vec![Permission::ReadWorkspace])?;
         let ctx = make_ctx(spec);
 
         let result = require_permission(&ctx, Permission::ReadWorkspace, "fs.read");
@@ -298,12 +306,13 @@ mod tests {
             result.is_none(),
             "should return None when permission is present"
         );
+        Ok(())
     }
 
     /// Missing permission → `Some(ToolOutput::Error)`.
     #[test]
-    fn test_require_permission_returns_error_when_missing() {
-        let (_base, spec) = make_sandbox("error_when_missing", vec![]); // no permissions at all
+    fn test_require_permission_returns_error_when_missing() -> TestResult {
+        let (_base, spec) = make_sandbox("error_when_missing", vec![])?; // no permissions at all
         let ctx = make_ctx(spec);
 
         let result = require_permission(&ctx, Permission::ReadWorkspace, "fs.read");
@@ -311,20 +320,26 @@ mod tests {
             result.is_some(),
             "should return Some when permission is absent"
         );
-        match result.unwrap() {
+        match result.ok_or(TestError::Missing("require_permission Ergebnis"))? {
             ToolOutput::Error { .. } => {}
-            other => panic!("expected ToolOutput::Error, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected ToolOutput::Error, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// Error message must contain both the tool name and the permission variant name.
     #[test]
-    fn test_error_message_includes_tool_name_and_permission_variant() {
-        let (_base, spec) = make_sandbox("msg_tool_and_variant", vec![]);
+    fn test_error_message_includes_tool_name_and_permission_variant() -> TestResult {
+        let (_base, spec) = make_sandbox("msg_tool_and_variant", vec![])?;
         let ctx = make_ctx(spec);
 
-        let output = require_permission(&ctx, Permission::ExecuteProcess, "shell.exec")
-            .expect("should produce Some when permission missing");
+        let output = require_permission(&ctx, Permission::ExecuteProcess, "shell.exec").ok_or(
+            TestError::Missing("should produce Some when permission missing"),
+        )?;
 
         match output {
             ToolOutput::Error { message } => {
@@ -337,18 +352,23 @@ mod tests {
                     "message must contain permission variant name, got: {message:?}"
                 );
             }
-            other => panic!("expected ToolOutput::Error, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected ToolOutput::Error, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// `NetworkAccess` gewährt und Host im Scope erlaubt → `None`.
     #[test]
-    fn test_require_host_access_returns_none_when_granted_and_host_allowed() {
+    fn test_require_host_access_returns_none_when_granted_and_host_allowed() -> TestResult {
         let (_base, spec) = make_sandbox_with_hosts(
             "host_none_when_allowed",
             vec![Permission::NetworkAccess],
             vec!["docs.rs"],
-        );
+        )?;
         let ctx = make_ctx(spec);
 
         let result = require_host_access(&ctx, "docs.rs", "http.fetch");
@@ -356,20 +376,22 @@ mod tests {
             result.is_none(),
             "should return None when NetworkAccess is granted and host is allowed"
         );
+        Ok(())
     }
 
     /// Fehlende `NetworkAccess`-Permission → `Some(error)`, Meldung nennt `NetworkAccess`.
     #[test]
-    fn test_require_host_access_returns_error_when_permission_missing() {
+    fn test_require_host_access_returns_error_when_permission_missing() -> TestResult {
         let (_base, spec) = make_sandbox_with_hosts(
             "host_error_when_permission_missing",
             vec![], // keine Permissions vorhanden
             vec!["docs.rs"],
-        );
+        )?;
         let ctx = make_ctx(spec);
 
-        let output = require_host_access(&ctx, "docs.rs", "http.fetch")
-            .expect("should produce Some when NetworkAccess is missing");
+        let output = require_host_access(&ctx, "docs.rs", "http.fetch").ok_or(
+            TestError::Missing("should produce Some when NetworkAccess is missing"),
+        )?;
 
         match output {
             ToolOutput::Error { message } => {
@@ -382,20 +404,25 @@ mod tests {
                     "message must contain tool name, got: {message:?}"
                 );
             }
-            other => panic!("expected ToolOutput::Error, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected ToolOutput::Error, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// `NetworkAccess` gewährt, aber Host nicht im Scope → `Some(error)`, Meldung nennt den Host.
     /// Prüft gezielt gegen die Allow-Liste, nicht nur gegen einen leeren Scope:
     /// `docs.rs` selbst bleibt erlaubt, nur `evil.example` wird abgelehnt.
     #[test]
-    fn test_require_host_access_returns_error_when_host_not_allowed() {
+    fn test_require_host_access_returns_error_when_host_not_allowed() -> TestResult {
         let (_base, spec) = make_sandbox_with_hosts(
             "host_error_when_host_not_allowed",
             vec![Permission::NetworkAccess],
             vec!["docs.rs"],
-        );
+        )?;
         let ctx = make_ctx(spec);
 
         assert!(
@@ -403,8 +430,9 @@ mod tests {
             "docs.rs is on the allow list and must remain allowed"
         );
 
-        let output = require_host_access(&ctx, "evil.example", "http.fetch")
-            .expect("should produce Some when host is not in the allowed scope");
+        let output = require_host_access(&ctx, "evil.example", "http.fetch").ok_or(
+            TestError::Missing("should produce Some when host is not in the allowed scope"),
+        )?;
 
         match output {
             ToolOutput::Error { message } => {
@@ -417,8 +445,13 @@ mod tests {
                     "message must contain tool name, got: {message:?}"
                 );
             }
-            other => panic!("expected ToolOutput::Error, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected ToolOutput::Error, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// Regression: die Punktgrenzen-Regel aus `NetworkScope::allows` gilt
@@ -426,12 +459,12 @@ mod tests {
     /// Endung mit dem erlaubten `docs.rs`, steht aber an keiner Punktgrenze
     /// und bleibt deshalb abgelehnt, während `docs.rs` selbst erlaubt bleibt.
     #[test]
-    fn test_require_host_access_rejects_evildocs_despite_shared_suffix() {
+    fn test_require_host_access_rejects_evildocs_despite_shared_suffix() -> TestResult {
         let (_base, spec) = make_sandbox_with_hosts(
             "host_rejects_evildocs_shared_suffix",
             vec![Permission::NetworkAccess],
             vec!["docs.rs"],
-        );
+        )?;
         let ctx = make_ctx(spec);
 
         assert!(
@@ -439,8 +472,9 @@ mod tests {
             "docs.rs selbst muss weiterhin erlaubt sein"
         );
 
-        let output = require_host_access(&ctx, "evildocs.rs", "http.fetch")
-            .expect("evildocs.rs darf nicht durch bloße Endung durchrutschen");
+        let output = require_host_access(&ctx, "evildocs.rs", "http.fetch").ok_or(
+            TestError::Missing("evildocs.rs darf nicht durch bloße Endung durchrutschen"),
+        )?;
         match output {
             ToolOutput::Error { message } => {
                 assert!(
@@ -448,8 +482,13 @@ mod tests {
                     "message must name the disallowed host, got: {message:?}"
                 );
             }
-            other => panic!("expected ToolOutput::Error, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected ToolOutput::Error, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// URL mit Schema, Pfad und ohne Userinfo/Port → reiner Hostname.
@@ -528,16 +567,18 @@ mod tests {
     /// `docs.rs` beschränkten Scope nicht mehr vorbei, ein absoluter Name mit
     /// abschließendem Punkt bleibt erlaubt.
     #[test]
-    fn test_require_host_access_blocks_backslash_bypass() {
+    fn test_require_host_access_blocks_backslash_bypass() -> TestResult {
         let (_base, spec) = make_sandbox_with_hosts(
             "host_blocks_backslash_bypass",
             vec![Permission::NetworkAccess],
             vec!["docs.rs"],
-        );
+        )?;
         let ctx = make_ctx(spec);
 
-        let at_bypass = host_from_url("https://evil.com\\@docs.rs/").expect("Host");
-        let dot_bypass = host_from_url("https://evil.com\\.docs.rs/").expect("Host");
+        let at_bypass =
+            host_from_url("https://evil.com\\@docs.rs/").ok_or(TestError::Missing("Host"))?;
+        let dot_bypass =
+            host_from_url("https://evil.com\\.docs.rs/").ok_or(TestError::Missing("Host"))?;
         for host in [at_bypass, dot_bypass] {
             assert!(
                 require_host_access(&ctx, &host, "http.fetch").is_some(),
@@ -545,8 +586,9 @@ mod tests {
             );
         }
 
-        let host = host_from_url("https://static.docs.rs./x").expect("Host");
+        let host = host_from_url("https://static.docs.rs./x").ok_or(TestError::Missing("Host"))?;
         assert!(require_host_access(&ctx, &host, "http.fetch").is_none());
+        Ok(())
     }
 
     /// Leere Eingabe → `None`.

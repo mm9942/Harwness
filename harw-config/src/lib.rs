@@ -37,7 +37,7 @@ pub use browser_toml::BrowserSection;
 pub use channel_toml::{ChannelFileToml, ChannelSectionToml, ChannelToml, TelegramChannelToml};
 pub use discovery::{
     HasName, ResolvedConfig, default_config_layers, discover_config,
-    discover_config_with_restricted,
+    discover_config_with_restricted, discover_config_with_restricted_and_project_settings,
 };
 pub use dod_toml::DodSection;
 pub use dotenv::{
@@ -70,3 +70,7 @@ pub use scope::{FIELD_TABLE, FieldScope, MergeRule, Scope, SettingScope};
 pub use skill_toml::SkillToml;
 pub use web_toml::WebSection;
 pub use writer::{ConfigWriter, RuleKind};
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

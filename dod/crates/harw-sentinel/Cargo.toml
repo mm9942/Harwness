@@ -30,6 +30,8 @@ harw-observe-file = { path = "../../../harw-observe-file" }
 harw-types = { path = "../../../harw-types" }
 # `#[derive(harw_macros::HarwError)]` für `src/error.rs` und `src/ipc.rs`.
 harw-macros = { path = "../../../harw-macros" }
+# `harw-sentinel completions <shell> [--install|--uninstall]`.
+harw-completions = { path = "../../../harw-completions", features = ["clap-args"] }
 # Schließt Bruch 1 (Sensor -> Regelwerk): `run_rules`, `Rule`, `RuleContext`,
 # `Finding`/`FindingKind`/`RuleChecked`, `EgressFlowRule`,
 # `StructureDriftRule`, `BaselineDeviationRule` — siehe `src/findings.rs`

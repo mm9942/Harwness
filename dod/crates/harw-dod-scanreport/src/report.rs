@@ -81,64 +81,84 @@ pub(crate) fn parse_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn sensor_id() -> SensorId {
         SensorId::from_str("scanreport-0")
     }
 
     #[test]
-    fn test_parse_report_detects_sarif_by_runs_field() {
+    fn test_parse_report_detects_sarif_by_runs_field() -> TestResult {
         let json = r#"{"runs": [{"results": [{"ruleId": "R1", "message": {"text": "x"}}]}]}"#;
-        let events =
-            parse_report(json, &sensor_id(), Timestamp::UNIX_EPOCH).expect("SARIF muss parsen");
+        let events = parse_report(json, &sensor_id(), Timestamp::UNIX_EPOCH)
+            .map_err(ctx("SARIF muss parsen"))?;
         assert_eq!(events.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_report_detects_cargo_audit_by_vulnerabilities_field() {
+    fn test_parse_report_detects_cargo_audit_by_vulnerabilities_field() -> TestResult {
         let json = r#"{"vulnerabilities": {"list": [{"advisory": {"id": "RUSTSEC-2021-0001"}, "package": {"name": "p", "version": "1"}}]}}"#;
         let events = parse_report(json, &sensor_id(), Timestamp::UNIX_EPOCH)
-            .expect("cargo-audit-Dokument muss parsen");
+            .map_err(ctx("cargo-audit-Dokument muss parsen"))?;
         assert_eq!(events.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_report_rejects_syntactically_invalid_json_without_leaking_content() {
+    fn test_parse_report_rejects_syntactically_invalid_json_without_leaking_content() -> TestResult
+    {
         let broken = "{ das ist kein json, sondern ein GEHEIMNIS-Marker";
-        let err = parse_report(broken, &sensor_id(), Timestamp::UNIX_EPOCH)
-            .expect_err("kaputtes JSON muss scheitern");
+        let result = parse_report(broken, &sensor_id(), Timestamp::UNIX_EPOCH);
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "kaputtes JSON muss scheitern".to_owned(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
         let message = err.to_string();
         assert!(!message.contains("GEHEIMNIS"));
         assert!(!message.contains(broken));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_report_rejects_unrecognized_json_shape() {
+    fn test_parse_report_rejects_unrecognized_json_shape() -> TestResult {
         let json = r#"{"unrelated_field": true}"#;
-        let err = parse_report(json, &sensor_id(), Timestamp::UNIX_EPOCH)
-            .expect_err("unbekannte Form muss scheitern");
+        let result = parse_report(json, &sensor_id(), Timestamp::UNIX_EPOCH);
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "unbekannte Form muss scheitern".to_owned(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_report_rejects_runs_field_with_wrong_inner_shape() {
+    fn test_parse_report_rejects_runs_field_with_wrong_inner_shape() -> TestResult {
         // `runs` ist vorhanden, aber kein Array von Läufen -- die
         // Top-Level-Erkennung greift, die genauere Typprüfung scheitert.
         let json = r#"{"runs": "nicht-ein-array"}"#;
-        let err = parse_report(json, &sensor_id(), Timestamp::UNIX_EPOCH)
-            .expect_err("falsch geformtes SARIF muss scheitern");
+        let result = parse_report(json, &sensor_id(), Timestamp::UNIX_EPOCH);
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "falsch geformtes SARIF muss scheitern".to_owned(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_report_prefers_sarif_when_both_fields_present() {
+    fn test_parse_report_prefers_sarif_when_both_fields_present() -> TestResult {
         // Randfall: beide Erkennungsfelder vorhanden -- SARIF hat Vorrang,
         // weil die Prüfung darauf zuerst greift. Dokumentiertes, getestetes
         // Verhalten statt stillschweigender Zufälligkeit.
         let json = r#"{"runs": [], "vulnerabilities": {"list": []}}"#;
         let events = parse_report(json, &sensor_id(), Timestamp::UNIX_EPOCH)
-            .expect("Dokument mit beiden Feldern muss als SARIF parsen");
+            .map_err(ctx("Dokument mit beiden Feldern muss als SARIF parsen"))?;
         assert!(events.is_empty());
+        Ok(())
     }
 }

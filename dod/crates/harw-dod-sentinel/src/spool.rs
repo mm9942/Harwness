@@ -91,8 +91,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use harw_dod_rules::finding::FindingRecord;
 use harw_fsutil::{
-    AtomicWriteOptions, EntryType, OpenMode, WalkLimits, WalkStop, open_beneath,
-    open_dir_nofollow, walk_beneath, write_atomic,
+    AtomicWriteOptions, EntryType, OpenMode, WalkLimits, WalkStop, open_beneath, open_dir_nofollow,
+    walk_beneath, write_atomic,
 };
 use harw_types::ContentDigest;
 
@@ -410,7 +410,10 @@ impl fmt::Display for SpoolError {
                 "finding spool: record of {len} bytes exceeds the limit of {limit} bytes"
             ),
             Self::SpoolFull { limit } => {
-                write!(f, "finding spool: spool holds the maximum of {limit} records")
+                write!(
+                    f,
+                    "finding spool: spool holds the maximum of {limit} records"
+                )
             }
             Self::TooManyEntries { limit } => write!(
                 f,
@@ -425,7 +428,10 @@ impl fmt::Display for SpoolError {
                 f.write_str("finding spool: record fails its own verification after encoding")
             }
             Self::Decode { id, .. } => {
-                write!(f, "finding spool: record {id} could not be decoded or verified")
+                write!(
+                    f,
+                    "finding spool: record {id} could not be decoded or verified"
+                )
             }
             Self::DigestMismatch { id } => write!(
                 f,
@@ -678,8 +684,12 @@ impl FindingSpool {
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(io_err("inspect spool record", &path)(err)),
         }
-        write_atomic(&path, &bytes, AtomicWriteOptions::with_mode(RECORD_FILE_MODE))
-            .map_err(io_err("write spool record", &path))?;
+        write_atomic(
+            &path,
+            &bytes,
+            AtomicWriteOptions::with_mode(RECORD_FILE_MODE),
+        )
+        .map_err(io_err("write spool record", &path))?;
         self.count.fetch_add(1, Ordering::SeqCst);
         Ok(id)
     }
@@ -766,9 +776,9 @@ impl FindingSpool {
                 EntryType::Symlink => Err(SpoolError::SymlinkRejected {
                     path: self.dir.join(id.file_name()),
                 }),
-                EntryType::Dir | EntryType::Other => Err(SpoolError::NotARegularFile {
-                    id: id.clone(),
-                }),
+                EntryType::Dir | EntryType::Other => {
+                    Err(SpoolError::NotARegularFile { id: id.clone() })
+                }
             };
             entries.push(SpoolEntry { id, record });
         }
@@ -885,17 +895,19 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    use harw_authority::NetworkScope;
     use harw_dod_rules::rule::{Rule, RuleContext};
     use harw_dod_rules::rules::StructureDriftRule;
     use harw_dod_rules::run_rules;
     use harw_dod_signals::{DriftSeverity, EventKind, SecurityEvent, SecurityEvidence};
-    use harw_authority::NetworkScope;
     use harw_types::SensorId;
     use jiff::Timestamp;
 
+    use crate::test_support::{TestError, TestResult, ctx};
+
     // Erzeugt `n` echte Records über die öffentliche Regel-Pipeline (die
     // einzige Prägestelle für `Finding<RuleChecked>` außerhalb der Crate).
-    fn records(n: usize, detail: &str) -> Vec<FindingRecord> {
+    fn records(n: usize, detail: &str) -> TestResult<Vec<FindingRecord>> {
         let events: Vec<SecurityEvent> = (0..n)
             .map(|i| SecurityEvent {
                 sensor: SensorId::from_str("workspace-0"),
@@ -908,7 +920,7 @@ mod tests {
             })
             .collect();
         let scope = NetworkScope::empty();
-        let ctx = RuleContext {
+        let rule_ctx = RuleContext {
             now: Timestamp::UNIX_EPOCH,
             samples: &[],
             events: &events,
@@ -917,18 +929,20 @@ mod tests {
         };
         let rule: &dyn Rule = &StructureDriftRule;
         let evidence = SecurityEvidence::capture(vec![], events.clone(), Timestamp::UNIX_EPOCH)
-            .expect("test evidence encodes");
-        run_rules(&[rule], &ctx)
+            .map_err(ctx("test evidence encodes"))?;
+        Ok(run_rules(&[rule], &rule_ctx)
             .iter()
             .map(|finding| finding.record(evidence.clone()))
-            .collect()
+            .collect())
     }
 
-    fn one_record() -> FindingRecord {
-        records(1, "unexpected setuid binary")
+    fn one_record() -> TestResult<FindingRecord> {
+        records(1, "unexpected setuid binary")?
             .into_iter()
             .next()
-            .expect("StructureDriftRule fires for a high drift event")
+            .ok_or(TestError::Missing(
+                "StructureDriftRule fires for a high drift event",
+            ))
     }
 
     fn spool_dir(root: &tempfile::TempDir) -> PathBuf {
@@ -936,240 +950,301 @@ mod tests {
     }
 
     #[test]
-    fn test_put_then_get_returns_identical_record() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let spool = FindingSpool::open(&spool_dir(&root)).expect("spool opens");
-        let record = one_record();
-        let id = spool.put(&record).expect("put succeeds");
+    fn test_put_then_get_returns_identical_record() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let spool = FindingSpool::open(&spool_dir(&root)).map_err(ctx("spool opens"))?;
+        let record = one_record()?;
+        let id = spool.put(&record).map_err(ctx("put succeeds"))?;
         assert_eq!(id.digest(), record.digest());
-        let back = spool.get(&id).expect("get succeeds");
+        let back = spool.get(&id).map_err(ctx("get succeeds"))?;
         assert_eq!(back, Some(record));
+        Ok(())
     }
 
     #[test]
-    fn test_put_writes_file_with_mode_0640() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let spool = FindingSpool::open(&spool_dir(&root)).expect("spool opens");
-        let id = spool.put(&one_record()).expect("put succeeds");
-        let meta = std::fs::metadata(spool.dir().join(id.file_name())).expect("record exists");
+    fn test_put_writes_file_with_mode_0640() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let spool = FindingSpool::open(&spool_dir(&root)).map_err(ctx("spool opens"))?;
+        let id = spool.put(&one_record()?).map_err(ctx("put succeeds"))?;
+        let meta =
+            std::fs::metadata(spool.dir().join(id.file_name())).map_err(ctx("record exists"))?;
         assert_eq!(meta.permissions().mode() & 0o777, RECORD_FILE_MODE);
+        Ok(())
     }
 
     #[test]
-    fn test_get_missing_id_returns_none() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let spool = FindingSpool::open(&spool_dir(&root)).expect("spool opens");
+    fn test_get_missing_id_returns_none() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let spool = FindingSpool::open(&spool_dir(&root)).map_err(ctx("spool opens"))?;
         let id = SpoolId {
             seq: 42,
             digest: ContentDigest::of(b"absent"),
         };
         assert!(matches!(spool.get(&id), Ok(None)));
+        Ok(())
     }
 
     #[test]
-    fn test_page_returns_records_in_write_order_with_cursor() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let spool = FindingSpool::open(&spool_dir(&root)).expect("spool opens");
-        let written: Vec<SpoolId> = records(3, "drift")
+    fn test_page_returns_records_in_write_order_with_cursor() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let spool = FindingSpool::open(&spool_dir(&root)).map_err(ctx("spool opens"))?;
+        let written: Vec<SpoolId> = records(3, "drift")?
             .iter()
-            .map(|record| spool.put(record).expect("put succeeds"))
-            .collect();
+            .map(|record| spool.put(record).map_err(ctx("put succeeds")))
+            .collect::<TestResult<Vec<_>>>()?;
 
-        let (first, cursor) = spool.page(None, 2).expect("first page");
+        let (first, cursor) = spool.page(None, 2).map_err(ctx("first page"))?;
         assert_eq!(
             first.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
             written[..2].to_vec()
         );
         assert!(first.iter().all(|e| e.record.is_ok()));
-        let cursor = cursor.expect("non-empty page yields a cursor");
+        let cursor = cursor.ok_or(TestError::Missing("non-empty page yields a cursor"))?;
 
-        let (second, cursor2) = spool.page(Some(&cursor), 2).expect("second page");
+        let (second, cursor2) = spool.page(Some(&cursor), 2).map_err(ctx("second page"))?;
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].id, written[2]);
-        let cursor2 = cursor2.expect("non-empty page yields a cursor");
+        let cursor2 = cursor2.ok_or(TestError::Missing("non-empty page yields a cursor"))?;
 
-        let (third, cursor3) = spool.page(Some(&cursor2), 2).expect("third page");
+        let (third, cursor3) = spool.page(Some(&cursor2), 2).map_err(ctx("third page"))?;
         assert!(third.is_empty());
         assert!(cursor3.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_page_cursor_sees_records_written_later() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let spool = FindingSpool::open(&spool_dir(&root)).expect("spool opens");
-        let mut batch = records(2, "late").into_iter();
-        spool.put(&batch.next().expect("record")).expect("put");
-        let (_, cursor) = spool.page(None, 10).expect("page");
-        let cursor = cursor.expect("cursor");
-        let later = spool.put(&batch.next().expect("record")).expect("put");
-        let (entries, _) = spool.page(Some(&cursor), 10).expect("page");
+    fn test_page_cursor_sees_records_written_later() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let spool = FindingSpool::open(&spool_dir(&root)).map_err(ctx("spool opens"))?;
+        let mut batch = records(2, "late")?.into_iter();
+        let first = batch.next().ok_or(TestError::Missing("record"))?;
+        spool.put(&first).map_err(ctx("put"))?;
+        let (_, cursor) = spool.page(None, 10).map_err(ctx("page"))?;
+        let cursor = cursor.ok_or(TestError::Missing("cursor"))?;
+        let second = batch.next().ok_or(TestError::Missing("record"))?;
+        let later = spool.put(&second).map_err(ctx("put"))?;
+        let (entries, _) = spool.page(Some(&cursor), 10).map_err(ctx("page"))?;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, later);
+        Ok(())
     }
 
     #[test]
-    fn test_page_with_zero_limit_is_empty() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let spool = FindingSpool::open(&spool_dir(&root)).expect("spool opens");
-        spool.put(&one_record()).expect("put succeeds");
-        let (entries, cursor) = spool.page(None, 0).expect("page");
+    fn test_page_with_zero_limit_is_empty() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let spool = FindingSpool::open(&spool_dir(&root)).map_err(ctx("spool opens"))?;
+        spool.put(&one_record()?).map_err(ctx("put succeeds"))?;
+        let (entries, cursor) = spool.page(None, 0).map_err(ctx("page"))?;
         assert!(entries.is_empty());
         assert!(cursor.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_reopen_continues_sequence() {
-        let root = tempfile::tempdir().expect("tempdir");
+    fn test_reopen_continues_sequence() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let dir = spool_dir(&root);
-        let mut batch = records(2, "reopen").into_iter();
+        let mut batch = records(2, "reopen")?.into_iter();
         let first = {
-            let spool = FindingSpool::open(&dir).expect("spool opens");
-            spool.put(&batch.next().expect("record")).expect("put")
+            let spool = FindingSpool::open(&dir).map_err(ctx("spool opens"))?;
+            let record = batch.next().ok_or(TestError::Missing("record"))?;
+            spool.put(&record).map_err(ctx("put"))?
         };
-        let spool = FindingSpool::open(&dir).expect("spool reopens");
-        let second = spool.put(&batch.next().expect("record")).expect("put");
+        let spool = FindingSpool::open(&dir).map_err(ctx("spool reopens"))?;
+        let record = batch.next().ok_or(TestError::Missing("record"))?;
+        let second = spool.put(&record).map_err(ctx("put"))?;
         assert!(second.seq() > first.seq());
+        Ok(())
     }
 
     #[test]
-    fn test_open_rejects_symlinked_spool_dir() {
-        let root = tempfile::tempdir().expect("tempdir");
+    fn test_open_rejects_symlinked_spool_dir() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let target = root.path().join("real");
-        std::fs::create_dir(&target).expect("target dir");
+        std::fs::create_dir(&target).map_err(ctx("target dir"))?;
         let link = root.path().join("findings");
-        std::os::unix::fs::symlink(&target, &link).expect("symlink");
-        let err = FindingSpool::open(&link).expect_err("symlinked dir rejected");
+        std::os::unix::fs::symlink(&target, &link).map_err(ctx("symlink"))?;
+        let Err(err) = FindingSpool::open(&link) else {
+            return Err(TestError::Unexpected(
+                "symlinked dir rejected: expected Err".into(),
+            ));
+        };
         assert!(matches!(err, SpoolError::SymlinkRejected { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_open_rejects_world_writable_dir() {
-        let root = tempfile::tempdir().expect("tempdir");
+    fn test_open_rejects_world_writable_dir() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let dir = spool_dir(&root);
-        std::fs::create_dir(&dir).expect("dir");
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).expect("chmod");
-        let err = FindingSpool::open(&dir).expect_err("world-writable dir rejected");
+        std::fs::create_dir(&dir).map_err(ctx("dir"))?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))
+            .map_err(ctx("chmod"))?;
+        let Err(err) = FindingSpool::open(&dir) else {
+            return Err(TestError::Unexpected(
+                "world-writable dir rejected: expected Err".into(),
+            ));
+        };
         assert!(matches!(err, SpoolError::InsecurePermissions { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_get_rejects_symlinked_record() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let spool = FindingSpool::open(&spool_dir(&root)).expect("spool opens");
-        let id = spool.put(&one_record()).expect("put succeeds");
+    fn test_get_rejects_symlinked_record() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let spool = FindingSpool::open(&spool_dir(&root)).map_err(ctx("spool opens"))?;
+        let id = spool.put(&one_record()?).map_err(ctx("put succeeds"))?;
         let path = spool.dir().join(id.file_name());
         let outside = root.path().join("outside.json");
-        std::fs::rename(&path, &outside).expect("move record out");
-        std::os::unix::fs::symlink(&outside, &path).expect("symlink record");
+        std::fs::rename(&path, &outside).map_err(ctx("move record out"))?;
+        std::os::unix::fs::symlink(&outside, &path).map_err(ctx("symlink record"))?;
 
-        let err = spool.get(&id).expect_err("symlinked record rejected");
+        let Err(err) = spool.get(&id) else {
+            return Err(TestError::Unexpected(
+                "symlinked record rejected: expected Err".into(),
+            ));
+        };
         assert!(matches!(err, SpoolError::SymlinkRejected { .. }));
 
-        let (entries, _) = spool.page(None, 10).expect("page still works");
+        let (entries, _) = spool.page(None, 10).map_err(ctx("page still works"))?;
         assert_eq!(entries.len(), 1);
         assert!(matches!(
             entries[0].record,
             Err(SpoolError::SymlinkRejected { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_put_rejects_record_over_size_limit() {
-        let root = tempfile::tempdir().expect("tempdir");
+    fn test_put_rejects_record_over_size_limit() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let limits = SpoolLimits {
             max_record_bytes: 64,
             max_entries: DEFAULT_MAX_ENTRIES,
         };
-        let spool = FindingSpool::open_with_limits(&spool_dir(&root), limits).expect("opens");
-        let err = spool.put(&one_record()).expect_err("oversized record rejected");
+        let spool =
+            FindingSpool::open_with_limits(&spool_dir(&root), limits).map_err(ctx("opens"))?;
+        let Err(err) = spool.put(&one_record()?) else {
+            return Err(TestError::Unexpected(
+                "oversized record rejected: expected Err".into(),
+            ));
+        };
         assert!(matches!(err, SpoolError::RecordTooLarge { limit: 64, .. }));
-        let (entries, _) = spool.page(None, 10).expect("page");
+        let (entries, _) = spool.page(None, 10).map_err(ctx("page"))?;
         assert!(entries.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_get_rejects_stored_record_over_size_limit() {
-        let root = tempfile::tempdir().expect("tempdir");
+    fn test_get_rejects_stored_record_over_size_limit() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let dir = spool_dir(&root);
-        let id = FindingSpool::open(&dir)
-            .expect("spool opens")
-            .put(&one_record())
-            .expect("put succeeds");
+        let opened = FindingSpool::open(&dir).map_err(ctx("spool opens"))?;
+        let id = opened.put(&one_record()?).map_err(ctx("put succeeds"))?;
         let limits = SpoolLimits {
             max_record_bytes: 64,
             max_entries: DEFAULT_MAX_ENTRIES,
         };
-        let small = FindingSpool::open_with_limits(&dir, limits).expect("reopens");
-        let err = small.get(&id).expect_err("oversized stored record rejected");
+        let small = FindingSpool::open_with_limits(&dir, limits).map_err(ctx("reopens"))?;
+        let Err(err) = small.get(&id) else {
+            return Err(TestError::Unexpected(
+                "oversized stored record rejected: expected Err".into(),
+            ));
+        };
         assert!(matches!(err, SpoolError::RecordTooLarge { limit: 64, .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_get_rejects_tampered_record_content() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let spool = FindingSpool::open(&spool_dir(&root)).expect("spool opens");
-        let id = spool.put(&one_record()).expect("put succeeds");
+    fn test_get_rejects_tampered_record_content() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let spool = FindingSpool::open(&spool_dir(&root)).map_err(ctx("spool opens"))?;
+        let id = spool.put(&one_record()?).map_err(ctx("put succeeds"))?;
         let path = spool.dir().join(id.file_name());
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+        let bytes = std::fs::read(&path).map_err(ctx("read"))?;
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).map_err(ctx("json"))?;
         value["severity"] = serde_json::Value::String("info".to_owned());
-        std::fs::write(&path, serde_json::to_vec(&value).expect("encode")).expect("write");
-        let err = spool.get(&id).expect_err("tampered record rejected");
+        let encoded = serde_json::to_vec(&value).map_err(ctx("encode"))?;
+        std::fs::write(&path, encoded).map_err(ctx("write"))?;
+        let Err(err) = spool.get(&id) else {
+            return Err(TestError::Unexpected(
+                "tampered record rejected: expected Err".into(),
+            ));
+        };
         assert!(matches!(err, SpoolError::Decode { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_get_rejects_record_under_foreign_digest_name() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let spool = FindingSpool::open(&spool_dir(&root)).expect("spool opens");
-        let mut batch = records(2, "swap").into_iter();
-        let a = spool.put(&batch.next().expect("record")).expect("put");
-        let b = spool.put(&batch.next().expect("record")).expect("put");
-        let bytes_b = std::fs::read(spool.dir().join(b.file_name())).expect("read b");
-        std::fs::write(spool.dir().join(a.file_name()), bytes_b).expect("overwrite a");
-        let err = spool.get(&a).expect_err("digest mismatch detected");
+    fn test_get_rejects_record_under_foreign_digest_name() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let spool = FindingSpool::open(&spool_dir(&root)).map_err(ctx("spool opens"))?;
+        let mut batch = records(2, "swap")?.into_iter();
+        let first = batch.next().ok_or(TestError::Missing("record"))?;
+        let a = spool.put(&first).map_err(ctx("put"))?;
+        let second = batch.next().ok_or(TestError::Missing("record"))?;
+        let b = spool.put(&second).map_err(ctx("put"))?;
+        let bytes_b = std::fs::read(spool.dir().join(b.file_name())).map_err(ctx("read b"))?;
+        std::fs::write(spool.dir().join(a.file_name()), bytes_b).map_err(ctx("overwrite a"))?;
+        let Err(err) = spool.get(&a) else {
+            return Err(TestError::Unexpected(
+                "digest mismatch detected: expected Err".into(),
+            ));
+        };
         assert!(matches!(err, SpoolError::DigestMismatch { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_put_rejects_when_spool_is_full() {
-        let root = tempfile::tempdir().expect("tempdir");
+    fn test_put_rejects_when_spool_is_full() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let limits = SpoolLimits {
             max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
             max_entries: 1,
         };
-        let spool = FindingSpool::open_with_limits(&spool_dir(&root), limits).expect("opens");
-        let mut batch = records(2, "full").into_iter();
-        spool.put(&batch.next().expect("record")).expect("first put");
-        let err = spool
-            .put(&batch.next().expect("record"))
-            .expect_err("second put rejected");
+        let spool =
+            FindingSpool::open_with_limits(&spool_dir(&root), limits).map_err(ctx("opens"))?;
+        let mut batch = records(2, "full")?.into_iter();
+        let first = batch.next().ok_or(TestError::Missing("record"))?;
+        spool.put(&first).map_err(ctx("first put"))?;
+        let second = batch.next().ok_or(TestError::Missing("record"))?;
+        let Err(err) = spool.put(&second) else {
+            return Err(TestError::Unexpected(
+                "second put rejected: expected Err".into(),
+            ));
+        };
         assert!(matches!(err, SpoolError::SpoolFull { limit: 1 }));
+        Ok(())
     }
 
     #[test]
-    fn test_spool_id_parse_accepts_only_canonical_form() {
+    fn test_spool_id_parse_accepts_only_canonical_form() -> TestResult {
         let digest = "ab".repeat(32);
         let good = format!("{:020}-{digest}", 5);
-        let id = SpoolId::parse(&good).expect("canonical id parses");
+        let id = SpoolId::parse(&good).ok_or(TestError::Missing("canonical id parses"))?;
         assert_eq!(id.to_string(), good);
         assert_eq!(SpoolId::from_file_name(&format!("{good}.json")), Some(id));
         assert!(SpoolId::parse(&format!("{:020}-{}", 5, "AB".repeat(32))).is_none());
         assert!(SpoolId::parse(&format!("5-{digest}")).is_none());
         assert!(SpoolId::from_file_name(&format!(".{good}.json.1.tmp")).is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_spool_cursor_roundtrips_through_text() {
+    fn test_spool_cursor_roundtrips_through_text() -> TestResult {
         let text = format!("{:020}-{}", 9, "0".repeat(64));
-        let cursor = SpoolCursor::parse(&text).expect("cursor parses");
+        let cursor = SpoolCursor::parse(&text).ok_or(TestError::Missing("cursor parses"))?;
         assert_eq!(cursor.after().seq(), 9);
         assert_eq!(cursor.to_string(), text);
+        Ok(())
     }
 
     #[test]
     fn test_spool_error_display_names_limit() {
-        let err = SpoolError::RecordTooLarge { len: 100, limit: 64 };
+        let err = SpoolError::RecordTooLarge {
+            len: 100,
+            limit: 64,
+        };
         assert_eq!(
             err.to_string(),
             "finding spool: record of 100 bytes exceeds the limit of 64 bytes"

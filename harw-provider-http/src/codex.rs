@@ -217,7 +217,10 @@ fn login_headers(document: &Value, originator: &str) -> Result<HeaderMap, ModelE
     // anderen OpenAI-Wire-Formaten üblichen Feature-Flag-Namensschema; die
     // Header werden bewusst nicht als sensitiv markiert, da sie kein
     // Tokenmaterial enthalten.
-    headers.insert("OpenAI-Beta", HeaderValue::from_static("responses=experimental"));
+    headers.insert(
+        "OpenAI-Beta",
+        HeaderValue::from_static("responses=experimental"),
+    );
     headers.insert(
         "session_id",
         HeaderValue::from_str(&uuid_v4_like()).unwrap_or_else(|_| HeaderValue::from_static("")),
@@ -235,11 +238,22 @@ fn uuid_v4_like() -> String {
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5],
-        bytes[6], bytes[7],
-        bytes[8], bytes[9],
-        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
     )
 }
 
@@ -349,11 +363,12 @@ impl ResponseDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use serde_json::json;
 
-    fn provider(base_url: &str, pointer: &str) -> ProviderToml {
-        let home = std::env::var_os("HOME").unwrap();
-        ProviderToml {
+    fn provider(base_url: &str, pointer: &str) -> TestResult<ProviderToml> {
+        let home = std::env::var_os("HOME").ok_or(TestError::Missing("HOME"))?;
+        Ok(ProviderToml {
             name: "openai".into(),
             api: "openai-responses".into(),
             base_url: base_url.into(),
@@ -374,21 +389,22 @@ mod tests {
             max_concurrency: None,
             originator: None,
             default_reasoning_effort: None,
-        }
+            gateway_identity_headers: false,
+        })
     }
 
     #[test]
-    fn migrates_only_canonical_codex_login_route() {
+    fn migrates_only_canonical_codex_login_route() -> TestResult {
         for base in [API_BASE_URL, BASE_URL] {
             assert!(
-                CodexRoute::from_provider(&provider(base, ACCESS_POINTER))
-                    .unwrap()
+                CodexRoute::from_provider(&provider(base, ACCESS_POINTER)?)
+                    .map_err(ctx("from_provider"))?
                     .is_some()
             );
         }
         assert!(
-            CodexRoute::from_provider(&provider(API_BASE_URL, "/OPENAI_API_KEY"))
-                .unwrap()
+            CodexRoute::from_provider(&provider(API_BASE_URL, "/OPENAI_API_KEY")?)
+                .map_err(ctx("from_provider"))?
                 .is_none()
         );
         for base in [
@@ -397,9 +413,9 @@ mod tests {
             "http://chatgpt.com/backend-api/codex",
             "https://api.openai.com/v1?x=y",
         ] {
-            assert!(CodexRoute::from_provider(&provider(base, ACCESS_POINTER)).is_err());
+            assert!(CodexRoute::from_provider(&provider(base, ACCESS_POINTER)?).is_err());
         }
-        let mut wrong = provider(BASE_URL, ACCESS_POINTER);
+        let mut wrong = provider(BASE_URL, ACCESS_POINTER)?;
         wrong.api = "openai-chat".into();
         assert!(CodexRoute::from_provider(&wrong).is_err());
         wrong.api = "openai-responses".into();
@@ -407,86 +423,102 @@ mod tests {
             .headers
             .insert("ChatGPT-Account-ID".into(), "different-account".into());
         assert!(CodexRoute::from_provider(&wrong).is_err());
+        Ok(())
     }
 
     #[test]
-    fn credentials_are_sensitive_and_missing_login_is_actionable() {
+    fn credentials_are_sensitive_and_missing_login_is_actionable() -> TestResult {
         let headers = login_headers(
             &json!({"tokens":{"access_token":"test-token","account_id":"test-account"}}),
             DEFAULT_ORIGINATOR,
         )
-        .unwrap();
+        .map_err(ctx("login_headers"))?;
         assert_eq!(headers[AUTHORIZATION], "Bearer test-token");
         assert!(headers[AUTHORIZATION].is_sensitive());
         assert!(headers["chatgpt-account-id"].is_sensitive());
-        let error =
-            login_headers(&json!({"tokens":{"access_token":" "}}), DEFAULT_ORIGINATOR)
-                .unwrap_err();
+        let Err(error) = login_headers(&json!({"tokens":{"access_token":" "}}), DEFAULT_ORIGINATOR)
+        else {
+            return Err(TestError::Unexpected(
+                "login_headers must reject a blank access token".into(),
+            ));
+        };
         assert!(error.to_string().contains("codex login"));
+        Ok(())
     }
 
     #[test]
-    fn login_headers_include_provisional_openai_beta_and_session_id() {
+    fn login_headers_include_provisional_openai_beta_and_session_id() -> TestResult {
         let headers = login_headers(
             &json!({"tokens":{"access_token":"test-token"}}),
             DEFAULT_ORIGINATOR,
         )
-        .unwrap();
+        .map_err(ctx("login_headers"))?;
         assert!(headers.contains_key("OpenAI-Beta"));
         assert!(headers.contains_key("session_id"));
         // Provisorische Header, siehe WHY-Kommentar in `login_headers`: kein
         // Tokenmaterial, daher bewusst nicht sensitiv markiert.
         assert!(!headers["OpenAI-Beta"].is_sensitive());
         assert!(!headers["session_id"].is_sensitive());
+        Ok(())
     }
 
     #[test]
-    fn login_headers_default_originator_is_harw() {
-        let headers =
-            login_headers(&json!({"tokens":{"access_token":"t"}}), DEFAULT_ORIGINATOR).unwrap();
+    fn login_headers_default_originator_is_harw() -> TestResult {
+        let headers = login_headers(&json!({"tokens":{"access_token":"t"}}), DEFAULT_ORIGINATOR)
+            .map_err(ctx("login_headers"))?;
         assert_eq!(headers["originator"], "harw");
         assert!(!headers["originator"].is_sensitive());
+        Ok(())
     }
 
     #[test]
-    fn login_headers_uses_configured_originator() {
-        let headers =
-            login_headers(&json!({"tokens":{"access_token":"t"}}), "codex_cli_rs").unwrap();
+    fn login_headers_uses_configured_originator() -> TestResult {
+        let headers = login_headers(&json!({"tokens":{"access_token":"t"}}), "codex_cli_rs")
+            .map_err(ctx("login_headers"))?;
         assert_eq!(headers["originator"], "codex_cli_rs");
+        Ok(())
     }
 
     #[test]
-    fn login_headers_falls_back_to_default_on_invalid_header_value() {
+    fn login_headers_falls_back_to_default_on_invalid_header_value() -> TestResult {
         // Steuerzeichen sind kein gültiger HeaderValue-Inhalt; `ProviderToml::validate`
         // verhindert das beim Konfigurations-Laden, `login_headers` bleibt trotzdem
         // fail-safe für Aufrufer ohne vorherige Validierung.
-        let headers =
-            login_headers(&json!({"tokens":{"access_token":"t"}}), "bad\nvalue").unwrap();
+        let headers = login_headers(&json!({"tokens":{"access_token":"t"}}), "bad\nvalue")
+            .map_err(ctx("login_headers"))?;
         assert_eq!(headers["originator"], DEFAULT_ORIGINATOR);
+        Ok(())
     }
 
     #[test]
-    fn from_provider_defaults_originator_to_harw_when_unset() {
-        let route = CodexRoute::from_provider(&provider(BASE_URL, ACCESS_POINTER))
-            .unwrap()
-            .unwrap();
+    fn from_provider_defaults_originator_to_harw_when_unset() -> TestResult {
+        let route = CodexRoute::from_provider(&provider(BASE_URL, ACCESS_POINTER)?)
+            .map_err(ctx("from_provider"))?
+            .ok_or(TestError::Missing("codex route"))?;
         assert_eq!(route.originator(), DEFAULT_ORIGINATOR);
+        Ok(())
     }
 
     #[test]
-    fn from_provider_uses_configured_originator_when_set() {
-        let mut config = provider(BASE_URL, ACCESS_POINTER);
+    fn from_provider_uses_configured_originator_when_set() -> TestResult {
+        let mut config = provider(BASE_URL, ACCESS_POINTER)?;
         config.originator = Some("codex_cli_rs".to_owned());
-        let route = CodexRoute::from_provider(&config).unwrap().unwrap();
+        let route = CodexRoute::from_provider(&config)
+            .map_err(ctx("from_provider"))?
+            .ok_or(TestError::Missing("codex route"))?;
         assert_eq!(route.originator(), "codex_cli_rs");
+        Ok(())
     }
 
     #[test]
-    fn from_provider_defaults_originator_when_blank() {
-        let mut config = provider(BASE_URL, ACCESS_POINTER);
+    fn from_provider_defaults_originator_when_blank() -> TestResult {
+        let mut config = provider(BASE_URL, ACCESS_POINTER)?;
         config.originator = Some("   ".to_owned());
-        let route = CodexRoute::from_provider(&config).unwrap().unwrap();
+        let route = CodexRoute::from_provider(&config)
+            .map_err(ctx("from_provider"))?
+            .ok_or(TestError::Missing("codex route"))?;
         assert_eq!(route.originator(), DEFAULT_ORIGINATOR);
+        Ok(())
     }
 
     #[test]
@@ -499,18 +531,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn access_token_needs_refresh_true_for_soon_expiring_jwt() {
+    async fn access_token_needs_refresh_true_for_soon_expiring_jwt() -> TestResult {
         let home = std::env::temp_dir().join(format!(
             "harw-provider-http-codex-refresh-check-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::create_dir_all(home.join(".codex")).map_err(ctx("create .codex dir"))?;
         let auth_path = home.join(".codex/auth.json");
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .map_err(ctx("system time"))?
             .as_secs() as i64;
         let header = base64_url_no_pad(b"{}");
         let payload = base64_url_no_pad(format!("{{\"exp\":{}}}", now + 30).as_bytes());
@@ -519,7 +551,7 @@ mod tests {
             &auth_path,
             json!({"tokens":{"access_token": soon_expiring, "refresh_token": "r"}}).to_string(),
         )
-        .unwrap();
+        .map_err(ctx("write auth.json"))?;
 
         let route = CodexRoute {
             path: auth_path.to_string_lossy().into_owned(),
@@ -527,13 +559,20 @@ mod tests {
         };
         // Ohne HOME-Bindung an die Allowlist liest `read_external_cli_credential`
         // nichts; direkt aus der Datei prüfen genügt für diesen Unit-Test.
-        let raw = std::fs::read_to_string(&auth_path).unwrap();
-        let document: Value = serde_json::from_str(&raw).unwrap();
-        let token = document.pointer(ACCESS_POINTER).and_then(Value::as_str).unwrap();
-        assert!(harw_oauth::jwt_needs_refresh(token, PROACTIVE_REFRESH_WINDOW_SECONDS));
+        let raw = std::fs::read_to_string(&auth_path).map_err(ctx("read auth.json"))?;
+        let document: Value = serde_json::from_str(&raw).map_err(ctx("parse auth.json"))?;
+        let token = document
+            .pointer(ACCESS_POINTER)
+            .and_then(Value::as_str)
+            .ok_or(TestError::Missing("access_token pointer"))?;
+        assert!(harw_oauth::jwt_needs_refresh(
+            token,
+            PROACTIVE_REFRESH_WINDOW_SECONDS
+        ));
         let _ = route.validate_login();
 
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 
     fn base64_url_no_pad(bytes: &[u8]) -> String {
@@ -549,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn fragmented_sse_preserves_tools_usage_and_reasoning() {
+    fn fragmented_sse_preserves_tools_usage_and_reasoning() -> TestResult {
         let response = json!({"status":"completed","output":[
             {"type":"reasoning","encrypted_content":"opaque"},
             {"type":"function_call","call_id":"call-1","name":"read","arguments":"{}"}
@@ -561,25 +600,26 @@ mod tests {
         let mut decoder = ResponseDecoder::default();
         let mut result = None;
         for chunk in stream.as_bytes().chunks(3) {
-            result = decoder.push(chunk).unwrap().or(result);
+            result = decoder.push(chunk).map_err(ctx("decoder push"))?.or(result);
         }
         assert_eq!(result, Some(response));
+        Ok(())
     }
 
     #[test]
-    fn sse_failure_and_incomplete_are_not_successful_tool_responses() {
-        assert!(
-            ResponseDecoder::default()
-                .push(b"data: {\"type\":\"error\",\"message\":\"private\"}\n\n")
-                .unwrap_err()
-                .to_string()
-                .find("private")
-                .is_none()
-        );
+    fn sse_failure_and_incomplete_are_not_successful_tool_responses() -> TestResult {
+        let Err(error) = ResponseDecoder::default()
+            .push(b"data: {\"type\":\"error\",\"message\":\"private\"}\n\n")
+        else {
+            return Err(TestError::Unexpected(
+                "decoder push must fail on an error event".into(),
+            ));
+        };
+        assert!(error.to_string().find("private").is_none());
         let value = ResponseDecoder::default()
             .push(b"data: {\"type\":\"response.incomplete\",\"response\":{\"output\":[]}}\n\n")
-            .unwrap()
-            .unwrap();
+            .map_err(ctx("decoder push"))?
+            .ok_or(TestError::Missing("decoded response value"))?;
         assert_eq!(value["status"], "incomplete");
         assert!(
             ResponseDecoder::default()
@@ -591,5 +631,6 @@ mod tests {
                 .push(b"data: {\"type\":\"response.completed\"}\n\n")
                 .is_err()
         );
+        Ok(())
     }
 }

@@ -167,9 +167,11 @@ pub mod report;
 pub mod sensor;
 
 pub use error::{FlowError, FlowResult};
-pub use event::{parse_flow_payload, parse_tcp_connect_v1, Direction, FlowEvent, Protocol, TcpConnectEventV1};
+pub use event::{
+    Direction, FlowEvent, Protocol, TcpConnectEventV1, parse_flow_payload, parse_tcp_connect_v1,
+};
 pub use report::{observe, to_security_event};
-pub use sensor::{FlowSensor, DEFAULT_READ_TIMEOUT};
+pub use sensor::{DEFAULT_READ_TIMEOUT, FlowSensor};
 
 /// Die Fähigkeit, die ein echter (Nicht-Fixture-)Lader für diese Crate
 /// braucht.
@@ -292,19 +294,28 @@ pub fn flow_program_spec(
 
 #[cfg(test)]
 mod tests {
-    use super::{flow_contracts, flow_program_spec, FLOW_TCP_V4_CONNECT_ATTACH_POINT, REQUIRED_CAPABILITY};
+    use super::{
+        FLOW_TCP_V4_CONNECT_ATTACH_POINT, REQUIRED_CAPABILITY, flow_contracts, flow_program_spec,
+    };
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn test_required_capability_is_load_bpf_program_in_the_bpf_class() {
-        assert_eq!(REQUIRED_CAPABILITY, harw_dod_cap::Capability::LoadBpfProgram);
-        assert_eq!(REQUIRED_CAPABILITY.class(), harw_dod_cap::CapabilityClass::Bpf);
+        assert_eq!(
+            REQUIRED_CAPABILITY,
+            harw_dod_cap::Capability::LoadBpfProgram
+        );
+        assert_eq!(
+            REQUIRED_CAPABILITY.class(),
+            harw_dod_cap::CapabilityClass::Bpf
+        );
     }
 
     #[test]
-    fn test_flow_program_spec_uses_an_fentry_and_needs_no_open_socket() {
-        let dir = tempfile::tempdir().expect("tempdir for program body");
+    fn test_flow_program_spec_uses_an_fentry_and_needs_no_open_socket() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir for program body"))?;
         let body_path = dir.path().join("flow.bpf.o");
-        std::fs::write(&body_path, b"bytecode-bytes").expect("write fixture program body");
+        std::fs::write(&body_path, b"bytecode-bytes").map_err(ctx("write fixture program body"))?;
 
         let spec = flow_program_spec(
             harw_types::SensorId::from_str("flow-0"),
@@ -314,6 +325,7 @@ mod tests {
         assert_eq!(spec.kind, harw_dod_bpf::BpfProgramKind::FEntry);
         assert_eq!(spec.attach_point, FLOW_TCP_V4_CONNECT_ATTACH_POINT);
         assert_eq!(spec.attach_point, "tcp_v4_connect");
+        Ok(())
     }
 
     #[test]
@@ -341,3 +353,7 @@ mod tests {
         );
     }
 }
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

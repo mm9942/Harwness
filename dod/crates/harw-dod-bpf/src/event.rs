@@ -252,8 +252,8 @@ pub fn parse_raw_event(bytes: &[u8]) -> Result<RawBpfEvent, BpfError> {
     let pid = read_u32_le(bytes, 0)?;
     let epoch_nanos = read_u64_le(bytes, 4)?;
     let comm = read_fixed_c_str(bytes, 12, COMM_LEN)?;
-    let observed_at =
-        jiff::Timestamp::from_nanosecond(i128::from(epoch_nanos)).map_err(|_| BpfError::MalformedEvent)?;
+    let observed_at = jiff::Timestamp::from_nanosecond(i128::from(epoch_nanos))
+        .map_err(|_| BpfError::MalformedEvent)?;
     let payload = bytes[HEADER_LEN..].to_vec();
 
     Ok(RawBpfEvent {
@@ -266,8 +266,9 @@ pub fn parse_raw_event(bytes: &[u8]) -> Result<RawBpfEvent, BpfError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_raw_event, read_fixed_c_str, read_u32_le, read_u64_le, HEADER_LEN};
+    use super::{HEADER_LEN, parse_raw_event, read_fixed_c_str, read_u32_le, read_u64_le};
     use crate::error::BpfError;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn well_formed_buffer(pid: u32, epoch_nanos: u64, comm: &[u8; 16], payload: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(HEADER_LEN + payload.len());
@@ -279,70 +280,107 @@ mod tests {
     }
 
     #[test]
-    fn test_read_u32_le_honors_byte_order_for_a_multi_byte_value() {
+    fn test_read_u32_le_honors_byte_order_for_a_multi_byte_value() -> TestResult {
         // 300 braucht zwei Bytes (0x2C, 0x01) — ein Test mit einem Wert
         // unter 256 könnte eine vertauschte Byte-Reihenfolge nicht erkennen.
         let bytes = 300u32.to_le_bytes();
-        assert_eq!(read_u32_le(&bytes, 0).unwrap(), 300);
+        assert_eq!(read_u32_le(&bytes, 0).map_err(ctx("u32 le lesen"))?, 300);
+        Ok(())
     }
 
     #[test]
-    fn test_read_u64_le_honors_byte_order_for_a_multi_byte_value() {
+    fn test_read_u64_le_honors_byte_order_for_a_multi_byte_value() -> TestResult {
         let bytes = 70_000u64.to_le_bytes();
-        assert_eq!(read_u64_le(&bytes, 0).unwrap(), 70_000);
+        assert_eq!(read_u64_le(&bytes, 0).map_err(ctx("u64 le lesen"))?, 70_000);
+        Ok(())
     }
 
     #[test]
-    fn test_read_u32_le_out_of_range_returns_malformed_event() {
-        let err = read_u32_le(&[0u8; 2], 0).expect_err("2 bytes cannot hold a u32");
+    fn test_read_u32_le_out_of_range_returns_malformed_event() -> TestResult {
+        let outcome = read_u32_le(&[0u8; 2], 0);
+        let Err(err) = outcome else {
+            return Err(TestError::Unexpected(
+                "2 bytes cannot hold a u32".to_owned(),
+            ));
+        };
         assert!(matches!(err, BpfError::MalformedEvent));
+        Ok(())
     }
 
     #[test]
-    fn test_read_fixed_c_str_stops_at_nul_terminator() {
-        assert_eq!(read_fixed_c_str(b"sshd\0\0\0\0", 0, 8).unwrap(), "sshd");
+    fn test_read_fixed_c_str_stops_at_nul_terminator() -> TestResult {
+        assert_eq!(
+            read_fixed_c_str(b"sshd\0\0\0\0", 0, 8).map_err(ctx("fixed c-str lesen"))?,
+            "sshd"
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_read_fixed_c_str_fills_buffer_completely_without_terminator() {
+    fn test_read_fixed_c_str_fills_buffer_completely_without_terminator() -> TestResult {
         // 8 Byte, keine Null irgendwo darin: die gesamte Breite ist der Name.
-        assert_eq!(read_fixed_c_str(b"exactly1", 0, 8).unwrap(), "exactly1");
+        assert_eq!(
+            read_fixed_c_str(b"exactly1", 0, 8).map_err(ctx("fixed c-str lesen"))?,
+            "exactly1"
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_read_fixed_c_str_out_of_range_returns_malformed_event() {
-        let err = read_fixed_c_str(b"short", 0, 16).expect_err("buffer shorter than the field");
+    fn test_read_fixed_c_str_out_of_range_returns_malformed_event() -> TestResult {
+        let outcome = read_fixed_c_str(b"short", 0, 16);
+        let Err(err) = outcome else {
+            return Err(TestError::Unexpected(
+                "buffer shorter than the field".to_owned(),
+            ));
+        };
         assert!(matches!(err, BpfError::MalformedEvent));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_raw_event_decodes_a_well_formed_buffer() {
+    fn test_parse_raw_event_decodes_a_well_formed_buffer() -> TestResult {
         let mut comm = [0u8; 16];
         comm[..4].copy_from_slice(b"sshd");
         let bytes = well_formed_buffer(4_242, 1_000_000_000, &comm, b"rest");
 
-        let event = parse_raw_event(&bytes).expect("well-formed buffer must parse");
+        let event = parse_raw_event(&bytes).map_err(ctx("well-formed buffer must parse"))?;
         assert_eq!(event.pid, 4_242);
         assert_eq!(event.comm, "sshd");
         assert_eq!(
             event.observed_at,
-            jiff::Timestamp::from_nanosecond(1_000_000_000).unwrap()
+            jiff::Timestamp::from_nanosecond(1_000_000_000)
+                .map_err(ctx("timestamp from nanosecond"))?
         );
         assert_eq!(event.payload, b"rest");
+        Ok(())
     }
 
     #[test]
-    fn test_parse_raw_event_too_short_buffer_returns_malformed_event_without_panicking() {
-        let err = parse_raw_event(&[1, 2, 3]).expect_err("a 3-byte buffer is far too short");
+    fn test_parse_raw_event_too_short_buffer_returns_malformed_event_without_panicking()
+    -> TestResult {
+        let outcome = parse_raw_event(&[1, 2, 3]);
+        let Err(err) = outcome else {
+            return Err(TestError::Unexpected(
+                "a 3-byte buffer is far too short".to_owned(),
+            ));
+        };
         assert!(matches!(err, BpfError::MalformedEvent));
         // Inhaltsfrei: die Meldung ist ein fester String, kann die Rohbytes
         // strukturell nicht enthalten.
         assert_eq!(err.to_string(), "bpf event buffer is malformed");
+        Ok(())
     }
 
     #[test]
-    fn test_parse_raw_event_empty_buffer_returns_malformed_event_without_panicking() {
-        let err = parse_raw_event(&[]).expect_err("an empty buffer must not panic");
+    fn test_parse_raw_event_empty_buffer_returns_malformed_event_without_panicking() -> TestResult {
+        let outcome = parse_raw_event(&[]);
+        let Err(err) = outcome else {
+            return Err(TestError::Unexpected(
+                "an empty buffer must not panic".to_owned(),
+            ));
+        };
         assert!(matches!(err, BpfError::MalformedEvent));
+        Ok(())
     }
 }

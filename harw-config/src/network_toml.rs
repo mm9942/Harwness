@@ -96,24 +96,26 @@ fn validate_host_list(field: &str, hosts: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn test_network_section_defaults_from_empty_toml() {
-        let section: NetworkSection = toml::from_str("").unwrap();
+    fn test_network_section_defaults_from_empty_toml() -> TestResult {
+        let section: NetworkSection = toml::from_str("").map_err(ctx("parse toml"))?;
         assert!(section.allow_hosts.is_empty());
         assert!(!section.allow_private);
         assert!(section.researcher_web_hosts.is_empty());
         assert_eq!(section, NetworkSection::default());
+        Ok(())
     }
 
     #[test]
-    fn test_network_section_full_toml_round_trip() {
+    fn test_network_section_full_toml_round_trip() -> TestResult {
         let src = r#"
             allow_hosts = ["docs.rs", "internal.example.test"]
             allow_private = true
             researcher_web_hosts = ["search.example.test"]
         "#;
-        let section: NetworkSection = toml::from_str(src).unwrap();
+        let section: NetworkSection = toml::from_str(src).map_err(ctx("parse toml"))?;
         assert_eq!(
             section.allow_hosts,
             vec!["docs.rs".to_owned(), "internal.example.test".to_owned()]
@@ -124,19 +126,26 @@ mod tests {
             vec!["search.example.test".to_owned()]
         );
 
-        let encoded = toml::to_string(&section).unwrap();
-        let decoded: NetworkSection = toml::from_str(&encoded).unwrap();
+        let encoded = toml::to_string(&section).map_err(ctx("encode toml"))?;
+        let decoded: NetworkSection =
+            toml::from_str(&encoded).map_err(ctx("parse encoded toml"))?;
         assert_eq!(decoded, section);
+        Ok(())
     }
 
     #[test]
-    fn test_network_section_rejects_unknown_field() {
+    fn test_network_section_rejects_unknown_field() -> TestResult {
         let src = r#"
             allow_hosts = ["docs.rs"]
             allow_hots = ["docs.rs"]
         "#;
-        let error = toml::from_str::<NetworkSection>(src).unwrap_err();
+        let Err(error) = toml::from_str::<NetworkSection>(src) else {
+            return Err(TestError::Unexpected(
+                "unknown field must be rejected".to_string(),
+            ));
+        };
         assert!(error.to_string().contains("unknown field"));
+        Ok(())
     }
 
     #[test]
@@ -145,23 +154,33 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rejects_blank_allow_host_entry() {
+    fn test_validate_rejects_blank_allow_host_entry() -> TestResult {
         let section = NetworkSection {
             allow_hosts: vec!["   ".to_owned()],
             ..NetworkSection::default()
         };
-        let error = section.validate().unwrap_err();
+        let Err(error) = section.validate() else {
+            return Err(TestError::Unexpected(
+                "blank allow_hosts entry must be rejected".to_string(),
+            ));
+        };
         assert!(error.contains("network.allow_hosts"));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_scheme_prefixed_researcher_web_host() {
+    fn test_validate_rejects_scheme_prefixed_researcher_web_host() -> TestResult {
         let section = NetworkSection {
             researcher_web_hosts: vec!["https://search.example.test".to_owned()],
             ..NetworkSection::default()
         };
-        let error = section.validate().unwrap_err();
+        let Err(error) = section.validate() else {
+            return Err(TestError::Unexpected(
+                "scheme-prefixed researcher_web_hosts entry must be rejected".to_string(),
+            ));
+        };
         assert!(error.contains("network.researcher_web_hosts"));
         assert!(error.contains("https://search.example.test"));
+        Ok(())
     }
 }

@@ -142,60 +142,67 @@ fn invalid_data(error: impl std::fmt::Display) -> TelegramTransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
-    fn missing_offset_loads_as_none() {
-        let root = tempfile::tempdir().expect("temporary root");
+    fn missing_offset_loads_as_none() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("temporary root"))?;
         let store = TelegramOffsetStore::new(root.path());
 
-        assert_eq!(store.load().expect("load missing offset"), None);
+        assert_eq!(store.load().map_err(ctx("load missing offset"))?, None);
+        Ok(())
     }
 
     #[test]
-    fn store_reopen_roundtrip() {
-        let root = tempfile::tempdir().expect("temporary root");
+    fn store_reopen_roundtrip() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("temporary root"))?;
         TelegramOffsetStore::new(root.path())
             .store(42)
-            .expect("store offset");
+            .map_err(ctx("store offset"))?;
 
         assert_eq!(
             TelegramOffsetStore::new(root.path())
                 .load()
-                .expect("reopen offset"),
+                .map_err(ctx("reopen offset"))?,
             Some(42)
         );
+        Ok(())
     }
 
     #[test]
-    fn malformed_and_negative_offsets_reject() {
-        let root = tempfile::tempdir().expect("temporary root");
+    fn malformed_and_negative_offsets_reject() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("temporary root"))?;
         let path = root.path().join(OFFSET_FILE);
-        fs::write(&path, br#"{"offset":"not-an-integer"}"#).expect("write malformed offset");
+        fs::write(&path, br#"{"offset":"not-an-integer"}"#)
+            .map_err(ctx("write malformed offset"))?;
         let store = TelegramOffsetStore::new(root.path());
 
         assert!(
             matches!(store.load(), Err(TelegramTransportError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData)
         );
 
-        fs::write(&path, br#"{"offset":-1}"#).expect("write negative offset");
+        fs::write(&path, br#"{"offset":-1}"#).map_err(ctx("write negative offset"))?;
         assert!(
             matches!(store.load(), Err(TelegramTransportError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData)
         );
         assert!(
             matches!(store.store(-1), Err(TelegramTransportError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData)
         );
+        Ok(())
     }
 
     #[test]
-    fn final_file_is_always_a_complete_json_record() {
-        let root = tempfile::tempdir().expect("temporary root");
+    fn final_file_is_always_a_complete_json_record() -> TestResult {
+        let root = tempfile::tempdir().map_err(ctx("temporary root"))?;
         let store = TelegramOffsetStore::new(root.path());
-        store.store(7).expect("initial store");
-        store.store(8).expect("replacement store");
+        store.store(7).map_err(ctx("initial store"))?;
+        store.store(8).map_err(ctx("replacement store"))?;
 
-        let bytes = fs::read(root.path().join(OFFSET_FILE)).expect("read final offset");
-        let record: OffsetRecord = serde_json::from_slice(&bytes).expect("complete offset JSON");
+        let bytes = fs::read(root.path().join(OFFSET_FILE)).map_err(ctx("read final offset"))?;
+        let record: OffsetRecord =
+            serde_json::from_slice(&bytes).map_err(ctx("complete offset JSON"))?;
         assert_eq!(record.offset, 8);
         assert!(!bytes.is_empty());
+        Ok(())
     }
 }

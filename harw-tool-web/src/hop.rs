@@ -39,8 +39,8 @@
 //! ```
 
 use crate::error::{WebToolError, WebToolResult};
-use harw_egress::{EgressError, EgressPolicy, EgressUrl, EgressUrlError};
 use harw_authority::NetworkScope;
+use harw_egress::{EgressError, EgressPolicy, EgressUrl, EgressUrlError};
 use std::net::IpAddr;
 
 /// Ein geprüftes Anfrageziel.
@@ -224,7 +224,10 @@ fn egress_denial(error: &EgressError, label: &str) -> WebToolError {
     let reason = match error {
         EgressError::InvalidUrl(inner) => return url_error(inner, label),
         EgressError::HostNotAllowed { host } => {
-            format!("Host {} ist nicht in der Egress-Allowlist", redact_host(host))
+            format!(
+                "Host {} ist nicht in der Egress-Allowlist",
+                redact_host(host)
+            )
         }
         EgressError::LocalHostName { .. } => {
             "lokale Hostnamen sind ohne Freigabe privater Ziele nicht erlaubt".to_owned()
@@ -237,7 +240,10 @@ fn egress_denial(error: &EgressError, label: &str) -> WebToolError {
             redact_host(host)
         ),
         EgressError::Lookup { host, .. } => {
-            format!("die DNS-Auflösung von {} ist fehlgeschlagen", redact_host(host))
+            format!(
+                "die DNS-Auflösung von {} ist fehlgeschlagen",
+                redact_host(host)
+            )
         }
         EgressError::InvalidAllowEntry { .. } => {
             return WebToolError::NotConfigured {
@@ -298,10 +304,11 @@ pub fn map_send_error(error: reqwest::Error, hop: usize) -> WebToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
-    fn policy(hosts: &[&str], allow_private: bool) -> EgressPolicy {
+    fn policy(hosts: &[&str], allow_private: bool) -> TestResult<EgressPolicy> {
         let hosts = hosts.iter().map(|host| (*host).to_owned()).collect();
-        EgressPolicy::new(hosts, allow_private).expect("gültige Test-Policy")
+        EgressPolicy::new(hosts, allow_private).map_err(ctx("gültige Test-Policy"))
     }
 
     fn scope(hosts: &[&str]) -> NetworkScope {
@@ -310,24 +317,25 @@ mod tests {
 
     /// Erlaubte https-URL wird normalisiert durchgelassen.
     #[test]
-    fn test_check_hop_accepts_allowed_https_url() {
+    fn test_check_hop_accepts_allowed_https_url() -> TestResult {
         let target = check_hop(
-            &policy(&["docs.rs"], false),
+            &policy(&["docs.rs"], false)?,
             &scope(&["docs.rs"]),
             false,
             " HTTPS://Static.Docs.RS/x ",
             0,
         )
-        .expect("erlaubt");
+        .map_err(ctx("erlaubt"))?;
         assert_eq!(target.url(), "https://static.docs.rs/x");
         assert_eq!(target.host(), "static.docs.rs");
+        Ok(())
     }
 
     /// IP-Literale werden per Adressklasse abgelehnt, auch wenn sie in der
     /// Allowlist stehen; die Meldung nennt keine Adresse.
     #[test]
-    fn test_check_hop_rejects_private_ip_literals_without_leaking_address() {
-        let policy = policy(&["127.0.0.1", "10.0.0.5", "docs.rs"], false);
+    fn test_check_hop_rejects_private_ip_literals_without_leaking_address() -> TestResult {
+        let policy = policy(&["127.0.0.1", "10.0.0.5", "docs.rs"], false)?;
         let scope = scope(&["127.0.0.1", "10.0.0.5", "docs.rs"]);
         for url in [
             "https://127.0.0.1/",
@@ -335,73 +343,101 @@ mod tests {
             "https://[::ffff:127.0.0.1]/",
             "https://2130706433/",
         ] {
-            let err = check_hop(&policy, &scope, false, url, 1).expect_err(url);
-            assert!(matches!(err, WebToolError::EgressDenied { .. }), "{url}: {err:?}");
+            let Err(err) = check_hop(&policy, &scope, false, url, 1) else {
+                return Err(TestError::Unexpected(format!("Err erwartet für {url}")));
+            };
+            assert!(
+                matches!(err, WebToolError::EgressDenied { .. }),
+                "{url}: {err:?}"
+            );
             let message = err.to_string();
             for leaked in ["127.0.0.1", "10.0.0.5", "2130706433", "::ffff"] {
                 assert!(!message.contains(leaked), "{url}: Adresse in {message}");
             }
         }
+        Ok(())
     }
 
     /// Cloud-Metadaten bleiben auch mit `allow_private` gesperrt.
     #[test]
-    fn test_check_hop_rejects_metadata_even_with_allow_private() {
-        let err = check_hop(
-            &policy(&["169.254.169.254"], true),
+    fn test_check_hop_rejects_metadata_even_with_allow_private() -> TestResult {
+        let Err(err) = check_hop(
+            &policy(&["169.254.169.254"], true)?,
             &scope(&["169.254.169.254"]),
             true,
             "http://169.254.169.254/latest/meta-data/",
             2,
-        )
-        .expect_err("Metadaten-Endpunkt");
+        ) else {
+            return Err(TestError::Unexpected(
+                "Err erwartet für Metadaten-Endpunkt".into(),
+            ));
+        };
         match err {
             WebToolError::EgressDenied { reason } => {
                 assert!(reason.contains("cloud-metadata"), "{reason}");
                 assert!(!reason.contains("169.254"), "{reason}");
             }
-            other => panic!("unerwartet: {other:?}"),
+            other => return Err(TestError::Unexpected(format!("unerwartet: {other:?}"))),
         }
+        Ok(())
     }
 
     /// Host außerhalb der Policy wird abgelehnt, bevor der Scope zählt.
     #[test]
-    fn test_check_hop_rejects_host_outside_policy() {
-        let err = check_hop(
-            &policy(&["docs.rs"], false),
+    fn test_check_hop_rejects_host_outside_policy() -> TestResult {
+        let Err(err) = check_hop(
+            &policy(&["docs.rs"], false)?,
             &scope(&["docs.rs", "evil.test"]),
             false,
             "https://evil.test/",
             1,
-        )
-        .expect_err("nicht in der Policy");
+        ) else {
+            return Err(TestError::Unexpected(
+                "Err erwartet: Host nicht in der Policy".into(),
+            ));
+        };
         assert!(matches!(err, WebToolError::EgressDenied { .. }), "{err:?}");
+        Ok(())
     }
 
     /// Policy erlaubt, Sandbox-Scope nicht → abgelehnt.
     #[test]
-    fn test_check_hop_rejects_host_outside_sandbox_scope() {
-        let err = check_hop(
-            &policy(&["docs.rs", "crates.io"], false),
+    fn test_check_hop_rejects_host_outside_sandbox_scope() -> TestResult {
+        let Err(err) = check_hop(
+            &policy(&["docs.rs", "crates.io"], false)?,
             &scope(&["docs.rs"]),
             false,
             "https://crates.io/",
             0,
-        )
-        .expect_err("nicht im Scope");
-        assert!(matches!(err, WebToolError::RedirectHostNotAllowed { .. }), "{err:?}");
+        ) else {
+            return Err(TestError::Unexpected(
+                "Err erwartet: Host nicht im Scope".into(),
+            ));
+        };
+        assert!(
+            matches!(err, WebToolError::RedirectHostNotAllowed { .. }),
+            "{err:?}"
+        );
+        Ok(())
     }
 
     /// `http://` nur mit Freigabe; andere Schemata nie.
     #[test]
-    fn test_check_hop_http_requires_explicit_opt_in() {
-        let policy = policy(&["docs.rs"], false);
+    fn test_check_hop_http_requires_explicit_opt_in() -> TestResult {
+        let policy = policy(&["docs.rs"], false)?;
         let scope = scope(&["docs.rs"]);
-        let err = check_hop(&policy, &scope, false, "http://docs.rs/", 0).expect_err("http");
-        assert!(matches!(err, WebToolError::SchemeNotAllowed { .. }), "{err:?}");
+        let Err(err) = check_hop(&policy, &scope, false, "http://docs.rs/", 0) else {
+            return Err(TestError::Unexpected("Err erwartet für http".into()));
+        };
+        assert!(
+            matches!(err, WebToolError::SchemeNotAllowed { .. }),
+            "{err:?}"
+        );
         assert!(check_hop(&policy, &scope, true, "http://docs.rs/", 0).is_ok());
         for url in ["file:///etc/passwd", "ftp://docs.rs/", "data:text/html,x"] {
-            let err = check_hop(&policy, &scope, true, url, 0).expect_err(url);
+            let Err(err) = check_hop(&policy, &scope, true, url, 0) else {
+                return Err(TestError::Unexpected(format!("Err erwartet für {url}")));
+            };
             assert!(
                 matches!(
                     err,
@@ -410,12 +446,13 @@ mod tests {
                 "{url}: {err:?}"
             );
         }
+        Ok(())
     }
 
     /// Userinfo und `\\@`-Tricks landen nie beim erlaubten Host.
     #[test]
-    fn test_check_hop_rejects_userinfo_and_backslash_confusion() {
-        let policy = policy(&["docs.rs"], false);
+    fn test_check_hop_rejects_userinfo_and_backslash_confusion() -> TestResult {
+        let policy = policy(&["docs.rs"], false)?;
         let scope = scope(&["docs.rs"]);
         assert!(matches!(
             check_hop(&policy, &scope, false, "https://user:pw@docs.rs/", 0),
@@ -425,33 +462,41 @@ mod tests {
             check_hop(&policy, &scope, false, "https://evil.com\\@docs.rs/", 0),
             Err(WebToolError::EgressDenied { .. })
         ));
+        Ok(())
     }
 
     /// Redirect-Hop-Logik: aufgelöstes Ziel auf private IP wird abgelehnt und
     /// die Meldung nennt nur den Platzhalter.
     #[test]
-    fn test_resolve_location_then_check_hop_rejects_private_redirect() {
-        let policy = policy(&["docs.rs"], false);
+    fn test_resolve_location_then_check_hop_rejects_private_redirect() -> TestResult {
+        let policy = policy(&["docs.rs"], false)?;
         let scope = scope(&["docs.rs"]);
         let next = resolve_location("https://docs.rs/a", "https://192.168.1.1/x", 1)
-            .expect("auflösbar");
-        let err = check_hop(&policy, &scope, false, &next, 1).expect_err("privat");
+            .map_err(ctx("auflösbar"))?;
+        let Err(err) = check_hop(&policy, &scope, false, &next, 1) else {
+            return Err(TestError::Unexpected("Err erwartet: privat".into()));
+        };
         assert!(matches!(err, WebToolError::EgressDenied { .. }), "{err:?}");
         assert!(!err.to_string().contains("192.168"), "{err}");
 
-        let relative = resolve_location("https://docs.rs/a/b", "/c?d", 1).expect("relativ");
+        let relative =
+            resolve_location("https://docs.rs/a/b", "/c?d", 1).map_err(ctx("relativ"))?;
         assert_eq!(relative, "https://docs.rs/c?d");
         assert!(check_hop(&policy, &scope, false, &relative, 1).is_ok());
+        Ok(())
     }
 
     /// Unauflösbare Location meldet nur den Platzhalter.
     #[test]
-    fn test_resolve_location_invalid_base_uses_placeholder() {
-        let err = resolve_location("kein url", "http://10.1.1.1/", 3).expect_err("Basis");
+    fn test_resolve_location_invalid_base_uses_placeholder() -> TestResult {
+        let Err(err) = resolve_location("kein url", "http://10.1.1.1/", 3) else {
+            return Err(TestError::Unexpected("Err erwartet: Basis".into()));
+        };
         match err {
             WebToolError::HostNotResolvable { url } => assert_eq!(url, "<Weiterleitung 3>"),
-            other => panic!("unerwartet: {other:?}"),
+            other => return Err(TestError::Unexpected(format!("unerwartet: {other:?}"))),
         }
+        Ok(())
     }
 
     /// IP-Literale werden in Meldungen neutralisiert, Namen nicht.

@@ -57,6 +57,7 @@ admitted = [
   "fs.search",
   "fs.glob",
   "fs.grep",
+  "doc.read_pdf",
   "agents.validate",
   "agents.list_proposals",
   "agents.write_definition",

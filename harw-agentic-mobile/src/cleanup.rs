@@ -170,10 +170,12 @@ impl std::error::Error for CleanupError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
-    fn proposal() -> CleanupProposal {
-        CleanupProposal::new(
-            ProposalId::parse("proposal-42").unwrap(),
+    fn proposal() -> TestResult<CleanupProposal> {
+        let id = ProposalId::parse("proposal-42").map_err(ctx("ProposalId parsen"))?;
+        let proposal = CleanupProposal::new(
+            id,
             CleanupCandidate {
                 document_ref: "content://media/external/downloads/42".into(),
                 display_name: "old-installer.apk".into(),
@@ -182,12 +184,13 @@ mod tests {
                 explanation: "APK was downloaded 14 months ago.".into(),
             },
         )
-        .unwrap()
+        .map_err(ctx("CleanupProposal erstellen"))?;
+        Ok(proposal)
     }
 
     #[test]
-    fn approval_can_only_move_to_quarantine() {
-        let reviewed = proposal().decide(Decision::Approve);
+    fn approval_can_only_move_to_quarantine() -> TestResult {
+        let reviewed = proposal()?.decide(Decision::Approve);
         assert_eq!(reviewed.status(), ProposalStatus::ApprovedForQuarantine);
         assert_eq!(
             reviewed.disposition(),
@@ -195,12 +198,14 @@ mod tests {
                 document_ref: "content://media/external/downloads/42".into()
             }
         );
+        Ok(())
     }
 
     #[test]
-    fn rejection_keeps_the_original_document() {
-        let reviewed = proposal().decide(Decision::Reject);
+    fn rejection_keeps_the_original_document() -> TestResult {
+        let reviewed = proposal()?.decide(Decision::Reject);
         assert_eq!(reviewed.status(), ProposalStatus::Rejected);
         assert!(matches!(reviewed.disposition(), Disposition::Keep { .. }));
+        Ok(())
     }
 }

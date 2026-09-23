@@ -415,6 +415,7 @@ fn push_evidence_unique(
 mod tests {
     use super::*;
     use crate::ids::{ContractRef, PathOrSymbol, PlanId, RevisionId};
+    use crate::test_support::{TestError, TestResult};
     use crate::types::{Criterion, InvalidationCondition, VerificationStep};
     use time::Duration;
 
@@ -491,18 +492,18 @@ mod tests {
         }
     }
 
-    fn find<'a>(plan: &'a Plan, id: &str) -> &'a PlanNode {
+    fn find<'a>(plan: &'a Plan, id: &str) -> TestResult<&'a PlanNode> {
         let wanted = TaskId::new(id);
-        match plan.nodes.iter().find(|node| node.id == wanted) {
-            Some(node) => node,
-            None => panic!("Knoten '{id}' fehlt im Plan"),
-        }
+        plan.nodes
+            .iter()
+            .find(|node| node.id == wanted)
+            .ok_or(TestError::Missing("Knoten im Plan"))
     }
 
     // ── AddNode ───────────────────────────────────────────────────────────
 
     #[test]
-    fn test_add_node_overwrites_payload_timestamps() {
+    fn test_add_node_overwrites_payload_timestamps() -> TestResult {
         let mut plan = make_plan(Vec::new());
         let action = PlanAction::AddNode {
             node: make_node("t1", PlanNodeStatus::Draft),
@@ -511,14 +512,15 @@ mod tests {
         apply_mutation(&mut plan, &action, "worker", now());
 
         assert_eq!(plan.nodes.len(), 1);
-        let node = find(&plan, "t1");
+        let node = find(&plan, "t1")?;
         assert_eq!(node.created_at, now());
         assert_eq!(node.updated_at, now());
         assert_eq!(node.status, PlanNodeStatus::Draft);
+        Ok(())
     }
 
     #[test]
-    fn test_add_node_keeps_payload_parent() {
+    fn test_add_node_keeps_payload_parent() -> TestResult {
         let mut plan = make_plan(Vec::new());
         let mut node = make_node("t1", PlanNodeStatus::Draft);
         node.parent = Some(TaskId::new("t-root"));
@@ -526,13 +528,14 @@ mod tests {
 
         apply_mutation(&mut plan, &action, "worker", now());
 
-        assert_eq!(find(&plan, "t1").parent, Some(TaskId::new("t-root")));
+        assert_eq!(find(&plan, "t1")?.parent, Some(TaskId::new("t-root")));
+        Ok(())
     }
 
     // ── UpdateNode / NodePatch ────────────────────────────────────────────
 
     #[test]
-    fn test_update_node_patch_objective() {
+    fn test_update_node_patch_objective() -> TestResult {
         let mut plan = make_plan(vec![make_node("t1", PlanNodeStatus::Draft)]);
         let action = PlanAction::UpdateNode {
             id: TaskId::new("t1"),
@@ -544,7 +547,7 @@ mod tests {
 
         apply_mutation(&mut plan, &action, "worker", now());
 
-        let node = find(&plan, "t1");
+        let node = find(&plan, "t1")?;
         assert_eq!(node.objective, "neues Ziel");
         assert_eq!(node.updated_at, now());
         assert_eq!(
@@ -552,10 +555,11 @@ mod tests {
             payload_time(),
             "UpdateNode darf created_at nicht anfassen"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_update_node_patch_kind() {
+    fn test_update_node_patch_kind() -> TestResult {
         let mut plan = make_plan(vec![make_node("t1", PlanNodeStatus::Draft)]);
         let action = PlanAction::UpdateNode {
             id: TaskId::new("t1"),
@@ -567,11 +571,12 @@ mod tests {
 
         apply_mutation(&mut plan, &action, "worker", now());
 
-        assert_eq!(find(&plan, "t1").kind, PlanNodeKind::Research);
+        assert_eq!(find(&plan, "t1")?.kind, PlanNodeKind::Research);
+        Ok(())
     }
 
     #[test]
-    fn test_update_node_patch_wave_sets_and_clears() {
+    fn test_update_node_patch_wave_sets_and_clears() -> TestResult {
         let mut plan = make_plan(vec![make_node("t1", PlanNodeStatus::Draft)]);
 
         let set = PlanAction::UpdateNode {
@@ -582,7 +587,7 @@ mod tests {
             },
         };
         apply_mutation(&mut plan, &set, "worker", now());
-        assert_eq!(find(&plan, "t1").wave, Some(3));
+        assert_eq!(find(&plan, "t1")?.wave, Some(3));
 
         // Äußeres `Some`, inneres `None` löscht die Wellen-Zuordnung.
         let clear = PlanAction::UpdateNode {
@@ -593,11 +598,12 @@ mod tests {
             },
         };
         apply_mutation(&mut plan, &clear, "worker", now());
-        assert_eq!(find(&plan, "t1").wave, None);
+        assert_eq!(find(&plan, "t1")?.wave, None);
+        Ok(())
     }
 
     #[test]
-    fn test_update_node_patch_wave_untouched_when_outer_none() {
+    fn test_update_node_patch_wave_untouched_when_outer_none() -> TestResult {
         let mut plan = make_plan(vec![make_node("t1", PlanNodeStatus::Draft)]);
         let set = PlanAction::UpdateNode {
             id: TaskId::new("t1"),
@@ -618,11 +624,12 @@ mod tests {
         };
         apply_mutation(&mut plan, &untouched, "worker", now());
 
-        assert_eq!(find(&plan, "t1").wave, Some(5));
+        assert_eq!(find(&plan, "t1")?.wave, Some(5));
+        Ok(())
     }
 
     #[test]
-    fn test_update_node_patch_dependencies() {
+    fn test_update_node_patch_dependencies() -> TestResult {
         let mut plan = make_plan(vec![make_node("t1", PlanNodeStatus::Draft)]);
         let action = PlanAction::UpdateNode {
             id: TaskId::new("t1"),
@@ -634,11 +641,12 @@ mod tests {
 
         apply_mutation(&mut plan, &action, "worker", now());
 
-        assert_eq!(find(&plan, "t1").dependencies, vec![TaskId::new("t0")]);
+        assert_eq!(find(&plan, "t1")?.dependencies, vec![TaskId::new("t0")]);
+        Ok(())
     }
 
     #[test]
-    fn test_update_node_patch_all_scopes() {
+    fn test_update_node_patch_all_scopes() -> TestResult {
         let mut plan = make_plan(vec![make_node("t1", PlanNodeStatus::Draft)]);
         let action = PlanAction::UpdateNode {
             id: TaskId::new("t1"),
@@ -652,17 +660,18 @@ mod tests {
 
         apply_mutation(&mut plan, &action, "worker", now());
 
-        let node = find(&plan, "t1");
+        let node = find(&plan, "t1")?;
         assert_eq!(node.read_scope, vec![PathOrSymbol::new("src/read.rs")]);
         assert_eq!(node.write_scope, vec![PathOrSymbol::new("src/write.rs")]);
         assert_eq!(
             node.forbidden_scope,
             vec![PathOrSymbol::new("src/secret.rs")]
         );
+        Ok(())
     }
 
     #[test]
-    fn test_update_node_patch_contracts() {
+    fn test_update_node_patch_contracts() -> TestResult {
         let mut plan = make_plan(vec![make_node("t1", PlanNodeStatus::Draft)]);
         let action = PlanAction::UpdateNode {
             id: TaskId::new("t1"),
@@ -675,13 +684,14 @@ mod tests {
 
         apply_mutation(&mut plan, &action, "worker", now());
 
-        let node = find(&plan, "t1");
+        let node = find(&plan, "t1")?;
         assert_eq!(node.input_contracts, vec![ContractRef::new("in::A")]);
         assert_eq!(node.output_contracts, vec![ContractRef::new("out::B")]);
+        Ok(())
     }
 
     #[test]
-    fn test_update_node_patch_acceptance_criteria() {
+    fn test_update_node_patch_acceptance_criteria() -> TestResult {
         let mut plan = make_plan(vec![make_node("t1", PlanNodeStatus::Draft)]);
         let action = PlanAction::UpdateNode {
             id: TaskId::new("t1"),
@@ -699,14 +709,15 @@ mod tests {
 
         apply_mutation(&mut plan, &action, "worker", now());
 
-        let node = find(&plan, "t1");
+        let node = find(&plan, "t1")?;
         assert_eq!(node.acceptance_criteria.len(), 1);
         assert_eq!(node.acceptance_criteria[0].description, "cargo test grün");
         assert_eq!(node.acceptance_criteria[0].verification.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_update_node_patch_assignment_sets_and_clears() {
+    fn test_update_node_patch_assignment_sets_and_clears() -> TestResult {
         let mut plan = make_plan(vec![make_node("t1", PlanNodeStatus::Draft)]);
 
         let set = PlanAction::UpdateNode {
@@ -722,7 +733,7 @@ mod tests {
         };
         apply_mutation(&mut plan, &set, "worker", now());
         assert_eq!(
-            find(&plan, "t1").assignment,
+            find(&plan, "t1")?.assignment,
             Some(Assignment {
                 worker: "w-1".to_owned(),
                 attempt: 2,
@@ -738,11 +749,12 @@ mod tests {
             },
         };
         apply_mutation(&mut plan, &clear, "worker", now());
-        assert_eq!(find(&plan, "t1").assignment, None);
+        assert_eq!(find(&plan, "t1")?.assignment, None);
+        Ok(())
     }
 
     #[test]
-    fn test_update_node_with_empty_patch_only_touches_updated_at() {
+    fn test_update_node_with_empty_patch_only_touches_updated_at() -> TestResult {
         let mut plan = make_plan(vec![make_node("t1", PlanNodeStatus::Draft)]);
         let action = PlanAction::UpdateNode {
             id: TaskId::new("t1"),
@@ -751,14 +763,15 @@ mod tests {
 
         apply_mutation(&mut plan, &action, "worker", now());
 
-        let node = find(&plan, "t1");
+        let node = find(&plan, "t1")?;
         assert_eq!(node.objective, "Ziel von t1");
         assert_eq!(node.kind, PlanNodeKind::Coding);
         assert_eq!(node.updated_at, now());
+        Ok(())
     }
 
     #[test]
-    fn test_update_node_with_unknown_id_is_noop() {
+    fn test_update_node_with_unknown_id_is_noop() -> TestResult {
         let mut plan = make_plan(vec![make_node("t1", PlanNodeStatus::Draft)]);
         let action = PlanAction::UpdateNode {
             id: TaskId::new("does-not-exist"),
@@ -771,14 +784,15 @@ mod tests {
         apply_mutation(&mut plan, &action, "worker", now());
 
         assert_eq!(plan.nodes.len(), 1);
-        assert_eq!(find(&plan, "t1").objective, "Ziel von t1");
-        assert_eq!(find(&plan, "t1").updated_at, payload_time());
+        assert_eq!(find(&plan, "t1")?.objective, "Ziel von t1");
+        assert_eq!(find(&plan, "t1")?.updated_at, payload_time());
+        Ok(())
     }
 
     // ── AddDependency ─────────────────────────────────────────────────────
 
     #[test]
-    fn test_add_dependency_is_idempotent() {
+    fn test_add_dependency_is_idempotent() -> TestResult {
         let mut plan = make_plan(vec![
             make_node("t0", PlanNodeStatus::Completed),
             make_node("t1", PlanNodeStatus::Draft),
@@ -791,13 +805,14 @@ mod tests {
         apply_mutation(&mut plan, &action, "worker", now());
         apply_mutation(&mut plan, &action, "worker", now());
 
-        assert_eq!(find(&plan, "t1").dependencies, vec![TaskId::new("t0")]);
+        assert_eq!(find(&plan, "t1")?.dependencies, vec![TaskId::new("t0")]);
+        Ok(())
     }
 
     // ── SetStatus ─────────────────────────────────────────────────────────
 
     #[test]
-    fn test_set_status_in_progress_creates_assignment_from_actor() {
+    fn test_set_status_in_progress_creates_assignment_from_actor() -> TestResult {
         let mut plan = make_plan(vec![make_node("t1", PlanNodeStatus::Ready)]);
         let action = PlanAction::SetStatus {
             id: TaskId::new("t1"),
@@ -807,7 +822,7 @@ mod tests {
 
         apply_mutation(&mut plan, &action, "worker-alpha", now());
 
-        let node = find(&plan, "t1");
+        let node = find(&plan, "t1")?;
         assert_eq!(node.status, PlanNodeStatus::InProgress);
         assert_eq!(
             node.assignment,
@@ -817,10 +832,11 @@ mod tests {
                 job: None,
             })
         );
+        Ok(())
     }
 
     #[test]
-    fn test_set_status_in_progress_keeps_attempt_and_job() {
+    fn test_set_status_in_progress_keeps_attempt_and_job() -> TestResult {
         let mut node = make_node("t1", PlanNodeStatus::Ready);
         node.assignment = Some(Assignment {
             worker: "worker-alt".to_owned(),
@@ -837,17 +853,18 @@ mod tests {
         apply_mutation(&mut plan, &action, "worker-neu", now());
 
         assert_eq!(
-            find(&plan, "t1").assignment,
+            find(&plan, "t1")?.assignment,
             Some(Assignment {
                 worker: "worker-neu".to_owned(),
                 attempt: 3,
                 job: Some("job-7".to_owned()),
             })
         );
+        Ok(())
     }
 
     #[test]
-    fn test_set_status_non_in_progress_does_not_create_assignment() {
+    fn test_set_status_non_in_progress_does_not_create_assignment() -> TestResult {
         let mut plan = make_plan(vec![make_node("t1", PlanNodeStatus::Draft)]);
         let action = PlanAction::SetStatus {
             id: TaskId::new("t1"),
@@ -857,15 +874,16 @@ mod tests {
 
         apply_mutation(&mut plan, &action, "worker", now());
 
-        let node = find(&plan, "t1");
+        let node = find(&plan, "t1")?;
         assert_eq!(node.status, PlanNodeStatus::Ready);
         assert_eq!(node.assignment, None);
+        Ok(())
     }
 
     // ── AttachEvidence ────────────────────────────────────────────────────
 
     #[test]
-    fn test_attach_evidence_sets_attached_at_and_ignores_duplicates() {
+    fn test_attach_evidence_sets_attached_at_and_ignores_duplicates() -> TestResult {
         let mut plan = make_plan(vec![make_node("t1", PlanNodeStatus::InProgress)]);
         let action = PlanAction::AttachEvidence {
             id: TaskId::new("t1"),
@@ -875,14 +893,15 @@ mod tests {
         apply_mutation(&mut plan, &action, "ci", now());
         apply_mutation(&mut plan, &action, "ci", now());
 
-        let node = find(&plan, "t1");
+        let node = find(&plan, "t1")?;
         assert_eq!(node.evidence.len(), 1, "Duplikat muss ignoriert werden");
         assert_eq!(node.evidence[0].kind, EvidenceKind::CargoTest);
         assert_eq!(node.evidence[0].attached_at, now());
+        Ok(())
     }
 
     #[test]
-    fn test_attach_evidence_distinguishes_kind_and_locator() {
+    fn test_attach_evidence_distinguishes_kind_and_locator() -> TestResult {
         let mut plan = make_plan(vec![make_node("t1", PlanNodeStatus::InProgress)]);
 
         for evidence in [
@@ -901,13 +920,14 @@ mod tests {
             );
         }
 
-        assert_eq!(find(&plan, "t1").evidence.len(), 3);
+        assert_eq!(find(&plan, "t1")?.evidence.len(), 3);
+        Ok(())
     }
 
     // ── Invalidate ────────────────────────────────────────────────────────
 
     #[test]
-    fn test_invalidate_sets_status_and_appends_condition() {
+    fn test_invalidate_sets_status_and_appends_condition() -> TestResult {
         let mut plan = make_plan(vec![
             make_node("t1", PlanNodeStatus::Ready),
             make_node("t2", PlanNodeStatus::Draft),
@@ -920,7 +940,7 @@ mod tests {
         apply_mutation(&mut plan, &action, "orchestrator", now());
 
         for id in ["t1", "t2"] {
-            let node = find(&plan, id);
+            let node = find(&plan, id)?;
             assert_eq!(node.status, PlanNodeStatus::Invalidated);
             assert_eq!(node.invalidation_conditions.len(), 1);
             assert!(matches!(
@@ -928,12 +948,13 @@ mod tests {
                 InvalidationCondition::RepoRevisionMoved
             ));
         }
+        Ok(())
     }
 
     // ── Reopen ────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_reopen_resets_to_draft_and_bumps_attempt() {
+    fn test_reopen_resets_to_draft_and_bumps_attempt() -> TestResult {
         let mut node = make_node("t1", PlanNodeStatus::Invalidated);
         node.assignment = Some(Assignment {
             worker: "worker-alpha".to_owned(),
@@ -948,7 +969,7 @@ mod tests {
 
         apply_mutation(&mut plan, &action, "orchestrator", now());
 
-        let node = find(&plan, "t1");
+        let node = find(&plan, "t1")?;
         assert_eq!(node.status, PlanNodeStatus::Draft);
         assert_eq!(
             node.assignment,
@@ -960,10 +981,11 @@ mod tests {
             "Reopen erhöht nur den Versuchszähler"
         );
         assert_eq!(node.updated_at, now());
+        Ok(())
     }
 
     #[test]
-    fn test_reopen_without_assignment_starts_first_attempt() {
+    fn test_reopen_without_assignment_starts_first_attempt() -> TestResult {
         let mut plan = make_plan(vec![make_node("t1", PlanNodeStatus::Invalidated)]);
         let action = PlanAction::Reopen {
             id: TaskId::new("t1"),
@@ -973,17 +995,18 @@ mod tests {
         apply_mutation(&mut plan, &action, "orchestrator", now());
 
         assert_eq!(
-            find(&plan, "t1").assignment,
+            find(&plan, "t1")?.assignment,
             Some(Assignment {
                 worker: "orchestrator".to_owned(),
                 attempt: FIRST_ATTEMPT,
                 job: None,
             })
         );
+        Ok(())
     }
 
     #[test]
-    fn test_reopen_keeps_existing_invalidation_conditions() {
+    fn test_reopen_keeps_existing_invalidation_conditions() -> TestResult {
         let mut node = make_node("t1", PlanNodeStatus::Invalidated);
         node.invalidation_conditions = vec![InvalidationCondition::ManualInvalidate];
         let mut plan = make_plan(vec![node]);
@@ -995,16 +1018,17 @@ mod tests {
         apply_mutation(&mut plan, &action, "orchestrator", now());
 
         assert_eq!(
-            find(&plan, "t1").invalidation_conditions.len(),
+            find(&plan, "t1")?.invalidation_conditions.len(),
             1,
             "Reopen darf keine weitere Invalidierungsbedingung anhängen"
         );
+        Ok(())
     }
 
     // ── Expand ────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_expand_inserts_children_with_parent_and_marks_composite() {
+    fn test_expand_inserts_children_with_parent_and_marks_composite() -> TestResult {
         let mut plan = make_plan(vec![make_node("t-parent", PlanNodeStatus::Draft)]);
         let action = PlanAction::Expand {
             parent: TaskId::new("t-parent"),
@@ -1018,18 +1042,19 @@ mod tests {
 
         assert_eq!(plan.nodes.len(), 3);
         for id in ["t-child-a", "t-child-b"] {
-            let child = find(&plan, id);
+            let child = find(&plan, id)?;
             assert_eq!(child.parent, Some(TaskId::new("t-parent")));
             assert_eq!(child.created_at, now());
             assert_eq!(child.updated_at, now());
         }
-        let parent = find(&plan, "t-parent");
+        let parent = find(&plan, "t-parent")?;
         assert_eq!(parent.kind, PlanNodeKind::Composite);
         assert_eq!(parent.updated_at, now());
+        Ok(())
     }
 
     #[test]
-    fn test_expand_overrides_payload_parent() {
+    fn test_expand_overrides_payload_parent() -> TestResult {
         let mut plan = make_plan(vec![make_node("t-parent", PlanNodeStatus::Draft)]);
         let mut child = make_node("t-child", PlanNodeStatus::Draft);
         child.parent = Some(TaskId::new("t-falsch"));
@@ -1041,16 +1066,17 @@ mod tests {
         apply_mutation(&mut plan, &action, "orchestrator", now());
 
         assert_eq!(
-            find(&plan, "t-child").parent,
+            find(&plan, "t-child")?.parent,
             Some(TaskId::new("t-parent")),
             "die Aktion bestimmt den Parent, nicht die Payload"
         );
+        Ok(())
     }
 
     // ── Condense ──────────────────────────────────────────────────────────
 
     #[test]
-    fn test_condense_transfers_deduplicated_evidence() {
+    fn test_condense_transfers_deduplicated_evidence() -> TestResult {
         let mut first = make_research_node("t-r1");
         first.evidence = vec![
             make_evidence(EvidenceKind::Finding, "f-1"),
@@ -1070,7 +1096,7 @@ mod tests {
         };
         apply_mutation(&mut plan, &action, "orchestrator", now());
 
-        let replacement = find(&plan, "t-contract");
+        let replacement = find(&plan, "t-contract")?;
         let locators: Vec<&str> = replacement
             .evidence
             .iter()
@@ -1091,10 +1117,11 @@ mod tests {
             payload_time(),
             "übertragene Evidenz behält ihren ursprünglichen Zeitstempel"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_condense_records_summary_and_supersedes_sources() {
+    fn test_condense_records_summary_and_supersedes_sources() -> TestResult {
         let mut plan = make_plan(vec![make_research_node("t-r1")]);
         let action = PlanAction::Condense {
             superseded: vec![TaskId::new("t-r1")],
@@ -1104,9 +1131,9 @@ mod tests {
 
         apply_mutation(&mut plan, &action, "orchestrator", now());
 
-        assert_eq!(find(&plan, "t-r1").status, PlanNodeStatus::Superseded);
+        assert_eq!(find(&plan, "t-r1")?.status, PlanNodeStatus::Superseded);
 
-        let replacement = find(&plan, "t-contract");
+        let replacement = find(&plan, "t-contract")?;
         assert_eq!(
             replacement.objective, "Ziel von t-contract",
             "die Zusammenfassung darf das Ziel nicht überschreiben"
@@ -1122,10 +1149,11 @@ mod tests {
             Some(harw_types::ContentDigest::of("Ergebnis".as_bytes())),
             "die Condense-Zusammenfassung liegt als String vor und muss einen Digest tragen"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_condense_ignores_unknown_superseded_ids() {
+    fn test_condense_ignores_unknown_superseded_ids() -> TestResult {
         let mut plan = make_plan(vec![make_research_node("t-r1")]);
         let action = PlanAction::Condense {
             superseded: vec![TaskId::new("t-r1"), TaskId::new("t-unbekannt")],
@@ -1136,13 +1164,14 @@ mod tests {
         apply_mutation(&mut plan, &action, "orchestrator", now());
 
         assert_eq!(plan.nodes.len(), 2);
-        assert_eq!(find(&plan, "t-contract").evidence.len(), 1);
+        assert_eq!(find(&plan, "t-contract")?.evidence.len(), 1);
+        Ok(())
     }
 
     // ── Supersede ─────────────────────────────────────────────────────────
 
     #[test]
-    fn test_supersede_sets_parent_revision_and_supersedes_open_nodes() {
+    fn test_supersede_sets_parent_revision_and_supersedes_open_nodes() -> TestResult {
         let mut plan = make_plan(vec![
             make_node("t-draft", PlanNodeStatus::Draft),
             make_node("t-ready", PlanNodeStatus::Ready),
@@ -1161,13 +1190,14 @@ mod tests {
             "die Revision setzt der Store, nicht die Mutation"
         );
         for id in ["t-draft", "t-ready", "t-blocked"] {
-            assert_eq!(find(&plan, id).status, PlanNodeStatus::Superseded);
-            assert_eq!(find(&plan, id).updated_at, now());
+            assert_eq!(find(&plan, id)?.status, PlanNodeStatus::Superseded);
+            assert_eq!(find(&plan, id)?.updated_at, now());
         }
+        Ok(())
     }
 
     #[test]
-    fn test_supersede_keeps_terminal_node_status() {
+    fn test_supersede_keeps_terminal_node_status() -> TestResult {
         let mut plan = make_plan(vec![
             make_node("t-completed", PlanNodeStatus::Completed),
             make_node("t-invalidated", PlanNodeStatus::Invalidated),
@@ -1178,22 +1208,26 @@ mod tests {
 
         apply_mutation(&mut plan, &action, "orchestrator", now());
 
-        assert_eq!(find(&plan, "t-completed").status, PlanNodeStatus::Completed);
         assert_eq!(
-            find(&plan, "t-invalidated").status,
+            find(&plan, "t-completed")?.status,
+            PlanNodeStatus::Completed
+        );
+        assert_eq!(
+            find(&plan, "t-invalidated")?.status,
             PlanNodeStatus::Invalidated
         );
         assert_eq!(
-            find(&plan, "t-completed").updated_at,
+            find(&plan, "t-completed")?.updated_at,
             payload_time(),
             "unveränderte Knoten dürfen keinen neuen Zeitstempel bekommen"
         );
+        Ok(())
     }
 
     // ── No-ops ────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_bind_goal_sets_goal_id() {
+    fn test_bind_goal_sets_goal_id() -> TestResult {
         let mut plan = make_plan(vec![make_node("t1", PlanNodeStatus::Draft)]);
         let action = PlanAction::BindGoal {
             goal_id: "g-1".to_owned(),
@@ -1201,16 +1235,21 @@ mod tests {
 
         apply_mutation(&mut plan, &action, "owner", now());
 
-        assert_eq!(plan.goal_id.as_deref(), Some("g-1"), "F-126: goal_id gesetzt");
+        assert_eq!(
+            plan.goal_id.as_deref(),
+            Some("g-1"),
+            "F-126: goal_id gesetzt"
+        );
         assert_eq!(
             plan.goal_statement, "Mutationstests",
             "BindGoal darf goal_statement nicht überschreiben"
         );
-        assert_eq!(find(&plan, "t1").updated_at, payload_time());
+        assert_eq!(find(&plan, "t1")?.updated_at, payload_time());
+        Ok(())
     }
 
     #[test]
-    fn test_add_node_clamps_future_evidence_timestamp() {
+    fn test_add_node_clamps_future_evidence_timestamp() -> TestResult {
         let mut plan = make_plan(Vec::new());
         let mut node = make_node("t1", PlanNodeStatus::Draft);
         let mut future = make_evidence(EvidenceKind::Finding, "q-1");
@@ -1221,17 +1260,18 @@ mod tests {
 
         apply_mutation(&mut plan, &PlanAction::AddNode { node }, "worker", now());
 
-        let node = find(&plan, "t1");
+        let node = find(&plan, "t1")?;
         assert_eq!(node.evidence[0].attached_at, now(), "Zukunft wird gekappt");
         assert_eq!(
             node.evidence[1].attached_at,
             now() - Duration::hours(1),
             "Vergangenheit bleibt"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_attach_evidence_duplicate_refreshes_attached_at() {
+    fn test_attach_evidence_duplicate_refreshes_attached_at() -> TestResult {
         let mut plan = make_plan(vec![make_node("t1", PlanNodeStatus::Draft)]);
         let action = PlanAction::AttachEvidence {
             id: TaskId::new("t1"),
@@ -1242,13 +1282,14 @@ mod tests {
         let later = now() + Duration::hours(30);
         apply_mutation(&mut plan, &action, "explorer", later);
 
-        let node = find(&plan, "t1");
+        let node = find(&plan, "t1")?;
         assert_eq!(node.evidence.len(), 1);
         assert_eq!(node.evidence[0].attached_at, later, "G-014: Frist erneuert");
+        Ok(())
     }
 
     #[test]
-    fn test_create_and_inspect_are_noops() {
+    fn test_create_and_inspect_are_noops() -> TestResult {
         let mut plan = make_plan(vec![make_node("t1", PlanNodeStatus::Draft)]);
 
         apply_mutation(
@@ -1265,6 +1306,7 @@ mod tests {
         assert_eq!(plan.id, PlanId::new("p-mutation"));
         assert_eq!(plan.goal_statement, "Mutationstests");
         assert_eq!(plan.nodes.len(), 1);
-        assert_eq!(find(&plan, "t1").updated_at, payload_time());
+        assert_eq!(find(&plan, "t1")?.updated_at, payload_time());
+        Ok(())
     }
 }

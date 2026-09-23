@@ -176,6 +176,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{bounded_function_declaration, channel_value};
+    use crate::test_support::{TestResult, ctx};
     use harw_browser::ids::BrowserContextId;
     use harw_browser::page_bridge::{PageBridgeInstallRequest, PageBridgePolicy};
     use serde_json::json;
@@ -196,9 +197,9 @@ mod tests {
     }
 
     #[test]
-    fn generated_preload_function_receives_channel_and_enforces_bounds() {
+    fn generated_preload_function_receives_channel_and_enforces_bounds() -> TestResult {
         let policy = PageBridgePolicy::new(512, 3, Duration::from_secs(2))
-            .expect("valid page bridge policy");
+            .map_err(ctx("valid page bridge policy"))?;
         let request = PageBridgeInstallRequest::new(
             BrowserContextId::new(),
             "erp-chat",
@@ -206,7 +207,7 @@ mod tests {
             "const observer = new MutationObserver(() => emit({ schema: 'v1' }));",
             policy,
         )
-        .expect("valid page bridge request");
+        .map_err(ctx("valid page bridge request"))?;
 
         let source = bounded_function_declaration(&request);
         assert!(source.starts_with("(channel) =>"));
@@ -216,5 +217,6 @@ mod tests {
         assert!(source.contains("byteLength > policy.maxPayloadBytes"));
         assert!(source.contains("sentInWindow >= policy.maxMessages"));
         assert!(source.contains("const __harwBridge = Object.freeze({ emit, policy })"));
+        Ok(())
     }
 }

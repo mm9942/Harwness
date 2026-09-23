@@ -142,10 +142,16 @@ impl GeckodriverPin {
         let metadata = std::fs::symlink_metadata(&self.path)
             .map_err(|error| pin_error(&self.path, format!("cannot stat geckodriver: {error}")))?;
         if metadata.file_type().is_symlink() {
-            return Err(pin_error(&self.path, "geckodriver path must not be a symbolic link"));
+            return Err(pin_error(
+                &self.path,
+                "geckodriver path must not be a symbolic link",
+            ));
         }
         if !metadata.is_file() {
-            return Err(pin_error(&self.path, "geckodriver path is not a regular file"));
+            return Err(pin_error(
+                &self.path,
+                "geckodriver path is not a regular file",
+            ));
         }
         if metadata.len() > MAX_GECKODRIVER_BYTES {
             return Err(pin_error(
@@ -355,7 +361,10 @@ pub trait BrowserLauncher: Send + Sync + fmt::Debug {
     ///
     /// # Errors
     /// - [`AdapterError::Launch`]: spawn or readiness failure.
-    async fn spawn(&self, prepared: &PreparedLaunch) -> Result<Box<dyn DriverProcess>, AdapterError>;
+    async fn spawn(
+        &self,
+        prepared: &PreparedLaunch,
+    ) -> Result<Box<dyn DriverProcess>, AdapterError>;
 }
 
 /// A spawned driver together with the audited launch description.
@@ -410,19 +419,20 @@ pub fn validate_prepared_launch(
     if !Path::new(program).is_absolute() {
         return Err(launch_error("sandbox program path must be absolute"));
     }
-    if let Some(forbidden) = prepared
-        .argv
-        .iter()
-        .find(|arg| FORBIDDEN_SANDBOX_ARGS.iter().any(|f| OsStr::new(f) == arg.as_os_str()))
-    {
+    if let Some(forbidden) = prepared.argv.iter().find(|arg| {
+        FORBIDDEN_SANDBOX_ARGS
+            .iter()
+            .any(|f| OsStr::new(f) == arg.as_os_str())
+    }) {
         return Err(launch_error(format!(
             "sandbox command line contains forbidden argument {forbidden:?}"
         )));
     }
-    let unshares_network = prepared
-        .argv
-        .iter()
-        .any(|arg| REQUIRED_NETNS_ARGS.iter().any(|r| OsStr::new(r) == arg.as_os_str()));
+    let unshares_network = prepared.argv.iter().any(|arg| {
+        REQUIRED_NETNS_ARGS
+            .iter()
+            .any(|r| OsStr::new(r) == arg.as_os_str())
+    });
     if !unshares_network {
         return Err(launch_error(
             "sandbox command line must unshare the network namespace (--unshare-net or --unshare-all)",
@@ -464,7 +474,10 @@ pub fn validate_prepared_launch(
         )));
     }
     let ports = command.ports();
-    if relay.listen_port == 0 || relay.listen_port == ports.webdriver || relay.listen_port == ports.bidi {
+    if relay.listen_port == 0
+        || relay.listen_port == ports.webdriver
+        || relay.listen_port == ports.bidi
+    {
         return Err(launch_error(
             "relay listen port must be nonzero and distinct from the geckodriver ports",
         ));
@@ -492,7 +505,9 @@ pub async fn launch_pinned_driver(
     let pin_for_hash = pin.clone();
     let verified = tokio::task::spawn_blocking(move || pin_for_hash.verify())
         .await
-        .map_err(|error| launch_error(format!("geckodriver verification task failed: {error}")))??;
+        .map_err(|error| {
+            launch_error(format!("geckodriver verification task failed: {error}"))
+        })??;
     let command = GeckodriverCommand::new(verified, launcher.driver_ports())?;
     let prepared = launcher.prepare(&command)?;
     if let Err(error) = validate_prepared_launch(&command, &prepared) {
@@ -525,7 +540,10 @@ fn sha256_file(path: &Path) -> Result<[u8; 32], AdapterError> {
         }
         total = total.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
         if total > MAX_GECKODRIVER_BYTES {
-            return Err(pin_error(path, "geckodriver grew beyond the size limit while hashing"));
+            return Err(pin_error(
+                path,
+                "geckodriver grew beyond the size limit while hashing",
+            ));
         }
         hasher.update(&buffer[..read]);
     }
@@ -582,6 +600,7 @@ fn launch_error(detail: impl Into<String>) -> AdapterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Temporary file removed on drop; test-only helper.
@@ -591,18 +610,19 @@ mod tests {
     }
 
     impl TempFile {
-        fn new(contents: &[u8]) -> Self {
-            let dir = std::env::temp_dir().join(format!("harw-geckodriver-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir(&dir).expect("temp dir is created");
+        fn new(contents: &[u8]) -> TestResult<Self> {
+            let dir =
+                std::env::temp_dir().join(format!("harw-geckodriver-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&dir).map_err(ctx("temp dir is created"))?;
             let path = dir.join("geckodriver");
-            std::fs::write(&path, contents).expect("temp geckodriver is written");
+            std::fs::write(&path, contents).map_err(ctx("temp geckodriver is written"))?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                    .expect("permissions are set");
+                    .map_err(ctx("permissions are set"))?;
             }
-            Self { dir, path }
+            Ok(Self { dir, path })
         }
     }
 
@@ -616,11 +636,10 @@ mod tests {
         hex(&Sha256::digest(bytes))
     }
 
-    fn verified(file: &TempFile, contents: &[u8]) -> VerifiedGeckodriver {
-        GeckodriverPin::new(file.path.to_path_buf(), &sha256_hex_of(contents))
-            .expect("valid pin")
-            .verify()
-            .expect("matching hash verifies")
+    fn verified(file: &TempFile, contents: &[u8]) -> TestResult<VerifiedGeckodriver> {
+        let pin = GeckodriverPin::new(file.path.to_path_buf(), &sha256_hex_of(contents))
+            .map_err(ctx("valid pin"))?;
+        pin.verify().map_err(ctx("matching hash verifies"))
     }
 
     const PORTS: DriverPorts = DriverPorts {
@@ -628,7 +647,10 @@ mod tests {
         bidi: 9222,
     };
 
-    fn good_prepared(command: &GeckodriverCommand) -> PreparedLaunch {
+    /// Baut eine gültige [`PreparedLaunch`]-Fixtur. Gibt `Result` zurück (statt
+    /// zu paniken), weil dieselbe Funktion auch aus `FakeLauncher::prepare`
+    /// (Trait-Signatur `Result<PreparedLaunch, AdapterError>`) aufgerufen wird.
+    fn good_prepared(command: &GeckodriverCommand) -> Result<PreparedLaunch, AdapterError> {
         let mut argv: Vec<OsString> = [
             "/usr/bin/bwrap",
             "--unshare-all",
@@ -644,15 +666,19 @@ mod tests {
         .map(OsString::from)
         .collect();
         argv.extend(command.argv().iter().cloned());
-        PreparedLaunch {
+        Ok(PreparedLaunch {
             argv,
-            webdriver_url: url::Url::parse("http://127.0.0.1:4444/").expect("valid url"),
+            webdriver_url: url::Url::parse("http://127.0.0.1:4444/").map_err(|_| {
+                AdapterError::Launch {
+                    detail: "invalid fixture url".to_owned(),
+                }
+            })?,
             relay: RelayEndpoint {
                 binary: PathBuf::from("/usr/libexec/harw/harw-netns-relay"),
                 listen_port: 1080,
                 proxy_socket: PathBuf::from("/run/user/1000/harw/egress.sock"),
             },
-        }
+        })
     }
 
     #[derive(Debug)]
@@ -677,78 +703,101 @@ mod tests {
         }
 
         fn prepare(&self, command: &GeckodriverCommand) -> Result<PreparedLaunch, AdapterError> {
-            let mut prepared = good_prepared(command);
+            let mut prepared = good_prepared(command)?;
             if self.share_net {
                 prepared.argv.insert(1, OsString::from("--share-net"));
             }
             Ok(prepared)
         }
 
-        async fn spawn(&self, _prepared: &PreparedLaunch) -> Result<Box<dyn DriverProcess>, AdapterError> {
+        async fn spawn(
+            &self,
+            _prepared: &PreparedLaunch,
+        ) -> Result<Box<dyn DriverProcess>, AdapterError> {
             self.spawns.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(FakeProcess))
         }
     }
 
     #[test]
-    fn test_geckodriver_pin_new_rejects_relative_path_and_bad_digest() {
+    fn test_geckodriver_pin_new_rejects_relative_path_and_bad_digest() -> TestResult {
         let digest = "a".repeat(64);
         assert!(matches!(
             GeckodriverPin::new(PathBuf::from("geckodriver"), &digest),
             Err(AdapterError::DriverPin { .. })
         ));
-        for bad in ["A".repeat(64), "a".repeat(63), "g".repeat(64), String::new()] {
+        for bad in [
+            "A".repeat(64),
+            "a".repeat(63),
+            "g".repeat(64),
+            String::new(),
+        ] {
             assert!(matches!(
                 GeckodriverPin::new(PathBuf::from("/opt/geckodriver"), &bad),
                 Err(AdapterError::DriverPin { .. })
             ));
         }
-        let pin = GeckodriverPin::new(PathBuf::from("/opt/geckodriver"), &digest).expect("valid pin");
+        let pin = GeckodriverPin::new(PathBuf::from("/opt/geckodriver"), &digest)
+            .map_err(ctx("valid pin"))?;
         assert_eq!(pin.sha256_hex(), digest);
+        Ok(())
     }
 
     #[test]
-    fn test_geckodriver_pin_verify_accepts_matching_hash() {
+    fn test_geckodriver_pin_verify_accepts_matching_hash() -> TestResult {
         let contents = b"#!/bin/false\npinned geckodriver fixture\n";
-        let file = TempFile::new(contents);
-        let token = verified(&file, contents);
+        let file = TempFile::new(contents)?;
+        let token = verified(&file, contents)?;
         assert_eq!(token.path(), file.path.as_path());
         assert_eq!(token.sha256_hex(), sha256_hex_of(contents));
+        Ok(())
     }
 
     #[test]
-    fn test_geckodriver_pin_verify_wrong_hash_is_error() {
-        let file = TempFile::new(b"real bytes");
+    fn test_geckodriver_pin_verify_wrong_hash_is_error() -> TestResult {
+        let file = TempFile::new(b"real bytes")?;
         let pin = GeckodriverPin::new(file.path.to_path_buf(), &sha256_hex_of(b"other bytes"))
-            .expect("valid pin");
+            .map_err(ctx("valid pin"))?;
         match pin.verify() {
             Err(AdapterError::DriverPin { detail, .. }) => assert!(detail.contains("mismatch")),
-            other => panic!("wrong hash must be rejected, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "wrong hash must be rejected, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_geckodriver_pin_verify_rejects_symlink_and_world_writable() {
+    fn test_geckodriver_pin_verify_rejects_symlink_and_world_writable() -> TestResult {
         use std::os::unix::fs::PermissionsExt;
         let contents = b"bytes";
-        let file = TempFile::new(contents);
+        let file = TempFile::new(contents)?;
         let link = file.dir.join("link");
-        std::os::unix::fs::symlink(&file.path, &link).expect("symlink is created");
-        let pin = GeckodriverPin::new(link, &sha256_hex_of(contents)).expect("valid pin");
-        assert!(matches!(pin.verify(), Err(AdapterError::DriverPin { detail, .. }) if detail.contains("symbolic link")));
+        std::os::unix::fs::symlink(&file.path, &link).map_err(ctx("symlink is created"))?;
+        let pin = GeckodriverPin::new(link, &sha256_hex_of(contents)).map_err(ctx("valid pin"))?;
+        assert!(
+            matches!(pin.verify(), Err(AdapterError::DriverPin { detail, .. }) if detail.contains("symbolic link"))
+        );
 
         std::fs::set_permissions(&file.path, std::fs::Permissions::from_mode(0o777))
-            .expect("permissions are set");
-        let pin = GeckodriverPin::new(file.path.to_path_buf(), &sha256_hex_of(contents)).expect("valid pin");
-        assert!(matches!(pin.verify(), Err(AdapterError::DriverPin { detail, .. }) if detail.contains("writable")));
+            .map_err(ctx("permissions are set"))?;
+        let pin = GeckodriverPin::new(file.path.to_path_buf(), &sha256_hex_of(contents))
+            .map_err(ctx("valid pin"))?;
+        assert!(
+            matches!(pin.verify(), Err(AdapterError::DriverPin { detail, .. }) if detail.contains("writable"))
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_geckodriver_command_new_builds_loopback_argv_and_rejects_bad_ports() {
+    fn test_geckodriver_command_new_builds_loopback_argv_and_rejects_bad_ports() -> TestResult {
         let contents = b"cmd";
-        let file = TempFile::new(contents);
-        let command = GeckodriverCommand::new(verified(&file, contents), PORTS).expect("valid command");
+        let file = TempFile::new(contents)?;
+        let command = GeckodriverCommand::new(verified(&file, contents)?, PORTS)
+            .map_err(ctx("valid command"))?;
         let argv: Vec<String> = command
             .argv()
             .iter()
@@ -758,57 +807,81 @@ mod tests {
         assert_eq!(
             &argv[1..],
             [
-                "--host", "127.0.0.1", "--port", "4444", "--websocket-port", "9222",
-                "--allow-hosts", "127.0.0.1", "--allow-origins", "http://127.0.0.1:4444",
-                "--log", "warn",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "4444",
+                "--websocket-port",
+                "9222",
+                "--allow-hosts",
+                "127.0.0.1",
+                "--allow-origins",
+                "http://127.0.0.1:4444",
+                "--log",
+                "warn",
             ]
         );
         for ports in [
-            DriverPorts { webdriver: 0, bidi: 9222 },
-            DriverPorts { webdriver: 4444, bidi: 4444 },
+            DriverPorts {
+                webdriver: 0,
+                bidi: 9222,
+            },
+            DriverPorts {
+                webdriver: 4444,
+                bidi: 4444,
+            },
         ] {
             assert!(matches!(
-                GeckodriverCommand::new(verified(&file, contents), ports),
+                GeckodriverCommand::new(verified(&file, contents)?, ports),
                 Err(AdapterError::Launch { .. })
             ));
         }
+        Ok(())
     }
 
     #[test]
-    fn test_validate_prepared_launch_accepts_isolated_command_without_share_net() {
+    fn test_validate_prepared_launch_accepts_isolated_command_without_share_net() -> TestResult {
         let contents = b"ok";
-        let file = TempFile::new(contents);
-        let command = GeckodriverCommand::new(verified(&file, contents), PORTS).expect("valid command");
-        let prepared = good_prepared(&command);
+        let file = TempFile::new(contents)?;
+        let command = GeckodriverCommand::new(verified(&file, contents)?, PORTS)
+            .map_err(ctx("valid command"))?;
+        let prepared = good_prepared(&command).map_err(ctx("good_prepared"))?;
         assert!(!prepared.argv.iter().any(|arg| arg == "--share-net"));
-        validate_prepared_launch(&command, &prepared).expect("isolated launch is accepted");
+        validate_prepared_launch(&command, &prepared)
+            .map_err(ctx("isolated launch is accepted"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_validate_prepared_launch_rejects_unsafe_command_lines() {
+    fn test_validate_prepared_launch_rejects_unsafe_command_lines() -> TestResult {
         let contents = b"bad";
-        let file = TempFile::new(contents);
-        let command = GeckodriverCommand::new(verified(&file, contents), PORTS).expect("valid command");
+        let file = TempFile::new(contents)?;
+        let command = GeckodriverCommand::new(verified(&file, contents)?, PORTS)
+            .map_err(ctx("valid command"))?;
 
-        let mut share_net = good_prepared(&command);
+        let mut share_net = good_prepared(&command).map_err(ctx("good_prepared"))?;
         share_net.argv.insert(2, OsString::from("--share-net"));
-        let mut no_unshare = good_prepared(&command);
-        no_unshare.argv.retain(|arg| arg != "--unshare-net" && arg != "--unshare-all");
-        let mut tampered = good_prepared(&command);
+        let mut no_unshare = good_prepared(&command).map_err(ctx("good_prepared"))?;
+        no_unshare
+            .argv
+            .retain(|arg| arg != "--unshare-net" && arg != "--unshare-all");
+        let mut tampered = good_prepared(&command).map_err(ctx("good_prepared"))?;
         if let Some(last) = tampered.argv.last_mut() {
             *last = OsString::from("trace");
         }
-        let mut bare = good_prepared(&command);
+        let mut bare = good_prepared(&command).map_err(ctx("good_prepared"))?;
         bare.argv = command.argv().to_vec();
-        let mut remote_url = good_prepared(&command);
-        remote_url.webdriver_url = url::Url::parse("http://10.0.0.2:4444/").expect("valid url");
-        let mut wrong_port = good_prepared(&command);
-        wrong_port.webdriver_url = url::Url::parse("http://127.0.0.1:5555/").expect("valid url");
-        let mut wrong_relay = good_prepared(&command);
+        let mut remote_url = good_prepared(&command).map_err(ctx("good_prepared"))?;
+        remote_url.webdriver_url =
+            url::Url::parse("http://10.0.0.2:4444/").map_err(ctx("valid url"))?;
+        let mut wrong_port = good_prepared(&command).map_err(ctx("good_prepared"))?;
+        wrong_port.webdriver_url =
+            url::Url::parse("http://127.0.0.1:5555/").map_err(ctx("valid url"))?;
+        let mut wrong_relay = good_prepared(&command).map_err(ctx("good_prepared"))?;
         wrong_relay.relay.binary = PathBuf::from("/usr/bin/socat");
-        let mut relay_port_clash = good_prepared(&command);
+        let mut relay_port_clash = good_prepared(&command).map_err(ctx("good_prepared"))?;
         relay_port_clash.relay.listen_port = 9222;
-        let mut relative_program = good_prepared(&command);
+        let mut relative_program = good_prepared(&command).map_err(ctx("good_prepared"))?;
         relative_program.argv[0] = OsString::from("bwrap");
 
         for (name, prepared) in [
@@ -823,36 +896,51 @@ mod tests {
             ("relative program", relative_program),
         ] {
             assert!(
-                matches!(validate_prepared_launch(&command, &prepared), Err(AdapterError::Launch { .. })),
+                matches!(
+                    validate_prepared_launch(&command, &prepared),
+                    Err(AdapterError::Launch { .. })
+                ),
                 "{name} must be rejected"
             );
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_launch_pinned_driver_never_spawns_share_net_or_wrong_hash() {
+    async fn test_launch_pinned_driver_never_spawns_share_net_or_wrong_hash() -> TestResult {
         let contents = b"launch";
-        let file = TempFile::new(contents);
-        let pin = GeckodriverPin::new(file.path.to_path_buf(), &sha256_hex_of(contents)).expect("valid pin");
+        let file = TempFile::new(contents)?;
+        let pin = GeckodriverPin::new(file.path.to_path_buf(), &sha256_hex_of(contents))
+            .map_err(ctx("valid pin"))?;
 
-        let unsafe_launcher = FakeLauncher { share_net: true, spawns: AtomicUsize::new(0) };
+        let unsafe_launcher = FakeLauncher {
+            share_net: true,
+            spawns: AtomicUsize::new(0),
+        };
         assert!(matches!(
             launch_pinned_driver(&unsafe_launcher, &pin).await,
             Err(AdapterError::Launch { .. })
         ));
         assert_eq!(unsafe_launcher.spawns.load(Ordering::SeqCst), 0);
 
-        let launcher = FakeLauncher { share_net: false, spawns: AtomicUsize::new(0) };
-        let wrong = GeckodriverPin::new(file.path.to_path_buf(), &sha256_hex_of(b"x")).expect("valid pin");
+        let launcher = FakeLauncher {
+            share_net: false,
+            spawns: AtomicUsize::new(0),
+        };
+        let wrong = GeckodriverPin::new(file.path.to_path_buf(), &sha256_hex_of(b"x"))
+            .map_err(ctx("valid pin"))?;
         assert!(matches!(
             launch_pinned_driver(&launcher, &wrong).await,
             Err(AdapterError::DriverPin { .. })
         ));
         assert_eq!(launcher.spawns.load(Ordering::SeqCst), 0);
 
-        let launched = launch_pinned_driver(&launcher, &pin).await.expect("safe launch spawns");
+        let launched = launch_pinned_driver(&launcher, &pin)
+            .await
+            .map_err(ctx("safe launch spawns"))?;
         assert_eq!(launcher.spawns.load(Ordering::SeqCst), 1);
         assert_eq!(launched.proxy_port(), 1080);
         assert_eq!(launched.webdriver_url().as_str(), "http://127.0.0.1:4444/");
+        Ok(())
     }
 }

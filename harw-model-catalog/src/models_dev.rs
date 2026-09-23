@@ -404,15 +404,16 @@ fn apply_cache(cache: &ModelsDevCache, catalog: &mut [ProviderSpec]) {
 mod tests {
     use super::*;
     use crate::spec::{ProviderApi, ProviderSpec};
+    use crate::test_support::{TestError, TestResult};
 
-    fn test_cache_dir(label: &str) -> PathBuf {
+    fn test_cache_dir(label: &str) -> TestResult<PathBuf> {
         let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
             "harw-model-catalog-{label}-{}-{sequence}",
             std::process::id()
         ));
-        std::fs::create_dir_all(&dir).expect("create test cache directory");
-        dir
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
     }
 
     /// Baut eine minimale ProviderSpec für Tests.
@@ -436,35 +437,61 @@ mod tests {
     }"#;
 
     #[test]
-    fn refresh_bypasses_fresh_cache_and_invalid_response_preserves_it() {
-        let dir = test_cache_dir("refresh");
+    fn refresh_bypasses_fresh_cache_and_invalid_response_preserves_it() -> TestResult {
+        let dir = test_cache_dir("refresh")?;
         let path = dir.join(CACHE_FILE_NAME);
-        fs::write(&path, SAMPLE).unwrap();
-        load_cache_with_fetch(&dir, false, || panic!("fresh cache must avoid network")).unwrap();
+        fs::write(&path, SAMPLE)?;
+        // Trap statt Panik: fetch darf bei frischem Cache (force=false) nicht
+        // aufgerufen werden. Der Aufruf-Flag wird danach geprüft.
+        let fetch_called = std::cell::Cell::new(false);
+        load_cache_with_fetch(&dir, false, || {
+            fetch_called.set(true);
+            Err(CatalogError::Http("fetch must not be called".into()))
+        })?;
+        assert!(!fetch_called.get(), "fresh cache must avoid network");
+
         let fresh = r#"{"openai":{"models":{"new-model":{}}}}"#;
-        let cache = load_cache_with_fetch(&dir, true, || Ok(fresh.into()))
-            .unwrap()
-            .unwrap();
-        assert_eq!(cache.models_for("openai").unwrap(), ["new-model"]);
-        let cache = load_cache_with_fetch(&dir, true, || Ok("invalid".into()))
-            .unwrap()
-            .unwrap();
-        assert_eq!(cache.models_for("openai").unwrap(), ["new-model"]);
-        assert_eq!(fs::read_to_string(&path).unwrap(), fresh);
-        let cache = load_cache_with_fetch(&dir, true, || Err(CatalogError::Http("offline".into())))
-            .unwrap()
-            .unwrap();
-        assert_eq!(cache.models_for("openai").unwrap(), ["new-model"]);
-        fs::write(&path, "broken cache").unwrap();
-        let cache = load_cache_with_fetch(&dir, false, || Ok(fresh.into()))
-            .unwrap()
-            .unwrap();
-        assert_eq!(cache.models_for("openai").unwrap(), ["new-model"]);
-        fs::remove_dir_all(dir).unwrap();
+        let cache = load_cache_with_fetch(&dir, true, || Ok(fresh.into()))?
+            .ok_or(TestError::Missing("cache after refresh"))?;
+        assert_eq!(
+            cache
+                .models_for("openai")
+                .ok_or(TestError::Missing("openai models"))?,
+            ["new-model"]
+        );
+        let cache = load_cache_with_fetch(&dir, true, || Ok("invalid".into()))?
+            .ok_or(TestError::Missing("cache after invalid response"))?;
+        assert_eq!(
+            cache
+                .models_for("openai")
+                .ok_or(TestError::Missing("openai models"))?,
+            ["new-model"]
+        );
+        assert_eq!(fs::read_to_string(&path)?, fresh);
+        let cache =
+            load_cache_with_fetch(&dir, true, || Err(CatalogError::Http("offline".into())))?
+                .ok_or(TestError::Missing("cache after offline fetch"))?;
+        assert_eq!(
+            cache
+                .models_for("openai")
+                .ok_or(TestError::Missing("openai models"))?,
+            ["new-model"]
+        );
+        fs::write(&path, "broken cache")?;
+        let cache = load_cache_with_fetch(&dir, false, || Ok(fresh.into()))?
+            .ok_or(TestError::Missing("cache after broken-cache refresh"))?;
+        assert_eq!(
+            cache
+                .models_for("openai")
+                .ok_or(TestError::Missing("openai models"))?,
+            ["new-model"]
+        );
+        fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]
-    fn aliases_and_text_filter_apply_to_provider_lists() {
+    fn aliases_and_text_filter_apply_to_provider_lists() -> TestResult {
         let cache = ModelsDevCache::from_json(
             r#"{
             "cloudflare-workers-ai": {"models": {
@@ -475,8 +502,7 @@ mod tests {
             "togetherai": {"models": {"vendor/model": {}}},
             "lmstudio": {"models": {"not-installed": {}}}
         }"#,
-        )
-        .unwrap();
+        )?;
         let mut catalog = vec![
             spec("cloudflare", vec![]),
             spec("together", vec![]),
@@ -486,12 +512,15 @@ mod tests {
         assert_eq!(catalog[0].models, ["@cf/current"]);
         assert_eq!(catalog[1].models, ["vendor/model"]);
         assert_eq!(catalog[2].models, ["installed"]);
+        Ok(())
     }
 
     #[test]
-    fn test_from_json_parses_provider_models() {
-        let cache = ModelsDevCache::from_json(SAMPLE).expect("valid sample json");
-        let mut openai = cache.models_for("openai").expect("openai present");
+    fn test_from_json_parses_provider_models() -> TestResult {
+        let cache = ModelsDevCache::from_json(SAMPLE)?;
+        let mut openai = cache
+            .models_for("openai")
+            .ok_or(TestError::Missing("openai models"))?;
         openai.sort();
         assert_eq!(openai, vec!["gpt-4o".to_owned(), "gpt-4o-mini".to_owned()]);
         assert_eq!(
@@ -499,17 +528,21 @@ mod tests {
             Some(vec!["claude-3-5-sonnet".to_owned()])
         );
         assert_eq!(cache.models_for("missing"), None);
+        Ok(())
     }
 
     #[test]
-    fn test_from_json_rejects_invalid_json() {
-        let err = ModelsDevCache::from_json("{ not json").unwrap_err();
+    fn test_from_json_rejects_invalid_json() -> TestResult {
+        let Err(err) = ModelsDevCache::from_json("{ not json") else {
+            return Err(TestError::Unexpected("Err erwartet (invalid json)".into()));
+        };
         assert!(matches!(err, CatalogError::Parse(_)));
+        Ok(())
     }
 
     #[test]
-    fn test_apply_cache_replaces_matching_models() {
-        let cache = ModelsDevCache::from_json(SAMPLE).expect("valid sample json");
+    fn test_apply_cache_replaces_matching_models() -> TestResult {
+        let cache = ModelsDevCache::from_json(SAMPLE)?;
         let mut catalog = vec![
             spec("openai", vec!["stale".to_owned()]),
             spec("unknown", vec!["keep".to_owned()]),
@@ -527,98 +560,104 @@ mod tests {
         assert_eq!(catalog[1].models, vec!["keep".to_owned()]);
         // Leere models.dev-Liste überschreibt bestehende Werte nicht.
         assert_eq!(catalog[2].models, vec!["keep-empty".to_owned()]);
+        Ok(())
     }
 
     #[test]
-    fn test_enrich_models_uses_fresh_cache_no_network() {
-        let dir = test_cache_dir("fresh-cache");
+    fn test_enrich_models_uses_fresh_cache_no_network() -> TestResult {
+        let dir = test_cache_dir("fresh-cache")?;
         let cache_path = dir.join(CACHE_FILE_NAME);
-        std::fs::write(&cache_path, SAMPLE).expect("write cache");
+        std::fs::write(&cache_path, SAMPLE)?;
 
         let mut catalog = vec![spec("openai", vec!["stale".to_owned()])];
-        enrich_models(&dir, &mut catalog).expect("enrich from fresh cache");
+        enrich_models(&dir, &mut catalog)?;
 
         let mut models = catalog[0].models.clone();
         models.sort();
         assert_eq!(models, vec!["gpt-4o".to_owned(), "gpt-4o-mini".to_owned()]);
 
         std::fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_enrich_models_rejects_symlinked_cache_without_reading_target() {
+    fn test_enrich_models_rejects_symlinked_cache_without_reading_target() -> TestResult {
         use std::os::unix::fs::symlink;
 
-        let dir = test_cache_dir("cache-symlink");
+        let dir = test_cache_dir("cache-symlink")?;
         let target = dir.join("outside-cache.json");
-        std::fs::write(&target, SAMPLE).expect("write symlink target");
+        std::fs::write(&target, SAMPLE)?;
         let cache_path = dir.join(CACHE_FILE_NAME);
-        symlink(&target, &cache_path).expect("create cache symlink");
+        symlink(&target, &cache_path)?;
 
         let mut catalog = vec![spec("openai", vec!["stale".to_owned()])];
-        let err = enrich_models(&dir, &mut catalog).expect_err("symlinked cache must be rejected");
+        let Err(err) = enrich_models(&dir, &mut catalog) else {
+            return Err(TestError::Unexpected(
+                "Err erwartet (symlinked cache must be rejected)".into(),
+            ));
+        };
 
         assert!(matches!(err, CatalogError::Io { .. }));
         assert_eq!(catalog[0].models, vec!["stale".to_owned()]);
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), SAMPLE);
+        assert_eq!(std::fs::read_to_string(&target)?, SAMPLE);
 
         std::fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_write_cache_avoids_fixed_symlinked_temp_artifact() {
+    fn test_write_cache_avoids_fixed_symlinked_temp_artifact() -> TestResult {
         use std::os::unix::fs::symlink;
 
-        let dir = test_cache_dir("temp-symlink");
+        let dir = test_cache_dir("temp-symlink")?;
         let cache_path = dir.join(CACHE_FILE_NAME);
         let target = dir.join("outside-temp.json");
-        std::fs::write(&target, "do not overwrite").expect("write temp symlink target");
+        std::fs::write(&target, "do not overwrite")?;
         let legacy_temp_path = cache_path.with_extension("json.tmp");
-        symlink(&target, &legacy_temp_path).expect("create legacy temporary symlink");
+        symlink(&target, &legacy_temp_path)?;
 
-        write_cache_atomic(&dir, &cache_path, SAMPLE)
-            .expect("write cache via unique temporary file");
+        write_cache_atomic(&dir, &cache_path, SAMPLE)?;
 
-        assert_eq!(std::fs::read_to_string(&cache_path).unwrap(), SAMPLE);
-        assert_eq!(
-            std::fs::read_to_string(&target).unwrap(),
-            "do not overwrite"
-        );
+        assert_eq!(std::fs::read_to_string(&cache_path)?, SAMPLE);
+        assert_eq!(std::fs::read_to_string(&target)?, "do not overwrite");
         assert!(
-            std::fs::symlink_metadata(&legacy_temp_path)
-                .unwrap()
+            std::fs::symlink_metadata(&legacy_temp_path)?
                 .file_type()
                 .is_symlink()
         );
 
         std::fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_write_cache_rejects_symlinked_cache_without_replacing_target() {
+    fn test_write_cache_rejects_symlinked_cache_without_replacing_target() -> TestResult {
         use std::os::unix::fs::symlink;
 
-        let dir = test_cache_dir("write-cache-symlink");
+        let dir = test_cache_dir("write-cache-symlink")?;
         let target = dir.join("outside-cache.json");
-        std::fs::write(&target, "do not replace").expect("write cache symlink target");
+        std::fs::write(&target, "do not replace")?;
         let cache_path = dir.join(CACHE_FILE_NAME);
-        symlink(&target, &cache_path).expect("create cache symlink");
+        symlink(&target, &cache_path)?;
 
-        let err = write_cache_atomic(&dir, &cache_path, SAMPLE)
-            .expect_err("symlinked cache destination must be rejected");
+        let Err(err) = write_cache_atomic(&dir, &cache_path, SAMPLE) else {
+            return Err(TestError::Unexpected(
+                "Err erwartet (symlinked cache destination must be rejected)".into(),
+            ));
+        };
 
         assert!(matches!(err, CatalogError::Io { .. }));
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "do not replace");
+        assert_eq!(std::fs::read_to_string(&target)?, "do not replace");
         assert!(
-            std::fs::symlink_metadata(&cache_path)
-                .unwrap()
+            std::fs::symlink_metadata(&cache_path)?
                 .file_type()
                 .is_symlink()
         );
 
         std::fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 }

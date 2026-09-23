@@ -42,6 +42,9 @@ pub use process_permit::{
 mod host_permit_session;
 pub use host_permit_session::HostPermitSessionRegistry;
 
+#[cfg(test)]
+mod test_support;
+
 /// Network mode for a process sandbox. No mode shares the host network
 /// namespace; proxy-only mode still needs
 /// [`harw_authority::Permission::NetworkAccess`] in the supplied authority.
@@ -64,14 +67,31 @@ pub struct RelaySpec {
 /// remain `harw_authority::AuthorityError` and are not wrapped here.
 #[derive(Debug)]
 pub enum SandboxError {
-    Io { path: PathBuf, reason: String },
+    Io {
+        path: PathBuf,
+        reason: String,
+    },
     ProcessExecutionDenied,
     MissingSandboxCommand,
-    InvalidSandboxWorkspaceDestination { path: PathBuf },
-    SandboxProcessSpawn { executable: PathBuf, reason: String },
+    InvalidSandboxWorkspaceDestination {
+        path: PathBuf,
+    },
+    SandboxProcessSpawn {
+        executable: PathBuf,
+        reason: String,
+    },
     NetworkModeNotGranted,
     CargoFetchNetworkDenied,
-    InvalidRelaySpec { field: &'static str, reason: String },
+    InvalidRelaySpec {
+        field: &'static str,
+        reason: String,
+    },
+    /// Ein Pfad, der laut fester Konfiguration oder Kanonikalisierung immer
+    /// einen Elternpfad haben muss, hatte keinen (Bible R087: keine Panik bei
+    /// einem eigentlich unerreichbaren Zustand, sondern ein benannter Fehler).
+    FixedPathWithoutParent {
+        path: PathBuf,
+    },
 }
 
 pub type SandboxResult<T> = Result<T, SandboxError>;
@@ -103,6 +123,11 @@ impl fmt::Display for SandboxError {
             Self::InvalidRelaySpec { field, reason } => {
                 write!(f, "invalid egress relay configuration ({field}): {reason}")
             }
+            Self::FixedPathWithoutParent { path } => write!(
+                f,
+                "path '{}' unexpectedly has no parent directory",
+                path.display()
+            ),
         }
     }
 }

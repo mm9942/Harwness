@@ -94,6 +94,7 @@ pub struct HostSample {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     fn sample() -> HostSample {
         HostSample {
@@ -105,14 +106,15 @@ mod tests {
     }
 
     #[test]
-    fn test_host_sample_serializes_metric_and_sensor_as_plain_strings() {
-        let json = serde_json::to_string(&sample()).expect("HostSample serializes");
+    fn test_host_sample_serializes_metric_and_sensor_as_plain_strings() -> TestResult {
+        let json = serde_json::to_string(&sample()).map_err(ctx("HostSample serializes"))?;
         assert!(json.contains(r#""sensor":"thermal-0""#));
         assert!(json.contains(r#""metric":"temperature_celsius""#));
+        Ok(())
     }
 
     #[test]
-    fn test_host_sample_deserialize_accepts_well_formed_static_fixture() {
+    fn test_host_sample_deserialize_accepts_well_formed_static_fixture() -> TestResult {
         // Literal, damit die Eingabe eine `'static`-Lebensdauer trägt (siehe
         // Typ-Doku oben) — kein Umweg über einen `String`-Puffer.
         let fixture: &'static str = r#"{
@@ -121,8 +123,10 @@ mod tests {
             "metric": "temperature_celsius",
             "value": 42.5
         }"#;
-        let parsed: HostSample = serde_json::from_str(fixture).expect("fixture deserializes");
+        let parsed: HostSample =
+            serde_json::from_str(fixture).map_err(ctx("fixture deserializes"))?;
         assert_eq!(parsed, sample());
+        Ok(())
     }
 
     #[test]

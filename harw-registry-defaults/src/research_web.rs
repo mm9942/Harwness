@@ -52,9 +52,9 @@
 
 use std::sync::Arc;
 
+use harw_authority::NetworkScope;
 use harw_config::NetworkSection;
 use harw_egress::EgressPolicy;
-use harw_authority::NetworkScope;
 
 use crate::error::{RegistryDefaultsError, RegistryDefaultsResult};
 
@@ -138,6 +138,7 @@ pub fn researcher_web_network_scope(policy: &EgressPolicy) -> NetworkScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn section(allow_hosts: &[&str], allow_private: bool, researcher: &[&str]) -> NetworkSection {
         NetworkSection {
@@ -148,52 +149,63 @@ mod tests {
     }
 
     #[test]
-    fn test_researcher_web_policy_empty_hosts_means_no_network() {
-        let policy =
-            researcher_web_policy(&section(&[], false, &[])).expect("leere Liste ist gültig");
+    fn test_researcher_web_policy_empty_hosts_means_no_network() -> TestResult {
+        let policy = researcher_web_policy(&section(&[], false, &[]))
+            .map_err(ctx("leere Liste ist gültig"))?;
         assert!(policy.allow_hosts().is_empty());
         assert!(policy.check_url("https://docs.rs/").is_err());
         assert!(researcher_web_network_scope(&policy).is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_researcher_web_policy_ignores_general_allow_hosts() {
+    fn test_researcher_web_policy_ignores_general_allow_hosts() -> TestResult {
         let policy = researcher_web_policy(&section(&["docs.rs", "example.com"], false, &[]))
-            .expect("gültig");
+            .map_err(ctx("gültig"))?;
         assert!(
             policy.check_url("https://docs.rs/").is_err(),
             "allow_hosts darf den Scope von researcher-web nicht erweitern"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_researcher_web_policy_never_allows_private_networks() {
+    fn test_researcher_web_policy_never_allows_private_networks() -> TestResult {
         let policy = researcher_web_policy(&section(&[], true, &["docs.rs", "127.0.0.1"]))
-            .expect("gültig");
+            .map_err(ctx("gültig"))?;
         assert!(!policy.allow_private());
         assert!(policy.check_url("https://docs.rs/serde").is_ok());
         assert!(
             policy.check_url("http://127.0.0.1/").is_err(),
             "Loopback bleibt gesperrt, auch wenn [network].allow_private = true"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_researcher_web_policy_rejects_invalid_entry() {
-        let error = researcher_web_policy(&section(&[], false, &["https://docs.rs"]))
-            .expect_err("Schema im Hosteintrag ist ungültig");
-        assert!(matches!(error, RegistryDefaultsError::ResearcherWebPolicy { .. }));
+    fn test_researcher_web_policy_rejects_invalid_entry() -> TestResult {
+        let Err(error) = researcher_web_policy(&section(&[], false, &["https://docs.rs"])) else {
+            return Err(TestError::Unexpected(
+                "Schema im Hosteintrag ist ungültig".to_owned(),
+            ));
+        };
+        assert!(matches!(
+            error,
+            RegistryDefaultsError::ResearcherWebPolicy { .. }
+        ));
         assert!(std::error::Error::source(&error).is_some());
+        Ok(())
     }
 
     #[test]
-    fn test_researcher_web_network_scope_matches_policy_hosts() {
+    fn test_researcher_web_network_scope_matches_policy_hosts() -> TestResult {
         let policy = researcher_web_policy(&section(&[], false, &["crates.io", "Docs.RS"]))
-            .expect("gültig");
+            .map_err(ctx("gültig"))?;
         let scope = researcher_web_network_scope(&policy);
         let hosts: Vec<&str> = scope.hosts().collect();
         assert_eq!(hosts, vec!["crates.io", "docs.rs"]);
         assert!(scope.allows("docs.rs"));
         assert!(!scope.allows("example.com"));
+        Ok(())
     }
 }

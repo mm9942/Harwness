@@ -96,41 +96,49 @@ fn default_token_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn test_web_section_defaults_from_empty_toml() {
-        let section: WebSection = toml::from_str("").unwrap();
+    fn test_web_section_defaults_from_empty_toml() -> TestResult {
+        let section: WebSection = toml::from_str("").map_err(ctx("parse toml"))?;
         assert_eq!(section.bind, "127.0.0.1");
         assert_eq!(section.port, 0);
         assert_eq!(section.token_ttl_secs, 900);
         assert_eq!(section, WebSection::default());
+        Ok(())
     }
 
     #[test]
-    fn test_web_section_full_toml_round_trip() {
+    fn test_web_section_full_toml_round_trip() -> TestResult {
         let src = r#"
             bind = "::1"
             port = 8899
             token_ttl_secs = 120
         "#;
-        let section: WebSection = toml::from_str(src).unwrap();
+        let section: WebSection = toml::from_str(src).map_err(ctx("parse toml"))?;
         assert_eq!(section.bind, "::1");
         assert_eq!(section.port, 8899);
         assert_eq!(section.token_ttl_secs, 120);
 
-        let encoded = toml::to_string(&section).unwrap();
-        let decoded: WebSection = toml::from_str(&encoded).unwrap();
+        let encoded = toml::to_string(&section).map_err(ctx("encode toml"))?;
+        let decoded: WebSection = toml::from_str(&encoded).map_err(ctx("parse encoded toml"))?;
         assert_eq!(decoded, section);
+        Ok(())
     }
 
     #[test]
-    fn test_web_section_rejects_unknown_field() {
+    fn test_web_section_rejects_unknown_field() -> TestResult {
         let src = r#"
             bind = "127.0.0.1"
             bnid = "127.0.0.1"
         "#;
-        let error = toml::from_str::<WebSection>(src).unwrap_err();
+        let Err(error) = toml::from_str::<WebSection>(src) else {
+            return Err(TestError::Unexpected(
+                "unknown field must be rejected".to_string(),
+            ));
+        };
         assert!(error.to_string().contains("unknown field"));
+        Ok(())
     }
 
     #[test]
@@ -148,22 +156,32 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rejects_non_loopback_bind() {
+    fn test_validate_rejects_non_loopback_bind() -> TestResult {
         let section = WebSection {
             bind: "0.0.0.0".to_owned(),
             ..WebSection::default()
         };
-        let error = section.validate().unwrap_err();
+        let Err(error) = section.validate() else {
+            return Err(TestError::Unexpected(
+                "non-loopback bind must be rejected".to_string(),
+            ));
+        };
         assert!(error.contains("0.0.0.0"));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_zero_token_ttl() {
+    fn test_validate_rejects_zero_token_ttl() -> TestResult {
         let section = WebSection {
             token_ttl_secs: 0,
             ..WebSection::default()
         };
-        let error = section.validate().unwrap_err();
+        let Err(error) = section.validate() else {
+            return Err(TestError::Unexpected(
+                "zero token_ttl_secs must be rejected".to_string(),
+            ));
+        };
         assert!(error.contains("token_ttl_secs"));
+        Ok(())
     }
 }

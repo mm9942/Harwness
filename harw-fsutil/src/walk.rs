@@ -306,9 +306,8 @@ impl Iterator for WalkBeneath {
             frame.next += 1;
             let rel_path = frame.rel.join(&name);
             let depth = frame.depth + 1;
-            let stat = retry_on_intr(|| {
-                rustix::fs::statat(&frame.fd, &name, AtFlags::SYMLINK_NOFOLLOW)
-            });
+            let stat =
+                retry_on_intr(|| rustix::fs::statat(&frame.fd, &name, AtFlags::SYMLINK_NOFOLLOW));
             self.yielded += 1;
 
             let stat = match stat {
@@ -388,6 +387,7 @@ fn dev_ino(stat: &Stat) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
     use std::os::unix::fs::symlink;
     use std::time::Duration;
 
@@ -397,37 +397,40 @@ mod tests {
         deadline: None,
     };
 
-    fn collect(walk: &mut WalkBeneath) -> Vec<(String, EntryType)> {
+    fn collect(walk: &mut WalkBeneath) -> TestResult<Vec<(String, EntryType)>> {
         walk.by_ref()
             .map(|entry| {
-                let entry = entry.expect("entry");
-                (entry.rel_path.to_string_lossy().into_owned(), entry.entry_type)
+                let entry = entry?;
+                Ok((
+                    entry.rel_path.to_string_lossy().into_owned(),
+                    entry.entry_type,
+                ))
             })
             .collect()
     }
 
     #[test]
-    fn sortierte_vorordnung_mit_typen_und_laengen() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+    fn sortierte_vorordnung_mit_typen_und_laengen() -> TestResult {
+        let tmp = tempfile::tempdir()?;
         let root = tmp.path();
-        std::fs::create_dir_all(root.join("b/inner")).expect("mkdir");
-        std::fs::write(root.join("c.txt"), b"12345").expect("write");
-        std::fs::write(root.join("a.txt"), b"1").expect("write");
-        std::fs::write(root.join("b/inner/z"), b"").expect("write");
-        symlink("c.txt", root.join("b/link")).expect("symlink");
+        std::fs::create_dir_all(root.join("b/inner"))?;
+        std::fs::write(root.join("c.txt"), b"12345")?;
+        std::fs::write(root.join("a.txt"), b"1")?;
+        std::fs::write(root.join("b/inner/z"), b"")?;
+        symlink("c.txt", root.join("b/link"))?;
 
-        let mut walk = walk_beneath(root, UNBEGRENZT).expect("walk");
-        let entries: Vec<WalkEntry> = walk.by_ref().map(|entry| entry.expect("entry")).collect();
+        let mut walk = walk_beneath(root, UNBEGRENZT)?;
+        let entries: Vec<WalkEntry> = walk.by_ref().collect::<io::Result<Vec<_>>>()?;
         let summary: Vec<(&str, EntryType, u64)> = entries
             .iter()
             .map(|entry| {
-                (
-                    entry.rel_path.to_str().expect("utf8"),
+                Ok::<_, TestError>((
+                    entry.rel_path.to_str().ok_or(TestError::Missing("utf8"))?,
                     entry.entry_type,
                     entry.len,
-                )
+                ))
             })
-            .collect();
+            .collect::<TestResult<Vec<_>>>()?;
         assert_eq!(
             summary,
             vec![
@@ -441,18 +444,19 @@ mod tests {
         );
         assert_eq!(walk.stopped(), None);
         assert!(walk.next().is_none(), "fused");
+        Ok(())
     }
 
     #[test]
-    fn schleife_a_zeigt_auf_punkt_terminiert() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        symlink(".", tmp.path().join("a")).expect("symlink");
-        std::fs::create_dir(tmp.path().join("d")).expect("mkdir");
-        symlink("..", tmp.path().join("d/up")).expect("symlink");
+    fn schleife_a_zeigt_auf_punkt_terminiert() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        symlink(".", tmp.path().join("a"))?;
+        std::fs::create_dir(tmp.path().join("d"))?;
+        symlink("..", tmp.path().join("d/up"))?;
 
-        let mut walk = walk_beneath(tmp.path(), UNBEGRENZT).expect("walk");
+        let mut walk = walk_beneath(tmp.path(), UNBEGRENZT)?;
         assert_eq!(
-            collect(&mut walk),
+            collect(&mut walk)?,
             vec![
                 ("a".to_owned(), EntryType::Symlink),
                 ("d".to_owned(), EntryType::Dir),
@@ -460,14 +464,15 @@ mod tests {
             ]
         );
         assert_eq!(walk.stopped(), None);
+        Ok(())
     }
 
     #[test]
-    fn dangling_symlink_wird_gemeldet() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        symlink("fehlt/nirgends", tmp.path().join("dangling")).expect("symlink");
-        let mut walk = walk_beneath(tmp.path(), UNBEGRENZT).expect("walk");
-        let entries: Vec<WalkEntry> = walk.by_ref().map(|entry| entry.expect("entry")).collect();
+    fn dangling_symlink_wird_gemeldet() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        symlink("fehlt/nirgends", tmp.path().join("dangling"))?;
+        let mut walk = walk_beneath(tmp.path(), UNBEGRENZT)?;
+        let entries: Vec<WalkEntry> = walk.by_ref().collect::<io::Result<Vec<_>>>()?;
         assert_eq!(
             entries,
             vec![WalkEntry {
@@ -476,22 +481,23 @@ mod tests {
                 len: "fehlt/nirgends".len() as u64,
             }]
         );
+        Ok(())
     }
 
     #[test]
-    fn tiefengrenze() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(tmp.path().join("d1/d2")).expect("mkdir");
-        std::fs::write(tmp.path().join("d1/d2/f"), b"x").expect("write");
-        std::fs::write(tmp.path().join("top"), b"x").expect("write");
+    fn tiefengrenze() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        std::fs::create_dir_all(tmp.path().join("d1/d2"))?;
+        std::fs::write(tmp.path().join("d1/d2/f"), b"x")?;
+        std::fs::write(tmp.path().join("top"), b"x")?;
 
         let limits = WalkLimits {
             max_depth: 1,
             ..UNBEGRENZT
         };
-        let mut walk = walk_beneath(tmp.path(), limits).expect("walk");
+        let mut walk = walk_beneath(tmp.path(), limits)?;
         assert_eq!(
-            collect(&mut walk),
+            collect(&mut walk)?,
             vec![
                 ("d1".to_owned(), EntryType::Dir),
                 ("top".to_owned(), EntryType::File),
@@ -503,31 +509,35 @@ mod tests {
             max_depth: 3,
             ..UNBEGRENZT
         };
-        let mut walk = walk_beneath(tmp.path(), limits).expect("walk");
-        assert_eq!(collect(&mut walk).len(), 4);
+        let mut walk = walk_beneath(tmp.path(), limits)?;
+        assert_eq!(collect(&mut walk)?.len(), 4);
         assert_eq!(walk.stopped(), None);
 
         let limits = WalkLimits {
             max_depth: 0,
             ..UNBEGRENZT
         };
-        let mut walk = walk_beneath(tmp.path(), limits).expect("walk");
-        assert!(collect(&mut walk).is_empty());
+        let mut walk = walk_beneath(tmp.path(), limits)?;
+        assert!(collect(&mut walk)?.is_empty());
         assert_eq!(walk.stopped(), Some(WalkStop::DepthLimit));
+        Ok(())
     }
 
     #[test]
-    fn entry_grenze() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+    fn entry_grenze() -> TestResult {
+        let tmp = tempfile::tempdir()?;
         for name in ["e", "d", "c", "b", "a"] {
-            std::fs::write(tmp.path().join(name), b"x").expect("write");
+            std::fs::write(tmp.path().join(name), b"x")?;
         }
         let limits = WalkLimits {
             max_entries: 3,
             ..UNBEGRENZT
         };
-        let mut walk = walk_beneath(tmp.path(), limits).expect("walk");
-        let names: Vec<String> = collect(&mut walk).into_iter().map(|(name, _)| name).collect();
+        let mut walk = walk_beneath(tmp.path(), limits)?;
+        let names: Vec<String> = collect(&mut walk)?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
         assert_eq!(names, ["a", "b", "c"]);
         assert_eq!(walk.stopped(), Some(WalkStop::EntryLimit));
 
@@ -535,66 +545,69 @@ mod tests {
             max_entries: 5,
             ..UNBEGRENZT
         };
-        let mut walk = walk_beneath(tmp.path(), limits).expect("walk");
-        assert_eq!(collect(&mut walk).len(), 5);
+        let mut walk = walk_beneath(tmp.path(), limits)?;
+        assert_eq!(collect(&mut walk)?.len(), 5);
         assert_eq!(walk.stopped(), None);
+        Ok(())
     }
 
     #[test]
-    fn entry_grenze_hat_vorrang_vor_tiefengrenze() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(tmp.path().join("a/b")).expect("mkdir");
-        std::fs::write(tmp.path().join("z"), b"x").expect("write");
+    fn entry_grenze_hat_vorrang_vor_tiefengrenze() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        std::fs::create_dir_all(tmp.path().join("a/b"))?;
+        std::fs::write(tmp.path().join("z"), b"x")?;
         let limits = WalkLimits {
             max_depth: 1,
             max_entries: 1,
             deadline: None,
         };
-        let mut walk = walk_beneath(tmp.path(), limits).expect("walk");
-        assert_eq!(collect(&mut walk), vec![("a".to_owned(), EntryType::Dir)]);
+        let mut walk = walk_beneath(tmp.path(), limits)?;
+        assert_eq!(collect(&mut walk)?, vec![("a".to_owned(), EntryType::Dir)]);
         assert_eq!(walk.stopped(), Some(WalkStop::EntryLimit));
+        Ok(())
     }
 
     #[test]
-    fn deadline_grenze() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(tmp.path().join("f"), b"x").expect("write");
+    fn deadline_grenze() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        std::fs::write(tmp.path().join("f"), b"x")?;
 
         let limits = WalkLimits {
             deadline: Some(Instant::now()),
             ..UNBEGRENZT
         };
-        let mut walk = walk_beneath(tmp.path(), limits).expect("walk");
-        assert!(collect(&mut walk).is_empty());
+        let mut walk = walk_beneath(tmp.path(), limits)?;
+        assert!(collect(&mut walk)?.is_empty());
         assert_eq!(walk.stopped(), Some(WalkStop::Deadline));
 
         let limits = WalkLimits {
             deadline: Some(Instant::now() + Duration::from_secs(3600)),
             ..UNBEGRENZT
         };
-        let mut walk = walk_beneath(tmp.path(), limits).expect("walk");
-        assert_eq!(collect(&mut walk).len(), 1);
+        let mut walk = walk_beneath(tmp.path(), limits)?;
+        assert_eq!(collect(&mut walk)?.len(), 1);
         assert_eq!(walk.stopped(), None);
+        Ok(())
     }
 
     /// R2-03: Ein nicht betretbares Unterverzeichnis liefert ein Fehler-Item,
     /// das gegen `max_entries` zählt.
     #[test]
-    fn fehler_beim_betreten_zaehlt_gegen_entry_grenze() {
+    fn fehler_beim_betreten_zaehlt_gegen_entry_grenze() -> TestResult {
         use std::os::unix::fs::PermissionsExt;
 
         if rustix::process::geteuid().is_root() {
             // root ignoriert `0o000` (CAP_DAC_OVERRIDE); das Öffnen gelänge.
             eprintln!("übersprungen: läuft als root, 0o000 sperrt nicht");
-            return;
+            return Ok(());
         }
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = tempfile::tempdir()?;
         let locked = tmp.path().join("a");
-        std::fs::create_dir(&locked).expect("mkdir");
-        std::fs::write(tmp.path().join("b"), b"x").expect("write");
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        std::fs::create_dir(&locked)?;
+        std::fs::write(tmp.path().join("b"), b"x")?;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))?;
 
-        // Stellt die Rechte auch bei einem Test-Panic wieder her, damit
+        // Stellt die Rechte auch bei einem Test-Fehlschlag wieder her, damit
         // `TempDir` aufräumen kann.
         struct Restore<'a>(&'a Path);
         impl Drop for Restore<'_> {
@@ -604,12 +617,14 @@ mod tests {
         }
         let _restore = Restore(&locked);
 
-        let run = |max_entries: usize| {
+        // Lokaler Alias, damit die Closure-Signatur nicht clippy::type_complexity auslöst.
+        type WalkRunOutcome = TestResult<(Vec<Result<String, Option<i32>>>, Option<WalkStop>)>;
+        let run = |max_entries: usize| -> WalkRunOutcome {
             let limits = WalkLimits {
                 max_entries,
                 ..UNBEGRENZT
             };
-            let mut walk = walk_beneath(tmp.path(), limits).expect("walk");
+            let mut walk = walk_beneath(tmp.path(), limits)?;
             let items: Vec<Result<String, Option<i32>>> = walk
                 .by_ref()
                 .map(|item| match item {
@@ -617,13 +632,13 @@ mod tests {
                     Err(err) => Err(err.raw_os_error()),
                 })
                 .collect();
-            (items, walk.stopped())
+            Ok((items, walk.stopped()))
         };
         let eacces = Some(rustix::io::Errno::ACCESS.raw_os_error());
 
-        let (items, stopped) = run(1);
-        let (items2, stopped2) = run(2);
-        let (items_all, stopped_all) = run(usize::MAX);
+        let (items, stopped) = run(1)?;
+        let (items2, stopped2) = run(2)?;
+        let (items_all, stopped_all) = run(usize::MAX)?;
 
         let a: Result<String, Option<i32>> = Ok("a".to_owned());
         let b: Result<String, Option<i32>> = Ok("b".to_owned());
@@ -634,26 +649,30 @@ mod tests {
         assert_eq!(stopped2, Some(WalkStop::EntryLimit));
         assert_eq!(items_all, vec![a, denied, b]);
         assert_eq!(stopped_all, None);
+        Ok(())
     }
 
     #[test]
-    fn wurzel_symlink_wird_abgelehnt() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir(tmp.path().join("real")).expect("mkdir");
-        symlink("real", tmp.path().join("link")).expect("symlink");
-        walk_beneath(&tmp.path().join("link"), UNBEGRENZT).unwrap_err();
+    fn wurzel_symlink_wird_abgelehnt() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        std::fs::create_dir(tmp.path().join("real"))?;
+        symlink("real", tmp.path().join("link"))?;
+        let Err(_) = walk_beneath(&tmp.path().join("link"), UNBEGRENZT) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        Ok(())
     }
 
     #[test]
-    fn begrenzter_namensspeicher_bleibt_deterministisch() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+    fn begrenzter_namensspeicher_bleibt_deterministisch() -> TestResult {
+        let tmp = tempfile::tempdir()?;
         for index in (0..200).rev() {
-            std::fs::write(tmp.path().join(format!("n{index:03}")), b"").expect("write");
+            std::fs::write(tmp.path().join(format!("n{index:03}")), b"")?;
         }
-        let fd = open_dir_nofollow(tmp.path()).expect("open");
-        let names = read_sorted_names(fd.as_fd(), 4, None)
-            .expect("read")
-            .expect("keine deadline");
+        let fd = open_dir_nofollow(tmp.path())?;
+        let names =
+            read_sorted_names(fd.as_fd(), 4, None)?.ok_or(TestError::Missing("keine deadline"))?;
         assert_eq!(names, ["n000", "n001", "n002", "n003"]);
+        Ok(())
     }
 }

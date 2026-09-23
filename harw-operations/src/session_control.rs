@@ -552,6 +552,7 @@ impl SessionController for NullSessionController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn test_snapshot_empty_returns_all_none() {
@@ -572,42 +573,51 @@ mod tests {
     }
 
     #[test]
-    fn test_null_controller_records_reasoning_effort() {
+    fn test_null_controller_records_reasoning_effort() -> TestResult {
         let ctrl = NullSessionController::new();
         ctrl.set_reasoning_effort(Some(ReasoningEffort::High))
-            .expect("set_reasoning_effort should succeed on NullSessionController");
+            .map_err(ctx(
+                "set_reasoning_effort should succeed on NullSessionController",
+            ))?;
         let snap = ctrl.snapshot();
         assert_eq!(
             snap.reasoning_effort,
             Some(ReasoningEffort::High),
             "snapshot should reflect the recorded reasoning effort"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_null_controller_records_active_model() {
+    fn test_null_controller_records_active_model() -> TestResult {
         let ctrl = NullSessionController::new();
         ctrl.set_active_model("claude-opus-4".to_owned())
-            .expect("set_active_model should succeed on NullSessionController");
+            .map_err(ctx(
+                "set_active_model should succeed on NullSessionController",
+            ))?;
         let snap = ctrl.snapshot();
         assert_eq!(
             snap.active_model.as_deref(),
             Some("claude-opus-4"),
             "snapshot should reflect the recorded active model"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_null_controller_records_active_provider() {
+    fn test_null_controller_records_active_provider() -> TestResult {
         let ctrl = NullSessionController::new();
         ctrl.set_active_provider("anthropic".to_owned())
-            .expect("set_active_provider should succeed on NullSessionController");
+            .map_err(ctx(
+                "set_active_provider should succeed on NullSessionController",
+            ))?;
         let snap = ctrl.snapshot();
         assert_eq!(
             snap.active_provider.as_deref(),
             Some("anthropic"),
             "snapshot should reflect the recorded active provider"
         );
+        Ok(())
     }
 
     #[test]
@@ -623,38 +633,43 @@ mod tests {
     }
 
     #[test]
-    fn test_null_controller_keeps_uia_selection_separate_from_generic_state() {
+    fn test_null_controller_keeps_uia_selection_separate_from_generic_state() -> TestResult {
         let ctrl = NullSessionController::new();
         ctrl.set_active_provider("generic-provider".to_owned())
-            .expect("generic provider setter should succeed");
+            .map_err(ctx("generic provider setter should succeed"))?;
         ctrl.set_uia_selection(UiaSelection::new(
             Some("uia-provider".to_owned()),
             Some("uia-model".to_owned()),
         ))
-        .expect("UIA selection setter should succeed");
+        .map_err(ctx("UIA selection setter should succeed"))?;
 
         assert_eq!(
             ctrl.snapshot().active_provider.as_deref(),
             Some("generic-provider")
         );
-        assert_eq!(ctrl.snapshot_uia_selection().provider(), Some("uia-provider"));
+        assert_eq!(
+            ctrl.snapshot_uia_selection().provider(),
+            Some("uia-provider")
+        );
         assert_eq!(ctrl.snapshot_uia_selection().model(), Some("uia-model"));
+        Ok(())
     }
 
     #[test]
-    fn test_null_controller_snapshot_reflects_all_setters() {
+    fn test_null_controller_snapshot_reflects_all_setters() -> TestResult {
         let ctrl = NullSessionController::new();
         ctrl.set_reasoning_effort(Some(ReasoningEffort::Medium))
-            .expect("set_reasoning_effort should succeed");
+            .map_err(ctx("set_reasoning_effort should succeed"))?;
         ctrl.set_active_model("claude-sonnet-4".to_owned())
-            .expect("set_active_model should succeed");
+            .map_err(ctx("set_active_model should succeed"))?;
         ctrl.set_active_provider("openai".to_owned())
-            .expect("set_active_provider should succeed");
+            .map_err(ctx("set_active_provider should succeed"))?;
 
         let snap = ctrl.snapshot();
         assert_eq!(snap.reasoning_effort, Some(ReasoningEffort::Medium));
         assert_eq!(snap.active_model.as_deref(), Some("claude-sonnet-4"));
         assert_eq!(snap.active_provider.as_deref(), Some("openai"));
+        Ok(())
     }
 
     #[test]
@@ -678,27 +693,28 @@ mod tests {
     }
 
     #[test]
-    fn test_null_controller_set_effort_none_clears_value() {
+    fn test_null_controller_set_effort_none_clears_value() -> TestResult {
         let ctrl = NullSessionController::new();
         ctrl.set_reasoning_effort(Some(ReasoningEffort::Low))
-            .expect("initial set should succeed");
+            .map_err(ctx("initial set should succeed"))?;
         ctrl.set_reasoning_effort(None)
-            .expect("clearing effort should succeed");
+            .map_err(ctx("clearing effort should succeed"))?;
         let snap = ctrl.snapshot();
         assert_eq!(
             snap.reasoning_effort, None,
             "snapshot reasoning_effort should be None after clearing"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_shared_controller_arc_clone_shares_state() {
+    fn test_shared_controller_arc_clone_shares_state() -> TestResult {
         use std::sync::Arc;
         let ctrl: SharedSessionController = Arc::new(NullSessionController::new());
         let ctrl2 = Arc::clone(&ctrl);
 
         ctrl.set_active_model("test-model".to_owned())
-            .expect("set_active_model should succeed");
+            .map_err(ctx("set_active_model should succeed"))?;
 
         let snap = ctrl2.snapshot();
         assert_eq!(
@@ -706,6 +722,7 @@ mod tests {
             Some("test-model"),
             "Arc clone must share the same internal state"
         );
+        Ok(())
     }
 
     #[test]

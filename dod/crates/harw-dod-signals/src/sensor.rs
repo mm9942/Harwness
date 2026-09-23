@@ -158,15 +158,13 @@ pub trait Sensor: Send + Sync + std::fmt::Debug {
     /// # Errors
     /// [`harw_dod_cap::SensorError`], wenn die Quelle nicht lesbar ist,
     /// außerhalb des Lesebereichs liegt oder eine unerwartete Form hat.
-    fn poll(
-        &self,
-        now: jiff::Timestamp,
-    ) -> Result<SensorReading, harw_dod_cap::SensorError>;
+    fn poll(&self, now: jiff::Timestamp) -> Result<SensorReading, harw_dod_cap::SensorError>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use harw_dod_cap::{Capability, ReadScope, SensorHandle};
     use harw_types::SensorId;
 
@@ -181,18 +179,18 @@ mod tests {
             &self.handle
         }
 
-        fn poll(
-            &self,
-            _now: jiff::Timestamp,
-        ) -> Result<SensorReading, harw_dod_cap::SensorError> {
+        fn poll(&self, _now: jiff::Timestamp) -> Result<SensorReading, harw_dod_cap::SensorError> {
             Ok(self.reading.clone())
         }
     }
 
     fn mock_handle() -> SensorHandle<harw_dod_cap::Bound> {
         let scope = ReadScope::from_roots([std::path::PathBuf::from("/sys/class/thermal")]);
-        SensorHandle::new(SensorId::from_str("mock-thermal"), Capability::ReadSysfsThermal)
-            .bind(scope)
+        SensorHandle::new(
+            SensorId::from_str("mock-thermal"),
+            Capability::ReadSysfsThermal,
+        )
+        .bind(scope)
     }
 
     #[test]
@@ -203,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mock_sensor_is_object_safe_as_boxed_trait_object() {
+    fn test_mock_sensor_is_object_safe_as_boxed_trait_object() -> TestResult {
         let mock = MockSensor {
             handle: mock_handle(),
             reading: SensorReading::default(),
@@ -212,9 +210,10 @@ mod tests {
 
         let reading = boxed
             .poll(jiff::Timestamp::UNIX_EPOCH)
-            .expect("mock sensor never fails");
+            .map_err(ctx("mock sensor never fails"))?;
         assert_eq!(reading, SensorReading::default());
         assert_eq!(boxed.handle().capability(), Capability::ReadSysfsThermal);
+        Ok(())
     }
 
     #[test]

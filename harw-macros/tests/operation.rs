@@ -344,7 +344,11 @@ impl FromRawArgs for BusyImmediateArgs {
     summary = "Befehl mit busy = \"immediate\".",
     domain = "misc",
     permission = "observer",
-    command(path = "/test_busy_immediate", visibility = "tui_only", busy = "immediate")
+    command(
+        path = "/test_busy_immediate",
+        visibility = "tui_only",
+        busy = "immediate"
+    )
 )]
 async fn test_busy_immediate(
     _ctx: &OpContext,
@@ -377,10 +381,7 @@ impl FromRawArgs for BusyDefaultArgs {
     permission = "observer",
     command(path = "/test_busy_default", visibility = "tui_only")
 )]
-async fn test_busy_default(
-    _ctx: &OpContext,
-    _args: BusyDefaultArgs,
-) -> Result<OpOutput, OpError> {
+async fn test_busy_default(_ctx: &OpContext, _args: BusyDefaultArgs) -> Result<OpOutput, OpError> {
     Ok(OpOutput::from("ok".to_owned()))
 }
 

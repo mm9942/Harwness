@@ -331,11 +331,12 @@ mod ts_serde {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use std::str::FromStr;
 
     /// Fester Referenz-Zeitstempel für deterministische Tests.
-    fn fixed_ts() -> jiff::Timestamp {
-        jiff::Timestamp::from_str("2024-01-01T00:00:00Z").expect("gültiger Zeitstempel")
+    fn fixed_ts() -> TestResult<jiff::Timestamp> {
+        jiff::Timestamp::from_str("2024-01-01T00:00:00Z").map_err(ctx("gültiger Zeitstempel"))
     }
 
     /// Legt einen temporären Home-Ordner unter dem OS-Temp-Verzeichnis an.
@@ -351,116 +352,128 @@ mod tests {
     }
 
     #[test]
-    fn test_write_read_roundtrip() {
+    fn test_write_read_roundtrip() -> TestResult {
         let home = temp_home();
         let checker = UpdateChecker::new(&home);
         let info = VersionInfo {
             latest_version: "1.2.3".to_owned(),
-            last_checked_at: fixed_ts(),
+            last_checked_at: fixed_ts()?,
             dismissed_version: Some("1.2.2".to_owned()),
         };
-        checker.write(&info).expect("write erfolgreich");
-        let read_back = checker.read().expect("read erfolgreich");
+        checker.write(&info).map_err(ctx("write erfolgreich"))?;
+        let read_back = checker.read().map_err(ctx("read erfolgreich"))?;
         assert_eq!(read_back, Some(info));
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 
     #[test]
-    fn test_read_missing_returns_none() {
+    fn test_read_missing_returns_none() -> TestResult {
         let home = temp_home();
         let checker = UpdateChecker::new(&home);
-        let result = checker.read().expect("read ohne Datei ist Ok");
+        let result = checker.read().map_err(ctx("read ohne Datei ist Ok"))?;
         assert_eq!(result, None);
+        Ok(())
     }
 
     #[test]
-    fn test_dismiss_creates_and_persists() {
+    fn test_dismiss_creates_and_persists() -> TestResult {
         let home = temp_home();
         let checker = UpdateChecker::new(&home);
-        checker.dismiss("9.9.9").expect("dismiss erfolgreich");
+        checker
+            .dismiss("9.9.9")
+            .map_err(ctx("dismiss erfolgreich"))?;
         let info = checker
             .read()
-            .expect("read erfolgreich")
-            .expect("Info vorhanden");
+            .map_err(ctx("read erfolgreich"))?
+            .ok_or(TestError::Missing("Info vorhanden"))?;
         assert_eq!(info.dismissed_version, Some("9.9.9".to_owned()));
         assert_eq!(info.latest_version, "9.9.9");
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 
     #[test]
-    fn test_dismiss_updates_existing() {
+    fn test_dismiss_updates_existing() -> TestResult {
         let home = temp_home();
         let checker = UpdateChecker::new(&home);
         let info = VersionInfo {
             latest_version: "2.0.0".to_owned(),
-            last_checked_at: fixed_ts(),
+            last_checked_at: fixed_ts()?,
             dismissed_version: None,
         };
-        checker.write(&info).expect("write erfolgreich");
-        checker.dismiss("2.0.0").expect("dismiss erfolgreich");
+        checker.write(&info).map_err(ctx("write erfolgreich"))?;
+        checker
+            .dismiss("2.0.0")
+            .map_err(ctx("dismiss erfolgreich"))?;
         let updated = checker
             .read()
-            .expect("read erfolgreich")
-            .expect("Info vorhanden");
+            .map_err(ctx("read erfolgreich"))?
+            .ok_or(TestError::Missing("Info vorhanden"))?;
         assert_eq!(updated.latest_version, "2.0.0");
         assert_eq!(updated.dismissed_version, Some("2.0.0".to_owned()));
-        assert_eq!(updated.last_checked_at, fixed_ts());
+        assert_eq!(updated.last_checked_at, fixed_ts()?);
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 
     #[test]
-    fn test_is_stale_true_when_beyond_ttl() {
+    fn test_is_stale_true_when_beyond_ttl() -> TestResult {
         let home = temp_home();
         let checker = UpdateChecker::new(&home);
         let info = VersionInfo {
             latest_version: "1.0.0".to_owned(),
-            last_checked_at: fixed_ts(),
+            last_checked_at: fixed_ts()?,
             dismissed_version: None,
         };
-        checker.write(&info).expect("write erfolgreich");
+        checker.write(&info).map_err(ctx("write erfolgreich"))?;
         // 25 Stunden später bei TTL 20h → fällig.
-        let now = jiff::Timestamp::from_str("2024-01-02T01:00:00Z").expect("gültig");
+        let now = jiff::Timestamp::from_str("2024-01-02T01:00:00Z").map_err(ctx("gültig"))?;
         assert!(checker.is_stale(now, DEFAULT_TTL_SECS));
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 
     #[test]
-    fn test_is_stale_false_within_ttl() {
+    fn test_is_stale_false_within_ttl() -> TestResult {
         let home = temp_home();
         let checker = UpdateChecker::new(&home);
         let info = VersionInfo {
             latest_version: "1.0.0".to_owned(),
-            last_checked_at: fixed_ts(),
+            last_checked_at: fixed_ts()?,
             dismissed_version: None,
         };
-        checker.write(&info).expect("write erfolgreich");
+        checker.write(&info).map_err(ctx("write erfolgreich"))?;
         // 10 Stunden später bei TTL 20h → nicht fällig.
-        let now = jiff::Timestamp::from_str("2024-01-01T10:00:00Z").expect("gültig");
+        let now = jiff::Timestamp::from_str("2024-01-01T10:00:00Z").map_err(ctx("gültig"))?;
         assert!(!checker.is_stale(now, DEFAULT_TTL_SECS));
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 
     #[test]
-    fn test_is_stale_true_when_missing_file() {
+    fn test_is_stale_true_when_missing_file() -> TestResult {
         let home = temp_home();
         let checker = UpdateChecker::new(&home);
         // Keine Datei → fail-open fällig.
-        assert!(checker.is_stale(fixed_ts(), DEFAULT_TTL_SECS));
+        assert!(checker.is_stale(fixed_ts()?, DEFAULT_TTL_SECS));
+        Ok(())
     }
 
     #[test]
-    fn test_is_stale_false_when_last_check_in_future() {
+    fn test_is_stale_false_when_last_check_in_future() -> TestResult {
         let home = temp_home();
         let checker = UpdateChecker::new(&home);
         let info = VersionInfo {
             latest_version: "1.0.0".to_owned(),
-            last_checked_at: fixed_ts(),
+            last_checked_at: fixed_ts()?,
             dismissed_version: None,
         };
-        checker.write(&info).expect("write erfolgreich");
+        checker.write(&info).map_err(ctx("write erfolgreich"))?;
         // now liegt VOR last_checked_at → negative Differenz → nicht fällig.
-        let now = jiff::Timestamp::from_str("2023-12-31T00:00:00Z").expect("gültig");
+        let now = jiff::Timestamp::from_str("2023-12-31T00:00:00Z").map_err(ctx("gültig"))?;
         assert!(!checker.is_stale(now, DEFAULT_TTL_SECS));
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 }

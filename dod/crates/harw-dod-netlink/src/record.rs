@@ -114,7 +114,9 @@ impl From<String> for RawRecord {
 
 impl From<&str> for RawRecord {
     fn from(line: &str) -> Self {
-        Self { line: line.to_owned() }
+        Self {
+            line: line.to_owned(),
+        }
     }
 }
 
@@ -265,7 +267,11 @@ fn parse_audit_timestamp(value: &str) -> Result<jiff::Timestamp, NetlinkError> {
         .map_err(|_| NetlinkError::MalformedRecord)?;
 
     let frac_digits = frac_str.len().clamp(1, 9);
-    let frac_trimmed = if frac_str.is_empty() { "0" } else { &frac_str[..frac_str.len().min(9)] };
+    let frac_trimmed = if frac_str.is_empty() {
+        "0"
+    } else {
+        &frac_str[..frac_str.len().min(9)]
+    };
     let frac_value: u32 = frac_trimmed
         .parse()
         .map_err(|_| NetlinkError::MalformedRecord)?;
@@ -357,73 +363,87 @@ pub fn parse_record(record: &RawRecord) -> Result<AuditFields, NetlinkError> {
 #[cfg(test)]
 mod tests {
     use super::{RawRecord, parse_record};
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
-    fn test_parse_record_full_record_extracts_all_fields() {
+    fn test_parse_record_full_record_extracts_all_fields() -> TestResult {
         let record = RawRecord::new(
             "type=SYSCALL msg=audit(1699999999.123:456): auid=1000 uid=0 pid=4242 success=yes",
         );
-        let fields = parse_record(&record).expect("wohlgeformter Record");
+        let fields = parse_record(&record)?;
 
         assert_eq!(fields.record_type, "SYSCALL");
         assert_eq!(fields.auid, Some(1000));
         assert_eq!(fields.uid, Some(0));
         assert_eq!(fields.pid, Some(4242));
         assert_eq!(fields.success, Some(true));
-        let ts = fields.timestamp.expect("Zeitstempel vorhanden");
+        let ts = fields.timestamp.ok_or(TestError::Missing("Zeitstempel"))?;
         assert_eq!(ts.as_second(), 1_699_999_999);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_record_auid_sentinel_max_value_is_none() {
+    fn test_parse_record_auid_sentinel_max_value_is_none() -> TestResult {
         // Der wichtigste Test dieser Crate: 4294967295 (u32::MAX, -1 als u32)
         // heißt "keine Anmelde-UID gesetzt" und muss None ergeben, nicht
         // Some(4294967295).
         let record = RawRecord::new("type=SYSCALL auid=4294967295 uid=0");
-        let fields = parse_record(&record).expect("wohlgeformter Record");
+        let fields = parse_record(&record)?;
         assert_eq!(fields.auid, None);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_record_auid_zero_is_some_zero() {
+    fn test_parse_record_auid_zero_is_some_zero() -> TestResult {
         // Abgrenzung zum Sentinelwert: auid=0 ist root, der sich tatsächlich
         // angemeldet hat, kein "nicht gesetzt".
         let record = RawRecord::new("type=SYSCALL auid=0 uid=0");
-        let fields = parse_record(&record).expect("wohlgeformter Record");
+        let fields = parse_record(&record)?;
         assert_eq!(fields.auid, Some(0));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_record_quoted_value_is_unpacked() {
+    fn test_parse_record_quoted_value_is_unpacked() -> TestResult {
         let record = RawRecord::new(r#"type=SYSCALL success="yes" auid=1000"#);
-        let fields = parse_record(&record).expect("wohlgeformter Record");
+        let fields = parse_record(&record)?;
         assert_eq!(fields.success, Some(true));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_record_malformed_record_error_message_has_no_record_content() {
+    fn test_parse_record_malformed_record_error_message_has_no_record_content() -> TestResult {
         let record = RawRecord::new("type=SYSCALL auid=not-a-number");
-        let err = parse_record(&record).expect_err("auid ist keine Zahl");
+        let Err(err) = parse_record(&record) else {
+            return Err(TestError::Unexpected(
+                "Err erwartet (auid ist keine Zahl)".into(),
+            ));
+        };
         let message = err.to_string();
         assert_eq!(message, "audit record is malformed");
         assert!(!message.contains("not-a-number"));
         assert!(!message.contains("SYSCALL"));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_record_missing_required_type_field_is_detected() {
+    fn test_parse_record_missing_required_type_field_is_detected() -> TestResult {
         let record = RawRecord::new("auid=1000 uid=0 pid=4242");
-        let err = parse_record(&record).expect_err("type fehlt");
+        let Err(err) = parse_record(&record) else {
+            return Err(TestError::Unexpected("Err erwartet (type fehlt)".into()));
+        };
         assert_eq!(err.to_string(), "audit record is malformed");
+        Ok(())
     }
 
     #[test]
-    fn test_parse_record_unrelated_hex_encoded_field_is_ignored() {
+    fn test_parse_record_unrelated_hex_encoded_field_is_ignored() -> TestResult {
         // exe ist hex-kodiert (siehe Moduldokumentation: bewusst nicht
         // dekodiert), stört aber die Extraktion der bekannten Felder nicht.
         let record = RawRecord::new("type=SYSCALL exe=2F62696E2F62617368 auid=1000");
-        let fields = parse_record(&record).expect("wohlgeformter Record");
+        let fields = parse_record(&record)?;
         assert_eq!(fields.auid, Some(1000));
+        Ok(())
     }
 
     #[test]

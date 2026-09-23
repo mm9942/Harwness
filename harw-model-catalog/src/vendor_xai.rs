@@ -401,6 +401,7 @@ pub fn xai_observations() -> Vec<ObservedModelBehavior> {
 mod tests {
     use super::*;
     use crate::observed::Score;
+    use crate::test_support::{TestError, TestResult};
 
     /// Stellt sicher, dass grok-4.5, grok-build-0.1 und grok-4.3 im Katalog enthalten sind.
     #[test]
@@ -538,70 +539,77 @@ mod tests {
 
     /// grok-build-0.1 ist im Preview-Status (public_beta).
     #[test]
-    fn grok_build_is_preview() {
+    fn grok_build_is_preview() -> TestResult {
         let d = xai_descriptors()
             .into_iter()
             .find(|d| d.model == "grok-build-0.1")
-            .expect("grok-build-0.1 fehlt im Katalog");
+            .ok_or(TestError::Missing("grok-build-0.1 descriptor"))?;
         assert_eq!(
             d.lifecycle,
             ModelLifecycle::Preview,
             "grok-build-0.1 sollte Preview-Lifecycle haben"
         );
+        Ok(())
     }
 
     /// grok-4.3 unterstützt Video-Eingabe (native video input).
     #[test]
-    fn grok_4_3_has_video_modality() {
+    fn grok_4_3_has_video_modality() -> TestResult {
         let d = xai_descriptors()
             .into_iter()
             .find(|d| d.model == "grok-4.3")
-            .expect("grok-4.3 fehlt im Katalog");
+            .ok_or(TestError::Missing("grok-4.3 descriptor"))?;
         assert!(
             d.modalities.contains(Modality::Video),
             "grok-4.3 sollte Modality::Video enthalten"
         );
+        Ok(())
     }
 
     /// grok-4.20-0309-non-reasoning hat kein Reasoning.
     #[test]
-    fn non_reasoning_variant_has_no_reasoning() {
+    fn non_reasoning_variant_has_no_reasoning() -> TestResult {
         let d = xai_descriptors()
             .into_iter()
             .find(|d| d.model == "grok-4.20-0309-non-reasoning")
-            .expect("grok-4.20-0309-non-reasoning fehlt im Katalog");
+            .ok_or(TestError::Missing(
+                "grok-4.20-0309-non-reasoning descriptor",
+            ))?;
         assert_eq!(
             d.capabilities.reasoning,
             ReasoningSupport::None,
             "grok-4.20-0309-non-reasoning sollte kein Reasoning haben"
         );
+        Ok(())
     }
 
     /// grok-4.5 hat Prompt-Caching (implizit, aufgrund gecachter Preise).
     #[test]
-    fn grok_4_5_has_implicit_caching() {
+    fn grok_4_5_has_implicit_caching() -> TestResult {
         let d = xai_descriptors()
             .into_iter()
             .find(|d| d.model == "grok-4.5")
-            .expect("grok-4.5 fehlt im Katalog");
+            .ok_or(TestError::Missing("grok-4.5 descriptor"))?;
         assert_eq!(
             d.capabilities.prompt_caching,
             PromptCachingSupport::Implicit,
             "grok-4.5 sollte implizites Prompt-Caching haben"
         );
+        Ok(())
     }
 
     /// grok-imagine-image-pro hat kein Streaming (eingestelltes Image-Modell).
     #[test]
-    fn imagine_image_pro_has_no_streaming() {
+    fn imagine_image_pro_has_no_streaming() -> TestResult {
         let d = xai_descriptors()
             .into_iter()
             .find(|d| d.model == "grok-imagine-image-pro")
-            .expect("grok-imagine-image-pro fehlt im Katalog");
+            .ok_or(TestError::Missing("grok-imagine-image-pro descriptor"))?;
         assert_eq!(
             d.capabilities.streaming,
             StreamingSupport::None,
             "grok-imagine-image-pro sollte kein Streaming haben"
         );
+        Ok(())
     }
 }

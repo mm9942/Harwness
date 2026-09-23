@@ -93,3 +93,7 @@ pub use fragment::{Fragment, FragmentLabel, FragmentOrigin, SectionName, Stabili
 pub use reference::{DigestStatus, FragmentReference};
 pub use render::{DetailMode, OmissionReason};
 pub use selector::Selector;
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

@@ -250,9 +250,11 @@ pub fn build_sensors(roots: &SensorRoots) -> Vec<Arc<dyn Sensor>> {
     let cpu: Arc<dyn Sensor> = Arc::new(harw_dod_cpu::CpuSensor::from(cpu_handle));
 
     let thermal_scope = ReadScope::from_roots([roots.thermal_root.clone()]);
-    let thermal_handle =
-        SensorHandle::new(SensorId::from_str("thermal-0"), Capability::ReadSysfsThermal)
-            .bind(thermal_scope);
+    let thermal_handle = SensorHandle::new(
+        SensorId::from_str("thermal-0"),
+        Capability::ReadSysfsThermal,
+    )
+    .bind(thermal_scope);
     let thermal: Arc<dyn Sensor> = Arc::new(harw_dod_thermal::ThermalSensor::from(thermal_handle));
 
     let workspace_scope = ReadScope::from_roots([roots.workspace_root.clone()]);
@@ -286,8 +288,9 @@ pub fn build_sensors(roots: &SensorRoots) -> Vec<Arc<dyn Sensor>> {
         Capability::ReadProcNetDev,
     )
     .bind(netcounters_scope);
-    let netcounters: Arc<dyn Sensor> =
-        Arc::new(harw_dod_netcounters::NetCountersSensor::from(netcounters_handle));
+    let netcounters: Arc<dyn Sensor> = Arc::new(harw_dod_netcounters::NetCountersSensor::from(
+        netcounters_handle,
+    ));
 
     let gpu_scope = ReadScope::from_roots([roots.gpu_root.clone()]);
     let gpu_handle =
@@ -295,9 +298,8 @@ pub fn build_sensors(roots: &SensorRoots) -> Vec<Arc<dyn Sensor>> {
     let gpu: Arc<dyn Sensor> = Arc::new(harw_dod_gpu::GpuSensor::from(gpu_handle));
 
     let cgroup_scope = ReadScope::from_roots([roots.cgroup_root.clone()]);
-    let cgroup_handle =
-        SensorHandle::new(SensorId::from_str("cgroup-0"), Capability::ReadCgroupV2)
-            .bind(cgroup_scope);
+    let cgroup_handle = SensorHandle::new(SensorId::from_str("cgroup-0"), Capability::ReadCgroupV2)
+        .bind(cgroup_scope);
     let cgroup: Arc<dyn Sensor> = Arc::new(harw_dod_cgroup::CgroupSensor::from(cgroup_handle));
 
     // `ScanReportSensor` wird nicht über `From<SensorHandle<Bound>>` gebaut,
@@ -340,14 +342,15 @@ pub fn build_sensors(roots: &SensorRoots) -> Vec<Arc<dyn Sensor>> {
 /// abweicht.
 #[must_use]
 pub fn all_unprivileged(sensors: &[Arc<dyn Sensor>]) -> bool {
-    sensors
-        .iter()
-        .all(|sensor| sensor.handle().capability().class() == harw_dod_cap::CapabilityClass::Unprivileged)
+    sensors.iter().all(|sensor| {
+        sensor.handle().capability().class() == harw_dod_cap::CapabilityClass::Unprivileged
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{all_unprivileged, build_sensors, SensorRoots};
+    use super::{SensorRoots, all_unprivileged, build_sensors};
+    use crate::test_support::{TestError, TestResult};
     use harw_dod_cap::{Capability, CapabilityClass};
     use std::path::PathBuf;
 
@@ -417,56 +420,61 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_sensor_appears_with_expected_id_and_capability() {
+    fn test_memory_sensor_appears_with_expected_id_and_capability() -> TestResult {
         let sensors = build_sensors(&roots());
         let memory = sensors
             .iter()
             .find(|s| s.handle().id().as_str() == "memory-0")
-            .expect("memory sensor is registered");
+            .ok_or(TestError::Missing("memory sensor is registered"))?;
         assert_eq!(memory.handle().capability(), Capability::ReadProcMeminfo);
+        Ok(())
     }
 
     #[test]
-    fn test_blockio_sensor_appears_with_expected_id_and_capability() {
+    fn test_blockio_sensor_appears_with_expected_id_and_capability() -> TestResult {
         let sensors = build_sensors(&roots());
         let blockio = sensors
             .iter()
             .find(|s| s.handle().id().as_str() == "blockio-0")
-            .expect("blockio sensor is registered");
+            .ok_or(TestError::Missing("blockio sensor is registered"))?;
         assert_eq!(blockio.handle().capability(), Capability::ReadSysfsBlock);
+        Ok(())
     }
 
     #[test]
-    fn test_netcounters_sensor_appears_with_expected_id_and_capability() {
+    fn test_netcounters_sensor_appears_with_expected_id_and_capability() -> TestResult {
         let sensors = build_sensors(&roots());
         let netcounters = sensors
             .iter()
             .find(|s| s.handle().id().as_str() == "netcounters-0")
-            .expect("netcounters sensor is registered");
+            .ok_or(TestError::Missing("netcounters sensor is registered"))?;
         assert_eq!(
             netcounters.handle().capability(),
             Capability::ReadProcNetDev
         );
+        Ok(())
     }
 
     #[test]
-    fn test_gpu_sensor_appears_with_expected_id_and_capability() {
+    fn test_gpu_sensor_appears_with_expected_id_and_capability() -> TestResult {
         let sensors = build_sensors(&roots());
         let gpu = sensors
             .iter()
             .find(|s| s.handle().id().as_str() == "gpu-0")
-            .expect("gpu sensor is registered");
+            .ok_or(TestError::Missing("gpu sensor is registered"))?;
         assert_eq!(gpu.handle().capability(), Capability::ReadSysfsDrm);
+        Ok(())
     }
 
     #[test]
-    fn test_cgroup_sensor_appears_with_expected_id_and_capability() {
+    fn test_cgroup_sensor_appears_with_expected_id_and_capability() -> TestResult {
         let sensors = build_sensors(&roots());
         let cgroup = sensors
             .iter()
             .find(|s| s.handle().id().as_str() == "cgroup-0")
-            .expect("cgroup sensor is registered");
+            .ok_or(TestError::Missing("cgroup sensor is registered"))?;
         assert_eq!(cgroup.handle().capability(), Capability::ReadCgroupV2);
+        Ok(())
     }
 
     #[test]

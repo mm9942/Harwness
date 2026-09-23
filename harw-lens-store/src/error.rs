@@ -111,6 +111,7 @@ pub enum LensStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn test_lens_store_error_display_invalid_index_name() {
@@ -155,9 +156,14 @@ mod tests {
     }
 
     #[test]
-    fn test_lens_store_error_from_serde() {
-        let serde_err = serde_json::from_str::<u32>("not json").unwrap_err();
+    fn test_lens_store_error_from_serde() -> TestResult {
+        let Err(serde_err) = serde_json::from_str::<u32>("not json") else {
+            return Err(TestError::Unexpected(
+                "malformed JSON must fail to parse".to_owned(),
+            ));
+        };
         let err: LensStoreError = serde_err.into();
         assert!(matches!(err, LensStoreError::Serde(_)));
+        Ok(())
     }
 }

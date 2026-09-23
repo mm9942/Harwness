@@ -272,32 +272,44 @@ impl<E: Embedder> Embedder for DimensionCheckedEmbedder<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
-    fn test_deterministic_embedder_same_text_yields_same_vector() {
+    fn test_deterministic_embedder_same_text_yields_same_vector() -> TestResult {
         let embedder = DeterministicEmbedder::new(16);
-        let a = embedder.embed(&["hello".to_owned()]).expect("no error");
-        let b = embedder.embed(&["hello".to_owned()]).expect("no error");
+        let a = embedder
+            .embed(&["hello".to_owned()])
+            .map_err(ctx("no error"))?;
+        let b = embedder
+            .embed(&["hello".to_owned()])
+            .map_err(ctx("no error"))?;
         assert_eq!(a, b);
+        Ok(())
     }
 
     #[test]
-    fn test_deterministic_embedder_different_texts_yield_different_vectors() {
+    fn test_deterministic_embedder_different_texts_yield_different_vectors() -> TestResult {
         let embedder = DeterministicEmbedder::new(16);
-        let a = embedder.embed(&["hello".to_owned()]).expect("no error");
-        let b = embedder.embed(&["world".to_owned()]).expect("no error");
+        let a = embedder
+            .embed(&["hello".to_owned()])
+            .map_err(ctx("no error"))?;
+        let b = embedder
+            .embed(&["world".to_owned()])
+            .map_err(ctx("no error"))?;
         assert_ne!(a, b);
+        Ok(())
     }
 
     #[test]
-    fn test_deterministic_embedder_vector_length_matches_dimensions() {
+    fn test_deterministic_embedder_vector_length_matches_dimensions() -> TestResult {
         let embedder = DeterministicEmbedder::new(24);
         let vectors = embedder
             .embed(&["a".to_owned(), "b".to_owned()])
-            .expect("no error");
+            .map_err(ctx("no error"))?;
         for vector in vectors {
             assert_eq!(vector.len(), 24);
         }
+        Ok(())
     }
 
     /// Ein `Embedder`, der bewusst eine falsche Vektorlänge liefert -- der

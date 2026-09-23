@@ -714,6 +714,7 @@ pub fn meta_observations() -> Vec<ObservedModelBehavior> {
 mod tests {
     use super::*;
     use crate::descriptor::{Modality, ModelLifecycle, StreamingSupport};
+    use crate::test_support::{TestError, TestResult};
 
     // ── meta_releases ────────────────────────────────────────────────────────
 
@@ -842,23 +843,24 @@ mod tests {
     }
 
     #[test]
-    fn cerebras_scout_descriptor_present() {
+    fn cerebras_scout_descriptor_present() -> TestResult {
         // Spezifische Assertion aus Brief: llama-4-scout-17b-16e-instruct @ cerebras.
         let ds = meta_descriptors();
         let d = ds
             .iter()
             .find(|d| d.provider == "cerebras" && d.model == "llama-4-scout-17b-16e-instruct")
-            .expect("Cerebras Scout-Descriptor fehlt");
+            .ok_or(TestError::Missing("Cerebras Scout-Descriptor"))?;
         assert_eq!(d.lifecycle, ModelLifecycle::Ga);
         assert!(
             d.capabilities.image_input,
             "Scout sollte image_input=true haben"
         );
         assert!(d.modalities.contains(Modality::Image));
+        Ok(())
     }
 
     #[test]
-    fn together_llama33_70b_descriptor_present() {
+    fn together_llama33_70b_descriptor_present() -> TestResult {
         // Spezifische Assertion: meta-llama/Llama-3.3-70B-Instruct-Turbo @ together.
         let ds = meta_descriptors();
         let d = ds
@@ -866,33 +868,39 @@ mod tests {
             .find(|d| {
                 d.provider == "together" && d.model == "meta-llama/Llama-3.3-70B-Instruct-Turbo"
             })
-            .expect("Together Llama-3.3-70B-Instruct-Turbo Descriptor fehlt");
+            .ok_or(TestError::Missing(
+                "Together Llama-3.3-70B-Instruct-Turbo Descriptor",
+            ))?;
         assert_eq!(d.lifecycle, ModelLifecycle::Ga);
         assert!(
             !d.capabilities.image_input,
             "3.3-Serie sollte kein image_input haben"
         );
         assert!(!d.modalities.contains(Modality::Image));
+        Ok(())
     }
 
     #[test]
-    fn groq_llama33_70b_versatile_descriptor_present() {
+    fn groq_llama33_70b_versatile_descriptor_present() -> TestResult {
         // Spezifische Assertion: llama-3.3-70b-versatile @ groq.
         let ds = meta_descriptors();
         let d = ds
             .iter()
             .find(|d| d.provider == "groq" && d.model == "llama-3.3-70b-versatile")
-            .expect("Groq llama-3.3-70b-versatile Descriptor fehlt");
+            .ok_or(TestError::Missing(
+                "Groq llama-3.3-70b-versatile Descriptor",
+            ))?;
         // Groq 3.3-70b hat status="deprecated" → Descriptor-Lifecycle=Deprecated.
         assert_eq!(
             d.lifecycle,
             ModelLifecycle::Deprecated,
             "Groq llama-3.3-70b-versatile sollte Deprecated sein"
         );
+        Ok(())
     }
 
     #[test]
-    fn maverick_groq_is_deprecated() {
+    fn maverick_groq_is_deprecated() -> TestResult {
         // Maverick / Groq hat status="deprecated" → Descriptor-Lifecycle=Deprecated.
         let ds = meta_descriptors();
         let d = ds
@@ -900,8 +908,9 @@ mod tests {
             .find(|d| {
                 d.provider == "groq" && d.model == "meta-llama/llama-4-maverick-17b-128e-instruct"
             })
-            .expect("Groq Maverick-Descriptor fehlt");
+            .ok_or(TestError::Missing("Groq Maverick-Descriptor"))?;
         assert_eq!(d.lifecycle, ModelLifecycle::Deprecated);
+        Ok(())
     }
 
     #[test]
@@ -1028,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn scout_groq_is_preview_lifecycle() {
+    fn scout_groq_is_preview_lifecycle() -> TestResult {
         // Scout / Groq hat status="preview" → Descriptor-Lifecycle=Preview.
         let ds = meta_descriptors();
         let d = ds
@@ -1036,12 +1045,13 @@ mod tests {
             .find(|d| {
                 d.provider == "groq" && d.model == "meta-llama/llama-4-scout-17b-16e-instruct"
             })
-            .expect("Groq Scout-Descriptor fehlt");
+            .ok_or(TestError::Missing("Groq Scout-Descriptor"))?;
         assert_eq!(
             d.lifecycle,
             ModelLifecycle::Preview,
             "Groq Scout sollte Preview sein"
         );
+        Ok(())
     }
 
     #[test]

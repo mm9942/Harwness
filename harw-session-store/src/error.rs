@@ -180,17 +180,23 @@ pub enum SessionStoreError {
     /// `JobStore::deny_blocked` on a job that is not `Blocked`. `/deny` falls
     /// back to `JobStore::cancel` for every other source state; this variant
     /// only fires for the dedicated Blocked-capable transition.
-    #[msg("job '{work_id}' cannot be denied from state {state:?}; only a Blocked job can be denied via deny_blocked")]
+    #[msg(
+        "job '{work_id}' cannot be denied from state {state:?}; only a Blocked job can be denied via deny_blocked"
+    )]
     JobNotDeniable { work_id: WorkId, state: JobState },
 
     /// `JobStore::retry` on a job that is neither `Failed` nor `Cancelled`.
-    #[msg("job '{work_id}' cannot be retried from state {state:?}; only Failed or Cancelled jobs are retryable")]
+    #[msg(
+        "job '{work_id}' cannot be retried from state {state:?}; only Failed or Cancelled jobs are retryable"
+    )]
     JobNotRetryable { work_id: WorkId, state: JobState },
 
     /// `JobStore::retry` refused to requeue because the job's own
     /// [`harw_job_runtime::RetryPolicy`] has no attempts left. The caller must
     /// not silently requeue past this ceiling.
-    #[msg("job '{work_id}' retry limit exhausted: {attempts} attempt(s) already recorded against a policy of {max_attempts}")]
+    #[msg(
+        "job '{work_id}' retry limit exhausted: {attempts} attempt(s) already recorded against a policy of {max_attempts}"
+    )]
     JobRetryLimitExhausted {
         work_id: WorkId,
         attempts: u32,

@@ -57,8 +57,8 @@
 //! Welle 2 (2d) — `/model switch` becomes the sole atomic provider+model switch.
 
 use harw_macros::operation;
-use harw_operations::{OpContext, OpError, OpOutput, SharedSessionController};
 use harw_operations::session_control::UiaSelection;
+use harw_operations::{OpContext, OpError, OpOutput, SharedSessionController};
 use std::sync::Arc;
 
 /// Argument struct for the `/provider` command.
@@ -78,7 +78,7 @@ use std::sync::Arc;
 ///
 /// # Spec Reference
 /// harwness Plan v2 — `/provider` sub-command table; Welle 2 (2d) — `switch` retired.
-#[derive(Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, harw_macros::OpArgs)]
 pub struct ProviderArgs {
     /// Sub-command: `"show"` (default), `"list"`, `"test"`.
     #[serde(default)]
@@ -141,7 +141,9 @@ fn configured_auth_status_label(provider: &harw_config::ProviderToml) -> &'stati
 /// `handle_uia_switch_core` already use — the runtime (`harw-tui`'s
 /// `command_exec::build_services`) injects `Arc<harw_config::ResolvedConfig>`
 /// into the `ServiceMap` specifically for `/model`- and `/provider`-ops.
-pub(crate) fn resolved_config(ctx: &OpContext) -> Result<Arc<harw_config::ResolvedConfig>, OpError> {
+pub(crate) fn resolved_config(
+    ctx: &OpContext,
+) -> Result<Arc<harw_config::ResolvedConfig>, OpError> {
     if let Some(config) = ctx.service::<Arc<harw_config::ResolvedConfig>>() {
         return Ok(Arc::clone(config));
     }
@@ -279,20 +281,20 @@ fn handle_show(ctx: &OpContext) -> Result<OpOutput, OpError> {
         }
     } else {
         let text = match &config.harness.default_provider {
-            Some(name) if configured_provider(&config, name).is_some() => {
-                let (canonical_id, _) = configured_provider(&config, name)
-                    .expect("configured provider was checked in the match guard");
-                let mut text = format!(
-                    "Active provider : {canonical_id}  (default from config, not yet switched)\n\
-                 Use `/provider switch <id>` to change the active provider."
-                );
-                append_load_status(ctx, canonical_id, &mut text);
-                text
-            }
-            Some(name) => format!(
-                "Default provider '{name}' is not present in the configured provider catalog. \
-                 Use `harw onboard` to repair the configuration."
-            ),
+            Some(name) => match configured_provider(&config, name) {
+                Some((canonical_id, _)) => {
+                    let mut text = format!(
+                        "Active provider : {canonical_id}  (default from config, not yet switched)\n\
+                     Use `/provider switch <id>` to change the active provider."
+                    );
+                    append_load_status(ctx, canonical_id, &mut text);
+                    text
+                }
+                None => format!(
+                    "Default provider '{name}' is not present in the configured provider catalog. \
+                     Use `harw onboard` to repair the configuration."
+                ),
+            },
             None => "No default provider configured. Use `harw onboard` to set one up.".to_owned(),
         };
         Ok(OpOutput::from(text))
@@ -525,8 +527,10 @@ pub(crate) fn handle_switch_core(
     // compatible with the target provider.
     let resolved_model: Option<String> = match &model {
         Some(requested_model) => {
-            let configured = crate::model::configured_model(&config, requested_model)
-                .ok_or_else(|| OpError::InvalidArguments(format!("unknown model: {requested_model}")))?;
+            let configured =
+                crate::model::configured_model(&config, requested_model).ok_or_else(|| {
+                    OpError::InvalidArguments(format!("unknown model: {requested_model}"))
+                })?;
             let model_provider = configured_provider(&config, &configured.provider)
                 .map(|(canonical, _)| canonical)
                 .unwrap_or(configured.provider.as_str());
@@ -542,7 +546,8 @@ pub(crate) fn handle_switch_core(
             let snap = controller.snapshot();
             if let Some(ref active_model) = snap.active_model {
                 if let Some(model) = config.models.values().find(|model| {
-                    model.id == *active_model || model.aliases.iter().any(|alias| alias == active_model)
+                    model.id == *active_model
+                        || model.aliases.iter().any(|alias| alias == active_model)
                 }) {
                     let model_provider = configured_provider(&config, &model.provider)
                         .map(|(canonical, _)| canonical)
@@ -655,8 +660,10 @@ pub(crate) fn handle_uia_switch_core(
     let mut cleared_incompatible_model = None;
     let resolved_model = match model {
         Some(requested_model) => {
-            let configured = crate::model::configured_model(&config, &requested_model)
-                .ok_or_else(|| OpError::InvalidArguments(format!("unknown model: {requested_model}")))?;
+            let configured =
+                crate::model::configured_model(&config, &requested_model).ok_or_else(|| {
+                    OpError::InvalidArguments(format!("unknown model: {requested_model}"))
+                })?;
             let model_provider = configured_provider(&config, &configured.provider)
                 .map(|(canonical, _)| canonical)
                 .unwrap_or(configured.provider.as_str());
@@ -687,7 +694,7 @@ pub(crate) fn handle_uia_switch_core(
                     cleared_incompatible_model = Some(current_model.to_owned());
                     None
                 }
-            }
+            },
         },
     };
 
@@ -807,7 +814,7 @@ fn handle_test(ctx: &OpContext) -> Result<OpOutput, OpError> {
 /// # Spec Reference
 /// Plan v2, Welle 6b — UIA-Sichtbarkeit auf Provider-Concurrency/
 /// Rate-Limit-Zustand + Live-Anpassung.
-#[derive(Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, harw_macros::OpArgs)]
 pub struct ProviderConcurrencyArgs {
     #[serde(default)]
     pub provider: Option<String>,
@@ -910,23 +917,35 @@ fn parse_concurrency_value(raw: &str) -> Result<Option<usize>, OpError> {
     domain = "catalog_config",
     permission = "operator",
     category = "model",
-    command(path = "/provider-concurrency", visibility = "tui_only", busy = "immediate"),
+    command(
+        path = "/provider-concurrency",
+        visibility = "tui_only",
+        busy = "immediate"
+    ),
     model_tool(approval = "always")
 )]
 async fn provider_concurrency(
     ctx: &OpContext,
     args: ProviderConcurrencyArgs,
 ) -> Result<OpOutput, OpError> {
-    let provider_arg = args.provider.as_deref().filter(|s| !s.trim().is_empty()).ok_or_else(|| {
-        OpError::InvalidArguments(
-            "usage: /provider-concurrency <provider> <n|unlimited>".to_owned(),
-        )
-    })?;
-    let value_arg = args.value.as_deref().filter(|s| !s.trim().is_empty()).ok_or_else(|| {
-        OpError::InvalidArguments(
-            "usage: /provider-concurrency <provider> <n|unlimited>".to_owned(),
-        )
-    })?;
+    let provider_arg = args
+        .provider
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            OpError::InvalidArguments(
+                "usage: /provider-concurrency <provider> <n|unlimited>".to_owned(),
+            )
+        })?;
+    let value_arg = args
+        .value
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            OpError::InvalidArguments(
+                "usage: /provider-concurrency <provider> <n|unlimited>".to_owned(),
+            )
+        })?;
     let target = parse_concurrency_value(value_arg)?;
 
     let config = resolved_config(ctx)?;
@@ -1013,7 +1032,7 @@ async fn provider_concurrency(
     domain = "catalog_config",
     permission = "operator",
     category = "model",
-    command(path = "/uia-provider", visibility = "tui_only"),
+    command(path = "/uia-provider", visibility = "tui_only")
 )]
 async fn uia_provider(ctx: &OpContext, args: ProviderArgs) -> Result<OpOutput, OpError> {
     let sub = args.cmd.as_deref().unwrap_or("show");
@@ -1103,7 +1122,10 @@ fn handle_uia_list(ctx: &OpContext) -> Result<OpOutput, OpError> {
         } else {
             "[auth-missing]"
         };
-        lines.push(format!("  {}  id={}  {status}", provider.name, provider.name));
+        lines.push(format!(
+            "  {}  id={}  {status}",
+            provider.name, provider.name
+        ));
     }
     lines.push(format!(
         "\nEffective UIA provider: {}",
@@ -1150,7 +1172,11 @@ fn handle_uia_test(ctx: &OpContext) -> Result<OpOutput, OpError> {
         }
         None => "Auth method: (none) — provider has no `auth` field configured.".to_owned(),
     };
-    let status = if provider.enabled { "enabled" } else { "disabled" };
+    let status = if provider.enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
     Ok(OpOutput::from(format!(
         "Effective UIA provider : {canonical}  [{status}]\nAPI type                : {}\n{}\nNote: live connection test (HTTP ping) not yet wired.",
         provider.api, auth_info
@@ -1160,14 +1186,17 @@ fn handle_uia_test(ctx: &OpContext) -> Result<OpOutput, OpError> {
 #[cfg(test)]
 mod tests {
     use super::{ProviderArgs, configured_provider};
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_operations::{
         FromRawArgs, NullSessionController, OpContext, OpError, SharedSessionController,
         context::ServiceMap,
     };
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::sync::Arc;
 
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
 
     // ── Context builder ───────────────────────────────────────────────────────
@@ -1176,13 +1205,13 @@ mod tests {
     fn make_test_ctx(
         ctrl: Option<SharedSessionController>,
         config: Option<Arc<harw_config::ResolvedConfig>>,
-    ) -> (OpContext, std::path::PathBuf) {
+    ) -> TestResult<(OpContext, std::path::PathBuf)> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp =
             std::env::temp_dir().join(format!("harw-provider-test-{}-{}", std::process::id(), id));
-        std::fs::create_dir_all(tmp.join("ws")).unwrap();
+        std::fs::create_dir_all(tmp.join("ws")).map_err(ctx("create test workspace"))?;
         let registry = WorkspaceRegistry::build(
             &tmp,
             [WorkspaceRegistration {
@@ -1191,13 +1220,13 @@ mod tests {
                 root: std::path::PathBuf::from("ws"),
             }],
         )
-        .expect("WorkspaceRegistry::build");
+        .map_err(ctx("WorkspaceRegistry::build"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .expect("resolve binding");
+            .map_err(ctx("resolve binding"))?;
         let sandbox = SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ReadWorkspace]),
@@ -1210,37 +1239,39 @@ mod tests {
             services.insert(config);
         }
         let ctx = OpContext::new(SessionId::new(), TurnId::new(), sandbox, services);
-        (ctx, tmp)
+        Ok((ctx, tmp))
     }
 
     // ── Existing arg-parsing tests (preserved) ────────────────────────────────
 
     #[test]
-    fn test_provider_args_from_raw_args_sets_cmd() {
+    fn test_provider_args_from_raw_args_sets_cmd() -> TestResult {
         let args = ProviderArgs::from_raw_args(&toks(&["list"]));
         match args {
             Ok(a) => assert_eq!(a.cmd.as_deref(), Some("list")),
-            Err(e) => panic!("Unexpected error: {e}"),
+            Err(e) => return Err(TestError::Unexpected(format!("Unexpected error: {e}"))),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_provider_args_from_raw_args_empty_tokens_sets_cmd_none() {
+    fn test_provider_args_from_raw_args_empty_tokens_sets_cmd_none() -> TestResult {
         let args = ProviderArgs::from_raw_args(&toks(&[]));
         match args {
             Ok(a) => assert!(a.cmd.is_none()),
-            Err(e) => panic!("Unexpected error: {e}"),
+            Err(e) => return Err(TestError::Unexpected(format!("Unexpected error: {e}"))),
         }
+        Ok(())
     }
 
     /// `switch` without a provider ID must return `OpError::InvalidArguments`.
     #[tokio::test]
-    async fn test_provider_switch_requires_target_id() {
+    async fn test_provider_switch_requires_target_id() -> TestResult {
         let args = ProviderArgs {
             cmd: Some("switch ".to_string()),
         };
         let ctrl: SharedSessionController = Arc::new(NullSessionController::new());
-        let (ctx, _tmp) = make_test_ctx(Some(ctrl), None);
+        let (ctx, _tmp) = make_test_ctx(Some(ctrl), None)?;
 
         let result = super::provider(&ctx, args).await;
 
@@ -1251,30 +1282,38 @@ mod tests {
                     "Error message must contain 'switch': {msg}"
                 );
             }
-            other => panic!("Expected OpError::InvalidArguments, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Expected OpError::InvalidArguments, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// `FromRawArgs` joins multiple tokens so that `["switch", "anthropic"]`
     /// becomes `"switch anthropic"`, which `strip_prefix("switch ")` recognises.
     #[test]
-    fn test_provider_args_recognizes_switch_prefix() {
+    fn test_provider_args_recognizes_switch_prefix() -> TestResult {
         let args = ProviderArgs::from_raw_args(&toks(&["switch", "anthropic"]))
-            .expect("from_raw_args must not fail");
-        let cmd = args.cmd.expect("cmd must be set");
+            .map_err(ctx("from_raw_args must not fail"))?;
+        let cmd = args.cmd.ok_or(TestError::Missing("cmd must be set"))?;
         assert!(
             cmd.strip_prefix("switch ").is_some(),
             "cmd must start with 'switch ', got: {cmd:?}"
         );
         assert_eq!(
-            cmd.strip_prefix("switch ").unwrap().trim(),
+            cmd.strip_prefix("switch ")
+                .ok_or(TestError::Missing("switch prefix"))?
+                .trim(),
             "anthropic",
             "Provider ID after 'switch ' must be 'anthropic'"
         );
+        Ok(())
     }
 
     #[test]
-    fn configured_provider_canonicalizes_a_configured_alias() {
+    fn configured_provider_canonicalizes_a_configured_alias() -> TestResult {
         let mut config = harw_config::ResolvedConfig::default();
         config.providers.insert(
             "operator-alias".to_owned(),
@@ -1284,7 +1323,7 @@ mod tests {
                 base_url: "https://api.example.test/v1".to_owned(),
                 auth: None,
                 auth_header: None,
-            api_key: None,
+                api_key: None,
                 headers: Default::default(),
                 models: Vec::new(),
                 enabled: true,
@@ -1293,34 +1332,38 @@ mod tests {
                 max_concurrency: None,
                 originator: None,
                 default_reasoning_effort: None,
+                gateway_identity_headers: false,
             },
         );
 
-        let (canonical, _) =
-            configured_provider(&config, "operator-alias").expect("configured alias must resolve");
+        let (canonical, _) = configured_provider(&config, "operator-alias")
+            .ok_or(TestError::Missing("configured alias must resolve"))?;
         assert_eq!(canonical, "canonical-provider");
+        Ok(())
     }
 
     #[test]
-    fn resolved_config_prefers_context_service() {
+    fn resolved_config_prefers_context_service() -> TestResult {
         let config = Arc::new(harw_config::ResolvedConfig::default());
-        let (ctx, _tmp) = make_test_ctx(None, Some(Arc::clone(&config)));
+        let (ctx, _tmp) = make_test_ctx(None, Some(Arc::clone(&config)))?;
 
-        let resolved = super::resolved_config(&ctx).expect("context config must resolve");
+        let resolved = super::resolved_config(&ctx)
+            .map_err(crate::test_support::ctx("context config must resolve"))?;
 
         assert!(
             Arc::ptr_eq(&resolved, &config),
             "the context-scoped resolved config must be authoritative"
         );
+        Ok(())
     }
 
     // ── Task D: provider_unknown_subcommand_rejected ──────────────────────────
 
     /// An unrecognised sub-command must return `OpError::InvalidArguments`.
     #[tokio::test]
-    async fn provider_unknown_subcommand_rejected() {
+    async fn provider_unknown_subcommand_rejected() -> TestResult {
         let ctrl: SharedSessionController = Arc::new(NullSessionController::new());
-        let (ctx, _tmp) = make_test_ctx(Some(ctrl), None);
+        let (ctx, _tmp) = make_test_ctx(Some(ctrl), None)?;
 
         let args = ProviderArgs {
             cmd: Some("frobnicator".to_owned()),
@@ -1339,9 +1382,12 @@ mod tests {
                 );
             }
             other => {
-                panic!("Expected OpError::InvalidArguments for unknown sub-command, got: {other:?}")
+                return Err(TestError::Unexpected(format!(
+                    "Expected OpError::InvalidArguments for unknown sub-command, got: {other:?}"
+                )));
             }
         }
+        Ok(())
     }
 
     // ── Welle 2 (2d), Teil 1: `switch` retired as a `/provider` sub-command ───
@@ -1351,9 +1397,9 @@ mod tests {
     /// message must redirect the operator to `/model` (the sole atomic
     /// provider+model switch entry point since this node).
     #[tokio::test]
-    async fn provider_switch_subcommand_no_longer_supported() {
+    async fn provider_switch_subcommand_no_longer_supported() -> TestResult {
         let ctrl: SharedSessionController = Arc::new(NullSessionController::new());
-        let (ctx, _tmp) = make_test_ctx(Some(ctrl), None);
+        let (ctx, _tmp) = make_test_ctx(Some(ctrl), None)?;
 
         let args = ProviderArgs {
             cmd: Some("switch anthropic".to_owned()),
@@ -1371,16 +1417,21 @@ mod tests {
                     "message must point the operator to /model: {msg}"
                 );
             }
-            other => panic!("Expected OpError::InvalidArguments, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Expected OpError::InvalidArguments, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// Same as [`provider_switch_subcommand_no_longer_supported`] but for
     /// `/uia-provider`, whose message must point to `/uia-model` instead.
     #[tokio::test]
-    async fn uia_provider_switch_subcommand_no_longer_supported() {
+    async fn uia_provider_switch_subcommand_no_longer_supported() -> TestResult {
         let ctrl: SharedSessionController = Arc::new(NullSessionController::new());
-        let (ctx, _tmp) = make_test_ctx(Some(ctrl), None);
+        let (ctx, _tmp) = make_test_ctx(Some(ctrl), None)?;
 
         let args = ProviderArgs {
             cmd: Some("switch anthropic".to_owned()),
@@ -1398,8 +1449,13 @@ mod tests {
                     "message must point the operator to /uia-model: {msg}"
                 );
             }
-            other => panic!("Expected OpError::InvalidArguments, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Expected OpError::InvalidArguments, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     // ── `/provider-concurrency` (Welle 6b) ─────────────────────────────────────
@@ -1423,6 +1479,7 @@ mod tests {
                 max_concurrency: None,
                 originator: None,
                 default_reasoning_effort: None,
+                gateway_identity_headers: false,
             },
         );
         config
@@ -1466,17 +1523,18 @@ mod tests {
     }
 
     #[test]
-    fn provider_concurrency_args_from_raw_args_assigns_provider_and_value() {
+    fn provider_concurrency_args_from_raw_args_assigns_provider_and_value() -> TestResult {
         let args = super::ProviderConcurrencyArgs::from_raw_args(&toks(&["openai", "3"]))
-            .expect("from_raw_args must not fail");
+            .map_err(ctx("from_raw_args must not fail"))?;
         assert_eq!(args.provider.as_deref(), Some("openai"));
         assert_eq!(args.value.as_deref(), Some("3"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn provider_concurrency_rejects_missing_provider_argument() {
+    async fn provider_concurrency_rejects_missing_provider_argument() -> TestResult {
         let config = Arc::new(openai_provider_config("openai"));
-        let (ctx, _tmp) = make_test_ctx(None, Some(config));
+        let (ctx, _tmp) = make_test_ctx(None, Some(config))?;
 
         let args = super::ProviderConcurrencyArgs {
             provider: None,
@@ -1484,12 +1542,13 @@ mod tests {
         };
         let result = super::provider_concurrency(&ctx, args).await;
         assert!(matches!(result, Err(OpError::InvalidArguments(_))));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn provider_concurrency_rejects_unknown_provider() {
+    async fn provider_concurrency_rejects_unknown_provider() -> TestResult {
         let config = Arc::new(openai_provider_config("openai"));
-        let (ctx, _tmp) = make_test_ctx(None, Some(config));
+        let (ctx, _tmp) = make_test_ctx(None, Some(config))?;
 
         let args = super::ProviderConcurrencyArgs {
             provider: Some("does-not-exist".to_owned()),
@@ -1500,17 +1559,23 @@ mod tests {
             Err(OpError::InvalidArguments(msg)) => {
                 assert!(msg.contains("unknown provider"), "message was: {msg}");
             }
-            other => panic!("Expected OpError::InvalidArguments, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Expected OpError::InvalidArguments, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn provider_concurrency_without_registered_load_registry_is_not_available() {
+    async fn provider_concurrency_without_registered_load_registry_is_not_available() -> TestResult
+    {
         // No `ProviderLoadRegistry` service inserted — simulates a runtime
         // whose composition root has not wired one into the `ServiceMap` yet
         // (see `harw_provider_http::build_provider_with_load_registry` doc).
         let config = Arc::new(openai_provider_config("openai"));
-        let (ctx, _tmp) = make_test_ctx(None, Some(config));
+        let (ctx, _tmp) = make_test_ctx(None, Some(config))?;
 
         let args = super::ProviderConcurrencyArgs {
             provider: Some("openai".to_owned()),
@@ -1518,5 +1583,6 @@ mod tests {
         };
         let result = super::provider_concurrency(&ctx, args).await;
         assert!(matches!(result, Err(OpError::NotAvailable(_))));
+        Ok(())
     }
 }

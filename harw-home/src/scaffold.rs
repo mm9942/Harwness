@@ -251,6 +251,7 @@ description = \"Default child-agent role, scaffolded automatically for immediate
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn profile_config_template_guides_current_default_model() {
@@ -259,60 +260,65 @@ mod tests {
     }
 
     #[test]
-    fn first_scaffold_persists_selected_non_default_profile() {
+    fn first_scaffold_persists_selected_non_default_profile() -> TestResult {
         let home =
             std::env::temp_dir().join(format!("harw-home-scaffold-{}", uuid::Uuid::now_v7()));
         let profile = "foo";
 
-        let report = ensure_home_with_profile(&home, profile).expect("scaffold home");
+        let report = ensure_home_with_profile(&home, profile).map_err(ctx("scaffold home"))?;
 
         assert!(report.created_home);
         assert_eq!(report.profile_dir, home.join("profiles").join(profile));
         assert_eq!(
-            std::fs::read_to_string(paths::active_profile_path(&home)).expect("active profile"),
+            std::fs::read_to_string(paths::active_profile_path(&home))
+                .map_err(ctx("active profile"))?,
             "foo\n"
         );
         assert!(report.profile_dir.join("config.toml").is_file());
         assert!(!home.join("profiles").join(paths::DEFAULT_PROFILE).exists());
 
-        let rerun = ensure_home_with_profile(&home, profile).expect("re-scaffold home");
+        let rerun = ensure_home_with_profile(&home, profile).map_err(ctx("re-scaffold home"))?;
 
         assert!(!rerun.created_home);
         assert!(rerun.written_files.is_empty());
         assert_eq!(
-            std::fs::read_to_string(paths::active_profile_path(&home)).expect("active profile"),
+            std::fs::read_to_string(paths::active_profile_path(&home))
+                .map_err(ctx("active profile"))?,
             "foo\n"
         );
 
-        std::fs::remove_dir_all(&home).expect("remove temporary scaffold");
+        std::fs::remove_dir_all(&home).map_err(ctx("remove temporary scaffold"))?;
+        Ok(())
     }
 
     #[test]
-    fn scaffold_preserves_existing_active_profile_pointer() {
+    fn scaffold_preserves_existing_active_profile_pointer() -> TestResult {
         let home =
             std::env::temp_dir().join(format!("harw-home-scaffold-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&home).expect("create temporary home");
+        std::fs::create_dir_all(&home).map_err(ctx("create temporary home"))?;
         std::fs::write(paths::active_profile_path(&home), "existing\n")
-            .expect("write active profile");
+            .map_err(ctx("write active profile"))?;
 
-        let report = ensure_home(&home).expect("scaffold home");
+        let report = ensure_home(&home).map_err(ctx("scaffold home"))?;
 
         assert_eq!(report.profile_dir, home.join("profiles").join("existing"));
         assert_eq!(
-            std::fs::read_to_string(paths::active_profile_path(&home)).expect("active profile"),
+            std::fs::read_to_string(paths::active_profile_path(&home))
+                .map_err(ctx("active profile"))?,
             "existing\n"
         );
 
-        std::fs::remove_dir_all(&home).expect("remove temporary scaffold");
+        std::fs::remove_dir_all(&home).map_err(ctx("remove temporary scaffold"))?;
+        Ok(())
     }
 
     #[test]
-    fn first_scaffold_writes_default_worker_agent_toml() {
+    fn first_scaffold_writes_default_worker_agent_toml() -> TestResult {
         let home =
             std::env::temp_dir().join(format!("harw-home-scaffold-{}", uuid::Uuid::now_v7()));
         let profile = "foo";
 
-        let report = ensure_home_with_profile(&home, profile).expect("scaffold home");
+        let report = ensure_home_with_profile(&home, profile).map_err(ctx("scaffold home"))?;
 
         let agent_path = report
             .profile_dir
@@ -325,54 +331,57 @@ mod tests {
             "the default worker agent.toml must be reported as newly written on first run"
         );
 
-        let contents = std::fs::read_to_string(&agent_path).expect("read default agent.toml");
-        let agent: harw_config::AgentToml =
-            toml::from_str(&contents).expect("default worker agent.toml must be valid AgentToml");
+        let contents =
+            std::fs::read_to_string(&agent_path).map_err(ctx("read default agent.toml"))?;
+        let agent: harw_config::AgentToml = toml::from_str(&contents)
+            .map_err(ctx("default worker agent.toml must be valid AgentToml"))?;
         assert_eq!(agent.name, "worker");
         assert_eq!(
             agent.role, "worker",
             "an omitted role must default to the worker role"
         );
 
-        std::fs::remove_dir_all(&home).expect("remove temporary scaffold");
+        std::fs::remove_dir_all(&home).map_err(ctx("remove temporary scaffold"))?;
+        Ok(())
     }
 
     #[test]
-    fn rerun_does_not_overwrite_default_worker_agent_toml() {
+    fn rerun_does_not_overwrite_default_worker_agent_toml() -> TestResult {
         let home =
             std::env::temp_dir().join(format!("harw-home-scaffold-{}", uuid::Uuid::now_v7()));
         let profile = "foo";
 
-        let first = ensure_home_with_profile(&home, profile).expect("scaffold home");
+        let first = ensure_home_with_profile(&home, profile).map_err(ctx("scaffold home"))?;
         let agent_path = first
             .profile_dir
             .join("agents")
             .join("worker")
             .join("agent.toml");
         let custom_contents = "name = \"worker\"\ndescription = \"customized\"\n";
-        std::fs::write(&agent_path, custom_contents).expect("simulate user customization");
+        std::fs::write(&agent_path, custom_contents).map_err(ctx("simulate user customization"))?;
 
-        let rerun = ensure_home_with_profile(&home, profile).expect("re-scaffold home");
+        let rerun = ensure_home_with_profile(&home, profile).map_err(ctx("re-scaffold home"))?;
 
         assert!(
             !rerun.written_files.contains(&agent_path),
             "a re-run must not report the already-present agent.toml as newly written"
         );
         assert_eq!(
-            std::fs::read_to_string(&agent_path).expect("read agent.toml after re-run"),
+            std::fs::read_to_string(&agent_path).map_err(ctx("read agent.toml after re-run"))?,
             custom_contents,
             "a re-run must never overwrite an existing agent.toml"
         );
 
-        std::fs::remove_dir_all(&home).expect("remove temporary scaffold");
+        std::fs::remove_dir_all(&home).map_err(ctx("remove temporary scaffold"))?;
+        Ok(())
     }
 
     #[test]
-    fn first_scaffold_writes_the_bundled_agents_and_skills() {
+    fn first_scaffold_writes_the_bundled_agents_and_skills() -> TestResult {
         let home =
             std::env::temp_dir().join(format!("harw-home-scaffold-{}", uuid::Uuid::now_v7()));
 
-        let report = ensure_home_with_profile(&home, "foo").expect("scaffold home");
+        let report = ensure_home_with_profile(&home, "foo").map_err(ctx("scaffold home"))?;
 
         for file in crate::bundle::bundled_files() {
             let target = file.target_in(&home);
@@ -384,41 +393,43 @@ mod tests {
             );
         }
 
-        std::fs::remove_dir_all(&home).expect("remove temporary scaffold");
+        std::fs::remove_dir_all(&home).map_err(ctx("remove temporary scaffold"))?;
+        Ok(())
     }
 
     #[test]
-    fn rerun_does_not_overwrite_a_customized_bundled_agent() {
+    fn rerun_does_not_overwrite_a_customized_bundled_agent() -> TestResult {
         let home =
             std::env::temp_dir().join(format!("harw-home-scaffold-{}", uuid::Uuid::now_v7()));
 
-        ensure_home_with_profile(&home, "foo").expect("scaffold home");
+        ensure_home_with_profile(&home, "foo").map_err(ctx("scaffold home"))?;
         let customized = home.join("agents").join("debugger").join("system.md");
         let contents = "# meine eigene Fassung\n";
-        std::fs::write(&customized, contents).expect("simulate user customization");
+        std::fs::write(&customized, contents).map_err(ctx("simulate user customization"))?;
 
-        let rerun = ensure_home_with_profile(&home, "foo").expect("re-scaffold home");
+        let rerun = ensure_home_with_profile(&home, "foo").map_err(ctx("re-scaffold home"))?;
 
         assert!(!rerun.written_files.contains(&customized));
         assert_eq!(
-            std::fs::read_to_string(&customized).expect("read after re-run"),
+            std::fs::read_to_string(&customized).map_err(ctx("read after re-run"))?,
             contents
         );
 
-        std::fs::remove_dir_all(&home).expect("remove temporary scaffold");
+        std::fs::remove_dir_all(&home).map_err(ctx("remove temporary scaffold"))?;
+        Ok(())
     }
 
     /// Das Bundle liegt auf der Home-Ebene und muss über die reguläre
     /// Layer-Kette gefunden werden — sonst hilft es dem Nutzer nicht.
     #[test]
-    fn bundled_agents_are_discoverable_over_the_home_layer() {
+    fn bundled_agents_are_discoverable_over_the_home_layer() -> TestResult {
         let home =
             std::env::temp_dir().join(format!("harw-home-scaffold-{}", uuid::Uuid::now_v7()));
 
-        let report = ensure_home_with_profile(&home, "foo").expect("scaffold home");
+        let report = ensure_home_with_profile(&home, "foo").map_err(ctx("scaffold home"))?;
 
         let resolved = harw_config::discover_config(&[home.clone(), report.profile_dir.clone()])
-            .expect("discovery over home and profile layer must succeed");
+            .map_err(ctx("discovery over home and profile layer must succeed"))?;
 
         assert!(resolved.agents.contains_key("coding-orchestrator"));
         assert!(resolved.agents.contains_key("rust-implementer"));
@@ -428,19 +439,22 @@ mod tests {
             "17 Bundle-Agenten plus der Profil-Default-Worker"
         );
 
-        std::fs::remove_dir_all(&home).expect("remove temporary scaffold");
+        std::fs::remove_dir_all(&home).map_err(ctx("remove temporary scaffold"))?;
+        Ok(())
     }
 
     #[test]
-    fn scaffolded_worker_agent_is_discoverable_via_harw_config() {
+    fn scaffolded_worker_agent_is_discoverable_via_harw_config() -> TestResult {
         let home =
             std::env::temp_dir().join(format!("harw-home-scaffold-{}", uuid::Uuid::now_v7()));
         let profile = "foo";
 
-        let report = ensure_home_with_profile(&home, profile).expect("scaffold home");
+        let report = ensure_home_with_profile(&home, profile).map_err(ctx("scaffold home"))?;
 
         let resolved = harw_config::discover_config(std::slice::from_ref(&report.profile_dir))
-            .expect("discovery over the scaffolded profile dir must succeed");
+            .map_err(ctx(
+                "discovery over the scaffolded profile dir must succeed",
+            ))?;
 
         assert_eq!(
             resolved.agents.len(),
@@ -449,6 +463,7 @@ mod tests {
         );
         assert!(resolved.agents.contains_key("worker"));
 
-        std::fs::remove_dir_all(&home).expect("remove temporary scaffold");
+        std::fs::remove_dir_all(&home).map_err(ctx("remove temporary scaffold"))?;
+        Ok(())
     }
 }

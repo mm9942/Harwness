@@ -75,6 +75,7 @@ pub enum ObserveFileError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     fn io_error() -> std::io::Error {
         std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied")
@@ -116,10 +117,11 @@ mod tests {
     }
 
     #[test]
-    fn test_observe_file_result_alias_exists() {
+    fn test_observe_file_result_alias_exists() -> TestResult {
         fn make() -> ObserveFileResult<u8> {
             Ok(1)
         }
-        assert_eq!(make().unwrap(), 1);
+        assert_eq!(make().map_err(ctx("observe file result alias"))?, 1);
+        Ok(())
     }
 }

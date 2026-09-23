@@ -96,7 +96,9 @@ pub enum PlanError {
     /// # Arguments
     /// - `conflicting_path` (`String`): der konfligierende Pfad/Symbol.
     /// - `existing_node` (`TaskId`): Knoten, der den Pfad bereits beansprucht.
-    #[msg("WriteScope-Konflikt: '{conflicting_path}' wird bereits von Knoten '{existing_node}' beansprucht")]
+    #[msg(
+        "WriteScope-Konflikt: '{conflicting_path}' wird bereits von Knoten '{existing_node}' beansprucht"
+    )]
     ScopeConflict {
         conflicting_path: String,
         existing_node: TaskId,
@@ -150,11 +152,10 @@ pub enum PlanError {
     /// # Arguments
     /// - `field` (`&'static str`): Name des betroffenen Feldes.
     /// - `value` (`String`): der ungültige Rohwert.
-    #[msg("Ungültiger Wert für '{field}': {value:?} (leer, nur Leerzeichen oder unzulässige Zeichen)")]
-    InvalidId {
-        field: &'static str,
-        value: String,
-    },
+    #[msg(
+        "Ungültiger Wert für '{field}': {value:?} (leer, nur Leerzeichen oder unzulässige Zeichen)"
+    )]
+    InvalidId { field: &'static str, value: String },
 
     /// `Create` wurde auf einem Store aufgerufen, der bereits einen Plan hält.
     ///
@@ -179,7 +180,9 @@ pub enum PlanError {
     /// - `id` (`TaskId`): Knoten, der gestartet werden soll.
     /// - `dependency` (`TaskId`): die blockierende Abhängigkeit.
     /// - `status` (`String`): aktueller Status der Abhängigkeit.
-    #[msg("Knoten '{id}' kann nicht gestartet werden: Abhängigkeit '{dependency}' hat Status '{status}' statt Completed")]
+    #[msg(
+        "Knoten '{id}' kann nicht gestartet werden: Abhängigkeit '{dependency}' hat Status '{status}' statt Completed"
+    )]
     DependencyNotCompleted {
         id: TaskId,
         dependency: TaskId,
@@ -208,7 +211,9 @@ pub enum PlanError {
     /// # Arguments
     /// - `child` (`TaskId`): der Kind-Knoten.
     /// - `path` (`String`): der überschreitende Pfad/Symbol.
-    #[msg("write_scope-Pfad '{path}' von Kind-Knoten '{child}' liegt außerhalb des Parent-Scopes (Regel 10)")]
+    #[msg(
+        "write_scope-Pfad '{path}' von Kind-Knoten '{child}' liegt außerhalb des Parent-Scopes (Regel 10)"
+    )]
     ExpandScopeEscapes { child: TaskId, path: String },
 
     /// Ein Composite-Knoten soll auf `Completed` gesetzt werden, obwohl noch
@@ -221,7 +226,9 @@ pub enum PlanError {
     /// # Arguments
     /// - `id` (`TaskId`): der Composite-Knoten.
     /// - `open` (`Vec<TaskId>`): die noch offenen Kind-Knoten.
-    #[msg("Composite-Knoten '{id}' kann nicht auf Completed gesetzt werden: offene Kind-Knoten {open:?}")]
+    #[msg(
+        "Composite-Knoten '{id}' kann nicht auf Completed gesetzt werden: offene Kind-Knoten {open:?}"
+    )]
     CompositeIncomplete { id: TaskId, open: Vec<TaskId> },
 
     /// Ein `Patch` wurde für einen bereits abgeschlossenen (`Completed`)
@@ -234,7 +241,9 @@ pub enum PlanError {
     ///
     /// # Arguments
     /// - `id` (`TaskId`): der versiegelte Knoten.
-    #[msg("Knoten '{id}' ist versiegelt (Completed/Superseded/Invalidated) und kann nicht mehr verändert werden")]
+    #[msg(
+        "Knoten '{id}' ist versiegelt (Completed/Superseded/Invalidated) und kann nicht mehr verändert werden"
+    )]
     NodeSealed { id: TaskId },
 
     /// Ein Akteur versucht eine Aktion, für die er nicht autorisiert ist.
@@ -415,6 +424,7 @@ impl PlanError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     // ── PlanToolConfigError: Display ───────────────────────────────────────
 
@@ -525,7 +535,10 @@ mod tests {
     #[test]
     fn test_plan_not_found_display() {
         let err = PlanError::PlanNotFound;
-        assert_eq!(err.to_string(), "Kein aktiver Plan vorhanden (Create fehlt)");
+        assert_eq!(
+            err.to_string(),
+            "Kein aktiver Plan vorhanden (Create fehlt)"
+        );
     }
 
     // ── PlanError: Display der neuen Varianten ──────────────────────────────
@@ -707,14 +720,18 @@ mod tests {
     }
 
     #[test]
-    fn test_from_serde_error_wraps_and_displays() {
-        let serde_err = serde_json::from_str::<serde_json::Value>("!!!")
-            .expect_err("ungültiges JSON muss einen Fehler liefern");
+    fn test_from_serde_error_wraps_and_displays() -> TestResult {
+        let Err(serde_err) = serde_json::from_str::<serde_json::Value>("!!!") else {
+            return Err(TestError::Unexpected(
+                "ungültiges JSON muss einen Fehler liefern".to_owned(),
+            ));
+        };
         let err: PlanError = serde_err.into();
 
         assert!(matches!(err, PlanError::Serde(_)));
         assert!(err.to_string().starts_with("Serialisierungsfehler: "));
         assert!(std::error::Error::source(&err).is_some());
+        Ok(())
     }
 
     #[test]

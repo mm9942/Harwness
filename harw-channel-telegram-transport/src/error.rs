@@ -153,6 +153,7 @@ impl From<std::io::Error> for TelegramTransportError {
 #[cfg(test)]
 mod tests {
     use super::{OffsetPersistenceOperation, TelegramTransportError};
+    use crate::test_support::{TestError, TestResult};
 
     fn assert_secret_redacted(error: TelegramTransportError, secret: &str) {
         assert!(!error.to_string().contains(secret));
@@ -212,17 +213,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reqwest_conversion_strips_the_bot_token_bearing_url_from_source_too() {
+    async fn reqwest_conversion_strips_the_bot_token_bearing_url_from_source_too() -> TestResult {
         let secret = "123456:telegram-bot-secret-token";
         let client = reqwest::Client::new();
         // Ein geschlossener Loopback-Port scheitert sofort beim Verbindungsaufbau,
         // ganz ohne echten Netzwerkzugriff, und reqwest haengt dabei die
         // angefragte URL (inkl. Bot-Token im Pfad) an den Fehler.
-        let request_error = client
+        let request_result = client
             .get(format!("http://127.0.0.1:1/bot{secret}/getMe"))
             .send()
-            .await
-            .expect_err("connecting to a closed local port must fail");
+            .await;
+        let Err(request_error) = request_result else {
+            return Err(TestError::Unexpected(
+                "connecting to a closed local port must fail".to_owned(),
+            ));
+        };
         assert!(
             request_error.url().is_some(),
             "precondition: reqwest attaches the request URL to a transport error"
@@ -234,10 +239,12 @@ mod tests {
         // dessen Display/Debug duerfen nach der Konvertierung kein Token mehr
         // enthalten (F-041/S8), nicht nur `TelegramTransportError`s eigenes
         // redigiertes Display/Debug.
-        let source = std::error::Error::source(&error).expect("transport error keeps its source");
+        let source = std::error::Error::source(&error)
+            .ok_or(TestError::Missing("transport error keeps its source"))?;
         assert!(!source.to_string().contains(secret));
         assert!(!format!("{source:?}").contains(secret));
         assert_secret_redacted(error, secret);
+        Ok(())
     }
 
     #[test]

@@ -568,7 +568,9 @@ fn reject_duplicate_names(
 /// ```
 #[must_use]
 pub fn builtin_agent_toml() -> &'static [(&'static str, &'static str)] {
-    AGENT_TOML.get_or_init(|| discover_agent_toml(&AGENTS_DIR)).as_slice()
+    AGENT_TOML
+        .get_or_init(|| discover_agent_toml(&AGENTS_DIR))
+        .as_slice()
 }
 
 /// Senkt die eingebauten Rollen zu [`ExecutableAgentIr`].
@@ -735,7 +737,9 @@ pub const SYNTHESIS_CLAN_ID: &str = "synthesis";
 /// ```
 #[must_use]
 pub fn builtin_family_toml() -> &'static [(&'static str, &'static str)] {
-    FAMILY_TOML.get_or_init(|| discover_family_toml(&AGENTS_DIR)).as_slice()
+    FAMILY_TOML
+        .get_or_init(|| discover_family_toml(&AGENTS_DIR))
+        .as_slice()
 }
 
 /// Der TOML-Quelltext der eingebauten Default-Organisation.
@@ -1099,7 +1103,10 @@ pub fn builtin_organization_knowledge(role: AgentRoleId) -> String {
             )
         }
         AgentRoleId::RootOrchestrator | AgentRoleId::ChildOrchestrator => {
-            format!("{ORGANIZATION_KNOWLEDGE}\n\n{}", builtin_role_knowledge(role))
+            format!(
+                "{ORGANIZATION_KNOWLEDGE}\n\n{}",
+                builtin_role_knowledge(role)
+            )
         }
         AgentRoleId::Worker | AgentRoleId::UiaWorker => builtin_role_knowledge(role).to_owned(),
     }
@@ -1110,10 +1117,12 @@ mod tests {
     use std::collections::{BTreeSet, HashSet};
 
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_agent_dsl::organization::{CellBarrier, CellKind, CellWritePartition};
 
-    fn builtin() -> HashMap<String, ExecutableAgentIr> {
-        builtin_agent_definitions(&HashMap::new()).expect("eingebaute Definitionen müssen lowern")
+    fn builtin() -> TestResult<HashMap<String, ExecutableAgentIr>> {
+        builtin_agent_definitions(&HashMap::new())
+            .map_err(ctx("eingebaute Definitionen müssen lowern"))
     }
 
     #[test]
@@ -1136,10 +1145,10 @@ mod tests {
     }
 
     #[test]
-    fn test_every_builtin_toml_parses() {
+    fn test_every_builtin_toml_parses() -> TestResult {
         for (name, source) in builtin_agent_toml() {
             let raw = parse_toml(source)
-                .unwrap_or_else(|error| panic!("{name} parst nicht: {error}"));
+                .map_err(|error| TestError::Unexpected(format!("{name} parst nicht: {error}")))?;
             assert_eq!(raw.schema, "harwness.agent/v1", "{name}");
             assert!(
                 matches!(
@@ -1154,11 +1163,12 @@ mod tests {
             );
             assert_eq!(raw.specialization, *name, "{name}");
         }
+        Ok(())
     }
 
     #[test]
-    fn test_builtin_definitions_lower_every_role_but_not_the_base() {
-        let definitions = builtin();
+    fn test_builtin_definitions_lower_every_role_but_not_the_base() -> TestResult {
+        let definitions = builtin()?;
         assert_eq!(definitions.len(), role_names::ALL.len());
         for role in role_names::ALL {
             assert!(definitions.contains_key(*role), "fehlt: {role}");
@@ -1167,10 +1177,11 @@ mod tests {
             !definitions.contains_key(WORKER_BASE_NAME),
             "die Basis ist keine startbare Rolle"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_worker_base_is_a_layer_not_a_startable_role() {
+    fn test_worker_base_is_a_layer_not_a_startable_role() -> TestResult {
         // Verfügbar als Layer: die Basis steht in der Rohliste, die
         // `builtin_agent_definitions` an `extends` weitergibt …
         assert!(
@@ -1182,24 +1193,31 @@ mod tests {
         // … ist aber keine startbare Rolle: weder in `role_names::ALL` …
         assert!(!role_names::ALL.contains(&WORKER_BASE_NAME));
         // … noch im Ergebnis von `builtin_agent_definitions`.
-        assert!(!builtin().contains_key(WORKER_BASE_NAME));
+        assert!(!builtin()?.contains_key(WORKER_BASE_NAME));
+        Ok(())
     }
 
     #[test]
-    fn test_require_worker_base_names_the_file_when_missing() {
+    fn test_require_worker_base_names_the_file_when_missing() -> TestResult {
         let entries: [(&str, &str); 1] = [(role_names::EXPLORER, "irrelevant")];
-        let error =
-            require_worker_base(&entries).expect_err("ohne Basis darf 'extends' nicht auflösen");
+        let Err(error) = require_worker_base(&entries) else {
+            return Err(TestError::Unexpected(
+                "ohne Basis darf 'extends' nicht auflösen".to_owned(),
+            ));
+        };
         assert!(
             error.to_string().contains(WORKER_BASE_NAME),
             "die Fehlermeldung muss '{WORKER_BASE_NAME}' nennen: {error}"
         );
+        Ok(())
     }
 
     #[test]
     fn test_require_worker_base_passes_when_present() {
-        let entries: [(&str, &str); 2] =
-            [(WORKER_BASE_NAME, "irrelevant"), (role_names::EXPLORER, "irrelevant")];
+        let entries: [(&str, &str); 2] = [
+            (WORKER_BASE_NAME, "irrelevant"),
+            (role_names::EXPLORER, "irrelevant"),
+        ];
         assert!(require_worker_base(&entries).is_ok());
     }
 
@@ -1245,10 +1263,13 @@ mod tests {
         // eine Teilmengen-Prüfung geschwächt: jeder früher fest verdrahtete
         // Name muss weiterhin gefunden werden, eine vierte, fünfte, … Family
         // darf dazukommen, ohne diesen Test zu brechen.
-        let expected_family_names: HashSet<&str> =
-            [RESEARCH_FAMILY_NAME, CODING_FAMILY_NAME].into_iter().collect();
-        let found_family_names: HashSet<&str> =
-            builtin_family_toml().iter().map(|(name, _)| *name).collect();
+        let expected_family_names: HashSet<&str> = [RESEARCH_FAMILY_NAME, CODING_FAMILY_NAME]
+            .into_iter()
+            .collect();
+        let found_family_names: HashSet<&str> = builtin_family_toml()
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
         assert!(
             expected_family_names.is_subset(&found_family_names),
             "jede frueher fest verdrahtete Family muss weiterhin gefunden werden: \
@@ -1329,7 +1350,10 @@ mod tests {
         let research_family = File::new("family/research.toml", b"schema = \"harwness.family/v1\"");
         let family_dir = leaked_dir("family", vec![DirEntry::File(research_family)]);
 
-        let root = leaked_dir("", vec![DirEntry::Dir(family_dir), DirEntry::Dir(families_dir)]);
+        let root = leaked_dir(
+            "",
+            vec![DirEntry::Dir(family_dir), DirEntry::Dir(families_dir)],
+        );
 
         let discovered = discover_family_toml(&root);
         let names: Vec<&str> = discovered.iter().map(|(name, _)| *name).collect();
@@ -1362,10 +1386,7 @@ mod tests {
             "families/security/members/security-triage-1.toml",
             b"schema = \"harwness.family-membership/v1\"",
         );
-        let members_dir = leaked_dir(
-            "families/security/members",
-            vec![DirEntry::File(member)],
-        );
+        let members_dir = leaked_dir("families/security/members", vec![DirEntry::File(member)]);
         let security_dir = leaked_dir(
             "families/security",
             vec![DirEntry::File(security_family), DirEntry::Dir(members_dir)],
@@ -1461,7 +1482,11 @@ mod tests {
         let apple = File::new("apple.toml", b"schema = \"harwness.agent/v1\"");
         let root = leaked_dir(
             "",
-            vec![DirEntry::File(zebra), DirEntry::File(mango), DirEntry::File(apple)],
+            vec![
+                DirEntry::File(zebra),
+                DirEntry::File(mango),
+                DirEntry::File(apple),
+            ],
         );
 
         let discovered = discover_agent_toml(&root);
@@ -1504,15 +1529,19 @@ mod tests {
             builtin_agent_toml().iter().map(|(name, _)| *name).collect();
         assert_eq!(first_agent_order, second_agent_order);
 
-        let first_family_order: Vec<&str> =
-            builtin_family_toml().iter().map(|(name, _)| *name).collect();
-        let second_family_order: Vec<&str> =
-            builtin_family_toml().iter().map(|(name, _)| *name).collect();
+        let first_family_order: Vec<&str> = builtin_family_toml()
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        let second_family_order: Vec<&str> = builtin_family_toml()
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
         assert_eq!(first_family_order, second_family_order);
     }
 
     #[test]
-    fn test_empty_agents_tree_is_a_hard_error_not_a_valid_empty_registry() {
+    fn test_empty_agents_tree_is_a_hard_error_not_a_valid_empty_registry() -> TestResult {
         // Ein leerer (oder fehlender) `agents/`-Baum darf nicht als gültige,
         // leere Registry durchgehen — sonst ist er von einer kaputten
         // Installation nicht zu unterscheiden (vgl. `GateReport::checked` in
@@ -1522,9 +1551,15 @@ mod tests {
         let empty_root = leaked_dir("", Vec::new());
 
         let discovered_roles = discover_agent_toml(&empty_root);
-        assert!(discovered_roles.is_empty(), "ein leerer Baum liefert keine Rollen");
-        let error = require_worker_base(&discovered_roles)
-            .expect_err("eine leere Rollen-Sammlung darf die Basis-Prüfung nicht bestehen");
+        assert!(
+            discovered_roles.is_empty(),
+            "ein leerer Baum liefert keine Rollen"
+        );
+        let Err(error) = require_worker_base(&discovered_roles) else {
+            return Err(TestError::Unexpected(
+                "eine leere Rollen-Sammlung darf die Basis-Prüfung nicht bestehen".to_owned(),
+            ));
+        };
         assert!(error.to_string().contains(WORKER_BASE_NAME));
 
         let discovered_families = discover_family_toml(&empty_root);
@@ -1532,10 +1567,11 @@ mod tests {
             discovered_families.is_empty(),
             "ein leerer Baum liefert keine Families"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_duplicate_role_name_is_a_hard_error_not_silent_precedence() {
+    fn test_duplicate_role_name_is_a_hard_error_not_silent_precedence() -> TestResult {
         // Zwei verschiedene Dateien, die denselben Dateinamen-Stamm tragen,
         // konnten vor AW6-00 nicht entstehen (ein Mensch pflegte die Liste von
         // Hand). Die Verzeichnis-Sammlung muss das jetzt als harten Fehler
@@ -1552,17 +1588,22 @@ mod tests {
         let root = leaked_dir("", vec![DirEntry::File(first), DirEntry::Dir(roles_dir)]);
 
         let discovered = discover_agent_toml(&root);
-        let error = reject_duplicate_names(&discovered, "Agentenrolle").expect_err(
-            "zwei Dateien mit demselben Namen müssen als Kollision scheitern, nicht still gewinnen/verlieren",
-        );
+        let Err(error) = reject_duplicate_names(&discovered, "Agentenrolle") else {
+            return Err(TestError::Unexpected(
+                "zwei Dateien mit demselben Namen müssen als Kollision scheitern, nicht still \
+                 gewinnen/verlieren"
+                    .to_owned(),
+            ));
+        };
         assert!(
             error.to_string().contains("explorer"),
             "die Fehlermeldung muss den kollidierenden Namen nennen: {error}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_duplicate_family_name_is_a_hard_error() {
+    fn test_duplicate_family_name_is_a_hard_error() -> TestResult {
         // Bei der heutigen pfadbasierten Namensregel ist eine Family-Kollision
         // strukturell ausgeschlossen (zwei Dateien können nicht denselben
         // Pfad tragen). `reject_duplicate_names` wird trotzdem generisch für
@@ -1572,9 +1613,13 @@ mod tests {
             ("family/research", "irrelevant"),
             ("family/research", "irrelevant, anderer Inhalt"),
         ];
-        let error = reject_duplicate_names(&entries, "Family")
-            .expect_err("zwei Family-Einträge mit demselben Namen müssen scheitern");
+        let Err(error) = reject_duplicate_names(&entries, "Family") else {
+            return Err(TestError::Unexpected(
+                "zwei Family-Einträge mit demselben Namen müssen scheitern".to_owned(),
+            ));
+        };
         assert!(error.to_string().contains("family/research"));
+        Ok(())
     }
 
     #[test]
@@ -1587,25 +1632,34 @@ mod tests {
 
         let discovered = discover_agent_toml(&root);
         let names: Vec<&str> = discovered.iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, vec!["explorer"], "README.md darf nicht als Rolle auftauchen");
+        assert_eq!(
+            names,
+            vec!["explorer"],
+            "README.md darf nicht als Rolle auftauchen"
+        );
     }
 
     #[test]
-    fn test_parse_failure_names_the_offending_file() {
+    fn test_parse_failure_names_the_offending_file() -> TestResult {
         let name = "roles/broken-role";
         let broken_source = "this is not = = valid toml";
-        let error = parse_toml(broken_source)
-            .map_err(|dsl_error| definition_error(name, dsl_error))
-            .expect_err("ungültiges TOML darf nicht parsen");
+        let Err(error) =
+            parse_toml(broken_source).map_err(|dsl_error| definition_error(name, dsl_error))
+        else {
+            return Err(TestError::Unexpected(
+                "ungültiges TOML darf nicht parsen".to_owned(),
+            ));
+        };
         let message = error.to_string();
         assert!(
             message.contains(name),
             "die Fehlermeldung muss den Dateinamen nennen, sonst sucht man ihn unter fünfzig: {message}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_broken_definition_in_the_tree_is_a_hard_error_not_silently_skipped() {
+    fn test_broken_definition_in_the_tree_is_a_hard_error_not_silently_skipped() -> TestResult {
         // Eine Datei, die eingesammelt wird (sie endet auf `.toml` und ist
         // gültiges UTF-8), aber deren Inhalt kein gültiges TOML ist, darf
         // nicht stillschweigend aus dem Ergebnis verschwinden — sie muss beim
@@ -1622,18 +1676,22 @@ mod tests {
         );
 
         let (name, source) = discovered[0];
-        let error = parse_toml(source)
-            .map_err(|dsl_error| definition_error(name, dsl_error))
-            .expect_err("kaputtes TOML darf nicht parsen");
+        let Err(error) = parse_toml(source).map_err(|dsl_error| definition_error(name, dsl_error))
+        else {
+            return Err(TestError::Unexpected(
+                "kaputtes TOML darf nicht parsen".to_owned(),
+            ));
+        };
         assert!(
             error.to_string().contains("broken-role"),
             "die Fehlermeldung muss die betroffene Datei nennen: {error}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_every_builtin_role_is_non_pausing_with_a_return_contract() {
-        for (role, ir) in builtin() {
+    fn test_every_builtin_role_is_non_pausing_with_a_return_contract() -> TestResult {
+        for (role, ir) in builtin()? {
             assert!(
                 matches!(
                     ir.role(),
@@ -1656,10 +1714,11 @@ mod tests {
                 "{role} braucht einen Rückgabevertrag"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_every_builtin_role_forbids_write_and_shell_tools() {
+    fn test_every_builtin_role_forbids_write_and_shell_tools() -> TestResult {
         // Ausdrückliche Ausnahmeliste (Slice B7) — genau `executor`, kein
         // Wildcard. `executor` (`RegistryProfile::Full`, siehe
         // `harw-registry-defaults/src/profile.rs::profile_for_role`) darf
@@ -1704,7 +1763,7 @@ mod tests {
         const ALLOWED_TO_WRITE_ONLY: &[&str] =
             &[role_names::MEMORY_STEWARD, role_names::UIA_WRITER];
 
-        for (role, ir) in builtin() {
+        for (role, ir) in builtin()? {
             if ALLOWED_TO_WRITE_AND_EXEC.contains(&role.as_str()) {
                 continue;
             }
@@ -1729,6 +1788,7 @@ mod tests {
                 );
             }
         }
+        Ok(())
     }
 
     /// Ergänzung zu [`test_every_builtin_role_forbids_write_and_shell_tools`]:
@@ -1742,10 +1802,10 @@ mod tests {
     /// bzw. [`crate::profile::RegistryProfile::UiaWriter`] (nicht nur eine
     /// TOML, die zufällig dieselben Werkzeugnamen admittiert).
     #[test]
-    fn test_only_executor_gets_the_shell_execution_profile() {
+    fn test_only_executor_gets_the_shell_execution_profile() -> TestResult {
         use crate::profile::{RegistryProfile, profile_for_role};
 
-        for (role, ir) in builtin() {
+        for (role, ir) in builtin()? {
             let admitted = ir.tool_surface().admitted();
             if role == role_names::EXECUTOR {
                 assert_eq!(
@@ -1818,6 +1878,7 @@ mod tests {
                 "{role} must not receive the dedicated process profile"
             );
         }
+        Ok(())
     }
 
     /// Befund (siehe Abschlussbericht dieses Knotens): `builtin_agent_definitions`
@@ -1846,7 +1907,8 @@ mod tests {
     /// Produktionslücke behoben ist, ist dies die einzige Prüfung, die diese
     /// vier Rollen tatsächlich lowert und ihre Werkzeugoberfläche verifiziert.
     #[test]
-    fn test_security_triage_roles_forbid_write_and_shell_tools_despite_the_role_names_all_gap() {
+    fn test_security_triage_roles_forbid_write_and_shell_tools_despite_the_role_names_all_gap()
+    -> TestResult {
         const SECURITY_ROLE_NAMES: [&str; 4] = [
             "security-egress-triage",
             "security-baseline-triage",
@@ -1854,14 +1916,15 @@ mod tests {
             "security-endpoint-triage",
         ];
 
-        require_worker_base(builtin_agent_toml()).expect("worker-base muss im eingebetteten Baum liegen");
+        require_worker_base(builtin_agent_toml())
+            .map_err(ctx("worker-base muss im eingebetteten Baum liegen"))?;
 
         let now = OffsetDateTime::now_utc();
         let mut layers: Vec<(DefinitionLayer, RawAgentDefinition)> = Vec::new();
         let mut targets: Vec<(&str, DefinitionId)> = Vec::new();
         for (name, source) in builtin_agent_toml() {
-            let raw =
-                parse_toml(source).unwrap_or_else(|error| panic!("{name} parst nicht: {error}"));
+            let raw = parse_toml(source)
+                .map_err(|error| TestError::Unexpected(format!("{name} parst nicht: {error}")))?;
             if SECURITY_ROLE_NAMES.contains(name) {
                 targets.push((*name, raw.id.clone()));
             }
@@ -1875,10 +1938,11 @@ mod tests {
         );
 
         for (name, id) in targets {
-            let resolved = resolve_definition(&id, &layers, now)
-                .unwrap_or_else(|error| panic!("{name} muss aufloesen: {error}"));
-            let ir =
-                lower(&resolved).unwrap_or_else(|error| panic!("{name} muss lowern: {error}"));
+            let resolved = resolve_definition(&id, &layers, now).map_err(|error| {
+                TestError::Unexpected(format!("{name} muss aufloesen: {error}"))
+            })?;
+            let ir = lower(&resolved)
+                .map_err(|error| TestError::Unexpected(format!("{name} muss lowern: {error}")))?;
             let admitted = ir.tool_surface().admitted();
             let forbidden = ir.tool_surface().forbidden();
             for tool in ["fs.write", "shell.exec"] {
@@ -1892,11 +1956,12 @@ mod tests {
                 );
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_builtin_roles_carry_the_shared_context_program_from_the_base() {
-        for (role, ir) in builtin() {
+    fn test_builtin_roles_carry_the_shared_context_program_from_the_base() -> TestResult {
+        for (role, ir) in builtin()? {
             assert_eq!(
                 ir.context_program().must_include(),
                 ["task.objective", "task.read_scope", "new.trigger_return"],
@@ -1908,11 +1973,12 @@ mod tests {
                 "{role}"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_explorer_tool_surface_and_budget() {
-        let definitions = builtin();
+    fn test_explorer_tool_surface_and_budget() -> TestResult {
+        let definitions = builtin()?;
         let explorer = &definitions[role_names::EXPLORER];
         assert_eq!(
             explorer.tool_surface().admitted(),
@@ -1933,7 +1999,7 @@ mod tests {
         let budget = explorer
             .spawn_contract()
             .budget()
-            .expect("[spawn.budget] muss gesetzt sein");
+            .ok_or(TestError::Missing("[spawn.budget] muss gesetzt sein"))?;
         assert_eq!(budget.max_tokens(), Some(60_000));
         assert_eq!(budget.max_tool_calls(), Some(40));
         assert_eq!(budget.max_wall_secs(), Some(180));
@@ -1941,10 +2007,11 @@ mod tests {
             explorer.return_pipeline().contract(),
             Some("harwness.return.research-finding@1")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_researcher_web_is_the_only_role_with_web_tools() {
+    fn test_researcher_web_is_the_only_role_with_web_tools() -> TestResult {
         // Addendum I: `uia-worker` (`RegistryProfile::UiaQuickHelper`)
         // admittiert seit der Korrektur ebenfalls ein Netz-Werkzeug —
         // ausschließlich `web.fetch`, siehe `agents/uia-worker.toml`.
@@ -1956,7 +2023,7 @@ mod tests {
         // — beide sind UIA-Erkundungsspezialisierungen mit derselben
         // Begründung, siehe `agents/uia-explorer.toml` und
         // `agents/uia-writer.toml`.
-        let definitions = builtin();
+        let definitions = builtin()?;
         for (role, ir) in &definitions {
             let has_web = ir
                 .tool_surface()
@@ -1972,6 +2039,7 @@ mod tests {
                 "{role}: web.* darf nur der Web-Rechercheur und die UIA-Erkundungsrollen führen"
             );
         }
+        Ok(())
     }
 
     /// W1-05: `plan`/`goal` deklarieren `model_tool(approval = "always")`
@@ -1981,8 +2049,8 @@ mod tests {
     /// wahrheitsgemäß; die Rückgabe läuft weiterhin über den
     /// `plan-proposal`-Contract.
     #[test]
-    fn test_planner_does_not_admit_plan_or_goal_operations() {
-        let definitions = builtin();
+    fn test_planner_does_not_admit_plan_or_goal_operations() -> TestResult {
+        let definitions = builtin()?;
         let planner = &definitions[role_names::PLANNER];
         let admitted = planner.tool_surface().admitted();
         assert!(!admitted.iter().any(|name| name == "plan"));
@@ -1991,6 +2059,7 @@ mod tests {
             planner.return_pipeline().contract(),
             Some("harwness.return.plan-proposal@1")
         );
+        Ok(())
     }
 
     /// Der Analyst und der Root-Orchestrator dürfen zwei Ebenen erzeugen.
@@ -2022,7 +2091,7 @@ mod tests {
     /// Konsolidierung ist ein einzelner, in sich geschlossener Lauf über
     /// bereits gelieferten Kontext, kein Fan-out.
     #[test]
-    fn test_analyst_and_root_orchestrator_are_allowed_to_spawn_two_levels() {
+    fn test_analyst_and_root_orchestrator_are_allowed_to_spawn_two_levels() -> TestResult {
         // Die Tiefe-0-Klasse: Rollen ohne eigene Ebene darunter — die vier
         // Triage-Rollen plus `memory-steward` und `agent-steward` (Addendum
         // K: ein Umsetzungslauf ist ein einzelner, in sich geschlossener
@@ -2052,12 +2121,10 @@ mod tests {
             role_names::EXECUTOR,
         ];
 
-        let definitions = builtin();
+        let definitions = builtin()?;
         let mut two_level_roles: Vec<&str> = Vec::new();
         for (role, ir) in &definitions {
-            let expected = if role == role_names::ANALYST
-                || role == role_names::ROOT_ORCHESTRATOR
-            {
+            let expected = if role == role_names::ANALYST || role == role_names::ROOT_ORCHESTRATOR {
                 2
             } else if ZERO_DEPTH_ROLES.contains(&role.as_str()) {
                 0
@@ -2085,7 +2152,9 @@ mod tests {
         // eine zufällige `HashMap`-Reihenfolge zu verlassen.
         let two_level_roles: BTreeSet<&str> = two_level_roles.into_iter().collect();
         let expected_two_level_roles: BTreeSet<&str> =
-            [role_names::ANALYST, role_names::ROOT_ORCHESTRATOR].into_iter().collect();
+            [role_names::ANALYST, role_names::ROOT_ORCHESTRATOR]
+                .into_iter()
+                .collect();
         assert_eq!(
             two_level_roles, expected_two_level_roles,
             "genau Analyst und Root-Orchestrator dürfen zwei Ebenen"
@@ -2099,55 +2168,61 @@ mod tests {
                 .any(|name| name.starts_with("web.")),
             "der Analyst arbeitet ohne Netzzugang"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_local_definition_overrides_builtin_role() {
+    fn test_local_definition_overrides_builtin_role() -> TestResult {
         // Eine bereits geladene lokale Definition belegt den Namen; die
         // eingebaute Rolle wird komplett übersprungen, nicht gemischt.
-        let local_explorer = builtin()
+        let local_explorer = builtin()?
             .remove(role_names::EXPLORER)
-            .expect("explorer muss eingebaut existieren");
+            .ok_or(TestError::Missing("explorer muss eingebaut existieren"))?;
         let mut existing = HashMap::new();
         existing.insert(role_names::EXPLORER.to_owned(), local_explorer);
 
         let definitions =
-            builtin_agent_definitions(&existing).expect("Restrollen müssen weiter lowern");
+            builtin_agent_definitions(&existing).map_err(ctx("Restrollen müssen weiter lowern"))?;
 
         assert!(
             !definitions.contains_key(role_names::EXPLORER),
             "die lokale Definition gewinnt; die eingebaute wird übersprungen"
         );
         assert_eq!(definitions.len(), role_names::ALL.len() - 1);
-        for role in role_names::ALL.iter().filter(|r| **r != role_names::EXPLORER) {
+        for role in role_names::ALL
+            .iter()
+            .filter(|r| **r != role_names::EXPLORER)
+        {
             assert!(definitions.contains_key(*role), "fehlt: {role}");
         }
+        Ok(())
     }
 
     // ── Families und Organisation ───────────────────────────────────────────
 
     /// Löst die eingebauten Families auf; ein Fehler ist ein Defekt der TOML-Dateien.
-    fn families() -> HashMap<String, ResolvedFamily> {
-        match builtin_family_definitions() {
-            Ok(families) => families,
-            Err(error) => panic!("eingebaute Families müssen auflösen: {error}"),
-        }
+    fn families() -> TestResult<HashMap<String, ResolvedFamily>> {
+        builtin_family_definitions().map_err(|error| {
+            TestError::Unexpected(format!("eingebaute Families müssen auflösen: {error}"))
+        })
     }
 
     /// Holt eine aufgelöste Family aus der Map oder scheitert mit ihrem Namen.
-    fn family(name: &str) -> ResolvedFamily {
-        match families().get(name) {
-            Some(resolved) => resolved.clone(),
-            None => panic!("Family '{name}' fehlt in builtin_family_definitions()"),
-        }
+    fn family(name: &str) -> TestResult<ResolvedFamily> {
+        families()?.get(name).cloned().ok_or_else(|| {
+            TestError::Unexpected(format!(
+                "Family '{name}' fehlt in builtin_family_definitions()"
+            ))
+        })
     }
 
     /// Löst die eingebaute Organisation auf; ein Fehler ist ein Defekt der TOML-Datei.
-    fn organization() -> ResolvedOrganization {
-        match default_organization() {
-            Ok(organization) => organization,
-            Err(error) => panic!("die eingebaute Organisation muss auflösen: {error}"),
-        }
+    fn organization() -> TestResult<ResolvedOrganization> {
+        default_organization().map_err(|error| {
+            TestError::Unexpected(format!(
+                "die eingebaute Organisation muss auflösen: {error}"
+            ))
+        })
     }
 
     /// Die Rollennamen eines Rosters in Deklarationsreihenfolge.
@@ -2177,7 +2252,9 @@ mod tests {
         // entkernt), bringt aber keine zusätzliche Prüfkraft mehr mit.
         let toml = builtin_family_toml();
         let names: HashSet<&str> = toml.iter().map(|(name, _)| *name).collect();
-        let expected: HashSet<&str> = [RESEARCH_FAMILY_NAME, CODING_FAMILY_NAME].into_iter().collect();
+        let expected: HashSet<&str> = [RESEARCH_FAMILY_NAME, CODING_FAMILY_NAME]
+            .into_iter()
+            .collect();
         assert!(
             expected.is_subset(&names),
             "research und coding muessen weiterhin unter den gefundenen Family-Namen sein: {names:?}"
@@ -2185,9 +2262,9 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_families_resolve_with_rosters_and_invariants() {
+    fn test_builtin_families_resolve_with_rosters_and_invariants() -> TestResult {
         for name in [RESEARCH_FAMILY_NAME, CODING_FAMILY_NAME] {
-            let resolved = family(name);
+            let resolved = family(name)?;
             assert_eq!(resolved.id.kind, "family", "{name}");
             assert!(!resolved.workers.is_empty(), "{name}: leeres Worker-Roster");
             assert!(
@@ -2198,11 +2275,12 @@ mod tests {
             let steps = resolved.trace.steps.len();
             assert_eq!(steps, 1, "{name}: erwartet genau einen Base-Schritt");
         }
+        Ok(())
     }
 
     #[test]
-    fn test_research_family_lists_exactly_the_read_only_research_roles() {
-        let resolved = family(RESEARCH_FAMILY_NAME);
+    fn test_research_family_lists_exactly_the_read_only_research_roles() -> TestResult {
+        let resolved = family(RESEARCH_FAMILY_NAME)?;
         assert_eq!(
             role_names_of(&resolved.workers),
             vec![
@@ -2216,10 +2294,11 @@ mod tests {
             vec![role_names::ANALYST],
             "nur der Analyst darf zwei Ebenen tief delegieren"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_coding_family_lists_only_roles_that_exist_in_role_names() {
+    fn test_coding_family_lists_only_roles_that_exist_in_role_names() -> TestResult {
         // Seit Slice B7 admittiert `executor` `fs.write`/`shell.exec` und
         // führt damit Befehls- und Dateioperationen im Auftrag des
         // Haupt-Agenten aus — er entwirft aber keinen Code, er führt bereits
@@ -2228,7 +2307,7 @@ mod tests {
         // vorbereiten (`planner`, `explorer`), als auch `executor`, der sie
         // ausführt. Erfundene IDs wären eine Zusage, die der Spawn nicht
         // einlösen kann.
-        let resolved = family(CODING_FAMILY_NAME);
+        let resolved = family(CODING_FAMILY_NAME)?;
         for name in role_names_of(&resolved.workers) {
             assert!(
                 role_names::ALL.contains(&name),
@@ -2239,13 +2318,14 @@ mod tests {
             role_names_of(&resolved.workers).contains(&role_names::PLANNER),
             "der Planer trägt die Coding-Spur"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_every_family_role_reference_is_an_embedded_agent() {
+    fn test_every_family_role_reference_is_an_embedded_agent() -> TestResult {
         let embedded: Vec<&str> = builtin_agent_toml().iter().map(|(name, _)| *name).collect();
         for family_name in [RESEARCH_FAMILY_NAME, CODING_FAMILY_NAME] {
-            let resolved = family(family_name);
+            let resolved = family(family_name)?;
             for entry in resolved.workers.iter().chain(resolved.orchestrators.iter()) {
                 assert_eq!(entry.id.kind, "agent", "{family_name}");
                 assert!(
@@ -2255,11 +2335,13 @@ mod tests {
                 );
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_default_organization_id_matches_the_constant() {
-        assert_eq!(organization().id.as_string(), DEFAULT_ORGANIZATION_ID);
+    fn test_default_organization_id_matches_the_constant() -> TestResult {
+        assert_eq!(organization()?.id.as_string(), DEFAULT_ORGANIZATION_ID);
+        Ok(())
     }
 
     /// Knoten AW6-03 hat mit `security` einen vierten Clan eingetragen
@@ -2281,7 +2363,7 @@ mod tests {
     ///    Clans — als Teilmengen-Prüfung, nicht als Gleichheit und ohne feste
     ///    Reihenfolge, damit ein fünfter Clan diesen Test nicht bricht.
     #[test]
-    fn test_every_clan_has_exactly_one_cell_and_every_cell_references_a_known_clan() {
+    fn test_every_clan_has_exactly_one_cell_and_every_cell_references_a_known_clan() -> TestResult {
         // Lokale Test-Konstante statt einer neuen `pub const` in Produktionscode:
         // `RESEARCH_CLAN_ID`/`CODING_CLAN_ID`/`SYNTHESIS_CLAN_ID` sind bereits
         // eingeführte Konstanten dieses Moduls; `security` bekommt hier bewusst
@@ -2289,7 +2371,7 @@ mod tests {
         // `#[cfg(test)]`-Block ändern darf.
         const SECURITY_CLAN_ID: &str = "security";
 
-        let resolved = organization();
+        let resolved = organization()?;
         let clan_ids: HashSet<&str> = resolved.clans.iter().map(|clan| clan.id.as_str()).collect();
 
         // Referenzielle Integrität: jede Zelle referenziert einen bekannten Clan.
@@ -2310,7 +2392,11 @@ mod tests {
                 .iter()
                 .filter(|cell| cell.clan == clan.id)
                 .count();
-            assert_eq!(cells_for_clan, 1, "Clan '{}' braucht genau eine Zelle", clan.id);
+            assert_eq!(
+                cells_for_clan, 1,
+                "Clan '{}' braucht genau eine Zelle",
+                clan.id
+            );
         }
 
         let expected: HashSet<&str> = [
@@ -2325,13 +2411,16 @@ mod tests {
             expected.is_subset(&clan_ids),
             "die vier bekannten Clans muessen weiterhin unter den aufgeloesten Clans sein: {clan_ids:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_research_cell_is_a_write_partitioned_fanout_over_research_nodes() {
-        let resolved = organization();
+    fn test_research_cell_is_a_write_partitioned_fanout_over_research_nodes() -> TestResult {
+        let resolved = organization()?;
         let Some((clan, cell)) = clan_cell(&resolved, RESEARCH_CLAN_ID) else {
-            panic!("der Research-Clan muss eine Zelle haben");
+            return Err(TestError::Unexpected(
+                "der Research-Clan muss eine Zelle haben".to_owned(),
+            ));
         };
         assert_eq!(cell.kind, CellKind::Fanout);
         assert_eq!(cell.barrier, CellBarrier::AllTerminal);
@@ -2339,41 +2428,49 @@ mod tests {
         assert_eq!(cell.members_from_plan, "research-*");
         assert_eq!(clan.plan_scope, "research-*");
         assert_eq!(clan.child_depth_cost, 1, "Standard-Tiefenkosten");
+        Ok(())
     }
 
     #[test]
-    fn test_coding_cell_is_sequential_and_write_partitioned() {
-        let resolved = organization();
+    fn test_coding_cell_is_sequential_and_write_partitioned() -> TestResult {
+        let resolved = organization()?;
         let Some((clan, cell)) = clan_cell(&resolved, CODING_CLAN_ID) else {
-            panic!("der Coding-Clan muss eine Zelle haben");
+            return Err(TestError::Unexpected(
+                "der Coding-Clan muss eine Zelle haben".to_owned(),
+            ));
         };
         assert_eq!(cell.kind, CellKind::Sequential);
         assert_eq!(cell.write_partition, CellWritePartition::Required);
         assert_eq!(cell.members_from_plan, "coding-*");
         assert_eq!(clan.plan_scope, "coding-*");
+        Ok(())
     }
 
     #[test]
-    fn test_synthesis_cell_uses_explicit_join() {
-        let resolved = organization();
+    fn test_synthesis_cell_uses_explicit_join() -> TestResult {
+        let resolved = organization()?;
         let Some((_, cell)) = clan_cell(&resolved, SYNTHESIS_CLAN_ID) else {
-            panic!("der Synthesis-Clan muss eine Zelle haben");
+            return Err(TestError::Unexpected(
+                "der Synthesis-Clan muss eine Zelle haben".to_owned(),
+            ));
         };
         assert_eq!(cell.barrier, CellBarrier::ExplicitJoin);
+        Ok(())
     }
 
     #[test]
-    fn test_clan_cell_is_none_for_an_unknown_clan() {
-        let resolved = organization();
+    fn test_clan_cell_is_none_for_an_unknown_clan() -> TestResult {
+        let resolved = organization()?;
         assert!(
             clan_cell(&resolved, "gibt-es-nicht").is_none(),
             "ein unbekannter Clan ist kein Fehler, sondern schlicht keine Zelle"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_organization_references_only_embedded_roles() {
-        let resolved = organization();
+    fn test_organization_references_only_embedded_roles() -> TestResult {
+        let resolved = organization()?;
         let mut agents = vec![&resolved.root.agent];
         agents.extend(resolved.clans.iter().map(|clan| &clan.leader));
         for reference in agents {
@@ -2384,12 +2481,13 @@ mod tests {
                 reference.id.name
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_every_organization_family_reference_is_an_embedded_family() {
-        let resolved = organization();
-        let known: Vec<String> = families()
+    fn test_every_organization_family_reference_is_an_embedded_family() -> TestResult {
+        let resolved = organization()?;
+        let known: Vec<String> = families()?
             .values()
             .map(|resolved| resolved.id.as_string())
             .collect();
@@ -2402,12 +2500,13 @@ mod tests {
                 reference.id
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_snapshot_ids_are_stable_across_repeated_lowering() {
-        let first = builtin();
-        let second = builtin();
+    fn test_snapshot_ids_are_stable_across_repeated_lowering() -> TestResult {
+        let first = builtin()?;
+        let second = builtin()?;
         for role in role_names::ALL {
             assert_eq!(
                 first[*role].snapshot_id(),
@@ -2415,6 +2514,7 @@ mod tests {
                 "{role}: gleiche Definition muss denselben Snapshot-Digest ergeben"
             );
         }
+        Ok(())
     }
 
     // ─── Addendum K: eingebettetes Organisations-/Bauplan-Wissen ──────────
@@ -2457,7 +2557,11 @@ mod tests {
             ("root-orchestrator.md", ROOT_ORCHESTRATOR_KNOWLEDGE),
             ("sub-orchestrator.md", SUB_ORCHESTRATOR_KNOWLEDGE),
         ] {
-            assert!(text.len() <= 1500, "roles/{name}: {} Bytes > 1500", text.len());
+            assert!(
+                text.len() <= 1500,
+                "roles/{name}: {} Bytes > 1500",
+                text.len()
+            );
         }
     }
 
@@ -2471,18 +2575,36 @@ mod tests {
 
         for role in [AgentRoleId::UserInterface, AgentRoleId::AgentSteward] {
             let text = builtin_organization_knowledge(role);
-            assert!(text.contains("harwness.knowledge.agent-organization@1"), "{role:?}");
-            assert!(text.contains("harwness.knowledge.agent-authoring@1"), "{role:?}");
+            assert!(
+                text.contains("harwness.knowledge.agent-organization@1"),
+                "{role:?}"
+            );
+            assert!(
+                text.contains("harwness.knowledge.agent-authoring@1"),
+                "{role:?}"
+            );
             assert!(text.ends_with(builtin_role_knowledge(role)), "{role:?}");
         }
-        for role in [AgentRoleId::RootOrchestrator, AgentRoleId::ChildOrchestrator] {
+        for role in [
+            AgentRoleId::RootOrchestrator,
+            AgentRoleId::ChildOrchestrator,
+        ] {
             let text = builtin_organization_knowledge(role);
-            assert!(text.contains("harwness.knowledge.agent-organization@1"), "{role:?}");
-            assert!(!text.contains("harwness.knowledge.agent-authoring@1"), "{role:?}");
+            assert!(
+                text.contains("harwness.knowledge.agent-organization@1"),
+                "{role:?}"
+            );
+            assert!(
+                !text.contains("harwness.knowledge.agent-authoring@1"),
+                "{role:?}"
+            );
             assert!(text.ends_with(builtin_role_knowledge(role)), "{role:?}");
         }
         for role in [AgentRoleId::Worker, AgentRoleId::UiaWorker] {
-            assert_eq!(builtin_organization_knowledge(role), builtin_role_knowledge(role));
+            assert_eq!(
+                builtin_organization_knowledge(role),
+                builtin_role_knowledge(role)
+            );
         }
     }
 }

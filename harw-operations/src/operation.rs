@@ -948,13 +948,16 @@ pub trait Operation: Send + Sync {
 mod tests {
     use super::{
         ApprovalPolicy, ArgsSchemaProbe, BusyAvailability, CommandVisibility,
-        DerivedArgsSchema as _, NoArgsSchema as _, OpInput, OpOutput, Operation,
-        OperationCategory, OperationDomain, OperationMeta, PermissionTier, Surface, WebMethod,
+        DerivedArgsSchema as _, NoArgsSchema as _, OpInput, OpOutput, Operation, OperationCategory,
+        OperationDomain, OperationMeta, PermissionTier, Surface, WebMethod,
     };
     use crate::context::{OpContext, ServiceMap};
     use crate::error::OpError;
     use crate::op_schema::{OpArgsSchema, object_schema, string_schema};
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use crate::test_support::{TestError, TestResult, ctx};
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::path::PathBuf;
     use std::sync::OnceLock;
@@ -1124,12 +1127,13 @@ mod tests {
     /// Erstellt einen minimalen `OpContext` für Tests.
     /// Legt ein temporäres Verzeichnis an, baut eine WorkspaceRegistry und
     /// konstruiert einen SandboxSpec mit ReadWorkspace-Berechtigung.
-    fn make_test_ctx() -> (OpContext, PathBuf) {
+    fn make_test_ctx() -> TestResult<(OpContext, PathBuf)> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTX_COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = CTX_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = std::env::temp_dir().join(format!("harw-ops-test-{}-{}", std::process::id(), id));
-        std::fs::create_dir_all(tmp.join("ws")).unwrap();
+        std::fs::create_dir_all(tmp.join("ws"))
+            .map_err(ctx("Test-Workspace-Verzeichnis anlegen"))?;
         let registry = WorkspaceRegistry::build(
             &tmp,
             [WorkspaceRegistration {
@@ -1138,19 +1142,19 @@ mod tests {
                 root: PathBuf::from("ws"),
             }],
         )
-        .unwrap();
+        .map_err(ctx("WorkspaceRegistry bauen"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .unwrap();
+            .map_err(ctx("Workspace auflösen"))?;
         let sandbox = SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ReadWorkspace]),
         );
         let ctx = OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new());
-        (ctx, tmp)
+        Ok((ctx, tmp))
     }
 
     // ── OperationDomain ───────────────────────────────────────────────────────
@@ -1293,10 +1297,7 @@ mod tests {
 
     #[test]
     fn test_busy_availability_equality() {
-        assert_eq!(
-            BusyAvailability::Immediate,
-            BusyAvailability::Immediate
-        );
+        assert_eq!(BusyAvailability::Immediate, BusyAvailability::Immediate);
         assert_eq!(
             BusyAvailability::DeferredUntilTurnEnd,
             BusyAvailability::DeferredUntilTurnEnd
@@ -1525,31 +1526,38 @@ mod tests {
     }
 
     #[test]
-    fn test_web_method_serde_roundtrip_get() {
-        let json = serde_json::to_string(&WebMethod::Get).expect("Serialisierung darf nicht fehlschlagen");
+    fn test_web_method_serde_roundtrip_get() -> TestResult {
+        let json = serde_json::to_string(&WebMethod::Get)
+            .map_err(ctx("Serialisierung darf nicht fehlschlagen"))?;
         let back: WebMethod =
-            serde_json::from_str(&json).expect("Deserialisierung darf nicht fehlschlagen");
+            serde_json::from_str(&json).map_err(ctx("Deserialisierung darf nicht fehlschlagen"))?;
         assert_eq!(back, WebMethod::Get);
+        Ok(())
     }
 
     #[test]
-    fn test_web_method_serde_roundtrip_post() {
-        let json = serde_json::to_string(&WebMethod::Post).expect("Serialisierung darf nicht fehlschlagen");
+    fn test_web_method_serde_roundtrip_post() -> TestResult {
+        let json = serde_json::to_string(&WebMethod::Post)
+            .map_err(ctx("Serialisierung darf nicht fehlschlagen"))?;
         let back: WebMethod =
-            serde_json::from_str(&json).expect("Deserialisierung darf nicht fehlschlagen");
+            serde_json::from_str(&json).map_err(ctx("Deserialisierung darf nicht fehlschlagen"))?;
         assert_eq!(back, WebMethod::Post);
+        Ok(())
     }
 
     #[test]
-    fn test_web_method_serde_uses_screaming_snake_case() {
+    fn test_web_method_serde_uses_screaming_snake_case() -> TestResult {
         assert_eq!(
-            serde_json::to_string(&WebMethod::Get).expect("Serialisierung darf nicht fehlschlagen"),
+            serde_json::to_string(&WebMethod::Get)
+                .map_err(ctx("Serialisierung darf nicht fehlschlagen"))?,
             "\"GET\""
         );
         assert_eq!(
-            serde_json::to_string(&WebMethod::Post).expect("Serialisierung darf nicht fehlschlagen"),
+            serde_json::to_string(&WebMethod::Post)
+                .map_err(ctx("Serialisierung darf nicht fehlschlagen"))?,
             "\"POST\""
         );
+        Ok(())
     }
 
     // ── OperationMeta ─────────────────────────────────────────────────────────
@@ -1690,15 +1698,20 @@ mod tests {
     }
 
     #[test]
-    fn test_op_invocation_command_path_and_args_accessible() {
+    fn test_op_invocation_command_path_and_args_accessible() -> TestResult {
         let input = OpInput::command("/session/list", vec!["--limit".to_owned(), "5".to_owned()]);
         match input.invocation {
             crate::operation::OpInvocation::Command { path, args } => {
                 assert_eq!(path, "/session/list");
                 assert_eq!(args, vec!["--limit".to_owned(), "5".to_owned()]);
             }
-            other => panic!("Erwartet Command, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Erwartet Command, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     // ── OpOutput ──────────────────────────────────────────────────────────────
@@ -1846,87 +1859,106 @@ mod tests {
     // ── Operation::run — happy path ───────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_noop_op_run_returns_ok() {
+    async fn test_noop_op_run_returns_ok() -> TestResult {
         let op = NoopOp;
-        let (ctx, tmp) = make_test_ctx();
+        let (ctx, tmp) = make_test_ctx()?;
         let result = op.run(&ctx, make_empty_input()).await;
         std::fs::remove_dir_all(tmp).ok();
         assert!(result.is_ok());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_noop_op_run_output_text_non_empty() {
+    async fn test_noop_op_run_output_text_non_empty() -> TestResult {
         let op = NoopOp;
-        let (ctx, tmp) = make_test_ctx();
+        let (ctx, tmp) = make_test_ctx()?;
         let out = op.run(&ctx, make_empty_input()).await;
         std::fs::remove_dir_all(tmp).ok();
         match out {
             Ok(o) => assert!(!o.text.is_empty()),
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
+            Err(e) => return Err(TestError::Unexpected(format!("Unerwarteter Fehler: {e}"))),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_multi_surface_op_run_reflects_arg_count() {
+    async fn test_multi_surface_op_run_reflects_arg_count() -> TestResult {
         let op = MultiSurfaceOp;
-        let (ctx, tmp) = make_test_ctx();
+        let (ctx, tmp) = make_test_ctx()?;
         let input = make_raw_input(&["a", "b", "c"]);
         let out = op.run(&ctx, input).await;
         std::fs::remove_dir_all(tmp).ok();
         match out {
             Ok(o) => assert_eq!(o.text, "args=3"),
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
+            Err(e) => return Err(TestError::Unexpected(format!("Unerwarteter Fehler: {e}"))),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_multi_surface_op_run_with_empty_args() {
+    async fn test_multi_surface_op_run_with_empty_args() -> TestResult {
         let op = MultiSurfaceOp;
-        let (ctx, tmp) = make_test_ctx();
+        let (ctx, tmp) = make_test_ctx()?;
         let out = op.run(&ctx, make_empty_input()).await;
         std::fs::remove_dir_all(tmp).ok();
         match out {
             Ok(o) => assert_eq!(o.text, "args=0"),
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
+            Err(e) => return Err(TestError::Unexpected(format!("Unerwarteter Fehler: {e}"))),
         }
+        Ok(())
     }
 
     // ── Operation::run — error paths ──────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_invalid_args_op_run_returns_invalid_arguments_err() {
+    async fn test_invalid_args_op_run_returns_invalid_arguments_err() -> TestResult {
         let op = InvalidArgsOp;
-        let (ctx, tmp) = make_test_ctx();
+        let (ctx, tmp) = make_test_ctx()?;
         let result = op.run(&ctx, make_empty_input()).await;
         std::fs::remove_dir_all(tmp).ok();
         match result {
             Err(OpError::InvalidArguments(_)) => {}
-            other => panic!("Erwartet InvalidArguments, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Erwartet InvalidArguments, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_execution_err_op_run_returns_execution_err() {
+    async fn test_execution_err_op_run_returns_execution_err() -> TestResult {
         let op = ExecutionErrOp;
-        let (ctx, tmp) = make_test_ctx();
+        let (ctx, tmp) = make_test_ctx()?;
         let result = op.run(&ctx, make_empty_input()).await;
         std::fs::remove_dir_all(tmp).ok();
         match result {
             Err(OpError::Execution(_)) => {}
-            other => panic!("Erwartet Execution, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Erwartet Execution, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_not_available_op_run_returns_not_available_err() {
+    async fn test_not_available_op_run_returns_not_available_err() -> TestResult {
         let op = NotAvailableOp;
-        let (ctx, tmp) = make_test_ctx();
+        let (ctx, tmp) = make_test_ctx()?;
         let result = op.run(&ctx, make_empty_input()).await;
         std::fs::remove_dir_all(tmp).ok();
         match result {
             Err(OpError::NotAvailable(_)) => {}
-            other => panic!("Erwartet NotAvailable, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Erwartet NotAvailable, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     // ── Send + Sync (compile-time checks via trait bounds) ────────────────────
@@ -1941,23 +1973,28 @@ mod tests {
     // ── Arc<dyn Operation> across threads ─────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_arc_dyn_operation_shared_across_tasks() {
+    async fn test_arc_dyn_operation_shared_across_tasks() -> TestResult {
         use std::sync::Arc;
-        let (ctx, tmp) = make_test_ctx();
-        let ctx = Arc::new(ctx);
+        let (op_ctx, tmp) = make_test_ctx()?;
+        let op_ctx = Arc::new(op_ctx);
         let op: Arc<dyn Operation> = Arc::new(NoopOp);
         let op2 = Arc::clone(&op);
-        let ctx1 = Arc::clone(&ctx);
-        let ctx2 = Arc::clone(&ctx);
+        let ctx1 = Arc::clone(&op_ctx);
+        let ctx2 = Arc::clone(&op_ctx);
         let h1 = tokio::spawn(async move { op.run(&ctx1, make_empty_input()).await });
         let h2 = tokio::spawn(async move { op2.run(&ctx2, make_empty_input()).await });
         let r1 = h1.await;
         let r2 = h2.await;
         std::fs::remove_dir_all(tmp).ok();
-        assert!(r1.is_ok(), "task 1 panicked");
-        assert!(r2.is_ok(), "task 2 panicked");
-        assert!(r1.unwrap().is_ok(), "operation 1 returned Err");
-        assert!(r2.unwrap().is_ok(), "operation 2 returned Err");
+        let Ok(inner1) = r1 else {
+            return Err(TestError::Unexpected("task 1 panicked".into()));
+        };
+        let Ok(inner2) = r2 else {
+            return Err(TestError::Unexpected("task 2 panicked".into()));
+        };
+        assert!(inner1.is_ok(), "operation 1 returned Err");
+        assert!(inner2.is_ok(), "operation 2 returned Err");
+        Ok(())
     }
 
     // ── OperationCategory ─────────────────────────────────────────────────────
@@ -2026,10 +2063,9 @@ mod tests {
     }
 
     #[test]
-    fn test_probe_schema_pointer_builds_closed_schema() {
-        let build = match probe_args_schema!(WithSchemaArgs) {
-            Some(build) => build,
-            None => panic!("Erwartet Some für WithSchemaArgs"),
+    fn test_probe_schema_pointer_builds_closed_schema() -> TestResult {
+        let Some(build) = probe_args_schema!(WithSchemaArgs) else {
+            return Err(TestError::Missing("Some für WithSchemaArgs"));
         };
         let schema = build();
 
@@ -2039,13 +2075,13 @@ mod tests {
             "das gelieferte Schema muss geschlossen sein"
         );
         assert_eq!(schema.required, Some(vec!["job_id".to_owned()]));
+        Ok(())
     }
 
     #[test]
-    fn test_probe_schema_pointer_equals_trait_function() {
-        let build = match probe_args_schema!(WithSchemaArgs) {
-            Some(build) => build,
-            None => panic!("Erwartet Some für WithSchemaArgs"),
+    fn test_probe_schema_pointer_equals_trait_function() -> TestResult {
+        let Some(build) = probe_args_schema!(WithSchemaArgs) else {
+            return Err(TestError::Missing("Some für WithSchemaArgs"));
         };
 
         assert_eq!(
@@ -2053,6 +2089,7 @@ mod tests {
             <WithSchemaArgs as OpArgsSchema>::json_schema(),
             "die Sonde muss genau die Trait-Funktion binden"
         );
+        Ok(())
     }
 
     #[test]
@@ -2092,7 +2129,7 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_meta_with_args_schema_is_cloneable() {
+    fn test_operation_meta_with_args_schema_is_cloneable() -> TestResult {
         let meta = OperationMeta {
             name: "with-schema",
             summary: "Trägt ein Argument-Schema.",
@@ -2101,15 +2138,15 @@ mod tests {
         };
         let cloned = meta.clone();
 
-        let build = match cloned.args_schema {
-            Some(build) => build,
-            None => panic!("der Zeiger muss den Clone überleben"),
+        let Some(build) = cloned.args_schema else {
+            return Err(TestError::Missing("der Zeiger muss den Clone überleben"));
         };
         assert_eq!(build().required, Some(vec!["job_id".to_owned()]));
+        Ok(())
     }
 
     #[test]
-    fn test_operation_meta_with_output_schema_is_cloneable() {
+    fn test_operation_meta_with_output_schema_is_cloneable() -> TestResult {
         let meta = OperationMeta {
             name: "with-output-schema",
             summary: "Trägt ein Ausgabe-Schema.",
@@ -2118,10 +2155,10 @@ mod tests {
         };
         let cloned = meta.clone();
 
-        let build = match cloned.output_schema {
-            Some(build) => build,
-            None => panic!("der Zeiger muss den Clone überleben"),
+        let Some(build) = cloned.output_schema else {
+            return Err(TestError::Missing("der Zeiger muss den Clone überleben"));
         };
         assert_eq!(build().required, Some(vec!["job_id".to_owned()]));
+        Ok(())
     }
 }

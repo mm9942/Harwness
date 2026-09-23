@@ -93,7 +93,7 @@
 //! ```
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout, Write as _};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -115,8 +115,7 @@ use harw_core::cancel::{CancelReason, CancelToken};
 use harw_core::turn_loop::TurnControl;
 use harw_core::{
     AgentSession, CompactionPlan, ConversationHistory, CoreError, InteractionMode,
-    ManagedAgentSpawner, ModelError, ModelMessage, TurnInput, TurnOutcome, compact_session,
-    run_turn,
+    ManagedAgentSpawner, ModelError, TurnInput, TurnOutcome, compact_session, run_turn,
 };
 use harw_extension_api::allow_rules::{ApprovalRule, RuleDecision, RuleScope, derive_shell_rule};
 use harw_extension_api::approval_mode::ApprovalMode;
@@ -129,10 +128,12 @@ use harw_plan::PlanStore;
 use harw_plan::goal::{GoalStore, evaluate_goal};
 use harw_protocol::events::{SessionEvent, TurnEvent};
 use harw_protocol::items::{ContentPart, ResultTrust, ToolCallResult, TurnItem};
+use harw_protocol::{AgentOrchestrationEvent, AgentOrchestrationStatus};
 use harw_types::ReasoningEffort;
 use harw_types::SessionId;
 use harw_types::TokenUsage;
 
+use crate::agent_tree::{AgentRow, AgentTree, AgentTreeAction};
 use crate::approval::{
     ApprovalDriver, ApprovalDriverError, ApprovalPrompt, ApprovalPromptReceiver, ChildTurnDriver,
 };
@@ -287,6 +288,15 @@ impl<T: HistoryCell> HistoryCell for SharedHistoryCell<T> {
 /// `ToolCallRequested`-Ereignis eintrifft, muss dieselbe Zelle wiederfinden,
 /// egal in welcher Reihenfolge beide beim Renderer ankommen (siehe
 /// [`ensure_tool_cell`]).
+///
+/// `last_commentary_text` ist der einzige Turn-gebundene Wert hier: er wird
+/// von [`drive_turn_animated`] zu Turn-Beginn auf `None` zurückgesetzt (im
+/// Gegensatz zu den obigen Feldern, die absichtlich über Turns hinweg
+/// bestehen bleiben) und im `TurnEvent::ItemAdded(AssistantMessage)`-Zweig
+/// von [`handle_turn_event`] gesetzt, sobald eine `Commentary`-Nachricht live
+/// über [`ChatApp::push_line`] gezeigt wird. `drive_turn_animated` nutzt ihn
+/// als zweite Verteidigungslinie gegen eine doppelte Anzeige derselben
+/// Antwort (siehe dortige Doku).
 #[derive(Debug, Default)]
 struct TurnEventState {
     /// `call_id` → die eine geteilte Werkzeugzelle dieses Aufrufs.
@@ -300,6 +310,10 @@ struct TurnEventState {
     export_incomplete_tools: HashMap<harw_types::ToolCallId, ()>,
     /// `child_id` → die eine Verlaufszelle dieses Kindes.
     child_cells: HashMap<String, Arc<Mutex<SubAgentCell>>>,
+    /// Text der zuletzt live gepushten `Commentary`-Assistant-Zeile des
+    /// aktuell laufenden Turns (oder `None`, wenn keine erschien). Siehe
+    /// Dokumentation oben.
+    last_commentary_text: Option<String>,
 }
 
 impl TurnEventState {
@@ -489,6 +503,10 @@ pub(crate) enum EffortTarget {
 /// gehen Tasten ausschließlich an das Overlay (siehe `handle_overlay_key`).
 #[derive(Debug)]
 enum Overlay {
+    /// Die interaktive, ausschließlich lesende Projektion des vom gemeinsamen
+    /// `ManagedAgentSpawner` gehaltenen Kind-Agentenbaums. Die Ausführung und
+    /// die Abbruchautorität bleiben beim Controller.
+    AgentTree(AgentTree),
     /// `/resume` ohne Argument öffnet eine filterbare Liste vergangener
     /// Sitzungen (Plan Schritt 7).
     SessionPicker(SessionPicker),
@@ -866,6 +884,13 @@ pub struct ChatApp {
     /// (`active_cancel` wird neu gesetzt) und beim Ende des laufenden Turns
     /// (`active_cancel = None`) wieder gelöscht.
     cancel_requested_at: Option<Instant>,
+    /// Zeitpunkt, zu dem `Ctrl+C` zuletzt tatsächlich eine nicht-leere
+    /// Eingabe-Warteschlange (`deferred_input`/`pending_turns`) verworfen hat
+    /// (Fix E / Teil 1b). Rein transienter Statuszeilen-Hinweis (siehe
+    /// [`render_viewport`]), analog zu `cancel_requested_at` — erzeugt KEINE
+    /// dauerhafte Verlaufszeile. Wird an denselben Stellen wie
+    /// `cancel_requested_at` zurückgesetzt (neuer Turn, Turn-Ende).
+    queue_cleared_at: Option<Instant>,
     /// Ein erstes Escape schließt nur Popup/History-Navigation; ein zweites
     /// Escape leert den Composer.
     escape_armed: bool,
@@ -929,6 +954,10 @@ pub struct ChatApp {
     /// den Turn stehenzulassen. `None` beantwortet jeden Handoff mit einem
     /// Fehlerergebnis (der Turn endet trotzdem regulär).
     managed_spawner: Option<Arc<ManagedAgentSpawner>>,
+    /// Append-only Orchestrierungsbeobachtungen, die beim Resume aus dem
+    /// StateStore geladen wurden. Sie sind reine Anzeigehistorie und werden
+    /// nie in den lebenden Controller zurückgespielt.
+    historic_agent_events: Vec<AgentOrchestrationEvent>,
     /// Zuletzt beobachteter Interaktionsmodus der Session. Wird an der
     /// Turn-Grenze aus [`AgentSession::mode`] nachgezogen bzw. aus
     /// [`TurnEvent::ModeChanged`] übernommen und in der Statuszeile angezeigt.
@@ -1039,6 +1068,16 @@ pub struct ChatApp {
     /// (`Option::take`) und ersetzt nur die Anzeige — der Modell-Turn selbst
     /// bekommt weiterhin den vollen Text.
     pending_turn_user_cell_override: Option<String>,
+    /// Vormerkung für [`TerminalGuard::reassert_terminal_modes`] (Register
+    /// "CSI-Sicherheitsnetz und Paste-Platzhalter", Punkt 7): `true`, sobald
+    /// ein Ereignis eingetreten ist, nach dem Raw-Mode/Bracketed-Paste/
+    /// Maus-Capture beschädigt zurückgekommen sein könnten (Ctrl+H beendet
+    /// eine Host-Arbeitsphase, siehe [`Self::end_host_mode`], oder ein
+    /// `shell.exec`-Werkzeugaufruf endet, siehe `handle_turn_event`).
+    /// Gesetzt an diesen beiden Stellen, weil dort kein `&mut TerminalGuard`
+    /// zur Hand ist; von einem Aufrufer, der einen Guard besitzt, über
+    /// [`Self::take_needs_terminal_reassert`] konsumiert.
+    needs_terminal_reassert: bool,
 }
 
 /// Handgeschriebene `Debug`-Implementierung, da [`CommandAdapter`] (enthält
@@ -1149,6 +1188,7 @@ impl ChatApp {
             pending_turns: std::collections::VecDeque::new(),
             active_cancel: None,
             cancel_requested_at: None,
+            queue_cleared_at: None,
             escape_armed: false,
             scroll: ChatScroll::new(),
             input_history,
@@ -1166,6 +1206,7 @@ impl ChatApp {
             last_history_total_lines: Cell::new(0),
             last_history_visible_rows: Cell::new(20),
             managed_spawner: None,
+            historic_agent_events: Vec::new(),
             active_mode: InteractionMode::default(),
             plan_services: None,
             tool_verbosity: ToolVerbosity::Compact,
@@ -1191,6 +1232,7 @@ impl ChatApp {
             hard_quit_requested: false,
             last_shell_command: None,
             pending_turn_user_cell_override: None,
+            needs_terminal_reassert: false,
         }
     }
 
@@ -1221,6 +1263,30 @@ impl ChatApp {
     #[must_use]
     pub(crate) fn with_runtime(mut self, assembly: Arc<harw_runtime::RuntimeAssembly>) -> Self {
         self.runtime = Some(assembly);
+        self
+    }
+
+    /// Installiert die beim Resume geladene, unveränderliche
+    /// Orchestrierungshistorie für die Agentenbaum-Projektion.
+    pub(crate) fn set_historic_agent_events(&mut self, events: Vec<AgentOrchestrationEvent>) {
+        self.historic_agent_events = events;
+    }
+
+    /// Rebinds persistent input history to the runtime-selected Harw home.
+    ///
+    /// `ChatApp::new` has a standalone fallback for tests and embedders. The
+    /// composition root calls this builder before the event loop starts, so
+    /// replacing the editor's initially loaded fallback history is safe and
+    /// makes an explicit `--home` authoritative for both reads and writes.
+    #[must_use]
+    pub(crate) fn with_home(mut self, home: &std::path::Path) -> Self {
+        let input_history = InputHistoryStore::at_home(home, INPUT_HISTORY_CAP);
+        let mut input = InputEditor::new();
+        for entry in input_history.load() {
+            input.push_history(entry);
+        }
+        self.input_history = input_history;
+        self.input = input;
         self
     }
 
@@ -1653,6 +1719,43 @@ impl ChatApp {
         self.overlay.is_some()
     }
 
+    /// Öffnet die Agentenbaum-Ansicht für die aktuelle Wurzelsitzung.
+    ///
+    /// Der Snapshot wird bei jedem Rendern neu aus dem gemeinsamen Spawner
+    /// gelesen, damit Start, Abschluss und ein Abbruch ohne separaten
+    /// TUI-internen Lifecycle-Cache sichtbar werden.
+    fn open_agent_tree(&mut self) {
+        self.overlay = Some(Overlay::AgentTree(AgentTree::default()));
+    }
+
+    /// Erzeugt einen topologisch sortierten, nicht-sensitiven Snapshot des
+    /// eigenen Agenten-Teilbaums. Der Spawner besitzt die einzige Quelle für
+    /// Admittierung und Status; unbekannte Telemetrie bleibt für die Anzeige
+    /// bewusst `None` statt als Nullwert erfunden zu werden.
+    fn agent_tree_rows(&self) -> Vec<AgentRow> {
+        let root = self.session_id().clone();
+        let mut rows = vec![AgentRow {
+            id: root.as_str().to_owned(),
+            parent: None,
+            role: "Wurzel-Orchestrator".to_owned(),
+            depth: 0,
+            status: "running".to_owned(),
+            task: None,
+            tokens: None,
+            tool_calls: None,
+            duration_ms: None,
+            budget: "—".to_owned(),
+            result: None,
+            can_stop: false,
+        }];
+        let mut seen = HashSet::from([root.as_str().to_owned()]);
+        if let Some(spawner) = self.managed_spawner() {
+            append_agent_tree_rows(spawner, &root, 1, &mut seen, &mut rows);
+        }
+        append_historic_agent_tree_rows(&self.historic_agent_events, &root, &mut seen, &mut rows);
+        rows
+    }
+
     /// Leitet die aktuell wirksame [`PermissionCycleStage`] aus dem
     /// Freigabemodus der Montage und dem aktiven Interaktionsmodus ab (Plan
     /// Schritt 5).
@@ -1721,23 +1824,27 @@ impl ChatApp {
                     );
                 }
             }
-            PermissionCycleStage::Ask | PermissionCycleStage::Auto | PermissionCycleStage::Full => {
-                let approval = match stage {
-                    PermissionCycleStage::Ask => ApprovalMode::AlwaysAsk,
-                    PermissionCycleStage::Auto => ApprovalMode::Delegated,
-                    PermissionCycleStage::Full => ApprovalMode::FullAccess,
-                    PermissionCycleStage::Plan => unreachable!("oben behandelt"),
-                };
-                self.set_approval_mode(approval);
-                if let Some(previous) = self.mode_before_plan.take() {
-                    self.active_mode = previous;
-                    if let Err(error) = self.session_controller.request_mode(previous.as_str()) {
-                        tracing::warn!(
-                            error = %error,
-                            "tui.permission_cycle.restore_mode_failed"
-                        );
-                    }
-                }
+            PermissionCycleStage::Ask => self.finish_permission_stage(ApprovalMode::AlwaysAsk),
+            PermissionCycleStage::Auto => self.finish_permission_stage(ApprovalMode::Delegated),
+            PermissionCycleStage::Full => self.finish_permission_stage(ApprovalMode::FullAccess),
+        }
+    }
+
+    // Gemeinsamer Abschluss der drei Nicht-Plan-Stufen: setzt den Freigabemodus
+    // und stellt, falls der Zyklus gerade aus `Plan` zurückkehrt, den vorherigen
+    // Interaktionsmodus wieder her. Vormals ein zweites, strukturell
+    // überflüssiges `match stage` mit einem `unreachable!`-Arm für `Plan` (der
+    // Fall existiert jetzt gar nicht mehr, da jede Nicht-Plan-Stufe ihren
+    // eigenen Match-Arm mit fixem `approval`-Wert hat).
+    fn finish_permission_stage(&mut self, approval: ApprovalMode) {
+        self.set_approval_mode(approval);
+        if let Some(previous) = self.mode_before_plan.take() {
+            self.active_mode = previous;
+            if let Err(error) = self.session_controller.request_mode(previous.as_str()) {
+                tracing::warn!(
+                    error = %error,
+                    "tui.permission_cycle.restore_mode_failed"
+                );
             }
         }
     }
@@ -2072,7 +2179,28 @@ impl ChatApp {
         registry.forget_session(&session);
         let _ = runtime.host_permit_ledger().revoke_session(&session);
         self.push_line(Role::System, "Host-Modus beendet — Isolation wieder aktiv.");
+        // Register „CSI-Sicherheitsnetz und Paste-Platzhalter", Punkt 7: die
+        // beendete Host-Arbeitsphase kann Terminal-Modi (Raw-Mode/Bracketed-
+        // Paste/Maus-Capture) beschädigt zurückgelassen haben — der Aufrufer
+        // mit Zugriff auf den `TerminalGuard` reasserted sie best-effort.
+        self.request_terminal_reassert();
         true
+    }
+
+    /// Merkt vor, dass Terminal-Modi best-effort reasserted werden sollen
+    /// (siehe [`Self::needs_terminal_reassert`]-Dokumentation).
+    pub(crate) fn request_terminal_reassert(&mut self) {
+        self.needs_terminal_reassert = true;
+    }
+
+    /// Konsumiert die Vormerkung aus [`Self::request_terminal_reassert`].
+    ///
+    /// # Rückgabe
+    /// `true` genau einmal pro Vormerkung — der Aufrufer ruft danach
+    /// [`TerminalGuard::reassert_terminal_modes`] auf.
+    #[must_use]
+    pub(crate) fn take_needs_terminal_reassert(&mut self) -> bool {
+        std::mem::take(&mut self.needs_terminal_reassert)
     }
 
     /// Hängt eine typisierte Zelle für die gegebene Rolle und den Text an den Log an.
@@ -2270,6 +2398,30 @@ impl TerminalGuard {
     fn terminal(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
         &mut self.terminal
     }
+
+    /// Reassertiert Raw-Mode, Bracketed-Paste und Maus-Capture best-effort
+    /// (Register „CSI-Sicherheitsnetz und Paste-Platzhalter", Punkt 7).
+    ///
+    /// # Beschreibung
+    /// Ein Host-`shell.exec`/`!`-Lauf oder das Ende einer Host-Arbeitsphase
+    /// (Ctrl+H) kann diese Terminal-Modi beschädigt zurücklassen — z. B.
+    /// wenn eine ausgeführte Fremd-Anwendung sie selbst geändert hat. Diese
+    /// Funktion stellt sie erneut her, ohne den Bildschirm zu löschen oder
+    /// den Alternate-Screen zu verlassen/erneut zu betreten. Fehler werden
+    /// protokolliert, aber nicht propagiert — ein fehlgeschlagenes
+    /// Selbstheilen darf die TUI niemals abstürzen lassen.
+    pub(crate) fn reassert_terminal_modes(&mut self) {
+        if let Err(error) = enable_raw_mode() {
+            tracing::warn!(%error, "tui.terminal.reassert_raw_mode_failed");
+        }
+        if let Err(error) = crossterm::execute!(
+            self.terminal.backend_mut(),
+            EnableBracketedPaste,
+            EnableMouseCapture,
+        ) {
+            tracing::warn!(%error, "tui.terminal.reassert_modes_failed");
+        }
+    }
 }
 
 /// Stellt Terminal-Raw-Mode, Bracketed-Paste und Alternate-Screen beim Drop zurück (Best-effort).
@@ -2324,6 +2476,144 @@ fn resume_request(raw: &str) -> Option<TuiRunOutcome> {
 fn is_bare_or_argless_switch(raw: &str, command: &str) -> bool {
     let trimmed = raw.trim();
     trimmed == command || trimmed == format!("{command} switch")
+}
+
+/// Appends the controller-owned descendants of `parent` in pre-order.
+///
+/// The `seen` guard makes a malformed controller snapshot harmless for the
+/// renderer. It never grants authority: stopping is still checked again by the
+/// controller against the caller's owned subtree.
+fn append_agent_tree_rows(
+    spawner: &ManagedAgentSpawner,
+    parent: &SessionId,
+    depth: usize,
+    seen: &mut HashSet<String>,
+    rows: &mut Vec<AgentRow>,
+) {
+    for record in spawner.list_children_for(parent) {
+        let id = record.child.as_str().to_owned();
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let budget = match (
+            record.budget.max_tokens,
+            record.budget.max_tool_calls,
+            record.budget.max_wall_time_ms,
+        ) {
+            (None, None, None) => "—".to_owned(),
+            (tokens, tools, wall) => format!(
+                "Tokens {} · Tools {} · Dauer {} ms",
+                tokens.map_or_else(|| "—".to_owned(), |value| value.to_string()),
+                tools.map_or_else(|| "—".to_owned(), |value| value.to_string()),
+                wall.map_or_else(|| "—".to_owned(), |value| value.to_string()),
+            ),
+        };
+        let child = record.child.clone();
+        rows.push(AgentRow {
+            id,
+            parent: Some(record.parent.as_str().to_owned()),
+            role: record.role,
+            depth,
+            status: record.status.as_str().to_owned(),
+            task: None,
+            tokens: None,
+            tool_calls: None,
+            duration_ms: None,
+            budget,
+            result: None,
+            can_stop: !record.status.is_terminal(),
+        });
+        append_agent_tree_rows(spawner, &child, depth.saturating_add(1), seen, rows);
+    }
+}
+
+/// Fügt die beim Resume geladene, letzte Beobachtung jedes historischen
+/// Kindes hinzu. Diese Projektion besitzt keine Ausführungsautorität: ein
+/// nicht-terminaler Eintrag stammt aus einem früheren Prozess und wird daher
+/// sichtbar als „unterbrochen“, nie als weiter laufender oder stoppbarer Job.
+fn append_historic_agent_tree_rows(
+    events: &[AgentOrchestrationEvent],
+    root: &SessionId,
+    seen: &mut HashSet<String>,
+    rows: &mut Vec<AgentRow>,
+) {
+    let mut latest = HashMap::<String, AgentOrchestrationEvent>::new();
+    for event in events.iter().filter(|event| &event.root_session_id == root) {
+        let id = event.child_session_id.as_str().to_owned();
+        if let Some(previous) = latest.get(&id) {
+            let mut merged = event.clone();
+            if merged.task.is_none() {
+                merged.task = previous.task.clone();
+            }
+            latest.insert(id, merged);
+        } else {
+            latest.insert(id, event.clone());
+        }
+    }
+    let mut events: Vec<_> = latest.into_values().collect();
+    events.sort_by(|left, right| {
+        left.depth.cmp(&right.depth).then_with(|| {
+            left.child_session_id
+                .as_str()
+                .cmp(right.child_session_id.as_str())
+        })
+    });
+    let mut depths: HashMap<String, usize> =
+        rows.iter().map(|row| (row.id.clone(), row.depth)).collect();
+    for event in events {
+        let id = event.child_session_id.as_str().to_owned();
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let parent = event.parent_session_id.as_str().to_owned();
+        let depth = depths
+            .get(&parent)
+            .copied()
+            .map_or(event.depth as usize, |parent_depth| {
+                parent_depth.saturating_add(1)
+            });
+        // Ein einziges erschöpfendes `match` statt vorherigem `matches!`-Check
+        // plus zweitem `match` mit `unreachable!`-Fallback: die nicht-
+        // terminalen Stufen sind hier explizit aufgezählt statt über `_`
+        // "irgendwie schon terminal" anzunehmen.
+        let status = match event.status {
+            AgentOrchestrationStatus::Completed => "completed",
+            AgentOrchestrationStatus::Failed => "failed",
+            AgentOrchestrationStatus::Cancelled => "cancelled",
+            AgentOrchestrationStatus::Admitted
+            | AgentOrchestrationStatus::Running
+            | AgentOrchestrationStatus::Progress
+            | AgentOrchestrationStatus::Paused => "interrupted",
+        }
+        .to_owned();
+        rows.push(AgentRow {
+            id: id.clone(),
+            parent: Some(parent),
+            role: event.role,
+            depth,
+            status,
+            task: event.task,
+            tokens: event.usage.as_ref().map(TokenUsage::total),
+            tool_calls: None,
+            duration_ms: event.duration_ms,
+            budget: "—".to_owned(),
+            result: event.detail,
+            can_stop: false,
+        });
+        depths.insert(id, depth);
+    }
+}
+
+/// Resolves the controller-owned parent for an exported child lifecycle event.
+///
+/// The controller record is authoritative whenever it is still retained. The
+/// current session is the event source and is the safe fallback when a child
+/// completed quickly enough that its record has already been released.
+fn exported_agent_parent_id(app: &ChatApp, child: &SessionId) -> Option<String> {
+    app.managed_spawner()
+        .and_then(|spawner| spawner.child_record(child))
+        .map(|record| record.parent.as_str().to_owned())
+        .or_else(|| Some(app.session_id().as_str().to_owned()))
 }
 
 fn visible_message_text(content: &[ContentPart]) -> String {
@@ -2645,8 +2935,20 @@ pub(crate) fn install_loaded_history(
 /// [`ChatApp::export_started_at`] unverändert beim TUI-Startzeitpunkt
 /// (siehe [`export_timestamp_now`]). Ein fehlender oder unlesbarer Sidecar
 /// wird nur geloggt, nie propagiert — dieselbe Best-Effort-Haltung wie
-/// [`harw_session_store::meta::load_or_derive`] selbst, das bei fehlendem
-/// Sidecar aus dem Transcript ableitet statt zu scheitern.
+/// [`harw_session_store::meta::peek`] selbst, das bei fehlendem Sidecar aus
+/// dem Transcript ableitet statt zu scheitern.
+///
+/// Liest bewusst über [`harw_session_store::meta::peek`], nicht über
+/// [`harw_session_store::meta::load_or_derive`]: diese Funktion läuft bei
+/// **jedem** TUI-Start (`install_loaded_history`), also auch für eine ganz
+/// neue Session, deren Transcript hier noch leer ist. `load_or_derive` würde
+/// in diesem Fall sofort einen Sidecar mit `first_user_message: None`
+/// speichern und ihn damit für den Rest der Session einfrieren — der
+/// Resume-Picker (und der Titel-Job in
+/// `harw-runtime/src/session_title.rs::ensure_title`) sähen danach nie mehr
+/// die tatsächliche erste Nutzernachricht, selbst nachdem sie im Transcript
+/// eingetroffen ist. `peek` liefert denselben Anzeigewert (identisches
+/// `created_at`), schreibt aber nie.
 ///
 /// # Argumente
 /// - `app` (`&mut ChatApp`): liefert Session-ID, Session-Store-Wurzel und
@@ -2659,7 +2961,7 @@ fn apply_session_store_started_at(app: &mut ChatApp) {
     }) else {
         return;
     };
-    match harw_session_store::meta::load_or_derive(&store_root, app.session_id()) {
+    match harw_session_store::meta::peek(&store_root, app.session_id()) {
         Ok(meta) => {
             app.export_started_at = Some(meta.created_at.as_second().to_string());
         }
@@ -2824,6 +3126,14 @@ pub(crate) async fn run_loop(
                             if handle_key(app, key, harw_tx) {
                                 frame_req.schedule_frame();
                             }
+                            // Register „CSI-Sicherheitsnetz und Paste-
+                            // Platzhalter", Punkt 7: Ctrl+H kann soeben eine
+                            // Host-Arbeitsphase beendet haben (siehe
+                            // `ChatApp::end_host_mode`) — Terminal-Modi
+                            // best-effort reassertieren.
+                            if app.take_needs_terminal_reassert() {
+                                guard.reassert_terminal_modes();
+                            }
                         }
                         TuiEvent::Mouse(mouse) => {
                             // Nur das Rad scrollt die Historie; Klicks und
@@ -2839,7 +3149,10 @@ pub(crate) async fn run_loop(
                         }
                         TuiEvent::Paste(text) => {
                             let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-                            app.input.insert_str(&normalized);
+                            // Große Pastes landen nur als kompakter
+                            // Platzhalter im Composer (siehe
+                            // `InputEditor::insert_paste`-Doku).
+                            app.input.insert_paste(&normalized);
                             app.sync_popup();
                             frame_req.schedule_frame();
                         }
@@ -2874,6 +3187,13 @@ pub(crate) async fn run_loop(
                         HarwEvent::Command(raw) => {
                             if let Some(request) = resume_request(&raw) {
                                 return Ok(request);
+                            }
+                            // Die bare Form ist eine interaktive Projektion;
+                            // `/agent list` bleibt der textuelle Slash-Befehl.
+                            if raw.trim() == "/agent" {
+                                app.open_agent_tree();
+                                frame_req.schedule_frame();
+                                continue;
                             }
                             // `/model`/`/uia-model`/`/uia-worker-model` ohne
                             // Argument (oder als argloses `switch`) öffnen den
@@ -3112,6 +3432,16 @@ pub(crate) async fn run_loop(
                                     .map(|line| Line::from(line.to_owned()))
                                     .collect();
                                 app.push_lines(lines);
+                                // Register „CSI-Sicherheitsnetz und Paste-
+                                // Platzhalter", Punkt 7: ein tatsächlich
+                                // gelaufener `!`/`!!`-Host-Befehl kann
+                                // Terminal-Modi (Raw-Mode/Bracketed-Paste/
+                                // Maus-Capture) beschädigt zurückgelassen
+                                // haben — best-effort reassertieren, bevor
+                                // ihr Ergebnis weiterverarbeitet wird.
+                                if shell_result.is_some() {
+                                    guard.reassert_terminal_modes();
+                                }
                                 // Plan Teil F: nach einem tatsächlich gelaufenen
                                 // `!`/`!!`-Befehl sofort einen Folge-Turn einreihen —
                                 // frei über `submitted` (identischer Pfad wie
@@ -3127,7 +3457,9 @@ pub(crate) async fn run_loop(
                                 // ein soeben angefordertes `/mode` sofort wirken —
                                 // sonst zeigte die Statuszeile bis zur nächsten
                                 // Nachricht weiter den alten Modus.
-                                app.apply_pending_controller_state(gateway.session_mut());
+                                if app.apply_pending_controller_state(gateway.session_mut()) {
+                                    persist_gateway_state(gateway).await?;
+                                }
                                 // AP W5-10b: Zielstand nach `/goal check` sichtbar
                                 // machen, sofern die Composition-Root Plan-/Ziel-
                                 // Dienste durchgereicht hat.
@@ -3192,6 +3524,13 @@ pub(crate) async fn run_loop(
                     if let Some(tev) = maybe_tev {
                         if handle_turn_event(app, &mut turn_state, tev) {
                             frame_req.schedule_frame();
+                        }
+                        // Register „CSI-Sicherheitsnetz und Paste-
+                        // Platzhalter", Punkt 7: ein abgeschlossener
+                        // `shell.exec`-Aufruf kann Terminal-Modi beschädigt
+                        // zurückgelassen haben (siehe `handle_turn_event`).
+                        if app.take_needs_terminal_reassert() {
+                            guard.reassert_terminal_modes();
                         }
                     }
                 }
@@ -3354,6 +3693,15 @@ fn ensure_tool_cell(
 ///   fort (kein zweiter Verlaufseintrag),
 /// - `ItemAdded(Reasoning)` → [`ReasoningHistoryCell`], nur bei nicht-leerer
 ///   Zusammenfassung; schließt eine offene Lese-Gruppe,
+/// - `ItemAdded(AssistantMessage)` → nur bei `phase == Some(Commentary)` eine
+///   sichtbare Assistant-Zeile über [`ChatApp::push_line`] (Live-Anzeige des
+///   kurzen Ack-Texts vor Tool-Aufrufen); bei `FinalAnswer` oder fehlender
+///   Phase bleibt die Anzeige `reveal_reply` am Turn-Ende vorbehalten, sonst
+///   entstünde eine Doppelanzeige. Der live gepushte Text wird zusätzlich in
+///   [`TurnEventState::last_commentary_text`] festgehalten — `reveal_reply`s
+///   Aufrufer ([`drive_turn_animated`]) gleicht seine Turn-Antwort dagegen ab
+///   ([`suppress_if_matches_commentary`]), als zweite Verteidigungslinie
+///   gegen eine doppelte Anzeige derselben Nachricht,
 /// - `ChildSpawned` → **eine** [`SubAgentCell`] je `child_id`, geteilt über
 ///   [`SharedHistoryCell`]; schließt eine offene Lese-Gruppe,
 /// - `ChildProgress` / `ChildCompleted` → schreiben **dieselbe** Zelle fort
@@ -3446,6 +3794,15 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                     ExportEntry::ToolCall { tool_name, .. } => Some(tool_name.clone()),
                     _ => None,
                 });
+            // Register „CSI-Sicherheitsnetz und Paste-Platzhalter", Punkt 7:
+            // ein abgeschlossener `shell.exec`-Aufruf kann Terminal-Modi
+            // (Raw-Mode/Bracketed-Paste/Maus-Capture) beschädigt
+            // zurücklassen — der Aufrufer (mit Zugriff auf den
+            // `TerminalGuard`) reasserted sie best-effort, sobald diese
+            // Vormerkung ansteht (siehe `ChatApp::take_needs_terminal_reassert`).
+            if tool_name.as_deref() == Some("shell.exec") {
+                app.request_terminal_reassert();
+            }
             if !state.export_tool_calls.contains_key(&call_id) {
                 app.export_entries.push(export_tool_call_entry(
                     &call_id,
@@ -3495,6 +3852,25 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             true
         }
         TurnEvent::ItemAdded {
+            item: TurnItem::AssistantMessage(message),
+            ..
+        } => {
+            // Nur der kurze Zwischentext vor einem Tool-Aufruf wird hier live
+            // gerendert. Die finale Turn-Antwort bleibt exklusiv `reveal_reply`
+            // am Turn-Ende vorbehalten (sonst erschiene sie doppelt: einmal
+            // hier, einmal beim Abschluss).
+            if message.phase != Some(harw_types::MessagePhase::Commentary) {
+                return false;
+            }
+            let text = visible_message_text(&message.content);
+            app.push_line(Role::Assistant, text.clone());
+            // Zweite Verteidigungslinie gegen eine Doppelanzeige: siehe
+            // `TurnEventState::last_commentary_text`-Doku und
+            // `drive_turn_animated`.
+            state.last_commentary_text = Some(text);
+            true
+        }
+        TurnEvent::ItemAdded {
             item: TurnItem::Error(error),
             ..
         } => {
@@ -3516,6 +3892,7 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
         } => {
             app.close_tool_group();
             let child_id = child.as_str().to_owned();
+            let parent_id = exported_agent_parent_id(app, &child);
             let cell = Arc::new(Mutex::new(SubAgentCell {
                 child_id: child_id.clone(),
                 role: role.clone(),
@@ -3531,7 +3908,7 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                 .push(ExportEntry::Agent(ExportAgentEntry {
                     agent_id: child_id.clone(),
                     role: Some(role.clone()),
-                    parent_id: None,
+                    parent_id,
                     status: Some("running".to_owned()),
                     summary: question.clone(),
                 }));
@@ -3545,6 +3922,7 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             tokens,
             ..
         } => {
+            let parent_id = exported_agent_parent_id(app, &child);
             let updated = state.update_child(child.as_str(), |cell| {
                 cell.apply_progress(tool_calls, tokens);
             });
@@ -3553,7 +3931,7 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                     .push(ExportEntry::Agent(ExportAgentEntry {
                         agent_id: child.as_str().to_owned(),
                         role: None,
-                        parent_id: None,
+                        parent_id,
                         status: Some("running".to_owned()),
                         summary: Some(format!("{tool_calls} Tool-Aufrufe, {tokens} Tokens")),
                     }));
@@ -3566,6 +3944,7 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             duration_ms,
             ..
         } => {
+            let parent_id = exported_agent_parent_id(app, &child);
             let updated = state.update_child(child.as_str(), |cell| {
                 cell.apply_completion(outcome.clone(), duration_ms);
             });
@@ -3574,7 +3953,7 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                     .push(ExportEntry::Agent(ExportAgentEntry {
                         agent_id: child.as_str().to_owned(),
                         role: None,
-                        parent_id: None,
+                        parent_id,
                         status: Some(outcome),
                         summary: Some(format!("Dauer: {duration_ms} ms")),
                     }));
@@ -4072,7 +4451,12 @@ fn build_export_meta(app: &ChatApp) -> ExportMeta {
 /// Das fertige Markdown-Dokument.
 fn build_export_markdown(app: &ChatApp, opts: &ExportOptions) -> String {
     let meta = build_export_meta(app);
-    export::render_markdown_with_extensions(&meta, &app.export_entries, opts, &app.export_meta_extensions)
+    export::render_markdown_with_extensions(
+        &meta,
+        &app.export_entries,
+        opts,
+        &app.export_meta_extensions,
+    )
 }
 
 /// Baut das Exportdokument aus dem parallel mitgeführten [`ExportEntry`]-Verlauf
@@ -4305,6 +4689,13 @@ pub(crate) async fn frame_scheduler(
 /// ihn — in beiden Fällen ist ein Redraw nötig).
 fn handle_overlay_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
     match app.overlay.as_mut() {
+        // Der Arm bindet nichts aus dem Overlay-Inhalt, daher endet der
+        // veränderliche Borrow von `app.overlay` schon vor diesem Aufruf und
+        // `app` darf hier erneut voll geliehen werden (NLL) — kein separater
+        // Vorab-Check mehr nötig, der Fall ist jetzt Teil dieses `match`.
+        Some(Overlay::AgentTree(_)) => {
+            handle_agent_tree_key(app, key);
+        }
         Some(Overlay::SessionPicker(picker)) => match picker.handle_key(key) {
             PickerAction::Stay => {}
             PickerAction::Cancel => app.overlay = None,
@@ -4347,7 +4738,9 @@ fn handle_overlay_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -
                 ChoiceAction::Cancel => app.overlay = None,
                 ChoiceAction::Chosen(index) => {
                     app.overlay = None;
-                    let level = EFFORT_LEVELS.get(index).map(std::string::ToString::to_string);
+                    let level = EFFORT_LEVELS
+                        .get(index)
+                        .map(std::string::ToString::to_string);
                     let level = level.unwrap_or_else(|| "clear".to_owned());
                     let command = match target {
                         EffortTarget::Session => format!("/effort {level}"),
@@ -4362,6 +4755,34 @@ fn handle_overlay_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -
     true
 }
 
+/// Handles the tree's local navigation and delegates a selected stop request
+/// to the shared controller. It is used for both idle and busy input, so the
+/// tree remains operable while a parent turn is running.
+fn handle_agent_tree_key(app: &mut ChatApp, key: KeyEvent) {
+    let rows = app.agent_tree_rows();
+    let action = match app.overlay.as_mut() {
+        Some(Overlay::AgentTree(tree)) => tree.handle_key(key, &rows),
+        _ => AgentTreeAction::Stay,
+    };
+    match action {
+        AgentTreeAction::Stay => {}
+        AgentTreeAction::Close => app.overlay = None,
+        AgentTreeAction::Stop(target) => {
+            let child = SessionId::from_str(target.clone());
+            let cancelled = app.managed_spawner().is_some_and(|spawner| {
+                spawner.owns_descendant(app.session_id(), &child)
+                    && spawner.request_cancellation(&child)
+            });
+            if !cancelled {
+                app.push_line(
+                    Role::System,
+                    format!("Abbruch für Agent {target} konnte nicht angefordert werden."),
+                );
+            }
+        }
+    }
+}
+
 /// Verarbeitet einen Tastendruck: mutiert den Eingabezustand und emittiert
 /// [`HarwEvent`]s. Gibt `true` zurück, wenn ein Redraw nötig ist.
 ///
@@ -4374,7 +4795,15 @@ fn handle_overlay_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -
 /// - **Backspace** — letztes Zeichen löschen.
 /// - **PageUp** — History nach oben scrollen (via [`ChatScroll::page_up`]).
 /// - **PageDown** — History nach unten scrollen (via [`ChatScroll::page_down`]).
+/// - **Strg+Pos1**/**Strg+Ende** — springt bei leerem Composer im Transkript
+///   an Anfang/Ende ([`ChatScroll`]), sonst im Composer an Puffer-Anfang/-Ende
+///   (siehe [`scroll_claims_key`] und `InputEditor::move_buffer_start`/
+///   `move_buffer_end`).
 /// - Bei offenem Popup: Pfeiltasten/Enter/Esc/Ziffern navigieren das Popup.
+/// - Alle übrigen Composer-Tasten (Pos1/Ende, Strg+Links/Rechts,
+///   Strg+Backspace/Strg+W, Strg+A/Strg+E …) siehe
+///   `InputEditor::handle_key_at`-Doku; ein bar Esc kann dort zusätzlich der
+///   Anfang einer zerstückelten CSI-Sequenz sein (dtach/zsh-Härtung).
 ///
 /// # Argumente
 /// - `app` (`&mut ChatApp`): Zustand, der mutiert wird — inklusive
@@ -4387,6 +4816,30 @@ fn handle_overlay_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -
 /// # Rückgabe
 /// `true` wenn ein Redraw angefordert werden soll, sonst `false`.
 fn handle_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
+    scroll_and_composer_key(app, key, bus)
+}
+
+/// Entscheidet, ob eine Taste zuerst dem Transkript-Scroll ([`ChatScroll`])
+/// angeboten werden soll, bevor sie den Composer erreicht (Register
+/// „CSI-Sicherheitsnetz und Paste-Platzhalter", Punkt 5).
+///
+/// # Beschreibung
+/// Strg+Pos1/Strg+Ende sind doppelt belegt: [`ChatScroll`] springt damit an
+/// Transkript-Anfang/-Ende, [`InputEditor`] an Composer-Anfang/-Ende
+/// ([`InputEditor::move_buffer_start`]/[`InputEditor::move_buffer_end`]).
+/// Bei nicht-leerer Eingabe gewinnt der Composer — ein Strg+Pos1 während des
+/// Tippens soll den Cursor bewegen, nicht wortlos das Transkript
+/// verschieben; bei leerem Composer bleibt das bisherige Verhalten
+/// (Transkript-Sprung) unverändert. Alle anderen von
+/// [`ChatScroll::handle_key`] behandelten Tasten (PageUp/PageDown,
+/// Shift+Up/Down) sind davon nicht betroffen.
+fn scroll_claims_key(app: &ChatApp, key: &KeyEvent) -> bool {
+    let is_ctrl_home_end = key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Home | KeyCode::End);
+    !(is_ctrl_home_end && !app.input.is_empty())
+}
+
+fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
     // ── Globale Steuer-Keys (unabhängig von Popup/Editor-Zustand) ────────
@@ -4488,13 +4941,17 @@ fn handle_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
     // ── ChatScroll konsultieren (PageUp/PageDown/Shift+Up/Shift+Down etc.) ──
     // Echte Werte aus dem letzten `draw_viewport`-Aufruf (vor dem ersten Draw:
     // 0 Zeilen / 20 sichtbar als sicherer Platzhalter) — ChatScroll clamped selbst.
-    match app.scroll.handle_key(
-        key,
-        app.last_history_total_lines() as usize,
-        app.last_history_visible_rows() as usize,
-    ) {
-        ScrollAction::Redraw => return true,
-        ScrollAction::Passthrough => {}
+    // Strg+Pos1/Strg+Ende gehen bei nicht-leerer Eingabe stattdessen an den
+    // Composer (siehe `scroll_claims_key`).
+    if scroll_claims_key(app, &key) {
+        match app.scroll.handle_key(
+            key,
+            app.last_history_total_lines() as usize,
+            app.last_history_visible_rows() as usize,
+        ) {
+            ScrollAction::Redraw => return true,
+            ScrollAction::Passthrough => {}
+        }
     }
 
     // Ctrl+J — neue Zeile einfügen (schließt ein offenes Popup).
@@ -4621,7 +5078,19 @@ fn handle_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
             return true;
         }
 
-        match app.input.handle_key(key) {
+        let action = app.input.handle_key(key);
+        // CSI-Sicherheitsnetz (siehe `input_editor.rs`): der Esc, der eben
+        // erst `escape_armed` scharfgestellt hat, war in Wahrheit der
+        // Anfang einer zerstückelten CSI-Sequenz (z. B. Pos1/Ende/Maus-
+        // Report nach einem host `shell.exec`, siehe dortige Doku) — kein
+        // bewusster Tastendruck. Die Scharfstellung wird deshalb rückgängig
+        // gemacht, damit ein später wirklich gedrücktes einzelnes Esc den
+        // Composer weiterhin nicht sofort leert, sondern erst beim zweiten
+        // bewussten Druck.
+        if app.input.take_swallowed_escape() {
+            app.escape_armed = false;
+        }
+        match action {
             InputAction::Submit(text) => {
                 // InputEditor hat den Puffer bereits geleert.
                 app.remember_input(&text);
@@ -4650,11 +5119,31 @@ fn handle_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
 /// # Beschreibung
 /// Startet den Spinner, treibt den Turn via [`drive_turn_animated`] (dabei
 /// animiert der Spinner frame-getaktet), stoppt den Spinner und enthüllt die
-/// Antwort dann zeilenweise via [`reveal_reply`]. Die vollständige Antwort wird
-/// in den Zustands-Log ([`ChatApp::push_line`]) übernommen.
+/// Antwort — sofern [`drive_turn_animated`] eine liefert — zeilenweise via
+/// [`reveal_reply`]. Liefert der Turn keine (siehe dortige Doku: Turn ohne
+/// neue, nicht-`Commentary` Assistant-Nachricht), bleibt `reveal_reply`
+/// bewusst aus, statt die Antwort des vorherigen Turns erneut zu zeigen. Die
+/// vollständige Antwort wird in den Zustands-Log ([`ChatApp::push_line`])
+/// übernommen.
 ///
 /// # Fehler
 /// [`TuiError`] bei Turn-Fehler oder Terminal-I/O.
+///
+/// Persistiert die nicht im Transcript enthaltene Session-Projektion an einer
+/// sicheren TUI-Turn-Grenze. Ein Fehler wird nicht in einen flüchtigen
+/// Weiterlauf umgewandelt: der Aufrufer erhält ihn als [`TuiError::Core`],
+/// damit ein anschließendes Resume keine unbestätigte Modus- oder
+/// Aktivierungsänderung sieht.
+async fn persist_gateway_state(
+    gateway: &mut dyn crate::gateway::ChatGateway,
+) -> Result<(), TuiError> {
+    let (session, store, _) = gateway.borrow_turn_ctx();
+    session
+        .persist_state(store)
+        .await
+        .map_err(|error| TuiError::Core(format!("could not persist session state: {error}")))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_turn_streaming(
     guard: &mut TerminalGuard,
@@ -4675,7 +5164,9 @@ async fn run_turn_streaming(
     // yet started. `AgentSession::set_mode` re-cuts tool activation and the
     // sandbox ceiling, so it must never happen inside a running turn.
     // See harw-tui Design §session_controller — apply_to_session, AP W5-05.
-    app.apply_pending_controller_state(gateway.session_mut());
+    if app.apply_pending_controller_state(gateway.session_mut()) {
+        persist_gateway_state(gateway).await?;
+    }
 
     // Keep a clone in the UI so Ctrl+C can cancel the core turn at its
     // cooperative checkpoints instead of merely queuing a character.
@@ -4683,8 +5174,10 @@ async fn run_turn_streaming(
     app.active_cancel = Some(cancel.clone());
     // Ein neuer Turn startet: ein evtl. noch angezeigter "Abbruch
     // angefordert …"-Hinweis aus einem vorherigen, jetzt abgeschlossenen Turn
-    // gehört nicht mehr zum aktuellen Zustand.
+    // gehört nicht mehr zum aktuellen Zustand. Derselbe Reset gilt für den
+    // "Warteschlange verworfen"-Hinweis (Fix E / Teil 1b).
     app.cancel_requested_at = None;
+    app.queue_cleared_at = None;
     // Welle 4c, Punkt 8: denselben `ManagedAgentSpawner`, den die Wurzelsitzung
     // beim Admittieren von Kindern befragt ([`ChatApp::managed_spawner`] ist
     // exakt `RuntimeAssembly::spawner()` — siehe deren Montage in
@@ -4696,8 +5189,7 @@ async fn run_turn_streaming(
     // dadurch mit ab. Ein Fehler (z. B. weil diese Session selbst ein
     // admittiertes Kind ist) ist nicht fatal für den Turn — nur geloggt.
     if let Some(spawner) = app.managed_spawner() {
-        if let Err(error) = spawner.register_parent_cancel_token(app.session_id(), cancel.clone())
-        {
+        if let Err(error) = spawner.register_parent_cancel_token(app.session_id(), cancel.clone()) {
             tracing::warn!(error = %error, "tui.turn.register_parent_cancel_token_failed");
         }
     }
@@ -4719,15 +5211,25 @@ async fn run_turn_streaming(
     spinner.stop();
     app.active_cancel = None;
     // Turn ist beendet (egal ob normal, per Fehler oder per Abbruch) — der
-    // transiente Abbruch-Hinweis hat damit ausgedient.
+    // transiente Abbruch-Hinweis hat damit ausgedient. Derselbe Reset gilt
+    // für den "Warteschlange verworfen"-Hinweis (Fix E / Teil 1b).
     app.cancel_requested_at = None;
+    app.queue_cleared_at = None;
 
     let reply = reply?;
 
     // Auto-Compact läuft jetzt in harw-core selbst (Turn-Loop nach
     // Runden/Turns), gesteuert über `AgentSession::auto_compact()`. Die TUI
     // muss dafür nichts mehr tun.
-    reveal_reply(guard, app, &reply).await?;
+    //
+    // `None` heißt: dieser Turn hat keine neue, nicht-`Commentary`
+    // Assistant-Nachricht angehängt (siehe `latest_final_reply`-Doku bei
+    // `drive_turn_animated`) — `reveal_reply` bleibt dann bewusst aus, sonst
+    // erschiene entweder eine bereits live gezeigte Commentary erneut oder
+    // die Antwort des vorherigen Turns.
+    if let Some(reply) = reply {
+        reveal_reply(guard, app, &reply).await?;
+    }
     Ok(())
 }
 
@@ -4757,8 +5259,33 @@ fn rate_limit_retry_input() -> TurnInput {
 /// # Beschreibung
 /// Rennt das `run_turn`-Future gegen einen [`SPINNER_INTERVAL`]-Timer: bei jedem
 /// Timer-Tick wird der Spinner weitergeschaltet und die Inline-Viewport neu
-/// gezeichnet, bis der Turn abgeschlossen ist. Extrahiert danach die letzte
-/// Assistant-Antwort aus der Session-Historie.
+/// gezeichnet, bis der Turn abgeschlossen ist. Extrahiert danach über
+/// [`latest_final_reply`] die Turn-Antwort — auf die Items beschränkt, die
+/// **während dieses Turns** neu an die Historie angehängt wurden.
+///
+/// # Bugfix: doppelte/verwaiste Antwortanzeige
+/// Früher lieferte diese Funktion `gateway.session_mut().history()
+/// .to_model_messages().into_iter().rev().find_map(...)` — turn-blind und
+/// phasenblind über die **gesamte** Session-Historie. Zwei Symptome:
+/// 1. War die letzte Assistant-Nachricht des Turns eine bereits über
+///    [`handle_turn_event`] live gepushte `Commentary`-Nachricht (gefolgt nur
+///    von Tool-Aufrufen), erschien ihr Text ein zweites Mal.
+/// 2. Fügte der Turn **gar keine** neue Assistant-Nachricht hinzu (z. B. ein
+///    zusammengefasster Warteschlangen-Turn, dispatcht über
+///    `run_turn_streaming`), lieferte `find_map` die Antwort des
+///    **vorherigen** Turns — sie erschien erneut, als hätte der neue Turn
+///    sie beantwortet.
+///
+/// Die Behebung: [`latest_final_reply`] betrachtet ausschließlich Items ab
+/// dem Historie-Stand vor diesem Turn (`history_len_before`, unten
+/// festgehalten) und ausschließlich [`TurnItem::AssistantMessage`]s, deren
+/// `phase` **nicht** `Commentary` ist — dafür braucht es `ConversationHistory
+/// ::items()` statt `to_model_messages()`, weil Letzteres das `phase`-Feld
+/// verwirft. Findet sich in diesem Bereich keine solche Nachricht, liefert
+/// diese Funktion `Ok(None)`; der Aufrufer ([`run_turn_streaming`]) ruft dann
+/// [`reveal_reply`] bewusst **nicht** auf. Als zweite Verteidigungslinie
+/// gleicht [`suppress_if_matches_commentary`] das Ergebnis zusätzlich gegen
+/// `turn_state.last_commentary_text` ab (siehe dortige Doku).
 ///
 /// Wenn der Provider HTTP 429 zurückgibt ([`ModelError::RateLimited`]), läuft
 /// eine budgetierte Retry-Schleife: bis zu [`RATE_LIMIT_MAX_ATTEMPTS`]
@@ -4767,9 +5294,10 @@ fn rate_limit_retry_input() -> TurnInput {
 /// von bis zu 25 %, damit parallele Clients nicht im Gleichtakt erneut
 /// an denselben Anbieter-Limiter schlagen. Die Chat-Session wird dabei
 /// **nicht** beendet:
-/// - Irgendein Versuch erfolgreich → Antwort wie gewohnt.
-/// - Budget erschöpft, weiterhin 429 → `Ok("⏱ Rate limit — …")`; der User
-///   kann erneut senden.
+/// - Irgendein Versuch erfolgreich → Antwort wie gewohnt (`Ok(Some(..))`,
+///   ggf. `Ok(None)` — siehe oben).
+/// - Budget erschöpft, weiterhin 429 → `Ok(Some("⏱ Rate limit — …"))`; der
+///   User kann erneut senden.
 /// - Anderer Fehler → `Err(TuiError::Core(...))` (normaler Fehlerfall).
 ///
 /// # Freigaben und Kind-Wiederaufnahme (AP W5-03)
@@ -4805,10 +5333,15 @@ fn rate_limit_retry_input() -> TurnInput {
 /// beim Freigabe-Panel) an [`ChoiceDialog::handle_key`] statt an den
 /// normalen Composer-Pfad.
 ///
+/// # Rückgabe
+/// `Ok(Some(text))`, wenn eine Antwort enthüllt werden soll; `Ok(None)`, wenn
+/// dieser Turn keine neue, nicht-`Commentary` Assistant-Nachricht angehängt
+/// hat (siehe Bugfix-Abschnitt oben) — der Aufrufer lässt `reveal_reply` dann
+/// aus.
+///
 /// # Fehler
-/// [`TuiError::Core`], wenn der Turn fehlschlägt (nicht durch Rate-Limit), der
-/// Freigabetreiber scheitert oder keine Antwort vorliegt; [`TuiError::Io`] beim
-/// Zeichnen.
+/// [`TuiError::Core`], wenn der Turn fehlschlägt (nicht durch Rate-Limit) oder
+/// der Freigabetreiber scheitert; [`TuiError::Io`] beim Zeichnen.
 #[allow(clippy::too_many_arguments)]
 async fn drive_turn_animated(
     guard: &mut TerminalGuard,
@@ -4822,9 +5355,16 @@ async fn drive_turn_animated(
     tui_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TuiEvent>,
     turn_event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TurnEvent>,
     turn_state: &mut TurnEventState,
-) -> Result<String, TuiError> {
+) -> Result<Option<String>, TuiError> {
     // Einmal zeichnen, damit der Spinner sofort erscheint.
     draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+
+    // Historie-Stand VOR diesem Turn und Reset des Commentary-Wächters
+    // (siehe Bugfix-Abschnitt der Funktionsdoku oben): beides beschreibt
+    // ausschließlich DIESEN Turn, nicht die gesamte Session-Historie, die
+    // `turn_state` sonst über Turns hinweg unverändert lässt.
+    let history_len_before = gateway.session_mut().history().len();
+    turn_state.last_commentary_text = None;
 
     // Rate-Limit-Retry-Schleife: Erstversuch plus bis zu
     // RATE_LIMIT_MAX_ATTEMPTS-1 Wiederholungen. Jeder Versuch läuft durch
@@ -4938,6 +5478,14 @@ async fn drive_turn_animated(
                                     ChoiceAction::Chosen(index) => {
                                         if let Some(prompt) = app.pending_host_permit.take() {
                                             apply_host_permit_decision(app, prompt, index);
+                                            // Register „CSI-Sicherheitsnetz
+                                            // und Paste-Platzhalter",
+                                            // Punkt 7: eine Host-Permit-
+                                            // Entscheidung kann eine Host-
+                                            // Arbeitsphase beginnen oder
+                                            // beenden, die Terminal-Modi
+                                            // beschädigt zurücklässt.
+                                            guard.reassert_terminal_modes();
                                         }
                                         app.pending_host_permit_dialog = None;
                                         host_permit_shown_at = None;
@@ -4961,6 +5509,14 @@ async fn drive_turn_animated(
                         if let Some(event) = maybe_turn_event {
                             if handle_turn_event(app, turn_state, event) {
                                 draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+                            }
+                            // Register „CSI-Sicherheitsnetz und Paste-
+                            // Platzhalter", Punkt 7: ein abgeschlossener
+                            // `shell.exec`-Aufruf kann Terminal-Modi
+                            // beschädigt zurückgelassen haben (siehe
+                            // `handle_turn_event`).
+                            if app.take_needs_terminal_reassert() {
+                                guard.reassert_terminal_modes();
                             }
                         }
                     }
@@ -4999,10 +5555,10 @@ async fn drive_turn_animated(
             Err(CoreError::Model(ModelError::RateLimited {
                 retry_after_secs, ..
             })) => {
-                return Ok(format!(
+                return Ok(Some(format!(
                     "⏱ Rate limit — provider busy; retry in {}s ({} attempts used)",
                     retry_after_secs, attempt
-                ));
+                )));
             }
             // Kein Rate-Limit: normaler Fehler oder Erfolg.
             other => break other.map_err(|error| TuiError::Core(error.to_string()))?,
@@ -5031,19 +5587,78 @@ async fn drive_turn_animated(
     }
 
     // Nachdem der Turn-Future gedroppt ist, ist der `&mut` auf die Session
-    // frei — wir dürfen sie erneut ausleihen, um die letzte Assistant-Antwort
-    // zu extrahieren.
-    gateway
-        .session_mut()
-        .history()
-        .to_model_messages()
-        .into_iter()
+    // frei — wir dürfen sie erneut ausleihen, um die Turn-Antwort zu
+    // extrahieren. Siehe Bugfix-Abschnitt der Funktionsdoku oben: nur Items
+    // ab `history_len_before` gehören zu DIESEM Turn.
+    let reply = latest_final_reply(gateway.session_mut().history(), history_len_before);
+    Ok(suppress_if_matches_commentary(
+        reply,
+        turn_state.last_commentary_text.as_deref(),
+    ))
+}
+
+/// Wählt die zu enthüllende Turn-Antwort aus den Items, die seit `since_len`
+/// neu an `history` angehängt wurden.
+///
+/// # Beschreibung
+/// Reine, terminal- und gateway-freie Funktion — extrahiert aus
+/// [`drive_turn_animated`] (siehe dortiger Bugfix-Abschnitt), damit sich die
+/// Turn-Eingrenzung ohne die volle async-Turn-Maschinerie testen lässt.
+/// Iteriert die Items ab Index `since_len` rückwärts und liefert den
+/// sichtbaren Text der ersten [`TurnItem::AssistantMessage`], deren `phase`
+/// **nicht** [`harw_types::MessagePhase::Commentary`] ist — eine
+/// `Commentary`-Nachricht wurde bereits live über [`handle_turn_event`]
+/// gezeigt und darf hier nicht erneut auftauchen. Reasoning-, Tool- und
+/// Error-Items werden dabei einfach übersprungen (kein Treffer), nicht als
+/// Abbruchkriterium behandelt.
+///
+/// # Argumente
+/// - `history` (`&ConversationHistory`): die vollständige Session-Historie.
+/// - `since_len` (`usize`): Anzahl Items, die vor dem aktuellen Turn bereits
+///   vorhanden waren (Historie-Länge unmittelbar vor `run_turn`).
+///
+/// # Rückgabe
+/// `Some(text)` der jüngsten passenden Nachricht innerhalb dieses Turns;
+/// `None`, wenn der Turn keine solche Nachricht angehängt hat (z. B. eine
+/// `Commentary`-Nachricht gefolgt nur von Tool-Aufrufen, oder gar keine neue
+/// Assistant-Nachricht).
+fn latest_final_reply(history: &ConversationHistory, since_len: usize) -> Option<String> {
+    history
+        .items()
+        .iter()
+        .skip(since_len)
         .rev()
-        .find_map(|message| match message {
-            ModelMessage::Assistant { text } => Some(text),
+        .find_map(|item| match item {
+            TurnItem::AssistantMessage(message)
+                if message.phase != Some(harw_types::MessagePhase::Commentary) =>
+            {
+                Some(visible_message_text(&message.content))
+            }
             _ => None,
         })
-        .ok_or_else(|| TuiError::Core("Modell lieferte keine Assistant-Antwort".to_owned()))
+}
+
+/// Zweite Verteidigungslinie gegen eine doppelte Antwortanzeige (siehe
+/// [`drive_turn_animated`]s Bugfix-Abschnitt): unterdrückt `reply`, falls er
+/// exakt dem zuletzt live gepushten `Commentary`-Text dieses Turns
+/// ([`TurnEventState::last_commentary_text`]) entspricht.
+///
+/// # Argumente
+/// - `reply` (`Option<String>`): das Ergebnis von [`latest_final_reply`].
+/// - `last_commentary` (`Option<&str>`): `turn_state.last_commentary_text`
+///   dieses Turns.
+///
+/// # Rückgabe
+/// `None`, wenn `reply` mit `last_commentary` exakt übereinstimmt; sonst
+/// unverändert `reply`.
+fn suppress_if_matches_commentary(
+    reply: Option<String>,
+    last_commentary: Option<&str>,
+) -> Option<String> {
+    match (reply, last_commentary) {
+        (Some(reply), Some(commentary)) if reply == commentary => None,
+        (reply, _) => reply,
+    }
 }
 
 /// Totzeit, bevor eine frisch angezeigte Freigabefrage `y`/`n` annimmt.
@@ -5506,6 +6121,76 @@ struct PendingApprovalPrompt {
     tool_cell: SharedToolCell,
 }
 
+/// Bricht den laufenden Turn ab und lehnt/verweigert eine offene Freigabe-
+/// oder Host-Permit-Frage — die Ctrl+C-Kernlogik innerhalb von
+/// [`drive_pauses_to_completion`], solange ein solcher Dialog sichtbar ist
+/// (Fix E / Teil 1b).
+///
+/// # Beschreibung
+/// Vor diesem Fix lehnte Ctrl+C bei offenem Dialog **nur** den Dialog ab —
+/// `active_cancel`/`pending_quit` blieben unberührt, der Turn und alle
+/// laufenden Kind-Agenten liefen unangetastet weiter. Diese Funktion
+/// ergänzt **zusätzlich** zum bestehenden Ablehnen/Verweigern denselben
+/// kooperativen Abbruch (`active_cancel.cancel(CancelReason::User)`) und
+/// dieselbe zweistufige Beenden-Scharfstellung ([`ChatApp::pending_quit`])
+/// wie [`handle_busy_event`] ohne offenen Dialog, inklusive Leeren bereits
+/// eingereihter Eingaben (`deferred_input`/`pending_turns`). Aus dem
+/// `tokio::select!`-Zweig von [`drive_pauses_to_completion`] extrahiert,
+/// damit die Kernlogik ohne den vollen Ereignis-Loop testbar ist.
+///
+/// # Argumente
+/// - `app` (`&mut ChatApp`): trägt `active_cancel`, `pending_quit`, beide
+///   Eingabe-Warteschlangen sowie die Dialogzustände.
+/// - `pending` (`&mut Option<PendingApprovalPrompt>`): die noch offene
+///   Freigabefrage der Schleife, falls vorhanden; wird konsumiert.
+/// - `dialog_shown_at` (`&mut Option<Instant>`): Arming-Uhr des
+///   Freigabe-Panels; wird wie beim bestehenden Ablehnen zurückgesetzt.
+/// - `host_permit_shown_at` (`&mut Option<Instant>`): dieselbe Uhr für den
+///   Host-Permit-Dialog.
+///
+/// # Nebenläufigkeit
+/// Single-task, hält keinen Lock über den `await`-Punkt in
+/// [`apply_approval_decision`] hinaus.
+async fn cancel_turn_and_reject_open_dialogs(
+    app: &mut ChatApp,
+    pending: &mut Option<PendingApprovalPrompt>,
+    dialog_shown_at: &mut Option<Instant>,
+    host_permit_shown_at: &mut Option<Instant>,
+) {
+    if let Some(cancel) = &app.active_cancel {
+        cancel.cancel(CancelReason::User);
+    }
+    app.pending_quit = Some(QuitArm {
+        label: "Ctrl+C",
+        at: Instant::now(),
+    });
+    let had_queued_input = !app.deferred_input.is_empty() || !app.pending_turns.is_empty();
+    app.deferred_input.clear();
+    app.pending_turns.clear();
+    if had_queued_input {
+        app.queue_cleared_at = Some(Instant::now());
+    }
+    // Bestehendes Ablehnen/Verweigern des offenen Dialogs bleibt
+    // zusätzlich bestehen, wird nicht ersetzt.
+    if let Some(open) = pending.take() {
+        apply_approval_decision(
+            app,
+            open,
+            ApprovalChoice::Reject {
+                reason: Some(REASON_OPERATOR_CANCELLED.to_owned()),
+            },
+        )
+        .await;
+    }
+    app.pending_approval_dialog = None;
+    *dialog_shown_at = None;
+    if let Some(prompt) = app.pending_host_permit.take() {
+        prompt.deny();
+    }
+    app.pending_host_permit_dialog = None;
+    *host_permit_shown_at = None;
+}
+
 /// Arbeitet jede Pause eines Turns ab, während der Renderer weiterläuft.
 ///
 /// # Beschreibung
@@ -5697,7 +6382,11 @@ async fn drive_pauses_to_completion(
                         }
                     }
                     Some(TuiEvent::Key(key)) => {
-                        if app.scroll.handle_key(key, app.last_history_total_lines() as usize,
+                        // Strg+Pos1/Strg+Ende gehen bei nicht-leerer Eingabe
+                        // an den Composer statt an den Transkript-Scroll
+                        // (siehe `scroll_claims_key`).
+                        if scroll_claims_key(app, &key)
+                            && app.scroll.handle_key(key, app.last_history_total_lines() as usize,
                             app.last_history_visible_rows() as usize) == ScrollAction::Redraw {
                             draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                             continue;
@@ -5709,21 +6398,17 @@ async fn drive_pauses_to_completion(
                         if key.modifiers.contains(KeyModifiers::CONTROL)
                             && matches!(key.code, KeyCode::Char('c' | 'C'))
                         {
-                            if let Some(open) = pending.take() {
-                                apply_approval_decision(
-                                    app,
-                                    open,
-                                    ApprovalChoice::Reject { reason: Some(REASON_OPERATOR_CANCELLED.to_owned()) },
-                                )
-                                .await;
-                            }
-                            app.pending_approval_dialog = None;
-                            dialog_shown_at = None;
-                            if let Some(prompt) = app.pending_host_permit.take() {
-                                prompt.deny();
-                            }
-                            app.pending_host_permit_dialog = None;
-                            host_permit_shown_at = None;
+                            // Fix E (Teil 1b): siehe
+                            // `cancel_turn_and_reject_open_dialogs` — bricht
+                            // zusätzlich zum bestehenden Ablehnen/Verweigern
+                            // des offenen Dialogs auch den Turn kooperativ ab.
+                            cancel_turn_and_reject_open_dialogs(
+                                app,
+                                &mut pending,
+                                &mut dialog_shown_at,
+                                &mut host_permit_shown_at,
+                            )
+                            .await;
                             draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                             continue;
                         }
@@ -5785,6 +6470,10 @@ async fn drive_pauses_to_completion(
                                 ChoiceAction::Chosen(index) => {
                                     if let Some(prompt) = app.pending_host_permit.take() {
                                         apply_host_permit_decision(app, prompt, index);
+                                        // Register „CSI-Sicherheitsnetz und
+                                        // Paste-Platzhalter", Punkt 7: siehe
+                                        // Gegenstück in `drive_turn_animated`.
+                                        guard.reassert_terminal_modes();
                                     }
                                     app.pending_host_permit_dialog = None;
                                     host_permit_shown_at = None;
@@ -5838,6 +6527,13 @@ async fn drive_pauses_to_completion(
                 if let Some(event) = maybe_turn_event {
                     if handle_turn_event(app, turn_state, event) {
                         draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+                    }
+                    // Register „CSI-Sicherheitsnetz und Paste-Platzhalter",
+                    // Punkt 7: ein abgeschlossener `shell.exec`-Aufruf kann
+                    // Terminal-Modi beschädigt zurückgelassen haben (siehe
+                    // `handle_turn_event`).
+                    if app.take_needs_terminal_reassert() {
+                        guard.reassert_terminal_modes();
                     }
                 }
             }
@@ -5899,6 +6595,10 @@ async fn run_immediate_busy_command(
     spinner: &Spinner,
     raw: &str,
 ) -> Result<(), TuiError> {
+    if raw.trim() == "/agent" {
+        app.open_agent_tree();
+        return draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label));
+    }
     let output = dispatch_slash_command(
         app.runtime(),
         app.adapters(),
@@ -5931,7 +6631,11 @@ fn queue_busy_key(app: &mut ChatApp, key: KeyEvent) -> BusyKeyOutcome {
             match classify_line(&text) {
                 LineAction::Chat(text) => app.pending_turns.push_back(text),
                 LineAction::Command(raw) => {
-                    if busy_availability_for(&app.command_registry, &raw) == BusyAvailability::Immediate
+                    if raw.trim() == "/agent" {
+                        return BusyKeyOutcome::RunImmediate(raw);
+                    }
+                    if busy_availability_for(&app.command_registry, &raw)
+                        == BusyAvailability::Immediate
                     {
                         return BusyKeyOutcome::RunImmediate(raw);
                     }
@@ -5973,6 +6677,15 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
             app.pending_quit = None;
         }
     }
+    // `/agent` kann während eines Turns als Immediate-Befehl geöffnet werden.
+    // Danach gehören seine Navigation und sein scoped `s`-Abbruch exklusiv
+    // dem Overlay, auch während der Spinner weiterläuft.
+    if let TuiEvent::Key(key) = &event {
+        if matches!(app.overlay.as_ref(), Some(Overlay::AgentTree(_))) {
+            handle_agent_tree_key(app, *key);
+            return BusyKeyOutcome::Redraw;
+        }
+    }
     let total = app.last_history_total_lines() as usize;
     let rows = app.last_history_visible_rows() as usize;
     match event {
@@ -5982,7 +6695,13 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
         {
             // Zweiter Druck innerhalb des Fensters: harter Abbruch statt
             // eines weiteren kooperativen Cancels.
-            if matches!(app.pending_quit, Some(QuitArm { label: "Ctrl+C", .. })) {
+            if matches!(
+                app.pending_quit,
+                Some(QuitArm {
+                    label: "Ctrl+C",
+                    ..
+                })
+            ) {
                 app.hard_quit_requested = true;
                 return BusyKeyOutcome::Redraw;
             }
@@ -5993,6 +6712,19 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
                 // dieser Hinweis mit dem Turn-Ende oder einem neuen Turn
                 // automatisch wieder verschwinden muss.
                 app.cancel_requested_at = Some(Instant::now());
+                // Fix E (Teil 1b): ein einziger Ctrl+C-Druck wirft bereits
+                // eingereihte Eingaben weg — sonst würden während des Turns
+                // eingereihte Nachrichten/Befehle nach dem Abbruch automatisch
+                // als nächster Turn ausgeliefert (siehe `run_loop`, wo
+                // `pending_turns`/`deferred_input` an Turn-Grenzen gedraint
+                // werden).
+                let had_queued_input =
+                    !app.deferred_input.is_empty() || !app.pending_turns.is_empty();
+                app.deferred_input.clear();
+                app.pending_turns.clear();
+                if had_queued_input {
+                    app.queue_cleared_at = Some(Instant::now());
+                }
                 app.pending_quit = Some(QuitArm {
                     label: "Ctrl+C",
                     at: Instant::now(),
@@ -6008,7 +6740,12 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
                 BusyKeyOutcome::Idle
             }
         }
-        TuiEvent::Key(key) if app.scroll.handle_key(key, total, rows) == ScrollAction::Redraw => {
+        // Strg+Pos1/Strg+Ende gehen bei nicht-leerer Eingabe an den
+        // Composer statt an den Transkript-Scroll (siehe `scroll_claims_key`).
+        TuiEvent::Key(key)
+            if scroll_claims_key(app, &key)
+                && app.scroll.handle_key(key, total, rows) == ScrollAction::Redraw =>
+        {
             BusyKeyOutcome::Redraw
         }
         // Shift+Tab gilt sofort und wird nicht in `deferred_input` eingereiht,
@@ -6019,8 +6756,11 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
         }
         TuiEvent::Draw | TuiEvent::Resize(_, _) => BusyKeyOutcome::Redraw,
         TuiEvent::Paste(text) => {
+            // Große Pastes landen nur als kompakter Platzhalter im Composer
+            // (siehe `InputEditor::insert_paste`-Doku) — derselbe Pfad wie
+            // im Idle-Fall oben in `run_loop`.
             app.input
-                .insert_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+                .insert_paste(&text.replace("\r\n", "\n").replace('\r', "\n"));
             app.sync_popup();
             BusyKeyOutcome::Redraw
         }
@@ -6096,6 +6836,11 @@ fn render_viewport(
     // `Clear` erst, sonst bliebe Chat-Text unter dem Overlay stehen
     // (dasselbe Muster wie beim `/command`-Popup weiter unten).
     match &app.overlay {
+        Some(Overlay::AgentTree(tree)) => {
+            frame.render_widget(Clear, area);
+            tree.render(area, frame.buffer_mut(), theme, &app.agent_tree_rows());
+            return;
+        }
         Some(Overlay::SessionPicker(picker)) => {
             frame.render_widget(Clear, area);
             picker.render(area, frame.buffer_mut(), &theme);
@@ -6123,7 +6868,10 @@ fn render_viewport(
     // Höhe und Cursor-Position müssen mit
     // derselben Breite rechnen, sonst laufen sie auseinander.
     let input_width = (area.width.saturating_sub(5)) as usize;
-    let input_height = match (&app.pending_approval_dialog, &app.pending_host_permit_dialog) {
+    let input_height = match (
+        &app.pending_approval_dialog,
+        &app.pending_host_permit_dialog,
+    ) {
         (Some(dialog), _) => dialog.desired_height(area.width),
         // Eine Host-Permit-Frage kann nur auftreten, wenn keine normale
         // Werkzeugfreigabe offen ist (siehe `drive_pauses_to_completion`:
@@ -6181,6 +6929,16 @@ fn render_viewport(
     } else {
         ""
     };
+    // Transienter Hinweis, dass Ctrl+C eine nicht-leere Eingabe-Warteschlange
+    // (`deferred_input`/`pending_turns`) tatsächlich verworfen hat (Fix E /
+    // Teil 1b) — analog zu `cancel_suffix` oben, keine dauerhafte
+    // Verlaufszeile, verschwindet an denselben Stellen wieder
+    // (`queue_cleared_at`-Reset an [`ChatApp`]).
+    let queue_cleared_suffix = if app.queue_cleared_at.is_some() {
+        " · Warteschlange verworfen"
+    } else {
+        ""
+    };
     // `quit_hint` (z. B. "Ctrl+C"/"Ctrl+D") signalisiert die Scharfstellung
     // des zweistufigen Beenden-Hinweises (`QuitArm`) und wurde bisher
     // stillschweigend verworfen.
@@ -6222,7 +6980,7 @@ fn render_viewport(
         .map(|_| " · Freigabemodus wird nach dem Turn übernommen")
         .unwrap_or("");
     let status = format!(
-        " {spinner_prefix}Shift+Tab: {permission} | Modus: {} | Tokens: {} (in {}, out {}{cache_suffix}){cancel_suffix}{quit_suffix}{queue_suffix}{tool_suffix}{pending_permission_suffix}",
+        " {spinner_prefix}Shift+Tab: {permission} | Modus: {} | Tokens: {} (in {}, out {}{cache_suffix}){cancel_suffix}{queue_cleared_suffix}{quit_suffix}{queue_suffix}{tool_suffix}{pending_permission_suffix}",
         app.active_mode().as_str(),
         app.total_usage.total(),
         app.total_usage.input_tokens,
@@ -6478,6 +7236,7 @@ impl From<ContextProviderRegistrationError> for TuiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -6523,7 +7282,7 @@ mod tests {
 
     /// Baut eine gültige Test-`SandboxSpec` gegen ein eindeutiges Temp-Verzeichnis
     /// (Muster übernommen aus `harw-operations/src/adapter/command.rs`).
-    fn test_sandbox() -> SandboxSpec {
+    fn test_sandbox() -> TestResult<SandboxSpec> {
         use harw_authority::{Permission, PermissionSet, WorkspaceRegistration, WorkspaceRegistry};
         use harw_types::{TenantId, WorkspaceId};
 
@@ -6531,7 +7290,7 @@ mod tests {
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root =
             std::env::temp_dir().join(format!("harw-tui-app-test-{}-{}", std::process::id(), id));
-        std::fs::create_dir_all(root.join("workspace")).expect("temp workspace dir");
+        std::fs::create_dir_all(root.join("workspace")).map_err(ctx("temp workspace dir"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -6540,17 +7299,17 @@ mod tests {
                 root: PathBuf::from("workspace"),
             }],
         )
-        .expect("workspace registry build");
+        .map_err(ctx("workspace registry build"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("tui-test"),
                 &WorkspaceId::from_str("workspace"),
             )
-            .expect("resolve workspace binding");
-        SandboxSpec::from_resolved(
+            .map_err(ctx("resolve workspace binding"))?;
+        Ok(SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ReadWorkspace, Permission::WriteWorkspace]),
-        )
+        ))
     }
 
     /// Baut einen `ChatApp`-Testzustand mit leerer Adapter-Pipeline und einer
@@ -6564,10 +7323,10 @@ mod tests {
     /// Popup-/Tab-Tests wird die Registry deshalb im Anschluss durch
     /// [`CommandRegistry::built_in()`] ersetzt, damit `/`-Präfixe echte
     /// Treffer liefern statt eines leeren, sofort wieder geschlossenen Popups.
-    pub(super) fn test_chat_app() -> ChatApp {
-        let mut app = ChatApp::new(Vec::new(), test_sandbox(), SessionId::new());
-        app.command_registry = CommandRegistry::built_in();
-        app
+    pub(super) fn test_chat_app() -> TestResult<ChatApp> {
+        let mut app = ChatApp::new(Vec::new(), test_sandbox()?, SessionId::new());
+        app.command_registry = CommandRegistry::built_in().map_err(ctx("built_in"))?;
+        Ok(app)
     }
 
     /// Baut einen Session-Store-Sidecar mit festem `created_at`/`last_opened_at`
@@ -6576,8 +7335,8 @@ mod tests {
         root: &std::path::Path,
         session_id: &SessionId,
         created_at: jiff::Timestamp,
-    ) {
-        std::fs::create_dir_all(root).expect("temp session store root");
+    ) -> TestResult {
+        std::fs::create_dir_all(root).map_err(ctx("temp session store root"))?;
         let meta = harw_session_store::meta::SessionMeta {
             version: harw_session_store::meta::SESSION_META_VERSION,
             session_id: session_id.clone(),
@@ -6594,7 +7353,8 @@ mod tests {
             total_usage: harw_types::TokenUsage::default(),
             drift_events: std::collections::BTreeMap::new(),
         };
-        harw_session_store::meta::save(root, &meta).expect("save session meta sidecar");
+        harw_session_store::meta::save(root, &meta).map_err(ctx("save session meta sidecar"))?;
+        Ok(())
     }
 
     /// Aufgabe 2 (Plan `recursive-cooking-lobster.md` Teil F): eine über
@@ -6603,12 +7363,13 @@ mod tests {
     /// `title_job_context.session_store_root` (nur bei aktiver
     /// Titelerzeugung gesetzt) zur Verfügung stand.
     #[test]
-    fn apply_session_store_started_at_uses_own_field_without_title_job_context() {
-        let mut app = test_chat_app();
+    fn apply_session_store_started_at_uses_own_field_without_title_job_context() -> TestResult {
+        let mut app = test_chat_app()?;
         let root =
             std::env::temp_dir().join(format!("harw-tui-app-test-started-at-{}", app.session_id()));
-        let created_at = jiff::Timestamp::from_second(1_700_000_000).expect("valid timestamp");
-        save_session_meta_with_created_at(&root, app.session_id(), created_at);
+        let created_at =
+            jiff::Timestamp::from_second(1_700_000_000).map_err(ctx("valid timestamp"))?;
+        save_session_meta_with_created_at(&root, app.session_id(), created_at)?;
 
         app = app.with_session_store_root(root.clone());
         apply_session_store_started_at(&mut app);
@@ -6619,18 +7380,22 @@ mod tests {
             app.export_started_at,
             Some(created_at.as_second().to_string())
         );
+        Ok(())
     }
 
     /// Ohne eigenes `session_store_root` fällt [`apply_session_store_started_at`]
     /// weiterhin auf `title_job_context.session_store_root` zurück (Rückwärts-
     /// kompatibilität mit dem Verhalten vor Aufgabe 2).
     #[test]
-    fn apply_session_store_started_at_falls_back_to_title_job_context() {
-        let mut app = test_chat_app();
-        let root = std::env::temp_dir()
-            .join(format!("harw-tui-app-test-started-at-fallback-{}", app.session_id()));
-        let created_at = jiff::Timestamp::from_second(1_650_000_000).expect("valid timestamp");
-        save_session_meta_with_created_at(&root, app.session_id(), created_at);
+    fn apply_session_store_started_at_falls_back_to_title_job_context() -> TestResult {
+        let mut app = test_chat_app()?;
+        let root = std::env::temp_dir().join(format!(
+            "harw-tui-app-test-started-at-fallback-{}",
+            app.session_id()
+        ));
+        let created_at =
+            jiff::Timestamp::from_second(1_650_000_000).map_err(ctx("valid timestamp"))?;
+        save_session_meta_with_created_at(&root, app.session_id(), created_at)?;
 
         app = app.with_title_job_context(TitleJobContext {
             provider: Arc::new(ScriptedModel::new(Vec::new())),
@@ -6646,19 +7411,21 @@ mod tests {
             app.export_started_at,
             Some(created_at.as_second().to_string())
         );
+        Ok(())
     }
 
     /// Ist weder das eigene Feld noch der Titel-Job-Kontext bekannt (kein
     /// `/resume` in diesem Lauf konfiguriert), bleibt `export_started_at`
     /// unverändert beim TUI-Startzeitpunkt aus `ChatApp::new`.
     #[test]
-    fn apply_session_store_started_at_leaves_tui_start_when_nothing_known() {
-        let mut app = test_chat_app();
+    fn apply_session_store_started_at_leaves_tui_start_when_nothing_known() -> TestResult {
+        let mut app = test_chat_app()?;
         let original = app.export_started_at.clone();
 
         apply_session_store_started_at(&mut app);
 
         assert_eq!(app.export_started_at, original);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -6667,50 +7434,58 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn is_shell_mode_input_true_for_bang_prefix() {
+    fn is_shell_mode_input_true_for_bang_prefix() -> TestResult {
         assert!(is_shell_mode_input("!ls -la"));
+        Ok(())
     }
 
     #[test]
-    fn is_shell_mode_input_true_for_double_bang() {
+    fn is_shell_mode_input_true_for_double_bang() -> TestResult {
         assert!(is_shell_mode_input("!!"));
+        Ok(())
     }
 
     #[test]
-    fn is_shell_mode_input_false_for_plain_text() {
+    fn is_shell_mode_input_false_for_plain_text() -> TestResult {
         assert!(!is_shell_mode_input("ls -la"));
         assert!(!is_shell_mode_input(""));
         assert!(!is_shell_mode_input("/status"));
+        Ok(())
     }
 
     #[test]
-    fn truncate_chars_with_marker_leaves_short_text_unchanged() {
+    fn truncate_chars_with_marker_leaves_short_text_unchanged() -> TestResult {
         assert_eq!(truncate_chars_with_marker("hallo", 8000), "hallo");
         assert_eq!(truncate_chars_with_marker("", 8000), "");
+        Ok(())
     }
 
     /// Kappung ist zeichengrenzen-sicher: ein 8001 Zeichen langer,
     /// mehrbytiger Text (Umlaute) darf nicht mitten in einem UTF-8-Codepunkt
     /// getrennt werden — `.chars().take(n)` garantiert das strukturell.
     #[test]
-    fn truncate_chars_with_marker_caps_long_multibyte_text_with_marker() {
+    fn truncate_chars_with_marker_caps_long_multibyte_text_with_marker() -> TestResult {
         let text: String = "ä".repeat(8001);
         let truncated = truncate_chars_with_marker(&text, 8000);
         assert!(truncated.ends_with("\n[gekürzt]"));
-        let body = truncated.strip_suffix("\n[gekürzt]").expect("marker suffix");
+        let body = truncated
+            .strip_suffix("\n[gekürzt]")
+            .ok_or(TestError::Missing("marker suffix"))?;
         assert_eq!(body.chars().count(), 8000);
         assert!(body.chars().all(|c| c == 'ä'));
+        Ok(())
     }
 
     #[test]
-    fn build_shell_turn_message_includes_command_and_exit_code() {
+    fn build_shell_turn_message_includes_command_and_exit_code() -> TestResult {
         let message = build_shell_turn_message("ls -la", 0, "total 0\n");
         assert!(message.starts_with("Ich habe `!ls -la` ausgeführt (Exit 0):"));
         assert!(message.contains("```text\ntotal 0\n\n```"));
+        Ok(())
     }
 
     #[test]
-    fn build_shell_turn_message_truncates_long_output() {
+    fn build_shell_turn_message_truncates_long_output() -> TestResult {
         let output: String = "x".repeat(SHELL_TURN_OUTPUT_MAX_CHARS + 500);
         let message = build_shell_turn_message("yes | head", 0, &output);
         assert!(message.contains("[gekürzt]"));
@@ -6721,11 +7496,12 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.rsplit_once("\n```"))
             .map(|(body, _)| body)
-            .expect("fenced code block");
+            .ok_or(TestError::Missing("fenced code block"))?;
         assert_eq!(
             fence_body.chars().count(),
             SHELL_TURN_OUTPUT_MAX_CHARS + "\n[gekürzt]".chars().count()
         );
+        Ok(())
     }
 
     fn shell_outcome(command: &str, exit_code: i64, combined_output: &str) -> ShellRunOutcome {
@@ -6740,13 +7516,17 @@ mod tests {
     /// direkt nach einem `!`-Befehl im Idle-Pfad), wird der Folge-Turn sofort
     /// zum nächsten zu treibenden Turn — derselbe Pfad wie `HarwEvent::Submit`.
     #[test]
-    fn queue_shell_follow_up_turn_submits_immediately_when_idle() {
-        let mut app = test_chat_app();
+    fn queue_shell_follow_up_turn_submits_immediately_when_idle() -> TestResult {
+        let mut app = test_chat_app()?;
         let mut submitted: Option<String> = None;
 
-        queue_shell_follow_up_turn(&mut app, &mut submitted, shell_outcome("echo hi", 0, "hi\n"));
+        queue_shell_follow_up_turn(
+            &mut app,
+            &mut submitted,
+            shell_outcome("echo hi", 0, "hi\n"),
+        );
 
-        let text = submitted.expect("turn queued immediately");
+        let text = submitted.ok_or(TestError::Missing("turn queued immediately"))?;
         assert!(text.starts_with("Ich habe `!echo hi` ausgeführt (Exit 0):"));
         assert!(app.pending_turns.is_empty());
         assert_eq!(app.last_shell_command.as_deref(), Some("echo hi"));
@@ -6754,14 +7534,15 @@ mod tests {
             app.pending_turn_user_cell_override.as_deref(),
             Some("↳ Ausgabe von !echo hi an den Agenten übergeben")
         );
+        Ok(())
     }
 
     /// Läuft bereits ein Turn (`submitted.is_some()`), wird der Folge-Turn
     /// stattdessen an `app.pending_turns` gehängt statt den belegten Platz zu
     /// überschreiben.
     #[test]
-    fn queue_shell_follow_up_turn_queues_when_turn_already_submitted() {
-        let mut app = test_chat_app();
+    fn queue_shell_follow_up_turn_queues_when_turn_already_submitted() -> TestResult {
+        let mut app = test_chat_app()?;
         let mut submitted: Option<String> = Some("bereits abgeschickte Nachricht".to_owned());
 
         queue_shell_follow_up_turn(&mut app, &mut submitted, shell_outcome("pwd", 1, "err\n"));
@@ -6771,13 +7552,14 @@ mod tests {
         assert!(
             app.pending_turns
                 .front()
-                .expect("queued follow-up turn")
+                .ok_or(TestError::Missing("queued follow-up turn"))?
                 .starts_with("Ich habe `!pwd` ausgeführt (Exit 1):")
         );
+        Ok(())
     }
 
     #[test]
-    fn export_request_marker_reads_format_options_and_path() {
+    fn export_request_marker_reads_format_options_and_path() -> TestResult {
         let request = export_request_from_data(&json!({
             "kind": "export.request",
             "format": "json",
@@ -6785,7 +7567,7 @@ mod tests {
             "include_reasoning_summary": true,
             "path": "exports/session with spaces.json",
         }))
-        .expect("valid export marker");
+        .ok_or(TestError::Missing("valid export marker"))?;
 
         assert_eq!(request.format, ExportOutputFormat::Json);
         assert!(!request.include_tool_calls);
@@ -6796,19 +7578,20 @@ mod tests {
         );
         // Kein `max_chars`-Schlüssel im Marker → `None`, keine Begrenzung.
         assert_eq!(request.max_chars, None);
+        Ok(())
     }
 
     /// `max_chars` im Marker (`--max-chars <n>` am `/export`-Command, siehe
     /// `harw_ops::export`) wird als positive Zahl übernommen und landet
     /// unverändert in `ExportOptions.max_chars`.
     #[test]
-    fn export_request_marker_reads_max_chars() {
+    fn export_request_marker_reads_max_chars() -> TestResult {
         let request = export_request_from_data(&json!({
             "kind": "export.request",
             "format": "markdown",
             "max_chars": 20000,
         }))
-        .expect("valid export marker");
+        .ok_or(TestError::Missing("valid export marker"))?;
 
         assert_eq!(request.max_chars, Some(20000));
 
@@ -6819,11 +7602,12 @@ mod tests {
             ..ExportOptions::default()
         };
         assert_eq!(opts.max_chars, Some(20000));
+        Ok(())
     }
 
     #[test]
-    fn build_export_markdown_reflects_reasoning_and_tool_options() {
-        let mut app = test_chat_app();
+    fn build_export_markdown_reflects_reasoning_and_tool_options() -> TestResult {
+        let mut app = test_chat_app()?;
         app.push_line(Role::User, "Frage");
         app.export_entries
             .push(ExportEntry::Reasoning("sichere Zusammenfassung".to_owned()));
@@ -6858,11 +7642,12 @@ mod tests {
             ExportOutputFormat::Markdown,
         );
         assert_eq!(with_reasoning, via_build_export);
+        Ok(())
     }
 
     #[test]
-    fn structured_export_request_feeds_json_renderer_options() {
-        let mut app = test_chat_app();
+    fn structured_export_request_feeds_json_renderer_options() -> TestResult {
+        let mut app = test_chat_app()?;
         app.push_line(Role::User, "Frage");
         app.export_entries
             .push(ExportEntry::Reasoning("sichere Zusammenfassung".to_owned()));
@@ -6878,15 +7663,17 @@ mod tests {
             "include_reasoning_summary": true,
             "path": null,
         }))
-        .expect("valid export marker");
+        .ok_or(TestError::Missing("valid export marker"))?;
         let opts = ExportOptions {
             include_tool_calls: request.include_tool_calls,
             include_reasoning: request.include_reasoning_summary,
             ..ExportOptions::default()
         };
         let document: Value = serde_json::from_str(&build_export(&app, &opts, request.format))
-            .expect("valid JSON export");
-        let events = document["events"].as_array().expect("events array");
+            .map_err(ctx("valid JSON export"))?;
+        let events = document["events"]
+            .as_array()
+            .ok_or(TestError::Missing("events array"))?;
 
         assert!(
             events
@@ -6894,17 +7681,19 @@ mod tests {
                 .any(|event| event["type"] == "reasoning_summary")
         );
         assert!(!events.iter().any(|event| event["type"] == "tool"));
+        Ok(())
     }
 
     #[test]
-    fn file_export_reports_the_actual_collision_suffix() {
-        let mut app = test_chat_app();
+    fn file_export_reports_the_actual_collision_suffix() -> TestResult {
+        let mut app = test_chat_app()?;
         let path = std::env::temp_dir().join(format!(
             "harw-tui-export-suffix-{}-{}.md",
             std::process::id(),
             SessionId::new()
         ));
-        let first = export::write_export_path(&path, "first\n").expect("create first export");
+        let first =
+            export::write_export_path(&path, "first\n").map_err(ctx("create first export"))?;
 
         resolve_export_request(
             &mut app,
@@ -6925,7 +7714,7 @@ mod tests {
                 ExportEntry::System(text) => Some(text.as_str()),
                 _ => None,
             })
-            .expect("export status message");
+            .ok_or(TestError::Missing("export status message"))?;
         let expected_suffix = format!("{}-2.md", path.with_extension("").display());
         assert!(message.contains(&expected_suffix), "message: {message}");
 
@@ -6933,10 +7722,11 @@ mod tests {
             "{}-2.md",
             path.file_stem()
                 .and_then(|stem| stem.to_str())
-                .expect("stem")
+                .ok_or(TestError::Missing("stem"))?
         ));
         std::fs::remove_file(first).ok();
         std::fs::remove_file(second).ok();
+        Ok(())
     }
 
     /// A7-Fallback-Entscheid: schlägt beim reinen `/export`
@@ -6949,8 +7739,8 @@ mod tests {
     /// zusätzlich den OSC-52-Fallback selbst scheitern, sodass
     /// `clipboard::copy_or_sequence` deterministisch `NoClipboard` liefert.
     #[test]
-    fn export_choice_falls_back_to_a_file_when_no_clipboard_is_available() {
-        let mut app = test_chat_app();
+    fn export_choice_falls_back_to_a_file_when_no_clipboard_is_available() -> TestResult {
+        let mut app = test_chat_app()?;
         // Größer als `clipboard::OSC52_MAX_BYTES` (100_000) — macht auch den
         // OSC-52-Fallback selbst unmöglich, nicht nur die Systemwerkzeuge.
         app.push_line(Role::User, "x".repeat(150_000));
@@ -6968,20 +7758,21 @@ mod tests {
                 ExportEntry::System(text) => Some(text.clone()),
                 _ => None,
             })
-            .expect("export status message");
+            .ok_or(TestError::Missing("export status message"))?;
         let expected_prefix = "Keine Zwischenablage — Export gespeichert unter ";
         assert!(message.starts_with(expected_prefix), "message: {message}");
 
         let path = std::path::PathBuf::from(
             message
                 .strip_prefix(expected_prefix)
-                .expect("prefix checked above"),
+                .ok_or(TestError::Missing("prefix checked above"))?,
         );
         assert!(
             path.exists(),
             "the fallback export file must actually be written: {path:?}"
         );
         std::fs::remove_file(&path).ok();
+        Ok(())
     }
 
     /// Test-lokaler Ersatz für das gelöschte `trusted_tui_spawn_context`
@@ -7010,7 +7801,7 @@ mod tests {
     }
 
     #[test]
-    fn busy_turn_scrolls_immediately_and_preserves_typed_input_in_order() {
+    fn busy_turn_scrolls_immediately_and_preserves_typed_input_in_order() -> TestResult {
         // `queue_busy_key` (siehe Doku dort) wurde bewusst umgebaut: Tastatur-
         // Events werden während eines laufenden Turns nicht mehr roh in
         // `deferred_input` zwischengelagert, sondern live in `app.input`
@@ -7023,7 +7814,7 @@ mod tests {
         // dafür unten). Diese Assertions prüfen jetzt genau das, statt die
         // alte Roh-Event-Warteschlange: Scrollen wirkt weiterhin sofort, und
         // Tippen + Einfügen bleiben in der Reihenfolge im Composer erhalten.
-        let mut app = test_chat_app();
+        let mut app = test_chat_app()?;
         app.last_history_total_lines.set(100);
         app.last_history_visible_rows.set(10);
         let typed = TuiEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
@@ -7046,6 +7837,7 @@ mod tests {
         );
         assert_eq!(app.input.text(), "xnext prompt");
         assert!(app.deferred_input.is_empty());
+        Ok(())
     }
 
     /// Welle 4b: `/status` trägt `BusyAvailability::Immediate` und nur seine
@@ -7054,22 +7846,24 @@ mod tests {
     /// bleiben unberührt (die eigentliche Ausführung obliegt dem Aufrufer,
     /// siehe `run_immediate_busy_command`).
     #[test]
-    fn busy_turn_immediate_command_reports_run_immediate_without_touching_deferred_input() {
-        let mut app = test_chat_app();
+    fn busy_turn_immediate_command_reports_run_immediate_without_touching_deferred_input()
+    -> TestResult {
+        let mut app = test_chat_app()?;
         app.input.insert_str("/status");
 
         let outcome = queue_busy_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(outcome, BusyKeyOutcome::RunImmediate("/status".to_owned()));
         assert!(app.input.is_empty());
         assert!(app.deferred_input.is_empty());
+        Ok(())
     }
 
     /// `/mode plan` bleibt `DeferredUntilTurnEnd` (kein `Immediate`-Befehl aus
     /// Welle 2d/3d/4a) — unverändertes Verhalten: Paste+Enter in
     /// `deferred_input`, für die autorisierte Ausführung nach Turn-Ende.
     #[test]
-    fn busy_turn_queues_submitted_command_for_authorized_dispatch_after_turn() {
-        let mut app = test_chat_app();
+    fn busy_turn_queues_submitted_command_for_authorized_dispatch_after_turn() -> TestResult {
+        let mut app = test_chat_app()?;
         app.input.insert_str("/mode plan");
 
         assert_eq!(
@@ -7089,13 +7883,14 @@ mod tests {
             )))
         );
         assert!(app.deferred_input.is_empty());
+        Ok(())
     }
 
     /// `/model switch x` bleibt eingereiht (Welle 4b-Sonderfall: `model` ist
     /// `Immediate` markiert, aber nur `show`/`list` dürfen sofort laufen).
     #[test]
-    fn busy_turn_model_switch_with_argument_stays_deferred() {
-        let mut app = test_chat_app();
+    fn busy_turn_model_switch_with_argument_stays_deferred() -> TestResult {
+        let mut app = test_chat_app()?;
         app.input.insert_str("/model switch x");
 
         assert_eq!(
@@ -7114,14 +7909,15 @@ mod tests {
             )))
         );
         assert!(app.deferred_input.is_empty());
+        Ok(())
     }
 
     /// Ein unbekannter Befehl bleibt sicher eingereiht — `busy_availability_for`
     /// liefert dafür `DeferredUntilTurnEnd`, der eigentliche „unbekannter
     /// Befehl"-Fehler entsteht erst im späteren Dispatch.
     #[test]
-    fn busy_turn_unknown_command_stays_deferred() {
-        let mut app = test_chat_app();
+    fn busy_turn_unknown_command_stays_deferred() -> TestResult {
+        let mut app = test_chat_app()?;
         app.input.insert_str("/no-such-command");
 
         assert_eq!(
@@ -7140,13 +7936,14 @@ mod tests {
             )))
         );
         assert!(app.deferred_input.is_empty());
+        Ok(())
     }
 
     /// Chattext (kein Slash-Befehl) landet weiterhin direkt in `pending_turns`,
     /// unabhängig von `busy_availability_for`.
     #[test]
-    fn busy_turn_chat_text_still_goes_to_pending_turns() {
-        let mut app = test_chat_app();
+    fn busy_turn_chat_text_still_goes_to_pending_turns() -> TestResult {
+        let mut app = test_chat_app()?;
         app.input.insert_str("hallo welt");
 
         assert_eq!(
@@ -7155,6 +7952,7 @@ mod tests {
         );
         assert_eq!(app.pending_turns.pop_front(), Some("hallo welt".to_owned()));
         assert!(app.deferred_input.is_empty());
+        Ok(())
     }
 
     /// Welle 4c: ein erster Ctrl+C während eines laufenden Turns bricht ihn
@@ -7165,14 +7963,20 @@ mod tests {
     /// mit zusätzlichem Cancel des laufenden Turns statt eines sofortigen
     /// `HarwEvent::Quit`.
     #[test]
-    fn double_ctrl_c_during_busy_quits_like_idle() {
-        let mut app = test_chat_app();
+    fn double_ctrl_c_during_busy_quits_like_idle() -> TestResult {
+        let mut app = test_chat_app()?;
         let cancel = CancelToken::new();
         app.active_cancel = Some(cancel.clone());
         let ctrl_c = || TuiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
 
-        assert_eq!(handle_busy_event(&mut app, ctrl_c()), BusyKeyOutcome::Redraw);
-        assert!(cancel.is_cancelled(), "erster Ctrl+C muss den Turn kooperativ abbrechen");
+        assert_eq!(
+            handle_busy_event(&mut app, ctrl_c()),
+            BusyKeyOutcome::Redraw
+        );
+        assert!(
+            cancel.is_cancelled(),
+            "erster Ctrl+C muss den Turn kooperativ abbrechen"
+        );
         assert!(matches!(
             app.pending_quit,
             Some(QuitArm {
@@ -7182,11 +7986,69 @@ mod tests {
         ));
         assert!(!app.hard_quit_requested);
 
-        assert_eq!(handle_busy_event(&mut app, ctrl_c()), BusyKeyOutcome::Redraw);
+        assert_eq!(
+            handle_busy_event(&mut app, ctrl_c()),
+            BusyKeyOutcome::Redraw
+        );
         assert!(
             app.hard_quit_requested,
             "zweiter Ctrl+C-Druck binnen des Fensters muss hart beenden"
         );
+        Ok(())
+    }
+
+    /// Fix E (Teil 1b): ein erster Ctrl+C-Druck wirft bereits eingereihte
+    /// Eingaben weg, statt sie nach dem Abbruch automatisch als nächsten Turn
+    /// auszuliefern (`run_loop`, das `pending_turns`/`deferred_input` an
+    /// Turn-Grenzen abarbeitet). Vor diesem Fix blieben beide Warteschlangen
+    /// unangetastet und die eingereihte Nachricht liefe unverändert nach.
+    #[test]
+    fn ctrl_c_during_busy_clears_deferred_input_and_pending_turns() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.active_cancel = Some(CancelToken::new());
+        app.deferred_input.push_back(TuiEvent::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+        app.pending_turns
+            .push_back("noch nicht gesendet".to_owned());
+        let ctrl_c = TuiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert_eq!(handle_busy_event(&mut app, ctrl_c), BusyKeyOutcome::Redraw);
+
+        assert!(
+            app.deferred_input.is_empty(),
+            "Ctrl+C muss bereits eingereihte Tastatur-/Paste-Ereignisse verwerfen"
+        );
+        assert!(
+            app.pending_turns.is_empty(),
+            "Ctrl+C muss bereits abgeschickte, aber noch nicht ausgelieferte Nachrichten verwerfen"
+        );
+        assert!(
+            app.queue_cleared_at.is_some(),
+            "eine tatsächlich geleerte Warteschlange muss den transienten Statuszeilen-Hinweis setzen"
+        );
+        Ok(())
+    }
+
+    /// Leere Warteschlangen dürfen den „Warteschlange verworfen“-Hinweis
+    /// nicht fälschlich scharfstellen — sonst zeigte die Statuszeile bei
+    /// jedem Ctrl+C einen Hinweis, obwohl nichts verworfen wurde.
+    #[test]
+    fn ctrl_c_during_busy_with_empty_queues_does_not_arm_queue_cleared_hint() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.active_cancel = Some(CancelToken::new());
+        assert!(app.deferred_input.is_empty());
+        assert!(app.pending_turns.is_empty());
+        let ctrl_c = TuiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert_eq!(handle_busy_event(&mut app, ctrl_c), BusyKeyOutcome::Redraw);
+
+        assert!(
+            app.queue_cleared_at.is_none(),
+            "ohne eingereihte Eingaben gibt es nichts zu verwerfen"
+        );
+        Ok(())
     }
 
     /// Nach Ablauf von `QUIT_HINT_WINDOW` beendet ein erneuter Ctrl+C-Druck
@@ -7194,8 +8056,8 @@ mod tests {
     /// gesetzt, exakt wie die Ablaufprüfung im Idle-Pfad von `run_loop`
     /// (Welle 4c, Punkt 5).
     #[test]
-    fn ctrl_c_during_busy_after_window_expiry_does_not_hard_quit() {
-        let mut app = test_chat_app();
+    fn ctrl_c_during_busy_after_window_expiry_does_not_hard_quit() -> TestResult {
+        let mut app = test_chat_app()?;
         app.active_cancel = Some(CancelToken::new());
         app.pending_quit = Some(QuitArm {
             label: "Ctrl+C",
@@ -7215,27 +8077,28 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
     }
 
     #[test]
-    fn rendered_input_keeps_cursor_on_wrapped_text_and_long_input_visible() {
-        let mut app = test_chat_app();
+    fn rendered_input_keeps_cursor_on_wrapped_text_and_long_input_visible() -> TestResult {
+        let mut app = test_chat_app()?;
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 16))
-            .expect("test terminal");
+            .map_err(ctx("test terminal"))?;
         app.input.insert_str("one two three four five");
         app.input.move_left();
         terminal
             .draw(|frame| render_viewport(frame, &app, &Spinner::new(), None))
-            .expect("draw");
-        let position = terminal.get_cursor_position().expect("cursor");
+            .map_err(ctx("draw"))?;
+        let position = terminal.get_cursor_position().map_err(ctx("cursor"))?;
         assert_eq!(terminal.backend().buffer()[position].symbol(), "e");
 
         app.input.clear();
         app.input.insert_str("0\n1\n2\n3\n4\n5\n6\n7\n8\n9\nlast");
         terminal
             .draw(|frame| render_viewport(frame, &app, &Spinner::new(), None))
-            .expect("draw");
-        let position = terminal.get_cursor_position().expect("cursor");
+            .map_err(ctx("draw"))?;
+        let position = terminal.get_cursor_position().map_err(ctx("cursor"))?;
         assert_eq!(
             terminal.backend().buffer()[(position.x - 1, position.y)].symbol(),
             "t"
@@ -7254,9 +8117,13 @@ mod tests {
             position.y < 15,
             "cursor remains inside input, above its own bottom border"
         );
+        Ok(())
     }
 
-    fn test_executable_agent_ir(admitted: &[&str], forbidden: &[&str]) -> ExecutableAgentIr {
+    fn test_executable_agent_ir(
+        admitted: &[&str],
+        forbidden: &[&str],
+    ) -> TestResult<ExecutableAgentIr> {
         let admitted = admitted
             .iter()
             .map(|name| format!("\"{name}\""))
@@ -7280,7 +8147,7 @@ admitted = [{admitted}]
 forbidden = [{forbidden}]
 "#
         ))
-        .expect("test executable policy TOML");
+        .map_err(ctx("test executable policy TOML"))?;
         let resolved = harw_agent_dsl::resolved::ResolvedAgentDefinition {
             id: raw.id,
             version: raw.version,
@@ -7294,7 +8161,7 @@ forbidden = [{forbidden}]
             reasoning_effort: raw.reasoning_effort,
         };
 
-        harw_agent_dsl::lower(&resolved).expect("lower test executable policy")
+        harw_agent_dsl::lower(&resolved).map_err(ctx("lower test executable policy"))
     }
 
     /// W2d-2/T2b: `build_tui_agent_session` ist entfallen (Montage lebt jetzt in
@@ -7303,10 +8170,10 @@ forbidden = [{forbidden}]
     /// gebaut (CONTRACTS-W2d2 §2 T2b). Das geprüfte Verhalten
     /// (`with_executable_agent_ir` schneidet die Werkzeugfläche) ist unverändert.
     #[test]
-    fn selected_executable_policy_limits_tui_session_tools_and_retains_snapshot() {
-        let policy = test_executable_agent_ir(&["stop"], &[]);
+    fn selected_executable_policy_limits_tui_session_tools_and_retains_snapshot() -> TestResult {
+        let policy = test_executable_agent_ir(&["stop"], &[])?;
         let snapshot_id = policy.snapshot_id();
-        let sandbox = test_sandbox();
+        let sandbox = test_sandbox()?;
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
         let (turn_event_tx, _turn_event_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7333,13 +8200,14 @@ forbidden = [{forbidden}]
             "selected executable policy must be deny-by-default"
         );
         assert_eq!(session.executable_snapshot_id(), Some(&snapshot_id));
+        Ok(())
     }
 
     /// W2d-2/T2b: siehe oben — ohne `with_executable_agent_ir` bleibt die
     /// volle Werkzeugfläche sichtbar.
     #[test]
-    fn absent_executable_policy_preserves_full_tui_session_visibility() {
-        let sandbox = test_sandbox();
+    fn absent_executable_policy_preserves_full_tui_session_visibility() -> TestResult {
+        let sandbox = test_sandbox()?;
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
         let (turn_event_tx, _turn_event_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7359,16 +8227,18 @@ forbidden = [{forbidden}]
                 .is_tool_enabled(&harw_extension_api::ToolName::new("shell.exec"))
         );
         assert!(session.executable_snapshot_id().is_none());
+        Ok(())
     }
 
     #[test]
-    fn rate_limit_retry_does_not_append_the_user_message_again() {
+    fn rate_limit_retry_does_not_append_the_user_message_again() -> TestResult {
         let retry = rate_limit_retry_input();
 
         assert!(
             retry.user_text.is_none(),
             "core already persisted the failed turn's user message"
         );
+        Ok(())
     }
 
     fn test_operations() -> Vec<Arc<dyn harw_operations::Operation>> {
@@ -7378,49 +8248,54 @@ forbidden = [{forbidden}]
     }
 
     #[test]
-    fn test_classify_line_ignore_on_empty() {
+    fn test_classify_line_ignore_on_empty() -> TestResult {
         // Leere Zeilen beenden nicht mehr — sie werden ignoriert.
         assert_eq!(classify_line(""), LineAction::Ignore);
         assert_eq!(classify_line("   "), LineAction::Ignore);
+        Ok(())
     }
 
     #[test]
-    fn test_classify_line_quit_on_slash_quit() {
+    fn test_classify_line_quit_on_slash_quit() -> TestResult {
         assert_eq!(classify_line("/quit"), LineAction::Quit);
         assert_eq!(classify_line("/exit"), LineAction::Quit);
+        Ok(())
     }
 
     #[test]
-    fn test_classify_line_chat_passes_text() {
+    fn test_classify_line_chat_passes_text() -> TestResult {
         assert_eq!(
             classify_line("hallo welt"),
             LineAction::Chat("hallo welt".to_owned())
         );
+        Ok(())
     }
 
     #[test]
-    fn test_classify_line_command_is_dispatched() {
+    fn test_classify_line_command_is_dispatched() -> TestResult {
         // `/command`-Zeilen werden nun zur Ausführung durchgereicht, nicht mehr
         // als „noch nicht unterstützt"-Hinweis abgewiesen.
         assert_eq!(
             classify_line("/status"),
             LineAction::Command("/status".to_owned())
         );
+        Ok(())
     }
 
     #[test]
-    fn test_chatapp_push_and_read() {
-        let mut app = test_chat_app();
+    fn test_chatapp_push_and_read() -> TestResult {
+        let mut app = test_chat_app()?;
         app.push_line(Role::User, "hi");
         // Nach einem push_line muss genau eine Zelle vorhanden sein.
         assert_eq!(app.cells_len(), 1);
         assert!(app.input().is_empty());
+        Ok(())
     }
 
     /// Prüft, dass nach je einem User- und Assistant-Push zwei Zellen vorhanden sind.
     #[test]
-    fn test_push_user_and_assistant_cells_count() {
-        let mut app = test_chat_app();
+    fn test_push_user_and_assistant_cells_count() -> TestResult {
+        let mut app = test_chat_app()?;
         app.push_line(Role::User, "Frage");
         app.push_line(Role::Assistant, "Antwort");
         assert_eq!(
@@ -7449,12 +8324,13 @@ forbidden = [{forbidden}]
             !asst_lines.is_empty(),
             "Assistant-Zelle muss mindestens eine Zeile liefern"
         );
+        Ok(())
     }
 
     /// Prüft, dass nach einem System-Push die PlainHistoryCell den Text enthält.
     #[test]
-    fn test_push_system_cell_plain_content() {
-        let mut app = test_chat_app();
+    fn test_push_system_cell_plain_content() -> TestResult {
+        let mut app = test_chat_app()?;
         app.push_line(Role::System, "Willkommen");
         assert_eq!(app.cells_len(), 1);
         assert_eq!(
@@ -7465,12 +8341,13 @@ forbidden = [{forbidden}]
         let lines = app.cells[0].display_lines(200, style::Theme::Dark);
         let content: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(content, "Willkommen");
+        Ok(())
     }
 
     /// Popup öffnet sich wenn der Eingabepuffer mit `/` beginnt.
     #[test]
-    fn test_popup_opens_on_slash_prefix() {
-        let mut app = test_chat_app();
+    fn test_popup_opens_on_slash_prefix() -> TestResult {
+        let mut app = test_chat_app()?;
         assert!(app.command_popup.is_none(), "initial kein Popup");
 
         app.input.insert_char('/');
@@ -7481,15 +8358,19 @@ forbidden = [{forbidden}]
             "nach '/' muss Popup geöffnet sein"
         );
         assert!(
-            !app.command_popup.as_ref().unwrap().is_empty(),
+            !app.command_popup
+                .as_ref()
+                .ok_or(TestError::Missing("command_popup"))?
+                .is_empty(),
             "ungefiltertes Popup darf nicht leer sein"
         );
+        Ok(())
     }
 
     /// Popup schließt sich wenn der Eingabepuffer das `/`-Präfix verliert.
     #[test]
-    fn test_popup_closes_without_slash_prefix() {
-        let mut app = test_chat_app();
+    fn test_popup_closes_without_slash_prefix() -> TestResult {
+        let mut app = test_chat_app()?;
 
         app.input.insert_char('/');
         app.sync_popup();
@@ -7502,6 +8383,7 @@ forbidden = [{forbidden}]
             app.command_popup.is_none(),
             "nach Entfernen des '/' muss Popup geschlossen sein"
         );
+        Ok(())
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -7516,8 +8398,8 @@ forbidden = [{forbidden}]
 
     /// Zwei Ctrl+D beenden auch bei nicht leerem Composer und offenem Popup.
     #[test]
-    fn double_ctrl_d_quits_regardless_of_composer_or_popup_state() {
-        let mut app = test_chat_app();
+    fn double_ctrl_d_quits_regardless_of_composer_or_popup_state() -> TestResult {
+        let mut app = test_chat_app()?;
         // `sync_popup` schließt das Popup, sobald der Query-Teil nach dem
         // `/` ein Leerzeichen enthält (Argument-Eingabe hat begonnen, siehe
         // Doku an `sync_popup`) — "/status mit Entwurf" erfüllt die
@@ -7547,13 +8429,14 @@ forbidden = [{forbidden}]
 
         assert!(!handle_key(&mut app, ctrl_d, &bus));
         assert!(matches!(receiver.try_recv(), Ok(HarwEvent::Quit)));
+        Ok(())
     }
 
     /// Enter bei einem offenen Popup übernimmt den markierten Befehl und
     /// sendet den unvollständigen Präfix nicht als unbekannten Command ab.
     #[test]
-    fn test_handle_key_enter_accepts_popup_selection_without_submit() {
-        let mut app = test_chat_app();
+    fn test_handle_key_enter_accepts_popup_selection_without_submit() -> TestResult {
+        let mut app = test_chat_app()?;
         app.input.clear();
         app.input.insert_str("/co");
         app.sync_popup();
@@ -7582,11 +8465,12 @@ forbidden = [{forbidden}]
             receiver.try_recv().is_err(),
             "Autocomplete darf noch keinen Command absenden"
         );
+        Ok(())
     }
 
     #[test]
-    fn busy_submit_is_queued_in_fifo_order() {
-        let mut app = test_chat_app();
+    fn busy_submit_is_queued_in_fifo_order() -> TestResult {
+        let mut app = test_chat_app()?;
         app.input.insert_str("erste Nachricht");
         assert_eq!(
             queue_busy_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -7607,13 +8491,14 @@ forbidden = [{forbidden}]
             Some("zweite Nachricht")
         );
         assert!(app.pending_turns.is_empty());
+        Ok(())
     }
 
     /// Der Composer bleibt beim ersten Escape erhalten und wird beim zweiten
     /// unmittelbaren Escape geleert.
     #[test]
-    fn two_escapes_clear_the_input_box() {
-        let mut app = test_chat_app();
+    fn two_escapes_clear_the_input_box() -> TestResult {
+        let mut app = test_chat_app()?;
         app.input.insert_str("nicht verlieren beim ersten Escape");
         let (bus, _receiver) = harw_event_channel();
         let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -7625,14 +8510,15 @@ forbidden = [{forbidden}]
         assert!(handle_key(&mut app, escape, &bus));
         assert!(app.input().is_empty());
         assert!(!app.escape_armed);
+        Ok(())
     }
 
     /// `KeyCode::Tab` bei offenem Popup akzeptiert die markierte Auswahl,
     /// setzt `app.input` auf `"/<name> "` und sendet dabei NICHTS über den
     /// Bus (kein Absenden, nur Autocomplete).
     #[test]
-    fn test_handle_key_tab_accepts_popup_selection_without_submit() {
-        let mut app = test_chat_app();
+    fn test_handle_key_tab_accepts_popup_selection_without_submit() -> TestResult {
+        let mut app = test_chat_app()?;
         app.input.clear();
         app.input.insert_str("/hel");
         app.sync_popup();
@@ -7642,7 +8528,11 @@ forbidden = [{forbidden}]
             .and_then(CommandPopup::selected_name)
         {
             Some(name) => assert_eq!(name, "help", "einzige Übereinstimmung für 'hel'"),
-            None => panic!("Popup muss eine Auswahl für 'hel' markieren"),
+            None => {
+                return Err(TestError::Unexpected(
+                    "Popup muss eine Auswahl für 'hel' markieren".into(),
+                ));
+            }
         }
 
         let (bus, mut receiver) = harw_event_channel();
@@ -7662,8 +8552,13 @@ forbidden = [{forbidden}]
         );
         match receiver.try_recv() {
             Err(_) => {}
-            Ok(event) => panic!("Tab darf kein HarwEvent senden, war: {event:?}"),
+            Ok(event) => {
+                return Err(TestError::Unexpected(format!(
+                    "Tab darf kein HarwEvent senden, war: {event:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// Regression: `/mo` listet zwei Präfix-Treffer (`/mode`, `/model`) UND
@@ -7674,8 +8569,8 @@ forbidden = [{forbidden}]
     /// stattdessen wird die Eingabe auf deren längstes gemeinsames Präfix
     /// erweitert (`/mode`) und das Popup bleibt offen.
     #[test]
-    fn test_handle_key_tab_extends_query_to_common_prefix_for_ambiguous_matches() {
-        let mut app = test_chat_app();
+    fn test_handle_key_tab_extends_query_to_common_prefix_for_ambiguous_matches() -> TestResult {
+        let mut app = test_chat_app()?;
         app.input.clear();
         app.input.insert_str("/mo");
         app.sync_popup();
@@ -7704,6 +8599,7 @@ forbidden = [{forbidden}]
             receiver.try_recv().is_err(),
             "Query-Erweiterung darf keinen Command absenden"
         );
+        Ok(())
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -7718,8 +8614,8 @@ forbidden = [{forbidden}]
     /// Nach `/stop job-` (Leerzeichen vorhanden) muss `sync_popup` das
     /// Popup schließen — die Eingabe befindet sich in der Argument-Phase.
     #[test]
-    fn test_sync_popup_closes_when_argument_has_whitespace() {
-        let mut app = test_chat_app();
+    fn test_sync_popup_closes_when_argument_has_whitespace() -> TestResult {
+        let mut app = test_chat_app()?;
         app.input.clear();
         app.input.insert_str("/stop job-");
 
@@ -7729,13 +8625,14 @@ forbidden = [{forbidden}]
             app.command_popup.is_none(),
             "Popup muss bei Whitespace nach '/' geschlossen sein"
         );
+        Ok(())
     }
 
     /// Kontrast: `/mod` (kein Leerzeichen) hält das Popup offen — reine
     /// Command-Namen-Eingabe ohne Argument-Phase.
     #[test]
-    fn test_sync_popup_stays_open_without_whitespace() {
-        let mut app = test_chat_app();
+    fn test_sync_popup_stays_open_without_whitespace() -> TestResult {
+        let mut app = test_chat_app()?;
         app.input.clear();
         app.input.insert_str("/mod");
 
@@ -7745,6 +8642,7 @@ forbidden = [{forbidden}]
             app.command_popup.is_some(),
             "Popup muss ohne Whitespace nach '/' offen bleiben"
         );
+        Ok(())
     }
 
     /// Kern-Regressionstest: Zeichen für Zeichen `/stop job-42` eintippen —
@@ -7752,8 +8650,8 @@ forbidden = [{forbidden}]
     /// verschluckt werden, sobald die Argument-Phase (nach dem Leerzeichen)
     /// erreicht ist.
     #[test]
-    fn test_handle_key_types_digits_in_argument_not_swallowed() {
-        let mut app = test_chat_app();
+    fn test_handle_key_types_digits_in_argument_not_swallowed() -> TestResult {
+        let mut app = test_chat_app()?;
         let (bus, mut receiver) = harw_event_channel();
 
         for character in "/stop job-42".chars() {
@@ -7771,10 +8669,11 @@ forbidden = [{forbidden}]
             receiver.try_recv().is_err(),
             "ohne Enter darf kein HarwEvent gesendet werden"
         );
+        Ok(())
     }
 
     #[test]
-    fn resume_command_becomes_a_runtime_request_only_for_valid_shapes() {
+    fn resume_command_becomes_a_runtime_request_only_for_valid_shapes() -> TestResult {
         assert_eq!(
             resume_request("/resume"),
             Some(TuiRunOutcome::Resume { selector: None })
@@ -7787,10 +8686,11 @@ forbidden = [{forbidden}]
         );
         assert_eq!(resume_request("/resume too many"), None);
         assert_eq!(resume_request("/resume-other"), None);
+        Ok(())
     }
 
     #[test]
-    fn durable_history_hydrates_core_and_redacts_non_text_visible_content() {
+    fn durable_history_hydrates_core_and_redacts_non_text_visible_content() -> TestResult {
         use harw_protocol::items::{
             AssistantMessageItem, ErrorItem, ReasoningItem, ResultTrust, ToolCallItem,
             ToolCallResult, ToolResultItem, UserMessageItem,
@@ -7850,7 +8750,7 @@ forbidden = [{forbidden}]
             ExtensionRegistry::builder().build(),
             event_tx,
         );
-        let mut app = test_chat_app();
+        let mut app = test_chat_app()?;
         install_loaded_history(&mut session, &mut app, history);
 
         assert_eq!(session.history().len(), 6);
@@ -7871,10 +8771,11 @@ forbidden = [{forbidden}]
         for secret in ["secret.example", "raw secret"] {
             assert!(!visible.contains(secret));
         }
+        Ok(())
     }
 
     #[test]
-    fn resume_hydration_pairs_orphan_result_and_marks_open_call() {
+    fn resume_hydration_pairs_orphan_result_and_marks_open_call() -> TestResult {
         use harw_protocol::items::{ResultTrust, ToolCallItem, ToolCallResult, ToolResultItem};
         use harw_types::{ItemId, ToolCallId};
 
@@ -7903,7 +8804,7 @@ forbidden = [{forbidden}]
             ExtensionRegistry::builder().build(),
             event_tx,
         );
-        let mut app = test_chat_app();
+        let mut app = test_chat_app()?;
         install_loaded_history(&mut session, &mut app, history);
 
         let visible = app
@@ -7942,10 +8843,11 @@ forbidden = [{forbidden}]
             ExportEntry::ToolResult { error: Some(error), .. }
                 if error == "unvollständig (Resume-Abbruch)"
         ));
+        Ok(())
     }
 
     #[test]
-    fn incident_hint_is_small_and_only_suggests_bug_report_on_known_signals() {
+    fn incident_hint_is_small_and_only_suggests_bug_report_on_known_signals() -> TestResult {
         assert!(
             incident_hint(&TuiError::Core("provider timeout".to_owned()), 2)
                 .is_some_and(|hint| hint.contains("/bug-report"))
@@ -7957,6 +8859,7 @@ forbidden = [{forbidden}]
         assert!(
             incident_hint(&TuiError::Core("ordinary validation error".to_owned()), 9).is_none()
         );
+        Ok(())
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -8088,11 +8991,11 @@ forbidden = [{forbidden}]
 
     /// Treibt einen Turn, der an `fs.write` pausiert, und beantwortet jede
     /// eintreffende Frage mit `approve`.
-    async fn drive_turn_answering(approve: bool) -> DrivenTurn {
+    async fn drive_turn_answering(approve: bool) -> TestResult<DrivenTurn> {
         let executions = Arc::new(AtomicUsize::new(0));
         let (handler, mut prompts) = TuiApprovalHandler::new();
         let driver = ApprovalDriver::new(Arc::clone(&handler));
-        let sandbox = test_sandbox();
+        let sandbox = test_sandbox()?;
         let mut session = approval_test_session(&handler, &executions, &sandbox);
         let model = ScriptedModel::new(vec![
             ScriptedModel::tool_response(APPROVAL_TEST_TOOL, json!({ "path": "note.txt" })),
@@ -8110,11 +9013,11 @@ forbidden = [{forbidden}]
         let outcome = match first {
             Ok(outcome) => outcome,
             Err(error) => {
-                return DrivenTurn {
+                return Ok(DrivenTurn {
                     outcome: Err(error.to_string()),
                     executions: executions.load(Ordering::SeqCst),
                     prompts_seen: 0,
-                };
+                });
             }
         };
         assert!(
@@ -8141,51 +9044,69 @@ forbidden = [{forbidden}]
             }
         };
 
-        DrivenTurn {
+        Ok(DrivenTurn {
             outcome: result.map_err(|error| tui_error_from_approval_driver(error).to_string()),
             executions: executions.load(Ordering::SeqCst),
             prompts_seen,
-        }
+        })
     }
 
     /// Bedingung 1 + 5: der Spawn-Kontext trägt einen Approval-Actor, und eine
     /// freigegebene Pause endet in `Completed` — das Werkzeug lief genau einmal.
     #[tokio::test]
-    async fn approved_pause_completes_the_turn_and_runs_the_tool() {
-        let driven = drive_turn_answering(true).await;
+    async fn approved_pause_completes_the_turn_and_runs_the_tool() -> TestResult {
+        let driven = drive_turn_answering(true).await?;
 
         match driven.outcome {
             Ok(TurnOutcome::Completed) => {}
-            Ok(other) => panic!("an approved pause must complete the turn, was: {other:?}"),
-            Err(error) => panic!("an approved pause must not fail the turn: {error}"),
+            Ok(other) => {
+                return Err(TestError::Unexpected(format!(
+                    "an approved pause must complete the turn, was: {other:?}"
+                )));
+            }
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "an approved pause must not fail the turn: {error}"
+                )));
+            }
         }
         assert_eq!(driven.prompts_seen, 1, "genau eine Frage erwartet");
         assert_eq!(
             driven.executions, 1,
             "eine Freigabe muss das Werkzeug genau einmal ausführen"
         );
+        Ok(())
     }
 
     /// Ablehnung: der Turn endet trotzdem sauber, das Werkzeug läuft **nicht**.
     #[tokio::test]
-    async fn rejected_pause_completes_the_turn_without_running_the_tool() {
-        let driven = drive_turn_answering(false).await;
+    async fn rejected_pause_completes_the_turn_without_running_the_tool() -> TestResult {
+        let driven = drive_turn_answering(false).await?;
 
         match driven.outcome {
             Ok(TurnOutcome::Completed) => {}
-            Ok(other) => panic!("a rejected pause must still complete the turn, was: {other:?}"),
-            Err(error) => panic!("a rejected pause must not fail the turn: {error}"),
+            Ok(other) => {
+                return Err(TestError::Unexpected(format!(
+                    "a rejected pause must still complete the turn, was: {other:?}"
+                )));
+            }
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "a rejected pause must not fail the turn: {error}"
+                )));
+            }
         }
         assert_eq!(driven.prompts_seen, 1, "genau eine Frage erwartet");
         assert_eq!(
             driven.executions, 0,
             "eine Ablehnung darf das Werkzeug nicht ausführen"
         );
+        Ok(())
     }
 
     /// Bedingung 3: nur ein ausdrückliches `y` gibt frei.
     #[test]
-    fn only_an_explicit_y_approves_a_pending_prompt() {
+    fn only_an_explicit_y_approves_a_pending_prompt() -> TestResult {
         let approve = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
         let reject = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE);
         let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -8206,6 +9127,7 @@ forbidden = [{forbidden}]
             ApprovalKeyAction::Reject(REASON_OPERATOR_CANCELLED)
         );
         assert_eq!(classify_approval_key(other), ApprovalKeyAction::Ignore);
+        Ok(())
     }
 
     /// Die Antwort landet beim wartenden Treiber **und** an derselben
@@ -8218,7 +9140,7 @@ forbidden = [{forbidden}]
     /// geprüfte Eigenschaft bleibt dieselbe: die Freigabe erreicht den
     /// Treiber, und dieselbe Zelle trägt danach das Ergebnis.
     #[tokio::test]
-    async fn answering_a_prompt_updates_the_same_cell() {
+    async fn answering_a_prompt_updates_the_same_cell() -> TestResult {
         let (handler, mut prompts) = TuiApprovalHandler::new();
         let request = ItemId::new();
         let call = ToolCall {
@@ -8230,10 +9152,14 @@ forbidden = [{forbidden}]
 
         let prompt = match prompts.try_recv() {
             Ok(prompt) => prompt,
-            Err(error) => panic!("die Frage muss den Renderer erreichen: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "die Frage muss den Renderer erreichen: {error}"
+                )));
+            }
         };
         let tool_cell: SharedToolCell = Arc::new(Mutex::new(ToolCell::started(&call)));
-        let mut app = ChatApp::new(Vec::new(), test_sandbox(), SessionId::new());
+        let mut app = ChatApp::new(Vec::new(), test_sandbox()?, SessionId::new());
 
         apply_approval_decision(
             &mut app,
@@ -8247,19 +9173,28 @@ forbidden = [{forbidden}]
 
         match handler.await_resolution(&request).await {
             ApprovalResolution::Approve => {}
-            other => panic!("eine Freigabe muss den Treiber erreichen, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "eine Freigabe muss den Treiber erreichen, war: {other:?}"
+                )));
+            }
         }
         match tool_cell.lock() {
             Ok(cell) => assert_eq!(cell.approval_note.as_deref(), Some("✓ freigegeben")),
-            Err(_) => panic!("die Zelle muss nach der Antwort lesbar bleiben"),
+            Err(_) => {
+                return Err(TestError::Unexpected(
+                    "die Zelle muss nach der Antwort lesbar bleiben".into(),
+                ));
+            }
         }
+        Ok(())
     }
 
     /// Eine Ablehnung schreibt dieselbe Werkzeugzelle mit der Ablehnungsnotiz
     /// fort — die Nachfolgerin des früheren `Some(false)` an der
     /// `ApprovalPromptCell` (siehe Kommentar oben).
     #[tokio::test]
-    async fn rejecting_a_prompt_marks_the_same_cell_as_denied() {
+    async fn rejecting_a_prompt_marks_the_same_cell_as_denied() -> TestResult {
         let (handler, mut prompts) = TuiApprovalHandler::new();
         let request = ItemId::new();
         let call = ToolCall {
@@ -8270,10 +9205,14 @@ forbidden = [{forbidden}]
         assert!(handler.open_prompt(&request, &call));
         let prompt = match prompts.try_recv() {
             Ok(prompt) => prompt,
-            Err(error) => panic!("die Frage muss den Renderer erreichen: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "die Frage muss den Renderer erreichen: {error}"
+                )));
+            }
         };
         let tool_cell: SharedToolCell = Arc::new(Mutex::new(ToolCell::started(&call)));
-        let mut app = ChatApp::new(Vec::new(), test_sandbox(), SessionId::new());
+        let mut app = ChatApp::new(Vec::new(), test_sandbox()?, SessionId::new());
 
         apply_approval_decision(
             &mut app,
@@ -8291,17 +9230,119 @@ forbidden = [{forbidden}]
             ApprovalResolution::Reject { reason } => {
                 assert_eq!(reason, REASON_OPERATOR_REJECTED);
             }
-            other => panic!("eine Ablehnung muss den Treiber erreichen, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "eine Ablehnung muss den Treiber erreichen, war: {other:?}"
+                )));
+            }
         }
         match tool_cell.lock() {
             Ok(cell) => assert_eq!(cell.approval_note.as_deref(), Some("✗ abgelehnt")),
-            Err(_) => panic!("die Zelle muss nach der Antwort lesbar bleiben"),
+            Err(_) => {
+                return Err(TestError::Unexpected(
+                    "die Zelle muss nach der Antwort lesbar bleiben".into(),
+                ));
+            }
         }
+        Ok(())
+    }
+
+    /// Fix E (Teil 1b): drückt der Nutzer Ctrl+C, während
+    /// `drive_pauses_to_completion` eine Freigabefrage anzeigt, bricht das
+    /// jetzt zusätzlich zum bestehenden Ablehnen des Dialogs auch den
+    /// laufenden Turn kooperativ ab und scharft den zweistufigen
+    /// Beenden-Hinweis. Vor diesem Fix blieben `active_cancel`/`pending_quit`
+    /// unberührt — nur der Dialog wurde abgelehnt, der Turn und alle
+    /// laufenden Kind-Agenten liefen weiter. Getestet direkt an der
+    /// extrahierten Kernlogik [`cancel_turn_and_reject_open_dialogs`], ohne
+    /// den vollen `drive_pauses_to_completion`-Ereignis-Loop aufzuziehen.
+    #[tokio::test]
+    async fn ctrl_c_with_open_approval_dialog_cancels_turn_and_still_rejects_dialog() -> TestResult
+    {
+        let (handler, mut prompts) = TuiApprovalHandler::new();
+        let request = ItemId::new();
+        let call = ToolCall {
+            id: ToolCallId::new(),
+            name: ToolName::new(APPROVAL_TEST_TOOL),
+            arguments: json!({ "path": "note.txt" }),
+        };
+        assert!(handler.open_prompt(&request, &call));
+        let prompt = match prompts.try_recv() {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "die Frage muss den Renderer erreichen: {error}"
+                )));
+            }
+        };
+        let tool_cell: SharedToolCell = Arc::new(Mutex::new(ToolCell::started(&call)));
+        let mut app = ChatApp::new(Vec::new(), test_sandbox()?, SessionId::new());
+        let cancel = CancelToken::new();
+        app.active_cancel = Some(cancel.clone());
+        app.pending_turns
+            .push_back("noch nicht gesendet".to_owned());
+        let mut pending = Some(PendingApprovalPrompt {
+            prompt,
+            tool_cell: Arc::clone(&tool_cell),
+        });
+        let mut dialog_shown_at = Some(Instant::now());
+        let mut host_permit_shown_at: Option<Instant> = None;
+
+        cancel_turn_and_reject_open_dialogs(
+            &mut app,
+            &mut pending,
+            &mut dialog_shown_at,
+            &mut host_permit_shown_at,
+        )
+        .await;
+
+        assert!(
+            cancel.is_cancelled(),
+            "Ctrl+C muss den Turn auch bei offenem Freigabe-Dialog kooperativ abbrechen"
+        );
+        assert!(
+            matches!(
+                app.pending_quit,
+                Some(QuitArm {
+                    label: "Ctrl+C",
+                    ..
+                })
+            ),
+            "Ctrl+C muss den zweistufigen Beenden-Hinweis scharfstellen"
+        );
+        assert!(
+            app.pending_turns.is_empty(),
+            "bereits eingereihte Nachrichten müssen verworfen werden"
+        );
+        assert!(pending.is_none(), "die Frage muss konsumiert sein");
+        assert!(dialog_shown_at.is_none());
+        assert!(app.pending_approval_dialog.is_none());
+
+        // Bestehendes Ablehnen bleibt zusätzlich bestehen, wird nicht ersetzt.
+        match handler.await_resolution(&request).await {
+            ApprovalResolution::Reject { reason } => {
+                assert_eq!(reason, REASON_OPERATOR_CANCELLED);
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Ctrl+C muss den Dialog weiterhin ablehnen, war: {other:?}"
+                )));
+            }
+        }
+        match tool_cell.lock() {
+            Ok(cell) => assert_eq!(cell.approval_note.as_deref(), Some("✗ abgelehnt")),
+            Err(_) => {
+                return Err(TestError::Unexpected(
+                    "die Zelle muss nach der Antwort lesbar bleiben".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Bedingung 7: die Kern-Ursache bleibt in der Fehlermeldung erhalten.
     #[test]
-    fn approval_driver_errors_keep_their_cause() {
+    fn approval_driver_errors_keep_their_cause() -> TestResult {
         let error = ApprovalDriverError::MissingPendingApproval {
             session: "session-42".to_owned(),
         };
@@ -8312,11 +9353,18 @@ forbidden = [{forbidden}]
                 assert!(message.contains("session-42"));
                 assert!(message.contains(&expected));
             }
-            TuiError::Io(_) => panic!("ein Treiberfehler ist kein Terminal-I/O-Fehler"),
+            TuiError::Io(_) => {
+                return Err(TestError::Unexpected(
+                    "ein Treiberfehler ist kein Terminal-I/O-Fehler".into(),
+                ));
+            }
             TuiError::ContextProviderRegistration(_) => {
-                panic!("ein Treiberfehler ist kein Namensraum-Konflikt")
+                return Err(TestError::Unexpected(
+                    "ein Treiberfehler ist kein Namensraum-Konflikt".into(),
+                ));
             }
         }
+        Ok(())
     }
 
     /// TUI-Berechtigungen (E4: lokaler Principal-Tier `Operator`, siehe
@@ -8327,8 +9375,9 @@ forbidden = [{forbidden}]
     /// Test benutzt denselben Wert direkt. `CommandServices` ist durch die
     /// Closure `F: FnOnce() -> ServiceMap` ersetzt (CE, CONTRACTS-W2d2 §1.2).
     #[tokio::test]
-    async fn local_tui_permissions_are_accessible_but_maintainer_commands_are_blocked() {
-        let sandbox = test_sandbox();
+    async fn local_tui_permissions_are_accessible_but_maintainer_commands_are_blocked() -> TestResult
+    {
+        let sandbox = test_sandbox()?;
         let operations = test_operations();
         let adapters = operations
             .iter()
@@ -8375,14 +9424,15 @@ forbidden = [{forbidden}]
             output,
             "Berechtigung verweigert: /plugins erfordert Maintainer; aktuelle Stufe ist Operator"
         );
+        Ok(())
     }
 
     /// `/mode` an der Turn-Grenze (AP W5-05). W2d-2/T2b: die Session wird über
     /// `AgentSession::new_with_id(..).with_spawn_context(..).with_turn_event_sink(..)`
     /// gebaut statt über das gelöschte `build_tui_agent_session`.
     #[test]
-    fn mode_request_is_applied_at_the_turn_boundary() {
-        let sandbox = test_sandbox();
+    fn mode_request_is_applied_at_the_turn_boundary() -> TestResult {
+        let sandbox = test_sandbox()?;
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
         let (turn_event_tx, _turn_event_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut session = AgentSession::new_with_id(
@@ -8400,7 +9450,9 @@ forbidden = [{forbidden}]
 
         assert_eq!(session.mode(), InteractionMode::Chat);
         if let Err(error) = SessionController::request_mode(controller.as_ref(), "explore") {
-            panic!("`/mode explore` muss angenommen werden: {error}");
+            return Err(TestError::Unexpected(format!(
+                "`/mode explore` muss angenommen werden: {error}"
+            )));
         }
         assert_eq!(
             session.mode(),
@@ -8412,13 +9464,14 @@ forbidden = [{forbidden}]
 
         assert_eq!(session.mode(), InteractionMode::Explore);
         assert_eq!(app.active_mode(), InteractionMode::Explore);
+        Ok(())
     }
 
     /// Ein unbekannter Modusname wird abgewiesen statt still auf den Default zu
     /// fallen; die Session bleibt unangetastet.
     #[test]
-    fn unknown_mode_names_never_change_the_session() {
-        let sandbox = test_sandbox();
+    fn unknown_mode_names_never_change_the_session() -> TestResult {
+        let sandbox = test_sandbox()?;
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
         let (turn_event_tx, _turn_event_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut session = AgentSession::new_with_id(
@@ -8437,6 +9490,7 @@ forbidden = [{forbidden}]
         assert!(SessionController::request_mode(controller.as_ref(), "yolo").is_err());
         assert!(!app.apply_pending_controller_state(&mut session));
         assert_eq!(session.mode(), InteractionMode::Chat);
+        Ok(())
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -8456,8 +9510,8 @@ forbidden = [{forbidden}]
     /// Kernanforderung W5-10b: drei Kind-Ereignisse erzeugen **eine** Zelle, die
     /// fortgeschrieben wird — nicht drei.
     #[test]
-    fn three_child_events_produce_a_single_sub_agent_cell() {
-        let mut app = test_chat_app();
+    fn three_child_events_produce_a_single_sub_agent_cell() -> TestResult {
+        let mut app = test_chat_app()?;
         let mut state = TurnEventState::default();
         let turn_id = TurnId::new();
         let child = SessionId::from_str("child-explorer-1");
@@ -8508,14 +9562,208 @@ forbidden = [{forbidden}]
             rendered.contains("fertig"),
             "die Zelle muss den Abschluss zeigen: {rendered:?}"
         );
+        Ok(())
+    }
+
+    /// Teil 1 (`recursive-cooking-lobster.md`): der kurze Ack-Text vor einem
+    /// Tool-Aufruf (`MessagePhase::Commentary`) muss sofort als sichtbare
+    /// Assistant-Zelle erscheinen, statt erst am Turn-Ende über
+    /// `reveal_reply`.
+    #[test]
+    fn commentary_assistant_message_renders_immediately() -> TestResult {
+        use harw_protocol::items::AssistantMessageItem;
+
+        let mut app = test_chat_app()?;
+        let mut state = TurnEventState::default();
+        let before = app.cells_len();
+
+        let handled = handle_turn_event(
+            &mut app,
+            &mut state,
+            TurnEvent::ItemAdded {
+                turn_id: TurnId::new(),
+                item: TurnItem::AssistantMessage(AssistantMessageItem {
+                    id: ItemId::new(),
+                    content: vec![ContentPart::Text {
+                        text: "Ich prüfe die Konfiguration …".to_owned(),
+                    }],
+                    phase: Some(harw_types::MessagePhase::Commentary),
+                }),
+            },
+        );
+
+        assert!(handled, "Commentary-Nachrichten müssen ein Redraw auslösen");
+        assert_eq!(
+            app.cells_len(),
+            before + 1,
+            "Commentary-Nachricht muss eine neue Zelle anlegen"
+        );
+        let rendered = rendered_cells(&app);
+        assert!(
+            rendered.contains("Ich prüfe die Konfiguration …"),
+            "Commentary-Text fehlt im gerenderten Verlauf: {rendered:?}"
+        );
+        Ok(())
+    }
+
+    /// Gegenprobe zu `commentary_assistant_message_renders_immediately`:
+    /// `phase == FinalAnswer` darf **keine** zusätzliche Zelle erzeugen — die
+    /// finale Antwort bleibt exklusiv `reveal_reply` am Turn-Ende vorbehalten,
+    /// sonst entstünde eine Doppelanzeige.
+    #[test]
+    fn final_answer_assistant_message_is_not_rendered_live() -> TestResult {
+        use harw_protocol::items::AssistantMessageItem;
+
+        let mut app = test_chat_app()?;
+        let mut state = TurnEventState::default();
+        let before = app.cells_len();
+
+        let handled = handle_turn_event(
+            &mut app,
+            &mut state,
+            TurnEvent::ItemAdded {
+                turn_id: TurnId::new(),
+                item: TurnItem::AssistantMessage(AssistantMessageItem {
+                    id: ItemId::new(),
+                    content: vec![ContentPart::Text {
+                        text: "Das ist die finale Antwort.".to_owned(),
+                    }],
+                    phase: Some(harw_types::MessagePhase::FinalAnswer),
+                }),
+            },
+        );
+
+        assert!(
+            !handled,
+            "FinalAnswer darf keinen Redraw über handle_turn_event auslösen"
+        );
+        assert_eq!(
+            app.cells_len(),
+            before,
+            "FinalAnswer darf keine zusätzliche Zelle anlegen (bleibt reveal_reply vorbehalten)"
+        );
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Bugfix: doppelte/verwaiste Antwortanzeige (`latest_final_reply`,
+    // `suppress_if_matches_commentary`) — siehe Bugfix-Abschnitt der
+    // `drive_turn_animated`-Doku.
+    // ------------------------------------------------------------------
+
+    fn tool_result_pair(history: &mut ConversationHistory) {
+        let call_id = ToolCallId::new();
+        history.push_tool_call(call_id.clone(), "fs.read", json!({ "path": "/tmp/x" }));
+        history.push_tool_result(call_id, ToolCallResult::success(json!({ "ok": true })), 5);
+    }
+
+    /// Fall (a): endet der Turn mit einer bereits live gezeigten
+    /// `Commentary`-Nachricht, gefolgt nur von Tool-Aufrufen, darf
+    /// `latest_final_reply` sie nicht ein zweites Mal liefern.
+    #[test]
+    fn latest_final_reply_commentary_then_tool_calls_returns_none() -> TestResult {
+        let mut history = ConversationHistory::new();
+        history.push_assistant_text(
+            "Ich prüfe die Konfiguration …",
+            Some(harw_types::MessagePhase::Commentary),
+        );
+        tool_result_pair(&mut history);
+
+        assert_eq!(latest_final_reply(&history, 0), None);
+        Ok(())
+    }
+
+    /// Fall (b): eine finale (nicht-`Commentary`) Antwort wird genau einmal
+    /// geliefert — unabhängig von einer vorherigen `Commentary`-Nachricht
+    /// desselben Turns.
+    #[test]
+    fn latest_final_reply_final_answer_is_returned_once() -> TestResult {
+        let mut history = ConversationHistory::new();
+        history.push_assistant_text(
+            "Ich prüfe die Konfiguration …",
+            Some(harw_types::MessagePhase::Commentary),
+        );
+        history.push_assistant_text(
+            "Die finale Antwort.",
+            Some(harw_types::MessagePhase::FinalAnswer),
+        );
+
+        assert_eq!(
+            latest_final_reply(&history, 0),
+            Some("Die finale Antwort.".to_owned())
+        );
+        Ok(())
+    }
+
+    /// Eine Assistant-Nachricht ganz ohne `phase` gilt — wie `FinalAnswer` —
+    /// als enthüllbar (siehe `handle_turn_event`s Doku: „bei `FinalAnswer`
+    /// oder fehlender Phase bleibt die Anzeige `reveal_reply` vorbehalten").
+    #[test]
+    fn latest_final_reply_missing_phase_is_returned() -> TestResult {
+        let mut history = ConversationHistory::new();
+        history.push_assistant_text("Antwort ohne Phasen-Metadaten.", None);
+
+        assert_eq!(
+            latest_final_reply(&history, 0),
+            Some("Antwort ohne Phasen-Metadaten.".to_owned())
+        );
+        Ok(())
+    }
+
+    /// Fall (c): fügt der aktuelle Turn gar keine neue Assistant-Nachricht
+    /// hinzu (z. B. ein zusammengefasster Warteschlangen-Turn), darf die
+    /// Antwort des VORHERIGEN Turns nicht erneut geliefert werden —
+    /// `since_len` grenzt die Suche strikt auf die neuen Items ein.
+    #[test]
+    fn latest_final_reply_no_new_assistant_item_returns_none() -> TestResult {
+        let mut history = ConversationHistory::new();
+        history.push_assistant_text(
+            "Antwort des vorherigen Turns.",
+            Some(harw_types::MessagePhase::FinalAnswer),
+        );
+        let since_len = history.len();
+        tool_result_pair(&mut history);
+
+        assert_eq!(latest_final_reply(&history, since_len), None);
+        Ok(())
+    }
+
+    /// Zweite Verteidigungslinie: ein `reply`, der exakt dem zuletzt live
+    /// gepushten Commentary-Text entspricht, wird unterdrückt.
+    #[test]
+    fn suppress_if_matches_commentary_dedupes_identical_text() -> TestResult {
+        assert_eq!(
+            suppress_if_matches_commentary(Some("gleicher Text".to_owned()), Some("gleicher Text")),
+            None
+        );
+        Ok(())
+    }
+
+    /// Unterschiedlicher Text, kein Commentary-Wächter gesetzt, oder gar
+    /// keine Antwort — in allen drei Fällen bleibt `reply` unverändert.
+    #[test]
+    fn suppress_if_matches_commentary_keeps_unrelated_values() -> TestResult {
+        assert_eq!(
+            suppress_if_matches_commentary(Some("neuer Text".to_owned()), Some("alter Text")),
+            Some("neuer Text".to_owned())
+        );
+        assert_eq!(
+            suppress_if_matches_commentary(Some("neuer Text".to_owned()), None),
+            Some("neuer Text".to_owned())
+        );
+        assert_eq!(
+            suppress_if_matches_commentary(None, Some("alter Text")),
+            None
+        );
+        Ok(())
     }
 
     /// A6: eine abgeschlossene Werkzeugausführung schreibt die Dauer nur in
     /// den `ExportEntry::ToolResult`-Eintrag; der zugehörige
     /// `ToolCall`-Eintrag bleibt ohne `duration_ms` (kein Backfill mehr).
     #[test]
-    fn tool_call_completion_leaves_the_call_entry_without_a_duration() {
-        let mut app = test_chat_app();
+    fn tool_call_completion_leaves_the_call_entry_without_a_duration() -> TestResult {
+        let mut app = test_chat_app()?;
         let mut state = TurnEventState::default();
         let turn_id = TurnId::new();
         let call_id = ToolCallId::new();
@@ -8568,13 +9816,14 @@ forbidden = [{forbidden}]
             Some(Some(42)),
             "ToolResult-Eintrag muss die Dauer tragen"
         );
+        Ok(())
     }
 
     /// A6 (Hydrate-Pfad): beim Laden einer durablen Historie bekommt der
     /// `ExportEntry::ToolCall`-Eintrag `trust` nachgetragen, aber keine Dauer
     /// mehr — die Dauer bleibt exklusiv am `ExportEntry::ToolResult`.
     #[test]
-    fn hydrated_tool_result_leaves_the_call_entry_without_a_duration() {
+    fn hydrated_tool_result_leaves_the_call_entry_without_a_duration() -> TestResult {
         use harw_protocol::items::{ResultTrust, ToolCallItem, ToolCallResult, ToolResultItem};
         use harw_types::{ItemId, ToolCallId};
 
@@ -8602,7 +9851,7 @@ forbidden = [{forbidden}]
             ExtensionRegistry::builder().build(),
             event_tx,
         );
-        let mut app = test_chat_app();
+        let mut app = test_chat_app()?;
         install_loaded_history(&mut session, &mut app, history);
 
         let call_entry = app.export_entries.iter().find_map(|entry| match entry {
@@ -8629,12 +9878,13 @@ forbidden = [{forbidden}]
             _ => None,
         });
         assert_eq!(result_duration, Some(Some(17)));
+        Ok(())
     }
 
     /// Ein Fortschritt für ein unbekanntes Kind erzeugt **keine** Zelle.
     #[test]
-    fn progress_for_an_unknown_child_creates_no_cell() {
-        let mut app = test_chat_app();
+    fn progress_for_an_unknown_child_creates_no_cell() -> TestResult {
+        let mut app = test_chat_app()?;
         let mut state = TurnEventState::default();
         let before = app.cells_len();
 
@@ -8651,13 +9901,14 @@ forbidden = [{forbidden}]
 
         assert!(!handled);
         assert_eq!(app.cells_len(), before);
+        Ok(())
     }
 
     /// Ohne Plan-Dienste geht die Plan-Information nicht verloren — sie wird nur
     /// einzeilig statt als Graph gezeigt.
     #[test]
-    fn plan_updates_degrade_to_a_system_line_without_plan_services() {
-        let mut app = test_chat_app();
+    fn plan_updates_degrade_to_a_system_line_without_plan_services() -> TestResult {
+        let mut app = test_chat_app()?;
         let mut state = TurnEventState::default();
 
         assert!(handle_turn_event(
@@ -8673,12 +9924,13 @@ forbidden = [{forbidden}]
         let rendered = rendered_cells(&app);
         assert!(rendered.contains("plan-7"));
         assert!(rendered.contains("Knoten ergänzt"));
+        Ok(())
     }
 
     /// `ModeChanged` zieht den internen Modus nach; ein unbekannter Name nicht.
     #[test]
-    fn mode_changed_events_update_the_active_mode() {
-        let mut app = test_chat_app();
+    fn mode_changed_events_update_the_active_mode() -> TestResult {
+        let mut app = test_chat_app()?;
         let mut state = TurnEventState::default();
 
         assert!(handle_turn_event(
@@ -8698,25 +9950,28 @@ forbidden = [{forbidden}]
             }
         ));
         assert_eq!(app.active_mode(), InteractionMode::Explore);
+        Ok(())
     }
 
     /// Nur die exakte Zeile `/goal check` löst eine [`GoalCell`] aus.
     #[test]
-    fn only_goal_check_requests_a_goal_cell() {
+    fn only_goal_check_requests_a_goal_cell() -> TestResult {
         assert!(is_goal_check_command("/goal check"));
         assert!(is_goal_check_command("  /goal   check  "));
         assert!(!is_goal_check_command("/goal set"));
         assert!(!is_goal_check_command("/goal"));
         assert!(!is_goal_check_command("/plan check"));
+        Ok(())
     }
 
     /// Ohne durchgereichte Plan-Dienste gibt es keinen Zielstand — und keinen
     /// Fehler.
     #[test]
-    fn goal_cell_is_absent_without_plan_services() {
-        let app = test_chat_app();
+    fn goal_cell_is_absent_without_plan_services() -> TestResult {
+        let app = test_chat_app()?;
 
         assert!(goal_cell_for_command(&app, "/goal check").is_none());
+        Ok(())
     }
 
     // ── Welle 4a/7b: Picker-Konsolidierung (`/model`, `/uia-model`,
@@ -8725,11 +9980,14 @@ forbidden = [{forbidden}]
     /// Bare Form und argloses `switch` öffnen den Picker; `switch <id>` mit
     /// Argument bleibt Text-Dispatch (kein Picker).
     #[test]
-    fn is_bare_or_argless_switch_matches_bare_and_argless_switch_only() {
+    fn is_bare_or_argless_switch_matches_bare_and_argless_switch_only() -> TestResult {
         assert!(is_bare_or_argless_switch("/model", "/model"));
         assert!(is_bare_or_argless_switch("  /model  ", "/model"));
         assert!(is_bare_or_argless_switch("/model switch", "/model"));
-        assert!(is_bare_or_argless_switch("/uia-effort switch", "/uia-effort"));
+        assert!(is_bare_or_argless_switch(
+            "/uia-effort switch",
+            "/uia-effort"
+        ));
 
         assert!(!is_bare_or_argless_switch("/model switch x", "/model"));
         assert!(!is_bare_or_argless_switch("/model list", "/model"));
@@ -8741,13 +9999,14 @@ forbidden = [{forbidden}]
         // fest, dass der Prädikat selbst `/provider` nicht fälschlich matcht,
         // falls er versehentlich doch wieder verdrahtet würde.
         assert!(!is_bare_or_argless_switch("/provider switch", "/model"));
+        Ok(())
     }
 
     /// Ohne Konfiguration (Test-`ChatApp` ohne Runtime-Montage) wird kein
     /// leerer Dialog geöffnet, sondern eine klare Systemzeile angehängt —
     /// für jedes der drei `PickerTarget`-Ziele.
     #[test]
-    fn open_model_switch_picker_without_config_pushes_system_line_not_overlay() {
+    fn open_model_switch_picker_without_config_pushes_system_line_not_overlay() -> TestResult {
         for target in [
             PickerTarget::Orchestrator,
             PickerTarget::Uia,
@@ -8755,17 +10014,18 @@ forbidden = [{forbidden}]
                 fixed_provider: "anthropic".to_owned(),
             },
         ] {
-            let mut app = test_chat_app();
+            let mut app = test_chat_app()?;
             app.open_model_switch_picker(target);
             assert!(app.overlay.is_none());
         }
+        Ok(())
     }
 
     /// `Accept` auf [`Overlay::ModelSwitch`] synthetisiert je nach `target`
     /// die richtige Befehlszeile — `/model switch`, `/uia-model switch` bzw.
     /// `/uia-worker-model switch` — und schließt das Overlay.
     #[test]
-    fn model_switch_accept_emits_the_command_line_for_each_target() {
+    fn model_switch_accept_emits_the_command_line_for_each_target() -> TestResult {
         let providers = vec![ProviderEntry {
             id: "anthropic".to_owned(),
             label: "Anthropic".to_owned(),
@@ -8790,9 +10050,10 @@ forbidden = [{forbidden}]
         ];
 
         for (target, expected) in cases {
-            let mut app = test_chat_app();
-            let picker = ModelSwitchPicker::new(target, providers.clone(), models.clone(), None, None)
-                .expect("providers fixture ist nicht leer");
+            let mut app = test_chat_app()?;
+            let picker =
+                ModelSwitchPicker::new(target, providers.clone(), models.clone(), None, None)
+                    .ok_or(TestError::Missing("providers fixture ist nicht leer"))?;
             app.overlay = Some(Overlay::ModelSwitch(Box::new(picker)));
 
             let (bus, mut receiver) = harw_event_channel();
@@ -8813,18 +10074,26 @@ forbidden = [{forbidden}]
                 );
             }
 
-            assert!(app.overlay.is_none(), "Overlay muss nach Accept geschlossen sein");
+            assert!(
+                app.overlay.is_none(),
+                "Overlay muss nach Accept geschlossen sein"
+            );
             match receiver.try_recv() {
                 Ok(HarwEvent::Command(command)) => assert_eq!(command, expected),
-                other => panic!("erwartete HarwEvent::Command({expected:?}), bekam {other:?}"),
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "erwartete HarwEvent::Command({expected:?}), bekam {other:?}"
+                    )));
+                }
             }
         }
+        Ok(())
     }
 
     /// `Cancel` (Esc) auf [`Overlay::ModelSwitch`] schließt das Overlay ohne
     /// eine Befehlszeile zu emittieren.
     #[test]
-    fn model_switch_cancel_closes_overlay_without_emitting_a_command() {
+    fn model_switch_cancel_closes_overlay_without_emitting_a_command() -> TestResult {
         let providers = vec![ProviderEntry {
             id: "anthropic".to_owned(),
             label: "Anthropic".to_owned(),
@@ -8836,10 +10105,11 @@ forbidden = [{forbidden}]
                 label: "Claude Sonnet".to_owned(),
             }],
         )];
-        let picker = ModelSwitchPicker::new(PickerTarget::Orchestrator, providers, models, None, None)
-            .expect("providers fixture ist nicht leer");
+        let picker =
+            ModelSwitchPicker::new(PickerTarget::Orchestrator, providers, models, None, None)
+                .ok_or(TestError::Missing("providers fixture ist nicht leer"))?;
 
-        let mut app = test_chat_app();
+        let mut app = test_chat_app()?;
         app.overlay = Some(Overlay::ModelSwitch(Box::new(picker)));
         let (bus, mut receiver) = harw_event_channel();
 
@@ -8854,6 +10124,7 @@ forbidden = [{forbidden}]
             receiver.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
+        Ok(())
     }
 
     /// Bare `/effort`/`/uia-effort` öffnet [`Overlay::EffortChoice`] mit
@@ -8861,18 +10132,22 @@ forbidden = [{forbidden}]
     /// Controller-Snapshot (`Session`) bzw. bleibt ohne Konfiguration auf
     /// Index 0 (`Uia`, kein persistierter Wert im Test-`ChatApp`).
     #[test]
-    fn open_effort_choice_lists_all_levels_with_reset_entry() {
-        let mut app = test_chat_app();
+    fn open_effort_choice_lists_all_levels_with_reset_entry() -> TestResult {
+        let mut app = test_chat_app()?;
         app.session_controller
             .set_reasoning_effort(Some(ReasoningEffort::High))
-            .expect("set_reasoning_effort muss gelingen");
+            .map_err(ctx("set_reasoning_effort muss gelingen"))?;
 
         app.open_effort_choice(EffortTarget::Session);
         match &app.overlay {
             Some(Overlay::EffortChoice { target, .. }) => {
                 assert_eq!(*target, EffortTarget::Session);
             }
-            other => panic!("erwartete Overlay::EffortChoice, bekam {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartete Overlay::EffortChoice, bekam {other:?}"
+                )));
+            }
         }
 
         app.open_effort_choice(EffortTarget::Uia);
@@ -8883,15 +10158,16 @@ forbidden = [{forbidden}]
                 ..
             })
         ));
+        Ok(())
     }
 
     /// Eine getroffene Effort-Wahl sendet `/effort <level>` bzw.
     /// `/uia-effort <level>`; der letzte Eintrag („Provider-Default
     /// (zurücksetzen)") sendet `clear` statt einer Stufe.
     #[test]
-    fn effort_choice_accept_emits_level_or_clear_per_target() {
+    fn effort_choice_accept_emits_level_or_clear_per_target() -> TestResult {
         // Session: dritte Stufe (Index 2 = "medium") direkt bestätigen.
-        let mut app = test_chat_app();
+        let mut app = test_chat_app()?;
         app.open_effort_choice(EffortTarget::Session);
         let (bus, mut receiver) = harw_event_channel();
         handle_key(
@@ -8912,11 +10188,15 @@ forbidden = [{forbidden}]
         assert!(app.overlay.is_none());
         match receiver.try_recv() {
             Ok(HarwEvent::Command(command)) => assert_eq!(command, "/effort medium"),
-            other => panic!("erwartete HarwEvent::Command(\"/effort medium\"), bekam {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartete HarwEvent::Command(\"/effort medium\"), bekam {other:?}"
+                )));
+            }
         }
 
         // Uia: letzten Eintrag (Reset) wählen → `clear`.
-        let mut app = test_chat_app();
+        let mut app = test_chat_app()?;
         app.open_effort_choice(EffortTarget::Uia);
         let (bus, mut receiver) = harw_event_channel();
         for _ in 0..EFFORT_LEVELS.len() {
@@ -8934,8 +10214,13 @@ forbidden = [{forbidden}]
         assert!(app.overlay.is_none());
         match receiver.try_recv() {
             Ok(HarwEvent::Command(command)) => assert_eq!(command, "/uia-effort clear"),
-            other => panic!("erwartete HarwEvent::Command(\"/uia-effort clear\"), bekam {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartete HarwEvent::Command(\"/uia-effort clear\"), bekam {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 }
 
@@ -8943,8 +10228,9 @@ forbidden = [{forbidden}]
 
 #[cfg(test)]
 mod approval_arming_tests {
-    use super::*;
     use super::tests::test_chat_app;
+    use super::*;
+    use crate::test_support::{TestResult, ctx};
     use crossterm::event::KeyEventKind;
     use ratatui::buffer::Buffer;
 
@@ -8958,7 +10244,7 @@ mod approval_arming_tests {
 
     /// Pflichtfall G-008: ein `y` innerhalb der Totzeit gibt **nichts** frei.
     #[test]
-    fn an_early_y_is_ignored_and_a_late_one_approves() {
+    fn an_early_y_is_ignored_and_a_late_one_approves() -> TestResult {
         assert_eq!(
             classify_armed_approval_key(key(KeyCode::Char('y')), Duration::ZERO, true),
             ApprovalKeyAction::NotArmed
@@ -8979,12 +10265,13 @@ mod approval_arming_tests {
             classify_armed_approval_key(key(KeyCode::Char('Y')), ARMED, true),
             ApprovalKeyAction::Approve
         );
+        Ok(())
     }
 
     /// Auch die Ablehnung per `n` ist der Tipp-Falle entzogen — sonst
     /// beantwortete ein getipptes „nein" die Frage, bevor sie gelesen ist.
     #[test]
-    fn an_early_n_is_ignored_and_a_late_one_rejects() {
+    fn an_early_n_is_ignored_and_a_late_one_rejects() -> TestResult {
         assert_eq!(
             classify_armed_approval_key(key(KeyCode::Char('n')), Duration::from_millis(10), true),
             ApprovalKeyAction::NotArmed
@@ -8993,11 +10280,12 @@ mod approval_arming_tests {
             classify_armed_approval_key(key(KeyCode::Char('n')), ARMED, true),
             ApprovalKeyAction::Reject(REASON_OPERATOR_REJECTED)
         );
+        Ok(())
     }
 
     /// Eine nicht sichtbare Frage (hochgescrollt) wird nie beantwortet.
     #[test]
-    fn an_invisible_question_accepts_no_answer() {
+    fn an_invisible_question_accepts_no_answer() -> TestResult {
         assert_eq!(
             classify_armed_approval_key(key(KeyCode::Char('y')), ARMED, false),
             ApprovalKeyAction::NotArmed
@@ -9006,22 +10294,24 @@ mod approval_arming_tests {
             classify_armed_approval_key(key(KeyCode::Char('n')), ARMED, false),
             ApprovalKeyAction::NotArmed
         );
+        Ok(())
     }
 
     /// Eine gedrückt gehaltene Taste ist keine Entscheidung.
     #[test]
-    fn a_repeated_key_never_answers() {
+    fn a_repeated_key_never_answers() -> TestResult {
         let repeat =
             KeyEvent::new_with_kind(KeyCode::Char('y'), KeyModifiers::NONE, KeyEventKind::Repeat);
         assert_eq!(
             classify_armed_approval_key(repeat, ARMED, true),
             ApprovalKeyAction::NotArmed
         );
+        Ok(())
     }
 
     /// Abbruchtasten bleiben immer wirksam: sie lehnen ab (fail-safe).
     #[test]
-    fn cancel_keys_stay_armed_because_they_reject() {
+    fn cancel_keys_stay_armed_because_they_reject() -> TestResult {
         assert_eq!(
             classify_armed_approval_key(key(KeyCode::Esc), Duration::ZERO, false),
             ApprovalKeyAction::Reject(REASON_OPERATOR_CANCELLED)
@@ -9034,11 +10324,12 @@ mod approval_arming_tests {
             ),
             ApprovalKeyAction::Reject(REASON_OPERATOR_CANCELLED)
         );
+        Ok(())
     }
 
     /// `v` klappt jederzeit auf, andere Tasten bleiben bedeutungslos.
     #[test]
-    fn v_toggles_details_and_other_keys_are_ignored() {
+    fn v_toggles_details_and_other_keys_are_ignored() -> TestResult {
         assert_eq!(
             classify_armed_approval_key(key(KeyCode::Char('v')), Duration::ZERO, true),
             ApprovalKeyAction::ToggleDetails
@@ -9059,6 +10350,7 @@ mod approval_arming_tests {
             ),
             ApprovalKeyAction::Ignore
         );
+        Ok(())
     }
 
     /// Der Anzeigezustand schaltet nach dem erneuten Anzeigen einer Frage
@@ -9075,13 +10367,14 @@ mod approval_arming_tests {
     /// Taste scharf, unmittelbar danach (Anzeigedauer zurück auf null) wieder
     /// nicht.
     #[test]
-    fn rearm_restarts_the_arming_delay() {
+    fn rearm_restarts_the_arming_delay() -> TestResult {
         let answer_key = key(KeyCode::Char('y'));
 
         assert!(approval_dialog_key_is_armed(answer_key, ARMED));
         // Rearm: eine neu eingetroffene Frage setzt die seit dem Anzeigen
         // verstrichene Zeit auf null zurück.
         assert!(!approval_dialog_key_is_armed(answer_key, Duration::ZERO));
+        Ok(())
     }
 
     // ── Host-Permit-Dialog (Plan „UIA-Shell-Worker und Shell-Modus", Schritt 2) ──
@@ -9101,7 +10394,10 @@ mod approval_arming_tests {
     /// tatsächlich verwendet — statt die privaten Felder des Typs zu erraten.
     fn build_host_permit_prompt(
         preselected: HostPermitVariant,
-    ) -> (HostPermitPrompt, tokio::sync::oneshot::Receiver<Option<HostPermitVariant>>) {
+    ) -> (
+        HostPermitPrompt,
+        tokio::sync::oneshot::Receiver<Option<HostPermitVariant>>,
+    ) {
         build_host_permit_prompt_for("host-process-worker@1", "echo hi", preselected)
     }
 
@@ -9114,7 +10410,10 @@ mod approval_arming_tests {
         worker_definition: &str,
         command: &str,
         preselected: HostPermitVariant,
-    ) -> (HostPermitPrompt, tokio::sync::oneshot::Receiver<Option<HostPermitVariant>>) {
+    ) -> (
+        HostPermitPrompt,
+        tokio::sync::oneshot::Receiver<Option<HostPermitVariant>>,
+    ) {
         HostPermitPrompt::new(
             "s1".to_owned(),
             worker_definition.to_owned(),
@@ -9128,26 +10427,102 @@ mod approval_arming_tests {
     /// Aufrufer [`HostPermitVariant::SingleExecution`] vorgeschlagen hat
     /// (Arbeitsmodus außerhalb von `shell`).
     #[tokio::test]
-    async fn build_host_permit_dialog_preselects_single_execution() {
+    async fn build_host_permit_dialog_preselects_single_execution() -> TestResult {
         let (prompt, answer) = build_host_permit_prompt(HostPermitVariant::SingleExecution);
         let mut dialog = build_host_permit_dialog(&prompt);
         let action = dialog.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(action, ChoiceAction::Chosen(0));
         assert!(prompt.deny());
-        assert_eq!(answer.await.expect("responder must deliver an answer"), None);
+        assert_eq!(
+            answer
+                .await
+                .map_err(ctx("responder must deliver an answer"))?,
+            None
+        );
+        Ok(())
     }
 
     /// `build_host_permit_dialog` wählt Option 1 (Host-Arbeitsphase) vor,
     /// wenn der Aufrufer [`HostPermitVariant::SessionLease`] vorgeschlagen hat
     /// (Shell-Modus).
     #[tokio::test]
-    async fn build_host_permit_dialog_preselects_session_lease() {
+    async fn build_host_permit_dialog_preselects_session_lease() -> TestResult {
         let (prompt, answer) = build_host_permit_prompt(HostPermitVariant::SessionLease);
         let mut dialog = build_host_permit_dialog(&prompt);
         let action = dialog.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(action, ChoiceAction::Chosen(1));
         assert!(prompt.deny());
-        assert_eq!(answer.await.expect("responder must deliver an answer"), None);
+        assert_eq!(
+            answer
+                .await
+                .map_err(ctx("responder must deliver an answer"))?,
+            None
+        );
+        Ok(())
+    }
+
+    /// Fix E (Teil 1b): dieselbe Erwartung wie beim Freigabe-Dialog
+    /// ([`ctrl_c_with_open_approval_dialog_cancels_turn_and_still_rejects_dialog`]),
+    /// hier für die Host-Permit-Frage — Ctrl+C bricht den Turn zusätzlich zum
+    /// bestehenden Verweigern der Frage kooperativ ab, statt nur die Frage
+    /// abzulehnen.
+    #[tokio::test]
+    async fn ctrl_c_with_open_host_permit_dialog_cancels_turn_and_still_denies_prompt() -> TestResult
+    {
+        let (prompt, answer) = build_host_permit_prompt(HostPermitVariant::SingleExecution);
+        let dialog = build_host_permit_dialog(&prompt);
+        let mut app = test_chat_app()?;
+        let cancel = CancelToken::new();
+        app.active_cancel = Some(cancel.clone());
+        app.deferred_input.push_back(TuiEvent::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+        app.pending_host_permit_dialog = Some(dialog);
+        app.pending_host_permit = Some(prompt);
+        let mut pending: Option<PendingApprovalPrompt> = None;
+        let mut dialog_shown_at: Option<Instant> = None;
+        let mut host_permit_shown_at = Some(Instant::now());
+
+        cancel_turn_and_reject_open_dialogs(
+            &mut app,
+            &mut pending,
+            &mut dialog_shown_at,
+            &mut host_permit_shown_at,
+        )
+        .await;
+
+        assert!(
+            cancel.is_cancelled(),
+            "Ctrl+C muss den Turn auch bei offenem Host-Permit-Dialog kooperativ abbrechen"
+        );
+        assert!(
+            matches!(
+                app.pending_quit,
+                Some(QuitArm {
+                    label: "Ctrl+C",
+                    ..
+                })
+            ),
+            "Ctrl+C muss den zweistufigen Beenden-Hinweis scharfstellen"
+        );
+        assert!(
+            app.deferred_input.is_empty(),
+            "bereits eingereihte Eingaben müssen verworfen werden"
+        );
+        assert!(app.pending_host_permit.is_none());
+        assert!(app.pending_host_permit_dialog.is_none());
+        assert!(host_permit_shown_at.is_none());
+
+        // Bestehendes Verweigern bleibt zusätzlich bestehen, wird nicht ersetzt.
+        assert_eq!(
+            answer
+                .await
+                .map_err(ctx("responder must deliver an answer"))?,
+            None,
+            "Ctrl+C muss die Host-Permit-Frage weiterhin verweigern"
+        );
+        Ok(())
     }
 
     /// Rendert einen [`ChoiceDialog`] in einen ausreichend breiten Puffer und
@@ -9169,7 +10544,7 @@ mod approval_arming_tests {
     /// eigenen Titel und rahmt `prompt.command()` als „Grund" statt als
     /// auszuführenden Befehl.
     #[test]
-    fn build_host_permit_dialog_uses_sandbox_lease_wording_for_the_lease_worker() {
+    fn build_host_permit_dialog_uses_sandbox_lease_wording_for_the_lease_worker() -> TestResult {
         let (prompt, _answer) = build_host_permit_prompt_for(
             harw_tool_shell::SANDBOX_LEASE_WORKER_DEFINITION,
             "brauche Host-PATH für cargo",
@@ -9190,12 +10565,13 @@ mod approval_arming_tests {
             !rendered.contains("Host-Ausführung erlauben?"),
             "rendered: {rendered}"
         );
+        Ok(())
     }
 
     /// Ein gewöhnlicher Host-Befehl (nicht die Sandbox-Lease-Worker-
     /// Definition) behält die bisherige Formulierung bei.
     #[test]
-    fn build_host_permit_dialog_keeps_the_command_wording_for_other_workers() {
+    fn build_host_permit_dialog_keeps_the_command_wording_for_other_workers() -> TestResult {
         let (prompt, _answer) = build_host_permit_prompt(HostPermitVariant::SingleExecution);
         let dialog = build_host_permit_dialog(&prompt);
         let rendered = rendered_choice_dialog(&dialog);
@@ -9212,6 +10588,7 @@ mod approval_arming_tests {
             !rendered.contains("Sandbox-Lease angefragt"),
             "rendered: {rendered}"
         );
+        Ok(())
     }
 
     /// B6: `open_host_permit_prompt` — die Funktion, die
@@ -9222,8 +10599,8 @@ mod approval_arming_tests {
     /// für `drive_turn_animated` vorhanden); dieser Test deckt die
     /// tatsächliche Zustandsänderung ab, die den Dialog sichtbar macht.
     #[test]
-    fn host_permit_prompt_arrival_opens_the_dialog_during_a_running_turn() {
-        let mut app = test_chat_app();
+    fn host_permit_prompt_arrival_opens_the_dialog_during_a_running_turn() -> TestResult {
+        let mut app = test_chat_app()?;
         assert!(app.pending_host_permit.is_none());
         assert!(app.pending_host_permit_dialog.is_none());
 
@@ -9233,14 +10610,15 @@ mod approval_arming_tests {
         assert!(app.pending_host_permit.is_some());
         assert!(app.pending_host_permit_dialog.is_some());
         assert!(shown_at.elapsed() < Duration::from_secs(1));
+        Ok(())
     }
 
     /// `open_host_permit_prompt` lehnt eine noch offene ältere Frage ab,
     /// statt sie still zu überschreiben (dieselbe K3-Regel wie beim
     /// normalen Freigabe-Panel).
     #[tokio::test]
-    async fn open_host_permit_prompt_denies_a_stale_open_prompt() {
-        let mut app = test_chat_app();
+    async fn open_host_permit_prompt_denies_a_stale_open_prompt() -> TestResult {
+        let mut app = test_chat_app()?;
         let (stale_prompt, stale_answer) =
             build_host_permit_prompt(HostPermitVariant::SingleExecution);
         open_host_permit_prompt(&mut app, stale_prompt);
@@ -9251,11 +10629,14 @@ mod approval_arming_tests {
         open_host_permit_prompt(&mut app, fresh_prompt);
 
         assert_eq!(
-            stale_answer.await.expect("responder must deliver an answer"),
+            stale_answer
+                .await
+                .map_err(ctx("responder must deliver an answer"))?,
             None,
             "the stale prompt must be denied, not silently dropped"
         );
         assert!(app.pending_host_permit.is_some());
+        Ok(())
     }
 
     /// `apply_host_permit_decision` mit Options-Index 0 genehmigt genau die
@@ -9264,55 +10645,63 @@ mod approval_arming_tests {
     /// geprüft, dass der App-seitige Dispatch die richtige Variante über den
     /// Antwortkanal sendet und die erwartete Systemzeile anhängt.
     #[tokio::test]
-    async fn apply_host_permit_decision_index_zero_approves_single_execution() {
+    async fn apply_host_permit_decision_index_zero_approves_single_execution() -> TestResult {
         let (prompt, answer) = build_host_permit_prompt(HostPermitVariant::SingleExecution);
-        let mut app = test_chat_app();
+        let mut app = test_chat_app()?;
         apply_host_permit_decision(&mut app, prompt, 0);
         assert_eq!(
-            answer.await.expect("responder must deliver an answer"),
+            answer
+                .await
+                .map_err(ctx("responder must deliver an answer"))?,
             Some(HostPermitVariant::SingleExecution)
         );
         assert!(
-            app.cells
+            app.cells.iter().any(|cell| cell
+                .display_lines(80, app.theme)
                 .iter()
-                .any(|cell| cell
-                    .display_lines(80, app.theme)
-                    .iter()
-                    .any(|line| line_contains(line, "einmalig freigegeben"))),
+                .any(|line| line_contains(line, "einmalig freigegeben"))),
             "a system line must confirm the single-execution approval"
         );
+        Ok(())
     }
 
     /// `apply_host_permit_decision` mit Options-Index 1 genehmigt die
     /// Host-Arbeitsphase.
     #[tokio::test]
-    async fn apply_host_permit_decision_index_one_approves_session_lease() {
+    async fn apply_host_permit_decision_index_one_approves_session_lease() -> TestResult {
         let (prompt, answer) = build_host_permit_prompt(HostPermitVariant::SessionLease);
-        let mut app = test_chat_app();
+        let mut app = test_chat_app()?;
         apply_host_permit_decision(&mut app, prompt, 1);
         assert_eq!(
-            answer.await.expect("responder must deliver an answer"),
+            answer
+                .await
+                .map_err(ctx("responder must deliver an answer"))?,
             Some(HostPermitVariant::SessionLease)
         );
         assert!(
-            app.cells
+            app.cells.iter().any(|cell| cell
+                .display_lines(80, app.theme)
                 .iter()
-                .any(|cell| cell
-                    .display_lines(80, app.theme)
-                    .iter()
-                    .any(|line| line_contains(line, "HOST-MODUS AKTIV"))),
+                .any(|line| line_contains(line, "HOST-MODUS AKTIV"))),
             "a system line must confirm the session-lease approval"
         );
+        Ok(())
     }
 
     /// Jeder andere Options-Index (hier: die „Nein"-Option, Index 2) lehnt ab
     /// — fail-closed statt eines Panics bei einem unerwarteten Index.
     #[tokio::test]
-    async fn apply_host_permit_decision_any_other_index_denies() {
+    async fn apply_host_permit_decision_any_other_index_denies() -> TestResult {
         let (prompt, answer) = build_host_permit_prompt(HostPermitVariant::SingleExecution);
-        let mut app = test_chat_app();
+        let mut app = test_chat_app()?;
         apply_host_permit_decision(&mut app, prompt, 2);
-        assert_eq!(answer.await.expect("responder must deliver an answer"), None);
+        assert_eq!(
+            answer
+                .await
+                .map_err(ctx("responder must deliver an answer"))?,
+            None
+        );
+        Ok(())
     }
 
     /// Fällt der Fragekanal weg, ohne dass je geantwortet wurde (z. B. der
@@ -9321,13 +10710,14 @@ mod approval_arming_tests {
     /// `Err`, nie eine stillschweigende Zustimmung. Dieselbe Sicherheitsregel
     /// wie beim normalen Freigabe-Panel: Ablehnung ist der Default.
     #[tokio::test]
-    async fn dropped_host_permit_prompt_fails_closed() {
+    async fn dropped_host_permit_prompt_fails_closed() -> TestResult {
         let (prompt, answer) = build_host_permit_prompt(HostPermitVariant::SingleExecution);
         drop(prompt);
         assert!(
             answer.await.is_err(),
             "a dropped prompt must close the answer channel instead of implicitly approving"
         );
+        Ok(())
     }
 
     /// Kleiner Helfer, der eine gerenderte [`Line`] auf enthaltenen Text prüft

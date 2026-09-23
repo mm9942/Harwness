@@ -5,7 +5,7 @@
 //! or the local echo path.
 //!
 //! # Responsibility
-//! Bundles the extension crates (fs, shell, deps, web, instructions,
+//! Bundles the extension crates (fs, doc, shell, deps, web, instructions,
 //! project-discovery) into a single `ExtensionRegistry`, plus discovers the
 //! current project context so the model knows where it is. Behind the
 //! optional `browser` Cargo feature it additionally offers the Harwness
@@ -65,6 +65,9 @@ pub mod embedded_agents;
 pub mod profile;
 pub mod research_web;
 
+#[cfg(test)]
+mod test_support;
+
 use std::path::PathBuf;
 
 use harw_extension_api::allow_rules::{AllowRuleSet, RuleDecision};
@@ -75,12 +78,12 @@ use harw_extension_api::{
 use harw_instructions::AgentIdentity;
 use harw_project_discovery::ProjectContext;
 
-pub use error::{RegistryDefaultsError, RegistryDefaultsResult};
 pub use agent_definition_tools::{
     AgentDefinitionToolProvider, DefinitionAuthorCeiling, DefinitionWriteMode,
     UiaSelfDocumentToolProvider,
 };
 pub use authority::{AuthorityReducer, authority_reducer_for_role, tool_permission};
+pub use error::{RegistryDefaultsError, RegistryDefaultsResult};
 pub use profile::{
     AgentDefinitionAccess, HostPermitWiring, IdentityOverrides, RegistryProfile,
     RestrictedToolProvider, agent_definition_tool_names_for_access, assemble_registry,
@@ -95,9 +98,10 @@ pub use research_web::{researcher_web_network_scope, researcher_web_policy};
 /// # Beschreibung
 /// Die Liste umfasst ausschließlich Werkzeuge, die **nachweislich** nur lesen
 /// und an keiner Fläche eine Freigabe (`ApprovalPolicy != None`) deklarieren:
-/// lesende Dateisystem-Werkzeuge, die Dependency-Werkzeuge, `lens.ask`, die
-/// Web-Recherche (deren Netzgrenze die Host-Allowlist der Sandbox zieht, nicht
-/// die Freigabe) und die lesenden Status-Operationen `status`/`ps`.
+/// lesende Dateisystem-Werkzeuge, das lesende PDF-Werkzeug (`doc.read_pdf`,
+/// `harw-tool-doc`), die Dependency-Werkzeuge, `lens.ask`, die Web-Recherche
+/// (deren Netzgrenze die Host-Allowlist der Sandbox zieht, nicht die
+/// Freigabe) und die lesenden Status-Operationen `status`/`ps`.
 ///
 /// Alles Mutierende — `fs.write`, `shell.exec`, `stop`, `plan`, `goal` —, alles
 /// mit Nebenwirkung über einen anderen Weg (`diff`, `explore`, `research_*`,
@@ -137,6 +141,12 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     "fs.search",
     "fs.glob",
     "fs.grep",
+    // Lesendes PDF-Werkzeug (`harw-tool-doc`, Anbindung W3): liest eine
+    // PDF-Datei aus dem Workspace seitenweise als Text/Markdown — dieselbe
+    // Berechtigung (`Permission::ReadWorkspace`) und dieselbe read-only
+    // Eigenschaft wie `fs.read`, erscheint deshalb überall, wo ein lesender
+    // FS-Provider registriert wird (siehe `profile::DOC_TOOLS`).
+    "doc.read_pdf",
     // Dependency-Werkzeuge (`harw-tool-deps`) — ausnahmslos read-only.
     "deps.graph",
     "deps.locked",
@@ -409,6 +419,7 @@ pub fn assemble_default_registry(cwd: PathBuf) -> RegistryDefaultsResult<Assembl
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn registered_names(assembled: &AssembledRegistry) -> Vec<String> {
         assembled
@@ -421,9 +432,9 @@ mod tests {
     }
 
     #[test]
-    fn assemble_from_current_dir_smoke() {
-        let cwd = std::env::current_dir().expect("cwd");
-        let ar = assemble_default_registry(cwd).expect("assemble");
+    fn assemble_from_current_dir_smoke() -> TestResult {
+        let cwd = std::env::current_dir().map_err(ctx("cwd"))?;
+        let ar = assemble_default_registry(cwd).map_err(ctx("assemble"))?;
         let total_tools: usize = ar
             .registry
             .tool_providers()
@@ -438,12 +449,13 @@ mod tests {
         assert_eq!(ar.registry.instructions_providers().len(), 1);
         assert_eq!(ar.registry.context_providers().len(), 1);
         assert_eq!(ar.registry.approval_handlers().len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn assemble_default_registry_still_yields_the_full_coding_tool_set() {
-        let cwd = std::env::current_dir().expect("cwd");
-        let ar = assemble_default_registry(cwd).expect("assemble");
+    fn assemble_default_registry_still_yields_the_full_coding_tool_set() -> TestResult {
+        let cwd = std::env::current_dir().map_err(ctx("cwd"))?;
+        let ar = assemble_default_registry(cwd).map_err(ctx("assemble"))?;
 
         // Ohne Browser — auch unter Feature `browser` (W5 RD: nur mit Grant).
         let expected_tools = vec![
@@ -453,6 +465,7 @@ mod tests {
             "fs.search".to_owned(),
             "fs.glob".to_owned(),
             "fs.grep".to_owned(),
+            "doc.read_pdf".to_owned(),
             "shell.exec".to_owned(),
         ];
 
@@ -467,6 +480,7 @@ mod tests {
             ar.project.project_root.display().to_string()
         );
         assert_eq!(ar.registry.context_providers().len(), 1);
+        Ok(())
     }
 
     fn call(name: &str) -> ToolCall {
@@ -566,12 +580,13 @@ mod tests {
     }
 
     #[test]
-    fn no_builtin_role_advertises_a_tool_outside_its_registered_set() {
+    fn no_builtin_role_advertises_a_tool_outside_its_registered_set() -> TestResult {
         // Ohne `PLANNING_OPERATION_TOOLS` bewirbt keine Rolle mehr ein
         // Werkzeug, das ihre Registry nicht trägt — insbesondere nicht
         // `plan`/`goal` beim Planner, die im Kind nie einen Executor hatten.
         for role in role_names::ALL {
-            let profile = profile_for_role(role).expect("eingebaute Rolle braucht ein Profil");
+            let profile = profile_for_role(role)
+                .ok_or(TestError::Missing("eingebaute Rolle braucht ein Profil"))?;
             assert_eq!(
                 profile.tool_names(),
                 profile.registered_tool_names(),
@@ -590,10 +605,12 @@ mod tests {
             // `ApprovalActor` aus `Principal::approval_actor`
             // (`harw-runtime/src/spec.rs`), der eine Rückfrage tatsächlich
             // beantworten kann, statt dass sie unbeantwortet hängen bleibt.
-            let reducer = crate::authority::authority_reducer_for_role(role)
-                .unwrap_or_else(|| panic!("eingebaute Rolle {role} ohne Reducer"));
-            let is_documented_gated_exception =
-                !profile.required_permissions().is_subset_of(&reducer.ceiling());
+            let reducer = crate::authority::authority_reducer_for_role(role).ok_or_else(|| {
+                TestError::Unexpected(format!("eingebaute Rolle {role} ohne Reducer"))
+            })?;
+            let is_documented_gated_exception = !profile
+                .required_permissions()
+                .is_subset_of(&reducer.ceiling());
             for tool in profile.tool_names() {
                 let needs_approval = DefaultApprovalPolicy::requires_explicit_approval(&call(tool));
                 if needs_approval && is_documented_gated_exception {
@@ -607,6 +624,7 @@ mod tests {
                 );
             }
         }
+        Ok(())
     }
 
     // `review` liefert ein `ExtFuture` (`Pin<Box<dyn Future>>`), aber diese
@@ -615,13 +633,15 @@ mod tests {
     // `Waker::noop` genügt darum, um sie synchron im Test auszulesen — die
     // Crate verbietet `unsafe`, ein handgebauter RawWaker wäre hier ohnehin
     // nicht erlaubt.
-    fn block_on<T>(mut future: harw_extension_api::ExtFuture<'_, T>) -> T {
+    fn block_on<T>(mut future: harw_extension_api::ExtFuture<'_, T>) -> TestResult<T> {
         use std::task::{Context, Poll, Waker};
 
         let mut cx = Context::from_waker(Waker::noop());
         match future.as_mut().poll(&mut cx) {
-            Poll::Ready(value) => value,
-            Poll::Pending => panic!("review() future did not complete on first poll"),
+            Poll::Ready(value) => Ok(value),
+            Poll::Pending => Err(TestError::Unexpected(
+                "review() future did not complete on first poll".to_owned(),
+            )),
         }
     }
 
@@ -632,72 +652,76 @@ mod tests {
     // laufen.
 
     #[test]
-    fn review_in_always_ask_mode_asks_even_for_read_only_tools() {
+    fn review_in_always_ask_mode_asks_even_for_read_only_tools() -> TestResult {
         let policy = DefaultApprovalPolicy::new(ApprovalModeCell::new(ApprovalMode::AlwaysAsk));
 
         assert!(matches!(
-            block_on(policy.review(&call("fs.read"))),
+            block_on(policy.review(&call("fs.read")))?,
             ApprovalDecision::AskUser(_)
         ));
         assert!(matches!(
-            block_on(policy.review(&call("shell.exec"))),
+            block_on(policy.review(&call("shell.exec")))?,
             ApprovalDecision::AskUser(_)
         ));
+        Ok(())
     }
 
     #[test]
-    fn review_in_delegated_mode_allows_only_the_allowlist() {
+    fn review_in_delegated_mode_allows_only_the_allowlist() -> TestResult {
         let policy = DefaultApprovalPolicy::new(ApprovalModeCell::new(ApprovalMode::Delegated));
 
         assert!(matches!(
-            block_on(policy.review(&call("fs.read"))),
+            block_on(policy.review(&call("fs.read")))?,
             ApprovalDecision::Allow
         ));
         assert!(matches!(
-            block_on(policy.review(&call("shell.exec"))),
+            block_on(policy.review(&call("shell.exec")))?,
             ApprovalDecision::AskUser(_)
         ));
+        Ok(())
     }
 
     #[test]
-    fn review_in_full_access_mode_allows_everything() {
+    fn review_in_full_access_mode_allows_everything() -> TestResult {
         let policy = DefaultApprovalPolicy::new(ApprovalModeCell::new(ApprovalMode::FullAccess));
 
         assert!(matches!(
-            block_on(policy.review(&call("fs.read"))),
+            block_on(policy.review(&call("fs.read")))?,
             ApprovalDecision::Allow
         ));
         assert!(matches!(
-            block_on(policy.review(&call("shell.exec"))),
+            block_on(policy.review(&call("shell.exec")))?,
             ApprovalDecision::Allow
         ));
+        Ok(())
     }
 
     /// Die Zusage „der Modus wird bei jedem Aufruf frisch gelesen“: Ein
     /// `set` auf einem Klon der Zelle wirkt auf die bereits gebaute Politik,
     /// ohne dass sie neu montiert werden müsste.
     #[test]
-    fn review_reads_the_mode_cell_on_every_call() {
+    fn review_reads_the_mode_cell_on_every_call() -> TestResult {
         let cell = ApprovalModeCell::new(ApprovalMode::Delegated);
         let policy = DefaultApprovalPolicy::new(cell.clone());
         let mutating = call("shell.exec");
 
         assert!(matches!(
-            block_on(policy.review(&mutating)),
+            block_on(policy.review(&mutating))?,
             ApprovalDecision::AskUser(_)
         ));
 
         cell.set(ApprovalMode::FullAccess);
         assert!(
-            matches!(block_on(policy.review(&mutating)), ApprovalDecision::Allow),
+            matches!(block_on(policy.review(&mutating))?, ApprovalDecision::Allow),
             "die Umschaltung muss sofort wirken, nicht erst im nächsten Turn"
         );
 
         cell.set(ApprovalMode::AlwaysAsk);
         assert!(matches!(
-            block_on(policy.review(&call("fs.read"))),
+            block_on(policy.review(&call("fs.read")))?,
             ApprovalDecision::AskUser(_)
         ));
+        Ok(())
     }
 
     /// Eine Politik mit eigener Zelle darf von der Zelle einer anderen nichts
@@ -705,7 +729,7 @@ mod tests {
     /// weg musste (G-009): Ein Kind im Modus `FullAccess` hätte sonst den
     /// Root-Modus mitverändert und umgekehrt.
     #[test]
-    fn two_policies_with_separate_cells_do_not_influence_each_other() {
+    fn two_policies_with_separate_cells_do_not_influence_each_other() -> TestResult {
         let root_cell = ApprovalModeCell::new(ApprovalMode::Delegated);
         let child_cell = ApprovalModeCell::new(ApprovalMode::Delegated);
         let root = DefaultApprovalPolicy::new(root_cell.clone());
@@ -714,25 +738,26 @@ mod tests {
         root_cell.set(ApprovalMode::FullAccess);
 
         assert!(matches!(
-            block_on(root.review(&call("shell.exec"))),
+            block_on(root.review(&call("shell.exec")))?,
             ApprovalDecision::Allow
         ));
         assert!(matches!(
-            block_on(child.review(&call("shell.exec"))),
+            block_on(child.review(&call("shell.exec")))?,
             ApprovalDecision::AskUser(_)
         ));
+        Ok(())
     }
 
     /// Die zusammengebaute Registry muss genau die übergebene Zelle tragen —
     /// sonst wäre das Durchreichen durch [`assemble_registry_for_project`]
     /// wirkungslos.
     #[test]
-    fn assembled_registry_uses_the_approval_mode_cell_it_was_given() {
+    fn assembled_registry_uses_the_approval_mode_cell_it_was_given() -> TestResult {
         use harw_project_discovery::{DiscoveryConfig, discover_project};
 
-        let cwd = std::env::current_dir().expect("cwd");
-        let project =
-            discover_project(&cwd, &DiscoveryConfig::default()).expect("Discovery im Workspace");
+        let cwd = std::env::current_dir().map_err(ctx("cwd"))?;
+        let project = discover_project(&cwd, &DiscoveryConfig::default())
+            .map_err(ctx("Discovery im Workspace"))?;
 
         let cell = ApprovalModeCell::new(ApprovalMode::AlwaysAsk);
         let assembled = assemble_registry_for_project(
@@ -741,7 +766,7 @@ mod tests {
             IdentityOverrides::default(),
             cell.clone(),
         )
-        .expect("assemble");
+        .map_err(ctx("assemble"))?;
 
         let handlers = assembled.registry.approval_handlers();
         assert_eq!(handlers.len(), 1);
@@ -749,7 +774,7 @@ mod tests {
 
         assert!(
             matches!(
-                block_on(handler.review(&call("fs.read"))),
+                block_on(handler.review(&call("fs.read")))?,
                 ApprovalDecision::AskUser(_)
             ),
             "die Registry muss den Modus der übergebenen Zelle sehen"
@@ -758,17 +783,18 @@ mod tests {
         cell.set(ApprovalMode::FullAccess);
         assert!(
             matches!(
-                block_on(handler.review(&call("fs.read"))),
+                block_on(handler.review(&call("fs.read")))?,
                 ApprovalDecision::Allow
             ),
             "ein `set` auf der übergebenen Zelle muss die montierte Registry erreichen"
         );
+        Ok(())
     }
 
     /// Eine passende `Allow`-Regel gibt frei, ohne dass die Modus-Logik
     /// überhaupt gefragt würde — selbst wenn der Modus `AlwaysAsk` wäre.
     #[test]
-    fn review_allows_a_call_matching_an_allow_rule_without_asking() {
+    fn review_allows_a_call_matching_an_allow_rule_without_asking() -> TestResult {
         use harw_extension_api::allow_rules::{ApprovalRule, RuleDecision, RuleScope};
 
         let rules = AllowRuleSet::new();
@@ -787,16 +813,17 @@ mod tests {
         call.arguments = serde_json::json!({"command": "git status --short"});
 
         assert!(matches!(
-            block_on(policy.review(&call)),
+            block_on(policy.review(&call))?,
             ApprovalDecision::Allow
         ));
+        Ok(())
     }
 
     /// Eine `Deny`-Regel gewinnt über eine passende `Allow`-Regel und über
     /// den Modus `FullAccess` — beides würde ohne Regel automatisch
     /// freigeben.
     #[test]
-    fn review_deny_rule_beats_allow_rule_and_full_access_mode() {
+    fn review_deny_rule_beats_allow_rule_and_full_access_mode() -> TestResult {
         use harw_extension_api::allow_rules::{ApprovalRule, RuleDecision, RuleScope};
 
         let rules = AllowRuleSet::new();
@@ -821,9 +848,10 @@ mod tests {
         call.arguments = serde_json::json!({"command": "git push origin main"});
 
         assert!(matches!(
-            block_on(policy.review(&call)),
+            block_on(policy.review(&call))?,
             ApprovalDecision::AskUser(_)
         ));
+        Ok(())
     }
 
     /// Nachtrag K3, „Freigabe-Härtung“: `agents.write_uia` und
@@ -831,7 +859,8 @@ mod tests {
     /// `ApprovalMode::FullAccess` und selbst mit einer passenden `Allow`-Regel,
     /// die für jedes andere Werkzeug automatisch freigeben würde.
     #[test]
-    fn review_always_asks_for_uia_and_commit_proposal_even_under_full_access_and_an_allow_rule() {
+    fn review_always_asks_for_uia_and_commit_proposal_even_under_full_access_and_an_allow_rule()
+    -> TestResult {
         use harw_extension_api::allow_rules::{ApprovalRule, RuleDecision, RuleScope};
 
         for tool in ALWAYS_ASK_TOOLS {
@@ -848,27 +877,32 @@ mod tests {
             );
 
             assert!(
-                matches!(block_on(policy.review(&call(tool))), ApprovalDecision::AskUser(_)),
+                matches!(
+                    block_on(policy.review(&call(tool)))?,
+                    ApprovalDecision::AskUser(_)
+                ),
                 "{tool} muss trotz FullAccess und einer Allow-Regel nachfragen"
             );
         }
+        Ok(())
     }
 
     /// Ohne passende Regel bleibt die bisherige Modus-Logik unverändert in
     /// Kraft — `AllowRuleSet::new()` (leer) ändert nichts am Verhalten von
     /// [`DefaultApprovalPolicy::new`].
     #[test]
-    fn review_without_a_matching_rule_falls_back_to_mode_logic() {
+    fn review_without_a_matching_rule_falls_back_to_mode_logic() -> TestResult {
         let policy = DefaultApprovalPolicy::new(ApprovalModeCell::new(ApprovalMode::Delegated));
 
         assert!(matches!(
-            block_on(policy.review(&call("fs.read"))),
+            block_on(policy.review(&call("fs.read")))?,
             ApprovalDecision::Allow
         ));
         assert!(matches!(
-            block_on(policy.review(&call("shell.exec"))),
+            block_on(policy.review(&call("shell.exec")))?,
             ApprovalDecision::AskUser(_)
         ));
+        Ok(())
     }
 
     #[test]

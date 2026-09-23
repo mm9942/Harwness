@@ -429,6 +429,7 @@ impl ShortTermMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     /// Hilfsmethode: Gibt die Summe geschätzter Tokens für alle Einträge zurück.
     fn total_tokens_in(stm: &ShortTermMemory) -> usize {
@@ -527,17 +528,18 @@ mod tests {
     }
 
     #[test]
-    fn serde_roundtrip_entry() {
+    fn serde_roundtrip_entry() -> TestResult {
         let entry = StmEntry {
             at: OffsetDateTime::now_utc(),
             role: StmRole::Assistant,
             salience: 42,
             content: "Serde-Roundtrip-Test".to_owned(),
         };
-        let json = serde_json::to_string(&entry).expect("serialize");
-        let restored: StmEntry = serde_json::from_str(&json).expect("deserialize");
+        let json = serde_json::to_string(&entry).map_err(ctx("serialize"))?;
+        let restored: StmEntry = serde_json::from_str(&json).map_err(ctx("deserialize"))?;
         assert_eq!(restored.role, entry.role);
         assert_eq!(restored.salience, entry.salience);
         assert_eq!(restored.content, entry.content);
+        Ok(())
     }
 }

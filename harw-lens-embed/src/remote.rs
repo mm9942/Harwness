@@ -159,7 +159,10 @@ impl<B: RemoteEmbedBackend> RemoteEmbedder<B> {
     /// ```
     #[must_use]
     pub fn new(backend: B, dimensions: usize) -> Self {
-        Self { backend, dimensions }
+        Self {
+            backend,
+            dimensions,
+        }
     }
 }
 
@@ -185,10 +188,11 @@ impl<B: RemoteEmbedBackend> Embedder for RemoteEmbedder<B> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     /// Aufzeichnendes Test-Backend: hält jeden `embed_remote`-Aufruf fest,
     /// statt eine echte Netzverbindung aufzubauen. Das war zum Zeitpunkt von
@@ -225,8 +229,12 @@ mod tests {
             self.calls.load(Ordering::SeqCst)
         }
 
-        fn texts_seen(&self) -> Vec<String> {
-            self.seen_texts.lock().expect("lock poisoned").clone()
+        fn texts_seen(&self) -> TestResult<Vec<String>> {
+            Ok(self
+                .seen_texts
+                .lock()
+                .map_err(ctx("Mutex vergiftet"))?
+                .clone())
         }
     }
 
@@ -235,14 +243,19 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.seen_texts
                 .lock()
-                .expect("lock poisoned")
+                .map_err(|error| EmbedError::RemoteBackendFailed {
+                    reason: format!("lock poisoned: {error}"),
+                })?
                 .extend(texts.iter().cloned());
             if self.fail {
                 return Err(EmbedError::RemoteBackendFailed {
                     reason: "simulated transport failure".to_owned(),
                 });
             }
-            Ok(texts.iter().map(|_| vec![0.0_f32; self.dimensions]).collect())
+            Ok(texts
+                .iter()
+                .map(|_| vec![0.0_f32; self.dimensions])
+                .collect())
         }
     }
 
@@ -253,17 +266,18 @@ mod tests {
     }
 
     #[test]
-    fn test_remote_embedder_forwards_texts_to_backend() {
+    fn test_remote_embedder_forwards_texts_to_backend() -> TestResult {
         let embedder = RemoteEmbedder::new(RecordingBackend::new(4), 4);
         let vectors = embedder
             .embed(&["a".to_owned(), "b".to_owned()])
-            .expect("backend succeeds");
+            .map_err(ctx("backend succeeds"))?;
         assert_eq!(vectors.len(), 2);
         assert_eq!(vectors[0].len(), 4);
+        Ok(())
     }
 
     #[test]
-    fn test_recording_backend_records_exactly_the_texts_it_was_asked_to_embed() {
+    fn test_recording_backend_records_exactly_the_texts_it_was_asked_to_embed() -> TestResult {
         // Proves the recording test double itself is trustworthy: the
         // guarantee `harw-lens-source`'s tests rely on ("this text never
         // reached the remote backend") is only meaningful if the backend
@@ -271,13 +285,17 @@ mod tests {
         let backend = RecordingBackend::new(2);
         backend
             .embed_remote(&["hello".to_owned(), "world".to_owned()])
-            .expect("backend succeeds");
+            .map_err(ctx("backend succeeds"))?;
         assert_eq!(backend.calls(), 1);
-        assert_eq!(backend.texts_seen(), vec!["hello".to_owned(), "world".to_owned()]);
+        assert_eq!(
+            backend.texts_seen()?,
+            vec!["hello".to_owned(), "world".to_owned()]
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_remote_embedder_forwarding_is_transparent_to_call_count() {
+    fn test_remote_embedder_forwarding_is_transparent_to_call_count() -> TestResult {
         // `RemoteEmbedder::embed` must not add, drop, or batch calls beyond
         // a single forward to the backend.
         struct CountingWrapper {
@@ -296,12 +314,13 @@ mod tests {
         );
         embedder
             .embed(&["one".to_owned(), "two".to_owned(), "three".to_owned()])
-            .expect("backend succeeds");
+            .map_err(ctx("backend succeeds"))?;
         assert_eq!(embedder.backend.inner.calls(), 1);
         assert_eq!(
-            embedder.backend.inner.texts_seen(),
+            embedder.backend.inner.texts_seen()?,
             vec!["one".to_owned(), "two".to_owned(), "three".to_owned()]
         );
+        Ok(())
     }
 
     #[test]

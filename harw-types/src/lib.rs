@@ -26,14 +26,17 @@ pub mod reasoning;
 pub mod roles;
 pub mod usage;
 
+#[cfg(test)]
+mod test_support;
+
 pub use clock::{Clock, SystemClock};
 pub use confidence::Confidence;
 pub use digest::ContentDigest;
 pub use error::{ImpactAssessmentError, InvalidDigest, InvalidId};
 pub use ids::{
     ActionId, ApprovalActor, ApprovalId, BaselineId, CgroupId, ChannelId, FindingId, HostId,
-    ItemId, PeerId, SensorId, SessionId, TenantId, ThreadId, ThreadRef, ToolCallId, TurnId,
-    WorkId, WorkspaceId,
+    ItemId, PeerId, SensorId, SessionId, TenantId, ThreadId, ThreadRef, ToolCallId, TurnId, WorkId,
+    WorkspaceId,
 };
 pub use impact::{ImpactAssessment, ImpactConfidence, ImpactDomain, ImpactSeverity};
 pub use principal::{IngressSurface, PermissionTier, Principal, PrincipalKind};
@@ -48,6 +51,7 @@ pub use usage::TokenUsage;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestResult;
 
     macro_rules! assert_public_fallible_id_api_rejects_blank {
         ($id_type:ty) => {
@@ -80,9 +84,10 @@ mod tests {
     }
 
     #[test]
-    fn public_id_types_preserve_non_blank_values() {
-        assert_eq!(SessionId::parse(" session ").unwrap().as_str(), " session ");
-        assert_eq!(ProviderId::parse(" openai ").unwrap().as_str(), " openai ");
+    fn public_id_types_preserve_non_blank_values() -> TestResult {
+        assert_eq!(SessionId::parse(" session ")?.as_str(), " session ");
+        assert_eq!(ProviderId::parse(" openai ")?.as_str(), " openai ");
+        Ok(())
     }
 }
 

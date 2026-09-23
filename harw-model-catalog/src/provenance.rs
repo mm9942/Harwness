@@ -395,44 +395,45 @@ impl MetricEstimate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestResult;
     use time::OffsetDateTime;
 
     // ── Test 1 ────────────────────────────────────────────────────────────────
 
     /// `ConservativeDefault` serialisiert als `{"kind":"conservative_default"}`.
     #[test]
-    fn policy_origin_serde_kebab() {
+    fn policy_origin_serde_kebab() -> TestResult {
         let origin = PolicyOrigin::ConservativeDefault;
-        let json = serde_json::to_string(&origin).expect("Serialisierung fehlgeschlagen");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&json).expect("JSON-Parse fehlgeschlagen");
+        let json = serde_json::to_string(&origin)?;
+        let parsed: serde_json::Value = serde_json::from_str(&json)?;
         assert_eq!(parsed["kind"], "conservative_default");
+        Ok(())
     }
 
     // ── Test 2 ────────────────────────────────────────────────────────────────
 
     /// `PrimarySource` ohne optionale Felder deserialisiert korrekt.
     #[test]
-    fn primary_source_optional_fields() {
+    fn primary_source_optional_fields() -> TestResult {
         let json = r#"{"url":"https://example.com/docs"}"#;
-        let src: PrimarySource =
-            serde_json::from_str(json).expect("Deserialisierung fehlgeschlagen");
+        let src: PrimarySource = serde_json::from_str(json)?;
         assert_eq!(src.url, "https://example.com/docs");
         assert!(src.title.is_none());
         assert!(src.content_sha256.is_none());
+        Ok(())
     }
 
     // ── Test 3 ────────────────────────────────────────────────────────────────
 
     /// `EvidenceState::Unmeasured` übersteht einen JSON-Roundtrip.
     #[test]
-    fn evidence_state_serde() {
+    fn evidence_state_serde() -> TestResult {
         let state = EvidenceState::Unmeasured;
-        let json = serde_json::to_string(&state).expect("Serialisierung fehlgeschlagen");
-        let restored: EvidenceState =
-            serde_json::from_str(&json).expect("Deserialisierung fehlgeschlagen");
+        let json = serde_json::to_string(&state)?;
+        let restored: EvidenceState = serde_json::from_str(&json)?;
         assert_eq!(state, restored);
         assert_eq!(json, "\"unmeasured\"");
+        Ok(())
     }
 
     // ── Test 4 ────────────────────────────────────────────────────────────────
@@ -529,12 +530,11 @@ mod tests {
 
     /// `MetricEstimate` übersteht einen vollständigen JSON-Roundtrip.
     #[test]
-    fn metric_serde_roundtrip() {
+    fn metric_serde_roundtrip() -> TestResult {
         let now = OffsetDateTime::now_utc();
         let original = MetricEstimate::measured(55, 20, Confidence::VeryHigh, now);
-        let json = serde_json::to_string(&original).expect("Serialisierung fehlgeschlagen");
-        let restored: MetricEstimate =
-            serde_json::from_str(&json).expect("Deserialisierung fehlgeschlagen");
+        let json = serde_json::to_string(&original)?;
+        let restored: MetricEstimate = serde_json::from_str(&json)?;
         assert_eq!(original.value, restored.value);
         assert_eq!(original.confidence, restored.confidence);
         assert_eq!(original.samples, restored.samples);
@@ -544,5 +544,6 @@ mod tests {
             original.last_updated.map(|t| t.unix_timestamp()),
             restored.last_updated.map(|t| t.unix_timestamp())
         );
+        Ok(())
     }
 }

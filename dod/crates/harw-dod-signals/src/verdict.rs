@@ -482,9 +482,10 @@ pub fn parse_and_validate_verdict(raw: &str) -> Result<SecurityVerdict, SignalsE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
-    fn finding(id: &str) -> FindingId {
-        FindingId::try_from_str(id).expect("non-empty id")
+    fn finding(id: &str) -> TestResult<FindingId> {
+        FindingId::try_from_str(id).map_err(ctx("non-empty id"))
     }
 
     fn sample(
@@ -507,44 +508,47 @@ mod tests {
     // -- Konstruktion setzt immer die aktuelle Vertragsfassung --------------
 
     #[test]
-    fn test_new_always_sets_current_contract_id() {
+    fn test_new_always_sets_current_contract_id() -> TestResult {
         let verdict = sample(
-            finding("finding-1"),
+            finding("finding-1")?,
             ContentDigest::of(b"evidence"),
             VerdictClassification::Benign,
         );
         assert_eq!(verdict.contract(), SecurityVerdict::CONTRACT_ID);
+        Ok(())
     }
 
     // -- Rundlauf / deny_unknown_fields ---------------------------------------
 
     #[test]
-    fn test_serde_roundtrip() {
+    fn test_serde_roundtrip() -> TestResult {
         let verdict = sample(
-            finding("finding-1"),
+            finding("finding-1")?,
             ContentDigest::of(b"evidence"),
             VerdictClassification::Suspicious,
         );
-        let json = serde_json::to_string(&verdict).expect("serializes");
+        let json = serde_json::to_string(&verdict).map_err(ctx("serializes"))?;
         let round_tripped: SecurityVerdict =
-            serde_json::from_str(&json).expect("deserializes");
+            serde_json::from_str(&json).map_err(ctx("deserializes"))?;
         assert_eq!(round_tripped, verdict);
+        Ok(())
     }
 
     #[test]
-    fn test_rejects_unknown_field() {
+    fn test_rejects_unknown_field() -> TestResult {
         let verdict = sample(
-            finding("finding-1"),
+            finding("finding-1")?,
             ContentDigest::of(b"evidence"),
             VerdictClassification::Suspicious,
         );
-        let mut value = serde_json::to_value(&verdict).expect("serializes");
+        let mut value = serde_json::to_value(&verdict).map_err(ctx("serializes"))?;
         value
             .as_object_mut()
-            .expect("object")
+            .ok_or(TestError::Missing("object"))?
             .insert("extra".to_string(), serde_json::Value::Bool(true));
         let result: Result<SecurityVerdict, _> = serde_json::from_value(value);
         assert!(result.is_err());
+        Ok(())
     }
 
     // -- binds(): der wichtigste Test dieses Knotens --------------------------
@@ -556,17 +560,18 @@ mod tests {
     // diesen öffentlichen Weg erkennbar sein.
 
     #[test]
-    fn test_binds_accepts_matching_finding_and_digest() {
-        let f = finding("finding-1");
+    fn test_binds_accepts_matching_finding_and_digest() -> TestResult {
+        let f = finding("finding-1")?;
         let digest = ContentDigest::of(b"evidence-for-finding-1");
         let verdict = sample(f.clone(), digest, VerdictClassification::Confirmed);
 
         assert!(verdict.binds(&f, digest).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_binds_rejects_verdict_bound_to_different_finding() {
-        let bound_finding = finding("finding-1");
+    fn test_binds_rejects_verdict_bound_to_different_finding() -> TestResult {
+        let bound_finding = finding("finding-1")?;
         let digest = ContentDigest::of(b"evidence-for-finding-1");
         let verdict = sample(bound_finding, digest, VerdictClassification::Confirmed);
 
@@ -574,14 +579,17 @@ mod tests {
         // Belegdigest (z. B. weil zwei Befunde zufällig denselben Beleg
         // referenzieren) — die Bindung muss trotzdem scheitern, weil das
         // Verdikt nicht für diesen Befund ausgestellt wurde.
-        let other_finding = finding("finding-2");
-        let err = verdict.binds(&other_finding, digest).unwrap_err();
+        let other_finding = finding("finding-2")?;
+        let Err(err) = verdict.binds(&other_finding, digest) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, SignalsError::VerdictBindingMismatch));
+        Ok(())
     }
 
     #[test]
-    fn test_binds_rejects_verdict_bound_to_different_evidence() {
-        let f = finding("finding-1");
+    fn test_binds_rejects_verdict_bound_to_different_evidence() -> TestResult {
+        let f = finding("finding-1")?;
         let bound_digest = ContentDigest::of(b"evidence-for-finding-1");
         let verdict = sample(f.clone(), bound_digest, VerdictClassification::Confirmed);
 
@@ -589,14 +597,17 @@ mod tests {
         // (der Beleg hat sich seither geändert, oder das Verdikt gehört zu
         // einem älteren Beleg desselben Befunds) — muss ebenfalls scheitern.
         let recipients_own_digest = ContentDigest::of(b"a-newer-evidence-capture");
-        let err = verdict.binds(&f, recipients_own_digest).unwrap_err();
+        let Err(err) = verdict.binds(&f, recipients_own_digest) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, SignalsError::VerdictBindingMismatch));
+        Ok(())
     }
 
     // -- Versionierung: unbekannte Fassung wird erkannt, nicht geraten --------
 
     #[test]
-    fn test_parse_verdict_rejects_wrong_contract_id() {
+    fn test_parse_verdict_rejects_wrong_contract_id() -> TestResult {
         let raw = r#"{
             "contract": "harwness.security-verdict/v2",
             "finding": "finding-1",
@@ -607,15 +618,15 @@ mod tests {
             "issued_by": "security-triage-1",
             "issued_at": "1970-01-01T00:00:00Z"
         }"#;
-        let err = parse_verdict(raw).unwrap_err();
-        assert!(matches!(
-            err,
-            SignalsError::VerdictUnknownContractVersion
-        ));
+        let Err(err) = parse_verdict(raw) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        assert!(matches!(err, SignalsError::VerdictUnknownContractVersion));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_verdict_accepts_current_contract_id() {
+    fn test_parse_verdict_accepts_current_contract_id() -> TestResult {
         let raw = r#"{
             "contract": "harwness.security-verdict/v1",
             "finding": "finding-1",
@@ -626,69 +637,81 @@ mod tests {
             "issued_by": "security-triage-1",
             "issued_at": "1970-01-01T00:00:00Z"
         }"#;
-        let verdict = parse_verdict(raw).expect("parses");
+        let verdict = parse_verdict(raw).map_err(ctx("parses"))?;
         assert_eq!(verdict.classification(), VerdictClassification::Benign);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_verdict_tolerates_json_code_fence() {
+    fn test_parse_verdict_tolerates_json_code_fence() -> TestResult {
         let raw = "```json\n{\"contract\":\"harwness.security-verdict/v1\",\
                    \"finding\":\"finding-1\",\"bound_evidence\":\
                    \"0000000000000000000000000000000000000000000000000000000000000000\",\
                    \"classification\":\"suspicious\",\"severity\":\"low\",\
                    \"rationale\":\"x\",\"issued_by\":\"a\",\
                    \"issued_at\":\"1970-01-01T00:00:00Z\"}\n```";
-        let verdict = parse_verdict(raw).expect("parses");
+        let verdict = parse_verdict(raw).map_err(ctx("parses"))?;
         assert_eq!(verdict.classification(), VerdictClassification::Suspicious);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_verdict_malformed_json_is_content_free() {
-        let err = parse_verdict("not json at all, contains SECRET_TOKEN_123").unwrap_err();
+    fn test_parse_verdict_malformed_json_is_content_free() -> TestResult {
+        let Err(err) = parse_verdict("not json at all, contains SECRET_TOKEN_123") else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, SignalsError::VerdictMalformed));
         // Die Ablehnung sagt "dass", nicht "was": der Rohtext taucht nicht
         // in der Display-Ausgabe auf.
         assert!(!err.to_string().contains("SECRET_TOKEN_123"));
+        Ok(())
     }
 
     // -- Validierung -----------------------------------------------------------
 
     #[test]
-    fn test_validate_verdict_rejects_empty_rationale() {
+    fn test_validate_verdict_rejects_empty_rationale() -> TestResult {
         let mut verdict = sample(
-            finding("finding-1"),
+            finding("finding-1")?,
             ContentDigest::of(b"evidence"),
             VerdictClassification::Benign,
         );
         verdict.rationale = "   ".to_owned();
-        let err = validate_verdict(&verdict).unwrap_err();
+        let Err(err) = validate_verdict(&verdict) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, SignalsError::VerdictEmptyField));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_verdict_rejects_empty_issued_by() {
+    fn test_validate_verdict_rejects_empty_issued_by() -> TestResult {
         let mut verdict = sample(
-            finding("finding-1"),
+            finding("finding-1")?,
             ContentDigest::of(b"evidence"),
             VerdictClassification::Benign,
         );
         verdict.issued_by = "".to_owned();
-        let err = validate_verdict(&verdict).unwrap_err();
+        let Err(err) = validate_verdict(&verdict) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, SignalsError::VerdictEmptyField));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_verdict_accepts_well_formed_verdict() {
+    fn test_validate_verdict_accepts_well_formed_verdict() -> TestResult {
         let verdict = sample(
-            finding("finding-1"),
+            finding("finding-1")?,
             ContentDigest::of(b"evidence"),
             VerdictClassification::Suspicious,
         );
         assert!(validate_verdict(&verdict).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_parse_and_validate_end_to_end() {
+    fn test_parse_and_validate_end_to_end() -> TestResult {
         let raw = r#"{
             "contract": "harwness.security-verdict/v1",
             "finding": "finding-1",
@@ -700,9 +723,13 @@ mod tests {
             "issued_by": "security-triage-1",
             "issued_at": "1970-01-01T00:00:00Z"
         }"#;
-        let verdict = parse_and_validate_verdict(raw).expect("parses and validates");
+        let verdict = parse_and_validate_verdict(raw).map_err(ctx("parses and validates"))?;
         assert_eq!(verdict.classification(), VerdictClassification::Confirmed);
-        assert_eq!(verdict.suggested_response(), Some(SuggestedResponse::Contain));
+        assert_eq!(
+            verdict.suggested_response(),
+            Some(SuggestedResponse::Contain)
+        );
+        Ok(())
     }
 
     // -- Kein Weg von einem Verdikt zu einer autorisierten Aktion -------------
@@ -716,9 +743,9 @@ mod tests {
     // taugt also nicht als Aktion, selbst wenn ein Aufrufer eine Übersetzung
     // versuchen wollte.
     #[test]
-    fn test_suggested_response_carries_no_action_target() {
+    fn test_suggested_response_carries_no_action_target() -> TestResult {
         let verdict = SecurityVerdict::new(
-            finding("finding-1"),
+            finding("finding-1")?,
             ContentDigest::of(b"evidence"),
             VerdictClassification::Confirmed,
             Severity::Critical,
@@ -730,8 +757,10 @@ mod tests {
         // Die Vorschlagsform serialisiert als reiner Kategorie-String — kein
         // Objekt, das ein Ziel (cgroup/pid/host) tragen könnte, das sich zu
         // einer konkreten Aktion zusammensetzen ließe.
-        let plain = serde_json::to_value(verdict.suggested_response()).expect("serializes");
+        let plain =
+            serde_json::to_value(verdict.suggested_response()).map_err(ctx("serializes"))?;
         assert_eq!(plain, serde_json::json!("contain"));
         assert!(plain.is_string());
+        Ok(())
     }
 }

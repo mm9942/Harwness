@@ -197,7 +197,11 @@ impl HttpEmbedBackend {
     /// let _ = backend;
     /// ```
     #[must_use]
-    pub fn new(base_url: impl Into<String>, model: impl Into<String>, api_key: SecretString) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        api_key: SecretString,
+    ) -> Self {
         Self {
             client: reqwest::blocking::Client::new(),
             base_url: base_url.into(),
@@ -264,22 +268,23 @@ impl RemoteEmbedBackend for HttpEmbedBackend {
             })?;
 
         let status = response.status();
-        let response_text = response.text().map_err(|error| EmbedError::RemoteBackendFailed {
-            reason: format!("failed to read response body: {error}"),
-        })?;
+        let response_text = response
+            .text()
+            .map_err(|error| EmbedError::RemoteBackendFailed {
+                reason: format!("failed to read response body: {error}"),
+            })?;
 
         if !status.is_success() {
             return Err(EmbedError::RemoteBackendFailed {
-                reason: format!(
-                    "HTTP {status}: {}",
-                    error_body_snippet(&response_text)
-                ),
+                reason: format!("HTTP {status}: {}", error_body_snippet(&response_text)),
             });
         }
 
         let parsed: EmbeddingsResponseBody =
-            serde_json::from_str(&response_text).map_err(|error| EmbedError::RemoteBackendFailed {
-                reason: format!("invalid response JSON: {error}"),
+            serde_json::from_str(&response_text).map_err(|error| {
+                EmbedError::RemoteBackendFailed {
+                    reason: format!("invalid response JSON: {error}"),
+                }
             })?;
 
         let mut ordered: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
@@ -301,7 +306,9 @@ impl RemoteEmbedBackend for HttpEmbedBackend {
             .enumerate()
             .map(|(index, vector)| {
                 vector.ok_or_else(|| EmbedError::RemoteBackendFailed {
-                    reason: format!("response did not include an embedding for input index {index}"),
+                    reason: format!(
+                        "response did not include an embedding for input index {index}"
+                    ),
                 })
             })
             .collect()
@@ -315,38 +322,55 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::catalog::{route, EmbeddingCatalog, EmbeddingRole};
+    use crate::catalog::{EmbeddingCatalog, EmbeddingRole, route};
     use crate::embedder::Embedder;
     use crate::remote::RemoteEmbedder;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_lens_types::Locality;
 
     /// Startet einen minimalen In-Process-HTTP-Mock, der genau eine Anfrage
     /// beantwortet -- keine echte Netzverbindung nach außen, wie von der
     /// Auflage dieses Knotens verlangt (`127.0.0.1`, Port 0 = vom OS
     /// zugewiesen, nie verlassen).
-    fn mock_server(status_line: &str, body: &str) -> (String, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
-        let base_url = format!("http://{}", listener.local_addr().expect("mock address"));
+    fn mock_server(
+        status_line: &str,
+        body: &str,
+    ) -> TestResult<(String, thread::JoinHandle<TestResult>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("bind mock server"))?;
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().map_err(ctx("mock address"))?
+        );
         let response = format!(
             "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         );
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept mock request");
+        let handle = thread::spawn(move || -> TestResult {
+            let (mut stream, _) = listener.accept().map_err(ctx("accept mock request"))?;
             let mut buffer = [0_u8; 4096];
             // Die Anfrage wird gelesen, aber verworfen: ohne das Lesen
             // schließt der Client die Verbindung nie sauber, weil er auf
             // eine Antwort wartet, während der Server noch liest.
-            let _ = stream.read(&mut buffer).expect("read mock request");
+            let _ = stream.read(&mut buffer).map_err(ctx("read mock request"))?;
             stream
                 .write_all(response.as_bytes())
-                .expect("write mock response");
+                .map_err(ctx("write mock response"))?;
+            Ok(())
         });
-        (base_url, handle)
+        Ok((base_url, handle))
+    }
+
+    /// Joint den Mock-Server-Thread und meldet einen Thread-Panic oder einen
+    /// Fehler innerhalb des Threads als `Err` statt als Panik.
+    fn join_mock_server(server: thread::JoinHandle<TestResult>) -> TestResult {
+        server
+            .join()
+            .map_err(|_| TestError::Unexpected("mock server thread panicked".to_owned()))??;
+        Ok(())
     }
 
     #[test]
-    fn test_http_embed_backend_parses_reordered_response() {
+    fn test_http_embed_backend_parses_reordered_response() -> TestResult {
         // Der Server liefert die Einträge absichtlich in vertauschter
         // Reihenfolge (index 1 vor index 0) -- die Zuordnung muss trotzdem
         // stimmen.
@@ -357,86 +381,100 @@ mod tests {
             ]
         })
         .to_string();
-        let (base_url, server) = mock_server("HTTP/1.1 200 OK", &body);
+        let (base_url, server) = mock_server("HTTP/1.1 200 OK", &body)?;
 
         let backend = HttpEmbedBackend::new(base_url, "test-model", SecretString::new("k".into()));
         let vectors = backend
             .embed_remote(&["first".to_owned(), "second".to_owned()])
-            .expect("mock succeeds");
+            .map_err(ctx("mock succeeds"))?;
 
         assert_eq!(vectors, vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
-        server.join().expect("mock server completes");
+        join_mock_server(server)
     }
 
     #[test]
-    fn test_http_embed_backend_reports_non_success_status() {
+    fn test_http_embed_backend_reports_non_success_status() -> TestResult {
         let (base_url, server) = mock_server(
             "HTTP/1.1 401 Unauthorized",
             r#"{"error":"invalid api key"}"#,
-        );
+        )?;
 
         let backend = HttpEmbedBackend::new(base_url, "test-model", SecretString::new("k".into()));
-        let error = backend
-            .embed_remote(&["x".to_owned()])
-            .expect_err("non-2xx status must fail");
+        let result = backend.embed_remote(&["x".to_owned()]);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected("non-2xx status must fail".to_owned()));
+        };
 
+        let error_repr = format!("{error:?}");
         let EmbedError::RemoteBackendFailed { reason } = error else {
-            panic!("expected RemoteBackendFailed");
+            return Err(TestError::Unexpected(format!(
+                "expected RemoteBackendFailed, got {error_repr}"
+            )));
         };
         assert!(reason.contains("401"));
         assert!(reason.contains("invalid api key"));
-        server.join().expect("mock server completes");
+        join_mock_server(server)
     }
 
     #[test]
-    fn test_http_embed_backend_reports_missing_index_entry() {
+    fn test_http_embed_backend_reports_missing_index_entry() -> TestResult {
         // Nur ein Eintrag fuer zwei angefragte Texte -- Index 1 fehlt.
         let body = serde_json::json!({
             "data": [{"index": 0, "embedding": [1.0]}]
         })
         .to_string();
-        let (base_url, server) = mock_server("HTTP/1.1 200 OK", &body);
+        let (base_url, server) = mock_server("HTTP/1.1 200 OK", &body)?;
 
         let backend = HttpEmbedBackend::new(base_url, "test-model", SecretString::new("k".into()));
-        let error = backend
-            .embed_remote(&["a".to_owned(), "b".to_owned()])
-            .expect_err("missing entry must fail, not silently pad");
+        let result = backend.embed_remote(&["a".to_owned(), "b".to_owned()]);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "missing entry must fail, not silently pad".to_owned(),
+            ));
+        };
 
+        let error_repr = format!("{error:?}");
         let EmbedError::RemoteBackendFailed { reason } = error else {
-            panic!("expected RemoteBackendFailed");
+            return Err(TestError::Unexpected(format!(
+                "expected RemoteBackendFailed, got {error_repr}"
+            )));
         };
         assert!(reason.contains('1'));
-        server.join().expect("mock server completes");
+        join_mock_server(server)
     }
 
     #[test]
-    fn test_http_embed_backend_reports_out_of_range_index() {
+    fn test_http_embed_backend_reports_out_of_range_index() -> TestResult {
         let body = serde_json::json!({
             "data": [{"index": 5, "embedding": [1.0]}]
         })
         .to_string();
-        let (base_url, server) = mock_server("HTTP/1.1 200 OK", &body);
+        let (base_url, server) = mock_server("HTTP/1.1 200 OK", &body)?;
 
         let backend = HttpEmbedBackend::new(base_url, "test-model", SecretString::new("k".into()));
-        let error = backend
-            .embed_remote(&["only-one".to_owned()])
-            .expect_err("out-of-range index must fail closed");
+        let result = backend.embed_remote(&["only-one".to_owned()]);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "out-of-range index must fail closed".to_owned(),
+            ));
+        };
 
         assert!(matches!(error, EmbedError::RemoteBackendFailed { .. }));
-        server.join().expect("mock server completes");
+        join_mock_server(server)
     }
 
     #[test]
-    fn test_http_embed_backend_reports_invalid_json() {
-        let (base_url, server) = mock_server("HTTP/1.1 200 OK", "not json");
+    fn test_http_embed_backend_reports_invalid_json() -> TestResult {
+        let (base_url, server) = mock_server("HTTP/1.1 200 OK", "not json")?;
 
         let backend = HttpEmbedBackend::new(base_url, "test-model", SecretString::new("k".into()));
-        let error = backend
-            .embed_remote(&["x".to_owned()])
-            .expect_err("invalid JSON must fail");
+        let result = backend.embed_remote(&["x".to_owned()]);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected("invalid JSON must fail".to_owned()));
+        };
 
         assert!(matches!(error, EmbedError::RemoteBackendFailed { .. }));
-        server.join().expect("mock server completes");
+        join_mock_server(server)
     }
 
     #[test]
@@ -445,7 +483,8 @@ mod tests {
         // Backend tut, bleibt `locality()` fest auf `Remote` -- ein
         // `HttpEmbedBackend` kann diese Auskunft nicht überschreiben (siehe
         // `RemoteEmbedder`s Moduldoku).
-        let backend = HttpEmbedBackend::new("http://unused.invalid", "m", SecretString::new("k".into()));
+        let backend =
+            HttpEmbedBackend::new("http://unused.invalid", "m", SecretString::new("k".into()));
         let embedder = RemoteEmbedder::new(backend, 4);
         assert_eq!(embedder.locality(), Locality::Remote);
     }
@@ -459,7 +498,7 @@ mod tests {
     /// *echten* Netz-Backends die Fail-Closed-Garantie von
     /// [`crate::catalog::route`] nicht aufweicht.
     #[test]
-    fn test_confidential_role_never_selects_the_http_backed_remote_profile() {
+    fn test_confidential_role_never_selects_the_http_backed_remote_profile() -> TestResult {
         let toml_src = r#"
             [[model]]
             roles = ["confidential"]
@@ -499,10 +538,12 @@ mod tests {
             locality = "local"
             batch_size = 32
         "#;
-        let catalog = EmbeddingCatalog::parse(toml_src).expect("parses");
-        let profile = route(&catalog, EmbeddingRole::Confidential)
-            .expect("a local profile exists alongside the HTTP-backed remote one");
+        let catalog = EmbeddingCatalog::parse(toml_src).map_err(ctx("parses"))?;
+        let profile = route(&catalog, EmbeddingRole::Confidential).map_err(ctx(
+            "a local profile exists alongside the HTTP-backed remote one",
+        ))?;
         assert_eq!(profile.locality, Locality::Local);
         assert_eq!(profile.backend, "onnx-local");
+        Ok(())
     }
 }

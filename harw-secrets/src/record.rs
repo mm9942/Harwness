@@ -78,9 +78,10 @@ pub struct SecretMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestResult;
 
     #[test]
-    fn sealed_record_round_trips_without_plaintext_fields() {
+    fn sealed_record_round_trips_without_plaintext_fields() -> TestResult {
         let record = SecretRecord {
             id: SecretId::new(),
             envelope_format: SecretEnvelopeFormat::DekWrappedV2,
@@ -92,31 +93,30 @@ mod tests {
             key_version: KeyVersion(7),
         };
 
-        let encoded = serde_json::to_string(&record).expect("sealed record serializes");
+        let encoded = serde_json::to_string(&record)?;
         assert!(!encoded.contains("raw-secret-plaintext"));
         assert!(!encoded.contains("dek-plaintext"));
 
-        let decoded: SecretRecord =
-            serde_json::from_str(&encoded).expect("sealed record deserializes");
+        let decoded: SecretRecord = serde_json::from_str(&encoded)?;
         assert_eq!(decoded, record);
+        Ok(())
     }
 
     #[test]
-    fn envelope_format_uses_stable_v2_wire_name() {
+    fn envelope_format_uses_stable_v2_wire_name() -> TestResult {
         assert_eq!(
-            serde_json::to_string(&SecretEnvelopeFormat::DekWrappedV2)
-                .expect("serialize two-layer envelope format"),
+            serde_json::to_string(&SecretEnvelopeFormat::DekWrappedV2)?,
             r#""dek_wrapped_v2""#
         );
         assert_eq!(
-            serde_json::to_string(&SecretEnvelopeFormat::LegacyDirectHpke)
-                .expect("serialize legacy envelope format"),
+            serde_json::to_string(&SecretEnvelopeFormat::LegacyDirectHpke)?,
             r#""direct_hpke_v1""#
         );
+        Ok(())
     }
 
     #[test]
-    fn legacy_record_without_envelope_format_defaults_to_direct_hpke() {
+    fn legacy_record_without_envelope_format_defaults_to_direct_hpke() -> TestResult {
         let legacy_json = r#"{
             "id":"018f1c2e-4d5a-7b80-9123-456789abcdef",
             "ciphertext":[222,173,190,239],
@@ -127,21 +127,21 @@ mod tests {
             "key_version":7
         }"#;
 
-        let decoded: SecretRecord =
-            serde_json::from_str(legacy_json).expect("legacy record deserializes");
+        let decoded: SecretRecord = serde_json::from_str(legacy_json)?;
 
         assert_eq!(
             decoded.envelope_format,
             SecretEnvelopeFormat::LegacyDirectHpke
         );
         assert_eq!(
-            serde_json::to_string(&decoded).expect("legacy record reserializes"),
+            serde_json::to_string(&decoded)?,
             r#"{"id":"018f1c2e-4d5a-7b80-9123-456789abcdef","envelope_format":"direct_hpke_v1","ciphertext":[222,173,190,239],"nonce":[1,2,3],"wrapped_dek":[202,254,186,190],"kem_algo":"ml_kem_768_x25519","aead_algo":"x_chacha20_poly1305","key_version":7}"#
         );
+        Ok(())
     }
 
     #[test]
-    fn record_with_legacy_pure_ml_kem_deserializes_but_does_not_reserialize() {
+    fn record_with_legacy_pure_ml_kem_deserializes_but_does_not_reserialize() -> TestResult {
         let legacy_kem_json = r#"{
             "id":"018f1c2e-4d5a-7b80-9123-456789abcdef",
             "envelope_format":"dek_wrapped_v2",
@@ -153,16 +153,16 @@ mod tests {
             "key_version":3
         }"#;
 
-        let decoded: SecretRecord =
-            serde_json::from_str(legacy_kem_json).expect("legacy KEM record deserializes");
+        let decoded: SecretRecord = serde_json::from_str(legacy_kem_json)?;
 
         assert_eq!(decoded.kem_algo, KemAlgo::LegacyMlKem1024);
         assert!(decoded.kem_algo.is_legacy());
         assert!(serde_json::to_string(&decoded).is_err());
+        Ok(())
     }
 
     #[test]
-    fn metadata_round_trips_unchanged() {
+    fn metadata_round_trips_unchanged() -> TestResult {
         let now = Timestamp::now();
         let metadata = SecretMetadata {
             id: SecretId::new(),
@@ -173,9 +173,9 @@ mod tests {
             updated_at: now,
         };
 
-        let encoded = serde_json::to_string(&metadata).expect("metadata serializes");
-        let decoded: SecretMetadata =
-            serde_json::from_str(&encoded).expect("metadata deserializes");
+        let encoded = serde_json::to_string(&metadata)?;
+        let decoded: SecretMetadata = serde_json::from_str(&encoded)?;
         assert_eq!(decoded, metadata);
+        Ok(())
     }
 }

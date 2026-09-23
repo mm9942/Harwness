@@ -57,35 +57,44 @@ impl ModeSection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn test_mode_section_defaults_from_empty_toml() {
-        let section: ModeSection = toml::from_str("").unwrap();
+    fn test_mode_section_defaults_from_empty_toml() -> TestResult {
+        let section: ModeSection = toml::from_str("").map_err(ctx("leeres mode-toml parsen"))?;
         assert_eq!(section.default, "plan");
         assert_eq!(section, ModeSection::default());
+        Ok(())
     }
 
     #[test]
-    fn test_mode_section_full_toml_round_trip() {
+    fn test_mode_section_full_toml_round_trip() -> TestResult {
         let src = r#"
             default = "plan"
         "#;
-        let section: ModeSection = toml::from_str(src).unwrap();
+        let section: ModeSection = toml::from_str(src).map_err(ctx("mode-toml parsen"))?;
         assert_eq!(section.default, "plan");
 
-        let encoded = toml::to_string(&section).unwrap();
-        let decoded: ModeSection = toml::from_str(&encoded).unwrap();
+        let encoded = toml::to_string(&section).map_err(ctx("mode-toml serialisieren"))?;
+        let decoded: ModeSection =
+            toml::from_str(&encoded).map_err(ctx("serialisiertes mode-toml re-parsen"))?;
         assert_eq!(decoded, section);
+        Ok(())
     }
 
     #[test]
-    fn test_mode_section_rejects_unknown_field() {
+    fn test_mode_section_rejects_unknown_field() -> TestResult {
         let src = r#"
             default = "chat"
             defualt = "chat"
         "#;
-        let error = toml::from_str::<ModeSection>(src).unwrap_err();
+        let Err(error) = toml::from_str::<ModeSection>(src) else {
+            return Err(TestError::Unexpected(
+                "unbekanntes Feld wurde nicht abgelehnt".to_owned(),
+            ));
+        };
         assert!(error.to_string().contains("unknown field"));
+        Ok(())
     }
 
     #[test]
@@ -99,12 +108,17 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rejects_unknown_mode() {
+    fn test_validate_rejects_unknown_mode() -> TestResult {
         let section = ModeSection {
             default: "sleepwalk".to_owned(),
         };
-        let error = section.validate().unwrap_err();
+        let Err(error) = section.validate() else {
+            return Err(TestError::Unexpected(
+                "unbekannter Modus wurde nicht abgelehnt".to_owned(),
+            ));
+        };
         assert!(error.contains("sleepwalk"));
+        Ok(())
     }
 
     #[test]

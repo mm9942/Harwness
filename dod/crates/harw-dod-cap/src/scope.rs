@@ -644,6 +644,7 @@ fn lexical_resolve(base: &Path, target: &Path) -> Option<PathBuf> {
 mod tests {
     use super::{AliasRoot, AliasRootError, ReadScope, lexical_resolve};
     use crate::error::SensorError;
+    use crate::test_support::{TestError, TestResult, ctx};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -674,18 +675,18 @@ mod tests {
     }
 
     #[test]
-    fn test_intersection_keeps_only_identical_alias_roots() {
+    fn test_intersection_keeps_only_identical_alias_roots() -> TestResult {
         let thermal = AliasRoot::sysfs_class(PathBuf::from("/sys/class/thermal"))
-            .expect("valid alias root");
+            .map_err(ctx("valid alias root"))?;
         let other_prefix = AliasRoot::new(
             PathBuf::from("/sys/class/thermal"),
             PathBuf::from("/sys/devices/virtual"),
         )
-        .expect("valid alias root");
-        let block = AliasRoot::sysfs_class(PathBuf::from("/sys/block")).expect("valid alias root");
+        .map_err(ctx("valid alias root"))?;
+        let block =
+            AliasRoot::sysfs_class(PathBuf::from("/sys/block")).map_err(ctx("valid alias root"))?;
 
-        let a =
-            ReadScope::from_roots_and_aliases(Vec::<PathBuf>::new(), [thermal.clone(), block]);
+        let a = ReadScope::from_roots_and_aliases(Vec::<PathBuf>::new(), [thermal.clone(), block]);
         let b = ReadScope::from_roots_and_aliases(
             Vec::<PathBuf>::new(),
             [thermal.clone(), other_prefix],
@@ -694,6 +695,7 @@ mod tests {
 
         assert_eq!(ab.alias_roots().collect::<Vec<_>>(), vec![&thermal]);
         assert!(!ab.allows(Path::new("/sys/block/mmcblk0/stat")));
+        Ok(())
     }
 
     #[test]
@@ -728,68 +730,99 @@ mod tests {
     }
 
     #[test]
-    fn test_allows_alias_declared_but_not_resolved_prefix() {
-        let alias =
-            AliasRoot::sysfs_class(PathBuf::from("/sys/class/drm")).expect("valid alias root");
+    fn test_allows_alias_declared_but_not_resolved_prefix() -> TestResult {
+        let alias = AliasRoot::sysfs_class(PathBuf::from("/sys/class/drm"))
+            .map_err(ctx("valid alias root"))?;
         let scope = ReadScope::from_roots_and_aliases(Vec::<PathBuf>::new(), [alias]);
         assert!(scope.allows(Path::new("/sys/class/drm/card1/device")));
         assert!(!scope.allows(Path::new("/sys/devices/platform/axi/axi:gpu")));
+        Ok(())
     }
 
     #[test]
-    fn test_roots_lists_plain_roots_then_alias_declared_without_duplicates() {
-        let block = AliasRoot::sysfs_class(PathBuf::from("/sys/block")).expect("valid alias root");
-        let proc_alias =
-            AliasRoot::new(PathBuf::from("/proc"), PathBuf::from("/proc")).expect("valid alias");
+    fn test_roots_lists_plain_roots_then_alias_declared_without_duplicates() -> TestResult {
+        let block =
+            AliasRoot::sysfs_class(PathBuf::from("/sys/block")).map_err(ctx("valid alias root"))?;
+        let proc_alias = AliasRoot::new(PathBuf::from("/proc"), PathBuf::from("/proc"))
+            .map_err(ctx("valid alias"))?;
         let scope =
             ReadScope::from_roots_and_aliases([PathBuf::from("/proc")], [block, proc_alias]);
         assert_eq!(
             scope.roots().collect::<Vec<_>>(),
             vec![Path::new("/proc"), Path::new("/sys/block")]
         );
+        Ok(())
     }
 
     #[test]
-    fn test_alias_root_new_normalizes_trailing_and_double_slashes() {
-        let alias = AliasRoot::new(PathBuf::from("/sys//block/"), PathBuf::from("/sys/devices/"))
-            .expect("valid alias root");
+    fn test_alias_root_new_normalizes_trailing_and_double_slashes() -> TestResult {
+        let alias = AliasRoot::new(
+            PathBuf::from("/sys//block/"),
+            PathBuf::from("/sys/devices/"),
+        )
+        .map_err(ctx("valid alias root"))?;
         assert_eq!(alias.declared(), Path::new("/sys/block"));
         assert_eq!(alias.resolved_prefix(), Path::new("/sys/devices"));
+        Ok(())
     }
 
     #[test]
-    fn test_alias_root_new_rejects_relative_declared() {
-        let err = AliasRoot::new(PathBuf::from("sys/block"), PathBuf::from("/sys/devices"))
-            .expect_err("relative declared path must be rejected");
+    fn test_alias_root_new_rejects_relative_declared() -> TestResult {
+        let result = AliasRoot::new(PathBuf::from("sys/block"), PathBuf::from("/sys/devices"));
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "relative declared path must be rejected".to_owned(),
+            ));
+        };
         assert!(matches!(err, AliasRootError::DeclaredNotNormalized { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_alias_root_new_rejects_parent_dir_in_prefix() {
-        let err = AliasRoot::new(PathBuf::from("/sys/block"), PathBuf::from("/sys/devices/../.."))
-            .expect_err("'..' in resolved prefix must be rejected");
-        assert!(matches!(err, AliasRootError::ResolvedPrefixNotNormalized { .. }));
-    }
-
-    #[test]
-    fn test_alias_root_new_rejects_filesystem_root_prefix() {
-        let err = AliasRoot::new(PathBuf::from("/sys/block"), PathBuf::from("/"))
-            .expect_err("'/' as resolved prefix must be rejected");
+    fn test_alias_root_new_rejects_parent_dir_in_prefix() -> TestResult {
+        let result = AliasRoot::new(
+            PathBuf::from("/sys/block"),
+            PathBuf::from("/sys/devices/../.."),
+        );
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "'..' in resolved prefix must be rejected".to_owned(),
+            ));
+        };
         assert!(matches!(
             err,
-            AliasRootError::FilesystemRoot { which: "resolved prefix" }
+            AliasRootError::ResolvedPrefixNotNormalized { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_alias_root_new_rejects_filesystem_root_prefix() -> TestResult {
+        let result = AliasRoot::new(PathBuf::from("/sys/block"), PathBuf::from("/"));
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "'/' as resolved prefix must be rejected".to_owned(),
+            ));
+        };
+        assert!(matches!(
+            err,
+            AliasRootError::FilesystemRoot {
+                which: "resolved prefix"
+            }
         ));
         assert_eq!(
             err.to_string(),
             "alias root resolved prefix must not be the filesystem root '/'"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_alias_root_sysfs_class_uses_sys_devices() {
-        let alias =
-            AliasRoot::sysfs_class(PathBuf::from("/sys/class/thermal")).expect("valid alias root");
+    fn test_alias_root_sysfs_class_uses_sys_devices() -> TestResult {
+        let alias = AliasRoot::sysfs_class(PathBuf::from("/sys/class/thermal"))
+            .map_err(ctx("valid alias root"))?;
         assert_eq!(alias.resolved_prefix(), Path::new("/sys/devices"));
+        Ok(())
     }
 
     #[test]
@@ -806,44 +839,52 @@ mod tests {
 
     #[test]
     fn test_lexical_resolve_rejects_escape_above_root() {
-        assert_eq!(lexical_resolve(Path::new("/sys"), Path::new("../../../x")), None);
+        assert_eq!(
+            lexical_resolve(Path::new("/sys"), Path::new("../../../x")),
+            None
+        );
     }
 
     #[test]
-    fn test_open_reads_file_inside_scope() {
+    fn test_open_reads_file_inside_scope() -> TestResult {
         use std::io::Read;
 
-        let dir = tempfile::tempdir().expect("tempdir for scope root");
+        let dir = tempfile::tempdir().map_err(ctx("tempdir for scope root"))?;
         let file_path = dir.path().join("data.txt");
-        std::fs::write(&file_path, b"hello").expect("write fixture file");
+        std::fs::write(&file_path, b"hello").map_err(ctx("write fixture file"))?;
 
         let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
         let mut file = scope
             .open(&file_path)
-            .expect("open must succeed for a file inside the scope");
+            .map_err(ctx("open must succeed for a file inside the scope"))?;
 
         let mut contents = String::new();
-        file.read_to_string(&mut contents).expect("read fixture file");
+        file.read_to_string(&mut contents)
+            .map_err(ctx("read fixture file"))?;
         assert_eq!(contents, "hello");
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_open_symlink_outside_scope_returns_outside_scope_without_naming_target() {
+    fn test_open_symlink_outside_scope_returns_outside_scope_without_naming_target() -> TestResult {
         use std::os::unix::fs::symlink;
 
-        let inside = tempfile::tempdir().expect("tempdir as scope root");
-        let outside = tempfile::tempdir().expect("tempdir outside the scope");
+        let inside = tempfile::tempdir().map_err(ctx("tempdir as scope root"))?;
+        let outside = tempfile::tempdir().map_err(ctx("tempdir outside the scope"))?;
         let secret = outside.path().join("secret.txt");
-        std::fs::write(&secret, b"top secret").expect("write secret fixture file");
+        std::fs::write(&secret, b"top secret").map_err(ctx("write secret fixture file"))?;
 
         let link = inside.path().join("link-to-secret");
-        symlink(&secret, &link).expect("create symlink pointing outside the scope");
+        symlink(&secret, &link).map_err(ctx("create symlink pointing outside the scope"))?;
 
         let scope = ReadScope::from_roots([inside.path().to_path_buf()]);
-        let err = scope
-            .open(&link)
-            .expect_err("a symlink resolving outside the scope must be rejected");
+        let result = scope.open(&link);
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "a symlink resolving outside the scope must be rejected".to_owned(),
+            ));
+        };
 
         assert!(matches!(err, SensorError::OutsideScope));
 
@@ -854,6 +895,7 @@ mod tests {
         assert!(!message.contains("secret"));
         assert!(!message.contains(outside_display.as_str()));
         assert!(!message.contains(secret_display.as_str()));
+        Ok(())
     }
 
     /// Nachgebauter sysfs-Baum mit echten Symlinks, strukturgleich zum RPi 5
@@ -867,221 +909,279 @@ mod tests {
 
     #[cfg(unix)]
     impl SysTree {
-        fn new() -> Self {
+        fn new() -> TestResult<Self> {
             use std::fs;
             use std::os::unix::fs::symlink;
 
-            let dir = tempfile::tempdir().expect("tempdir for fake sysfs");
+            let dir = tempfile::tempdir().map_err(ctx("tempdir for fake sysfs"))?;
             // Kanonisieren, damit ein symlinktes Temp-Verzeichnis die
             // Alias-Regel 4 nicht verfälscht.
-            let base = dir.path().canonicalize().expect("canonical tempdir");
+            let base = dir
+                .path()
+                .canonicalize()
+                .map_err(ctx("canonical tempdir"))?;
             let sys = base.join("sys");
 
             let zone0 = sys.join("devices/virtual/thermal/thermal_zone0");
-            fs::create_dir_all(&zone0).expect("create zone0");
-            fs::write(zone0.join("temp"), "42000\n").expect("write temp");
+            fs::create_dir_all(&zone0).map_err(ctx("create zone0"))?;
+            fs::write(zone0.join("temp"), "42000\n").map_err(ctx("write temp"))?;
 
             let class = sys.join("class/thermal");
-            fs::create_dir_all(&class).expect("create class dir");
-            symlink("../../devices/virtual/thermal/thermal_zone0", class.join("thermal_zone0"))
-                .expect("class -> devices symlink");
+            fs::create_dir_all(&class).map_err(ctx("create class dir"))?;
+            symlink(
+                "../../devices/virtual/thermal/thermal_zone0",
+                class.join("thermal_zone0"),
+            )
+            .map_err(ctx("class -> devices symlink"))?;
 
             let gpu = sys.join("devices/platform/axi/axi:gpu");
             let card1 = gpu.join("drm/card1");
-            fs::create_dir_all(&card1).expect("create card1");
-            fs::write(gpu.join("gpu_busy_percent"), "7\n").expect("write busy");
-            symlink("../../../axi:gpu", card1.join("device")).expect("device symlink");
+            fs::create_dir_all(&card1).map_err(ctx("create card1"))?;
+            fs::write(gpu.join("gpu_busy_percent"), "7\n").map_err(ctx("write busy"))?;
+            symlink("../../../axi:gpu", card1.join("device")).map_err(ctx("device symlink"))?;
             let drm = sys.join("class/drm");
-            fs::create_dir_all(&drm).expect("create drm class dir");
-            symlink("../../devices/platform/axi/axi:gpu/drm/card1", drm.join("card1"))
-                .expect("drm class symlink");
-            fs::write(drm.join("version"), "drm 1.1.0\n").expect("write version");
+            fs::create_dir_all(&drm).map_err(ctx("create drm class dir"))?;
+            symlink(
+                "../../devices/platform/axi/axi:gpu/drm/card1",
+                drm.join("card1"),
+            )
+            .map_err(ctx("drm class symlink"))?;
+            fs::write(drm.join("version"), "drm 1.1.0\n").map_err(ctx("write version"))?;
 
             let outside = base.join("outside");
-            fs::create_dir_all(&outside).expect("create outside");
-            fs::write(outside.join("secret"), "geheim\n").expect("write secret");
+            fs::create_dir_all(&outside).map_err(ctx("create outside"))?;
+            fs::write(outside.join("secret"), "geheim\n").map_err(ctx("write secret"))?;
 
-            Self { _dir: dir, base }
+            Ok(Self { _dir: dir, base })
         }
 
         fn sys(&self, rel: &str) -> PathBuf {
             self.base.join("sys").join(rel)
         }
 
-        fn thermal_scope(&self) -> ReadScope {
+        fn thermal_scope(&self) -> TestResult<ReadScope> {
             let alias = AliasRoot::new(self.sys("class/thermal"), self.sys("devices"))
-                .expect("valid alias root");
-            ReadScope::from_roots_and_aliases(Vec::<PathBuf>::new(), [alias])
+                .map_err(ctx("valid alias root"))?;
+            Ok(ReadScope::from_roots_and_aliases(
+                Vec::<PathBuf>::new(),
+                [alias],
+            ))
         }
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_resolve_plain_class_root_rejects_sysfs_symlink_regression_f005() {
-        let tree = SysTree::new();
+    fn test_resolve_plain_class_root_rejects_sysfs_symlink_regression_f005() -> TestResult {
+        let tree = SysTree::new()?;
         let scope = ReadScope::from_roots([tree.sys("class/thermal")]);
-        let err = scope
-            .resolve(&tree.sys("class/thermal/thermal_zone0/temp"))
-            .expect_err("plain class root must not follow into /sys/devices");
+        let result = scope.resolve(&tree.sys("class/thermal/thermal_zone0/temp"));
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "plain class root must not follow into /sys/devices".to_owned(),
+            ));
+        };
         assert!(matches!(err, SensorError::OutsideScope));
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_open_alias_class_entry_into_resolved_prefix_reads_value() {
+    fn test_open_alias_class_entry_into_resolved_prefix_reads_value() -> TestResult {
         use std::io::Read;
 
-        let tree = SysTree::new();
-        let scope = tree.thermal_scope();
+        let tree = SysTree::new()?;
+        let scope = tree.thermal_scope()?;
         let requested = tree.sys("class/thermal/thermal_zone0/temp");
 
-        let resolved = scope.resolve(&requested).expect("alias must admit class entry");
-        assert_eq!(resolved, tree.sys("devices/virtual/thermal/thermal_zone0/temp"));
+        let resolved = scope
+            .resolve(&requested)
+            .map_err(ctx("alias must admit class entry"))?;
+        assert_eq!(
+            resolved,
+            tree.sys("devices/virtual/thermal/thermal_zone0/temp")
+        );
 
         let mut content = String::new();
         scope
             .open(&requested)
-            .expect("open via alias")
+            .map_err(ctx("open via alias"))?
             .read_to_string(&mut content)
-            .expect("read temp");
+            .map_err(ctx("read temp"))?;
         assert_eq!(content, "42000\n");
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_resolve_alias_deeper_symlink_inside_prefix_is_admitted() {
-        let tree = SysTree::new();
+    fn test_resolve_alias_deeper_symlink_inside_prefix_is_admitted() -> TestResult {
+        let tree = SysTree::new()?;
         let alias = AliasRoot::new(tree.sys("class/drm"), tree.sys("devices"))
-            .expect("valid alias root");
+            .map_err(ctx("valid alias root"))?;
         let scope = ReadScope::from_roots_and_aliases(Vec::<PathBuf>::new(), [alias]);
 
         let resolved = scope
             .resolve(&tree.sys("class/drm/card1/device/gpu_busy_percent"))
-            .expect("card1/device stays inside /sys/devices");
-        assert_eq!(resolved, tree.sys("devices/platform/axi/axi:gpu/gpu_busy_percent"));
+            .map_err(ctx("card1/device stays inside /sys/devices"))?;
+        assert_eq!(
+            resolved,
+            tree.sys("devices/platform/axi/axi:gpu/gpu_busy_percent")
+        );
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_resolve_alias_regular_class_entry_is_admitted() {
-        let tree = SysTree::new();
+    fn test_resolve_alias_regular_class_entry_is_admitted() -> TestResult {
+        let tree = SysTree::new()?;
         let alias = AliasRoot::new(tree.sys("class/drm"), tree.sys("devices"))
-            .expect("valid alias root");
+            .map_err(ctx("valid alias root"))?;
         let scope = ReadScope::from_roots_and_aliases(Vec::<PathBuf>::new(), [alias]);
 
         let resolved = scope
             .resolve(&tree.sys("class/drm/version"))
-            .expect("regular file under declared is admitted");
+            .map_err(ctx("regular file under declared is admitted"))?;
         assert_eq!(resolved, tree.sys("class/drm/version"));
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_resolve_alias_pointing_outside_prefix_is_rejected() {
+    fn test_resolve_alias_pointing_outside_prefix_is_rejected() -> TestResult {
         use std::os::unix::fs::symlink;
 
-        let tree = SysTree::new();
+        let tree = SysTree::new()?;
         symlink("../../../outside", tree.sys("class/thermal/thermal_zone9"))
-            .expect("evil class symlink");
-        let scope = tree.thermal_scope();
+            .map_err(ctx("evil class symlink"))?;
+        let scope = tree.thermal_scope()?;
 
-        let err = scope
-            .resolve(&tree.sys("class/thermal/thermal_zone9/secret"))
-            .expect_err("alias target outside resolved prefix must be rejected");
+        let result = scope.resolve(&tree.sys("class/thermal/thermal_zone9/secret"));
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "alias target outside resolved prefix must be rejected".to_owned(),
+            ));
+        };
         assert!(matches!(err, SensorError::OutsideScope));
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_resolve_alias_double_symlink_is_rejected() {
+    fn test_resolve_alias_double_symlink_is_rejected() -> TestResult {
         use std::os::unix::fs::symlink;
 
-        let tree = SysTree::new();
+        let tree = SysTree::new()?;
         // devices/hop -> virtual/thermal/thermal_zone0 (zweite Ebene), und
         // class/thermal/thermal_zone1 -> ../../devices/hop (erste Ebene).
         symlink("virtual/thermal/thermal_zone0", tree.sys("devices/hop"))
-            .expect("second-level symlink");
+            .map_err(ctx("second-level symlink"))?;
         symlink("../../devices/hop", tree.sys("class/thermal/thermal_zone1"))
-            .expect("first-level symlink");
-        let scope = tree.thermal_scope();
+            .map_err(ctx("first-level symlink"))?;
+        let scope = tree.thermal_scope()?;
 
-        let err = scope
-            .resolve(&tree.sys("class/thermal/thermal_zone1/temp"))
-            .expect_err("symlink to symlink must be rejected even if the end is inside");
+        let result = scope.resolve(&tree.sys("class/thermal/thermal_zone1/temp"));
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "symlink to symlink must be rejected even if the end is inside".to_owned(),
+            ));
+        };
         assert!(matches!(err, SensorError::OutsideScope));
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_resolve_alias_target_through_symlinked_directory_outside_is_rejected() {
+    fn test_resolve_alias_target_through_symlinked_directory_outside_is_rejected() -> TestResult {
         use std::os::unix::fs::symlink;
 
-        let tree = SysTree::new();
-        symlink(tree.base.join("outside"), tree.sys("devices/jump")).expect("jump dir symlink");
-        symlink("../../devices/jump", tree.sys("class/thermal/thermal_zone2"))
-            .expect("class symlink via jump");
-        let scope = tree.thermal_scope();
+        let tree = SysTree::new()?;
+        symlink(tree.base.join("outside"), tree.sys("devices/jump"))
+            .map_err(ctx("jump dir symlink"))?;
+        symlink(
+            "../../devices/jump",
+            tree.sys("class/thermal/thermal_zone2"),
+        )
+        .map_err(ctx("class symlink via jump"))?;
+        let scope = tree.thermal_scope()?;
 
-        let err = scope
-            .resolve(&tree.sys("class/thermal/thermal_zone2/secret"))
-            .expect_err("target via symlinked directory must be rejected");
+        let result = scope.resolve(&tree.sys("class/thermal/thermal_zone2/secret"));
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "target via symlinked directory must be rejected".to_owned(),
+            ));
+        };
         assert!(matches!(err, SensorError::OutsideScope));
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_resolve_alias_deep_symlink_outside_is_rejected() {
+    fn test_resolve_alias_deep_symlink_outside_is_rejected() -> TestResult {
         use std::os::unix::fs::symlink;
 
-        let tree = SysTree::new();
+        let tree = SysTree::new()?;
         symlink(
             tree.base.join("outside/secret"),
             tree.sys("devices/virtual/thermal/thermal_zone0/leak"),
         )
-        .expect("deep evil symlink");
-        let scope = tree.thermal_scope();
+        .map_err(ctx("deep evil symlink"))?;
+        let scope = tree.thermal_scope()?;
 
-        let err = scope
-            .resolve(&tree.sys("class/thermal/thermal_zone0/leak"))
-            .expect_err("deep symlink outside must be rejected");
+        let result = scope.resolve(&tree.sys("class/thermal/thermal_zone0/leak"));
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "deep symlink outside must be rejected".to_owned(),
+            ));
+        };
         assert!(matches!(err, SensorError::OutsideScope));
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_resolve_alias_parent_dir_component_is_rejected() {
-        let tree = SysTree::new();
-        let scope = tree.thermal_scope();
+    fn test_resolve_alias_parent_dir_component_is_rejected() -> TestResult {
+        let tree = SysTree::new()?;
+        let scope = tree.thermal_scope()?;
 
-        let err = scope
-            .resolve(&tree.sys("class/thermal/thermal_zone0/../../../../outside/secret"))
-            .expect_err("'..' must be rejected before any resolution");
+        let result =
+            scope.resolve(&tree.sys("class/thermal/thermal_zone0/../../../../outside/secret"));
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "'..' must be rejected before any resolution".to_owned(),
+            ));
+        };
         assert!(matches!(err, SensorError::OutsideScope));
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_resolve_direct_resolved_prefix_path_is_rejected() {
-        let tree = SysTree::new();
-        let scope = tree.thermal_scope();
+    fn test_resolve_direct_resolved_prefix_path_is_rejected() -> TestResult {
+        let tree = SysTree::new()?;
+        let scope = tree.thermal_scope()?;
 
-        let err = scope
-            .resolve(&tree.sys("devices/virtual/thermal/thermal_zone0/temp"))
-            .expect_err("resolved prefix is not a request root");
+        let result = scope.resolve(&tree.sys("devices/virtual/thermal/thermal_zone0/temp"));
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "resolved prefix is not a request root".to_owned(),
+            ));
+        };
         assert!(matches!(err, SensorError::OutsideScope));
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_resolve_alias_missing_entry_returns_io() {
-        let tree = SysTree::new();
-        let scope = tree.thermal_scope();
+    fn test_resolve_alias_missing_entry_returns_io() -> TestResult {
+        let tree = SysTree::new()?;
+        let scope = tree.thermal_scope()?;
 
-        let err = scope
-            .resolve(&tree.sys("class/thermal/thermal_zone7/temp"))
-            .expect_err("missing entry must fail");
+        let result = scope.resolve(&tree.sys("class/thermal/thermal_zone7/temp"));
+        let Err(err) = result else {
+            return Err(TestError::Unexpected("missing entry must fail".to_owned()));
+        };
         assert!(
             matches!(err, SensorError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound)
         );
+        Ok(())
     }
 }

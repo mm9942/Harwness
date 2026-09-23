@@ -82,6 +82,9 @@ pub mod hop;
 pub mod html;
 pub mod provider;
 
+#[cfg(test)]
+mod test_support;
+
 pub use cache::{CacheEntry, CacheScope};
 pub use crates_io::{CrateSummary, CratesIoArgs, WebCratesIoTool, crates_io_url, summarize};
 pub use docs_rs::{DocsRsArgs, WebDocsRsTool, docs_rs_url, extract_main_content};

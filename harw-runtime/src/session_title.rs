@@ -51,8 +51,7 @@ const MAX_REPLY_CHARS: usize = 500;
 const MAX_TITLE_CHARS: usize = 80;
 
 /// System-Prompt für die Titelgenerierung (siehe „Schritt 7" der Spec).
-const TITLE_SYSTEM_PROMPT: &str =
-    "Erzeuge einen Titel mit 3-6 Wörtern in der Sprache des Nutzers. Nur der Titel, keine Anführungszeichen, kein Punkt.";
+const TITLE_SYSTEM_PROMPT: &str = "Erzeuge einen Titel mit 3-6 Wörtern in der Sprache des Nutzers. Nur der Titel, keine Anführungszeichen, kein Punkt.";
 
 /// Eingabe für [`generate_title`]: der Beginn einer Session, aus dem ein
 /// Titel destilliert werden soll.
@@ -124,7 +123,11 @@ pub async fn generate_title(
     .ok()?;
 
     let cleaned = clean_title(&raw);
-    if cleaned.is_empty() { None } else { Some(cleaned) }
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
 }
 
 /// Stellt sicher, dass eine Session einen Titel trägt, und liefert die
@@ -166,11 +169,20 @@ pub async fn ensure_title(
     model: &str,
 ) -> Result<SessionMeta, SessionTitleError> {
     let current = meta::load_or_derive(store_root, id)?;
-    if matches!(current.title_source, TitleSource::Model | TitleSource::Manual) {
+    if matches!(
+        current.title_source,
+        TitleSource::Model | TitleSource::Manual
+    ) {
         return Ok(current);
     }
 
     let first_user_message = current.first_user_message.clone().unwrap_or_default();
+    // Ohne erste Nutzernachricht gibt es nichts zu betiteln; ein leerer
+    // Fallback-Titel würde sonst als `title = ""` gespeichert und der Picker
+    // zeigte weiter „(ohne Titel)“.
+    if first_user_message.trim().is_empty() {
+        return Ok(current);
+    }
     let request = TitleRequest {
         session_id: id.clone(),
         first_user_message: first_user_message.clone(),
@@ -273,8 +285,13 @@ pub fn spawn_title_job(
             }
             None => (Arc::clone(&provider), model),
         };
-        if let Err(error) =
-            ensure_title(&store_root, &id, effective_provider.as_ref(), &effective_model).await
+        if let Err(error) = ensure_title(
+            &store_root,
+            &id,
+            effective_provider.as_ref(),
+            &effective_model,
+        )
+        .await
         {
             tracing::warn!(
                 session = %id,
@@ -316,6 +333,7 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_core::model::{ModelError, ModelFuture, ModelRequest, ModelResponse};
 
     /// Stub-Provider für die Tests dieses Moduls: liefert `reply`
@@ -336,95 +354,109 @@ mod tests {
         }
     }
 
-    fn runtime() -> tokio::runtime::Runtime {
+    fn runtime() -> TestResult<tokio::runtime::Runtime> {
         tokio::runtime::Builder::new_current_thread()
             .build()
-            .expect("current-thread runtime")
+            .map_err(ctx("current-thread runtime"))
     }
 
     /// Seeds a sidecar with a first user message, without this test module
     /// needing to name `jiff::Timestamp` itself (harw-runtime does not
     /// depend on `jiff` directly): the timestamps come untouched from
     /// [`meta::load_or_derive`]'s own fresh-`SessionMeta` construction.
-    fn seed_meta(root: &Path, id: &SessionId, first_user_message: &str) {
-        let mut current = meta::load_or_derive(root, id).expect("fresh meta derives");
+    fn seed_meta(root: &Path, id: &SessionId, first_user_message: &str) -> TestResult {
+        let mut current = meta::load_or_derive(root, id).map_err(ctx("fresh meta derives"))?;
         current.first_user_message = Some(first_user_message.to_owned());
-        meta::save(root, &current).expect("seed meta saves");
+        meta::save(root, &current).map_err(ctx("seed meta saves"))
     }
 
     #[test]
-    fn ensure_title_sets_a_model_title_on_success() {
-        let temp = tempfile::tempdir().unwrap();
+    fn ensure_title_sets_a_model_title_on_success() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let session = SessionId::from_str("session-a");
-        seed_meta(temp.path(), &session, "Wie baue ich einen Titel-Generator?");
+        seed_meta(temp.path(), &session, "Wie baue ich einen Titel-Generator?")?;
         let provider = StubProvider {
             reply: Ok("Titel Generator Bauen".to_owned()),
         };
 
-        let result = runtime()
+        let result = runtime()?
             .block_on(ensure_title(temp.path(), &session, &provider, "test-model"))
-            .expect("ensure_title succeeds");
+            .map_err(ctx("ensure_title succeeds"))?;
 
         assert_eq!(result.title_source, TitleSource::Model);
         assert_eq!(result.title.as_deref(), Some("Titel Generator Bauen"));
+        Ok(())
     }
 
     #[test]
-    fn ensure_title_falls_back_to_the_first_message_on_provider_error() {
-        let temp = tempfile::tempdir().unwrap();
+    fn ensure_title_falls_back_to_the_first_message_on_provider_error() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let session = SessionId::from_str("session-a");
-        seed_meta(temp.path(), &session, "Erste Nachricht als Fallback-Quelle");
+        seed_meta(temp.path(), &session, "Erste Nachricht als Fallback-Quelle")?;
         let provider = StubProvider { reply: Err(()) };
 
-        let result = runtime()
+        let result = runtime()?
             .block_on(ensure_title(temp.path(), &session, &provider, "test-model"))
-            .expect("ensure_title succeeds even on provider error");
+            .map_err(ctx("ensure_title succeeds even on provider error"))?;
 
         let expected_fallback = meta::fallback_title("Erste Nachricht als Fallback-Quelle");
         assert_eq!(result.title_source, TitleSource::Fallback);
         assert_eq!(result.title.as_deref(), Some(expected_fallback.as_str()));
+        Ok(())
     }
 
     #[test]
-    fn ensure_title_does_not_overwrite_an_existing_model_title() {
-        let temp = tempfile::tempdir().unwrap();
+    fn ensure_title_does_not_overwrite_an_existing_model_title() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let session = SessionId::from_str("session-a");
-        seed_meta(temp.path(), &session, "Erste Nachricht");
-        meta::set_title(temp.path(), &session, "Bestehender Titel", TitleSource::Model)
-            .expect("seed title");
+        seed_meta(temp.path(), &session, "Erste Nachricht")?;
+        meta::set_title(
+            temp.path(),
+            &session,
+            "Bestehender Titel",
+            TitleSource::Model,
+        )
+        .map_err(ctx("seed title"))?;
         let provider = StubProvider {
             reply: Ok("Anderer Titel Vom Modell".to_owned()),
         };
 
-        let result = runtime()
+        let result = runtime()?
             .block_on(ensure_title(temp.path(), &session, &provider, "test-model"))
-            .expect("ensure_title succeeds");
+            .map_err(ctx("ensure_title succeeds"))?;
 
         assert_eq!(result.title_source, TitleSource::Model);
         assert_eq!(result.title.as_deref(), Some("Bestehender Titel"));
+        Ok(())
     }
 
     #[test]
-    fn ensure_title_does_not_overwrite_a_manual_title() {
-        let temp = tempfile::tempdir().unwrap();
+    fn ensure_title_does_not_overwrite_a_manual_title() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let session = SessionId::from_str("session-a");
-        seed_meta(temp.path(), &session, "Erste Nachricht");
-        meta::set_title(temp.path(), &session, "Von Hand Gesetzt", TitleSource::Manual)
-            .expect("seed title");
+        seed_meta(temp.path(), &session, "Erste Nachricht")?;
+        meta::set_title(
+            temp.path(),
+            &session,
+            "Von Hand Gesetzt",
+            TitleSource::Manual,
+        )
+        .map_err(ctx("seed title"))?;
         let provider = StubProvider {
             reply: Ok("Anderer Titel Vom Modell".to_owned()),
         };
 
-        let result = runtime()
+        let result = runtime()?
             .block_on(ensure_title(temp.path(), &session, &provider, "test-model"))
-            .expect("ensure_title succeeds");
+            .map_err(ctx("ensure_title succeeds"))?;
 
         assert_eq!(result.title_source, TitleSource::Manual);
         assert_eq!(result.title.as_deref(), Some("Von Hand Gesetzt"));
+        Ok(())
     }
 
     #[test]
-    fn generate_title_strips_quotes_and_uses_only_the_first_line() {
+    fn generate_title_strips_quotes_and_uses_only_the_first_line() -> TestResult {
         let provider = StubProvider {
             reply: Ok("\"Mein Toller Titel\".\nZweite Zeile wird ignoriert".to_owned()),
         };
@@ -434,15 +466,16 @@ mod tests {
             first_assistant_reply: None,
         };
 
-        let title = runtime()
+        let title = runtime()?
             .block_on(generate_title(&provider, "test-model", &request))
-            .expect("cleaned title is non-empty");
+            .ok_or(TestError::Missing("cleaned title is non-empty"))?;
 
         assert_eq!(title, "Mein Toller Titel");
+        Ok(())
     }
 
     #[test]
-    fn generate_title_returns_none_for_a_blank_cleaned_result() {
+    fn generate_title_returns_none_for_a_blank_cleaned_result() -> TestResult {
         let provider = StubProvider {
             reply: Ok("\"'.".to_owned()),
         };
@@ -452,13 +485,14 @@ mod tests {
             first_assistant_reply: None,
         };
 
-        let title = runtime().block_on(generate_title(&provider, "test-model", &request));
+        let title = runtime()?.block_on(generate_title(&provider, "test-model", &request));
 
         assert_eq!(title, None);
+        Ok(())
     }
 
     #[test]
-    fn generate_title_returns_none_on_provider_error() {
+    fn generate_title_returns_none_on_provider_error() -> TestResult {
         let provider = StubProvider { reply: Err(()) };
         let request = TitleRequest {
             session_id: SessionId::from_str("session-a"),
@@ -466,8 +500,9 @@ mod tests {
             first_assistant_reply: None,
         };
 
-        let title = runtime().block_on(generate_title(&provider, "test-model", &request));
+        let title = runtime()?.block_on(generate_title(&provider, "test-model", &request));
 
         assert_eq!(title, None);
+        Ok(())
     }
 }

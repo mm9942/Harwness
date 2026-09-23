@@ -395,18 +395,19 @@ impl AgentIdentity {
         // zeichengleich zur Fassung vor dieser Erweiterung. Der Text ist
         // rein statisch (keine Daten, keine Zeitstempel), damit er
         // innerhalb des cachebaren Prompt-Präfixes bleibt.
-        let efficient_tool_use_section = if self.tools_available.iter().any(|t| t.starts_with("fs.")) {
-            "\n\n## Efficient tool use\n\
+        let efficient_tool_use_section =
+            if self.tools_available.iter().any(|t| t.starts_with("fs.")) {
+                "\n\n## Efficient tool use\n\
 - Read files with fs.read/fs.grep/fs.search/fs.glob, not shell.exec (cat, sed, python).\n\
 - Locate first with fs.grep/fs.search, then read only the targeted range via offset/max_bytes.\n\
 - Pass numeric arguments as JSON numbers, not strings.\n\
 - Do not re-read a file you already read unless it changed.\n\
 - Avoid probe reads like max_bytes:1.\n\
 - Keep tool output small."
-                .to_owned()
-        } else {
-            String::new()
-        };
+                    .to_owned()
+            } else {
+                String::new()
+            };
 
         let mut prompt = format!(
             "You are {agent_name}, a {role_description} operating inside a local Rust workspace.\n\
@@ -591,6 +592,7 @@ async fn baseline_instructions(state: &AgentIdentity) -> LoadedInstructions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
     use harw_extension_api::InstructionsProvider;
 
     #[test]
@@ -699,7 +701,10 @@ mod tests {
         let cwd = format!("/ws/{}evil", '\u{202E}');
         let prompt = AgentIdentity::new("harw", cwd).render_system_prompt();
 
-        assert!(!prompt.contains('\u{202E}'), "das rohe Bidi-Zeichen darf nicht vorkommen");
+        assert!(
+            !prompt.contains('\u{202E}'),
+            "das rohe Bidi-Zeichen darf nicht vorkommen"
+        );
         assert!(prompt.contains("\\u{202e}"));
     }
 
@@ -742,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_includes_efficient_tool_use_section_when_fs_tool_present() {
+    fn test_render_includes_efficient_tool_use_section_when_fs_tool_present() -> TestResult {
         let prompt = AgentIdentity::new("harw", "/ws")
             .with_tools(vec!["fs.read".to_owned(), "shell.exec".to_owned()])
             .render_system_prompt();
@@ -750,22 +755,33 @@ mod tests {
         assert!(prompt.contains("## Efficient tool use"));
         assert!(prompt.contains("fs.read/fs.grep/fs.search/fs.glob"));
 
-        let tools_at = prompt.find("## Available tools").expect("tools section");
-        let efficient_at = prompt.find("## Efficient tool use").expect("efficient section");
-        let behavioral_at = prompt.find("## Behavioral rules").expect("behavioral section");
+        let tools_at = prompt
+            .find("## Available tools")
+            .ok_or(TestError::Missing("tools section"))?;
+        let efficient_at = prompt
+            .find("## Efficient tool use")
+            .ok_or(TestError::Missing("efficient section"))?;
+        let behavioral_at = prompt
+            .find("## Behavioral rules")
+            .ok_or(TestError::Missing("behavioral section"))?;
         assert!(
             tools_at < efficient_at && efficient_at < behavioral_at,
             "efficient tool use section must sit right after the tools list and before behavioral rules"
         );
 
-        let section_start = prompt.find("## Efficient tool use").expect("section start");
-        let section_end = prompt.find("\n\n## Behavioral rules").expect("section end");
+        let section_start = prompt
+            .find("## Efficient tool use")
+            .ok_or(TestError::Missing("section start"))?;
+        let section_end = prompt
+            .find("\n\n## Behavioral rules")
+            .ok_or(TestError::Missing("section end"))?;
         let section_bytes = &prompt.as_bytes()[section_start..section_end];
         assert!(
             section_bytes.len() <= 600,
             "efficient tool use section must stay within 600 bytes, was {}",
             section_bytes.len()
         );
+        Ok(())
     }
 
     #[test]
@@ -829,18 +845,23 @@ mod tests {
     }
 
     #[test]
-    fn test_render_appends_mode_section_before_return_contract() {
+    fn test_render_appends_mode_section_before_return_contract() -> TestResult {
         let prompt = AgentIdentity::new("harw", "/ws")
             .with_mode_section("Explore only.")
             .with_return_contract("{ \"finding\": \"string\" }")
             .render_system_prompt();
 
-        let mode_at = prompt.find("## Interaction mode").expect("mode section");
-        let contract_at = prompt.find("## Return contract").expect("contract section");
+        let mode_at = prompt
+            .find("## Interaction mode")
+            .ok_or(TestError::Missing("mode section"))?;
+        let contract_at = prompt
+            .find("## Return contract")
+            .ok_or(TestError::Missing("contract section"))?;
         assert!(
             mode_at < contract_at,
             "der Modus steht vor dem Rückgabevertrag"
         );
+        Ok(())
     }
 
     #[test]
@@ -880,19 +901,32 @@ mod tests {
     }
 
     #[test]
-    fn test_context_blocks_section_precedes_mode_and_return_contract() {
+    fn test_context_blocks_section_precedes_mode_and_return_contract() -> TestResult {
         let prompt = AgentIdentity::new("harw", "/ws")
             .with_trust_boundary_notice()
             .with_mode_section("Explore only.")
             .with_return_contract("{ \"finding\": \"string\" }")
             .render_system_prompt();
 
-        let blocks_at = prompt.find("## Context blocks").expect("context blocks section");
-        let mode_at = prompt.find("## Interaction mode").expect("mode section");
-        let contract_at = prompt.find("## Return contract").expect("contract section");
+        let blocks_at = prompt
+            .find("## Context blocks")
+            .ok_or(TestError::Missing("context blocks section"))?;
+        let mode_at = prompt
+            .find("## Interaction mode")
+            .ok_or(TestError::Missing("mode section"))?;
+        let contract_at = prompt
+            .find("## Return contract")
+            .ok_or(TestError::Missing("contract section"))?;
 
-        assert!(blocks_at < mode_at, "context blocks precede interaction mode");
-        assert!(mode_at < contract_at, "interaction mode precedes the return contract");
+        assert!(
+            blocks_at < mode_at,
+            "context blocks precede interaction mode"
+        );
+        assert!(
+            mode_at < contract_at,
+            "interaction mode precedes the return contract"
+        );
+        Ok(())
     }
 
     #[tokio::test]

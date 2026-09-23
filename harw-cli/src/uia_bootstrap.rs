@@ -551,20 +551,24 @@ fn profile_directory(home: &Path) -> Result<PathBuf, String> {
 fn persist_active_uia(home: &Path, id: &str) -> Result<(), String> {
     let path = active_profile_config(home)?;
     let mut writer = ConfigWriter::open(&path).map_err(|error| error.to_string())?;
-    writer.set_value("active_uia_definition", value(id));
+    writer
+        .set_value("active_uia_definition", value(id))
+        .map_err(|error| error.to_string())?;
     writer.save().map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
-    fn generated_definition_is_a_valid_uia_document() {
+    fn generated_definition_is_a_valid_uia_document() -> TestResult {
         let source = "schema = \"harwness.agent/v1\"\nid = \"harwness.agent.test-uia@1\"\nversion = \"1.0.0\"\nrole = \"user-interface\"\nspecialization = \"terminal-ui\"\n";
-        let parsed =
-            harw_agent_dsl::parse::parse_toml(source).expect("generated definition parses");
+        let parsed = harw_agent_dsl::parse::parse_toml(source)
+            .map_err(ctx("generated definition parses"))?;
         assert_eq!(parsed.role, AgentRoleId::UserInterface);
+        Ok(())
     }
 
     // --- slugify ---
@@ -609,27 +613,33 @@ mod tests {
     // --- unique_agent_slug ---
 
     #[test]
-    fn test_unique_agent_slug_no_collision_returns_base() {
-        let dir = tempfile::tempdir().expect("create temp dir");
+    fn test_unique_agent_slug_no_collision_returns_base() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("create temp dir"))?;
         let result = unique_agent_slug(dir.path(), "ada");
         assert_eq!(result, "ada");
+        Ok(())
     }
 
     #[test]
-    fn test_unique_agent_slug_single_collision_returns_suffix_2() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        std::fs::create_dir_all(dir.path().join("ada")).expect("create existing agent dir");
+    fn test_unique_agent_slug_single_collision_returns_suffix_2() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("create temp dir"))?;
+        std::fs::create_dir_all(dir.path().join("ada"))
+            .map_err(ctx("create existing agent dir"))?;
         let result = unique_agent_slug(dir.path(), "ada");
         assert_eq!(result, "ada-2");
+        Ok(())
     }
 
     #[test]
-    fn test_unique_agent_slug_multiple_collisions_returns_suffix_3() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        std::fs::create_dir_all(dir.path().join("ada")).expect("create existing agent dir");
-        std::fs::create_dir_all(dir.path().join("ada-2")).expect("create existing agent dir");
+    fn test_unique_agent_slug_multiple_collisions_returns_suffix_3() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("create temp dir"))?;
+        std::fs::create_dir_all(dir.path().join("ada"))
+            .map_err(ctx("create existing agent dir"))?;
+        std::fs::create_dir_all(dir.path().join("ada-2"))
+            .map_err(ctx("create existing agent dir"))?;
         let result = unique_agent_slug(dir.path(), "ada");
         assert_eq!(result, "ada-3");
+        Ok(())
     }
 
     // --- escape_toml_basic_string ---
@@ -660,8 +670,8 @@ mod tests {
     // --- write_uia_files ---
 
     #[test]
-    fn test_write_uia_files_writes_all_five_files_with_content() {
-        let dir = tempfile::tempdir().expect("create temp dir");
+    fn test_write_uia_files_writes_all_five_files_with_content() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("create temp dir"))?;
         let target = dir.path().join("ada");
         let result = write_uia_files(
             &target,
@@ -673,29 +683,31 @@ mod tests {
         );
         assert!(result.is_ok());
 
-        let definition =
-            std::fs::read_to_string(target.join("definition.toml")).expect("read definition.toml");
+        let definition = std::fs::read_to_string(target.join("definition.toml"))
+            .map_err(ctx("read definition.toml"))?;
         assert!(definition.contains("id = \"harwness.agent.ada@1\""));
         assert!(definition.contains("role = \"user-interface\""));
 
-        let agent = std::fs::read_to_string(target.join("agent.toml")).expect("read agent.toml");
+        let agent =
+            std::fs::read_to_string(target.join("agent.toml")).map_err(ctx("read agent.toml"))?;
         assert!(agent.contains("name = \"Ada\""));
 
         let identity =
-            std::fs::read_to_string(target.join("identity.md")).expect("read identity.md");
+            std::fs::read_to_string(target.join("identity.md")).map_err(ctx("read identity.md"))?;
         assert!(identity.contains("Ich bin Ada."));
 
-        let personality =
-            std::fs::read_to_string(target.join("Personality.md")).expect("read Personality.md");
+        let personality = std::fs::read_to_string(target.join("Personality.md"))
+            .map_err(ctx("read Personality.md"))?;
         assert!(personality.contains("Ruhig und direkt."));
 
-        let user = std::fs::read_to_string(target.join("USER.md")).expect("read USER.md");
+        let user = std::fs::read_to_string(target.join("USER.md")).map_err(ctx("read USER.md"))?;
         assert!(user.contains("Name: Test"));
+        Ok(())
     }
 
     #[test]
-    fn test_write_generated_uia_includes_identity_md() {
-        let dir = tempfile::tempdir().expect("create temp dir");
+    fn test_write_generated_uia_includes_identity_md() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("create temp dir"))?;
         let target = dir.path().join("ada");
         write_uia_files(
             &target,
@@ -705,16 +717,17 @@ mod tests {
             "personality\n",
             "user\n",
         )
-        .expect("write uia files");
+        .map_err(ctx("write uia files"))?;
         assert!(target.join("identity.md").exists());
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_write_uia_files_sets_unix_permissions_to_0600() {
+    fn test_write_uia_files_sets_unix_permissions_to_0600() -> TestResult {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let dir = tempfile::tempdir().expect("create temp dir");
+        let dir = tempfile::tempdir().map_err(ctx("create temp dir"))?;
         let target = dir.path().join("ada");
         let result = write_uia_files(
             &target,
@@ -734,15 +747,16 @@ mod tests {
             "USER.md",
         ] {
             let path = target.join(file_name);
-            let metadata = std::fs::metadata(&path).expect("read metadata");
+            let metadata = std::fs::metadata(&path).map_err(ctx("read metadata"))?;
             let mode = metadata.permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "unexpected permissions for {file_name}");
         }
+        Ok(())
     }
 
     #[test]
-    fn test_write_uia_files_escapes_name_with_quotes_in_definition() {
-        let dir = tempfile::tempdir().expect("create temp dir");
+    fn test_write_uia_files_escapes_name_with_quotes_in_definition() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("create temp dir"))?;
         let target = dir.path().join("ada");
         let result = write_uia_files(
             &target,
@@ -754,9 +768,10 @@ mod tests {
         );
         assert!(result.is_ok());
 
-        let definition =
-            std::fs::read_to_string(target.join("definition.toml")).expect("read definition.toml");
+        let definition = std::fs::read_to_string(target.join("definition.toml"))
+            .map_err(ctx("read definition.toml"))?;
         assert!(definition.contains("name = \"Ada \\\"the Bot\\\"\""));
+        Ok(())
     }
 
     // --- require_terminal ---

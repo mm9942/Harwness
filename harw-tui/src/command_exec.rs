@@ -540,7 +540,11 @@ where
                 Err(error) => format!("Fehler: {error}"),
             }
         }
-        CommandAction::Shell(command) => execute_shell(sandbox, session_id, command).await.display_text,
+        CommandAction::Shell(command) => {
+            execute_shell(sandbox, session_id, command)
+                .await
+                .display_text
+        }
         CommandAction::ShellRepeat => "Shell-Wiederholung ist noch nicht verfügbar.".to_owned(),
         CommandAction::Note(note) => format!("Notiz: {note}"),
         CommandAction::Mention { target, body } => format!("@{target}: {body}"),
@@ -949,21 +953,22 @@ mod tests {
         Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
     };
     use harw_operations::adapter::CommandAdapter;
-    use harw_operations::registry::OperationRegistry;
     use harw_operations::operation::BusyAvailability;
+    use harw_operations::registry::OperationRegistry;
     use harw_operations::{
         CommandVisibility, OpContext, OpFuture, OpInput, OpOutput, Operation, OperationCategory,
         OperationDomain, OperationMeta, PermissionTier, Surface,
     };
     use harw_types::{SessionId, TenantId, WorkspaceId};
 
-    use crate::session_controller::TuiSessionController;
     use crate::CommandRegistry;
+    use crate::session_controller::TuiSessionController;
     use harw_operations::SessionController;
 
     use super::{
         CommandServices, build_services, dispatch_command_with_shell_result, shell_escape_provider,
     };
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Baut alle 16 `harw-ops`-Adapter über die echte Registrierungsfunktion.
     fn adapters() -> Vec<CommandAdapter> {
@@ -976,7 +981,7 @@ mod tests {
     }
 
     /// Baut eine gültige Test-`SandboxSpec` gegen ein eindeutiges Temp-Verzeichnis.
-    fn test_sandbox() -> (SandboxSpec, PathBuf) {
+    fn test_sandbox() -> TestResult<(SandboxSpec, PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -984,7 +989,7 @@ mod tests {
             std::process::id(),
             id
         ));
-        std::fs::create_dir_all(root.join("workspace")).expect("temp workspace dir");
+        std::fs::create_dir_all(root.join("workspace")).map_err(ctx("temp workspace dir"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -993,18 +998,18 @@ mod tests {
                 root: PathBuf::from("workspace"),
             }],
         )
-        .expect("workspace registry build");
+        .map_err(ctx("workspace registry build"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("tui-test"),
                 &WorkspaceId::from_str("workspace"),
             )
-            .expect("resolve workspace binding");
+            .map_err(ctx("resolve workspace binding"))?;
         let sandbox = SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ReadWorkspace, Permission::WriteWorkspace]),
         );
-        (sandbox, root)
+        Ok((sandbox, root))
     }
 
     /// Baut einen frischen langlebigen Test-Controller.
@@ -1066,9 +1071,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_help_lists_registered_operations() {
+    async fn test_help_lists_registered_operations() -> TestResult {
         let adapters = adapters();
-        let (sandbox, tmp) = test_sandbox();
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
 
         let output = super::execute_command(
@@ -1093,6 +1098,7 @@ mod tests {
                 "missing op {name} in help output; got: {output}"
             );
         }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1100,9 +1106,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_status_embeds_session_id() {
+    async fn test_status_embeds_session_id() -> TestResult {
         let adapters = adapters();
-        let (sandbox, tmp) = test_sandbox();
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
 
         let output = super::execute_command(
@@ -1125,20 +1131,21 @@ mod tests {
             output.contains(session_id.as_str()),
             "expected session id {session_id} in status output; got: {output}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_status_embeds_provider_and_model() {
+    async fn test_status_embeds_provider_and_model() -> TestResult {
         let adapters = adapters();
-        let (sandbox, tmp) = test_sandbox();
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
         let controller = test_controller();
         controller
             .set_active_provider("anthropic".to_owned())
-            .unwrap();
+            .map_err(ctx("set_active_provider must succeed"))?;
         controller
             .set_active_model("claude-sonnet".to_owned())
-            .unwrap();
+            .map_err(ctx("set_active_model must succeed"))?;
 
         let output = super::execute_command(
             &adapters,
@@ -1164,6 +1171,7 @@ mod tests {
             output.contains("Modell: claude-sonnet"),
             "expected model in status output; got: {output}"
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1171,9 +1179,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_unknown_command_returns_honest_message() {
+    async fn test_unknown_command_returns_honest_message() -> TestResult {
         let adapters = adapters();
-        let (sandbox, tmp) = test_sandbox();
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
 
         let output = super::execute_command(
@@ -1193,6 +1201,7 @@ mod tests {
         std::fs::remove_dir_all(tmp).ok();
 
         assert_eq!(output, "Unbekannter Command: /gibtsnicht");
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1200,9 +1209,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_shell_not_available() {
+    async fn test_shell_not_available() -> TestResult {
         let adapters = adapters();
-        let (sandbox, tmp) = test_sandbox();
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
 
         let output = super::execute_command(
@@ -1225,12 +1234,13 @@ mod tests {
             !output.contains("Capability 'commands.shell' ist nicht aktiviert"),
             "die lokale TUI aktiviert commands.shell standardmäßig: {output}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_shell_repeat_is_not_implemented() {
+    async fn test_shell_repeat_is_not_implemented() -> TestResult {
         let adapters = adapters();
-        let (sandbox, tmp) = test_sandbox();
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
 
         let output = super::execute_command(
@@ -1250,6 +1260,7 @@ mod tests {
         std::fs::remove_dir_all(tmp).ok();
 
         assert_eq!(output, "Shell-Wiederholung ist noch nicht verfügbar.");
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1260,9 +1271,9 @@ mod tests {
     /// Hinweistext und kein `ShellRunOutcome` — `app.rs` darf dann keinen
     /// Folge-Turn starten.
     #[tokio::test]
-    async fn dispatch_shell_repeat_without_previous_command_reports_hint() {
+    async fn dispatch_shell_repeat_without_previous_command_reports_hint() -> TestResult {
         let adapters = adapters();
-        let (sandbox, tmp) = test_sandbox();
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
         let controller = test_controller();
 
@@ -1280,6 +1291,7 @@ mod tests {
 
         assert_eq!(outcome.text, "Kein vorheriger !-Befehl");
         assert!(outcome.shell.is_none());
+        Ok(())
     }
 
     /// Mit einem vorherigen Befehl versucht `!!`, ihn über `execute_shell`
@@ -1290,9 +1302,9 @@ mod tests {
     /// gespeicherte Befehl tatsächlich (erneut) beim Ausführer ankommt statt
     /// bei der alten „noch nicht verfügbar"-Meldung stehen zu bleiben.
     #[tokio::test]
-    async fn dispatch_shell_repeat_with_previous_command_reruns_it() {
+    async fn dispatch_shell_repeat_with_previous_command_reruns_it() -> TestResult {
         let adapters = adapters();
-        let (sandbox, tmp) = test_sandbox();
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
         let controller = test_controller();
 
@@ -1320,6 +1332,7 @@ mod tests {
             outcome.text, "Shell-Wiederholung ist noch nicht verfügbar.",
             "dispatch_command_with_shell_result muss !! wirklich auflösen"
         );
+        Ok(())
     }
 
     /// Ein direkter `!`-Befehl (nicht `!!`) läuft über denselben Pfad wie
@@ -1328,9 +1341,9 @@ mod tests {
     /// Ablehnungstext wie bei der bestehenden `!`-Deny-Prüfung
     /// (`test_execute_with_context_admitted_shell_denied_without_execute_permission`).
     #[tokio::test]
-    async fn dispatch_shell_command_reports_no_structured_result_when_denied() {
+    async fn dispatch_shell_command_reports_no_structured_result_when_denied() -> TestResult {
         let adapters: Vec<CommandAdapter> = Vec::new();
-        let (sandbox, tmp) = test_sandbox();
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
         let controller = test_controller();
 
@@ -1351,12 +1364,14 @@ mod tests {
             outcome.text,
             "Shell-Ausführung abgelehnt: shell.exec denied: ExecuteProcess permission missing"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_execute_with_context_admitted_shell_denied_without_execute_permission() {
+    async fn test_execute_with_context_admitted_shell_denied_without_execute_permission()
+    -> TestResult {
         let adapters = adapters();
-        let (sandbox, tmp) = test_sandbox();
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
         let controller = test_controller();
         let context = crate::DispatchContext {
@@ -1413,6 +1428,7 @@ mod tests {
             "Shell-Ausführung abgelehnt: shell.exec denied: ExecuteProcess permission missing"
         );
         assert_eq!(repeat, "Shell-Wiederholung ist noch nicht verfügbar.");
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1420,9 +1436,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_plain_text_is_chat() {
+    async fn test_plain_text_is_chat() -> TestResult {
         let adapters = adapters();
-        let (sandbox, tmp) = test_sandbox();
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
 
         let output = super::execute_command(
@@ -1442,6 +1458,7 @@ mod tests {
         std::fs::remove_dir_all(tmp).ok();
 
         assert_eq!(output, "hallo welt");
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1449,9 +1466,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_note_prefix_renders_note() {
+    async fn test_note_prefix_renders_note() -> TestResult {
         let adapters = adapters();
-        let (sandbox, tmp) = test_sandbox();
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
 
         let output = super::execute_command(
@@ -1471,12 +1488,13 @@ mod tests {
         std::fs::remove_dir_all(tmp).ok();
 
         assert_eq!(output, "Notiz: this is a note");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_mention_renders_correctly() {
+    async fn test_mention_renders_correctly() -> TestResult {
         let adapters = adapters();
-        let (sandbox, tmp) = test_sandbox();
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
 
         let output = super::execute_command(
@@ -1496,6 +1514,7 @@ mod tests {
         std::fs::remove_dir_all(tmp).ok();
 
         assert_eq!(output, "@alice: hello there");
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1504,9 +1523,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn owner_wrapper_dispatches_operator_command_without_error() {
+    async fn owner_wrapper_dispatches_operator_command_without_error() -> TestResult {
         let adapters = adapters();
-        let (sandbox, tmp) = test_sandbox();
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
 
         let output = super::execute_command(
@@ -1529,12 +1548,13 @@ mod tests {
             !output.starts_with("Unbekannter Command"),
             "/model must be a known command; got: {output}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn observer_cannot_dispatch_an_operator_command() {
+    async fn observer_cannot_dispatch_an_operator_command() -> TestResult {
         let adapters = adapters();
-        let (sandbox, tmp) = test_sandbox();
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
 
         let controller = test_controller();
@@ -1553,15 +1573,16 @@ mod tests {
             output,
             "Berechtigung verweigert: /model erfordert Operator; aktuelle Stufe ist Observer"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn denied_alias_does_not_build_services_or_dispatch() {
+    async fn denied_alias_does_not_build_services_or_dispatch() -> TestResult {
         let operation = Arc::new(CountingOperation::protected_alias());
         let adapters = CommandAdapter::from_operation(operation.clone());
         operation.meta_reads.store(0, Ordering::Relaxed);
 
-        let (sandbox, tmp) = test_sandbox();
+        let (sandbox, tmp) = test_sandbox()?;
         let controller = test_controller();
         let output = super::execute_command_as(
             &adapters,
@@ -1588,13 +1609,14 @@ mod tests {
             0,
             "a denied alias must not dispatch its operation"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_execute_command_as_observer_cannot_run_operator_command() {
+    async fn test_execute_command_as_observer_cannot_run_operator_command() -> TestResult {
         let operation = Arc::new(CountingOperation::protected_alias());
         let adapters = CommandAdapter::from_operation(operation.clone());
-        let (sandbox, tmp) = test_sandbox();
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
         let controller = test_controller();
 
@@ -1630,12 +1652,13 @@ mod tests {
 
         assert_eq!(admitted, "dispatched");
         assert_eq!(operation.dispatches.load(Ordering::Relaxed), 1);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_execute_command_as_unknown_command_suggests_nearest() {
+    async fn test_execute_command_as_unknown_command_suggests_nearest() -> TestResult {
         let adapters = adapters();
-        let (sandbox, tmp) = test_sandbox();
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
 
         let controller = test_controller();
@@ -1656,6 +1679,7 @@ mod tests {
             output,
             "Unbekannter Command: /stauts (meinten Sie /status?)"
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1670,9 +1694,9 @@ mod tests {
     /// exactly at, and only at, the point `execute_with_context` reaches
     /// `CommandAction::Command`.
     #[tokio::test]
-    async fn test_execute_command_as_does_not_build_services_on_denied_admission() {
+    async fn test_execute_command_as_does_not_build_services_on_denied_admission() -> TestResult {
         let adapters = adapters();
-        let (sandbox, tmp) = test_sandbox();
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
         let controller = test_controller();
         let calls = AtomicUsize::new(0);
@@ -1723,6 +1747,7 @@ mod tests {
             1,
             "services() must be evaluated exactly once, after successful admission"
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1730,8 +1755,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_empty_adapters_reports_unknown_for_any_command() {
-        let (sandbox, tmp) = test_sandbox();
+    async fn test_empty_adapters_reports_unknown_for_any_command() -> TestResult {
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
 
         let output = super::execute_command(
@@ -1751,6 +1776,7 @@ mod tests {
         std::fs::remove_dir_all(tmp).ok();
 
         assert_eq!(output, "Unbekannter Command: /status");
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1765,9 +1791,9 @@ mod tests {
     /// The test also verifies that the `CommandRegistry` and the adapter
     /// resolve to the same canonical spec name, confirming a single truth source.
     #[tokio::test]
-    async fn alias_dispatches_to_same_handler_as_canonical() {
+    async fn alias_dispatches_to_same_handler_as_canonical() -> TestResult {
         let adapters = adapters();
-        let (sandbox, tmp) = test_sandbox();
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
         let controller = test_controller();
 
@@ -1813,13 +1839,13 @@ mod tests {
 
         // Verify that CommandRegistry (the discovery/autocomplete side) and the
         // adapter lookup (the execution side) agree on the same canonical name.
-        let registry = CommandRegistry::built_in();
-        let spec_via_alias = registry
-            .find("m")
-            .expect("'m' must be findable in CommandRegistry");
-        let spec_via_canonical = registry
-            .find("model")
-            .expect("'model' must be findable in CommandRegistry");
+        let registry = CommandRegistry::built_in().map_err(ctx("built_in"))?;
+        let spec_via_alias = registry.find("m").ok_or(TestError::Missing(
+            "'m' must be findable in CommandRegistry",
+        ))?;
+        let spec_via_canonical = registry.find("model").ok_or(TestError::Missing(
+            "'model' must be findable in CommandRegistry",
+        ))?;
         assert_eq!(
             spec_via_alias.name.as_str(),
             spec_via_canonical.name.as_str(),
@@ -1832,12 +1858,13 @@ mod tests {
         let model_adapter = adapters
             .iter()
             .find(|a| a.path() == "/model")
-            .expect("a /model adapter must exist");
+            .ok_or(TestError::Missing("a /model adapter must exist"))?;
         let alias_resolves_same_op = model_adapter.operation().meta().aliases.contains(&"m");
         assert!(
             alias_resolves_same_op,
             "the /model adapter's OperationMeta must declare 'm' as an alias"
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1850,7 +1877,7 @@ mod tests {
     /// ruft `build_services` zweimal auf und prüft, dass der Wert nach beiden Aufrufen
     /// erhalten bleibt — d.h. kein frischer Controller mehr pro Aufruf erzeugt wird.
     #[test]
-    fn test_long_lived_controller_survives_two_build_services_calls() {
+    fn test_long_lived_controller_survives_two_build_services_calls() -> TestResult {
         use harw_operations::{SessionController, SharedSessionController};
         use harw_types::ReasoningEffort;
 
@@ -1860,14 +1887,16 @@ mod tests {
         // Setze einen Nicht-Default-Effort auf den langlebigen Controller.
         controller
             .set_reasoning_effort(Some(ReasoningEffort::High))
-            .expect("set_reasoning_effort must succeed");
+            .map_err(ctx("set_reasoning_effort must succeed"))?;
 
         // Erster build_services-Aufruf — klont den Controller-Arc in die ServiceMap.
         let services1 = super::build_services(&adapters, None, None, &controller, None, None);
         // Abruf via SharedSessionController-TypeId (Arc<dyn SessionController>).
         let retrieved1 = services1
             .get::<SharedSessionController>()
-            .expect("SharedSessionController must be in ServiceMap after first call");
+            .ok_or(TestError::Missing(
+                "SharedSessionController must be in ServiceMap after first call",
+            ))?;
         assert_eq!(
             retrieved1.snapshot().reasoning_effort,
             Some(ReasoningEffort::High),
@@ -1878,13 +1907,16 @@ mod tests {
         let services2 = super::build_services(&adapters, None, None, &controller, None, None);
         let retrieved2 = services2
             .get::<SharedSessionController>()
-            .expect("SharedSessionController must be in ServiceMap after second call");
+            .ok_or(TestError::Missing(
+                "SharedSessionController must be in ServiceMap after second call",
+            ))?;
         assert_eq!(
             retrieved2.snapshot().reasoning_effort,
             Some(ReasoningEffort::High),
             "second build_services call must still see the original reasoning effort — \
              the long-lived Arc was not replaced by a fresh controller"
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1892,36 +1924,51 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_build_services_preserves_resolved_config_arc() {
+    fn test_build_services_preserves_resolved_config_arc() -> TestResult {
         let adapters = adapters();
         let controller = test_controller();
         let runtime_config = Arc::new(harw_config::ResolvedConfig::default());
 
-        let services =
-            super::build_services(&adapters, Some(&runtime_config), None, &controller, None, None);
-        let retrieved = services
-            .get::<Arc<harw_config::ResolvedConfig>>()
-            .expect("ResolvedConfig Arc must be present when supplied");
+        let services = super::build_services(
+            &adapters,
+            Some(&runtime_config),
+            None,
+            &controller,
+            None,
+            None,
+        );
+        let retrieved =
+            services
+                .get::<Arc<harw_config::ResolvedConfig>>()
+                .ok_or(TestError::Missing(
+                    "ResolvedConfig Arc must be present when supplied",
+                ))?;
 
         assert!(
             Arc::ptr_eq(retrieved, &runtime_config),
             "ServiceMap must retain the exact Arc resolved by the composition root"
         );
+        Ok(())
     }
 
     #[test]
-    fn build_services_preserves_durable_job_store_arc() {
+    fn build_services_preserves_durable_job_store_arc() -> TestResult {
         let adapters = adapters();
         let controller = test_controller();
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = Arc::new(harw_session_store::JobStore::new(temp.path()));
 
-        let services = super::build_services(&adapters, None, None, &controller, Some(&store), None);
-        let resolved = services
-            .get::<Arc<harw_session_store::JobStore>>()
-            .expect("durable job store must be available to command operations");
+        let services =
+            super::build_services(&adapters, None, None, &controller, Some(&store), None);
+        let resolved =
+            services
+                .get::<Arc<harw_session_store::JobStore>>()
+                .ok_or(TestError::Missing(
+                    "durable job store must be available to command operations",
+                ))?;
 
         assert!(Arc::ptr_eq(resolved, &store));
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1931,17 +1978,17 @@ mod tests {
     /// `dispatch_slash_command_reports_the_idle_no_runtime_message`: mirrors
     /// the `app.rs` `HarwEvent::Command`-Zweig's "no runtime" branch verbatim.
     #[tokio::test]
-    async fn dispatch_slash_command_reports_the_idle_no_runtime_message() {
+    async fn dispatch_slash_command_reports_the_idle_no_runtime_message() -> TestResult {
         let adapters = adapters();
-        let (sandbox, tmp) = test_sandbox();
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
 
         let output =
-            super::dispatch_slash_command(None, &adapters, &sandbox, &session_id, "/status")
-                .await;
+            super::dispatch_slash_command(None, &adapters, &sandbox, &session_id, "/status").await;
         std::fs::remove_dir_all(tmp).ok();
 
         assert_eq!(output, "Fehler: keine Runtime-Montage");
+        Ok(())
     }
 
     /// `dispatch_slash_command_with_empty_adapters_reports_unknown`: without a
@@ -1950,8 +1997,9 @@ mod tests {
     /// prove they still agree (an empty adapter list is honest about missing
     /// commands, same as the idle path).
     #[tokio::test]
-    async fn dispatch_slash_command_and_execute_command_as_agree_on_unknown_command() {
-        let (sandbox, tmp) = test_sandbox();
+    async fn dispatch_slash_command_and_execute_command_as_agree_on_unknown_command() -> TestResult
+    {
+        let (sandbox, tmp) = test_sandbox()?;
         let session_id = SessionId::new();
         let controller = test_controller();
 
@@ -1967,94 +2015,105 @@ mod tests {
         std::fs::remove_dir_all(tmp).ok();
 
         assert_eq!(via_execute_command_as, "Unbekannter Command: /status");
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
     // 13. busy_availability_for classifier
     // -----------------------------------------------------------------------
 
-    fn built_in_registry() -> CommandRegistry {
-        CommandRegistry::built_in()
+    fn built_in_registry() -> TestResult<CommandRegistry> {
+        CommandRegistry::built_in().map_err(ctx("built_in"))
     }
 
     #[test]
-    fn busy_availability_for_status_is_immediate() {
+    fn busy_availability_for_status_is_immediate() -> TestResult {
         assert_eq!(
-            super::busy_availability_for(&built_in_registry(), "/status"),
+            super::busy_availability_for(&built_in_registry()?, "/status"),
             BusyAvailability::Immediate
         );
+        Ok(())
     }
 
     #[test]
-    fn busy_availability_for_mode_plan_is_deferred() {
+    fn busy_availability_for_mode_plan_is_deferred() -> TestResult {
         assert_eq!(
-            super::busy_availability_for(&built_in_registry(), "/mode plan"),
+            super::busy_availability_for(&built_in_registry()?, "/mode plan"),
             BusyAvailability::DeferredUntilTurnEnd
         );
+        Ok(())
     }
 
     #[test]
-    fn busy_availability_for_model_show_is_immediate() {
+    fn busy_availability_for_model_show_is_immediate() -> TestResult {
         assert_eq!(
-            super::busy_availability_for(&built_in_registry(), "/model show"),
+            super::busy_availability_for(&built_in_registry()?, "/model show"),
             BusyAvailability::Immediate
         );
+        Ok(())
     }
 
     #[test]
-    fn busy_availability_for_model_switch_with_argument_is_deferred() {
+    fn busy_availability_for_model_switch_with_argument_is_deferred() -> TestResult {
         assert_eq!(
-            super::busy_availability_for(&built_in_registry(), "/model switch x"),
+            super::busy_availability_for(&built_in_registry()?, "/model switch x"),
             BusyAvailability::DeferredUntilTurnEnd
         );
+        Ok(())
     }
 
     #[test]
-    fn busy_availability_for_bare_model_is_deferred() {
+    fn busy_availability_for_bare_model_is_deferred() -> TestResult {
         assert_eq!(
-            super::busy_availability_for(&built_in_registry(), "/model"),
+            super::busy_availability_for(&built_in_registry()?, "/model"),
             BusyAvailability::DeferredUntilTurnEnd
         );
+        Ok(())
     }
 
     #[test]
-    fn busy_availability_for_bare_provider_is_immediate() {
+    fn busy_availability_for_bare_provider_is_immediate() -> TestResult {
         assert_eq!(
-            super::busy_availability_for(&built_in_registry(), "/provider"),
+            super::busy_availability_for(&built_in_registry()?, "/provider"),
             BusyAvailability::Immediate
         );
+        Ok(())
     }
 
     #[test]
-    fn busy_availability_for_provider_list_is_immediate() {
+    fn busy_availability_for_provider_list_is_immediate() -> TestResult {
         assert_eq!(
-            super::busy_availability_for(&built_in_registry(), "/provider list"),
+            super::busy_availability_for(&built_in_registry()?, "/provider list"),
             BusyAvailability::Immediate
         );
+        Ok(())
     }
 
     #[test]
-    fn busy_availability_for_provider_test_is_deferred() {
+    fn busy_availability_for_provider_test_is_deferred() -> TestResult {
         assert_eq!(
-            super::busy_availability_for(&built_in_registry(), "/provider test"),
+            super::busy_availability_for(&built_in_registry()?, "/provider test"),
             BusyAvailability::DeferredUntilTurnEnd
         );
+        Ok(())
     }
 
     #[test]
-    fn busy_availability_for_unknown_command_is_deferred() {
+    fn busy_availability_for_unknown_command_is_deferred() -> TestResult {
         assert_eq!(
-            super::busy_availability_for(&built_in_registry(), "/gibtsnicht"),
+            super::busy_availability_for(&built_in_registry()?, "/gibtsnicht"),
             BusyAvailability::DeferredUntilTurnEnd
         );
+        Ok(())
     }
 
     #[test]
-    fn busy_availability_for_chat_text_is_deferred() {
+    fn busy_availability_for_chat_text_is_deferred() -> TestResult {
         assert_eq!(
-            super::busy_availability_for(&built_in_registry(), "hallo welt"),
+            super::busy_availability_for(&built_in_registry()?, "hallo welt"),
             BusyAvailability::DeferredUntilTurnEnd
         );
+        Ok(())
     }
 
     /// `busy_availability_for_alias_of_an_immediate_command_is_immediate`: an
@@ -2065,19 +2124,24 @@ mod tests {
     /// to `show`) because [`super::busy_availability_for`] matches on
     /// `spec.name` (the canonical name), not on the typed token.
     #[test]
-    fn busy_availability_for_alias_of_an_immediate_command_is_immediate() {
-        let registry = built_in_registry();
-        let canonical = registry.find("provider").expect("provider must be registered");
+    fn busy_availability_for_alias_of_an_immediate_command_is_immediate() -> TestResult {
+        let registry = built_in_registry()?;
+        let canonical = registry
+            .find("provider")
+            .ok_or(TestError::Missing("provider must be registered"))?;
         let alias = canonical
             .aliases
             .first()
             .cloned()
-            .expect("/provider must declare at least one alias for this test to be meaningful");
+            .ok_or(TestError::Missing(
+                "/provider must declare at least one alias for this test to be meaningful",
+            ))?;
 
         assert_eq!(
             super::busy_availability_for(&registry, &format!("/{alias}")),
             BusyAvailability::Immediate
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2134,7 +2198,7 @@ mod tests {
     /// no rebuild, no clone-of-contents. This is what makes `/sandbox-lease`
     /// and the `/status` line resolve the live ledger/registry state.
     #[test]
-    fn build_services_inserts_host_permit_handles_from_assembly_accessors() {
+    fn build_services_inserts_host_permit_handles_from_assembly_accessors() -> TestResult {
         let adapters = adapters();
         let controller = test_controller();
         let ledger = Arc::new(harw_sandbox::ProcessPermitLedger::default());
@@ -2149,7 +2213,9 @@ mod tests {
 
         let retrieved = services
             .get::<Arc<harw_tool_shell::HostPermitHandles>>()
-            .expect("HostPermitHandles must be present in the ServiceMap when supplied");
+            .ok_or(TestError::Missing(
+                "HostPermitHandles must be present in the ServiceMap when supplied",
+            ))?;
 
         assert!(
             Arc::ptr_eq(retrieved, &handles),
@@ -2166,6 +2232,7 @@ mod tests {
             "the registry Arc inside HostPermitHandles must stay ptr-identical to the \
              assembly's host permit session registry"
         );
+        Ok(())
     }
 
     /// `build_services_without_host_permit_handles_leaves_service_absent`:
@@ -2236,7 +2303,11 @@ mod tests {
         let adapters = CommandAdapter::from_operation(operation);
         let registry = CommandRegistry::from_command_adapters(&adapters);
 
-        for raw in ["/sandbox-lease", "/sandbox-lease status", "/sandbox-lease revoke"] {
+        for raw in [
+            "/sandbox-lease",
+            "/sandbox-lease status",
+            "/sandbox-lease revoke",
+        ] {
             assert_eq!(
                 super::busy_availability_for(&registry, raw),
                 BusyAvailability::Immediate,

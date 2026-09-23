@@ -3,7 +3,7 @@
 //! (sleeping/awaiting) is left to the caller / a future `backon` integration.
 
 use jiff::SignedDuration;
-use serde::{de, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de};
 
 use crate::error::{JobRuntimeError, JobRuntimeResult};
 
@@ -114,6 +114,7 @@ fn clamp_i128(v: i128) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn policy(factor: f64) -> RetryPolicy {
         RetryPolicy {
@@ -125,34 +126,54 @@ mod tests {
     }
 
     #[test]
-    fn first_retry_uses_the_base_delay() {
+    fn first_retry_uses_the_base_delay() -> TestResult {
         let retry = policy(2.0);
-        assert_eq!(retry.next_delay(0).unwrap(), SignedDuration::from_secs(1));
-        assert_eq!(retry.next_delay(1).unwrap(), SignedDuration::from_secs(1));
-        assert_eq!(retry.next_delay(2).unwrap(), SignedDuration::from_secs(2));
-        assert_eq!(retry.next_delay(3).unwrap(), SignedDuration::from_secs(4));
+        assert_eq!(
+            retry.next_delay(0).map_err(ctx("valid delay"))?,
+            SignedDuration::from_secs(1)
+        );
+        assert_eq!(
+            retry.next_delay(1).map_err(ctx("valid delay"))?,
+            SignedDuration::from_secs(1)
+        );
+        assert_eq!(
+            retry.next_delay(2).map_err(ctx("valid delay"))?,
+            SignedDuration::from_secs(2)
+        );
+        assert_eq!(
+            retry.next_delay(3).map_err(ctx("valid delay"))?,
+            SignedDuration::from_secs(4)
+        );
+        Ok(())
     }
 
     #[test]
-    fn retry_rejects_invalid_factors() {
+    fn retry_rejects_invalid_factors() -> TestResult {
         for factor in [f64::NAN, f64::NEG_INFINITY, -1.0, 0.0, f64::INFINITY] {
             match policy(factor).next_delay(0) {
                 Err(JobRuntimeError::RetryExhausted { attempts: 0 }) => {}
-                result => panic!("invalid factor returned unexpected result: {result:?}"),
+                result => {
+                    return Err(TestError::Unexpected(format!(
+                        "invalid factor returned unexpected result: {result:?}"
+                    )));
+                }
             }
         }
+        Ok(())
     }
 
     #[test]
     fn construction_rejects_invalid_factor_and_negative_delays() {
         for factor in [f64::NAN, f64::NEG_INFINITY, -1.0, 0.0, f64::INFINITY] {
-            assert!(RetryPolicy::try_new(
-                4,
-                SignedDuration::from_secs(1),
-                factor,
-                SignedDuration::from_secs(30),
-            )
-            .is_err());
+            assert!(
+                RetryPolicy::try_new(
+                    4,
+                    SignedDuration::from_secs(1),
+                    factor,
+                    SignedDuration::from_secs(30),
+                )
+                .is_err()
+            );
         }
 
         for (base_delay, max_delay) in [
@@ -195,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn deserialization_rejects_invalid_factor_and_negative_delays() {
+    fn deserialization_rejects_invalid_factor_and_negative_delays() -> TestResult {
         let valid = serde_json::json!({
             "max_attempts": 4,
             "base_delay": "1s",
@@ -210,10 +231,14 @@ mod tests {
             serde_json::json!({ "max_delay": "-1ms" }),
         ] {
             let mut value = valid.clone();
-            for (key, replacement) in invalid.as_object().expect("test object") {
+            for (key, replacement) in invalid
+                .as_object()
+                .ok_or(TestError::Missing("test object"))?
+            {
                 value[key] = replacement.clone();
             }
             assert!(serde_json::from_value::<RetryPolicy>(value).is_err());
         }
+        Ok(())
     }
 }

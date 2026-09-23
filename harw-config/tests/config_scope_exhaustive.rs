@@ -21,6 +21,9 @@
 
 use std::str::FromStr;
 
+mod common;
+use common::{TestResult, ctx};
+
 use harw_config::harness_config::{
     CompactionToml, GuardsToml, OnboardingSection, OnboardingSeen, ReasoningWeightsToml,
 };
@@ -121,7 +124,11 @@ fn test_field_table_exhaustive_logging_section() {
         json,
     } = LoggingSection::default();
     let _ = (level, target_module_paths, json);
-    for path in ["logging.level", "logging.target_module_paths", "logging.json"] {
+    for path in [
+        "logging.level",
+        "logging.target_module_paths",
+        "logging.json",
+    ] {
         assert_path_in_field_table_exactly_once(path);
     }
 }
@@ -155,7 +162,13 @@ fn test_field_table_exhaustive_session_section() {
         title_generation,
         title_model,
     } = SessionSection::default();
-    let _ = (store_dir, journal_format, retention_days, title_generation, title_model);
+    let _ = (
+        store_dir,
+        journal_format,
+        retention_days,
+        title_generation,
+        title_model,
+    );
     for path in [
         "session.store_dir",
         "session.journal_format",
@@ -178,7 +191,10 @@ fn test_field_table_exhaustive_policy_section() {
         require_approval_for,
     } = PolicySection::default();
     let _ = (default_visibility_scope, require_approval_for);
-    for path in ["policy.default_visibility_scope", "policy.require_approval_for"] {
+    for path in [
+        "policy.default_visibility_scope",
+        "policy.require_approval_for",
+    ] {
         assert_path_in_field_table_exactly_once(path);
     }
 }
@@ -207,10 +223,11 @@ fn test_field_table_exhaustive_mcp_listener_section() {
 }
 
 #[test]
-fn test_field_table_exhaustive_mcp_principal_toml() {
+fn test_field_table_exhaustive_mcp_principal_toml() -> TestResult {
     let principal = McpPrincipalToml {
         id: "p1".to_owned(),
-        credential_ref: SecretRef::from_str("env:P1_TOKEN").unwrap(),
+        credential_ref: SecretRef::from_str("env:P1_TOKEN")
+            .map_err(ctx("env:P1_TOKEN secret ref"))?,
         tenant: "mia".to_owned(),
         workspace: "harwness".to_owned(),
         job_capabilities: vec![],
@@ -232,6 +249,7 @@ fn test_field_table_exhaustive_mcp_principal_toml() {
     ] {
         assert_path_in_field_table_exactly_once(field_path);
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -372,7 +390,13 @@ fn test_field_table_exhaustive_permissions_section() {
         deny,
         extra_roots,
     } = PermissionsSection::default();
-    let _ = (default_mode, approval_timeout_secs, allow, deny, extra_roots);
+    let _ = (
+        default_mode,
+        approval_timeout_secs,
+        allow,
+        deny,
+        extra_roots,
+    );
     for path in [
         "permissions.default_mode",
         "permissions.approval_timeout_secs",

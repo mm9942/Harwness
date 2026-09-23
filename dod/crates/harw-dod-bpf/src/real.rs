@@ -1,13 +1,13 @@
- //! Reale, `aya`-gestützte eBPF-Ladeschicht.
- //!
- //! # V1 production contract
- //! The historical research notes below predate the standalone C object
- //! domain and are not the active contract.  Production uses only
- //! [`BpfObjectContract`]: one exact program, the four named v1 maps, a
- //! populated scope map before attach, and either a sched tracepoint or the
- //! target-BTF `FEntry` TCP-connect hook.  Profileless [`BpfLoader::load`]
- //! intentionally refuses real attachment; [`RealBpfLoader::load_contracts`]
- //! rolls back all links on a partial failure.
+//! Reale, `aya`-gestützte eBPF-Ladeschicht.
+//!
+//! # V1 production contract
+//! The historical research notes below predate the standalone C object
+//! domain and are not the active contract.  Production uses only
+//! [`BpfObjectContract`]: one exact program, the four named v1 maps, a
+//! populated scope map before attach, and either a sched tracepoint or the
+//! target-BTF `FEntry` TCP-connect hook.  Profileless [`BpfLoader::load`]
+//! intentionally refuses real attachment; [`RealBpfLoader::load_contracts`]
+//! rolls back all links on a partial failure.
 //!
 //! # Recherche, mit Quellen (Stand dieses Berichts)
 //! Vor dieser Datei stand die Entscheidung von `harw-dod-bpf`s eigener
@@ -205,28 +205,28 @@
 //! let loader: Box<dyn BpfLoader> = Box::new(RealBpfLoader::new());
 //! drop(loader);
 //! ```
-// 
+//
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, Map, MapData, PerCpuArray, RingBuf};
 use aya::programs::{FEntry, KProbe, TracePoint};
 use aya::{Btf, Ebpf};
 
-use crate::error::BpfError;
+use crate::abi::{WireEvent, parse_wire_event};
 use crate::contract::{
-    BpfObjectContract, EVENTS_MAP_NAME, LOSS_COUNTS_MAP_NAME, REQUIRED_MAP_NAMES,
-    SEQUENCE_MAP_NAME, SCOPE_MAP_NAME,
+    BpfObjectContract, EVENTS_MAP_NAME, LOSS_COUNTS_MAP_NAME, REQUIRED_MAP_NAMES, SCOPE_MAP_NAME,
+    SEQUENCE_MAP_NAME,
 };
-use crate::event::{parse_raw_event, RawBpfEvent};
+use crate::error::BpfError;
+use crate::event::{RawBpfEvent, parse_raw_event};
 use crate::handle::BpfHandle;
 use crate::loader::BpfLoader;
-use crate::spec::{BpfProgramKind, BpfProgramSpec};
 use crate::profile::BpfScope;
+use crate::spec::{BpfProgramKind, BpfProgramSpec};
 use crate::time::{KernelTimeMapper, TimeConfidence};
-use crate::abi::{parse_wire_event, WireEvent};
 
 /// Name der Ringpuffer-Map, die ein geladenes Objekt tragen muss.
 ///
@@ -338,34 +338,70 @@ impl RealBpfLoader {
         // Selecting by the exact object program name rejects a second,
         // unexpected program instead of attaching whichever iterator entry
         // happens to appear first.
-        let program = ebpf.program_mut(&contract.program_name).ok_or(BpfError::InvalidProgramContract)?;
+        let program = ebpf
+            .program_mut(&contract.program_name)
+            .ok_or(BpfError::InvalidProgramContract)?;
         match contract.kind {
             BpfProgramKind::Tracepoint => {
                 let (category, name) = split_tracepoint_attach_point(&contract.attach_point)?;
-                let tracepoint: &mut TracePoint = program.try_into().map_err(|_| BpfError::InvalidProgramContract)?;
+                let tracepoint: &mut TracePoint = program
+                    .try_into()
+                    .map_err(|_| BpfError::InvalidProgramContract)?;
                 tracepoint.load().map_err(|_| BpfError::ProgramLoadFailed)?;
-                tracepoint.attach(category, name).map_err(|_| BpfError::ProgramLoadFailed)?;
+                tracepoint
+                    .attach(category, name)
+                    .map_err(|_| BpfError::ProgramLoadFailed)?;
             }
             BpfProgramKind::KProbe => {
-                let kprobe: &mut KProbe = program.try_into().map_err(|_| BpfError::InvalidProgramContract)?;
+                let kprobe: &mut KProbe = program
+                    .try_into()
+                    .map_err(|_| BpfError::InvalidProgramContract)?;
                 kprobe.load().map_err(|_| BpfError::ProgramLoadFailed)?;
-                kprobe.attach(&contract.attach_point, 0).map_err(|_| BpfError::ProgramLoadFailed)?;
+                kprobe
+                    .attach(&contract.attach_point, 0)
+                    .map_err(|_| BpfError::ProgramLoadFailed)?;
             }
             BpfProgramKind::FEntry => {
                 let btf = Btf::from_sys_fs().map_err(|_| BpfError::InvalidProgramContract)?;
-                let fentry: &mut FEntry = program.try_into().map_err(|_| BpfError::InvalidProgramContract)?;
-                fentry.load(&contract.attach_point, &btf).map_err(|_| BpfError::ProgramLoadFailed)?;
+                let fentry: &mut FEntry = program
+                    .try_into()
+                    .map_err(|_| BpfError::InvalidProgramContract)?;
+                fentry
+                    .load(&contract.attach_point, &btf)
+                    .map_err(|_| BpfError::ProgramLoadFailed)?;
                 fentry.attach().map_err(|_| BpfError::ProgramLoadFailed)?;
             }
             BpfProgramKind::SocketFilter => return Err(BpfError::UnsupportedProgramKind),
         }
-        let map = ebpf.take_map(EVENTS_MAP_NAME).ok_or(BpfError::InvalidProgramContract)?;
-        let ring_buf = map.try_into().map_err(|_| BpfError::InvalidProgramContract)?;
-        let loss_map = ebpf.take_map(LOSS_COUNTS_MAP_NAME).ok_or(BpfError::InvalidProgramContract)?;
-        let loss_counts = loss_map.try_into().map_err(|_| BpfError::InvalidProgramContract)?;
-        let handle = BpfHandle::new(contract.sensor.clone(), contract.kind, contract.attach_point.clone());
-        let mut loaded = self.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        loaded.insert(handle.id(), LoadedProgram { _ebpf: ebpf, ring_buf, loss_counts });
+        let map = ebpf
+            .take_map(EVENTS_MAP_NAME)
+            .ok_or(BpfError::InvalidProgramContract)?;
+        let ring_buf = map
+            .try_into()
+            .map_err(|_| BpfError::InvalidProgramContract)?;
+        let loss_map = ebpf
+            .take_map(LOSS_COUNTS_MAP_NAME)
+            .ok_or(BpfError::InvalidProgramContract)?;
+        let loss_counts = loss_map
+            .try_into()
+            .map_err(|_| BpfError::InvalidProgramContract)?;
+        let handle = BpfHandle::new(
+            contract.sensor.clone(),
+            contract.kind,
+            contract.attach_point.clone(),
+        );
+        let mut loaded = self
+            .loaded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loaded.insert(
+            handle.id(),
+            LoadedProgram {
+                _ebpf: ebpf,
+                ring_buf,
+                loss_counts,
+            },
+        );
         Ok(handle)
     }
 
@@ -374,7 +410,10 @@ impl RealBpfLoader {
     /// already created by this call is dropped before the error is returned.
     /// An empty list is rejected because it cannot establish observation
     /// readiness.
-    pub fn load_contracts(&self, contracts: &[BpfObjectContract]) -> Result<Vec<BpfHandle>, BpfError> {
+    pub fn load_contracts(
+        &self,
+        contracts: &[BpfObjectContract],
+    ) -> Result<Vec<BpfHandle>, BpfError> {
         if contracts.is_empty() {
             return Err(BpfError::InvalidProgramContract);
         }
@@ -420,8 +459,13 @@ impl RealBpfLoader {
         let deadline = Instant::now() + timeout;
         loop {
             let events = {
-                let mut loaded = self.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let entry = loaded.get_mut(&handle.id()).ok_or(BpfError::UnknownHandle)?;
+                let mut loaded = self
+                    .loaded
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let entry = loaded
+                    .get_mut(&handle.id())
+                    .ok_or(BpfError::UnknownHandle)?;
                 let mut events = Vec::new();
                 while let Some(item) = entry.ring_buf.next() {
                     let event = match parse_wire_event(&item) {
@@ -435,11 +479,17 @@ impl RealBpfLoader {
                         self.invalid_wire_events.fetch_add(1, Ordering::Relaxed);
                         continue;
                     };
-                    events.push(TimedWireEvent { event, observed_at, time_confidence: mapper.confidence() });
+                    events.push(TimedWireEvent {
+                        event,
+                        observed_at,
+                        time_confidence: mapper.confidence(),
+                    });
                 }
                 events
             };
-            if !events.is_empty() || Instant::now() >= deadline { return Ok(events); }
+            if !events.is_empty() || Instant::now() >= deadline {
+                return Ok(events);
+            }
             std::thread::sleep(POLL_INTERVAL.min(timeout));
         }
     }
@@ -448,7 +498,10 @@ impl RealBpfLoader {
     /// Per-CPU values are summed with saturation: counter wrap must never
     /// make a known loss look smaller.
     pub fn loss_counters(&self, handle: &BpfHandle) -> Result<BpfLossCounters, BpfError> {
-        let loaded = self.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let loaded = self
+            .loaded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = loaded.get(&handle.id()).ok_or(BpfError::UnknownHandle)?;
         Ok(BpfLossCounters {
             exec: sum_loss_slot(&entry.loss_counts, 1)?,
@@ -460,7 +513,9 @@ impl RealBpfLoader {
 }
 
 fn sum_loss_slot(loss_counts: &PerCpuArray<MapData, u64>, slot: u32) -> Result<u64, BpfError> {
-    let values = loss_counts.get(&slot, 0).map_err(|_| BpfError::ProgramLoadFailed)?;
+    let values = loss_counts
+        .get(&slot, 0)
+        .map_err(|_| BpfError::ProgramLoadFailed)?;
     Ok(values.iter().copied().fold(0u64, u64::saturating_add))
 }
 
@@ -493,8 +548,11 @@ fn matches_exact_object_contract(ebpf: &Ebpf, contract: &BpfObjectContract) -> b
 /// `SEQUENCE` is not consumed by host code, but its key/value width is part
 /// of the C/Rust ABI.  Check it while the object is still unattached.
 fn validate_sequence_map(ebpf: &mut Ebpf) -> Result<(), BpfError> {
-    let map = ebpf.map_mut(SEQUENCE_MAP_NAME).ok_or(BpfError::InvalidProgramContract)?;
-    let sequence: AyaArray<_, u64> = AyaArray::try_from(map).map_err(|_| BpfError::InvalidProgramContract)?;
+    let map = ebpf
+        .map_mut(SEQUENCE_MAP_NAME)
+        .ok_or(BpfError::InvalidProgramContract)?;
+    let sequence: AyaArray<_, u64> =
+        AyaArray::try_from(map).map_err(|_| BpfError::InvalidProgramContract)?;
     if sequence.len() != 1 {
         return Err(BpfError::InvalidProgramContract);
     }
@@ -532,7 +590,9 @@ fn capability_bit_set(cap_eff_hex: &str, bit: u32) -> bool {
         .unwrap_or(false)
 }
 
-fn cap_bpf_bit_set(cap_eff_hex: &str) -> bool { capability_bit_set(cap_eff_hex, CAP_BPF_BIT) }
+fn cap_bpf_bit_set(cap_eff_hex: &str) -> bool {
+    capability_bit_set(cap_eff_hex, CAP_BPF_BIT)
+}
 
 /// Prüft, ob der laufende Prozess `CAP_BPF` in seiner effektiven
 /// Fähigkeitsmenge trägt.
@@ -561,7 +621,12 @@ fn has_cap_bpf() -> bool {
 fn has_attach_capabilities() -> bool {
     std::fs::read_to_string("/proc/self/status")
         .ok()
-        .and_then(|status| status.lines().find_map(|line| line.strip_prefix("CapEff:")).map(str::to_owned))
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("CapEff:"))
+                .map(str::to_owned)
+        })
         .is_some_and(|hex| has_cap_bpf() && capability_bit_set(&hex, CAP_PERFMON_BIT))
 }
 
@@ -569,13 +634,20 @@ fn has_attach_capabilities() -> bool {
 /// The BPF objects use key `0` as an explicit host-profile marker; an empty
 /// cgroup map is never interpreted as host observation.
 fn populate_scope_map(ebpf: &mut Ebpf, scope: &BpfScope) -> Result<(), BpfError> {
-    let map = ebpf.map_mut(SCOPE_MAP_NAME).ok_or(BpfError::InvalidProgramContract)?;
+    let map = ebpf
+        .map_mut(SCOPE_MAP_NAME)
+        .ok_or(BpfError::InvalidProgramContract)?;
     let mut ids: AyaHashMap<&mut MapData, u64, u8> =
         AyaHashMap::try_from(map).map_err(|_| BpfError::InvalidProgramContract)?;
     match scope {
-        BpfScope::Host => ids.insert(0u64, 1u8, 0).map_err(|_| BpfError::InvalidProgramContract),
+        BpfScope::Host => ids
+            .insert(0u64, 1u8, 0)
+            .map_err(|_| BpfError::InvalidProgramContract),
         BpfScope::Cgroups { groups, .. } => {
-            for group in groups { ids.insert(group.id, 1u8, 0).map_err(|_| BpfError::InvalidProgramContract)?; }
+            for group in groups {
+                ids.insert(group.id, 1u8, 0)
+                    .map_err(|_| BpfError::InvalidProgramContract)?;
+            }
             Ok(())
         }
     }
@@ -598,7 +670,9 @@ fn populate_scope_map(ebpf: &mut Ebpf, scope: &BpfScope) -> Result<(), BpfError>
 /// - [`BpfError::ProgramLoadFailed`], wenn `attach_point` keinen
 ///   Doppelpunkt enthält.
 fn split_tracepoint_attach_point(attach_point: &str) -> Result<(&str, &str), BpfError> {
-    attach_point.split_once(':').ok_or(BpfError::ProgramLoadFailed)
+    attach_point
+        .split_once(':')
+        .ok_or(BpfError::ProgramLoadFailed)
 }
 
 impl BpfLoader for RealBpfLoader {
@@ -645,12 +719,21 @@ impl BpfLoader for RealBpfLoader {
     ///   ist.
     /// - [`BpfError::MalformedEvent`], wenn ein gelesener Puffer nicht die
     ///   erwartete Form hat.
-    fn read_events(&self, handle: &BpfHandle, timeout: Duration) -> Result<Vec<RawBpfEvent>, BpfError> {
+    fn read_events(
+        &self,
+        handle: &BpfHandle,
+        timeout: Duration,
+    ) -> Result<Vec<RawBpfEvent>, BpfError> {
         let deadline = Instant::now() + timeout;
         loop {
             let events = {
-                let mut loaded = self.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let entry = loaded.get_mut(&handle.id()).ok_or(BpfError::UnknownHandle)?;
+                let mut loaded = self
+                    .loaded
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let entry = loaded
+                    .get_mut(&handle.id())
+                    .ok_or(BpfError::UnknownHandle)?;
                 let mut events = Vec::new();
                 while let Some(item) = entry.ring_buf.next() {
                     events.push(parse_raw_event(&item)?);
@@ -667,9 +750,12 @@ impl BpfLoader for RealBpfLoader {
 
 #[cfg(test)]
 mod tests {
-    use super::{cap_bpf_bit_set, has_cap_bpf, split_tracepoint_attach_point, RealBpfLoader, CAP_BPF_BIT};
+    use super::{
+        CAP_BPF_BIT, RealBpfLoader, cap_bpf_bit_set, has_cap_bpf, split_tracepoint_attach_point,
+    };
     use crate::error::BpfError;
     use crate::loader::BpfLoader;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
     fn test_new_boxed_as_dyn_bpf_loader_compiles_and_holds_no_programs() {
@@ -718,15 +804,21 @@ mod tests {
     }
 
     #[test]
-    fn test_split_tracepoint_attach_point_splits_on_first_colon() {
-        let (category, name) = split_tracepoint_attach_point("sched:sched_process_exec").unwrap();
+    fn test_split_tracepoint_attach_point_splits_on_first_colon() -> TestResult {
+        let (category, name) = split_tracepoint_attach_point("sched:sched_process_exec")
+            .map_err(ctx("split_tracepoint_attach_point"))?;
         assert_eq!(category, "sched");
         assert_eq!(name, "sched_process_exec");
+        Ok(())
     }
 
     #[test]
-    fn test_split_tracepoint_attach_point_without_colon_returns_program_load_failed() {
-        let err = split_tracepoint_attach_point("no-colon-here").expect_err("must fail without a colon");
+    fn test_split_tracepoint_attach_point_without_colon_returns_program_load_failed() -> TestResult
+    {
+        let Err(err) = split_tracepoint_attach_point("no-colon-here") else {
+            return Err(TestError::Unexpected("must fail without a colon".into()));
+        };
         assert!(matches!(err, BpfError::ProgramLoadFailed));
+        Ok(())
     }
 }

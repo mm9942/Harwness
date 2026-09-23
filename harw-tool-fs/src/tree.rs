@@ -417,7 +417,11 @@ fn load_ignore(dir: &File) -> Option<Gitignore> {
             continue;
         };
         let mut bytes = Vec::new();
-        if file.take(MAX_IGNORE_FILE_BYTES).read_to_end(&mut bytes).is_err() {
+        if file
+            .take(MAX_IGNORE_FILE_BYTES)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
             continue;
         }
         for line in String::from_utf8_lossy(&bytes).lines() {
@@ -470,7 +474,13 @@ where
         return Ok(None);
     }
     let remaining = state.opts.max_entries.saturating_sub(state.entries);
-    let listed = read_dir_limited(state.workspace, dir, dir_rel, remaining, state.opts.deadline);
+    let listed = read_dir_limited(
+        state.workspace,
+        dir,
+        dir_rel,
+        remaining,
+        state.opts.deadline,
+    );
     let (children, pending_stop) = match listed {
         Ok(listed) => listed,
         Err(err) if is_start => return Err(err),
@@ -558,6 +568,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
     use std::fs;
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
@@ -567,65 +578,78 @@ mod tests {
     }
 
     /// Workspace `ws/` neben einem fremden Verzeichnis `outside/`.
-    fn fixture() -> (TempDir, PathBuf, PathBuf) {
-        let dir = TempDir::new().expect("tempdir");
-        let base = dir.path().canonicalize().expect("canonicalize");
+    fn fixture() -> TestResult<(TempDir, PathBuf, PathBuf)> {
+        let dir = TempDir::new()?;
+        let base = dir.path().canonicalize()?;
         let ws = base.join("ws");
         let outside = base.join("outside");
-        fs::create_dir_all(&ws).expect("mkdir ws");
-        fs::create_dir_all(outside.join("deep")).expect("mkdir outside");
-        fs::write(outside.join("secret.txt"), "TOPSECRET").expect("write secret");
-        fs::write(outside.join("deep/more.txt"), "TOPSECRET").expect("write secret");
-        (dir, ws, outside)
+        fs::create_dir_all(&ws)?;
+        fs::create_dir_all(outside.join("deep"))?;
+        fs::write(outside.join("secret.txt"), "TOPSECRET")?;
+        fs::write(outside.join("deep/more.txt"), "TOPSECRET")?;
+        Ok((dir, ws, outside))
     }
 
     fn collect(
         workspace: &Workspace,
         start: &Path,
         opts: WalkOptions,
-    ) -> (Vec<String>, Option<StopReason>) {
+    ) -> TestResult<(Vec<String>, Option<StopReason>)> {
         let mut seen = Vec::new();
         let stop = walk_tree(workspace, start, opts, |entry| {
             seen.push(entry.rel.to_string_lossy().into_owned());
             ControlFlow::Continue(())
-        })
-        .expect("walk");
-        (seen, stop)
+        })?;
+        Ok((seen, stop))
     }
 
     #[test]
-    fn normalize_relative_lehnt_ausbrueche_ab() {
-        assert_eq!(normalize_relative(".").unwrap(), PathBuf::new());
-        assert_eq!(normalize_relative("./src/").unwrap(), PathBuf::from("src"));
-        assert_eq!(normalize_relative("a//b/.").unwrap(), PathBuf::from("a/b"));
+    fn normalize_relative_lehnt_ausbrueche_ab() -> TestResult {
+        assert_eq!(
+            normalize_relative(".").map_err(TestError::Unexpected)?,
+            PathBuf::new()
+        );
+        assert_eq!(
+            normalize_relative("./src/").map_err(TestError::Unexpected)?,
+            PathBuf::from("src")
+        );
+        assert_eq!(
+            normalize_relative("a//b/.").map_err(TestError::Unexpected)?,
+            PathBuf::from("a/b")
+        );
         assert!(normalize_relative("").is_err());
         assert!(normalize_relative("../x").is_err());
         assert!(normalize_relative("a/../b").is_err());
         assert!(normalize_relative("/etc/passwd").is_err());
+        Ok(())
     }
 
     #[test]
-    fn walk_folgt_keinen_symlinks_und_terminiert_bei_schleifen() {
-        let (_dir, ws, outside) = fixture();
-        fs::create_dir_all(ws.join("a")).unwrap();
-        fs::write(ws.join("a/inner.txt"), "x").unwrap();
-        symlink(&outside, ws.join("link_dir")).unwrap();
-        symlink(outside.join("secret.txt"), ws.join("link_file")).unwrap();
-        symlink(".", ws.join("loop")).unwrap();
-        symlink("..", ws.join("a/up")).unwrap();
+    fn walk_folgt_keinen_symlinks_und_terminiert_bei_schleifen() -> TestResult {
+        let (_dir, ws, outside) = fixture()?;
+        fs::create_dir_all(ws.join("a"))?;
+        fs::write(ws.join("a/inner.txt"), "x")?;
+        symlink(&outside, ws.join("link_dir"))?;
+        symlink(outside.join("secret.txt"), ws.join("link_file"))?;
+        symlink(".", ws.join("loop"))?;
+        symlink("..", ws.join("a/up"))?;
 
-        let workspace = Workspace::open(&ws).unwrap();
+        let workspace = Workspace::open(&ws)?;
         let opts = WalkOptions::standard(false, no_exclude);
-        let (seen, stop) = collect(&workspace, Path::new(""), opts);
+        let (seen, stop) = collect(&workspace, Path::new(""), opts)?;
         assert_eq!(stop, None);
-        assert_eq!(seen, vec!["a", "a/inner.txt", "a/up", "link_dir", "link_file", "loop"]);
+        assert_eq!(
+            seen,
+            vec!["a", "a/inner.txt", "a/up", "link_dir", "link_file", "loop"]
+        );
+        Ok(())
     }
 
     #[test]
-    fn start_ueber_symlink_wird_abgelehnt() {
-        let (_dir, ws, outside) = fixture();
-        symlink(&outside, ws.join("link_dir")).unwrap();
-        let workspace = Workspace::open(&ws).unwrap();
+    fn start_ueber_symlink_wird_abgelehnt() -> TestResult {
+        let (_dir, ws, outside) = fixture()?;
+        symlink(&outside, ws.join("link_dir"))?;
+        let workspace = Workspace::open(&ws)?;
         let result = walk_tree(
             &workspace,
             Path::new("link_dir"),
@@ -633,19 +657,25 @@ mod tests {
             |_| ControlFlow::Continue(()),
         );
         assert!(result.is_err(), "Start über Symlink muss scheitern");
-        assert!(workspace.open_any(Path::new("link_dir/secret.txt")).is_err());
+        assert!(
+            workspace
+                .open_any(Path::new("link_dir/secret.txt"))
+                .is_err()
+        );
+        Ok(())
     }
 
     #[test]
-    fn race_verzeichnis_durch_symlink_ersetzt() {
-        let (_dir, ws, outside) = fixture();
-        fs::write(ws.join("a.txt"), "a").unwrap();
-        fs::create_dir_all(ws.join("sub")).unwrap();
-        fs::write(ws.join("sub/own.txt"), "own").unwrap();
+    fn race_verzeichnis_durch_symlink_ersetzt() -> TestResult {
+        let (_dir, ws, outside) = fixture()?;
+        fs::write(ws.join("a.txt"), "a")?;
+        fs::create_dir_all(ws.join("sub"))?;
+        fs::write(ws.join("sub/own.txt"), "own")?;
 
-        let workspace = Workspace::open(&ws).unwrap();
+        let workspace = Workspace::open(&ws)?;
         let mut seen = Vec::new();
         let mut read_outside = false;
+        let mut io_error: Option<io::Error> = None;
         let stop = walk_tree(
             &workspace,
             Path::new(""),
@@ -654,37 +684,49 @@ mod tests {
                 if entry.rel == Path::new("a.txt") {
                     // Wettlauf-Surrogat: `sub` wurde bereits als Verzeichnis
                     // gelistet und wird jetzt gegen einen Symlink getauscht.
-                    fs::rename(ws.join("sub"), ws.join("sub_old")).unwrap();
-                    symlink(&outside, ws.join("sub")).unwrap();
+                    if let Err(err) = fs::rename(ws.join("sub"), ws.join("sub_old")) {
+                        io_error.get_or_insert(err);
+                    }
+                    if let Err(err) = symlink(&outside, ws.join("sub")) {
+                        io_error.get_or_insert(err);
+                    }
                 }
                 if entry.entry_type == EntryType::File {
                     if let Ok(file) = open_file_in(entry.dir, entry.name) {
-                        let bytes = read_bounded(&file, 1024).unwrap().unwrap();
-                        read_outside |= bytes == b"TOPSECRET";
+                        match read_bounded(&file, 1024) {
+                            Ok(Some(bytes)) => read_outside |= bytes == b"TOPSECRET",
+                            Ok(None) => {}
+                            Err(err) => {
+                                io_error.get_or_insert(err);
+                            }
+                        }
                     }
                 }
                 seen.push(entry.rel.to_string_lossy().into_owned());
                 ControlFlow::Continue(())
             },
-        )
-        .unwrap();
+        )?;
+        if let Some(err) = io_error {
+            return Err(TestError::from(err));
+        }
         assert_eq!(stop, None);
         assert!(!read_outside, "fremder Inhalt gelesen: {seen:?}");
         assert!(seen.iter().all(|rel| !rel.starts_with("sub/")), "{seen:?}");
         // Direktes Öffnen über das getauschte Glied scheitert ebenfalls.
         assert!(workspace.open_any(Path::new("sub/secret.txt")).is_err());
+        Ok(())
     }
 
     #[test]
-    fn geoeffnetes_verzeichnis_bleibt_nach_tausch_gebunden() {
-        let (_dir, ws, outside) = fixture();
-        fs::create_dir_all(ws.join("sub")).unwrap();
-        fs::write(ws.join("sub/own.txt"), "own").unwrap();
-        let workspace = Workspace::open(&ws).unwrap();
-        let sub = workspace.open_dir(Path::new("sub")).unwrap();
+    fn geoeffnetes_verzeichnis_bleibt_nach_tausch_gebunden() -> TestResult {
+        let (_dir, ws, outside) = fixture()?;
+        fs::create_dir_all(ws.join("sub"))?;
+        fs::write(ws.join("sub/own.txt"), "own")?;
+        let workspace = Workspace::open(&ws)?;
+        let sub = workspace.open_dir(Path::new("sub"))?;
 
-        fs::rename(ws.join("sub"), ws.join("sub_old")).unwrap();
-        symlink(&outside, ws.join("sub")).unwrap();
+        fs::rename(ws.join("sub"), ws.join("sub_old"))?;
+        symlink(&outside, ws.join("sub"))?;
 
         let deadline = Instant::now() + WALK_DEADLINE;
         match read_dir_limited(&workspace, &sub, Path::new("sub"), 100, deadline) {
@@ -695,79 +737,93 @@ mod tests {
             }
             Err(err) => assert!(proc_fd_path(&sub).is_none(), "unerwarteter Fehler: {err}"),
         }
+        Ok(())
     }
 
     #[test]
-    fn eintrags_tiefen_und_zeitgrenze_greifen() {
-        let (_dir, ws, _outside) = fixture();
+    fn eintrags_tiefen_und_zeitgrenze_greifen() -> TestResult {
+        let (_dir, ws, _outside) = fixture()?;
         for i in 0..20 {
-            fs::write(ws.join(format!("f{i:02}")), "x").unwrap();
+            fs::write(ws.join(format!("f{i:02}")), "x")?;
         }
         let mut deep = ws.join("zz");
         for _ in 0..(HARD_MAX_DEPTH + 3) {
-            fs::create_dir_all(&deep).unwrap();
+            fs::create_dir_all(&deep)?;
             deep.push("d");
         }
-        let workspace = Workspace::open(&ws).unwrap();
+        let workspace = Workspace::open(&ws)?;
 
         let mut opts = WalkOptions::standard(false, no_exclude);
         opts.max_entries = 5;
-        let (seen, stop) = collect(&workspace, Path::new(""), opts);
+        let (seen, stop) = collect(&workspace, Path::new(""), opts)?;
         assert_eq!(seen.len(), 5);
         assert_eq!(stop, Some(StopReason::EntryLimit));
 
         let mut opts = WalkOptions::standard(false, no_exclude);
         opts.max_depth = usize::MAX;
-        let (seen, stop) = collect(&workspace, Path::new("zz"), opts);
-        assert_eq!(seen.len(), HARD_MAX_DEPTH, "Tiefe wird hart auf 32 begrenzt");
+        let (seen, stop) = collect(&workspace, Path::new("zz"), opts)?;
+        assert_eq!(
+            seen.len(),
+            HARD_MAX_DEPTH,
+            "Tiefe wird hart auf 32 begrenzt"
+        );
         assert_eq!(stop, Some(StopReason::DepthLimit));
 
         let mut opts = WalkOptions::standard(false, no_exclude);
         opts.deadline = Instant::now();
-        let (seen, stop) = collect(&workspace, Path::new(""), opts);
+        let (seen, stop) = collect(&workspace, Path::new(""), opts)?;
         assert!(seen.is_empty());
         assert_eq!(stop, Some(StopReason::Deadline));
+        Ok(())
     }
 
     #[test]
-    fn gitignore_beschneidet_und_vorfahren_zaehlen() {
-        let (_dir, ws, _outside) = fixture();
-        fs::create_dir_all(ws.join("src/gen")).unwrap();
-        fs::create_dir_all(ws.join("node_modules/pkg")).unwrap();
-        fs::write(ws.join(".gitignore"), "node_modules/\n*.log\n").unwrap();
-        fs::write(ws.join("src/.gitignore"), "gen/\n!keep.log\n").unwrap();
-        fs::write(ws.join("src/a.rs"), "").unwrap();
-        fs::write(ws.join("src/x.log"), "").unwrap();
-        fs::write(ws.join("src/keep.log"), "").unwrap();
-        fs::write(ws.join("src/gen/out.rs"), "").unwrap();
-        fs::write(ws.join("node_modules/pkg/index.js"), "").unwrap();
-        let workspace = Workspace::open(&ws).unwrap();
+    fn gitignore_beschneidet_und_vorfahren_zaehlen() -> TestResult {
+        let (_dir, ws, _outside) = fixture()?;
+        fs::create_dir_all(ws.join("src/gen"))?;
+        fs::create_dir_all(ws.join("node_modules/pkg"))?;
+        fs::write(ws.join(".gitignore"), "node_modules/\n*.log\n")?;
+        fs::write(ws.join("src/.gitignore"), "gen/\n!keep.log\n")?;
+        fs::write(ws.join("src/a.rs"), "")?;
+        fs::write(ws.join("src/x.log"), "")?;
+        fs::write(ws.join("src/keep.log"), "")?;
+        fs::write(ws.join("src/gen/out.rs"), "")?;
+        fs::write(ws.join("node_modules/pkg/index.js"), "")?;
+        let workspace = Workspace::open(&ws)?;
 
         let opts = WalkOptions::standard(true, no_exclude);
-        let (seen, _) = collect(&workspace, Path::new(""), opts);
+        let (seen, _) = collect(&workspace, Path::new(""), opts)?;
         assert_eq!(
             seen,
-            vec![".gitignore", "src", "src/.gitignore", "src/a.rs", "src/keep.log"]
+            vec![
+                ".gitignore",
+                "src",
+                "src/.gitignore",
+                "src/a.rs",
+                "src/keep.log"
+            ]
         );
 
-        let (seen, _) = collect(&workspace, Path::new("src"), opts);
+        let (seen, _) = collect(&workspace, Path::new("src"), opts)?;
         assert_eq!(seen, vec!["src/.gitignore", "src/a.rs", "src/keep.log"]);
+        Ok(())
     }
 
     #[test]
-    fn read_bounded_und_zeilenkuerzung() {
-        let (_dir, ws, _outside) = fixture();
-        fs::write(ws.join("small"), "abc").unwrap();
-        let workspace = Workspace::open(&ws).unwrap();
-        let file = workspace.open_any(Path::new("small")).unwrap();
-        assert_eq!(read_bounded(&file, 3).unwrap().as_deref(), Some(&b"abc"[..]));
-        let file = workspace.open_any(Path::new("small")).unwrap();
-        assert_eq!(read_bounded(&file, 2).unwrap(), None);
+    fn read_bounded_und_zeilenkuerzung() -> TestResult {
+        let (_dir, ws, _outside) = fixture()?;
+        fs::write(ws.join("small"), "abc")?;
+        let workspace = Workspace::open(&ws)?;
+        let file = workspace.open_any(Path::new("small"))?;
+        assert_eq!(read_bounded(&file, 3)?.as_deref(), Some(&b"abc"[..]));
+        let file = workspace.open_any(Path::new("small"))?;
+        assert_eq!(read_bounded(&file, 2)?, None);
 
         let long = "ä".repeat(MAX_LINE_BYTES);
         let cut = truncate_line(&long);
         assert!(cut.len() <= MAX_LINE_BYTES + '…'.len_utf8());
         assert!(cut.ends_with('…'));
         assert_eq!(truncate_line("kurz"), "kurz");
+        Ok(())
     }
 }

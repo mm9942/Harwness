@@ -224,7 +224,11 @@ pub fn write_bug_report(home: &Path, report: &BugReport) -> Result<PathBuf, BugR
     // Schreibe erst vollständig in eine exklusiv angelegte Datei. `hard_link`
     // ist hier absichtlich statt `rename` verwendet: auf Unix würde `rename`
     // ein bereits vorhandenes Ziel atomar überschreiben.
-    let temp_path = dir.join(format!(".{}.{}.tmp", report.id, REPORT_ID_COUNTER.fetch_add(1, Ordering::Relaxed)));
+    let temp_path = dir.join(format!(
+        ".{}.{}.tmp",
+        report.id,
+        REPORT_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -325,7 +329,7 @@ impl FromRawArgs for BugReportArgs {
     summary = "Speichert einen lokalen Bug-Report unter ~/.harw/bug-report/.",
     domain = "misc",
     permission = "operator",
-    command(path = "/bug-report", visibility = "tui_only"),
+    command(path = "/bug-report", visibility = "tui_only")
 )]
 async fn bug_report(_ctx: &OpContext, args: BugReportArgs) -> Result<OpOutput, OpError> {
     let Some(title) = args.title.clone().filter(|t| !t.is_empty()) else {
@@ -363,6 +367,7 @@ async fn bug_report(_ctx: &OpContext, args: BugReportArgs) -> Result<OpOutput, O
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     fn sample_report(id: &str) -> BugReport {
         BugReport {
@@ -380,16 +385,16 @@ mod tests {
     }
 
     #[test]
-    fn write_bug_report_creates_file_with_expected_sections() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+    fn write_bug_report_creates_file_with_expected_sections() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let home = tmp.path();
         let report = sample_report("bug-test-0001");
 
-        let path = write_bug_report(home, &report).expect("write succeeds");
+        let path = write_bug_report(home, &report).map_err(ctx("write succeeds"))?;
         assert!(path.exists());
         assert_eq!(path, home.join("bug-report").join("bug-test-0001.md"));
 
-        let content = std::fs::read_to_string(&path).expect("read back");
+        let content = std::fs::read_to_string(&path).map_err(ctx("read back"))?;
         assert!(content.contains("# Something broke"));
         assert!(content.contains("## What happened"));
         assert!(content.contains("## What user said"));
@@ -400,11 +405,12 @@ mod tests {
         assert!(content.contains("Run `harw chat` then type a long message."));
         assert!(content.contains("stderr: thread panicked at ..."));
         assert!(content.contains("Task category: coding"));
+        Ok(())
     }
 
     #[test]
-    fn write_bug_report_handles_none_optional_fields() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+    fn write_bug_report_handles_none_optional_fields() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let home = tmp.path();
         let report = BugReport {
             id: "bug-test-0002".to_owned(),
@@ -419,23 +425,25 @@ mod tests {
             evidence: None,
         };
 
-        let path = write_bug_report(home, &report).expect("write succeeds with None fields");
-        let content = std::fs::read_to_string(&path).expect("read back");
+        let path =
+            write_bug_report(home, &report).map_err(ctx("write succeeds with None fields"))?;
+        let content = std::fs::read_to_string(&path).map_err(ctx("read back"))?;
         assert!(content.contains("Task category: -"));
         assert!(content.contains("## What user said\n-"));
         assert!(content.contains("## Repro\n-"));
         assert!(content.contains("## Evidence\n-"));
+        Ok(())
     }
 
     #[test]
-    fn write_bug_report_is_redacted_and_does_not_overwrite() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+    fn write_bug_report_is_redacted_and_does_not_overwrite() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let mut report = sample_report("bug-test-safe");
         report.what_happened = "Authorization: Bearer super-secret\nnormal detail".to_owned();
         report.evidence = Some("api_key=sk-secret-value".to_owned());
 
-        let path = write_bug_report(tmp.path(), &report).expect("write succeeds");
-        let original = std::fs::read_to_string(&path).expect("read back");
+        let path = write_bug_report(tmp.path(), &report).map_err(ctx("write succeeds"))?;
+        let original = std::fs::read_to_string(&path).map_err(ctx("read back"))?;
         assert!(!original.contains("super-secret"));
         assert!(!original.contains("sk-secret-value"));
         assert!(original.contains("normal detail"));
@@ -443,12 +451,16 @@ mod tests {
         let mut replacement = report;
         replacement.what_happened = "replacement".to_owned();
         assert!(write_bug_report(tmp.path(), &replacement).is_err());
-        assert_eq!(std::fs::read_to_string(path).expect("read original"), original);
+        assert_eq!(
+            std::fs::read_to_string(path).map_err(ctx("read original"))?,
+            original
+        );
+        Ok(())
     }
 
     #[test]
-    fn write_bug_report_rejects_path_like_ids() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+    fn write_bug_report_rejects_path_like_ids() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let mut report = sample_report("../escape");
         assert!(matches!(
             write_bug_report(tmp.path(), &report),
@@ -459,6 +471,7 @@ mod tests {
             write_bug_report(tmp.path(), &report),
             Err(BugReportError::InvalidId)
         ));
+        Ok(())
     }
 
     #[test]

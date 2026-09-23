@@ -13,11 +13,14 @@
 //! `Action<Authorized>` öffnet, steht im `//!`-Block von `src/lib.rs` selbst
 //! (dort, wo die Entscheidung begründet wird), nicht hier.
 
+mod common;
+
+use common::{TestError, TestResult, ctx};
+use harw_authority::NetworkScope;
 use harw_dod::{
     Actor, Capability, CpuSensor, EgressFlowRule, EventKind, ReadScope, Rule, RuleContext,
     SecurityEvent, Sensor, SensorHandle, Verdict, run_rules, triage,
 };
-use harw_authority::NetworkScope;
 use harw_types::SensorId;
 
 /// "Beobachte den Host": ein Griff bauen, einen der neun re-exportierten
@@ -27,19 +30,25 @@ use harw_types::SensorId;
 /// reale `/proc` (Testrichtlinie: kein Dateisystem außerhalb eines eigenen
 /// Tempdirs).
 #[test]
-fn test_facade_builds_and_polls_a_sensor_end_to_end() {
-    let root = tempfile::tempdir().expect("tempdir");
-    std::fs::write(root.path().join("stat"), "cpu 10 20 30 40\n").expect("write synthetic stat file");
+fn test_facade_builds_and_polls_a_sensor_end_to_end() -> TestResult {
+    let root = tempfile::tempdir().map_err(ctx("tempdir"))?;
+    std::fs::write(root.path().join("stat"), "cpu 10 20 30 40\n")
+        .map_err(ctx("write synthetic stat file"))?;
 
     let scope = ReadScope::from_roots([root.path().to_path_buf()]);
-    let handle = SensorHandle::new(SensorId::from_str("cpu-0"), Capability::ReadProcStat).bind(scope);
+    let handle =
+        SensorHandle::new(SensorId::from_str("cpu-0"), Capability::ReadProcStat).bind(scope);
     let sensor = CpuSensor::from(handle);
 
-    let reading = sensor
-        .poll(jiff::Timestamp::UNIX_EPOCH)
-        .expect("cpu sensor poll must succeed against a well-formed synthetic stat file");
+    let reading = sensor.poll(jiff::Timestamp::UNIX_EPOCH).map_err(ctx(
+        "cpu sensor poll must succeed against a well-formed synthetic stat file",
+    ))?;
 
-    assert!(!reading.samples.is_empty(), "a well-formed cpu line must yield at least one HostSample");
+    assert!(
+        !reading.samples.is_empty(),
+        "a well-formed cpu line must yield at least one HostSample"
+    );
+    Ok(())
 }
 
 /// "Bewerte einen Befund": eine Regel gegen ein beobachtetes Ereignis
@@ -47,7 +56,7 @@ fn test_facade_builds_and_polls_a_sensor_end_to_end() {
 /// zweiten Beispiel im `//!`-Block von `src/lib.rs` nimmt, hier als
 /// Integrationstest mit echten Assertions statt nur "kompiliert".
 #[test]
-fn test_facade_evaluates_a_finding_end_to_end() {
+fn test_facade_evaluates_a_finding_end_to_end() -> TestResult {
     let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
     let events = vec![SecurityEvent {
         sensor: SensorId::from_str("net-0"),
@@ -68,11 +77,19 @@ fn test_facade_evaluates_a_finding_end_to_end() {
     let rule: &dyn Rule = &EgressFlowRule;
 
     let checked = run_rules(&[rule], &ctx);
-    assert_eq!(checked.len(), 1, "a destination outside the allowed scope must trigger exactly one finding");
+    assert_eq!(
+        checked.len(),
+        1,
+        "a destination outside the allowed scope must trigger exactly one finding"
+    );
 
-    let finding = checked.into_iter().next().expect("checked above");
+    let finding = checked
+        .into_iter()
+        .next()
+        .ok_or(TestError::Missing("checked above"))?;
     let triaged = triage(finding, Verdict::Confirmed);
     assert_eq!(*triaged.verdict(), Verdict::Confirmed);
+    Ok(())
 }
 
 /// Die Standardausstattung (kein `privileged`-Feature) zieht keine der drei
@@ -82,7 +99,7 @@ fn test_facade_evaluates_a_finding_end_to_end() {
 /// gegen den tatsächlichen Manifest-Text, nicht gegen das, was diese Crate
 /// zu tun *behauptet*.
 #[test]
-fn test_default_feature_set_pulls_in_no_privileged_crate() {
+fn test_default_feature_set_pulls_in_no_privileged_crate() -> TestResult {
     let manifest = include_str!("../Cargo.toml");
 
     for privileged_crate in [
@@ -96,7 +113,11 @@ fn test_default_feature_set_pulls_in_no_privileged_crate() {
         let line = manifest
             .lines()
             .find(|line| line.trim_start().starts_with(&needle))
-            .unwrap_or_else(|| panic!("{privileged_crate} must be declared as a path dependency"));
+            .ok_or_else(|| {
+                TestError::Unexpected(format!(
+                    "{privileged_crate} must be declared as a path dependency"
+                ))
+            })?;
         assert!(
             line.contains("optional = true"),
             "{privileged_crate} must be `optional = true`, reachable only via the `privileged` feature: {line}"
@@ -104,9 +125,11 @@ fn test_default_feature_set_pulls_in_no_privileged_crate() {
     }
 
     assert!(
-        !manifest.contains("default = [\"privileged\"]") && !manifest.contains("default = [\"privileged\","),
+        !manifest.contains("default = [\"privileged\"]")
+            && !manifest.contains("default = [\"privileged\","),
         "no `[features]` default entry may enable `privileged` -- a bare `harw-dod` dependency must not carry any capability class"
     );
+    Ok(())
 }
 
 /// Belegt, dass die fünf Fähigkeits-Crates tatsächlich hinter dem
@@ -115,15 +138,19 @@ fn test_default_feature_set_pulls_in_no_privileged_crate() {
 /// ohne zugehörigen Feature-Eintrag wäre für jeden Konsumenten unerreichbar
 /// und ebenso falsch wie ein unbedingter Reexport.
 #[test]
-fn test_privileged_feature_activates_exactly_the_five_capability_crates() {
+fn test_privileged_feature_activates_exactly_the_five_capability_crates() -> TestResult {
     let manifest = include_str!("../Cargo.toml");
     let features_section = manifest
         .split("[features]")
         .nth(1)
-        .expect("manifest must declare a [features] section")
+        .ok_or(TestError::Missing(
+            "manifest must declare a [features] section",
+        ))?
         .split("[dev-dependencies]")
         .next()
-        .expect("[features] section must be followed by [dev-dependencies]");
+        .ok_or(TestError::Missing(
+            "[features] section must be followed by [dev-dependencies]",
+        ))?;
 
     for privileged_crate in [
         "harw-dod-authlog",
@@ -138,4 +165,5 @@ fn test_privileged_feature_activates_exactly_the_five_capability_crates() {
             "the `privileged` feature must list `{needle}`"
         );
     }
+    Ok(())
 }

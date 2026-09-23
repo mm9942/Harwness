@@ -268,6 +268,7 @@ async fn help(ctx: &OpContext, args: HelpArgs) -> Result<OpOutput, OpError> {
 mod tests {
     use std::sync::Arc;
 
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
     use harw_operations::operation::BusyAvailability;
     use harw_operations::{
@@ -346,21 +347,18 @@ mod tests {
     // ── HelpArgs ──────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_help_args_from_raw_args_sets_filter() {
-        let args = HelpArgs::from_raw_args(&toks(&["stat"]));
-        match args {
-            Ok(a) => assert_eq!(a.filter.as_deref(), Some("stat")),
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
-        }
+    fn test_help_args_from_raw_args_sets_filter() -> TestResult {
+        let args =
+            HelpArgs::from_raw_args(&toks(&["stat"])).map_err(ctx("HelpArgs::from_raw_args"))?;
+        assert_eq!(args.filter.as_deref(), Some("stat"));
+        Ok(())
     }
 
     #[test]
-    fn test_help_args_from_raw_args_empty_tokens_sets_filter_none() {
-        let args = HelpArgs::from_raw_args(&toks(&[]));
-        match args {
-            Ok(a) => assert!(a.filter.is_none()),
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
-        }
+    fn test_help_args_from_raw_args_empty_tokens_sets_filter_none() -> TestResult {
+        let args = HelpArgs::from_raw_args(&toks(&[])).map_err(ctx("HelpArgs::from_raw_args"))?;
+        assert!(args.filter.is_none());
+        Ok(())
     }
 
     // ── build_grouped_help ────────────────────────────────────────────────────
@@ -395,7 +393,7 @@ mod tests {
     /// Prüft, dass Model-Kategorie vor System-Kategorie erscheint, wenn beide
     /// vertreten sind — unabhängig von der Registrierungsreihenfolge.
     #[test]
-    fn test_help_output_orders_categories_deterministically() {
+    fn test_help_output_orders_categories_deterministically() -> TestResult {
         let sys_op = make_op(
             "status",
             "System-Status.",
@@ -414,17 +412,18 @@ mod tests {
         let ops: Vec<Arc<dyn Operation>> = vec![sys_op, model_op];
         let text = build_grouped_help(ops.iter(), None);
 
-        let model_pos = text
-            .find("Model:")
-            .expect("'Model:' muss in Ausgabe vorhanden sein");
-        let system_pos = text
-            .find("System:")
-            .expect("'System:' muss in Ausgabe vorhanden sein");
+        let model_pos = text.find("Model:").ok_or(TestError::Missing(
+            "'Model:' muss in Ausgabe vorhanden sein",
+        ))?;
+        let system_pos = text.find("System:").ok_or(TestError::Missing(
+            "'System:' muss in Ausgabe vorhanden sein",
+        ))?;
 
         assert!(
             model_pos < system_pos,
             "Model: muss vor System: erscheinen; war:\n{text}"
         );
+        Ok(())
     }
 
     /// `test_help_output_shows_aliases_when_present`
@@ -485,7 +484,7 @@ mod tests {
     /// Prüft, dass Operationen innerhalb derselben Kategorie alphabetisch
     /// nach Name sortiert sind.
     #[test]
-    fn test_help_output_sorts_commands_alphabetically_within_category() {
+    fn test_help_output_sorts_commands_alphabetically_within_category() -> TestResult {
         let ops: Vec<Arc<dyn Operation>> = vec![
             make_op(
                 "stop",
@@ -512,15 +511,20 @@ mod tests {
 
         let text = build_grouped_help(ops.iter(), None);
 
-        let pos_attach = text.find("/attach").expect("'/attach' fehlt");
-        let pos_ps = text.find("/ps").expect("'/ps' fehlt");
-        let pos_stop = text.find("/stop").expect("'/stop' fehlt");
+        let pos_attach = text
+            .find("/attach")
+            .ok_or(TestError::Missing("'/attach' fehlt"))?;
+        let pos_ps = text.find("/ps").ok_or(TestError::Missing("'/ps' fehlt"))?;
+        let pos_stop = text
+            .find("/stop")
+            .ok_or(TestError::Missing("'/stop' fehlt"))?;
 
         assert!(
             pos_attach < pos_ps,
             "/attach muss vor /ps stehen; war:\n{text}"
         );
         assert!(pos_ps < pos_stop, "/ps muss vor /stop stehen; war:\n{text}");
+        Ok(())
     }
 
     // ── Zusatz: leere Aliasse erzeugen kein "(aliases:)" ─────────────────────

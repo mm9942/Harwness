@@ -63,7 +63,9 @@ pub fn validate_finding(finding: &ResearchFinding) -> ResearchResult<()> {
         });
     }
     if finding.conclusion.trim().is_empty() {
-        return Err(ResearchError::EmptyField { field: "conclusion" });
+        return Err(ResearchError::EmptyField {
+            field: "conclusion",
+        });
     }
     if finding.produced_by.trim().is_empty() {
         return Err(ResearchError::EmptyField {
@@ -101,14 +103,20 @@ pub fn parse_and_validate(raw: &str) -> ResearchResult<ResearchFinding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::types::{QuestionId, SourceClass, SourceReference};
 
-    fn ts() -> jiff::Timestamp {
-        "2026-08-27T00:00:00Z".parse().unwrap()
+    fn ts() -> TestResult<jiff::Timestamp> {
+        "2026-08-27T00:00:00Z"
+            .parse()
+            .map_err(ctx("fixture timestamp is valid"))
     }
 
-    fn base_finding(confidence: Confidence, evidence: Vec<SourceReference>) -> ResearchFinding {
-        ResearchFinding {
+    fn base_finding(
+        confidence: Confidence,
+        evidence: Vec<SourceReference>,
+    ) -> TestResult<ResearchFinding> {
+        Ok(ResearchFinding {
             question_id: QuestionId::new("q-1"),
             conclusion: "some conclusion".to_owned(),
             evidence,
@@ -118,95 +126,121 @@ mod tests {
             unresolved_questions: vec![],
             confidence,
             produced_by: "explorer-1".to_owned(),
-            produced_at: ts(),
-        }
+            produced_at: ts()?,
+        })
     }
 
-    fn evidence() -> Vec<SourceReference> {
-        vec![SourceReference {
+    fn evidence() -> TestResult<Vec<SourceReference>> {
+        Ok(vec![SourceReference {
             kind: SourceClass::OfficialDocs,
             locator: "https://docs.rs/jiff".to_owned(),
-            retrieved_at: ts(),
+            retrieved_at: ts()?,
             digest: None,
             excerpt: "…".to_owned(),
-        }]
+        }])
     }
 
     #[test]
-    fn test_parse_finding_strips_json_fence() {
+    fn test_parse_finding_strips_json_fence() -> TestResult {
         let raw = "```json\n{\"question_id\":\"q-1\",\"conclusion\":\"c\",\"evidence\":[],\
                    \"confidence\":\"low\",\"produced_by\":\"agent-1\",\
                    \"produced_at\":\"2026-08-27T00:00:00Z\"}\n```";
-        let finding = parse_finding(raw).unwrap();
+        let finding = parse_finding(raw).map_err(ctx("parse_finding"))?;
         assert_eq!(finding.question_id.as_str(), "q-1");
         assert_eq!(finding.confidence, Confidence::Low);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_finding_without_fence_still_works() {
+    fn test_parse_finding_without_fence_still_works() -> TestResult {
         let raw = "{\"question_id\":\"q-2\",\"conclusion\":\"c\",\"evidence\":[],\
                    \"confidence\":\"low\",\"produced_by\":\"agent-1\",\
                    \"produced_at\":\"2026-08-27T00:00:00Z\"}";
-        let finding = parse_finding(raw).unwrap();
+        let finding = parse_finding(raw).map_err(ctx("parse_finding"))?;
         assert_eq!(finding.question_id.as_str(), "q-2");
+        Ok(())
     }
 
     #[test]
-    fn test_parse_finding_invalid_json_returns_json_error() {
-        let err = parse_finding("not json at all").unwrap_err();
+    fn test_parse_finding_invalid_json_returns_json_error() -> TestResult {
+        let result = parse_finding("not json at all");
+        let Err(err) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, ResearchError::Json(_)));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_finding_high_without_evidence_is_err() {
-        let finding = base_finding(Confidence::High, vec![]);
-        let err = validate_finding(&finding).unwrap_err();
+    fn test_validate_finding_high_without_evidence_is_err() -> TestResult {
+        let finding = base_finding(Confidence::High, vec![])?;
+        let result = validate_finding(&finding);
+        let Err(err) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(
             err,
             ResearchError::EvidenceRequired { question_id } if question_id.as_str() == "q-1"
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_finding_low_without_evidence_is_ok() {
-        let finding = base_finding(Confidence::Low, vec![]);
+    fn test_validate_finding_low_without_evidence_is_ok() -> TestResult {
+        let finding = base_finding(Confidence::Low, vec![])?;
         assert!(validate_finding(&finding).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_validate_finding_medium_with_evidence_is_ok() {
-        let finding = base_finding(Confidence::Medium, evidence());
+    fn test_validate_finding_medium_with_evidence_is_ok() -> TestResult {
+        let finding = base_finding(Confidence::Medium, evidence()?)?;
         assert!(validate_finding(&finding).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_validate_finding_empty_question_id_is_err() {
-        let mut finding = base_finding(Confidence::Low, vec![]);
+    fn test_validate_finding_empty_question_id_is_err() -> TestResult {
+        let mut finding = base_finding(Confidence::Low, vec![])?;
         finding.question_id = QuestionId::new("   ");
-        let err = validate_finding(&finding).unwrap_err();
+        let result = validate_finding(&finding);
+        let Err(err) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(
             err,
-            ResearchError::EmptyField { field: "question_id" }
+            ResearchError::EmptyField {
+                field: "question_id"
+            }
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_finding_empty_locator_is_err() {
-        let mut bad_evidence = evidence();
+    fn test_validate_finding_empty_locator_is_err() -> TestResult {
+        let mut bad_evidence = evidence()?;
         bad_evidence[0].locator = " ".to_owned();
-        let finding = base_finding(Confidence::High, bad_evidence);
-        let err = validate_finding(&finding).unwrap_err();
-        assert!(matches!(err, ResearchError::EmptyField { field: "locator" }));
+        let finding = base_finding(Confidence::High, bad_evidence)?;
+        let result = validate_finding(&finding);
+        let Err(err) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        assert!(matches!(
+            err,
+            ResearchError::EmptyField { field: "locator" }
+        ));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_and_validate_end_to_end() {
+    fn test_parse_and_validate_end_to_end() -> TestResult {
         let raw = "```json\n{\"question_id\":\"q-3\",\"conclusion\":\"c\",\
                    \"evidence\":[{\"kind\":\"web\",\"locator\":\"https://example.com\",\
                    \"retrieved_at\":\"2026-08-27T00:00:00Z\"}],\
                    \"confidence\":\"high\",\"produced_by\":\"agent-1\",\
                    \"produced_at\":\"2026-08-27T00:00:00Z\"}\n```";
-        let finding = parse_and_validate(raw).unwrap();
+        let finding = parse_and_validate(raw).map_err(ctx("parse_and_validate"))?;
         assert_eq!(finding.confidence, Confidence::High);
+        Ok(())
     }
 }

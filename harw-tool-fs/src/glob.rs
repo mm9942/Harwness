@@ -182,7 +182,8 @@ fn glob_blocking(root: &Path, args: &GlobArgs) -> ToolOutput {
         Err(err) => {
             return ToolOutput::error(format!(
                 "fs.glob: '{start_input}' ist kein lesbares Verzeichnis \
-                 (Symlinks werden nicht verfolgt): {err}"
+                 (Symlinks werden nicht verfolgt): {err}; erwartet ein Verzeichnis; für \
+                 einzelne Dateien fs.read oder fs.grep verwenden"
             ));
         }
     };
@@ -212,7 +213,7 @@ fn glob_blocking(root: &Path, args: &GlobArgs) -> ToolOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{Fixture, SECRET, call as tool_call, render};
+    use crate::test_support::{Fixture, SECRET, TestError, TestResult, call as tool_call, ctx, render};
     use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_tools::ToolExecutor;
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
@@ -223,9 +224,9 @@ mod tests {
     fn make_sandbox_with_permissions(
         root: &StdPath,
         permissions: Vec<Permission>,
-    ) -> SandboxSpec {
+    ) -> TestResult<SandboxSpec> {
         let ws_dir = root.join("ws");
-        fs::create_dir_all(&ws_dir).unwrap();
+        fs::create_dir_all(&ws_dir)?;
         let registry = WorkspaceRegistry::build(
             root,
             [WorkspaceRegistration {
@@ -234,11 +235,11 @@ mod tests {
                 root: PathBuf::from("ws"),
             }],
         )
-        .unwrap();
+        .map_err(ctx("registry"))?;
         let binding = registry
             .resolve(&TenantId::from_str("t"), &WorkspaceId::from_str("w"))
-            .unwrap();
-        SandboxSpec::from_resolved(binding, PermissionSet::from_policy(permissions))
+            .map_err(ctx("binding"))?;
+        Ok(SandboxSpec::from_resolved(binding, PermissionSet::from_policy(permissions)))
     }
 
     fn make_ctx(sandbox: SandboxSpec) -> ToolExecutionContext {
@@ -253,131 +254,140 @@ mod tests {
         }
     }
 
-    fn extract_matches(output: ToolOutput) -> Vec<String> {
+    fn extract_matches(output: ToolOutput) -> TestResult<Vec<String>> {
         match output {
             ToolOutput::Json { content } => content["matches"]
                 .as_array()
-                .expect("matches must be an array")
+                .ok_or(TestError::Missing("matches"))?
                 .iter()
-                .map(|v| v.as_str().expect("match must be a string").to_owned())
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .ok_or(TestError::Missing("match"))
+                })
                 .collect(),
-            other => panic!("expected json output, got: {other:?}"),
+            other => Err(TestError::Unexpected(format!("expected json output, got: {other:?}"))),
         }
     }
 
     #[tokio::test]
-    async fn test_fs_glob_finds_rust_files_recursively() {
-        let dir = TempDir::new().unwrap();
+    async fn test_fs_glob_finds_rust_files_recursively() -> TestResult {
+        let dir = TempDir::new()?;
         let ws = dir.path().join("ws");
-        fs::create_dir_all(ws.join("src/nested")).unwrap();
-        fs::write(ws.join("src/main.rs"), "fn main() {}").unwrap();
-        fs::write(ws.join("src/nested/lib.rs"), "pub fn f() {}").unwrap();
-        fs::write(ws.join("readme.md"), "not rust").unwrap();
+        fs::create_dir_all(ws.join("src/nested"))?;
+        fs::write(ws.join("src/main.rs"), "fn main() {}")?;
+        fs::write(ws.join("src/nested/lib.rs"), "pub fn f() {}")?;
+        fs::write(ws.join("readme.md"), "not rust")?;
 
-        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace]);
+        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace])?;
         let ctx = make_ctx(sandbox);
         let args = glob_args("**/*.rs", None, None);
 
-        let output = fs_glob(&ctx, args).await.unwrap();
-        let matches = extract_matches(output);
+        let output = fs_glob(&ctx, args).await?;
+        let matches = extract_matches(output)?;
 
         assert_eq!(
             matches,
             vec!["src/main.rs".to_owned(), "src/nested/lib.rs".to_owned()]
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_fs_glob_ignores_target_dir() {
-        let dir = TempDir::new().unwrap();
+    async fn test_fs_glob_ignores_target_dir() -> TestResult {
+        let dir = TempDir::new()?;
         let ws = dir.path().join("ws");
-        fs::create_dir_all(ws.join("target")).unwrap();
-        fs::create_dir_all(ws.join("src")).unwrap();
-        fs::write(ws.join("target/generated.rs"), "// generated").unwrap();
-        fs::write(ws.join("src/main.rs"), "fn main() {}").unwrap();
+        fs::create_dir_all(ws.join("target"))?;
+        fs::create_dir_all(ws.join("src"))?;
+        fs::write(ws.join("target/generated.rs"), "// generated")?;
+        fs::write(ws.join("src/main.rs"), "fn main() {}")?;
 
-        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace]);
+        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace])?;
         let ctx = make_ctx(sandbox);
         let args = glob_args("**/*.rs", None, None);
 
-        let output = fs_glob(&ctx, args).await.unwrap();
-        let matches = extract_matches(output);
+        let output = fs_glob(&ctx, args).await?;
+        let matches = extract_matches(output)?;
 
         assert_eq!(matches, vec!["src/main.rs".to_owned()]);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_fs_glob_respects_gitignore() {
-        let dir = TempDir::new().unwrap();
+    async fn test_fs_glob_respects_gitignore() -> TestResult {
+        let dir = TempDir::new()?;
         let ws = dir.path().join("ws");
-        fs::create_dir_all(&ws).unwrap();
-        fs::write(ws.join(".gitignore"), "ignored.rs\n").unwrap();
-        fs::write(ws.join("ignored.rs"), "// ignored").unwrap();
-        fs::write(ws.join("kept.rs"), "// kept").unwrap();
+        fs::create_dir_all(&ws)?;
+        fs::write(ws.join(".gitignore"), "ignored.rs\n")?;
+        fs::write(ws.join("ignored.rs"), "// ignored")?;
+        fs::write(ws.join("kept.rs"), "// kept")?;
 
-        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace]);
+        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace])?;
         let ctx = make_ctx(sandbox);
         let args = glob_args("*.rs", None, None);
 
-        let output = fs_glob(&ctx, args).await.unwrap();
-        let matches = extract_matches(output);
+        let output = fs_glob(&ctx, args).await?;
+        let matches = extract_matches(output)?;
 
         assert_eq!(matches, vec!["kept.rs".to_owned()]);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_fs_glob_caps_at_max_results() {
-        let dir = TempDir::new().unwrap();
+    async fn test_fs_glob_caps_at_max_results() -> TestResult {
+        let dir = TempDir::new()?;
         let ws = dir.path().join("ws");
-        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&ws)?;
         for i in 0..5 {
-            fs::write(ws.join(format!("file{i}.rs")), "// f").unwrap();
+            fs::write(ws.join(format!("file{i}.rs")), "// f")?;
         }
 
-        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace]);
+        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace])?;
         let ctx = make_ctx(sandbox);
         let args = glob_args("*.rs", None, Some(2));
 
-        let output = fs_glob(&ctx, args).await.unwrap();
+        let output = fs_glob(&ctx, args).await?;
         match output {
             ToolOutput::Json { content } => {
-                let matches = content["matches"].as_array().unwrap();
+                let matches = content["matches"].as_array().ok_or(TestError::Missing("matches"))?;
                 assert_eq!(matches.len(), 2, "expected result capped at 2");
                 assert!(
                     content["note"].as_str().is_some(),
                     "expected a truncation note"
                 );
             }
-            other => panic!("expected json output, got: {other:?}"),
+            other => return Err(TestError::Unexpected(format!("expected json output, got: {other:?}"))),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_fs_glob_invalid_pattern_returns_error() {
-        let dir = TempDir::new().unwrap();
+    async fn test_fs_glob_invalid_pattern_returns_error() -> TestResult {
+        let dir = TempDir::new()?;
         let ws = dir.path().join("ws");
-        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&ws)?;
 
-        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace]);
+        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace])?;
         let ctx = make_ctx(sandbox);
         let args = glob_args("[", None, None);
 
-        let output = fs_glob(&ctx, args).await.unwrap();
+        let output = fs_glob(&ctx, args).await?;
         match output {
             ToolOutput::Error { message } => {
                 assert!(message.contains("ungültiges Muster"), "got: {message}");
             }
-            other => panic!("expected error output, got: {other:?}"),
+            other => return Err(TestError::Unexpected(format!("expected error output, got: {other:?}"))),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_fs_glob_denied_when_no_read_permission() {
-        let dir = TempDir::new().unwrap();
+    async fn test_fs_glob_denied_when_no_read_permission() -> TestResult {
+        let dir = TempDir::new()?;
         let ws = dir.path().join("ws");
-        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&ws)?;
 
-        let sandbox = make_sandbox_with_permissions(dir.path(), vec![]);
+        let sandbox = make_sandbox_with_permissions(dir.path(), vec![])?;
         let ctx = make_ctx(sandbox);
         let call = harw_tools::ToolCall {
             id: ToolCallId::new(),
@@ -386,71 +396,79 @@ mod tests {
         };
 
         let tool = FsGlobTool;
-        let result = tool.execute(&ctx, &call).await.unwrap();
+        let result = tool.execute(&ctx, &call).await?;
         match result {
             ToolOutput::Error { message } => {
                 assert!(message.contains("ReadWorkspace"), "unexpected: {message}");
             }
-            other => panic!("expected error output, got: {other:?}"),
+            other => return Err(TestError::Unexpected(format!("expected error output, got: {other:?}"))),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_fs_glob_does_not_follow_symlinks() {
-        let fixture = Fixture::new();
-        fixture.plant_escapes();
-        fs::write(fixture.ws.join("nested/own.rs"), "// own").unwrap();
-        let ctx = fixture.ctx(vec![Permission::ReadWorkspace]);
+    async fn test_fs_glob_does_not_follow_symlinks() -> TestResult {
+        let fixture = Fixture::new()?;
+        fixture.plant_escapes()?;
+        fs::write(fixture.ws.join("nested/own.rs"), "// own")?;
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
 
-        let output = fs_glob(&ctx, glob_args("**/*", None, None)).await.unwrap();
-        let matches = extract_matches(output);
+        let output = fs_glob(&ctx, glob_args("**/*", None, None)).await?;
+        let matches = extract_matches(output)?;
         assert_eq!(matches, vec!["nested/own.rs".to_owned()]);
 
         for path in ["link_dir", "loop", "nested/up", "../outside"] {
             let args = glob_args("**/*", Some(path), None);
-            let output = fs_glob(&ctx, args).await.unwrap();
+            let output = fs_glob(&ctx, args).await?;
             assert!(matches!(output, ToolOutput::Error { .. }), "{path}: {output:?}");
-            assert!(!render(&output).contains(SECRET));
+            assert!(!render(&output)?.contains(SECRET));
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_fs_glob_pattern_is_relative_to_workspace_root() {
-        let fixture = Fixture::new();
-        fs::create_dir_all(fixture.ws.join("src/nested")).unwrap();
-        fs::write(fixture.ws.join("src/nested/lib.rs"), "").unwrap();
-        let ctx = fixture.ctx(vec![Permission::ReadWorkspace]);
+    async fn test_fs_glob_pattern_is_relative_to_workspace_root() -> TestResult {
+        let fixture = Fixture::new()?;
+        fs::create_dir_all(fixture.ws.join("src/nested"))?;
+        fs::write(fixture.ws.join("src/nested/lib.rs"), "")?;
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
 
         let args = glob_args("src/**/*.rs", Some("src"), None);
-        let output = fs_glob(&ctx, args).await.unwrap();
-        assert_eq!(extract_matches(output), vec!["src/nested/lib.rs".to_owned()]);
+        let output = fs_glob(&ctx, args).await?;
+        assert_eq!(extract_matches(output)?, vec!["src/nested/lib.rs".to_owned()]);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_fs_glob_caps_results_at_hard_limit() {
-        let fixture = Fixture::new();
+    async fn test_fs_glob_caps_results_at_hard_limit() -> TestResult {
+        let fixture = Fixture::new()?;
         for i in 0..(HARD_MAX_RESULTS + 5) {
-            fs::write(fixture.ws.join(format!("f{i:05}.rs")), "").unwrap();
+            fs::write(fixture.ws.join(format!("f{i:05}.rs")), "")?;
         }
-        let ctx = fixture.ctx(vec![Permission::ReadWorkspace]);
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
         let args = glob_args("*.rs", None, Some(usize::MAX));
-        let output = fs_glob(&ctx, args).await.unwrap();
+        let output = fs_glob(&ctx, args).await?;
         match output {
             ToolOutput::Json { content } => {
-                assert_eq!(content["matches"].as_array().unwrap().len(), HARD_MAX_RESULTS);
+                assert_eq!(
+                    content["matches"].as_array().ok_or(TestError::Missing("matches"))?.len(),
+                    HARD_MAX_RESULTS
+                );
                 assert_eq!(content["stopped"], "result_limit");
             }
-            other => panic!("expected json output, got: {other:?}"),
+            other => return Err(TestError::Unexpected(format!("expected json output, got: {other:?}"))),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_fs_glob_executor_runs_blocking_work() {
-        let fixture = Fixture::new();
-        fs::write(fixture.ws.join("a.rs"), "").unwrap();
-        let ctx = fixture.ctx(vec![Permission::ReadWorkspace]);
+    async fn test_fs_glob_executor_runs_blocking_work() -> TestResult {
+        let fixture = Fixture::new()?;
+        fs::write(fixture.ws.join("a.rs"), "")?;
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
         let call = tool_call("fs.glob", serde_json::json!({ "pattern": "*.rs" }));
-        let output = FsGlobTool.execute(&ctx, &call).await.unwrap();
-        assert_eq!(extract_matches(output), vec!["a.rs".to_owned()]);
+        let output = FsGlobTool.execute(&ctx, &call).await?;
+        assert_eq!(extract_matches(output)?, vec!["a.rs".to_owned()]);
+        Ok(())
     }
 }

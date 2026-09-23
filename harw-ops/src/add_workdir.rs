@@ -128,8 +128,8 @@ fn list_workdirs(ctx: &OpContext) -> Result<OpOutput, OpError> {
 /// - [`OpError::InvalidArguments`]: Validierung schlug fehl (siehe
 ///   [`harw_sandbox::ExtraRootError`]), oder `path_str` konnte für `--save`
 ///   nicht kanonisiert werden.
-/// - [`OpError::Execution`]: Projekt-Config-Pfad, -Öffnen oder -Speichern
-///   schlug bei `--save` fehl.
+/// - [`OpError::Execution`]: Projekt-Config-Pfad, -Öffnen, -Schreiben oder
+///   -Speichern schlug bei `--save` fehl.
 fn add_one_workdir(ctx: &OpContext, path_str: &str, save: bool) -> Result<OpOutput, OpError> {
     let Some(cell) = ctx.service::<ExtraRootsCell>() else {
         return Err(OpError::NotAvailable(NO_EXTRA_ROOTS_CELL.to_owned()));
@@ -151,20 +151,31 @@ fn add_one_workdir(ctx: &OpContext, path_str: &str, save: bool) -> Result<OpOutp
             ))
         })?;
         let path = crate::permissions::scope_path(ctx, SettingScope::Project)?;
-        let mut writer = ConfigWriter::open(&path)
-            .map_err(|error| OpError::Execution(format!("Config öffnen fehlgeschlagen: {error}")))?;
-        let newly_persisted = writer.append_extra_root(&canonical);
-        writer
-            .save()
-            .map_err(|error| OpError::Execution(format!("Config speichern fehlgeschlagen: {error}")))?;
+        let mut writer = ConfigWriter::open(&path).map_err(|error| {
+            OpError::Execution(format!("Config öffnen fehlgeschlagen: {error}"))
+        })?;
+        let newly_persisted = writer.append_extra_root(&canonical).map_err(|error| {
+            OpError::Execution(format!("Config schreiben fehlgeschlagen: {error}"))
+        })?;
+        writer.save().map_err(|error| {
+            OpError::Execution(format!("Config speichern fehlgeschlagen: {error}"))
+        })?;
         note = format!(
             " Dauerhaft in {} gemerkt{}.",
             path.display(),
-            if newly_persisted { "" } else { " (war bereits vorhanden)" }
+            if newly_persisted {
+                ""
+            } else {
+                " (war bereits vorhanden)"
+            }
         );
     }
 
-    let verb = if added { "hinzugefügt" } else { "bereits registriert" };
+    let verb = if added {
+        "hinzugefügt"
+    } else {
+        "bereits registriert"
+    };
     Ok(OpOutput::from(format!(
         "Arbeitsverzeichnis {} {}.{note}",
         candidate.display(),
@@ -210,7 +221,9 @@ fn remove_workdir(ctx: &OpContext, path_str: &str) -> Result<OpOutput, OpError> 
         return Err(OpError::NotAvailable(NO_EXTRA_ROOTS_CELL.to_owned()));
     };
     let candidate = PathBuf::from(path_str);
-    let canonical = candidate.canonicalize().unwrap_or_else(|_| candidate.clone());
+    let canonical = candidate
+        .canonicalize()
+        .unwrap_or_else(|_| candidate.clone());
 
     if !cell.remove(&canonical) {
         return Err(OpError::InvalidArguments(format!(
@@ -222,7 +235,10 @@ fn remove_workdir(ctx: &OpContext, path_str: &str) -> Result<OpOutput, OpError> 
     let mut note = String::new();
     if let Ok(path) = crate::permissions::scope_path(ctx, SettingScope::Project) {
         if let Ok(mut writer) = ConfigWriter::open(&path) {
-            if writer.remove_extra_root(&canonical) && writer.save().is_ok() {
+            // Bestes Bemühen: ein interner Schreibfehler (siehe
+            // `ConfigError::WriterShapeMismatch`) zählt hier wie "nicht
+            // entfernt", genau wie ein fehlgeschlagenes `save()`.
+            if writer.remove_extra_root(&canonical).unwrap_or(false) && writer.save().is_ok() {
                 note = format!(" Auch dauerhaft aus {} entfernt.", path.display());
             }
         }
@@ -237,22 +253,25 @@ fn remove_workdir(ctx: &OpContext, path_str: &str) -> Result<OpOutput, OpError> 
 #[cfg(test)]
 mod tests {
     use super::{AddWorkdirArgs, add_workdir};
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
-    use harw_sandbox    ::ExtraRootsCell;
+    use harw_sandbox::ExtraRootsCell;
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Baut einen [`OpContext`] dessen Sandbox-Root ein frisches temporäres
     /// Verzeichnis ist, optional mit registrierter [`ExtraRootsCell`].
-    fn test_context(with_cell: bool) -> (OpContext, PathBuf) {
+    fn test_context(with_cell: bool) -> TestResult<(OpContext, PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root =
             std::env::temp_dir().join(format!("harw-add-workdir-test-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(root.join("workspace")).expect("create test workspace");
+        std::fs::create_dir_all(root.join("workspace")).map_err(ctx("create test workspace"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -261,13 +280,13 @@ mod tests {
                 root: PathBuf::from("workspace"),
             }],
         )
-        .expect("build workspace registry");
+        .map_err(ctx("build workspace registry"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("workspace"),
             )
-            .expect("resolve workspace binding");
+            .map_err(ctx("resolve workspace binding"))?;
         let mut services = ServiceMap::new();
         if with_cell {
             services.insert(ExtraRootsCell::new());
@@ -281,47 +300,56 @@ mod tests {
             ),
             services,
         );
-        (ctx, root)
+        Ok((ctx, root))
     }
 
     #[test]
-    fn test_add_workdir_args_from_raw_args_captures_all_tokens() {
-        let args = AddWorkdirArgs::from_raw_args(&toks(&["/tmp/x", "--save"])).expect("parse");
+    fn test_add_workdir_args_from_raw_args_captures_all_tokens() -> TestResult {
+        let args =
+            AddWorkdirArgs::from_raw_args(&toks(&["/tmp/x", "--save"])).map_err(ctx("parse"))?;
         assert_eq!(args.tokens, vec!["/tmp/x".to_owned(), "--save".to_owned()]);
+        Ok(())
     }
 
     #[test]
-    fn test_add_workdir_args_from_raw_args_empty_is_empty() {
-        let args = AddWorkdirArgs::from_raw_args(&toks(&[])).expect("parse");
+    fn test_add_workdir_args_from_raw_args_empty_is_empty() -> TestResult {
+        let args = AddWorkdirArgs::from_raw_args(&toks(&[])).map_err(ctx("parse"))?;
         assert!(args.tokens.is_empty());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn add_workdir_without_a_cell_is_not_available() {
-        let (ctx, root) = test_context(false);
+    async fn add_workdir_without_a_cell_is_not_available() -> TestResult {
+        let (ctx, root) = test_context(false)?;
         let result = add_workdir(&ctx, AddWorkdirArgs { tokens: Vec::new() }).await;
         std::fs::remove_dir_all(&root).ok();
         match result {
             Err(OpError::NotAvailable(message)) => assert!(message.contains("ExtraRootsCell")),
-            other => panic!("expected NotAvailable, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn add_workdir_without_args_lists_empty_state() {
-        let (ctx, root) = test_context(true);
+    async fn add_workdir_without_args_lists_empty_state() -> TestResult {
+        let (ctx, root) = test_context(true)?;
         let result = add_workdir(&ctx, AddWorkdirArgs { tokens: Vec::new() })
             .await
-            .expect("list");
+            .map_err(crate::test_support::ctx("list"))?;
         std::fs::remove_dir_all(&root).ok();
         assert!(result.text.contains("Keine zusätzlichen"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn add_workdir_registers_a_valid_directory_for_the_session() {
-        let (ctx, root) = test_context(true);
+    async fn add_workdir_registers_a_valid_directory_for_the_session() -> TestResult {
+        let (ctx, root) = test_context(true)?;
         let extra = root.join("extra");
-        std::fs::create_dir_all(&extra).expect("create extra dir");
+        std::fs::create_dir_all(&extra).map_err(crate::test_support::ctx("create extra dir"))?;
 
         let output = add_workdir(
             &ctx,
@@ -330,19 +358,20 @@ mod tests {
             },
         )
         .await
-        .expect("add workdir");
+        .map_err(crate::test_support::ctx("add workdir"))?;
         assert!(output.text.contains("hinzugefügt"));
 
         let listed = add_workdir(&ctx, AddWorkdirArgs { tokens: Vec::new() })
             .await
-            .expect("list after add");
+            .map_err(crate::test_support::ctx("list after add"))?;
         std::fs::remove_dir_all(&root).ok();
         assert!(listed.text.contains("1 zusätzliche"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn add_workdir_rejects_root_directory() {
-        let (ctx, root) = test_context(true);
+    async fn add_workdir_rejects_root_directory() -> TestResult {
+        let (ctx, root) = test_context(true)?;
         let result = add_workdir(
             &ctx,
             AddWorkdirArgs {
@@ -353,20 +382,28 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         match result {
             Err(OpError::InvalidArguments(message)) => {
-                assert!(message.contains('/'), "message should mention '/': {message}");
+                assert!(
+                    message.contains('/'),
+                    "message should mention '/': {message}"
+                );
             }
-            other => panic!("expected invalid arguments, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected invalid arguments, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn add_workdir_rejects_user_home() {
-        let (ctx, root) = test_context(true);
+    async fn add_workdir_rejects_user_home() -> TestResult {
+        let (ctx, root) = test_context(true)?;
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let Some(home) = home else {
             // Kein $HOME in dieser Umgebung gesetzt — Test übersprungen statt fälschlich zu bestehen.
             std::fs::remove_dir_all(&root).ok();
-            return;
+            return Ok(());
         };
         let result = add_workdir(
             &ctx,
@@ -387,13 +424,18 @@ mod tests {
             Err(OpError::InvalidArguments(message)) => {
                 assert!(message.contains("Home-Verzeichnis"), "{message}");
             }
-            other => panic!("expected invalid arguments, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected invalid arguments, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn add_workdir_remove_without_path_is_invalid() {
-        let (ctx, root) = test_context(true);
+    async fn add_workdir_remove_without_path_is_invalid() -> TestResult {
+        let (ctx, root) = test_context(true)?;
         let result = add_workdir(
             &ctx,
             AddWorkdirArgs {
@@ -403,13 +445,14 @@ mod tests {
         .await;
         std::fs::remove_dir_all(&root).ok();
         assert!(matches!(result, Err(OpError::InvalidArguments(_))));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn add_workdir_remove_round_trips_a_registered_directory() {
-        let (ctx, root) = test_context(true);
+    async fn add_workdir_remove_round_trips_a_registered_directory() -> TestResult {
+        let (ctx, root) = test_context(true)?;
         let extra = root.join("extra");
-        std::fs::create_dir_all(&extra).expect("create extra dir");
+        std::fs::create_dir_all(&extra).map_err(crate::test_support::ctx("create extra dir"))?;
         let extra_str = extra.to_string_lossy().into_owned();
 
         add_workdir(
@@ -419,7 +462,7 @@ mod tests {
             },
         )
         .await
-        .expect("add");
+        .map_err(crate::test_support::ctx("add"))?;
 
         let removed = add_workdir(
             &ctx,
@@ -428,21 +471,22 @@ mod tests {
             },
         )
         .await
-        .expect("remove");
+        .map_err(crate::test_support::ctx("remove"))?;
         assert!(removed.text.contains("entfernt"));
 
         let listed = add_workdir(&ctx, AddWorkdirArgs { tokens: Vec::new() })
             .await
-            .expect("list after remove");
+            .map_err(crate::test_support::ctx("list after remove"))?;
         std::fs::remove_dir_all(&root).ok();
         assert!(listed.text.contains("Keine zusätzlichen"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn add_workdir_remove_of_unregistered_path_is_invalid() {
-        let (ctx, root) = test_context(true);
+    async fn add_workdir_remove_of_unregistered_path_is_invalid() -> TestResult {
+        let (ctx, root) = test_context(true)?;
         let extra = root.join("never-added");
-        std::fs::create_dir_all(&extra).expect("create dir");
+        std::fs::create_dir_all(&extra).map_err(crate::test_support::ctx("create dir"))?;
         let result = add_workdir(
             &ctx,
             AddWorkdirArgs {
@@ -452,5 +496,6 @@ mod tests {
         .await;
         std::fs::remove_dir_all(&root).ok();
         assert!(matches!(result, Err(OpError::InvalidArguments(_))));
+        Ok(())
     }
 }

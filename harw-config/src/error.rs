@@ -37,6 +37,11 @@ pub enum ConfigError {
     #[msg("channel token '{reference}' is reused by more than one channel binding")]
     DuplicateChannelToken { reference: String },
 
+    #[msg(
+        "internal error: key '{key}' was just normalised to {expected} but could not be read back as one"
+    )]
+    WriterShapeMismatch { key: String, expected: &'static str },
+
     #[from]
     Io(std::io::Error),
 }

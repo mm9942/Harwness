@@ -40,7 +40,7 @@
 //! assert!(!selector.matches("plan.current"));
 //! ```
 
-use crate::error::{validate_name, ContextError};
+use crate::error::{ContextError, validate_name};
 
 /// Ein Glob über Sektions- und Fragmentnamen.
 ///
@@ -191,40 +191,46 @@ fn segment_matches(pattern: &str, text: &str) -> bool {
 mod tests {
     use super::Selector;
     use crate::error::ContextError;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
-    fn test_matches_exact_literal_hit() {
-        let selector = Selector::try_new("history.tail").unwrap();
+    fn test_matches_exact_literal_hit() -> TestResult {
+        let selector = Selector::try_new("history.tail").map_err(ctx("history.tail"))?;
         assert!(selector.matches("history.tail"));
+        Ok(())
     }
 
     #[test]
-    fn test_matches_star_hit_within_segment() {
-        let selector = Selector::try_new("history.*").unwrap();
+    fn test_matches_star_hit_within_segment() -> TestResult {
+        let selector = Selector::try_new("history.*").map_err(ctx("history.*"))?;
         assert!(selector.matches("history.tail"));
         assert!(selector.matches("history.head"));
+        Ok(())
     }
 
     #[test]
-    fn test_matches_non_hit_different_literal() {
-        let selector = Selector::try_new("history.*").unwrap();
+    fn test_matches_non_hit_different_literal() -> TestResult {
+        let selector = Selector::try_new("history.*").map_err(ctx("history.*"))?;
         assert!(!selector.matches("plan.current"));
+        Ok(())
     }
 
     #[test]
-    fn test_matches_prefix_without_boundary_is_not_a_hit() {
+    fn test_matches_prefix_without_boundary_is_not_a_hit() -> TestResult {
         // "history" ist ein Literal ohne Wildcard: ein Präfix-Treffer ohne
         // explizite Grenze (`*`) darf nicht als Match zählen.
-        let selector = Selector::try_new("history").unwrap();
+        let selector = Selector::try_new("history").map_err(ctx("history"))?;
         assert!(!selector.matches("history.tail"));
         assert!(selector.matches("history"));
+        Ok(())
     }
 
     #[test]
-    fn test_matches_double_star_crosses_segment_boundary() {
-        let selector = Selector::try_new("plan/**").unwrap();
+    fn test_matches_double_star_crosses_segment_boundary() -> TestResult {
+        let selector = Selector::try_new("plan/**").map_err(ctx("plan/**"))?;
         assert!(selector.matches("plan/a/b/c"));
         assert!(selector.matches("plan"));
+        Ok(())
     }
 
     #[test]

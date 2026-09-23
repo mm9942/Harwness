@@ -150,3 +150,7 @@ pub use observed::ObservedBehavior;
 pub use remote::{RemoteEmbedBackend, RemoteEmbedder};
 pub use runtime::RuntimeProfile;
 pub use spec::EmbeddingSpec;
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

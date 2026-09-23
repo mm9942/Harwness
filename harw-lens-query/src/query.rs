@@ -86,7 +86,7 @@
 //! assert_eq!(hits.len(), 1);
 //! ```
 
-use harw_lens_embed::{prepare_query, Embedder, EmbeddingDescriptor};
+use harw_lens_embed::{Embedder, EmbeddingDescriptor, prepare_query};
 use harw_lens_index::{Query, VectorIndex};
 use harw_lens_rank::collapse;
 use harw_lens_types::{CollapsePolicy, EdgeIndex, IndexManifest, Ranked};
@@ -308,9 +308,12 @@ pub fn query_scoped(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_lens_embed::DeterministicEmbedder;
     use harw_lens_index::{Bm25Index, FlatIndex};
-    use harw_lens_types::{ByteSpan, Chunk, ChunkDigest, EdgeKind, IndexManifest, Locality, Metric, SourceRef};
+    use harw_lens_types::{
+        ByteSpan, Chunk, ChunkDigest, EdgeKind, IndexManifest, Locality, Metric, SourceRef,
+    };
     use harw_types::ContentDigest;
 
     fn descriptor() -> EmbeddingDescriptor {
@@ -355,27 +358,30 @@ mod tests {
 
     /// Baut einen `FlatIndex` aus roh vorgegebenen Chunks, mit Embeddings, die
     /// über `prepare_document` konsistent zum Query-Pfad entstehen.
-    fn build_flat_index(embedder: &DeterministicEmbedder, chunks: &[Chunk]) -> FlatIndex {
+    fn build_flat_index(
+        embedder: &DeterministicEmbedder,
+        chunks: &[Chunk],
+    ) -> TestResult<FlatIndex> {
         let entries: Vec<(Chunk, Vec<f32>)> = chunks
             .iter()
             .map(|chunk| {
                 let prepared = harw_lens_embed::prepare_document(&descriptor(), &chunk.text);
-                let embedding = embedder
+                let mut vectors = embedder
                     .embed(&[prepared])
-                    .expect("deterministic embedder never fails")
-                    .pop()
-                    .expect("one vector");
-                (chunk.clone(), embedding)
+                    .map_err(ctx("deterministic embedder never fails"))?;
+                let embedding = vectors.pop().ok_or(TestError::Missing("one vector"))?;
+                Ok((chunk.clone(), embedding))
             })
-            .collect();
-        FlatIndex::build(manifest(), entries).expect("test embeddings share a single dimension")
+            .collect::<TestResult<Vec<_>>>()?;
+        FlatIndex::build(manifest(), entries)
+            .map_err(ctx("test embeddings share a single dimension"))
     }
 
     #[test]
-    fn test_query_finds_matching_chunk_and_carries_correct_source_ref() {
+    fn test_query_finds_matching_chunk_and_carries_correct_source_ref() -> TestResult {
         let embedder = DeterministicEmbedder::new(8);
         let chunk = chunk_at("hallo welt", "a.txt", 0, 10);
-        let index = build_flat_index(&embedder, std::slice::from_ref(&chunk));
+        let index = build_flat_index(&embedder, std::slice::from_ref(&chunk))?;
 
         let hits = query(
             &index,
@@ -387,14 +393,15 @@ mod tests {
             CollapsePolicy::ByDigest,
             10,
         )
-        .expect("query succeeds");
+        .map_err(ctx("query succeeds"))?;
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].chunk.source, chunk.source);
+        Ok(())
     }
 
     #[test]
-    fn test_query_applies_query_prefix_never_document_prefix() {
+    fn test_query_applies_query_prefix_never_document_prefix() -> TestResult {
         // A recording embedder proves *which* text reached the embedder,
         // rather than only whether retrieval happened to work.
         struct RecordingEmbedder {
@@ -402,8 +409,14 @@ mod tests {
             seen: std::sync::Mutex<Vec<String>>,
         }
         impl Embedder for RecordingEmbedder {
-            fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, harw_lens_embed::EmbedError> {
-                self.seen.lock().expect("lock poisoned").extend(texts.iter().cloned());
+            fn embed(
+                &self,
+                texts: &[String],
+            ) -> Result<Vec<Vec<f32>>, harw_lens_embed::EmbedError> {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend(texts.iter().cloned());
                 self.inner.embed(texts)
             }
             fn dimensions(&self) -> usize {
@@ -416,7 +429,7 @@ mod tests {
             seen: std::sync::Mutex::new(Vec::new()),
         };
         let chunk = chunk_at("hallo welt", "a.txt", 0, 10);
-        let index = build_flat_index(&recorder.inner, std::slice::from_ref(&chunk));
+        let index = build_flat_index(&recorder.inner, std::slice::from_ref(&chunk))?;
 
         query(
             &index,
@@ -428,14 +441,19 @@ mod tests {
             CollapsePolicy::ByDigest,
             10,
         )
-        .expect("query succeeds");
+        .map_err(ctx("query succeeds"))?;
 
-        let seen = recorder.seen.lock().expect("lock poisoned").clone();
+        let seen = recorder
+            .seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         assert_eq!(seen, vec!["query: hallo welt".to_owned()]);
+        Ok(())
     }
 
     #[test]
-    fn test_query_leaves_query_text_field_unprefixed_for_lexical_search() {
+    fn test_query_leaves_query_text_field_unprefixed_for_lexical_search() -> TestResult {
         // `Bm25Index` tokenizes `Query::text` literally. If the embedding
         // query-prefix ("query: ") ever leaked into that field, the decoy
         // chunk below (which literally contains the word "query") would
@@ -468,21 +486,22 @@ mod tests {
             CollapsePolicy::ByDigest,
             10,
         )
-        .expect("query succeeds");
+        .map_err(ctx("query succeeds"))?;
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].chunk.source, matching.source);
+        Ok(())
     }
 
     #[test]
-    fn test_query_is_deterministic_across_repeated_calls() {
+    fn test_query_is_deterministic_across_repeated_calls() -> TestResult {
         let embedder = DeterministicEmbedder::new(8);
         let chunks = vec![
             chunk_at("first entry", "a.txt", 0, 11),
             chunk_at("second entry", "b.txt", 0, 12),
             chunk_at("third entry", "c.txt", 0, 11),
         ];
-        let index = build_flat_index(&embedder, &chunks);
+        let index = build_flat_index(&embedder, &chunks)?;
 
         let first = query(
             &index,
@@ -494,7 +513,7 @@ mod tests {
             CollapsePolicy::ByDigest,
             10,
         )
-        .expect("first query");
+        .map_err(ctx("first query"))?;
         let second = query(
             &index,
             "entry",
@@ -505,19 +524,20 @@ mod tests {
             CollapsePolicy::ByDigest,
             10,
         )
-        .expect("second query");
+        .map_err(ctx("second query"))?;
 
         let first_order: Vec<_> = first.iter().map(|r| r.chunk.digest).collect();
         let second_order: Vec<_> = second.iter().map(|r| r.chunk.digest).collect();
         assert_eq!(first_order, second_order);
+        Ok(())
     }
 
     #[test]
-    fn test_query_collapse_fixture_superseded_by_keeps_only_the_newer_chunk() {
+    fn test_query_collapse_fixture_superseded_by_keeps_only_the_newer_chunk() -> TestResult {
         let embedder = DeterministicEmbedder::new(8);
         let older = chunk_at("draft v1", "notes.md", 0, 8);
         let newer = chunk_at("draft v2", "notes.md", 0, 8);
-        let index = build_flat_index(&embedder, &[older.clone(), newer.clone()]);
+        let index = build_flat_index(&embedder, &[older.clone(), newer.clone()])?;
 
         let edges = EdgeIndex::from_edges([(older.digest, newer.digest)], std::iter::empty());
 
@@ -531,21 +551,21 @@ mod tests {
             CollapsePolicy::BySourceAndSpan,
             10,
         )
-        .expect("query succeeds");
+        .map_err(ctx("query succeeds"))?;
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].chunk.digest, newer.digest);
+        Ok(())
     }
 
     #[test]
-    fn test_query_collapse_fixture_contradicts_keeps_both_chunks() {
+    fn test_query_collapse_fixture_contradicts_keeps_both_chunks() -> TestResult {
         let embedder = DeterministicEmbedder::new(8);
         let claim_a = chunk_at("the build passes", "status.md", 0, 17);
         let claim_b = chunk_at("the build fails", "status.md", 0, 17);
-        let index = build_flat_index(&embedder, &[claim_a.clone(), claim_b.clone()]);
+        let index = build_flat_index(&embedder, &[claim_a.clone(), claim_b.clone()])?;
 
-        let edges =
-            EdgeIndex::from_edges(std::iter::empty(), [(claim_a.digest, claim_b.digest)]);
+        let edges = EdgeIndex::from_edges(std::iter::empty(), [(claim_a.digest, claim_b.digest)]);
         assert!(edges.has_edge(claim_a.digest, claim_b.digest, EdgeKind::Contradicts));
 
         let hits = query(
@@ -558,16 +578,17 @@ mod tests {
             CollapsePolicy::BySourceAndSpan,
             10,
         )
-        .expect("query succeeds");
+        .map_err(ctx("query succeeds"))?;
 
         // The most important fixture: two contradicting claims never collapse
         // into one -- doing so would silently discard whichever one loses the
         // tiebreak, deleting exactly the information the edge exists to keep.
         assert_eq!(hits.len(), 2);
+        Ok(())
     }
 
     #[test]
-    fn test_query_rejects_query_manifest_with_mismatched_model() {
+    fn test_query_rejects_query_manifest_with_mismatched_model() -> TestResult {
         // This is the test that the whole node exists to make possible: the
         // first version of `query` built its query manifest from
         // `index.manifest().clone()`, so `compatible_with` could never see a
@@ -577,14 +598,14 @@ mod tests {
         // answered with lookalike hits from the wrong vector space.
         let embedder = DeterministicEmbedder::new(8);
         let chunk = chunk_at("hallo welt", "a.txt", 0, 10);
-        let index = build_flat_index(&embedder, std::slice::from_ref(&chunk));
+        let index = build_flat_index(&embedder, std::slice::from_ref(&chunk))?;
 
         let mismatched_provenance = QueryProvenance {
             model: "model-b".to_owned(),
             chunker_version: manifest().chunker_version,
         };
 
-        let err = query(
+        let result = query(
             &index,
             "hallo welt",
             &embedder,
@@ -593,20 +614,26 @@ mod tests {
             &EdgeIndex::default(),
             CollapsePolicy::ByDigest,
             10,
-        )
-        .expect_err("a query embedded with a different model than the index must be rejected");
+        );
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "a query embedded with a different model than the index must be rejected"
+                    .to_owned(),
+            ));
+        };
 
         assert!(matches!(err, QueryError::Index(_)));
+        Ok(())
     }
 
     #[test]
-    fn test_query_accepts_query_manifest_with_matching_provenance() {
+    fn test_query_accepts_query_manifest_with_matching_provenance() -> TestResult {
         // The counter test to the one above: without it, the mismatch test
         // would only show that *something* about the call fails, not that
         // the check is specific to a mismatched model.
         let embedder = DeterministicEmbedder::new(8);
         let chunk = chunk_at("hallo welt", "a.txt", 0, 10);
-        let index = build_flat_index(&embedder, std::slice::from_ref(&chunk));
+        let index = build_flat_index(&embedder, std::slice::from_ref(&chunk))?;
 
         let hits = query(
             &index,
@@ -618,27 +645,30 @@ mod tests {
             CollapsePolicy::ByDigest,
             10,
         )
-        .expect("provenance matching the index manifest must be accepted");
+        .map_err(ctx(
+            "provenance matching the index manifest must be accepted",
+        ))?;
 
         assert_eq!(hits.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_query_rejects_query_manifest_with_mismatched_chunker_version() {
+    fn test_query_rejects_query_manifest_with_mismatched_chunker_version() -> TestResult {
         // Same rejection, different cause: the chunk boundaries shifted
         // between chunker versions, not the vector space -- but a caller
         // still embedded against an assumption the index no longer holds,
         // and the check must fire just the same.
         let embedder = DeterministicEmbedder::new(8);
         let chunk = chunk_at("hallo welt", "a.txt", 0, 10);
-        let index = build_flat_index(&embedder, std::slice::from_ref(&chunk));
+        let index = build_flat_index(&embedder, std::slice::from_ref(&chunk))?;
 
         let mismatched_provenance = QueryProvenance {
             model: manifest().model,
             chunker_version: manifest().chunker_version + 1,
         };
 
-        let err = query(
+        let result = query(
             &index,
             "hallo welt",
             &embedder,
@@ -647,9 +677,14 @@ mod tests {
             &EdgeIndex::default(),
             CollapsePolicy::ByDigest,
             10,
-        )
-        .expect_err("a query embedded against a different chunker version must be rejected");
+        );
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "a query embedded against a different chunker version must be rejected".to_owned(),
+            ));
+        };
 
         assert!(matches!(err, QueryError::Index(_)));
+        Ok(())
     }
 }

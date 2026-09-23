@@ -234,15 +234,52 @@ fn fs_read_spec() -> ToolSpec {
             ..Default::default()
         },
     );
+    props.insert(
+        "line".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::Integer),
+            description: Some(
+                "1-based line number to start reading from (line mode, the default). Cannot \
+                 be combined with 'offset'/'max_bytes'/'tail'. Default: 1."
+                    .to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
+    props.insert(
+        "limit".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::Integer),
+            description: Some(
+                "Number of lines to return (line mode). Default: 400, hard maximum: 2000. \
+                 Cannot be combined with 'offset'/'max_bytes'."
+                    .to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
+    props.insert(
+        "tail".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::Integer),
+            description: Some(
+                "Return only the last N lines (e.g. for logs), numbered with their real line \
+                 numbers. Hard maximum: 2000. Cannot be combined with 'line'/'offset'/'max_bytes'."
+                    .to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
 
     ToolSpec::Function(FunctionToolSpec {
         name: ToolName::new("fs.read"),
         description:
-            "Read a file relative to the workspace root. Returns file content as UTF-8 text. \
-             Binary files are returned with lossy UTF-8 decoding. \
-             Path traversal (e.g. '../') and symlinks are rejected. Directories cannot be read. \
-             Content longer than min(max_bytes, 64 KiB) is truncated, not refused; the reply \
-             then ends with a hint naming the offset to continue from."
+            "Liest eine Textdatei zeilenweise mit Zeilennummern (`line`, `limit`; Vorgabe ab \
+             Zeile 1, 400 Zeilen). Für bestimmte Stellen zuerst `fs.grep` (ripgrep, mit \
+             grep-Rückfall; liefert Zeilennummern), dann `fs.read` mit `line`. Kein \
+             `sed`/`head`/`tail`/`grep` über `shell.exec` nötig. `offset`/`max_bytes` lesen \
+             byteweise (Rückfall). `tail` = letzte N Zeilen, z. B. für Logs. Für PDFs \
+             `doc.read_pdf` verwenden."
                 .to_owned(),
         parameters: JsonSchema {
             schema_type: Some(JsonSchemaType::Object),
@@ -394,16 +431,22 @@ fn fs_search_spec() -> ToolSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use crate::test_support::{TestError, TestResult, ctx};
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::collections::HashSet;
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
-    fn make_sandbox_with_permissions(root: &Path, permissions: Vec<Permission>) -> SandboxSpec {
+    fn make_sandbox_with_permissions(
+        root: &Path,
+        permissions: Vec<Permission>,
+    ) -> TestResult<SandboxSpec> {
         let ws_dir = root.join("ws");
-        fs::create_dir_all(&ws_dir).unwrap();
+        fs::create_dir_all(&ws_dir)?;
         let registry = WorkspaceRegistry::build(
             root,
             [WorkspaceRegistration {
@@ -412,11 +455,14 @@ mod tests {
                 root: PathBuf::from("ws"),
             }],
         )
-        .unwrap();
+        .map_err(ctx("registry"))?;
         let binding = registry
             .resolve(&TenantId::from_str("t"), &WorkspaceId::from_str("w"))
-            .unwrap();
-        SandboxSpec::from_resolved(binding, PermissionSet::from_policy(permissions))
+            .map_err(ctx("binding"))?;
+        Ok(SandboxSpec::from_resolved(
+            binding,
+            PermissionSet::from_policy(permissions),
+        ))
     }
 
     fn make_ctx(sandbox: SandboxSpec) -> harw_tools::executor::ToolExecutionContext {
@@ -432,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fs_tool_provider_lists_six_tools() {
+    fn test_fs_tool_provider_lists_six_tools() -> TestResult {
         let provider = FsToolProvider::new();
         let tools = provider.tools();
         assert_eq!(tools.len(), 6, "expected exactly 6 tools");
@@ -444,10 +490,11 @@ mod tests {
         assert!(names.contains("fs.search"), "missing fs.search");
         assert!(names.contains("fs.glob"), "missing fs.glob");
         assert!(names.contains("fs.grep"), "missing fs.grep");
+        Ok(())
     }
 
     #[test]
-    fn test_fs_tool_provider_parallel_safe_flags() {
+    fn test_fs_tool_provider_parallel_safe_flags() -> TestResult {
         let provider = FsToolProvider::new();
 
         assert!(provider.parallel_safe(&ToolName::new("fs.read")));
@@ -457,10 +504,11 @@ mod tests {
         assert!(provider.parallel_safe(&ToolName::new("fs.grep")));
         assert!(!provider.parallel_safe(&ToolName::new("fs.write")));
         assert!(!provider.parallel_safe(&ToolName::new("unknown")));
+        Ok(())
     }
 
     #[test]
-    fn test_fs_tool_provider_returns_executor_for_each_tool() {
+    fn test_fs_tool_provider_returns_executor_for_each_tool() -> TestResult {
         let provider = FsToolProvider::new();
 
         assert!(provider.executor(&ToolName::new("fs.read")).is_some());
@@ -470,10 +518,11 @@ mod tests {
         assert!(provider.executor(&ToolName::new("fs.glob")).is_some());
         assert!(provider.executor(&ToolName::new("fs.grep")).is_some());
         assert!(provider.executor(&ToolName::new("unknown")).is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_fs_tool_provider_default_equals_new() {
+    fn test_fs_tool_provider_default_equals_new() -> TestResult {
         let provider_default = FsToolProvider::default();
         let provider_new = FsToolProvider::new();
 
@@ -483,29 +532,41 @@ mod tests {
         let names_default: Vec<&str> = tools_default.iter().map(|t| t.name()).collect();
         let names_new: Vec<&str> = tools_new.iter().map(|t| t.name()).collect();
         assert_eq!(names_default, names_new);
+        Ok(())
     }
 
     #[test]
-    fn test_fs_tool_provider_full_read_roundtrip() {
-        let dir = TempDir::new().unwrap();
+    fn test_fs_tool_provider_full_read_roundtrip() -> TestResult {
+        let dir = TempDir::new()?;
         let ws = dir.path().join("ws");
-        fs::create_dir_all(&ws).unwrap();
-        fs::write(ws.join("greet.txt"), "Hello, Harwness!").unwrap();
+        fs::create_dir_all(&ws)?;
+        fs::write(ws.join("greet.txt"), "Hello, Harwness!")?;
 
         let provider = FsToolProvider::new();
-        let executor = provider.executor(&ToolName::new("fs.read")).unwrap();
+        let executor = provider
+            .executor(&ToolName::new("fs.read"))
+            .ok_or(TestError::Missing("fs.read executor"))?;
 
-        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace]);
+        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace])?;
         let ctx = make_ctx(sandbox);
-        let call = make_call("fs.read", serde_json::json!({ "path": "greet.txt" }));
+        // W1-03: der Standardmodus von `fs.read` ist jetzt der Zeilenmodus;
+        // `offset: 0` erzwingt hier explizit den (unveränderten) Byte-Modus,
+        // damit dieser Roundtrip-Test weiterhin reine Byte-Ausgabe prüft.
+        let call = make_call(
+            "fs.read",
+            serde_json::json!({ "path": "greet.txt", "offset": 0 }),
+        );
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let result = rt.block_on(executor.execute(&ctx, &call)).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().build()?;
+        let result = rt.block_on(executor.execute(&ctx, &call))?;
         match result {
             harw_tools::ToolOutput::Text { content } => assert_eq!(content, "Hello, Harwness!"),
-            other => panic!("expected text output, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected text output, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 }

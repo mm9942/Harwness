@@ -299,9 +299,7 @@ fn bounded_reset_all(
     ceiling: &SessionActivation,
 ) -> ToolsCommandOutcome {
     *activation = ceiling.clone();
-    ToolsCommandOutcome::Confirmation(
-        "reset all tool overrides to the session ceiling".to_string(),
-    )
+    ToolsCommandOutcome::Confirmation("reset all tool overrides to the session ceiling".to_string())
 }
 
 /// Resets one named tool to the state the session ceiling gives it
@@ -413,6 +411,7 @@ fn bounded_set_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     fn full_activation() -> SessionActivation {
         SessionActivation::new(ToolProfile::Full)
@@ -450,7 +449,7 @@ mod tests {
     /// same output contract, driven through `dispatch_tools_command_bounded`
     /// with an empty snapshot instead of a registry.
     #[test]
-    fn test_dispatch_tools_command_bounded_list_returns_profile_line_when_no_tools() {
+    fn test_dispatch_tools_command_bounded_list_returns_profile_line_when_no_tools() -> TestResult {
         let known: Vec<(String, bool)> = Vec::new();
         let ceiling = full_activation();
         let mut activation = full_activation();
@@ -458,7 +457,7 @@ mod tests {
         let outcome = dispatch_tools_command_bounded("", &known, &mut activation, &ceiling);
 
         let ToolsCommandOutcome::Listing(lines) = outcome else {
-            panic!("expected Listing");
+            return Err(TestError::Unexpected("expected Listing".into()));
         };
         assert!(!lines.is_empty(), "should have at least a profile line");
         assert!(
@@ -469,6 +468,7 @@ mod tests {
             lines.iter().any(|l| l.contains("no tools registered")),
             "should mention no tools"
         );
+        Ok(())
     }
 
     /// `/tools` with two known tools lists both with on/off status markers
@@ -476,7 +476,8 @@ mod tests {
     ///
     /// Migrated from the removed `handle_tools_command` (W2d-2/F-TOOLS, R6).
     #[test]
-    fn test_dispatch_tools_command_bounded_list_shows_known_tools_with_snapshot_status() {
+    fn test_dispatch_tools_command_bounded_list_shows_known_tools_with_snapshot_status()
+    -> TestResult {
         let known = both_known(); // test.alpha=true, test.beta=false
         let ceiling = full_activation();
         let mut activation = full_activation();
@@ -484,16 +485,21 @@ mod tests {
         let outcome = dispatch_tools_command_bounded("", &known, &mut activation, &ceiling);
 
         let ToolsCommandOutcome::Listing(lines) = outcome else {
-            panic!("expected Listing");
+            return Err(TestError::Unexpected("expected Listing".into()));
         };
         assert!(
-            lines.iter().any(|l| l.contains("[on ]") && l.contains("test.alpha")),
+            lines
+                .iter()
+                .any(|l| l.contains("[on ]") && l.contains("test.alpha")),
             "alpha is enabled in the snapshot, so it should show as on"
         );
         assert!(
-            lines.iter().any(|l| l.contains("[off]") && l.contains("test.beta")),
+            lines
+                .iter()
+                .any(|l| l.contains("[off]") && l.contains("test.beta")),
             "beta is disabled in the snapshot, so it should show as off"
         );
+        Ok(())
     }
 
     /// `/tools on <name>` enables a tool that was disabled, when the ceiling
@@ -544,7 +550,7 @@ mod tests {
     /// `activation.profile()` is not asserted here; tool visibility is.
     #[test]
     fn test_dispatch_tools_command_bounded_profile_switch_reports_plain_confirmation_when_unrestricted()
-    {
+     {
         let known: Vec<(String, bool)> = Vec::new();
         let ceiling = full_activation();
         let mut activation = full_activation();
@@ -595,7 +601,8 @@ mod tests {
         let ceiling = full_activation();
         let mut activation = full_activation();
 
-        let outcome = dispatch_tools_command_bounded("frobnicate", &known, &mut activation, &ceiling);
+        let outcome =
+            dispatch_tools_command_bounded("frobnicate", &known, &mut activation, &ceiling);
 
         assert!(matches!(outcome, ToolsCommandOutcome::Error(_)));
     }
@@ -635,7 +642,10 @@ mod tests {
         let mut activation = full_activation();
         let ceiling = bounded_ceiling();
         let ghost = ToolName::new("test.ghost");
-        assert!(activation.is_tool_enabled(&ghost), "Full profile defaults to visible");
+        assert!(
+            activation.is_tool_enabled(&ghost),
+            "Full profile defaults to visible"
+        );
 
         let outcome =
             dispatch_tools_command_bounded("off test.ghost", &known, &mut activation, &ceiling);
@@ -743,7 +753,10 @@ mod tests {
                 "reset all tool overrides to the session ceiling".to_string()
             )
         );
-        assert!(activation.is_tool_enabled(&alpha), "ceiling allows test.alpha");
+        assert!(
+            activation.is_tool_enabled(&alpha),
+            "ceiling allows test.alpha"
+        );
         assert!(
             !activation.is_tool_enabled(&beta),
             "reset must not re-enable test.beta beyond the ceiling"
@@ -765,7 +778,9 @@ mod tests {
 
         assert_eq!(
             outcome,
-            ToolsCommandOutcome::Confirmation("reset test.beta to session ceiling (off)".to_string())
+            ToolsCommandOutcome::Confirmation(
+                "reset test.beta to session ceiling (off)".to_string()
+            )
         );
         assert!(
             !activation.is_tool_enabled(&beta),
@@ -797,10 +812,15 @@ mod tests {
         assert!(matches!(second, ToolsCommandOutcome::Confirmation(_)));
         assert_eq!(
             third,
-            ToolsCommandOutcome::Confirmation("reset test.alpha to session ceiling (on)".to_string())
+            ToolsCommandOutcome::Confirmation(
+                "reset test.alpha to session ceiling (on)".to_string()
+            )
         );
         assert!(!activation.is_tool_enabled(&beta), "test.beta stays off");
-        assert!(activation.is_tool_enabled(&alpha), "test.alpha restored to on");
+        assert!(
+            activation.is_tool_enabled(&alpha),
+            "test.alpha restored to on"
+        );
     }
 
     /// T3/T9(b): with a `Minimal` + allowlist ceiling, `on <tool outside>` is

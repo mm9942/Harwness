@@ -5,7 +5,7 @@
 //! Höchste Stabilität: diese Typen ändern sich fast nie.
 
 pub use crate::error::InvalidId;
-use serde::{de::Deserializer, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Deserializer};
 use std::fmt;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -243,6 +243,7 @@ mod tests {
         ApprovalId, ChannelId, ItemId, PeerId, SessionId, TenantId, ThreadId, ThreadRef,
         ToolCallId, TurnId, WorkId, WorkspaceId,
     };
+    use crate::test_support::TestResult;
 
     macro_rules! assert_fallible_apis_reject_blank_ids {
         ($id_type:ty) => {
@@ -255,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn every_id_type_rejects_empty_and_whitespace_only_values_from_fallible_apis() {
+    fn every_id_type_rejects_empty_and_whitespace_only_values_from_fallible_apis() -> TestResult {
         assert_fallible_apis_reject_blank_ids!(SessionId);
         assert_fallible_apis_reject_blank_ids!(ThreadId);
         assert_fallible_apis_reject_blank_ids!(TurnId);
@@ -269,34 +270,33 @@ mod tests {
         assert_fallible_apis_reject_blank_ids!(ThreadRef);
         assert_fallible_apis_reject_blank_ids!(ApprovalId);
 
-        assert_eq!(
-            SessionId::try_from_str(" session ").unwrap().as_str(),
-            " session "
-        );
+        assert_eq!(SessionId::try_from_str(" session ")?.as_str(), " session ");
+        Ok(())
     }
 
     #[test]
-    fn string_parser_and_legacy_constructor_are_available() {
-        assert_eq!("session".parse::<SessionId>().unwrap().as_str(), "session");
+    fn string_parser_and_legacy_constructor_are_available() -> TestResult {
+        assert_eq!("session".parse::<SessionId>()?.as_str(), "session");
         assert_eq!(SessionId::from_str("legacy").as_str(), "legacy");
+        Ok(())
     }
 
     #[test]
-    fn deserialization_rejects_empty_and_whitespace_only_values() {
+    fn deserialization_rejects_empty_and_whitespace_only_values() -> TestResult {
         assert!(serde_json::from_str::<ThreadRef>(r#"""#).is_err());
         assert!(serde_json::from_str::<ThreadRef>(r#""  \t\n""#).is_err());
         assert_eq!(
-            serde_json::from_str::<ThreadRef>(r#""thread-1""#)
-                .unwrap()
-                .as_str(),
+            serde_json::from_str::<ThreadRef>(r#""thread-1""#)?.as_str(),
             "thread-1"
         );
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod aw0_03_ids_tests {
     use super::{ActionId, BaselineId, CgroupId, FindingId, HostId, SensorId};
+    use crate::test_support::TestResult;
 
     macro_rules! assert_fallible_apis_reject_blank_ids {
         ($id_type:ty) => {
@@ -319,63 +319,48 @@ mod aw0_03_ids_tests {
     }
 
     #[test]
-    fn test_as_str_returns_what_went_in() {
+    fn test_as_str_returns_what_went_in() -> TestResult {
+        assert_eq!(FindingId::try_from_str("finding-1")?.as_str(), "finding-1");
+        assert_eq!(SensorId::try_from_str("sensor-1")?.as_str(), "sensor-1");
+        assert_eq!(ActionId::try_from_str("action-1")?.as_str(), "action-1");
         assert_eq!(
-            FindingId::try_from_str("finding-1").unwrap().as_str(),
-            "finding-1"
-        );
-        assert_eq!(
-            SensorId::try_from_str("sensor-1").unwrap().as_str(),
-            "sensor-1"
-        );
-        assert_eq!(
-            ActionId::try_from_str("action-1").unwrap().as_str(),
-            "action-1"
-        );
-        assert_eq!(
-            BaselineId::try_from_str("baseline-1").unwrap().as_str(),
+            BaselineId::try_from_str("baseline-1")?.as_str(),
             "baseline-1"
         );
-        assert_eq!(HostId::try_from_str("host-1").unwrap().as_str(), "host-1");
-        assert_eq!(
-            CgroupId::try_from_str("cgroup-1").unwrap().as_str(),
-            "cgroup-1"
-        );
+        assert_eq!(HostId::try_from_str("host-1")?.as_str(), "host-1");
+        assert_eq!(CgroupId::try_from_str("cgroup-1")?.as_str(), "cgroup-1");
+        Ok(())
     }
 
     #[test]
-    fn test_serde_roundtrip_for_new_id_types() {
-        let finding = FindingId::try_from_str("finding-42").unwrap();
-        let json = serde_json::to_string(&finding).unwrap();
+    fn test_serde_roundtrip_for_new_id_types() -> TestResult {
+        let finding = FindingId::try_from_str("finding-42")?;
+        let json = serde_json::to_string(&finding)?;
         assert_eq!(json, "\"finding-42\"");
-        let round_tripped: FindingId = serde_json::from_str(&json).unwrap();
+        let round_tripped: FindingId = serde_json::from_str(&json)?;
         assert_eq!(round_tripped, finding);
 
-        let sensor = SensorId::try_from_str("sensor-42").unwrap();
-        let round_tripped: SensorId =
-            serde_json::from_str(&serde_json::to_string(&sensor).unwrap()).unwrap();
+        let sensor = SensorId::try_from_str("sensor-42")?;
+        let round_tripped: SensorId = serde_json::from_str(&serde_json::to_string(&sensor)?)?;
         assert_eq!(round_tripped, sensor);
 
-        let action = ActionId::try_from_str("action-42").unwrap();
-        let round_tripped: ActionId =
-            serde_json::from_str(&serde_json::to_string(&action).unwrap()).unwrap();
+        let action = ActionId::try_from_str("action-42")?;
+        let round_tripped: ActionId = serde_json::from_str(&serde_json::to_string(&action)?)?;
         assert_eq!(round_tripped, action);
 
-        let baseline = BaselineId::try_from_str("baseline-42").unwrap();
-        let round_tripped: BaselineId =
-            serde_json::from_str(&serde_json::to_string(&baseline).unwrap()).unwrap();
+        let baseline = BaselineId::try_from_str("baseline-42")?;
+        let round_tripped: BaselineId = serde_json::from_str(&serde_json::to_string(&baseline)?)?;
         assert_eq!(round_tripped, baseline);
 
-        let host = HostId::try_from_str("host-42").unwrap();
-        let round_tripped: HostId =
-            serde_json::from_str(&serde_json::to_string(&host).unwrap()).unwrap();
+        let host = HostId::try_from_str("host-42")?;
+        let round_tripped: HostId = serde_json::from_str(&serde_json::to_string(&host)?)?;
         assert_eq!(round_tripped, host);
 
-        let cgroup = CgroupId::try_from_str("cgroup-42").unwrap();
-        let round_tripped: CgroupId =
-            serde_json::from_str(&serde_json::to_string(&cgroup).unwrap()).unwrap();
+        let cgroup = CgroupId::try_from_str("cgroup-42")?;
+        let round_tripped: CgroupId = serde_json::from_str(&serde_json::to_string(&cgroup)?)?;
         assert_eq!(round_tripped, cgroup);
 
         assert!(serde_json::from_str::<CgroupId>("\"\"").is_err());
+        Ok(())
     }
 }

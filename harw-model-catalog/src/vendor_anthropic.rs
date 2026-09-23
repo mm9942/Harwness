@@ -379,6 +379,7 @@ mod tests {
     use super::*;
     use crate::descriptor::{Modality, ModelLifecycle, ToolCallingSupport};
     use crate::observed::Score;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn test_anthropic_descriptors_required_models_present() {
@@ -454,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn test_anthropic_descriptors_legacy_models_are_deprecated() {
+    fn test_anthropic_descriptors_legacy_models_are_deprecated() -> TestResult {
         // All legacy/deprecated records from the JSON must carry Deprecated lifecycle.
         let deprecated_ids = [
             "claude-opus-4-7",
@@ -471,7 +472,7 @@ mod tests {
         for id in &deprecated_ids {
             let lifecycle = map
                 .get(*id)
-                .unwrap_or_else(|| panic!("Legacy model '{}' not found", id));
+                .ok_or_else(|| TestError::Unexpected(format!("Legacy model '{}' not found", id)))?;
             assert_eq!(
                 *lifecycle,
                 ModelLifecycle::Deprecated,
@@ -480,6 +481,7 @@ mod tests {
                 lifecycle
             );
         }
+        Ok(())
     }
 
     #[test]
@@ -503,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn test_anthropic_descriptors_current_models_native_tool_calling() {
+    fn test_anthropic_descriptors_current_models_native_tool_calling() -> TestResult {
         // GA Fable/Opus/Sonnet/Haiku models must use Native tool calling.
         let native_models = [
             "claude-fable-5",
@@ -518,7 +520,7 @@ mod tests {
         for id in &native_models {
             let tc = map
                 .get(*id)
-                .unwrap_or_else(|| panic!("Model '{}' not found", id));
+                .ok_or_else(|| TestError::Unexpected(format!("Model '{}' not found", id)))?;
             assert_eq!(
                 *tc,
                 ToolCallingSupport::Native,
@@ -526,6 +528,7 @@ mod tests {
                 id
             );
         }
+        Ok(())
     }
 
     #[test]

@@ -384,6 +384,7 @@ async fn web_docs_rs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     // --- URL-Bau ------------------------------------------------------------
 
@@ -476,13 +477,14 @@ mod tests {
 
     /// Jede gebaute URL ist https und hat docs.rs als Host.
     #[test]
-    fn test_docs_rs_url_is_always_https_on_docs_rs() {
-        let url = docs_rs_url("serde", None, None).expect("gültige URL");
+    fn test_docs_rs_url_is_always_https_on_docs_rs() -> TestResult {
+        let url = docs_rs_url("serde", None, None).ok_or(TestError::Missing("gültige URL"))?;
         assert!(url.starts_with("https://"));
         assert_eq!(
             harw_tools::host_from_url(&url).as_deref(),
             Some(DOCS_RS_HOST)
         );
+        Ok(())
     }
 
     // --- Inhaltsextraktion --------------------------------------------------
@@ -513,11 +515,12 @@ mod tests {
 
     /// Das Ergebnis lässt sich weiter nach Markdown konvertieren.
     #[test]
-    fn test_extract_main_content_result_converts_to_markdown() {
+    fn test_extract_main_content_result_converts_to_markdown() -> TestResult {
         let html = "<html><body><div id=\"main-content\"><h1>Titel</h1></div></body></html>";
-        let markdown =
-            html_to_markdown(&extract_main_content(html)).expect("die Konvertierung muss gelingen");
+        let markdown = html_to_markdown(&extract_main_content(html))
+            .map_err(ctx("die Konvertierung muss gelingen"))?;
         assert!(markdown.contains("Titel"), "unerwartet: {markdown}");
+        Ok(())
     }
 
     // --- Kürzung ------------------------------------------------------------
@@ -575,19 +578,29 @@ mod tests {
 
     /// Nur `crate_name` ist Pflicht.
     #[test]
-    fn test_docs_rs_args_schema_requires_crate_name_only() {
+    fn test_docs_rs_args_schema_requires_crate_name_only() -> TestResult {
         let harw_tools::ToolSpec::Function(spec) = WebDocsRsTool::spec();
         assert_eq!(spec.name.as_str(), "web.docs_rs");
-        let required = spec.parameters.required.expect("required-Liste");
+        let required = spec
+            .parameters
+            .required
+            .ok_or(TestError::Missing("required-Liste"))?;
         assert_eq!(required, vec!["crate_name".to_owned()]);
+        Ok(())
     }
 
     // --- Tests, die einen laufenden Server bräuchten ------------------------
 
     /// Benötigt Netzzugriff auf docs.rs; im CI nicht ausführbar.
+    ///
+    /// Kein `unimplemented!` mehr (Bible R089/R101/R165): `#[ignore]` hält
+    /// den Test ohnehin aus dem Default-Lauf heraus; würde er dennoch mit
+    /// `--ignored` ausgeführt, meldet er sich als `Err` statt zu paniken.
     #[tokio::test]
     #[ignore = "benötigt echten Netzzugriff auf docs.rs"]
-    async fn test_web_docs_rs_fetches_live_documentation() {
-        unimplemented!("echter Netzzugriff nicht erlaubt");
+    async fn test_web_docs_rs_fetches_live_documentation() -> TestResult {
+        Err(TestError::Unexpected(
+            "echter Netzzugriff nicht erlaubt".to_owned(),
+        ))
     }
 }

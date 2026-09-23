@@ -229,7 +229,11 @@ impl OtlpSink {
     /// assert_eq!(sink.buffered_len(), 0);
     /// ```
     #[must_use]
-    pub fn new(transport: Arc<dyn OtlpTransport>, clock: Arc<dyn OtlpClock>, config: OtlpConfig) -> Self {
+    pub fn new(
+        transport: Arc<dyn OtlpTransport>,
+        clock: Arc<dyn OtlpClock>,
+        config: OtlpConfig,
+    ) -> Self {
         Self {
             transport,
             clock,
@@ -347,7 +351,8 @@ impl OtlpSink {
             let nanos = match schema::timestamp_to_unix_nanos(point.timestamp) {
                 Ok(nanos) => nanos,
                 Err(_) => {
-                    self.timestamp_out_of_range_dropped.fetch_add(1, Ordering::Relaxed);
+                    self.timestamp_out_of_range_dropped
+                        .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
             };
@@ -417,7 +422,9 @@ impl OtlpSink {
             // eine Gruppe ohne jeden Datenpunkt — ein `Metric` ohne
             // `sum`/`gauge`/`histogram` trägt keine Information und würde
             // nur unnötig auf die Leitung gehen.
-            .filter(|metric| metric.sum.is_some() || metric.gauge.is_some() || metric.histogram.is_some())
+            .filter(|metric| {
+                metric.sum.is_some() || metric.gauge.is_some() || metric.histogram.is_some()
+            })
             .collect()
     }
 }
@@ -485,6 +492,7 @@ mod tests {
     use super::*;
     use crate::clock::FixedClock;
     use crate::config::{HeaderEntry, OtlpConfig};
+    use crate::test_support::{TestResult, ctx};
     use crate::transport::RecordingTransport;
 
     const COUNTER_NO_LABELS: MetricKey = MetricKey {
@@ -558,14 +566,14 @@ mod tests {
         (transport, sink)
     }
 
-    fn parse(bytes: &[u8]) -> serde_json::Value {
-        serde_json::from_slice(bytes).expect("sink must emit valid JSON")
+    fn parse(bytes: &[u8]) -> TestResult<serde_json::Value> {
+        serde_json::from_slice(bytes).map_err(ctx("sink must emit valid JSON"))
     }
 
     // ── Golden-Test ──────────────────────────────────────────────────────
 
     #[test]
-    fn test_golden_fixture_matches_expected_otlp_json() {
+    fn test_golden_fixture_matches_expected_otlp_json() -> TestResult {
         let (transport, sink) = epoch_sink(100, 100);
 
         sink.record(&COUNTER_NO_LABELS, MetricValue::Count(42), &[]);
@@ -591,76 +599,82 @@ mod tests {
 
         let sent = transport.sent_batches();
         assert_eq!(sent.len(), 1, "all five points fit in one batch");
-        let actual = parse(&sent[0]);
+        let actual = parse(&sent[0])?;
         let expected: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/golden_metrics_otlp.json"))
-                .expect("fixture must be valid JSON");
+                .map_err(ctx("fixture must be valid JSON"))?;
         assert_eq!(actual, expected);
+        Ok(())
     }
 
     // ── Jede `MetricKind`-Variante fällt auf das richtige Konstrukt ──────
 
     #[test]
-    fn test_counter_maps_to_sum_construct() {
+    fn test_counter_maps_to_sum_construct() -> TestResult {
         let (transport, sink) = epoch_sink(10, 10);
         sink.record(&COUNTER_NO_LABELS, MetricValue::Count(1), &[]);
         sink.flush();
 
         let sent = transport.sent_batches();
-        let value = parse(&sent[0]);
+        let value = parse(&sent[0])?;
         let metric = &value["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0];
         assert!(metric.get("sum").is_some());
         assert!(metric.get("gauge").is_none());
         assert!(metric.get("histogram").is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_gauge_maps_to_gauge_construct() {
+    fn test_gauge_maps_to_gauge_construct() -> TestResult {
         let (transport, sink) = epoch_sink(10, 10);
         sink.record(&GAUGE_NO_LABELS, MetricValue::Gauge(1.0), &[]);
         sink.flush();
 
         let sent = transport.sent_batches();
-        let value = parse(&sent[0]);
+        let value = parse(&sent[0])?;
         let metric = &value["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0];
         assert!(metric.get("gauge").is_some());
         assert!(metric.get("sum").is_none());
         assert!(metric.get("histogram").is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_histogram_maps_to_histogram_construct() {
+    fn test_histogram_maps_to_histogram_construct() -> TestResult {
         let (transport, sink) = epoch_sink(10, 10);
         sink.record(&LATENCY_HISTOGRAM, MetricValue::Observation(2.0), &[]);
         sink.flush();
 
         let sent = transport.sent_batches();
-        let value = parse(&sent[0]);
+        let value = parse(&sent[0])?;
         let metric = &value["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0];
         assert!(metric.get("histogram").is_some());
         assert!(metric.get("sum").is_none());
         assert!(metric.get("gauge").is_none());
+        Ok(())
     }
 
     // ── Labels/Attribute ─────────────────────────────────────────────────
 
     #[test]
-    fn test_empty_labels_omit_the_attributes_field() {
+    fn test_empty_labels_omit_the_attributes_field() -> TestResult {
         let (transport, sink) = epoch_sink(10, 10);
         sink.record(&COUNTER_NO_LABELS, MetricValue::Count(1), &[]);
         sink.flush();
 
         let sent = transport.sent_batches();
-        let value = parse(&sent[0]);
-        let point = &value["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["sum"]["dataPoints"][0];
+        let value = parse(&sent[0])?;
+        let point =
+            &value["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["sum"]["dataPoints"][0];
         assert!(
             point.get("attributes").is_none(),
             "an empty label set must not appear as an empty `attributes` array either: {point}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_labels_translate_to_sorted_attributes() {
+    fn test_labels_translate_to_sorted_attributes() -> TestResult {
         let (transport, sink) = epoch_sink(10, 10);
         sink.record(
             &CHILD_ADMITTED,
@@ -673,12 +687,14 @@ mod tests {
         sink.flush();
 
         let sent = transport.sent_batches();
-        let value = parse(&sent[0]);
-        let attributes = &value["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["sum"]["dataPoints"][0]["attributes"];
+        let value = parse(&sent[0])?;
+        let attributes = &value["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["sum"]["dataPoints"]
+            [0]["attributes"];
         assert_eq!(attributes[0]["key"], "clan");
         assert_eq!(attributes[0]["value"]["stringValue"], "research");
         assert_eq!(attributes[1]["key"], "role");
         assert_eq!(attributes[1]["value"]["stringValue"], "guard");
+        Ok(())
     }
 
     // ── Pufferüberlauf ───────────────────────────────────────────────────
@@ -691,7 +707,11 @@ mod tests {
             sink.record(&COUNTER_NO_LABELS, MetricValue::Count(1), &[]);
         }
 
-        assert_eq!(sink.buffered_len(), 3, "the buffer never grows past max_buffer");
+        assert_eq!(
+            sink.buffered_len(),
+            3,
+            "the buffer never grows past max_buffer"
+        );
         assert_eq!(
             sink.buffer_overflow_dropped_count(),
             2,
@@ -780,7 +800,11 @@ mod tests {
         sink.record(&WARDEN_ESCALATION, MetricValue::Count(1), &[]);
         sink.flush();
 
-        assert_eq!(sink.buffered_len(), 0, "a protected metric must never be buffered");
+        assert_eq!(
+            sink.buffered_len(),
+            0,
+            "a protected metric must never be buffered"
+        );
         assert!(
             transport.sent_batches().is_empty(),
             "a protected metric must never reach the transport"
@@ -821,14 +845,21 @@ mod tests {
         sink.record(&GAUGE_NO_LABELS, MetricValue::Gauge(f64::NAN), &[]);
         sink.flush();
 
-        assert!(transport.sent_batches().is_empty(), "a non-finite value must not reach JSON");
+        assert!(
+            transport.sent_batches().is_empty(),
+            "a non-finite value must not reach JSON"
+        );
         assert_eq!(sink.non_finite_dropped_count(), 1);
     }
 
     #[test]
     fn test_non_finite_histogram_observation_is_dropped_and_counted() {
         let (transport, sink) = epoch_sink(10, 10);
-        sink.record(&LATENCY_HISTOGRAM, MetricValue::Observation(f64::INFINITY), &[]);
+        sink.record(
+            &LATENCY_HISTOGRAM,
+            MetricValue::Observation(f64::INFINITY),
+            &[],
+        );
         sink.flush();
 
         assert!(transport.sent_batches().is_empty());

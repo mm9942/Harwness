@@ -461,6 +461,8 @@ pub(crate) fn config_layers_report_in(
     let Some(cwd) = cwd else {
         return Ok(report);
     };
+    let project = crate::project::discover_project(cwd, &[])?;
+    let cwd = project.root.as_path();
     let repo_local = cwd.join(HOME_DIR_NAME);
     if !repo_local.is_dir() {
         return Ok(report);
@@ -517,6 +519,7 @@ fn user_home_directory() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestResult;
 
     #[test]
     fn plans_dir_ends_with_plans_component_below_home() {
@@ -612,11 +615,12 @@ mod tests {
     }
 
     #[test]
-    fn visibility_index_dir_places_visibility_name_below_index_below_home() {
+    fn visibility_index_dir_places_visibility_name_below_index_below_home() -> TestResult {
         let home = PathBuf::from("/tmp/harw-test-home");
-        let index = visibility_index_dir(&home, "internal").unwrap();
+        let index = visibility_index_dir(&home, "internal")?;
         assert!(index.starts_with(&home));
         assert_eq!(index, home.join("index").join("internal"));
+        Ok(())
     }
 
     #[test]
@@ -645,13 +649,11 @@ mod tests {
     struct TempDir(PathBuf);
 
     impl TempDir {
-        fn new(label: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "harw-home-layers-{label}-{}",
-                uuid::Uuid::now_v7()
-            ));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
+        fn new(label: &str) -> TestResult<Self> {
+            let path = std::env::temp_dir()
+                .join(format!("harw-home-layers-{label}-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir_all(&path)?;
+            Ok(Self(path))
         }
     }
 
@@ -661,102 +663,104 @@ mod tests {
         }
     }
 
-    fn repo_with_harw(label: &str) -> TempDir {
-        let repo = TempDir::new(label);
-        std::fs::create_dir_all(repo.0.join(".harw/providers")).unwrap();
+    fn repo_with_harw(label: &str) -> TestResult<TempDir> {
+        let repo = TempDir::new(label)?;
+        std::fs::create_dir_all(repo.0.join(".harw/providers"))?;
         std::fs::write(
             repo.0.join(".harw/providers/openai.toml"),
             "name = \"openai\"\napi = \"openai\"\nbase_url = \"https://evil.example\"\n",
-        )
-        .unwrap();
-        repo
+        )?;
+        Ok(repo)
     }
 
     #[test]
-    fn untrusted_repo_layer_is_reported_but_not_layered() {
-        let home = TempDir::new("home");
-        let repo = repo_with_harw("repo");
+    fn untrusted_repo_layer_is_reported_but_not_layered() -> TestResult {
+        let home = TempDir::new("home")?;
+        let repo = repo_with_harw("repo")?;
 
-        let report =
-            config_layers_report_in(&home.0, DEFAULT_PROFILE, Some(repo.0.as_path())).unwrap();
+        let report = config_layers_report_in(&home.0, DEFAULT_PROFILE, Some(repo.0.as_path()))?;
 
         assert_eq!(
             report.layers,
-            vec![home.0.clone(), home.0.join("profiles").join(DEFAULT_PROFILE)]
+            vec![
+                home.0.clone(),
+                home.0.join("profiles").join(DEFAULT_PROFILE)
+            ]
         );
         assert_eq!(report.untrusted_repo, Some(repo.0.join(".harw")));
         assert_eq!(report.status, Some(TrustStatus::Untrusted));
+        Ok(())
     }
 
     #[test]
-    fn trusted_repo_layer_is_appended_until_it_changes() {
-        let home = TempDir::new("home");
-        let repo = repo_with_harw("repo");
-        crate::trust::trust_project(&home.0, &repo.0).unwrap();
+    fn trusted_repo_layer_is_appended_until_it_changes() -> TestResult {
+        let home = TempDir::new("home")?;
+        let repo = repo_with_harw("repo")?;
+        crate::trust::trust_project(&home.0, &repo.0)?;
 
-        let report =
-            config_layers_report_in(&home.0, DEFAULT_PROFILE, Some(repo.0.as_path())).unwrap();
+        let report = config_layers_report_in(&home.0, DEFAULT_PROFILE, Some(repo.0.as_path()))?;
         assert_eq!(report.layers.len(), 3);
         assert_eq!(report.layers.last(), Some(&repo.0.join(".harw")));
         assert_eq!(report.untrusted_repo, None);
         assert_eq!(report.status, Some(TrustStatus::Trusted));
 
-        std::fs::write(repo.0.join(".harw/auth.toml"), "[credentials]\n").unwrap();
-        let report =
-            config_layers_report_in(&home.0, DEFAULT_PROFILE, Some(repo.0.as_path())).unwrap();
+        std::fs::write(repo.0.join(".harw/auth.toml"), "[credentials]\n")?;
+        let report = config_layers_report_in(&home.0, DEFAULT_PROFILE, Some(repo.0.as_path()))?;
         assert_eq!(report.layers.len(), 2);
         assert_eq!(report.untrusted_repo, Some(repo.0.join(".harw")));
         assert_eq!(report.status, Some(TrustStatus::Changed));
+        Ok(())
     }
 
     #[test]
-    fn repo_layer_identical_to_home_is_not_duplicated() {
+    fn repo_layer_identical_to_home_is_not_duplicated() -> TestResult {
         // `harw` im `$HOME` gestartet: `<cwd>/.harw` ist der Root-Space selbst.
-        let user_home = TempDir::new("user-home");
+        let user_home = TempDir::new("user-home")?;
         let harw_home = user_home.0.join(HOME_DIR_NAME);
-        std::fs::create_dir_all(&harw_home).unwrap();
+        std::fs::create_dir_all(&harw_home)?;
 
-        let report = config_layers_report_in(
-            &harw_home,
-            DEFAULT_PROFILE,
-            Some(user_home.0.as_path()),
-        )
-        .unwrap();
+        let report =
+            config_layers_report_in(&harw_home, DEFAULT_PROFILE, Some(user_home.0.as_path()))?;
 
         assert_eq!(
             report.layers,
-            vec![harw_home.clone(), harw_home.join("profiles").join(DEFAULT_PROFILE)]
+            vec![
+                harw_home.clone(),
+                harw_home.join("profiles").join(DEFAULT_PROFILE)
+            ]
         );
         assert_eq!(report.untrusted_repo, None);
         assert_eq!(report.status, None);
         // Kein Trust-Store wurde dafür angelegt oder gelesen.
         assert!(!crate::trust::trusted_projects_path(&harw_home).exists());
+        Ok(())
     }
 
     #[test]
-    fn cwd_without_harw_or_unknown_cwd_yields_only_home_layers() {
-        let home = TempDir::new("home");
-        let plain = TempDir::new("plain");
+    fn cwd_without_harw_or_unknown_cwd_yields_only_home_layers() -> TestResult {
+        let home = TempDir::new("home")?;
+        let plain = TempDir::new("plain")?;
         for cwd in [Some(plain.0.as_path()), None] {
-            let report = config_layers_report_in(&home.0, DEFAULT_PROFILE, cwd).unwrap();
+            let report = config_layers_report_in(&home.0, DEFAULT_PROFILE, cwd)?;
             assert_eq!(report.layers.len(), 2);
             assert_eq!(report.untrusted_repo, None);
             assert_eq!(report.status, None);
         }
+        Ok(())
     }
 
     #[test]
-    fn config_layers_report_at_uses_explicit_cwd_without_process_cwd() {
+    fn config_layers_report_at_uses_explicit_cwd_without_process_cwd() -> TestResult {
         // Deckt `config_layers_report_at` gegen zwei Tempdirs ab — eine
         // freigegebene, eine nicht freigegebene Repo-`.harw` — ohne
         // `std::env::set_current_dir` zu benutzen (das ist prozessglobal und
         // würde parallele Tests gegenseitig stören).
-        let home = TempDir::new("at-home");
-        let trusted_repo = repo_with_harw("at-trusted-repo");
-        crate::trust::trust_project(&home.0, &trusted_repo.0).unwrap();
-        let untrusted_repo = repo_with_harw("at-untrusted-repo");
+        let home = TempDir::new("at-home")?;
+        let trusted_repo = repo_with_harw("at-trusted-repo")?;
+        crate::trust::trust_project(&home.0, &trusted_repo.0)?;
+        let untrusted_repo = repo_with_harw("at-untrusted-repo")?;
 
-        let trusted_report = config_layers_report_at(&home.0, trusted_repo.0.as_path()).unwrap();
+        let trusted_report = config_layers_report_at(&home.0, trusted_repo.0.as_path())?;
         assert_eq!(
             trusted_report.layers.last(),
             Some(&trusted_repo.0.join(".harw"))
@@ -764,27 +768,28 @@ mod tests {
         assert_eq!(trusted_report.untrusted_repo, None);
         assert_eq!(trusted_report.status, Some(TrustStatus::Trusted));
 
-        let untrusted_report =
-            config_layers_report_at(&home.0, untrusted_repo.0.as_path()).unwrap();
+        let untrusted_report = config_layers_report_at(&home.0, untrusted_repo.0.as_path())?;
         assert_eq!(untrusted_report.layers.len(), 2);
         assert_eq!(
             untrusted_report.untrusted_repo,
             Some(untrusted_repo.0.join(".harw"))
         );
         assert_eq!(untrusted_report.status, Some(TrustStatus::Untrusted));
+        Ok(())
     }
 
     #[test]
-    fn invalid_profile_name_is_rejected_before_trust_lookup() {
-        let home = TempDir::new("home");
+    fn invalid_profile_name_is_rejected_before_trust_lookup() -> TestResult {
+        let home = TempDir::new("home")?;
         assert!(matches!(
             config_layers_report_in(&home.0, "../escape", None),
             Err(HomeError::InvalidProfileName { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn aw_program_directories_are_pairwise_distinct() {
+    fn aw_program_directories_are_pairwise_distinct() -> TestResult {
         let home = PathBuf::from("/tmp/harw-test-home");
         // Jedes der sechs Teilsysteme braucht einen eigenen Speicherort;
         // keine zwei dürfen auf denselben Pfad kollidieren.
@@ -794,7 +799,7 @@ mod tests {
             ring_snapshot_dir(&home),
             scan_reports_dir(&home),
             lens_store_dir(&home),
-            visibility_index_dir(&home, "internal").unwrap(),
+            visibility_index_dir(&home, "internal")?,
         ];
         for (i, left) in dirs.iter().enumerate() {
             for (j, right) in dirs.iter().enumerate() {
@@ -803,5 +808,6 @@ mod tests {
                 }
             }
         }
+        Ok(())
     }
 }

@@ -73,6 +73,10 @@ pub struct ProviderToml {
     /// ist Aufgabe einer späteren Welle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_reasoning_effort: Option<ReasoningEffort>,
+    /// Opt-in: sendet pro Request `x-harw-session`, `x-harw-agent`, `x-harw-role`
+    /// an eigene Cloudflare-Worker/AI-Gateway-Endpunkte. Standard: aus.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gateway_identity_headers: bool,
 }
 
 /// Höchstlänge des `originator`-Felds (siehe [`ProviderToml::validate`]).
@@ -82,10 +86,7 @@ const MAX_ORIGINATOR_CHARS: usize = 64;
 /// Zeichen (0x20–0x7E) enthält — also ohne Steuerzeichen (Tab, Zeilenumbruch, …)
 /// und ohne Nicht-ASCII-Zeichen.
 fn is_printable_ascii(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .chars()
-            .all(|c| c.is_ascii() && !c.is_ascii_control())
+    !value.is_empty() && value.chars().all(|c| c.is_ascii() && !c.is_ascii_control())
 }
 
 impl ProviderToml {
@@ -201,33 +202,36 @@ impl Default for RateLimitToml {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn test_provider_with_auth_secretref() {
+    fn test_provider_with_auth_secretref() -> TestResult {
         let src = r#"
             name = "openai"
             api = "openai-chat"
             base_url = "https://api.openai.com/v1"
             auth = "env:OPENAI_API_KEY"
         "#;
-        let provider: ProviderToml = toml::from_str(src).unwrap();
+        let provider: ProviderToml = toml::from_str(src).map_err(ctx("provider toml parsen"))?;
         assert!(!provider.has_plaintext_secret());
+        Ok(())
     }
 
     #[test]
-    fn test_provider_legacy_api_key_flagged() {
+    fn test_provider_legacy_api_key_flagged() -> TestResult {
         let src = r#"
             name = "old-style"
             api = "openai-chat"
             base_url = "https://api.openai.com/v1"
             api_key = "sk-literal-value-here"
         "#;
-        let provider: ProviderToml = toml::from_str(src).unwrap();
+        let provider: ProviderToml = toml::from_str(src).map_err(ctx("provider toml parsen"))?;
         assert!(provider.has_plaintext_secret());
+        Ok(())
     }
 
     #[test]
-    fn test_provider_rejects_misspelled_auth_field() {
+    fn test_provider_rejects_misspelled_auth_field() -> TestResult {
         let src = r#"
             name = "openai"
             api = "openai-chat"
@@ -235,27 +239,33 @@ mod tests {
             auht = "env:OPENAI_API_KEY"
         "#;
 
-        let error = toml::from_str::<ProviderToml>(src).unwrap_err();
+        let Err(error) = toml::from_str::<ProviderToml>(src) else {
+            return Err(TestError::Unexpected(
+                "misspelled auth field should fail to parse".into(),
+            ));
+        };
         assert!(error.to_string().contains("unknown field `auht`"));
+        Ok(())
     }
 
-    fn provider_with_headers(headers: &[(&str, &str)]) -> ProviderToml {
+    fn provider_with_headers(headers: &[(&str, &str)]) -> TestResult<ProviderToml> {
         let src = r#"
             name = "gateway"
             api = "openai-chat"
             base_url = "https://gateway.example/v1"
             auth = "env:GATEWAY_KEY"
         "#;
-        let mut provider: ProviderToml = toml::from_str(src).unwrap();
+        let mut provider: ProviderToml =
+            toml::from_str(src).map_err(ctx("provider toml parsen"))?;
         provider.headers = headers
             .iter()
             .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
             .collect();
-        provider
+        Ok(provider)
     }
 
     #[test]
-    fn test_validate_rejects_plaintext_credential_headers() {
+    fn test_validate_rejects_plaintext_credential_headers() -> TestResult {
         for name in [
             "authorization",
             "Authorization",
@@ -265,8 +275,12 @@ mod tests {
             "x-auth-token",
             "X-Session-Token-Id",
         ] {
-            let provider = provider_with_headers(&[(name, "Bearer plaintext-header-secret")]);
-            let error = provider.validate().expect_err(name);
+            let provider = provider_with_headers(&[(name, "Bearer plaintext-header-secret")])?;
+            let Err(error) = provider.validate() else {
+                return Err(TestError::Unexpected(format!(
+                    "{name}: erwartete validate()-Ablehnung eines Klartext-Headers"
+                )));
+            };
             assert!(
                 matches!(&error, ConfigError::PlaintextSecret { field, .. }
                     if *field == format!("headers.{name}")),
@@ -274,47 +288,59 @@ mod tests {
             );
             assert!(!error.to_string().contains("plaintext-header-secret"));
         }
+        Ok(())
     }
 
     #[test]
-    fn test_validate_accepts_secret_ref_credential_headers_and_plain_other_headers() {
+    fn test_validate_accepts_secret_ref_credential_headers_and_plain_other_headers() -> TestResult {
         let provider = provider_with_headers(&[
             ("authorization", "env:GATEWAY_BEARER"),
             ("x-api-key", "secrets:gateway/api-key"),
             ("cf-aig-token", "file:/home/mia/.harw/secrets/cf.token"),
             ("x-provider-marker", "plain-value"),
             ("keyboard", "not-a-credential"),
-        ]);
-        provider.validate().expect("secret refs and ordinary headers are valid");
+        ])?;
+        provider
+            .validate()
+            .map_err(ctx("secret refs and ordinary headers are valid"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_malformed_secret_ref_and_reports_smallest_name() {
-        let provider = provider_with_headers(&[
-            ("x-api-key", "env:"),
-            ("authorization", "unknown:value"),
-        ]);
-        let error = provider.validate().unwrap_err();
+    fn test_validate_rejects_malformed_secret_ref_and_reports_smallest_name() -> TestResult {
+        let provider =
+            provider_with_headers(&[("x-api-key", "env:"), ("authorization", "unknown:value")])?;
+        let Err(error) = provider.validate() else {
+            return Err(TestError::Unexpected(
+                "malformed secret ref should fail validation".into(),
+            ));
+        };
         assert!(matches!(
             error,
             ConfigError::PlaintextSecret { ref field, .. } if field == "headers.authorization"
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_provider_rejects_misspelled_api_field() {
+    fn test_provider_rejects_misspelled_api_field() -> TestResult {
         let src = r#"
             name = "openai"
             ap = "openai-chat"
             base_url = "https://api.openai.com/v1"
         "#;
 
-        let error = toml::from_str::<ProviderToml>(src).unwrap_err();
+        let Err(error) = toml::from_str::<ProviderToml>(src) else {
+            return Err(TestError::Unexpected(
+                "misspelled api field should fail to parse".into(),
+            ));
+        };
         assert!(error.to_string().contains("unknown field `ap`"));
+        Ok(())
     }
 
     #[test]
-    fn test_provider_with_rate_limit_section_parses_and_defaults_margin() {
+    fn test_provider_with_rate_limit_section_parses_and_defaults_margin() -> TestResult {
         let src = r#"
             name = "openai"
             api = "openai-chat"
@@ -323,65 +349,76 @@ mod tests {
             [rate_limit]
             enabled = true
         "#;
-        let provider: ProviderToml = toml::from_str(src).unwrap();
-        let rate_limit = provider.rate_limit.expect("rate_limit section present");
+        let provider: ProviderToml = toml::from_str(src).map_err(ctx("provider toml parsen"))?;
+        let rate_limit = provider
+            .rate_limit
+            .ok_or(TestError::Missing("rate_limit section present"))?;
         assert!(rate_limit.enabled);
         assert_eq!(rate_limit.safety_margin_pct, 10);
+        Ok(())
     }
 
     #[test]
-    fn test_provider_without_rate_limit_section_is_none() {
+    fn test_provider_without_rate_limit_section_is_none() -> TestResult {
         let src = r#"
             name = "openai"
             api = "openai-chat"
             base_url = "https://api.openai.com/v1"
         "#;
-        let provider: ProviderToml = toml::from_str(src).unwrap();
+        let provider: ProviderToml = toml::from_str(src).map_err(ctx("provider toml parsen"))?;
         assert!(provider.rate_limit.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_provider_with_max_concurrency_round_trips() {
+    fn test_provider_with_max_concurrency_round_trips() -> TestResult {
         let src = r#"
             name = "workers-ai"
             api = "openai-chat"
             base_url = "https://gateway.example/v1"
             max_concurrency = 3
         "#;
-        let provider: ProviderToml = toml::from_str(src).unwrap();
+        let provider: ProviderToml = toml::from_str(src).map_err(ctx("provider toml parsen"))?;
         assert_eq!(provider.max_concurrency, Some(3));
-        provider.validate().expect("max_concurrency = 3 is valid");
+        provider
+            .validate()
+            .map_err(ctx("max_concurrency = 3 is valid"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_provider_without_max_concurrency_is_none() {
+    fn test_provider_without_max_concurrency_is_none() -> TestResult {
         let src = r#"
             name = "openai"
             api = "openai-chat"
             base_url = "https://api.openai.com/v1"
         "#;
-        let provider: ProviderToml = toml::from_str(src).unwrap();
+        let provider: ProviderToml = toml::from_str(src).map_err(ctx("provider toml parsen"))?;
         assert!(provider.max_concurrency.is_none());
-        provider.validate().expect("absent max_concurrency is valid (unbounded)");
+        provider
+            .validate()
+            .map_err(ctx("absent max_concurrency is valid (unbounded)"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_provider_with_max_concurrency_one_round_trips() {
+    fn test_provider_with_max_concurrency_one_round_trips() -> TestResult {
         let src = r#"
             name = "workers-ai"
             api = "openai-chat"
             base_url = "https://gateway.example/v1"
             max_concurrency = 1
         "#;
-        let provider: ProviderToml = toml::from_str(src).unwrap();
+        let provider: ProviderToml = toml::from_str(src).map_err(ctx("provider toml parsen"))?;
         assert_eq!(provider.max_concurrency, Some(1));
-        provider
-            .validate()
-            .expect("max_concurrency = 1 is the strictest valid value (fully serialized)");
+        provider.validate().map_err(ctx(
+            "max_concurrency = 1 is the strictest valid value (fully serialized)",
+        ))?;
+        Ok(())
     }
 
     #[test]
-    fn test_provider_with_max_concurrency_and_rate_limit_both_set_no_interaction() {
+    fn test_provider_with_max_concurrency_and_rate_limit_both_set_no_interaction() -> TestResult {
         let src = r#"
             name = "workers-ai"
             api = "openai-chat"
@@ -392,137 +429,243 @@ mod tests {
             enabled = true
             safety_margin_pct = 20
         "#;
-        let provider: ProviderToml = toml::from_str(src).unwrap();
+        let provider: ProviderToml = toml::from_str(src).map_err(ctx("provider toml parsen"))?;
         assert_eq!(provider.max_concurrency, Some(4));
-        let rate_limit = provider
-            .rate_limit
-            .clone()
-            .expect("rate_limit section present alongside max_concurrency");
+        let rate_limit = provider.rate_limit.clone().ok_or(TestError::Missing(
+            "rate_limit section present alongside max_concurrency",
+        ))?;
         assert!(rate_limit.enabled);
         assert_eq!(rate_limit.safety_margin_pct, 20);
-        provider
-            .validate()
-            .expect("max_concurrency and rate_limit are independent and both valid together");
+        provider.validate().map_err(ctx(
+            "max_concurrency and rate_limit are independent and both valid together",
+        ))?;
+        Ok(())
     }
 
     #[test]
-    fn test_provider_without_originator_is_none_and_omitted_on_serialize() {
+    fn test_provider_without_originator_is_none_and_omitted_on_serialize() -> TestResult {
         let src = r#"
             name = "openai"
             api = "openai-responses"
             base_url = "https://api.openai.com/v1"
         "#;
-        let provider: ProviderToml = toml::from_str(src).unwrap();
+        let provider: ProviderToml = toml::from_str(src).map_err(ctx("provider toml parsen"))?;
         assert!(provider.originator.is_none());
         provider
             .validate()
-            .expect("absent originator is valid (keeps the harw default)");
-        assert!(!toml::to_string(&provider).unwrap().contains("originator"));
+            .map_err(ctx("absent originator is valid (keeps the harw default)"))?;
+        assert!(
+            !toml::to_string(&provider)
+                .map_err(ctx("provider toml serialisieren"))?
+                .contains("originator")
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_provider_with_originator_round_trips() {
+    fn test_provider_with_originator_round_trips() -> TestResult {
         let src = r#"
             name = "openai"
             api = "openai-responses"
             base_url = "https://chatgpt.com/backend-api/codex"
             originator = "codex_cli_rs"
         "#;
-        let provider: ProviderToml = toml::from_str(src).unwrap();
+        let provider: ProviderToml = toml::from_str(src).map_err(ctx("provider toml parsen"))?;
         assert_eq!(provider.originator.as_deref(), Some("codex_cli_rs"));
-        provider.validate().expect("printable ASCII originator is valid");
+        provider
+            .validate()
+            .map_err(ctx("printable ASCII originator is valid"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_empty_originator() {
-        let mut provider = provider_with_headers(&[]);
+    fn test_validate_rejects_empty_originator() -> TestResult {
+        let mut provider = provider_with_headers(&[])?;
         provider.originator = Some(String::new());
-        let error = provider.validate().unwrap_err();
+        let Err(error) = provider.validate() else {
+            return Err(TestError::Unexpected(
+                "empty originator should fail validation".into(),
+            ));
+        };
         assert!(matches!(error, ConfigError::Invalid(ref msg) if msg.contains("originator")));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_originator_with_control_characters() {
-        let mut provider = provider_with_headers(&[]);
+    fn test_validate_rejects_originator_with_control_characters() -> TestResult {
+        let mut provider = provider_with_headers(&[])?;
         provider.originator = Some("bad\nvalue".to_owned());
-        let error = provider.validate().unwrap_err();
+        let Err(error) = provider.validate() else {
+            return Err(TestError::Unexpected(
+                "control characters in originator should fail validation".into(),
+            ));
+        };
         assert!(matches!(error, ConfigError::Invalid(ref msg) if msg.contains("originator")));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_originator_with_non_ascii() {
-        let mut provider = provider_with_headers(&[]);
+    fn test_validate_rejects_originator_with_non_ascii() -> TestResult {
+        let mut provider = provider_with_headers(&[])?;
         provider.originator = Some("härw".to_owned());
-        let error = provider.validate().unwrap_err();
+        let Err(error) = provider.validate() else {
+            return Err(TestError::Unexpected(
+                "non-ASCII originator should fail validation".into(),
+            ));
+        };
         assert!(matches!(error, ConfigError::Invalid(ref msg) if msg.contains("originator")));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_originator_over_max_length() {
-        let mut provider = provider_with_headers(&[]);
+    fn test_validate_rejects_originator_over_max_length() -> TestResult {
+        let mut provider = provider_with_headers(&[])?;
         provider.originator = Some("a".repeat(65));
-        let error = provider.validate().unwrap_err();
+        let Err(error) = provider.validate() else {
+            return Err(TestError::Unexpected(
+                "originator over the length cap should fail validation".into(),
+            ));
+        };
         assert!(matches!(error, ConfigError::Invalid(ref msg) if msg.contains("originator")));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_accepts_originator_at_max_length() {
-        let mut provider = provider_with_headers(&[]);
+    fn test_validate_accepts_originator_at_max_length() -> TestResult {
+        let mut provider = provider_with_headers(&[])?;
         provider.originator = Some("a".repeat(64));
         provider
             .validate()
-            .expect("originator at exactly the length cap is valid");
+            .map_err(ctx("originator at exactly the length cap is valid"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_provider_without_default_reasoning_effort_is_none() {
+    fn test_provider_without_default_reasoning_effort_is_none() -> TestResult {
         let src = r#"
             name = "openai"
             api = "openai-chat"
             base_url = "https://api.openai.com/v1"
         "#;
-        let provider: ProviderToml = toml::from_str(src).unwrap();
+        let provider: ProviderToml = toml::from_str(src).map_err(ctx("provider toml parsen"))?;
         assert!(provider.default_reasoning_effort.is_none());
-        assert!(!toml::to_string(&provider).unwrap().contains("default_reasoning_effort"));
+        assert!(
+            !toml::to_string(&provider)
+                .map_err(ctx("provider toml serialisieren"))?
+                .contains("default_reasoning_effort")
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_provider_with_default_reasoning_effort_round_trips() {
+    fn test_provider_with_default_reasoning_effort_round_trips() -> TestResult {
         let src = r#"
             name = "openai"
             api = "openai-chat"
             base_url = "https://api.openai.com/v1"
             default_reasoning_effort = "high"
         "#;
-        let provider: ProviderToml = toml::from_str(src).unwrap();
+        let provider: ProviderToml = toml::from_str(src).map_err(ctx("provider toml parsen"))?;
         assert_eq!(
             provider.default_reasoning_effort,
             Some(harw_types::ReasoningEffort::High)
         );
+        Ok(())
     }
 
     #[test]
-    fn test_provider_rejects_unknown_default_reasoning_effort_value() {
+    fn test_provider_rejects_unknown_default_reasoning_effort_value() -> TestResult {
         let src = r#"
             name = "openai"
             api = "openai-chat"
             base_url = "https://api.openai.com/v1"
             default_reasoning_effort = "extreme"
         "#;
-        let error = toml::from_str::<ProviderToml>(src).unwrap_err();
-        assert!(error.to_string().contains("extreme") || error.to_string().contains("unknown variant"));
+        let Err(error) = toml::from_str::<ProviderToml>(src) else {
+            return Err(TestError::Unexpected(
+                "unknown default_reasoning_effort value should fail to parse".into(),
+            ));
+        };
+        assert!(
+            error.to_string().contains("extreme") || error.to_string().contains("unknown variant")
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_max_concurrency_zero() {
+    fn test_provider_without_gateway_identity_headers_defaults_to_false() -> TestResult {
+        let src = r#"
+            name = "openai"
+            api = "openai-chat"
+            base_url = "https://api.openai.com/v1"
+        "#;
+        let provider: ProviderToml = toml::from_str(src).map_err(ctx("provider toml parsen"))?;
+        assert!(!provider.gateway_identity_headers);
+        Ok(())
+    }
+
+    #[test]
+    fn test_provider_with_gateway_identity_headers_true_parses() -> TestResult {
+        let src = r#"
+            name = "workers-ai"
+            api = "openai-chat"
+            base_url = "https://gateway.example/v1"
+            gateway_identity_headers = true
+        "#;
+        let provider: ProviderToml = toml::from_str(src).map_err(ctx("provider toml parsen"))?;
+        assert!(provider.gateway_identity_headers);
+        Ok(())
+    }
+
+    #[test]
+    fn test_serializing_default_gateway_identity_headers_omits_the_key() -> TestResult {
+        let src = r#"
+            name = "openai"
+            api = "openai-chat"
+            base_url = "https://api.openai.com/v1"
+        "#;
+        let provider: ProviderToml = toml::from_str(src).map_err(ctx("provider toml parsen"))?;
+        assert!(!provider.gateway_identity_headers);
+        assert!(
+            !toml::to_string(&provider)
+                .map_err(ctx("provider toml serialisieren"))?
+                .contains("gateway_identity_headers")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_serializing_true_gateway_identity_headers_round_trips() -> TestResult {
+        let src = r#"
+            name = "workers-ai"
+            api = "openai-chat"
+            base_url = "https://gateway.example/v1"
+            gateway_identity_headers = true
+        "#;
+        let provider: ProviderToml = toml::from_str(src).map_err(ctx("provider toml parsen"))?;
+        let serialized = toml::to_string(&provider).map_err(ctx("provider toml serialisieren"))?;
+        assert!(serialized.contains("gateway_identity_headers = true"));
+        let round_tripped: ProviderToml = toml::from_str(&serialized)
+            .map_err(ctx("serialisiertes provider toml erneut parsen"))?;
+        assert!(round_tripped.gateway_identity_headers);
+        Ok(())
+    }
+
+    #[test]
+    fn test_validate_rejects_max_concurrency_zero() -> TestResult {
         let src = r#"
             name = "workers-ai"
             api = "openai-chat"
             base_url = "https://gateway.example/v1"
             max_concurrency = 0
         "#;
-        let provider: ProviderToml = toml::from_str(src).unwrap();
-        let error = provider.validate().unwrap_err();
+        let provider: ProviderToml = toml::from_str(src).map_err(ctx("provider toml parsen"))?;
+        let Err(error) = provider.validate() else {
+            return Err(TestError::Unexpected(
+                "max_concurrency = 0 should fail validation".into(),
+            ));
+        };
         assert!(matches!(error, ConfigError::Invalid(ref msg) if msg.contains("max_concurrency")));
+        Ok(())
     }
 }

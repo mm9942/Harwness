@@ -183,6 +183,8 @@ mod tests {
     use harw_provider_http::SecretResolver;
     use secrecy::{ExposeSecret as _, SecretString};
 
+    use crate::test_support::{TestError, TestResult, ctx};
+
     use super::{
         McpCredentialError, parse_keyring_reference, resolve_mcp_credential,
         resolve_mcp_credential_with_resolver,
@@ -202,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn injected_resolver_resolves_and_trims_sealed_secret() {
+    fn injected_resolver_resolves_and_trims_sealed_secret() -> TestResult {
         let resolver = FakeSecretResolver {
             result: Ok(SecretString::new("  sealed-mcp-token\n".into())),
         };
@@ -211,54 +213,70 @@ mod tests {
             &SecretRef::Secrets("tenant/mcp-token".to_owned()),
             Some(&resolver),
         )
-        .expect("injected resolver should resolve a sealed MCP credential");
+        .map_err(ctx(
+            "injected resolver should resolve a sealed MCP credential",
+        ))?;
 
         assert_eq!(credential, b"sealed-mcp-token");
+        Ok(())
     }
 
     #[test]
-    fn secrets_reference_without_resolver_is_rejected() {
-        let error = resolve_mcp_credential(&SecretRef::Secrets("tenant/mcp-token".to_owned()))
-            .expect_err("secrets references must fail closed without a resolver");
+    fn secrets_reference_without_resolver_is_rejected() -> TestResult {
+        let Err(error) = resolve_mcp_credential(&SecretRef::Secrets("tenant/mcp-token".to_owned()))
+        else {
+            return Err(TestError::Unexpected(
+                "secrets references must fail closed without a resolver".into(),
+            ));
+        };
 
         assert!(matches!(
             error,
             McpCredentialError::UnsupportedReference { .. }
         ));
+        Ok(())
     }
 
     #[test]
-    fn resolver_failure_keeps_safe_diagnostic_without_secret_value() {
+    fn resolver_failure_keeps_safe_diagnostic_without_secret_value() -> TestResult {
         let secret = "must-not-appear-in-error";
         let resolver = FakeSecretResolver {
             result: Err("sealed secret resolver unavailable".to_owned()),
         };
 
-        let error = resolve_mcp_credential_with_resolver(
+        let Err(error) = resolve_mcp_credential_with_resolver(
             &SecretRef::Secrets("tenant/mcp-token".to_owned()),
             Some(&resolver),
-        )
-        .expect_err("resolver failures must reject the MCP credential");
+        ) else {
+            return Err(TestError::Unexpected(
+                "resolver failures must reject the MCP credential".into(),
+            ));
+        };
 
         let diagnostic = error.to_string();
         assert!(matches!(error, McpCredentialError::SecretResolution { .. }));
         assert!(diagnostic.contains("sealed secret resolver unavailable"));
         assert!(!diagnostic.contains(secret));
+        Ok(())
     }
 
     #[test]
-    fn empty_sealed_secret_is_rejected_after_trimming() {
+    fn empty_sealed_secret_is_rejected_after_trimming() -> TestResult {
         let resolver = FakeSecretResolver {
             result: Ok(SecretString::new(" \t\n ".into())),
         };
 
-        let error = resolve_mcp_credential_with_resolver(
+        let Err(error) = resolve_mcp_credential_with_resolver(
             &SecretRef::Secrets("tenant/mcp-token".to_owned()),
             Some(&resolver),
-        )
-        .expect_err("empty sealed credentials must be rejected");
+        ) else {
+            return Err(TestError::Unexpected(
+                "empty sealed credentials must be rejected".into(),
+            ));
+        };
 
         assert!(matches!(error, McpCredentialError::EmptyCredential { .. }));
+        Ok(())
     }
 
     #[test]
@@ -287,13 +305,19 @@ mod tests {
     }
 
     #[test]
-    fn invalid_keyring_reference_fails_before_os_keyring_access() {
-        let error = resolve_mcp_credential(&SecretRef::Keyring("service/account/extra".to_owned()))
-            .expect_err("ambiguous keyring references must be rejected");
+    fn invalid_keyring_reference_fails_before_os_keyring_access() -> TestResult {
+        let Err(error) =
+            resolve_mcp_credential(&SecretRef::Keyring("service/account/extra".to_owned()))
+        else {
+            return Err(TestError::Unexpected(
+                "ambiguous keyring references must be rejected".into(),
+            ));
+        };
 
         assert!(matches!(
             error,
             McpCredentialError::InvalidKeyringReference { .. }
         ));
+        Ok(())
     }
 }

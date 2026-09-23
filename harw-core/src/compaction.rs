@@ -26,8 +26,8 @@
 //!      identischem Tool-Namen und kanonisch-gleichen Argumenten sie ersetzt
 //!      hat (die Wiederholung war offensichtlich der eigentliche Versuch);
 //!    - wiederholte, identische, erfolgreiche schreibgeschützte Lesezugriffe
-//!      (`fs.read*`, `fs.list*`, `fs.search*`, `fs.grep*`, `fs.glob*`) werden
-//!      bis auf den letzten dedupliziert;
+//!      (`fs.read*`, `fs.list*`, `fs.search*`, `fs.grep*`, `fs.glob*`,
+//!      `doc.read_pdf*`) werden bis auf den letzten dedupliziert;
 //!    - übergroße alte Tool-Ergebnisse werden auf ihren Kopf plus einen
 //!      Kürzungs-Hinweis reduziert.
 //! 2. [`compact_session`]: führt zuerst [`deterministic_pass`] aus. Reicht das
@@ -57,9 +57,7 @@ use crate::history::ConversationHistory;
 use crate::model::{ModelProvider, ModelRequest};
 use crate::session::AgentSession;
 use harw_extension_api::LoadedInstructions;
-use harw_protocol::items::{
-    AssistantMessageItem, ContentPart, ToolCallResult, TurnItem,
-};
+use harw_protocol::items::{AssistantMessageItem, ContentPart, ToolCallResult, TurnItem};
 use harw_types::{ItemId, ModelId, SessionId, ToolCallId};
 use std::collections::{BTreeSet, HashMap};
 
@@ -229,7 +227,11 @@ pub fn deterministic_pass(
 
     drop_failed_retried_pairs(&mut older, &mut items_dropped);
     dedupe_read_only_calls(&mut older, &mut calls_deduplicated);
-    truncate_large_results(&mut older, plan.tool_result_head_bytes, &mut results_truncated);
+    truncate_large_results(
+        &mut older,
+        plan.tool_result_head_bytes,
+        &mut results_truncated,
+    );
 
     let mut items = Vec::new();
     for group in older {
@@ -344,7 +346,10 @@ fn item_bytes(item: &TurnItem) -> usize {
 /// für die harte Turn-Start-Verdichtung ableiten kann (Addendum D), ohne die
 /// Byte/Token-Faustregel ein zweites Mal zu implementieren.
 pub(crate) fn total_bytes(items: &[TurnItem]) -> usize {
-    items.iter().map(item_bytes).fold(0_usize, usize::saturating_add)
+    items
+        .iter()
+        .map(item_bytes)
+        .fold(0_usize, usize::saturating_add)
 }
 
 /// Schätzt die Token-Zahl der gesamten Historie aus ihrer Byte-Größe (4
@@ -506,9 +511,16 @@ fn drop_failed_retried_pairs(groups: &mut Vec<Vec<TurnItem>>, items_dropped: &mu
 
 /// `true`, wenn `tool_name` einem der schreibgeschützten Lesetool-Präfixe aus
 /// dem Vertrag entspricht (`fs.read`, `fs.list`, `fs.search`, `fs.grep`,
-/// `fs.glob`).
+/// `fs.glob`, `doc.read_pdf`).
 fn is_read_only_tool(tool_name: &str) -> bool {
-    const PREFIXES: [&str; 5] = ["fs.read", "fs.list", "fs.search", "fs.grep", "fs.glob"];
+    const PREFIXES: [&str; 6] = [
+        "fs.read",
+        "fs.list",
+        "fs.search",
+        "fs.grep",
+        "fs.glob",
+        "doc.read_pdf",
+    ];
     PREFIXES.iter().any(|prefix| tool_name.starts_with(prefix))
 }
 
@@ -569,21 +581,28 @@ fn tool_result_with_text(result: &ToolCallResult, text: String) -> ToolCallResul
 /// falls im Aufruf-Argument `path` ermittelbar.
 fn truncation_marker(elided_bytes: usize, path_hint: Option<&str>) -> String {
     match path_hint {
-        Some(path) => format!(
-            "\n[gekürzt: {elided_bytes} Bytes ({path}) — bei Bedarf erneut lesen]"
-        ),
+        Some(path) => {
+            format!("\n[gekürzt: {elided_bytes} Bytes ({path}) — bei Bedarf erneut lesen]")
+        }
         None => format!("\n[gekürzt: {elided_bytes} Bytes — bei Bedarf erneut lesen]"),
     }
 }
 
 /// Schritt (c): Inhalt alter Tool-Ergebnisse, die `head_bytes` überschreiten,
 /// wird auf ihren UTF-8-sicheren Kopf plus [`truncation_marker`] reduziert.
-fn truncate_large_results(groups: &mut [Vec<TurnItem>], head_bytes: usize, results_truncated: &mut usize) {
+fn truncate_large_results(
+    groups: &mut [Vec<TurnItem>],
+    head_bytes: usize,
+    results_truncated: &mut usize,
+) {
     let mut call_meta: HashMap<ToolCallId, (String, serde_json::Value)> = HashMap::new();
     for group in groups.iter() {
         for item in group {
             if let TurnItem::ToolCall(call) = item {
-                call_meta.insert(call.call_id.clone(), (call.tool_name.clone(), call.arguments.clone()));
+                call_meta.insert(
+                    call.call_id.clone(),
+                    (call.tool_name.clone(), call.arguments.clone()),
+                );
             }
         }
     }
@@ -599,13 +618,19 @@ fn truncate_large_results(groups: &mut [Vec<TurnItem>], head_bytes: usize, resul
             }
             let elided = text.len() - head_bytes;
             let head_end = floor_char_boundary(&text, head_bytes);
-            let path_hint = call_meta.get(&result_item.call_id).and_then(|(name, args)| {
-                if name.starts_with("fs.read") {
-                    args.get("path").and_then(|value| value.as_str()).map(str::to_owned)
-                } else {
-                    None
-                }
-            });
+            let path_hint = call_meta
+                .get(&result_item.call_id)
+                .and_then(|(name, args)| {
+                    // `fs.read` und `doc.read_pdf` tragen beide `{"path": …}`
+                    // als Argumentform — deshalb derselbe Pfad-Hinweis.
+                    if name.starts_with("fs.read") || name.starts_with("doc.read_pdf") {
+                        args.get("path")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_owned)
+                    } else {
+                        None
+                    }
+                });
             let marker = truncation_marker(elided, path_hint.as_deref());
 
             let mut truncated = String::with_capacity(head_end + marker.len());
@@ -639,7 +664,11 @@ fn render_item(out: &mut String, item: &TurnItem) {
             out.push_str(")\n");
         }
         TurnItem::ToolResult(result) => {
-            let status = if result.result.is_success() { "ok" } else { "error" };
+            let status = if result.result.is_success() {
+                "ok"
+            } else {
+                "error"
+            };
             out.push_str("Tool-Result [");
             out.push_str(status);
             out.push_str("]: ");
@@ -714,7 +743,9 @@ async fn summarize_older_half(
     match model.respond(request).await {
         Ok(response) => {
             let Some(text) = response.message.filter(|text| !text.trim().is_empty()) else {
-                tracing::warn!("compaction summary call returned no usable text; keeping deterministic result");
+                tracing::warn!(
+                    "compaction summary call returned no usable text; keeping deterministic result"
+                );
                 return None;
             };
 
@@ -747,6 +778,7 @@ async fn summarize_older_half(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestResult;
     use harw_protocol::items::{ToolCallItem, ToolResultItem, UserMessageItem};
 
     #[test]
@@ -761,7 +793,9 @@ mod tests {
     fn user(text: &str) -> TurnItem {
         TurnItem::UserMessage(UserMessageItem {
             id: ItemId::new(),
-            content: vec![ContentPart::Text { text: text.to_owned() }],
+            content: vec![ContentPart::Text {
+                text: text.to_owned(),
+            }],
         })
     }
 
@@ -816,7 +850,10 @@ mod tests {
 
         let (result, outcome) = deterministic_pass(&history, &default_plan());
 
-        assert_eq!(outcome.items_dropped, 2, "call+result des fehlgeschlagenen Paars entfernt");
+        assert_eq!(
+            outcome.items_dropped, 2,
+            "call+result des fehlgeschlagenen Paars entfernt"
+        );
         let call_ids: Vec<&str> = result
             .items()
             .iter()
@@ -825,7 +862,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(call_ids, vec!["b"], "nur der wiederholte, erfolgreiche Aufruf bleibt");
+        assert_eq!(
+            call_ids,
+            vec!["b"],
+            "nur der wiederholte, erfolgreiche Aufruf bleibt"
+        );
     }
 
     #[test]
@@ -847,11 +888,14 @@ mod tests {
 
         let (result, _outcome) = deterministic_pass(&history, &default_plan());
 
-        let has_current_failed_pair = result.items().iter().any(|item| {
-            matches!(item, TurnItem::ToolCall(c) if c.call_id.as_str() == "c")
-        }) && result.items().iter().any(|item| {
-            matches!(item, TurnItem::ToolResult(r) if r.call_id.as_str() == "c")
-        });
+        let has_current_failed_pair = result
+            .items()
+            .iter()
+            .any(|item| matches!(item, TurnItem::ToolCall(c) if c.call_id.as_str() == "c"))
+            && result
+                .items()
+                .iter()
+                .any(|item| matches!(item, TurnItem::ToolResult(r) if r.call_id.as_str() == "c"));
         assert!(
             has_current_failed_pair,
             "der fehlgeschlagene Aufruf im aktuellen Turn wurde entfernt, obwohl er unangetastet bleiben muss"
@@ -860,14 +904,21 @@ mod tests {
         let has_current_user = result.items().iter().any(|item| {
             matches!(item, TurnItem::UserMessage(m) if matches!(&m.content[0], ContentPart::Text { text } if text == "current trigger"))
         });
-        assert!(has_current_user, "die auslösende UserMessage des aktuellen Turns fehlt");
+        assert!(
+            has_current_user,
+            "die auslösende UserMessage des aktuellen Turns fehlt"
+        );
     }
 
     #[test]
-    fn test_deterministic_pass_truncates_oversized_old_result_with_marker() {
+    fn test_deterministic_pass_truncates_oversized_old_result_with_marker() -> TestResult {
         let mut history = ConversationHistory::new();
         history.push(user("older turn"));
-        history.push(call("a", "fs.read", serde_json::json!({"path": "/tmp/foo.txt"})));
+        history.push(call(
+            "a",
+            "fs.read",
+            serde_json::json!({"path": "/tmp/foo.txt"}),
+        ));
         let big_text = "y".repeat(200);
         history.push(ok_result("a", serde_json::json!(big_text)));
         history.push(user("current trigger"));
@@ -881,17 +932,127 @@ mod tests {
             .iter()
             .find_map(|item| match item {
                 TurnItem::ToolResult(r) if r.call_id.as_str() == "a" => match &r.result {
-                    ToolCallResult::Success { value: serde_json::Value::String(text) } => Some(text.clone()),
+                    ToolCallResult::Success {
+                        value: serde_json::Value::String(text),
+                    } => Some(text.clone()),
                     _ => None,
                 },
                 _ => None,
             })
-            .expect("gekürztes Ergebnis bleibt als Erfolg mit Text erhalten");
+            .ok_or(crate::test_support::TestError::Missing(
+                "gekürztes Ergebnis bleibt als Erfolg mit Text erhalten",
+            ))?;
 
         assert!(truncated_text.starts_with(&"y".repeat(plan.tool_result_head_bytes)));
         assert!(truncated_text.contains("gekürzt"));
-        assert!(truncated_text.contains("/tmp/foo.txt"), "Pfad-Hinweis für fs.read fehlt");
+        assert!(
+            truncated_text.contains("/tmp/foo.txt"),
+            "Pfad-Hinweis für fs.read fehlt"
+        );
         assert!(truncated_text.len() < big_text.len());
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_read_only_tool_covers_every_read_only_prefix() {
+        for tool_name in [
+            "fs.read",
+            "fs.list",
+            "fs.search",
+            "fs.grep",
+            "fs.glob",
+            "doc.read_pdf",
+            "fs.read.chunk",
+            "doc.read_pdf.page",
+        ] {
+            assert!(
+                is_read_only_tool(tool_name),
+                "'{tool_name}' muss als schreibgeschütztes Lesetool gelten"
+            );
+        }
+        for tool_name in ["fs.write", "shell.exec", "web.fetch", "doc.write_pdf"] {
+            assert!(
+                !is_read_only_tool(tool_name),
+                "'{tool_name}' darf nicht als schreibgeschütztes Lesetool gelten"
+            );
+        }
+    }
+
+    #[test]
+    fn test_deterministic_pass_truncates_oversized_doc_read_pdf_result_with_path_hint() -> TestResult
+    {
+        let mut history = ConversationHistory::new();
+        history.push(user("older turn"));
+        history.push(call(
+            "a",
+            "doc.read_pdf",
+            serde_json::json!({"path": "/tmp/report.pdf"}),
+        ));
+        let big_text = "z".repeat(200);
+        history.push(ok_result("a", serde_json::json!(big_text)));
+        history.push(user("current trigger"));
+
+        let plan = default_plan();
+        let (result, outcome) = deterministic_pass(&history, &plan);
+
+        assert_eq!(outcome.results_truncated, 1);
+        let truncated_text = result
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                TurnItem::ToolResult(r) if r.call_id.as_str() == "a" => match &r.result {
+                    ToolCallResult::Success {
+                        value: serde_json::Value::String(text),
+                    } => Some(text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .ok_or(crate::test_support::TestError::Missing(
+                "gekürztes Ergebnis bleibt als Erfolg mit Text erhalten",
+            ))?;
+
+        assert!(
+            truncated_text.contains("/tmp/report.pdf"),
+            "Pfad-Hinweis für doc.read_pdf fehlt"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_deterministic_pass_dedupes_repeated_doc_read_pdf_calls_keeping_last() {
+        let mut history = ConversationHistory::new();
+        history.push(user("older turn"));
+        history.push(call(
+            "a",
+            "doc.read_pdf",
+            serde_json::json!({"path": "/x.pdf"}),
+        ));
+        history.push(ok_result("a", serde_json::json!("first read")));
+        history.push(call(
+            "b",
+            "doc.read_pdf",
+            serde_json::json!({"path": "/x.pdf"}),
+        ));
+        history.push(ok_result("b", serde_json::json!("second read")));
+        history.push(user("current trigger"));
+
+        let (result, outcome) = deterministic_pass(&history, &default_plan());
+
+        assert_eq!(outcome.calls_deduplicated, 1);
+        let call_ids: Vec<&str> = result
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::ToolCall(c) => Some(c.call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            call_ids,
+            vec!["b"],
+            "nur das letzte Vorkommen bleibt erhalten"
+        );
     }
 
     #[test]
@@ -915,6 +1076,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(call_ids, vec!["b"], "nur das letzte Vorkommen bleibt erhalten");
+        assert_eq!(
+            call_ids,
+            vec!["b"],
+            "nur das letzte Vorkommen bleibt erhalten"
+        );
     }
 }

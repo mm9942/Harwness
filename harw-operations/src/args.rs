@@ -249,6 +249,7 @@ pub fn split_subcommand(tokens: &[String]) -> Option<(String, &[String])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
@@ -272,18 +273,25 @@ mod tests {
     // ── require_first ─────────────────────────────────────────────────────────
 
     #[test]
-    fn test_require_first_error_on_empty() {
-        let err = require_first(&[], "session id").unwrap_err();
+    fn test_require_first_error_on_empty() -> TestResult {
+        let Err(err) = require_first(&[], "session id") else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(
             matches!(err, OpError::InvalidArguments(ref msg) if msg.contains("session id")),
             "expected message to contain 'session id', got: {err}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_require_first_returns_first() {
+    fn test_require_first_returns_first() -> TestResult {
         let tokens = strs(&["id-99", "extra"]);
-        assert_eq!(require_first(&tokens, "id").unwrap(), "id-99");
+        assert_eq!(
+            require_first(&tokens, "id").map_err(ctx("require_first"))?,
+            "id-99"
+        );
+        Ok(())
     }
 
     // ── join_all_optional ─────────────────────────────────────────────────────
@@ -344,24 +352,30 @@ mod tests {
     }
 
     #[test]
-    fn test_require_empty_err_on_nonempty() {
+    fn test_require_empty_err_on_nonempty() -> TestResult {
         let tokens = strs(&["stray"]);
-        let err = require_empty(&tokens).unwrap_err();
+        let Err(err) = require_empty(&tokens) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(
             matches!(err, OpError::InvalidArguments(_)),
             "expected InvalidArguments, got: {err}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_require_empty_err_message_contains_count() {
+    fn test_require_empty_err_message_contains_count() -> TestResult {
         let tokens = strs(&["a", "b", "c"]);
-        let err = require_empty(&tokens).unwrap_err();
+        let Err(err) = require_empty(&tokens) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         let msg = err.to_string();
         assert!(
             msg.contains('3'),
             "error message should mention count 3, was: {msg}"
         );
+        Ok(())
     }
 
     // ── split_subcommand ──────────────────────────────────────────────────────
@@ -372,18 +386,22 @@ mod tests {
     }
 
     #[test]
-    fn test_split_subcommand_two_tokens_splits_head_and_tail() {
+    fn test_split_subcommand_two_tokens_splits_head_and_tail() -> TestResult {
         let tokens = strs(&["switch", "abc"]);
-        let (head, tail) = split_subcommand(&tokens).unwrap();
+        let (head, tail) =
+            split_subcommand(&tokens).ok_or(TestError::Missing("split_subcommand"))?;
         assert_eq!(head, "switch");
         assert_eq!(tail, &tokens[1..]);
+        Ok(())
     }
 
     #[test]
-    fn test_split_subcommand_single_token_tail_is_empty() {
+    fn test_split_subcommand_single_token_tail_is_empty() -> TestResult {
         let tokens = strs(&["list"]);
-        let (head, tail) = split_subcommand(&tokens).unwrap();
+        let (head, tail) =
+            split_subcommand(&tokens).ok_or(TestError::Missing("split_subcommand"))?;
         assert_eq!(head, "list");
         assert!(tail.is_empty());
+        Ok(())
     }
 }

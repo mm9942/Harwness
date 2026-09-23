@@ -266,6 +266,7 @@ pub(crate) fn clamp_max_tokens(model: &str, requested: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn test_lookup_finds_current_models_and_aliases() {
@@ -328,8 +329,8 @@ mod tests {
     }
 
     #[test]
-    fn test_effort_wire_value_maps_levels_per_model() {
-        let opus5 = lookup("claude-opus-5").expect("opus 5 row");
+    fn test_effort_wire_value_maps_levels_per_model() -> TestResult {
+        let opus5 = lookup("claude-opus-5").ok_or(TestError::Missing("opus 5 row"))?;
         assert_eq!(effort_wire_value(opus5, ReasoningEffort::Minimal), None);
         assert_eq!(effort_wire_value(opus5, ReasoningEffort::Low), Some("low"));
         assert_eq!(
@@ -346,7 +347,7 @@ mod tests {
         );
         assert_eq!(effort_wire_value(opus5, ReasoningEffort::Max), Some("max"));
 
-        let sonnet46 = lookup("claude-sonnet-4-6").expect("sonnet 4.6 row");
+        let sonnet46 = lookup("claude-sonnet-4-6").ok_or(TestError::Missing("sonnet 4.6 row"))?;
         assert_eq!(
             effort_wire_value(sonnet46, ReasoningEffort::Xhigh),
             Some("high")
@@ -356,14 +357,15 @@ mod tests {
             Some("max")
         );
 
-        let opus45 = lookup("claude-opus-4-5").expect("opus 4.5 row");
+        let opus45 = lookup("claude-opus-4-5").ok_or(TestError::Missing("opus 4.5 row"))?;
         assert_eq!(
             effort_wire_value(opus45, ReasoningEffort::Max),
             Some("high")
         );
 
-        let haiku = lookup("claude-haiku-4-5").expect("haiku row");
+        let haiku = lookup("claude-haiku-4-5").ok_or(TestError::Missing("haiku row"))?;
         assert_eq!(effort_wire_value(haiku, ReasoningEffort::High), None);
+        Ok(())
     }
 
     #[test]

@@ -130,6 +130,7 @@ pub fn lenient_opt_usize<'de, D: serde::Deserializer<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[derive(Debug, Deserialize)]
     struct U64Args {
@@ -144,77 +145,103 @@ mod tests {
     }
 
     #[test]
-    fn test_lenient_opt_u64_accepts_number() {
-        let parsed: U64Args = serde_json::from_str(r#"{"value": 8000}"#).expect("number parses");
+    fn test_lenient_opt_u64_accepts_number() -> TestResult {
+        let parsed: U64Args =
+            serde_json::from_str(r#"{"value": 8000}"#).map_err(ctx("number parses"))?;
         assert_eq!(parsed.value, Some(8000));
+        Ok(())
     }
 
     #[test]
-    fn test_lenient_opt_u64_accepts_numeric_string() {
+    fn test_lenient_opt_u64_accepts_numeric_string() -> TestResult {
         let parsed: U64Args =
-            serde_json::from_str(r#"{"value": "8000"}"#).expect("numeric string parses");
+            serde_json::from_str(r#"{"value": "8000"}"#).map_err(ctx("numeric string parses"))?;
         assert_eq!(parsed.value, Some(8000));
+        Ok(())
     }
 
     #[test]
-    fn test_lenient_opt_u64_accepts_padded_numeric_string() {
-        let parsed: U64Args =
-            serde_json::from_str(r#"{"value": " 42 "}"#).expect("padded numeric string parses");
+    fn test_lenient_opt_u64_accepts_padded_numeric_string() -> TestResult {
+        let parsed: U64Args = serde_json::from_str(r#"{"value": " 42 "}"#)
+            .map_err(ctx("padded numeric string parses"))?;
         assert_eq!(parsed.value, Some(42));
+        Ok(())
     }
 
     #[test]
-    fn test_lenient_opt_u64_accepts_null() {
-        let parsed: U64Args = serde_json::from_str(r#"{"value": null}"#).expect("null parses");
+    fn test_lenient_opt_u64_accepts_null() -> TestResult {
+        let parsed: U64Args =
+            serde_json::from_str(r#"{"value": null}"#).map_err(ctx("null parses"))?;
         assert_eq!(parsed.value, None);
+        Ok(())
     }
 
     #[test]
-    fn test_lenient_opt_u64_accepts_missing_field() {
-        let parsed: U64Args = serde_json::from_str(r#"{}"#).expect("missing field parses");
+    fn test_lenient_opt_u64_accepts_missing_field() -> TestResult {
+        let parsed: U64Args = serde_json::from_str(r#"{}"#).map_err(ctx("missing field parses"))?;
         assert_eq!(parsed.value, None);
+        Ok(())
     }
 
     #[test]
-    fn test_lenient_opt_u64_rejects_float_string() {
-        let err = serde_json::from_str::<U64Args>(r#"{"value": "8000.5"}"#)
-            .expect_err("float string must be rejected");
+    fn test_lenient_opt_u64_rejects_float_string() -> TestResult {
+        let Err(err) = serde_json::from_str::<U64Args>(r#"{"value": "8000.5"}"#) else {
+            return Err(TestError::Unexpected(
+                "float string must be rejected".into(),
+            ));
+        };
         assert!(err.to_string().contains(ERR_MSG));
+        Ok(())
     }
 
     #[test]
-    fn test_lenient_opt_u64_rejects_negative_string() {
-        let err = serde_json::from_str::<U64Args>(r#"{"value": "-1"}"#)
-            .expect_err("negative string must be rejected");
+    fn test_lenient_opt_u64_rejects_negative_string() -> TestResult {
+        let Err(err) = serde_json::from_str::<U64Args>(r#"{"value": "-1"}"#) else {
+            return Err(TestError::Unexpected(
+                "negative string must be rejected".into(),
+            ));
+        };
         assert!(err.to_string().contains(ERR_MSG));
+        Ok(())
     }
 
     #[test]
-    fn test_lenient_opt_u64_rejects_non_numeric_string() {
-        let err = serde_json::from_str::<U64Args>(r#"{"value": "abc"}"#)
-            .expect_err("non-numeric string must be rejected");
+    fn test_lenient_opt_u64_rejects_non_numeric_string() -> TestResult {
+        let Err(err) = serde_json::from_str::<U64Args>(r#"{"value": "abc"}"#) else {
+            return Err(TestError::Unexpected(
+                "non-numeric string must be rejected".into(),
+            ));
+        };
         assert!(err.to_string().contains(ERR_MSG));
+        Ok(())
     }
 
     #[test]
-    fn test_lenient_opt_u64_rejects_negative_number() {
+    fn test_lenient_opt_u64_rejects_negative_number() -> TestResult {
         // JSON `-1` is not representable as u64 via the untagged Num(u64) variant,
         // so it falls through to string matching and fails deserialization.
-        let err = serde_json::from_str::<U64Args>(r#"{"value": -1}"#)
-            .expect_err("negative number must be rejected");
+        let Err(err) = serde_json::from_str::<U64Args>(r#"{"value": -1}"#) else {
+            return Err(TestError::Unexpected(
+                "negative number must be rejected".into(),
+            ));
+        };
         assert!(!err.to_string().is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_lenient_opt_usize_accepts_numeric_string() {
+    fn test_lenient_opt_usize_accepts_numeric_string() -> TestResult {
         let parsed: UsizeArgs =
-            serde_json::from_str(r#"{"value": "100"}"#).expect("numeric string parses");
+            serde_json::from_str(r#"{"value": "100"}"#).map_err(ctx("numeric string parses"))?;
         assert_eq!(parsed.value, Some(100));
+        Ok(())
     }
 
     #[test]
-    fn test_lenient_opt_usize_accepts_number() {
-        let parsed: UsizeArgs = serde_json::from_str(r#"{"value": 100}"#).expect("number parses");
+    fn test_lenient_opt_usize_accepts_number() -> TestResult {
+        let parsed: UsizeArgs =
+            serde_json::from_str(r#"{"value": 100}"#).map_err(ctx("number parses"))?;
         assert_eq!(parsed.value, Some(100));
+        Ok(())
     }
 }

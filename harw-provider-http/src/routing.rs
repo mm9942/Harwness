@@ -105,6 +105,7 @@ impl ModelProvider for RoutingModelProvider {
 #[cfg(test)]
 mod tests {
     use super::RoutingModelProvider;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_core::{
         ContextAssembly, ConversationHistory, ModelError, ModelFuture, ModelProvider, ModelRequest,
         ModelResponse,
@@ -129,7 +130,14 @@ mod tests {
             let response = self.response;
             let requests = Arc::clone(&self.requests);
             Box::pin(async move {
-                requests.lock().unwrap().push(request);
+                requests
+                    .lock()
+                    .map_err(|poison| {
+                        ModelError::RequestFailed(format!(
+                            "mock provider requests lock poisoned: {poison}"
+                        ))
+                    })?
+                    .push(request);
                 Ok(ModelResponse::text(response))
             })
         }
@@ -150,6 +158,7 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         }
     }
 
@@ -163,7 +172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routes_to_default_and_preserves_model_id() {
+    async fn routes_to_default_and_preserves_model_id() -> TestResult {
         let default_requests = Arc::new(Mutex::new(Vec::new()));
         let explicit_requests = Arc::new(Mutex::new(Vec::new()));
         let router = RoutingModelProvider::new(
@@ -183,24 +192,25 @@ mod tests {
             ]),
             "default",
         )
-        .unwrap();
+        .map_err(ctx("router construction"))?;
 
         let response = router
             .respond(request().with_model_id(Some(ModelId::from("model-override"))))
             .await
-            .unwrap();
+            .map_err(ctx("respond"))?;
 
         assert_eq!(response.message.as_deref(), Some("default"));
-        let requests = default_requests.lock().unwrap();
+        let requests = default_requests.lock().map_err(ctx("requests lock"))?;
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0].model_id.as_ref().map(ModelId::as_str),
             Some("model-override")
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn routes_to_explicit_provider() {
+    async fn routes_to_explicit_provider() -> TestResult {
         let default_requests = Arc::new(Mutex::new(Vec::new()));
         let explicit_requests = Arc::new(Mutex::new(Vec::new()));
         let router = RoutingModelProvider::new(
@@ -220,19 +230,26 @@ mod tests {
             ]),
             "default",
         )
-        .unwrap();
+        .map_err(ctx("router construction"))?;
 
         let response = router
             .respond(request().with_provider_id(Some(ProviderId::from("explicit"))))
             .await
-            .unwrap();
+            .map_err(ctx("respond"))?;
 
         assert_eq!(response.message.as_deref(), Some("explicit"));
-        assert_eq!(explicit_requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            explicit_requests
+                .lock()
+                .map_err(ctx("requests lock"))?
+                .len(),
+            1
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rejects_unknown_provider_before_calling_any_backend() {
+    async fn rejects_unknown_provider_before_calling_any_backend() -> TestResult {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let router = RoutingModelProvider::new(
             registry([(
@@ -242,19 +259,24 @@ mod tests {
             )]),
             "default",
         )
-        .unwrap();
+        .map_err(ctx("router construction"))?;
 
-        let error = router
+        let Err(error) = router
             .respond(request().with_provider_id(Some(ProviderId::from("unknown"))))
             .await
-            .unwrap_err();
+        else {
+            return Err(TestError::Unexpected(
+                "unknown provider must be rejected".to_owned(),
+            ));
+        };
 
         assert!(matches!(error, ModelError::RequestFailed(_)));
-        assert!(requests.lock().unwrap().is_empty());
+        assert!(requests.lock().map_err(ctx("requests lock"))?.is_empty());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_respond_empty_provider_id_is_error_not_default_fallback() {
+    async fn test_respond_empty_provider_id_is_error_not_default_fallback() -> TestResult {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let router = RoutingModelProvider::new(
             registry([(
@@ -264,22 +286,27 @@ mod tests {
             )]),
             "default",
         )
-        .unwrap();
+        .map_err(ctx("router construction"))?;
 
-        let error = router
+        let Err(error) = router
             .respond(request().with_provider_id(Some(ProviderId::from(""))))
             .await
-            .unwrap_err();
+        else {
+            return Err(TestError::Unexpected(
+                "empty provider id must be rejected".to_owned(),
+            ));
+        };
 
         assert!(
             matches!(&error, ModelError::RequestFailed(message) if message.contains("empty")),
             "unexpected error: {error}"
         );
-        assert!(requests.lock().unwrap().is_empty());
+        assert!(requests.lock().map_err(ctx("requests lock"))?.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_provider_ids_lists_registered_backends_in_order() {
+    fn test_provider_ids_lists_registered_backends_in_order() -> TestResult {
         let router = RoutingModelProvider::new(
             registry([
                 (
@@ -299,17 +326,20 @@ mod tests {
             ]),
             "zeta",
         )
-        .unwrap();
+        .map_err(ctx("router construction"))?;
         assert_eq!(
             router.provider_ids().collect::<Vec<_>>(),
             vec!["alpha", "zeta"]
         );
+        Ok(())
     }
 
     #[test]
-    fn validates_empty_registry_and_missing_default_deterministically() {
+    fn validates_empty_registry_and_missing_default_deterministically() -> TestResult {
         let Err(empty) = RoutingModelProvider::new(BTreeMap::new(), "default") else {
-            panic!("an empty provider set must be rejected");
+            return Err(TestError::Unexpected(
+                "an empty provider set must be rejected".to_owned(),
+            ));
         };
         assert!(matches!(empty, crate::HttpProviderError::EmptyProviderSet));
 
@@ -321,12 +351,15 @@ mod tests {
             )) as Box<dyn ModelProvider>,
         )]);
         let Err(missing) = RoutingModelProvider::new(providers, "default") else {
-            panic!("a missing default provider must be rejected");
+            return Err(TestError::Unexpected(
+                "a missing default provider must be rejected".to_owned(),
+            ));
         };
         assert!(matches!(
             missing,
             crate::HttpProviderError::DefaultProviderNotFound { name }
                 if name == "default"
         ));
+        Ok(())
     }
 }

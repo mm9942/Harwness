@@ -51,7 +51,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const OSC52_MAX_BYTES: usize = 100_000;
 
 /// Alphabet der Standard-Base64-Kodierung (RFC 4648, mit `+`/`/` und `=`-Padding).
-const BASE64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Welches Ziel den Text letztlich erhalten hat.
 ///
@@ -337,6 +338,7 @@ pub fn wrap_osc52_for_tmux(sequence: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Bekannte Base64-Testvektoren (RFC 4648 §10) müssen exakt stimmen.
     #[test]
@@ -356,26 +358,33 @@ mod tests {
 
     /// Die OSC-52-Sequenz umschließt die Base64-Nutzlast mit dem korrekten Rahmen.
     #[test]
-    fn test_osc52_sequence_framing() {
-        let seq = osc52_sequence("ab").expect("kurzer Text passt");
+    fn test_osc52_sequence_framing() -> TestResult {
+        let seq = osc52_sequence("ab").map_err(ctx("kurzer Text passt"))?;
         assert_eq!(seq, "\x1b]52;c;YWI=\x07");
         assert!(seq.starts_with("\x1b]52;c;"));
         assert!(seq.ends_with('\x07'));
+        Ok(())
     }
 
     /// Leerer Text ergibt eine leere Base64-Nutzlast, aber einen gültigen Rahmen.
     #[test]
-    fn test_osc52_sequence_empty_text() {
-        let seq = osc52_sequence("").expect("leerer Text passt");
+    fn test_osc52_sequence_empty_text() -> TestResult {
+        let seq = osc52_sequence("").map_err(ctx("leerer Text passt"))?;
         assert_eq!(seq, "\x1b]52;c;\x07");
+        Ok(())
     }
 
     /// Text oberhalb der Obergrenze wird abgelehnt statt eine überlange Sequenz zu bauen.
     #[test]
-    fn test_osc52_sequence_size_cap_rejects_oversized_text() {
+    fn test_osc52_sequence_size_cap_rejects_oversized_text() -> TestResult {
         let oversized = "a".repeat(OSC52_MAX_BYTES + 1);
-        let err = osc52_sequence(&oversized).expect_err("zu groß muss abgelehnt werden");
+        let Err(err) = osc52_sequence(&oversized) else {
+            return Err(TestError::Unexpected(
+                "zu groß muss abgelehnt werden".to_owned(),
+            ));
+        };
         assert!(matches!(err, ExportError::NoClipboard));
+        Ok(())
     }
 
     /// Text exakt an der Obergrenze wird noch akzeptiert.
@@ -388,11 +397,12 @@ mod tests {
     /// A7: die tmux-Hülle beginnt mit dem DCS-Passthrough-Präfix und endet
     /// mit dem DCS-Terminator.
     #[test]
-    fn test_wrap_osc52_for_tmux_frames_the_passthrough() {
-        let seq = osc52_sequence("ab").expect("kurzer Text passt");
+    fn test_wrap_osc52_for_tmux_frames_the_passthrough() -> TestResult {
+        let seq = osc52_sequence("ab").map_err(ctx("kurzer Text passt"))?;
         let wrapped = wrap_osc52_for_tmux(&seq);
         assert!(wrapped.starts_with("\x1bPtmux;"));
         assert!(wrapped.ends_with("\x1b\\"));
+        Ok(())
     }
 
     /// A7: jedes `\x1b` innerhalb der eingehüllten Sequenz wird verdoppelt —
@@ -400,8 +410,8 @@ mod tests {
     /// Hülle muss also zwei direkt aufeinanderfolgende ESC an dieser Stelle
     /// zeigen.
     #[test]
-    fn test_wrap_osc52_for_tmux_doubles_escape_bytes() {
-        let seq = osc52_sequence("ab").expect("kurzer Text passt");
+    fn test_wrap_osc52_for_tmux_doubles_escape_bytes() -> TestResult {
+        let seq = osc52_sequence("ab").map_err(ctx("kurzer Text passt"))?;
         assert_eq!(seq.matches('\x1b').count(), 1);
 
         let wrapped = wrap_osc52_for_tmux(&seq);
@@ -410,14 +420,16 @@ mod tests {
         // plus zwei aus der verdoppelten Nutzlast = vier insgesamt.
         assert_eq!(wrapped.matches('\x1b').count(), 4);
         assert!(wrapped.contains("\x1b\x1b]52;c;"));
+        Ok(())
     }
 
     /// Ein leerer Text ergibt trotzdem eine korrekt gerahmte, nicht-leere
     /// Hülle.
     #[test]
-    fn test_wrap_osc52_for_tmux_empty_payload() {
-        let seq = osc52_sequence("").expect("leerer Text passt");
+    fn test_wrap_osc52_for_tmux_empty_payload() -> TestResult {
+        let seq = osc52_sequence("").map_err(ctx("leerer Text passt"))?;
         let wrapped = wrap_osc52_for_tmux(&seq);
         assert_eq!(wrapped, "\x1bPtmux;\x1b\x1b]52;c;\x07\x1b\\");
+        Ok(())
     }
 }

@@ -330,6 +330,7 @@ pub fn load(path: &Path) -> FixturesResult<CaptureManifest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn sample_manifest() -> CaptureManifest {
         CaptureManifest {
@@ -353,26 +354,30 @@ mod tests {
     }
 
     #[test]
-    fn test_materialize_creates_real_symlink() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        materialize(&sample_manifest(), dir.path()).expect("materialize muss gelingen");
+    fn test_materialize_creates_real_symlink() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        materialize(&sample_manifest(), dir.path()).map_err(ctx("materialize muss gelingen"))?;
 
         let link_path = dir.path().join("sys/class/thermal/thermal_zone0");
-        let meta = fs::symlink_metadata(&link_path).expect("symlink_metadata");
+        let meta = fs::symlink_metadata(&link_path).map_err(ctx("symlink_metadata"))?;
         assert!(meta.file_type().is_symlink());
-        let target = fs::read_link(&link_path).expect("read_link");
+        let target = fs::read_link(&link_path).map_err(ctx("read_link"))?;
         assert_eq!(
             target,
             PathBuf::from("../../devices/virtual/thermal/thermal_zone0")
         );
 
         let file_path = dir.path().join("sys/class/thermal/thermal_zone0/type");
-        assert_eq!(fs::read_to_string(file_path).expect("read type"), "cpu-thermal\n");
+        assert_eq!(
+            fs::read_to_string(file_path).map_err(ctx("read type"))?,
+            "cpu-thermal\n"
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_materialize_rejects_parent_dir_segment() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_materialize_rejects_parent_dir_segment() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let manifest = CaptureManifest {
             kernel: "test".to_owned(),
             captured_at: "2026-01-01T00:00:00Z".to_owned(),
@@ -384,45 +389,67 @@ mod tests {
             }],
         };
 
-        let err = materialize(&manifest, dir.path()).expect_err("'..' muss abgelehnt werden");
+        let result = materialize(&manifest, dir.path());
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "'..' muss abgelehnt werden".to_owned(),
+            ));
+        };
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let parent = dir
+            .path()
+            .parent()
+            .ok_or(TestError::Missing("dir.path() hat kein parent"))?;
         assert!(
-            !dir.path().parent().unwrap().join("etc/passwd").exists(),
+            !parent.join("etc/passwd").exists(),
             "es darf keine Datei außerhalb von root entstanden sein"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_materialize_is_idempotent_for_repeated_symlink() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_materialize_is_idempotent_for_repeated_symlink() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let manifest = sample_manifest();
-        materialize(&manifest, dir.path()).expect("erster materialize-Aufruf");
-        materialize(&manifest, dir.path()).expect("zweiter materialize-Aufruf muss ebenfalls gelingen");
+        materialize(&manifest, dir.path()).map_err(ctx("erster materialize-Aufruf"))?;
+        materialize(&manifest, dir.path())
+            .map_err(ctx("zweiter materialize-Aufruf muss ebenfalls gelingen"))?;
 
         let link_path = dir.path().join("sys/class/thermal/thermal_zone0");
-        assert!(fs::symlink_metadata(&link_path)
-            .expect("symlink_metadata")
-            .file_type()
-            .is_symlink());
+        assert!(
+            fs::symlink_metadata(&link_path)
+                .map_err(ctx("symlink_metadata"))?
+                .file_type()
+                .is_symlink()
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_load_reads_real_capture_file() {
+    fn test_load_reads_real_capture_file() -> TestResult {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("captures/rpi5-6.18/thermal.json");
-        let manifest = load(&path).expect("echtes Capture-File muss laden");
+        let manifest = load(&path).map_err(ctx("echtes Capture-File muss laden"))?;
 
         assert_eq!(manifest.kernel, "6.18.34+rpt-rpi-2712");
-        assert!(manifest
-            .entries
-            .iter()
-            .any(|entry| entry.path == "/sys/class/thermal/thermal_zone0/temp"));
+        assert!(
+            manifest
+                .entries
+                .iter()
+                .any(|entry| entry.path == "/sys/class/thermal/thermal_zone0/temp")
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_load_missing_file_is_io_error() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let err = load(&dir.path().join("does-not-exist.json"))
-            .expect_err("fehlende Datei muss scheitern");
+    fn test_load_missing_file_is_io_error() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let result = load(&dir.path().join("does-not-exist.json"));
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "fehlende Datei muss scheitern".to_owned(),
+            ));
+        };
         assert!(matches!(err, crate::error::FixturesError::Io(_)));
+        Ok(())
     }
 }

@@ -183,6 +183,8 @@ pub mod skills;
 pub mod status;
 pub mod stop;
 #[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(test)]
 pub(crate) mod testutil;
 pub mod usage;
 pub mod work;
@@ -454,6 +456,7 @@ pub fn register_plan_tools(registry: &mut OperationRegistry, config: &PlanToolCo
 #[cfg(test)]
 mod tests {
     use super::{compact_unavailable_output, register_all};
+    use crate::test_support::{TestError, TestResult};
     use harw_operations::operation::WebMethod;
     use harw_operations::registry::OperationRegistry;
     use harw_operations::{ApprovalPolicy, PermissionTier, Surface};
@@ -473,11 +476,21 @@ mod tests {
     /// jeweiligen `#[operation(...)]`-Aufruf in der Op-Datei (siehe dort).
     const EXPECTED_WEB_SURFACES: &[(&str, &str, WebMethod, ApprovalPolicy)] = &[
         ("help", "/api/help", WebMethod::Get, ApprovalPolicy::None),
-        ("status", "/api/status", WebMethod::Get, ApprovalPolicy::None),
+        (
+            "status",
+            "/api/status",
+            WebMethod::Get,
+            ApprovalPolicy::None,
+        ),
         ("ps", "/api/ps", WebMethod::Get, ApprovalPolicy::None),
         ("diff", "/api/diff", WebMethod::Get, ApprovalPolicy::None),
         ("work", "/api/work", WebMethod::Get, ApprovalPolicy::None),
-        ("attach", "/api/attach", WebMethod::Get, ApprovalPolicy::None),
+        (
+            "attach",
+            "/api/attach",
+            WebMethod::Get,
+            ApprovalPolicy::None,
+        ),
         (
             "permissions",
             "/api/permissions",
@@ -533,7 +546,7 @@ mod tests {
     ];
 
     #[test]
-    fn every_exposed_operation_appears_with_its_web_path_in_the_registry() {
+    fn every_exposed_operation_appears_with_its_web_path_in_the_registry() -> TestResult {
         // Der Prüfstein dieses Knotens: `Surface::Web` existierte seit UI-00,
         // aber keine reale Operation deklarierte ihn — der Typgenerator für
         // `webui/lib/generated/operations.ts` sah `[] as const`. Dieser Test
@@ -541,9 +554,9 @@ mod tests {
         // tatsächlich über die Registry mit ihrem Web-Pfad auffindbar ist.
         let reg = full_registry();
         for (name, path, method, approval) in EXPECTED_WEB_SURFACES {
-            let op = reg
-                .find_by_name(name.trim())
-                .unwrap_or_else(|| panic!("operation '{name}' must be registered"));
+            let op = reg.find_by_name(name.trim()).ok_or_else(|| {
+                TestError::Unexpected(format!("operation '{name}' must be registered"))
+            })?;
             let mut found = false;
             for surface in &op.meta().surfaces {
                 if let Surface::Web {
@@ -562,6 +575,7 @@ mod tests {
                 "operation '{name}' must declare Surface::Web {{ path: \"{path}\", method: {method:?}, approval: {approval:?} }}"
             );
         }
+        Ok(())
     }
 
     #[test]
@@ -594,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn web_surfaces_carry_the_same_permission_tier_as_the_operation() {
+    fn web_surfaces_carry_the_same_permission_tier_as_the_operation() -> TestResult {
         // "Die PermissionTier bleibt unverändert" — jede Web-Fläche teilt sich
         // ein einziges `OperationMeta` mit den übrigen Flächen derselben
         // Operation, es gibt keinen zweiten, laxeren Berechtigungspfad.
@@ -618,15 +632,16 @@ mod tests {
             ("approval.resolve", PermissionTier::Operator),
         ];
         for (name, tier) in expected_permissions {
-            let op = reg.find_by_name(name.trim()).unwrap_or_else(|| {
-                panic!("operation '{name}' must be registered");
-            });
+            let op = reg.find_by_name(name.trim()).ok_or_else(|| {
+                TestError::Unexpected(format!("operation '{name}' must be registered"))
+            })?;
             assert_eq!(
                 op.meta().permission,
                 *tier,
                 "operation '{name}' permission tier must arrive unchanged"
             );
         }
+        Ok(())
     }
 
     #[test]
@@ -653,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn negative_model_tool_checks_are_unaffected_by_web_exposure() {
+    fn negative_model_tool_checks_are_unaffected_by_web_exposure() -> TestResult {
         // Die bestehenden Negativprüfungen (welche Operation KEINE
         // ModelTool-Fläche hat) leben in den jeweiligen Op-Dateien
         // (`mode.rs`, `context_proposal.rs`, `memory.rs`, `plugins.rs`,
@@ -663,9 +678,9 @@ mod tests {
         // würde.
         let reg = full_registry();
         for name in ["mode", "context-proposal", "memory", "plugins", "skills"] {
-            let op = reg
-                .find_by_name(name)
-                .unwrap_or_else(|| panic!("operation '{name}' must be registered"));
+            let op = reg.find_by_name(name).ok_or_else(|| {
+                TestError::Unexpected(format!("operation '{name}' must be registered"))
+            })?;
             assert!(
                 !op.meta()
                     .surfaces
@@ -674,6 +689,7 @@ mod tests {
                 "operation '{name}' must not have gained a Web surface"
             );
         }
+        Ok(())
     }
 
     #[test]
@@ -780,7 +796,8 @@ mod tests {
     }
 
     #[test]
-    fn context_proposal_is_discoverable_through_the_registry_with_its_permission_intact() {
+    fn context_proposal_is_discoverable_through_the_registry_with_its_permission_intact()
+    -> TestResult {
         // Der eigentliche Prüfstein dieses Integrationsschritts: die Operation
         // war fertig und getestet, aber in keiner Registry erreichbar (siehe
         // Moduldoku, Abschnitt „Op-Set" vor diesem Commit). Jetzt muss sie
@@ -792,13 +809,14 @@ mod tests {
 
         let op = reg
             .find_by_command("/context-proposal")
-            .expect("/context-proposal must be registered");
+            .ok_or(TestError::Missing("/context-proposal must be registered"))?;
         assert_eq!(op.meta().name, "context-proposal");
         assert_eq!(
             op.meta().permission,
             harw_operations::PermissionTier::Operator,
             "permission tier must arrive unchanged from the building node"
         );
+        Ok(())
     }
 
     #[test]
@@ -892,18 +910,19 @@ mod tests {
     }
 
     #[test]
-    fn compact_is_registered_as_unavailable_not_as_a_functional_action() {
+    fn compact_is_registered_as_unavailable_not_as_a_functional_action() -> TestResult {
         let mut reg = OperationRegistry::new();
         register_all(&mut reg);
 
         let compact = reg
             .find_by_command("/compact")
-            .expect("/compact must remain discoverable");
+            .ok_or(TestError::Missing("/compact must remain discoverable"))?;
         assert_eq!(compact.meta().name, "compact");
         assert_eq!(
             compact.meta().summary,
             "Session-Komprimierung ist in dieser Laufzeit nicht verfügbar."
         );
+        Ok(())
     }
 
     #[test]

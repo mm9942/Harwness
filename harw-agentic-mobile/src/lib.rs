@@ -16,3 +16,7 @@ pub use cleanup::{
     ProposalId, ProposalStatus, ReviewedProposal,
 };
 pub use notification::{ApprovalNotification, NotificationAction};
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

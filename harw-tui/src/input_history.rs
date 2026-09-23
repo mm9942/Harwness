@@ -57,6 +57,14 @@ pub(crate) struct InputHistoryStore {
 }
 
 impl InputHistoryStore {
+    /// Open history in the home selected by the runtime (including `--home`).
+    pub(crate) fn at_home(home: &std::path::Path, cap: usize) -> Self {
+        Self {
+            path: Some(harw_home::paths::input_history_path(home)),
+            cap,
+        }
+    }
+
     /// Öffnet den Store für das aktuelle harw-Home.
     ///
     /// # Beschreibung
@@ -202,10 +210,11 @@ fn decode(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
-    fn history_survives_reopening_with_multiline_and_literal_escapes() {
-        let directory = tempfile::tempdir().expect("history directory");
+    fn history_survives_reopening_with_multiline_and_literal_escapes() -> TestResult {
+        let directory = tempfile::tempdir().map_err(ctx("history directory"))?;
         let path = directory.path().join("input_history");
         let store = InputHistoryStore {
             path: Some(path.clone()),
@@ -220,5 +229,6 @@ mod tests {
             cap: 2,
         };
         assert_eq!(reopened.load(), ["first\nsecond \\n", "carriage\rreturn"]);
+        Ok(())
     }
 }

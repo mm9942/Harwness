@@ -282,16 +282,21 @@ pub fn dock_security_finding(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
+    use harw_authority::NetworkScope;
     use harw_dod_rules::rule::{Rule, RuleContext};
     use harw_dod_rules::rules::EgressFlowRule;
-    use harw_dod_rules::{run_rules, triaged_finding_for_test, Verdict};
-    use harw_dod_signals::{EventKind, Hardness, Severity, SecurityEvent};
+    use harw_dod_rules::{Verdict, run_rules, triaged_finding_for_test};
+    use harw_dod_signals::{EventKind, Hardness, SecurityEvent, Severity};
     use harw_plan::admission::PathRule;
     use harw_plan::{PlanNodeStatus, PlanStore};
-    use harw_authority::NetworkScope;
     use harw_types::{FindingId, SensorId};
 
-    fn triaged_finding(severity: Severity, hardness: Hardness, verdict: Verdict) -> Finding<Triaged> {
+    fn triaged_finding(
+        severity: Severity,
+        hardness: Hardness,
+        verdict: Verdict,
+    ) -> TestResult<Finding<Triaged>> {
         triaged_finding_at(severity, hardness, verdict, jiff::Timestamp::UNIX_EPOCH)
     }
 
@@ -313,7 +318,7 @@ mod tests {
         hardness: Hardness,
         verdict: Verdict,
         observed_at: jiff::Timestamp,
-    ) -> Finding<Triaged> {
+    ) -> TestResult<Finding<Triaged>> {
         let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
         let events = vec![SecurityEvent {
             sensor: SensorId::from_str("net-0"),
@@ -341,7 +346,7 @@ mod tests {
         let finding = raw_findings
             .into_iter()
             .find(|f| f.rule_id() == EgressFlowRule.id())
-            .expect("EgressFlowRule löst aus");
+            .ok_or(TestError::Missing("EgressFlowRule löst aus"))?;
         assert_eq!(
             finding.severity(),
             severity,
@@ -361,7 +366,7 @@ mod tests {
         // gefolgt von `triage`). Gefüttert wird er ausschließlich mit den
         // Feldern des soeben real von `EgressFlowRule` berechneten Befundes
         // — kein erfundener Kurzschluss von Raw direkt nach Triaged.
-        triaged_finding_for_test(
+        Ok(triaged_finding_for_test(
             finding.rule_id(),
             finding.kind(),
             finding.severity(),
@@ -370,12 +375,12 @@ mod tests {
             finding.observed_at(),
             FindingId::new(),
             verdict,
-        )
+        ))
     }
 
-    fn sample_security_evidence() -> SecurityEvidence {
+    fn sample_security_evidence() -> TestResult<SecurityEvidence> {
         SecurityEvidence::capture(vec![], vec![], jiff::Timestamp::UNIX_EPOCH)
-            .expect("leere Evidenz kodiert immer")
+            .map_err(ctx("leere Evidenz kodiert immer"))
     }
 
     fn sample_violation() -> ScopeViolation {
@@ -388,30 +393,33 @@ mod tests {
     // -- evidence_for_security_finding: Digest kommt strukturell an --------
 
     #[test]
-    fn test_evidence_for_security_finding_carries_the_evidence_digest() {
-        let finding = triaged_finding(Severity::High, Hardness::Observed, Verdict::Confirmed);
-        let evidence = sample_security_evidence();
+    fn test_evidence_for_security_finding_carries_the_evidence_digest() -> TestResult {
+        let finding = triaged_finding(Severity::High, Hardness::Observed, Verdict::Confirmed)?;
+        let evidence = sample_security_evidence()?;
         let reference = evidence_for_security_finding(&finding, &evidence, "dod:escalate");
         assert_eq!(reference.digest, Some(evidence.digest));
         assert_eq!(reference.kind, EvidenceKind::Other);
         assert_eq!(reference.actor, "dod:escalate");
+        Ok(())
     }
 
     // -- offset_from_timestamp wird benutzt, auch an den Rändern -----------
 
     #[test]
-    fn test_evidence_for_security_finding_uses_offset_from_timestamp_at_unix_epoch() {
-        let finding = triaged_finding(Severity::High, Hardness::Observed, Verdict::Confirmed);
-        let evidence = sample_security_evidence();
+    fn test_evidence_for_security_finding_uses_offset_from_timestamp_at_unix_epoch() -> TestResult {
+        let finding = triaged_finding(Severity::High, Hardness::Observed, Verdict::Confirmed)?;
+        let evidence = sample_security_evidence()?;
         let reference = evidence_for_security_finding(&finding, &evidence, "dod:escalate");
         assert_eq!(
             reference.attached_at,
             offset_from_timestamp(finding.observed_at())
         );
+        Ok(())
     }
 
     #[test]
-    fn test_evidence_for_security_finding_matches_the_independent_oracle_far_in_the_future() {
+    fn test_evidence_for_security_finding_matches_the_independent_oracle_far_in_the_future()
+    -> TestResult {
         // Unabhaengig von `offset_from_timestamp` selbst nachgerechnet, damit
         // dieser Test nicht nur die eigene Umrechnung gegen sich selbst
         // prueft: `time::OffsetDateTime::from_unix_timestamp_nanos` ist der
@@ -422,16 +430,18 @@ mod tests {
             Hardness::Observed,
             Verdict::Confirmed,
             far_future,
-        );
-        let evidence = sample_security_evidence();
+        )?;
+        let evidence = sample_security_evidence()?;
         let reference = evidence_for_security_finding(&finding, &evidence, "dod:escalate");
         let expected = time::OffsetDateTime::from_unix_timestamp_nanos(far_future.as_nanosecond())
             .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
         assert_eq!(reference.attached_at, expected);
+        Ok(())
     }
 
     #[test]
-    fn test_evidence_for_security_finding_matches_the_independent_oracle_before_plan_begin() {
+    fn test_evidence_for_security_finding_matches_the_independent_oracle_before_plan_begin()
+    -> TestResult {
         // Ein Befund, der lange vor dem Planbeginn beobachtet wurde (hier:
         // `Timestamp::MIN`) — derselbe unabhaengige Abgleich wie oben, nur am
         // anderen Rand.
@@ -441,13 +451,14 @@ mod tests {
             Hardness::Observed,
             Verdict::Confirmed,
             before_begin,
-        );
-        let evidence = sample_security_evidence();
+        )?;
+        let evidence = sample_security_evidence()?;
         let reference = evidence_for_security_finding(&finding, &evidence, "dod:escalate");
         let expected =
             time::OffsetDateTime::from_unix_timestamp_nanos(before_begin.as_nanosecond())
                 .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
         assert_eq!(reference.attached_at, expected);
+        Ok(())
     }
 
     // -- ContractViolation erzeugt einen Vorschlag, nie eine Invalidierung -
@@ -469,39 +480,49 @@ mod tests {
     }
 
     #[test]
-    fn test_dock_security_finding_never_reaches_apply_as_an_invalidation() {
+    fn test_dock_security_finding_never_reaches_apply_as_an_invalidation() -> TestResult {
         let task = TaskId::new("t-1");
-        let finding = triaged_finding(Severity::High, Hardness::Observed, Verdict::Confirmed);
-        let evidence = sample_security_evidence();
+        let finding = triaged_finding(Severity::High, Hardness::Observed, Verdict::Confirmed)?;
+        let evidence = sample_security_evidence()?;
         let violation = sample_violation();
 
-        let steps = dock_security_finding(&task, &finding, &evidence, Some(&violation), "dod:escalate")
-            .expect("konfirmierter, eskalationswuerdiger Befund dockt an");
+        let steps =
+            dock_security_finding(&task, &finding, &evidence, Some(&violation), "dod:escalate")
+                .map_err(ctx("konfirmierter, eskalationswuerdiger Befund dockt an"))?;
 
         assert_eq!(steps.len(), 2);
         assert!(matches!(steps[0], ReconcileStep::AttachEvidence { .. }));
         assert!(matches!(steps[1], ReconcileStep::AskModel { .. }));
-        assert!(steps.iter().all(|step| !matches!(step, ReconcileStep::Invalidate { .. })));
+        assert!(
+            steps
+                .iter()
+                .all(|step| !matches!(step, ReconcileStep::Invalidate { .. }))
+        );
 
         let store = crate::testing::seeded_plan_store(vec![crate::testing::coding_node(
             "t-1",
             PlanNodeStatus::Ready,
-        )]);
+        )])?;
         let (events, deferred) =
             crate::controller::PlanController::apply(&steps, &store, None, "dod:escalate")
-                .expect("apply gelingt");
+                .map_err(ctx("apply gelingt"))?;
         // Der Vorschlag wurde zurueckgegeben, nicht ausgefuehrt.
         assert_eq!(deferred, vec![steps[1].clone()]);
         // Kein `PlanEvent` beschreibt eine Invalidierung.
-        assert!(!events.iter().any(|event| format!("{event:?}").contains("Invalidat")));
+        assert!(
+            !events
+                .iter()
+                .any(|event| format!("{event:?}").contains("Invalidat"))
+        );
         // Der Knoten bleibt `Ready` — kein direkter Weg zur Invalidierung.
-        let plan = store.current().expect("Plan lesbar");
+        let plan = store.current().map_err(ctx("Plan lesbar"))?;
         let node = plan
             .nodes
             .iter()
             .find(|node| node.id == task)
-            .expect("Knoten existiert weiterhin");
+            .ok_or(TestError::Missing("Knoten existiert weiterhin"))?;
         assert_eq!(node.status, PlanNodeStatus::Ready);
+        Ok(())
     }
 
     // -- Determinismus: gleicher Befund, gleicher Plan, gleicher Vorschlag -
@@ -525,16 +546,21 @@ mod tests {
     // -- abgelehnte Andockung: inhaltsfrei -----------------------------------
 
     #[test]
-    fn test_dock_security_finding_rejects_unescalatable_finding_content_free() {
+    fn test_dock_security_finding_rejects_unescalatable_finding_content_free() -> TestResult {
         let task = TaskId::new("t-1");
-        let finding = triaged_finding(Severity::High, Hardness::Observed, Verdict::NeedsReview);
-        let evidence = sample_security_evidence();
+        let finding = triaged_finding(Severity::High, Hardness::Observed, Verdict::NeedsReview)?;
+        let evidence = sample_security_evidence()?;
 
-        let error = dock_security_finding(&task, &finding, &evidence, None, "dod:escalate")
-            .expect_err("ein nicht bestaetigter Befund dockt nicht an");
+        let Err(error) = dock_security_finding(&task, &finding, &evidence, None, "dod:escalate")
+        else {
+            return Err(TestError::Unexpected(
+                "ein nicht bestaetigter Befund dockt nicht an".to_string(),
+            ));
+        };
         assert!(matches!(error, PlanBridgeError::SecurityDocking(_)));
         let text = error.to_string();
         assert!(!text.chars().any(|c| c.is_ascii_digit()));
         assert!(!text.contains("t-1"));
+        Ok(())
     }
 }

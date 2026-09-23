@@ -8,27 +8,29 @@
 
 #![forbid(unsafe_code)]
 
+pub(crate) mod agent_tree;
 pub mod app;
 pub mod approval;
 pub mod approval_dialog;
-pub mod host_permit_dialog;
 pub(crate) mod chat_scroll;
-pub(crate) mod input_history;
+pub(crate) mod choice_dialog;
+pub mod clipboard;
 mod command;
 pub(crate) mod command_exec;
 pub(crate) mod command_popup;
-pub(crate) mod choice_dialog;
-pub(crate) mod model_switch_picker;
-pub mod clipboard;
 mod error;
-pub mod export;
 pub(crate) mod events;
+pub mod export;
 pub(crate) mod frame_requester;
 pub mod gateway;
 pub(crate) mod history_cell;
+pub mod host_permit_dialog;
 mod input;
 pub(crate) mod input_editor;
+pub(crate) mod input_history;
 pub(crate) mod input_reader;
+pub mod model_picker;
+pub(crate) mod model_switch_picker;
 mod registry;
 pub mod relative_time;
 pub(crate) mod runtime_commands;
@@ -37,7 +39,6 @@ pub(crate) mod sanitize;
 pub mod session_controller;
 pub mod session_picker;
 pub mod setup;
-pub mod model_picker;
 pub(crate) mod spinner;
 pub(crate) mod streaming;
 pub(crate) mod style;
@@ -61,6 +62,7 @@ pub use export::{
 };
 pub use gateway::{ChatGateway, LocalGateway};
 pub use input::{Invocation, classify_input};
+pub use model_picker::{ModelPickerOutcome, ModelPickerProvider, run_model_picker};
 pub use registry::{
     CapabilitySet, CommandAction, CommandRegistry, DispatchContext, InvocationSurface,
     ShellCapability,
@@ -69,4 +71,7 @@ pub use relative_time::relative_time;
 pub use runtime_root::{TuiAssemblyFactory, TuiResume, TuiRunOptions, TuiSessionWiring, run_tui};
 pub use session_picker::{PickerAction, SessionEntry, SessionPicker};
 pub use setup::{SetupApp, SetupOutcome, SetupStage, run_setup};
-pub use model_picker::{ModelPickerOutcome, ModelPickerProvider, run_model_picker};
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

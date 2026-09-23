@@ -68,9 +68,10 @@ pub struct ModelCapabilitiesToml {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
-    fn test_model_with_aliases_and_capabilities() {
+    fn test_model_with_aliases_and_capabilities() -> TestResult {
         let src = r#"
             id = "gpt-5"
             provider = "openai"
@@ -80,10 +81,11 @@ mod tests {
             tool_use = true
             vision = true
         "#;
-        let model: ModelToml = toml::from_str(src).unwrap();
+        let model: ModelToml = toml::from_str(src).map_err(ctx("model-toml parsen"))?;
         assert_eq!(model.aliases, vec!["gpt5", "openai-flagship"]);
         assert!(model.capabilities.tool_use);
         assert!(!model.capabilities.streaming);
+        Ok(())
     }
 
     #[test]
@@ -111,14 +113,15 @@ mod tests {
     }
 
     #[test]
-    fn test_model_with_explicit_prompt_caching_parses() {
+    fn test_model_with_explicit_prompt_caching_parses() -> TestResult {
         let src = r#"
             id = "claude-opus"
             provider = "anthropic"
             prompt_caching = "explicit"
         "#;
-        let model: ModelToml = toml::from_str(src).unwrap();
+        let model: ModelToml = toml::from_str(src).map_err(ctx("model-toml parsen"))?;
         assert_eq!(model.prompt_caching, Some(PromptCachingMode::Explicit));
+        Ok(())
     }
 
     #[test]
@@ -132,38 +135,42 @@ mod tests {
     }
 
     #[test]
-    fn test_model_without_prompt_caching_is_none() {
+    fn test_model_without_prompt_caching_is_none() -> TestResult {
         let src = r#"
             id = "claude-opus"
             provider = "anthropic"
         "#;
-        let model: ModelToml = toml::from_str(src).unwrap();
+        let model: ModelToml = toml::from_str(src).map_err(ctx("model-toml parsen"))?;
         assert_eq!(model.prompt_caching, None);
+        Ok(())
     }
 
     #[test]
-    fn test_model_without_default_reasoning_effort_is_none() {
+    fn test_model_without_default_reasoning_effort_is_none() -> TestResult {
         let src = r#"
             id = "claude-opus"
             provider = "anthropic"
         "#;
-        let model: ModelToml = toml::from_str(src).unwrap();
+        let model: ModelToml = toml::from_str(src).map_err(ctx("model-toml parsen"))?;
         assert!(model.default_reasoning_effort.is_none());
-        assert!(!toml::to_string(&model).unwrap().contains("default_reasoning_effort"));
+        let encoded = toml::to_string(&model).map_err(ctx("model-toml serialisieren"))?;
+        assert!(!encoded.contains("default_reasoning_effort"));
+        Ok(())
     }
 
     #[test]
-    fn test_model_with_default_reasoning_effort_round_trips() {
+    fn test_model_with_default_reasoning_effort_round_trips() -> TestResult {
         let src = r#"
             id = "claude-opus"
             provider = "anthropic"
             default_reasoning_effort = "xhigh"
         "#;
-        let model: ModelToml = toml::from_str(src).unwrap();
+        let model: ModelToml = toml::from_str(src).map_err(ctx("model-toml parsen"))?;
         assert_eq!(
             model.default_reasoning_effort,
             Some(harw_types::ReasoningEffort::Xhigh)
         );
+        Ok(())
     }
 
     #[test]

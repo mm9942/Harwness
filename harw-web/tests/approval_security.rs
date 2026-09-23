@@ -6,6 +6,9 @@
 //! - `resolved_at` stammt aus der übergebenen Serveruhr;
 //! - abgelaufene Anfragen sind nicht auflösbar und nicht gelistet.
 
+mod common;
+
+use common::{TestError, TestResult, ctx};
 use harw_session_store::approval::{ApprovalRecord, ApprovalStore};
 use harw_session_store::error::SessionStoreError;
 use harw_types::{
@@ -31,16 +34,16 @@ fn issued_at() -> Timestamp {
     Timestamp::constant(1_700_000_000, 0)
 }
 
-fn clock_after(minutes: i64) -> FixedClock {
+fn clock_after(minutes: i64) -> TestResult<FixedClock> {
     // Testhilfe: der Wertebereich wird nie verlassen.
-    FixedClock(
+    Ok(FixedClock(
         issued_at()
             .checked_add(SignedDuration::from_mins(minutes))
-            .expect("timestamp in range"),
-    )
+            .map_err(ctx("timestamp in range"))?,
+    ))
 }
 
-fn issue(store: &ApprovalStore) -> (SessionId, ItemId) {
+fn issue(store: &ApprovalStore) -> TestResult<(SessionId, ItemId)> {
     let session = SessionId::from_str("session-1");
     let request = ItemId::from_str("approval-1");
     store
@@ -53,8 +56,8 @@ fn issue(store: &ApprovalStore) -> (SessionId, ItemId) {
             },
             issued_at: issued_at(),
         })
-        .expect("issue");
-    (session, request)
+        .map_err(ctx("issue"))?;
+    Ok((session, request))
 }
 
 fn web_principal() -> Principal {
@@ -67,10 +70,10 @@ fn web_principal() -> Principal {
 }
 
 #[test]
-fn test_resolve_approval_model_principal_is_rejected_and_store_untouched() {
-    let temp = tempfile::tempdir().expect("tempdir");
+fn test_resolve_approval_model_principal_is_rejected_and_store_untouched() -> TestResult {
+    let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
     let store = ApprovalStore::new(temp.path());
-    let (session, request) = issue(&store);
+    let (session, request) = issue(&store)?;
     let model = Principal::trusted_ingress(
         PrincipalKind::Model,
         "root",
@@ -78,65 +81,88 @@ fn test_resolve_approval_model_principal_is_rejected_and_store_untouched() {
         PermissionTier::Owner,
     );
 
-    let error = resolve_approval(
+    let result = resolve_approval(
         &store,
         &ApprovalCaller::new(&model),
         &session,
         &request,
         ReviewDecision::Approved,
         None,
-        &clock_after(1),
-    )
-    .expect_err("model has no approver actor");
+        &clock_after(1)?,
+    );
+    let Err(error) = result else {
+        return Err(TestError::Unexpected(
+            "model has no approver actor".to_owned(),
+        ));
+    };
 
     assert!(matches!(error, SecurityError::NoApproverActor { .. }));
-    assert_eq!(store.resolution(&session, &request).expect("readable"), None);
+    assert_eq!(
+        store
+            .resolution(&session, &request)
+            .map_err(ctx("readable"))?,
+        None
+    );
+    Ok(())
 }
 
 #[test]
-fn test_resolve_approval_web_principal_requires_confirmed_peer() {
-    let temp = tempfile::tempdir().expect("tempdir");
+fn test_resolve_approval_web_principal_requires_confirmed_peer() -> TestResult {
+    let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
     let store = ApprovalStore::new(temp.path());
-    let (session, request) = issue(&store);
+    let (session, request) = issue(&store)?;
     let principal = web_principal();
 
-    let error = resolve_approval(
+    let result = resolve_approval(
         &store,
         &ApprovalCaller::new(&principal),
         &session,
         &request,
         ReviewDecision::Approved,
         None,
-        &clock_after(1),
-    )
-    .expect_err("no peer");
+        &clock_after(1)?,
+    );
+    let Err(error) = result else {
+        return Err(TestError::Unexpected("no peer".to_owned()));
+    };
     assert!(matches!(error, SecurityError::UnauthenticatedWebPeer));
 
     let table = StaticUidApprovalActorMap::new(vec![(1000, "owner".to_owned())]);
     let stranger = PeerCredentials::new(7, 4242, 4242);
-    let error = resolve_approval(
+    let result = resolve_approval(
         &store,
         &ApprovalCaller::new(&principal).with_web_peer(&stranger, &table),
         &session,
         &request,
         ReviewDecision::Approved,
         None,
-        &clock_after(1),
-    )
-    .expect_err("unknown peer");
-    assert!(matches!(error, SecurityError::UnknownApprover { uid: 4242 }));
-    assert_eq!(store.resolution(&session, &request).expect("readable"), None);
+        &clock_after(1)?,
+    );
+    let Err(error) = result else {
+        return Err(TestError::Unexpected("unknown peer".to_owned()));
+    };
+    assert!(matches!(
+        error,
+        SecurityError::UnknownApprover { uid: 4242 }
+    ));
+    assert_eq!(
+        store
+            .resolution(&session, &request)
+            .map_err(ctx("readable"))?,
+        None
+    );
+    Ok(())
 }
 
 #[test]
-fn test_resolve_approval_resolved_at_comes_from_server_clock() {
-    let temp = tempfile::tempdir().expect("tempdir");
+fn test_resolve_approval_resolved_at_comes_from_server_clock() -> TestResult {
+    let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
     let store = ApprovalStore::new(temp.path());
-    let (session, request) = issue(&store);
+    let (session, request) = issue(&store)?;
     let principal = web_principal();
     let table = StaticUidApprovalActorMap::new(vec![(1000, "owner".to_owned())]);
     let peer = PeerCredentials::new(7, 1000, 1000);
-    let clock = clock_after(12);
+    let clock = clock_after(12)?;
 
     let resolution = resolve_approval(
         &store,
@@ -147,7 +173,7 @@ fn test_resolve_approval_resolved_at_comes_from_server_clock() {
         None,
         &clock,
     )
-    .expect("resolves");
+    .map_err(ctx("resolves"))?;
 
     assert_eq!(resolution.resolved_at, clock.0);
     assert_eq!(
@@ -156,22 +182,32 @@ fn test_resolve_approval_resolved_at_comes_from_server_clock() {
             id: "owner".to_owned()
         }
     );
+    Ok(())
 }
 
 #[test]
-fn test_expired_request_is_not_listed_and_not_resolvable() {
-    let temp = tempfile::tempdir().expect("tempdir");
+fn test_expired_request_is_not_listed_and_not_resolvable() -> TestResult {
+    let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
     let store = ApprovalStore::new(temp.path());
-    let (session, request) = issue(&store);
+    let (session, request) = issue(&store)?;
     let principal = web_principal();
     let table = StaticUidApprovalActorMap::new(vec![(1000, "owner".to_owned())]);
     let peer = PeerCredentials::new(7, 1000, 1000);
-    let expired = clock_after(30);
+    let expired = clock_after(30)?;
 
-    assert_eq!(list_pending_approvals(&store, 10, &clock_after(29)).expect("list").len(), 1);
-    assert!(list_pending_approvals(&store, 10, &expired).expect("list").is_empty());
+    assert_eq!(
+        list_pending_approvals(&store, 10, &clock_after(29)?)
+            .map_err(ctx("list"))?
+            .len(),
+        1
+    );
+    assert!(
+        list_pending_approvals(&store, 10, &expired)
+            .map_err(ctx("list"))?
+            .is_empty()
+    );
 
-    let error = resolve_approval(
+    let result = resolve_approval(
         &store,
         &ApprovalCaller::new(&principal).with_web_peer(&peer, &table),
         &session,
@@ -179,10 +215,13 @@ fn test_expired_request_is_not_listed_and_not_resolvable() {
         ReviewDecision::Approved,
         None,
         &expired,
-    )
-    .expect_err("expired");
+    );
+    let Err(error) = result else {
+        return Err(TestError::Unexpected("expired".to_owned()));
+    };
     assert!(matches!(
         error,
         SecurityError::Store(SessionStoreError::ApprovalExpired { .. })
     ));
+    Ok(())
 }

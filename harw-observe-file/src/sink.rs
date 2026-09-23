@@ -50,8 +50,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use harw_observe::{
     Cardinality, FieldName, FieldValue, MetricKey, MetricKind, MetricValue, TelemetrySink, Unit,
@@ -403,6 +403,7 @@ fn next_rotation_sequence(dir: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use tempfile::tempdir;
 
     fn key(name: &'static str) -> MetricKey {
@@ -416,18 +417,19 @@ mod tests {
     }
 
     #[test]
-    fn test_open_creates_directory_and_active_file() {
-        let dir = tempdir().unwrap();
+    fn test_open_creates_directory_and_active_file() -> TestResult {
+        let dir = tempdir().map_err(ctx("Temp-Verzeichnis anlegen"))?;
         let target = dir.path().join("nested");
-        let sink = FileSink::open(&target, 1_048_576).unwrap();
+        let sink = FileSink::open(&target, 1_048_576).map_err(ctx("FileSink öffnen"))?;
         assert!(target.join(ACTIVE_FILE_NAME).exists());
         assert_eq!(sink.name(), "file");
+        Ok(())
     }
 
     #[test]
-    fn test_record_appends_readable_jsonl_line() {
-        let dir = tempdir().unwrap();
-        let sink = FileSink::open(dir.path(), 1_048_576).unwrap();
+    fn test_record_appends_readable_jsonl_line() -> TestResult {
+        let dir = tempdir().map_err(ctx("Temp-Verzeichnis anlegen"))?;
+        let sink = FileSink::open(dir.path(), 1_048_576).map_err(ctx("FileSink öffnen"))?;
         sink.record(
             &key("jobs_total"),
             MetricValue::Count(3),
@@ -435,55 +437,72 @@ mod tests {
         );
         sink.flush();
 
-        let contents = fs::read_to_string(dir.path().join(ACTIVE_FILE_NAME)).unwrap();
-        let line = contents.lines().next().unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+        let contents = fs::read_to_string(dir.path().join(ACTIVE_FILE_NAME))
+            .map_err(ctx("aktive Datei lesen"))?;
+        let line = contents
+            .lines()
+            .next()
+            .ok_or(crate::test_support::TestError::Missing("erste Zeile"))?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(line).map_err(ctx("Zeile als JSON parsen"))?;
         assert_eq!(parsed["metric"], "jobs_total");
         assert_eq!(parsed["value"], 3);
         assert_eq!(parsed["labels"][0][0], "host");
         assert_eq!(parsed["labels"][0][1], "a");
+        Ok(())
     }
 
     #[test]
-    fn test_record_rotates_after_max_bytes_and_writes_digest_sidecar() {
-        let dir = tempdir().unwrap();
-        let sink = FileSink::open(dir.path(), 1).unwrap();
+    fn test_record_rotates_after_max_bytes_and_writes_digest_sidecar() -> TestResult {
+        let dir = tempdir().map_err(ctx("Temp-Verzeichnis anlegen"))?;
+        let sink = FileSink::open(dir.path(), 1).map_err(ctx("FileSink öffnen"))?;
         sink.record(&key("a"), MetricValue::Count(1), &[]);
 
         let rotated: Vec<_> = fs::read_dir(dir.path())
-            .unwrap()
+            .map_err(ctx("Verzeichnis lesen"))?
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|name| name.starts_with(ROTATED_PREFIX) && name.ends_with(ROTATED_SUFFIX))
             .collect();
-        assert_eq!(rotated.len(), 1, "expected exactly one rotated file, got {rotated:?}");
+        assert_eq!(
+            rotated.len(),
+            1,
+            "expected exactly one rotated file, got {rotated:?}"
+        );
 
         let rotated_path = dir.path().join(&rotated[0]);
         let digest_path = dir.path().join(format!("{}{DIGEST_SUFFIX}", rotated[0]));
         assert!(digest_path.exists());
 
-        let expected_digest = blake3::hash(&fs::read(&rotated_path).unwrap())
-            .to_hex()
-            .to_string();
-        let stored_digest = fs::read_to_string(&digest_path).unwrap();
+        let expected_digest =
+            blake3::hash(&fs::read(&rotated_path).map_err(ctx("rotierte Datei lesen"))?)
+                .to_hex()
+                .to_string();
+        let stored_digest = fs::read_to_string(&digest_path).map_err(ctx("Digest-Datei lesen"))?;
         assert_eq!(stored_digest, expected_digest);
 
-        let active_len = fs::metadata(dir.path().join(ACTIVE_FILE_NAME)).unwrap().len();
-        assert_eq!(active_len, 0, "active file must be empty right after rotation");
+        let active_len = fs::metadata(dir.path().join(ACTIVE_FILE_NAME))
+            .map_err(ctx("aktive Datei-Metadaten lesen"))?
+            .len();
+        assert_eq!(
+            active_len, 0,
+            "active file must be empty right after rotation"
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_open_resumes_sequence_after_restart() {
-        let dir = tempdir().unwrap();
+    fn test_open_resumes_sequence_after_restart() -> TestResult {
+        let dir = tempdir().map_err(ctx("Temp-Verzeichnis anlegen"))?;
         {
-            let sink = FileSink::open(dir.path(), 1).unwrap();
+            let sink = FileSink::open(dir.path(), 1).map_err(ctx("FileSink öffnen"))?;
             sink.record(&key("a"), MetricValue::Count(1), &[]);
         }
-        let sink2 = FileSink::open(dir.path(), 1).unwrap();
+        let sink2 = FileSink::open(dir.path(), 1).map_err(ctx("FileSink erneut öffnen"))?;
         sink2.record(&key("b"), MetricValue::Count(2), &[]);
 
         let mut sequences: Vec<u64> = fs::read_dir(dir.path())
-            .unwrap()
+            .map_err(ctx("Verzeichnis lesen"))?
             .flatten()
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().into_owned();
@@ -498,22 +517,25 @@ mod tests {
             vec![0, 1],
             "sequence numbers must not collide across restarts"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_write_error_count_starts_at_zero_and_stays_zero_on_success() {
-        let dir = tempdir().unwrap();
-        let sink = FileSink::open(dir.path(), 1_048_576).unwrap();
+    fn test_write_error_count_starts_at_zero_and_stays_zero_on_success() -> TestResult {
+        let dir = tempdir().map_err(ctx("Temp-Verzeichnis anlegen"))?;
+        let sink = FileSink::open(dir.path(), 1_048_576).map_err(ctx("FileSink öffnen"))?;
         assert_eq!(sink.write_error_count(), 0);
         sink.record(&key("x"), MetricValue::Count(1), &[]);
         assert_eq!(sink.write_error_count(), 0);
+        Ok(())
     }
 
     #[test]
-    fn test_name_is_file() {
-        let dir = tempdir().unwrap();
-        let sink = FileSink::open(dir.path(), 1_048_576).unwrap();
+    fn test_name_is_file() -> TestResult {
+        let dir = tempdir().map_err(ctx("Temp-Verzeichnis anlegen"))?;
+        let sink = FileSink::open(dir.path(), 1_048_576).map_err(ctx("FileSink öffnen"))?;
         assert_eq!(sink.name(), "file");
+        Ok(())
     }
 
     #[test]

@@ -28,7 +28,7 @@
 //! return — never by the content payload itself.
 
 pub use crate::error::ImpactAssessmentError;
-use serde::{de, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use std::fmt;
 
 /// Cross-family impact severity level.
@@ -388,6 +388,7 @@ impl ImpactAssessment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn test_severity_ordering() {
@@ -398,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn test_severity_display_roundtrip() {
+    fn test_severity_display_roundtrip() -> TestResult {
         for level in [
             ImpactSeverity::Info,
             ImpactSeverity::Low,
@@ -407,20 +408,19 @@ mod tests {
             ImpactSeverity::Critical,
         ] {
             let text = level.to_string();
-            assert_eq!(text.parse::<ImpactSeverity>().unwrap(), level);
+            assert_eq!(text.parse::<ImpactSeverity>()?, level);
         }
+        Ok(())
     }
 
     #[test]
-    fn test_severity_from_str_case_insensitive() {
+    fn test_severity_from_str_case_insensitive() -> TestResult {
         assert_eq!(
-            "CRITICAL".parse::<ImpactSeverity>().unwrap(),
+            "CRITICAL".parse::<ImpactSeverity>()?,
             ImpactSeverity::Critical
         );
-        assert_eq!(
-            "High".parse::<ImpactSeverity>().unwrap(),
-            ImpactSeverity::High
-        );
+        assert_eq!("High".parse::<ImpactSeverity>()?, ImpactSeverity::High);
+        Ok(())
     }
 
     #[test]
@@ -430,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn test_impact_assessment_is_high_or_critical() {
+    fn test_impact_assessment_is_high_or_critical() -> TestResult {
         let high = ImpactAssessment::new_with_evidence(
             ImpactSeverity::High,
             ImpactDomain::Correctness,
@@ -438,8 +438,7 @@ mod tests {
             "test failure",
             vec!["test-log".to_owned()],
             "verifier-agent",
-        )
-        .unwrap();
+        )?;
         assert!(high.is_high_or_critical());
 
         let medium = ImpactAssessment::new(
@@ -448,13 +447,13 @@ mod tests {
             ImpactConfidence::High,
             "style issue",
             "verifier-agent",
-        )
-        .unwrap();
+        )?;
         assert!(!medium.is_high_or_critical());
+        Ok(())
     }
 
     #[test]
-    fn test_unconfirmed_critical() {
+    fn test_unconfirmed_critical() -> TestResult {
         let unconfirmed = ImpactAssessment::new_with_evidence(
             ImpactSeverity::Critical,
             ImpactDomain::Security,
@@ -462,8 +461,7 @@ mod tests {
             "possible secret leak",
             vec!["scanner-match".to_owned()],
             "scanner",
-        )
-        .unwrap();
+        )?;
         assert!(unconfirmed.is_unconfirmed_critical());
 
         let confirmed = ImpactAssessment::new_with_evidence(
@@ -473,13 +471,13 @@ mod tests {
             "verified secret leak",
             vec!["audit-trace".to_owned()],
             "scanner",
-        )
-        .unwrap();
+        )?;
         assert!(!confirmed.is_unconfirmed_critical());
+        Ok(())
     }
 
     #[test]
-    fn test_impact_assessment_serde_roundtrip() {
+    fn test_impact_assessment_serde_roundtrip() -> TestResult {
         let assessment = ImpactAssessment {
             level: ImpactSeverity::Critical,
             domain: ImpactDomain::DataLoss,
@@ -489,9 +487,10 @@ mod tests {
             reported_by: "job-runtime".to_owned(),
             normalized_by: Some("escalation-policy-v1".to_owned()),
         };
-        let json = serde_json::to_string(&assessment).unwrap();
-        let recovered: ImpactAssessment = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&assessment)?;
+        let recovered: ImpactAssessment = serde_json::from_str(&json)?;
         assert_eq!(assessment, recovered);
+        Ok(())
     }
 
     #[test]
@@ -508,25 +507,30 @@ mod tests {
     }
 
     #[test]
-    fn test_high_and_critical_require_evidence() {
-        let error = ImpactAssessment::new(
+    fn test_high_and_critical_require_evidence() -> TestResult {
+        let result = ImpactAssessment::new(
             ImpactSeverity::High,
             ImpactDomain::Correctness,
             ImpactConfidence::High,
             "missing evidence",
             "agent",
-        )
-        .unwrap_err();
+        );
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "Err erwartet: fehlende Evidenz muss abgelehnt werden".into(),
+            ));
+        };
         assert_eq!(
             error,
             ImpactAssessmentError::MissingEvidence {
                 level: ImpactSeverity::High
             }
         );
+        Ok(())
     }
 
     #[test]
-    fn test_deserialization_validates_invariants() {
+    fn test_deserialization_validates_invariants() -> TestResult {
         let json = r#"{
             "level":"critical",
             "domain":"security",
@@ -535,12 +539,18 @@ mod tests {
             "evidence":[],
             "reported_by":"scanner"
         }"#;
-        let error = serde_json::from_str::<ImpactAssessment>(json).unwrap_err();
+        let result = serde_json::from_str::<ImpactAssessment>(json);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "Err erwartet: fehlende Evidenz muss beim Deserialisieren abgelehnt werden".into(),
+            ));
+        };
         assert!(error.to_string().contains("require evidence"));
+        Ok(())
     }
 
     #[test]
-    fn test_low_confidence_critical_is_allowed_when_evidenced() {
+    fn test_low_confidence_critical_is_allowed_when_evidenced() -> TestResult {
         let assessment = ImpactAssessment::new_with_evidence(
             ImpactSeverity::Critical,
             ImpactDomain::Security,
@@ -548,8 +558,8 @@ mod tests {
             "possible leak",
             vec!["scanner-match".to_owned()],
             "scanner",
-        )
-        .unwrap();
+        )?;
         assert!(assessment.is_unconfirmed_critical());
+        Ok(())
     }
 }

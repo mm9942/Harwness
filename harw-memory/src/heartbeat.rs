@@ -402,6 +402,7 @@ pub fn tick_with_fact_decay<M: crate::store::Memory>(
 mod tests {
     use super::*;
     use crate::store::Memory;
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::types::{Entry, MaintenanceReport, RecallQuery, Signal, Stats};
 
     // ── MockStore ──────────────────────────────────────────────────────────────
@@ -422,19 +423,27 @@ mod tests {
 
     impl Memory for MockStore {
         fn hot(&self) -> MemoryResult<String> {
-            unimplemented!("not needed for heartbeat tests")
+            Err(crate::error::MemoryError::LockContention {
+                attempted: "MockStore::hot (in Heartbeat-Tests nicht benötigt)",
+            })
         }
 
         fn recall<'a>(&self, _query: RecallQuery<'a>) -> MemoryResult<Vec<Entry>> {
-            unimplemented!("not needed for heartbeat tests")
+            Err(crate::error::MemoryError::LockContention {
+                attempted: "MockStore::recall (in Heartbeat-Tests nicht benötigt)",
+            })
         }
 
         fn record(&self, _signal: Signal) -> MemoryResult<()> {
-            unimplemented!("not needed for heartbeat tests")
+            Err(crate::error::MemoryError::LockContention {
+                attempted: "MockStore::record (in Heartbeat-Tests nicht benötigt)",
+            })
         }
 
         fn maintain(&self) -> MemoryResult<MaintenanceReport> {
-            unimplemented!("not needed for heartbeat tests")
+            Err(crate::error::MemoryError::LockContention {
+                attempted: "MockStore::maintain (in Heartbeat-Tests nicht benötigt)",
+            })
         }
 
         fn stats(&self) -> MemoryResult<Stats> {
@@ -456,31 +465,35 @@ mod tests {
     /// Design-Doc §6: HOT-Overflow (>100 Zeilen) → älteste per `last_used` → WARM.
     /// Der Report nennt das Delta; der Store führt die Kürzung aus.
     #[test]
-    fn test_overflow_reports_demote_delta() {
+    fn test_overflow_reports_demote_delta() -> TestResult {
         let store = MockStore::new(Stats {
             hot_lines: 120,
             ..Stats::default()
         });
-        let report = tick(&store, now(), HeartbeatConfig::default()).unwrap();
+        let report =
+            tick(&store, now(), HeartbeatConfig::default()).map_err(ctx("tick sollte gelingen"))?;
         assert_eq!(report.demoted, 20, "overshoot should be 120 - 100 = 20");
         assert_eq!(
             report.hot_lines_after, 100,
             "after virtual trim hot_lines_after == max"
         );
+        Ok(())
     }
 
     // ── Test 2: No overflow → demoted stays zero ───────────────────────────────
 
     /// Prüft, dass kein Overflow kein `demoted` erzeugt.
     #[test]
-    fn test_no_overflow_reports_zero_demote() {
+    fn test_no_overflow_reports_zero_demote() -> TestResult {
         let store = MockStore::new(Stats {
             hot_lines: 50,
             ..Stats::default()
         });
-        let report = tick(&store, now(), HeartbeatConfig::default()).unwrap();
+        let report =
+            tick(&store, now(), HeartbeatConfig::default()).map_err(ctx("tick sollte gelingen"))?;
         assert_eq!(report.demoted, 0);
         assert_eq!(report.hot_lines_after, 50);
+        Ok(())
     }
 
     // ── Test 3: Pending signals → promotions ──────────────────────────────────
@@ -489,20 +502,22 @@ mod tests {
     ///
     /// Design-Doc §6: PatternHint 3× in 7d → nach WARM.
     #[test]
-    fn test_pending_signals_yield_promotions() {
+    fn test_pending_signals_yield_promotions() -> TestResult {
         let store = MockStore::new(Stats {
             pending_signals: 9,
             ..Stats::default()
         });
-        let report = tick(&store, now(), HeartbeatConfig::default()).unwrap();
+        let report =
+            tick(&store, now(), HeartbeatConfig::default()).map_err(ctx("tick sollte gelingen"))?;
         assert_eq!(report.promoted, 3, "9 / 3 = 3 promotion slots");
+        Ok(())
     }
 
     // ── Test 4: Idempotency ────────────────────────────────────────────────────
 
     /// Prüft Invariante 8 (philosophy.md §16): zwei identische Stats → gleicher Report.
     #[test]
-    fn test_idempotent_when_stats_stable() {
+    fn test_idempotent_when_stats_stable() -> TestResult {
         let stats = Stats {
             hot_lines: 80,
             pending_signals: 6,
@@ -511,9 +526,12 @@ mod tests {
             cold_namespaces: 1,
         };
         let store = MockStore::new(stats);
-        let first = tick(&store, now(), HeartbeatConfig::default()).unwrap();
-        let second = tick(&store, now(), HeartbeatConfig::default()).unwrap();
+        let first = tick(&store, now(), HeartbeatConfig::default())
+            .map_err(ctx("erster tick sollte gelingen"))?;
+        let second = tick(&store, now(), HeartbeatConfig::default())
+            .map_err(ctx("zweiter tick sollte gelingen"))?;
         assert_eq!(first, second, "tick must be idempotent for stable stats");
+        Ok(())
     }
 
     // ── Test 5: Default config matches design-doc ─────────────────────────────
@@ -534,43 +552,48 @@ mod tests {
 
     /// Stellt sicher, dass `HeartbeatReport` verlustfrei JSON-serialisiert werden kann.
     #[test]
-    fn test_report_serde_roundtrip() {
+    fn test_report_serde_roundtrip() -> TestResult {
         let original = HeartbeatReport {
             promoted: 2,
             demoted: 15,
             archived: 0,
             hot_lines_after: 85,
         };
-        let json = serde_json::to_string(&original).expect("serialize should not fail");
+        let json = serde_json::to_string(&original).map_err(ctx("serialize should not fail"))?;
         let restored: HeartbeatReport =
-            serde_json::from_str(&json).expect("deserialize should not fail");
+            serde_json::from_str(&json).map_err(ctx("deserialize should not fail"))?;
         assert_eq!(original, restored);
+        Ok(())
     }
 
     // ── Additional edge: signals below threshold → no promotion ───────────────
 
     /// Randfall: Signale unter dem Schwellwert → keine Promotions.
     #[test]
-    fn test_signals_below_threshold_yield_no_promotions() {
+    fn test_signals_below_threshold_yield_no_promotions() -> TestResult {
         let store = MockStore::new(Stats {
             pending_signals: 2,
             ..Stats::default()
         });
-        let report = tick(&store, now(), HeartbeatConfig::default()).unwrap();
+        let report =
+            tick(&store, now(), HeartbeatConfig::default()).map_err(ctx("tick sollte gelingen"))?;
         assert_eq!(report.promoted, 0, "2 < 3 threshold — no promotion");
+        Ok(())
     }
 
     // ── Additional edge: exact threshold → exactly one promotion slot ──────────
 
     /// Randfall: exakt Schwellwert-viele Signale → exakt 1 Promotion-Slot.
     #[test]
-    fn test_signals_at_exact_threshold_yield_one_promotion() {
+    fn test_signals_at_exact_threshold_yield_one_promotion() -> TestResult {
         let store = MockStore::new(Stats {
             pending_signals: 3,
             ..Stats::default()
         });
-        let report = tick(&store, now(), HeartbeatConfig::default()).unwrap();
+        let report =
+            tick(&store, now(), HeartbeatConfig::default()).map_err(ctx("tick sollte gelingen"))?;
         assert_eq!(report.promoted, 1);
+        Ok(())
     }
 
     // ── Additional edge: disabled promotion avoids division by zero ──────────
@@ -578,7 +601,7 @@ mod tests {
     /// Ein Runtime-Override mit Schwellwert `0` darf den Heartbeat nicht
     /// panicken lassen; er deaktiviert stattdessen nur die Promotion-Berechnung.
     #[test]
-    fn test_zero_promotion_threshold_disables_promotions() {
+    fn test_zero_promotion_threshold_disables_promotions() -> TestResult {
         let store = MockStore::new(Stats {
             pending_signals: 9,
             ..Stats::default()
@@ -588,16 +611,17 @@ mod tests {
             ..HeartbeatConfig::default()
         };
 
-        let report = tick(&store, now(), cfg).unwrap();
+        let report = tick(&store, now(), cfg).map_err(ctx("tick sollte gelingen"))?;
 
         assert_eq!(report.promoted, 0);
+        Ok(())
     }
 
     // ── Additional edge: archived is always zero in this iteration ─────────────
 
     /// Randfall: `archived` ist immer 0 — reserviert für Cold-Sweep in Folge-Fanout.
     #[test]
-    fn test_archived_always_zero() {
+    fn test_archived_always_zero() -> TestResult {
         let store = MockStore::new(Stats {
             hot_lines: 200,
             pending_signals: 100,
@@ -605,8 +629,10 @@ mod tests {
             warm_total_lines: 5000,
             cold_namespaces: 10,
         });
-        let report = tick(&store, now(), HeartbeatConfig::default()).unwrap();
+        let report =
+            tick(&store, now(), HeartbeatConfig::default()).map_err(ctx("tick sollte gelingen"))?;
         assert_eq!(report.archived, 0, "Cold-Sweep reserved for future fanout");
+        Ok(())
     }
 
     // ── Fakten-Verfall (memory-v3-ltm.md §5.4) ────────────────────────────────
@@ -615,7 +641,7 @@ mod tests {
     use time::Duration;
 
     /// Erzeugt eine frische, isolierte `FactStore`-Wurzel für einen Test.
-    fn tmp_fact_store(tag: &str) -> (std::path::PathBuf, FactStore) {
+    fn tmp_fact_store(tag: &str) -> TestResult<(std::path::PathBuf, FactStore)> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -623,8 +649,9 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let store = FactStore::open(&root, FactScope::Project).unwrap();
-        (root, store)
+        let store = FactStore::open(&root, FactScope::Project)
+            .map_err(ctx("FactStore::open sollte gelingen"))?;
+        Ok((root, store))
     }
 
     fn sample_decay_fact(name: &str, confidence: f32) -> Fact {
@@ -647,16 +674,25 @@ mod tests {
     /// `max_unused_days` vollständig abgelaufen ist — davor bleibt der Fakt
     /// unverändert.
     #[test]
-    fn decay_facts_halves_confidence_only_after_window_elapses() {
-        let (root, store) = tmp_fact_store("window");
-        store.write(&sample_decay_fact("alte-entscheidung", 0.8)).unwrap();
-        let written = store.read("alte-entscheidung").unwrap().unwrap();
+    fn decay_facts_halves_confidence_only_after_window_elapses() -> TestResult {
+        let (root, store) = tmp_fact_store("window")?;
+        store
+            .write(&sample_decay_fact("alte-entscheidung", 0.8))
+            .map_err(ctx("Fakt schreiben sollte gelingen"))?;
+        let written = store
+            .read("alte-entscheidung")
+            .map_err(ctx("Fakt lesen sollte gelingen"))?
+            .ok_or(TestError::Missing("alte-entscheidung"))?;
 
         // Knapp unter dem Fenster: keine Änderung.
         let before_window = written.updated + Duration::days(89);
-        let report = decay_facts(&[&store], 90, before_window).unwrap();
+        let report = decay_facts(&[&store], 90, before_window)
+            .map_err(ctx("decay_facts sollte gelingen"))?;
         assert_eq!(report.facts_decayed, 0, "89 Tage < 90 Tage Fenster");
-        let unchanged = store.read("alte-entscheidung").unwrap().unwrap();
+        let unchanged = store
+            .read("alte-entscheidung")
+            .map_err(ctx("Fakt lesen sollte gelingen"))?
+            .ok_or(TestError::Missing("alte-entscheidung"))?;
         assert!(
             (unchanged.confidence - 0.8).abs() < f32::EPSILON,
             "confidence darf vor Fensterablauf nicht sinken, war {}",
@@ -665,40 +701,62 @@ mod tests {
 
         // Fenster genau erreicht: Verfall greift.
         let at_window = written.updated + Duration::days(90);
-        let report = decay_facts(&[&store], 90, at_window).unwrap();
+        let report =
+            decay_facts(&[&store], 90, at_window).map_err(ctx("decay_facts sollte gelingen"))?;
         assert_eq!(report.facts_decayed, 1, "90 Tage == Fenster muss verfallen");
-        let decayed = store.read("alte-entscheidung").unwrap().unwrap();
+        let decayed = store
+            .read("alte-entscheidung")
+            .map_err(ctx("Fakt lesen sollte gelingen"))?
+            .ok_or(TestError::Missing("alte-entscheidung"))?;
         assert!(
             (decayed.confidence - 0.4).abs() < f32::EPSILON,
             "confidence muss halbiert sein (0.8 -> 0.4), war {}",
             decayed.confidence
         );
-        assert!(report.facts_below_threshold.is_empty(), "0.4 liegt über 0.2");
+        assert!(
+            report.facts_below_threshold.is_empty(),
+            "0.4 liegt über 0.2"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     /// Design §5.4: ein Fakt mit `usage_count > 0` verfällt nicht, egal wie
     /// alt sein letzter Zugriff liegt.
     #[test]
-    fn decay_facts_skips_used_facts() {
-        let (root, store) = tmp_fact_store("used");
-        store.write(&sample_decay_fact("oft-genutzt", 0.9)).unwrap();
-        store.record_usage(&["oft-genutzt"]).unwrap();
-        let (count, last_used) = store.usage("oft-genutzt").unwrap();
+    fn decay_facts_skips_used_facts() -> TestResult {
+        let (root, store) = tmp_fact_store("used")?;
+        store
+            .write(&sample_decay_fact("oft-genutzt", 0.9))
+            .map_err(ctx("Fakt schreiben sollte gelingen"))?;
+        store
+            .record_usage(&["oft-genutzt"])
+            .map_err(ctx("record_usage sollte gelingen"))?;
+        let (count, last_used) = store
+            .usage("oft-genutzt")
+            .ok_or(TestError::Missing("usage sollte gelingen"))?;
         assert_eq!(count, 1);
 
         let far_future = last_used + Duration::days(10_000);
-        let report = decay_facts(&[&store], 90, far_future).unwrap();
+        let report =
+            decay_facts(&[&store], 90, far_future).map_err(ctx("decay_facts sollte gelingen"))?;
 
-        assert_eq!(report.facts_decayed, 0, "benutzte Fakten dürfen nicht verfallen");
-        let unchanged = store.read("oft-genutzt").unwrap().unwrap();
+        assert_eq!(
+            report.facts_decayed, 0,
+            "benutzte Fakten dürfen nicht verfallen"
+        );
+        let unchanged = store
+            .read("oft-genutzt")
+            .map_err(ctx("Fakt lesen sollte gelingen"))?
+            .ok_or(TestError::Missing("oft-genutzt"))?;
         assert!(
             (unchanged.confidence - 0.9).abs() < f32::EPSILON,
             "confidence eines genutzten Fakts darf sich nicht ändern"
         );
 
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     /// Design §5.4: `facts_decayed` zählt alle verfallenen Fakten,
@@ -706,28 +764,44 @@ mod tests {
     /// `0.2` fällt — beide Felder müssen exakt stimmen, über mehrere Wurzeln
     /// hinweg aufsummiert.
     #[test]
-    fn decay_facts_report_fields_are_exact() {
-        let (root_a, store_a) = tmp_fact_store("report-a");
-        let (root_b, store_b) = tmp_fact_store("report-b");
+    fn decay_facts_report_fields_are_exact() -> TestResult {
+        let (root_a, store_a) = tmp_fact_store("report-a")?;
+        let (root_b, store_b) = tmp_fact_store("report-b")?;
 
         // Fällt nach Halbierung nicht unter 0.2 (0.8 -> 0.4).
-        store_a.write(&sample_decay_fact("bleibt-drueber", 0.8)).unwrap();
+        store_a
+            .write(&sample_decay_fact("bleibt-drueber", 0.8))
+            .map_err(ctx("Fakt schreiben sollte gelingen"))?;
         // Fällt nach Halbierung unter 0.2 (0.3 -> 0.15).
-        store_b.write(&sample_decay_fact("faellt-drunter", 0.3)).unwrap();
+        store_b
+            .write(&sample_decay_fact("faellt-drunter", 0.3))
+            .map_err(ctx("Fakt schreiben sollte gelingen"))?;
 
-        let old_a = store_a.read("bleibt-drueber").unwrap().unwrap();
-        let old_b = store_b.read("faellt-drunter").unwrap().unwrap();
+        let old_a = store_a
+            .read("bleibt-drueber")
+            .map_err(ctx("Fakt lesen sollte gelingen"))?
+            .ok_or(TestError::Missing("bleibt-drueber"))?;
+        let old_b = store_b
+            .read("faellt-drunter")
+            .map_err(ctx("Fakt lesen sollte gelingen"))?
+            .ok_or(TestError::Missing("faellt-drunter"))?;
         let now = old_a.updated.max(old_b.updated) + Duration::days(200);
 
-        let report = decay_facts(&[&store_a, &store_b], 90, now).unwrap();
+        let report = decay_facts(&[&store_a, &store_b], 90, now)
+            .map_err(ctx("decay_facts sollte gelingen"))?;
 
-        assert_eq!(report.facts_decayed, 2, "beide Fakten müssen verfallen sein");
+        assert_eq!(
+            report.facts_decayed, 2,
+            "beide Fakten müssen verfallen sein"
+        );
         assert_eq!(
             report.facts_below_threshold,
             vec!["faellt-drunter".to_owned()],
             "nur der zweite Fakt darf unter 0.2 gemeldet werden"
         );
-        let still_present = store_b.read("faellt-drunter").unwrap();
+        let still_present = store_b
+            .read("faellt-drunter")
+            .map_err(ctx("Fakt lesen sollte gelingen"))?;
         assert!(
             still_present.is_some(),
             "Fakten unter der Schwelle werden gemeldet, nicht gelöscht (§5.4)"
@@ -735,15 +809,21 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root_a);
         let _ = std::fs::remove_dir_all(&root_b);
+        Ok(())
     }
 
     /// `tick_with_fact_decay` liefert unverändertes HOT/WARM/COLD-Verhalten
     /// (identisch zu [`tick`]) zusammen mit dem Fakten-Verfall-Report.
     #[test]
-    fn tick_with_fact_decay_combines_both_reports_without_changing_hot_behaviour() {
-        let (root, fact_store) = tmp_fact_store("combined");
-        fact_store.write(&sample_decay_fact("kombi-fakt", 0.6)).unwrap();
-        let written = fact_store.read("kombi-fakt").unwrap().unwrap();
+    fn tick_with_fact_decay_combines_both_reports_without_changing_hot_behaviour() -> TestResult {
+        let (root, fact_store) = tmp_fact_store("combined")?;
+        fact_store
+            .write(&sample_decay_fact("kombi-fakt", 0.6))
+            .map_err(ctx("Fakt schreiben sollte gelingen"))?;
+        let written = fact_store
+            .read("kombi-fakt")
+            .map_err(ctx("Fakt lesen sollte gelingen"))?
+            .ok_or(TestError::Missing("kombi-fakt"))?;
         let far_future = written.updated + Duration::days(365);
 
         let mem_store = MockStore::new(Stats {
@@ -754,23 +834,28 @@ mod tests {
         let cfg = HeartbeatConfig::default();
 
         let (heartbeat_report, decay_report) =
-            tick_with_fact_decay(&mem_store, far_future, cfg.clone(), &[&fact_store]).unwrap();
+            tick_with_fact_decay(&mem_store, far_future, cfg.clone(), &[&fact_store])
+                .map_err(ctx("tick_with_fact_decay sollte gelingen"))?;
 
-        let plain_tick = tick(&mem_store, far_future, cfg).unwrap();
+        let plain_tick = tick(&mem_store, far_future, cfg).map_err(ctx("tick sollte gelingen"))?;
         assert_eq!(
             heartbeat_report, plain_tick,
             "tick_with_fact_decay darf das HOT/WARM/COLD-Ergebnis nicht verändern"
         );
         assert_eq!(decay_report.facts_decayed, 1);
-        assert!(decay_report.facts_below_threshold.is_empty(), "0.3 liegt über 0.2");
+        assert!(
+            decay_report.facts_below_threshold.is_empty(),
+            "0.3 liegt über 0.2"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     /// `FactDecayReport::default()` und JSON-Roundtrip verhalten sich wie
     /// `HeartbeatReport` — leer bzw. verlustfrei.
     #[test]
-    fn fact_decay_report_default_and_serde_roundtrip() {
+    fn fact_decay_report_default_and_serde_roundtrip() -> TestResult {
         let default = FactDecayReport::default();
         assert_eq!(default.facts_decayed, 0);
         assert!(default.facts_below_threshold.is_empty());
@@ -779,9 +864,10 @@ mod tests {
             facts_decayed: 3,
             facts_below_threshold: vec!["a".to_owned(), "b".to_owned()],
         };
-        let json = serde_json::to_string(&original).expect("serialize should not fail");
+        let json = serde_json::to_string(&original).map_err(ctx("serialize should not fail"))?;
         let restored: FactDecayReport =
-            serde_json::from_str(&json).expect("deserialize should not fail");
+            serde_json::from_str(&json).map_err(ctx("deserialize should not fail"))?;
         assert_eq!(original, restored);
+        Ok(())
     }
 }

@@ -21,3 +21,7 @@ pub use telegram::{TelegramChannel, ThrottleNotice};
 pub use work_request::{
     WorkRequestRecord, WorkRequestState, WorkRequestStore, launch_sandboxed_worker,
 };
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

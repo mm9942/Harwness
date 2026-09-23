@@ -169,8 +169,8 @@ impl SentinelSink {
             path: path.display().to_string(),
         };
 
-        let socket =
-            net::socket(AddressFamily::UNIX, SocketType::SEQPACKET, None).map_err(|_| connect_err())?;
+        let socket = net::socket(AddressFamily::UNIX, SocketType::SEQPACKET, None)
+            .map_err(|_| connect_err())?;
         let addr = net::SocketAddrUnix::new(path).map_err(|_| connect_err())?;
         net::connect(&socket, &addr).map_err(|_| connect_err())?;
 
@@ -215,6 +215,7 @@ mod tests {
     use harw_types::{ContentDigest, SensorId};
 
     use super::encode_event;
+    use crate::test_support::{TestResult, ctx};
 
     fn sample_event() -> SecurityEvent {
         SecurityEvent {
@@ -229,19 +230,21 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_event_round_trips_through_serde_json() {
+    fn test_encode_event_round_trips_through_serde_json() -> TestResult {
         let event = sample_event();
-        let bytes = encode_event(&event).expect("SecurityEvent serializes");
+        let bytes = encode_event(&event).map_err(ctx("SecurityEvent serializes"))?;
         let decoded: SecurityEvent =
-            serde_json::from_slice(&bytes).expect("round-trips through the wire format");
+            serde_json::from_slice(&bytes).map_err(ctx("round-trips through the wire format"))?;
         assert_eq!(decoded, event);
+        Ok(())
     }
 
     #[test]
-    fn test_encode_event_produces_valid_utf8_json() {
-        let bytes = encode_event(&sample_event()).expect("SecurityEvent serializes");
-        let text = String::from_utf8(bytes).expect("wire format is valid UTF-8");
+    fn test_encode_event_produces_valid_utf8_json() -> TestResult {
+        let bytes = encode_event(&sample_event()).map_err(ctx("SecurityEvent serializes"))?;
+        let text = String::from_utf8(bytes).map_err(ctx("wire format is valid UTF-8"))?;
         assert!(text.contains("process-exec"));
+        Ok(())
     }
 
     // Bewusst kein Test öffnet einen echten Socket: weder `SentinelSink::connect`

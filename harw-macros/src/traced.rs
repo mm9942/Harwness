@@ -322,64 +322,86 @@ pub(crate) fn expand_traced(func: ItemFn, args: TracedArgs) -> syn::Result<Token
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn parse_args(tokens: TokenStream) -> syn::Result<TracedArgs> {
         parse_traced_args(tokens)
     }
 
     #[test]
-    fn parse_traced_args_defaults_to_info_and_no_fields() {
-        let args = parse_args(quote! {}).expect("empty attribute must parse");
+    fn parse_traced_args_defaults_to_info_and_no_fields() -> TestResult {
+        let args = parse_args(quote! {}).map_err(ctx("empty attribute must parse"))?;
         assert_eq!(args.level, ParsedLevel::Info);
         assert!(args.fields.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn parse_traced_args_reads_level_and_fields() {
+    fn parse_traced_args_reads_level_and_fields() -> TestResult {
         let args = parse_args(quote! { level = "debug", fields(child_id, clan) })
-            .expect("valid attribute must parse");
+            .map_err(ctx("valid attribute must parse"))?;
         assert_eq!(args.level, ParsedLevel::Debug);
         assert_eq!(args.fields.len(), 2);
         assert_eq!(args.fields[0], "child_id");
         assert_eq!(args.fields[1], "clan");
+        Ok(())
     }
 
     #[test]
-    fn parse_traced_args_accepts_fields_only() {
-        let args = parse_args(quote! { fields(a) }).expect("fields-only attribute must parse");
+    fn parse_traced_args_accepts_fields_only() -> TestResult {
+        let args =
+            parse_args(quote! { fields(a) }).map_err(ctx("fields-only attribute must parse"))?;
         assert_eq!(args.level, ParsedLevel::Info);
         assert_eq!(args.fields.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn parse_traced_args_rejects_unknown_key() {
-        let err = parse_args(quote! { bogus = "x" }).expect_err("unknown key must be rejected");
+    fn parse_traced_args_rejects_unknown_key() -> TestResult {
+        let Err(err) = parse_args(quote! { bogus = "x" }) else {
+            return Err(TestError::Unexpected(
+                "unknown key must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("unbekannter Schlüssel"));
+        Ok(())
     }
 
     #[test]
-    fn parse_traced_args_rejects_invalid_level() {
-        let err =
-            parse_args(quote! { level = "verbose" }).expect_err("invalid level must be rejected");
+    fn parse_traced_args_rejects_invalid_level() -> TestResult {
+        let Err(err) = parse_args(quote! { level = "verbose" }) else {
+            return Err(TestError::Unexpected(
+                "invalid level must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("unbekannter level"));
+        Ok(())
     }
 
     #[test]
-    fn parse_traced_args_rejects_duplicate_level() {
-        let err = parse_args(quote! { level = "info", level = "debug" })
-            .expect_err("duplicate level must be rejected");
+    fn parse_traced_args_rejects_duplicate_level() -> TestResult {
+        let Err(err) = parse_args(quote! { level = "info", level = "debug" }) else {
+            return Err(TestError::Unexpected(
+                "duplicate level must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("doppelt angegeben"));
+        Ok(())
     }
 
     #[test]
-    fn parse_traced_args_rejects_duplicate_fields() {
-        let err = parse_args(quote! { fields(a), fields(b) })
-            .expect_err("duplicate fields must be rejected");
+    fn parse_traced_args_rejects_duplicate_fields() -> TestResult {
+        let Err(err) = parse_args(quote! { fields(a), fields(b) }) else {
+            return Err(TestError::Unexpected(
+                "duplicate fields must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("doppelt angegeben"));
+        Ok(())
     }
 
     #[test]
-    fn expand_traced_rejects_field_not_an_argument() {
+    fn expand_traced_rejects_field_not_an_argument() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             fn foo(present: i32) -> i32 { present }
         };
@@ -387,12 +409,17 @@ mod tests {
             level: ParsedLevel::Info,
             fields: vec![syn::parse_quote!(missing)],
         };
-        let err = expand_traced(func, args).expect_err("unknown field name must be rejected");
+        let Err(err) = expand_traced(func, args) else {
+            return Err(TestError::Unexpected(
+                "unknown field name must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("kein Argument"));
+        Ok(())
     }
 
     #[test]
-    fn expand_traced_sync_fn_uses_enter_not_instrument() {
+    fn expand_traced_sync_fn_uses_enter_not_instrument() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             fn compute(x: i32) -> i32 { x * 2 }
         };
@@ -401,15 +428,16 @@ mod tests {
             fields: vec![],
         };
         let tokens = expand_traced(func, args)
-            .expect("sync fn must expand")
+            .map_err(ctx("sync fn must expand"))?
             .to_string();
         assert!(tokens.contains("enter"));
         assert!(!tokens.contains("instrument"));
         assert!(tokens.contains("is_disabled"));
+        Ok(())
     }
 
     #[test]
-    fn expand_traced_async_fn_uses_instrument_not_enter() {
+    fn expand_traced_async_fn_uses_instrument_not_enter() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn compute(x: i32) -> i32 { x * 2 }
         };
@@ -418,15 +446,16 @@ mod tests {
             fields: vec![],
         };
         let tokens = expand_traced(func, args)
-            .expect("async fn must expand")
+            .map_err(ctx("async fn must expand"))?
             .to_string();
         assert!(tokens.contains("instrument"));
         assert!(!tokens.contains("enter"));
         assert!(tokens.contains("async move"));
+        Ok(())
     }
 
     #[test]
-    fn expand_traced_emits_redact_call_for_each_field() {
+    fn expand_traced_emits_redact_call_for_each_field() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             fn admit(child_id: &ChildId, clan: &ClanId) {}
         };
@@ -435,7 +464,7 @@ mod tests {
             fields: vec![syn::parse_quote!(child_id), syn::parse_quote!(clan)],
         };
         let tokens = expand_traced(func, args)
-            .expect("fn with fields must expand")
+            .map_err(ctx("fn with fields must expand"))?
             .to_string();
         assert!(tokens.contains(":: harw_observe :: Redact"));
         assert!(tokens.contains("redact"));
@@ -444,10 +473,11 @@ mod tests {
         assert!(tokens.contains("Level :: DEBUG"));
         assert!(tokens.contains("\"child_id\""));
         assert!(tokens.contains("\"clan\""));
+        Ok(())
     }
 
     #[test]
-    fn expand_traced_without_fields_emits_no_redact_call() {
+    fn expand_traced_without_fields_emits_no_redact_call() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             fn noop() {}
         };
@@ -456,31 +486,17 @@ mod tests {
             fields: vec![],
         };
         let tokens = expand_traced(func, args)
-            .expect("fn without fields must expand")
+            .map_err(ctx("fn without fields must expand"))?
             .to_string();
         assert!(!tokens.contains("Redact"));
         assert!(tokens.contains("Level :: INFO"));
+        Ok(())
     }
 
     #[test]
     fn parsed_level_to_tokens_maps_all_variants() {
-        assert!(
-            ParsedLevel::Trace
-                .to_tokens()
-                .to_string()
-                .contains("TRACE")
-        );
-        assert!(
-            ParsedLevel::Warn
-                .to_tokens()
-                .to_string()
-                .contains("WARN")
-        );
-        assert!(
-            ParsedLevel::Error
-                .to_tokens()
-                .to_string()
-                .contains("ERROR")
-        );
+        assert!(ParsedLevel::Trace.to_tokens().to_string().contains("TRACE"));
+        assert!(ParsedLevel::Warn.to_tokens().to_string().contains("WARN"));
+        assert!(ParsedLevel::Error.to_tokens().to_string().contains("ERROR"));
     }
 }

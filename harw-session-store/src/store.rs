@@ -59,8 +59,8 @@ use harw_types::SessionId;
 use tempfile::NamedTempFile;
 
 use crate::error::{SessionStoreError, SessionStoreResult};
-use crate::reader::TranscriptReader;
 pub use crate::reader::MAX_RECORD_BYTES;
+use crate::reader::TranscriptReader;
 use crate::record::TranscriptRecord;
 
 /// File extension used for every session transcript.
@@ -443,7 +443,8 @@ fn last_line_end(file: &mut File, len: u64) -> SessionStoreResult<u64> {
         buffer.resize(size, 0);
         file.seek(SeekFrom::Start(start))
             .map_err(SessionStoreError::Io)?;
-        file.read_exact(&mut buffer).map_err(SessionStoreError::Io)?;
+        file.read_exact(&mut buffer)
+            .map_err(SessionStoreError::Io)?;
         if let Some(index) = buffer.iter().rposition(|byte| *byte == b'\n') {
             let index = u64::try_from(index).map_err(|_| {
                 SessionStoreError::Io(std::io::Error::other("tail scan index exceeds u64"))
@@ -659,6 +660,7 @@ use crate::durability::sync_parent_directory;
 mod tests {
     use super::*;
     use crate::record::RecordKind;
+    use crate::test_support::{TestError, TestResult};
     use harw_types::ThreadRef;
 
     #[cfg(unix)]
@@ -676,35 +678,30 @@ mod tests {
     }
 
     #[test]
-    fn append_is_durable_and_replayable() {
-        let temp = tempfile::tempdir().unwrap();
+    fn append_is_durable_and_replayable() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = TranscriptStore::new(temp.path());
-        store.append(&record("session-a", 0)).unwrap();
-        store.append(&record("session-a", 1)).unwrap();
+        store.append(&record("session-a", 0))?;
+        store.append(&record("session-a", 1))?;
 
         let replayed = store
-            .reader(&SessionId::from_str("session-a"))
-            .unwrap()
-            .collect::<SessionStoreResult<Vec<_>>>()
-            .unwrap();
+            .reader(&SessionId::from_str("session-a"))?
+            .collect::<SessionStoreResult<Vec<_>>>()?;
         assert_eq!(replayed.len(), 2);
         assert_eq!(replayed[1].sequence, 1);
+        Ok(())
     }
 
     #[test]
-    fn rewrite_replaces_a_session_atomically() {
-        let temp = tempfile::tempdir().unwrap();
+    fn rewrite_replaces_a_session_atomically() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = TranscriptStore::new(temp.path());
-        store.append(&record("session-a", 0)).unwrap();
-        store
-            .rewrite(&SessionId::from_str("session-a"), &[record("session-a", 9)])
-            .unwrap();
+        store.append(&record("session-a", 0))?;
+        store.rewrite(&SessionId::from_str("session-a"), &[record("session-a", 9)])?;
 
         let replayed = store
-            .reader(&SessionId::from_str("session-a"))
-            .unwrap()
-            .collect::<SessionStoreResult<Vec<_>>>()
-            .unwrap();
+            .reader(&SessionId::from_str("session-a"))?
+            .collect::<SessionStoreResult<Vec<_>>>()?;
         assert_eq!(
             replayed
                 .iter()
@@ -712,84 +709,90 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![9]
         );
+        Ok(())
     }
 
     #[test]
-    fn rewrite_rejects_cross_session_records() {
-        let temp = tempfile::tempdir().unwrap();
+    fn rewrite_rejects_cross_session_records() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = TranscriptStore::new(temp.path());
-        let error = store
-            .rewrite(&SessionId::from_str("session-a"), &[record("session-b", 0)])
-            .unwrap_err();
+        let Err(error) =
+            store.rewrite(&SessionId::from_str("session-a"), &[record("session-b", 0)])
+        else {
+            return Err(TestError::Unexpected(
+                "expected a cross-session rewrite to be rejected".to_owned(),
+            ));
+        };
         assert!(matches!(error, SessionStoreError::SessionMismatch { .. }));
+        Ok(())
     }
 
     #[test]
-    fn rewrite_respects_the_same_lock_as_append() {
-        let temp = tempfile::tempdir().unwrap();
+    fn rewrite_respects_the_same_lock_as_append() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = TranscriptStore::new(temp.path());
         let session = SessionId::from_str("session-a");
-        let path = store.transcript_path(&session).unwrap();
-        let lock = lock_transcript(&path, &session).unwrap();
+        let path = store.transcript_path(&session)?;
+        let lock = lock_transcript(&path, &session)?;
 
-        let error = store
-            .rewrite(&session, &[record("session-a", 0)])
-            .unwrap_err();
+        let Err(error) = store.rewrite(&session, &[record("session-a", 0)]) else {
+            return Err(TestError::Unexpected(
+                "expected rewrite to observe the append lock".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
             SessionStoreError::LockContended { session: contended } if contended == session
         ));
-        FileExt::unlock(&lock).unwrap();
+        FileExt::unlock(&lock)?;
+        Ok(())
     }
 
     #[test]
-    fn transcript_path_keeps_safe_ids_under_the_store_root() {
-        let temp = tempfile::tempdir().unwrap();
+    fn transcript_path_keeps_safe_ids_under_the_store_root() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = TranscriptStore::new(temp.path());
 
-        let path = store
-            .transcript_path(&SessionId::from_str("session_123-ABC"))
-            .unwrap();
+        let path = store.transcript_path(&SessionId::from_str("session_123-ABC"))?;
 
         assert_eq!(path, temp.path().join("session_123-ABC.jsonl"));
         assert!(path.starts_with(temp.path()));
+        Ok(())
     }
 
     #[test]
-    fn transcript_path_accepts_exact_legacy_tui_id() {
-        let temp = tempfile::tempdir().unwrap();
+    fn transcript_path_accepts_exact_legacy_tui_id() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = TranscriptStore::new(temp.path());
         let session = "local-tui:0123456789abcdef";
 
-        let path = store
-            .transcript_path(&SessionId::from_str(session))
-            .unwrap();
+        let path = store.transcript_path(&SessionId::from_str(session))?;
 
         assert_eq!(path, temp.path().join(format!("{session}.jsonl")));
         assert!(path.starts_with(temp.path()));
+        Ok(())
     }
 
     #[test]
-    fn legacy_tui_transcript_is_replayable() {
-        let temp = tempfile::tempdir().unwrap();
+    fn legacy_tui_transcript_is_replayable() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = TranscriptStore::new(temp.path());
         let session = "local-tui:0123456789abcdef";
-        store.append(&record(session, 0)).unwrap();
+        store.append(&record(session, 0))?;
 
         let replayed = store
-            .reader(&SessionId::from_str(session))
-            .unwrap()
-            .collect::<SessionStoreResult<Vec<_>>>()
-            .unwrap();
+            .reader(&SessionId::from_str(session))?
+            .collect::<SessionStoreResult<Vec<_>>>()?;
 
         assert_eq!(replayed.len(), 1);
         assert_eq!(replayed[0].session_id.as_str(), session);
+        Ok(())
     }
 
     #[test]
-    fn transcript_path_rejects_unsafe_session_ids() {
-        let temp = tempfile::tempdir().unwrap();
+    fn transcript_path_rejects_unsafe_session_ids() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = TranscriptStore::new(temp.path());
 
         for session in [
@@ -813,11 +816,12 @@ mod tests {
                 Err(SessionStoreError::UnsafeTranscriptPath(value)) if value == session
             ));
         }
+        Ok(())
     }
 
     #[test]
-    fn transcript_operations_fail_closed_for_unsafe_session_ids() {
-        let temp = tempfile::tempdir().unwrap();
+    fn transcript_operations_fail_closed_for_unsafe_session_ids() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = TranscriptStore::new(temp.path());
         let unsafe_session = SessionId::from_str("../escape");
 
@@ -834,54 +838,59 @@ mod tests {
             Err(SessionStoreError::UnsafeTranscriptPath(value)) if value == "../escape"
         ));
         assert!(!temp.path().join("escape.jsonl").exists());
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn transcript_symlink_is_rejected_for_append_rewrite_and_replay() {
-        let temp = tempfile::tempdir().unwrap();
+    fn transcript_symlink_is_rejected_for_append_rewrite_and_replay() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = TranscriptStore::new(temp.path());
         let session = SessionId::from_str("session-a");
-        let transcript_path = store.transcript_path(&session).unwrap();
+        let transcript_path = store.transcript_path(&session)?;
         let target = temp.path().join("outside-transcript.jsonl");
-        std::fs::write(&target, "outside transcript").unwrap();
-        symlink(&target, &transcript_path).unwrap();
+        std::fs::write(&target, "outside transcript")?;
+        symlink(&target, &transcript_path)?;
 
-        assert_symlink_rejected(store.append(&record("session-a", 0)));
-        assert_symlink_rejected(store.rewrite(&session, &[record("session-a", 1)]));
-        assert_symlink_rejected(store.reader(&session));
-        assert_eq!(
-            std::fs::read_to_string(target).unwrap(),
-            "outside transcript"
-        );
+        assert_symlink_rejected(store.append(&record("session-a", 0)))?;
+        assert_symlink_rejected(store.rewrite(&session, &[record("session-a", 1)]))?;
+        assert_symlink_rejected(store.reader(&session))?;
+        assert_eq!(std::fs::read_to_string(target)?, "outside transcript");
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn transcript_lock_symlink_is_rejected_for_append_and_rewrite() {
-        let temp = tempfile::tempdir().unwrap();
+    fn transcript_lock_symlink_is_rejected_for_append_and_rewrite() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = TranscriptStore::new(temp.path());
         let session = SessionId::from_str("session-a");
-        let transcript_path = store.transcript_path(&session).unwrap();
+        let transcript_path = store.transcript_path(&session)?;
         let lock_path = transcript_path.with_extension(format!("{TRANSCRIPT_EXT}.lock"));
         let target = temp.path().join("outside-transcript.lock");
-        std::fs::write(&target, "outside lock").unwrap();
-        symlink(&target, &lock_path).unwrap();
+        std::fs::write(&target, "outside lock")?;
+        symlink(&target, &lock_path)?;
 
-        assert_symlink_rejected(store.append(&record("session-a", 0)));
-        assert_symlink_rejected(store.rewrite(&session, &[record("session-a", 1)]));
-        assert_eq!(std::fs::read_to_string(target).unwrap(), "outside lock");
+        assert_symlink_rejected(store.append(&record("session-a", 0)))?;
+        assert_symlink_rejected(store.rewrite(&session, &[record("session-a", 1)]))?;
+        assert_eq!(std::fs::read_to_string(target)?, "outside lock");
         assert!(!transcript_path.exists());
+        Ok(())
     }
 
     #[cfg(unix)]
-    fn assert_symlink_rejected<T>(result: SessionStoreResult<T>) {
+    fn assert_symlink_rejected<T>(result: SessionStoreResult<T>) -> TestResult {
         match result {
             Err(SessionStoreError::Io(error)) => {
                 assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+                Ok(())
             }
-            Err(error) => panic!("expected a symlink rejection, got {error:?}"),
-            Ok(_) => panic!("expected a symlink rejection"),
+            Err(error) => Err(TestError::Unexpected(format!(
+                "expected a symlink rejection, got {error:?}"
+            ))),
+            Ok(_) => Err(TestError::Unexpected(
+                "expected a symlink rejection".to_owned(),
+            )),
         }
     }
 }

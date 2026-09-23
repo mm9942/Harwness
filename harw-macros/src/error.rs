@@ -151,8 +151,12 @@ fn display_arm(v: &VariantInfo) -> syn::Result<proc_macro2::TokenStream> {
             let names: Vec<Ident> = fields
                 .named
                 .iter()
-                .map(|f| f.ident.clone().unwrap())
-                .collect();
+                .map(|f| {
+                    f.ident.clone().ok_or_else(|| {
+                        syn::Error::new_spanned(f, "HarwError requires every field to be named")
+                    })
+                })
+                .collect::<syn::Result<Vec<Ident>>>()?;
             if let Some(msg) = &v.msg {
                 let fmt = rewrite_format(&msg.value());
                 let fmt = LitStr::new(&fmt, msg.span());

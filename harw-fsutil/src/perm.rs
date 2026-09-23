@@ -58,37 +58,45 @@ pub fn ensure_private_regular(file: &File) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
 
-    fn file_with_mode(dir: &std::path::Path, name: &str, mode: u32) -> File {
+    fn file_with_mode(dir: &std::path::Path, name: &str, mode: u32) -> io::Result<File> {
         let path = dir.join(name);
-        std::fs::write(&path, b"geheim").expect("write");
-        std::fs::set_permissions(&path, Permissions::from_mode(mode)).expect("chmod");
-        File::open(&path).expect("open")
+        std::fs::write(&path, b"geheim")?;
+        std::fs::set_permissions(&path, Permissions::from_mode(mode))?;
+        File::open(&path)
     }
 
     #[test]
-    fn akzeptiert_0600_und_0400() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        ensure_private_regular(&file_with_mode(tmp.path(), "a", 0o600)).expect("0600");
-        ensure_private_regular(&file_with_mode(tmp.path(), "b", 0o400)).expect("0400");
+    fn akzeptiert_0600_und_0400() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        ensure_private_regular(&file_with_mode(tmp.path(), "a", 0o600)?)?;
+        ensure_private_regular(&file_with_mode(tmp.path(), "b", 0o400)?)?;
+        Ok(())
     }
 
     #[test]
-    fn lehnt_0644_und_0640_und_0606_ab() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+    fn lehnt_0644_und_0640_und_0606_ab() -> TestResult {
+        let tmp = tempfile::tempdir()?;
         for (name, mode) in [("a", 0o644), ("b", 0o640), ("c", 0o606)] {
-            let err = ensure_private_regular(&file_with_mode(tmp.path(), name, mode)).unwrap_err();
+            let Err(err) = ensure_private_regular(&file_with_mode(tmp.path(), name, mode)?) else {
+                return Err(TestError::Unexpected(format!("Err erwartet für {mode:o}")));
+            };
             assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{mode:o}");
         }
+        Ok(())
     }
 
     #[test]
-    fn lehnt_verzeichnis_ab() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = File::open(tmp.path()).expect("open dir");
-        let err = ensure_private_regular(&dir).unwrap_err();
+    fn lehnt_verzeichnis_ab() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let dir = File::open(tmp.path())?;
+        let Err(err) = ensure_private_regular(&dir) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        Ok(())
     }
 }

@@ -8,10 +8,13 @@
 //! zwei kleine, hier definierte Mock-Sensoren — kein `harw-dod-*`-Sensor,
 //! keine reale Quelle.
 
+mod common;
+
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use common::{TestError, TestResult, ctx};
 use harw_dod_cap::{Bound, Capability, ReadScope, SensorError, SensorHandle};
 use harw_dod_sentinel::health::{DegradeReason, RetryPolicy, SensorHealth};
 use harw_dod_sentinel::{Sentinel, SentinelConfig};
@@ -58,7 +61,7 @@ impl Sensor for ScriptedSensor {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.script
             .lock()
-            .expect("test mutex not poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pop_front()
             .unwrap_or_else(|| Ok(SensorReading::default()))
     }
@@ -97,7 +100,7 @@ impl TelemetrySink for RecordingSink {
     fn record(&self, key: &MetricKey, value: MetricValue, labels: &[(FieldName, FieldValue)]) {
         self.records
             .lock()
-            .expect("test mutex not poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push((key.name, value, labels.to_vec()));
     }
 
@@ -112,7 +115,7 @@ impl RecordingSink {
     fn count_by_name(&self, name: &str) -> usize {
         self.records
             .lock()
-            .expect("test mutex not poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .filter(|(recorded_name, ..)| *recorded_name == name)
             .count()
@@ -120,7 +123,7 @@ impl RecordingSink {
 }
 
 #[test]
-fn test_full_lifecycle_healthy_transient_and_permanent_sensors() {
+fn test_full_lifecycle_healthy_transient_and_permanent_sensors() -> TestResult {
     let now0 = Timestamp::UNIX_EPOCH;
 
     // Sensor 1: liefert dauerhaft, ein Sample je Abruf.
@@ -143,11 +146,18 @@ fn test_full_lifecycle_healthy_transient_and_permanent_sensors() {
     let flaky = ScriptedSensor::new(
         "flaky-0",
         Capability::ReadSysfsThermal,
-        vec![Err(SensorError::MalformedSource), Ok(SensorReading::default())],
+        vec![
+            Err(SensorError::MalformedSource),
+            Ok(SensorReading::default()),
+        ],
     );
 
     // Sensor 3: sofort dauerhaft aufgegeben.
-    let broken = ScriptedSensor::new("broken-0", Capability::ReadProcMeminfo, vec![Err(SensorError::OutsideScope)]);
+    let broken = ScriptedSensor::new(
+        "broken-0",
+        Capability::ReadProcMeminfo,
+        vec![Err(SensorError::OutsideScope)],
+    );
 
     let sink = Arc::new(RecordingSink::default());
     let config = SentinelConfig::new(RetryPolicy::new(5, SignedDuration::from_secs(0)), 64, 64);
@@ -165,7 +175,10 @@ fn test_full_lifecycle_healthy_transient_and_permanent_sensors() {
     assert_eq!(round1.samples.len(), 1);
     assert_eq!(round1.events.len(), 1);
     let EventKind::SensorDegraded { sensor } = &round1.events[0].kind else {
-        panic!("expected SensorDegraded in round 1");
+        return Err(TestError::Unexpected(format!(
+            "expected SensorDegraded in round 1, got {:?}",
+            round1.events[0].kind
+        )));
     };
     assert_eq!(sensor.as_str(), "broken-0");
 
@@ -174,20 +187,24 @@ fn test_full_lifecycle_healthy_transient_and_permanent_sensors() {
     let round2 = sentinel.poll_all(now0);
     assert_eq!(round2.samples.len(), 1);
     assert!(round2.events.is_empty());
-    assert_eq!(broken.calls(), 1, "a degraded sensor must never be polled again");
+    assert_eq!(
+        broken.calls(),
+        1,
+        "a degraded sensor must never be polled again"
+    );
 
     let snapshot = sentinel.health_snapshot();
-    let health_of = |id: &str| {
+    let health_of = |id: &str| -> TestResult<SensorHealth> {
         snapshot
             .iter()
             .find(|(sensor_id, _)| sensor_id.as_str() == id)
             .map(|(_, health)| health.clone())
-            .expect("sensor present in snapshot")
+            .ok_or(TestError::Missing("sensor present in snapshot"))
     };
-    assert_eq!(health_of("healthy-0"), SensorHealth::Bound);
-    assert_eq!(health_of("flaky-0"), SensorHealth::Bound);
+    assert_eq!(health_of("healthy-0")?, SensorHealth::Bound);
+    assert_eq!(health_of("flaky-0")?, SensorHealth::Bound);
     assert_eq!(
-        health_of("broken-0"),
+        health_of("broken-0")?,
         SensorHealth::Degraded {
             reason: DegradeReason::Permanent
         }
@@ -203,10 +220,10 @@ fn test_full_lifecycle_healthy_transient_and_permanent_sensors() {
     // denselben Beleg.
     let evidence_a = sentinel
         .freeze(now0)
-        .expect("well-formed buffer content always encodes");
+        .map_err(ctx("well-formed buffer content always encodes"))?;
     let evidence_b = sentinel
         .freeze(now0)
-        .expect("well-formed buffer content always encodes");
+        .map_err(ctx("well-formed buffer content always encodes"))?;
     assert_eq!(evidence_a, evidence_b);
     assert_eq!(evidence_a.samples.len(), 2);
     assert_eq!(evidence_a.events.len(), 1);
@@ -218,6 +235,7 @@ fn test_full_lifecycle_healthy_transient_and_permanent_sensors() {
     assert!(sink.count_by_name("harw_sentinel_sensor_errors_total") >= 2);
     assert_eq!(sink.count_by_name("harw_sentinel_sensors_degraded"), 2);
     assert_eq!(sink.count_by_name("harw_sentinel_buffer_utilization"), 4);
+    Ok(())
 }
 
 #[test]
@@ -228,11 +246,21 @@ fn test_ring_buffer_capacity_bounds_survive_a_full_lifecycle() {
         Capability::ReadProcNetDev,
         vec![
             Ok(SensorReading {
-                samples: vec![sample("loud-0", "bytes_sent_total", 1.0, Timestamp::UNIX_EPOCH)],
+                samples: vec![sample(
+                    "loud-0",
+                    "bytes_sent_total",
+                    1.0,
+                    Timestamp::UNIX_EPOCH,
+                )],
                 events: vec![],
             }),
             Ok(SensorReading {
-                samples: vec![sample("loud-0", "bytes_sent_total", 2.0, Timestamp::UNIX_EPOCH)],
+                samples: vec![sample(
+                    "loud-0",
+                    "bytes_sent_total",
+                    2.0,
+                    Timestamp::UNIX_EPOCH,
+                )],
                 events: vec![],
             }),
         ],

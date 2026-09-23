@@ -139,10 +139,12 @@ impl Resolve for ScopedResolver {
         let host = name.as_str().to_ascii_lowercase();
         Box::pin(async move {
             policy.check_host(&host).map_err(boxed)?;
-            let resolved = lookup
-                .lookup(&host)
-                .await
-                .map_err(|source| boxed(EgressError::Lookup { host: host.clone(), source }))?;
+            let resolved = lookup.lookup(&host).await.map_err(|source| {
+                boxed(EgressError::Lookup {
+                    host: host.clone(),
+                    source,
+                })
+            })?;
             let permitted = filter_resolved(&policy, &host, resolved).map_err(boxed)?;
             let addrs: Addrs = Box::new(permitted.into_iter());
             Ok::<Addrs, BoxError>(addrs)
@@ -186,8 +188,15 @@ where
         }
     }
     if permitted.is_empty() {
-        tracing::warn!(host, denied = denied.len(), "egress: keine zulässige Adresse");
-        return Err(EgressError::NoPermittedAddress { host: host.to_owned(), denied });
+        tracing::warn!(
+            host,
+            denied = denied.len(),
+            "egress: keine zulässige Adresse"
+        );
+        return Err(EgressError::NoPermittedAddress {
+            host: host.to_owned(),
+            denied,
+        });
     }
     tracing::debug!(
         host,
@@ -202,6 +211,7 @@ where
 mod tests {
     use super::*;
     use crate::classify::AddrClass;
+    use crate::test_support::{TestError, TestResult, ctx};
     use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::{IpAddr, TcpListener};
@@ -210,18 +220,22 @@ mod tests {
     struct StubLookup(HashMap<String, Vec<SocketAddr>>);
 
     impl StubLookup {
-        fn new(entries: &[(&str, &[&str])]) -> Arc<Self> {
+        fn new(entries: &[(&str, &[&str])]) -> TestResult<Arc<Self>> {
             let map = entries
                 .iter()
                 .map(|(host, addrs)| {
                     let parsed = addrs
                         .iter()
-                        .map(|raw| SocketAddr::new(raw.parse::<IpAddr>().expect("Test-IP"), 0))
-                        .collect();
-                    ((*host).to_owned(), parsed)
+                        .map(|raw| {
+                            raw.parse::<IpAddr>()
+                                .map(|ip| SocketAddr::new(ip, 0))
+                                .map_err(ctx("Test-IP"))
+                        })
+                        .collect::<TestResult<Vec<SocketAddr>>>()?;
+                    Ok(((*host).to_owned(), parsed))
                 })
-                .collect();
-            Arc::new(Self(map))
+                .collect::<TestResult<HashMap<String, Vec<SocketAddr>>>>()?;
+            Ok(Arc::new(Self(map)))
         }
     }
 
@@ -234,13 +248,18 @@ mod tests {
         }
     }
 
-    fn policy(hosts: &[&str], allow_private: bool) -> Arc<EgressPolicy> {
+    fn policy(hosts: &[&str], allow_private: bool) -> TestResult<Arc<EgressPolicy>> {
         let hosts = hosts.iter().map(|h| (*h).to_owned()).collect();
-        Arc::new(EgressPolicy::new(hosts, allow_private).expect("gültige Test-Policy"))
+        Ok(Arc::new(
+            EgressPolicy::new(hosts, allow_private).map_err(ctx("gültige Test-Policy"))?,
+        ))
     }
 
-    fn sock(raw: &str) -> SocketAddr {
-        SocketAddr::new(raw.parse::<IpAddr>().expect("Test-IP"), 0)
+    fn sock(raw: &str) -> TestResult<SocketAddr> {
+        Ok(SocketAddr::new(
+            raw.parse::<IpAddr>().map_err(ctx("Test-IP"))?,
+            0,
+        ))
     }
 
     // Sucht einen `EgressError` in der `source()`-Kette.
@@ -257,31 +276,41 @@ mod tests {
         None
     }
 
-    fn name(host: &str) -> Name {
-        host.parse::<Name>().expect("gültiger Name")
+    fn name(host: &str) -> TestResult<Name> {
+        host.parse::<Name>().map_err(ctx("gültiger Name"))
     }
 
     #[test]
-    fn test_filter_resolved_drops_private_answers() {
-        let p = policy(&["rebind.example"], false);
-        let resolved = [sock("10.0.0.1"), sock("93.184.216.34"), sock("::ffff:127.0.0.1")];
-        let permitted = filter_resolved(&p, "rebind.example", resolved).expect("öffentlich");
-        assert_eq!(permitted, [sock("93.184.216.34")]);
-    }
-
-    #[test]
-    fn test_filter_resolved_all_private_is_error_with_classes() {
-        let p = policy(&["rebind.example"], false);
+    fn test_filter_resolved_drops_private_answers() -> TestResult {
+        let p = policy(&["rebind.example"], false)?;
         let resolved = [
-            sock("127.0.0.1"),
-            sock("169.254.169.254"),
-            sock("64:ff9b::a00:1"),
-            sock("fd00::1"),
+            sock("10.0.0.1")?,
+            sock("93.184.216.34")?,
+            sock("::ffff:127.0.0.1")?,
+        ];
+        let permitted =
+            filter_resolved(&p, "rebind.example", resolved).map_err(ctx("öffentlich"))?;
+        assert_eq!(permitted, [sock("93.184.216.34")?]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_filter_resolved_all_private_is_error_with_classes() -> TestResult {
+        let p = policy(&["rebind.example"], false)?;
+        let resolved = [
+            sock("127.0.0.1")?,
+            sock("169.254.169.254")?,
+            sock("64:ff9b::a00:1")?,
+            sock("fd00::1")?,
         ];
         let result = filter_resolved(&p, "rebind.example", resolved);
         let (host, denied) = match result {
             Err(EgressError::NoPermittedAddress { host, denied }) => (host, denied),
-            other => panic!("erwartet NoPermittedAddress, erhalten {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet NoPermittedAddress, erhalten {other:?}"
+                )));
+            }
         };
         assert_eq!(host, "rebind.example");
         let classes: Vec<AddrClass> = denied.iter().map(|(_, class)| *class).collect();
@@ -292,46 +321,62 @@ mod tests {
             AddrClass::UniqueLocal,
         ];
         assert_eq!(classes, expected);
+        Ok(())
     }
 
     #[test]
-    fn test_filter_resolved_empty_answer_is_error() {
-        let p = policy(&["x.example"], false);
+    fn test_filter_resolved_empty_answer_is_error() -> TestResult {
+        let p = policy(&["x.example"], false)?;
         let result = filter_resolved(&p, "x.example", Vec::new());
         let empty_denied = matches!(
             &result,
             Err(EgressError::NoPermittedAddress { denied, .. }) if denied.is_empty()
         );
         assert!(empty_denied, "{result:?}");
+        Ok(())
     }
 
     #[test]
-    fn test_filter_resolved_allow_private_keeps_lan_but_not_metadata() {
-        let p = policy(&["nas.lan"], true);
-        let resolved = [sock("192.168.1.10"), sock("169.254.169.254")];
-        let permitted = filter_resolved(&p, "nas.lan", resolved).expect("LAN erlaubt");
-        assert_eq!(permitted, [sock("192.168.1.10")]);
+    fn test_filter_resolved_allow_private_keeps_lan_but_not_metadata() -> TestResult {
+        let p = policy(&["nas.lan"], true)?;
+        let resolved = [sock("192.168.1.10")?, sock("169.254.169.254")?];
+        let permitted = filter_resolved(&p, "nas.lan", resolved).map_err(ctx("LAN erlaubt"))?;
+        assert_eq!(permitted, [sock("192.168.1.10")?]);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_scoped_resolver_filters_private_answer() {
-        let lookup = StubLookup::new(&[("api.docs.rs", &["10.0.0.7", "2606:4700::1"])]);
-        let resolver = ScopedResolver { policy: policy(&["docs.rs"], false), lookup };
-        let addrs: Vec<SocketAddr> = match resolver.resolve(name("api.docs.rs")).await {
-            Ok(addrs) => addrs.collect(),
-            Err(err) => panic!("Auflösung muss gelingen: {err}"),
+    async fn test_scoped_resolver_filters_private_answer() -> TestResult {
+        let lookup = StubLookup::new(&[("api.docs.rs", &["10.0.0.7", "2606:4700::1"])])?;
+        let resolver = ScopedResolver {
+            policy: policy(&["docs.rs"], false)?,
+            lookup,
         };
-        assert_eq!(addrs, [sock("2606:4700::1")]);
+        let addrs: Vec<SocketAddr> = match resolver.resolve(name("api.docs.rs")?).await {
+            Ok(addrs) => addrs.collect(),
+            Err(err) => {
+                return Err(TestError::Unexpected(format!(
+                    "Auflösung muss gelingen: {err}"
+                )));
+            }
+        };
+        assert_eq!(addrs, [sock("2606:4700::1")?]);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_scoped_resolver_rejects_host_outside_allowlist_before_lookup() {
+    async fn test_scoped_resolver_rejects_host_outside_allowlist_before_lookup() -> TestResult {
         // Der Stub kennt den Host nicht: ein Lookup ergäbe `Lookup`, nicht
         // `HostNotAllowed`.
-        let lookup = StubLookup::new(&[]);
-        let resolver = ScopedResolver { policy: policy(&["docs.rs"], false), lookup };
-        let Err(err) = resolver.resolve(name("evil.com")).await else {
-            panic!("evil.com darf nicht aufgelöst werden");
+        let lookup = StubLookup::new(&[])?;
+        let resolver = ScopedResolver {
+            policy: policy(&["docs.rs"], false)?,
+            lookup,
+        };
+        let Err(err) = resolver.resolve(name("evil.com")?).await else {
+            return Err(TestError::Unexpected(
+                "evil.com darf nicht aufgelöst werden".into(),
+            ));
         };
         let found = find_egress_error(&*err);
         let rejected = matches!(
@@ -339,34 +384,41 @@ mod tests {
             Some(EgressError::HostNotAllowed { host }) if host == "evil.com"
         );
         assert!(rejected, "{found:?}");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_build_client_request_to_rebound_name_fails_without_connecting() {
-        let lookup = StubLookup::new(&[("rebind.test", &["127.0.0.1"])]);
-        let client = build_client_with_lookup(policy(&["rebind.test"], false), lookup)
-            .expect("Client baubar");
-        let err = client.get("http://rebind.test:9/").send().await.expect_err("muss scheitern");
-        let loopback = ("127.0.0.1".parse::<IpAddr>().expect("IP"), AddrClass::Loopback);
+    async fn test_build_client_request_to_rebound_name_fails_without_connecting() -> TestResult {
+        let lookup = StubLookup::new(&[("rebind.test", &["127.0.0.1"])])?;
+        let client = build_client_with_lookup(policy(&["rebind.test"], false)?, lookup)
+            .map_err(ctx("Client baubar"))?;
+        let Err(err) = client.get("http://rebind.test:9/").send().await else {
+            return Err(TestError::Unexpected("muss scheitern".into()));
+        };
+        let loopback = (
+            "127.0.0.1".parse::<IpAddr>().map_err(ctx("IP"))?,
+            AddrClass::Loopback,
+        );
         let found = find_egress_error(&err);
         let denied_loopback = matches!(
             found,
             Some(EgressError::NoPermittedAddress { denied, .. }) if denied.as_slice() == [loopback]
         );
         assert!(denied_loopback, "{err:?}");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_build_client_connects_only_to_checked_address() {
+    async fn test_build_client_connects_only_to_checked_address() -> TestResult {
         // Loopback-Server (kein externes Netz); `allow_private` erlaubt ihn.
-        let listener = TcpListener::bind("127.0.0.1:0").expect("Loopback-Bind");
-        let port = listener.local_addr().expect("lokale Adresse").port();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("Verbindung");
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("Loopback-Bind"))?;
+        let port = listener.local_addr().map_err(ctx("lokale Adresse"))?.port();
+        let server = std::thread::spawn(move || -> TestResult<String> {
+            let (mut stream, _) = listener.accept().map_err(ctx("Verbindung"))?;
             let mut buf = [0_u8; 1024];
             let mut seen: Vec<u8> = Vec::new();
             while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
-                let n = stream.read(&mut buf).expect("Anfrage lesen");
+                let n = stream.read(&mut buf).map_err(ctx("Anfrage lesen"))?;
                 if n == 0 {
                     break;
                 }
@@ -374,21 +426,27 @@ mod tests {
             }
             let response = b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/\r\n\
                              Content-Length: 0\r\nConnection: close\r\n\r\n";
-            stream.write_all(response).expect("Antwort schreiben");
-            String::from_utf8_lossy(&seen).into_owned()
+            stream
+                .write_all(response)
+                .map_err(ctx("Antwort schreiben"))?;
+            Ok(String::from_utf8_lossy(&seen).into_owned())
         });
 
-        let lookup = StubLookup::new(&[("svc.test", &["127.0.0.1"])]);
-        let client =
-            build_client_with_lookup(policy(&["svc.test"], true), lookup).expect("Client baubar");
+        let lookup = StubLookup::new(&[("svc.test", &["127.0.0.1"])])?;
+        let client = build_client_with_lookup(policy(&["svc.test"], true)?, lookup)
+            .map_err(ctx("Client baubar"))?;
         let response = client
             .get(format!("http://svc.test:{port}/probe"))
             .send()
             .await
-            .expect("Anfrage an geprüfte Adresse");
+            .map_err(ctx("Anfrage an geprüfte Adresse"))?;
         // Redirects werden nicht verfolgt: der 302 kommt beim Aufrufer an.
         assert_eq!(response.status(), reqwest::StatusCode::FOUND);
-        let request = server.join().expect("Server-Thread");
+        let request = server
+            .join()
+            .map_err(|_| TestError::Unexpected("Server-Thread".into()))?
+            .map_err(ctx("Server-Thread"))?;
         assert!(request.starts_with("GET /probe HTTP/1.1\r\n"), "{request}");
+        Ok(())
     }
 }

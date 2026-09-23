@@ -55,7 +55,7 @@
 //! ```
 
 use crate::error::InvalidDigest;
-use serde::{de::Deserializer, ser::Serializer, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Deserializer, ser::Serializer};
 use std::fmt;
 use std::str::FromStr;
 
@@ -298,6 +298,7 @@ impl<'de> Deserialize<'de> for ContentDigest {
 #[cfg(test)]
 mod tests {
     use super::ContentDigest;
+    use crate::test_support::{TestResult, ctx};
     use std::str::FromStr;
 
     #[test]
@@ -315,12 +316,13 @@ mod tests {
     }
 
     #[test]
-    fn test_display_from_str_roundtrip() {
+    fn test_display_from_str_roundtrip() -> TestResult {
         let digest = ContentDigest::of(b"round trip me");
         let text = digest.to_string();
         assert_eq!(text.len(), 64);
-        let parsed = ContentDigest::from_str(&text).expect("valid hex round-trips");
+        let parsed = ContentDigest::from_str(&text).map_err(ctx("valid hex round-trips"))?;
         assert_eq!(parsed, digest);
+        Ok(())
     }
 
     #[test]
@@ -342,25 +344,27 @@ mod tests {
     }
 
     #[test]
-    fn test_from_str_accepts_uppercase_hex() {
+    fn test_from_str_accepts_uppercase_hex() -> TestResult {
         let digest = ContentDigest::of(b"case insensitive");
         let upper = digest.to_string().to_uppercase();
-        let parsed = ContentDigest::from_str(&upper).expect("uppercase hex is valid");
+        let parsed = ContentDigest::from_str(&upper).map_err(ctx("uppercase hex is valid"))?;
         assert_eq!(parsed, digest);
+        Ok(())
     }
 
     #[test]
-    fn test_serde_roundtrip_uses_string_not_array() {
+    fn test_serde_roundtrip_uses_string_not_array() -> TestResult {
         let digest = ContentDigest::of(b"serde payload");
-        let json = serde_json::to_string(&digest).expect("serializes");
+        let json = serde_json::to_string(&digest).map_err(ctx("serializes"))?;
 
         // Explicitly assert the JSON form is a string, not a byte array.
         assert!(json.starts_with('"') && json.ends_with('"'));
         assert!(!json.starts_with('['));
 
         let round_tripped: ContentDigest =
-            serde_json::from_str(&json).expect("deserializes back");
+            serde_json::from_str(&json).map_err(ctx("deserializes back"))?;
         assert_eq!(round_tripped, digest);
+        Ok(())
     }
 
     #[test]

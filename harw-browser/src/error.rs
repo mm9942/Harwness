@@ -168,12 +168,15 @@ impl From<url::ParseError> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
-    fn sample_url_parse_error() -> url::ParseError {
+    fn sample_url_parse_error() -> TestResult<url::ParseError> {
         // "not a url" has no scheme separator, guaranteed to fail parsing.
         match "not a url".parse::<url::Url>() {
-            Ok(_) => unreachable!("test fixture string must fail to parse as a URL"),
-            Err(e) => e,
+            Ok(_) => Err(TestError::Unexpected(
+                "test fixture string must fail to parse as a URL".into(),
+            )),
+            Err(e) => Ok(e),
         }
     }
 
@@ -247,15 +250,16 @@ mod tests {
     }
 
     #[test]
-    fn test_display_url_parse_is_non_empty() {
-        let err = Error::UrlParse(sample_url_parse_error());
+    fn test_display_url_parse_is_non_empty() -> TestResult {
+        let err = Error::UrlParse(sample_url_parse_error()?);
         let message = err.to_string();
         assert!(!message.is_empty());
         assert!(message.contains("failed to parse URL"));
+        Ok(())
     }
 
     #[test]
-    fn test_debug_delegates_to_display() {
+    fn test_debug_delegates_to_display() -> TestResult {
         let errors: Vec<Error> = vec![
             Error::SessionNotFound {
                 session_id: BrowserSessionId::new(),
@@ -263,30 +267,37 @@ mod tests {
             Error::SelectorNotFound {
                 detail: "detail".to_owned(),
             },
-            Error::UrlParse(sample_url_parse_error()),
+            Error::UrlParse(sample_url_parse_error()?),
         ];
         for err in errors {
             assert_eq!(format!("{err:?}"), format!("{err}"));
         }
+        Ok(())
     }
 
     #[test]
-    fn test_from_url_parse_error_round_trips() {
-        let parse_err = sample_url_parse_error();
+    fn test_from_url_parse_error_round_trips() -> TestResult {
+        let parse_err = sample_url_parse_error()?;
         let expected_message = parse_err.to_string();
         let err: Error = parse_err.into();
         match err {
             Error::UrlParse(inner) => assert_eq!(inner.to_string(), expected_message),
-            other => panic!("expected Error::UrlParse, got {other}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Error::UrlParse, got {other}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_source_returns_some_for_url_parse() {
+    fn test_source_returns_some_for_url_parse() -> TestResult {
         use std::error::Error as _;
 
-        let err = Error::UrlParse(sample_url_parse_error());
+        let err = Error::UrlParse(sample_url_parse_error()?);
         assert!(err.source().is_some());
+        Ok(())
     }
 
     #[test]

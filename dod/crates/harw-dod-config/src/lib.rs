@@ -792,6 +792,7 @@ fn read_limited(file: File) -> Result<Vec<u8>, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
@@ -807,7 +808,7 @@ egress_allow_cidrs = []
 "#;
 
     #[test]
-    fn cgroup_ancestry_is_component_aware() {
+    fn cgroup_ancestry_is_component_aware() -> TestResult {
         let config = Config::from_toml(
             r#"
 schema_version = 1
@@ -822,53 +823,71 @@ sensors = ["exec"]
 egress_allow_cidrs = []
 "#,
         )
-        .expect("valid cgroup config");
-        let resolved = config.resolve_active().expect("active profile");
+        .map_err(ctx("valid cgroup config"))?;
+        let resolved = config.resolve_active().map_err(ctx("active profile"))?;
         let ObservationScope::Cgroups(scope) = resolved.scope() else {
-            panic!("expected cgroup scope");
+            return Err(crate::test_support::TestError::Unexpected(
+                "expected cgroup scope".into(),
+            ));
         };
         let root = &scope.paths()[0];
         assert!(root.is_same_or_ancestor_of(&CgroupPath(PathBuf::from("/a/b"))));
         assert!(!root.is_same_or_ancestor_of(&CgroupPath(PathBuf::from("/ab"))));
+        Ok(())
     }
 
     #[test]
-    fn digest_changes_with_the_exact_config_bytes() {
-        let first = Config::from_toml(HOST_PROFILE).expect("valid config");
-        let second = Config::from_toml(&format!("{HOST_PROFILE}\n")).expect("valid config");
+    fn digest_changes_with_the_exact_config_bytes() -> TestResult {
+        let first = Config::from_toml(HOST_PROFILE).map_err(ctx("valid config"))?;
+        let second =
+            Config::from_toml(&format!("{HOST_PROFILE}\n")).map_err(ctx("valid config"))?;
         assert_ne!(
-            first.resolve_active().expect("profile").config_digest(),
-            second.resolve_active().expect("profile").config_digest()
+            first
+                .resolve_active()
+                .map_err(ctx("profile"))?
+                .config_digest(),
+            second
+                .resolve_active()
+                .map_err(ctx("profile"))?
+                .config_digest()
         );
+        Ok(())
     }
 
     #[test]
-    fn final_component_open_rejects_a_symlink() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn final_component_open_rejects_a_symlink() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let target = dir.path().join("target.toml");
         let link = dir.path().join("config.toml");
-        fs::write(&target, HOST_PROFILE).expect("write target");
-        symlink(&target, &link).expect("symlink");
+        fs::write(&target, HOST_PROFILE).map_err(ctx("write target"))?;
+        symlink(&target, &link).map_err(ctx("symlink"))?;
         assert!(open_trusted_regular_file(CWD, &link, PathTrust::Explicit(link.clone())).is_err());
+        Ok(())
     }
 
     #[test]
-    fn explicit_reader_rejects_relative_paths() {
+    fn explicit_reader_rejects_relative_paths() -> TestResult {
         assert!(matches!(
             load_config("config.toml"),
             Err(ConfigError::InvalidExplicitPath { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn trusted_mode_rejects_group_writable_files() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn trusted_mode_rejects_group_writable_files() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let path = dir.path().join("config.toml");
-        fs::write(&path, HOST_PROFILE).expect("write config");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).expect("chmod");
+        fs::write(&path, HOST_PROFILE).map_err(ctx("write config"))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).map_err(ctx("chmod"))?;
         assert!(matches!(
             open_explicit_config(&path),
             Err(ConfigError::UntrustedExplicitPath { .. })
         ));
+        Ok(())
     }
 }
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

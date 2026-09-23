@@ -108,13 +108,11 @@ impl EventJournalPolicy {
     /// # Errors
     /// - `InvalidArgument`: zero or above [`HARD_MAX_JOURNAL_BYTES`].
     pub fn with_max_bytes(self, max_bytes: usize) -> harw_browser::Result<Self> {
-        let Some(max_bytes) = NonZeroUsize::new(max_bytes)
-            .filter(|bytes| bytes.get() <= HARD_MAX_JOURNAL_BYTES)
+        let Some(max_bytes) =
+            NonZeroUsize::new(max_bytes).filter(|bytes| bytes.get() <= HARD_MAX_JOURNAL_BYTES)
         else {
             return Err(BrowserError::InvalidArgument {
-                detail: format!(
-                    "event journal byte budget must be 1..={HARD_MAX_JOURNAL_BYTES}"
-                ),
+                detail: format!("event journal byte budget must be 1..={HARD_MAX_JOURNAL_BYTES}"),
             });
         };
         Ok(Self { max_bytes, ..self })
@@ -337,6 +335,7 @@ fn truncate_utf8(value: &mut String, max: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_browser::ids::{BrowserContextId, BrowserSessionId, EventId};
 
     fn envelope(cursor: u64, class: EventClass, message: String) -> EventEnvelope {
@@ -358,19 +357,26 @@ mod tests {
     }
 
     #[test]
-    fn test_event_journal_policy_bounded_rejects_zero_and_oversize() {
+    fn test_event_journal_policy_bounded_rejects_zero_and_oversize() -> TestResult {
         assert!(EventJournalPolicy::bounded(0).is_err());
         assert!(EventJournalPolicy::bounded(HARD_MAX_JOURNAL_CAPACITY + 1).is_err());
-        let policy = EventJournalPolicy::bounded(8).expect("valid capacity");
+        let policy = EventJournalPolicy::bounded(8).map_err(ctx("valid capacity"))?;
         assert_eq!(policy.max_bytes(), DEFAULT_JOURNAL_MAX_BYTES);
         assert!(policy.with_max_bytes(0).is_err());
         assert!(policy.with_max_bytes(HARD_MAX_JOURNAL_BYTES + 1).is_err());
-        assert_eq!(policy.with_max_bytes(4_096).expect("valid bytes").max_bytes(), 4_096);
+        assert_eq!(
+            policy
+                .with_max_bytes(4_096)
+                .map_err(ctx("valid bytes"))?
+                .max_bytes(),
+            4_096
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_event_journal_push_caps_entries_for_critical_flood() {
-        let policy = EventJournalPolicy::bounded(4).expect("valid capacity");
+    fn test_event_journal_push_caps_entries_for_critical_flood() -> TestResult {
+        let policy = EventJournalPolicy::bounded(4).map_err(ctx("valid capacity"))?;
         let mut journal = EventJournal::new(policy);
         for cursor in 1..=50 {
             journal.push(envelope(cursor, EventClass::Critical, "c".to_owned()));
@@ -379,44 +385,59 @@ mod tests {
         assert_eq!(journal.stats().dropped, 46);
         assert_eq!(journal.last_cursor().map(|c| c.value()), Some(50));
         assert_eq!(journal.since(BrowserEventCursor::zero()).len(), 4);
+        Ok(())
     }
 
     #[test]
-    fn test_event_journal_push_caps_retained_bytes() {
+    fn test_event_journal_push_caps_retained_bytes() -> TestResult {
         let policy = EventJournalPolicy::bounded(1_000)
             .and_then(|policy| policy.with_max_bytes(4 * 1024))
-            .expect("valid policy");
+            .map_err(ctx("valid policy"))?;
         let mut journal = EventJournal::new(policy);
         for cursor in 1..=100 {
-            journal.push(envelope(cursor, EventClass::ConsoleRepetition, "x".repeat(500)));
+            journal.push(envelope(
+                cursor,
+                EventClass::ConsoleRepetition,
+                "x".repeat(500),
+            ));
         }
         assert!(journal.retained_bytes() <= 4 * 1024);
         assert!(journal.len() < 100);
         assert!(journal.stats().deduplicated > 0);
+        Ok(())
     }
 
     #[test]
-    fn test_event_journal_push_truncates_oversized_fields() {
-        let policy = EventJournalPolicy::bounded(4).expect("valid capacity");
+    fn test_event_journal_push_truncates_oversized_fields() -> TestResult {
+        let policy = EventJournalPolicy::bounded(4).map_err(ctx("valid capacity"))?;
         let mut journal = EventJournal::new(policy);
-        journal.push(envelope(1, EventClass::Critical, "é".repeat(MAX_EVENT_FIELD_BYTES)));
+        journal.push(envelope(
+            1,
+            EventClass::Critical,
+            "é".repeat(MAX_EVENT_FIELD_BYTES),
+        ));
         let events = journal.since(BrowserEventCursor::zero());
         match &events[0].event {
             BrowserEvent::ConsoleEntry { message, .. } => {
                 assert!(message.len() <= MAX_EVENT_FIELD_BYTES);
                 assert!(message.chars().all(|c| c == 'é'));
             }
-            other => panic!("unexpected event {other:?}"),
+            other => return Err(TestError::Unexpected(format!("unexpected event {other:?}"))),
         }
         assert!(journal.retained_bytes() <= MAX_EVENT_FIELD_BYTES + 256);
+        Ok(())
     }
 
     #[test]
-    fn test_event_journal_push_critical_evicts_non_critical_first() {
-        let policy = EventJournalPolicy::bounded(2).expect("valid capacity");
+    fn test_event_journal_push_critical_evicts_non_critical_first() -> TestResult {
+        let policy = EventJournalPolicy::bounded(2).map_err(ctx("valid capacity"))?;
         let mut journal = EventJournal::new(policy);
         journal.push(envelope(1, EventClass::Critical, "keep".to_owned()));
-        journal.push(envelope(2, EventClass::RequestLifecycle, "evict".to_owned()));
+        journal.push(envelope(
+            2,
+            EventClass::RequestLifecycle,
+            "evict".to_owned(),
+        ));
         journal.push(envelope(3, EventClass::Critical, "new".to_owned()));
         let cursors: Vec<u64> = journal
             .since(BrowserEventCursor::zero())
@@ -424,5 +445,6 @@ mod tests {
             .map(|event| event.cursor.value())
             .collect();
         assert_eq!(cursors, vec![1, 3]);
+        Ok(())
     }
 }

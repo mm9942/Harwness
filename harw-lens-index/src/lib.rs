@@ -91,3 +91,7 @@ pub use error::{IndexError, IndexResult};
 pub use flat::FlatIndex;
 pub use query::Query;
 pub use vector_index::VectorIndex;
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

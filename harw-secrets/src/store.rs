@@ -1022,33 +1022,34 @@ mod tests {
     use crate::error::AuditError;
     use crate::kek::derive_public_key;
     use crate::policy::KemAlgo;
+    use crate::test_support::{TestError, TestResult};
 
     use super::*;
 
-    fn store_with_key_material() -> SecretStore {
+    fn store_with_key_material() -> TestResult<SecretStore> {
         let policy = CryptoPolicy::strongest();
-        SecretStore::with_key_material(
+        Ok(SecretStore::with_key_material(
             test_root("in-process"),
             policy,
             KekProvenance::EnvSeed {
                 var: "HARW_TEST_SEED".to_owned(),
             },
             KeyVersion::initial(),
-            test_material(policy),
-        )
+            test_material(policy)?,
+        ))
     }
 
-    fn store_with_root(root: PathBuf) -> SecretStore {
+    fn store_with_root(root: PathBuf) -> TestResult<SecretStore> {
         let policy = CryptoPolicy::strongest();
-        SecretStore::with_key_material(
+        Ok(SecretStore::with_key_material(
             root,
             policy,
             KekProvenance::EnvSeed {
                 var: "HARW_TEST_SEED".to_owned(),
             },
             KeyVersion::initial(),
-            test_material(policy),
-        )
+            test_material(policy)?,
+        ))
     }
 
     fn test_root(label: &str) -> PathBuf {
@@ -1061,29 +1062,29 @@ mod tests {
 
     /// Hybrid public key via the production derivation boundary
     /// (`RecipientPrivateKey::from_seed_bytes` + `public_key`).
-    fn hybrid_public_key(policy: CryptoPolicy, seed: [u8; 32]) -> Vec<u8> {
-        derive_public_key(&policy, &SecretBox::new(seed.to_vec().into_boxed_slice()))
-            .expect("deterministic hybrid HPKE public key")
+    fn hybrid_public_key(policy: CryptoPolicy, seed: [u8; 32]) -> TestResult<Vec<u8>> {
+        let public = derive_public_key(&policy, &SecretBox::new(seed.to_vec().into_boxed_slice()))?;
+        Ok(public)
     }
 
-    fn keypair_bytes(policy: CryptoPolicy) -> (Vec<u8>, [u8; 32]) {
+    fn keypair_bytes(policy: CryptoPolicy) -> TestResult<(Vec<u8>, [u8; 32])> {
         let seed = [0xA5; 32];
-        (hybrid_public_key(policy, seed), seed)
+        Ok((hybrid_public_key(policy, seed)?, seed))
     }
 
-    fn test_material(policy: CryptoPolicy) -> KekMaterial {
-        let (public, seed) = keypair_bytes(policy);
-        KekMaterial::new(public, SecretBox::new(seed.to_vec().into_boxed_slice()))
-            .expect("32-byte deterministic HPKE seed")
+    fn test_material(policy: CryptoPolicy) -> TestResult<KekMaterial> {
+        let (public, seed) = keypair_bytes(policy)?;
+        let material = KekMaterial::new(public, SecretBox::new(seed.to_vec().into_boxed_slice()))?;
+        Ok(material)
     }
 
-    fn material_from_hpke_parts(public: Vec<u8>, seed: [u8; 32]) -> KekMaterial {
-        KekMaterial::new(public, SecretBox::new(seed.to_vec().into_boxed_slice()))
-            .expect("32-byte deterministic HPKE seed")
+    fn material_from_hpke_parts(public: Vec<u8>, seed: [u8; 32]) -> TestResult<KekMaterial> {
+        let material = KekMaterial::new(public, SecretBox::new(seed.to_vec().into_boxed_slice()))?;
+        Ok(material)
     }
 
-    fn material_from_seed(policy: CryptoPolicy, seed: [u8; 32]) -> KekMaterial {
-        material_from_hpke_parts(hybrid_public_key(policy, seed), seed)
+    fn material_from_seed(policy: CryptoPolicy, seed: [u8; 32]) -> TestResult<KekMaterial> {
+        material_from_hpke_parts(hybrid_public_key(policy, seed)?, seed)
     }
 
     #[test]
@@ -1097,75 +1098,59 @@ mod tests {
     }
 
     #[test]
-    fn create_get_and_delete_are_sealed_in_process() {
-        let mut store = store_with_key_material();
+    fn create_get_and_delete_are_sealed_in_process() -> TestResult {
+        let mut store = store_with_key_material()?;
         let secret = SecretBox::new(b"token-value".to_vec().into_boxed_slice());
 
-        let id = store
-            .create("provider-token", "provider-auth", &secret)
-            .expect("create sealed record");
+        let id = store.create("provider-token", "provider-auth", &secret)?;
 
         assert_eq!(store.len(), 1);
-        assert_eq!(
-            store
-                .get(&id)
-                .expect("open sealed record")
-                .expose_secret()
-                .as_ref(),
-            b"token-value"
-        );
-        assert_eq!(
-            store.metadata(&id).expect("metadata").name,
-            "provider-token"
-        );
+        assert_eq!(store.get(&id)?.expose_secret().as_ref(), b"token-value");
+        assert_eq!(store.metadata(&id)?.name, "provider-token");
 
-        store.delete(&id).expect("delete record");
+        store.delete(&id)?;
         assert!(matches!(store.get(&id), Err(SecretsError::NotFound { .. })));
+        Ok(())
     }
 
     #[test]
-    fn get_by_reference_resolves_a_canonical_secret_id() {
-        let mut store = store_with_key_material();
+    fn get_by_reference_resolves_a_canonical_secret_id() -> TestResult {
+        let mut store = store_with_key_material()?;
         let secret = SecretBox::new(b"token-value".to_vec().into_boxed_slice());
-        let id = store
-            .create("provider-token", "provider-auth", &secret)
-            .expect("create sealed record");
+        let id = store.create("provider-token", "provider-auth", &secret)?;
 
-        let resolved = store
-            .get_by_reference(&format!("secrets:{id}"))
-            .expect("resolve canonical id reference");
+        let resolved = store.get_by_reference(&format!("secrets:{id}"))?;
 
         assert_eq!(resolved.expose_secret().as_ref(), b"token-value");
+        Ok(())
     }
 
     #[test]
-    fn get_by_reference_resolves_a_unique_exact_metadata_name() {
-        let mut store = store_with_key_material();
+    fn get_by_reference_resolves_a_unique_exact_metadata_name() -> TestResult {
+        let mut store = store_with_key_material()?;
         let secret = SecretBox::new(b"token-value".to_vec().into_boxed_slice());
-        store
-            .create("provider-token", "provider-auth", &secret)
-            .expect("create sealed record");
+        store.create("provider-token", "provider-auth", &secret)?;
 
-        let resolved = store
-            .get_by_reference("secrets:provider-token")
-            .expect("resolve unique metadata name");
+        let resolved = store.get_by_reference("secrets:provider-token")?;
 
         assert_eq!(resolved.expose_secret().as_ref(), b"token-value");
+        Ok(())
     }
 
     #[test]
-    fn get_by_reference_rejects_an_unknown_metadata_name() {
-        let store = store_with_key_material();
+    fn get_by_reference_rejects_an_unknown_metadata_name() -> TestResult {
+        let store = store_with_key_material()?;
 
         assert!(matches!(
             store.get_by_reference("secrets:missing-provider-token"),
             Err(SecretsError::SecretNameNotFound { name }) if name == "missing-provider-token"
         ));
+        Ok(())
     }
 
     #[test]
-    fn get_by_reference_rejects_blank_and_whitespace_targets() {
-        let store = store_with_key_material();
+    fn get_by_reference_rejects_blank_and_whitespace_targets() -> TestResult {
+        let store = store_with_key_material()?;
 
         for reference in ["", "   ", "secrets:", "secrets: \t"] {
             let target = reference.strip_prefix("secrets:").unwrap_or(reference);
@@ -1174,37 +1159,34 @@ mod tests {
                 Err(SecretsError::SecretNameNotFound { name }) if name == target
             ));
         }
+        Ok(())
     }
 
     #[test]
-    fn get_by_reference_rejects_a_blank_prefixed_target_even_when_metadata_matches() {
-        let mut store = store_with_key_material();
+    fn get_by_reference_rejects_a_blank_prefixed_target_even_when_metadata_matches() -> TestResult {
+        let mut store = store_with_key_material()?;
         let secret = SecretBox::new(b"token-value".to_vec().into_boxed_slice());
-        store
-            .create("", "blank-name", &secret)
-            .expect("create blank-name metadata");
+        store.create("", "blank-name", &secret)?;
 
         assert!(matches!(
             store.get_by_reference("secrets:"),
             Err(SecretsError::SecretNameNotFound { name }) if name.is_empty()
         ));
+        Ok(())
     }
 
     #[test]
-    fn get_by_reference_rejects_ambiguous_metadata_names() {
-        let mut store = store_with_key_material();
+    fn get_by_reference_rejects_ambiguous_metadata_names() -> TestResult {
+        let mut store = store_with_key_material()?;
         let secret = SecretBox::new(b"token-value".to_vec().into_boxed_slice());
-        store
-            .create("provider-token", "first-provider-auth", &secret)
-            .expect("create first sealed record");
-        store
-            .create("provider-token", "second-provider-auth", &secret)
-            .expect("create second sealed record");
+        store.create("provider-token", "first-provider-auth", &secret)?;
+        store.create("provider-token", "second-provider-auth", &secret)?;
 
         assert!(matches!(
             store.get_by_reference("secrets:provider-token"),
             Err(SecretsError::AmbiguousSecretName { name, matches: 2 }) if name == "provider-token"
         ));
+        Ok(())
     }
 
     #[test]
@@ -1226,19 +1208,13 @@ mod tests {
     }
 
     #[test]
-    fn list_is_sorted_by_name_then_secret_id_bytes() {
-        let mut store = store_with_key_material();
+    fn list_is_sorted_by_name_then_secret_id_bytes() -> TestResult {
+        let mut store = store_with_key_material()?;
         let secret = SecretBox::new(b"token-value".to_vec().into_boxed_slice());
 
-        let zulu = store
-            .create("zulu", "provider-auth", &secret)
-            .expect("zulu");
-        let alpha_first = store
-            .create("alpha", "provider-auth", &secret)
-            .expect("first alpha");
-        let alpha_second = store
-            .create("alpha", "provider-auth", &secret)
-            .expect("second alpha");
+        let zulu = store.create("zulu", "provider-auth", &secret)?;
+        let alpha_first = store.create("alpha", "provider-auth", &secret)?;
+        let alpha_second = store.create("alpha", "provider-auth", &secret)?;
 
         let mut alpha_ids = [alpha_first, alpha_second];
         alpha_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
@@ -1254,16 +1230,17 @@ mod tests {
         assert_eq!(metadata[0].id, alpha_ids[0]);
         assert_eq!(metadata[1].id, alpha_ids[1]);
         assert_eq!(metadata[2].id, zulu);
+        Ok(())
     }
 
     #[test]
-    fn concurrent_atomic_writes_use_distinct_temporary_files() {
+    fn concurrent_atomic_writes_use_distinct_temporary_files() -> TestResult {
         let root = std::env::temp_dir().join(format!(
             "harw-secrets-atomic-write-{}-{}",
             std::process::id(),
             format_secret_id(&SecretId::new())
         ));
-        fs::create_dir_all(&root).expect("create test directory");
+        fs::create_dir_all(&root)?;
 
         let sequence = Arc::new(AtomicU64::new(0));
         let start = Arc::new(Barrier::new(2));
@@ -1279,30 +1256,35 @@ mod tests {
         }
 
         for write in writes {
-            write.join().expect("write thread").expect("atomic write");
+            match write.join() {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(TestError::Unexpected("write thread panicked".into()));
+                }
+            }
         }
 
-        let persisted = fs::read(root.join("shared.log")).expect("persisted file");
+        let persisted = fs::read(root.join("shared.log"))?;
         assert!(persisted == b"first write" || persisted == b"second write");
-        assert!(fs::read_dir(&root)
-            .expect("test directory entries")
-            .all(|entry| !entry
-                .expect("directory entry")
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".tmp")));
+        let mut saw_tmp_leftover = false;
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().ends_with(".tmp") {
+                saw_tmp_leftover = true;
+            }
+        }
+        assert!(!saw_tmp_leftover);
+        Ok(())
     }
 
     #[test]
-    fn successful_mutations_persist_audit_and_checkpoint_state_atomically() {
+    fn successful_mutations_persist_audit_and_checkpoint_state_atomically() -> TestResult {
         let root = test_root("audit");
-        let mut store = store_with_root(root.clone());
+        let mut store = store_with_root(root.clone())?;
         let secret = SecretBox::new(b"token-value".to_vec().into_boxed_slice());
 
-        let id = store
-            .create("provider-token", "provider-auth", &secret)
-            .expect("create sealed record");
-        store.delete(&id).expect("delete record");
+        let id = store.create("provider-token", "provider-auth", &secret)?;
+        store.delete(&id)?;
 
         assert_eq!(store.audit_log().len(), 2);
         assert_eq!(store.audit_log().events()[0].action, "secret.create");
@@ -1310,19 +1292,16 @@ mod tests {
         assert!(store.audit_log().verify().is_ok());
         assert!(root.join(AUDIT_FILE).is_file());
         assert!(root.join(CHECKPOINT_FILE).is_file());
-        assert!(!std::fs::read(root.join(AUDIT_FILE))
-            .expect("audit file")
-            .is_empty());
-        assert!(!std::fs::read(root.join(CHECKPOINT_FILE))
-            .expect("checkpoint file")
-            .is_empty());
+        assert!(!std::fs::read(root.join(AUDIT_FILE))?.is_empty());
+        assert!(!std::fs::read(root.join(CHECKPOINT_FILE))?.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn sealed_entries_survive_a_store_restart() {
+    fn sealed_entries_survive_a_store_restart() -> TestResult {
         let root = test_root("restart-round-trip");
         let policy = CryptoPolicy::strongest();
-        let (public, seed) = keypair_bytes(policy);
+        let (public, seed) = keypair_bytes(policy)?;
         let mut store = SecretStore::with_key_material(
             root.clone(),
             policy,
@@ -1330,12 +1309,10 @@ mod tests {
                 var: "HARW_TEST_SEED".to_owned(),
             },
             KeyVersion::initial(),
-            material_from_hpke_parts(public.clone(), seed),
+            material_from_hpke_parts(public.clone(), seed)?,
         );
         let value = SecretBox::new(b"restart-token".to_vec().into_boxed_slice());
-        let id = store
-            .create("provider-token", "provider-auth", &value)
-            .expect("create");
+        let id = store.create("provider-token", "provider-auth", &value)?;
 
         let reopened = SecretStore::open_with_key_material(
             root,
@@ -1344,30 +1321,23 @@ mod tests {
                 var: "HARW_TEST_SEED".to_owned(),
             },
             KeyVersion::initial(),
-            material_from_hpke_parts(public, seed),
-        )
-        .expect("reopen sealed store");
+            material_from_hpke_parts(public, seed)?,
+        )?;
 
         assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened.metadata(&id)?.name, "provider-token");
         assert_eq!(
-            reopened.metadata(&id).expect("metadata").name,
-            "provider-token"
-        );
-        assert_eq!(
-            reopened
-                .get(&id)
-                .expect("unseal after restart")
-                .expose_secret()
-                .as_ref(),
+            reopened.get(&id)?.expose_secret().as_ref(),
             b"restart-token"
         );
+        Ok(())
     }
 
     #[test]
-    fn opening_with_a_new_generation_rejects_durable_old_generation_records() {
+    fn opening_with_a_new_generation_rejects_durable_old_generation_records() -> TestResult {
         let root = test_root("rotation-incomplete-open");
         let policy = CryptoPolicy::strongest();
-        let (public, seed) = keypair_bytes(policy);
+        let (public, seed) = keypair_bytes(policy)?;
         let mut store = SecretStore::with_key_material(
             root.clone(),
             policy,
@@ -1375,12 +1345,10 @@ mod tests {
                 var: "HARW_TEST_SEED".to_owned(),
             },
             KeyVersion::initial(),
-            material_from_hpke_parts(public.clone(), seed),
+            material_from_hpke_parts(public.clone(), seed)?,
         );
         let value = SecretBox::new(b"old-generation-token".to_vec().into_boxed_slice());
-        let id = store
-            .create("provider-token", "provider-auth", &value)
-            .expect("create old-generation record");
+        let id = store.create("provider-token", "provider-auth", &value)?;
         let expected = KeyVersion::initial().next();
 
         assert!(matches!(
@@ -1399,6 +1367,7 @@ mod tests {
             }) if found_id == id && found == KeyVersion::initial() && found_expected == expected
         ));
 
+        let next_material = material_from_hpke_parts(public, seed)?;
         assert!(matches!(
             SecretStore::open_with_key_material(
                 root,
@@ -1407,7 +1376,7 @@ mod tests {
                     var: "HARW_TEST_SEED".to_owned(),
                 },
                 expected,
-                material_from_hpke_parts(public, seed),
+                next_material,
             ),
             Err(SecretsError::RotationIncomplete {
                 id: found_id,
@@ -1415,18 +1384,19 @@ mod tests {
                 expected: found_expected,
             }) if found_id == id && found == KeyVersion::initial() && found_expected == expected
         ));
+        Ok(())
     }
 
     #[test]
-    fn rotation_rewraps_only_deks_and_reopens_with_next_material() {
+    fn rotation_rewraps_only_deks_and_reopens_with_next_material() -> TestResult {
         for policy in [
             CryptoPolicy::ml_kem_768_p256(),
             CryptoPolicy::ml_kem_768_x25519(),
             CryptoPolicy::strongest(),
         ] {
             let root = test_root("rotation-rewrap");
-            let old_material = material_from_seed(policy, [0xA5; 32]);
-            let next_material = material_from_seed(policy, [0x5A; 32]);
+            let old_material = material_from_seed(policy, [0xA5; 32])?;
+            let next_material = material_from_seed(policy, [0x5A; 32])?;
             let mut store = SecretStore::with_key_material(
                 root.clone(),
                 policy,
@@ -1437,15 +1407,13 @@ mod tests {
                 old_material,
             );
             let value = SecretBox::new(b"rotation-token".to_vec().into_boxed_slice());
-            let id = store
-                .create("provider-token", "provider-auth", &value)
-                .expect("create record for rotation");
-            let before = store.record(&id).expect("record before rotation");
+            let id = store.create("provider-token", "provider-auth", &value)?;
+            let before = store.record(&id)?;
             assert_eq!(before.kem_algo, policy.kem);
 
-            store.rotate(next_material).expect("rotate V2 record");
+            store.rotate(next_material)?;
 
-            let after = store.record(&id).expect("record after rotation");
+            let after = store.record(&id)?;
             assert_eq!(after.envelope_format, before.envelope_format);
             assert_eq!(after.kem_algo, policy.kem);
             assert_eq!(after.ciphertext, before.ciphertext);
@@ -1453,22 +1421,17 @@ mod tests {
             assert_ne!(after.wrapped_dek, before.wrapped_dek);
             assert_eq!(after.key_version, KeyVersion::initial().next());
             assert_eq!(
-                store
-                    .metadata(&id)
-                    .expect("metadata after rotation")
-                    .key_version,
+                store.metadata(&id)?.key_version,
                 KeyVersion::initial().next()
             );
-            assert_eq!(
-                store
-                    .audit_log()
-                    .events()
-                    .last()
-                    .expect("rotation audit")
-                    .action,
-                "secret.rotate"
-            );
+            let last_event = store
+                .audit_log()
+                .events()
+                .last()
+                .ok_or(TestError::Missing("audit event after rotation"))?;
+            assert_eq!(last_event.action, "secret.rotate");
 
+            let reopen_material = material_from_seed(policy, [0x5A; 32])?;
             let reopened = SecretStore::open_with_key_material(
                 root,
                 policy,
@@ -1476,68 +1439,58 @@ mod tests {
                     var: "HARW_TEST_SEED".to_owned(),
                 },
                 KeyVersion::initial().next(),
-                material_from_seed(policy, [0x5A; 32]),
-            )
-            .expect("reopen rotated store with next material");
+                reopen_material,
+            )?;
             assert_eq!(
-                reopened
-                    .get(&id)
-                    .expect("open with next material")
-                    .expose_secret()
-                    .as_ref(),
+                reopened.get(&id)?.expose_secret().as_ref(),
                 b"rotation-token"
             );
         }
+        Ok(())
     }
 
     /// Durable store at `root` holding one record named `provider-token` whose
     /// KEM wire name was reset to the retired pure `ml_kem_768`, as written
     /// before the hybrid switch. Returns its id, entry path, and raw bytes.
-    fn legacy_kem_store_on_disk(root: &Path) -> (SecretId, PathBuf, Vec<u8>) {
-        let mut store = store_with_root(root.to_owned());
+    fn legacy_kem_store_on_disk(root: &Path) -> TestResult<(SecretId, PathBuf, Vec<u8>)> {
+        let mut store = store_with_root(root.to_owned())?;
         let value = SecretBox::new(b"legacy-kem-token".to_vec().into_boxed_slice());
-        let id = store
-            .create("provider-token", "provider-auth", &value)
-            .expect("create sealed record");
+        let id = store.create("provider-token", "provider-auth", &value)?;
 
         let path = secrets_root(root).join(secret_file_name(&id));
-        let mut durable: serde_json::Value =
-            serde_json::from_slice(&fs::read(&path).expect("read durable entry"))
-                .expect("durable entry is JSON");
+        let mut durable: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
         durable["record"]["kem_algo"] = serde_json::Value::String("ml_kem_768".to_owned());
-        let legacy_bytes = serde_json::to_vec(&durable).expect("encode legacy entry");
-        fs::write(&path, &legacy_bytes).expect("write legacy entry");
-        (id, path, legacy_bytes)
+        let legacy_bytes = serde_json::to_vec(&durable)?;
+        fs::write(&path, &legacy_bytes)?;
+        Ok((id, path, legacy_bytes))
     }
 
-    fn reopen_strongest(root: &Path) -> SecretStore {
+    fn reopen_strongest(root: &Path) -> TestResult<SecretStore> {
         let policy = CryptoPolicy::strongest();
-        SecretStore::open_with_key_material(
+        let material = material_from_seed(policy, [0xA5; 32])?;
+        let store = SecretStore::open_with_key_material(
             root.to_owned(),
             policy,
             KekProvenance::EnvSeed {
                 var: "HARW_TEST_SEED".to_owned(),
             },
             KeyVersion::initial(),
-            material_from_seed(policy, [0xA5; 32]),
-        )
-        .expect("legacy records remain loadable")
+            material,
+        )?;
+        Ok(store)
     }
 
     #[test]
-    fn legacy_pure_ml_kem_records_load_but_can_neither_be_opened_nor_rotated() {
+    fn legacy_pure_ml_kem_records_load_but_can_neither_be_opened_nor_rotated() -> TestResult {
         let root = test_root("legacy-kem");
         let policy = CryptoPolicy::strongest();
-        let (id, path, legacy_bytes) = legacy_kem_store_on_disk(&root);
+        let (id, path, legacy_bytes) = legacy_kem_store_on_disk(&root)?;
 
-        let mut reopened = reopen_strongest(&root);
+        let mut reopened = reopen_strongest(&root)?;
 
         assert_eq!(reopened.len(), 1);
         assert_eq!(reopened.list().len(), 1);
-        assert_eq!(
-            reopened.record(&id).expect("legacy record").kem_algo,
-            KemAlgo::LegacyMlKem768
-        );
+        assert_eq!(reopened.record(&id)?.kem_algo, KemAlgo::LegacyMlKem768);
         assert!(matches!(
             reopened.get(&id),
             Err(SecretsError::UnsupportedLegacyKem { algo }) if algo == "ml_kem_768"
@@ -1555,61 +1508,51 @@ mod tests {
                 var: "HARW_TEST_SEED".to_owned(),
             },
             KeyVersion::initial(),
-        )
-        .expect("legacy records load without key material");
+        )?;
         assert_eq!(without_key_material.list().len(), 1);
-        assert_eq!(
-            without_key_material
-                .metadata(&id)
-                .expect("legacy metadata")
-                .name,
-            "provider-token"
-        );
+        assert_eq!(without_key_material.metadata(&id)?.name, "provider-token");
+        let rotate_material = material_from_seed(policy, [0x5A; 32])?;
         assert!(matches!(
-            reopened.rotate(material_from_seed(policy, [0x5A; 32])),
+            reopened.rotate(rotate_material),
             Err(SecretsError::UnsupportedLegacyKem { algo }) if algo == "ml_kem_768"
         ));
         assert_eq!(reopened.key_version(), KeyVersion::initial());
-        assert_eq!(
-            fs::read(&path).expect("legacy entry after failed rotation"),
-            legacy_bytes
-        );
+        assert_eq!(fs::read(&path)?, legacy_bytes);
+        Ok(())
     }
 
     #[test]
-    fn failed_audit_after_deleting_a_legacy_record_restores_its_raw_bytes() {
+    fn failed_audit_after_deleting_a_legacy_record_restores_its_raw_bytes() -> TestResult {
         let root = test_root("legacy-delete-audit-rollback");
-        let (id, path, legacy_bytes) = legacy_kem_store_on_disk(&root);
-        let mut reopened = reopen_strongest(&root);
+        let (id, path, legacy_bytes) = legacy_kem_store_on_disk(&root)?;
+        let mut reopened = reopen_strongest(&root)?;
         // A re-serialization based rollback cannot restore this record.
         assert!(serde_json::to_vec(&reopened.index[&id]).is_err());
 
         // Same audit-failure injection as
         // `failed_audit_after_delete_restores_the_exact_sealed_entry`.
-        fs::remove_file(root.join(CHECKPOINT_FILE)).expect("remove checkpoint file");
-        fs::create_dir(root.join(CHECKPOINT_FILE)).expect("block checkpoint file");
+        fs::remove_file(root.join(CHECKPOINT_FILE))?;
+        fs::create_dir(root.join(CHECKPOINT_FILE))?;
 
         assert!(matches!(reopened.delete(&id), Err(SecretsError::Io(_))));
 
         assert!(reopened.contains(&id));
         assert_eq!(reopened.audit_log().len(), 0);
         assert_eq!(
-            fs::read(&path).expect("restored legacy entry"),
+            fs::read(&path)?,
             legacy_bytes,
             "rollback must restore the exact raw legacy record bytes"
         );
 
         // Disk and index stay consistent across a restart.
-        fs::remove_dir(root.join(CHECKPOINT_FILE)).expect("unblock checkpoint file");
-        let restarted = reopen_strongest(&root);
-        assert_eq!(
-            restarted.record(&id).expect("legacy record after restart").kem_algo,
-            KemAlgo::LegacyMlKem768
-        );
+        fs::remove_dir(root.join(CHECKPOINT_FILE))?;
+        let restarted = reopen_strongest(&root)?;
+        assert_eq!(restarted.record(&id)?.kem_algo, KemAlgo::LegacyMlKem768);
+        Ok(())
     }
 
     #[test]
-    fn rotation_rewraps_each_record_under_its_own_recorded_kem() {
+    fn rotation_rewraps_each_record_under_its_own_recorded_kem() -> TestResult {
         let root = test_root("rotation-mixed-kem");
         let old_policy = CryptoPolicy::ml_kem_768_x25519();
         let new_policy = CryptoPolicy::strongest();
@@ -1622,15 +1565,13 @@ mod tests {
             old_policy,
             provenance(),
             KeyVersion::initial(),
-            material_from_seed(old_policy, [0xA5; 32]),
+            material_from_seed(old_policy, [0xA5; 32])?,
         );
-        let old_id = old_store
-            .create(
-                "old-token",
-                "provider-auth",
-                &SecretBox::new(b"old-kem-token".to_vec().into_boxed_slice()),
-            )
-            .expect("create record under the previous policy");
+        let old_id = old_store.create(
+            "old-token",
+            "provider-auth",
+            &SecretBox::new(b"old-kem-token".to_vec().into_boxed_slice()),
+        )?;
         drop(old_store);
 
         // Policy change: same root seed, new store KEM.
@@ -1639,54 +1580,36 @@ mod tests {
             new_policy,
             provenance(),
             KeyVersion::initial(),
-            material_from_seed(new_policy, [0xA5; 32]),
-        )
-        .expect("reopen under the new policy");
-        let new_id = store
-            .create(
-                "new-token",
-                "provider-auth",
-                &SecretBox::new(b"new-kem-token".to_vec().into_boxed_slice()),
-            )
-            .expect("create record under the new policy");
+            material_from_seed(new_policy, [0xA5; 32])?,
+        )?;
+        let new_id = store.create(
+            "new-token",
+            "provider-auth",
+            &SecretBox::new(b"new-kem-token".to_vec().into_boxed_slice()),
+        )?;
 
-        store
-            .rotate(material_from_seed(new_policy, [0x5A; 32]))
-            .expect("rotate a store holding records of two KEMs");
+        store.rotate(material_from_seed(new_policy, [0x5A; 32])?)?;
 
-        assert_eq!(
-            store.record(&old_id).expect("old record").kem_algo,
-            old_policy.kem
-        );
-        assert_eq!(
-            store.record(&new_id).expect("new record").kem_algo,
-            new_policy.kem
-        );
+        assert_eq!(store.record(&old_id)?.kem_algo, old_policy.kem);
+        assert_eq!(store.record(&new_id)?.kem_algo, new_policy.kem);
         let reopened = SecretStore::open_with_key_material(
             root,
             new_policy,
             provenance(),
             KeyVersion::initial().next(),
-            material_from_seed(new_policy, [0x5A; 32]),
-        )
-        .expect("reopen rotated mixed store");
+            material_from_seed(new_policy, [0x5A; 32])?,
+        )?;
         for (id, expected) in [
             (old_id, b"old-kem-token".as_slice()),
             (new_id, b"new-kem-token".as_slice()),
         ] {
-            assert_eq!(
-                reopened
-                    .get(&id)
-                    .expect("open rotated record")
-                    .expose_secret()
-                    .as_ref(),
-                expected
-            );
+            assert_eq!(reopened.get(&id)?.expose_secret().as_ref(), expected);
         }
+        Ok(())
     }
 
     #[test]
-    fn legacy_rotation_is_rejected_without_mutating_memory_or_disk() {
+    fn legacy_rotation_is_rejected_without_mutating_memory_or_disk() -> TestResult {
         let root = test_root("legacy-rotation");
         let policy = CryptoPolicy::strongest();
         let mut store = SecretStore::with_key_material(
@@ -1696,39 +1619,37 @@ mod tests {
                 var: "HARW_TEST_SEED".to_owned(),
             },
             KeyVersion::initial(),
-            material_from_seed(policy, [0xA5; 32]),
+            material_from_seed(policy, [0xA5; 32])?,
         );
         let value = SecretBox::new(b"legacy-token".to_vec().into_boxed_slice());
-        let id = store
-            .create("legacy", "test", &value)
-            .expect("create record");
-        let legacy = store.index.get_mut(&id).expect("stored record");
+        let id = store.create("legacy", "test", &value)?;
+        let legacy = store
+            .index
+            .get_mut(&id)
+            .ok_or(TestError::Missing("stored record"))?;
         legacy.record.envelope_format = crate::record::SecretEnvelopeFormat::LegacyDirectHpke;
-        persist_secret(&root, legacy).expect("persist legacy discriminator");
-        let before_record = store.record(&id).expect("legacy record before rotation");
-        let before_bytes = fs::read(secrets_root(&root).join(secret_file_name(&id)))
-            .expect("legacy durable entry before rotation");
+        persist_secret(&root, legacy)?;
+        let before_record = store.record(&id)?;
+        let before_bytes = fs::read(secrets_root(&root).join(secret_file_name(&id)))?;
 
+        let rotate_material = material_from_seed(policy, [0x5A; 32])?;
         assert!(matches!(
-            store.rotate(material_from_seed(policy, [0x5A; 32])),
+            store.rotate(rotate_material),
             Err(SecretsError::PersistenceFormat { .. })
         ));
 
         assert_eq!(store.key_version(), KeyVersion::initial());
+        assert_eq!(store.record(&id)?, before_record);
         assert_eq!(
-            store.record(&id).expect("record after failure"),
-            before_record
-        );
-        assert_eq!(
-            fs::read(secrets_root(&root).join(secret_file_name(&id)))
-                .expect("legacy durable entry after failure"),
+            fs::read(secrets_root(&root).join(secret_file_name(&id)))?,
             before_bytes
         );
         assert_eq!(store.audit_log().len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn open_recovers_a_backup_when_interrupted_promotion_has_no_active_directory() {
+    fn open_recovers_a_backup_when_interrupted_promotion_has_no_active_directory() -> TestResult {
         let root = test_root("rotation-recovery");
         let policy = CryptoPolicy::strongest();
         let mut store = SecretStore::with_key_material(
@@ -1738,14 +1659,11 @@ mod tests {
                 var: "HARW_TEST_SEED".to_owned(),
             },
             KeyVersion::initial(),
-            material_from_seed(policy, [0xA5; 32]),
+            material_from_seed(policy, [0xA5; 32])?,
         );
         let value = SecretBox::new(b"recovery-token".to_vec().into_boxed_slice());
-        let id = store
-            .create("recovery", "test", &value)
-            .expect("create record");
-        fs::rename(secrets_root(&root), backup_secrets_root(&root))
-            .expect("simulate crash after active-to-backup rename");
+        let id = store.create("recovery", "test", &value)?;
+        fs::rename(secrets_root(&root), backup_secrets_root(&root))?;
 
         let reopened = SecretStore::open_with_key_material(
             root.clone(),
@@ -1754,32 +1672,29 @@ mod tests {
                 var: "HARW_TEST_SEED".to_owned(),
             },
             KeyVersion::initial(),
-            material_from_seed(policy, [0xA5; 32]),
-        )
-        .expect("recover backup on open");
+            material_from_seed(policy, [0xA5; 32])?,
+        )?;
 
         assert!(secrets_root(&root).is_dir());
         assert!(!backup_secrets_root(&root).exists());
         assert_eq!(
-            reopened
-                .get(&id)
-                .expect("open recovered secret")
-                .expose_secret()
-                .as_ref(),
+            reopened.get(&id)?.expose_secret().as_ref(),
             b"recovery-token"
         );
+        Ok(())
     }
 
     #[test]
-    fn get_rejects_an_in_memory_record_from_a_different_generation_before_opening() {
-        let mut store = store_with_key_material();
+    fn get_rejects_an_in_memory_record_from_a_different_generation_before_opening() -> TestResult {
+        let mut store = store_with_key_material()?;
         let value = SecretBox::new(b"generation-guard-token".to_vec().into_boxed_slice());
-        let id = store
-            .create("provider-token", "provider-auth", &value)
-            .expect("create sealed record");
+        let id = store.create("provider-token", "provider-auth", &value)?;
         let expected = store.key_version();
         let found = expected.next();
-        let stored = store.index.get_mut(&id).expect("created record in index");
+        let stored = store
+            .index
+            .get_mut(&id)
+            .ok_or(TestError::Missing("created record in index"))?;
         stored.record.key_version = found;
         stored.metadata.key_version = found;
 
@@ -1791,13 +1706,14 @@ mod tests {
                 expected: expected_version,
             }) if found_id == id && found_version == found && expected_version == expected
         ));
+        Ok(())
     }
 
     #[test]
-    fn durable_delete_survives_a_store_restart() {
+    fn durable_delete_survives_a_store_restart() -> TestResult {
         let root = test_root("delete-restart");
         let policy = CryptoPolicy::strongest();
-        let (public, seed) = keypair_bytes(policy);
+        let (public, seed) = keypair_bytes(policy)?;
         let mut store = SecretStore::with_key_material(
             root.clone(),
             policy,
@@ -1805,13 +1721,11 @@ mod tests {
                 var: "HARW_TEST_SEED".to_owned(),
             },
             KeyVersion::initial(),
-            material_from_hpke_parts(public.clone(), seed),
+            material_from_hpke_parts(public.clone(), seed)?,
         );
         let value = SecretBox::new(b"delete-token".to_vec().into_boxed_slice());
-        let id = store
-            .create("delete-me", "provider-auth", &value)
-            .expect("create");
-        store.delete(&id).expect("durable delete");
+        let id = store.create("delete-me", "provider-auth", &value)?;
+        store.delete(&id)?;
 
         let reopened = SecretStore::open_with_key_material(
             root,
@@ -1820,27 +1734,26 @@ mod tests {
                 var: "HARW_TEST_SEED".to_owned(),
             },
             KeyVersion::initial(),
-            material_from_hpke_parts(public, seed),
-        )
-        .expect("reopen after delete");
+            material_from_hpke_parts(public, seed)?,
+        )?;
 
         assert!(reopened.is_empty());
         assert!(matches!(
             reopened.metadata(&id),
             Err(SecretsError::NotFound { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn malformed_durable_entries_are_rejected_on_open() {
+    fn malformed_durable_entries_are_rejected_on_open() -> TestResult {
         let root = test_root("malformed-entry");
         let id = SecretId::new();
         let directory = secrets_root(&root);
-        fs::create_dir_all(&directory).expect("create secrets directory");
-        fs::write(directory.join(secret_file_name(&id)), b"not valid JSON")
-            .expect("write malformed entry");
+        fs::create_dir_all(&directory)?;
+        fs::write(directory.join(secret_file_name(&id)), b"not valid JSON")?;
         let policy = CryptoPolicy::strongest();
-        let (public, seed) = keypair_bytes(policy);
+        let (public, seed) = keypair_bytes(policy)?;
 
         assert!(matches!(
             SecretStore::open_with_key_material(
@@ -1850,17 +1763,18 @@ mod tests {
                     var: "HARW_TEST_SEED".to_owned(),
                 },
                 KeyVersion::initial(),
-                material_from_hpke_parts(public, seed),
+                material_from_hpke_parts(public, seed)?,
             ),
             Err(SecretsError::PersistenceFormat { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn failed_durable_create_does_not_advance_memory_state() {
+    fn failed_durable_create_does_not_advance_memory_state() -> TestResult {
         let root = test_root("create-failure");
-        fs::write(&root, b"not a directory").expect("create blocking file");
-        let mut store = store_with_root(root);
+        fs::write(&root, b"not a directory")?;
+        let mut store = store_with_root(root)?;
         let value = SecretBox::new(b"unpersisted-token".to_vec().into_boxed_slice());
 
         assert!(matches!(
@@ -1869,13 +1783,14 @@ mod tests {
         ));
         assert!(store.is_empty());
         assert_eq!(store.audit_log().len(), 0);
+        Ok(())
     }
 
     #[test]
-    fn failed_audit_after_create_removes_the_newly_persisted_secret() {
+    fn failed_audit_after_create_removes_the_newly_persisted_secret() -> TestResult {
         let root = test_root("create-audit-rollback");
-        fs::create_dir_all(root.join(CHECKPOINT_FILE)).expect("block checkpoint file");
-        let mut store = store_with_root(root.clone());
+        fs::create_dir_all(root.join(CHECKPOINT_FILE))?;
+        let mut store = store_with_root(root.clone())?;
         let value = SecretBox::new(b"rolled-back-token".to_vec().into_boxed_slice());
 
         assert!(matches!(
@@ -1885,46 +1800,41 @@ mod tests {
 
         assert!(store.is_empty());
         assert_eq!(store.audit_log().len(), 0);
-        assert!(fs::read_dir(secrets_root(&root))
-            .expect("secrets directory")
-            .next()
-            .is_none());
+        assert!(fs::read_dir(secrets_root(&root))?.next().is_none());
+        Ok(())
     }
 
     #[test]
-    fn failed_audit_after_delete_restores_the_exact_sealed_entry() {
+    fn failed_audit_after_delete_restores_the_exact_sealed_entry() -> TestResult {
         let root = test_root("delete-audit-rollback");
-        let mut store = store_with_root(root.clone());
+        let mut store = store_with_root(root.clone())?;
         let value = SecretBox::new(b"restored-token".to_vec().into_boxed_slice());
-        let id = store
-            .create("provider-token", "provider-auth", &value)
-            .expect("create sealed record");
+        let id = store.create("provider-token", "provider-auth", &value)?;
         let path = secrets_root(&root).join(secret_file_name(&id));
-        let original_entry = fs::read(&path).expect("original sealed entry");
+        let original_entry = fs::read(&path)?;
 
-        fs::remove_file(root.join(CHECKPOINT_FILE)).expect("remove checkpoint file");
-        fs::create_dir(root.join(CHECKPOINT_FILE)).expect("block checkpoint file");
+        fs::remove_file(root.join(CHECKPOINT_FILE))?;
+        fs::create_dir(root.join(CHECKPOINT_FILE))?;
 
         assert!(matches!(store.delete(&id), Err(SecretsError::Io(_))));
 
         assert!(store.contains(&id));
         assert_eq!(store.audit_log().len(), 1);
         assert_eq!(
-            fs::read(path).expect("restored sealed entry"),
+            fs::read(path)?,
             original_entry,
             "rollback must restore the exact sealed record bytes"
         );
+        Ok(())
     }
 
     #[test]
-    fn verify_persisted_audit_chain_confirms_a_real_disk_round_trip() {
+    fn verify_persisted_audit_chain_confirms_a_real_disk_round_trip() -> TestResult {
         let root = test_root("persisted-chain-intact");
-        let mut store = store_with_root(root);
+        let mut store = store_with_root(root)?;
         let value = SecretBox::new(b"chain-check-token".to_vec().into_boxed_slice());
-        let id = store
-            .create("provider-token", "provider-auth", &value)
-            .expect("create sealed record");
-        store.delete(&id).expect("delete record");
+        let id = store.create("provider-token", "provider-auth", &value)?;
+        store.delete(&id)?;
 
         match store.verify_persisted_audit_chain() {
             Ok(PersistedChainStatus::Intact {
@@ -1934,30 +1844,34 @@ mod tests {
                 assert_eq!(event_count, 2);
                 assert_eq!(chain_head, store.audit_log().chain_head());
             }
-            other => panic!("expected an intact persisted chain, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected an intact persisted chain, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn verify_persisted_audit_chain_reports_absent_for_a_store_with_no_mutations() {
+    fn verify_persisted_audit_chain_reports_absent_for_a_store_with_no_mutations() -> TestResult {
         let root = test_root("persisted-chain-absent");
-        let store = store_with_root(root);
+        let store = store_with_root(root)?;
 
         assert!(matches!(
             store.verify_persisted_audit_chain(),
             Ok(PersistedChainStatus::Absent)
         ));
+        Ok(())
     }
 
     #[test]
-    fn verify_persisted_audit_chain_detects_a_disk_file_tampered_after_the_fact() {
+    fn verify_persisted_audit_chain_detects_a_disk_file_tampered_after_the_fact() -> TestResult {
         let root = test_root("persisted-chain-tampered");
-        let mut store = store_with_root(root.clone());
+        let mut store = store_with_root(root.clone())?;
         let value = SecretBox::new(b"tamper-check-token".to_vec().into_boxed_slice());
-        let id = store
-            .create("provider-token", "provider-auth", &value)
-            .expect("create sealed record");
-        store.delete(&id).expect("delete record");
+        let id = store.create("provider-token", "provider-auth", &value)?;
+        store.delete(&id)?;
 
         // The first event's hash is event index 1's `prev_hash`, present
         // once in its primary encoding and once in its redundant trailer
@@ -1965,7 +1879,7 @@ mod tests {
         // different value breaks only the chain link, not the file's
         // framing, so this must surface as `ChainBroken`, not a load error.
         let event0_hash = sha256(&canonical_bytes(&store.audit_log().events()[0]));
-        let mut bytes = fs::read(root.join(AUDIT_FILE)).expect("read persisted audit log");
+        let mut bytes = fs::read(root.join(AUDIT_FILE))?;
         let replacement = [0xEE_u8; 32];
         let mut replaced = 0;
         let mut i = 0;
@@ -1982,33 +1896,35 @@ mod tests {
             replaced, 2,
             "expected the prev_hash to appear in both the primary and redundant encodings"
         );
-        fs::write(root.join(AUDIT_FILE), &bytes).expect("write tampered audit log");
+        fs::write(root.join(AUDIT_FILE), &bytes)?;
 
-        let error = store
-            .verify_persisted_audit_chain()
-            .expect_err("a tampered disk file must not verify as intact");
+        let Err(error) = store.verify_persisted_audit_chain() else {
+            return Err(TestError::Unexpected(
+                "Err erwartet (tampered disk file must not verify as intact)".into(),
+            ));
+        };
         assert!(matches!(error, AuditError::ChainBroken { index: 1, .. }));
         assert!(!error.to_string().contains("provider-token"));
         assert!(!error.to_string().contains("chain-check-token"));
         assert!(!error.to_string().contains("tamper-check-token"));
+        Ok(())
     }
 
     #[test]
-    fn verify_persisted_audit_chain_rejects_a_truncated_disk_file() {
+    fn verify_persisted_audit_chain_rejects_a_truncated_disk_file() -> TestResult {
         let root = test_root("persisted-chain-truncated");
-        let mut store = store_with_root(root.clone());
+        let mut store = store_with_root(root.clone())?;
         let value = SecretBox::new(b"truncate-check-token".to_vec().into_boxed_slice());
-        store
-            .create("provider-token", "provider-auth", &value)
-            .expect("create sealed record");
+        store.create("provider-token", "provider-auth", &value)?;
 
-        let bytes = fs::read(root.join(AUDIT_FILE)).expect("read persisted audit log");
+        let bytes = fs::read(root.join(AUDIT_FILE))?;
         let truncated = &bytes[..bytes.len() / 2];
-        fs::write(root.join(AUDIT_FILE), truncated).expect("write truncated audit log");
+        fs::write(root.join(AUDIT_FILE), truncated)?;
 
         assert!(matches!(
             store.verify_persisted_audit_chain(),
             Err(AuditError::Io(_))
         ));
+        Ok(())
     }
 }

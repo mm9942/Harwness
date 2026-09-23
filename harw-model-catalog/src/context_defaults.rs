@@ -162,7 +162,9 @@ mod tests {
     #[test]
     fn test_program_defaults_for_known_policies() {
         assert_eq!(
-            program_defaults_for(&ContextPolicy::TightSelect).total.total,
+            program_defaults_for(&ContextPolicy::TightSelect)
+                .total
+                .total,
             32_000
         );
         assert_eq!(
@@ -170,7 +172,9 @@ mod tests {
             128_000
         );
         assert_eq!(
-            program_defaults_for(&ContextPolicy::BroadContext).total.total,
+            program_defaults_for(&ContextPolicy::BroadContext)
+                .total
+                .total,
             512_000
         );
     }

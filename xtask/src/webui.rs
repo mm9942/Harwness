@@ -178,8 +178,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
 /// # Errors
 /// Siehe [`run`].
 fn cmd_types(workspace_root: &Path, check_only: bool) -> Result<(), String> {
-    let graph = WorkspaceGraph::load(workspace_root)
-        .map_err(|error| format!("Workspace-Graph unter '{}' nicht lesbar: {error}", workspace_root.display()))?;
+    let graph = WorkspaceGraph::load(workspace_root).map_err(|error| {
+        format!(
+            "Workspace-Graph unter '{}' nicht lesbar: {error}",
+            workspace_root.display()
+        )
+    })?;
     let routes = discover_routes(&graph)?;
     let rendered = render_typescript(&routes);
     let out_path = workspace_root.join(GENERATED_RELATIVE_PATH);
@@ -229,8 +233,9 @@ fn write_or_check(out_path: &Path, rendered: &str, check_only: bool) -> Result<(
         };
     }
     if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Verzeichnis '{}' nicht anlegbar: {error}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            format!("Verzeichnis '{}' nicht anlegbar: {error}", parent.display())
+        })?;
     }
     fs::write(out_path, rendered)
         .map_err(|error| format!("'{}' nicht schreibbar: {error}", out_path.display()))
@@ -288,11 +293,15 @@ fn discover_routes(graph: &WorkspaceGraph) -> Result<Vec<WebRouteDescriptor>, St
 /// # Errors
 /// Wenn `dir` oder ein Untereintrag nicht lesbar ist.
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries = fs::read_dir(dir)
-        .map_err(|error| format!("'{}' nicht lesbar: {error}", dir.display()))?;
+    let entries =
+        fs::read_dir(dir).map_err(|error| format!("'{}' nicht lesbar: {error}", dir.display()))?;
     for entry in entries {
-        let entry = entry
-            .map_err(|error| format!("Verzeichniseintrag in '{}' nicht lesbar: {error}", dir.display()))?;
+        let entry = entry.map_err(|error| {
+            format!(
+                "Verzeichniseintrag in '{}' nicht lesbar: {error}",
+                dir.display()
+            )
+        })?;
         let path = entry.path();
         if path.is_dir() {
             collect_rs_files(&path, out)?;
@@ -326,7 +335,10 @@ fn extract_routes_from_source(source: &str) -> Vec<WebRouteDescriptor> {
     let mut routes = Vec::new();
 
     for (open, close) in find_struct_blocks(source, "OperationMeta") {
-        if test_ranges.iter().any(|(start, end)| open >= *start && open <= *end) {
+        if test_ranges
+            .iter()
+            .any(|(start, end)| open >= *start && open <= *end)
+        {
             continue;
         }
         let block = &source[open..=close];
@@ -542,10 +554,7 @@ fn strip_comments(source: &str) -> String {
 /// beginnt; `false`, wenn es sich eher um eine Lifetime handelt.
 fn looks_like_char_literal(bytes: &[u8], idx: usize) -> bool {
     match bytes.get(idx + 1) {
-        Some(b'\\') => bytes[idx + 1..]
-            .iter()
-            .take(12)
-            .any(|&b| b == b'\''),
+        Some(b'\\') => bytes[idx + 1..].iter().take(12).any(|&b| b == b'\''),
         Some(_) => bytes.get(idx + 2) == Some(&b'\''),
         None => false,
     }
@@ -907,7 +916,9 @@ fn render_typescript(routes: &[WebRouteDescriptor]) -> String {
     let mut out = String::new();
     out.push_str(HEADER);
     out.push('\n');
-    out.push_str("export type PermissionTier = \"Observer\" | \"Operator\" | \"Maintainer\" | \"Owner\";\n");
+    out.push_str(
+        "export type PermissionTier = \"Observer\" | \"Operator\" | \"Maintainer\" | \"Owner\";\n",
+    );
     out.push_str(
         "export type ApprovalPolicy =\n  | \"None\"\n  | \"Always\"\n  | \"RequireForScope\"\n  \
          | \"RequireForEffect\"\n  | \"RequireForRiskClass\";\n",
@@ -954,6 +965,7 @@ mod tests {
     use super::{
         WebRouteDescriptor, extract_routes_from_source, render_typescript, write_or_check,
     };
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Eine Beispiel-Quelldatei mit genau einer produktiven `Surface::Web`-Route.
     const GOLDEN_SOURCE: &str = r#"
@@ -1110,30 +1122,39 @@ impl Operation for SessionListOp {
     }
 
     #[test]
-    fn test_write_or_check_reports_missing_file() {
+    fn test_write_or_check_reports_missing_file() -> TestResult {
         let path = temp_file("missing.ts");
         let result = write_or_check(&path, "content", true);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("fehlt"));
+        let Err(message) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        assert!(message.contains("fehlt"));
+        Ok(())
     }
 
     #[test]
-    fn test_write_or_check_reports_stale_file() {
+    fn test_write_or_check_reports_stale_file() -> TestResult {
         let path = temp_file("stale.ts");
-        std::fs::write(&path, "alter Inhalt").unwrap();
+        std::fs::write(&path, "alter Inhalt").map_err(ctx("Testdatei schreiben"))?;
         let result = write_or_check(&path, "neuer Inhalt", true);
         std::fs::remove_file(&path).ok();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("veraltet"));
+        let Err(message) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        assert!(message.contains("veraltet"));
+        Ok(())
     }
 
     #[test]
-    fn test_write_or_check_accepts_fresh_file() {
+    fn test_write_or_check_accepts_fresh_file() -> TestResult {
         let path = temp_file("fresh.ts");
-        std::fs::write(&path, "gleicher Inhalt").unwrap();
+        std::fs::write(&path, "gleicher Inhalt").map_err(ctx("Testdatei schreiben"))?;
         let result = write_or_check(&path, "gleicher Inhalt", true);
         std::fs::remove_file(&path).ok();
         assert!(result.is_ok());
+        Ok(())
     }
 
     #[test]

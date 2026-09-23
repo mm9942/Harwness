@@ -150,11 +150,11 @@ pub mod sensor;
 
 pub use error::{ProcmonError, ProcmonResult};
 pub use event::{
-    parse_exec_payload, parse_exec_v1, parse_process_exit_v1, ArgvCapture,
-    ExecutablePathCapture, ExecEvent, ExecEventV1, ProcessExitEventV1,
-    EXEC_PATH_TRUNCATED, EXEC_PATH_UNAVAILABLE,
+    ArgvCapture, EXEC_PATH_TRUNCATED, EXEC_PATH_UNAVAILABLE, ExecEvent, ExecEventV1,
+    ExecutablePathCapture, ProcessExitEventV1, parse_exec_payload, parse_exec_v1,
+    parse_process_exit_v1,
 };
-pub use sensor::{ProcmonSensor, DEFAULT_READ_TIMEOUT};
+pub use sensor::{DEFAULT_READ_TIMEOUT, ProcmonSensor};
 
 /// Der Kernel-Tracepoint, an den das eBPF-Programm dieser Crate angehängt
 /// wird.
@@ -262,13 +262,14 @@ pub fn procmon_program_spec(
 
 #[cfg(test)]
 mod tests {
-    use super::{procmon_contracts, procmon_program_spec, PROCMON_TRACEPOINT_ATTACH_POINT};
+    use super::{PROCMON_TRACEPOINT_ATTACH_POINT, procmon_contracts, procmon_program_spec};
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
-    fn test_procmon_program_spec_uses_a_tracepoint_at_the_documented_attach_point() {
-        let dir = tempfile::tempdir().expect("tempdir for program body");
+    fn test_procmon_program_spec_uses_a_tracepoint_at_the_documented_attach_point() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir for program body"))?;
         let body_path = dir.path().join("procmon.bpf.o");
-        std::fs::write(&body_path, b"bytecode-bytes").expect("write fixture program body");
+        std::fs::write(&body_path, b"bytecode-bytes").map_err(ctx("write fixture program body"))?;
 
         let spec = procmon_program_spec(
             harw_types::SensorId::from_str("procmon-0"),
@@ -278,6 +279,7 @@ mod tests {
         assert_eq!(spec.kind, harw_dod_bpf::BpfProgramKind::Tracepoint);
         assert_eq!(spec.attach_point, PROCMON_TRACEPOINT_ATTACH_POINT);
         assert_eq!(spec.attach_point, "sched:sched_process_exec");
+        Ok(())
     }
 
     #[test]
@@ -299,3 +301,7 @@ mod tests {
         assert_eq!(contracts[1].program_name, "dod_sched_process_exit");
     }
 }
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

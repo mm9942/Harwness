@@ -171,9 +171,7 @@ async fn effort(ctx: &OpContext, args: EffortArgs) -> Result<OpOutput, OpError> 
             controller
                 .set_reasoning_effort(Some(effort))
                 .map_err(|e| OpError::Execution(e.to_string()))?;
-            Ok(OpOutput::from(format!(
-                "Reasoning-Effort gesetzt: {other}"
-            )))
+            Ok(OpOutput::from(format!("Reasoning-Effort gesetzt: {other}")))
         }
     }
 }
@@ -318,7 +316,7 @@ fn handle_uia_effort_clear(persist: impl FnOnce(Option<&str>) -> Option<String>)
     domain = "catalog_config",
     permission = "operator",
     category = "model",
-    command(path = "/uia-effort", visibility = "tui_only"),
+    command(path = "/uia-effort", visibility = "tui_only")
 )]
 async fn uia_effort(ctx: &OpContext, args: EffortArgs) -> Result<OpOutput, OpError> {
     let sub = args.level.as_deref().unwrap_or("show");
@@ -352,30 +350,29 @@ async fn uia_effort(ctx: &OpContext, args: EffortArgs) -> Result<OpOutput, OpErr
 #[cfg(test)]
 mod tests {
     use super::EffortArgs;
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
     use harw_operations::{FromRawArgs, OpInput};
 
     /// Prüft, dass `from_raw_args` das erste Token als `level` übernimmt.
     #[test]
-    fn test_effort_args_from_raw_args_maps_level() {
-        let args = EffortArgs::from_raw_args(&toks(&["high"]));
-        match args {
-            Ok(a) => assert_eq!(a.level.as_deref(), Some("high")),
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
-        }
+    fn test_effort_args_from_raw_args_maps_level() -> TestResult {
+        let args = EffortArgs::from_raw_args(&toks(&["high"]))
+            .map_err(ctx("EffortArgs::from_raw_args"))?;
+        assert_eq!(args.level.as_deref(), Some("high"));
+        Ok(())
     }
 
     /// Prüft, dass leere Token-Liste `level = None` liefert.
     #[test]
-    fn test_effort_args_from_empty_tokens_produces_none() {
-        let args = EffortArgs::from_raw_args(&toks(&[]));
-        match args {
-            Ok(a) => assert!(
-                a.level.is_none(),
-                "Leere Token-Liste muss level=None ergeben"
-            ),
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
-        }
+    fn test_effort_args_from_empty_tokens_produces_none() -> TestResult {
+        let args =
+            EffortArgs::from_raw_args(&toks(&[])).map_err(ctx("EffortArgs::from_raw_args"))?;
+        assert!(
+            args.level.is_none(),
+            "Leere Token-Liste muss level=None ergeben"
+        );
+        Ok(())
     }
 
     /// Prüft, dass `level = None` im Handler als `"show"` interpretiert wird —
@@ -390,11 +387,12 @@ mod tests {
     /// Prüft, dass Serde mit einem JSON-`null`-Wert `level = None` ergibt
     /// (via `#[serde(default)]` auf dem Feld).
     #[test]
-    fn test_effort_args_serde_deserialize_from_json_null_uses_default() {
+    fn test_effort_args_serde_deserialize_from_json_null_uses_default() -> TestResult {
         let json = r#"{"level": null}"#;
-        let args: EffortArgs =
-            serde_json::from_str(json).expect("Deserialisierung aus JSON null muss klappen");
+        let args: EffortArgs = serde_json::from_str(json)
+            .map_err(ctx("Deserialisierung aus JSON null muss klappen"))?;
         assert!(args.level.is_none(), "level=null in JSON muss None ergeben");
+        Ok(())
     }
 
     // ── OpInvocation coverage ─────────────────────────────────────────────────
@@ -416,14 +414,14 @@ mod tests {
     /// `persist` mit `Some(level)` verankert wird — ohne jeglichen
     /// Live-`SessionController`-Aufruf (anders als `/effort`).
     #[test]
-    fn handle_uia_effort_switch_persists_and_confirms() {
+    fn handle_uia_effort_switch_persists_and_confirms() -> TestResult {
         let mut persisted: Option<String> = None;
         let result = handle_uia_effort_switch("high", |level| {
             persisted = level.map(str::to_owned);
             None
         });
 
-        let output = result.expect("ein gültiges Level darf nicht fehlschlagen");
+        let output = result.map_err(ctx("ein gültiges Level darf nicht fehlschlagen"))?;
         assert_eq!(persisted.as_deref(), Some("high"));
         assert!(
             output
@@ -437,22 +435,23 @@ mod tests {
             "Bestätigungstext muss auf die nächste Sitzung verweisen: {}",
             output.text
         );
+        Ok(())
     }
 
     /// Prüft, dass ein Persistenzfehler als angehängte Notiz zurückkommt,
     /// statt den Aufrufer fehlschlagen zu lassen (bestes Bemühen, analog
     /// `persist_uia_worker_model`).
     #[test]
-    fn handle_uia_effort_switch_appends_persist_failure_note() {
+    fn handle_uia_effort_switch_appends_persist_failure_note() -> TestResult {
         let result = handle_uia_effort_switch("medium", |_| {
             Some(
-                "Hinweis: konnte UIA-Reasoning-Effort nicht dauerhaft speichern (boom)."
-                    .to_owned(),
+                "Hinweis: konnte UIA-Reasoning-Effort nicht dauerhaft speichern (boom).".to_owned(),
             )
         });
 
-        let output =
-            result.expect("Persistenzfehler darf den bereits validierten Wechsel nicht scheitern lassen");
+        let output = result.map_err(ctx(
+            "Persistenzfehler darf den bereits validierten Wechsel nicht scheitern lassen",
+        ))?;
         assert!(
             output
                 .text
@@ -460,16 +459,23 @@ mod tests {
             "Fehlernotiz muss im Bestätigungstext auftauchen: {}",
             output.text
         );
+        Ok(())
     }
 
     /// Prüft, dass ein unbekanntes Level abgelehnt wird und die Fehlermeldung
     /// alle sechs Effort-Stufen nennt — `persist` darf dabei nicht aufgerufen
     /// werden.
     #[test]
-    fn uia_effort_rejects_unknown_level() {
+    fn uia_effort_rejects_unknown_level() -> TestResult {
+        let persist_called = std::cell::Cell::new(false);
         let result = handle_uia_effort_switch("extreme", |_| {
-            panic!("persist darf bei ungültigem Level nicht aufgerufen werden")
+            persist_called.set(true);
+            None
         });
+        assert!(
+            !persist_called.get(),
+            "persist darf bei ungültigem Level nicht aufgerufen werden"
+        );
 
         match result {
             Err(OpError::InvalidArguments(msg)) => {
@@ -480,8 +486,11 @@ mod tests {
                         "Fehlertext muss '{level}' auflisten: {msg}"
                     );
                 }
+                Ok(())
             }
-            other => panic!("InvalidArguments erwartet, erhalten: {other:?}"),
+            other => Err(TestError::Unexpected(format!(
+                "InvalidArguments erwartet, erhalten: {other:?}"
+            ))),
         }
     }
 
@@ -517,7 +526,7 @@ mod tests {
     fn make_test_ctx(
         ctrl: Option<harw_operations::SharedSessionController>,
         config: std::sync::Arc<harw_config::ResolvedConfig>,
-    ) -> (harw_operations::OpContext, std::path::PathBuf) {
+    ) -> TestResult<(harw_operations::OpContext, std::path::PathBuf)> {
         use harw_authority::{
             Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
         };
@@ -527,9 +536,12 @@ mod tests {
 
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp = std::env::temp_dir()
-            .join(format!("harw-uia-effort-test-{}-{}", std::process::id(), id));
-        std::fs::create_dir_all(tmp.join("ws")).unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "harw-uia-effort-test-{}-{}",
+            std::process::id(),
+            id
+        ));
+        std::fs::create_dir_all(tmp.join("ws")).map_err(ctx("Test-Workspace anlegen"))?;
         let registry = WorkspaceRegistry::build(
             &tmp,
             [WorkspaceRegistration {
@@ -538,13 +550,13 @@ mod tests {
                 root: std::path::PathBuf::from("ws"),
             }],
         )
-        .expect("WorkspaceRegistry::build");
+        .map_err(ctx("WorkspaceRegistry::build"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .expect("resolve binding");
+            .map_err(ctx("resolve binding"))?;
         let sandbox = SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ReadWorkspace]),
@@ -554,36 +566,36 @@ mod tests {
             services.insert(c);
         }
         services.insert(config);
-        let ctx =
+        let test_ctx =
             harw_operations::OpContext::new(SessionId::new(), TurnId::new(), sandbox, services);
-        (ctx, tmp)
+        Ok((test_ctx, tmp))
     }
 
     /// Prüft, dass `/uia-effort show` den Wert aus `config.harness.reasoning.uia`
     /// meldet und dabei einen abweichenden Live-Controller-Wert **ignoriert**
     /// — im Gegensatz zu `/effort show`, das bewusst den Live-Snapshot liest.
     #[tokio::test]
-    async fn uia_effort_show_reports_config_value_without_a_live_override() {
+    async fn uia_effort_show_reports_config_value_without_a_live_override() -> TestResult {
         use harw_operations::{NullSessionController, SessionController, SharedSessionController};
         use harw_types::ReasoningEffort;
         use std::sync::Arc;
 
         let ctrl = Arc::new(NullSessionController::new());
         ctrl.set_reasoning_effort(Some(ReasoningEffort::Medium))
-            .expect("set_reasoning_effort muss gelingen");
+            .map_err(ctx("set_reasoning_effort muss gelingen"))?;
         let shared: SharedSessionController = ctrl as SharedSessionController;
 
         let mut config = harw_config::ResolvedConfig::default();
         config.harness.reasoning.uia = Some("high".to_owned());
 
-        let (ctx, _tmp) = make_test_ctx(Some(shared), Arc::new(config));
+        let (op_ctx, _tmp) = make_test_ctx(Some(shared), Arc::new(config))?;
 
         let args = EffortArgs {
             level: Some("show".to_owned()),
         };
-        let result = super::uia_effort(&ctx, args)
+        let result = super::uia_effort(&op_ctx, args)
             .await
-            .expect("show darf nicht fehlschlagen");
+            .map_err(ctx("show darf nicht fehlschlagen"))?;
 
         assert!(
             result.text.contains("high"),
@@ -595,27 +607,29 @@ mod tests {
             "show-Ausgabe darf den Live-Controller-Wert nicht durchsickern lassen: {}",
             result.text
         );
+        Ok(())
     }
 
     /// Prüft, dass `/uia-effort show` ohne gesetzten Config-Wert den
     /// Rollen-Default-Hinweis meldet, statt (fälschlich) einen Live-Snapshot
     /// zu lesen.
     #[tokio::test]
-    async fn uia_effort_show_reports_role_default_hint_when_unset() {
+    async fn uia_effort_show_reports_role_default_hint_when_unset() -> TestResult {
         let config = harw_config::ResolvedConfig::default();
-        let (ctx, _tmp) = make_test_ctx(None, std::sync::Arc::new(config));
+        let (op_ctx, _tmp) = make_test_ctx(None, std::sync::Arc::new(config))?;
 
         let args = EffortArgs {
             level: Some("show".to_owned()),
         };
-        let result = super::uia_effort(&ctx, args)
+        let result = super::uia_effort(&op_ctx, args)
             .await
-            .expect("show darf nicht fehlschlagen");
+            .map_err(ctx("show darf nicht fehlschlagen"))?;
 
         assert!(
             result.text.contains("nicht gesetzt"),
             "show-Ausgabe muss den 'nicht gesetzt'-Hinweis melden: {}",
             result.text
         );
+        Ok(())
     }
 }

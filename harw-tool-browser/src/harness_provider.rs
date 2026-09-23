@@ -37,9 +37,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use harw_authority::Permission;
 use harw_browser::policy::OriginRule;
 use harw_extension_api::contributors::ToolProvider;
-use harw_authority::Permission;
 use harw_tools::{
     AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType, ToolCall,
     ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput, ToolSpec,
@@ -224,7 +224,10 @@ fn selector_schema() -> JsonSchema {
             ("Name", string("")),
             (
                 "TagClass",
-                object("", vec![("tag", string(""), true), ("class", string(""), true)]),
+                object(
+                    "",
+                    vec![("tag", string(""), true), ("class", string(""), true)],
+                ),
             ),
             ("LinkText", string("")),
             ("XPath", string("")),
@@ -233,7 +236,10 @@ fn selector_schema() -> JsonSchema {
                 "Role",
                 object(
                     "",
-                    vec![("role", string(""), true), ("name", nullable(string("")), false)],
+                    vec![
+                        ("role", string(""), true),
+                        ("name", nullable(string("")), false),
+                    ],
                 ),
             ),
         ],
@@ -259,12 +265,24 @@ fn action_schema() -> JsonSchema {
             ("Click", target()),
             (
                 "Type",
-                object("", vec![("target", target_schema(), true), ("text", string(""), true)]),
+                object(
+                    "",
+                    vec![
+                        ("target", target_schema(), true),
+                        ("text", string(""), true),
+                    ],
+                ),
             ),
             ("Clear", target()),
             (
                 "Select",
-                object("", vec![("target", target_schema(), true), ("value", string(""), true)]),
+                object(
+                    "",
+                    vec![
+                        ("target", target_schema(), true),
+                        ("value", string(""), true),
+                    ],
+                ),
             ),
             ("Focus", target()),
             ("Hover", target()),
@@ -283,7 +301,10 @@ fn action_schema() -> JsonSchema {
                 "KeyPress",
                 object(
                     "",
-                    vec![("target", nullable(target_schema()), false), ("key", string(""), true)],
+                    vec![
+                        ("target", nullable(target_schema()), false),
+                        ("key", string(""), true),
+                    ],
                 ),
             ),
             (
@@ -299,7 +320,14 @@ fn action_schema() -> JsonSchema {
             ("Submit", target()),
             (
                 "Navigate",
-                object("", vec![("url", string("http(s) URL inside the granted origins."), true)]),
+                object(
+                    "",
+                    vec![(
+                        "url",
+                        string("http(s) URL inside the granted origins."),
+                        true,
+                    )],
+                ),
             ),
         ],
     )
@@ -364,11 +392,18 @@ pub(crate) fn browser_tool_parameters(tool_name: &str) -> JsonSchema {
         "browser.open" => object(
             "Open a browser session. Origins, profile and limits are fixed by the operator.",
             vec![
-                ("start_url", string("http(s) start URL inside the granted origins."), true),
+                (
+                    "start_url",
+                    string("http(s) start URL inside the granted origins."),
+                    true,
+                ),
                 ("headless", leaf(JsonSchemaType::Boolean, ""), true),
                 (
                     "bidi",
-                    string_enum("WebDriver BiDi requirement.", &["Required", "Preferred", "NotRequired"]),
+                    string_enum(
+                        "WebDriver BiDi requirement.",
+                        &["Required", "Preferred", "NotRequired"],
+                    ),
                     true,
                 ),
                 (
@@ -426,14 +461,22 @@ pub(crate) fn browser_tool_parameters(tool_name: &str) -> JsonSchema {
                 ("session_id", session(), true),
                 ("context_id", context(), true),
                 ("condition", wait_condition_schema(), true),
-                ("timeout", integer("Timeout in milliseconds (at least 1)."), true),
+                (
+                    "timeout",
+                    integer("Timeout in milliseconds (at least 1)."),
+                    true,
+                ),
             ],
         ),
         "browser.events" => object(
             "",
             vec![
                 ("session_id", session(), true),
-                ("since", integer("Event cursor; 0 reads from the start."), true),
+                (
+                    "since",
+                    integer("Event cursor; 0 reads from the start."),
+                    true,
+                ),
             ],
         ),
         "browser.close" => object("", vec![("session_id", session(), true)]),
@@ -476,16 +519,21 @@ impl ToolExecutor for BrowserToolExecutor {
             })?;
 
             for host in scope_hosts(prepared.request()) {
-                if let Some(denied) = harw_tools::require_host_access(context, &host, &self.tool_name)
+                if let Some(denied) =
+                    harw_tools::require_host_access(context, &host, &self.tool_name)
                 {
                     return Ok(denied);
                 }
             }
 
             let owner = context.session_id().as_str();
-            let response = self.tool_set.dispatch(owner, prepared).await.map_err(|error| {
-                ToolsError::ExecutionFailed(format!("{}: {error}", self.tool_name))
-            })?;
+            let response = self
+                .tool_set
+                .dispatch(owner, prepared)
+                .await
+                .map_err(|error| {
+                    ToolsError::ExecutionFailed(format!("{}: {error}", self.tool_name))
+                })?;
 
             serde_json::to_value(response)
                 .map(ToolOutput::json)
@@ -598,7 +646,10 @@ mod tests {
         action::{ActionRequest, BrowserAction},
         ids::{BrowserContextId, BrowserEventCursor, BrowserObservationRevision, BrowserSessionId},
         observation::ObservationMode,
-        policy::{BiDiRequirement, BrowserLimits, OpenBrowserRequest, OriginPolicy, OriginRule, ProfilePolicy},
+        policy::{
+            BiDiRequirement, BrowserLimits, OpenBrowserRequest, OriginPolicy, OriginRule,
+            ProfilePolicy,
+        },
         selector::{Selector, Target},
         wait::{WaitCondition, WaitTimeout},
     };
@@ -608,30 +659,33 @@ mod tests {
         OpenRequest, PreparedBrowserRequest, WaitRequest, browser_tool_parameters, parse_request,
         rule_scope_host, scope_hosts,
     };
+    use crate::test_support::{TestError, TestResult, ctx};
 
     // Test fixtures use literal ids/URLs; a parse failure is a test bug.
-    fn session_id() -> BrowserSessionId {
-        BrowserSessionId::from_str("00000000-0000-4000-8000-000000000001").expect("fixed UUID")
+    fn session_id() -> TestResult<BrowserSessionId> {
+        BrowserSessionId::from_str("00000000-0000-4000-8000-000000000001")
+            .map_err(ctx("fixed UUID"))
     }
 
-    fn context_id() -> BrowserContextId {
-        BrowserContextId::from_str("00000000-0000-4000-8000-000000000002").expect("fixed UUID")
+    fn context_id() -> TestResult<BrowserContextId> {
+        BrowserContextId::from_str("00000000-0000-4000-8000-000000000002")
+            .map_err(ctx("fixed UUID"))
     }
 
-    fn url(text: &str) -> url::Url {
-        url::Url::parse(text).expect("fixed URL")
+    fn url(text: &str) -> TestResult<url::Url> {
+        url::Url::parse(text).map_err(ctx("fixed URL"))
     }
 
-    fn open_request() -> OpenRequest {
-        OpenRequest {
-            start_url: url("https://example.com/start"),
+    fn open_request() -> TestResult<OpenRequest> {
+        Ok(OpenRequest {
+            start_url: url("https://example.com/start")?,
             headless: true,
             bidi: BiDiRequirement::Preferred,
             viewport: None,
-        }
+        })
     }
 
-    fn request_arguments(request: &BrowserToolRequest) -> serde_json::Value {
+    fn request_arguments(request: &BrowserToolRequest) -> TestResult<serde_json::Value> {
         let payload = match request {
             BrowserToolRequest::Open(request) => serde_json::to_value(request),
             BrowserToolRequest::Observe(request) => serde_json::to_value(request),
@@ -641,27 +695,27 @@ mod tests {
             BrowserToolRequest::Events(request) => serde_json::to_value(request),
             BrowserToolRequest::Close(request) => serde_json::to_value(request),
         };
-        payload.expect("all public browser operation payloads serialize")
+        payload.map_err(ctx("all public browser operation payloads serialize"))
     }
 
     #[test]
-    fn test_parse_request_accepts_each_browser_operation_shape() {
+    fn test_parse_request_accepts_each_browser_operation_shape() -> TestResult {
         let target = Target::new(Selector::Css("main".to_owned()));
         let requests = [
-            ("browser.open", BrowserToolRequest::Open(open_request())),
+            ("browser.open", BrowserToolRequest::Open(open_request()?)),
             (
                 "browser.observe",
                 BrowserToolRequest::Observe(ObserveRequest {
-                    session_id: session_id(),
-                    context_id: context_id(),
+                    session_id: session_id()?,
+                    context_id: context_id()?,
                     mode: ObservationMode::PageSummary,
                 }),
             ),
             (
                 "browser.find",
                 BrowserToolRequest::Find(FindRequest {
-                    session_id: session_id(),
-                    context_id: context_id(),
+                    session_id: session_id()?,
+                    context_id: context_id()?,
                     target: target.clone(),
                     revision: BrowserObservationRevision::initial(),
                 }),
@@ -669,15 +723,15 @@ mod tests {
             (
                 "browser.act",
                 BrowserToolRequest::Act(ActRequest {
-                    session_id: session_id(),
-                    request: ActionRequest::new(context_id(), BrowserAction::Click { target }),
+                    session_id: session_id()?,
+                    request: ActionRequest::new(context_id()?, BrowserAction::Click { target }),
                 }),
             ),
             (
                 "browser.wait",
                 BrowserToolRequest::Wait(WaitRequest {
-                    session_id: session_id(),
-                    context_id: context_id(),
+                    session_id: session_id()?,
+                    context_id: context_id()?,
                     condition: WaitCondition::NavigationComplete,
                     timeout: WaitTimeout::from_millis(1),
                 }),
@@ -685,45 +739,69 @@ mod tests {
             (
                 "browser.events",
                 BrowserToolRequest::Events(EventsRequest {
-                    session_id: session_id(),
+                    session_id: session_id()?,
                     since: BrowserEventCursor::zero(),
                 }),
             ),
-            ("browser.close", BrowserToolRequest::Close(CloseRequest { session_id: session_id() })),
+            (
+                "browser.close",
+                BrowserToolRequest::Close(CloseRequest {
+                    session_id: session_id()?,
+                }),
+            ),
         ];
 
         for (name, expected) in requests {
-            let parsed = parse_request(name, request_arguments(&expected))
-                .expect("serialized request shape is accepted by its browser operation");
+            let parsed = parse_request(name, request_arguments(&expected)?).map_err(ctx(
+                "serialized request shape is accepted by its browser operation",
+            ))?;
             assert_eq!(parsed, expected, "{name} must preserve its request");
         }
+        Ok(())
     }
 
     #[test]
-    fn test_parse_request_rejects_model_supplied_open_authority() {
+    fn test_parse_request_rejects_model_supplied_open_authority() -> TestResult {
         for (field, value) in [
-            ("allowed_origins", serde_json::json!(["https://evil.example"])),
-            ("authentication_origins", serde_json::json!(["https://evil.example"])),
-            ("profile", serde_json::json!({"Persistent": {"binding": "admin"}})),
-            ("limits", serde_json::json!({"max_actions_per_session": 5000})),
+            (
+                "allowed_origins",
+                serde_json::json!(["https://evil.example"]),
+            ),
+            (
+                "authentication_origins",
+                serde_json::json!(["https://evil.example"]),
+            ),
+            (
+                "profile",
+                serde_json::json!({"Persistent": {"binding": "admin"}}),
+            ),
+            (
+                "limits",
+                serde_json::json!({"max_actions_per_session": 5000}),
+            ),
         ] {
-            let mut arguments = serde_json::to_value(open_request()).expect("serializes");
+            let mut arguments = serde_json::to_value(open_request()?).map_err(ctx("serializes"))?;
             arguments[field] = value;
-            let error = parse_request("browser.open", arguments)
-                .expect_err("authority fields must not be accepted from the model");
+            let result = parse_request("browser.open", arguments);
+            let Err(error) = result else {
+                return Err(TestError::Unexpected(
+                    "authority fields must not be accepted from the model".to_owned(),
+                ));
+            };
             assert!(
                 matches!(&error, harw_tools::ToolsError::InvalidArguments { reason, .. } if reason.contains(field)),
                 "{field}: {error:?}"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_parse_request_rejects_upload_and_script() {
+    fn test_parse_request_rejects_upload_and_script() -> TestResult {
         let upload = serde_json::json!({
-            "session_id": session_id(),
+            "session_id": session_id()?,
             "request": {
-                "context_id": context_id(),
+                "context_id": context_id()?,
                 "expected_revision": 1,
                 "action": {"Upload": {"target": {"primary": {"Css": "input"}, "fallbacks": []}, "file_path": "/etc/passwd"}}
             }
@@ -731,59 +809,73 @@ mod tests {
         assert!(parse_request("browser.act", upload).is_err());
 
         let script = serde_json::json!({
-            "session_id": session_id(),
-            "context_id": context_id(),
+            "session_id": session_id()?,
+            "context_id": context_id()?,
             "condition": {"CustomScript": {"predicate": "return true"}},
             "timeout": 1000
         });
         assert!(parse_request("browser.wait", script).is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_parse_request_rejects_unknown_browser_operation() {
-        let error = parse_request("browser.unknown", serde_json::json!({}))
-            .expect_err("unknown browser operation must be rejected");
+    fn test_parse_request_rejects_unknown_browser_operation() -> TestResult {
+        let result = parse_request("browser.unknown", serde_json::json!({}));
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "unknown browser operation must be rejected".to_owned(),
+            ));
+        };
         assert!(matches!(
             error,
             harw_tools::ToolsError::InvalidArguments { name, .. } if name == "browser.unknown"
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_browser_tool_parameters_open_is_flat_and_closed() {
-        let schema = serde_json::to_value(browser_tool_parameters("browser.open")).expect("serializes");
+    fn test_browser_tool_parameters_open_is_flat_and_closed() -> TestResult {
+        let schema = serde_json::to_value(browser_tool_parameters("browser.open"))
+            .map_err(ctx("serializes"))?;
         assert_eq!(schema["additionalProperties"], serde_json::json!(false));
         assert_eq!(
             schema["required"],
             serde_json::json!(["start_url", "headless", "bidi"])
         );
-        let properties = schema["properties"].as_object().expect("object properties");
+        let properties = schema["properties"]
+            .as_object()
+            .ok_or(TestError::Missing("object properties"))?;
         let mut keys: Vec<&str> = properties.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, ["bidi", "headless", "start_url", "viewport"]);
+        Ok(())
     }
 
     #[test]
-    fn test_rule_scope_host_strips_scheme_port_and_probes_wildcards() {
-        let exact = OriginRule::parse("https://erp.example.com:8443").expect("valid rule");
+    fn test_rule_scope_host_strips_scheme_port_and_probes_wildcards() -> TestResult {
+        let exact = OriginRule::parse("https://erp.example.com:8443").map_err(ctx("valid rule"))?;
         assert_eq!(rule_scope_host(&exact), "erp.example.com");
-        let wildcard = OriginRule::parse("https://*.example.com").expect("valid rule");
-        assert_eq!(rule_scope_host(&wildcard), "harw-wildcard-scope-probe.example.com");
-        let ipv6 = OriginRule::parse("https://[2001:db8::1]:444").expect("valid rule");
+        let wildcard = OriginRule::parse("https://*.example.com").map_err(ctx("valid rule"))?;
+        assert_eq!(
+            rule_scope_host(&wildcard),
+            "harw-wildcard-scope-probe.example.com"
+        );
+        let ipv6 = OriginRule::parse("https://[2001:db8::1]:444").map_err(ctx("valid rule"))?;
         assert_eq!(rule_scope_host(&ipv6), "2001:db8::1");
+        Ok(())
     }
 
     #[test]
-    fn test_scope_hosts_open_covers_start_and_both_policies() {
+    fn test_scope_hosts_open_covers_start_and_both_policies() -> TestResult {
         let open = OpenBrowserRequest {
-            start_url: url("https://erp.example.com/inbox"),
+            start_url: url("https://erp.example.com/inbox")?,
             headless: true,
             profile: ProfilePolicy::Ephemeral,
             bidi: BiDiRequirement::Preferred,
             allowed_origins: OriginPolicy::from_origins(["https://erp.example.com"], true)
-                .expect("valid policy"),
+                .map_err(ctx("valid policy"))?,
             authentication_origins: OriginPolicy::from_origins(["https://sso.example.org"], true)
-                .expect("valid policy"),
+                .map_err(ctx("valid policy"))?,
             viewport: None,
             limits: BrowserLimits::default(),
         };
@@ -793,12 +885,18 @@ mod tests {
         );
 
         let act = ActRequest {
-            session_id: session_id(),
+            session_id: session_id()?,
             request: ActionRequest::new(
-                context_id(),
-                BrowserAction::Navigate { url: url("https://other.example.net/x") },
+                context_id()?,
+                BrowserAction::Navigate {
+                    url: url("https://other.example.net/x")?,
+                },
             ),
         };
-        assert_eq!(scope_hosts(&PreparedBrowserRequest::Act(act)), ["other.example.net"]);
+        assert_eq!(
+            scope_hosts(&PreparedBrowserRequest::Act(act)),
+            ["other.example.net"]
+        );
+        Ok(())
     }
 }

@@ -121,26 +121,28 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn test_dod_section_defaults_from_empty_toml() {
-        let section: DodSection = toml::from_str("").unwrap();
+    fn test_dod_section_defaults_from_empty_toml() -> TestResult {
+        let section: DodSection = toml::from_str("").map_err(ctx("parse toml"))?;
         assert!(section.kill_requires_human);
         assert!(section.auto_freeze);
         assert_eq!(section.proof_key_dir, None);
         assert!(section.allowed_cgroup_prefixes.is_empty());
         assert_eq!(section, DodSection::default());
+        Ok(())
     }
 
     #[test]
-    fn test_dod_section_full_toml_round_trip() {
+    fn test_dod_section_full_toml_round_trip() -> TestResult {
         let src = r#"
             kill_requires_human = true
             auto_freeze = false
             proof_key_dir = "/var/lib/harw/dod/keys"
             allowed_cgroup_prefixes = ["/sys/fs/cgroup/harw.slice/"]
         "#;
-        let section: DodSection = toml::from_str(src).unwrap();
+        let section: DodSection = toml::from_str(src).map_err(ctx("parse toml"))?;
         assert!(section.kill_requires_human);
         assert!(!section.auto_freeze);
         assert_eq!(
@@ -152,19 +154,25 @@ mod tests {
             vec!["/sys/fs/cgroup/harw.slice/".to_owned()]
         );
 
-        let encoded = toml::to_string(&section).unwrap();
-        let decoded: DodSection = toml::from_str(&encoded).unwrap();
+        let encoded = toml::to_string(&section).map_err(ctx("encode toml"))?;
+        let decoded: DodSection = toml::from_str(&encoded).map_err(ctx("parse encoded toml"))?;
         assert_eq!(decoded, section);
+        Ok(())
     }
 
     #[test]
-    fn test_dod_section_rejects_unknown_field() {
+    fn test_dod_section_rejects_unknown_field() -> TestResult {
         let src = r#"
             kill_requires_human = true
             kill_reqiures_human = true
         "#;
-        let error = toml::from_str::<DodSection>(src).unwrap_err();
+        let Err(error) = toml::from_str::<DodSection>(src) else {
+            return Err(TestError::Unexpected(
+                "unknown field must be rejected".to_string(),
+            ));
+        };
         assert!(error.to_string().contains("unknown field"));
+        Ok(())
     }
 
     #[test]
@@ -173,23 +181,33 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rejects_kill_requires_human_false() {
+    fn test_validate_rejects_kill_requires_human_false() -> TestResult {
         let section = DodSection {
             kill_requires_human: false,
             ..DodSection::default()
         };
-        let error = section.validate().unwrap_err();
+        let Err(error) = section.validate() else {
+            return Err(TestError::Unexpected(
+                "kill_requires_human = false must be rejected".to_string(),
+            ));
+        };
         assert!(error.contains("kill_requires_human"));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_blank_cgroup_prefix() {
+    fn test_validate_rejects_blank_cgroup_prefix() -> TestResult {
         let section = DodSection {
             allowed_cgroup_prefixes: vec!["   ".to_owned()],
             ..DodSection::default()
         };
-        let error = section.validate().unwrap_err();
+        let Err(error) = section.validate() else {
+            return Err(TestError::Unexpected(
+                "blank cgroup prefix must be rejected".to_string(),
+            ));
+        };
         assert!(error.contains("allowed_cgroup_prefixes"));
+        Ok(())
     }
 
     #[test]

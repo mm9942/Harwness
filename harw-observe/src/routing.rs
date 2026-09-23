@@ -621,6 +621,7 @@ mod tests {
 
     use super::*;
     use crate::metric::{Cardinality, MetricKind, Unit};
+    use crate::test_support::{TestError, TestResult};
 
     fn key(name: &'static str) -> MetricKey {
         MetricKey {
@@ -825,7 +826,10 @@ mod tests {
         let file = sink();
         let export = sink();
         let mut routing = RoutingSink::new(as_dyn(&file));
-        routing.approve_export(as_dyn(&export), ExportApproval::granted("security.", "alice"));
+        routing.approve_export(
+            as_dyn(&export),
+            ExportApproval::granted("security.", "alice"),
+        );
 
         routing.record(&key("security.finding_total"), MetricValue::Count(1), &[]);
 
@@ -842,11 +846,18 @@ mod tests {
         let file = sink();
         let export = sink();
         let mut routing = RoutingSink::new(as_dyn(&file));
-        routing.approve_export(as_dyn(&export), ExportApproval::granted("security.", "alice"));
+        routing.approve_export(
+            as_dyn(&export),
+            ExportApproval::granted("security.", "alice"),
+        );
 
         routing.record(&key("warden.escalation_total"), MetricValue::Count(1), &[]);
 
-        assert_eq!(export.count(), 0, "a security. approval must not unlock warden.");
+        assert_eq!(
+            export.count(),
+            0,
+            "a security. approval must not unlock warden."
+        );
         assert_eq!(file.count(), 1);
     }
 
@@ -939,14 +950,17 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_threads_all_records_arrive_at_correct_sink() {
+    fn test_concurrent_threads_all_records_arrive_at_correct_sink() -> TestResult {
         let default = sink();
         let app_sink = sink();
         let export_sink = sink();
 
         let mut routing = RoutingSink::new(as_dyn(&default));
         routing.route("app.", as_dyn(&app_sink));
-        routing.approve_export(as_dyn(&export_sink), ExportApproval::granted("security.", "alice"));
+        routing.approve_export(
+            as_dyn(&export_sink),
+            ExportApproval::granted("security.", "alice"),
+        );
 
         let routing: Arc<dyn TelemetrySink> = Arc::new(routing);
 
@@ -959,7 +973,11 @@ mod tests {
                         if thread_id % 2 == 0 {
                             routing.record(&key("app.jobs_total"), MetricValue::Count(1), &[]);
                         } else {
-                            routing.record(&key("security.finding_total"), MetricValue::Count(1), &[]);
+                            routing.record(
+                                &key("security.finding_total"),
+                                MetricValue::Count(1),
+                                &[],
+                            );
                         }
                     }
                 })
@@ -967,7 +985,9 @@ mod tests {
             .collect();
 
         for handle in handles {
-            handle.join().unwrap();
+            handle
+                .join()
+                .map_err(|_| TestError::Unexpected("thread panicked".to_owned()))?;
         }
 
         // Zwei Threads schreiben "app." (nur `app_sink`), zwei schreiben
@@ -976,6 +996,7 @@ mod tests {
         assert_eq!(app_sink.count(), 2 * ITERATIONS);
         assert_eq!(default.count(), 2 * ITERATIONS);
         assert_eq!(export_sink.count(), 2 * ITERATIONS);
+        Ok(())
     }
 
     // ── flush() ──────────────────────────────────────────────────────────

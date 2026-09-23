@@ -126,12 +126,13 @@ mod tests {
     use crate::audit::chain::AuditLog;
     use crate::audit::event::{Actor, SubjectRef};
     use crate::audit::mirror::{ChainAuditMirror, RecordingMirrorTransport};
+    use crate::test_support::{TestResult, ctx};
     use harw_observe::{NullCounterRegistry, NullSink, TelemetrySink};
     use jiff::Timestamp;
     use std::sync::Mutex;
 
-    fn ts(seconds: i64) -> Timestamp {
-        Timestamp::from_second(seconds).expect("valid test timestamp")
+    fn ts(seconds: i64) -> TestResult<Timestamp> {
+        Timestamp::from_second(seconds).map_err(ctx("valid test timestamp"))
     }
 
     #[derive(Debug, Default)]
@@ -186,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn test_intact_chain_section_leaves_audit_chain_break_at_zero() {
+    fn test_intact_chain_section_leaves_audit_chain_break_at_zero() -> TestResult {
         let _guard = AUDIT_COUNTER_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -196,14 +197,15 @@ mod tests {
         log.append(Actor::System, "secret.access", Vec::new());
         let mirror = ChainAuditMirror::new(RecordingMirrorTransport::new());
 
-        let outcome = mirror.verify_and_mirror(&log, ts(700), &NullSink);
+        let outcome = mirror.verify_and_mirror(&log, ts(700)?, &NullSink);
 
         assert!(outcome.is_ok());
         assert_eq!(AUDIT_CHAIN_BREAK.count(), before);
+        Ok(())
     }
 
     #[test]
-    fn test_tampered_chain_section_increments_audit_chain_break_and_records() {
+    fn test_tampered_chain_section_increments_audit_chain_break_and_records() -> TestResult {
         let _guard = AUDIT_COUNTER_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -213,11 +215,12 @@ mod tests {
         let mirror = ChainAuditMirror::new(RecordingMirrorTransport::new());
         let sink = RecordingSink::default();
 
-        let outcome = mirror.verify_and_mirror(&log, ts(800), &sink);
+        let outcome = mirror.verify_and_mirror(&log, ts(800)?, &sink);
 
         assert!(outcome.is_err());
         assert_eq!(AUDIT_CHAIN_BREAK.count(), before + 1);
         assert_eq!(*sink.calls.lock().unwrap_or_else(|p| p.into_inner()), 1);
+        Ok(())
     }
 
     /// Kein Schlüsselmaterial und kein Protokollinhalt darf in Name, Label

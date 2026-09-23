@@ -120,14 +120,14 @@
 //! assert!(reported.is_some(), "eine Verbindung außerhalb des (leeren) Scopes ist ein Befund");
 //! ```
 
+use harw_authority::NetworkScope;
 use harw_dod_bpf::RawBpfEvent;
 use harw_dod_signals::{Actor, EventKind, SecurityEvent};
-use harw_authority::NetworkScope;
 use harw_types::SensorId;
 use jiff::Timestamp;
 
 use crate::error::FlowError;
-use crate::event::{parse_flow_payload, Direction, FlowEvent};
+use crate::event::{Direction, FlowEvent, parse_flow_payload};
 
 /// Übersetzt ein geparstes [`FlowEvent`] in eine `SecurityEvent` — oder in
 /// gar keine, wenn die Melderegel greift.
@@ -219,21 +219,24 @@ pub fn observe(
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use harw_dod_bpf::RawBpfEvent;
     use harw_authority::{EgressTarget, NetworkScope};
+    use harw_dod_bpf::RawBpfEvent;
     use harw_types::SensorId;
     use jiff::Timestamp;
 
     use super::{observe, to_security_event};
     use crate::event::{Direction, FlowEvent, Protocol};
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn sensor() -> SensorId {
         SensorId::from_str("flow-0")
     }
 
-    fn scope_allowing_10_0_0_0_24() -> NetworkScope {
-        let cidr: ipnet::IpNet = "10.0.0.0/24".parse().expect("valid test CIDR literal");
-        NetworkScope::from_targets([EgressTarget::Cidr(cidr)])
+    fn scope_allowing_10_0_0_0_24() -> TestResult<NetworkScope> {
+        let cidr: ipnet::IpNet = "10.0.0.0/24"
+            .parse()
+            .map_err(ctx("valid test CIDR literal"))?;
+        Ok(NetworkScope::from_targets([EgressTarget::Cidr(cidr)]))
     }
 
     fn outbound_event(addr: IpAddr) -> FlowEvent {
@@ -248,12 +251,13 @@ mod tests {
     }
 
     #[test]
-    fn test_to_security_event_reports_a_flow_that_leaves_the_allowed_scope() {
+    fn test_to_security_event_reports_a_flow_that_leaves_the_allowed_scope() -> TestResult {
         let event = outbound_event(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)));
-        let scope = scope_allowing_10_0_0_0_24();
+        let scope = scope_allowing_10_0_0_0_24()?;
 
-        let reported = to_security_event(&event, &sensor(), Timestamp::UNIX_EPOCH, &scope)
-            .expect("a destination outside the allowed scope must be reported");
+        let reported = to_security_event(&event, &sensor(), Timestamp::UNIX_EPOCH, &scope).ok_or(
+            TestError::Missing("a destination outside the allowed scope must be reported"),
+        )?;
 
         assert_eq!(reported.sensor, sensor());
         assert_eq!(reported.actor.as_ref().map(|a| a.uid), Some(1_000));
@@ -262,17 +266,19 @@ mod tests {
             harw_dod_signals::EventKind::EgressFlow { ref destination, port: 443 }
                 if destination == "203.0.113.9"
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_to_security_event_does_not_report_a_flow_inside_the_allowed_scope() {
+    fn test_to_security_event_does_not_report_a_flow_inside_the_allowed_scope() -> TestResult {
         let event = outbound_event(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)));
-        let scope = scope_allowing_10_0_0_0_24();
+        let scope = scope_allowing_10_0_0_0_24()?;
 
         assert!(
             to_security_event(&event, &sensor(), Timestamp::UNIX_EPOCH, &scope).is_none(),
             "eine Verbindung innerhalb des erlaubten Bereichs darf nicht gemeldet werden"
         );
+        Ok(())
     }
 
     #[test]
@@ -299,13 +305,14 @@ mod tests {
     }
 
     #[test]
-    fn test_to_security_event_is_deterministic_for_the_same_inputs() {
+    fn test_to_security_event_is_deterministic_for_the_same_inputs() -> TestResult {
         let event = outbound_event(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)));
-        let scope = scope_allowing_10_0_0_0_24();
+        let scope = scope_allowing_10_0_0_0_24()?;
 
         let first = to_security_event(&event, &sensor(), Timestamp::UNIX_EPOCH, &scope);
         let second = to_security_event(&event, &sensor(), Timestamp::UNIX_EPOCH, &scope);
         assert_eq!(first, second);
+        Ok(())
     }
 
     fn well_formed_flow_payload(port: u16, addr: [u8; 4], trailer: &[u8]) -> Vec<u8> {
@@ -322,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn test_observe_reports_a_flow_that_leaves_the_allowed_scope() {
+    fn test_observe_reports_a_flow_that_leaves_the_allowed_scope() -> TestResult {
         let payload = well_formed_flow_payload(443, [203, 0, 113, 9], &[]);
         let raw = RawBpfEvent {
             pid: 100,
@@ -330,16 +337,19 @@ mod tests {
             observed_at: Timestamp::UNIX_EPOCH,
             payload,
         };
-        let scope = scope_allowing_10_0_0_0_24();
+        let scope = scope_allowing_10_0_0_0_24()?;
 
         let reported = observe(&raw, &sensor(), &scope)
-            .expect("well-formed payload must parse")
-            .expect("destination outside scope must be reported");
+            .map_err(ctx("well-formed payload must parse"))?
+            .ok_or(TestError::Missing(
+                "destination outside scope must be reported",
+            ))?;
         assert_eq!(reported.observed_at, Timestamp::UNIX_EPOCH);
+        Ok(())
     }
 
     #[test]
-    fn test_observe_is_deterministic_for_the_same_raw_event() {
+    fn test_observe_is_deterministic_for_the_same_raw_event() -> TestResult {
         let payload = well_formed_flow_payload(443, [203, 0, 113, 9], &[]);
         let raw = RawBpfEvent {
             pid: 100,
@@ -347,15 +357,17 @@ mod tests {
             observed_at: Timestamp::UNIX_EPOCH,
             payload,
         };
-        let scope = scope_allowing_10_0_0_0_24();
+        let scope = scope_allowing_10_0_0_0_24()?;
 
-        let first = observe(&raw, &sensor(), &scope).expect("parses");
-        let second = observe(&raw, &sensor(), &scope).expect("parses");
+        let first = observe(&raw, &sensor(), &scope).map_err(ctx("parses"))?;
+        let second = observe(&raw, &sensor(), &scope).map_err(ctx("parses"))?;
         assert_eq!(first, second);
+        Ok(())
     }
 
     #[test]
-    fn test_observe_never_leaks_bytes_beyond_the_flow_layout_into_the_serialized_event() {
+    fn test_observe_never_leaks_bytes_beyond_the_flow_layout_into_the_serialized_event()
+    -> TestResult {
         const CANARY: &str = "HARW-FLOW-PAYLOAD-CANARY-CONTENT";
         let payload = well_formed_flow_payload(443, [203, 0, 113, 9], CANARY.as_bytes());
         let raw = RawBpfEvent {
@@ -364,13 +376,17 @@ mod tests {
             observed_at: Timestamp::UNIX_EPOCH,
             payload,
         };
-        let scope = scope_allowing_10_0_0_0_24();
+        let scope = scope_allowing_10_0_0_0_24()?;
 
         let reported = observe(&raw, &sensor(), &scope)
-            .expect("well-formed payload must parse")
-            .expect("destination outside scope must be reported");
+            .map_err(ctx("well-formed payload must parse"))?
+            .ok_or(TestError::Missing(
+                "destination outside scope must be reported",
+            ))?;
 
-        let serialized = serde_json::to_string(&reported).expect("SecurityEvent serializes");
+        let serialized =
+            serde_json::to_string(&reported).map_err(ctx("SecurityEvent serializes"))?;
         assert!(!serialized.contains(CANARY));
+        Ok(())
     }
 }

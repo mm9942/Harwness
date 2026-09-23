@@ -2,29 +2,34 @@
 //! Guardrails und Handoff-Detection.
 
 use harw_agent_dsl::roles::AgentRoleId;
+use harw_authority::{
+    Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+};
 use harw_core::{
-    resume_after_approval, resume_after_approval_durable, resume_after_child, run_turn,
-    run_turn_durable, AgentSession, ApprovalResolution, ConfigApprovalPolicy, EchoModelProvider,
-    InMemoryStateStore, ModelFuture, ModelProvider, ModelRequest, ModelResponse, SessionState,
-    SpawnContext, TurnInput, TurnOutcome,
+    AgentSession, ApprovalResolution, ConfigApprovalPolicy, EchoModelProvider, InMemoryStateStore,
+    ModelFuture, ModelProvider, ModelRequest, ModelResponse, SessionState, SpawnContext, TurnInput,
+    TurnOutcome, resume_after_approval, resume_after_approval_durable, resume_after_child,
+    run_turn, run_turn_durable,
 };
 use harw_extension_api::{
     AgentSpawnError, AgentSpawner, ApprovalDecision, ApprovalHandler, ExtensionRegistry,
     ExtensionRegistryBuilder, SpawnFuture, SpawnInput, ToolExecutor, ToolExecutorFuture, ToolName,
     ToolOutput, ToolProvider, ToolSpec,
 };
-use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
 use harw_session_store::ApprovalStore;
+use harw_tools::ToolCall;
 use harw_tools::schema::JsonSchema;
 use harw_tools::spec::FunctionToolSpec;
-use harw_tools::ToolCall;
 use harw_types::{
     AgentRole, ApprovalActor, ItemId, ReviewDecision, SessionId, TenantId, ToolCallId, WorkspaceId,
 };
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
+
+mod common;
+use common::{TestError, TestResult, ctx};
 
 fn tool_spec(name: &str) -> ToolSpec {
     ToolSpec::Function(FunctionToolSpec {
@@ -37,15 +42,15 @@ fn tool_spec(name: &str) -> ToolSpec {
 
 fn new_session(
     registry: ExtensionRegistry,
-) -> (
+) -> TestResult<(
     AgentSession,
     mpsc::UnboundedReceiver<harw_protocol::events::SessionEvent>,
-) {
+)> {
     let (tx, rx) = mpsc::unbounded_channel();
-    (
+    Ok((
         AgentSession::new(AgentRole::Assistant, None, registry, tx).with_spawn_context(
             SpawnContext {
-                sandbox: test_sandbox(),
+                sandbox: test_sandbox()?,
                 suggestions: None,
                 capability_snapshot: None,
                 approval_actor: Some(test_approval_actor()),
@@ -58,7 +63,7 @@ fn new_session(
             },
         ),
         rx,
-    )
+    ))
 }
 
 fn test_approval_actor() -> ApprovalActor {
@@ -67,10 +72,10 @@ fn test_approval_actor() -> ApprovalActor {
     }
 }
 
-fn test_sandbox() -> SandboxSpec {
+fn test_sandbox() -> TestResult<SandboxSpec> {
     let harness_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("harw-core has a workspace parent")
+        .ok_or(TestError::Missing("harw-core has a workspace parent"))?
         .to_path_buf();
     let registry = WorkspaceRegistry::build(
         &harness_root,
@@ -80,16 +85,16 @@ fn test_sandbox() -> SandboxSpec {
             root: PathBuf::from("harw-core"),
         }],
     )
-    .expect("test workspace is registered");
-    SandboxSpec::from_resolved(
+    .map_err(ctx("test workspace is registered"))?;
+    Ok(SandboxSpec::from_resolved(
         registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("core-tests"),
             )
-            .expect("test workspace resolves"),
+            .map_err(ctx("test workspace resolves"))?,
         PermissionSet::from_policy([Permission::ReadWorkspace]),
-    )
+    ))
 }
 
 // --- Test-Doubles --------------------------------------------------------
@@ -109,7 +114,11 @@ impl ScriptedModel {
 
 impl ModelProvider for ScriptedModel {
     fn respond<'a>(&'a self, _req: ModelRequest) -> ModelFuture<'a> {
-        let next = self.responses.lock().unwrap().pop_front();
+        let next = self
+            .responses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop_front();
         Box::pin(async move { next.ok_or(harw_core::ModelError::EmptyResponse) })
     }
 }
@@ -341,15 +350,15 @@ impl AgentSpawner for StubSpawner {
 // --- Tests ---------------------------------------------------------------
 
 #[tokio::test]
-async fn echo_model_completes_turn() {
+async fn echo_model_completes_turn() -> TestResult {
     let registry = ExtensionRegistryBuilder::default().build();
-    let (mut session, _rx) = new_session(registry);
+    let (mut session, _rx) = new_session(registry)?;
     let store = InMemoryStateStore::new();
     let model = EchoModelProvider::new("hi there");
 
     let outcome = run_turn(&mut session, &model, &store, TurnInput::user("hello"))
         .await
-        .expect("turn runs");
+        .map_err(ctx("turn runs"))?;
 
     assert!(matches!(outcome, TurnOutcome::Completed));
     assert_eq!(*session.state(), SessionState::Idle);
@@ -357,10 +366,11 @@ async fn echo_model_completes_turn() {
     assert_eq!(session.history().len(), 2);
     // persisted both items
     assert_eq!(store.turn_count(session.id()), 2);
+    Ok(())
 }
 
 #[tokio::test]
-async fn tool_call_then_final() {
+async fn tool_call_then_final() -> TestResult {
     let calls = Arc::new(AtomicUsize::new(0));
     let registry = ExtensionRegistryBuilder::default()
         .tool_provider(Arc::new(EchoToolProvider {
@@ -368,7 +378,7 @@ async fn tool_call_then_final() {
             calls: calls.clone(),
         }))
         .build();
-    let (mut session, _rx) = new_session(registry);
+    let (mut session, _rx) = new_session(registry)?;
     let store = InMemoryStateStore::new();
 
     let model = ScriptedModel::new(vec![
@@ -389,17 +399,18 @@ async fn tool_call_then_final() {
 
     let outcome = run_turn(&mut session, &model, &store, TurnInput::user("go"))
         .await
-        .expect("turn runs");
+        .map_err(ctx("turn runs"))?;
 
     assert!(matches!(outcome, TurnOutcome::Completed));
     assert_eq!(calls.load(Ordering::SeqCst), 1, "tool executed once");
     assert_eq!(*session.state(), SessionState::Idle);
     // user, assistant(commentary), tool_call, tool_result, assistant(final)
     assert_eq!(session.history().len(), 5);
+    Ok(())
 }
 
 #[tokio::test]
-async fn duplicate_tool_names_fail_before_any_model_or_tool_dispatch() {
+async fn duplicate_tool_names_fail_before_any_model_or_tool_dispatch() -> TestResult {
     let calls = Arc::new(AtomicUsize::new(0));
     let registry = ExtensionRegistryBuilder::default()
         .tool_provider(Arc::new(EchoToolProvider {
@@ -411,22 +422,25 @@ async fn duplicate_tool_names_fail_before_any_model_or_tool_dispatch() {
             calls: calls.clone(),
         }))
         .build();
-    let (mut session, _rx) = new_session(registry);
+    let (mut session, _rx) = new_session(registry)?;
     let store = InMemoryStateStore::new();
     let model = ScriptedModel::new(vec![ModelResponse::text("must not run")]);
 
-    let error = run_turn(&mut session, &model, &store, TurnInput::user("go"))
-        .await
-        .expect_err("ambiguous tool ownership is unsafe");
+    let Err(error) = run_turn(&mut session, &model, &store, TurnInput::user("go")).await else {
+        return Err(TestError::Unexpected(
+            "ambiguous tool ownership is unsafe".to_owned(),
+        ));
+    };
     assert!(matches!(
         error,
         harw_core::CoreError::DuplicateTool { ref name } if name == "ambiguous"
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+    Ok(())
 }
 
 #[tokio::test]
-async fn tool_execution_without_a_server_resolved_sandbox_fails_closed() {
+async fn tool_execution_without_a_server_resolved_sandbox_fails_closed() -> TestResult {
     let calls = Arc::new(AtomicUsize::new(0));
     let registry = ExtensionRegistryBuilder::default()
         .tool_provider(Arc::new(EchoToolProvider {
@@ -444,7 +458,7 @@ async fn tool_execution_without_a_server_resolved_sandbox_fails_closed() {
 
     let outcome = run_turn(&mut session, &model, &store, TurnInput::user("go"))
         .await
-        .expect("missing execution context is returned to the model");
+        .map_err(ctx("missing execution context is returned to the model"))?;
 
     assert!(matches!(outcome, TurnOutcome::Completed));
     assert_eq!(calls.load(Ordering::SeqCst), 0, "tool was never executed");
@@ -454,10 +468,11 @@ async fn tool_execution_without_a_server_resolved_sandbox_fails_closed() {
         "model saw the rejection"
     );
     assert_eq!(*session.state(), SessionState::Idle);
+    Ok(())
 }
 
 #[tokio::test]
-async fn micro_agent_tool_result_returns_to_requesting_model_before_final_answer() {
+async fn micro_agent_tool_result_returns_to_requesting_model_before_final_answer() -> TestResult {
     let calls = Arc::new(AtomicUsize::new(0));
     let registry = ExtensionRegistryBuilder::default()
         .tool_provider(Arc::new(EchoToolProvider {
@@ -465,7 +480,7 @@ async fn micro_agent_tool_result_returns_to_requesting_model_before_final_answer
             calls: calls.clone(),
         }))
         .build();
-    let (mut session, _rx) = new_session(registry);
+    let (mut session, _rx) = new_session(registry)?;
     let store = InMemoryStateStore::new();
     let model = ToolResultAwareModel {
         calls: AtomicUsize::new(0),
@@ -474,16 +489,17 @@ async fn micro_agent_tool_result_returns_to_requesting_model_before_final_answer
 
     let outcome = run_turn(&mut session, &model, &store, TurnInput::user("help me"))
         .await
-        .expect("micro-agent tool loop completes");
+        .map_err(ctx("micro-agent tool loop completes"))?;
 
     assert!(matches!(outcome, TurnOutcome::Completed));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(model.calls.load(Ordering::SeqCst), 2);
     assert_eq!(*session.state(), SessionState::Idle);
+    Ok(())
 }
 
 #[tokio::test]
-async fn explicitly_parallel_safe_tool_calls_are_joined_before_the_next_model_run() {
+async fn explicitly_parallel_safe_tool_calls_are_joined_before_the_next_model_run() -> TestResult {
     let calls = Arc::new(AtomicUsize::new(0));
     let registry = ExtensionRegistryBuilder::default()
         .tool_provider(Arc::new(ParallelEchoToolProvider {
@@ -491,7 +507,7 @@ async fn explicitly_parallel_safe_tool_calls_are_joined_before_the_next_model_ru
             calls: calls.clone(),
         }))
         .build();
-    let (mut session, _rx) = new_session(registry);
+    let (mut session, _rx) = new_session(registry)?;
     let store = InMemoryStateStore::new();
     let model = ScriptedModel::new(vec![
         ModelResponse {
@@ -516,15 +532,16 @@ async fn explicitly_parallel_safe_tool_calls_are_joined_before_the_next_model_ru
 
     let outcome = run_turn(&mut session, &model, &store, TurnInput::user("parallel"))
         .await
-        .expect("parallel tool response completes");
+        .map_err(ctx("parallel tool response completes"))?;
 
     assert!(matches!(outcome, TurnOutcome::Completed));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(*session.state(), SessionState::Idle);
+    Ok(())
 }
 
 #[tokio::test]
-async fn handoff_pauses_then_resumes() {
+async fn handoff_pauses_then_resumes() -> TestResult {
     let child_id = SessionId::new();
     let spawns = Arc::new(AtomicUsize::new(0));
     let finished = Arc::new(AtomicUsize::new(0));
@@ -535,7 +552,7 @@ async fn handoff_pauses_then_resumes() {
             finished: finished.clone(),
         }))
         .build();
-    let (mut session, _rx) = new_session(registry);
+    let (mut session, _rx) = new_session(registry)?;
     let store = InMemoryStateStore::new();
 
     let handoff_call_id = ToolCallId::new();
@@ -557,7 +574,7 @@ async fn handoff_pauses_then_resumes() {
 
     let outcome = run_turn(&mut session, &model, &store, TurnInput::user("delegate"))
         .await
-        .expect("turn runs");
+        .map_err(ctx("turn runs"))?;
 
     match outcome {
         TurnOutcome::AwaitingChild {
@@ -569,7 +586,11 @@ async fn handoff_pauses_then_resumes() {
             assert_eq!(call_id, handoff_call_id);
             assert_eq!(role, "worker");
         }
-        other => panic!("expected AwaitingChild, got {other:?}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "expected AwaitingChild, got {other:?}"
+            )));
+        }
     }
     assert_eq!(spawns.load(Ordering::SeqCst), 1);
     assert_eq!(*session.state(), SessionState::WaitingForChild);
@@ -600,15 +621,16 @@ async fn handoff_pauses_then_resumes() {
         harw_protocol::ToolCallResult::success(serde_json::json!({"result": "ok"})),
     )
     .await
-    .expect("resume runs");
+    .map_err(ctx("resume runs"))?;
 
     assert!(matches!(resumed, TurnOutcome::Completed));
     assert_eq!(finished.load(Ordering::SeqCst), 1);
     assert_eq!(*session.state(), SessionState::Idle);
+    Ok(())
 }
 
 #[tokio::test]
-async fn approval_pause_resumes_the_original_call_then_runs_the_model_again() {
+async fn approval_pause_resumes_the_original_call_then_runs_the_model_again() -> TestResult {
     let calls = Arc::new(AtomicUsize::new(0));
     let request = ItemId::new();
     let registry = ExtensionRegistryBuilder::default()
@@ -620,7 +642,7 @@ async fn approval_pause_resumes_the_original_call_then_runs_the_model_again() {
             request: request.clone(),
         }))
         .build();
-    let (mut session, _rx) = new_session(registry);
+    let (mut session, _rx) = new_session(registry)?;
     let store = InMemoryStateStore::new();
     let call_id = ToolCallId::new();
     let model = ScriptedModel::new(vec![
@@ -639,7 +661,7 @@ async fn approval_pause_resumes_the_original_call_then_runs_the_model_again() {
 
     let paused = run_turn(&mut session, &model, &store, TurnInput::user("go"))
         .await
-        .expect("turn pauses for approval");
+        .map_err(ctx("turn pauses for approval"))?;
     assert!(matches!(
         paused,
         TurnOutcome::AwaitingApproval {
@@ -653,7 +675,7 @@ async fn approval_pause_resumes_the_original_call_then_runs_the_model_again() {
     let wrong_actor = ApprovalActor::Operator {
         id: "other-operator".to_owned(),
     };
-    let mismatch = resume_after_approval(
+    let Err(mismatch) = resume_after_approval(
         &mut session,
         &model,
         &store,
@@ -661,7 +683,11 @@ async fn approval_pause_resumes_the_original_call_then_runs_the_model_again() {
         ApprovalResolution::Approve,
     )
     .await
-    .expect_err("a different actor cannot approve this tool call");
+    else {
+        return Err(TestError::Unexpected(
+            "a different actor cannot approve this tool call".to_owned(),
+        ));
+    };
     assert!(matches!(
         mismatch,
         harw_core::CoreError::ApprovalActorMismatch { .. }
@@ -676,15 +702,16 @@ async fn approval_pause_resumes_the_original_call_then_runs_the_model_again() {
         ApprovalResolution::Approve,
     )
     .await
-    .expect("approval resumes original call");
+    .map_err(ctx("approval resumes original call"))?;
 
     assert!(matches!(resumed, TurnOutcome::Completed));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(*session.state(), SessionState::Idle);
+    Ok(())
 }
 
 #[tokio::test]
-async fn configured_policy_section_is_a_runtime_approval_handler() {
+async fn configured_policy_section_is_a_runtime_approval_handler() -> TestResult {
     let calls = Arc::new(AtomicUsize::new(0));
     let registry = ExtensionRegistryBuilder::default()
         .tool_provider(Arc::new(EchoToolProvider {
@@ -693,7 +720,7 @@ async fn configured_policy_section_is_a_runtime_approval_handler() {
         }))
         .approval_handler(Arc::new(ConfigApprovalPolicy::new(["shell".to_owned()])))
         .build();
-    let (mut session, _rx) = new_session(registry);
+    let (mut session, _rx) = new_session(registry)?;
     let store = InMemoryStateStore::new();
     let model = ScriptedModel::new(vec![ModelResponse {
         message: None,
@@ -708,44 +735,51 @@ async fn configured_policy_section_is_a_runtime_approval_handler() {
 
     let outcome = run_turn(&mut session, &model, &store, TurnInput::user("run it"))
         .await
-        .expect("configured policy pauses rather than dispatching");
+        .map_err(ctx("configured policy pauses rather than dispatching"))?;
     assert!(matches!(outcome, TurnOutcome::AwaitingApproval { .. }));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+    Ok(())
 }
 
 #[tokio::test]
-async fn double_start_is_rejected() {
+async fn double_start_is_rejected() -> TestResult {
     let registry = ExtensionRegistryBuilder::default().build();
-    let (mut session, _rx) = new_session(registry);
+    let (mut session, _rx) = new_session(registry)?;
     // manually move to Running and try to start again
-    let _h = session.try_start_turn().expect("first start ok");
+    let _h = session.try_start_turn().map_err(ctx("first start ok"))?;
     let err = session.try_start_turn();
     assert!(err.is_err(), "second start must be rejected while running");
+    Ok(())
 }
 
 #[tokio::test]
-async fn model_failure_transitions_the_active_session_to_failed() {
+async fn model_failure_transitions_the_active_session_to_failed() -> TestResult {
     let registry = ExtensionRegistryBuilder::default().build();
-    let (mut session, _rx) = new_session(registry);
+    let (mut session, _rx) = new_session(registry)?;
     let store = InMemoryStateStore::new();
 
-    let error = run_turn(
+    let Err(error) = run_turn(
         &mut session,
         &FailingModel,
         &store,
         TurnInput::user("hello"),
     )
     .await
-    .expect_err("model failure reaches caller");
+    else {
+        return Err(TestError::Unexpected(
+            "model failure reaches caller".to_owned(),
+        ));
+    };
 
     assert!(error.to_string().contains("unavailable"));
     assert!(
         matches!(session.state(), SessionState::Failed(reason) if reason.contains("unavailable"))
     );
+    Ok(())
 }
 
 #[tokio::test]
-async fn durable_approval_is_written_then_consumed_once_before_resuming() {
+async fn durable_approval_is_written_then_consumed_once_before_resuming() -> TestResult {
     let calls = Arc::new(AtomicUsize::new(0));
     let request = ItemId::new();
     let registry = ExtensionRegistryBuilder::default()
@@ -757,9 +791,9 @@ async fn durable_approval_is_written_then_consumed_once_before_resuming() {
             request: request.clone(),
         }))
         .build();
-    let (mut session, _rx) = new_session(registry);
+    let (mut session, _rx) = new_session(registry)?;
     let store = InMemoryStateStore::new();
-    let temp = tempfile::tempdir().expect("temp directory");
+    let temp = tempfile::tempdir().map_err(ctx("temp directory"))?;
     let approvals = ApprovalStore::new(temp.path());
     let call_id = ToolCallId::new();
     let model = ScriptedModel::new(vec![
@@ -784,11 +818,11 @@ async fn durable_approval_is_written_then_consumed_once_before_resuming() {
         TurnInput::user("go"),
     )
     .await
-    .expect("durable request is issued before the turn pauses");
+    .map_err(ctx("durable request is issued before the turn pauses"))?;
     assert!(matches!(paused, TurnOutcome::AwaitingApproval { .. }));
     let durable = approvals
         .pending(session.id(), &request)
-        .expect("request survives outside the in-memory session");
+        .map_err(ctx("request survives outside the in-memory session"))?;
     assert_eq!(durable.call_id, call_id);
     assert_eq!(durable.actor, test_approval_actor());
 
@@ -801,22 +835,25 @@ async fn durable_approval_is_written_then_consumed_once_before_resuming() {
         ApprovalResolution::Approve,
     )
     .await
-    .expect("the matching actor consumes and resumes once");
+    .map_err(ctx("the matching actor consumes and resumes once"))?;
     assert!(matches!(resumed, TurnOutcome::Completed));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-    let replay = approvals
-        .resolve(
-            session.id(),
-            &request,
-            ReviewDecision::Approved,
-            None,
-            &test_approval_actor(),
-            &harw_types::SystemClock,
-        )
-        .expect_err("the durable request cannot be consumed twice");
+    let Err(replay) = approvals.resolve(
+        session.id(),
+        &request,
+        ReviewDecision::Approved,
+        None,
+        &test_approval_actor(),
+        &harw_types::SystemClock,
+    ) else {
+        return Err(TestError::Unexpected(
+            "the durable request cannot be consumed twice".to_owned(),
+        ));
+    };
     assert!(matches!(
         replay,
         harw_session_store::SessionStoreError::ApprovalAlreadyResolved { .. }
     ));
+    Ok(())
 }

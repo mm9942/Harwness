@@ -269,7 +269,8 @@ impl PlanJobBridge {
         ensure_node_exists(plan, task)?;
 
         let events = apply_atomically(plan, actor, |snapshot| {
-            if find_node(snapshot, task).is_some_and(|node| node.status == PlanNodeStatus::Completed)
+            if find_node(snapshot, task)
+                .is_some_and(|node| node.status == PlanNodeStatus::Completed)
             {
                 return Vec::new();
             }
@@ -478,18 +479,20 @@ fn admit_node(
     task: &TaskId,
 ) -> Result<Option<String>, PlanBridgeError> {
     // Schritt 1: Draft → Ready, bevor ein Job existiert (K5).
-    apply_atomically(plan, actor, |snapshot| match job_candidate(snapshot, task) {
-        Some(node) if node.status == PlanNodeStatus::Draft => vec![PlanAction::SetStatus {
-            id: task.clone(),
-            status: PlanNodeStatus::Ready,
-            reason: Some("wird als Job admittiert".to_owned()),
-        }],
-        _ => Vec::new(),
+    apply_atomically(plan, actor, |snapshot| {
+        match job_candidate(snapshot, task) {
+            Some(node) if node.status == PlanNodeStatus::Draft => vec![PlanAction::SetStatus {
+                id: task.clone(),
+                status: PlanNodeStatus::Ready,
+                reason: Some("wird als Job admittiert".to_owned()),
+            }],
+            _ => Vec::new(),
+        }
     })?;
 
     let snapshot = plan.current()?;
-    let Some(node) = job_candidate(&snapshot, task)
-        .filter(|node| node.status == PlanNodeStatus::Ready)
+    let Some(node) =
+        job_candidate(&snapshot, task).filter(|node| node.status == PlanNodeStatus::Ready)
     else {
         tracing::debug!(task = %task, "Knoten ist nicht mehr admittierbar — übersprungen");
         return Ok(None);
@@ -500,7 +503,14 @@ fn admit_node(
     let work_id = admission_work_id(&snapshot.id, &node.id, revision)?;
     let contract = contract_from_node(node, template.base_revision.clone(), revision);
     let payload = node_payload(snapshot.id.as_str(), node, revision, &contract)?;
-    ensure_job_admitted(jobs, template, &work_id, payload, snapshot.id.as_str(), task)?;
+    ensure_job_admitted(
+        jobs,
+        template,
+        &work_id,
+        payload,
+        snapshot.id.as_str(),
+        task,
+    )?;
 
     // Schritt 3: Bindung und Start atomar.
     let attempt = node
@@ -620,9 +630,15 @@ fn ensure_job_admitted(
                 .get(work_id)
                 .map_err(|error| PlanBridgeError::JobStore(error.to_string()))?;
             let belongs = existing.job.kind == JobKind::Custom(PLAN_NODE_JOB_KIND.to_owned())
-                && existing.input.get("plan_id").and_then(serde_json::Value::as_str)
+                && existing
+                    .input
+                    .get("plan_id")
+                    .and_then(serde_json::Value::as_str)
                     == Some(plan_id)
-                && existing.input.get("task_id").and_then(serde_json::Value::as_str)
+                && existing
+                    .input
+                    .get("task_id")
+                    .and_then(serde_json::Value::as_str)
                     == Some(task.as_str());
             let reusable = matches!(existing.job.state, JobState::Pending | JobState::Ready);
             if belongs && reusable {
@@ -689,6 +705,7 @@ fn scope_strings(scopes: &[harw_plan::PathOrSymbol]) -> Vec<&str> {
 mod tests {
     use super::*;
     use crate::metrics::{EVIDENCE_ATTACHED_TOTAL, INVALIDATIONS_TOTAL};
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testing::{
         RecordingSink, ScriptedPlanStore, admission_template, coding_node, exploration_config,
         job_count, plan_id, research_node, seeded_plan_store, seeded_plan_store_with_config,
@@ -697,69 +714,54 @@ mod tests {
     use harw_plan::InMemoryPlanStore;
     use harw_plan::error::PlanError;
 
-    fn template() -> JobAdmissionTemplate {
+    fn template() -> TestResult<JobAdmissionTemplate> {
         admission_template()
     }
 
-    fn job_store() -> (JobStore, tempfile::TempDir) {
+    fn job_store() -> TestResult<(JobStore, tempfile::TempDir)> {
         temp_job_store()
     }
 
-    fn snapshot_of(plan: &dyn PlanStore) -> Plan {
-        match plan.current() {
-            Ok(snapshot) => snapshot,
-            Err(error) => panic!("current: {error}"),
-        }
+    fn snapshot_of(plan: &dyn PlanStore) -> TestResult<Plan> {
+        plan.current().map_err(ctx("current"))
     }
 
     #[test]
-    fn test_admit_ready_nodes_creates_a_job_and_moves_the_node_in_progress() {
-        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)]);
-        let (jobs, _dir) = job_store();
+    fn test_admit_ready_nodes_creates_a_job_and_moves_the_node_in_progress() -> TestResult {
+        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)])?;
+        let (jobs, _dir) = job_store()?;
 
-        let admitted = match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime")
-        {
-            Ok(admitted) => admitted,
-            Err(error) => panic!("admit schlug fehl: {error}"),
-        };
+        let admitted = PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template()?, "runtime")
+            .map_err(ctx("admit schlug fehl"))?;
 
         assert_eq!(admitted.len(), 1);
         let (task, work_id) = &admitted[0];
         assert_eq!(task, &TaskId::new("t-1"));
         assert!(!work_id.is_empty());
 
-        let snapshot = match plan.current() {
-            Ok(snapshot) => snapshot,
-            Err(error) => panic!("current: {error}"),
-        };
+        let snapshot = plan.current().map_err(ctx("current"))?;
         let node = &snapshot.nodes[0];
         assert_eq!(node.status, PlanNodeStatus::InProgress);
-        match &node.assignment {
-            Some(assignment) => {
-                assert_eq!(assignment.job.as_deref(), Some(work_id.as_str()));
-                assert_eq!(assignment.worker, "runtime");
-                assert_eq!(assignment.attempt, 0);
-            }
-            None => panic!("Assignment fehlt"),
-        }
+        let assignment = node
+            .assignment
+            .as_ref()
+            .ok_or(TestError::Missing("Assignment fehlt"))?;
+        assert_eq!(assignment.job.as_deref(), Some(work_id.as_str()));
+        assert_eq!(assignment.worker, "runtime");
+        assert_eq!(assignment.attempt, 0);
+        Ok(())
     }
 
     #[test]
-    fn test_admit_ready_nodes_payload_carries_the_full_contract() {
-        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)]);
-        let (jobs, _dir) = job_store();
+    fn test_admit_ready_nodes_payload_carries_the_full_contract() -> TestResult {
+        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)])?;
+        let (jobs, _dir) = job_store()?;
         let revision_before = plan.revision();
 
-        let admitted = match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime")
-        {
-            Ok(admitted) => admitted,
-            Err(error) => panic!("admit schlug fehl: {error}"),
-        };
+        let admitted = PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template()?, "runtime")
+            .map_err(ctx("admit schlug fehl"))?;
         let work_id = WorkId::from_str(admitted[0].1.as_str());
-        let stored = match jobs.get(&work_id) {
-            Ok(stored) => stored,
-            Err(error) => panic!("Job lesen: {error}"),
-        };
+        let stored = jobs.get(&work_id).map_err(ctx("Job lesen"))?;
 
         assert_eq!(
             stored.job.kind,
@@ -768,7 +770,10 @@ mod tests {
         let input = &stored.input;
         assert_eq!(input["plan_id"].as_str(), Some("p-test"));
         assert_eq!(input["task_id"].as_str(), Some("t-1"));
-        assert_eq!(input["plan_revision"].as_u64(), Some(revision_before.value()));
+        assert_eq!(
+            input["plan_revision"].as_u64(),
+            Some(revision_before.value())
+        );
         assert!(input["contract"].is_object());
         assert!(input["objective"].is_string());
         assert!(input["write_scope"].is_array());
@@ -786,91 +791,92 @@ mod tests {
                 "reserviertes Feld '{reserved}' im Payload"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_admit_ready_nodes_promotes_a_draft_node_through_ready() {
-        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Draft)]);
-        let (jobs, _dir) = job_store();
+    fn test_admit_ready_nodes_promotes_a_draft_node_through_ready() -> TestResult {
+        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Draft)])?;
+        let (jobs, _dir) = job_store()?;
 
-        if let Err(error) = PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime") {
-            panic!("admit schlug fehl: {error}");
-        }
+        PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template()?, "runtime")
+            .map_err(ctx("admit schlug fehl"))?;
 
-        let snapshot = match plan.current() {
-            Ok(snapshot) => snapshot,
-            Err(error) => panic!("current: {error}"),
-        };
+        let snapshot = plan.current().map_err(ctx("current"))?;
         assert_eq!(snapshot.nodes[0].status, PlanNodeStatus::InProgress);
+        Ok(())
     }
 
     #[test]
-    fn test_admit_ready_nodes_skips_non_work_kinds() {
-        let plan = seeded_plan_store(vec![research_node("r-1", PlanNodeStatus::Ready)]);
-        let (jobs, _dir) = job_store();
+    fn test_admit_ready_nodes_skips_non_work_kinds() -> TestResult {
+        let plan = seeded_plan_store(vec![research_node("r-1", PlanNodeStatus::Ready)])?;
+        let (jobs, _dir) = job_store()?;
 
-        match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime") {
+        match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template()?, "runtime") {
             Err(PlanBridgeError::NoReadyNodes) => {}
-            other => panic!("erwartet NoReadyNodes, bekommen: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet NoReadyNodes, bekommen: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_admit_ready_nodes_reports_no_ready_nodes_on_an_empty_plan() {
+    fn test_admit_ready_nodes_reports_no_ready_nodes_on_an_empty_plan() -> TestResult {
         let plan = InMemoryPlanStore::new();
-        if let Err(error) = plan.apply(
+        plan.apply(
             PlanAction::Create {
-                plan_id: plan_id("p-empty"),
+                plan_id: plan_id("p-empty")?,
                 goal: "Ziel".to_owned(),
             },
             "test",
-        ) {
-            panic!("Plan anlegen: {error}");
-        }
-        let (jobs, _dir) = job_store();
+        )
+        .map_err(ctx("Plan anlegen"))?;
+        let (jobs, _dir) = job_store()?;
 
-        match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime") {
+        match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template()?, "runtime") {
             Err(PlanBridgeError::NoReadyNodes) => {}
-            other => panic!("erwartet NoReadyNodes, bekommen: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet NoReadyNodes, bekommen: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_on_job_completed_attaches_evidence_and_completes() {
-        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)]);
-        let (jobs, _dir) = job_store();
-        let admitted = match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime")
-        {
-            Ok(admitted) => admitted,
-            Err(error) => panic!("admit schlug fehl: {error}"),
-        };
+    fn test_on_job_completed_attaches_evidence_and_completes() -> TestResult {
+        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)])?;
+        let (jobs, _dir) = job_store()?;
+        let admitted = PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template()?, "runtime")
+            .map_err(ctx("admit schlug fehl"))?;
         let (task, work_id) = &admitted[0];
 
-        if let Err(error) = PlanJobBridge::on_job_completed(
+        PlanJobBridge::on_job_completed(
             &plan,
             task,
             work_id,
             "cargo test grün",
             "runtime",
             OffsetDateTime::UNIX_EPOCH,
-        ) {
-            panic!("on_job_completed schlug fehl: {error}");
-        }
+        )
+        .map_err(ctx("on_job_completed schlug fehl"))?;
 
-        let snapshot = match plan.current() {
-            Ok(snapshot) => snapshot,
-            Err(error) => panic!("current: {error}"),
-        };
+        let snapshot = plan.current().map_err(ctx("current"))?;
         let node = &snapshot.nodes[0];
         assert_eq!(node.status, PlanNodeStatus::Completed);
         assert_eq!(node.evidence.len(), 1);
         assert_eq!(node.evidence[0].kind, EvidenceKind::Job);
         assert_eq!(&node.evidence[0].locator, work_id);
+        Ok(())
     }
 
     #[test]
-    fn test_on_job_completed_rejects_an_unknown_task() {
-        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)]);
+    fn test_on_job_completed_rejects_an_unknown_task() -> TestResult {
+        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)])?;
 
         match PlanJobBridge::on_job_completed(
             &plan,
@@ -883,37 +889,34 @@ mod tests {
             Err(PlanBridgeError::NodeNotFound { task }) => {
                 assert_eq!(task, TaskId::new("t-unbekannt"));
             }
-            other => panic!("erwartet NodeNotFound, bekommen: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet NodeNotFound, bekommen: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_on_job_failed_invalidates_the_node_without_reopening_it() {
-        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)]);
-        let (jobs, _dir) = job_store();
-        let admitted = match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime")
-        {
-            Ok(admitted) => admitted,
-            Err(error) => panic!("admit schlug fehl: {error}"),
-        };
+    fn test_on_job_failed_invalidates_the_node_without_reopening_it() -> TestResult {
+        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)])?;
+        let (jobs, _dir) = job_store()?;
+        let admitted = PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template()?, "runtime")
+            .map_err(ctx("admit schlug fehl"))?;
         let (task, work_id) = &admitted[0];
 
-        if let Err(error) =
-            PlanJobBridge::on_job_failed(&plan, task, work_id, "clippy rot", "runtime")
-        {
-            panic!("on_job_failed schlug fehl: {error}");
-        }
+        PlanJobBridge::on_job_failed(&plan, task, work_id, "clippy rot", "runtime")
+            .map_err(ctx("on_job_failed schlug fehl"))?;
 
-        let snapshot = match plan.current() {
-            Ok(snapshot) => snapshot,
-            Err(error) => panic!("current: {error}"),
-        };
+        let snapshot = plan.current().map_err(ctx("current"))?;
         assert_eq!(snapshot.nodes[0].status, PlanNodeStatus::Invalidated);
+        Ok(())
     }
 
     #[test]
-    fn test_on_job_failed_rejects_an_unknown_task() {
-        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)]);
+    fn test_on_job_failed_rejects_an_unknown_task() -> TestResult {
+        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)])?;
 
         match PlanJobBridge::on_job_failed(
             &plan,
@@ -923,23 +926,25 @@ mod tests {
             "runtime",
         ) {
             Err(PlanBridgeError::NodeNotFound { .. }) => {}
-            other => panic!("erwartet NodeNotFound, bekommen: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet NodeNotFound, bekommen: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_on_job_completed_observed_emits_evidence_attached_total() {
-        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)]);
-        let (jobs, _dir) = job_store();
-        let admitted = match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime")
-        {
-            Ok(admitted) => admitted,
-            Err(error) => panic!("admit schlug fehl: {error}"),
-        };
+    fn test_on_job_completed_observed_emits_evidence_attached_total() -> TestResult {
+        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)])?;
+        let (jobs, _dir) = job_store()?;
+        let admitted = PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template()?, "runtime")
+            .map_err(ctx("admit schlug fehl"))?;
         let (task, work_id) = &admitted[0];
         let sink = RecordingSink::new();
 
-        if let Err(error) = PlanJobBridge::on_job_completed_observed(
+        PlanJobBridge::on_job_completed_observed(
             &plan,
             task,
             work_id,
@@ -947,175 +952,183 @@ mod tests {
             "runtime",
             OffsetDateTime::UNIX_EPOCH,
             Some(&sink),
-        ) {
-            panic!("on_job_completed_observed schlug fehl: {error}");
-        }
+        )
+        .map_err(ctx("on_job_completed_observed schlug fehl"))?;
 
         assert_eq!(sink.values_for(EVIDENCE_ATTACHED_TOTAL.name).len(), 1);
         assert!(sink.values_for(INVALIDATIONS_TOTAL.name).is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_on_job_failed_observed_emits_invalidations_total() {
-        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)]);
-        let (jobs, _dir) = job_store();
-        let admitted = match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime")
-        {
-            Ok(admitted) => admitted,
-            Err(error) => panic!("admit schlug fehl: {error}"),
-        };
+    fn test_on_job_failed_observed_emits_invalidations_total() -> TestResult {
+        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)])?;
+        let (jobs, _dir) = job_store()?;
+        let admitted = PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template()?, "runtime")
+            .map_err(ctx("admit schlug fehl"))?;
         let (task, work_id) = &admitted[0];
         let sink = RecordingSink::new();
 
-        if let Err(error) = PlanJobBridge::on_job_failed_observed(
+        PlanJobBridge::on_job_failed_observed(
             &plan,
             task,
             work_id,
             "clippy rot",
             "runtime",
             Some(&sink),
-        ) {
-            panic!("on_job_failed_observed schlug fehl: {error}");
-        }
+        )
+        .map_err(ctx("on_job_failed_observed schlug fehl"))?;
 
         assert_eq!(sink.values_for(INVALIDATIONS_TOTAL.name).len(), 1);
         assert!(sink.values_for(EVIDENCE_ATTACHED_TOTAL.name).is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_on_job_failed_observed_without_a_sink_still_invalidates() {
-        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)]);
-        let (jobs, _dir) = job_store();
-        let admitted = match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime")
-        {
-            Ok(admitted) => admitted,
-            Err(error) => panic!("admit schlug fehl: {error}"),
-        };
+    fn test_on_job_failed_observed_without_a_sink_still_invalidates() -> TestResult {
+        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)])?;
+        let (jobs, _dir) = job_store()?;
+        let admitted = PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template()?, "runtime")
+            .map_err(ctx("admit schlug fehl"))?;
         let (task, work_id) = &admitted[0];
 
-        if let Err(error) =
-            PlanJobBridge::on_job_failed_observed(&plan, task, work_id, "clippy rot", "runtime", None)
-        {
-            panic!("on_job_failed_observed schlug fehl: {error}");
-        }
+        PlanJobBridge::on_job_failed_observed(&plan, task, work_id, "clippy rot", "runtime", None)
+            .map_err(ctx("on_job_failed_observed schlug fehl"))?;
 
-        let snapshot = match plan.current() {
-            Ok(snapshot) => snapshot,
-            Err(error) => panic!("current: {error}"),
-        };
+        let snapshot = plan.current().map_err(ctx("current"))?;
         assert_eq!(snapshot.nodes[0].status, PlanNodeStatus::Invalidated);
+        Ok(())
     }
 
     #[test]
-    fn test_template_exposes_its_submitter() {
-        let template = template();
+    fn test_template_exposes_its_submitter() -> TestResult {
+        let template = template()?;
         assert!(matches!(
             template.submitter(),
             ApprovalActor::Operator { id } if id == "operator-1"
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_admit_ready_nodes_twice_admits_exactly_one_job() {
-        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)]);
-        let (jobs, _dir) = job_store();
+    fn test_admit_ready_nodes_twice_admits_exactly_one_job() -> TestResult {
+        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)])?;
+        let (jobs, _dir) = job_store()?;
 
-        if let Err(error) = PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime") {
-            panic!("erste Admission schlug fehl: {error}");
-        }
-        match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime") {
+        PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template()?, "runtime")
+            .map_err(ctx("erste Admission schlug fehl"))?;
+        match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template()?, "runtime") {
             Err(PlanBridgeError::NoReadyNodes) => {}
-            other => panic!("erwartet NoReadyNodes, bekommen: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet NoReadyNodes, bekommen: {other:?}"
+                )));
+            }
         }
-        assert_eq!(job_count(&jobs), 1);
+        assert_eq!(job_count(&jobs)?, 1);
+        Ok(())
     }
 
     #[test]
-    fn test_admit_ready_nodes_is_idempotent_after_a_failed_plan_batch() {
+    fn test_admit_ready_nodes_is_idempotent_after_a_failed_plan_batch() -> TestResult {
         let plan = ScriptedPlanStore::new(seeded_plan_store(vec![coding_node(
             "t-1",
             PlanNodeStatus::Ready,
-        )]));
-        let (jobs, _dir) = job_store();
+        )])?);
+        let (jobs, _dir) = job_store()?;
         plan.inject_failures(1);
 
-        match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime") {
+        match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template()?, "runtime") {
             Err(PlanBridgeError::Plan(PlanError::Io(_))) => {}
-            other => panic!("erwartet injizierten Batch-Fehler, bekommen: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet injizierten Batch-Fehler, bekommen: {other:?}"
+                )));
+            }
         }
         // Der Job existiert, der Knoten ist aber noch nicht gebunden.
-        assert_eq!(job_count(&jobs), 1);
-        let first = snapshot_of(&plan);
+        assert_eq!(job_count(&jobs)?, 1);
+        let first = snapshot_of(&plan)?;
         assert_eq!(first.nodes[0].status, PlanNodeStatus::Ready);
         assert!(first.nodes[0].assignment.is_none());
 
-        let admitted = match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime")
-        {
-            Ok(admitted) => admitted,
-            Err(error) => panic!("Wiederholung schlug fehl: {error}"),
-        };
+        let admitted = PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template()?, "runtime")
+            .map_err(ctx("Wiederholung schlug fehl"))?;
 
         // Kein zweiter Job: derselbe Job wird gebunden.
-        assert_eq!(job_count(&jobs), 1);
+        assert_eq!(job_count(&jobs)?, 1);
         assert_eq!(admitted.len(), 1);
-        let bound = snapshot_of(&plan);
+        let bound = snapshot_of(&plan)?;
         let node = &bound.nodes[0];
         assert_eq!(node.status, PlanNodeStatus::InProgress);
         assert_eq!(
-            node.assignment.as_ref().and_then(|assignment| assignment.job.as_deref()),
+            node.assignment
+                .as_ref()
+                .and_then(|assignment| assignment.job.as_deref()),
             Some(admitted[0].1.as_str())
         );
-        match jobs.list(&harw_session_store::JobListQuery::default()) {
-            Ok(page) => assert_eq!(page.jobs[0].job.id.as_str(), admitted[0].1),
-            Err(error) => panic!("Jobs auflisten: {error}"),
-        }
+        let page = jobs
+            .list(&harw_session_store::JobListQuery::default())
+            .map_err(ctx("Jobs auflisten"))?;
+        assert_eq!(page.jobs[0].job.id.as_str(), admitted[0].1);
+        Ok(())
     }
 
     #[test]
-    fn test_admit_ready_nodes_retries_once_after_a_revision_conflict() {
+    fn test_admit_ready_nodes_retries_once_after_a_revision_conflict() -> TestResult {
         let plan = ScriptedPlanStore::new(seeded_plan_store(vec![coding_node(
             "t-1",
             PlanNodeStatus::Ready,
-        )]));
-        let (jobs, _dir) = job_store();
+        )])?);
+        let (jobs, _dir) = job_store()?;
         plan.inject_conflicts(1);
 
-        let admitted = match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime")
-        {
-            Ok(admitted) => admitted,
-            Err(error) => panic!("admit schlug fehl: {error}"),
-        };
+        let admitted = PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template()?, "runtime")
+            .map_err(ctx("admit schlug fehl"))?;
 
         assert_eq!(admitted.len(), 1);
         assert_eq!(plan.batch_calls(), 2, "erwartet genau eine Wiederholung");
-        assert_eq!(job_count(&jobs), 1);
-        assert_eq!(snapshot_of(&plan).nodes[0].status, PlanNodeStatus::InProgress);
+        assert_eq!(job_count(&jobs)?, 1);
+        assert_eq!(
+            snapshot_of(&plan)?.nodes[0].status,
+            PlanNodeStatus::InProgress
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_admit_ready_nodes_creates_no_job_when_exploration_is_missing() {
+    fn test_admit_ready_nodes_creates_no_job_when_exploration_is_missing() -> TestResult {
         let plan = seeded_plan_store_with_config(
             exploration_config(),
             vec![coding_node("t-1", PlanNodeStatus::Draft)],
-        );
-        let (jobs, _dir) = job_store();
+        )?;
+        let (jobs, _dir) = job_store()?;
 
-        match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime") {
+        match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template()?, "runtime") {
             Err(PlanBridgeError::Plan(PlanError::BatchActionRejected { source, .. })) => {
                 assert!(
                     matches!(*source, PlanError::ExplorationRequired { .. }),
                     "unerwartete Ursache: {source}"
                 );
             }
-            other => panic!("erwartet ExplorationRequired, bekommen: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet ExplorationRequired, bekommen: {other:?}"
+                )));
+            }
         }
-        assert_eq!(job_count(&jobs), 0, "Waisen-Job trotz abgelehnter Admission");
-        assert_eq!(snapshot_of(&plan).nodes[0].status, PlanNodeStatus::Draft);
+        assert_eq!(
+            job_count(&jobs)?,
+            0,
+            "Waisen-Job trotz abgelehnter Admission"
+        );
+        assert_eq!(snapshot_of(&plan)?.nodes[0].status, PlanNodeStatus::Draft);
+        Ok(())
     }
 
     #[test]
-    fn test_admission_work_id_is_deterministic_per_node_and_revision() {
-        let plan = plan_id("p-test");
+    fn test_admission_work_id_is_deterministic_per_node_and_revision() -> TestResult {
+        let plan = plan_id("p-test")?;
         let task = TaskId::new("t-1");
         let first = admission_work_id(&plan, &task, RevisionId::new(3));
         let second = admission_work_id(&plan, &task, RevisionId::new(3));
@@ -1134,52 +1147,59 @@ mod tests {
                         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
                 );
             }
-            other => panic!("WorkId-Ableitung schlug fehl: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "WorkId-Ableitung schlug fehl: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_on_job_completed_twice_is_a_noop() {
-        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)]);
-        let (jobs, _dir) = job_store();
-        let admitted = match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime")
-        {
-            Ok(admitted) => admitted,
-            Err(error) => panic!("admit schlug fehl: {error}"),
-        };
+    fn test_on_job_completed_twice_is_a_noop() -> TestResult {
+        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)])?;
+        let (jobs, _dir) = job_store()?;
+        let admitted = PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template()?, "runtime")
+            .map_err(ctx("admit schlug fehl"))?;
         let (task, work_id) = &admitted[0];
         for round in 0..2 {
-            if let Err(error) = PlanJobBridge::on_job_completed(
+            PlanJobBridge::on_job_completed(
                 &plan,
                 task,
                 work_id,
                 "fertig",
                 "runtime",
                 OffsetDateTime::UNIX_EPOCH,
-            ) {
-                panic!("on_job_completed Runde {round}: {error}");
-            }
+            )
+            .map_err(|error| {
+                TestError::Unexpected(format!("on_job_completed Runde {round}: {error}"))
+            })?;
         }
         let revision_after_first = plan.revision();
-        if let Err(error) = PlanJobBridge::on_job_completed(
+        PlanJobBridge::on_job_completed(
             &plan,
             task,
             work_id,
             "fertig",
             "runtime",
             OffsetDateTime::UNIX_EPOCH,
-        ) {
-            panic!("on_job_completed dritte Runde: {error}");
-        }
-        assert_eq!(plan.revision(), revision_after_first, "No-op erzeugte eine Revision");
-        let snapshot = snapshot_of(&plan);
+        )
+        .map_err(ctx("on_job_completed dritte Runde"))?;
+        assert_eq!(
+            plan.revision(),
+            revision_after_first,
+            "No-op erzeugte eine Revision"
+        );
+        let snapshot = snapshot_of(&plan)?;
         assert_eq!(snapshot.nodes[0].status, PlanNodeStatus::Completed);
         assert_eq!(snapshot.nodes[0].evidence.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_on_job_completed_on_a_ready_node_attaches_nothing() {
-        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)]);
+    fn test_on_job_completed_on_a_ready_node_attaches_nothing() -> TestResult {
+        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)])?;
 
         match PlanJobBridge::on_job_completed(
             &plan,
@@ -1192,27 +1212,34 @@ mod tests {
             Err(PlanBridgeError::Plan(PlanError::BatchActionRejected { index, .. })) => {
                 assert_eq!(index, 1, "der Statuswechsel muss scheitern");
             }
-            other => panic!("erwartet BatchActionRejected, bekommen: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet BatchActionRejected, bekommen: {other:?}"
+                )));
+            }
         }
-        let snapshot = snapshot_of(&plan);
-        assert!(snapshot.nodes[0].evidence.is_empty(), "Evidenz trotz Abbruch angehängt");
+        let snapshot = snapshot_of(&plan)?;
+        assert!(
+            snapshot.nodes[0].evidence.is_empty(),
+            "Evidenz trotz Abbruch angehängt"
+        );
         assert_eq!(snapshot.nodes[0].status, PlanNodeStatus::Ready);
+        Ok(())
     }
 
     #[test]
-    fn test_on_job_failed_twice_is_a_noop() {
-        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)]);
+    fn test_on_job_failed_twice_is_a_noop() -> TestResult {
+        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)])?;
         for round in 0..2 {
-            if let Err(error) = PlanJobBridge::on_job_failed(
-                &plan,
-                &TaskId::new("t-1"),
-                "work-x",
-                "rot",
-                "runtime",
-            ) {
-                panic!("on_job_failed Runde {round}: {error}");
-            }
+            PlanJobBridge::on_job_failed(&plan, &TaskId::new("t-1"), "work-x", "rot", "runtime")
+                .map_err(|error| {
+                    TestError::Unexpected(format!("on_job_failed Runde {round}: {error}"))
+                })?;
         }
-        assert_eq!(snapshot_of(&plan).nodes[0].status, PlanNodeStatus::Invalidated);
+        assert_eq!(
+            snapshot_of(&plan)?.nodes[0].status,
+            PlanNodeStatus::Invalidated
+        );
+        Ok(())
     }
 }

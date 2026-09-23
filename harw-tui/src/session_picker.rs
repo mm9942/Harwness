@@ -403,7 +403,13 @@ impl SessionPicker {
 
     /// Baut die Spans für eine einzelne Listenzeile (Marker, Relativzeit,
     /// Titel, optionales Suffix aus Turns/Projekt-Label).
-    fn build_row_line(&self, entry: &SessionEntry, is_selected: bool, width: usize, theme: Theme) -> Line<'static> {
+    fn build_row_line(
+        &self,
+        entry: &SessionEntry,
+        is_selected: bool,
+        width: usize,
+        theme: Theme,
+    ) -> Line<'static> {
         let marker_style = if is_selected {
             style::selected_style(theme)
         } else {
@@ -672,7 +678,10 @@ mod tests {
             picker.handle_key(make_key(KeyCode::Char(c)));
         }
         assert!(picker.filtered.is_empty());
-        assert_eq!(picker.handle_key(make_key(KeyCode::Enter)), PickerAction::Stay);
+        assert_eq!(
+            picker.handle_key(make_key(KeyCode::Enter)),
+            PickerAction::Stay
+        );
     }
 
     /// `Esc` löscht zuerst einen nicht-leeren Filter, danach erst `Cancel`.

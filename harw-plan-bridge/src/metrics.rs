@@ -373,11 +373,12 @@ pub fn record_apply_side_effects(sink: &dyn TelemetrySink, steps: &[ReconcileSte
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{
-        RecordingSink, coding_node, covered_goal_fixture, node_with, plan_with,
+    use crate::test_support::{TestError, TestResult};
+    use crate::testing::{RecordingSink, coding_node, covered_goal_fixture, node_with, plan_with};
+    use harw_plan::{
+        EvidenceKind, EvidenceRef, InvalidationCondition, PathOrSymbol, PlanNodeKind,
+        PlanNodeStatus, TaskId,
     };
-    use harw_plan::{EvidenceKind, EvidenceRef, InvalidationCondition, PathOrSymbol, PlanNodeKind,
-        PlanNodeStatus, TaskId};
 
     fn evidence(locator: &str) -> EvidenceRef {
         EvidenceRef {
@@ -408,10 +409,7 @@ mod tests {
         assert!(matches!(recorded[0].value, MetricValue::Count(1)));
         assert_eq!(recorded[0].labels.len(), 1);
         assert_eq!(recorded[0].labels[0].0.as_str(), "step");
-        assert_eq!(
-            recorded[0].labels[0].1,
-            FieldValue::Str("mark_ready")
-        );
+        assert_eq!(recorded[0].labels[0].1, FieldValue::Str("mark_ready"));
         assert_eq!(recorded[1].labels[0].1, FieldValue::Str("ask_model"));
     }
 
@@ -439,9 +437,9 @@ mod tests {
     }
 
     #[test]
-    fn test_record_goal_age_days_computes_days_since_created_at() {
+    fn test_record_goal_age_days_computes_days_since_created_at() -> TestResult {
         let sink = RecordingSink::new();
-        let (_plan, goal) = covered_goal_fixture();
+        let (_plan, goal) = covered_goal_fixture()?;
         let now = goal.created_at + time::Duration::days(7);
 
         record_goal_age_days(&sink, &goal, now);
@@ -449,24 +447,26 @@ mod tests {
         let recorded = sink.values_for(GOAL_AGE_DAYS.name);
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].value, MetricValue::Gauge(7.0));
+        Ok(())
     }
 
     #[test]
-    fn test_record_goal_age_days_never_goes_negative() {
+    fn test_record_goal_age_days_never_goes_negative() -> TestResult {
         let sink = RecordingSink::new();
-        let (_plan, goal) = covered_goal_fixture();
+        let (_plan, goal) = covered_goal_fixture()?;
         let earlier = goal.created_at - time::Duration::days(3);
 
         record_goal_age_days(&sink, &goal, earlier);
 
         let recorded = sink.values_for(GOAL_AGE_DAYS.name);
         assert_eq!(recorded[0].value, MetricValue::Gauge(0.0));
+        Ok(())
     }
 
     #[test]
-    fn test_record_goal_coverage_is_between_zero_and_one() {
+    fn test_record_goal_coverage_is_between_zero_and_one() -> TestResult {
         let sink = RecordingSink::new();
-        let (plan, goal) = covered_goal_fixture();
+        let (plan, goal) = covered_goal_fixture()?;
 
         record_goal_coverage(&sink, &goal, &plan);
 
@@ -474,11 +474,19 @@ mod tests {
         assert_eq!(recorded.len(), 1);
         match recorded[0].value {
             MetricValue::Gauge(value) => {
-                assert!((0.0..=1.0).contains(&value), "coverage außerhalb [0,1]: {value}");
+                assert!(
+                    (0.0..=1.0).contains(&value),
+                    "coverage außerhalb [0,1]: {value}"
+                );
                 assert_eq!(value, 1.0, "die Fixture ist vollständig belegt");
             }
-            other => panic!("erwartet Gauge, bekommen: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Gauge, bekommen: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
@@ -514,15 +522,12 @@ mod tests {
     }
 
     #[test]
-    fn test_no_emitted_label_contains_a_node_title_a_path_or_free_text() {
+    fn test_no_emitted_label_contains_a_node_title_a_path_or_free_text() -> TestResult {
         let sink = RecordingSink::new();
-        let mut sensitive_node = coding_node(
-            "t-super-geheimes-projekt",
-            PlanNodeStatus::Draft,
-        );
+        let mut sensitive_node = coding_node("t-super-geheimes-projekt", PlanNodeStatus::Draft);
         sensitive_node.write_scope = vec![PathOrSymbol::new("secrets/customer-42/keys.pem")];
         sensitive_node.objective = "Migriere den Kundenschlüssel für Kunde ACME".to_owned();
-        let plan = plan_with(vec![sensitive_node]);
+        let plan = plan_with(vec![sensitive_node])?;
 
         let steps = vec![
             ReconcileStep::ProposeExpand {
@@ -536,7 +541,7 @@ mod tests {
 
         record_reconcile_steps(&sink, &steps);
         record_proposals_pending(&sink, &steps);
-        let (_plan_unused, goal) = covered_goal_fixture();
+        let (_plan_unused, goal) = covered_goal_fixture()?;
         record_goal_age_days(&sink, &goal, goal.created_at);
         record_goal_coverage(&sink, &goal, &plan);
 
@@ -560,9 +565,14 @@ mod tests {
                         KNOWN_STEP_LABELS.contains(text),
                         "Label trägt keinen bekannten Schrittnamen: {text}"
                     ),
-                    other => panic!("erwartet FieldValue::Str, bekommen: {other:?}"),
+                    other => {
+                        return Err(TestError::Unexpected(format!(
+                            "erwartet FieldValue::Str, bekommen: {other:?}"
+                        )));
+                    }
                 }
             }
         }
+        Ok(())
     }
 }

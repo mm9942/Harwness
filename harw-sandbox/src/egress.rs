@@ -408,6 +408,7 @@ fn v6_is_private_or_special(addr: Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     const BACKSLASH_AT: &str = "https://evil.com\\@docs.rs/";
     const BACKSLASH_DOT: &str = "https://evil.com\\.docs.rs/";
@@ -416,15 +417,19 @@ mod tests {
         EgressUrl::parse(input)
     }
 
-    fn host_of(input: &str) -> String {
+    fn host_of(input: &str) -> TestResult<String> {
         match parse(input) {
-            Ok(url) => url.host_str(),
-            Err(err) => panic!("{input:?} muss parsebar sein: {err:?}"),
+            Ok(url) => Ok(url.host_str()),
+            Err(err) => Err(TestError::Unexpected(format!(
+                "{input:?} muss parsebar sein: {err:?}"
+            ))),
         }
     }
 
-    fn ip(raw: &str) -> EgressHost {
-        EgressHost::Ip(raw.parse().expect("gültige Testadresse"))
+    fn ip(raw: &str) -> TestResult<EgressHost> {
+        raw.parse()
+            .map(EgressHost::Ip)
+            .map_err(|_| TestError::Unexpected(format!("{raw:?} ist keine gültige Testadresse")))
     }
 
     fn domain(name: &str) -> EgressHost {
@@ -434,42 +439,53 @@ mod tests {
     // --- Parser-Differenzen (F-002) -----------------------------------------
 
     #[test]
-    fn backslash_before_at_ends_authority() {
-        let host = host_of(BACKSLASH_AT);
+    fn backslash_before_at_ends_authority() -> TestResult {
+        let host = host_of(BACKSLASH_AT)?;
         assert_eq!(host, "evil.com");
         assert!(!host_matches_suffix("docs.rs", &host));
+        Ok(())
     }
 
     #[test]
-    fn backslash_before_dot_suffix_ends_authority() {
-        let host = host_of(BACKSLASH_DOT);
+    fn backslash_before_dot_suffix_ends_authority() -> TestResult {
+        let host = host_of(BACKSLASH_DOT)?;
         assert_eq!(host, "evil.com");
         assert!(!host_matches_suffix("docs.rs", &host));
+        Ok(())
     }
 
     #[test]
-    fn as_url_host_agrees_with_checked_host() {
-        let url = parse(BACKSLASH_AT).unwrap();
+    fn as_url_host_agrees_with_checked_host() -> TestResult {
+        let url =
+            parse(BACKSLASH_AT).map_err(ctx("as_url_host_agrees_with_checked_host: parse"))?;
         assert_eq!(url.as_url().host_str(), Some("evil.com"));
+        Ok(())
     }
 
     // --- IPv6 (F-167) -------------------------------------------------------
 
     #[test]
-    fn ipv6_literal_with_port() {
-        let url = parse("https://[::1]:8080/").unwrap();
-        assert_eq!(url.host(), &ip("::1"));
+    fn ipv6_literal_with_port() -> TestResult {
+        let url = parse("https://[::1]:8080/").map_err(ctx("ipv6_literal_with_port: parse"))?;
+        assert_eq!(url.host(), &ip("::1")?);
         assert_eq!(url.host_str(), "::1");
         assert_eq!(url.port(), 8080);
         assert!(url.is_https());
         assert!(url.host().is_loopback());
+        Ok(())
     }
 
     #[test]
-    fn ipv4_whatwg_shorthand_becomes_address() {
-        let loopback = ip("127.0.0.1");
-        assert_eq!(parse("http://0x7f.1/").unwrap().host(), &loopback);
-        assert_eq!(parse("http://2130706433/").unwrap().host(), &loopback);
+    fn ipv4_whatwg_shorthand_becomes_address() -> TestResult {
+        let loopback = ip("127.0.0.1")?;
+        let a = parse("http://0x7f.1/")
+            .map_err(ctx("ipv4_whatwg_shorthand_becomes_address: parse 0x7f.1"))?;
+        let b = parse("http://2130706433/").map_err(ctx(
+            "ipv4_whatwg_shorthand_becomes_address: parse 2130706433",
+        ))?;
+        assert_eq!(a.host(), &loopback);
+        assert_eq!(b.host(), &loopback);
+        Ok(())
     }
 
     // --- Normalisierung -----------------------------------------------------
@@ -489,50 +505,56 @@ mod tests {
     }
 
     #[test]
-    fn empty_userinfo_marker_is_not_userinfo() {
+    fn empty_userinfo_marker_is_not_userinfo() -> TestResult {
         // WHATWG verwirft ein leeres `@`-Präfix ohne Benutzername und
         // Passwort; es bleibt keine Userinfo übrig.
-        assert_eq!(host_of("https://:@docs.rs/"), "docs.rs");
+        assert_eq!(host_of("https://:@docs.rs/")?, "docs.rs");
+        Ok(())
     }
 
     #[test]
-    fn idna_becomes_punycode() {
-        assert_eq!(host_of("https://bücher.de/"), "xn--bcher-kva.de");
-        assert_eq!(host_of("https://BÜCHER.de/"), "xn--bcher-kva.de");
+    fn idna_becomes_punycode() -> TestResult {
+        assert_eq!(host_of("https://bücher.de/")?, "xn--bcher-kva.de");
+        assert_eq!(host_of("https://BÜCHER.de/")?, "xn--bcher-kva.de");
+        Ok(())
     }
 
     #[test]
-    fn trailing_dot_is_removed() {
+    fn trailing_dot_is_removed() -> TestResult {
         let invalid = Err(EgressUrlError::InvalidHost);
-        assert_eq!(host_of("https://docs.rs./x"), "docs.rs");
+        assert_eq!(host_of("https://docs.rs./x")?, "docs.rs");
         assert_eq!(parse("https://docs.rs../"), invalid);
         assert_eq!(parse("https://a..b/"), invalid);
+        Ok(())
     }
 
     #[test]
-    fn uppercase_is_lowered() {
-        let url = parse("HTTPS://Docs.RS:8443/Path").unwrap();
+    fn uppercase_is_lowered() -> TestResult {
+        let url = parse("HTTPS://Docs.RS:8443/Path").map_err(ctx("uppercase_is_lowered: parse"))?;
         assert_eq!(url.host_str(), "docs.rs");
         assert_eq!(url.port(), 8443);
         assert!(url.is_https());
+        Ok(())
     }
 
     #[test]
-    fn percent_encoded_host_is_decoded() {
-        assert_eq!(host_of("https://%64ocs.rs/"), "docs.rs");
+    fn percent_encoded_host_is_decoded() -> TestResult {
+        assert_eq!(host_of("https://%64ocs.rs/")?, "docs.rs");
         // Ein kodierter Schrägstrich bleibt ein verbotenes Host-Zeichen.
         let encoded_slash = parse("https://evil.com%2F.docs.rs/");
         assert_eq!(encoded_slash, Err(EgressUrlError::Parse));
+        Ok(())
     }
 
     #[test]
-    fn default_ports() {
-        let http = parse("http://docs.rs/").unwrap();
-        let https = parse("https://docs.rs/").unwrap();
+    fn default_ports() -> TestResult {
+        let http = parse("http://docs.rs/").map_err(ctx("default_ports: parse http"))?;
+        let https = parse("https://docs.rs/").map_err(ctx("default_ports: parse https"))?;
         assert_eq!(http.port(), 80);
         assert_eq!(https.port(), 443);
         assert!(!http.is_https());
         assert!(https.is_https());
+        Ok(())
     }
 
     #[test]
@@ -547,21 +569,26 @@ mod tests {
     }
 
     #[test]
-    fn error_display_does_not_echo_input() {
-        let text = parse("https://geheim:passwort@docs.rs/")
-            .unwrap_err()
-            .to_string();
+    fn error_display_does_not_echo_input() -> TestResult {
+        let Err(err) = parse("https://geheim:passwort@docs.rs/") else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        let text = err.to_string();
         assert!(!text.contains("geheim"), "{text}");
         assert!(!text.contains("passwort"), "{text}");
 
-        let scheme = parse("gopher://docs.rs/").unwrap_err().to_string();
+        let Err(err) = parse("gopher://docs.rs/") else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        let scheme = err.to_string();
         assert!(!scheme.contains("gopher"), "{scheme}");
+        Ok(())
     }
 
     // --- Klassifikation -----------------------------------------------------
 
     #[test]
-    fn classification_table() {
+    fn classification_table() -> TestResult {
         let special = [
             "127.0.0.1",
             "0.0.0.0",
@@ -604,7 +631,7 @@ mod tests {
             "2002:808:808::1",
         ];
         for raw in special {
-            let host = ip(raw);
+            let host = ip(raw)?;
             assert!(host.is_private_or_special(), "{raw} muss speziell sein");
         }
 
@@ -629,13 +656,14 @@ mod tests {
             "::fffe:0:a00:1",
         ];
         for raw in public {
-            let host = ip(raw);
+            let host = ip(raw)?;
             assert!(!host.is_private_or_special(), "{raw} muss öffentlich sein");
         }
+        Ok(())
     }
 
     #[test]
-    fn loopback_classification() {
+    fn loopback_classification() -> TestResult {
         assert!(domain("localhost").is_loopback());
         assert!(domain("api.localhost").is_loopback());
         assert!(!domain("notlocalhost").is_loopback());
@@ -664,14 +692,16 @@ mod tests {
         }
         // Schnittpunkt mitten in `ö`: kein Panic, kein Treffer.
         assert!(!domain("äölocalhost").is_loopback());
-        assert!(ip("127.8.9.10").is_loopback());
-        assert!(ip("::ffff:127.0.0.1").is_loopback());
-        assert!(!ip("10.0.0.1").is_loopback());
-        assert_eq!(host_of("http://LOCALHOST./"), "localhost");
+        assert!(ip("127.8.9.10")?.is_loopback());
+        assert!(ip("::ffff:127.0.0.1")?.is_loopback());
+        assert!(!ip("10.0.0.1")?.is_loopback());
+        assert_eq!(host_of("http://LOCALHOST./")?, "localhost");
 
-        let mapped = parse("http://[::ffff:10.0.0.1]/").unwrap();
+        let mapped =
+            parse("http://[::ffff:10.0.0.1]/").map_err(ctx("loopback_classification: parse"))?;
         assert!(mapped.host().is_private_or_special());
         assert!(!mapped.host().is_loopback());
+        Ok(())
     }
 
     // --- Suffix-Regel -------------------------------------------------------

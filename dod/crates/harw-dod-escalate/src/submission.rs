@@ -191,16 +191,21 @@ impl TriageSubmission {
 #[cfg(test)]
 mod tests {
     use super::{SubmissionError, TRIAGE_SUBMISSION_VERSION, TriageSubmission};
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_dod_signals::{SecurityVerdict, Severity, VerdictClassification};
     use harw_types::{ContentDigest, FindingId};
 
-    fn finding(id: &str) -> FindingId {
-        FindingId::try_from_str(id).expect("non-empty id")
+    fn finding(id: &str) -> TestResult<FindingId> {
+        FindingId::try_from_str(id).map_err(ctx("non-empty id"))
     }
 
-    fn verdict_for(id: &str, digest: ContentDigest, rationale: &str) -> SecurityVerdict {
-        SecurityVerdict::new(
-            finding(id),
+    fn verdict_for(
+        id: &str,
+        digest: ContentDigest,
+        rationale: &str,
+    ) -> TestResult<SecurityVerdict> {
+        Ok(SecurityVerdict::new(
+            finding(id)?,
             digest,
             VerdictClassification::Confirmed,
             Severity::High,
@@ -208,84 +213,101 @@ mod tests {
             None,
             "security-triage".to_owned(),
             jiff::Timestamp::UNIX_EPOCH,
-        )
+        ))
     }
 
     #[test]
-    fn test_new_accepts_bound_verdict_and_sets_version() {
+    fn test_new_accepts_bound_verdict_and_sets_version() -> TestResult {
         let digest = ContentDigest::of(b"record");
         let submission =
-            TriageSubmission::new(finding("f-1"), digest, verdict_for("f-1", digest, "ok")).unwrap();
+            TriageSubmission::new(finding("f-1")?, digest, verdict_for("f-1", digest, "ok")?)
+                .map_err(ctx("submission builds"))?;
         assert_eq!(submission.version(), TRIAGE_SUBMISSION_VERSION);
-        assert_eq!(submission.finding(), &finding("f-1"));
+        assert_eq!(submission.finding(), &finding("f-1")?);
         assert_eq!(submission.finding_digest(), digest);
-        assert_eq!(submission.verdict().finding(), &finding("f-1"));
+        assert_eq!(submission.verdict().finding(), &finding("f-1")?);
+        Ok(())
     }
 
     #[test]
-    fn test_new_rejects_verdict_for_other_finding_or_digest() {
+    fn test_new_rejects_verdict_for_other_finding_or_digest() -> TestResult {
         let digest = ContentDigest::of(b"record");
         let other = ContentDigest::of(b"other");
         assert!(matches!(
-            TriageSubmission::new(finding("f-1"), digest, verdict_for("f-2", digest, "ok")),
+            TriageSubmission::new(finding("f-1")?, digest, verdict_for("f-2", digest, "ok")?),
             Err(SubmissionError::BindingMismatch)
         ));
         assert!(matches!(
-            TriageSubmission::new(finding("f-1"), digest, verdict_for("f-1", other, "ok")),
+            TriageSubmission::new(finding("f-1")?, digest, verdict_for("f-1", other, "ok")?),
             Err(SubmissionError::BindingMismatch)
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_empty_rationale() {
+    fn test_validate_rejects_empty_rationale() -> TestResult {
         let digest = ContentDigest::of(b"record");
         assert!(matches!(
-            TriageSubmission::new(finding("f-1"), digest, verdict_for("f-1", digest, "  ")),
+            TriageSubmission::new(finding("f-1")?, digest, verdict_for("f-1", digest, "  ")?),
             Err(SubmissionError::InvalidVerdict)
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_binds_requires_spool_record_identity_and_digest() {
+    fn test_binds_requires_spool_record_identity_and_digest() -> TestResult {
         let digest = ContentDigest::of(b"record");
         let submission =
-            TriageSubmission::new(finding("f-1"), digest, verdict_for("f-1", digest, "ok")).unwrap();
-        assert!(submission.binds(&finding("f-1"), digest).is_ok());
+            TriageSubmission::new(finding("f-1")?, digest, verdict_for("f-1", digest, "ok")?)
+                .map_err(ctx("submission builds"))?;
+        assert!(submission.binds(&finding("f-1")?, digest).is_ok());
         assert!(matches!(
-            submission.binds(&finding("f-1"), ContentDigest::of(b"tampered record")),
+            submission.binds(&finding("f-1")?, ContentDigest::of(b"tampered record")),
             Err(SubmissionError::BindingMismatch)
         ));
         assert!(matches!(
-            submission.binds(&finding("f-9"), digest),
+            submission.binds(&finding("f-9")?, digest),
             Err(SubmissionError::BindingMismatch)
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_serde_roundtrip_and_deserialized_values_are_revalidated() {
+    fn test_serde_roundtrip_and_deserialized_values_are_revalidated() -> TestResult {
         let digest = ContentDigest::of(b"record");
         let submission =
-            TriageSubmission::new(finding("f-1"), digest, verdict_for("f-1", digest, "ok")).unwrap();
-        let json = serde_json::to_value(&submission).unwrap();
-        let back: TriageSubmission = serde_json::from_value(json.clone()).unwrap();
+            TriageSubmission::new(finding("f-1")?, digest, verdict_for("f-1", digest, "ok")?)
+                .map_err(ctx("submission builds"))?;
+        let json = serde_json::to_value(&submission).map_err(ctx("submission serializes"))?;
+        let back: TriageSubmission =
+            serde_json::from_value(json.clone()).map_err(ctx("submission roundtrips"))?;
         assert_eq!(back, submission);
 
         let mut wrong_version = json.clone();
         wrong_version["version"] = serde_json::Value::from(2);
-        let back: TriageSubmission = serde_json::from_value(wrong_version).unwrap();
-        assert!(matches!(back.validate(), Err(SubmissionError::UnsupportedVersion(2))));
+        let back: TriageSubmission = serde_json::from_value(wrong_version)
+            .map_err(ctx("wrong-version value deserializes"))?;
+        assert!(matches!(
+            back.validate(),
+            Err(SubmissionError::UnsupportedVersion(2))
+        ));
 
         let mut swapped = json.clone();
         swapped["finding"] = serde_json::Value::from("f-2");
-        let back: TriageSubmission = serde_json::from_value(swapped).unwrap();
-        assert!(matches!(back.validate(), Err(SubmissionError::BindingMismatch)));
+        let back: TriageSubmission =
+            serde_json::from_value(swapped).map_err(ctx("swapped-finding value deserializes"))?;
+        assert!(matches!(
+            back.validate(),
+            Err(SubmissionError::BindingMismatch)
+        ));
 
         let mut extra = json;
         extra
             .as_object_mut()
-            .unwrap()
+            .ok_or(TestError::Missing("json object"))?
             .insert("action".to_owned(), serde_json::Value::from("kill"));
         assert!(serde_json::from_value::<TriageSubmission>(extra).is_err());
+        Ok(())
     }
 
     #[test]

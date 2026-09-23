@@ -8,6 +8,9 @@
 //! (b) the module layout makes sense from a consumer perspective, and
 //! (c) the ergonomics of `harw::prelude::*` are acceptable.
 
+mod common;
+
+use common::{TestResult, ctx};
 use harw::prelude::*;
 
 // TOML fixture copied from harw-agent-dsl/src/raw.rs unit tests (minimal shape).
@@ -32,7 +35,7 @@ specialization = "sdk-example"
 /// 7. Parse a minimal agent TOML using `harw::agent::parse::parse_toml`.
 /// 8. Assert the resulting `RawAgentDefinition` carries the expected `id.name`.
 #[test]
-fn sdk_composes_minimal_runnable_setup() {
+fn sdk_composes_minimal_runnable_setup() -> TestResult {
     // ── Step 1: empty registry via prelude type ───────────────────────────────
     let mut registry = OperationRegistry::new();
     assert!(registry.is_empty(), "fresh registry must be empty");
@@ -105,8 +108,9 @@ fn sdk_composes_minimal_runnable_setup() {
     );
 
     // ── Step 6: AssembledRegistry via harw::defaults ──────────────────────────
-    let assembled = harw::defaults::assemble_default_registry(std::env::temp_dir())
-        .expect("assemble_default_registry must succeed with temp_dir as cwd");
+    let assembled = harw::defaults::assemble_default_registry(std::env::temp_dir()).map_err(
+        ctx("assemble_default_registry must succeed with temp_dir as cwd"),
+    )?;
     // Confirm at least one tool provider is present (fs + shell = 5 tools).
     let total_tools: usize = assembled
         .registry
@@ -121,7 +125,7 @@ fn sdk_composes_minimal_runnable_setup() {
 
     // ── Step 7: parse minimal agent TOML via harw::agent::parse ──────────────
     let raw = harw::agent::parse::parse_toml(MINIMAL_AGENT_TOML)
-        .expect("minimal agent TOML must parse without error");
+        .map_err(ctx("minimal agent TOML must parse without error"))?;
 
     // ── Step 8: resulting RawAgentDefinition has the expected id.name ─────────
     assert_eq!(
@@ -132,6 +136,7 @@ fn sdk_composes_minimal_runnable_setup() {
         raw.specialization, "sdk-example",
         "parsed agent specialization must match the fixture"
     );
+    Ok(())
 }
 
 /// SDK example: registry + compiled agent definition + executable runtime context.
@@ -154,30 +159,34 @@ fn sdk_composes_minimal_runnable_setup() {
 ///    from the assembled registry, an unbounded `tokio::sync::mpsc` channel, and
 ///    `harw::types::AgentRole::Assistant`.
 #[tokio::test]
-async fn sdk_example_toml_to_executable_runtime_context() {
+async fn sdk_example_toml_to_executable_runtime_context() -> TestResult {
     // ── Step 1: parse the minimal agent TOML ──────────────────────────────────
     let raw = harw::agent::parse::parse_toml(MINIMAL_AGENT_TOML)
-        .expect("minimal agent TOML must parse without error");
+        .map_err(ctx("minimal agent TOML must parse without error"))?;
 
     // ── Step 2: resolve into a ResolvedAgentDefinition ────────────────────────
     let id = harw::agent::ids::DefinitionId::parse("harwness.agent.sdk-example@1")
-        .expect("DefinitionId::parse must succeed for the fixture id");
+        .map_err(ctx("DefinitionId::parse must succeed for the fixture id"))?;
     let layers = vec![(harw::agent::layers::DefinitionLayer::BuiltIn, raw)];
     let resolved =
         harw::agent::resolve::resolve_definition(&id, &layers, time::OffsetDateTime::now_utc())
-            .expect("resolve_definition must succeed for the minimal fixture");
+            .map_err(ctx(
+                "resolve_definition must succeed for the minimal fixture",
+            ))?;
 
     // ── Step 3: lower into an ExecutableAgentIr ───────────────────────────────
-    let ir: harw::agent::ExecutableAgentIr =
-        harw::agent::lower(&resolved).expect("lower must succeed for the resolved definition");
+    let ir: harw::agent::ExecutableAgentIr = harw::agent::lower(&resolved)
+        .map_err(ctx("lower must succeed for the resolved definition"))?;
     assert_eq!(
-        ir.id().name, "sdk-example",
+        ir.id().name,
+        "sdk-example",
         "lowered ExecutableAgentIr.id().name must match the fixture"
     );
 
     // ── Step 4: assemble a default registry ───────────────────────────────────
-    let assembled = harw::defaults::assemble_default_registry(std::env::temp_dir())
-        .expect("assemble_default_registry must succeed with temp_dir as cwd");
+    let assembled = harw::defaults::assemble_default_registry(std::env::temp_dir()).map_err(
+        ctx("assemble_default_registry must succeed with temp_dir as cwd"),
+    )?;
 
     // ── Step 5: construct an executable runtime context (AgentSession) ───────
     let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -197,4 +206,5 @@ async fn sdk_example_toml_to_executable_runtime_context() {
         !session.id().as_str().is_empty(),
         "constructed AgentSession must have a non-empty generated SessionId"
     );
+    Ok(())
 }

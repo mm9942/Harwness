@@ -119,23 +119,26 @@ async fn attach(ctx: &OpContext, args: AttachArgs) -> Result<OpOutput, OpError> 
 #[cfg(test)]
 mod tests {
     use super::{AttachArgs, attach};
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_job_runtime::{Budget, Job, JobKind, RetryPolicy};
     use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_session_store::JobStore;
     use harw_types::{ApprovalActor, SessionId, TenantId, TurnId, WorkId, WorkspaceId};
     use jiff::Timestamp;
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    fn test_context(store: Option<Arc<JobStore>>) -> (OpContext, PathBuf) {
+    fn test_context(store: Option<Arc<JobStore>>) -> TestResult<(OpContext, PathBuf)> {
         let root = std::env::temp_dir().join(format!(
             "harw-attach-test-{}-{}",
             std::process::id(),
             SessionId::new()
         ));
-        std::fs::create_dir_all(root.join("workspace")).unwrap();
+        std::fs::create_dir_all(root.join("workspace")).map_err(ctx("create test workspace"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -144,13 +147,13 @@ mod tests {
                 root: PathBuf::from("workspace"),
             }],
         )
-        .unwrap();
+        .map_err(ctx("build workspace registry"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("workspace"),
             )
-            .unwrap();
+            .map_err(ctx("resolve workspace binding"))?;
         let sandbox = SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ReadWorkspace]),
@@ -159,13 +162,13 @@ mod tests {
         if let Some(store) = store {
             services.insert(store);
         }
-        (
+        Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, services),
             root,
-        )
+        ))
     }
 
-    fn admitted_record(id: &str) -> harw_job_runtime::StoredJob {
+    fn admitted_record(id: &str) -> TestResult<harw_job_runtime::StoredJob> {
         let now = Timestamp::now();
         let mut job = Job::new(
             WorkId::from_str(id),
@@ -179,8 +182,8 @@ mod tests {
             },
             now,
         );
-        job.mark_ready(now).unwrap();
-        harw_job_runtime::StoredJob {
+        job.mark_ready(now).map_err(ctx("mark_ready"))?;
+        Ok(harw_job_runtime::StoredJob {
             job,
             scope: harw_job_runtime::JobScope::new(
                 TenantId::from_str("test-tenant"),
@@ -198,40 +201,43 @@ mod tests {
             cancellation: None,
             revision: 0,
             trace: None,
-        }
+        })
     }
 
     #[test]
-    fn test_attach_args_from_raw_args_sets_job_id() {
+    fn test_attach_args_from_raw_args_sets_job_id() -> TestResult {
         let args = AttachArgs::from_raw_args(&toks(&["work-attach-42"]));
         match args {
             Ok(a) => assert_eq!(a.job_id.as_deref(), Some("work-attach-42")),
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
+            Err(e) => return Err(TestError::Unexpected(format!("Unerwarteter Fehler: {e}"))),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_attach_args_from_raw_args_empty_tokens_sets_job_id_none() {
+    fn test_attach_args_from_raw_args_empty_tokens_sets_job_id_none() -> TestResult {
         let args = AttachArgs::from_raw_args(&toks(&[]));
         match args {
             Ok(a) => assert!(a.job_id.is_none()),
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
+            Err(e) => return Err(TestError::Unexpected(format!("Unerwarteter Fehler: {e}"))),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn attach_without_job_id_returns_invalid_arguments() {
-        let (ctx, root) = test_context(None);
+    async fn attach_without_job_id_returns_invalid_arguments() -> TestResult {
+        let (ctx, root) = test_context(None)?;
         let result = attach(&ctx, AttachArgs::default()).await;
         assert!(
             matches!(result, Err(OpError::InvalidArguments(message)) if message == "job_id fehlt")
         );
-        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn attach_without_job_store_returns_not_available() {
-        let (ctx, root) = test_context(None);
+    async fn attach_without_job_store_returns_not_available() -> TestResult {
+        let (ctx, root) = test_context(None)?;
         let result = attach(
             &ctx,
             AttachArgs {
@@ -242,21 +248,24 @@ mod tests {
         assert!(
             matches!(result, Err(OpError::NotAvailable(message)) if message == "durable job store is not configured")
         );
-        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn attach_admitted_job_renders_id_state_and_revision() {
+    async fn attach_admitted_job_renders_id_state_and_revision() -> TestResult {
         let (ctx, root) = {
             let store_root = std::env::temp_dir().join(format!(
                 "harw-attach-store-{}-{}",
                 std::process::id(),
                 SessionId::new()
             ));
-            std::fs::create_dir_all(&store_root).unwrap();
+            std::fs::create_dir_all(&store_root).map_err(ctx("create store root"))?;
             let store = Arc::new(JobStore::new(&store_root));
-            store.admit(&admitted_record("work-attach-42")).unwrap();
-            let (ctx, context_root) = test_context(Some(store));
+            store
+                .admit(&admitted_record("work-attach-42")?)
+                .map_err(ctx("admit record"))?;
+            let (ctx, context_root) = test_context(Some(store))?;
             (ctx, (context_root, store_root))
         };
         let result = attach(
@@ -266,9 +275,11 @@ mod tests {
             },
         )
         .await
-        .unwrap();
+        .map_err(crate::test_support::ctx("attach"))?;
         assert_eq!(result.text, "Job work-attach-42\nState: Ready\nRevision: 0");
-        std::fs::remove_dir_all(ctx.sandbox().workspace().canonical_root()).unwrap();
-        std::fs::remove_dir_all(root.1).unwrap();
+        std::fs::remove_dir_all(ctx.sandbox().workspace().canonical_root())
+            .map_err(crate::test_support::ctx("remove workspace root"))?;
+        std::fs::remove_dir_all(root.1).map_err(crate::test_support::ctx("remove store root"))?;
+        Ok(())
     }
 }

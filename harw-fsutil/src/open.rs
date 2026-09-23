@@ -155,7 +155,9 @@ impl OpenMode {
             ));
         }
         if self.truncate && self.append {
-            return Err(invalid_input("OpenMode: truncate und append schließen sich aus"));
+            return Err(invalid_input(
+                "OpenMode: truncate und append schließen sich aus",
+            ));
         }
         if self.create_new {
             flags |= OFlags::CREATE | OFlags::EXCL;
@@ -469,14 +471,18 @@ pub(crate) fn validate_beneath_path(rel: &Path) -> io::Result<Vec<&OsStr>> {
                 return Err(invalid_input("open_beneath: `..` ist nicht erlaubt"));
             }
             Component::RootDir | Component::Prefix(_) => {
-                return Err(invalid_input("open_beneath: absoluter Pfad ist nicht erlaubt"));
+                return Err(invalid_input(
+                    "open_beneath: absoluter Pfad ist nicht erlaubt",
+                ));
             }
         }
     }
     // `components()` verwirft ein abschließendes `/` bzw. `/.`, `openat2` nicht.
     let bytes = rel.as_os_str().as_bytes();
     if bytes.ends_with(b"/") || bytes.ends_with(b"/.") {
-        return Err(invalid_input("open_beneath: abschließendes `/` ist nicht erlaubt"));
+        return Err(invalid_input(
+            "open_beneath: abschließendes `/` ist nicht erlaubt",
+        ));
     }
     Ok(parts)
 }
@@ -489,6 +495,7 @@ pub(crate) fn invalid_input(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use rustix::io::Errno;
     use std::io::{Read, Write};
     use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
@@ -502,112 +509,156 @@ mod tests {
             .any(|errno| err.raw_os_error() == Some(errno.raw_os_error()))
     }
 
-    /// Baut `root/{dir/inner.txt, top.txt, link_file -> top.txt,
-    /// link_dir -> dir, dangling -> fehlt}`.
-    fn fixture() -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path();
-        std::fs::create_dir(root.join("dir")).expect("mkdir");
-        std::fs::write(root.join("dir/inner.txt"), b"inner").expect("write");
-        std::fs::write(root.join("top.txt"), b"top").expect("write");
-        symlink("top.txt", root.join("link_file")).expect("symlink");
-        symlink("dir", root.join("link_dir")).expect("symlink");
-        symlink("fehlt", root.join("dangling")).expect("symlink");
-        tmp
+    /// Wie [`is_errno`], aber liefert einen [`TestError`] statt zu assert!en,
+    /// damit Aufrufer per `?` propagieren können.
+    fn expect_errno(err: &io::Error, candidates: &[Errno]) -> TestResult {
+        if is_errno(err, candidates) {
+            Ok(())
+        } else {
+            Err(TestError::Unexpected(format!("{err:?}")))
+        }
     }
 
-    fn read_all(mut file: File) -> String {
+    /// Baut `root/{dir/inner.txt, top.txt, link_file -> top.txt,
+    /// link_dir -> dir, dangling -> fehlt}`.
+    fn fixture() -> TestResult<tempfile::TempDir> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        std::fs::create_dir(root.join("dir"))?;
+        std::fs::write(root.join("dir/inner.txt"), b"inner")?;
+        std::fs::write(root.join("top.txt"), b"top")?;
+        symlink("top.txt", root.join("link_file"))?;
+        symlink("dir", root.join("link_dir"))?;
+        symlink("fehlt", root.join("dangling"))?;
+        Ok(tmp)
+    }
+
+    fn read_all(mut file: File) -> TestResult<String> {
         let mut text = String::new();
-        file.read_to_string(&mut text).expect("read");
-        text
+        file.read_to_string(&mut text)?;
+        Ok(text)
     }
 
     #[test]
-    fn oflags_validierung_wie_openoptions() {
+    fn oflags_validierung_wie_openoptions() -> TestResult {
         let none = OpenMode {
             read: false,
             ..OpenMode::read_only()
         };
-        assert_eq!(none.oflags().unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let Err(err) = none.oflags() else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
         let trunc_ro = OpenMode {
             truncate: true,
             ..OpenMode::read_only()
         };
-        assert_eq!(trunc_ro.oflags().unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let Err(err) = trunc_ro.oflags() else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
         let trunc_append = OpenMode {
             truncate: true,
             ..OpenMode::append_create(0o600)
         };
-        assert_eq!(trunc_append.oflags().unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let Err(err) = trunc_append.oflags() else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
-        let flags = OpenMode::write_create_new(0o600).oflags().expect("gültig");
+        let flags = OpenMode::write_create_new(0o600)
+            .oflags()
+            .map_err(ctx("gültig"))?;
         let expected = OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::CREATE | OFlags::EXCL;
         assert!(flags.contains(expected));
         assert!(flags.contains(OFlags::WRONLY));
-        let flags = OpenMode::read_only().oflags().expect("gültig");
+        let flags = OpenMode::read_only().oflags().map_err(ctx("gültig"))?;
         assert!(flags.contains(OFlags::NOFOLLOW));
-        assert!(flags.contains(OFlags::NONBLOCK), "R2-10: nie blockierend öffnen");
+        assert!(
+            flags.contains(OFlags::NONBLOCK),
+            "R2-10: nie blockierend öffnen"
+        );
         assert!(!flags.contains(OFlags::CREATE));
+        Ok(())
     }
 
     #[test]
-    fn open_nofollow_liest_regulaere_datei() {
-        let tmp = fixture();
-        let file = open_nofollow(&tmp.path().join("top.txt"), OpenMode::read_only()).expect("open");
-        assert_eq!(read_all(file), "top");
+    fn open_nofollow_liest_regulaere_datei() -> TestResult {
+        let tmp = fixture()?;
+        let file = open_nofollow(&tmp.path().join("top.txt"), OpenMode::read_only())?;
+        assert_eq!(read_all(file)?, "top");
+        Ok(())
     }
 
     #[test]
-    fn open_nofollow_symlink_als_letztes_glied_scheitert() {
-        let tmp = fixture();
-        let err = open_nofollow(&tmp.path().join("link_file"), OpenMode::read_only()).unwrap_err();
-        assert!(is_errno(&err, &[Errno::LOOP]), "{err:?}");
+    fn open_nofollow_symlink_als_letztes_glied_scheitert() -> TestResult {
+        let tmp = fixture()?;
+        let Err(err) = open_nofollow(&tmp.path().join("link_file"), OpenMode::read_only()) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        expect_errno(&err, &[Errno::LOOP])
     }
 
     #[test]
-    fn open_nofollow_legt_nichts_hinter_dangling_symlink_an() {
-        let tmp = fixture();
+    fn open_nofollow_legt_nichts_hinter_dangling_symlink_an() -> TestResult {
+        let tmp = fixture()?;
         let dangling = tmp.path().join("dangling");
-        let err = open_nofollow(&dangling, OpenMode::write_truncate(0o600)).unwrap_err();
-        assert!(is_errno(&err, &[Errno::LOOP, Errno::EXIST]), "{err:?}");
-        let err = open_nofollow(&dangling, OpenMode::write_create_new(0o600)).unwrap_err();
-        assert!(is_errno(&err, &[Errno::LOOP, Errno::EXIST]), "{err:?}");
+        let Err(err) = open_nofollow(&dangling, OpenMode::write_truncate(0o600)) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        expect_errno(&err, &[Errno::LOOP, Errno::EXIST])?;
+        let Err(err) = open_nofollow(&dangling, OpenMode::write_create_new(0o600)) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        expect_errno(&err, &[Errno::LOOP, Errno::EXIST])?;
         assert!(!tmp.path().join("fehlt").exists());
+        Ok(())
     }
 
     #[test]
-    fn open_dir_nofollow_lehnt_symlink_ab() {
-        let tmp = fixture();
-        open_dir_nofollow(&tmp.path().join("dir")).expect("verzeichnis");
-        let err = open_dir_nofollow(&tmp.path().join("link_dir")).unwrap_err();
-        assert!(is_errno(&err, &[Errno::LOOP, Errno::NOTDIR]), "{err:?}");
-        let err = open_dir_nofollow(&tmp.path().join("top.txt")).unwrap_err();
-        assert!(is_errno(&err, &[Errno::NOTDIR]), "{err:?}");
+    fn open_dir_nofollow_lehnt_symlink_ab() -> TestResult {
+        let tmp = fixture()?;
+        open_dir_nofollow(&tmp.path().join("dir")).map_err(ctx("verzeichnis"))?;
+        let Err(err) = open_dir_nofollow(&tmp.path().join("link_dir")) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        expect_errno(&err, &[Errno::LOOP, Errno::NOTDIR])?;
+        let Err(err) = open_dir_nofollow(&tmp.path().join("top.txt")) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        expect_errno(&err, &[Errno::NOTDIR])
     }
 
     /// Gemeinsame Prüfungen für beide `open_beneath`-Pfade.
-    fn check_beneath(open: fn(BorrowedFd<'_>, &Path, OpenMode) -> io::Result<File>) {
-        let tmp = fixture();
-        let root = open_dir_nofollow(tmp.path()).expect("root");
+    fn check_beneath(open: fn(BorrowedFd<'_>, &Path, OpenMode) -> io::Result<File>) -> TestResult {
+        let tmp = fixture()?;
+        let root = open_dir_nofollow(tmp.path())?;
         let root = root.as_fd();
 
-        let file = open(root, Path::new("dir/inner.txt"), OpenMode::read_only()).expect("nested");
-        assert_eq!(read_all(file), "inner");
         let file =
-            open(root, Path::new("./dir/./inner.txt"), OpenMode::read_only()).expect("curdir");
-        assert_eq!(read_all(file), "inner");
+            open(root, Path::new("dir/inner.txt"), OpenMode::read_only()).map_err(ctx("nested"))?;
+        assert_eq!(read_all(file)?, "inner");
+        let file = open(root, Path::new("./dir/./inner.txt"), OpenMode::read_only())
+            .map_err(ctx("curdir"))?;
+        assert_eq!(read_all(file)?, "inner");
 
         // Symlink als letztes Glied.
-        let err = open(root, Path::new("link_file"), OpenMode::read_only()).unwrap_err();
-        assert!(is_errno(&err, &[Errno::LOOP]), "{err:?}");
+        let Err(err) = open(root, Path::new("link_file"), OpenMode::read_only()) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        expect_errno(&err, &[Errno::LOOP])?;
         // Symlink als mittleres Glied.
-        let err = open(root, Path::new("link_dir/inner.txt"), OpenMode::read_only()).unwrap_err();
-        assert!(is_errno(&err, &[Errno::LOOP, Errno::NOTDIR]), "{err:?}");
+        let Err(err) = open(root, Path::new("link_dir/inner.txt"), OpenMode::read_only()) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        expect_errno(&err, &[Errno::LOOP, Errno::NOTDIR])?;
         // Dangling Symlink mit Anlegen: nichts wird angelegt.
-        let err = open(root, Path::new("dangling"), OpenMode::write_truncate(0o600)).unwrap_err();
-        assert!(is_errno(&err, &[Errno::LOOP, Errno::EXIST]), "{err:?}");
+        let Err(err) = open(root, Path::new("dangling"), OpenMode::write_truncate(0o600)) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        expect_errno(&err, &[Errno::LOOP, Errno::EXIST])?;
         assert!(!tmp.path().join("fehlt").exists());
 
         // `..`, absolute Pfade und (R2-04) abschließendes `/` bzw. `/.` —
@@ -626,51 +677,58 @@ mod tests {
             "dir/inner.txt/",
         ];
         for bad in bad_paths {
-            let err = open(root, Path::new(bad), OpenMode::read_only()).unwrap_err();
+            let Err(err) = open(root, Path::new(bad), OpenMode::read_only()) else {
+                return Err(TestError::Unexpected(format!("Err erwartet für {bad:?}")));
+            };
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
         }
         // Ohne abschließendes `/` bleiben Verzeichnis und Wurzel öffenbar.
-        let dir = open(root, Path::new("dir"), OpenMode::read_only()).expect("dir");
-        assert!(dir.metadata().expect("meta").is_dir());
-        let dot = open(root, Path::new("."), OpenMode::read_only()).expect("wurzel");
-        assert!(dot.metadata().expect("meta").is_dir());
-        let file = open(root, Path::new("dir//./inner.txt"), OpenMode::read_only()).expect("mitte");
-        assert_eq!(read_all(file), "inner");
+        let dir = open(root, Path::new("dir"), OpenMode::read_only()).map_err(ctx("dir"))?;
+        assert!(dir.metadata().map_err(ctx("meta"))?.is_dir());
+        let dot = open(root, Path::new("."), OpenMode::read_only()).map_err(ctx("wurzel"))?;
+        assert!(dot.metadata().map_err(ctx("meta"))?.is_dir());
+        let file = open(root, Path::new("dir//./inner.txt"), OpenMode::read_only())
+            .map_err(ctx("mitte"))?;
+        assert_eq!(read_all(file)?, "inner");
 
         // Anlegen unterhalb der Wurzel mit Rechten ohne Gruppe/Andere.
         let neu = OpenMode::write_create_new(0o600);
-        let mut file = open(root, Path::new("dir/neu.txt"), neu).expect("create");
-        file.write_all(b"neu").expect("write");
-        let meta = std::fs::symlink_metadata(tmp.path().join("dir/neu.txt")).expect("meta");
+        let mut file = open(root, Path::new("dir/neu.txt"), neu).map_err(ctx("create"))?;
+        file.write_all(b"neu")?;
+        let meta = std::fs::symlink_metadata(tmp.path().join("dir/neu.txt"))?;
         assert!(meta.is_file());
         assert_eq!(meta.permissions().mode() & 0o077, 0);
-        let err = open(root, Path::new("dir/neu.txt"), neu).unwrap_err();
-        assert!(is_errno(&err, &[Errno::EXIST]), "{err:?}");
+        let Err(err) = open(root, Path::new("dir/neu.txt"), neu) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        expect_errno(&err, &[Errno::EXIST])
     }
 
     #[test]
-    fn open_beneath_oeffentlicher_pfad() {
-        check_beneath(open_beneath);
+    fn open_beneath_oeffentlicher_pfad() -> TestResult {
+        check_beneath(open_beneath)
     }
 
     #[test]
-    fn open_beneath_enosys_fallback_komponentenweise() {
-        check_beneath(open_beneath_componentwise);
+    fn open_beneath_enosys_fallback_komponentenweise() -> TestResult {
+        check_beneath(open_beneath_componentwise)
     }
 
     #[test]
-    fn fallback_punkt_oeffnet_wurzel() {
-        let tmp = fixture();
-        let root = open_dir_nofollow(tmp.path()).expect("root");
+    fn fallback_punkt_oeffnet_wurzel() -> TestResult {
+        let tmp = fixture()?;
+        let root = open_dir_nofollow(tmp.path())?;
         let dot = Path::new(".");
-        let file =
-            open_beneath_componentwise(root.as_fd(), dot, OpenMode::read_only()).expect("wurzel");
-        assert!(file.metadata().expect("meta").is_dir());
+        let file = open_beneath_componentwise(root.as_fd(), dot, OpenMode::read_only())
+            .map_err(ctx("wurzel"))?;
+        assert!(file.metadata().map_err(ctx("meta"))?.is_dir());
+        Ok(())
     }
 
     /// Führt `f` in einem eigenen Thread aus. Blockiert es länger als 10 s,
-    /// schlägt der Test fehl, statt die ganze Testsuite aufzuhängen.
-    fn within_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    /// schlägt der Test mit einem `Err` fehl, statt die ganze Testsuite
+    /// aufzuhängen.
+    fn within_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> TestResult<T> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             // Der Empfänger existiert nach einem Timeout nicht mehr; dann ist
@@ -678,7 +736,7 @@ mod tests {
             let _ = tx.send(f());
         });
         rx.recv_timeout(std::time::Duration::from_secs(10))
-            .expect("Öffnen blockiert (FIFO ohne O_NONBLOCK?)")
+            .map_err(ctx("Öffnen blockiert (FIFO ohne O_NONBLOCK?)"))
     }
 
     /// Erfolg wird zu `None`, ein Fehler zu seiner `ErrorKind`.
@@ -700,90 +758,103 @@ mod tests {
 
     /// R2-10: Ein FIFO als letztes Glied blockiert nicht und wird abgelehnt.
     #[test]
-    fn fifo_blockiert_nicht_und_wird_abgelehnt() {
-        let tmp = fixture();
+    fn fifo_blockiert_nicht_und_wird_abgelehnt() -> TestResult {
+        let tmp = fixture()?;
         let fifo = tmp.path().join("fifo");
         if !make_fifo(&fifo) {
-            return;
+            return Ok(());
         }
         let invalid = Some(io::ErrorKind::InvalidInput);
 
         let path = fifo.clone();
-        let ro = within_timeout(move || outcome(open_nofollow(&path, OpenMode::read_only())));
+        let ro = within_timeout(move || outcome(open_nofollow(&path, OpenMode::read_only())))?;
         assert_eq!(ro, invalid);
         let path = fifo.clone();
-        let rw = within_timeout(move || outcome(open_nofollow(&path, OpenMode::read_write())));
+        let rw = within_timeout(move || outcome(open_nofollow(&path, OpenMode::read_write())))?;
         assert_eq!(rw, invalid);
         // Schreiben ohne Leser: `ENXIO` statt Warten.
         let path = fifo.clone();
         let write = OpenMode::write_truncate(0o600);
-        let wo = within_timeout(move || outcome(open_nofollow(&path, write)));
+        let wo = within_timeout(move || outcome(open_nofollow(&path, write)))?;
         assert!(wo.is_some(), "Schreib-Öffnen eines FIFOs muss scheitern");
 
-        let openers: [Opener; 2] =
-            [open_beneath, open_beneath_componentwise];
+        let openers: [Opener; 2] = [open_beneath, open_beneath_componentwise];
         for open in openers {
             let root_path = tmp.path().to_path_buf();
-            let result = within_timeout(move || {
-                let root = open_dir_nofollow(&root_path).expect("root");
-                outcome(open(root.as_fd(), Path::new("fifo"), OpenMode::read_only()))
-            });
+            let result = within_timeout(move || -> TestResult<Option<io::ErrorKind>> {
+                let root = open_dir_nofollow(&root_path).map_err(ctx("root"))?;
+                Ok(outcome(open(
+                    root.as_fd(),
+                    Path::new("fifo"),
+                    OpenMode::read_only(),
+                )))
+            })??;
             assert_eq!(result, invalid);
         }
-        assert!(std::fs::symlink_metadata(&fifo).expect("meta").file_type().is_fifo());
+        assert!(std::fs::symlink_metadata(&fifo)?.file_type().is_fifo());
+        Ok(())
     }
 
     /// R2-10: Geräte werden ebenfalls abgelehnt.
     #[test]
-    fn zeichengeraet_wird_abgelehnt() {
+    fn zeichengeraet_wird_abgelehnt() -> TestResult {
         let null = Path::new("/dev/null");
         if !null.exists() {
             eprintln!("übersprungen: /dev/null fehlt");
-            return;
+            return Ok(());
         }
-        let err = open_nofollow(null, OpenMode::read_only()).unwrap_err();
+        let Err(err) = open_nofollow(null, OpenMode::read_only()) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        Ok(())
     }
 
     /// R2-10: Zurückgegebene Deskriptoren sind wieder blockierend; `O_APPEND`
     /// bleibt beim Entfernen von `O_NONBLOCK` erhalten.
     #[test]
-    fn nonblock_wird_nach_dem_oeffnen_entfernt() {
-        let tmp = fixture();
-        let file = open_nofollow(&tmp.path().join("top.txt"), OpenMode::read_only()).expect("open");
-        let status = rustix::fs::fcntl_getfl(file.as_fd()).expect("getfl");
+    fn nonblock_wird_nach_dem_oeffnen_entfernt() -> TestResult {
+        let tmp = fixture()?;
+        let file = open_nofollow(&tmp.path().join("top.txt"), OpenMode::read_only())?;
+        let status = rustix::fs::fcntl_getfl(file.as_fd()).map_err(ctx("getfl"))?;
         assert!(!status.contains(OFlags::NONBLOCK));
 
         let log = tmp.path().join("log");
-        let file = open_nofollow(&log, OpenMode::append_create(0o600)).expect("append");
-        let status = rustix::fs::fcntl_getfl(file.as_fd()).expect("getfl");
+        let file = open_nofollow(&log, OpenMode::append_create(0o600)).map_err(ctx("append"))?;
+        let status = rustix::fs::fcntl_getfl(file.as_fd()).map_err(ctx("getfl"))?;
         assert!(status.contains(OFlags::APPEND));
         assert!(!status.contains(OFlags::NONBLOCK));
 
-        let root = open_dir_nofollow(tmp.path()).expect("root");
-        let openers: [Opener; 2] =
-            [open_beneath, open_beneath_componentwise];
+        let root = open_dir_nofollow(tmp.path())?;
+        let openers: [Opener; 2] = [open_beneath, open_beneath_componentwise];
         for open in openers {
-            let file = open(root.as_fd(), Path::new("dir/inner.txt"), OpenMode::read_only())
-                .expect("open");
-            let status = rustix::fs::fcntl_getfl(file.as_fd()).expect("getfl");
+            let file = open(
+                root.as_fd(),
+                Path::new("dir/inner.txt"),
+                OpenMode::read_only(),
+            )
+            .map_err(ctx("open"))?;
+            let status = rustix::fs::fcntl_getfl(file.as_fd()).map_err(ctx("getfl"))?;
             assert!(!status.contains(OFlags::NONBLOCK));
-            let dir = open(root.as_fd(), Path::new("."), OpenMode::read_only()).expect("dir");
-            let status = rustix::fs::fcntl_getfl(dir.as_fd()).expect("getfl");
+            let dir =
+                open(root.as_fd(), Path::new("."), OpenMode::read_only()).map_err(ctx("dir"))?;
+            let status = rustix::fs::fcntl_getfl(dir.as_fd()).map_err(ctx("getfl"))?;
             assert!(!status.contains(OFlags::NONBLOCK));
         }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn fallback_passiert_nur_durchsuchbares_verzeichnis() {
-        let tmp = fixture();
+    fn fallback_passiert_nur_durchsuchbares_verzeichnis() -> TestResult {
+        let tmp = fixture()?;
         let dir = tmp.path().join("dir");
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o100)).expect("chmod");
-        let root = open_dir_nofollow(tmp.path()).expect("root");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o100))?;
+        let root = open_dir_nofollow(tmp.path())?;
         let rel = Path::new("dir/inner.txt");
         let result = open_beneath_componentwise(root.as_fd(), rel, OpenMode::read_only());
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-        assert_eq!(read_all(result.expect("O_PATH-Abstieg")), "inner");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        assert_eq!(read_all(result.map_err(ctx("O_PATH-Abstieg"))?)?, "inner");
+        Ok(())
     }
 }

@@ -32,6 +32,9 @@ use harw_tools::{JsonSchemaType, ToolSpec};
 use harw_types::CgroupId;
 use serde::{Deserialize, Serialize};
 
+mod common;
+use common::{TestError, TestResult, ctx};
+
 /// Stand-in for `harw_dod_warden_proto::AuthorizationProof` (AW5-02, not yet
 /// built). Implements exactly the bounds `warden_actions!` requires of the
 /// `authorization_proof = <Pfad>;` type: `Debug`, `Clone`, `Serialize`,
@@ -65,64 +68,77 @@ harw_macros::warden_actions! {
     }
 }
 
-fn sample_cgroup() -> CgroupId {
-    CgroupId::try_from_str("cgroup-1").expect("non-empty id")
+fn sample_cgroup() -> TestResult<CgroupId> {
+    CgroupId::try_from_str("cgroup-1").map_err(ctx("non-empty id"))
 }
 
 // -- Wire-Roundtrip -----------------------------------------------------------
 
 #[test]
-fn wire_roundtrip_preserves_action_and_proof() {
+fn wire_roundtrip_preserves_action_and_proof() -> TestResult {
     let proposed = ProposedAction::FreezeCgroup {
-        cgroup: sample_cgroup(),
+        cgroup: sample_cgroup()?,
     };
     let proof = FakeProof {
         approval_id: "approval-42".to_string(),
     };
 
     let request = WardenActionRequest::new(proposed, proof.clone());
-    let json = serde_json::to_string(&request).expect("request must serialize");
+    let json = serde_json::to_string(&request).map_err(ctx("request must serialize"))?;
 
     assert!(json.contains("\"kind\":\"freeze-cgroup\""));
     assert!(json.contains("\"approval_id\":\"approval-42\""));
 
     let round_tripped: WardenActionRequest =
-        serde_json::from_str(&json).expect("request must deserialize");
+        serde_json::from_str(&json).map_err(ctx("request must deserialize"))?;
 
-    assert_eq!(round_tripped.action, WardenAction::FreezeCgroup { cgroup: sample_cgroup() });
+    assert_eq!(
+        round_tripped.action,
+        WardenAction::FreezeCgroup {
+            cgroup: sample_cgroup()?
+        }
+    );
     assert_eq!(round_tripped.proof, proof);
+    Ok(())
 }
 
 #[test]
 fn wire_deserialization_rejects_unknown_fields() {
     let malformed = r#"{"action":{"kind":"freeze-cgroup","cgroup":"cgroup-1","extra":true},"proof":{"approval_id":"a"}}"#;
     let result: Result<WardenActionRequest, _> = serde_json::from_str(malformed);
-    assert!(result.is_err(), "deny_unknown_fields must reject the extra field");
+    assert!(
+        result.is_err(),
+        "deny_unknown_fields must reject the extra field"
+    );
 }
 
 #[test]
-fn vec_field_action_round_trips_through_json() {
+fn vec_field_action_round_trips_through_json() -> TestResult {
     let proposed = ProposedAction::IsolateCgroups {
-        cgroups: vec![sample_cgroup(), CgroupId::try_from_str("cgroup-2").unwrap()],
+        cgroups: vec![
+            sample_cgroup()?,
+            CgroupId::try_from_str("cgroup-2").map_err(ctx("non-empty id"))?,
+        ],
     };
     let action: WardenAction = proposed.into();
-    let json = serde_json::to_string(&action).expect("action must serialize");
-    let round_tripped: WardenAction = serde_json::from_str(&json).expect("action must deserialize");
+    let json = serde_json::to_string(&action).map_err(ctx("action must serialize"))?;
+    let round_tripped: WardenAction =
+        serde_json::from_str(&json).map_err(ctx("action must deserialize"))?;
     assert_eq!(action, round_tripped);
+    Ok(())
 }
 
 // -- Schema vorhanden ----------------------------------------------------------
 
 #[test]
-fn tool_schema_is_strict_and_covers_every_action() {
+fn tool_schema_is_strict_and_covers_every_action() -> TestResult {
     let spec = ProposedAction::tool_schema();
     match spec {
         ToolSpec::Function(function) => {
             assert!(function.strict, "the tool schema must be strict");
-            let any_of = function
-                .parameters
-                .any_of
-                .expect("parameters must be a union over the three actions");
+            let any_of = function.parameters.any_of.ok_or(TestError::Missing(
+                "parameters must be a union over the three actions",
+            ))?;
             assert_eq!(any_of.len(), 3);
             for variant in &any_of {
                 assert_eq!(variant.schema_type, Some(JsonSchemaType::Object));
@@ -133,43 +149,46 @@ fn tool_schema_is_strict_and_covers_every_action() {
             }
         }
     }
+    Ok(())
 }
 
 // -- Audit-Name gesetzt ---------------------------------------------------------
 
 #[test]
-fn audit_records_the_declared_name_per_action() {
+fn audit_records_the_declared_name_per_action() -> TestResult {
     let freeze = WardenActionAudit::for_action(WardenAction::FreezeCgroup {
-        cgroup: sample_cgroup(),
+        cgroup: sample_cgroup()?,
     });
     assert_eq!(freeze.audit_name, "warden.freeze_cgroup");
 
     let kill = WardenActionAudit::for_action(WardenAction::KillProcessTree {
-        cgroup: sample_cgroup(),
+        cgroup: sample_cgroup()?,
     });
     assert_eq!(kill.audit_name, "warden.kill_process_tree");
 
     let isolate = WardenActionAudit::for_action(WardenAction::IsolateCgroups {
-        cgroups: vec![sample_cgroup()],
+        cgroups: vec![sample_cgroup()?],
     });
     assert_eq!(isolate.audit_name, "warden.isolate_cgroups");
+    Ok(())
 }
 
 // -- Zulässigkeitsmatrix befragbar -----------------------------------------------
 
 #[test]
-fn admissibility_matrix_matches_the_declaration() {
+fn admissibility_matrix_matches_the_declaration() -> TestResult {
     let freeze = WardenAction::FreezeCgroup {
-        cgroup: sample_cgroup(),
+        cgroup: sample_cgroup()?,
     };
     assert!(freeze.is_admissible_from(EscalationStage::RuleTriggered));
     assert!(freeze.is_admissible_from(EscalationStage::Escalated));
 
     let kill = WardenAction::KillProcessTree {
-        cgroup: sample_cgroup(),
+        cgroup: sample_cgroup()?,
     };
     assert!(!kill.is_admissible_from(EscalationStage::RuleTriggered));
     assert!(kill.is_admissible_from(EscalationStage::Escalated));
+    Ok(())
 }
 
 /// Integration coverage for the case AW5-02 actually needed: a declaration
@@ -191,6 +210,7 @@ fn admissibility_matrix_matches_the_declaration() {
 /// Abschnitt „Was pro Deklaration erzeugt wird").
 mod without_tool_schema {
     use super::FakeProof;
+    use crate::common::{TestResult, ctx};
 
     harw_macros::warden_actions! {
         authorization_proof = FakeProof;
@@ -209,43 +229,51 @@ mod without_tool_schema {
         }
     }
 
-    fn sample_cgroup() -> harw_types::CgroupId {
-        harw_types::CgroupId::try_from_str("cgroup-1").expect("non-empty id")
+    fn sample_cgroup() -> TestResult<harw_types::CgroupId> {
+        harw_types::CgroupId::try_from_str("cgroup-1").map_err(ctx("non-empty id"))
     }
 
     #[test]
-    fn wire_roundtrip_preserves_action_and_proof_without_tool_schema() {
+    fn wire_roundtrip_preserves_action_and_proof_without_tool_schema() -> TestResult {
         let proposed = ProposedAction::FreezeCgroup {
-            cgroup: sample_cgroup(),
+            cgroup: sample_cgroup()?,
         };
         let proof = FakeProof {
             approval_id: "approval-42".to_string(),
         };
 
         let request = WardenActionRequest::new(proposed, proof.clone());
-        let json = serde_json::to_string(&request).expect("request must serialize");
+        let json = serde_json::to_string(&request).map_err(ctx("request must serialize"))?;
         assert!(json.contains("\"kind\":\"freeze-cgroup\""));
 
         let round_tripped: WardenActionRequest =
-            serde_json::from_str(&json).expect("request must deserialize");
-        assert_eq!(round_tripped.action, WardenAction::FreezeCgroup { cgroup: sample_cgroup() });
+            serde_json::from_str(&json).map_err(ctx("request must deserialize"))?;
+        assert_eq!(
+            round_tripped.action,
+            WardenAction::FreezeCgroup {
+                cgroup: sample_cgroup()?
+            }
+        );
         assert_eq!(round_tripped.proof, proof);
+        Ok(())
     }
 
     #[test]
-    fn audit_records_the_declared_name_without_tool_schema() {
+    fn audit_records_the_declared_name_without_tool_schema() -> TestResult {
         let freeze = WardenActionAudit::for_action(WardenAction::FreezeCgroup {
-            cgroup: sample_cgroup(),
+            cgroup: sample_cgroup()?,
         });
         assert_eq!(freeze.audit_name, "warden.freeze_cgroup");
+        Ok(())
     }
 
     #[test]
-    fn admissibility_matrix_matches_the_declaration_without_tool_schema() {
+    fn admissibility_matrix_matches_the_declaration_without_tool_schema() -> TestResult {
         let kill = WardenAction::KillProcessTree {
-            cgroup: sample_cgroup(),
+            cgroup: sample_cgroup()?,
         };
         assert!(!kill.is_admissible_from(EscalationStage::RuleTriggered));
         assert!(kill.is_admissible_from(EscalationStage::Escalated));
+        Ok(())
     }
 }

@@ -37,16 +37,26 @@ impl KernelTimeMapper {
     }
     #[must_use]
     pub fn measured(sampled_ktime_ns: u64, sampled_realtime: Timestamp) -> Self {
-        Self { sampled_ktime_ns, sampled_realtime, confidence: TimeConfidence::Measured }
+        Self {
+            sampled_ktime_ns,
+            sampled_realtime,
+            confidence: TimeConfidence::Measured,
+        }
     }
 
     #[must_use]
     pub fn after_discontinuity(sampled_ktime_ns: u64, sampled_realtime: Timestamp) -> Self {
-        Self { sampled_ktime_ns, sampled_realtime, confidence: TimeConfidence::Uncertain }
+        Self {
+            sampled_ktime_ns,
+            sampled_realtime,
+            confidence: TimeConfidence::Uncertain,
+        }
     }
 
     #[must_use]
-    pub fn confidence(&self) -> TimeConfidence { self.confidence }
+    pub fn confidence(&self) -> TimeConfidence {
+        self.confidence
+    }
 
     pub fn map(&self, ktime_ns: u64) -> Option<Timestamp> {
         let delta = i128::from(ktime_ns) - i128::from(self.sampled_ktime_ns);
@@ -63,12 +73,23 @@ fn timespec_nanoseconds(timespec: rustix::time::Timespec) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{KernelTimeMapper, TimeConfidence};
+    use crate::test_support::{TestError, TestResult, ctx};
     use jiff::Timestamp;
 
     #[test]
-    fn maps_monotonic_delta_without_treating_ktime_as_epoch() {
-        let mapper = KernelTimeMapper::measured(900, Timestamp::new(1_700_000_000, 0).unwrap());
-        assert_eq!(mapper.map(1_900).unwrap(), Timestamp::new(1_700_000_000, 1_000).unwrap());
+    fn maps_monotonic_delta_without_treating_ktime_as_epoch() -> TestResult {
+        let mapper = KernelTimeMapper::measured(
+            900,
+            Timestamp::new(1_700_000_000, 0).map_err(ctx("gültiger Zeitstempel"))?,
+        );
+        let mapped = mapper
+            .map(1_900)
+            .ok_or(TestError::Missing("gemapptes Timestamp"))?;
+        assert_eq!(
+            mapped,
+            Timestamp::new(1_700_000_000, 1_000).map_err(ctx("gültiger Zeitstempel"))?
+        );
+        Ok(())
     }
 
     #[test]
@@ -78,11 +99,14 @@ mod tests {
     }
 
     #[test]
-    fn sample_maps_its_own_monotonic_instant_to_realtime() {
-        let mapper = KernelTimeMapper::sample().expect("Linux realtime and monotonic clocks fit the wire range");
+    fn sample_maps_its_own_monotonic_instant_to_realtime() -> TestResult {
+        let mapper = KernelTimeMapper::sample().ok_or(TestError::Missing(
+            "Linux realtime and monotonic clocks fit the wire range",
+        ))?;
         // The test deliberately asserts only a usable mapping, not an exact
         // wall-clock value, because the two clock syscalls are distinct reads.
         assert!(mapper.map(0).is_some());
         assert_eq!(mapper.confidence(), TimeConfidence::Measured);
+        Ok(())
     }
 }

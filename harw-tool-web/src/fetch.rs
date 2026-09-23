@@ -76,9 +76,9 @@ use crate::cache::{
 use crate::error::{WebToolError, WebToolResult};
 use crate::hop::{HopTarget, check_hop, map_send_error, resolve_location};
 use crate::html::{html_to_markdown, html_to_text, truncate_utf8};
+use harw_authority::NetworkScope;
 use harw_egress::EgressPolicy;
 use harw_macros::Tool;
-use harw_authority::NetworkScope;
 use harw_tools::{ToolExecutionContext, ToolOutput, ToolsError};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -654,7 +654,9 @@ impl WebFetcher {
         max_bytes: Option<usize>,
     ) -> Self {
         let limit = max_bytes
-            .map_or(self.options.max_bytes, |requested| requested.min(self.options.max_bytes))
+            .map_or(self.options.max_bytes, |requested| {
+                requested.min(self.options.max_bytes)
+            })
             .max(1);
         Self {
             client: self.client.clone(),
@@ -715,7 +717,13 @@ impl WebFetcher {
     /// # Concurrency
     /// Rein auf `&self`.
     pub fn check_target(&self, url: &str, hop: usize) -> WebToolResult<HopTarget> {
-        check_hop(&self.policy, &self.network, self.options.allow_http, url, hop)
+        check_hop(
+            &self.policy,
+            &self.network,
+            self.options.allow_http,
+            url,
+            hop,
+        )
     }
 
     /// Prüft, ob ein gelesener Cache-Eintrag verwendet werden darf.
@@ -792,7 +800,10 @@ impl WebFetcher {
     pub async fn fetch(&self, url: &str, format: OutputFormat) -> WebToolResult<FetchedDocument> {
         let source = self.fetch_source(url).await?;
         let max_output = self.options.max_output_bytes;
-        run_blocking("web-render", move || finish_document(source, format, max_output)).await
+        run_blocking("web-render", move || {
+            finish_document(source, format, max_output)
+        })
+        .await
     }
 
     /// Holt den Rohkörper einer Ressource (Cache, Conditional-GET, Redirects).
@@ -937,15 +948,21 @@ impl WebFetcher {
     /// Schreibt einen Eintrag auf dem Blocking-Pool; Fehler werden protokolliert.
     async fn store(&self, path: PathBuf, entry: CacheEntry) {
         let base = self.cache_dir.clone();
-        let result =
-            run_blocking("web-cache-write", move || write_cache_entry(&base, &path, &entry)).await;
+        let result = run_blocking("web-cache-write", move || {
+            write_cache_entry(&base, &path, &entry)
+        })
+        .await;
         if let Err(err) = result {
             tracing::warn!(error = %err, "web.cache.write_failed");
         }
     }
 
     /// Führt die Redirect-Kette und liest den Körper unter dem Byte-Limit.
-    async fn fetch_chain(&self, start: &HopTarget, etag: Option<&str>) -> WebToolResult<RawOutcome> {
+    async fn fetch_chain(
+        &self,
+        start: &HopTarget,
+        etag: Option<&str>,
+    ) -> WebToolResult<RawOutcome> {
         let mut current = start.clone();
         let mut chain = vec![start.url().to_owned()];
         let mut hop = 0usize;
@@ -1196,6 +1213,7 @@ async fn web_fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use std::io::{ErrorKind, Read, Write};
     use std::net::TcpListener;
     use std::thread::JoinHandle;
@@ -1213,10 +1231,10 @@ mod tests {
     }
 
     impl TestServer {
-        fn spawn(responses: Vec<String>) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("Loopback-Bind");
-            let base = format!("http://{}", listener.local_addr().expect("Adresse"));
-            listener.set_nonblocking(true).expect("nonblocking");
+        fn spawn(responses: Vec<String>) -> TestResult<Self> {
+            let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("Loopback-Bind"))?;
+            let base = format!("http://{}", listener.local_addr().map_err(ctx("Adresse"))?);
+            listener.set_nonblocking(true).map_err(ctx("nonblocking"))?;
             let handle = std::thread::spawn(move || {
                 let mut requests = Vec::new();
                 for response in responses {
@@ -1250,11 +1268,17 @@ mod tests {
                 }
                 requests
             });
-            Self { base, handle }
+            Ok(Self { base, handle })
         }
 
-        fn requests(self) -> Vec<String> {
-            self.handle.join().expect("Server-Thread")
+        /// Wartet auf den Server-Thread; ein Panik im Thread wird als
+        /// [`TestError::Context`] zurückgegeben statt weiterzureichen
+        /// (`JoinError`-Payload ist `Box<dyn Any + Send>`, nicht `Display`).
+        fn requests(self) -> TestResult<Vec<String>> {
+            self.handle.join().map_err(|_| TestError::Context {
+                context: "Server-Thread",
+                source: "der Server-Thread ist paniert".to_owned(),
+            })
         }
     }
 
@@ -1279,17 +1303,28 @@ mod tests {
 
     /// Fetcher mit Policy `hosts` (+ `allow_private`), gleichem Sandbox-Scope
     /// und festem Cache-Scope.
-    fn fetcher_for(dir: &Path, hosts: &[&str], allow_private: bool, options: WebFetchOptions) -> WebFetcher {
+    fn fetcher_for(
+        dir: &Path,
+        hosts: &[&str],
+        allow_private: bool,
+        options: WebFetchOptions,
+    ) -> TestResult<WebFetcher> {
         let owned: Vec<String> = hosts.iter().map(|host| (*host).to_owned()).collect();
-        let policy = Arc::new(EgressPolicy::new(owned.clone(), allow_private).expect("Policy"));
+        let policy =
+            Arc::new(EgressPolicy::new(owned.clone(), allow_private).map_err(ctx("Policy"))?);
         let network = NetworkScope::from_hosts(owned);
         let scope = CacheScope::new("tenant", "workspace", &network);
-        WebFetcher::new(policy, dir.to_path_buf(), options)
-            .expect("Client baut")
-            .scoped(network, scope, None)
+        Ok(WebFetcher::new(policy, dir.to_path_buf(), options)
+            .map_err(ctx("Client baut"))?
+            .scoped(network, scope, None))
     }
 
-    fn entry_for(fetcher: &WebFetcher, chain: Vec<String>, body: &str, fetched_at: u64) -> (PathBuf, CacheEntry) {
+    fn entry_for(
+        fetcher: &WebFetcher,
+        chain: Vec<String>,
+        body: &str,
+        fetched_at: u64,
+    ) -> (PathBuf, CacheEntry) {
         let request = chain.first().cloned().unwrap_or_default();
         let key = cache_key(&fetcher.policy().digest(), &fetcher.cache_scope(), &request);
         let entry = CacheEntry {
@@ -1309,15 +1344,16 @@ mod tests {
 
     /// Text- und JSON-artige Typen sind erlaubt, Parameter werden verworfen.
     #[test]
-    fn test_check_content_type_accepts_text_and_json() {
+    fn test_check_content_type_accepts_text_and_json() -> TestResult {
         assert_eq!(
-            check_content_type("text/html; charset=utf-8", "docs.rs").expect("erlaubt"),
+            check_content_type("text/html; charset=utf-8", "docs.rs").map_err(ctx("erlaubt"))?,
             "text/html"
         );
         assert_eq!(
-            check_content_type("application/vnd.api+json", "crates.io").expect("erlaubt"),
+            check_content_type("application/vnd.api+json", "crates.io").map_err(ctx("erlaubt"))?,
             "application/vnd.api+json"
         );
+        Ok(())
     }
 
     /// Binärformate und fehlender Header werden abgelehnt.
@@ -1335,39 +1371,60 @@ mod tests {
 
     /// Ein Chunk-Stream bricht exakt an der Grenze ab, ohne Teilübernahme.
     #[test]
-    fn test_push_chunk_stops_at_limit_and_keeps_buffer_intact() {
+    fn test_push_chunk_stops_at_limit_and_keeps_buffer_intact() -> TestResult {
         let mut buffer = Vec::new();
         assert!(push_chunk(&mut buffer, b"aaaa", 10, "docs.rs").is_ok());
         assert!(push_chunk(&mut buffer, b"bbbb", 10, "docs.rs").is_ok());
-        let err = push_chunk(&mut buffer, b"cccc", 10, "docs.rs").expect_err("Limit");
-        assert!(matches!(err, WebToolError::ResponseTooLarge { limit: 10, .. }));
+        let Err(err) = push_chunk(&mut buffer, b"cccc", 10, "docs.rs") else {
+            return Err(TestError::Unexpected("Err erwartet: Limit".into()));
+        };
+        assert!(matches!(
+            err,
+            WebToolError::ResponseTooLarge { limit: 10, .. }
+        ));
         assert_eq!(buffer.len(), 8);
         assert!(push_chunk(&mut Vec::new(), b"x", 0, "docs.rs").is_err());
+        Ok(())
     }
 
     // --- Aufbereitung -------------------------------------------------------
 
     /// `raw` lässt HTML unangetastet; Nicht-HTML bleibt in allen Formen gleich.
     #[test]
-    fn test_render_raw_and_non_html_pass_through() {
+    fn test_render_raw_and_non_html_pass_through() -> TestResult {
         let html = "<p>x</p><script>y</script>";
-        assert_eq!(render(html, "text/html", OutputFormat::Raw).expect("raw"), html);
+        assert_eq!(
+            render(html, "text/html", OutputFormat::Raw).map_err(ctx("raw"))?,
+            html
+        );
         let json = r#"{"a":"<script>"}"#;
-        for format in [OutputFormat::Text, OutputFormat::Markdown, OutputFormat::Raw] {
-            assert_eq!(render(json, "application/json", format).expect("json"), json);
+        for format in [
+            OutputFormat::Text,
+            OutputFormat::Markdown,
+            OutputFormat::Raw,
+        ] {
+            assert_eq!(
+                render(json, "application/json", format).map_err(ctx("json"))?,
+                json
+            );
         }
+        Ok(())
     }
 
     /// Text-Form entfernt script/style.
     #[test]
-    fn test_render_text_strips_script_and_style() {
+    fn test_render_text_strips_script_and_style() -> TestResult {
         let html = "<body><style>p{}</style><p>sichtbar</p><script>unsichtbar</script></body>";
-        assert_eq!(render(html, "text/html", OutputFormat::Text).expect("text"), "sichtbar");
+        assert_eq!(
+            render(html, "text/html", OutputFormat::Text).map_err(ctx("text"))?,
+            "sichtbar"
+        );
+        Ok(())
     }
 
     /// `finish_document` kappt nach der Aufbereitung an einer Zeichengrenze.
     #[test]
-    fn test_finish_document_truncates_on_multibyte_boundary() {
+    fn test_finish_document_truncates_on_multibyte_boundary() -> TestResult {
         let raw = FetchedDocument {
             url: "https://docs.rs/".to_owned(),
             status: 200,
@@ -1377,9 +1434,10 @@ mod tests {
             etag: None,
             truncated: false,
         };
-        let done = finish_document(raw, OutputFormat::Text, 5).expect("fertig");
+        let done = finish_document(raw, OutputFormat::Text, 5).map_err(ctx("fertig"))?;
         assert_eq!(done.body, "ää");
         assert!(done.truncated);
+        Ok(())
     }
 
     /// Die Formatwahl akzeptiert die dokumentierten Werte und lehnt andere ab.
@@ -1387,7 +1445,10 @@ mod tests {
     fn test_output_format_parse_known_and_unknown_values() {
         assert_eq!(OutputFormat::parse(Some("  ")), Some(OutputFormat::Text));
         assert_eq!(OutputFormat::parse(Some("RAW")), Some(OutputFormat::Raw));
-        assert_eq!(OutputFormat::parse(Some("md")), Some(OutputFormat::Markdown));
+        assert_eq!(
+            OutputFormat::parse(Some("md")),
+            Some(OutputFormat::Markdown)
+        );
         assert_eq!(OutputFormat::parse(Some("pdf")), None);
     }
 
@@ -1397,132 +1458,203 @@ mod tests {
     #[test]
     fn test_shared_fetcher_without_configuration_is_not_configured() {
         // Kein Test dieses Crates installiert einen Fetcher.
-        assert!(matches!(shared_fetcher(), Err(WebToolError::NotConfigured { .. })));
+        assert!(matches!(
+            shared_fetcher(),
+            Err(WebToolError::NotConfigured { .. })
+        ));
     }
 
     /// Limits werden gedeckelt; `scoped` kann nur senken.
     #[test]
-    fn test_scoped_caps_requested_max_bytes() {
-        let dir = TempDir::new().expect("Tempdir");
-        let policy = Arc::new(EgressPolicy::new(vec!["docs.rs".to_owned()], false).expect("Policy"));
+    fn test_scoped_caps_requested_max_bytes() -> TestResult {
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
+        let policy =
+            Arc::new(EgressPolicy::new(vec!["docs.rs".to_owned()], false).map_err(ctx("Policy"))?);
         let options = WebFetchOptions {
             max_bytes: usize::MAX,
             max_output_bytes: 0,
             ..WebFetchOptions::default()
         };
-        let base = WebFetcher::new(policy, dir.path().to_path_buf(), options).expect("Client");
+        let base =
+            WebFetcher::new(policy, dir.path().to_path_buf(), options).map_err(ctx("Client"))?;
         assert_eq!(base.max_bytes(), HARD_MAX_BYTES);
         assert_eq!(base.options().max_output_bytes, 1);
 
         let scope = CacheScope::unbound();
-        assert_eq!(base.scoped(NetworkScope::empty(), scope, Some(usize::MAX)).max_bytes(), HARD_MAX_BYTES);
-        assert_eq!(base.scoped(NetworkScope::empty(), scope, Some(2_048)).max_bytes(), 2_048);
-        assert_eq!(base.scoped(NetworkScope::empty(), scope, Some(0)).max_bytes(), 1);
+        assert_eq!(
+            base.scoped(NetworkScope::empty(), scope, Some(usize::MAX))
+                .max_bytes(),
+            HARD_MAX_BYTES
+        );
+        assert_eq!(
+            base.scoped(NetworkScope::empty(), scope, Some(2_048))
+                .max_bytes(),
+            2_048
+        );
+        assert_eq!(
+            base.scoped(NetworkScope::empty(), scope, Some(0))
+                .max_bytes(),
+            1
+        );
+        Ok(())
     }
 
     /// Ohne Sandbox-Scope ist kein Host erreichbar, auch wenn die Policy ihn erlaubt.
     #[tokio::test]
-    async fn test_fetch_without_scope_denies_every_host() {
-        let dir = TempDir::new().expect("Tempdir");
-        let policy = Arc::new(EgressPolicy::new(vec!["docs.rs".to_owned()], false).expect("Policy"));
+    async fn test_fetch_without_scope_denies_every_host() -> TestResult {
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
+        let policy =
+            Arc::new(EgressPolicy::new(vec!["docs.rs".to_owned()], false).map_err(ctx("Policy"))?);
         let fetcher = WebFetcher::new(policy, dir.path().to_path_buf(), WebFetchOptions::default())
-            .expect("Client");
-        let err = fetcher
+            .map_err(ctx("Client"))?;
+        let Err(err) = fetcher
             .fetch("https://docs.rs/serde/", OutputFormat::Text)
             .await
-            .expect_err("leerer Scope");
-        assert!(matches!(err, WebToolError::RedirectHostNotAllowed { .. }), "{err:?}");
+        else {
+            return Err(TestError::Unexpected("Err erwartet: leerer Scope".into()));
+        };
+        assert!(
+            matches!(err, WebToolError::RedirectHostNotAllowed { .. }),
+            "{err:?}"
+        );
+        Ok(())
     }
 
     /// IP-Literal-URL wird vor jedem Netzkontakt abgelehnt, ohne Adresse in der Meldung.
     #[tokio::test]
-    async fn test_fetch_rejects_ip_literal_url_before_network() {
-        let dir = TempDir::new().expect("Tempdir");
-        let fetcher = fetcher_for(dir.path(), &["127.0.0.1", "169.254.169.254"], false, WebFetchOptions::default());
-        for url in ["https://127.0.0.1/", "https://169.254.169.254/latest/meta-data/"] {
-            let err = fetcher.fetch(url, OutputFormat::Raw).await.expect_err(url);
-            assert!(matches!(err, WebToolError::EgressDenied { .. }), "{url}: {err:?}");
+    async fn test_fetch_rejects_ip_literal_url_before_network() -> TestResult {
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
+        let fetcher = fetcher_for(
+            dir.path(),
+            &["127.0.0.1", "169.254.169.254"],
+            false,
+            WebFetchOptions::default(),
+        )?;
+        for url in [
+            "https://127.0.0.1/",
+            "https://169.254.169.254/latest/meta-data/",
+        ] {
+            let Err(err) = fetcher.fetch(url, OutputFormat::Raw).await else {
+                return Err(TestError::Unexpected(format!("Err erwartet für {url}")));
+            };
+            assert!(
+                matches!(err, WebToolError::EgressDenied { .. }),
+                "{url}: {err:?}"
+            );
             let message = err.to_string();
-            assert!(!message.contains("127.0.0.1") && !message.contains("169.254"), "{message}");
+            assert!(
+                !message.contains("127.0.0.1") && !message.contains("169.254"),
+                "{message}"
+            );
         }
+        Ok(())
     }
 
     /// `http://` ohne Freigabe scheitert am Schema.
     #[tokio::test]
-    async fn test_fetch_rejects_http_without_opt_in() {
-        let dir = TempDir::new().expect("Tempdir");
-        let fetcher = fetcher_for(dir.path(), &["docs.rs"], false, WebFetchOptions::default());
-        let err = fetcher
+    async fn test_fetch_rejects_http_without_opt_in() -> TestResult {
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
+        let fetcher = fetcher_for(dir.path(), &["docs.rs"], false, WebFetchOptions::default())?;
+        let Err(err) = fetcher
             .fetch("http://docs.rs/serde/", OutputFormat::Text)
             .await
-            .expect_err("http");
-        assert!(matches!(err, WebToolError::SchemeNotAllowed { .. }), "{err:?}");
+        else {
+            return Err(TestError::Unexpected("Err erwartet: http".into()));
+        };
+        assert!(
+            matches!(err, WebToolError::SchemeNotAllowed { .. }),
+            "{err:?}"
+        );
+        Ok(())
     }
 
     // --- Redirects gegen einen Loopback-Server ------------------------------
 
     /// F-035: Redirect auf den Metadaten-Endpunkt wird vor dem Senden abgelehnt.
     #[tokio::test]
-    async fn test_fetch_redirect_to_metadata_ip_is_rejected() {
+    async fn test_fetch_redirect_to_metadata_ip_is_rejected() -> TestResult {
         let server = TestServer::spawn(vec![http_response(
             "302 Found",
             &[("Location", "http://169.254.169.254/latest/meta-data/")],
             "",
-        )]);
-        let dir = TempDir::new().expect("Tempdir");
-        let fetcher = fetcher_for(dir.path(), &["127.0.0.1", "169.254.169.254"], true, loopback_options());
+        )])?;
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
+        let fetcher = fetcher_for(
+            dir.path(),
+            &["127.0.0.1", "169.254.169.254"],
+            true,
+            loopback_options(),
+        )?;
 
-        let err = fetcher
+        let Err(err) = fetcher
             .fetch(&format!("{}/start", server.base), OutputFormat::Raw)
             .await
-            .expect_err("Metadaten-Redirect");
+        else {
+            return Err(TestError::Unexpected(
+                "Err erwartet: Metadaten-Redirect".into(),
+            ));
+        };
         assert!(matches!(err, WebToolError::EgressDenied { .. }), "{err:?}");
         assert!(!err.to_string().contains("169.254"), "{err}");
-        assert_eq!(server.requests().len(), 1, "nur die Start-Anfrage darf rausgehen");
+        assert_eq!(
+            server.requests()?.len(),
+            1,
+            "nur die Start-Anfrage darf rausgehen"
+        );
+        Ok(())
     }
 
     /// Redirect auf einen Host außerhalb der Policy wird abgelehnt.
     #[tokio::test]
-    async fn test_fetch_redirect_to_host_outside_policy_is_rejected() {
+    async fn test_fetch_redirect_to_host_outside_policy_is_rejected() -> TestResult {
         let server = TestServer::spawn(vec![http_response(
             "301 Moved Permanently",
             &[("Location", "https://evil.test/steal")],
             "",
-        )]);
-        let dir = TempDir::new().expect("Tempdir");
-        let fetcher = fetcher_for(dir.path(), &["127.0.0.1"], true, loopback_options());
+        )])?;
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
+        let fetcher = fetcher_for(dir.path(), &["127.0.0.1"], true, loopback_options())?;
 
-        let err = fetcher
+        let Err(err) = fetcher
             .fetch(&format!("{}/start", server.base), OutputFormat::Raw)
             .await
-            .expect_err("fremder Host");
+        else {
+            return Err(TestError::Unexpected("Err erwartet: fremder Host".into()));
+        };
         assert!(matches!(err, WebToolError::EgressDenied { .. }), "{err:?}");
         assert!(!err.to_string().contains("steal"), "{err}");
-        assert_eq!(server.requests().len(), 1);
+        assert_eq!(server.requests()?.len(), 1);
+        Ok(())
     }
 
     /// Mehr als `MAX_REDIRECTS` Weiterleitungen brechen ab.
     #[tokio::test]
-    async fn test_fetch_redirect_chain_beyond_limit_is_rejected() {
+    async fn test_fetch_redirect_chain_beyond_limit_is_rejected() -> TestResult {
         let responses = (0..=MAX_REDIRECTS)
             .map(|_| http_response("302 Found", &[("Location", "/loop")], ""))
             .collect();
-        let server = TestServer::spawn(responses);
-        let dir = TempDir::new().expect("Tempdir");
-        let fetcher = fetcher_for(dir.path(), &["127.0.0.1"], true, loopback_options());
+        let server = TestServer::spawn(responses)?;
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
+        let fetcher = fetcher_for(dir.path(), &["127.0.0.1"], true, loopback_options())?;
 
-        let err = fetcher
+        let Err(err) = fetcher
             .fetch(&format!("{}/start", server.base), OutputFormat::Raw)
             .await
-            .expect_err("Kette zu lang");
-        assert!(matches!(err, WebToolError::TooManyRedirects { .. }), "{err:?}");
-        assert_eq!(server.requests().len(), MAX_REDIRECTS + 1);
+        else {
+            return Err(TestError::Unexpected("Err erwartet: Kette zu lang".into()));
+        };
+        assert!(
+            matches!(err, WebToolError::TooManyRedirects { .. }),
+            "{err:?}"
+        );
+        assert_eq!(server.requests()?.len(), MAX_REDIRECTS + 1);
+        Ok(())
     }
 
     /// Erfolgreicher Abruf über einen erlaubten Redirect: Kette im Cache,
     /// Text bereinigt und UTF-8-sicher gekappt.
     #[tokio::test]
-    async fn test_fetch_follows_allowed_redirect_and_caps_text() {
+    async fn test_fetch_follows_allowed_redirect_and_caps_text() -> TestResult {
         let server = TestServer::spawn(vec![
             http_response("302 Found", &[("Location", "/ziel")], ""),
             http_response(
@@ -1530,30 +1662,37 @@ mod tests {
                 &[("Content-Type", "text/html; charset=utf-8")],
                 "<html><body><script>GEHEIM</script><p>ääää</p></body></html>",
             ),
-        ]);
-        let dir = TempDir::new().expect("Tempdir");
+        ])?;
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
         let options = WebFetchOptions {
             max_output_bytes: 5,
             ..loopback_options()
         };
-        let fetcher = fetcher_for(dir.path(), &["127.0.0.1"], true, options);
+        let fetcher = fetcher_for(dir.path(), &["127.0.0.1"], true, options)?;
         let start = format!("{}/start", server.base);
         let target = format!("{}/ziel", server.base);
 
-        let document = fetcher.fetch(&start, OutputFormat::Text).await.expect("Abruf");
+        let document = fetcher
+            .fetch(&start, OutputFormat::Text)
+            .await
+            .map_err(ctx("Abruf"))?;
         assert_eq!(document.url, target);
         assert_eq!(document.body, "ää");
         assert!(document.truncated);
         assert!(!document.from_cache);
-        assert_eq!(server.requests().len(), 2);
+        assert_eq!(server.requests()?.len(), 2);
 
         // Zweiter Abruf: frischer, validierter Cache-Treffer ohne Netz; `raw`
         // liefert den gespeicherten Rohkörper, gekappt auf 5 Bytes.
-        let again = fetcher.fetch(&start, OutputFormat::Raw).await.expect("Cache");
+        let again = fetcher
+            .fetch(&start, OutputFormat::Raw)
+            .await
+            .map_err(ctx("Cache"))?;
         assert!(again.from_cache);
         assert_eq!(again.url, target);
         assert_eq!(again.body, "<html");
         assert!(again.truncated);
+        Ok(())
     }
 
     // --- Cache-Validierung --------------------------------------------------
@@ -1561,107 +1700,157 @@ mod tests {
     /// F-035: ein frischer Treffer, dessen Endziel nun verboten ist, wird
     /// verworfen und neu geholt.
     #[tokio::test]
-    async fn test_fetch_discards_cache_hit_with_forbidden_final_target() {
+    async fn test_fetch_discards_cache_hit_with_forbidden_final_target() -> TestResult {
         let server = TestServer::spawn(vec![http_response(
             "200 OK",
             &[("Content-Type", "text/plain")],
             "frisch",
-        )]);
-        let dir = TempDir::new().expect("Tempdir");
-        let fetcher = fetcher_for(dir.path(), &["127.0.0.1"], true, loopback_options());
+        )])?;
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
+        let fetcher = fetcher_for(dir.path(), &["127.0.0.1"], true, loopback_options())?;
         let start = fetcher
             .check_target(&format!("{}/doc", server.base), 0)
-            .expect("Start erlaubt");
+            .map_err(ctx("Start erlaubt"))?;
         let (path, poisoned) = entry_for(
             &fetcher,
             vec![start.url().to_owned(), "https://evil.test/doc".to_owned()],
             "vergiftet",
             now_secs(),
         );
-        write_cache_entry(fetcher.cache_dir(), &path, &poisoned).expect("Cache schreiben");
+        write_cache_entry(fetcher.cache_dir(), &path, &poisoned).map_err(ctx("Cache schreiben"))?;
 
-        let document = fetcher.fetch(start.url(), OutputFormat::Raw).await.expect("Abruf");
-        assert!(!document.from_cache, "der vergiftete Eintrag darf nicht bedienen");
+        let document = fetcher
+            .fetch(start.url(), OutputFormat::Raw)
+            .await
+            .map_err(ctx("Abruf"))?;
+        assert!(
+            !document.from_cache,
+            "der vergiftete Eintrag darf nicht bedienen"
+        );
         assert_eq!(document.body, "frisch");
-        assert_eq!(server.requests().len(), 1);
+        assert_eq!(server.requests()?.len(), 1);
+        Ok(())
     }
 
     /// Ein verworfener Eintrag rettet auch keinen Transportfehler (kein Fail-open).
     #[tokio::test]
-    async fn test_fetch_stale_fallback_never_uses_forbidden_entry() {
-        let closed = TcpListener::bind("127.0.0.1:0").expect("Bind");
-        let base = format!("http://{}", closed.local_addr().expect("Adresse"));
+    async fn test_fetch_stale_fallback_never_uses_forbidden_entry() -> TestResult {
+        let closed = TcpListener::bind("127.0.0.1:0").map_err(ctx("Bind"))?;
+        let base = format!("http://{}", closed.local_addr().map_err(ctx("Adresse"))?);
         drop(closed);
-        let dir = TempDir::new().expect("Tempdir");
-        let fetcher = fetcher_for(dir.path(), &["127.0.0.1"], true, loopback_options());
-        let start = fetcher.check_target(&format!("{base}/doc"), 0).expect("Start");
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
+        let fetcher = fetcher_for(dir.path(), &["127.0.0.1"], true, loopback_options())?;
+        let start = fetcher
+            .check_target(&format!("{base}/doc"), 0)
+            .map_err(ctx("Start"))?;
         let (path, poisoned) = entry_for(
             &fetcher,
-            vec![start.url().to_owned(), "http://10.0.0.1.nip.io/x".to_owned()],
+            vec![
+                start.url().to_owned(),
+                "http://10.0.0.1.nip.io/x".to_owned(),
+            ],
             "vergiftet",
             0,
         );
-        write_cache_entry(fetcher.cache_dir(), &path, &poisoned).expect("Cache schreiben");
+        write_cache_entry(fetcher.cache_dir(), &path, &poisoned).map_err(ctx("Cache schreiben"))?;
 
-        let err = fetcher.fetch(start.url(), OutputFormat::Raw).await.expect_err("kein Fail-open");
+        let Err(err) = fetcher.fetch(start.url(), OutputFormat::Raw).await else {
+            return Err(TestError::Unexpected("Err erwartet: kein Fail-open".into()));
+        };
         assert!(err.is_transport(), "{err:?}");
+        Ok(())
     }
 
     /// Ein gültiger frischer Eintrag wird ohne Netz bedient.
     #[tokio::test]
-    async fn test_fetch_serves_valid_fresh_cache_entry_without_network() {
-        let closed = TcpListener::bind("127.0.0.1:0").expect("Bind");
-        let base = format!("http://{}", closed.local_addr().expect("Adresse"));
+    async fn test_fetch_serves_valid_fresh_cache_entry_without_network() -> TestResult {
+        let closed = TcpListener::bind("127.0.0.1:0").map_err(ctx("Bind"))?;
+        let base = format!("http://{}", closed.local_addr().map_err(ctx("Adresse"))?);
         drop(closed);
-        let dir = TempDir::new().expect("Tempdir");
-        let fetcher = fetcher_for(dir.path(), &["127.0.0.1"], true, loopback_options());
-        let start = fetcher.check_target(&format!("{base}/doc"), 0).expect("Start");
-        let (path, entry) = entry_for(&fetcher, vec![start.url().to_owned()], "gecacht", now_secs());
-        write_cache_entry(fetcher.cache_dir(), &path, &entry).expect("Cache schreiben");
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
+        let fetcher = fetcher_for(dir.path(), &["127.0.0.1"], true, loopback_options())?;
+        let start = fetcher
+            .check_target(&format!("{base}/doc"), 0)
+            .map_err(ctx("Start"))?;
+        let (path, entry) = entry_for(
+            &fetcher,
+            vec![start.url().to_owned()],
+            "gecacht",
+            now_secs(),
+        );
+        write_cache_entry(fetcher.cache_dir(), &path, &entry).map_err(ctx("Cache schreiben"))?;
 
-        let document = fetcher.fetch(start.url(), OutputFormat::Raw).await.expect("Cache");
+        let document = fetcher
+            .fetch(start.url(), OutputFormat::Raw)
+            .await
+            .map_err(ctx("Cache"))?;
         assert!(document.from_cache);
         assert_eq!(document.body, "gecacht");
         assert_eq!(document.etag.as_deref(), Some("\"v1\""));
+        Ok(())
     }
 
     /// Ein Eintrag unter anderer Policy ist unter der neuen Policy unsichtbar.
     #[test]
-    fn test_validate_cached_rejects_entry_from_other_policy_key() {
-        let dir = TempDir::new().expect("Tempdir");
-        let narrow = fetcher_for(dir.path(), &["docs.rs"], false, WebFetchOptions::default());
-        let wide = fetcher_for(dir.path(), &["docs.rs", "evil.test"], false, WebFetchOptions::default());
+    fn test_validate_cached_rejects_entry_from_other_policy_key() -> TestResult {
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
+        let narrow = fetcher_for(dir.path(), &["docs.rs"], false, WebFetchOptions::default())?;
+        let wide = fetcher_for(
+            dir.path(),
+            &["docs.rs", "evil.test"],
+            false,
+            WebFetchOptions::default(),
+        )?;
         let url = "https://docs.rs/";
         let (_, entry) = entry_for(&wide, vec![url.to_owned()], "x", now_secs());
-        let narrow_key = to_hex(&cache_key(&narrow.policy().digest(), &narrow.cache_scope(), url));
+        let narrow_key = to_hex(&cache_key(
+            &narrow.policy().digest(),
+            &narrow.cache_scope(),
+            url,
+        ));
 
         assert!(matches!(
             narrow.validate_cached(&entry, &narrow_key, url),
             Err(WebToolError::CacheCorrupt { .. })
         ));
         assert!(wide.validate_cached(&entry, &entry.key, url).is_ok());
+        Ok(())
     }
 
     /// Conditional-GET: `304` erneuert den Zeitstempel und bedient den Eintrag.
     #[tokio::test]
-    async fn test_fetch_conditional_get_refreshes_cache_on_304() {
-        let server = TestServer::spawn(vec![http_response("304 Not Modified", &[], "")]);
-        let dir = TempDir::new().expect("Tempdir");
-        let fetcher = fetcher_for(dir.path(), &["127.0.0.1"], true, loopback_options());
-        let start = fetcher.check_target(&format!("{}/doc", server.base), 0).expect("Start");
+    async fn test_fetch_conditional_get_refreshes_cache_on_304() -> TestResult {
+        let server = TestServer::spawn(vec![http_response("304 Not Modified", &[], "")])?;
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
+        let fetcher = fetcher_for(dir.path(), &["127.0.0.1"], true, loopback_options())?;
+        let start = fetcher
+            .check_target(&format!("{}/doc", server.base), 0)
+            .map_err(ctx("Start"))?;
         let (path, stale) = entry_for(&fetcher, vec![start.url().to_owned()], "alt", 1);
-        write_cache_entry(fetcher.cache_dir(), &path, &stale).expect("Cache schreiben");
+        write_cache_entry(fetcher.cache_dir(), &path, &stale).map_err(ctx("Cache schreiben"))?;
 
-        let document = fetcher.fetch(start.url(), OutputFormat::Raw).await.expect("304");
+        let document = fetcher
+            .fetch(start.url(), OutputFormat::Raw)
+            .await
+            .map_err(ctx("304"))?;
         assert_eq!(document.status, 304);
         assert!(document.from_cache);
         assert_eq!(document.body, "alt");
 
-        let requests = server.requests();
+        let requests = server.requests()?;
         assert_eq!(requests.len(), 1);
-        assert!(requests[0].to_ascii_lowercase().contains("if-none-match: \"v1\""), "{}", requests[0]);
-        let refreshed = read_cache_entry(&path).expect("lesen").expect("vorhanden");
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("if-none-match: \"v1\""),
+            "{}",
+            requests[0]
+        );
+        let refreshed = read_cache_entry(&path)
+            .map_err(ctx("lesen"))?
+            .ok_or(TestError::Missing("vorhanden"))?;
         assert!(refreshed.fetched_at > 1);
+        Ok(())
     }
 
     // --- Tool-Deklaration ---------------------------------------------------
@@ -1670,7 +1859,10 @@ mod tests {
     #[test]
     fn test_web_fetch_tool_declares_network_permission() {
         assert_eq!(WebFetchTool::NAME, "web.fetch");
-        assert_eq!(WebFetchTool::PERMISSION, Some(harw_tools::Permission::NetworkAccess));
+        assert_eq!(
+            WebFetchTool::PERMISSION,
+            Some(harw_tools::Permission::NetworkAccess)
+        );
     }
 
     // `PARALLEL_SAFE` ist eine makro-generierte `const bool`; die Assertion
@@ -1679,13 +1871,20 @@ mod tests {
 
     /// Das Schema bewirbt `url` als Pflichtfeld und kennt die Optionen.
     #[test]
-    fn test_fetch_args_schema_requires_url_only() {
+    fn test_fetch_args_schema_requires_url_only() -> TestResult {
         let harw_tools::ToolSpec::Function(spec) = WebFetchTool::spec();
         assert_eq!(spec.name.as_str(), "web.fetch");
-        let required = spec.parameters.required.expect("required-Liste");
+        let required = spec
+            .parameters
+            .required
+            .ok_or(TestError::Missing("required-Liste"))?;
         assert_eq!(required, vec!["url".to_owned()]);
-        let properties = spec.parameters.properties.expect("properties");
+        let properties = spec
+            .parameters
+            .properties
+            .ok_or(TestError::Missing("properties"))?;
         assert!(properties.contains_key("format"));
         assert!(properties.contains_key("max_bytes"));
+        Ok(())
     }
 }

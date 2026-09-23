@@ -116,7 +116,9 @@ use crate::error::WardenBinError;
 ///   Prozess-ID.
 pub(crate) fn verify_listen_pid(raw: Option<&str>, current_pid: u32) -> Result<(), WardenBinError> {
     let raw = raw.ok_or(WardenBinError::ListenPidMissing)?;
-    let pid: u32 = raw.parse().map_err(|_| WardenBinError::ListenPidMalformed)?;
+    let pid: u32 = raw
+        .parse()
+        .map_err(|_| WardenBinError::ListenPidMalformed)?;
     if pid != current_pid {
         return Err(WardenBinError::ListenPidForeign);
     }
@@ -185,7 +187,9 @@ pub fn acquire_listen_socket() -> Result<std::os::fd::OwnedFd, WardenBinError> {
             // heraus, ohne dass wir `unsafe` brauchen -- die Alternative
             // `into_raw()` plus `from_raw_fd` wäre genau das, was
             // `#![forbid(unsafe_code)]` hier verbietet.
-            let (_name, fd) = fds.pop().expect("Länge unmittelbar zuvor geprüft");
+            let (_name, fd) = fds
+                .pop()
+                .ok_or_else(|| WardenBinError::UnexpectedListenFdCount { actual: 0 })?;
             Ok(fd.into_std())
         }
         actual => Err(WardenBinError::UnexpectedListenFdCount { actual }),
@@ -196,6 +200,7 @@ pub fn acquire_listen_socket() -> Result<std::os::fd::OwnedFd, WardenBinError> {
 mod tests {
     use super::{verify_listen_fds_count, verify_listen_pid};
     use crate::error::WardenBinError;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn test_missing_listen_pid_is_a_clean_error() {
@@ -247,8 +252,12 @@ mod tests {
     }
 
     #[test]
-    fn test_valid_listen_fds_count_parses() {
-        assert_eq!(verify_listen_fds_count(Some("1")).unwrap(), 1);
+    fn test_valid_listen_fds_count_parses() -> TestResult {
+        assert_eq!(
+            verify_listen_fds_count(Some("1")).map_err(ctx("valid listen fds count"))?,
+            1
+        );
+        Ok(())
     }
 
     // `acquire_listen_socket` selbst wird hier bewusst nicht getestet: es

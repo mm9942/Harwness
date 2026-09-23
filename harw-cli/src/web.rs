@@ -134,10 +134,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use harw_authority::SandboxSpec;
 use harw_operations::context::{OpContext, ServiceMap};
 use harw_operations::operation::PermissionTier;
 use harw_runtime::{RuntimeAssembly, ServiceSurface};
-use harw_authority::SandboxSpec;
 use harw_session_store::approval::ApprovalStore;
 use harw_types::{SessionId, TurnId};
 use harw_web::events::WebEventBus;
@@ -377,44 +377,31 @@ fn web_op_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
+    use harw_authority::Permission;
     use harw_operations::registry::OperationRegistry;
     use harw_runtime::EntryKind;
-    use harw_authority::Permission;
     use harw_types::Principal;
 
     // Montage aus leerem Temp-Home ohne Netz/Provider (`ModelSource::Echo`).
     // Die `TempDir`s müssen so lange leben wie die Montage.
     fn test_assembly(
         with_approval_store: bool,
-    ) -> (tempfile::TempDir, tempfile::TempDir, RuntimeAssembly) {
-        let home = match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(error) => panic!("tempdir: {error}"),
-        };
-        let cwd = match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(error) => panic!("tempdir: {error}"),
-        };
+    ) -> TestResult<(tempfile::TempDir, tempfile::TempDir, RuntimeAssembly)> {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let cwd = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = with_approval_store.then(|| Arc::new(ApprovalStore::new(home.path())));
-        let assembly =
-            match crate::runtime_web::web_assembly(home.path(), cwd.path(), 1000, store, None) {
-                Ok(assembly) => assembly,
-                Err(error) => panic!("web assembly: {error}"),
-            };
-        (home, cwd, assembly)
+        let assembly = crate::runtime_web::web_assembly(home.path(), cwd.path(), 1000, store, None)
+            .map_err(ctx("web assembly"))?;
+        Ok((home, cwd, assembly))
     }
 
     // Web-Wurzel-Sandbox über einem eigenen Temp-Verzeichnis.
-    fn test_root_sandbox() -> (tempfile::TempDir, SandboxSpec) {
-        let dir = match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(error) => panic!("tempdir: {error}"),
-        };
-        let sandbox = match harw_runtime::root_sandbox(EntryKind::Web, dir.path()) {
-            Ok(sandbox) => sandbox,
-            Err(error) => panic!("root sandbox: {error}"),
-        };
-        (dir, sandbox)
+    fn test_root_sandbox() -> TestResult<(tempfile::TempDir, SandboxSpec)> {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let sandbox =
+            harw_runtime::root_sandbox(EntryKind::Web, dir.path()).map_err(ctx("root sandbox"))?;
+        Ok((dir, sandbox))
     }
 
     // Basis-Map wie früher `build_web_op_context`: nur die Registry.
@@ -431,9 +418,9 @@ mod tests {
     /// Ohne Freigabespeicher entsteht trotzdem ein gültiger Kontext mit
     /// Registry, Peer, Genehmiger und tier-genauem Principal aus der Montage.
     #[test]
-    fn test_web_context_for_without_approval_store_still_builds_a_context() {
-        let (_home, _cwd, assembly) = test_assembly(false);
-        let (_root_dir, root) = test_root_sandbox();
+    fn test_web_context_for_without_approval_store_still_builds_a_context() -> TestResult {
+        let (_home, _cwd, assembly) = test_assembly(false)?;
+        let (_root_dir, root) = test_root_sandbox()?;
         let approver: Arc<dyn ApprovalActorResolver> =
             Arc::new(StaticUidApprovalActorMap::new(vec![]));
         let peer = PeerCredentials::new(1, 1, 1);
@@ -444,17 +431,20 @@ mod tests {
         assert_eq!(ctx.service::<PeerCredentials>(), Some(&peer));
         assert!(ctx.service::<Arc<dyn ApprovalActorResolver>>().is_some());
         assert!(ctx.service::<Arc<ApprovalStore>>().is_none());
-        let principal = ctx.service::<Principal>().expect("principal is registered");
+        let principal = ctx
+            .service::<Principal>()
+            .ok_or(TestError::Missing("principal is registered"))?;
         assert_eq!(principal.id(), "uid:1");
         assert_eq!(principal.tier(), PermissionTier::Owner);
+        Ok(())
     }
 
     /// F-045: ein `Observer`-Peer bekommt nur `ReadWorkspace` — und einen
     /// Observer-Principal, nicht den Owner-Principal der Montage.
     #[test]
-    fn test_web_context_for_observer_sandbox_has_only_read_workspace() {
-        let (_home, _cwd, assembly) = test_assembly(true);
-        let (_root_dir, root) = test_root_sandbox();
+    fn test_web_context_for_observer_sandbox_has_only_read_workspace() -> TestResult {
+        let (_home, _cwd, assembly) = test_assembly(true)?;
+        let (_root_dir, root) = test_root_sandbox()?;
         let approver: Arc<dyn ApprovalActorResolver> = Arc::new(StaticUidApprovalActorMap::new(
             vec![(1000, "owner".to_owned())],
         ));
@@ -468,14 +458,17 @@ mod tests {
         assert!(!permissions.contains(Permission::ExecuteProcess));
         assert!(permissions.is_subset_of(root.permissions()));
         assert!(ctx.service::<Arc<ApprovalStore>>().is_some());
-        let principal = ctx.service::<Principal>().expect("principal is registered");
+        let principal = ctx
+            .service::<Principal>()
+            .ok_or(TestError::Missing("principal is registered"))?;
         assert_eq!(principal.tier(), PermissionTier::Observer);
+        Ok(())
     }
 
     /// Kein Tier erhält mehr als die Web-Wurzel-Sandbox.
     #[test]
-    fn test_web_op_context_never_exceeds_root_sandbox_for_any_tier() {
-        let (_root_dir, root) = test_root_sandbox();
+    fn test_web_op_context_never_exceeds_root_sandbox_for_any_tier() -> TestResult {
+        let (_root_dir, root) = test_root_sandbox()?;
         let approver: Arc<dyn ApprovalActorResolver> =
             Arc::new(StaticUidApprovalActorMap::new(vec![]));
         for tier in [
@@ -501,24 +494,22 @@ mod tests {
                 crate::runtime_web::narrow_web_sandbox(&root, tier).permissions()
             );
         }
+        Ok(())
     }
 
     /// Mit `PeerCredentials`, `ApprovalActorResolver` und `ApprovalStore` in
     /// der `ServiceMap` antwortet `approval.pending` nicht mit
     /// `OpError::NotAvailable`. Öffnet nur ein temporäres Verzeichnis.
     #[tokio::test]
-    async fn test_approval_pending_is_reachable_once_peer_and_resolver_are_wired() {
+    async fn test_approval_pending_is_reachable_once_peer_and_resolver_are_wired() -> TestResult {
         use harw_operations::OpError;
         use harw_operations::operation::OpInput;
 
         let mut registry = OperationRegistry::new();
         harw_ops::register_all(&mut registry);
-        let (_root_dir, root) = test_root_sandbox();
+        let (_root_dir, root) = test_root_sandbox()?;
 
-        let store_root = match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(error) => panic!("tempdir: {error}"),
-        };
+        let store_root = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let approval_store = Arc::new(ApprovalStore::new(store_root.path()));
         let peer = PeerCredentials::new(1, 1000, 1000);
         let approver: Arc<dyn ApprovalActorResolver> = Arc::new(StaticUidApprovalActorMap::new(
@@ -528,7 +519,7 @@ mod tests {
         let op = Arc::clone(
             registry
                 .find_by_name("approval.pending")
-                .expect("approval.pending ist registriert"),
+                .ok_or(TestError::Missing("approval.pending ist registriert"))?,
         );
         let ctx = web_op_context(
             registry_map(&registry),
@@ -547,23 +538,21 @@ mod tests {
             !matches!(result, Err(OpError::NotAvailable(_))),
             "approval.pending sollte erreichbar sein, war aber: {result:?}"
         );
+        Ok(())
     }
 
     /// Eine `uid` ohne Eintrag in der Genehmiger-Tabelle wird abgewiesen —
     /// nie auf einen Vorgabe-Actor abgebildet.
     #[tokio::test]
-    async fn test_approval_resolve_rejects_a_peer_unknown_to_the_approver_table() {
+    async fn test_approval_resolve_rejects_a_peer_unknown_to_the_approver_table() -> TestResult {
         use harw_operations::OpError;
         use harw_operations::operation::OpInput;
 
         let mut registry = OperationRegistry::new();
         harw_ops::register_all(&mut registry);
-        let (_root_dir, root) = test_root_sandbox();
+        let (_root_dir, root) = test_root_sandbox()?;
 
-        let store_root = match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(error) => panic!("tempdir: {error}"),
-        };
+        let store_root = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let approval_store = Arc::new(ApprovalStore::new(store_root.path()));
         // Dieselbe Komposition wie in `serve_web`: nur die eigene uid (hier
         // 1000) ist eingetragen — 9999 bleibt bewusst ohne Eintrag.
@@ -575,7 +564,7 @@ mod tests {
         let op = Arc::clone(
             registry
                 .find_by_name("approval.resolve")
-                .expect("approval.resolve ist registriert"),
+                .ok_or(TestError::Missing("approval.resolve ist registriert"))?,
         );
         let ctx = web_op_context(
             registry_map(&registry),
@@ -598,14 +587,20 @@ mod tests {
             Err(OpError::NotAvailable(message)) => {
                 assert!(message.contains("keinem Genehmiger zugeordnet"));
             }
-            other => panic!("erwartet NotAvailable(..keinem Genehmiger..), erhalten: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet NotAvailable(..keinem Genehmiger..), erhalten: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// Der `ApprovalActor` stammt ausschließlich aus den Peer-Credentials,
     /// nie aus dem Anfragerumpf.
     #[tokio::test]
-    async fn test_approval_resolve_derives_the_actor_from_peer_credentials_not_the_body() {
+    async fn test_approval_resolve_derives_the_actor_from_peer_credentials_not_the_body()
+    -> TestResult {
         use harw_operations::operation::OpInput;
         use harw_session_store::approval::ApprovalRecord;
         use harw_types::{ApprovalActor, Clock, ItemId, ToolCallId};
@@ -630,12 +625,9 @@ mod tests {
 
         let mut registry = OperationRegistry::new();
         harw_ops::register_all(&mut registry);
-        let (_root_dir, root) = test_root_sandbox();
+        let (_root_dir, root) = test_root_sandbox()?;
 
-        let store_root = match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(error) => panic!("tempdir: {error}"),
-        };
+        let store_root = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let approval_store = Arc::new(ApprovalStore::new(store_root.path()));
         approval_store
             .issue(&ApprovalRecord {
@@ -647,7 +639,7 @@ mod tests {
                 },
                 issued_at,
             })
-            .expect("issue succeeds against a fresh store");
+            .map_err(ctx("issue succeeds against a fresh store"))?;
 
         let peer = PeerCredentials::new(1, 1000, 1000);
         let approver: Arc<dyn ApprovalActorResolver> = Arc::new(StaticUidApprovalActorMap::new(
@@ -657,7 +649,7 @@ mod tests {
         let op = Arc::clone(
             registry
                 .find_by_name("approval.resolve")
-                .expect("approval.resolve ist registriert"),
+                .ok_or(TestError::Missing("approval.resolve ist registriert"))?,
         );
         let mut services = registry_map(&registry);
         let clock: Arc<dyn Clock> = Arc::new(FixedClock(issued_at));
@@ -678,12 +670,15 @@ mod tests {
             "decision": "approved",
             "resolved_at": "1970-01-01T00:00:00Z",
         });
-        let output = op
-            .run(&ctx, OpInput::model_tool(args))
-            .await
-            .expect("resolve succeeds: peer.uid ist in der Genehmiger-Tabelle");
+        let output =
+            op.run(&ctx, OpInput::model_tool(args))
+                .await
+                .map_err(crate::test_support::ctx(
+                    "resolve succeeds: peer.uid ist in der Genehmiger-Tabelle",
+                ))?;
 
         assert!(output.text.contains("owner"));
+        Ok(())
     }
 
     /// Eine halb geöffnete Planungsfläche wird nie an die Montage gereicht.
@@ -730,17 +725,19 @@ mod tests {
     /// lässt jede Operation mit mindestens einer Nicht-ModelTool-Fläche
     /// durch, sie fehlen also nicht in der Web-Registrierung.
     #[test]
-    fn test_web_route_table_from_registry_includes_approval_routes() {
+    fn test_web_route_table_from_registry_includes_approval_routes() -> TestResult {
         use harw_web::router::WebMethod;
 
-        let (_home, _cwd, assembly) = test_assembly(true);
+        let (_home, _cwd, assembly) = test_assembly(true)?;
 
         let routes = WebRouteTable::from_registry(assembly.operations())
-            .expect("no two operations claim the same web path");
+            .map_err(ctx("no two operations claim the same web path"))?;
 
         let pending = routes
             .find("/api/approval-pending")
-            .expect("approval.pending is registered as a web route from the assembly");
+            .ok_or(TestError::Missing(
+                "approval.pending is registered as a web route from the assembly",
+            ))?;
         assert_eq!(pending.operation_name(), "approval.pending");
         assert_eq!(
             routes.method_for("/api/approval-pending"),
@@ -750,12 +747,15 @@ mod tests {
 
         let resolve = routes
             .find("/api/approval-resolve")
-            .expect("approval.resolve is registered as a web route from the assembly");
+            .ok_or(TestError::Missing(
+                "approval.resolve is registered as a web route from the assembly",
+            ))?;
         assert_eq!(resolve.operation_name(), "approval.resolve");
         assert_eq!(
             routes.method_for("/api/approval-resolve"),
             Some(WebMethod::Post),
             "approval.resolve is declared mutating (POST)"
         );
+        Ok(())
     }
 }

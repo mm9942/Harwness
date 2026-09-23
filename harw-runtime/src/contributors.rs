@@ -26,13 +26,13 @@
 
 use std::sync::Arc;
 
+use harw_authority::NetworkScope;
 use harw_config::ResolvedConfig;
 use harw_core::SpawnContext;
 use harw_extension_api::ExtensionRegistryBuilder;
 use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_operations::registry::OperationRegistry;
 use harw_project_discovery::ProjectContext;
-use harw_authority::NetworkScope;
 
 use crate::assembly::{SessionLifecycleHook, TurnLimits};
 use crate::config::ConfigTrustReport;
@@ -125,8 +125,11 @@ pub trait AssemblyContributor: Send + Sync {
     /// [`crate::error::RuntimeError`], wenn der Beitrag nicht erbracht werden
     /// kann. Die Montage bricht dann ab — fail-closed: ein Lauf mit halb
     /// beigesteuertem Subsystem entsteht nicht.
-    fn contribute(&self, inputs: &AssemblyInputs<'_>, parts: &mut AssemblyParts)
-    -> RuntimeResult<()>;
+    fn contribute(
+        &self,
+        inputs: &AssemblyInputs<'_>,
+        parts: &mut AssemblyParts,
+    ) -> RuntimeResult<()>;
 }
 
 /// Die Contributors, die jeder Einstieg ohne weitere Angabe bekommt.

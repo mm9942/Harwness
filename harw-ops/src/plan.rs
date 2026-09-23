@@ -240,7 +240,11 @@ impl CallSurface {
                 format!("human:{}@{session}", principal.id())
             }
             (Self::Command | Self::Model, kind) => {
-                format!("model:{}/{}@{session}", principal_kind_label(kind), principal.id())
+                format!(
+                    "model:{}/{}@{session}",
+                    principal_kind_label(kind),
+                    principal.id()
+                )
             }
         }
     }
@@ -1553,14 +1557,15 @@ fn step_label(step: &ReconcileStep) -> String {
 #[cfg(test)]
 mod tests {
     use super::{CallSurface, PlanArgs, PlanCall};
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
+    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_operations::context::ServiceMap;
     use harw_operations::{FromRawArgs, OpContext, OpError};
     use harw_plan::actions::PlanAction;
     use harw_plan::ids::{PlanId, TaskId};
     use harw_plan::types::{PlanNodeKind, PlanNodeStatus};
     use harw_plan::{InMemoryPlanStore, PlanStore, PlanToolConfig};
-    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{
         IngressSurface, PermissionTier, Principal, PrincipalKind, SessionId, TenantId, TurnId,
         WorkspaceId,
@@ -1582,7 +1587,7 @@ mod tests {
 
     /// Baut einen `OpContext` mit temporärem Workspace und den übergebenen
     /// Diensten; ergänzt einen menschlichen Principal, falls keiner darin liegt.
-    fn context_with(mut services: ServiceMap) -> (OpContext, std::path::PathBuf) {
+    fn context_with(mut services: ServiceMap) -> TestResult<(OpContext, std::path::PathBuf)> {
         if services.get::<Principal>().is_none() {
             services.insert(human_principal());
         }
@@ -1590,11 +1595,11 @@ mod tests {
     }
 
     /// Wie [`context_with`], aber ohne den Principal zu ergänzen.
-    fn bare_context(services: ServiceMap) -> (OpContext, std::path::PathBuf) {
+    fn bare_context(services: ServiceMap) -> TestResult<(OpContext, std::path::PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!("harw-plan-op-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(root.join("ws")).expect("Test-Workspace anlegen");
+        std::fs::create_dir_all(root.join("ws")).map_err(ctx("Test-Workspace anlegen"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -1603,28 +1608,28 @@ mod tests {
                 root: std::path::PathBuf::from("ws"),
             }],
         )
-        .expect("WorkspaceRegistry bauen");
+        .map_err(ctx("WorkspaceRegistry bauen"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .expect("Workspace auflösen");
+            .map_err(ctx("Workspace auflösen"))?;
         let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
-        (
+        Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, services),
             root,
-        )
+        ))
     }
 
     /// Kontext mit aktiviertem Plan-Werkzeug und einem leeren In-Memory-Store.
-    fn context_with_store() -> (OpContext, Arc<dyn PlanStore>, std::path::PathBuf) {
+    fn context_with_store() -> TestResult<(OpContext, Arc<dyn PlanStore>, std::path::PathBuf)> {
         let store: Arc<dyn PlanStore> = Arc::new(InMemoryPlanStore::new());
         let mut services = ServiceMap::new();
         services.insert(Arc::clone(&store));
         services.insert(PlanToolConfig::enabled_defaults());
-        let (ctx, root) = context_with(services);
-        (ctx, store, root)
+        let (ctx, root) = context_with(services)?;
+        Ok((ctx, store, root))
     }
 
     fn cleanup(root: std::path::PathBuf) {
@@ -1640,13 +1645,18 @@ mod tests {
     // ── Argument-Parsing ─────────────────────────────────────────────────────
 
     #[test]
-    fn from_raw_args_without_tokens_uses_default_subcommand_inspect() {
+    fn from_raw_args_without_tokens_uses_default_subcommand_inspect() -> TestResult {
         let call = match PlanCall::from_raw_args(&toks(&[])) {
             Ok(call) => call,
-            Err(error) => panic!("leerer Input muss den Default liefern: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "leerer Input muss den Default liefern: {error}"
+                )));
+            }
         };
         assert_eq!(call.surface, CallSurface::Command);
         assert!(matches!(call.args, PlanArgs::Inspect));
+        Ok(())
     }
 
     #[test]
@@ -1656,7 +1666,7 @@ mod tests {
     }
 
     #[test]
-    fn from_raw_args_create_takes_id_and_joined_goal() {
+    fn from_raw_args_create_takes_id_and_joined_goal() -> TestResult {
         match PlanCall::from_raw_args(&toks(&["create", "p-1", "Ziel", "mit", "Worten"])) {
             Ok(PlanCall {
                 args: PlanArgs::Create { id, goal },
@@ -1666,12 +1676,17 @@ mod tests {
                 assert_eq!(id.as_deref(), Some("p-1"));
                 assert_eq!(goal.as_deref(), Some("Ziel mit Worten"));
             }
-            other => panic!("erwartet Create, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Create, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn from_raw_args_add_takes_id_kind_and_joined_objective() {
+    fn from_raw_args_add_takes_id_kind_and_joined_objective() -> TestResult {
         match PlanCall::from_raw_args(&toks(&["add", "t-1", "coding", "Modul", "bauen"])) {
             Ok(PlanCall {
                 args:
@@ -1686,12 +1701,17 @@ mod tests {
                 assert_eq!(kind.as_deref(), Some("coding"));
                 assert_eq!(objective.as_deref(), Some("Modul bauen"));
             }
-            other => panic!("erwartet Add, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Add, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn from_raw_args_patch_takes_id_field_and_joined_value() {
+    fn from_raw_args_patch_takes_id_field_and_joined_value() -> TestResult {
         match PlanCall::from_raw_args(&toks(&["patch", "t-1", "write-scope", "a.rs", "b.rs"])) {
             Ok(PlanCall {
                 args: PlanArgs::Patch { id, field, value },
@@ -1701,12 +1721,17 @@ mod tests {
                 assert_eq!(field.as_deref(), Some("write-scope"));
                 assert_eq!(value.as_deref(), Some("a.rs b.rs"));
             }
-            other => panic!("erwartet Patch, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Patch, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn from_raw_args_dep_takes_child_and_parent() {
+    fn from_raw_args_dep_takes_child_and_parent() -> TestResult {
         match PlanCall::from_raw_args(&toks(&["dep", "t-2", "t-1"])) {
             Ok(PlanCall {
                 args: PlanArgs::Dep { child, parent },
@@ -1715,12 +1740,17 @@ mod tests {
                 assert_eq!(child.as_deref(), Some("t-2"));
                 assert_eq!(parent.as_deref(), Some("t-1"));
             }
-            other => panic!("erwartet Dep, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Dep, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn from_raw_args_status_takes_id_and_status() {
+    fn from_raw_args_status_takes_id_and_status() -> TestResult {
         match PlanCall::from_raw_args(&toks(&["status", "t-1", "ready"])) {
             Ok(PlanCall {
                 args: PlanArgs::Status { id, status },
@@ -1729,12 +1759,17 @@ mod tests {
                 assert_eq!(id.as_deref(), Some("t-1"));
                 assert_eq!(status.as_deref(), Some("ready"));
             }
-            other => panic!("erwartet Status, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Status, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn from_raw_args_evidence_takes_id_kind_and_joined_locator() {
+    fn from_raw_args_evidence_takes_id_kind_and_joined_locator() -> TestResult {
         match PlanCall::from_raw_args(&toks(&["evidence", "t-1", "cargo_test", "cargo", "test"])) {
             Ok(PlanCall {
                 args: PlanArgs::Evidence { id, kind, locator },
@@ -1744,8 +1779,13 @@ mod tests {
                 assert_eq!(kind.as_deref(), Some("cargo_test"));
                 assert_eq!(locator.as_deref(), Some("cargo test"));
             }
-            other => panic!("erwartet Evidence, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Evidence, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
@@ -1769,7 +1809,7 @@ mod tests {
     }
 
     #[test]
-    fn from_raw_args_expand_condense_reopen_supersede_bind_goal_parse() {
+    fn from_raw_args_expand_condense_reopen_supersede_bind_goal_parse() -> TestResult {
         match PlanCall::from_raw_args(&toks(&["expand", "t-1", "coding:t-1a,coding:t-1b"])) {
             Ok(PlanCall {
                 args: PlanArgs::Expand { parent, children },
@@ -1778,7 +1818,11 @@ mod tests {
                 assert_eq!(parent.as_deref(), Some("t-1"));
                 assert_eq!(children.as_deref(), Some("coding:t-1a,coding:t-1b"));
             }
-            other => panic!("erwartet Expand, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Expand, war: {other:?}"
+                )));
+            }
         }
 
         match PlanCall::from_raw_args(&toks(&["condense", "a,b", "c-1", "kurz", "gefasst"])) {
@@ -1795,7 +1839,11 @@ mod tests {
                 assert_eq!(replacement.as_deref(), Some("c-1"));
                 assert_eq!(summary.as_deref(), Some("kurz gefasst"));
             }
-            other => panic!("erwartet Condense, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Condense, war: {other:?}"
+                )));
+            }
         }
 
         match PlanCall::from_raw_args(&toks(&["reopen", "t-1", "Annahme", "widerlegt"])) {
@@ -1806,7 +1854,11 @@ mod tests {
                 assert_eq!(id.as_deref(), Some("t-1"));
                 assert_eq!(reason.as_deref(), Some("Annahme widerlegt"));
             }
-            other => panic!("erwartet Reopen, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Reopen, war: {other:?}"
+                )));
+            }
         }
 
         match PlanCall::from_raw_args(&toks(&["supersede", "7"])) {
@@ -1814,7 +1866,11 @@ mod tests {
                 args: PlanArgs::Supersede { revision },
                 ..
             }) => assert_eq!(revision.as_deref(), Some("7")),
-            other => panic!("erwartet Supersede, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Supersede, war: {other:?}"
+                )));
+            }
         }
 
         match PlanCall::from_raw_args(&toks(&["bind-goal", "g-1"])) {
@@ -1822,19 +1878,29 @@ mod tests {
                 args: PlanArgs::BindGoal { goal_id },
                 ..
             }) => assert_eq!(goal_id.as_deref(), Some("g-1")),
-            other => panic!("erwartet BindGoal, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet BindGoal, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn json_surface_deserializes_to_model_surface() {
+    fn json_surface_deserializes_to_model_surface() -> TestResult {
         let value = serde_json::json!({ "action": "create", "id": "p-1", "goal": "Ziel" });
         let call: PlanCall = match serde_json::from_value(value) {
             Ok(call) => call,
-            Err(error) => panic!("JSON-Deserialisierung schlug fehl: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "JSON-Deserialisierung schlug fehl: {error}"
+                )));
+            }
         };
         assert_eq!(call.surface, CallSurface::Model);
         assert!(matches!(call.args, PlanArgs::Create { .. }));
+        Ok(())
     }
 
     #[test]
@@ -1879,12 +1945,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_plan_without_principal_is_not_available_and_writes_nothing() {
+    async fn test_plan_without_principal_is_not_available_and_writes_nothing() -> TestResult {
         let store: Arc<dyn PlanStore> = Arc::new(InMemoryPlanStore::new());
         let mut services = ServiceMap::new();
         services.insert(Arc::clone(&store));
         services.insert(PlanToolConfig::enabled_defaults());
-        let (ctx, root) = bare_context(services);
+        let (ctx, root) = bare_context(services)?;
 
         let result = run_command(&ctx, &["create", "p-1", "ohne", "Principal"]).await;
         let plan = store.current();
@@ -1894,14 +1960,19 @@ mod tests {
             Err(OpError::NotAvailable(message)) => {
                 assert_eq!(message, super::MISSING_PRINCIPAL);
             }
-            other => panic!("erwartet NotAvailable, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet NotAvailable, war: {other:?}"
+                )));
+            }
         }
         assert!(plan.is_err(), "ohne Principal darf kein Plan entstehen");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_plan_create_rejects_invalid_plan_id_without_echoing_it() {
-        let (ctx, store, root) = context_with_store();
+    async fn test_plan_create_rejects_invalid_plan_id_without_echoing_it() -> TestResult {
+        let (ctx, store, root) = context_with_store()?;
         let traversal = run_command(&ctx, &["create", "../../etc", "Ziel"]).await;
         let upper = run_command(&ctx, &["create", "My_Plan", "Ziel"]).await;
         let plan = store.current();
@@ -1911,40 +1982,60 @@ mod tests {
             match result {
                 Err(OpError::InvalidArguments(message)) => {
                     assert!(message.contains("ungültige Plan-ID"), "war: {message}");
-                    assert!(!message.contains(".."), "Rohwert/Pfad im Fehlertext: {message}");
-                    assert!(!message.contains("My_Plan"), "Rohwert im Fehlertext: {message}");
+                    assert!(
+                        !message.contains(".."),
+                        "Rohwert/Pfad im Fehlertext: {message}"
+                    );
+                    assert!(
+                        !message.contains("My_Plan"),
+                        "Rohwert im Fehlertext: {message}"
+                    );
                 }
-                other => panic!("erwartet InvalidArguments, war: {other:?}"),
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "erwartet InvalidArguments, war: {other:?}"
+                    )));
+                }
             }
         }
         assert!(plan.is_err(), "eine abgelehnte ID darf keinen Plan anlegen");
+        Ok(())
     }
 
     #[test]
-    fn test_surface_call_derives_surface_from_parse_path() {
+    fn test_surface_call_derives_surface_from_parse_path() -> TestResult {
         use crate::explore::ExploreArgs;
         let command = match super::SurfaceCall::<ExploreArgs>::from_raw_args(&toks(&["frage"])) {
             Ok(call) => call,
-            Err(error) => panic!("Command-Parse schlug fehl: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "Command-Parse schlug fehl: {error}"
+                )));
+            }
         };
         assert_eq!(command.surface, CallSurface::Command);
         let model: super::SurfaceCall<ExploreArgs> =
             match serde_json::from_value(serde_json::json!({ "question": "frage" })) {
                 Ok(call) => call,
-                Err(error) => panic!("JSON-Parse schlug fehl: {error}"),
+                Err(error) => {
+                    return Err(TestError::Unexpected(format!(
+                        "JSON-Parse schlug fehl: {error}"
+                    )));
+                }
             };
         assert_eq!(model.surface, CallSurface::Model);
         assert_eq!(
             super::SurfaceCall::<ExploreArgs>::default().surface,
             CallSurface::Model
         );
+        Ok(())
     }
 
     // ── Verfügbarkeit ────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn missing_plan_store_is_not_available() {
-        let (ctx, root) = context_with(ServiceMap::new());
+    async fn missing_plan_store_is_not_available() -> TestResult {
+        let (ctx, root) = context_with(ServiceMap::new())?;
         let result = super::plan(&ctx, PlanCall::from_command(PlanArgs::Inspect)).await;
         cleanup(root);
 
@@ -1952,18 +2043,23 @@ mod tests {
             Err(OpError::NotAvailable(message)) => {
                 assert!(message.contains("kein Plan-Store"), "war: {message}");
             }
-            other => panic!("erwartet NotAvailable, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet NotAvailable, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn disabled_config_is_not_available_and_names_the_switch() {
+    async fn disabled_config_is_not_available_and_names_the_switch() -> TestResult {
         let store: Arc<dyn PlanStore> = Arc::new(InMemoryPlanStore::new());
         let mut services = ServiceMap::new();
         services.insert(store);
         // Der Default der Konfiguration ist bewusst deaktiviert.
         services.insert(PlanToolConfig::default());
-        let (ctx, root) = context_with(services);
+        let (ctx, root) = context_with(services)?;
 
         let result = super::plan(&ctx, PlanCall::from_command(PlanArgs::Inspect)).await;
         cleanup(root);
@@ -1972,15 +2068,20 @@ mod tests {
             Err(OpError::NotAvailable(message)) => {
                 assert!(message.contains("[tools.plan] enabled"), "war: {message}");
             }
-            other => panic!("erwartet NotAvailable, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet NotAvailable, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     // ── Ende-zu-Ende gegen einen echten Store ────────────────────────────────
 
     #[tokio::test]
-    async fn create_add_dep_and_ready_reflect_the_dependency_edge() {
-        let (ctx, store, root) = context_with_store();
+    async fn create_add_dep_and_ready_reflect_the_dependency_edge() -> TestResult {
+        let (ctx, store, root) = context_with_store()?;
 
         let created = run_command(&ctx, &["create", "p-1", "Plan-Op", "verdrahten"]).await;
         let added_first =
@@ -2002,7 +2103,10 @@ mod tests {
 
         match plan {
             Ok(plan) => {
-                assert_eq!(plan.id, PlanId::parse("p-1").expect("gültige Test-ID"));
+                assert_eq!(
+                    plan.id,
+                    PlanId::parse("p-1").map_err(crate::test_support::ctx("gültige Test-ID"))?
+                );
                 assert_eq!(plan.nodes.len(), 2);
                 let second = plan
                     .nodes
@@ -2011,7 +2115,11 @@ mod tests {
                     .map(|node| node.dependencies.clone());
                 assert_eq!(second, Some(vec![TaskId::new("t-1")]));
             }
-            Err(error) => panic!("Plan lesen schlug fehl: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "Plan lesen schlug fehl: {error}"
+                )));
+            }
         }
 
         match ready {
@@ -2022,13 +2130,16 @@ mod tests {
                     "t-2 hängt an t-1 und darf nicht ausführbar sein: {text}"
                 );
             }
-            Err(error) => panic!("ready schlug fehl: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!("ready schlug fehl: {error}")));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn actor_carries_the_human_prefix_on_the_command_surface() {
-        let (ctx, store, root) = context_with_store();
+    async fn actor_carries_the_human_prefix_on_the_command_surface() -> TestResult {
+        let (ctx, store, root) = context_with_store()?;
         let created = run_command(&ctx, &["create", "p-1", "Akteur", "prüfen"]).await;
         let history = store.history(None);
         cleanup(root);
@@ -2042,16 +2153,21 @@ mod tests {
                         actor.starts_with("human:"),
                         "Command-Fläche muss 'human:' schreiben, war: {actor}"
                     ),
-                    None => panic!("History ist leer"),
+                    None => return Err(TestError::Unexpected("History ist leer".to_owned())),
                 }
             }
-            Err(error) => panic!("History lesen schlug fehl: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "History lesen schlug fehl: {error}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn actor_carries_the_model_prefix_on_the_model_tool_surface() {
-        let (ctx, store, root) = context_with_store();
+    async fn actor_carries_the_model_prefix_on_the_model_tool_surface() -> TestResult {
+        let (ctx, store, root) = context_with_store()?;
         let result = super::plan(
             &ctx,
             PlanCall::from_model(PlanArgs::Create {
@@ -2070,20 +2186,26 @@ mod tests {
                     actor.starts_with("model:"),
                     "Modell-Fläche muss 'model:' schreiben, war: {actor}"
                 ),
-                None => panic!("History ist leer"),
+                None => return Err(TestError::Unexpected("History ist leer".to_owned())),
             },
-            Err(error) => panic!("History lesen schlug fehl: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "History lesen schlug fehl: {error}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn waves_report_the_topological_layers_with_write_set_batches() {
-        let (ctx, store, root) = context_with_store();
+    async fn waves_report_the_topological_layers_with_write_set_batches() -> TestResult {
+        let (ctx, store, root) = context_with_store()?;
 
         let seeded = store
             .apply(
                 PlanAction::Create {
-                    plan_id: PlanId::parse("p-waves").expect("gültige Test-ID"),
+                    plan_id: PlanId::parse("p-waves")
+                        .map_err(crate::test_support::ctx("gültige Test-ID"))?,
                     goal: "Wellen".to_owned(),
                 },
                 "test",
@@ -2136,18 +2258,22 @@ mod tests {
                     "t-1 gehört in Welle 0: {wave_zero}"
                 );
             }
-            Err(error) => panic!("waves schlug fehl: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!("waves schlug fehl: {error}")));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn reconcile_reports_applied_and_only_proposed_steps() {
-        let (ctx, store, root) = context_with_store();
+    async fn reconcile_reports_applied_and_only_proposed_steps() -> TestResult {
+        let (ctx, store, root) = context_with_store()?;
 
         let seeded = store
             .apply(
                 PlanAction::Create {
-                    plan_id: PlanId::parse("p-rec").expect("gültige Test-ID"),
+                    plan_id: PlanId::parse("p-rec")
+                        .map_err(crate::test_support::ctx("gültige Test-ID"))?,
                     goal: "Abgleich".to_owned(),
                 },
                 "test",
@@ -2182,7 +2308,11 @@ mod tests {
                     "ein Docs-Knoten geht als Job-Vorschlag zurück: {text}"
                 );
             }
-            Err(error) => panic!("reconcile schlug fehl: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "reconcile schlug fehl: {error}"
+                )));
+            }
         }
 
         match plan {
@@ -2191,13 +2321,18 @@ mod tests {
                 plan.nodes.first().map(|node| node.status),
                 Some(PlanNodeStatus::Draft)
             ),
-            Err(error) => panic!("Plan lesen schlug fehl: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "Plan lesen schlug fehl: {error}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn missing_arguments_report_the_usage_line() {
-        let (ctx, _store, root) = context_with_store();
+    async fn missing_arguments_report_the_usage_line() -> TestResult {
+        let (ctx, _store, root) = context_with_store()?;
         let result = super::plan(
             &ctx,
             PlanCall::from_command(PlanArgs::Create {
@@ -2212,13 +2347,18 @@ mod tests {
             Err(OpError::InvalidArguments(message)) => {
                 assert!(message.contains("plan create"), "war: {message}");
             }
-            other => panic!("erwartet InvalidArguments, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet InvalidArguments, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn unknown_node_kind_is_rejected_with_the_full_value_list() {
-        let (ctx, _store, root) = context_with_store();
+    async fn unknown_node_kind_is_rejected_with_the_full_value_list() -> TestResult {
+        let (ctx, _store, root) = context_with_store()?;
         let result = super::plan(
             &ctx,
             PlanCall::from_command(PlanArgs::Add {
@@ -2235,13 +2375,18 @@ mod tests {
                 assert!(message.contains("zaubern"), "war: {message}");
                 assert!(message.contains("coding"), "Werteliste fehlt: {message}");
             }
-            other => panic!("erwartet InvalidArguments, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet InvalidArguments, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn inspect_without_a_plan_points_at_plan_create() {
-        let (ctx, _store, root) = context_with_store();
+    async fn inspect_without_a_plan_points_at_plan_create() -> TestResult {
+        let (ctx, _store, root) = context_with_store()?;
         let result = super::plan(&ctx, PlanCall::from_command(PlanArgs::Inspect)).await;
         cleanup(root);
 
@@ -2249,13 +2394,18 @@ mod tests {
             Err(OpError::InvalidArguments(message)) => {
                 assert!(message.contains("plan create"), "war: {message}");
             }
-            other => panic!("erwartet InvalidArguments, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet InvalidArguments, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn patch_sets_the_write_scope_from_a_comma_list() {
-        let (ctx, store, root) = context_with_store();
+    async fn patch_sets_the_write_scope_from_a_comma_list() -> TestResult {
+        let (ctx, store, root) = context_with_store()?;
 
         let created = run_command(&ctx, &["create", "p-1", "Patch", "prüfen"]).await;
         let added = run_command(&ctx, &["add", "t-1", "coding", "bauen"]).await;
@@ -2275,7 +2425,12 @@ mod tests {
                     .map(|node| super::join_scope(&node.write_scope));
                 assert_eq!(scope.as_deref(), Some("src/a.rs, src/b.rs"));
             }
-            Err(error) => panic!("Plan lesen schlug fehl: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "Plan lesen schlug fehl: {error}"
+                )));
+            }
         }
+        Ok(())
     }
 }

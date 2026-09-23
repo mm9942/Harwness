@@ -345,20 +345,21 @@ mod tests {
     use super::*;
     use crate::ids::{DefinitionId, DefinitionRef};
     use crate::roles::AgentRoleId;
+    use crate::test_support::TestResult;
 
-    fn make_id() -> DefinitionId {
-        DefinitionId::parse("harwness.agent.test-worker@1").unwrap()
+    fn make_id() -> TestResult<DefinitionId> {
+        Ok(DefinitionId::parse("harwness.agent.test-worker@1")?)
     }
 
-    fn make_ref() -> DefinitionRef {
-        DefinitionRef {
-            id: DefinitionId::parse("harwness.agent.worker-base@1").unwrap(),
+    fn make_ref() -> TestResult<DefinitionRef> {
+        Ok(DefinitionRef {
+            id: DefinitionId::parse("harwness.agent.worker-base@1")?,
             version: None,
-        }
+        })
     }
 
     #[test]
-    fn test_display_all_variants() {
+    fn test_display_all_variants() -> TestResult {
         let cases: Vec<DslError> = vec![
             DslError::Parse("fehler beim parsen".to_owned()),
             DslError::InvalidId {
@@ -366,26 +367,26 @@ mod tests {
                 reason: "kein @-Zeichen",
             },
             DslError::MissingBase {
-                of: Box::new(make_id()),
-                referenced: Box::new(make_ref()),
+                of: Box::new(make_id()?),
+                referenced: Box::new(make_ref()?),
                 location: DiagLocation::none(),
             },
             DslError::MissingMixin {
-                of: Box::new(make_id()),
-                referenced: Box::new(make_ref()),
+                of: Box::new(make_id()?),
+                referenced: Box::new(make_ref()?),
                 location: DiagLocation::none(),
             },
             DslError::InheritanceCycle {
-                cycle: vec![make_id(), make_ref().id],
+                cycle: vec![make_id()?, make_ref()?.id],
                 location: DiagLocation::none(),
             },
             DslError::AuthorityElevation {
-                of: Box::new(make_id()),
+                of: Box::new(make_id()?),
                 added_capabilities: vec!["spawn.child".to_owned()],
                 location: DiagLocation::none(),
             },
             DslError::IllegalRoleForMixin {
-                mixin: Box::new(make_id()),
+                mixin: Box::new(make_id()?),
                 role: AgentRoleId::Worker,
                 location: DiagLocation::none(),
             },
@@ -408,6 +409,7 @@ mod tests {
                 std::mem::discriminant(err)
             );
         }
+        Ok(())
     }
 
     #[test]
@@ -428,11 +430,11 @@ mod tests {
     }
 
     #[test]
-    fn test_inheritance_cycle_display_includes_path_and_location() {
+    fn test_inheritance_cycle_display_includes_path_and_location() -> TestResult {
         use std::error::Error;
 
         let err = DslError::InheritanceCycle {
-            cycle: vec![make_id(), make_ref().id],
+            cycle: vec![make_id()?, make_ref()?.id],
             location: DiagLocation::field("extends"),
         };
         let msg = err.to_string();
@@ -440,12 +442,13 @@ mod tests {
         assert!(msg.contains("harwness.agent.worker-base@1"), "got: {msg}");
         assert!(msg.contains("extends"), "got: {msg}");
         assert!(err.source().is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_authority_elevation_display_contains_field_path_when_set() {
+    fn test_authority_elevation_display_contains_field_path_when_set() -> TestResult {
         let err = DslError::AuthorityElevation {
-            of: Box::new(make_id()),
+            of: Box::new(make_id()?),
             added_capabilities: vec!["agent.spawn.child".to_owned()],
             location: DiagLocation::field("authority.capabilities[3]"),
         };
@@ -454,6 +457,7 @@ mod tests {
             msg.contains("authority.capabilities"),
             "Display should contain 'authority.capabilities', got: {msg}"
         );
+        Ok(())
     }
 
     #[test]
@@ -484,10 +488,10 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_base_display_includes_location_when_present() {
+    fn test_missing_base_display_includes_location_when_present() -> TestResult {
         let err = DslError::MissingBase {
-            of: Box::new(make_id()),
-            referenced: Box::new(make_ref()),
+            of: Box::new(make_id()?),
+            referenced: Box::new(make_ref()?),
             location: DiagLocation {
                 layer: Some("BuiltIn".to_owned()),
                 field_path: None,
@@ -498,12 +502,13 @@ mod tests {
             msg.contains("BuiltIn"),
             "expected layer in message, got: {msg}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_authority_elevation_display_no_field_path_when_none() {
+    fn test_authority_elevation_display_no_field_path_when_none() -> TestResult {
         let err = DslError::AuthorityElevation {
-            of: Box::new(make_id()),
+            of: Box::new(make_id()?),
             added_capabilities: vec!["x".to_owned()],
             location: DiagLocation::none(),
         };
@@ -511,5 +516,6 @@ mod tests {
         // No location suffix should be appended
         assert!(!msg.contains("field:"), "unexpected 'field:' in: {msg}");
         assert!(!msg.contains("layer:"), "unexpected 'layer:' in: {msg}");
+        Ok(())
     }
 }

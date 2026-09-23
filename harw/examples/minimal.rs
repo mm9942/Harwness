@@ -22,7 +22,7 @@ role = "worker"
 specialization = "minimal-example"
 "#;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── 1. Build and populate the OperationRegistry ───────────────────────────
     let mut registry = OperationRegistry::new();
     harw::ops::builtins::register_all(&mut registry);
@@ -48,8 +48,7 @@ fn main() {
         .unwrap_or("(not found)");
 
     // ── 3. Assemble the default ExtensionRegistry ─────────────────────────────
-    let assembled = harw::defaults::assemble_default_registry(std::env::temp_dir())
-        .expect("project discovery must succeed from temp_dir");
+    let assembled = harw::defaults::assemble_default_registry(std::env::temp_dir())?;
 
     let total_tools: usize = assembled
         .registry
@@ -59,8 +58,7 @@ fn main() {
         .sum();
 
     // ── 4. Parse a minimal agent TOML definition ──────────────────────────────
-    let raw = harw::agent::parse::parse_toml(MINIMAL_AGENT_TOML)
-        .expect("minimal TOML fixture must parse without error");
+    let raw = harw::agent::parse::parse_toml(MINIMAL_AGENT_TOML)?;
 
     // ── 5. Report ─────────────────────────────────────────────────────────────
     println!(
@@ -69,4 +67,5 @@ fn main() {
          agent_id={agent_id}",
         agent_id = raw.id,
     );
+    Ok(())
 }

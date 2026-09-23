@@ -374,7 +374,11 @@ impl CommandPopup {
             if desc_x < area.right() {
                 let desc_width = area.right().saturating_sub(desc_x);
                 let desc_area = Rect::new(desc_x, y, desc_width, 1);
-                Widget::render(Line::styled(item.description.clone(), desc_style), desc_area, buf);
+                Widget::render(
+                    Line::styled(item.description.clone(), desc_style),
+                    desc_area,
+                    buf,
+                );
             }
         }
     }
@@ -386,59 +390,80 @@ mod tests {
 
     use super::*;
     use crate::CommandRegistry;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn make_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn built_in_popup() -> CommandPopup {
-        CommandPopup::new(&CommandRegistry::built_in())
+    fn built_in_popup() -> TestResult<CommandPopup> {
+        let registry = CommandRegistry::built_in().map_err(ctx("built_in"))?;
+        Ok(CommandPopup::new(&registry))
     }
 
     #[test]
-    fn popup_contains_every_registry_spec() {
-        let registry = CommandRegistry::built_in();
+    fn popup_contains_every_registry_spec() -> TestResult {
+        let registry = CommandRegistry::built_in().map_err(ctx("built_in"))?;
         let popup = CommandPopup::new(&registry);
         assert_eq!(popup.items.len(), registry.specs().len());
         for spec in registry.specs() {
-            assert!(popup.items.iter().any(|item| item.name == spec.name.as_str()));
+            assert!(
+                popup
+                    .items
+                    .iter()
+                    .any(|item| item.name == spec.name.as_str())
+            );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_filter_narrows_list() {
-        let mut popup = built_in_popup();
+    fn test_filter_narrows_list() -> TestResult {
+        let mut popup = built_in_popup()?;
         let initial_count = popup.filtered.len();
         assert!(initial_count > 1);
         popup.on_query_change("hel");
         assert_eq!(popup.filtered.len(), 1);
         assert_eq!(popup.selected_name(), Some("help"));
+        Ok(())
     }
 
     #[test]
-    fn test_enter_returns_accept() {
-        let mut popup = built_in_popup();
-        let expected = popup.selected_name().unwrap().to_owned();
-        assert_eq!(popup.on_key(make_key(KeyCode::Enter)), PopupAction::Accept(expected));
+    fn test_enter_returns_accept() -> TestResult {
+        let mut popup = built_in_popup()?;
+        let expected = popup
+            .selected_name()
+            .ok_or(TestError::Missing("selected_name"))?
+            .to_owned();
+        assert_eq!(
+            popup.on_key(make_key(KeyCode::Enter)),
+            PopupAction::Accept(expected)
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_esc_returns_cancel() {
-        let mut popup = built_in_popup();
+    fn test_esc_returns_cancel() -> TestResult {
+        let mut popup = built_in_popup()?;
         assert_eq!(popup.on_key(make_key(KeyCode::Esc)), PopupAction::Cancel);
+        Ok(())
     }
 
     #[test]
-    fn test_digit_selects_nth_item() {
-        let mut popup = built_in_popup();
+    fn test_digit_selects_nth_item() -> TestResult {
+        let mut popup = built_in_popup()?;
         assert!(popup.filtered.len() >= 2);
         let second_name = popup.items[popup.filtered[1]].name.clone();
-        assert_eq!(popup.on_key(make_key(KeyCode::Char('2'))), PopupAction::Accept(second_name));
+        assert_eq!(
+            popup.on_key(make_key(KeyCode::Char('2'))),
+            PopupAction::Accept(second_name)
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_navigation_stays_in_bounds() {
-        let mut popup = built_in_popup();
+    fn test_navigation_stays_in_bounds() -> TestResult {
+        let mut popup = built_in_popup()?;
         let len = popup.filtered.len();
         popup.move_up();
         assert_eq!(popup.selected, 0);
@@ -447,42 +472,50 @@ mod tests {
         }
         assert_eq!(popup.selected, len - 1);
         assert!(popup.selected_name().is_some());
+        Ok(())
     }
 
     #[test]
-    fn test_is_empty_after_no_match_query() {
-        let mut popup = built_in_popup();
+    fn test_is_empty_after_no_match_query() -> TestResult {
+        let mut popup = built_in_popup()?;
         popup.on_query_change("xyzzy_existiert_nicht_12345");
         assert!(popup.is_empty());
         assert_eq!(popup.selected_name(), None);
+        Ok(())
     }
 
     #[test]
-    fn test_digit_out_of_range_returns_stay() {
-        let mut popup = built_in_popup();
+    fn test_digit_out_of_range_returns_stay() -> TestResult {
+        let mut popup = built_in_popup()?;
         popup.on_query_change("help");
         assert_eq!(popup.filtered.len(), 1);
-        assert_eq!(popup.on_key(make_key(KeyCode::Char('2'))), PopupAction::Stay);
+        assert_eq!(
+            popup.on_key(make_key(KeyCode::Char('2'))),
+            PopupAction::Stay
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_empty_query_restores_all_items() {
-        let mut popup = built_in_popup();
+    fn test_empty_query_restores_all_items() -> TestResult {
+        let mut popup = built_in_popup()?;
         let initial_count = popup.filtered.len();
         popup.on_query_change("help");
         popup.on_query_change("");
         assert_eq!(popup.filtered.len(), initial_count);
+        Ok(())
     }
 
     #[test]
-    fn test_selected_clamped_after_filter_shrinks() {
-        let mut popup = built_in_popup();
+    fn test_selected_clamped_after_filter_shrinks() -> TestResult {
+        let mut popup = built_in_popup()?;
         for _ in 0..20 {
             popup.move_down();
         }
         assert!(popup.selected > 0);
         popup.on_query_change("help");
         assert_eq!(popup.selected, 0);
+        Ok(())
     }
 
     /// Case-insensitive Rang-Klassifikation: Präfix-Treffer stehen vor
@@ -496,8 +529,8 @@ mod tests {
     /// beide Präfix-Treffer für `mo`; `/memory` ist nur ein Teilstring-Treffer
     /// und muss dahinter einsortiert werden.
     #[test]
-    fn ranking_prefers_prefix_matches_over_substring_matches() {
-        let mut popup = built_in_popup();
+    fn ranking_prefers_prefix_matches_over_substring_matches() -> TestResult {
+        let mut popup = built_in_popup()?;
         popup.on_query_change("mo");
 
         assert_eq!(
@@ -533,17 +566,22 @@ mod tests {
                 popup.items[idx].name
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn visible_range_scrolls_when_selection_passes_available_rows() {
-        let mut popup = built_in_popup();
-        assert!(popup.filtered.len() > 8, "test requires more than eight commands");
+    fn visible_range_scrolls_when_selection_passes_available_rows() -> TestResult {
+        let mut popup = built_in_popup()?;
+        assert!(
+            popup.filtered.len() > 8,
+            "test requires more than eight commands"
+        );
         for _ in 0..8 {
             popup.move_down();
         }
 
         assert_eq!(popup.visible_range(8), 1..9);
         assert!(popup.visible_range(8).contains(&popup.selected));
+        Ok(())
     }
 }

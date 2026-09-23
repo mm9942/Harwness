@@ -304,8 +304,8 @@ fn main() -> ExitCode {
 fn init_tracing(level: cli::LogLevel) {
     use tracing_subscriber::EnvFilter;
 
-    let filter = EnvFilter::try_new(level.as_filter_directive())
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        EnvFilter::try_new(level.as_filter_directive()).unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -345,14 +345,28 @@ fn init_tracing(level: cli::LogLevel) {
 /// fehlende Landlock-Unterstützung sind **kein** `Err` (siehe
 /// Moduldoku).
 fn run(cli: Cli) -> SentinelBinResult<()> {
+    // `completions` läuft vor jedem Sink-, Socket- oder Landlock-Schritt:
+    // es schreibt nur ein Skript (bzw. installiert es) und beendet sich.
+    if let Some(harw_completions::CompletionsSubcommand::Completions(args)) = &cli.command {
+        harw_completions::run_completions(
+            &mut <Cli as clap::CommandFactory>::command(),
+            "harw-sentinel",
+            args,
+            &harw_completions::HomeEnv::from_process(),
+            &mut std::io::stdout().lock(),
+        )?;
+        return Ok(());
+    }
+
     let home = match cli.home.clone() {
         Some(path) => path,
         None => harw_home::paths::home_dir().map_err(SentinelBinError::from)?,
     };
 
     let telemetry_dir = harw_home::paths::telemetry_dir(&home);
-    let sink: Arc<dyn TelemetrySink> =
-        Arc::new(FileSink::open(&telemetry_dir, TELEMETRY_MAX_BYTES).map_err(SentinelBinError::from)?);
+    let sink: Arc<dyn TelemetrySink> = Arc::new(
+        FileSink::open(&telemetry_dir, TELEMETRY_MAX_BYTES).map_err(SentinelBinError::from)?,
+    );
     tracing::info!(dir = %telemetry_dir.display(), "telemetry sink opened");
 
     let socket_path = cli
@@ -379,7 +393,11 @@ fn run(cli: Cli) -> SentinelBinResult<()> {
     // ebenda).
     let landlock_event = if outcome.is_degraded() {
         let event = sandbox::landlock_degraded_event(Timestamp::now());
-        tracing::warn!(?event, ?outcome, "running without landlock self-restriction");
+        tracing::warn!(
+            ?event,
+            ?outcome,
+            "running without landlock self-restriction"
+        );
         Some(event)
     } else {
         tracing::info!(?outcome, "landlock self-restriction applied");
@@ -474,7 +492,10 @@ fn poll_once(sentinel: &mut Sentinel, inbox: Option<&IpcInboxHandle>, sink: &dyn
                 "buffer frozen into evidence"
             );
             let reported = findings::report_findings(sink, &evidence, now);
-            tracing::debug!(reported, "security rules evaluated against this cycle's evidence");
+            tracing::debug!(
+                reported,
+                "security rules evaluated against this cycle's evidence"
+            );
         }
         Err(error) => {
             tracing::warn!(error = %error, "failed to freeze buffer into evidence this round");
@@ -600,7 +621,8 @@ fn drain_external_events(_sentinel: &mut Sentinel, _inbox: Option<&IpcInboxHandl
 fn spawn_ipc_if_available(socket_path: &std::path::Path) -> Option<IpcInboxHandle> {
     match ipc::IpcListener::bind(socket_path) {
         Ok(listener) => {
-            let inbox: IpcInboxHandle = Arc::new(Mutex::new(ipc::IpcInbox::new(IPC_INBOX_CAPACITY)));
+            let inbox: IpcInboxHandle =
+                Arc::new(Mutex::new(ipc::IpcInbox::new(IPC_INBOX_CAPACITY)));
             // Der Pfad kommt vom Listener, nicht aus `socket_path`: gemeldet
             // wird damit, woran tatsächlich gebunden wurde, nicht was
             // angefordert war. Die beiden können auseinandergehen, und dann
@@ -636,6 +658,7 @@ fn spawn_ipc_if_available(socket_path: &std::path::Path) -> Option<IpcInboxHandl
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     // Eine Laufzeit-Zusicherung über eine Konstante kann nicht fehlschlagen --
     // clippy hat recht, dass das kein Test ist. Als `const`-Zusicherung wird
@@ -644,25 +667,29 @@ mod tests {
     const _: () = assert!(TELEMETRY_MAX_BYTES > 0);
 
     #[test]
-    fn test_run_rejects_a_home_override_pointing_at_a_file_not_a_directory() {
-        let file = tempfile::NamedTempFile::new().expect("temp file");
-        let cli = Cli::try_parse_from([
-            "harw-sentinel",
-            "--once",
-            "--home",
-            file.path().to_str().expect("utf8 path"),
-        ])
-        .expect("valid cli");
+    fn test_run_rejects_a_home_override_pointing_at_a_file_not_a_directory() -> TestResult {
+        let file = tempfile::NamedTempFile::new().map_err(ctx("temp file"))?;
+        let path = file
+            .path()
+            .to_str()
+            .ok_or(TestError::Missing("utf8 path"))?;
+        let cli = Cli::try_parse_from(["harw-sentinel", "--once", "--home", path])
+            .map_err(ctx("valid cli"))?;
 
         let result = run(cli);
         assert!(
-            matches!(result, Err(SentinelBinError::Sink(_)) | Err(SentinelBinError::Home(_))),
+            matches!(
+                result,
+                Err(SentinelBinError::Sink(_)) | Err(SentinelBinError::Home(_))
+            ),
             "a non-directory --home must fail to resolve or to open the telemetry sink"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_landlock_degraded_event_survives_being_captured_before_the_sentinel_exists() {
+    fn test_landlock_degraded_event_survives_being_captured_before_the_sentinel_exists()
+    -> TestResult {
         // Spiegelt die Reihenfolge in `run()`: `sandbox::restrict_self` (und
         // damit `landlock_degraded_event`) läuft, bevor `Sentinel::new` je
         // aufgerufen wird — die Antwort auf Frage 3 der Moduldoku, Abschnitt
@@ -671,17 +698,29 @@ mod tests {
         let landlock_event = Some(sandbox::landlock_degraded_event(Timestamp::UNIX_EPOCH));
 
         // An dieser Stelle existiert `sentinel` in `run()` noch nicht.
-        let mut sentinel = Sentinel::new(Vec::new(), Arc::new(harw_observe::NullSink), SentinelConfig::default());
+        let mut sentinel = Sentinel::new(
+            Vec::new(),
+            Arc::new(harw_observe::NullSink),
+            SentinelConfig::default(),
+        );
         if let Some(event) = landlock_event {
             sentinel.record_external_event(event);
         }
 
-        assert_eq!(sentinel.buffer().event_len(), 1, "the landlock event must not be lost");
+        assert_eq!(
+            sentinel.buffer().event_len(),
+            1,
+            "the landlock event must not be lost"
+        );
         let evidence = sentinel
             .freeze(Timestamp::UNIX_EPOCH)
-            .expect("well-formed buffer content always encodes");
+            .map_err(ctx("well-formed buffer content always encodes"))?;
         assert_eq!(evidence.events.len(), 1);
-        assert_eq!(evidence.events[0].sensor.as_str(), sandbox::LANDLOCK_STATUS_SENSOR_ID);
+        assert_eq!(
+            evidence.events[0].sensor.as_str(),
+            sandbox::LANDLOCK_STATUS_SENSOR_ID
+        );
+        Ok(())
     }
 
     /// Deckt die IPC-Inbox-Entleerung ab — ausschließlich über
@@ -716,8 +755,10 @@ mod tests {
         }
 
         fn mock_degrading_sensor(id: &str) -> Arc<dyn Sensor> {
-            let scope = ReadScope::from_roots([PathBuf::from("/nonexistent-harw-sentinel-mock-root")]);
-            let handle = SensorHandle::new(SensorId::from_str(id), Capability::ReadProcStat).bind(scope);
+            let scope =
+                ReadScope::from_roots([PathBuf::from("/nonexistent-harw-sentinel-mock-root")]);
+            let handle =
+                SensorHandle::new(SensorId::from_str(id), Capability::ReadProcStat).bind(scope);
             Arc::new(AlwaysPermanentlyFailingSensor { handle })
         }
 
@@ -741,37 +782,46 @@ mod tests {
         }
 
         #[test]
-        fn test_externally_received_ipc_event_appears_in_buffer_and_freeze() {
+        fn test_externally_received_ipc_event_appears_in_buffer_and_freeze() -> TestResult {
             let inbox: IpcInboxHandle = Arc::new(Mutex::new(ipc::IpcInbox::new(4)));
             inbox
                 .lock()
-                .expect("uncontended lock")
+                .map_err(ctx("uncontended lock"))?
                 .push(ipc::ReceivedEvent {
                     event: sample_probe_event("probe-fs-0"),
                     peer: sample_peer(),
                 });
 
-            let mut sentinel = Sentinel::new(Vec::new(), Arc::new(harw_observe::NullSink), SentinelConfig::default());
+            let mut sentinel = Sentinel::new(
+                Vec::new(),
+                Arc::new(harw_observe::NullSink),
+                SentinelConfig::default(),
+            );
             poll_once(&mut sentinel, Some(&inbox), &harw_observe::NullSink);
 
             assert_eq!(sentinel.buffer().event_len(), 1);
             let evidence = sentinel
                 .freeze(Timestamp::UNIX_EPOCH)
-                .expect("well-formed buffer content always encodes");
+                .map_err(ctx("well-formed buffer content always encodes"))?;
             assert_eq!(evidence.events.len(), 1);
             assert_eq!(evidence.events[0].sensor.as_str(), "probe-fs-0");
+            Ok(())
         }
 
         #[test]
-        fn test_poll_once_drains_the_inbox_after_poll_all_so_internal_events_precede_external_ones() {
+        fn test_poll_once_drains_the_inbox_after_poll_all_so_internal_events_precede_external_ones()
+        -> TestResult {
             let sensor = mock_degrading_sensor("mock-degrade-0");
-            let mut sentinel =
-                Sentinel::new(vec![sensor], Arc::new(harw_observe::NullSink), SentinelConfig::default());
+            let mut sentinel = Sentinel::new(
+                vec![sensor],
+                Arc::new(harw_observe::NullSink),
+                SentinelConfig::default(),
+            );
 
             let inbox: IpcInboxHandle = Arc::new(Mutex::new(ipc::IpcInbox::new(4)));
             inbox
                 .lock()
-                .expect("uncontended lock")
+                .map_err(ctx("uncontended lock"))?
                 .push(ipc::ReceivedEvent {
                     event: sample_probe_event("probe-fs-0"),
                     peer: sample_peer(),
@@ -790,8 +840,16 @@ mod tests {
                 .events()
                 .map(|event| event.sensor.as_str().to_owned())
                 .collect();
-            assert_eq!(ids, vec!["mock-degrade-0".to_owned(), "probe-fs-0".to_owned()]);
-            assert_eq!(sentinel.degraded_count(), 1, "the registered mock sensor degraded");
+            assert_eq!(
+                ids,
+                vec!["mock-degrade-0".to_owned(), "probe-fs-0".to_owned()]
+            );
+            assert_eq!(
+                sentinel.degraded_count(),
+                1,
+                "the registered mock sensor degraded"
+            );
+            Ok(())
         }
 
         #[test]
@@ -799,9 +857,17 @@ mod tests {
             // `inbox == None` entspricht einem gescheiterten `bind()` beim
             // Start (siehe `spawn_ipc_if_available`) — kein Fehler, nur kein
             // externes Ereignis in diesem Zyklus.
-            let mut sentinel = Sentinel::new(Vec::new(), Arc::new(harw_observe::NullSink), SentinelConfig::default());
+            let mut sentinel = Sentinel::new(
+                Vec::new(),
+                Arc::new(harw_observe::NullSink),
+                SentinelConfig::default(),
+            );
             poll_once(&mut sentinel, None, &harw_observe::NullSink);
             assert_eq!(sentinel.buffer().event_len(), 0);
         }
     }
 }
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

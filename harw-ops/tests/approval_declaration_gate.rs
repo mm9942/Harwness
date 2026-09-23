@@ -34,7 +34,11 @@ fn full_registry() -> OperationRegistry {
     let mut registry = OperationRegistry::new();
     harw_ops::register_all(&mut registry);
     let added = harw_ops::register_plan_tools(&mut registry, &PlanToolConfig::enabled_defaults());
-    assert_eq!(added, harw_ops::PLAN_TOOL_COUNT, "Planungsfläche muss registriert sein");
+    assert_eq!(
+        added,
+        harw_ops::PLAN_TOOL_COUNT,
+        "Planungsfläche muss registriert sein"
+    );
     registry
 }
 

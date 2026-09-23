@@ -137,16 +137,17 @@ impl ContextBudgetSpec {
 mod tests {
     use super::ContextBudgetSpec;
     use crate::fragment::SectionName;
+    use crate::test_support::{TestResult, ctx};
     use harw_lens_types::BudgetSpec;
     use std::collections::BTreeMap;
 
-    fn section(name: &str) -> SectionName {
-        SectionName::try_new(name).unwrap()
+    fn section(name: &str) -> TestResult<SectionName> {
+        SectionName::try_new(name).map_err(ctx("valid section name"))
     }
 
     #[test]
-    fn test_tighten_returns_minimum_per_shared_section() {
-        let history = section("history.tail");
+    fn test_tighten_returns_minimum_per_shared_section() -> TestResult {
+        let history = section("history.tail")?;
 
         let mut a_sections = BTreeMap::new();
         a_sections.insert(history.clone(), 100);
@@ -164,12 +165,13 @@ mod tests {
 
         let tightened = a.tighten(&b);
         assert_eq!(tightened.per_section.get(&history), Some(&40));
+        Ok(())
     }
 
     #[test]
-    fn test_tighten_keeps_section_present_only_in_one_side() {
-        let only_in_a = section("plan.current");
-        let only_in_b = section("history.tail");
+    fn test_tighten_keeps_section_present_only_in_one_side() -> TestResult {
+        let only_in_a = section("plan.current")?;
+        let only_in_b = section("history.tail")?;
 
         let mut a_sections = BTreeMap::new();
         a_sections.insert(only_in_a.clone(), 77);
@@ -188,10 +190,11 @@ mod tests {
         let tightened = a.tighten(&b);
         assert_eq!(tightened.per_section.get(&only_in_a), Some(&77));
         assert_eq!(tightened.per_section.get(&only_in_b), Some(&55));
+        Ok(())
     }
 
     #[test]
-    fn test_tighten_result_never_exceeds_either_input() {
+    fn test_tighten_result_never_exceeds_either_input() -> TestResult {
         // Ein Alias statt eines vierfach geschachtelten Tupeltyps -- clippy
         // hat recht, dass die rohe Form nicht mehr lesbar ist.
         type SectionBudgets<'a> = Vec<(&'a str, u32)>;
@@ -208,19 +211,21 @@ mod tests {
         ];
 
         for (total_a, total_b, sections_a, sections_b) in cases {
+            let a_per_section: BTreeMap<SectionName, u32> = sections_a
+                .iter()
+                .map(|(name, value)| section(name).map(|s| (s, *value)))
+                .collect::<TestResult<BTreeMap<_, _>>>()?;
             let a = ContextBudgetSpec {
                 total: BudgetSpec { total: total_a },
-                per_section: sections_a
-                    .iter()
-                    .map(|(name, value)| (section(name), *value))
-                    .collect(),
+                per_section: a_per_section,
             };
+            let b_per_section: BTreeMap<SectionName, u32> = sections_b
+                .iter()
+                .map(|(name, value)| section(name).map(|s| (s, *value)))
+                .collect::<TestResult<BTreeMap<_, _>>>()?;
             let b = ContextBudgetSpec {
                 total: BudgetSpec { total: total_b },
-                per_section: sections_b
-                    .iter()
-                    .map(|(name, value)| (section(name), *value))
-                    .collect(),
+                per_section: b_per_section,
             };
 
             let tightened = a.tighten(&b);
@@ -237,25 +242,28 @@ mod tests {
                 }
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_section_budget_falls_back_to_total_when_section_absent() {
+    fn test_section_budget_falls_back_to_total_when_section_absent() -> TestResult {
         let spec = ContextBudgetSpec {
             total: BudgetSpec { total: 500 },
             per_section: BTreeMap::new(),
         };
-        assert_eq!(spec.section_budget(&section("plan.current")), 500);
+        assert_eq!(spec.section_budget(&section("plan.current")?), 500);
+        Ok(())
     }
 
     #[test]
-    fn test_section_budget_prefers_explicit_entry_over_total() {
+    fn test_section_budget_prefers_explicit_entry_over_total() -> TestResult {
         let mut per_section = BTreeMap::new();
-        per_section.insert(section("history.tail"), 40);
+        per_section.insert(section("history.tail")?, 40);
         let spec = ContextBudgetSpec {
             total: BudgetSpec { total: 500 },
             per_section,
         };
-        assert_eq!(spec.section_budget(&section("history.tail")), 40);
+        assert_eq!(spec.section_budget(&section("history.tail")?), 40);
+        Ok(())
     }
 }

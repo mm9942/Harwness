@@ -282,6 +282,7 @@ mod tests {
         CompactionPolicy, ContextPolicy, DelegationPolicy, ModelRuntimeProfile, RetryPolicy,
         TaskShape,
     };
+    use crate::test_support::{TestError, TestResult};
 
     // -----------------------------------------------------------------------
     // Fixture helpers
@@ -468,7 +469,7 @@ mod tests {
     ///
     /// Design ref: §6 — FocusedCodingWorker formula.
     #[test]
-    fn test_pick_returns_best_scoring() {
+    fn test_pick_returns_best_scoring() -> TestResult {
         let desc_low = make_descriptor("prov", "low-model");
         let desc_high = make_descriptor("prov", "high-model");
         let low_profile = make_profile();
@@ -505,7 +506,7 @@ mod tests {
         ];
 
         let best = pick(ModelRole::FocusedCodingWorker, &candidates)
-            .expect("non-empty pool must yield Some");
+            .ok_or(TestError::Missing("non-empty pool must yield Some"))?;
         assert_eq!(
             best.descriptor.model, "high-model",
             "pick must return the candidate with the higher score"
@@ -520,6 +521,7 @@ mod tests {
         assert_eq!(best.profile.max_parallel_tools, 6);
         assert_eq!(best.profile.delegation_policy, DelegationPolicy::Bold);
         assert_eq!(best.profile.max_child_fanout, 5);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -529,7 +531,7 @@ mod tests {
     /// Verifies that routing rejects an otherwise higher-scoring candidate
     /// whose profile violates the runtime limits.
     #[test]
-    fn test_pick_skips_candidate_with_invalid_runtime_profile() {
+    fn test_pick_skips_candidate_with_invalid_runtime_profile() -> TestResult {
         let valid_descriptor = make_descriptor("prov", "valid-model");
         let invalid_descriptor = make_descriptor("prov", "invalid-model");
         let valid_profile = make_profile();
@@ -556,10 +558,12 @@ mod tests {
         assert_eq!(ranked.len(), 1, "invalid profiles must not produce routes");
         assert_eq!(ranked[0].descriptor.model, "valid-model");
 
-        let selected = pick(ModelRole::Scout, &candidates).expect("valid candidate must remain");
+        let selected = pick(ModelRole::Scout, &candidates)
+            .ok_or(TestError::Missing("valid candidate must remain"))?;
         assert_eq!(selected.descriptor.model, "valid-model");
         assert!(selected.has_valid_runtime_profile());
         assert!(!candidates[1].has_valid_runtime_profile());
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -570,27 +574,22 @@ mod tests {
     ///
     /// Design ref: §6 — `#[serde(rename_all = "snake_case")]` on `ModelRole`.
     #[test]
-    fn test_role_enum_serde_snake_case() {
+    fn test_role_enum_serde_snake_case() -> TestResult {
         assert_eq!(
-            serde_json::to_string(&ModelRole::FocusedCodingWorker).unwrap(),
+            serde_json::to_string(&ModelRole::FocusedCodingWorker)?,
             "\"focused_coding_worker\""
         );
         assert_eq!(
-            serde_json::to_string(&ModelRole::Orchestrator).unwrap(),
+            serde_json::to_string(&ModelRole::Orchestrator)?,
             "\"orchestrator\""
         );
         assert_eq!(
-            serde_json::to_string(&ModelRole::RepositoryWorker).unwrap(),
+            serde_json::to_string(&ModelRole::RepositoryWorker)?,
             "\"repository_worker\""
         );
-        assert_eq!(
-            serde_json::to_string(&ModelRole::Verifier).unwrap(),
-            "\"verifier\""
-        );
-        assert_eq!(
-            serde_json::to_string(&ModelRole::Scout).unwrap(),
-            "\"scout\""
-        );
+        assert_eq!(serde_json::to_string(&ModelRole::Verifier)?, "\"verifier\"");
+        assert_eq!(serde_json::to_string(&ModelRole::Scout)?, "\"scout\"");
+        Ok(())
     }
 
     // -----------------------------------------------------------------------

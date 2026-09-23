@@ -570,6 +570,7 @@ pub fn openai_observations() -> Vec<ObservedModelBehavior> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     /// Jeder Descriptor muss ein positives Kontextfenster haben.
     #[test]
@@ -640,30 +641,32 @@ mod tests {
 
     /// o3-pro hat kein Streaming (laut JSON streaming: "none").
     #[test]
-    fn o3_pro_has_no_streaming() {
+    fn o3_pro_has_no_streaming() -> TestResult {
         let d = openai_descriptors()
             .into_iter()
             .find(|d| d.model == "o3-pro")
-            .expect("o3-pro fehlt im Katalog");
+            .ok_or(TestError::Missing("o3-pro descriptor"))?;
         assert_eq!(
             d.capabilities.streaming,
             StreamingSupport::None,
             "o3-pro sollte kein Streaming haben"
         );
+        Ok(())
     }
 
     /// o3-deep-research hat kein Tool-Calling (laut JSON tool_calling: "none").
     #[test]
-    fn o3_deep_research_has_no_tool_calling() {
+    fn o3_deep_research_has_no_tool_calling() -> TestResult {
         let d = openai_descriptors()
             .into_iter()
             .find(|d| d.model == "o3-deep-research")
-            .expect("o3-deep-research fehlt im Katalog");
+            .ok_or(TestError::Missing("o3-deep-research descriptor"))?;
         assert_eq!(
             d.capabilities.tool_calling,
             ToolCallingSupport::None,
             "o3-deep-research sollte kein Tool-Calling haben"
         );
+        Ok(())
     }
 
     /// Deprecated-Modelle sind korrekt markiert.

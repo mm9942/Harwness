@@ -1,3 +1,6 @@
+mod common;
+
+use common::{TestError, TestResult, ctx};
 use harw_browser::error::Error as BrowserError;
 use harw_browser::host::BrowserHost;
 use harw_browser::policy::{
@@ -10,20 +13,15 @@ use harw_browser_thirtyfour::{
 use std::path::{Path, PathBuf};
 use url::Url;
 
-fn url(value: &str) -> Url {
-    match Url::parse(value) {
-        Ok(url) => url,
-        Err(error) => panic!("test URL must be valid: {error}"),
-    }
+fn url(value: &str) -> TestResult<Url> {
+    Url::parse(value).map_err(ctx("test URL must be valid"))
 }
 
-fn open_request(start_url: &str, allowed_origin: &str) -> OpenBrowserRequest {
-    let allowed_origins = match OriginPolicy::from_origins([allowed_origin], true) {
-        Ok(policy) => policy,
-        Err(error) => panic!("test origin policy must be valid: {error}"),
-    };
-    OpenBrowserRequest {
-        start_url: url(start_url),
+fn open_request(start_url: &str, allowed_origin: &str) -> TestResult<OpenBrowserRequest> {
+    let allowed_origins = OriginPolicy::from_origins([allowed_origin], true)
+        .map_err(ctx("test origin policy must be valid"))?;
+    Ok(OpenBrowserRequest {
+        start_url: url(start_url)?,
         headless: true,
         profile: ProfilePolicy::Ephemeral,
         bidi: BiDiRequirement::Required,
@@ -34,18 +32,15 @@ fn open_request(start_url: &str, allowed_origin: &str) -> OpenBrowserRequest {
             height: 720,
         }),
         limits: BrowserLimits::default(),
-    }
+    })
 }
 
 #[test]
-fn firefox_host_preserves_explicit_process_configuration() {
+fn firefox_host_preserves_explicit_process_configuration() -> TestResult {
     let binary = PathBuf::from("/opt/firefox/firefox");
     let config = FirefoxHostConfig::new().with_firefox_binary(binary);
 
-    let host = match FirefoxHost::new(config) {
-        Ok(host) => host,
-        Err(error) => panic!("deterministic host construction failed: {error}"),
-    };
+    let host = FirefoxHost::new(config).map_err(ctx("deterministic host construction failed"))?;
 
     assert_eq!(
         host.config().firefox_binary(),
@@ -53,61 +48,73 @@ fn firefox_host_preserves_explicit_process_configuration() {
     );
     assert!(host.config().geckodriver_pin().is_none());
     assert!(host.config().launcher().is_none());
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_open_without_pinned_geckodriver_fails_closed_before_any_process_start() {
-    let host = match FirefoxHost::new(FirefoxHostConfig::new()) {
-        Ok(host) => host,
-        Err(error) => panic!("default host construction failed: {error}"),
-    };
-    let request = open_request("https://erp.example/login", "https://erp.example");
+async fn test_open_without_pinned_geckodriver_fails_closed_before_any_process_start() -> TestResult
+{
+    let host = FirefoxHost::new(FirefoxHostConfig::new())
+        .map_err(ctx("default host construction failed"))?;
+    let request = open_request("https://erp.example/login", "https://erp.example")?;
 
     match host.open(request).await {
         Err(BrowserError::CapabilityUnavailable { detail }) => {
             assert!(detail.contains("pinned geckodriver"));
         }
-        Err(other) => panic!("unexpected open error: {other}"),
-        Ok(_) => panic!("open must fail without a pinned geckodriver"),
+        Err(other) => {
+            return Err(TestError::Unexpected(format!(
+                "unexpected open error: {other}"
+            )));
+        }
+        Ok(_) => {
+            return Err(TestError::Unexpected(
+                "open must fail without a pinned geckodriver".into(),
+            ));
+        }
     }
+    Ok(())
 }
 
 #[test]
-fn open_validation_rejects_a_disallowed_origin_before_driver_startup() {
-    let host = match FirefoxHost::new(FirefoxHostConfig::new()) {
-        Ok(host) => host,
-        Err(error) => panic!("default host construction failed: {error}"),
-    };
-    let request = open_request("https://outside.example/login", "https://erp.example");
+fn open_validation_rejects_a_disallowed_origin_before_driver_startup() -> TestResult {
+    let host = FirefoxHost::new(FirefoxHostConfig::new())
+        .map_err(ctx("default host construction failed"))?;
+    let request = open_request("https://outside.example/login", "https://erp.example")?;
 
-    let error = match host.validate_open_request(&request) {
-        Ok(()) => panic!("a start URL outside the allowlist must be rejected"),
-        Err(error) => error,
+    let Err(error) = host.validate_open_request(&request) else {
+        return Err(TestError::Unexpected(
+            "a start URL outside the allowlist must be rejected".into(),
+        ));
     };
 
     match error {
         BrowserError::OriginNotAllowed { origin } => {
             assert_eq!(origin, "https://outside.example");
         }
-        other => panic!("unexpected validation error: {other}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "unexpected validation error: {other}"
+            )));
+        }
     }
+    Ok(())
 }
 
 #[test]
-fn open_validation_rejects_a_zero_sized_viewport_without_a_driver() {
-    let host = match FirefoxHost::new(FirefoxHostConfig::new()) {
-        Ok(host) => host,
-        Err(error) => panic!("default host construction failed: {error}"),
-    };
-    let mut request = open_request("https://erp.example/login", "https://erp.example");
+fn open_validation_rejects_a_zero_sized_viewport_without_a_driver() -> TestResult {
+    let host = FirefoxHost::new(FirefoxHostConfig::new())
+        .map_err(ctx("default host construction failed"))?;
+    let mut request = open_request("https://erp.example/login", "https://erp.example")?;
     request.viewport = Some(Viewport {
         width: 0,
         height: 720,
     });
 
-    let error = match host.validate_open_request(&request) {
-        Ok(()) => panic!("a zero-width viewport must be rejected"),
-        Err(error) => error,
+    let Err(error) = host.validate_open_request(&request) else {
+        return Err(TestError::Unexpected(
+            "a zero-width viewport must be rejected".into(),
+        ));
     };
 
     match error {
@@ -115,12 +122,17 @@ fn open_validation_rejects_a_zero_sized_viewport_without_a_driver() {
             assert!(detail.contains("viewport"));
             assert!(detail.contains("0x720"));
         }
-        other => panic!("unexpected validation error: {other}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "unexpected validation error: {other}"
+            )));
+        }
     }
+    Ok(())
 }
 
 #[test]
-fn typed_driver_timeout_maps_to_the_browser_timeout_boundary() {
+fn typed_driver_timeout_maps_to_the_browser_timeout_boundary() -> TestResult {
     let adapter_error = AdapterError::DriverTimeout {
         operation: DriverOperation::StartSession,
         detail: "geckodriver did not answer before the startup deadline".to_owned(),
@@ -133,12 +145,17 @@ fn typed_driver_timeout_maps_to_the_browser_timeout_boundary() {
             assert!(detail.contains("start session"));
             assert!(detail.contains("startup deadline"));
         }
-        other => panic!("unexpected mapped error: {other}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "unexpected mapped error: {other}"
+            )));
+        }
     }
+    Ok(())
 }
 
 #[test]
-fn typed_missing_bidi_maps_to_capability_unavailable() {
+fn typed_missing_bidi_maps_to_capability_unavailable() -> TestResult {
     let adapter_error = AdapterError::CapabilityUnavailable {
         capability: FIREFOX_CAPABILITY_ID,
         detail: "WebDriver did not return a BiDi websocket URL".to_owned(),
@@ -151,8 +168,13 @@ fn typed_missing_bidi_maps_to_capability_unavailable() {
             assert!(detail.contains(FIREFOX_CAPABILITY_ID));
             assert!(detail.contains("BiDi websocket URL"));
         }
-        other => panic!("unexpected mapped error: {other}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "unexpected mapped error: {other}"
+            )));
+        }
     }
+    Ok(())
 }
 
 #[test]

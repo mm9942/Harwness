@@ -51,14 +51,18 @@ use std::collections::{BTreeSet, HashMap};
 use harw_registry_defaults::embedded_agents::builtin_agent_definitions;
 use harw_registry_defaults::profile::{RegistryProfile, profile_for_role, role_names};
 
+mod common;
+use common::{TestError, TestResult, ctx};
+
 /// Lädt die aufgelösten eingebauten Rollendefinitionen (TOML-Seite).
 ///
 /// Keine lokalen Überschreibungen (`existing` bleibt leer) — dieser Test
 /// prüft ausschließlich die eingebetteten Definitionen unter
 /// `harw-registry-defaults/agents/`.
-fn resolved_roles() -> HashMap<String, harw_agent_dsl::ExecutableAgentIr> {
-    builtin_agent_definitions(&HashMap::new())
-        .expect("eingebaute Rollendefinitionen müssen sich auflösen lassen")
+fn resolved_roles() -> TestResult<HashMap<String, harw_agent_dsl::ExecutableAgentIr>> {
+    builtin_agent_definitions(&HashMap::new()).map_err(ctx(
+        "eingebaute Rollendefinitionen müssen sich auflösen lassen",
+    ))
 }
 
 /// Jedes von einer Rolle `admitted` Werkzeug muss vom Profil der Rolle
@@ -66,15 +70,16 @@ fn resolved_roles() -> HashMap<String, harw_agent_dsl::ExecutableAgentIr> {
 /// der Agent laut Registrierung nie im Inventar sieht: toter, irreführender
 /// Text in der `admitted`-Liste.
 #[test]
-fn every_role_admitted_tool_is_registered_by_its_profile() {
-    let roles = resolved_roles();
+fn every_role_admitted_tool_is_registered_by_its_profile() -> TestResult {
+    let roles = resolved_roles()?;
 
     for role in role_names::ALL {
-        let ir = roles
-            .get(*role)
-            .unwrap_or_else(|| panic!("Rolle {role} fehlt in den aufgelösten Definitionen"));
-        let profile = profile_for_role(role)
-            .unwrap_or_else(|| panic!("eingebaute Rolle {role} braucht ein Profil"));
+        let ir = roles.get(*role).ok_or(TestError::Unexpected(format!(
+            "Rolle {role} fehlt in den aufgelösten Definitionen"
+        )))?;
+        let profile = profile_for_role(role).ok_or(TestError::Unexpected(format!(
+            "eingebaute Rolle {role} braucht ein Profil"
+        )))?;
         let advertised: BTreeSet<&str> = profile.tool_names().into_iter().collect();
 
         for admitted in ir.tool_surface().admitted() {
@@ -87,6 +92,7 @@ fn every_role_admitted_tool_is_registered_by_its_profile() {
             );
         }
     }
+    Ok(())
 }
 
 /// Der Kernfall aus Befund 1: jedes vom Profil registrierte/beworbene
@@ -100,17 +106,22 @@ fn every_role_admitted_tool_is_registered_by_its_profile() {
 /// (`RegistryProfile::tool_names`), aber `planner.toml` admittierte es nicht
 /// — genau die Lücke aus Befund 1, gegen künftige Wiederholung abgesichert.
 #[test]
-fn every_profile_registered_tool_is_admitted_by_its_role() {
-    let roles = resolved_roles();
+fn every_profile_registered_tool_is_admitted_by_its_role() -> TestResult {
+    let roles = resolved_roles()?;
 
     for role in role_names::ALL {
-        let ir = roles
-            .get(*role)
-            .unwrap_or_else(|| panic!("Rolle {role} fehlt in den aufgelösten Definitionen"));
-        let profile = profile_for_role(role)
-            .unwrap_or_else(|| panic!("eingebaute Rolle {role} braucht ein Profil"));
-        let admitted: BTreeSet<&str> =
-            ir.tool_surface().admitted().iter().map(String::as_str).collect();
+        let ir = roles.get(*role).ok_or(TestError::Unexpected(format!(
+            "Rolle {role} fehlt in den aufgelösten Definitionen"
+        )))?;
+        let profile = profile_for_role(role).ok_or(TestError::Unexpected(format!(
+            "eingebaute Rolle {role} braucht ein Profil"
+        )))?;
+        let admitted: BTreeSet<&str> = ir
+            .tool_surface()
+            .admitted()
+            .iter()
+            .map(String::as_str)
+            .collect();
 
         for tool in profile.tool_names() {
             assert!(
@@ -122,6 +133,7 @@ fn every_profile_registered_tool_is_admitted_by_its_role() {
             );
         }
     }
+    Ok(())
 }
 
 /// Sichtbarkeitsprobe für Befund 2, zweite Hälfte: welche von den
@@ -145,12 +157,14 @@ fn every_profile_registered_tool_is_admitted_by_its_role() {
 /// `shell.exec`/`browser.*` von keiner Rolle admittiert werden, ist der
 /// gewollte Zustand aus AP W3-04, keine übersehene Lücke.
 #[test]
-fn profile_tools_unclaimed_by_any_role_match_the_documented_expectation() {
-    let roles = resolved_roles();
+fn profile_tools_unclaimed_by_any_role_match_the_documented_expectation() -> TestResult {
+    let roles = resolved_roles()?;
 
     let mut admitted_anywhere: BTreeSet<String> = BTreeSet::new();
     for role in role_names::ALL {
-        let ir = roles.get(*role).expect("Rolle geladen");
+        let ir = roles
+            .get(*role)
+            .ok_or(TestError::Missing("Rolle geladen"))?;
         admitted_anywhere.extend(ir.tool_surface().admitted().iter().cloned());
     }
 
@@ -177,6 +191,7 @@ fn profile_tools_unclaimed_by_any_role_match_the_documented_expectation() {
          Werkzeug in ihrer admitted-Liste, oder diese Erwartungsmenge muss \
          bewusst um {unclaimed:?} erweitert werden"
     );
+    Ok(())
 }
 
 /// `agent-steward` und `RegistryProfile::AgentStewardship` sind ein
@@ -196,16 +211,20 @@ fn profile_tools_unclaimed_by_any_role_match_the_documented_expectation() {
 /// stillschweigend an den beiden generischen Tests hängen zu lassen.
 #[test]
 fn agent_steward_admits_the_commit_mode_tool_set_even_though_two_tools_are_mode_gated_at_runtime()
-{
-    let roles = resolved_roles();
+-> TestResult {
+    let roles = resolved_roles()?;
     let ir = roles
         .get(role_names::AGENT_STEWARD)
-        .expect("agent-steward ist eingebaut");
-    let admitted: BTreeSet<&str> =
-        ir.tool_surface().admitted().iter().map(String::as_str).collect();
+        .ok_or(TestError::Missing("agent-steward ist eingebaut"))?;
+    let admitted: BTreeSet<&str> = ir
+        .tool_surface()
+        .admitted()
+        .iter()
+        .map(String::as_str)
+        .collect();
 
     let profile = profile_for_role(role_names::AGENT_STEWARD)
-        .expect("agent-steward braucht ein Profil");
+        .ok_or(TestError::Missing("agent-steward braucht ein Profil"))?;
     assert_eq!(profile, RegistryProfile::AgentStewardship);
     let advertised: BTreeSet<&str> = profile.tool_names().into_iter().collect();
 
@@ -216,11 +235,23 @@ fn agent_steward_admits_the_commit_mode_tool_set_even_though_two_tools_are_mode_
          Laufzeit nicht registriert werden"
     );
     for mode_gated in ["agents.commit_proposal", "agents.reject_proposal"] {
-        assert!(admitted.contains(mode_gated), "{mode_gated} fehlt in admitted");
+        assert!(
+            admitted.contains(mode_gated),
+            "{mode_gated} fehlt in admitted"
+        );
     }
-    for always_on in ["agents.validate", "agents.list_proposals", "agents.write_definition", "agents.write_uia"] {
-        assert!(admitted.contains(always_on), "{always_on} fehlt in admitted");
+    for always_on in [
+        "agents.validate",
+        "agents.list_proposals",
+        "agents.write_definition",
+        "agents.write_uia",
+    ] {
+        assert!(
+            admitted.contains(always_on),
+            "{always_on} fehlt in admitted"
+        );
     }
+    Ok(())
 }
 
 /// Nachtrag K3 (Welle FANIN-K, Fan-in-Zusatzpunkte): schärft den Test oben um

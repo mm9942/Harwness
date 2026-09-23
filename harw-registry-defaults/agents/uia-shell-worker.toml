@@ -63,6 +63,7 @@ admitted = [
   "fs.search",
   "fs.glob",
   "fs.grep",
+  "doc.read_pdf",
 ]
 forbidden = [
   "fs.write",

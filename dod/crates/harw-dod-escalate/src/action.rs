@@ -141,7 +141,9 @@ where
     S::Inner: std::fmt::Debug,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Action").field("inner", &self.inner).finish()
+        f.debug_struct("Action")
+            .field("inner", &self.inner)
+            .finish()
     }
 }
 
@@ -303,14 +305,20 @@ impl Action<Authorized> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
+    use harw_authority::NetworkScope;
     use harw_dod_rules::rule::{Rule, RuleContext};
     use harw_dod_rules::rules::EgressFlowRule;
     use harw_dod_rules::{run_rules, triage};
     use harw_dod_signals::{EventKind, SecurityEvent};
-    use harw_authority::NetworkScope;
     use harw_types::{CgroupId, SensorId};
 
-    fn confirmed_finding() -> Finding<Triaged> {
+    // Die Testfaelle unten binden `RuleContext`-Werte an den lokalen Namen
+    // `ctx` (Vorbild fuer echten Aufrufcode) -- der Test-Helfer `ctx()` wird
+    // dort deshalb voll qualifiziert aufgerufen, um die Verschattung zu
+    // vermeiden (siehe Worker-Zusatz).
+
+    fn confirmed_finding() -> TestResult<Finding<Triaged>> {
         let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
         let events = vec![SecurityEvent {
             sensor: SensorId::from_str("net-0"),
@@ -330,8 +338,11 @@ mod tests {
         };
         let rule: &dyn Rule = &EgressFlowRule;
         let checked = run_rules(&[rule], &ctx);
-        let finding = checked.into_iter().next().expect("EgressFlowRule löst aus");
-        triage(finding, Verdict::Confirmed)
+        let finding = checked
+            .into_iter()
+            .next()
+            .ok_or(TestError::Missing("EgressFlowRule löst aus"))?;
+        Ok(triage(finding, Verdict::Confirmed))
     }
 
     fn actor() -> ApprovalActor {
@@ -341,16 +352,17 @@ mod tests {
     }
 
     #[test]
-    fn test_propose_carries_the_given_action_unchanged() {
+    fn test_propose_carries_the_given_action_unchanged() -> TestResult {
         let action = ProposedAction::FreezeCgroup {
-            cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
+            cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("CgroupId parsen"))?,
         };
         let proposed = Action::propose(action.clone());
         assert_eq!(proposed.proposed(), &action);
+        Ok(())
     }
 
     #[test]
-    fn test_authorize_rejects_unconfirmed_verdict() {
+    fn test_authorize_rejects_unconfirmed_verdict() -> TestResult {
         let finding = {
             let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
             let events = vec![SecurityEvent {
@@ -371,69 +383,109 @@ mod tests {
             };
             let rule: &dyn Rule = &EgressFlowRule;
             let checked = run_rules(&[rule], &ctx);
-            let finding = checked.into_iter().next().expect("EgressFlowRule löst aus");
+            let finding = checked
+                .into_iter()
+                .next()
+                .ok_or(TestError::Missing("EgressFlowRule löst aus"))?;
             triage(finding, Verdict::NeedsReview)
         };
         let proposed = Action::propose(ProposedAction::FreezeCgroup {
-            cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
+            cgroup: CgroupId::try_from_str("cgroup-1")
+                .map_err(crate::test_support::ctx("CgroupId parsen"))?,
         });
 
-        let err = proposed
-            .authorize(&finding, EscalationStage::RuleTriggered, actor(), Timestamp::UNIX_EPOCH)
-            .unwrap_err();
+        let result = proposed.authorize(
+            &finding,
+            EscalationStage::RuleTriggered,
+            actor(),
+            Timestamp::UNIX_EPOCH,
+        );
+        let Err(err) = result else {
+            return Err(TestError::Unexpected("Err erwartet".to_owned()));
+        };
         assert!(matches!(err, EscalateError::VerdictNotConfirmed));
+        Ok(())
     }
 
     #[test]
-    fn test_authorize_rejects_action_not_admissible_at_stage() {
-        let finding = confirmed_finding();
+    fn test_authorize_rejects_action_not_admissible_at_stage() -> TestResult {
+        let finding = confirmed_finding()?;
         let proposed = Action::propose(ProposedAction::KillProcessTree {
-            cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
+            cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("CgroupId parsen"))?,
         });
 
-        let err = proposed
-            .authorize(&finding, EscalationStage::RuleTriggered, actor(), Timestamp::UNIX_EPOCH)
-            .unwrap_err();
+        let result = proposed.authorize(
+            &finding,
+            EscalationStage::RuleTriggered,
+            actor(),
+            Timestamp::UNIX_EPOCH,
+        );
+        let Err(err) = result else {
+            return Err(TestError::Unexpected("Err erwartet".to_owned()));
+        };
         assert!(matches!(err, EscalateError::NotAdmissibleAtStage));
+        Ok(())
     }
 
     #[test]
-    fn test_authorize_succeeds_and_binds_the_exact_action() {
-        let finding = confirmed_finding();
+    fn test_authorize_succeeds_and_binds_the_exact_action() -> TestResult {
+        let finding = confirmed_finding()?;
         let proposed = Action::propose(ProposedAction::FreezeCgroup {
-            cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
+            cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("CgroupId parsen"))?,
         });
 
         let authorized = proposed
-            .authorize(&finding, EscalationStage::RuleTriggered, actor(), Timestamp::UNIX_EPOCH)
-            .expect("verdict confirmed and admissible at rule-triggered");
+            .authorize(
+                &finding,
+                EscalationStage::RuleTriggered,
+                actor(),
+                Timestamp::UNIX_EPOCH,
+            )
+            .map_err(ctx("verdict confirmed and admissible at rule-triggered"))?;
 
         let request = authorized.request();
         assert!(request.proof.verify(finding.id(), &request.action).is_ok());
+        Ok(())
     }
 
     /// Der wichtigste Test dieser Crate: ein Beleg, der an eine andere Aktion
     /// gebunden ist, wird zurückgewiesen.
     #[test]
-    fn test_authorized_proof_rejects_a_different_action() {
-        let finding = confirmed_finding();
+    fn test_authorized_proof_rejects_a_different_action() -> TestResult {
+        let finding = confirmed_finding()?;
         let proposed = Action::propose(ProposedAction::FreezeCgroup {
-            cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
+            cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("CgroupId parsen"))?,
         });
 
         let authorized = proposed
-            .authorize(&finding, EscalationStage::RuleTriggered, actor(), Timestamp::UNIX_EPOCH)
-            .expect("authorization succeeds");
+            .authorize(
+                &finding,
+                EscalationStage::RuleTriggered,
+                actor(),
+                Timestamp::UNIX_EPOCH,
+            )
+            .map_err(ctx("authorization succeeds"))?;
         let request = authorized.into_request();
 
         let different_action = WardenAction::FreezeCgroup {
-            cgroup: CgroupId::try_from_str("cgroup-9").unwrap(),
+            cgroup: CgroupId::try_from_str("cgroup-9").map_err(ctx("CgroupId parsen"))?,
         };
-        assert!(request.proof.authorizes(finding.id(), &different_action).is_err());
+        assert!(
+            request
+                .proof
+                .authorizes(finding.id(), &different_action)
+                .is_err()
+        );
 
         let different_kind = WardenAction::IsolateNetwork {
-            cgroup: CgroupId::try_from_str("cgroup-1").unwrap(),
+            cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("CgroupId parsen"))?,
         };
-        assert!(request.proof.authorizes(finding.id(), &different_kind).is_err());
+        assert!(
+            request
+                .proof
+                .authorizes(finding.id(), &different_kind)
+                .is_err()
+        );
+        Ok(())
     }
 }

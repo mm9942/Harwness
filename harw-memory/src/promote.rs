@@ -206,7 +206,10 @@ pub fn evaluate_signals(
 /// [`MemoryError::Io`], wenn `warm_dir` (oder ein Namespace-Unterordner)
 /// nicht angelegt werden kann, oder eine Kandidat-Datei nicht geschrieben
 /// werden kann.
-pub fn apply_promotion(candidates: &[PromotionCandidate], warm_dir: &Path) -> MemoryResult<PromotionOutcome> {
+pub fn apply_promotion(
+    candidates: &[PromotionCandidate],
+    warm_dir: &Path,
+) -> MemoryResult<PromotionOutcome> {
     fs::create_dir_all(warm_dir).map_err(|e| MemoryError::Io {
         path: warm_dir.to_path_buf(),
         source: e,
@@ -229,7 +232,10 @@ pub fn apply_promotion(candidates: &[PromotionCandidate], warm_dir: &Path) -> Me
             candidate.content.as_bytes(),
             harw_fsutil::AtomicWriteOptions::with_mode(0o600),
         )
-        .map_err(|e| MemoryError::Io { path: target, source: e })?;
+        .map_err(|e| MemoryError::Io {
+            path: target,
+            source: e,
+        })?;
         warm_created += 1;
     }
 
@@ -243,11 +249,13 @@ pub fn apply_promotion(candidates: &[PromotionCandidate], warm_dir: &Path) -> Me
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("harw-promote-{tag}-{}-{id}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("harw-promote-{tag}-{}-{id}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
     }
@@ -338,7 +346,11 @@ mod tests {
             pattern("nicht-bevormunden", "anderer Sachverhalt", now),
         ];
         let candidates = evaluate_signals(&signals, now, Duration::days(7), 3);
-        assert_eq!(candidates.len(), 1, "PatternHint-Treffer hat nur 1 Vorkommen");
+        assert_eq!(
+            candidates.len(),
+            1,
+            "PatternHint-Treffer hat nur 1 Vorkommen"
+        );
         assert_eq!(candidates[0].namespace, "correction/nicht-bevormunden");
         assert_eq!(candidates[0].hit_count, 3);
     }
@@ -363,48 +375,62 @@ mod tests {
             pattern("greeting", "c", now),
         ];
         let candidates = evaluate_signals(&signals, now, Duration::days(7), 3);
-        assert!(candidates.is_empty(), "zukuenftiger Zeitstempel wird verworfen");
+        assert!(
+            candidates.is_empty(),
+            "zukuenftiger Zeitstempel wird verworfen"
+        );
     }
 
     // -- apply_promotion ------------------------------------------------
 
     #[test]
-    fn apply_promotion_writes_new_candidate_files() {
+    fn apply_promotion_writes_new_candidate_files() -> TestResult {
         let dir = tmp_dir("write");
         let candidates = vec![PromotionCandidate {
             namespace: "pattern_hint/greeting".to_owned(),
             content: "- hello\n".to_owned(),
             hit_count: 3,
         }];
-        let outcome = apply_promotion(&candidates, &dir).unwrap();
+        let outcome = apply_promotion(&candidates, &dir).map_err(ctx("apply_promotion"))?;
         assert_eq!(outcome.warm_created, 1);
         assert_eq!(outcome.demoted_to_cold, 0);
         assert!(outcome.archived_warnings.is_empty());
         assert_eq!(
-            fs::read_to_string(dir.join("pattern_hint/greeting.md")).unwrap(),
+            fs::read_to_string(dir.join("pattern_hint/greeting.md"))
+                .map_err(ctx("read greeting.md"))?,
             "- hello\n"
         );
         let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[test]
-    fn apply_promotion_does_not_overwrite_existing_warm_file() {
+    fn apply_promotion_does_not_overwrite_existing_warm_file() -> TestResult {
         let dir = tmp_dir("idempotent");
-        fs::create_dir_all(&dir).unwrap();
-        fs::create_dir_all(dir.join("pattern_hint")).unwrap();
-        fs::write(dir.join("pattern_hint/greeting.md"), "- bereits vorhanden\n").unwrap();
+        fs::create_dir_all(&dir).map_err(ctx("create dir"))?;
+        fs::create_dir_all(dir.join("pattern_hint")).map_err(ctx("create pattern_hint dir"))?;
+        fs::write(
+            dir.join("pattern_hint/greeting.md"),
+            "- bereits vorhanden\n",
+        )
+        .map_err(ctx("write greeting.md"))?;
 
         let candidates = vec![PromotionCandidate {
             namespace: "pattern_hint/greeting".to_owned(),
             content: "- neuer Inhalt\n".to_owned(),
             hit_count: 5,
         }];
-        let outcome = apply_promotion(&candidates, &dir).unwrap();
-        assert_eq!(outcome.warm_created, 0, "bestehende Datei bleibt unangetastet");
+        let outcome = apply_promotion(&candidates, &dir).map_err(ctx("apply_promotion"))?;
         assert_eq!(
-            fs::read_to_string(dir.join("pattern_hint/greeting.md")).unwrap(),
+            outcome.warm_created, 0,
+            "bestehende Datei bleibt unangetastet"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("pattern_hint/greeting.md"))
+                .map_err(ctx("read greeting.md"))?,
             "- bereits vorhanden\n"
         );
         let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 }

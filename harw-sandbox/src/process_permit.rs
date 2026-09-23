@@ -201,10 +201,13 @@ impl ProcessPermitLedger {
             state.permits.remove(&id);
             return Err(ProcessPermitError::Expired);
         }
+        // Die Sperre ist seit der Existenzprüfung oben ununterbrochen gehalten,
+        // daher kann der Eintrag hier nicht verschwunden sein; `UnknownPermit`
+        // ist trotzdem der korrekte Fehler statt einer Panik (Bible R087).
         let permit = state
             .permits
             .get_mut(&id)
-            .expect("permit was checked while the ledger lock is held");
+            .ok_or(ProcessPermitError::UnknownPermit)?;
         if permit.request != *actual {
             return Err(ProcessPermitError::BindingMismatch);
         }
@@ -304,6 +307,7 @@ pub fn request_for_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     fn request(environment: ProcessEnvironment) -> ProcessPermitRequest {
         request_for_workspace(
@@ -316,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn single_execution_is_bound_and_consumed() {
+    fn single_execution_is_bound_and_consumed() -> TestResult {
         let ledger = ProcessPermitLedger::default();
         let request = request(ProcessEnvironment::LocalHost);
         let id = ledger
@@ -325,7 +329,7 @@ mod tests {
                 HostApprovalScope::SingleExecution,
                 Duration::from_secs(30),
             )
-            .unwrap();
+            .map_err(ctx("issue_after_local_approval failed"))?;
         assert!(ledger.authorize(id, &request).is_ok());
         assert_eq!(
             ledger.authorize(id, &request),
@@ -338,10 +342,11 @@ mod tests {
             ledger.authorize(id, &changed),
             Err(ProcessPermitError::BindingMismatch)
         );
+        Ok(())
     }
 
     #[test]
-    fn session_lease_is_host_only_and_revocable() {
+    fn session_lease_is_host_only_and_revocable() -> TestResult {
         let ledger = ProcessPermitLedger::default();
         let strict = request(ProcessEnvironment::StrictSandbox);
         assert_eq!(
@@ -359,7 +364,7 @@ mod tests {
                 HostApprovalScope::SessionLease,
                 Duration::from_secs(30),
             )
-            .unwrap();
+            .map_err(ctx("issue_after_local_approval failed"))?;
         assert!(ledger.authorize(id, &host).is_ok());
         assert!(ledger.authorize(id, &host).is_ok());
         assert_eq!(ledger.revoke_session("local-session"), Ok(1));
@@ -367,5 +372,6 @@ mod tests {
             ledger.authorize(id, &host),
             Err(ProcessPermitError::UnknownPermit)
         );
+        Ok(())
     }
 }

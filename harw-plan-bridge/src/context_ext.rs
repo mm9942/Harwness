@@ -208,6 +208,7 @@ pub fn register_plan_services(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
     use crate::testing::InMemoryGoalStore;
     use harw_plan::InMemoryPlanStore;
 
@@ -228,22 +229,21 @@ mod tests {
     }
 
     #[test]
-    fn test_register_plan_services_stores_the_exact_arcs() {
+    fn test_register_plan_services_stores_the_exact_arcs() -> TestResult {
         let (services, plan, findings) = populated_services();
 
-        let registered_plan = match services.get::<Arc<dyn PlanStore>>() {
-            Some(registered) => registered,
-            None => panic!("Plan-Store wurde nicht registriert"),
-        };
-        let registered_findings = match services.get::<Arc<FindingStore>>() {
-            Some(registered) => registered,
-            None => panic!("Finding-Store wurde nicht registriert"),
-        };
+        let registered_plan = services
+            .get::<Arc<dyn PlanStore>>()
+            .ok_or(TestError::Missing("Plan-Store wurde nicht registriert"))?;
+        let registered_findings = services
+            .get::<Arc<FindingStore>>()
+            .ok_or(TestError::Missing("Finding-Store wurde nicht registriert"))?;
 
         assert!(Arc::ptr_eq(registered_plan, &plan));
         assert!(Arc::ptr_eq(registered_findings, &findings));
         assert!(services.get::<Arc<dyn GoalStore>>().is_some());
         assert!(services.get::<PlanToolConfig>().is_some());
+        Ok(())
     }
 
     #[test]
@@ -267,12 +267,13 @@ mod tests {
     }
 
     #[test]
-    fn test_registered_config_is_readable_as_a_clone() {
+    fn test_registered_config_is_readable_as_a_clone() -> TestResult {
         let (services, _plan, _findings) = populated_services();
-        let config = match services.get::<PlanToolConfig>() {
-            Some(config) => config.clone(),
-            None => panic!("Konfiguration wurde nicht registriert"),
-        };
+        let config = services
+            .get::<PlanToolConfig>()
+            .ok_or(TestError::Missing("Konfiguration wurde nicht registriert"))?
+            .clone();
         assert!(config.is_enabled());
+        Ok(())
     }
 }

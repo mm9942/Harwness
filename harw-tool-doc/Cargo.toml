@@ -1,0 +1,37 @@
+[package]
+name = "harw-tool-doc"
+version.workspace = true
+edition.workspace = true
+# Höher als workspace.package.rust-version (1.85): oxidize-pdf >=5 (die von
+# doc.read_pdf/native.rs verwendete API-Generation, siehe design-doc
+# doc_read_pdf_design.md) deklariert selbst rust-version 1.88. Mit dem
+# geerbten Workspace-Default löst `cargo add`/der MSRV-Resolver still auf die
+# inkompatible 2.x-Reihe zurück. Der installierte Compiler (1.98.1) erfüllt
+# 1.88 problemlos; nur diese Crate braucht die höhere deklarierte MSRV.
+rust-version = "1.88"
+
+[dependencies]
+harw-authority = { path = "../harw-authority" }
+# W5 N-DOC: HTTP-Client und Egress-Policy für Mistral OCR ausschließlich aus
+# harw-egress (Scoped-Resolver, Adressklassen, keine Auto-Redirects, kein Proxy).
+harw-egress = { path = "../harw-egress" }
+# Symlinkfestes, ELOOP-strenges Öffnen der PDF-Datei unterhalb der Workspace-Wurzel.
+harw-fsutil = { path = "../harw-fsutil" }
+harw-extension-api = { path = "../harw-extension-api" }
+harw-macros = { path = "../harw-macros" }
+harw-tools = { path = "../harw-tools" }
+oxidize-pdf = { version = "5.1.3", default-features = false, features = ["compression"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
+base64 = "0.23.1"
+secrecy = "0.10"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio = { version = "1.53.1", features = ["rt", "time"] }
+tracing.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { version = "1.53.1", features = ["rt", "macros", "time"] }

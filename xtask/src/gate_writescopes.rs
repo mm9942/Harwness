@@ -913,7 +913,10 @@ fn covers(glob: &str, candidate: &str) -> bool {
         }
         (0..star_pos).all(|k| segment_matches(g[k], c[k]))
     } else {
-        g.len() == c.len() && g.iter().zip(c.iter()).all(|(&gg, &cc)| segment_matches(gg, cc))
+        g.len() == c.len()
+            && g.iter()
+                .zip(c.iter())
+                .all(|(&gg, &cc)| segment_matches(gg, cc))
     }
 }
 
@@ -1292,20 +1295,19 @@ pub fn run() -> Result<GateReport, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     fn table(rows: &str) -> String {
-        format!(
-            "| ID | Titel | Schreibbereich | Hängt an |\n|---|---|---|---|\n{rows}"
-        )
+        format!("| ID | Titel | Schreibbereich | Hängt an |\n|---|---|---|---|\n{rows}")
     }
 
     #[test]
-    fn test_evaluate_same_scope_without_path_is_violation() {
+    fn test_evaluate_same_scope_without_path_is_violation() -> TestResult {
         let markdown = table(
             "| A-01 | eins | `crate/a.rs` | — |\n\
              | A-02 | zwei | `crate/a.rs` | — |\n",
         );
-        let parsed = parse_plan(&markdown).expect("sollte parsen");
+        let parsed = parse_plan(&markdown).map_err(ctx("sollte parsen"))?;
         let report = evaluate(&parsed);
 
         assert!(!report.is_green());
@@ -1317,22 +1319,24 @@ mod tests {
             "{:?}",
             report.violations
         );
+        Ok(())
     }
 
     #[test]
-    fn test_evaluate_same_scope_with_edge_is_green() {
+    fn test_evaluate_same_scope_with_edge_is_green() -> TestResult {
         let markdown = table(
             "| A-01 | eins | `crate/a.rs` | — |\n\
              | A-02 | zwei | `crate/a.rs` | A-01 |\n",
         );
-        let parsed = parse_plan(&markdown).expect("sollte parsen");
+        let parsed = parse_plan(&markdown).map_err(ctx("sollte parsen"))?;
         let report = evaluate(&parsed);
 
         assert!(report.is_green(), "{:?}", report.violations);
+        Ok(())
     }
 
     #[test]
-    fn test_evaluate_transitive_path_over_three_nodes_is_green() {
+    fn test_evaluate_transitive_path_over_three_nodes_is_green() -> TestResult {
         // A-03 hängt an A-02, A-02 hängt an A-01: A-03 → A-02 → A-01 ist ein
         // Pfad, obwohl A-03 keine direkte Kante zu A-01 hat.
         let markdown = table(
@@ -1340,19 +1344,20 @@ mod tests {
              | A-02 | zwei | `crate/b.rs` | A-01 |\n\
              | A-03 | drei | `crate/a.rs` | A-02 |\n",
         );
-        let parsed = parse_plan(&markdown).expect("sollte parsen");
+        let parsed = parse_plan(&markdown).map_err(ctx("sollte parsen"))?;
         let report = evaluate(&parsed);
 
         assert!(report.is_green(), "{:?}", report.violations);
+        Ok(())
     }
 
     #[test]
-    fn test_scope_overlap_detects_containment_not_only_equality() {
+    fn test_scope_overlap_detects_containment_not_only_equality() -> TestResult {
         let markdown = table(
             "| A-01 | eins | `harw-core/**` | — |\n\
              | A-02 | zwei | `harw-core/src/session.rs` | — |\n",
         );
-        let parsed = parse_plan(&markdown).expect("sollte parsen");
+        let parsed = parse_plan(&markdown).map_err(ctx("sollte parsen"))?;
         let report = evaluate(&parsed);
 
         assert!(!report.is_green());
@@ -1364,15 +1369,16 @@ mod tests {
             "Gleichheit allein hätte diese Kollision nicht gefunden: {:?}",
             report.violations
         );
+        Ok(())
     }
 
     #[test]
-    fn test_brace_expansion_checks_both_branches() {
+    fn test_brace_expansion_checks_both_branches() -> TestResult {
         let markdown = table(
             "| A-01 | eins | `crate/{x,y}.rs` | — |\n\
              | A-02 | zwei | `crate/y.rs` | — |\n",
         );
-        let parsed = parse_plan(&markdown).expect("sollte parsen");
+        let parsed = parse_plan(&markdown).map_err(ctx("sollte parsen"))?;
         assert_eq!(parsed.nodes[0].scopes.len(), 2, "beide Zweige erwartet");
 
         let report = evaluate(&parsed);
@@ -1387,12 +1393,13 @@ mod tests {
             "crate/x.rs überlappt mit nichts und darf nicht auftauchen: {:?}",
             report.violations
         );
+        Ok(())
     }
 
     #[test]
-    fn test_prose_cell_is_ignored_with_notice_not_silently() {
+    fn test_prose_cell_is_ignored_with_notice_not_silently() -> TestResult {
         let markdown = table("| A-01 | eins | alle neuen Crate-Stubs | — |\n");
-        let parsed = parse_plan(&markdown).expect("sollte parsen");
+        let parsed = parse_plan(&markdown).map_err(ctx("sollte parsen"))?;
 
         assert_eq!(parsed.nodes[0].scopes.len(), 0);
         assert_eq!(
@@ -1405,15 +1412,16 @@ mod tests {
         let report = evaluate(&parsed);
         assert_eq!(report.checked, 0, "Prosa zählt nicht als geprüfter Bereich");
         assert!(!report.is_green(), "reine Prosa prüft nichts (G-102)");
+        Ok(())
     }
 
     #[test]
-    fn test_cycle_is_reported_and_does_not_hang() {
+    fn test_cycle_is_reported_and_does_not_hang() -> TestResult {
         let markdown = table(
             "| A-01 | eins | `crate/a.rs` | A-02 |\n\
              | A-02 | zwei | `crate/b.rs` | A-01 |\n",
         );
-        let parsed = parse_plan(&markdown).expect("sollte parsen");
+        let parsed = parse_plan(&markdown).map_err(ctx("sollte parsen"))?;
         // Terminiert die Testfunktion überhaupt (statt zu hängen), ist das
         // bereits der Kernbeweis; die Meldung wird zusätzlich geprüft.
         let report = evaluate(&parsed);
@@ -1423,19 +1431,21 @@ mod tests {
             "{:?}",
             report.violations
         );
+        Ok(())
     }
 
     #[test]
-    fn test_checked_counts_scope_entries_not_nodes() {
+    fn test_checked_counts_scope_entries_not_nodes() -> TestResult {
         let markdown = table(
             "| A-01 | eins | `crate/a.rs`, `crate/{x,y}.rs` | — |\n\
              | A-02 | zwei | `crate/b.rs` | — |\n",
         );
-        let parsed = parse_plan(&markdown).expect("sollte parsen");
+        let parsed = parse_plan(&markdown).map_err(ctx("sollte parsen"))?;
         let report = evaluate(&parsed);
 
         // A-01: crate/a.rs, crate/x.rs, crate/y.rs (3) + A-02: crate/b.rs (1) = 4.
         assert_eq!(report.checked, 4);
+        Ok(())
     }
 
     #[test]
@@ -1446,26 +1456,31 @@ mod tests {
     }
 
     #[test]
-    fn test_id_range_reference_resolves_to_grouped_and_individual_nodes() {
+    fn test_id_range_reference_resolves_to_grouped_and_individual_nodes() -> TestResult {
         let markdown = table(
             "| A-01 | eins | `crate/x.rs` | — |\n\
              | A-02..04 | gruppe | `crate/{m,n,o}.rs` | A-01 |\n\
              | A-05 | fünf | `crate/z.rs` | A-02 |\n\
              | A-06 | sechs | `crate/w.rs` | A-02..A-05 |\n",
         );
-        let parsed = parse_plan(&markdown).expect("sollte parsen");
+        let parsed = parse_plan(&markdown).map_err(ctx("sollte parsen"))?;
         let (adj, unresolved) = build_edges(&parsed.nodes);
         assert!(unresolved.is_empty(), "{unresolved:?}");
 
-        let idx = |id: &str| parsed.nodes.iter().position(|n| n.id == id).unwrap();
-        let group = idx("A-02..04");
-        let a06 = idx("A-06");
+        let idx = |id: &str| -> TestResult<usize> {
+            parsed.nodes.iter().position(|n| n.id == id).ok_or(
+                crate::test_support::TestError::Missing("Knoten-ID gefunden"),
+            )
+        };
+        let group = idx("A-02..04")?;
+        let a06 = idx("A-06")?;
         assert!(
             adj[a06].contains(&group),
             "A-06 muss über den Bereich A-02..A-05 auch die zusammengefasste \
              Zeile A-02..04 erreichen"
         );
-        assert!(adj[a06].contains(&idx("A-05")));
+        assert!(adj[a06].contains(&idx("A-05")?));
+        Ok(())
     }
 
     #[test]

@@ -57,3 +57,7 @@ pub use rank::{
     BudgetSpec, BytesOverFour, CollapsePolicy, CostEstimate, CostEstimator, EdgeIndex, EdgeKind,
     Packed, Ranked,
 };
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

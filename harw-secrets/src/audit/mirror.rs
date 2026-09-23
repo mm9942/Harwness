@@ -116,8 +116,8 @@
 //! Moduldoku für die Invariante, den erwarteten Wert null und die ehrliche
 //! Einschränkung, was dieser Zähler nicht beobachten kann.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use harw_observe::TelemetrySink;
 use jiff::Timestamp;
@@ -473,10 +473,11 @@ mod tests {
     use super::*;
     use crate::audit::event::{Actor, SubjectRef};
     use crate::audit::telemetry::AUDIT_COUNTER_LOCK;
+    use crate::test_support::{TestResult, ctx};
     use harw_observe::NullSink;
 
-    fn ts(seconds: i64) -> Timestamp {
-        Timestamp::from_second(seconds).expect("valid test timestamp")
+    fn ts(seconds: i64) -> TestResult<Timestamp> {
+        Timestamp::from_second(seconds).map_err(ctx("valid test timestamp"))
     }
 
     /// Builds a two-event chain and then breaks it by tampering the second
@@ -500,22 +501,23 @@ mod tests {
     }
 
     #[test]
-    fn intact_chain_reports_zero_breaks_and_records_one_heartbeat() {
+    fn intact_chain_reports_zero_breaks_and_records_one_heartbeat() -> TestResult {
         let mut log = AuditLog::new();
         log.append(Actor::System, "secret.access", Vec::new());
         let transport = RecordingMirrorTransport::new();
         let mirror = ChainAuditMirror::new(transport);
 
-        let outcome = mirror.verify_and_mirror(&log, ts(100), &NullSink);
+        let outcome = mirror.verify_and_mirror(&log, ts(100)?, &NullSink);
 
         assert!(outcome.is_ok());
         assert_eq!(mirror.chain_break_count(), 0);
         assert_eq!(mirror.transport.entries().len(), 1);
         assert!(mirror.transport.alerts().is_empty());
+        Ok(())
     }
 
     #[test]
-    fn broken_chain_is_detected_and_alert_is_sent_and_counter_moves_off_zero() {
+    fn broken_chain_is_detected_and_alert_is_sent_and_counter_moves_off_zero() -> TestResult {
         let _guard = AUDIT_COUNTER_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -524,19 +526,23 @@ mod tests {
         let mirror = ChainAuditMirror::new(transport);
         let before = AUDIT_CHAIN_BREAK.count();
 
-        let outcome = mirror.verify_and_mirror(&log, ts(200), &NullSink);
+        let outcome = mirror.verify_and_mirror(&log, ts(200)?, &NullSink);
 
-        assert!(matches!(outcome, Err(AuditError::ChainBroken { index: 1, .. })));
+        assert!(matches!(
+            outcome,
+            Err(AuditError::ChainBroken { index: 1, .. })
+        ));
         assert_eq!(mirror.chain_break_count(), 1);
         assert_eq!(AUDIT_CHAIN_BREAK.count(), before + 1);
         let alerts = mirror.transport.alerts();
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].broken_at_index, 1);
         assert_eq!(alerts[0].total_events, 2);
+        Ok(())
     }
 
     #[test]
-    fn break_alert_never_carries_actor_action_or_subject_content() {
+    fn break_alert_never_carries_actor_action_or_subject_content() -> TestResult {
         let _guard = AUDIT_COUNTER_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -544,7 +550,7 @@ mod tests {
         let transport = RecordingMirrorTransport::new();
         let mirror = ChainAuditMirror::new(transport);
 
-        let _ = mirror.verify_and_mirror(&log, ts(300), &NullSink);
+        let _ = mirror.verify_and_mirror(&log, ts(300)?, &NullSink);
 
         let alerts = mirror.transport.alerts();
         let rendered = alerts[0].to_report_line();
@@ -553,10 +559,11 @@ mod tests {
         assert!(!rendered.contains("prod-token"));
         assert!(rendered.contains("AUDIT CHAIN BREAK"));
         assert!(rendered.contains("index 1"));
+        Ok(())
     }
 
     #[test]
-    fn heartbeat_never_carries_actor_action_or_subject_content() {
+    fn heartbeat_never_carries_actor_action_or_subject_content() -> TestResult {
         let mut log = AuditLog::new();
         log.append(
             Actor::Operator("operator-jane".to_owned()),
@@ -566,9 +573,7 @@ mod tests {
         let transport = RecordingMirrorTransport::new();
         let mirror = ChainAuditMirror::new(transport);
 
-        mirror
-            .verify_and_mirror(&log, ts(400), &NullSink)
-            .expect("single-event chain verifies");
+        mirror.verify_and_mirror(&log, ts(400)?, &NullSink)?;
 
         let entries = mirror.transport.entries();
         let rendered = entries[0].to_report_line();
@@ -576,22 +581,24 @@ mod tests {
         assert!(!rendered.contains("secret.rotate"));
         assert!(!rendered.contains("prod-token"));
         assert!(rendered.contains("event_count=1"));
+        Ok(())
     }
 
     #[test]
-    fn failed_transport_does_not_hang_and_is_not_silently_dropped() {
+    fn failed_transport_does_not_hang_and_is_not_silently_dropped() -> TestResult {
         let mut log = AuditLog::new();
         log.append(Actor::System, "secret.access", Vec::new());
         let mirror = ChainAuditMirror::new(RecordingMirrorTransport::always_failing());
 
-        let outcome = mirror.verify_and_mirror(&log, ts(500), &NullSink);
+        let outcome = mirror.verify_and_mirror(&log, ts(500)?, &NullSink);
 
         assert!(outcome.is_ok());
         assert_eq!(mirror.delivery_failure_count(), 1);
+        Ok(())
     }
 
     #[test]
-    fn failed_transport_on_a_broken_chain_still_reports_the_break_locally() {
+    fn failed_transport_on_a_broken_chain_still_reports_the_break_locally() -> TestResult {
         let _guard = AUDIT_COUNTER_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -599,12 +606,13 @@ mod tests {
         let mirror = ChainAuditMirror::new(RecordingMirrorTransport::always_failing());
         let before = AUDIT_CHAIN_BREAK.count();
 
-        let outcome = mirror.verify_and_mirror(&log, ts(600), &NullSink);
+        let outcome = mirror.verify_and_mirror(&log, ts(600)?, &NullSink);
 
         assert!(matches!(outcome, Err(AuditError::ChainBroken { .. })));
         assert_eq!(mirror.chain_break_count(), 1);
         assert_eq!(AUDIT_CHAIN_BREAK.count(), before + 1);
         // One failure for the heartbeat, one for the alert.
         assert_eq!(mirror.delivery_failure_count(), 2);
+        Ok(())
     }
 }

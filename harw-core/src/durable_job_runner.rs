@@ -126,8 +126,7 @@ impl std::error::Error for DurableJobRunnerError {
             Self::Store(error) => Some(error),
             Self::Registry(error) => Some(error),
             Self::LeaseLost {
-                cause: Some(cause),
-                ..
+                cause: Some(cause), ..
             } => Some(cause),
             Self::LeaseLost { cause: None, .. } | Self::Blocking { .. } => None,
         }
@@ -692,6 +691,7 @@ impl Drop for RunGuard {
 mod tests {
     use super::*;
     use crate::execution_registry::ExecutionControl;
+    use crate::test_support::{TestResult, ctx};
     use harw_job_runtime::{Budget, Job, JobKind, RetryPolicy, StoredJob};
     use harw_types::{ApprovalActor, TenantId, WorkspaceId};
     use jiff::SignedDuration;
@@ -733,7 +733,7 @@ mod tests {
         }
     }
 
-    fn record(id: &str) -> StoredJob {
+    fn record(id: &str) -> TestResult<StoredJob> {
         let now = Timestamp::now();
         let mut job = Job::new(
             WorkId::from_str(id),
@@ -747,8 +747,8 @@ mod tests {
             },
             now,
         );
-        job.mark_ready(now).expect("new job is pending");
-        StoredJob {
+        job.mark_ready(now).map_err(ctx("new job is pending"))?;
+        Ok(StoredJob {
             job,
             scope: harw_job_runtime::JobScope::new(
                 TenantId::from_str("tenant"),
@@ -766,17 +766,19 @@ mod tests {
             cancellation: None,
             revision: 0,
             trace: None,
-        }
+        })
     }
 
-    fn runner(id: &str) -> (tempfile::TempDir, Arc<JobStore>, DurableJobRunner, WorkId) {
-        let temp = tempfile::tempdir().expect("tempdir");
+    fn runner(
+        id: &str,
+    ) -> TestResult<(tempfile::TempDir, Arc<JobStore>, DurableJobRunner, WorkId)> {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = Arc::new(JobStore::new(temp.path()));
         let work_id = WorkId::from_str(id);
-        store.admit(&record(id)).expect("admit record");
+        store.admit(&record(id)?).map_err(ctx("admit record"))?;
         let executions = Arc::new(JobExecutionRegistry::new());
         let runner = DurableJobRunner::new(Arc::clone(&store), executions);
-        (temp, store, runner, work_id)
+        Ok((temp, store, runner, work_id))
     }
 
     fn request(now: Timestamp) -> ClaimRequest {
@@ -814,8 +816,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn happy_completion_unregisters_exact_execution() {
-        let (_temp, store, runner, work_id) = runner("work-happy");
+    async fn happy_completion_unregisters_exact_execution() -> TestResult {
+        let (_temp, store, runner, work_id) = runner("work-happy")?;
         let control = FakeControl::new();
         let expected = Arc::clone(&control);
         let completion = runner
@@ -829,19 +831,20 @@ mod tests {
                 })
             })
             .await
-            .expect("run succeeds");
+            .map_err(ctx("run succeeds"))?;
         assert!(matches!(completion.outcome, JobOutcome::Succeeded { .. }));
         assert_eq!(expected.graceful.load(Ordering::SeqCst), 0);
         assert!(runner.executions().is_empty());
         assert_eq!(
-            store.get(&work_id).expect("record").job.state,
+            store.get(&work_id).map_err(ctx("record"))?.job.state,
             harw_job_runtime::JobState::Completed
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn failed_outcome_still_unregisters_execution() {
-        let (_temp, store, runner, work_id) = runner("work-failed");
+    async fn failed_outcome_still_unregisters_execution() -> TestResult {
+        let (_temp, store, runner, work_id) = runner("work-failed")?;
         let control = FakeControl::new();
         let completion = runner
             .run(&work_id, &request(Timestamp::now()), move |_claim| {
@@ -852,18 +855,19 @@ mod tests {
                 })
             })
             .await
-            .expect("durable failure is a completion");
+            .map_err(ctx("durable failure is a completion"))?;
         assert!(matches!(completion.outcome, JobOutcome::Failed { .. }));
         assert!(runner.executions().is_empty());
         assert_eq!(
-            store.get(&work_id).expect("record").job.state,
+            store.get(&work_id).map_err(ctx("record"))?.job.state,
             harw_job_runtime::JobState::Failed
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn durable_cancellation_fences_runner_before_completion() {
-        let (_temp, store, _unused_runner, work_id) = runner("work-cancel");
+    async fn durable_cancellation_fences_runner_before_completion() -> TestResult {
+        let (_temp, store, _unused_runner, work_id) = runner("work-cancel")?;
         let executions = Arc::new(JobExecutionRegistry::new());
         let runner = DurableJobRunner::new(Arc::clone(&store), Arc::clone(&executions));
         let control = FakeControl::new();
@@ -888,7 +892,7 @@ mod tests {
                 })
                 .await
         });
-        let token = claimed_rx.await.expect("claim reached operation");
+        let token = claimed_rx.await.map_err(ctx("claim reached operation"))?;
         // The operation is built before registration; wait for the binding.
         for _ in 0..200 {
             if executions.contains(&token) {
@@ -907,7 +911,7 @@ mod tests {
                     reason: "operator cancellation".to_owned(),
                 },
             )
-            .expect("durable cancellation");
+            .map_err(ctx("durable cancellation"))?;
         assert_eq!(
             transition.prior_lease.as_ref().map(|lease| lease.token()),
             Some(token.clone())
@@ -916,11 +920,11 @@ mod tests {
             executions
                 .cancel(&token, std::time::Duration::from_secs(1))
                 .await
-                .expect("live cancellation"),
+                .map_err(ctx("live cancellation"))?,
             crate::execution_registry::CancellationResult::Graceful
         );
         assert_eq!(control.graceful.load(Ordering::SeqCst), 1);
-        let result = run.await.expect("runner task");
+        let result = run.await.map_err(ctx("runner task"))?;
         assert!(matches!(
             result,
             Err(DurableJobRunnerError::Store(
@@ -932,8 +936,9 @@ mod tests {
         ));
         assert!(executions.is_empty());
         assert!(matches!(
-            store.get(&work_id).expect("record").job.state,
+            store.get(&work_id).map_err(ctx("record"))?.job.state,
             harw_job_runtime::JobState::Cancelled
         ));
+        Ok(())
     }
 }

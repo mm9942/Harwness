@@ -189,7 +189,11 @@ const V6_TABLE: [([u16; 8], u32, AddrClass); 13] = [
     ([0x64, 0xff9b, 1, 0, 0, 0, 0, 0], 48, AddrClass::Reserved),
     ([0x100, 0, 0, 0, 0, 0, 0, 0], 64, AddrClass::Reserved),
     ([0x2001, 0x2, 0, 0, 0, 0, 0, 0], 48, AddrClass::Benchmark),
-    ([0x2001, 0xdb8, 0, 0, 0, 0, 0, 0], 32, AddrClass::Documentation),
+    (
+        [0x2001, 0xdb8, 0, 0, 0, 0, 0, 0],
+        32,
+        AddrClass::Documentation,
+    ),
     ([0x3fff, 0, 0, 0, 0, 0, 0, 0], 20, AddrClass::Documentation),
     ([0x2001, 0, 0, 0, 0, 0, 0, 0], 23, AddrClass::Reserved),
     ([0x2002, 0, 0, 0, 0, 0, 0, 0], 16, AddrClass::Reserved),
@@ -236,7 +240,10 @@ fn classify_v6(addr: Ipv6Addr) -> AddrClass {
     {
         return classify_v4(low_v4(addr));
     }
-    if let Some((_, _, class)) = V6_TABLE.iter().find(|(net, len, _)| v6_in(addr, *net, *len)) {
+    if let Some((_, _, class)) = V6_TABLE
+        .iter()
+        .find(|(net, len, _)| v6_in(addr, *net, *len))
+    {
         return *class;
     }
     if v6_in(addr, V6_GLOBAL_UNICAST.0, V6_GLOBAL_UNICAST.1) {
@@ -273,19 +280,21 @@ fn v6_in(addr: Ipv6Addr, net: [u16; 8], len: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
-    fn class_of(raw: &str) -> AddrClass {
-        classify(raw.parse().expect("gültige Testadresse"))
+    fn class_of(raw: &str) -> TestResult<AddrClass> {
+        Ok(classify(raw.parse().map_err(ctx("gültige Testadresse"))?))
     }
 
-    fn assert_table(table: &[(&str, AddrClass)]) {
+    fn assert_table(table: &[(&str, AddrClass)]) -> TestResult {
         for (raw, expected) in table {
-            assert_eq!(class_of(raw), *expected, "{raw}");
+            assert_eq!(class_of(raw)?, *expected, "{raw}");
         }
+        Ok(())
     }
 
     #[test]
-    fn test_classify_ipv4_table() {
+    fn test_classify_ipv4_table() -> TestResult {
         assert_table(&[
             ("127.0.0.1", AddrClass::Loopback),
             ("127.255.255.254", AddrClass::Loopback),
@@ -318,11 +327,11 @@ mod tests {
             ("192.88.99.1", AddrClass::Reserved),
             ("8.8.8.8", AddrClass::Public),
             ("1.1.1.1", AddrClass::Public),
-        ]);
+        ])
     }
 
     #[test]
-    fn test_classify_ipv6_table() {
+    fn test_classify_ipv6_table() -> TestResult {
         assert_table(&[
             ("::", AddrClass::Unspecified),
             ("::1", AddrClass::Loopback),
@@ -352,11 +361,11 @@ mod tests {
             ("4000::1", AddrClass::Reserved),
             ("5f00::1", AddrClass::Reserved),
             ("1000::1", AddrClass::Reserved),
-        ]);
+        ])
     }
 
     #[test]
-    fn test_classify_ipv4_mapped_uses_inner_address() {
+    fn test_classify_ipv4_mapped_uses_inner_address() -> TestResult {
         assert_table(&[
             ("::ffff:127.0.0.1", AddrClass::Loopback),
             ("::ffff:10.0.0.1", AddrClass::Private),
@@ -366,11 +375,11 @@ mod tests {
             ("::ffff:255.255.255.255", AddrClass::Broadcast),
             ("::ffff:0.0.0.0", AddrClass::Unspecified),
             ("::ffff:8.8.8.8", AddrClass::Public),
-        ]);
+        ])
     }
 
     #[test]
-    fn test_classify_nat64_uses_inner_address() {
+    fn test_classify_nat64_uses_inner_address() -> TestResult {
         assert_table(&[
             ("64:ff9b::808:808", AddrClass::Public),
             ("64:ff9b::a00:1", AddrClass::Private),
@@ -378,7 +387,7 @@ mod tests {
             ("64:ff9b::a9fe:a9fe", AddrClass::CloudMetadata),
             ("64:ff9b::6464:1", AddrClass::Cgnat),
             ("64:ff9b::c000:201", AddrClass::Documentation),
-        ]);
+        ])
     }
 
     #[test]

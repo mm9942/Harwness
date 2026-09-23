@@ -87,13 +87,19 @@ impl fmt::Display for EgressError {
                 "Host {host} bezeichnet die eigene Maschine; private Ziele sind nicht erlaubt"
             ),
             Self::AddressDenied { addr, class } => {
-                write!(f, "Zieladresse {addr} ({class}) ist für Egress nicht erlaubt")
+                write!(
+                    f,
+                    "Zieladresse {addr} ({class}) ist für Egress nicht erlaubt"
+                )
             }
             Self::NoPermittedAddress { host, denied } => {
                 if denied.is_empty() {
                     write!(f, "DNS-Auflösung von {host} lieferte keine Adresse")
                 } else {
-                    write!(f, "DNS-Auflösung von {host} lieferte nur unzulässige Adressen: ")?;
+                    write!(
+                        f,
+                        "DNS-Auflösung von {host} lieferte nur unzulässige Adressen: "
+                    )?;
                     for (index, (addr, class)) in denied.iter().enumerate() {
                         if index > 0 {
                             write!(f, ", ")?;
@@ -141,26 +147,36 @@ impl From<reqwest::Error> for EgressError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use std::error::Error as _;
 
     #[test]
-    fn test_display_address_denied_names_address_and_class() {
+    fn test_display_address_denied_names_address_and_class() -> TestResult {
         let err = EgressError::AddressDenied {
-            addr: "169.254.169.254".parse().unwrap(),
+            addr: "169.254.169.254"
+                .parse()
+                .map_err(ctx("IP-Adresse parsen"))?,
             class: AddrClass::CloudMetadata,
         };
         let text = err.to_string();
         assert!(text.contains("169.254.169.254"), "{text}");
         assert!(text.contains("cloud-metadata"), "{text}");
+        Ok(())
     }
 
     #[test]
-    fn test_display_no_permitted_address_lists_denied() {
+    fn test_display_no_permitted_address_lists_denied() -> TestResult {
         let err = EgressError::NoPermittedAddress {
             host: "rebind.example".to_owned(),
             denied: vec![
-                ("10.0.0.1".parse().unwrap(), AddrClass::Private),
-                ("::1".parse().unwrap(), AddrClass::Loopback),
+                (
+                    "10.0.0.1".parse().map_err(ctx("IP-Adresse parsen"))?,
+                    AddrClass::Private,
+                ),
+                (
+                    "::1".parse().map_err(ctx("IP-Adresse parsen"))?,
+                    AddrClass::Loopback,
+                ),
             ],
         };
         assert_eq!(
@@ -172,13 +188,20 @@ mod tests {
             host: "x.example".to_owned(),
             denied: Vec::new(),
         };
-        assert_eq!(empty.to_string(), "DNS-Auflösung von x.example lieferte keine Adresse");
+        assert_eq!(
+            empty.to_string(),
+            "DNS-Auflösung von x.example lieferte keine Adresse"
+        );
+        Ok(())
     }
 
     #[test]
     fn test_from_egress_url_error_keeps_source() {
         let err = EgressError::from(EgressUrlError::UserinfoPresent);
-        assert!(matches!(err, EgressError::InvalidUrl(EgressUrlError::UserinfoPresent)));
+        assert!(matches!(
+            err,
+            EgressError::InvalidUrl(EgressUrlError::UserinfoPresent)
+        ));
         assert!(err.source().is_some());
     }
 }

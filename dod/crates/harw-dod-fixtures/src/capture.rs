@@ -225,7 +225,9 @@ where
     let capture_scope = ReadScope::from_roots([tree_dir.clone()]);
     let handle = crate::build_handle(capability, capture_scope);
     let sensor = build(handle);
-    let reading = sensor.poll(now).map_err(crate::error::FixturesError::from)?;
+    let reading = sensor
+        .poll(now)
+        .map_err(crate::error::FixturesError::from)?;
 
     write_expected(case_dir, now, &reading)?;
 
@@ -351,6 +353,7 @@ mod tests {
     use harw_types::SensorId;
 
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[derive(Debug)]
     struct EchoValueSensor {
@@ -387,11 +390,11 @@ mod tests {
     }
 
     #[test]
-    fn test_capture_writes_tree_and_expect_json() {
-        let source = tempfile::tempdir().expect("source tempdir");
-        std::fs::write(source.path().join("value"), "7\n").expect("write source value");
+    fn test_capture_writes_tree_and_expect_json() -> TestResult {
+        let source = tempfile::tempdir().map_err(ctx("source tempdir"))?;
+        std::fs::write(source.path().join("value"), "7\n").map_err(ctx("write source value"))?;
 
-        let target = tempfile::tempdir().expect("target tempdir");
+        let target = tempfile::tempdir().map_err(ctx("target tempdir"))?;
         let case_dir = target.path().join("typical");
 
         let report = capture(
@@ -401,28 +404,29 @@ mod tests {
             &case_dir,
             Timestamp::UNIX_EPOCH,
         )
-        .expect("capture muss gelingen");
+        .map_err(ctx("capture muss gelingen"))?;
 
         assert_eq!(report.case_dir, case_dir);
         assert_eq!(report.files_copied, 1);
         assert!(!report.warning.is_empty());
 
         let copied = std::fs::read_to_string(case_dir.join("tree").join("value"))
-            .expect("kopierte value-Datei lesbar");
+            .map_err(ctx("kopierte value-Datei lesbar"))?;
         assert_eq!(copied, "7\n");
 
-        let expect_json =
-            std::fs::read_to_string(case_dir.join("expect.json")).expect("expect.json lesbar");
+        let expect_json = std::fs::read_to_string(case_dir.join("expect.json"))
+            .map_err(ctx("expect.json lesbar"))?;
         assert!(expect_json.contains("captured_value"));
         assert!(expect_json.contains(&SensorId::from_str(crate::FIXTURE_SENSOR_ID).to_string()));
+        Ok(())
     }
 
     #[test]
-    fn test_capture_round_trip_sensor_suite_accepts_output() {
-        let source = tempfile::tempdir().expect("source tempdir");
-        std::fs::write(source.path().join("value"), "99\n").expect("write source value");
+    fn test_capture_round_trip_sensor_suite_accepts_output() -> TestResult {
+        let source = tempfile::tempdir().map_err(ctx("source tempdir"))?;
+        std::fs::write(source.path().join("value"), "99\n").map_err(ctx("write source value"))?;
 
-        let target = tempfile::tempdir().expect("target tempdir");
+        let target = tempfile::tempdir().map_err(ctx("target tempdir"))?;
         let case_dir = target.path().join("typical");
 
         capture(
@@ -432,18 +436,20 @@ mod tests {
             &case_dir,
             Timestamp::UNIX_EPOCH,
         )
-        .expect("capture muss gelingen");
+        .map_err(ctx("capture muss gelingen"))?;
 
         // Rundlauf: dieselbe tree/-Kopie erneut gepollt muss exakt das in
         // expect.json hinterlegte SensorReading reproduzieren — die
         // Determinismus-Prüfung aus `harness`, hier direkt nachvollzogen.
-        let expected = crate::fixture_io::read_expected(&case_dir).expect("expect.json lesbar");
+        let expected =
+            crate::fixture_io::read_expected(&case_dir).map_err(ctx("expect.json lesbar"))?;
         let scope = ReadScope::from_roots([case_dir.join("tree")]);
         let sensor = EchoValueSensor::from(crate::build_handle(Capability::ReadProcStat, scope));
         let reading = sensor
             .poll(expected.now)
-            .expect("erneuter Poll gegen die Kopie muss gelingen");
+            .map_err(ctx("erneuter Poll gegen die Kopie muss gelingen"))?;
         assert_eq!(reading, expected.reading.into_reading());
+        Ok(())
     }
 
     #[test]
@@ -463,10 +469,10 @@ mod tests {
     }
 
     #[test]
-    fn test_capture_report_warning_is_always_present() {
-        let source = tempfile::tempdir().expect("source tempdir");
-        std::fs::write(source.path().join("value"), "1\n").expect("write");
-        let target = tempfile::tempdir().expect("target tempdir");
+    fn test_capture_report_warning_is_always_present() -> TestResult {
+        let source = tempfile::tempdir().map_err(ctx("source tempdir"))?;
+        std::fs::write(source.path().join("value"), "1\n").map_err(ctx("write"))?;
+        let target = tempfile::tempdir().map_err(ctx("target tempdir"))?;
         let case_dir = target.path().join("case");
 
         let report = capture(
@@ -476,8 +482,9 @@ mod tests {
             &case_dir,
             Timestamp::UNIX_EPOCH,
         )
-        .expect("capture muss gelingen");
+        .map_err(ctx("capture muss gelingen"))?;
 
         assert!(report.warning.contains("Prüfe tree/ von Hand"));
+        Ok(())
     }
 }

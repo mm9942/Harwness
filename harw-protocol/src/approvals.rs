@@ -269,6 +269,7 @@ impl ApprovalResponse {
 #[cfg(test)]
 mod tests {
     use super::{ApprovalKind, ApprovalRequest, ApprovalResponse};
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_types::{
         APPROVAL_TIMEOUT_REASON, ApprovalActor, ApprovalId, DEFAULT_APPROVAL_TIMEOUT,
         ReviewDecision, RiskLevel, TurnId, WorkId,
@@ -324,30 +325,34 @@ mod tests {
     }
 
     #[test]
-    fn default_timeout_at_adds_the_shared_default_duration() {
+    fn default_timeout_at_adds_the_shared_default_duration() -> TestResult {
         let requested_at = jiff::Timestamp::constant(1_700_000_000, 0);
         let timeout_at = ApprovalRequest::default_timeout_at(requested_at);
         assert_eq!(
             timeout_at,
             requested_at
                 .checked_add(DEFAULT_APPROVAL_TIMEOUT)
-                .expect("default timeout stays in range")
+                .map_err(ctx("default timeout stays in range"))?
         );
+        Ok(())
     }
 
     #[test]
-    fn is_expired_is_inclusive_at_the_deadline() {
+    fn is_expired_is_inclusive_at_the_deadline() -> TestResult {
         let requested_at = jiff::Timestamp::constant(1_700_000_000, 0);
         let request = test_request(requested_at);
 
         assert!(!request.is_expired(requested_at));
         assert!(request.is_expired(request.timeout_at));
-        assert!(request.is_expired(
-            request
-                .timeout_at
-                .checked_add(jiff::SignedDuration::from_secs(1))
-                .expect("one second after the deadline stays in range")
-        ));
+        assert!(
+            request.is_expired(
+                request
+                    .timeout_at
+                    .checked_add(jiff::SignedDuration::from_secs(1))
+                    .map_err(ctx("one second after the deadline stays in range"))?
+            )
+        );
+        Ok(())
     }
 
     #[test]
@@ -386,12 +391,12 @@ mod tests {
     }
 
     #[test]
-    fn approval_request_round_trips_through_json() {
+    fn approval_request_round_trips_through_json() -> TestResult {
         let requested_at = jiff::Timestamp::constant(1_700_000_000, 0);
         let request = test_request(requested_at);
-        let json = serde_json::to_string(&request).expect("request serializes");
+        let json = serde_json::to_string(&request).map_err(ctx("request serializes"))?;
         let decoded: ApprovalRequest =
-            serde_json::from_str(&json).expect("request deserializes");
+            serde_json::from_str(&json).map_err(ctx("request deserializes"))?;
 
         assert_eq!(decoded.id, request.id);
         assert_eq!(decoded.work_id, request.work_id);
@@ -404,12 +409,17 @@ mod tests {
                 ApprovalKind::Exec { command: left, .. },
                 ApprovalKind::Exec { command: right, .. },
             ) => assert_eq!(left, right),
-            other => panic!("expected two Exec kinds, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected two Exec kinds, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn approval_response_round_trips_through_json() {
+    fn approval_response_round_trips_through_json() -> TestResult {
         let response = ApprovalResponse {
             request_id: ApprovalId::new(),
             decision: ReviewDecision::ApprovedOnce,
@@ -417,13 +427,14 @@ mod tests {
             decided_at: jiff::Timestamp::constant(1_700_000_400, 0),
             reason: Some("bounded exception".to_owned()),
         };
-        let json = serde_json::to_string(&response).expect("response serializes");
+        let json = serde_json::to_string(&response).map_err(ctx("response serializes"))?;
         let decoded: ApprovalResponse =
-            serde_json::from_str(&json).expect("response deserializes");
+            serde_json::from_str(&json).map_err(ctx("response deserializes"))?;
 
         assert_eq!(decoded.request_id, response.request_id);
         assert_eq!(decoded.decision, response.decision);
         assert_eq!(decoded.decided_at, response.decided_at);
         assert_eq!(decoded.reason, response.reason);
+        Ok(())
     }
 }

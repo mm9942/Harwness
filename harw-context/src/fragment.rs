@@ -41,7 +41,7 @@
 //! assert!(TrustClass::Instruction.trust_rank() > TrustClass::Data.trust_rank());
 //! ```
 
-use crate::error::{validate_name, ContextError};
+use crate::error::{ContextError, validate_name};
 
 /// Vertrauensklasse eines Fragments. **Drei Werte, geschlossen.**
 ///
@@ -267,6 +267,7 @@ impl std::fmt::Display for FragmentLabel {
 mod tests {
     use super::{Fragment, FragmentLabel, FragmentOrigin, SectionName, Stability, TrustClass};
     use crate::error::ContextError;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
     fn test_trust_rank_orders_instruction_above_evidence_above_data() {
@@ -309,10 +310,11 @@ mod tests {
     }
 
     #[test]
-    fn test_section_name_try_new_accepts_valid_name() {
-        let section = SectionName::try_new("history.tail").unwrap();
+    fn test_section_name_try_new_accepts_valid_name() -> TestResult {
+        let section = SectionName::try_new("history.tail").map_err(ctx("try_new"))?;
         assert_eq!(section.as_str(), "history.tail");
         assert_eq!(section.to_string(), "history.tail");
+        Ok(())
     }
 
     #[test]
@@ -324,15 +326,16 @@ mod tests {
     }
 
     #[test]
-    fn test_fragment_label_try_new_accepts_valid_label() {
-        let label = FragmentLabel::try_new("turn-42").unwrap();
+    fn test_fragment_label_try_new_accepts_valid_label() -> TestResult {
+        let label = FragmentLabel::try_new("turn-42").map_err(ctx("try_new"))?;
         assert_eq!(label.as_str(), "turn-42");
+        Ok(())
     }
 
-    fn sample_fragment() -> Fragment {
-        Fragment {
-            label: FragmentLabel::try_new("turn-42").unwrap(),
-            section: SectionName::try_new("history.tail").unwrap(),
+    fn sample_fragment() -> TestResult<Fragment> {
+        Ok(Fragment {
+            label: FragmentLabel::try_new("turn-42").map_err(ctx("try_new label"))?,
+            section: SectionName::try_new("history.tail").map_err(ctx("try_new section"))?,
             trust: TrustClass::Evidence,
             stability: Stability::Stable,
             origin: FragmentOrigin {
@@ -343,28 +346,33 @@ mod tests {
             cost: harw_lens_types::CostEstimate(12),
             digest: harw_types::ContentDigest::of(b"hello context"),
             body: "hello context".to_owned(),
-        }
+        })
     }
 
     #[test]
-    fn test_fragment_serde_roundtrip() {
-        let fragment = sample_fragment();
-        let json = serde_json::to_string(&fragment).expect("fragment must serialize");
+    fn test_fragment_serde_roundtrip() -> TestResult {
+        let fragment = sample_fragment()?;
+        let json = serde_json::to_string(&fragment).map_err(ctx("fragment must serialize"))?;
         let restored: Fragment =
-            serde_json::from_str(&json).expect("fragment must deserialize");
+            serde_json::from_str(&json).map_err(ctx("fragment must deserialize"))?;
         assert_eq!(fragment, restored);
+        Ok(())
     }
 
     #[test]
-    fn test_fragment_deserialize_rejects_unknown_field() {
-        let fragment = sample_fragment();
-        let mut value = serde_json::to_value(&fragment).expect("fragment must serialize to value");
+    fn test_fragment_deserialize_rejects_unknown_field() -> TestResult {
+        let fragment = sample_fragment()?;
+        let mut value =
+            serde_json::to_value(&fragment).map_err(ctx("fragment must serialize to value"))?;
         value
             .as_object_mut()
-            .expect("fragment serializes to an object")
+            .ok_or(TestError::Unexpected(
+                "fragment must serialize to an object".to_string(),
+            ))?
             .insert("unexpected".to_owned(), serde_json::json!(true));
 
         let result: Result<Fragment, _> = serde_json::from_value(value);
         assert!(result.is_err());
+        Ok(())
     }
 }

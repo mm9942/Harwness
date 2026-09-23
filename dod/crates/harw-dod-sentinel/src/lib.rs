@@ -180,3 +180,7 @@ pub use sentinel::{Sentinel, SentinelConfig};
 pub use spool::{
     FindingSpool, SpoolCursor, SpoolEntry, SpoolError, SpoolId, SpoolLimits, SpoolResult,
 };
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

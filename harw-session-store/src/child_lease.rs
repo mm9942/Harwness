@@ -22,14 +22,14 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::error::{SessionStoreError, SessionStoreResult};
+use crate::store::{persist_noclobber, quarantine_file};
 use fs4::FileExt;
 use harw_observe::TraceContext;
 use harw_types::{SessionId, ToolCallId};
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
-use crate::error::{SessionStoreError, SessionStoreResult};
-use crate::store::{persist_noclobber, quarantine_file};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChildLeaseRecord {
@@ -492,14 +492,15 @@ fn safe_component(value: &str) -> SessionStoreResult<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use harw_types::SessionId;
 
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
-    fn lease(child: &str, expires_in_seconds: i64) -> ChildLeaseRecord {
+    fn lease(child: &str, expires_in_seconds: i64) -> TestResult<ChildLeaseRecord> {
         let admitted_at = Timestamp::now();
-        ChildLeaseRecord {
+        Ok(ChildLeaseRecord {
             child: SessionId::from_str(child),
             parent: SessionId::from_str("parent-1"),
             handoff_call_id: ToolCallId::from_str("call-1"),
@@ -508,9 +509,9 @@ mod tests {
             admitted_at,
             lease_expires_at: admitted_at
                 .checked_add(jiff::SignedDuration::from_secs(expires_in_seconds))
-                .unwrap(),
+                .map_err(ctx("lease: admitted_at + expires_in_seconds"))?,
             trace: None,
-        }
+        })
     }
 
     fn sample_trace() -> TraceContext {
@@ -522,38 +523,41 @@ mod tests {
     }
 
     #[test]
-    fn lease_record_with_trace_context_roundtrips_through_serde() {
+    fn lease_record_with_trace_context_roundtrips_through_serde() -> TestResult {
         let original = ChildLeaseRecord {
             trace: Some(sample_trace()),
-            ..lease("child-traced", 60)
+            ..lease("child-traced", 60)?
         };
 
-        let json = serde_json::to_string(&original).unwrap();
-        let decoded: ChildLeaseRecord = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&original)?;
+        let decoded: ChildLeaseRecord = serde_json::from_str(&json)?;
 
         assert_eq!(decoded, original);
+        Ok(())
     }
 
     #[test]
-    fn lease_record_without_trace_context_roundtrips_through_serde() {
-        let original = lease("child-untraced", 60);
+    fn lease_record_without_trace_context_roundtrips_through_serde() -> TestResult {
+        let original = lease("child-untraced", 60)?;
         assert_eq!(original.trace, None);
 
-        let json = serde_json::to_string(&original).unwrap();
-        let decoded: ChildLeaseRecord = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&original)?;
+        let decoded: ChildLeaseRecord = serde_json::from_str(&json)?;
 
         assert_eq!(decoded, original);
         assert_eq!(decoded.trace, None);
+        Ok(())
     }
 
     #[test]
-    fn a_lease_record_without_trace_omits_the_field_from_its_json() {
-        let json = serde_json::to_string(&lease("child-untraced", 60)).unwrap();
+    fn a_lease_record_without_trace_omits_the_field_from_its_json() -> TestResult {
+        let json = serde_json::to_string(&lease("child-untraced", 60)?)?;
 
         assert!(
             !json.contains("\"trace\""),
             "a None trace must be absent, not serialized as `\"trace\":null`: {json}"
         );
+        Ok(())
     }
 
     /// The most important test in this module: a `ChildLeaseRecord` written
@@ -562,7 +566,7 @@ mod tests {
     /// from `lease(..)`, so it independently pins the pre-trace file format
     /// rather than testing today's serializer against itself.
     #[test]
-    fn a_pre_trace_lease_file_still_deserializes_with_no_trace() {
+    fn a_pre_trace_lease_file_still_deserializes_with_no_trace() -> TestResult {
         let legacy = r#"{
             "child": "child-legacy",
             "parent": "parent-legacy",
@@ -574,169 +578,180 @@ mod tests {
         }"#;
 
         let decoded: ChildLeaseRecord = serde_json::from_str(legacy)
-            .expect("a pre-trace ChildLeaseRecord file must still deserialize");
+            .map_err(ctx("a pre-trace ChildLeaseRecord file must still deserialize"))?;
 
         assert_eq!(decoded.trace, None);
         assert_eq!(decoded.child, SessionId::from_str("child-legacy"));
         assert_eq!(decoded.depth, 1);
+        Ok(())
     }
 
     #[test]
-    fn admitted_lease_with_trace_context_roundtrips_through_the_real_store_path() {
-        let temp = tempfile::tempdir().unwrap();
+    fn admitted_lease_with_trace_context_roundtrips_through_the_real_store_path() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = ChildLeaseStore::new(temp.path());
         let admitted = ChildLeaseRecord {
             trace: Some(sample_trace()),
-            ..lease("child-store-traced", 60)
+            ..lease("child-store-traced", 60)?
         };
 
-        store.admit(&admitted).unwrap();
+        store.admit(&admitted)?;
 
-        assert_eq!(store.active().unwrap(), vec![admitted]);
+        assert_eq!(store.active()?, vec![admitted]);
+        Ok(())
     }
 
     #[test]
-    fn admitted_lease_without_trace_context_roundtrips_through_the_real_store_path() {
-        let temp = tempfile::tempdir().unwrap();
+    fn admitted_lease_without_trace_context_roundtrips_through_the_real_store_path() -> TestResult
+    {
+        let temp = tempfile::tempdir()?;
         let store = ChildLeaseStore::new(temp.path());
-        let admitted = lease("child-store-untraced", 60);
+        let admitted = lease("child-store-untraced", 60)?;
         assert_eq!(admitted.trace, None);
 
-        store.admit(&admitted).unwrap();
+        store.admit(&admitted)?;
 
-        let active = store.active().unwrap();
+        let active = store.active()?;
         assert_eq!(active, vec![admitted]);
         assert_eq!(active[0].trace, None);
+        Ok(())
     }
 
     #[test]
-    fn expiry_claim_is_durable_and_single_delivery() {
-        let temp = tempfile::tempdir().unwrap();
+    fn expiry_claim_is_durable_and_single_delivery() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = ChildLeaseStore::new(temp.path());
-        let expired = lease("child-expired", -1);
-        let active = lease("child-active", 60);
-        store.admit(&expired).unwrap();
-        store.admit(&active).unwrap();
+        let expired = lease("child-expired", -1)?;
+        let active = lease("child-active", 60)?;
+        store.admit(&expired)?;
+        store.admit(&active)?;
 
-        let first = store.claim_expired(Timestamp::now()).unwrap();
+        let first = store.claim_expired(Timestamp::now())?;
         assert_eq!(first, vec![expired.clone()]);
-        assert!(store.claim_expired(Timestamp::now()).unwrap().is_empty());
-        assert_eq!(store.active().unwrap(), vec![active]);
+        assert!(store.claim_expired(Timestamp::now())?.is_empty());
+        assert_eq!(store.active()?, vec![active]);
+        Ok(())
     }
 
     #[test]
-    fn completion_prevents_later_recovery_delivery_and_is_auditable() {
-        let temp = tempfile::tempdir().unwrap();
+    fn completion_prevents_later_recovery_delivery_and_is_auditable() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = ChildLeaseStore::new(temp.path());
-        let record = lease("child-1", -1);
-        store.admit(&record).unwrap();
-        let completion = store.complete(&record.child, Timestamp::now()).unwrap();
+        let record = lease("child-1", -1)?;
+        store.admit(&record)?;
+        let completion = store.complete(&record.child, Timestamp::now())?;
         assert_eq!(completion.lease, record);
-        assert!(store.claim_expired(Timestamp::now()).unwrap().is_empty());
+        assert!(store.claim_expired(Timestamp::now())?.is_empty());
         assert!(matches!(
             store.complete(&completion.lease.child, Timestamp::now()),
             Err(SessionStoreError::ChildLeaseAlreadyCompleted { .. })
         ));
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn list_and_expiry_ignore_symlinked_active_leases() {
-        let temp = tempfile::tempdir().unwrap();
+    fn list_and_expiry_ignore_symlinked_active_leases() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = ChildLeaseStore::new(temp.path());
-        std::fs::create_dir_all(store.root()).unwrap();
-        let linked_record = lease("child-linked", -1);
+        std::fs::create_dir_all(store.root())?;
+        let linked_record = lease("child-linked", -1)?;
         let target = temp.path().join("outside-active.json");
-        std::fs::write(&target, serde_json::to_vec(&linked_record).unwrap()).unwrap();
+        std::fs::write(&target, serde_json::to_vec(&linked_record)?)?;
         let link = store.root().join("child-linked.active.json");
-        symlink(&target, &link).unwrap();
+        symlink(&target, &link)?;
 
-        assert!(store.active().unwrap().is_empty());
-        assert!(store.claim_expired(Timestamp::now()).unwrap().is_empty());
-        assert!(std::fs::symlink_metadata(&link)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(store.active()?.is_empty());
+        assert!(store.claim_expired(Timestamp::now())?.is_empty());
+        assert!(std::fs::symlink_metadata(&link)?.file_type().is_symlink());
         assert!(target.exists());
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn expiry_does_not_replace_a_symlinked_terminal_record() {
-        let temp = tempfile::tempdir().unwrap();
+    fn expiry_does_not_replace_a_symlinked_terminal_record() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = ChildLeaseStore::new(temp.path());
-        let record = lease("child-expired", -1);
-        store.admit(&record).unwrap();
+        let record = lease("child-expired", -1)?;
+        store.admit(&record)?;
         let target = temp.path().join("outside-expired.json");
-        std::fs::write(&target, b"untrusted").unwrap();
-        let expired = store.expired_path(&record.child).unwrap();
-        symlink(&target, &expired).unwrap();
+        std::fs::write(&target, b"untrusted")?;
+        let expired = store.expired_path(&record.child)?;
+        symlink(&target, &expired)?;
 
-        assert!(store.claim_expired(Timestamp::now()).unwrap().is_empty());
-        assert!(std::fs::symlink_metadata(&expired)
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        assert_eq!(std::fs::read(&target).unwrap(), b"untrusted");
-        assert!(store.active_path(&record.child).unwrap().exists());
+        assert!(store.claim_expired(Timestamp::now())?.is_empty());
+        assert!(
+            std::fs::symlink_metadata(&expired)?
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target)?, b"untrusted");
+        assert!(store.active_path(&record.child)?.exists());
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn completion_does_not_read_symlinked_lease_records() {
-        let temp = tempfile::tempdir().unwrap();
+    fn completion_does_not_read_symlinked_lease_records() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = ChildLeaseStore::new(temp.path());
-        std::fs::create_dir_all(store.root()).unwrap();
-        let record = lease("child-linked", -1);
+        std::fs::create_dir_all(store.root())?;
+        let record = lease("child-linked", -1)?;
         let target = temp.path().join("outside-active.json");
-        std::fs::write(&target, serde_json::to_vec(&record).unwrap()).unwrap();
-        let active = store.active_path(&record.child).unwrap();
-        symlink(&target, &active).unwrap();
+        std::fs::write(&target, serde_json::to_vec(&record)?)?;
+        let active = store.active_path(&record.child)?;
+        symlink(&target, &active)?;
 
         assert!(matches!(
             store.complete(&record.child, Timestamp::now()),
             Err(SessionStoreError::ChildLeaseNotFound { .. })
         ));
-        assert!(std::fs::symlink_metadata(&active)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&active)?
+                .file_type()
+                .is_symlink()
+        );
         assert!(target.exists());
+        Ok(())
     }
 
     #[test]
-    fn sync_parent_directory_reports_a_missing_directory_without_panicking() {
-        let temp = tempfile::tempdir().unwrap();
+    fn sync_parent_directory_reports_a_missing_directory_without_panicking() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let missing = temp.path().join("does-not-exist");
 
         assert!(matches!(
             sync_parent_directory(&missing),
             Err(SessionStoreError::Io(_))
         ));
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn symlinked_completion_record_neither_suppresses_nor_is_replaced() {
-        let temp = tempfile::tempdir().unwrap();
+    fn symlinked_completion_record_neither_suppresses_nor_is_replaced() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = ChildLeaseStore::new(temp.path());
-        let record = lease("child-completion-link", 60);
-        store.admit(&record).unwrap();
+        let record = lease("child-completion-link", 60)?;
+        store.admit(&record)?;
         let target = temp.path().join("outside-completed.json");
-        std::fs::write(&target, b"untrusted").unwrap();
-        let completed = store.completed_path(&record.child).unwrap();
-        symlink(&target, &completed).unwrap();
+        std::fs::write(&target, b"untrusted")?;
+        let completed = store.completed_path(&record.child)?;
+        symlink(&target, &completed)?;
 
-        assert_eq!(store.active().unwrap(), vec![record.clone()]);
+        assert_eq!(store.active()?, vec![record.clone()]);
         assert!(matches!(
             store.complete(&record.child, Timestamp::now()),
             Err(SessionStoreError::Io(_))
         ));
-        assert!(std::fs::symlink_metadata(&completed)
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        assert_eq!(std::fs::read(&target).unwrap(), b"untrusted");
-        assert!(store.active_path(&record.child).unwrap().exists());
+        assert!(
+            std::fs::symlink_metadata(&completed)?
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target)?, b"untrusted");
+        assert!(store.active_path(&record.child)?.exists());
+        Ok(())
     }
 }

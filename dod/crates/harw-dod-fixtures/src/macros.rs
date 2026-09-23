@@ -12,10 +12,16 @@
 /// (Determinismus, Inhaltsfreiheit, Bereichsdichtheit, Verhalten bei leerer
 /// Quelle, Redaktion, Kardinalität, Fehlerfall) sowie eine achte, optionale
 /// Adversarial-Prüfung, die sich selbst überspringt, wenn
-/// `fixtures/adversarial/` nicht existiert. Jede generierte Funktion ist ein
+/// `fixtures/adversarial/` nicht existiert. Jede generierte Funktion gibt
+/// `-> Result<(), $crate::error::HarnessViolation>` zurück und ist ein
 /// dünner Aufruf der gleichnamigen `assert_*`-Funktion in
-/// [`crate::harness`] — dort steht die eigentliche Prüflogik, hier nur die
-/// Verdrahtung.
+/// [`crate::harness`] als Tail-Expression — dort steht die eigentliche
+/// Prüflogik, hier nur die Verdrahtung. `#[test]`-Funktionen akzeptieren
+/// diese Rückgabeform genauso wie `()`: ein `Err` markiert den Test als
+/// fehlgeschlagen und druckt den Fehler über `Debug`
+/// ([`crate::error::HarnessViolation`] leitet `Debug` per
+/// `#[derive(Debug)]` ab), ohne dass die geprüfte `assert_*`-Funktion selbst
+/// paniken muss (Bible R087/R089).
 ///
 /// # Bereichsdichtheit vs. leerer Bereich
 /// Diese beiden Prüfungen waren bis Knoten K48 eine einzige Zusicherung
@@ -64,12 +70,14 @@
 ///
 /// # Returns
 /// Kein Wert — das Makro erzeugt Item-Code (ein `mod` mit `#[test]`-
-/// Funktionen), keinen Ausdruck.
+/// Funktionen), keinen Ausdruck. Jede generierte Funktion selbst gibt
+/// `Result<(), $crate::error::HarnessViolation>` zurück (siehe oben).
 ///
 /// # Errors
-/// Kein `Result`. Eine verletzte Prüfung äußert sich als fehlgeschlagener
-/// Test (Panic in der jeweiligen generierten Funktion), nicht als
-/// Rückgabewert.
+/// Kein `Result` des Makro-Aufrufs selbst. Eine verletzte Prüfung äußert
+/// sich als `Err($crate::error::HarnessViolation)` aus der jeweiligen
+/// generierten `#[test]`-Funktion, die `cargo test` als fehlgeschlagenen
+/// Test meldet — nicht mehr als Panic (Bible R087/R089).
 ///
 /// # Examples
 /// ```rust,ignore
@@ -149,68 +157,74 @@ macro_rules! sensor_suite {
                 ))
             }
 
-            fn __build(
-                handle: ::harw_dod_cap::SensorHandle<::harw_dod_cap::Bound>,
-            ) -> $sensor {
+            fn __build(handle: ::harw_dod_cap::SensorHandle<::harw_dod_cap::Bound>) -> $sensor {
                 <$sensor as ::core::convert::From<
                     ::harw_dod_cap::SensorHandle<::harw_dod_cap::Bound>,
                 >>::from(handle)
             }
 
             #[test]
-            fn test_sensor_suite_determinism() {
-                $crate::harness::assert_determinism(__build, $capability, &__fixtures_root());
+            fn test_sensor_suite_determinism()
+            -> ::core::result::Result<(), $crate::error::HarnessViolation> {
+                $crate::harness::assert_determinism(__build, $capability, &__fixtures_root())
             }
 
             #[test]
-            fn test_sensor_suite_content_freedom() {
-                $crate::harness::assert_content_freedom(__build, $capability, &__fixtures_root());
+            fn test_sensor_suite_content_freedom()
+            -> ::core::result::Result<(), $crate::error::HarnessViolation> {
+                $crate::harness::assert_content_freedom(__build, $capability, &__fixtures_root())
             }
 
             #[test]
-            fn test_sensor_suite_scope_containment() {
-                $crate::harness::assert_scope_containment(__build, $capability, &__fixtures_root());
+            fn test_sensor_suite_scope_containment()
+            -> ::core::result::Result<(), $crate::error::HarnessViolation> {
+                $crate::harness::assert_scope_containment(__build, $capability, &__fixtures_root())
             }
 
             #[test]
-            fn test_sensor_suite_empty_scope_behavior() {
+            fn test_sensor_suite_empty_scope_behavior()
+            -> ::core::result::Result<(), $crate::error::HarnessViolation> {
                 match $empty_scope {
                     $crate::harness::EmptyScopeExpectation::SourceUnavailableIsError => {
-                        $crate::harness::assert_scope_tightness(__build, $capability);
+                        $crate::harness::assert_scope_tightness(__build, $capability)
                     }
                     $crate::harness::EmptyScopeExpectation::EmptySourceIsNormal => {
-                        $crate::harness::assert_empty_scope_is_ok(__build, $capability);
+                        $crate::harness::assert_empty_scope_is_ok(__build, $capability)
                     }
                 }
             }
 
             #[test]
-            fn test_sensor_suite_redaction() {
-                $crate::harness::assert_redaction(__build, $capability, &__fixtures_root());
+            fn test_sensor_suite_redaction()
+            -> ::core::result::Result<(), $crate::error::HarnessViolation> {
+                $crate::harness::assert_redaction(__build, $capability, &__fixtures_root())
             }
 
             #[test]
-            fn test_sensor_suite_cardinality() {
+            fn test_sensor_suite_cardinality()
+            -> ::core::result::Result<(), $crate::error::HarnessViolation> {
                 $crate::harness::assert_cardinality(
                     __build,
                     $capability,
                     &__fixtures_root(),
                     $max_cardinality,
-                );
+                )
             }
 
             #[test]
-            fn test_sensor_suite_error_case() {
-                $crate::harness::assert_error_case(__build, $capability, &__fixtures_root());
+            fn test_sensor_suite_error_case()
+            -> ::core::result::Result<(), $crate::error::HarnessViolation> {
+                $crate::harness::assert_error_case(__build, $capability, &__fixtures_root())
             }
 
             #[test]
-            fn test_sensor_suite_adversarial_survives() {
+            fn test_sensor_suite_adversarial_survives()
+            -> ::core::result::Result<(), $crate::error::HarnessViolation> {
                 $crate::harness::assert_adversarial_survives(
                     __build,
                     $capability,
                     &__fixtures_root(),
-                );
+                )
             }
         }
     };

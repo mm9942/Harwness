@@ -23,8 +23,9 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 mod auth;
 mod chat;
 mod cli;
-mod completion;
+mod completions;
 mod connect;
+mod doc_ocr;
 mod gateway;
 mod home;
 mod job_worker;
@@ -44,6 +45,8 @@ mod runtime_web;
 mod sandbox_cmd;
 mod secret_store;
 mod settings;
+#[cfg(test)]
+mod test_support;
 mod uia_bootstrap;
 mod web;
 mod worker_cancellation;
@@ -181,6 +184,8 @@ fn init_tracing(level: &str, log_sensitive: bool, tui_active: bool) {
     } else {
         level
     };
+    // `--log` wird bereits beim Parsen validiert (`LogFilterParser`); der
+    // `warn`-Fallback ist nur noch eine defensive No-op-Absicherung.
     let filter = EnvFilter::try_new(effective).unwrap_or_else(|_| EnvFilter::new("warn"));
     // Im Alternate-Screen ist auch STDERR sichtbar. Ein `fmt`-Layer darf in
     // der TUI daher gar nicht installiert werden: Ein Sink-Writer schützt nur
@@ -276,7 +281,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         }
         Some(Command::Connect { channel, pair }) => {
             let home = home::resolve_home(home_override)?;
-            connect::run(&home, &channel, pair.as_deref())
+            connect::run(&home, channel.as_str(), pair.as_deref())
         }
         Some(Command::Doctor { config_dir }) => {
             let layers = resolve_layers(home_override.clone(), config_dir.clone())?;
@@ -319,7 +324,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Some(Command::Auth { action }) => auth::run(home_override, action),
-        Some(Command::Completion { shell }) => completion::print_completion(shell),
+        Some(Command::Completions(command)) => completions::run(command),
         Some(Command::Update { check }) => lifecycle::update(home_override, check),
         Some(Command::Service { action }) => lifecycle::service(home_override, action),
         Some(Command::Catalog { refresh }) => lifecycle::catalog(home_override, refresh),
@@ -351,7 +356,10 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             scope,
             dry_run,
             yes,
-        }) => lifecycle::uninstall(home_override, &scope, dry_run, yes),
+        }) => {
+            let scope: Vec<String> = scope.iter().map(|s| s.as_str().to_owned()).collect();
+            lifecycle::uninstall(home_override, &scope, dry_run, yes)
+        }
         Some(Command::Uia { action }) => match action {
             cli::UiaAction::New => uia_bootstrap::run_new_uia_command(home_override),
         },
@@ -408,7 +416,7 @@ fn run_startup_migrations(
             Command::Init
             | Command::Classify { .. }
             | Command::Run { .. }
-            | Command::Completion { .. }
+            | Command::Completions(_)
             | Command::Update { .. }
             | Command::Service { .. }
             | Command::Catalog { .. }
@@ -643,6 +651,16 @@ fn serve_mcp(
 
     require_home_for_sealed_refs(&config, home.as_deref())?;
     let secret_resolver = open_serve_secret_resolver(&config, home.as_deref())?;
+    // `doc.read_pdf` (docs/design/doc_read_pdf_design.md §W4): nutzt Mistral
+    // OCR, wenn `serve`s Provider-Universum einen erreichbaren Mistral-Provider
+    // enthält; sonst bleibt sie beim lokalen `oxidize-pdf`-Rückfall (nie fatal).
+    crate::doc_ocr::install_doc_ocr(
+        &config,
+        home.as_deref(),
+        secret_resolver
+            .as_ref()
+            .map(|resolver| resolver as &dyn SecretResolver),
+    );
     let authenticator = build_authenticator(
         &config,
         secret_resolver
@@ -1114,6 +1132,7 @@ fn open_serve_secret_resolver(
                 rate_limit: None,
                 max_concurrency: None,
                 default_reasoning_effort: None,
+                gateway_identity_headers: false,
             },
         );
         needs_resolver = true;
@@ -2642,69 +2661,83 @@ fn print_runtime_rights(home: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn cli_parses_bare_invocation_as_chat() {
-        let cli = Cli::try_parse_from(["harw"]).expect("bare harw parses");
+    fn cli_parses_bare_invocation_as_chat() -> TestResult {
+        let cli = Cli::try_parse_from(["harw"]).map_err(ctx("bare harw parses"))?;
         assert!(cli.command.is_none());
+        Ok(())
     }
 
     #[test]
-    fn cli_parses_doctor_with_config_dir() {
+    fn cli_parses_doctor_with_config_dir() -> TestResult {
         let cli = Cli::try_parse_from(["harw", "doctor", "--config-dir", "/tmp/x"])
-            .expect("doctor parses");
+            .map_err(ctx("doctor parses"))?;
         assert!(matches!(cli.command, Some(Command::Doctor { .. })));
+        Ok(())
     }
 
     #[test]
-    fn cli_treats_unknown_token_as_chat_prompt() {
+    fn cli_treats_unknown_token_as_chat_prompt() -> TestResult {
         // Wie `codex "prompt"`: ein freistehendes Token ist der Chat-Prompt,
         // kein unbekannter Subcommand.
-        let cli = Cli::try_parse_from(["harw", "launch"]).expect("free token parses as prompt");
+        let cli =
+            Cli::try_parse_from(["harw", "launch"]).map_err(ctx("free token parses as prompt"))?;
         assert!(cli.command.is_none());
         assert_eq!(cli.chat.prompt.as_deref(), Some("launch"));
+        Ok(())
     }
 
     #[test]
-    fn local_run_executes_a_completed_core_turn() {
-        let home = unique_temp_dir("local-run-response");
-        harw_home::ensure_home(&home).expect("home scaffolds");
+    fn local_run_executes_a_completed_core_turn() -> TestResult {
+        let home = unique_temp_dir("local-run-response")?;
+        harw_home::ensure_home(&home).map_err(ctx("home scaffolds"))?;
         assert_eq!(
-            run_local_echo("hello harness", &home).unwrap(),
+            run_local_echo("hello harness", &home).map_err(ctx("run local echo"))?,
             "echo: hello harness"
         );
-        std::fs::remove_dir_all(home).expect("remove temporary home");
+        std::fs::remove_dir_all(home).map_err(ctx("remove temporary home"))?;
+        Ok(())
     }
 
     #[test]
-    fn local_run_persists_transcript_under_isolated_home() {
-        let home = unique_temp_dir("local-run-transcript");
-        harw_home::ensure_home(&home).expect("home scaffolds");
+    fn local_run_persists_transcript_under_isolated_home() -> TestResult {
+        let home = unique_temp_dir("local-run-transcript")?;
+        harw_home::ensure_home(&home).map_err(ctx("home scaffolds"))?;
 
         assert_eq!(
-            run_local_echo("persist me", &home).unwrap(),
+            run_local_echo("persist me", &home).map_err(ctx("run local echo"))?,
             "echo: persist me"
         );
 
         let profile_name = harw_home::active_profile_name(&home);
         let sessions_root = home.join("profiles").join(profile_name).join("sessions");
         let transcripts = std::fs::read_dir(&sessions_root)
-            .expect("sessions directory exists")
-            .map(|entry| entry.expect("transcript directory entry").path())
+            .map_err(ctx("sessions directory exists"))?
+            .map(|entry| {
+                entry
+                    .map_err(ctx("transcript directory entry"))
+                    .map(|entry| entry.path())
+            })
+            .collect::<TestResult<Vec<_>>>()?
+            .into_iter()
             .filter(|path| {
                 path.extension()
                     .is_some_and(|extension| extension == "jsonl")
             })
             .collect::<Vec<_>>();
         assert_eq!(transcripts.len(), 1, "run creates one durable transcript");
-        let transcript = std::fs::read_to_string(&transcripts[0]).expect("read transcript");
+        let transcript =
+            std::fs::read_to_string(&transcripts[0]).map_err(ctx("read transcript"))?;
         assert!(transcript.contains("persist me"), "user input is durable");
         assert!(
             transcript.contains("echo: persist me"),
             "assistant response is durable"
         );
 
-        std::fs::remove_dir_all(home).expect("remove temporary home");
+        std::fs::remove_dir_all(home).map_err(ctx("remove temporary home"))?;
+        Ok(())
     }
 
     #[test]
@@ -2713,43 +2746,49 @@ mod tests {
     }
 
     #[test]
-    fn startup_migrations_write_one_backup_and_are_idempotent() {
-        let dir = tempfile::tempdir().expect("create temporary config directory");
+    fn startup_migrations_write_one_backup_and_are_idempotent() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("create temporary config directory"))?;
         let config_path = dir.path().join("config.toml");
         let original = "# existing user configuration\n[logging]\nlevel = \"info\"\n";
-        std::fs::write(&config_path, original).expect("write old config");
+        std::fs::write(&config_path, original).map_err(ctx("write old config"))?;
 
         migrate_config_paths(std::slice::from_ref(&config_path))
-            .expect("startup migration succeeds");
+            .map_err(ctx("startup migration succeeds"))?;
 
-        let migrated = std::fs::read_to_string(&config_path).expect("read migrated config");
+        let migrated =
+            std::fs::read_to_string(&config_path).map_err(ctx("read migrated config"))?;
         assert!(migrated.contains("config_version = 1"), "{migrated}");
         assert_eq!(
             std::fs::read_to_string(dir.path().join("config.toml.bak.0"))
-                .expect("read migration backup"),
+                .map_err(ctx("read migration backup"))?,
             original
         );
 
         migrate_config_paths(std::slice::from_ref(&config_path))
-            .expect("current config is a no-op");
+            .map_err(ctx("current config is a no-op"))?;
         assert_eq!(
-            std::fs::read_to_string(&config_path).expect("read config after second run"),
+            std::fs::read_to_string(&config_path).map_err(ctx("read config after second run"))?,
             migrated
         );
         assert!(
             !dir.path().join("config.toml.bak.1").exists(),
             "idempotent migration must not create another backup"
         );
+        Ok(())
     }
 
     #[test]
-    fn startup_migrations_report_the_affected_config_path() {
-        let dir = tempfile::tempdir().expect("create temporary config directory");
+    fn startup_migrations_report_the_affected_config_path() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("create temporary config directory"))?;
         let config_path = dir.path().join("config.toml");
-        std::fs::write(&config_path, "config_version = 2\n").expect("write future config");
+        std::fs::write(&config_path, "config_version = 2\n").map_err(ctx("write future config"))?;
 
-        let error = migrate_config_paths(std::slice::from_ref(&config_path))
-            .expect_err("future config version must stop startup");
+        let result = migrate_config_paths(std::slice::from_ref(&config_path));
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "future config version must stop startup".into(),
+            ));
+        };
 
         assert!(
             error.contains("configuration migration failed for"),
@@ -2760,31 +2799,40 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("kein Migrationspfad"), "{error}");
+        Ok(())
     }
 
     #[test]
-    fn completion_path_skips_startup_migrations() {
+    fn completion_path_skips_startup_migrations() -> TestResult {
         let home = tempfile::tempdir()
-            .expect("create temporary parent")
+            .map_err(ctx("create temporary parent"))?
             .path()
             .join("absent-harw-home");
-        let command = Some(Command::Completion {
-            shell: clap_complete::Shell::Zsh,
-        });
+        let command = Some(Command::Completions(cli::CompletionsCommand {
+            args: harw_completions::CompletionsArgs {
+                shell: Some(harw_completions::Shell::Zsh),
+                install: false,
+                uninstall: false,
+                dry_run: false,
+            },
+            all_binaries: false,
+        }));
 
-        run_startup_migrations(&command, Some(home.clone())).expect("completion skips migrations");
+        run_startup_migrations(&command, Some(home.clone()))
+            .map_err(ctx("completion skips migrations"))?;
 
         assert!(
             !home.exists(),
             "completion must not scaffold a home or write migration state"
         );
+        Ok(())
     }
 
-    fn unique_temp_dir(label: &str) -> PathBuf {
+    fn unique_temp_dir(label: &str) -> TestResult<PathBuf> {
         let dir =
             std::env::temp_dir().join(format!("harw-cli-test-{label}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir creates");
-        dir
+        std::fs::create_dir_all(&dir).map_err(ctx("temp dir creates"))?;
+        Ok(dir)
     }
 
     /// Z1-R2-03: `harw serve` muss `file:`-Credentials auflösen, die
@@ -2793,23 +2841,26 @@ mod tests {
     /// bewusst fail-closed
     /// (`harw_provider_http::FILE_CREDENTIAL_NO_HOME_REASON`).
     #[test]
-    fn build_serve_provider_resolves_file_credentials_only_with_a_home() {
+    fn build_serve_provider_resolves_file_credentials_only_with_a_home() -> TestResult {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let home = unique_temp_dir("serve-provider-file-credential");
+        let home = unique_temp_dir("serve-provider-file-credential")?;
         let secrets = home.join("secrets");
-        std::fs::create_dir_all(&secrets).expect("secrets dir creates");
+        std::fs::create_dir_all(&secrets).map_err(ctx("secrets dir creates"))?;
         let token = secrets.join("gateway.key");
-        std::fs::write(&token, "gateway-file-key").expect("secret writes");
+        std::fs::write(&token, "gateway-file-key").map_err(ctx("secret writes"))?;
         std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600))
-            .expect("secret is private");
+            .map_err(ctx("secret is private"))?;
 
         let provider = ProviderToml {
             name: "gateway".to_owned(),
             api: "openai-chat".to_owned(),
             base_url: "https://gateway.example/v1".to_owned(),
             auth: Some(SecretRef::File(
-                token.to_str().expect("UTF-8 fixture path").to_owned(),
+                token
+                    .to_str()
+                    .ok_or(TestError::Missing("UTF-8 fixture path"))?
+                    .to_owned(),
             )),
             auth_header: Some("bearer".to_owned()),
             api_key: None,
@@ -2821,24 +2872,30 @@ mod tests {
             rate_limit: None,
             max_concurrency: None,
             default_reasoning_effort: None,
+            gateway_identity_headers: false,
         };
         let mut config = ResolvedConfig::default();
         config.harness.default_provider = Some("gateway".to_owned());
         config.harness.default_model = Some("model".to_owned());
         config.providers.insert("gateway".to_owned(), provider);
 
-        build_serve_provider(&config, Some(home.as_path()), None)
-            .expect("file credential below <home>/secrets resolves for serve");
+        build_serve_provider(&config, Some(home.as_path()), None).map_err(ctx(
+            "file credential below <home>/secrets resolves for serve",
+        ))?;
         // `Box<dyn ModelProvider>` implementiert kein `Debug` (Trait-Objekt
         // ohne Debug-Bound) — `.expect_err(..)` würde das für den Ok-Zweig
         // verlangen. Daher hier von Hand matchen und im unerwarteten
         // Ok-Fall mit einer eigenen, sprechenden Meldung abbrechen statt
         // den Provider selbst zu formatieren.
-        let error = match build_serve_provider(&config, None, None) {
+        let result = build_serve_provider(&config, None, None);
+        let error = match result {
             Err(error) => error,
-            Ok(_) => panic!(
-                "file credential must stay fail-closed without a home, got a provider instead"
-            ),
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "file credential must stay fail-closed without a home, got a provider instead"
+                        .into(),
+                ));
+            }
         };
         assert!(
             !error.contains("gateway-file-key"),
@@ -2846,7 +2903,8 @@ mod tests {
         );
         assert!(!error.contains("gateway.key"), "leaked path: {error}");
 
-        std::fs::remove_dir_all(&home).expect("remove temporary home");
+        std::fs::remove_dir_all(&home).map_err(ctx("remove temporary home"))?;
+        Ok(())
     }
 
     // ── Planungsfläche: Composition-Root (AP W5-08) ───────────────────────────
@@ -2854,8 +2912,8 @@ mod tests {
     /// Baut die Plan-Dienste über einem frischen Home und gibt beides zurück.
     fn plan_services_over_temp_home(
         config: &PlanToolConfig,
-    ) -> (tempfile::TempDir, super::PlanServices) {
-        let home = tempfile::tempdir().expect("create temporary home");
+    ) -> TestResult<(tempfile::TempDir, super::PlanServices)> {
+        let home = tempfile::tempdir().map_err(ctx("create temporary home"))?;
         let root = harw_home::project::ProjectRoot {
             root: home.path().to_path_buf(),
             trust_key: home.path().to_path_buf(),
@@ -2868,12 +2926,12 @@ mod tests {
             DEFAULT_PLAN_SPACE,
             DEFAULT_GOAL_SPACE,
         )
-        .expect("plan services build");
-        (home, services)
+        .map_err(ctx("plan services build"))?;
+        Ok((home, services))
     }
 
     #[test]
-    fn disabled_plan_surface_registers_nothing_and_creates_no_directories() {
+    fn disabled_plan_surface_registers_nothing_and_creates_no_directories() -> TestResult {
         // `persist = true` bei `enabled = false`: gerade dann darf nichts auf
         // der Platte entstehen — sonst sähe ein abgeschaltetes Werkzeug beim
         // nächsten Blick ins Dateisystem benutzt aus.
@@ -2887,7 +2945,7 @@ mod tests {
             "explizit deaktivierte Konfiguration bleibt aus"
         );
 
-        let (home, services) = plan_services_over_temp_home(&config);
+        let (home, services) = plan_services_over_temp_home(&config)?;
 
         assert!(services.plan.is_none());
         assert!(services.goal.is_none());
@@ -2919,12 +2977,13 @@ mod tests {
                 "{path} darf bei geschlossenem Gate nicht auffindbar sein"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn enabled_plan_surface_registers_six_operations_and_four_services() {
+    fn enabled_plan_surface_registers_six_operations_and_four_services() -> TestResult {
         let config = PlanToolConfig::enabled_defaults();
-        let (_home, services) = plan_services_over_temp_home(&config);
+        let (_home, services) = plan_services_over_temp_home(&config)?;
 
         assert!(services.plan.is_some());
         assert!(services.goal.is_some());
@@ -2946,15 +3005,16 @@ mod tests {
                 "{name} wurde nicht registriert"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn persisting_plan_surface_uses_separate_plan_and_goal_roots() {
+    fn persisting_plan_surface_uses_separate_plan_and_goal_roots() -> TestResult {
         let config = PlanToolConfig {
             persist: true,
             ..PlanToolConfig::enabled_defaults()
         };
-        let (home, services) = plan_services_over_temp_home(&config);
+        let (home, services) = plan_services_over_temp_home(&config)?;
 
         assert!(services.plan.is_some());
         assert!(services.goal.is_some());
@@ -2967,47 +3027,60 @@ mod tests {
             plans, goals,
             "ein Ziel überlebt Plan-Revisionen und braucht einen eigenen Speicherort"
         );
+        Ok(())
     }
 
     #[test]
-    fn unknown_mode_is_rejected_with_the_list_of_valid_modes() {
-        let error = resolve_startup_mode(Some("voelliger-unsinn"), "chat")
-            .expect_err("ein unbekannter Modus darf nicht still auf chat fallen");
+    fn unknown_mode_is_rejected_with_the_list_of_valid_modes() -> TestResult {
+        let result = resolve_startup_mode(Some("voelliger-unsinn"), "chat");
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "ein unbekannter Modus darf nicht still auf chat fallen".into(),
+            ));
+        };
 
         assert!(error.contains("voelliger-unsinn"), "{error}");
         for mode in ["chat", "plan", "explore", "work", "shell"] {
             assert!(error.contains(mode), "{error} nennt '{mode}' nicht");
         }
+        Ok(())
     }
 
     #[test]
-    fn explicit_mode_is_typed_and_beats_the_configured_default() {
+    fn explicit_mode_is_typed_and_beats_the_configured_default() -> TestResult {
         assert_eq!(
-            resolve_startup_mode(Some("explore"), "work").expect("explore parses"),
+            resolve_startup_mode(Some("explore"), "work").map_err(ctx("explore parses"))?,
             InteractionMode::Explore
         );
         assert_eq!(
-            resolve_startup_mode(Some(" WORK "), "chat").expect("normalisierter Name parst"),
+            resolve_startup_mode(Some(" WORK "), "chat")
+                .map_err(ctx("normalisierter Name parst"))?,
             InteractionMode::Work
         );
         assert_eq!(
-            resolve_startup_mode(None, "plan").expect("[mode] default gilt ohne Flag"),
+            resolve_startup_mode(None, "plan").map_err(ctx("[mode] default gilt ohne Flag"))?,
             InteractionMode::Plan
         );
+        Ok(())
     }
 
     #[test]
-    fn invalid_configured_mode_is_an_error_not_a_silent_chat_fallback() {
-        let error = resolve_startup_mode(None, "wörk")
-            .expect_err("auch ein Konfigurationsfehler darf nicht still werden");
+    fn invalid_configured_mode_is_an_error_not_a_silent_chat_fallback() -> TestResult {
+        let result = resolve_startup_mode(None, "wörk");
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "auch ein Konfigurationsfehler darf nicht still werden".into(),
+            ));
+        };
         assert!(error.contains("[mode] default"), "{error}");
         assert!(error.contains("work"), "{error}");
+        Ok(())
     }
 
     /// `to_runtime` reicht eine Planungsfläche nur vollständig weiter — und
     /// zwar mit **denselben** Store-Instanzen, nicht mit neu geöffneten.
     #[test]
-    fn test_plan_services_to_runtime_requires_all_three_stores() {
+    fn test_plan_services_to_runtime_requires_all_three_stores() -> TestResult {
         let disabled = super::PlanServices {
             plan: None,
             goal: None,
@@ -3028,16 +3101,20 @@ mod tests {
         );
 
         let config = PlanToolConfig::enabled_defaults();
-        let (_home, complete) = plan_services_over_temp_home(&config);
+        let (_home, complete) = plan_services_over_temp_home(&config)?;
         let Some(runtime) = complete.to_runtime() else {
-            panic!("bei aktiver Planungsfläche müssen alle drei Stores vorliegen");
+            return Err(TestError::Unexpected(
+                "bei aktiver Planungsfläche müssen alle drei Stores vorliegen".into(),
+            ));
         };
         let (Some(plan), Some(goal), Some(findings)) = (
             complete.plan.as_ref(),
             complete.goal.as_ref(),
             complete.findings.as_ref(),
         ) else {
-            panic!("die Fixture hat alle drei Stores");
+            return Err(TestError::Unexpected(
+                "die Fixture hat alle drei Stores".into(),
+            ));
         };
         assert!(Arc::ptr_eq(&runtime.plan, plan), "derselbe Plan-Store");
         assert!(Arc::ptr_eq(&runtime.goal, goal), "derselbe Goal-Store");
@@ -3050,14 +3127,15 @@ mod tests {
             "die Konfiguration reist mit"
         );
         assert_eq!(runtime.plan_config.max_nodes, complete.config.max_nodes);
+        Ok(())
     }
 
     /// Der Startmodus ist ein Rückgabewert, kein Prozesszustand: zwei
     /// Auflösungen hintereinander liefern je ihren eigenen Modus.
     #[test]
-    fn test_prepare_planning_startup_resolves_mode_without_global_state() {
-        let home = tempfile::tempdir().expect("create temporary home");
-        let cwd = tempfile::tempdir().expect("create temporary cwd");
+    fn test_prepare_planning_startup_resolves_mode_without_global_state() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temporary home"))?;
+        let cwd = tempfile::tempdir().map_err(ctx("create temporary cwd"))?;
         let spec = runtime_entry::runtime_spec(
             EntryKind::Tui,
             home.path(),
@@ -3066,7 +3144,7 @@ mod tests {
         );
 
         let explore = prepare_planning_startup(&spec, Some("explore"), None)
-            .expect("explicit explore mode resolves");
+            .map_err(ctx("explicit explore mode resolves"))?;
         let explore_mode = explore.mode;
         assert_eq!(
             explore.services.to_runtime().is_some(),
@@ -3076,28 +3154,36 @@ mod tests {
         drop(explore);
 
         let work = prepare_planning_startup(&spec, Some("work"), None)
-            .expect("explicit work mode resolves");
+            .map_err(ctx("explicit work mode resolves"))?;
         assert_eq!(explore_mode, InteractionMode::Explore);
         assert_eq!(work.mode, InteractionMode::Work);
         drop(work);
 
         let Err(error) = prepare_planning_startup(&spec, Some("voelliger-unsinn"), None) else {
-            panic!("ein unbekannter Modus darf keinen Start ergeben");
+            return Err(TestError::Unexpected(
+                "ein unbekannter Modus darf keinen Start ergeben".into(),
+            ));
         };
         assert!(error.contains("voelliger-unsinn"), "{error}");
+        Ok(())
     }
 
     #[test]
-    fn startup_goal_is_readable_and_created_by_a_human_actor() {
+    fn startup_goal_is_readable_and_created_by_a_human_actor() -> TestResult {
         let config = PlanToolConfig::enabled_defaults();
-        let (_home, services) = plan_services_over_temp_home(&config);
+        let (_home, services) = plan_services_over_temp_home(&config)?;
 
         let summary = seed_startup_goal(&services, "  Die Planungsfläche steht  ", STARTUP_GOAL_ID)
-            .expect("das Startziel muss anlegbar sein");
+            .map_err(ctx("das Startziel muss anlegbar sein"))?;
         assert!(summary.contains(STARTUP_GOAL_ID), "{summary}");
 
-        let store = services.goal.as_ref().expect("Goal-Store vorhanden");
-        let goal = store.current().expect("Ziel ist über den Store lesbar");
+        let store = services
+            .goal
+            .as_ref()
+            .ok_or(TestError::Missing("Goal-Store vorhanden"))?;
+        let goal = store
+            .current()
+            .map_err(ctx("Ziel ist über den Store lesbar"))?;
         assert_eq!(goal.id.as_str(), STARTUP_GOAL_ID);
         assert_eq!(goal.statement, "Die Planungsfläche steht");
         assert_eq!(
@@ -3114,41 +3200,54 @@ mod tests {
             status: GoalStatus::Achieved,
             reason: Some("alle Kriterien belegt".to_owned()),
         };
-        harw_plan::goal::validate_goal_action(Some(&goal), &achieve, CLI_ACTOR)
-            .expect("ein menschlicher Akteur darf das Ziel für erreicht erklären");
+        harw_plan::goal::validate_goal_action(Some(&goal), &achieve, CLI_ACTOR).map_err(ctx(
+            "ein menschlicher Akteur darf das Ziel für erreicht erklären",
+        ))?;
         match harw_plan::goal::validate_goal_action(Some(&goal), &achieve, "model:test") {
             Err(harw_plan::PlanError::ActorNotAuthorized { .. }) => {}
-            other => panic!("ein Modell-Akteur muss abgewiesen werden, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "ein Modell-Akteur muss abgewiesen werden, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn startup_goal_without_the_plan_surface_names_the_config_key() {
+    fn startup_goal_without_the_plan_surface_names_the_config_key() -> TestResult {
         let config = PlanToolConfig::default();
-        let (_home, services) = plan_services_over_temp_home(&config);
+        let (_home, services) = plan_services_over_temp_home(&config)?;
 
-        let error = seed_startup_goal(&services, "irgendein Ziel", STARTUP_GOAL_ID)
-            .expect_err("ohne Goal-Store darf --goal nicht stillschweigend verpuffen");
+        let result = seed_startup_goal(&services, "irgendein Ziel", STARTUP_GOAL_ID);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "ohne Goal-Store darf --goal nicht stillschweigend verpuffen".into(),
+            ));
+        };
         assert!(error.contains("tools.plan"), "{error}");
+        Ok(())
     }
 
     #[test]
-    fn startup_goal_rejects_an_empty_statement() {
+    fn startup_goal_rejects_an_empty_statement() -> TestResult {
         let config = PlanToolConfig::enabled_defaults();
-        let (_home, services) = plan_services_over_temp_home(&config);
+        let (_home, services) = plan_services_over_temp_home(&config)?;
 
         assert!(seed_startup_goal(&services, "   ", STARTUP_GOAL_ID).is_err());
+        Ok(())
     }
 
     #[test]
-    fn plan_section_translates_into_one_shared_tool_config() {
+    fn plan_section_translates_into_one_shared_tool_config() -> TestResult {
         let section: PlanSection = toml::from_str(
             "enabled = true\npersist = true\nmax_nodes = 128\n\
              require_exploration_for = [\"coding\", \"docs\"]\n",
         )
-        .expect("gültige [tools.plan]-Sektion");
+        .map_err(ctx("gültige [tools.plan]-Sektion"))?;
 
-        let config = plan_tool_config_from_section(&section).expect("Sektion ist übersetzbar");
+        let config =
+            plan_tool_config_from_section(&section).map_err(ctx("Sektion ist übersetzbar"))?;
         assert!(config.is_enabled());
         assert!(config.persist);
         assert_eq!(config.max_nodes, 128);
@@ -3161,6 +3260,7 @@ mod tests {
         let (registry, plan_tools) = build_operation_registry(&config);
         assert_eq!(plan_tools, harw_ops::PLAN_TOOL_COUNT);
         assert!(registry.find_by_command("/analyze").is_some());
+        Ok(())
     }
 
     /// Die Knotenart-Liste in `harw-config` bleibt mit `PlanNodeKind::ALL`
@@ -3192,19 +3292,24 @@ mod tests {
     }
 
     #[test]
-    fn plan_section_with_an_unknown_node_kind_is_rejected() {
+    fn plan_section_with_an_unknown_node_kind_is_rejected() -> TestResult {
         let section = PlanSection {
             require_exploration_for: vec!["schreiben".to_owned()],
             ..PlanSection::default()
         };
 
-        let error = plan_tool_config_from_section(&section)
-            .expect_err("ein Tippfehler in require_exploration_for muss auffallen");
+        let result = plan_tool_config_from_section(&section);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "ein Tippfehler in require_exploration_for muss auffallen".into(),
+            ));
+        };
         assert!(error.contains("schreiben"), "{error}");
+        Ok(())
     }
 
     #[test]
-    fn analyze_flags_map_onto_the_operation_command_grammar() {
+    fn analyze_flags_map_onto_the_operation_command_grammar() -> TestResult {
         let args = AnalyzeArgs {
             crate_name: Some("harw-core".to_owned()),
             workspace: false,
@@ -3215,7 +3320,7 @@ mod tests {
         };
 
         assert_eq!(
-            analyze_tokens(&args).expect("Flags sind übersetzbar"),
+            analyze_tokens(&args).map_err(ctx("Flags sind übersetzbar"))?,
             vec![
                 "--dry-run".to_owned(),
                 "--top-down".to_owned(),
@@ -3224,10 +3329,11 @@ mod tests {
                 "harw-core".to_owned(),
             ]
         );
+        Ok(())
     }
 
     #[test]
-    fn analyze_tokens_are_accepted_by_the_operation_argument_parser() {
+    fn analyze_tokens_are_accepted_by_the_operation_argument_parser() -> TestResult {
         use harw_operations::FromRawArgs;
 
         let args = AnalyzeArgs {
@@ -3238,18 +3344,19 @@ mod tests {
             dry_run: true,
             max_parallel: Some(3),
         };
-        let tokens = analyze_tokens(&args).expect("Flags sind übersetzbar");
+        let tokens = analyze_tokens(&args).map_err(ctx("Flags sind übersetzbar"))?;
 
         let parsed = harw_ops::analyze::AnalyzeArgs::from_raw_args(&tokens)
-            .expect("die Operation muss ihre eigene Grammatik akzeptieren");
+            .map_err(ctx("die Operation muss ihre eigene Grammatik akzeptieren"))?;
         assert_eq!(parsed.crate_name.as_deref(), Some("harw-core"));
         assert_eq!(parsed.bottom_up, Some(false));
         assert_eq!(parsed.dry_run, Some(true));
         assert_eq!(parsed.max_parallel, Some(3));
+        Ok(())
     }
 
     #[test]
-    fn analyze_rejects_contradictory_direction_and_scope_flags() {
+    fn analyze_rejects_contradictory_direction_and_scope_flags() -> TestResult {
         let both_directions = AnalyzeArgs {
             crate_name: None,
             workspace: false,
@@ -3268,8 +3375,12 @@ mod tests {
             dry_run: false,
             max_parallel: None,
         };
-        let error = analyze_tokens(&workspace_and_crate)
-            .expect_err("--workspace und ein Crate-Name schließen einander aus");
+        let result = analyze_tokens(&workspace_and_crate);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "--workspace und ein Crate-Name schließen einander aus".into(),
+            ));
+        };
         assert!(error.contains("harw-core"), "{error}");
 
         let zero_parallel = AnalyzeArgs {
@@ -3281,21 +3392,22 @@ mod tests {
             max_parallel: Some(0),
         };
         assert!(analyze_tokens(&zero_parallel).is_err());
+        Ok(())
     }
 
     /// C3: bei aktiver Planungsfläche montiert [`analyze_assembly`] eine
     /// Laufzeit, in der `/analyze` über
     /// `assembly.operations().find_by_command` auffindbar ist.
     #[test]
-    fn test_analyze_assembly_registers_analyze_operation_when_plan_enabled() {
-        let home = tempfile::tempdir().expect("create temporary home");
-        harw_home::ensure_home(home.path()).expect("home scaffolds");
+    fn test_analyze_assembly_registers_analyze_operation_when_plan_enabled() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temporary home"))?;
+        harw_home::ensure_home(home.path()).map_err(ctx("home scaffolds"))?;
         std::fs::write(
             home.path().join("config.toml"),
             "[tools.plan]\nenabled = true\n",
         )
-        .expect("write plan-enabled config");
-        let cwd = tempfile::tempdir().expect("create temporary cwd");
+        .map_err(ctx("write plan-enabled config"))?;
+        let cwd = tempfile::tempdir().map_err(ctx("create temporary cwd"))?;
 
         let spec = runtime_entry::runtime_spec(
             EntryKind::Analyze,
@@ -3303,32 +3415,33 @@ mod tests {
             cwd.path(),
             runtime_entry::local_principal(IngressSurface::Cli),
         );
-        let startup = prepare_planning_startup(&spec, None, None)
-            .expect("planning startup resolves over an enabled plan surface");
+        let startup = prepare_planning_startup(&spec, None, None).map_err(ctx(
+            "planning startup resolves over an enabled plan surface",
+        ))?;
         assert!(
             startup.plan_config.is_enabled(),
             "config.toml muss [tools.plan] aktivieren"
         );
-        let plan = startup
-            .services
-            .to_runtime()
-            .expect("bei aktiver Fläche liegen alle drei Plan-Stores vor");
+        let plan = startup.services.to_runtime().ok_or(TestError::Missing(
+            "bei aktiver Fläche liegen alle drei Plan-Stores vor",
+        ))?;
 
         let (assembly, _event_rx) =
             analyze_assembly(spec, plan, ModelSource::Echo("test".to_owned()), None)
-                .expect("analyze assembly builds over an enabled plan surface");
+                .map_err(ctx("analyze assembly builds over an enabled plan surface"))?;
 
         assert!(
             assembly.operations().find_by_command("/analyze").is_some(),
             "/analyze muss bei aktiver Planungsfläche registriert sein"
         );
+        Ok(())
     }
 
     /// C3: eine abgeschaltete Planungsfläche lässt `harw analyze` mit der
     /// zentralen Fehlermeldung ([`analyze_plan_surface_disabled`]) scheitern.
     #[test]
-    fn test_cmd_analyze_disabled_plan_surface_names_config_key() {
-        let home = tempfile::tempdir().expect("create temporary home");
+    fn test_cmd_analyze_disabled_plan_surface_names_config_key() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temporary home"))?;
         // `[tools.plan].enabled` defaults to `true` (siehe
         // `harw-config/src/plan_toml.rs::PlanSection::default`), also muss
         // die Fläche hier explizit abgeschaltet werden — sonst durchläuft
@@ -3362,7 +3475,7 @@ mod tests {
         // vorhandene Datei mehr), dann `[tools.plan] enabled = false` in die
         // Profil-`config.toml` schreiben, die Datei, die `cmd_analyze`
         // tatsächlich zuletzt liest.
-        harw_home::ensure_home(home.path()).expect("home scaffolds");
+        harw_home::ensure_home(home.path()).map_err(ctx("home scaffolds"))?;
         std::fs::write(
             home.path()
                 .join("profiles")
@@ -3370,7 +3483,7 @@ mod tests {
                 .join("config.toml"),
             "[tools.plan]\nenabled = false\n",
         )
-        .expect("write plan-disabled config");
+        .map_err(ctx("write plan-disabled config"))?;
         let args = AnalyzeArgs {
             crate_name: None,
             workspace: false,
@@ -3380,44 +3493,51 @@ mod tests {
             max_parallel: None,
         };
 
-        let error = cmd_analyze(Some(home.path().to_path_buf()), None, None, &args)
-            .expect_err("harw analyze muss ohne `[tools.plan] enabled = true` scheitern");
+        let result = cmd_analyze(Some(home.path().to_path_buf()), None, None, &args);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "harw analyze muss ohne `[tools.plan] enabled = true` scheitern".into(),
+            ));
+        };
         assert_eq!(error, analyze_plan_surface_disabled());
+        Ok(())
     }
 
     #[test]
-    fn cli_exposes_mode_and_goal_as_root_flags() {
+    fn cli_exposes_mode_and_goal_as_root_flags() -> TestResult {
         let cli = Cli::try_parse_from(["harw", "--mode", "explore", "--goal", "Bridge fertig"])
-            .expect("root flags parse");
+            .map_err(ctx("root flags parse"))?;
 
         assert_eq!(cli.mode.as_deref(), Some("explore"));
         assert_eq!(cli.goal.as_deref(), Some("Bridge fertig"));
         assert!(cli.command.is_none());
+        Ok(())
     }
 
     #[test]
-    fn external_serve_config_uses_explicit_home_for_sealed_secret_store() {
+    fn external_serve_config_uses_explicit_home_for_sealed_secret_store() -> TestResult {
         let config_dir = PathBuf::from("/tmp/harw-external-config");
         let home = PathBuf::from("/tmp/harw-sealed-secret-store");
 
         let (layers, storage_root, secret_store_home) =
             resolve_serve_paths(Some(home.clone()), Some(config_dir.clone()))
-                .expect("external config with explicit home resolves");
+                .map_err(ctx("external config with explicit home resolves"))?;
 
         assert_eq!(layers, vec![config_dir.clone()]);
         assert_eq!(storage_root, config_dir);
         assert_eq!(secret_store_home, Some(home));
+        Ok(())
     }
 
     #[test]
-    fn normal_serve_config_uses_active_profile_as_storage_root() {
-        let home = unique_temp_dir("serve-active-profile-root");
-        harw_home::ensure_home(&home).expect("home scaffolds");
+    fn normal_serve_config_uses_active_profile_as_storage_root() -> TestResult {
+        let home = unique_temp_dir("serve-active-profile-root")?;
+        harw_home::ensure_home(&home).map_err(ctx("home scaffolds"))?;
         std::fs::write(harw_home::paths::active_profile_path(&home), "mcp-worker\n")
-            .expect("active profile writes");
+            .map_err(ctx("active profile writes"))?;
 
-        let (_, storage_root, secret_store_home) =
-            resolve_serve_paths(Some(home.clone()), None).expect("normal serve paths resolve");
+        let (_, storage_root, secret_store_home) = resolve_serve_paths(Some(home.clone()), None)
+            .map_err(ctx("normal serve paths resolve"))?;
 
         assert_eq!(storage_root, home.join("profiles").join("mcp-worker"));
         assert_eq!(
@@ -3426,43 +3546,55 @@ mod tests {
         );
         assert_eq!(secret_store_home, Some(home.clone()));
         std::fs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[test]
-    fn normal_serve_config_rejects_an_invalid_active_profile() {
-        let home = unique_temp_dir("serve-invalid-active-profile");
+    fn normal_serve_config_rejects_an_invalid_active_profile() -> TestResult {
+        let home = unique_temp_dir("serve-invalid-active-profile")?;
         std::fs::write(harw_home::paths::active_profile_path(&home), "../outside\n")
-            .expect("invalid active profile writes");
+            .map_err(ctx("invalid active profile writes"))?;
 
-        let error = resolve_serve_paths(Some(home.clone()), None)
-            .expect_err("invalid active profile must fail path resolution");
+        let result = resolve_serve_paths(Some(home.clone()), None);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "invalid active profile must fail path resolution".into(),
+            ));
+        };
 
         assert!(error.contains("invalid profile name"), "{error}");
         assert!(error.contains("../outside"), "{error}");
         std::fs::remove_dir_all(&home).ok();
+        Ok(())
     }
 
     #[test]
-    fn external_serve_config_rejects_sealed_refs_without_explicit_home() {
+    fn external_serve_config_rejects_sealed_refs_without_explicit_home() -> TestResult {
         let config_dir = PathBuf::from("/tmp/harw-external-config");
-        let (_, _, secret_store_home) = resolve_serve_paths(None, Some(config_dir))
-            .expect("external config without home still resolves its config paths");
+        let (_, _, secret_store_home) = resolve_serve_paths(None, Some(config_dir)).map_err(
+            ctx("external config without home still resolves its config paths"),
+        )?;
         let mut config = ResolvedConfig::default();
         config.providers.insert(
             "sealed".to_owned(),
             toml::from_str(
                 "name = \"sealed\"\napi = \"openai-compatible\"\nbase_url = \"https://example.test\"\nauth = \"secrets:provider-token\"\n",
             )
-            .expect("valid sealed provider config"),
+            .map_err(ctx("valid sealed provider config"))?,
         );
         // `serve` must actually select this provider for the gate to fire —
         // the provider-scoped check only looks at `default_provider`.
         config.harness.default_provider = Some("sealed".to_owned());
 
-        let error = require_home_for_sealed_refs(&config, secret_store_home.as_deref())
-            .expect_err("external config must not guess a sealed-secret root");
+        let result = require_home_for_sealed_refs(&config, secret_store_home.as_deref());
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "external config must not guess a sealed-secret root".into(),
+            ));
+        };
         assert!(error.contains("requires HARW_HOME"), "{error}");
         assert!(error.contains("--config-dir"), "{error}");
+        Ok(())
     }
 
     /// Ein aktivierter `secrets:`-Provider, den `serve` gar nicht auswählt
@@ -3470,64 +3602,79 @@ mod tests {
     /// fehlkonfigurierter Provider darf unbeteiligte Einträge nicht
     /// mitreißen.
     #[test]
-    fn external_serve_config_ignores_unused_sealed_provider_without_home() {
+    fn external_serve_config_ignores_unused_sealed_provider_without_home() -> TestResult {
         let mut config = ResolvedConfig::default();
         config.providers.insert(
             "sealed".to_owned(),
             toml::from_str(
                 "name = \"sealed\"\napi = \"openai-compatible\"\nbase_url = \"https://example.test\"\nauth = \"secrets:provider-token\"\n",
             )
-            .expect("valid sealed provider config"),
+            .map_err(ctx("valid sealed provider config"))?,
         );
         config.harness.default_provider = None;
 
-        require_home_for_sealed_refs(&config, None)
-            .expect("an enabled but unselected sealed provider must not require HARW_HOME");
+        require_home_for_sealed_refs(&config, None).map_err(ctx(
+            "an enabled but unselected sealed provider must not require HARW_HOME",
+        ))?;
+        Ok(())
     }
 
     #[test]
-    fn serve_fails_closed_when_listener_is_disabled() {
-        let dir = unique_temp_dir("serve-disabled");
-        std::fs::write(dir.join("config.toml"), "").expect("empty config writes");
-        let error = serve_mcp(vec![dir.clone()], dir.clone(), None)
-            .expect_err("serve must refuse a disabled listener");
+    fn serve_fails_closed_when_listener_is_disabled() -> TestResult {
+        let dir = unique_temp_dir("serve-disabled")?;
+        std::fs::write(dir.join("config.toml"), "").map_err(ctx("empty config writes"))?;
+        let result = serve_mcp(vec![dir.clone()], dir.clone(), None);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "serve must refuse a disabled listener".into(),
+            ));
+        };
         assert!(error.contains("mcp_listener.enabled is false"), "{error}");
         std::fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 
     #[test]
-    fn external_config_dir_rejects_sealed_provider_without_harw_home() {
+    fn external_config_dir_rejects_sealed_provider_without_harw_home() -> TestResult {
         let mut config = ResolvedConfig::default();
         config.providers.insert(
             "sealed".to_owned(),
             toml::from_str(
                 "name = \"sealed\"\napi = \"openai-compatible\"\nbase_url = \"https://example.test\"\nauth = \"secrets:provider-token\"\n",
             )
-            .expect("valid sealed provider config"),
+            .map_err(ctx("valid sealed provider config"))?,
         );
         // `serve` must actually select this provider for the gate to fire —
         // the provider-scoped check only looks at `default_provider`.
         config.harness.default_provider = Some("sealed".to_owned());
 
-        let error = require_home_for_sealed_refs(&config, None)
-            .expect_err("external config must not guess a sealed-secret root");
+        let result = require_home_for_sealed_refs(&config, None);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "external config must not guess a sealed-secret root".into(),
+            ));
+        };
         assert!(error.contains("requires HARW_HOME"), "{error}");
         assert!(error.contains("--config-dir"), "{error}");
 
         require_home_for_sealed_refs(&config, Some(Path::new("/tmp/harw-sealed-secret-store")))
-            .expect("explicit home enables the sealed provider secret store");
+            .map_err(ctx(
+                "explicit home enables the sealed provider secret store",
+            ))?;
+        Ok(())
     }
 
     #[test]
-    fn ordinary_provider_refs_remain_valid_without_harw_home() {
+    fn ordinary_provider_refs_remain_valid_without_harw_home() -> TestResult {
         let config = ResolvedConfig::default();
 
         require_home_for_sealed_refs(&config, None)
-            .expect("ordinary provider references do not require HARW_HOME");
+            .map_err(ctx("ordinary provider references do not require HARW_HOME"))?;
+        Ok(())
     }
 
     #[test]
-    fn external_config_dir_rejects_sealed_mcp_principal_without_harw_home() {
+    fn external_config_dir_rejects_sealed_mcp_principal_without_harw_home() -> TestResult {
         let mut config = ResolvedConfig::default();
         config
             .harness
@@ -3535,56 +3682,68 @@ mod tests {
             .principals
             .push(harw_config::McpPrincipalToml {
                 id: "sealed-mcp".to_owned(),
-                credential_ref: "secrets:mcp-token".parse().expect("valid secret ref"),
+                credential_ref: "secrets:mcp-token"
+                    .parse()
+                    .map_err(ctx("valid secret ref"))?,
                 tenant: "mia".to_owned(),
                 workspace: "harwness".to_owned(),
                 job_capabilities: Vec::new(),
             });
 
-        let error = require_home_for_sealed_refs(&config, None)
-            .expect_err("external config must not guess a sealed-secret root");
+        let result = require_home_for_sealed_refs(&config, None);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "external config must not guess a sealed-secret root".into(),
+            ));
+        };
         assert!(error.contains("requires HARW_HOME"), "{error}");
         assert!(error.contains("MCP principal"), "{error}");
 
         require_home_for_sealed_refs(&config, Some(Path::new("/tmp/harw-sealed-secret-store")))
-            .expect("explicit home enables the sealed MCP principal secret store");
+            .map_err(ctx(
+                "explicit home enables the sealed MCP principal secret store",
+            ))?;
+        Ok(())
     }
 
     /// Baut eine Config mit zwei Providern: `"sealed"` referenziert
     /// `secrets:`, wird aber nicht ausgewählt; `"plain"` referenziert `env:`
     /// und ist `default_provider`. Für den provider-verengten Serve-Pfad darf
     /// so ein ungenutzter `sealed`-Provider den Start nicht blockieren.
-    fn serve_config_with_unused_sealed_provider() -> ResolvedConfig {
+    fn serve_config_with_unused_sealed_provider() -> TestResult<ResolvedConfig> {
         let mut config = ResolvedConfig::default();
         config.providers.insert(
             "sealed".to_owned(),
             toml::from_str(
                 "name = \"sealed\"\napi = \"openai-compatible\"\nbase_url = \"https://example.test\"\nauth = \"secrets:provider-token\"\n",
             )
-            .expect("valid sealed provider config"),
+            .map_err(ctx("valid sealed provider config"))?,
         );
         config.providers.insert(
             "plain".to_owned(),
             toml::from_str(
                 "name = \"plain\"\napi = \"openai-compatible\"\nbase_url = \"https://example.test\"\nauth = \"env:PLAIN_TOKEN\"\n",
             )
-            .expect("valid plain provider config"),
+            .map_err(ctx("valid plain provider config"))?,
         );
         config.harness.default_provider = Some("plain".to_owned());
-        config
+        Ok(config)
     }
 
     #[test]
-    fn active_serve_provider_uses_sealed_secret_ignores_an_unselected_sealed_provider() {
-        let config = serve_config_with_unused_sealed_provider();
+    fn active_serve_provider_uses_sealed_secret_ignores_an_unselected_sealed_provider() -> TestResult
+    {
+        let config = serve_config_with_unused_sealed_provider()?;
         assert!(!active_serve_provider_uses_sealed_secret(&config));
+        Ok(())
     }
 
     #[test]
-    fn active_serve_provider_uses_sealed_secret_true_for_the_selected_provider() {
-        let mut config = serve_config_with_unused_sealed_provider();
+    fn active_serve_provider_uses_sealed_secret_true_for_the_selected_provider() -> TestResult {
+        let mut config = serve_config_with_unused_sealed_provider()?;
         config.harness.default_provider = Some("sealed".to_owned());
         assert!(active_serve_provider_uses_sealed_secret(&config));
+        Ok(())
     }
 
     /// Kernverhalten dieses Reports: ein aktivierter, aber von `serve` nicht
@@ -3592,26 +3751,30 @@ mod tests {
     /// blockieren — `open_serve_secret_resolver` muss `Ok(None)` liefern,
     /// nicht fehlschlagen.
     #[test]
-    fn open_serve_secret_resolver_ignores_unused_sealed_provider_without_a_kek() {
-        let config = serve_config_with_unused_sealed_provider();
-        let home = tempfile::tempdir().expect("temporary home");
+    fn open_serve_secret_resolver_ignores_unused_sealed_provider_without_a_kek() -> TestResult {
+        let config = serve_config_with_unused_sealed_provider()?;
+        let home = tempfile::tempdir().map_err(ctx("temporary home"))?;
 
         let resolver = open_serve_secret_resolver(&config, Some(home.path()))
-            .expect("an unused sealed provider must not require a KEK");
+            .map_err(ctx("an unused sealed provider must not require a KEK"))?;
         assert!(resolver.is_none());
+        Ok(())
     }
 
     #[test]
-    fn open_serve_secret_resolver_fails_closed_for_the_selected_sealed_provider() {
-        let mut config = serve_config_with_unused_sealed_provider();
+    fn open_serve_secret_resolver_fails_closed_for_the_selected_sealed_provider() -> TestResult {
+        let mut config = serve_config_with_unused_sealed_provider()?;
         config.harness.default_provider = Some("sealed".to_owned());
-        let home = tempfile::tempdir().expect("temporary home");
+        let home = tempfile::tempdir().map_err(ctx("temporary home"))?;
 
         let result = open_serve_secret_resolver(&config, Some(home.path()));
         let Err(error) = result else {
-            panic!("the actually selected sealed provider must still require a KEK");
+            return Err(TestError::Unexpected(
+                "the actually selected sealed provider must still require a KEK".into(),
+            ));
         };
         assert!(error.contains("requires a configured KEK"), "{error}");
+        Ok(())
     }
 
     /// Auch wenn `default_provider` selbst kein `secrets:` referenziert,
@@ -3619,43 +3782,53 @@ mod tests {
     /// Principal ist ein Authentifizierungsziel, das `serve` beim Start
     /// tatsächlich verwendet (`build_authenticator`).
     #[test]
-    fn open_serve_secret_resolver_fails_closed_for_a_sealed_mcp_principal_with_plain_provider() {
-        let mut config = serve_config_with_unused_sealed_provider();
+    fn open_serve_secret_resolver_fails_closed_for_a_sealed_mcp_principal_with_plain_provider()
+    -> TestResult {
+        let mut config = serve_config_with_unused_sealed_provider()?;
         config
             .harness
             .mcp_listener
             .principals
             .push(harw_config::McpPrincipalToml {
                 id: "sealed-mcp".to_owned(),
-                credential_ref: "secrets:mcp-token".parse().expect("valid secret ref"),
+                credential_ref: "secrets:mcp-token"
+                    .parse()
+                    .map_err(ctx("valid secret ref"))?,
                 tenant: "mia".to_owned(),
                 workspace: "harwness".to_owned(),
                 job_capabilities: Vec::new(),
             });
-        let home = tempfile::tempdir().expect("temporary home");
+        let home = tempfile::tempdir().map_err(ctx("temporary home"))?;
 
         let result = open_serve_secret_resolver(&config, Some(home.path()));
         let Err(error) = result else {
-            panic!("a configured sealed MCP principal must still require a KEK");
+            return Err(TestError::Unexpected(
+                "a configured sealed MCP principal must still require a KEK".into(),
+            ));
         };
         assert!(error.contains("requires a configured KEK"), "{error}");
+        Ok(())
     }
 
     #[test]
-    fn open_serve_secret_resolver_returns_none_without_home_even_for_a_selected_sealed_provider() {
-        let mut config = serve_config_with_unused_sealed_provider();
+    fn open_serve_secret_resolver_returns_none_without_home_even_for_a_selected_sealed_provider()
+    -> TestResult {
+        let mut config = serve_config_with_unused_sealed_provider()?;
         config.harness.default_provider = Some("sealed".to_owned());
 
-        let resolver = open_serve_secret_resolver(&config, None)
-            .expect("without --home there is nowhere to open the sealed store");
+        let resolver = open_serve_secret_resolver(&config, None).map_err(ctx(
+            "without --home there is nowhere to open the sealed store",
+        ))?;
         assert!(resolver.is_none());
+        Ok(())
     }
 
     #[test]
-    fn build_authenticator_resolves_file_credentials_for_every_principal() {
-        let dir = unique_temp_dir("build-authenticator-ok");
+    fn build_authenticator_resolves_file_credentials_for_every_principal() -> TestResult {
+        let dir = unique_temp_dir("build-authenticator-ok")?;
         let credential_path = dir.join("token");
-        std::fs::write(&credential_path, "super-secret-token").expect("credential file writes");
+        std::fs::write(&credential_path, "super-secret-token")
+            .map_err(ctx("credential file writes"))?;
 
         let mut config = ResolvedConfig::default();
         config
@@ -3666,22 +3839,24 @@ mod tests {
                 id: "mia-local".to_owned(),
                 credential_ref: format!("file:{}", credential_path.display())
                     .parse()
-                    .expect("valid secret ref"),
+                    .map_err(ctx("valid secret ref"))?,
                 tenant: "mia".to_owned(),
                 workspace: "harwness".to_owned(),
                 job_capabilities: Vec::new(),
             });
 
-        let authenticator = build_authenticator(&config, None).expect("credential resolves");
+        let authenticator =
+            build_authenticator(&config, None).map_err(ctx("credential resolves"))?;
         let principal = authenticator
             .authenticate(Some("Bearer super-secret-token"))
-            .expect("token authenticates");
+            .map_err(ctx("token authenticates"))?;
         assert_eq!(principal.principal_key, "mia-local");
         std::fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 
     #[test]
-    fn build_principal_registry_maps_capabilities_and_tenant_scope() {
+    fn build_principal_registry_maps_capabilities_and_tenant_scope() -> TestResult {
         let mut config = ResolvedConfig::default();
         config
             .harness
@@ -3689,7 +3864,9 @@ mod tests {
             .principals
             .push(harw_config::McpPrincipalToml {
                 id: "mia-local".to_owned(),
-                credential_ref: "env:HARW_TEST_UNUSED".parse().expect("valid secret ref"),
+                credential_ref: "env:HARW_TEST_UNUSED"
+                    .parse()
+                    .map_err(ctx("valid secret ref"))?,
                 tenant: "mia".to_owned(),
                 workspace: "harwness".to_owned(),
                 job_capabilities: vec![
@@ -3698,11 +3875,11 @@ mod tests {
                 ],
             });
 
-        let registry =
-            build_principal_registry(&config).expect("distinct principal ids build a registry");
-        let principal = registry
-            .get("mia-local")
-            .expect("configured principal is present in the registry");
+        let registry = build_principal_registry(&config)
+            .map_err(ctx("distinct principal ids build a registry"))?;
+        let principal = registry.get("mia-local").ok_or(TestError::Missing(
+            "configured principal is present in the registry",
+        ))?;
         assert!(
             principal
                 .capabilities()
@@ -3718,10 +3895,11 @@ mod tests {
                 .capabilities()
                 .contains(&McpJobCapability::ReadWorkspace)
         );
+        Ok(())
     }
 
     #[test]
-    fn build_principal_registry_grants_submit_own_only_when_configured() {
+    fn build_principal_registry_grants_submit_own_only_when_configured() -> TestResult {
         let mut config = ResolvedConfig::default();
         for (id, job_capabilities) in [
             ("submitter", vec![McpJobCapabilityToml::SubmitOwn]),
@@ -3733,33 +3911,36 @@ mod tests {
                 .principals
                 .push(harw_config::McpPrincipalToml {
                     id: id.to_owned(),
-                    credential_ref: "env:HARW_TEST_UNUSED".parse().expect("valid secret ref"),
+                    credential_ref: "env:HARW_TEST_UNUSED"
+                        .parse()
+                        .map_err(ctx("valid secret ref"))?,
                     tenant: "mia".to_owned(),
                     workspace: "harwness".to_owned(),
                     job_capabilities,
                 });
         }
 
-        let registry =
-            build_principal_registry(&config).expect("distinct principal ids build a registry");
+        let registry = build_principal_registry(&config)
+            .map_err(ctx("distinct principal ids build a registry"))?;
         assert!(
             registry
                 .get("submitter")
-                .expect("configured submitter is present")
+                .ok_or(TestError::Missing("configured submitter is present"))?
                 .capabilities()
                 .contains(&McpJobCapability::SubmitOwn)
         );
         assert!(
             !registry
                 .get("reader")
-                .expect("configured reader is present")
+                .ok_or(TestError::Missing("configured reader is present"))?
                 .capabilities()
                 .contains(&McpJobCapability::SubmitOwn)
         );
+        Ok(())
     }
 
     #[test]
-    fn test_build_principal_registry_rejects_duplicate_id() {
+    fn test_build_principal_registry_rejects_duplicate_id() -> TestResult {
         let mut config = ResolvedConfig::default();
         for workspace in ["first", "second"] {
             config
@@ -3768,7 +3949,9 @@ mod tests {
                 .principals
                 .push(harw_config::McpPrincipalToml {
                     id: "twice".to_owned(),
-                    credential_ref: "env:HARW_TEST_UNUSED".parse().expect("valid secret ref"),
+                    credential_ref: "env:HARW_TEST_UNUSED"
+                        .parse()
+                        .map_err(ctx("valid secret ref"))?,
                     tenant: "mia".to_owned(),
                     workspace: workspace.to_owned(),
                     job_capabilities: vec![McpJobCapabilityToml::SubmitOwn],
@@ -3776,18 +3959,27 @@ mod tests {
         }
 
         match build_principal_registry(&config) {
-            Ok(_) => panic!("a duplicated principal id must abort registry construction"),
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "a duplicated principal id must abort registry construction".into(),
+                ));
+            }
             Err(error) => {
                 assert!(error.contains("'twice'"), "{error}");
                 assert!(error.contains("more than once"), "{error}");
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_dispatch_web_without_home_names_home_flag() {
-        let error = web_home(Err("could not determine the home directory".to_owned()))
-            .expect_err("an unresolvable home must stop harw web");
+    fn test_dispatch_web_without_home_names_home_flag() -> TestResult {
+        let result = web_home(Err("could not determine the home directory".to_owned()));
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "an unresolvable home must stop harw web".into(),
+            ));
+        };
         assert!(error.contains("--home"), "{error}");
         assert!(error.contains("HARW_HOME"), "{error}");
         assert!(
@@ -3797,55 +3989,67 @@ mod tests {
 
         let home = PathBuf::from("/tmp/harw-web-home");
         assert_eq!(web_home(Ok(home.clone())), Ok(home));
+        Ok(())
     }
 
     /// C6: ein externes `--config-dir` ist kein HARW-Home — `doctor` darf
     /// keinen Montageversuch dagegen unternehmen, sondern überspringt die
     /// Laufzeit-Rechte ausdrücklich.
     #[test]
-    fn test_doctor_home_resolution_skips_runtime_rights_with_config_dir() {
+    fn test_doctor_home_resolution_skips_runtime_rights_with_config_dir() -> TestResult {
         let config_dir = PathBuf::from("/tmp/harw-doctor-config-dir");
-        let error = doctor_home_resolution(Some(config_dir.as_path()), None)
-            .expect_err("--config-dir must skip the runtime rights assembly");
+        let result = doctor_home_resolution(Some(config_dir.as_path()), None);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "--config-dir must skip the runtime rights assembly".into(),
+            ));
+        };
         assert_eq!(error, "skipped: --config-dir");
 
         // Auch mit einem zusätzlich gesetzten `--home` bleibt es beim Skip:
         // `--config-dir` gewinnt, das Home wird nicht stillschweigend benutzt.
-        let error = doctor_home_resolution(
+        let result = doctor_home_resolution(
             Some(config_dir.as_path()),
             Some(PathBuf::from("/tmp/harw-doctor-home")),
-        )
-        .expect_err("--config-dir must win over a coincidentally set --home");
+        );
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "--config-dir must win over a coincidentally set --home".into(),
+            ));
+        };
         assert_eq!(error, "skipped: --config-dir");
+        Ok(())
     }
 
     /// C6: ohne `--config-dir` löst `doctor` den Root-Space normal auf.
     #[test]
-    fn test_doctor_home_resolution_resolves_explicit_home_without_config_dir() {
+    fn test_doctor_home_resolution_resolves_explicit_home_without_config_dir() -> TestResult {
         let home = PathBuf::from("/tmp/harw-doctor-explicit-home");
         let resolved = doctor_home_resolution(None, Some(home.clone()))
-            .expect("an explicit --home resolves without --config-dir");
+            .map_err(ctx("an explicit --home resolves without --config-dir"))?;
         assert_eq!(resolved, home);
+        Ok(())
     }
 
     #[test]
-    fn test_run_startup_migrations_project_skips_home_resolution() {
-        let parent = tempfile::tempdir().expect("create temporary parent");
+    fn test_run_startup_migrations_project_skips_home_resolution() -> TestResult {
+        let parent = tempfile::tempdir().map_err(ctx("create temporary parent"))?;
         let missing_home = parent.path().join("absent-harw-home");
         let command = Cli::try_parse_from(["harw", "project", "status"])
-            .expect("project status parses")
+            .map_err(ctx("project status parses"))?
             .command;
 
         run_startup_migrations(&command, Some(missing_home.clone()))
-            .expect("project commands do not migrate configuration");
+            .map_err(ctx("project commands do not migrate configuration"))?;
         assert!(
             !missing_home.exists(),
             "project commands must not scaffold a home during startup migrations"
         );
+        Ok(())
     }
 
     #[test]
-    fn build_authenticator_fails_closed_on_unresolvable_credential() {
+    fn build_authenticator_fails_closed_on_unresolvable_credential() -> TestResult {
         let mut config = ResolvedConfig::default();
         config
             .harness
@@ -3855,16 +4059,21 @@ mod tests {
                 id: "mia-local".to_owned(),
                 credential_ref: "env:HARW_TEST_MCP_TOKEN_UNSET_FOR_SURE"
                     .parse()
-                    .expect("valid secret ref"),
+                    .map_err(ctx("valid secret ref"))?,
                 tenant: "mia".to_owned(),
                 workspace: "harwness".to_owned(),
                 job_capabilities: Vec::new(),
             });
 
         match build_authenticator(&config, None) {
-            Ok(_) => panic!("missing environment credential must fail closed"),
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "missing environment credential must fail closed".into(),
+                ));
+            }
             Err(error) => assert!(error.contains("mia-local"), "{error}"),
         }
+        Ok(())
     }
 
     /// Fake listener: serves until the shared watch flag turns `true`, like
@@ -3880,12 +4089,12 @@ mod tests {
         }
         stopped
             .send(())
-            .expect("test observer outlives the fake listener");
+            .map_err(|()| std::io::Error::other("test observer outlives the fake listener"))?;
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_serve_until_shutdown_stops_listener_and_worker() {
+    async fn test_serve_until_shutdown_stops_listener_and_worker() -> TestResult {
         let (shutdown_tx, worker_rx) = tokio::sync::watch::channel(false);
         let (trigger_tx, trigger_rx) = tokio::sync::oneshot::channel::<()>();
         let (listener_stopped_tx, mut listener_stopped_rx) = tokio::sync::oneshot::channel();
@@ -3899,13 +4108,13 @@ mod tests {
             }
             worker_done_tx
                 .send(())
-                .expect("serve_until awaits the worker");
+                .map_err(|()| TestError::Unexpected("serve_until awaits the worker".into()))
         });
 
         let serve = serve_until(
             |rx| fake_listener(rx, listener_stopped_tx),
             async {
-                trigger_rx.await.expect("trigger sender kept alive");
+                let _ = trigger_rx.await;
             },
             &shutdown_tx,
             worker_done_rx,
@@ -3921,20 +4130,23 @@ mod tests {
         );
         assert!(listener_stopped_rx.try_recv().is_err());
 
-        trigger_tx.send(()).expect("serve_until holds the trigger");
+        trigger_tx
+            .send(())
+            .map_err(|()| TestError::Unexpected("serve_until holds the trigger".into()))?;
         let outcome = tokio::time::timeout(Duration::from_secs(5), serve)
             .await
-            .expect("shutdown must end serve_until");
+            .map_err(ctx("shutdown must end serve_until"))?;
 
         assert_eq!(outcome.listener, Ok(()));
         assert_eq!(outcome.worker, WorkerStop::Finished);
         assert_eq!(listener_stopped_rx.try_recv(), Ok(()));
         assert!(*shutdown_tx.borrow());
-        worker.await.expect("worker task joins");
+        worker.await.map_err(ctx("worker task joins"))??;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_serve_until_caps_wait_for_stuck_worker() {
+    async fn test_serve_until_caps_wait_for_stuck_worker() -> TestResult {
         let (shutdown_tx, _worker_rx) = tokio::sync::watch::channel(false);
         let (listener_stopped_tx, _listener_stopped_rx) = tokio::sync::oneshot::channel();
         // The sender is kept alive and never used: a worker that ignores shutdown.
@@ -3951,14 +4163,15 @@ mod tests {
             ),
         )
         .await
-        .expect("grace period must bound serve_until");
+        .map_err(ctx("grace period must bound serve_until"))?;
 
         assert_eq!(outcome.listener, Ok(()));
         assert_eq!(outcome.worker, WorkerStop::TimedOut);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_serve_until_worker_panic_while_serving_is_error() {
+    async fn test_serve_until_worker_panic_while_serving_is_error() -> TestResult {
         let (shutdown_tx, _worker_rx) = tokio::sync::watch::channel(false);
         let (listener_stopped_tx, mut listener_stopped_rx) = tokio::sync::oneshot::channel();
         let (worker_done_tx, worker_done_rx) = tokio::sync::oneshot::channel::<()>();
@@ -3975,16 +4188,19 @@ mod tests {
             ),
         )
         .await
-        .expect("a vanished worker must end serve_until");
+        .map_err(ctx("a vanished worker must end serve_until"))?;
 
         assert_eq!(outcome.worker, WorkerStop::Vanished);
-        let error = outcome.listener.expect_err("dead worker is reported");
+        let Err(error) = outcome.listener else {
+            return Err(TestError::Unexpected("dead worker is reported".into()));
+        };
         assert!(error.contains("job worker stopped unexpectedly"), "{error}");
         assert_eq!(listener_stopped_rx.try_recv(), Ok(()));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_serve_until_listener_error_signals_worker_shutdown() {
+    async fn test_serve_until_listener_error_signals_worker_shutdown() -> TestResult {
         let (shutdown_tx, worker_rx) = tokio::sync::watch::channel(false);
         let (worker_done_tx, worker_done_rx) = tokio::sync::oneshot::channel();
         let worker = tokio::spawn(async move {
@@ -3996,7 +4212,7 @@ mod tests {
             }
             worker_done_tx
                 .send(())
-                .expect("serve_until awaits the worker");
+                .map_err(|()| TestError::Unexpected("serve_until awaits the worker".into()))
         });
 
         let outcome = serve_until(
@@ -4010,41 +4226,53 @@ mod tests {
 
         assert_eq!(outcome.listener, Err("accept failed".to_owned()));
         assert_eq!(outcome.worker, WorkerStop::Finished);
-        worker.await.expect("worker task joins");
+        worker.await.map_err(ctx("worker task joins"))??;
+        Ok(())
     }
 
     #[test]
-    fn test_spawn_job_worker_thread_reports_completion() {
+    fn test_spawn_job_worker_thread_reports_completion() -> TestResult {
         let runtime = Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("build worker runtime for test");
+            .map_err(ctx("build worker runtime for test"))?;
         let (ran_tx, ran_rx) = std::sync::mpsc::channel();
+        // `make_worker`'s `Fut: Future<Output = ()>` bound fixes the return
+        // type to `()`: a failed send here can't propagate through `?` and
+        // instead is logged, mirroring the same race's handling on
+        // `done_tx.send` a few lines above in production code.
         let worker = spawn_job_worker_thread(runtime, move || async move {
-            ran_tx
+            if ran_tx
                 .send(std::thread::current().name().map(str::to_owned))
-                .expect("test receiver alive");
+                .is_err()
+            {
+                tracing::debug!("test: ran_rx dropped before the worker reported");
+            }
         })
-        .expect("spawn worker thread");
+        .map_err(ctx("spawn worker thread"))?;
 
-        worker.handle.join().expect("worker thread joins");
+        worker
+            .handle
+            .join()
+            .map_err(|_| TestError::Unexpected("worker thread joins".into()))?;
         assert_eq!(
-            ran_rx.recv().expect("worker ran"),
+            ran_rx.recv().map_err(ctx("worker ran"))?,
             Some("harw-job-worker".to_owned())
         );
         let mut done = worker.done;
         assert_eq!(done.try_recv(), Ok(()));
+        Ok(())
     }
 
     #[test]
-    fn test_jemalloc_allocator_is_feature_gated() {
+    fn test_jemalloc_allocator_is_feature_gated() -> TestResult {
         let source = include_str!("main.rs");
         let allocator = source
             .find("#[global_allocator]")
-            .expect("global allocator declaration present");
+            .ok_or(TestError::Missing("global allocator declaration present"))?;
         let gate = source
             .find("#[cfg(feature = \"jemalloc\")]")
-            .expect("jemalloc cfg gate present");
+            .ok_or(TestError::Missing("jemalloc cfg gate present"))?;
         // The gate must directly precede the allocator attribute.
         assert!(gate < allocator);
         assert_eq!(
@@ -4067,6 +4295,7 @@ mod tests {
         assert!(manifest.contains("jemalloc = [\"dep:tikv-jemallocator\"]"));
         // Opt-in: the default feature set must not pull jemalloc in.
         assert!(manifest.contains("default = []"));
+        Ok(())
     }
 
     fn unique_doctor_temp_dir(label: &str) -> PathBuf {
@@ -4102,9 +4331,9 @@ mod tests {
     }
 
     #[test]
-    fn audit_integrity_evidence_reports_absent_for_a_fresh_home() {
+    fn audit_integrity_evidence_reports_absent_for_a_fresh_home() -> TestResult {
         let home = unique_doctor_temp_dir("audit-absent");
-        std::fs::create_dir_all(&home).expect("create fresh temp home");
+        std::fs::create_dir_all(&home).map_err(ctx("create fresh temp home"))?;
 
         assert!(matches!(
             audit_integrity_evidence(&home),
@@ -4112,6 +4341,7 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 
     #[test]
@@ -4165,13 +4395,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn kek_file_perms_evidence_ok_for_a_0600_key_file() {
+    fn kek_file_perms_evidence_ok_for_a_0600_key_file() -> TestResult {
         use std::os::unix::fs::PermissionsExt;
 
         let path = unique_doctor_temp_dir("kek-ok");
-        std::fs::write(&path, [0u8; 32]).expect("write test key file");
+        std::fs::write(&path, [0u8; 32]).map_err(ctx("write test key file"))?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .expect("set 0600 permissions");
+            .map_err(ctx("set 0600 permissions"))?;
 
         let config = ResolvedConfig {
             auth: harw_config::AuthConfig {
@@ -4192,17 +4422,18 @@ mod tests {
         ));
 
         let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn kek_file_perms_evidence_unsafe_for_a_group_readable_key_file() {
+    fn kek_file_perms_evidence_unsafe_for_a_group_readable_key_file() -> TestResult {
         use std::os::unix::fs::PermissionsExt;
 
         let path = unique_doctor_temp_dir("kek-unsafe");
-        std::fs::write(&path, [0u8; 32]).expect("write test key file");
+        std::fs::write(&path, [0u8; 32]).map_err(ctx("write test key file"))?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
-            .expect("set unsafe permissions");
+            .map_err(ctx("set unsafe permissions"))?;
 
         let config = ResolvedConfig {
             auth: harw_config::AuthConfig {
@@ -4223,22 +4454,24 @@ mod tests {
         ));
 
         let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     #[test]
-    fn run_doctor_checks_returns_false_when_nothing_fails() {
+    fn run_doctor_checks_returns_false_when_nothing_fails() -> TestResult {
         let home = unique_doctor_temp_dir("run-checks-ok");
-        std::fs::create_dir_all(&home).expect("create fresh temp home");
+        std::fs::create_dir_all(&home).map_err(ctx("create fresh temp home"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
-                .expect("set 0700 home permissions");
+                .map_err(ctx("set 0700 home permissions"))?;
         }
         let config = ResolvedConfig::default();
 
         assert!(!run_doctor_checks(&home, &config));
 
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 }

@@ -46,6 +46,7 @@ use crate::activation::{SessionActivation, ToolProfile};
 use crate::history::ConversationHistory;
 use crate::mode::InteractionMode;
 use harw_extension_api::ExtFuture;
+use harw_protocol::AgentOrchestrationEvent;
 use harw_protocol::items::{ResultTrust, ToolCallResult, ToolResultItem, TurnItem};
 use harw_session_store::{RecordKind, TranscriptStore};
 use harw_tools::ToolName;
@@ -392,6 +393,15 @@ fn history_replaced_item_count(payload: &serde_json::Value) -> Option<usize> {
         .map(|count| count as usize)
 }
 
+/// Erkennt einen versionierten Agenten-Lifecycle-Datensatz, ohne andere
+/// `Lifecycle`-Payloads (Sitzungszustand, Verdichtung, Drift) zu dekodieren.
+fn is_agent_orchestration_payload(payload: &serde_json::Value) -> bool {
+    payload
+        .get("marker")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|marker| marker == "agent_orchestration")
+}
+
 // ---------------------------------------------------------------------------
 // Reparatur offener Tool-Calls (F-150)
 // ---------------------------------------------------------------------------
@@ -508,6 +518,28 @@ pub fn repair_open_tool_calls(history: &mut ConversationHistory) -> Vec<ToolCall
 /// Sitzungszustand speichern/laden. Alles Weitere (Cursor, Snapshots, Forks)
 /// sind additive Methoden für später.
 pub trait StateStore: Send + Sync {
+    /// Persists one versioned orchestration observation using the same
+    /// per-session sequence owner as turns and lifecycle markers.
+    fn record_agent_orchestration<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        event: &'a AgentOrchestrationEvent,
+    ) -> ExtFuture<'a, StateStoreResult<()>> {
+        let _ = (sid, event);
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Lädt die append-only Orchestrierungsbeobachtungen einer Wurzelsitzung.
+    ///
+    /// Der Standard ist leer, damit bestehende Stores ohne Lifecycle-Archiv
+    /// weiterhin gültig bleiben. Konsumenten behandeln einen leeren Verlauf
+    /// als „keine historischen Kinder bekannt“, niemals als laufende Arbeit.
+    fn load_agent_orchestration<'a>(
+        &'a self,
+        _sid: &'a SessionId,
+    ) -> ExtFuture<'a, StateStoreResult<Vec<AgentOrchestrationEvent>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
     /// Persistiert ein einzelnes `TurnItem` für die gegebene Session.
     fn save_turn<'a>(
         &'a self,
@@ -723,11 +755,12 @@ impl TranscriptStateStore {
                 Some(sequence) => sequence,
                 None => recovered_next_sequence(&store, &sid)?,
             };
-            let next = sequence
-                .checked_add(1)
-                .ok_or_else(|| StateStoreError::SequenceExhausted {
-                    session: sid.clone(),
-                })?;
+            let next =
+                sequence
+                    .checked_add(1)
+                    .ok_or_else(|| StateStoreError::SequenceExhausted {
+                        session: sid.clone(),
+                    })?;
             let record = harw_session_store::TranscriptRecord::new(
                 sid,
                 thread,
@@ -745,14 +778,65 @@ impl TranscriptStateStore {
 }
 
 impl StateStore for TranscriptStateStore {
+    fn record_agent_orchestration<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        event: &'a AgentOrchestrationEvent,
+    ) -> ExtFuture<'a, StateStoreResult<()>> {
+        Box::pin(async move {
+            let mut payload =
+                serde_json::to_value(event).map_err(harw_session_store::SessionStoreError::from)?;
+            if let serde_json::Value::Object(object) = &mut payload {
+                object.insert("marker".into(), serde_json::json!("agent_orchestration"));
+            }
+            self.append_record(sid, RecordKind::Lifecycle, payload)
+                .await
+        })
+    }
+
+    fn load_agent_orchestration<'a>(
+        &'a self,
+        sid: &'a SessionId,
+    ) -> ExtFuture<'a, StateStoreResult<Vec<AgentOrchestrationEvent>>> {
+        Box::pin(async move {
+            let store = Arc::clone(&self.transcript_store);
+            let thread = (self.thread_for_session)(sid);
+            let sid = sid.clone();
+            run_blocking("transcript_load_agent_orchestration", move || {
+                let reader = match store.reader(&sid) {
+                    Ok(reader) => reader,
+                    Err(harw_session_store::SessionStoreError::NotFound { .. }) => {
+                        return Ok(Vec::new());
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let mut events = Vec::new();
+                for record in reader {
+                    let record = record?;
+                    if record.kind != RecordKind::Lifecycle
+                        || record.thread != thread
+                        || !is_agent_orchestration_payload(&record.payload)
+                    {
+                        continue;
+                    }
+                    events.push(
+                        serde_json::from_value(record.payload)
+                            .map_err(harw_session_store::SessionStoreError::from)?,
+                    );
+                }
+                Ok(events)
+            })
+            .await
+        })
+    }
     fn save_turn<'a>(
         &'a self,
         sid: &'a SessionId,
         item: &'a TurnItem,
     ) -> ExtFuture<'a, StateStoreResult<()>> {
         Box::pin(async move {
-            let payload = serde_json::to_value(item)
-                .map_err(harw_session_store::SessionStoreError::from)?;
+            let payload =
+                serde_json::to_value(item).map_err(harw_session_store::SessionStoreError::from)?;
             self.append_record(sid, RecordKind::Item, payload).await
         })
     }
@@ -778,7 +862,8 @@ impl StateStore for TranscriptStateStore {
                 self.save_turn(sid, item).await?;
             }
             let payload = history_replaced_payload(history.items().len())?;
-            self.append_record(sid, RecordKind::Lifecycle, payload).await
+            self.append_record(sid, RecordKind::Lifecycle, payload)
+                .await
         })
     }
 
@@ -831,7 +916,8 @@ impl StateStore for TranscriptStateStore {
     ) -> ExtFuture<'a, StateStoreResult<()>> {
         Box::pin(async move {
             let payload = session_state_payload(state)?;
-            self.append_record(sid, RecordKind::Lifecycle, payload).await
+            self.append_record(sid, RecordKind::Lifecycle, payload)
+                .await
         })
     }
 
@@ -873,8 +959,8 @@ impl StateStore for TranscriptStateStore {
         round: &'a UsageRound,
     ) -> ExtFuture<'a, StateStoreResult<()>> {
         Box::pin(async move {
-            let payload = serde_json::to_value(round)
-                .map_err(harw_session_store::SessionStoreError::from)?;
+            let payload =
+                serde_json::to_value(round).map_err(harw_session_store::SessionStoreError::from)?;
             self.append_record(sid, RecordKind::Turn, payload).await?;
 
             // Best-effort: die Sidecar-Metadaten sind eine Ableitung für den
@@ -910,7 +996,8 @@ impl StateStore for TranscriptStateStore {
     ) -> ExtFuture<'a, StateStoreResult<()>> {
         Box::pin(async move {
             let payload = drift_payload(event)?;
-            self.append_record(sid, RecordKind::Lifecycle, payload).await?;
+            self.append_record(sid, RecordKind::Lifecycle, payload)
+                .await?;
 
             let store = Arc::clone(&self.transcript_store);
             let sid_owned = sid.clone();
@@ -942,6 +1029,7 @@ impl StateStore for TranscriptStateStore {
 pub struct InMemoryStateStore {
     inner: Mutex<HashMap<String, Vec<TurnItem>>>,
     states: Mutex<HashMap<String, SessionStateSnapshot>>,
+    orchestration: Mutex<HashMap<String, Vec<AgentOrchestrationEvent>>>,
 }
 
 impl InMemoryStateStore {
@@ -951,10 +1039,13 @@ impl InMemoryStateStore {
     }
 
     /// Anzahl der Sessions mit gespeichertem Verlauf.
+    ///
+    /// Liefert `0`, wenn der interne Mutex vergiftet ist (R087: keine Panik) —
+    /// siehe [`Self::try_session_count`] für die fehlbare Variante mit
+    /// Fehlerdetails.
     #[must_use]
     pub fn session_count(&self) -> usize {
-        self.try_session_count()
-            .unwrap_or_else(|error| panic!("unable to count sessions: {error}"))
+        self.try_session_count().unwrap_or(0)
     }
 
     /// Fallible variant of [`Self::session_count`].
@@ -963,10 +1054,13 @@ impl InMemoryStateStore {
     }
 
     /// Anzahl gespeicherter Items für eine Session (Test-/Diagnose-Hilfe).
+    ///
+    /// Liefert `0`, wenn der interne Mutex vergiftet ist (R087: keine Panik) —
+    /// siehe [`Self::try_turn_count`] für die fehlbare Variante mit
+    /// Fehlerdetails.
     #[must_use]
     pub fn turn_count(&self, sid: &SessionId) -> usize {
-        self.try_turn_count(sid)
-            .unwrap_or_else(|error| panic!("unable to count turns: {error}"))
+        self.try_turn_count(sid).unwrap_or(0)
     }
 
     /// Fallible variant of [`Self::turn_count`].
@@ -976,6 +1070,31 @@ impl InMemoryStateStore {
 }
 
 impl StateStore for InMemoryStateStore {
+    fn record_agent_orchestration<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        event: &'a AgentOrchestrationEvent,
+    ) -> ExtFuture<'a, StateStoreResult<()>> {
+        Box::pin(async move {
+            lock_state(&self.orchestration, "record_agent_orchestration")?
+                .entry(sid.as_str().to_owned())
+                .or_default()
+                .push(event.clone());
+            Ok(())
+        })
+    }
+
+    fn load_agent_orchestration<'a>(
+        &'a self,
+        sid: &'a SessionId,
+    ) -> ExtFuture<'a, StateStoreResult<Vec<AgentOrchestrationEvent>>> {
+        Box::pin(async move {
+            Ok(lock_state(&self.orchestration, "load_agent_orchestration")?
+                .get(sid.as_str())
+                .cloned()
+                .unwrap_or_default())
+        })
+    }
     fn save_turn<'a>(
         &'a self,
         sid: &'a SessionId,
@@ -1044,6 +1163,7 @@ impl StateStore for InMemoryStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn session() -> SessionId {
         SessionId::from_str("state-store-test")
@@ -1062,122 +1182,124 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn in_memory_store_round_trips_history() {
+    async fn in_memory_store_round_trips_history() -> TestResult {
         let store = InMemoryStateStore::new();
         let mut history = ConversationHistory::new();
         history.push_user_text("hello");
 
-        store.save_history(&session(), &history).await.unwrap();
+        store.save_history(&session(), &history).await?;
 
         assert_eq!(store.session_count(), 1);
         assert_eq!(store.turn_count(&session()), 1);
-        let loaded = store.load_history(&session()).await.unwrap();
+        let loaded = store.load_history(&session()).await?;
         assert_eq!(
-            serde_json::to_value(loaded.items()).unwrap(),
-            serde_json::to_value(history.items()).unwrap()
+            serde_json::to_value(loaded.items())?,
+            serde_json::to_value(history.items())?
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn transcript_store_round_trips_items_with_deterministic_thread_mapping() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn transcript_store_round_trips_items_with_deterministic_thread_mapping() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = TranscriptStateStore::new(TranscriptStore::new(temp.path()), transcript_thread);
         let item = error_item("durable failure");
 
-        store.save_turn(&session(), &item).await.unwrap();
+        store.save_turn(&session(), &item).await?;
 
-        let loaded = store.load_history(&session()).await.unwrap();
+        let loaded = store.load_history(&session()).await?;
         assert_eq!(
-            serde_json::to_value(loaded.items()).unwrap(),
+            serde_json::to_value(loaded.items())?,
             serde_json::json!([item])
         );
         let records = TranscriptStore::new(temp.path())
-            .reader(&session())
-            .unwrap()
-            .collect::<harw_session_store::SessionStoreResult<Vec<_>>>()
-            .unwrap();
+            .reader(&session())?
+            .collect::<harw_session_store::SessionStoreResult<Vec<_>>>()?;
         assert_eq!(records[0].thread, transcript_thread(&session()));
         assert_eq!(records[0].sequence, 0);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn transcript_store_save_history_replaces_after_compaction() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn transcript_store_save_history_replaces_after_compaction() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let sid = session();
         let store = TranscriptStateStore::new(TranscriptStore::new(temp.path()), transcript_thread);
 
-        store.save_turn(&sid, &error_item("pre-compact 1")).await.unwrap();
-        store.save_turn(&sid, &error_item("pre-compact 2")).await.unwrap();
-        store.save_turn(&sid, &error_item("pre-compact 3")).await.unwrap();
+        store.save_turn(&sid, &error_item("pre-compact 1")).await?;
+        store.save_turn(&sid, &error_item("pre-compact 2")).await?;
+        store.save_turn(&sid, &error_item("pre-compact 3")).await?;
 
         let compacted_item = error_item("compacted summary");
         let compacted = ConversationHistory::from_items(vec![compacted_item.clone()]);
-        store.save_history(&sid, &compacted).await.unwrap();
+        store.save_history(&sid, &compacted).await?;
 
-        let loaded = store.load_history(&sid).await.unwrap();
+        let loaded = store.load_history(&sid).await?;
         assert_eq!(
-            serde_json::to_value(loaded.items()).unwrap(),
+            serde_json::to_value(loaded.items())?,
             serde_json::json!([compacted_item]),
             "load_history must return exactly the compacted item, not old + new"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn transcript_store_save_history_marker_keeps_later_appended_items() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn transcript_store_save_history_marker_keeps_later_appended_items() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let sid = session();
         let store = TranscriptStateStore::new(TranscriptStore::new(temp.path()), transcript_thread);
 
-        store.save_turn(&sid, &error_item("pre-compact 1")).await.unwrap();
-        store.save_turn(&sid, &error_item("pre-compact 2")).await.unwrap();
-        store.save_turn(&sid, &error_item("pre-compact 3")).await.unwrap();
+        store.save_turn(&sid, &error_item("pre-compact 1")).await?;
+        store.save_turn(&sid, &error_item("pre-compact 2")).await?;
+        store.save_turn(&sid, &error_item("pre-compact 3")).await?;
 
         let compacted_item = error_item("compacted summary");
         let compacted = ConversationHistory::from_items(vec![compacted_item.clone()]);
-        store.save_history(&sid, &compacted).await.unwrap();
+        store.save_history(&sid, &compacted).await?;
 
         let new_item = error_item("post-compact turn");
-        store.save_turn(&sid, &new_item).await.unwrap();
+        store.save_turn(&sid, &new_item).await?;
 
-        let loaded = store.load_history(&sid).await.unwrap();
+        let loaded = store.load_history(&sid).await?;
         assert_eq!(
-            serde_json::to_value(loaded.items()).unwrap(),
+            serde_json::to_value(loaded.items())?,
             serde_json::json!([compacted_item, new_item]),
             "items appended after the history_replaced marker must accumulate normally"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn transcript_store_load_session_state_unaffected_by_history_replaced_marker() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn transcript_store_load_session_state_unaffected_by_history_replaced_marker()
+    -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let sid = session();
         let store = TranscriptStateStore::new(TranscriptStore::new(temp.path()), transcript_thread);
 
-        store.save_turn(&sid, &error_item("pre-compact")).await.unwrap();
+        store.save_turn(&sid, &error_item("pre-compact")).await?;
         store
             .save_session_state(&sid, &snapshot(InteractionMode::Plan, 2))
-            .await
-            .unwrap();
+            .await?;
         let compacted = ConversationHistory::from_items(vec![error_item("compacted summary")]);
-        store.save_history(&sid, &compacted).await.unwrap();
+        store.save_history(&sid, &compacted).await?;
 
-        let loaded_state = store.load_session_state(&sid).await.unwrap();
+        let loaded_state = store.load_session_state(&sid).await?;
         assert_eq!(
             loaded_state,
             Some(snapshot(InteractionMode::Plan, 2)),
             "the history_replaced marker must never be mistaken for a session-state snapshot"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn transcript_store_recovers_sequence_and_serializes_concurrent_saves() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn transcript_store_recovers_sequence_and_serializes_concurrent_saves() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let initial =
             TranscriptStateStore::new(TranscriptStore::new(temp.path()), transcript_thread);
         initial
             .save_turn(&session(), &error_item("before restart"))
-            .await
-            .unwrap();
+            .await?;
 
         let recovered =
             TranscriptStateStore::new(TranscriptStore::new(temp.path()), transcript_thread);
@@ -1188,23 +1310,22 @@ mod tests {
             recovered.save_turn(&session_id, &first),
             recovered.save_turn(&session_id, &second),
         );
-        first_result.unwrap();
-        second_result.unwrap();
+        first_result?;
+        second_result?;
 
         let sequences = TranscriptStore::new(temp.path())
-            .reader(&session())
-            .unwrap()
-            .collect::<harw_session_store::SessionStoreResult<Vec<_>>>()
-            .unwrap()
+            .reader(&session())?
+            .collect::<harw_session_store::SessionStoreResult<Vec<_>>>()?
             .into_iter()
             .map(|record| record.sequence)
             .collect::<Vec<_>>();
         assert_eq!(sequences, vec![0, 1, 2]);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn transcript_store_rejects_sequence_exhaustion_during_recovery() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn transcript_store_rejects_sequence_exhaustion_during_recovery() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let sid = session();
         let record = harw_session_store::TranscriptRecord::new(
             sid.clone(),
@@ -1212,34 +1333,42 @@ mod tests {
             u64::MAX,
             jiff::Timestamp::now(),
             RecordKind::Item,
-            serde_json::to_value(error_item("sequence exhaustion fixture")).unwrap(),
+            serde_json::to_value(error_item("sequence exhaustion fixture"))?,
         );
-        TranscriptStore::new(temp.path()).append(&record).unwrap();
+        TranscriptStore::new(temp.path()).append(&record)?;
 
         let store = TranscriptStateStore::new(TranscriptStore::new(temp.path()), transcript_thread);
-        let error = store
-            .save_turn(&sid, &error_item("must not append"))
-            .await
-            .unwrap_err();
+        let Err(error) = store.save_turn(&sid, &error_item("must not append")).await else {
+            return Err(TestError::Unexpected(
+                "sequence exhaustion must be rejected".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
             StateStoreError::SequenceExhausted { session } if session.as_str() == sid.as_str()
         ));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn poisoned_mutex_is_reported_by_store_operations() {
+    async fn poisoned_mutex_is_reported_by_store_operations() -> TestResult {
         let store = InMemoryStateStore::new();
         std::thread::scope(|scope| {
             let handle = scope.spawn(|| {
+                // Absichtliche Panik in einem gescopten Thread: einziger Weg,
+                // den Mutex kontrolliert zu vergiften, um die
+                // Poison-Behandlung der Store-Operationen unten zu prüfen.
+                // Die Panik wird über `handle.join()` gefangen und nie in
+                // diesen Test-Thread propagiert (R087-Ausnahme: bewusst
+                // getestete Panik als Vergiftungsmechanismus, siehe Bericht).
                 let _guard = store.inner.lock().unwrap();
                 panic!("poison test");
             });
             assert!(handle.join().is_err());
         });
 
-        let error = store
+        let Err(error) = store
             .save_turn(
                 &session(),
                 &TurnItem::Error(harw_protocol::items::ErrorItem {
@@ -1249,43 +1378,60 @@ mod tests {
                 }),
             )
             .await
-            .unwrap_err();
+        else {
+            return Err(TestError::Unexpected(
+                "save_turn must report the poisoned mutex".to_owned(),
+            ));
+        };
         assert!(matches!(
             error,
             StateStoreError::PoisonedMutex {
                 operation: "save_turn"
             }
         ));
+        let Err(count_error) = store.try_session_count() else {
+            return Err(TestError::Unexpected(
+                "try_session_count must report the poisoned mutex".to_owned(),
+            ));
+        };
         assert!(matches!(
-            store.try_session_count().unwrap_err(),
+            count_error,
             StateStoreError::PoisonedMutex {
                 operation: "session_count"
             }
         ));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn poisoned_transcript_sequence_mutex_is_reported() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn poisoned_transcript_sequence_mutex_is_reported() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = TranscriptStateStore::new(TranscriptStore::new(temp.path()), transcript_thread);
         std::thread::scope(|scope| {
             let handle = scope.spawn(|| {
+                // Siehe Kommentar in `poisoned_mutex_is_reported_by_store_operations`:
+                // dieselbe absichtliche Vergiftungs-Panik, kontrolliert gefangen.
                 let _guard = store.sessions.lock().unwrap();
                 panic!("poison test");
             });
             assert!(handle.join().is_err());
         });
 
-        let error = store
+        let Err(error) = store
             .save_turn(&session(), &error_item("poisoned durable state"))
             .await
-            .unwrap_err();
+        else {
+            return Err(TestError::Unexpected(
+                "save_turn must report the poisoned transcript sequence mutex".to_owned(),
+            ));
+        };
         assert!(matches!(
             error,
             StateStoreError::PoisonedMutex {
                 operation: "transcript_save_turn"
             }
         ));
+        Ok(())
     }
 
     #[test]
@@ -1336,7 +1482,7 @@ mod tests {
     }
 
     #[test]
-    fn test_repair_open_tool_calls_inserts_runtime_error_at_end_of_round() {
+    fn test_repair_open_tool_calls_inserts_runtime_error_at_end_of_round() -> TestResult {
         let mut history = ConversationHistory::from_items(vec![
             tool_call("a"),
             tool_call("b"),
@@ -1352,7 +1498,9 @@ mod tests {
             vec!["call:a", "call:b", "result:b", "result:a", "user"]
         );
         let TurnItem::ToolResult(synthetic) = &history.items()[3] else {
-            panic!("synthetic result expected at index 3");
+            return Err(TestError::Unexpected(
+                "synthetic result expected at index 3".to_owned(),
+            ));
         };
         assert_eq!(synthetic.trust, ResultTrust::Runtime);
         assert_eq!(
@@ -1360,6 +1508,7 @@ mod tests {
             ToolCallResult::error(INTERRUPTED_TOOL_CALL_MESSAGE)
         );
         assert_eq!(synthetic.id.as_str(), "synthetic-result-a");
+        Ok(())
     }
 
     #[test]
@@ -1385,20 +1534,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_history_repairs_open_calls_in_both_stores() {
+    async fn test_load_history_repairs_open_calls_in_both_stores() -> TestResult {
         let sid = session();
         let memory = InMemoryStateStore::new();
         let persisted = ConversationHistory::from_items(vec![user_item("q"), tool_call("open")]);
-        memory.save_history(&sid, &persisted).await.unwrap();
-        let loaded = memory.load_history(&sid).await.unwrap();
+        memory.save_history(&sid, &persisted).await?;
+        let loaded = memory.load_history(&sid).await?;
         assert_eq!(kinds(&loaded), vec!["user", "call:open", "result:open"]);
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let durable =
             TranscriptStateStore::new(TranscriptStore::new(temp.path()), transcript_thread);
-        durable.save_history(&sid, &persisted).await.unwrap();
-        let loaded = durable.load_history(&sid).await.unwrap();
+        durable.save_history(&sid, &persisted).await?;
+        let loaded = durable.load_history(&sid).await?;
         assert_eq!(kinds(&loaded), vec!["user", "call:open", "result:open"]);
+        Ok(())
     }
 
     fn snapshot(mode: InteractionMode, input_tokens: u64) -> SessionStateSnapshot {
@@ -1425,50 +1575,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_transcript_session_state_latest_wins_and_ignores_foreign_lifecycle() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn test_transcript_session_state_latest_wins_and_ignores_foreign_lifecycle() -> TestResult
+    {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let sid = session();
         let store = TranscriptStateStore::new(TranscriptStore::new(temp.path()), transcript_thread);
-        assert_eq!(store.load_session_state(&sid).await.unwrap(), None);
+        assert_eq!(store.load_session_state(&sid).await?, None);
 
         store
             .save_session_state(&sid, &snapshot(InteractionMode::Plan, 1))
-            .await
-            .unwrap();
-        store.save_turn(&sid, &error_item("between")).await.unwrap();
+            .await?;
+        store.save_turn(&sid, &error_item("between")).await?;
         store
             .save_session_state(&sid, &snapshot(InteractionMode::Explore, 7))
-            .await
-            .unwrap();
+            .await?;
         store
             .append_record(
                 &sid,
                 RecordKind::Lifecycle,
                 serde_json::json!({ "event": "opened" }),
             )
-            .await
-            .unwrap();
+            .await?;
 
         let restarted =
             TranscriptStateStore::new(TranscriptStore::new(temp.path()), transcript_thread);
-        let loaded = restarted.load_session_state(&sid).await.unwrap();
+        let loaded = restarted.load_session_state(&sid).await?;
         assert_eq!(loaded, Some(snapshot(InteractionMode::Explore, 7)));
-        let history = restarted.load_history(&sid).await.unwrap();
-        assert_eq!(history.len(), 1, "state records never leak into the history");
+        let history = restarted.load_history(&sid).await?;
+        assert_eq!(
+            history.len(),
+            1,
+            "state records never leak into the history"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_in_memory_session_state_round_trips() {
+    async fn test_in_memory_session_state_round_trips() -> TestResult {
         let store = InMemoryStateStore::new();
         let sid = session();
         store
             .save_session_state(&sid, &snapshot(InteractionMode::Work, 3))
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(
-            store.load_session_state(&sid).await.unwrap(),
+            store.load_session_state(&sid).await?,
             Some(snapshot(InteractionMode::Work, 3))
         );
+        Ok(())
     }
 
     #[test]
@@ -1487,8 +1640,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_transcript_store_parallel_sessions_get_independent_sequences() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn test_transcript_store_parallel_sessions_get_independent_sequences() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = Arc::new(TranscriptStateStore::new(
             TranscriptStore::new(temp.path()),
             transcript_thread,
@@ -1506,20 +1659,21 @@ mod tests {
             }
         }
         for handle in handles {
-            handle.await.unwrap().unwrap();
+            handle
+                .await
+                .map_err(ctx("spawned save_turn task does not panic"))??;
         }
 
         for session_index in 0..2 {
             let mut sequences = TranscriptStore::new(temp.path())
-                .reader(&SessionId::from_str(format!("parallel-{session_index}")))
-                .unwrap()
-                .collect::<harw_session_store::SessionStoreResult<Vec<_>>>()
-                .unwrap()
+                .reader(&SessionId::from_str(format!("parallel-{session_index}")))?
+                .collect::<harw_session_store::SessionStoreResult<Vec<_>>>()?
                 .into_iter()
                 .map(|record| record.sequence)
                 .collect::<Vec<_>>();
             sequences.sort_unstable();
             assert_eq!(sequences, (0..5).collect::<Vec<u64>>());
         }
+        Ok(())
     }
 }

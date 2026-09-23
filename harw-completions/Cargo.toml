@@ -1,0 +1,23 @@
+[package]
+name = "harw-completions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Shell completion generation and managed installation for harw binaries"
+
+[features]
+default = []
+# Exposes `CompletionsArgs` / `CompletionsSubcommand` (clap derive) and `run_completions`.
+clap-args = []
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+clap_complete = "4.6.11"
+harw-macros = { path = "../harw-macros" }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -356,6 +356,7 @@ fn map_read_fs_error(err: harw_dod_readfs::ReadFsError) -> SensorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use std::fs;
 
     fn sensor_id() -> SensorId {
@@ -393,17 +394,39 @@ mod tests {
         .to_string()
     }
 
+    /// Test-Hilfsfunktion: erzeugt ein temporäres Verzeichnis, meldet einen
+    /// Fehlschlag als [`TestError`] statt zu paniken (Bible R087/R165).
+    fn temp_dir() -> TestResult<tempfile::TempDir> {
+        tempfile::tempdir().map_err(ctx("tempdir"))
+    }
+
+    /// Test-Hilfsfunktion: schreibt eine Fixture-Datei, meldet einen
+    /// Fehlschlag mit dem übergebenen Kontext als [`TestError`].
+    fn write_fixture(path: &Path, contents: impl AsRef<[u8]>, context: &'static str) -> TestResult {
+        fs::write(path, contents).map_err(ctx(context))
+    }
+
+    /// Test-Hilfsfunktion: legt ein Verzeichnis an, meldet einen Fehlschlag
+    /// mit dem übergebenen Kontext als [`TestError`].
+    fn make_dir(path: &Path, context: &'static str) -> TestResult {
+        fs::create_dir(path).map_err(ctx(context))
+    }
+
     // --- Explizit geforderte Einzelfälle ------------------------------------
 
     #[test]
-    fn test_valid_report_yields_expected_security_events() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fs::write(dir.path().join("report.sarif"), VALID_SARIF).expect("write fixture");
+    fn test_valid_report_yields_expected_security_events() -> TestResult {
+        let dir = temp_dir()?;
+        write_fixture(
+            &dir.path().join("report.sarif"),
+            VALID_SARIF,
+            "write fixture",
+        )?;
 
         let sensor = sensor_for(dir.path());
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("gültiger Bericht muss erfolgreich gelesen werden");
+            .map_err(ctx("gültiger Bericht muss erfolgreich gelesen werden"))?;
 
         assert_eq!(reading.samples.len(), 0);
         assert_eq!(reading.events.len(), 2);
@@ -412,39 +435,42 @@ mod tests {
             assert_eq!(event.observed_at, Timestamp::UNIX_EPOCH);
             assert!(event.actor.is_none());
         }
+        Ok(())
     }
 
     #[test]
-    fn test_empty_directory_yields_empty_reading_without_error() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_empty_directory_yields_empty_reading_without_error() -> TestResult {
+        let dir = temp_dir()?;
         let sensor = sensor_for(dir.path());
 
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("ein leeres Verzeichnis darf keinen Fehler auslösen");
+            .map_err(ctx("ein leeres Verzeichnis darf keinen Fehler auslösen"))?;
 
         assert!(reading.samples.is_empty());
         assert!(reading.events.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_missing_directory_yields_empty_reading_without_error() {
+    fn test_missing_directory_yields_empty_reading_without_error() -> TestResult {
         // `scan_reports_dir` wird nur benannt, nie angelegt (siehe
         // `harw-home`-Moduldoku) -- ein Sensor muss auch dann funktionieren,
         // wenn noch kein Scanner je einen Bericht abgelegt hat.
-        let parent = tempfile::tempdir().expect("tempdir");
+        let parent = temp_dir()?;
         let missing = parent.path().join("scan_reports");
         let sensor = sensor_for(&missing);
 
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("ein fehlendes Verzeichnis darf keinen Fehler auslösen");
+            .map_err(ctx("ein fehlendes Verzeichnis darf keinen Fehler auslösen"))?;
         assert!(reading.events.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_oversized_description_field_is_truncated_not_rejected() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_oversized_description_field_is_truncated_not_rejected() -> TestResult {
+        let dir = temp_dir()?;
         let huge_description = "X".repeat(crate::redact::MAX_DETAIL_LEN * 10);
         let json = serde_json::json!({
             "vulnerabilities": {
@@ -459,25 +485,26 @@ mod tests {
             }
         })
         .to_string();
-        fs::write(dir.path().join("audit.json"), json).expect("write fixture");
+        write_fixture(&dir.path().join("audit.json"), json, "write fixture")?;
 
         let sensor = sensor_for(dir.path());
-        let reading = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect("übergroßes Feld darf den Bericht nicht scheitern lassen");
+        let reading = sensor.poll(Timestamp::UNIX_EPOCH).map_err(ctx(
+            "übergroßes Feld darf den Bericht nicht scheitern lassen",
+        ))?;
 
         assert_eq!(reading.events.len(), 1);
         let harw_dod_signals::EventKind::StructureDrift { detail, .. } = &reading.events[0].kind
         else {
-            panic!("erwartete StructureDrift");
+            return Err(TestError::Unexpected("erwartete StructureDrift".to_owned()));
         };
         assert!(detail.len() < huge_description.len());
         assert!(!detail.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_control_characters_in_free_text_are_neutralized() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_control_characters_in_free_text_are_neutralized() -> TestResult {
+        let dir = temp_dir()?;
         let mut text_with_control = String::from("zeile eins");
         text_with_control.push('\n');
         text_with_control.push_str("zeile zwei");
@@ -487,38 +514,44 @@ mod tests {
         text_with_control.push_str("[0m");
 
         let json = sarif_with_message(&text_with_control);
-        fs::write(dir.path().join("report.json"), json).expect("write fixture");
+        write_fixture(&dir.path().join("report.json"), json, "write fixture")?;
 
         let sensor = sensor_for(dir.path());
-        let reading = sensor.poll(Timestamp::UNIX_EPOCH).expect("muss gelingen");
+        let reading = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .map_err(ctx("muss gelingen"))?;
 
         assert_eq!(reading.events.len(), 1);
         let harw_dod_signals::EventKind::StructureDrift { detail, .. } = &reading.events[0].kind
         else {
-            panic!("erwartete StructureDrift");
+            return Err(TestError::Unexpected("erwartete StructureDrift".to_owned()));
         };
         assert!(!detail.contains('\n'));
         assert!(!detail.contains('\u{1b}'));
+        Ok(())
     }
 
     #[test]
-    fn test_malformed_json_error_message_does_not_contain_report_content() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_malformed_json_error_message_does_not_contain_report_content() -> TestResult {
+        let dir = temp_dir()?;
         let secret_marker = "GEHEIMNIS-1234567890";
-        fs::write(
-            dir.path().join("broken.json"),
+        write_fixture(
+            &dir.path().join("broken.json"),
             format!("{{ das ist kaputt: {secret_marker}"),
-        )
-        .expect("write fixture");
+            "write fixture",
+        )?;
 
         let sensor = sensor_for(dir.path());
-        let err = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect_err("kaputtes JSON muss scheitern");
+        let Err(err) = sensor.poll(Timestamp::UNIX_EPOCH) else {
+            return Err(TestError::Unexpected(
+                "kaputtes JSON muss scheitern".to_owned(),
+            ));
+        };
 
         let message = err.to_string();
         assert!(!message.contains(secret_marker));
         assert!(matches!(err, SensorError::MalformedSource));
+        Ok(())
     }
 
     #[test]
@@ -531,58 +564,83 @@ mod tests {
 
     /// 1. Determinismus: derselbe Bericht ergibt zweimal dasselbe Ergebnis.
     #[test]
-    fn test_check_determinism_same_input_yields_equal_reading() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fs::write(dir.path().join("report.sarif"), VALID_SARIF).expect("write fixture");
+    fn test_check_determinism_same_input_yields_equal_reading() -> TestResult {
+        let dir = temp_dir()?;
+        write_fixture(
+            &dir.path().join("report.sarif"),
+            VALID_SARIF,
+            "write fixture",
+        )?;
         let sensor = sensor_for(dir.path());
 
-        let first = sensor.poll(Timestamp::UNIX_EPOCH).expect("erster Abruf");
-        let second = sensor.poll(Timestamp::UNIX_EPOCH).expect("zweiter Abruf");
+        let first = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .map_err(ctx("erster Abruf"))?;
+        let second = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .map_err(ctx("zweiter Abruf"))?;
         assert_eq!(first, second);
+        Ok(())
     }
 
     /// 2. Inhaltsfreiheit: der Fehlertext bei kaputtem JSON nennt weder den
     ///    Berichtsinhalt noch den aufgelösten Pfad der betroffenen Datei.
     #[test]
-    fn test_check_content_freedom_error_never_echoes_source_paths() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fs::write(dir.path().join("broken.json"), "{ nicht valide").expect("write fixture");
+    fn test_check_content_freedom_error_never_echoes_source_paths() -> TestResult {
+        let dir = temp_dir()?;
+        write_fixture(
+            &dir.path().join("broken.json"),
+            "{ nicht valide",
+            "write fixture",
+        )?;
         let sensor = sensor_for(dir.path());
 
-        let err = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect_err("muss scheitern");
+        let Err(err) = sensor.poll(Timestamp::UNIX_EPOCH) else {
+            return Err(TestError::Unexpected("muss scheitern".to_owned()));
+        };
         let message = err.to_string();
         assert!(!message.contains(dir.path().to_string_lossy().as_ref()));
+        Ok(())
     }
 
     /// 3. Scope-Dichtheit: eine Datei außerhalb des konfigurierten Bereichs
     ///    darf niemals in das Ergebnis einfließen, selbst wenn sie im
     ///    unmittelbaren Nachbarverzeichnis liegt und denselben Namen trägt.
     #[test]
-    fn test_check_scope_tightness_ignores_files_outside_configured_root() {
-        let base = tempfile::tempdir().expect("tempdir");
+    fn test_check_scope_tightness_ignores_files_outside_configured_root() -> TestResult {
+        let base = temp_dir()?;
         let inside = base.path().join("scan_reports");
         let outside = base.path().join("other");
-        fs::create_dir(&inside).expect("create inside dir");
-        fs::create_dir(&outside).expect("create outside dir");
-        fs::write(inside.join("report.sarif"), VALID_SARIF).expect("write inside fixture");
-        fs::write(outside.join("report.sarif"), VALID_SARIF).expect("write outside fixture");
+        make_dir(&inside, "create inside dir")?;
+        make_dir(&outside, "create outside dir")?;
+        write_fixture(
+            &inside.join("report.sarif"),
+            VALID_SARIF,
+            "write inside fixture",
+        )?;
+        write_fixture(
+            &outside.join("report.sarif"),
+            VALID_SARIF,
+            "write outside fixture",
+        )?;
 
         let sensor = sensor_for(&inside);
-        let reading = sensor.poll(Timestamp::UNIX_EPOCH).expect("muss gelingen");
+        let reading = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .map_err(ctx("muss gelingen"))?;
 
         // Nur die zwei Befunde aus der EINEN im Bereich liegenden Datei --
         // nicht vier, was der Fall wäre, würde auch die Nachbardatei
         // gelesen.
         assert_eq!(reading.events.len(), 2);
+        Ok(())
     }
 
     /// 4. Redaktion: Steuerzeichen werden entfernt UND ein übergroßes Feld
     ///    wird gekappt, in derselben Nachricht.
     #[test]
-    fn test_check_redaction_combines_truncation_and_control_char_removal() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_check_redaction_combines_truncation_and_control_char_removal() -> TestResult {
+        let dir = temp_dir()?;
         let mut huge_with_control = "y".repeat(crate::redact::MAX_DETAIL_LEN * 4);
         huge_with_control.push('\n');
         huge_with_control.push_str("END");
@@ -590,87 +648,102 @@ mod tests {
         huge_with_control.push_str("[0m");
 
         let json = sarif_with_message(&huge_with_control);
-        fs::write(dir.path().join("report.json"), json).expect("write fixture");
+        write_fixture(&dir.path().join("report.json"), json, "write fixture")?;
 
         let sensor = sensor_for(dir.path());
-        let reading = sensor.poll(Timestamp::UNIX_EPOCH).expect("muss gelingen");
+        let reading = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .map_err(ctx("muss gelingen"))?;
 
         let harw_dod_signals::EventKind::StructureDrift { detail, .. } = &reading.events[0].kind
         else {
-            panic!("erwartete StructureDrift");
+            return Err(TestError::Unexpected("erwartete StructureDrift".to_owned()));
         };
         assert!(!detail.contains('\n'));
         assert!(!detail.contains('\u{1b}'));
         assert!(detail.len() < huge_with_control.len());
+        Ok(())
     }
 
     /// 5. Kardinalität: N Befunde über mehrere Dateien hinweg ergeben genau
     ///    N Ereignisse -- keine Verdopplung, kein Verlust.
     #[test]
-    fn test_check_cardinality_events_sum_across_multiple_files() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fs::write(dir.path().join("a.sarif"), VALID_SARIF).expect("write fixture a"); // 2 Treffer
+    fn test_check_cardinality_events_sum_across_multiple_files() -> TestResult {
+        let dir = temp_dir()?;
+        write_fixture(&dir.path().join("a.sarif"), VALID_SARIF, "write fixture a")?; // 2 Treffer
         let audit_json = r#"{"vulnerabilities": {"list": [
             {"advisory": {"id": "RUSTSEC-2099-0001"}, "package": {"name": "p", "version": "1"}}
         ]}}"#; // 1 Treffer
-        fs::write(dir.path().join("b.json"), audit_json).expect("write fixture b");
+        write_fixture(&dir.path().join("b.json"), audit_json, "write fixture b")?;
 
         let sensor = sensor_for(dir.path());
-        let reading = sensor.poll(Timestamp::UNIX_EPOCH).expect("muss gelingen");
+        let reading = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .map_err(ctx("muss gelingen"))?;
 
         assert_eq!(reading.events.len(), 3);
+        Ok(())
     }
 
     /// 6. Fehlerfall: eine erkennbare, aber nicht unterstützte Form
     ///    scheitert mit `MalformedSource`, nicht mit Panik oder stillem
     ///    Verwerfen.
     #[test]
-    fn test_check_error_case_unrecognized_shape_fails_with_malformed_source() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fs::write(dir.path().join("unknown.json"), r#"{"not_a_known_format": 1}"#)
-            .expect("write fixture");
+    fn test_check_error_case_unrecognized_shape_fails_with_malformed_source() -> TestResult {
+        let dir = temp_dir()?;
+        write_fixture(
+            &dir.path().join("unknown.json"),
+            r#"{"not_a_known_format": 1}"#,
+            "write fixture",
+        )?;
 
         let sensor = sensor_for(dir.path());
-        let err = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect_err("unbekannte Form muss scheitern");
+        let Err(err) = sensor.poll(Timestamp::UNIX_EPOCH) else {
+            return Err(TestError::Unexpected(
+                "unbekannte Form muss scheitern".to_owned(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
+        Ok(())
     }
 
     // --- F-064: reguläre-Datei-Prüfung vor jedem Lesezugriff ---------------
 
     #[test]
-    fn test_open_if_regular_file_accepts_regular_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_open_if_regular_file_accepts_regular_file() -> TestResult {
+        let dir = temp_dir()?;
         let file = dir.path().join("report.json");
-        fs::write(&file, "{}").expect("write fixture");
+        write_fixture(&file, "{}", "write fixture")?;
 
         assert!(
             open_if_regular_file(&file).is_some(),
             "eine reguläre Datei muss als solche erkannt werden"
         );
+        Ok(())
     }
 
     /// F-064, Kernbeleg: ein Verzeichnis, dessen Name auf `.json` endet
     /// (deshalb ein Glob-Treffer), ist keine reguläre Datei.
     #[test]
-    fn test_open_if_regular_file_rejects_directory() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_open_if_regular_file_rejects_directory() -> TestResult {
+        let dir = temp_dir()?;
         let fake_report_dir = dir.path().join("looks-like-a-report.json");
-        fs::create_dir(&fake_report_dir).expect("Verzeichnis anlegen");
+        make_dir(&fake_report_dir, "Verzeichnis anlegen")?;
 
         assert!(
             open_if_regular_file(&fake_report_dir).is_none(),
             "ein Verzeichnis darf nicht als reguläre Datei durchgehen"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_open_if_regular_file_rejects_missing_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_open_if_regular_file_rejects_missing_path() -> TestResult {
+        let dir = temp_dir()?;
         let missing = dir.path().join("fehlt.json");
 
         assert!(open_if_regular_file(&missing).is_none());
+        Ok(())
     }
 
     /// F-064, Abrufebene: ein Verzeichnis, das wie ein Bericht benannt ist,
@@ -682,21 +755,30 @@ mod tests {
     /// echte FIFO ohne neue Testabhängigkeit hier nicht angelegt werden
     /// kann).
     #[test]
-    fn test_poll_skips_directory_shaped_like_a_report_but_still_reports_sibling_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fs::create_dir(dir.path().join("looks-like-a-report.json")).expect("Verzeichnis anlegen");
-        fs::write(dir.path().join("real-report.sarif"), VALID_SARIF).expect("write fixture");
+    fn test_poll_skips_directory_shaped_like_a_report_but_still_reports_sibling_file() -> TestResult
+    {
+        let dir = temp_dir()?;
+        make_dir(
+            &dir.path().join("looks-like-a-report.json"),
+            "Verzeichnis anlegen",
+        )?;
+        write_fixture(
+            &dir.path().join("real-report.sarif"),
+            VALID_SARIF,
+            "write fixture",
+        )?;
 
         let sensor = sensor_for(dir.path());
-        let reading = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect("ein gleichnamiges Verzeichnis darf den Abruf nicht scheitern lassen");
+        let reading = sensor.poll(Timestamp::UNIX_EPOCH).map_err(ctx(
+            "ein gleichnamiges Verzeichnis darf den Abruf nicht scheitern lassen",
+        ))?;
 
         assert_eq!(
             reading.events.len(),
             2,
             "die zwei Treffer aus der echten Nachbardatei müssen trotzdem ankommen"
         );
+        Ok(())
     }
 
     // --- F-064: `GlobLimitExceeded` ist erschöpfend behandelt --------------
@@ -708,6 +790,9 @@ mod tests {
             limit_name: "candidates",
             limit: 4096,
         };
-        assert!(matches!(map_read_fs_error(err), SensorError::MalformedSource));
+        assert!(matches!(
+            map_read_fs_error(err),
+            SensorError::MalformedSource
+        ));
     }
 }

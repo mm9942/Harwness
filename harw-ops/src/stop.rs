@@ -62,7 +62,7 @@ use std::sync::Arc;
 /// let args: StopArgs = serde_json::from_str(r#"{"job_id":"abc-123"}"#).unwrap();
 /// assert_eq!(args.job_id.as_deref(), Some("abc-123"));
 /// ```
-#[derive(Default, serde::Deserialize, harw_macros::FromRawArgs)]
+#[derive(Default, serde::Deserialize, harw_macros::FromRawArgs, harw_macros::OpArgs)]
 pub struct StopArgs {
     /// ID des Jobs, der abgebrochen werden soll.
     #[serde(default)]
@@ -115,10 +115,13 @@ async fn stop(ctx: &OpContext, args: StopArgs) -> Result<OpOutput, OpError> {
 #[cfg(test)]
 mod tests {
     use super::{StopArgs, stop};
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_job_runtime::{Budget, Job, JobKind, JobScope, JobState, RetryPolicy, StoredJob};
     use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_session_store::JobStore;
     use harw_types::{ApprovalActor, SessionId, TenantId, TurnId, WorkId, WorkspaceId};
     use jiff::{SignedDuration, Timestamp};
@@ -127,11 +130,13 @@ mod tests {
         atomic::{AtomicU64, Ordering},
     };
 
-    fn make_test_ctx(with_store: bool) -> (OpContext, std::path::PathBuf, Option<Arc<JobStore>>) {
+    fn make_test_ctx(
+        with_store: bool,
+    ) -> TestResult<(OpContext, std::path::PathBuf, Option<Arc<JobStore>>)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!("harw-stop-test-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(root.join("ws")).expect("create test workspace");
+        std::fs::create_dir_all(root.join("ws")).map_err(ctx("create test workspace"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -140,13 +145,13 @@ mod tests {
                 root: std::path::PathBuf::from("ws"),
             }],
         )
-        .expect("build workspace registry");
+        .map_err(ctx("build workspace registry"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .expect("resolve workspace binding");
+            .map_err(ctx("resolve workspace binding"))?;
         let sandbox = SandboxSpec::from_resolved(
             binding,
             PermissionSet::from_policy([Permission::ReadWorkspace]),
@@ -156,14 +161,14 @@ mod tests {
         if let Some(store) = &store {
             services.insert(Arc::clone(store));
         }
-        (
+        Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, services),
             root,
             store,
-        )
+        ))
     }
 
-    fn admitted_job(id: &str) -> StoredJob {
+    fn admitted_job(id: &str) -> TestResult<StoredJob> {
         let now = Timestamp::now();
         let mut job = Job::new(
             WorkId::from_str(id),
@@ -177,8 +182,9 @@ mod tests {
             },
             now,
         );
-        job.mark_ready(now).expect("new job can become ready");
-        StoredJob {
+        job.mark_ready(now)
+            .map_err(ctx("new job can become ready"))?;
+        Ok(StoredJob {
             job,
             scope: JobScope::new(
                 TenantId::from_str("test-tenant"),
@@ -196,42 +202,49 @@ mod tests {
             cancellation: None,
             revision: 0,
             trace: None,
-        }
+        })
     }
 
     #[test]
-    fn test_stop_args_from_raw_args_sets_job_id() {
+    fn test_stop_args_from_raw_args_sets_job_id() -> TestResult {
         let args = StopArgs::from_raw_args(&toks(&["job-42"]));
         match args {
             Ok(a) => assert_eq!(a.job_id.as_deref(), Some("job-42")),
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
+            Err(e) => return Err(TestError::Unexpected(format!("Unerwarteter Fehler: {e}"))),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_stop_args_from_raw_args_empty_tokens_sets_job_id_none() {
+    fn test_stop_args_from_raw_args_empty_tokens_sets_job_id_none() -> TestResult {
         let args = StopArgs::from_raw_args(&toks(&[]));
         match args {
             Ok(a) => assert!(a.job_id.is_none()),
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
+            Err(e) => return Err(TestError::Unexpected(format!("Unerwarteter Fehler: {e}"))),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn stop_without_job_id_returns_invalid_arguments() {
-        let (ctx, root, _) = make_test_ctx(false);
+    async fn stop_without_job_id_returns_invalid_arguments() -> TestResult {
+        let (ctx, root, _) = make_test_ctx(false)?;
         let result = stop(&ctx, StopArgs::default()).await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         match result {
             Err(OpError::InvalidArguments(message)) => assert!(message.contains("job_id")),
-            other => panic!("expected InvalidArguments, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected InvalidArguments, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn stop_without_job_store_returns_not_available() {
-        let (ctx, root, _) = make_test_ctx(false);
+    async fn stop_without_job_store_returns_not_available() -> TestResult {
+        let (ctx, root, _) = make_test_ctx(false)?;
         let result = stop(
             &ctx,
             StopArgs {
@@ -239,22 +252,27 @@ mod tests {
             },
         )
         .await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         match result {
             Err(OpError::NotAvailable(message)) => assert!(message.contains("job store")),
-            other => panic!("expected NotAvailable, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn stop_cancels_admitted_job_and_reports_id_and_revision() {
-        let (ctx, root, store) = make_test_ctx(true);
-        let store = store.expect("test context includes job store");
+    async fn stop_cancels_admitted_job_and_reports_id_and_revision() -> TestResult {
+        let (ctx, root, store) = make_test_ctx(true)?;
+        let store = store.ok_or(TestError::Missing("test context includes job store"))?;
         let work_id = WorkId::from_str("work-cancel");
         store
-            .admit(&admitted_job(work_id.as_str()))
-            .expect("admit job");
+            .admit(&admitted_job(work_id.as_str())?)
+            .map_err(crate::test_support::ctx("admit job"))?;
 
         let output = stop(
             &ctx,
@@ -263,12 +281,15 @@ mod tests {
             },
         )
         .await
-        .expect("cancel admitted job");
-        let persisted = store.get(&work_id).expect("read cancelled job");
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        .map_err(crate::test_support::ctx("cancel admitted job"))?;
+        let persisted = store
+            .get(&work_id)
+            .map_err(crate::test_support::ctx("read cancelled job"))?;
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         assert_eq!(persisted.job.state, JobState::Cancelled);
         assert!(output.text.contains(work_id.as_str()));
         assert!(output.text.contains(&persisted.revision.to_string()));
+        Ok(())
     }
 }

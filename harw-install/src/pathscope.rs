@@ -165,28 +165,38 @@ impl PathScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn scope() -> PathScope {
         PathScope::new("/srv/harw")
     }
 
     #[test]
-    fn test_resolve_nested_relative_ok() {
-        let got = scope().resolve("a/b.toml").expect("innerhalb root erlaubt");
+    fn test_resolve_nested_relative_ok() -> TestResult {
+        let got = scope()
+            .resolve("a/b.toml")
+            .map_err(ctx("innerhalb root erlaubt"))?;
         assert_eq!(got, PathBuf::from("/srv/harw/a/b.toml"));
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_curdir_is_normalized() {
-        let got = scope().resolve("./a/./b.toml").expect("cur-dir erlaubt");
+    fn test_resolve_curdir_is_normalized() -> TestResult {
+        let got = scope()
+            .resolve("./a/./b.toml")
+            .map_err(ctx("cur-dir erlaubt"))?;
         assert_eq!(got, PathBuf::from("/srv/harw/a/b.toml"));
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_parent_dir_within_root_ok() {
+    fn test_resolve_parent_dir_within_root_ok() -> TestResult {
         // Steigt einmal auf, bleibt aber im root.
-        let got = scope().resolve("a/../b.toml").expect("bleibt in root");
+        let got = scope()
+            .resolve("a/../b.toml")
+            .map_err(ctx("bleibt in root"))?;
         assert_eq!(got, PathBuf::from("/srv/harw/b.toml"));
+        Ok(())
     }
 
     #[test]
@@ -208,11 +218,16 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_traversal_input_is_preserved() {
+    fn test_resolve_traversal_input_is_preserved() -> TestResult {
         match scope().resolve("a/../../x") {
             Err(PathError::Traversal { input }) => assert_eq!(input, "a/../../x"),
-            other => panic!("erwartete Traversal, bekam {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartete Traversal, bekam {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]

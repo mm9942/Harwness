@@ -316,6 +316,7 @@ fn parse_cpu_line(rows: &[Vec<String>]) -> Result<Vec<(&'static str, u64)>, Sens
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn rows_from(lines: &[&str]) -> Vec<Vec<String>> {
         lines
@@ -325,12 +326,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_cpu_line_maps_middle_column_not_just_the_first() {
+    fn test_parse_cpu_line_maps_middle_column_not_just_the_first() -> TestResult {
         let rows = rows_from(&[
             "cpu  2255 34 2290 22625563 6290 127 456 0 0 0",
             "cpu0 1132 34 1441 11311718 3675 127 438 0 0 0",
         ]);
-        let fields = parse_cpu_line(&rows).expect("wohlgeformte cpu-Zeile muss geparst werden");
+        let fields =
+            parse_cpu_line(&rows).map_err(ctx("wohlgeformte cpu-Zeile muss geparst werden"))?;
 
         // "system" ist das dritte gemeldete Feld (Index 2) — der Wert aus
         // der Mitte der Zeile, nicht der erste. Nur so belegt der Test, dass
@@ -338,16 +340,13 @@ mod tests {
         // Position 0 und 1 übereinstimmen.
         assert_eq!(fields[2], ("system_jiffies", 2290));
         assert_eq!(fields[0], ("user_jiffies", 2255));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_cpu_line_ignores_per_core_lines() {
-        let rows = rows_from(&[
-            "cpu  10 20 30 40",
-            "cpu0 1 2 3 4",
-            "cpu1 1 2 3 4",
-        ]);
-        let fields = parse_cpu_line(&rows).expect("aggregatzeile muss gefunden werden");
+    fn test_parse_cpu_line_ignores_per_core_lines() -> TestResult {
+        let rows = rows_from(&["cpu  10 20 30 40", "cpu0 1 2 3 4", "cpu1 1 2 3 4"]);
+        let fields = parse_cpu_line(&rows).map_err(ctx("aggregatzeile muss gefunden werden"))?;
         assert_eq!(
             fields,
             vec![
@@ -357,55 +356,80 @@ mod tests {
                 ("idle_jiffies", 40),
             ]
         );
+        Ok(())
     }
 
     #[test]
-    fn test_parse_cpu_line_accepts_extra_trailing_columns() {
+    fn test_parse_cpu_line_accepts_extra_trailing_columns() -> TestResult {
         // Der wichtigste Robustheitsfall: ein künftiger Kernel hängt weitere
         // Spalten an. Der Parser darf daran nicht scheitern.
         let rows = rows_from(&["cpu 1 2 3 4 5 6 7 8 9 10 11 12 13"]);
-        let fields = parse_cpu_line(&rows).expect("zusätzliche Spalten dürfen nicht scheitern");
+        let fields =
+            parse_cpu_line(&rows).map_err(ctx("zusätzliche Spalten dürfen nicht scheitern"))?;
         assert_eq!(fields.len(), FIELD_METRICS.len());
         assert_eq!(fields[9], ("guest_nice_jiffies", 10));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_cpu_line_accepts_minimum_four_fields() {
+    fn test_parse_cpu_line_accepts_minimum_four_fields() -> TestResult {
         let rows = rows_from(&["cpu 1 2 3 4"]);
-        let fields = parse_cpu_line(&rows).expect("vier Felder sind die historische Untergrenze");
+        let fields =
+            parse_cpu_line(&rows).map_err(ctx("vier Felder sind die historische Untergrenze"))?;
         assert_eq!(fields.len(), 4);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_cpu_line_rejects_too_few_fields() {
+    fn test_parse_cpu_line_rejects_too_few_fields() -> TestResult {
         let rows = rows_from(&["cpu 1 2 3"]);
-        let err = parse_cpu_line(&rows).expect_err("drei Felder unterschreiten die Untergrenze");
+        let Err(err) = parse_cpu_line(&rows) else {
+            return Err(TestError::Unexpected(
+                "drei Felder unterschreiten die Untergrenze".to_string(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
         // Inhaltsfreiheit auch im Fehlerfall zu weniger Spalten: der
         // Zeileninhalt darf in der Meldung nicht auftauchen.
         assert!(!err.to_string().contains("cpu 1 2 3"));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_cpu_line_rejects_non_numeric_field_without_leaking_content() {
+    fn test_parse_cpu_line_rejects_non_numeric_field_without_leaking_content() -> TestResult {
         let rows = rows_from(&["cpu 1 not-a-number 3 4"]);
-        let err = parse_cpu_line(&rows).expect_err("nicht-numerischer Wert muss scheitern");
+        let Err(err) = parse_cpu_line(&rows) else {
+            return Err(TestError::Unexpected(
+                "nicht-numerischer Wert muss scheitern".to_string(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
         assert!(!err.to_string().contains("not-a-number"));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_cpu_line_rejects_missing_aggregate_line() {
+    fn test_parse_cpu_line_rejects_missing_aggregate_line() -> TestResult {
         let rows = rows_from(&["cpu0 1 2 3 4", "intr 123 0 0"]);
-        let err = parse_cpu_line(&rows).expect_err("ohne cpu-Zeile muss es scheitern");
+        let Err(err) = parse_cpu_line(&rows) else {
+            return Err(TestError::Unexpected(
+                "ohne cpu-Zeile muss es scheitern".to_string(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_cpu_line_rejects_empty_input() {
+    fn test_parse_cpu_line_rejects_empty_input() -> TestResult {
         let rows: Vec<Vec<String>> = Vec::new();
-        let err = parse_cpu_line(&rows).expect_err("leere Zeilenliste muss scheitern");
+        let Err(err) = parse_cpu_line(&rows) else {
+            return Err(TestError::Unexpected(
+                "leere Zeilenliste muss scheitern".to_string(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
+        Ok(())
     }
 
     #[test]

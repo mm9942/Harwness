@@ -18,9 +18,9 @@
 //!   workflow.json
 //! ```
 
-use std::fs::{self, File};
 #[cfg(not(unix))]
 use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -376,14 +376,12 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> MemoryResult<()> {
         path: tmp.clone(),
         source: e,
     })?;
-    let mut file = open_without_following_symlinks(
-        OpenMode::write_truncate(DEFAULT_CREATE_MODE),
-        &tmp,
-    )
-    .map_err(|e| MemoryError::Io {
-        path: tmp.clone(),
-        source: e,
-    })?;
+    let mut file =
+        open_without_following_symlinks(OpenMode::write_truncate(DEFAULT_CREATE_MODE), &tmp)
+            .map_err(|e| MemoryError::Io {
+                path: tmp.clone(),
+                source: e,
+            })?;
     file.write_all(bytes).map_err(|e| MemoryError::Io {
         path: tmp.clone(),
         source: e,
@@ -556,14 +554,12 @@ impl Memory for FileMemoryStore {
             path: path.clone(),
             source: e,
         })?;
-        let mut file = open_without_following_symlinks(
-            OpenMode::append_create(DEFAULT_CREATE_MODE),
-            &path,
-        )
-        .map_err(|e| MemoryError::Io {
-            path: path.clone(),
-            source: e,
-        })?;
+        let mut file =
+            open_without_following_symlinks(OpenMode::append_create(DEFAULT_CREATE_MODE), &path)
+                .map_err(|e| MemoryError::Io {
+                    path: path.clone(),
+                    source: e,
+                })?;
         writeln!(file, "{line}").map_err(|e| MemoryError::Io {
             path: path.clone(),
             source: e,
@@ -704,6 +700,7 @@ impl Memory for FileMemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     fn tmp_root(tag: &str) -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -712,19 +709,19 @@ mod tests {
     }
 
     #[test]
-    fn maintain_counts_pending_before_promoting_pattern_hints() {
+    fn maintain_counts_pending_before_promoting_pattern_hints() -> TestResult {
         let root = tmp_root("promote");
-        let store = FileMemoryStore::open(&root).unwrap();
+        let store = FileMemoryStore::open(&root).map_err(ctx("open"))?;
         for note in ["first", "second", "third"] {
             store
                 .record(Signal::PatternHint {
                     key: "greeting".to_owned(),
                     note: note.to_owned(),
                 })
-                .unwrap();
+                .map_err(ctx("record"))?;
         }
 
-        let report = store.maintain().unwrap();
+        let report = store.maintain().map_err(ctx("maintain"))?;
         assert_eq!(report.signals_processed, 3);
         assert_eq!(
             report
@@ -735,49 +732,52 @@ mod tests {
         );
         assert_eq!(report.warm_created, 1);
         assert_eq!(
-            fs::read_to_string(root.join("warm/domain/greeting.md")).unwrap(),
+            fs::read_to_string(root.join("warm/domain/greeting.md"))
+                .map_err(ctx("read_to_string"))?,
             "third\n"
         );
-        assert_eq!(store.stats().unwrap().pending_signals, 0);
+        assert_eq!(store.stats().map_err(ctx("stats"))?.pending_signals, 0);
 
-        let second = store.maintain().unwrap();
+        let second = store.maintain().map_err(ctx("maintain"))?;
         assert_eq!(second.signals_processed, 0);
         assert_eq!(second.warm_created, 0);
         let _ = fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[test]
-    fn maintain_demotes_hot_overflow_into_warm() {
+    fn maintain_demotes_hot_overflow_into_warm() -> TestResult {
         let root = tmp_root("demote");
-        let store = FileMemoryStore::open(&root).unwrap();
+        let store = FileMemoryStore::open(&root).map_err(ctx("open"))?;
         let hot = (0..102)
             .map(|line| format!("line-{line}"))
             .collect::<Vec<_>>()
             .join("\n");
-        fs::write(root.join("HOT.md"), format!("{hot}\n")).unwrap();
+        fs::write(root.join("HOT.md"), format!("{hot}\n")).map_err(ctx("write"))?;
 
-        let report = store.maintain().unwrap();
+        let report = store.maintain().map_err(ctx("maintain"))?;
         assert_eq!(
             report.heartbeat.as_ref().map(|heartbeat| heartbeat.demoted),
             Some(2)
         );
-        assert_eq!(store.stats().unwrap().hot_lines, 100);
+        assert_eq!(store.stats().map_err(ctx("stats"))?.hot_lines, 100);
         assert_eq!(
-            fs::read_to_string(root.join("warm/inactive.md")).unwrap(),
+            fs::read_to_string(root.join("warm/inactive.md")).map_err(ctx("read_to_string"))?,
             "line-0\nline-1\n"
         );
         let _ = fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[test]
-    fn stats_counts_hot_overflow_without_relaxing_hot() {
+    fn stats_counts_hot_overflow_without_relaxing_hot() -> TestResult {
         let root = tmp_root("stats-overflow");
-        let store = FileMemoryStore::open(&root).unwrap();
+        let store = FileMemoryStore::open(&root).map_err(ctx("open"))?;
         let hot = (0..101)
             .map(|line| format!("line-{line}"))
             .collect::<Vec<_>>()
             .join("\n");
-        fs::write(root.join("HOT.md"), format!("{hot}\n")).unwrap();
+        fs::write(root.join("HOT.md"), format!("{hot}\n")).map_err(ctx("write"))?;
 
         assert!(matches!(
             store.hot(),
@@ -787,35 +787,37 @@ mod tests {
                 limit_lines: 100,
             }) if tier == "hot"
         ));
-        assert_eq!(store.stats().unwrap().hot_lines, 101);
+        assert_eq!(store.stats().map_err(ctx("stats"))?.hot_lines, 101);
 
-        let report = store.maintain().unwrap();
+        let report = store.maintain().map_err(ctx("maintain"))?;
         assert_eq!(
             report.heartbeat.as_ref().map(|heartbeat| heartbeat.demoted),
             Some(1)
         );
-        assert_eq!(store.stats().unwrap().hot_lines, 100);
+        assert_eq!(store.stats().map_err(ctx("stats"))?.hot_lines, 100);
         let _ = fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn namespace_discovery_skips_symlinked_files_and_directories() {
+    fn namespace_discovery_skips_symlinked_files_and_directories() -> TestResult {
         use std::os::unix::fs::symlink;
 
         let root = tmp_root("symlink-guard");
         let outside = tmp_root("symlink-target");
-        let store = FileMemoryStore::open(&root).unwrap();
+        let store = FileMemoryStore::open(&root).map_err(ctx("open"))?;
 
-        fs::create_dir_all(root.join("warm/nested")).unwrap();
-        fs::write(root.join("warm/nested/kept.md"), "warm content\n").unwrap();
-        fs::write(root.join("cold/kept.md"), "cold content\n").unwrap();
+        fs::create_dir_all(root.join("warm/nested")).map_err(ctx("create_dir_all"))?;
+        fs::write(root.join("warm/nested/kept.md"), "warm content\n").map_err(ctx("write"))?;
+        fs::write(root.join("cold/kept.md"), "cold content\n").map_err(ctx("write"))?;
 
-        fs::create_dir_all(outside.join("directory")).unwrap();
-        fs::write(outside.join("secret.md"), "outside file\n").unwrap();
-        fs::write(outside.join("directory/secret.md"), "outside directory\n").unwrap();
-        symlink(outside.join("secret.md"), root.join("warm/linked.md")).unwrap();
-        symlink(outside.join("directory"), root.join("cold/linked")).unwrap();
+        fs::create_dir_all(outside.join("directory")).map_err(ctx("create_dir_all"))?;
+        fs::write(outside.join("secret.md"), "outside file\n").map_err(ctx("write"))?;
+        fs::write(outside.join("directory/secret.md"), "outside directory\n")
+            .map_err(ctx("write"))?;
+        symlink(outside.join("secret.md"), root.join("warm/linked.md")).map_err(ctx("symlink"))?;
+        symlink(outside.join("directory"), root.join("cold/linked")).map_err(ctx("symlink"))?;
 
         let entries = store
             .recall(RecallQuery {
@@ -824,7 +826,7 @@ mod tests {
                 include_cold: true,
                 limit: 10,
             })
-            .unwrap();
+            .map_err(ctx("recall"))?;
         let namespaces: Vec<_> = entries
             .iter()
             .map(|entry| entry.namespace.as_str())
@@ -836,28 +838,29 @@ mod tests {
                 .all(|entry| !entry.content.contains("outside"))
         );
 
-        let stats = store.stats().unwrap();
+        let stats = store.stats().map_err(ctx("stats"))?;
         assert_eq!(stats.warm_namespaces, 1);
         assert_eq!(stats.cold_namespaces, 1);
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn namespace_discovery_skips_a_symlinked_tier_root() {
+    fn namespace_discovery_skips_a_symlinked_tier_root() -> TestResult {
         use std::os::unix::fs::symlink;
 
         let root = tmp_root("symlinked-tier-root");
         let outside = tmp_root("symlinked-tier-target");
-        let store = FileMemoryStore::open(&root).unwrap();
+        let store = FileMemoryStore::open(&root).map_err(ctx("open"))?;
 
-        fs::create_dir_all(&outside).unwrap();
-        fs::write(outside.join("secret.md"), "outside warm content\n").unwrap();
-        fs::remove_dir(root.join("warm")).unwrap();
-        symlink(&outside, root.join("warm")).unwrap();
-        fs::write(root.join("cold/kept.md"), "cold content\n").unwrap();
+        fs::create_dir_all(&outside).map_err(ctx("create_dir_all"))?;
+        fs::write(outside.join("secret.md"), "outside warm content\n").map_err(ctx("write"))?;
+        fs::remove_dir(root.join("warm")).map_err(ctx("remove_dir"))?;
+        symlink(&outside, root.join("warm")).map_err(ctx("symlink"))?;
+        fs::write(root.join("cold/kept.md"), "cold content\n").map_err(ctx("write"))?;
 
         let entries = store
             .recall(RecallQuery {
@@ -866,37 +869,38 @@ mod tests {
                 include_cold: true,
                 limit: 10,
             })
-            .unwrap();
+            .map_err(ctx("recall"))?;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].namespace, "kept");
         assert_eq!(entries[0].tier, Tier::Cold);
-        assert_eq!(store.stats().unwrap().warm_namespaces, 0);
+        assert_eq!(store.stats().map_err(ctx("stats"))?.warm_namespaces, 0);
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn fixed_authority_files_reject_symlink_indirection() {
+    fn fixed_authority_files_reject_symlink_indirection() -> TestResult {
         use std::os::unix::fs::symlink;
 
         let root = tmp_root("fixed-file-symlinks");
         let outside = tmp_root("fixed-file-targets");
-        let store = FileMemoryStore::open(&root).unwrap();
-        fs::create_dir_all(&outside).unwrap();
+        let store = FileMemoryStore::open(&root).map_err(ctx("open"))?;
+        fs::create_dir_all(&outside).map_err(ctx("create_dir_all"))?;
 
         let hot_target = outside.join("hot.md");
         let state_target = outside.join("state.json");
         let workflow_target = outside.join("workflow.json");
         let signal_target = outside.join("corrections.jsonl");
         for target in [&hot_target, &state_target, &workflow_target, &signal_target] {
-            fs::write(target, "outside authority\n").unwrap();
+            fs::write(target, "outside authority\n").map_err(ctx("write"))?;
         }
-        symlink(&hot_target, root.join("HOT.md")).unwrap();
-        symlink(&state_target, root.join("state.json")).unwrap();
-        symlink(&workflow_target, root.join("workflow.json")).unwrap();
-        symlink(&signal_target, root.join("signals/corrections.jsonl")).unwrap();
+        symlink(&hot_target, root.join("HOT.md")).map_err(ctx("symlink"))?;
+        symlink(&state_target, root.join("state.json")).map_err(ctx("symlink"))?;
+        symlink(&workflow_target, root.join("workflow.json")).map_err(ctx("symlink"))?;
+        symlink(&signal_target, root.join("signals/corrections.jsonl")).map_err(ctx("symlink"))?;
 
         assert!(matches!(
             store.hot(),
@@ -939,10 +943,14 @@ mod tests {
         ));
 
         for target in [&hot_target, &state_target, &workflow_target, &signal_target] {
-            assert_eq!(fs::read_to_string(target).unwrap(), "outside authority\n");
+            assert_eq!(
+                fs::read_to_string(target).map_err(ctx("read_to_string"))?,
+                "outside authority\n"
+            );
         }
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
+        Ok(())
     }
 }

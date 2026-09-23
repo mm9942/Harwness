@@ -321,6 +321,7 @@ pub fn apply_messages_cache_control(body: &mut Value, strategy: CacheStrategy) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn resolve_dashscope_kimi_k3_is_implicit() {
@@ -432,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_chat_cache_control_never_exceeds_max_breakpoints() {
+    fn apply_chat_cache_control_never_exceeds_max_breakpoints() -> TestResult {
         let mut messages = vec![serde_json::json!({ "role": "system", "content": "sys" })];
         for i in 0..60 {
             messages.push(serde_json::json!({ "role": "user", "content": format!("m{i}") }));
@@ -445,7 +446,7 @@ mod tests {
 
         let marker_count = body["messages"]
             .as_array()
-            .unwrap()
+            .ok_or(TestError::Missing("messages array"))?
             .iter()
             .filter(|message| {
                 message["content"].as_array().is_some_and(|content| {
@@ -456,6 +457,7 @@ mod tests {
             })
             .count();
         assert!(marker_count <= 4);
+        Ok(())
     }
 
     #[test]

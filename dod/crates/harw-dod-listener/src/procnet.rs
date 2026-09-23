@@ -308,7 +308,10 @@ fn read_table(scope: &ReadScope, path: &Path) -> Result<Vec<String>, SensorError
 ///
 /// # Concurrency
 /// Zustandslos; von jedem Thread parallel aufrufbar.
-pub fn collect_listeners(scope: &ReadScope, root: &Path) -> Result<Vec<ListenerRecord>, SensorError> {
+pub fn collect_listeners(
+    scope: &ReadScope,
+    root: &Path,
+) -> Result<Vec<ListenerRecord>, SensorError> {
     let mut records = Vec::new();
     for (relative, expected_state) in [
         ("net/tcp", TCP_LISTEN_STATE),
@@ -330,6 +333,7 @@ pub fn collect_listeners(scope: &ReadScope, root: &Path) -> Result<Vec<ListenerR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Baut eine realistische Datenzeile mit wählbarem Zustand, lokalem Port
     /// und Inode; die übrigen Spalten sind feste, plausible Platzhalter.
@@ -340,80 +344,96 @@ mod tests {
         )
     }
 
-    const HEADER: &str =
-        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode";
+    const HEADER: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode";
 
     #[test]
-    fn test_parse_listener_line_state_0a_is_recognized_as_listener() {
+    fn test_parse_listener_line_state_0a_is_recognized_as_listener() -> TestResult {
         let line = data_line("0A", "0050", 12345);
         let record = parse_listener_line(&line, TCP_LISTEN_STATE)
-            .expect("wohlgeformte Zeile")
-            .expect("Zustand 0A muss als Listener erkannt werden");
+            .map_err(ctx("wohlgeformte Zeile"))?
+            .ok_or(TestError::Missing(
+                "Zustand 0A muss als Listener erkannt werden",
+            ))?;
         assert_eq!(record.port, 80);
         assert_eq!(record.inode, 12345);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_listener_line_other_state_is_not_a_listener() {
+    fn test_parse_listener_line_other_state_is_not_a_listener() -> TestResult {
         let line = data_line("01", "0050", 12345);
         assert_eq!(
-            parse_listener_line(&line, TCP_LISTEN_STATE).expect("wohlgeformte Zeile"),
+            parse_listener_line(&line, TCP_LISTEN_STATE).map_err(ctx("wohlgeformte Zeile"))?,
             None,
             "nur Zustand 0A darf für eine TCP-Tabelle als Listener zählen"
         );
+        Ok(())
     }
 
     /// Port über 255 prüft, dass alle vier Hexziffern gelesen werden — ein
     /// Fehler, der nur zwei Ziffern läse, wäre für Ports unter 256 zufällig
     /// noch korrekt (siehe Doku von `parse_local_port`).
     #[test]
-    fn test_parse_listener_line_reads_port_above_255_correctly() {
+    fn test_parse_listener_line_reads_port_above_255_correctly() -> TestResult {
         let line = data_line("0A", "1F90", 99);
         let record = parse_listener_line(&line, TCP_LISTEN_STATE)
-            .expect("wohlgeformte Zeile")
-            .expect("Zustand 0A");
+            .map_err(ctx("wohlgeformte Zeile"))?
+            .ok_or(TestError::Missing("Zustand 0A"))?;
         assert_eq!(record.port, 8080);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_listener_line_works_for_ipv6_style_address() {
+    fn test_parse_listener_line_works_for_ipv6_style_address() -> TestResult {
         let line = "   0: 00000000000000000000000000000000:1F90 \
                      00000000000000000000000000000000:0000 0A 00000000:00000000 \
                      00:00000000 00000000  1000        0 54321 1 0000000000000000 100 0 0 10 0";
         let record = parse_listener_line(line, TCP_LISTEN_STATE)
-            .expect("wohlgeformte IPv6-Zeile")
-            .expect("Zustand 0A");
+            .map_err(ctx("wohlgeformte IPv6-Zeile"))?
+            .ok_or(TestError::Missing("Zustand 0A"))?;
         assert_eq!(record.port, 8080);
         assert_eq!(record.inode, 54321);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_listener_line_header_row_is_not_a_listener_and_not_an_error() {
+    fn test_parse_listener_line_header_row_is_not_a_listener_and_not_an_error() -> TestResult {
         assert_eq!(
-            parse_listener_line(HEADER, TCP_LISTEN_STATE).expect("Kopfzeile hat genug Spalten"),
+            parse_listener_line(HEADER, TCP_LISTEN_STATE)
+                .map_err(ctx("Kopfzeile hat genug Spalten"))?,
             None
         );
+        Ok(())
     }
 
     #[test]
-    fn test_parse_listener_line_too_few_columns_is_malformed_without_line_content_in_message() {
+    fn test_parse_listener_line_too_few_columns_is_malformed_without_line_content_in_message()
+    -> TestResult {
         let short_line = "   0: 0100007F:0050 00000000:0000 0A";
-        let err = parse_listener_line(short_line, TCP_LISTEN_STATE)
-            .expect_err("zu wenige Spalten muss scheitern");
+        let Err(err) = parse_listener_line(short_line, TCP_LISTEN_STATE) else {
+            return Err(TestError::Unexpected(
+                "zu wenige Spalten muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
         let message = err.to_string();
         assert!(
             !message.contains("0100007F"),
             "die Fehlermeldung darf den Zeileninhalt nicht enthalten: {message}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_parse_listener_line_non_hex_port_is_malformed() {
+    fn test_parse_listener_line_non_hex_port_is_malformed() -> TestResult {
         let line = data_line("0A", "ZZZZ", 1);
-        let err = parse_listener_line(&line, TCP_LISTEN_STATE)
-            .expect_err("nicht-hexadezimaler Port muss scheitern");
+        let Err(err) = parse_listener_line(&line, TCP_LISTEN_STATE) else {
+            return Err(TestError::Unexpected(
+                "nicht-hexadezimaler Port muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
+        Ok(())
     }
 
     // --- F-065-Nachtrag: UDP braucht `07`, nicht `0A` -----------------------
@@ -422,13 +442,14 @@ mod tests {
     /// Listener zählt (`0A`), darf für eine UDP-Tabelle **nicht** zählen —
     /// UDP-Tabellen werten `07` aus (siehe Moduldokumentation).
     #[test]
-    fn test_parse_listener_line_tcp_listen_state_is_not_udp_unconnected_state() {
+    fn test_parse_listener_line_tcp_listen_state_is_not_udp_unconnected_state() -> TestResult {
         let line = data_line("0A", "0050", 1);
         assert_eq!(
-            parse_listener_line(&line, UDP_UNCONNECTED_STATE).expect("wohlgeformte Zeile"),
+            parse_listener_line(&line, UDP_UNCONNECTED_STATE).map_err(ctx("wohlgeformte Zeile"))?,
             None,
             "der TCP-Zustandscode darf für eine UDP-Tabelle nichts treffen"
         );
+        Ok(())
     }
 
     /// Der eigentliche Regressionsbeleg: ein Zustandscode `07`, wie er in
@@ -436,13 +457,16 @@ mod tests {
     /// als Listener erkannt, wenn er gegen [`UDP_UNCONNECTED_STATE`] geprüft
     /// wird.
     #[test]
-    fn test_parse_listener_line_udp_state_07_is_recognized_as_listener() {
+    fn test_parse_listener_line_udp_state_07_is_recognized_as_listener() -> TestResult {
         let line = data_line("07", "A2A9", 11029);
         let record = parse_listener_line(&line, UDP_UNCONNECTED_STATE)
-            .expect("wohlgeformte Zeile")
-            .expect("Zustand 07 muss für UDP als Listener erkannt werden");
+            .map_err(ctx("wohlgeformte Zeile"))?
+            .ok_or(TestError::Missing(
+                "Zustand 07 muss für UDP als Listener erkannt werden",
+            ))?;
         assert_eq!(record.port, 0xA2A9);
         assert_eq!(record.inode, 11029);
+        Ok(())
     }
 
     /// End-to-End über `collect_listeners` mit den beiden realen
@@ -451,11 +475,11 @@ mod tests {
     /// den F-065-Nachtrag: vor dieser Korrektur hätte keine der beiden
     /// Zeilen je einen Treffer erzeugt.
     #[test]
-    fn test_collect_listeners_recognizes_real_udp_capture_lines() {
+    fn test_collect_listeners_recognizes_real_udp_capture_lines() -> TestResult {
         const HEADER_UDP: &str = "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops";
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let net_dir = dir.path().join("net");
-        std::fs::create_dir_all(&net_dir).expect("net-Verzeichnis anlegen");
+        std::fs::create_dir_all(&net_dir).map_err(ctx("net-Verzeichnis anlegen"))?;
         // Wörtlich aus `harw-dod-fixtures/captures/rpi5-6.18/procnet.json`
         // übernommen (zwei gebundene, unverbundene UDP-Sockets, Zustand `07`).
         let content = format!(
@@ -463,15 +487,22 @@ mod tests {
                118: 00000000:A2A9 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 11029 2 00000000e611d66c 0\n\
                694: 00000000:14E9 00000000:0000 07 00000000:00000000 00:00000000 00000000   101        0 7036 2 0000000047b7b231 0\n"
         );
-        std::fs::write(net_dir.join("udp"), content).expect("net/udp schreiben");
+        std::fs::write(net_dir.join("udp"), content).map_err(ctx("net/udp schreiben"))?;
 
         let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
-        let records = collect_listeners(&scope, dir.path()).expect("poll muss gelingen");
+        let records = collect_listeners(&scope, dir.path()).map_err(ctx("poll muss gelingen"))?;
 
         let ports: std::collections::BTreeSet<u16> =
             records.iter().map(|record| record.port).collect();
-        assert!(ports.contains(&0xA2A9), "Port aus `sl 118` muss erkannt werden");
-        assert!(ports.contains(&0x14E9), "Port aus `sl 694` muss erkannt werden");
+        assert!(
+            ports.contains(&0xA2A9),
+            "Port aus `sl 118` muss erkannt werden"
+        );
+        assert!(
+            ports.contains(&0x14E9),
+            "Port aus `sl 694` muss erkannt werden"
+        );
+        Ok(())
     }
 
     // --- F-065: Zeilen-/Gesamtlimit statt Abbruch der gesamten Tabelle ------
@@ -480,32 +511,34 @@ mod tests {
     /// Sockets brauchten, um die frühere 1-MiB-Grenze zu überschreiten,
     /// lässt `read_table` nicht scheitern — sie kappt bei [`MAX_TABLE_LINES`].
     #[test]
-    fn test_read_table_caps_at_max_lines_without_erroring_f065() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_read_table_caps_at_max_lines_without_erroring_f065() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let net_dir = dir.path().join("net");
-        std::fs::create_dir_all(&net_dir).expect("net-Verzeichnis anlegen");
+        std::fs::create_dir_all(&net_dir).map_err(ctx("net-Verzeichnis anlegen"))?;
         let content = "x\n".repeat(MAX_TABLE_LINES + 10);
-        std::fs::write(net_dir.join("tcp"), content).expect("net/tcp schreiben");
+        std::fs::write(net_dir.join("tcp"), content).map_err(ctx("net/tcp schreiben"))?;
         let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
 
-        let lines = read_table(&scope, &net_dir.join("tcp"))
-            .expect("eine sehr lange Tabelle darf den Abruf nicht scheitern lassen");
+        let lines = read_table(&scope, &net_dir.join("tcp")).map_err(ctx(
+            "eine sehr lange Tabelle darf den Abruf nicht scheitern lassen",
+        ))?;
 
         assert_eq!(
             lines.len(),
             MAX_TABLE_LINES,
             "muss bei der Zeilengrenze kappen, nicht scheitern"
         );
+        Ok(())
     }
 
     /// Symmetrischer Beleg für die Byte-Grenze: wenige, aber sehr lange
     /// Zeilen (insgesamt deutlich über [`MAX_TABLE_BYTES`]) lassen den
     /// Abruf ebenfalls nicht scheitern.
     #[test]
-    fn test_read_table_caps_at_max_bytes_without_erroring_f065() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_read_table_caps_at_max_bytes_without_erroring_f065() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let net_dir = dir.path().join("net");
-        std::fs::create_dir_all(&net_dir).expect("net-Verzeichnis anlegen");
+        std::fs::create_dir_all(&net_dir).map_err(ctx("net-Verzeichnis anlegen"))?;
         let long_line = "y".repeat(4 * 1024 * 1024); // 4 MiB je Zeile
         let mut content = String::new();
         for _ in 0..5 {
@@ -513,11 +546,12 @@ mod tests {
             content.push('\n');
         }
         // 5 * 4 MiB = 20 MiB, deutlich über MAX_TABLE_BYTES (16 MiB).
-        std::fs::write(net_dir.join("tcp"), &content).expect("net/tcp schreiben");
+        std::fs::write(net_dir.join("tcp"), &content).map_err(ctx("net/tcp schreiben"))?;
         let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
 
-        let lines = read_table(&scope, &net_dir.join("tcp"))
-            .expect("eine sehr große Tabelle darf den Abruf nicht scheitern lassen");
+        let lines = read_table(&scope, &net_dir.join("tcp")).map_err(ctx(
+            "eine sehr große Tabelle darf den Abruf nicht scheitern lassen",
+        ))?;
 
         let total_bytes: usize = lines.iter().map(String::len).sum();
         assert!(
@@ -528,35 +562,42 @@ mod tests {
             lines.len() < 5,
             "mindestens eine der fünf 4-MiB-Zeilen darf nicht mehr ankommen"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_read_table_missing_file_yields_empty_lines_not_an_error() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_read_table_missing_file_yields_empty_lines_not_an_error() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
 
         let lines = read_table(&scope, &dir.path().join("net").join("tcp6"))
-            .expect("eine fehlende Tabelle darf nicht scheitern");
+            .map_err(ctx("eine fehlende Tabelle darf nicht scheitern"))?;
         assert!(lines.is_empty());
+        Ok(())
     }
 
     /// Scope-Dichtheit: `collect_listeners` liest niemals außerhalb des
     /// übergebenen `ReadScope`, selbst wenn `root` auf ein tatsächlich
     /// existierendes Verzeichnis zeigt.
     #[test]
-    fn test_collect_listeners_rejects_root_outside_scope() {
-        let real_root = tempfile::tempdir().expect("tempdir für die echte Wurzel");
-        let other_root = tempfile::tempdir().expect("tempdir außerhalb des Bereichs");
-        std::fs::create_dir_all(real_root.path().join("net")).expect("net-Verzeichnis anlegen");
+    fn test_collect_listeners_rejects_root_outside_scope() -> TestResult {
+        let real_root = tempfile::tempdir().map_err(ctx("tempdir für die echte Wurzel"))?;
+        let other_root = tempfile::tempdir().map_err(ctx("tempdir außerhalb des Bereichs"))?;
+        std::fs::create_dir_all(real_root.path().join("net"))
+            .map_err(ctx("net-Verzeichnis anlegen"))?;
         std::fs::write(
             real_root.path().join("net").join("tcp"),
             data_line("0A", "0050", 1),
         )
-        .expect("net/tcp schreiben");
+        .map_err(ctx("net/tcp schreiben"))?;
 
         let scope = ReadScope::from_roots([other_root.path().to_path_buf()]);
-        let err = collect_listeners(&scope, real_root.path())
-            .expect_err("eine Wurzel außerhalb des Bereichs muss scheitern");
+        let Err(err) = collect_listeners(&scope, real_root.path()) else {
+            return Err(TestError::Unexpected(
+                "eine Wurzel außerhalb des Bereichs muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, SensorError::OutsideScope));
+        Ok(())
     }
 }

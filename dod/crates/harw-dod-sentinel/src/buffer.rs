@@ -355,6 +355,7 @@ fn utilization(len: usize, capacity: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::EvidenceBuffer;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_dod_signals::{EventKind, HostSample, SecurityEvent};
     use harw_types::SensorId;
     use jiff::Timestamp;
@@ -396,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn test_push_event_overwrites_oldest_when_capacity_exceeded() {
+    fn test_push_event_overwrites_oldest_when_capacity_exceeded() -> TestResult {
         let mut buffer = EvidenceBuffer::new(2, 2);
         buffer.push_event(event(1));
         buffer.push_event(event(2));
@@ -404,11 +405,14 @@ mod tests {
         let ports: Vec<u16> = buffer
             .events()
             .map(|e| match e.kind {
-                EventKind::ListenerOpened { port } => port,
-                _ => unreachable!("test fixture only produces ListenerOpened"),
+                EventKind::ListenerOpened { port } => Ok(port),
+                _ => Err(TestError::Unexpected(
+                    "test fixture only produces ListenerOpened".into(),
+                )),
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(ports, vec![2, 3]);
+        Ok(())
     }
 
     #[test]
@@ -447,38 +451,46 @@ mod tests {
     }
 
     #[test]
-    fn test_freeze_digest_is_stable_across_calls_without_new_entries() {
+    fn test_freeze_digest_is_stable_across_calls_without_new_entries() -> TestResult {
         let mut buffer = EvidenceBuffer::new(4, 4);
         buffer.push_sample(sample(1.0));
         buffer.push_event(event(80));
 
         let first = buffer
             .freeze(Timestamp::UNIX_EPOCH)
-            .expect("well-formed buffer content always encodes");
+            .map_err(ctx("well-formed buffer content always encodes"))?;
         let second = buffer
             .freeze(Timestamp::UNIX_EPOCH)
-            .expect("well-formed buffer content always encodes");
+            .map_err(ctx("well-formed buffer content always encodes"))?;
 
         assert_eq!(first.digest, second.digest);
         assert_eq!(first, second);
+        Ok(())
     }
 
     #[test]
-    fn test_freeze_preserves_ring_order() {
+    fn test_freeze_preserves_ring_order() -> TestResult {
         let mut buffer = EvidenceBuffer::new(4, 4);
         buffer.push_sample(sample(1.0));
         buffer.push_sample(sample(2.0));
 
         let evidence = buffer
             .freeze(Timestamp::UNIX_EPOCH)
-            .expect("well-formed buffer content always encodes");
+            .map_err(ctx("well-formed buffer content always encodes"))?;
         assert_eq!(evidence.samples, vec![sample(1.0), sample(2.0)]);
+        Ok(())
     }
 
     #[test]
     fn test_default_buffer_uses_documented_capacities() {
         let buffer = EvidenceBuffer::default();
-        assert_eq!(buffer.sample_capacity(), EvidenceBuffer::DEFAULT_SAMPLE_CAPACITY);
-        assert_eq!(buffer.event_capacity(), EvidenceBuffer::DEFAULT_EVENT_CAPACITY);
+        assert_eq!(
+            buffer.sample_capacity(),
+            EvidenceBuffer::DEFAULT_SAMPLE_CAPACITY
+        );
+        assert_eq!(
+            buffer.event_capacity(),
+            EvidenceBuffer::DEFAULT_EVENT_CAPACITY
+        );
     }
 }

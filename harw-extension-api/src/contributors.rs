@@ -246,7 +246,10 @@ pub trait ContextProvider: Send + Sync {
     /// assert_eq!(fragments.len(), 1);
     /// assert_eq!(fragments[0].trust, TrustClass::Data);
     /// ```
-    fn contribute_v2<'a>(&'a self, ctx: &'a TurnInputContext) -> ExtFuture<'a, Vec<harw_context::Fragment>> {
+    fn contribute_v2<'a>(
+        &'a self,
+        ctx: &'a TurnInputContext,
+    ) -> ExtFuture<'a, Vec<harw_context::Fragment>> {
         let legacy = self.contribute(ctx);
         Box::pin(async move {
             legacy
@@ -346,6 +349,7 @@ pub trait TurnObserver: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestResult;
     use harw_context::Stability;
     use std::task::{Context, Poll, Waker};
 
@@ -375,7 +379,10 @@ mod tests {
     struct PlainProvider;
 
     impl ContextProvider for PlainProvider {
-        fn contribute<'a>(&'a self, _ctx: &'a TurnInputContext) -> ExtFuture<'a, Vec<ContextFragment>> {
+        fn contribute<'a>(
+            &'a self,
+            _ctx: &'a TurnInputContext,
+        ) -> ExtFuture<'a, Vec<ContextFragment>> {
             Box::pin(async {
                 vec![ContextFragment {
                     label: "project.root".to_owned(),
@@ -390,7 +397,10 @@ mod tests {
     struct EnrichedProvider;
 
     impl ContextProvider for EnrichedProvider {
-        fn contribute<'a>(&'a self, _ctx: &'a TurnInputContext) -> ExtFuture<'a, Vec<ContextFragment>> {
+        fn contribute<'a>(
+            &'a self,
+            _ctx: &'a TurnInputContext,
+        ) -> ExtFuture<'a, Vec<ContextFragment>> {
             // Wird von diesem Test nicht erwartet aufgerufen zu werden --
             // `contribute_v2` ist direkt überschrieben und darf nicht auf
             // die Vorgabe (die `contribute` aufruft) zurückfallen.
@@ -403,10 +413,20 @@ mod tests {
         ) -> ExtFuture<'a, Vec<harw_context::Fragment>> {
             Box::pin(async {
                 let body = "verified plan snapshot".to_owned();
+                // Feste, gültige Test-Literale ("plan.current"/"plan") -- dieser
+                // Zweig ist unerreichbar, aber `contribute_v2` liefert per Trait
+                // `Vec<Fragment>` ohne `Result`, daher kein `?`/Panik: ein
+                // Fehlschlag würde ein leeres Ergebnis liefern, das die
+                // Test-Assertion (`fragments.len()`) sichtbar macht.
+                let (Ok(label), Ok(section)) = (
+                    harw_context::FragmentLabel::try_new("plan.current"),
+                    harw_context::SectionName::try_new("plan"),
+                ) else {
+                    return Vec::new();
+                };
                 vec![harw_context::Fragment {
-                    label: harw_context::FragmentLabel::try_new("plan.current")
-                        .expect("valid label"),
-                    section: harw_context::SectionName::try_new("plan").expect("valid section"),
+                    label,
+                    section,
                     trust: TrustClass::Evidence,
                     stability: Stability::Pinned,
                     origin: harw_context::FragmentOrigin {
@@ -427,17 +447,19 @@ mod tests {
     /// `contribute`-Ergebnis manuell durch `fragment_from_v1` schicken --
     /// keine abweichende, zweite Abbildung entsteht durch die Vorgabe.
     #[test]
-    fn contribute_v2_default_matches_fragment_from_v1_of_contribute_result() {
+    fn contribute_v2_default_matches_fragment_from_v1_of_contribute_result() -> TestResult {
         let provider = PlainProvider;
 
         let via_default = block_on(provider.contribute_v2(&ctx()));
         let legacy = block_on(provider.contribute(&ctx()));
         let via_manual_bridge: Vec<harw_context::Fragment> = legacy
             .iter()
-            .map(|f| fragment_from_v1(f, V1_BRIDGE_TIMESTAMP).expect("valid v1 label converts"))
-            .collect();
+            .map(|f| fragment_from_v1(f, V1_BRIDGE_TIMESTAMP))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(crate::test_support::ctx("valid v1 label converts"))?;
 
         assert_eq!(via_default, via_manual_bridge);
+        Ok(())
     }
 
     /// Die Vorgabe setzt die niedrigste Vertrauensklasse und `Fresh` --
@@ -489,7 +511,10 @@ mod tests {
     struct EmptyLabelProvider;
 
     impl ContextProvider for EmptyLabelProvider {
-        fn contribute<'a>(&'a self, _ctx: &'a TurnInputContext) -> ExtFuture<'a, Vec<ContextFragment>> {
+        fn contribute<'a>(
+            &'a self,
+            _ctx: &'a TurnInputContext,
+        ) -> ExtFuture<'a, Vec<ContextFragment>> {
             Box::pin(async {
                 vec![ContextFragment {
                     label: String::new(),
@@ -543,7 +568,10 @@ mod tests {
     struct EmptyLabelOverrideProvider;
 
     impl ContextProvider for EmptyLabelOverrideProvider {
-        fn contribute<'a>(&'a self, _ctx: &'a TurnInputContext) -> ExtFuture<'a, Vec<ContextFragment>> {
+        fn contribute<'a>(
+            &'a self,
+            _ctx: &'a TurnInputContext,
+        ) -> ExtFuture<'a, Vec<ContextFragment>> {
             // Absichtlich ein leeres Label -- würde dieser Pfad je über die
             // Vorgabe-Brücke laufen, würde er normalisiert. Er soll aber nie
             // aufgerufen werden, weil `contribute_v2` unten direkt überschrieben ist.
@@ -561,9 +589,19 @@ mod tests {
         ) -> ExtFuture<'a, Vec<harw_context::Fragment>> {
             Box::pin(async {
                 let body = "own fragment, own label".to_owned();
+                // Feste, gültige Test-Literale ("own.label"/"own") -- siehe
+                // Begründung bei `EnrichedProvider::contribute_v2` oben: kein
+                // `Result` im Trait-Rückgabetyp, daher leeres Ergebnis statt
+                // Panik im (unerreichbaren) Fehlerzweig.
+                let (Ok(label), Ok(section)) = (
+                    harw_context::FragmentLabel::try_new("own.label"),
+                    harw_context::SectionName::try_new("own"),
+                ) else {
+                    return Vec::new();
+                };
                 vec![harw_context::Fragment {
-                    label: harw_context::FragmentLabel::try_new("own.label").expect("valid label"),
-                    section: harw_context::SectionName::try_new("own").expect("valid section"),
+                    label,
+                    section,
                     trust: TrustClass::Evidence,
                     stability: Stability::Pinned,
                     origin: harw_context::FragmentOrigin {
@@ -632,7 +670,10 @@ mod tests {
 
     #[test]
     fn approval_handler_kind_and_label_can_be_overridden() {
-        assert_eq!(NamedApprovalHandler.kind(), ApprovalHandlerKind::Interactive);
+        assert_eq!(
+            NamedApprovalHandler.kind(),
+            ApprovalHandlerKind::Interactive
+        );
         assert_eq!(NamedApprovalHandler.label(), "named-handler");
     }
 }

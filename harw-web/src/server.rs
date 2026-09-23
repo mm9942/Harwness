@@ -181,7 +181,8 @@ type WebResponse = Response<BoxBody<Bytes, Infallible>>;
 /// wird, die [`crate::router::decide_route`] gar nicht freigegeben hat. Die
 /// Implementierung MUSS `sandbox`/`services` aus serverseitig vertrauter
 /// Konfiguration ableiten, niemals aus dem HTTP-Request.
-pub type WebContextFactory = dyn Fn(&PeerCredentials, PermissionTier) -> OpContext + Send + Sync + 'static;
+pub type WebContextFactory =
+    dyn Fn(&PeerCredentials, PermissionTier) -> OpContext + Send + Sync + 'static;
 
 /// Konfiguration für [`BoundWebServer::bind`].
 #[derive(Debug, Clone)]
@@ -433,7 +434,8 @@ async fn bind_unix_listener(path: &Path) -> Result<UnixListener, WebError> {
                     path: path_display(),
                 });
             }
-            let probe = tokio::time::timeout(STALE_SOCKET_PROBE_TIMEOUT, UnixStream::connect(path)).await;
+            let probe =
+                tokio::time::timeout(STALE_SOCKET_PROBE_TIMEOUT, UnixStream::connect(path)).await;
             match probe {
                 Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
                     // Toter Socket: niemand lauscht mehr — nur dieser Fall
@@ -492,7 +494,13 @@ fn http_connection_builder(header_read_timeout: Duration) -> Builder<TokioExecut
 /// Betriebssystem-Fehlernummer.
 fn is_fatal_accept_error(error: &std::io::Error) -> bool {
     use rustix::io::Errno;
-    const FATAL: [Errno; 5] = [Errno::BADF, Errno::NOTSOCK, Errno::INVAL, Errno::FAULT, Errno::OPNOTSUPP];
+    const FATAL: [Errno; 5] = [
+        Errno::BADF,
+        Errno::NOTSOCK,
+        Errno::INVAL,
+        Errno::FAULT,
+        Errno::OPNOTSUPP,
+    ];
     Errno::from_io_error(error).is_some_and(|errno| FATAL.contains(&errno))
 }
 
@@ -739,7 +747,9 @@ async fn read_json_body(
 /// `TrustClass` (siehe `crate::events`-Moduldoku), daher immer
 /// [`harw_context::TrustClass::Data`] — die niedrigste Klasse, nie eine
 /// erfundene.
-fn op_result_response(result: Result<harw_operations::operation::OpOutput, OpError>) -> WebResponse {
+fn op_result_response(
+    result: Result<harw_operations::operation::OpOutput, OpError>,
+) -> WebResponse {
     match result {
         Ok(output) => {
             let mut body = serde_json::json!({
@@ -808,16 +818,17 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ACCEPT_BACKOFF_BASE, ACCEPT_BACKOFF_MAX, BoundWebServer, HEADER_READ_TIMEOUT, MAX_BODY_BYTES,
-        WebContextFactory, WebServerConfig, accept_backoff, bind_unix_listener, forbidden_reason_str,
-        http_connection_builder, is_fatal_accept_error, json_response, method_not_allowed_response,
-        op_result_response, read_json_body, status_for_op_error,
+        ACCEPT_BACKOFF_BASE, ACCEPT_BACKOFF_MAX, BoundWebServer, HEADER_READ_TIMEOUT,
+        MAX_BODY_BYTES, WebContextFactory, WebServerConfig, accept_backoff, bind_unix_listener,
+        forbidden_reason_str, http_connection_builder, is_fatal_accept_error, json_response,
+        method_not_allowed_response, op_result_response, read_json_body, status_for_op_error,
     };
     use crate::authz::StaticUidTierMap;
     use crate::error::WebError;
     use crate::events::WebEventBus;
     use crate::peer::PeerCredentials;
     use crate::router::{ForbiddenReason, WebMethod, WebRouteTable};
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_operations::context::OpContext;
     use harw_operations::error::OpError;
     use harw_operations::operation::PermissionTier;
@@ -862,10 +873,10 @@ mod tests {
     /// EOF des Clients kann das Ergebnis also nicht verfälschen. Das
     /// Schreiben läuft nebenläufig, damit ein Server, der nach einer
     /// Ablehnung nicht weiterliest, den Test nicht blockiert.
-    async fn send_and_read_status_line(path: &Path, raw: Vec<u8>) -> String {
+    async fn send_and_read_status_line(path: &Path, raw: Vec<u8>) -> TestResult<String> {
         let stream = UnixStream::connect(path)
             .await
-            .expect("Testserver lauscht am Tempdir-Socket");
+            .map_err(ctx("Testserver lauscht am Tempdir-Socket"))?;
         let (mut reader, mut writer) = stream.into_split();
         let writer_task = tokio::spawn(async move {
             // `EPIPE` ist erwartbar, wenn der Server nach `413` schließt.
@@ -874,9 +885,11 @@ mod tests {
         });
         let status = tokio::time::timeout(TEST_DEADLINE, read_status_line(&mut reader))
             .await
-            .expect("Antwort (oder Verbindungsende) innerhalb der Testfrist");
+            .map_err(ctx(
+                "Antwort (oder Verbindungsende) innerhalb der Testfrist",
+            ))?;
         writer_task.abort();
-        status
+        Ok(status)
     }
 
     /// Bedient genau eine Verbindung mit dem **produktiven**
@@ -897,18 +910,22 @@ mod tests {
                 return;
             };
             let builder = http_connection_builder(header_read_timeout);
-            let _ = builder
-                .serve_connection(
-                    TokioIo::new(stream),
-                    service_fn(move |request| async move {
-                        let response = match read_json_body(request, MAX_BODY_BYTES, body_read_timeout).await {
-                            Ok(value) => json_response(StatusCode::OK, &value),
-                            Err(response) => response,
-                        };
-                        Ok::<_, Infallible>(response)
-                    }),
-                )
-                .await;
+            let _ =
+                builder
+                    .serve_connection(
+                        TokioIo::new(stream),
+                        service_fn(move |request| async move {
+                            let response =
+                                match read_json_body(request, MAX_BODY_BYTES, body_read_timeout)
+                                    .await
+                                {
+                                    Ok(value) => json_response(StatusCode::OK, &value),
+                                    Err(response) => response,
+                                };
+                            Ok::<_, Infallible>(response)
+                        }),
+                    )
+                    .await;
         })
     }
 
@@ -925,8 +942,8 @@ mod tests {
         raw
     }
 
-    fn socket_tempdir() -> tempfile::TempDir {
-        tempfile::tempdir().expect("Tempdir für den Test-Socket anlegbar")
+    fn socket_tempdir() -> TestResult<tempfile::TempDir> {
+        tempfile::tempdir().map_err(ctx("Tempdir für den Test-Socket anlegbar"))
     }
 
     #[test]
@@ -988,21 +1005,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_op_result_response_without_data_keeps_text_trust_shape() {
+    async fn test_op_result_response_without_data_keeps_text_trust_shape() -> TestResult {
         use http_body_util::BodyExt;
-        let output = harw_operations::operation::OpOutput { text: "hallo".to_owned(), data: None };
+        let output = harw_operations::operation::OpOutput {
+            text: "hallo".to_owned(),
+            data: None,
+        };
         let response = op_result_response(Ok(output));
         assert_eq!(response.status(), StatusCode::OK);
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let object = body.as_object().unwrap();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(ctx("Rumpf sollte sich sammeln lassen"))?
+            .to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(ctx("JSON sollte sich dekodieren lassen"))?;
+        let object = body.as_object().ok_or(TestError::Missing("JSON-Objekt"))?;
         assert_eq!(object.get("text"), Some(&serde_json::json!("hallo")));
         assert!(object.contains_key("trust"));
-        assert!(!object.contains_key("data"), "ohne Nutzlast kein data-Feld: {body}");
+        assert!(
+            !object.contains_key("data"),
+            "ohne Nutzlast kein data-Feld: {body}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_op_result_response_with_data_adds_data_field() {
+    async fn test_op_result_response_with_data_adds_data_field() -> TestResult {
         use http_body_util::BodyExt;
         let output = harw_operations::operation::OpOutput {
             text: "2 Einträge".to_owned(),
@@ -1010,11 +1040,18 @@ mod tests {
         };
         let response = op_result_response(Ok(output));
         assert_eq!(response.status(), StatusCode::OK);
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(ctx("Rumpf sollte sich sammeln lassen"))?
+            .to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(ctx("JSON sollte sich dekodieren lassen"))?;
         assert_eq!(body["text"], serde_json::json!("2 Einträge"));
         assert_eq!(body["data"], serde_json::json!({"items": [1, 2]}));
         assert!(body.get("trust").is_some());
+        Ok(())
     }
 
     #[test]
@@ -1031,7 +1068,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_json_response_body_round_trips_through_serde() {
+    async fn test_json_response_body_round_trips_through_serde() -> TestResult {
         use http_body_util::BodyExt;
         let payload = serde_json::json!({"text": "hallo"});
         let response = json_response(StatusCode::OK, &payload);
@@ -1039,120 +1076,169 @@ mod tests {
             .into_body()
             .collect()
             .await
-            .expect("in-memory body always resolves")
+            .map_err(ctx("in-memory body always resolves"))?
             .to_bytes();
-        let decoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(ctx("JSON sollte sich dekodieren lassen"))?;
         assert_eq!(decoded, payload);
+        Ok(())
     }
 
     // ── Echter Unix-Socket: Rumpfgrenze und Timeouts (F-184) ────────────────
 
     #[tokio::test]
-    async fn test_chunked_body_over_limit_in_many_chunks_yields_413() {
-        let dir = socket_tempdir();
+    async fn test_chunked_body_over_limit_in_many_chunks_yields_413() -> TestResult {
+        let dir = socket_tempdir()?;
         let path = dir.path().join("w.sock");
-        let server = spawn_body_reader(UnixListener::bind(&path).unwrap(), HEADER_READ_TIMEOUT, TEST_DEADLINE);
+        let listener =
+            UnixListener::bind(&path).map_err(ctx("UnixListener::bind sollte gelingen"))?;
+        let server = spawn_body_reader(listener, HEADER_READ_TIMEOUT, TEST_DEADLINE);
         // Kein einzelner Chunk überschreitet die Grenze, erst die Summe —
         // genau der Fall, den eine reine `Content-Length`-Prüfung übersieht.
         let chunk = vec![b'a'; 30 * 1024];
         let raw = chunked_post(&[chunk.clone(), chunk.clone(), chunk]);
-        let status = send_and_read_status_line(&path, raw).await;
-        assert!(status.starts_with("HTTP/1.1 413"), "erwartet 413, erhalten: {status:?}");
+        let status = send_and_read_status_line(&path, raw).await?;
+        assert!(
+            status.starts_with("HTTP/1.1 413"),
+            "erwartet 413, erhalten: {status:?}"
+        );
         server.abort();
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_chunked_single_chunk_one_byte_over_limit_yields_413() {
-        let dir = socket_tempdir();
+    async fn test_chunked_single_chunk_one_byte_over_limit_yields_413() -> TestResult {
+        let dir = socket_tempdir()?;
         let path = dir.path().join("w.sock");
-        let server = spawn_body_reader(UnixListener::bind(&path).unwrap(), HEADER_READ_TIMEOUT, TEST_DEADLINE);
+        let listener =
+            UnixListener::bind(&path).map_err(ctx("UnixListener::bind sollte gelingen"))?;
+        let server = spawn_body_reader(listener, HEADER_READ_TIMEOUT, TEST_DEADLINE);
         let raw = chunked_post(&[vec![b' '; MAX_BODY_BYTES + 1]]);
-        let status = send_and_read_status_line(&path, raw).await;
-        assert!(status.starts_with("HTTP/1.1 413"), "erwartet 413, erhalten: {status:?}");
+        let status = send_and_read_status_line(&path, raw).await?;
+        assert!(
+            status.starts_with("HTTP/1.1 413"),
+            "erwartet 413, erhalten: {status:?}"
+        );
         server.abort();
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_chunked_body_within_limit_is_decoded() {
-        let dir = socket_tempdir();
+    async fn test_chunked_body_within_limit_is_decoded() -> TestResult {
+        let dir = socket_tempdir()?;
         let path = dir.path().join("w.sock");
-        let server = spawn_body_reader(UnixListener::bind(&path).unwrap(), HEADER_READ_TIMEOUT, TEST_DEADLINE);
+        let listener =
+            UnixListener::bind(&path).map_err(ctx("UnixListener::bind sollte gelingen"))?;
+        let server = spawn_body_reader(listener, HEADER_READ_TIMEOUT, TEST_DEADLINE);
         let raw = chunked_post(&[b"{\"a\":".to_vec(), b"1}".to_vec()]);
-        let status = send_and_read_status_line(&path, raw).await;
-        assert!(status.starts_with("HTTP/1.1 200"), "erwartet 200, erhalten: {status:?}");
+        let status = send_and_read_status_line(&path, raw).await?;
+        assert!(
+            status.starts_with("HTTP/1.1 200"),
+            "erwartet 200, erhalten: {status:?}"
+        );
         server.abort();
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_declared_content_length_over_limit_yields_413_without_body() {
-        let dir = socket_tempdir();
+    async fn test_declared_content_length_over_limit_yields_413_without_body() -> TestResult {
+        let dir = socket_tempdir()?;
         let path = dir.path().join("w.sock");
-        let server = spawn_body_reader(UnixListener::bind(&path).unwrap(), HEADER_READ_TIMEOUT, TEST_DEADLINE);
+        let listener =
+            UnixListener::bind(&path).map_err(ctx("UnixListener::bind sollte gelingen"))?;
+        let server = spawn_body_reader(listener, HEADER_READ_TIMEOUT, TEST_DEADLINE);
         let raw = format!(
             "POST /api/x HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
             MAX_BODY_BYTES + 1
         )
         .into_bytes();
-        let status = send_and_read_status_line(&path, raw).await;
-        assert!(status.starts_with("HTTP/1.1 413"), "erwartet 413, erhalten: {status:?}");
+        let status = send_and_read_status_line(&path, raw).await?;
+        assert!(
+            status.starts_with("HTTP/1.1 413"),
+            "erwartet 413, erhalten: {status:?}"
+        );
         server.abort();
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_stalled_body_yields_408_after_body_read_timeout() {
-        let dir = socket_tempdir();
+    async fn test_stalled_body_yields_408_after_body_read_timeout() -> TestResult {
+        let dir = socket_tempdir()?;
         let path = dir.path().join("w.sock");
-        let server = spawn_body_reader(
-            UnixListener::bind(&path).unwrap(),
-            HEADER_READ_TIMEOUT,
-            Duration::from_millis(100),
-        );
+        let listener =
+            UnixListener::bind(&path).map_err(ctx("UnixListener::bind sollte gelingen"))?;
+        let server = spawn_body_reader(listener, HEADER_READ_TIMEOUT, Duration::from_millis(100));
         // 20 Byte angekündigt, 4 gesendet, Verbindung bleibt offen.
-        let raw = b"POST /api/x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 20\r\n\r\n{\"a\"".to_vec();
-        let status = send_and_read_status_line(&path, raw).await;
-        assert!(status.starts_with("HTTP/1.1 408"), "erwartet 408, erhalten: {status:?}");
+        let raw =
+            b"POST /api/x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 20\r\n\r\n{\"a\"".to_vec();
+        let status = send_and_read_status_line(&path, raw).await?;
+        assert!(
+            status.starts_with("HTTP/1.1 408"),
+            "erwartet 408, erhalten: {status:?}"
+        );
         server.abort();
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_incomplete_headers_close_connection_after_header_read_timeout() {
-        let dir = socket_tempdir();
+    async fn test_incomplete_headers_close_connection_after_header_read_timeout() -> TestResult {
+        let dir = socket_tempdir()?;
         let path = dir.path().join("w.sock");
-        let server = spawn_body_reader(
-            UnixListener::bind(&path).unwrap(),
-            Duration::from_millis(100),
-            TEST_DEADLINE,
-        );
+        let listener =
+            UnixListener::bind(&path).map_err(ctx("UnixListener::bind sollte gelingen"))?;
+        let server = spawn_body_reader(listener, Duration::from_millis(100), TEST_DEADLINE);
         // Kopf nie abgeschlossen (kein Leerzeilen-Ende); die Schreibhälfte
         // bleibt offen — das Verbindungsende kann nur vom Server kommen.
         let raw = b"GET / HTTP/1.1\r\nHost: localhost\r\n".to_vec();
-        let status = send_and_read_status_line(&path, raw).await;
-        assert_eq!(status, "", "hyper schließt nach Header-Timeout ohne Antwort");
+        let status = send_and_read_status_line(&path, raw).await?;
+        assert_eq!(
+            status, "",
+            "hyper schließt nach Header-Timeout ohne Antwort"
+        );
         server.abort();
+        Ok(())
     }
 
     // ── Echter Unix-Socket: Socket-Bind (F-185) ───────────────────────────────
 
     #[tokio::test]
-    async fn test_bind_on_fresh_path_creates_socket() {
-        let dir = socket_tempdir();
+    async fn test_bind_on_fresh_path_creates_socket() -> TestResult {
+        let dir = socket_tempdir()?;
         let path = dir.path().join("w.sock");
-        let _listener = bind_unix_listener(&path).await.expect("freier Pfad bindbar");
-        assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_socket());
+        let _listener = bind_unix_listener(&path)
+            .await
+            .map_err(ctx("freier Pfad bindbar"))?;
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .map_err(ctx("symlink_metadata sollte gelingen"))?
+                .file_type()
+                .is_socket()
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_bind_refuses_live_socket_and_leaves_it_serving() {
-        let dir = socket_tempdir();
+    async fn test_bind_refuses_live_socket_and_leaves_it_serving() -> TestResult {
+        let dir = socket_tempdir()?;
         let path = dir.path().join("w.sock");
-        let live = UnixListener::bind(&path).unwrap();
+        let live = UnixListener::bind(&path).map_err(ctx("UnixListener::bind sollte gelingen"))?;
 
         let result = bind_unix_listener(&path).await;
-        assert!(matches!(result, Err(WebError::SocketInUse { .. })), "erhalten: {result:?}");
+        assert!(
+            matches!(result, Err(WebError::SocketInUse { .. })),
+            "erhalten: {result:?}"
+        );
 
         // Die Datei ist noch da und der ursprüngliche Listener nimmt weiter an.
-        assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_socket());
-        let client = UnixStream::connect(&path).await.expect("lebender Socket erreichbar");
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .map_err(ctx("symlink_metadata sollte gelingen"))?
+                .file_type()
+                .is_socket()
+        );
+        let client = UnixStream::connect(&path)
+            .await
+            .map_err(ctx("lebender Socket erreichbar"))?;
         let accepted = tokio::time::timeout(TEST_DEADLINE, async {
             // Der Lebendigkeits-`connect` von `bind_unix_listener` liegt ggf.
             // zuerst in der Warteschlange — beide Verbindungen annehmen.
@@ -1161,67 +1247,119 @@ mod tests {
             (first.is_ok(), second.is_ok())
         })
         .await
-        .expect("ursprünglicher Listener nimmt Verbindungen an");
+        .map_err(ctx("ursprünglicher Listener nimmt Verbindungen an"))?;
         assert_eq!(accepted, (true, true));
         drop(client);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_bind_replaces_dead_socket() {
-        let dir = socket_tempdir();
+    async fn test_bind_replaces_dead_socket() -> TestResult {
+        let dir = socket_tempdir()?;
         let path = dir.path().join("w.sock");
         // Rest eines abgestürzten Laufs: Socket-Datei ohne Lauscher.
-        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
-        assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_socket());
+        drop(
+            std::os::unix::net::UnixListener::bind(&path)
+                .map_err(ctx("UnixListener::bind sollte gelingen"))?,
+        );
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .map_err(ctx("symlink_metadata sollte gelingen"))?
+                .file_type()
+                .is_socket()
+        );
 
-        let listener = bind_unix_listener(&path).await.expect("toter Socket wird ersetzt");
-        let client = UnixStream::connect(&path).await.expect("neuer Socket erreichbar");
+        let listener = bind_unix_listener(&path)
+            .await
+            .map_err(ctx("toter Socket wird ersetzt"))?;
+        let client = UnixStream::connect(&path)
+            .await
+            .map_err(ctx("neuer Socket erreichbar"))?;
         let accepted = tokio::time::timeout(TEST_DEADLINE, listener.accept())
             .await
-            .expect("neuer Listener nimmt an");
+            .map_err(ctx("neuer Listener nimmt an"))?;
         assert!(accepted.is_ok());
         drop(client);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_bind_refuses_regular_file_and_leaves_content_unchanged() {
-        let dir = socket_tempdir();
+    async fn test_bind_refuses_regular_file_and_leaves_content_unchanged() -> TestResult {
+        let dir = socket_tempdir()?;
         let path = dir.path().join("w.sock");
-        std::fs::write(&path, b"fremde Daten").unwrap();
+        std::fs::write(&path, b"fremde Daten").map_err(ctx("Datei schreiben sollte gelingen"))?;
 
         let result = bind_unix_listener(&path).await;
-        assert!(matches!(result, Err(WebError::SocketPathOccupied { .. })), "erhalten: {result:?}");
-        assert_eq!(std::fs::read(&path).unwrap(), b"fremde Daten");
+        assert!(
+            matches!(result, Err(WebError::SocketPathOccupied { .. })),
+            "erhalten: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).map_err(ctx("Datei lesen sollte gelingen"))?,
+            b"fremde Daten"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_bind_refuses_symlink_and_leaves_link_and_target_unchanged() {
-        let dir = socket_tempdir();
+    async fn test_bind_refuses_symlink_and_leaves_link_and_target_unchanged() -> TestResult {
+        let dir = socket_tempdir()?;
         let target = dir.path().join("ziel.txt");
         let path = dir.path().join("w.sock");
-        std::fs::write(&target, b"Ziel bleibt").unwrap();
-        std::os::unix::fs::symlink(&target, &path).unwrap();
+        std::fs::write(&target, b"Ziel bleibt").map_err(ctx("Datei schreiben sollte gelingen"))?;
+        std::os::unix::fs::symlink(&target, &path)
+            .map_err(ctx("symlink anlegen sollte gelingen"))?;
 
         let result = bind_unix_listener(&path).await;
-        assert!(matches!(result, Err(WebError::SocketPathOccupied { .. })), "erhalten: {result:?}");
-        assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
-        assert_eq!(std::fs::read(&target).unwrap(), b"Ziel bleibt");
+        assert!(
+            matches!(result, Err(WebError::SocketPathOccupied { .. })),
+            "erhalten: {result:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .map_err(ctx("symlink_metadata sollte gelingen"))?
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(&target).map_err(ctx("Datei lesen sollte gelingen"))?,
+            b"Ziel bleibt"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_bind_refuses_symlink_to_dead_socket_and_removes_nothing() {
-        let dir = socket_tempdir();
+    async fn test_bind_refuses_symlink_to_dead_socket_and_removes_nothing() -> TestResult {
+        let dir = socket_tempdir()?;
         let target = dir.path().join("tot.sock");
         let path = dir.path().join("w.sock");
-        drop(std::os::unix::net::UnixListener::bind(&target).unwrap());
-        std::os::unix::fs::symlink(&target, &path).unwrap();
+        drop(
+            std::os::unix::net::UnixListener::bind(&target)
+                .map_err(ctx("UnixListener::bind sollte gelingen"))?,
+        );
+        std::os::unix::fs::symlink(&target, &path)
+            .map_err(ctx("symlink anlegen sollte gelingen"))?;
 
         // Ein `connect` durch den Symlink ergäbe `ECONNREFUSED` — trotzdem
         // darf weder der Link noch sein Ziel verschwinden.
         let result = bind_unix_listener(&path).await;
-        assert!(matches!(result, Err(WebError::SocketPathOccupied { .. })), "erhalten: {result:?}");
-        assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
-        assert!(std::fs::symlink_metadata(&target).unwrap().file_type().is_socket());
+        assert!(
+            matches!(result, Err(WebError::SocketPathOccupied { .. })),
+            "erhalten: {result:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .map_err(ctx("symlink_metadata sollte gelingen"))?
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::symlink_metadata(&target)
+                .map_err(ctx("symlink_metadata sollte gelingen"))?
+                .file_type()
+                .is_socket()
+        );
+        Ok(())
     }
 
     // ── accept()-Fehler (F-185) ───────────────────────────────────────────────
@@ -1258,13 +1396,21 @@ mod tests {
             let error = std::io::Error::from_raw_os_error(errno.raw_os_error());
             assert!(!is_fatal_accept_error(&error), "vorübergehend: {error}");
         }
-        assert!(!is_fatal_accept_error(&std::io::Error::other("ohne Fehlernummer")));
+        assert!(!is_fatal_accept_error(&std::io::Error::other(
+            "ohne Fehlernummer"
+        )));
     }
 
     #[test]
     fn test_unusable_listener_accept_errors_are_fatal() {
         use rustix::io::Errno;
-        for errno in [Errno::BADF, Errno::NOTSOCK, Errno::INVAL, Errno::FAULT, Errno::OPNOTSUPP] {
+        for errno in [
+            Errno::BADF,
+            Errno::NOTSOCK,
+            Errno::INVAL,
+            Errno::FAULT,
+            Errno::OPNOTSUPP,
+        ] {
             let error = std::io::Error::from_raw_os_error(errno.raw_os_error());
             assert!(is_fatal_accept_error(&error), "fatal: {error}");
         }
@@ -1273,39 +1419,68 @@ mod tests {
     // ── Echter Unix-Socket: Annahmeschleife Ende-zu-Ende ─────────────────────
 
     #[tokio::test]
-    async fn test_serve_until_answers_over_real_socket_and_stops_on_shutdown() {
-        let dir = socket_tempdir();
+    async fn test_serve_until_answers_over_real_socket_and_stops_on_shutdown() -> TestResult {
+        let dir = socket_tempdir()?;
         let path = dir.path().join("w.sock");
-        let routes = WebRouteTable::from_registry(&OperationRegistry::new()).unwrap();
+        let routes = WebRouteTable::from_registry(&OperationRegistry::new())
+            .map_err(ctx("WebRouteTable::from_registry sollte gelingen"))?;
         // Leere Routentabelle: `decide_route` liefert nie `Execute`, die
-        // Fabrik wird also nie aufgerufen.
-        let context_factory: Arc<WebContextFactory> =
-            Arc::new(|_peer: &PeerCredentials, _tier: PermissionTier| -> OpContext {
+        // Fabrik wird also nie aufgerufen — kein neutraler Dummy-Rückgabewert
+        // möglich, um das per Flag/Assert statt Panik zu belegen: der
+        // Rückgabetyp `WebContextFactory = dyn Fn(&PeerCredentials,
+        // PermissionTier) -> OpContext + Send + Sync + 'static` (Typalias
+        // oben) verlangt einen echten `OpContext`, der wiederum eine echte
+        // `harw_authority::SandboxSpec` braucht (`OpContext::new`,
+        // harw-operations/src/context.rs). Eine `SandboxSpec` lässt sich nur
+        // über eine reale, kanonisierte `WorkspaceBinding` bauen
+        // (`SandboxSpec::from_resolved`/`from_resolved_for_test`,
+        // harw-authority/src/lib.rs) — `harw-authority` ist keine
+        // Abhängigkeit dieser Crate (siehe Cargo.toml) und würde als neue
+        // Abhängigkeit gegen den Arbeitsauftrag verstoßen. `WebContextFactory`
+        // ist zudem Produktionscode ohne `Result`-Variante; eine
+        // Signaturänderung bräche alle Aufrufer außerhalb dieser Datei.
+        // `unreachable!` bleibt daher bewusst stehen; identisches, ebenso
+        // begründetes Muster in `harw-web/tests/method_admission.rs`.
+        let context_factory: Arc<WebContextFactory> = Arc::new(
+            |_peer: &PeerCredentials, _tier: PermissionTier| -> OpContext {
                 unreachable!("leere Routentabelle: decide_route liefert nie Execute")
-            });
+            },
+        );
         let server = BoundWebServer::bind(
-            WebServerConfig { socket_path: path.clone() },
+            WebServerConfig {
+                socket_path: path.clone(),
+            },
             routes,
-            Arc::new(StaticUidTierMap::with_default(vec![], PermissionTier::Observer)),
+            Arc::new(StaticUidTierMap::with_default(
+                vec![],
+                PermissionTier::Observer,
+            )),
             context_factory,
-            Arc::new(WebEventBus::new(8).unwrap()),
+            Arc::new(WebEventBus::new(8).map_err(ctx("WebEventBus::new sollte gelingen"))?),
         )
         .await
-        .expect("Tempdir-Socket bindbar");
+        .map_err(ctx("Tempdir-Socket bindbar"))?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         let client = async {
             let raw = b"GET /api/gibt-es-nicht HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec();
-            let status = send_and_read_status_line(&path, raw).await;
-            shutdown_tx.send(true).expect("Server hält den Empfänger");
-            status
+            let status = send_and_read_status_line(&path, raw).await?;
+            shutdown_tx
+                .send(true)
+                .map_err(ctx("Server hält den Empfänger"))?;
+            Ok(status)
         };
         let (served, status) = tokio::time::timeout(TEST_DEADLINE, async {
             tokio::join!(server.serve_until(shutdown_rx), client)
         })
         .await
-        .expect("Server endet nach Shutdown-Signal");
-        assert!(status.starts_with("HTTP/1.1 404"), "erwartet 404, erhalten: {status:?}");
+        .map_err(ctx("Server endet nach Shutdown-Signal"))?;
+        let status = status?;
+        assert!(
+            status.starts_with("HTTP/1.1 404"),
+            "erwartet 404, erhalten: {status:?}"
+        );
         assert!(served.is_ok());
+        Ok(())
     }
 }

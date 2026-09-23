@@ -11,9 +11,12 @@
 //!    über `harw_lens_query::query_scoped` — Beleg dafür, dass die Fassade
 //!    selbst nichts berechnet.
 
+mod common;
+
+use common::{TestError, TestResult, ctx};
 use harw_lens::{
-    ask, build, index_status, IndexSelector, LensError, QueryError, QueryProvenance, ReadScope,
-    CHUNKER_VERSION, DEFAULT_VISIBILITY, DOCS_DESIGN_INDEX, OPERATOR_ONLY_VISIBILITY,
+    CHUNKER_VERSION, DEFAULT_VISIBILITY, DOCS_DESIGN_INDEX, IndexSelector, LensError,
+    OPERATOR_ONLY_VISIBILITY, QueryError, QueryProvenance, ReadScope, ask, build, index_status,
 };
 use harw_lens_embed::{DeterministicEmbedder, EmbeddingDescriptor};
 use harw_lens_types::{CollapsePolicy, EdgeIndex, Locality, Metric, SourceRef};
@@ -46,8 +49,8 @@ fn document(text: &str, path: &str, visibility: &str) -> harw_lens::RawDocument 
 }
 
 #[test]
-fn test_build_then_ask_round_trip_finds_hits() {
-    let home = tempfile::tempdir().expect("tempdir");
+fn test_build_then_ask_round_trip_finds_hits() -> TestResult {
+    let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
     let embedder = DeterministicEmbedder::new(16);
     let descriptor = descriptor();
     let documents = vec![document(
@@ -66,7 +69,7 @@ fn test_build_then_ask_round_trip_finds_hits() {
         &embedder,
         &descriptor,
     )
-    .expect("build succeeds");
+    .map_err(ctx("build succeeds"))?;
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].visibility, DEFAULT_VISIBILITY);
     assert_eq!(reports[0].chunk_count, 1);
@@ -86,15 +89,16 @@ fn test_build_then_ask_round_trip_finds_hits() {
         CollapsePolicy::ByDigest,
         10,
     )
-    .expect("ask succeeds");
+    .map_err(ctx("ask succeeds"))?;
 
     assert_eq!(hits.len(), 1);
     assert!(hits[0].chunk.text.contains("Fassaden"));
+    Ok(())
 }
 
 #[test]
-fn test_ask_outside_read_scope_returns_error_not_empty_list() {
-    let home = tempfile::tempdir().expect("tempdir");
+fn test_ask_outside_read_scope_returns_error_not_empty_list() -> TestResult {
+    let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
     let embedder = DeterministicEmbedder::new(16);
     let descriptor = descriptor();
     let documents = vec![document(
@@ -113,7 +117,7 @@ fn test_ask_outside_read_scope_returns_error_not_empty_list() {
         &embedder,
         &descriptor,
     )
-    .expect("build succeeds");
+    .map_err(ctx("build succeeds"))?;
 
     // Der Selektor fragt exakt den Index/die Sichtbarkeit an, unter der
     // gerade gebaut wurde -- nur der Lesebereich des Aufrufers gibt sie
@@ -135,7 +139,11 @@ fn test_ask_outside_read_scope_returns_error_not_empty_list() {
     );
 
     // Der wichtigste Fall: ein Fehler, niemals `Ok(vec![])`.
-    let err = result.expect_err("selector outside read scope must be rejected");
+    let Err(err) = result else {
+        return Err(TestError::Unexpected(
+            "selector outside read scope must be rejected".into(),
+        ));
+    };
     assert!(matches!(
         err,
         LensError::Query(QueryError::IndexNotVisible {
@@ -143,11 +151,12 @@ fn test_ask_outside_read_scope_returns_error_not_empty_list() {
             ref visibility,
         }) if index_name == DOCS_DESIGN_INDEX && visibility == OPERATOR_ONLY_VISIBILITY
     ));
+    Ok(())
 }
 
 #[test]
-fn test_index_not_visible_is_distinguishable_from_missing_index_error() {
-    let home = tempfile::tempdir().expect("tempdir");
+fn test_index_not_visible_is_distinguishable_from_missing_index_error() -> TestResult {
+    let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
     let embedder = DeterministicEmbedder::new(16);
     let descriptor = descriptor();
 
@@ -155,7 +164,7 @@ fn test_index_not_visible_is_distinguishable_from_missing_index_error() {
     // `resolve_index` scheitert bereits vor jedem Dateisystemzugriff.
     let scope = ReadScope::single(DEFAULT_VISIBILITY);
     let out_of_scope_selector = IndexSelector::new(DOCS_DESIGN_INDEX, OPERATOR_ONLY_VISIBILITY);
-    let out_of_scope_err = ask(
+    let Err(out_of_scope_err) = ask(
         home.path(),
         &out_of_scope_selector,
         &scope,
@@ -166,13 +175,16 @@ fn test_index_not_visible_is_distinguishable_from_missing_index_error() {
         &EdgeIndex::default(),
         CollapsePolicy::ByDigest,
         10,
-    )
-    .expect_err("out-of-scope selector must be rejected");
+    ) else {
+        return Err(TestError::Unexpected(
+            "out-of-scope selector must be rejected".into(),
+        ));
+    };
 
     // Fall B: Sichtbarkeit innerhalb des Lesebereichs, aber kein Index
     // dieses Namens existiert -- ein anderer Fehler als Fall A.
     let missing_index_selector = IndexSelector::new("does-not-exist", DEFAULT_VISIBILITY);
-    let missing_index_err = ask(
+    let Err(missing_index_err) = ask(
         home.path(),
         &missing_index_selector,
         &scope,
@@ -183,8 +195,11 @@ fn test_index_not_visible_is_distinguishable_from_missing_index_error() {
         &EdgeIndex::default(),
         CollapsePolicy::ByDigest,
         10,
-    )
-    .expect_err("missing index must be rejected");
+    ) else {
+        return Err(TestError::Unexpected(
+            "missing index must be rejected".into(),
+        ));
+    };
 
     assert!(matches!(
         out_of_scope_err,
@@ -197,11 +212,12 @@ fn test_index_not_visible_is_distinguishable_from_missing_index_error() {
     // Nach dem Wickeln in `LensError` bleiben beide Varianten getrennt --
     // keine der beiden `matches!`-Prüfungen oben würde für den jeweils
     // anderen Fehler zutreffen.
+    Ok(())
 }
 
 #[test]
-fn test_ask_computes_nothing_itself_same_hits_as_direct_query_scoped_call() {
-    let home = tempfile::tempdir().expect("tempdir");
+fn test_ask_computes_nothing_itself_same_hits_as_direct_query_scoped_call() -> TestResult {
+    let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
     let embedder = DeterministicEmbedder::new(16);
     let descriptor = descriptor();
     let documents = vec![
@@ -219,7 +235,7 @@ fn test_ask_computes_nothing_itself_same_hits_as_direct_query_scoped_call() {
         &embedder,
         &descriptor,
     )
-    .expect("build succeeds");
+    .map_err(ctx("build succeeds"))?;
 
     let selector = IndexSelector::new(DOCS_DESIGN_INDEX, DEFAULT_VISIBILITY);
     let scope = ReadScope::single(DEFAULT_VISIBILITY);
@@ -237,7 +253,7 @@ fn test_ask_computes_nothing_itself_same_hits_as_direct_query_scoped_call() {
         CollapsePolicy::ByDigest,
         10,
     )
-    .expect("ask succeeds");
+    .map_err(ctx("ask succeeds"))?;
 
     let via_direct_query_path = harw_lens_query::query_scoped(
         home.path(),
@@ -251,10 +267,11 @@ fn test_ask_computes_nothing_itself_same_hits_as_direct_query_scoped_call() {
         CollapsePolicy::ByDigest,
         10,
     )
-    .expect("direct query_scoped call succeeds");
+    .map_err(ctx("direct query_scoped call succeeds"))?;
 
     assert!(!via_facade.is_empty());
     assert_eq!(via_facade, via_direct_query_path);
+    Ok(())
 }
 
 /// Der zentrale Beleg dieses Knotens: die Manifest-Prüfung in
@@ -265,8 +282,8 @@ fn test_ask_computes_nothing_itself_same_hits_as_direct_query_scoped_call() {
 /// `QueryError::Index(_)` unterscheidbar bleibt, nicht auf eine
 /// Zeichenkette zusammengefaltet.
 #[test]
-fn test_ask_rejects_a_query_embedded_with_a_different_model_than_the_index() {
-    let home = tempfile::tempdir().expect("tempdir");
+fn test_ask_rejects_a_query_embedded_with_a_different_model_than_the_index() -> TestResult {
+    let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
     let embedder = DeterministicEmbedder::new(16);
     let descriptor = descriptor();
     let documents = vec![document(
@@ -285,7 +302,7 @@ fn test_ask_rejects_a_query_embedded_with_a_different_model_than_the_index() {
         &embedder,
         &descriptor,
     )
-    .expect("build succeeds");
+    .map_err(ctx("build succeeds"))?;
 
     let selector = IndexSelector::new(DOCS_DESIGN_INDEX, DEFAULT_VISIBILITY);
     let scope = ReadScope::single(DEFAULT_VISIBILITY);
@@ -307,18 +324,22 @@ fn test_ask_rejects_a_query_embedded_with_a_different_model_than_the_index() {
         10,
     );
 
-    let err = result.expect_err(
-        "a query embedded with a different model than the index must be rejected, never silently answered",
-    );
+    let Err(err) = result else {
+        return Err(TestError::Unexpected(
+            "a query embedded with a different model than the index must be rejected, never silently answered"
+                .into(),
+        ));
+    };
     assert!(matches!(err, LensError::Query(QueryError::Index(_))));
+    Ok(())
 }
 
 /// Gegentest zum vorherigen: passende Provenienz liefert Treffer. Ohne
 /// diesen Test bewiese der vorherige nur, dass irgendetwas an dem Aufruf
 /// fehlschlägt, nicht dass die Prüfung modellspezifisch ist.
 #[test]
-fn test_ask_accepts_a_query_embedded_with_the_same_model_as_the_index() {
-    let home = tempfile::tempdir().expect("tempdir");
+fn test_ask_accepts_a_query_embedded_with_the_same_model_as_the_index() -> TestResult {
+    let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
     let embedder = DeterministicEmbedder::new(16);
     let descriptor = descriptor();
     let documents = vec![document(
@@ -337,7 +358,7 @@ fn test_ask_accepts_a_query_embedded_with_the_same_model_as_the_index() {
         &embedder,
         &descriptor,
     )
-    .expect("build succeeds");
+    .map_err(ctx("build succeeds"))?;
 
     let selector = IndexSelector::new(DOCS_DESIGN_INDEX, DEFAULT_VISIBILITY);
     let scope = ReadScope::single(DEFAULT_VISIBILITY);
@@ -358,17 +379,21 @@ fn test_ask_accepts_a_query_embedded_with_the_same_model_as_the_index() {
         CollapsePolicy::ByDigest,
         10,
     )
-    .expect("provenance matching the index's model must be accepted");
+    .map_err(ctx(
+        "provenance matching the index's model must be accepted",
+    ))?;
 
     assert!(!hits.is_empty());
+    Ok(())
 }
 
 /// Derselbe Fehlertyp, ein anderer Grund: eine abweichende
 /// Zerlegungsfassung verschiebt die Chunk-Grenzen, nicht den Vektorraum --
 /// die Prüfung muss trotzdem über die Fassade greifen.
 #[test]
-fn test_ask_rejects_a_query_embedded_with_a_different_chunker_version_than_the_index() {
-    let home = tempfile::tempdir().expect("tempdir");
+fn test_ask_rejects_a_query_embedded_with_a_different_chunker_version_than_the_index() -> TestResult
+{
+    let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
     let embedder = DeterministicEmbedder::new(16);
     let descriptor = descriptor();
     let documents = vec![document(
@@ -387,7 +412,7 @@ fn test_ask_rejects_a_query_embedded_with_a_different_chunker_version_than_the_i
         &embedder,
         &descriptor,
     )
-    .expect("build succeeds");
+    .map_err(ctx("build succeeds"))?;
 
     let selector = IndexSelector::new(DOCS_DESIGN_INDEX, DEFAULT_VISIBILITY);
     let scope = ReadScope::single(DEFAULT_VISIBILITY);
@@ -396,7 +421,7 @@ fn test_ask_rejects_a_query_embedded_with_a_different_chunker_version_than_the_i
         chunker_version: CHUNKER_VERSION + 1,
     };
 
-    let err = ask(
+    let Err(err) = ask(
         home.path(),
         &selector,
         &scope,
@@ -407,10 +432,14 @@ fn test_ask_rejects_a_query_embedded_with_a_different_chunker_version_than_the_i
         &EdgeIndex::default(),
         CollapsePolicy::ByDigest,
         10,
-    )
-    .expect_err("a query embedded against a different chunker version must be rejected");
+    ) else {
+        return Err(TestError::Unexpected(
+            "a query embedded against a different chunker version must be rejected".into(),
+        ));
+    };
 
     assert!(matches!(err, LensError::Query(QueryError::Index(_))));
+    Ok(())
 }
 
 /// [`index_status`] ist die im `crate`-`//!`-Block angekündigte
@@ -418,13 +447,13 @@ fn test_ask_rejects_a_query_embedded_with_a_different_chunker_version_than_the_i
 /// danach, mit `chunk_count`/`dimension` aus den tatsächlich gespeicherten
 /// Einträgen statt nur dem Manifest.
 #[test]
-fn test_index_status_reflects_build_state_through_the_facade() {
-    let home = tempfile::tempdir().expect("tempdir");
+fn test_index_status_reflects_build_state_through_the_facade() -> TestResult {
+    let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
     let embedder = DeterministicEmbedder::new(16);
     let descriptor = descriptor();
 
     let before = index_status(home.path(), DOCS_DESIGN_INDEX, DEFAULT_VISIBILITY)
-        .expect("no error before any build");
+        .map_err(ctx("no error before any build"))?;
     assert_eq!(before, None);
 
     let documents = vec![document(
@@ -442,11 +471,11 @@ fn test_index_status_reflects_build_state_through_the_facade() {
         &embedder,
         &descriptor,
     )
-    .expect("build succeeds");
+    .map_err(ctx("build succeeds"))?;
 
     let after = index_status(home.path(), DOCS_DESIGN_INDEX, DEFAULT_VISIBILITY)
-        .expect("reads")
-        .expect("index exists after build");
+        .map_err(ctx("reads"))?
+        .ok_or(TestError::Missing("index exists after build"))?;
     assert_eq!(after.index_name, DOCS_DESIGN_INDEX);
     assert_eq!(after.visibility, DEFAULT_VISIBILITY);
     assert_eq!(after.model, "test-model");
@@ -455,4 +484,5 @@ fn test_index_status_reflects_build_state_through_the_facade() {
     assert_eq!(after.dimension, Some(16));
     assert_eq!(after.chunk_count, 1);
     assert!(after.modified.is_some());
+    Ok(())
 }

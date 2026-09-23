@@ -214,9 +214,7 @@ fn parse_contributor_args(
     let parser = syn::meta::parser(|meta| {
         if meta.path.is_ident("name") {
             if name.is_some() {
-                return Err(meta.error(format!(
-                    "duplicate `{macro_name}` attribute field `name`"
-                )));
+                return Err(meta.error(format!("duplicate `{macro_name}` attribute field `name`")));
             }
             name = Some(meta.value()?.parse()?);
             Ok(())
@@ -361,12 +359,11 @@ pub(crate) fn parse_context_provider_args(
             Ok(())
         } else if meta.path.is_ident("namespace") {
             if namespace.is_some() {
-                return Err(
-                    meta.error("duplicate `context_provider` attribute field `namespace`")
-                );
+                return Err(meta.error("duplicate `context_provider` attribute field `namespace`"));
             }
             let lit: LitStr = meta.value()?.parse()?;
-            validate_namespace(&lit.value()).map_err(|reason| syn::Error::new_spanned(&lit, reason))?;
+            validate_namespace(&lit.value())
+                .map_err(|reason| syn::Error::new_spanned(&lit, reason))?;
             namespace = Some(lit);
             Ok(())
         } else if meta.path.is_ident("trust") {
@@ -814,11 +811,15 @@ pub(crate) fn expand_instructions_provider(
 #[cfg(test)]
 mod contributor_tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Entfernt sämtliche Whitespaces aus einem `TokenStream::to_string()`, damit
     /// Substring-Prüfungen unabhängig von `quote`s Token-Abstandsregeln sind.
     fn normalize(ts: &proc_macro2::TokenStream) -> String {
-        ts.to_string().chars().filter(|c| !c.is_whitespace()).collect()
+        ts.to_string()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
     }
 
     /// Prüft, ob unmittelbar vor der erzeugten Struct ein `#[doc]`-Attribut
@@ -843,164 +844,193 @@ mod contributor_tests {
     // ── parse_context_provider_args / parse_instructions_provider_args ───────
 
     #[test]
-    fn parse_context_provider_args_accepts_name_and_struct_name() {
+    fn parse_context_provider_args_accepts_name_and_struct_name() -> TestResult {
         let args = parse_context_provider_args(quote! {
             name = "goal", struct_name = "CustomProvider"
         })
-        .expect("supported fields should parse");
+        .map_err(ctx("supported fields should parse"))?;
 
-        assert_eq!(args.name.as_ref().map(LitStr::value), Some("goal".to_owned()));
+        assert_eq!(
+            args.name.as_ref().map(LitStr::value),
+            Some("goal".to_owned())
+        );
         assert_eq!(
             args.struct_name.as_ref().map(LitStr::value),
             Some("CustomProvider".to_owned())
         );
+        Ok(())
     }
 
     #[test]
-    fn parse_context_provider_args_rejects_unknown_field() {
-        let error = parse_context_provider_args(quote!(unknown = "x"))
-            .expect_err("unknown field must be rejected");
+    fn parse_context_provider_args_rejects_unknown_field() -> TestResult {
+        let Err(error) = parse_context_provider_args(quote!(unknown = "x")) else {
+            return Err(TestError::Unexpected(
+                "unknown field must be rejected".to_owned(),
+            ));
+        };
         assert!(
             error
                 .to_string()
                 .contains("unknown `context_provider` attribute field")
         );
+        Ok(())
     }
 
     #[test]
-    fn parse_context_provider_args_rejects_duplicate_name() {
-        let error = parse_context_provider_args(quote!(name = "a", name = "b"))
-            .expect_err("duplicate field must be rejected");
+    fn parse_context_provider_args_rejects_duplicate_name() -> TestResult {
+        let Err(error) = parse_context_provider_args(quote!(name = "a", name = "b")) else {
+            return Err(TestError::Unexpected(
+                "duplicate field must be rejected".to_owned(),
+            ));
+        };
         assert!(
             error
                 .to_string()
                 .contains("duplicate `context_provider` attribute field `name`")
         );
+        Ok(())
     }
 
     #[test]
-    fn parse_instructions_provider_args_accepts_fields() {
+    fn parse_instructions_provider_args_accepts_fields() -> TestResult {
         let args = parse_instructions_provider_args(quote! {
             name = "baseline"
         })
-        .expect("supported fields should parse");
+        .map_err(ctx("supported fields should parse"))?;
         assert_eq!(
             args.name.as_ref().map(LitStr::value),
             Some("baseline".to_owned())
         );
+        Ok(())
     }
 
     #[test]
-    fn parse_instructions_provider_args_rejects_unknown_field() {
-        let error = parse_instructions_provider_args(quote!(role = "x"))
-            .expect_err("unknown field must be rejected");
+    fn parse_instructions_provider_args_rejects_unknown_field() -> TestResult {
+        let Err(error) = parse_instructions_provider_args(quote!(role = "x")) else {
+            return Err(TestError::Unexpected(
+                "unknown field must be rejected".to_owned(),
+            ));
+        };
         assert!(
             error
                 .to_string()
                 .contains("unknown `instructions_provider` attribute field")
         );
+        Ok(())
     }
 
     // ── expand_context_provider: struct-name derivation ───────────────────────
 
     #[test]
-    fn expand_context_provider_stateless_derives_struct_name_from_fn() {
+    fn expand_context_provider_stateless_derives_struct_name_from_fn() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn goal_context(ctx: &TurnInputContext) -> Vec<ContextFragment> {
                 Vec::new()
             }
         };
         let tokens = expand_context_provider(func, ContextProviderArgs::default())
-            .expect("valid stateless fn must expand");
+            .map_err(ctx("valid stateless fn must expand"))?;
         let flat = normalize(&tokens);
 
         assert!(flat.contains("pubstructGoalContextProvider;"));
         assert!(flat.contains("implGoalContextProvider"));
         assert!(flat.contains("pubfnnew()->Self"));
-        assert!(flat.contains(
-            "impl::harw_extension_api::ContextProviderforGoalContextProvider"
-        ));
+        assert!(flat.contains("impl::harw_extension_api::ContextProviderforGoalContextProvider"));
         assert!(flat.contains("goal_context(ctx)"));
+        Ok(())
     }
 
     #[test]
-    fn expand_context_provider_stateful_generates_state_field() {
+    fn expand_context_provider_stateful_generates_state_field() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn goal_context(ctx: &TurnInputContext, state: &GoalContextState) -> Vec<ContextFragment> {
                 Vec::new()
             }
         };
         let tokens = expand_context_provider(func, ContextProviderArgs::default())
-            .expect("valid stateful fn must expand");
+            .map_err(ctx("valid stateful fn must expand"))?;
         let flat = normalize(&tokens);
 
         assert!(flat.contains("pubstructGoalContextProvider{state:GoalContextState,}"));
         assert!(flat.contains("pubfnnew(state:GoalContextState)->Self{Self{state}}"));
         assert!(flat.contains("goal_context(ctx,&self.state)"));
+        Ok(())
     }
 
     #[test]
-    fn expand_context_provider_struct_name_override_is_used() {
+    fn expand_context_provider_struct_name_override_is_used() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn goal_context(ctx: &TurnInputContext) -> Vec<ContextFragment> {
                 Vec::new()
             }
         };
-        let args = parse_context_provider_args(quote!(struct_name = "CustomProvider")).unwrap();
-        let tokens = expand_context_provider(func, args).expect("override must expand");
+        let args = parse_context_provider_args(quote!(struct_name = "CustomProvider"))
+            .map_err(ctx("struct_name override should parse"))?;
+        let tokens = expand_context_provider(func, args).map_err(ctx("override must expand"))?;
         let flat = normalize(&tokens);
 
         assert!(flat.contains("pubstructCustomProvider;"));
         assert!(!flat.contains("GoalContextProvider"));
+        Ok(())
     }
 
     #[test]
-    fn expand_context_provider_default_name_const_falls_back_to_fn_name() {
+    fn expand_context_provider_default_name_const_falls_back_to_fn_name() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn goal_context(ctx: &TurnInputContext) -> Vec<ContextFragment> {
                 Vec::new()
             }
         };
-        let tokens = expand_context_provider(func, ContextProviderArgs::default()).unwrap();
+        let tokens = expand_context_provider(func, ContextProviderArgs::default())
+            .map_err(ctx("valid stateless fn must expand"))?;
         let flat = normalize(&tokens);
         assert!(flat.contains("pubconstNAME:&'staticstr=\"goal_context\""));
+        Ok(())
     }
 
     // ── expand_context_provider: error cases ──────────────────────────────────
 
     #[test]
-    fn expand_context_provider_rejects_non_async_fn() {
+    fn expand_context_provider_rejects_non_async_fn() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             fn goal_context(ctx: &TurnInputContext) -> Vec<ContextFragment> {
                 Vec::new()
             }
         };
-        let error = expand_context_provider(func, ContextProviderArgs::default())
-            .expect_err("non-async fn must be rejected");
+        let Err(error) = expand_context_provider(func, ContextProviderArgs::default()) else {
+            return Err(TestError::Unexpected(
+                "non-async fn must be rejected".to_owned(),
+            ));
+        };
         assert_eq!(
             error.to_string(),
             "#[context_provider] requires an `async fn`"
         );
+        Ok(())
     }
 
     #[test]
-    fn expand_context_provider_rejects_zero_params() {
+    fn expand_context_provider_rejects_zero_params() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn goal_context() -> Vec<ContextFragment> {
                 Vec::new()
             }
         };
-        let error = expand_context_provider(func, ContextProviderArgs::default())
-            .expect_err("zero params must be rejected");
+        let Err(error) = expand_context_provider(func, ContextProviderArgs::default()) else {
+            return Err(TestError::Unexpected(
+                "zero params must be rejected".to_owned(),
+            ));
+        };
         assert!(
             error
                 .to_string()
                 .contains("requires at least `(ctx: &TurnInputContext)`")
         );
+        Ok(())
     }
 
     #[test]
-    fn expand_context_provider_rejects_too_many_params() {
+    fn expand_context_provider_rejects_too_many_params() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn goal_context(
                 ctx: &TurnInputContext,
@@ -1010,58 +1040,70 @@ mod contributor_tests {
                 Vec::new()
             }
         };
-        let error = expand_context_provider(func, ContextProviderArgs::default())
-            .expect_err("more than two params must be rejected");
+        let Err(error) = expand_context_provider(func, ContextProviderArgs::default()) else {
+            return Err(TestError::Unexpected(
+                "more than two params must be rejected".to_owned(),
+            ));
+        };
         assert!(
             error
                 .to_string()
                 .contains("accepts at most `(ctx: &TurnInputContext, state: &StateType)`")
         );
+        Ok(())
     }
 
     #[test]
-    fn expand_context_provider_rejects_first_param_not_reference() {
+    fn expand_context_provider_rejects_first_param_not_reference() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn goal_context(ctx: TurnInputContext) -> Vec<ContextFragment> {
                 Vec::new()
             }
         };
-        let error = expand_context_provider(func, ContextProviderArgs::default())
-            .expect_err("owned first param must be rejected");
+        let Err(error) = expand_context_provider(func, ContextProviderArgs::default()) else {
+            return Err(TestError::Unexpected(
+                "owned first param must be rejected".to_owned(),
+            ));
+        };
         assert!(
             error
                 .to_string()
                 .contains("the first `#[context_provider]` argument must be a reference")
         );
+        Ok(())
     }
 
     #[test]
-    fn expand_context_provider_rejects_second_param_not_reference() {
+    fn expand_context_provider_rejects_second_param_not_reference() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn goal_context(ctx: &TurnInputContext, state: GoalContextState) -> Vec<ContextFragment> {
                 Vec::new()
             }
         };
-        let error = expand_context_provider(func, ContextProviderArgs::default())
-            .expect_err("owned second param must be rejected");
+        let Err(error) = expand_context_provider(func, ContextProviderArgs::default()) else {
+            return Err(TestError::Unexpected(
+                "owned second param must be rejected".to_owned(),
+            ));
+        };
         assert!(
             error
                 .to_string()
                 .contains("the second `#[context_provider]` argument (state) must be a reference")
         );
+        Ok(())
     }
 
     // ── expand_instructions_provider ──────────────────────────────────────────
 
     #[test]
-    fn expand_instructions_provider_stateless_derives_struct_name_from_fn() {
+    fn expand_instructions_provider_stateless_derives_struct_name_from_fn() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn baseline_instructions() -> LoadedInstructions {
                 LoadedInstructions::default()
             }
         };
         let tokens = expand_instructions_provider(func, ContributorArgs::default())
-            .expect("valid stateless fn must expand");
+            .map_err(ctx("valid stateless fn must expand"))?;
         let flat = normalize(&tokens);
 
         assert!(flat.contains("pubstructBaselineInstructionsProvider;"));
@@ -1069,84 +1111,100 @@ mod contributor_tests {
             "impl::harw_extension_api::InstructionsProviderforBaselineInstructionsProvider"
         ));
         assert!(flat.contains("baseline_instructions()"));
+        Ok(())
     }
 
     #[test]
-    fn expand_instructions_provider_stateful_generates_state_field() {
+    fn expand_instructions_provider_stateful_generates_state_field() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn baseline_instructions(state: &BaselineState) -> LoadedInstructions {
                 LoadedInstructions::default()
             }
         };
         let tokens = expand_instructions_provider(func, ContributorArgs::default())
-            .expect("valid stateful fn must expand");
+            .map_err(ctx("valid stateful fn must expand"))?;
         let flat = normalize(&tokens);
 
         assert!(flat.contains("pubstructBaselineInstructionsProvider{state:BaselineState,}"));
         assert!(flat.contains("baseline_instructions(&self.state)"));
+        Ok(())
     }
 
     #[test]
-    fn expand_instructions_provider_rejects_non_async_fn() {
+    fn expand_instructions_provider_rejects_non_async_fn() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             fn baseline_instructions() -> LoadedInstructions {
                 LoadedInstructions::default()
             }
         };
-        let error = expand_instructions_provider(func, ContributorArgs::default())
-            .expect_err("non-async fn must be rejected");
+        let Err(error) = expand_instructions_provider(func, ContributorArgs::default()) else {
+            return Err(TestError::Unexpected(
+                "non-async fn must be rejected".to_owned(),
+            ));
+        };
         assert_eq!(
             error.to_string(),
             "#[instructions_provider] requires an `async fn`"
         );
+        Ok(())
     }
 
     #[test]
-    fn expand_instructions_provider_rejects_too_many_params() {
+    fn expand_instructions_provider_rejects_too_many_params() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn baseline_instructions(state: &BaselineState, extra: &ExtraState) -> LoadedInstructions {
                 LoadedInstructions::default()
             }
         };
-        let error = expand_instructions_provider(func, ContributorArgs::default())
-            .expect_err("more than one param must be rejected");
+        let Err(error) = expand_instructions_provider(func, ContributorArgs::default()) else {
+            return Err(TestError::Unexpected(
+                "more than one param must be rejected".to_owned(),
+            ));
+        };
         assert!(
             error
                 .to_string()
                 .contains("accepts at most `(state: &StateType)`")
         );
+        Ok(())
     }
 
     #[test]
-    fn expand_instructions_provider_rejects_param_not_reference() {
+    fn expand_instructions_provider_rejects_param_not_reference() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn baseline_instructions(state: BaselineState) -> LoadedInstructions {
                 LoadedInstructions::default()
             }
         };
-        let error = expand_instructions_provider(func, ContributorArgs::default())
-            .expect_err("owned state param must be rejected");
+        let Err(error) = expand_instructions_provider(func, ContributorArgs::default()) else {
+            return Err(TestError::Unexpected(
+                "owned state param must be rejected".to_owned(),
+            ));
+        };
         assert!(
-            error
-                .to_string()
-                .contains("the first `#[instructions_provider]` argument (state) must be a reference")
+            error.to_string().contains(
+                "the first `#[instructions_provider]` argument (state) must be a reference"
+            )
         );
+        Ok(())
     }
 
     #[test]
-    fn expand_instructions_provider_struct_name_override_is_used() {
+    fn expand_instructions_provider_struct_name_override_is_used() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn baseline_instructions() -> LoadedInstructions {
                 LoadedInstructions::default()
             }
         };
-        let args =
-            parse_instructions_provider_args(quote!(struct_name = "CustomInstructions")).unwrap();
-        let tokens = expand_instructions_provider(func, args).expect("override must expand");
+        let args = parse_instructions_provider_args(quote!(struct_name = "CustomInstructions"))
+            .map_err(ctx("struct_name override should parse"))?;
+        let tokens =
+            expand_instructions_provider(func, args).map_err(ctx("override must expand"))?;
         let flat = normalize(&tokens);
 
         assert!(flat.contains("pubstructCustomInstructions;"));
         assert!(!flat.contains("BaselineInstructionsProvider"));
+        Ok(())
     }
 
     // ── Doc-Durchreichung (AP: Migrationsblocker 2) ───────────────────────────
@@ -1157,7 +1215,7 @@ mod contributor_tests {
     /// verlangt exakte Adjazenz zum `pub struct`, damit der Test scheitern
     /// würde, wenn die Doku nur auf `#func` verbliebe.
     #[test]
-    fn expand_context_provider_forwards_fn_doc_to_generated_struct() {
+    fn expand_context_provider_forwards_fn_doc_to_generated_struct() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             /// Emits project metadata fragments.
             async fn goal_context(ctx: &TurnInputContext) -> Vec<ContextFragment> {
@@ -1165,7 +1223,7 @@ mod contributor_tests {
             }
         };
         let tokens = expand_context_provider(func, ContextProviderArgs::default())
-            .expect("documented fn must expand");
+            .map_err(ctx("documented fn must expand"))?;
         let flat = normalize(&tokens);
 
         assert!(
@@ -1174,11 +1232,12 @@ mod contributor_tests {
             "doc comment of the annotated fn must be forwarded directly onto \
              the generated struct, immediately preceding its derive/definition"
         );
+        Ok(())
     }
 
     /// Dieselbe Prüfung für `#[instructions_provider]`.
     #[test]
-    fn expand_instructions_provider_forwards_fn_doc_to_generated_struct() {
+    fn expand_instructions_provider_forwards_fn_doc_to_generated_struct() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             /// Loads the baseline system prompt.
             async fn baseline_instructions() -> LoadedInstructions {
@@ -1186,15 +1245,17 @@ mod contributor_tests {
             }
         };
         let tokens = expand_instructions_provider(func, ContributorArgs::default())
-            .expect("documented fn must expand");
+            .map_err(ctx("documented fn must expand"))?;
         let flat = normalize(&tokens);
 
         assert!(
-            flat.contains("#[derive(Debug,Clone,Copy,Default)]pubstructBaselineInstructionsProvider;")
-                && doc_precedes_struct(&flat, "BaselineInstructionsProvider"),
+            flat.contains(
+                "#[derive(Debug,Clone,Copy,Default)]pubstructBaselineInstructionsProvider;"
+            ) && doc_precedes_struct(&flat, "BaselineInstructionsProvider"),
             "doc comment of the annotated fn must be forwarded directly onto \
              the generated struct, immediately preceding its derive/definition"
         );
+        Ok(())
     }
 
     // ── Derive-Wahl für zustandsbehaftete Provider ────────────────────────────
@@ -1203,32 +1264,33 @@ mod contributor_tests {
     /// `Clone`/`Copy`/`Default`, die für einen beliebigen `state`-Typ nicht
     /// garantiert werden können) — siehe Moduldoc, Punkt 1.
     #[test]
-    fn expand_context_provider_stateful_derives_debug() {
+    fn expand_context_provider_stateful_derives_debug() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn goal_context(ctx: &TurnInputContext, state: &GoalContextState) -> Vec<ContextFragment> {
                 Vec::new()
             }
         };
         let tokens = expand_context_provider(func, ContextProviderArgs::default())
-            .expect("valid stateful fn must expand");
+            .map_err(ctx("valid stateful fn must expand"))?;
         let flat = normalize(&tokens);
 
         assert!(
             flat.contains("#[derive(Debug)]pubstructGoalContextProvider{state:GoalContextState,}"),
             "stateful provider must derive Debug for tracing/observability"
         );
+        Ok(())
     }
 
     /// Dieselbe Prüfung für `#[instructions_provider]`.
     #[test]
-    fn expand_instructions_provider_stateful_derives_debug() {
+    fn expand_instructions_provider_stateful_derives_debug() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn baseline_instructions(state: &BaselineState) -> LoadedInstructions {
                 LoadedInstructions::default()
             }
         };
         let tokens = expand_instructions_provider(func, ContributorArgs::default())
-            .expect("valid stateful fn must expand");
+            .map_err(ctx("valid stateful fn must expand"))?;
         let flat = normalize(&tokens);
 
         assert!(
@@ -1237,6 +1299,7 @@ mod contributor_tests {
             ),
             "stateful provider must derive Debug for tracing/observability"
         );
+        Ok(())
     }
 
     /// Nutzt das ergänzte `Debug`-Derive tatsächlich (nicht nur strukturelle
@@ -1275,62 +1338,83 @@ mod contributor_tests {
     // ── AW3-03-Nachzug: `namespace`, `trust` ──────────────────────────────────
 
     #[test]
-    fn parse_context_provider_args_accepts_namespace_and_trust() {
+    fn parse_context_provider_args_accepts_namespace_and_trust() -> TestResult {
         let args = parse_context_provider_args(quote! {
             namespace = "plan", trust = Evidence
         })
-        .expect("valid namespace/trust must parse");
+        .map_err(ctx("valid namespace/trust must parse"))?;
         assert_eq!(
             args.namespace.as_ref().map(LitStr::value),
             Some("plan".to_owned())
         );
-        assert_eq!(args.trust.as_ref().map(Ident::to_string), Some("Evidence".to_owned()));
+        assert_eq!(
+            args.trust.as_ref().map(Ident::to_string),
+            Some("Evidence".to_owned())
+        );
+        Ok(())
     }
 
     #[test]
-    fn parse_context_provider_args_rejects_empty_namespace() {
-        let error = parse_context_provider_args(quote!(namespace = ""))
-            .expect_err("empty namespace must be rejected");
+    fn parse_context_provider_args_rejects_empty_namespace() -> TestResult {
+        let Err(error) = parse_context_provider_args(quote!(namespace = "")) else {
+            return Err(TestError::Unexpected(
+                "empty namespace must be rejected".to_owned(),
+            ));
+        };
         assert!(error.to_string().contains("must not be empty"));
+        Ok(())
     }
 
     #[test]
-    fn parse_context_provider_args_rejects_namespace_with_invalid_character() {
-        let error = parse_context_provider_args(quote!(namespace = "My.Namespace"))
-            .expect_err("uppercase and '.' must be rejected");
+    fn parse_context_provider_args_rejects_namespace_with_invalid_character() -> TestResult {
+        let Err(error) = parse_context_provider_args(quote!(namespace = "My.Namespace")) else {
+            return Err(TestError::Unexpected(
+                "uppercase and '.' must be rejected".to_owned(),
+            ));
+        };
         assert!(error.to_string().contains("invalid character"));
+        Ok(())
     }
 
     #[test]
-    fn parse_context_provider_args_rejects_unknown_trust_class() {
-        let error = parse_context_provider_args(quote!(trust = Bogus))
-            .expect_err("unknown trust class must be rejected");
+    fn parse_context_provider_args_rejects_unknown_trust_class() -> TestResult {
+        let Err(error) = parse_context_provider_args(quote!(trust = Bogus)) else {
+            return Err(TestError::Unexpected(
+                "unknown trust class must be rejected".to_owned(),
+            ));
+        };
         assert!(error.to_string().contains("unknown trust class `Bogus`"));
+        Ok(())
     }
 
     #[test]
-    fn expand_context_provider_default_namespace_is_fn_name() {
+    fn expand_context_provider_default_namespace_is_fn_name() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn goal_context(ctx: &TurnInputContext) -> Vec<ContextFragment> {
                 Vec::new()
             }
         };
-        let tokens = expand_context_provider(func, ContextProviderArgs::default()).unwrap();
+        let tokens = expand_context_provider(func, ContextProviderArgs::default())
+            .map_err(ctx("valid stateless fn must expand"))?;
         let flat = normalize(&tokens);
         assert!(flat.contains("pubconstNAMESPACE:&'staticstr=\"goal_context\""));
+        Ok(())
     }
 
     #[test]
-    fn expand_context_provider_explicit_namespace_is_used() {
+    fn expand_context_provider_explicit_namespace_is_used() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn goal_context(ctx: &TurnInputContext) -> Vec<ContextFragment> {
                 Vec::new()
             }
         };
-        let args = parse_context_provider_args(quote!(namespace = "plan")).unwrap();
-        let tokens = expand_context_provider(func, args).unwrap();
+        let args = parse_context_provider_args(quote!(namespace = "plan"))
+            .map_err(ctx("namespace override should parse"))?;
+        let tokens =
+            expand_context_provider(func, args).map_err(ctx("valid stateless fn must expand"))?;
         let flat = normalize(&tokens);
         assert!(flat.contains("pubconstNAMESPACE:&'staticstr=\"plan\""));
+        Ok(())
     }
 
     /// Belegt, dass die Vorgabe für `trust` nachweislich die niedrigste Klasse
@@ -1338,32 +1422,37 @@ mod contributor_tests {
     /// Moduldoku. Ein Provider, der `trust` nicht angibt, darf niemals still
     /// `Instruction` oder `Evidence` bekommen.
     #[test]
-    fn expand_context_provider_default_trust_is_lowest_class() {
+    fn expand_context_provider_default_trust_is_lowest_class() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn goal_context(ctx: &TurnInputContext) -> Vec<ContextFragment> {
                 Vec::new()
             }
         };
-        let tokens = expand_context_provider(func, ContextProviderArgs::default()).unwrap();
+        let tokens = expand_context_provider(func, ContextProviderArgs::default())
+            .map_err(ctx("valid stateless fn must expand"))?;
         let flat = normalize(&tokens);
         assert!(flat.contains(
             "pubconstTRUST:::harw_extension_api::TrustClass=::harw_extension_api::TrustClass::Data;"
         ));
+        Ok(())
     }
 
     #[test]
-    fn expand_context_provider_explicit_trust_is_used() {
+    fn expand_context_provider_explicit_trust_is_used() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn goal_context(ctx: &TurnInputContext) -> Vec<ContextFragment> {
                 Vec::new()
             }
         };
-        let args = parse_context_provider_args(quote!(trust = Instruction)).unwrap();
-        let tokens = expand_context_provider(func, args).unwrap();
+        let args = parse_context_provider_args(quote!(trust = Instruction))
+            .map_err(ctx("trust override should parse"))?;
+        let tokens =
+            expand_context_provider(func, args).map_err(ctx("valid stateless fn must expand"))?;
         let flat = normalize(&tokens);
         assert!(flat.contains(
             "pubconstTRUST:::harw_extension_api::TrustClass=::harw_extension_api::TrustClass::Instruction;"
         ));
+        Ok(())
     }
 
     /// Belegt, dass jeder generierte Provider zusätzlich `DeclaredContextProvider`
@@ -1371,13 +1460,14 @@ mod contributor_tests {
     /// `Arc<dyn ContextProvider>` überleben (siehe Moduldoku, Abschnitt „Wie
     /// NAMESPACE/TRUST bei der Registrierung ankommen").
     #[test]
-    fn expand_context_provider_implements_declared_context_provider() {
+    fn expand_context_provider_implements_declared_context_provider() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn goal_context(ctx: &TurnInputContext) -> Vec<ContextFragment> {
                 Vec::new()
             }
         };
-        let tokens = expand_context_provider(func, ContextProviderArgs::default()).unwrap();
+        let tokens = expand_context_provider(func, ContextProviderArgs::default())
+            .map_err(ctx("valid stateless fn must expand"))?;
         let flat = normalize(&tokens);
         assert!(flat.contains(
             "impl::harw_extension_api::registry::DeclaredContextProviderforGoalContextProvider"
@@ -1386,6 +1476,7 @@ mod contributor_tests {
         assert!(flat.contains(
             "fndeclared_max_trust(&self)->::harw_extension_api::TrustClass{Self::TRUST}"
         ));
+        Ok(())
     }
 
     // ── Nachzug: `ContextProvider::namespace()`/`max_trust()` selbst ──────────
@@ -1397,21 +1488,21 @@ mod contributor_tests {
     /// deklarierte Klasse melden, hier `Evidence` — der Kernbefund, den
     /// dieser Nachzug behebt.
     #[test]
-    fn expand_context_provider_overrides_context_provider_max_trust_with_declared_value() {
+    fn expand_context_provider_overrides_context_provider_max_trust_with_declared_value()
+    -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn goal_context(ctx: &TurnInputContext) -> Vec<ContextFragment> {
                 Vec::new()
             }
         };
-        let args = parse_context_provider_args(quote!(trust = Evidence)).unwrap();
-        let tokens = expand_context_provider(func, args).unwrap();
+        let args = parse_context_provider_args(quote!(trust = Evidence))
+            .map_err(ctx("trust override should parse"))?;
+        let tokens =
+            expand_context_provider(func, args).map_err(ctx("valid stateless fn must expand"))?;
         let flat = normalize(&tokens);
-        assert!(flat.contains(
-            "impl::harw_extension_api::ContextProviderforGoalContextProvider"
-        ));
-        assert!(flat.contains(
-            "fnmax_trust(&self)->::harw_extension_api::TrustClass{Self::TRUST}"
-        ));
+        assert!(flat.contains("impl::harw_extension_api::ContextProviderforGoalContextProvider"));
+        assert!(flat.contains("fnmax_trust(&self)->::harw_extension_api::TrustClass{Self::TRUST}"));
+        Ok(())
     }
 
     /// Ohne `trust`-Angabe hält die Vorgabe: `Self::TRUST` bleibt
@@ -1419,36 +1510,41 @@ mod contributor_tests {
     /// nur `Self::TRUST` zurück — kein erfundener Wert, kein Typname als
     /// Klasse.
     #[test]
-    fn expand_context_provider_overrides_context_provider_max_trust_defaults_to_data() {
+    fn expand_context_provider_overrides_context_provider_max_trust_defaults_to_data() -> TestResult
+    {
         let func: ItemFn = syn::parse_quote! {
             async fn goal_context(ctx: &TurnInputContext) -> Vec<ContextFragment> {
                 Vec::new()
             }
         };
-        let tokens = expand_context_provider(func, ContextProviderArgs::default()).unwrap();
+        let tokens = expand_context_provider(func, ContextProviderArgs::default())
+            .map_err(ctx("valid stateless fn must expand"))?;
         let flat = normalize(&tokens);
         assert!(flat.contains(
             "pubconstTRUST:::harw_extension_api::TrustClass=::harw_extension_api::TrustClass::Data;"
         ));
-        assert!(flat.contains(
-            "fnmax_trust(&self)->::harw_extension_api::TrustClass{Self::TRUST}"
-        ));
+        assert!(flat.contains("fnmax_trust(&self)->::harw_extension_api::TrustClass{Self::TRUST}"));
+        Ok(())
     }
 
     /// Ein deklarierter `namespace` muss über `ContextProvider::namespace()`
     /// selbst ankommen, nicht nur über `DeclaredContextProvider`.
     #[test]
-    fn expand_context_provider_overrides_context_provider_namespace_with_declared_value() {
+    fn expand_context_provider_overrides_context_provider_namespace_with_declared_value()
+    -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn goal_context(ctx: &TurnInputContext) -> Vec<ContextFragment> {
                 Vec::new()
             }
         };
-        let args = parse_context_provider_args(quote!(namespace = "plan")).unwrap();
-        let tokens = expand_context_provider(func, args).unwrap();
+        let args = parse_context_provider_args(quote!(namespace = "plan"))
+            .map_err(ctx("namespace override should parse"))?;
+        let tokens =
+            expand_context_provider(func, args).map_err(ctx("valid stateless fn must expand"))?;
         let flat = normalize(&tokens);
         assert!(flat.contains("pubconstNAMESPACE:&'staticstr=\"plan\""));
         assert!(flat.contains("fnnamespace(&self)->&'staticstr{Self::NAMESPACE}"));
+        Ok(())
     }
 
     /// Ohne `namespace`-Angabe fällt `NAMESPACE` auf den Funktionsnamen
@@ -1456,28 +1552,39 @@ mod contributor_tests {
     /// weiterhin mit `Self::NAMESPACE`, nicht mit dem Trait-Vorgabewert
     /// (`std::any::type_name::<Self>()`).
     #[test]
-    fn expand_context_provider_overrides_context_provider_namespace_defaults_to_fn_name() {
+    fn expand_context_provider_overrides_context_provider_namespace_defaults_to_fn_name()
+    -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn goal_context(ctx: &TurnInputContext) -> Vec<ContextFragment> {
                 Vec::new()
             }
         };
-        let tokens = expand_context_provider(func, ContextProviderArgs::default()).unwrap();
+        let tokens = expand_context_provider(func, ContextProviderArgs::default())
+            .map_err(ctx("valid stateless fn must expand"))?;
         let flat = normalize(&tokens);
         assert!(flat.contains("pubconstNAMESPACE:&'staticstr=\"goal_context\""));
         assert!(flat.contains("fnnamespace(&self)->&'staticstr{Self::NAMESPACE}"));
+        Ok(())
     }
 
     #[test]
-    fn expand_context_provider_rejects_uppercase_default_namespace() {
+    fn expand_context_provider_rejects_uppercase_default_namespace() -> TestResult {
         let func: ItemFn = syn::parse_quote! {
             async fn GoalContext(ctx: &TurnInputContext) -> Vec<ContextFragment> {
                 Vec::new()
             }
         };
-        let error = expand_context_provider(func, ContextProviderArgs::default())
-            .expect_err("an uppercase fn name must not silently become a broken default namespace");
-        assert!(error.to_string().contains("is not a valid default namespace"));
+        let Err(error) = expand_context_provider(func, ContextProviderArgs::default()) else {
+            return Err(TestError::Unexpected(
+                "an uppercase fn name must not silently become a broken default namespace"
+                    .to_owned(),
+            ));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("is not a valid default namespace")
+        );
+        Ok(())
     }
 }
-

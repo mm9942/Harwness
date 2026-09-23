@@ -279,6 +279,7 @@ impl Default for CancelToken {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn test_new_is_not_cancelled() {
@@ -347,7 +348,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cancelled_future_completes_after_cancel() {
+    async fn test_cancelled_future_completes_after_cancel() -> TestResult {
         let token = CancelToken::new();
         let waiter = token.clone();
 
@@ -359,7 +360,8 @@ mod tests {
 
         handle
             .await
-            .expect("cancelled() task must not panic or be aborted");
+            .map_err(ctx("cancelled() task must not panic or be aborted"))?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -373,7 +375,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cancelled_future_completes_via_parent_cancellation() {
+    async fn test_cancelled_future_completes_via_parent_cancellation() -> TestResult {
         let parent = CancelToken::new();
         let child = parent.child();
 
@@ -385,6 +387,7 @@ mod tests {
 
         handle
             .await
-            .expect("child cancelled() task must not panic or be aborted");
+            .map_err(ctx("child cancelled() task must not panic or be aborted"))?;
+        Ok(())
     }
 }

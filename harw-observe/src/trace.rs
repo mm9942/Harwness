@@ -141,57 +141,84 @@ fn is_lowercase_hex_of_len(value: &str, len: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
+
+    // Lokale Variablen heißen hier `ctx` (TraceContext-Instanzen) — der Test-Helfer
+    // `ctx()` wird deshalb überall voll qualifiziert aufgerufen, um die Verschattung
+    // zu vermeiden (siehe Worker-Zusatz).
 
     #[test]
-    fn test_trace_context_new_accepts_valid_hex() {
-        let ctx = TraceContext::new("a".repeat(32), "b".repeat(16)).unwrap();
+    fn test_trace_context_new_accepts_valid_hex() -> TestResult {
+        let ctx = TraceContext::new("a".repeat(32), "b".repeat(16))
+            .map_err(crate::test_support::ctx("TraceContext::new"))?;
         assert_eq!(ctx.trace_id, "a".repeat(32));
         assert_eq!(ctx.span_id, "b".repeat(16));
         assert!(ctx.parent_span_id.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_trace_context_new_rejects_wrong_length() {
-        let err = TraceContext::new("short", "b".repeat(16)).unwrap_err();
+    fn test_trace_context_new_rejects_wrong_length() -> TestResult {
+        let result = TraceContext::new("short", "b".repeat(16));
+        let Err(err) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, ObserveError::InvalidTraceId { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_trace_context_new_rejects_uppercase() {
-        let err = TraceContext::new("A".repeat(32), "b".repeat(16)).unwrap_err();
+    fn test_trace_context_new_rejects_uppercase() -> TestResult {
+        let result = TraceContext::new("A".repeat(32), "b".repeat(16));
+        let Err(err) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, ObserveError::InvalidTraceId { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_trace_context_new_rejects_invalid_span_id() {
-        let err = TraceContext::new("a".repeat(32), "bad").unwrap_err();
+    fn test_trace_context_new_rejects_invalid_span_id() -> TestResult {
+        let result = TraceContext::new("a".repeat(32), "bad");
+        let Err(err) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, ObserveError::InvalidSpanId { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_trace_context_with_parent_sets_field() {
+    fn test_trace_context_with_parent_sets_field() -> TestResult {
         let ctx = TraceContext::new("a".repeat(32), "b".repeat(16))
-            .unwrap()
+            .map_err(crate::test_support::ctx("TraceContext::new"))?
             .with_parent("c".repeat(16))
-            .unwrap();
+            .map_err(crate::test_support::ctx("TraceContext::with_parent"))?;
         assert_eq!(ctx.parent_span_id.as_deref(), Some("c".repeat(16).as_str()));
+        Ok(())
     }
 
     #[test]
-    fn test_trace_context_with_parent_rejects_invalid() {
-        let err = TraceContext::new("a".repeat(32), "b".repeat(16))
-            .unwrap()
-            .with_parent("bad")
-            .unwrap_err();
+    fn test_trace_context_with_parent_rejects_invalid() -> TestResult {
+        let ctx = TraceContext::new("a".repeat(32), "b".repeat(16))
+            .map_err(crate::test_support::ctx("TraceContext::new"))?;
+        let result = ctx.with_parent("bad");
+        let Err(err) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, ObserveError::InvalidSpanId { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_trace_context_serde_roundtrip() {
-        let ctx = TraceContext::new("a".repeat(32), "b".repeat(16)).unwrap();
-        let json = serde_json::to_string(&ctx).unwrap();
-        let back: TraceContext = serde_json::from_str(&json).unwrap();
+    fn test_trace_context_serde_roundtrip() -> TestResult {
+        let ctx = TraceContext::new("a".repeat(32), "b".repeat(16))
+            .map_err(crate::test_support::ctx("TraceContext::new"))?;
+        let json =
+            serde_json::to_string(&ctx).map_err(crate::test_support::ctx("serialisieren"))?;
+        let back: TraceContext =
+            serde_json::from_str(&json).map_err(crate::test_support::ctx("deserialisieren"))?;
         assert_eq!(ctx, back);
+        Ok(())
     }
 
     #[test]
@@ -202,19 +229,24 @@ mod tests {
     }
 
     #[test]
-    fn test_trace_context_parent_span_id_omitted_when_none() {
-        let ctx = TraceContext::new("a".repeat(32), "b".repeat(16)).unwrap();
-        let json = serde_json::to_string(&ctx).unwrap();
+    fn test_trace_context_parent_span_id_omitted_when_none() -> TestResult {
+        let ctx = TraceContext::new("a".repeat(32), "b".repeat(16))
+            .map_err(crate::test_support::ctx("TraceContext::new"))?;
+        let json =
+            serde_json::to_string(&ctx).map_err(crate::test_support::ctx("serialisieren"))?;
         assert!(!json.contains("parent_span_id"));
+        Ok(())
     }
 
     #[test]
-    fn test_trace_context_parent_span_id_present_when_set() {
+    fn test_trace_context_parent_span_id_present_when_set() -> TestResult {
         let ctx = TraceContext::new("a".repeat(32), "b".repeat(16))
-            .unwrap()
+            .map_err(crate::test_support::ctx("TraceContext::new"))?
             .with_parent("c".repeat(16))
-            .unwrap();
-        let json = serde_json::to_string(&ctx).unwrap();
+            .map_err(crate::test_support::ctx("TraceContext::with_parent"))?;
+        let json =
+            serde_json::to_string(&ctx).map_err(crate::test_support::ctx("serialisieren"))?;
         assert!(json.contains("parent_span_id"));
+        Ok(())
     }
 }

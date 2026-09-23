@@ -342,16 +342,18 @@ fn artifact_id_from_relative(prefix: &str, relative: &Path) -> Option<ArtifactId
 mod tests {
     use super::*;
     use crate::artifact::Frontmatter;
+    use crate::test_support::{TestError, TestResult};
     use crate::visibility::{AgentId, VisibilityScope};
 
-    fn temporary_root(label: &str) -> PathBuf {
+    fn temporary_root(label: &str) -> TestResult<PathBuf> {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock is after epoch")
+            .map_err(crate::test_support::ctx("system clock is after epoch"))?
             .as_nanos();
         let root = std::env::temp_dir().join(format!("{label}-{}-{nonce}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("create temporary knowledge root");
-        root
+        std::fs::create_dir_all(&root)
+            .map_err(crate::test_support::ctx("create temporary knowledge root"))?;
+        Ok(root)
     }
 
     fn frontmatter() -> Frontmatter {
@@ -363,8 +365,8 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_reads_the_durable_layout_and_restores_backlinks() {
-        let root = temporary_root("harw-knowledge-rebuild");
+    fn rebuild_reads_the_durable_layout_and_restores_backlinks() -> TestResult {
+        let root = temporary_root("harw-knowledge-rebuild")?;
         let store = KnowledgeStore::new(&root);
 
         let core = KnowledgeArtifact::new(
@@ -375,7 +377,7 @@ mod tests {
         );
         store
             .write_artifact(&store.core_memory_path(), &core)
-            .expect("write core artifact");
+            .map_err(crate::test_support::ctx("write core artifact"))?;
 
         let mut topic_frontmatter = frontmatter();
         topic_frontmatter
@@ -389,7 +391,7 @@ mod tests {
         );
         store
             .write_artifact(&root.join("topics/nested/runtime.md"), &topic)
-            .expect("write topic artifact");
+            .map_err(crate::test_support::ctx("write topic artifact"))?;
 
         let palace = KnowledgeArtifact::new(
             ArtifactId::new("palace/deploy"),
@@ -399,9 +401,10 @@ mod tests {
         );
         store
             .write_artifact(&store.palace_path(&ArtifactId::new("deploy")), &palace)
-            .expect("write palace artifact");
+            .map_err(crate::test_support::ctx("write palace artifact"))?;
 
-        let rebuilt = KnowledgeIndex::rebuild(&store).expect("rebuild index");
+        let rebuilt =
+            KnowledgeIndex::rebuild(&store).map_err(crate::test_support::ctx("rebuild index"))?;
 
         assert_eq!(rebuilt.len(), 3);
         assert!(rebuilt.get(&ArtifactId::new("core/memory")).is_some());
@@ -410,23 +413,26 @@ mod tests {
             ArtifactId::new("topic/nested/runtime")
         );
 
-        std::fs::remove_dir_all(root).expect("remove temporary knowledge root");
+        std::fs::remove_dir_all(root)
+            .map_err(crate::test_support::ctx("remove temporary knowledge root"))?;
+        Ok(())
     }
 
     /// AW5-09: a `ContextProposal` artifact written under `context-proposals/`
     /// is picked up by `rebuild`, just like the six pre-existing surfaces.
     #[test]
-    fn rebuild_indexes_context_proposals() {
+    fn rebuild_indexes_context_proposals() -> TestResult {
         use crate::context_proposal::ContextProposal;
         use harw_agent_dsl::ids::DefinitionId;
 
-        let root = temporary_root("harw-knowledge-rebuild-context-proposal");
+        let root = temporary_root("harw-knowledge-rebuild-context-proposal")?;
         let store = KnowledgeStore::new(&root);
 
         let proposal = ContextProposal::new(
             ArtifactId::new("context-proposal/promote-history-tail"),
             "history.tail wiederholt über Budget ausgelassen",
-            DefinitionId::parse("harwness.context.base@1").expect("valid definition id"),
+            DefinitionId::parse("harwness.context.base@1")
+                .map_err(crate::test_support::ctx("valid definition id"))?,
             "deadbeef".repeat(8),
             Vec::new(),
             Vec::new(),
@@ -437,30 +443,33 @@ mod tests {
         proposal_frontmatter.visibility = VisibilityScope::OperatorOnly;
         let artifact = proposal
             .to_artifact(proposal_frontmatter)
-            .expect("proposal embeds into an artifact");
+            .map_err(crate::test_support::ctx("proposal embeds into an artifact"))?;
         store
             .write_artifact(
                 &store.context_proposal_path(&ArtifactId::new("promote-history-tail")),
                 &artifact,
             )
-            .expect("write context-proposal artifact");
+            .map_err(crate::test_support::ctx("write context-proposal artifact"))?;
 
-        let rebuilt = KnowledgeIndex::rebuild(&store).expect("rebuild index");
+        let rebuilt =
+            KnowledgeIndex::rebuild(&store).map_err(crate::test_support::ctx("rebuild index"))?;
 
         assert_eq!(rebuilt.len(), 1);
         let indexed = rebuilt
             .get(&ArtifactId::new("context-proposal/promote-history-tail"))
-            .expect("context-proposal artifact is indexed");
+            .ok_or(TestError::Missing("context-proposal artifact is indexed"))?;
         assert_eq!(indexed.kind, ArtifactKind::ContextProposal);
 
-        std::fs::remove_dir_all(root).expect("remove temporary knowledge root");
+        std::fs::remove_dir_all(root)
+            .map_err(crate::test_support::ctx("remove temporary knowledge root"))?;
+        Ok(())
     }
 
     #[test]
-    fn rebuild_treats_a_missing_root_as_an_empty_store() {
+    fn rebuild_treats_a_missing_root_as_an_empty_store() -> TestResult {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock is after epoch")
+            .map_err(crate::test_support::ctx("system clock is after epoch"))?
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
             "harw-knowledge-missing-{}-{}",
@@ -469,37 +478,49 @@ mod tests {
         ));
         let store = KnowledgeStore::new(&root);
 
-        let rebuilt = KnowledgeIndex::rebuild(&store).expect("empty rebuild");
+        let rebuilt =
+            KnowledgeIndex::rebuild(&store).map_err(crate::test_support::ctx("empty rebuild"))?;
 
         assert!(rebuilt.is_empty());
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn markdown_files_rejects_symlink_escapes_and_cycles_but_keeps_regular_directories() {
-        let root = temporary_root("harw-knowledge-markdown-files");
-        let external = temporary_root("harw-knowledge-external");
-        std::fs::write(root.join("inside.md"), "inside").expect("write in-root markdown");
-        std::fs::create_dir(root.join("nested")).expect("create in-root nested directory");
+    fn markdown_files_rejects_symlink_escapes_and_cycles_but_keeps_regular_directories()
+    -> TestResult {
+        let root = temporary_root("harw-knowledge-markdown-files")?;
+        let external = temporary_root("harw-knowledge-external")?;
+        std::fs::write(root.join("inside.md"), "inside")
+            .map_err(crate::test_support::ctx("write in-root markdown"))?;
+        std::fs::create_dir(root.join("nested"))
+            .map_err(crate::test_support::ctx("create in-root nested directory"))?;
         std::fs::write(root.join("nested/inside.md"), "nested inside")
-            .expect("write nested in-root markdown");
-        std::fs::write(external.join("outside.md"), "outside").expect("write external markdown");
-        std::os::unix::fs::symlink(&external, root.join("external"))
-            .expect("create external directory symlink");
+            .map_err(crate::test_support::ctx("write nested in-root markdown"))?;
+        std::fs::write(external.join("outside.md"), "outside")
+            .map_err(crate::test_support::ctx("write external markdown"))?;
+        std::os::unix::fs::symlink(&external, root.join("external")).map_err(
+            crate::test_support::ctx("create external directory symlink"),
+        )?;
         std::os::unix::fs::symlink(external.join("outside.md"), root.join("outside.md"))
-            .expect("create external markdown symlink");
+            .map_err(crate::test_support::ctx("create external markdown symlink"))?;
         std::os::unix::fs::symlink(&root, root.join("cycle"))
-            .expect("create cyclic directory symlink");
+            .map_err(crate::test_support::ctx("create cyclic directory symlink"))?;
 
-        let canonical_root = std::fs::canonicalize(&root).expect("canonicalize knowledge root");
-        let files = markdown_files(&root, &canonical_root).expect("collect bounded markdown files");
+        let canonical_root = std::fs::canonicalize(&root)
+            .map_err(crate::test_support::ctx("canonicalize knowledge root"))?;
+        let files = markdown_files(&root, &canonical_root)
+            .map_err(crate::test_support::ctx("collect bounded markdown files"))?;
 
         assert_eq!(
             files,
             vec![root.join("inside.md"), root.join("nested/inside.md")]
         );
 
-        std::fs::remove_dir_all(root).expect("remove temporary knowledge root");
-        std::fs::remove_dir_all(external).expect("remove temporary external root");
+        std::fs::remove_dir_all(root)
+            .map_err(crate::test_support::ctx("remove temporary knowledge root"))?;
+        std::fs::remove_dir_all(external)
+            .map_err(crate::test_support::ctx("remove temporary external root"))?;
+        Ok(())
     }
 }

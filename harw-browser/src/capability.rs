@@ -157,6 +157,7 @@ impl BrowserCapabilityProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn test_new_constructs_probe_with_matching_fields() {
@@ -184,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn test_browser_capability_probe_serde_json_round_trip() {
+    fn test_browser_capability_probe_serde_json_round_trip() -> TestResult {
         let probe = BrowserCapabilityProbe::new(
             "firefox".to_owned(),
             None,
@@ -197,9 +198,10 @@ mod tests {
             CapabilityStatus::Native,
         );
 
-        let json = serde_json::to_string(&probe).expect("probe serializes");
+        let json = serde_json::to_string(&probe).map_err(ctx("probe serializes"))?;
         let decoded: BrowserCapabilityProbe =
-            serde_json::from_str(&json).expect("probe deserializes");
+            serde_json::from_str(&json).map_err(ctx("probe deserializes"))?;
         assert_eq!(decoded, probe);
+        Ok(())
     }
 }

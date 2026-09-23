@@ -82,3 +82,7 @@ pub use markdown::chunk_markdown;
 pub use plain::{chunk_plain, DEFAULT_OVERLAP_BYTES, DEFAULT_TARGET_BYTES};
 pub use relations::suggest_relations;
 pub use rust_code::chunk_rust;
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

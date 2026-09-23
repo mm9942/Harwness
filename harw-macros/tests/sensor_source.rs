@@ -27,6 +27,9 @@ use harw_dod_cap::{Bound, Capability, ReadScope, SensorHandle};
 use harw_dod_signals::{HostSample, Sensor, SensorReading};
 use harw_types::SensorId;
 
+mod common;
+use common::{TestResult, ctx};
+
 const TEMPDIR_PREFIX: &str = "harw-macros-sensor-source-test-";
 
 #[derive(Debug, harw_macros::SensorSource)]
@@ -54,8 +57,8 @@ struct ThermalSensor {
 
 fn build_sensor(dir: &std::path::Path) -> ThermalSensor {
     let scope = ReadScope::from_roots([dir.to_path_buf()]);
-    let handle = SensorHandle::new(SensorId::from_str("thermal-0"), ThermalSensor::CAPABILITY)
-        .bind(scope);
+    let handle =
+        SensorHandle::new(SensorId::from_str("thermal-0"), ThermalSensor::CAPABILITY).bind(scope);
     ThermalSensor { handle, zones: () }
 }
 
@@ -66,23 +69,23 @@ fn sensor_source_capability_and_id_constants_match_declaration() {
 }
 
 #[test]
-fn sensor_source_poll_reads_via_readfs_and_returns_expected_samples() {
+fn sensor_source_poll_reads_via_readfs_and_returns_expected_samples() -> TestResult {
     let dir = tempfile::Builder::new()
         .prefix(TEMPDIR_PREFIX)
         .tempdir()
-        .expect("tempdir for sensor fixture");
+        .map_err(ctx("tempdir for sensor fixture"))?;
 
     let zone0 = dir.path().join("thermal_zone0");
     let zone1 = dir.path().join("thermal_zone1");
-    fs::create_dir_all(&zone0).expect("create thermal_zone0");
-    fs::create_dir_all(&zone1).expect("create thermal_zone1");
-    fs::write(zone0.join("temp"), "42000\n").expect("write thermal_zone0/temp");
-    fs::write(zone1.join("temp"), "43000\n").expect("write thermal_zone1/temp");
+    fs::create_dir_all(&zone0).map_err(ctx("create thermal_zone0"))?;
+    fs::create_dir_all(&zone1).map_err(ctx("create thermal_zone1"))?;
+    fs::write(zone0.join("temp"), "42000\n").map_err(ctx("write thermal_zone0/temp"))?;
+    fs::write(zone1.join("temp"), "43000\n").map_err(ctx("write thermal_zone1/temp"))?;
 
     let sensor = build_sensor(dir.path());
     let reading = sensor
         .poll(jiff::Timestamp::UNIX_EPOCH)
-        .expect("poll must succeed for a well-formed fixture");
+        .map_err(ctx("poll must succeed for a well-formed fixture"))?;
 
     let expected = SensorReading {
         samples: vec![
@@ -103,46 +106,49 @@ fn sensor_source_poll_reads_via_readfs_and_returns_expected_samples() {
     };
 
     assert_eq!(reading, expected);
+    Ok(())
 }
 
 #[test]
-fn sensor_source_poll_is_deterministic_for_the_same_injected_now() {
+fn sensor_source_poll_is_deterministic_for_the_same_injected_now() -> TestResult {
     let dir = tempfile::Builder::new()
         .prefix(TEMPDIR_PREFIX)
         .tempdir()
-        .expect("tempdir for determinism fixture");
+        .map_err(ctx("tempdir for determinism fixture"))?;
 
     let zone0 = dir.path().join("thermal_zone0");
-    fs::create_dir_all(&zone0).expect("create thermal_zone0");
-    fs::write(zone0.join("temp"), "51000\n").expect("write thermal_zone0/temp");
+    fs::create_dir_all(&zone0).map_err(ctx("create thermal_zone0"))?;
+    fs::write(zone0.join("temp"), "51000\n").map_err(ctx("write thermal_zone0/temp"))?;
 
     let sensor = build_sensor(dir.path());
     let now = jiff::Timestamp::UNIX_EPOCH;
 
-    let first = sensor.poll(now).expect("first poll must succeed");
-    let second = sensor.poll(now).expect("second poll must succeed");
+    let first = sensor.poll(now).map_err(ctx("first poll must succeed"))?;
+    let second = sensor.poll(now).map_err(ctx("second poll must succeed"))?;
 
     assert_eq!(
         first, second,
         "two poll() calls with the same injected `now` must return exactly the same reading"
     );
+    Ok(())
 }
 
 #[test]
-fn sensor_source_poll_maps_outside_scope_to_sensor_error() {
+fn sensor_source_poll_maps_outside_scope_to_sensor_error() -> TestResult {
     // A glob pattern that resolves nothing inside the bound scope yields an
     // empty, successful reading rather than an error — `glob()` treats "no
     // matches" as a valid, empty result (see `harw-dod-readfs/src/glob.rs`).
     let dir = tempfile::Builder::new()
         .prefix(TEMPDIR_PREFIX)
         .tempdir()
-        .expect("tempdir for empty fixture");
+        .map_err(ctx("tempdir for empty fixture"))?;
 
     let sensor = build_sensor(dir.path());
     let reading = sensor
         .poll(jiff::Timestamp::UNIX_EPOCH)
-        .expect("poll over an empty fixture tree must still succeed");
+        .map_err(ctx("poll over an empty fixture tree must still succeed"))?;
 
     assert!(reading.samples.is_empty());
     assert!(reading.events.is_empty());
+    Ok(())
 }

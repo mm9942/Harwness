@@ -82,8 +82,8 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -183,10 +183,11 @@ impl PromEndpoint {
                 let socket_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
                 require_loopback(socket_addr)?;
 
-                let listener = TcpListener::bind(socket_addr).map_err(|source| PromError::Bind {
-                    address: socket_addr.to_string(),
-                    source,
-                })?;
+                let listener =
+                    TcpListener::bind(socket_addr).map_err(|source| PromError::Bind {
+                        address: socket_addr.to_string(),
+                        source,
+                    })?;
                 let local_tcp_addr = listener.local_addr().map_err(|source| PromError::Bind {
                     address: socket_addr.to_string(),
                     source,
@@ -198,7 +199,12 @@ impl PromEndpoint {
                         source,
                     })?;
 
-                let handle = spawn_tcp_server(listener, Arc::clone(&sink), Arc::clone(&stop), Arc::clone(&serve_errors));
+                let handle = spawn_tcp_server(
+                    listener,
+                    Arc::clone(&sink),
+                    Arc::clone(&stop),
+                    Arc::clone(&serve_errors),
+                );
 
                 Ok(Self {
                     sink,
@@ -222,7 +228,12 @@ impl PromEndpoint {
                         source,
                     })?;
 
-                let handle = spawn_unix_server(listener, Arc::clone(&sink), Arc::clone(&stop), Arc::clone(&serve_errors));
+                let handle = spawn_unix_server(
+                    listener,
+                    Arc::clone(&sink),
+                    Arc::clone(&stop),
+                    Arc::clone(&serve_errors),
+                );
 
                 Ok(Self {
                     sink,
@@ -420,6 +431,7 @@ fn build_response(request: &[u8], sink: &PromSink) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_observe::{Cardinality, MetricKey, MetricKind, MetricValue, TelemetrySink, Unit};
     use std::net::{IpAddr, Ipv4Addr as V4, TcpStream};
 
@@ -462,110 +474,154 @@ mod tests {
     }
 
     #[test]
-    fn test_require_loopback_rejects_public_address() {
+    fn test_require_loopback_rejects_public_address() -> TestResult {
         let addr = SocketAddr::from((IpAddr::V4(V4::new(93, 184, 216, 34)), 80));
-        let err = require_loopback(addr).expect_err("public address must be rejected");
+        let Err(err) = require_loopback(addr) else {
+            return Err(TestError::Unexpected(
+                "public address must be rejected".into(),
+            ));
+        };
         match err {
             PromError::NonLoopbackBind { address } => {
                 assert_eq!(address, "93.184.216.34:80");
             }
-            other => panic!("expected NonLoopbackBind, got {other}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NonLoopbackBind, got {other}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_bind_loopback_serves_metrics_over_tcp() {
-        let endpoint = PromEndpoint::bind(BindAddr::Loopback(0)).expect("loopback binds");
-        let addr = endpoint.local_addr().expect("tcp endpoint has a local address");
-        endpoint.sink().record(&TEST_KEY, MetricValue::Count(9), &[]);
+    fn test_bind_loopback_serves_metrics_over_tcp() -> TestResult {
+        let endpoint = PromEndpoint::bind(BindAddr::Loopback(0)).map_err(ctx("loopback binds"))?;
+        let addr = endpoint
+            .local_addr()
+            .ok_or(TestError::Missing("tcp endpoint has a local address"))?;
+        endpoint
+            .sink()
+            .record(&TEST_KEY, MetricValue::Count(9), &[]);
 
-        let mut stream = TcpStream::connect(addr).expect("connects to bound loopback port");
+        let mut stream =
+            TcpStream::connect(addr).map_err(ctx("connects to bound loopback port"))?;
         stream
             .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .expect("request writes");
+            .map_err(ctx("request writes"))?;
         let response = read_all(&mut stream);
 
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(response.contains("text/plain; version=0.0.4"), "{response}");
-        assert!(response.contains("harw_endpoint_test_total 9"), "{response}");
+        assert!(
+            response.contains("harw_endpoint_test_total 9"),
+            "{response}"
+        );
         assert_eq!(endpoint.serve_error_count(), 0);
+        Ok(())
     }
 
     #[test]
-    fn test_bind_loopback_returns_404_for_unknown_path() {
-        let endpoint = PromEndpoint::bind(BindAddr::Loopback(0)).expect("loopback binds");
-        let addr = endpoint.local_addr().expect("tcp endpoint has a local address");
+    fn test_bind_loopback_returns_404_for_unknown_path() -> TestResult {
+        let endpoint = PromEndpoint::bind(BindAddr::Loopback(0)).map_err(ctx("loopback binds"))?;
+        let addr = endpoint
+            .local_addr()
+            .ok_or(TestError::Missing("tcp endpoint has a local address"))?;
 
-        let mut stream = TcpStream::connect(addr).expect("connects to bound loopback port");
+        let mut stream =
+            TcpStream::connect(addr).map_err(ctx("connects to bound loopback port"))?;
         stream
             .write_all(b"GET /other HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .expect("request writes");
+            .map_err(ctx("request writes"))?;
         let response = read_all(&mut stream);
 
         assert!(response.starts_with("HTTP/1.1 404 Not Found"), "{response}");
+        Ok(())
     }
 
     #[test]
-    fn test_bind_loopback_returns_405_for_non_get_method() {
-        let endpoint = PromEndpoint::bind(BindAddr::Loopback(0)).expect("loopback binds");
-        let addr = endpoint.local_addr().expect("tcp endpoint has a local address");
+    fn test_bind_loopback_returns_405_for_non_get_method() -> TestResult {
+        let endpoint = PromEndpoint::bind(BindAddr::Loopback(0)).map_err(ctx("loopback binds"))?;
+        let addr = endpoint
+            .local_addr()
+            .ok_or(TestError::Missing("tcp endpoint has a local address"))?;
 
-        let mut stream = TcpStream::connect(addr).expect("connects to bound loopback port");
+        let mut stream =
+            TcpStream::connect(addr).map_err(ctx("connects to bound loopback port"))?;
         stream
             .write_all(b"POST /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .expect("request writes");
+            .map_err(ctx("request writes"))?;
         let response = read_all(&mut stream);
 
-        assert!(response.starts_with("HTTP/1.1 405 Method Not Allowed"), "{response}");
+        assert!(
+            response.starts_with("HTTP/1.1 405 Method Not Allowed"),
+            "{response}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_bind_unix_socket_serves_metrics_over_the_socket() {
+    fn test_bind_unix_socket_serves_metrics_over_the_socket() -> TestResult {
         use std::os::unix::net::UnixStream;
 
-        let dir = tempfile::tempdir().expect("temp dir creates");
+        let dir = tempfile::tempdir().map_err(ctx("temp dir creates"))?;
         let path = dir.path().join("prom.sock");
-        let endpoint =
-            PromEndpoint::bind(BindAddr::UnixSocket(path.clone())).expect("unix socket binds");
-        endpoint.sink().record(&TEST_KEY, MetricValue::Count(3), &[]);
+        let endpoint = PromEndpoint::bind(BindAddr::UnixSocket(path.clone()))
+            .map_err(ctx("unix socket binds"))?;
+        endpoint
+            .sink()
+            .record(&TEST_KEY, MetricValue::Count(3), &[]);
         assert!(endpoint.local_addr().is_none());
 
-        let mut stream = UnixStream::connect(&path).expect("connects to bound unix socket");
+        let mut stream =
+            UnixStream::connect(&path).map_err(ctx("connects to bound unix socket"))?;
         stream
             .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .expect("request writes");
+            .map_err(ctx("request writes"))?;
         let response = read_all(&mut stream);
 
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
-        assert!(response.contains("harw_endpoint_test_total 3"), "{response}");
+        assert!(
+            response.contains("harw_endpoint_test_total 3"),
+            "{response}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_bind_unix_socket_removes_stale_socket_file_left_by_a_previous_run() {
-        let dir = tempfile::tempdir().expect("temp dir creates");
+    fn test_bind_unix_socket_removes_stale_socket_file_left_by_a_previous_run() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("temp dir creates"))?;
         let path = dir.path().join("prom.sock");
 
         {
             let _first = PromEndpoint::bind(BindAddr::UnixSocket(path.clone()))
-                .expect("first bind succeeds");
+                .map_err(ctx("first bind succeeds"))?;
             // `_first` is dropped at the end of this block, but its socket
             // file is not guaranteed to be unlinked by that alone; the
             // second `bind()` below must still succeed by removing it.
         }
 
-        let _second = PromEndpoint::bind(BindAddr::UnixSocket(path)).expect("second bind succeeds");
+        let _second =
+            PromEndpoint::bind(BindAddr::UnixSocket(path)).map_err(ctx("second bind succeeds"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_drop_stops_background_thread_and_releases_the_tcp_port() {
-        let endpoint = PromEndpoint::bind(BindAddr::Loopback(0)).expect("loopback binds");
-        let addr = endpoint.local_addr().expect("tcp endpoint has a local address");
+    fn test_drop_stops_background_thread_and_releases_the_tcp_port() -> TestResult {
+        let endpoint = PromEndpoint::bind(BindAddr::Loopback(0)).map_err(ctx("loopback binds"))?;
+        let addr = endpoint
+            .local_addr()
+            .ok_or(TestError::Missing("tcp endpoint has a local address"))?;
         drop(endpoint);
 
         // A listening socket has no lingering TIME_WAIT state of its own;
         // once `Drop` has joined the accept-loop thread, the port must be
         // immediately rebindable.
         let rebound = TcpListener::bind(addr);
-        assert!(rebound.is_ok(), "port must be free after PromEndpoint is dropped");
+        assert!(
+            rebound.is_ok(),
+            "port must be free after PromEndpoint is dropped"
+        );
+        Ok(())
     }
 }

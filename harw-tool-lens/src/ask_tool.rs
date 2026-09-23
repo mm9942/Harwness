@@ -62,7 +62,7 @@
 use crate::provenance::{ask_descriptor, ask_embedder, ask_provenance};
 use crate::scope::{derive_read_scope, selectors_in_scope};
 use harw_lens::{CollapsePolicy, EdgeIndex, Ranked};
-use harw_lens_federation::{federated_query, FederatedOutcome, SkipReason, SkippedIndex};
+use harw_lens_federation::{FederatedOutcome, SkipReason, SkippedIndex, federated_query};
 use harw_macros::Tool;
 use harw_tools::{ToolExecutionContext, ToolOutput, ToolsError};
 use serde::Deserialize;
@@ -185,7 +185,9 @@ fn ask_with_home(
     args: &LensAskArgs,
 ) -> Result<ToolOutput, ToolsError> {
     if args.question.trim().is_empty() {
-        return Ok(ToolOutput::error("lens.ask: 'question' darf nicht leer sein"));
+        return Ok(ToolOutput::error(
+            "lens.ask: 'question' darf nicht leer sein",
+        ));
     }
 
     let scope = derive_read_scope(context);
@@ -274,28 +276,34 @@ async fn lens_ask(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harw_lens::{
-        collect_design_docs, DEFAULT_VISIBILITY, DOCS_DESIGN_INDEX, OPERATOR_ONLY_VISIBILITY,
+    use crate::test_support::{TestError, TestResult, ctx};
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
     };
-    use harw_lens_query::{resolve_index, IndexSelector, QueryError, ReadScope};
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_lens::{
+        DEFAULT_VISIBILITY, DOCS_DESIGN_INDEX, OPERATOR_ONLY_VISIBILITY, collect_design_docs,
+    };
+    use harw_lens_query::{IndexSelector, QueryError, ReadScope, resolve_index};
     use harw_tools::{ToolCall, ToolExecutor as _, ToolName};
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::path::{Path, PathBuf};
 
-    fn scratch_dir(label: &str) -> PathBuf {
+    fn scratch_dir(label: &str) -> TestResult<PathBuf> {
         let dir = std::env::temp_dir().join(format!(
             "harw-tool-lens-ask-tests-{}-{label}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("Scratch-Verzeichnis anlegen");
-        dir
+        std::fs::create_dir_all(&dir).map_err(ctx("Scratch-Verzeichnis anlegen"))?;
+        Ok(dir)
     }
 
-    fn make_context(harness: &Path, permissions: Vec<Permission>) -> ToolExecutionContext {
+    fn make_context(
+        harness: &Path,
+        permissions: Vec<Permission>,
+    ) -> TestResult<ToolExecutionContext> {
         let workspace_dir = harness.join("ws");
-        std::fs::create_dir_all(&workspace_dir).expect("Workspace anlegen");
+        std::fs::create_dir_all(&workspace_dir).map_err(ctx("Workspace anlegen"))?;
         let registry = WorkspaceRegistry::build(
             harness,
             [WorkspaceRegistration {
@@ -304,19 +312,23 @@ mod tests {
                 root: PathBuf::from("ws"),
             }],
         )
-        .expect("Registry bauen");
+        .map_err(ctx("Registry bauen"))?;
         let binding = registry
             .resolve(&TenantId::from_str("t"), &WorkspaceId::from_str("w"))
-            .expect("Workspace auflösen");
+            .map_err(ctx("Workspace auflösen"))?;
         let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::from_policy(permissions));
-        ToolExecutionContext::new(SessionId::new(), TurnId::new(), sandbox)
+        Ok(ToolExecutionContext::new(
+            SessionId::new(),
+            TurnId::new(),
+            sandbox,
+        ))
     }
 
-    fn block_on<F: std::future::Future>(future: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
+    fn block_on<F: std::future::Future>(future: F) -> TestResult<F::Output> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
-            .expect("Tokio-Runtime bauen")
-            .block_on(future)
+            .map_err(ctx("Tokio-Runtime bauen"))?;
+        Ok(runtime.block_on(future))
     }
 
     /// **Der Beleg, dass Lens jetzt einen Konsumenten hat.** Ein per
@@ -324,19 +336,20 @@ mod tests {
     /// einen echten Index; `lens.ask` (der Werkzeug-Executor, kein direkter
     /// Funktionsaufruf) findet darüber tatsächlich einen Treffer.
     #[test]
-    fn test_agent_reaches_lens_hits_through_the_tool() {
-        let harness = scratch_dir("reaches-lens");
+    fn test_agent_reaches_lens_hits_through_the_tool() -> TestResult {
+        let harness = scratch_dir("reaches-lens")?;
         let home = harness.join("home");
-        std::fs::create_dir_all(&home).expect("Root-Space anlegen");
+        std::fs::create_dir_all(&home).map_err(ctx("Root-Space anlegen"))?;
 
         let docs_dir = harness.join("docs");
-        std::fs::create_dir_all(&docs_dir).expect("Docs-Verzeichnis anlegen");
+        std::fs::create_dir_all(&docs_dir).map_err(ctx("Docs-Verzeichnis anlegen"))?;
         std::fs::write(
             docs_dir.join("intro.md"),
             "# Einfuehrung\n\nLens bindet zehn Crates unter einer Fassade.\n",
         )
-        .expect("Design-Dokument schreiben");
-        let documents = collect_design_docs(&docs_dir).expect("Design-Dokumente einsammeln");
+        .map_err(ctx("Design-Dokument schreiben"))?;
+        let documents =
+            collect_design_docs(&docs_dir).map_err(ctx("Design-Dokumente einsammeln"))?;
 
         let embedder = ask_embedder();
         let descriptor = ask_descriptor();
@@ -350,7 +363,7 @@ mod tests {
             embedder.as_ref(),
             &descriptor,
         )
-        .expect("Index bauen");
+        .map_err(ctx("Index bauen"))?;
 
         // `selectors_in_scope` befragt bei DEFAULT_VISIBILITY sowohl
         // `docs.design` als auch `knowledge.palace` (siehe `scope.rs`).
@@ -378,33 +391,44 @@ mod tests {
             embedder.as_ref(),
             &descriptor,
         )
-        .expect("Palace-Index bauen");
+        .map_err(ctx("Palace-Index bauen"))?;
 
-        let context = make_context(&harness, vec![Permission::ReadWorkspace]);
+        let context = make_context(&harness, vec![Permission::ReadWorkspace])?;
         let args = LensAskArgs {
             question: "Wie bindet Lens Crates?".to_owned(),
             limit: None,
         };
 
-        let output = ask_with_home(&home, &context, &args).expect("Tool-Funktion liefert nie Err");
+        let output =
+            ask_with_home(&home, &context, &args).map_err(ctx("Tool-Funktion liefert nie Err"))?;
 
         match output {
             ToolOutput::Json { content } => {
-                let hits = content["hits"].as_array().expect("hits ist ein Array");
-                assert!(!hits.is_empty(), "erwartet mindestens einen Treffer: {content}");
+                let hits = content["hits"]
+                    .as_array()
+                    .ok_or(TestError::Missing("hits ist ein Array"))?;
+                assert!(
+                    !hits.is_empty(),
+                    "erwartet mindestens einen Treffer: {content}"
+                );
                 assert!(
                     content["queried"]
                         .as_array()
-                        .expect("queried ist ein Array")
+                        .ok_or(TestError::Missing("queried ist ein Array"))?
                         .iter()
                         .any(|s| s["index_name"] == DOCS_DESIGN_INDEX),
                     "docs.design haette befragt werden muessen: {content}"
                 );
             }
-            other => panic!("erwartet ToolOutput::Json, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet ToolOutput::Json, war: {other:?}"
+                )));
+            }
         }
 
         std::fs::remove_dir_all(&harness).ok();
+        Ok(())
     }
 
     /// Modellname, mit dem der Test-Index gebaut wird -- muss
@@ -418,28 +442,33 @@ mod tests {
     /// Trefferliste -- die zweite Verteidigungslinie hinter
     /// [`crate::scope::selectors_in_scope`] (siehe dessen Moduldokumentation).
     #[test]
-    fn test_federated_query_rejects_selector_outside_scope_even_though_ask_tool_never_sends_one() {
-        let harness = scratch_dir("outside-scope");
+    fn test_federated_query_rejects_selector_outside_scope_even_though_ask_tool_never_sends_one()
+    -> TestResult {
+        let harness = scratch_dir("outside-scope")?;
         let home = harness.join("home");
-        std::fs::create_dir_all(&home).expect("Root-Space anlegen");
+        std::fs::create_dir_all(&home).map_err(ctx("Root-Space anlegen"))?;
 
         let scope = ReadScope::single(DEFAULT_VISIBILITY);
         let outside_selector = IndexSelector::new(DOCS_DESIGN_INDEX, OPERATOR_ONLY_VISIBILITY);
 
-        let err = resolve_index(&home, &outside_selector, &scope)
-            .expect_err("ein Selektor ausserhalb des Scopes muss fehlschlagen");
+        let Err(err) = resolve_index(&home, &outside_selector, &scope) else {
+            return Err(TestError::Unexpected(
+                "ein Selektor ausserhalb des Scopes muss fehlschlagen".to_owned(),
+            ));
+        };
         assert!(matches!(err, QueryError::IndexNotVisible { .. }));
 
         std::fs::remove_dir_all(&harness).ok();
+        Ok(())
     }
 
     /// Der Aufrufer kann seinen eigenen `ReadScope` nicht wählen: ein
     /// versuchtes `scope`-Feld in `call.arguments` wird von
     /// `#[serde(deny_unknown_fields)]` abgewiesen, bevor es je gelesen wird.
     #[test]
-    fn test_ask_args_reject_caller_supplied_scope_field() {
-        let harness = scratch_dir("reject-scope-field");
-        let context = make_context(&harness, vec![Permission::ReadWorkspace]);
+    fn test_ask_args_reject_caller_supplied_scope_field() -> TestResult {
+        let harness = scratch_dir("reject-scope-field")?;
+        let context = make_context(&harness, vec![Permission::ReadWorkspace])?;
         let tool = LensAskTool;
         let call = ToolCall {
             id: ToolCallId::new(),
@@ -450,21 +479,22 @@ mod tests {
             }),
         };
 
-        let result = block_on(tool.execute(&context, &call));
+        let result = block_on(tool.execute(&context, &call))?;
         assert!(
             result.is_err(),
             "ein zusaetzliches 'scope'-Feld muss die Deserialisierung scheitern lassen"
         );
 
         std::fs::remove_dir_all(&harness).ok();
+        Ok(())
     }
 
     /// Ein beliebiges unbekanntes Feld wird ebenso abgewiesen (K19), nicht
     /// nur `scope` speziell.
     #[test]
-    fn test_ask_args_reject_any_unknown_field() {
-        let harness = scratch_dir("reject-unknown-field");
-        let context = make_context(&harness, vec![Permission::ReadWorkspace]);
+    fn test_ask_args_reject_any_unknown_field() -> TestResult {
+        let harness = scratch_dir("reject-unknown-field")?;
+        let context = make_context(&harness, vec![Permission::ReadWorkspace])?;
         let tool = LensAskTool;
         let call = ToolCall {
             id: ToolCallId::new(),
@@ -475,21 +505,22 @@ mod tests {
             }),
         };
 
-        let result = block_on(tool.execute(&context, &call));
+        let result = block_on(tool.execute(&context, &call))?;
         assert!(
             result.is_err(),
             "ein zusaetzliches 'index_name'-Feld muss die Deserialisierung scheitern lassen"
         );
 
         std::fs::remove_dir_all(&harness).ok();
+        Ok(())
     }
 
     /// Fehlende `ReadWorkspace`-Permission verweigert den Dienst, bevor
     /// irgendein Root-Space beruehrt wird.
     #[test]
-    fn test_ask_denied_without_read_workspace_permission() {
-        let harness = scratch_dir("denied-no-permission");
-        let context = make_context(&harness, vec![]);
+    fn test_ask_denied_without_read_workspace_permission() -> TestResult {
+        let harness = scratch_dir("denied-no-permission")?;
+        let context = make_context(&harness, vec![])?;
         let tool = LensAskTool;
         let call = ToolCall {
             id: ToolCallId::new(),
@@ -497,22 +528,27 @@ mod tests {
             arguments: serde_json::json!({ "question": "irrelevant" }),
         };
 
-        let output = block_on(tool.execute(&context, &call)).expect("Tool laeuft");
+        let output = block_on(tool.execute(&context, &call))?.map_err(ctx("Tool laeuft"))?;
         match output {
             ToolOutput::Error { message } => {
                 assert!(message.contains("ReadWorkspace"), "war: {message}");
             }
-            other => panic!("erwartet ToolOutput::Error, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet ToolOutput::Error, war: {other:?}"
+                )));
+            }
         }
 
         std::fs::remove_dir_all(&harness).ok();
+        Ok(())
     }
 
     /// Eine leere Frage wird ohne Root-Space-/Föderationsaufruf abgelehnt.
     #[test]
-    fn test_ask_rejects_blank_question() {
-        let harness = scratch_dir("blank-question");
-        let context = make_context(&harness, vec![Permission::ReadWorkspace]);
+    fn test_ask_rejects_blank_question() -> TestResult {
+        let harness = scratch_dir("blank-question")?;
+        let context = make_context(&harness, vec![Permission::ReadWorkspace])?;
 
         let output = block_on(lens_ask(
             &context,
@@ -520,16 +556,21 @@ mod tests {
                 question: "   ".to_owned(),
                 limit: None,
             },
-        ))
-        .expect("Tool-Funktion liefert nie Err");
+        ))?
+        .map_err(ctx("Tool-Funktion liefert nie Err"))?;
 
         match output {
             ToolOutput::Error { message } => {
                 assert!(message.contains("question"), "war: {message}");
             }
-            other => panic!("erwartet ToolOutput::Error, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet ToolOutput::Error, war: {other:?}"
+                )));
+            }
         }
 
         std::fs::remove_dir_all(&harness).ok();
+        Ok(())
     }
 }

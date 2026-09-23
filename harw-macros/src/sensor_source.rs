@@ -501,14 +501,8 @@ pub(crate) fn expand_sensor_source(input: &DeriveInput) -> syn::Result<TokenStre
     let sensor_id_lit = &args.sensor_id;
 
     let prefix = args.metrics_prefix.value();
-    let polls_name = LitStr::new(
-        &format!("{prefix}polls_total"),
-        args.metrics_prefix.span(),
-    );
-    let errors_name = LitStr::new(
-        &format!("{prefix}errors_total"),
-        args.metrics_prefix.span(),
-    );
+    let polls_name = LitStr::new(&format!("{prefix}polls_total"), args.metrics_prefix.span());
+    let errors_name = LitStr::new(&format!("{prefix}errors_total"), args.metrics_prefix.span());
 
     let metrics_mod_ident = Ident::new(
         &format!("__harw_sensor_source_metrics_{struct_ident}"),
@@ -729,6 +723,7 @@ pub(crate) fn expand_sensor_source(input: &DeriveInput) -> syn::Result<TokenStre
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
     fn validate_capability_accepts_all_fourteen_variants() {
@@ -739,10 +734,15 @@ mod tests {
     }
 
     #[test]
-    fn validate_capability_rejects_unknown_name() {
+    fn validate_capability_rejects_unknown_name() -> TestResult {
         let ident = Ident::new("Bogus", proc_macro2::Span::call_site());
-        let err = validate_capability(&ident).expect_err("unknown capability must be rejected");
+        let Err(err) = validate_capability(&ident) else {
+            return Err(TestError::Unexpected(
+                "unknown capability must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("unbekannte capability"));
+        Ok(())
     }
 
     fn valid_input() -> DeriveInput {
@@ -757,27 +757,35 @@ mod tests {
     }
 
     #[test]
-    fn expand_rejects_enum() {
+    fn expand_rejects_enum() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[sensor(capability = ReadSysfsThermal, id = "x", metrics = "p_")]
             enum Foo { A, B }
         };
-        let err = expand_sensor_source(&input).expect_err("enums must be rejected");
+        let Err(err) = expand_sensor_source(&input) else {
+            return Err(TestError::Unexpected("enums must be rejected".to_owned()));
+        };
         assert!(err.to_string().contains("structs"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_tuple_struct() {
+    fn expand_rejects_tuple_struct() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[sensor(capability = ReadSysfsThermal, id = "x", metrics = "p_")]
             struct Foo(u8);
         };
-        let err = expand_sensor_source(&input).expect_err("tuple structs must be rejected");
+        let Err(err) = expand_sensor_source(&input) else {
+            return Err(TestError::Unexpected(
+                "tuple structs must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("benannten Feldern"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_two_capabilities() {
+    fn expand_rejects_two_capabilities() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[sensor(
                 capability = ReadSysfsThermal,
@@ -791,12 +799,17 @@ mod tests {
                 zones: (),
             }
         };
-        let err = expand_sensor_source(&input).expect_err("two capabilities must be rejected");
+        let Err(err) = expand_sensor_source(&input) else {
+            return Err(TestError::Unexpected(
+                "two capabilities must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("`capability` doppelt angegeben"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_unknown_capability() {
+    fn expand_rejects_unknown_capability() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[sensor(capability = Bogus, id = "thermal", metrics = "harw_dod_thermal_")]
             struct ThermalSensor {
@@ -805,12 +818,17 @@ mod tests {
                 zones: (),
             }
         };
-        let err = expand_sensor_source(&input).expect_err("unknown capability must be rejected");
+        let Err(err) = expand_sensor_source(&input) else {
+            return Err(TestError::Unexpected(
+                "unknown capability must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("unbekannte capability"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_unknown_sensor_key() {
+    fn expand_rejects_unknown_sensor_key() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[sensor(capability = ReadSysfsThermal, id = "thermal", metrics = "p_", bogus = "x")]
             struct ThermalSensor {
@@ -819,12 +837,17 @@ mod tests {
                 zones: (),
             }
         };
-        let err = expand_sensor_source(&input).expect_err("unknown sensor key must be rejected");
+        let Err(err) = expand_sensor_source(&input) else {
+            return Err(TestError::Unexpected(
+                "unknown sensor key must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("unbekannter sensor-Schlüssel"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_missing_handle_field() {
+    fn expand_rejects_missing_handle_field() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[sensor(capability = ReadSysfsThermal, id = "thermal", metrics = "p_")]
             struct ThermalSensor {
@@ -832,24 +855,34 @@ mod tests {
                 zones: (),
             }
         };
-        let err = expand_sensor_source(&input).expect_err("missing handle field must be rejected");
+        let Err(err) = expand_sensor_source(&input) else {
+            return Err(TestError::Unexpected(
+                "missing handle field must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("Feld `handle:"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_missing_source_field() {
+    fn expand_rejects_missing_source_field() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[sensor(capability = ReadSysfsThermal, id = "thermal", metrics = "p_")]
             struct ThermalSensor {
                 handle: (),
             }
         };
-        let err = expand_sensor_source(&input).expect_err("missing source field must be rejected");
+        let Err(err) = expand_sensor_source(&input) else {
+            return Err(TestError::Unexpected(
+                "missing source field must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("keines gefunden"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_two_source_fields() {
+    fn expand_rejects_two_source_fields() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[sensor(capability = ReadSysfsThermal, id = "thermal", metrics = "p_")]
             struct ThermalSensor {
@@ -860,12 +893,17 @@ mod tests {
                 b: (),
             }
         };
-        let err = expand_sensor_source(&input).expect_err("two source fields must be rejected");
+        let Err(err) = expand_sensor_source(&input) else {
+            return Err(TestError::Unexpected(
+                "two source fields must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("ist zwei Sensoren"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_empty_glob() {
+    fn expand_rejects_empty_glob() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[sensor(capability = ReadSysfsThermal, id = "thermal", metrics = "p_")]
             struct ThermalSensor {
@@ -874,12 +912,17 @@ mod tests {
                 zones: (),
             }
         };
-        let err = expand_sensor_source(&input).expect_err("empty glob must be rejected");
+        let Err(err) = expand_sensor_source(&input) else {
+            return Err(TestError::Unexpected(
+                "empty glob must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("Glob-Muster darf nicht leer sein"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_unknown_parse_mode() {
+    fn expand_rejects_unknown_parse_mode() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[sensor(capability = ReadSysfsThermal, id = "thermal", metrics = "p_")]
             struct ThermalSensor {
@@ -888,12 +931,17 @@ mod tests {
                 zones: (),
             }
         };
-        let err = expand_sensor_source(&input).expect_err("unknown parse mode must be rejected");
+        let Err(err) = expand_sensor_source(&input) else {
+            return Err(TestError::Unexpected(
+                "unknown parse mode must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("unbekannter parse-Modus"));
+        Ok(())
     }
 
     #[test]
-    fn expand_rejects_unknown_source_key() {
+    fn expand_rejects_unknown_source_key() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[sensor(capability = ReadSysfsThermal, id = "thermal", metrics = "p_")]
             struct ThermalSensor {
@@ -902,14 +950,19 @@ mod tests {
                 zones: (),
             }
         };
-        let err = expand_sensor_source(&input).expect_err("unknown source key must be rejected");
+        let Err(err) = expand_sensor_source(&input) else {
+            return Err(TestError::Unexpected(
+                "unknown source key must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("unbekannter source-Schlüssel"));
+        Ok(())
     }
 
     #[test]
-    fn expand_accepts_valid_sensor_and_generates_expected_items() {
+    fn expand_accepts_valid_sensor_and_generates_expected_items() -> TestResult {
         let tokens = expand_sensor_source(&valid_input())
-            .expect("valid sensor must expand")
+            .map_err(ctx("valid sensor must expand"))?
             .to_string();
 
         assert!(tokens.contains("impl ThermalSensor"));
@@ -929,10 +982,11 @@ mod tests {
         assert!(!tokens.contains("Timestamp :: now"));
         // Ohne `#[sensor(error = ...)]` darf keine `From`-Brücke entstehen.
         assert!(!tokens.contains("into_sensor_error"));
+        Ok(())
     }
 
     #[test]
-    fn expand_with_error_attribute_emits_from_bridge() {
+    fn expand_with_error_attribute_emits_from_bridge() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[sensor(
                 capability = ReadSysfsThermal,
@@ -947,7 +1001,7 @@ mod tests {
             }
         };
         let tokens = expand_sensor_source(&input)
-            .expect("sensor with error path must expand")
+            .map_err(ctx("sensor with error path must expand"))?
             .to_string();
 
         assert!(tokens.contains(
@@ -955,10 +1009,11 @@ mod tests {
              for :: harw_dod_cap :: SensorError"
         ));
         assert!(tokens.contains("into_sensor_error"));
+        Ok(())
     }
 
     #[test]
-    fn expand_uses_u64_reader_when_requested() {
+    fn expand_uses_u64_reader_when_requested() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[sensor(capability = ReadSysfsBlock, id = "block", metrics = "harw_dod_block_")]
             struct BlockSensor {
@@ -968,9 +1023,10 @@ mod tests {
             }
         };
         let tokens = expand_sensor_source(&input)
-            .expect("u64 sensor must expand")
+            .map_err(ctx("u64 sensor must expand"))?
             .to_string();
         assert!(tokens.contains(":: harw_dod_readfs :: parse_u64"));
         assert!(!tokens.contains(":: harw_dod_readfs :: parse_i64"));
+        Ok(())
     }
 }

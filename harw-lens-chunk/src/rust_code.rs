@@ -178,15 +178,16 @@ pub fn chunk_rust(source: &SourceRef, text: &str) -> Vec<Chunk> {
             let preamble_start = starts[preamble_start_line];
             let item_end = find_item_end(text, line_start);
 
-            let chunk_start = if preamble_start > cursor && !text[cursor..preamble_start].trim().is_empty() {
-                chunks.push(make_chunk(source, text, cursor, preamble_start));
-                preamble_start
-            } else {
-                // Pure whitespace between the previous chunk and this element's
-                // preamble (or no gap at all): fold it into this element's chunk
-                // instead of emitting a standalone blank-line chunk.
-                cursor
-            };
+            let chunk_start =
+                if preamble_start > cursor && !text[cursor..preamble_start].trim().is_empty() {
+                    chunks.push(make_chunk(source, text, cursor, preamble_start));
+                    preamble_start
+                } else {
+                    // Pure whitespace between the previous chunk and this element's
+                    // preamble (or no gap at all): fold it into this element's chunk
+                    // instead of emitting a standalone blank-line chunk.
+                    cursor
+                };
             chunks.push(make_chunk(source, text, chunk_start, item_end));
             cursor = item_end;
 
@@ -379,6 +380,7 @@ fn line_index_at_or_after(starts: &[usize], byte_offset: usize, from_idx: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     fn file_source() -> SourceRef {
         SourceRef::File {
@@ -386,7 +388,7 @@ mod tests {
         }
     }
 
-    fn assert_gapless(text: &str, chunks: &[Chunk]) {
+    fn assert_gapless(text: &str, chunks: &[Chunk]) -> TestResult {
         assert!(!chunks.is_empty(), "expected at least one chunk");
         assert_eq!(chunks[0].span.start, 0);
         for pair in chunks.windows(2) {
@@ -395,11 +397,14 @@ mod tests {
                 "chunks must be contiguous without gaps or overlap"
             );
         }
-        let last = chunks.last().expect("checked non-empty above");
+        let last = chunks
+            .last()
+            .ok_or(TestError::Missing("checked non-empty above"))?;
         assert_eq!(last.span.end, text.len());
         for chunk in chunks {
             assert_eq!(&text[chunk.span.start..chunk.span.end], chunk.text);
         }
+        Ok(())
     }
 
     #[test]
@@ -408,12 +413,12 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_rust_module_doc_is_first_and_separate_chunk() {
+    fn test_chunk_rust_module_doc_is_first_and_separate_chunk() -> TestResult {
         let text = "//! Modulkopf.\n//! Zweite Zeile.\n\nfn foo() {}\n";
         let chunks = chunk_rust(&file_source(), text);
         assert_eq!(chunks[0].text, "//! Modulkopf.\n//! Zweite Zeile.\n");
         assert!(chunks.iter().skip(1).any(|c| c.text.contains("fn foo()")));
-        assert_gapless(text, &chunks);
+        assert_gapless(text, &chunks)
     }
 
     #[test]
@@ -425,30 +430,30 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_rust_doc_comment_stays_with_its_element() {
+    fn test_chunk_rust_doc_comment_stays_with_its_element() -> TestResult {
         let text = "/// Doku für foo.\npub fn foo() {}\n\npub fn bar() {}\n";
         let chunks = chunk_rust(&file_source(), text);
         let foo_chunk = chunks
             .iter()
             .find(|c| c.text.contains("pub fn foo()"))
-            .expect("foo chunk exists");
+            .ok_or(TestError::Missing("foo chunk exists"))?;
         assert!(foo_chunk.text.starts_with("/// Doku für foo."));
         let bar_chunk = chunks
             .iter()
             .find(|c| c.text.contains("pub fn bar()"))
-            .expect("bar chunk exists");
+            .ok_or(TestError::Missing("bar chunk exists"))?;
         assert!(!bar_chunk.text.contains("Doku für foo"));
-        assert_gapless(text, &chunks);
+        assert_gapless(text, &chunks)
     }
 
     #[test]
-    fn test_chunk_rust_two_consecutive_fns_are_separated() {
+    fn test_chunk_rust_two_consecutive_fns_are_separated() -> TestResult {
         let text = "fn a() {}\nfn b() {}\n";
         let chunks = chunk_rust(&file_source(), text);
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].text, "fn a() {}\n");
         assert_eq!(chunks[1].text, "fn b() {}\n");
-        assert_gapless(text, &chunks);
+        assert_gapless(text, &chunks)
     }
 
     #[test]
@@ -460,26 +465,27 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_rust_impl_block_is_one_chunk_including_nested_methods() {
+    fn test_chunk_rust_impl_block_is_one_chunk_including_nested_methods() -> TestResult {
         let text = "struct Foo;\n\nimpl Foo {\n    fn method(&self) -> u32 {\n        1\n    }\n}\n\nfn after() {}\n";
         let chunks = chunk_rust(&file_source(), text);
         let impl_chunk = chunks
             .iter()
             .find(|c| c.text.contains("impl Foo"))
-            .expect("impl chunk exists");
+            .ok_or(TestError::Missing("impl chunk exists"))?;
         assert!(impl_chunk.text.contains("fn method"));
         assert!(impl_chunk.text.trim_end().ends_with('}'));
         // The blank line before `fn after` is folded into its chunk rather
         // than becoming its own standalone whitespace chunk.
-        assert!(chunks.last().expect("has chunks").text.contains("fn after() {}"));
-        assert_gapless(text, &chunks);
+        let last = chunks.last().ok_or(TestError::Missing("has chunks"))?;
+        assert!(last.text.contains("fn after() {}"));
+        assert_gapless(text, &chunks)
     }
 
     #[test]
-    fn test_chunk_rust_byte_spans_cover_text_without_gaps() {
+    fn test_chunk_rust_byte_spans_cover_text_without_gaps() -> TestResult {
         let text = "//! Kopf.\n\nuse std::fmt;\n\n/// Doku.\npub struct Foo {\n    pub x: u32,\n}\n\nfn helper() {}\n";
         let chunks = chunk_rust(&file_source(), text);
-        assert_gapless(text, &chunks);
+        assert_gapless(text, &chunks)
     }
 
     #[test]

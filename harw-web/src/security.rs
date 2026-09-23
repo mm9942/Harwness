@@ -401,9 +401,7 @@ impl<'a> ApprovalCaller<'a> {
         if principal.surface() != IngressSurface::Web {
             return Ok(actor);
         }
-        let (peer, resolver) = self
-            .web_peer
-            .ok_or(SecurityError::UnauthenticatedWebPeer)?;
+        let (peer, resolver) = self.web_peer.ok_or(SecurityError::UnauthenticatedWebPeer)?;
         let peer_actor = resolver
             .actor_for(peer)
             .ok_or(SecurityError::UnknownApprover { uid: peer.uid })?;
@@ -587,6 +585,7 @@ mod tests {
         StaticUidApprovalActorMap, list_pending_approvals, pending_approval, resolve_approval,
     };
     use crate::peer::PeerCredentials;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_session_store::approval::{ApprovalRecord, ApprovalStore};
     use harw_session_store::error::SessionStoreError;
     use harw_types::{
@@ -610,9 +609,13 @@ mod tests {
         Timestamp::constant(ISSUED_SECS, 0)
     }
 
-    fn clock_after(offset: SignedDuration) -> FixedClock {
+    fn clock_after(offset: SignedDuration) -> TestResult<FixedClock> {
         // Testhilfe: Überlauf ist bei 1.7e9 s + Minuten ausgeschlossen.
-        FixedClock(issued_at().checked_add(offset).expect("timestamp in range"))
+        Ok(FixedClock(
+            issued_at()
+                .checked_add(offset)
+                .map_err(ctx("timestamp in range"))?,
+        ))
     }
 
     fn peer(uid: u32) -> PeerCredentials {
@@ -642,7 +645,7 @@ mod tests {
         store: &ApprovalStore,
         request: &str,
         actor: ApprovalActor,
-    ) -> (SessionId, ItemId) {
+    ) -> TestResult<(SessionId, ItemId)> {
         let session = SessionId::from_str("session-1");
         let request = ItemId::from_str(request);
         let record = ApprovalRecord {
@@ -652,8 +655,10 @@ mod tests {
             actor,
             issued_at: issued_at(),
         };
-        store.issue(&record).expect("issue pending approval");
-        (session, request)
+        store
+            .issue(&record)
+            .map_err(ctx("issue pending approval"))?;
+        Ok((session, request))
     }
 
     #[test]
@@ -667,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn test_approval_caller_actor_rejects_model_principal() {
+    fn test_approval_caller_actor_rejects_model_principal() -> TestResult {
         let model = Principal::trusted_ingress(
             PrincipalKind::Model,
             "root",
@@ -676,10 +681,14 @@ mod tests {
         );
         let web_peer = peer(1000);
         let table = resolver();
-        let error = ApprovalCaller::new(&model)
+        let Err(error) = ApprovalCaller::new(&model)
             .with_web_peer(&web_peer, &table)
             .actor()
-            .expect_err("model principals never approve");
+        else {
+            return Err(TestError::Unexpected(
+                "model principals never approve".into(),
+            ));
+        };
         assert!(matches!(
             error,
             SecurityError::NoApproverActor {
@@ -687,14 +696,17 @@ mod tests {
                 surface: IngressSurface::Web
             }
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_approval_caller_actor_rejects_child_principal() {
+    fn test_approval_caller_actor_rejects_child_principal() -> TestResult {
         let child = web_principal().child_of("explorer");
-        let error = ApprovalCaller::new(&child)
-            .actor()
-            .expect_err("child principals never approve");
+        let Err(error) = ApprovalCaller::new(&child).actor() else {
+            return Err(TestError::Unexpected(
+                "child principals never approve".into(),
+            ));
+        };
         assert!(matches!(
             error,
             SecurityError::NoApproverActor {
@@ -702,86 +714,109 @@ mod tests {
                 ..
             }
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_approval_caller_actor_web_without_peer_is_unauthenticated() {
+    fn test_approval_caller_actor_web_without_peer_is_unauthenticated() -> TestResult {
         let principal = web_principal();
-        let error = ApprovalCaller::new(&principal)
-            .actor()
-            .expect_err("web principal requires an authenticated peer");
+        let Err(error) = ApprovalCaller::new(&principal).actor() else {
+            return Err(TestError::Unexpected(
+                "web principal requires an authenticated peer".into(),
+            ));
+        };
         assert!(matches!(error, SecurityError::UnauthenticatedWebPeer));
+        Ok(())
     }
 
     #[test]
-    fn test_approval_caller_actor_web_unknown_peer_is_rejected() {
+    fn test_approval_caller_actor_web_unknown_peer_is_rejected() -> TestResult {
         let principal = web_principal();
         let web_peer = peer(9999);
         let table = resolver();
-        let error = ApprovalCaller::new(&principal)
+        let Err(error) = ApprovalCaller::new(&principal)
             .with_web_peer(&web_peer, &table)
             .actor()
-            .expect_err("peer outside the approver table");
-        assert!(matches!(error, SecurityError::UnknownApprover { uid: 9999 }));
+        else {
+            return Err(TestError::Unexpected(
+                "peer outside the approver table".into(),
+            ));
+        };
+        assert!(matches!(
+            error,
+            SecurityError::UnknownApprover { uid: 9999 }
+        ));
+        Ok(())
     }
 
     #[test]
-    fn test_approval_caller_actor_web_peer_mapping_to_other_actor_is_mismatch() {
+    fn test_approval_caller_actor_web_peer_mapping_to_other_actor_is_mismatch() -> TestResult {
         let principal = web_principal();
         let web_peer = peer(1000);
         let table = StaticUidApprovalActorMap::new(vec![(1000, "alice".to_owned())]);
-        let error = ApprovalCaller::new(&principal)
+        let Err(error) = ApprovalCaller::new(&principal)
             .with_web_peer(&web_peer, &table)
             .actor()
-            .expect_err("peer and principal disagree");
+        else {
+            return Err(TestError::Unexpected("peer and principal disagree".into()));
+        };
         assert!(matches!(
             error,
             SecurityError::ApproverIdentityMismatch { uid: 1000 }
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_approval_caller_actor_web_confirmed_peer_yields_principal_actor() {
+    fn test_approval_caller_actor_web_confirmed_peer_yields_principal_actor() -> TestResult {
         let principal = web_principal();
         let web_peer = peer(1000);
         let table = resolver();
         let actor = ApprovalCaller::new(&principal)
             .with_web_peer(&web_peer, &table)
             .actor()
-            .expect("confirmed web approver");
+            .map_err(ctx("confirmed web approver"))?;
         assert_eq!(actor, owner());
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_approval_rejects_caller_without_actor_without_touching_store() {
-        let temp = tempfile::tempdir().expect("tempdir");
+    fn test_resolve_approval_rejects_caller_without_actor_without_touching_store() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = ApprovalStore::new(temp.path());
-        let (session, request) = issue_pending(&store, "approval-1", owner());
+        let (session, request) = issue_pending(&store, "approval-1", owner())?;
         let child = web_principal().child_of("explorer");
 
-        let error = resolve_approval(
+        let Err(error) = resolve_approval(
             &store,
             &ApprovalCaller::new(&child),
             &session,
             &request,
             ReviewDecision::Approved,
             None,
-            &clock_after(SignedDuration::from_mins(1)),
-        )
-        .expect_err("no actor → rejected");
+            &clock_after(SignedDuration::from_mins(1))?,
+        ) else {
+            return Err(TestError::Unexpected("no actor → rejected".into()));
+        };
         assert!(matches!(error, SecurityError::NoApproverActor { .. }));
-        assert_eq!(store.resolution(&session, &request).expect("readable"), None);
+        assert_eq!(
+            store
+                .resolution(&session, &request)
+                .map_err(ctx("readable"))?,
+            None
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_approval_uses_server_clock_for_resolved_at() {
-        let temp = tempfile::tempdir().expect("tempdir");
+    fn test_resolve_approval_uses_server_clock_for_resolved_at() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = ApprovalStore::new(temp.path());
-        let (session, request) = issue_pending(&store, "approval-1", owner());
+        let (session, request) = issue_pending(&store, "approval-1", owner())?;
         let principal = web_principal();
         let web_peer = peer(1000);
         let table = resolver();
-        let clock = clock_after(SignedDuration::from_mins(5));
+        let clock = clock_after(SignedDuration::from_mins(5))?;
 
         let resolution = resolve_approval(
             &store,
@@ -792,53 +827,61 @@ mod tests {
             Some("bounded exception".to_owned()),
             &clock,
         )
-        .expect("resolution succeeds");
+        .map_err(ctx("resolution succeeds"))?;
         assert_eq!(resolution.resolved_at, clock.0);
         assert_eq!(resolution.actor, owner());
         assert_eq!(resolution.decision, ReviewDecision::ApprovedOnce);
         let durable = store
             .resolution(&session, &request)
-            .expect("readable")
-            .expect("durable resolution");
+            .map_err(ctx("readable"))?
+            .ok_or(TestError::Missing("durable resolution"))?;
         assert_eq!(durable.resolved_at, clock.0);
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_approval_expired_request_is_rejected() {
-        let temp = tempfile::tempdir().expect("tempdir");
+    fn test_resolve_approval_expired_request_is_rejected() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = ApprovalStore::new(temp.path());
-        let (session, request) = issue_pending(&store, "approval-1", owner());
+        let (session, request) = issue_pending(&store, "approval-1", owner())?;
         let principal = web_principal();
         let web_peer = peer(1000);
         let table = resolver();
 
-        let error = resolve_approval(
+        let Err(error) = resolve_approval(
             &store,
             &ApprovalCaller::new(&principal).with_web_peer(&web_peer, &table),
             &session,
             &request,
             ReviewDecision::Approved,
             None,
-            &clock_after(SignedDuration::from_mins(31)),
-        )
-        .expect_err("expired");
+            &clock_after(SignedDuration::from_mins(31))?,
+        ) else {
+            return Err(TestError::Unexpected("expired".into()));
+        };
         assert!(matches!(
             error,
             SecurityError::Store(SessionStoreError::ApprovalExpired { .. })
         ));
-        assert_eq!(store.resolution(&session, &request).expect("readable"), None);
+        assert_eq!(
+            store
+                .resolution(&session, &request)
+                .map_err(ctx("readable"))?,
+            None
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_approval_second_confirmation_is_rejected_not_overwritten() {
-        let temp = tempfile::tempdir().expect("tempdir");
+    fn test_resolve_approval_second_confirmation_is_rejected_not_overwritten() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = ApprovalStore::new(temp.path());
-        let (session, request) = issue_pending(&store, "approval-1", owner());
+        let (session, request) = issue_pending(&store, "approval-1", owner())?;
         let principal = web_principal();
         let web_peer = peer(1000);
         let table = resolver();
         let caller = ApprovalCaller::new(&principal).with_web_peer(&web_peer, &table);
-        let clock = clock_after(SignedDuration::from_mins(1));
+        let clock = clock_after(SignedDuration::from_mins(1))?;
 
         resolve_approval(
             &store,
@@ -849,8 +892,8 @@ mod tests {
             None,
             &clock,
         )
-        .expect("first resolution");
-        let replay = resolve_approval(
+        .map_err(ctx("first resolution"))?;
+        let Err(replay) = resolve_approval(
             &store,
             &caller,
             &session,
@@ -858,24 +901,26 @@ mod tests {
             ReviewDecision::Rejected,
             None,
             &clock,
-        )
-        .expect_err("replay");
+        ) else {
+            return Err(TestError::Unexpected("replay".into()));
+        };
         assert!(matches!(
             replay,
             SecurityError::Store(SessionStoreError::ApprovalAlreadyResolved { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_list_pending_approvals_excludes_resolved_and_uses_clock() {
-        let temp = tempfile::tempdir().expect("tempdir");
+    fn test_list_pending_approvals_excludes_resolved_and_uses_clock() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = ApprovalStore::new(temp.path());
-        let (session, first) = issue_pending(&store, "approval-1", owner());
-        issue_pending(&store, "approval-2", owner());
+        let (session, first) = issue_pending(&store, "approval-1", owner())?;
+        issue_pending(&store, "approval-2", owner())?;
         let principal = web_principal();
         let web_peer = peer(1000);
         let table = resolver();
-        let clock = clock_after(SignedDuration::from_mins(1));
+        let clock = clock_after(SignedDuration::from_mins(1))?;
 
         resolve_approval(
             &store,
@@ -886,38 +931,45 @@ mod tests {
             None,
             &clock,
         )
-        .expect("resolve first");
+        .map_err(ctx("resolve first"))?;
 
-        let open = list_pending_approvals(&store, 10, &clock).expect("list");
+        let open = list_pending_approvals(&store, 10, &clock).map_err(ctx("list"))?;
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].request.as_str(), "approval-2");
 
-        let later = clock_after(SignedDuration::from_mins(30));
-        assert!(list_pending_approvals(&store, 10, &later).expect("list").is_empty());
+        let later = clock_after(SignedDuration::from_mins(30))?;
+        assert!(
+            list_pending_approvals(&store, 10, &later)
+                .map_err(ctx("list"))?
+                .is_empty()
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_pending_approval_not_found_is_reported_not_invented() {
-        let temp = tempfile::tempdir().expect("tempdir");
+    fn test_pending_approval_not_found_is_reported_not_invented() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = ApprovalStore::new(temp.path());
-        let error = pending_approval(
+        let Err(error) = pending_approval(
             &store,
             &SessionId::from_str("session-2"),
             &ItemId::from_str("does-not-exist"),
-        )
-        .expect_err("missing");
+        ) else {
+            return Err(TestError::Unexpected("missing".into()));
+        };
         assert!(matches!(
             error,
             SecurityError::Store(SessionStoreError::ApprovalNotFound { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_pending_approval_view_carries_irreversibility_flag() {
-        let temp = tempfile::tempdir().expect("tempdir");
+    fn test_pending_approval_view_carries_irreversibility_flag() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = ApprovalStore::new(temp.path());
-        let (session, request) = issue_pending(&store, "approval-1", owner());
-        let record = pending_approval(&store, &session, &request).expect("pending");
+        let (session, request) = issue_pending(&store, "approval-1", owner())?;
+        let record = pending_approval(&store, &session, &request).map_err(ctx("pending"))?;
 
         let view = PendingApprovalView {
             record,
@@ -927,6 +979,7 @@ mod tests {
         };
         assert!(view.irreversible);
         assert_eq!(view.rationale, "<img src=x onerror=alert(1)>");
+        Ok(())
     }
 
     #[test]
@@ -935,7 +988,11 @@ mod tests {
             kind: PrincipalKind::Model,
             surface: IngressSurface::Child,
         };
-        assert!(error.to_string().contains("darf keine Genehmigungsanfrage auflösen"));
+        assert!(
+            error
+                .to_string()
+                .contains("darf keine Genehmigungsanfrage auflösen")
+        );
         assert!(std::error::Error::source(&error).is_none());
         let mismatch = SecurityError::ApproverIdentityMismatch { uid: 7 };
         assert!(mismatch.to_string().contains("uid 7"));

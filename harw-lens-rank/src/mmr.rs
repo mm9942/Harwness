@@ -114,10 +114,7 @@ pub fn mmr(candidates: &[Ranked], lambda: f32, limit: usize) -> Vec<Ranked> {
     }
 
     let lambda = lambda.clamp(0.0, 1.0);
-    let tokens: Vec<HashSet<String>> = candidates
-        .iter()
-        .map(|c| tokenize(&c.chunk.text))
-        .collect();
+    let tokens: Vec<HashSet<String>> = candidates.iter().map(|c| tokenize(&c.chunk.text)).collect();
 
     let mut remaining: Vec<usize> = (0..candidates.len()).collect();
     let mut selected: Vec<usize> = Vec::with_capacity(limit.min(candidates.len()));
@@ -235,11 +232,7 @@ mod tests {
 
     #[test]
     fn test_mmr_limit_caps_selection_size() {
-        let candidates = vec![
-            ranked("one", 0.9),
-            ranked("two", 0.8),
-            ranked("three", 0.7),
-        ];
+        let candidates = vec![ranked("one", 0.9), ranked("two", 0.8), ranked("three", 0.7)];
 
         let selected = mmr(&candidates, 0.5, 2);
         assert_eq!(selected.len(), 2);

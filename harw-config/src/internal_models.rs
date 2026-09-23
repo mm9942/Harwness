@@ -86,14 +86,18 @@ impl InternalModelPoint {
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         let normalized = value.trim().replace('-', "_");
-        Self::ALL.into_iter().find(|point| point.key() == normalized)
+        Self::ALL
+            .into_iter()
+            .find(|point| point.key() == normalized)
     }
 
     /// Einzeiliges deutsches Beschreibungslabel dieser Stelle.
     #[must_use]
     pub fn description(self) -> &'static str {
         match self {
-            Self::SessionTitle => "Erzeugt den Sitzungstitel nach der ersten abgeschlossenen Runde.",
+            Self::SessionTitle => {
+                "Erzeugt den Sitzungstitel nach der ersten abgeschlossenen Runde."
+            }
             Self::CompactionSummary => {
                 "Fasst den Gesprächsverlauf beim Verdichten (Compaction) zusammen."
             }
@@ -265,9 +269,12 @@ impl ResolvedInternalModel {
 /// provider.has_plaintext_secret()`.
 #[must_use]
 pub fn openrouter_available(config: &crate::ResolvedConfig) -> bool {
-    config.providers.get(OPENROUTER_PROVIDER).is_some_and(|provider| {
-        provider.enabled && (provider.auth.is_some() || provider.has_plaintext_secret())
-    })
+    config
+        .providers
+        .get(OPENROUTER_PROVIDER)
+        .is_some_and(|provider| {
+            provider.enabled && (provider.auth.is_some() || provider.has_plaintext_secret())
+        })
 }
 
 /// Löst die Provider-/Modell-Wahl für `point` gemäß der Nutzerregel auf
@@ -332,20 +339,24 @@ pub fn resolve_internal_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ResolvedConfig;
     use crate::auth_toml::SecretRef;
     use crate::harness_config::HarnessConfig;
     use crate::provider_toml::ProviderToml;
-    use crate::ResolvedConfig;
+    use crate::test_support::{TestResult, ctx};
     use std::collections::HashMap;
     use std::str::FromStr;
 
-    fn openrouter_provider(enabled: bool, with_auth: bool) -> ProviderToml {
-        ProviderToml {
+    fn openrouter_provider(enabled: bool, with_auth: bool) -> TestResult<ProviderToml> {
+        Ok(ProviderToml {
             name: OPENROUTER_PROVIDER.to_owned(),
             api: "openrouter-chat".to_owned(),
             base_url: "https://openrouter.ai/api/v1".to_owned(),
             auth: if with_auth {
-                Some(SecretRef::from_str("env:OPENROUTER_API_KEY").expect("valid secret ref"))
+                Some(
+                    SecretRef::from_str("env:OPENROUTER_API_KEY")
+                        .map_err(ctx("valid secret ref"))?,
+                )
             } else {
                 None
             },
@@ -359,24 +370,25 @@ mod tests {
             max_concurrency: None,
             originator: None,
             default_reasoning_effort: None,
-        }
+            gateway_identity_headers: false,
+        })
     }
 
-    fn config_with_openrouter(enabled: bool, with_auth: bool) -> ResolvedConfig {
+    fn config_with_openrouter(enabled: bool, with_auth: bool) -> TestResult<ResolvedConfig> {
         let mut providers = HashMap::new();
         providers.insert(
             OPENROUTER_PROVIDER.to_owned(),
-            openrouter_provider(enabled, with_auth),
+            openrouter_provider(enabled, with_auth)?,
         );
-        ResolvedConfig {
+        Ok(ResolvedConfig {
             providers,
             ..Default::default()
-        }
+        })
     }
 
     #[test]
-    fn test_explicit_choice_wins_over_openrouter_default() {
-        let mut config = config_with_openrouter(true, true);
+    fn test_explicit_choice_wins_over_openrouter_default() -> TestResult {
+        let mut config = config_with_openrouter(true, true)?;
         config.harness.internal_models.set_choice(
             InternalModelPoint::Research,
             Some(InternalModelChoice {
@@ -389,11 +401,12 @@ mod tests {
         assert_eq!(resolved.source, InternalModelSource::Explicit);
         assert_eq!(resolved.provider.as_deref(), Some("anthropic"));
         assert_eq!(resolved.model.as_deref(), Some("claude-haiku"));
+        Ok(())
     }
 
     #[test]
-    fn test_empty_choice_forces_main_model() {
-        let mut config = config_with_openrouter(true, true);
+    fn test_empty_choice_forces_main_model() -> TestResult {
+        let mut config = config_with_openrouter(true, true)?;
         config.harness.internal_models.set_choice(
             InternalModelPoint::CompactionSummary,
             Some(InternalModelChoice::default()),
@@ -404,11 +417,12 @@ mod tests {
         assert!(resolved.is_main_model());
         assert!(resolved.provider.is_none());
         assert!(resolved.model.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_openrouter_default_used_when_available() {
-        let config = config_with_openrouter(true, true);
+    fn test_openrouter_default_used_when_available() -> TestResult {
+        let config = config_with_openrouter(true, true)?;
         let resolved = resolve_internal_model(&config, InternalModelPoint::Explorer);
         assert_eq!(resolved.source, InternalModelSource::OpenRouterDefault);
         assert_eq!(resolved.provider.as_deref(), Some(OPENROUTER_PROVIDER));
@@ -416,30 +430,34 @@ mod tests {
             resolved.model.as_deref(),
             Some("nvidia/nemotron-3-super-120b-a12b")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_openrouter_disabled_falls_back_to_main_model() {
-        let config = config_with_openrouter(false, true);
+    fn test_openrouter_disabled_falls_back_to_main_model() -> TestResult {
+        let config = config_with_openrouter(false, true)?;
         let resolved = resolve_internal_model(&config, InternalModelPoint::SessionTitle);
         assert_eq!(resolved.source, InternalModelSource::MainModel);
         assert!(resolved.is_main_model());
+        Ok(())
     }
 
     #[test]
-    fn test_openrouter_without_auth_falls_back_to_main_model() {
-        let config = config_with_openrouter(true, false);
+    fn test_openrouter_without_auth_falls_back_to_main_model() -> TestResult {
+        let config = config_with_openrouter(true, false)?;
         assert!(!openrouter_available(&config));
         let resolved = resolve_internal_model(&config, InternalModelPoint::MemoryConsolidation);
         assert_eq!(resolved.source, InternalModelSource::MainModel);
+        Ok(())
     }
 
     #[test]
-    fn test_use_openrouter_defaults_false_forces_main_model() {
-        let mut config = config_with_openrouter(true, true);
+    fn test_use_openrouter_defaults_false_forces_main_model() -> TestResult {
+        let mut config = config_with_openrouter(true, true)?;
         config.harness.internal_models.use_openrouter_defaults = false;
         let resolved = resolve_internal_model(&config, InternalModelPoint::DreamReflection);
         assert_eq!(resolved.source, InternalModelSource::MainModel);
+        Ok(())
     }
 
     #[test]
@@ -487,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn test_internal_models_toml_parses_deny_unknown_fields() {
+    fn test_internal_models_toml_parses_deny_unknown_fields() -> TestResult {
         let src = r#"
             use_openrouter_defaults = false
 
@@ -495,7 +513,8 @@ mod tests {
             provider = "anthropic"
             model = "claude-haiku"
         "#;
-        let parsed: InternalModelsToml = toml::from_str(src).expect("valid internal_models table");
+        let parsed: InternalModelsToml =
+            toml::from_str(src).map_err(ctx("valid internal_models table"))?;
         assert!(!parsed.use_openrouter_defaults);
         assert_eq!(
             parsed.choice(InternalModelPoint::SessionTitle),
@@ -509,5 +528,6 @@ mod tests {
             use_openrouter_defualts = false
         "#;
         assert!(toml::from_str::<InternalModelsToml>(bad).is_err());
+        Ok(())
     }
 }

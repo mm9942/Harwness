@@ -517,7 +517,10 @@ impl LensStore {
     /// store.put_index("my-index", &manifest, b"raw").expect("stores");
     /// assert!(store.index_manifest_modified("my-index").expect("reads").is_some());
     /// ```
-    pub fn index_manifest_modified(&self, name: &str) -> LensStoreResult<Option<std::time::SystemTime>> {
+    pub fn index_manifest_modified(
+        &self,
+        name: &str,
+    ) -> LensStoreResult<Option<std::time::SystemTime>> {
         let path = self.index_dir(name)?.join(MANIFEST_FILE_NAME);
         if !path_exists(&path)? {
             return Ok(None);
@@ -686,17 +689,18 @@ fn validate_index_name(name: &str) -> LensStoreResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use harw_lens_types::{ByteSpan, Locality, Metric, SourceRef};
 
-    fn sample_chunk(text: &str) -> Chunk {
-        Chunk {
+    fn sample_chunk(text: &str) -> TestResult<Chunk> {
+        Ok(Chunk {
             digest: ChunkDigest(ContentDigest::of(text.as_bytes())),
             source: SourceRef::File {
                 path: "a.txt".to_owned(),
             },
-            span: ByteSpan::new(0, text.len()).expect("valid span"),
+            span: ByteSpan::new(0, text.len()).map_err(ctx("valid span"))?,
             text: text.to_owned(),
-        }
+        })
     }
 
     fn sample_manifest() -> IndexManifest {
@@ -711,150 +715,175 @@ mod tests {
     }
 
     #[test]
-    fn test_put_chunk_then_get_chunk_returns_same_chunk() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = LensStore::open(temp.path()).expect("opens");
-        let chunk = sample_chunk("hallo welt");
+    fn test_put_chunk_then_get_chunk_returns_same_chunk() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = LensStore::open(temp.path()).map_err(ctx("opens"))?;
+        let chunk = sample_chunk("hallo welt")?;
 
-        let digest = store.put_chunk(&chunk).expect("stores");
-        let loaded = store.get_chunk(&digest).expect("reads");
+        let digest = store.put_chunk(&chunk).map_err(ctx("stores"))?;
+        let loaded = store.get_chunk(&digest).map_err(ctx("reads"))?;
 
         assert_eq!(loaded, Some(chunk));
+        Ok(())
     }
 
     #[test]
-    fn test_put_chunk_twice_same_content_creates_one_file() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = LensStore::open(temp.path()).expect("opens");
-        let chunk = sample_chunk("wiederholter inhalt");
+    fn test_put_chunk_twice_same_content_creates_one_file() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = LensStore::open(temp.path()).map_err(ctx("opens"))?;
+        let chunk = sample_chunk("wiederholter inhalt")?;
 
-        let first = store.put_chunk(&chunk).expect("stores first");
-        let second = store.put_chunk(&chunk).expect("stores second");
+        let first = store.put_chunk(&chunk).map_err(ctx("stores first"))?;
+        let second = store.put_chunk(&chunk).map_err(ctx("stores second"))?;
         assert_eq!(first, second);
 
         let (dir, _) = store.chunk_paths(&chunk.digest);
         let entries: Vec<_> = std::fs::read_dir(&dir)
-            .expect("reads fanout dir")
+            .map_err(ctx("reads fanout dir"))?
             .collect::<std::io::Result<Vec<_>>>()
-            .expect("valid entries");
+            .map_err(ctx("valid entries"))?;
         assert_eq!(entries.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_get_chunk_unknown_digest_returns_none() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = LensStore::open(temp.path()).expect("opens");
+    fn test_get_chunk_unknown_digest_returns_none() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = LensStore::open(temp.path()).map_err(ctx("opens"))?;
         let digest = ChunkDigest(ContentDigest::of(b"nie geschrieben"));
 
-        assert_eq!(store.get_chunk(&digest).expect("reads"), None);
+        assert_eq!(store.get_chunk(&digest).map_err(ctx("reads"))?, None);
+        Ok(())
     }
 
     #[test]
-    fn test_has_chunk_reflects_presence() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = LensStore::open(temp.path()).expect("opens");
-        let chunk = sample_chunk("vorhanden");
+    fn test_has_chunk_reflects_presence() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = LensStore::open(temp.path()).map_err(ctx("opens"))?;
+        let chunk = sample_chunk("vorhanden")?;
 
-        assert!(!store.has_chunk(&chunk.digest).expect("checks"));
-        store.put_chunk(&chunk).expect("stores");
-        assert!(store.has_chunk(&chunk.digest).expect("checks"));
+        assert!(!store.has_chunk(&chunk.digest).map_err(ctx("checks"))?);
+        store.put_chunk(&chunk).map_err(ctx("stores"))?;
+        assert!(store.has_chunk(&chunk.digest).map_err(ctx("checks"))?);
+        Ok(())
     }
 
     #[test]
-    fn test_get_chunk_tampered_file_reports_digest_mismatch() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = LensStore::open(temp.path()).expect("opens");
-        let chunk = sample_chunk("unverfälschter inhalt");
-        let digest = store.put_chunk(&chunk).expect("stores");
+    fn test_get_chunk_tampered_file_reports_digest_mismatch() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = LensStore::open(temp.path()).map_err(ctx("opens"))?;
+        let chunk = sample_chunk("unverfälschter inhalt")?;
+        let digest = store.put_chunk(&chunk).map_err(ctx("stores"))?;
 
         let (_, path) = store.chunk_paths(&digest);
         let mut tampered = chunk.clone();
         tampered.text = "verfälschter inhalt".to_owned();
-        std::fs::write(&path, serde_json::to_vec(&tampered).expect("serializes"))
-            .expect("overwrites on disk");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&tampered).map_err(ctx("serializes"))?,
+        )
+        .map_err(ctx("overwrites on disk"))?;
 
         let result = store.get_chunk(&digest);
         assert!(matches!(
             result,
             Err(LensStoreError::ChunkDigestMismatch { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_put_index_get_manifest_and_read_data_roundtrip() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = LensStore::open(temp.path()).expect("opens");
+    fn test_put_index_get_manifest_and_read_data_roundtrip() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = LensStore::open(temp.path()).map_err(ctx("opens"))?;
         let manifest = sample_manifest();
         let data = b"raw-index-bytes".to_vec();
 
         store
             .put_index("my-index", &manifest, &data)
-            .expect("stores");
+            .map_err(ctx("stores"))?;
 
         assert_eq!(
-            store.get_index_manifest("my-index").expect("reads"),
+            store.get_index_manifest("my-index").map_err(ctx("reads"))?,
             Some(manifest)
         );
         assert_eq!(
-            store.read_index_data("my-index").expect("reads"),
+            store.read_index_data("my-index").map_err(ctx("reads"))?,
             Some(data)
         );
+        Ok(())
     }
 
     #[test]
-    fn test_get_index_manifest_unknown_name_returns_none() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = LensStore::open(temp.path()).expect("opens");
-
-        assert_eq!(store.get_index_manifest("never-written").unwrap(), None);
-        assert_eq!(store.read_index_data("never-written").unwrap(), None);
-    }
-
-    #[test]
-    fn test_index_manifest_modified_unknown_name_returns_none() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = LensStore::open(temp.path()).expect("opens");
+    fn test_get_index_manifest_unknown_name_returns_none() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = LensStore::open(temp.path()).map_err(ctx("opens"))?;
 
         assert_eq!(
-            store.index_manifest_modified("never-written").unwrap(),
+            store
+                .get_index_manifest("never-written")
+                .map_err(ctx("reads"))?,
             None
         );
+        assert_eq!(
+            store
+                .read_index_data("never-written")
+                .map_err(ctx("reads"))?,
+            None
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_index_manifest_modified_returns_some_after_put_index() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = LensStore::open(temp.path()).expect("opens");
+    fn test_index_manifest_modified_unknown_name_returns_none() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = LensStore::open(temp.path()).map_err(ctx("opens"))?;
+
+        assert_eq!(
+            store
+                .index_manifest_modified("never-written")
+                .map_err(ctx("reads"))?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_manifest_modified_returns_some_after_put_index() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = LensStore::open(temp.path()).map_err(ctx("opens"))?;
         let manifest = sample_manifest();
 
         store
             .put_index("my-index", &manifest, b"data")
-            .expect("stores");
+            .map_err(ctx("stores"))?;
 
         assert!(
             store
                 .index_manifest_modified("my-index")
-                .expect("reads")
+                .map_err(ctx("reads"))?
                 .is_some()
         );
+        Ok(())
     }
 
     #[test]
-    fn test_index_manifest_modified_rejects_path_separator_in_name() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = LensStore::open(temp.path()).expect("opens");
+    fn test_index_manifest_modified_rejects_path_separator_in_name() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = LensStore::open(temp.path()).map_err(ctx("opens"))?;
 
         let result = store.index_manifest_modified("a/b");
         assert!(matches!(
             result,
             Err(LensStoreError::InvalidIndexName { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_put_index_rejects_path_separator_in_name() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = LensStore::open(temp.path()).expect("opens");
+    fn test_put_index_rejects_path_separator_in_name() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = LensStore::open(temp.path()).map_err(ctx("opens"))?;
         let manifest = sample_manifest();
 
         let result = store.put_index("a/b", &manifest, b"data");
@@ -862,12 +891,13 @@ mod tests {
             result,
             Err(LensStoreError::InvalidIndexName { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_put_index_rejects_dot_dot_traversal_in_name() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = LensStore::open(temp.path()).expect("opens");
+    fn test_put_index_rejects_dot_dot_traversal_in_name() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = LensStore::open(temp.path()).map_err(ctx("opens"))?;
         let manifest = sample_manifest();
 
         let result = store.put_index("../escape", &manifest, b"data");
@@ -875,35 +905,38 @@ mod tests {
             result,
             Err(LensStoreError::InvalidIndexName { .. })
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_put_chunk_leaves_no_tmp_file_in_fanout_dir() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = LensStore::open(temp.path()).expect("opens");
-        let chunk = sample_chunk("aufgeräumter persist-pfad");
+    fn test_put_chunk_leaves_no_tmp_file_in_fanout_dir() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let store = LensStore::open(temp.path()).map_err(ctx("opens"))?;
+        let chunk = sample_chunk("aufgeräumter persist-pfad")?;
 
-        store.put_chunk(&chunk).expect("stores");
+        store.put_chunk(&chunk).map_err(ctx("stores"))?;
 
         let (dir, path) = store.chunk_paths(&chunk.digest);
         let entries: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .expect("reads fanout dir")
-            .map(|entry| entry.expect("valid entry").path())
-            .collect();
+            .map_err(ctx("reads fanout dir"))?
+            .map(|entry| entry.map(|e| e.path()).map_err(ctx("valid entry")))
+            .collect::<TestResult<Vec<PathBuf>>>()?;
 
         assert_eq!(entries, vec![path]);
+        Ok(())
     }
 
     #[test]
-    fn test_open_rejects_lens_store_path_occupied_by_a_file() {
-        let temp = tempfile::tempdir().expect("tempdir");
+    fn test_open_rejects_lens_store_path_occupied_by_a_file() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         std::fs::write(temp.path().join("lens_store"), b"not a directory")
-            .expect("writes blocking file");
+            .map_err(ctx("writes blocking file"))?;
 
         let result = LensStore::open(temp.path());
         assert!(matches!(
             result,
             Err(LensStoreError::UnexpectedPathType { .. })
         ));
+        Ok(())
     }
 }

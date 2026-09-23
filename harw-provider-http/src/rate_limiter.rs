@@ -579,18 +579,19 @@ fn instant_from_epoch_seconds(epoch: f64, now: Instant) -> Option<Instant> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use reqwest::header::{HeaderMap, HeaderValue};
 
-    fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
+    fn header_map(pairs: &[(&str, &str)]) -> TestResult<HeaderMap> {
         let mut headers = HeaderMap::new();
         for (name, value) in pairs {
             headers.insert(
                 reqwest::header::HeaderName::from_bytes(name.as_bytes())
-                    .expect("valid header name"),
-                HeaderValue::from_str(value).expect("valid header value"),
+                    .map_err(ctx("valid header name"))?,
+                HeaderValue::from_str(value).map_err(ctx("valid header value"))?,
             );
         }
-        headers
+        Ok(headers)
     }
 
     #[test]
@@ -613,19 +614,20 @@ mod tests {
     }
 
     #[test]
-    fn test_disabled_limiter_never_waits() {
+    fn test_disabled_limiter_never_waits() -> TestResult {
         let limiter = ProviderRateLimiter::new(None);
         assert!(!limiter.is_enabled());
         let headers = header_map(&[
             ("anthropic-ratelimit-requests-limit", "50"),
             ("anthropic-ratelimit-requests-remaining", "0"),
-        ]);
+        ])?;
         limiter.observe_headers(&headers);
         assert_eq!(limiter.pending_wait(), None);
+        Ok(())
     }
 
     #[test]
-    fn test_observe_headers_anthropic_family_triggers_pending_wait() {
+    fn test_observe_headers_anthropic_family_triggers_pending_wait() -> TestResult {
         let limiter = ProviderRateLimiter::new(Some(harw_config::RateLimitToml {
             enabled: true,
             safety_margin_pct: 20,
@@ -634,17 +636,18 @@ mod tests {
             ("anthropic-ratelimit-requests-limit", "100"),
             ("anthropic-ratelimit-requests-remaining", "5"),
             ("anthropic-ratelimit-requests-reset", "2999-01-01T00:00:00Z"),
-        ]);
+        ])?;
         limiter.observe_headers(&headers);
         let wait = limiter.pending_wait();
         assert!(
             wait.is_some(),
             "remaining 5%% <= safety margin 20%% muss warten ausloesen"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_observe_headers_openai_family_above_margin_no_wait() {
+    fn test_observe_headers_openai_family_above_margin_no_wait() -> TestResult {
         let limiter = ProviderRateLimiter::new(Some(harw_config::RateLimitToml {
             enabled: true,
             safety_margin_pct: 10,
@@ -653,13 +656,14 @@ mod tests {
             ("x-ratelimit-limit-requests", "100"),
             ("x-ratelimit-remaining-requests", "80"),
             ("x-ratelimit-reset-requests", "6m0s"),
-        ]);
+        ])?;
         limiter.observe_headers(&headers);
         assert_eq!(limiter.pending_wait(), None);
+        Ok(())
     }
 
     #[test]
-    fn test_observe_headers_malformed_values_ignored() {
+    fn test_observe_headers_malformed_values_ignored() -> TestResult {
         let limiter = ProviderRateLimiter::new(Some(harw_config::RateLimitToml {
             enabled: true,
             safety_margin_pct: 50,
@@ -668,26 +672,28 @@ mod tests {
             ("anthropic-ratelimit-tokens-limit", "not-a-number"),
             ("anthropic-ratelimit-tokens-remaining", "also-bad"),
             ("anthropic-ratelimit-tokens-reset", "not-a-timestamp"),
-        ]);
+        ])?;
         limiter.observe_headers(&headers);
         assert_eq!(limiter.pending_wait(), None);
+        Ok(())
     }
 
     #[test]
-    fn test_retry_after_header_triggers_pending_wait() {
+    fn test_retry_after_header_triggers_pending_wait() -> TestResult {
         let limiter = ProviderRateLimiter::new(Some(harw_config::RateLimitToml {
             enabled: true,
             safety_margin_pct: 10,
         }));
-        let headers = header_map(&[("retry-after", "5")]);
+        let headers = header_map(&[("retry-after", "5")])?;
         limiter.observe_headers(&headers);
         let wait = limiter.pending_wait();
         assert!(wait.is_some());
-        assert!(wait.expect("checked above") <= Duration::from_secs(5));
+        assert!(wait.ok_or(TestError::Missing("checked above"))? <= Duration::from_secs(5));
+        Ok(())
     }
 
     #[test]
-    fn test_pending_wait_capped_at_max_wait() {
+    fn test_pending_wait_capped_at_max_wait() -> TestResult {
         let limiter = ProviderRateLimiter::new(Some(harw_config::RateLimitToml {
             enabled: true,
             safety_margin_pct: 100,
@@ -696,17 +702,22 @@ mod tests {
             ("anthropic-ratelimit-requests-limit", "10"),
             ("anthropic-ratelimit-requests-remaining", "1"),
             ("anthropic-ratelimit-requests-reset", "2999-01-01T00:00:00Z"),
-        ]);
+        ])?;
         limiter.observe_headers(&headers);
-        let wait = limiter.pending_wait().expect("wait erwartet");
+        let wait = limiter
+            .pending_wait()
+            .ok_or(TestError::Missing("wait erwartet"))?;
         assert!(wait <= MAX_WAIT);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_rfc3339_epoch_seconds_basic() {
+    fn test_parse_rfc3339_epoch_seconds_basic() -> TestResult {
         // 1970-01-01T00:00:01Z == 1 Sekunde seit Epoche.
-        let epoch = parse_rfc3339_epoch_seconds("1970-01-01T00:00:01Z").expect("parsebar");
+        let epoch = parse_rfc3339_epoch_seconds("1970-01-01T00:00:01Z")
+            .ok_or(TestError::Missing("parsebar"))?;
         assert!((epoch - 1.0).abs() < 1e-6);
+        Ok(())
     }
 
     #[test]

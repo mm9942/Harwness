@@ -250,6 +250,7 @@ fn join_semantics(barrier: CellBarrier) -> JoinSemantics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testing::{coding_node, plan_with};
     use harw_agent_dsl::organization::CellKind;
     use harw_plan::{PathOrSymbol, PlanNodeStatus};
@@ -289,21 +290,19 @@ mod tests {
     }
 
     #[test]
-    fn test_from_cell_selects_members_by_task_id_glob() {
+    fn test_from_cell_selects_members_by_task_id_glob() -> TestResult {
         let plan = plan_with(vec![
             node_writing("tui-1", &["harw-tui/src/a.rs"]),
             node_writing("cli-1", &["harw-cli/src/b.rs"]),
             node_writing("tui-2", &["harw-tui/src/c.rs"]),
-        ]);
+        ])?;
 
-        let resolved = match CellPlan::from_cell(
+        let resolved = CellPlan::from_cell(
             &cell("tui-*", CellWritePartition::None, CellBarrier::AllTerminal),
             None,
             &plan,
-        ) {
-            Ok(resolved) => resolved,
-            Err(error) => panic!("from_cell schlug fehl: {error}"),
-        };
+        )
+        .map_err(ctx("from_cell schlug fehl"))?;
 
         assert_eq!(
             resolved.members,
@@ -311,16 +310,17 @@ mod tests {
         );
         assert_eq!(resolved.batches, vec![resolved.members.clone()]);
         assert_eq!(resolved.role, "cell-1");
+        Ok(())
     }
 
     #[test]
-    fn test_from_cell_selects_members_by_write_scope_glob() {
+    fn test_from_cell_selects_members_by_write_scope_glob() -> TestResult {
         let plan = plan_with(vec![
             node_writing("t-1", &["harw-tui/src/a.rs"]),
             node_writing("t-2", &["harw-cli/src/b.rs"]),
-        ]);
+        ])?;
 
-        let resolved = match CellPlan::from_cell(
+        let resolved = CellPlan::from_cell(
             &cell(
                 "harw-tui/**",
                 CellWritePartition::None,
@@ -328,20 +328,19 @@ mod tests {
             ),
             None,
             &plan,
-        ) {
-            Ok(resolved) => resolved,
-            Err(error) => panic!("from_cell schlug fehl: {error}"),
-        };
+        )
+        .map_err(ctx("from_cell schlug fehl"))?;
 
         assert_eq!(resolved.members, vec![TaskId::new("t-1")]);
+        Ok(())
     }
 
     #[test]
-    fn test_clan_plan_scope_narrows_the_selection() {
+    fn test_clan_plan_scope_narrows_the_selection() -> TestResult {
         let plan = plan_with(vec![
             node_writing("t-1", &["harw-tui/src/a.rs"]),
             node_writing("t-2", &["harw-cli/src/b.rs"]),
-        ]);
+        ])?;
         let clan = RawClanSpec {
             id: "clan-tui".to_owned(),
             name: "TUI".to_owned(),
@@ -351,28 +350,27 @@ mod tests {
             child_depth_cost: 1,
         };
 
-        let resolved = match CellPlan::from_cell(
+        let resolved = CellPlan::from_cell(
             &cell("t-*", CellWritePartition::None, CellBarrier::AllTerminal),
             Some(&clan),
             &plan,
-        ) {
-            Ok(resolved) => resolved,
-            Err(error) => panic!("from_cell schlug fehl: {error}"),
-        };
+        )
+        .map_err(ctx("from_cell schlug fehl"))?;
 
         assert_eq!(resolved.members, vec![TaskId::new("t-1")]);
         assert_eq!(resolved.role, "clan-tui");
+        Ok(())
     }
 
     #[test]
-    fn test_required_partition_splits_conflicting_write_scopes_into_batches() {
+    fn test_required_partition_splits_conflicting_write_scopes_into_batches() -> TestResult {
         let plan = plan_with(vec![
             node_writing("t-1", &["src/shared.rs"]),
             node_writing("t-2", &["src/shared.rs"]),
             node_writing("t-3", &["src/other.rs"]),
-        ]);
+        ])?;
 
-        let resolved = match CellPlan::from_cell(
+        let resolved = CellPlan::from_cell(
             &cell(
                 "t-*",
                 CellWritePartition::Required,
@@ -380,10 +378,8 @@ mod tests {
             ),
             None,
             &plan,
-        ) {
-            Ok(resolved) => resolved,
-            Err(error) => panic!("from_cell schlug fehl: {error}"),
-        };
+        )
+        .map_err(ctx("from_cell schlug fehl"))?;
 
         assert_eq!(resolved.members.len(), 3);
         assert_eq!(resolved.batches.len(), 2, "Batches: {:?}", resolved.batches);
@@ -403,16 +399,17 @@ mod tests {
             batch.contains(&TaskId::new("t-1")) && batch.contains(&TaskId::new("t-2"))
         });
         assert!(!together, "kollidierende Knoten im selben Batch");
+        Ok(())
     }
 
     #[test]
-    fn test_advisory_partition_keeps_everything_in_one_batch() {
+    fn test_advisory_partition_keeps_everything_in_one_batch() -> TestResult {
         let plan = plan_with(vec![
             node_writing("t-1", &["src/shared.rs"]),
             node_writing("t-2", &["src/shared.rs"]),
-        ]);
+        ])?;
 
-        let resolved = match CellPlan::from_cell(
+        let resolved = CellPlan::from_cell(
             &cell(
                 "t-*",
                 CellWritePartition::Advisory,
@@ -420,18 +417,17 @@ mod tests {
             ),
             None,
             &plan,
-        ) {
-            Ok(resolved) => resolved,
-            Err(error) => panic!("from_cell schlug fehl: {error}"),
-        };
+        )
+        .map_err(ctx("from_cell schlug fehl"))?;
 
         assert_eq!(resolved.batches.len(), 1);
         assert_eq!(resolved.batches[0].len(), 2);
+        Ok(())
     }
 
     #[test]
-    fn test_barrier_maps_to_join_semantics() {
-        let plan = plan_with(vec![node_writing("t-1", &["src/a.rs"])]);
+    fn test_barrier_maps_to_join_semantics() -> TestResult {
+        let plan = plan_with(vec![node_writing("t-1", &["src/a.rs"])])?;
         let cases = [
             (CellBarrier::AllTerminal, JoinSemantics::AllTerminal),
             (CellBarrier::AnyTerminal, JoinSemantics::AnyTerminal),
@@ -439,21 +435,17 @@ mod tests {
         ];
 
         for (barrier, expected) in cases {
-            let resolved = match CellPlan::from_cell(
-                &cell("t-*", CellWritePartition::None, barrier),
-                None,
-                &plan,
-            ) {
-                Ok(resolved) => resolved,
-                Err(error) => panic!("from_cell schlug fehl: {error}"),
-            };
+            let resolved =
+                CellPlan::from_cell(&cell("t-*", CellWritePartition::None, barrier), None, &plan)
+                    .map_err(ctx("from_cell schlug fehl"))?;
             assert_eq!(resolved.join, expected, "Barriere {barrier:?}");
         }
+        Ok(())
     }
 
     #[test]
-    fn test_blank_member_pattern_is_rejected() {
-        let plan = plan_with(vec![node_writing("t-1", &["src/a.rs"])]);
+    fn test_blank_member_pattern_is_rejected() -> TestResult {
+        let plan = plan_with(vec![node_writing("t-1", &["src/a.rs"])])?;
 
         match CellPlan::from_cell(
             &cell("   ", CellWritePartition::None, CellBarrier::AllTerminal),
@@ -462,16 +454,19 @@ mod tests {
         ) {
             Err(PlanBridgeError::CellMemberPattern { pattern }) => {
                 assert_eq!(pattern, "   ");
+                Ok(())
             }
-            other => panic!("erwartet CellMemberPattern, bekommen: {other:?}"),
+            other => Err(TestError::Unexpected(format!(
+                "erwartet CellMemberPattern, bekommen: {other:?}"
+            ))),
         }
     }
 
     #[test]
-    fn test_pattern_without_matches_yields_an_empty_wave() {
-        let plan = plan_with(vec![node_writing("t-1", &["src/a.rs"])]);
+    fn test_pattern_without_matches_yields_an_empty_wave() -> TestResult {
+        let plan = plan_with(vec![node_writing("t-1", &["src/a.rs"])])?;
 
-        let resolved = match CellPlan::from_cell(
+        let resolved = CellPlan::from_cell(
             &cell(
                 "nichts-*",
                 CellWritePartition::Required,
@@ -479,29 +474,26 @@ mod tests {
             ),
             None,
             &plan,
-        ) {
-            Ok(resolved) => resolved,
-            Err(error) => panic!("from_cell schlug fehl: {error}"),
-        };
+        )
+        .map_err(ctx("from_cell schlug fehl"))?;
 
         assert!(resolved.members.is_empty());
         assert!(resolved.batches.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_fanout_requests_follow_batch_order_and_skip_unresolved_members() {
+    fn test_fanout_requests_follow_batch_order_and_skip_unresolved_members() -> TestResult {
         let plan = plan_with(vec![
             node_writing("t-1", &["src/a.rs"]),
             node_writing("t-2", &["src/b.rs"]),
-        ]);
-        let resolved_cell = match CellPlan::from_cell(
+        ])?;
+        let resolved_cell = CellPlan::from_cell(
             &cell("t-*", CellWritePartition::None, CellBarrier::AllTerminal),
             None,
             &plan,
-        ) {
-            Ok(resolved) => resolved,
-            Err(error) => panic!("from_cell schlug fehl: {error}"),
-        };
+        )
+        .map_err(ctx("from_cell schlug fehl"))?;
 
         // Nur t-1 wurde admittiert.
         let child = SessionId::new();
@@ -519,16 +511,17 @@ mod tests {
             requests[0].input.user_text.as_deref(),
             Some("arbeite an t-1")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_fanout_requests_are_deterministic() {
+    fn test_fanout_requests_are_deterministic() -> TestResult {
         let plan = plan_with(vec![
             node_writing("t-1", &["src/a.rs"]),
             node_writing("t-2", &["src/b.rs"]),
             node_writing("t-3", &["src/c.rs"]),
-        ]);
-        let resolved_cell = match CellPlan::from_cell(
+        ])?;
+        let resolved_cell = CellPlan::from_cell(
             &cell(
                 "t-*",
                 CellWritePartition::Required,
@@ -536,10 +529,8 @@ mod tests {
             ),
             None,
             &plan,
-        ) {
-            Ok(resolved) => resolved,
-            Err(error) => panic!("from_cell schlug fehl: {error}"),
-        };
+        )
+        .map_err(ctx("from_cell schlug fehl"))?;
 
         let mut children: HashMap<TaskId, (SessionId, TurnInput)> = HashMap::new();
         for id in ["t-1", "t-2", "t-3"] {
@@ -563,5 +554,6 @@ mod tests {
         };
         assert_eq!(ids(&first), ids(&second));
         assert_eq!(first.len(), 3);
+        Ok(())
     }
 }

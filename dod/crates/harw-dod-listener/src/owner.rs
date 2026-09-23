@@ -343,21 +343,24 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn test_parse_cgroup_id_prefers_unified_v2_line() {
+    fn test_parse_cgroup_id_prefers_unified_v2_line() -> TestResult {
         let content = "12:pids:/user.slice/user-1000.slice\n\
                         0::/user.slice/user-1000.slice/session-3.scope\n";
-        let id = parse_cgroup_id(content).expect("v2-Zeile muss aufgelöst werden");
+        let id = parse_cgroup_id(content).ok_or(TestError::Missing("v2-Zeile aufgelöst"))?;
         assert_eq!(id.as_str(), "/user.slice/user-1000.slice/session-3.scope");
+        Ok(())
     }
 
     #[test]
-    fn test_parse_cgroup_id_falls_back_to_first_v1_line() {
+    fn test_parse_cgroup_id_falls_back_to_first_v1_line() -> TestResult {
         let content = "4:memory:/user.slice/user-1000.slice\n\
                         7:cpu:/user.slice/user-1000.slice\n";
-        let id = parse_cgroup_id(content).expect("erste v1-Zeile muss aufgelöst werden");
+        let id = parse_cgroup_id(content).ok_or(TestError::Missing("erste v1-Zeile aufgelöst"))?;
         assert_eq!(id.as_str(), "/user.slice/user-1000.slice");
+        Ok(())
     }
 
     #[test]
@@ -366,44 +369,48 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_cgroup_id_skips_lines_with_empty_path() {
+    fn test_parse_cgroup_id_skips_lines_with_empty_path() -> TestResult {
         let content = "0::\n4:memory:/real.slice\n";
-        let id = parse_cgroup_id(content).expect("Zeile mit leerem Pfad wird übersprungen");
+        let id = parse_cgroup_id(content)
+            .ok_or(TestError::Missing("Zeile mit leerem Pfad übersprungen"))?;
         assert_eq!(id.as_str(), "/real.slice");
+        Ok(())
     }
 
     /// Baut `root/<pid>/fd/<fd>` als Symlink auf `socket:[<inode>]` — das
     /// procfs-Muster für einen Socket-Deskriptor, ohne dass "socket:[..]"
     /// selbst ein reales Ziel sein muss (siehe Moduldokumentation).
     #[cfg(unix)]
-    fn write_socket_fd(root: &Path, pid: u32, fd: u32, inode: u64) {
+    fn write_socket_fd(root: &Path, pid: u32, fd: u32, inode: u64) -> TestResult {
         let fd_dir = root.join(pid.to_string()).join("fd");
-        fs::create_dir_all(&fd_dir).expect("fd-Verzeichnis anlegen");
+        fs::create_dir_all(&fd_dir).map_err(ctx("fd-Verzeichnis anlegen"))?;
         symlink(format!("socket:[{inode}]"), fd_dir.join(fd.to_string()))
-            .expect("Socket-Symlink anlegen");
+            .map_err(ctx("Socket-Symlink anlegen"))?;
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_resolve_owners_finds_pid_owning_inode() {
-        let dir = tempdir().expect("tempdir");
-        write_socket_fd(dir.path(), 1000, 3, 12345);
+    fn test_resolve_owners_finds_pid_owning_inode() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
+        write_socket_fd(dir.path(), 1000, 3, 12345)?;
         let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
 
         let inodes: HashSet<u64> = [12345].into_iter().collect();
         let owners = resolve_owners(&scope, dir.path(), &inodes);
 
         assert_eq!(owners.get(&12345), Some(&1000));
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_resolve_owners_skips_process_with_missing_fd_directory() {
-        let dir = tempdir().expect("tempdir");
+    fn test_resolve_owners_skips_process_with_missing_fd_directory() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         // `2000` existiert als PID-Verzeichnis, aber ohne lesbares `fd` —
         // dieselbe Fehlerbahn wie eine fehlende Leseberechtigung.
-        fs::create_dir_all(dir.path().join("2000")).expect("pid-Verzeichnis anlegen");
-        write_socket_fd(dir.path(), 1000, 3, 12345);
+        fs::create_dir_all(dir.path().join("2000")).map_err(ctx("pid-Verzeichnis anlegen"))?;
+        write_socket_fd(dir.path(), 1000, 3, 12345)?;
         let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
 
         let inodes: HashSet<u64> = [12345, 99999].into_iter().collect();
@@ -411,63 +418,70 @@ mod tests {
 
         assert_eq!(owners.get(&12345), Some(&1000));
         assert_eq!(owners.get(&99999), None);
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_owners_empty_inode_set_returns_empty_map() {
-        let dir = tempdir().expect("tempdir");
+    fn test_resolve_owners_empty_inode_set_returns_empty_map() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
         let owners = resolve_owners(&scope, dir.path(), &HashSet::new());
         assert!(owners.is_empty());
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_read_actor_resolves_uid_and_cgroup() {
-        let dir = tempdir().expect("tempdir");
+    fn test_read_actor_resolves_uid_and_cgroup() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let pid_dir = dir.path().join("1000");
-        fs::create_dir_all(&pid_dir).expect("pid-Verzeichnis anlegen");
+        fs::create_dir_all(&pid_dir).map_err(ctx("pid-Verzeichnis anlegen"))?;
         fs::write(
             pid_dir.join("status"),
             "Name:\tsshd\nUid:\t1000\t1000\t1000\t1000\n",
         )
-        .expect("status schreiben");
+        .map_err(ctx("status schreiben"))?;
         fs::write(pid_dir.join("cgroup"), "0::/user.slice/user-1000.slice\n")
-            .expect("cgroup schreiben");
+            .map_err(ctx("cgroup schreiben"))?;
         let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
 
-        let actor = read_actor(&scope, dir.path(), 1000).expect("Actor muss auflösbar sein");
+        let actor =
+            read_actor(&scope, dir.path(), 1000).ok_or(TestError::Missing("Actor auflösbar"))?;
         assert_eq!(actor.uid, 1000);
         assert_eq!(actor.auid, None);
         assert_eq!(
             actor.cgroup.map(|c| c.as_str().to_owned()),
             Some("/user.slice/user-1000.slice".to_owned())
         );
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_read_actor_missing_cgroup_file_still_resolves_uid_with_none_cgroup() {
-        let dir = tempdir().expect("tempdir");
+    fn test_read_actor_missing_cgroup_file_still_resolves_uid_with_none_cgroup() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let pid_dir = dir.path().join("1000");
-        fs::create_dir_all(&pid_dir).expect("pid-Verzeichnis anlegen");
+        fs::create_dir_all(&pid_dir).map_err(ctx("pid-Verzeichnis anlegen"))?;
         fs::write(pid_dir.join("status"), "Uid:\t1000\t1000\t1000\t1000\n")
-            .expect("status schreiben");
+            .map_err(ctx("status schreiben"))?;
         // Keine `cgroup`-Datei angelegt.
         let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
 
-        let actor = read_actor(&scope, dir.path(), 1000).expect("UID allein reicht für Actor");
+        let actor = read_actor(&scope, dir.path(), 1000)
+            .ok_or(TestError::Missing("UID allein reicht für Actor"))?;
         assert_eq!(actor.uid, 1000);
         assert_eq!(actor.cgroup, None);
+        Ok(())
     }
 
     #[test]
-    fn test_read_actor_missing_status_file_returns_none() {
-        let dir = tempdir().expect("tempdir");
-        fs::create_dir_all(dir.path().join("1000")).expect("pid-Verzeichnis anlegen");
+    fn test_read_actor_missing_status_file_returns_none() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
+        fs::create_dir_all(dir.path().join("1000")).map_err(ctx("pid-Verzeichnis anlegen"))?;
         let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
 
         assert_eq!(read_actor(&scope, dir.path(), 1000), None);
+        Ok(())
     }
 
     /// Scope-Dichtheit: `resolve_owners` durchsucht `root` gar nicht erst,
@@ -475,15 +489,16 @@ mod tests {
     /// nicht, wenn unter `root` tatsächlich auflösbare Daten liegen.
     #[cfg(unix)]
     #[test]
-    fn test_resolve_owners_returns_empty_when_root_outside_scope() {
-        let real_root = tempdir().expect("tempdir für die echte Wurzel");
-        let other_root = tempdir().expect("tempdir außerhalb des Bereichs");
-        write_socket_fd(real_root.path(), 1000, 3, 12345);
+    fn test_resolve_owners_returns_empty_when_root_outside_scope() -> TestResult {
+        let real_root = tempdir().map_err(ctx("tempdir für die echte Wurzel"))?;
+        let other_root = tempdir().map_err(ctx("tempdir außerhalb des Bereichs"))?;
+        write_socket_fd(real_root.path(), 1000, 3, 12345)?;
 
         let scope = ReadScope::from_roots([other_root.path().to_path_buf()]);
         let inodes: HashSet<u64> = [12345].into_iter().collect();
         let owners = resolve_owners(&scope, real_root.path(), &inodes);
 
         assert!(owners.is_empty());
+        Ok(())
     }
 }

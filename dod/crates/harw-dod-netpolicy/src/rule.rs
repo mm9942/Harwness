@@ -169,6 +169,7 @@ fn host_matches(allowed: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn test_from_egress_target_host_maps_to_allow_host() {
@@ -193,32 +194,35 @@ mod tests {
     }
 
     #[test]
-    fn test_from_egress_target_cidr_maps_to_allow_cidr() {
-        let net: IpNet = "10.0.0.0/8".parse().expect("valid CIDR literal");
+    fn test_from_egress_target_cidr_maps_to_allow_cidr() -> TestResult {
+        let net: IpNet = "10.0.0.0/8".parse().map_err(ctx("valid CIDR literal"))?;
         let target = EgressTarget::Cidr(net);
         assert_eq!(NetRule::from(target), NetRule::AllowCidr { cidr: net });
+        Ok(())
     }
 
     #[test]
-    fn test_allow_host_rule_matches_only_the_exact_name() {
+    fn test_allow_host_rule_matches_only_the_exact_name() -> TestResult {
         let rule = NetRule::AllowHost {
             host: "api.example.com".to_owned(),
         };
         assert!(rule.allows_host("api.example.com"));
         assert!(rule.allows_host("API.EXAMPLE.COM"));
         assert!(!rule.allows_host("sub.api.example.com"));
-        assert!(!rule.allows_addr("10.0.0.1".parse().expect("valid IP")));
+        assert!(!rule.allows_addr("10.0.0.1".parse().map_err(ctx("valid IP"))?));
+        Ok(())
     }
 
     #[test]
-    fn test_allow_dns_suffix_rule_matches_at_a_dot_boundary() {
+    fn test_allow_dns_suffix_rule_matches_at_a_dot_boundary() -> TestResult {
         let rule = NetRule::AllowDnsSuffix {
             suffix: "docs.rs".to_owned(),
         };
         assert!(rule.allows_host("docs.rs"));
         assert!(rule.allows_host("static.docs.rs"));
         assert!(!rule.allows_host("evildocs.rs"));
-        assert!(!rule.allows_addr("10.0.0.1".parse().expect("valid IP")));
+        assert!(!rule.allows_addr("10.0.0.1".parse().map_err(ctx("valid IP"))?));
+        Ok(())
     }
 
     /// `host_matches` delegiert an `harw_authority::host_matches_suffix`
@@ -243,12 +247,13 @@ mod tests {
     }
 
     #[test]
-    fn test_allow_cidr_rule_matches_only_addresses_never_hosts() {
-        let net: IpNet = "10.0.0.0/8".parse().expect("valid CIDR literal");
+    fn test_allow_cidr_rule_matches_only_addresses_never_hosts() -> TestResult {
+        let net: IpNet = "10.0.0.0/8".parse().map_err(ctx("valid CIDR literal"))?;
         let rule = NetRule::AllowCidr { cidr: net };
-        assert!(rule.allows_addr("10.1.2.3".parse().expect("valid IP")));
-        assert!(!rule.allows_addr("11.0.0.0".parse().expect("valid IP")));
+        assert!(rule.allows_addr("10.1.2.3".parse().map_err(ctx("valid IP"))?));
+        assert!(!rule.allows_addr("11.0.0.0".parse().map_err(ctx("valid IP"))?));
         assert!(!rule.allows_host("docs.rs"));
+        Ok(())
     }
 
     #[test]

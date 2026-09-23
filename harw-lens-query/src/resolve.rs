@@ -93,16 +93,19 @@ pub fn resolve_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn test_resolve_index_rejects_visibility_outside_scope_before_touching_disk() {
+    fn test_resolve_index_rejects_visibility_outside_scope_before_touching_disk() -> TestResult {
         // A path that cannot possibly exist: proves the rejection happens
         // before any filesystem access, not because the directory is missing.
         let home = Path::new("/definitely/does/not/exist/harw-lens-query-test");
         let selector = IndexSelector::new("knowledge.palace", "operator-only");
         let scope = ReadScope::single("workspace");
 
-        let err = resolve_index(home, &selector, &scope).expect_err("must be rejected");
+        let Err(err) = resolve_index(home, &selector, &scope) else {
+            return Err(TestError::Unexpected("must be rejected".into()));
+        };
         assert!(matches!(
             err,
             QueryError::IndexNotVisible {
@@ -110,15 +113,19 @@ mod tests {
                 ref visibility,
             } if index_name == "knowledge.palace" && visibility == "operator-only"
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_index_missing_index_within_allowed_scope_is_an_index_error() {
-        let home = tempfile::tempdir().expect("tempdir");
+    fn test_resolve_index_missing_index_within_allowed_scope_is_an_index_error() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let selector = IndexSelector::new("does-not-exist", "workspace");
         let scope = ReadScope::single("workspace");
 
-        let err = resolve_index(home.path(), &selector, &scope).expect_err("no such index");
+        let Err(err) = resolve_index(home.path(), &selector, &scope) else {
+            return Err(TestError::Unexpected("no such index".into()));
+        };
         assert!(matches!(err, QueryError::Index(_)));
+        Ok(())
     }
 }

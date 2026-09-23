@@ -252,6 +252,20 @@ fn file_name_of(path: &str) -> &str {
 
 const PLAN_SCOPE_TOOLS: [&str; 3] = ["fs.write", "fs.edit", "fs.patch"];
 
+/// Tools, deren wiederholter *erfolgreicher* Aufruf mit identischer Signatur
+/// dennoch als Rundenfortschritt zählt (Fix C, Moduldoku „Achter Nachtrag").
+///
+/// # Description
+/// `harw-core/src/turn_loop.rs::apply_tool_guard` verwendet diese Liste, um
+/// die sonst geltende Regel „nur eine *neue* Erfolgs-Signatur zählt als
+/// Fortschritt" für Werkzeuge auszusetzen, mit denen legitim auf einen
+/// laufenden Hintergrundprozess gewartet wird (z. B. wiederholtes
+/// `shell.exec status`). Ohne diese Ausnahme erschien ein solches Polling dem
+/// Modell als Endlosschleife ohne Fortschritt, obwohl jeder Aufruf real
+/// ausgeführt wurde — siehe die umformulierte Hinweismeldung in
+/// [`TurnGuard::observe_round_end`].
+pub(crate) const POLLING_TOOLS: &[&str] = &["shell.exec"];
+
 /// Turn-lokaler Zustand der Wächter aus Addendum F+G.
 ///
 /// # Description
@@ -298,7 +312,12 @@ impl TurnGuard {
         }
     }
 
-    fn event(&self, kind: DriftKind, detail: impl Into<String>, tool_name: Option<&str>) -> DriftEvent {
+    fn event(
+        &self,
+        kind: DriftKind,
+        detail: impl Into<String>,
+        tool_name: Option<&str>,
+    ) -> DriftEvent {
         DriftEvent {
             kind,
             session_id: self.session_id.to_string(),
@@ -402,10 +421,7 @@ impl TurnGuard {
                 if let Some(path) = arguments.get("path").and_then(serde_json::Value::as_str) {
                     let file_name = file_name_of(path);
                     let already_warned = self.scope_drift_warned_paths.contains(path);
-                    if !file_name.is_empty()
-                        && !plan_text.contains(file_name)
-                        && !already_warned
-                    {
+                    if !file_name.is_empty() && !plan_text.contains(file_name) && !already_warned {
                         self.scope_drift_warned_paths.insert(path.to_owned());
                         let event = self.event(
                             DriftKind::PlanScopeDrift,
@@ -481,7 +497,10 @@ impl TurnGuard {
             );
             return GuardVerdict::Warn {
                 hint: format!(
-                    "[harw-Wächter] {rounds} Runden ohne erkennbaren Fortschritt — Strategie überdenken."
+                    "[harw-Wächter] {rounds} Runden mit wiederholten identischen Aufrufen ohne \
+                     neues Ergebnis. Hinweis: Es gibt keinen Antwort-Cache — jeder Aufruf wurde \
+                     echt ausgeführt. Beim Warten auf einen laufenden Prozess ist Wiederholen in \
+                     Ordnung; sonst Vorgehen überdenken."
                 ),
                 event,
             };
@@ -513,6 +532,7 @@ impl TurnGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn sid() -> harw_types::SessionId {
         harw_types::SessionId::new()
@@ -565,7 +585,10 @@ mod tests {
         };
         let mut guard = TurnGuard::new(policy, &session_id);
 
-        assert!(matches!(guard.observe_round_end(false), GuardVerdict::Continue));
+        assert!(matches!(
+            guard.observe_round_end(false),
+            GuardVerdict::Continue
+        ));
         assert!(matches!(
             guard.observe_round_end(false),
             GuardVerdict::Warn { .. }
@@ -590,7 +613,46 @@ mod tests {
             guard.observe_round_end(false),
             GuardVerdict::Warn { .. }
         ));
-        assert!(matches!(guard.observe_round_end(true), GuardVerdict::Continue));
+        assert!(matches!(
+            guard.observe_round_end(true),
+            GuardVerdict::Continue
+        ));
+    }
+
+    // Fix C (Moduldoku „Achter Nachtrag"): das Modell hatte den alten Hinweis
+    // "... Strategie überdenken." als Beleg für einen nicht existenten
+    // Antwort-Cache fehlgedeutet und begann, Befehle künstlich zu variieren
+    // (`echo LAEUFT-v2`, `-v3`), obwohl es legitim auf einen laufenden
+    // Hintergrundprozess wartete. Der neue Hinweistext muss explizit
+    // klarstellen, dass es keinen Cache gibt.
+    #[test]
+    fn test_observe_round_end_no_progress_hint_denies_response_cache() -> TestResult {
+        let session_id = sid();
+        let policy = GuardPolicy {
+            no_progress_rounds_warn: 1,
+            no_progress_rounds_abort: 100,
+            ..GuardPolicy::default()
+        };
+        let mut guard = TurnGuard::new(policy, &session_id);
+
+        match guard.observe_round_end(false) {
+            GuardVerdict::Warn { hint, .. } => {
+                assert!(
+                    hint.contains("kein"),
+                    "hint must explicitly deny a response cache: {hint}"
+                );
+                assert!(
+                    hint.contains("Cache"),
+                    "hint must name the misunderstood concept ('Cache') directly: {hint}"
+                );
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected GuardVerdict::Warn, got {other:?}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -611,13 +673,19 @@ mod tests {
             "plan body mentions foo.rs",
         );
 
-        assert!(matches!(guard.observe_round_end(true), GuardVerdict::Continue));
+        assert!(matches!(
+            guard.observe_round_end(true),
+            GuardVerdict::Continue
+        ));
         assert!(matches!(
             guard.observe_round_end(true),
             GuardVerdict::Warn { .. }
         ));
         // Einmalig: ein weiterer Aufruf ohne neuen Plan-Call warnt nicht erneut.
-        assert!(matches!(guard.observe_round_end(true), GuardVerdict::Continue));
+        assert!(matches!(
+            guard.observe_round_end(true),
+            GuardVerdict::Continue
+        ));
     }
 
     #[test]
@@ -691,15 +759,23 @@ mod tests {
                 guard.observe_tool_result("shell.run", &args, ToolOutcomeStatus::Error, "boom"),
                 GuardVerdict::Continue
             ));
-            assert!(matches!(guard.observe_round_end(false), GuardVerdict::Continue));
+            assert!(matches!(
+                guard.observe_round_end(false),
+                GuardVerdict::Continue
+            ));
         }
     }
 
     #[test]
-    fn test_drift_kind_key_matches_serde_name() {
-        assert_eq!(DriftKind::RepeatedFailingCall.key(), "repeated_failing_call");
+    fn test_drift_kind_key_matches_serde_name() -> TestResult {
+        assert_eq!(
+            DriftKind::RepeatedFailingCall.key(),
+            "repeated_failing_call"
+        );
         assert_eq!(DriftKind::ChildLeaseExpired.key(), "child_lease_expired");
-        let value = serde_json::to_value(DriftKind::PlanScopeDrift).unwrap();
+        let value = serde_json::to_value(DriftKind::PlanScopeDrift)
+            .map_err(ctx("DriftKind::PlanScopeDrift serialisieren"))?;
         assert_eq!(value, serde_json::json!("plan_scope_drift"));
+        Ok(())
     }
 }

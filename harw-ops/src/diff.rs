@@ -89,7 +89,7 @@ const GIT_DIFF_ENV: &[(&str, &str)] = &[
 ];
 
 /// Argument container for the `/diff` operation.
-#[derive(Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, harw_macros::OpArgs)]
 pub struct DiffArgs {
     /// Optional workspace-relative path filter.
     #[serde(default)]
@@ -333,23 +333,23 @@ mod tests {
         DiffArgs, DiffOperation, GIT_DIFF_BASE_ARGV, GIT_DIFF_ENV, build_git_diff_plan, diff,
         render_shell_command, render_shell_output, validate_relative_pathspec,
     };
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
-    use harw_operations::{
-        ApprovalPolicy, FromRawArgs, OpContext, OpError, Operation, Surface,
-        context::ServiceMap,
-    };
     use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_operations::{
+        ApprovalPolicy, FromRawArgs, OpContext, OpError, Operation, Surface, context::ServiceMap,
+    };
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::{
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    fn test_context() -> (OpContext, PathBuf) {
+    fn test_context() -> TestResult<(OpContext, PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!("harw-diff-test-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(root.join("workspace")).expect("create test workspace");
+        std::fs::create_dir_all(root.join("workspace")).map_err(ctx("create test workspace"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -358,14 +358,14 @@ mod tests {
                 root: PathBuf::from("workspace"),
             }],
         )
-        .expect("build workspace registry");
+        .map_err(ctx("build workspace registry"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("workspace"),
             )
-            .expect("resolve workspace binding");
-        (
+            .map_err(ctx("resolve workspace binding"))?;
+        Ok((
             OpContext::new(
                 SessionId::new(),
                 TurnId::new(),
@@ -373,28 +373,31 @@ mod tests {
                 ServiceMap::new(),
             ),
             root,
-        )
+        ))
     }
 
     #[test]
-    fn test_diff_args_from_raw_args_stat_flag_only() {
-        let args = DiffArgs::from_raw_args(&toks(&["--stat"])).expect("parse args");
+    fn test_diff_args_from_raw_args_stat_flag_only() -> TestResult {
+        let args = DiffArgs::from_raw_args(&toks(&["--stat"])).map_err(ctx("parse args"))?;
         assert!(args.stat_only);
         assert!(args.path.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_diff_args_from_raw_args_stat_flag_and_path() {
-        let args = DiffArgs::from_raw_args(&toks(&["--stat", "src"])).expect("parse args");
+    fn test_diff_args_from_raw_args_stat_flag_and_path() -> TestResult {
+        let args = DiffArgs::from_raw_args(&toks(&["--stat", "src"])).map_err(ctx("parse args"))?;
         assert!(args.stat_only);
         assert_eq!(args.path.as_deref(), Some("src"));
+        Ok(())
     }
 
     #[test]
-    fn test_diff_args_from_raw_args_no_tokens_defaults() {
-        let args = DiffArgs::from_raw_args(&toks(&[])).expect("parse args");
+    fn test_diff_args_from_raw_args_no_tokens_defaults() -> TestResult {
+        let args = DiffArgs::from_raw_args(&toks(&[])).map_err(ctx("parse args"))?;
         assert!(!args.stat_only);
         assert!(args.path.is_none());
+        Ok(())
     }
 
     #[test]
@@ -414,8 +417,8 @@ mod tests {
     }
 
     #[test]
-    fn test_build_git_diff_plan_defaults_have_hardening_argv_and_env() {
-        let plan = build_git_diff_plan(&DiffArgs::default()).expect("build plan");
+    fn test_build_git_diff_plan_defaults_have_hardening_argv_and_env() -> TestResult {
+        let plan = build_git_diff_plan(&DiffArgs::default()).map_err(ctx("build plan"))?;
 
         // Exact argv for the default (no `--stat`, no path filter) case: this
         // pins every hardening flag from the module doc — fsmonitor hook,
@@ -435,30 +438,37 @@ mod tests {
             ]
         );
         assert_eq!(plan.env, GIT_DIFF_ENV.to_vec());
+        Ok(())
     }
 
     #[test]
-    fn test_build_git_diff_plan_with_stat_and_path_appends_literal_pathspec() {
+    fn test_build_git_diff_plan_with_stat_and_path_appends_literal_pathspec() -> TestResult {
         let plan = build_git_diff_plan(&DiffArgs {
             path: Some("src".to_owned()),
             stat_only: true,
         })
-        .expect("build plan");
+        .map_err(ctx("build plan"))?;
 
         let tail = &plan.argv[plan.argv.len() - 3..];
         assert_eq!(tail, ["--stat", "--", ":(literal)src"]);
+        Ok(())
     }
 
     #[test]
-    fn test_build_git_diff_plan_rejects_pathspec_magic() {
+    fn test_build_git_diff_plan_rejects_pathspec_magic() -> TestResult {
         for magic_path in [":/", ":(top)src", "::src", ":src"] {
-            let error = build_git_diff_plan(&DiffArgs {
+            let result = build_git_diff_plan(&DiffArgs {
                 path: Some(magic_path.to_owned()),
                 stat_only: false,
-            })
-            .expect_err("pathspec magic must be rejected");
+            });
+            let Err(error) = result else {
+                return Err(TestError::Unexpected(
+                    "pathspec magic must be rejected".to_owned(),
+                ));
+            };
             assert!(matches!(error, OpError::InvalidArguments(_)));
         }
+        Ok(())
     }
 
     #[test]
@@ -472,8 +482,8 @@ mod tests {
     }
 
     #[test]
-    fn test_render_shell_command_quotes_every_token_for_default_plan() {
-        let plan = build_git_diff_plan(&DiffArgs::default()).expect("build plan");
+    fn test_render_shell_command_quotes_every_token_for_default_plan() -> TestResult {
+        let plan = build_git_diff_plan(&DiffArgs::default()).map_err(ctx("build plan"))?;
         let command = render_shell_command(&plan);
         assert_eq!(
             command,
@@ -482,15 +492,16 @@ mod tests {
              'diff.external=' '-c' 'core.pager=cat' '--no-pager' 'diff' '--no-textconv' \
              '--no-ext-diff' '--no-color'"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_render_shell_command_escapes_quotes_in_malicious_literal_path() {
+    fn test_render_shell_command_escapes_quotes_in_malicious_literal_path() -> TestResult {
         let plan = build_git_diff_plan(&DiffArgs {
             path: Some("src/'; touch owned; echo '".to_owned()),
             stat_only: true,
         })
-        .expect("build plan");
+        .map_err(ctx("build plan"))?;
         let command = render_shell_command(&plan);
 
         // Exact tail: `--` then the fully quoted, `'\''`-escaped literal
@@ -500,28 +511,38 @@ mod tests {
             command.ends_with(expected_tail),
             "unexpected quoting: {command}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_nonzero_git_status_does_not_echo_diff_output() {
-        let error = render_shell_output(serde_json::json!({
+    fn test_nonzero_git_status_does_not_echo_diff_output() -> TestResult {
+        let result = render_shell_output(serde_json::json!({
             "exit_code": 1,
             "stdout": "sensitive diff content",
             "stderr": "sensitive diagnostic",
-        }))
-        .expect_err("nonzero git status must fail");
+        }));
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "nonzero git status must fail".to_owned(),
+            ));
+        };
 
         match error {
             OpError::Execution(message) => {
                 assert_eq!(message, "git diff exited with status 1");
                 assert!(!message.contains("sensitive"));
             }
-            other => panic!("expected execution error, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected execution error, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_killed_by_output_limit_returns_truncated_ok_not_error() {
+    fn test_killed_by_output_limit_returns_truncated_ok_not_error() -> TestResult {
         let text = render_shell_output(serde_json::json!({
             "exit_code": -1,
             "stdout": "diff --git a/x b/x\n+partial",
@@ -529,17 +550,20 @@ mod tests {
             "truncated": true,
             "killed_by_output_limit": true,
         }))
-        .expect("killed-by-output-limit must be a truncated success, not an error");
+        .map_err(ctx(
+            "killed-by-output-limit must be a truncated success, not an error",
+        ))?;
 
         assert!(text.starts_with("diff --git a/x b/x\n+partial"));
         assert!(
             text.contains("Diff gekürzt bei 64 KiB"),
             "missing truncation notice: {text}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_truncated_without_kill_returns_ok_with_notice() {
+    fn test_truncated_without_kill_returns_ok_with_notice() -> TestResult {
         let text = render_shell_output(serde_json::json!({
             "exit_code": 0,
             "stdout": "diff --git a/x b/x\n+full run, output just capped",
@@ -547,36 +571,46 @@ mod tests {
             "truncated": true,
             "killed_by_output_limit": false,
         }))
-        .expect("truncated-but-completed output must be Ok");
+        .map_err(ctx("truncated-but-completed output must be Ok"))?;
 
         assert!(text.starts_with("diff --git a/x b/x\n+full run, output just capped"));
         assert!(
             text.contains("Diff gekürzt bei 64 KiB"),
             "missing truncation notice: {text}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_real_git_failure_without_kill_is_still_an_error() {
-        let error = render_shell_output(serde_json::json!({
+    fn test_real_git_failure_without_kill_is_still_an_error() -> TestResult {
+        let result = render_shell_output(serde_json::json!({
             "exit_code": 1,
             "stdout": "",
             "stderr": "fatal: not a git repository",
             "truncated": false,
             "killed_by_output_limit": false,
-        }))
-        .expect_err("a genuine non-zero git exit without a kill must stay an error");
+        }));
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "a genuine non-zero git exit without a kill must stay an error".to_owned(),
+            ));
+        };
 
         match error {
             OpError::Execution(message) => {
                 assert_eq!(message, "git diff exited with status 1");
             }
-            other => panic!("expected execution error, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected execution error, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_missing_truncation_fields_default_to_false() {
+    fn test_missing_truncation_fields_default_to_false() -> TestResult {
         // Older/foreign JSON without `truncated`/`killed_by_output_limit` must
         // behave exactly as before: success without a notice, error on
         // nonzero exit.
@@ -585,8 +619,11 @@ mod tests {
             "stdout": "diff --git a/x b/x\n+ok",
             "stderr": "",
         }))
-        .expect("missing optional fields must default to false, not fail parsing");
+        .map_err(ctx(
+            "missing optional fields must default to false, not fail parsing",
+        ))?;
         assert_eq!(text, "diff --git a/x b/x\n+ok");
+        Ok(())
     }
 
     #[test]
@@ -603,13 +640,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_diff_without_execute_process_fails_before_process_invocation() {
-        let (ctx, root) = test_context();
+    async fn test_diff_without_execute_process_fails_before_process_invocation() -> TestResult {
+        let (ctx, root) = test_context()?;
         let result = diff(&ctx, DiffArgs::default()).await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         assert!(
             matches!(result, Err(OpError::Execution(message)) if message.contains("ExecuteProcess permission missing"))
         );
+        Ok(())
     }
 }

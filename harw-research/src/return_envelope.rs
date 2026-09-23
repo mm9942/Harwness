@@ -109,10 +109,11 @@ pub fn envelope_with_finding(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::types::{Confidence, QuestionId};
 
-    fn sample_finding() -> ResearchFinding {
-        ResearchFinding {
+    fn sample_finding() -> TestResult<ResearchFinding> {
+        Ok(ResearchFinding {
             question_id: QuestionId::new("q-1"),
             conclusion: "jiff 0.2.32 is current".to_owned(),
             evidence: vec![],
@@ -122,19 +123,23 @@ mod tests {
             unresolved_questions: vec![],
             confidence: Confidence::Low,
             produced_by: "explorer-1".to_owned(),
-            produced_at: "2026-08-27T00:00:00Z".parse().unwrap(),
-        }
+            produced_at: "2026-08-27T00:00:00Z"
+                .parse()
+                .map_err(ctx("timestamp fixture literal must parse"))?,
+        })
     }
 
     #[test]
-    fn test_return_outcome_serializes_snake_case() {
-        let json = serde_json::to_string(&ReturnOutcome::Success).unwrap();
+    fn test_return_outcome_serializes_snake_case() -> TestResult {
+        let json = serde_json::to_string(&ReturnOutcome::Success)
+            .map_err(ctx("ReturnOutcome must serialize"))?;
         assert_eq!(json, "\"success\"");
+        Ok(())
     }
 
     #[test]
-    fn test_envelope_with_finding_sets_payload_and_summary() {
-        let finding = sample_finding();
+    fn test_envelope_with_finding_sets_payload_and_summary() -> TestResult {
+        let finding = sample_finding()?;
         let env = envelope_with_finding("explorer-1", Some("node-42"), &finding);
 
         assert_eq!(env.agent_id, "explorer-1");
@@ -144,39 +149,51 @@ mod tests {
         assert!(env.artifacts.is_empty());
         assert!(env.blockers.is_empty());
 
-        let expected_payload = serde_json::to_value(&finding).unwrap();
+        let expected_payload =
+            serde_json::to_value(&finding).map_err(ctx("finding must serialize to value"))?;
         assert_eq!(env.payload, expected_payload);
+        Ok(())
     }
 
     #[test]
-    fn test_envelope_with_finding_plan_node_id_none() {
-        let finding = sample_finding();
+    fn test_envelope_with_finding_plan_node_id_none() -> TestResult {
+        let finding = sample_finding()?;
         let env = envelope_with_finding("explorer-1", None, &finding);
         assert_eq!(env.plan_node_id, None);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_return_envelope_strips_json_fence() {
+    fn test_parse_return_envelope_strips_json_fence() -> TestResult {
         let raw = "```json\n{\"agent_id\":\"a1\",\"outcome\":\"partial\",\
                    \"summary\":\"partly done\",\"payload\":{}}\n```";
-        let env = parse_return_envelope(raw).unwrap();
+        let env = parse_return_envelope(raw).map_err(ctx("well-formed fenced JSON must parse"))?;
         assert_eq!(env.agent_id, "a1");
         assert_eq!(env.outcome, ReturnOutcome::Partial);
         assert!(env.artifacts.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_parse_return_envelope_invalid_json_returns_json_error() {
-        let err = parse_return_envelope("nope").unwrap_err();
+    fn test_parse_return_envelope_invalid_json_returns_json_error() -> TestResult {
+        let result = parse_return_envelope("nope");
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "expected Err for malformed JSON".to_owned(),
+            ));
+        };
         assert!(matches!(err, ResearchError::Json(_)));
+        Ok(())
     }
 
     #[test]
-    fn test_return_envelope_roundtrip() {
-        let finding = sample_finding();
+    fn test_return_envelope_roundtrip() -> TestResult {
+        let finding = sample_finding()?;
         let env = envelope_with_finding("explorer-1", Some("node-1"), &finding);
-        let json = serde_json::to_string(&env).unwrap();
-        let back: ReturnEnvelope = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&env).map_err(ctx("envelope must serialize"))?;
+        let back: ReturnEnvelope =
+            serde_json::from_str(&json).map_err(ctx("envelope must deserialize"))?;
         assert_eq!(env, back);
+        Ok(())
     }
 }

@@ -400,58 +400,62 @@ impl PreparedBrowserCall {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_browser::action::BrowserAction;
     use harw_browser::error::Error;
     use harw_browser::selector::Selector;
 
     // Test helper: literals only, a parse failure is a test bug.
-    fn url(s: &str) -> url::Url {
-        url::Url::parse(s).expect("valid test url")
+    fn url(s: &str) -> TestResult<url::Url> {
+        url::Url::parse(s).map_err(ctx("valid test url"))
     }
 
-    fn origins(list: &[&str], deny: bool) -> OriginPolicy {
-        OriginPolicy::from_origins(list, deny).expect("valid test policy")
+    fn origins(list: &[&str], deny: bool) -> TestResult<OriginPolicy> {
+        OriginPolicy::from_origins(list, deny).map_err(ctx("valid test policy"))
     }
 
-    fn open_request(start: &str) -> OpenRequest {
-        OpenRequest {
-            start_url: url(start),
+    fn open_request(start: &str) -> TestResult<OpenRequest> {
+        Ok(OpenRequest {
+            start_url: url(start)?,
             headless: true,
             bidi: BiDiRequirement::Preferred,
             viewport: None,
-        }
+        })
     }
 
-    fn grant_policy() -> BrowserOpenPolicy {
-        BrowserOpenPolicy::grant(BrowserOpenGrant::ephemeral(
-            origins(&["https://erp.example.com"], false),
-            origins(&["https://sso.example.net"], true),
-        ))
+    fn grant_policy() -> TestResult<BrowserOpenPolicy> {
+        Ok(BrowserOpenPolicy::grant(BrowserOpenGrant::ephemeral(
+            origins(&["https://erp.example.com"], false)?,
+            origins(&["https://sso.example.net"], true)?,
+        )))
     }
 
-    fn act_json(action: serde_json::Value) -> serde_json::Value {
+    fn act_json(action: serde_json::Value) -> TestResult<serde_json::Value> {
         let request = ActRequest {
             session_id: BrowserSessionId::new(),
             request: ActionRequest::new(BrowserContextId::new(), BrowserAction::Reload),
         };
-        let mut json = serde_json::to_value(request).expect("act serializes");
+        let mut json = serde_json::to_value(request).map_err(ctx("act serializes"))?;
         json["request"]["action"] = action;
-        json
+        Ok(json)
     }
 
     #[test]
-    fn test_authorize_without_grant_fails_closed() {
-        let error = BrowserOpenPolicy::default()
-            .authorize(&open_request("https://erp.example.com/"))
-            .expect_err("no grant must deny");
+    fn test_authorize_without_grant_fails_closed() -> TestResult {
+        let Err(error) =
+            BrowserOpenPolicy::default().authorize(&open_request("https://erp.example.com/")?)
+        else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(error, Error::OriginNotAllowed { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_authorize_keeps_authentication_origins_separate() {
-        let authorized = grant_policy()
-            .authorize(&open_request("https://erp.example.com/login"))
-            .expect("allowed start authorizes");
+    fn test_authorize_keeps_authentication_origins_separate() -> TestResult {
+        let authorized = grant_policy()?
+            .authorize(&open_request("https://erp.example.com/login")?)
+            .map_err(ctx("allowed start authorizes"))?;
         assert_eq!(
             authorized.allowed_origins.origins(),
             vec!["https://erp.example.com".to_owned()]
@@ -460,21 +464,24 @@ mod tests {
             authorized.authentication_origins.origins(),
             vec!["https://sso.example.net".to_owned()]
         );
-        let sso = url("https://sso.example.net/authorize");
+        let sso = url("https://sso.example.net/authorize")?;
         assert!(authorized.check_navigation_target(&sso).is_err());
         assert!(authorized.check_observed_location(&sso).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_authorize_rejects_authentication_origin_as_start() {
-        let error = grant_policy()
-            .authorize(&open_request("https://sso.example.net/login"))
-            .expect_err("auth origin is not a start url");
+    fn test_authorize_rejects_authentication_origin_as_start() -> TestResult {
+        let Err(error) = grant_policy()?.authorize(&open_request("https://sso.example.net/login")?)
+        else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(error, Error::OriginNotAllowed { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_authorize_rejects_origin_change_in_start_url() {
+    fn test_authorize_rejects_origin_change_in_start_url() -> TestResult {
         for start in [
             "http://erp.example.com/",
             "https://erp.example.com:8443/",
@@ -482,26 +489,28 @@ mod tests {
             "https://sub.erp.example.com/",
         ] {
             assert!(
-                grant_policy().authorize(&open_request(start)).is_err(),
+                grant_policy()?.authorize(&open_request(start)?).is_err(),
                 "{start} must be rejected"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_authorize_tightens_private_network_veto_and_applies_grant_profile_limits() {
+    fn test_authorize_tightens_private_network_veto_and_applies_grant_profile_limits() -> TestResult
+    {
         let limits = BrowserLimits::default().with_max_actions_per_session(7);
         let policy = BrowserOpenPolicy::grant(
             BrowserOpenGrant::persistent(
-                origins(&["https://erp.example.com"], false),
-                origins(&["https://sso.example.net"], true),
+                origins(&["https://erp.example.com"], false)?,
+                origins(&["https://sso.example.net"], true)?,
                 "sales-team",
             )
             .with_limits(limits),
         );
         let authorized = policy
-            .authorize(&open_request("https://erp.example.com/"))
-            .expect("authorizes");
+            .authorize(&open_request("https://erp.example.com/")?)
+            .map_err(ctx("authorizes"))?;
         assert!(authorized.allowed_origins.deny_private_networks());
         assert!(authorized.authentication_origins.deny_private_networks());
         assert_eq!(
@@ -511,28 +520,31 @@ mod tests {
             }
         );
         assert_eq!(authorized.limits.max_actions_per_session(), 7);
+        Ok(())
     }
 
     #[test]
-    fn test_authorize_rejects_invalid_persistent_binding() {
+    fn test_authorize_rejects_invalid_persistent_binding() -> TestResult {
         let policy = BrowserOpenPolicy::grant(BrowserOpenGrant::persistent(
-            origins(&["https://erp.example.com"], true),
+            origins(&["https://erp.example.com"], true)?,
             OriginPolicy::default(),
             "../../.ssh",
         ));
         assert!(
             policy
-                .authorize(&open_request("https://erp.example.com/"))
+                .authorize(&open_request("https://erp.example.com/")?)
                 .is_err()
         );
+        Ok(())
     }
 
     #[test]
-    fn test_open_request_rejects_model_supplied_authority_fields() {
-        let base = serde_json::to_value(open_request("https://erp.example.com/"))
-            .expect("open serializes");
-        let decoded: OpenRequest = serde_json::from_value(base.clone()).expect("plain open parses");
-        assert_eq!(decoded, open_request("https://erp.example.com/"));
+    fn test_open_request_rejects_model_supplied_authority_fields() -> TestResult {
+        let base = serde_json::to_value(open_request("https://erp.example.com/")?)
+            .map_err(ctx("open serializes"))?;
+        let decoded: OpenRequest =
+            serde_json::from_value(base.clone()).map_err(ctx("plain open parses"))?;
+        assert_eq!(decoded, open_request("https://erp.example.com/")?);
 
         for (field, value) in [
             (
@@ -543,7 +555,10 @@ mod tests {
                 "authentication_origins",
                 serde_json::json!({"allow": [], "deny_private_networks": false}),
             ),
-            ("profile", serde_json::json!({"Persistent": {"binding": "x"}})),
+            (
+                "profile",
+                serde_json::json!({"Persistent": {"binding": "x"}}),
+            ),
             ("limits", serde_json::json!({})),
         ] {
             let mut json = base.clone();
@@ -553,34 +568,37 @@ mod tests {
                 "field {field} must be rejected"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_act_request_rejects_upload_and_script_actions() {
+    fn test_act_request_rejects_upload_and_script_actions() -> TestResult {
         let target = serde_json::to_value(Target::new(Selector::Id("f".to_owned())))
-            .expect("target serializes");
+            .map_err(ctx("target serializes"))?;
         for action in [
             serde_json::json!({"Upload": {"target": target.clone(), "file_path": "/etc/shadow"}}),
             serde_json::json!({"upload": {"target": target.clone(), "file_path": "/etc/shadow"}}),
             serde_json::json!({"Script": {"source": "fetch('https://evil')"}}),
             serde_json::json!({"script": "fetch('https://evil')"}),
         ] {
-            assert!(serde_json::from_value::<ActRequest>(act_json(action)).is_err());
+            assert!(serde_json::from_value::<ActRequest>(act_json(action)?).is_err());
         }
         let click = serde_json::json!({"Click": {"target": target}});
-        assert!(serde_json::from_value::<ActRequest>(act_json(click)).is_ok());
+        assert!(serde_json::from_value::<ActRequest>(act_json(click)?).is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_wait_request_rejects_custom_script_and_bad_timeout() {
+    fn test_wait_request_rejects_custom_script_and_bad_timeout() -> TestResult {
         let request = WaitRequest {
             session_id: BrowserSessionId::new(),
             context_id: BrowserContextId::new(),
             condition: WaitCondition::NavigationComplete,
             timeout: WaitTimeout::from_millis(1_000),
         };
-        let base = serde_json::to_value(&request).expect("wait serializes");
-        let decoded: WaitRequest = serde_json::from_value(base.clone()).expect("wait parses");
+        let base = serde_json::to_value(&request).map_err(ctx("wait serializes"))?;
+        let decoded: WaitRequest =
+            serde_json::from_value(base.clone()).map_err(ctx("wait parses"))?;
         assert_eq!(decoded, request);
 
         let mut script = base.clone();
@@ -590,6 +608,7 @@ mod tests {
         let mut zero = base.clone();
         zero["timeout"] = serde_json::json!(0);
         assert!(serde_json::from_value::<WaitRequest>(zero).is_err());
+        Ok(())
     }
 
     #[test]
@@ -610,11 +629,13 @@ mod tests {
     }
 
     #[test]
-    fn test_browser_tool_request_round_trip_open() {
-        let request = BrowserToolRequest::Open(open_request("https://erp.example.com/"));
-        let json = serde_json::to_value(&request).expect("serializes");
-        let decoded: BrowserToolRequest = serde_json::from_value(json).expect("deserializes");
+    fn test_browser_tool_request_round_trip_open() -> TestResult {
+        let request = BrowserToolRequest::Open(open_request("https://erp.example.com/")?);
+        let json = serde_json::to_value(&request).map_err(ctx("serializes"))?;
+        let decoded: BrowserToolRequest =
+            serde_json::from_value(json).map_err(ctx("deserializes"))?;
         assert_eq!(decoded, request);
+        Ok(())
     }
 
     #[test]
@@ -632,14 +653,20 @@ mod tests {
         let prepared =
             PreparedBrowserCall::new(PreparedBrowserRequest::Close(close.clone()), scope.clone());
         assert_eq!(prepared.scope(), &scope);
-        assert_eq!(prepared.request(), &PreparedBrowserRequest::Close(close.clone()));
-        assert_eq!(prepared.into_request(), PreparedBrowserRequest::Close(close));
+        assert_eq!(
+            prepared.request(),
+            &PreparedBrowserRequest::Close(close.clone())
+        );
+        assert_eq!(
+            prepared.into_request(),
+            PreparedBrowserRequest::Close(close)
+        );
     }
 
     #[test]
-    fn test_browser_open_grant_accessors() {
+    fn test_browser_open_grant_accessors() -> TestResult {
         let grant = BrowserOpenGrant::ephemeral(
-            origins(&["https://erp.example.com"], true),
+            origins(&["https://erp.example.com"], true)?,
             OriginPolicy::default(),
         );
         assert_eq!(grant.profile(), &ProfilePolicy::Ephemeral);
@@ -651,5 +678,6 @@ mod tests {
                 .configured_grant()
                 .is_some_and(|g| g == &grant)
         );
+        Ok(())
     }
 }

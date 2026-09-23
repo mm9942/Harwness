@@ -33,6 +33,8 @@ pub mod kek;
 pub mod policy;
 pub mod record;
 pub mod store;
+#[cfg(test)]
+mod test_support;
 
 pub use audit::chain::AuditLog;
 pub use audit::checkpoint::{Checkpoint, CheckpointLog};

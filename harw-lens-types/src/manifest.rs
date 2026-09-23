@@ -126,6 +126,7 @@ impl IndexManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use harw_types::ContentDigest;
 
     fn sample_manifest() -> IndexManifest {
@@ -189,11 +190,13 @@ mod tests {
     }
 
     #[test]
-    fn test_index_manifest_roundtrips_through_json() {
+    fn test_index_manifest_roundtrips_through_json() -> TestResult {
         let manifest = sample_manifest();
-        let json = serde_json::to_string(&manifest).expect("serializes");
-        let round_tripped: IndexManifest = serde_json::from_str(&json).expect("deserializes");
+        let json = serde_json::to_string(&manifest).map_err(ctx("serializes"))?;
+        let round_tripped: IndexManifest =
+            serde_json::from_str(&json).map_err(ctx("deserializes"))?;
         assert_eq!(round_tripped, manifest);
+        Ok(())
     }
 
     #[test]
@@ -211,22 +214,24 @@ mod tests {
     }
 
     #[test]
-    fn test_locality_serializes_kebab_case() {
+    fn test_locality_serializes_kebab_case() -> TestResult {
         assert_eq!(
-            serde_json::to_string(&Locality::Local).unwrap(),
+            serde_json::to_string(&Locality::Local).map_err(ctx("serializes"))?,
             "\"local\""
         );
         assert_eq!(
-            serde_json::to_string(&Locality::Remote).unwrap(),
+            serde_json::to_string(&Locality::Remote).map_err(ctx("serializes"))?,
             "\"remote\""
         );
+        Ok(())
     }
 
     #[test]
-    fn test_metric_serializes_kebab_case() {
+    fn test_metric_serializes_kebab_case() -> TestResult {
         assert_eq!(
-            serde_json::to_string(&Metric::DotProduct).unwrap(),
+            serde_json::to_string(&Metric::DotProduct).map_err(ctx("serializes"))?,
             "\"dot-product\""
         );
+        Ok(())
     }
 }

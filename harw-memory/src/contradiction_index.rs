@@ -367,6 +367,7 @@ mod tests {
     use crate::epistemic::{
         Confidence, EpistemicSignal, MemoryScope, OutcomeVerdict, Provenance, Validity,
     };
+    use crate::test_support::{TestResult, ctx};
     use time::OffsetDateTime;
 
     /// Erzeugt ein minimales `EpistemicSignal` für Tests.
@@ -630,21 +631,22 @@ mod tests {
 
     // 10. Serde-Roundtrip für Contradiction
     #[test]
-    fn test_serde_roundtrip_contradiction() {
+    fn test_serde_roundtrip_contradiction() -> TestResult {
         let c = Contradiction {
             left_id: "left-1".to_owned(),
             right_id: "right-2".to_owned(),
             reason: ContradictionReason::ScopeConflictWithConfidenceDelta,
             severity: 70,
         };
-        let json = serde_json::to_string(&c).expect("Serialisierung fehlgeschlagen");
+        let json = serde_json::to_string(&c).map_err(ctx("Serialisierung fehlgeschlagen"))?;
         let back: Contradiction =
-            serde_json::from_str(&json).expect("Deserialisierung fehlgeschlagen");
+            serde_json::from_str(&json).map_err(ctx("Deserialisierung fehlgeschlagen"))?;
         assert_eq!(back, c, "Serde-Roundtrip muss identisch sein");
         // Prüfe snake_case-Variante im JSON
         assert!(
             json.contains("scope_conflict_with_confidence_delta"),
             "ContradictionReason muss als snake_case serialisiert werden"
         );
+        Ok(())
     }
 }

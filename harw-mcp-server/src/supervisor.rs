@@ -194,8 +194,11 @@ impl McpJobBudgetLimits {
             return Ok(self.as_budget());
         };
         let max_tokens = bounded("max_tokens", requested.max_tokens, self.max_tokens)?;
-        let max_tool_calls =
-            bounded("max_tool_calls", requested.max_tool_calls, self.max_tool_calls)?;
+        let max_tool_calls = bounded(
+            "max_tool_calls",
+            requested.max_tool_calls,
+            self.max_tool_calls,
+        )?;
         let max_wall = match requested.max_wall {
             None => self.max_wall,
             Some(wall) if wall <= self.max_wall => wall,
@@ -284,9 +287,7 @@ impl McpIdempotencyKey {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
         {
-            return Err(McpSupervisorError::InvalidIdempotencyKey {
-                length: raw.len(),
-            });
+            return Err(McpSupervisorError::InvalidIdempotencyKey { length: raw.len() });
         }
         Ok(Self(raw.to_owned()))
     }
@@ -604,12 +605,18 @@ pub enum McpSupervisorError {
     JobStore(SessionStoreError),
     /// Idempotenzschlüssel verletzt die Schlüsselgrammatik (Schlüssel selbst
     /// wird nicht gespiegelt).
-    InvalidIdempotencyKey { length: usize },
+    InvalidIdempotencyKey {
+        length: usize,
+    },
     /// Idempotenzschlüssel benennt bereits einen Job mit anderem Input, Kind
     /// oder Scope. Fail closed: es wird nie ein Job stillschweigend zugelassen.
-    IdempotencyConflict { work_id: WorkId },
+    IdempotencyConflict {
+        work_id: WorkId,
+    },
     /// Der Submitter hat sein Einreichungsfenster ausgeschöpft.
-    RateLimited { retry_after: SignedDuration },
+    RateLimited {
+        retry_after: SignedDuration,
+    },
     /// Der Sperrmechanismus der Ratenbegrenzung ist vergiftet (gesperrter
     /// Mutex nach einem Panic). Fail closed statt stillschweigend zuzulassen.
     LimiterUnavailable,
@@ -630,7 +637,10 @@ impl fmt::Display for McpSupervisorError {
                 "idempotency key already used for a different submission (job {work_id})"
             ),
             Self::RateLimited { retry_after } => {
-                write!(f, "submission rate limit reached; retry after {retry_after}")
+                write!(
+                    f,
+                    "submission rate limit reached; retry after {retry_after}"
+                )
             }
             Self::LimiterUnavailable => f.write_str("submission rate limiter is unavailable"),
         }
@@ -808,7 +818,13 @@ impl McpSupervisor for DurableMcpSupervisor {
             let now = Timestamp::now();
             self.rate_limiter.try_acquire(&limiter_key, now)?;
 
-            let mut job = Job::new(id.clone(), kind.clone(), budget, default_retry_policy(), now);
+            let mut job = Job::new(
+                id.clone(),
+                kind.clone(),
+                budget,
+                default_retry_policy(),
+                now,
+            );
             if let Err(error) = job.mark_ready(now) {
                 self.rate_limiter.release(&limiter_key, now);
                 return Err(McpSupervisorError::InvalidSubmission(error.to_string()));
@@ -1017,6 +1033,8 @@ mod tests {
     use harw_session_store::ClaimRequest;
     use jiff::SignedDuration;
 
+    use crate::test_support::{TestError, TestResult, ctx};
+
     fn scope() -> JobScope {
         JobScope::new(
             TenantId::from_str("tenant-a"),
@@ -1067,7 +1085,7 @@ mod tests {
         )
     }
 
-    fn record(id: &str) -> StoredJob {
+    fn record(id: &str) -> TestResult<StoredJob> {
         let now = Timestamp::now();
         let mut job = Job::new(
             WorkId::from_str(id),
@@ -1081,8 +1099,8 @@ mod tests {
             },
             now,
         );
-        job.mark_ready(now).unwrap();
-        StoredJob {
+        job.mark_ready(now).map_err(ctx("mark_ready"))?;
+        Ok(StoredJob {
             job,
             scope: scope(),
             input: serde_json::json!({"task": "test"}),
@@ -1094,12 +1112,17 @@ mod tests {
             cancellation: None,
             revision: 0,
             trace: None,
-        }
+        })
     }
 
     struct PersistedTransitionSink {
         store: Arc<JobStore>,
         calls: Mutex<Vec<WorkId>>,
+        // Der Trait `WorkerCancellationSink` gibt kein `Result` zurück (Produktionscode,
+        // nicht in dieser Datei anpassbar); ein Fehlschlag beim Nachlesen des Stores
+        // wird deshalb hier gesammelt statt gepanikt und danach im Test per
+        // `assert!` geprüft (Bible R087/R165 — kein `.unwrap()`/`panic!` im Callback).
+        load_failures: Mutex<Vec<String>>,
     }
 
     impl PersistedTransitionSink {
@@ -1107,11 +1130,22 @@ mod tests {
             Self {
                 store,
                 calls: Mutex::new(Vec::new()),
+                load_failures: Mutex::new(Vec::new()),
             }
         }
 
         fn calls(&self) -> Vec<WorkId> {
-            self.calls.lock().unwrap().clone()
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn load_failures(&self) -> Vec<String> {
+            self.load_failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
     }
 
@@ -1124,11 +1158,22 @@ mod tests {
             // This observes the durable store at signal time. It proves the
             // supervisor did not contact a worker before the cancellation and
             // its fence were committed.
-            let persisted = self.store.get(work_id).unwrap();
-            assert_eq!(persisted.job.state, JobState::Cancelled);
-            assert!(persisted.lease.is_none());
-            assert!(persisted.lease_epoch > prior_lease.epoch);
-            self.calls.lock().unwrap().push(work_id.clone());
+            match self.store.get(work_id) {
+                Ok(persisted) => {
+                    assert_eq!(persisted.job.state, JobState::Cancelled);
+                    assert!(persisted.lease.is_none());
+                    assert!(persisted.lease_epoch > prior_lease.epoch);
+                }
+                Err(error) => self
+                    .load_failures
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(format!("store.get({work_id:?}) failed: {error}")),
+            }
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(work_id.clone());
             WorkerCancellationStatus::Requested
         }
     }
@@ -1192,13 +1237,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_and_ready_cancellation_do_not_signal_a_worker() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn pending_and_ready_cancellation_do_not_signal_a_worker() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = Arc::new(JobStore::new(temp.path()));
-        let mut pending = record("pending-cancel");
+        let mut pending = record("pending-cancel")?;
         pending.job.state = JobState::Pending;
-        store.admit(&pending).unwrap();
-        store.admit(&record("ready-cancel")).unwrap();
+        store.admit(&pending).map_err(ctx("admit"))?;
+        store
+            .admit(&record("ready-cancel")?)
+            .map_err(ctx("admit"))?;
 
         let sink = Arc::new(PersistedTransitionSink::new(Arc::clone(&store)));
         let supervisor =
@@ -1211,7 +1258,7 @@ mod tests {
                     "superseded".to_owned(),
                 )
                 .await
-                .unwrap();
+                .map_err(ctx("cancel_job"))?;
             assert!(!receipt.worker_signal_required);
             assert_eq!(
                 receipt.worker_cancellation,
@@ -1219,13 +1266,17 @@ mod tests {
             );
         }
         assert!(sink.calls().is_empty());
+        assert!(sink.load_failures().is_empty());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn running_cancellation_signals_only_after_durable_fence() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn running_cancellation_signals_only_after_durable_fence() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = Arc::new(JobStore::new(temp.path()));
-        store.admit(&record("running-cancel")).unwrap();
+        store
+            .admit(&record("running-cancel")?)
+            .map_err(ctx("admit"))?;
         let now = Timestamp::now();
         store
             .claim(
@@ -1236,7 +1287,7 @@ mod tests {
                     now,
                 },
             )
-            .unwrap();
+            .map_err(ctx("claim"))?;
 
         let sink = Arc::new(PersistedTransitionSink::new(Arc::clone(&store)));
         let supervisor =
@@ -1248,7 +1299,7 @@ mod tests {
                 "operator stopped task".to_owned(),
             )
             .await
-            .unwrap();
+            .map_err(ctx("cancel_job"))?;
         assert_eq!(receipt.previous_state, JobState::Running);
         assert!(receipt.worker_signal_required);
         assert_eq!(
@@ -1256,13 +1307,17 @@ mod tests {
             WorkerCancellationStatus::Requested
         );
         assert_eq!(sink.calls(), vec![WorkId::from_str("running-cancel")]);
+        assert!(sink.load_failures().is_empty());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn running_cancellation_reports_unavailable_without_a_live_controller() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn running_cancellation_reports_unavailable_without_a_live_controller() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = Arc::new(JobStore::new(temp.path()));
-        store.admit(&record("running-unavailable")).unwrap();
+        store
+            .admit(&record("running-unavailable")?)
+            .map_err(ctx("admit"))?;
         store
             .claim(
                 &WorkId::from_str("running-unavailable"),
@@ -1272,7 +1327,7 @@ mod tests {
                     now: Timestamp::now(),
                 },
             )
-            .unwrap();
+            .map_err(ctx("claim"))?;
 
         let receipt = DurableMcpSupervisor::new(store)
             .cancel_job(
@@ -1281,20 +1336,23 @@ mod tests {
                 "operator stopped task".to_owned(),
             )
             .await
-            .unwrap();
+            .map_err(ctx("cancel_job"))?;
 
         assert!(receipt.worker_signal_required);
         assert_eq!(
             receipt.worker_cancellation,
             WorkerCancellationStatus::Unavailable
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn running_cancellation_fails_closed_for_an_invalid_sink_status() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn running_cancellation_fails_closed_for_an_invalid_sink_status() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = Arc::new(JobStore::new(temp.path()));
-        store.admit(&record("running-invalid-status")).unwrap();
+        store
+            .admit(&record("running-invalid-status")?)
+            .map_err(ctx("admit"))?;
         store
             .claim(
                 &WorkId::from_str("running-invalid-status"),
@@ -1304,7 +1362,7 @@ mod tests {
                     now: Timestamp::now(),
                 },
             )
-            .unwrap();
+            .map_err(ctx("claim"))?;
 
         let receipt = DurableMcpSupervisor::with_worker_cancellation_sink(
             store,
@@ -1316,18 +1374,19 @@ mod tests {
             "operator stopped task".to_owned(),
         )
         .await
-        .unwrap();
+        .map_err(ctx("cancel_job"))?;
 
         assert!(receipt.worker_signal_required);
         assert_eq!(
             receipt.worker_cancellation,
             WorkerCancellationStatus::Unavailable
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn submit_admits_a_ready_job_in_the_authenticated_scope() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn submit_admits_a_ready_job_in_the_authenticated_scope() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = Arc::new(JobStore::new(temp.path()));
         let supervisor = DurableMcpSupervisor::new(Arc::clone(&store));
 
@@ -1342,11 +1401,11 @@ mod tests {
                 },
             )
             .await
-            .unwrap();
+            .map_err(ctx("submit_job"))?;
 
         assert_eq!(submitted.kind, "worker");
         assert_eq!(submitted.state, JobState::Ready);
-        let stored = store.get(&submitted.work_id).unwrap();
+        let stored = store.get(&submitted.work_id).map_err(ctx("get"))?;
         assert_eq!(stored.scope, scope());
         assert_eq!(
             stored.input,
@@ -1359,11 +1418,12 @@ mod tests {
         );
         assert_ne!(stored.job.budget, Budget::unbounded());
         assert_eq!(stored.job.retry, default_retry_policy());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn submit_rejects_a_budget_above_the_server_maximum_without_admitting() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn submit_rejects_a_budget_above_the_server_maximum_without_admitting() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = Arc::new(JobStore::new(temp.path()));
         let supervisor = DurableMcpSupervisor::new(Arc::clone(&store));
 
@@ -1383,7 +1443,9 @@ mod tests {
             )
             .await;
         let Err(McpSupervisorError::InvalidSubmission(detail)) = too_many_tokens else {
-            panic!("a token budget above the server maximum must be rejected");
+            return Err(TestError::Unexpected(
+                "a token budget above the server maximum must be rejected".to_owned(),
+            ));
         };
         assert!(detail.contains("max_tokens"), "{detail}");
         assert!(detail.contains(&MCP_JOB_MAX_TOKENS.to_string()), "{detail}");
@@ -1431,13 +1493,14 @@ mod tests {
         // Nichts davon wurde zugelassen.
         let page = store
             .list(&harw_session_store::JobListQuery::default())
-            .unwrap();
+            .map_err(ctx("list"))?;
         assert!(page.jobs.is_empty());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn submit_keeps_budgets_within_the_maximum_and_fills_missing_limits() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn submit_keeps_budgets_within_the_maximum_and_fills_missing_limits() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = Arc::new(JobStore::new(temp.path()));
         let supervisor = DurableMcpSupervisor::new(Arc::clone(&store));
 
@@ -1456,22 +1519,24 @@ mod tests {
                 },
             )
             .await
-            .unwrap();
+            .map_err(ctx("submit_job"))?;
 
-        let stored = store.get(&submitted.work_id).unwrap();
+        let stored = store.get(&submitted.work_id).map_err(ctx("get"))?;
         assert_eq!(stored.job.budget.max_tokens, Some(MCP_JOB_MAX_TOKENS));
         assert_eq!(
             stored.job.budget.max_wall,
             Some(SignedDuration::from_secs(MCP_JOB_MAX_WALL_SECONDS))
         );
         assert_eq!(stored.job.budget.max_tool_calls, Some(3));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn stricter_composition_limits_apply_to_submissions() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn stricter_composition_limits_apply_to_submissions() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = Arc::new(JobStore::new(temp.path()));
-        let limits = McpJobBudgetLimits::new(1_000, SignedDuration::from_secs(30), 2).unwrap();
+        let limits = McpJobBudgetLimits::new(1_000, SignedDuration::from_secs(30), 2)
+            .ok_or(TestError::Missing("valid McpJobBudgetLimits"))?;
         let supervisor = DurableMcpSupervisor::new(Arc::clone(&store)).with_budget_limits(limits);
         assert_eq!(supervisor.budget_limits(), limits);
 
@@ -1506,11 +1571,16 @@ mod tests {
                 },
             )
             .await
-            .unwrap();
+            .map_err(ctx("submit_job"))?;
         assert_eq!(
-            store.get(&defaulted.work_id).unwrap().job.budget,
+            store
+                .get(&defaulted.work_id)
+                .map_err(ctx("get"))?
+                .job
+                .budget,
             limits.as_budget()
         );
+        Ok(())
     }
 
     #[test]
@@ -1531,9 +1601,7 @@ mod tests {
             ),
             Some(ceiling)
         );
-        assert!(
-            McpJobBudgetLimits::new(MCP_JOB_MAX_TOKENS + 1, ceiling.max_wall(), 1).is_none()
-        );
+        assert!(McpJobBudgetLimits::new(MCP_JOB_MAX_TOKENS + 1, ceiling.max_wall(), 1).is_none());
         assert!(
             McpJobBudgetLimits::new(
                 1,
@@ -1551,8 +1619,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_requires_capability_and_validates_untrusted_fields() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn submit_requires_capability_and_validates_untrusted_fields() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = Arc::new(JobStore::new(temp.path()));
         let supervisor = DurableMcpSupervisor::new(store);
 
@@ -1607,13 +1675,14 @@ mod tests {
             invalid_budget,
             Err(McpSupervisorError::InvalidSubmission(_))
         ));
+        Ok(())
     }
 
     // ── Idempotency (F-158-Parität) ─────────────────────────────────────
 
     #[tokio::test]
-    async fn submit_with_idempotency_key_admits_once_and_is_idempotent_on_retry() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn submit_with_idempotency_key_admits_once_and_is_idempotent_on_retry() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = Arc::new(JobStore::new(temp.path()));
         let supervisor = DurableMcpSupervisor::new(Arc::clone(&store));
         let submission = || McpJobSubmission {
@@ -1626,11 +1695,11 @@ mod tests {
         let first = supervisor
             .submit_job(&submit_context(), submission())
             .await
-            .unwrap();
+            .map_err(ctx("submit_job"))?;
         let second = supervisor
             .submit_job(&submit_context(), submission())
             .await
-            .unwrap();
+            .map_err(ctx("submit_job"))?;
 
         assert_eq!(first.work_id, second.work_id);
         assert!(
@@ -1641,17 +1710,18 @@ mod tests {
         );
         let page = store
             .list(&harw_session_store::JobListQuery::default())
-            .unwrap();
+            .map_err(ctx("list"))?;
         assert_eq!(
             page.jobs.len(),
             1,
             "a retried idempotent submission must not create a second job"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn submit_with_same_idempotency_key_and_different_input_conflicts() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn submit_with_same_idempotency_key_and_different_input_conflicts() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = Arc::new(JobStore::new(temp.path()));
         let supervisor = DurableMcpSupervisor::new(Arc::clone(&store));
 
@@ -1666,7 +1736,7 @@ mod tests {
                 },
             )
             .await
-            .unwrap();
+            .map_err(ctx("submit_job"))?;
 
         let conflict = supervisor
             .submit_job(
@@ -1683,11 +1753,12 @@ mod tests {
             conflict,
             Err(McpSupervisorError::IdempotencyConflict { .. })
         ));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn submit_rejects_an_invalid_idempotency_key() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn submit_rejects_an_invalid_idempotency_key() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = Arc::new(JobStore::new(temp.path()));
         let supervisor = DurableMcpSupervisor::new(store);
 
@@ -1706,15 +1777,17 @@ mod tests {
             rejected,
             Err(McpSupervisorError::InvalidIdempotencyKey { .. })
         ));
+        Ok(())
     }
 
     // ── Rate limiting (F-158-Parität) ───────────────────────────────────
 
     #[tokio::test]
-    async fn submit_rejects_once_the_submitter_rate_window_is_exhausted() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn submit_rejects_once_the_submitter_rate_window_is_exhausted() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = Arc::new(JobStore::new(temp.path()));
-        let limits = McpAdmissionLimits::new(1, SignedDuration::from_secs(60)).unwrap();
+        let limits = McpAdmissionLimits::new(1, SignedDuration::from_secs(60))
+            .ok_or(TestError::Missing("valid McpAdmissionLimits"))?;
         let supervisor = DurableMcpSupervisor::new(Arc::clone(&store)).with_rate_limits(limits);
         assert_eq!(supervisor.rate_limits(), limits);
 
@@ -1729,7 +1802,7 @@ mod tests {
                 },
             )
             .await
-            .unwrap();
+            .map_err(ctx("submit_job"))?;
 
         let rejected = supervisor
             .submit_job(
@@ -1750,15 +1823,17 @@ mod tests {
         // Nichts vom zweiten (abgelehnten) Versuch wurde zugelassen.
         let page = store
             .list(&harw_session_store::JobListQuery::default())
-            .unwrap();
+            .map_err(ctx("list"))?;
         assert_eq!(page.jobs.len(), 1);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn idempotent_retries_do_not_charge_the_rate_limit_window() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn idempotent_retries_do_not_charge_the_rate_limit_window() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let store = Arc::new(JobStore::new(temp.path()));
-        let limits = McpAdmissionLimits::new(1, SignedDuration::from_secs(60)).unwrap();
+        let limits = McpAdmissionLimits::new(1, SignedDuration::from_secs(60))
+            .ok_or(TestError::Missing("valid McpAdmissionLimits"))?;
         let supervisor = DurableMcpSupervisor::new(Arc::clone(&store)).with_rate_limits(limits);
         let submission = || McpJobSubmission {
             kind: McpSubmittedJobKind::Worker,
@@ -1773,7 +1848,7 @@ mod tests {
         let first = supervisor
             .submit_job(&submit_context(), submission())
             .await
-            .unwrap();
+            .map_err(ctx("submit_job"))?;
 
         // (b) Dieselbe Einreichung noch einmal: trifft den Idempotenz-Cache
         // (der Lookup passiert vor `try_acquire`) und liefert denselben Job
@@ -1781,7 +1856,7 @@ mod tests {
         let duplicate = supervisor
             .submit_job(&submit_context(), submission())
             .await
-            .unwrap();
+            .map_err(ctx("submit_job"))?;
         assert_eq!(duplicate.work_id, first.work_id);
 
         // (c) Eine andere Einreichung ohne Schlüssel erreicht die
@@ -1828,8 +1903,9 @@ mod tests {
         // (e) Im Store liegt genau der eine Job aus (a)/(b).
         let page = store
             .list(&harw_session_store::JobListQuery::default())
-            .unwrap();
+            .map_err(ctx("list"))?;
         assert_eq!(page.jobs.len(), 1);
+        Ok(())
     }
 
     #[test]

@@ -86,6 +86,7 @@ impl BrowserEventCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use std::str::FromStr;
 
     #[test]
@@ -114,12 +115,13 @@ mod tests {
     }
 
     #[test]
-    fn test_browser_session_id_display_from_str_round_trip() {
+    fn test_browser_session_id_display_from_str_round_trip() -> TestResult {
         let id = BrowserSessionId::new();
         let rendered = id.to_string();
-        let parsed = BrowserSessionId::from_str(&rendered).expect("valid uuid string");
+        let parsed = BrowserSessionId::from_str(&rendered).map_err(ctx("valid uuid string"))?;
         assert_eq!(id, parsed);
         assert_eq!(id.as_uuid(), parsed.as_uuid());
+        Ok(())
     }
 
     #[test]
@@ -163,12 +165,13 @@ mod tests {
     }
 
     #[test]
-    fn test_browser_context_id_display_from_str_round_trip() {
+    fn test_browser_context_id_display_from_str_round_trip() -> TestResult {
         let id = BrowserContextId::new();
         let rendered = id.to_string();
-        let parsed = BrowserContextId::from_str(&rendered).expect("valid uuid string");
+        let parsed = BrowserContextId::from_str(&rendered).map_err(ctx("valid uuid string"))?;
         assert_eq!(id, parsed);
         assert_eq!(id.as_uuid(), parsed.as_uuid());
+        Ok(())
     }
 
     #[test]

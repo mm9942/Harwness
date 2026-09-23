@@ -531,6 +531,7 @@ fn is_valid_webhook_secret(secret_token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn api_urls_follow_telegram_bot_api_shape() {
@@ -568,24 +569,25 @@ mod tests {
     }
 
     #[test]
-    fn response_envelope_parses_telegram_error_parameters_and_acknowledgements() {
+    fn response_envelope_parses_telegram_error_parameters_and_acknowledgements() -> TestResult {
         let rate_limited: TelegramResponse<bool> = serde_json::from_str(
             r#"{"ok":false,"description":"Too Many Requests","error_code":429,"parameters":{"retry_after":17}}"#,
         )
-        .map_err(|error| error.to_string())
-        .unwrap_or_else(|error| panic!("test JSON must deserialize: {error}"));
+        .map_err(ctx("test JSON must deserialize"))?;
         assert!(!rate_limited.ok);
         assert_eq!(rate_limited.error_code, Some(429));
         assert_eq!(
-            rate_limited.parameters.and_then(|parameters| parameters.retry_after),
+            rate_limited
+                .parameters
+                .and_then(|parameters| parameters.retry_after),
             Some(17)
         );
 
         let acknowledgement: TelegramResponse<bool> =
             serde_json::from_str(r#"{"ok":true,"result":true}"#)
-                .map_err(|error| error.to_string())
-                .unwrap_or_else(|error| panic!("test JSON must deserialize: {error}"));
+                .map_err(ctx("test JSON must deserialize"))?;
         assert_eq!(acknowledgement.result, Some(true));
+        Ok(())
     }
 
     #[test]

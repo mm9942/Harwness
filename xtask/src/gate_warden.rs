@@ -318,7 +318,9 @@ const C_BUILD_EXCEPTIONS: &[CBuildException] = &[CBuildException {
 /// Keine — totale, panikfreie Funktion.
 #[must_use]
 fn is_c_build_exception(krate: &str, tool: &str) -> bool {
-    C_BUILD_EXCEPTIONS.iter().any(|exception| exception.krate == krate && exception.tool == tool)
+    C_BUILD_EXCEPTIONS
+        .iter()
+        .any(|exception| exception.krate == krate && exception.tool == tool)
 }
 
 /// Ein einzelner `[[package]]`-Eintrag aus `Cargo.lock`, so weit reduziert,
@@ -393,8 +395,12 @@ fn unquote(raw: &str) -> String {
 /// ```
 fn parse_lock_entries(root: &Path) -> Result<Vec<LockEntry>, String> {
     let path = root.join("Cargo.lock");
-    let content = fs::read_to_string(&path)
-        .map_err(|error| format!("Cargo.lock nicht lesbar unter '{}': {error}", path.display()))?;
+    let content = fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "Cargo.lock nicht lesbar unter '{}': {error}",
+            path.display()
+        )
+    })?;
 
     let mut entries = Vec::new();
     let mut current: Option<LockEntry> = None;
@@ -779,10 +785,16 @@ fn apply_dependency_attr_kv(attrs: &mut DependencyEdgeAttrs, key: &str, value: &
 ///
 /// # Errors
 /// Wenn die Wurzel-`Cargo.toml` nicht lesbar ist.
-fn parse_workspace_dependencies(root: &Path) -> Result<HashMap<String, DependencyEdgeAttrs>, String> {
+fn parse_workspace_dependencies(
+    root: &Path,
+) -> Result<HashMap<String, DependencyEdgeAttrs>, String> {
     let path = root.join("Cargo.toml");
-    let content = fs::read_to_string(&path)
-        .map_err(|error| format!("Wurzel-Cargo.toml nicht lesbar unter '{}': {error}", path.display()))?;
+    let content = fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "Wurzel-Cargo.toml nicht lesbar unter '{}': {error}",
+            path.display()
+        )
+    })?;
     Ok(parse_manifest_facts(&content).dependency_attrs)
 }
 
@@ -984,7 +996,12 @@ fn parse_manifest_facts(content: &str) -> ManifestFacts {
                 let item = unquote(line.trim_end_matches(','));
                 if !item.is_empty() {
                     if is_dependency_features {
-                        facts.dependency_attrs.entry(name).or_default().features.push(item);
+                        facts
+                            .dependency_attrs
+                            .entry(name)
+                            .or_default()
+                            .features
+                            .push(item);
                     } else {
                         facts.feature_defs.entry(name).or_default().push(item);
                     }
@@ -1073,7 +1090,8 @@ fn parse_manifest_facts(content: &str) -> ManifestFacts {
                             let base = parts.next().unwrap_or(raw_key).to_owned();
                             match parts.next() {
                                 Some(sub_key) => {
-                                    let attrs = facts.dependency_attrs.entry(base.clone()).or_default();
+                                    let attrs =
+                                        facts.dependency_attrs.entry(base.clone()).or_default();
                                     if apply_dependency_attr_kv(attrs, sub_key, value) {
                                         pending_array = Some((true, base));
                                     }
@@ -1092,8 +1110,11 @@ fn parse_manifest_facts(content: &str) -> ManifestFacts {
                                     // Default-Eintrag (nicht optional,
                                     // Default-Features an, keine Features)
                                     // ist für diese Form korrekt.
-                                    let attrs = facts.dependency_attrs.entry(base.clone()).or_default();
-                                    if let Some(inner) = value.strip_prefix('{').and_then(|v| v.strip_suffix('}')) {
+                                    let attrs =
+                                        facts.dependency_attrs.entry(base.clone()).or_default();
+                                    if let Some(inner) =
+                                        value.strip_prefix('{').and_then(|v| v.strip_suffix('}'))
+                                    {
                                         for part in split_top_level_commas(inner) {
                                             if let Some(part_eq) = part.find('=') {
                                                 let k = part[..part_eq].trim();
@@ -1124,9 +1145,13 @@ fn parse_manifest_facts(content: &str) -> ManifestFacts {
                         .chars()
                         .next()
                         .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-                        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+                        && key
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
                     if is_valid_key {
-                        if let Some(inline) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+                        if let Some(inline) =
+                            value.strip_prefix('[').and_then(|v| v.strip_suffix(']'))
+                        {
                             let entry = facts.feature_defs.entry(key.to_owned()).or_default();
                             for item in split_top_level_commas(inline) {
                                 let item = unquote(item);
@@ -1407,7 +1432,10 @@ impl<'a> ClosureBuilder<'a> {
         let mut lock_by_name: HashMap<&'a str, Vec<&'a LockEntry>> = HashMap::new();
         let mut lock_by_key: HashMap<(String, String), &'a LockEntry> = HashMap::new();
         for entry in lock {
-            lock_by_name.entry(entry.name.as_str()).or_default().push(entry);
+            lock_by_name
+                .entry(entry.name.as_str())
+                .or_default()
+                .push(entry);
             lock_by_key.insert((entry.name.clone(), entry.version.clone()), entry);
         }
         Self {
@@ -1449,27 +1477,48 @@ impl<'a> ClosureBuilder<'a> {
     /// ["serde"]`-Kante wird so im nächsten Durchlauf zur Grundlage dafür,
     /// welche von `jiff`s **eigenen** optionalen Abhängigkeiten (`defmt`,
     /// `jiff-static`, `log`) aktiviert sind.
-    fn maybe_follow_edge(&mut self, parent_name: &str, parent_facts: &ManifestFacts, dep_name: &str, dep_version: Option<&str>) {
-        let raw_attrs = parent_facts.dependency_attrs.get(dep_name).cloned().unwrap_or_default();
+    fn maybe_follow_edge(
+        &mut self,
+        parent_name: &str,
+        parent_facts: &ManifestFacts,
+        dep_name: &str,
+        dep_version: Option<&str>,
+    ) {
+        let raw_attrs = parent_facts
+            .dependency_attrs
+            .get(dep_name)
+            .cloned()
+            .unwrap_or_default();
         let (attrs, problem) = resolve_workspace_edge(dep_name, &raw_attrs, self.workspace_deps);
         if let Some(msg) = problem {
             self.result.problems.push(msg);
         }
 
         if attrs.optional {
-            let parent_requested = self.prev_requested_features.get(parent_name).cloned().unwrap_or_default();
+            let parent_requested = self
+                .prev_requested_features
+                .get(parent_name)
+                .cloned()
+                .unwrap_or_default();
             let parent_default = *self.prev_default_enabled.get(parent_name).unwrap_or(&false);
-            let activated = resolve_activated_optional_deps(parent_facts, &parent_requested, parent_default);
+            let activated =
+                resolve_activated_optional_deps(parent_facts, &parent_requested, parent_default);
             if !activated.contains(dep_name) {
                 return;
             }
         }
 
-        let child_req = self.next_requested_features.entry(dep_name.to_owned()).or_default();
+        let child_req = self
+            .next_requested_features
+            .entry(dep_name.to_owned())
+            .or_default();
         for feature in &attrs.features {
             child_req.insert(feature.clone());
         }
-        let child_def = self.next_default_enabled.entry(dep_name.to_owned()).or_insert(false);
+        let child_def = self
+            .next_default_enabled
+            .entry(dep_name.to_owned())
+            .or_insert(false);
         if attrs.default_features {
             *child_def = true;
         }
@@ -1486,9 +1535,9 @@ impl<'a> ClosureBuilder<'a> {
     /// wird.
     fn run_from_root(&mut self, root: &str) {
         let Some(node) = self.graph.get(root) else {
-            self.result
-                .problems
-                .push(format!("Wurzel-Crate '{root}' nicht im Workspace-Graphen gefunden"));
+            self.result.problems.push(format!(
+                "Wurzel-Crate '{root}' nicht im Workspace-Graphen gefunden"
+            ));
             return;
         };
         self.visited_internal.insert(root.to_owned());
@@ -1550,9 +1599,9 @@ impl<'a> ClosureBuilder<'a> {
         self.visited_internal.insert(name.to_owned());
 
         let Some(node) = self.graph.get(name) else {
-            self.result
-                .problems
-                .push(format!("internes Crate '{name}' nicht im Workspace-Graphen gefunden"));
+            self.result.problems.push(format!(
+                "internes Crate '{name}' nicht im Workspace-Graphen gefunden"
+            ));
             return;
         };
 
@@ -1602,9 +1651,9 @@ impl<'a> ClosureBuilder<'a> {
                 }
             }
             None => {
-                self.result
-                    .problems
-                    .push(format!("kein Lockfile-Eintrag für internes Crate '{name}' gefunden"));
+                self.result.problems.push(format!(
+                    "kein Lockfile-Eintrag für internes Crate '{name}' gefunden"
+                ));
             }
         }
     }
@@ -1682,8 +1731,18 @@ impl<'a> ClosureBuilder<'a> {
     /// Zerlegt den Builder nach Abschluss eines Durchlaufs in sein Ergebnis
     /// und die für den nächsten Durchlauf gesammelten Feature-Anforderungen
     /// (siehe [`compute_closure`]).
-    fn into_parts(self) -> (ClosureResult, HashMap<String, HashSet<String>>, HashMap<String, bool>) {
-        (self.result, self.next_requested_features, self.next_default_enabled)
+    fn into_parts(
+        self,
+    ) -> (
+        ClosureResult,
+        HashMap<String, HashSet<String>>,
+        HashMap<String, bool>,
+    ) {
+        (
+            self.result,
+            self.next_requested_features,
+            self.next_default_enabled,
+        )
     }
 }
 
@@ -1739,7 +1798,14 @@ fn compute_closure(
     let safety_limit = 128usize;
 
     for _ in 0..safety_limit {
-        let mut builder = ClosureBuilder::new(graph, lock, locator, workspace_deps, &requested_features, &default_enabled);
+        let mut builder = ClosureBuilder::new(
+            graph,
+            lock,
+            locator,
+            workspace_deps,
+            &requested_features,
+            &default_enabled,
+        );
         builder.run_from_root(root);
         let (result, next_requested, mut next_default) = builder.into_parts();
         next_default.insert(root.to_owned(), true);
@@ -1859,12 +1925,18 @@ fn load_and_compute() -> Result<ClosureResult, String> {
     // gebraucht (siehe Moduldoku, Abschnitt „Feature-Auflösung").
     let workspace_deps = parse_workspace_dependencies(root_path)?;
 
-    Ok(compute_closure(WARDEN_ROOT, &graph, &lock, &locator, &workspace_deps))
+    Ok(compute_closure(
+        WARDEN_ROOT,
+        &graph,
+        &lock,
+        &locator,
+        &workspace_deps,
+    ))
 }
 
 /// Gate 4: Warden-Abhängigkeitszahl (K53).
 pub mod dependency_budget {
-    use super::{evaluate_dependency_budget, load_and_compute, GateReport};
+    use super::{GateReport, evaluate_dependency_budget, load_and_compute};
 
     /// Führt Gate 4 aus.
     ///
@@ -1896,7 +1968,7 @@ pub mod dependency_budget {
 
 /// Gate 5: kein C-Übersetzer im Warden-Teilbaum.
 pub mod c_build {
-    use super::{evaluate_c_build, load_and_compute, GateReport};
+    use super::{GateReport, evaluate_c_build, load_and_compute};
 
     /// Führt Gate 5 aus.
     ///
@@ -1941,12 +2013,18 @@ pub mod c_build {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// `build_tool_names` ersetzt den vormaligen reinen `bool`-Parameter:
     /// er trägt die konkreten Werkzeugnamen (`"cc"`/`"bindgen"`), damit
     /// Tests der Ausnahmetabelle ([`C_BUILD_EXCEPTIONS`]) dasselbe Signal
     /// erzeugen können, das [`parse_manifest_facts`] tatsächlich liefert.
-    fn facts(is_proc_macro: bool, has_links: bool, build_tool_names: &[&str], deps: &[&str]) -> ManifestFacts {
+    fn facts(
+        is_proc_macro: bool,
+        has_links: bool,
+        build_tool_names: &[&str],
+        deps: &[&str],
+    ) -> ManifestFacts {
         ManifestFacts {
             is_proc_macro,
             has_links,
@@ -1961,11 +2039,18 @@ mod tests {
         }
     }
 
-    fn closure_with(internal: &[&str], external: &[&str], facts_map: Vec<(&str, ManifestFacts)>) -> ClosureResult {
+    fn closure_with(
+        internal: &[&str],
+        external: &[&str],
+        facts_map: Vec<(&str, ManifestFacts)>,
+    ) -> ClosureResult {
         ClosureResult {
             internal: internal.iter().map(|s| (*s).to_owned()).collect(),
             external: external.iter().map(|s| (*s).to_owned()).collect(),
-            facts: facts_map.into_iter().map(|(k, v)| (k.to_owned(), v)).collect(),
+            facts: facts_map
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v))
+                .collect(),
             problems: Vec::new(),
         }
     }
@@ -1989,7 +2074,9 @@ mod tests {
         // Invariante relativ zu `MAX_WARDEN_RUNTIME_DEPS`, statt gegen eine
         // absolute Zahl, die bei jeder Anpassung der Konstante erneut
         // bricht (siehe Auftrag).
-        let names: Vec<String> = (0..MAX_WARDEN_RUNTIME_DEPS).map(|i| format!("crate-{i}")).collect();
+        let names: Vec<String> = (0..MAX_WARDEN_RUNTIME_DEPS)
+            .map(|i| format!("crate-{i}"))
+            .collect();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let result = closure_with(&refs, &[], Vec::new());
 
@@ -2008,7 +2095,9 @@ mod tests {
         // gegen die feste Zahl 13 (aus der ursprünglichen, in sich
         // widersprüchlichen K53-Lesart) — jetzt relativ zu
         // `MAX_WARDEN_RUNTIME_DEPS` formuliert, siehe Auftrag.
-        let names: Vec<String> = (0..=MAX_WARDEN_RUNTIME_DEPS).map(|i| format!("crate-{i}")).collect();
+        let names: Vec<String> = (0..=MAX_WARDEN_RUNTIME_DEPS)
+            .map(|i| format!("crate-{i}"))
+            .collect();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         assert_eq!(refs.len(), MAX_WARDEN_RUNTIME_DEPS + 1);
         let result = closure_with(&refs, &[], Vec::new());
@@ -2017,7 +2106,10 @@ mod tests {
 
         assert!(!report.is_green());
         assert_eq!(report.violations.len(), 1);
-        assert!(report.violations[0].contains(&format!("{} Laufzeit-Crates", MAX_WARDEN_RUNTIME_DEPS + 1)));
+        assert!(
+            report.violations[0]
+                .contains(&format!("{} Laufzeit-Crates", MAX_WARDEN_RUNTIME_DEPS + 1))
+        );
     }
 
     #[test]
@@ -2052,7 +2144,10 @@ mod tests {
 
         let report = evaluate_c_build(&result);
 
-        assert!(report.is_green(), "build.rs allein darf nicht röten: {report:?}");
+        assert!(
+            report.is_green(),
+            "build.rs allein darf nicht röten: {report:?}"
+        );
         assert!(report.checked > 0);
     }
 
@@ -2096,11 +2191,18 @@ mod tests {
         // Ausnahme (siehe C_BUILD_EXCEPTIONS) — dieselbe Kante, die der
         // vorige Test für ein unbekanntes Crate rot werden lässt, darf für
         // blake3 kein Verstoß sein.
-        let result = closure_with(&[], &["blake3"], vec![("blake3", facts(false, false, &["cc"], &[]))]);
+        let result = closure_with(
+            &[],
+            &["blake3"],
+            vec![("blake3", facts(false, false, &["cc"], &[]))],
+        );
 
         let report = evaluate_c_build(&result);
 
-        assert!(report.is_green(), "blake3s dokumentierte cc-Ausnahme darf nicht röten: {report:?}");
+        assert!(
+            report.is_green(),
+            "blake3s dokumentierte cc-Ausnahme darf nicht röten: {report:?}"
+        );
     }
 
     #[test]
@@ -2109,11 +2211,18 @@ mod tests {
         // blake3 zusätzlich einen `links`-Schlüssel, bliebe es deswegen rot
         // — das ist hier nachgebildet, weil `links` nie durch
         // `C_BUILD_EXCEPTIONS` gedeckt wird (siehe `evaluate_c_build`-Doku).
-        let result = closure_with(&[], &["blake3"], vec![("blake3", facts(false, true, &["cc"], &[]))]);
+        let result = closure_with(
+            &[],
+            &["blake3"],
+            vec![("blake3", facts(false, true, &["cc"], &[]))],
+        );
 
         let report = evaluate_c_build(&result);
 
-        assert!(!report.is_green(), "links-Schlüssel bleibt trotz cc-Ausnahme ein Verstoß");
+        assert!(
+            !report.is_green(),
+            "links-Schlüssel bleibt trotz cc-Ausnahme ein Verstoß"
+        );
         assert!(report.violations[0].contains("links-Schlüssel=true"));
     }
 
@@ -2169,7 +2278,8 @@ mod tests {
 
     #[test]
     fn test_parse_manifest_facts_bindgen_via_dotted_dependency_table_is_flagged() {
-        let content = "[package]\nname = \"foo\"\n\n[build-dependencies.bindgen]\nversion = \"0.60\"\n";
+        let content =
+            "[package]\nname = \"foo\"\n\n[build-dependencies.bindgen]\nversion = \"0.60\"\n";
         let facts = parse_manifest_facts(content);
         assert!(facts.build_needs_c_compiler);
         assert_eq!(facts.build_tool_names, vec!["bindgen".to_owned()]);
@@ -2177,7 +2287,8 @@ mod tests {
 
     #[test]
     fn test_parse_manifest_facts_collects_normal_dependency_names() {
-        let content = "[dependencies]\nserde = \"1\"\nfoo = { version = \"2\", features = [\"a\"] }\n";
+        let content =
+            "[dependencies]\nserde = \"1\"\nfoo = { version = \"2\", features = [\"a\"] }\n";
         let facts = parse_manifest_facts(content);
         assert!(facts.normal_dep_names.contains(&"serde".to_owned()));
         assert!(facts.normal_dep_names.contains(&"foo".to_owned()));
@@ -2185,8 +2296,7 @@ mod tests {
 
     #[test]
     fn test_parse_manifest_facts_ignores_dev_and_build_dependencies_for_normal_deps() {
-        let content =
-            "[dependencies]\nserde = \"1\"\n\n[dev-dependencies]\ntempfile = \"3\"\n\n[build-dependencies]\ncc = \"1\"\n";
+        let content = "[dependencies]\nserde = \"1\"\n\n[dev-dependencies]\ntempfile = \"3\"\n\n[build-dependencies]\ncc = \"1\"\n";
         let facts = parse_manifest_facts(content);
         assert_eq!(facts.normal_dep_names, vec!["serde".to_owned()]);
     }
@@ -2194,47 +2304,63 @@ mod tests {
     // -- Feature-Auflösungs-Korrektur: neue Tests ---------------------------
 
     #[test]
-    fn test_parse_manifest_facts_detects_optional_inline_table() {
+    fn test_parse_manifest_facts_detects_optional_inline_table() -> TestResult {
         let content = "[dependencies]\ndefmt = { version = \"1\", optional = true }\n";
         let facts = parse_manifest_facts(content);
-        assert!(facts.dependency_attrs.get("defmt").expect("defmt gefunden").optional);
+        assert!(
+            facts
+                .dependency_attrs
+                .get("defmt")
+                .ok_or(TestError::Missing("defmt gefunden"))?
+                .optional
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_parse_manifest_facts_detects_workspace_shorthand() {
+    fn test_parse_manifest_facts_detects_workspace_shorthand() -> TestResult {
         let content = "[dependencies]\njiff.workspace = true\n";
         let facts = parse_manifest_facts(content);
         assert!(
             facts
                 .dependency_attrs
                 .get("jiff")
-                .expect("jiff gefunden")
+                .ok_or(TestError::Missing("jiff gefunden"))?
                 .workspace_inherited
         );
+        Ok(())
     }
 
     #[test]
-    fn test_parse_manifest_facts_dotted_table_multiline_features() {
+    fn test_parse_manifest_facts_dotted_table_multiline_features() -> TestResult {
         let content = "[dependencies.foo]\nversion = \"1\"\noptional = true\nfeatures = [\n \"a\",\n \"b\",\n]\n";
         let facts = parse_manifest_facts(content);
-        let attrs = facts.dependency_attrs.get("foo").expect("foo gefunden");
+        let attrs = facts
+            .dependency_attrs
+            .get("foo")
+            .ok_or(TestError::Missing("foo gefunden"))?;
         assert!(attrs.optional);
         assert_eq!(attrs.features, vec!["a".to_owned(), "b".to_owned()]);
         // Der latente Fehler der Vorfassung ist behoben: `version`/
         // `optional`/`features` landen nicht mehr als eigene
         // Abhängigkeitsnamen in `normal_dep_names`.
         assert_eq!(facts.normal_dep_names, vec!["foo".to_owned()]);
+        Ok(())
     }
 
     #[test]
     fn test_parse_manifest_facts_features_section_multiline_and_inline() {
-        let content = "[features]\ndefault = [\n \"std\",\n \"serde\",\n]\ndefmt = [\"dep:defmt\"]\n";
+        let content =
+            "[features]\ndefault = [\n \"std\",\n \"serde\",\n]\ndefmt = [\"dep:defmt\"]\n";
         let facts = parse_manifest_facts(content);
         assert_eq!(
             facts.feature_defs.get("default"),
             Some(&vec!["std".to_owned(), "serde".to_owned()])
         );
-        assert_eq!(facts.feature_defs.get("defmt"), Some(&vec!["dep:defmt".to_owned()]));
+        assert_eq!(
+            facts.feature_defs.get("defmt"),
+            Some(&vec!["dep:defmt".to_owned()])
+        );
     }
 
     fn facts_with_optional_dep(dep_name: &str) -> ManifestFacts {
@@ -2256,13 +2382,17 @@ mod tests {
         // dem Befund. Er wäre vor dieser Korrektur rot gewesen.
         let f = facts_with_optional_dep("defmt");
         let active = resolve_activated_optional_deps(&f, &HashSet::new(), true);
-        assert!(!active.contains("defmt"), "defmt darf ohne Anforderung nicht aktiv sein");
+        assert!(
+            !active.contains("defmt"),
+            "defmt darf ohne Anforderung nicht aktiv sein"
+        );
     }
 
     #[test]
     fn test_resolve_activated_optional_deps_explicitly_requested_is_included() {
         let mut f = facts_with_optional_dep("defmt");
-        f.feature_defs.insert("defmt".to_owned(), vec!["dep:defmt".to_owned()]);
+        f.feature_defs
+            .insert("defmt".to_owned(), vec!["dep:defmt".to_owned()]);
         let requested: HashSet<String> = ["defmt".to_owned()].into_iter().collect();
         let active = resolve_activated_optional_deps(&f, &requested, true);
         assert!(active.contains("defmt"));
@@ -2271,8 +2401,10 @@ mod tests {
     #[test]
     fn test_resolve_activated_optional_deps_default_feature_activates_dependency() {
         let mut f = facts_with_optional_dep("jiff-tzdb-platform");
-        f.feature_defs
-            .insert("default".to_owned(), vec!["tzdb-bundle-platform".to_owned()]);
+        f.feature_defs.insert(
+            "default".to_owned(),
+            vec!["tzdb-bundle-platform".to_owned()],
+        );
         f.feature_defs.insert(
             "tzdb-bundle-platform".to_owned(),
             vec!["dep:jiff-tzdb-platform".to_owned()],
@@ -2284,8 +2416,10 @@ mod tests {
     #[test]
     fn test_resolve_activated_optional_deps_default_features_disabled_excludes_default_only_dep() {
         let mut f = facts_with_optional_dep("jiff-tzdb-platform");
-        f.feature_defs
-            .insert("default".to_owned(), vec!["tzdb-bundle-platform".to_owned()]);
+        f.feature_defs.insert(
+            "default".to_owned(),
+            vec!["tzdb-bundle-platform".to_owned()],
+        );
         f.feature_defs.insert(
             "tzdb-bundle-platform".to_owned(),
             vec!["dep:jiff-tzdb-platform".to_owned()],
@@ -2297,11 +2431,16 @@ mod tests {
     #[test]
     fn test_resolve_activated_optional_deps_feature_enables_feature_fixpoint() {
         let mut f = facts_with_optional_dep("backend");
-        f.feature_defs.insert("full".to_owned(), vec!["extra".to_owned()]);
-        f.feature_defs.insert("extra".to_owned(), vec!["dep:backend".to_owned()]);
+        f.feature_defs
+            .insert("full".to_owned(), vec!["extra".to_owned()]);
+        f.feature_defs
+            .insert("extra".to_owned(), vec!["dep:backend".to_owned()]);
         let requested: HashSet<String> = ["full".to_owned()].into_iter().collect();
         let active = resolve_activated_optional_deps(&f, &requested, false);
-        assert!(active.contains("backend"), "full -> extra -> dep:backend muss die Kette durchlaufen");
+        assert!(
+            active.contains("backend"),
+            "full -> extra -> dep:backend muss die Kette durchlaufen"
+        );
     }
 
     #[test]
@@ -2309,7 +2448,8 @@ mod tests {
         // Nachbildung von `jiff`s `tz-fat = ["jiff-static?/tz-fat"]`: eine
         // schwache Referenz aktiviert `jiff-static` gerade nicht.
         let mut f = facts_with_optional_dep("jiff-static");
-        f.feature_defs.insert("default".to_owned(), vec!["tz-fat".to_owned()]);
+        f.feature_defs
+            .insert("default".to_owned(), vec!["tz-fat".to_owned()]);
         f.feature_defs
             .insert("tz-fat".to_owned(), vec!["jiff-static?/tz-fat".to_owned()]);
         let active = resolve_activated_optional_deps(&f, &HashSet::new(), true);
@@ -2342,7 +2482,8 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_workspace_edge_missing_root_entry_is_a_problem_not_a_silent_default() {
+    fn test_resolve_workspace_edge_missing_root_entry_is_a_problem_not_a_silent_default()
+    -> TestResult {
         let workspace_deps: HashMap<String, DependencyEdgeAttrs> = HashMap::new();
         let local = DependencyEdgeAttrs {
             workspace_inherited: true,
@@ -2351,7 +2492,12 @@ mod tests {
 
         let (_, problem) = resolve_workspace_edge("ghost", &local, &workspace_deps);
 
-        assert!(problem.expect("Problem erwartet").contains("ghost"));
+        assert!(
+            problem
+                .ok_or(TestError::Missing("Problem erwartet"))?
+                .contains("ghost")
+        );
+        Ok(())
     }
 
     // -- Nachkorrektur: `[workspace.dependencies]` in allen drei
@@ -2366,23 +2512,32 @@ mod tests {
     // Schreibweise ab; ein vierter belegt, dass ein wirklich fehlender
     // Eintrag weiterhin ein Verstoß bleibt.
 
-    fn write_root_manifest(dir: &std::path::Path, workspace_dependencies_block: &str) {
-        fs::create_dir_all(dir).expect("Scratch-Verzeichnis anlegen");
-        let content = format!("[workspace]\nmembers = []\n\n[workspace.dependencies]\n{workspace_dependencies_block}\n");
-        fs::write(dir.join("Cargo.toml"), content).expect("Cargo.toml schreiben");
+    fn write_root_manifest(
+        dir: &std::path::Path,
+        workspace_dependencies_block: &str,
+    ) -> TestResult {
+        fs::create_dir_all(dir).map_err(ctx("Scratch-Verzeichnis anlegen"))?;
+        let content = format!(
+            "[workspace]\nmembers = []\n\n[workspace.dependencies]\n{workspace_dependencies_block}\n"
+        );
+        fs::write(dir.join("Cargo.toml"), content).map_err(ctx("Cargo.toml schreiben"))?;
+        Ok(())
     }
 
     #[test]
-    fn test_parse_workspace_dependencies_plain_string_form() {
+    fn test_parse_workspace_dependencies_plain_string_form() -> TestResult {
         // Die Schreibweise, die den Fehler auslöste: `name = "1.2.3"`, ohne
         // Inline-Tabelle.
         let dir = std::env::temp_dir().join(format!("gate-warden-ws-plain-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        write_root_manifest(&dir, "serde_json = \"1.0.150\"\nblake3 = \"1.8.7\"\n");
+        write_root_manifest(&dir, "serde_json = \"1.0.150\"\nblake3 = \"1.8.7\"\n")?;
 
-        let deps = parse_workspace_dependencies(&dir).expect("Wurzel-Cargo.toml parsen");
+        let deps = parse_workspace_dependencies(&dir).map_err(ctx("Wurzel-Cargo.toml parsen"))?;
 
-        assert!(deps.contains_key("serde_json"), "serde_json fehlt: {deps:?}");
+        assert!(
+            deps.contains_key("serde_json"),
+            "serde_json fehlt: {deps:?}"
+        );
         assert!(deps.contains_key("blake3"), "blake3 fehlt: {deps:?}");
         let serde_json = &deps["serde_json"];
         assert!(!serde_json.optional);
@@ -2390,47 +2545,59 @@ mod tests {
         assert!(serde_json.features.is_empty());
 
         fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_parse_workspace_dependencies_inline_table_form() {
-        let dir = std::env::temp_dir().join(format!("gate-warden-ws-inline-{}", std::process::id()));
+    fn test_parse_workspace_dependencies_inline_table_form() -> TestResult {
+        let dir =
+            std::env::temp_dir().join(format!("gate-warden-ws-inline-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        write_root_manifest(&dir, "jiff = { version = \"0.2.32\", features = [\"serde\"] }\n");
+        write_root_manifest(
+            &dir,
+            "jiff = { version = \"0.2.32\", features = [\"serde\"] }\n",
+        )?;
 
-        let deps = parse_workspace_dependencies(&dir).expect("Wurzel-Cargo.toml parsen");
+        let deps = parse_workspace_dependencies(&dir).map_err(ctx("Wurzel-Cargo.toml parsen"))?;
 
-        let jiff = deps.get("jiff").expect("jiff gefunden");
+        let jiff = deps
+            .get("jiff")
+            .ok_or(TestError::Missing("jiff gefunden"))?;
         assert_eq!(jiff.features, vec!["serde".to_owned()]);
 
         fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_parse_workspace_dependencies_subtable_form() {
-        let dir = std::env::temp_dir().join(format!("gate-warden-ws-subtable-{}", std::process::id()));
+    fn test_parse_workspace_dependencies_subtable_form() -> TestResult {
+        let dir =
+            std::env::temp_dir().join(format!("gate-warden-ws-subtable-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("Scratch-Verzeichnis anlegen");
+        fs::create_dir_all(&dir).map_err(ctx("Scratch-Verzeichnis anlegen"))?;
         let content = "[workspace]\nmembers = []\n\n[workspace.dependencies.foo]\nversion = \"1\"\noptional = false\n";
-        fs::write(dir.join("Cargo.toml"), content).expect("Cargo.toml schreiben");
+        fs::write(dir.join("Cargo.toml"), content).map_err(ctx("Cargo.toml schreiben"))?;
 
-        let deps = parse_workspace_dependencies(&dir).expect("Wurzel-Cargo.toml parsen");
+        let deps = parse_workspace_dependencies(&dir).map_err(ctx("Wurzel-Cargo.toml parsen"))?;
 
         assert!(deps.contains_key("foo"), "foo fehlt: {deps:?}");
 
         fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_parse_workspace_dependencies_then_resolve_missing_entry_stays_a_violation() {
+    fn test_parse_workspace_dependencies_then_resolve_missing_entry_stays_a_violation() -> TestResult
+    {
         // Belegt, dass die Korrektur das richtige Verhalten nicht abschwächt:
         // ein Name, der wirklich nicht in `[workspace.dependencies]` steht,
         // bleibt ein Verstoß -- kein stilles Überspringen.
-        let dir = std::env::temp_dir().join(format!("gate-warden-ws-missing-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("gate-warden-ws-missing-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        write_root_manifest(&dir, "serde_json = \"1.0.150\"\n");
+        write_root_manifest(&dir, "serde_json = \"1.0.150\"\n")?;
 
-        let deps = parse_workspace_dependencies(&dir).expect("Wurzel-Cargo.toml parsen");
+        let deps = parse_workspace_dependencies(&dir).map_err(ctx("Wurzel-Cargo.toml parsen"))?;
         let local = DependencyEdgeAttrs {
             workspace_inherited: true,
             ..Default::default()
@@ -2438,10 +2605,15 @@ mod tests {
         let (_, problem) = resolve_workspace_edge("tracing", &local, &deps);
 
         assert!(
-            problem.expect("Problem erwartet, da 'tracing' nicht in [workspace.dependencies] steht").contains("tracing")
+            problem
+                .ok_or(TestError::Missing(
+                    "Problem erwartet, da 'tracing' nicht in [workspace.dependencies] steht"
+                ))?
+                .contains("tracing")
         );
 
         fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 
     #[test]
@@ -2468,10 +2640,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_lock_entries_reads_multiline_and_inline_dependency_arrays() {
+    fn test_parse_lock_entries_reads_multiline_and_inline_dependency_arrays() -> TestResult {
         let dir = std::env::temp_dir().join(format!("gate-warden-lock-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("Scratch-Verzeichnis anlegen");
+        fs::create_dir_all(&dir).map_err(ctx("Scratch-Verzeichnis anlegen"))?;
         let lock_content = r#"
 version = 4
 
@@ -2488,30 +2660,39 @@ name = "leaf"
 version = "1.0.0"
 dependencies = []
 "#;
-        fs::write(dir.join("Cargo.lock"), lock_content).expect("Cargo.lock schreiben");
+        fs::write(dir.join("Cargo.lock"), lock_content).map_err(ctx("Cargo.lock schreiben"))?;
 
-        let entries = parse_lock_entries(&dir).expect("Lockfile parsen");
+        let entries = parse_lock_entries(&dir).map_err(ctx("Lockfile parsen"))?;
         let warden = entries
             .iter()
             .find(|e| e.name == "harw-warden")
-            .expect("harw-warden gefunden");
-        assert_eq!(warden.dependencies, vec!["clap".to_owned(), "rustix 1.1.4".to_owned()]);
+            .ok_or(TestError::Missing("harw-warden gefunden"))?;
+        assert_eq!(
+            warden.dependencies,
+            vec!["clap".to_owned(), "rustix 1.1.4".to_owned()]
+        );
 
-        let leaf = entries.iter().find(|e| e.name == "leaf").expect("leaf gefunden");
+        let leaf = entries
+            .iter()
+            .find(|e| e.name == "leaf")
+            .ok_or(TestError::Missing("leaf gefunden"))?;
         assert!(leaf.dependencies.is_empty());
 
         fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_parse_lock_entries_missing_file_is_an_error_not_an_empty_vec() {
-        let dir = std::env::temp_dir().join(format!("gate-warden-lock-missing-{}", std::process::id()));
+    fn test_parse_lock_entries_missing_file_is_an_error_not_an_empty_vec() -> TestResult {
+        let dir =
+            std::env::temp_dir().join(format!("gate-warden-lock-missing-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("Scratch-Verzeichnis anlegen");
+        fs::create_dir_all(&dir).map_err(ctx("Scratch-Verzeichnis anlegen"))?;
 
         let result = parse_lock_entries(&dir);
         assert!(result.is_err());
 
         fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 }

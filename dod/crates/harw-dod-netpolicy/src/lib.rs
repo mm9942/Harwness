@@ -134,3 +134,7 @@ pub use backend::{InspectBackend, NetBackend};
 pub use error::{NetPolicyError, NetPolicyResult};
 pub use plan::{plan_for_scope, NetPlan};
 pub use rule::NetRule;
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

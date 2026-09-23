@@ -150,12 +150,14 @@
 
 use std::time::Duration;
 
-use harw_dod_bpf::{BpfError, BpfHandle, BpfLoader, BpfProgramKind, BpfProgramSource, BpfProgramSpec};
+use harw_authority::NetworkScope;
+use harw_dod_bpf::{
+    BpfError, BpfHandle, BpfLoader, BpfProgramKind, BpfProgramSource, BpfProgramSpec,
+};
 use harw_dod_cap::{Bound, Capability, ReadScope, SensorError, SensorHandle};
 use harw_dod_flow::FlowError;
 use harw_dod_procmon::ProcmonSensor;
 use harw_dod_signals::{Sensor, SensorReading};
-use harw_authority::NetworkScope;
 use harw_types::SensorId;
 use jiff::Timestamp;
 
@@ -443,54 +445,60 @@ mod tests {
     use std::borrow::Cow;
     use std::net::{IpAddr, Ipv4Addr};
 
+    use harw_authority::{EgressTarget, NetworkScope};
     use harw_dod_bpf::event::RawBpfEvent;
     use harw_dod_bpf::fixture::FixtureBpfLoader;
     use harw_dod_bpf::{BpfError, BpfProgramSource};
     use harw_dod_cap::{Capability, SensorError};
     use harw_dod_signals::{EventKind, Sensor};
-    use harw_authority::{EgressTarget, NetworkScope};
     use harw_types::SensorId;
     use jiff::Timestamp;
 
     use super::{
-        bpf_error_to_sensor_error, build_flow_sensor, build_procmon_sensor, flow_error_to_sensor_error,
-        FlowSensor,
+        FlowSensor, bpf_error_to_sensor_error, build_flow_sensor, build_procmon_sensor,
+        flow_error_to_sensor_error,
     };
     use crate::error::ProbeError;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn placeholder_source() -> BpfProgramSource {
         BpfProgramSource::Embedded(Cow::Borrowed(&[]))
     }
 
     #[test]
-    fn test_build_procmon_sensor_with_capable_fixture_loader_succeeds() {
+    fn test_build_procmon_sensor_with_capable_fixture_loader_succeeds() -> TestResult {
         let loader = FixtureBpfLoader::new(Vec::new());
         let sensor = build_procmon_sensor(
             Box::new(loader),
             SensorId::from_str("probe-bpf-procmon-0"),
             placeholder_source(),
         )
-        .expect("fixture loader with capability always succeeds");
+        .map_err(ctx("fixture loader with capability always succeeds"))?;
         assert_eq!(sensor.handle().capability(), Capability::LoadBpfProgram);
+        Ok(())
     }
 
     #[test]
-    fn test_build_procmon_sensor_without_capability_maps_to_bpf_load() {
+    fn test_build_procmon_sensor_without_capability_maps_to_bpf_load() -> TestResult {
         let loader = FixtureBpfLoader::without_capability();
-        let err = build_procmon_sensor(
+        let Err(err) = build_procmon_sensor(
             Box::new(loader),
             SensorId::from_str("probe-bpf-procmon-0"),
             placeholder_source(),
-        )
-        .expect_err("a loader without the bpf capability must fail to load");
+        ) else {
+            return Err(TestError::Unexpected(
+                "a loader without the bpf capability must fail to load".into(),
+            ));
+        };
         assert!(matches!(
             err,
             ProbeError::BpfLoad(BpfError::CapabilityUnavailable)
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_build_flow_sensor_with_capable_fixture_loader_succeeds() {
+    fn test_build_flow_sensor_with_capable_fixture_loader_succeeds() -> TestResult {
         let loader = FixtureBpfLoader::new(Vec::new());
         let sensor = build_flow_sensor(
             Box::new(loader),
@@ -498,24 +506,29 @@ mod tests {
             placeholder_source(),
             NetworkScope::empty(),
         )
-        .expect("fixture loader with capability always succeeds");
+        .map_err(ctx("fixture loader with capability always succeeds"))?;
         assert_eq!(sensor.handle().capability(), Capability::LoadBpfProgram);
+        Ok(())
     }
 
     #[test]
-    fn test_build_flow_sensor_without_capability_maps_to_bpf_load() {
+    fn test_build_flow_sensor_without_capability_maps_to_bpf_load() -> TestResult {
         let loader = FixtureBpfLoader::without_capability();
-        let err = build_flow_sensor(
+        let Err(err) = build_flow_sensor(
             Box::new(loader),
             SensorId::from_str("probe-bpf-flow-0"),
             placeholder_source(),
             NetworkScope::empty(),
-        )
-        .expect_err("a loader without the bpf capability must fail to load");
+        ) else {
+            return Err(TestError::Unexpected(
+                "a loader without the bpf capability must fail to load".into(),
+            ));
+        };
         assert!(matches!(
             err,
             ProbeError::BpfLoad(BpfError::CapabilityUnavailable)
         ));
+        Ok(())
     }
 
     /// Baut einen wohlgeformten, 32 Byte breiten Flow-Payload — dasselbe
@@ -532,44 +545,53 @@ mod tests {
         bytes
     }
 
-    fn flow_raw_event(payload: Vec<u8>) -> RawBpfEvent {
-        RawBpfEvent {
+    fn flow_raw_event(payload: Vec<u8>) -> TestResult<RawBpfEvent> {
+        Ok(RawBpfEvent {
             pid: 100,
             comm: "curl".to_owned(),
-            observed_at: Timestamp::new(1_700_000_000, 0).expect("valid timestamp"),
+            observed_at: Timestamp::new(1_700_000_000, 0).map_err(ctx("valid timestamp"))?,
             payload,
-        }
+        })
     }
 
     #[test]
-    fn test_flow_sensor_poll_reports_a_connection_outside_the_allowed_scope() {
+    fn test_flow_sensor_poll_reports_a_connection_outside_the_allowed_scope() -> TestResult {
         let loader = FixtureBpfLoader::new(vec![flow_raw_event(well_formed_flow_payload(
             443,
             [203, 0, 113, 9],
-        ))]);
+        ))?]);
         let sensor = build_flow_sensor(
             Box::new(loader),
             SensorId::from_str("probe-bpf-flow-0"),
             placeholder_source(),
             NetworkScope::empty(),
         )
-        .expect("fixture loader with capability always succeeds");
+        .map_err(ctx("fixture loader with capability always succeeds"))?;
 
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("fixture-backed sensor never fails");
+            .map_err(ctx("fixture-backed sensor never fails"))?;
         assert_eq!(reading.events.len(), 1);
-        assert_eq!(reading.events[0].sensor, SensorId::from_str("probe-bpf-flow-0"));
-        assert!(matches!(reading.events[0].kind, EventKind::EgressFlow { .. }));
+        assert_eq!(
+            reading.events[0].sensor,
+            SensorId::from_str("probe-bpf-flow-0")
+        );
+        assert!(matches!(
+            reading.events[0].kind,
+            EventKind::EgressFlow { .. }
+        ));
+        Ok(())
     }
 
     #[test]
-    fn test_flow_sensor_poll_does_not_report_a_connection_inside_the_allowed_scope() {
+    fn test_flow_sensor_poll_does_not_report_a_connection_inside_the_allowed_scope() -> TestResult {
         let loader = FixtureBpfLoader::new(vec![flow_raw_event(well_formed_flow_payload(
             443,
             [10, 0, 0, 5],
-        ))]);
-        let cidr: ipnet::IpNet = "10.0.0.0/24".parse().expect("valid test CIDR literal");
+        ))?]);
+        let cidr: ipnet::IpNet = "10.0.0.0/24"
+            .parse()
+            .map_err(ctx("valid test CIDR literal"))?;
         let scope = NetworkScope::from_targets([EgressTarget::Cidr(cidr)]);
         let sensor = build_flow_sensor(
             Box::new(loader),
@@ -577,56 +599,65 @@ mod tests {
             placeholder_source(),
             scope,
         )
-        .expect("fixture loader with capability always succeeds");
+        .map_err(ctx("fixture loader with capability always succeeds"))?;
 
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("fixture-backed sensor never fails");
+            .map_err(ctx("fixture-backed sensor never fails"))?;
         assert!(reading.events.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_flow_sensor_poll_maps_malformed_payload_to_malformed_source() {
-        let loader = FixtureBpfLoader::new(vec![flow_raw_event(vec![1, 2, 3])]);
+    fn test_flow_sensor_poll_maps_malformed_payload_to_malformed_source() -> TestResult {
+        let loader = FixtureBpfLoader::new(vec![flow_raw_event(vec![1, 2, 3])?]);
         let sensor = build_flow_sensor(
             Box::new(loader),
             SensorId::from_str("probe-bpf-flow-0"),
             placeholder_source(),
             NetworkScope::empty(),
         )
-        .expect("fixture loader with capability always succeeds");
+        .map_err(ctx("fixture loader with capability always succeeds"))?;
 
-        let err = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect_err("a too-short flow payload must fail");
+        let Err(err) = sensor.poll(Timestamp::UNIX_EPOCH) else {
+            return Err(TestError::Unexpected(
+                "a too-short flow payload must fail".into(),
+            ));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
+        Ok(())
     }
 
     #[test]
-    fn test_flow_sensor_poll_two_independently_built_sensors_yield_identical_readings() {
-        let make_loader =
-            || FixtureBpfLoader::new(vec![flow_raw_event(well_formed_flow_payload(443, [203, 0, 113, 9]))]);
+    fn test_flow_sensor_poll_two_independently_built_sensors_yield_identical_readings() -> TestResult
+    {
+        let make_loader = || -> TestResult<FixtureBpfLoader> {
+            Ok(FixtureBpfLoader::new(vec![flow_raw_event(
+                well_formed_flow_payload(443, [203, 0, 113, 9]),
+            )?]))
+        };
 
         let first = build_flow_sensor(
-            Box::new(make_loader()),
+            Box::new(make_loader()?),
             SensorId::from_str("probe-bpf-flow-0"),
             placeholder_source(),
             NetworkScope::empty(),
         )
-        .expect("fixture loader with capability always succeeds")
+        .map_err(ctx("fixture loader with capability always succeeds"))?
         .poll(Timestamp::UNIX_EPOCH)
-        .expect("first poll");
+        .map_err(ctx("first poll"))?;
         let second = build_flow_sensor(
-            Box::new(make_loader()),
+            Box::new(make_loader()?),
             SensorId::from_str("probe-bpf-flow-0"),
             placeholder_source(),
             NetworkScope::empty(),
         )
-        .expect("fixture loader with capability always succeeds")
+        .map_err(ctx("fixture loader with capability always succeeds"))?
         .poll(Timestamp::UNIX_EPOCH)
-        .expect("second poll, independent sensor instance");
+        .map_err(ctx("second poll, independent sensor instance"))?;
 
         assert_eq!(first, second);
+        Ok(())
     }
 
     #[test]
@@ -648,7 +679,10 @@ mod tests {
     #[test]
     fn test_bpf_error_to_sensor_error_maps_io_to_io() {
         let source = std::io::Error::other("boom");
-        assert!(matches!(bpf_error_to_sensor_error(BpfError::Io(source)), SensorError::Io(_)));
+        assert!(matches!(
+            bpf_error_to_sensor_error(BpfError::Io(source)),
+            SensorError::Io(_)
+        ));
     }
 
     #[test]
@@ -660,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn test_flow_sensor_debug_format_does_not_panic() {
+    fn test_flow_sensor_debug_format_does_not_panic() -> TestResult {
         let loader = FixtureBpfLoader::new(Vec::new());
         let sensor: FlowSensor = build_flow_sensor(
             Box::new(loader),
@@ -668,34 +702,45 @@ mod tests {
             placeholder_source(),
             NetworkScope::empty(),
         )
-        .expect("fixture loader with capability always succeeds");
+        .map_err(ctx("fixture loader with capability always succeeds"))?;
         let debug = format!("{sensor:?}");
         assert!(debug.contains("FlowSensor"));
+        Ok(())
     }
 
     /// Belegt, dass eine egress-Meldung tatsächlich eine sinnvolle Adresse
     /// trägt — nicht nur, dass irgendein Ereignis ankommt.
     #[test]
-    fn test_flow_sensor_reported_destination_matches_the_observed_address() {
+    fn test_flow_sensor_reported_destination_matches_the_observed_address() -> TestResult {
         let loader = FixtureBpfLoader::new(vec![flow_raw_event(well_formed_flow_payload(
             443,
             [203, 0, 113, 9],
-        ))]);
+        ))?]);
         let sensor = build_flow_sensor(
             Box::new(loader),
             SensorId::from_str("probe-bpf-flow-0"),
             placeholder_source(),
             NetworkScope::empty(),
         )
-        .expect("fixture loader with capability always succeeds");
+        .map_err(ctx("fixture loader with capability always succeeds"))?;
 
-        let reading = sensor.poll(Timestamp::UNIX_EPOCH).expect("fixture-backed sensor never fails");
+        let reading = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .map_err(ctx("fixture-backed sensor never fails"))?;
         match &reading.events[0].kind {
             EventKind::EgressFlow { destination, port } => {
-                assert_eq!(destination, &IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)).to_string());
+                assert_eq!(
+                    destination,
+                    &IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)).to_string()
+                );
                 assert_eq!(*port, 443);
             }
-            other => panic!("expected EventKind::EgressFlow, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected EventKind::EgressFlow, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 }

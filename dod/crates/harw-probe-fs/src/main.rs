@@ -109,9 +109,11 @@ mod source;
 #[cfg(test)]
 mod push_only_guard;
 
+use std::path::Path;
 use std::process::ExitCode;
 
 use clap::Parser as _;
+use harw_completions::CompletionsSubcommand;
 use harw_dod_cap::{Capability, ReadScope, SensorHandle};
 use harw_dod_fsmon::FsMonSensor;
 use harw_types::SensorId;
@@ -134,6 +136,8 @@ use error::ProbeError;
 /// fehlte (siehe [`source`]-Moduldoku für deren aktuellen Stand).
 /// `ExitCode::FAILURE` bei jedem Fehlerpfad — Kommandozeile,
 /// Landlock-Schranke, fehlender Sentinel, nicht verfügbare fanotify-Quelle.
+/// Der `completions`-Unterbefehl endet mit `ExitCode::SUCCESS` bzw.
+/// `ExitCode::FAILURE`, bevor Socket, Landlock oder Sensoren angefasst werden.
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -152,7 +156,31 @@ fn main() -> ExitCode {
 
     init_tracing(cli.log);
 
-    match run(cli) {
+    // `completions` läuft vor jedem Socket-, Landlock- oder fanotify-Schritt.
+    if let Some(CompletionsSubcommand::Completions(args)) = cli.command.as_ref() {
+        return match run_completions(args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                tracing::error!(error = %err, "harw-probe-fs completions failed");
+                eprintln!("harw-probe-fs: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // `clap` erzwingt `--sentinel-socket` ohne Unterbefehl bereits
+    // (`required = true`); diese Prüfung ist nur die defensive Entpackung
+    // des `Option` (siehe `cli`-Moduldoku).
+    let Some(sentinel_socket) = cli.sentinel_socket.clone() else {
+        let err = <Cli as clap::CommandFactory>::command().error(
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "the following required argument was not provided: --sentinel-socket <PATH>",
+        );
+        eprint!("{err}");
+        return ExitCode::FAILURE;
+    };
+
+    match run(cli, &sentinel_socket) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             tracing::error!(error = %err, "harw-probe-fs exiting");
@@ -189,6 +217,31 @@ fn init_tracing(level: LogLevel) {
         .init();
 }
 
+/// Führt den `completions`-Unterbefehl aus.
+///
+/// # Description
+/// Schreibt das Completion-Skript nach stdout oder installiert bzw. entfernt
+/// es (siehe `harw_completions::run_completions`). Berührt weder Socket
+/// noch Landlock noch fanotify.
+///
+/// # Arguments
+/// - `args` (`&harw_completions::CompletionsArgs`): die geparsten
+///   Unterbefehls-Argumente.
+///
+/// # Errors
+/// [`error::ProbeError::Completions`], wenn Erzeugung, Installation oder das
+/// Schreiben nach stdout scheitert.
+fn run_completions(args: &harw_completions::CompletionsArgs) -> Result<(), ProbeError> {
+    harw_completions::run_completions(
+        &mut <Cli as clap::CommandFactory>::command(),
+        "harw-probe-fs",
+        args,
+        &harw_completions::HomeEnv::from_process(),
+        &mut std::io::stdout().lock(),
+    )?;
+    Ok(())
+}
+
 /// Führt den eigentlichen Sondenbetrieb aus.
 ///
 /// # Description
@@ -203,6 +256,7 @@ fn init_tracing(level: LogLevel) {
 ///
 /// # Arguments
 /// - `cli` (`cli::Cli`): die geparste Kommandozeile.
+/// - `sentinel_socket` (`&Path`): der bereits entpackte `--sentinel-socket`.
 ///
 /// # Errors
 /// [`error::ProbeError::SentinelConnectFailed`] wenn der Sentinel nicht
@@ -212,11 +266,11 @@ fn init_tracing(level: LogLevel) {
 /// fanotify-Gruppe nicht initialisieren lässt oder keine Wurzel des
 /// `ReadScope` markiert werden konnte (siehe [`source`]-Moduldoku) — z. B.
 /// wenn der Prozess nicht mit `CAP_SYS_ADMIN` läuft.
-fn run(cli: Cli) -> Result<(), ProbeError> {
+fn run(cli: Cli, sentinel_socket: &Path) -> Result<(), ProbeError> {
     let scope = ReadScope::from_roots(cli.scope_roots.iter().cloned());
 
-    let sink = sink::build_sentinel_sink(&cli.sentinel_socket)?;
-    tracing::info!(path = %cli.sentinel_socket.display(), "connected to sentinel");
+    let sink = sink::build_sentinel_sink(sentinel_socket)?;
+    tracing::info!(path = %sentinel_socket.display(), "connected to sentinel");
 
     landlock::enforce_read_scope(&scope)?;
 
@@ -243,3 +297,7 @@ mod tests {
     // echten Socket öffnet, ein echtes Landlock bindet oder eine echte
     // fanotify-Gruppe öffnet.
 }
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

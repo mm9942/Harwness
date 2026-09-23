@@ -123,8 +123,15 @@ mod tests {
 
     #[test]
     fn test_preselected_variant_for_mode_chat_plan_explore_prefer_single_execution() {
-        for mode in [InteractionMode::Chat, InteractionMode::Plan, InteractionMode::Explore] {
-            assert_eq!(preselected_variant_for_mode(mode), HostPermitVariant::SingleExecution);
+        for mode in [
+            InteractionMode::Chat,
+            InteractionMode::Plan,
+            InteractionMode::Explore,
+        ] {
+            assert_eq!(
+                preselected_variant_for_mode(mode),
+                HostPermitVariant::SingleExecution
+            );
         }
     }
 

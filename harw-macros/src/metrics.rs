@@ -267,14 +267,13 @@ impl Parse for MetricEntry {
 
         input.parse::<Token![;]>()?;
 
-        let unit =
-            unit.ok_or_else(|| syn::Error::new_spanned(&ident, "fehlendes `unit = ...`"))?;
+        let unit = unit.ok_or_else(|| syn::Error::new_spanned(&ident, "fehlendes `unit = ...`"))?;
         let labels =
             labels.ok_or_else(|| syn::Error::new_spanned(&ident, "fehlendes `labels = [...]`"))?;
         let cardinality = cardinality
             .ok_or_else(|| syn::Error::new_spanned(&ident, "fehlendes `cardinality = ...`"))?;
-        let name = name
-            .ok_or_else(|| syn::Error::new_spanned(&ident, "fehlendes `name = \"...\"`"))?;
+        let name =
+            name.ok_or_else(|| syn::Error::new_spanned(&ident, "fehlendes `name = \"...\"`"))?;
 
         Ok(MetricEntry {
             docs,
@@ -415,96 +414,140 @@ pub(crate) fn expand_metrics(input: TokenStream) -> syn::Result<TokenStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn validate_metric_name_rejects_empty() {
-        let err = validate_metric_name("", ParsedKind::Gauge, ParsedUnit::Count)
-            .expect_err("empty name must be rejected");
+    fn validate_metric_name_rejects_empty() -> TestResult {
+        let Err(err) = validate_metric_name("", ParsedKind::Gauge, ParsedUnit::Count) else {
+            return Err(TestError::Unexpected(
+                "empty name must be rejected".to_owned(),
+            ));
+        };
         assert!(err.contains("darf nicht leer sein"));
+        Ok(())
     }
 
     #[test]
-    fn validate_metric_name_rejects_uppercase() {
-        let err = validate_metric_name("Harw_Cost", ParsedKind::Gauge, ParsedUnit::Count)
-            .expect_err("uppercase must be rejected");
+    fn validate_metric_name_rejects_uppercase() -> TestResult {
+        let Err(err) = validate_metric_name("Harw_Cost", ParsedKind::Gauge, ParsedUnit::Count)
+        else {
+            return Err(TestError::Unexpected(
+                "uppercase must be rejected".to_owned(),
+            ));
+        };
         assert!(err.contains("ungültiges Zeichen"));
+        Ok(())
     }
 
     #[test]
-    fn validate_metric_name_rejects_counter_without_total_suffix() {
-        let err =
-            validate_metric_name("harw_child_admitted", ParsedKind::Counter, ParsedUnit::Count)
-                .expect_err("counter without _total must be rejected");
+    fn validate_metric_name_rejects_counter_without_total_suffix() -> TestResult {
+        let Err(err) = validate_metric_name(
+            "harw_child_admitted",
+            ParsedKind::Counter,
+            ParsedUnit::Count,
+        ) else {
+            return Err(TestError::Unexpected(
+                "counter without _total must be rejected".to_owned(),
+            ));
+        };
         assert!(err.contains("_total"));
+        Ok(())
     }
 
     #[test]
     fn validate_metric_name_accepts_counter_with_total_suffix() {
-        assert!(validate_metric_name(
-            "harw_child_admitted_total",
-            ParsedKind::Counter,
-            ParsedUnit::Count
-        )
-        .is_ok());
+        assert!(
+            validate_metric_name(
+                "harw_child_admitted_total",
+                ParsedKind::Counter,
+                ParsedUnit::Count
+            )
+            .is_ok()
+        );
     }
 
     #[test]
-    fn validate_metric_name_rejects_missing_unit_substring() {
-        let err =
-            validate_metric_name("harw_data_read_total", ParsedKind::Counter, ParsedUnit::Bytes)
-                .expect_err("missing _bytes must be rejected");
+    fn validate_metric_name_rejects_missing_unit_substring() -> TestResult {
+        let Err(err) = validate_metric_name(
+            "harw_data_read_total",
+            ParsedKind::Counter,
+            ParsedUnit::Bytes,
+        ) else {
+            return Err(TestError::Unexpected(
+                "missing _bytes must be rejected".to_owned(),
+            ));
+        };
         assert!(err.contains("_bytes"));
+        Ok(())
     }
 
     #[test]
     fn validate_metric_name_accepts_unit_substring_anywhere() {
-        assert!(validate_metric_name(
-            "harw_bytes_read_total",
-            ParsedKind::Counter,
-            ParsedUnit::Bytes
-        )
-        .is_ok());
+        assert!(
+            validate_metric_name(
+                "harw_bytes_read_total",
+                ParsedKind::Counter,
+                ParsedUnit::Bytes
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn validate_metric_name_count_and_ratio_need_no_suffix() {
         assert!(
-            validate_metric_name("harw_context_cost", ParsedKind::Gauge, ParsedUnit::Count)
-                .is_ok()
+            validate_metric_name("harw_context_cost", ParsedKind::Gauge, ParsedUnit::Count).is_ok()
         );
-        assert!(validate_metric_name("harw_hit_rate", ParsedKind::Gauge, ParsedUnit::Ratio).is_ok());
+        assert!(
+            validate_metric_name("harw_hit_rate", ParsedKind::Gauge, ParsedUnit::Ratio).is_ok()
+        );
     }
 
     #[test]
-    fn expand_metrics_rejects_duplicate_const_name() {
+    fn expand_metrics_rejects_duplicate_const_name() -> TestResult {
         let input: TokenStream = quote! {
             A: counter, unit = count, labels = [], cardinality = single, name = "harw_a_total";
             A: gauge, unit = count, labels = [], cardinality = single, name = "harw_b";
         };
-        let err = expand_metrics(input).expect_err("duplicate const name must be rejected");
+        let Err(err) = expand_metrics(input) else {
+            return Err(TestError::Unexpected(
+                "duplicate const name must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("bereits doppelt vergeben"));
+        Ok(())
     }
 
     #[test]
-    fn expand_metrics_rejects_invalid_label() {
+    fn expand_metrics_rejects_invalid_label() -> TestResult {
         let input: TokenStream = quote! {
             A: counter, unit = count, labels = ["Clan"], cardinality = single, name = "harw_a_total";
         };
-        let err = expand_metrics(input).expect_err("invalid label must be rejected");
+        let Err(err) = expand_metrics(input) else {
+            return Err(TestError::Unexpected(
+                "invalid label must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("ungültiges Zeichen"));
+        Ok(())
     }
 
     #[test]
-    fn expand_metrics_rejects_unknown_key() {
+    fn expand_metrics_rejects_unknown_key() -> TestResult {
         let input: TokenStream = quote! {
             A: counter, bogus = count, labels = [], cardinality = single, name = "harw_a_total";
         };
-        let err = expand_metrics(input).expect_err("unknown key must be rejected");
+        let Err(err) = expand_metrics(input) else {
+            return Err(TestError::Unexpected(
+                "unknown key must be rejected".to_owned(),
+            ));
+        };
         assert!(err.to_string().contains("unbekannter Schlüssel"));
+        Ok(())
     }
 
     #[test]
-    fn expand_metrics_accepts_valid_declaration() {
+    fn expand_metrics_accepts_valid_declaration() -> TestResult {
         let input: TokenStream = quote! {
             /// Wie viele Kinder aufgenommen wurden.
             CHILD_ADMITTED: counter, unit = count, labels = ["clan", "role"], cardinality = bounded(64),
@@ -514,7 +557,7 @@ mod tests {
                 name = "harw_context_cost_tokens";
         };
         let tokens = expand_metrics(input)
-            .expect("valid declaration must expand")
+            .map_err(ctx("valid declaration must expand"))?
             .to_string();
 
         assert!(tokens.contains("pub const CHILD_ADMITTED"));
@@ -528,5 +571,6 @@ mod tests {
         assert!(tokens.contains("pub static ALL"));
         assert!(tokens.contains("& CHILD_ADMITTED"));
         assert!(tokens.contains("& CONTEXT_COST"));
+        Ok(())
     }
 }

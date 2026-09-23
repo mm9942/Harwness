@@ -91,13 +91,14 @@ pub struct AgentArgs {
     pub value: Option<String>,
 }
 
-/// Verweigert Child-Agent-Management, solange die Boundary nicht verfügbar ist.
+/// Verwaltet ausschließlich die vom aufrufenden Parent besessenen Kinder.
 ///
 /// # Beschreibung
-/// `ManagedAgentSpawner` ist noch nicht in [`OpContext`] komponiert. Daher
-/// werden alle erfolgreich geparsten Aufrufe fail-closed mit einem statischen
-/// [`OpError::NotAvailable`] beendet; [`AgentArgs::action`],
-/// [`AgentArgs::target`] und [`AgentArgs::value`] werden nicht ausgewertet.
+/// Der von der Runtime installierte [`harw_core::ManagedAgentSpawner`] ist die
+/// einzige Lifecycle-Grenze. `list` zeigt ausschließlich direkte Kinder der
+/// aktuellen Sitzung; `stop` akzeptiert einen Knoten aus deren Teilbaum und
+/// lässt die rekursive Abbruchwirkung beim Controller. Fehlt der Dienst,
+/// bleibt die Operation fail-closed mit [`OpError::NotAvailable`].
 ///
 /// **Command only**: Das Modell darf diese Operation nicht selbst aufrufen, da
 /// sich das Modell nicht selbst manipulieren darf. Kein `model_tool`-Attribut.
@@ -108,8 +109,9 @@ pub struct AgentArgs {
 ///   `target` und `value` werden bis zur Boundary-Integration nicht ausgewertet.
 ///
 /// # Rückgabe
-/// Immer [`OpError::NotAvailable`], solange die Child-Agent-Management-Boundary
-/// nicht in [`OpContext`] verfügbar ist.
+/// Eine textuelle Liste, eine Abbruchbestätigung oder eine präzise
+/// [`OpError`]-Antwort für fehlende Dienste, ungültige Argumente und Ziele
+/// außerhalb des besessenen Teilbaums.
 ///
 /// # Fehler
 /// Gibt [`OpError::InvalidArguments`] zurück, wenn `json_args` nicht in
@@ -118,10 +120,6 @@ pub struct AgentArgs {
 ///
 /// # Nebenläufigkeit
 /// Zustandslos; keine Locks, keine Threads, kein geteilter Zustand.
-///
-/// # Ausstehend
-/// Ein echter Body darf erst mit einer expliziten `ManagedAgentSpawner`-
-/// Boundary in [`OpContext`] ergänzt werden.
 ///
 /// # Beispiel
 /// ```rust,no_run
@@ -132,7 +130,7 @@ pub struct AgentArgs {
     summary = "Child-Agent-Management: list/stop gegen den registrierten ManagedAgentSpawner.",
     domain = "agents",
     permission = "operator",
-    command(path = "/agent", visibility = "channel_parity")
+    command(path = "/agent", visibility = "channel_parity", busy = "immediate")
 )]
 async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
     let Some(spawner) = ctx.service::<std::sync::Arc<harw_core::ManagedAgentSpawner>>() else {
@@ -143,7 +141,7 @@ async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
 
     match args.action.as_deref().unwrap_or("list") {
         "list" => {
-            let children = spawner.list_children_for(ctx.session_id());
+            let children = spawner.list_descendants_for(ctx.session_id());
             if children.is_empty() {
                 return Ok(OpOutput::from("Keine aktiven Child-Agents.".to_owned()));
             }
@@ -154,8 +152,10 @@ async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
                     record.child, record.role, record.depth, record.lease_expires_at
                 ));
             }
-            Ok(OpOutput::from(lines.join("
-")))
+            Ok(OpOutput::from(lines.join(
+                "
+",
+            )))
         }
         "stop" => {
             let Some(target) = args.target.as_deref() else {
@@ -164,6 +164,11 @@ async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
                 ));
             };
             let child_id = harw_types::SessionId::from_str(target.to_owned());
+            if !spawner.owns_descendant(ctx.session_id(), &child_id) {
+                return Err(OpError::NotAvailable(
+                    "agent target is unavailable in this parent session".to_owned(),
+                ));
+            }
             if spawner.request_cancellation(&child_id) {
                 Ok(OpOutput::from(format!(
                     "Cancellation für Child-Agent {target} angefordert."
@@ -186,18 +191,19 @@ async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
 #[cfg(test)]
 mod tests {
     use super::AgentArgs;
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
-    use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
     use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn test_context() -> (OpContext, std::path::PathBuf) {
+    fn test_context() -> TestResult<(OpContext, std::path::PathBuf)> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root =
             std::env::temp_dir().join(format!("harw-agent-test-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(root.join("ws")).expect("create test workspace");
+        std::fs::create_dir_all(root.join("ws")).map_err(ctx("create test workspace"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -206,22 +212,22 @@ mod tests {
                 root: std::path::PathBuf::from("ws"),
             }],
         )
-        .expect("build workspace registry");
+        .map_err(ctx("build workspace registry"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .expect("resolve workspace binding");
+            .map_err(ctx("resolve workspace binding"))?;
         let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
-        (
+        Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new()),
             root,
-        )
+        ))
     }
 
     #[test]
-    fn test_agent_args_from_raw_args_sets_action() {
+    fn test_agent_args_from_raw_args_sets_action() -> TestResult {
         let args = AgentArgs::from_raw_args(&toks(&["list"]));
         match args {
             Ok(a) => {
@@ -229,12 +235,13 @@ mod tests {
                 assert!(a.target.is_none());
                 assert!(a.value.is_none());
             }
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
+            Err(e) => return Err(TestError::Unexpected(format!("Unerwarteter Fehler: {e}"))),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_agent_args_from_raw_args_stop_preserves_target() {
+    fn test_agent_args_from_raw_args_stop_preserves_target() -> TestResult {
         let args = AgentArgs::from_raw_args(&toks(&["stop", "abc-42"]));
         match args {
             Ok(a) => {
@@ -242,12 +249,13 @@ mod tests {
                 assert_eq!(a.target.as_deref(), Some("abc-42"));
                 assert!(a.value.is_none());
             }
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
+            Err(e) => return Err(TestError::Unexpected(format!("Unerwarteter Fehler: {e}"))),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_agent_args_from_raw_args_budget_preserves_target_and_value() {
+    fn test_agent_args_from_raw_args_budget_preserves_target_and_value() -> TestResult {
         let args = AgentArgs::from_raw_args(&toks(&["budget", "abc-42", "8k"]));
         match args {
             Ok(a) => {
@@ -255,12 +263,13 @@ mod tests {
                 assert_eq!(a.target.as_deref(), Some("abc-42"));
                 assert_eq!(a.value.as_deref(), Some("8k"));
             }
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
+            Err(e) => return Err(TestError::Unexpected(format!("Unerwarteter Fehler: {e}"))),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_agent_args_from_raw_args_empty_tokens_sets_action_none() {
+    fn test_agent_args_from_raw_args_empty_tokens_sets_action_none() -> TestResult {
         let args = AgentArgs::from_raw_args(&toks(&[]));
         match args {
             Ok(a) => {
@@ -268,13 +277,14 @@ mod tests {
                 assert!(a.target.is_none());
                 assert!(a.value.is_none());
             }
-            Err(e) => panic!("Unerwarteter Fehler: {e}"),
+            Err(e) => return Err(TestError::Unexpected(format!("Unerwarteter Fehler: {e}"))),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn agent_default_and_list_return_not_available() {
-        let (ctx, root) = test_context();
+    async fn agent_default_and_list_return_not_available() -> TestResult {
+        let (ctx, root) = test_context()?;
         let expected = "child-agent management is not available";
         assert!(matches!(
             super::agent(&ctx, AgentArgs::default()).await,
@@ -292,12 +302,13 @@ mod tests {
             .await,
             Err(OpError::NotAvailable(message)) if message == expected
         ));
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn agent_budget_does_not_leak_target_or_value() {
-        let (ctx, root) = test_context();
+    async fn agent_budget_does_not_leak_target_or_value() -> TestResult {
+        let (ctx, root) = test_context()?;
         let action = "budget";
         let target = "sensitive-agent-id";
         let value = "secret-budget";
@@ -310,7 +321,7 @@ mod tests {
             },
         )
         .await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         match result {
             Err(OpError::NotAvailable(message)) => {
@@ -319,20 +330,28 @@ mod tests {
                 assert!(!message.contains(target));
                 assert!(!message.contains(value));
             }
-            other => panic!("expected NotAvailable, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn agent_list_with_spawner_service_reports_no_active_children() {
+    async fn agent_list_with_spawner_service_reports_no_active_children() -> TestResult {
         use harw_core::{ChildLimits, ManagedAgentSpawner, SessionManager};
         use harw_operations::context::ServiceMap;
         use std::sync::{Arc, Mutex};
 
-        let (ctx, root) = test_context();
+        let (ctx, root) = test_context()?;
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(event_tx)));
-        let spawner = Arc::new(ManagedAgentSpawner::new(manager, ChildLimits::conservative()));
+        let spawner = Arc::new(ManagedAgentSpawner::new(
+            manager,
+            ChildLimits::conservative(),
+        ));
 
         let mut services = ServiceMap::new();
         services.insert(spawner);
@@ -344,24 +363,32 @@ mod tests {
         );
 
         let result = super::agent(&ctx, AgentArgs::default()).await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         match result {
             Ok(output) => assert!(output.text.contains("Keine aktive")),
-            other => panic!("expected Ok empty listing, got: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Ok empty listing, got: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn agent_stop_with_spawner_service_and_unknown_target_is_invalid_argument() {
+    async fn agent_stop_with_spawner_service_and_unknown_target_is_not_available() -> TestResult {
         use harw_core::{ChildLimits, ManagedAgentSpawner, SessionManager};
         use harw_operations::context::ServiceMap;
         use std::sync::{Arc, Mutex};
 
-        let (ctx, root) = test_context();
+        let (ctx, root) = test_context()?;
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(event_tx)));
-        let spawner = Arc::new(ManagedAgentSpawner::new(manager, ChildLimits::conservative()));
+        let spawner = Arc::new(ManagedAgentSpawner::new(
+            manager,
+            ChildLimits::conservative(),
+        ));
 
         let mut services = ServiceMap::new();
         services.insert(spawner);
@@ -381,9 +408,9 @@ mod tests {
             },
         )
         .await;
-        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
-        assert!(matches!(result, Err(OpError::InvalidArguments(_))));
+        assert!(matches!(result, Err(OpError::NotAvailable(_))));
+        Ok(())
     }
 }
-

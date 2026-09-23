@@ -692,6 +692,7 @@ pub fn profile_for(model: &str) -> ModelRuntimeProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Test 1: Unbekannte Modell-ID liefert DEFAULT_PROFILE.
     #[test]
@@ -759,37 +760,39 @@ mod tests {
 
     /// Test 4: ContextPolicy::BroadContext serialisiert als "broad_context".
     #[test]
-    fn test_enum_serde_snake_case() {
-        let json = serde_json::to_string(&ContextPolicy::BroadContext).unwrap();
+    fn test_enum_serde_snake_case() -> TestResult {
+        let json = serde_json::to_string(&ContextPolicy::BroadContext)?;
         assert_eq!(json, "\"broad_context\"");
 
-        let json = serde_json::to_string(&CompactionPolicy::OnPressure).unwrap();
+        let json = serde_json::to_string(&CompactionPolicy::OnPressure)?;
         assert_eq!(json, "\"on_pressure\"");
 
-        let json = serde_json::to_string(&DelegationPolicy::Forbidden).unwrap();
+        let json = serde_json::to_string(&DelegationPolicy::Forbidden)?;
         assert_eq!(json, "\"forbidden\"");
 
-        let json = serde_json::to_string(&TaskShape::RepositoryScale).unwrap();
+        let json = serde_json::to_string(&TaskShape::RepositoryScale)?;
         assert_eq!(json, "\"repository_scale\"");
+        Ok(())
     }
 
     /// Test 5: Serde JSON Roundtrip für ModelRuntimeProfile.
     #[test]
-    fn test_profile_roundtrip() {
+    fn test_profile_roundtrip() -> TestResult {
         let original = profile_for("claude-opus-4-8");
-        let json = serde_json::to_string(&original).unwrap();
-        let restored: ModelRuntimeProfile = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&original)?;
+        let restored: ModelRuntimeProfile = serde_json::from_str(&json)?;
         assert_eq!(original, restored);
 
         // Auch DEFAULT_PROFILE roundtrip testen.
-        let json = serde_json::to_string(&DEFAULT_PROFILE).unwrap();
-        let restored: ModelRuntimeProfile = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&DEFAULT_PROFILE)?;
+        let restored: ModelRuntimeProfile = serde_json::from_str(&json)?;
         assert_eq!(DEFAULT_PROFILE, restored);
+        Ok(())
     }
 
     /// Test 6: Fallible constructors reject zero and excessive runtime limits.
     #[test]
-    fn test_fallible_construction_rejects_invalid_limits() {
+    fn test_fallible_construction_rejects_invalid_limits() -> TestResult {
         assert_eq!(
             RetryPolicy::try_new(0, 500, false),
             Err(RuntimeProfileValidationError::ZeroRetryLimit)
@@ -806,7 +809,9 @@ mod tests {
             Err(RuntimeProfileValidationError::ZeroRetryBackoff)
         );
 
-        let retry = RetryPolicy::try_new(1, 500, false).unwrap();
+        let retry = RetryPolicy::try_new(1, 500, false).map_err(ctx(
+            "RetryPolicy::try_new(1, 500, false) sollte gültig sein",
+        ))?;
         assert_eq!(
             ModelRuntimeProfile::try_new(
                 ContextPolicy::Balanced,
@@ -831,6 +836,7 @@ mod tests {
             ),
             Err(RuntimeProfileValidationError::ForbiddenDelegationAllowsChildren { actual: 1 })
         );
+        Ok(())
     }
 
     /// Test 7: Fallible constructors remain usable in stable const contexts.
@@ -881,69 +887,120 @@ mod tests {
 
     /// Test 8: Deserialisierung kann keine unvalidierten Runtime-Profile erzeugen.
     #[test]
-    fn test_deserialization_rejects_every_invalid_runtime_profile_field() {
-        let mut invalid = serde_json::to_value(DEFAULT_PROFILE).unwrap();
+    fn test_deserialization_rejects_every_invalid_runtime_profile_field() -> TestResult {
+        let mut invalid = serde_json::to_value(DEFAULT_PROFILE)?;
         invalid["retry_policy"]["max_retries"] = serde_json::json!(0);
-        let error = serde_json::from_value::<ModelRuntimeProfile>(invalid).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("max_retries must be greater than zero"));
+        let Err(error) = serde_json::from_value::<ModelRuntimeProfile>(invalid) else {
+            return Err(TestError::Unexpected("Err erwartet (max_retries=0)".into()));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("max_retries must be greater than zero")
+        );
 
-        let mut invalid = serde_json::to_value(DEFAULT_PROFILE).unwrap();
+        let mut invalid = serde_json::to_value(DEFAULT_PROFILE)?;
         invalid["retry_policy"]["max_retries"] = serde_json::json!(MAX_RETRIES + 1);
-        let error = serde_json::from_value::<ModelRuntimeProfile>(invalid).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("max_retries 11 exceeds maximum 10"));
+        let Err(error) = serde_json::from_value::<ModelRuntimeProfile>(invalid) else {
+            return Err(TestError::Unexpected(
+                "Err erwartet (max_retries > MAX_RETRIES)".into(),
+            ));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("max_retries 11 exceeds maximum 10")
+        );
 
-        let mut invalid = serde_json::to_value(DEFAULT_PROFILE).unwrap();
+        let mut invalid = serde_json::to_value(DEFAULT_PROFILE)?;
         invalid["retry_policy"]["backoff_ms"] = serde_json::json!(0);
-        let error = serde_json::from_value::<ModelRuntimeProfile>(invalid).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("backoff_ms must be greater than zero"));
+        let Err(error) = serde_json::from_value::<ModelRuntimeProfile>(invalid) else {
+            return Err(TestError::Unexpected("Err erwartet (backoff_ms=0)".into()));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("backoff_ms must be greater than zero")
+        );
 
-        let mut invalid = serde_json::to_value(DEFAULT_PROFILE).unwrap();
+        let mut invalid = serde_json::to_value(DEFAULT_PROFILE)?;
         invalid["retry_policy"]["backoff_ms"] = serde_json::json!(MAX_BACKOFF_MS + 1);
-        let error = serde_json::from_value::<ModelRuntimeProfile>(invalid).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("backoff_ms 60001 exceeds maximum 60000"));
+        let Err(error) = serde_json::from_value::<ModelRuntimeProfile>(invalid) else {
+            return Err(TestError::Unexpected(
+                "Err erwartet (backoff_ms > MAX_BACKOFF_MS)".into(),
+            ));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("backoff_ms 60001 exceeds maximum 60000")
+        );
 
-        let mut invalid = serde_json::to_value(DEFAULT_PROFILE).unwrap();
+        let mut invalid = serde_json::to_value(DEFAULT_PROFILE)?;
         invalid["max_parallel_tools"] = serde_json::json!(0);
-        let error = serde_json::from_value::<ModelRuntimeProfile>(invalid).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("max_parallel_tools must be greater than zero"));
+        let Err(error) = serde_json::from_value::<ModelRuntimeProfile>(invalid) else {
+            return Err(TestError::Unexpected(
+                "Err erwartet (max_parallel_tools=0)".into(),
+            ));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("max_parallel_tools must be greater than zero")
+        );
 
-        let mut invalid = serde_json::to_value(DEFAULT_PROFILE).unwrap();
+        let mut invalid = serde_json::to_value(DEFAULT_PROFILE)?;
         invalid["max_parallel_tools"] = serde_json::json!(MAX_PARALLEL_TOOLS + 1);
-        let error = serde_json::from_value::<ModelRuntimeProfile>(invalid).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("max_parallel_tools 17 exceeds maximum 16"));
+        let Err(error) = serde_json::from_value::<ModelRuntimeProfile>(invalid) else {
+            return Err(TestError::Unexpected(
+                "Err erwartet (max_parallel_tools > MAX_PARALLEL_TOOLS)".into(),
+            ));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("max_parallel_tools 17 exceeds maximum 16")
+        );
 
-        let mut invalid = serde_json::to_value(DEFAULT_PROFILE).unwrap();
+        let mut invalid = serde_json::to_value(DEFAULT_PROFILE)?;
         invalid["max_child_fanout"] = serde_json::json!(0);
-        let error = serde_json::from_value::<ModelRuntimeProfile>(invalid).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("delegation_policy Cautious requires max_child_fanout greater than zero"));
+        let Err(error) = serde_json::from_value::<ModelRuntimeProfile>(invalid) else {
+            return Err(TestError::Unexpected(
+                "Err erwartet (max_child_fanout=0)".into(),
+            ));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("delegation_policy Cautious requires max_child_fanout greater than zero")
+        );
 
-        let mut invalid = serde_json::to_value(DEFAULT_PROFILE).unwrap();
+        let mut invalid = serde_json::to_value(DEFAULT_PROFILE)?;
         invalid["max_child_fanout"] = serde_json::json!(MAX_CHILD_FANOUT + 1);
-        let error = serde_json::from_value::<ModelRuntimeProfile>(invalid).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("max_child_fanout 17 exceeds maximum 16"));
+        let Err(error) = serde_json::from_value::<ModelRuntimeProfile>(invalid) else {
+            return Err(TestError::Unexpected(
+                "Err erwartet (max_child_fanout > MAX_CHILD_FANOUT)".into(),
+            ));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("max_child_fanout 17 exceeds maximum 16")
+        );
 
-        let mut invalid = serde_json::to_value(DEFAULT_PROFILE).unwrap();
+        let mut invalid = serde_json::to_value(DEFAULT_PROFILE)?;
         invalid["delegation_policy"] = serde_json::json!("forbidden");
-        let error = serde_json::from_value::<ModelRuntimeProfile>(invalid).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("delegation_policy forbidden requires max_child_fanout 0, got 2"));
+        let Err(error) = serde_json::from_value::<ModelRuntimeProfile>(invalid) else {
+            return Err(TestError::Unexpected(
+                "Err erwartet (delegation_policy=forbidden, max_child_fanout=2)".into(),
+            ));
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("delegation_policy forbidden requires max_child_fanout 0, got 2")
+        );
+        Ok(())
     }
 
     /// Test 9: RetryPolicy-Bounds für alle 15 kuratierten Modelle.

@@ -48,10 +48,11 @@ pub use error::JobRuntimeError as JobError;
 #[cfg(test)]
 mod tests {
     use super::{Budget, BudgetUsage, JobRuntimeError, Lease, RetryPolicy, WorkId};
+    use crate::test_support::{TestError, TestResult, ctx};
     use jiff::{SignedDuration, Timestamp};
 
     #[test]
-    fn public_budget_api_rejects_negative_wall_charges_without_accounting_them() {
+    fn public_budget_api_rejects_negative_wall_charges_without_accounting_them() -> TestResult {
         let budget = Budget::unbounded();
         let mut usage = BudgetUsage {
             tokens: 7,
@@ -60,27 +61,35 @@ mod tests {
         };
         let original = usage.clone();
 
-        let error = budget
-            .charge_wall(&mut usage, SignedDuration::from_millis(-1))
-            .expect_err("negative wall charges must fail closed");
+        let Err(error) = budget.charge_wall(&mut usage, SignedDuration::from_millis(-1)) else {
+            return Err(TestError::Unexpected(
+                "negative wall charges must fail closed".into(),
+            ));
+        };
 
         assert!(matches!(error, JobRuntimeError::NegativeWallCharge { .. }));
         assert_eq!(usage, original);
+        Ok(())
     }
 
     #[test]
-    fn public_lease_api_rejects_non_positive_ttl_before_timestamp_arithmetic() {
+    fn public_lease_api_rejects_non_positive_ttl_before_timestamp_arithmetic() -> TestResult {
         let now = Timestamp::MAX;
 
         for ttl in [SignedDuration::ZERO, SignedDuration::from_secs(-1)] {
-            let error = Lease::acquire(WorkId::from_str("work-1"), "worker-a", now, ttl)
-                .expect_err("non-positive lease TTLs must fail closed");
+            let Err(error) = Lease::acquire(WorkId::from_str("work-1"), "worker-a", now, ttl)
+            else {
+                return Err(TestError::Unexpected(
+                    "non-positive lease TTLs must fail closed".into(),
+                ));
+            };
 
             assert!(matches!(
                 error,
                 JobRuntimeError::LeaseExpired { expired_at, .. } if expired_at == now
             ));
         }
+        Ok(())
     }
 
     #[test]
@@ -101,7 +110,7 @@ mod tests {
     }
 
     #[test]
-    fn public_retry_api_uses_base_delay_for_the_initial_retry() {
+    fn public_retry_api_uses_base_delay_for_the_initial_retry() -> TestResult {
         let retry = RetryPolicy {
             max_attempts: 4,
             base_delay: SignedDuration::from_secs(1),
@@ -112,14 +121,19 @@ mod tests {
         assert_eq!(
             retry
                 .next_delay(0)
-                .expect("initial retry must be schedulable"),
+                .map_err(ctx("initial retry must be schedulable"))?,
             SignedDuration::from_secs(1)
         );
         assert_eq!(
             retry
                 .next_delay(1)
-                .expect("first recorded retry must be schedulable"),
+                .map_err(ctx("first recorded retry must be schedulable"))?,
             SignedDuration::from_secs(1)
         );
+        Ok(())
     }
 }
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

@@ -347,6 +347,7 @@ impl PlanContextProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testing::coding_node;
     use harw_plan::{PathOrSymbol, PlanNodeStatus};
 
@@ -356,31 +357,37 @@ mod tests {
         node
     }
 
-    fn provider_with(pattern: &str, nodes: Vec<PlanNode>) -> PlanContextProvider {
-        PlanContextProvider::try_new(Arc::new(crate::testing::seeded_plan_store(nodes)), pattern)
-            .expect("nicht-leeres Muster konstruiert immer erfolgreich")
+    fn provider_with(pattern: &str, nodes: Vec<PlanNode>) -> TestResult<PlanContextProvider> {
+        let store = crate::testing::seeded_plan_store(nodes)?;
+        PlanContextProvider::try_new(Arc::new(store), pattern)
+            .map_err(ctx("nicht-leeres Muster konstruiert immer erfolgreich"))
     }
 
     #[test]
-    fn test_try_new_rejects_blank_scope_pattern() {
+    fn test_try_new_rejects_blank_scope_pattern() -> TestResult {
         let plan: Arc<dyn PlanStore> = Arc::new(harw_plan::InMemoryPlanStore::new());
         match PlanContextProvider::try_new(plan, "   ") {
-            Err(PlanBridgeError::CellMemberPattern { pattern }) => assert_eq!(pattern, "   "),
-            other => panic!("erwartet CellMemberPattern, bekommen: {other:?}"),
+            Err(PlanBridgeError::CellMemberPattern { pattern }) => {
+                assert_eq!(pattern, "   ");
+                Ok(())
+            }
+            other => Err(TestError::Unexpected(format!(
+                "erwartet CellMemberPattern, bekommen: {other:?}"
+            ))),
         }
     }
 
     /// Der wichtigste Test dieser Aufgabe: ein Knoten eines fremden Clans
     /// (anderes `write_scope`-Revier) erscheint nicht in den Fragmenten.
     #[test]
-    fn test_fragments_exclude_nodes_of_a_foreign_clan() {
+    fn test_fragments_exclude_nodes_of_a_foreign_clan() -> TestResult {
         let provider = provider_with(
             "harw-tui/**",
             vec![
                 node_writing("tui-1", &["harw-tui/src/a.rs"]),
                 node_writing("cli-1", &["harw-cli/src/b.rs"]),
             ],
-        );
+        )?;
 
         let fragments = provider.fragments(jiff::Timestamp::UNIX_EPOCH);
 
@@ -390,27 +397,29 @@ mod tests {
             fragments.iter().all(|f| f.label.as_str() != "cli-1"),
             "fremder Clan-Knoten ist durchgerutscht: {fragments:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_fragments_match_by_task_id_glob_too() {
+    fn test_fragments_match_by_task_id_glob_too() -> TestResult {
         let provider = provider_with(
             "tui-*",
             vec![
                 node_writing("tui-1", &["harw-cli/src/a.rs"]),
                 node_writing("cli-1", &["harw-cli/src/b.rs"]),
             ],
-        );
+        )?;
 
         let fragments = provider.fragments(jiff::Timestamp::UNIX_EPOCH);
 
         assert_eq!(fragments.len(), 1);
         assert_eq!(fragments[0].label.as_str(), "tui-1");
+        Ok(())
     }
 
     #[test]
-    fn test_fragment_fields_are_fully_populated() {
-        let provider = provider_with("t-*", vec![node_writing("t-1", &["src/a.rs"])]);
+    fn test_fragment_fields_are_fully_populated() -> TestResult {
+        let provider = provider_with("t-*", vec![node_writing("t-1", &["src/a.rs"])])?;
         let produced_at = jiff::Timestamp::UNIX_EPOCH;
 
         let fragments = provider.fragments(produced_at);
@@ -430,28 +439,37 @@ mod tests {
             "digest muss aus dem tatsächlichen Body berechnet sein"
         );
         assert!(fragment.body.contains("t-1"));
+        Ok(())
     }
 
     #[test]
-    fn test_no_plan_contributes_nothing() {
+    fn test_no_plan_contributes_nothing() -> TestResult {
         let plan: Arc<dyn PlanStore> = Arc::new(harw_plan::InMemoryPlanStore::new());
         let provider = PlanContextProvider::try_new(plan, "t-*")
-            .expect("nicht-leeres Muster konstruiert immer erfolgreich");
+            .map_err(ctx("nicht-leeres Muster konstruiert immer erfolgreich"))?;
         assert!(provider.fragments(jiff::Timestamp::UNIX_EPOCH).is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_pattern_without_matches_yields_no_fragments() {
-        let provider = provider_with("nichts-*", vec![node_writing("t-1", &["src/a.rs"])]);
+    fn test_pattern_without_matches_yields_no_fragments() -> TestResult {
+        let provider = provider_with("nichts-*", vec![node_writing("t-1", &["src/a.rs"])])?;
         assert!(provider.fragments(jiff::Timestamp::UNIX_EPOCH).is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_declaration_registers_successfully() {
+    fn test_declaration_registers_successfully() -> TestResult {
         let mut registry = crate::fragment_registry::FragmentProviderRegistry::new();
         registry
             .try_register(PlanContextProvider::declaration())
-            .expect("PlanContextProvider's own declaration must pass its own registry");
-        assert_eq!(registry.max_trust(PLAN_CONTEXT_NAMESPACE), Some(PLAN_CONTEXT_MAX_TRUST));
+            .map_err(ctx(
+                "PlanContextProvider's own declaration must pass its own registry",
+            ))?;
+        assert_eq!(
+            registry.max_trust(PLAN_CONTEXT_NAMESPACE),
+            Some(PLAN_CONTEXT_MAX_TRUST)
+        );
+        Ok(())
     }
 }

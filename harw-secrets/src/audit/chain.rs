@@ -342,7 +342,7 @@ fn read_actor(cursor: &mut Cursor<'_>) -> AuditResult<()> {
         _ => {
             return Err(malformed_persisted_chain(
                 "audit log record has an unrecognized actor discriminant",
-            ))
+            ));
         }
     }
     Ok(())
@@ -463,10 +463,10 @@ pub fn load_and_verify_persisted_chain(path: &Path) -> AuditResult<PersistedChai
         Ok(_) => {
             return Err(malformed_persisted_chain(
                 "audit log path exists but is not a regular file",
-            ))
+            ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(PersistedChainStatus::Absent)
+            return Ok(PersistedChainStatus::Absent);
         }
         Err(error) => return Err(AuditError::Io(error)),
     }
@@ -516,6 +516,7 @@ pub fn load_and_verify_persisted_chain(path: &Path) -> AuditResult<PersistedChai
 #[cfg(test)]
 mod persisted_chain_tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     fn temp_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -609,12 +610,12 @@ mod persisted_chain_tests {
     }
 
     #[test]
-    fn intact_persisted_chain_loads_and_verifies() {
+    fn intact_persisted_chain_loads_and_verifies() -> TestResult {
         let log = two_event_log();
         let path = temp_path("intact");
-        std::fs::write(&path, encode_persisted_log(log.events())).expect("write test log");
+        std::fs::write(&path, encode_persisted_log(log.events()))?;
 
-        let status = load_and_verify_persisted_chain(&path).expect("intact chain loads");
+        let status = load_and_verify_persisted_chain(&path)?;
 
         assert_eq!(
             status,
@@ -624,10 +625,11 @@ mod persisted_chain_tests {
             }
         );
         let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     #[test]
-    fn tampered_prev_hash_is_reported_as_chain_broken_not_a_load_error() {
+    fn tampered_prev_hash_is_reported_as_chain_broken_not_a_load_error() -> TestResult {
         let log = two_event_log();
         let path = temp_path("tampered");
         let mut bytes = encode_persisted_log(log.events());
@@ -638,63 +640,75 @@ mod persisted_chain_tests {
             replaced, 2,
             "the tampered hash must appear in both the primary and redundant encodings"
         );
-        std::fs::write(&path, &bytes).expect("write tampered test log");
+        std::fs::write(&path, &bytes)?;
 
-        let error = load_and_verify_persisted_chain(&path).expect_err("tampered chain must fail");
+        let Err(error) = load_and_verify_persisted_chain(&path) else {
+            return Err(TestError::Unexpected(
+                "Err erwartet (tampered chain must fail)".into(),
+            ));
+        };
         assert!(matches!(error, AuditError::ChainBroken { index: 1, .. }));
         assert!(!error.to_string().contains("should-not-leak"));
         let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     #[test]
-    fn truncated_file_is_a_load_error_not_a_crash_or_intact() {
+    fn truncated_file_is_a_load_error_not_a_crash_or_intact() -> TestResult {
         let log = two_event_log();
         let path = temp_path("truncated");
         let bytes = encode_persisted_log(log.events());
         let truncated = &bytes[..bytes.len() / 2];
-        std::fs::write(&path, truncated).expect("write truncated test log");
+        std::fs::write(&path, truncated)?;
 
-        let error = load_and_verify_persisted_chain(&path).expect_err("truncated file must fail");
+        let Err(error) = load_and_verify_persisted_chain(&path) else {
+            return Err(TestError::Unexpected(
+                "Err erwartet (truncated file must fail)".into(),
+            ));
+        };
         assert!(matches!(error, AuditError::Io(_)));
         assert!(!error.to_string().contains("should-not-leak"));
         let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     #[test]
-    fn bad_header_is_a_load_error() {
+    fn bad_header_is_a_load_error() -> TestResult {
         let path = temp_path("bad-header");
-        std::fs::write(&path, b"not-an-audit-log-file-at-all").expect("write garbage");
+        std::fs::write(&path, b"not-an-audit-log-file-at-all")?;
 
         assert!(matches!(
             load_and_verify_persisted_chain(&path),
             Err(AuditError::Io(_))
         ));
         let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     #[test]
-    fn trailing_bytes_after_declared_event_count_are_a_load_error() {
+    fn trailing_bytes_after_declared_event_count_are_a_load_error() -> TestResult {
         let log = two_event_log();
         let path = temp_path("trailing");
         let mut bytes = encode_persisted_log(log.events());
         bytes.extend_from_slice(b"trailing-garbage");
-        std::fs::write(&path, &bytes).expect("write test log with trailing bytes");
+        std::fs::write(&path, &bytes)?;
 
         assert!(matches!(
             load_and_verify_persisted_chain(&path),
             Err(AuditError::Io(_))
         ));
         let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_symlink_is_refused_not_dereferenced() {
+    fn a_symlink_is_refused_not_dereferenced() -> TestResult {
         let log = two_event_log();
         let target = temp_path("symlink-target");
-        std::fs::write(&target, encode_persisted_log(log.events())).expect("write target");
+        std::fs::write(&target, encode_persisted_log(log.events()))?;
         let link = temp_path("symlink-link");
-        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+        std::os::unix::fs::symlink(&target, &link)?;
 
         assert!(matches!(
             load_and_verify_persisted_chain(&link),
@@ -702,20 +716,22 @@ mod persisted_chain_tests {
         ));
         let _ = std::fs::remove_file(&target);
         let _ = std::fs::remove_file(&link);
+        Ok(())
     }
 
     #[test]
-    fn empty_valid_log_is_intact_with_zero_events() {
+    fn empty_valid_log_is_intact_with_zero_events() -> TestResult {
         let path = temp_path("empty");
-        std::fs::write(&path, encode_persisted_log(&[])).expect("write empty test log");
+        std::fs::write(&path, encode_persisted_log(&[]))?;
 
         assert_eq!(
-            load_and_verify_persisted_chain(&path).expect("empty chain is intact"),
+            load_and_verify_persisted_chain(&path)?,
             PersistedChainStatus::Intact {
                 event_count: 0,
                 chain_head: GENESIS_HASH,
             }
         );
         let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 }

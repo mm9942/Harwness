@@ -55,7 +55,8 @@ impl Rule for BaselineDeviationRule {
                 }
                 Err(BaselineError::MissingBaseline) => continue,
                 Err(BaselineError::PromotionNotReviewed { .. })
-                | Err(BaselineError::InvalidRange { .. }) => continue,
+                | Err(BaselineError::InvalidRange { .. })
+                | Err(BaselineError::EvidenceEncoding { .. }) => continue,
             }
         }
 
@@ -70,6 +71,7 @@ fn is_within_baseline(baseline: &Baseline, sample: &HostSample) -> Result<bool, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use harw_dod_signals::SensorId;
     use jiff::Timestamp;
 
@@ -97,18 +99,21 @@ mod tests {
     }
 
     #[test]
-    fn test_value_within_baseline_does_not_trigger() {
-        let baseline = Baseline::new("cpu-load", "cpu-load", 0.0, 80.0).unwrap();
+    fn test_value_within_baseline_does_not_trigger() -> TestResult {
+        let baseline =
+            Baseline::new("cpu-load", "cpu-load", 0.0, 80.0).map_err(ctx("gültige Baseline"))?;
         let samples = vec![sample("cpu-load", 42.0)];
         let scope = NetworkScope::empty();
         let ctx = ctx_with(&samples, &[baseline], &scope);
 
         assert!(BaselineDeviationRule.evaluate(&ctx).is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_value_above_baseline_triggers_anomaly() {
-        let baseline = Baseline::new("cpu-load", "cpu-load", 0.0, 80.0).unwrap();
+    fn test_value_above_baseline_triggers_anomaly() -> TestResult {
+        let baseline =
+            Baseline::new("cpu-load", "cpu-load", 0.0, 80.0).map_err(ctx("gültige Baseline"))?;
         let samples = vec![sample("cpu-load", 99.9)];
         let scope = NetworkScope::empty();
         let ctx = ctx_with(&samples, &[baseline], &scope);
@@ -118,6 +123,7 @@ mod tests {
         assert_eq!(findings[0].kind, FindingKind::Anomaly);
         assert_eq!(findings[0].severity, Severity::Medium);
         assert!(findings[0].summary.contains("cpu-load"));
+        Ok(())
     }
 
     #[test]
@@ -129,19 +135,22 @@ mod tests {
     }
 
     #[test]
-    fn test_only_one_finding_per_metric() {
-        let baseline = Baseline::new("cpu-load", "cpu-load", 0.0, 80.0).unwrap();
+    fn test_only_one_finding_per_metric() -> TestResult {
+        let baseline =
+            Baseline::new("cpu-load", "cpu-load", 0.0, 80.0).map_err(ctx("gültige Baseline"))?;
         let samples = vec![sample("cpu-load", 90.0), sample("cpu-load", 95.0)];
         let scope = NetworkScope::empty();
         let ctx = ctx_with(&samples, &[baseline], &scope);
 
         let findings = BaselineDeviationRule.evaluate(&ctx);
         assert_eq!(findings.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_evaluate_is_deterministic_for_identical_context() {
-        let baseline = Baseline::new("cpu-load", "cpu-load", 0.0, 80.0).unwrap();
+    fn test_evaluate_is_deterministic_for_identical_context() -> TestResult {
+        let baseline =
+            Baseline::new("cpu-load", "cpu-load", 0.0, 80.0).map_err(ctx("gültige Baseline"))?;
         let samples = vec![sample("cpu-load", 99.9)];
         let scope = NetworkScope::empty();
         let ctx = ctx_with(&samples, &[baseline], &scope);
@@ -150,5 +159,6 @@ mod tests {
             BaselineDeviationRule.evaluate(&ctx),
             BaselineDeviationRule.evaluate(&ctx)
         );
+        Ok(())
     }
 }

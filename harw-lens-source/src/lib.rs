@@ -231,14 +231,16 @@ mod build;
 mod document;
 mod error;
 mod status;
+#[cfg(test)]
+mod test_support;
 
-pub use build::{build_index, IndexBuildReport, LENS_REMOTE_EMBED_ON_OPERATOR_ONLY};
+pub use build::{IndexBuildReport, LENS_REMOTE_EMBED_ON_OPERATOR_ONLY, build_index};
 pub use document::{
-    collect_design_docs, collect_diary_documents, collect_palace_documents, collect_rust_sources,
-    visibility_of_scope, RawDocument,
+    RawDocument, collect_design_docs, collect_diary_documents, collect_palace_documents,
+    collect_rust_sources, visibility_of_scope,
 };
 pub use error::{SourceError, SourceResult};
-pub use status::{index_status, IndexStatus};
+pub use status::{IndexStatus, index_status};
 
 /// Name des Index für Planungs- und Architekturdokumente
 /// ([`collect_design_docs`], zerlegt mit `chunk_markdown`).

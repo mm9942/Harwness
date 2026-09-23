@@ -310,7 +310,7 @@ fn run_provider(home: &Path, action: SettingsProviderAction) -> Result<(), Setti
             auth,
             models,
         } => {
-            add_provider(home, &name, &api, &base_url, auth.as_deref(), models)?;
+            add_provider(home, &name, api.as_str(), &base_url, auth.as_deref(), models)?;
             print_validation_result(home);
             Ok(())
         }
@@ -436,6 +436,7 @@ fn add_provider(
         rate_limit: None,
         max_concurrency: None,
         default_reasoning_effort: None,
+        gateway_identity_headers: false,
     };
     write_provider(home, &provider)
 }
@@ -520,7 +521,7 @@ fn run_model(home: &Path, action: SettingsModelAction) -> Result<(), SettingsErr
 fn set_default_model(home: &Path, id: &str) -> Result<(), SettingsError> {
     let path = global_config_path(home)?;
     let mut writer = ConfigWriter::open(&path)?;
-    writer.set_value("default_model", value(id));
+    writer.set_value("default_model", value(id))?;
     writer.save()?;
     Ok(())
 }
@@ -552,7 +553,7 @@ fn run_set(
     };
     let path = config_path_for_scope(home, scope)?;
     let mut writer = ConfigWriter::open(&path)?;
-    writer.set_value(key, value(new_value.as_str()));
+    writer.set_value(key, value(new_value.as_str()))?;
     writer.save()?;
     print_validation_result(home);
     Ok(())
@@ -566,7 +567,7 @@ fn run_permissions(home: &Path, action: SettingsPermissionsAction) -> Result<(),
     match action {
         SettingsPermissionsAction::Get { scope } => print_permissions(home, scope.resolve()),
         SettingsPermissionsAction::SetMode { mode, scope } => {
-            set_permissions_mode(home, &mode, scope.resolve())?;
+            set_permissions_mode(home, mode.as_str(), scope.resolve())?;
             print_validation_result(home);
             Ok(())
         }
@@ -663,7 +664,7 @@ fn set_permissions_mode(home: &Path, mode: &str, scope: SettingScope) -> Result<
     }
     let path = config_path_for_scope(home, scope)?;
     let mut writer = ConfigWriter::open(&path)?;
-    writer.set_default_mode(mode);
+    writer.set_default_mode(mode)?;
     writer.save()?;
     Ok(())
 }
@@ -678,7 +679,7 @@ fn append_permissions_rule(
     let path = config_path_for_scope(home, scope)?;
     let rule = RuleToml { tool, pattern };
     let mut writer = ConfigWriter::open(&path)?;
-    writer.append_rule(kind, &rule);
+    writer.append_rule(kind, &rule)?;
     writer.save()?;
     Ok(())
 }
@@ -696,7 +697,7 @@ fn remove_permissions_rule(
         RuleKind::Deny => section.deny.len(),
     };
     let mut writer = ConfigWriter::open(&path)?;
-    match writer.remove_rule(kind, index) {
+    match writer.remove_rule(kind, index)? {
         Some(_) => {
             writer.save()?;
             Ok(())
@@ -1023,66 +1024,82 @@ fn write_atomic(path: &Path, content: &[u8]) -> Result<(), SettingsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Isoliertes `HARW_HOME` für einen Test; nutzt ausschließlich
     /// `--home`-Style Overrides (kein Env-Mutieren), damit Tests parallel
     /// laufen können.
-    fn temp_home() -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn temp_home() -> TestResult<(tempfile::TempDir, PathBuf)> {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let home = dir.path().join("harw-home");
-        harw_home::ensure_home(&home).expect("ensure_home");
-        (dir, home)
+        harw_home::ensure_home(&home).map_err(ctx("ensure_home"))?;
+        Ok((dir, home))
     }
 
     #[test]
-    fn test_add_provider_rejects_plaintext_auth() {
-        let (_guard, home) = temp_home();
-        let error = add_provider(
+    fn test_add_provider_rejects_plaintext_auth() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        let result = add_provider(
             &home,
             "acme",
             "openai-chat",
             "https://api.acme.test/v1",
             Some("sk-plain"),
             vec![],
-        )
-        .expect_err("plaintext auth must be rejected");
+        );
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "plaintext auth must be rejected".into(),
+            ));
+        };
         assert!(matches!(error, SettingsError::PlaintextAuthRejected { .. }));
         assert!(error.to_string().contains("harw auth"));
+        Ok(())
     }
 
     #[test]
-    fn test_add_provider_rejects_invalid_name() {
-        let (_guard, home) = temp_home();
-        let error = add_provider(
+    fn test_add_provider_rejects_invalid_name() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        let result = add_provider(
             &home,
             "../escape",
             "openai-chat",
             "https://api.acme.test/v1",
             None,
             vec![],
-        )
-        .expect_err("invalid provider name must be rejected");
+        );
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "invalid provider name must be rejected".into(),
+            ));
+        };
         assert!(matches!(error, SettingsError::InvalidProviderName { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_add_provider_rejects_unsupported_api() {
-        let (_guard, home) = temp_home();
-        let error = add_provider(
+    fn test_add_provider_rejects_unsupported_api() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        let result = add_provider(
             &home,
             "acme",
             "made-up-api",
             "https://api.acme.test/v1",
             None,
             vec![],
-        )
-        .expect_err("unsupported api must be rejected");
+        );
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "unsupported api must be rejected".into(),
+            ));
+        };
         assert!(matches!(error, SettingsError::UnsupportedApi { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_provider_roundtrip_add_list_disable_enable_remove() {
-        let (_guard, home) = temp_home();
+    fn test_provider_roundtrip_add_list_disable_enable_remove() -> TestResult {
+        let (_guard, home) = temp_home()?;
         add_provider(
             &home,
             "acme",
@@ -1091,70 +1108,81 @@ mod tests {
             Some("env:ACME_KEY"),
             vec!["acme-large".to_owned()],
         )
-        .expect("add provider");
+        .map_err(ctx("add provider"))?;
 
-        let names = discover_provider_names(&home).expect("list providers");
+        let names = discover_provider_names(&home).map_err(ctx("list providers"))?;
         assert_eq!(names, vec!["acme".to_owned()]);
 
-        let provider = read_provider(&home, "acme").expect("read provider");
+        let provider = read_provider(&home, "acme").map_err(ctx("read provider"))?;
         assert!(provider.enabled);
         assert_eq!(provider.base_url, "https://api.acme.test/v1");
         assert_eq!(provider.models, vec!["acme-large".to_owned()]);
 
-        set_provider_enabled(&home, "acme", false).expect("disable provider");
+        set_provider_enabled(&home, "acme", false).map_err(ctx("disable provider"))?;
         assert!(
             !read_provider(&home, "acme")
-                .expect("reread provider")
+                .map_err(ctx("reread provider"))?
                 .enabled
         );
 
-        set_provider_enabled(&home, "acme", true).expect("enable provider");
+        set_provider_enabled(&home, "acme", true).map_err(ctx("enable provider"))?;
         assert!(
             read_provider(&home, "acme")
-                .expect("reread provider")
+                .map_err(ctx("reread provider"))?
                 .enabled
         );
 
-        remove_provider(&home, "acme").expect("remove provider");
+        remove_provider(&home, "acme").map_err(ctx("remove provider"))?;
         assert!(
             discover_provider_names(&home)
-                .expect("list after remove")
+                .map_err(ctx("list after remove"))?
                 .is_empty()
         );
+        Ok(())
     }
 
     #[test]
-    fn test_remove_missing_provider_is_reported() {
-        let (_guard, home) = temp_home();
-        let error = remove_provider(&home, "ghost").expect_err("missing provider must error");
+    fn test_remove_missing_provider_is_reported() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        let result = remove_provider(&home, "ghost");
+        let Err(error) = result else {
+            return Err(TestError::Unexpected("missing provider must error".into()));
+        };
         assert!(matches!(error, SettingsError::ProviderNotFound { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_set_default_model_round_trips_through_global_config() {
-        let (_guard, home) = temp_home();
-        set_default_model(&home, "gpt-5.4").expect("set default model");
+    fn test_set_default_model_round_trips_through_global_config() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        set_default_model(&home, "gpt-5.4").map_err(ctx("set default model"))?;
 
-        let path = global_config_path(&home).expect("global config path");
-        let writer = ConfigWriter::open(&path).expect("reopen");
+        let path = global_config_path(&home).map_err(ctx("global config path"))?;
+        let writer = ConfigWriter::open(&path).map_err(ctx("reopen"))?;
         assert_eq!(
             writer.get_value("default_model"),
             Some("gpt-5.4".to_owned())
         );
+        Ok(())
     }
 
     #[test]
-    fn test_permissions_mode_rejects_unknown_value() {
-        let (_guard, home) = temp_home();
-        let error = set_permissions_mode(&home, "yolo", SettingScope::Global)
-            .expect_err("unknown mode must be rejected");
+    fn test_permissions_mode_rejects_unknown_value() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        let result = set_permissions_mode(&home, "yolo", SettingScope::Global);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "unknown mode must be rejected".into(),
+            ));
+        };
         assert!(matches!(error, SettingsError::InvalidMode { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_permissions_allow_deny_roundtrip_and_remove_by_index() {
-        let (_guard, home) = temp_home();
-        set_permissions_mode(&home, "auto", SettingScope::Global).expect("set mode");
+    fn test_permissions_allow_deny_roundtrip_and_remove_by_index() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        set_permissions_mode(&home, "auto", SettingScope::Global).map_err(ctx("set mode"))?;
         append_permissions_rule(
             &home,
             RuleKind::Allow,
@@ -1162,7 +1190,7 @@ mod tests {
             Some("cargo check".to_owned()),
             SettingScope::Global,
         )
-        .expect("append allow rule");
+        .map_err(ctx("append allow rule"))?;
         append_permissions_rule(
             &home,
             RuleKind::Deny,
@@ -1170,72 +1198,85 @@ mod tests {
             None,
             SettingScope::Global,
         )
-        .expect("append deny rule");
+        .map_err(ctx("append deny rule"))?;
 
-        let path = global_config_path(&home).expect("global config path");
-        let section = load_permissions_section(&path).expect("load permissions section");
+        let path = global_config_path(&home).map_err(ctx("global config path"))?;
+        let section = load_permissions_section(&path).map_err(ctx("load permissions section"))?;
         assert_eq!(section.default_mode.as_deref(), Some("auto"));
         assert_eq!(section.allow.len(), 1);
         assert_eq!(section.allow[0].tool, "shell.exec");
         assert_eq!(section.deny.len(), 1);
 
         remove_permissions_rule(&home, RuleKind::Allow, 0, SettingScope::Global)
-            .expect("remove allow rule");
-        let section = load_permissions_section(&path).expect("reload permissions section");
+            .map_err(ctx("remove allow rule"))?;
+        let section = load_permissions_section(&path).map_err(ctx("reload permissions section"))?;
         assert!(section.allow.is_empty());
         assert_eq!(section.deny.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_remove_permissions_rule_rejects_out_of_range_index() {
-        let (_guard, home) = temp_home();
-        let error = remove_permissions_rule(&home, RuleKind::Allow, 3, SettingScope::Global)
-            .expect_err("out-of-range index must be rejected");
+    fn test_remove_permissions_rule_rejects_out_of_range_index() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        let result = remove_permissions_rule(&home, RuleKind::Allow, 3, SettingScope::Global);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "out-of-range index must be rejected".into(),
+            ));
+        };
         assert!(matches!(
             error,
             SettingsError::InvalidRuleIndex { index: 3, len: 0 }
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_get_set_generic_dotted_key_round_trips_at_global_scope() {
-        let (_guard, home) = temp_home();
+    fn test_get_set_generic_dotted_key_round_trips_at_global_scope() -> TestResult {
+        let (_guard, home) = temp_home()?;
         run_set(
             &home,
             "policy_profile",
             Some("strict".to_owned()),
             SettingScope::Global,
         )
-        .expect("set dotted key");
+        .map_err(ctx("set dotted key"))?;
 
-        let path = global_config_path(&home).expect("global config path");
-        let writer = ConfigWriter::open(&path).expect("reopen");
+        let path = global_config_path(&home).map_err(ctx("global config path"))?;
+        let writer = ConfigWriter::open(&path).map_err(ctx("reopen"))?;
         assert_eq!(
             writer.get_value("policy_profile"),
             Some("strict".to_owned())
         );
+        Ok(())
     }
 
     #[test]
-    fn test_set_without_value_is_rejected() {
-        let (_guard, home) = temp_home();
-        let error = run_set(&home, "policy_profile", None, SettingScope::Global)
-            .expect_err("missing value must be rejected");
+    fn test_set_without_value_is_rejected() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        let result = run_set(&home, "policy_profile", None, SettingScope::Global);
+        let Err(error) = result else {
+            return Err(TestError::Unexpected(
+                "missing value must be rejected".into(),
+            ));
+        };
         assert!(matches!(error, SettingsError::MissingValue { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_project_scope_writes_under_project_settings_dir() {
-        let (_guard, home) = temp_home();
+    fn test_project_scope_writes_under_project_settings_dir() -> TestResult {
+        let (_guard, home) = temp_home()?;
         // `project_settings_path` läuft über `discover_project` ab dem
         // tatsächlichen Arbeitsverzeichnis des Testprozesses; da jeder
         // Ordner mindestens `ProjectKind::Directory` ergibt, muss dieser
         // Aufruf immer einen Pfad liefern.
-        let path = project_settings_path(&home).expect("resolve project settings path");
+        let path = project_settings_path(&home).map_err(ctx("resolve project settings path"))?;
         assert!(path.starts_with(home.join("profiles")));
         assert_eq!(
             path.file_name().and_then(|n| n.to_str()),
             Some("settings.toml")
         );
+        Ok(())
     }
 }

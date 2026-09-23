@@ -281,6 +281,7 @@ fn validate_session_key(session_key: &str) -> Result<(), McpEventBusError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     fn updated_event(revision: u64) -> McpLifecycleEventKind {
         McpLifecycleEventKind::JobUpdated {
@@ -291,26 +292,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_subscriber_reports_lag_without_growing_queue() {
-        let bus = McpEventBus::new(2).unwrap();
-        let mut subscription = bus.subscribe("session-a").unwrap();
+    async fn bounded_subscriber_reports_lag_without_growing_queue() -> TestResult {
+        let bus = McpEventBus::new(2).map_err(ctx("bus new"))?;
+        let mut subscription = bus.subscribe("session-a").map_err(ctx("subscribe"))?;
         let now = Timestamp::now();
-        bus.publish("session-a", now, updated_event(1)).unwrap();
-        bus.publish("session-a", now, updated_event(2)).unwrap();
-        bus.publish("session-a", now, updated_event(3)).unwrap();
+        bus.publish("session-a", now, updated_event(1))
+            .map_err(ctx("publish 1"))?;
+        bus.publish("session-a", now, updated_event(2))
+            .map_err(ctx("publish 2"))?;
+        bus.publish("session-a", now, updated_event(3))
+            .map_err(ctx("publish 3"))?;
         assert!(matches!(
             subscription.recv().await,
             Err(McpEventReceiveError::Lagged { skipped: 1 })
         ));
-        let event = subscription.recv().await.unwrap();
+        let event = subscription.recv().await.map_err(ctx("recv"))?;
         assert_eq!(event.sequence, 2);
         assert_eq!(bus.subscriber_count("session-a"), 1);
+        Ok(())
     }
 
     #[test]
-    fn dropping_final_subscriber_cleans_up_session_channel() {
-        let bus = McpEventBus::new(1).unwrap();
-        let subscription = bus.subscribe("session-a").unwrap();
+    fn dropping_final_subscriber_cleans_up_session_channel() -> TestResult {
+        let bus = McpEventBus::new(1).map_err(ctx("bus new"))?;
+        let subscription = bus.subscribe("session-a").map_err(ctx("subscribe"))?;
         assert_eq!(bus.subscriber_count("session-a"), 1);
         drop(subscription);
         assert_eq!(bus.subscriber_count("session-a"), 0);
@@ -318,18 +323,20 @@ mod tests {
             bus.publish("session-a", Timestamp::now(), updated_event(1)),
             Err(McpEventBusError::SessionNotSubscribed)
         ));
+        Ok(())
     }
 
     #[test]
-    fn capacity_and_session_keys_are_validated() {
+    fn capacity_and_session_keys_are_validated() -> TestResult {
         assert!(matches!(
             McpEventBus::new(0),
             Err(McpEventBusError::CapacityZero)
         ));
-        let bus = McpEventBus::new(1).unwrap();
+        let bus = McpEventBus::new(1).map_err(ctx("bus new"))?;
         assert!(matches!(
             bus.subscribe(""),
             Err(McpEventBusError::InvalidSessionKey)
         ));
+        Ok(())
     }
 }

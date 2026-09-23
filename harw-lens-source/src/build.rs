@@ -150,14 +150,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use harw_lens_chunk::{chunk_markdown, chunk_rust};
-use harw_lens_embed::{prepare_document, Embedder, EmbeddingDescriptor};
+use harw_lens_embed::{Embedder, EmbeddingDescriptor, prepare_document};
 use harw_lens_index::FlatIndex;
 use harw_lens_store::LensStore;
 use harw_lens_types::{Chunk, ChunkDigest, IndexManifest, Locality, Metric};
+use harw_observe::{Cardinality, MetricKey, MetricKind, NullCounter, NullSink, Unit};
 use harw_types::ContentDigest;
-use harw_observe::{
-    Cardinality, MetricKey, MetricKind, NullCounter, NullSink, Unit,
-};
 use serde::{Deserialize, Serialize};
 
 use crate::document::RawDocument;
@@ -357,7 +355,11 @@ fn build_visibility_bucket(
 
     let mut chunks: Vec<Chunk> = Vec::new();
     for document in documents {
-        chunks.extend(chunk_for_index(index_name, &document.source, &document.text));
+        chunks.extend(chunk_for_index(
+            index_name,
+            &document.source,
+            &document.text,
+        ));
     }
 
     for chunk in &chunks {
@@ -406,12 +408,13 @@ fn build_visibility_bucket(
 
     let mut entries: Vec<(Chunk, Vec<f32>)> = Vec::with_capacity(chunks.len());
     for chunk in &chunks {
-        let embedding = cache
-            .get(&chunk.digest)
-            .cloned()
-            .ok_or_else(|| SourceError::MissingEmbedding {
-                digest: chunk.digest.0.to_string(),
-            })?;
+        let embedding =
+            cache
+                .get(&chunk.digest)
+                .cloned()
+                .ok_or_else(|| SourceError::MissingEmbedding {
+                    digest: chunk.digest.0.to_string(),
+                })?;
         entries.push((chunk.clone(), embedding));
     }
 
@@ -541,7 +544,10 @@ fn save_embedding_cache(
 /// Chunk-*Menge* (unabhängig von der Iterationsreihenfolge) liefern denselben
 /// `source_set_digest`.
 fn compute_source_set_digest(chunks: &[Chunk]) -> ContentDigest {
-    let mut digests: Vec<[u8; 32]> = chunks.iter().map(|chunk| *chunk.digest.0.as_bytes()).collect();
+    let mut digests: Vec<[u8; 32]> = chunks
+        .iter()
+        .map(|chunk| *chunk.digest.0.as_bytes())
+        .collect();
     digests.sort_unstable();
     let mut buffer = Vec::with_capacity(digests.len() * 32);
     for digest in digests {
@@ -553,11 +559,12 @@ fn compute_source_set_digest(chunks: &[Chunk]) -> ContentDigest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
     use harw_lens_embed::EmbeddingDescriptor;
     use harw_lens_index::{Query, VectorIndex};
     use harw_lens_types::SourceRef;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Zählt jeden Aufruf von `embed`, um Inkrementalität nachweisbar zu
     /// machen: "der Embedder wurde N-mal aufgerufen" ist sonst nur eine
@@ -581,8 +588,16 @@ mod tests {
             self.call_count.load(Ordering::SeqCst)
         }
 
+        /// Liest die bislang gesehenen Texte. Ein vergifteter Mutex (ein
+        /// anderer Thread ist mit dem Lock gehaltenen panisch abgebrochen)
+        /// wird per `into_inner` weiterverwendet statt zu paniken — dieses
+        /// Test-Double läuft nie mit konkurrierenden Schreibern, ein
+        /// Poisoning ist hier ausschließlich theoretisch.
         fn texts_seen(&self) -> Vec<String> {
-            self.seen_texts.lock().expect("lock poisoned").clone()
+            self.seen_texts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
         }
     }
 
@@ -591,7 +606,7 @@ mod tests {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             self.seen_texts
                 .lock()
-                .expect("lock poisoned")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .extend(texts.iter().cloned());
             self.inner.embed(texts)
         }
@@ -668,8 +683,8 @@ mod tests {
     }
 
     #[test]
-    fn test_build_index_first_build_embeds_every_chunk() {
-        let home = tempfile::tempdir().expect("tempdir");
+    fn test_build_index_first_build_embeds_every_chunk() -> TestResult {
+        let home = tempfile::tempdir()?;
         let embedder = CountingEmbedder::new(8);
         let documents = vec![one_document("# Title\n\nBody text.\n")];
 
@@ -682,18 +697,18 @@ mod tests {
             Metric::Cosine,
             &embedder,
             &descriptor(),
-        )
-        .expect("builds");
+        )?;
 
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].embedded_count, reports[0].chunk_count);
         assert_eq!(reports[0].reused_count, 0);
         assert_eq!(embedder.calls(), 1);
+        Ok(())
     }
 
     #[test]
-    fn test_build_index_second_build_over_unchanged_material_never_calls_embedder() {
-        let home = tempfile::tempdir().expect("tempdir");
+    fn test_build_index_second_build_over_unchanged_material_never_calls_embedder() -> TestResult {
+        let home = tempfile::tempdir()?;
         let embedder = CountingEmbedder::new(8);
         let documents = vec![one_document("# Title\n\nBody text.\n")];
 
@@ -706,8 +721,7 @@ mod tests {
             Metric::Cosine,
             &embedder,
             &descriptor(),
-        )
-        .expect("first build");
+        )?;
         assert_eq!(embedder.calls(), 1);
 
         let reports = build_index(
@@ -719,17 +733,21 @@ mod tests {
             Metric::Cosine,
             &embedder,
             &descriptor(),
-        )
-        .expect("second build");
+        )?;
 
-        assert_eq!(embedder.calls(), 1, "second build must not call the embedder again");
+        assert_eq!(
+            embedder.calls(),
+            1,
+            "second build must not call the embedder again"
+        );
         assert_eq!(reports[0].embedded_count, 0);
         assert_eq!(reports[0].reused_count, reports[0].chunk_count);
+        Ok(())
     }
 
     #[test]
-    fn test_build_index_changing_one_document_only_reembeds_its_chunks() {
-        let home = tempfile::tempdir().expect("tempdir");
+    fn test_build_index_changing_one_document_only_reembeds_its_chunks() -> TestResult {
+        let home = tempfile::tempdir()?;
         let embedder = CountingEmbedder::new(8);
         let unchanged = RawDocument {
             source: SourceRef::File {
@@ -755,8 +773,7 @@ mod tests {
             Metric::Cosine,
             &embedder,
             &descriptor(),
-        )
-        .expect("first build");
+        )?;
         let first_call_count = embedder.calls();
         assert!(first_call_count >= 1);
 
@@ -770,8 +787,7 @@ mod tests {
             Metric::Cosine,
             &embedder,
             &descriptor(),
-        )
-        .expect("second build");
+        )?;
 
         assert_eq!(
             embedder.calls(),
@@ -781,17 +797,19 @@ mod tests {
         // Every freshly embedded text carries the changed body's content and
         // the document prefix — never the unchanged document's text.
         let seen = embedder.texts_seen();
-        let last_batch = &seen[seen.len() - reports.last().expect("has report").embedded_count..];
+        let last_report = reports.last().ok_or(TestError::Missing("build report"))?;
+        let last_batch = &seen[seen.len() - last_report.embedded_count..];
         for text in last_batch {
             assert!(text.starts_with("passage: "));
             assert!(text.contains("A different body now."));
             assert!(!text.contains("Stays the same."));
         }
+        Ok(())
     }
 
     #[test]
-    fn test_build_index_applies_document_prefix_before_embedding() {
-        let home = tempfile::tempdir().expect("tempdir");
+    fn test_build_index_applies_document_prefix_before_embedding() -> TestResult {
+        let home = tempfile::tempdir()?;
         let embedder = CountingEmbedder::new(8);
         let documents = vec![one_document("plain body text")];
 
@@ -804,16 +822,16 @@ mod tests {
             Metric::Cosine,
             &embedder,
             &descriptor(),
-        )
-        .expect("builds");
+        )?;
 
         let seen = embedder.texts_seen();
         assert!(seen.iter().all(|text| text.starts_with("passage: ")));
+        Ok(())
     }
 
     #[test]
-    fn test_build_index_is_queryable_and_hits_carry_the_right_source_ref() {
-        let home = tempfile::tempdir().expect("tempdir");
+    fn test_build_index_is_queryable_and_hits_carry_the_right_source_ref() -> TestResult {
+        let home = tempfile::tempdir()?;
         let embedder = CountingEmbedder::new(8);
         let documents = vec![one_document("# Title\n\nBody text.\n")];
 
@@ -826,25 +844,25 @@ mod tests {
             Metric::Cosine,
             &embedder,
             &descriptor(),
-        )
-        .expect("builds");
+        )?;
 
-        let store_root = harw_home::paths::visibility_index_dir(home.path(), "workspace")
-            .expect("valid visibility name");
-        let store = LensStore::open(&store_root).expect("opens store");
-        let index = FlatIndex::load(&store, "docs.design").expect("loads index");
+        let store_root = harw_home::paths::visibility_index_dir(home.path(), "workspace")?;
+        let store = LensStore::open(&store_root)?;
+        let index = FlatIndex::load(&store, "docs.design")?;
 
         let embedding = embedder
-            .embed(&[harw_lens_embed::prepare_document(&descriptor(), "# Title\n\nBody text.\n")])
-            .expect("embeds")
+            .embed(&[harw_lens_embed::prepare_document(
+                &descriptor(),
+                "# Title\n\nBody text.\n",
+            )])?
             .pop()
-            .expect("one vector");
+            .ok_or(TestError::Missing("embedding vector"))?;
         let query = Query {
             embedding: Some(embedding),
             text: None,
             manifest: index.manifest().clone(),
         };
-        let hits = index.search(&query, 10).expect("search succeeds");
+        let hits = index.search(&query, 10)?;
         assert!(!hits.is_empty());
         assert_eq!(
             hits[0].chunk.source,
@@ -852,11 +870,12 @@ mod tests {
                 path: "doc.md".to_owned()
             }
         );
+        Ok(())
     }
 
     #[test]
-    fn test_build_index_separates_operator_only_visibility_from_workspace_store() {
-        let home = tempfile::tempdir().expect("tempdir");
+    fn test_build_index_separates_operator_only_visibility_from_workspace_store() -> TestResult {
+        let home = tempfile::tempdir()?;
         let embedder = CountingEmbedder::new(8);
         let workspace_doc = RawDocument {
             source: SourceRef::Artifact {
@@ -882,20 +901,15 @@ mod tests {
             Metric::Cosine,
             &embedder,
             &descriptor(),
-        )
-        .expect("builds");
+        )?;
         assert_eq!(reports.len(), 2);
 
-        let workspace_root = harw_home::paths::visibility_index_dir(home.path(), "workspace")
-            .expect("valid visibility name");
-        let operator_root =
-            harw_home::paths::visibility_index_dir(home.path(), "operator-only")
-                .expect("valid visibility name");
+        let workspace_root = harw_home::paths::visibility_index_dir(home.path(), "workspace")?;
+        let operator_root = harw_home::paths::visibility_index_dir(home.path(), "operator-only")?;
         assert_ne!(workspace_root, operator_root);
 
-        let workspace_store = LensStore::open(&workspace_root).expect("opens workspace store");
-        let workspace_index =
-            FlatIndex::load(&workspace_store, "knowledge.palace").expect("loads workspace index");
+        let workspace_store = LensStore::open(&workspace_root)?;
+        let workspace_index = FlatIndex::load(&workspace_store, "knowledge.palace")?;
 
         // The most important security test of this node: the secret content's
         // chunk must not exist at all in the physically separate workspace
@@ -908,30 +922,27 @@ mod tests {
         );
         for chunk in &secret_chunks {
             assert!(
-                !workspace_store.has_chunk(&chunk.digest).expect("checks"),
+                !workspace_store.has_chunk(&chunk.digest)?,
                 "operator-only chunk must not exist in the workspace-visibility store"
             );
         }
-        assert!(workspace_index
-            .search(
-                &Query {
-                    embedding: Some(vec![0.0; 8]),
-                    text: None,
-                    manifest: workspace_index.manifest().clone(),
-                },
-                10,
-            )
-            .expect("search succeeds")
-            .iter()
-            .all(|hit| hit.chunk.source
-                != SourceRef::Artifact {
-                    id: "palace/secret".to_owned()
-                }));
+        let workspace_hits = workspace_index.search(
+            &Query {
+                embedding: Some(vec![0.0; 8]),
+                text: None,
+                manifest: workspace_index.manifest().clone(),
+            },
+            10,
+        )?;
+        assert!(workspace_hits.iter().all(|hit| hit.chunk.source
+            != SourceRef::Artifact {
+                id: "palace/secret".to_owned()
+            }));
 
-        let operator_store = LensStore::open(&operator_root).expect("opens operator store");
-        let operator_index =
-            FlatIndex::load(&operator_store, "knowledge.palace").expect("loads operator index");
+        let operator_store = LensStore::open(&operator_root)?;
+        let operator_index = FlatIndex::load(&operator_store, "knowledge.palace")?;
         assert!(!operator_index.is_empty());
+        Ok(())
     }
 
     fn operator_only_document(text: &str, id: &str) -> RawDocument {
@@ -949,8 +960,9 @@ mod tests {
     /// bewiese der Test nur "es endet mit einem Fehler", nicht "der Text
     /// wurde nie verschickt").
     #[test]
-    fn test_build_index_operator_only_bucket_with_remote_embedder_is_rejected_before_embedding() {
-        let home = tempfile::tempdir().expect("tempdir");
+    fn test_build_index_operator_only_bucket_with_remote_embedder_is_rejected_before_embedding()
+    -> TestResult {
+        let home = tempfile::tempdir()?;
         let embedder = RemoteCountingEmbedder::new(8);
         let documents = vec![operator_only_document(
             "operator only secret content",
@@ -974,7 +986,11 @@ mod tests {
             Err(SourceError::OperatorOnlyRemoteEmbed { index_name }) => {
                 assert_eq!(index_name, "knowledge.palace");
             }
-            other => panic!("expected SourceError::OperatorOnlyRemoteEmbed, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected SourceError::OperatorOnlyRemoteEmbed, got {other:?}"
+                )));
+            }
         }
         assert_eq!(
             embedder.calls(),
@@ -985,14 +1001,15 @@ mod tests {
             LENS_REMOTE_EMBED_ON_OPERATOR_ONLY.count() > before,
             "the null counter must be driven past zero by an actual violation"
         );
+        Ok(())
     }
 
     /// Gegenprobe zum obigen Test: derselbe Remote-Embedder bleibt für einen
     /// gewöhnlichen `workspace`-Bucket zugelassen -- der Guard darf nicht
     /// überbreit greifen.
     #[test]
-    fn test_build_index_workspace_bucket_with_remote_embedder_still_succeeds() {
-        let home = tempfile::tempdir().expect("tempdir");
+    fn test_build_index_workspace_bucket_with_remote_embedder_still_succeeds() -> TestResult {
+        let home = tempfile::tempdir()?;
         let embedder = RemoteCountingEmbedder::new(8);
         let documents = vec![one_document("# Title\n\nOrdinary body.\n")];
 
@@ -1005,11 +1022,11 @@ mod tests {
             Metric::Cosine,
             &embedder,
             &descriptor(),
-        )
-        .expect("workspace visibility is not subject to the operator-only guard");
+        )?;
 
         assert_eq!(reports.len(), 1);
         assert_eq!(embedder.calls(), 1);
+        Ok(())
     }
 
     /// [`crate::CODE_RUST_INDEX`] wird mit `chunk_rust` zerlegt, nicht mit
@@ -1017,8 +1034,8 @@ mod tests {
     /// Markdown-Zerlegung anders ausfiele (kein `#`-Überschriftenzeichen),
     /// trotzdem an Element-Grenzen (`fn`) zerlegt wird.
     #[test]
-    fn test_build_index_code_rust_index_uses_chunk_rust_not_chunk_markdown() {
-        let home = tempfile::tempdir().expect("tempdir");
+    fn test_build_index_code_rust_index_uses_chunk_rust_not_chunk_markdown() -> TestResult {
+        let home = tempfile::tempdir()?;
         let embedder = CountingEmbedder::new(8);
         let source_text = "fn a() {}\nfn b() {}\n";
         let documents = vec![RawDocument {
@@ -1038,8 +1055,7 @@ mod tests {
             Metric::Cosine,
             &embedder,
             &descriptor(),
-        )
-        .expect("builds");
+        )?;
 
         let expected = harw_lens_chunk::chunk_rust(
             &SourceRef::File {
@@ -1051,6 +1067,7 @@ mod tests {
         let seen = embedder.texts_seen();
         assert!(seen.iter().any(|text| text.contains("fn a() {}")));
         assert!(seen.iter().any(|text| text.contains("fn b() {}")));
+        Ok(())
     }
 
     /// Determinismus für [`crate::CODE_RUST_INDEX`]: derselbe Quelltext
@@ -1059,8 +1076,8 @@ mod tests {
     /// `test_build_index_second_build_over_unchanged_material_never_calls_embedder`
     /// für `docs.design` belegt, hier für die zweite Zerlegungsstrategie.
     #[test]
-    fn test_build_index_code_rust_index_second_build_never_calls_embedder() {
-        let home = tempfile::tempdir().expect("tempdir");
+    fn test_build_index_code_rust_index_second_build_never_calls_embedder() -> TestResult {
+        let home = tempfile::tempdir()?;
         let embedder = CountingEmbedder::new(8);
         let documents = vec![RawDocument {
             source: SourceRef::File {
@@ -1079,8 +1096,7 @@ mod tests {
             Metric::Cosine,
             &embedder,
             &descriptor(),
-        )
-        .expect("first build");
+        )?;
         assert_eq!(embedder.calls(), 1);
 
         let reports = build_index(
@@ -1092,10 +1108,14 @@ mod tests {
             Metric::Cosine,
             &embedder,
             &descriptor(),
-        )
-        .expect("second build");
+        )?;
 
-        assert_eq!(embedder.calls(), 1, "second build must not call the embedder again");
+        assert_eq!(
+            embedder.calls(),
+            1,
+            "second build must not call the embedder again"
+        );
         assert_eq!(reports[0].embedded_count, 0);
+        Ok(())
     }
 }

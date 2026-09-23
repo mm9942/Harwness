@@ -134,6 +134,7 @@ impl PermissionsSection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
     fn test_default_section_is_empty_and_valid() {
@@ -147,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_toml_round_trip() {
+    fn test_full_toml_round_trip() -> TestResult {
         let src = r#"
             default_mode = "auto"
             approval_timeout_secs = 60
@@ -160,7 +161,7 @@ mod tests {
             [[deny]]
             tool = "fs.write"
         "#;
-        let section: PermissionsSection = toml::from_str(src).unwrap();
+        let section: PermissionsSection = toml::from_str(src).map_err(ctx("parse toml"))?;
         assert_eq!(section.default_mode.as_deref(), Some("auto"));
         assert_eq!(section.approval_timeout_secs, Some(60));
         assert_eq!(section.allow.len(), 1);
@@ -169,22 +170,32 @@ mod tests {
         assert_eq!(section.deny.len(), 1);
         assert_eq!(section.deny[0].tool, "fs.write");
         assert!(section.deny[0].pattern.is_none());
-        assert_eq!(section.extra_roots, vec![PathBuf::from("/home/mia/scratch")]);
+        assert_eq!(
+            section.extra_roots,
+            vec![PathBuf::from("/home/mia/scratch")]
+        );
         assert!(section.validate().is_ok());
 
-        let encoded = toml::to_string(&section).unwrap();
-        let decoded: PermissionsSection = toml::from_str(&encoded).unwrap();
+        let encoded = toml::to_string(&section).map_err(ctx("encode toml"))?;
+        let decoded: PermissionsSection =
+            toml::from_str(&encoded).map_err(ctx("parse encoded toml"))?;
         assert_eq!(decoded, section);
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_unknown_default_mode() {
+    fn test_validate_rejects_unknown_default_mode() -> TestResult {
         let section = PermissionsSection {
             default_mode: Some("yolo".to_owned()),
             ..PermissionsSection::default()
         };
-        let error = section.validate().unwrap_err();
+        let Err(error) = section.validate() else {
+            return Err(TestError::Unexpected(
+                "unknown default_mode must be rejected".to_string(),
+            ));
+        };
         assert!(error.contains("default_mode"));
+        Ok(())
     }
 
     #[test]
@@ -220,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rejects_empty_rule_tool() {
+    fn test_validate_rejects_empty_rule_tool() -> TestResult {
         let section = PermissionsSection {
             allow: vec![RuleToml {
                 tool: "   ".to_owned(),
@@ -228,30 +239,45 @@ mod tests {
             }],
             ..PermissionsSection::default()
         };
-        let error = section.validate().unwrap_err();
+        let Err(error) = section.validate() else {
+            return Err(TestError::Unexpected(
+                "empty rule tool must be rejected".to_string(),
+            ));
+        };
         assert!(error.contains("tool"));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_relative_extra_root() {
+    fn test_validate_rejects_relative_extra_root() -> TestResult {
         let section = PermissionsSection {
             extra_roots: vec![PathBuf::from("relative/path")],
             ..PermissionsSection::default()
         };
-        let error = section.validate().unwrap_err();
+        let Err(error) = section.validate() else {
+            return Err(TestError::Unexpected(
+                "relative extra_root must be rejected".to_string(),
+            ));
+        };
         assert!(error.contains("extra_roots"));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_rejects_more_than_eight_extra_roots() {
+    fn test_validate_rejects_more_than_eight_extra_roots() -> TestResult {
         let section = PermissionsSection {
             extra_roots: (0..9)
                 .map(|n| PathBuf::from(format!("/root/{n}")))
                 .collect(),
             ..PermissionsSection::default()
         };
-        let error = section.validate().unwrap_err();
+        let Err(error) = section.validate() else {
+            return Err(TestError::Unexpected(
+                "more than eight extra_roots must be rejected".to_string(),
+            ));
+        };
         assert!(error.contains("extra_roots"));
+        Ok(())
     }
 
     #[test]

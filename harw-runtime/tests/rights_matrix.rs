@@ -19,9 +19,12 @@
 //! Root-Space), [`ModelSource::Echo`] als Modell — kein Netz, kein Anbieter,
 //! kein Geheimnis.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use common::{TestError, TestResult, ctx};
 use harw_agent_dsl::roles::AgentRoleId;
 use harw_core::{ChildRegistryFactory, EchoModelProvider, InMemoryStateStore, StateStore};
 use harw_extension_api::allow_rules::AllowRuleSet;
@@ -65,20 +68,20 @@ struct Fixture {
     project: PathBuf,
 }
 
-fn fixture() -> Fixture {
-    let dir = tempfile::tempdir().expect("tempdir");
+fn fixture() -> TestResult<Fixture> {
+    let dir = tempfile::tempdir()?;
     let home = dir.path().join("home");
     let project = dir.path().join("project");
-    std::fs::create_dir_all(&home).expect("home");
-    std::fs::create_dir_all(&project).expect("project");
+    std::fs::create_dir_all(&home).map_err(ctx("home"))?;
+    std::fs::create_dir_all(&project).map_err(ctx("project"))?;
     // Projekt-Marker, damit `discover_project` genau hier stehen bleibt.
-    std::fs::write(project.join("Cargo.toml"), "[workspace]\n").expect("marker");
-    write_fixture_uia(&home);
-    Fixture {
+    std::fs::write(project.join("Cargo.toml"), "[workspace]\n").map_err(ctx("marker"))?;
+    write_fixture_uia(&home)?;
+    Ok(Fixture {
         _dir: dir,
         home,
         project,
-    }
+    })
 }
 
 /// Legt eine minimale, gültige UIA (`role = "user-interface"`) im
@@ -99,20 +102,20 @@ fn fixture() -> Fixture {
 /// `active_profile`-Datei ist `"default"` (`harw_home::active_profile_name`).
 /// Nur `Tui`/`OneShot` lesen `active_uia_definition` überhaupt
 /// (`resolve_active_uia`); alle anderen Einstiege bleiben unverändert.
-fn write_fixture_uia(home: &Path) {
+fn write_fixture_uia(home: &Path) -> TestResult {
     let profile_dir = home.join("profiles").join("default");
     let agent_dir = profile_dir.join("agents").join("fixture-uia");
-    std::fs::create_dir_all(&agent_dir).expect("fixture uia dir");
+    std::fs::create_dir_all(&agent_dir).map_err(ctx("fixture uia dir"))?;
     std::fs::write(
         agent_dir.join("definition.toml"),
         "schema = \"harwness.agent/v1\"\nid = \"harwness.agent.fixture-uia@1\"\nversion = \"1.0.0\"\nrole = \"user-interface\"\nspecialization = \"terminal-ui\"\n",
     )
-    .expect("fixture uia definition");
+    .map_err(ctx("fixture uia definition"))?;
     std::fs::write(
         profile_dir.join("config.toml"),
         "active_uia_definition = \"harwness.agent.fixture-uia@1\"\n",
     )
-    .expect("fixture profile config");
+    .map_err(ctx("fixture profile config"))
 }
 
 fn spec_for(entry: EntryKind, fixture: &Fixture) -> RuntimeSpec {
@@ -257,11 +260,11 @@ fn expected(entry: EntryKind) -> Expected {
 }
 
 #[test]
-fn every_entry_matches_its_row_of_the_rights_table() {
+fn every_entry_matches_its_row_of_the_rights_table() -> TestResult {
     for entry in ALL_ENTRIES {
-        let fixture = fixture();
+        let fixture = fixture()?;
         let assembled = assemble(entry, &fixture)
-            .unwrap_or_else(|error| panic!("{entry:?} muss montieren: {error}"));
+            .map_err(|error| TestError::Unexpected(format!("{entry:?} muss montieren: {error}")))?;
         let snapshot = assembled.assembly.rights_snapshot();
         let want = expected(entry);
 
@@ -301,13 +304,14 @@ fn every_entry_matches_its_row_of_the_rights_table() {
             assembled.assembly.principal().approval_actor()
         );
     }
+    Ok(())
 }
 
 #[test]
-fn no_entry_carries_network() {
+fn no_entry_carries_network() -> TestResult {
     for entry in ALL_ENTRIES {
-        let fixture = fixture();
-        let assembled = assemble(entry, &fixture).expect("montiert");
+        let fixture = fixture()?;
+        let assembled = assemble(entry, &fixture)?;
         let snapshot = assembled.assembly.rights_snapshot();
         assert!(
             !snapshot.permissions.iter().any(|p| p == "NetworkAccess"),
@@ -318,24 +322,21 @@ fn no_entry_carries_network() {
             "{entry:?} darf bis W5 keinen Netz-Scope tragen"
         );
         assert!(
-            assembled
-                .assembly
-                .sandbox()
-                .network_scope()
-                .is_empty(),
+            assembled.assembly.sandbox().network_scope().is_empty(),
             "{entry:?}: auch die Sandbox selbst trägt keinen Scope"
         );
     }
+    Ok(())
 }
 
 #[test]
-fn spawner_roles_are_exactly_the_builtin_roles() {
+fn spawner_roles_are_exactly_the_builtin_roles() -> TestResult {
     let mut want: Vec<String> = role_names::ALL.iter().map(|r| (*r).to_owned()).collect();
     want.sort();
 
     for entry in ALL_ENTRIES {
-        let fixture = fixture();
-        let assembled = assemble(entry, &fixture).expect("montiert");
+        let fixture = fixture()?;
+        let assembled = assemble(entry, &fixture)?;
         let snapshot = assembled.assembly.rights_snapshot();
         match entry.profile().spawner {
             SpawnerPolicy::BuiltinRoles => {
@@ -348,13 +349,14 @@ fn spawner_roles_are_exactly_the_builtin_roles() {
             }
         }
     }
+    Ok(())
 }
 
 #[test]
-fn ceiling_sections_follow_the_ceiling_policy() {
+fn ceiling_sections_follow_the_ceiling_policy() -> TestResult {
     for entry in ALL_ENTRIES {
-        let fixture = fixture();
-        let assembled = assemble(entry, &fixture).expect("montiert");
+        let fixture = fixture()?;
+        let assembled = assemble(entry, &fixture)?;
         let sections = assembled.assembly.rights_snapshot().ceiling_sections;
         match entry.profile().ceiling {
             CeilingPolicy::Closed => assert!(sections.is_empty(), "{entry:?}"),
@@ -366,11 +368,12 @@ fn ceiling_sections_follow_the_ceiling_policy() {
             }
         }
     }
+    Ok(())
 }
 
 #[test]
-fn a_spawning_entry_needs_a_session_event_sender() {
-    let fixture = fixture();
+fn a_spawning_entry_needs_a_session_event_sender() -> TestResult {
+    let fixture = fixture()?;
     let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
     let built = RuntimeAssembly::builder(spec_for(EntryKind::Tui, &fixture))
         .model(ModelSource::Echo("echo".to_owned()))
@@ -382,12 +385,13 @@ fn a_spawning_entry_needs_a_session_event_sender() {
         .build();
 
     assert!(matches!(built, Err(RuntimeError::Spawner { .. })));
+    Ok(())
 }
 
 #[test]
-fn the_child_factory_refuses_an_unknown_role() {
-    let fixture = fixture();
-    let assembled = assemble(EntryKind::Tui, &fixture).expect("montiert");
+fn the_child_factory_refuses_an_unknown_role() -> TestResult {
+    let fixture = fixture()?;
+    let assembled = assemble(EntryKind::Tui, &fixture)?;
     let factory = RuntimeChildRegistryFactory::new(
         assembled.assembly.project().clone(),
         Arc::new(EchoModelProvider::new("echo")),
@@ -399,7 +403,7 @@ fn the_child_factory_refuses_an_unknown_role() {
             AllowRuleSet::new(),
         ),
     )
-    .expect("Fabrik");
+    .map_err(ctx("Fabrik"))?;
 
     let input = spawn_input();
     // Kein `.expect_err(...)`: das verlangte `Result::Ok`-Typ `Debug`, den
@@ -407,7 +411,11 @@ fn the_child_factory_refuses_an_unknown_role() {
     // nicht ins Log). Die Eigenschaft, um die es hier geht — die Kette scheitert
     // an der unbekannten Rolle —, prüfen wir direkt über den `Err`-Zweig.
     let error = match factory.build_registry("definitely-not-a-role", &input, None) {
-        Ok(_) => panic!("unbekannte Rolle muss fehlschlagen"),
+        Ok(_) => {
+            return Err(TestError::Unexpected(
+                "unbekannte Rolle muss fehlschlagen".into(),
+            ));
+        }
         Err(error) => error,
     };
     assert!(
@@ -419,13 +427,14 @@ fn the_child_factory_refuses_an_unknown_role() {
     // Gegenprobe: eine eingebaute Rolle montiert.
     factory
         .build_registry(role_names::EXPLORER, &input, None)
-        .expect("eingebaute Rolle montiert");
+        .map_err(ctx("eingebaute Rolle montiert"))?;
+    Ok(())
 }
 
 #[test]
-fn the_child_registry_inherits_the_config_approval_policy() {
-    let fixture = fixture();
-    let assembled = assemble(EntryKind::Tui, &fixture).expect("montiert");
+fn the_child_registry_inherits_the_config_approval_policy() -> TestResult {
+    let fixture = fixture()?;
+    let assembled = assemble(EntryKind::Tui, &fixture)?;
     let mut config = harw_config::ResolvedConfig::default();
     config.harness.policy.require_approval_for = vec!["fs.write".to_owned()];
     let chain = ApprovalChain::for_root(
@@ -450,10 +459,10 @@ fn the_child_registry_inherits_the_config_approval_policy() {
         Arc::new(EchoModelProvider::new("echo")),
         chain,
     )
-    .expect("Fabrik");
+    .map_err(ctx("Fabrik"))?;
     let registry = factory
         .build_registry(role_names::EXPLORER, &spawn_input(), None)
-        .expect("montiert");
+        .map_err(ctx("montiert"))?;
 
     // Die Kind-Registry führt die geerbte Kette (F-018) — und **genau** sie:
     // `install_over_default` hängt keine zweite `DefaultApprovalPolicy` neben
@@ -464,17 +473,18 @@ fn the_child_registry_inherits_the_config_approval_policy() {
         child_chain.len(),
         "die Kind-Registry bildet die Kind-Kette ab, ohne Dublette: {child_chain:?}"
     );
+    Ok(())
 }
 
 #[test]
-fn discovery_runs_exactly_once_per_assembly() {
-    let fixture = fixture();
-    let assembled = assemble(EntryKind::Tui, &fixture).expect("montiert");
+fn discovery_runs_exactly_once_per_assembly() -> TestResult {
+    let fixture = fixture()?;
+    let assembled = assemble(EntryKind::Tui, &fixture)?;
 
     // Das Projektverzeichnis verschwindet **nach** der Montage. Eine
     // verborgene zweite Erkennung könnte danach nicht mehr gelingen; der
     // Beweis hängt also nicht an einem Zähler, sondern an der Unmöglichkeit.
-    std::fs::remove_dir_all(&fixture.project).expect("Projekt entfernen");
+    std::fs::remove_dir_all(&fixture.project).map_err(ctx("Projekt entfernen"))?;
     assert!(
         harw_project_discovery::discover_project(
             &fixture.project,
@@ -493,7 +503,7 @@ fn discovery_runs_exactly_once_per_assembly() {
             turn_events,
             None,
         )
-        .expect("die Wurzelsitzung entsteht ohne zweite Erkennung");
+        .map_err(ctx("die Wurzelsitzung entsteht ohne zweite Erkennung"))?;
     assert_eq!(root.session.id(), assembled.assembly.root_session_id());
 
     // Auch eine Kind-Registry kommt ohne Verzeichnis aus.
@@ -508,23 +518,24 @@ fn discovery_runs_exactly_once_per_assembly() {
             AllowRuleSet::new(),
         ),
     )
-    .expect("Fabrik");
+    .map_err(ctx("Fabrik"))?;
     factory
         .build_registry(role_names::EXPLORER, &spawn_input(), None)
-        .expect("Kind-Registry ohne zweite Erkennung");
+        .map_err(ctx("Kind-Registry ohne zweite Erkennung"))?;
+    Ok(())
 }
 
 #[test]
-fn the_root_session_is_handed_out_exactly_once() {
-    let fixture = fixture();
-    let assembled = assemble(EntryKind::Tui, &fixture).expect("montiert");
+fn the_root_session_is_handed_out_exactly_once() -> TestResult {
+    let fixture = fixture()?;
+    let assembled = assemble(EntryKind::Tui, &fixture)?;
     let id = assembled.assembly.root_session_id().clone();
 
     let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEventAlias>();
     assembled
         .assembly
         .new_root_session(id.clone(), assembled.events.clone(), turn_events, None)
-        .expect("erste Wurzelsitzung");
+        .map_err(ctx("erste Wurzelsitzung"))?;
 
     let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEventAlias>();
     let second =
@@ -532,12 +543,13 @@ fn the_root_session_is_handed_out_exactly_once() {
             .assembly
             .new_root_session(id, assembled.events.clone(), turn_events, None);
     assert!(matches!(second, Err(RuntimeError::Registry { .. })));
+    Ok(())
 }
 
 #[test]
-fn a_foreign_session_id_is_refused() {
-    let fixture = fixture();
-    let assembled = assemble(EntryKind::Tui, &fixture).expect("montiert");
+fn a_foreign_session_id_is_refused() -> TestResult {
+    let fixture = fixture()?;
+    let assembled = assemble(EntryKind::Tui, &fixture)?;
     let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEventAlias>();
     let refused = assembled.assembly.new_root_session(
         SessionId::new(),
@@ -546,10 +558,11 @@ fn a_foreign_session_id_is_refused() {
         None,
     );
     assert!(matches!(refused, Err(RuntimeError::Spawner { .. })));
+    Ok(())
 }
 
 #[test]
-fn root_activation_matches_the_session_base_activation() {
+fn root_activation_matches_the_session_base_activation() -> TestResult {
     // `EntryKind::Tui` (und `OneShot`) montieren seit dem UIA-Vertrag
     // ausschließlich über `harness.active_uia_definition`
     // (`resolve_active_uia`, `harw-runtime/src/assembly.rs`) — dort ersetzt
@@ -563,7 +576,7 @@ fn root_activation_matches_the_session_base_activation() {
     // `RuntimeError::Spawner`). Die Invariante W2A-02 bleibt unverändert:
     // die Spawner-Fläche, mit der die Wurzel registriert wurde, muss exakt
     // die Basis-Aktivierung der eröffneten Sitzung sein.
-    let fixture = fixture();
+    let fixture = fixture()?;
     let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEventAlias>();
     let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
     let mut spec = spec_for(EntryKind::Analyze, &fixture);
@@ -577,29 +590,35 @@ fn root_activation_matches_the_session_base_activation() {
         })
         .session_events(events.clone())
         .build()
-        .expect("montiert");
+        .map_err(ctx("montiert"))?;
 
     let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEventAlias>();
     let root = assembly
-        .new_root_session(assembly.root_session_id().clone(), events, turn_events, None)
-        .expect("Wurzelsitzung");
+        .new_root_session(
+            assembly.root_session_id().clone(),
+            events,
+            turn_events,
+            None,
+        )
+        .map_err(ctx("Wurzelsitzung"))?;
 
     // Der Spawner wurde mit derselben Fläche registriert, die die Sitzung
     // danach als Basis führt — sonst würde ein Kind gegen eine andere
     // Aktivierung geschnitten als die, unter der die Wurzel läuft (W2A-02).
     let base = root.session.base_activation();
     assert_eq!(base.profile(), harw_core::ToolProfile::Minimal);
+    Ok(())
 }
 
 #[test]
-fn an_unknown_active_agent_fails_closed() {
+fn an_unknown_active_agent_fails_closed() -> TestResult {
     // `active_agent` bestimmt die Wurzelaktivierung nur für Nicht-UI-
     // Einstiege (`resolve_active_uia` in `harw-runtime/src/assembly.rs`
     // gibt für alles außer `Tui`/`OneShot` `Ok(None)` zurück, also greift
     // dort `resolve_active_agent(spec.active_agent, ...)`). `Analyze` ist
     // ein solcher Nicht-UI-Einstieg. Fail-closed bei unbekannter Rolle
     // bleibt die geprüfte Absicht — nur der Einstieg wechselt.
-    let fixture = fixture();
+    let fixture = fixture()?;
     let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEventAlias>();
     let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
     let mut spec = spec_for(EntryKind::Analyze, &fixture);
@@ -615,10 +634,11 @@ fn an_unknown_active_agent_fails_closed() {
         .build();
 
     assert!(matches!(built, Err(RuntimeError::Registry { .. })));
+    Ok(())
 }
 
 #[test]
-fn tui_ignores_an_unknown_active_agent_because_the_uia_governs() {
+fn tui_ignores_an_unknown_active_agent_because_the_uia_governs() -> TestResult {
     // In `Tui` (und `OneShot`) bestimmt ausschließlich die konfigurierte
     // UIA die Root-Aktivierung; `resolve_active_agent` wird für
     // `spec.active_agent` gar nicht erst aufgerufen, sobald `uia_ir`
@@ -626,7 +646,7 @@ fn tui_ignores_an_unknown_active_agent_because_the_uia_governs() {
     // `active_agent`-Rolle darf die UIA daher weder ersetzen noch die
     // Montage zu Fall bringen — die Fixture-UIA aus `write_fixture_uia`
     // montiert unverändert.
-    let fixture = fixture();
+    let fixture = fixture()?;
     let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEventAlias>();
     let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
     let mut spec = spec_for(EntryKind::Tui, &fixture);
@@ -645,16 +665,20 @@ fn tui_ignores_an_unknown_active_agent_because_the_uia_governs() {
         built.is_ok(),
         "die UIA muss eine unbekannte active_agent-Rolle in Tui überschatten: {built:?}"
     );
+    Ok(())
 }
 
 #[test]
-fn turn_limits_never_exceed_the_root_budget() {
+fn turn_limits_never_exceed_the_root_budget() -> TestResult {
     for entry in ALL_ENTRIES {
-        let fixture = fixture();
-        let assembled = assemble(entry, &fixture).expect("montiert");
+        let fixture = fixture()?;
+        let assembled = assemble(entry, &fixture)?;
         let budget = *assembled.assembly.budget();
         let limits = *assembled.assembly.turn_limits();
-        assert_eq!(limits.max_model_rounds, budget.max_model_rounds, "{entry:?}");
+        assert_eq!(
+            limits.max_model_rounds, budget.max_model_rounds,
+            "{entry:?}"
+        );
         assert_eq!(
             limits.max_output_tokens_total, budget.max_total_tokens,
             "{entry:?}"
@@ -662,6 +686,7 @@ fn turn_limits_never_exceed_the_root_budget() {
         assert_eq!(limits.wall_time, budget.max_wall, "{entry:?}");
         assert!(limits.tool_result_max_bytes > 0, "{entry:?}");
     }
+    Ok(())
 }
 
 /// Ein Haken-Doppel: merkt sich jede gemeldete Sitzung.
@@ -703,8 +728,8 @@ impl AssemblyContributor for HookContributor {
 /// ein — damit ist beides geprüft: dass ein Beitrag die Montage erreicht und
 /// dass `close_session` jeden Haken ruft.
 #[test]
-fn closing_a_session_reaches_every_hook() {
-    let fixture = fixture();
+fn closing_a_session_reaches_every_hook() -> TestResult {
+    let fixture = fixture()?;
     let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEventAlias>();
     let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
     let contributor = Arc::new(HookContributor::default());
@@ -718,7 +743,7 @@ fn closing_a_session_reaches_every_hook() {
         .session_events(events)
         .contributor(Arc::clone(&contributor) as Arc<dyn AssemblyContributor>)
         .build()
-        .expect("montiert");
+        .map_err(ctx("montiert"))?;
 
     // Wurzel und ein Kind: `close_session` unterscheidet sie nicht.
     let child = SessionId::new();
@@ -732,6 +757,7 @@ fn closing_a_session_reaches_every_hook() {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     assert_eq!(seen, vec![assembly.root_session_id().clone(), child]);
+    Ok(())
 }
 
 /// Ein Responder-Doppel: entscheidet nichts, meldet aber Art und Namen,
@@ -769,10 +795,10 @@ fn operation_model_tool_names(assembly: &RuntimeAssembly) -> Vec<String> {
 /// Z2c-01, erste Hälfte: die Operations-Registry eines Laufs ist die seines
 /// Einstiegs — [`OperationSurface::None`] heißt wirklich „keine".
 #[test]
-fn the_operation_surface_reaches_the_assembled_run() {
+fn the_operation_surface_reaches_the_assembled_run() -> TestResult {
     for entry in ALL_ENTRIES {
-        let fixture = fixture();
-        let assembled = assemble(entry, &fixture).expect("montiert");
+        let fixture = fixture()?;
+        let assembled = assemble(entry, &fixture)?;
         let operations = assembled.assembly.operations();
         match entry.profile().operations {
             OperationSurface::None => assert!(
@@ -785,6 +811,7 @@ fn the_operation_surface_reaches_the_assembled_run() {
             }
         }
     }
+    Ok(())
 }
 
 /// Die Namen der Plan-Werkzeuge, die `register_plan_tools`
@@ -807,9 +834,9 @@ const PLAN_TOOL_NAMES: &[&str] = &[
 /// `Analyze` und `Web` — Vertrag „nur Commands" — dieselbe volle
 /// Modell-Tool-Fläche wie die TUI.
 #[test]
-fn only_the_full_surface_offers_operations_to_the_model() {
-    let fixture = fixture();
-    let tui = assemble(EntryKind::Tui, &fixture).expect("montiert");
+fn only_the_full_surface_offers_operations_to_the_model() -> TestResult {
+    let fixture = fixture()?;
+    let tui = assemble(EntryKind::Tui, &fixture)?;
     let exposed = operation_model_tool_names(&tui.assembly);
     assert!(
         !exposed.is_empty(),
@@ -832,7 +859,7 @@ fn only_the_full_surface_offers_operations_to_the_model() {
     // (siehe unten). Nur *innerhalb* der vollen Fläche unterscheiden sich
     // `Tui` und `OneShot` jetzt um genau die dokumentierten Plan-Werkzeuge.
     for entry in [EntryKind::Tui, EntryKind::OneShot] {
-        let assembled = assemble(entry, &fixture).expect("montiert");
+        let assembled = assemble(entry, &fixture)?;
         let tools = assembled.assembly.rights_snapshot().tools;
         for name in &exposed {
             let is_plan_tool = PLAN_TOOL_NAMES.contains(&name.as_str());
@@ -853,7 +880,7 @@ fn only_the_full_surface_offers_operations_to_the_model() {
     }
 
     for entry in [EntryKind::Analyze, EntryKind::Web] {
-        let assembled = assemble(entry, &fixture).expect("montiert");
+        let assembled = assemble(entry, &fixture)?;
         let tools = assembled.assembly.rights_snapshot().tools;
         for name in &exposed {
             assert!(
@@ -866,16 +893,17 @@ fn only_the_full_surface_offers_operations_to_the_model() {
             "{entry:?} behält seine Command-Operationen"
         );
     }
+    Ok(())
 }
 
 /// Z2c-02: Ein Responder ist nur dort zulässig, wo die Vertragstabelle eine
 /// anwesende Person vorsieht; sonst montiert die Kette den deterministischen
 /// Deny-Handler ihrer [`AskResolution`].
 #[test]
-fn only_an_interactive_entry_accepts_an_approval_responder() {
+fn only_an_interactive_entry_accepts_an_approval_responder() -> TestResult {
     for entry in ALL_ENTRIES {
-        let fixture = fixture();
-        let assembled = assemble(entry, &fixture).expect("montiert");
+        let fixture = fixture()?;
+        let assembled = assemble(entry, &fixture)?;
         let ask = entry.profile().ask;
         let label = AskResolutionPolicy::label_for(ask);
         let id = assembled.assembly.root_session_id().clone();
@@ -890,9 +918,11 @@ fn only_an_interactive_entry_accepts_an_approval_responder() {
 
         match ask {
             AskResolution::Interactive => {
-                let root = offered.unwrap_or_else(|error| {
-                    panic!("{entry:?} löst interaktiv auf und nimmt einen Responder: {error}")
-                });
+                let root = offered.map_err(|error| {
+                    TestError::Unexpected(format!(
+                        "{entry:?} löst interaktiv auf und nimmt einen Responder: {error}"
+                    ))
+                })?;
                 assert_eq!(root.session.id(), &id);
                 let chain = assembled.assembly.rights_snapshot().approval_chain;
                 assert!(
@@ -918,7 +948,9 @@ fn only_an_interactive_entry_accepts_an_approval_responder() {
                 assembled
                     .assembly
                     .new_root_session(id, assembled.events.clone(), turn_events, None)
-                    .unwrap_or_else(|error| panic!("{entry:?} montiert ohne Responder: {error}"));
+                    .map_err(|error| {
+                        TestError::Unexpected(format!("{entry:?} montiert ohne Responder: {error}"))
+                    })?;
 
                 let chain = assembled.assembly.rights_snapshot().approval_chain;
                 assert!(
@@ -928,16 +960,17 @@ fn only_an_interactive_entry_accepts_an_approval_responder() {
             }
         }
     }
+    Ok(())
 }
 
 /// Z2c-06: Die Kette trägt die eingebaute Standardpolitik **genau einmal**.
 /// `assemble_registry_for_project` registriert sie selbst; eine zweite käme
 /// aus der Montage und wäre eine Dublette.
 #[test]
-fn every_entry_carries_exactly_one_default_policy() {
+fn every_entry_carries_exactly_one_default_policy() -> TestResult {
     for entry in ALL_ENTRIES {
-        let fixture = fixture();
-        let assembled = assemble(entry, &fixture).expect("montiert");
+        let fixture = fixture()?;
+        let assembled = assemble(entry, &fixture)?;
         let chain = assembled.assembly.rights_snapshot().approval_chain;
         let defaults: Vec<&(&str, ApprovalHandlerKind)> = chain
             .iter()
@@ -946,6 +979,7 @@ fn every_entry_carries_exactly_one_default_policy() {
         assert_eq!(defaults.len(), 1, "{entry:?}: {chain:?}");
         assert_eq!(defaults[0].0, DEFAULT_POLICY_LABEL, "{entry:?}");
     }
+    Ok(())
 }
 
 /// Ein minimaler, vertrauenswürdiger Handoff für die Fabrik-Tests.
@@ -961,11 +995,12 @@ fn spawn_input() -> harw_extension_api::SpawnInput {
 
 /// Hält `Path` im Gebrauch: die Fixture-Pfade werden als `&Path` geprüft.
 #[test]
-fn the_fixture_project_is_a_directory() {
-    let fixture = fixture();
+fn the_fixture_project_is_a_directory() -> TestResult {
+    let fixture = fixture()?;
     let project: &Path = fixture.project.as_path();
     assert!(project.is_dir());
     assert!(fixture.home.is_dir());
+    Ok(())
 }
 
 // The next two tests close the end-to-end gap left by
@@ -988,11 +1023,11 @@ fn the_fixture_project_is_a_directory() {
 /// root's own session id for building a `SpawnInput`.
 async fn uia_spawner_fixture(
     assembled: &Assembled,
-) -> (
+) -> TestResult<(
     Arc<harw_core::ManagedAgentSpawner>,
     harw_authority::SandboxSpec,
     SessionId,
-) {
+)> {
     let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEventAlias>();
     let root = assembled
         .assembly
@@ -1002,11 +1037,13 @@ async fn uia_spawner_fixture(
             turn_events,
             None,
         )
-        .expect("Wurzelsitzung");
+        .map_err(ctx("Wurzelsitzung"))?;
     let organizational_role = root
         .session
         .spawn_context()
-        .expect("root session carries a trusted spawn context")
+        .ok_or(TestError::Missing(
+            "root session carries a trusted spawn context",
+        ))?
         .organizational_role;
     assert_eq!(
         organizational_role,
@@ -1014,15 +1051,12 @@ async fn uia_spawner_fixture(
         "precondition: the fixture UIA governs this root as UserInterface"
     );
 
-    let spawner = Arc::clone(
-        assembled
-            .assembly
-            .spawner()
-            .expect("EntryKind::Tui mounts a BuiltinRoles spawner"),
-    );
+    let spawner = Arc::clone(assembled.assembly.spawner().ok_or(TestError::Missing(
+        "EntryKind::Tui mounts a BuiltinRoles spawner",
+    ))?);
     let sandbox = assembled.assembly.sandbox().clone();
     let parent = assembled.assembly.root_session_id().clone();
-    (spawner, sandbox, parent)
+    Ok((spawner, sandbox, parent))
 }
 
 /// Builds a minimal, trusted `SpawnInput` for the given parent session.
@@ -1048,13 +1082,13 @@ fn uia_child_input(parent_session_id: SessionId) -> harw_extension_api::SpawnInp
 /// against the same `ManagedAgentSpawner` a mounted `EntryKind::Tui` run
 /// actually registers, not a hand-built stand-in.
 #[tokio::test]
-async fn uia_root_session_is_denied_the_plain_explore_and_research_roles() {
-    let fixture = fixture();
-    let assembled = assemble(EntryKind::Tui, &fixture).expect("montiert");
-    let (spawner, sandbox, parent) = uia_spawner_fixture(&assembled).await;
+async fn uia_root_session_is_denied_the_plain_explore_and_research_roles() -> TestResult {
+    let fixture = fixture()?;
+    let assembled = assemble(EntryKind::Tui, &fixture)?;
+    let (spawner, sandbox, parent) = uia_spawner_fixture(&assembled).await?;
 
     for plain_role in [role_names::EXPLORER, role_names::RESEARCHER_WEB] {
-        let rejected = spawner
+        let Err(rejected) = spawner
             .spawn_child(
                 plain_role,
                 uia_child_input(parent.clone()),
@@ -1062,13 +1096,17 @@ async fn uia_root_session_is_denied_the_plain_explore_and_research_roles() {
                 None,
             )
             .await
-            .expect_err("a UIA root session must never spawn a plain Worker-role child");
+        else {
+            return Err(TestError::Unexpected(
+                "a UIA root session must never spawn a plain Worker-role child".into(),
+            ));
+        };
         assert_eq!(
-            rejected.message,
-            "no delegation capability is available for this request",
+            rejected.message, "no delegation capability is available for this request",
             "role '{plain_role}'"
         );
     }
+    Ok(())
 }
 
 /// Case 2 (the fix; needs the sibling change to compile):
@@ -1084,10 +1122,11 @@ async fn uia_root_session_is_denied_the_plain_explore_and_research_roles() {
 /// `harw-ops/src/{explore,research}.rs` redirects a UIA caller to these
 /// role names.
 #[tokio::test]
-async fn uia_root_session_is_admitted_its_uia_explorer_and_uia_writer_specializations() {
-    let fixture = fixture();
-    let assembled = assemble(EntryKind::Tui, &fixture).expect("montiert");
-    let (spawner, sandbox, parent) = uia_spawner_fixture(&assembled).await;
+async fn uia_root_session_is_admitted_its_uia_explorer_and_uia_writer_specializations() -> TestResult
+{
+    let fixture = fixture()?;
+    let assembled = assemble(EntryKind::Tui, &fixture)?;
+    let (spawner, sandbox, parent) = uia_spawner_fixture(&assembled).await?;
 
     for uia_role in [role_names::UIA_EXPLORER, role_names::UIA_WRITER] {
         spawner
@@ -1098,10 +1137,13 @@ async fn uia_root_session_is_admitted_its_uia_explorer_and_uia_writer_specializa
                 None,
             )
             .await
-            .unwrap_or_else(|error| {
-                panic!("a UIA root session must admit its '{uia_role}' specialization: {error:?}")
-            });
+            .map_err(|error| {
+                TestError::Unexpected(format!(
+                    "a UIA root session must admit its '{uia_role}' specialization: {error:?}"
+                ))
+            })?;
     }
+    Ok(())
 }
 
 // ── Welle 3a, Teil A: die uia-worker-Rollenfamilie bekommt die UIA nicht die
@@ -1128,6 +1170,7 @@ fn two_provider_config() -> harw_config::ResolvedConfig {
             max_concurrency: None,
             originator: None,
             default_reasoning_effort: None,
+            gateway_identity_headers: false,
         }
     }
 
@@ -1195,10 +1238,9 @@ fn two_provider_config() -> harw_config::ResolvedConfig {
 ///    Netzzugriff bleibt (keine echte Verbindung nötig, siehe unten).
 #[tokio::test]
 async fn uia_worker_and_its_siblings_use_the_uia_provider_not_the_default_provider_when_they_differ()
-{
-
-    let fixture = fixture();
-    let assembled = assemble(EntryKind::Tui, &fixture).expect("montiert");
+-> TestResult {
+    let fixture = fixture()?;
+    let assembled = assemble(EntryKind::Tui, &fixture)?;
 
     let mut config = two_provider_config();
     config.harness.uia_provider = Some("local-b".to_owned());
@@ -1207,10 +1249,14 @@ async fn uia_worker_and_its_siblings_use_the_uia_provider_not_the_default_provid
     let spec = spec_for(EntryKind::Tui, &fixture);
     let default_tree_model: Arc<dyn harw_core::ModelProvider> =
         harw_runtime::model::build_root_model(&spec, &config, ModelSource::Configured)
-            .expect("default provider (local-a) must build");
-    let uia_client = harw_runtime::model::build_uia_model(&spec, &config, true, &default_tree_model)
-        .expect("uia provider (local-b) must resolve to a UiaDefaultRouteProvider wrapping the \
-                 default router — no second HTTP client is built");
+            .map_err(ctx("default provider (local-a) must build"))?;
+    let uia_client =
+        harw_runtime::model::build_uia_model(&spec, &config, true, &default_tree_model).map_err(
+            ctx(
+                "uia provider (local-b) must resolve to a UiaDefaultRouteProvider wrapping the \
+             default router — no second HTTP client is built",
+            ),
+        )?;
     let uia_worker_model = harw_runtime::model::build_uia_worker_model(&config, &uia_client);
 
     assert!(
@@ -1230,7 +1276,7 @@ async fn uia_worker_and_its_siblings_use_the_uia_provider_not_the_default_provid
             AllowRuleSet::new(),
         ),
     )
-    .expect("Fabrik");
+    .map_err(ctx("Fabrik"))?;
 
     for role in [
         role_names::UIA_WORKER,
@@ -1241,13 +1287,15 @@ async fn uia_worker_and_its_siblings_use_the_uia_provider_not_the_default_provid
         // Beweisschritt 1: die Rolle spawnt tatsächlich.
         factory
             .build_registry(role, &spawn_input(), None)
-            .unwrap_or_else(|error| panic!("role '{role}' must build a registry: {error:?}"));
+            .map_err(|error| {
+                TestError::Unexpected(format!("role '{role}' must build a registry: {error:?}"))
+            })?;
 
         // Beweisschritt 2: exakt das uia-abgeleitete Modell, nicht das
         // Vorgabe-Modell.
-        let model = factory
-            .model_for(role)
-            .unwrap_or_else(|error| panic!("role '{role}' must resolve a model: {error:?}"));
+        let model = factory.model_for(role).map_err(|error| {
+            TestError::Unexpected(format!("role '{role}' must resolve a model: {error:?}"))
+        })?;
         assert!(
             Arc::ptr_eq(&model, &uia_worker_model),
             "role '{role}' must receive exactly the uia-derived model, not the default \
@@ -1299,4 +1347,5 @@ async fn uia_worker_and_its_siblings_use_the_uia_provider_not_the_default_provid
              registered in the default router: {message}"
         );
     }
+    Ok(())
 }

@@ -400,6 +400,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Baut einen Bereich, der genau `dir` umfasst.
     fn scope_for(dir: &Path) -> ReadScope {
@@ -407,13 +408,14 @@ mod tests {
     }
 
     #[test]
-    fn test_read_line_fields_splits_columns_and_keeps_line_order() {
-        let dir = tempdir().expect("tempdir");
+    fn test_read_line_fields_splits_columns_and_keeps_line_order() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let file = dir.path().join("stat");
-        fs::write(&file, "cpu  2255 34 2290\ncpu0 1132 34 1441\n").expect("write");
+        fs::write(&file, "cpu  2255 34 2290\ncpu0 1132 34 1441\n").map_err(ctx("write"))?;
         let scope = scope_for(dir.path());
 
-        let rows = read_line_fields(&scope, &file).expect("read_line_fields muss gelingen");
+        let rows =
+            read_line_fields(&scope, &file).map_err(ctx("read_line_fields muss gelingen"))?;
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], "cpu");
@@ -421,223 +423,282 @@ mod tests {
         // Spaltenzuordnung wirklich.
         assert_eq!(rows[0][2], "34");
         assert_eq!(rows[1][0], "cpu0");
+        Ok(())
     }
 
     #[test]
-    fn test_read_line_fields_accepts_extra_columns() {
+    fn test_read_line_fields_accepts_extra_columns() -> TestResult {
         // Neuere Kernel hängen Spalten an. Ein Leser, der auf eine feste
         // Feldzahl besteht, scheitert nach einem Update an einer Datei, die
         // völlig in Ordnung ist.
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let file = dir.path().join("stat");
-        fs::write(&file, "cpu 1 2 3 4 5 6 7 8 9 10 11 12\n").expect("write");
+        fs::write(&file, "cpu 1 2 3 4 5 6 7 8 9 10 11 12\n").map_err(ctx("write"))?;
         let scope = scope_for(dir.path());
 
-        let rows = read_line_fields(&scope, &file).expect("read_line_fields muss gelingen");
+        let rows =
+            read_line_fields(&scope, &file).map_err(ctx("read_line_fields muss gelingen"))?;
 
         assert_eq!(rows[0].len(), 13);
+        Ok(())
     }
 
     #[test]
-    fn test_read_line_fields_drops_empty_lines() {
-        let dir = tempdir().expect("tempdir");
+    fn test_read_line_fields_drops_empty_lines() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let file = dir.path().join("stat");
-        fs::write(&file, "a 1\n\n   \nb 2\n").expect("write");
+        fs::write(&file, "a 1\n\n   \nb 2\n").map_err(ctx("write"))?;
         let scope = scope_for(dir.path());
 
-        let rows = read_line_fields(&scope, &file).expect("read_line_fields muss gelingen");
+        let rows =
+            read_line_fields(&scope, &file).map_err(ctx("read_line_fields muss gelingen"))?;
 
         assert_eq!(rows.len(), 2, "Leerzeilen tragen keine Felder");
+        Ok(())
     }
 
     #[test]
-    fn test_read_line_fields_outside_scope_rejected() {
-        let inside = tempdir().expect("tempdir");
-        let outside = tempdir().expect("tempdir");
+    fn test_read_line_fields_outside_scope_rejected() -> TestResult {
+        let inside = tempdir().map_err(ctx("tempdir"))?;
+        let outside = tempdir().map_err(ctx("tempdir"))?;
         let file = outside.path().join("stat");
-        fs::write(&file, "cpu 1\n").expect("write");
+        fs::write(&file, "cpu 1\n").map_err(ctx("write"))?;
         let scope = scope_for(inside.path());
 
         assert!(matches!(
             read_line_fields(&scope, &file),
             Err(ReadFsError::Scope(SensorError::OutsideScope))
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_read_to_string_success() {
-        let dir = tempdir().expect("tempdir");
+    fn test_read_to_string_success() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let file = dir.path().join("value");
-        fs::write(&file, "hallo\n").expect("write");
+        fs::write(&file, "hallo\n").map_err(ctx("write"))?;
         let scope = scope_for(dir.path());
 
-        let content = read_to_string(&scope, &file).expect("read_to_string muss gelingen");
+        let content = read_to_string(&scope, &file).map_err(ctx("read_to_string muss gelingen"))?;
         assert_eq!(content, "hallo\n");
+        Ok(())
     }
 
     #[test]
-    fn test_read_to_string_outside_scope_rejected() {
-        let inside = tempdir().expect("tempdir");
-        let outside = tempdir().expect("tempdir");
+    fn test_read_to_string_outside_scope_rejected() -> TestResult {
+        let inside = tempdir().map_err(ctx("tempdir"))?;
+        let outside = tempdir().map_err(ctx("tempdir"))?;
         let file = outside.path().join("value");
-        fs::write(&file, "hallo\n").expect("write");
+        fs::write(&file, "hallo\n").map_err(ctx("write"))?;
         let scope = scope_for(inside.path());
 
-        let err =
-            read_to_string(&scope, &file).expect_err("außerhalb des Bereichs muss scheitern");
+        let Err(err) = read_to_string(&scope, &file) else {
+            return Err(TestError::Unexpected(
+                "außerhalb des Bereichs muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, ReadFsError::Scope(SensorError::OutsideScope)));
+        Ok(())
     }
 
     #[test]
-    fn test_read_to_string_missing_file_rejected() {
-        let dir = tempdir().expect("tempdir");
+    fn test_read_to_string_missing_file_rejected() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let missing = dir.path().join("fehlt");
         let scope = scope_for(dir.path());
 
-        let err = read_to_string(&scope, &missing).expect_err("fehlende Datei muss scheitern");
+        let Err(err) = read_to_string(&scope, &missing) else {
+            return Err(TestError::Unexpected(
+                "fehlende Datei muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, ReadFsError::Scope(_)));
+        Ok(())
     }
 
     #[test]
-    fn test_read_to_string_over_limit_rejected() {
-        let dir = tempdir().expect("tempdir");
+    fn test_read_to_string_over_limit_rejected() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let file = dir.path().join("gross");
         let oversized = vec![b'x'; (MAX_READ_BYTES + 1) as usize];
-        fs::write(&file, &oversized).expect("write");
+        fs::write(&file, &oversized).map_err(ctx("write"))?;
         let scope = scope_for(dir.path());
 
-        let err =
-            read_to_string(&scope, &file).expect_err("Datei über der Grenze muss scheitern");
+        let Err(err) = read_to_string(&scope, &file) else {
+            return Err(TestError::Unexpected(
+                "Datei über der Grenze muss scheitern".into(),
+            ));
+        };
         assert!(matches!(
             err,
             ReadFsError::TooLarge { limit } if limit == MAX_READ_BYTES
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_read_lines_success() {
-        let dir = tempdir().expect("tempdir");
+    fn test_read_lines_success() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let file = dir.path().join("lines");
-        fs::write(&file, "a\nb\nc\n").expect("write");
+        fs::write(&file, "a\nb\nc\n").map_err(ctx("write"))?;
         let scope = scope_for(dir.path());
 
-        let lines = read_lines(&scope, &file).expect("read_lines muss gelingen");
+        let lines = read_lines(&scope, &file).map_err(ctx("read_lines muss gelingen"))?;
         assert_eq!(lines, vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]);
+        Ok(())
     }
 
     #[test]
-    fn test_read_lines_outside_scope_rejected() {
-        let inside = tempdir().expect("tempdir");
-        let outside = tempdir().expect("tempdir");
+    fn test_read_lines_outside_scope_rejected() -> TestResult {
+        let inside = tempdir().map_err(ctx("tempdir"))?;
+        let outside = tempdir().map_err(ctx("tempdir"))?;
         let file = outside.path().join("lines");
-        fs::write(&file, "a\n").expect("write");
+        fs::write(&file, "a\n").map_err(ctx("write"))?;
         let scope = scope_for(inside.path());
 
-        let err = read_lines(&scope, &file).expect_err("außerhalb des Bereichs muss scheitern");
+        let Err(err) = read_lines(&scope, &file) else {
+            return Err(TestError::Unexpected(
+                "außerhalb des Bereichs muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, ReadFsError::Scope(SensorError::OutsideScope)));
+        Ok(())
     }
 
     #[test]
-    fn test_read_lines_missing_file_rejected() {
-        let dir = tempdir().expect("tempdir");
+    fn test_read_lines_missing_file_rejected() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let missing = dir.path().join("fehlt");
         let scope = scope_for(dir.path());
 
-        let err = read_lines(&scope, &missing).expect_err("fehlende Datei muss scheitern");
+        let Err(err) = read_lines(&scope, &missing) else {
+            return Err(TestError::Unexpected(
+                "fehlende Datei muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, ReadFsError::Scope(_)));
+        Ok(())
     }
 
     #[test]
-    fn test_read_first_line_success() {
-        let dir = tempdir().expect("tempdir");
+    fn test_read_first_line_success() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let file = dir.path().join("temp");
-        fs::write(&file, "45000\n").expect("write");
+        fs::write(&file, "45000\n").map_err(ctx("write"))?;
         let scope = scope_for(dir.path());
 
-        let line = read_first_line(&scope, &file).expect("read_first_line muss gelingen");
+        let line = read_first_line(&scope, &file).map_err(ctx("read_first_line muss gelingen"))?;
         assert_eq!(line, "45000");
+        Ok(())
     }
 
     #[test]
-    fn test_read_first_line_outside_scope_rejected() {
-        let inside = tempdir().expect("tempdir");
-        let outside = tempdir().expect("tempdir");
+    fn test_read_first_line_outside_scope_rejected() -> TestResult {
+        let inside = tempdir().map_err(ctx("tempdir"))?;
+        let outside = tempdir().map_err(ctx("tempdir"))?;
         let file = outside.path().join("temp");
-        fs::write(&file, "45000\n").expect("write");
+        fs::write(&file, "45000\n").map_err(ctx("write"))?;
         let scope = scope_for(inside.path());
 
-        let err =
-            read_first_line(&scope, &file).expect_err("außerhalb des Bereichs muss scheitern");
+        let Err(err) = read_first_line(&scope, &file) else {
+            return Err(TestError::Unexpected(
+                "außerhalb des Bereichs muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, ReadFsError::Scope(SensorError::OutsideScope)));
+        Ok(())
     }
 
     #[test]
-    fn test_read_first_line_missing_file_rejected() {
-        let dir = tempdir().expect("tempdir");
+    fn test_read_first_line_missing_file_rejected() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let missing = dir.path().join("fehlt");
         let scope = scope_for(dir.path());
 
-        let err = read_first_line(&scope, &missing).expect_err("fehlende Datei muss scheitern");
+        let Err(err) = read_first_line(&scope, &missing) else {
+            return Err(TestError::Unexpected(
+                "fehlende Datei muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, ReadFsError::Scope(_)));
+        Ok(())
     }
 
     #[test]
-    fn test_read_first_line_empty_file_is_malformed() {
-        let dir = tempdir().expect("tempdir");
+    fn test_read_first_line_empty_file_is_malformed() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let file = dir.path().join("leer");
-        fs::write(&file, "").expect("write");
+        fs::write(&file, "").map_err(ctx("write"))?;
         let scope = scope_for(dir.path());
 
-        let err = read_first_line(&scope, &file).expect_err("leere Datei muss scheitern");
+        let Err(err) = read_first_line(&scope, &file) else {
+            return Err(TestError::Unexpected("leere Datei muss scheitern".into()));
+        };
         assert!(matches!(
             err,
             ReadFsError::Scope(SensorError::MalformedSource)
         ));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_i64_valid_content() {
-        let dir = tempdir().expect("tempdir");
+    fn test_parse_i64_valid_content() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let file = dir.path().join("temp");
-        fs::write(&file, "42\n").expect("write");
+        fs::write(&file, "42\n").map_err(ctx("write"))?;
         let scope = scope_for(dir.path());
 
-        let value = parse_i64(&scope, &file).expect("parse_i64 muss gelingen");
+        let value = parse_i64(&scope, &file).map_err(ctx("parse_i64 muss gelingen"))?;
         assert_eq!(value, 42);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_i64_outside_scope_rejected() {
-        let inside = tempdir().expect("tempdir");
-        let outside = tempdir().expect("tempdir");
+    fn test_parse_i64_outside_scope_rejected() -> TestResult {
+        let inside = tempdir().map_err(ctx("tempdir"))?;
+        let outside = tempdir().map_err(ctx("tempdir"))?;
         let file = outside.path().join("temp");
-        fs::write(&file, "42\n").expect("write");
+        fs::write(&file, "42\n").map_err(ctx("write"))?;
         let scope = scope_for(inside.path());
 
-        let err = parse_i64(&scope, &file).expect_err("außerhalb des Bereichs muss scheitern");
+        let Err(err) = parse_i64(&scope, &file) else {
+            return Err(TestError::Unexpected(
+                "außerhalb des Bereichs muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, ReadFsError::Scope(SensorError::OutsideScope)));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_i64_missing_file_rejected() {
-        let dir = tempdir().expect("tempdir");
+    fn test_parse_i64_missing_file_rejected() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let missing = dir.path().join("fehlt");
         let scope = scope_for(dir.path());
 
-        let err = parse_i64(&scope, &missing).expect_err("fehlende Datei muss scheitern");
+        let Err(err) = parse_i64(&scope, &missing) else {
+            return Err(TestError::Unexpected(
+                "fehlende Datei muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, ReadFsError::Scope(_)));
+        Ok(())
     }
 
     /// Die Zusage der Crate: nicht parsbarer Inhalt löst `MalformedSource`
     /// aus, und der Inhalt selbst erscheint nirgends in der Meldung.
     #[test]
-    fn test_parse_i64_malformed_content_does_not_leak_content_in_message() {
-        let dir = tempdir().expect("tempdir");
+    fn test_parse_i64_malformed_content_does_not_leak_content_in_message() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let file = dir.path().join("temp");
-        fs::write(&file, "nicht-zahl\n").expect("write");
+        fs::write(&file, "nicht-zahl\n").map_err(ctx("write"))?;
         let scope = scope_for(dir.path());
 
-        let err = parse_i64(&scope, &file).expect_err("nicht-numerischer Inhalt muss scheitern");
+        let Err(err) = parse_i64(&scope, &file) else {
+            return Err(TestError::Unexpected(
+                "nicht-numerischer Inhalt muss scheitern".into(),
+            ));
+        };
         assert!(matches!(
             err,
             ReadFsError::Scope(SensorError::MalformedSource)
@@ -647,65 +708,83 @@ mod tests {
             !message.contains("nicht-zahl"),
             "die Fehlermeldung darf den gelesenen Inhalt nicht enthalten: {message}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_parse_u64_valid_content() {
-        let dir = tempdir().expect("tempdir");
+    fn test_parse_u64_valid_content() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let file = dir.path().join("rx_bytes");
-        fs::write(&file, "18446744073709551615\n").expect("write");
+        fs::write(&file, "18446744073709551615\n").map_err(ctx("write"))?;
         let scope = scope_for(dir.path());
 
-        let value = parse_u64(&scope, &file).expect("parse_u64 muss gelingen");
+        let value = parse_u64(&scope, &file).map_err(ctx("parse_u64 muss gelingen"))?;
         assert_eq!(value, u64::MAX);
+        Ok(())
     }
 
     #[test]
-    fn test_parse_u64_outside_scope_rejected() {
-        let inside = tempdir().expect("tempdir");
-        let outside = tempdir().expect("tempdir");
+    fn test_parse_u64_outside_scope_rejected() -> TestResult {
+        let inside = tempdir().map_err(ctx("tempdir"))?;
+        let outside = tempdir().map_err(ctx("tempdir"))?;
         let file = outside.path().join("rx_bytes");
-        fs::write(&file, "1\n").expect("write");
+        fs::write(&file, "1\n").map_err(ctx("write"))?;
         let scope = scope_for(inside.path());
 
-        let err = parse_u64(&scope, &file).expect_err("außerhalb des Bereichs muss scheitern");
+        let Err(err) = parse_u64(&scope, &file) else {
+            return Err(TestError::Unexpected(
+                "außerhalb des Bereichs muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, ReadFsError::Scope(SensorError::OutsideScope)));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_u64_missing_file_rejected() {
-        let dir = tempdir().expect("tempdir");
+    fn test_parse_u64_missing_file_rejected() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let missing = dir.path().join("fehlt");
         let scope = scope_for(dir.path());
 
-        let err = parse_u64(&scope, &missing).expect_err("fehlende Datei muss scheitern");
+        let Err(err) = parse_u64(&scope, &missing) else {
+            return Err(TestError::Unexpected(
+                "fehlende Datei muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, ReadFsError::Scope(_)));
+        Ok(())
     }
 
     #[test]
-    fn test_parse_u64_malformed_content_does_not_leak_content_in_message() {
-        let dir = tempdir().expect("tempdir");
+    fn test_parse_u64_malformed_content_does_not_leak_content_in_message() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let file = dir.path().join("rx_bytes");
-        fs::write(&file, "nicht-zahl\n").expect("write");
+        fs::write(&file, "nicht-zahl\n").map_err(ctx("write"))?;
         let scope = scope_for(dir.path());
 
-        let err = parse_u64(&scope, &file).expect_err("nicht-numerischer Inhalt muss scheitern");
+        let Err(err) = parse_u64(&scope, &file) else {
+            return Err(TestError::Unexpected(
+                "nicht-numerischer Inhalt muss scheitern".into(),
+            ));
+        };
         let message = err.to_string();
         assert!(
             !message.contains("nicht-zahl"),
             "die Fehlermeldung darf den gelesenen Inhalt nicht enthalten: {message}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_read_key_values_preserves_order() {
-        let dir = tempdir().expect("tempdir");
+    fn test_read_key_values_preserves_order() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let file = dir.path().join("meminfo");
         fs::write(&file, "MemTotal:       16384 kB\nMemFree:        2048 kB\n")
-            .expect("write");
+            .map_err(ctx("write"))?;
         let scope = scope_for(dir.path());
 
-        let pairs = read_key_values(&scope, &file, ':').expect("read_key_values muss gelingen");
+        let pairs =
+            read_key_values(&scope, &file, ':').map_err(ctx("read_key_values muss gelingen"))?;
         assert_eq!(
             pairs,
             vec![
@@ -713,40 +792,50 @@ mod tests {
                 ("MemFree".to_owned(), "2048 kB".to_owned()),
             ]
         );
+        Ok(())
     }
 
     #[test]
-    fn test_read_key_values_outside_scope_rejected() {
-        let inside = tempdir().expect("tempdir");
-        let outside = tempdir().expect("tempdir");
+    fn test_read_key_values_outside_scope_rejected() -> TestResult {
+        let inside = tempdir().map_err(ctx("tempdir"))?;
+        let outside = tempdir().map_err(ctx("tempdir"))?;
         let file = outside.path().join("meminfo");
-        fs::write(&file, "MemTotal: 1 kB\n").expect("write");
+        fs::write(&file, "MemTotal: 1 kB\n").map_err(ctx("write"))?;
         let scope = scope_for(inside.path());
 
-        let err = read_key_values(&scope, &file, ':')
-            .expect_err("außerhalb des Bereichs muss scheitern");
+        let Err(err) = read_key_values(&scope, &file, ':') else {
+            return Err(TestError::Unexpected(
+                "außerhalb des Bereichs muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, ReadFsError::Scope(SensorError::OutsideScope)));
+        Ok(())
     }
 
     #[test]
-    fn test_read_key_values_missing_file_rejected() {
-        let dir = tempdir().expect("tempdir");
+    fn test_read_key_values_missing_file_rejected() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let missing = dir.path().join("fehlt");
         let scope = scope_for(dir.path());
 
-        let err =
-            read_key_values(&scope, &missing, ':').expect_err("fehlende Datei muss scheitern");
+        let Err(err) = read_key_values(&scope, &missing, ':') else {
+            return Err(TestError::Unexpected(
+                "fehlende Datei muss scheitern".into(),
+            ));
+        };
         assert!(matches!(err, ReadFsError::Scope(_)));
+        Ok(())
     }
 
     #[test]
-    fn test_read_key_values_skips_lines_without_separator() {
-        let dir = tempdir().expect("tempdir");
+    fn test_read_key_values_skips_lines_without_separator() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
         let file = dir.path().join("mixed");
-        fs::write(&file, "a: 1\n\nb: 2\n").expect("write");
+        fs::write(&file, "a: 1\n\nb: 2\n").map_err(ctx("write"))?;
         let scope = scope_for(dir.path());
 
-        let pairs = read_key_values(&scope, &file, ':').expect("read_key_values muss gelingen");
+        let pairs =
+            read_key_values(&scope, &file, ':').map_err(ctx("read_key_values muss gelingen"))?;
         assert_eq!(
             pairs,
             vec![
@@ -754,67 +843,86 @@ mod tests {
                 ("b".to_owned(), "2".to_owned()),
             ]
         );
+        Ok(())
     }
 
     /// Nachgebauter sysfs-Ausschnitt mit echtem Symlink
     /// `sys/class/thermal/thermal_zone0 -> ../../devices/virtual/thermal/thermal_zone0`
     /// (strukturgleich zum RPi 5) plus einem Alias-Bereich darauf.
     #[cfg(unix)]
-    fn alias_thermal_tree(base: &Path) -> (ReadScope, std::path::PathBuf) {
+    fn alias_thermal_tree(base: &Path) -> TestResult<(ReadScope, std::path::PathBuf)> {
         use harw_dod_cap::scope::AliasRoot;
         use std::os::unix::fs::symlink;
 
         let zone = base.join("sys/devices/virtual/thermal/thermal_zone0");
-        fs::create_dir_all(&zone).expect("create zone");
-        fs::write(zone.join("temp"), "48150\n").expect("write temp");
+        fs::create_dir_all(&zone).map_err(ctx("create zone"))?;
+        fs::write(zone.join("temp"), "48150\n").map_err(ctx("write temp"))?;
         let class = base.join("sys/class/thermal");
-        fs::create_dir_all(&class).expect("create class");
+        fs::create_dir_all(&class).map_err(ctx("create class"))?;
         symlink(
             "../../devices/virtual/thermal/thermal_zone0",
             class.join("thermal_zone0"),
         )
-        .expect("class symlink");
+        .map_err(ctx("class symlink"))?;
 
-        let alias = AliasRoot::new(class.clone(), base.join("sys/devices")).expect("alias root");
+        let alias =
+            AliasRoot::new(class.clone(), base.join("sys/devices")).map_err(ctx("alias root"))?;
         let scope = ReadScope::from_roots_and_aliases(Vec::<std::path::PathBuf>::new(), [alias]);
-        (scope, class)
+        Ok((scope, class))
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_parse_i64_through_alias_root_reads_sysfs_class_symlink() {
-        let dir = tempdir().expect("tempdir");
-        let base = dir.path().canonicalize().expect("canonical tempdir");
-        let (scope, class) = alias_thermal_tree(&base);
+    fn test_parse_i64_through_alias_root_reads_sysfs_class_symlink() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
+        let base = dir
+            .path()
+            .canonicalize()
+            .map_err(ctx("canonical tempdir"))?;
+        let (scope, class) = alias_thermal_tree(&base)?;
 
         let value = parse_i64(&scope, &class.join("thermal_zone0/temp"))
-            .expect("Alias-Wurzel muss den sysfs-Klassen-Symlink lesen");
+            .map_err(ctx("Alias-Wurzel muss den sysfs-Klassen-Symlink lesen"))?;
         assert_eq!(value, 48150);
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_parse_i64_plain_class_root_rejects_sysfs_symlink() {
-        let dir = tempdir().expect("tempdir");
-        let base = dir.path().canonicalize().expect("canonical tempdir");
-        let (_, class) = alias_thermal_tree(&base);
+    fn test_parse_i64_plain_class_root_rejects_sysfs_symlink() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
+        let base = dir
+            .path()
+            .canonicalize()
+            .map_err(ctx("canonical tempdir"))?;
+        let (_, class) = alias_thermal_tree(&base)?;
         let plain = scope_for(&class);
 
-        let err = parse_i64(&plain, &class.join("thermal_zone0/temp"))
-            .expect_err("ohne Alias-Wurzel bleibt das Ziel außerhalb");
+        let Err(err) = parse_i64(&plain, &class.join("thermal_zone0/temp")) else {
+            return Err(TestError::Unexpected(
+                "ohne Alias-Wurzel bleibt das Ziel außerhalb".into(),
+            ));
+        };
         assert!(matches!(err, ReadFsError::Scope(SensorError::OutsideScope)));
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_read_to_string_alias_rejects_parent_dir_escape() {
-        let dir = tempdir().expect("tempdir");
-        let base = dir.path().canonicalize().expect("canonical tempdir");
-        let (scope, class) = alias_thermal_tree(&base);
-        fs::write(base.join("secret"), "geheim\n").expect("write secret");
+    fn test_read_to_string_alias_rejects_parent_dir_escape() -> TestResult {
+        let dir = tempdir().map_err(ctx("tempdir"))?;
+        let base = dir
+            .path()
+            .canonicalize()
+            .map_err(ctx("canonical tempdir"))?;
+        let (scope, class) = alias_thermal_tree(&base)?;
+        fs::write(base.join("secret"), "geheim\n").map_err(ctx("write secret"))?;
 
-        let err = read_to_string(&scope, &class.join("thermal_zone0/../../../../secret"))
-            .expect_err("'..' muss abgelehnt werden");
+        let Err(err) = read_to_string(&scope, &class.join("thermal_zone0/../../../../secret"))
+        else {
+            return Err(TestError::Unexpected("'..' muss abgelehnt werden".into()));
+        };
         assert!(matches!(err, ReadFsError::Scope(SensorError::OutsideScope)));
+        Ok(())
     }
 }

@@ -46,8 +46,10 @@ mod collapse;
 mod fuse;
 mod mmr;
 mod pack;
+#[cfg(test)]
+mod test_support;
 
-pub use bm25::{bm25_scores, Bm25Params};
+pub use bm25::{Bm25Params, bm25_scores};
 pub use collapse::collapse;
 pub use fuse::rrf_fuse;
 pub use mmr::mmr;

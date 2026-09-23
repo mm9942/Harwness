@@ -70,7 +70,10 @@ impl Baseline {
     /// erlaubten Wertebereich.
     ///
     /// # Errors
-    /// [`BaselineError::InvalidRange`] wenn `min > max`.
+    /// - [`BaselineError::InvalidRange`] wenn `min > max`.
+    /// - [`BaselineError::EvidenceEncoding`] wenn die leere Startevidenz
+    ///   nicht kodierbar ist (in der Praxis nicht erreichbar für leere
+    ///   `samples`/`events`).
     pub fn new(
         id: impl fmt::Display,
         metric: impl Into<Cow<'static, str>>,
@@ -93,7 +96,9 @@ impl Baseline {
             max,
             hardness: Hardness::Observed,
             evidence: SecurityEvidence::capture(vec![], vec![], jiff::Timestamp::UNIX_EPOCH)
-                .expect("empty evidence always encodes"),
+                .map_err(|source| BaselineError::EvidenceEncoding {
+                    reason: source.to_string(),
+                })?,
             status: PalaceStatus::Provisional,
             tags: Vec::new(),
         })
@@ -187,6 +192,14 @@ pub enum BaselineError {
         /// Obere Grenze.
         max: f64,
     },
+    /// Die leere Startevidenz einer neuen Baseline ließ sich nicht kodieren
+    /// (siehe [`harw_dod_signals::SecurityEvidence::capture`]). Trägt die
+    /// Fehlermeldung als `String` statt des fremden `SignalsError`, da
+    /// dieser weder `Clone` noch `PartialEq` ableitet.
+    EvidenceEncoding {
+        /// Die Fehlermeldung des zugrunde liegenden Kodierungsfehlers.
+        reason: String,
+    },
 }
 
 impl fmt::Display for BaselineError {
@@ -200,6 +213,9 @@ impl fmt::Display for BaselineError {
             Self::MissingBaseline => write!(f, "no baseline defined for metric"),
             Self::InvalidRange { metric, min, max } => {
                 write!(f, "invalid baseline range for '{metric}': {min} > {max}")
+            }
+            Self::EvidenceEncoding { reason } => {
+                write!(f, "failed to encode empty baseline evidence: {reason}")
             }
         }
     }
@@ -221,10 +237,11 @@ pub fn finding_kind_for_status(status: PalaceStatus) -> Option<FindingKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
-    fn evidence() -> SecurityEvidence {
+    fn evidence() -> TestResult<SecurityEvidence> {
         SecurityEvidence::capture(vec![], vec![], jiff::Timestamp::UNIX_EPOCH)
-            .expect("empty evidence always encodes")
+            .map_err(ctx("empty evidence always encodes"))
     }
 
     #[test]
@@ -257,29 +274,38 @@ mod tests {
     }
 
     #[test]
-    fn test_baseline_new_starts_provisional_and_formats_a_display_id() {
-        let baseline = Baseline::new("baseline/cpu", "cpu", 0.0, 100.0).unwrap();
+    fn test_baseline_new_starts_provisional_and_formats_a_display_id() -> TestResult {
+        let baseline =
+            Baseline::new("baseline/cpu", "cpu", 0.0, 100.0).map_err(ctx("baseline new"))?;
 
         assert_eq!(baseline.status, PalaceStatus::Provisional);
         assert_eq!(baseline.id, "baseline/cpu");
         assert_eq!(baseline.metric, "cpu");
+        Ok(())
     }
 
     #[test]
-    fn test_baseline_contains_works() {
-        let baseline = Baseline::new("cpu", "cpu", 0.0, 80.0).unwrap();
+    fn test_baseline_contains_works() -> TestResult {
+        let baseline = Baseline::new("cpu", "cpu", 0.0, 80.0).map_err(ctx("baseline new"))?;
         assert!(baseline.contains(42.0));
         assert!(!baseline.contains(99.9));
+        Ok(())
     }
 
     #[test]
-    fn test_baseline_new_rejects_invalid_range() {
-        let err = Baseline::new("cpu", "cpu", 80.0, 0.0).unwrap_err();
+    fn test_baseline_new_rejects_invalid_range() -> TestResult {
+        let result = Baseline::new("cpu", "cpu", 80.0, 0.0);
+        let Err(err) = result else {
+            return Err(crate::test_support::TestError::Unexpected(
+                "Err erwartet".into(),
+            ));
+        };
         assert!(matches!(err, BaselineError::InvalidRange { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_baseline_promotion_without_review_is_rejected() {
+    fn test_baseline_promotion_without_review_is_rejected() -> TestResult {
         let mut baseline = Baseline::with_details(
             "baseline/cpu",
             "cpu baseline",
@@ -287,19 +313,23 @@ mod tests {
             0.0,
             100.0,
             Hardness::Observed,
-            evidence(),
+            evidence()?,
         );
 
-        let error = baseline
-            .promote_to_established(false)
-            .expect_err("unreviewed promotion must be refused");
+        let result = baseline.promote_to_established(false);
+        let Err(error) = result else {
+            return Err(crate::test_support::TestError::Unexpected(
+                "unreviewed promotion must be refused".into(),
+            ));
+        };
 
         assert!(matches!(error, BaselineError::PromotionNotReviewed { .. }));
         assert_eq!(baseline.status, PalaceStatus::Provisional);
+        Ok(())
     }
 
     #[test]
-    fn test_baseline_promotion_with_review_becomes_established() {
+    fn test_baseline_promotion_with_review_becomes_established() -> TestResult {
         let mut baseline = Baseline::with_details(
             "baseline/cpu",
             "cpu baseline",
@@ -307,21 +337,23 @@ mod tests {
             0.0,
             100.0,
             Hardness::Observed,
-            evidence(),
+            evidence()?,
         );
 
         baseline
             .promote_to_established(true)
-            .expect("reviewed promotion succeeds");
+            .map_err(ctx("reviewed promotion succeeds"))?;
 
         assert_eq!(baseline.status, PalaceStatus::Established);
+        Ok(())
     }
 
     #[test]
-    fn test_baseline_new_accepts_a_harw_knowledge_artifact_id() {
+    fn test_baseline_new_accepts_a_harw_knowledge_artifact_id() -> TestResult {
         let id = harw_knowledge::artifact::ArtifactId::new("baseline/from-knowledge");
-        let baseline = Baseline::new(id, "cpu", 0.0, 100.0).unwrap();
+        let baseline = Baseline::new(id, "cpu", 0.0, 100.0).map_err(ctx("baseline new"))?;
 
         assert_eq!(baseline.id, "baseline/from-knowledge");
+        Ok(())
     }
 }

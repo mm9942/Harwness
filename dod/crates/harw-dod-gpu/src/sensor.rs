@@ -575,7 +575,8 @@ mod tests {
     use harw_types::SensorId;
     use jiff::Timestamp;
 
-    use super::{card_device_dirs, is_card_root_name, GpuSensor, MAX_CARDS};
+    use super::{GpuSensor, MAX_CARDS, card_device_dirs, is_card_root_name};
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Das `fixtures/`-Wurzelverzeichnis dieser Crate.
     fn fixtures_root() -> PathBuf {
@@ -591,24 +592,25 @@ mod tests {
     }
 
     #[test]
-    fn test_host_without_gpu_yields_empty_reading_not_an_error() {
+    fn test_host_without_gpu_yields_empty_reading_not_an_error() -> TestResult {
         // Der wichtigste Test dieser Crate (siehe `lib.rs`-Moduldoku): ein
         // leerer Baum ohne jede Karte darf den Abruf nicht scheitern lassen.
         let sensor = build_sensor(fixtures_root().join("empty-host/tree"));
-        let reading = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect("ein Host ohne GPU muss erfolgreich pollen, nicht scheitern");
+        let reading = sensor.poll(Timestamp::UNIX_EPOCH).map_err(ctx(
+            "ein Host ohne GPU muss erfolgreich pollen, nicht scheitern",
+        ))?;
 
         assert!(reading.samples.is_empty());
         assert!(reading.events.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_partial_card_reports_present_files_without_failing() {
+    fn test_partial_card_reports_present_files_without_failing() -> TestResult {
         let sensor = build_sensor(fixtures_root().join("partial-card/tree"));
-        let reading = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect("eine Karte mit nur einem Teil der Dateien darf den Abruf nicht scheitern lassen");
+        let reading = sensor.poll(Timestamp::UNIX_EPOCH).map_err(ctx(
+            "eine Karte mit nur einem Teil der Dateien darf den Abruf nicht scheitern lassen",
+        ))?;
 
         // Nur `gpu_busy_percent` und die `hwmon`-Temperatur sind in diesem
         // Fixture vorhanden — kein `mem_info_vram_used`/`_total`.
@@ -637,20 +639,21 @@ mod tests {
             "eine fehlende VRAM-Datei darf keine Metrik erzeugen: {:?}",
             reading.samples
         );
+        Ok(())
     }
 
     #[test]
-    fn test_millicelsius_is_converted_to_celsius() {
+    fn test_millicelsius_is_converted_to_celsius() -> TestResult {
         let sensor = build_sensor(fixtures_root().join("one-card-full/tree"));
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("one-card-full Fixture muss erfolgreich pollen");
+            .map_err(ctx("one-card-full Fixture muss erfolgreich pollen"))?;
 
         let temp_sample = reading
             .samples
             .iter()
             .find(|s| s.metric.starts_with("gpu_temperature_celsius_"))
-            .expect("Temperatursample muss vorhanden sein");
+            .ok_or(TestError::Missing("Temperatursample"))?;
 
         // Epsilon-Vergleich statt `assert_eq!` auf `f64`: 52000/1000 = 52.0
         // ist hier zwar exakt darstellbar, ein direkter `==`-Vergleich auf
@@ -661,21 +664,22 @@ mod tests {
             "52000 Millidegree müssen 52.0 °C ergeben, war {}",
             temp_sample.value
         );
+        Ok(())
     }
 
     #[test]
-    fn test_two_cards_yield_distinct_metric_labels() {
+    fn test_two_cards_yield_distinct_metric_labels() -> TestResult {
         let sensor = build_sensor(fixtures_root().join("two-cards/tree"));
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("two-cards Fixture muss erfolgreich pollen");
+            .map_err(ctx("two-cards Fixture muss erfolgreich pollen"))?;
 
         assert_eq!(reading.samples.len(), 8);
         let card0_busy = reading
             .samples
             .iter()
             .find(|s| s.metric.starts_with("gpu_busy_percent_"))
-            .expect("mindestens eine Auslastungsmetrik muss vorhanden sein");
+            .ok_or(TestError::Missing("Auslastungsmetrik"))?;
         assert!(
             reading
                 .samples
@@ -685,14 +689,18 @@ mod tests {
             "zwei Karten müssen unterschiedliche Auslastungs-Metriknamen tragen: {:?}",
             reading.samples
         );
+        Ok(())
     }
 
     #[test]
-    fn test_non_numeric_content_is_malformed_source_without_leaking_content() {
+    fn test_non_numeric_content_is_malformed_source_without_leaking_content() -> TestResult {
         let sensor = build_sensor(fixtures_root().join("malformed/non-numeric"));
-        let err = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect_err("nicht-numerischer Inhalt muss scheitern");
+        let result = sensor.poll(Timestamp::UNIX_EPOCH);
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "nicht-numerischer Inhalt muss scheitern".to_owned(),
+            ));
+        };
 
         assert!(matches!(err, SensorError::MalformedSource));
         let rendered = format!("{err}{err:?}");
@@ -700,32 +708,38 @@ mod tests {
             !rendered.contains("not-a-number"),
             "Fehlermeldung darf den gelesenen Inhalt nicht enthalten: {rendered}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_empty_file_content_is_malformed_source() {
+    fn test_empty_file_content_is_malformed_source() -> TestResult {
         let sensor = build_sensor(fixtures_root().join("malformed/empty-file"));
-        let err = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect_err("eine leere Datei muss scheitern");
+        let result = sensor.poll(Timestamp::UNIX_EPOCH);
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "eine leere Datei muss scheitern".to_owned(),
+            ));
+        };
 
         assert!(matches!(err, SensorError::MalformedSource));
+        Ok(())
     }
 
     #[test]
-    fn test_determinism_with_same_now() {
+    fn test_determinism_with_same_now() -> TestResult {
         let sensor = build_sensor(fixtures_root().join("one-card-full/tree"));
         let first = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("erster Poll muss gelingen");
+            .map_err(ctx("erster Poll muss gelingen"))?;
         let second = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("zweiter Poll muss gelingen");
+            .map_err(ctx("zweiter Poll muss gelingen"))?;
 
         assert_eq!(
             first, second,
             "zwei Polls mit demselben injizierten now müssen dasselbe Ergebnis liefern"
         );
+        Ok(())
     }
 
     #[test]
@@ -738,51 +752,55 @@ mod tests {
     }
 
     #[test]
-    fn test_card_device_dirs_excludes_connector_directories_regression_f203() {
+    fn test_card_device_dirs_excludes_connector_directories_regression_f203() -> TestResult {
         // Ein Multi-Monitor-Host: `card0` ist die echte Karte, `card0-HDMI-A-1`
         // ist DRMs zusätzliches Connector-Verzeichnis für denselben Anschluss
         // — beide tragen ein `device`-Symlink und würden ohne Filterung als
         // zwei Karten gezählt.
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(dir.path().join("card0/device")).expect("card0/device");
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        std::fs::create_dir_all(dir.path().join("card0/device")).map_err(ctx("card0/device"))?;
         std::fs::write(dir.path().join("card0/device/gpu_busy_percent"), "5\n")
-            .expect("gpu_busy_percent schreiben");
+            .map_err(ctx("gpu_busy_percent schreiben"))?;
         std::fs::create_dir_all(dir.path().join("card0-HDMI-A-1/device"))
-            .expect("card0-HDMI-A-1/device");
+            .map_err(ctx("card0-HDMI-A-1/device"))?;
         std::fs::write(
             dir.path().join("card0-HDMI-A-1/device/gpu_busy_percent"),
             "5\n",
         )
-        .expect("gpu_busy_percent im Connector-Verzeichnis schreiben");
+        .map_err(ctx("gpu_busy_percent im Connector-Verzeichnis schreiben"))?;
 
         let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
-        let device_dirs = card_device_dirs(&scope).expect("card_device_dirs darf nicht scheitern");
+        let device_dirs =
+            card_device_dirs(&scope).map_err(ctx("card_device_dirs darf nicht scheitern"))?;
 
         assert_eq!(
             device_dirs.len(),
             1,
             "das Connector-Verzeichnis darf nicht als eigene Karte gezählt werden: {device_dirs:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_card_device_dirs_truncates_to_max_cards_regression_f203() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_card_device_dirs_truncates_to_max_cards_regression_f203() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         for i in 0..(MAX_CARDS + 4) {
             let card_dir = dir.path().join(format!("card{i}/device"));
-            std::fs::create_dir_all(&card_dir).expect("card device dir");
+            std::fs::create_dir_all(&card_dir).map_err(ctx("card device dir"))?;
             std::fs::write(card_dir.join("gpu_busy_percent"), "1\n")
-                .expect("gpu_busy_percent schreiben");
+                .map_err(ctx("gpu_busy_percent schreiben"))?;
         }
 
         let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
-        let device_dirs = card_device_dirs(&scope).expect("card_device_dirs darf nicht scheitern");
+        let device_dirs =
+            card_device_dirs(&scope).map_err(ctx("card_device_dirs darf nicht scheitern"))?;
 
         assert_eq!(
             device_dirs.len(),
             MAX_CARDS,
             "MAX_CARDS muss durchgesetzt werden, nicht nur deklariert sein"
         );
+        Ok(())
     }
 
     /// Der Ordner der echten Pi-Captures (`C-FIXT`, `harw-dod-fixtures`),
@@ -804,23 +822,24 @@ mod tests {
     /// stattdessen ein leeres, aber erfolgreiches Ergebnis für genau eine
     /// gefundene Karte), nicht die konkreten Metrikwerte.
     #[test]
-    fn test_poll_reads_real_pi_capture_through_alias_scope_regression_f005() {
+    fn test_poll_reads_real_pi_capture_through_alias_scope_regression_f005() -> TestResult {
         let manifest_path = rpi5_captures_dir().join("gpu.json");
         let manifest = harw_dod_fixtures::capture_manifest::load(&manifest_path)
-            .expect("captures/rpi5-6.18/gpu.json muss ladbar sein");
+            .map_err(ctx("captures/rpi5-6.18/gpu.json muss ladbar sein"))?;
 
-        let tmp = tempfile::tempdir().expect("tempdir für die Materialisierung");
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir für die Materialisierung"))?;
         harw_dod_fixtures::capture_manifest::materialize(&manifest, tmp.path())
-            .expect("materialize muss die echte Symlink-Struktur anlegen");
+            .map_err(ctx("materialize muss die echte Symlink-Struktur anlegen"))?;
 
         let declared = tmp.path().join("sys/class/drm");
         let resolved_prefix = tmp.path().join("sys/devices");
         let alias = harw_dod_cap::scope::AliasRoot::new(declared, resolved_prefix)
-            .expect("AliasRoot::new mit Tempdir-Wurzeln");
+            .map_err(ctx("AliasRoot::new mit Tempdir-Wurzeln"))?;
         let scope = ReadScope::from_roots_and_aliases(Vec::new(), [alias]);
 
-        let device_dirs =
-            card_device_dirs(&scope).expect("Alias-Scope muss die reale Karte über den Symlink finden");
+        let device_dirs = card_device_dirs(&scope).map_err(ctx(
+            "Alias-Scope muss die reale Karte über den Symlink finden",
+        ))?;
         assert_eq!(
             device_dirs.len(),
             1,
@@ -833,10 +852,11 @@ mod tests {
         )
         .bind(scope);
         let sensor = GpuSensor::from(handle);
-        let reading = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect("ein Host mit einer Karte ohne bekannte Metrikdateien darf nicht scheitern");
+        let reading = sensor.poll(Timestamp::UNIX_EPOCH).map_err(ctx(
+            "ein Host mit einer Karte ohne bekannte Metrikdateien darf nicht scheitern",
+        ))?;
         assert!(reading.samples.is_empty());
+        Ok(())
     }
 
     harw_dod_fixtures::sensor_suite! {

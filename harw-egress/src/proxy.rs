@@ -201,7 +201,13 @@ impl EgressProxy {
         limits: ProxyLimits,
         lookup: Arc<dyn HostLookup>,
     ) -> Self {
-        Self { shared: Arc::new(Shared { policy, limits, lookup }) }
+        Self {
+            shared: Arc::new(Shared {
+                policy,
+                limits,
+                lookup,
+            }),
+        }
     }
 
     /// Die durchgesetzte Policy.
@@ -329,7 +335,9 @@ pub async fn serve(
     limits: ProxyLimits,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), EgressError> {
-    EgressProxy::new(policy, limits).run(listener, shutdown).await
+    EgressProxy::new(policy, limits)
+        .run(listener, shutdown)
+        .await
 }
 
 // Protokolliert abgestürzte Sitzungs-Tasks (Abbruch beim Shutdown ist normal).
@@ -475,7 +483,11 @@ where
     };
     let mut port = [0_u8; 2];
     reader.read_exact(&mut port).await?;
-    Ok(Request { command, target, port: u16::from_be_bytes(port) })
+    Ok(Request {
+        command,
+        target,
+        port: u16::from_be_bytes(port),
+    })
 }
 
 // Methodenaushandlung plus Request; sendet bei Ablehnung die passende Antwort.
@@ -484,7 +496,9 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     if !read_greeting(stream).await? {
-        stream.write_all(&[SOCKS_VERSION, METHOD_NONE_ACCEPTABLE]).await?;
+        stream
+            .write_all(&[SOCKS_VERSION, METHOD_NONE_ACCEPTABLE])
+            .await?;
         return Err(HandshakeError::NoAcceptableMethod);
     }
     stream.write_all(&[SOCKS_VERSION, METHOD_NO_AUTH]).await?;
@@ -630,15 +644,22 @@ async fn checked_candidates(
         Target::Ip(ip) => {
             let addr = SocketAddr::new(*ip, port);
             policy.check_addr(addr).map_err(ConnectFailure::Egress)?;
-            policy.check_host(&ip.to_string()).map_err(ConnectFailure::Egress)?;
+            policy
+                .check_host(&ip.to_string())
+                .map_err(ConnectFailure::Egress)?;
             Ok(vec![addr])
         }
         Target::Domain(host) => {
             policy.check_host(host).map_err(ConnectFailure::Egress)?;
             let resolved = shared.lookup.lookup(host).await.map_err(|source| {
-                ConnectFailure::Egress(EgressError::Lookup { host: host.to_owned(), source })
+                ConnectFailure::Egress(EgressError::Lookup {
+                    host: host.to_owned(),
+                    source,
+                })
             })?;
-            let with_port = resolved.into_iter().map(|addr| SocketAddr::new(addr.ip(), port));
+            let with_port = resolved
+                .into_iter()
+                .map(|addr| SocketAddr::new(addr.ip(), port));
             filter_resolved(policy, host, with_port).map_err(ConnectFailure::Egress)
         }
     }
@@ -692,11 +713,24 @@ async fn run_session(shared: Arc<Shared>, session: u64, mut client: UnixStream) 
             TargetAddr::Ip(_) => 0,
         };
         let failure = ConnectFailure::InvalidName;
-        deny(&mut client, session, None, port, &failure, len, limits.handshake_timeout).await;
+        deny(
+            &mut client,
+            session,
+            None,
+            port,
+            &failure,
+            len,
+            limits.handshake_timeout,
+        )
+        .await;
         return;
     };
 
-    let opened = match timeout(limits.connect_timeout, open_upstream(&shared, &target, port)).await
+    let opened = match timeout(
+        limits.connect_timeout,
+        open_upstream(&shared, &target, port),
+    )
+    .await
     {
         Ok(result) => result,
         Err(_elapsed) => Err(ConnectFailure::Timeout),
@@ -705,12 +739,26 @@ async fn run_session(shared: Arc<Shared>, session: u64, mut client: UnixStream) 
         Ok(opened) => opened,
         Err(failure) => {
             let reply_timeout = limits.handshake_timeout;
-            deny(&mut client, session, Some(&target), port, &failure, 0, reply_timeout).await;
+            deny(
+                &mut client,
+                session,
+                Some(&target),
+                port,
+                &failure,
+                0,
+                reply_timeout,
+            )
+            .await;
             return;
         }
     };
 
-    match timeout(limits.handshake_timeout, write_reply(&mut client, REP_SUCCEEDED)).await {
+    match timeout(
+        limits.handshake_timeout,
+        write_reply(&mut client, REP_SUCCEEDED),
+    )
+    .await
+    {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
             tracing::debug!(session, error = %err, "egress-proxy: Erfolgsantwort nicht zustellbar");
@@ -830,7 +878,11 @@ async fn pump(client: &mut UnixStream, upstream: &mut TcpStream, limits: &ProxyL
     let (mut up_rd, mut up_wr) = upstream.split();
     let mut to_up = vec![0_u8; COPY_BUFFER];
     let mut to_client = vec![0_u8; COPY_BUFFER];
-    let mut transfer = Transfer { bytes_up: 0, bytes_down: 0, end: PumpEnd::Closed };
+    let mut transfer = Transfer {
+        bytes_up: 0,
+        bytes_down: 0,
+        end: PumpEnd::Closed,
+    };
     let mut up_open = true;
     let mut down_open = true;
 
@@ -945,6 +997,8 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::task::JoinHandle;
 
+    use crate::test_support::{TestError, TestResult, ctx};
+
     // Netzfreier Resolver mit festen Antworten; zählt Aufrufe.
     struct StubLookup {
         answers: HashMap<String, Vec<SocketAddr>>,
@@ -952,41 +1006,49 @@ mod tests {
     }
 
     impl StubLookup {
-        fn new(entries: &[(&str, &[&str])]) -> Arc<Self> {
-            let answers = entries
-                .iter()
-                .map(|(host, addrs)| {
-                    let parsed = addrs
-                        .iter()
-                        .map(|ip| SocketAddr::new(ip.parse().expect("Test-IP"), 0))
-                        .collect();
-                    ((*host).to_owned(), parsed)
-                })
-                .collect();
-            Arc::new(Self { answers, calls: AtomicUsize::new(0) })
+        fn new(entries: &[(&str, &[&str])]) -> TestResult<Arc<Self>> {
+            let mut answers = HashMap::new();
+            for (host, addrs) in entries {
+                let mut parsed = Vec::with_capacity(addrs.len());
+                for raw_ip in *addrs {
+                    let ip: IpAddr = raw_ip.parse().map_err(ctx("Test-IP"))?;
+                    parsed.push(SocketAddr::new(ip, 0));
+                }
+                answers.insert((*host).to_owned(), parsed);
+            }
+            Ok(Arc::new(Self {
+                answers,
+                calls: AtomicUsize::new(0),
+            }))
         }
     }
 
     impl HostLookup for StubLookup {
         fn lookup(&self, host: &str) -> LookupFuture {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let result = self.answers.get(host).cloned().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "stub: unbekannter Host")
-            });
+            let result =
+                self.answers.get(host).cloned().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "stub: unbekannter Host")
+                });
             Box::pin(std::future::ready(result))
         }
     }
 
-    fn policy(hosts: &[&str], allow_private: bool) -> Arc<EgressPolicy> {
+    fn policy(hosts: &[&str], allow_private: bool) -> TestResult<Arc<EgressPolicy>> {
         let hosts = hosts.iter().map(|h| (*h).to_owned()).collect();
-        Arc::new(EgressPolicy::new(hosts, allow_private).expect("gültige Test-Policy"))
+        let policy = EgressPolicy::new(hosts, allow_private).map_err(ctx("gültige Test-Policy"))?;
+        Ok(Arc::new(policy))
     }
 
     fn shared(policy: Arc<EgressPolicy>, lookup: Arc<StubLookup>) -> Shared {
-        Shared { policy, limits: ProxyLimits::default(), lookup }
+        Shared {
+            policy,
+            limits: ProxyLimits::default(),
+            lookup,
+        }
     }
 
-    fn request_bytes(command: u8, target: &TargetAddr, port: u16) -> Vec<u8> {
+    fn request_bytes(command: u8, target: &TargetAddr, port: u16) -> TestResult<Vec<u8>> {
         let mut bytes = vec![SOCKS_VERSION, command, 0];
         match target {
             TargetAddr::Ip(IpAddr::V4(v4)) => {
@@ -999,98 +1061,153 @@ mod tests {
             }
             TargetAddr::Domain(name) => {
                 bytes.push(ATYP_DOMAIN);
-                bytes.push(u8::try_from(name.len()).expect("Name ≤ 255"));
+                let len = u8::try_from(name.len()).map_err(ctx("Name ≤ 255"))?;
+                bytes.push(len);
                 bytes.extend_from_slice(name);
             }
         }
         bytes.extend_from_slice(&port.to_be_bytes());
-        bytes
+        Ok(bytes)
     }
 
     #[tokio::test]
-    async fn test_read_greeting_detects_no_auth() {
+    async fn test_read_greeting_detects_no_auth() -> TestResult {
         let mut offered: &[u8] = &[5, 2, 0x02, 0x00];
-        assert!(read_greeting(&mut offered).await.expect("gültig"));
+        assert!(read_greeting(&mut offered).await.map_err(ctx("gültig"))?);
         let mut password_only: &[u8] = &[5, 1, 0x02];
-        assert!(!read_greeting(&mut password_only).await.expect("gültig"));
+        assert!(
+            !read_greeting(&mut password_only)
+                .await
+                .map_err(ctx("gültig"))?
+        );
         let mut none: &[u8] = &[5, 0];
-        assert!(!read_greeting(&mut none).await.expect("gültig"));
+        assert!(!read_greeting(&mut none).await.map_err(ctx("gültig"))?);
         let mut socks4: &[u8] = &[4, 1, 0x00];
-        assert!(matches!(read_greeting(&mut socks4).await, Err(HandshakeError::Version(4))));
+        assert!(matches!(
+            read_greeting(&mut socks4).await,
+            Err(HandshakeError::Version(4))
+        ));
         let mut truncated: &[u8] = &[5, 3, 0x00];
-        assert!(matches!(read_greeting(&mut truncated).await, Err(HandshakeError::Io(_))));
+        assert!(matches!(
+            read_greeting(&mut truncated).await,
+            Err(HandshakeError::Io(_))
+        ));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_read_request_parses_domain_ipv4_ipv6() {
+    async fn test_read_request_parses_domain_ipv4_ipv6() -> TestResult {
         let cases = [
             TargetAddr::Domain(b"docs.rs".to_vec()),
-            TargetAddr::Ip("93.184.216.34".parse().expect("IPv4")),
-            TargetAddr::Ip("2606:4700::1111".parse().expect("IPv6")),
+            TargetAddr::Ip("93.184.216.34".parse().map_err(ctx("IPv4"))?),
+            TargetAddr::Ip("2606:4700::1111".parse().map_err(ctx("IPv6"))?),
         ];
         for target in cases {
-            let bytes = request_bytes(CMD_CONNECT, &target, 443);
+            let bytes = request_bytes(CMD_CONNECT, &target, 443)?;
             let mut reader: &[u8] = &bytes;
-            let request = read_request(&mut reader).await.expect("gültig");
-            assert_eq!(request, Request { command: CMD_CONNECT, target, port: 443 });
+            let request = read_request(&mut reader).await.map_err(ctx("gültig"))?;
+            assert_eq!(
+                request,
+                Request {
+                    command: CMD_CONNECT,
+                    target,
+                    port: 443
+                }
+            );
             assert!(reader.is_empty(), "Request vollständig gelesen");
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_read_request_rejects_malformed() {
+    async fn test_read_request_rejects_malformed() -> TestResult {
         let mut bad_atyp: &[u8] = &[5, 1, 0, 0x09, 1, 2, 3, 4, 0, 80];
-        let err = read_request(&mut bad_atyp).await.expect_err("ATYP 9");
+        let Err(err) = read_request(&mut bad_atyp).await else {
+            return Err(TestError::Unexpected(
+                "ATYP 9 hätte scheitern müssen".into(),
+            ));
+        };
         assert!(matches!(err, HandshakeError::AddressType(0x09)));
         assert_eq!(err.reply_code(), Some(REP_ADDRESS_TYPE_NOT_SUPPORTED));
 
         let mut empty_name: &[u8] = &[5, 1, 0, ATYP_DOMAIN, 0, 0, 80];
-        let err = read_request(&mut empty_name).await.expect_err("leerer Name");
+        let Err(err) = read_request(&mut empty_name).await else {
+            return Err(TestError::Unexpected(
+                "leerer Name hätte scheitern müssen".into(),
+            ));
+        };
         assert!(matches!(err, HandshakeError::EmptyDomain));
         assert_eq!(err.reply_code(), Some(REP_GENERAL_FAILURE));
 
         let mut reserved: &[u8] = &[5, 1, 1, ATYP_IPV4, 1, 2, 3, 4, 0, 80];
-        let err = read_request(&mut reserved).await.expect_err("RSV");
+        let Err(err) = read_request(&mut reserved).await else {
+            return Err(TestError::Unexpected("RSV hätte scheitern müssen".into()));
+        };
         assert!(matches!(err, HandshakeError::Reserved(1)));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_handshake_bind_and_udp_rejected_with_0x07() {
+    async fn test_handshake_bind_and_udp_rejected_with_0x07() -> TestResult {
         for command in [0x02_u8, 0x03] {
             let (mut client, mut server) = tokio::io::duplex(1024);
-            let target = TargetAddr::Ip("93.184.216.34".parse().expect("IPv4"));
+            let target = TargetAddr::Ip("93.184.216.34".parse().map_err(ctx("IPv4"))?);
             let mut input = vec![5, 1, 0];
-            input.extend(request_bytes(command, &target, 80));
-            client.write_all(&input).await.expect("schreiben");
-            let err = handshake(&mut server).await.expect_err("nicht CONNECT");
+            input.extend(request_bytes(command, &target, 80)?);
+            client.write_all(&input).await.map_err(ctx("schreiben"))?;
+            let Err(err) = handshake(&mut server).await else {
+                return Err(TestError::Unexpected(
+                    "nicht CONNECT hätte scheitern müssen".into(),
+                ));
+            };
             assert!(matches!(err, HandshakeError::UnsupportedCommand(c) if c == command));
             let mut answer = [0_u8; 12];
-            client.read_exact(&mut answer).await.expect("Antwort");
+            client
+                .read_exact(&mut answer)
+                .await
+                .map_err(ctx("Antwort"))?;
             assert_eq!(&answer[..2], &[5, 0]);
             assert_eq!(answer[2..], reply_bytes(REP_COMMAND_NOT_SUPPORTED));
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_handshake_without_no_auth_gets_0xff() {
+    async fn test_handshake_without_no_auth_gets_0xff() -> TestResult {
         let (mut client, mut server) = tokio::io::duplex(64);
-        client.write_all(&[5, 1, 0x02]).await.expect("schreiben");
-        let err = handshake(&mut server).await.expect_err("keine Methode");
+        client
+            .write_all(&[5, 1, 0x02])
+            .await
+            .map_err(ctx("schreiben"))?;
+        let Err(err) = handshake(&mut server).await else {
+            return Err(TestError::Unexpected(
+                "keine Methode hätte scheitern müssen".into(),
+            ));
+        };
         assert!(matches!(err, HandshakeError::NoAcceptableMethod));
         let mut answer = [0_u8; 2];
-        client.read_exact(&mut answer).await.expect("Antwort");
+        client
+            .read_exact(&mut answer)
+            .await
+            .map_err(ctx("Antwort"))?;
         assert_eq!(answer, [5, 0xFF]);
+        Ok(())
     }
 
     #[test]
-    fn test_normalize_domain_cases() {
+    fn test_normalize_domain_cases() -> TestResult {
         let domain = |s: &str| Some(Target::Domain(s.to_owned()));
-        let ip = |s: &str| Some(Target::Ip(s.parse().expect("IP")));
+        let localhost: IpAddr = "127.0.0.1".parse().map_err(ctx("IP"))?;
+        let ipv6_loopback: IpAddr = "::1".parse().map_err(ctx("IP"))?;
+        let ip = |addr: IpAddr| Some(Target::Ip(addr));
         assert_eq!(normalize_domain(b"Docs.RS."), domain("docs.rs"));
-        assert_eq!(normalize_domain(b"xn--bcher-kva.de"), domain("xn--bcher-kva.de"));
-        assert_eq!(normalize_domain(b"127.1"), ip("127.0.0.1"));
-        assert_eq!(normalize_domain(b"2130706433"), ip("127.0.0.1"));
-        assert_eq!(normalize_domain(b"[::1]"), ip("::1"));
+        assert_eq!(
+            normalize_domain(b"xn--bcher-kva.de"),
+            domain("xn--bcher-kva.de")
+        );
+        assert_eq!(normalize_domain(b"127.1"), ip(localhost));
+        assert_eq!(normalize_domain(b"2130706433"), ip(localhost));
+        assert_eq!(normalize_domain(b"[::1]"), ip(ipv6_loopback));
         let bad_names: [&[u8]; 10] = [
             b"a..b",
             b".docs.rs",
@@ -1106,63 +1223,103 @@ mod tests {
         for bad in bad_names {
             assert_eq!(normalize_domain(bad), None, "{bad:?}");
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_checked_candidates_domain_not_allowed_is_0x02_without_lookup() {
-        let lookup = StubLookup::new(&[("evil.example", &["93.184.216.34"])]);
-        let state = shared(policy(&["docs.rs"], false), Arc::clone(&lookup));
+    async fn test_checked_candidates_domain_not_allowed_is_0x02_without_lookup() -> TestResult {
+        let lookup = StubLookup::new(&[("evil.example", &["93.184.216.34"])])?;
+        let state = shared(policy(&["docs.rs"], false)?, Arc::clone(&lookup));
         let target = Target::Domain("evil.example".to_owned());
-        let failure = checked_candidates(&state, &target, 443).await.expect_err("nicht erlaubt");
-        assert!(matches!(failure, ConnectFailure::Egress(EgressError::HostNotAllowed { .. })));
+        let Err(failure) = checked_candidates(&state, &target, 443).await else {
+            return Err(TestError::Unexpected(
+                "nicht erlaubt hätte scheitern müssen".into(),
+            ));
+        };
+        assert!(matches!(
+            failure,
+            ConnectFailure::Egress(EgressError::HostNotAllowed { .. })
+        ));
         assert_eq!(failure.reply_code(), REP_NOT_ALLOWED);
-        assert_eq!(lookup.calls.load(Ordering::SeqCst), 0, "keine Auflösung vor Allowlist");
+        assert_eq!(
+            lookup.calls.load(Ordering::SeqCst),
+            0,
+            "keine Auflösung vor Allowlist"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_checked_candidates_private_ip_is_0x02() {
-        let lookup = StubLookup::new(&[]);
-        let state = shared(policy(&["10.0.0.1", "169.254.169.254"], false), lookup);
+    async fn test_checked_candidates_private_ip_is_0x02() -> TestResult {
+        let lookup = StubLookup::new(&[])?;
+        let state = shared(policy(&["10.0.0.1", "169.254.169.254"], false)?, lookup);
         for raw in ["10.0.0.1", "169.254.169.254", "::ffff:10.0.0.1"] {
-            let target = Target::Ip(raw.parse().expect("IP"));
-            let failure = checked_candidates(&state, &target, 80).await.expect_err(raw);
+            let ip: IpAddr = raw.parse().map_err(ctx("IP"))?;
+            let target = Target::Ip(ip);
+            let Err(failure) = checked_candidates(&state, &target, 80).await else {
+                return Err(TestError::Unexpected(format!(
+                    "{raw} hätte scheitern müssen"
+                )));
+            };
             assert!(
-                matches!(failure, ConnectFailure::Egress(EgressError::AddressDenied { .. })),
+                matches!(
+                    failure,
+                    ConnectFailure::Egress(EgressError::AddressDenied { .. })
+                ),
                 "{raw}: {failure:?}"
             );
             assert_eq!(failure.reply_code(), REP_NOT_ALLOWED);
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_checked_candidates_public_ip_requires_allowlist() {
-        let state = shared(policy(&["docs.rs"], false), StubLookup::new(&[]));
-        let target = Target::Ip("93.184.216.34".parse().expect("IP"));
-        let failure = checked_candidates(&state, &target, 80).await.expect_err("nicht gelistet");
-        assert!(matches!(failure, ConnectFailure::Egress(EgressError::HostNotAllowed { .. })));
+    async fn test_checked_candidates_public_ip_requires_allowlist() -> TestResult {
+        let state = shared(policy(&["docs.rs"], false)?, StubLookup::new(&[])?);
+        let ip: IpAddr = "93.184.216.34".parse().map_err(ctx("IP"))?;
+        let target = Target::Ip(ip);
+        let Err(failure) = checked_candidates(&state, &target, 80).await else {
+            return Err(TestError::Unexpected(
+                "nicht gelistet hätte scheitern müssen".into(),
+            ));
+        };
+        assert!(matches!(
+            failure,
+            ConnectFailure::Egress(EgressError::HostNotAllowed { .. })
+        ));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_checked_candidates_rebinding_answer_is_0x02() {
-        let lookup = StubLookup::new(&[("rebind.example", &["127.0.0.1", "169.254.169.254"])]);
-        let state = shared(policy(&["rebind.example"], false), lookup);
+    async fn test_checked_candidates_rebinding_answer_is_0x02() -> TestResult {
+        let lookup = StubLookup::new(&[("rebind.example", &["127.0.0.1", "169.254.169.254"])])?;
+        let state = shared(policy(&["rebind.example"], false)?, lookup);
         let target = Target::Domain("rebind.example".to_owned());
-        let failure = checked_candidates(&state, &target, 80).await.expect_err("nur privat");
+        let Err(failure) = checked_candidates(&state, &target, 80).await else {
+            return Err(TestError::Unexpected(
+                "nur privat hätte scheitern müssen".into(),
+            ));
+        };
         assert!(matches!(
             failure,
             ConnectFailure::Egress(EgressError::NoPermittedAddress { ref denied, .. })
                 if denied.len() == 2
         ));
         assert_eq!(failure.reply_code(), REP_NOT_ALLOWED);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_checked_candidates_keeps_only_permitted_and_sets_port() {
-        let lookup = StubLookup::new(&[("mixed.example", &["10.0.0.5", "93.184.216.34"])]);
-        let state = shared(policy(&["mixed.example"], false), lookup);
+    async fn test_checked_candidates_keeps_only_permitted_and_sets_port() -> TestResult {
+        let lookup = StubLookup::new(&[("mixed.example", &["10.0.0.5", "93.184.216.34"])])?;
+        let state = shared(policy(&["mixed.example"], false)?, lookup);
         let target = Target::Domain("mixed.example".to_owned());
-        let addrs = checked_candidates(&state, &target, 8443).await.expect("eine zulässig");
-        assert_eq!(addrs, vec!["93.184.216.34:8443".parse::<SocketAddr>().expect("Adresse")]);
+        let addrs = checked_candidates(&state, &target, 8443)
+            .await
+            .map_err(ctx("eine zulässig"))?;
+        let expected: SocketAddr = "93.184.216.34:8443".parse().map_err(ctx("Adresse"))?;
+        assert_eq!(addrs, vec![expected]);
+        Ok(())
     }
 
     #[test]
@@ -1198,22 +1355,29 @@ mod tests {
         policy: Arc<EgressPolicy>,
         lookup: Arc<StubLookup>,
         limits: ProxyLimits,
-    ) -> Harness {
-        let dir = tempfile::tempdir().expect("tempdir");
+    ) -> TestResult<Harness> {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let socket = dir.path().join("egress.sock");
-        let listener = UnixListener::bind(&socket).expect("Unix-Socket binden");
+        let listener = UnixListener::bind(&socket).map_err(ctx("Unix-Socket binden"))?;
         let (stop, stopped) = oneshot::channel::<()>();
         let proxy = EgressProxy::with_lookup(policy, limits, lookup);
         let task = tokio::spawn(proxy.run(listener, async move {
             // Senden oder Fallenlassen des Senders beendet den Proxy.
             let _ = stopped.await;
         }));
-        Harness { _dir: dir, socket, stop: Some(stop), task }
+        Ok(Harness {
+            _dir: dir,
+            socket,
+            stop: Some(stop),
+            task,
+        })
     }
 
-    async fn echo_server() -> SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("Loopback binden");
-        let addr = listener.local_addr().expect("lokale Adresse");
+    async fn echo_server() -> TestResult<SocketAddr> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(ctx("Loopback binden"))?;
+        let addr = listener.local_addr().map_err(ctx("lokale Adresse"))?;
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 tokio::spawn(async move {
@@ -1223,70 +1387,100 @@ mod tests {
                 });
             }
         });
-        addr
+        Ok(addr)
     }
 
-    async fn socks_connect(socket: &Path, target: &TargetAddr, port: u16) -> (UnixStream, u8) {
-        let mut stream = UnixStream::connect(socket).await.expect("Proxy verbinden");
-        stream.write_all(&[5, 1, 0]).await.expect("Greeting");
+    async fn socks_connect(
+        socket: &Path,
+        target: &TargetAddr,
+        port: u16,
+    ) -> TestResult<(UnixStream, u8)> {
+        let mut stream = UnixStream::connect(socket)
+            .await
+            .map_err(ctx("Proxy verbinden"))?;
+        stream
+            .write_all(&[5, 1, 0])
+            .await
+            .map_err(ctx("Greeting"))?;
         let mut method = [0_u8; 2];
-        stream.read_exact(&mut method).await.expect("Methodenantwort");
+        stream
+            .read_exact(&mut method)
+            .await
+            .map_err(ctx("Methodenantwort"))?;
         assert_eq!(method, [5, 0]);
-        stream.write_all(&request_bytes(CMD_CONNECT, target, port)).await.expect("Request");
+        stream
+            .write_all(&request_bytes(CMD_CONNECT, target, port)?)
+            .await
+            .map_err(ctx("Request"))?;
         let mut reply = [0_u8; 10];
-        stream.read_exact(&mut reply).await.expect("Antwort");
+        stream
+            .read_exact(&mut reply)
+            .await
+            .map_err(ctx("Antwort"))?;
         assert_eq!(reply[0], 5);
         assert_eq!(reply[2..], [0, ATYP_IPV4, 0, 0, 0, 0, 0, 0]);
-        (stream, reply[1])
+        Ok((stream, reply[1]))
     }
 
     async fn read_eof_within(stream: &mut UnixStream, limit: Duration) -> bool {
         let mut buf = [0_u8; 64];
-        matches!(timeout(limit, stream.read(&mut buf)).await, Ok(Ok(0) | Err(_)))
+        matches!(
+            timeout(limit, stream.read(&mut buf)).await,
+            Ok(Ok(0) | Err(_))
+        )
     }
 
     #[tokio::test]
-    async fn test_serve_end_to_end_ipv4_echo() {
-        let echo = echo_server().await;
-        let harness =
-            start_proxy(policy(&["127.0.0.1"], true), StubLookup::new(&[]), ProxyLimits::default());
+    async fn test_serve_end_to_end_ipv4_echo() -> TestResult {
+        let echo = echo_server().await?;
+        let harness = start_proxy(
+            policy(&["127.0.0.1"], true)?,
+            StubLookup::new(&[])?,
+            ProxyLimits::default(),
+        )?;
         let target = TargetAddr::Ip(echo.ip());
-        let (mut stream, code) = socks_connect(&harness.socket, &target, echo.port()).await;
+        let (mut stream, code) = socks_connect(&harness.socket, &target, echo.port()).await?;
         assert_eq!(code, REP_SUCCEEDED);
-        stream.write_all(b"ping").await.expect("schreiben");
+        stream.write_all(b"ping").await.map_err(ctx("schreiben"))?;
         let mut answer = [0_u8; 4];
         timeout(Duration::from_secs(5), stream.read_exact(&mut answer))
             .await
-            .expect("rechtzeitig")
-            .expect("Echo");
+            .map_err(ctx("rechtzeitig"))?
+            .map_err(ctx("Echo"))?;
         assert_eq!(&answer, b"ping");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_serve_end_to_end_domain_uses_checked_address() {
-        let echo = echo_server().await;
-        let lookup = StubLookup::new(&[("echo.test", &["127.0.0.1"])]);
-        let harness = start_proxy(policy(&["echo.test"], true), lookup, ProxyLimits::default());
+    async fn test_serve_end_to_end_domain_uses_checked_address() -> TestResult {
+        let echo = echo_server().await?;
+        let lookup = StubLookup::new(&[("echo.test", &["127.0.0.1"])])?;
+        let harness = start_proxy(
+            policy(&["echo.test"], true)?,
+            lookup,
+            ProxyLimits::default(),
+        )?;
         let target = TargetAddr::Domain(b"ECHO.test.".to_vec());
-        let (mut stream, code) = socks_connect(&harness.socket, &target, echo.port()).await;
+        let (mut stream, code) = socks_connect(&harness.socket, &target, echo.port()).await?;
         assert_eq!(code, REP_SUCCEEDED);
-        stream.write_all(b"hallo").await.expect("schreiben");
-        stream.shutdown().await.expect("halb schließen");
+        stream.write_all(b"hallo").await.map_err(ctx("schreiben"))?;
+        stream.shutdown().await.map_err(ctx("halb schließen"))?;
         let mut answer = Vec::new();
         timeout(Duration::from_secs(5), stream.read_to_end(&mut answer))
             .await
-            .expect("rechtzeitig")
-            .expect("Echo bis EOF");
+            .map_err(ctx("rechtzeitig"))?
+            .map_err(ctx("Echo bis EOF"))?;
         assert_eq!(answer, b"hallo");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_serve_end_to_end_denials() {
-        let echo = echo_server().await;
-        let lookup = StubLookup::new(&[("echo.test", &["127.0.0.1"])]);
+    async fn test_serve_end_to_end_denials() -> TestResult {
+        let echo = echo_server().await?;
+        let lookup = StubLookup::new(&[("echo.test", &["127.0.0.1"])])?;
         // Strikte Policy: Loopback ist eine private Klasse.
-        let strict = policy(&["echo.test", "127.0.0.1"], false);
-        let harness = start_proxy(strict, lookup, ProxyLimits::default());
+        let strict = policy(&["echo.test", "127.0.0.1"], false)?;
+        let harness = start_proxy(strict, lookup, ProxyLimits::default())?;
         let cases = [
             TargetAddr::Ip(echo.ip()),
             TargetAddr::Domain(b"echo.test".to_vec()),
@@ -1294,68 +1488,95 @@ mod tests {
             TargetAddr::Domain(b"bad name".to_vec()),
         ];
         for target in cases {
-            let (mut stream, code) = socks_connect(&harness.socket, &target, echo.port()).await;
+            let (mut stream, code) = socks_connect(&harness.socket, &target, echo.port()).await?;
             assert_eq!(code, REP_NOT_ALLOWED, "{target:?}");
-            assert!(read_eof_within(&mut stream, Duration::from_secs(5)).await, "{target:?}");
+            assert!(
+                read_eof_within(&mut stream, Duration::from_secs(5)).await,
+                "{target:?}"
+            );
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_serve_idle_timeout_closes_session() {
-        let echo = echo_server().await;
-        let limits =
-            ProxyLimits { idle_timeout: Duration::from_millis(200), ..ProxyLimits::default() };
-        let harness = start_proxy(policy(&["127.0.0.1"], true), StubLookup::new(&[]), limits);
+    async fn test_serve_idle_timeout_closes_session() -> TestResult {
+        let echo = echo_server().await?;
+        let limits = ProxyLimits {
+            idle_timeout: Duration::from_millis(200),
+            ..ProxyLimits::default()
+        };
+        let harness = start_proxy(policy(&["127.0.0.1"], true)?, StubLookup::new(&[])?, limits)?;
         let target = TargetAddr::Ip(echo.ip());
-        let (mut stream, code) = socks_connect(&harness.socket, &target, echo.port()).await;
+        let (mut stream, code) = socks_connect(&harness.socket, &target, echo.port()).await?;
         assert_eq!(code, REP_SUCCEEDED);
         assert!(read_eof_within(&mut stream, Duration::from_secs(5)).await);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_serve_byte_limit_closes_without_forwarding() {
-        let echo = echo_server().await;
-        let limits = ProxyLimits { max_bytes_per_direction: 4, ..ProxyLimits::default() };
-        let harness = start_proxy(policy(&["127.0.0.1"], true), StubLookup::new(&[]), limits);
+    async fn test_serve_byte_limit_closes_without_forwarding() -> TestResult {
+        let echo = echo_server().await?;
+        let limits = ProxyLimits {
+            max_bytes_per_direction: 4,
+            ..ProxyLimits::default()
+        };
+        let harness = start_proxy(policy(&["127.0.0.1"], true)?, StubLookup::new(&[])?, limits)?;
         let target = TargetAddr::Ip(echo.ip());
-        let (mut stream, code) = socks_connect(&harness.socket, &target, echo.port()).await;
+        let (mut stream, code) = socks_connect(&harness.socket, &target, echo.port()).await?;
         assert_eq!(code, REP_SUCCEEDED);
-        stream.write_all(b"zu lang").await.expect("schreiben");
+        stream
+            .write_all(b"zu lang")
+            .await
+            .map_err(ctx("schreiben"))?;
         let mut buf = Vec::new();
         let read = timeout(Duration::from_secs(5), stream.read_to_end(&mut buf)).await;
         // Innerhalb der Frist: EOF oder Reset, beides ohne weitergeleitete Daten.
         assert!(read.is_ok(), "Timeout: {read:?}");
         assert!(buf.is_empty(), "nichts weitergegeben: {buf:?}");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_serve_max_connections_rejects_extra_client() {
-        let echo = echo_server().await;
-        let limits = ProxyLimits { max_connections: 1, ..ProxyLimits::default() };
-        let harness = start_proxy(policy(&["127.0.0.1"], true), StubLookup::new(&[]), limits);
+    async fn test_serve_max_connections_rejects_extra_client() -> TestResult {
+        let echo = echo_server().await?;
+        let limits = ProxyLimits {
+            max_connections: 1,
+            ..ProxyLimits::default()
+        };
+        let harness = start_proxy(policy(&["127.0.0.1"], true)?, StubLookup::new(&[])?, limits)?;
         let target = TargetAddr::Ip(echo.ip());
-        let (_first, code) = socks_connect(&harness.socket, &target, echo.port()).await;
+        let (_first, code) = socks_connect(&harness.socket, &target, echo.port()).await?;
         assert_eq!(code, REP_SUCCEEDED);
-        let mut second = UnixStream::connect(&harness.socket).await.expect("verbinden");
+        let mut second = UnixStream::connect(&harness.socket)
+            .await
+            .map_err(ctx("verbinden"))?;
         // Schreiben kann schon scheitern, wenn der Proxy schneller schließt.
         let _ = second.write_all(&[5, 1, 0]).await;
         assert!(read_eof_within(&mut second, Duration::from_secs(5)).await);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_serve_shutdown_returns_ok_and_aborts_sessions() {
-        let echo = echo_server().await;
-        let mut harness =
-            start_proxy(policy(&["127.0.0.1"], true), StubLookup::new(&[]), ProxyLimits::default());
+    async fn test_serve_shutdown_returns_ok_and_aborts_sessions() -> TestResult {
+        let echo = echo_server().await?;
+        let mut harness = start_proxy(
+            policy(&["127.0.0.1"], true)?,
+            StubLookup::new(&[])?,
+            ProxyLimits::default(),
+        )?;
         let (mut stream, code) =
-            socks_connect(&harness.socket, &TargetAddr::Ip(echo.ip()), echo.port()).await;
+            socks_connect(&harness.socket, &TargetAddr::Ip(echo.ip()), echo.port()).await?;
         assert_eq!(code, REP_SUCCEEDED);
-        harness.stop.take().expect("Sender").send(()).expect("Proxy läuft");
+        let sender = harness.stop.take().ok_or(TestError::Missing("Sender"))?;
+        sender.send(()).map_err(|_| {
+            TestError::Unexpected("Proxy läuft nicht mehr: send() schlug fehl".into())
+        })?;
         let result = timeout(Duration::from_secs(5), &mut harness.task)
             .await
-            .expect("rechtzeitig")
-            .expect("Task nicht abgestürzt");
+            .map_err(ctx("rechtzeitig"))?
+            .map_err(ctx("Task nicht abgestürzt"))?;
         assert!(result.is_ok(), "{result:?}");
         assert!(read_eof_within(&mut stream, Duration::from_secs(5)).await);
+        Ok(())
     }
 }

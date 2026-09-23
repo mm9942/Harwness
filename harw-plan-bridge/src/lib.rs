@@ -112,7 +112,8 @@ pub use crate::plan_context::{
     PlanContextProvider,
 };
 pub use crate::security_bridge::{
-    dock_security_finding, evidence_for_security_finding, propose_invalidation_for_contract_violation,
+    dock_security_finding, evidence_for_security_finding,
+    propose_invalidation_for_contract_violation,
 };
 
 /// Gemeinsame Test-Fixtures für alle Module dieser Crate.
@@ -148,6 +149,7 @@ pub(crate) mod testing {
     use time::OffsetDateTime;
 
     use crate::job_bridge::JobAdmissionTemplate;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     /// Re-Export des echten Goal-Stores für die Aufrufstellen in dieser Crate.
     pub(crate) use harw_plan::InMemoryGoalStore;
@@ -281,17 +283,17 @@ pub(crate) mod testing {
     }
 
     /// Parst eine Test-Plan-ID über die geprüfte Grammatik (`PlanId::parse`).
-    pub(crate) fn plan_id(raw: &str) -> PlanId {
-        match PlanId::parse(raw) {
-            Ok(id) => id,
-            Err(error) => panic!("Test-Plan-ID '{raw}' ungültig: {error}"),
-        }
+    pub(crate) fn plan_id(raw: &str) -> TestResult<PlanId> {
+        PlanId::parse(raw).map_err(|error| TestError::Context {
+            context: "Test-Plan-ID ungültig",
+            source: format!("'{raw}': {error}"),
+        })
     }
 
     /// Baut einen Plan-Snapshot von Hand (ohne Store-Validation).
-    pub(crate) fn plan_with(nodes: Vec<PlanNode>) -> Plan {
-        Plan {
-            id: plan_id("p-test"),
+    pub(crate) fn plan_with(nodes: Vec<PlanNode>) -> TestResult<Plan> {
+        Ok(Plan {
+            id: plan_id("p-test")?,
             revision: RevisionId::new(1),
             parent_revision: None,
             goal_statement: "Test-Ziel".to_owned(),
@@ -299,14 +301,14 @@ pub(crate) mod testing {
             nodes,
             created_at: plan_time(),
             updated_at: plan_time(),
-        }
+        })
     }
 
     /// Legt einen `InMemoryPlanStore` (aktivierte Standardwerte, ohne
     /// Explorationspflicht) mit Plan und Knoten an.
     ///
     /// Siehe [`seeded_plan_store_with_config`] für die Einfügeregeln.
-    pub(crate) fn seeded_plan_store(nodes: Vec<PlanNode>) -> InMemoryPlanStore {
+    pub(crate) fn seeded_plan_store(nodes: Vec<PlanNode>) -> TestResult<InMemoryPlanStore> {
         seeded_plan_store_with_config(PlanToolConfig::enabled_defaults(), nodes)
     }
 
@@ -333,29 +335,24 @@ pub(crate) mod testing {
     pub(crate) fn seeded_plan_store_with_config(
         config: PlanToolConfig,
         nodes: Vec<PlanNode>,
-    ) -> InMemoryPlanStore {
-        let store = match InMemoryPlanStore::with_config(config) {
-            Ok(store) => store,
-            Err(error) => panic!("Store anlegen: {error}"),
-        };
-        if let Err(error) = store.apply(
-            PlanAction::Create {
-                plan_id: plan_id("p-test"),
-                goal: "Test-Ziel".to_owned(),
-            },
-            "test",
-        ) {
-            panic!("Plan anlegen: {error}");
-        }
+    ) -> TestResult<InMemoryPlanStore> {
+        let store = InMemoryPlanStore::with_config(config).map_err(ctx("Store anlegen"))?;
+        store
+            .apply(
+                PlanAction::Create {
+                    plan_id: plan_id("p-test")?,
+                    goal: "Test-Ziel".to_owned(),
+                },
+                "test",
+            )
+            .map_err(ctx("Plan anlegen"))?;
         let actions = seed_actions(nodes);
         if !actions.is_empty() {
-            if let Err(error) =
-                store.apply_batch(&plan_id("p-test"), actions, "test", RevisionId::new(1))
-            {
-                panic!("Knoten einsäen: {error}");
-            }
+            store
+                .apply_batch(&plan_id("p-test")?, actions, "test", RevisionId::new(1))
+                .map_err(ctx("Knoten einsäen"))?;
         }
-        store
+        Ok(store)
     }
 
     /// Übersetzt Wunschknoten in `AddNode(Draft)` plus zulässige Übergänge.
@@ -375,7 +372,11 @@ pub(crate) mod testing {
     }
 
     /// Die Übergangskette von `Draft` in den Zielstatus.
-    fn seed_transitions(id: &TaskId, target: PlanNodeStatus, has_evidence: bool) -> Vec<PlanAction> {
+    fn seed_transitions(
+        id: &TaskId,
+        target: PlanNodeStatus,
+        has_evidence: bool,
+    ) -> Vec<PlanAction> {
         let set = |status: PlanNodeStatus| PlanAction::SetStatus {
             id: id.clone(),
             status,
@@ -502,7 +503,9 @@ pub(crate) mod testing {
         ) -> PlanResult<PlanRevision> {
             self.batch_calls.fetch_add(1, Ordering::SeqCst);
             if take_one(&self.failures) {
-                return Err(PlanError::Io(std::io::Error::other("injizierter Batch-Fehler")));
+                return Err(PlanError::Io(std::io::Error::other(
+                    "injizierter Batch-Fehler",
+                )));
             }
             if take_one(&self.conflicts) {
                 self.inner.apply(PlanAction::Inspect, "fremder-schreiber")?;
@@ -512,12 +515,10 @@ pub(crate) mod testing {
     }
 
     /// Ein Job-Admission-Template mit festen Testwerten.
-    pub(crate) fn admission_template() -> JobAdmissionTemplate {
-        let retry = match RetryPolicy::try_new(1, SignedDuration::ZERO, 2.0, SignedDuration::ZERO) {
-            Ok(retry) => retry,
-            Err(error) => panic!("RetryPolicy: {error}"),
-        };
-        JobAdmissionTemplate::new(
+    pub(crate) fn admission_template() -> TestResult<JobAdmissionTemplate> {
+        let retry = RetryPolicy::try_new(1, SignedDuration::ZERO, 2.0, SignedDuration::ZERO)
+            .map_err(ctx("RetryPolicy"))?;
+        Ok(JobAdmissionTemplate::new(
             JobScope::new(
                 TenantId::from_str("tenant-test"),
                 WorkspaceId::from_str("workspace"),
@@ -529,24 +530,21 @@ pub(crate) mod testing {
             retry,
             RepoRevision("abc123".to_owned()),
             timestamp(),
-        )
+        ))
     }
 
     /// Ein Job-Store in einem frischen Temp-Verzeichnis.
-    pub(crate) fn temp_job_store() -> (JobStore, tempfile::TempDir) {
-        let dir = match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(error) => panic!("Temp-Verzeichnis: {error}"),
-        };
-        (JobStore::new(dir.path()), dir)
+    pub(crate) fn temp_job_store() -> TestResult<(JobStore, tempfile::TempDir)> {
+        let dir = tempfile::tempdir().map_err(ctx("Temp-Verzeichnis"))?;
+        Ok((JobStore::new(dir.path()), dir))
     }
 
     /// Zahl aller Jobs im Store (eine Seite genügt für Tests).
-    pub(crate) fn job_count(jobs: &JobStore) -> usize {
-        match jobs.list(&JobListQuery::default()) {
-            Ok(page) => page.jobs.len(),
-            Err(error) => panic!("Jobs auflisten: {error}"),
-        }
+    pub(crate) fn job_count(jobs: &JobStore) -> TestResult<usize> {
+        let page = jobs
+            .list(&JobListQuery::default())
+            .map_err(ctx("Jobs auflisten"))?;
+        Ok(page.jobs.len())
     }
 
     /// Konfiguration, die Exploration vor `Coding` verlangt.
@@ -615,7 +613,7 @@ pub(crate) mod testing {
     }
 
     /// Plan und Ziel, bei dem jedes Kriterium durch Evidenz belegt ist.
-    pub(crate) fn covered_goal_fixture() -> (Plan, Goal) {
+    pub(crate) fn covered_goal_fixture() -> TestResult<(Plan, Goal)> {
         let mut node = coding_node("t-1", PlanNodeStatus::Completed);
         node.evidence = vec![EvidenceRef {
             kind: EvidenceKind::Manual,
@@ -624,7 +622,7 @@ pub(crate) mod testing {
             actor: "operator".to_owned(),
             digest: None,
         }];
-        let plan = plan_with(vec![node]);
+        let plan = plan_with(vec![node])?;
 
         let mut goal = goal_with_open_criterion();
         goal.invariants = Vec::new();
@@ -634,12 +632,13 @@ pub(crate) mod testing {
                 note: "handgeprueft".to_owned(),
             }],
         }];
-        (plan, goal)
+        Ok((plan, goal))
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::test_support::{TestError, TestResult};
 
         // Die früheren Tests `test_in_memory_goal_store_reports_no_goal_before_set`,
         // `test_in_memory_goal_store_records_history_and_revision` und
@@ -653,33 +652,37 @@ pub(crate) mod testing {
         // zusätzliche Abdeckung gewesen.
 
         #[test]
-        fn test_covered_goal_fixture_is_actually_covered() {
-            let (plan, goal) = covered_goal_fixture();
+        fn test_covered_goal_fixture_is_actually_covered() -> TestResult {
+            let (plan, goal) = covered_goal_fixture()?;
             let report = harw_plan::goal::evaluate_goal(&goal, &plan);
             assert!(report.criteria_open.is_empty(), "{report:?}");
             assert!(report.invariants_violated.is_empty(), "{report:?}");
             assert!(report.coverage >= 1.0);
+            Ok(())
         }
 
         #[test]
-        fn test_seeded_plan_store_accepts_the_shared_fixtures() {
+        fn test_seeded_plan_store_accepts_the_shared_fixtures() -> TestResult {
             let store = seeded_plan_store(vec![
                 coding_node("t-1", PlanNodeStatus::Ready),
                 coding_node("t-2", PlanNodeStatus::Completed),
-            ]);
+            ])?;
             match store.current() {
                 Ok(plan) => {
                     assert_eq!(plan.nodes.len(), 2);
                     assert_eq!(plan.nodes[0].status, PlanNodeStatus::Ready);
                     assert_eq!(plan.nodes[1].status, PlanNodeStatus::Completed);
                     assert_eq!(plan.nodes[1].evidence.len(), 1);
+                    Ok(())
                 }
-                Err(error) => panic!("current schlug fehl: {error}"),
+                Err(error) => Err(TestError::Unexpected(format!(
+                    "current schlug fehl: {error}"
+                ))),
             }
         }
 
         #[test]
-        fn test_seeded_plan_store_reaches_every_status_through_legal_transitions() {
+        fn test_seeded_plan_store_reaches_every_status_through_legal_transitions() -> TestResult {
             let statuses = [
                 PlanNodeStatus::Draft,
                 PlanNodeStatus::Ready,
@@ -694,28 +697,42 @@ pub(crate) mod testing {
                 .enumerate()
                 .map(|(index, status)| coding_node(&format!("t-{index}"), *status))
                 .collect();
-            let store = seeded_plan_store(nodes);
-            let plan = match store.current() {
-                Ok(plan) => plan,
-                Err(error) => panic!("current schlug fehl: {error}"),
+            let store = seeded_plan_store(nodes)?;
+            let Ok(plan) = store.current() else {
+                return Err(TestError::Unexpected("current schlug fehl".into()));
             };
             let seen: Vec<PlanNodeStatus> = plan.nodes.iter().map(|node| node.status).collect();
             assert_eq!(seen, statuses.to_vec());
+            Ok(())
         }
 
         #[test]
-        fn test_scripted_plan_store_injects_a_real_revision_conflict() {
+        fn test_scripted_plan_store_injects_a_real_revision_conflict() -> TestResult {
             let store = ScriptedPlanStore::new(seeded_plan_store(vec![coding_node(
                 "t-1",
                 PlanNodeStatus::Draft,
-            )]));
+            )])?);
             store.inject_conflicts(1);
             let revision = store.revision();
-            match store.apply_batch(&plan_id("p-test"), vec![PlanAction::Inspect], "t", revision) {
+            match store.apply_batch(
+                &plan_id("p-test")?,
+                vec![PlanAction::Inspect],
+                "t",
+                revision,
+            ) {
                 Err(PlanError::RevisionConflict { .. }) => {}
-                other => panic!("erwartet RevisionConflict, bekommen: {other:?}"),
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "erwartet RevisionConflict, bekommen: {other:?}"
+                    )));
+                }
             }
             assert_eq!(store.batch_calls(), 1);
+            Ok(())
         }
     }
 }
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

@@ -68,8 +68,8 @@
 //! gegen [`derive_read_scope`]s Ergebnis — der Aufrufer wählt nichts, er
 //! bekommt, was sein (fester) Lesebereich hergibt.
 use harw_lens::{
-    IndexSelector, ReadScope, DEFAULT_VISIBILITY, DOCS_DESIGN_INDEX, KNOWLEDGE_PALACE_INDEX,
-    OPERATOR_ONLY_VISIBILITY,
+    DEFAULT_VISIBILITY, DOCS_DESIGN_INDEX, IndexSelector, KNOWLEDGE_PALACE_INDEX,
+    OPERATOR_ONLY_VISIBILITY, ReadScope,
 };
 use harw_tools::ToolExecutionContext;
 
@@ -188,19 +188,20 @@ pub fn selectors_in_scope(scope: &ReadScope) -> Vec<IndexSelector> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use harw_authority::{
         Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
     };
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::path::PathBuf;
 
-    fn make_context(label: &str, permissions: Vec<Permission>) -> ToolExecutionContext {
+    fn make_context(label: &str, permissions: Vec<Permission>) -> TestResult<ToolExecutionContext> {
         let base = std::env::temp_dir().join(format!(
             "harw-tool-lens-scope-tests-{}-{label}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(base.join("ws")).expect("Workspace anlegen");
+        std::fs::create_dir_all(base.join("ws")).map_err(ctx("Workspace anlegen"))?;
         let registry = WorkspaceRegistry::build(
             &base,
             [WorkspaceRegistration {
@@ -209,12 +210,16 @@ mod tests {
                 root: PathBuf::from("ws"),
             }],
         )
-        .expect("Registry bauen");
+        .map_err(ctx("Registry bauen"))?;
         let binding = registry
             .resolve(&TenantId::from_str("t"), &WorkspaceId::from_str("w"))
-            .expect("Workspace auflösen");
+            .map_err(ctx("Workspace auflösen"))?;
         let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::from_policy(permissions));
-        ToolExecutionContext::new(SessionId::new(), TurnId::new(), sandbox)
+        Ok(ToolExecutionContext::new(
+            SessionId::new(),
+            TurnId::new(),
+            sandbox,
+        ))
     }
 
     /// Der Kern der Auflage: unabhängig davon, welche Berechtigungen der
@@ -223,7 +228,7 @@ mod tests {
     /// Berechtigungen, die `"operator-only"` freischaltet, weil die Sandbox
     /// diesen Begriff nicht kennt.
     #[test]
-    fn test_derive_read_scope_never_allows_operator_only_regardless_of_permissions() {
+    fn test_derive_read_scope_never_allows_operator_only_regardless_of_permissions() -> TestResult {
         let all_permissions = vec![
             Permission::ReadWorkspace,
             Permission::WriteWorkspace,
@@ -233,25 +238,27 @@ mod tests {
             Permission::ManagePlugins,
             Permission::ReadCargoRegistry,
         ];
-        let context = make_context("all-perms", all_permissions);
+        let context = make_context("all-perms", all_permissions)?;
 
         let scope = derive_read_scope(&context);
 
         assert!(scope.allows(DEFAULT_VISIBILITY));
         assert!(!scope.allows(OPERATOR_ONLY_VISIBILITY));
+        Ok(())
     }
 
     /// Ohne jede Berechtigung bleibt der Lesebereich identisch -- der
     /// abgeleitete Scope hängt nicht von `PermissionSet` ab, weil keine der
     /// dort vorhandenen Berechtigungen einen Sichtbarkeitsbegriff trägt.
     #[test]
-    fn test_derive_read_scope_identical_with_no_permissions_at_all() {
-        let context = make_context("no-perms", vec![]);
+    fn test_derive_read_scope_identical_with_no_permissions_at_all() -> TestResult {
+        let context = make_context("no-perms", vec![])?;
 
         let scope = derive_read_scope(&context);
 
         assert!(scope.allows(DEFAULT_VISIBILITY));
         assert!(!scope.allows(OPERATOR_ONLY_VISIBILITY));
+        Ok(())
     }
 
     #[test]
@@ -261,15 +268,21 @@ mod tests {
         let selectors = selectors_in_scope(&scope);
 
         assert_eq!(selectors.len(), 2);
-        assert!(selectors
-            .iter()
-            .all(|selector| selector.visibility == DEFAULT_VISIBILITY));
-        assert!(selectors
-            .iter()
-            .any(|selector| selector.index_name == DOCS_DESIGN_INDEX));
-        assert!(selectors
-            .iter()
-            .any(|selector| selector.index_name == KNOWLEDGE_PALACE_INDEX));
+        assert!(
+            selectors
+                .iter()
+                .all(|selector| selector.visibility == DEFAULT_VISIBILITY)
+        );
+        assert!(
+            selectors
+                .iter()
+                .any(|selector| selector.index_name == DOCS_DESIGN_INDEX)
+        );
+        assert!(
+            selectors
+                .iter()
+                .any(|selector| selector.index_name == KNOWLEDGE_PALACE_INDEX)
+        );
     }
 
     #[test]

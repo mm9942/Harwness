@@ -45,3 +45,7 @@ pub use discovery::{
     DiscoveredDoc, DiscoveryConfig, DiscoveryError, ProjectContext, discover_project,
 };
 pub use provider::ProjectContextProvider;
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

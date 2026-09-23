@@ -117,19 +117,20 @@ use crate::error::{CoreError, CoreResult};
 use crate::history::ConversationHistory;
 use crate::mode::InteractionMode;
 use crate::state_store::{
-    ActivationSnapshot, SESSION_STATE_VERSION, SessionStateSnapshot, StateStore,
-    StateStoreResult, repair_open_tool_calls,
+    ActivationSnapshot, SESSION_STATE_VERSION, SessionStateSnapshot, StateStore, StateStoreResult,
+    repair_open_tool_calls,
 };
+use crate::turn_loop::TurnControl;
 use harw_agent_dsl::ExecutableAgentIr;
 use harw_agent_dsl::executable::{ContextProgram, SnapshotId};
 use harw_agent_dsl::roles::AgentRoleId;
+use harw_authority::{PermissionRequest, SandboxSpec};
 use harw_catalog::{AgentSuggestions, SpawnCapabilitySnapshot};
 use harw_context::ContextCeiling;
 use harw_extension_api::ExtensionRegistry;
 use harw_observe::TraceContext;
 use harw_protocol::events::SessionEvent;
 use harw_protocol::events::TurnEvent;
-use harw_authority::{PermissionRequest, SandboxSpec};
 use harw_tools::{ToolCall, ToolName};
 use harw_types::{
     AgentRole, ApprovalActor, ItemId, ModelId, ProviderId, ReasoningEffort, SessionId, TokenUsage,
@@ -171,6 +172,21 @@ pub struct AgentSession {
     /// Der aktuell laufende / pausierte Turn (gesetzt ab `try_start_turn`,
     /// erhalten über einen Handoff hinweg, gelöscht bei `complete_turn`).
     current_turn: Option<TurnId>,
+    /// Der [`TurnControl`]-Steuerblock des aktuell laufenden/pausierten Turns.
+    ///
+    /// Analog zu [`Self::current_turn`], gleiche Lebensdauer: gesetzt sobald
+    /// ein Turn über [`crate::turn_loop::run_turn`]/`run_turn_durable` beginnt,
+    /// erhalten über eine Handoff- oder Rückfrage-Pause hinweg, gelöscht bei
+    /// [`Self::complete_turn`]. Schließt die in `turn_loop.rs`s Moduldoku
+    /// („Fünfter Nachtrag") dokumentierte Lücke: ohne dieses Feld bauten sich
+    /// `resume_after_child`/`resume_after_approval` (bzw. ihre
+    /// `_durable`-Varianten) nach jeder Pause einen frischen, unbegrenzten
+    /// `TurnControl::new()` mit eigenem `CancelToken` — ein vor der Pause
+    /// gültiger Abbruchwunsch (Ctrl+C) ging dadurch verloren. `TurnControl`
+    /// ist bereits `#[derive(Clone)]`; ein Klon teilt denselben `CancelToken`
+    /// und denselben Zähler mit dem Original, ein `Arc` ist deshalb nicht
+    /// nötig.
+    active_turn_control: Option<TurnControl>,
     pending_approval: Option<PendingApproval>,
     pending_handoff: Option<PendingHandoff>,
     spawn_context: Option<SpawnContext>,
@@ -494,6 +510,7 @@ impl AgentSession {
             registry,
             history: ConversationHistory::new(),
             current_turn: None,
+            active_turn_control: None,
             pending_approval: None,
             pending_handoff: None,
             spawn_context: None,
@@ -939,9 +956,7 @@ impl AgentSession {
     /// Liefert den aktuell registrierten Fortschritts-Beobachter, falls
     /// vorhanden.
     #[must_use]
-    pub fn progress_observer(
-        &self,
-    ) -> Option<&std::sync::Arc<dyn crate::guard::ProgressObserver>> {
+    pub fn progress_observer(&self) -> Option<&std::sync::Arc<dyn crate::guard::ProgressObserver>> {
         self.progress_observer.as_ref()
     }
 
@@ -1187,6 +1202,37 @@ impl AgentSession {
         self.current_turn.as_ref()
     }
 
+    /// Hinterlegt den [`TurnControl`]-Steuerblock des gerade gestarteten
+    /// Turns, damit er über eine Handoff- oder Rückfrage-Pause hinweg
+    /// erhalten bleibt.
+    ///
+    /// # Description
+    /// Aufgerufen von `run_turn_with_approvals` (`turn_loop.rs`) direkt nach
+    /// `try_start_turn`, mit einem Klon des `TurnInput::control`-Blocks des
+    /// neuen Turns. Ein späterer `resume_after_child`/`resume_after_approval`
+    /// liest denselben Block über [`Self::active_turn_control`] zurück, statt
+    /// sich einen frischen zu bauen — siehe Feld-Doku.
+    ///
+    /// # Arguments
+    /// - `control` (`TurnControl`): der Steuerblock des soeben gestarteten
+    ///   Turns (Ownership).
+    pub(crate) fn set_active_turn_control(&mut self, control: TurnControl) {
+        self.active_turn_control = Some(control);
+    }
+
+    /// Der [`TurnControl`]-Steuerblock des aktuell laufenden/pausierten
+    /// Turns, sofern einer hinterlegt ist.
+    ///
+    /// # Returns
+    /// `Some(&TurnControl)`, wenn [`Self::set_active_turn_control`] seit dem
+    /// letzten [`Self::complete_turn`] aufgerufen wurde; sonst `None` — z. B.
+    /// wenn eine Session ihren Turn nie über `run_turn`/`run_turn_durable`
+    /// gestartet hat (Tests, die direkt `try_start_turn` rufen).
+    #[must_use]
+    pub(crate) fn active_turn_control(&self) -> Option<&TurnControl> {
+        self.active_turn_control.as_ref()
+    }
+
     /// Versucht einen Turn zu starten. Nur aus `Idle` möglich.
     pub fn try_start_turn(&mut self) -> Result<TurnHandle, TurnRejection> {
         match &self.state {
@@ -1275,6 +1321,7 @@ impl AgentSession {
         self.total_usage.add(&usage);
         self.state = SessionState::Idle;
         self.current_turn = None;
+        self.active_turn_control = None;
         self.pending_approval = None;
         self.pending_handoff = None;
         let _ = self.event_tx.send(SessionEvent::TurnCompleted {
@@ -1492,7 +1539,10 @@ impl AgentSession {
             version: SESSION_STATE_VERSION,
             mode: self.mode,
             total_usage: self.total_usage.clone(),
-            executable_snapshot_id: self.executable_snapshot_id.as_ref().map(ToString::to_string),
+            executable_snapshot_id: self
+                .executable_snapshot_id
+                .as_ref()
+                .map(ToString::to_string),
             base_activation: ActivationSnapshot::capture(
                 &self.base_activation,
                 tool_names.iter().map(String::as_str),
@@ -1538,7 +1588,10 @@ impl AgentSession {
             );
             return false;
         }
-        let current_snapshot_id = self.executable_snapshot_id.as_ref().map(ToString::to_string);
+        let current_snapshot_id = self
+            .executable_snapshot_id
+            .as_ref()
+            .map(ToString::to_string);
         if snapshot.executable_snapshot_id == current_snapshot_id {
             self.base_activation = self
                 .base_activation
@@ -1642,13 +1695,14 @@ impl AgentSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_agent_dsl::authority::AuthorityCeiling;
     use harw_agent_dsl::lower;
     use harw_agent_dsl::parse::parse_toml;
     use harw_agent_dsl::resolved::{ResolutionTrace, ResolvedAgentDefinition};
+    use harw_authority::{Permission, PermissionSet, WorkspaceRegistration, WorkspaceRegistry};
     use harw_context::{ContextBudgetSpec, SectionName, TrustClass};
     use harw_extension_api::ExtensionRegistryBuilder;
-    use harw_authority::{Permission, PermissionSet, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{TenantId, WorkspaceId};
     use std::path::PathBuf;
 
@@ -1715,41 +1769,52 @@ mod tests {
     }
 
     #[test]
-    fn begin_approval_stores_requested_at_and_computes_default_timeout_at() {
+    fn begin_approval_stores_requested_at_and_computes_default_timeout_at() -> TestResult {
         let mut session = test_session();
         session
             .try_start_turn()
-            .expect("an idle session can start a turn");
+            .map_err(ctx("an idle session can start a turn"))?;
         let now = jiff::Timestamp::constant(1_700_000_000, 0);
 
         session
-            .begin_approval(test_approval_call(), ItemId::new(), test_approval_actor(), now)
-            .expect("a running session accepts an approval pause");
+            .begin_approval(
+                test_approval_call(),
+                ItemId::new(),
+                test_approval_actor(),
+                now,
+            )
+            .map_err(ctx("a running session accepts an approval pause"))?;
 
-        let pending = session
-            .pending_approval()
-            .expect("begin_approval must record a pending approval");
+        let pending = session.pending_approval().ok_or(TestError::Missing(
+            "begin_approval muss ein Approval speichern",
+        ))?;
         assert_eq!(pending.requested_at, now);
         assert_eq!(
             pending.timeout_at,
             now.checked_add(DEFAULT_APPROVAL_TIMEOUT)
-                .expect("default timeout stays in range")
+                .map_err(ctx("default timeout stays in range"))?
         );
+        Ok(())
     }
 
     #[test]
-    fn pending_approval_is_timed_out_is_inclusive_at_the_deadline() {
+    fn pending_approval_is_timed_out_is_inclusive_at_the_deadline() -> TestResult {
         let mut session = test_session();
         session
             .try_start_turn()
-            .expect("an idle session can start a turn");
+            .map_err(ctx("an idle session can start a turn"))?;
         let now = jiff::Timestamp::constant(1_700_000_000, 0);
         session
-            .begin_approval(test_approval_call(), ItemId::new(), test_approval_actor(), now)
-            .expect("a running session accepts an approval pause");
-        let pending = session
-            .pending_approval()
-            .expect("begin_approval must record a pending approval");
+            .begin_approval(
+                test_approval_call(),
+                ItemId::new(),
+                test_approval_actor(),
+                now,
+            )
+            .map_err(ctx("a running session accepts an approval pause"))?;
+        let pending = session.pending_approval().ok_or(TestError::Missing(
+            "begin_approval muss ein Approval speichern",
+        ))?;
 
         assert!(!pending.is_timed_out(now), "freshly opened, not timed out");
         assert!(
@@ -1757,7 +1822,7 @@ mod tests {
                 pending
                     .timeout_at
                     .checked_sub(jiff::SignedDuration::from_secs(1))
-                    .expect("one second before the deadline stays in range")
+                    .map_err(ctx("one second before the deadline stays in range"))?
             ),
             "one second before the deadline must not be timed out"
         );
@@ -1770,10 +1835,11 @@ mod tests {
                 pending
                     .timeout_at
                     .checked_add(jiff::SignedDuration::from_secs(1))
-                    .expect("one second after the deadline stays in range")
+                    .map_err(ctx("one second after the deadline stays in range"))?
             ),
             "past the deadline must stay timed out"
         );
+        Ok(())
     }
 
     #[test]
@@ -1789,7 +1855,7 @@ mod tests {
         assert!(session.pending_approval().is_none());
     }
 
-    fn executable_agent_ir(admitted: &[&str], forbidden: &[&str]) -> ExecutableAgentIr {
+    fn executable_agent_ir(admitted: &[&str], forbidden: &[&str]) -> TestResult<ExecutableAgentIr> {
         let admitted = admitted
             .iter()
             .map(|name| format!("\"{name}\""))
@@ -1813,7 +1879,7 @@ admitted = [{admitted}]
 forbidden = [{forbidden}]
 "#
         ))
-        .expect("test agent definition must parse");
+        .map_err(ctx("test agent definition must parse"))?;
         let resolved = ResolvedAgentDefinition {
             id: raw.id,
             version: raw.version,
@@ -1827,7 +1893,7 @@ forbidden = [{forbidden}]
             reasoning_effort: raw.reasoning_effort.clone(),
         };
 
-        lower(&resolved).expect("test agent definition must lower")
+        lower(&resolved).map_err(ctx("test agent definition must lower"))
     }
 
     #[test]
@@ -1846,8 +1912,8 @@ forbidden = [{forbidden}]
     }
 
     #[test]
-    fn executable_policy_with_empty_admitted_list_allows_no_tools() {
-        let executable = executable_agent_ir(&[], &[]);
+    fn executable_policy_with_empty_admitted_list_allows_no_tools() -> TestResult {
+        let executable = executable_agent_ir(&[], &[])?;
         let session = test_session().with_executable_agent_ir(&executable);
 
         assert_eq!(session.activation().profile(), ToolProfile::Minimal);
@@ -1861,11 +1927,12 @@ forbidden = [{forbidden}]
                 .activation()
                 .is_tool_enabled(&ToolName::new("custom.tool"))
         );
+        Ok(())
     }
 
     #[test]
-    fn executable_policy_makes_admitted_tools_visible() {
-        let executable = executable_agent_ir(&["fs.read", "custom.tool"], &[]);
+    fn executable_policy_makes_admitted_tools_visible() -> TestResult {
+        let executable = executable_agent_ir(&["fs.read", "custom.tool"], &[])?;
         let session = test_session().with_executable_agent_ir(&executable);
 
         assert!(
@@ -1883,11 +1950,12 @@ forbidden = [{forbidden}]
                 .activation()
                 .is_tool_enabled(&ToolName::new("shell.exec"))
         );
+        Ok(())
     }
 
     #[test]
-    fn executable_policy_forbidden_tool_wins_over_admission() {
-        let executable = executable_agent_ir(&["shell.exec"], &["shell.exec"]);
+    fn executable_policy_forbidden_tool_wins_over_admission() -> TestResult {
+        let executable = executable_agent_ir(&["shell.exec"], &["shell.exec"])?;
         let session = test_session().with_executable_agent_ir(&executable);
 
         assert!(
@@ -1895,15 +1963,17 @@ forbidden = [{forbidden}]
                 .activation()
                 .is_tool_enabled(&ToolName::new("shell.exec"))
         );
+        Ok(())
     }
 
     #[test]
-    fn executable_policy_retains_snapshot_id() {
-        let executable = executable_agent_ir(&[], &[]);
+    fn executable_policy_retains_snapshot_id() -> TestResult {
+        let executable = executable_agent_ir(&[], &[])?;
         let snapshot_id = executable.snapshot_id();
         let session = test_session().with_executable_agent_ir(&executable);
 
         assert_eq!(session.executable_snapshot_id(), Some(&snapshot_id));
+        Ok(())
     }
 
     #[test]
@@ -1986,10 +2056,12 @@ forbidden = [{forbidden}]
     /// Baut eine Sandbox auf dem echten Harness-Verzeichnis mit genau den
     /// übergebenen Permissions. Kein Netzwerk, kein Schreibzugriff — nur die
     /// Auflösung eines bereits vorhandenen Pfades.
-    fn test_sandbox(permissions: &[Permission]) -> SandboxSpec {
+    fn test_sandbox(permissions: &[Permission]) -> TestResult<SandboxSpec> {
         let harness_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
-            .expect("harw-core hat ein Workspace-Elternverzeichnis")
+            .ok_or(TestError::Missing(
+                "harw-core hat ein Workspace-Elternverzeichnis",
+            ))?
             .to_path_buf();
         let registry = WorkspaceRegistry::build(
             &harness_root,
@@ -1999,21 +2071,21 @@ forbidden = [{forbidden}]
                 root: PathBuf::from("harw-core"),
             }],
         )
-        .expect("Test-Workspace ist registrierbar");
-        SandboxSpec::from_resolved(
+        .map_err(ctx("Test-Workspace ist registrierbar"))?;
+        Ok(SandboxSpec::from_resolved(
             registry
                 .resolve(
                     &TenantId::from_str("test-tenant"),
                     &WorkspaceId::from_str("core-mode-tests"),
                 )
-                .expect("Test-Workspace löst auf"),
+                .map_err(ctx("Test-Workspace löst auf"))?,
             PermissionSet::from_policy(permissions.iter().copied()),
-        )
+        ))
     }
 
-    fn test_spawn_context(permissions: &[Permission]) -> SpawnContext {
-        SpawnContext {
-            sandbox: test_sandbox(permissions),
+    fn test_spawn_context(permissions: &[Permission]) -> TestResult<SpawnContext> {
+        Ok(SpawnContext {
+            sandbox: test_sandbox(permissions)?,
             suggestions: None,
             capability_snapshot: None,
             approval_actor: None,
@@ -2021,20 +2093,20 @@ forbidden = [{forbidden}]
             allowed_child_orchestrators: Vec::new(),
             trace: None,
             ceiling: None,
-        }
+        })
     }
 
-    fn session_with_permissions(permissions: &[Permission]) -> AgentSession {
-        test_session().with_spawn_context(test_spawn_context(permissions))
+    fn session_with_permissions(permissions: &[Permission]) -> TestResult<AgentSession> {
+        Ok(test_session().with_spawn_context(test_spawn_context(permissions)?))
     }
 
-    fn permissions_of(session: &AgentSession) -> PermissionSet {
-        session
+    fn permissions_of(session: &AgentSession) -> TestResult<PermissionSet> {
+        Ok(session
             .spawn_context()
-            .expect("Test-Session hat einen Spawn-Kontext")
+            .ok_or(TestError::Missing("Test-Session hat einen Spawn-Kontext"))?
             .sandbox
             .permissions()
-            .clone()
+            .clone())
     }
 
     #[test]
@@ -2058,36 +2130,40 @@ forbidden = [{forbidden}]
     }
 
     #[test]
-    fn test_set_mode_emits_mode_changed_with_canonical_name() {
+    fn test_set_mode_emits_mode_changed_with_canonical_name() -> TestResult {
         let (turn_tx, mut turn_rx) = mpsc::unbounded_channel();
         let mut session =
-            session_with_permissions(&[Permission::ReadWorkspace]).with_turn_event_sink(turn_tx);
+            session_with_permissions(&[Permission::ReadWorkspace])?.with_turn_event_sink(turn_tx);
 
         session.set_mode(InteractionMode::Explore);
 
-        let event = turn_rx.try_recv().expect("ModeChanged wird gesendet");
+        let event = turn_rx
+            .try_recv()
+            .map_err(ctx("ModeChanged wird gesendet"))?;
         assert!(
             matches!(event, TurnEvent::ModeChanged { mode } if mode == "explore"),
             "das Event muss den kanonischen Modusnamen tragen"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_set_mode_without_event_sink_is_a_no_op_for_events() {
+    fn test_set_mode_without_event_sink_is_a_no_op_for_events() -> TestResult {
         // Ohne Sink darf set_mode nicht scheitern und muss trotzdem wirken.
-        let mut session = session_with_permissions(&[Permission::WriteWorkspace]);
+        let mut session = session_with_permissions(&[Permission::WriteWorkspace])?;
         session.set_mode(InteractionMode::Explore);
         assert_eq!(session.mode(), InteractionMode::Explore);
-        assert!(!permissions_of(&session).contains(Permission::WriteWorkspace));
+        assert!(!permissions_of(&session)?.contains(Permission::WriteWorkspace));
+        Ok(())
     }
 
     #[test]
-    fn test_set_mode_explore_disables_write_and_shell_tools() {
+    fn test_set_mode_explore_disables_write_and_shell_tools() -> TestResult {
         let mut session = session_with_permissions(&[
             Permission::ReadWorkspace,
             Permission::WriteWorkspace,
             Permission::ExecuteProcess,
-        ]);
+        ])?;
         assert!(
             session
                 .activation()
@@ -2118,21 +2194,22 @@ forbidden = [{forbidden}]
                 .is_tool_enabled(&ToolName::new("deps.source_read"))
         );
         assert_eq!(session.activation().profile(), ToolProfile::Minimal);
+        Ok(())
     }
 
     #[test]
-    fn test_set_mode_explore_removes_write_and_execute_permissions() {
+    fn test_set_mode_explore_removes_write_and_execute_permissions() -> TestResult {
         let mut session = session_with_permissions(&[
             Permission::ReadWorkspace,
             Permission::WriteWorkspace,
             Permission::ExecuteProcess,
             Permission::NetworkAccess,
             Permission::ReadCargoRegistry,
-        ]);
+        ])?;
 
         session.set_mode(InteractionMode::Explore);
 
-        let permissions = permissions_of(&session);
+        let permissions = permissions_of(&session)?;
         assert!(permissions.contains(Permission::ReadWorkspace));
         assert!(permissions.contains(Permission::ReadCargoRegistry));
         for removed in [
@@ -2145,20 +2222,21 @@ forbidden = [{forbidden}]
                 "Explore muss {removed:?} entziehen"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_set_mode_plan_keeps_network_but_not_mutation() {
+    fn test_set_mode_plan_keeps_network_but_not_mutation() -> TestResult {
         let mut session = session_with_permissions(&[
             Permission::ReadWorkspace,
             Permission::WriteWorkspace,
             Permission::ExecuteProcess,
             Permission::NetworkAccess,
-        ]);
+        ])?;
 
         session.set_mode(InteractionMode::Plan);
 
-        let permissions = permissions_of(&session);
+        let permissions = permissions_of(&session)?;
         assert!(permissions.contains(Permission::NetworkAccess));
         assert!(permissions.contains(Permission::ReadWorkspace));
         assert!(!permissions.contains(Permission::WriteWorkspace));
@@ -2173,21 +2251,22 @@ forbidden = [{forbidden}]
                 .activation()
                 .is_tool_enabled(&ToolName::new("fs.write"))
         );
+        Ok(())
     }
 
     #[test]
-    fn test_set_mode_work_restores_the_base_and_invents_nothing() {
+    fn test_set_mode_work_restores_the_base_and_invents_nothing() -> TestResult {
         // Der Schnitt läuft immer von der Basis-Sandbox aus: reversibel nach
         // oben bis zur Basis, nie darüber hinaus.
         let mut session =
-            session_with_permissions(&[Permission::ReadWorkspace, Permission::WriteWorkspace]);
+            session_with_permissions(&[Permission::ReadWorkspace, Permission::WriteWorkspace])?;
 
         session.set_mode(InteractionMode::Explore);
-        assert!(!permissions_of(&session).contains(Permission::WriteWorkspace));
+        assert!(!permissions_of(&session)?.contains(Permission::WriteWorkspace));
 
         session.set_mode(InteractionMode::Work);
 
-        let permissions = permissions_of(&session);
+        let permissions = permissions_of(&session)?;
         assert!(
             permissions.contains(Permission::WriteWorkspace),
             "Work muss die Basis-Permission zurückgeben — sonst wäre /mode eine Ratsche"
@@ -2197,11 +2276,12 @@ forbidden = [{forbidden}]
             "Work darf keine Permission erfinden, die die Basis nie hatte"
         );
         assert!(permissions.contains(Permission::ReadWorkspace));
+        Ok(())
     }
 
     #[test]
-    fn test_set_mode_work_reopens_tool_activation_only() {
-        let mut session = session_with_permissions(&[Permission::ReadWorkspace]);
+    fn test_set_mode_work_reopens_tool_activation_only() -> TestResult {
+        let mut session = session_with_permissions(&[Permission::ReadWorkspace])?;
 
         session.set_mode(InteractionMode::Explore);
         assert!(
@@ -2220,14 +2300,15 @@ forbidden = [{forbidden}]
             "die Tool-Aktivierung ist nicht monoton — die Sandbox trägt die Grenze"
         );
         assert!(
-            !permissions_of(&session).contains(Permission::WriteWorkspace),
+            !permissions_of(&session)?.contains(Permission::WriteWorkspace),
             "ein wieder sichtbares Werkzeug bekommt keine Autorität zurück"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_set_mode_drops_earlier_tool_overrides() {
-        let mut session = session_with_permissions(&[Permission::ReadWorkspace]);
+    fn test_set_mode_drops_earlier_tool_overrides() -> TestResult {
+        let mut session = session_with_permissions(&[Permission::ReadWorkspace])?;
         session
             .activation_mut()
             .enable_tool(ToolName::new("shell.exec"));
@@ -2240,11 +2321,12 @@ forbidden = [{forbidden}]
                 .is_tool_enabled(&ToolName::new("shell.exec")),
             "ein alter enable_tool-Override darf kein Werkzeug in Explore retten"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_set_mode_preserves_the_workspace_binding() {
-        let before = test_sandbox(&[Permission::ReadWorkspace, Permission::WriteWorkspace]);
+    fn test_set_mode_preserves_the_workspace_binding() -> TestResult {
+        let before = test_sandbox(&[Permission::ReadWorkspace, Permission::WriteWorkspace])?;
         let mut session = test_session().with_spawn_context(SpawnContext {
             sandbox: before.clone(),
             suggestions: None,
@@ -2260,11 +2342,12 @@ forbidden = [{forbidden}]
 
         let after = session
             .spawn_context()
-            .expect("Spawn-Kontext bleibt erhalten")
+            .ok_or(TestError::Missing("Spawn-Kontext bleibt erhalten"))?
             .sandbox
             .clone();
         assert_eq!(before.workspace(), after.workspace());
         assert!(after.ensure_child_of(&before).is_ok());
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2272,9 +2355,10 @@ forbidden = [{forbidden}]
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_with_spawn_context_preserves_the_trace_context() {
-        let trace = TraceContext::new("a".repeat(32), "b".repeat(16)).expect("valid trace context");
-        let mut context = test_spawn_context(&[Permission::ReadWorkspace]);
+    fn test_with_spawn_context_preserves_the_trace_context() -> TestResult {
+        let trace = TraceContext::new("a".repeat(32), "b".repeat(16))
+            .map_err(ctx("valid trace context"))?;
+        let mut context = test_spawn_context(&[Permission::ReadWorkspace])?;
         context.trace = Some(trace.clone());
 
         let session = test_session().with_spawn_context(context);
@@ -2282,24 +2366,26 @@ forbidden = [{forbidden}]
         assert_eq!(
             session
                 .spawn_context()
-                .expect("session has a spawn context")
+                .ok_or(TestError::Missing("session has a spawn context"))?
                 .trace,
             Some(trace)
         );
+        Ok(())
     }
 
     #[test]
-    fn test_spawn_context_without_a_trace_stays_none_through_construction() {
-        let session = session_with_permissions(&[Permission::ReadWorkspace]);
+    fn test_spawn_context_without_a_trace_stays_none_through_construction() -> TestResult {
+        let session = session_with_permissions(&[Permission::ReadWorkspace])?;
 
         assert!(
             session
                 .spawn_context()
-                .expect("session has a spawn context")
+                .ok_or(TestError::Missing("session has a spawn context"))?
                 .trace
                 .is_none(),
             "a context built without a trace must not gain one along the way"
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2307,7 +2393,7 @@ forbidden = [{forbidden}]
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_with_spawn_context_preserves_the_context_ceiling() {
+    fn test_with_spawn_context_preserves_the_context_ceiling() -> TestResult {
         // `with_spawn_context` deliberately restricts only `sandbox` via the
         // mode's permission ceiling (see its doc comment above); the context
         // ceiling is a separate authority cut entirely by
@@ -2315,7 +2401,7 @@ forbidden = [{forbidden}]
         // session construction untouched — the same guarantee already
         // covered for `trace` above.
         let ceiling = ContextCeiling {
-            sections: [SectionName::try_new("history.tail").expect("valid section name")]
+            sections: [SectionName::try_new("history.tail")?]
                 .into_iter()
                 .collect(),
             max_trust: TrustClass::Evidence,
@@ -2324,7 +2410,7 @@ forbidden = [{forbidden}]
                 per_section: std::collections::BTreeMap::new(),
             },
         };
-        let mut context = test_spawn_context(&[Permission::ReadWorkspace]);
+        let mut context = test_spawn_context(&[Permission::ReadWorkspace])?;
         context.ceiling = Some(ceiling.clone());
 
         let session = test_session().with_spawn_context(context);
@@ -2332,30 +2418,32 @@ forbidden = [{forbidden}]
         assert_eq!(
             session
                 .spawn_context()
-                .expect("session has a spawn context")
+                .ok_or(TestError::Missing("session has a spawn context"))?
                 .ceiling,
             Some(ceiling),
             "with_spawn_context must not silently widen, narrow, or drop the context ceiling"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_spawn_context_without_a_ceiling_stays_none_through_construction() {
-        let session = session_with_permissions(&[Permission::ReadWorkspace]);
+    fn test_spawn_context_without_a_ceiling_stays_none_through_construction() -> TestResult {
+        let session = session_with_permissions(&[Permission::ReadWorkspace])?;
 
         assert!(
             session
                 .spawn_context()
-                .expect("session has a spawn context")
+                .ok_or(TestError::Missing("session has a spawn context"))?
                 .ceiling
                 .is_none(),
             "a context built without a ceiling must not gain one along the way; \
              `admit` — not construction — is where `None` is later read as fail-closed"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_mode_ceiling_is_independent_of_builder_order() {
+    fn test_mode_ceiling_is_independent_of_builder_order() -> TestResult {
         let permissions = [
             Permission::ReadWorkspace,
             Permission::WriteWorkspace,
@@ -2363,12 +2451,17 @@ forbidden = [{forbidden}]
         ];
         let mode_first = test_session()
             .with_mode(InteractionMode::Explore)
-            .with_spawn_context(test_spawn_context(&permissions));
-        let mut context_first = test_session().with_spawn_context(test_spawn_context(&permissions));
+            .with_spawn_context(test_spawn_context(&permissions)?);
+        let mut context_first =
+            test_session().with_spawn_context(test_spawn_context(&permissions)?);
         context_first.set_mode(InteractionMode::Explore);
 
-        assert_eq!(permissions_of(&mode_first), permissions_of(&context_first));
-        assert!(!permissions_of(&mode_first).contains(Permission::WriteWorkspace));
+        assert_eq!(
+            permissions_of(&mode_first)?,
+            permissions_of(&context_first)?
+        );
+        assert!(!permissions_of(&mode_first)?.contains(Permission::WriteWorkspace));
+        Ok(())
     }
 
     #[test]
@@ -2438,7 +2531,7 @@ forbidden = [{forbidden}]
     }
 
     #[test]
-    fn test_mode_ceiling_matches_activation_after_set_mode() {
+    fn test_mode_ceiling_matches_activation_after_set_mode() -> TestResult {
         // `SessionActivation` hat kein `PartialEq` (siehe activation.rs) —
         // der Vergleich läuft daher über `is_tool_enabled` an Sondennamen
         // sowie `profile()`, wie schon `intersect`s eigene Tests in
@@ -2447,7 +2540,7 @@ forbidden = [{forbidden}]
             Permission::ReadWorkspace,
             Permission::WriteWorkspace,
             Permission::ExecuteProcess,
-        ]);
+        ])?;
 
         session.set_mode(InteractionMode::Explore);
 
@@ -2467,6 +2560,7 @@ forbidden = [{forbidden}]
                 "activation() muss nach set_mode exakt mode_ceiling() entsprechen für {name}"
             );
         }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2474,22 +2568,27 @@ forbidden = [{forbidden}]
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_complete_turn_accepts_the_active_turn() {
+    fn test_complete_turn_accepts_the_active_turn() -> TestResult {
         let mut session = test_session();
-        let handle = session.try_start_turn().expect("turn starts from Idle");
+        let handle = session
+            .try_start_turn()
+            .map_err(ctx("turn starts from Idle"))?;
 
         session
             .complete_turn(handle, TokenUsage::default())
-            .expect("the active turn completes");
+            .map_err(ctx("the active turn completes"))?;
 
         assert_eq!(session.state(), &SessionState::Idle);
         assert!(session.current_turn().is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_complete_turn_rejects_a_foreign_turn_id_without_mutation() {
+    fn test_complete_turn_rejects_a_foreign_turn_id_without_mutation() -> TestResult {
         let mut session = test_session();
-        let active = session.try_start_turn().expect("turn starts from Idle");
+        let active = session
+            .try_start_turn()
+            .map_err(ctx("turn starts from Idle"))?;
         let usage = TokenUsage {
             input_tokens: 10,
             output_tokens: 5,
@@ -2498,61 +2597,79 @@ forbidden = [{forbidden}]
             cache_write_tokens: None,
         };
 
-        let error = session
-            .complete_turn(
-                TurnHandle {
-                    turn_id: TurnId::new(),
-                    session_id: session.id().clone(),
-                },
-                usage,
-            )
-            .expect_err("a stale turn id must be rejected");
+        let Err(error) = session.complete_turn(
+            TurnHandle {
+                turn_id: TurnId::new(),
+                session_id: session.id().clone(),
+            },
+            usage,
+        ) else {
+            return Err(TestError::Unexpected(
+                "a stale turn id must be rejected".to_owned(),
+            ));
+        };
 
         assert!(matches!(error, CoreError::TurnRejected(_)));
         assert_eq!(session.state(), &SessionState::Running);
         assert_eq!(session.current_turn(), Some(&active.turn_id));
         assert_eq!(session.total_usage(), &TokenUsage::default());
+        Ok(())
     }
 
     #[test]
-    fn test_complete_turn_from_failed_is_rejected() {
+    fn test_complete_turn_from_failed_is_rejected() -> TestResult {
         let mut session = test_session();
-        let handle = session.try_start_turn().expect("turn starts from Idle");
+        let handle = session
+            .try_start_turn()
+            .map_err(ctx("turn starts from Idle"))?;
         session.fail("provider timeout".to_owned());
 
-        let error = session
-            .complete_turn(handle, TokenUsage::default())
-            .expect_err("Failed is left only through recover");
+        let Err(error) = session.complete_turn(handle, TokenUsage::default()) else {
+            return Err(TestError::Unexpected(
+                "Failed is left only through recover".to_owned(),
+            ));
+        };
 
         assert!(matches!(error, CoreError::TurnRejected(_)));
         assert!(matches!(session.state(), SessionState::Failed(_)));
+        Ok(())
     }
 
     #[test]
-    fn test_recover_returns_failed_session_to_idle_and_allows_a_new_turn() {
+    fn test_recover_returns_failed_session_to_idle_and_allows_a_new_turn() -> TestResult {
         let mut session = test_session();
-        let _handle = session.try_start_turn().expect("turn starts from Idle");
-        session
-            .history_mut()
-            .push_tool_call(ToolCallId::from_str("crashed"), "fs.read", serde_json::json!({}));
+        let _handle = session
+            .try_start_turn()
+            .map_err(ctx("turn starts from Idle"))?;
+        session.history_mut().push_tool_call(
+            ToolCallId::from_str("crashed"),
+            "fs.read",
+            serde_json::json!({}),
+        );
         session.fail("provider 5xx".to_owned());
 
-        let repaired = session.recover().expect("Failed is recoverable");
+        let repaired = session.recover().map_err(ctx("Failed is recoverable"))?;
 
         assert_eq!(repaired, vec![ToolCallId::from_str("crashed")]);
         assert_eq!(session.state(), &SessionState::Idle);
         assert!(session.current_turn().is_none());
         assert_eq!(session.history().len(), 2);
         assert!(session.try_start_turn().is_ok());
+        Ok(())
     }
 
     #[test]
-    fn test_recover_from_idle_is_rejected() {
+    fn test_recover_from_idle_is_rejected() -> TestResult {
         let mut session = test_session();
 
-        let error = session.recover().expect_err("only Failed is recoverable");
+        let Err(error) = session.recover() else {
+            return Err(TestError::Unexpected(
+                "only Failed is recoverable".to_owned(),
+            ));
+        };
 
         assert!(matches!(error, CoreError::TurnRejected(_)));
         assert_eq!(session.state(), &SessionState::Idle);
+        Ok(())
     }
 }

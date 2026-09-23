@@ -53,16 +53,17 @@ pub struct WardenRequestEnvelope {
 #[cfg(test)]
 mod tests {
     use super::WardenRequestEnvelope;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_dod_warden_proto::{
         AuthorizationProof, EscalationStage, ProposedAction, WardenAction, WardenActionRequest,
     };
     use harw_types::{ApprovalActor, CgroupId, FindingId};
 
-    fn sample_envelope() -> WardenRequestEnvelope {
+    fn sample_envelope() -> TestResult<WardenRequestEnvelope> {
         let action = WardenAction::FreezeCgroup {
-            cgroup: CgroupId::try_from_str("cgroup-1").expect("non-empty id"),
+            cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("non-empty id"))?,
         };
-        let finding = FindingId::try_from_str("finding-1").expect("non-empty id");
+        let finding = FindingId::try_from_str("finding-1").map_err(ctx("non-empty id"))?;
         let proof = AuthorizationProof::new(
             finding.clone(),
             EscalationStage::RuleTriggered,
@@ -70,36 +71,40 @@ mod tests {
                 id: "operator-1".to_string(),
             },
             jiff::Timestamp::UNIX_EPOCH,
-            action.content_digest().expect("action encodes"),
+            action.content_digest().map_err(ctx("action encodes"))?,
         );
         let request = WardenActionRequest::new(
             ProposedAction::FreezeCgroup {
-                cgroup: CgroupId::try_from_str("cgroup-1").expect("non-empty id"),
+                cgroup: CgroupId::try_from_str("cgroup-1").map_err(ctx("non-empty id"))?,
             },
             proof,
         );
-        WardenRequestEnvelope { finding, request }
+        Ok(WardenRequestEnvelope { finding, request })
     }
 
     #[test]
-    fn test_serde_roundtrip() {
-        let envelope = sample_envelope();
-        let json = serde_json::to_string(&envelope).expect("serializes");
+    fn test_serde_roundtrip() -> TestResult {
+        let envelope = sample_envelope()?;
+        let json = serde_json::to_string(&envelope).map_err(ctx("serializes"))?;
         let round_tripped: WardenRequestEnvelope =
-            serde_json::from_str(&json).expect("deserializes");
+            serde_json::from_str(&json).map_err(ctx("deserializes"))?;
         assert_eq!(round_tripped.finding, envelope.finding);
         assert_eq!(round_tripped.request.action, envelope.request.action);
+        Ok(())
     }
 
     #[test]
-    fn test_rejects_unknown_field() {
-        let envelope = sample_envelope();
-        let mut value = serde_json::to_value(&envelope).unwrap();
+    fn test_rejects_unknown_field() -> TestResult {
+        let envelope = sample_envelope()?;
+        let mut value = serde_json::to_value(&envelope).map_err(ctx("serializes"))?;
         value
             .as_object_mut()
-            .unwrap()
+            .ok_or(TestError::Unexpected(
+                "envelope serializes to an object".to_string(),
+            ))?
             .insert("extra".to_string(), serde_json::Value::Bool(true));
         let result: Result<WardenRequestEnvelope, _> = serde_json::from_value(value);
         assert!(result.is_err());
+        Ok(())
     }
 }

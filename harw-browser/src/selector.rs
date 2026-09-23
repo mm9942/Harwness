@@ -41,6 +41,7 @@ impl Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn test_candidates_yields_primary_then_fallbacks_in_order() {
@@ -98,7 +99,7 @@ mod tests {
     }
 
     #[test]
-    fn test_target_serde_json_round_trip_with_struct_variant_selectors() {
+    fn test_target_serde_json_round_trip_with_struct_variant_selectors() -> TestResult {
         let target = Target::new(Selector::Role {
             role: "button".to_owned(),
             name: Some("Submit".to_owned()),
@@ -109,9 +110,10 @@ mod tests {
         })
         .with_fallback(Selector::XPath("//button[@type='submit']".to_owned()));
 
-        let json = serde_json::to_string(&target).expect("target serializes");
-        let decoded: Target = serde_json::from_str(&json).expect("target deserializes");
+        let json = serde_json::to_string(&target).map_err(ctx("target serializes"))?;
+        let decoded: Target = serde_json::from_str(&json).map_err(ctx("target deserializes"))?;
         assert_eq!(decoded, target);
+        Ok(())
     }
 
     #[test]

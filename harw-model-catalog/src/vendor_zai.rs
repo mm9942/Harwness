@@ -485,6 +485,7 @@ mod tests {
     use super::*;
     use crate::descriptor::{Modality, ModelLifecycle};
     use crate::observed::Score;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn test_zai_descriptors_required_models_present() {
@@ -536,28 +537,30 @@ mod tests {
     }
 
     #[test]
-    fn test_glm52_flagship_context_window() {
+    fn test_glm52_flagship_context_window() -> TestResult {
         // GLM-5.2 muss das 1M-Kontext-Fenster haben (Pflicht-Assertion).
         let descs = zai_descriptors();
         let glm52 = descs
             .iter()
             .find(|d| d.model == "glm-5.2")
-            .expect("glm-5.2 nicht gefunden");
+            .ok_or(TestError::Missing("glm-5.2 descriptor"))?;
         assert_eq!(
             glm52.context_window, 1_000_000,
             "GLM-5.2 context_window muss 1_000_000 sein"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_glm52_reasoning_effort() {
+    fn test_glm52_reasoning_effort() -> TestResult {
         // GLM-5.2 unterstützt Effort-basiertes Reasoning (high/max).
         let descs = zai_descriptors();
         let glm52 = descs
             .iter()
             .find(|d| d.model == "glm-5.2")
-            .expect("glm-5.2 nicht gefunden");
+            .ok_or(TestError::Missing("glm-5.2 descriptor"))?;
         assert_eq!(glm52.capabilities.reasoning, ReasoningSupport::Effort);
+        Ok(())
     }
 
     #[test]

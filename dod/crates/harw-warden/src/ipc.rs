@@ -225,7 +225,10 @@ fn handle_connection(connection: OwnedFd, peer: PeerCredentials, warden: &Warden
             }
         }
         Ok(None) => {
-            tracing::debug!(?peer, "ipc peer closed the connection without sending a request");
+            tracing::debug!(
+                ?peer,
+                "ipc peer closed the connection without sending a request"
+            );
         }
         Err(error) => {
             tracing::warn!(?peer, error = %error, "failed to receive a well-formed request from ipc peer");
@@ -261,8 +264,8 @@ fn recv_envelope(connection: &OwnedFd) -> Result<Option<WardenRequestEnvelope>, 
     use rustix::net::RecvFlags;
 
     let mut buffer = [0u8; RECV_BUFFER_LEN];
-    let (copied, message_len) = rustix::net::recv(connection, &mut buffer, RecvFlags::TRUNC)
-        .map_err(|_| IpcError::Recv)?;
+    let (copied, message_len) =
+        rustix::net::recv(connection, &mut buffer, RecvFlags::TRUNC).map_err(|_| IpcError::Recv)?;
 
     if message_len == 0 {
         return Ok(None);
@@ -301,6 +304,7 @@ fn send_response(
 #[cfg(test)]
 mod tests {
     use super::IpcError;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
     fn test_oversized_message_error_is_content_free() {
@@ -311,14 +315,18 @@ mod tests {
     }
 
     #[test]
-    fn test_malformed_error_wraps_and_links_the_inner_serde_error() {
+    fn test_malformed_error_wraps_and_links_the_inner_serde_error() -> TestResult {
         use std::error::Error as _;
 
-        let json_err = serde_json::from_str::<serde_json::Value>("not json")
-            .expect_err("deliberately malformed JSON");
+        let Err(json_err) = serde_json::from_str::<serde_json::Value>("not json") else {
+            return Err(TestError::Unexpected(
+                "expected deliberately malformed JSON to fail parsing".into(),
+            ));
+        };
         let err: IpcError = json_err.into();
         assert!(matches!(err, IpcError::Malformed(_)));
         assert!(err.source().is_some());
+        Ok(())
     }
 
     // `serve_forever`/`accept_connection`/`handle_connection` werden hier

@@ -202,6 +202,7 @@ pub struct Chunk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use harw_types::ContentDigest;
 
     #[test]
@@ -223,14 +224,15 @@ mod tests {
     }
 
     #[test]
-    fn test_byte_span_validate_accepts_span_within_text() {
-        let span = ByteSpan::new(0, 5).expect("valid span");
+    fn test_byte_span_validate_accepts_span_within_text() -> TestResult {
+        let span = ByteSpan::new(0, 5).map_err(ctx("valid span"))?;
         assert_eq!(span.validate("hello"), Ok(()));
+        Ok(())
     }
 
     #[test]
-    fn test_byte_span_validate_rejects_span_past_text_end() {
-        let span = ByteSpan::new(0, 10).expect("valid span");
+    fn test_byte_span_validate_rejects_span_past_text_end() -> TestResult {
+        let span = ByteSpan::new(0, 10).map_err(ctx("valid span"))?;
         assert_eq!(
             span.validate("hi"),
             Err(LensTypesError::SpanOutOfBounds {
@@ -239,10 +241,11 @@ mod tests {
                 len: 2,
             })
         );
+        Ok(())
     }
 
     #[test]
-    fn test_source_ref_serializes_kebab_case_variant_tags() {
+    fn test_source_ref_serializes_kebab_case_variant_tags() -> TestResult {
         let file = SourceRef::File {
             path: "src/lib.rs".to_owned(),
         };
@@ -257,27 +260,39 @@ mod tests {
             entry: "e-1".to_owned(),
         };
 
-        assert!(serde_json::to_string(&file).unwrap().contains("\"file\""));
-        assert!(serde_json::to_string(&artifact)
-            .unwrap()
-            .contains("\"artifact\""));
-        assert!(serde_json::to_string(&plan_node)
-            .unwrap()
-            .contains("\"plan-node\""));
-        assert!(serde_json::to_string(&diary)
-            .unwrap()
-            .contains("\"diary\""));
+        assert!(
+            serde_json::to_string(&file)
+                .map_err(ctx("serializes"))?
+                .contains("\"file\"")
+        );
+        assert!(
+            serde_json::to_string(&artifact)
+                .map_err(ctx("serializes"))?
+                .contains("\"artifact\"")
+        );
+        assert!(
+            serde_json::to_string(&plan_node)
+                .map_err(ctx("serializes"))?
+                .contains("\"plan-node\"")
+        );
+        assert!(
+            serde_json::to_string(&diary)
+                .map_err(ctx("serializes"))?
+                .contains("\"diary\"")
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_source_ref_roundtrips_through_json() {
+    fn test_source_ref_roundtrips_through_json() -> TestResult {
         let source = SourceRef::PlanNode {
             plan: "p-1".to_owned(),
             node: "n-1".to_owned(),
         };
-        let json = serde_json::to_string(&source).expect("serializes");
-        let round_tripped: SourceRef = serde_json::from_str(&json).expect("deserializes");
+        let json = serde_json::to_string(&source).map_err(ctx("serializes"))?;
+        let round_tripped: SourceRef = serde_json::from_str(&json).map_err(ctx("deserializes"))?;
         assert_eq!(round_tripped, source);
+        Ok(())
     }
 
     #[test]
@@ -287,18 +302,21 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_digest_serializes_transparently_as_hex_string() {
+    fn test_chunk_digest_serializes_transparently_as_hex_string() -> TestResult {
         let digest = ChunkDigest(ContentDigest::of(b"chunk text"));
-        let json = serde_json::to_string(&digest).expect("serializes");
+        let json = serde_json::to_string(&digest).map_err(ctx("serializes"))?;
         assert!(json.starts_with('"') && json.ends_with('"'));
+        Ok(())
     }
 
     #[test]
-    fn test_chunk_digest_roundtrips_through_json() {
+    fn test_chunk_digest_roundtrips_through_json() -> TestResult {
         let digest = ChunkDigest(ContentDigest::of(b"chunk text"));
-        let json = serde_json::to_string(&digest).expect("serializes");
-        let round_tripped: ChunkDigest = serde_json::from_str(&json).expect("deserializes");
+        let json = serde_json::to_string(&digest).map_err(ctx("serializes"))?;
+        let round_tripped: ChunkDigest =
+            serde_json::from_str(&json).map_err(ctx("deserializes"))?;
         assert_eq!(round_tripped, digest);
+        Ok(())
     }
 
     #[test]
@@ -309,18 +327,19 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_roundtrips_through_json() {
+    fn test_chunk_roundtrips_through_json() -> TestResult {
         let chunk = Chunk {
             digest: ChunkDigest(ContentDigest::of(b"hello")),
             source: SourceRef::File {
                 path: "a.txt".to_owned(),
             },
-            span: ByteSpan::new(0, 5).expect("valid span"),
+            span: ByteSpan::new(0, 5).map_err(ctx("valid span"))?,
             text: "hello".to_owned(),
         };
-        let json = serde_json::to_string(&chunk).expect("serializes");
-        let round_tripped: Chunk = serde_json::from_str(&json).expect("deserializes");
+        let json = serde_json::to_string(&chunk).map_err(ctx("serializes"))?;
+        let round_tripped: Chunk = serde_json::from_str(&json).map_err(ctx("deserializes"))?;
         assert_eq!(round_tripped, chunk);
+        Ok(())
     }
 
     #[test]

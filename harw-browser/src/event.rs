@@ -261,6 +261,7 @@ impl BackpressureStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn test_backpressure_stats_record_each_increments_once() {
@@ -364,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn test_event_envelope_serde_json_round_trip_with_script_message() {
+    fn test_event_envelope_serde_json_round_trip_with_script_message() -> TestResult {
         // ScriptMessage carries a `serde_json::Value` payload and the envelope carries
         // a `time::OffsetDateTime` timestamp; both are protocol-boundary types that must
         // survive a JSON round trip unchanged.
@@ -380,19 +381,23 @@ mod tests {
             },
         );
 
-        let json = serde_json::to_string(&envelope).expect("envelope serializes");
-        let decoded: EventEnvelope = serde_json::from_str(&json).expect("envelope deserializes");
+        let json = serde_json::to_string(&envelope).map_err(ctx("envelope serializes"))?;
+        let decoded: EventEnvelope =
+            serde_json::from_str(&json).map_err(ctx("envelope deserializes"))?;
         assert_eq!(decoded, envelope);
+        Ok(())
     }
 
     #[test]
-    fn test_backpressure_stats_serde_json_round_trip() {
+    fn test_backpressure_stats_serde_json_round_trip() -> TestResult {
         let mut stats = BackpressureStats::default();
         stats.record_drop();
         stats.record_aggregate();
 
-        let json = serde_json::to_string(&stats).expect("stats serialize");
-        let decoded: BackpressureStats = serde_json::from_str(&json).expect("stats deserialize");
+        let json = serde_json::to_string(&stats).map_err(ctx("stats serialize"))?;
+        let decoded: BackpressureStats =
+            serde_json::from_str(&json).map_err(ctx("stats deserialize"))?;
         assert_eq!(decoded, stats);
+        Ok(())
     }
 }

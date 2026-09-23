@@ -11,6 +11,9 @@ use harw_dod_cap::{Bound, Capability, SensorError, SensorHandle};
 use harw_dod_signals::{HostSample, Sensor, SensorReading};
 use jiff::Timestamp;
 
+mod common;
+use common::{TestResult, ctx};
+
 /// Liest `value` unterhalb der einzigen Scope-Wurzel als `i64` — dieselbe
 /// Minimalform wie in `tests/sensor_suite_smoke.rs`.
 #[derive(Debug)]
@@ -48,11 +51,11 @@ impl Sensor for EchoValueSensor {
 }
 
 #[test]
-fn test_capture_output_is_accepted_by_a_fresh_poll() {
-    let source = tempfile::tempdir().expect("source tempdir");
-    std::fs::write(source.path().join("value"), "123\n").expect("write source value");
+fn test_capture_output_is_accepted_by_a_fresh_poll() -> TestResult {
+    let source = tempfile::tempdir().map_err(ctx("source tempdir"))?;
+    std::fs::write(source.path().join("value"), "123\n").map_err(ctx("write source value"))?;
 
-    let target = tempfile::tempdir().expect("target tempdir");
+    let target = tempfile::tempdir().map_err(ctx("target tempdir"))?;
     let case_dir = target.path().join("captured-case");
 
     let report = harw_dod_fixtures::capture::capture(
@@ -62,7 +65,7 @@ fn test_capture_output_is_accepted_by_a_fresh_poll() {
         &case_dir,
         Timestamp::UNIX_EPOCH,
     )
-    .expect("capture muss gelingen");
+    .map_err(ctx("capture muss gelingen"))?;
 
     assert_eq!(report.case_dir, case_dir);
     assert_eq!(report.files_copied, 1);
@@ -74,9 +77,9 @@ fn test_capture_output_is_accepted_by_a_fresh_poll() {
     // Rundlauf: dieselbe tree/-Kopie erneut gepollt muss exakt das
     // SensorReading liefern, das capture() nach expect.json geschrieben hat.
     let expect_json =
-        std::fs::read_to_string(case_dir.join("expect.json")).expect("expect.json lesbar");
+        std::fs::read_to_string(case_dir.join("expect.json")).map_err(ctx("expect.json lesbar"))?;
     let expected: serde_json::Value =
-        serde_json::from_str(&expect_json).expect("expect.json ist gueltiges JSON");
+        serde_json::from_str(&expect_json).map_err(ctx("expect.json ist gueltiges JSON"))?;
     assert_eq!(expected["reading"]["samples"][0]["value"], 123.0);
     assert_eq!(
         expected["reading"]["samples"][0]["sensor"],
@@ -92,29 +95,30 @@ fn test_capture_output_is_accepted_by_a_fresh_poll() {
     let sensor = EchoValueSensor::from(handle);
     let reading = sensor
         .poll(Timestamp::UNIX_EPOCH)
-        .expect("erneuter Poll gegen die Kopie muss gelingen");
+        .map_err(ctx("erneuter Poll gegen die Kopie muss gelingen"))?;
 
     assert_eq!(reading.samples.len(), 1);
     assert_eq!(reading.samples[0].value, 123.0);
+    Ok(())
 }
 
 #[test]
-fn test_capture_redacts_current_username_from_file_content() {
+fn test_capture_redacts_current_username_from_file_content() -> TestResult {
     let Ok(user) = std::env::var("USER").or_else(|_| std::env::var("LOGNAME")) else {
         // Auf einem Host ohne $USER/$LOGNAME (z. B. manche Container) ist
         // nichts zu redigieren zu erwarten; dann ist dieser Test vakuos, aber
         // nicht falsch — die anderen Assertions unten entfallen ebenfalls.
-        return;
+        return Ok(());
     };
     if user.trim().is_empty() {
-        return;
+        return Ok(());
     }
 
-    let source = tempfile::tempdir().expect("source tempdir");
+    let source = tempfile::tempdir().map_err(ctx("source tempdir"))?;
     std::fs::write(source.path().join("value"), format!("1\n# owner={user}\n"))
-        .expect("write source value");
+        .map_err(ctx("write source value"))?;
 
-    let target = tempfile::tempdir().expect("target tempdir");
+    let target = tempfile::tempdir().map_err(ctx("target tempdir"))?;
     let case_dir = target.path().join("redaction-case");
 
     let report = harw_dod_fixtures::capture::capture(
@@ -124,15 +128,19 @@ fn test_capture_redacts_current_username_from_file_content() {
         &case_dir,
         Timestamp::UNIX_EPOCH,
     )
-    .expect("capture muss gelingen");
+    .map_err(ctx("capture muss gelingen"))?;
 
     assert!(
         report.redactions_applied >= 1,
         "capture() muss den aktuellen Benutzernamen im Dateiinhalt redigieren"
     );
 
-    let copied =
-        std::fs::read_to_string(case_dir.join("tree").join("value")).expect("value lesbar");
-    assert!(!copied.contains(&user), "redigierter Baum darf den Benutzernamen nicht mehr enthalten");
+    let copied = std::fs::read_to_string(case_dir.join("tree").join("value"))
+        .map_err(ctx("value lesbar"))?;
+    assert!(
+        !copied.contains(&user),
+        "redigierter Baum darf den Benutzernamen nicht mehr enthalten"
+    );
     assert!(copied.contains("<REDACTED-USER>"));
+    Ok(())
 }

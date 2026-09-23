@@ -152,3 +152,7 @@ pub use security::{
     list_pending_approvals, resolve_approval,
 };
 pub use server::{BoundWebServer, WebContextFactory, WebServerConfig};
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

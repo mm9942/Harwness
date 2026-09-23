@@ -25,8 +25,11 @@
 //! successful switch used to reach the real `HARW_HOME`-resolving
 //! `config.toml` write, now runs unignored.
 
+mod common;
+
 use std::sync::Arc;
 
+use common::{TestError, TestResult, ctx};
 use harw_core::model::ModelRequest;
 use harw_core::session::AgentSession;
 use harw_extension_api::{ExtensionRegistryBuilder, LoadedInstructions};
@@ -81,7 +84,7 @@ fn build_model_request_like_turn_loop(session: &AgentSession) -> ModelRequest {
 ///   apply_to_session → session.reasoning_effort() == High →
 ///   ModelRequest.reasoning_effort == High
 #[test]
-fn slice5_effort_high_influences_next_model_request() {
+fn slice5_effort_high_influences_next_model_request() -> TestResult {
     let ctrl = Arc::new(TuiSessionController::new());
     let mut session = fresh_session();
 
@@ -93,7 +96,7 @@ fn slice5_effort_high_influences_next_model_request() {
     );
 
     ctrl.set_reasoning_effort(Some(ReasoningEffort::High))
-        .expect("set_reasoning_effort must succeed");
+        .map_err(ctx("set_reasoning_effort must succeed"))?;
 
     let applied = ctrl.apply_to_session(&mut session);
     assert!(
@@ -115,6 +118,7 @@ fn slice5_effort_high_influences_next_model_request() {
         Some(ReasoningEffort::High),
         "ModelRequest.reasoning_effort must carry High from session"
     );
+    Ok(())
 }
 
 // ── Test 2: slice6_effort_clear_restores_provider_default ────────────────────
@@ -125,13 +129,13 @@ fn slice5_effort_high_influences_next_model_request() {
 /// Chain tested: set(High) → apply → set(None) → apply →
 ///   session.reasoning_effort() == None → ModelRequest.reasoning_effort == None
 #[test]
-fn slice6_effort_clear_restores_provider_default() {
+fn slice6_effort_clear_restores_provider_default() -> TestResult {
     let ctrl = Arc::new(TuiSessionController::new());
     let mut session = fresh_session();
 
     // First, set effort to High.
     ctrl.set_reasoning_effort(Some(ReasoningEffort::High))
-        .expect("initial set_reasoning_effort must succeed");
+        .map_err(ctx("initial set_reasoning_effort must succeed"))?;
     ctrl.apply_to_session(&mut session);
     assert_eq!(
         session.reasoning_effort(),
@@ -141,7 +145,7 @@ fn slice6_effort_clear_restores_provider_default() {
 
     // Now clear it (equivalent to /effort clear).
     ctrl.set_reasoning_effort(None)
-        .expect("clearing reasoning_effort must succeed");
+        .map_err(ctx("clearing reasoning_effort must succeed"))?;
 
     let applied = ctrl.apply_to_session(&mut session);
     assert!(
@@ -162,6 +166,7 @@ fn slice6_effort_clear_restores_provider_default() {
         req.reasoning_effort, None,
         "ModelRequest.reasoning_effort must be None (provider will choose default)"
     );
+    Ok(())
 }
 
 // ── Test 3: slice7_model_switch_influences_next_turn ─────────────────────────
@@ -178,15 +183,15 @@ fn slice6_effort_clear_restores_provider_default() {
 ///   apply_to_session → session.active_model() == ModelId::from("claude-opus-4-8") →
 ///   ModelRequest.model_id == Some(ModelId::from("claude-opus-4-8"))
 #[test]
-fn slice7_model_switch_influences_next_turn() {
+fn slice7_model_switch_influences_next_turn() -> TestResult {
     let ctrl = Arc::new(TuiSessionController::new());
     let mut session = fresh_session();
 
     // Set provider first so the snapshot is self-consistent.
     ctrl.set_active_provider("anthropic".to_owned())
-        .expect("set_active_provider must succeed");
+        .map_err(ctx("set_active_provider must succeed"))?;
     ctrl.set_active_model("claude-opus-4-8".to_owned())
-        .expect("set_active_model must succeed");
+        .map_err(ctx("set_active_model must succeed"))?;
 
     let applied = ctrl.apply_to_session(&mut session);
     assert!(
@@ -209,6 +214,7 @@ fn slice7_model_switch_influences_next_turn() {
         Some(ModelId::from("claude-opus-4-8")),
         "ModelRequest.model_id must carry claude-opus-4-8 from session"
     );
+    Ok(())
 }
 
 // ── Test 4: slice8_provider_switch_influences_next_turn ──────────────────────
@@ -224,12 +230,12 @@ fn slice7_model_switch_influences_next_turn() {
 ///   apply_to_session → session.active_provider() == ProviderId::from("test-provider-slice8") →
 ///   ModelRequest.provider_id == Some(ProviderId::from("test-provider-slice8"))
 #[test]
-fn slice8_provider_switch_influences_next_turn() {
+fn slice8_provider_switch_influences_next_turn() -> TestResult {
     let ctrl = Arc::new(TuiSessionController::new());
     let mut session = fresh_session();
 
     ctrl.set_active_provider("test-provider-slice8".to_owned())
-        .expect("set_active_provider must succeed");
+        .map_err(ctx("set_active_provider must succeed"))?;
 
     let applied = ctrl.apply_to_session(&mut session);
     assert!(
@@ -252,6 +258,7 @@ fn slice8_provider_switch_influences_next_turn() {
         Some(ProviderId::from("test-provider-slice8")),
         "ModelRequest.provider_id must carry test-provider-slice8 from session"
     );
+    Ok(())
 }
 
 // ── Test 5: slice9_model_switch_to_different_provider_is_atomic ─────────────
@@ -292,24 +299,26 @@ fn slice8_provider_switch_influences_next_turn() {
 /// only holds type-erased clones of them).
 fn build_slice9_fixture(
     openai_enabled: bool,
-) -> (
+) -> TestResult<(
     harw_operations::OpContext,
     std::path::PathBuf,
     Arc<TuiSessionController>,
     Arc<harw_ops::model::RecordingSelectionPersistence>,
-) {
+)> {
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_config::{ModelToml, ProviderToml, ResolvedConfig, SecretRef};
     use harw_operations::{SharedSessionController, context::ServiceMap};
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
-    use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use harw_ops::model::{RecordingSelectionPersistence, SelectionPersistence};
+    use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
 
     // ── Build a minimal OpContext with a real SandboxSpec ─────────────────────
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = std::env::temp_dir().join(format!("harw-slice9-{}-{}", std::process::id(), id));
-    std::fs::create_dir_all(tmp.join("ws")).expect("create tmp workspace dir");
+    std::fs::create_dir_all(tmp.join("ws")).map_err(ctx("create tmp workspace dir"))?;
 
     let ws_registry = WorkspaceRegistry::build(
         &tmp,
@@ -319,14 +328,14 @@ fn build_slice9_fixture(
             root: std::path::PathBuf::from("ws"),
         }],
     )
-    .expect("WorkspaceRegistry::build must succeed");
+    .map_err(ctx("WorkspaceRegistry::build must succeed"))?;
 
     let binding = ws_registry
         .resolve(
             &TenantId::from_str("test-tenant"),
             &WorkspaceId::from_str("ws"),
         )
-        .expect("workspace binding must resolve");
+        .map_err(ctx("workspace binding must resolve"))?;
 
     let sandbox = SandboxSpec::from_resolved(
         binding,
@@ -354,6 +363,7 @@ fn build_slice9_fixture(
             max_concurrency: None,
             originator: None,
             default_reasoning_effort: None,
+            gateway_identity_headers: false,
         },
     );
     config.providers.insert(
@@ -373,6 +383,7 @@ fn build_slice9_fixture(
             max_concurrency: None,
             originator: None,
             default_reasoning_effort: None,
+            gateway_identity_headers: false,
         },
     );
     config.models.insert(
@@ -411,14 +422,15 @@ fn build_slice9_fixture(
     // ── Set up TuiSessionController with anthropic provider + anthropic model ─
     let ctrl = Arc::new(TuiSessionController::new());
     ctrl.set_active_provider("anthropic".to_owned())
-        .expect("set_active_provider must succeed");
+        .map_err(ctx("set_active_provider must succeed"))?;
     ctrl.set_active_model("claude-opus-4-8".to_owned())
-        .expect("set_active_model must succeed");
+        .map_err(ctx("set_active_model must succeed"))?;
 
     // ── Inject a recording persistence service, so `/model switch` never
     // reaches the real filesystem `HARW_HOME` config write ────────────────────
     let recorder = Arc::new(RecordingSelectionPersistence::new());
-    let persistence: Arc<dyn SelectionPersistence> = Arc::clone(&recorder) as Arc<dyn SelectionPersistence>;
+    let persistence: Arc<dyn SelectionPersistence> =
+        Arc::clone(&recorder) as Arc<dyn SelectionPersistence>;
 
     // ── Build OpContext with the controller ───────────────────────────────────
     let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
@@ -426,9 +438,10 @@ fn build_slice9_fixture(
     services.insert(shared);
     services.insert(Arc::new(config));
     services.insert(persistence);
-    let ctx = harw_operations::OpContext::new(SessionId::new(), TurnId::new(), sandbox, services);
+    let op_ctx =
+        harw_operations::OpContext::new(SessionId::new(), TurnId::new(), sandbox, services);
 
-    (ctx, tmp, ctrl, recorder)
+    Ok((op_ctx, tmp, ctrl, recorder))
 }
 
 /// Proves the atomic-switch success path: `/model switch <id>`, invoked via
@@ -460,10 +473,10 @@ fn build_slice9_fixture(
 /// persistence call site is test-injectable through the public `Operation`
 /// surface, the same way `resolved_config` already was.
 #[tokio::test]
-async fn slice9_model_switch_to_different_provider_is_atomic() {
+async fn slice9_model_switch_to_different_provider_is_atomic() -> TestResult {
     use harw_operations::{OpInput, Operation};
 
-    let (ctx, tmp, ctrl, recorder) = build_slice9_fixture(true);
+    let (op_ctx, tmp, ctrl, recorder) = build_slice9_fixture(true)?;
 
     // ── Invoke ModelOperation::run() with ["switch", "gpt-test-slice9"] ───────
     let op = harw_ops::model::ModelOperation;
@@ -471,13 +484,15 @@ async fn slice9_model_switch_to_different_provider_is_atomic() {
         "/model",
         vec!["switch".to_owned(), "gpt-test-slice9".to_owned()],
     );
-    let result = op.run(&ctx, input).await;
+    let result = op.run(&op_ctx, input).await;
 
     match result {
         Ok(_) => {}
-        other => panic!(
-            "Expected Ok for a cross-provider atomic /model switch, got: {other:?}"
-        ),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "Expected Ok for a cross-provider atomic /model switch, got: {other:?}"
+            )));
+        }
     }
 
     // ATOMIC SUCCESS: both provider and model must have switched together.
@@ -499,15 +514,18 @@ async fn slice9_model_switch_to_different_provider_is_atomic() {
     // filesystem persistence, and that it was not skipped or double-called.
     assert_eq!(
         recorder.calls(),
-        vec![harw_ops::model::RecordedSelectionPersistCall::DefaultSelection {
-            provider: Some("openai".to_owned()),
-            model: Some("gpt-test-slice9".to_owned()),
-        }],
+        vec![
+            harw_ops::model::RecordedSelectionPersistCall::DefaultSelection {
+                provider: Some("openai".to_owned()),
+                model: Some("gpt-test-slice9".to_owned()),
+            }
+        ],
         "persist_default_selection must be called exactly once with (openai, gpt-test-slice9)"
     );
 
     // Cleanup tmp dir (best effort).
     let _ = std::fs::remove_dir_all(&tmp);
+    Ok(())
 }
 
 /// Proves the handler-level atomicity guard still holds on the *failure*
@@ -522,10 +540,10 @@ async fn slice9_model_switch_to_different_provider_is_atomic() {
 /// Action:       /model switch gpt-test-slice9   (target provider "openai" DISABLED)
 /// Assert:       Err(InvalidArguments) AND snapshot is byte-for-byte unchanged
 #[tokio::test]
-async fn slice9b_model_switch_to_disabled_target_provider_is_atomic_on_failure() {
+async fn slice9b_model_switch_to_disabled_target_provider_is_atomic_on_failure() -> TestResult {
     use harw_operations::{OpInput, Operation};
 
-    let (ctx, tmp, ctrl, recorder) = build_slice9_fixture(false);
+    let (op_ctx, tmp, ctrl, recorder) = build_slice9_fixture(false)?;
     let snapshot_before = ctrl.snapshot();
 
     // ── Invoke ModelOperation::run() with ["switch", "gpt-test-slice9"] ───────
@@ -534,7 +552,7 @@ async fn slice9b_model_switch_to_disabled_target_provider_is_atomic_on_failure()
         "/model",
         vec!["switch".to_owned(), "gpt-test-slice9".to_owned()],
     );
-    let result = op.run(&ctx, input).await;
+    let result = op.run(&op_ctx, input).await;
 
     match result {
         Err(harw_operations::OpError::InvalidArguments(msg)) => {
@@ -544,7 +562,9 @@ async fn slice9b_model_switch_to_disabled_target_provider_is_atomic_on_failure()
             );
         }
         other => {
-            panic!("Expected InvalidArguments for a disabled target provider, got: {other:?}")
+            return Err(TestError::Unexpected(format!(
+                "Expected InvalidArguments for a disabled target provider, got: {other:?}"
+            )));
         }
     }
 
@@ -569,6 +589,7 @@ async fn slice9b_model_switch_to_disabled_target_provider_is_atomic_on_failure()
 
     // Cleanup tmp dir (best effort).
     let _ = std::fs::remove_dir_all(&tmp);
+    Ok(())
 }
 
 // ── Test 6: slice10_controller_state_survives_multiple_commands ──────────────
@@ -580,17 +601,17 @@ async fn slice9b_model_switch_to_disabled_target_provider_is_atomic_on_failure()
 ///   apply_to_session (single call) →
 ///   all three session fields set → ModelRequest carries all three
 #[test]
-fn slice10_controller_state_survives_multiple_commands() {
+fn slice10_controller_state_survives_multiple_commands() -> TestResult {
     let ctrl = Arc::new(TuiSessionController::new());
     let mut session = fresh_session();
 
     // Three sequential mutations — each bumps the generation counter.
     ctrl.set_reasoning_effort(Some(ReasoningEffort::Medium))
-        .expect("set_reasoning_effort must succeed");
+        .map_err(ctx("set_reasoning_effort must succeed"))?;
     ctrl.set_active_model("claude-opus-4-8".to_owned())
-        .expect("set_active_model must succeed");
+        .map_err(ctx("set_active_model must succeed"))?;
     ctrl.set_active_provider("anthropic".to_owned())
-        .expect("set_active_provider must succeed");
+        .map_err(ctx("set_active_provider must succeed"))?;
 
     // Snapshot must reflect all three before apply.
     let snap = ctrl.snapshot();
@@ -640,6 +661,7 @@ fn slice10_controller_state_survives_multiple_commands() {
         !second_applied,
         "second apply without new mutations must be a no-op"
     );
+    Ok(())
 }
 
 // ── Test 7: slice11_second_session_is_isolated ───────────────────────────────
@@ -650,20 +672,20 @@ fn slice10_controller_state_survives_multiple_commands() {
 /// This ensures `Arc` is wrapping a fresh `TuiSessionController` each time,
 /// not a shared singleton.
 #[test]
-fn slice11_second_session_is_isolated() {
+fn slice11_second_session_is_isolated() -> TestResult {
     let ctrl_a = Arc::new(TuiSessionController::new());
     let ctrl_b = Arc::new(TuiSessionController::new());
 
     // Mutate A only.
     ctrl_a
         .set_reasoning_effort(Some(ReasoningEffort::High))
-        .expect("set_reasoning_effort on A must succeed");
+        .map_err(ctx("set_reasoning_effort on A must succeed"))?;
     ctrl_a
         .set_active_model("claude-opus-4-8".to_owned())
-        .expect("set_active_model on A must succeed");
+        .map_err(ctx("set_active_model on A must succeed"))?;
     ctrl_a
         .set_active_provider("anthropic".to_owned())
-        .expect("set_active_provider on A must succeed");
+        .map_err(ctx("set_active_provider on A must succeed"))?;
 
     // B's snapshot must still be all-None.
     let snap_b = ctrl_b.snapshot();
@@ -722,4 +744,5 @@ fn slice11_second_session_is_isolated() {
         session_a.active_provider(),
         Some(&ProviderId::from("anthropic"))
     );
+    Ok(())
 }

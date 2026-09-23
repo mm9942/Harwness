@@ -132,55 +132,46 @@ pub enum Confidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestResult;
 
     #[test]
-    fn test_confidence_json_form_matches_literal_per_variant() {
+    fn test_confidence_json_form_matches_literal_per_variant() -> TestResult {
         // Literal comparison, not a roundtrip: a roundtrip stays green even
         // if serialization and deserialization drift together.
+        assert_eq!(serde_json::to_string(&Confidence::VeryLow)?, "\"very_low\"");
+        assert_eq!(serde_json::to_string(&Confidence::Low)?, "\"low\"");
+        assert_eq!(serde_json::to_string(&Confidence::Medium)?, "\"medium\"");
+        assert_eq!(serde_json::to_string(&Confidence::High)?, "\"high\"");
         assert_eq!(
-            serde_json::to_string(&Confidence::VeryLow).unwrap(),
-            "\"very_low\""
-        );
-        assert_eq!(
-            serde_json::to_string(&Confidence::Low).unwrap(),
-            "\"low\""
-        );
-        assert_eq!(
-            serde_json::to_string(&Confidence::Medium).unwrap(),
-            "\"medium\""
-        );
-        assert_eq!(
-            serde_json::to_string(&Confidence::High).unwrap(),
-            "\"high\""
-        );
-        assert_eq!(
-            serde_json::to_string(&Confidence::VeryHigh).unwrap(),
+            serde_json::to_string(&Confidence::VeryHigh)?,
             "\"very_high\""
         );
+        Ok(())
     }
 
     #[test]
-    fn test_confidence_deserializes_from_literal_per_variant() {
+    fn test_confidence_deserializes_from_literal_per_variant() -> TestResult {
         assert_eq!(
-            serde_json::from_str::<Confidence>("\"very_low\"").unwrap(),
+            serde_json::from_str::<Confidence>("\"very_low\"")?,
             Confidence::VeryLow
         );
         assert_eq!(
-            serde_json::from_str::<Confidence>("\"low\"").unwrap(),
+            serde_json::from_str::<Confidence>("\"low\"")?,
             Confidence::Low
         );
         assert_eq!(
-            serde_json::from_str::<Confidence>("\"medium\"").unwrap(),
+            serde_json::from_str::<Confidence>("\"medium\"")?,
             Confidence::Medium
         );
         assert_eq!(
-            serde_json::from_str::<Confidence>("\"high\"").unwrap(),
+            serde_json::from_str::<Confidence>("\"high\"")?,
             Confidence::High
         );
         assert_eq!(
-            serde_json::from_str::<Confidence>("\"very_high\"").unwrap(),
+            serde_json::from_str::<Confidence>("\"very_high\"")?,
             Confidence::VeryHigh
         );
+        Ok(())
     }
 
     #[test]
@@ -193,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn test_confidence_roundtrip_all_variants() {
+    fn test_confidence_roundtrip_all_variants() -> TestResult {
         for c in [
             Confidence::VeryLow,
             Confidence::Low,
@@ -201,9 +192,10 @@ mod tests {
             Confidence::High,
             Confidence::VeryHigh,
         ] {
-            let json = serde_json::to_string(&c).unwrap();
-            let recovered: Confidence = serde_json::from_str(&json).unwrap();
+            let json = serde_json::to_string(&c)?;
+            let recovered: Confidence = serde_json::from_str(&json)?;
             assert_eq!(c, recovered);
         }
+        Ok(())
     }
 }

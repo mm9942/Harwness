@@ -7,6 +7,9 @@
 //! Pipeline under test:
 //!   `parse_toml(&src)` → `resolve_definition(&id, &layers, now)` → `lower(&resolved)`
 
+mod common;
+
+use common::{TestResult, ctx};
 use harw_agent_dsl::ExecutableAgentIr;
 use harw_agent_dsl::error::DslError;
 use harw_agent_dsl::ids::DefinitionId;
@@ -26,13 +29,13 @@ const AUTH_ATTACKER_TOML: &str = include_str!("fixtures/authority_elevation_atta
 // Helper: run the full pipeline for a TOML string, returning ExecutableAgentIr
 // --------------------------------------------------------------------------
 
-fn pipeline(toml_src: &str, id_str: &str) -> ExecutableAgentIr {
-    let raw = parse_toml(toml_src).expect("parse_toml should succeed");
-    let id = DefinitionId::parse(id_str).expect("DefinitionId::parse should succeed");
+fn pipeline(toml_src: &str, id_str: &str) -> TestResult<ExecutableAgentIr> {
+    let raw = parse_toml(toml_src).map_err(ctx("parse_toml should succeed"))?;
+    let id = DefinitionId::parse(id_str).map_err(ctx("DefinitionId::parse should succeed"))?;
     let layers = vec![(DefinitionLayer::BuiltIn, raw)];
     let resolved = resolve_definition(&id, &layers, time::OffsetDateTime::now_utc())
-        .expect("resolve_definition should succeed");
-    lower(&resolved).expect("lower should succeed")
+        .map_err(ctx("resolve_definition should succeed"))?;
+    lower(&resolved).map_err(ctx("lower should succeed"))
 }
 
 // --------------------------------------------------------------------------
@@ -40,9 +43,9 @@ fn pipeline(toml_src: &str, id_str: &str) -> ExecutableAgentIr {
 // --------------------------------------------------------------------------
 
 #[test]
-fn slice13_full_pipeline_minimal_agent() {
+fn slice13_full_pipeline_minimal_agent() -> TestResult {
     // Run the complete pipeline using the fixture file.
-    let ir: ExecutableAgentIr = pipeline(MINIMAL_TOML, "harwness.agent.slice13-minimal@1");
+    let ir: ExecutableAgentIr = pipeline(MINIMAL_TOML, "harwness.agent.slice13-minimal@1")?;
 
     // Assert the IR has the expected identity and role fields.
     assert_eq!(
@@ -78,7 +81,8 @@ fn slice13_full_pipeline_minimal_agent() {
     // The function `consume_ir` below only accepts ExecutableAgentIr; this line compiles
     // only if `ir` is exactly that type.
     fn consume_ir(_: ExecutableAgentIr) {}
-    consume_ir(pipeline(MINIMAL_TOML, "harwness.agent.slice13-minimal@1"));
+    consume_ir(pipeline(MINIMAL_TOML, "harwness.agent.slice13-minimal@1")?);
+    Ok(())
 }
 
 // --------------------------------------------------------------------------
@@ -86,11 +90,11 @@ fn slice13_full_pipeline_minimal_agent() {
 // --------------------------------------------------------------------------
 
 #[test]
-fn slice13_snapshot_id_stable_across_two_lowerings() {
+fn slice13_snapshot_id_stable_across_two_lowerings() -> TestResult {
     let id_str = "harwness.agent.slice13-minimal@1";
 
-    let ir1 = pipeline(MINIMAL_TOML, id_str);
-    let ir2 = pipeline(MINIMAL_TOML, id_str);
+    let ir1 = pipeline(MINIMAL_TOML, id_str)?;
+    let ir2 = pipeline(MINIMAL_TOML, id_str)?;
 
     assert_eq!(
         ir1.snapshot_id(),
@@ -100,6 +104,7 @@ fn slice13_snapshot_id_stable_across_two_lowerings() {
         ir1.snapshot_id(),
         ir2.snapshot_id()
     );
+    Ok(())
 }
 
 // --------------------------------------------------------------------------
@@ -107,7 +112,7 @@ fn slice13_snapshot_id_stable_across_two_lowerings() {
 // --------------------------------------------------------------------------
 
 #[test]
-fn slice13_snapshot_id_changes_when_role_changes() {
+fn slice13_snapshot_id_changes_when_role_changes() -> TestResult {
     // Two TOMLs identical except for `role`.
     // Same id value so the id-contribution to the hash is equal; only role differs.
     const WORKER_TOML: &str = r#"
@@ -126,8 +131,8 @@ specialization = "slice13-role-test"
 "#;
 
     let id_str = "harwness.agent.slice13-role-test@1";
-    let ir_worker = pipeline(WORKER_TOML, id_str);
-    let ir_orch = pipeline(ORCHESTRATOR_TOML, id_str);
+    let ir_worker = pipeline(WORKER_TOML, id_str)?;
+    let ir_orch = pipeline(ORCHESTRATOR_TOML, id_str)?;
 
     assert_ne!(
         ir_worker.snapshot_id(),
@@ -136,6 +141,7 @@ specialization = "slice13-role-test"
          both produced: {}",
         ir_worker.snapshot_id()
     );
+    Ok(())
 }
 
 // --------------------------------------------------------------------------
@@ -143,12 +149,13 @@ specialization = "slice13-role-test"
 // --------------------------------------------------------------------------
 
 #[test]
-fn slice13_dsl_error_carries_field_path() {
+fn slice13_dsl_error_carries_field_path() -> TestResult {
     // The attacker fixture has [patch.authority.capabilities] append = [...],
     // which is unconditionally rejected by the resolver (§7, §22 Invariant 7).
-    let raw = parse_toml(AUTH_ATTACKER_TOML).expect("parse_toml should succeed for attacker");
+    let raw =
+        parse_toml(AUTH_ATTACKER_TOML).map_err(ctx("parse_toml should succeed for attacker"))?;
     let id_str = "harwness.agent.slice13-auth-attacker@1";
-    let id = DefinitionId::parse(id_str).expect("DefinitionId::parse should succeed");
+    let id = DefinitionId::parse(id_str).map_err(ctx("DefinitionId::parse should succeed"))?;
     let layers = vec![(DefinitionLayer::BuiltIn, raw)];
 
     let result = resolve_definition(&id, &layers, time::OffsetDateTime::now_utc());
@@ -158,7 +165,9 @@ fn slice13_dsl_error_carries_field_path() {
         result.is_err(),
         "resolve_definition should fail for authority-elevation attempt"
     );
-    let err = result.unwrap_err();
+    let Err(err) = result else {
+        return Err(common::TestError::Unexpected("Err erwartet".into()));
+    };
     assert!(
         matches!(err, DslError::AuthorityElevation { .. }),
         "Expected DslError::AuthorityElevation, got: {err}"
@@ -180,8 +189,11 @@ fn slice13_dsl_error_carries_field_path() {
             location.field_path
         );
     } else {
-        panic!("Expected DslError::AuthorityElevation but got a different variant");
+        return Err(common::TestError::Unexpected(
+            "Expected DslError::AuthorityElevation but got a different variant".into(),
+        ));
     }
+    Ok(())
 }
 
 // --------------------------------------------------------------------------
@@ -189,12 +201,12 @@ fn slice13_dsl_error_carries_field_path() {
 // --------------------------------------------------------------------------
 
 #[test]
-fn slice13_no_raw_toml_types_leak_to_ir_consumer() {
+fn slice13_no_raw_toml_types_leak_to_ir_consumer() -> TestResult {
     // Compile-time proof: this function only accepts ExecutableAgentIr.
     // If the pipeline returned a raw TOML type, this line would not compile.
     fn consume_ir(_ir: harw_agent_dsl::ExecutableAgentIr) {}
 
-    let ir = pipeline(MINIMAL_TOML, "harwness.agent.slice13-minimal@1");
+    let ir = pipeline(MINIMAL_TOML, "harwness.agent.slice13-minimal@1")?;
     consume_ir(ir);
 
     // Runtime proof: the type name of ExecutableAgentIr must not contain "Raw" or "toml::".
@@ -207,4 +219,5 @@ fn slice13_no_raw_toml_types_leak_to_ir_consumer() {
         !type_name.contains("toml::"),
         "ExecutableAgentIr type name must not contain 'toml::', got: {type_name}"
     );
+    Ok(())
 }

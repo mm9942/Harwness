@@ -28,6 +28,7 @@ admitted = [
   "fs.search",
   "fs.glob",
   "fs.grep",
+  "doc.read_pdf",
   "deps.graph",
   "deps.locked",
   "deps.source_read",

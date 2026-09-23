@@ -301,22 +301,30 @@ mod tests {
 
     use super::{MismatchAspect, ProofError, WardenProtoError, WardenProtoResult};
     use crate::denial::Denial;
+    use crate::test_support::{TestError, TestResult};
 
-    fn sample_json_error() -> serde_json::Error {
-        serde_json::from_str::<serde_json::Value>("not json").unwrap_err()
+    fn sample_json_error() -> TestResult<serde_json::Error> {
+        let Err(source) = serde_json::from_str::<serde_json::Value>("not json") else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        Ok(source)
     }
 
     #[test]
-    fn test_action_encoding_display_interpolates_inner_message() {
-        let err = WardenProtoError::from(sample_json_error());
+    fn test_action_encoding_display_interpolates_inner_message() -> TestResult {
+        let err = WardenProtoError::from(sample_json_error()?);
         let display = err.to_string();
-        assert!(display.starts_with("failed to encode a warden action for content-addressed binding:"));
+        assert!(
+            display.starts_with("failed to encode a warden action for content-addressed binding:")
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_action_encoding_source_returns_inner_error() {
-        let err: WardenProtoError = sample_json_error().into();
+    fn test_action_encoding_source_returns_inner_error() -> TestResult {
+        let err: WardenProtoError = sample_json_error()?.into();
         assert!(err.source().is_some());
+        Ok(())
     }
 
     #[test]
@@ -324,7 +332,10 @@ mod tests {
         let finding = WardenProtoError::ProofMismatch(MismatchAspect::Finding).to_string();
         let action = WardenProtoError::ProofMismatch(MismatchAspect::Action).to_string();
         assert_eq!(finding, action);
-        assert_eq!(finding, "authorization proof does not authorize the requested action");
+        assert_eq!(
+            finding,
+            "authorization proof does not authorize the requested action"
+        );
     }
 
     #[test]
@@ -336,7 +347,10 @@ mod tests {
     #[test]
     fn test_not_admissible_at_stage_display_and_source() {
         let err = WardenProtoError::NotAdmissibleAtStage;
-        assert_eq!(err.to_string(), "action is not admissible at the proof's escalation stage");
+        assert_eq!(
+            err.to_string(),
+            "action is not admissible at the proof's escalation stage"
+        );
         assert!(err.source().is_none());
     }
 
@@ -350,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn test_as_denial_maps_business_errors_and_drops_internal_ones() {
+    fn test_as_denial_maps_business_errors_and_drops_internal_ones() -> TestResult {
         assert_eq!(
             WardenProtoError::ProofMismatch(MismatchAspect::Finding).as_denial(),
             Some(Denial::ProofMismatch)
@@ -363,11 +377,15 @@ mod tests {
             WardenProtoError::NotAdmissibleAtStage.as_denial(),
             Some(Denial::NotAdmissibleAtStage)
         );
-        assert_eq!(WardenProtoError::from(sample_json_error()).as_denial(), None);
+        assert_eq!(
+            WardenProtoError::from(sample_json_error()?).as_denial(),
+            None
+        );
         assert_eq!(
             WardenProtoError::from(ProofError::UnsupportedVersion(1)).as_denial(),
             Some(Denial::UnsupportedVersion)
         );
+        Ok(())
     }
 
     #[test]
@@ -386,19 +404,31 @@ mod tests {
         ] {
             assert_eq!(err.as_denial(), Denial::ProofMismatch);
         }
-        assert_eq!(ProofError::NotAdmissibleAtStage.as_denial(), Denial::NotAdmissibleAtStage);
-        assert_eq!(ProofError::UnsupportedVersion(7).as_denial(), Denial::UnsupportedVersion);
+        assert_eq!(
+            ProofError::NotAdmissibleAtStage.as_denial(),
+            Denial::NotAdmissibleAtStage
+        );
+        assert_eq!(
+            ProofError::UnsupportedVersion(7).as_denial(),
+            Denial::UnsupportedVersion
+        );
         let io = ProofError::from(std::io::Error::other("disk full"));
         assert_eq!(io.as_denial(), Denial::Unavailable);
     }
 
     #[test]
     fn test_proof_error_display_is_content_free() {
-        assert_eq!(ProofError::UnsupportedVersion(7).to_string(), "unsupported warden proof version");
+        assert_eq!(
+            ProofError::UnsupportedVersion(7).to_string(),
+            "unsupported warden proof version"
+        );
         let io = ProofError::from(std::io::Error::other("secret-path"));
         assert!(!io.to_string().contains("secret-path"));
         assert!(io.source().is_some());
-        assert_eq!(format!("{:?}", ProofError::BadMac), ProofError::BadMac.to_string());
+        assert_eq!(
+            format!("{:?}", ProofError::BadMac),
+            ProofError::BadMac.to_string()
+        );
     }
 
     #[test]

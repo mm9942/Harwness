@@ -271,7 +271,10 @@ async fn deps_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{block_on, sandbox_context, scratch_dir, tool_call, write_lockfile};
+    use crate::test_support::{
+        TestError, TestResult, block_on, ctx, sandbox_context, scratch_dir, tool_call,
+        write_lockfile,
+    };
     use harw_tools::ToolExecutor as _;
     use std::fs;
 
@@ -343,14 +346,14 @@ mod tests {
     }
 
     #[test]
-    fn test_locked_detail_with_registry_access_resolves_source_path() {
-        let cargo_home = scratch_dir("locked-registry");
+    fn test_locked_detail_with_registry_access_resolves_source_path() -> TestResult {
+        let cargo_home = scratch_dir("locked-registry")?;
         let crate_dir = cargo_home
             .join("registry")
             .join("src")
             .join("index.crates.io-testhash")
             .join("serde-1.0.228");
-        fs::create_dir_all(&crate_dir).expect("Registry-Fixture anlegen");
+        fs::create_dir_all(&crate_dir).map_err(ctx("Registry-Fixture anlegen"))?;
         let access = RegistryAccess::with_home(cargo_home.clone());
 
         let packages = sample_packages();
@@ -361,19 +364,21 @@ mod tests {
         assert_eq!(detail["available_versions"][0], "1.0.228");
 
         fs::remove_dir_all(&cargo_home).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_deps_locked_tool_lists_external_packages() {
-        let harness = scratch_dir("locked-tool-list");
+    fn test_deps_locked_tool_lists_external_packages() -> TestResult {
+        let harness = scratch_dir("locked-tool-list")?;
         let workspace = harness.join("ws");
-        fs::create_dir_all(&workspace).expect("Workspace anlegen");
-        write_lockfile(&workspace);
+        fs::create_dir_all(&workspace).map_err(ctx("Workspace anlegen"))?;
+        write_lockfile(&workspace)?;
 
-        let context = sandbox_context(&harness, vec![Permission::ReadWorkspace]);
+        let context = sandbox_context(&harness, vec![Permission::ReadWorkspace])?;
         let call = tool_call("deps.locked", serde_json::json!({}));
 
-        let output = block_on(DepsLockedTool.execute(&context, &call)).expect("Tool läuft");
+        let output =
+            block_on(DepsLockedTool.execute(&context, &call))?.map_err(ctx("Tool läuft"))?;
 
         match output {
             ToolOutput::Json { content } => {
@@ -382,23 +387,29 @@ mod tests {
                 assert_eq!(content["packages"][0]["name"], "serde");
                 assert_eq!(content["packages"][0]["version"], "1.0.228");
             }
-            other => panic!("JSON-Ausgabe erwartet, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "JSON-Ausgabe erwartet, war: {other:?}"
+                )));
+            }
         }
 
         fs::remove_dir_all(&harness).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_deps_locked_tool_returns_detail_for_named_crate() {
-        let harness = scratch_dir("locked-tool-detail");
+    fn test_deps_locked_tool_returns_detail_for_named_crate() -> TestResult {
+        let harness = scratch_dir("locked-tool-detail")?;
         let workspace = harness.join("ws");
-        fs::create_dir_all(&workspace).expect("Workspace anlegen");
-        write_lockfile(&workspace);
+        fs::create_dir_all(&workspace).map_err(ctx("Workspace anlegen"))?;
+        write_lockfile(&workspace)?;
 
-        let context = sandbox_context(&harness, vec![Permission::ReadWorkspace]);
+        let context = sandbox_context(&harness, vec![Permission::ReadWorkspace])?;
         let call = tool_call("deps.locked", serde_json::json!({ "crate_name": "serde" }));
 
-        let output = block_on(DepsLockedTool.execute(&context, &call)).expect("Tool läuft");
+        let output =
+            block_on(DepsLockedTool.execute(&context, &call))?.map_err(ctx("Tool läuft"))?;
 
         match output {
             ToolOutput::Json { content } => {
@@ -409,58 +420,75 @@ mod tests {
                     "ohne ReadCargoRegistry darf der Cache nicht befragt werden"
                 );
             }
-            other => panic!("JSON-Ausgabe erwartet, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "JSON-Ausgabe erwartet, war: {other:?}"
+                )));
+            }
         }
 
         fs::remove_dir_all(&harness).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_deps_locked_tool_reports_unknown_crate() {
-        let harness = scratch_dir("locked-tool-unknown");
+    fn test_deps_locked_tool_reports_unknown_crate() -> TestResult {
+        let harness = scratch_dir("locked-tool-unknown")?;
         let workspace = harness.join("ws");
-        fs::create_dir_all(&workspace).expect("Workspace anlegen");
-        write_lockfile(&workspace);
+        fs::create_dir_all(&workspace).map_err(ctx("Workspace anlegen"))?;
+        write_lockfile(&workspace)?;
 
-        let context = sandbox_context(&harness, vec![Permission::ReadWorkspace]);
+        let context = sandbox_context(&harness, vec![Permission::ReadWorkspace])?;
         let call = tool_call(
             "deps.locked",
             serde_json::json!({ "crate_name": "gibt-es-nicht" }),
         );
 
-        let output = block_on(DepsLockedTool.execute(&context, &call)).expect("Tool läuft");
+        let output =
+            block_on(DepsLockedTool.execute(&context, &call))?.map_err(ctx("Tool läuft"))?;
 
         match output {
             ToolOutput::Error { message } => {
                 assert!(message.contains("gibt-es-nicht"), "war: {message}");
             }
-            other => panic!("Fehlerausgabe erwartet, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Fehlerausgabe erwartet, war: {other:?}"
+                )));
+            }
         }
 
         fs::remove_dir_all(&harness).ok();
+        Ok(())
     }
 
     #[test]
-    fn test_deps_locked_tool_denies_without_read_workspace() {
-        let harness = scratch_dir("locked-tool-denied");
+    fn test_deps_locked_tool_denies_without_read_workspace() -> TestResult {
+        let harness = scratch_dir("locked-tool-denied")?;
         let workspace = harness.join("ws");
-        fs::create_dir_all(&workspace).expect("Workspace anlegen");
-        write_lockfile(&workspace);
+        fs::create_dir_all(&workspace).map_err(ctx("Workspace anlegen"))?;
+        write_lockfile(&workspace)?;
 
-        let context = sandbox_context(&harness, Vec::new());
+        let context = sandbox_context(&harness, Vec::new())?;
         let call = tool_call("deps.locked", serde_json::json!({}));
 
-        let output = block_on(DepsLockedTool.execute(&context, &call)).expect("Tool läuft");
+        let output =
+            block_on(DepsLockedTool.execute(&context, &call))?.map_err(ctx("Tool läuft"))?;
 
         match output {
             ToolOutput::Error { message } => assert!(
                 message.contains("ReadWorkspace"),
                 "fehlende Permission muss benannt werden, war: {message}"
             ),
-            other => panic!("Fehlerausgabe erwartet, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Fehlerausgabe erwartet, war: {other:?}"
+                )));
+            }
         }
 
         fs::remove_dir_all(&harness).ok();
+        Ok(())
     }
 
     #[test]

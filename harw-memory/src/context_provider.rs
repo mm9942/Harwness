@@ -451,11 +451,29 @@ impl<M: Memory> MemoryContextProvider<M> {
             }
         };
 
-        push_fragment(&mut fragments, SECTION_HOT, "hot", &result.base.hot, produced_at);
-        push_fragment(&mut fragments, SECTION_STM, "stm", &result.base.stm, produced_at);
+        push_fragment(
+            &mut fragments,
+            SECTION_HOT,
+            "hot",
+            &result.base.hot,
+            produced_at,
+        );
+        push_fragment(
+            &mut fragments,
+            SECTION_STM,
+            "stm",
+            &result.base.stm,
+            produced_at,
+        );
         for (index, slice) in result.base.warm.iter().enumerate() {
             let label = format!("warm-{index}-{}", slice.namespace);
-            push_fragment(&mut fragments, SECTION_WARM, &label, &slice.content, produced_at);
+            push_fragment(
+                &mut fragments,
+                SECTION_WARM,
+                &label,
+                &slice.content,
+                produced_at,
+            );
         }
         fragments
     }
@@ -547,7 +565,12 @@ impl<M: Memory> MemoryContextProvider<M> {
             }
             used_tokens +=
                 push_fact_fragment(out, SECTION_FACT_PREFERENCE, scope, &fact, produced_at);
-            record_delivery(scope, &fact.name, &mut project_delivered, &mut global_delivered);
+            record_delivery(
+                scope,
+                &fact.name,
+                &mut project_delivered,
+                &mut global_delivered,
+            );
         }
 
         // (2b) Fallstricke — immer, Projekt vor Global, max.
@@ -589,7 +612,12 @@ impl<M: Memory> MemoryContextProvider<M> {
                 fact.description.clone()
             };
             pitfall_lines.push(format!("- {text}"));
-            record_delivery(scope, &fact.name, &mut project_delivered, &mut global_delivered);
+            record_delivery(
+                scope,
+                &fact.name,
+                &mut project_delivered,
+                &mut global_delivered,
+            );
         }
         if !pitfall_lines.is_empty() {
             let body = format!("## Bekannte Fallstricke\n{}", pitfall_lines.join("\n"));
@@ -637,7 +665,12 @@ impl<M: Memory> MemoryContextProvider<M> {
                 delivered.insert((scope, fact.name.clone()));
                 push_fact_fragment(out, SECTION_FACT_SEARCH, scope, &fact, produced_at);
                 used_tokens += cost;
-                record_delivery(scope, &fact.name, &mut project_delivered, &mut global_delivered);
+                record_delivery(
+                    scope,
+                    &fact.name,
+                    &mut project_delivered,
+                    &mut global_delivered,
+                );
             }
         }
 
@@ -670,7 +703,13 @@ impl<M: Memory> MemoryContextProvider<M> {
                                 "## Bekannte Dateien (bereits gelesen)\n{}",
                                 lines.join("\n")
                             );
-                            push_fragment(out, SECTION_FILE_INDEX, "known-files", &body, produced_at);
+                            push_fragment(
+                                out,
+                                SECTION_FILE_INDEX,
+                                "known-files",
+                                &body,
+                                produced_at,
+                            );
                         }
                     }
                     Err(error) => {
@@ -760,7 +799,11 @@ fn record_delivery(
 /// Baut das Index-Fragment aus §4(1) und liefert die geschätzte Tokenzahl
 /// zurück (0, wenn nichts angehängt wurde — leerer Index oder ungültige
 /// Sektion/Beschriftung, siehe [`push_fragment`]).
-fn push_index_fragment(out: &mut Vec<Fragment>, facts: &[Fact], produced_at: jiff::Timestamp) -> usize {
+fn push_index_fragment(
+    out: &mut Vec<Fragment>,
+    facts: &[Fact],
+    produced_at: jiff::Timestamp,
+) -> usize {
     let text = render_fact_index(facts);
     let cost = text.len() / 4;
     let before = out.len();
@@ -896,9 +939,10 @@ fn push_fragment(
 mod tests {
     use super::*;
     use crate::file_store::FileMemoryStore;
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::types::Signal;
 
-    fn tmp_root(tag: &str) -> std::path::PathBuf {
+    fn tmp_root(tag: &str) -> TestResult<std::path::PathBuf> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -910,8 +954,8 @@ mod tests {
         // Das Verzeichnis muss existieren, bevor jemand hineinschreibt -- der
         // Helfer lieferte zuvor nur einen Pfad, und das erste `fs::write`
         // scheiterte mit `NotFound`.
-        std::fs::create_dir_all(&root).expect("Testwurzel anlegen");
-        root
+        std::fs::create_dir_all(&root).map_err(ctx("Testwurzel anlegen"))?;
+        Ok(root)
     }
 
     // ── selection_role_for ────────────────────────────────────────────────
@@ -951,35 +995,36 @@ mod tests {
 
     // ── MemoryContextProvider::fragments ─────────────────────────────────
 
-    fn provider(root: &std::path::Path) -> MemoryContextProvider<FileMemoryStore> {
-        let store = Arc::new(FileMemoryStore::open(root).expect("open memory store"));
-        MemoryContextProvider::new(
+    fn provider(root: &std::path::Path) -> TestResult<MemoryContextProvider<FileMemoryStore>> {
+        let store = Arc::new(FileMemoryStore::open(root).map_err(ctx("open memory store"))?);
+        Ok(MemoryContextProvider::new(
             store,
             ShortTermMemory::new("session-1", 32, 2_048),
             ContextPolicy::Balanced,
-        )
+        ))
     }
 
     #[test]
-    fn test_empty_store_contributes_nothing() {
-        let root = tmp_root("empty");
-        let fragments = provider(&root).fragments(
+    fn test_empty_store_contributes_nothing() -> TestResult {
+        let root = tmp_root("empty")?;
+        let fragments = provider(&root)?.fragments(
             &TurnInputContext::default(),
             time::OffsetDateTime::UNIX_EPOCH,
             jiff::Timestamp::UNIX_EPOCH,
         );
         assert!(fragments.is_empty());
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn test_hot_content_becomes_a_fragment_with_all_fields_populated() {
-        let root = tmp_root("hot");
+    fn test_hot_content_becomes_a_fragment_with_all_fields_populated() -> TestResult {
+        let root = tmp_root("hot")?;
         std::fs::write(root.join("HOT.md"), "Regel 1: keine Doppelantworten.\n")
-            .expect("write HOT.md");
+            .map_err(ctx("write HOT.md"))?;
         let produced_at = jiff::Timestamp::UNIX_EPOCH;
 
-        let fragments = provider(&root).fragments(
+        let fragments = provider(&root)?.fragments(
             &TurnInputContext::default(),
             time::OffsetDateTime::UNIX_EPOCH,
             produced_at,
@@ -988,7 +1033,7 @@ mod tests {
         let hot = fragments
             .iter()
             .find(|f| f.section.as_str() == SECTION_HOT)
-            .expect("HOT fragment present");
+            .ok_or(TestError::Missing("HOT fragment present"))?;
         assert_eq!(hot.trust, MEMORY_CONTEXT_MAX_TRUST);
         assert_eq!(hot.stability, Stability::Fresh);
         assert_eq!(hot.origin.provider, PROVIDER_NAME);
@@ -999,28 +1044,36 @@ mod tests {
         assert!(hot.body.contains("keine Doppelantworten"));
 
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn test_record_populates_a_warm_fragment_when_recalled() {
-        let root = tmp_root("warm");
-        let store = Arc::new(FileMemoryStore::open(&root).expect("open memory store"));
+    fn test_record_populates_a_warm_fragment_when_recalled() -> TestResult {
+        let root = tmp_root("warm")?;
+        let store = Arc::new(FileMemoryStore::open(&root).map_err(ctx("open memory store"))?);
         // Die Beförderung nach WARM verlangt **drei** `PatternHint`-Signale mit
         // demselben Schlüssel -- so ist `FileMemoryStore::maintain` gebaut
         // (siehe dessen eigenen Test `maintain_counts_pending_before_
         // promoting_pattern_hints`). Ein einzelnes `Reflection` erzeugt keine
         // Warm-Scheibe; der Test forderte zuvor ein Fragment aus einem Signal,
         // das der Speicher gar nicht befördert.
-        for note in ["Popup schluckt Enter", "Popup schluckt Enter erneut", "Popup darf Enter nie schlucken."] {
+        for note in [
+            "Popup schluckt Enter",
+            "Popup schluckt Enter erneut",
+            "Popup darf Enter nie schlucken.",
+        ] {
             store
                 .record(Signal::PatternHint {
                     key: "tui-command-wiring".to_owned(),
                     note: note.to_owned(),
                 })
-                .expect("record pattern hint");
+                .map_err(ctx("record pattern hint"))?;
         }
-        let report = store.maintain().expect("maintain promotes signals");
-        assert_eq!(report.warm_created, 1, "drei gleiche Hinweise ergeben eine Warm-Scheibe");
+        let report = store.maintain().map_err(ctx("maintain promotes signals"))?;
+        assert_eq!(
+            report.warm_created, 1,
+            "drei gleiche Hinweise ergeben eine Warm-Scheibe"
+        );
 
         let provider = MemoryContextProvider::new(
             store,
@@ -1038,9 +1091,13 @@ mod tests {
         // Rendering entsteht, wenn zuvor tatsächlich ein Signal verarbeitet
         // wurde — die genaue Tier-Zuordnung ist Sache von `context_policy`,
         // nicht dieses Providers.
-        assert!(!fragments.is_empty(), "erwartet mindestens ein Fragment nach maintain()");
+        assert!(
+            !fragments.is_empty(),
+            "erwartet mindestens ein Fragment nach maintain()"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // ── Fakten (M2, §4) ───────────────────────────────────────────────────
@@ -1065,24 +1122,24 @@ mod tests {
         mem_root: &std::path::Path,
         project_facts: Option<Arc<FactStore>>,
         global_facts: Option<Arc<FactStore>>,
-    ) -> MemoryContextProvider<FileMemoryStore> {
-        let store = Arc::new(FileMemoryStore::open(mem_root).expect("open memory store"));
-        MemoryContextProvider::with_facts(
+    ) -> TestResult<MemoryContextProvider<FileMemoryStore>> {
+        let store = Arc::new(FileMemoryStore::open(mem_root).map_err(ctx("open memory store"))?);
+        Ok(MemoryContextProvider::with_facts(
             store,
             ShortTermMemory::new("session-1", 32, 2_048),
             ContextPolicy::Balanced,
             project_facts,
             global_facts,
-        )
+        ))
     }
 
     #[test]
-    fn test_without_fact_stores_behaves_like_before() {
-        let root = tmp_root("no-facts");
+    fn test_without_fact_stores_behaves_like_before() -> TestResult {
+        let root = tmp_root("no-facts")?;
         std::fs::write(root.join("HOT.md"), "Regel 1: keine Doppelantworten.\n")
-            .expect("write HOT.md");
+            .map_err(ctx("write HOT.md"))?;
 
-        let fragments = provider(&root).fragments(
+        let fragments = provider(&root)?.fragments(
             &TurnInputContext::default(),
             time::OffsetDateTime::UNIX_EPOCH,
             jiff::Timestamp::UNIX_EPOCH,
@@ -1096,16 +1153,18 @@ mod tests {
         );
         assert!(fragments.iter().any(|f| f.section.as_str() == SECTION_HOT));
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn test_preference_facts_always_included_project_before_global() {
-        let mem_root = tmp_root("pref-mem");
-        let project_root = tmp_root("pref-project");
-        let global_root = tmp_root("pref-global");
+    fn test_preference_facts_always_included_project_before_global() -> TestResult {
+        let mem_root = tmp_root("pref-mem")?;
+        let project_root = tmp_root("pref-project")?;
+        let global_root = tmp_root("pref-global")?;
 
-        let project_store =
-            Arc::new(FactStore::open(&project_root, FactScope::Project).expect("open project"));
+        let project_store = Arc::new(
+            FactStore::open(&project_root, FactScope::Project).map_err(ctx("open project"))?,
+        );
         project_store
             .write(&make_fact(
                 "proj-pref",
@@ -1113,10 +1172,10 @@ mod tests {
                 FactScope::Project,
                 "Projekt-Präferenz",
             ))
-            .expect("write project preference");
+            .map_err(ctx("write project preference"))?;
 
         let global_store =
-            Arc::new(FactStore::open(&global_root, FactScope::Global).expect("open global"));
+            Arc::new(FactStore::open(&global_root, FactScope::Global).map_err(ctx("open global"))?);
         global_store
             .write(&make_fact(
                 "glob-pref",
@@ -1124,9 +1183,9 @@ mod tests {
                 FactScope::Global,
                 "Global-Präferenz",
             ))
-            .expect("write global preference");
+            .map_err(ctx("write global preference"))?;
 
-        let fragments = facts_provider(&mem_root, Some(project_store), Some(global_store))
+        let fragments = facts_provider(&mem_root, Some(project_store), Some(global_store))?
             .fragments(
                 &TurnInputContext::default(),
                 time::OffsetDateTime::UNIX_EPOCH,
@@ -1136,11 +1195,11 @@ mod tests {
         let project_pos = fragments
             .iter()
             .position(|f| f.label.as_str() == "project-proj-pref")
-            .expect("project preference fragment present");
+            .ok_or(TestError::Missing("project preference fragment present"))?;
         let global_pos = fragments
             .iter()
             .position(|f| f.label.as_str() == "global-glob-pref")
-            .expect("global preference fragment present");
+            .ok_or(TestError::Missing("global preference fragment present"))?;
         assert!(
             project_pos < global_pos,
             "Projekt-Präferenz muss vor Global-Präferenz stehen"
@@ -1149,15 +1208,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&mem_root);
         let _ = std::fs::remove_dir_all(&project_root);
         let _ = std::fs::remove_dir_all(&global_root);
+        Ok(())
     }
 
     #[test]
-    fn test_search_hits_respect_the_memory_token_budget() {
-        let mem_root = tmp_root("budget-mem");
-        let project_root = tmp_root("budget-project");
+    fn test_search_hits_respect_the_memory_token_budget() -> TestResult {
+        let mem_root = tmp_root("budget-mem")?;
+        let project_root = tmp_root("budget-project")?;
 
-        let project_store =
-            Arc::new(FactStore::open(&project_root, FactScope::Project).expect("open project"));
+        let project_store = Arc::new(
+            FactStore::open(&project_root, FactScope::Project).map_err(ctx("open project"))?,
+        );
         for i in 0..5 {
             project_store
                 .write(&make_fact(
@@ -1166,12 +1227,12 @@ mod tests {
                     FactScope::Project,
                     "Ein langer Text über Zeppeline und ihre Geschichte in der Luftfahrt.",
                 ))
-                .expect("write fact");
+                .map_err(ctx("write fact"))?;
         }
 
         let stm = ShortTermMemory::new("session-1", 32, 2_048);
         stm.push(StmRole::User, 80, "Erzähl mir etwas über Zeppelin");
-        let store = Arc::new(FileMemoryStore::open(&mem_root).expect("open memory store"));
+        let store = Arc::new(FileMemoryStore::open(&mem_root).map_err(ctx("open memory store"))?);
         let provider = MemoryContextProvider::with_facts(
             store,
             stm,
@@ -1198,17 +1259,19 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&mem_root);
         let _ = std::fs::remove_dir_all(&project_root);
+        Ok(())
     }
 
     // ── Fallstricke + Dateiwissen (Addendum B) ───────────────────────────
 
     #[test]
-    fn test_pitfall_fact_appears_under_heading_without_keyword_match() {
-        let mem_root = tmp_root("pitfall-mem");
-        let project_root = tmp_root("pitfall-project");
+    fn test_pitfall_fact_appears_under_heading_without_keyword_match() -> TestResult {
+        let mem_root = tmp_root("pitfall-mem")?;
+        let project_root = tmp_root("pitfall-project")?;
 
-        let project_store =
-            Arc::new(FactStore::open(&project_root, FactScope::Project).expect("open project"));
+        let project_store = Arc::new(
+            FactStore::open(&project_root, FactScope::Project).map_err(ctx("open project"))?,
+        );
         project_store
             .write(&make_fact(
                 "known-pitfall",
@@ -1216,11 +1279,11 @@ mod tests {
                 FactScope::Project,
                 "Popup darf Enter nie schlucken.",
             ))
-            .expect("write pitfall");
+            .map_err(ctx("write pitfall"))?;
 
         // Kein STM-Nutzertext -> search_keywords() liefert None, der
         // Pitfall-Abschnitt darf trotzdem erscheinen ("immer" laut §4/Addendum B).
-        let fragments = facts_provider(&mem_root, Some(project_store), None).fragments(
+        let fragments = facts_provider(&mem_root, Some(project_store), None)?.fragments(
             &TurnInputContext::default(),
             time::OffsetDateTime::UNIX_EPOCH,
             jiff::Timestamp::UNIX_EPOCH,
@@ -1229,15 +1292,22 @@ mod tests {
         let pitfall = fragments
             .iter()
             .find(|f| f.section.as_str() == SECTION_FACT_PITFALL)
-            .expect("pitfall fragment present even without keyword match");
+            .ok_or(TestError::Missing(
+                "pitfall fragment present even without keyword match",
+            ))?;
         assert!(pitfall.body.contains("Bekannte Fallstricke"));
         assert!(pitfall.body.contains("- Popup darf Enter nie schlucken."));
 
         let _ = std::fs::remove_dir_all(&mem_root);
         let _ = std::fs::remove_dir_all(&project_root);
+        Ok(())
     }
 
-    fn make_file_knowledge(path: &str, summary: &str, symbols: Vec<String>) -> crate::file_index::FileKnowledge {
+    fn make_file_knowledge(
+        path: &str,
+        summary: &str,
+        symbols: Vec<String>,
+    ) -> crate::file_index::FileKnowledge {
         crate::file_index::FileKnowledge {
             path: path.to_owned(),
             size_bytes: 42,
@@ -1252,21 +1322,21 @@ mod tests {
     }
 
     #[test]
-    fn test_file_index_hit_appears_when_keyword_matches_symbol() {
-        let mem_root = tmp_root("fidx-mem");
-        let index_root = tmp_root("fidx-index");
+    fn test_file_index_hit_appears_when_keyword_matches_symbol() -> TestResult {
+        let mem_root = tmp_root("fidx-mem")?;
+        let index_root = tmp_root("fidx-index")?;
 
         let index = crate::file_index::FileKnowledgeIndex::open(&index_root)
-            .expect("open file knowledge index");
+            .map_err(ctx("open file knowledge index"))?;
         index
             .upsert(make_file_knowledge(
                 "src/zeppelin.rs",
                 "Zeppelin-Hilfsfunktionen",
                 vec!["zeppelin_helper".to_owned()],
             ))
-            .expect("upsert file knowledge");
+            .map_err(ctx("upsert file knowledge"))?;
 
-        let store = Arc::new(FileMemoryStore::open(&mem_root).expect("open memory store"));
+        let store = Arc::new(FileMemoryStore::open(&mem_root).map_err(ctx("open memory store"))?);
         let stm = ShortTermMemory::new("session-1", 32, 2_048);
         stm.push(StmRole::User, 80, "Erzähl mir etwas über zeppelin");
         let provider = MemoryContextProvider::new(store, stm, ContextPolicy::Balanced)
@@ -1281,21 +1351,24 @@ mod tests {
         let file_hit = fragments
             .iter()
             .find(|f| f.section.as_str() == SECTION_FILE_INDEX)
-            .expect("file-index fragment present when a keyword matches a symbol");
+            .ok_or(TestError::Missing(
+                "file-index fragment present when a keyword matches a symbol",
+            ))?;
         assert!(file_hit.body.contains("Bekannte Dateien (bereits gelesen)"));
         assert!(file_hit.body.contains("src/zeppelin.rs"));
 
         let _ = std::fs::remove_dir_all(&mem_root);
         let _ = std::fs::remove_dir_all(&index_root);
+        Ok(())
     }
 
     #[test]
-    fn test_file_index_section_is_truncated_by_a_tiny_budget_without_panicking() {
-        let mem_root = tmp_root("fidx-budget-mem");
-        let index_root = tmp_root("fidx-budget-index");
+    fn test_file_index_section_is_truncated_by_a_tiny_budget_without_panicking() -> TestResult {
+        let mem_root = tmp_root("fidx-budget-mem")?;
+        let index_root = tmp_root("fidx-budget-index")?;
 
         let index = crate::file_index::FileKnowledgeIndex::open(&index_root)
-            .expect("open file knowledge index");
+            .map_err(ctx("open file knowledge index"))?;
         for i in 0..5 {
             index
                 .upsert(make_file_knowledge(
@@ -1303,10 +1376,10 @@ mod tests {
                     "Ein langer Beschreibungstext über Zeppeline und ihre Geschichte in der Luftfahrt, damit die Zeile teuer wird.",
                     vec!["zeppelin_helper".to_owned()],
                 ))
-                .expect("upsert file knowledge");
+                .map_err(ctx("upsert file knowledge"))?;
         }
 
-        let store = Arc::new(FileMemoryStore::open(&mem_root).expect("open memory store"));
+        let store = Arc::new(FileMemoryStore::open(&mem_root).map_err(ctx("open memory store"))?);
         let stm = ShortTermMemory::new("session-1", 32, 2_048);
         stm.push(StmRole::User, 80, "Erzähl mir etwas über zeppelin");
         let provider = MemoryContextProvider::new(store, stm, ContextPolicy::Balanced)
@@ -1327,8 +1400,15 @@ mod tests {
             file_hit_count <= 1,
             "ein winziges Budget darf höchstens ein Dateiwissen-Fragment (oder keins) zulassen"
         );
-        if let Some(hit) = fragments.iter().find(|f| f.section.as_str() == SECTION_FILE_INDEX) {
-            let line_count = hit.body.lines().filter(|l| l.starts_with("- src/zeppelin")).count();
+        if let Some(hit) = fragments
+            .iter()
+            .find(|f| f.section.as_str() == SECTION_FILE_INDEX)
+        {
+            let line_count = hit
+                .body
+                .lines()
+                .filter(|l| l.starts_with("- src/zeppelin"))
+                .count();
             assert!(
                 line_count < 5,
                 "ein Budget von 1 Token darf nicht alle 5 Dateizeilen zulassen, got {line_count}"
@@ -1337,15 +1417,17 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&mem_root);
         let _ = std::fs::remove_dir_all(&index_root);
+        Ok(())
     }
 
     #[test]
-    fn test_delivered_fact_usage_counter_increments() {
-        let mem_root = tmp_root("usage-mem");
-        let project_root = tmp_root("usage-project");
+    fn test_delivered_fact_usage_counter_increments() -> TestResult {
+        let mem_root = tmp_root("usage-mem")?;
+        let project_root = tmp_root("usage-project")?;
 
-        let project_store =
-            Arc::new(FactStore::open(&project_root, FactScope::Project).expect("open project"));
+        let project_store = Arc::new(
+            FactStore::open(&project_root, FactScope::Project).map_err(ctx("open project"))?,
+        );
         project_store
             .write(&make_fact(
                 "usage-pref",
@@ -1353,10 +1435,10 @@ mod tests {
                 FactScope::Project,
                 "Präferenz",
             ))
-            .expect("write preference");
+            .map_err(ctx("write preference"))?;
         assert!(project_store.usage("usage-pref").is_none());
 
-        let fragments = facts_provider(&mem_root, Some(Arc::clone(&project_store)), None)
+        let fragments = facts_provider(&mem_root, Some(Arc::clone(&project_store)), None)?
             .fragments(
                 &TurnInputContext::default(),
                 time::OffsetDateTime::UNIX_EPOCH,
@@ -1370,10 +1452,11 @@ mod tests {
 
         let (count, _) = project_store
             .usage("usage-pref")
-            .expect("usage recorded after delivery");
+            .ok_or(TestError::Missing("usage recorded after delivery"))?;
         assert_eq!(count, 1);
 
         let _ = std::fs::remove_dir_all(&mem_root);
         let _ = std::fs::remove_dir_all(&project_root);
+        Ok(())
     }
 }

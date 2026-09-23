@@ -108,7 +108,12 @@ fn expand_struct(input: &DeriveInput, data: &DataStruct) -> syn::Result<proc_mac
         let name = field
             .ident
             .as_ref()
-            .expect("benanntes Feld hat immer einen Bezeichner")
+            .ok_or_else(|| {
+                syn::Error::new_spanned(
+                    field,
+                    "derive(OpArgs) erfordert einen Bezeichner für jedes Feld",
+                )
+            })?
             .to_string();
         let default = field_default(field)?;
         let description = doc_string(&field.attrs);
@@ -187,10 +192,12 @@ fn expand_enum(input: &DeriveInput, data: &DataEnum) -> syn::Result<proc_macro2:
         let mut field_summaries: Vec<String> = Vec::with_capacity(fields.len());
 
         for field in fields {
-            let field_ident = field
-                .ident
-                .as_ref()
-                .expect("benanntes Feld hat immer einen Bezeichner");
+            let field_ident = field.ident.as_ref().ok_or_else(|| {
+                syn::Error::new_spanned(
+                    field,
+                    "derive(OpArgs) erfordert einen Bezeichner für jedes Feld",
+                )
+            })?;
             let name = field_ident.to_string();
 
             if name == ACTION_PROPERTY {
@@ -289,9 +296,8 @@ fn validate_subcommand_marker(attrs: &[syn::Attribute]) -> syn::Result<()> {
             if meta.path.is_ident("subcommand") {
                 Ok(())
             } else {
-                Err(meta.error(
-                    "unbekannter `raw`-Schlüssel auf Enum-Ebene; erwartet: `subcommand`",
-                ))
+                Err(meta
+                    .error("unbekannter `raw`-Schlüssel auf Enum-Ebene; erwartet: `subcommand`"))
             }
         })?;
     }
@@ -393,23 +399,24 @@ fn kebab_case(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{expand_op_args, json_type_name, kebab_case, variant_summary_line};
+    use crate::test_support::{TestError, TestResult, ctx};
     use syn::DeriveInput;
 
-    fn expand(input: DeriveInput) -> String {
-        expand_op_args(&input)
-            .expect("unterstützter Argument-Typ muss expandieren")
-            .to_string()
+    fn expand(input: DeriveInput) -> TestResult<String> {
+        Ok(expand_op_args(&input)
+            .map_err(ctx("unterstützter Argument-Typ muss expandieren"))?
+            .to_string())
     }
 
     // ── Struct-Pfad ───────────────────────────────────────────────────────────
 
     #[test]
-    fn test_expand_op_args_struct_emits_op_args_schema_impl() {
+    fn test_expand_op_args_struct_emits_op_args_schema_impl() -> TestResult {
         let expanded = expand(syn::parse_quote! {
             struct StopArgs {
                 job_id: String,
             }
-        });
+        })?;
 
         assert!(
             expanded.contains("impl :: harw_operations :: OpArgsSchema for StopArgs"),
@@ -417,188 +424,218 @@ mod tests {
         );
         assert!(expanded.contains("fn json_schema () -> :: harw_tools :: JsonSchema"));
         assert!(expanded.contains(":: harw_operations :: op_schema :: object_schema"));
+        Ok(())
     }
 
     #[test]
-    fn test_expand_op_args_struct_field_becomes_property() {
+    fn test_expand_op_args_struct_field_becomes_property() -> TestResult {
         let expanded = expand(syn::parse_quote! {
             struct DiffArgs {
                 path: String,
                 stat_only: bool,
             }
-        });
+        })?;
 
-        assert!(expanded.contains("(\"path\" ,"), "erzeugt wurde: {expanded}");
+        assert!(
+            expanded.contains("(\"path\" ,"),
+            "erzeugt wurde: {expanded}"
+        );
         assert!(expanded.contains("(\"stat_only\" ,"));
         assert!(expanded.contains(":: harw_tools :: JsonSchemaType :: String"));
         assert!(expanded.contains(":: harw_tools :: JsonSchemaType :: Boolean"));
+        Ok(())
     }
 
     #[test]
-    fn test_expand_op_args_struct_non_option_field_is_required() {
+    fn test_expand_op_args_struct_non_option_field_is_required() -> TestResult {
         let expanded = expand(syn::parse_quote! {
             struct StopArgs {
                 job_id: String,
             }
-        });
+        })?;
 
         assert!(
             expanded.contains("& [\"job_id\"]"),
             "erzeugt wurde: {expanded}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_expand_op_args_struct_option_field_is_not_required() {
+    fn test_expand_op_args_struct_option_field_is_not_required() -> TestResult {
         let expanded = expand(syn::parse_quote! {
             struct PsArgs {
                 status: Option<String>,
             }
-        });
+        })?;
 
-        assert!(expanded.contains("(\"status\" ,"), "erzeugt wurde: {expanded}");
+        assert!(
+            expanded.contains("(\"status\" ,"),
+            "erzeugt wurde: {expanded}"
+        );
         assert!(
             expanded.contains("& []"),
             "Option-Felder dürfen nicht in `required` landen: {expanded}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_expand_op_args_struct_default_field_is_not_required() {
+    fn test_expand_op_args_struct_default_field_is_not_required() -> TestResult {
         let expanded = expand(syn::parse_quote! {
             struct SearchArgs {
                 #[tool(default = 25)]
                 page_size: u8,
             }
-        });
+        })?;
 
         assert!(
             expanded.contains("& []"),
             "Felder mit Default sind nicht erforderlich: {expanded}"
         );
         assert!(expanded.contains(":: harw_tools :: serde_json :: json ! (25)"));
+        Ok(())
     }
 
     #[test]
-    fn test_expand_op_args_struct_doc_comment_becomes_description() {
+    fn test_expand_op_args_struct_doc_comment_becomes_description() -> TestResult {
         let expanded = expand(syn::parse_quote! {
             struct DiffArgs {
                 /// Pfad relativ zum Workspace.
                 path: Option<String>,
             }
-        });
+        })?;
 
         assert!(
             expanded.contains("\"Pfad relativ zum Workspace.\""),
             "erzeugt wurde: {expanded}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_expand_op_args_struct_vec_field_becomes_array() {
+    fn test_expand_op_args_struct_vec_field_becomes_array() -> TestResult {
         let expanded = expand(syn::parse_quote! {
             struct ExploreArgs {
                 paths: Vec<String>,
             }
-        });
+        })?;
 
         assert!(
             expanded.contains(":: harw_tools :: JsonSchemaType :: Array"),
             "erzeugt wurde: {expanded}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_expand_op_args_tuple_struct_is_rejected() {
+    fn test_expand_op_args_tuple_struct_is_rejected() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             struct StopArgs(String);
         };
 
-        let error = expand_op_args(&input).expect_err("Tupel-Structs müssen abgewiesen werden");
+        let Err(error) = expand_op_args(&input) else {
+            return Err(TestError::Unexpected(
+                "Tupel-Structs müssen abgewiesen werden".to_owned(),
+            ));
+        };
         assert!(error.to_string().contains("benannte Felder"));
+        Ok(())
     }
 
     #[test]
-    fn test_expand_op_args_unit_struct_is_rejected() {
+    fn test_expand_op_args_unit_struct_is_rejected() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             struct StatusArgs;
         };
 
-        let error = expand_op_args(&input).expect_err("Unit-Structs müssen abgewiesen werden");
+        let Err(error) = expand_op_args(&input) else {
+            return Err(TestError::Unexpected(
+                "Unit-Structs müssen abgewiesen werden".to_owned(),
+            ));
+        };
         assert!(error.to_string().contains("benannte Felder"));
+        Ok(())
     }
 
     #[test]
-    fn test_expand_op_args_unsupported_field_type_is_rejected() {
+    fn test_expand_op_args_unsupported_field_type_is_rejected() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             struct WeirdArgs {
                 handle: std::net::TcpStream,
             }
         };
 
-        let error =
-            expand_op_args(&input).expect_err("nicht unterstützte Feldtypen müssen scheitern");
+        let Err(error) = expand_op_args(&input) else {
+            return Err(TestError::Unexpected(
+                "nicht unterstützte Feldtypen müssen scheitern".to_owned(),
+            ));
+        };
         assert!(error.to_string().contains("unsupported tool field type"));
+        Ok(())
     }
 
     // ── Enum-Pfad ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_expand_op_args_enum_emits_action_enum_list() {
+    fn test_expand_op_args_enum_emits_action_enum_list() -> TestResult {
         let expanded = expand(syn::parse_quote! {
             #[raw(subcommand)]
             enum PlanArgs {
                 Show,
                 ResearchDeps,
             }
-        });
+        })?;
 
         assert!(
             expanded.contains(":: harw_operations :: op_schema :: enum_string_schema"),
             "erzeugt wurde: {expanded}"
         );
         assert!(expanded.contains("& [\"show\" , \"research-deps\"]"));
+        Ok(())
     }
 
     #[test]
-    fn test_expand_op_args_enum_action_is_the_only_required_property() {
+    fn test_expand_op_args_enum_action_is_the_only_required_property() -> TestResult {
         let expanded = expand(syn::parse_quote! {
             #[raw(subcommand)]
             enum PlanArgs {
                 Show { id: String },
             }
-        });
+        })?;
 
         assert!(
             expanded.contains("& [\"action\"]"),
             "nur `action` darf erforderlich sein: {expanded}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_expand_op_args_enum_unions_variant_fields_as_properties() {
+    fn test_expand_op_args_enum_unions_variant_fields_as_properties() -> TestResult {
         let expanded = expand(syn::parse_quote! {
             #[raw(subcommand)]
             enum PlanArgs {
                 Show { id: String },
                 Add { title: String, depth: Option<u8> },
             }
-        });
+        })?;
 
         assert!(expanded.contains("(\"id\" ,"), "erzeugt wurde: {expanded}");
         assert!(expanded.contains("(\"title\" ,"));
         assert!(expanded.contains("(\"depth\" ,"));
+        Ok(())
     }
 
     #[test]
-    fn test_expand_op_args_enum_uses_described_object_schema() {
+    fn test_expand_op_args_enum_uses_described_object_schema() -> TestResult {
         let expanded = expand(syn::parse_quote! {
             #[raw(subcommand)]
             enum PlanArgs {
                 /// Zeigt den Plan.
                 Show { id: String },
             }
-        });
+        })?;
 
         assert!(
             expanded.contains(":: harw_operations :: op_schema :: described_object_schema"),
@@ -606,10 +643,11 @@ mod tests {
         );
         assert!(expanded.contains("Zeigt den Plan."));
         assert!(expanded.contains("`id` (string, erforderlich)"));
+        Ok(())
     }
 
     #[test]
-    fn test_expand_op_args_enum_duplicate_field_keeps_first_description() {
+    fn test_expand_op_args_enum_duplicate_field_keeps_first_description() -> TestResult {
         let expanded = expand(syn::parse_quote! {
             #[raw(subcommand)]
             enum PlanArgs {
@@ -622,7 +660,7 @@ mod tests {
                     id: String,
                 },
             }
-        });
+        })?;
 
         assert!(
             expanded.contains("Erste Beschreibung."),
@@ -632,23 +670,25 @@ mod tests {
             !expanded.contains("Zweite Beschreibung."),
             "die erste Variante bestimmt die Property-Beschreibung: {expanded}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_expand_op_args_enum_optional_and_required_same_field_is_accepted() {
+    fn test_expand_op_args_enum_optional_and_required_same_field_is_accepted() -> TestResult {
         let expanded = expand(syn::parse_quote! {
             #[raw(subcommand)]
             enum PlanArgs {
                 Show { id: String },
                 List { id: Option<String> },
             }
-        });
+        })?;
 
         assert!(expanded.contains("(\"id\" ,"), "erzeugt wurde: {expanded}");
+        Ok(())
     }
 
     #[test]
-    fn test_expand_op_args_enum_conflicting_field_types_are_rejected() {
+    fn test_expand_op_args_enum_conflicting_field_types_are_rejected() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[raw(subcommand)]
             enum PlanArgs {
@@ -657,12 +697,17 @@ mod tests {
             }
         };
 
-        let error = expand_op_args(&input).expect_err("Typkonflikte müssen scheitern");
+        let Err(error) = expand_op_args(&input) else {
+            return Err(TestError::Unexpected(
+                "Typkonflikte müssen scheitern".to_owned(),
+            ));
+        };
         assert!(error.to_string().contains("unterschiedliche Typen"));
+        Ok(())
     }
 
     #[test]
-    fn test_expand_op_args_enum_tuple_variant_is_rejected() {
+    fn test_expand_op_args_enum_tuple_variant_is_rejected() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[raw(subcommand)]
             enum PlanArgs {
@@ -670,12 +715,17 @@ mod tests {
             }
         };
 
-        let error = expand_op_args(&input).expect_err("Tupel-Varianten müssen scheitern");
+        let Err(error) = expand_op_args(&input) else {
+            return Err(TestError::Unexpected(
+                "Tupel-Varianten müssen scheitern".to_owned(),
+            ));
+        };
         assert!(error.to_string().contains("Tupelfelder"));
+        Ok(())
     }
 
     #[test]
-    fn test_expand_op_args_enum_reserved_action_field_is_rejected() {
+    fn test_expand_op_args_enum_reserved_action_field_is_rejected() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[raw(subcommand)]
             enum PlanArgs {
@@ -683,23 +733,31 @@ mod tests {
             }
         };
 
-        let error = expand_op_args(&input).expect_err("`action` ist reserviert");
+        let Err(error) = expand_op_args(&input) else {
+            return Err(TestError::Unexpected("`action` ist reserviert".to_owned()));
+        };
         assert!(error.to_string().contains("reserviert"));
+        Ok(())
     }
 
     #[test]
-    fn test_expand_op_args_enum_without_variants_is_rejected() {
+    fn test_expand_op_args_enum_without_variants_is_rejected() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[raw(subcommand)]
             enum PlanArgs {}
         };
 
-        let error = expand_op_args(&input).expect_err("leere Enums müssen scheitern");
+        let Err(error) = expand_op_args(&input) else {
+            return Err(TestError::Unexpected(
+                "leere Enums müssen scheitern".to_owned(),
+            ));
+        };
         assert!(error.to_string().contains("mindestens eine Enum-Variante"));
+        Ok(())
     }
 
     #[test]
-    fn test_expand_op_args_enum_unknown_raw_key_is_rejected() {
+    fn test_expand_op_args_enum_unknown_raw_key_is_rejected() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             #[raw(positional)]
             enum PlanArgs {
@@ -707,34 +765,43 @@ mod tests {
             }
         };
 
-        let error = expand_op_args(&input).expect_err("unbekannte raw-Schlüssel müssen scheitern");
+        let Err(error) = expand_op_args(&input) else {
+            return Err(TestError::Unexpected(
+                "unbekannte raw-Schlüssel müssen scheitern".to_owned(),
+            ));
+        };
         assert!(error.to_string().contains("subcommand"));
+        Ok(())
     }
 
     #[test]
-    fn test_expand_op_args_enum_without_raw_marker_still_expands() {
+    fn test_expand_op_args_enum_without_raw_marker_still_expands() -> TestResult {
         let expanded = expand(syn::parse_quote! {
             enum PlanArgs {
                 Show,
             }
-        });
+        })?;
 
         assert!(
             expanded.contains("& [\"action\"]"),
             "erzeugt wurde: {expanded}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_expand_op_args_union_is_rejected() {
+    fn test_expand_op_args_union_is_rejected() -> TestResult {
         let input: DeriveInput = syn::parse_quote! {
             union Weird {
                 a: u32,
             }
         };
 
-        let error = expand_op_args(&input).expect_err("unions müssen scheitern");
+        let Err(error) = expand_op_args(&input) else {
+            return Err(TestError::Unexpected("unions müssen scheitern".to_owned()));
+        };
         assert!(error.to_string().contains("union"));
+        Ok(())
     }
 
     // ── Reine Hilfsfunktionen ─────────────────────────────────────────────────
@@ -787,7 +854,8 @@ mod tests {
 
     #[test]
     fn test_variant_summary_line_with_fields_and_without_doc() {
-        let line = variant_summary_line("add", None, &["`title` (string, erforderlich)".to_owned()]);
+        let line =
+            variant_summary_line("add", None, &["`title` (string, erforderlich)".to_owned()]);
 
         assert_eq!(line, "- `add` Felder: `title` (string, erforderlich).");
     }

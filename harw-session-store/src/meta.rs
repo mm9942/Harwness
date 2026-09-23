@@ -25,6 +25,18 @@
 //! Payload nur als `serde_json::Value`, wie es die Modul-Doku von
 //! [`crate::record`] vorschreibt).
 //!
+//! ## Selbstheilung eines leeren `first_user_message`
+//! Existiert bereits ein Sidecar, dessen `first_user_message` `None` ist —
+//! etwa weil er für eine damals noch leere Session geschrieben wurde, bevor
+//! die erste Nutzernachricht im Transcript eintraf —, rescannt
+//! [`load_or_derive`] das Transcript erneut nur für diesen einen Wert und
+//! speichert ihn nach, sobald er gefunden wird; `created_at` und alle
+//! anderen Felder bleiben dabei unangetastet. [`peek`] leistet dieselbe
+//! Ableitung/Selbstheilung rein lesend, ohne je zu speichern — für Aufrufer,
+//! die nur einen Anzeigewert brauchen und keinen halbleeren Sidecar
+//! einfrieren wollen (siehe
+//! `harw-tui/src/app.rs::apply_session_store_started_at`).
+//!
 //! ## Zählweise von `turns`
 //! Kein aktueller Schreiber in diesem Repository erzeugt
 //! `RecordKind::Turn`-Datensätze mit einer unterscheidbaren
@@ -251,7 +263,8 @@ pub fn load(root: &Path, id: &SessionId) -> SessionStoreResult<Option<SessionMet
         Err(error) => return Err(SessionStoreError::Io(error)),
     };
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(SessionStoreError::Io)?;
+    file.read_to_end(&mut bytes)
+        .map_err(SessionStoreError::Io)?;
     match serde_json::from_slice::<SessionMeta>(&bytes) {
         Ok(meta) => Ok(Some(meta)),
         Err(error) => {
@@ -293,16 +306,27 @@ pub fn save(root: &Path, meta: &SessionMeta) -> SessionStoreResult<()> {
 /// Liefert den Sidecar einer Session, oder leitet ihn aus dem Transcript ab.
 ///
 /// # Description
-/// Existiert ein gültiger Sidecar (siehe [`load`]), wird er unverändert
-/// zurückgegeben. Sonst wird das Transcript sequenziell gelesen: `created_at`
-/// kommt vom ersten Datensatz, `last_opened_at` vom letzten (fehlt jeder
-/// Datensatz — leeres oder fehlendes Transcript — fällt beides auf die
-/// Datei-`mtime`, sonst auf `Timestamp::now()` zurück), `first_user_message`
-/// vom ersten `RecordKind::Item`-Datensatz vom Typ `"user_message"`
-/// (gekürzt, siehe Modul-Doku), und `turns` zählt `RecordKind::Turn`-Datensätze
-/// (Zählweise siehe Modul-Doku). Das Ergebnis wird anschließend best-effort
-/// gespeichert ([`save`]-Fehler werden nur mit `tracing::warn!` gemeldet,
-/// nie propagiert), damit der nächste Aufruf den Sidecar direkt liest.
+/// Existiert ein gültiger Sidecar (siehe [`load`]) mit gesetztem
+/// `first_user_message`, wird er unverändert zurückgegeben. Existiert ein
+/// gültiger Sidecar mit `first_user_message: None` (siehe Modul-Doku
+/// „Selbstheilung eines leeren `first_user_message`"), wird das Transcript
+/// erneut über [`first_user_message_from_transcript`] nach dieser einen
+/// Nachricht durchsucht; wird sie jetzt gefunden, wird nur dieses Feld
+/// gesetzt, der gepatchte Sidecar gespeichert ([`save`]-Fehler werden nur mit
+/// `tracing::warn!` gemeldet, nie propagiert) und zurückgegeben — alle
+/// anderen Felder (insbesondere `created_at`) bleiben unverändert. Bleibt sie
+/// weiterhin `None`, wird der geladene Sidecar unverändert und ungespeichert
+/// zurückgegeben.
+///
+/// Existiert gar kein Sidecar, wird das Transcript sequenziell gelesen:
+/// `created_at` kommt vom ersten Datensatz, `last_opened_at` vom letzten
+/// (fehlt jeder Datensatz — leeres oder fehlendes Transcript — fällt beides
+/// auf die Datei-`mtime`, sonst auf `Timestamp::now()` zurück),
+/// `first_user_message` vom ersten `RecordKind::Item`-Datensatz vom Typ
+/// `"user_message"` (gekürzt, siehe Modul-Doku), und `turns` zählt
+/// `RecordKind::Turn`-Datensätze (Zählweise siehe Modul-Doku). Das Ergebnis
+/// wird anschließend best-effort gespeichert, damit der nächste Aufruf den
+/// Sidecar direkt liest.
 ///
 /// # Errors
 /// - [`SessionStoreError::UnsafeTranscriptPath`]: `id` ist keine gültige
@@ -310,7 +334,19 @@ pub fn save(root: &Path, meta: &SessionMeta) -> SessionStoreResult<()> {
 /// - [`SessionStoreError::CorruptRecord`], [`SessionStoreError::Io`]: das
 ///   Transcript selbst ist nicht lesbar (defekter Datensatz, Symlink, …).
 pub fn load_or_derive(root: &Path, id: &SessionId) -> SessionStoreResult<SessionMeta> {
-    if let Some(meta) = load(root, id)? {
+    if let Some(mut meta) = load(root, id)? {
+        if meta.first_user_message.is_none() {
+            if let Some(text) = first_user_message_from_transcript(root, id)? {
+                meta.first_user_message = Some(text);
+                if let Err(error) = save(root, &meta) {
+                    tracing::warn!(
+                        session = %id,
+                        error = %error,
+                        "failed to persist self-healed session meta sidecar; continuing without it"
+                    );
+                }
+            }
+        }
         return Ok(meta);
     }
     let derived = derive_from_transcript(root, id)?;
@@ -322,6 +358,35 @@ pub fn load_or_derive(root: &Path, id: &SessionId) -> SessionStoreResult<Session
         );
     }
     Ok(derived)
+}
+
+/// Wie [`load_or_derive`] (inklusive der dort dokumentierten Selbstheilung
+/// eines leeren `first_user_message`), speichert aber nie — weder den
+/// Selbstheilungs-Patch noch einen frisch abgeleiteten Sidecar.
+///
+/// # Description
+/// Für Aufrufer, die nur einen Anzeigewert brauchen (z. B.
+/// `harw-tui/src/app.rs::apply_session_store_started_at` beim TUI-Start) und
+/// deshalb keinen Sidecar für eine Session schreiben dürfen, deren Transcript
+/// zum Aufrufzeitpunkt noch leer sein kann — sonst würde ein späterer,
+/// ehrlicher Schreiber (z. B. [`load_or_derive`] selbst) diesen Sidecar nie
+/// wieder als „noch abzuleiten" erkennen und `first_user_message` bliebe für
+/// die gesamte Session dauerhaft `None` (siehe Modul-Doku).
+///
+/// # Errors
+/// Wie [`load_or_derive`], abzüglich möglicher Schreibfehler — diese Funktion
+/// schreibt nie, kann also auch keinen [`SessionStoreError`] daraus
+/// zurückgeben.
+pub fn peek(root: &Path, id: &SessionId) -> SessionStoreResult<SessionMeta> {
+    if let Some(mut meta) = load(root, id)? {
+        if meta.first_user_message.is_none() {
+            if let Some(text) = first_user_message_from_transcript(root, id)? {
+                meta.first_user_message = Some(text);
+            }
+        }
+        return Ok(meta);
+    }
+    derive_from_transcript(root, id)
 }
 
 // Kern von `load_or_derive`, wenn kein gültiger Sidecar existiert.
@@ -340,7 +405,6 @@ fn derive_from_transcript(root: &Path, id: &SessionId) -> SessionStoreResult<Ses
 
     let mut created_at: Option<Timestamp> = None;
     let mut last_recorded_at: Option<Timestamp> = None;
-    let mut first_user_message: Option<String> = None;
     let mut turns: u64 = 0;
 
     for record in reader {
@@ -350,15 +414,12 @@ fn derive_from_transcript(root: &Path, id: &SessionId) -> SessionStoreResult<Ses
         }
         last_recorded_at = Some(record.recorded_at);
 
-        if first_user_message.is_none() && record.kind == RecordKind::Item {
-            if let Some(text) = extract_user_message_text(&record.payload) {
-                first_user_message = Some(truncate_chars(&text, MAX_FIRST_USER_MESSAGE_CHARS));
-            }
-        }
         if record.kind == RecordKind::Turn && counts_as_completed_turn(&record.payload) {
             turns += 1;
         }
     }
+
+    let first_user_message = first_user_message_from_transcript(root, id)?;
 
     let fallback_time = || mtime_or(&transcript_path, now);
     let created_at = created_at.unwrap_or_else(fallback_time);
@@ -380,6 +441,36 @@ fn derive_from_transcript(root: &Path, id: &SessionId) -> SessionStoreResult<Ses
         total_usage: harw_types::TokenUsage::default(),
         drift_events: BTreeMap::new(),
     })
+}
+
+// Sucht im Transcript unabhängig vom Sidecar-Zustand nach der ersten
+// Nutzernachricht: der erste `RecordKind::Item`-Datensatz vom Typ
+// `"user_message"`, zeichensicher gekürzt (siehe Modul-Doku). Kern der
+// Extraktion in [`derive_from_transcript`] (dort einmalig aufgerufen), aber
+// auch von [`load_or_derive`]/[`peek`] für die Selbstheilung eines
+// bestehenden Sidecars mit `first_user_message: None` genutzt (siehe
+// Modul-Doku „Selbstheilung eines leeren `first_user_message`"). Fehlt das
+// Transcript ganz, liefert das `Ok(None)` statt eines Fehlers — derselbe
+// Best-Effort-Umgang wie beim Rest dieses Moduls.
+fn first_user_message_from_transcript(
+    root: &Path,
+    id: &SessionId,
+) -> SessionStoreResult<Option<String>> {
+    let store = TranscriptStore::new(root);
+    let reader = match store.reader(id) {
+        Ok(reader) => reader,
+        Err(SessionStoreError::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    for record in reader {
+        let record = record?;
+        if record.kind == RecordKind::Item {
+            if let Some(text) = extract_user_message_text(&record.payload) {
+                return Ok(Some(truncate_chars(&text, MAX_FIRST_USER_MESSAGE_CHARS)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 // Extrahiert den zusammengefügten Text aller Textteile eines
@@ -437,7 +528,11 @@ fn mtime_or(path: &Path, fallback: Timestamp) -> Timestamp {
 ///
 /// # Errors
 /// Wie [`load_or_derive`] und [`save`].
-pub fn touch_opened(root: &Path, id: &SessionId, now: Timestamp) -> SessionStoreResult<SessionMeta> {
+pub fn touch_opened(
+    root: &Path,
+    id: &SessionId,
+    now: Timestamp,
+) -> SessionStoreResult<SessionMeta> {
     let mut meta = load_or_derive(root, id)?;
     meta.last_opened_at = now;
     save(root, &meta)?;
@@ -461,7 +556,10 @@ pub fn set_title(
     source: TitleSource,
 ) -> SessionStoreResult<SessionMeta> {
     let mut meta = load_or_derive(root, id)?;
-    meta.title = Some(truncate_chars(&normalize_whitespace(title), MAX_TITLE_CHARS));
+    meta.title = Some(truncate_chars(
+        &normalize_whitespace(title),
+        MAX_TITLE_CHARS,
+    ));
     meta.title_source = source;
     save(root, &meta)?;
     Ok(meta)
@@ -583,6 +681,7 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_types::ThreadRef;
 
     use crate::record::TranscriptRecord;
@@ -596,8 +695,8 @@ mod tests {
     }
 
     #[test]
-    fn save_and_load_round_trip() {
-        let temp = tempfile::tempdir().unwrap();
+    fn save_and_load_round_trip() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let session = SessionId::from_str("session-a");
         let meta = SessionMeta {
             version: SESSION_META_VERSION,
@@ -622,72 +721,70 @@ mod tests {
             drift_events: BTreeMap::from([("repeated_failing_call".to_owned(), 2)]),
         };
 
-        save(temp.path(), &meta).unwrap();
-        let loaded = load(temp.path(), &session).unwrap();
+        save(temp.path(), &meta)?;
+        let loaded = load(temp.path(), &session)?;
 
         assert_eq!(loaded, Some(meta));
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn save_writes_a_private_file_mode() {
+    fn save_writes_a_private_file_mode() -> TestResult {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir()?;
         let session = SessionId::from_str("session-a");
         let meta = SessionMeta::fresh(session.clone(), Timestamp::now());
 
-        save(temp.path(), &meta).unwrap();
+        save(temp.path(), &meta)?;
 
-        let mode = std::fs::metadata(meta_path(temp.path(), &session))
-            .unwrap()
+        let mode = std::fs::metadata(meta_path(temp.path(), &session))?
             .permissions()
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+        Ok(())
     }
 
     #[test]
-    fn load_missing_sidecar_returns_none() {
-        let temp = tempfile::tempdir().unwrap();
+    fn load_missing_sidecar_returns_none() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let session = SessionId::from_str("session-a");
 
-        assert_eq!(load(temp.path(), &session).unwrap(), None);
+        assert_eq!(load(temp.path(), &session)?, None);
+        Ok(())
     }
 
     #[test]
-    fn load_or_derive_extracts_first_user_message_and_persists_sidecar() {
-        let temp = tempfile::tempdir().unwrap();
+    fn load_or_derive_extracts_first_user_message_and_persists_sidecar() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = TranscriptStore::new(temp.path());
         let session = SessionId::from_str("session-a");
         let thread = ThreadRef::from_str("root");
-        store
-            .append(&TranscriptRecord::new(
-                session.clone(),
-                thread.clone(),
-                0,
-                Timestamp::now(),
-                RecordKind::Item,
-                user_message_payload("Hallo Welt, wie geht es dir heute?"),
-            ))
-            .unwrap();
-        store
-            .append(&TranscriptRecord::new(
-                session.clone(),
-                thread,
-                1,
-                Timestamp::now(),
-                RecordKind::Item,
-                serde_json::json!({
-                    "type": "assistant_message",
-                    "id": "item-2",
-                    "content": [{ "type": "text", "text": "Mir geht es gut." }],
-                }),
-            ))
-            .unwrap();
+        store.append(&TranscriptRecord::new(
+            session.clone(),
+            thread.clone(),
+            0,
+            Timestamp::now(),
+            RecordKind::Item,
+            user_message_payload("Hallo Welt, wie geht es dir heute?"),
+        ))?;
+        store.append(&TranscriptRecord::new(
+            session.clone(),
+            thread,
+            1,
+            Timestamp::now(),
+            RecordKind::Item,
+            serde_json::json!({
+                "type": "assistant_message",
+                "id": "item-2",
+                "content": [{ "type": "text", "text": "Mir geht es gut." }],
+            }),
+        ))?;
 
         assert!(!meta_path(temp.path(), &session).exists());
-        let meta = load_or_derive(temp.path(), &session).unwrap();
+        let meta = load_or_derive(temp.path(), &session)?;
 
         assert_eq!(
             meta.first_user_message.as_deref(),
@@ -700,101 +797,228 @@ mod tests {
             meta_path(temp.path(), &session).exists(),
             "load_or_derive must persist the derived sidecar"
         );
-        assert_eq!(load(temp.path(), &session).unwrap(), Some(meta));
+        assert_eq!(load(temp.path(), &session)?, Some(meta));
+        Ok(())
     }
 
     #[test]
-    fn load_or_derive_without_a_transcript_returns_a_fresh_meta() {
-        let temp = tempfile::tempdir().unwrap();
+    fn load_or_derive_without_a_transcript_returns_a_fresh_meta() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let session = SessionId::from_str("session-a");
 
-        let meta = load_or_derive(temp.path(), &session).unwrap();
+        let meta = load_or_derive(temp.path(), &session)?;
 
         assert_eq!(meta.created_at, meta.last_opened_at);
         assert_eq!(meta.first_user_message, None);
         assert_eq!(meta.turns, 0);
+        Ok(())
     }
 
     #[test]
-    fn load_or_derive_counts_turn_records_respecting_phase_when_present() {
-        let temp = tempfile::tempdir().unwrap();
+    fn load_or_derive_counts_turn_records_respecting_phase_when_present() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let store = TranscriptStore::new(temp.path());
         let session = SessionId::from_str("session-a");
         let thread = ThreadRef::from_str("root");
         // Kein `phase`-Feld: zählt wie die heutige, phasenlose Schreibweise.
-        store
-            .append(&TranscriptRecord::new(
-                session.clone(),
-                thread.clone(),
-                0,
-                Timestamp::now(),
-                RecordKind::Turn,
-                serde_json::json!({ "sequence": 0 }),
-            ))
-            .unwrap();
+        store.append(&TranscriptRecord::new(
+            session.clone(),
+            thread.clone(),
+            0,
+            Timestamp::now(),
+            RecordKind::Turn,
+            serde_json::json!({ "sequence": 0 }),
+        ))?;
         // Started/completed-Paar: nur "completed" zählt, kein Doppelzählen.
-        store
-            .append(&TranscriptRecord::new(
-                session.clone(),
-                thread.clone(),
-                1,
-                Timestamp::now(),
-                RecordKind::Turn,
-                serde_json::json!({ "phase": "started" }),
-            ))
-            .unwrap();
-        store
-            .append(&TranscriptRecord::new(
-                session.clone(),
-                thread,
-                2,
-                Timestamp::now(),
-                RecordKind::Turn,
-                serde_json::json!({ "phase": "completed" }),
-            ))
-            .unwrap();
+        store.append(&TranscriptRecord::new(
+            session.clone(),
+            thread.clone(),
+            1,
+            Timestamp::now(),
+            RecordKind::Turn,
+            serde_json::json!({ "phase": "started" }),
+        ))?;
+        store.append(&TranscriptRecord::new(
+            session.clone(),
+            thread,
+            2,
+            Timestamp::now(),
+            RecordKind::Turn,
+            serde_json::json!({ "phase": "completed" }),
+        ))?;
 
-        let meta = load_or_derive(temp.path(), &session).unwrap();
+        let meta = load_or_derive(temp.path(), &session)?;
 
         assert_eq!(meta.turns, 2);
+        Ok(())
     }
 
     #[test]
-    fn touch_opened_updates_last_opened_at_and_persists() {
-        let temp = tempfile::tempdir().unwrap();
+    fn load_or_derive_self_heals_a_sidecar_whose_transcript_gained_a_user_message() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let session = SessionId::from_str("session-a");
-        let initial = load_or_derive(temp.path(), &session).unwrap();
+        // Reproduces the TUI-startup bug: a sidecar was written for a still
+        // empty session (e.g. via `SessionMeta::fresh`), so
+        // `first_user_message` starts out `None`.
+        let fresh = SessionMeta::fresh(session.clone(), Timestamp::now());
+        save(temp.path(), &fresh)?;
+        assert_eq!(fresh.first_user_message, None);
+
+        // The session then actually starts and the transcript gains its
+        // first user message, but the sidecar on disk still says `None`.
+        let store = TranscriptStore::new(temp.path());
+        let thread = ThreadRef::from_str("root");
+        store.append(&TranscriptRecord::new(
+            session.clone(),
+            thread,
+            0,
+            Timestamp::now(),
+            RecordKind::Item,
+            user_message_payload("Wie geht es dir heute?"),
+        ))?;
+
+        let healed = load_or_derive(temp.path(), &session)?;
+
+        assert_eq!(
+            healed.first_user_message.as_deref(),
+            Some("Wie geht es dir heute?")
+        );
+        // The self-heal must never rewrite unrelated fields, especially not
+        // `created_at`.
+        assert_eq!(healed.created_at, fresh.created_at);
+        assert_eq!(healed.title, None);
+        assert_eq!(healed.title_source, TitleSource::None);
+        // `display_title` now falls back to the recovered first message
+        // instead of the "(ohne Titel)" placeholder.
+        assert_eq!(healed.display_title(), "Wie geht es dir heute?");
+
+        // The healed sidecar was persisted, so the next `load` sees it too.
+        let reloaded = load(temp.path(), &session)?.ok_or(TestError::Missing("reloaded sidecar"))?;
+        assert_eq!(reloaded, healed);
+        Ok(())
+    }
+
+    #[test]
+    fn load_or_derive_leaves_a_sidecar_untouched_while_the_transcript_still_has_no_user_message()
+    -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let session = SessionId::from_str("session-a");
+        let fresh = SessionMeta::fresh(session.clone(), Timestamp::now());
+        save(temp.path(), &fresh)?;
+        let path = meta_path(temp.path(), &session);
+        let mtime_before = std::fs::metadata(&path)?.modified()?;
+
+        // The transcript exists but only carries a non-user-message record.
+        let store = TranscriptStore::new(temp.path());
+        let thread = ThreadRef::from_str("root");
+        store.append(&TranscriptRecord::new(
+            session.clone(),
+            thread,
+            0,
+            Timestamp::now(),
+            RecordKind::Item,
+            serde_json::json!({
+                "type": "assistant_message",
+                "id": "item-1",
+                "content": [{ "type": "text", "text": "Hallo!" }],
+            }),
+        ))?;
+
+        let result = load_or_derive(temp.path(), &session)?;
+
+        assert_eq!(result.first_user_message, None);
+        assert_eq!(result, fresh);
+
+        let mtime_after = std::fs::metadata(&path)?.modified()?;
+        assert_eq!(
+            mtime_before, mtime_after,
+            "load_or_derive must not rewrite the sidecar when nothing new was found"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn peek_never_persists_a_derived_or_self_healed_sidecar() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let session = SessionId::from_str("session-a");
+
+        // No sidecar at all: `peek` derives from the (empty) transcript but
+        // must not write anything.
+        assert!(!meta_path(temp.path(), &session).exists());
+        let derived = peek(temp.path(), &session)?;
+        assert_eq!(derived.first_user_message, None);
+        assert!(
+            !meta_path(temp.path(), &session).exists(),
+            "peek must never persist a derived sidecar"
+        );
+
+        // A sidecar with `first_user_message: None` plus a transcript that
+        // now has a message: `peek` must return the healed value, but still
+        // must not persist it.
+        save(temp.path(), &derived)?;
+        let store = TranscriptStore::new(temp.path());
+        let thread = ThreadRef::from_str("root");
+        store.append(&TranscriptRecord::new(
+            session.clone(),
+            thread,
+            0,
+            Timestamp::now(),
+            RecordKind::Item,
+            user_message_payload("Peek sollte das sehen"),
+        ))?;
+
+        let peeked = peek(temp.path(), &session)?;
+        assert_eq!(
+            peeked.first_user_message.as_deref(),
+            Some("Peek sollte das sehen")
+        );
+
+        let on_disk = load(temp.path(), &session)?.ok_or(TestError::Missing("on_disk sidecar"))?;
+        assert_eq!(
+            on_disk.first_user_message, None,
+            "peek must not persist the self-heal"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn touch_opened_updates_last_opened_at_and_persists() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let session = SessionId::from_str("session-a");
+        let initial = load_or_derive(temp.path(), &session)?;
         let later = initial
             .created_at
             .checked_add(jiff::SignedDuration::from_secs(60))
-            .unwrap();
+            .map_err(ctx("initial.created_at + 60s"))?;
 
-        let touched = touch_opened(temp.path(), &session, later).unwrap();
+        let touched = touch_opened(temp.path(), &session, later)?;
 
         assert_eq!(touched.last_opened_at, later);
         assert_eq!(touched.created_at, initial.created_at);
-        let reloaded = load(temp.path(), &session).unwrap().unwrap();
+        let reloaded = load(temp.path(), &session)?.ok_or(TestError::Missing("reloaded sidecar"))?;
         assert_eq!(reloaded.last_opened_at, later);
+        Ok(())
     }
 
     #[test]
-    fn set_title_normalizes_whitespace_and_enforces_max_length() {
-        let temp = tempfile::tempdir().unwrap();
+    fn set_title_normalizes_whitespace_and_enforces_max_length() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let session = SessionId::from_str("session-a");
         let messy = format!("  Hallo   {}  Welt  ", "x".repeat(90));
 
-        let meta = set_title(temp.path(), &session, &messy, TitleSource::Model).unwrap();
+        let meta = set_title(temp.path(), &session, &messy, TitleSource::Model)?;
 
         assert_eq!(meta.title_source, TitleSource::Model);
-        let title = meta.title.unwrap();
+        let title = meta.title.ok_or(TestError::Missing("meta.title"))?;
         assert!(!title.contains("  "));
         assert!(!title.starts_with(' ') && !title.ends_with(' '));
         assert_eq!(title.chars().count(), MAX_TITLE_CHARS);
+        Ok(())
     }
 
     #[test]
-    fn set_project_updates_and_clears_fields() {
-        let temp = tempfile::tempdir().unwrap();
+    fn set_project_updates_and_clears_fields() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let session = SessionId::from_str("session-a");
         let cwd = PathBuf::from("/home/mia/projects/harwness/sub");
         let root = PathBuf::from("/home/mia/projects/harwness");
@@ -805,20 +1029,20 @@ mod tests {
             Some(cwd.as_path()),
             Some(root.as_path()),
             Some("harwness-abc123"),
-        )
-        .unwrap();
+        )?;
         assert_eq!(meta.cwd.as_deref(), Some(cwd.as_path()));
         assert_eq!(meta.project_root.as_deref(), Some(root.as_path()));
         assert_eq!(meta.project_key.as_deref(), Some("harwness-abc123"));
 
-        let cleared = set_project(temp.path(), &session, None, None, None).unwrap();
+        let cleared = set_project(temp.path(), &session, None, None, None)?;
         assert_eq!(cleared.cwd, None);
         assert_eq!(cleared.project_root, None);
         assert_eq!(cleared.project_key, None);
+        Ok(())
     }
 
     #[test]
-    fn fallback_title_truncates_first_line_char_safely() {
+    fn fallback_title_truncates_first_line_char_safely() -> TestResult {
         let long_line = "x".repeat(90);
         let message = format!("{long_line}\nzweite Zeile wird ignoriert");
 
@@ -826,15 +1050,17 @@ mod tests {
 
         assert_eq!(title.chars().count(), FALLBACK_TITLE_CHARS + 1);
         assert!(title.ends_with(ELLIPSIS));
+        Ok(())
     }
 
     #[test]
-    fn fallback_title_of_blank_message_is_empty() {
+    fn fallback_title_of_blank_message_is_empty() -> TestResult {
         assert_eq!(fallback_title("   \n\t  "), "");
+        Ok(())
     }
 
     #[test]
-    fn display_title_prefers_title_then_fallback_then_placeholder() {
+    fn display_title_prefers_title_then_fallback_then_placeholder() -> TestResult {
         let session = SessionId::from_str("session-a");
         let mut meta = SessionMeta::fresh(session, Timestamp::now());
 
@@ -845,55 +1071,52 @@ mod tests {
 
         meta.title = Some("Eigener Titel".to_owned());
         assert_eq!(meta.display_title(), "Eigener Titel");
+        Ok(())
     }
 
     #[test]
-    fn malformed_sidecar_is_ignored_and_rederived() {
-        let temp = tempfile::tempdir().unwrap();
+    fn malformed_sidecar_is_ignored_and_rederived() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let session = SessionId::from_str("session-a");
-        std::fs::write(meta_path(temp.path(), &session), b"{ not json").unwrap();
+        std::fs::write(meta_path(temp.path(), &session), b"{ not json")?;
 
-        assert_eq!(load(temp.path(), &session).unwrap(), None);
+        assert_eq!(load(temp.path(), &session)?, None);
 
-        let derived = load_or_derive(temp.path(), &session).unwrap();
+        let derived = load_or_derive(temp.path(), &session)?;
         assert_eq!(derived.title, None);
         assert_eq!(derived.turns, 0);
         // `load_or_derive` must have overwritten the malformed file.
-        assert_eq!(load(temp.path(), &session).unwrap(), Some(derived));
+        assert_eq!(load(temp.path(), &session)?, Some(derived));
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn symlinked_sidecar_is_not_followed_for_read_or_write() {
+    fn symlinked_sidecar_is_not_followed_for_read_or_write() -> TestResult {
         use std::os::unix::fs::symlink;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir()?;
         let session = SessionId::from_str("session-a");
         let path = meta_path(temp.path(), &session);
         let external = temp.path().join("outside-meta.json");
-        std::fs::write(&external, b"sentinel-should-not-be-read").unwrap();
-        symlink(&external, &path).unwrap();
+        std::fs::write(&external, b"sentinel-should-not-be-read")?;
+        symlink(&external, &path)?;
 
-        assert_eq!(load(temp.path(), &session).unwrap(), None);
-        assert_eq!(
-            std::fs::read(&external).unwrap(),
-            b"sentinel-should-not-be-read"
-        );
+        assert_eq!(load(temp.path(), &session)?, None);
+        assert_eq!(std::fs::read(&external)?, b"sentinel-should-not-be-read");
 
         let meta = SessionMeta::fresh(session.clone(), Timestamp::now());
-        save(temp.path(), &meta).unwrap();
+        save(temp.path(), &meta)?;
 
-        assert!(!std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
-        assert_eq!(
-            std::fs::read(&external).unwrap(),
-            b"sentinel-should-not-be-read"
-        );
-        assert_eq!(load(temp.path(), &session).unwrap(), Some(meta));
+        assert!(!std::fs::symlink_metadata(&path)?.file_type().is_symlink());
+        assert_eq!(std::fs::read(&external)?, b"sentinel-should-not-be-read");
+        assert_eq!(load(temp.path(), &session)?, Some(meta));
+        Ok(())
     }
 
     #[test]
-    fn add_usage_round_accumulates_usage_and_increments_counters() {
-        let temp = tempfile::tempdir().unwrap();
+    fn add_usage_round_accumulates_usage_and_increments_counters() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let session = SessionId::from_str("session-a");
         let first = harw_types::TokenUsage {
             input_tokens: 100,
@@ -910,12 +1133,12 @@ mod tests {
             cache_write_tokens: Some(3),
         };
 
-        let after_first = add_usage_round(temp.path(), &session, &first).unwrap();
+        let after_first = add_usage_round(temp.path(), &session, &first)?;
         assert_eq!(after_first.usage_rounds, 1);
         assert_eq!(after_first.turns, 1);
         assert_eq!(after_first.total_usage, first);
 
-        let after_second = add_usage_round(temp.path(), &session, &second).unwrap();
+        let after_second = add_usage_round(temp.path(), &session, &second)?;
         assert_eq!(after_second.usage_rounds, 2);
         assert_eq!(after_second.turns, 2);
         assert_eq!(after_second.total_usage.input_tokens, 150);
@@ -923,13 +1146,14 @@ mod tests {
         assert_eq!(after_second.total_usage.cached_tokens, Some(15));
         assert_eq!(after_second.total_usage.cache_write_tokens, Some(3));
 
-        let reloaded = load(temp.path(), &session).unwrap().unwrap();
+        let reloaded = load(temp.path(), &session)?.ok_or(TestError::Missing("reloaded sidecar"))?;
         assert_eq!(reloaded, after_second);
+        Ok(())
     }
 
     #[test]
-    fn unsafe_session_id_is_rejected_by_load_and_save() {
-        let temp = tempfile::tempdir().unwrap();
+    fn unsafe_session_id_is_rejected_by_load_and_save() -> TestResult {
+        let temp = tempfile::tempdir()?;
         let unsafe_session = SessionId::from_str("../escape");
 
         assert!(matches!(
@@ -941,5 +1165,6 @@ mod tests {
             save(temp.path(), &meta),
             Err(SessionStoreError::UnsafeTranscriptPath(value)) if value == "../escape"
         ));
+        Ok(())
     }
 }

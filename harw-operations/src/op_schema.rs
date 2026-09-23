@@ -397,6 +397,7 @@ mod tests {
         OpArgsSchema, array_schema, bool_schema, described_object_schema, enum_string_schema,
         integer_schema, number_schema, object_schema, string_schema,
     };
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_tools::{AdditionalProperties, JsonSchema, JsonSchemaType};
 
     #[test]
@@ -412,13 +413,14 @@ mod tests {
     }
 
     #[test]
-    fn test_object_schema_empty_properties_still_present() {
+    fn test_object_schema_empty_properties_still_present() -> TestResult {
         let schema = object_schema(Vec::new(), &[]);
 
-        let properties = schema
-            .properties
-            .expect("auch ein argumentloses Tool bekommt eine leere Property-Menge");
+        let properties = schema.properties.ok_or(TestError::Missing(
+            "auch ein argumentloses Tool bekommt eine leere Property-Menge",
+        ))?;
         assert!(properties.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -455,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn test_object_schema_duplicate_property_keeps_first_description() {
+    fn test_object_schema_duplicate_property_keeps_first_description() -> TestResult {
         let schema = object_schema(
             vec![
                 ("goal", string_schema("Erste Beschreibung.")),
@@ -464,13 +466,16 @@ mod tests {
             &[],
         );
 
-        let properties = schema.properties.expect("properties gesetzt");
+        let properties = schema
+            .properties
+            .ok_or(TestError::Missing("properties gesetzt"))?;
         assert_eq!(properties.len(), 1);
         assert_eq!(
             properties["goal"].description.as_deref(),
             Some("Erste Beschreibung."),
             "bei doppeltem Feldnamen gewinnt der erste Eintrag"
         );
+        Ok(())
     }
 
     #[test]
@@ -528,12 +533,13 @@ mod tests {
     }
 
     #[test]
-    fn test_array_schema_wraps_item_schema() {
+    fn test_array_schema_wraps_item_schema() -> TestResult {
         let schema = array_schema(string_schema("Ein Pfad."));
 
         assert_eq!(schema.schema_type, Some(JsonSchemaType::Array));
-        let items = schema.items.expect("items gesetzt");
+        let items = schema.items.ok_or(TestError::Missing("items gesetzt"))?;
         assert_eq!(items.schema_type, Some(JsonSchemaType::String));
+        Ok(())
     }
 
     #[test]
@@ -568,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn test_op_args_schema_impl_serializes_to_closed_json() {
+    fn test_op_args_schema_impl_serializes_to_closed_json() -> TestResult {
         struct StopArgs;
 
         impl OpArgsSchema for StopArgs {
@@ -580,7 +586,8 @@ mod tests {
             }
         }
 
-        let serialized = serde_json::to_value(StopArgs::json_schema()).expect("Schema serialisiert");
+        let serialized =
+            serde_json::to_value(StopArgs::json_schema()).map_err(ctx("Schema serialisiert"))?;
 
         assert_eq!(
             serialized,
@@ -593,5 +600,6 @@ mod tests {
                 "additionalProperties": false
             })
         );
+        Ok(())
     }
 }

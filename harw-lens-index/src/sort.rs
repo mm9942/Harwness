@@ -139,41 +139,43 @@ pub(crate) fn top_k_ranked<I: Iterator<Item = Ranked>>(items: I, k: usize) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use harw_lens_types::{ByteSpan, Chunk, ChunkDigest, SourceRef};
     use harw_types::ContentDigest;
 
-    fn chunk(text: &str) -> Chunk {
-        Chunk {
+    fn chunk(text: &str) -> TestResult<Chunk> {
+        Ok(Chunk {
             digest: ChunkDigest(ContentDigest::of(text.as_bytes())),
             source: SourceRef::File {
                 path: "a.txt".to_owned(),
             },
-            span: ByteSpan::new(0, text.len()).expect("valid span"),
+            span: ByteSpan::new(0, text.len()).map_err(ctx("valid span"))?,
             text: text.to_owned(),
-        }
+        })
     }
 
     #[test]
-    fn test_sort_ranked_desc_orders_by_score_descending() {
+    fn test_sort_ranked_desc_orders_by_score_descending() -> TestResult {
         let mut ranked = vec![
             Ranked {
-                chunk: chunk("low"),
+                chunk: chunk("low")?,
                 score: 0.1,
             },
             Ranked {
-                chunk: chunk("high"),
+                chunk: chunk("high")?,
                 score: 0.9,
             },
         ];
         sort_ranked_desc(&mut ranked);
         assert_eq!(ranked[0].chunk.text, "high");
         assert_eq!(ranked[1].chunk.text, "low");
+        Ok(())
     }
 
     #[test]
-    fn test_sort_ranked_desc_breaks_ties_by_chunk_digest_ascending() {
-        let a = chunk("a-content");
-        let b = chunk("b-content");
+    fn test_sort_ranked_desc_breaks_ties_by_chunk_digest_ascending() -> TestResult {
+        let a = chunk("a-content")?;
+        let b = chunk("b-content")?;
         let (first, second) = if a.digest <= b.digest { (a, b) } else { (b, a) };
         let mut ranked = vec![
             Ranked {
@@ -188,12 +190,13 @@ mod tests {
         sort_ranked_desc(&mut ranked);
         assert_eq!(ranked[0].chunk.digest, first.digest);
         assert_eq!(ranked[1].chunk.digest, second.digest);
+        Ok(())
     }
 
     #[test]
-    fn test_sort_ranked_desc_is_deterministic_across_repeated_calls() {
-        let a = chunk("a-content");
-        let b = chunk("b-content");
+    fn test_sort_ranked_desc_is_deterministic_across_repeated_calls() -> TestResult {
+        let a = chunk("a-content")?;
+        let b = chunk("b-content")?;
         let mut first_run = vec![
             Ranked {
                 chunk: a.clone(),
@@ -210,25 +213,26 @@ mod tests {
         let first_order: Vec<_> = first_run.iter().map(|r| r.chunk.digest).collect();
         let second_order: Vec<_> = second_run.iter().map(|r| r.chunk.digest).collect();
         assert_eq!(first_order, second_order);
+        Ok(())
     }
 
-    fn ranked(text: &str, score: f32) -> Ranked {
-        Ranked {
-            chunk: chunk(text),
+    fn ranked(text: &str, score: f32) -> TestResult<Ranked> {
+        Ok(Ranked {
+            chunk: chunk(text)?,
             score,
-        }
+        })
     }
 
     #[test]
-    fn test_top_k_ranked_matches_full_sort_then_truncate_reference() {
+    fn test_top_k_ranked_matches_full_sort_then_truncate_reference() -> TestResult {
         let candidates = vec![
-            ranked("a", 0.3),
-            ranked("b", 0.9),
-            ranked("c", 0.1),
-            ranked("d", 0.9),
-            ranked("e", 0.5),
-            ranked("f", 0.7),
-            ranked("g", 0.9),
+            ranked("a", 0.3)?,
+            ranked("b", 0.9)?,
+            ranked("c", 0.1)?,
+            ranked("d", 0.9)?,
+            ranked("e", 0.5)?,
+            ranked("f", 0.7)?,
+            ranked("g", 0.9)?,
         ];
 
         for k in 0..=candidates.len() + 2 {
@@ -248,37 +252,42 @@ mod tests {
                 "score mismatch for k = {k}"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn test_top_k_ranked_zero_limit_returns_empty() {
-        let candidates = vec![ranked("a", 1.0), ranked("b", 2.0)];
+    fn test_top_k_ranked_zero_limit_returns_empty() -> TestResult {
+        let candidates = vec![ranked("a", 1.0)?, ranked("b", 2.0)?];
         assert!(top_k_ranked(candidates.into_iter(), 0).is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_top_k_ranked_limit_larger_than_input_returns_all_sorted() {
-        let candidates = vec![ranked("low", 0.1), ranked("high", 0.9)];
+    fn test_top_k_ranked_limit_larger_than_input_returns_all_sorted() -> TestResult {
+        let candidates = vec![ranked("low", 0.1)?, ranked("high", 0.9)?];
         let result = top_k_ranked(candidates.into_iter(), 10);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].chunk.text, "high");
         assert_eq!(result[1].chunk.text, "low");
+        Ok(())
     }
 
     #[test]
-    fn test_top_k_ranked_on_empty_input_returns_empty() {
+    fn test_top_k_ranked_on_empty_input_returns_empty() -> TestResult {
         assert!(top_k_ranked(std::iter::empty::<Ranked>(), 5).is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_top_k_ranked_is_nan_safe_and_does_not_panic() {
+    fn test_top_k_ranked_is_nan_safe_and_does_not_panic() -> TestResult {
         let candidates = vec![
-            ranked("nan", f32::NAN),
-            ranked("normal", 0.5),
-            ranked("negative-nan", -f32::NAN),
+            ranked("nan", f32::NAN)?,
+            ranked("normal", 0.5)?,
+            ranked("negative-nan", -f32::NAN)?,
         ];
         // Muss ohne Panic terminieren und darf keine Elemente verlieren.
         let result = top_k_ranked(candidates.into_iter(), 2);
         assert_eq!(result.len(), 2);
+        Ok(())
     }
 }

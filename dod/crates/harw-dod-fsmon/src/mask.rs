@@ -99,45 +99,67 @@ mod tests {
 
     use super::{FAN_CLOSE_WRITE, FAN_MODIFY, interpret_mask};
     use crate::error::FsMonError;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     #[test]
-    fn test_interpret_mask_close_write_yields_file_write() {
+    fn test_interpret_mask_close_write_yields_file_write() -> TestResult {
         let kind = interpret_mask(FAN_CLOSE_WRITE, "/etc/passwd".to_owned())
-            .expect("FAN_CLOSE_WRITE muss interpretierbar sein");
+            .map_err(ctx("FAN_CLOSE_WRITE muss interpretierbar sein"))?;
         match kind {
             EventKind::FileWrite { path } => assert_eq!(path, "/etc/passwd"),
-            other => panic!("erwartet FileWrite, erhalten {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet FileWrite, erhalten {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_interpret_mask_modify_yields_file_write() {
+    fn test_interpret_mask_modify_yields_file_write() -> TestResult {
         let kind = interpret_mask(FAN_MODIFY, "/etc/shadow".to_owned())
-            .expect("FAN_MODIFY muss interpretierbar sein");
+            .map_err(ctx("FAN_MODIFY muss interpretierbar sein"))?;
         assert!(matches!(kind, EventKind::FileWrite { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_interpret_mask_combined_write_bits_yield_file_write() {
+    fn test_interpret_mask_combined_write_bits_yield_file_write() -> TestResult {
         let kind = interpret_mask(FAN_MODIFY | FAN_CLOSE_WRITE, "/tmp/x".to_owned())
-            .expect("kombinierte Schreib-Bits müssen interpretierbar sein");
+            .map_err(ctx("kombinierte Schreib-Bits müssen interpretierbar sein"))?;
         assert!(matches!(kind, EventKind::FileWrite { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_interpret_mask_unrecognized_bits_return_malformed_source() {
+    fn test_interpret_mask_unrecognized_bits_return_malformed_source() -> TestResult {
         // FAN_ACCESS (0x01) allein trägt keinen Schreibzugriff.
-        let err = interpret_mask(0x01, "/etc/passwd".to_owned())
-            .expect_err("reiner Lesezugriff darf nicht interpretierbar sein");
+        let result = interpret_mask(0x01, "/etc/passwd".to_owned());
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "reiner Lesezugriff darf nicht interpretierbar sein".to_owned(),
+            ));
+        };
         assert!(matches!(err, FsMonError::MalformedSource));
+        Ok(())
     }
 
     #[test]
-    fn test_interpret_mask_zero_returns_malformed_source_without_raw_bytes_in_message() {
-        let err = interpret_mask(0, "/etc/passwd".to_owned())
-            .expect_err("eine leere Maske muss scheitern");
+    fn test_interpret_mask_zero_returns_malformed_source_without_raw_bytes_in_message() -> TestResult
+    {
+        let result = interpret_mask(0, "/etc/passwd".to_owned());
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "eine leere Maske muss scheitern".to_owned(),
+            ));
+        };
         let message = err.to_string();
         assert!(matches!(err, FsMonError::MalformedSource));
-        assert!(!message.contains('0'), "Meldung darf keine rohe Maske enthalten: {message}");
+        assert!(
+            !message.contains('0'),
+            "Meldung darf keine rohe Maske enthalten: {message}"
+        );
+        Ok(())
     }
 }

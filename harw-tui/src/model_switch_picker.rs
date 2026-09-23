@@ -338,7 +338,8 @@ impl ModelSwitchPicker {
                     return PickerAction::Cancel;
                 }
 
-                let provider_matches = self.active_provider.as_deref() == Some(provider_id.as_str());
+                let provider_matches =
+                    self.active_provider.as_deref() == Some(provider_id.as_str());
                 let model_start_index =
                     initial_model_index(models, provider_matches, self.active_model.as_deref());
                 let model_labels: Vec<String> = models.iter().map(|m| m.label.to_owned()).collect();
@@ -379,10 +380,12 @@ impl ModelSwitchPicker {
             ChoiceAction::Chosen(idx) => {
                 let provider_id = match &self.target {
                     PickerTarget::UiaWorker { fixed_provider } => fixed_provider.to_owned(),
-                    PickerTarget::Orchestrator | PickerTarget::Uia => match self.selected_provider.take() {
-                        Some(id) => id,
-                        None => return PickerAction::Cancel,
-                    },
+                    PickerTarget::Orchestrator | PickerTarget::Uia => {
+                        match self.selected_provider.take() {
+                            Some(id) => id,
+                            None => return PickerAction::Cancel,
+                        }
+                    }
                 };
 
                 let models = models_for_provider(&self.models_by_provider, &provider_id);
@@ -446,6 +449,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     fn make_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -509,7 +513,7 @@ mod tests {
 
     /// Provider-Stufe: `Up`/`Down` bleiben in Grenzen (kein Panic).
     #[test]
-    fn test_provider_stage_navigation_stays_in_bounds() {
+    fn test_provider_stage_navigation_stays_in_bounds() -> TestResult {
         let mut picker = ModelSwitchPicker::new(
             PickerTarget::Orchestrator,
             providers_fixture(),
@@ -517,7 +521,7 @@ mod tests {
             None,
             None,
         )
-        .expect("providers fixture ist nicht leer");
+        .ok_or(TestError::Missing("providers fixture ist nicht leer"))?;
 
         // Über das Ende hinaus.
         for _ in 0..10 {
@@ -527,12 +531,13 @@ mod tests {
         for _ in 0..10 {
             assert_eq!(picker.on_key(make_key(KeyCode::Up)), PickerAction::Stay);
         }
+        Ok(())
     }
 
     /// `Enter`/`Chosen` auf der Provider-Stufe wechselt zur Modell-Stufe mit
     /// korrekt vorausgewähltem Modell.
     #[test]
-    fn test_enter_on_provider_switches_to_model_stage_with_preselection() {
+    fn test_enter_on_provider_switches_to_model_stage_with_preselection() -> TestResult {
         let mut picker = ModelSwitchPicker::new(
             PickerTarget::Orchestrator,
             providers_fixture(),
@@ -540,7 +545,7 @@ mod tests {
             Some("anthropic"),
             Some("claude-opus"),
         )
-        .expect("providers fixture ist nicht leer");
+        .ok_or(TestError::Missing("providers fixture ist nicht leer"))?;
 
         // Startindex ist bereits auf "anthropic" (aktiver Provider) vorausgewählt;
         // Enter wählt ihn direkt.
@@ -555,12 +560,13 @@ mod tests {
                 model: "claude-opus".to_owned(),
             }
         );
+        Ok(())
     }
 
     /// `Left` in der Modell-Stufe springt zur Provider-Stufe zurück; der
     /// Provider-Cursor bleibt erhalten (kein Reset).
     #[test]
-    fn test_left_in_model_stage_returns_to_provider_without_reset() {
+    fn test_left_in_model_stage_returns_to_provider_without_reset() -> TestResult {
         let mut picker = ModelSwitchPicker::new(
             PickerTarget::Orchestrator,
             providers_fixture(),
@@ -568,7 +574,7 @@ mod tests {
             None,
             None,
         )
-        .expect("providers fixture ist nicht leer");
+        .ok_or(TestError::Missing("providers fixture ist nicht leer"))?;
 
         // Provider-Cursor bewegen (Index 1 = "openai"), dann wählen.
         assert_eq!(picker.on_key(make_key(KeyCode::Down)), PickerAction::Stay);
@@ -582,12 +588,13 @@ mod tests {
         // auf Index 0 zurückgesetzt zu sein.
         assert_eq!(picker.on_key(make_key(KeyCode::Enter)), PickerAction::Stay);
         assert_eq!(picker.selected_provider.as_deref(), Some("openai"));
+        Ok(())
     }
 
     /// `Left` bei `PickerTarget::UiaWorker` ist ein No-op (`Stay`), bleibt in
     /// der Modell-Stufe.
     #[test]
-    fn test_left_on_uia_worker_target_is_noop() {
+    fn test_left_on_uia_worker_target_is_noop() -> TestResult {
         let mut picker = ModelSwitchPicker::new(
             PickerTarget::UiaWorker {
                 fixed_provider: "anthropic".to_owned(),
@@ -597,16 +604,17 @@ mod tests {
             None,
             None,
         )
-        .expect("providers fixture ist nicht leer");
+        .ok_or(TestError::Missing("providers fixture ist nicht leer"))?;
 
         assert_eq!(picker.stage, PickerStage::Model);
         assert_eq!(picker.on_key(make_key(KeyCode::Left)), PickerAction::Stay);
         assert_eq!(picker.stage, PickerStage::Model);
+        Ok(())
     }
 
     /// `Enter` in der Modell-Stufe liefert `Accept` mit korrekten IDs.
     #[test]
-    fn test_enter_in_model_stage_returns_accept_with_correct_ids() {
+    fn test_enter_in_model_stage_returns_accept_with_correct_ids() -> TestResult {
         let mut picker = ModelSwitchPicker::new(
             PickerTarget::UiaWorker {
                 fixed_provider: "openai".to_owned(),
@@ -616,7 +624,7 @@ mod tests {
             None,
             None,
         )
-        .expect("providers fixture ist nicht leer");
+        .ok_or(TestError::Missing("providers fixture ist nicht leer"))?;
 
         assert_eq!(
             picker.on_key(make_key(KeyCode::Enter)),
@@ -625,11 +633,12 @@ mod tests {
                 model: "gpt-5".to_owned(),
             }
         );
+        Ok(())
     }
 
     /// `Esc` auf der Provider-Stufe bricht vollständig ab.
     #[test]
-    fn test_esc_on_provider_stage_returns_cancel() {
+    fn test_esc_on_provider_stage_returns_cancel() -> TestResult {
         let mut picker = ModelSwitchPicker::new(
             PickerTarget::Orchestrator,
             providers_fixture(),
@@ -637,14 +646,15 @@ mod tests {
             None,
             None,
         )
-        .expect("providers fixture ist nicht leer");
+        .ok_or(TestError::Missing("providers fixture ist nicht leer"))?;
 
         assert_eq!(picker.on_key(make_key(KeyCode::Esc)), PickerAction::Cancel);
+        Ok(())
     }
 
     /// `Esc` auf der Modell-Stufe bricht vollständig ab (kein Stufen-Rücksprung).
     #[test]
-    fn test_esc_on_model_stage_returns_cancel() {
+    fn test_esc_on_model_stage_returns_cancel() -> TestResult {
         let mut picker = ModelSwitchPicker::new(
             PickerTarget::Orchestrator,
             providers_fixture(),
@@ -652,16 +662,17 @@ mod tests {
             None,
             None,
         )
-        .expect("providers fixture ist nicht leer");
+        .ok_or(TestError::Missing("providers fixture ist nicht leer"))?;
 
         assert_eq!(picker.on_key(make_key(KeyCode::Enter)), PickerAction::Stay);
         assert_eq!(picker.stage, PickerStage::Model);
         assert_eq!(picker.on_key(make_key(KeyCode::Esc)), PickerAction::Cancel);
+        Ok(())
     }
 
     /// Provider ohne Modelle gewählt (Enter auf Provider-Stufe) → `Cancel`.
     #[test]
-    fn test_choosing_provider_without_models_returns_cancel() {
+    fn test_choosing_provider_without_models_returns_cancel() -> TestResult {
         let mut picker = ModelSwitchPicker::new(
             PickerTarget::Orchestrator,
             providers_fixture(),
@@ -669,19 +680,23 @@ mod tests {
             None,
             None,
         )
-        .expect("providers fixture ist nicht leer");
+        .ok_or(TestError::Missing("providers fixture ist nicht leer"))?;
 
         // Index 2 = "empty-provider" (keine Modelle in der Fixture).
-        assert_eq!(picker.on_key(make_key(KeyCode::Char('3'))), PickerAction::Cancel);
+        assert_eq!(
+            picker.on_key(make_key(KeyCode::Char('3'))),
+            PickerAction::Cancel
+        );
         // Stage bleibt unverändert (kein Wechsel bei Abbruch).
         assert_eq!(picker.stage, PickerStage::Provider);
+        Ok(())
     }
 
     /// `PickerTarget::UiaWorker`-Konstruktion startet direkt in
     /// `PickerStage::Model`; die Provider-Stufe ist nie über `render`/`on_key`
     /// erreichbar.
     #[test]
-    fn test_uia_worker_starts_in_model_stage_provider_stage_unreachable() {
+    fn test_uia_worker_starts_in_model_stage_provider_stage_unreachable() -> TestResult {
         let picker = ModelSwitchPicker::new(
             PickerTarget::UiaWorker {
                 fixed_provider: "anthropic".to_owned(),
@@ -691,7 +706,7 @@ mod tests {
             None,
             None,
         )
-        .expect("providers fixture ist nicht leer");
+        .ok_or(TestError::Missing("providers fixture ist nicht leer"))?;
 
         assert_eq!(picker.stage, PickerStage::Model);
         assert!(picker.model_dialog.is_some());
@@ -708,11 +723,12 @@ mod tests {
             .join("");
         assert!(rendered.contains("Claude Sonnet"));
         assert!(!rendered.contains(PROVIDER_DIALOG_TITLE));
+        Ok(())
     }
 
     /// `target()` liefert den bei der Konstruktion übergebenen Kontext zurück.
     #[test]
-    fn test_target_getter_returns_constructed_target() {
+    fn test_target_getter_returns_constructed_target() -> TestResult {
         let picker = ModelSwitchPicker::new(
             PickerTarget::UiaWorker {
                 fixed_provider: "openai".to_owned(),
@@ -722,7 +738,7 @@ mod tests {
             None,
             None,
         )
-        .expect("providers fixture ist nicht leer");
+        .ok_or(TestError::Missing("providers fixture ist nicht leer"))?;
 
         assert_eq!(
             picker.target(),
@@ -730,5 +746,6 @@ mod tests {
                 fixed_provider: "openai".to_owned(),
             }
         );
+        Ok(())
     }
 }

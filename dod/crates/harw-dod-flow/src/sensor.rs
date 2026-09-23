@@ -124,10 +124,10 @@
 
 use std::time::Duration;
 
+use harw_authority::NetworkScope;
 use harw_dod_bpf::{BpfError, BpfHandle, BpfLoader};
 use harw_dod_cap::{Bound, SensorError, SensorHandle};
 use harw_dod_signals::{Sensor, SensorReading};
-use harw_authority::NetworkScope;
 use jiff::Timestamp;
 
 use crate::error::FlowError;
@@ -351,19 +351,20 @@ fn flow_error_to_sensor_error(err: FlowError) -> SensorError {
 mod tests {
     use std::net::IpAddr;
 
+    use harw_authority::{EgressTarget, NetworkScope};
     use harw_dod_bpf::event::RawBpfEvent;
     use harw_dod_bpf::fixture::FixtureBpfLoader;
     use harw_dod_bpf::{BpfError, BpfLoader, BpfProgramKind, BpfProgramSource, BpfProgramSpec};
-    use harw_dod_cap::{Bound, Capability, ReadScope, SensorHandle, SensorError};
+    use harw_dod_cap::{Bound, Capability, ReadScope, SensorError, SensorHandle};
     use harw_dod_signals::{EventKind, Sensor};
-    use harw_authority::{EgressTarget, NetworkScope};
     use harw_types::SensorId;
     use jiff::Timestamp;
     use std::borrow::Cow;
 
-    use super::{bpf_error_to_sensor_error, flow_error_to_sensor_error, FlowSensor};
+    use super::{FlowSensor, bpf_error_to_sensor_error, flow_error_to_sensor_error};
     use crate::error::FlowError;
     use crate::report::observe;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn handle_with(capability: Capability) -> SensorHandle<Bound> {
         SensorHandle::new(SensorId::from_str("flow-test"), capability)
@@ -379,9 +380,11 @@ mod tests {
         )
     }
 
-    fn scope_allowing_10_0_0_0_24() -> NetworkScope {
-        let cidr: ipnet::IpNet = "10.0.0.0/24".parse().expect("valid test CIDR literal");
-        NetworkScope::from_targets([EgressTarget::Cidr(cidr)])
+    fn scope_allowing_10_0_0_0_24() -> TestResult<NetworkScope> {
+        let cidr: ipnet::IpNet = "10.0.0.0/24"
+            .parse()
+            .map_err(ctx("valid test CIDR literal"))?;
+        Ok(NetworkScope::from_targets([EgressTarget::Cidr(cidr)]))
     }
 
     /// Baut ein wohlgeformtes 32-Byte-Flow-`payload`, wie
@@ -407,122 +410,148 @@ mod tests {
         }
     }
 
-    fn build_sensor(events: Vec<RawBpfEvent>, scope: NetworkScope) -> FlowSensor {
+    fn build_sensor(events: Vec<RawBpfEvent>, scope: NetworkScope) -> TestResult<FlowSensor> {
         let loader = FixtureBpfLoader::new(events);
         let bpf_handle = loader
             .load(&sample_spec())
-            .expect("fixture loader with capability always succeeds");
-        FlowSensor::new(handle_with(Capability::LoadBpfProgram), Box::new(loader), bpf_handle, scope)
+            .map_err(ctx("fixture loader with capability always succeeds"))?;
+        Ok(FlowSensor::new(
+            handle_with(Capability::LoadBpfProgram),
+            Box::new(loader),
+            bpf_handle,
+            scope,
+        ))
     }
 
     #[test]
-    fn test_handle_returns_bound_handle_with_load_bpf_program_capability() {
-        let sensor = build_sensor(Vec::new(), NetworkScope::empty());
+    fn test_handle_returns_bound_handle_with_load_bpf_program_capability() -> TestResult {
+        let sensor = build_sensor(Vec::new(), NetworkScope::empty())?;
         assert_eq!(sensor.handle().capability(), Capability::LoadBpfProgram);
+        Ok(())
     }
 
     #[test]
-    fn test_poll_with_no_events_returns_empty_reading() {
-        let sensor = build_sensor(Vec::new(), NetworkScope::empty());
+    fn test_poll_with_no_events_returns_empty_reading() -> TestResult {
+        let sensor = build_sensor(Vec::new(), NetworkScope::empty())?;
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("fixture-backed sensor never fails");
+            .map_err(ctx("fixture-backed sensor never fails"))?;
         assert!(reading.samples.is_empty());
         assert!(reading.events.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_poll_yields_the_same_event_that_observe_would_yield_for_the_same_raw_event() {
+    fn test_poll_yields_the_same_event_that_observe_would_yield_for_the_same_raw_event()
+    -> TestResult {
         // Der wichtigste Test dieser Datei: `poll()` über einen `FlowSensor`
         // muss dasselbe Ergebnis liefern wie ein direkter `observe()`-Aufruf
         // auf demselben Rohereignis — die Parselogik läuft dabei tatsächlich,
         // nicht nur behauptet.
-        let observed_at = Timestamp::new(1_700_000_000, 0).expect("gültiger Zeitstempel");
+        let observed_at = Timestamp::new(1_700_000_000, 0).map_err(ctx("gültiger Zeitstempel"))?;
         let payload = flow_payload(443, [203, 0, 113, 9]);
         let raw = raw_event(observed_at, payload);
-        let scope = scope_allowing_10_0_0_0_24();
+        let scope = scope_allowing_10_0_0_0_24()?;
         let sensor_id = SensorId::from_str("flow-test");
 
         let expected = observe(&raw, &sensor_id, &scope)
-            .expect("well-formed payload must parse")
-            .expect("destination outside scope must be reported");
+            .map_err(ctx("well-formed payload must parse"))?
+            .ok_or(TestError::Missing(
+                "destination outside scope must be reported",
+            ))?;
 
-        let sensor = build_sensor(vec![raw], scope);
+        let sensor = build_sensor(vec![raw], scope)?;
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("fixture-backed sensor never fails");
+            .map_err(ctx("fixture-backed sensor never fails"))?;
 
         assert_eq!(reading.events, vec![expected]);
+        Ok(())
     }
 
     #[test]
-    fn test_poll_actually_parses_the_payload_and_applies_the_report_rule() {
+    fn test_poll_actually_parses_the_payload_and_applies_the_report_rule() -> TestResult {
         // Belegt, dass die Parse- und Melderegel-Logik tatsächlich ausgeführt
         // wird (nicht nur trivial über einen `sensor_suite!`-Pfad besteht,
         // der hier nie greifen würde): eine Verbindung innerhalb des
         // erlaubten Bereichs erzeugt kein Ereignis.
         let payload = flow_payload(80, [10, 0, 0, 5]);
-        let sensor = build_sensor(vec![raw_event(Timestamp::UNIX_EPOCH, payload)], scope_allowing_10_0_0_0_24());
+        let sensor = build_sensor(
+            vec![raw_event(Timestamp::UNIX_EPOCH, payload)],
+            scope_allowing_10_0_0_0_24()?,
+        )?;
 
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("fixture-backed sensor never fails");
+            .map_err(ctx("fixture-backed sensor never fails"))?;
         assert!(reading.events.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_poll_reports_egress_flow_kind_with_destination_and_port() {
+    fn test_poll_reports_egress_flow_kind_with_destination_and_port() -> TestResult {
         let payload = flow_payload(8_443, [198, 51, 100, 7]);
         let sensor = build_sensor(
             vec![raw_event(Timestamp::UNIX_EPOCH, payload)],
             NetworkScope::empty(),
-        );
+        )?;
 
         let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("fixture-backed sensor never fails");
+            .map_err(ctx("fixture-backed sensor never fails"))?;
         assert_eq!(reading.events.len(), 1);
 
         match &reading.events[0].kind {
             EventKind::EgressFlow { destination, port } => {
                 assert_eq!(destination, "198.51.100.7");
                 assert_eq!(*port, 8_443);
-                assert_eq!(destination.parse::<IpAddr>().expect("valid ip"), IpAddr::from([198, 51, 100, 7]));
+                assert_eq!(
+                    destination.parse::<IpAddr>().map_err(ctx("valid ip"))?,
+                    IpAddr::from([198, 51, 100, 7])
+                );
             }
-            other => panic!("expected EventKind::EgressFlow, got {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected EventKind::EgressFlow, got {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn test_poll_propagates_malformed_payload_as_malformed_source() {
+    fn test_poll_propagates_malformed_payload_as_malformed_source() -> TestResult {
         let sensor = build_sensor(
             vec![raw_event(Timestamp::UNIX_EPOCH, vec![1, 2, 3])],
             NetworkScope::empty(),
-        );
-        let err = sensor
-            .poll(Timestamp::UNIX_EPOCH)
-            .expect_err("zu kurzes payload muss scheitern");
+        )?;
+        let Err(err) = sensor.poll(Timestamp::UNIX_EPOCH) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, SensorError::MalformedSource));
+        Ok(())
     }
 
     #[test]
-    fn test_poll_two_independently_built_sensors_with_same_now_yield_identical_readings() {
+    fn test_poll_two_independently_built_sensors_with_same_now_yield_identical_readings()
+    -> TestResult {
         // Wie `harw-dod-procmon`: `FixtureBpfLoader::read_events` entleert
         // seine Warteschlange, ein zweiter Poll auf derselben Instanz ist
         // deshalb bewusst nicht idempotent. Determinismus bedeutet hier: zwei
         // unabhängig konstruierte Sensoren mit identischem Ereignisinhalt und
         // identischem Scope liefern bei gleichem `now` dasselbe Ergebnis.
-        let observed_at = Timestamp::new(1_000, 0).expect("gültiger Zeitstempel");
+        let observed_at = Timestamp::new(1_000, 0).map_err(ctx("gültiger Zeitstempel"))?;
         let make_events = || vec![raw_event(observed_at, flow_payload(443, [203, 0, 113, 9]))];
 
-        let first = build_sensor(make_events(), scope_allowing_10_0_0_0_24())
+        let first = build_sensor(make_events(), scope_allowing_10_0_0_0_24()?)?
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("erster Poll");
-        let second = build_sensor(make_events(), scope_allowing_10_0_0_0_24())
+            .map_err(ctx("erster Poll"))?;
+        let second = build_sensor(make_events(), scope_allowing_10_0_0_0_24()?)?
             .poll(Timestamp::UNIX_EPOCH)
-            .expect("zweiter Poll, unabhängige Sensor-Instanz");
+            .map_err(ctx("zweiter Poll, unabhängige Sensor-Instanz"))?;
 
         assert_eq!(first, second);
+        Ok(())
     }
 
     #[test]
@@ -544,7 +573,10 @@ mod tests {
     #[test]
     fn test_bpf_error_to_sensor_error_maps_io_to_io() {
         let source = std::io::Error::other("boom");
-        assert!(matches!(bpf_error_to_sensor_error(BpfError::Io(source)), SensorError::Io(_)));
+        assert!(matches!(
+            bpf_error_to_sensor_error(BpfError::Io(source)),
+            SensorError::Io(_)
+        ));
     }
 
     #[test]

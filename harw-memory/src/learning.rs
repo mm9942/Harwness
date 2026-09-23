@@ -500,6 +500,7 @@ fn reject_symlink(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use time::Duration;
 
     // Hilfsfunktion: OffsetDateTime N Tage vor `now`
@@ -619,7 +620,7 @@ mod tests {
     // ── save / load Roundtrip ────────────────────────────
 
     #[test]
-    fn save_and_load_roundtrip() {
+    fn save_and_load_roundtrip() -> TestResult {
         // Temporäres Verzeichnis anlegen
         let root = std::env::temp_dir().join(format!(
             "harw-learning-test-{}-{}",
@@ -629,7 +630,7 @@ mod tests {
                 .unwrap_or_default()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(root.join("signals")).unwrap();
+        std::fs::create_dir_all(root.join("signals")).map_err(ctx("signals dir anlegen"))?;
 
         let now = OffsetDateTime::now_utc();
         let mut counter = PatternCounter::default();
@@ -637,8 +638,8 @@ mod tests {
         counter.observe("alpha", now);
         counter.observe("beta", now);
 
-        save(&counter, &root).expect("save must succeed");
-        let loaded = load_or_default(&root).expect("load must succeed");
+        save(&counter, &root).map_err(ctx("save must succeed"))?;
+        let loaded = load_or_default(&root).map_err(ctx("load must succeed"))?;
 
         assert_eq!(
             loaded.observations["alpha"].count, counter.observations["alpha"].count,
@@ -650,11 +651,12 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn save_rejects_symlinked_target_without_touching_external_file() {
+    fn save_rejects_symlinked_target_without_touching_external_file() -> TestResult {
         use std::os::unix::fs::symlink;
 
         let root = std::env::temp_dir().join(format!(
@@ -664,24 +666,34 @@ mod tests {
         ));
         let signals = root.join("signals");
         let outside = root.join("outside.json");
-        std::fs::create_dir_all(&signals).unwrap();
-        std::fs::write(&outside, b"external state").unwrap();
-        symlink(&outside, signals.join("patterns.json")).unwrap();
+        std::fs::create_dir_all(&signals).map_err(ctx("signals dir anlegen"))?;
+        std::fs::write(&outside, b"external state").map_err(ctx("outside-Datei schreiben"))?;
+        symlink(&outside, signals.join("patterns.json")).map_err(ctx("symlink anlegen"))?;
 
-        let error = save(&PatternCounter::default(), &root).unwrap_err();
+        let Err(error) = save(&PatternCounter::default(), &root) else {
+            return Err(TestError::Unexpected(
+                "save must reject a symlinked target".to_owned(),
+            ));
+        };
 
         assert!(matches!(error, MemoryError::Io { .. }));
-        assert_eq!(std::fs::read(&outside).unwrap(), b"external state");
-        assert!(std::fs::symlink_metadata(signals.join("patterns.json"))
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert_eq!(
+            std::fs::read(&outside).map_err(ctx("outside-Datei lesen"))?,
+            b"external state"
+        );
+        assert!(
+            std::fs::symlink_metadata(signals.join("patterns.json"))
+                .map_err(ctx("symlink-Metadaten lesen"))?
+                .file_type()
+                .is_symlink()
+        );
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn save_does_not_follow_predictable_temp_symlink() {
+    fn save_does_not_follow_predictable_temp_symlink() -> TestResult {
         use std::os::unix::fs::symlink;
 
         let root = std::env::temp_dir().join(format!(
@@ -691,18 +703,30 @@ mod tests {
         ));
         let signals = root.join("signals");
         let outside = root.join("outside.json");
-        std::fs::create_dir_all(&signals).unwrap();
-        std::fs::write(&outside, b"external state").unwrap();
-        symlink(&outside, signals.join("patterns.json.tmp")).unwrap();
+        std::fs::create_dir_all(&signals).map_err(ctx("signals dir anlegen"))?;
+        std::fs::write(&outside, b"external state").map_err(ctx("outside-Datei schreiben"))?;
+        symlink(&outside, signals.join("patterns.json.tmp")).map_err(ctx("symlink anlegen"))?;
 
-        save(&PatternCounter::default(), &root).unwrap();
+        save(&PatternCounter::default(), &root).map_err(ctx("save must succeed"))?;
 
-        assert_eq!(std::fs::read(&outside).unwrap(), b"external state");
-        assert_eq!(load_or_default(&root).unwrap().observations.len(), 0);
-        assert!(std::fs::symlink_metadata(signals.join("patterns.json.tmp"))
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert_eq!(
+            std::fs::read(&outside).map_err(ctx("outside-Datei lesen"))?,
+            b"external state"
+        );
+        assert_eq!(
+            load_or_default(&root)
+                .map_err(ctx("load must succeed"))?
+                .observations
+                .len(),
+            0
+        );
+        assert!(
+            std::fs::symlink_metadata(signals.join("patterns.json.tmp"))
+                .map_err(ctx("symlink-Metadaten lesen"))?
+                .file_type()
+                .is_symlink()
+        );
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 }

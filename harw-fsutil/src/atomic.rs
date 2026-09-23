@@ -269,7 +269,9 @@ pub(crate) fn temp_name(target: &OsStr, attempt: u32) -> OsString {
 fn random_salt(pid: u32, counter: u64, attempt: u32) -> u64 {
     let (secs, nanos) = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or((0, 0), |elapsed| (elapsed.as_secs(), elapsed.subsec_nanos()));
+        .map_or((0, 0), |elapsed| {
+            (elapsed.as_secs(), elapsed.subsec_nanos())
+        });
     let mut hasher = RandomState::new().build_hasher();
     hasher.write_u32(pid);
     hasher.write_u64(counter);
@@ -282,24 +284,24 @@ fn random_salt(pid: u32, counter: u64, attempt: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use std::os::unix::fs::symlink;
 
-    fn dir_names(dir: &Path) -> Vec<OsString> {
-        let mut names: Vec<OsString> = std::fs::read_dir(dir)
-            .expect("read_dir")
-            .map(|entry| entry.expect("entry").file_name())
-            .collect();
+    fn dir_names(dir: &Path) -> TestResult<Vec<OsString>> {
+        let mut names: Vec<OsString> = std::fs::read_dir(dir)?
+            .map(|entry| entry.map(|e| e.file_name()))
+            .collect::<io::Result<Vec<_>>>()?;
         names.sort();
-        names
+        Ok(names)
     }
 
     #[test]
-    fn schreibt_neue_datei_mit_mode() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+    fn schreibt_neue_datei_mit_mode() -> TestResult {
+        let tmp = tempfile::tempdir()?;
         let path = tmp.path().join("state.json");
-        write_atomic(&path, b"eins", AtomicWriteOptions::private()).expect("write");
-        assert_eq!(std::fs::read(&path).expect("read"), b"eins");
-        let meta = std::fs::symlink_metadata(&path).expect("meta");
+        write_atomic(&path, b"eins", AtomicWriteOptions::private())?;
+        assert_eq!(std::fs::read(&path)?, b"eins");
+        let meta = std::fs::symlink_metadata(&path)?;
         assert_eq!(meta.permissions().mode() & 0o7777, 0o600);
 
         write_atomic(
@@ -310,65 +312,79 @@ mod tests {
                 fsync_dir: false,
             },
         )
-        .expect("overwrite");
-        assert_eq!(std::fs::read(&path).expect("read"), b"zwei");
-        let meta = std::fs::symlink_metadata(&path).expect("meta");
+        .map_err(ctx("overwrite"))?;
+        assert_eq!(std::fs::read(&path)?, b"zwei");
+        let meta = std::fs::symlink_metadata(&path)?;
         assert_eq!(meta.permissions().mode() & 0o7777, 0o644);
-        assert_eq!(dir_names(tmp.path()), vec![OsString::from("state.json")]);
+        assert_eq!(dir_names(tmp.path())?, vec![OsString::from("state.json")]);
+        Ok(())
     }
 
     #[test]
-    fn ersetzt_ziel_symlink_statt_ihm_zu_folgen() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+    fn ersetzt_ziel_symlink_statt_ihm_zu_folgen() -> TestResult {
+        let tmp = tempfile::tempdir()?;
         let victim = tmp.path().join("victim");
-        std::fs::write(&victim, b"original").expect("write");
+        std::fs::write(&victim, b"original")?;
         let target = tmp.path().join("target");
-        symlink(&victim, &target).expect("symlink");
+        symlink(&victim, &target)?;
 
-        write_atomic(&target, b"neu", AtomicWriteOptions::private()).expect("write");
+        write_atomic(&target, b"neu", AtomicWriteOptions::private())?;
 
-        let meta = std::fs::symlink_metadata(&target).expect("meta");
+        let meta = std::fs::symlink_metadata(&target)?;
         assert!(meta.file_type().is_file(), "Symlink muss ersetzt sein");
-        assert_eq!(std::fs::read(&target).expect("read"), b"neu");
-        assert_eq!(std::fs::read(&victim).expect("read"), b"original");
+        assert_eq!(std::fs::read(&target)?, b"neu");
+        assert_eq!(std::fs::read(&victim)?, b"original");
+        Ok(())
     }
 
     #[test]
-    fn ersetzt_dangling_symlink_ohne_ziel_anzulegen() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+    fn ersetzt_dangling_symlink_ohne_ziel_anzulegen() -> TestResult {
+        let tmp = tempfile::tempdir()?;
         let target = tmp.path().join("target");
-        symlink(tmp.path().join("fehlt"), &target).expect("symlink");
-        write_atomic(&target, b"neu", AtomicWriteOptions::private()).expect("write");
-        assert!(std::fs::symlink_metadata(&target).expect("meta").is_file());
+        symlink(tmp.path().join("fehlt"), &target)?;
+        write_atomic(&target, b"neu", AtomicWriteOptions::private())?;
+        assert!(std::fs::symlink_metadata(&target)?.is_file());
         assert!(!tmp.path().join("fehlt").exists());
+        Ok(())
     }
 
     #[test]
     fn tempname_bleibt_unter_name_max() {
         let long = OsString::from("a".repeat(NAME_MAX));
         let name = temp_name(&long, 7);
-        assert!(name.as_bytes().len() <= NAME_MAX, "{}", name.as_bytes().len());
+        assert!(
+            name.as_bytes().len() <= NAME_MAX,
+            "{}",
+            name.as_bytes().len()
+        );
         assert!(name.as_bytes().starts_with(b".aaa"));
         assert!(name.as_bytes().ends_with(b".tmp"));
 
         let short = temp_name(OsStr::new("x"), 0);
         assert!(short.as_bytes().starts_with(b".x."));
-        assert_ne!(temp_name(OsStr::new("x"), 0), short, "Zähler macht Namen eindeutig");
+        assert_ne!(
+            temp_name(OsStr::new("x"), 0),
+            short,
+            "Zähler macht Namen eindeutig"
+        );
     }
 
     /// R2-09: Der Tempname trägt 16 Hex-Ziffern Zufall; zwei Namen
     /// unterscheiden sich darin (Kollision mit Wahrscheinlichkeit 2^-64).
     #[test]
-    fn tempname_hat_zufallsanteil() {
-        let salt_of = |name: &OsStr| -> String {
-            let text = name.to_str().expect("ascii").to_owned();
+    fn tempname_hat_zufallsanteil() -> TestResult {
+        let salt_of = |name: &OsStr| -> TestResult<String> {
+            let text = name.to_str().ok_or(TestError::Missing("ascii"))?.to_owned();
             let parts: Vec<&str> = text.rsplitn(3, '.').collect();
             // rsplitn: ["tmp", "<zufall>", ".x.<pid>.<zähler>"]
             assert_eq!(parts.first(), Some(&"tmp"), "{text}");
-            parts.get(1).map(|salt| (*salt).to_owned()).expect("zufall")
+            parts
+                .get(1)
+                .map(|salt| (*salt).to_owned())
+                .ok_or(TestError::Missing("zufall"))
         };
-        let first = salt_of(temp_name(OsStr::new("x"), 0).as_os_str());
-        let second = salt_of(temp_name(OsStr::new("x"), 0).as_os_str());
+        let first = salt_of(temp_name(OsStr::new("x"), 0).as_os_str())?;
+        let second = salt_of(temp_name(OsStr::new("x"), 0).as_os_str())?;
         for salt in [&first, &second] {
             assert_eq!(salt.len(), 16, "{salt}");
             assert!(salt.bytes().all(|byte| byte.is_ascii_hexdigit()), "{salt}");
@@ -376,67 +392,82 @@ mod tests {
         assert_ne!(first, second);
         let long = temp_name(OsStr::new(&"y".repeat(NAME_MAX)), u32::MAX);
         assert_eq!(long.as_bytes().len(), NAME_MAX);
+        Ok(())
     }
 
     /// R2-09: Für alle beschreibbares Verzeichnis ohne Sticky-Bit wird
     /// abgelehnt; mit Sticky-Bit oder ohne `o+w` geschrieben.
     #[test]
-    fn weltbeschreibbares_verzeichnis_ohne_sticky_wird_abgelehnt() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+    fn weltbeschreibbares_verzeichnis_ohne_sticky_wird_abgelehnt() -> TestResult {
+        let tmp = tempfile::tempdir()?;
         let shared = tmp.path().join("shared");
-        std::fs::create_dir(&shared).expect("mkdir");
+        std::fs::create_dir(&shared)?;
         let target = shared.join("state");
-        let chmod = |mode: u32| {
-            std::fs::set_permissions(&shared, Permissions::from_mode(mode)).expect("chmod");
+        let chmod = |mode: u32| -> io::Result<()> {
+            std::fs::set_permissions(&shared, Permissions::from_mode(mode))
         };
 
-        chmod(0o777);
-        let err = write_atomic(&target, b"x", AtomicWriteOptions::private()).unwrap_err();
-        let after_reject = dir_names(&shared);
-        chmod(0o1777);
+        chmod(0o777)?;
+        let Err(err) = write_atomic(&target, b"x", AtomicWriteOptions::private()) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        let after_reject = dir_names(&shared)?;
+        chmod(0o1777)?;
         let sticky = write_atomic(&target, b"sticky", AtomicWriteOptions::private());
-        chmod(0o770);
+        chmod(0o770)?;
         let group = write_atomic(&target, b"gruppe", AtomicWriteOptions::private());
-        chmod(0o700);
+        chmod(0o700)?;
 
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert!(after_reject.is_empty(), "keine Tempreste: {after_reject:?}");
-        sticky.expect("Sticky-Bit erlaubt");
-        group.expect("ohne o+w erlaubt");
-        assert_eq!(std::fs::read(&target).expect("read"), b"gruppe");
-        assert_eq!(dir_names(&shared), vec![OsString::from("state")]);
+        sticky.map_err(ctx("Sticky-Bit erlaubt"))?;
+        group.map_err(ctx("ohne o+w erlaubt"))?;
+        assert_eq!(std::fs::read(&target)?, b"gruppe");
+        assert_eq!(dir_names(&shared)?, vec![OsString::from("state")]);
+        Ok(())
     }
 
     #[test]
-    fn langer_dateiname_wird_geschrieben() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+    fn langer_dateiname_wird_geschrieben() -> TestResult {
+        let tmp = tempfile::tempdir()?;
         let name = "b".repeat(NAME_MAX);
         let path = tmp.path().join(&name);
-        write_atomic(&path, b"lang", AtomicWriteOptions::private()).expect("write");
-        assert_eq!(std::fs::read(&path).expect("read"), b"lang");
-        assert_eq!(dir_names(tmp.path()), vec![OsString::from(name)]);
+        write_atomic(&path, b"lang", AtomicWriteOptions::private())?;
+        assert_eq!(std::fs::read(&path)?, b"lang");
+        assert_eq!(dir_names(tmp.path())?, vec![OsString::from(name)]);
+        Ok(())
     }
 
     #[test]
-    fn ziel_verzeichnis_scheitert_ohne_reste() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+    fn ziel_verzeichnis_scheitert_ohne_reste() -> TestResult {
+        let tmp = tempfile::tempdir()?;
         let path = tmp.path().join("sub");
-        std::fs::create_dir(&path).expect("mkdir");
-        write_atomic(&path, b"x", AtomicWriteOptions::private()).unwrap_err();
-        assert_eq!(dir_names(tmp.path()), vec![OsString::from("sub")]);
-        assert!(std::fs::symlink_metadata(&path).expect("meta").is_dir());
+        std::fs::create_dir(&path)?;
+        let Err(_) = write_atomic(&path, b"x", AtomicWriteOptions::private()) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        assert_eq!(dir_names(tmp.path())?, vec![OsString::from("sub")]);
+        assert!(std::fs::symlink_metadata(&path)?.is_dir());
+        Ok(())
     }
 
     #[test]
-    fn ungueltige_pfade() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let err = write_atomic(Path::new("/"), b"x", AtomicWriteOptions::private()).unwrap_err();
+    fn ungueltige_pfade() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let Err(err) = write_atomic(Path::new("/"), b"x", AtomicWriteOptions::private()) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         let parent = tmp.path().join("..");
-        let err = write_atomic(&parent, b"x", AtomicWriteOptions::private()).unwrap_err();
+        let Err(err) = write_atomic(&parent, b"x", AtomicWriteOptions::private()) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         let missing = tmp.path().join("fehlt/datei");
-        let err = write_atomic(&missing, b"x", AtomicWriteOptions::private()).unwrap_err();
+        let Err(err) = write_atomic(&missing, b"x", AtomicWriteOptions::private()) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        Ok(())
     }
 }

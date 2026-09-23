@@ -274,6 +274,7 @@ pub fn check_dotenv_permissions(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
 
     // --- Parser-Tests ---
 
@@ -377,7 +378,7 @@ mod tests {
     // --- load_env_layer Tests ---
 
     #[test]
-    fn test_load_env_layer_profile_overrides_root() {
+    fn test_load_env_layer_profile_overrides_root() -> TestResult {
         use std::io::Write;
 
         let dir = std::env::temp_dir();
@@ -386,25 +387,26 @@ mod tests {
 
         // Root definiert KEY=root
         {
-            let mut f = std::fs::File::create(&root_env).unwrap();
-            writeln!(f, "KEY=root").unwrap();
-            writeln!(f, "ONLY_ROOT=yes").unwrap();
+            let mut f = std::fs::File::create(&root_env).map_err(ctx("root_env anlegen"))?;
+            writeln!(f, "KEY=root").map_err(ctx("KEY=root schreiben"))?;
+            writeln!(f, "ONLY_ROOT=yes").map_err(ctx("ONLY_ROOT=yes schreiben"))?;
         }
         // Profil definiert KEY=profile
         {
-            let mut f = std::fs::File::create(&profile_env).unwrap();
-            writeln!(f, "KEY=profile").unwrap();
+            let mut f = std::fs::File::create(&profile_env).map_err(ctx("profile_env anlegen"))?;
+            writeln!(f, "KEY=profile").map_err(ctx("KEY=profile schreiben"))?;
         }
 
         // Wir modellieren zwei "Layer"-Verzeichnisse als Elternverzeichnisse der .env-Dateien.
         // Da load_env_layer `layer.join(".env")` ruft, brauchen wir Verzeichnisse mit .env-Dateien.
         let root_dir = dir.join("harw_test_root_layerdir");
         let profile_dir_path = dir.join("harw_test_profile_layerdir");
-        std::fs::create_dir_all(&root_dir).unwrap();
-        std::fs::create_dir_all(&profile_dir_path).unwrap();
+        std::fs::create_dir_all(&root_dir).map_err(ctx("root_dir anlegen"))?;
+        std::fs::create_dir_all(&profile_dir_path).map_err(ctx("profile_dir anlegen"))?;
 
-        std::fs::copy(&root_env, root_dir.join(".env")).unwrap();
-        std::fs::copy(&profile_env, profile_dir_path.join(".env")).unwrap();
+        std::fs::copy(&root_env, root_dir.join(".env")).map_err(ctx("root .env kopieren"))?;
+        std::fs::copy(&profile_env, profile_dir_path.join(".env"))
+            .map_err(ctx("profile .env kopieren"))?;
 
         let layers = vec![root_dir.clone(), profile_dir_path.clone()];
         let merged = load_env_layer(&layers);
@@ -419,5 +421,6 @@ mod tests {
         let _ = std::fs::remove_file(profile_env);
         let _ = std::fs::remove_dir_all(root_dir);
         let _ = std::fs::remove_dir_all(profile_dir_path);
+        Ok(())
     }
 }

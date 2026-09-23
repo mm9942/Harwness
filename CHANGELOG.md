@@ -13,6 +13,30 @@ Semantic Versioning within the 0.x pre-release range.
   defaults to the current directory). A project's repo-local `.harw` configuration
   layer is now loaded only for projects that have been explicitly trusted this way.
 
+**Shell-Completions (`harw completions`)**
+- Neuer Befehl `harw completions [SHELL] [--install|--uninstall] [--dry-run]`
+  (bash, zsh, fish, elvish, powershell; ohne `SHELL` wird die Shell aus
+  `$SHELL` erkannt). Ohne Flag wird das Skript wie bisher auf stdout
+  ausgegeben. `--install` schreibt es an den kanonischen Ort (zsh:
+  `$ZSH_CUSTOM/completions/_harw` bei oh-my-zsh, sonst
+  `~/.local/share/zsh/site-functions/_harw` plus verwalteter `fpath`-Block in
+  `.zshrc` vor `compinit`; bash:
+  `~/.local/share/bash-completion/completions/harw`; fish:
+  `~/.config/fish/completions/harw.fish`) und ersetzt dabei ältere
+  harw-verwaltete Installationen samt veralteter Pfade, rc-Blöcke und
+  `.zcompdump*`-Caches, statt sie zu stapeln. `--uninstall` entfernt all das,
+  `--dry-run` zeigt nur an, was geschehen würde. `--all-binaries` ruft
+  zusätzlich `completions` für jedes auf `$PATH` gefundene DoD-Binary auf.
+  `harw completion` bleibt als verstecktes Alias erhalten.
+- Neue Crate `harw-completions`: Skripterzeugung mit Verwaltungsmarker,
+  Ortsauflösung pro Shell, Installation/Deinstallation sowie die
+  wiederverwendbaren clap-Argumente (`CompletionsArgs`,
+  `CompletionsSubcommand`, Feature `clap-args`).
+- Die DoD-Binaries `harw-sentinel`, `harw-warden`, `harw-probe-fs` und
+  `harw-probe-bpf` haben einen Unterbefehl `completions` mit denselben
+  Optionen erhalten; er läuft vor jedem Sensor-, Socket- oder
+  Landlock-Start.
+
 **Freigaben, Regeln und Lebensdauern (Scopes)**
 - Neuer `SettingScope`-Typ (`harw-config/src/scope.rs`) für die drei Lebensdauern
   einer Einstellung: `Session` (nur im Speicher), `Project` (dauerhaft pro Projekt,
@@ -124,6 +148,21 @@ Semantic Versioning within the 0.x pre-release range.
   ausgelassen, bevor die Nutzernachricht selbst gefährdet wäre.
 
 ### Changed
+
+- **CLI-Werte werden beim Parsen geprüft.** Ein ungültiger `--log`-Filter oder
+  ein unbekannter `--mode` ist jetzt ein Parse-Fehler (vorher stillschweigend
+  akzeptiert). Feste Wertemengen sind als Enums typisiert und erscheinen in
+  `--help` und in den Shell-Completions: `connect --channel`,
+  `uninstall --scope`, `auth login|token --provider`, `auth import --source`,
+  `mcp setup|check --server`, `lens build --source`,
+  `settings provider add --api`, `settings permissions set-mode` und
+  `models internal openrouter-defaults`. Pfad-, URL- und Freitext-Argumente
+  tragen passende Value-Hints.
+
+- **Auto-Compact löst bei 500 000 Input-Tokens aus** (vorher 120 000):
+  `DEFAULT_ABSOLUTE_CEILING_TOKENS` (`harw-core/src/auto_compact.rs`) steuert
+  über den absoluten Deckel der `AutoCompactPolicy`, wie `maybe_compact`
+  (`turn_loop.rs`) aus `last_round_usage.input_tokens` entscheidet.
 
 - `harw web` no longer accepts `--config-dir`; the root space is resolved exclusively
   from `--home`/`HARW_HOME`, which is now required. The web surface's permission

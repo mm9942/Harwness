@@ -170,6 +170,7 @@ fn sanitize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResult, ctx};
     use harw_core::ModelRequest;
     use harw_tools::{FunctionToolSpec, JsonSchema, JsonSchemaType, ToolName, ToolSpec};
     use harw_types::ToolCallId;
@@ -191,6 +192,7 @@ mod tests {
             max_output_tokens: None,
             tool_result_max_bytes: None,
             cancel: None,
+            identity: None,
         }
     }
 
@@ -239,10 +241,10 @@ mod tests {
     }
 
     #[test]
-    fn test_for_request_registers_history_tool_call_names() {
+    fn test_for_request_registers_history_tool_call_names() -> TestResult {
         let mut history = harw_core::ConversationHistory::new();
         history.push_tool_call(
-            ToolCallId::try_from_str("call-1").expect("valid call id"),
+            ToolCallId::try_from_str("call-1").map_err(ctx("valid call id"))?,
             "context.load",
             serde_json::json!({}),
         );
@@ -254,6 +256,7 @@ mod tests {
 
         assert_eq!(codec.encode("context.load"), "context_load");
         assert_eq!(codec.decode("context_load"), "context.load");
+        Ok(())
     }
 
     #[test]

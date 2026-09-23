@@ -59,6 +59,9 @@ pub mod open;
 pub mod perm;
 pub mod walk;
 
+#[cfg(test)]
+mod test_support;
+
 pub use atomic::{AtomicWriteOptions, write_atomic};
 pub use open::{OpenMode, is_symlink_loop, open_beneath, open_dir_nofollow, open_nofollow};
 pub use perm::ensure_private_regular;

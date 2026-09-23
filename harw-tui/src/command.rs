@@ -137,11 +137,16 @@ mod tests {
     use super::{
         BusyAvailability, CommandDomain, CommandName, CommandScope, CommandSpec, OutputSurface,
     };
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::{CommandError, PermissionTier};
 
     #[test]
-    fn command_name_parse_retains_the_invalid_input() {
-        let error = CommandName::parse("Uppercase").expect_err("uppercase names must fail");
+    fn command_name_parse_retains_the_invalid_input() -> TestResult {
+        let Err(error) = CommandName::parse("Uppercase") else {
+            return Err(TestError::Unexpected(
+                "uppercase names must fail".to_owned(),
+            ));
+        };
 
         assert_eq!(
             error,
@@ -149,19 +154,23 @@ mod tests {
                 input: "Uppercase".to_owned(),
             }
         );
+        Ok(())
     }
 
     #[test]
-    fn command_spec_rejects_an_invalid_alias_with_a_typed_error() {
-        let error = CommandSpec::new(
+    fn command_spec_rejects_an_invalid_alias_with_a_typed_error() -> TestResult {
+        let Err(error) = CommandSpec::new(
             "status",
             ["not_an_alias"],
             CommandScope::TuiOnly,
             PermissionTier::Observer,
             OutputSurface::Inline,
             CommandDomain::SessionLifecycle,
-        )
-        .expect_err("underscores are not valid command aliases");
+        ) else {
+            return Err(TestError::Unexpected(
+                "underscores are not valid command aliases".to_owned(),
+            ));
+        };
 
         assert_eq!(
             error,
@@ -169,10 +178,11 @@ mod tests {
                 input: "not_an_alias".to_owned(),
             }
         );
+        Ok(())
     }
 
     #[test]
-    fn command_spec_new_defaults_busy_to_deferred_until_turn_end() {
+    fn command_spec_new_defaults_busy_to_deferred_until_turn_end() -> TestResult {
         let spec = CommandSpec::new(
             "status",
             Vec::<String>::new(),
@@ -181,7 +191,7 @@ mod tests {
             OutputSurface::Inline,
             CommandDomain::SessionLifecycle,
         )
-        .expect("valid spec must construct");
+        .map_err(ctx("valid spec must construct"))?;
 
         assert_eq!(
             spec.busy,
@@ -189,10 +199,11 @@ mod tests {
             "CommandSpec::new must default busy to DeferredUntilTurnEnd, matching \
              OperationMeta::busy's default"
         );
+        Ok(())
     }
 
     #[test]
-    fn command_spec_busy_field_can_be_set_to_immediate() {
+    fn command_spec_busy_field_can_be_set_to_immediate() -> TestResult {
         let mut spec = CommandSpec::new(
             "status",
             Vec::<String>::new(),
@@ -201,9 +212,10 @@ mod tests {
             OutputSurface::Inline,
             CommandDomain::SessionLifecycle,
         )
-        .expect("valid spec must construct");
+        .map_err(ctx("valid spec must construct"))?;
         spec.busy = BusyAvailability::Immediate;
 
         assert_eq!(spec.busy, BusyAvailability::Immediate);
+        Ok(())
     }
 }

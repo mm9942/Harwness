@@ -183,12 +183,17 @@ fn try_persist_default_selection(
     let profile_dir = harw_home::profile_dir(&home, &profile).map_err(|error| error.to_string())?;
     let config_path = profile_dir.join("config.toml");
 
-    let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(|error| error.to_string())?;
+    let mut writer =
+        harw_config::ConfigWriter::open(&config_path).map_err(|error| error.to_string())?;
     if let Some(provider) = default_provider {
-        writer.set_value("default_provider", toml_edit::value(provider));
+        writer
+            .set_value("default_provider", toml_edit::value(provider))
+            .map_err(|error| error.to_string())?;
     }
     if let Some(model) = default_model {
-        writer.set_value("default_model", toml_edit::value(model));
+        writer
+            .set_value("default_model", toml_edit::value(model))
+            .map_err(|error| error.to_string())?;
     }
     writer.save().map_err(|error| error.to_string())
 }
@@ -254,12 +259,17 @@ fn try_persist_uia_selection(
     let profile_dir = harw_home::profile_dir(&home, &profile).map_err(|error| error.to_string())?;
     let config_path = profile_dir.join("config.toml");
 
-    let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(|error| error.to_string())?;
+    let mut writer =
+        harw_config::ConfigWriter::open(&config_path).map_err(|error| error.to_string())?;
     if let Some(provider) = uia_provider {
-        writer.set_value("uia_provider", toml_edit::value(provider));
+        writer
+            .set_value("uia_provider", toml_edit::value(provider))
+            .map_err(|error| error.to_string())?;
     }
     match uia_model {
-        Some(model) => writer.set_value("uia_model", toml_edit::value(model)),
+        Some(model) => writer
+            .set_value("uia_model", toml_edit::value(model))
+            .map_err(|error| error.to_string())?,
         None => {
             writer.remove_value("uia_model");
         }
@@ -324,9 +334,12 @@ fn try_persist_uia_worker_model(model: Option<&str>) -> Result<(), String> {
     let profile_dir = harw_home::profile_dir(&home, &profile).map_err(|error| error.to_string())?;
     let config_path = profile_dir.join("config.toml");
 
-    let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(|error| error.to_string())?;
+    let mut writer =
+        harw_config::ConfigWriter::open(&config_path).map_err(|error| error.to_string())?;
     match model {
-        Some(model) => writer.set_value("uia_worker_model", toml_edit::value(model)),
+        Some(model) => writer
+            .set_value("uia_worker_model", toml_edit::value(model))
+            .map_err(|error| error.to_string())?,
         None => {
             writer.remove_value("uia_worker_model");
         }
@@ -399,9 +412,12 @@ fn try_persist_uia_reasoning_effort(effort: Option<&str>) -> Result<(), String> 
     let profile_dir = harw_home::profile_dir(&home, &profile).map_err(|error| error.to_string())?;
     let config_path = profile_dir.join("config.toml");
 
-    let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(|error| error.to_string())?;
+    let mut writer =
+        harw_config::ConfigWriter::open(&config_path).map_err(|error| error.to_string())?;
     match effort {
-        Some(level) => writer.set_value("reasoning.uia", toml_edit::value(level)),
+        Some(level) => writer
+            .set_value("reasoning.uia", toml_edit::value(level))
+            .map_err(|error| error.to_string())?,
         None => {
             writer.remove_value("reasoning.uia");
         }
@@ -646,13 +662,17 @@ mod tests {
         FileSelectionPersistence, OpError, RecordedSelectionPersistCall,
         RecordingSelectionPersistence, SelectionPersistence, execution_error,
     };
+    use crate::test_support::{TestResult, ctx};
 
     #[test]
     fn recording_selection_persistence_records_default_selection_call() {
         let recorder = RecordingSelectionPersistence::new();
         let note = recorder.persist_default_selection(Some("openai"), Some("gpt-test"));
 
-        assert!(note.is_none(), "recording persistence never fails: {note:?}");
+        assert!(
+            note.is_none(),
+            "recording persistence never fails: {note:?}"
+        );
         assert_eq!(
             recorder.calls(),
             vec![RecordedSelectionPersistCall::DefaultSelection {
@@ -737,22 +757,30 @@ mod tests {
     // Der Rundlauf testet daher denselben `ConfigWriter`-Schreibpfad direkt
     // gegen ein temporäres Verzeichnis.
     #[test]
-    fn test_uia_selection_persistence_round_trip_writes_uia_keys() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_uia_selection_persistence_round_trip_writes_uia_keys() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let config_path = dir.path().join("config.toml");
 
-        let mut writer = harw_config::ConfigWriter::open(&config_path).expect("open");
-        writer.set_value("uia_provider", toml_edit::value("anthropic"));
-        writer.set_value("uia_model", toml_edit::value("claude-x"));
-        writer.save().expect("save");
+        let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(ctx("open"))?;
+        writer
+            .set_value("uia_provider", toml_edit::value("anthropic"))
+            .map_err(ctx("set_value uia_provider"))?;
+        writer
+            .set_value("uia_model", toml_edit::value("claude-x"))
+            .map_err(ctx("set_value uia_model"))?;
+        writer.save().map_err(ctx("save"))?;
 
-        let reopened = harw_config::ConfigWriter::open(&config_path).expect("reopen");
-        assert_eq!(reopened.get_value("uia_provider"), Some("anthropic".to_owned()));
+        let reopened = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen"))?;
+        assert_eq!(
+            reopened.get_value("uia_provider"),
+            Some("anthropic".to_owned())
+        );
         assert_eq!(reopened.get_value("uia_model"), Some("claude-x".to_owned()));
 
-        let content = std::fs::read_to_string(&config_path).expect("read back");
+        let content = std::fs::read_to_string(&config_path).map_err(ctx("read back"))?;
         assert!(content.contains("uia_provider"));
         assert!(content.contains("uia_model"));
+        Ok(())
     }
 
     // ── uia_worker_model-Persistenz-Rundlauf, ohne echte HARW_HOME-Env-Mutation ──
@@ -762,30 +790,35 @@ mod tests {
     // des `None`-Zweigs, der (anders als bei `persist_default_selection`/
     // `persist_uia_selection`) eine explizite Entfernung ist, kein "unverändert lassen".
     #[test]
-    fn test_uia_worker_model_persistence_round_trip_writes_and_removes_the_key() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_uia_worker_model_persistence_round_trip_writes_and_removes_the_key() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let config_path = dir.path().join("config.toml");
 
-        let mut writer = harw_config::ConfigWriter::open(&config_path).expect("open");
-        writer.set_value("uia_worker_model", toml_edit::value("claude-worker-x"));
-        writer.save().expect("save");
+        let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(ctx("open"))?;
+        writer
+            .set_value("uia_worker_model", toml_edit::value("claude-worker-x"))
+            .map_err(ctx("set_value uia_worker_model"))?;
+        writer.save().map_err(ctx("save"))?;
 
-        let reopened = harw_config::ConfigWriter::open(&config_path).expect("reopen");
+        let reopened = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen"))?;
         assert_eq!(
             reopened.get_value("uia_worker_model"),
             Some("claude-worker-x".to_owned())
         );
-        let content = std::fs::read_to_string(&config_path).expect("read back");
+        let content = std::fs::read_to_string(&config_path).map_err(ctx("read back"))?;
         assert!(content.contains("uia_worker_model"));
 
         // `None` removes the key (an explicit action, unlike the "leave
         // unchanged" semantics of `persist_default_selection`/`persist_uia_selection`).
-        let mut writer = harw_config::ConfigWriter::open(&config_path).expect("reopen for removal");
+        let mut writer =
+            harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen for removal"))?;
         assert!(writer.remove_value("uia_worker_model"));
-        writer.save().expect("save after removal");
+        writer.save().map_err(ctx("save after removal"))?;
 
-        let reopened = harw_config::ConfigWriter::open(&config_path).expect("reopen after removal");
+        let reopened =
+            harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen after removal"))?;
         assert!(reopened.get_value("uia_worker_model").is_none());
+        Ok(())
     }
 
     // ── reasoning.uia-Persistenz-Rundlauf, ohne echte HARW_HOME-Env-Mutation ──
@@ -797,27 +830,33 @@ mod tests {
     // `uia_provider`) und des `None`-Zweigs, der (analog zu
     // `persist_uia_worker_model`) eine explizite Entfernung ist.
     #[test]
-    fn test_uia_reasoning_effort_persistence_round_trip_writes_and_removes_the_nested_key() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_uia_reasoning_effort_persistence_round_trip_writes_and_removes_the_nested_key()
+    -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let config_path = dir.path().join("config.toml");
 
-        let mut writer = harw_config::ConfigWriter::open(&config_path).expect("open");
-        writer.set_value("reasoning.uia", toml_edit::value("high"));
-        writer.save().expect("save");
+        let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(ctx("open"))?;
+        writer
+            .set_value("reasoning.uia", toml_edit::value("high"))
+            .map_err(ctx("set_value reasoning.uia"))?;
+        writer.save().map_err(ctx("save"))?;
 
-        let reopened = harw_config::ConfigWriter::open(&config_path).expect("reopen");
+        let reopened = harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen"))?;
         assert_eq!(reopened.get_value("reasoning.uia"), Some("high".to_owned()));
-        let content = std::fs::read_to_string(&config_path).expect("read back");
+        let content = std::fs::read_to_string(&config_path).map_err(ctx("read back"))?;
         assert!(content.contains("[reasoning]"));
         assert!(content.contains("uia = \"high\""));
 
         // `None` removes only the leaf key; the `[reasoning]` table itself is
         // left in place (see `ConfigWriter::remove_value` doc comment).
-        let mut writer = harw_config::ConfigWriter::open(&config_path).expect("reopen for removal");
+        let mut writer =
+            harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen for removal"))?;
         assert!(writer.remove_value("reasoning.uia"));
-        writer.save().expect("save after removal");
+        writer.save().map_err(ctx("save after removal"))?;
 
-        let reopened = harw_config::ConfigWriter::open(&config_path).expect("reopen after removal");
+        let reopened =
+            harw_config::ConfigWriter::open(&config_path).map_err(ctx("reopen after removal"))?;
         assert!(reopened.get_value("reasoning.uia").is_none());
+        Ok(())
     }
 }

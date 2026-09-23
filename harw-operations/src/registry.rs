@@ -689,10 +689,12 @@ mod tests {
     use std::sync::{Arc, OnceLock};
 
     use super::OperationRegistry;
+    use crate::error::OpError;
     use crate::operation::{
         ApprovalPolicy, BusyAvailability, CommandVisibility, OpFuture, OpInput, Operation,
         OperationCategory, OperationDomain, OperationMeta, PermissionTier, Surface, WebMethod,
     };
+    use crate::test_support::{TestError, TestResult};
 
     // ── Fixtures ─────────────────────────────────────────────────────────────
 
@@ -725,7 +727,11 @@ mod tests {
         }
 
         fn run<'a>(&'a self, _ctx: &'a crate::context::OpContext, _input: OpInput) -> OpFuture<'a> {
-            unimplemented!("TestOp::run wird in Registry-Tests nicht aufgerufen")
+            Box::pin(async {
+                Err(OpError::Execution(
+                    "TestOp::run wird in Registry-Tests nicht aufgerufen".to_owned(),
+                ))
+            })
         }
     }
 
@@ -785,7 +791,7 @@ mod tests {
     // ── 2. register() fügt Op hinzu; find_by_name findet sie ─────────────────
 
     #[test]
-    fn test_register_and_find_by_name() {
+    fn test_register_and_find_by_name() -> TestResult {
         let mut registry = OperationRegistry::new();
         let op = make_plain_op("status");
         registry.register(Arc::clone(&op));
@@ -796,7 +802,14 @@ mod tests {
             found.is_some(),
             "find_by_name('status') sollte Some zurückgeben"
         );
-        assert_eq!(found.unwrap().meta().name, "status");
+        assert_eq!(
+            found
+                .ok_or(TestError::Missing("find_by_name('status')"))?
+                .meta()
+                .name,
+            "status"
+        );
+        Ok(())
     }
 
     // ── 3. find_by_name mit unbekanntem Namen → None ──────────────────────────
@@ -813,7 +826,7 @@ mod tests {
     // ── 4. find_by_command findet Op mit Surface::Command ────────────────────
 
     #[test]
-    fn test_find_by_command_matches_surface_path() {
+    fn test_find_by_command_matches_surface_path() -> TestResult {
         let mut registry = OperationRegistry::new();
         registry.register(make_command_op("foo-op", "/foo"));
 
@@ -822,7 +835,14 @@ mod tests {
             found.is_some(),
             "find_by_command('/foo') sollte Some zurückgeben"
         );
-        assert_eq!(found.unwrap().meta().name, "foo-op");
+        assert_eq!(
+            found
+                .ok_or(TestError::Missing("find_by_command('/foo')"))?
+                .meta()
+                .name,
+            "foo-op"
+        );
+        Ok(())
     }
 
     // ── 5. find_by_command mit unbekanntem Pfad → None ───────────────────────
@@ -960,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn test_try_register_returns_err_on_duplicate_names() {
+    fn test_try_register_returns_err_on_duplicate_names() -> TestResult {
         use super::RegistryError;
         let mut registry = OperationRegistry::new();
         // First registration succeeds.
@@ -985,7 +1005,9 @@ mod tests {
         );
         // Registry must still contain only the original op.
         assert_eq!(registry.len(), 1);
-        let found = registry.find_by_name("dup").unwrap();
+        let found = registry
+            .find_by_name("dup")
+            .ok_or(TestError::Missing("find_by_name('dup')"))?;
         let has_first = found
             .meta()
             .surfaces
@@ -995,6 +1017,7 @@ mod tests {
             has_first,
             "find_by_name should return the first (oldest) op"
         );
+        Ok(())
     }
 
     #[test]
@@ -1125,7 +1148,11 @@ mod tests {
                 _ctx: &'a crate::context::OpContext,
                 _input: OpInput,
             ) -> OpFuture<'a> {
-                unimplemented!()
+                Box::pin(async {
+                    Err(OpError::Execution(
+                        "run() wird in Registry-Tests nicht aufgerufen".to_owned(),
+                    ))
+                })
             }
         }
 
@@ -1154,7 +1181,11 @@ mod tests {
                 _ctx: &'a crate::context::OpContext,
                 _input: OpInput,
             ) -> OpFuture<'a> {
-                unimplemented!()
+                Box::pin(async {
+                    Err(OpError::Execution(
+                        "run() wird in Registry-Tests nicht aufgerufen".to_owned(),
+                    ))
+                })
             }
         }
 
@@ -1193,7 +1224,11 @@ mod tests {
                 _ctx: &'a crate::context::OpContext,
                 _input: OpInput,
             ) -> OpFuture<'a> {
-                unimplemented!()
+                Box::pin(async {
+                    Err(OpError::Execution(
+                        "run() wird in Registry-Tests nicht aufgerufen".to_owned(),
+                    ))
+                })
             }
         }
 
@@ -1226,7 +1261,7 @@ mod tests {
     // Statischer OnceLock-Test: Prüft, dass eine Op mit OnceLock<OperationMeta>
     // stabil dieselbe Referenz liefert (wie Built-in-Ops es tun würden).
     #[test]
-    fn test_once_lock_op_meta_stable_reference() {
+    fn test_once_lock_op_meta_stable_reference() -> TestResult {
         struct StableOp;
 
         impl Operation for StableOp {
@@ -1251,16 +1286,23 @@ mod tests {
                 _ctx: &'a crate::context::OpContext,
                 _input: OpInput,
             ) -> OpFuture<'a> {
-                unimplemented!()
+                Box::pin(async {
+                    Err(OpError::Execution(
+                        "run() wird in Registry-Tests nicht aufgerufen".to_owned(),
+                    ))
+                })
             }
         }
 
         let mut registry = OperationRegistry::new();
         registry.register(Arc::new(StableOp));
 
-        let found = registry.find_by_name("stable").unwrap();
+        let found = registry
+            .find_by_name("stable")
+            .ok_or(TestError::Missing("find_by_name('stable')"))?;
         let ptr1 = found.meta() as *const OperationMeta;
         let ptr2 = found.meta() as *const OperationMeta;
         assert_eq!(ptr1, ptr2, "OnceLock-Meta muss dieselbe Adresse liefern");
+        Ok(())
     }
 }

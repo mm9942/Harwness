@@ -424,9 +424,10 @@ fn is_atom(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use serde_json::json;
 
-    fn message() -> RawMessage {
+    fn message() -> TestResult<RawMessage> {
         serde_json::from_value(json!({
             "message_id": 7,
             "chat": { "id": -10042, "type": "supergroup", "title": "Ops" },
@@ -437,19 +438,20 @@ mod tests {
             "document": { "file_id": "doc-1", "file_name": "brief.txt", "mime_type": "text/plain", "file_size": 12 },
             "photo": [{ "file_id": "photo-small", "file_size": 1 }, { "file_id": "photo-large", "file_size": 2 }]
         }))
-        .expect("test message JSON is valid")
+        .map_err(ctx("test message JSON is valid"))
     }
 
     #[test]
-    fn serde_mapping_preserves_routing_identity_and_conservative_attachments() {
+    fn serde_mapping_preserves_routing_identity_and_conservative_attachments() -> TestResult {
         let update = RawUpdate {
             update_id: 123,
-            message: Some(message()),
+            message: Some(message()?),
             edited_message: None,
             callback_query: None,
         };
 
-        let event = map_update(&update, 700, Some("@harwbot")).expect("message maps");
+        let event =
+            map_update(&update, 700, Some("@harwbot")).ok_or(TestError::Missing("message maps"))?;
         assert_eq!(event.channel.as_str(), "telegram");
         assert_eq!(event.peer.as_str(), "-10042");
         assert_eq!(event.thread.as_ref().map(ThreadRef::as_str), Some("33"));
@@ -467,11 +469,12 @@ mod tests {
         assert_eq!(event.attachments.len(), 2);
         assert_eq!(event.attachments[0].remote_id, "doc-1");
         assert_eq!(event.attachments[1].remote_id, "photo-large");
+        Ok(())
     }
 
     #[test]
-    fn mapping_uses_caption_entities_and_reply_to_bot_but_not_unstructured_text() {
-        let mut caption_message = message();
+    fn mapping_uses_caption_entities_and_reply_to_bot_but_not_unstructured_text() -> TestResult {
+        let mut caption_message = message()?;
         caption_message.text = None;
         caption_message.entities.clear();
         caption_message.caption = Some("look @harwbot".to_owned());
@@ -491,10 +494,10 @@ mod tests {
             700,
             Some("@harwbot"),
         )
-        .expect("caption maps");
+        .ok_or(TestError::Missing("caption maps"))?;
         assert!(caption_event.mentioned);
 
-        let mut reply_message = message();
+        let mut reply_message = message()?;
         reply_message.text = Some("not an @harwbot mention without an entity".to_owned());
         reply_message.entities.clear();
         reply_message.reply_to_message = Some(Box::new(RawMessage {
@@ -530,12 +533,13 @@ mod tests {
             700,
             Some("harwbot"),
         )
-        .expect("reply maps");
+        .ok_or(TestError::Missing("reply maps"))?;
         assert!(reply_event.mentioned);
+        Ok(())
     }
 
     #[test]
-    fn callback_is_serde_deserializable_but_not_mapped_as_message_input() {
+    fn callback_is_serde_deserializable_but_not_mapped_as_message_input() -> TestResult {
         let update = RawUpdate {
             update_id: 22,
             message: None,
@@ -549,11 +553,12 @@ mod tests {
                     last_name: None,
                     username: None,
                 },
-                message: Some(message()),
+                message: Some(message()?),
                 data: Some("opaque-approval-token".to_owned()),
             }),
         };
         assert!(map_update(&update, 700, Some("harwbot")).is_none());
+        Ok(())
     }
 
     #[test]
@@ -633,8 +638,8 @@ mod tests {
     }
 
     #[test]
-    fn utf16_entity_offsets_support_non_ascii_prefixes() {
-        let mut message = message();
+    fn utf16_entity_offsets_support_non_ascii_prefixes() -> TestResult {
+        let mut message = message()?;
         message.text = Some("🙂 @harwbot".to_owned());
         message.entities = vec![RawMessageEntity {
             kind: "mention".to_owned(),
@@ -652,8 +657,9 @@ mod tests {
             700,
             Some("harwbot"),
         )
-        .expect("message maps");
+        .ok_or(TestError::Missing("message maps"))?;
         assert!(event.mentioned);
+        Ok(())
     }
 
     #[test]
@@ -690,8 +696,8 @@ mod tests {
     }
 
     #[test]
-    fn text_mention_entity_uses_bot_id_without_a_username() {
-        let mut message = message();
+    fn text_mention_entity_uses_bot_id_without_a_username() -> TestResult {
+        let mut message = message()?;
         message.text = Some("for Harw".to_owned());
         message.entities = vec![RawMessageEntity {
             kind: "text_mention".to_owned(),
@@ -715,7 +721,8 @@ mod tests {
             700,
             None,
         )
-        .expect("message maps");
+        .ok_or(TestError::Missing("message maps"))?;
         assert!(event.mentioned);
+        Ok(())
     }
 }

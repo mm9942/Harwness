@@ -944,7 +944,9 @@ fn render_check(store: &dyn GoalStore, ctx: &OpContext) -> Result<String, OpErro
 mod tests {
     use super::{GoalArgs, GoalCall};
     use crate::plan::CallSurface;
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
+    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_operations::context::ServiceMap;
     use harw_operations::{FromRawArgs, OpContext, OpError};
     use harw_plan::actions::PlanAction;
@@ -953,13 +955,12 @@ mod tests {
     use harw_plan::ids::{PlanId, TaskId};
     use harw_plan::types::{EvidenceKind, EvidenceRef, PlanNode, PlanNodeKind, PlanNodeStatus};
     use harw_plan::{InMemoryGoalStore, InMemoryPlanStore, PlanStore, PlanToolConfig};
-    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{
         IngressSurface, PermissionTier, Principal, PrincipalKind, SessionId, TenantId, TurnId,
         WorkspaceId,
     };
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use time::OffsetDateTime;
 
     // ── Goal-Store: echte Implementierung ────────────────────────────────────
@@ -989,14 +990,14 @@ mod tests {
     /// einen authentifizierten Principal verlangen (siehe `plan.rs`), bräuchte
     /// jeder Testfall sonst individuell einen — dieselbe Konvention wie
     /// `plan::tests::context_with`.
-    fn context_with(mut services: ServiceMap) -> (OpContext, std::path::PathBuf) {
+    fn context_with(mut services: ServiceMap) -> TestResult<(OpContext, std::path::PathBuf)> {
         if services.get::<Principal>().is_none() {
             services.insert(human_principal());
         }
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!("harw-goal-op-{}-{id}", std::process::id()));
-        std::fs::create_dir_all(root.join("ws")).expect("Test-Workspace anlegen");
+        std::fs::create_dir_all(root.join("ws")).map_err(ctx("Test-Workspace anlegen"))?;
         let registry = WorkspaceRegistry::build(
             &root,
             [WorkspaceRegistration {
@@ -1005,35 +1006,38 @@ mod tests {
                 root: std::path::PathBuf::from("ws"),
             }],
         )
-        .expect("WorkspaceRegistry bauen");
+        .map_err(ctx("WorkspaceRegistry bauen"))?;
         let binding = registry
             .resolve(
                 &TenantId::from_str("test-tenant"),
                 &WorkspaceId::from_str("ws"),
             )
-            .expect("Workspace auflösen");
+            .map_err(ctx("Workspace auflösen"))?;
         let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
-        (
+        Ok((
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, services),
             root,
-        )
+        ))
     }
 
-    /// Kontext mit aktiviertem Werkzeug, Goal-Store und Plan-Store.
-    fn context_with_stores() -> (
+    /// Lokaler Alias, damit die Signatur nicht clippy::type_complexity auslöst.
+    type ContextWithStores = TestResult<(
         OpContext,
         Arc<dyn GoalStore>,
         Arc<dyn PlanStore>,
         std::path::PathBuf,
-    ) {
+    )>;
+
+    /// Kontext mit aktiviertem Werkzeug, Goal-Store und Plan-Store.
+    fn context_with_stores() -> ContextWithStores {
         let goal_store: Arc<dyn GoalStore> = Arc::new(InMemoryGoalStore::default());
         let plan_store: Arc<dyn PlanStore> = Arc::new(InMemoryPlanStore::new());
         let mut services = ServiceMap::new();
         services.insert(Arc::clone(&goal_store));
         services.insert(Arc::clone(&plan_store));
         services.insert(PlanToolConfig::enabled_defaults());
-        let (ctx, root) = context_with(services);
-        (ctx, goal_store, plan_store, root)
+        let (ctx, root) = context_with(services)?;
+        Ok((ctx, goal_store, plan_store, root))
     }
 
     fn cleanup(root: std::path::PathBuf) {
@@ -1071,7 +1075,7 @@ mod tests {
 
     /// Legt einen Plan mit einem abgeschlossenen Knoten an, der genau einen
     /// `manual`-Nachweis mit dem übergebenen Lokator trägt.
-    fn seed_completed_plan(store: &dyn PlanStore, locator: &str) {
+    fn seed_completed_plan(store: &dyn PlanStore, locator: &str) -> TestResult {
         let seeded = store
             .apply(
                 PlanAction::Create {
@@ -1134,21 +1138,29 @@ mod tests {
                 )
             });
         if let Err(error) = seeded {
-            panic!("Plan-Fixture schlug fehl: {error}");
+            return Err(TestError::Unexpected(format!(
+                "Plan-Fixture schlug fehl: {error}"
+            )));
         }
+        Ok(())
     }
 
     // ── Argument-Parsing ─────────────────────────────────────────────────────
 
     #[test]
-    fn from_raw_args_without_tokens_uses_default_subcommand_show() {
+    fn from_raw_args_without_tokens_uses_default_subcommand_show() -> TestResult {
         match GoalCall::from_raw_args(&toks(&[])) {
             Ok(call) => {
                 assert_eq!(call.surface, CallSurface::Command);
                 assert!(matches!(call.args, GoalArgs::Show));
             }
-            Err(error) => panic!("leerer Input muss den Default liefern: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "leerer Input muss den Default liefern: {error}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
@@ -1160,7 +1172,7 @@ mod tests {
     }
 
     #[test]
-    fn from_raw_args_set_takes_id_and_joined_statement() {
+    fn from_raw_args_set_takes_id_and_joined_statement() -> TestResult {
         match GoalCall::from_raw_args(&toks(&["set", "g-1", "Alles", "grün"])) {
             Ok(GoalCall {
                 args: GoalArgs::Set { id, statement },
@@ -1170,53 +1182,83 @@ mod tests {
                 assert_eq!(id.as_deref(), Some("g-1"));
                 assert_eq!(statement.as_deref(), Some("Alles grün"));
             }
-            other => panic!("erwartet Set, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Set, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn from_raw_args_joined_single_argument_subcommands_parse() {
+    fn from_raw_args_joined_single_argument_subcommands_parse() -> TestResult {
         match GoalCall::from_raw_args(&toks(&["refine", "Neuer", "Wortlaut"])).map(|c| c.args) {
             Ok(GoalArgs::Refine { statement }) => {
                 assert_eq!(statement.as_deref(), Some("Neuer Wortlaut"));
             }
-            other => panic!("erwartet Refine, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Refine, war: {other:?}"
+                )));
+            }
         }
         match GoalCall::from_raw_args(&toks(&["criteria", "Tests", "grün"])).map(|c| c.args) {
             Ok(GoalArgs::Criteria { description }) => {
                 assert_eq!(description.as_deref(), Some("Tests grün"));
             }
-            other => panic!("erwartet Criteria, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Criteria, war: {other:?}"
+                )));
+            }
         }
         match GoalCall::from_raw_args(&toks(&["invariant", "keine", "Downtime"])).map(|c| c.args) {
             Ok(GoalArgs::Invariant { description }) => {
                 assert_eq!(description.as_deref(), Some("keine Downtime"));
             }
-            other => panic!("erwartet Invariant, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Invariant, war: {other:?}"
+                )));
+            }
         }
         match GoalCall::from_raw_args(&toks(&["question", "Wie", "testen?"])).map(|c| c.args) {
             Ok(GoalArgs::Question { text }) => {
                 assert_eq!(text.as_deref(), Some("Wie testen?"));
             }
-            other => panic!("erwartet Question, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Question, war: {other:?}"
+                )));
+            }
         }
         match GoalCall::from_raw_args(&toks(&["achieve", "alles", "belegt"])).map(|c| c.args) {
             Ok(GoalArgs::Achieve { reason }) => {
                 assert_eq!(reason.as_deref(), Some("alles belegt"));
             }
-            other => panic!("erwartet Achieve, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Achieve, war: {other:?}"
+                )));
+            }
         }
         match GoalCall::from_raw_args(&toks(&["abandon", "nicht", "mehr", "nötig"])).map(|c| c.args)
         {
             Ok(GoalArgs::Abandon { reason }) => {
                 assert_eq!(reason.as_deref(), Some("nicht mehr nötig"));
             }
-            other => panic!("erwartet Abandon, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Abandon, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn from_raw_args_constraint_takes_kind_and_joined_description() {
+    fn from_raw_args_constraint_takes_kind_and_joined_description() -> TestResult {
         match GoalCall::from_raw_args(&toks(&["constraint", "scope", "nur", "harw-ops"]))
             .map(|c| c.args)
         {
@@ -1224,15 +1266,24 @@ mod tests {
                 assert_eq!(kind.as_deref(), Some("scope"));
                 assert_eq!(description.as_deref(), Some("nur harw-ops"));
             }
-            other => panic!("erwartet Constraint, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Constraint, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
-    fn from_raw_args_bind_and_unit_subcommands_parse() {
+    fn from_raw_args_bind_and_unit_subcommands_parse() -> TestResult {
         match GoalCall::from_raw_args(&toks(&["bind", "p-1"])).map(|c| c.args) {
             Ok(GoalArgs::Bind { plan_id }) => assert_eq!(plan_id.as_deref(), Some("p-1")),
-            other => panic!("erwartet Bind, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet Bind, war: {other:?}"
+                )));
+            }
         }
         assert!(matches!(
             GoalCall::from_raw_args(&toks(&["check"])).map(|c| c.args),
@@ -1242,18 +1293,24 @@ mod tests {
             GoalCall::from_raw_args(&toks(&["show"])).map(|c| c.args),
             Ok(GoalArgs::Show)
         ));
+        Ok(())
     }
 
     #[test]
-    fn json_surface_deserializes_to_model_surface() {
+    fn json_surface_deserializes_to_model_surface() -> TestResult {
         let value = serde_json::json!({ "action": "criteria", "description": "Tests grün" });
         match serde_json::from_value::<GoalCall>(value) {
             Ok(call) => {
                 assert_eq!(call.surface, CallSurface::Model);
                 assert!(matches!(call.args, GoalArgs::Criteria { .. }));
             }
-            Err(error) => panic!("JSON-Deserialisierung schlug fehl: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "JSON-Deserialisierung schlug fehl: {error}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[test]
@@ -1269,10 +1326,10 @@ mod tests {
     // ── Verfügbarkeit ────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn missing_goal_store_is_not_available() {
+    async fn missing_goal_store_is_not_available() -> TestResult {
         let mut services = ServiceMap::new();
         services.insert(PlanToolConfig::enabled_defaults());
-        let (ctx, root) = context_with(services);
+        let (ctx, root) = context_with(services)?;
 
         let result = super::goal(&ctx, GoalCall::from_command(GoalArgs::Show)).await;
         cleanup(root);
@@ -1281,17 +1338,22 @@ mod tests {
             Err(OpError::NotAvailable(message)) => {
                 assert!(message.contains("kein Goal-Store"), "war: {message}");
             }
-            other => panic!("erwartet NotAvailable, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet NotAvailable, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn disabled_config_is_not_available_and_names_the_switch() {
+    async fn disabled_config_is_not_available_and_names_the_switch() -> TestResult {
         let goal_store: Arc<dyn GoalStore> = Arc::new(InMemoryGoalStore::default());
         let mut services = ServiceMap::new();
         services.insert(goal_store);
         services.insert(PlanToolConfig::default());
-        let (ctx, root) = context_with(services);
+        let (ctx, root) = context_with(services)?;
 
         let result = super::goal(&ctx, GoalCall::from_command(GoalArgs::Show)).await;
         cleanup(root);
@@ -1300,15 +1362,21 @@ mod tests {
             Err(OpError::NotAvailable(message)) => {
                 assert!(message.contains("[tools.plan] enabled"), "war: {message}");
             }
-            other => panic!("erwartet NotAvailable, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet NotAvailable, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     // ── Autoritätsgrenze ─────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn achieve_is_rejected_on_the_model_tool_surface_and_allowed_on_the_command_surface() {
-        let (ctx, store, _plan, root) = context_with_stores();
+    async fn achieve_is_rejected_on_the_model_tool_surface_and_allowed_on_the_command_surface()
+    -> TestResult {
+        let (ctx, store, _plan, root) = context_with_stores()?;
 
         let set = run_command(&ctx, &["set", "g-1", "Autorität", "prüfen"]).await;
         let criterion = run_command(&ctx, &["criteria", "Tests", "grün"]).await;
@@ -1338,7 +1406,11 @@ mod tests {
                 );
                 assert!(message.contains("goal achieve"), "war: {message}");
             }
-            other => panic!("Modell-Fläche muss abgelehnt werden, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "Modell-Fläche muss abgelehnt werden, war: {other:?}"
+                )));
+            }
         }
         assert_eq!(
             status_after_model.ok(),
@@ -1353,11 +1425,12 @@ mod tests {
 
         assert!(via_command.is_ok(), "Command-Fläche: {via_command:?}");
         assert_eq!(status_after_command.ok(), Some(GoalStatus::Achieved));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn abandon_is_rejected_on_the_model_tool_surface() {
-        let (ctx, _store, _plan, root) = context_with_stores();
+    async fn abandon_is_rejected_on_the_model_tool_surface() -> TestResult {
+        let (ctx, _store, _plan, root) = context_with_stores()?;
         let set = run_command(&ctx, &["set", "g-1", "Autorität", "prüfen"]).await;
         let result = super::goal(
             &ctx,
@@ -1370,6 +1443,7 @@ mod tests {
 
         assert!(set.is_ok(), "set schlug fehl: {set:?}");
         assert!(matches!(result, Err(OpError::NotAvailable(_))));
+        Ok(())
     }
 
     #[tokio::test]
@@ -1409,9 +1483,9 @@ mod tests {
     // ── Bewertung ────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn check_reports_fifty_percent_when_one_of_two_criteria_is_covered() {
-        let (ctx, _store, plan_store, root) = context_with_stores();
-        seed_completed_plan(plan_store.as_ref(), "Tests grün");
+    async fn check_reports_fifty_percent_when_one_of_two_criteria_is_covered() -> TestResult {
+        let (ctx, _store, plan_store, root) = context_with_stores()?;
+        seed_completed_plan(plan_store.as_ref(), "Tests grün")?;
 
         let set = run_command(&ctx, &["set", "g-1", "Halbe", "Strecke"]).await;
         let first = run_command(&ctx, &["criteria", "Tests", "grün"]).await;
@@ -1434,14 +1508,17 @@ mod tests {
                 assert!(text.contains("Offen (1):"), "war:\n{text}");
                 assert!(text.contains("2. Doku vollständig"), "war:\n{text}");
             }
-            Err(error) => panic!("check schlug fehl: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!("check schlug fehl: {error}")));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn show_lists_statement_criteria_status_and_coverage() {
-        let (ctx, _store, plan_store, root) = context_with_stores();
-        seed_completed_plan(plan_store.as_ref(), "Tests grün");
+    async fn show_lists_statement_criteria_status_and_coverage() -> TestResult {
+        let (ctx, _store, plan_store, root) = context_with_stores()?;
+        seed_completed_plan(plan_store.as_ref(), "Tests grün")?;
 
         let set = run_command(&ctx, &["set", "g-1", "Sichtbar", "machen"]).await;
         let criterion = run_command(&ctx, &["criteria", "Tests", "grün"]).await;
@@ -1467,13 +1544,16 @@ mod tests {
                     "war:\n{text}"
                 );
             }
-            Err(error) => panic!("show schlug fehl: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!("show schlug fehl: {error}")));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn show_without_a_goal_points_at_goal_set() {
-        let (ctx, _store, _plan, root) = context_with_stores();
+    async fn show_without_a_goal_points_at_goal_set() -> TestResult {
+        let (ctx, _store, _plan, root) = context_with_stores()?;
         let result = super::goal(&ctx, GoalCall::from_command(GoalArgs::Show)).await;
         cleanup(root);
 
@@ -1481,13 +1561,18 @@ mod tests {
             Err(OpError::InvalidArguments(message)) => {
                 assert!(message.contains("goal set"), "war: {message}");
             }
-            other => panic!("erwartet InvalidArguments, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet InvalidArguments, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn set_refuses_to_replace_a_live_goal_and_names_what_would_be_lost() {
-        let (ctx, _store, _plan, root) = context_with_stores();
+    async fn set_refuses_to_replace_a_live_goal_and_names_what_would_be_lost() -> TestResult {
+        let (ctx, _store, _plan, root) = context_with_stores()?;
         let set = run_command(&ctx, &["set", "g-1", "Erstes", "Ziel"]).await;
         let criterion = run_command(&ctx, &["criteria", "Tests", "grün"]).await;
         let replaced = run_command(&ctx, &["set", "g-2", "Zweites", "Ziel"]).await;
@@ -1500,13 +1585,18 @@ mod tests {
                 assert!(message.contains("g-1"), "war: {message}");
                 assert!(message.contains("goal refine"), "war: {message}");
             }
-            other => panic!("erwartet InvalidArguments, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet InvalidArguments, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn refine_changes_the_statement_and_keeps_the_criteria() {
-        let (ctx, store, _plan, root) = context_with_stores();
+    async fn refine_changes_the_statement_and_keeps_the_criteria() -> TestResult {
+        let (ctx, store, _plan, root) = context_with_stores()?;
         let set = run_command(&ctx, &["set", "g-1", "Alter", "Wortlaut"]).await;
         let criterion = run_command(&ctx, &["criteria", "Tests", "grün"]).await;
         let refined = run_command(&ctx, &["refine", "Neuer", "Wortlaut"]).await;
@@ -1521,14 +1611,19 @@ mod tests {
                 assert_eq!(goal.statement, "Neuer Wortlaut");
                 assert_eq!(goal.acceptance_criteria.len(), 1);
             }
-            Err(error) => panic!("Ziel lesen schlug fehl: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "Ziel lesen schlug fehl: {error}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn bind_uses_the_revision_of_the_loaded_plan() {
-        let (ctx, store, plan_store, root) = context_with_stores();
-        seed_completed_plan(plan_store.as_ref(), "Tests grün");
+    async fn bind_uses_the_revision_of_the_loaded_plan() -> TestResult {
+        let (ctx, store, plan_store, root) = context_with_stores()?;
+        seed_completed_plan(plan_store.as_ref(), "Tests grün")?;
         let expected = plan_store.revision();
 
         let set = run_command(&ctx, &["set", "g-1", "Binden"]).await;
@@ -1543,13 +1638,18 @@ mod tests {
                 assert_eq!(goal.plan_id, Some(PlanId::new("p-1")));
                 assert_eq!(goal.plan_revision, Some(expected));
             }
-            Err(error) => panic!("Ziel lesen schlug fehl: {error}"),
+            Err(error) => {
+                return Err(TestError::Unexpected(format!(
+                    "Ziel lesen schlug fehl: {error}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn unknown_constraint_kind_is_rejected_with_the_full_value_list() {
-        let (ctx, _store, _plan, root) = context_with_stores();
+    async fn unknown_constraint_kind_is_rejected_with_the_full_value_list() -> TestResult {
+        let (ctx, _store, _plan, root) = context_with_stores()?;
         let set = run_command(&ctx, &["set", "g-1", "Rahmen"]).await;
         let result = run_command(&ctx, &["constraint", "wetter", "sonnig"]).await;
         cleanup(root);
@@ -1560,13 +1660,18 @@ mod tests {
                 assert!(message.contains("wetter"), "war: {message}");
                 assert!(message.contains("policy"), "Werteliste fehlt: {message}");
             }
-            other => panic!("erwartet InvalidArguments, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet InvalidArguments, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn missing_arguments_report_the_usage_line() {
-        let (ctx, _store, _plan, root) = context_with_stores();
+    async fn missing_arguments_report_the_usage_line() -> TestResult {
+        let (ctx, _store, _plan, root) = context_with_stores()?;
         let result = super::goal(
             &ctx,
             GoalCall::from_command(GoalArgs::Set {
@@ -1581,7 +1686,12 @@ mod tests {
             Err(OpError::InvalidArguments(message)) => {
                 assert!(message.contains("goal set"), "war: {message}");
             }
-            other => panic!("erwartet InvalidArguments, war: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet InvalidArguments, war: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 }

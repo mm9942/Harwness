@@ -59,3 +59,7 @@ pub use capability::{Capability, CapabilityClass};
 pub use error::{Permanence, SensorError};
 pub use handle::{Bound, SensorHandle, Unbound};
 pub use scope::ReadScope;
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

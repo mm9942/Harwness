@@ -7,18 +7,23 @@
 //! - Confirming `OpError` Display / `std::error::Error` surface through the public path.
 //! - Confirming that `Arc<dyn Operation>` can be shared across Tokio tasks.
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
+use common::{TestError, TestResult, ctx};
+use harw_authority::{
+    Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+};
+use harw_operations::adapter::WebAdapter;
+use harw_operations::operation::BusyAvailability;
+use harw_operations::registry::OperationRegistry;
 use harw_operations::{
     ApprovalPolicy, CommandVisibility, OpContext, OpError, OpFuture, OpInput, OpInvocation,
     OpOutput, Operation, OperationCategory, OperationDomain, OperationMeta, PermissionTier,
     ServiceMap, Surface, WebMethod,
 };
-use harw_operations::operation::BusyAvailability;
-use harw_operations::adapter::WebAdapter;
-use harw_operations::registry::OperationRegistry;
-use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
 use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
 
 // ── Test fixtures (minimal concrete Operation impls) ─────────────────────────
@@ -116,7 +121,7 @@ fn empty_input() -> OpInput {
 /// Erstellt einen minimalen `OpContext` für Integrationstests.
 /// Legt temporäre Verzeichnisse an, baut eine WorkspaceRegistry und
 /// konstruiert einen SandboxSpec mit ReadWorkspace-Berechtigung.
-fn make_test_ctx() -> (OpContext, PathBuf) {
+fn make_test_ctx() -> TestResult<(OpContext, PathBuf)> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static CTX_COUNTER: AtomicU64 = AtomicU64::new(0);
     let id = CTX_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -125,7 +130,7 @@ fn make_test_ctx() -> (OpContext, PathBuf) {
         std::process::id(),
         id
     ));
-    std::fs::create_dir_all(tmp.join("ws")).unwrap();
+    std::fs::create_dir_all(tmp.join("ws")).map_err(ctx("Test-Workspace-Verzeichnis anlegen"))?;
     let registry = WorkspaceRegistry::build(
         &tmp,
         [WorkspaceRegistration {
@@ -134,19 +139,19 @@ fn make_test_ctx() -> (OpContext, PathBuf) {
             root: PathBuf::from("ws"),
         }],
     )
-    .unwrap();
+    .map_err(ctx("WorkspaceRegistry bauen"))?;
     let binding = registry
         .resolve(
             &TenantId::from_str("test-tenant"),
             &WorkspaceId::from_str("ws"),
         )
-        .unwrap();
+        .map_err(ctx("Workspace auflösen"))?;
     let sandbox = SandboxSpec::from_resolved(
         binding,
         PermissionSet::from_policy([Permission::ReadWorkspace]),
     );
     let ctx = OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new());
-    (ctx, tmp)
+    Ok((ctx, tmp))
 }
 
 // ── OperationMeta via public re-export ────────────────────────────────────────
@@ -176,115 +181,143 @@ fn test_echo_op_meta_two_surfaces() {
 }
 
 #[test]
-fn test_echo_op_meta_first_surface_is_command() {
+fn test_echo_op_meta_first_surface_is_command() -> TestResult {
     let op = EchoOp;
     match &op.meta().surfaces[0] {
         Surface::Command { path, visibility } => {
             assert_eq!(*path, "/echo");
             assert_eq!(*visibility, CommandVisibility::ChannelParity);
         }
-        other => panic!("Erwartet Command, war: {other:?}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "Erwartet Command, war: {other:?}"
+            )));
+        }
     }
+    Ok(())
 }
 
 #[test]
-fn test_echo_op_meta_second_surface_is_model_tool() {
+fn test_echo_op_meta_second_surface_is_model_tool() -> TestResult {
     let op = EchoOp;
     match &op.meta().surfaces[1] {
         Surface::ModelTool { readonly, approval } => {
             assert!(*readonly);
             assert_eq!(*approval, ApprovalPolicy::None);
         }
-        other => panic!("Erwartet ModelTool, war: {other:?}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "Erwartet ModelTool, war: {other:?}"
+            )));
+        }
     }
+    Ok(())
 }
 
 // ── Operation::run — happy path ───────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_echo_op_run_returns_joined_args() {
+async fn test_echo_op_run_returns_joined_args() -> TestResult {
     let op = EchoOp;
-    let (ctx, tmp) = make_test_ctx();
+    let (ctx, tmp) = make_test_ctx()?;
     let result = op.run(&ctx, raw_input(&["hello", "world"])).await;
     std::fs::remove_dir_all(tmp).ok();
     match result {
         Ok(out) => assert_eq!(out.text, "hello world"),
-        Err(e) => panic!("Unerwarteter Fehler: {e}"),
+        Err(e) => return Err(TestError::Unexpected(format!("Unerwarteter Fehler: {e}"))),
     }
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_echo_op_run_with_empty_input_returns_empty_string() {
+async fn test_echo_op_run_with_empty_input_returns_empty_string() -> TestResult {
     let op = EchoOp;
-    let (ctx, tmp) = make_test_ctx();
+    let (ctx, tmp) = make_test_ctx()?;
     let result = op.run(&ctx, empty_input()).await;
     std::fs::remove_dir_all(tmp).ok();
     match result {
         Ok(out) => assert!(out.text.is_empty()),
-        Err(e) => panic!("Unerwarteter Fehler: {e}"),
+        Err(e) => return Err(TestError::Unexpected(format!("Unerwarteter Fehler: {e}"))),
     }
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_echo_op_run_with_single_arg() {
+async fn test_echo_op_run_with_single_arg() -> TestResult {
     let op = EchoOp;
-    let (ctx, tmp) = make_test_ctx();
+    let (ctx, tmp) = make_test_ctx()?;
     let result = op.run(&ctx, raw_input(&["only"])).await;
     std::fs::remove_dir_all(tmp).ok();
     match result {
         Ok(out) => assert_eq!(out.text, "only"),
-        Err(e) => panic!("Unerwarteter Fehler: {e}"),
+        Err(e) => return Err(TestError::Unexpected(format!("Unerwarteter Fehler: {e}"))),
     }
+    Ok(())
 }
 
 // ── Operation::run — all error variants ──────────────────────────────────────
 
 #[tokio::test]
-async fn test_failing_op_run_invalid_arguments() {
+async fn test_failing_op_run_invalid_arguments() -> TestResult {
     let op = FailingOp {
         variant: FailVariant::InvalidArgs,
     };
-    let (ctx, tmp) = make_test_ctx();
+    let (ctx, tmp) = make_test_ctx()?;
     let result = op.run(&ctx, empty_input()).await;
     std::fs::remove_dir_all(tmp).ok();
     match result {
         Err(OpError::InvalidArguments(msg)) => {
             assert_eq!(msg, "integration-test");
         }
-        other => panic!("Erwartet InvalidArguments, war: {other:?}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "Erwartet InvalidArguments, war: {other:?}"
+            )));
+        }
     }
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_failing_op_run_execution_error() {
+async fn test_failing_op_run_execution_error() -> TestResult {
     let op = FailingOp {
         variant: FailVariant::Execution,
     };
-    let (ctx, tmp) = make_test_ctx();
+    let (ctx, tmp) = make_test_ctx()?;
     let result = op.run(&ctx, empty_input()).await;
     std::fs::remove_dir_all(tmp).ok();
     match result {
         Err(OpError::Execution(msg)) => {
             assert_eq!(msg, "integration-test");
         }
-        other => panic!("Erwartet Execution, war: {other:?}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "Erwartet Execution, war: {other:?}"
+            )));
+        }
     }
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_failing_op_run_not_available_error() {
+async fn test_failing_op_run_not_available_error() -> TestResult {
     let op = FailingOp {
         variant: FailVariant::NotAvailable,
     };
-    let (ctx, tmp) = make_test_ctx();
+    let (ctx, tmp) = make_test_ctx()?;
     let result = op.run(&ctx, empty_input()).await;
     std::fs::remove_dir_all(tmp).ok();
     match result {
         Err(OpError::NotAvailable(msg)) => {
             assert_eq!(msg, "integration-test");
         }
-        other => panic!("Erwartet NotAvailable, war: {other:?}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "Erwartet NotAvailable, war: {other:?}"
+            )));
+        }
     }
+    Ok(())
 }
 
 // ── OpError public surface ────────────────────────────────────────────────────
@@ -324,14 +357,14 @@ fn test_permission_tier_ordering_public_reexport() {
 // ── Arc<dyn Operation> concurrency ────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_arc_dyn_operation_concurrent_execution() {
-    let (ctx, tmp) = make_test_ctx();
-    let ctx = Arc::new(ctx);
+async fn test_arc_dyn_operation_concurrent_execution() -> TestResult {
+    let (op_ctx, tmp) = make_test_ctx()?;
+    let op_ctx = Arc::new(op_ctx);
     let op: Arc<dyn Operation> = Arc::new(EchoOp);
     let mut handles = Vec::new();
     for i in 0..8_u32 {
         let op_ref = Arc::clone(&op);
-        let ctx_ref = Arc::clone(&ctx);
+        let ctx_ref = Arc::clone(&op_ctx);
         let arg = format!("task-{i}");
         handles.push(tokio::spawn(async move {
             op_ref.run(&ctx_ref, raw_input(&[&arg])).await
@@ -340,9 +373,13 @@ async fn test_arc_dyn_operation_concurrent_execution() {
     for (i, handle) in handles.into_iter().enumerate() {
         let join_result = handle.await;
         assert!(join_result.is_ok(), "task {i} panicked");
-        let op_result = join_result.unwrap();
+        let Ok(op_result) = join_result else {
+            return Err(TestError::Unexpected(format!("task {i} join failed")));
+        };
         assert!(op_result.is_ok(), "task {i} returned Err: {:?}", op_result);
-        let out = op_result.unwrap();
+        let Ok(out) = op_result else {
+            return Err(TestError::Unexpected(format!("task {i} returned Err")));
+        };
         assert!(
             out.text.starts_with("task-"),
             "task {i} output malformed: {}",
@@ -350,6 +387,7 @@ async fn test_arc_dyn_operation_concurrent_execution() {
         );
     }
     std::fs::remove_dir_all(tmp).ok();
+    Ok(())
 }
 
 // ── OpInput / OpOutput via public reexport ────────────────────────────────────
@@ -379,7 +417,7 @@ fn test_op_invocation_model_tool_via_public_reexport() {
 }
 
 #[test]
-fn test_op_invocation_agent_tool_via_public_reexport() {
+fn test_op_invocation_agent_tool_via_public_reexport() -> TestResult {
     let args = serde_json::json!({ "task": "review" });
     let input = OpInput::agent_tool("reviewer", args.clone());
     assert!(input.invocation.is_agent_tool());
@@ -392,8 +430,13 @@ fn test_op_invocation_agent_tool_via_public_reexport() {
             assert_eq!(child_name, "reviewer");
             assert_eq!(got, args);
         }
-        other => panic!("Erwartet AgentTool, war: {other:?}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "Erwartet AgentTool, war: {other:?}"
+            )));
+        }
     }
+    Ok(())
 }
 
 #[test]
@@ -425,10 +468,10 @@ fn test_op_output_inequality_via_public_reexport() {
 // ── OpContext public API ───────────────────────────────────────────────────────
 
 #[test]
-fn test_op_context_session_id_roundtrip() {
+fn test_op_context_session_id_roundtrip() -> TestResult {
     // Build a dedicated temp dir so we can control the session_id and turn_id.
     let tmp = std::env::temp_dir().join(format!("harw-ops-ctx-roundtrip-{}", std::process::id()));
-    std::fs::create_dir_all(tmp.join("ws")).unwrap();
+    std::fs::create_dir_all(tmp.join("ws")).map_err(ctx("Test-Workspace-Verzeichnis anlegen"))?;
     let registry = WorkspaceRegistry::build(
         &tmp,
         [WorkspaceRegistration {
@@ -437,10 +480,10 @@ fn test_op_context_session_id_roundtrip() {
             root: PathBuf::from("ws"),
         }],
     )
-    .unwrap();
+    .map_err(ctx("WorkspaceRegistry bauen"))?;
     let binding = registry
         .resolve(&TenantId::from_str("t"), &WorkspaceId::from_str("ws"))
-        .unwrap();
+        .map_err(ctx("Workspace auflösen"))?;
     let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
     let session = SessionId::from_str("test-session-123");
     let turn = TurnId::from_str("test-turn-456");
@@ -448,24 +491,32 @@ fn test_op_context_session_id_roundtrip() {
     assert_eq!(ctx.session_id().as_str(), "test-session-123");
     assert_eq!(ctx.turn_id().as_str(), "test-turn-456");
     std::fs::remove_dir_all(tmp).ok();
+    Ok(())
 }
 
 #[test]
-fn test_op_context_sandbox_accessible() {
-    let (ctx, tmp) = make_test_ctx();
+fn test_op_context_sandbox_accessible() -> TestResult {
+    let (ctx, tmp) = make_test_ctx()?;
     let _sandbox = ctx.sandbox();
     // Sandbox accessible — does not panic.
     std::fs::remove_dir_all(tmp).ok();
+    Ok(())
 }
 
 // ── ServiceMap public API ─────────────────────────────────────────────────────
 
 #[test]
-fn test_service_map_insert_and_get() {
+fn test_service_map_insert_and_get() -> TestResult {
     struct Svc(u32);
     let mut map = ServiceMap::new();
     map.insert(Svc(99));
-    assert_eq!(map.get::<Svc>().unwrap().0, 99);
+    assert_eq!(
+        map.get::<Svc>()
+            .ok_or(TestError::Missing("Svc im ServiceMap"))?
+            .0,
+        99
+    );
+    Ok(())
 }
 
 #[test]
@@ -475,20 +526,26 @@ fn test_service_map_get_missing_returns_none() {
 }
 
 #[test]
-fn test_service_map_overwrite() {
+fn test_service_map_overwrite() -> TestResult {
     let mut map = ServiceMap::new();
     map.insert(1_u32);
     map.insert(2_u32);
-    assert_eq!(*map.get::<u32>().unwrap(), 2);
+    assert_eq!(
+        *map.get::<u32>()
+            .ok_or(TestError::Missing("u32 im ServiceMap"))?,
+        2
+    );
+    Ok(())
 }
 
 #[test]
-fn test_op_context_service_lookup() {
+fn test_op_context_service_lookup() -> TestResult {
     struct DbPool;
-    let (ctx, tmp) = make_test_ctx();
+    let (ctx, tmp) = make_test_ctx()?;
     // No DbPool registered — must return None.
     assert!(ctx.service::<DbPool>().is_none());
     std::fs::remove_dir_all(tmp).ok();
+    Ok(())
 }
 
 // ── Surface::Web — fällt durch Registry und Adapter wie die anderen drei ───────
@@ -536,7 +593,7 @@ impl Operation for WebOp {
 }
 
 #[test]
-fn test_web_op_meta_surface_is_web() {
+fn test_web_op_meta_surface_is_web() -> TestResult {
     let op = WebOp;
     assert_eq!(op.meta().surfaces.len(), 1);
     match &op.meta().surfaces[0] {
@@ -549,8 +606,13 @@ fn test_web_op_meta_surface_is_web() {
             assert_eq!(*method, WebMethod::Get);
             assert_eq!(*approval, ApprovalPolicy::None);
         }
-        other => panic!("Erwartet Web, war: {other:?}"),
+        other => {
+            return Err(TestError::Unexpected(format!(
+                "Erwartet Web, war: {other:?}"
+            )));
+        }
     }
+    Ok(())
 }
 
 #[test]
@@ -617,16 +679,17 @@ fn test_web_adapter_absent_for_operation_without_web_surface() {
 }
 
 #[tokio::test]
-async fn test_web_adapter_invoke_runs_the_underlying_operation() {
+async fn test_web_adapter_invoke_runs_the_underlying_operation() -> TestResult {
     let op: Arc<dyn Operation> = Arc::new(WebOp);
     let adapters = WebAdapter::from_operation(op);
-    let (ctx, tmp) = make_test_ctx();
+    let (ctx, tmp) = make_test_ctx()?;
     let result = adapters[0]
         .invoke(&ctx, serde_json::json!({ "q": "hallo-web" }))
         .await;
     std::fs::remove_dir_all(tmp).ok();
     match result {
         Ok(out) => assert_eq!(out.text, "hallo-web"),
-        Err(e) => panic!("Unerwarteter Fehler: {e}"),
+        Err(e) => return Err(TestError::Unexpected(format!("Unerwarteter Fehler: {e}"))),
     }
+    Ok(())
 }

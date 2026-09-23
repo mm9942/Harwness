@@ -108,38 +108,47 @@ mod tests {
     use std::error::Error as _;
 
     use super::{SignalsError, SignalsResult};
+    use crate::test_support::{TestError, TestResult};
 
     // Erzeugt einen echten `serde_json::Error` für die Tests, ohne die
     // Digestbildung selbst anzustoßen: das Verhalten des `#[from]`-Pfads ist
     // unabhängig davon, welcher Aufrufer ihn auslöst.
-    fn sample_json_error() -> serde_json::Error {
-        serde_json::from_str::<serde_json::Value>("not json").unwrap_err()
+    fn sample_json_error() -> TestResult<serde_json::Error> {
+        let Err(error) = serde_json::from_str::<serde_json::Value>("not json") else {
+            return Err(TestError::Unexpected(
+                "expected an Err from invalid JSON".into(),
+            ));
+        };
+        Ok(error)
     }
 
     #[test]
-    fn test_digest_encoding_display_includes_prefix_and_inner_message() {
-        let err = SignalsError::from(sample_json_error());
+    fn test_digest_encoding_display_includes_prefix_and_inner_message() -> TestResult {
+        let err = SignalsError::from(sample_json_error()?);
         let display = err.to_string();
         assert!(
-            display.starts_with(
-                "failed to encode evidence samples and events for digest formation:"
-            )
+            display
+                .starts_with("failed to encode evidence samples and events for digest formation:")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_digest_encoding_source_returns_inner_error() {
-        let err: SignalsError = sample_json_error().into();
+    fn test_digest_encoding_source_returns_inner_error() -> TestResult {
+        let err: SignalsError = sample_json_error()?.into();
         assert!(err.source().is_some());
+        Ok(())
     }
 
     #[test]
-    fn test_signals_result_alias_carries_signals_error() {
-        fn always_fails() -> SignalsResult<()> {
-            Err(SignalsError::from(sample_json_error()))
+    fn test_signals_result_alias_carries_signals_error() -> TestResult {
+        let json_error = sample_json_error()?;
+        fn always_fails(json_error: serde_json::Error) -> SignalsResult<()> {
+            Err(SignalsError::from(json_error))
         }
 
-        assert!(always_fails().is_err());
+        assert!(always_fails(json_error).is_err());
+        Ok(())
     }
 
     // -- Verdict*-Varianten sind inhaltsfrei -----------------------------------

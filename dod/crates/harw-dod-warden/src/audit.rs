@@ -150,11 +150,12 @@ impl AuditSink for RecordingAuditSink {
 #[cfg(test)]
 mod tests {
     use super::{AuditEvent, AuditSink, RecordingAuditSink};
+    use crate::test_support::{TestResult, ctx};
     use harw_dod_warden_proto::{Denial, WardenAction};
     use harw_types::CgroupId;
 
-    fn cgroup(id: &str) -> CgroupId {
-        CgroupId::try_from_str(id).expect("non-empty id")
+    fn cgroup(id: &str) -> TestResult<CgroupId> {
+        CgroupId::try_from_str(id).map_err(ctx("non-empty id"))
     }
 
     #[test]
@@ -164,10 +165,10 @@ mod tests {
     }
 
     #[test]
-    fn test_record_appends_in_call_order() {
+    fn test_record_appends_in_call_order() -> TestResult {
         let sink = RecordingAuditSink::new();
         let action = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
         sink.record(AuditEvent::Attempting {
             action: action.clone(),
@@ -181,5 +182,6 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], AuditEvent::Attempting { .. }));
         assert!(matches!(events[1], AuditEvent::Denied { .. }));
+        Ok(())
     }
 }

@@ -63,6 +63,7 @@ jiff = { workspace = true }
 # `handoff.json`. War zuvor nur Dev-Dependency; jetzt auch für den
 # Produktivpfad benötigt.
 serde_json = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

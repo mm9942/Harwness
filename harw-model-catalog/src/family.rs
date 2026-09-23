@@ -449,6 +449,7 @@ pub struct ModelAlias {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult};
 
     // Hilfsfunktion: erzeugt eine vollständige ModelRelease für Llama 3.3-70b.
     fn make_llama_release(variant: Option<&str>) -> ModelRelease {
@@ -515,17 +516,18 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_serde_kebab() {
+    fn lifecycle_serde_kebab() -> TestResult {
         // Test 5: ReleaseLifecycle::Deprecated serialisiert als "deprecated".
-        let json = serde_json::to_string(&ReleaseLifecycle::Deprecated).expect("Serialisierung OK");
+        let json = serde_json::to_string(&ReleaseLifecycle::Deprecated)?;
         assert_eq!(json, "\"deprecated\"");
 
-        let roundtrip: ReleaseLifecycle = serde_json::from_str(&json).expect("Deserialisierung OK");
+        let roundtrip: ReleaseLifecycle = serde_json::from_str(&json)?;
         assert_eq!(roundtrip, ReleaseLifecycle::Deprecated);
+        Ok(())
     }
 
     #[test]
-    fn family_hash_eq() {
+    fn family_hash_eq() -> TestResult {
         // Test 6: Zwei identische ModelFamilys hashen gleich → HashMap-Key verwendbar.
         use std::collections::HashMap;
         let f1 = ModelFamily::new("meta", "llama");
@@ -536,23 +538,29 @@ mod tests {
         // f2 ist gleich f1; überschreibt den Eintrag.
         map.insert(f2, "zweiter Eintrag");
         assert_eq!(map.len(), 1);
-        assert_eq!(*map.values().next().unwrap(), "zweiter Eintrag");
+        let value = map
+            .values()
+            .next()
+            .ok_or(TestError::Missing("ein Eintrag in map"))?;
+        assert_eq!(*value, "zweiter Eintrag");
+        Ok(())
     }
 
     #[test]
-    fn alias_serde_roundtrip() {
+    fn alias_serde_roundtrip() -> TestResult {
         // Test 7: ModelAlias JSON-Roundtrip.
         let alias = ModelAlias {
             alias: "llama-3-latest".to_owned(),
             resolved_to: EndpointModelId("llama-3.3-70b-versatile".to_owned()),
         };
-        let json = serde_json::to_string(&alias).expect("Serialisierung OK");
-        let restored: ModelAlias = serde_json::from_str(&json).expect("Deserialisierung OK");
+        let json = serde_json::to_string(&alias)?;
+        let restored: ModelAlias = serde_json::from_str(&json)?;
         assert_eq!(alias, restored);
+        Ok(())
     }
 
     #[test]
-    fn provider_offering_json_roundtrip() {
+    fn provider_offering_json_roundtrip() -> TestResult {
         // Test 8: Vollständiges Offering (mit quantization) JSON-Roundtrip.
         let mut offering = make_offering(
             make_llama_release(Some("instruct")),
@@ -560,34 +568,37 @@ mod tests {
             "llama-3.3-70b-versatile",
         );
         offering.quantization = Some("fp8".to_owned());
-        let json = serde_json::to_string(&offering).expect("Serialisierung OK");
-        let restored: ProviderOffering = serde_json::from_str(&json).expect("Deserialisierung OK");
+        let json = serde_json::to_string(&offering)?;
+        let restored: ProviderOffering = serde_json::from_str(&json)?;
         assert_eq!(offering, restored);
         assert_eq!(restored.quantization, Some("fp8".to_owned()));
+        Ok(())
     }
 
     #[test]
-    fn serde_transparent_endpoint_id() {
+    fn serde_transparent_endpoint_id() -> TestResult {
         // Test 9: EndpointModelId("gpt-5") serialisiert als "gpt-5", nicht als Objekt.
         let id = EndpointModelId("gpt-5".to_owned());
-        let json = serde_json::to_string(&id).expect("Serialisierung OK");
+        let json = serde_json::to_string(&id)?;
         assert_eq!(json, "\"gpt-5\"");
-        let restored: EndpointModelId = serde_json::from_str(&json).expect("Deserialisierung OK");
+        let restored: EndpointModelId = serde_json::from_str(&json)?;
         assert_eq!(restored.0, "gpt-5");
+        Ok(())
     }
 
     #[test]
-    fn serde_optional_variant_and_release_date() {
+    fn serde_optional_variant_and_release_date() -> TestResult {
         // Test 10: Deserialisierung ohne variant- und released_at-Felder klappt.
         let json = r#"{
             "family": {"vendor": "openai", "family": "gpt"},
             "version": "4o",
             "lifecycle": "ga"
         }"#;
-        let release: ModelRelease = serde_json::from_str(json).expect("Deserialisierung OK");
+        let release: ModelRelease = serde_json::from_str(json)?;
         assert_eq!(release.variant, None);
         assert_eq!(release.released_at, None);
         assert_eq!(release.lifecycle, ReleaseLifecycle::Ga);
         assert_eq!(release.version, "4o");
+        Ok(())
     }
 }

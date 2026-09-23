@@ -244,7 +244,9 @@ fn write_credential_document(path: &Path, document: &Value) -> OAuthResult<()> {
     let write_result = (|| -> OAuthResult<()> {
         let mut file = options.open(&temp_path)?;
         let serialized = serde_json::to_string_pretty(document).map_err(|error| {
-            OAuthError::CodexCredentialFile(format!("could not serialize refreshed tokens: {error}"))
+            OAuthError::CodexCredentialFile(format!(
+                "could not serialize refreshed tokens: {error}"
+            ))
         })?;
         file.write_all(serialized.as_bytes())?;
         file.flush()?;
@@ -402,6 +404,7 @@ pub async fn refresh_codex_tokens(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn temp_home(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -410,8 +413,11 @@ mod tests {
         ))
     }
 
-    fn write_auth_json(path: &Path, access_token: &str, refresh_token: &str) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fn write_auth_json(path: &Path, access_token: &str, refresh_token: &str) -> TestResult {
+        let parent = path
+            .parent()
+            .ok_or(TestError::Missing("auth.json parent directory"))?;
+        std::fs::create_dir_all(parent).map_err(ctx("Testverzeichnis anlegen"))?;
         std::fs::write(
             path,
             serde_json::json!({
@@ -427,7 +433,8 @@ mod tests {
             })
             .to_string(),
         )
-        .unwrap();
+        .map_err(ctx("auth.json schreiben"))?;
+        Ok(())
     }
 
     fn make_jwt_with_exp(exp: i64) -> String {
@@ -448,23 +455,25 @@ mod tests {
     }
 
     #[test]
-    fn test_jwt_needs_refresh_true_when_expiring_soon() {
+    fn test_jwt_needs_refresh_true_when_expiring_soon() -> TestResult {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .map_err(ctx("Systemzeit vor UNIX_EPOCH"))?
             .as_secs() as i64;
         let token = make_jwt_with_exp(now + 60);
         assert!(jwt_needs_refresh(&token, 300));
+        Ok(())
     }
 
     #[test]
-    fn test_jwt_needs_refresh_false_when_far_from_expiry() {
+    fn test_jwt_needs_refresh_false_when_far_from_expiry() -> TestResult {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .map_err(ctx("Systemzeit vor UNIX_EPOCH"))?
             .as_secs() as i64;
         let token = make_jwt_with_exp(now + 3_600);
         assert!(!jwt_needs_refresh(&token, 300));
+        Ok(())
     }
 
     #[test]
@@ -480,32 +489,48 @@ mod tests {
     #[test]
     fn test_unix_seconds_to_rfc3339_known_date() {
         // 2024-01-02T03:24:05Z
-        assert_eq!(unix_seconds_to_rfc3339(1_704_165_845), "2024-01-02T03:24:05Z");
+        assert_eq!(
+            unix_seconds_to_rfc3339(1_704_165_845),
+            "2024-01-02T03:24:05Z"
+        );
     }
 
     #[tokio::test]
-    async fn test_refresh_codex_tokens_rejects_missing_refresh_token() {
+    async fn test_refresh_codex_tokens_rejects_missing_refresh_token() -> TestResult {
         let home = temp_home("missing-refresh");
         let _ = std::fs::remove_dir_all(&home);
         let path = home.join("auth.json");
-        write_auth_json(&path, "old-access", "");
+        write_auth_json(&path, "old-access", "")?;
 
         let client = reqwest::Client::new();
-        let error = refresh_codex_tokens(&client, &path).await.unwrap_err();
+        let outcome = refresh_codex_tokens(&client, &path).await;
+        let Err(error) = outcome else {
+            let _ = std::fs::remove_dir_all(&home);
+            return Err(TestError::Unexpected(
+                "refresh must fail on missing refresh_token".to_owned(),
+            ));
+        };
         assert!(matches!(error, OAuthError::MissingField("refresh_token")));
 
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_refresh_codex_tokens_rejects_missing_credential_file() {
+    async fn test_refresh_codex_tokens_rejects_missing_credential_file() -> TestResult {
         let home = temp_home("missing-file");
         let _ = std::fs::remove_dir_all(&home);
         let path = home.join("auth.json");
 
         let client = reqwest::Client::new();
-        let error = refresh_codex_tokens(&client, &path).await.unwrap_err();
+        let outcome = refresh_codex_tokens(&client, &path).await;
+        let Err(error) = outcome else {
+            return Err(TestError::Unexpected(
+                "refresh must fail on missing credential file".to_owned(),
+            ));
+        };
         assert!(matches!(error, OAuthError::TokenStoreIo(_)));
+        Ok(())
     }
 
     #[test]
@@ -519,33 +544,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_acquire_refresh_lock_round_trips() {
+    async fn test_acquire_refresh_lock_round_trips() -> TestResult {
         let home = temp_home("lock-roundtrip");
         let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&home).map_err(ctx("Testverzeichnis anlegen"))?;
         let auth_path = home.join("auth.json");
-        std::fs::write(&auth_path, "{}").unwrap();
+        std::fs::write(&auth_path, "{}").map_err(ctx("auth.json schreiben"))?;
 
-        let guard = acquire_refresh_lock(&auth_path).await.expect("lock acquired");
+        let guard = acquire_refresh_lock(&auth_path)
+            .await
+            .map_err(ctx("lock acquired"))?;
         assert!(lock_path_for(&auth_path).exists());
         drop(guard);
         assert!(!lock_path_for(&auth_path).exists());
 
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_refresh_codex_tokens_never_touches_real_user_home() {
+    async fn test_refresh_codex_tokens_never_touches_real_user_home() -> TestResult {
         // Sicherheitsnetz: dieser Test darf niemals gegen die echte
         // `~/.codex/auth.json` des Nutzers laufen. Er arbeitet ausschließlich
         // mit einer isolierten temporären Kopie.
         let home = temp_home("isolated-copy");
         let _ = std::fs::remove_dir_all(&home);
         let path = home.join("auth.json");
-        write_auth_json(&path, "old-access", "old-refresh");
+        write_auth_json(&path, "old-access", "old-refresh")?;
         assert_ne!(path, dirs_codex_auth_json_for_test());
 
         let _ = std::fs::remove_dir_all(&home);
+        Ok(())
     }
 
     fn dirs_codex_auth_json_for_test() -> PathBuf {

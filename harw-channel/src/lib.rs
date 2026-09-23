@@ -52,3 +52,7 @@ pub use event::{
 pub use ids::{ChannelId, PeerId, SessionKey, TenantId, ThreadRef};
 pub use pairing::{PairingCode, PairingRecord, PairingRegistry};
 pub use pairing_store::PairingStore;
+
+// Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
+#[cfg(test)]
+mod test_support;

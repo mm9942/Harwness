@@ -146,7 +146,8 @@ impl FsListExecutor {
             Err(err) => {
                 return Ok(ToolOutput::error(format!(
                     "fs.list: '{}' ist kein lesbares Verzeichnis \
-                     (Symlinks werden nicht verfolgt): {err}",
+                     (Symlinks werden nicht verfolgt): {err}; erwartet ein Verzeichnis; für \
+                     einzelne Dateien fs.read oder fs.grep verwenden",
                     args.path
                 )));
             }
@@ -212,16 +213,19 @@ impl ToolExecutor for FsListExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{Fixture, SECRET, call, render};
+    use crate::test_support::{Fixture, SECRET, TestError, TestResult, call, ctx, render};
     use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
-    fn make_sandbox_with_permissions(root: &Path, permissions: Vec<Permission>) -> SandboxSpec {
+    fn make_sandbox_with_permissions(
+        root: &Path,
+        permissions: Vec<Permission>,
+    ) -> TestResult<SandboxSpec> {
         let ws_dir = root.join("ws");
-        fs::create_dir_all(&ws_dir).unwrap();
+        fs::create_dir_all(&ws_dir)?;
         let registry = WorkspaceRegistry::build(
             root,
             [WorkspaceRegistration {
@@ -230,11 +234,11 @@ mod tests {
                 root: PathBuf::from("ws"),
             }],
         )
-        .unwrap();
+        .map_err(ctx("registry"))?;
         let binding = registry
             .resolve(&TenantId::from_str("t"), &WorkspaceId::from_str("w"))
-            .unwrap();
-        SandboxSpec::from_resolved(binding, PermissionSet::from_policy(permissions))
+            .map_err(ctx("binding"))?;
+        Ok(SandboxSpec::from_resolved(binding, PermissionSet::from_policy(permissions)))
     }
 
     fn make_ctx(sandbox: SandboxSpec) -> ToolExecutionContext {
@@ -250,68 +254,75 @@ mod tests {
     }
 
     #[test]
-    fn test_fs_list_lists_directory_successfully() {
-        let dir = TempDir::new().unwrap();
+    fn test_fs_list_lists_directory_successfully() -> TestResult {
+        let dir = TempDir::new()?;
         let ws = dir.path().join("ws");
-        fs::create_dir_all(&ws).unwrap();
-        fs::write(ws.join("a.txt"), "aaa").unwrap();
-        fs::write(ws.join("b.txt"), "bb").unwrap();
-        fs::create_dir_all(ws.join("subdir")).unwrap();
+        fs::create_dir_all(&ws)?;
+        fs::write(ws.join("a.txt"), "aaa")?;
+        fs::write(ws.join("b.txt"), "bb")?;
+        fs::create_dir_all(ws.join("subdir"))?;
 
         let executor = FsListExecutor {
             max_entries: DEFAULT_MAX_ENTRIES,
         };
-        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace]);
+        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace])?;
         let ctx = make_ctx(sandbox);
         let call = make_call(serde_json::json!({ "path": "." }));
 
-        let result = executor.list_dir(&ctx, &call).unwrap();
+        let result = executor.list_dir(&ctx, &call)?;
         match result {
             ToolOutput::Json { content } => {
-                let arr = content["entries"].as_array().expect("should be array");
-                let names: Vec<&str> = arr.iter().map(|e| e["name"].as_str().unwrap()).collect();
+                let arr = content["entries"]
+                    .as_array()
+                    .ok_or(TestError::Missing("entries"))?;
+                let names = arr
+                    .iter()
+                    .map(|e| e["name"].as_str().ok_or(TestError::Missing("name")))
+                    .collect::<TestResult<Vec<&str>>>()?;
                 assert_eq!(names, vec!["a.txt", "b.txt", "subdir"]);
                 assert_eq!(arr[0]["kind"], "file");
                 assert_eq!(arr[0]["size"], 3);
                 assert_eq!(arr[2]["kind"], "dir");
                 assert!(content.get("stopped").is_none());
             }
-            other => panic!("expected json output, got: {other:?}"),
+            other => return Err(TestError::Unexpected(format!("expected json output, got: {other:?}"))),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_fs_list_denied_when_no_read_permission() {
-        let dir = TempDir::new().unwrap();
+    fn test_fs_list_denied_when_no_read_permission() -> TestResult {
+        let dir = TempDir::new()?;
         let ws = dir.path().join("ws");
-        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&ws)?;
 
         let executor = FsListExecutor {
             max_entries: DEFAULT_MAX_ENTRIES,
         };
-        let sandbox = make_sandbox_with_permissions(dir.path(), vec![]);
+        let sandbox = make_sandbox_with_permissions(dir.path(), vec![])?;
         let ctx = make_ctx(sandbox);
         let call = make_call(serde_json::json!({ "path": "." }));
 
-        let result = executor.list_dir(&ctx, &call).unwrap();
+        let result = executor.list_dir(&ctx, &call)?;
         match result {
             ToolOutput::Error { message } => {
                 assert!(message.contains("ReadWorkspace"), "unexpected: {message}");
             }
-            other => panic!("expected error output, got: {other:?}"),
+            other => return Err(TestError::Unexpected(format!("expected error output, got: {other:?}"))),
         }
+        Ok(())
     }
 
     #[test]
-    fn test_fs_list_invalid_args_returns_err() {
-        let dir = TempDir::new().unwrap();
+    fn test_fs_list_invalid_args_returns_err() -> TestResult {
+        let dir = TempDir::new()?;
         let ws = dir.path().join("ws");
-        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&ws)?;
 
         let executor = FsListExecutor {
             max_entries: DEFAULT_MAX_ENTRIES,
         };
-        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace]);
+        let sandbox = make_sandbox_with_permissions(dir.path(), vec![Permission::ReadWorkspace])?;
         let ctx = make_ctx(sandbox);
         // Missing "path"
         let call = make_call(serde_json::json!({ "max_entries": 5 }));
@@ -321,76 +332,84 @@ mod tests {
             matches!(result, Err(ToolsError::InvalidArguments { .. })),
             "expected InvalidArguments, got: {result:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_fs_list_does_not_follow_symlinks() {
-        let fixture = Fixture::new();
-        fixture.plant_escapes();
+    fn test_fs_list_does_not_follow_symlinks() -> TestResult {
+        let fixture = Fixture::new()?;
+        fixture.plant_escapes()?;
         let executor = FsListExecutor {
             max_entries: DEFAULT_MAX_ENTRIES,
         };
-        let ctx = fixture.ctx(vec![Permission::ReadWorkspace]);
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
 
-        let output = executor
-            .list_dir(&ctx, &call("fs.list", serde_json::json!({ "path": "." })))
-            .unwrap();
+        let output = executor.list_dir(&ctx, &call("fs.list", serde_json::json!({ "path": "." })))?;
         let ToolOutput::Json { content } = &output else {
-            panic!("expected json output, got: {output:?}");
+            return Err(TestError::Unexpected(format!("expected json output, got: {output:?}")));
         };
-        let entries = content["entries"].as_array().unwrap();
+        let entries = content["entries"]
+            .as_array()
+            .ok_or(TestError::Missing("entries"))?;
         for entry in entries {
-            let name = entry["name"].as_str().unwrap();
+            let name = entry["name"].as_str().ok_or(TestError::Missing("name"))?;
             if ["link_dir", "link_file", "loop"].contains(&name) {
                 assert_eq!(entry["kind"], "other", "{name}");
                 assert_eq!(entry["size"], 0, "{name}");
             }
         }
-        assert!(!render(&output).contains("secret.txt"));
+        assert!(!render(&output)?.contains("secret.txt"));
 
         for path in ["link_dir", "loop", "nested/up", "link_dir/deep", "../outside"] {
-            let output = executor
-                .list_dir(&ctx, &call("fs.list", serde_json::json!({ "path": path })))
-                .unwrap();
+            let output =
+                executor.list_dir(&ctx, &call("fs.list", serde_json::json!({ "path": path })))?;
             assert!(matches!(output, ToolOutput::Error { .. }), "{path}: {output:?}");
-            let rendered = render(&output);
+            let rendered = render(&output)?;
             assert!(!rendered.contains("secret.txt") && !rendered.contains(SECRET), "{rendered}");
         }
+        Ok(())
     }
 
     #[test]
-    fn test_fs_list_reports_entry_limit() {
-        let fixture = Fixture::new();
+    fn test_fs_list_reports_entry_limit() -> TestResult {
+        let fixture = Fixture::new()?;
         for i in 0..5 {
-            fs::write(fixture.ws.join(format!("f{i}")), "x").unwrap();
+            fs::write(fixture.ws.join(format!("f{i}")), "x")?;
         }
         let executor = FsListExecutor { max_entries: 3 };
-        let ctx = fixture.ctx(vec![Permission::ReadWorkspace]);
-        let output = executor
-            .list_dir(&ctx, &call("fs.list", serde_json::json!({ "path": "." })))
-            .unwrap();
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
+        let output = executor.list_dir(&ctx, &call("fs.list", serde_json::json!({ "path": "." })))?;
         let ToolOutput::Json { content } = output else {
-            panic!("expected json output");
+            return Err(TestError::Unexpected("expected json output".to_string()));
         };
-        assert_eq!(content["entries"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            content["entries"]
+                .as_array()
+                .ok_or(TestError::Missing("entries"))?
+                .len(),
+            3
+        );
         assert_eq!(content["stopped"], "entry_limit");
+        Ok(())
     }
 
     #[test]
-    fn test_fs_list_race_directory_replaced_by_symlink() {
-        let fixture = Fixture::new();
-        fs::create_dir_all(fixture.ws.join("sub")).unwrap();
+    fn test_fs_list_race_directory_replaced_by_symlink() -> TestResult {
+        let fixture = Fixture::new()?;
+        fs::create_dir_all(fixture.ws.join("sub"))?;
         let executor = FsListExecutor {
             max_entries: DEFAULT_MAX_ENTRIES,
         };
-        let ctx = fixture.ctx(vec![Permission::ReadWorkspace]);
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
         let call = call("fs.list", serde_json::json!({ "path": "sub" }));
-        assert!(matches!(executor.list_dir(&ctx, &call).unwrap(), ToolOutput::Json { .. }));
+        let first = executor.list_dir(&ctx, &call)?;
+        assert!(matches!(first, ToolOutput::Json { .. }));
 
-        fs::rename(fixture.ws.join("sub"), fixture.ws.join("sub_old")).unwrap();
-        std::os::unix::fs::symlink(&fixture.outside, fixture.ws.join("sub")).unwrap();
-        let output = executor.list_dir(&ctx, &call).unwrap();
+        fs::rename(fixture.ws.join("sub"), fixture.ws.join("sub_old"))?;
+        std::os::unix::fs::symlink(&fixture.outside, fixture.ws.join("sub"))?;
+        let output = executor.list_dir(&ctx, &call)?;
         assert!(matches!(output, ToolOutput::Error { .. }), "{output:?}");
-        assert!(!render(&output).contains("secret.txt"));
+        assert!(!render(&output)?.contains("secret.txt"));
+        Ok(())
     }
 }

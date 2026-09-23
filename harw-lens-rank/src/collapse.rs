@@ -75,7 +75,10 @@ fn group_key(policy: CollapsePolicy, ranked: &Ranked) -> GroupKey {
 /// `score`, bei Gleichstand der kleinste [`ChunkDigest`] — ein stabiler
 /// Tiebreak über ein Merkmal des Dokuments, nie über die Fundreihenfolge.
 fn pick_representative(indices: &[usize], candidates: &[Ranked]) -> usize {
-    debug_assert!(!indices.is_empty(), "pick_representative erwartet >= 1 Index");
+    debug_assert!(
+        !indices.is_empty(),
+        "pick_representative erwartet >= 1 Index"
+    );
     let mut sorted = indices.to_vec();
     sorted.sort_by(|&a, &b| {
         candidates[b]
@@ -134,7 +137,10 @@ fn pick_representative(indices: &[usize], candidates: &[Ranked]) -> usize {
 pub fn collapse(candidates: &[Ranked], policy: CollapsePolicy, edges: &EdgeIndex) -> Vec<Ranked> {
     let mut groups: HashMap<GroupKey, Vec<usize>> = HashMap::new();
     for (idx, ranked) in candidates.iter().enumerate() {
-        groups.entry(group_key(policy, ranked)).or_default().push(idx);
+        groups
+            .entry(group_key(policy, ranked))
+            .or_default()
+            .push(idx);
     }
 
     let mut keep = vec![true; candidates.len()];

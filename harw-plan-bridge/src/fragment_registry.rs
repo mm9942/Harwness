@@ -254,8 +254,7 @@ impl FragmentProviderRegistry {
             return Err(FragmentRegistryError::NamespaceBlank);
         }
 
-        if declaration.may_carry_user_content && declaration.max_trust == TrustClass::Instruction
-        {
+        if declaration.may_carry_user_content && declaration.max_trust == TrustClass::Instruction {
             return Err(FragmentRegistryError::TrustClaimTooHigh {
                 provider: declaration.provider_name,
                 claimed: declaration.max_trust,
@@ -315,6 +314,7 @@ impl FragmentProviderRegistry {
 #[cfg(test)]
 mod tests {
     use super::{FragmentProviderDeclaration, FragmentProviderRegistry, FragmentRegistryError};
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_context::TrustClass;
     use harw_lens_types::{BytesOverFour, CostEstimator};
     use std::sync::Arc;
@@ -335,27 +335,32 @@ mod tests {
     }
 
     #[test]
-    fn test_try_register_accepts_distinct_namespaces() {
+    fn test_try_register_accepts_distinct_namespaces() -> TestResult {
         let mut registry = FragmentProviderRegistry::new();
         registry
             .try_register(declaration("Plan", "plan", TrustClass::Evidence, true))
-            .expect("plan namespace registers");
+            .map_err(ctx("plan namespace registers"))?;
         registry
             .try_register(declaration("Memory", "memory", TrustClass::Data, true))
-            .expect("memory namespace registers");
+            .map_err(ctx("memory namespace registers"))?;
         assert_eq!(registry.len(), 2);
+        Ok(())
     }
 
     #[test]
-    fn test_try_register_rejects_duplicate_namespace() {
+    fn test_try_register_rejects_duplicate_namespace() -> TestResult {
         let mut registry = FragmentProviderRegistry::new();
         registry
             .try_register(declaration("Plan", "plan", TrustClass::Evidence, true))
-            .expect("first claim succeeds");
+            .map_err(ctx("first claim succeeds"))?;
 
-        let error = registry
-            .try_register(declaration("RoguePlan", "plan", TrustClass::Data, true))
-            .expect_err("second claim of the same namespace must be rejected");
+        let outcome =
+            registry.try_register(declaration("RoguePlan", "plan", TrustClass::Data, true));
+        let Err(error) = outcome else {
+            return Err(TestError::Unexpected(
+                "second claim of the same namespace must be rejected".to_owned(),
+            ));
+        };
 
         match error {
             FragmentRegistryError::NamespaceAlreadyClaimed {
@@ -367,23 +372,31 @@ mod tests {
                 assert_eq!(existing_provider, "Plan");
                 assert_eq!(new_provider, "RoguePlan");
             }
-            other => panic!("unexpected error: {other:?}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "unexpected error: {other:?}"
+                )));
+            }
         }
         // Die abgelehnte Registrierung darf die bestehende nicht überschreiben.
         assert_eq!(registry.max_trust("plan"), Some(TrustClass::Evidence));
+        Ok(())
     }
 
     #[test]
-    fn test_try_register_rejects_instruction_claim_from_mixed_source() {
+    fn test_try_register_rejects_instruction_claim_from_mixed_source() -> TestResult {
         let mut registry = FragmentProviderRegistry::new();
-        let error = registry
-            .try_register(declaration(
-                "Untrusted",
-                "untrusted",
-                TrustClass::Instruction,
-                true,
-            ))
-            .expect_err("a user-influenced source must never claim Instruction");
+        let outcome = registry.try_register(declaration(
+            "Untrusted",
+            "untrusted",
+            TrustClass::Instruction,
+            true,
+        ));
+        let Err(error) = outcome else {
+            return Err(TestError::Unexpected(
+                "a user-influenced source must never claim Instruction".to_owned(),
+            ));
+        };
 
         assert!(matches!(
             error,
@@ -392,7 +405,11 @@ mod tests {
                 claimed: TrustClass::Instruction,
             }
         ));
-        assert!(registry.is_empty(), "rejected registration must not persist");
+        assert!(
+            registry.is_empty(),
+            "rejected registration must not persist"
+        );
+        Ok(())
     }
 
     /// Positivkontrolle: die Prüfung lehnt nicht *jede* `Instruction`-Klasse
@@ -402,7 +419,7 @@ mod tests {
     /// jeden künftigen, wirklich systemeigenen Provider unbrauchbar machen
     /// würde.
     #[test]
-    fn test_try_register_accepts_instruction_claim_from_system_source() {
+    fn test_try_register_accepts_instruction_claim_from_system_source() -> TestResult {
         let mut registry = FragmentProviderRegistry::new();
         registry
             .try_register(declaration(
@@ -411,35 +428,42 @@ mod tests {
                 TrustClass::Instruction,
                 false,
             ))
-            .expect("a system-only source may claim Instruction");
+            .map_err(ctx("a system-only source may claim Instruction"))?;
         assert_eq!(registry.max_trust("system"), Some(TrustClass::Instruction));
+        Ok(())
     }
 
     #[test]
-    fn test_try_register_rejects_blank_namespace() {
+    fn test_try_register_rejects_blank_namespace() -> TestResult {
         let mut registry = FragmentProviderRegistry::new();
-        let error = registry
-            .try_register(declaration("Plan", "   ", TrustClass::Evidence, true))
-            .expect_err("blank namespace must be rejected");
+        let outcome = registry.try_register(declaration("Plan", "   ", TrustClass::Evidence, true));
+        let Err(error) = outcome else {
+            return Err(TestError::Unexpected(
+                "blank namespace must be rejected".to_owned(),
+            ));
+        };
         assert!(matches!(error, FragmentRegistryError::NamespaceBlank));
+        Ok(())
     }
 
     #[test]
-    fn test_cost_estimator_is_retrievable_after_registration() {
+    fn test_cost_estimator_is_retrievable_after_registration() -> TestResult {
         let mut registry = FragmentProviderRegistry::new();
         registry
             .try_register(declaration("Plan", "plan", TrustClass::Evidence, true))
-            .expect("registration succeeds");
+            .map_err(ctx("registration succeeds"))?;
         let estimator = registry
             .cost_estimator("plan")
-            .expect("estimator is stored");
+            .ok_or(TestError::Missing("estimator is stored"))?;
         assert_eq!(estimator.estimate("abcd"), BytesOverFour.estimate("abcd"));
+        Ok(())
     }
 
     #[test]
-    fn test_max_trust_and_cost_estimator_are_none_for_unknown_namespace() {
+    fn test_max_trust_and_cost_estimator_are_none_for_unknown_namespace() -> TestResult {
         let registry = FragmentProviderRegistry::new();
         assert_eq!(registry.max_trust("plan"), None);
         assert!(registry.cost_estimator("plan").is_none());
+        Ok(())
     }
 }

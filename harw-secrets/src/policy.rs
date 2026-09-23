@@ -150,6 +150,7 @@ mod tests {
     use crypt_guard::pq_hpke::Kem;
 
     use crate::error::SecretsError;
+    use crate::test_support::TestResult;
 
     use super::{AeadAlgo, CryptoPolicy, KemAlgo};
 
@@ -165,70 +166,64 @@ mod tests {
     ];
 
     #[test]
-    fn algorithms_use_explicit_snake_case_wire_names() {
+    fn algorithms_use_explicit_snake_case_wire_names() -> TestResult {
         assert_eq!(
-            serde_json::to_string(&KemAlgo::MlKem768P256).expect("serialize KEM"),
+            serde_json::to_string(&KemAlgo::MlKem768P256)?,
             r#""ml_kem_768_p256""#
         );
         assert_eq!(
-            serde_json::to_string(&KemAlgo::MlKem1024P384).expect("serialize KEM"),
+            serde_json::to_string(&KemAlgo::MlKem1024P384)?,
             r#""ml_kem_1024_p384""#
         );
         assert_eq!(
-            serde_json::to_string(&KemAlgo::MlKem768X25519).expect("serialize KEM"),
+            serde_json::to_string(&KemAlgo::MlKem768X25519)?,
             r#""ml_kem_768_x25519""#
         );
         assert_eq!(
-            serde_json::to_string(&AeadAlgo::XChaCha20Poly1305).expect("serialize AEAD"),
+            serde_json::to_string(&AeadAlgo::XChaCha20Poly1305)?,
             r#""x_chacha20_poly1305""#
         );
         assert_eq!(
-            serde_json::to_string(&AeadAlgo::AesGcmSiv).expect("serialize AEAD"),
+            serde_json::to_string(&AeadAlgo::AesGcmSiv)?,
             r#""aes_gcm_siv""#
         );
+        Ok(())
     }
 
     #[test]
-    fn hybrid_wire_names_round_trip_and_match_the_internal_name() {
+    fn hybrid_wire_names_round_trip_and_match_the_internal_name() -> TestResult {
         for kem in HYBRID_KEMS {
-            let encoded = serde_json::to_string(&kem).expect("serialize hybrid KEM");
+            let encoded = serde_json::to_string(&kem)?;
             assert_eq!(encoded, format!("\"{}\"", kem.wire_name()));
-            let decoded: KemAlgo = serde_json::from_str(&encoded).expect("deserialize hybrid KEM");
+            let decoded: KemAlgo = serde_json::from_str(&encoded)?;
             assert_eq!(decoded, kem);
             assert!(!kem.is_legacy());
         }
+        Ok(())
     }
 
     #[test]
-    fn legacy_wire_names_deserialize_but_never_serialize() {
+    fn legacy_wire_names_deserialize_but_never_serialize() -> TestResult {
         for (wire, expected) in [
             ("ml_kem_512", KemAlgo::LegacyMlKem512),
             ("ml_kem_768", KemAlgo::LegacyMlKem768),
             ("ml_kem_1024", KemAlgo::LegacyMlKem1024),
         ] {
-            let decoded: KemAlgo =
-                serde_json::from_str(&format!("\"{wire}\"")).expect("deserialize legacy KEM");
+            let decoded: KemAlgo = serde_json::from_str(&format!("\"{wire}\""))?;
             assert_eq!(decoded, expected);
             assert!(decoded.is_legacy());
             assert_eq!(decoded.wire_name(), wire);
             assert!(serde_json::to_string(&decoded).is_err());
         }
+        Ok(())
     }
 
     #[test]
-    fn hybrid_kems_map_to_the_exact_crypt_guard_kem() {
-        assert_eq!(
-            KemAlgo::MlKem768P256.hpke_kem().expect("hybrid KEM"),
-            Kem::MlKem768P256
-        );
-        assert_eq!(
-            KemAlgo::MlKem1024P384.hpke_kem().expect("hybrid KEM"),
-            Kem::MlKem1024P384
-        );
-        assert_eq!(
-            KemAlgo::MlKem768X25519.hpke_kem().expect("hybrid KEM"),
-            Kem::MlKem768X25519
-        );
+    fn hybrid_kems_map_to_the_exact_crypt_guard_kem() -> TestResult {
+        assert_eq!(KemAlgo::MlKem768P256.hpke_kem()?, Kem::MlKem768P256);
+        assert_eq!(KemAlgo::MlKem1024P384.hpke_kem()?, Kem::MlKem1024P384);
+        assert_eq!(KemAlgo::MlKem768X25519.hpke_kem()?, Kem::MlKem768X25519);
+        Ok(())
     }
 
     #[test]
@@ -254,19 +249,20 @@ mod tests {
     }
 
     #[test]
-    fn crypto_policy_round_trips_with_stable_field_names() {
+    fn crypto_policy_round_trips_with_stable_field_names() -> TestResult {
         let policy = CryptoPolicy {
             kem: KemAlgo::MlKem768X25519,
             aead: AeadAlgo::AesGcmSiv,
         };
 
-        let encoded = serde_json::to_string(&policy).expect("serialize policy");
+        let encoded = serde_json::to_string(&policy)?;
         assert_eq!(
             encoded,
             r#"{"kem":"ml_kem_768_x25519","aead":"aes_gcm_siv"}"#
         );
 
-        let decoded: CryptoPolicy = serde_json::from_str(&encoded).expect("deserialize policy");
+        let decoded: CryptoPolicy = serde_json::from_str(&encoded)?;
         assert_eq!(decoded, policy);
+        Ok(())
     }
 }

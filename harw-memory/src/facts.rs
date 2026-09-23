@@ -513,7 +513,10 @@ fn redact_near_keyword_base64(text: &str) -> String {
     for &(start, end) in &runs {
         let window_start = start.saturating_sub(20);
         let window: String = lower[window_start..start].iter().collect();
-        if ["key", "secret", "token"].iter().any(|k| window.contains(k)) {
+        if ["key", "secret", "token"]
+            .iter()
+            .any(|k| window.contains(k))
+        {
             for flag in &mut redacted[start..end] {
                 *flag = true;
             }
@@ -1151,12 +1154,10 @@ impl FactStore {
     fn read_usage_map(&self) -> MemoryResult<HashMap<String, UsageEntry>> {
         let path = self.usage_path();
         match read_optional_no_symlink(&path)? {
-            Some(bytes) => {
-                serde_json::from_slice(&bytes).map_err(|e| MemoryError::Serde {
-                    context: "usage.json lesen",
-                    source: e,
-                })
-            }
+            Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| MemoryError::Serde {
+                context: "usage.json lesen",
+                source: e,
+            }),
             None => Ok(HashMap::new()),
         }
     }
@@ -1295,15 +1296,14 @@ fn format_date(ts: OffsetDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestError, TestResult, ctx};
     use time::Duration;
 
     fn tmp_root(tag: &str) -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "harw-facts-{tag}-{}-{id}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("harw-facts-{tag}-{}-{id}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         root
     }
@@ -1353,15 +1353,18 @@ mod tests {
     // -- round trip --------------------------------------------------------
 
     #[test]
-    fn write_then_read_round_trips_umlauts_and_multiline_body() {
+    fn write_then_read_round_trips_umlauts_and_multiline_body() -> TestResult {
         let root = tmp_root("roundtrip");
-        let store = FactStore::open(&root, FactScope::Project).unwrap();
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("FactStore::open"))?;
         let mut fact = sample_fact("tui-approval-arming");
         fact.description = "Ünïcödé: äöüß Beschreibung".to_owned();
         fact.body = "Zeile 1 mit ö.\nZeile 2 mit ü und ß.\n".to_owned();
 
-        store.write(&fact).unwrap();
-        let read_back = store.read("tui-approval-arming").unwrap().unwrap();
+        store.write(&fact).map_err(ctx("write"))?;
+        let read_back = store
+            .read("tui-approval-arming")
+            .map_err(ctx("read"))?
+            .ok_or(TestError::Missing("tui-approval-arming"))?;
 
         assert_eq!(read_back.name, "tui-approval-arming");
         assert_eq!(read_back.description, fact.description);
@@ -1372,125 +1375,144 @@ mod tests {
         assert_eq!(read_back.tags, fact.tags);
         assert!((read_back.confidence - 0.8).abs() < 0.01);
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn write_preserves_created_and_bumps_updated_on_overwrite() {
+    fn write_preserves_created_and_bumps_updated_on_overwrite() -> TestResult {
         let root = tmp_root("preserve-created");
-        let store = FactStore::open(&root, FactScope::Project).unwrap();
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("FactStore::open"))?;
         let fact = sample_fact("stable-name");
-        store.write(&fact).unwrap();
-        let first = store.read("stable-name").unwrap().unwrap();
+        store.write(&fact).map_err(ctx("write"))?;
+        let first = store
+            .read("stable-name")
+            .map_err(ctx("read"))?
+            .ok_or(TestError::Missing("stable-name"))?;
 
         std::thread::sleep(std::time::Duration::from_millis(10));
         let mut second_write = fact.clone();
         second_write.description = "geändert".to_owned();
-        store.write(&second_write).unwrap();
-        let second = store.read("stable-name").unwrap().unwrap();
+        store.write(&second_write).map_err(ctx("write"))?;
+        let second = store
+            .read("stable-name")
+            .map_err(ctx("read"))?
+            .ok_or(TestError::Missing("stable-name"))?;
 
         assert_eq!(second.created, first.created);
         assert!(second.updated >= first.updated);
         assert_eq!(second.description, "geändert");
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn missing_fact_reads_as_none() {
+    fn missing_fact_reads_as_none() -> TestResult {
         let root = tmp_root("missing");
-        let store = FactStore::open(&root, FactScope::Global).unwrap();
-        assert!(store.read("does-not-exist").unwrap().is_none());
+        let store = FactStore::open(&root, FactScope::Global).map_err(ctx("FactStore::open"))?;
+        assert!(store.read("does-not-exist").map_err(ctx("read"))?.is_none());
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn defaults_apply_when_optional_keys_are_absent() {
+    fn defaults_apply_when_optional_keys_are_absent() -> TestResult {
         let root = tmp_root("defaults");
-        let store = FactStore::open(&root, FactScope::Global).unwrap();
+        let store = FactStore::open(&root, FactScope::Global).map_err(ctx("FactStore::open"))?;
         let raw = "---\nname: minimal\ndescription: nur das Nötigste\n---\n\nInhalt.\n";
-        fs::write(root.join("facts/minimal.md"), raw).unwrap();
+        fs::write(root.join("facts/minimal.md"), raw).map_err(ctx("fs::write"))?;
 
-        let fact = store.read("minimal").unwrap().unwrap();
+        let fact = store
+            .read("minimal")
+            .map_err(ctx("read"))?
+            .ok_or(TestError::Missing("minimal"))?;
         assert_eq!(fact.fact_type, FactType::Fact);
         assert_eq!(fact.scope, FactScope::Global);
         assert!((fact.confidence - 0.8).abs() < f32::EPSILON);
         assert!(fact.tags.is_empty());
         assert!(fact.sources.is_empty());
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // -- malformed frontmatter --------------------------------------------
 
     #[test]
-    fn missing_closing_delimiter_is_an_error() {
+    fn missing_closing_delimiter_is_an_error() -> TestResult {
         let root = tmp_root("malformed-no-close");
-        let store = FactStore::open(&root, FactScope::Project).unwrap();
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("FactStore::open"))?;
         fs::write(
             root.join("facts/broken.md"),
             "---\nname: broken\ndescription: x\n\nInhalt ohne Ende.\n",
         )
-        .unwrap();
-        assert!(matches!(
-            store.read("broken").unwrap_err(),
-            MemoryError::FrontmatterInvalid { .. }
-        ));
+        .map_err(ctx("fs::write"))?;
+        let Err(err) = store.read("broken") else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        assert!(matches!(err, MemoryError::FrontmatterInvalid { .. }));
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn missing_description_is_an_error() {
+    fn missing_description_is_an_error() -> TestResult {
         let root = tmp_root("malformed-no-desc");
-        let store = FactStore::open(&root, FactScope::Project).unwrap();
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("FactStore::open"))?;
         fs::write(
             root.join("facts/broken.md"),
             "---\nname: broken\n---\n\nInhalt.\n",
         )
-        .unwrap();
-        assert!(matches!(
-            store.read("broken").unwrap_err(),
-            MemoryError::FrontmatterInvalid { .. }
-        ));
+        .map_err(ctx("fs::write"))?;
+        let Err(err) = store.read("broken") else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        assert!(matches!(err, MemoryError::FrontmatterInvalid { .. }));
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn unclosed_inline_list_is_an_error() {
+    fn unclosed_inline_list_is_an_error() -> TestResult {
         let root = tmp_root("malformed-list");
-        let store = FactStore::open(&root, FactScope::Project).unwrap();
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("FactStore::open"))?;
         fs::write(
             root.join("facts/broken.md"),
             "---\nname: broken\ndescription: x\ntags: [a, b\n---\n\nInhalt.\n",
         )
-        .unwrap();
-        assert!(matches!(
-            store.read("broken").unwrap_err(),
-            MemoryError::FrontmatterInvalid { .. }
-        ));
+        .map_err(ctx("fs::write"))?;
+        let Err(err) = store.read("broken") else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
+        assert!(matches!(err, MemoryError::FrontmatterInvalid { .. }));
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn list_skips_malformed_files_and_logs() {
+    fn list_skips_malformed_files_and_logs() -> TestResult {
         let root = tmp_root("list-skips");
-        let store = FactStore::open(&root, FactScope::Project).unwrap();
-        store.write(&sample_fact("good-one")).unwrap();
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("FactStore::open"))?;
+        store
+            .write(&sample_fact("good-one"))
+            .map_err(ctx("write"))?;
         fs::write(
             root.join("facts/broken.md"),
             "---\nname: broken\n---\n\nkeine description.\n",
         )
-        .unwrap();
+        .map_err(ctx("fs::write"))?;
 
-        let facts = store.list().unwrap();
+        let facts = store.list().map_err(ctx("list"))?;
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].name, "good-one");
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // -- traversal ----------------------------------------------------------
 
     #[test]
-    fn invalid_names_are_rejected() {
+    fn invalid_names_are_rejected() -> TestResult {
         let root = tmp_root("traversal");
-        let store = FactStore::open(&root, FactScope::Project).unwrap();
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("FactStore::open"))?;
         for bad in ["../x", "a/b", "", "Uppercase", "a.b", "a b"] {
             assert!(
                 matches!(
@@ -1505,141 +1527,185 @@ mod tests {
             ));
         }
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // -- search ---------------------------------------------------------
 
     #[test]
-    fn search_ranks_name_match_over_body_match() {
+    fn search_ranks_name_match_over_body_match() -> TestResult {
         let root = tmp_root("search");
-        let store = FactStore::open(&root, FactScope::Project).unwrap();
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("FactStore::open"))?;
         let mut name_hit = sample_fact("popup-timing");
         name_hit.description = "irrelevant".to_owned();
         name_hit.body = "irrelevant".to_owned();
-        store.write(&name_hit).unwrap();
+        store.write(&name_hit).map_err(ctx("write"))?;
 
         let mut body_hit = sample_fact("other-topic");
         body_hit.description = "irrelevant".to_owned();
         body_hit.body = "erwähnt popup nur im Fließtext".to_owned();
-        store.write(&body_hit).unwrap();
+        store.write(&body_hit).map_err(ctx("write"))?;
 
-        let hits = store.search(&["popup"], 10).unwrap();
+        let hits = store.search(&["popup"], 10).map_err(ctx("search"))?;
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].name, "popup-timing");
         assert_eq!(hits[1].name, "other-topic");
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn search_with_no_match_returns_empty() {
+    fn search_with_no_match_returns_empty() -> TestResult {
         let root = tmp_root("search-empty");
-        let store = FactStore::open(&root, FactScope::Project).unwrap();
-        store.write(&sample_fact("some-fact")).unwrap();
-        let hits = store.search(&["nirgendwo-erwaehnt"], 10).unwrap();
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("FactStore::open"))?;
+        store
+            .write(&sample_fact("some-fact"))
+            .map_err(ctx("write"))?;
+        let hits = store
+            .search(&["nirgendwo-erwaehnt"], 10)
+            .map_err(ctx("search"))?;
         assert!(hits.is_empty());
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // -- index -----------------------------------------------------------
 
     #[test]
-    fn index_groups_by_type_in_stable_order() {
+    fn index_groups_by_type_in_stable_order() -> TestResult {
         let root = tmp_root("index");
-        let store = FactStore::open(&root, FactScope::Project).unwrap();
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("FactStore::open"))?;
         let mut pref = sample_fact("z-pref");
         pref.fact_type = FactType::Preference;
-        store.write(&pref).unwrap();
+        store.write(&pref).map_err(ctx("write"))?;
         let mut fact_b = sample_fact("b-fact");
         fact_b.fact_type = FactType::Fact;
-        store.write(&fact_b).unwrap();
+        store.write(&fact_b).map_err(ctx("write"))?;
         let mut fact_a = sample_fact("a-fact");
         fact_a.fact_type = FactType::Fact;
-        store.write(&fact_a).unwrap();
+        store.write(&fact_a).map_err(ctx("write"))?;
 
-        let index = fs::read_to_string(root.join("MEMORY.md")).unwrap();
+        let index = fs::read_to_string(root.join("MEMORY.md")).map_err(ctx("read_to_string"))?;
         assert!(index.starts_with("# Gedächtnis (project)\n\n"));
-        let fact_heading = index.find("## Fakt").unwrap();
-        let pref_heading = index.find("## Präferenz").unwrap();
-        assert!(fact_heading < pref_heading, "Fakt muss vor Präferenz stehen");
-        let a_pos = index.find("a-fact.md").unwrap();
-        let b_pos = index.find("b-fact.md").unwrap();
+        let fact_heading = index
+            .find("## Fakt")
+            .ok_or(TestError::Missing("## Fakt heading"))?;
+        let pref_heading = index
+            .find("## Präferenz")
+            .ok_or(TestError::Missing("## Präferenz heading"))?;
+        assert!(
+            fact_heading < pref_heading,
+            "Fakt muss vor Präferenz stehen"
+        );
+        let a_pos = index
+            .find("a-fact.md")
+            .ok_or(TestError::Missing("a-fact.md"))?;
+        let b_pos = index
+            .find("b-fact.md")
+            .ok_or(TestError::Missing("b-fact.md"))?;
         assert!(a_pos < b_pos, "innerhalb der Gruppe alphabetisch nach name");
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn delete_removes_file_usage_and_index_line() {
+    fn delete_removes_file_usage_and_index_line() -> TestResult {
         let root = tmp_root("delete");
-        let store = FactStore::open(&root, FactScope::Project).unwrap();
-        store.write(&sample_fact("to-delete")).unwrap();
-        store.record_usage(&["to-delete"]).unwrap();
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("FactStore::open"))?;
+        store
+            .write(&sample_fact("to-delete"))
+            .map_err(ctx("write"))?;
+        store
+            .record_usage(&["to-delete"])
+            .map_err(ctx("record_usage"))?;
         assert!(store.usage("to-delete").is_some());
 
-        let deleted = store.delete("to-delete").unwrap();
+        let deleted = store.delete("to-delete").map_err(ctx("delete"))?;
         assert!(deleted);
         assert!(!root.join("facts/to-delete.md").exists());
         assert!(store.usage("to-delete").is_none());
-        let index = fs::read_to_string(root.join("MEMORY.md")).unwrap();
+        let index = fs::read_to_string(root.join("MEMORY.md")).map_err(ctx("read_to_string"))?;
         assert!(!index.contains("to-delete.md"));
 
-        assert!(!store.delete("to-delete").unwrap());
+        assert!(!store.delete("to-delete").map_err(ctx("delete"))?);
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // -- usage / decay -----------------------------------------------------
 
     #[test]
-    fn usage_counters_persist_across_calls() {
+    fn usage_counters_persist_across_calls() -> TestResult {
         let root = tmp_root("usage");
-        let store = FactStore::open(&root, FactScope::Project).unwrap();
-        store.write(&sample_fact("tracked")).unwrap();
-        store.record_usage(&["tracked"]).unwrap();
-        store.record_usage(&["tracked", "tracked"]).unwrap();
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("FactStore::open"))?;
+        store.write(&sample_fact("tracked")).map_err(ctx("write"))?;
+        store
+            .record_usage(&["tracked"])
+            .map_err(ctx("record_usage"))?;
+        store
+            .record_usage(&["tracked", "tracked"])
+            .map_err(ctx("record_usage"))?;
 
-        let (count, _last_used) = store.usage("tracked").unwrap();
+        let (count, _last_used) = store
+            .usage("tracked")
+            .ok_or(TestError::Missing("tracked usage"))?;
         assert_eq!(count, 3);
         assert!(store.usage("never-used").is_none());
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn decay_halves_confidence_after_unused_window_and_reports_low_confidence() {
+    fn decay_halves_confidence_after_unused_window_and_reports_low_confidence() -> TestResult {
         let root = tmp_root("decay");
-        let store = FactStore::open(&root, FactScope::Project).unwrap();
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("FactStore::open"))?;
         let mut fact = sample_fact("stale-fact");
         fact.confidence = 0.3;
-        store.write(&fact).unwrap();
+        store.write(&fact).map_err(ctx("write"))?;
 
         let now = OffsetDateTime::now_utc();
         // Innerhalb des Fensters: keine Änderung.
-        let unchanged = store.decay(90, now).unwrap();
+        let unchanged = store.decay(90, now).map_err(ctx("decay"))?;
         assert!(unchanged.is_empty());
-        let still = store.read("stale-fact").unwrap().unwrap();
+        let still = store
+            .read("stale-fact")
+            .map_err(ctx("read"))?
+            .ok_or(TestError::Missing("stale-fact"))?;
         assert!((still.confidence - 0.3).abs() < 0.01);
 
         // Nach dem Fenster (kein usage-Eintrag => Alter ab `updated`).
         let far_future = now + Duration::days(91);
-        let fallen = store.decay(90, far_future).unwrap();
+        let fallen = store.decay(90, far_future).map_err(ctx("decay"))?;
         assert_eq!(fallen, vec!["stale-fact".to_owned()]);
-        let decayed = store.read("stale-fact").unwrap().unwrap();
+        let decayed = store
+            .read("stale-fact")
+            .map_err(ctx("read"))?
+            .ok_or(TestError::Missing("stale-fact"))?;
         assert!((decayed.confidence - 0.15).abs() < 0.01);
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
-    fn decay_skips_facts_with_recorded_usage() {
+    fn decay_skips_facts_with_recorded_usage() -> TestResult {
         let root = tmp_root("decay-used");
-        let store = FactStore::open(&root, FactScope::Project).unwrap();
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("FactStore::open"))?;
         let fact = sample_fact("used-fact");
-        store.write(&fact).unwrap();
-        store.record_usage(&["used-fact"]).unwrap();
+        store.write(&fact).map_err(ctx("write"))?;
+        store
+            .record_usage(&["used-fact"])
+            .map_err(ctx("record_usage"))?;
 
         let far_future = OffsetDateTime::now_utc() + Duration::days(200);
-        let fallen = store.decay(90, far_future).unwrap();
+        let fallen = store.decay(90, far_future).map_err(ctx("decay"))?;
         assert!(fallen.is_empty());
-        let unchanged = store.read("used-fact").unwrap().unwrap();
+        let unchanged = store
+            .read("used-fact")
+            .map_err(ctx("read"))?
+            .ok_or(TestError::Missing("used-fact"))?;
         assert!((unchanged.confidence - 0.8).abs() < 0.01);
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // -- redact ---------------------------------------------------------
@@ -1688,10 +1754,7 @@ mod tests {
 
     #[test]
     fn redact_catches_key_value_secrets() {
-        assert_eq!(
-            redact("password=hunter2geheim"),
-            "password=[redacted]"
-        );
+        assert_eq!(redact("password=hunter2geheim"), "password=[redacted]");
         assert_eq!(redact("api_key=abcdef123456"), "api_key=[redacted]");
         assert_eq!(redact("token = zyxwv98765"), "token = [redacted]");
     }
@@ -1706,24 +1769,33 @@ mod tests {
 
     #[test]
     fn redact_does_not_touch_long_run_without_keyword_context() {
-        let text = "Dieser Hash hat viele Zeichen: aGVsbG93b3JsZGhlbGxvd29ybGRoZWxsb3dvcmxk am Ende.";
+        let text =
+            "Dieser Hash hat viele Zeichen: aGVsbG93b3JsZGhlbGxvd29ybGRoZWxsb3dvcmxk am Ende.";
         assert_eq!(redact(text), text);
     }
 
     #[test]
-    fn write_redacts_body_description_and_tags() {
+    fn write_redacts_body_description_and_tags() -> TestResult {
         let root = tmp_root("write-redacts");
-        let store = FactStore::open(&root, FactScope::Project).unwrap();
+        let store = FactStore::open(&root, FactScope::Project).map_err(ctx("FactStore::open"))?;
         let mut fact = sample_fact("has-secret");
         fact.description = "enthält sk-abcdefghijklmnopqrstuvwxyz".to_owned();
         fact.body = "Bearer supersecrettoken123 im Body".to_owned();
         fact.tags = vec!["AKIAABCDEFGHIJKLMNOP".to_owned()];
-        store.write(&fact).unwrap();
+        store.write(&fact).map_err(ctx("write"))?;
 
-        let read_back = store.read("has-secret").unwrap().unwrap();
-        assert!(!read_back.description.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+        let read_back = store
+            .read("has-secret")
+            .map_err(ctx("read"))?
+            .ok_or(TestError::Missing("has-secret"))?;
+        assert!(
+            !read_back
+                .description
+                .contains("sk-abcdefghijklmnopqrstuvwxyz")
+        );
         assert!(read_back.body.contains("[redacted]"));
         assert_eq!(read_back.tags[0], "[redacted]");
         let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 }

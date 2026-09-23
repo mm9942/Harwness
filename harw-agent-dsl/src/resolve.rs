@@ -22,7 +22,7 @@ use crate::authority::AuthorityCeiling;
 use crate::error::{DiagLocation, DslError, DslResult};
 use crate::ids::DefinitionId;
 use crate::layers::DefinitionLayer;
-use crate::merge::{apply_merge_op, MergeOp};
+use crate::merge::{MergeOp, apply_merge_op};
 use crate::raw::RawAgentDefinition;
 use crate::resolved::{ResolutionStep, ResolutionTrace, ResolvedAgentDefinition};
 
@@ -104,10 +104,20 @@ pub fn resolve_definition(
             }),
             location: DiagLocation::none(),
         })?;
+    // `target_layers` wurde oben bereits als nicht-leer bestätigt (siehe
+    // `base_target`); dieselbe Fehlervariante dient hier nur als defensiver
+    // Fallback statt einer Panik (Bible R087).
     let target = target_layers
         .last()
         .copied()
-        .expect("target_layers was checked to be non-empty");
+        .ok_or_else(|| DslError::MissingBase {
+            of: Box::new(target_id.clone()),
+            referenced: Box::new(crate::ids::DefinitionRef {
+                id: target_id.clone(),
+                version: None,
+            }),
+            location: DiagLocation::none(),
+        })?;
     let authoritative_role = base_target.role;
 
     let mut ctx = ResolveCtx {
@@ -245,11 +255,12 @@ fn apply_mixins(
     ctx: &mut ResolveCtx<'_>,
 ) -> DslResult<()> {
     for (mixin_idx, mixin_ref) in definition.mixins.iter().enumerate() {
-        let mixin = find_reference(ctx.sorted, mixin_ref).ok_or_else(|| DslError::MissingMixin {
-            of: Box::new(ctx.target_id.clone()),
-            referenced: Box::new(mixin_ref.clone()),
-            location: DiagLocation::field(format!("mixins[{mixin_idx}]")),
-        })?;
+        let mixin =
+            find_reference(ctx.sorted, mixin_ref).ok_or_else(|| DslError::MissingMixin {
+                of: Box::new(ctx.target_id.clone()),
+                referenced: Box::new(mixin_ref.clone()),
+                location: DiagLocation::field(format!("mixins[{mixin_idx}]")),
+            })?;
         // Mixins dürfen die Rolle nicht ändern (§6)
         if mixin.role != authoritative_role {
             return Err(DslError::IllegalRoleForMixin {
@@ -527,6 +538,7 @@ mod tests {
     use super::*;
     use crate::layers::DefinitionLayer;
     use crate::parse::parse_toml;
+    use crate::test_support::{TestError, TestResult};
 
     fn now() -> OffsetDateTime {
         OffsetDateTime::now_utc()
@@ -541,17 +553,18 @@ specialization = "test-worker"
 "#;
 
     #[test]
-    fn test_simple_no_extends() {
-        let raw = parse_toml(MINIMAL_WORKER).unwrap();
-        let id = DefinitionId::parse("harwness.agent.worker@1").unwrap();
+    fn test_simple_no_extends() -> TestResult {
+        let raw = parse_toml(MINIMAL_WORKER)?;
+        let id = DefinitionId::parse("harwness.agent.worker@1")?;
         let layers = vec![(DefinitionLayer::BuiltIn, raw)];
-        let resolved = resolve_definition(&id, &layers, now()).unwrap();
+        let resolved = resolve_definition(&id, &layers, now())?;
         assert_eq!(resolved.specialization, "test-worker");
         assert_eq!(resolved.role, crate::roles::AgentRoleId::Worker);
+        Ok(())
     }
 
     #[test]
-    fn test_missing_base_errors() {
+    fn test_missing_base_errors() -> TestResult {
         let src = r#"
 schema = "harwness.agent/v1"
 id = "harwness.agent.my-worker@1"
@@ -560,15 +573,16 @@ role = "worker"
 specialization = "test"
 extends = { id = "harwness.agent.nonexistent-base@1" }
 "#;
-        let raw = parse_toml(src).unwrap();
-        let id = DefinitionId::parse("harwness.agent.my-worker@1").unwrap();
+        let raw = parse_toml(src)?;
+        let id = DefinitionId::parse("harwness.agent.my-worker@1")?;
         let layers = vec![(DefinitionLayer::BuiltIn, raw)];
         let result = resolve_definition(&id, &layers, now());
         assert!(matches!(result, Err(DslError::MissingBase { .. })));
+        Ok(())
     }
 
     #[test]
-    fn test_authority_elevation_rejected() {
+    fn test_authority_elevation_rejected() -> TestResult {
         // Ein Patch, der versucht, Capabilities per `append` hinzuzufügen
         let src = r#"
 schema = "harwness.agent/v1"
@@ -583,8 +597,8 @@ capabilities = ["filesystem.read"]
 [patch.authority.capabilities]
 append = ["agent.spawn.child-orchestrator"]
 "#;
-        let raw = parse_toml(src).unwrap();
-        let id = DefinitionId::parse("harwness.agent.evil-worker@1").unwrap();
+        let raw = parse_toml(src)?;
+        let id = DefinitionId::parse("harwness.agent.evil-worker@1")?;
         let layers = vec![(DefinitionLayer::BuiltIn, raw)];
         let result = resolve_definition(&id, &layers, now());
         assert!(
@@ -592,10 +606,11 @@ append = ["agent.spawn.child-orchestrator"]
             "Erwartet AuthorityElevation, erhalten: {:?}",
             result
         );
+        Ok(())
     }
 
     #[test]
-    fn test_authority_elevation_display_contains_field_path() {
+    fn test_authority_elevation_display_contains_field_path() -> TestResult {
         // Verifies that the resolver passes field_path "authority.capabilities" into AuthorityElevation.
         let src = r#"
 schema = "harwness.agent/v1"
@@ -610,19 +625,22 @@ capabilities = ["filesystem.read"]
 [patch.authority.capabilities]
 append = ["agent.spawn.child-orchestrator"]
 "#;
-        let raw = parse_toml(src).unwrap();
-        let id = DefinitionId::parse("harwness.agent.evil-worker@2").unwrap();
+        let raw = parse_toml(src)?;
+        let id = DefinitionId::parse("harwness.agent.evil-worker@2")?;
         let layers = vec![(DefinitionLayer::BuiltIn, raw)];
-        let err = resolve_definition(&id, &layers, now()).unwrap_err();
+        let Err(err) = resolve_definition(&id, &layers, now()) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         let msg = err.to_string();
         assert!(
             msg.contains("authority.capabilities"),
             "Display should contain 'authority.capabilities', got: {msg}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_trace_contains_base_and_mixin_steps() {
+    fn test_resolve_trace_contains_base_and_mixin_steps() -> TestResult {
         let base_src = r#"
 schema = "harwness.agent/v1"
 id = "harwness.agent.worker-base@1"
@@ -646,16 +664,16 @@ specialization = "rust-worker"
 extends = { id = "harwness.agent.worker-base@1" }
 mixins = [{ id = "harwness.mixin.rust-coding@1" }]
 "#;
-        let base = parse_toml(base_src).unwrap();
-        let mixin = parse_toml(mixin_src).unwrap();
-        let target = parse_toml(target_src).unwrap();
-        let id = DefinitionId::parse("harwness.agent.rust-worker@1").unwrap();
+        let base = parse_toml(base_src)?;
+        let mixin = parse_toml(mixin_src)?;
+        let target = parse_toml(target_src)?;
+        let id = DefinitionId::parse("harwness.agent.rust-worker@1")?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::BuiltIn, mixin),
             (DefinitionLayer::BuiltIn, target),
         ];
-        let resolved = resolve_definition(&id, &layers, now()).unwrap();
+        let resolved = resolve_definition(&id, &layers, now())?;
         // Trace muss: base-Step, mixin-Step, patch-Step (target) enthalten = ≥ 2 Steps
         assert!(
             resolved.trace.steps.len() >= 2,
@@ -676,12 +694,13 @@ mixins = [{ id = "harwness.mixin.rust-coding@1" }]
             kinds.contains(&"mixin"),
             "Trace muss 'mixin'-Schritt enthalten"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_with_layer_priority() {
+    fn test_resolve_with_layer_priority() -> TestResult {
         // Höhere Schicht (Project) überschreibt BuiltIn
-        let builtin = parse_toml(MINIMAL_WORKER).unwrap();
+        let builtin = parse_toml(MINIMAL_WORKER)?;
         let project_src = r#"
 schema = "harwness.agent/v1"
 id = "harwness.agent.worker@1"
@@ -689,19 +708,20 @@ version = "2.0.0"
 role = "worker"
 specialization = "project-override"
 "#;
-        let project = parse_toml(project_src).unwrap();
-        let id = DefinitionId::parse("harwness.agent.worker@1").unwrap();
+        let project = parse_toml(project_src)?;
+        let id = DefinitionId::parse("harwness.agent.worker@1")?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, builtin),
             (DefinitionLayer::Project, project),
         ];
-        let resolved = resolve_definition(&id, &layers, now()).unwrap();
+        let resolved = resolve_definition(&id, &layers, now())?;
         assert_eq!(resolved.specialization, "project-override");
         assert_eq!(resolved.version.0.major, 2);
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_recursively_applies_all_extends() {
+    fn test_resolve_recursively_applies_all_extends() -> TestResult {
         let root = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -713,8 +733,7 @@ specialization = "root"
 [root_only]
 enabled = true
 "#,
-        )
-        .unwrap();
+        )?;
         let middle = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -727,8 +746,7 @@ extends = { id = "harwness.agent.root-base@1" }
 [middle_only]
 enabled = true
 "#,
-        )
-        .unwrap();
+        )?;
         let target = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -738,9 +756,8 @@ role = "worker"
 specialization = "target"
 extends = { id = "harwness.agent.middle-base@1" }
 "#,
-        )
-        .unwrap();
-        let id = DefinitionId::parse("harwness.agent.recursive-target@1").unwrap();
+        )?;
+        let id = DefinitionId::parse("harwness.agent.recursive-target@1")?;
         let resolved = resolve_definition(
             &id,
             &[
@@ -749,8 +766,7 @@ extends = { id = "harwness.agent.middle-base@1" }
                 (DefinitionLayer::BuiltIn, target),
             ],
             now(),
-        )
-        .unwrap();
+        )?;
 
         assert!(resolved.config.contains_key("root_only"));
         assert!(resolved.config.contains_key("middle_only"));
@@ -765,10 +781,11 @@ extends = { id = "harwness.agent.middle-base@1" }
             base_sources,
             vec!["harwness.agent.root-base@1", "harwness.agent.middle-base@1"]
         );
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_recursively_applies_extends_from_higher_target_layer() {
+    fn test_resolve_recursively_applies_extends_from_higher_target_layer() -> TestResult {
         let root = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -780,8 +797,7 @@ specialization = "root"
 [root_only]
 enabled = true
 "#,
-        )
-        .unwrap();
+        )?;
         let base = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -794,8 +810,7 @@ extends = { id = "harwness.agent.overlay-root@1" }
 [base_only]
 enabled = true
 "#,
-        )
-        .unwrap();
+        )?;
         let lower_target = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -807,8 +822,7 @@ specialization = "lower"
 [lower_only]
 enabled = true
 "#,
-        )
-        .unwrap();
+        )?;
         let higher_target = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -821,9 +835,8 @@ extends = { id = "harwness.agent.overlay-base@1" }
 [higher_only]
 enabled = true
 "#,
-        )
-        .unwrap();
-        let id = DefinitionId::parse("harwness.agent.overlay-target@1").unwrap();
+        )?;
+        let id = DefinitionId::parse("harwness.agent.overlay-target@1")?;
 
         let resolved = resolve_definition(
             &id,
@@ -834,16 +847,16 @@ enabled = true
                 (DefinitionLayer::Project, higher_target),
             ],
             now(),
-        )
-        .unwrap();
+        )?;
 
         for table in ["root_only", "base_only", "lower_only", "higher_only"] {
             assert!(resolved.config.contains_key(table), "missing {table}");
         }
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_rejects_cycle_declared_by_higher_target_layer() {
+    fn test_resolve_rejects_cycle_declared_by_higher_target_layer() -> TestResult {
         let lower_target = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -852,8 +865,7 @@ version = "1.0.0"
 role = "worker"
 specialization = "lower"
 "#,
-        )
-        .unwrap();
+        )?;
         let higher_target = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -863,25 +875,27 @@ role = "worker"
 specialization = "higher"
 extends = { id = "harwness.agent.overlay-cycle@1" }
 "#,
-        )
-        .unwrap();
-        let id = DefinitionId::parse("harwness.agent.overlay-cycle@1").unwrap();
+        )?;
+        let id = DefinitionId::parse("harwness.agent.overlay-cycle@1")?;
 
-        let error = resolve_definition(
+        let result = resolve_definition(
             &id,
             &[
                 (DefinitionLayer::BuiltIn, lower_target),
                 (DefinitionLayer::Project, higher_target),
             ],
             now(),
-        )
-        .unwrap_err();
+        );
+        let Err(error) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
 
         assert!(matches!(error, DslError::InheritanceCycle { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_honors_explicit_reference_version() {
+    fn test_resolve_honors_explicit_reference_version() -> TestResult {
         let base_v1 = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -893,8 +907,7 @@ specialization = "v1"
 [selected]
 version = "1.0.0"
 "#,
-        )
-        .unwrap();
+        )?;
         let base_v2 = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -906,8 +919,7 @@ specialization = "v2"
 [selected]
 version = "1.2.0"
 "#,
-        )
-        .unwrap();
+        )?;
         let target = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -917,9 +929,8 @@ role = "worker"
 specialization = "target"
 extends = { id = "harwness.agent.versioned-base@1", version = "1.0.0" }
 "#,
-        )
-        .unwrap();
-        let id = DefinitionId::parse("harwness.agent.versioned-target@1").unwrap();
+        )?;
+        let id = DefinitionId::parse("harwness.agent.versioned-target@1")?;
         let resolved = resolve_definition(
             &id,
             &[
@@ -928,17 +939,17 @@ extends = { id = "harwness.agent.versioned-base@1", version = "1.0.0" }
                 (DefinitionLayer::BuiltIn, target),
             ],
             now(),
-        )
-        .unwrap();
+        )?;
 
         assert_eq!(
             resolved.config["selected"]["version"].as_str(),
             Some("1.0.0")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_uses_newest_unpinned_reference_version_in_winning_layer() {
+    fn test_resolve_uses_newest_unpinned_reference_version_in_winning_layer() -> TestResult {
         let newest_base = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -950,8 +961,7 @@ specialization = "newest"
 [selected]
 version = "1.2.0"
 "#,
-        )
-        .unwrap();
+        )?;
         let older_base = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -963,8 +973,7 @@ specialization = "older"
 [selected]
 version = "1.0.0"
 "#,
-        )
-        .unwrap();
+        )?;
         let target = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -974,9 +983,8 @@ role = "worker"
 specialization = "target"
 extends = { id = "harwness.agent.unpinned-base@1" }
 "#,
-        )
-        .unwrap();
-        let id = DefinitionId::parse("harwness.agent.unpinned-target@1").unwrap();
+        )?;
+        let id = DefinitionId::parse("harwness.agent.unpinned-target@1")?;
 
         let resolved = resolve_definition(
             &id,
@@ -986,17 +994,17 @@ extends = { id = "harwness.agent.unpinned-base@1" }
                 (DefinitionLayer::BuiltIn, target),
             ],
             now(),
-        )
-        .unwrap();
+        )?;
 
         assert_eq!(
             resolved.config["selected"]["version"].as_str(),
             Some("1.2.0")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_rejects_direct_inheritance_cycle() {
+    fn test_resolve_rejects_direct_inheritance_cycle() -> TestResult {
         let definition = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -1006,22 +1014,24 @@ role = "worker"
 specialization = "cycle"
 extends = { id = "harwness.agent.self-cycle@1" }
 "#,
-        )
-        .unwrap();
-        let id = DefinitionId::parse("harwness.agent.self-cycle@1").unwrap();
+        )?;
+        let id = DefinitionId::parse("harwness.agent.self-cycle@1")?;
 
-        let error =
-            resolve_definition(&id, &[(DefinitionLayer::BuiltIn, definition)], now()).unwrap_err();
+        let result = resolve_definition(&id, &[(DefinitionLayer::BuiltIn, definition)], now());
+        let Err(error) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
 
         let DslError::InheritanceCycle { cycle, location } = error else {
-            panic!("expected InheritanceCycle");
+            return Err(TestError::Unexpected("expected InheritanceCycle".into()));
         };
         assert_eq!(cycle, vec![id.clone(), id]);
         assert_eq!(location.field_path.as_deref(), Some("extends"));
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_rejects_indirect_inheritance_cycle_with_closed_path() {
+    fn test_resolve_rejects_indirect_inheritance_cycle_with_closed_path() -> TestResult {
         let first = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -1031,8 +1041,7 @@ role = "worker"
 specialization = "a"
 extends = { id = "harwness.agent.cycle-b@1" }
 "#,
-        )
-        .unwrap();
+        )?;
         let second = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -1042,8 +1051,7 @@ role = "worker"
 specialization = "b"
 extends = { id = "harwness.agent.cycle-c@1" }
 "#,
-        )
-        .unwrap();
+        )?;
         let third = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -1053,11 +1061,10 @@ role = "worker"
 specialization = "c"
 extends = { id = "harwness.agent.cycle-b@1" }
 "#,
-        )
-        .unwrap();
-        let id = DefinitionId::parse("harwness.agent.cycle-a@1").unwrap();
+        )?;
+        let id = DefinitionId::parse("harwness.agent.cycle-a@1")?;
 
-        let error = resolve_definition(
+        let result = resolve_definition(
             &id,
             &[
                 (DefinitionLayer::BuiltIn, first),
@@ -1065,25 +1072,28 @@ extends = { id = "harwness.agent.cycle-b@1" }
                 (DefinitionLayer::BuiltIn, third),
             ],
             now(),
-        )
-        .unwrap_err();
+        );
+        let Err(error) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
 
         let DslError::InheritanceCycle { cycle, location } = error else {
-            panic!("expected InheritanceCycle");
+            return Err(TestError::Unexpected("expected InheritanceCycle".into()));
         };
         assert_eq!(
             cycle,
             vec![
-                DefinitionId::parse("harwness.agent.cycle-b@1").unwrap(),
-                DefinitionId::parse("harwness.agent.cycle-c@1").unwrap(),
-                DefinitionId::parse("harwness.agent.cycle-b@1").unwrap(),
+                DefinitionId::parse("harwness.agent.cycle-b@1")?,
+                DefinitionId::parse("harwness.agent.cycle-c@1")?,
+                DefinitionId::parse("harwness.agent.cycle-b@1")?,
             ]
         );
         assert_eq!(location.field_path.as_deref(), Some("extends"));
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_includes_target_direct_authority() {
+    fn test_resolve_includes_target_direct_authority() -> TestResult {
         let definition = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -1095,21 +1105,20 @@ specialization = "authority"
 [authority]
 capabilities = ["filesystem.read", "process.spawn.sandboxed"]
 "#,
-        )
-        .unwrap();
-        let id = DefinitionId::parse("harwness.agent.authority-target@1").unwrap();
+        )?;
+        let id = DefinitionId::parse("harwness.agent.authority-target@1")?;
 
-        let resolved =
-            resolve_definition(&id, &[(DefinitionLayer::BuiltIn, definition)], now()).unwrap();
+        let resolved = resolve_definition(&id, &[(DefinitionLayer::BuiltIn, definition)], now())?;
 
         assert_eq!(
             resolved.authority.capabilities,
             vec!["filesystem.read", "process.spawn.sandboxed"]
         );
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_rejects_direct_authority_elevation_over_base() {
+    fn test_resolve_rejects_direct_authority_elevation_over_base() -> TestResult {
         let base = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -1121,8 +1130,7 @@ specialization = "base"
 [authority]
 capabilities = ["filesystem.read"]
 "#,
-        )
-        .unwrap();
+        )?;
         let target = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -1135,19 +1143,20 @@ extends = { id = "harwness.agent.authority-base@1" }
 [authority]
 capabilities = ["filesystem.read", "filesystem.write"]
 "#,
-        )
-        .unwrap();
-        let id = DefinitionId::parse("harwness.agent.authority-child@1").unwrap();
+        )?;
+        let id = DefinitionId::parse("harwness.agent.authority-child@1")?;
 
-        let error = resolve_definition(
+        let result = resolve_definition(
             &id,
             &[
                 (DefinitionLayer::BuiltIn, base),
                 (DefinitionLayer::BuiltIn, target),
             ],
             now(),
-        )
-        .unwrap_err();
+        );
+        let Err(error) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
 
         let DslError::AuthorityElevation {
             of,
@@ -1155,7 +1164,7 @@ capabilities = ["filesystem.read", "filesystem.write"]
             location,
         } = error
         else {
-            panic!("expected AuthorityElevation");
+            return Err(TestError::Unexpected("expected AuthorityElevation".into()));
         };
         assert_eq!(*of, id);
         assert_eq!(added_capabilities, vec!["filesystem.write"]);
@@ -1163,10 +1172,11 @@ capabilities = ["filesystem.read", "filesystem.write"]
             location.field_path.as_deref(),
             Some("authority.capabilities")
         );
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_validates_role_of_mixin_declared_by_base() {
+    fn test_resolve_validates_role_of_mixin_declared_by_base() -> TestResult {
         let mixin = parse_toml(
             r#"
 schema = "harwness.mixin/v1"
@@ -1175,8 +1185,7 @@ version = "1.0.0"
 role = "root-orchestrator"
 specialization = "mixin"
 "#,
-        )
-        .unwrap();
+        )?;
         let base = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -1186,8 +1195,7 @@ role = "worker"
 specialization = "base"
 mixins = [{ id = "harwness.mixin.incompatible-base-mixin@1" }]
 "#,
-        )
-        .unwrap();
+        )?;
         let target = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -1197,11 +1205,10 @@ role = "worker"
 specialization = "target"
 extends = { id = "harwness.agent.mixin-role-base@1" }
 "#,
-        )
-        .unwrap();
-        let id = DefinitionId::parse("harwness.agent.mixin-role-target@1").unwrap();
+        )?;
+        let id = DefinitionId::parse("harwness.agent.mixin-role-target@1")?;
 
-        let error = resolve_definition(
+        let result = resolve_definition(
             &id,
             &[
                 (DefinitionLayer::BuiltIn, mixin),
@@ -1209,14 +1216,17 @@ extends = { id = "harwness.agent.mixin-role-base@1" }
                 (DefinitionLayer::BuiltIn, target),
             ],
             now(),
-        )
-        .unwrap_err();
+        );
+        let Err(error) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
 
         assert!(matches!(error, DslError::IllegalRoleForMixin { .. }));
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_composes_lower_layer_tables_with_highest_scalar_overrides() {
+    fn test_resolve_composes_lower_layer_tables_with_highest_scalar_overrides() -> TestResult {
         let lower = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -1231,8 +1241,7 @@ mode = "lower"
 lower_only = true
 labels = ["builtin"]
 "#,
-        )
-        .unwrap();
+        )?;
         let higher = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -1247,9 +1256,8 @@ mode = "higher"
 higher_only = true
 labels = ["project"]
 "#,
-        )
-        .unwrap();
-        let id = DefinitionId::parse("harwness.agent.layered@1").unwrap();
+        )?;
+        let id = DefinitionId::parse("harwness.agent.layered@1")?;
 
         let resolved = resolve_definition(
             &id,
@@ -1258,8 +1266,7 @@ labels = ["project"]
                 (DefinitionLayer::BuiltIn, lower),
             ],
             now(),
-        )
-        .unwrap();
+        )?;
 
         assert_eq!(resolved.version.0, semver::Version::new(1, 2, 0));
         assert_eq!(resolved.specialization, "higher");
@@ -1275,10 +1282,11 @@ labels = ["project"]
                 toml::Value::String("project".to_owned()),
             ])
         );
+        Ok(())
     }
 
     #[test]
-    fn test_resolve_rejects_authority_elevation_in_higher_layer() {
+    fn test_resolve_rejects_authority_elevation_in_higher_layer() -> TestResult {
         let lower = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -1290,8 +1298,7 @@ specialization = "lower"
 [authority]
 capabilities = ["filesystem.read"]
 "#,
-        )
-        .unwrap();
+        )?;
         let higher = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -1303,19 +1310,20 @@ specialization = "higher"
 [authority]
 capabilities = ["filesystem.read", "filesystem.write"]
 "#,
-        )
-        .unwrap();
-        let id = DefinitionId::parse("harwness.agent.layered-authority@1").unwrap();
+        )?;
+        let id = DefinitionId::parse("harwness.agent.layered-authority@1")?;
 
-        let error = resolve_definition(
+        let result = resolve_definition(
             &id,
             &[
                 (DefinitionLayer::BuiltIn, lower),
                 (DefinitionLayer::Project, higher),
             ],
             now(),
-        )
-        .unwrap_err();
+        );
+        let Err(error) = result else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
 
         let DslError::AuthorityElevation {
             added_capabilities,
@@ -1323,13 +1331,14 @@ capabilities = ["filesystem.read", "filesystem.write"]
             ..
         } = error
         else {
-            panic!("expected AuthorityElevation");
+            return Err(TestError::Unexpected("expected AuthorityElevation".into()));
         };
         assert_eq!(added_capabilities, vec!["filesystem.write"]);
         assert_eq!(
             location.field_path.as_deref(),
             Some("authority.capabilities")
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1339,16 +1348,17 @@ capabilities = ["filesystem.read", "filesystem.write"]
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_reasoning_effort_absent_everywhere_resolves_to_none() {
-        let raw = parse_toml(MINIMAL_WORKER).unwrap();
-        let id = DefinitionId::parse("harwness.agent.worker@1").unwrap();
+    fn test_reasoning_effort_absent_everywhere_resolves_to_none() -> TestResult {
+        let raw = parse_toml(MINIMAL_WORKER)?;
+        let id = DefinitionId::parse("harwness.agent.worker@1")?;
         let layers = vec![(DefinitionLayer::BuiltIn, raw)];
-        let resolved = resolve_definition(&id, &layers, now()).unwrap();
+        let resolved = resolve_definition(&id, &layers, now())?;
         assert!(resolved.reasoning_effort.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_reasoning_effort_set_only_on_target_is_used() {
+    fn test_reasoning_effort_set_only_on_target_is_used() -> TestResult {
         let src = r#"
 schema = "harwness.agent/v1"
 id = "harwness.agent.effort-target@1"
@@ -1357,15 +1367,16 @@ role = "worker"
 specialization = "effort-target"
 reasoning_effort = "high"
 "#;
-        let raw = parse_toml(src).unwrap();
-        let id = DefinitionId::parse("harwness.agent.effort-target@1").unwrap();
+        let raw = parse_toml(src)?;
+        let id = DefinitionId::parse("harwness.agent.effort-target@1")?;
         let layers = vec![(DefinitionLayer::BuiltIn, raw)];
-        let resolved = resolve_definition(&id, &layers, now()).unwrap();
+        let resolved = resolve_definition(&id, &layers, now())?;
         assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
+        Ok(())
     }
 
     #[test]
-    fn test_reasoning_effort_inherited_from_extends_base_when_target_silent() {
+    fn test_reasoning_effort_inherited_from_extends_base_when_target_silent() -> TestResult {
         // Basis setzt reasoning_effort; das Ziel selbst schweigt dazu -> die
         // Basisaussage wird übernommen (spezifischste vorhandene Aussage gewinnt,
         // eine schweigende Ebene löscht nichts).
@@ -1378,8 +1389,7 @@ role = "worker"
 specialization = "base"
 reasoning_effort = "low"
 "#,
-        )
-        .unwrap();
+        )?;
         let target = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -1389,19 +1399,19 @@ role = "worker"
 specialization = "child"
 extends = { id = "harwness.agent.effort-base@1" }
 "#,
-        )
-        .unwrap();
-        let id = DefinitionId::parse("harwness.agent.effort-child@1").unwrap();
+        )?;
+        let id = DefinitionId::parse("harwness.agent.effort-child@1")?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::BuiltIn, target),
         ];
-        let resolved = resolve_definition(&id, &layers, now()).unwrap();
+        let resolved = resolve_definition(&id, &layers, now())?;
         assert_eq!(resolved.reasoning_effort.as_deref(), Some("low"));
+        Ok(())
     }
 
     #[test]
-    fn test_reasoning_effort_target_overrides_extends_base() {
+    fn test_reasoning_effort_target_overrides_extends_base() -> TestResult {
         // Spezifischere Definition (Ziel) überschreibt die Aussage der Basis —
         // identisch zur Vererbungsregel von BudgetSpec::effort_cap.
         let base = parse_toml(
@@ -1413,8 +1423,7 @@ role = "worker"
 specialization = "base"
 reasoning_effort = "low"
 "#,
-        )
-        .unwrap();
+        )?;
         let target = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -1425,19 +1434,19 @@ specialization = "child"
 extends = { id = "harwness.agent.effort-base2@1" }
 reasoning_effort = "high"
 "#,
-        )
-        .unwrap();
-        let id = DefinitionId::parse("harwness.agent.effort-child2@1").unwrap();
+        )?;
+        let id = DefinitionId::parse("harwness.agent.effort-child2@1")?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, base),
             (DefinitionLayer::BuiltIn, target),
         ];
-        let resolved = resolve_definition(&id, &layers, now()).unwrap();
+        let resolved = resolve_definition(&id, &layers, now())?;
         assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
+        Ok(())
     }
 
     #[test]
-    fn test_reasoning_effort_inherited_from_mixin_when_target_silent() {
+    fn test_reasoning_effort_inherited_from_mixin_when_target_silent() -> TestResult {
         let mixin = parse_toml(
             r#"
 schema = "harwness.mixin/v1"
@@ -1447,8 +1456,7 @@ role = "worker"
 specialization = "mixin"
 reasoning_effort = "medium"
 "#,
-        )
-        .unwrap();
+        )?;
         let target = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -1458,19 +1466,19 @@ role = "worker"
 specialization = "target"
 mixins = [{ id = "harwness.mixin.effort-mixin@1" }]
 "#,
-        )
-        .unwrap();
-        let id = DefinitionId::parse("harwness.agent.effort-mixin-user@1").unwrap();
+        )?;
+        let id = DefinitionId::parse("harwness.agent.effort-mixin-user@1")?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, mixin),
             (DefinitionLayer::BuiltIn, target),
         ];
-        let resolved = resolve_definition(&id, &layers, now()).unwrap();
+        let resolved = resolve_definition(&id, &layers, now())?;
         assert_eq!(resolved.reasoning_effort.as_deref(), Some("medium"));
+        Ok(())
     }
 
     #[test]
-    fn test_reasoning_effort_target_overrides_mixin() {
+    fn test_reasoning_effort_target_overrides_mixin() -> TestResult {
         let mixin = parse_toml(
             r#"
 schema = "harwness.mixin/v1"
@@ -1480,8 +1488,7 @@ role = "worker"
 specialization = "mixin"
 reasoning_effort = "medium"
 "#,
-        )
-        .unwrap();
+        )?;
         let target = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -1492,19 +1499,19 @@ specialization = "target"
 mixins = [{ id = "harwness.mixin.effort-mixin2@1" }]
 reasoning_effort = "high"
 "#,
-        )
-        .unwrap();
-        let id = DefinitionId::parse("harwness.agent.effort-mixin-user2@1").unwrap();
+        )?;
+        let id = DefinitionId::parse("harwness.agent.effort-mixin-user2@1")?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, mixin),
             (DefinitionLayer::BuiltIn, target),
         ];
-        let resolved = resolve_definition(&id, &layers, now()).unwrap();
+        let resolved = resolve_definition(&id, &layers, now())?;
         assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
+        Ok(())
     }
 
     #[test]
-    fn test_reasoning_effort_higher_layer_overrides_lower_layer() {
+    fn test_reasoning_effort_higher_layer_overrides_lower_layer() -> TestResult {
         let builtin = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -1514,8 +1521,7 @@ role = "worker"
 specialization = "builtin"
 reasoning_effort = "low"
 "#,
-        )
-        .unwrap();
+        )?;
         let project = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -1525,19 +1531,19 @@ role = "worker"
 specialization = "project"
 reasoning_effort = "high"
 "#,
-        )
-        .unwrap();
-        let id = DefinitionId::parse("harwness.agent.effort-layered@1").unwrap();
+        )?;
+        let id = DefinitionId::parse("harwness.agent.effort-layered@1")?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, builtin),
             (DefinitionLayer::Project, project),
         ];
-        let resolved = resolve_definition(&id, &layers, now()).unwrap();
+        let resolved = resolve_definition(&id, &layers, now())?;
         assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
+        Ok(())
     }
 
     #[test]
-    fn test_reasoning_effort_higher_layer_silent_keeps_lower_layer_value() {
+    fn test_reasoning_effort_higher_layer_silent_keeps_lower_layer_value() -> TestResult {
         let builtin = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -1547,8 +1553,7 @@ role = "worker"
 specialization = "builtin"
 reasoning_effort = "low"
 "#,
-        )
-        .unwrap();
+        )?;
         let project = parse_toml(
             r#"
 schema = "harwness.agent/v1"
@@ -1557,14 +1562,14 @@ version = "1.1.0"
 role = "worker"
 specialization = "project"
 "#,
-        )
-        .unwrap();
-        let id = DefinitionId::parse("harwness.agent.effort-layered2@1").unwrap();
+        )?;
+        let id = DefinitionId::parse("harwness.agent.effort-layered2@1")?;
         let layers = vec![
             (DefinitionLayer::BuiltIn, builtin),
             (DefinitionLayer::Project, project),
         ];
-        let resolved = resolve_definition(&id, &layers, now()).unwrap();
+        let resolved = resolve_definition(&id, &layers, now())?;
         assert_eq!(resolved.reasoning_effort.as_deref(), Some("low"));
+        Ok(())
     }
 }

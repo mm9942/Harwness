@@ -92,19 +92,20 @@ impl AuditSink for TracingAuditSink {
 #[cfg(test)]
 mod tests {
     use super::TracingAuditSink;
+    use crate::test_support::{TestResult, ctx};
     use harw_dod_warden::{AuditEvent, AuditSink};
     use harw_dod_warden_proto::{Denial, WardenAction};
     use harw_types::CgroupId;
 
-    fn cgroup(id: &str) -> CgroupId {
-        CgroupId::try_from_str(id).expect("non-empty id")
+    fn cgroup(id: &str) -> TestResult<CgroupId> {
+        CgroupId::try_from_str(id).map_err(ctx("non-empty id"))
     }
 
     #[test]
-    fn test_record_does_not_panic_for_every_event_variant() {
+    fn test_record_does_not_panic_for_every_event_variant() -> TestResult {
         let sink = TracingAuditSink::new();
         let action = WardenAction::FreezeCgroup {
-            cgroup: cgroup("cgroup-1"),
+            cgroup: cgroup("cgroup-1")?,
         };
         sink.record(AuditEvent::Attempting {
             action: action.clone(),
@@ -120,5 +121,6 @@ mod tests {
             reason: Denial::ProofMismatch,
         });
         sink.record(AuditEvent::VerificationFailed { action });
+        Ok(())
     }
 }

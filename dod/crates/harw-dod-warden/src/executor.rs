@@ -321,135 +321,179 @@ impl ProcessTreeKiller for RecordingExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_path_segment, CgroupFreezer, CgroupReleaser, CgroupV2Executor, NetworkIsolator,
-        ProcessTreeKiller, RecordedCall, RecordingExecutor,
+        CgroupFreezer, CgroupReleaser, CgroupV2Executor, NetworkIsolator, ProcessTreeKiller,
+        RecordedCall, RecordingExecutor, validate_path_segment,
     };
     use crate::error::WardenError;
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_types::CgroupId;
 
-    fn cgroup(id: &str) -> CgroupId {
-        CgroupId::try_from_str(id).expect("non-empty id")
+    fn cgroup(id: &str) -> TestResult<CgroupId> {
+        CgroupId::try_from_str(id).map_err(ctx("non-empty id"))
     }
 
     // -- validate_path_segment -------------------------------------------------
 
     #[test]
-    fn test_validate_path_segment_accepts_plain_id() {
-        assert_eq!(validate_path_segment(&cgroup("cgroup-1")).unwrap(), "cgroup-1");
+    fn test_validate_path_segment_accepts_plain_id() -> TestResult {
+        let cg = cgroup("cgroup-1")?;
+        assert_eq!(
+            validate_path_segment(&cg).map_err(ctx("validate path segment"))?,
+            "cgroup-1"
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_validate_path_segment_rejects_slash() {
-        let err = validate_path_segment(&cgroup("a/b")).unwrap_err();
+    fn test_validate_path_segment_rejects_slash() -> TestResult {
+        let cg = cgroup("a/b")?;
+        let Err(err) = validate_path_segment(&cg) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, WardenError::InvalidCgroupId));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_path_segment_rejects_parent_traversal() {
-        let err = validate_path_segment(&cgroup("../etc")).unwrap_err();
+    fn test_validate_path_segment_rejects_parent_traversal() -> TestResult {
+        let cg = cgroup("../etc")?;
+        let Err(err) = validate_path_segment(&cg) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, WardenError::InvalidCgroupId));
+        Ok(())
     }
 
     #[test]
-    fn test_validate_path_segment_rejects_embedded_nul() {
-        let err = validate_path_segment(&cgroup("a\0b")).unwrap_err();
+    fn test_validate_path_segment_rejects_embedded_nul() -> TestResult {
+        let cg = cgroup("a\0b")?;
+        let Err(err) = validate_path_segment(&cg) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, WardenError::InvalidCgroupId));
+        Ok(())
     }
 
     // -- CgroupV2Executor: keine echte Wirkung außerhalb eines Tempdirs -------
 
     #[test]
-    fn test_cgroup_v2_executor_freeze_writes_control_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir(dir.path().join("cgroup-1")).expect("create cgroup dir");
+    fn test_cgroup_v2_executor_freeze_writes_control_file() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        std::fs::create_dir(dir.path().join("cgroup-1")).map_err(ctx("create cgroup dir"))?;
         let executor = CgroupV2Executor::new(dir.path());
 
-        executor.freeze(&cgroup("cgroup-1")).expect("freeze succeeds");
+        let cg = cgroup("cgroup-1")?;
+        executor.freeze(&cg).map_err(ctx("freeze succeeds"))?;
 
         let written = std::fs::read_to_string(dir.path().join("cgroup-1").join("cgroup.freeze"))
-            .expect("control file written");
+            .map_err(ctx("control file written"))?;
         assert_eq!(written, "1");
+        Ok(())
     }
 
     #[test]
-    fn test_cgroup_v2_executor_release_writes_zero() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir(dir.path().join("cgroup-1")).expect("create cgroup dir");
+    fn test_cgroup_v2_executor_release_writes_zero() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        std::fs::create_dir(dir.path().join("cgroup-1")).map_err(ctx("create cgroup dir"))?;
         let executor = CgroupV2Executor::new(dir.path());
 
-        executor.release(&cgroup("cgroup-1")).expect("release succeeds");
+        let cg = cgroup("cgroup-1")?;
+        executor.release(&cg).map_err(ctx("release succeeds"))?;
 
         let written = std::fs::read_to_string(dir.path().join("cgroup-1").join("cgroup.freeze"))
-            .expect("control file written");
+            .map_err(ctx("control file written"))?;
         assert_eq!(written, "0");
+        Ok(())
     }
 
     #[test]
-    fn test_cgroup_v2_executor_kill_writes_control_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir(dir.path().join("cgroup-1")).expect("create cgroup dir");
+    fn test_cgroup_v2_executor_kill_writes_control_file() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        std::fs::create_dir(dir.path().join("cgroup-1")).map_err(ctx("create cgroup dir"))?;
         let executor = CgroupV2Executor::new(dir.path());
 
-        executor.kill(&cgroup("cgroup-1")).expect("kill succeeds");
+        let cg = cgroup("cgroup-1")?;
+        executor.kill(&cg).map_err(ctx("kill succeeds"))?;
 
         let written = std::fs::read_to_string(dir.path().join("cgroup-1").join("cgroup.kill"))
-            .expect("control file written");
+            .map_err(ctx("control file written"))?;
         assert_eq!(written, "1");
+        Ok(())
     }
 
     #[test]
-    fn test_cgroup_v2_executor_rejects_traversal_before_touching_filesystem() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_cgroup_v2_executor_rejects_traversal_before_touching_filesystem() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let executor = CgroupV2Executor::new(dir.path());
 
-        let err = executor.freeze(&cgroup("../escape")).unwrap_err();
+        let cg = cgroup("../escape")?;
+        let Err(err) = executor.freeze(&cg) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, WardenError::InvalidCgroupId));
+        Ok(())
     }
 
     #[test]
-    fn test_cgroup_v2_executor_reports_io_error_for_missing_directory() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_cgroup_v2_executor_reports_io_error_for_missing_directory() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
         let executor = CgroupV2Executor::new(dir.path());
 
-        let err = executor.freeze(&cgroup("does-not-exist")).unwrap_err();
+        let cg = cgroup("does-not-exist")?;
+        let Err(err) = executor.freeze(&cg) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, WardenError::Io(_)));
+        Ok(())
     }
 
     // -- RecordingExecutor: jede Aktion über ihren Trait, nie echte Wirkung ---
 
     #[test]
-    fn test_recording_executor_records_freeze_via_trait() {
+    fn test_recording_executor_records_freeze_via_trait() -> TestResult {
         let executor = RecordingExecutor::new();
-        CgroupFreezer::freeze(&executor, &cgroup("cgroup-1")).expect("records, does not act");
-        assert_eq!(executor.calls(), vec![RecordedCall::Freeze(cgroup("cgroup-1"))]);
+        let cg = cgroup("cgroup-1")?;
+        CgroupFreezer::freeze(&executor, &cg).map_err(ctx("records, does not act"))?;
+        assert_eq!(executor.calls(), vec![RecordedCall::Freeze(cg)]);
+        Ok(())
     }
 
     #[test]
-    fn test_recording_executor_records_release_via_trait() {
+    fn test_recording_executor_records_release_via_trait() -> TestResult {
         let executor = RecordingExecutor::new();
-        CgroupReleaser::release(&executor, &cgroup("cgroup-1")).expect("records, does not act");
-        assert_eq!(executor.calls(), vec![RecordedCall::Release(cgroup("cgroup-1"))]);
+        let cg = cgroup("cgroup-1")?;
+        CgroupReleaser::release(&executor, &cg).map_err(ctx("records, does not act"))?;
+        assert_eq!(executor.calls(), vec![RecordedCall::Release(cg)]);
+        Ok(())
     }
 
     #[test]
-    fn test_recording_executor_records_isolate_via_trait() {
+    fn test_recording_executor_records_isolate_via_trait() -> TestResult {
         let executor = RecordingExecutor::new();
-        NetworkIsolator::isolate(&executor, &cgroup("cgroup-1")).expect("records, does not act");
-        assert_eq!(executor.calls(), vec![RecordedCall::Isolate(cgroup("cgroup-1"))]);
+        let cg = cgroup("cgroup-1")?;
+        NetworkIsolator::isolate(&executor, &cg).map_err(ctx("records, does not act"))?;
+        assert_eq!(executor.calls(), vec![RecordedCall::Isolate(cg)]);
+        Ok(())
     }
 
     #[test]
-    fn test_recording_executor_records_kill_via_trait() {
+    fn test_recording_executor_records_kill_via_trait() -> TestResult {
         let executor = RecordingExecutor::new();
-        ProcessTreeKiller::kill(&executor, &cgroup("cgroup-1")).expect("records, does not act");
-        assert_eq!(executor.calls(), vec![RecordedCall::Kill(cgroup("cgroup-1"))]);
+        let cg = cgroup("cgroup-1")?;
+        ProcessTreeKiller::kill(&executor, &cg).map_err(ctx("records, does not act"))?;
+        assert_eq!(executor.calls(), vec![RecordedCall::Kill(cg)]);
+        Ok(())
     }
 
     #[test]
-    fn test_failing_recording_executor_still_records_before_returning_err() {
+    fn test_failing_recording_executor_still_records_before_returning_err() -> TestResult {
         let executor = RecordingExecutor::new_failing();
-        let err = CgroupFreezer::freeze(&executor, &cgroup("cgroup-1")).unwrap_err();
+        let cg = cgroup("cgroup-1")?;
+        let Err(err) = CgroupFreezer::freeze(&executor, &cg) else {
+            return Err(TestError::Unexpected("Err erwartet".into()));
+        };
         assert!(matches!(err, WardenError::Io(_)));
-        assert_eq!(executor.calls(), vec![RecordedCall::Freeze(cgroup("cgroup-1"))]);
+        assert_eq!(executor.calls(), vec![RecordedCall::Freeze(cg)]);
+        Ok(())
     }
 }
