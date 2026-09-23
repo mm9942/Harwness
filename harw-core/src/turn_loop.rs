@@ -1396,6 +1396,170 @@ fn child_question(arguments: &serde_json::Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// Argumentfelder eines Handoff-Calls, die — in dieser Reihenfolge — als
+/// Arbeitsauftrag des Kindes gelesen werden. `"question"` ist die ältere
+/// Schreibweise (siehe [`child_question`]).
+const HANDOFF_TASK_FIELDS: [&str; 4] = ["task", "instructions", "objective", "question"];
+
+/// Leitet den Arbeitsauftrag (`SpawnInput::instructions`) eines Handoff-Calls
+/// aus dessen Argumenten ab.
+///
+/// # Beschreibung
+/// Das erste nicht-leere String-Feld aus [`HANDOFF_TASK_FIELDS`] ist der
+/// Auftrag; ein zusätzliches nicht-leeres String-Feld `"context"` wird als
+/// eigener Absatz angehängt, damit das Kind den Kontext in seinem ersten
+/// Nutzer-Turn tatsächlich sieht. Fehlt ein solches Feld, wird das gesamte
+/// Argument-JSON als Text übergeben (ein nackter JSON-String als sein Inhalt).
+/// `null`, ein leeres Objekt und ein leerer String tragen keinen Auftrag und
+/// ergeben `None` — der Spawner fällt dann auf `SpawnInput::context` zurück.
+///
+/// # Arguments
+/// - `arguments` (`&serde_json::Value`): die vom Modell gelieferten Argumente.
+///
+/// # Returns
+/// `Some(auftrag)` oder `None`, wenn die Argumente nichts Verwertbares tragen.
+fn handoff_instructions(arguments: &serde_json::Value) -> Option<String> {
+    let non_empty_field = |field: &str| {
+        arguments
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    };
+    if let Some(task) = HANDOFF_TASK_FIELDS
+        .iter()
+        .find_map(|field| non_empty_field(*field))
+    {
+        return Some(match non_empty_field("context") {
+            Some(context) => format!("{task}\n\nKontext:\n{context}"),
+            None => task.to_owned(),
+        });
+    }
+    match arguments {
+        serde_json::Value::Null => None,
+        serde_json::Value::Object(map) if map.is_empty() => None,
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        }
+        other => Some(other.to_string()),
+    }
+}
+
+/// Prüft, ob ein Rollenname als Suffix eines Handoff-Werkzeugnamens taugt.
+///
+/// Provider verlangen Werkzeugnamen aus `[A-Za-z0-9_-]` mit höchstens 64
+/// Zeichen; ein Name außerhalb davon würde den ganzen Request ungültig
+/// machen und wird deshalb nicht als Werkzeug angeboten (der textuelle
+/// Delegationsblock nennt ihn weiterhin).
+fn is_valid_handoff_role(role: &str) -> bool {
+    !role.is_empty()
+        && HANDOFF_PREFIX.len() + role.len() <= 64
+        && role
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Baut die Werkzeugdefinition `transfer_to_<role>` für ein Delegationsziel.
+///
+/// # Beschreibung
+/// Schema: `{"task": string (Pflicht), "context": string (optional)}`, keine
+/// weiteren Felder. Die Ausführung übernimmt die Handoff-Erkennung in
+/// `drive_turn` ([`handoff_role`]), nicht ein `ToolExecutor`.
+///
+/// # Arguments
+/// - `role` (`&str`): exakter Rollenname des Delegationsziels.
+///
+/// # Returns
+/// Die Function-Tool-Spezifikation.
+fn handoff_tool_spec(role: &str) -> ToolSpec {
+    let string_property = |description: &str| JsonSchema {
+        schema_type: Some(JsonSchemaType::String),
+        description: Some(description.to_owned()),
+        ..JsonSchema::default()
+    };
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "task".to_owned(),
+        string_property(
+            "Konkreter, eigenständig verständlicher Arbeitsauftrag für den Unteragenten. / \
+             Concrete, self-contained task for the sub-agent.",
+        ),
+    );
+    properties.insert(
+        "context".to_owned(),
+        string_property(
+            "Optionaler Zusatzkontext (Fakten, Pfade, Randbedingungen). / \
+             Optional extra context (facts, paths, constraints).",
+        ),
+    );
+    ToolSpec::Function(FunctionToolSpec {
+        name: ToolName::new(format!("{HANDOFF_PREFIX}{role}")),
+        description: format!(
+            "Delegiert eine Aufgabe an den Unteragenten '{role}' und wartet auf sein Ergebnis. / \
+             Delegates a task to the '{role}' sub-agent and waits for its result."
+        ),
+        parameters: JsonSchema {
+            schema_type: Some(JsonSchemaType::Object),
+            properties: Some(properties),
+            required: Some(vec!["task".to_owned()]),
+            additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
+            ..JsonSchema::default()
+        },
+        strict: false,
+    })
+}
+
+/// Ergänzt die Werkzeugliste einer Modellanfrage um `transfer_to_<role>` für
+/// jedes sichtbare Delegationsziel.
+///
+/// # Beschreibung
+/// Delegationsziele liefert der Spawner
+/// ([`harw_extension_api::AgentSpawner::delegation_target_names`]); dessen
+/// Sichtbarkeitsregeln sind die Autorität, nicht das Werkzeugprofil der
+/// Session — `Minimal`/`Coding`-Profile kennen keine `transfer_to_*`-Namen
+/// und würden Handoffs sonst stets verbergen. Ausgelassen wird ein Ziel nur,
+/// wenn (a) ein registriertes Werkzeug gleichen Namens existiert (die
+/// Registry gewinnt), (b) der Name ungültig ist ([`is_valid_handoff_role`])
+/// oder (c) die Session-Aktivierung genau dieses Werkzeug ausdrücklich
+/// abgeschaltet hat (das Profil ließe es zu, `is_tool_enabled` verneint).
+/// Danach wird wieder stabil nach Namen sortiert (Prompt-Cache, siehe
+/// [`collect_tools`]).
+///
+/// # Arguments
+/// - `session` (`&AgentSession`): liefert die Aktivierung.
+/// - `tools` (`&mut Vec<ToolSpec>`): Ergebnis von [`collect_tools`].
+/// - `targets` (`&[String]`): sortierte Rollennamen der Delegationsziele.
+fn append_handoff_tools(session: &AgentSession, tools: &mut Vec<ToolSpec>, targets: &[String]) {
+    if targets.is_empty() {
+        return;
+    }
+    let activation = session.activation();
+    let profile_allowlist = activation.profile().allowlist();
+    let mut added = false;
+    for role in targets {
+        if !is_valid_handoff_role(role) {
+            tracing::warn!(role = %role, "turn_loop.handoff_tool_invalid_role");
+            continue;
+        }
+        let name = ToolName::new(format!("{HANDOFF_PREFIX}{role}"));
+        if tools.iter().any(|spec| spec.name() == name.as_str()) {
+            continue;
+        }
+        let profile_admits = profile_allowlist
+            .as_ref()
+            .is_none_or(|allowlist| allowlist.contains(&name));
+        if profile_admits && !activation.is_tool_enabled(&name) {
+            continue;
+        }
+        tools.push(handoff_tool_spec(role));
+        added = true;
+    }
+    if added {
+        tools.sort_by(|a, b| a.name().cmp(b.name()));
+    }
+}
+
 /// Sammelt alle Tool-Specs über alle `ToolProvider` und filtert nach der
 /// session-level [`SessionActivation`][crate::activation::SessionActivation].
 ///

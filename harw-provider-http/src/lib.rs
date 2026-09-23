@@ -1896,6 +1896,7 @@ fn provider_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
 }
 
 /// Renders a typed remote-response error without retaining an arbitrary body.
+#[cfg(test)]
 fn sanitized_provider_error(status: u16, request_id: Option<&str>, body: &str) -> String {
     HttpProviderError::remote_response(status, request_id.map(str::to_owned), body).to_string()
 }

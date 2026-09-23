@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::artifact::{ArtifactId, ArtifactKind, Frontmatter, KnowledgeArtifact};
+use crate::dream::DreamReport;
 use crate::error::{KnowledgeError, KnowledgeResult};
 use crate::visibility::AgentId;
 
@@ -162,6 +163,47 @@ impl KnowledgeStore {
         let rendered = render_frontmatter(&artifact.frontmatter, &artifact.body)?;
         write_atomic(path, &rendered)
     }
+
+    /// Schreibt einen [`DreamReport`] mit gültigem YAML-Frontmatter nach
+    /// `dreams/<YYYY-MM-DD>/<work-id>.md` (Datum = UTC-Tag von `created_at`).
+    ///
+    /// Nutzt denselben Frontmatter-Writer wie [`Self::write_artifact`], sodass
+    /// [`crate::index::KnowledgeIndex::rebuild`] den Bericht als
+    /// `ArtifactKind::DreamReport` mit Id [`DreamReport::artifact_id`] einliest.
+    ///
+    /// # Returns
+    /// Den Pfad der geschriebenen Datei.
+    ///
+    /// # Errors
+    /// [`KnowledgeError::Io`] (`InvalidInput`), wenn die `work_id` keine
+    /// sichere einzelne Pfadkomponente ist (leer, `.`/`..`, Pfadtrenner,
+    /// Steuerzeichen); sonst [`KnowledgeError::Frontmatter`]/[`KnowledgeError::Io`]
+    /// beim Rendern bzw. Schreiben.
+    pub fn write_dream_report(&self, report: &DreamReport) -> KnowledgeResult<PathBuf> {
+        let job_id = report.work_id.as_str();
+        ensure_path_component(job_id)?;
+        let path = self.dream_path(&report.report_date(), job_id);
+        self.write_artifact(&path, &report.to_artifact())?;
+        Ok(path)
+    }
+}
+
+/// Lehnt Werte ab, die als einzelne Pfadkomponente unter dem Store-Root
+/// entkommen oder unlesbare Dateinamen erzeugen könnten.
+fn ensure_path_component(component: &str) -> KnowledgeResult<()> {
+    let unsafe_component = component.is_empty()
+        || component == "."
+        || component == ".."
+        || component
+            .chars()
+            .any(|c| c == '/' || c == '\\' || c == ':' || c.is_control());
+    if unsafe_component {
+        return Err(KnowledgeError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsafe knowledge path component: {component:?}"),
+        )));
+    }
+    Ok(())
 }
 
 /// Atomically write `contents` to `path` via a sibling temp file + rename.

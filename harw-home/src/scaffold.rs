@@ -61,7 +61,8 @@ fn ensure_home_with_profile(home: &Path, profile: &str) -> HomeResult<Scaffolded
     create_dir(home)?;
     harden_dir(home)?;
     create_dir(&paths::cache_dir(home))?;
-    create_dir(&paths::jobs_dir(home))?;
+    // Kein `<home>/jobs`: der `JobStore` lebt profilbezogen unter
+    // `profiles/<name>/jobs` und legt sein Verzeichnis selbst an.
 
     // Profil-Verzeichnisse.
     create_dir(&profile_dir)?;
@@ -69,6 +70,7 @@ fn ensure_home_with_profile(home: &Path, profile: &str) -> HomeResult<Scaffolded
     for sub in ["providers", "models", "channels", "sessions", "memories"] {
         create_dir(&profile_dir.join(sub))?;
     }
+    create_dir(&paths::knowledge_dir(&profile_dir))?;
 
     // Root-Dateien (nur schreiben, wenn absent).
     write_if_absent(
@@ -286,6 +288,28 @@ mod tests {
                 .map_err(ctx("active profile"))?,
             "foo\n"
         );
+
+        std::fs::remove_dir_all(&home).map_err(ctx("remove temporary scaffold"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn first_scaffold_creates_profile_knowledge_dir_but_no_root_jobs_dir() -> TestResult {
+        let home =
+            std::env::temp_dir().join(format!("harw-home-scaffold-{}", uuid::Uuid::now_v7()));
+
+        let report = ensure_home_with_profile(&home, "analysis").map_err(ctx("scaffold home"))?;
+
+        let knowledge = paths::knowledge_dir(&report.profile_dir);
+        assert_eq!(knowledge, home.join("profiles/analysis/knowledge"));
+        assert!(knowledge.is_dir());
+        assert!(report.profile_dir.join("memories").is_dir());
+        assert!(report.profile_dir.join("sessions").is_dir());
+        assert!(!home.join("jobs").exists());
+
+        let rerun = ensure_home_with_profile(&home, "analysis").map_err(ctx("re-scaffold home"))?;
+        assert!(rerun.written_files.is_empty());
+        assert!(knowledge.is_dir());
 
         std::fs::remove_dir_all(&home).map_err(ctx("remove temporary scaffold"))?;
         Ok(())
