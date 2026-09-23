@@ -316,7 +316,7 @@ fn build_knowledge_source(
 fn load_knowledge_index(home: &Path) -> Result<KnowledgeIndex, String> {
     let profile_name = harw_home::active_profile_name(home);
     let profile = harw_home::profile_dir(home, &profile_name).map_err(|error| error.to_string())?;
-    let knowledge_root = profile.join("knowledge");
+    let knowledge_root = harw_home::knowledge_dir(&profile);
     let store = KnowledgeStore::new(&knowledge_root);
     KnowledgeIndex::rebuild(&store).map_err(|error| format!("Memory Palace einlesen: {error}"))
 }

@@ -86,7 +86,7 @@
 use crate::ModelProvider;
 use crate::activation::SessionActivation;
 use crate::cancel::{CancelReason, CancelToken};
-use crate::session::{AgentSession, SpawnContext};
+use crate::session::{AgentSession, LiveEmitter, SpawnContext};
 use crate::session_manager::SessionManager;
 use crate::state_store::StateStore;
 use crate::turn_loop::{TurnInput, TurnOutcome, run_turn, run_turn_durable};
@@ -99,9 +99,9 @@ use harw_extension_api::{
 };
 use harw_observe::TraceContext;
 use harw_protocol::items::{ContentPart, TurnItem};
-use harw_protocol::{AgentOrchestrationEvent, AgentOrchestrationStatus};
+use harw_protocol::{AgentOrchestrationEvent, AgentOrchestrationStatus, TurnEvent};
 use harw_session_store::{ApprovalStore, ChildLeaseRecord, ChildLeaseStore};
-use harw_types::{AgentRole, ReasoningEffort, SessionId, TokenUsage, ToolCallId};
+use harw_types::{AgentRole, ReasoningEffort, SessionId, TokenUsage, ToolCallId, TurnId};
 use jiff::{SignedDuration, Timestamp};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;

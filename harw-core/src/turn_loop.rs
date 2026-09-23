@@ -59,24 +59,26 @@
 //!   Turn mit [`TurnOutcome::Truncated`]. `StopReason::{Refusal,
 //!   ContentFilter}` endet mit [`TurnOutcome::Refused`]. Tool-Calls einer
 //!   solchen Antwort werden nie ausgeführt (Argumente können abgeschnitten
-//!   sein). Nur für die UIA-Root-Session (kein Parent, Organisationsrolle
-//!   `UserInterface` — Kriterium wie `is_uia_root_session` in
-//!   `harw-tui/src/session_controller.rs`): trägt `response.reasoning`
-//!   mindestens einen Anthropic-`"thinking"`-Block mit lesbarem Text, wird
-//!   dieser Text als `TurnItem::Reasoning` (VOR der AssistantMessage) in die
-//!   History gepusht und per `TurnEvent::ItemAdded` gemeldet.
-//!   `"redacted_thinking"`- und verschlüsseltes OpenAI-Reasoning liefern
-//!   keinen extrahierbaren Text und bleiben unsichtbar; alle anderen
-//!   Sessions sehen nie ein `TurnItem::Reasoning`. `to_model_messages`
-//!   (`history.rs`) überspringt `Reasoning`-Items beim nächsten
-//!   Provider-Request ohnehin — das Item stört dort also nicht.
+//!   sein). Für jede Session (Root wie Kind): trägt `response.reasoning`
+//!   lesbaren Denktext (Anthropic-`"thinking"`, OpenAI-Reasoning-Summary,
+//!   `reasoning_content`), wird dieser Text als `TurnItem::Reasoning` (VOR der
+//!   AssistantMessage) in die History gepusht, persistiert und per
+//!   `TurnEvent::ItemAdded` gemeldet. `"redacted_thinking"`- und
+//!   verschlüsseltes OpenAI-Reasoning liefern keinen extrahierbaren Text und
+//!   bleiben unsichtbar. Modell-Input wird das Item nie:
+//!   `ConversationHistory::to_model_messages` (`history.rs`) überspringt
+//!   `Reasoning`-Items bedingungslos.
 //! - **Resume-Fehler.** Eine abgelehnte Wiederaufnahme (falscher Actor, falsches
 //!   Kind, keine offene Anfrage, bereits aufgelöst) bleibt `Err` und lässt die
 //!   Pause intakt. Scheitert eine *angenommene* Wiederaufnahme (Persistenz,
 //!   Spawner, Ausführungsgrenze) oder ist die dauerhafte Freigabe abgelaufen
 //!   bzw. defekt, endet der Turn mit [`TurnOutcome::Failed`] (Session `Failed`).
-//! - **Handoffs** (`transfer_to_*`) laufen nur, wenn die Aktivierung der Session
-//!   den Werkzeugnamen freigibt.
+//! - **Handoffs** (`transfer_to_*`): Für jedes vom Spawner gemeldete
+//!   Delegationsziel bietet `drive_turn` eine echte Werkzeugdefinition
+//!   `transfer_to_<role>` (`{"task", "context"?}`) an, sofern die Aktivierung
+//!   sie nicht ausdrücklich abschaltet. Beim Aufruf wird
+//!   `SpawnInput::instructions` aus `task`/`instructions`/`objective`/
+//!   `question` (plus optionalem `context`) bzw. dem Argument-JSON gefüllt.
 //!
 //! # AW1-03: warum Schritt 1 noch der alte Pfad ist
 //!
@@ -462,7 +464,8 @@ use harw_protocol::items::{
 };
 use harw_session_store::{ApprovalRecord, ApprovalStore};
 use harw_tools::{
-    ToolCall, ToolExecutionContext, ToolName, ToolOutput, ToolSpec, ToolsError, TracedToolExecutor,
+    AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType, ToolCall,
+    ToolExecutionContext, ToolName, ToolOutput, ToolSpec, ToolsError, TracedToolExecutor,
 };
 use harw_types::{
     ApprovalActor, Clock, ReviewDecision, SessionId, SystemClock, TokenUsage, ToolCallId,
@@ -996,33 +999,6 @@ fn continuation_fragment(body: &str) -> Option<harw_context::Fragment> {
     })
 }
 
-/// Entscheidet, ob die laufende Session die UIA-Root-Session ist — das
-/// einzige organisatorische Kriterium, unter dem Reasoning-Text sichtbar
-/// gemacht wird (Welle 3 — 3e).
-///
-/// # Beschreibung
-/// Identisches Kriterium zu `is_uia_root_session` in
-/// `harw-tui/src/session_controller.rs:473-480`: kein Parent UND
-/// Organisationsrolle `UserInterface`. Diese Datei kann jene Funktion nicht
-/// wiederverwenden (anderer Crate, keine gemeinsame Abhängigkeit), daher
-/// dieselbe Prüfung hier dupliziert statt einer neuen crate-übergreifenden
-/// Kopplung. Kind-/Worker-Sessions (jede mit Parent) und Root-Sessions
-/// anderer Rollen (z. B. `RootOrchestrator`) liefern `false`.
-///
-/// # Arguments
-/// - `session` (`&AgentSession`): die laufende Session.
-///
-/// # Returns
-/// `true` genau dann, wenn `session.parent_session_id()` `None` ist und
-/// `session.spawn_context().organizational_role == AgentRoleId::UserInterface`.
-fn is_uia_root_session(session: &AgentSession) -> bool {
-    session.parent_session_id().is_none()
-        && session
-            .spawn_context()
-            .map(|context| context.organizational_role)
-            == Some(harw_agent_dsl::roles::AgentRoleId::UserInterface)
-}
-
 // Baut die per-Request-Identität für optionale Gateway-Header (`x-harw-*`),
 // die `drive_turn` unten an `ModelRequest::with_identity` übergibt.
 //
@@ -1034,7 +1010,8 @@ fn is_uia_root_session(session: &AgentSession) -> bool {
 // mehrstufige Kette bis zur Wurzel. Ohne Parent ist die Session selbst die
 // Wurzel. `role` liest `SpawnContext::organizational_role`; fehlt der
 // `SpawnContext` ganz (kein tatsächlich modellierter Root — jeder modellierte
-// Root, siehe `is_uia_root_session` oben, trägt einen `SpawnContext`, z. B.
+// Root — kein Parent, Organisationsrolle `UserInterface`, Kriterium wie
+// `is_uia_root_session` in `harw-tui` — trägt einen `SpawnContext`, z. B.
 // eine bare Test-Session), fällt `role` auf `"main"` zurück.
 fn request_identity(session: &AgentSession) -> RequestIdentity {
     let agent = session.id().as_str().to_owned();
@@ -2579,7 +2556,7 @@ async fn resume_after_approval_with_store(
                     let input = SpawnInput {
                         parent_session_id: session.id().clone(),
                         handoff_call_id: pending.call.id.clone(),
-                        instructions: None,
+                        instructions: handoff_instructions(&pending.call.arguments),
                         context: pending.call.arguments,
                         // Hereditär, nie neu erfunden: dieser Handoff deklariert
                         // selbst keine eigene Kontextdecke (`call.arguments`
@@ -2868,13 +2845,17 @@ async fn drive_turn(
             }
         }
         let instructions = load_instructions(session).await;
-        let tools = collect_tools(session)?;
+        let mut tools = collect_tools(session)?;
 
         // Nachtrag F (Delegationsprojektion): EIN deterministischer
         // Kontextblock, NACH den Tools angehängt (stabiler Teil — die Liste
         // ändert sich selten, sortiert vom Spawner geliefert). Leer ⇒ nichts.
+        // Dieselben Ziele werden zusätzlich als echte Werkzeugdefinitionen
+        // `transfer_to_<role>` angeboten — erst damit kann das Modell den
+        // Handoff tatsächlich aufrufen (siehe `append_handoff_tools`).
         if let Some(spawner) = session.registry().spawner() {
             let delegation_targets = spawner.delegation_target_names(session.id());
+            append_handoff_tools(session, &mut tools, &delegation_targets);
             if let Some(fragment) = delegation_targets_fragment(&delegation_targets) {
                 fragments.push(fragment);
             }
@@ -3033,36 +3014,35 @@ async fn drive_turn(
         // unten im Tool-Call-Loop gesetzt.
         let mut round_progressed_by_tools = false;
 
-        // Reasoning sichtbar machen (Welle 3 — 3e): nur für die UIA-Root-
-        // Session, und nur, wenn sich lesbarer `"thinking"`-Text extrahieren
-        // ließ (redacted/verschlüsseltes Reasoning bleibt unsichtbar). VOR
-        // der AssistantMessage eingefügt — Denken kommt vor der Antwort.
-        // `to_model_messages` (history.rs) überspringt `TurnItem::Reasoning`
-        // beim nächsten Provider-Request explizit, das Item stört dort also
-        // nicht.
-        if is_uia_root_session(session) {
-            if let Some(text) = response.reasoning.as_ref().and_then(extract_thinking_text) {
-                let reasoning_id = harw_types::ItemId::new();
-                session
-                    .history_mut()
-                    .push(TurnItem::Reasoning(ReasoningItem {
-                        id: reasoning_id.clone(),
-                        summary_text: vec![text.clone()],
+        // Reasoning persistieren (Runde 2): für JEDE Session, sofern sich
+        // lesbarer Denktext extrahieren ließ (redacted/verschlüsseltes
+        // Reasoning bleibt unsichtbar). VOR der AssistantMessage eingefügt —
+        // Denken kommt vor der Antwort. Vom Modell-Input bleibt es
+        // unabhängig von der Session-Art ausgeschlossen:
+        // `ConversationHistory::to_model_messages` (history.rs) überspringt
+        // `TurnItem::Reasoning` bedingungslos, und alle Provider bauen ihre
+        // Nachrichten ausschließlich darüber.
+        if let Some(text) = response.reasoning.as_ref().and_then(extract_thinking_text) {
+            let reasoning_id = harw_types::ItemId::new();
+            session
+                .history_mut()
+                .push(TurnItem::Reasoning(ReasoningItem {
+                    id: reasoning_id.clone(),
+                    summary_text: vec![text.clone()],
+                    raw_content: Vec::new(),
+                }));
+            persist_last(session, store).await?;
+            emit(
+                session,
+                TurnEvent::ItemAdded {
+                    turn_id: handle.turn_id.clone(),
+                    item: TurnItem::Reasoning(ReasoningItem {
+                        id: reasoning_id,
+                        summary_text: vec![text],
                         raw_content: Vec::new(),
-                    }));
-                persist_last(session, store).await?;
-                emit(
-                    session,
-                    TurnEvent::ItemAdded {
-                        turn_id: handle.turn_id.clone(),
-                        item: TurnItem::Reasoning(ReasoningItem {
-                            id: reasoning_id,
-                            summary_text: vec![text],
-                            raw_content: Vec::new(),
-                        }),
-                    },
-                );
-            }
+                    }),
+                },
+            );
         }
 
         if let Some(text) = response.message {
@@ -3370,7 +3350,7 @@ async fn drive_turn(
                 let spawn_input = SpawnInput {
                     parent_session_id: session.id().clone(),
                     handoff_call_id: call.id.clone(),
-                    instructions: None,
+                    instructions: handoff_instructions(&call.arguments),
                     context: call.arguments.clone(),
                     // Siehe die Begründung an der Schwester-Konstruktionsstelle
                     // in `resume_after_approval_with_store`: hereditär, nie

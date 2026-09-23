@@ -757,7 +757,7 @@ pub fn run(
 
     // Knowledge-Store am Profil-Wissensordner mounten (memory/diary/dream/
     // workbench/kanban teilen sich diesen Store).
-    let knowledge_root = profile.join("knowledge");
+    let knowledge_root = harw_home::knowledge_dir(&profile);
     std::fs::create_dir_all(&knowledge_root)
         .map_err(|error| format!("knowledge-Ordner anlegen: {error}"))?;
     let knowledge = KnowledgeStore::new(&knowledge_root);
