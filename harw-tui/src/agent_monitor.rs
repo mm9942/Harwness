@@ -913,8 +913,7 @@ impl AgentMonitor {
             .wrap(Wrap { trim: false });
         let header_height = u16::try_from(header.line_count(inner.width))
             .unwrap_or(u16::MAX)
-            .min(inner.height / 2)
-            .max(1);
+            .clamp(1, (inner.height / 2).max(1));
         header.render(
             Rect {
                 height: header_height,
@@ -1768,7 +1767,7 @@ mod tests {
             (0..area.height).find_map(|y| {
                 (0..area.width).find_map(|x| {
                     let cell = &buf[(x, y)];
-                    (cell.symbol().starts_with(needle)).then(|| cell.style())
+                    cell.symbol().starts_with(needle).then(|| cell.style())
                 })
             })
         };

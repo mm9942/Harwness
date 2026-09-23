@@ -1210,12 +1210,21 @@ fn analysis_question(
         )
     };
 
-    let hints: Vec<LanguageHints> = unit.kinds.iter().copied().filter_map(language_hints).collect();
+    let hints: Vec<LanguageHints> = unit
+        .kinds
+        .iter()
+        .copied()
+        .filter_map(language_hints)
+        .collect();
     let is_documents = hints.is_empty() && unit.kinds.contains(&ProjectKind::Documents);
     let description = match unit.kinds.first() {
         Some(_) => {
             let labels: Vec<&str> = unit.kinds.iter().map(|kind| kind.label()).collect();
-            format!("Einheit `{}` (Projektart {})", unit.name, labels.join(" + "))
+            format!(
+                "Einheit `{}` (Projektart {})",
+                unit.name,
+                labels.join(" + ")
+            )
         }
         None => format!("Verzeichnis `{}`", unit.name),
     };
@@ -1256,18 +1265,19 @@ fn analysis_question(
                 "Doku-Kommentare/Docstrings".to_owned(),
             )
         } else {
-            let join = |pick: fn(&LanguageHints) -> &'static str| -> String {
-                hints
-                    .iter()
-                    .map(|hint| format!("{}: {}", hint.language, pick(hint)))
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            };
-            (
-                join(|hint| hint.api),
-                join(|hint| hint.markers),
-                join(|hint| hint.docs),
-            )
+            let api: Vec<String> = hints
+                .iter()
+                .map(|hint| format!("{}: {}", hint.language, hint.api))
+                .collect();
+            let markers: Vec<String> = hints
+                .iter()
+                .map(|hint| format!("{}: {}", hint.language, hint.markers))
+                .collect();
+            let docs: Vec<String> = hints
+                .iter()
+                .map(|hint| format!("{}: {}", hint.language, hint.docs))
+                .collect();
+            (api.join("; "), markers.join("; "), docs.join("; "))
         };
         format!(
             "1. Öffentliche Oberfläche ({api}) mit Signatur bzw. Fundstelle, gruppiert nach \
@@ -1450,34 +1460,32 @@ fn reconcile_proposals(
 /// ([`wave_batches`]).
 fn wave_json(
     level: usize,
-    crates: &[&CrateNode],
+    units: &[&AnalysisUnit],
     dependencies_enabled: bool,
-    batches: &[Vec<&CrateNode>],
+    batches: &[Vec<&AnalysisUnit>],
 ) -> Value {
-    let nodes: Vec<Value> = crates
+    let nodes: Vec<Value> = units
         .iter()
-        .map(|crate_node| {
+        .map(|unit| {
             let dependencies: Vec<String> = if dependencies_enabled {
-                crate_node.deps.iter().map(|dep| node_id(dep)).collect()
+                unit.deps.iter().map(|dep| node_id(dep)).collect()
             } else {
                 Vec::new()
             };
             json!({
-                "id": node_id(&crate_node.name),
-                "crate": crate_node.name,
-                "level": crate_node.level,
+                "id": node_id(&unit.name),
+                "crate": unit.name,
+                "unit": unit.name,
+                "kind": unit.kind_label(),
+                "path": unit.rel_display(),
+                "level": unit.level,
                 "dependencies": dependencies,
             })
         })
         .collect();
     let batches: Vec<Vec<String>> = batches
         .iter()
-        .map(|batch| {
-            batch
-                .iter()
-                .map(|crate_node| node_id(&crate_node.name))
-                .collect()
-        })
+        .map(|batch| batch.iter().map(|unit| node_id(&unit.name)).collect())
         .collect();
     json!({ "level": level, "nodes": nodes, "batches": batches })
 }
@@ -1489,14 +1497,14 @@ fn wave_json(
 /// # Beschreibung
 /// Das Ergebnis der Zell-Auflösung einer Ebene. `batches` laufen nacheinander,
 /// die Mitglieder eines Batches nebenläufig. Ohne auflösbare Zelle enthält
-/// `batches` genau einen Batch mit allen Crates der Ebene und `join` ist
+/// `batches` genau einen Batch mit allen Einheiten der Ebene und `join` ist
 /// [`JoinSemantics::AllTerminal`] — das bisherige Verhalten.
 ///
 /// # Nebenläufigkeit
-/// Reiner Werttyp; hält nur Verweise auf den Workspace-Graphen.
+/// Reiner Werttyp; hält nur Verweise auf den Einheiten-Graphen.
 struct WavePlan<'a> {
     /// Die Startgruppen der Welle in Ausführungsreihenfolge.
-    batches: Vec<Vec<&'a CrateNode>>,
+    batches: Vec<Vec<&'a AnalysisUnit>>,
     /// Wie der Orchestrator auf die Kinder eines Batches wartet.
     join: JoinSemantics,
     /// Die Zell-ID, wenn die Welle aus einer Zelle stammt; sonst `None`.
@@ -1533,9 +1541,9 @@ fn load_organization() -> Option<ResolvedOrganization> {
 ///
 /// # Beschreibung
 /// [`CellPlan::from_cell`] löst gegen einen [`Plan`] auf, nicht gegen einen
-/// Crate-Graphen. Dieser Plan enthält genau die Analyse-Knoten *einer* Ebene —
+/// Einheiten-Graphen. Dieser Plan enthält genau die Analyse-Knoten *einer* Ebene —
 /// dadurch bleibt die Wellenordnung erhalten, die
-/// [`WorkspaceGraph::topological_levels`] vorgibt: eine Zelle über dem
+/// [`UnitGraph::levels`] vorgibt: eine Zelle über dem
 /// Gesamtplan würde alle Ebenen zu einer einzigen Welle verschmelzen und die
 /// Bottom-up-Ordnung zerstören.
 ///
@@ -1544,15 +1552,15 @@ fn load_organization() -> Option<ResolvedOrganization> {
 /// `id` und `write_scope`. Der Plan wird nirgends persistiert.
 ///
 /// # Argumente
-/// - `root` (`&Path`): Workspace-Wurzel für die Lesebereiche.
-/// - `crates` (`&[&CrateNode]`): die Crates dieser Ebene.
+/// - `root` (`&Path`): Wurzel für die Lesebereiche.
+/// - `units` (`&[&AnalysisUnit]`): die Einheiten dieser Ebene.
 ///
 /// # Rückgabe
-/// Ein flüchtiger [`Plan`] mit einem Analyse-Knoten je Crate.
+/// Ein flüchtiger [`Plan`] mit einem Analyse-Knoten je Einheit.
 ///
 /// # Nebenläufigkeit
 /// Rein bis auf die Systemuhr für die Zeitstempel der Knoten.
-fn wave_plan(root: &Path, crates: &[&CrateNode]) -> Plan {
+fn wave_plan(root: &Path, units: &[&AnalysisUnit]) -> Plan {
     let now = offset_from_timestamp(jiff::Timestamp::now());
     Plan {
         id: PlanId::new(ANALYSIS_PLAN_ID),
@@ -1560,9 +1568,9 @@ fn wave_plan(root: &Path, crates: &[&CrateNode]) -> Plan {
         parent_revision: None,
         goal_statement: "Analyse-Welle".to_owned(),
         goal_id: None,
-        nodes: crates
+        nodes: units
             .iter()
-            .map(|crate_node| analysis_node(root, crate_node, Vec::new()))
+            .map(|unit| analysis_node(root, unit, Vec::new()))
             .collect(),
         created_at: now,
         updated_at: now,
@@ -1574,8 +1582,8 @@ fn wave_plan(root: &Path, crates: &[&CrateNode]) -> Plan {
 /// # Argumente
 /// - `cell` (`Option<(&RawClanSpec, &RawCellSpec)>`): Clan und Zelle aus der
 ///   Organisation; `None`, wenn keine gefunden wurde.
-/// - `root` (`&Path`): Workspace-Wurzel.
-/// - `crates` (`&[&CrateNode]`): die Crates dieser Ebene.
+/// - `root` (`&Path`): Wurzel.
+/// - `units` (`&[&AnalysisUnit]`): die Einheiten dieser Ebene.
 ///
 /// # Rückgabe
 /// `Some(cell_plan)`, wenn die Zelle mindestens ein Mitglied auswählt; sonst
@@ -1591,10 +1599,10 @@ fn wave_plan(root: &Path, crates: &[&CrateNode]) -> Plan {
 fn cell_plan_for_wave(
     cell: Option<(&RawClanSpec, &RawCellSpec)>,
     root: &Path,
-    crates: &[&CrateNode],
+    units: &[&AnalysisUnit],
 ) -> Option<CellPlan> {
     let (clan, spec) = cell?;
-    let plan = wave_plan(root, crates);
+    let plan = wave_plan(root, units);
     match CellPlan::from_cell(spec, Some(clan), &plan) {
         Ok(resolved) if !resolved.members.is_empty() => Some(resolved),
         Ok(resolved) => {
@@ -1602,7 +1610,7 @@ fn cell_plan_for_wave(
                 cell = resolved.cell_id.as_str(),
                 clan = clan.id.as_str(),
                 pattern = spec.members_from_plan.as_str(),
-                crates = crates.len(),
+                units = units.len(),
                 "analyze.cell.no_members"
             );
             None
@@ -1619,48 +1627,51 @@ fn cell_plan_for_wave(
     }
 }
 
-/// Übersetzt die Batches einer aufgelösten Zelle in Crate-Gruppen.
+/// Übersetzt die Batches einer aufgelösten Zelle in Einheiten-Gruppen.
 ///
 /// # Beschreibung
-/// Bildet jede `TaskId` eines Batches auf ihr Crate zurück. Die Zelle darf die
+/// Bildet jede `TaskId` eines Batches auf ihr Einheit zurück. Die Zelle darf die
 /// Ebene umsortieren und aufteilen, aber nichts verschlucken: deckt sie nicht
-/// **jedes** Crate der Ebene ab, wird das Ergebnis verworfen und die ungeteilte
-/// Welle zurückgegeben. Sonst würde eine zu enge Zelle stillschweigend Crates
+/// **jedes** Einheit der Ebene ab, wird das Ergebnis verworfen und die ungeteilte
+/// Welle zurückgegeben. Sonst würde eine zu enge Zelle stillschweigend Einheiten
 /// von der Analyse ausschließen — ein Rückschritt gegenüber dem Verhalten ohne
 /// Organisation.
 ///
 /// # Argumente
 /// - `cell` (`Option<&CellPlan>`): die aufgelöste Zelle dieser Ebene.
-/// - `crates` (`&[&CrateNode]`): die Crates der Ebene in Graph-Reihenfolge.
+/// - `units` (`&[&AnalysisUnit]`): die Einheiten der Ebene in Graph-Reihenfolge.
 ///
 /// # Rückgabe
 /// Die Batches in Ausführungsreihenfolge; im Rückfall genau ein Batch mit allen
-/// Crates.
+/// Einheiten.
 ///
 /// # Nebenläufigkeit
 /// Rein funktional, keine Seiteneffekte.
-fn wave_batches<'a>(cell: Option<&CellPlan>, crates: &[&'a CrateNode]) -> Vec<Vec<&'a CrateNode>> {
+fn wave_batches<'a>(
+    cell: Option<&CellPlan>,
+    units: &[&'a AnalysisUnit],
+) -> Vec<Vec<&'a AnalysisUnit>> {
     let Some(cell) = cell else {
-        return vec![crates.to_vec()];
+        return vec![units.to_vec()];
     };
 
-    let mut batches: Vec<Vec<&'a CrateNode>> = Vec::with_capacity(cell.batches.len());
+    let mut batches: Vec<Vec<&'a AnalysisUnit>> = Vec::with_capacity(cell.batches.len());
     let mut covered = 0_usize;
     for batch in &cell.batches {
-        let mut members: Vec<&'a CrateNode> = Vec::with_capacity(batch.len());
+        let mut members: Vec<&'a AnalysisUnit> = Vec::with_capacity(batch.len());
         for task in batch {
-            match crates
+            match units
                 .iter()
-                .find(|crate_node| node_id(&crate_node.name) == task.as_str())
+                .find(|unit| node_id(&unit.name) == task.as_str())
             {
-                Some(crate_node) => {
-                    members.push(*crate_node);
+                Some(unit) => {
+                    members.push(*unit);
                     covered += 1;
                 }
                 None => tracing::warn!(
                     cell = cell.cell_id.as_str(),
                     task = task.as_str(),
-                    "analyze.cell.member_without_crate"
+                    "analyze.cell.member_without_unit"
                 ),
             }
         }
@@ -1669,14 +1680,14 @@ fn wave_batches<'a>(cell: Option<&CellPlan>, crates: &[&'a CrateNode]) -> Vec<Ve
         }
     }
 
-    if batches.is_empty() || covered != crates.len() {
+    if batches.is_empty() || covered != units.len() {
         tracing::warn!(
             cell = cell.cell_id.as_str(),
             covered,
-            expected = crates.len(),
+            expected = units.len(),
             "analyze.cell.partial_cover — Rückfall auf die ungeteilte Welle"
         );
-        return vec![crates.to_vec()];
+        return vec![units.to_vec()];
     }
     batches
 }
@@ -1685,8 +1696,8 @@ fn wave_batches<'a>(cell: Option<&CellPlan>, crates: &[&'a CrateNode]) -> Vec<Ve
 ///
 /// # Argumente
 /// - `cell` (`Option<(&RawClanSpec, &RawCellSpec)>`): Clan und Zelle aus der Organisation.
-/// - `root` (`&Path`): Workspace-Wurzel.
-/// - `crates` (`&[&CrateNode]`): die Crates dieser Ebene.
+/// - `root` (`&Path`): Wurzel.
+/// - `units` (`&[&AnalysisUnit]`): die Einheiten dieser Ebene.
 ///
 /// # Rückgabe
 /// Der [`WavePlan`] dieser Ebene; ohne Zelle ein einziger Batch mit
@@ -1697,11 +1708,11 @@ fn wave_batches<'a>(cell: Option<&CellPlan>, crates: &[&'a CrateNode]) -> Vec<Ve
 fn plan_wave<'a>(
     cell: Option<(&RawClanSpec, &RawCellSpec)>,
     root: &Path,
-    crates: &[&'a CrateNode],
+    units: &[&'a AnalysisUnit],
 ) -> WavePlan<'a> {
-    let resolved = cell_plan_for_wave(cell, root, crates);
+    let resolved = cell_plan_for_wave(cell, root, units);
     WavePlan {
-        batches: wave_batches(resolved.as_ref(), crates),
+        batches: wave_batches(resolved.as_ref(), units),
         join: resolved
             .as_ref()
             .map_or(JoinSemantics::AllTerminal, |plan| plan.join),
@@ -1749,7 +1760,7 @@ fn cell_json(cell: Option<(&RawClanSpec, &RawCellSpec)>) -> Value {
 /// - `args` ([`AnalyzeArgs`]): die Argumente; werden konsumiert.
 ///
 /// # Rückgabe
-/// `Ok(OpOutput)` mit einem JSON-Bericht: Wellen, Crate-Anzahl, Findings,
+/// `Ok(OpOutput)` mit einem JSON-Bericht: Wellen, Einheiten-Anzahl, Findings,
 /// offene Fragen, Reconcile-Vorschläge und Fehlschläge je Knoten.
 ///
 /// # Fehler
