@@ -42,7 +42,7 @@
 
 use harw_tools::{ToolOutput, ToolsError, executor::ToolExecutionContext};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 /// Namen beider Prozess-Werkzeuge (in Registrierungsreihenfolge).
 pub const PROCESS_TOOL_NAMES: [&str; 2] = ["process.list", "process.kill"];
@@ -191,7 +191,9 @@ fn validate_secs(value: Option<u64>, default: u64, max: u64, field: &str) -> Res
     match value {
         None => Ok(default),
         Some(secs) if (1..=max).contains(&secs) => Ok(secs),
-        Some(secs) => Err(format!("{field} must be between 1 and {max} seconds, got {secs}")),
+        Some(secs) => Err(format!(
+            "{field} must be between 1 and {max} seconds, got {secs}"
+        )),
     }
 }
 
@@ -332,7 +334,7 @@ mod platform {
         let mut survived = 0usize;
         let mut errors = 0usize;
         for report in reports {
-            match report.result {
+            match &report.result {
                 KillResult::Killed | KillResult::KilledAfterRetry => killed += 1,
                 KillResult::AlreadyExited => already_exited += 1,
                 KillResult::Survived => survived += 1,
@@ -487,6 +489,7 @@ mod tests {
     use harw_extension_api::contributors::ToolProvider as _;
     use harw_tools::{ToolCall, ToolName};
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
+    use serde_json::json;
     use std::fmt;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -575,7 +578,10 @@ mod tests {
 
     #[test]
     fn test_provider_lists_both_tools_in_order() {
-        assert_eq!(ProcessToolProvider::TOOL_NAMES, PROCESS_TOOL_NAMES.as_slice());
+        assert_eq!(
+            ProcessToolProvider::TOOL_NAMES,
+            PROCESS_TOOL_NAMES.as_slice()
+        );
         let provider = ProcessToolProvider::new();
         let tools = provider.tools();
         let names: Vec<&str> = tools.iter().map(harw_tools::ToolSpec::name).collect();
@@ -591,7 +597,11 @@ mod tests {
         assert!(provider.parallel_safe(&ToolName::new("process.list")));
         assert!(!provider.parallel_safe(&ToolName::new("process.kill")));
         assert!(!provider.parallel_safe(&ToolName::new("process.unknown")));
-        assert!(provider.executor(&ToolName::new("process.unknown")).is_none());
+        assert!(
+            provider
+                .executor(&ToolName::new("process.unknown"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -675,9 +685,15 @@ mod tests {
         let context = sandbox_context(harness.path(), vec![Permission::ExecuteProcess])?;
         for name in PROCESS_TOOL_NAMES {
             let message = expect_error(run(&context, name, json!({}))?)?;
-            assert!(message.contains("at least one selector"), "{name}: {message}");
+            assert!(
+                message.contains("at least one selector"),
+                "{name}: {message}"
+            );
             let message = expect_error(run(&context, name, json!({ "uid": 0 }))?)?;
-            assert!(message.contains("at least one selector"), "{name}: {message}");
+            assert!(
+                message.contains("at least one selector"),
+                "{name}: {message}"
+            );
         }
         Ok(())
     }
