@@ -1,0 +1,32 @@
+[package]
+name = "harw-tool-process"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Agent-Werkzeuge process.list/process.kill über die Bibliotheks-API von harw-killer (nur Linux)."
+publish = false
+
+[dependencies]
+harw-authority = { path = "../harw-authority" }
+harw-extension-api = { path = "../harw-extension-api" }
+harw-macros = { path = "../harw-macros" }
+harw-tools = { path = "../harw-tools" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+
+# `harw-killer` ist bewusst Linux-only (pidfd, /proc); auf anderen Zielen
+# liefern beide Werkzeuge einen klaren Tool-Fehler statt nicht zu bauen.
+[target.'cfg(target_os = "linux")'.dependencies]
+harw-killer = { path = "../harw-killer" }
+# `spawn_blocking`: `preview`/`kill_own` blockieren (Snapshot, Warten auf
+# Prozessende bis `timeout + kill_wait`) und dürfen den Executor nicht halten.
+tokio = { version = "1", features = ["rt"] }
+
+[dev-dependencies]
+harw-types = { path = "../harw-types" }
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[lints]
+workspace = true

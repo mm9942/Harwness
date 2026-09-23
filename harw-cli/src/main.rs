@@ -2985,7 +2985,10 @@ mod tests {
             kill_passthrough_args(os(&["harw", "kill", "--log", "debug", "-p", "x", "--help"])),
             Some(os(&["--log", "debug", "-p", "x", "--help"]))
         );
-        assert_eq!(kill_passthrough_args(os(&["harw", "kill"])), Some(Vec::new()));
+        assert_eq!(
+            kill_passthrough_args(os(&["harw", "kill"])),
+            Some(Vec::new())
+        );
         assert_eq!(kill_passthrough_args(os(&["harw", "doctor", "kill"])), None);
         assert_eq!(kill_passthrough_args(os(&["harw"])), None);
     }

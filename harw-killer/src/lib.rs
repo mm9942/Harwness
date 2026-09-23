@@ -275,14 +275,24 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
+    ExitCode::from(exit_status(args, &helper))
+}
+
+// Numeric exit status behind `run_cli`, separated so tests can compare it.
+fn exit_status<I, T>(args: I, helper: &HelperInvocation) -> u8
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    const FAILURE: u8 = 1;
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) => {
             // Clap prints help/version to stdout and usage errors to stderr.
             if error.print().is_err() {
-                return ExitCode::FAILURE;
+                return FAILURE;
             }
-            return ExitCode::from(u8::try_from(error.exit_code()).unwrap_or(2));
+            return u8::try_from(error.exit_code()).unwrap_or(2);
         }
     };
     let subscriber = tracing_subscriber::fmt()
@@ -291,21 +301,22 @@ where
         .with_ansi(io::stderr().is_terminal())
         .with_writer(io::stderr)
         .finish();
-    if let Err(error) = tracing::subscriber::set_global_default(subscriber)
-        && helper == HelperInvocation::Standalone
-    {
-        // Logger setup failure precedes the availability of tracing; write the CLI fatal error directly.
-        let mut out = io::stderr().lock();
-        if writeln!(out, "Cannot initialize tracing: {error}").is_err() {
-            return ExitCode::FAILURE;
+    if let Err(error) = tracing::subscriber::set_global_default(subscriber) {
+        // A host CLI may already own the global subscriber; keep it for subcommands.
+        if *helper == HelperInvocation::Standalone {
+            // Logger setup failure precedes the availability of tracing; write the CLI fatal error directly.
+            let mut out = io::stderr().lock();
+            if writeln!(out, "Cannot initialize tracing: {error}").is_err() {
+                return FAILURE;
+            }
+            return FAILURE;
         }
-        return ExitCode::FAILURE;
     }
-    match run(&cli, &helper) {
-        Ok(code) => ExitCode::from(code),
+    match run(&cli, helper) {
+        Ok(code) => code,
         Err(error) => {
             tracing::error!(error=%error,"killer failed");
-            ExitCode::FAILURE
+            FAILURE
         }
     }
 }
@@ -330,13 +341,9 @@ mod tests {
     // Usage errors never reach selection; help exits successfully.
     #[test]
     fn test_run_cli_parse_errors_do_not_select() {
-        assert_eq!(
-            run_cli(["killer"], HelperInvocation::Standalone),
-            ExitCode::from(2)
-        );
-        assert_eq!(
-            run_cli(["killer", "--regex", "x"], HelperInvocation::Standalone),
-            ExitCode::from(2)
-        );
+        let standalone = HelperInvocation::Standalone;
+        assert_eq!(exit_status(["killer"], &standalone), 2);
+        assert_eq!(exit_status(["killer", "--regex", "x"], &standalone), 2);
+        assert_eq!(exit_status(["killer", "-p", "/bin/x"], &standalone), 2);
     }
 }
