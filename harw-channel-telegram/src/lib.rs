@@ -13,7 +13,10 @@ mod sandbox;
 mod telegram;
 mod work_request;
 
-pub use approval_tokens::{ApprovalTokenStore, PendingApproval};
+pub use approval_tokens::{
+    ApprovalCallbackContext, ApprovalTokenStore, PendingApproval, TelegramChatId, TelegramMessageId,
+    TelegramThreadId,
+};
 pub use config::{DEFAULT_MAX_UPDATES_PER_PEER_PER_MIN, TelegramChannelConfig, TopicMode};
 pub use error::{TelegramChannelError, TelegramChannelResult};
 pub use sandbox::TelegramSandbox;

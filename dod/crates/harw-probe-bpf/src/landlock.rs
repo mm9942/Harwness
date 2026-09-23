@@ -46,8 +46,9 @@
 //! ist zulässig und ergibt die engste Regel (kein lesbares Dateisystemziel).
 //!
 //! Nur Verzeichnisse, nie Einzeldateien: die Regel verwendet
-//! `AccessFs::from_read`, das auch Verzeichnisrechte (`ReadDir`) enthält —
-//! eine solche Regel auf einer Datei lehnt die `landlock`-Crate ab.
+//! `AccessFs::from_read`, das auch Verzeichnisrechte (`ReadDir`) enthält;
+//! auf einer Einzeldatei passten diese Rechte nicht (siehe
+//! `main::KERNEL_INTERFACE_ROOTS`).
 //!
 //! # Was die Regel beschränkt
 //! Behandelt werden die lesenden Zugriffsrechte der ABI-Stufe V1
