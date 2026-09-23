@@ -3868,6 +3868,39 @@ fn ensure_tool_cell(
 ///
 /// # Rückgabe
 /// `true`, wenn sich der sichtbare Zustand geändert hat und ein Redraw nötig ist.
+/// Obergrenze (Zeichen) des vorgehaltenen Live-Reasoning-Schwanzes.
+const LIVE_REASONING_MAX_CHARS: usize = 2000;
+/// Maximale Zahl umbrochener Live-Reasoning-Zeilen im Chat.
+const LIVE_REASONING_MAX_LINES: usize = 3;
+
+/// Baut die transienten Live-Reasoning-Zeilen: die letzten (bis zu)
+/// [`LIVE_REASONING_MAX_LINES`] umbrochenen Zeilen, gedimmt, die erste mit
+/// `"∴ "`-Markierung.
+///
+/// # Argumente
+/// - `text` (`&str`): Roher, gestreamter Reasoning-Text (wird sanitisiert).
+/// - `width` (`u16`): Breite der Verlaufsfläche.
+/// - `theme` ([`style::Theme`]): Farbschema.
+fn live_reasoning_lines(text: &str, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
+    let sanitized = crate::sanitize::sanitize_inline(text);
+    let wrapped = crate::history_cell::wrap_plain(sanitized.trim(), width.saturating_sub(4));
+    let skip = wrapped.len().saturating_sub(LIVE_REASONING_MAX_LINES);
+    wrapped
+        .into_iter()
+        .skip(skip)
+        .enumerate()
+        .map(|(index, line)| {
+            let content: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            let prefix = if index == 0 { "  ∴ " } else { "    " };
+            Line::styled(format!("{prefix}{content}"), style::dim_style(theme))
+        })
+        .collect()
+}
+
 fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnEvent) -> bool {
     match event {
         TurnEvent::ToolCallRequested {
@@ -4006,10 +4039,15 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
         }
         TurnEvent::ReasoningDelta { text, .. } => {
             app.live_reasoning.push_str(&text);
-            // Nur ein kurzer Schwanz bleibt sichtbar.
+            // Nur ein Schwanz bleibt vorgehalten — genug für die letzten
+            // drei umbrochenen Zeilen auch auf breiten Terminals.
             let count = app.live_reasoning.chars().count();
-            if count > 400 {
-                app.live_reasoning = app.live_reasoning.chars().skip(count - 400).collect();
+            if count > LIVE_REASONING_MAX_CHARS {
+                app.live_reasoning = app
+                    .live_reasoning
+                    .chars()
+                    .skip(count - LIVE_REASONING_MAX_CHARS)
+                    .collect();
             }
             true
         }
@@ -7310,7 +7348,17 @@ fn render_viewport(
         format!(" · {n} Nachricht(en) warten", n = app.pending_turns.len())
     };
     let tool_suffix = if app.has_collapsed_tool_cells() {
-        " · Ctrl+O: Werkzeugdetails"
+        " · Ctrl+O: Werkzeug-/Reasoning-Details"
+    } else {
+        ""
+    };
+    // Kontexthinweis für das fokussierte Agenten-Panel.
+    let agents_hint = if app.panels.focus == crate::panes::PaneFocus::Agents {
+        if app.agent_detail.is_some() {
+            " · Esc: Liste | j/k/Bild↑↓: scrollen | g/G: Anfang/Ende | r: Reasoning"
+        } else {
+            " · Enter: Agentendetails"
+        }
     } else {
         ""
     };
@@ -7319,7 +7367,7 @@ fn render_viewport(
         .map(|_| " · Freigabemodus wird nach dem Turn übernommen")
         .unwrap_or("");
     let status = format!(
-        " {spinner_prefix}Shift+Tab: {permission} | Modus: {} | Σ Tokens: {} (in {}, out {}{cache_suffix}){context_suffix}{agents_suffix}{explorer_suffix}{cancel_suffix}{queue_cleared_suffix}{quit_suffix}{queue_suffix}{tool_suffix}{pending_permission_suffix}",
+        " {spinner_prefix}Shift+Tab: {permission} | Modus: {} | Σ Tokens: {} (in {}, out {}{cache_suffix}){context_suffix}{agents_suffix}{explorer_suffix}{cancel_suffix}{queue_cleared_suffix}{quit_suffix}{queue_suffix}{tool_suffix}{agents_hint}{pending_permission_suffix}",
         app.active_mode().as_str(),
         crate::agent_monitor::human_tokens(usage.total()),
         crate::agent_monitor::human_tokens(usage.prompt_tokens()),
@@ -7358,13 +7406,7 @@ fn render_viewport(
         .collect();
     // Transient: live gestreamtes Reasoning/Text der laufenden Runde.
     if !app.live_reasoning.is_empty() {
-        all_lines.push(Line::styled(
-            format!(
-                "  ∴ {}",
-                crate::sanitize::sanitize_inline(&app.live_reasoning)
-            ),
-            style::dim_style(theme),
-        ));
+        all_lines.extend(live_reasoning_lines(&app.live_reasoning, width, theme));
     }
     if !app.live_stream.is_empty() {
         for (index, text) in app.live_stream.lines().enumerate() {

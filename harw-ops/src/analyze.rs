@@ -2449,10 +2449,10 @@ mod tests {
     #[tokio::test]
     async fn test_analyze_on_root_with_cargo_toml_still_uses_the_real_graph_load_path() -> TestResult
     {
-        // Regressionsschutz: mit `Cargo.toml` bleibt der echte
-        // `WorkspaceGraph::load`-Pfad unverändert — erkennbar an der realen
-        // internen Abhängigkeit a→b, die der synthetische Rückfall nie
-        // herleitet (dessen Pseudo-Crates tragen immer leere `deps`).
+        // Regressionsschutz: für einen Cargo-Workspace reichert
+        // `WorkspaceGraph::load` die Explorer-Einheiten an — erkennbar an der
+        // realen internen Abhängigkeit a→b, die der Verzeichnis-Rückfall nie
+        // herleitet (dessen Einheiten tragen immer leere `deps`).
         let (ctx, root) = workspace_context()?;
         let result = super::analyze(
             &ctx,
@@ -2886,5 +2886,282 @@ mod tests {
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new()),
             root,
         ))
+    }
+
+    // ── Projektneutraler Einheiten-Graph ─────────────────────────────────────
+
+    /// Schreibt eine Datei samt Elternverzeichnissen.
+    fn write_file(path: &Path, content: &str) -> TestResult {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(ctx("Verzeichnis anlegen"))?;
+        }
+        std::fs::write(path, content).map_err(ctx("Datei schreiben"))?;
+        Ok(())
+    }
+
+    /// Legt ein Nicht-Cargo-Fixture an: zwei npm-Pakete und zwei
+    /// Python-Projekte mit je einer Pfad-Abhängigkeit.
+    ///
+    /// Erwartet: `web → shared-js` (`file:`-Abhängigkeit in `package.json`)
+    /// und `api → core` (`[tool.uv.sources]` in `pyproject.toml`).
+    fn polyglot_workspace(dir: &Path) -> TestResult {
+        write_file(
+            &dir.join("web/package.json"),
+            r#"{ "name": "web", "dependencies": { "shared-js": "file:../shared-js" } }"#,
+        )?;
+        write_file(
+            &dir.join("shared-js/package.json"),
+            r#"{ "name": "shared-js", "version": "1.0.0" }"#,
+        )?;
+        write_file(
+            &dir.join("api/pyproject.toml"),
+            "[project]\nname = \"api\"\n\n[tool.uv.sources]\ncore = { path = \"../core\" }\n",
+        )?;
+        write_file(
+            &dir.join("core/pyproject.toml"),
+            "[project]\nname = \"core\"\n",
+        )?;
+        Ok(())
+    }
+
+    /// Kontext, dessen Sandbox auf das Nicht-Cargo-Fixture zeigt.
+    fn polyglot_context() -> TestResult<(OpContext, PathBuf)> {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "harw-analyze-polyglot-test-{}-{id}",
+            std::process::id()
+        ));
+        let workspace = root.join("ws");
+        std::fs::create_dir_all(&workspace).map_err(ctx("Test-Workspace anlegen"))?;
+        polyglot_workspace(&workspace)?;
+        let registry = WorkspaceRegistry::build(
+            &root,
+            [WorkspaceRegistration {
+                tenant: TenantId::from_str("test-tenant"),
+                workspace: WorkspaceId::from_str("ws"),
+                root: PathBuf::from("ws"),
+            }],
+        )
+        .map_err(ctx("Workspace-Registry bauen"))?;
+        let binding = registry
+            .resolve(
+                &TenantId::from_str("test-tenant"),
+                &WorkspaceId::from_str("ws"),
+            )
+            .map_err(ctx("Workspace-Binding auflösen"))?;
+        let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::empty());
+        Ok((
+            OpContext::new(SessionId::new(), TurnId::new(), sandbox, ServiceMap::new()),
+            root,
+        ))
+    }
+
+    /// Führt einen Dry-Run aus und parst den Bericht.
+    async fn dry_run_report(
+        op_ctx: &OpContext,
+        args: AnalyzeArgs,
+    ) -> TestResult<serde_json::Value> {
+        let output = super::analyze(
+            op_ctx,
+            AnalyzeArgs {
+                dry_run: Some(true),
+                ..args
+            },
+        )
+        .await
+        .map_err(ctx("Dry-Run darf nicht fehlschlagen"))?;
+        serde_json::from_str(&output.text).map_err(ctx("Dry-Run-Ausgabe ist kein JSON"))
+    }
+
+    #[tokio::test]
+    async fn test_analyze_on_npm_and_python_fixture_builds_units_and_edges() -> TestResult {
+        let (op_ctx, root) = polyglot_context()?;
+        let report = dry_run_report(&op_ctx, AnalyzeArgs::default()).await;
+        std::fs::remove_dir_all(root).ok();
+        let report = report?;
+
+        assert_eq!(report["graph"]["source"], serde_json::json!("explorer"));
+        assert_eq!(report["unit_count"], serde_json::json!(4));
+        assert_eq!(report["crate_count"], serde_json::json!(4));
+        assert_eq!(
+            report["leaf_first"],
+            serde_json::json!([
+                node_id("core"),
+                node_id("shared-js"),
+                node_id("api"),
+                node_id("web")
+            ]),
+            "Pfad-Abhängigkeiten müssen die Ziele eine Ebene tiefer legen"
+        );
+        assert_eq!(
+            report["waves"][1]["nodes"][0]["unit"],
+            serde_json::json!("api")
+        );
+        assert_eq!(
+            report["waves"][1]["nodes"][0]["kind"],
+            serde_json::json!("python")
+        );
+        assert_eq!(
+            report["waves"][1]["nodes"][0]["dependencies"],
+            serde_json::json!([node_id("core")])
+        );
+        assert_eq!(
+            report["waves"][1]["nodes"][1]["kind"],
+            serde_json::json!("node")
+        );
+        assert_eq!(
+            report["waves"][1]["nodes"][1]["dependencies"],
+            serde_json::json!([node_id("shared-js")])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_analyze_on_polyglot_fixture_subgraph_by_unit_name_and_path() -> TestResult {
+        let (op_ctx, root) = polyglot_context()?;
+        let by_name = dry_run_report(
+            &op_ctx,
+            AnalyzeArgs {
+                crate_name: Some("web".to_owned()),
+                ..AnalyzeArgs::default()
+            },
+        )
+        .await;
+        let by_path = dry_run_report(
+            &op_ctx,
+            AnalyzeArgs {
+                crate_name: Some("./api/".to_owned()),
+                ..AnalyzeArgs::default()
+            },
+        )
+        .await;
+        let unknown = super::analyze(
+            &op_ctx,
+            AnalyzeArgs {
+                crate_name: Some("gibt-es-nicht".to_owned()),
+                dry_run: Some(true),
+                ..AnalyzeArgs::default()
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(root).ok();
+
+        assert_eq!(
+            by_name?["leaf_first"],
+            serde_json::json!([node_id("shared-js"), node_id("web")])
+        );
+        assert_eq!(
+            by_path?["leaf_first"],
+            serde_json::json!([node_id("core"), node_id("api")])
+        );
+        assert!(matches!(unknown, Err(OpError::Execution(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_unit_graph_marks_nested_projects_and_skips_workspace_shells() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("Temp-Verzeichnis anlegen"))?;
+        let root = std::fs::canonicalize(dir.path()).map_err(ctx("Wurzel kanonisieren"))?;
+        // Wurzel-`package.json` mit `workspaces` ist eine Hülle, keine Einheit;
+        // das Mitglied `packages/ui` ist eine. `packages/ui/tools` ist ein
+        // darin verschachteltes Python-Projekt.
+        write_file(
+            &root.join("package.json"),
+            r#"{ "name": "mono", "private": true, "workspaces": ["packages/*"] }"#,
+        )?;
+        write_file(
+            &root.join("packages/ui/package.json"),
+            r#"{ "name": "@acme/ui" }"#,
+        )?;
+        write_file(
+            &root.join("packages/ui/tools/pyproject.toml"),
+            "[project]\nname = \"ui-tools\"\n",
+        )?;
+
+        let (graph, info) = build_unit_graph(&root).map_err(ctx("Graph bauen"))?;
+        assert_eq!(info["source"], serde_json::json!("explorer"));
+        let mut names: Vec<&str> = graph.units.iter().map(|unit| unit.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["@acme/ui", "ui-tools"],
+            "die Hülle 'mono' zählt nicht"
+        );
+        assert_eq!(node_id("@acme/ui"), "research--acme-ui");
+
+        let Some(ui) = graph.get("@acme/ui") else {
+            return Err(TestError::Unexpected("Einheit @acme/ui fehlt".to_owned()));
+        };
+        let nested: Vec<&str> = graph
+            .nested_in(ui)
+            .iter()
+            .map(|unit| unit.name.as_str())
+            .collect();
+        assert_eq!(nested, vec!["ui-tools"]);
+
+        let question = analysis_question(&root, ui, &[], &graph.nested_in(ui));
+        assert!(question.question.contains("packages/ui/tools"));
+        assert_eq!(question.scope.paths, vec!["packages/ui/**".to_owned()]);
+        assert!(
+            question.scope.crates.is_empty(),
+            "npm-Pakete sind keine Crates"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_analysis_question_is_language_neutral_for_python_units() {
+        let unit = AnalysisUnit {
+            kinds: vec![ProjectKind::Python],
+            cargo_name: None,
+            version: None,
+            manifest: Some(PathBuf::from("core/pyproject.toml")),
+            ..crate_node("core", 0)
+        };
+        let question = analysis_question(Path::new("/ws"), &unit, &[], &[]);
+        let text = question.question.as_str();
+        assert!(text.contains("NotImplementedError"), "{text}");
+        assert!(text.contains("Docstrings"), "{text}");
+        assert!(
+            !text.contains("todo!()"),
+            "keine Rust-Marker für Python: {text}"
+        );
+        assert!(
+            !text.contains("`pub`"),
+            "keine Rust-API-Begriffe für Python: {text}"
+        );
+        assert!(!text.contains("Crate"), "{text}");
+    }
+
+    #[test]
+    fn test_analysis_question_for_rust_units_keeps_rust_markers() {
+        let unit = crate_node("a", 0);
+        let question = analysis_question(Path::new("/ws"), &unit, &[], &[]);
+        assert!(question.question.contains("todo!()"));
+        assert!(question.question.contains("`pub`"));
+        assert_eq!(question.scope.crates, vec!["a".to_owned()]);
+    }
+
+    #[test]
+    fn test_analysis_question_for_plain_directory_is_generic() {
+        let unit = directory_unit(Path::new("/ws"), PathBuf::from("/ws/scripts"));
+        let question = analysis_question(Path::new("/ws"), &unit, &[], &[]);
+        assert!(question.question.contains("Verzeichnis `scripts`"));
+        assert!(question.question.contains("raise NotImplementedError"));
+        assert_eq!(question.scope.paths, vec!["scripts/**".to_owned()]);
+    }
+
+    #[test]
+    fn test_analyze_args_accept_unit_name_and_crate_name_in_json() -> TestResult {
+        let legacy: AnalyzeArgs =
+            serde_json::from_value(serde_json::json!({ "crate_name": "harw-core" }))
+                .map_err(ctx("crate_name muss weiter gelten"))?;
+        assert_eq!(legacy.unit_name(), Some("harw-core"));
+        let neutral: AnalyzeArgs =
+            serde_json::from_value(serde_json::json!({ "unit_name": "web" }))
+                .map_err(ctx("unit_name muss gelten"))?;
+        assert_eq!(neutral.unit_name(), Some("web"));
+        Ok(())
     }
 }
