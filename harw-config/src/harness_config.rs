@@ -123,6 +123,11 @@ pub struct CompactionToml {
     /// (`harw_core::DEFAULT_ABSOLUTE_CEILING_TOKENS`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub absolute_ceiling_tokens: Option<u64>,
+    /// Byte-Obergrenze des Verlaufs je Modell-Request. `None` → aus dem
+    /// Kontextfenster des aktiven Modells abgeleitet (~3 B/Token), damit
+    /// Auto-Compaction vor jeder stillen Byte-Kappung greift.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_history_bytes: Option<usize>,
 }
 
 /// `[reasoning]` — Rollen-Reasoning-Effort-Gewichtung (Addendum F+G,

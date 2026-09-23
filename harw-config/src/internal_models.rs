@@ -349,6 +349,7 @@ mod tests {
 
     fn openrouter_provider(enabled: bool, with_auth: bool) -> TestResult<ProviderToml> {
         Ok(ProviderToml {
+            stream: None,
             name: OPENROUTER_PROVIDER.to_owned(),
             api: "openrouter-chat".to_owned(),
             base_url: "https://openrouter.ai/api/v1".to_owned(),

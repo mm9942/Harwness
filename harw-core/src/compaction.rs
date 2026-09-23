@@ -294,12 +294,14 @@ pub async fn compact_session(
     plan: &CompactionPlan,
     reason: Option<CompactDecision>,
 ) -> CoreResult<CompactionOutcome> {
+    let items_before = session.history().len();
     let (deterministic_history, mut outcome) = deterministic_pass(session.history(), plan);
     let mut final_history = deterministic_history;
+    let mut summary_usage = harw_types::TokenUsage::default();
 
     if outcome.bytes_after > plan.target_history_bytes {
         if let Some((summarized_history, summary_text, bytes_after)) =
-            summarize_older_half(&final_history, plan, model).await
+            summarize_older_half(&final_history, plan, model, &mut summary_usage).await
         {
             final_history = summarized_history;
             outcome.summarized = true;
@@ -310,6 +312,21 @@ pub async fn compact_session(
 
     outcome.reason = reason;
     *session.history_mut() = final_history;
+
+    // Live-Beobachtung: Nutzung des Zusammenfassungs-Aufrufs und die
+    // Verdichtung selbst (sonst nur als `tracing::info!` sichtbar).
+    if summary_usage != harw_types::TokenUsage::default() {
+        session.publish_agent_event(crate::agent_events::AgentEventKind::InternalUsage {
+            purpose: "compaction".to_owned(),
+            usage: summary_usage,
+        });
+    }
+    session.live_emitter().emit(harw_protocol::TurnEvent::CompactionApplied {
+        turn_id: session.current_turn().cloned(),
+        reason: reason.map_or_else(|| "manual".to_owned(), |r| format!("{r:?}")),
+        items_before: u32::try_from(items_before).unwrap_or(u32::MAX),
+        items_after: u32::try_from(session.history().len()).unwrap_or(u32::MAX),
+    });
 
     if let Some(observer) = session.compaction_observer() {
         observer.on_compacted(session.id(), &outcome);
@@ -708,6 +725,7 @@ async fn summarize_older_half(
     history: &ConversationHistory,
     plan: &CompactionPlan,
     model: &dyn ModelProvider,
+    usage_out: &mut harw_types::TokenUsage,
 ) -> Option<(ConversationHistory, String, usize)> {
     let (mut older, current) = split_current_turn(history);
     if older.is_empty() {
@@ -742,6 +760,7 @@ async fn summarize_older_half(
 
     match model.respond(request).await {
         Ok(response) => {
+            *usage_out = response.usage.clone();
             let Some(text) = response.message.filter(|text| !text.trim().is_empty()) else {
                 tracing::warn!(
                     "compaction summary call returned no usable text; keeping deterministic result"

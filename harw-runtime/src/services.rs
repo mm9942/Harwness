@@ -451,6 +451,7 @@ impl RuntimeServices {
     /// | [`ExtraRootsCell`] | ✓ | ✓ | ✓ | ✓ |
     /// | [`Principal`] | ✓ | ✓ | ✓ | ✓ |
     /// | [`ProviderLoadRegistry`] | ✓ | ✓ | ✓ | ✓ |
+    /// | `SharedProviderConnectionCheck` (`/provider test`) | ✓ | ✓ | ✓ | ✓ |
     /// | `Arc<dyn Memory>` (falls vorhanden) | ✓ | ✓ | ✓ | ✓ |
     /// | `Arc<JobStore>` (falls vorhanden) | ✓ | ✓ | ✓ | ✓ |
     /// | `Arc<`[`HostPermitHandles`]`>` (falls vorhanden, Plan Teil B3) | ✓ | ✓ | ✓ | ✓ |
@@ -552,6 +553,14 @@ impl RuntimeServices {
             &mut names,
             self.parts.provider_load_registry.clone(),
         );
+        // Live-Verbindungstest für `/provider test` und `/uia-provider test`
+        // (`GET /models`); `secrets:`-Schlüssel brauchen einen Resolver, den
+        // diese Montage nicht hält — sie werden dann als nicht auflösbar
+        // gemeldet, alle anderen Referenzen (env/file/keyring) funktionieren.
+        let connection_check: harw_ops::provider::SharedProviderConnectionCheck = Arc::new(
+            harw_ops::provider::DiscoveryConnectionCheck::new(harw_home::home_dir().ok(), None),
+        );
+        insert_service(&mut map, &mut names, connection_check);
 
         if let Some(memory) = &self.parts.memory {
             insert_service(&mut map, &mut names, Arc::clone(memory));
@@ -740,6 +749,7 @@ mod tests {
             type_name::<ExtraRootsCell>(),
             type_name::<Principal>(),
             type_name::<ProviderLoadRegistry>(),
+            type_name::<harw_ops::provider::SharedProviderConnectionCheck>(),
         ]
     }
 

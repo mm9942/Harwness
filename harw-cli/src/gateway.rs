@@ -7,8 +7,12 @@
 //!   (mit Secret-Resolver für versiegelte `secrets:`-Credentials, siehe
 //!   [`crate::runtime_gateway::gateway_assembly`]), an den Nachrichten als
 //!   Turns gehen.
-//! - **Channels/Telegram** — bewusst fail-closed, bis der sichere Adapter
-//!   einen transport-gebundenen Ingress bereitstellt.
+//! - **Channels/Telegram** — je aktivierter `[[channel.telegram]]`-Bindung
+//!   ein eigener, supervidierter Ingress-Task (Long-Poll oder Webhook, siehe
+//!   [`telegram_ingress_modes`]). Jede Bindung, die ein Vertrauens-Gate nicht
+//!   besteht (keine gepinnten Identitäten, nicht auflösbares Credential,
+//!   ungültige Webhook-Angaben, geteilter Bot-Token), bleibt einzeln
+//!   fail-closed deaktiviert, ohne die übrigen Bindungen mitzureißen.
 //! - **Knowledge/Workbench** — [`harw_knowledge::KnowledgeStore`] wird am
 //!   Profil-Wissensordner gemountet; beim Start werden persistente
 //!   Workbench-Scopes (Session/Projekt-Arbeitssets) gescannt. Die Scopes
@@ -97,10 +101,14 @@
 //! Laufzeitfehler der Subsysteme werden geloggt und führen **nicht** zum
 //! Prozess-Exit — der Daemon bleibt am Leben (kein Crash-Loop).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, mpsc};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use jiff::{SignedDuration, Timestamp};
@@ -110,12 +118,13 @@ use harw_channel_telegram::{
     TelegramChannel, TelegramChannelConfig, ThrottleNotice, TopicMode, WorkRequestStore,
 };
 use harw_channel_telegram_transport::{
-    AdmittedEventConsumer, LongPollConfig, LongPollShutdown, RendererConfig, TelegramClient,
-    TelegramOffsetStore, TelegramOutbound, TelegramRenderer, spawn_long_poll_thread,
+    AdmittedEventConsumer, BotCommand, LongPollConfig, LongPollShutdown, RendererConfig,
+    TelegramClient, TelegramOffsetStore, TelegramOutbound, TelegramRenderer, TransportResult,
+    WebhookConfig, run_webhook_server, spawn_long_poll_thread,
 };
 use harw_config::{
-    ChannelToml, InternalModelPoint, ResolvedConfig, SecretRef, resolve_env_ref,
-    resolve_internal_model,
+    ChannelToml, InternalModelPoint, ResolvedConfig, SecretRef, TelegramChannelToml,
+    resolve_env_ref, resolve_internal_model,
 };
 use harw_core::{
     AgentSession, ModelProvider, PinnedModelProvider, TranscriptStateStore, TurnInput, TurnOutcome,
@@ -212,9 +221,60 @@ fn audit_chain_check_interval_secs(raw: Option<&str>) -> u64 {
 struct TelegramIngressPlan {
     binding: harw_config::TelegramChannelToml,
     bot_token: SecretString,
+    /// Aufgelöster Transport dieser Bindung (Long-Poll oder Webhook).
+    transport: TelegramTransportPlan,
 }
 
-/// Telegram remains disabled unless construction completed all trust gates.
+/// Aufgelöster Ingress-Transport einer Bindung.
+enum TelegramTransportPlan {
+    /// `getUpdates`-Long-Poll mit profil- und bindungsbezogenem Offset.
+    LongPoll {
+        /// `true`, wenn `transport = "webhook"` konfiguriert ist, aber der
+        /// `[channel.telegram.transport_webhook]`-Block fehlt: dann fällt die
+        /// Bindung sichtbar auf Long-Poll zurück, statt stumm zu bleiben.
+        webhook_fallback: bool,
+    },
+    /// Telegram-Webhook: `setWebhook` beim Start, lokaler Listener,
+    /// `deleteWebhook` beim geordneten Shutdown.
+    Webhook(TelegramWebhookPlan),
+}
+
+/// Vollständig aufgelöste Webhook-Angaben einer Bindung.
+struct TelegramWebhookPlan {
+    /// Öffentliche HTTPS-URL, die Telegram per `setWebhook` erhält.
+    public_url: String,
+    /// Pfad-Anteil von `public_url`; der lokale Listener lauscht auf genau
+    /// diesem Pfad (ein Reverse-Proxy muss ihn unverändert weiterreichen).
+    route: String,
+    /// Lokale Listen-Adresse des Webhook-Servers.
+    listen_addr: SocketAddr,
+    /// Aufgelöstes `secret_token` (`X-Telegram-Bot-Api-Secret-Token`).
+    secret_token: SecretString,
+}
+
+/// Rein aus der Bindungskonfiguration abgeleitete Transportwahl (noch ohne
+/// Geheimnisauflösung), siehe [`telegram_transport_choice`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TelegramTransportChoice {
+    /// Long-Poll; `webhook_fallback` wie in [`TelegramTransportPlan::LongPoll`].
+    LongPoll { webhook_fallback: bool },
+    /// Webhook mit bereits validierter URL, Route und Listen-Adresse.
+    Webhook {
+        public_url: String,
+        route: String,
+        listen_addr: SocketAddr,
+    },
+}
+
+/// Ingress-Entscheidung für genau eine aktivierte Telegram-Bindung.
+struct TelegramBindingIngress {
+    /// Die konfigurierte Bindungs-ID (`ChannelId`, z. B. `telegram:ops`).
+    id: String,
+    mode: TelegramIngressMode,
+}
+
+/// A Telegram binding remains disabled unless construction completed all
+/// trust gates.
 ///
 /// `Enabled` boxes its payload: [`TelegramIngressPlan`] embeds the full
 /// [`harw_config::TelegramChannelToml`] (groups/topics/security/rate-limit/
@@ -506,15 +566,20 @@ pub fn run(
     // Die Gateway-Montagen ersetzen `config_layers` + `discover_config` +
     // `validate` und den früher separat gebauten Provider. Scheitert der
     // Provider-Aufbau, endet `run` mit `Err` — kein Echo-Fallback (G-048).
-    // Telegram und Dream bekommen je eine eigene Montage (G1/G3), damit
-    // Audit und Trace den auslösenden Kanal unterscheiden.
+    // Dream und jede aktivierte Telegram-Bindung bekommen je eine eigene
+    // Montage (G1/G3), damit Audit und Trace den auslösenden Kanal — und bei
+    // Telegram die auslösende Bindung — unterscheiden.
     let assemblies = mount_gateway_assembly(&home, &cwd, &profile.join("sessions"))?;
     // Shared with `audit_chain_scheduler`, which clones this `Arc` into a
     // fresh `spawn_blocking` closure on every tick (see its doc for why it
     // re-opens the configured secret store each tick instead of holding one).
-    let config = Arc::clone(assemblies.telegram.config());
+    let config = Arc::clone(assemblies.dream.config());
     let providers = GatewayProviders {
-        telegram: Arc::clone(assemblies.telegram.model()),
+        telegram: assemblies
+            .telegram
+            .iter()
+            .map(|entry| (entry.binding_id.clone(), Arc::clone(entry.assembly.model())))
+            .collect(),
         dream: Arc::clone(assemblies.dream.model()),
     };
 
@@ -569,29 +634,37 @@ type GatewaySecretResolver = Arc<dyn harw_provider_http::SecretResolver + Send +
 
 /// Die Runtime-Montagen eines Gateway-Starts (Befunde G1/G3).
 ///
-/// Telegram und Dream laufen über **getrennte**
+/// Dream und jede aktivierte Telegram-Bindung laufen über **getrennte**
 /// [`harw_runtime::RuntimeAssembly`]-Instanzen mit eigener
 /// [`harw_runtime::EntryKind`] (`GatewayTelegram`/`GatewayDream`), eigenem
 /// Principal und eigenem Transkript-Mapper, damit Audit und Trace den
-/// auslösenden Kanal unterscheiden können. Beide teilen denselben
-/// Secret-Resolver. Es gibt keinen Config-Schalter, der Dream deaktiviert —
-/// der Dream-Scheduler läuft immer, deshalb wird die Dream-Montage stets
-/// gebaut.
+/// auslösenden Kanal (und bei Telegram die Bindung) unterscheiden können.
+/// Alle teilen denselben Secret-Resolver. Es gibt keinen Config-Schalter, der
+/// Dream deaktiviert — der Dream-Scheduler läuft immer, deshalb wird die
+/// Dream-Montage stets gebaut; ihre Konfiguration speist außerdem
+/// Statusausgabe, Telegram-Ingress und Audit-Kettenprüfung.
 struct GatewayAssemblies {
-    /// Montage für Telegram-Turns; ihre Konfiguration speist außerdem
-    /// Statusausgabe, Telegram-Ingress und Audit-Kettenprüfung.
-    telegram: harw_runtime::RuntimeAssembly,
+    /// Je aktivierter Telegram-Bindung eine Montage (leer, wenn keine
+    /// Bindung aktiviert ist).
+    telegram: Vec<TelegramAssembly>,
     /// Montage für Dream-Läufe; ihr Modell geht an [`dream_scheduler`].
     dream: harw_runtime::RuntimeAssembly,
 }
 
-/// Die Wurzel-Modelle der beiden Gateway-Montagen, gebündelt für
+/// Die Montage einer einzelnen Telegram-Bindung.
+struct TelegramAssembly {
+    /// Konfigurierte Bindungs-ID, aus der der Principal abgeleitet wurde.
+    binding_id: String,
+    assembly: harw_runtime::RuntimeAssembly,
+}
+
+/// Die Wurzel-Modelle der Gateway-Montagen, gebündelt für
 /// [`supervise`] (hält dessen Parameterliste unter der
 /// `clippy::too_many_arguments`-Schwelle, ohne `#[allow]`).
 struct GatewayProviders {
-    /// Modell der Telegram-Montage (`GatewayAssemblies::telegram`); geht an
-    /// die Telegram-Long-Poll-Supervision.
-    telegram: Arc<dyn ModelProvider>,
+    /// Modell je Telegram-Bindung (`GatewayAssemblies::telegram`, Schlüssel =
+    /// Bindungs-ID); geht an die Supervision der jeweiligen Bindung.
+    telegram: HashMap<String, Arc<dyn ModelProvider>>,
     /// Modell der **eigenen** Dream-Montage (`GatewayAssemblies::dream`,
     /// Befunde G1/G3); geht an [`dream_scheduler`].
     dream: Arc<dyn ModelProvider>,
@@ -603,13 +676,16 @@ struct GatewayProviders {
 /// # Description
 /// `gateway_assembly` lädt die maßgebliche Konfiguration erst innerhalb von
 /// `RuntimeAssemblyBuilder::build`, aber der Secret-Resolver muss vorher
-/// stehen (er wird per `Arc::clone` an beide Montagen gereicht). Diese
+/// stehen (er wird per `Arc::clone` an alle Montagen gereicht). Diese
 /// Funktion lädt deshalb vorab dieselbe vertrauensbewusste Konfiguration über
 /// [`harw_runtime::load_config`] — mit der [`harw_runtime::RuntimeSpec`] des
 /// übergebenen `entry` (`entry.entry_kind()`, Befund G4 statt eines hart
-/// codierten `EntryKind::GatewayTelegram`).
+/// codierten `EntryKind::GatewayTelegram`). Die vorab geladene Konfiguration
+/// wird zusätzlich zurückgegeben: [`mount_gateway_assembly`] leitet daraus
+/// ab, für welche aktivierten Telegram-Bindungen es je eine Montage mit
+/// bindungsbezogenem Principal baut.
 ///
-/// **Warum provider-verengt statt eines vollen Scans:** beide
+/// **Warum provider-verengt statt eines vollen Scans:** alle
 /// Gateway-Montagen (`GatewayEntry::Telegram`/`Dream`) lesen dasselbe
 /// `home`/`cwd`, also dieselbe aufgelöste Konfiguration, und beide bauen ihr
 /// Modell über `ModelSource::Configured`, das ausschließlich
@@ -636,6 +712,7 @@ struct GatewayProviders {
 ///   vorläufige Spec).
 ///
 /// # Returns
+/// Ein Paar aus Resolver und vorab geladener Konfiguration. Der Resolver ist
 /// `Some(resolver)`, wenn der tatsächlich genutzte Provider (`default_provider`)
 /// `secrets:` nutzt und der versiegelte Speicher geöffnet werden konnte;
 /// `None` sonst — auch dann, wenn ein *anderer*, von diesem Gateway-Start
@@ -651,7 +728,7 @@ fn open_gateway_secret_resolver(
     home: &Path,
     cwd: &Path,
     principal: &Principal,
-) -> Result<Option<GatewaySecretResolver>, String> {
+) -> Result<(Option<GatewaySecretResolver>, ResolvedConfig), String> {
     let spec = crate::runtime_entry::runtime_spec(entry.entry_kind(), home, cwd, principal.clone());
     let (preliminary_config, _trust_report) =
         harw_runtime::load_config(&spec).map_err(|error| format!("gateway: {error}"))?;
@@ -661,7 +738,7 @@ fn open_gateway_secret_resolver(
     )
     .map_err(|error| format!("gateway: {error}"))?;
     // `doc.read_pdf` (docs/design/doc_read_pdf_design.md §W4): Telegram- und
-    // Dream-Montage teilen sich diesen einen Resolver (siehe
+    // Dream-Montagen teilen sich diesen einen Resolver (siehe
     // `mount_gateway_assembly`), daher genügt eine Installation hier für
     // beide Gateway-Kanäle; nie fatal für den Gateway-Start.
     crate::doc_ocr::install_doc_ocr(
@@ -671,30 +748,38 @@ fn open_gateway_secret_resolver(
             .as_ref()
             .map(|resolver| resolver as &dyn harw_provider_http::SecretResolver),
     );
-    Ok(resolver.map(|resolver| Arc::new(resolver) as GatewaySecretResolver))
+    Ok((
+        resolver.map(|resolver| Arc::new(resolver) as GatewaySecretResolver),
+        preliminary_config,
+    ))
 }
 
 /// Montiert die Gateway-Runtimes (Konfiguration, Vertrauen, Modell) einmalig.
 ///
 /// # Description
 /// Öffnet zuerst über [`open_gateway_secret_resolver`] genau einmal den
-/// Secret-Resolver (Regression B3) und baut dann über [`gateway_assembly`]
-/// zwei [`harw_runtime::RuntimeAssembly`]-Instanzen, die sich diesen
-/// Resolver per `Arc::clone` teilen:
+/// Secret-Resolver (Regression B3) samt vorab geladener Konfiguration und baut
+/// dann über [`gateway_assembly`] die [`harw_runtime::RuntimeAssembly`]-
+/// Instanzen, die sich diesen Resolver per `Arc::clone` teilen:
 ///
-/// - **Telegram:** [`GatewayEntry::Telegram`], Principal
-///   `channel_principal(GatewayEntry::Telegram, "gateway")`,
-///   Transkript-Verlaufsspeicher unter `sessions_root` mit
-///   [`telegram_thread_for_session`].
 /// - **Dream:** [`GatewayEntry::Dream`], Principal
 ///   `channel_principal(GatewayEntry::Dream, "")` (Dream hat keinen externen
 ///   Peer), Transkript-Verlaufsspeicher unter `sessions_root` mit
 ///   [`dream_thread_for_session`] — derselbe Mapper, den
 ///   [`build_dream_state_store`] für die Dream-Läufe nutzt.
+/// - **Telegram, je aktivierter Bindung:** [`GatewayEntry::Telegram`],
+///   Principal `channel_principal(GatewayEntry::Telegram, peer)` mit `peer`
+///   aus [`telegram_principal_peer`] — also `telegram:<bindung>`, abgeleitet
+///   aus der vertrauenswürdig **konfigurierten** Bot-Bindung (nie aus Chat-
+///   oder Modelltext). Die Rechte bleiben unabhängig davon `Observer`/`{}`;
+///   der jeweils handelnde Mensch wird weiterhin pro Ereignis über
+///   `SessionKey`/`SenderRef` an der Admission-Grenze getragen.
+///   Transkript-Verlaufsspeicher unter `sessions_root` mit
+///   [`telegram_thread_for_session`].
 ///
 /// Meldet ein nicht freigegebenes repo-lokales `.harw` einmal per
 /// `tracing::warn!` (Feld `path`); es wurde von der Montage höchstens
-/// verengend übernommen und ist **kein** Fehler. Beide Montagen lesen
+/// verengend übernommen und ist **kein** Fehler. Alle Montagen lesen
 /// denselben `home`/`cwd`, der Vertrauensbefund ist daher identisch.
 ///
 /// # Arguments
@@ -712,32 +797,41 @@ fn mount_gateway_assembly(
     cwd: &Path,
     sessions_root: &Path,
 ) -> Result<GatewayAssemblies, String> {
-    // Daemon-Platzhalter (G6): bis P1.6 gibt es keinen transport-gebundenen
-    // Peer für die Telegram-Montage des Daemons. `"gateway"` ist deshalb eine
-    // feste Platzhalter-Kennung (`telegram:gateway`), kein authentifizierter
-    // Telegram-Peer; die Rechte bleiben unabhängig davon `Observer`/`{}`.
-    let telegram_principal = channel_principal(GatewayEntry::Telegram, "gateway");
-    let secret_resolver =
-        open_gateway_secret_resolver(GatewayEntry::Telegram, home, cwd, &telegram_principal)?;
+    let dream_principal = channel_principal(GatewayEntry::Dream, "");
+    let (secret_resolver, preliminary_config) =
+        open_gateway_secret_resolver(GatewayEntry::Dream, home, cwd, &dream_principal)?;
 
-    let telegram = gateway_assembly(
-        GatewayEntry::Telegram,
-        home,
-        cwd,
-        telegram_principal,
-        crate::runtime_entry::transcript_state_store(sessions_root, telegram_thread_for_session),
-        secret_resolver.as_ref().map(Arc::clone),
-    )?;
     let dream = gateway_assembly(
         GatewayEntry::Dream,
         home,
         cwd,
-        channel_principal(GatewayEntry::Dream, ""),
+        dream_principal,
         crate::runtime_entry::transcript_state_store(sessions_root, dream_thread_for_session),
-        secret_resolver,
+        secret_resolver.as_ref().map(Arc::clone),
     )?;
 
-    let trust_report = telegram.trust_report();
+    let mut telegram = Vec::new();
+    for binding_id in enabled_telegram_binding_ids(&preliminary_config) {
+        let principal =
+            channel_principal(GatewayEntry::Telegram, telegram_principal_peer(&binding_id));
+        let assembly = gateway_assembly(
+            GatewayEntry::Telegram,
+            home,
+            cwd,
+            principal,
+            crate::runtime_entry::transcript_state_store(
+                sessions_root,
+                telegram_thread_for_session,
+            ),
+            secret_resolver.as_ref().map(Arc::clone),
+        )?;
+        telegram.push(TelegramAssembly {
+            binding_id,
+            assembly,
+        });
+    }
+
+    let trust_report = dream.trust_report();
     if trust_report.has_untrusted_repo() {
         let path = trust_report
             .untrusted_repo
@@ -749,6 +843,44 @@ fn mount_gateway_assembly(
         );
     }
     Ok(GatewayAssemblies { telegram, dream })
+}
+
+/// Liefert den Peer-Anteil des Telegram-Principals einer Bindung.
+///
+/// [`channel_principal`] stellt jedem Peer `telegram:` voran; Bindungs-IDs
+/// tragen dieses Präfix per Konvention bereits (`telegram:support-bot`).
+/// Damit der Principal `telegram:support-bot` statt
+/// `telegram:telegram:support-bot` heißt, wird ein führendes `telegram:`
+/// abgeschnitten — außer es bliebe danach nichts übrig; dann gilt die
+/// vollständige ID. Rein und ohne Seiteneffekte.
+fn telegram_principal_peer(binding_id: &str) -> &str {
+    match binding_id.strip_prefix("telegram:") {
+        Some(rest) if !rest.trim().is_empty() => rest,
+        _ => binding_id,
+    }
+}
+
+/// IDs aller aktivierten Telegram-Bindungen, deterministisch sortiert.
+fn enabled_telegram_binding_ids(config: &ResolvedConfig) -> Vec<String> {
+    enabled_telegram_bindings(config)
+        .into_iter()
+        .map(|binding| binding.id.clone())
+        .collect()
+}
+
+/// Alle aktivierten Telegram-Bindungen, nach ID sortiert (die Channel-Map
+/// ist eine `HashMap`; Status und Aufgabenreihenfolge sollen stabil sein).
+fn enabled_telegram_bindings(config: &ResolvedConfig) -> Vec<&TelegramChannelToml> {
+    let mut bindings = config
+        .channels
+        .values()
+        .filter_map(|channel| match channel {
+            ChannelToml::Telegram(binding) if binding.enabled => Some(binding),
+            ChannelToml::Telegram(_) => None,
+        })
+        .collect::<Vec<_>>();
+    bindings.sort_by(|left, right| left.id.cmp(&right.id));
+    bindings
 }
 
 /// Statuszeile des Agenten-Subsystems für die Startausgabe.
@@ -773,9 +905,16 @@ fn gateway_provider_status(config: &ResolvedConfig) -> String {
 ///   `'static`-fähigen Griff auf die Konfiguration statt eines an diesen
 ///   Stack-Frame gebundenen Borrows braucht.
 /// - `providers` ([`GatewayProviders`]): die Wurzel-Modelle der Telegram-
-///   und der **eigenen** Dream-Montage (`RuntimeAssembly::model`, Befunde
-///   G1/G3); `telegram` geht an die Telegram-Long-Poll-Supervision, `dream`
-///   an [`dream_scheduler`].
+///   Montagen (je Bindung) und der **eigenen** Dream-Montage
+///   (`RuntimeAssembly::model`, Befunde G1/G3); `telegram` geht je Bindung an
+///   [`supervise_telegram_binding`], `dream` an [`dream_scheduler`].
+///
+/// # Shutdown
+/// Nach einem Shutdown-Signal wird für jede im Webhook-Modus gestartete
+/// Bindung `deleteWebhook` aufgerufen ([`teardown_telegram_webhooks`],
+/// zeitlich begrenzt), damit Telegram nicht weiter an einen gestoppten
+/// Listener zustellt; ausstehende Updates bleiben dabei bei Telegram
+/// gepuffert und erreichen den nächsten Start.
 /// - `telemetry_sink` (`Arc<dyn TelemetrySink>`): derselbe zusammengesetzte
 ///   Sink, den [`run`] baut; [`audit_chain_scheduler`] meldet
 ///   `audit_chain_break` darüber (siehe dessen Doku für die Routing-
@@ -792,13 +931,13 @@ async fn supervise(
     telemetry_sink: Arc<dyn TelemetrySink>,
     audit_chain_check_interval_secs: u64,
 ) -> Result<(), String> {
-    // Beide Provider stammen aus den Gateway-Montagen in [`run`] und sind dort
+    // Alle Provider stammen aus den Gateway-Montagen in [`run`] und sind dort
     // bereits erfolgreich gebaut worden; einen degradierten Echo-Zustand gibt
     // es nicht mehr (G-048).
     let provider_status = gateway_provider_status(&config);
 
-    let telegram_mode = telegram_ingress_mode(&config);
-    let telegram_status = telegram_ingress_status(&telegram_mode);
+    let telegram_bindings = telegram_ingress_modes(&config);
+    let telegram_status = telegram_ingress_status(&telegram_bindings);
 
     // Persistente Workbench-Scopes zählen. Das sind gespeicherte Arbeitssets,
     // keine fortsetzbaren Gateway-Ausführungen.
@@ -824,13 +963,13 @@ async fn supervise(
         eprintln!("  mcp            : aktiviert in Config (separat via `harw serve`)");
     }
 
-    // Gemeinsame Aktivitätsuhr: Dream liest sie. Telegram starts only after the
-    // transport, identity-pinning, credential, and admitted-event handoff gates
-    // have all succeeded; no legacy polling path is present here.
+    // Gemeinsame Aktivitätsuhr: Dream liest sie. Eine Telegram-Bindung
+    // startet erst, nachdem Transport-, Identity-Pinning-, Credential- und
+    // Admitted-Event-Handoff-Gates für genau diese Bindung bestanden sind.
     let activity: ActivityClock = Arc::new(Mutex::new(Instant::now()));
 
     let GatewayProviders {
-        telegram: telegram_provider,
+        telegram: mut telegram_providers,
         dream: dream_provider,
     } = providers;
     let telegram_profile = dream_transcript_root
@@ -853,21 +992,57 @@ async fn supervise(
         )
         .map_err(|error| format!("gateway: workspace registry: {error}"))?,
     );
-    let channels = async move {
-        match telegram_mode {
+    // Ein einziger `WorkRequestStore` für alle Bindungen: er serialisiert
+    // seine Dateizugriffe nur über einen prozessinternen Mutex, zwei parallel
+    // laufende Instanzen auf demselben Verzeichnis dürften sich also nicht
+    // gegenseitig überschreiben.
+    let work_requests = Arc::new(WorkRequestStore::new(
+        &telegram_profile.join("channel-state").join("work-requests"),
+    ));
+
+    let mut webhook_teardowns = Vec::new();
+    let mut binding_tasks: Vec<TelegramBindingTask> = Vec::new();
+    for binding in telegram_bindings {
+        match binding.mode {
             TelegramIngressMode::Disabled(reason) => {
-                tracing::warn!(reason = %reason, "Telegram ingress remains disabled (fail closed)");
-                std::future::pending::<()>().await
+                tracing::warn!(binding = %binding.id, reason = %reason, "Telegram binding remains disabled (fail closed)");
             }
             TelegramIngressMode::Enabled(plan) => {
-                // Weder ein Start-Fehler (z. B. kein Netz beim Boot) noch ein
-                // späteres Enden des Poll-Threads darf Telegram für den Rest
-                // der Gateway-Laufzeit stillegen (S6/S9) — beides führt hier
-                // zu einem Neustart mit Backoff statt zu einer aufgegebenen
-                // Aufgabe.
-                supervise_telegram_long_poll(*plan, telegram_provider, telegram_profile, workspaces)
-                    .await
+                // Die Montage wurde aus derselben, vorab geladenen
+                // Konfiguration abgeleitet; fehlt sie (Konfiguration hat sich
+                // zwischen beiden Ladevorgängen geändert), bleibt diese
+                // Bindung zu — nie ein Rückgriff auf einen fremden Principal.
+                let Some(provider) = telegram_providers.remove(&binding.id) else {
+                    tracing::error!(binding = %binding.id, "Telegram binding has no mounted runtime assembly; remains disabled (fail closed)");
+                    continue;
+                };
+                if matches!(plan.transport, TelegramTransportPlan::Webhook(_)) {
+                    webhook_teardowns.push(TelegramWebhookTeardown {
+                        binding_id: binding.id.clone(),
+                        bot_token: plan.bot_token.clone(),
+                    });
+                }
+                binding_tasks.push(Box::pin(supervise_telegram_binding(
+                    *plan,
+                    provider,
+                    telegram_profile.clone(),
+                    Arc::clone(&workspaces),
+                    Arc::clone(&work_requests),
+                )));
             }
+        }
+    }
+    let channels = async move {
+        if binding_tasks.is_empty() {
+            tracing::warn!("Telegram ingress remains disabled (fail closed)");
+            std::future::pending::<()>().await;
+        } else {
+            // Weder ein Start-Fehler (z. B. kein Netz beim Boot) noch ein
+            // späteres Enden eines Transports darf eine Bindung für den Rest
+            // der Gateway-Laufzeit stillegen (S6/S9) — jede Bindung startet
+            // mit Backoff neu, unabhängig von den anderen.
+            let never = drive_telegram_bindings(binding_tasks).await;
+            match never {}
         }
     };
 
@@ -898,6 +1073,9 @@ async fn supervise(
             eprintln!("harw gateway — Shutdown-Signal empfangen, beende sauber.");
         }
     }
+    // Der `channels`-Zweig (und damit jeder Webhook-Listener) ist hier
+    // bereits verworfen; erst jetzt den Webhook bei Telegram abmelden.
+    teardown_telegram_webhooks(&webhook_teardowns).await;
     Ok(())
 }
 
@@ -1239,49 +1417,317 @@ fn describe_audit_chain_check(result: &AuditResult<PersistedChainStatus>) -> Aud
     }
 }
 
-fn telegram_ingress_mode(config: &ResolvedConfig) -> TelegramIngressMode {
-    let enabled = config
-        .channels
-        .values()
-        .filter_map(|channel| match channel {
-            ChannelToml::Telegram(binding) if binding.enabled => Some(binding),
-            ChannelToml::Telegram(_) => None,
+/// Bindungs-ID, deren Long-Poll-Offset aus Kompatibilitätsgründen weiter
+/// direkt unter `channel-state/telegram-offset` liegt: die von
+/// `harw connect --channel telegram` angelegte Standardbindung hat dort schon
+/// vor der Mehrfachbindungs-Unterstützung ihren Offset persistiert.
+const TELEGRAM_LEGACY_OFFSET_BINDING: &str = "telegram:default";
+
+/// Update-Arten, die Telegram per Long-Poll bzw. Webhook zustellen soll.
+///
+/// Entspricht bewusst der Vorgabe des Long-Poll-Runners
+/// (`message`/`edited_message`): `callback_query` wird nicht abonniert, weil
+/// die Transport-Abbildung (`map_update`) Button-Taps nicht als
+/// `InboundEvent` weiterreicht und dieser Gateway keine Inline-Buttons
+/// rendert — ein abonnierter, aber nie beantworteter Callback würde beim
+/// Nutzer nur als hängender Ladeindikator enden.
+const TELEGRAM_ALLOWED_UPDATES: [&str; 2] = ["message", "edited_message"];
+
+/// Von Telegram für Webhooks akzeptierte Ports (Bot-API `setWebhook`).
+const TELEGRAM_WEBHOOK_PORTS: [u16; 4] = [443, 80, 88, 8443];
+
+/// Obergrenze für einen einzelnen `deleteWebhook`-Aufruf beim Shutdown: der
+/// Client wiederholt Serverfehler mit Backoff, der Shutdown darf daran aber
+/// nicht beliebig lange hängen.
+const TELEGRAM_WEBHOOK_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Mindestlaufzeit eines gestarteten Transports, ab der er als „stabil"
+/// gilt und den Neustart-Backoff zurücksetzt (siehe
+/// [`telegram_attempt_after_run`]).
+const TELEGRAM_STABLE_RUN: Duration = Duration::from_secs(60);
+
+/// Ermittelt die Ingress-Entscheidung jeder aktivierten Telegram-Bindung.
+///
+/// # Description
+/// Jede aktivierte Bindung wird einzeln gegen alle Gateway-eigenen
+/// Vertrauens-Gates geprüft ([`telegram_binding_mode`]); anschließend
+/// schließt [`disable_conflicting_telegram_bindings`] Bindungen, die sich
+/// einen Bot-Token oder eine Webhook-Listen-Adresse teilen. Eine
+/// fehlgeschlagene Bindung bleibt fail-closed deaktiviert, ohne die übrigen
+/// zu beeinflussen. Die Reihenfolge folgt der sortierten Bindungs-ID.
+///
+/// # Returns
+/// Eine (möglicherweise leere) Liste; leer heißt „keine Bindung aktiviert".
+fn telegram_ingress_modes(config: &ResolvedConfig) -> Vec<TelegramBindingIngress> {
+    let mut bindings = enabled_telegram_bindings(config)
+        .into_iter()
+        .map(|binding| TelegramBindingIngress {
+            id: binding.id.clone(),
+            mode: telegram_binding_mode(binding, config),
         })
         .collect::<Vec<_>>();
-    let [binding] = enabled.as_slice() else {
-        return TelegramIngressMode::Disabled(if enabled.is_empty() {
-            "no enabled Telegram binding is configured".to_owned()
-        } else {
-            "multiple enabled Telegram bindings require an explicit runtime multiplexer".to_owned()
-        });
-    };
-    if binding.transport != "long_poll" {
-        return TelegramIngressMode::Disabled(
-            "webhook transport has no registered gateway lifecycle handoff".to_owned(),
-        );
+    disable_conflicting_telegram_bindings(&mut bindings);
+    bindings
+}
+
+/// Prüft eine einzelne aktivierte Bindung gegen alle Gateway-eigenen Gates.
+///
+/// Reihenfolge: gültige Channel-ID, gültiger Topic-Modus, gepinnte
+/// Identitäten, Transportwahl ([`telegram_transport_choice`]), Bot-
+/// Credential und — nur im Webhook-Modus — das `secret_token`. Meldungen
+/// nennen nie einen Geheimniswert oder den Namen einer Umgebungsvariable.
+fn telegram_binding_mode(binding: &TelegramChannelToml, config: &ResolvedConfig) -> TelegramIngressMode {
+    if ChannelId::try_from(binding.id.clone()).is_err() {
+        return TelegramIngressMode::Disabled("Telegram channel id is invalid".to_owned());
+    }
+    if telegram_topic_mode(&binding.topics.mode).is_none() {
+        return TelegramIngressMode::Disabled("Telegram topic mode is invalid".to_owned());
     }
     if binding.security.pinned_identities.is_empty() {
         return TelegramIngressMode::Disabled(
             "enabled Telegram binding has no pinned identities".to_owned(),
         );
     }
+    let choice = match telegram_transport_choice(binding) {
+        Ok(choice) => choice,
+        Err(reason) => return TelegramIngressMode::Disabled(reason),
+    };
     let Some(token) = resolve_telegram_secret(&binding.bot_token_ref, config) else {
         return TelegramIngressMode::Disabled(
             "Telegram bot credential could not be resolved through a supported secret boundary"
                 .to_owned(),
         );
     };
+    let transport = match choice {
+        TelegramTransportChoice::LongPoll { webhook_fallback } => {
+            TelegramTransportPlan::LongPoll { webhook_fallback }
+        }
+        TelegramTransportChoice::Webhook {
+            public_url,
+            route,
+            listen_addr,
+        } => {
+            let Some(secret_token) = binding
+                .transport_webhook
+                .as_ref()
+                .and_then(|webhook| resolve_telegram_secret(&webhook.secret_token_ref, config))
+            else {
+                return TelegramIngressMode::Disabled(
+                    "Telegram webhook secret could not be resolved through a supported secret boundary"
+                        .to_owned(),
+                );
+            };
+            if !is_valid_telegram_webhook_secret(secret_token.expose_secret()) {
+                return TelegramIngressMode::Disabled(
+                    "Telegram webhook secret must be 1-256 characters from [A-Za-z0-9_-]"
+                        .to_owned(),
+                );
+            }
+            TelegramTransportPlan::Webhook(TelegramWebhookPlan {
+                public_url,
+                route,
+                listen_addr,
+                secret_token,
+            })
+        }
+    };
     TelegramIngressMode::Enabled(Box::new(TelegramIngressPlan {
-        binding: (*binding).clone(),
+        binding: binding.clone(),
         bot_token: token,
+        transport,
     }))
 }
 
-fn telegram_ingress_status(mode: &TelegramIngressMode) -> String {
-    match mode {
-        TelegramIngressMode::Enabled(plan) => {
-            format!("bereit (sicherer Long-Poll-Adapter: {})", plan.binding.id)
+/// Leitet die Transportwahl einer Bindung rein aus ihrer Konfiguration ab.
+///
+/// - `transport = "long_poll"` → Long-Poll.
+/// - `transport = "webhook"` **ohne** `[transport_webhook]`-Block → sichtbarer
+///   Rückfall auf Long-Poll (`webhook_fallback = true`).
+/// - `transport = "webhook"` mit Block → Webhook, sofern `public_url`
+///   ([`telegram_webhook_route`]) und `listen_addr` gültig sind; sonst `Err`
+///   (fail closed — eine fehlerhafte Webhook-Angabe fällt **nicht** still auf
+///   Long-Poll zurück).
+/// - jeder andere Wert → `Err`.
+fn telegram_transport_choice(
+    binding: &TelegramChannelToml,
+) -> Result<TelegramTransportChoice, String> {
+    match binding.transport.as_str() {
+        "long_poll" => Ok(TelegramTransportChoice::LongPoll {
+            webhook_fallback: false,
+        }),
+        "webhook" => {
+            let Some(webhook) = binding.transport_webhook.as_ref() else {
+                return Ok(TelegramTransportChoice::LongPoll {
+                    webhook_fallback: true,
+                });
+            };
+            let route = telegram_webhook_route(&webhook.public_url)?;
+            let listen_addr = webhook
+                .listen_addr
+                .trim()
+                .parse::<SocketAddr>()
+                .map_err(|_| "Telegram webhook listen_addr is not a socket address".to_owned())?;
+            Ok(TelegramTransportChoice::Webhook {
+                public_url: webhook.public_url.trim().to_owned(),
+                route,
+                listen_addr,
+            })
         }
+        _ => Err("unknown Telegram transport (expected long_poll or webhook)".to_owned()),
+    }
+}
+
+/// Validiert eine Webhook-`public_url` und liefert den lokalen Routenpfad.
+///
+/// Telegram verlangt HTTPS und einen der Ports aus
+/// [`TELEGRAM_WEBHOOK_PORTS`]; eingebettete Zugangsdaten werden abgelehnt.
+/// Der Pfad wird zur Route des lokalen Listeners und muss deshalb eine vom
+/// Router sicher akzeptierte Form haben ([`is_supported_webhook_route`]) —
+/// `axum` würde Pfade mit Platzhalter-Syntax sonst beim Aufbau des Routers
+/// mit einem Panic ablehnen.
+fn telegram_webhook_route(public_url: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse(public_url.trim())
+        .map_err(|_| "Telegram webhook public_url is not a valid URL".to_owned())?;
+    if url.scheme() != "https" {
+        return Err("Telegram webhook public_url must use https".to_owned());
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err("Telegram webhook public_url has no host".to_owned());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("Telegram webhook public_url must not embed credentials".to_owned());
+    }
+    if !url
+        .port_or_known_default()
+        .is_some_and(|port| TELEGRAM_WEBHOOK_PORTS.contains(&port))
+    {
+        return Err(
+            "Telegram webhook public_url port is not supported by Telegram (443, 80, 88, 8443)"
+                .to_owned(),
+        );
+    }
+    let route = url.path();
+    if !is_supported_webhook_route(route) {
+        return Err("Telegram webhook public_url path is not a supported route".to_owned());
+    }
+    Ok(route.to_owned())
+}
+
+/// Ob `path` als Webhook-Route taugt: `/` oder `/`-getrennte, nicht leere
+/// Segmente aus `[A-Za-z0-9._~-]` ohne `.`/`..`-Segmente. Schließt damit
+/// insbesondere `axum`-Platzhalter (`{…}`, `:name`, `*rest`) aus.
+fn is_supported_webhook_route(path: &str) -> bool {
+    if path == "/" {
+        return true;
+    }
+    let Some(rest) = path.strip_prefix('/') else {
+        return false;
+    };
+    rest.split('/').all(|segment| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
+    })
+}
+
+/// Telegrams Regel für `secret_token`: 1–256 Zeichen aus `[A-Za-z0-9_-]`.
+/// Vorab geprüft, damit eine ungültige Angabe die Bindung beim Start
+/// schließt, statt `setWebhook` in einer Backoff-Schleife scheitern zu lassen.
+fn is_valid_telegram_webhook_secret(secret: &str) -> bool {
+    (1..=256).contains(&secret.len())
+        && secret
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+/// Übersetzt `[channel.telegram.topics].mode` in den Admission-Modus.
+fn telegram_topic_mode(mode: &str) -> Option<TopicMode> {
+    match mode {
+        "per_topic_session" => Some(TopicMode::PerTopicSession),
+        "shared_session" => Some(TopicMode::SharedSession),
+        _ => None,
+    }
+}
+
+/// Schließt Bindungen, die parallel nicht sicher betrieben werden können.
+///
+/// - **Geteilter Bot-Token:** Telegram erlaubt je Bot genau einen
+///   Update-Konsumenten; zwei Bindungen mit demselben Token würden sich
+///   gegenseitig `getUpdates`/`setWebhook` wegnehmen. Alle beteiligten
+///   Bindungen werden geschlossen (keine willkürliche „erste gewinnt"-Wahl).
+/// - **Geteilte Webhook-Listen-Adresse:** jede Webhook-Bindung bindet ihren
+///   eigenen Listener; eine zweite Bindung auf derselben Adresse könnte nie
+///   starten. Auch hier werden alle Beteiligten geschlossen.
+fn disable_conflicting_telegram_bindings(bindings: &mut [TelegramBindingIngress]) {
+    let mut shared_token = HashSet::new();
+    let mut shared_listener = HashSet::new();
+    for (left_index, left) in bindings.iter().enumerate() {
+        let TelegramIngressMode::Enabled(left_plan) = &left.mode else {
+            continue;
+        };
+        for (right_index, right) in bindings.iter().enumerate().skip(left_index + 1) {
+            let TelegramIngressMode::Enabled(right_plan) = &right.mode else {
+                continue;
+            };
+            if left_plan.bot_token.expose_secret() == right_plan.bot_token.expose_secret() {
+                shared_token.insert(left_index);
+                shared_token.insert(right_index);
+            }
+            if let (TelegramTransportPlan::Webhook(left_hook), TelegramTransportPlan::Webhook(right_hook)) =
+                (&left_plan.transport, &right_plan.transport)
+            {
+                if left_hook.listen_addr == right_hook.listen_addr {
+                    shared_listener.insert(left_index);
+                    shared_listener.insert(right_index);
+                }
+            }
+        }
+    }
+    for (index, binding) in bindings.iter_mut().enumerate() {
+        if shared_token.contains(&index) {
+            binding.mode = TelegramIngressMode::Disabled(
+                "multiple enabled Telegram bindings share one bot credential; Telegram allows a single update consumer per bot"
+                    .to_owned(),
+            );
+        } else if shared_listener.contains(&index) {
+            binding.mode = TelegramIngressMode::Disabled(
+                "Telegram webhook listen_addr is shared with another enabled binding".to_owned(),
+            );
+        }
+    }
+}
+
+/// Startzeile für `channels/tg`: je Bindung `<id>: <status>`, mit `; `
+/// verbunden; ohne aktivierte Bindung eine einzelne Fail-closed-Meldung.
+/// Enthält nie Geheimnisse oder die öffentliche Webhook-URL.
+fn telegram_ingress_status(bindings: &[TelegramBindingIngress]) -> String {
+    if bindings.is_empty() {
+        return "deaktiviert (fail closed: no enabled Telegram binding is configured)".to_owned();
+    }
+    bindings
+        .iter()
+        .map(|binding| format!("{}: {}", binding.id, telegram_binding_status(&binding.mode)))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn telegram_binding_status(mode: &TelegramIngressMode) -> String {
+    match mode {
+        TelegramIngressMode::Enabled(plan) => match &plan.transport {
+            TelegramTransportPlan::LongPoll {
+                webhook_fallback: false,
+            } => "bereit (sicherer Long-Poll-Adapter)".to_owned(),
+            TelegramTransportPlan::LongPoll {
+                webhook_fallback: true,
+            } => "bereit (sicherer Long-Poll-Adapter; transport=webhook ohne [transport_webhook], Rückfall auf Long-Poll)".to_owned(),
+            TelegramTransportPlan::Webhook(webhook) => format!(
+                "bereit (sicherer Webhook-Adapter auf {}{})",
+                webhook.listen_addr, webhook.route
+            ),
+        },
         TelegramIngressMode::Disabled(reason) => format!("deaktiviert (fail closed: {reason})"),
     }
 }
@@ -1323,12 +1769,150 @@ fn telegram_http_client(request_timeout: Duration) -> Result<reqwest::Client, St
         .map_err(|_| "Telegram HTTP client could not be built".to_owned())
 }
 
-async fn start_telegram_long_poll(
+/// Ein laufender Ingress-Transport einer Bindung, wie ihn
+/// [`start_telegram_binding`] übergibt.
+enum RunningTelegramIngress {
+    /// Eigener Long-Poll-Thread; endet mit einem `TransportResult`.
+    LongPoll(std::thread::JoinHandle<TransportResult<()>>),
+    /// Fertig konfigurierter Webhook-Listener; läuft, bis
+    /// [`run_webhook_server`] zurückkehrt oder der Future verworfen wird.
+    Webhook(WebhookConfig),
+}
+
+/// Zugangsdaten, um den Webhook einer Bindung beim Shutdown abzumelden.
+struct TelegramWebhookTeardown {
+    binding_id: String,
+    bot_token: SecretString,
+}
+
+/// Ein nie endender Supervisions-Future je Telegram-Bindung.
+type TelegramBindingTask = Pin<Box<dyn std::future::Future<Output = Infallible>>>;
+
+/// Treibt alle Bindungs-Supervisionen nebenläufig auf der aktuellen Task.
+///
+/// Bewusst ohne `tokio::spawn`: die Supervisions-Futures müssen dadurch
+/// nicht `Send` sein, und sie enden mit dem umgebenden `select!` in
+/// [`supervise`] (Shutdown verwirft sie alle zugleich). Jeder Weckruf pollt
+/// alle Futures; bei einer Handvoll Bindungen ist das vernachlässigbar.
+async fn drive_telegram_bindings(mut tasks: Vec<TelegramBindingTask>) -> Infallible {
+    std::future::poll_fn(move |cx| {
+        for task in &mut tasks {
+            if let Poll::Ready(never) = std::future::Future::poll(task.as_mut(), cx) {
+                return Poll::Ready(never);
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+/// Die Befehle, die dieser Gateway für **jeden** admittierten Peer
+/// tatsächlich verarbeitet (`GatewayTelegramConsumer`,
+/// `harw_channel_telegram_transport::parse_command`). `/pair` fehlt bewusst:
+/// es gehört zum lokalen `harw connect`-Ablauf und wird nie vom Gateway
+/// ausgeführt.
+fn telegram_gateway_commands() -> Vec<BotCommand> {
+    [
+        (
+            "request",
+            "Arbeitsauftrag anfragen: /request <workspace> <rolle> <aufgabe>",
+        ),
+        ("review", "Arbeitsauftrag prüfen: /review <work-id>"),
+        ("approve", "Arbeitsauftrag freigeben: /approve <work-id>"),
+        ("deny", "Arbeitsauftrag ablehnen: /deny <work-id>"),
+        ("cancel", "Arbeitsauftrag abbrechen: /cancel <work-id>"),
+    ]
+    .into_iter()
+    .map(|(command, description)| BotCommand {
+        command: command.to_owned(),
+        description: description.to_owned(),
+    })
+    .collect()
+}
+
+/// Leitet das Befehlsmenü aus `[channel.telegram.commands].menu_source` ab.
+///
+/// - `"policy_visible"` (Vorgabe): genau die Befehle, die jeder admittierte
+///   Peer über diesen Gateway ausführen kann ([`telegram_gateway_commands`]).
+///   Der Client kennt derzeit nur den Standard-Scope von `setMyCommands`;
+///   peer-relative Menüs je Sichtbarkeits-Scope brauchen einen Scope-Parameter
+///   im Transport (siehe Integrationsbedarf im Bericht) — bis dahin ist das
+///   Menü die für alle admittierten Peers gleiche, policy-sichtbare Menge.
+/// - `"none"`: kein Menü veröffentlichen (ein bestehendes bleibt unberührt).
+/// - sonst: `Err` mit einer Meldung ohne Geheimnisinhalt.
+fn telegram_menu_commands(menu_source: &str) -> Result<Option<Vec<BotCommand>>, String> {
+    match menu_source.trim() {
+        "policy_visible" => Ok(Some(telegram_gateway_commands())),
+        "none" => Ok(None),
+        other => Err(format!(
+            "unknown commands.menu_source {other:?} (expected policy_visible or none)"
+        )),
+    }
+}
+
+/// Veröffentlicht das Befehlsmenü einer Bindung (best effort: ein Fehler wird
+/// geloggt, schließt die Bindung aber nicht — das Menü ist reine Anzeige,
+/// die Autorisierung liegt in Admission und Befehlsverarbeitung).
+async fn publish_telegram_command_menu(
+    binding: &TelegramChannelToml,
+    client: &TelegramClient,
+) {
+    match telegram_menu_commands(&binding.commands.menu_source) {
+        Ok(Some(commands)) => {
+            if let Err(error) = client.set_my_commands(&commands).await {
+                tracing::warn!(binding = %binding.id, error = %error, "Telegram command menu could not be published");
+            }
+        }
+        Ok(None) => {
+            tracing::debug!(binding = %binding.id, "Telegram command menu publication disabled by config");
+        }
+        Err(reason) => {
+            tracing::warn!(binding = %binding.id, reason = %reason, "Telegram command menu not published");
+        }
+    }
+}
+
+/// Offset-Verzeichnis des Long-Poll-Runners einer Bindung.
+///
+/// [`TELEGRAM_LEGACY_OFFSET_BINDING`] behält `<state>/telegram-offset`; jede
+/// andere Bindung bekommt ein eigenes Unterverzeichnis, benannt nach der
+/// Hex-Kodierung ihrer ID (kollisionsfrei, dateisystemsicher und ohne `.`,
+/// kann also nie mit `offset.json`/`offset.lock` des Legacy-Pfads
+/// kollidieren). Zwei Bindungen teilen sich damit nie einen Offset.
+fn telegram_offset_root(channel_state: &Path, binding_id: &str) -> PathBuf {
+    let legacy = channel_state.join("telegram-offset");
+    if binding_id == TELEGRAM_LEGACY_OFFSET_BINDING {
+        return legacy;
+    }
+    let encoded = binding_id
+        .bytes()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    legacy.join(encoded)
+}
+
+/// Startet Admission, Runtime-Handoff und Transport einer Bindung.
+///
+/// # Description
+/// Reihenfolge: Bot-Identität (`getMe`), Befehlsmenü
+/// ([`publish_telegram_command_menu`]), Transport-Lebenszyklus — im
+/// Long-Poll-Modus ein `deleteWebhook` (ein nach einem Absturz verwaister
+/// Webhook würde `getUpdates` sonst dauerhaft mit 409 blockieren), im
+/// Webhook-Modus `setWebhook` mit `public_url` und `secret_token` —, erst
+/// danach die Admission-/Throttle-Threads und der Transport selbst. Scheitert
+/// ein Schritt vor den Threads, bleibt nichts halb gestartet zurück.
+///
+/// # Errors
+/// Eine inhaltsfreie Meldung (nie Token oder Secret), wenn ein Schritt
+/// scheitert; [`supervise_telegram_binding`] versucht es dann mit Backoff
+/// erneut.
+async fn start_telegram_binding(
     plan: &TelegramIngressPlan,
     provider: Arc<dyn ModelProvider>,
-    profile: PathBuf,
+    profile: &Path,
     workspaces: Arc<harw_authority::WorkspaceRegistry>,
-) -> Result<std::thread::JoinHandle<harw_channel_telegram_transport::TransportResult<()>>, String> {
+    work_requests: Arc<WorkRequestStore>,
+) -> Result<RunningTelegramIngress, String> {
     let channel_id = ChannelId::try_from(plan.binding.id.clone())
         .map_err(|_| "Telegram channel id is invalid".to_owned())?;
     let mut channel_config = TelegramChannelConfig::new(channel_id.clone());
@@ -1354,18 +1938,43 @@ async fn start_telegram_long_poll(
     // operator's configured ceiling.
     channel_config.max_updates_per_peer_per_min =
         plan.binding.rate_limit.max_updates_per_peer_per_min;
-    channel_config.topic_mode = match plan.binding.topics.mode.as_str() {
-        "per_topic_session" => TopicMode::PerTopicSession,
-        "shared_session" => TopicMode::SharedSession,
-        _ => return Err("Telegram topic mode is invalid".to_owned()),
-    };
+    channel_config.topic_mode = telegram_topic_mode(&plan.binding.topics.mode)
+        .ok_or_else(|| "Telegram topic mode is invalid".to_owned())?;
 
     let bot_http = telegram_http_client(TELEGRAM_CLIENT_REQUEST_TIMEOUT)?;
-    let bot_client = TelegramClient::with_http_client(bot_http, plan.bot_token.expose_secret());
+    let bot_client = Arc::new(TelegramClient::with_http_client(
+        bot_http,
+        plan.bot_token.expose_secret(),
+    ));
     let bot = bot_client
         .get_me()
         .await
         .map_err(|_| "Telegram bot identity lookup failed".to_owned())?;
+    publish_telegram_command_menu(&plan.binding, &bot_client).await;
+    match &plan.transport {
+        TelegramTransportPlan::LongPoll { webhook_fallback } => {
+            if *webhook_fallback {
+                tracing::warn!(binding = %plan.binding.id, "transport = \"webhook\" without [transport_webhook]; falling back to long polling");
+            }
+            if let Err(error) = bot_client.delete_webhook(false).await {
+                tracing::warn!(binding = %plan.binding.id, error = %error, "Telegram webhook could not be cleared before long polling");
+            }
+        }
+        TelegramTransportPlan::Webhook(webhook) => {
+            if !webhook.listen_addr.ip().is_loopback() {
+                tracing::warn!(binding = %plan.binding.id, listen_addr = %webhook.listen_addr, "Telegram webhook listener binds a non-loopback address; exposure is the operator's responsibility");
+            }
+            bot_client
+                .set_webhook(
+                    &webhook.public_url,
+                    Some(webhook.secret_token.expose_secret()),
+                    &TELEGRAM_ALLOWED_UPDATES,
+                    false,
+                )
+                .await
+                .map_err(|_| "Telegram webhook registration failed".to_owned())?;
+        }
+    }
     // Feed the configured per-chat outbound ceiling through instead of the
     // renderer's hardcoded default (§3.5 `max_outbound_per_chat_per_sec`).
     // `RendererConfig::default()` supplies every other field (message-length
@@ -1375,13 +1984,10 @@ async fn start_telegram_long_poll(
         ..RendererConfig::default()
     };
     let renderer: Arc<dyn TelegramOutbound> = Arc::new(TelegramRenderer::with_config(
-        Arc::new(bot_client),
+        Arc::clone(&bot_client),
         renderer_config,
     ));
     let throttle_outbound = Arc::clone(&renderer);
-    let work_requests = Arc::new(WorkRequestStore::new(
-        &profile.join("channel-state").join("work-requests"),
-    ));
     let consumer = Arc::new(GatewayTelegramConsumer {
         provider,
         transcript_root: profile.join("sessions"),
@@ -1440,84 +2046,157 @@ async fn start_telegram_long_poll(
             }
         })
         .map_err(|_| "Telegram admission handoff thread could not start".to_owned())?;
-    let shutdown = LongPollShutdown::default();
-    let offset_store =
-        TelegramOffsetStore::new(profile.join("channel-state").join("telegram-offset"));
-    let poll_http = telegram_http_client(TELEGRAM_LONG_POLL_REQUEST_TIMEOUT)?;
-    let long_poll = LongPollConfig::new(
-        TelegramClient::with_http_client(poll_http, plan.bot_token.expose_secret()),
-        channel_id.as_str(),
-        bot,
-        offset_store,
-        ingress_tx,
-        shutdown,
-    );
-    spawn_long_poll_thread(long_poll)
-        .map_err(|_| "Telegram long-poll thread could not start".to_owned())
+    match &plan.transport {
+        TelegramTransportPlan::LongPoll { .. } => {
+            let offset_store = TelegramOffsetStore::new(telegram_offset_root(
+                &profile.join("channel-state"),
+                &plan.binding.id,
+            ));
+            let poll_http = telegram_http_client(TELEGRAM_LONG_POLL_REQUEST_TIMEOUT)?;
+            let long_poll = LongPollConfig::new(
+                TelegramClient::with_http_client(poll_http, plan.bot_token.expose_secret()),
+                channel_id.as_str(),
+                bot,
+                offset_store,
+                ingress_tx,
+                LongPollShutdown::default(),
+            );
+            spawn_long_poll_thread(long_poll)
+                .map(RunningTelegramIngress::LongPoll)
+                .map_err(|_| "Telegram long-poll thread could not start".to_owned())
+        }
+        TelegramTransportPlan::Webhook(webhook) => {
+            Ok(RunningTelegramIngress::Webhook(WebhookConfig::new(
+                webhook.listen_addr,
+                webhook.route.clone(),
+                webhook.secret_token.expose_secret(),
+                channel_id.as_str(),
+                bot.id,
+                bot.username.clone(),
+                ingress_tx,
+            )))
+        }
+    }
 }
 
-/// Treibt [`start_telegram_long_poll`] mit Neustart-Backoff an.
+/// Supervidiert genau eine Telegram-Bindung mit Neustart-Backoff.
 ///
-/// Zwei Fälle dürfen Telegram nicht dauerhaft stillegen (S6/S9): ein
-/// Start-Fehler (z. B. kein Netz beim Boot, `get_me` schlägt fehl) und ein
-/// späteres Enden des Poll-Threads (voller Sink über zu viele Wiederholungen
-/// hinweg, ein I/O-Fehler im Offset-Store, ein Panic). Beide Fälle führen
-/// hier zu einem erneuten Versuch nach [`telegram_restart_backoff`] statt zu
-/// einem für den Rest der Gateway-Laufzeit aufgegebenen `channels`-Zweig.
-/// Läuft nie sichtbar aus (`!`), genau wie das bisherige
-/// `std::future::pending::<()>().await` — [`supervise`]s `select!` behandelt
-/// diesen Zweig also unverändert als „läuft, bis ein anderer Zweig fertig
-/// wird".
-async fn supervise_telegram_long_poll(
+/// Zwei Fälle dürfen eine Bindung nicht dauerhaft stillegen (S6/S9): ein
+/// Start-Fehler (z. B. kein Netz beim Boot, `getMe`/`setWebhook` schlägt
+/// fehl) und ein späteres Enden des Transports (Long-Poll-Thread endet —
+/// voller Sink über zu viele Wiederholungen, I/O-Fehler im Offset-Store,
+/// Panic — oder der Webhook-Listener kehrt zurück, z. B. weil die
+/// Listen-Adresse belegt ist). Beide Fälle führen zu einem erneuten Versuch
+/// nach [`telegram_restart_backoff`]. Der Backoff wird nur nach einem
+/// **stabilen** Lauf zurückgesetzt ([`telegram_attempt_after_run`]), damit
+/// ein sofort wieder endender Transport (z. B. belegter Port) die Bot-API
+/// nicht im Sekundentakt mit `getMe`/`setWebhook` belastet.
+///
+/// Endet nie (`Infallible`); [`supervise`]s `select!` verwirft den Future
+/// beim Shutdown. Andere Bindungen laufen davon unabhängig weiter.
+async fn supervise_telegram_binding(
     plan: TelegramIngressPlan,
     provider: Arc<dyn ModelProvider>,
     profile: PathBuf,
     workspaces: Arc<harw_authority::WorkspaceRegistry>,
-) -> ! {
+    work_requests: Arc<WorkRequestStore>,
+) -> Infallible {
+    let binding_id = plan.binding.id.clone();
     let mut attempt: u32 = 0;
     loop {
-        match start_telegram_long_poll(
+        let started = Instant::now();
+        match start_telegram_binding(
             &plan,
             Arc::clone(&provider),
-            profile.clone(),
+            &profile,
             Arc::clone(&workspaces),
+            Arc::clone(&work_requests),
         )
         .await
         {
-            Ok(handle) => {
-                // Ein erfolgreicher Start setzt den Backoff zurück: nur
-                // *aufeinanderfolgende* Fehlschläge sollen länger werden.
-                attempt = 0;
+            Ok(RunningTelegramIngress::LongPoll(handle)) => {
                 // Das blockierende `JoinHandle::join()` gehört nicht auf die
                 // Tokio-Event-Loop dieser Task.
                 match tokio::task::spawn_blocking(move || handle.join()).await {
                     Ok(Ok(Ok(()))) => {
-                        tracing::warn!(
-                            "Telegram long-poll runner stopped cleanly; restarting with backoff"
-                        );
+                        tracing::warn!(binding = %binding_id, "Telegram long-poll runner stopped cleanly; restarting with backoff");
                     }
                     Ok(Ok(Err(error))) => {
-                        tracing::error!(error = %error, "Telegram long-poll runner stopped; restarting with backoff");
+                        tracing::error!(binding = %binding_id, error = %error, "Telegram long-poll runner stopped; restarting with backoff");
                     }
                     Ok(Err(_)) => {
-                        tracing::error!(
-                            "Telegram long-poll runner panicked; restarting with backoff"
-                        );
+                        tracing::error!(binding = %binding_id, "Telegram long-poll runner panicked; restarting with backoff");
                     }
                     Err(_) => {
-                        tracing::error!(
-                            "Telegram long-poll supervision task panicked; restarting with backoff"
-                        );
+                        tracing::error!(binding = %binding_id, "Telegram long-poll supervision task panicked; restarting with backoff");
                     }
                 }
             }
+            Ok(RunningTelegramIngress::Webhook(config)) => match run_webhook_server(config).await {
+                Ok(()) => {
+                    tracing::warn!(binding = %binding_id, "Telegram webhook listener stopped; restarting with backoff");
+                }
+                Err(error) => {
+                    tracing::error!(binding = %binding_id, error = %error, "Telegram webhook listener failed; restarting with backoff");
+                }
+            },
             Err(error) => {
-                tracing::error!(error = %error, "Telegram ingress setup failed; retrying with backoff");
+                tracing::error!(binding = %binding_id, error = %error, "Telegram ingress setup failed; retrying with backoff");
             }
         }
+        attempt = telegram_attempt_after_run(attempt, started.elapsed());
         let backoff = telegram_restart_backoff(attempt);
         attempt = attempt.saturating_add(1);
         tokio::time::sleep(backoff).await;
+    }
+}
+
+/// Reine Entscheidungsfunktion: welcher Backoff-Zähler nach einem Lauf gilt.
+///
+/// Ein Lauf von mindestens [`TELEGRAM_STABLE_RUN`] gilt als gesund und setzt
+/// den Zähler auf `0`; ein kürzerer Lauf (Start-Fehler oder sofort endender
+/// Transport) behält ihn, sodass aufeinanderfolgende Fehlschläge länger
+/// warten.
+fn telegram_attempt_after_run(attempt: u32, ran_for: Duration) -> u32 {
+    if ran_for >= TELEGRAM_STABLE_RUN {
+        0
+    } else {
+        attempt
+    }
+}
+
+/// Meldet beim Shutdown den Webhook jeder Webhook-Bindung ab.
+///
+/// `drop_pending_updates = false`: Telegram puffert ausstehende Updates und
+/// liefert sie nach dem nächsten `setWebhook` (oder an einen Long-Poll)
+/// aus. Jeder Aufruf ist durch [`TELEGRAM_WEBHOOK_TEARDOWN_TIMEOUT`]
+/// begrenzt; Fehler werden nur geloggt — der Shutdown läuft weiter.
+async fn teardown_telegram_webhooks(teardowns: &[TelegramWebhookTeardown]) {
+    for teardown in teardowns {
+        let http = match telegram_http_client(TELEGRAM_CLIENT_REQUEST_TIMEOUT) {
+            Ok(http) => http,
+            Err(error) => {
+                tracing::warn!(binding = %teardown.binding_id, error = %error, "Telegram webhook could not be removed on shutdown");
+                continue;
+            }
+        };
+        let client = TelegramClient::with_http_client(http, teardown.bot_token.expose_secret());
+        match tokio::time::timeout(
+            TELEGRAM_WEBHOOK_TEARDOWN_TIMEOUT,
+            client.delete_webhook(false),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                tracing::info!(binding = %teardown.binding_id, "Telegram webhook removed on shutdown");
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(binding = %teardown.binding_id, error = %error, "Telegram webhook could not be removed on shutdown");
+            }
+            Err(_) => {
+                tracing::warn!(binding = %teardown.binding_id, "Telegram webhook removal timed out on shutdown");
+            }
+        }
     }
 }
 
@@ -2339,7 +3018,7 @@ mod tests {
 
     #[test]
     fn telegram_ingress_fails_closed_without_an_enabled_binding() {
-        let mode = telegram_ingress_mode(&ResolvedConfig::default());
+        let mode = telegram_ingress_modes(&ResolvedConfig::default());
 
         let diagnostic = telegram_ingress_status(&mode);
         assert!(diagnostic.contains("fail closed"));
@@ -2366,7 +3045,7 @@ pinned_identities = [123456789]
             ..Default::default()
         };
 
-        let mode = telegram_ingress_mode(&config);
+        let mode = telegram_ingress_modes(&config);
         let diagnostic = telegram_ingress_status(&mode);
 
         assert!(diagnostic.contains("fail closed"));

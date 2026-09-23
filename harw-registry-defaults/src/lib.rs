@@ -91,7 +91,7 @@ pub use profile::{
     assemble_registry_for_sandbox, assemble_registry_for_sandbox_with_definition_access,
     profile_for_role, role_names,
 };
-pub use research_web::{researcher_web_network_scope, researcher_web_policy};
+pub use research_web::{install_web_tools, researcher_web_network_scope, researcher_web_policy};
 
 /// Die Werkzeuge, die ohne Nutzerrückfrage ausgeführt werden dürfen.
 ///

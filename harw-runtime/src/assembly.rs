@@ -70,7 +70,7 @@ use harw_authority::{
 use harw_config::{PermissionsSection, PlanSection, ResolvedConfig};
 use harw_context::ContextCeiling;
 use harw_core::{
-    AgentSession, ChildRegistryFactory, DriftObserver, GuardPolicy, InteractionMode,
+    AgentSession, ChildRegistryFactory, ContextBudget, DriftObserver, GuardPolicy, InteractionMode,
     ManagedAgentSpawner, ModelProvider, OrchestrationObserver, PitfallAdvisor, RoleEffortWeights,
     SessionActivation, SessionManager, SpawnContext, StateStore, ToolProfile,
 };
@@ -137,7 +137,8 @@ use crate::trace::new_root_trace;
 /// Aus [`RootBudget::max_model_rounds`] allein folgt keine Obergrenze für
 /// Werkzeugaufrufe: eine Runde darf mehrere Aufrufe parallel enthalten
 /// (`harw-core/src/turn_loop.rs`, Parallelpfad). Der Faktor ist bewusst
-/// konservativ und dokumentiert; die **Durchsetzung** folgt in Welle W4a.
+/// konservativ und dokumentiert; durchgesetzt wird er im Turn-Loop über
+/// [`TurnLimits::to_core`].
 const TOOL_CALLS_PER_ROUND: u32 = 8;
 
 /// Obergrenze eines einzelnen gerenderten Werkzeugergebnisses in Bytes.
@@ -166,9 +167,8 @@ const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
 /// `harw-core` kennt heute keinen solchen Typ (`grep TurnLimits` über den
 /// Workspace ist leer), deshalb steht er hier. Er ist **reine Ableitung**:
 /// jedes Feld folgt aus dem Budget des Laufs oder aus einer dokumentierten
-/// Konstante dieses Moduls. Die Durchsetzung (Abbruch bei Überschreitung)
-/// gehört in den Turn-Loop und folgt in Welle W4a; bis dahin ist dieser Typ
-/// der eine Ort, an dem die Zahlen stehen, statt fünf verstreuter Literale.
+/// Konstante dieses Moduls. Durchgesetzt werden die Werte im Turn-Loop von
+/// `harw-core` ([`Self::to_core`], als Vorgabe-Grenzen der Wurzelsitzung).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TurnLimits {
     /// Maximale Anzahl Modell-Runden eines Turns.
@@ -184,6 +184,18 @@ pub struct TurnLimits {
 }
 
 impl TurnLimits {
+    /// Die durchsetzbare Form für den Turn-Loop von `harw-core`.
+    #[must_use]
+    pub const fn to_core(&self) -> harw_core::turn_loop::TurnLimits {
+        harw_core::turn_loop::TurnLimits {
+            max_model_rounds: self.max_model_rounds,
+            max_tool_calls: self.max_tool_calls,
+            max_output_tokens_total: self.max_output_tokens_total,
+            wall_time: self.wall_time,
+            tool_result_max_bytes: self.tool_result_max_bytes,
+        }
+    }
+
     /// Leitet die Turn-Grenzwerte aus dem Budget des Laufs ab.
     ///
     /// # Argumente
@@ -1145,6 +1157,9 @@ pub struct RuntimeAssemblyBuilder {
     /// [`Self::build`] mit den Beiträgen der [`AssemblyContributor`]s
     /// zusammengeführt.
     extra_lifecycle_hooks: Vec<Arc<dyn SessionLifecycleHook>>,
+    /// Agenten-übergreifender Live-Bus; ohne expliziten Aufruf legt
+    /// [`Self::build`] einen frischen an.
+    agent_events: Option<harw_core::AgentEventHub>,
 }
 
 impl std::fmt::Debug for RuntimeAssemblyBuilder {
@@ -1263,6 +1278,13 @@ impl RuntimeAssemblyBuilder {
     /// genau diese Kennung als vertrauenswürdige Wurzel registriert
     /// (`ManagedAgentSpawner::with_external_root_parent`), und eine zweite
     /// Registrierung ist dort ausgeschlossen.
+    #[must_use]
+    pub fn agent_events(mut self, hub: harw_core::AgentEventHub) -> Self {
+        self.agent_events = Some(hub);
+        self
+    }
+
+    /// Setzt die Kennung der Wurzelsitzung (siehe unten).
     #[must_use]
     pub fn root_session_id(mut self, id: SessionId) -> Self {
         self.root_session_id = Some(id);
@@ -1392,7 +1414,9 @@ impl RuntimeAssemblyBuilder {
             project_facts,
             global_facts,
             extra_lifecycle_hooks,
+            agent_events,
         } = self;
+        let agent_events = agent_events.unwrap_or_default();
 
         let model_source = model.ok_or_else(|| RuntimeError::Provider {
             detail: "no model source was given to the runtime builder".to_owned(),
@@ -1418,6 +1442,17 @@ impl RuntimeAssemblyBuilder {
         // 1. Konfiguration mit Vertrauensbericht.
         let (config, trust_report) = load_config(&spec)?;
         let config = Arc::new(config);
+        // Netz-Werkzeuge (web.fetch/web.search/…) einmal je Prozess mit der
+        // Egress-Policy aus `[network]`/`[research]` und dem Such-Backend aus
+        // `[web.search]` einrichten — ohne das scheitert jeder Abruf mit
+        // `NotConfigured`. Ein ungültiger Host-Eintrag deaktiviert nur das
+        // Netz (Warnung), nicht die ganze Sitzung.
+        if let Ok(home) = harw_home::home_dir()
+            && let Err(error) =
+                harw_registry_defaults::install_web_tools(&config, &harw_home::cache_dir(&home))
+        {
+            tracing::warn!(%error, "runtime.web_tools_not_configured");
+        }
 
         // 2. Projekterkennung — genau einmal je Lauf.
         let project =
@@ -1909,6 +1944,7 @@ impl RuntimeAssemblyBuilder {
                 sandbox_profile: &sandbox_profile,
                 host_permit_wiring: &host_permit_wiring_for_children,
                 state_store: Arc::clone(&stores.state_store),
+                agent_events: agent_events.clone(),
             },
             session_events,
         )?;
@@ -2129,6 +2165,7 @@ impl RuntimeAssemblyBuilder {
             stores,
             spawner,
             spawner_roles,
+            agent_events,
             lifecycle_hooks,
             tools,
             root_session_id,
@@ -2934,17 +2971,67 @@ impl ContextProvider for MemoryFactsContextProvider {
 /// # Rückgabe
 /// Die Token-Zahl des effektiven Kontextfensters, nie 0 (Vorgabe greift).
 fn resolve_context_window(config: &ResolvedConfig) -> u64 {
-    let Some(model_id) = config.harness.default_model.as_deref() else {
-        return DEFAULT_CONTEXT_WINDOW_TOKENS;
-    };
-    let entry = config.models.get(model_id).or_else(|| {
-        config.models.values().find(|model| {
-            model.id == model_id || model.aliases.iter().any(|alias| alias.as_str() == model_id)
+    match config.harness.default_model.as_deref() {
+        Some(model_id) => context_window_for_model(config, model_id),
+        None => DEFAULT_CONTEXT_WINDOW_TOKENS,
+    }
+}
+
+/// Kontextfenster eines Modells in Tokens.
+///
+/// Rangfolge: `[models.<id>].context_window` (per ID oder Alias) →
+/// eingebauter Modellkatalog (`harw-model-catalog`, verifizierte
+/// Vendor-Angaben) → [`DEFAULT_CONTEXT_WINDOW_TOKENS`].
+#[must_use]
+pub fn context_window_for_model(config: &ResolvedConfig, model_id: &str) -> u64 {
+    static CATALOG: std::sync::OnceLock<HashMap<String, u64>> = std::sync::OnceLock::new();
+    let configured = config
+        .models
+        .get(model_id)
+        .or_else(|| {
+            config.models.values().find(|model| {
+                model.id == model_id || model.aliases.iter().any(|alias| alias.as_str() == model_id)
+            })
         })
+        .and_then(|model| model.context_window);
+    if let Some(window) = configured {
+        return window;
+    }
+    let catalog = CATALOG.get_or_init(|| {
+        harw_model_catalog::descriptor::bootstrap_descriptors()
+            .into_iter()
+            .map(|d| (d.model.as_str().to_owned(), u64::from(d.context_window)))
+            .collect()
     });
-    entry
-        .and_then(|model| model.context_window)
+    // Konfigurierte ID kann auf ein Katalogmodell zeigen (`id` ≠ Schlüssel).
+    let canonical = config
+        .models
+        .get(model_id)
+        .map_or(model_id, |model| model.id.as_str());
+    catalog
+        .get(canonical)
+        .or_else(|| catalog.get(model_id))
+        .copied()
         .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS)
+}
+
+/// Byte-Budget der Request-Montage aus dem Kontextfenster abgeleitet: der
+/// Verlauf darf ~3 Bytes je Token belegen (konservativ, Text ≈ 4 B/Token),
+/// damit Auto-Compaction (70 % des Fensters) greift, **bevor** die harte
+/// Byte-Kappung still Verlauf verwirft. `[context].max_history_bytes`
+/// übersteuert.
+#[must_use]
+pub fn context_budget_for_window(config: &ResolvedConfig, window_tokens: u64) -> ContextBudget {
+    let conservative = ContextBudget::conservative();
+    let derived = usize::try_from(window_tokens.saturating_mul(3)).unwrap_or(usize::MAX);
+    ContextBudget {
+        max_context_bytes: conservative.max_context_bytes,
+        max_history_bytes: config
+            .harness
+            .compaction
+            .max_history_bytes
+            .unwrap_or_else(|| derived.max(conservative.max_history_bytes)),
+    }
 }
 
 /// Bridges controller lifecycle snapshots into the runtime's existing durable
@@ -3069,6 +3156,8 @@ struct SpawnerInputs<'a> {
     host_permit_wiring: &'a Option<HostPermitWiring>,
     /// Shared transcript/state store used by lifecycle observer records.
     state_store: Arc<dyn StateStore>,
+    /// Live-Bus des Laufs; jedes Kind bekommt ihn über den SessionManager.
+    agent_events: harw_core::AgentEventHub,
 }
 
 /// Montiert den Spawner eines Laufs nach seiner [`SpawnerPolicy`].
@@ -3108,6 +3197,7 @@ fn build_spawner(
         sandbox_profile,
         host_permit_wiring,
         state_store,
+        agent_events,
     } = inputs;
 
     let events = session_events.ok_or_else(|| RuntimeError::Spawner {
@@ -3190,9 +3280,24 @@ fn build_spawner(
     );
 
     let model_id = config.harness.default_model.as_deref().unwrap_or_default();
-    let manager = Arc::new(std::sync::Mutex::new(SessionManager::new(events)));
+    let manager = Arc::new(std::sync::Mutex::new(
+        SessionManager::new(events).with_agent_events(agent_events.clone()),
+    ));
+    let window_config = Arc::new(config.clone());
     let mut spawner = ManagedAgentSpawner::new(manager, child_limits(config, model_id))
-        .with_orchestration_observer(Arc::new(StateStoreOrchestrationObserver { state_store }))
+        // Jedes Kind bekommt das Kontextfenster seines tatsächlichen Modells.
+        .with_context_window_resolver(Arc::new(move |model: Option<&str>| {
+            match model.or(window_config.harness.default_model.as_deref()) {
+                Some(model) => context_window_for_model(&window_config, model),
+                None => DEFAULT_CONTEXT_WINDOW_TOKENS,
+            }
+        }))
+        // Orchestrierungs-Events gehen live auf den Bus und danach in den
+        // persistierenden StateStore-Observer.
+        .with_orchestration_observer(Arc::new(harw_core::HubOrchestrationObserver::new(
+            agent_events,
+            Some(Arc::new(StateStoreOrchestrationObserver { state_store })),
+        )))
         // Addendum F+G: Rollen-Reasoning-Gewichtung und Drift-Beobachter
         // gelten für jedes über diesen Spawner admittierte Kind.
         .with_role_effort_weights(Some(crate::guard_wiring::role_effort_weights_from_config(
@@ -3304,6 +3409,8 @@ pub struct RuntimeAssembly {
     stores: RuntimeStores,
     spawner: Option<Arc<ManagedAgentSpawner>>,
     spawner_roles: Vec<String>,
+    /// Agenten-übergreifender Live-Bus (Wurzel + alle Kinder).
+    agent_events: harw_core::AgentEventHub,
     lifecycle_hooks: Vec<Arc<dyn SessionLifecycleHook>>,
     tools: Vec<String>,
     root_session_id: SessionId,
@@ -3392,13 +3499,14 @@ impl RuntimeAssembly {
             memory: None,
             session_controller: None,
             session_events: None,
-            contributors: Vec::new(),
+            contributors: crate::contributors::default_contributors(),
             root_session_id: None,
             secret_resolver: None,
             narrowing: None,
             project_facts: None,
             global_facts: None,
             extra_lifecycle_hooks: Vec::new(),
+            agent_events: None,
         }
     }
 
@@ -3738,6 +3846,14 @@ impl RuntimeAssembly {
         self.spawner.as_ref()
     }
 
+    /// Der agenten-übergreifende Live-Bus dieses Laufs. Beobachter (TUI,
+    /// Web, Telemetrie) abonnieren ihn über
+    /// [`harw_core::AgentEventHub::subscribe`].
+    #[must_use]
+    pub fn agent_events(&self) -> &harw_core::AgentEventHub {
+        &self.agent_events
+    }
+
     /// Die Kennung der Wurzelsitzung.
     ///
     /// # Beschreibung
@@ -3884,6 +4000,20 @@ impl RuntimeAssembly {
                 .with_spawn_context(self.spawn_context.clone())
                 .with_reasoning_effort(reasoning_effort)
                 .with_turn_event_sink(turn_events)
+                .with_agent_events(self.agent_events.clone())
+                .with_context_budget(context_budget_for_window(&self.config, context_window))
+                // Die aus dem Budget abgeleiteten Turn-Grenzen werden jetzt
+                // tatsächlich im Turn-Loop durchgesetzt.
+                .with_default_turn_limits(self.turn_limits.to_core())
+                .with_context_window_resolver({
+                    let config = Arc::clone(&self.config);
+                    Arc::new(move |model: Option<&str>| {
+                        match model.or(config.harness.default_model.as_deref()) {
+                            Some(model) => context_window_for_model(&config, model),
+                            None => DEFAULT_CONTEXT_WINDOW_TOKENS,
+                        }
+                    })
+                })
                 .with_auto_compact(Some(
                     harw_core::AutoCompactPolicy::for_context_window(context_window)
                         .with_absolute_ceiling(Some(
@@ -3936,6 +4066,9 @@ impl RuntimeAssembly {
             context_window = context_window,
             "runtime.root_session.created"
         );
+        // `SessionConfigured` an alle Beobachter (TUI übernimmt das Modell
+        // für den Export).
+        session.announce_configured();
 
         Ok(RootSession {
             session,
@@ -4148,6 +4281,7 @@ mod tests {
     fn two_provider_config() -> ResolvedConfig {
         fn loopback_provider(name: &str) -> harw_config::ProviderToml {
             harw_config::ProviderToml {
+                stream: None,
                 name: name.to_owned(),
                 api: "openai-chat".to_owned(),
                 base_url: "http://127.0.0.1:11434/v1".to_owned(),

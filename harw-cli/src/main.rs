@@ -174,6 +174,22 @@ pub fn log_sensitive_enabled() -> bool {
 ///
 /// Panics if a global subscriber has already been installed (only possible if
 /// this function is called twice, which is a programming error).
+/// Öffnet (und rotiert bei Bedarf) das Datei-Log der TUI.
+fn open_tui_log_file() -> Option<std::fs::File> {
+    const MAX_BYTES: u64 = 10 * 1024 * 1024;
+    let dir = harw_home::logs_dir(&harw_home::home_dir().ok()?);
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("tui.log");
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > MAX_BYTES) {
+        let _ = std::fs::rename(&path, dir.join("tui.log.1"));
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
 fn init_tracing(level: &str, log_sensitive: bool, tui_active: bool) {
     use tracing_subscriber::EnvFilter;
     // Standardmäßig auf `warn` reduzieren, damit die interaktive TUI (Alternate
@@ -194,7 +210,21 @@ fn init_tracing(level: &str, log_sensitive: bool, tui_active: bool) {
     // aber *keine* Ereignisse in das Terminal.
     if tui_active {
         use tracing_subscriber::prelude::*;
-        tracing_subscriber::registry().with(filter).init();
+        // Ins Terminal darf nichts, in eine Datei schon: `<HARW_HOME>/logs/tui.log`
+        // (bei > 10 MiB beim Start nach `tui.log.1` rotiert). Ohne auflösbares
+        // Home bleibt es bei der reinen Registry.
+        match open_tui_log_file() {
+            Some(file) => tracing_subscriber::registry()
+                .with(filter)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_target(true)
+                        .with_writer(std::sync::Mutex::new(file)),
+                )
+                .init(),
+            None => tracing_subscriber::registry().with(filter).init(),
+        }
     } else {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
@@ -1118,6 +1148,7 @@ fn open_serve_secret_resolver(
         resolver_config.providers.insert(
             "__mcp_secret_resolver__".to_owned(),
             ProviderToml {
+                stream: None,
                 name: "__mcp_secret_resolver__".to_owned(),
                 api: "openai-compatible".to_owned(),
                 base_url: "https://invalid.local".to_owned(),
@@ -2853,6 +2884,7 @@ mod tests {
             .map_err(ctx("secret is private"))?;
 
         let provider = ProviderToml {
+            stream: None,
             name: "gateway".to_owned(),
             api: "openai-chat".to_owned(),
             base_url: "https://gateway.example/v1".to_owned(),

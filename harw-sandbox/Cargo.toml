@@ -21,7 +21,7 @@ harw-types = { path = "../harw-types" }
 # featurelos. `process`/`rt` werden hier nicht gebraucht, da `SandboxChild`
 # weiterhin `std::process::Child` (kein `tokio::process::Child`) hält.
 # Version/Feature-Stil wie in harw-tool-shell/Cargo.toml.
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["macros", "time"] }
 
 [dev-dependencies]
 # `#[tokio::test]` für die neuen `wait_or_cancel`-Tests braucht zusätzlich

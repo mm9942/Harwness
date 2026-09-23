@@ -11,6 +11,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 pub mod activation;
+pub mod agent_events;
 pub mod admission;
 pub mod auto_compact;
 pub mod cancel;
@@ -34,12 +35,16 @@ pub mod policy;
 pub mod session;
 pub mod session_manager;
 pub mod state_store;
+pub mod stream;
 #[cfg(test)]
 mod test_support;
 pub mod testing;
 pub mod turn_loop;
 
 pub use activation::{SessionActivation, ToolProfile};
+pub use agent_events::{
+    AgentEvent, AgentEventHub, AgentEventKind, HubOrchestrationObserver, UsageReportingProvider,
+};
 pub use admission::{
     AdmissionContext, JobAdmissionError, JobAdmissionPolicy, JobAdmissionService, JobIntent,
     ResolvedAdmission,
@@ -52,7 +57,7 @@ pub use capture::{ToolOutcome, ToolOutcomeObserver, ToolOutcomeStatus};
 pub use child_controller::{
     AgentBudget, BudgetDimension, ChildLimits, ChildRecord, ChildRegistryFactory, ChildRunResult,
     ExpiredChild, FanoutRequest, JoinSemantics, ManagedAgentSpawner, OrchestrationObserver,
-    ParentGrant, RoleEffortWeights, TaskComplexity,
+    ParentGrant, RoleEffortWeights, TaskComplexity, ContextWindowResolver, DEFAULT_CHILD_CONTEXT_WINDOW,
 };
 pub use compaction::{
     CompactionObserver, CompactionOutcome, CompactionPlan, SUMMARY_MARKER, compact_session,
@@ -86,9 +91,10 @@ pub use pinned_model::PinnedModelProvider;
 pub use policy::ConfigApprovalPolicy;
 pub use session::{
     APPROVAL_TIMEOUT_REASON, AgentSession, DEFAULT_APPROVAL_TIMEOUT, PendingApproval,
-    PendingHandoff, SessionState, SpawnContext, TurnHandle, TurnRejection,
+    LiveEmitter, PendingHandoff, SessionState, SpawnContext, TurnHandle, TurnRejection,
 };
 pub use session_manager::SessionManager;
+pub use stream::{ModelStreamEvent, StreamSink};
 pub use state_store::{
     InMemoryStateStore, SessionThreadMapper, StateStore, TranscriptStateStore, UsageRound,
 };

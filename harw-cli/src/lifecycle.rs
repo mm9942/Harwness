@@ -6,15 +6,24 @@
 //!   in den jeweiligen Descriptor-Modulen.
 //! - `harw service install` legt je eine Dienst-Unit für `harw serve`
 //!   (MCP-Listener + Job-Worker) und `harw gateway` an (G-065). Unter systemd
-//!   werden nur die Unit-Dateien geschrieben; `systemctl` ruft der Nutzer selbst
-//!   auf (Hinweis wird ausgegeben).
+//!   werden die User-Units geschrieben, neu geladen und per
+//!   `systemctl --user enable --now` aktiviert.
+//! - `harw gateway <aktion>` steuert nur den Gateway-Dienst über ein erkanntes
+//!   Backend: systemd-User-Unit (`systemctl --user`), launchd-LaunchAgent
+//!   (`launchctl`, macOS) oder als portabler Rückfall einen losgelösten
+//!   Hintergrundprozess mit PID-Datei `<home>/run/harw-gateway.pid` und Log
+//!   `<home>/logs/harw-gateway.log`. Alle externen Aufrufe werden von reinen
+//!   Funktionen als Argumentvektoren gebaut (testbar ohne Ausführung);
+//!   `HARW_GATEWAY_BACKEND` erzwingt ein Backend.
 //! - [`ShutdownSignals`]: SIGTERM/SIGINT als Auslöser des geordneten Shutdowns
 //!   von `harw serve` (G-022, `crate::serve_until`).
 //!
 //! # Nebenläufigkeit
 //! [`ShutdownSignals::install`] muss innerhalb einer Tokio-Runtime mit
 //! aktiviertem IO-Treiber laufen; die Signal-Registrierung ist prozessweit.
-//! Alle übrigen Funktionen sind synchron und zustandslos.
+//! Alle übrigen Funktionen sind synchron; der Zustand des Gateway-Rückfalls
+//! liegt ausschließlich in dessen PID-Datei (gleichzeitige Start-/Stopp-Aufrufe
+//! werden nicht gegeneinander gesperrt).
 //!
 //! # Fehler
 //! Fehler werden als `String` an `main::dispatch` gereicht (Exit-Code 2).
@@ -257,58 +266,785 @@ pub fn service(home_override: Option<PathBuf>, action: ServiceAction) -> Result<
     Ok(())
 }
 
-/// Verwaltet ausschließlich die `harw-gateway.service` des aktiven Profils.
+/// Umgebungsvariable, die das Gateway-Dienst-Backend explizit festlegt
+/// (`systemd`, `launchd` oder `detached`); ohne sie wird automatisch erkannt.
+pub(crate) const GATEWAY_BACKEND_ENV: &str = "HARW_GATEWAY_BACKEND";
+
+/// Wartezeit nach dem Start eines Hintergrundprozesses, bevor geprüft wird, ob
+/// er sich sofort wieder beendet hat (z. B. wegen Konfigurationsfehlern).
+const DETACHED_STARTUP_PROBE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Frist für ein geordnetes Beenden (SIGTERM/`taskkill`), bevor hart beendet wird.
+const DETACHED_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Frist nach dem harten Beenden, bis der Prozess verschwunden sein muss.
+const DETACHED_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Abfrageintervall beim Warten auf das Prozessende.
+const DETACHED_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Dienstverwaltung, über die `harw gateway <aktion>` den Gateway steuert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayBackend {
+    /// systemd-User-Unit (`systemctl --user`, Linux).
+    SystemdUser,
+    /// launchd-LaunchAgent (`launchctl`, macOS).
+    Launchd,
+    /// Portabler Rückfall: losgelöster Hintergrundprozess mit PID-Datei unter
+    /// dem HARW-Home, gesteuert über die PID.
+    Detached,
+}
+
+impl std::fmt::Display for GatewayBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::SystemdUser => "systemd (User-Unit)",
+            Self::Launchd => "launchd (LaunchAgent)",
+            Self::Detached => "Hintergrundprozess (PID-Datei)",
+        })
+    }
+}
+
+/// Backend-unabhängige Gateway-Operation.
 ///
+/// Entkoppelt die Befehlsbauer von der CLI-Grammatik ([`GatewayAction`]). Der
+/// Status ist keine Operation, sondern [`gateway_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayOp {
+    Install,
+    Start,
+    Stop,
+    Restart,
+    Enable,
+    Disable,
+}
+
+impl GatewayOp {
+    /// Bildet die CLI-Aktion auf die Operation ab.
+    fn from_action(action: &GatewayAction) -> Self {
+        match action {
+            GatewayAction::Install => Self::Install,
+            GatewayAction::Start => Self::Start,
+            GatewayAction::Stop => Self::Stop,
+            GatewayAction::Restart => Self::Restart,
+            GatewayAction::Enable => Self::Enable,
+            GatewayAction::Disable => Self::Disable,
+        }
+    }
+}
+
+/// Beobachteter Laufzustand des Gateway-Dienstes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayRunState {
+    /// Läuft; die PID ist bekannt, sofern das Backend sie liefert.
+    Running(Option<u32>),
+    /// Eingerichtet bzw. bekannt, aber nicht aktiv.
+    Stopped,
+    /// Keine Unit/kein LaunchAgent vorhanden.
+    NotInstalled,
+}
+
+impl std::fmt::Display for GatewayRunState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Running(Some(pid)) => write!(f, "läuft (PID {pid})"),
+            Self::Running(None) => f.write_str("läuft"),
+            Self::Stopped => f.write_str("gestoppt"),
+            Self::NotInstalled => f.write_str("nicht installiert"),
+        }
+    }
+}
+
+/// Prozessfamilie für die PID-Befehle des Rückfall-Backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcFamily {
+    /// `kill` (Linux, macOS, BSD).
+    Unix,
+    /// `tasklist`/`taskkill`.
+    Windows,
+}
+
+impl ProcFamily {
+    /// Familie des laufenden Systems.
+    fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Unix
+        }
+    }
+}
+
+/// Steuert den Gateway-Dienst `harw-gateway` des aktiven Profils.
+///
+/// # Description
 /// Die Kurzform unter `harw gateway` ist für den täglichen Betrieb gedacht;
-/// `harw service` bleibt die Verwaltung beider Hintergrunddienste.
+/// `harw service` bleibt die Verwaltung beider Hintergrunddienste. Das Backend
+/// wählt [`select_gateway_backend`]: systemd-User-Units (`systemctl --user`),
+/// launchd-LaunchAgents (`launchctl`) oder als portabler Rückfall ein
+/// losgelöster Hintergrundprozess mit PID-Datei unter `<home>/run`. Nach jeder
+/// erfolgreichen Aktion wird der beobachtete Zustand ausgegeben.
+///
+/// # Errors
+/// Home-/Executable-Auflösung, ungültiges [`GATEWAY_BACKEND_ENV`], fehlschlagende
+/// Dienstmanager-Befehle (mit deren Diagnose) sowie `enable`/`disable` im
+/// Rückfall-Backend, das keinen Autostart kennt.
 pub fn gateway_service(
     home_override: Option<PathBuf>,
     action: GatewayAction,
 ) -> Result<(), String> {
     let home = resolve_home(home_override)?;
-    let platform = Platform::detect();
-    if detect_service_manager(&platform).kind() != ServiceKind::Systemd {
-        return Err(
-            "Gateway-Service-Steuerung wird auf dieser Plattform noch nicht unterstützt".to_owned(),
-        );
-    }
+    let backend = detect_gateway_backend()?;
     let [_serve, gateway] = service_specs(
         &std::env::current_exe().map_err(|error| error.to_string())?,
         &home,
     );
-    match action {
-        GatewayAction::Install => {
-            let manager = harw_install::service_systemd::SystemdServiceManager::new();
-            let unit_dir = systemd_user_unit_dir(
-                std::env::var_os("XDG_CONFIG_HOME"),
-                std::env::var_os("HOME"),
-            )?;
-            write_systemd_units(&unit_dir, &manager, std::slice::from_ref(&gateway))?;
-            systemctl_gateway(&["daemon-reload"])?;
-            systemctl_gateway(&["enable", "--now", "harw-gateway.service"])?;
-        }
-        GatewayAction::Start => systemctl_gateway(&["start", "harw-gateway.service"])?,
-        GatewayAction::Stop => systemctl_gateway(&["stop", "harw-gateway.service"])?,
-        GatewayAction::Restart => systemctl_gateway(&["restart", "harw-gateway.service"])?,
-        GatewayAction::Enable => systemctl_gateway(&["enable", "harw-gateway.service"])?,
-        GatewayAction::Disable => systemctl_gateway(&["disable", "harw-gateway.service"])?,
+    let op = GatewayOp::from_action(&action);
+    tracing::info!(backend = ?backend, op = ?op, "gateway.service.action");
+    match backend {
+        GatewayBackend::SystemdUser => systemd_gateway(op, &gateway)?,
+        GatewayBackend::Launchd => launchd_gateway(op, &gateway)?,
+        GatewayBackend::Detached => detached_gateway(op, &gateway, &home)?,
+    }
+    match gateway_state(backend, &gateway, &home) {
+        Ok(state) => println!("Gateway-Dienst [{backend}]: {state}"),
+        Err(error) => tracing::warn!(error = %error, "gateway.service.status_unavailable"),
     }
     Ok(())
 }
 
-/// Führt einen systemd-User-Befehl aus und gibt dessen Diagnose vollständig weiter.
-fn systemctl_gateway(args: &[&str]) -> Result<(), String> {
-    let output = std::process::Command::new("systemctl")
-        .arg("--user")
+/// Erkennt das Gateway-Backend für das laufende System.
+fn detect_gateway_backend() -> Result<GatewayBackend, String> {
+    let platform = Platform::detect();
+    let kind = detect_service_manager(&platform).kind();
+    // Entspricht `sd_booted()`: nur mit laufendem systemd existiert dieses Verzeichnis.
+    let systemd_booted = Path::new("/run/systemd/system").is_dir();
+    let override_value = std::env::var(GATEWAY_BACKEND_ENV).ok();
+    select_gateway_backend(kind, systemd_booted, override_value.as_deref())
+}
+
+/// Wählt das Gateway-Backend rein aus den beobachteten Fakten.
+///
+/// # Description
+/// Ein nicht leerer `override_value` ([`GATEWAY_BACKEND_ENV`]) gewinnt. Sonst:
+/// systemd nur, wenn der Plattform-Manager systemd ist **und** systemd
+/// tatsächlich läuft (Container/WSL ohne systemd fallen zurück); launchd auf
+/// macOS; alles andere (Windows, unbekannte Systeme) nutzt den portablen
+/// Hintergrundprozess.
+///
+/// # Errors
+/// Bei einem unbekannten Override-Wert.
+fn select_gateway_backend(
+    kind: ServiceKind,
+    systemd_booted: bool,
+    override_value: Option<&str>,
+) -> Result<GatewayBackend, String> {
+    if let Some(raw) = override_value.map(str::trim).filter(|raw| !raw.is_empty()) {
+        return match raw.to_ascii_lowercase().as_str() {
+            "systemd" => Ok(GatewayBackend::SystemdUser),
+            "launchd" => Ok(GatewayBackend::Launchd),
+            "detached" | "pid" => Ok(GatewayBackend::Detached),
+            other => Err(format!(
+                "{GATEWAY_BACKEND_ENV}={other} unbekannt (erlaubt: systemd, launchd, detached)"
+            )),
+        };
+    }
+    Ok(match kind {
+        ServiceKind::Systemd if systemd_booted => GatewayBackend::SystemdUser,
+        ServiceKind::Launchd => GatewayBackend::Launchd,
+        ServiceKind::Systemd | ServiceKind::Schtasks | ServiceKind::Unsupported => {
+            GatewayBackend::Detached
+        }
+    })
+}
+
+/// Fragt den Laufzustand über das gewählte Backend ab.
+fn gateway_state(
+    backend: GatewayBackend,
+    spec: &ServiceSpec,
+    home: &Path,
+) -> Result<GatewayRunState, String> {
+    match backend {
+        GatewayBackend::SystemdUser => {
+            let unit_dir = systemd_user_unit_dir(
+                std::env::var_os("XDG_CONFIG_HOME"),
+                std::env::var_os("HOME"),
+            )?;
+            if !unit_dir.join(format!("{}.service", spec.name)).is_file() {
+                return Ok(GatewayRunState::NotInstalled);
+            }
+            // `is-active` endet bei inaktiven Units mit Status != 0; maßgeblich
+            // ist die ausgegebene Zustandszeile.
+            let output = run_command(&systemd_status_command(&spec.name))?;
+            Ok(systemd_active_state(&String::from_utf8_lossy(
+                &output.stdout,
+            )))
+        }
+        GatewayBackend::Launchd => {
+            let plist = launch_agent_plist_path(std::env::var_os("HOME"), &spec.name)?;
+            let output = run_command(&launchd_status_command(&spec.name))?;
+            if output.status.success() {
+                Ok(
+                    match launchctl_list_pid(&String::from_utf8_lossy(&output.stdout)) {
+                        Some(pid) => GatewayRunState::Running(Some(pid)),
+                        None => GatewayRunState::Stopped,
+                    },
+                )
+            } else if plist.is_file() {
+                Ok(GatewayRunState::Stopped)
+            } else {
+                Ok(GatewayRunState::NotInstalled)
+            }
+        }
+        GatewayBackend::Detached => Ok(match detached_running_pid(&gateway_pid_path(home))? {
+            Some(pid) => GatewayRunState::Running(Some(pid)),
+            None => GatewayRunState::Stopped,
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// systemd
+// ---------------------------------------------------------------------------
+
+/// Führt eine Gateway-Operation über `systemctl --user` aus (bisheriges Verhalten).
+fn systemd_gateway(op: GatewayOp, spec: &ServiceSpec) -> Result<(), String> {
+    if op == GatewayOp::Install {
+        let manager = harw_install::service_systemd::SystemdServiceManager::new();
+        let unit_dir = systemd_user_unit_dir(
+            std::env::var_os("XDG_CONFIG_HOME"),
+            std::env::var_os("HOME"),
+        )?;
+        write_systemd_units(&unit_dir, &manager, std::slice::from_ref(spec))?;
+    }
+    for argv in systemd_gateway_commands(op, &spec.name) {
+        run_checked(&argv)?;
+    }
+    Ok(())
+}
+
+/// Baut die `systemctl --user`-Aufrufe einer Operation (rein, ohne I/O).
+///
+/// # Returns
+/// Die Argumentvektoren in Ausführungsreihenfolge (`argv[0]` = Programm).
+/// `Install` setzt voraus, dass die Unit-Datei bereits geschrieben ist.
+fn systemd_gateway_commands(op: GatewayOp, name: &str) -> Vec<Vec<String>> {
+    let unit = format!("{name}.service");
+    let systemctl = |args: &[&str]| -> Vec<String> {
+        ["systemctl", "--user"]
+            .iter()
+            .chain(args)
+            .map(|arg| (*arg).to_owned())
+            .collect()
+    };
+    match op {
+        GatewayOp::Install => vec![
+            systemctl(&["daemon-reload"]),
+            systemctl(&["enable", "--now", &unit]),
+        ],
+        GatewayOp::Start => vec![systemctl(&["start", &unit])],
+        GatewayOp::Stop => vec![systemctl(&["stop", &unit])],
+        GatewayOp::Restart => vec![systemctl(&["restart", &unit])],
+        GatewayOp::Enable => vec![systemctl(&["enable", &unit])],
+        GatewayOp::Disable => vec![systemctl(&["disable", &unit])],
+    }
+}
+
+/// Argumentvektor der Statusabfrage `systemctl --user is-active <name>.service` (rein).
+fn systemd_status_command(name: &str) -> Vec<String> {
+    vec![
+        "systemctl".to_owned(),
+        "--user".to_owned(),
+        "is-active".to_owned(),
+        format!("{name}.service"),
+    ]
+}
+
+/// Deutet die Ausgabe von `systemctl --user is-active` (rein).
+fn systemd_active_state(stdout: &str) -> GatewayRunState {
+    match stdout.lines().next().map(str::trim) {
+        Some("active" | "activating" | "reloading" | "refreshing") => {
+            GatewayRunState::Running(None)
+        }
+        _ => GatewayRunState::Stopped,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// launchd
+// ---------------------------------------------------------------------------
+
+/// Führt eine Gateway-Operation über `launchctl` im GUI-Domain des Nutzers aus.
+///
+/// `install` schreibt `~/Library/LaunchAgents/<name>.plist` (gerendert von
+/// [`harw_install::service_launchd::LaunchdServiceManager`], `RunAtLoad` +
+/// `KeepAlive`) und lädt den Agent (bei bereits geladenem Agent neu).
+fn launchd_gateway(op: GatewayOp, spec: &ServiceSpec) -> Result<(), String> {
+    let plist = launch_agent_plist_path(std::env::var_os("HOME"), &spec.name)?;
+    if op == GatewayOp::Install {
+        write_launch_agent(&plist, spec)?;
+    }
+    let uid_output = run_checked(&["id".to_owned(), "-u".to_owned()])?;
+    let domain = launchd_domain(parse_uid(&String::from_utf8_lossy(&uid_output.stdout))?);
+    let loaded = run_command(&launchd_status_command(&spec.name))?
+        .status
+        .success();
+    for argv in launchd_gateway_commands(op, &domain, &spec.name, &plist, loaded) {
+        run_checked(&argv)?;
+    }
+    Ok(())
+}
+
+/// Schreibt das LaunchAgent-Plist des Gateways (Verzeichnis wird angelegt).
+fn write_launch_agent(plist: &Path, spec: &ServiceSpec) -> Result<(), String> {
+    if let Some(parent) = plist.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "LaunchAgents-Verzeichnis {} nicht anlegbar: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let manager = harw_install::service_launchd::LaunchdServiceManager::new();
+    std::fs::write(plist, manager.render_unit(spec))
+        .map_err(|error| format!("Plist {} nicht schreibbar: {error}", plist.display()))?;
+    tracing::info!(plist = %plist.display(), "service.launch_agent.written");
+    Ok(())
+}
+
+/// Pfad des LaunchAgent-Plist `$HOME/Library/LaunchAgents/<label>.plist`
+/// (Umgebung wird übergeben, damit Tests kein `set_var` brauchen).
+///
+/// # Errors
+/// Wenn `HOME` fehlt, leer oder relativ ist.
+fn launch_agent_plist_path(home: Option<OsString>, label: &str) -> Result<PathBuf, String> {
+    match home.map(PathBuf::from) {
+        Some(home) if home.is_absolute() => Ok(home
+            .join("Library")
+            .join("LaunchAgents")
+            .join(format!("{label}.plist"))),
+        _ => Err("LaunchAgent-Pfad nicht bestimmbar: HOME fehlt oder ist relativ".to_owned()),
+    }
+}
+
+/// launchd-Domain des angemeldeten Nutzers (`gui/<uid>`).
+fn launchd_domain(uid: u32) -> String {
+    format!("gui/{uid}")
+}
+
+/// Liest die numerische UID aus der Ausgabe von `id -u` (rein).
+fn parse_uid(stdout: &str) -> Result<u32, String> {
+    stdout.trim().parse().map_err(|error| {
+        format!(
+            "UID aus `id -u` nicht lesbar ({:?}): {error}",
+            stdout.trim()
+        )
+    })
+}
+
+/// Baut die `launchctl`-Aufrufe einer Operation (rein, ohne I/O).
+///
+/// # Description
+/// Nutzt die Domain-Befehle (`bootstrap`/`bootout`/`kickstart`/`enable`/
+/// `disable`) mit Ziel `<domain>/<label>`. Weil das Plist `KeepAlive` setzt,
+/// stoppt nur `bootout` den Dienst dauerhaft (ein `kill` würde launchd neu
+/// starten lassen); `start` lädt den Agent per `bootstrap` bzw. stößt einen
+/// geladenen per `kickstart` an. `enable`/`disable` ändern wie bei systemd nur
+/// den Autostart, nicht den Laufzustand.
+///
+/// # Arguments
+/// - `loaded`: ob der Agent aktuell in launchd geladen ist.
+fn launchd_gateway_commands(
+    op: GatewayOp,
+    domain: &str,
+    label: &str,
+    plist: &Path,
+    loaded: bool,
+) -> Vec<Vec<String>> {
+    let target = format!("{domain}/{label}");
+    let plist = plist.display().to_string();
+    let launchctl = |args: &[&str]| -> Vec<String> {
+        std::iter::once("launchctl")
+            .chain(args.iter().copied())
+            .map(str::to_owned)
+            .collect()
+    };
+    let bootstrap = launchctl(&["bootstrap", domain, &plist]);
+    match op {
+        GatewayOp::Install if loaded => vec![
+            launchctl(&["enable", &target]),
+            launchctl(&["bootout", &target]),
+            bootstrap,
+        ],
+        GatewayOp::Install => vec![launchctl(&["enable", &target]), bootstrap],
+        GatewayOp::Start if loaded => vec![launchctl(&["kickstart", &target])],
+        GatewayOp::Start => vec![bootstrap],
+        GatewayOp::Stop if loaded => vec![launchctl(&["bootout", &target])],
+        GatewayOp::Stop => Vec::new(),
+        GatewayOp::Restart if loaded => vec![launchctl(&["kickstart", "-k", &target])],
+        GatewayOp::Restart => vec![bootstrap],
+        GatewayOp::Enable => vec![launchctl(&["enable", &target])],
+        GatewayOp::Disable => vec![launchctl(&["disable", &target])],
+    }
+}
+
+/// Argumentvektor der Status-/Ladeabfrage `launchctl list <label>` (rein);
+/// Exit-Status 0 heißt „geladen".
+fn launchd_status_command(label: &str) -> Vec<String> {
+    vec!["launchctl".to_owned(), "list".to_owned(), label.to_owned()]
+}
+
+/// Liest die PID aus der Ausgabe von `launchctl list <label>` (rein).
+///
+/// Erwartet eine Zeile der Form `"PID" = 123;`; fehlt sie, ist der Agent
+/// geladen, aber nicht laufend.
+fn launchctl_list_pid(stdout: &str) -> Option<u32> {
+    stdout.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("\"PID\"")?.trim_start();
+        let rest = rest.strip_prefix('=')?.trim();
+        rest.trim_end_matches(';').trim().parse().ok()
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Portabler Rückfall: Hintergrundprozess mit PID-Datei
+// ---------------------------------------------------------------------------
+
+/// PID-Datei des losgelösten Gateways: `<home>/run/harw-gateway.pid`.
+fn gateway_pid_path(home: &Path) -> PathBuf {
+    home.join("run").join(format!("{GATEWAY_SERVICE_NAME}.pid"))
+}
+
+/// Log des losgelösten Gateways (stdout+stderr): `<home>/logs/harw-gateway.log`.
+fn gateway_log_path(home: &Path) -> PathBuf {
+    harw_home::paths::logs_dir(home).join(format!("{GATEWAY_SERVICE_NAME}.log"))
+}
+
+/// Führt eine Gateway-Operation über den PID-basierten Rückfall aus.
+fn detached_gateway(op: GatewayOp, spec: &ServiceSpec, home: &Path) -> Result<(), String> {
+    let pid_path = gateway_pid_path(home);
+    let log_path = gateway_log_path(home);
+    match op {
+        GatewayOp::Install => {
+            detached_start(spec, &pid_path, &log_path)?;
+            println!(
+                "Hinweis: kein nutzbarer Dienstmanager (systemd/launchd) erkannt — der Gateway \
+                 läuft als Hintergrundprozess ohne Autostart beim Login und ohne automatischen \
+                 Neustart nach Absturz."
+            );
+            Ok(())
+        }
+        GatewayOp::Start => detached_start(spec, &pid_path, &log_path),
+        GatewayOp::Stop => detached_stop(&pid_path),
+        GatewayOp::Restart => {
+            detached_stop(&pid_path)?;
+            detached_start(spec, &pid_path, &log_path)
+        }
+        GatewayOp::Enable | GatewayOp::Disable => Err(format!(
+            "Autostart nicht verfügbar: kein Dienstmanager (systemd/launchd) erkannt; der \
+             Gateway läuft nur als Hintergrundprozess ({GATEWAY_BACKEND_ENV}=systemd|launchd \
+             erzwingt ein Backend)."
+        )),
+    }
+}
+
+/// Startet den Gateway losgelöst und schreibt die PID-Datei.
+///
+/// Läuft bereits ein Gateway laut PID-Datei, passiert nichts. Beendet sich der
+/// neue Prozess innerhalb von [`DETACHED_STARTUP_PROBE`], wird das als Fehler
+/// mit Verweis auf das Log gemeldet und die PID-Datei entfernt.
+#[allow(
+    clippy::zombie_processes,
+    reason = "der Gateway soll den CLI-Prozess überleben; nach dem Ende von `harw` übernimmt init das Einsammeln"
+)]
+fn detached_start(spec: &ServiceSpec, pid_path: &Path, log_path: &Path) -> Result<(), String> {
+    if let Some(pid) = detached_running_pid(pid_path)? {
+        println!("Gateway läuft bereits (PID {pid}).");
+        return Ok(());
+    }
+    let mut child = spawn_detached(spec, log_path)?;
+    let pid = child.id();
+    if let Err(error) = write_pid_file(pid_path, pid) {
+        if let Err(kill_error) = child.kill() {
+            tracing::warn!(error = %kill_error, pid, "gateway.detached.kill_after_pidfile_failure");
+        }
+        return Err(error);
+    }
+    std::thread::sleep(DETACHED_STARTUP_PROBE);
+    match child.try_wait() {
+        Ok(None) => {
+            tracing::info!(pid, pid_file = %pid_path.display(), "gateway.detached.started");
+            println!("Gateway gestartet (PID {pid}); Log: {}", log_path.display());
+            Ok(())
+        }
+        Ok(Some(status)) => {
+            remove_pid_file(pid_path)?;
+            Err(format!(
+                "Gateway beendete sich direkt nach dem Start ({status}); Log: {}",
+                log_path.display()
+            ))
+        }
+        Err(error) => Err(format!(
+            "Zustand des Gateway-Prozesses {pid} unbekannt: {error}"
+        )),
+    }
+}
+
+/// Startet `spec.exec` losgelöst: eigene Prozessgruppe (Unix) bzw. ohne
+/// Konsole (Windows), stdin leer, stdout/stderr an `log_path` angehängt.
+fn spawn_detached(spec: &ServiceSpec, log_path: &Path) -> Result<std::process::Child, String> {
+    let (program, args) = spec
+        .exec
+        .split_first()
+        .ok_or_else(|| format!("Dienst {} ohne Programm", spec.name))?;
+    if let Some(dir) = log_path.parent() {
+        std::fs::create_dir_all(dir).map_err(|error| {
+            format!("Log-Verzeichnis {} nicht anlegbar: {error}", dir.display())
+        })?;
+    }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .map_err(|error| format!("Log {} nicht öffenbar: {error}", log_path.display()))?;
+    let log_err = log
+        .try_clone()
+        .map_err(|error| format!("Log {} nicht duplizierbar: {error}", log_path.display()))?;
+    let mut command = std::process::Command::new(program);
+    command
         .args(args)
-        .output()
-        .map_err(|error| format!("systemctl --user nicht ausführbar: {error}"))?;
-    if output.status.success() {
+        .current_dir(&spec.working_dir)
+        .envs(spec.env.iter().map(|(key, value)| (key, value)))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(log_err));
+    detach_command(&mut command);
+    command
+        .spawn()
+        .map_err(|error| format!("Gateway-Prozess {program} nicht startbar: {error}"))
+}
+
+/// Löst den Kindprozess von Terminal und Prozessgruppe des Aufrufers, damit
+/// Ctrl-C bzw. das Schließen der Shell ihn nicht mitbeendet.
+#[cfg(unix)]
+fn detach_command(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+    command.process_group(0);
+}
+
+/// Löst den Kindprozess von Terminal und Prozessgruppe des Aufrufers, damit
+/// Ctrl-C bzw. das Schließen der Konsole ihn nicht mitbeendet.
+#[cfg(windows)]
+fn detach_command(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt as _;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}
+
+/// Ohne Unix/Windows gibt es keine Loslösung; der Prozess erbt die Gruppe.
+#[cfg(not(any(unix, windows)))]
+fn detach_command(_command: &mut std::process::Command) {}
+
+/// Stoppt den losgelösten Gateway: geordnet, nach [`DETACHED_STOP_GRACE`] hart.
+fn detached_stop(pid_path: &Path) -> Result<(), String> {
+    let Some(pid) = detached_running_pid(pid_path)? else {
+        remove_pid_file(pid_path)?;
+        println!("Gateway läuft nicht.");
+        return Ok(());
+    };
+    let family = ProcFamily::current();
+    // Ein gescheitertes geordnetes Signal ist kein Abbruchgrund: danach folgt
+    // ohnehin das harte Beenden (unter Windows lehnt `taskkill` ohne `/F`
+    // konsolenlose Prozesse regelmäßig ab).
+    match run_command(&pid_terminate_command(family, pid, false)) {
+        Ok(output) if !output.status.success() => tracing::warn!(
+            pid,
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "gateway.detached.graceful_stop_refused"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(pid, error = %error, "gateway.detached.graceful_stop_failed"),
+    }
+    if wait_for_exit(family, pid, DETACHED_STOP_GRACE)? {
+        remove_pid_file(pid_path)?;
+        println!("Gateway gestoppt (PID {pid}).");
+        return Ok(());
+    }
+    run_checked(&pid_terminate_command(family, pid, true))?;
+    if wait_for_exit(family, pid, DETACHED_KILL_GRACE)? {
+        remove_pid_file(pid_path)?;
+        println!("Gateway hart beendet (PID {pid}).");
         Ok(())
     } else {
+        Err(format!("Gateway-Prozess {pid} lässt sich nicht beenden"))
+    }
+}
+
+/// Wartet höchstens `grace`, bis `pid` nicht mehr lebt.
+///
+/// # Returns
+/// `true`, wenn der Prozess innerhalb der Frist verschwunden ist.
+fn wait_for_exit(family: ProcFamily, pid: u32, grace: std::time::Duration) -> Result<bool, String> {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        if !pid_alive(family, pid)? {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(DETACHED_POLL_INTERVAL);
+    }
+}
+
+/// Liefert die PID des laufenden Gateways laut PID-Datei.
+///
+/// # Returns
+/// `None`, wenn die Datei fehlt, unlesbaren Inhalt hat, der Prozess nicht mehr
+/// lebt oder die PID inzwischen einem anderen Programm gehört (Prüfung über
+/// `/proc/<pid>/cmdline`, wo vorhanden). Eine solche veraltete Datei bleibt
+/// liegen und wird beim nächsten Start/Stopp überschrieben bzw. entfernt.
+fn detached_running_pid(pid_path: &Path) -> Result<Option<u32>, String> {
+    let raw = match std::fs::read_to_string(pid_path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "PID-Datei {} nicht lesbar: {error}",
+                pid_path.display()
+            ));
+        }
+    };
+    let Some(pid) = parse_pid_file(&raw) else {
+        tracing::warn!(pid_file = %pid_path.display(), "gateway.detached.pidfile_invalid");
+        return Ok(None);
+    };
+    if !pid_alive(ProcFamily::current(), pid)? {
+        return Ok(None);
+    }
+    match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(cmdline) if !cmdline_is_gateway(&cmdline) => {
+            tracing::warn!(pid, "gateway.detached.pid_reused");
+            Ok(None)
+        }
+        _ => Ok(Some(pid)),
+    }
+}
+
+/// Schreibt die PID-Datei (Verzeichnis wird angelegt).
+fn write_pid_file(pid_path: &Path, pid: u32) -> Result<(), String> {
+    if let Some(dir) = pid_path.parent() {
+        std::fs::create_dir_all(dir).map_err(|error| {
+            format!("PID-Verzeichnis {} nicht anlegbar: {error}", dir.display())
+        })?;
+    }
+    std::fs::write(pid_path, format!("{pid}\n"))
+        .map_err(|error| format!("PID-Datei {} nicht schreibbar: {error}", pid_path.display()))
+}
+
+/// Entfernt die PID-Datei; eine fehlende Datei ist kein Fehler.
+fn remove_pid_file(pid_path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(pid_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "PID-Datei {} nicht entfernbar: {error}",
+            pid_path.display()
+        )),
+    }
+}
+
+/// Liest eine PID aus dem Inhalt der PID-Datei (rein); `0` ist ungültig.
+fn parse_pid_file(raw: &str) -> Option<u32> {
+    raw.trim().parse().ok().filter(|pid| *pid > 0)
+}
+
+/// Prüft, ob eine `/proc/<pid>/cmdline` (NUL-getrennt) den Subcommand
+/// `gateway` enthält (rein) — Schutz gegen wiederverwendete PIDs.
+fn cmdline_is_gateway(raw: &[u8]) -> bool {
+    raw.split(|byte| *byte == 0)
+        .skip(1)
+        .any(|arg| arg == b"gateway")
+}
+
+/// Prüft über den externen Probe-Befehl, ob `pid` lebt.
+fn pid_alive(family: ProcFamily, pid: u32) -> Result<bool, String> {
+    let output = run_command(&pid_probe_command(family, pid))?;
+    Ok(match family {
+        ProcFamily::Unix => output.status.success(),
+        ProcFamily::Windows => tasklist_lists_pid(&String::from_utf8_lossy(&output.stdout), pid),
+    })
+}
+
+/// Argumentvektor der Lebendprüfung (rein): `kill -0 <pid>` bzw.
+/// `tasklist /FI "PID eq <pid>" /NH /FO CSV`.
+fn pid_probe_command(family: ProcFamily, pid: u32) -> Vec<String> {
+    match family {
+        ProcFamily::Unix => vec!["kill".to_owned(), "-0".to_owned(), pid.to_string()],
+        ProcFamily::Windows => vec![
+            "tasklist".to_owned(),
+            "/FI".to_owned(),
+            format!("PID eq {pid}"),
+            "/NH".to_owned(),
+            "/FO".to_owned(),
+            "CSV".to_owned(),
+        ],
+    }
+}
+
+/// Argumentvektor des Beendens (rein): `kill -TERM|-KILL <pid>` bzw.
+/// `taskkill [/F] /PID <pid>`.
+fn pid_terminate_command(family: ProcFamily, pid: u32, force: bool) -> Vec<String> {
+    match (family, force) {
+        (ProcFamily::Unix, false) => vec!["kill".to_owned(), "-TERM".to_owned(), pid.to_string()],
+        (ProcFamily::Unix, true) => vec!["kill".to_owned(), "-KILL".to_owned(), pid.to_string()],
+        (ProcFamily::Windows, false) => {
+            vec!["taskkill".to_owned(), "/PID".to_owned(), pid.to_string()]
+        }
+        (ProcFamily::Windows, true) => vec![
+            "taskkill".to_owned(),
+            "/F".to_owned(),
+            "/PID".to_owned(),
+            pid.to_string(),
+        ],
+    }
+}
+
+/// Prüft, ob die CSV-Ausgabe von `tasklist` eine Zeile für `pid` enthält (rein).
+fn tasklist_lists_pid(stdout: &str, pid: u32) -> bool {
+    let needle = format!(",\"{pid}\",");
+    stdout.lines().any(|line| line.contains(&needle))
+}
+
+// ---------------------------------------------------------------------------
+// Befehlsausführung
+// ---------------------------------------------------------------------------
+
+/// Führt einen Argumentvektor aus und liefert die vollständige Ausgabe.
+///
+/// # Errors
+/// Leerer Vektor oder nicht startbares Programm.
+fn run_command(argv: &[String]) -> Result<std::process::Output, String> {
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| "leerer Befehl".to_owned())?;
+    std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|error| format!("{} nicht ausführbar: {error}", argv.join(" ")))
+}
+
+/// Wie [`run_command`], wertet aber einen Exit-Status != 0 als Fehler und
+/// gibt dessen Diagnose (stderr) vollständig weiter.
+fn run_checked(argv: &[String]) -> Result<std::process::Output, String> {
+    let output = run_command(argv)?;
+    if output.status.success() {
+        Ok(output)
+    } else {
         Err(format!(
-            "systemctl --user {} fehlgeschlagen: {}",
-            args.join(" "),
+            "{} fehlgeschlagen: {}",
+            argv.join(" "),
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
@@ -988,5 +1724,294 @@ mod tests {
             evaluate_evidence(&[], ApprovalMode::FullAccess, false, false),
             (false, false)
         );
+    }
+
+    /// Wandelt erwartete `&str`-Argumentvektoren für Vergleiche um.
+    fn argvs(expected: &[&[&str]]) -> Vec<Vec<String>> {
+        expected
+            .iter()
+            .map(|argv| argv.iter().map(|arg| (*arg).to_owned()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn test_select_gateway_backend_prefers_booted_systemd() -> TestResult {
+        assert_eq!(
+            select_gateway_backend(ServiceKind::Systemd, true, None)
+                .map_err(ctx("systemd selection"))?,
+            GatewayBackend::SystemdUser
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_select_gateway_backend_falls_back_without_running_systemd() -> TestResult {
+        assert_eq!(
+            select_gateway_backend(ServiceKind::Systemd, false, None)
+                .map_err(ctx("systemd without boot"))?,
+            GatewayBackend::Detached
+        );
+        for kind in [ServiceKind::Schtasks, ServiceKind::Unsupported] {
+            assert_eq!(
+                select_gateway_backend(kind, true, Some("  "))
+                    .map_err(ctx("fallback selection"))?,
+                GatewayBackend::Detached
+            );
+        }
+        assert_eq!(
+            select_gateway_backend(ServiceKind::Launchd, false, None)
+                .map_err(ctx("launchd selection"))?,
+            GatewayBackend::Launchd
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_select_gateway_backend_honours_override() -> TestResult {
+        assert_eq!(
+            select_gateway_backend(ServiceKind::Systemd, true, Some("Detached"))
+                .map_err(ctx("override detached"))?,
+            GatewayBackend::Detached
+        );
+        assert_eq!(
+            select_gateway_backend(ServiceKind::Unsupported, false, Some("systemd"))
+                .map_err(ctx("override systemd"))?,
+            GatewayBackend::SystemdUser
+        );
+        let Err(error) = select_gateway_backend(ServiceKind::Systemd, true, Some("runit")) else {
+            return Err(TestError::Unexpected("unknown override must fail".into()));
+        };
+        assert!(error.contains(GATEWAY_BACKEND_ENV), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_systemd_gateway_commands_keep_previous_invocations() {
+        assert_eq!(
+            systemd_gateway_commands(GatewayOp::Install, GATEWAY_SERVICE_NAME),
+            argvs(&[
+                &["systemctl", "--user", "daemon-reload"],
+                &[
+                    "systemctl",
+                    "--user",
+                    "enable",
+                    "--now",
+                    "harw-gateway.service"
+                ],
+            ])
+        );
+        for (op, verb) in [
+            (GatewayOp::Start, "start"),
+            (GatewayOp::Stop, "stop"),
+            (GatewayOp::Restart, "restart"),
+            (GatewayOp::Enable, "enable"),
+            (GatewayOp::Disable, "disable"),
+        ] {
+            assert_eq!(
+                systemd_gateway_commands(op, GATEWAY_SERVICE_NAME),
+                argvs(&[&["systemctl", "--user", verb, "harw-gateway.service"]])
+            );
+        }
+        assert_eq!(
+            systemd_status_command(GATEWAY_SERVICE_NAME),
+            ["systemctl", "--user", "is-active", "harw-gateway.service"]
+        );
+    }
+
+    #[test]
+    fn test_systemd_active_state_parses_is_active_output() {
+        assert_eq!(
+            systemd_active_state("active\n"),
+            GatewayRunState::Running(None)
+        );
+        assert_eq!(
+            systemd_active_state("activating\n"),
+            GatewayRunState::Running(None)
+        );
+        assert_eq!(systemd_active_state("inactive\n"), GatewayRunState::Stopped);
+        assert_eq!(systemd_active_state("failed\n"), GatewayRunState::Stopped);
+        assert_eq!(systemd_active_state(""), GatewayRunState::Stopped);
+    }
+
+    #[test]
+    fn test_launchd_gateway_commands_when_not_loaded() {
+        let plist = Path::new("/Users/u/Library/LaunchAgents/harw-gateway.plist");
+        let cmds = |op| launchd_gateway_commands(op, "gui/501", "harw-gateway", plist, false);
+        let bootstrap: &[&str] = &[
+            "launchctl",
+            "bootstrap",
+            "gui/501",
+            "/Users/u/Library/LaunchAgents/harw-gateway.plist",
+        ];
+        assert_eq!(
+            cmds(GatewayOp::Install),
+            argvs(&[&["launchctl", "enable", "gui/501/harw-gateway"], bootstrap])
+        );
+        assert_eq!(cmds(GatewayOp::Start), argvs(&[bootstrap]));
+        assert_eq!(cmds(GatewayOp::Restart), argvs(&[bootstrap]));
+        assert!(cmds(GatewayOp::Stop).is_empty());
+        assert_eq!(
+            cmds(GatewayOp::Enable),
+            argvs(&[&["launchctl", "enable", "gui/501/harw-gateway"]])
+        );
+        assert_eq!(
+            cmds(GatewayOp::Disable),
+            argvs(&[&["launchctl", "disable", "gui/501/harw-gateway"]])
+        );
+    }
+
+    #[test]
+    fn test_launchd_gateway_commands_when_loaded() {
+        let plist = Path::new("/Users/u/Library/LaunchAgents/harw-gateway.plist");
+        let cmds = |op| launchd_gateway_commands(op, "gui/501", "harw-gateway", plist, true);
+        assert_eq!(
+            cmds(GatewayOp::Install),
+            argvs(&[
+                &["launchctl", "enable", "gui/501/harw-gateway"],
+                &["launchctl", "bootout", "gui/501/harw-gateway"],
+                &[
+                    "launchctl",
+                    "bootstrap",
+                    "gui/501",
+                    "/Users/u/Library/LaunchAgents/harw-gateway.plist"
+                ],
+            ])
+        );
+        assert_eq!(
+            cmds(GatewayOp::Start),
+            argvs(&[&["launchctl", "kickstart", "gui/501/harw-gateway"]])
+        );
+        assert_eq!(
+            cmds(GatewayOp::Stop),
+            argvs(&[&["launchctl", "bootout", "gui/501/harw-gateway"]])
+        );
+        assert_eq!(
+            cmds(GatewayOp::Restart),
+            argvs(&[&["launchctl", "kickstart", "-k", "gui/501/harw-gateway"]])
+        );
+        assert_eq!(
+            launchd_status_command("harw-gateway"),
+            ["launchctl", "list", "harw-gateway"]
+        );
+    }
+
+    #[test]
+    fn test_launch_agent_plist_path_and_domain() -> TestResult {
+        assert_eq!(
+            launch_agent_plist_path(Some(OsString::from("/Users/u")), "harw-gateway")
+                .map_err(ctx("plist path"))?,
+            PathBuf::from("/Users/u/Library/LaunchAgents/harw-gateway.plist")
+        );
+        assert!(launch_agent_plist_path(Some(OsString::from("rel")), "x").is_err());
+        assert!(launch_agent_plist_path(None, "x").is_err());
+        assert_eq!(
+            launchd_domain(parse_uid("501\n").map_err(ctx("uid"))?),
+            "gui/501"
+        );
+        assert!(parse_uid("root").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_launchctl_list_pid_parses_running_and_loaded_only() {
+        let running = "{\n\t\"LimitLoadToSessionType\" = \"Aqua\";\n\t\"Label\" = \
+                       \"harw-gateway\";\n\t\"PID\" = 4242;\n\t\"LastExitStatus\" = 0;\n};\n";
+        assert_eq!(launchctl_list_pid(running), Some(4242));
+        let loaded = "{\n\t\"Label\" = \"harw-gateway\";\n\t\"LastExitStatus\" = 256;\n};\n";
+        assert_eq!(launchctl_list_pid(loaded), None);
+    }
+
+    #[test]
+    fn test_pid_commands_per_family() {
+        assert_eq!(
+            pid_probe_command(ProcFamily::Unix, 42),
+            ["kill", "-0", "42"]
+        );
+        assert_eq!(
+            pid_terminate_command(ProcFamily::Unix, 42, false),
+            ["kill", "-TERM", "42"]
+        );
+        assert_eq!(
+            pid_terminate_command(ProcFamily::Unix, 42, true),
+            ["kill", "-KILL", "42"]
+        );
+        assert_eq!(
+            pid_probe_command(ProcFamily::Windows, 42),
+            ["tasklist", "/FI", "PID eq 42", "/NH", "/FO", "CSV"]
+        );
+        assert_eq!(
+            pid_terminate_command(ProcFamily::Windows, 42, false),
+            ["taskkill", "/PID", "42"]
+        );
+        assert_eq!(
+            pid_terminate_command(ProcFamily::Windows, 42, true),
+            ["taskkill", "/F", "/PID", "42"]
+        );
+    }
+
+    #[test]
+    fn test_tasklist_lists_pid_matches_exact_pid_column() {
+        let out = "\"harw.exe\",\"4242\",\"Console\",\"1\",\"12.345 K\"\r\n";
+        assert!(tasklist_lists_pid(out, 4242));
+        assert!(!tasklist_lists_pid(out, 424));
+        assert!(!tasklist_lists_pid(
+            "INFO: No tasks are running which match the specified criteria.\r\n",
+            4242
+        ));
+    }
+
+    #[test]
+    fn test_pid_file_parsing_and_cmdline_check() {
+        assert_eq!(parse_pid_file("1234\n"), Some(1234));
+        assert_eq!(parse_pid_file("0"), None);
+        assert_eq!(parse_pid_file("abc"), None);
+        assert!(cmdline_is_gateway(b"/usr/bin/harw\0gateway\0"));
+        assert!(!cmdline_is_gateway(b"/usr/bin/gateway\0serve\0"));
+        assert!(!cmdline_is_gateway(b"/usr/bin/vim\0notes.txt\0"));
+    }
+
+    #[test]
+    fn test_gateway_pid_and_log_paths_live_under_home() {
+        let home = Path::new("/srv/harw");
+        assert_eq!(
+            gateway_pid_path(home),
+            PathBuf::from("/srv/harw/run/harw-gateway.pid")
+        );
+        assert_eq!(
+            gateway_log_path(home),
+            PathBuf::from("/srv/harw/logs/harw-gateway.log")
+        );
+    }
+
+    #[test]
+    fn test_detached_pid_file_roundtrip_and_missing_file() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temporary HARW home"))?;
+        let pid_path = gateway_pid_path(home.path());
+        assert_eq!(
+            detached_running_pid(&pid_path).map_err(ctx("missing pid file"))?,
+            None
+        );
+        write_pid_file(&pid_path, 4242).map_err(ctx("write pid file"))?;
+        let raw = std::fs::read_to_string(&pid_path).map_err(ctx("read pid file"))?;
+        assert_eq!(parse_pid_file(&raw), Some(4242));
+        remove_pid_file(&pid_path).map_err(ctx("remove pid file"))?;
+        remove_pid_file(&pid_path).map_err(ctx("remove missing pid file"))?;
+        assert!(!pid_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_detached_gateway_rejects_autostart_actions() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create temporary HARW home"))?;
+        let [_serve, gateway] = service_specs(Path::new("/usr/bin/harw"), home.path());
+        for op in [GatewayOp::Enable, GatewayOp::Disable] {
+            let Err(error) = detached_gateway(op, &gateway, home.path()) else {
+                return Err(TestError::Unexpected(
+                    "autostart must be unavailable without a service manager".into(),
+                ));
+            };
+            assert!(error.contains("Autostart"), "{error}");
+        }
+        Ok(())
     }
 }

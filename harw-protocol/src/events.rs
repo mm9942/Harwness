@@ -125,6 +125,39 @@ pub enum TurnEvent {
     /// (chat|plan|explore|work|shell). Wird von der Session gesendet, sobald
     /// ein Moduswechsel abgeschlossen ist.
     ModeChanged { mode: String },
+    /// Live-Textdelta der laufenden Modell-Runde (nur bei streamenden
+    /// Providern). Der finale Text kommt weiterhin als `ItemAdded`.
+    AssistantDelta { turn_id: TurnId, text: String },
+    /// Live-Reasoning-Delta der laufenden Modell-Runde.
+    ReasoningDelta { turn_id: TurnId, text: String },
+    /// Live-Tokenstand: `round` ist der (ggf. noch wachsende) Stand der
+    /// aktuellen Modell-Runde, `turn_total` die Summe aller abgeschlossenen
+    /// Runden dieses Turns plus `round`. `final_round` ist `true`, sobald
+    /// die Runde abgeschlossen ist (Pro-Runde-Fallback liefert nur diese).
+    UsageUpdated {
+        turn_id: TurnId,
+        round: TokenUsage,
+        turn_total: TokenUsage,
+        final_round: bool,
+    },
+    /// Kontextfenster-Auslastung nach einer Modell-Runde. `used_tokens`
+    /// zählt alle Prompt-Tokens (inkl. Cache-Read/-Write), `window_tokens`
+    /// ist das effektive Kontextfenster des aktiven Modells.
+    /// `history_items_dropped` meldet, wie viele Verlaufseinträge das
+    /// Byte-Budget für diese Runde weggelassen hat.
+    ContextUpdated {
+        turn_id: TurnId,
+        used_tokens: u64,
+        window_tokens: u64,
+        history_items_dropped: u32,
+    },
+    /// Eine (Auto-)Kompaktierung wurde angewendet.
+    CompactionApplied {
+        turn_id: Option<TurnId>,
+        reason: String,
+        items_before: u32,
+        items_after: u32,
+    },
 }
 
 #[cfg(test)]

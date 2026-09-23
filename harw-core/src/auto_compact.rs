@@ -188,6 +188,16 @@ impl AutoCompactPolicy {
         }
     }
 
+    /// Dieselbe Policy für ein anderes Kontextfenster (z. B. nach einem
+    /// Modellwechsel): Schwellen neu abgeleitet, feste Obergrenze und
+    /// Turn-Start-Ziel bleiben erhalten.
+    #[must_use]
+    pub fn rescaled(self, context_window_tokens: u64) -> Self {
+        Self::for_context_window(context_window_tokens)
+            .with_absolute_ceiling(self.absolute_ceiling_tokens)
+            .with_turn_start_target(self.turn_start_target_tokens)
+    }
+
     /// Deaktivierte Policy (Fenster 0) — entscheidet immer `None`.
     #[must_use]
     pub fn disabled() -> Self {
@@ -294,6 +304,17 @@ impl AutoCompactPolicy {
 mod tests {
     use super::*;
     use crate::test_support::{TestResult, ctx};
+
+    #[test]
+    fn rescaled_keeps_ceiling_and_target() {
+        let policy = AutoCompactPolicy::for_context_window(200_000)
+            .with_absolute_ceiling(Some(500_000))
+            .with_turn_start_target(Some(40_000))
+            .rescaled(1_000_000);
+        assert_eq!(policy.context_window_tokens(), 1_000_000);
+        assert_eq!(policy.turn_start_target_tokens(), Some(40_000));
+        assert_eq!(policy.absolute_ceiling_tokens, Some(500_000));
+    }
 
     #[test]
     fn thresholds_derive_from_context_window() {

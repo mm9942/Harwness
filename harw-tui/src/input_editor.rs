@@ -1,4 +1,3 @@
-#![allow(dead_code)] // pub API-Fläche; volle Nutzung folgt in späteren Waves
 //! Autarker In-Memory-Editor für die Chat-Eingabezeile.
 //!
 //! # Verantwortung
@@ -383,6 +382,7 @@ impl InputEditor {
     ///
     /// # Returns
     /// Byte-Offset im UTF-8-Puffer. Immer an einer Char-Grenze.
+    #[cfg(test)]
     pub fn cursor(&self) -> usize {
         self.cursor
     }
@@ -399,6 +399,7 @@ impl InputEditor {
     ///
     /// # Returns
     /// Slice der History-Einträge.
+    #[cfg(test)]
     pub fn history(&self) -> &[String] {
         &self.history
     }
@@ -584,34 +585,6 @@ impl InputEditor {
         }
         self.cursor = self.next_grapheme_boundary(self.cursor);
         debug_assert!(self.buffer.is_char_boundary(self.cursor));
-    }
-
-    /// Bewegt den Cursor eine Zeile nach oben (Multi-Line) oder triggert History-Back
-    /// (Single-Line). Gibt `true` zurück, wenn eine History-Navigation stattfand.
-    ///
-    /// # Returns
-    /// `true` wenn History navigiert wurde, `false` bei Cursor-Bewegung.
-    pub fn move_up(&mut self) -> bool {
-        if self.is_multiline() {
-            self.move_cursor_line(-1);
-            false
-        } else {
-            self.history_back()
-        }
-    }
-
-    /// Bewegt den Cursor eine Zeile nach unten (Multi-Line) oder triggert History-Forward
-    /// (Single-Line). Gibt `true` zurück, wenn eine History-Navigation stattfand.
-    ///
-    /// # Returns
-    /// `true` wenn History navigiert wurde, `false` bei Cursor-Bewegung.
-    pub fn move_down(&mut self) -> bool {
-        if self.is_multiline() {
-            self.move_cursor_line(1);
-            false
-        } else {
-            self.history_forward()
-        }
     }
 
     /// Bewegt den Cursor zum Anfang der aktuellen Zeile.
@@ -994,6 +967,22 @@ impl InputEditor {
         (row + soft_row, col_width)
     }
 
+    /// Prueft, ob Up/Down History-Recall ausloesen darf.
+    ///
+    /// Gate-Bedingung: leerer Buffer ODER (Cursor am Anfang/Ende UND Text entspricht last_recalled).
+    fn should_recall_history(&self) -> bool {
+        if self.buffer.is_empty() {
+            return true;
+        }
+        if self.cursor != 0 && self.cursor != self.buffer.len() {
+            return false;
+        }
+        match &self.last_recalled {
+            Some(recalled) => self.buffer.as_str() == recalled.as_str(),
+            None => false,
+        }
+    }
+
     /// High-level Convenience: nimmt ein [`KeyEvent`] und ruft die passende Methode auf.
     ///
     /// # Beschreibung
@@ -1032,7 +1021,7 @@ impl InputEditor {
     /// - `Ctrl+Delete` → `delete_word_right` + `Redraw`
     /// - `Up` (Single-Line) → `history_back` → `Redraw` oder `Passthrough`
     /// - `Down` (Single-Line) → `history_forward`
-    /// - `Up`/`Down` (Multi-Line) → `move_up`/`move_down` + `Redraw`
+    /// - `Up`/`Down` (Multi-Line) → `move_cursor_line` + `Redraw`
     /// - `Escape` während History-Browse → `cancel_history` + `Redraw`
     /// - Jeder bar `Escape` merkt sich zusätzlich einen möglichen
     ///   CSI-Sequenz-Anfang (siehe Moduldoku "CSI-Sicherheitsnetz");
@@ -1047,22 +1036,6 @@ impl InputEditor {
     ///
     /// # Nebenläufigkeit
     /// Nicht thread-safe; Aufrufer serialisiert Zugriff.
-    /// Prueft, ob Up/Down History-Recall ausloesen darf.
-    ///
-    /// Gate-Bedingung: leerer Buffer ODER (Cursor am Anfang/Ende UND Text entspricht last_recalled).
-    fn should_recall_history(&self) -> bool {
-        if self.buffer.is_empty() {
-            return true;
-        }
-        if self.cursor != 0 && self.cursor != self.buffer.len() {
-            return false;
-        }
-        match &self.last_recalled {
-            Some(recalled) => self.buffer.as_str() == recalled.as_str(),
-            None => false,
-        }
-    }
-
     pub fn handle_key(&mut self, key: KeyEvent) -> InputAction {
         self.handle_key_at(key, Instant::now())
     }
@@ -1328,6 +1301,7 @@ impl InputEditor {
     ///
     /// # Rückgabe
     /// Slice der aktuell offenen [`PendingPaste`]-Einträge.
+    #[cfg(test)]
     pub fn pastes(&self) -> &[PendingPaste] {
         &self.pastes
     }

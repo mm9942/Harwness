@@ -134,7 +134,7 @@ use harw_protocol::events::TurnEvent;
 use harw_tools::{ToolCall, ToolName};
 use harw_types::{
     AgentRole, ApprovalActor, ItemId, ModelId, ProviderId, ReasoningEffort, SessionId, TokenUsage,
-    ToolCallId, TurnId,
+    ThreadId, ToolCallId, TurnId,
 };
 use std::collections::BTreeSet;
 use tokio::sync::mpsc;
@@ -205,6 +205,17 @@ pub struct AgentSession {
     /// Item-Updates). Andere Granularität als `event_tx` — daher ein
     /// eigener, separater Kanal statt Wiederverwendung.
     turn_event_tx: Option<mpsc::UnboundedSender<TurnEvent>>,
+    /// Optionaler agenten-übergreifender Live-Bus (siehe
+    /// [`crate::agent_events`]); jedes Turn-Event wird mit Absender-Kennung
+    /// zusätzlich hierher gespiegelt.
+    agent_events: Option<crate::agent_events::AgentEventHub>,
+    /// Löst bei einem Modellwechsel das neue Kontextfenster auf, damit
+    /// Auto-Compaction und Byte-Budget dem aktiven Modell folgen.
+    context_window_resolver: Option<std::sync::Arc<crate::child_controller::ContextWindowResolver>>,
+    /// Vorgabe-Grenzen für Turns ohne eigene Grenzen (siehe `run_turn`).
+    default_turn_limits: Option<crate::turn_loop::TurnLimits>,
+    /// Startzeitpunkt des offenen Handoffs (für `ChildCompleted::duration_ms`).
+    handoff_started_at: Option<std::time::Instant>,
     /// Session-level filter controlling which tools, instructions providers,
     /// and context providers are exposed to the model. Defaults to
     /// [`SessionActivation::default()`] (Full profile, no overrides), which
@@ -423,6 +434,48 @@ pub struct PendingHandoff {
     pub role: String,
 }
 
+/// Losgelöster Live-Event-Sender einer Session (siehe
+/// [`AgentSession::live_emitter`]). Billig klonbar, `Send + Sync`.
+#[derive(Debug, Clone, Default)]
+pub struct LiveEmitter {
+    turn_tx: Option<mpsc::UnboundedSender<TurnEvent>>,
+    hub: Option<(
+        crate::agent_events::AgentEventHub,
+        SessionId,
+        Option<SessionId>,
+        String,
+    )>,
+}
+
+impl LiveEmitter {
+    /// `true`, wenn überhaupt jemand zuhört.
+    #[must_use]
+    pub fn is_observed(&self) -> bool {
+        self.turn_tx.is_some()
+            || self
+                .hub
+                .as_ref()
+                .is_some_and(|(hub, ..)| hub.observer_count() > 0)
+    }
+
+    /// Sendet ein Turn-Event an Turn-Sink und Agenten-Bus (best effort).
+    pub fn emit(&self, event: TurnEvent) {
+        if let Some((hub, agent, parent, role)) = &self.hub
+            && hub.observer_count() > 0
+        {
+            hub.publish(crate::agent_events::AgentEvent {
+                agent: agent.clone(),
+                parent: parent.clone(),
+                role: role.clone(),
+                kind: crate::agent_events::AgentEventKind::Turn(event.clone()),
+            });
+        }
+        if let Some(tx) = &self.turn_tx {
+            let _ = tx.send(event);
+        }
+    }
+}
+
 /// Handle das ein laufender Turn hält.
 pub struct TurnHandle {
     pub turn_id: TurnId,
@@ -528,6 +581,10 @@ impl AgentSession {
             executable_snapshot_id: None,
             context_program: None,
             auto_compact: None,
+            agent_events: None,
+            handoff_started_at: None,
+            default_turn_limits: None,
+            context_window_resolver: None,
             compaction_observer: None,
             tool_outcome_observer: None,
             compaction_summary_model: (None, None),
@@ -733,6 +790,11 @@ impl AgentSession {
     pub fn with_context_budget(mut self, context_budget: ContextBudget) -> Self {
         self.context_budget = context_budget;
         self
+    }
+
+    /// Nicht-konsumierende Variante von [`Self::with_context_budget`].
+    pub fn set_context_budget(&mut self, context_budget: ContextBudget) {
+        self.context_budget = context_budget;
     }
 
     #[must_use]
@@ -980,7 +1042,29 @@ impl AgentSession {
     /// already registered in the session manager. `None` falls back to the
     /// provider's catalog default.
     pub fn set_active_model(&mut self, model: Option<ModelId>) {
+        let changed = self.active_model != model;
         self.active_model = model;
+        if changed
+            && let Some(resolve) = &self.context_window_resolver
+        {
+            let window = resolve(self.active_model.as_ref().map(ModelId::as_str));
+            if let Some(policy) = self.auto_compact {
+                self.auto_compact = Some(policy.rescaled(window));
+            }
+            let history = usize::try_from(window.saturating_mul(3)).unwrap_or(usize::MAX);
+            self.context_budget.max_history_bytes = history.max(ContextBudget::conservative().max_history_bytes);
+        }
+    }
+
+    /// Setzt den Resolver für Kontextfenster je Modell (siehe
+    /// [`Self::set_active_model`]).
+    #[must_use]
+    pub fn with_context_window_resolver(
+        mut self,
+        resolver: std::sync::Arc<crate::child_controller::ContextWindowResolver>,
+    ) -> Self {
+        self.context_window_resolver = Some(resolver);
+        self
     }
 
     /// Builder-style setter: overrides the provider used for every turn of
@@ -1012,6 +1096,66 @@ impl AgentSession {
     pub fn with_turn_event_sink(mut self, turn_event_tx: mpsc::UnboundedSender<TurnEvent>) -> Self {
         self.turn_event_tx = Some(turn_event_tx);
         self
+    }
+
+    /// Hängt den agenten-übergreifenden Live-Bus an.
+    #[must_use]
+    pub fn with_agent_events(mut self, hub: crate::agent_events::AgentEventHub) -> Self {
+        self.agent_events = Some(hub);
+        self
+    }
+
+    /// Nicht-konsumierende Variante von [`Self::with_agent_events`].
+    pub fn set_agent_events(&mut self, hub: Option<crate::agent_events::AgentEventHub>) {
+        self.agent_events = hub;
+    }
+
+    /// Der angehängte Live-Bus, falls vorhanden.
+    #[must_use]
+    pub fn agent_events(&self) -> Option<&crate::agent_events::AgentEventHub> {
+        self.agent_events.as_ref()
+    }
+
+    /// Anzeigename der Rolle dieser Session für Live-Beobachter.
+    #[must_use]
+    pub fn role_label(&self) -> String {
+        match &self.role {
+            AgentRole::Agent { name } => name.clone(),
+            other => other.to_string(),
+        }
+    }
+
+    /// Veröffentlicht ein Turn-Event dieser Session auf dem Live-Bus
+    /// (No-op ohne Bus oder ohne Beobachter).
+    pub fn publish_agent_event(&self, kind: crate::agent_events::AgentEventKind) {
+        if let Some(hub) = &self.agent_events
+            && hub.observer_count() > 0
+        {
+            hub.publish(crate::agent_events::AgentEvent {
+                agent: self.id.clone(),
+                parent: self.parent_session_id.clone(),
+                role: self.role_label(),
+                kind,
+            });
+        }
+    }
+
+    /// Ein vom `&self`-Borrow gelöster Sender für Live-Turn-Events (Turn-Sink
+    /// plus Agenten-Bus), z. B. für einen Streaming-Callback, der während des
+    /// Modellaufrufs aus dem Provider heraus feuert.
+    #[must_use]
+    pub fn live_emitter(&self) -> LiveEmitter {
+        LiveEmitter {
+            turn_tx: self.turn_event_tx.clone(),
+            hub: self.agent_events.clone().map(|hub| {
+                (
+                    hub,
+                    self.id.clone(),
+                    self.parent_session_id.clone(),
+                    self.role_label(),
+                )
+            }),
+        }
     }
 
     /// Returns the attached live per-turn event sink, if any was configured
@@ -1350,8 +1494,60 @@ impl AgentSession {
             call_id,
             role,
         });
+        self.handoff_started_at = Some(std::time::Instant::now());
         self.state = SessionState::WaitingForChild;
         Ok(())
+    }
+
+    /// Setzt die Vorgabe-Grenzen, die jeder Turn ohne eigene
+    /// [`crate::turn_loop::TurnLimits`] bekommt.
+    #[must_use]
+    pub fn with_default_turn_limits(mut self, limits: crate::turn_loop::TurnLimits) -> Self {
+        self.default_turn_limits = Some(limits);
+        self
+    }
+
+    /// Die Vorgabe-Grenzen dieser Session, falls gesetzt.
+    #[must_use]
+    pub fn default_turn_limits(&self) -> Option<crate::turn_loop::TurnLimits> {
+        self.default_turn_limits
+    }
+
+    /// Meldet, dass die Session konfiguriert ist (Modell steht fest).
+    pub fn announce_configured(&self) {
+        let _ = self.event_tx.send(SessionEvent::SessionConfigured {
+            session_id: self.id.clone(),
+            thread_id: ThreadId::new(),
+            model: self
+                .active_model
+                .as_ref()
+                .map_or_else(|| "default".to_owned(), |m| m.as_str().to_owned()),
+        });
+    }
+
+    /// Meldet das saubere Ende der Session.
+    pub fn announce_closed(&self, reason: Option<String>) {
+        let _ = self.event_tx.send(SessionEvent::SessionClosed {
+            session_id: self.id.clone(),
+            reason,
+        });
+    }
+
+    /// Meldet einen Fehler auf Session-Ebene (z. B. einen gescheiterten Turn).
+    pub fn report_error(&self, message: String, retryable: bool) {
+        let _ = self.event_tx.send(SessionEvent::SessionError {
+            session_id: self.id.clone(),
+            message,
+            retryable,
+        });
+    }
+
+    /// Entnimmt die bisherige Laufzeit des zuletzt begonnenen Handoffs in
+    /// Millisekunden (0, wenn kein Startzeitpunkt bekannt ist).
+    pub fn take_handoff_elapsed_ms(&mut self) -> u64 {
+        self.handoff_started_at
+            .take()
+            .map_or(0, |start| u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX))
     }
 
     /// Pausiert die Session für eine Freigabeentscheidung.
@@ -2590,6 +2786,7 @@ forbidden = [{forbidden}]
             .try_start_turn()
             .map_err(ctx("turn starts from Idle"))?;
         let usage = TokenUsage {
+            cache_separate: false,
             input_tokens: 10,
             output_tokens: 5,
             reasoning_tokens: None,

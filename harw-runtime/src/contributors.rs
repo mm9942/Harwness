@@ -135,27 +135,47 @@ pub trait AssemblyContributor: Send + Sync {
 /// Die Contributors, die jeder Einstieg ohne weitere Angabe bekommt.
 ///
 /// # Beschreibung
-/// **Heute leer, und das ist kein Platzhalter, sondern der Stand des
-/// Vertrags:** bis einschließlich Welle W2d montiert `harw-runtime` genau die
-/// Bausteine aus §runtime-spec, und keiner davon ist optional. Erst Welle W6
-/// („Integration: Contributors, CLI-Hooks, Features, E2E-Tests") hängt hier
-/// die Subsysteme ein, die Teil B verdrahtet — Netz-Politik (W5/P1.7),
-/// DoD-Kette, Browser-Host und Web-UI.
-///
-/// Die Funktion existiert schon jetzt, damit die Einstiege in W2d
-/// `.contributor(..)`-frei gegen **diese** Liste montieren und W6 nur eine
-/// Datei ändern muss statt neun Composition Roots.
-///
-/// # Rückgabe
-/// Eine leere Liste.
-///
-/// # Beispiele
-/// ```rust
-/// assert!(harw_runtime::contributors::default_contributors().is_empty());
-/// ```
+/// [`crate::assembly::RuntimeAssemblyBuilder`] startet mit genau dieser
+/// Liste; `.contributor(..)` hängt weitere an. Enthalten:
+/// - [`crate::mcp_wiring::McpContributor`]: konfigurierte MCP-Server als
+///   Werkzeuge `mcp.<server>.<tool>` (No-op ohne aktive `[mcps.*]`).
+/// - [`BrowserRootContributor`] (Feature `browser`): `browser.*` für die
+///   Wurzelsitzung, wenn `[browser].roles` `"root"` enthält.
 #[must_use]
 pub fn default_contributors() -> Vec<Arc<dyn AssemblyContributor>> {
-    Vec::new()
+    let mut contributors: Vec<Arc<dyn AssemblyContributor>> =
+        vec![Arc::new(crate::mcp_wiring::McpContributor)];
+    #[cfg(feature = "browser")]
+    contributors.push(Arc::new(BrowserRootContributor));
+    contributors
+}
+
+/// Hängt die Browser-Werkzeuge (Firefox/geckodriver, WebDriver BiDi) an die
+/// Wurzel-Registry, sofern `[browser].enabled` und `[browser].roles` die
+/// Rolle `root` enthält. Kinder bekommen sie rollenweise in
+/// `children.rs` über dieselbe Konfiguration.
+#[cfg(feature = "browser")]
+#[derive(Debug, Default)]
+pub struct BrowserRootContributor;
+
+#[cfg(feature = "browser")]
+impl AssemblyContributor for BrowserRootContributor {
+    fn contribute(&self, inputs: &AssemblyInputs<'_>, parts: &mut AssemblyParts) -> RuntimeResult<()> {
+        if !inputs.config.browser.grants_role("root") {
+            return Ok(());
+        }
+        match harw_registry_defaults::profile::browser_tool_provider_for_config(
+            &inputs.config.browser,
+        ) {
+            Ok(Some(provider)) => {
+                let registry = std::mem::take(&mut parts.registry);
+                parts.registry = registry.tool_provider(provider);
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "runtime.browser_root_provider_unavailable"),
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -163,7 +183,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_contributors_is_empty_until_w6() {
-        assert!(default_contributors().is_empty());
+    fn default_contributors_include_mcp() {
+        assert!(!default_contributors().is_empty());
     }
 }

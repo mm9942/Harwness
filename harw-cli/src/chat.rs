@@ -136,7 +136,7 @@ pub(crate) struct ChatOptions {
     /// Sessions des aktuellen Projekts, `harw -r --all` alle").
     pub(crate) all_projects: bool,
     /// `--verbose`: ausführlichere TUI-Darstellung beim Start (Plan Schritt 2,
-    /// Ctrl+O-Äquivalent). Wird in [`ChatRuntimeInputs::verbose`] bereitgehalten;
+    /// Ctrl+O-Äquivalent). Landet als `TuiRunOptions::verbose_tools` in der TUI;
     /// siehe dort für den erwarteten Abnehmer.
     pub(crate) verbose: bool,
     /// `--add-dir`: zusätzliche, für diese Sitzung freigegebene
@@ -342,11 +342,9 @@ struct ChatRuntimeInputs {
     // Globale Fakten-Wurzel (`<home>/profiles/<profil>/memories`), analog zu
     // `project_facts`; Projekt geht laut Design §4 im Lesepfad vor.
     global_facts: Option<Arc<FactStore>>,
-    // `--verbose` (Contract §5 Zeile B5, Plan Schritt 2 Ctrl+O-Äquivalent).
-    // Bereitgehalten für die TUI-Montage; `TuiRunOptions`/`TuiSessionWiring`
-    // (Nachbar-Slice B3) tragen heute noch kein `verbose`-Feld, das diesen
-    // Wert entgegennimmt.
-    #[allow(dead_code)]
+    // `--verbose` (Contract §5 Zeile B5, Plan Schritt 2 Ctrl+O-Äquivalent):
+    // wird über `ChatTuiFactory::verbose_tools` als
+    // `TuiRunOptions::verbose_tools` an die TUI gereicht.
     verbose: bool,
 }
 

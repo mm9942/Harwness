@@ -349,6 +349,7 @@ fn build_slice9_fixture(
     config.providers.insert(
         "openai".to_owned(),
         ProviderToml {
+            stream: None,
             name: "openai".to_owned(),
             api: "openai-chat".to_owned(),
             base_url: "https://api.openai.com/v1".to_owned(),
@@ -369,6 +370,7 @@ fn build_slice9_fixture(
     config.providers.insert(
         "anthropic".to_owned(),
         ProviderToml {
+            stream: None,
             name: "anthropic".to_owned(),
             api: "anthropic-messages".to_owned(),
             base_url: "https://api.anthropic.com/v1".to_owned(),
@@ -389,6 +391,7 @@ fn build_slice9_fixture(
     config.models.insert(
         "gpt-test-slice9".to_owned(),
         ModelToml {
+            stream: None,
             id: "gpt-test-slice9".to_owned(),
             name: None,
             provider: "openai".to_owned(),
@@ -405,6 +408,7 @@ fn build_slice9_fixture(
     config.models.insert(
         "claude-opus-4-8".to_owned(),
         ModelToml {
+            stream: None,
             id: "claude-opus-4-8".to_owned(),
             name: None,
             provider: "anthropic".to_owned(),

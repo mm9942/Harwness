@@ -20,10 +20,11 @@ use crate::audit::chain::{
     AUDIT_FORMAT_VERSION, AUDIT_MAGIC, AuditLog, PersistedChainStatus, canonical_bytes,
 };
 use crate::audit::checkpoint::{
-    CHECKPOINT_FORMAT_VERSION, CHECKPOINT_MAGIC, CheckpointLog, PersistedCheckpointStatus,
+    CHECKPOINT_FORMAT_VERSION, CHECKPOINT_MAGIC, Checkpoint, CheckpointLog,
+    PersistedCheckpointStatus,
 };
 use crate::audit::event::{Actor, SubjectRef};
-use crate::error::{AuditResult, SecretsError, SecretsResult};
+use crate::error::{AuditError, AuditResult, SecretsError, SecretsResult};
 use crate::id::{KeyVersion, SecretId};
 use crate::kek::KekProvenance;
 use crate::policy::{CryptoPolicy, KemAlgo};
@@ -200,12 +201,103 @@ impl SecretStore {
         &self.audit
     }
 
-    /// The in-memory checkpoint state. Checkpoint signing is currently not
-    /// available from the audit types, so this remains empty until that API is
-    /// implemented.
+    /// Die In-Memory-Checkpoint-Kette dieses Handles: jeder über
+    /// [`Self::sign_checkpoint`] erfolgreich signierte und dauerhaft
+    /// geschriebene Checkpoint, in Signierreihenfolge. Wie
+    /// [`Self::audit_log`] enthält sie nur, was über dieses Handle entstand;
+    /// `open` lädt keine persistierten Checkpoints (dafür gibt es
+    /// [`Self::verify_persisted_checkpoints`]).
     #[must_use]
     pub fn checkpoint_log(&self) -> &CheckpointLog {
         &self.checkpoints
+    }
+
+    /// Signiert den aktuellen Kettenkopf des In-Memory-Audit-Logs (§4.2) als
+    /// neuen ML-DSA-65-Checkpoint, hängt ihn an die Checkpoint-Kette an und
+    /// schreibt `audit.log` und `checkpoints.log` (jede Datei für sich atomar).
+    ///
+    /// Der Checkpoint trägt den Kettenkopf-Hash, die Ereigniszahl als
+    /// Sequenznummer, den Signierzeitpunkt und die Signatur über
+    /// [`crate::audit::checkpoint::checkpoint_canonical_bytes`]; er ist über
+    /// `prev_checkpoint_hash` mit seinem Vorgänger verkettet.
+    ///
+    /// Der Signierschlüssel ist bewusst **nicht** aus dem KEK abgeleitet
+    /// (Spezifikation §4.2: „The signing key is distinct from the KEK"): wer
+    /// den KEK kompromittiert, soll Checkpoints nicht fälschen können. Der
+    /// Aufrufer liefert den 32-Byte-ML-DSA-65-Seed aus seiner eigenen
+    /// Schlüssel-Provenienz; der passende Verifikationsschlüssel wird für
+    /// [`Self::verify_checkpoints`] bzw. [`Self::verify_persisted_checkpoints`]
+    /// verwendet.
+    ///
+    /// Transaktional wie die Mutationen: Die In-Memory-Checkpoint-Kette
+    /// ändert sich erst, nachdem der Zustand dauerhaft geschrieben wurde.
+    ///
+    /// # Errors
+    /// - [`AuditError::NonMonotonicCheckpoint`]: seit dem letzten Checkpoint
+    ///   wurde kein neues Audit-Ereignis aufgezeichnet.
+    /// - [`AuditError::CheckpointSigning`]: `crypt_guard` konnte mit
+    ///   `signing_key` nicht signieren (z. B. ungültige Seed-Länge).
+    /// - [`AuditError::Io`]: der Audit-/Checkpoint-Zustand konnte nicht
+    ///   dauerhaft geschrieben werden.
+    pub fn sign_checkpoint(&mut self, signing_key: &SecretBox<[u8]>) -> AuditResult<Checkpoint> {
+        let mut next_checkpoints = self.checkpoints.clone();
+        let checkpoint = next_checkpoints
+            .emit(
+                self.audit.chain_head(),
+                self.audit.len() as u64,
+                signing_key,
+            )?
+            .clone();
+        persist_audit_state(&self.root, &self.audit, &next_checkpoints)
+            .map_err(audit_persistence_error)?;
+        self.checkpoints = next_checkpoints;
+        Ok(checkpoint)
+    }
+
+    /// Verifiziert die In-Memory-Checkpoint-Kette gegen das In-Memory-Audit-Log
+    /// (§4.3, Schritte 1–3):
+    ///
+    /// 1. die Audit-Hash-Kette selbst ([`AuditLog::verify`]),
+    /// 2. die innere Checkpoint-Verkettung, strikte Monotonie der
+    ///    `event_count`-Werte und keinen Checkpoint jenseits der Log-Länge,
+    /// 3. für jeden Checkpoint: sein `chain_head_hash` ist exakt der
+    ///    Kettenkopf des Audit-Logs nach `event_count` Ereignissen, und seine
+    ///    ML-DSA-Signatur verifiziert gegen `verification_key`.
+    ///
+    /// # Errors
+    /// - [`AuditError::ChainBroken`]: die Audit- oder Checkpoint-Verkettung ist
+    ///   gebrochen, **oder** ein Checkpoint attestiert einen anderen
+    ///   Kettenkopf als das Audit-Log an dieser Position hat (dann ist
+    ///   `index` die `event_count` des Checkpoints, `expected` der
+    ///   tatsächliche Audit-Kettenkopf und `found` der signierte Wert).
+    /// - [`AuditError::NonMonotonicCheckpoint`] /
+    ///   [`AuditError::CheckpointBeyondLog`]: strukturelle Verletzungen
+    ///   (z. B. ein nach dem Checkpoint gekürztes Audit-Log).
+    /// - [`AuditError::InvalidCheckpointSignature`]: eine Signatur verifiziert
+    ///   nicht gegen `verification_key`.
+    pub fn verify_checkpoints(&self, verification_key: &[u8]) -> AuditResult<()> {
+        self.audit.verify()?;
+        self.checkpoints.verify_chain()?;
+        self.checkpoints.check_monotonic()?;
+        self.checkpoints.check_within_log(self.audit.len() as u64)?;
+        for checkpoint in self.checkpoints.checkpoints() {
+            let expected = audit_head_after(&self.audit, checkpoint.event_count).ok_or(
+                AuditError::CheckpointBeyondLog {
+                    referenced: checkpoint.event_count,
+                    actual: self.audit.len() as u64,
+                },
+            )?;
+            if expected != checkpoint.chain_head_hash {
+                return Err(AuditError::ChainBroken {
+                    index: checkpoint.event_count,
+                    expected,
+                    found: checkpoint.chain_head_hash,
+                });
+            }
+            self.checkpoints
+                .verify_signature(checkpoint, verification_key)?;
+        }
+        Ok(())
     }
 
     /// Load this store's persisted `audit.log` from disk and verify its hash
@@ -891,6 +983,30 @@ fn persistence_format_error(
     SecretsError::PersistenceFormat {
         operation: operation.into(),
         reason: reason.into(),
+    }
+}
+
+/// Kettenkopf des Audit-Logs nach genau `event_count` Ereignissen, oder
+/// `None`, wenn das Log kürzer ist. Setzt eine bereits verifizierte Kette
+/// voraus: dann ist `events[k].prev_hash` der Kopf nach `k` Ereignissen.
+fn audit_head_after(audit: &AuditLog, event_count: u64) -> Option<[u8; 32]> {
+    let index = usize::try_from(event_count).ok()?;
+    if index == audit.len() {
+        return Some(audit.chain_head());
+    }
+    audit.events().get(index).map(|event| event.prev_hash)
+}
+
+/// Überführt einen Persistenzfehler von [`persist_audit_state`] in den
+/// Audit-Fehlertyp. `persist_audit_state` erzeugt nur I/O-Fehler; jede andere
+/// Variante wird inhaltsfrei als `InvalidData` gemeldet.
+fn audit_persistence_error(error: SecretsError) -> AuditError {
+    match error {
+        SecretsError::Io(source) => AuditError::Io(source),
+        other => AuditError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            other.to_string(),
+        )),
     }
 }
 
@@ -1925,6 +2041,225 @@ mod tests {
             store.verify_persisted_audit_chain(),
             Err(AuditError::Io(_))
         ));
+        Ok(())
+    }
+
+    fn checkpoint_keypair() -> TestResult<(SecretBox<[u8]>, Vec<u8>)> {
+        let mut rng = crypt_guard::kem::backend::OsRng;
+        let (signing_key, verification_key) =
+            <crypt_guard::sign::ml_dsa::MlDsa65Impl as crypt_guard::sign::SignAlgorithm>::keypair(
+                &mut rng,
+            )
+            .map_err(crate::test_support::ctx(
+                "generate ML-DSA-65 checkpoint keypair",
+            ))?;
+        Ok((
+            SecretBox::new(signing_key.as_bytes().to_vec().into_boxed_slice()),
+            verification_key.as_bytes().to_vec(),
+        ))
+    }
+
+    #[test]
+    fn sign_checkpoint_attests_the_audit_head_and_verifies() -> TestResult {
+        let root = test_root("checkpoint-sign");
+        let mut store = store_with_root(root)?;
+        let (signing_key, verification_key) = checkpoint_keypair()?;
+        let value = SecretBox::new(b"checkpoint-token".to_vec().into_boxed_slice());
+        let id = store.create("provider-token", "provider-auth", &value)?;
+
+        let first = store.sign_checkpoint(&signing_key)?;
+        assert_eq!(first.event_count, 1);
+        assert_eq!(first.chain_head_hash, store.audit_log().chain_head());
+        assert_eq!(
+            first.prev_checkpoint_hash,
+            crate::audit::chain::GENESIS_HASH
+        );
+        assert!(!first.signature.is_empty());
+
+        store.delete(&id)?;
+        let second = store.sign_checkpoint(&signing_key)?;
+        assert_eq!(second.event_count, 2);
+        assert_eq!(second.chain_head_hash, store.audit_log().chain_head());
+        assert_eq!(
+            second.prev_checkpoint_hash,
+            crate::audit::checkpoint::checkpoint_hash(&first)
+        );
+
+        assert_eq!(store.checkpoint_log().len(), 2);
+        store.verify_checkpoints(&verification_key)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sign_checkpoint_without_new_events_is_refused_and_leaves_state_unchanged() -> TestResult {
+        let root = test_root("checkpoint-no-new-events");
+        let mut store = store_with_root(root)?;
+        let (signing_key, _) = checkpoint_keypair()?;
+        let value = SecretBox::new(b"checkpoint-token".to_vec().into_boxed_slice());
+        store.create("provider-token", "provider-auth", &value)?;
+        store.sign_checkpoint(&signing_key)?;
+
+        assert!(matches!(
+            store.sign_checkpoint(&signing_key),
+            Err(AuditError::NonMonotonicCheckpoint { index: 1 })
+        ));
+        assert_eq!(store.checkpoint_log().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_checkpoint_persistence_does_not_advance_memory_state() -> TestResult {
+        let root = test_root("checkpoint-persist-failure");
+        let mut store = store_with_root(root.clone())?;
+        let (signing_key, _) = checkpoint_keypair()?;
+        let value = SecretBox::new(b"checkpoint-token".to_vec().into_boxed_slice());
+        store.create("provider-token", "provider-auth", &value)?;
+        fs::remove_file(root.join(CHECKPOINT_FILE))?;
+        fs::create_dir(root.join(CHECKPOINT_FILE))?;
+
+        assert!(matches!(
+            store.sign_checkpoint(&signing_key),
+            Err(AuditError::Io(_))
+        ));
+        assert!(store.checkpoint_log().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn signed_checkpoints_persist_and_verify_on_disk() -> TestResult {
+        let root = test_root("checkpoint-persisted");
+        let mut store = store_with_root(root.clone())?;
+        let (signing_key, verification_key) = checkpoint_keypair()?;
+        let value = SecretBox::new(b"checkpoint-token".to_vec().into_boxed_slice());
+        let id = store.create("provider-token", "provider-auth", &value)?;
+        store.sign_checkpoint(&signing_key)?;
+        store.delete(&id)?;
+        store.sign_checkpoint(&signing_key)?;
+
+        assert_eq!(
+            store.verify_persisted_checkpoints(2, Some(&verification_key))?,
+            PersistedCheckpointStatus::Intact {
+                checkpoint_count: 2,
+                signatures_checked: true,
+            }
+        );
+
+        // Ein einzelnes umgekipptes Signaturbyte muss auf der Platte auffallen.
+        let signature = store
+            .checkpoint_log()
+            .checkpoints()
+            .last()
+            .ok_or(TestError::Missing("second checkpoint"))?
+            .signature
+            .clone();
+        let mut bytes = fs::read(root.join(CHECKPOINT_FILE))?;
+        let position = bytes
+            .windows(signature.len())
+            .position(|window| window == signature.as_slice())
+            .ok_or(TestError::Missing("signature bytes in checkpoints.log"))?;
+        bytes[position] ^= 0x01;
+        fs::write(root.join(CHECKPOINT_FILE), &bytes)?;
+
+        assert!(matches!(
+            store.verify_persisted_checkpoints(2, Some(&verification_key)),
+            Err(AuditError::InvalidCheckpointSignature { event_count: 2 })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn verify_checkpoints_rejects_a_wrong_verification_key() -> TestResult {
+        let root = test_root("checkpoint-wrong-key");
+        let mut store = store_with_root(root)?;
+        let (signing_key, _) = checkpoint_keypair()?;
+        let (_, other_verification_key) = checkpoint_keypair()?;
+        let value = SecretBox::new(b"checkpoint-token".to_vec().into_boxed_slice());
+        store.create("provider-token", "provider-auth", &value)?;
+        store.sign_checkpoint(&signing_key)?;
+
+        assert!(matches!(
+            store.verify_checkpoints(&other_verification_key),
+            Err(AuditError::InvalidCheckpointSignature { event_count: 1 })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn verify_checkpoints_detects_a_rewritten_audit_history() -> TestResult {
+        let root = test_root("checkpoint-rewritten-history");
+        let mut store = store_with_root(root)?;
+        let (signing_key, verification_key) = checkpoint_keypair()?;
+        let value = SecretBox::new(b"checkpoint-token".to_vec().into_boxed_slice());
+        store.create("provider-token", "provider-auth", &value)?;
+        let checkpoint = store.sign_checkpoint(&signing_key)?;
+
+        // Ein Angreifer ersetzt die Historie durch eine in sich konsistente
+        // Kette gleicher Länge: die Audit-Kette allein verifiziert, der
+        // signierte Kettenkopf aber nicht mehr.
+        let mut forged = store.audit_log().events().to_vec();
+        let first = forged
+            .first_mut()
+            .ok_or(TestError::Missing("audit event to forge"))?;
+        first.action = "secret.forged".to_owned();
+        store.audit = AuditLog::from_raw_events_for_test(forged);
+        store.audit_log().verify()?;
+
+        match store.verify_checkpoints(&verification_key) {
+            Err(AuditError::ChainBroken {
+                index: 1,
+                expected,
+                found,
+            }) => {
+                assert_eq!(expected, store.audit_log().chain_head());
+                assert_eq!(found, checkpoint.chain_head_hash);
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected a checkpoint head mismatch, got {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn verify_checkpoints_detects_a_truncated_audit_log() -> TestResult {
+        let root = test_root("checkpoint-truncated-history");
+        let mut store = store_with_root(root)?;
+        let (signing_key, verification_key) = checkpoint_keypair()?;
+        let value = SecretBox::new(b"checkpoint-token".to_vec().into_boxed_slice());
+        let id = store.create("provider-token", "provider-auth", &value)?;
+        store.delete(&id)?;
+        store.sign_checkpoint(&signing_key)?;
+
+        let mut truncated = store.audit_log().events().to_vec();
+        truncated.truncate(1);
+        store.audit = AuditLog::from_raw_events_for_test(truncated);
+
+        assert!(matches!(
+            store.verify_checkpoints(&verification_key),
+            Err(AuditError::CheckpointBeyondLog {
+                referenced: 2,
+                actual: 1,
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn verify_checkpoints_accepts_an_intermediate_checkpoint_after_more_events() -> TestResult {
+        let root = test_root("checkpoint-intermediate");
+        let mut store = store_with_root(root)?;
+        let (signing_key, verification_key) = checkpoint_keypair()?;
+        let value = SecretBox::new(b"checkpoint-token".to_vec().into_boxed_slice());
+        let id = store.create("provider-token", "provider-auth", &value)?;
+        store.sign_checkpoint(&signing_key)?;
+        store.delete(&id)?;
+
+        // Checkpoint bei Ereignis 1, Log inzwischen bei 2: der Kopf nach
+        // einem Ereignis ist `events[1].prev_hash`.
+        store.verify_checkpoints(&verification_key)?;
+        assert_eq!(store.checkpoint_log().len(), 1);
         Ok(())
     }
 }

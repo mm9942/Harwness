@@ -278,7 +278,11 @@ impl Warden {
     fn dispatch(&self, action: &WardenAction) -> crate::error::WardenResult<()> {
         match action {
             WardenAction::FreezeCgroup { cgroup } => self.freezer.freeze(cgroup),
-            WardenAction::ReleaseCgroup { cgroup } => self.releaser.release(cgroup),
+            WardenAction::ReleaseCgroup { cgroup } => {
+                // Freigabe hebt auch eine Netz-Isolation derselben cgroup auf.
+                self.releaser.release(cgroup)?;
+                self.isolator.release_isolation(cgroup)
+            }
             WardenAction::IsolateNetwork { cgroup } => self.isolator.isolate(cgroup),
             WardenAction::KillProcessTree { cgroup } => self.killer.kill(cgroup),
         }

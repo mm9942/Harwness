@@ -51,8 +51,8 @@
 //!
 //! # Concurrency
 //! The types are plain `Send + Sync` serde data. This crate spawns no threads;
-//! file-watching (workbench) and job scheduling (dream) are deferred to the
-//! parent build and surface as [`error::KnowledgeError::NotYetImplemented`].
+//! file-watching (workbench) is driven by the parent build; the dream job's
+//! cron schedule lives in [`context_steward`].
 
 #![forbid(unsafe_code)]
 

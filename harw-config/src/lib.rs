@@ -68,7 +68,7 @@ pub use provider_toml::{OriginAllowlistToml, ProviderToml, RateLimitToml};
 pub use research_toml::ResearchSection;
 pub use scope::{FIELD_TABLE, FieldScope, MergeRule, Scope, SettingScope};
 pub use skill_toml::SkillToml;
-pub use web_toml::WebSection;
+pub use web_toml::{WebSearchToml, WebSection};
 pub use writer::{ConfigWriter, RuleKind};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.

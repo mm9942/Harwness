@@ -51,7 +51,8 @@ harw-session-store = { path = "../harw-session-store" }
 harw-tool-shell = { path = "../harw-tool-shell" }
 harw-types = { path = "../harw-types" }
 # Kein `[workspace.dependencies]`-Eintrag für tokio; Version = Cargo.lock.
-tokio = { version = "1.53.0", features = ["rt", "sync", "time"] }
+tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time"] }
+harw-mcp-client = { path = "../harw-mcp-client" }
 tracing = { workspace = true }
 # secrecy 0.10 wie harw-provider-http/harw-model-catalog (Version = Cargo.lock)
 secrecy = "0.10.3"

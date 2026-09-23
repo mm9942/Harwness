@@ -4,6 +4,9 @@
 //! Transportdetails bewusst klein: JSON-RPC-Requests, optionale Session-ID,
 //! Bearer-Authentifizierung sowie JSON- und endliche SSE-Antworten.
 
+pub mod stdio;
+pub mod tool_bridge;
+
 use std::fmt;
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -47,12 +50,16 @@ pub enum McpError {
     /// Das aufgerufene Tool meldet `isError: true`. Dies ist ein
     /// fachlicher Fehler des Tools, kein Transport- oder Protokollfehler.
     ToolCallFailed(Vec<McpContent>),
+    /// Transportfehler abseits von HTTP (z. B. stdio-Prozess beendet,
+    /// Lese-/Schreibfehler auf der Pipe, Zeitüberschreitung).
+    Transport(String),
 }
 
 impl fmt::Display for McpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidEndpoint(reason) => write!(f, "invalid MCP endpoint: {reason}"),
+            Self::Transport(reason) => write!(f, "MCP transport failed: {reason}"),
             Self::InvalidHeader(name) => write!(f, "invalid MCP header: {name}"),
             Self::Http(error) => write!(f, "MCP HTTP request failed: {error}"),
             Self::UnexpectedStatus { status, body } => {

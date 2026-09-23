@@ -1,4 +1,4 @@
-//! `/agent` — Child-Agent-Management (list/stop gegen `ManagedAgentSpawner`).
+//! `/agent` — Child-Agent-Management (list/stop/budget gegen `ManagedAgentSpawner`).
 //!
 //! # Verantwortungsbereich
 //! Implementiert die `agent`-Operation gemäß Harwness Plan v2.
@@ -23,7 +23,12 @@
 //! `list` und `stop` lesen den `Arc<ManagedAgentSpawner>`-Service aus
 //! [`OpContext`], falls die TUI-Kompositionswurzel einen konfiguriert hat.
 //! Ohne registrierten Spawner liefert die Operation weiterhin fail-closed
-//! [`OpError::NotAvailable`]. `budget` bleibt vorerst [`OpError::NotAvailable`].
+//! [`OpError::NotAvailable`]. `budget` zeigt die globalen [`harw_core::ChildLimits`],
+//! die bei der Admission festgelegten [`harw_core::AgentBudget`]-Deckel je Kind
+//! (Tokens, Tool-Aufrufe, Wanduhrzeit, Reasoning-Effort, Tiefe/Tiefendecke)
+//! samt Live-Verbrauch aus `ChildRecord::live` sowie eine Aggregation je Rolle.
+//! Eine Budget-*Anpassung* (`/agent budget <id> <wert>`) bietet der Controller
+//! nicht an; sie bleibt fail-closed [`OpError::NotAvailable`].
 //!
 //! # Beispiel
 //! ```rust,no_run
@@ -59,10 +64,9 @@ use harw_operations::{OpContext, OpError, OpOutput};
 ///   Relevant für `budget`; bei `list` und `stop` ignoriert.
 ///
 /// # Verfügbarkeit
-/// Validierung und Routing der Sub-Kommandos gegen den `ManagedAgentSpawner`
-/// sind noch nicht verfügbar, weil die Boundary noch nicht in [`OpContext`]
-/// verdrahtet ist. Die Argumente werden weiterhin geparst, aber nicht in die
-/// Fehlermeldung übernommen.
+/// Die Sub-Kommandos werden gegen den in [`OpContext`] registrierten
+/// `ManagedAgentSpawner` geroutet. Argumentwerte werden nie in
+/// `NotAvailable`-Fehlermeldungen übernommen.
 ///
 /// # Beispiel
 /// ```rust
@@ -95,31 +99,35 @@ pub struct AgentArgs {
 ///
 /// # Beschreibung
 /// Der von der Runtime installierte [`harw_core::ManagedAgentSpawner`] ist die
-/// einzige Lifecycle-Grenze. `list` zeigt ausschließlich direkte Kinder der
-/// aktuellen Sitzung; `stop` akzeptiert einen Knoten aus deren Teilbaum und
-/// lässt die rekursive Abbruchwirkung beim Controller. Fehlt der Dienst,
-/// bleibt die Operation fail-closed mit [`OpError::NotAvailable`].
+/// einzige Lifecycle-Grenze. `list` zeigt den Teilbaum der aktuellen Sitzung;
+/// `stop` akzeptiert einen Knoten aus deren Teilbaum und lässt die rekursive
+/// Abbruchwirkung beim Controller. `budget` zeigt Limits, Budget-Deckel und
+/// Live-Verbrauch für den gesamten Teilbaum oder — mit `target` — für genau
+/// einen besessenen Knoten. Fehlt der Dienst, bleibt die Operation
+/// fail-closed mit [`OpError::NotAvailable`].
 ///
 /// **Command only**: Das Modell darf diese Operation nicht selbst aufrufen, da
 /// sich das Modell nicht selbst manipulieren darf. Kein `model_tool`-Attribut.
 ///
 /// # Argumente
-/// - `_ctx` (`&OpContext`): Session-Kontext (aktuell ungenutzt).
-/// - `_args` (`AgentArgs`): Typisierte Sub-Kommando-Argumente. `action`,
-///   `target` und `value` werden bis zur Boundary-Integration nicht ausgewertet.
+/// - `ctx` (`&OpContext`): Session-Kontext; liefert die aufrufende Session-ID
+///   und den `Arc<ManagedAgentSpawner>`-Dienst.
+/// - `args` (`AgentArgs`): Typisierte Sub-Kommando-Argumente.
 ///
 /// # Rückgabe
-/// Eine textuelle Liste, eine Abbruchbestätigung oder eine präzise
-/// [`OpError`]-Antwort für fehlende Dienste, ungültige Argumente und Ziele
-/// außerhalb des besessenen Teilbaums.
+/// Eine textuelle Liste, eine Abbruchbestätigung, einen Budget-Bericht oder
+/// eine präzise [`OpError`]-Antwort für fehlende Dienste, ungültige Argumente
+/// und Ziele außerhalb des besessenen Teilbaums.
 ///
 /// # Fehler
-/// Gibt [`OpError::InvalidArguments`] zurück, wenn `json_args` nicht in
-/// [`AgentArgs`] deserialisiert werden kann (wird vom Makro gehandhabt), oder
-/// [`OpError::NotAvailable`] für jede erfolgreich geparste Invocation.
+/// - [`OpError::InvalidArguments`]: `json_args` nicht deserialisierbar (Makro),
+///   unbekannte Action, `stop` ohne Ziel oder ein Ziel ohne aktiven Record.
+/// - [`OpError::NotAvailable`]: kein Spawner registriert, Ziel außerhalb des
+///   eigenen Teilbaums oder eine angefragte Budget-Anpassung (`value`).
 ///
 /// # Nebenläufigkeit
-/// Zustandslos; keine Locks, keine Threads, kein geteilter Zustand.
+/// Die Operation selbst ist zustandslos; der Spawner nimmt nur kurz seine
+/// internen Locks und liefert Snapshots zurück.
 ///
 /// # Beispiel
 /// ```rust,no_run
@@ -127,7 +135,7 @@ pub struct AgentArgs {
 /// ```
 #[operation(
     name = "agent",
-    summary = "Child-Agent-Management: list/stop gegen den registrierten ManagedAgentSpawner.",
+    summary = "Child-Agent-Management: list/stop/budget gegen den registrierten ManagedAgentSpawner.",
     domain = "agents",
     permission = "operator",
     command(path = "/agent", visibility = "channel_parity", busy = "immediate")
@@ -179,13 +187,156 @@ async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
                 )))
             }
         }
-        "budget" => Err(OpError::NotAvailable(
-            "child-agent budget adjustment is not available".to_owned(),
-        )),
+        "budget" => {
+            if args.value.is_some() {
+                return Err(OpError::NotAvailable(
+                    "child-agent budget adjustment is not available".to_owned(),
+                ));
+            }
+            let records = match args.target.as_deref() {
+                None => spawner.list_descendants_for(ctx.session_id()),
+                Some(target) => {
+                    let child_id = harw_types::SessionId::from_str(target.to_owned());
+                    if !spawner.owns_descendant(ctx.session_id(), &child_id) {
+                        return Err(OpError::NotAvailable(
+                            "agent target is unavailable in this parent session".to_owned(),
+                        ));
+                    }
+                    let Some(record) = spawner.child_record(&child_id) else {
+                        return Err(OpError::InvalidArguments(format!(
+                            "no admitted child agent found for target '{target}'"
+                        )));
+                    };
+                    vec![record]
+                }
+            };
+            Ok(OpOutput::from(format_budget_report(
+                &spawner.limits(),
+                &records,
+                jiff::Timestamp::now(),
+            )))
+        }
         unknown => Err(OpError::InvalidArguments(format!(
             "unknown /agent action '{unknown}'"
         ))),
     }
+}
+
+/// Formatiert den Budget-Bericht für `/agent budget`.
+///
+/// # Beschreibung
+/// Reine Darstellungsfunktion ohne Spawner-Zugriff, damit sie ohne
+/// admittierte Kinder testbar ist. Der Bericht besteht aus
+/// 1. den globalen [`harw_core::ChildLimits`] des Controllers,
+/// 2. einer Aggregation je Rolle (Anzahl, summierte Live-Tokens und
+///    Tool-Aufrufe) und
+/// 3. je Kind dem Budget-Deckel aus `ChildRecord::budget` gegenüber dem
+///    Live-Verbrauch aus `ChildRecord::live` (Tokens = Input + Output wie bei
+///    der Controller-eigenen Überbudget-Erkennung) und der seit `admitted_at`
+///    vergangenen Wanduhrzeit, plus Tiefe gegen die geerbte Tiefendecke.
+///
+/// # Argumente
+/// - `limits` (`&ChildLimits`): globale Admission-Limits des Spawners.
+/// - `records` (`&[ChildRecord]`): die anzuzeigenden, besessenen Kinder.
+/// - `now` (`jiff::Timestamp`): Referenzzeitpunkt für die Wanduhrzeit.
+///
+/// # Rückgabe
+/// Mehrzeiliger Text; bei leerem `records` nur die Limits und der Hinweis
+/// „Keine aktiven Child-Agents.“.
+///
+/// # Nebenläufigkeit
+/// Reine Funktion; kein geteilter Zustand.
+fn format_budget_report(
+    limits: &harw_core::ChildLimits,
+    records: &[harw_core::ChildRecord],
+    now: jiff::Timestamp,
+) -> String {
+    let mut lines = vec![format!(
+        "Child-Agent-Limits: max_depth={}, max_active_children_per_parent={}, lease_seconds={}",
+        limits.max_depth, limits.max_active_children_per_parent, limits.lease_seconds
+    )];
+    if records.is_empty() {
+        lines.push("Keine aktiven Child-Agents.".to_owned());
+        return lines.join("\n");
+    }
+
+    let mut per_role: std::collections::BTreeMap<&str, (usize, u64, u64)> =
+        std::collections::BTreeMap::new();
+    for record in records {
+        let entry = per_role.entry(record.role.as_str()).or_insert((0, 0, 0));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = entry.1.saturating_add(record.live.usage.total());
+        entry.2 = entry.2.saturating_add(u64::from(record.live.tool_calls));
+    }
+    lines.push("Je Rolle:".to_owned());
+    for (role, (count, tokens, tool_calls)) in &per_role {
+        lines.push(format!(
+            "- {role}: {count} Kind(er), tokens={tokens}, tool_calls={tool_calls}"
+        ));
+    }
+
+    lines.push(format!("{} Child-Agent(s):", records.len()));
+    for record in records {
+        let elapsed_ms = u64::try_from(now.duration_since(record.admitted_at).as_millis().max(0))
+            .unwrap_or(u64::MAX);
+        let effort = record.budget.reasoning_effort.map_or_else(
+            || "provider-default".to_owned(),
+            |effort| effort.to_string(),
+        );
+        lines.push(format!(
+            "- {} (role={}, status={}, depth={}/{})",
+            record.child,
+            record.role,
+            record.status.as_str(),
+            record.depth,
+            record.depth_ceiling
+        ));
+        lines.push(format!(
+            "  tokens: {}",
+            usage_against_limit(record.live.usage.total(), record.budget.max_tokens, "")
+        ));
+        lines.push(format!(
+            "  tool_calls: {}",
+            usage_against_limit(
+                u64::from(record.live.tool_calls),
+                record.budget.max_tool_calls.map(u64::from),
+                ""
+            )
+        ));
+        lines.push(format!(
+            "  wall_time: {}",
+            usage_against_limit(elapsed_ms, record.budget.max_wall_time_ms, "ms")
+        ));
+        lines.push(format!("  reasoning_effort: {effort}"));
+    }
+    lines.join("\n")
+}
+
+/// Formatiert `used` gegen ein optionales Limit als `used / limit (p%)`.
+///
+/// # Argumente
+/// - `used` (`u64`): bisheriger Verbrauch.
+/// - `limit` (`Option<u64>`): Deckel; `None` = unbegrenzt.
+/// - `unit` (`&str`): Einheitensuffix für beide Werte (z. B. `"ms"`).
+///
+/// # Rückgabe
+/// `"<used><unit> / unbegrenzt"` ohne Deckel, sonst
+/// `"<used><unit> / <limit><unit> (<p>%)"`, bei Überschreitung mit Zusatz
+/// `" ÜBERSCHRITTEN"`. Ein Deckel `0` liefert keinen Prozentwert.
+fn usage_against_limit(used: u64, limit: Option<u64>, unit: &str) -> String {
+    let Some(limit) = limit else {
+        return format!("{used}{unit} / unbegrenzt");
+    };
+    let mut text = if limit == 0 {
+        format!("{used}{unit} / {limit}{unit}")
+    } else {
+        let percent = u128::from(used).saturating_mul(100) / u128::from(limit);
+        format!("{used}{unit} / {limit}{unit} ({percent}%)")
+    };
+    if used > limit {
+        text.push_str(" ÜBERSCHRITTEN");
+    }
+    text
 }
 
 #[cfg(test)]
@@ -411,6 +562,228 @@ mod tests {
         std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
 
         assert!(matches!(result, Err(OpError::NotAvailable(_))));
+        Ok(())
+    }
+
+    fn context_with_spawner() -> TestResult<(OpContext, std::path::PathBuf)> {
+        use harw_core::{ChildLimits, ManagedAgentSpawner, SessionManager};
+        use std::sync::{Arc, Mutex};
+
+        let (ctx, root) = test_context()?;
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(event_tx)));
+        let spawner = Arc::new(ManagedAgentSpawner::new(
+            manager,
+            ChildLimits::conservative(),
+        ));
+        let mut services = ServiceMap::new();
+        services.insert(spawner);
+        Ok((
+            OpContext::new(
+                ctx.session_id().clone(),
+                ctx.turn_id().clone(),
+                ctx.sandbox().clone(),
+                services,
+            ),
+            root,
+        ))
+    }
+
+    fn record(
+        child: &str,
+        role: &str,
+        budget: harw_core::AgentBudget,
+        tokens: (u64, u64),
+        tool_calls: u32,
+        admitted_at: jiff::Timestamp,
+    ) -> harw_core::ChildRecord {
+        harw_core::ChildRecord {
+            child: SessionId::from_str(child),
+            parent: SessionId::from_str("parent-1"),
+            handoff_call_id: harw_types::ToolCallId::from_str(format!("call-{child}")),
+            role: role.to_owned(),
+            depth: 1,
+            admitted_at,
+            lease_expires_at: admitted_at,
+            budget,
+            allow_pause: false,
+            depth_ceiling: 3,
+            trace: None,
+            status: harw_core::child_controller::ChildStatus::Running,
+            task_complexity: None,
+            live: harw_core::child_controller::ChildLiveStats {
+                usage: harw_types::TokenUsage {
+                    input_tokens: tokens.0,
+                    output_tokens: tokens.1,
+                    ..harw_types::TokenUsage::default()
+                },
+                tool_calls,
+            },
+        }
+    }
+
+    #[test]
+    fn usage_against_limit_formats_unlimited_percent_and_exceeded() -> TestResult {
+        assert_eq!(super::usage_against_limit(5, None, ""), "5 / unbegrenzt");
+        assert_eq!(
+            super::usage_against_limit(25, Some(100), ""),
+            "25 / 100 (25%)"
+        );
+        assert_eq!(
+            super::usage_against_limit(1500, Some(1000), "ms"),
+            "1500ms / 1000ms (150%) ÜBERSCHRITTEN"
+        );
+        assert_eq!(
+            super::usage_against_limit(1, Some(0), ""),
+            "1 / 0 ÜBERSCHRITTEN"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn format_budget_report_without_children_shows_limits_only() -> TestResult {
+        let report = super::format_budget_report(
+            &harw_core::ChildLimits::conservative(),
+            &[],
+            jiff::Timestamp::UNIX_EPOCH,
+        );
+        assert!(
+            report.contains("max_depth=4, max_active_children_per_parent=8, lease_seconds=900")
+        );
+        assert!(report.contains("Keine aktiven Child-Agents."));
+        assert!(!report.contains("Je Rolle"));
+        Ok(())
+    }
+
+    #[test]
+    fn format_budget_report_shows_per_child_budget_live_usage_and_role_totals() -> TestResult {
+        let admitted = jiff::Timestamp::from_second(1_000).map_err(ctx("admitted timestamp"))?;
+        let now = jiff::Timestamp::from_second(1_012).map_err(ctx("now timestamp"))?;
+        let capped = harw_core::AgentBudget {
+            max_tokens: Some(1_000),
+            max_tool_calls: Some(4),
+            max_wall_time_ms: Some(10_000),
+            reasoning_effort: Some(harw_types::ReasoningEffort::High),
+        };
+        let records = vec![
+            record("child-a", "explorer", capped, (200, 50), 2, admitted),
+            record(
+                "child-b",
+                "explorer",
+                harw_core::AgentBudget::default(),
+                (100, 0),
+                7,
+                admitted,
+            ),
+            record(
+                "child-c",
+                "worker",
+                harw_core::AgentBudget::default(),
+                (0, 0),
+                0,
+                admitted,
+            ),
+        ];
+        let report =
+            super::format_budget_report(&harw_core::ChildLimits::conservative(), &records, now);
+
+        assert!(report.contains("- explorer: 2 Kind(er), tokens=350, tool_calls=9"));
+        assert!(report.contains("- worker: 1 Kind(er), tokens=0, tool_calls=0"));
+        assert!(report.contains("3 Child-Agent(s):"));
+        assert!(report.contains("- child-a (role=explorer, status=running, depth=1/3)"));
+        assert!(report.contains("  tokens: 250 / 1000 (25%)"));
+        assert!(report.contains("  tool_calls: 2 / 4 (50%)"));
+        assert!(report.contains("  wall_time: 12000ms / 10000ms (120%) ÜBERSCHRITTEN"));
+        assert!(report.contains("  reasoning_effort: high"));
+        assert!(report.contains("  tokens: 100 / unbegrenzt"));
+        assert!(report.contains("  tool_calls: 7 / unbegrenzt"));
+        assert!(report.contains("  reasoning_effort: provider-default"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_budget_with_spawner_and_no_children_reports_limits() -> TestResult {
+        let (ctx, root) = context_with_spawner()?;
+        let result = super::agent(
+            &ctx,
+            AgentArgs {
+                action: Some("budget".to_owned()),
+                target: None,
+                value: None,
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
+        match result {
+            Ok(output) => {
+                assert!(output.text.contains("Child-Agent-Limits: max_depth=4"));
+                assert!(output.text.contains("Keine aktiven Child-Agents."));
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected Ok budget report, got: {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_budget_adjustment_with_spawner_is_not_available_and_does_not_leak() -> TestResult
+    {
+        let (ctx, root) = context_with_spawner()?;
+        let result = super::agent(
+            &ctx,
+            AgentArgs {
+                action: Some("budget".to_owned()),
+                target: Some("sensitive-agent-id".to_owned()),
+                value: Some("secret-budget".to_owned()),
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
+        match result {
+            Err(OpError::NotAvailable(message)) => {
+                assert_eq!(message, "child-agent budget adjustment is not available");
+                assert!(!message.contains("sensitive-agent-id"));
+                assert!(!message.contains("secret-budget"));
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable, got: {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_budget_with_unowned_target_is_not_available() -> TestResult {
+        let (ctx, root) = context_with_spawner()?;
+        let result = super::agent(
+            &ctx,
+            AgentArgs {
+                action: Some("budget".to_owned()),
+                target: Some("unknown-child".to_owned()),
+                value: None,
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(root).map_err(crate::test_support::ctx("remove test workspace"))?;
+        match result {
+            Err(OpError::NotAvailable(message)) => {
+                assert_eq!(
+                    message,
+                    "agent target is unavailable in this parent session"
+                );
+                assert!(!message.contains("unknown-child"));
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected NotAvailable, got: {other:?}"
+                )));
+            }
+        }
         Ok(())
     }
 }

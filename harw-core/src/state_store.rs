@@ -1559,6 +1559,7 @@ mod tests {
             version: SESSION_STATE_VERSION,
             mode,
             total_usage: TokenUsage {
+                cache_separate: false,
                 input_tokens,
                 output_tokens: 2,
                 reasoning_tokens: None,

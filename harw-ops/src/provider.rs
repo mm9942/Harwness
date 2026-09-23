@@ -23,7 +23,10 @@
 //!   Also reports credential status (variant type, not value) for the active provider.
 //! - `list`: enumerates every provider in the live resolved configuration and marks each as `[active]`,
 //!   `[auth-ok]`, or `[auth-missing]`.
-//! - `test`: shows the auth-ref type for the config-default provider (no secret value).
+//! - `test`: tests the runtime-active (else config-default) provider: auth-ref type
+//!   (no secret value) plus a live HTTP connection test through the
+//!   [`ProviderConnectionCheck`] service (`GET /models`); without a registered
+//!   service the live line says so and only the configuration is reported.
 //!
 //! `switch` is **no longer** a `/provider` sub-command (Welle 2, 2d). An atomic
 //! provider(+model) switch is exclusively driven by `/model switch <id>` (and,
@@ -59,7 +62,140 @@
 use harw_macros::operation;
 use harw_operations::session_control::UiaSelection;
 use harw_operations::{OpContext, OpError, OpOutput, SharedSessionController};
+use harw_provider_http::discovery::DiscoveryError;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+
+/// Ergebnis eines erfolgreichen Live-Verbindungstests gegen einen Provider.
+///
+/// # Fields
+/// - `model_count` (`usize`): Anzahl der vom `/models`-Endpunkt gemeldeten
+///   Modelle. `0` ist zwar eine HTTP-Erfolgsantwort, deutet aber fast immer
+///   auf ein Auth-/Endpunkt-Problem hin (siehe `harw models scan`).
+/// - `credential_sent` (`bool`): ob die Anfrage mit einem aufgelösten
+///   Credential gesendet wurde (`false` = unauthentifiziert, etwa lokales
+///   Ollama oder eine nicht auflösbare `auth`-Referenz).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionCheckReport {
+    /// Anzahl der gemeldeten Modelle.
+    pub model_count: usize,
+    /// Ob ein Credential mitgesendet wurde.
+    pub credential_sent: bool,
+}
+
+/// Rückgabe-Future von [`ProviderConnectionCheck::check`].
+pub type ConnectionCheckFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ConnectionCheckReport, DiscoveryError>> + Send + 'a>>;
+
+/// Live-Verbindungstest (HTTP) gegen einen konfigurierten Provider.
+///
+/// # Description
+/// `/provider test` und `/uia-provider test` suchen diesen Dienst als
+/// [`SharedProviderConnectionCheck`] (`Arc<dyn ProviderConnectionCheck>`) im
+/// [`OpContext`]. Fehlt er, melden beide Ops nur den statischen
+/// Konfigurationsbefund und sagen ausdrücklich, dass kein Live-Test lief —
+/// die Operation schlägt dann **nicht** fehl.
+///
+/// Die Produktions-Implementierung ist [`DiscoveryConnectionCheck`] (dieselbe
+/// `/models`-Abfrage wie `harw models scan`); Tests setzen eigene Attrappen
+/// ein, damit sie nie ins Netz gehen.
+///
+/// # Concurrency
+/// `Send + Sync`, damit der Dienst in der `ServiceMap` liegen und über
+/// `.await` hinweg geborgt werden kann.
+pub trait ProviderConnectionCheck: Send + Sync {
+    /// Prüft die Erreichbarkeit und Anmeldung von `provider`.
+    ///
+    /// # Arguments
+    /// - `provider_name` (`&str`): kanonischer Provider-Name (Diagnose).
+    /// - `provider` (`&harw_config::ProviderToml`): Konfigurationseintrag.
+    /// - `config` (`&harw_config::ResolvedConfig`): liefert den Env-Layer für
+    ///   `env:`-Credential-Referenzen.
+    ///
+    /// # Errors
+    /// [`DiscoveryError`] klassifiziert Auth-, API-, Netzwerk-, Decode- und
+    /// „nicht unterstützt"-Fehler; der Text enthält nie ein Geheimnis.
+    fn check<'a>(
+        &'a self,
+        provider_name: &'a str,
+        provider: &'a harw_config::ProviderToml,
+        config: &'a harw_config::ResolvedConfig,
+    ) -> ConnectionCheckFuture<'a>;
+}
+
+/// Die Form, in der [`ProviderConnectionCheck`] im [`OpContext`] registriert
+/// wird (`ServiceMap` indiziert nach konkretem Typ).
+pub type SharedProviderConnectionCheck = Arc<dyn ProviderConnectionCheck>;
+
+/// Produktions-[`ProviderConnectionCheck`] über
+/// [`harw_provider_http::discovery::list_models`].
+///
+/// # Description
+/// Löst das Credential exakt wie `harw models scan` über
+/// [`harw_provider_http::discovery::resolve_provider_api_key`] auf (mit
+/// harw-Home für `file:`-Referenzen und optionalem sealed-secret-Resolver für
+/// `secrets:`-Referenzen); ein Klartext-`api_key` dient als Rückfall. Danach
+/// wird `GET {base_url}/models` (bzw. `/v1/models` für
+/// `anthropic-messages`) mit 20-s-Zeitlimit abgefragt. Der Schlüssel wird nie
+/// geloggt oder ausgegeben.
+pub struct DiscoveryConnectionCheck {
+    home: Option<PathBuf>,
+    resolver: Option<Arc<dyn harw_provider_http::SecretResolver + Send + Sync>>,
+}
+
+impl DiscoveryConnectionCheck {
+    /// Baut den Test mit harw-Home und optionalem `secrets:`-Resolver.
+    ///
+    /// # Arguments
+    /// - `home` (`Option<PathBuf>`): harw-Home für `file:`-Credentials;
+    ///   `None` lässt solche Referenzen unaufgelöst.
+    /// - `resolver`: sealed-secret-Resolver der Runtime; `None` lässt
+    ///   `secrets:`-Referenzen unaufgelöst.
+    #[must_use]
+    pub fn new(
+        home: Option<PathBuf>,
+        resolver: Option<Arc<dyn harw_provider_http::SecretResolver + Send + Sync>>,
+    ) -> Self {
+        Self { home, resolver }
+    }
+}
+
+impl ProviderConnectionCheck for DiscoveryConnectionCheck {
+    fn check<'a>(
+        &'a self,
+        provider_name: &'a str,
+        provider: &'a harw_config::ProviderToml,
+        config: &'a harw_config::ResolvedConfig,
+    ) -> ConnectionCheckFuture<'a> {
+        // Synchron vor dem ersten `.await` auflösen: der Resolver muss so
+        // nicht über einen Suspend-Punkt hinweg geborgt werden.
+        let resolver = self
+            .resolver
+            .as_deref()
+            .map(|resolver| resolver as &dyn harw_provider_http::SecretResolver);
+        let api_key = harw_provider_http::discovery::resolve_provider_api_key(
+            provider_name,
+            provider,
+            config,
+            self.home.as_deref(),
+            resolver,
+        )
+        .or_else(|| provider.api_key.clone().filter(|key| !key.is_empty()));
+        Box::pin(async move {
+            let models = harw_provider_http::discovery::list_models(
+                provider_name,
+                provider,
+                api_key.as_deref(),
+            )
+            .await?;
+            Ok(ConnectionCheckReport {
+                model_count: models.len(),
+                credential_sent: api_key.is_some(),
+            })
+        })
+    }
+}
 
 /// Argument struct for the `/provider` command.
 ///
@@ -67,7 +203,8 @@ use std::sync::Arc;
 /// - `cmd` (`Option<String>`): optional sub-command. Valid values:
 ///   - `"show"` (default) — shows the runtime-active provider.
 ///   - `"list"` — enumerates all configured providers (no secret values).
-///   - `"test"` — shows auth-ref type of the default provider (no secret value).
+///   - `"test"` — auth-ref type (no secret value) plus live connection test of the
+///     runtime-active, else default provider.
 ///
 ///   Any other value (including a bare `"switch ..."`, no longer supported
 ///   here — see `/model switch`) is rejected with [`harw_operations::OpError::InvalidArguments`].
@@ -162,7 +299,8 @@ pub(crate) fn resolved_config(
 ///   the credential variant type for the active provider (no secret value).
 /// - **`list`**: enumerates every provider in the resolved configuration; marks each as active,
 ///   `auth-ok`, or `auth-missing`.
-/// - **`test`**: shows the auth-ref type for the config-default provider.
+/// - **`test`**: auth-ref type plus live connection test (see [`ProviderConnectionCheck`])
+///   for the runtime-active, else config-default provider.
 /// - **anything else** (including `switch ...`, retired here — see `/model
 ///   switch`): returns [`OpError::InvalidArguments`] pointing to `/model`.
 ///
@@ -192,7 +330,7 @@ pub(crate) fn resolved_config(
 /// // Invoked via the harw dispatcher — no direct calls.
 /// // /provider            → shows runtime-active provider
 /// // /provider list       → lists all configured providers
-/// // /provider test       → shows auth-ref type of config-default provider
+/// // /provider test       → auth-ref type + live connection test of the active provider
 /// // /model switch <id>   → atomically switches provider+model (see harw-ops::model)
 /// ```
 #[operation(
@@ -216,7 +354,7 @@ async fn provider(ctx: &OpContext, args: ProviderArgs) -> Result<OpOutput, OpErr
     match sub {
         "show" => handle_show(ctx),
         "list" => handle_list(ctx),
-        "test" => handle_test(ctx),
+        "test" => handle_test(ctx).await,
         other => Err(OpError::InvalidArguments(format!(
             "Unknown /provider sub-command: '{other}'. \
              Supported: show, list, test. Use `/model` to change the active provider and model together."
@@ -284,8 +422,8 @@ fn handle_show(ctx: &OpContext) -> Result<OpOutput, OpError> {
             Some(name) => match configured_provider(&config, name) {
                 Some((canonical_id, _)) => {
                     let mut text = format!(
-                        "Active provider : {canonical_id}  (default from config, not yet switched)\n\
-                     Use `/provider switch <id>` to change the active provider."
+                        "Active provider : {canonical_id}  (config default — no runtime switch in this session)\n\
+                     Use `/model switch <id>` to change provider and model together."
                     );
                     append_load_status(ctx, canonical_id, &mut text);
                     text
@@ -307,13 +445,14 @@ fn handle_show(ctx: &OpContext) -> Result<OpOutput, OpError> {
 /// [`harw_provider_http::ProviderLoadControl`] handle for `canonical_id`.
 ///
 /// # Description
-/// Silently a no-op when either is missing — most commonly because the
-/// composition root has not (yet) wired a [`harw_provider_http::ProviderLoadRegistry`]
-/// into the [`harw_operations::context::ServiceMap`] (see
-/// `harw_provider_http::build_provider_with_load_registry`), or because
-/// `canonical_id` names an `anthropic-messages` provider, which currently has
-/// no `ProviderLoadControl` implementation. `/provider show` must keep
-/// working (with only the base info) either way — this is purely additive.
+/// Silently a no-op when either is missing. The runtime
+/// (`harw_runtime::services::RuntimeServices`) registers a
+/// [`harw_provider_http::ProviderLoadRegistry`] on every surface, so a missing
+/// registry only occurs in standalone/test contexts; a missing handle means
+/// `canonical_id` was not built as a model provider in this run (the registry
+/// only holds the root and UIA providers, OpenAI-compatible and
+/// `anthropic-messages` alike). `/provider show` must keep working (with only
+/// the base info) either way — this is purely additive.
 ///
 /// # Arguments
 /// - `ctx` (`&OpContext`): execution context, queried for the registry service.
@@ -730,46 +869,11 @@ pub(crate) fn handle_uia_switch_core(
     Ok(OpOutput::from(text))
 }
 
-/// Implements `/provider test` — shows the auth-ref type for the config-default provider.
-///
-/// # Description
-/// Reads `harness.default_provider` from the config layer and reports what
-/// auth method is configured. Shows only the variant type — never the secret
-/// value. Also reports whether the provider is enabled.
-///
-/// # Returns
-/// [`OpOutput`] with auth-type label and provider status.
-///
-/// # Errors
-/// - [`OpError::Execution`]: config discovery failed.
-///
-/// # Concurrency
-/// Stateless; thread-safe.
-///
-/// # Spec Reference
-/// harwness Plan v2 — `/provider test`.
-fn handle_test(ctx: &OpContext) -> Result<OpOutput, OpError> {
-    let config = resolved_config(ctx)?;
-
-    let Some(default_name) = &config.harness.default_provider else {
-        return Ok(OpOutput::from(
-            "No default provider configured — no test possible. \
-             Use `harw onboard` to set one up."
-                .to_owned(),
-        ));
-    };
-
-    let Some(provider_toml) = config.providers.get(default_name) else {
-        return Ok(OpOutput::from(format!(
-            "Default provider '{default_name}' is listed in harness config but \
-             no matching provider entry was found.\n\
-             Run `harw onboard` again or check your config layers."
-        )));
-    };
-
-    let auth_info = match &provider_toml.auth {
+/// Beschreibt die konfigurierte Auth-Methode eines Providers — nur den
+/// Referenztyp (Präfix vor `:`), nie den Wert.
+fn auth_method_line(provider: &harw_config::ProviderToml) -> String {
+    match &provider.auth {
         Some(secret_ref) => {
-            // Show only the ref type (prefix before ':'), never the value.
             let ref_string = secret_ref.as_ref_string();
             let ref_type = ref_string
                 .split_once(':')
@@ -777,12 +881,111 @@ fn handle_test(ctx: &OpContext) -> Result<OpOutput, OpError> {
                 .unwrap_or("unknown");
             format!("Auth method: {ref_type}:  [ref present — value not shown]")
         }
-        None if provider_toml.has_plaintext_secret() => {
+        None if provider.has_plaintext_secret() => {
             "Auth method: api_key (plaintext) — WARNING: insecure; \
              use an `auth` SecretRef instead."
                 .to_owned()
         }
         None => "Auth method: (none) — provider has no `auth` field configured.".to_owned(),
+    }
+}
+
+/// Führt den Live-Verbindungstest über den registrierten
+/// [`ProviderConnectionCheck`] aus und liefert eine einzeilige Befundzeile.
+///
+/// # Description
+/// Degradiert statt zu scheitern: ein deaktivierter Provider wird nicht
+/// kontaktiert, und ohne registrierten Dienst meldet die Zeile klar, dass
+/// nur die Konfiguration geprüft wurde. Fehler des Tests (Auth, Netzwerk,
+/// HTTP-Status) sind ein *Befund* und damit Teil der Ausgabe, kein
+/// [`OpError`].
+async fn live_connection_line(
+    ctx: &OpContext,
+    provider_name: &str,
+    provider: &harw_config::ProviderToml,
+    config: &harw_config::ResolvedConfig,
+) -> String {
+    const LABEL: &str = "Live test        :";
+    if !provider.enabled {
+        return format!("{LABEL} skipped — provider is disabled in configuration");
+    }
+    let Some(check) = ctx.service::<SharedProviderConnectionCheck>() else {
+        return format!(
+            "{LABEL} unavailable — this runtime has no provider connection-check service \
+             registered; only the configuration above was checked"
+        );
+    };
+    match check.check(provider_name, provider, config).await {
+        Ok(report) => {
+            let auth = if report.credential_sent {
+                "authenticated"
+            } else {
+                "unauthenticated"
+            };
+            if report.model_count == 0 {
+                format!(
+                    "{LABEL} reachable ({auth}), but 0 models reported — \
+                     check credentials and endpoint"
+                )
+            } else {
+                format!(
+                    "{LABEL} OK — reachable ({auth}), {count} models reported",
+                    count = report.model_count
+                )
+            }
+        }
+        Err(DiscoveryError::Unsupported { api }) => {
+            format!("{LABEL} not supported for provider API '{api}'")
+        }
+        Err(error) => format!("{LABEL} FAILED — {error}"),
+    }
+}
+
+/// Implements `/provider test` — static auth check plus live connection test.
+///
+/// # Description
+/// Tests the runtime-active provider (controller snapshot) if one was
+/// switched in this session, otherwise `harness.default_provider`. Reports
+/// the configured auth method (variant type only — never the secret value),
+/// whether the provider is enabled, and the result of a live HTTP connection
+/// test via the [`ProviderConnectionCheck`] service (see
+/// [`live_connection_line`] — degrades with a clear note when no service is
+/// registered).
+///
+/// # Returns
+/// [`OpOutput`] with auth-type label, provider status and live-test line.
+///
+/// # Errors
+/// - [`OpError::Execution`]: config discovery failed.
+///
+/// # Concurrency
+/// Stateless; thread-safe. Awaits at most one HTTP request (20 s timeout).
+///
+/// # Spec Reference
+/// harwness Plan v2 — `/provider test`.
+async fn handle_test(ctx: &OpContext) -> Result<OpOutput, OpError> {
+    let config = resolved_config(ctx)?;
+
+    let runtime_active = ctx
+        .service::<SharedSessionController>()
+        .and_then(|controller| controller.snapshot().active_provider);
+    let (label, target_name) = match (runtime_active, &config.harness.default_provider) {
+        (Some(active), _) => ("Active provider  :", active),
+        (None, Some(default_name)) => ("Default provider :", default_name.clone()),
+        (None, None) => {
+            return Ok(OpOutput::from(
+                "No default provider configured — no test possible. \
+                 Use `harw onboard` to set one up."
+                    .to_owned(),
+            ));
+        }
+    };
+
+    let Some((canonical, provider_toml)) = configured_provider(&config, &target_name) else {
+        return Ok(OpOutput::from(format!(
+            "Provider '{target_name}' is not present in the configured provider catalog.\n\
+             Run `harw onboard` again or check your config layers."
+        )));
     };
 
     let status = if provider_toml.enabled {
@@ -790,14 +993,15 @@ fn handle_test(ctx: &OpContext) -> Result<OpOutput, OpError> {
     } else {
         "disabled"
     };
+    let live = live_connection_line(ctx, canonical, provider_toml, &config).await;
 
     Ok(OpOutput::from(format!(
-        "Default provider : {default_name}  [{status}]\n\
+        "{label} {canonical}  [{status}]\n\
          API type         : {api}\n\
          {auth_info}\n\
-         Note: live connection test (HTTP ping) not yet wired — \
-         re-run after harw-provider-http integration.",
+         {live}",
         api = provider_toml.api,
+        auth_info = auth_method_line(provider_toml),
     )))
 }
 
@@ -904,9 +1108,10 @@ fn parse_concurrency_value(raw: &str) -> Result<Option<usize>, OpError> {
 /// - [`OpError::InvalidArguments`]: missing provider/value, unknown provider,
 ///   or a malformed value (see [`parse_concurrency_value`]).
 /// - [`OpError::NotAvailable`]: no [`harw_provider_http::ProviderLoadRegistry`]
-///   is registered in the [`OpContext`] (composition root has not wired it
-///   in yet), or the resolved provider has no registered handle (currently:
-///   any `anthropic-messages` provider — see
+///   is registered in the [`OpContext`] (the runtime registers one on every
+///   surface, so this only happens in standalone/test contexts), or the
+///   resolved provider has no registered handle (it was not built as the
+///   root or UIA model provider in this run — see
 ///   `harw_provider_http::build_named_provider` doc).
 ///
 /// # Spec Reference
@@ -956,16 +1161,16 @@ async fn provider_concurrency(
         .service::<harw_provider_http::ProviderLoadRegistry>()
         .ok_or_else(|| {
             OpError::NotAvailable(
-                "provider load-control registry is not available in this runtime \
-                 (the composition root has not wired a ProviderLoadRegistry into the \
-                 ServiceMap yet)"
+                "provider load-control registry is not available in this execution context \
+                 (no ProviderLoadRegistry registered in the ServiceMap)"
                     .to_owned(),
             )
         })?;
     let control = registry.get(canonical_id).ok_or_else(|| {
         OpError::NotAvailable(format!(
             "provider '{canonical_id}' has no live load-control handle \
-             (only OpenAI-compatible backends currently expose this)"
+             (only providers built as the root or UIA model provider in this run are \
+             registered)"
         ))
     })?;
 
@@ -998,7 +1203,8 @@ async fn provider_concurrency(
 /// - **`show`** (default): reports the effective UIA provider/model from the
 ///   live UIA selection, otherwise `uia_provider`/`uia_model` config.
 /// - **`list`**: lists the provider catalog and marks the effective UIA provider.
-/// - **`test`**: tests the effective UIA provider's configured auth variant.
+/// - **`test`**: reports the effective UIA provider's configured auth variant
+///   and runs the live connection test (see [`ProviderConnectionCheck`]).
 /// - **anything else** (including `switch ...`, retired here — see
 ///   `/uia-model switch`, which resolves the target model's configured
 ///   provider and delegates to [`handle_uia_switch_core`]): returns
@@ -1028,7 +1234,7 @@ async fn provider_concurrency(
 /// harwness Plan v2 — UIA-specific pinned provider/model selection.
 #[operation(
     name = "uia-provider",
-    summary = "Zeigt/wechselt den für die UIA gepinnten Provider (uia_provider), unabhängig vom Default.",
+    summary = "Zeigt/listet/testet den für die UIA gepinnten Provider (uia_provider), unabhängig vom Default.",
     domain = "catalog_config",
     permission = "operator",
     category = "model",
@@ -1044,7 +1250,7 @@ async fn uia_provider(ctx: &OpContext, args: ProviderArgs) -> Result<OpOutput, O
     match sub {
         "show" => handle_uia_show(ctx),
         "list" => handle_uia_list(ctx),
-        "test" => handle_uia_test(ctx),
+        "test" => handle_uia_test(ctx).await,
         other => Err(OpError::InvalidArguments(format!(
             "Unknown /uia-provider sub-command: '{other}'. \
              Supported: show, list, test. Use `/uia-model` to change the active provider and model together."
@@ -1055,10 +1261,11 @@ async fn uia_provider(ctx: &OpContext, args: ProviderArgs) -> Result<OpOutput, O
 /// Implements `/uia-provider show` — reports the UIA's pinned provider.
 ///
 /// # Description
-/// Reads `config.harness.uia_provider` directly (a persisted config value,
-/// not runtime-switched state — the UIA pin is not mutated by
-/// `/provider switch`). If unset, reports the fallback to `default_provider`
-/// (or the absence of any configured default).
+/// Reports the effective UIA selection via
+/// [`crate::model::effective_uia_selection`]: the live UIA selection from the
+/// [`SharedSessionController`] (set by `/uia-model switch`) if present,
+/// otherwise `harness.uia_provider`/`harness.uia_model` from config. The
+/// generic `/model switch` never changes this selection.
 ///
 /// # Arguments
 /// - `ctx` (`&OpContext`): used to resolve the configuration.
@@ -1138,8 +1345,9 @@ fn handle_uia_list(ctx: &OpContext) -> Result<OpOutput, OpError> {
     Ok(OpOutput::from(lines.join("\n")))
 }
 
-/// Implements `/uia-provider test` — tests the effective UIA provider.
-fn handle_uia_test(ctx: &OpContext) -> Result<OpOutput, OpError> {
+/// Implements `/uia-provider test` — tests the effective UIA provider
+/// (static auth check plus live connection test, see [`live_connection_line`]).
+async fn handle_uia_test(ctx: &OpContext) -> Result<OpOutput, OpError> {
     let config = resolved_config(ctx)?;
     let controller = ctx.service::<SharedSessionController>();
     let selection = crate::model::effective_uia_selection(controller, &config);
@@ -1147,7 +1355,7 @@ fn handle_uia_test(ctx: &OpContext) -> Result<OpOutput, OpError> {
     let Some(provider_name) = selection.provider() else {
         return Ok(OpOutput::from(
             "No effective UIA provider configured — no test possible. \
-             Use `/uia-provider switch <id>` to set one."
+             Use `/uia-model switch <id>` to set one."
                 .to_owned(),
         ));
     };
@@ -1157,29 +1365,16 @@ fn handle_uia_test(ctx: &OpContext) -> Result<OpOutput, OpError> {
         )));
     };
 
-    let auth_info = match &provider.auth {
-        Some(secret_ref) => {
-            let ref_string = secret_ref.as_ref_string();
-            let ref_type = ref_string
-                .split_once(':')
-                .map(|(prefix, _)| prefix)
-                .unwrap_or("unknown");
-            format!("Auth method: {ref_type}:  [ref present — value not shown]")
-        }
-        None if provider.has_plaintext_secret() => {
-            "Auth method: api_key (plaintext) — WARNING: insecure; use an `auth` SecretRef instead."
-                .to_owned()
-        }
-        None => "Auth method: (none) — provider has no `auth` field configured.".to_owned(),
-    };
     let status = if provider.enabled {
         "enabled"
     } else {
         "disabled"
     };
+    let live = live_connection_line(ctx, canonical, provider, &config).await;
     Ok(OpOutput::from(format!(
-        "Effective UIA provider : {canonical}  [{status}]\nAPI type                : {}\n{}\nNote: live connection test (HTTP ping) not yet wired.",
-        provider.api, auth_info
+        "Effective UIA provider : {canonical}  [{status}]\nAPI type               : {}\n{}\n{live}",
+        provider.api,
+        auth_method_line(provider)
     )))
 }
 
@@ -1205,6 +1400,16 @@ mod tests {
     fn make_test_ctx(
         ctrl: Option<SharedSessionController>,
         config: Option<Arc<harw_config::ResolvedConfig>>,
+    ) -> TestResult<(OpContext, std::path::PathBuf)> {
+        make_test_ctx_with_check(ctrl, config, None)
+    }
+
+    /// Like [`make_test_ctx`], additionally registering an optional
+    /// [`super::SharedProviderConnectionCheck`].
+    fn make_test_ctx_with_check(
+        ctrl: Option<SharedSessionController>,
+        config: Option<Arc<harw_config::ResolvedConfig>>,
+        check: Option<super::SharedProviderConnectionCheck>,
     ) -> TestResult<(OpContext, std::path::PathBuf)> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1237,6 +1442,9 @@ mod tests {
         }
         if let Some(config) = config {
             services.insert(config);
+        }
+        if let Some(check) = check {
+            services.insert(check);
         }
         let ctx = OpContext::new(SessionId::new(), TurnId::new(), sandbox, services);
         Ok((ctx, tmp))
@@ -1318,6 +1526,7 @@ mod tests {
         config.providers.insert(
             "operator-alias".to_owned(),
             harw_config::ProviderToml {
+                stream: None,
                 name: "canonical-provider".to_owned(),
                 api: "openai-chat".to_owned(),
                 base_url: "https://api.example.test/v1".to_owned(),
@@ -1465,6 +1674,7 @@ mod tests {
         config.providers.insert(
             name.to_owned(),
             harw_config::ProviderToml {
+                stream: None,
                 name: name.to_owned(),
                 api: "openai-chat".to_owned(),
                 base_url: "https://api.example.test/v1".to_owned(),
@@ -1572,7 +1782,7 @@ mod tests {
     async fn provider_concurrency_without_registered_load_registry_is_not_available() -> TestResult
     {
         // No `ProviderLoadRegistry` service inserted — simulates a runtime
-        // whose composition root has not wired one into the `ServiceMap` yet
+        // execution context without one in its `ServiceMap` (standalone/test)
         // (see `harw_provider_http::build_provider_with_load_registry` doc).
         let config = Arc::new(openai_provider_config("openai"));
         let (ctx, _tmp) = make_test_ctx(None, Some(config))?;
@@ -1583,6 +1793,350 @@ mod tests {
         };
         let result = super::provider_concurrency(&ctx, args).await;
         assert!(matches!(result, Err(OpError::NotAvailable(_))));
+        Ok(())
+    }
+
+    // ── Live connection test (`/provider test`, `/uia-provider test`) ─────────
+
+    /// Scripted outcome of [`FakeCheck`] (`DiscoveryError` is not `Clone`).
+    enum FakeOutcome {
+        Reachable {
+            model_count: usize,
+            credential_sent: bool,
+        },
+        AuthRejected,
+        Unsupported,
+    }
+
+    /// Test double for [`super::ProviderConnectionCheck`]; never touches the network.
+    struct FakeCheck {
+        outcome: FakeOutcome,
+        calls: std::sync::atomic::AtomicUsize,
+        last_provider: std::sync::Mutex<Option<String>>,
+    }
+
+    impl FakeCheck {
+        fn new(outcome: FakeOutcome) -> Arc<Self> {
+            Arc::new(Self {
+                outcome,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                last_provider: std::sync::Mutex::new(None),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn last_provider(&self) -> Option<String> {
+            self.last_provider
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+        }
+    }
+
+    impl super::ProviderConnectionCheck for FakeCheck {
+        fn check<'a>(
+            &'a self,
+            provider_name: &'a str,
+            _provider: &'a harw_config::ProviderToml,
+            _config: &'a harw_config::ResolvedConfig,
+        ) -> super::ConnectionCheckFuture<'a> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Ok(mut guard) = self.last_provider.lock() {
+                *guard = Some(provider_name.to_owned());
+            }
+            let result = match self.outcome {
+                FakeOutcome::Reachable {
+                    model_count,
+                    credential_sent,
+                } => Ok(super::ConnectionCheckReport {
+                    model_count,
+                    credential_sent,
+                }),
+                FakeOutcome::AuthRejected => Err(super::DiscoveryError::Auth {
+                    status: 401,
+                    detail: "rejected".to_owned(),
+                }),
+                FakeOutcome::Unsupported => Err(super::DiscoveryError::Unsupported {
+                    api: "exotic-api".to_owned(),
+                }),
+            };
+            Box::pin(async move { result })
+        }
+    }
+
+    /// Two enabled providers, `openai` as default and UIA provider.
+    fn test_config_with_defaults() -> harw_config::ResolvedConfig {
+        let mut config = openai_provider_config("openai");
+        let second = openai_provider_config("other");
+        config.providers.extend(second.providers);
+        config.harness.default_provider = Some("openai".to_owned());
+        config.harness.uia_provider = Some("openai".to_owned());
+        config
+    }
+
+    async fn run_provider_test(
+        ctrl: Option<SharedSessionController>,
+        config: harw_config::ResolvedConfig,
+        check: Option<super::SharedProviderConnectionCheck>,
+    ) -> TestResult<String> {
+        let (ctx, _tmp) = make_test_ctx_with_check(ctrl, Some(Arc::new(config)), check)?;
+        let output = super::provider(
+            &ctx,
+            ProviderArgs {
+                cmd: Some("test".to_owned()),
+            },
+        )
+        .await
+        .map_err(ctx_err("/provider test must succeed"))?;
+        Ok(output.text)
+    }
+
+    fn ctx_err<E: std::fmt::Display>(context: &'static str) -> impl FnOnce(E) -> TestError {
+        crate::test_support::ctx(context)
+    }
+
+    #[tokio::test]
+    async fn provider_test_without_check_service_degrades_with_clear_note() -> TestResult {
+        let text = run_provider_test(None, test_config_with_defaults(), None).await?;
+        assert!(text.contains("Default provider : openai"), "text: {text}");
+        assert!(text.contains("Live test"), "text: {text}");
+        assert!(text.contains("unavailable"), "text: {text}");
+        assert!(
+            !text.contains("not yet"),
+            "stale wording must be gone: {text}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_test_reports_successful_live_check() -> TestResult {
+        let fake = FakeCheck::new(FakeOutcome::Reachable {
+            model_count: 3,
+            credential_sent: true,
+        });
+        let check: super::SharedProviderConnectionCheck = fake.clone();
+        let text = run_provider_test(None, test_config_with_defaults(), Some(check)).await?;
+        assert!(text.contains("OK"), "text: {text}");
+        assert!(text.contains("3 models"), "text: {text}");
+        assert!(text.contains("authenticated"), "text: {text}");
+        assert_eq!(fake.calls(), 1);
+        assert_eq!(fake.last_provider().as_deref(), Some("openai"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_test_flags_zero_models_as_suspicious() -> TestResult {
+        let fake = FakeCheck::new(FakeOutcome::Reachable {
+            model_count: 0,
+            credential_sent: false,
+        });
+        let check: super::SharedProviderConnectionCheck = fake;
+        let text = run_provider_test(None, test_config_with_defaults(), Some(check)).await?;
+        assert!(text.contains("0 models"), "text: {text}");
+        assert!(text.contains("unauthenticated"), "text: {text}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_test_reports_failed_live_check_as_finding_not_error() -> TestResult {
+        let fake = FakeCheck::new(FakeOutcome::AuthRejected);
+        let check: super::SharedProviderConnectionCheck = fake;
+        let text = run_provider_test(None, test_config_with_defaults(), Some(check)).await?;
+        assert!(text.contains("FAILED"), "text: {text}");
+        assert!(text.contains("401"), "text: {text}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_test_reports_unsupported_api() -> TestResult {
+        let fake = FakeCheck::new(FakeOutcome::Unsupported);
+        let check: super::SharedProviderConnectionCheck = fake;
+        let text = run_provider_test(None, test_config_with_defaults(), Some(check)).await?;
+        assert!(text.contains("not supported"), "text: {text}");
+        assert!(text.contains("exotic-api"), "text: {text}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_test_skips_live_check_for_disabled_provider() -> TestResult {
+        let mut config = test_config_with_defaults();
+        if let Some(provider) = config.providers.get_mut("openai") {
+            provider.enabled = false;
+        }
+        let fake = FakeCheck::new(FakeOutcome::Reachable {
+            model_count: 1,
+            credential_sent: true,
+        });
+        let check: super::SharedProviderConnectionCheck = fake.clone();
+        let text = run_provider_test(None, config, Some(check)).await?;
+        assert!(text.contains("[disabled]"), "text: {text}");
+        assert!(text.contains("skipped"), "text: {text}");
+        assert_eq!(fake.calls(), 0, "a disabled provider must not be contacted");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_test_prefers_runtime_active_provider_over_default() -> TestResult {
+        use harw_operations::session_control::SessionController;
+        let null = NullSessionController::new();
+        null.set_active_provider("other".to_owned())
+            .map_err(ctx_err("set_active_provider"))?;
+        let ctrl: SharedSessionController = Arc::new(null);
+        let fake = FakeCheck::new(FakeOutcome::Reachable {
+            model_count: 2,
+            credential_sent: true,
+        });
+        let check: super::SharedProviderConnectionCheck = fake.clone();
+        let text = run_provider_test(Some(ctrl), test_config_with_defaults(), Some(check)).await?;
+        assert!(text.contains("Active provider  : other"), "text: {text}");
+        assert_eq!(fake.last_provider().as_deref(), Some("other"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn uia_provider_test_runs_live_check_for_effective_uia_provider() -> TestResult {
+        let fake = FakeCheck::new(FakeOutcome::Reachable {
+            model_count: 5,
+            credential_sent: true,
+        });
+        let check: super::SharedProviderConnectionCheck = fake.clone();
+        let (ctx, _tmp) = make_test_ctx_with_check(
+            None,
+            Some(Arc::new(test_config_with_defaults())),
+            Some(check),
+        )?;
+        let output = super::uia_provider(
+            &ctx,
+            ProviderArgs {
+                cmd: Some("test".to_owned()),
+            },
+        )
+        .await
+        .map_err(ctx_err("/uia-provider test must succeed"))?;
+        assert!(
+            output.text.contains("Effective UIA provider : openai"),
+            "text: {}",
+            output.text
+        );
+        assert!(output.text.contains("5 models"), "text: {}", output.text);
+        assert!(!output.text.contains("not yet"), "text: {}", output.text);
+        assert_eq!(fake.last_provider().as_deref(), Some("openai"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn uia_provider_test_without_check_service_degrades() -> TestResult {
+        let (ctx, _tmp) =
+            make_test_ctx_with_check(None, Some(Arc::new(test_config_with_defaults())), None)?;
+        let output = super::uia_provider(
+            &ctx,
+            ProviderArgs {
+                cmd: Some("test".to_owned()),
+            },
+        )
+        .await
+        .map_err(ctx_err("/uia-provider test must succeed"))?;
+        assert!(output.text.contains("unavailable"), "text: {}", output.text);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_show_default_text_points_to_model_switch() -> TestResult {
+        let ctrl: SharedSessionController = Arc::new(NullSessionController::new());
+        let (ctx, _tmp) = make_test_ctx(Some(ctrl), Some(Arc::new(test_config_with_defaults())))?;
+        let output = super::provider(&ctx, ProviderArgs { cmd: None })
+            .await
+            .map_err(ctx_err("/provider show must succeed"))?;
+        assert!(
+            output.text.contains("config default"),
+            "text: {}",
+            output.text
+        );
+        assert!(
+            output.text.contains("/model switch"),
+            "text: {}",
+            output.text
+        );
+        assert!(
+            !output.text.contains("/provider switch"),
+            "text: {}",
+            output.text
+        );
+        assert!(!output.text.contains("not yet"), "text: {}", output.text);
+        Ok(())
+    }
+
+    /// End-to-end check of [`super::DiscoveryConnectionCheck`] against a
+    /// local one-shot HTTP server (no external network): it must call
+    /// `GET {base_url}/models` with the plaintext key as bearer and count
+    /// the reported models.
+    #[tokio::test]
+    async fn discovery_connection_check_queries_models_endpoint() -> TestResult {
+        use std::io::{Read, Write};
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").map_err(ctx_err("bind listener"))?;
+        let addr = listener.local_addr().map_err(ctx_err("local_addr"))?;
+        let server = std::thread::spawn(move || -> TestResult<String> {
+            let (mut stream, _) = listener.accept().map_err(ctx_err("accept"))?;
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .map_err(ctx_err("set_read_timeout"))?;
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buffer).map_err(ctx_err("read"))?;
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(buffer.get(..n).ok_or(TestError::Missing("buffer"))?);
+            }
+            let body = r#"{"data":[{"id":"m1"},{"id":"m2"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .map_err(ctx_err("write response"))?;
+            Ok(String::from_utf8_lossy(&bytes).to_lowercase())
+        });
+
+        let mut config = openai_provider_config("local");
+        if let Some(provider) = config.providers.get_mut("local") {
+            provider.base_url = format!("http://{addr}/v1");
+            provider.api_key = Some("test-key".to_owned());
+        }
+        let provider = config
+            .providers
+            .get("local")
+            .ok_or(TestError::Missing("local provider"))?;
+
+        let check = super::DiscoveryConnectionCheck::new(None, None);
+        let report = super::ProviderConnectionCheck::check(&check, "local", provider, &config)
+            .await
+            .map_err(ctx_err("live check must succeed"))?;
+        assert_eq!(
+            report,
+            super::ConnectionCheckReport {
+                model_count: 2,
+                credential_sent: true,
+            }
+        );
+
+        let request = server
+            .join()
+            .map_err(|_| TestError::Unexpected("server thread panicked".to_owned()))??;
+        assert!(
+            request.starts_with("get /v1/models http/1.1"),
+            "request: {request}"
+        );
+        assert!(
+            request.contains("authorization: bearer test-key"),
+            "request: {request}"
+        );
         Ok(())
     }
 }

@@ -90,7 +90,87 @@ pub enum ChannelError {
     #[from]
     Serde(serde_json::Error),
 
-    /// A skeleton body whose upstream wiring (persistence, transport) is deferred.
-    #[msg("not yet implemented: {0}")]
-    NotYetImplemented(String),
+    /// The channel's inbound transport cannot deliver events right now: the
+    /// binding was built without ingress, another runner already owns the
+    /// receiver, or the runtime sink/ingress lock is gone. This is a
+    /// configuration/lifecycle condition of a configured channel, not a
+    /// missing feature.
+    #[msg("ingress for channel '{channel}' is unavailable: {reason}")]
+    IngressUnavailable { channel: ChannelId, reason: String },
+
+    /// The channel binding deliberately offers no path for the requested
+    /// operation (e.g. launching a sandboxed worker from an approved work
+    /// request). `operation` is a stable, static identifier suitable for
+    /// matching; `detail` names the affected object for the operator.
+    #[msg("channel '{channel}' does not support operation '{operation}': {detail}")]
+    OperationUnsupported {
+        channel: ChannelId,
+        operation: &'static str,
+        detail: String,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{TestError, TestResult};
+
+    #[test]
+    fn ingress_unavailable_display_names_channel_and_reason() -> TestResult {
+        let error = ChannelError::IngressUnavailable {
+            channel: ChannelId::from_str("telegram"),
+            reason: "ingress is not configured".to_owned(),
+        };
+        let rendered = error.to_string();
+        if rendered != "ingress for channel 'telegram' is unavailable: ingress is not configured" {
+            return Err(TestError::Unexpected(rendered));
+        }
+        if std::error::Error::source(&error).is_some() {
+            return Err(TestError::Unexpected(
+                "IngressUnavailable must not carry a source".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn operation_unsupported_display_names_operation_and_detail() -> TestResult {
+        let error = ChannelError::OperationUnsupported {
+            channel: ChannelId::from_str("telegram"),
+            operation: "sandboxed-launch",
+            detail: "work request 'w-1'".to_owned(),
+        };
+        let rendered = error.to_string();
+        if rendered
+            != "channel 'telegram' does not support operation 'sandboxed-launch': work request 'w-1'"
+        {
+            return Err(TestError::Unexpected(rendered));
+        }
+        if !matches!(
+            error,
+            ChannelError::OperationUnsupported {
+                operation: "sandboxed-launch",
+                ..
+            }
+        ) {
+            return Err(TestError::Unexpected(
+                "operation identifier must be matchable".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn io_error_converts_and_exposes_source() -> TestResult {
+        let error = ChannelError::from(std::io::Error::other("disk gone"));
+        let source = std::error::Error::source(&error)
+            .ok_or(TestError::Missing("source of ChannelError::Io"))?;
+        if source.to_string() != "disk gone" {
+            return Err(TestError::Unexpected(source.to_string()));
+        }
+        if error.to_string() != "i/o error in channel layer: disk gone" {
+            return Err(TestError::Unexpected(error.to_string()));
+        }
+        Ok(())
+    }
 }

@@ -16,7 +16,7 @@ description = "Read-only Erkundung von Workspace und Dependency-Quellen; liefert
 [work]
 mode = "read-only-exploration"
 may_write_code = false
-may_research_web = false
+may_research_web = true
 
 # Die zugelassene Werkzeugoberflaeche. `forbidden` benennt die verweigerten
 # Werkzeuge ausdruecklich, damit ein Konsument die Ablehnung begruenden kann,
@@ -34,8 +34,14 @@ admitted = [
   "deps.source_read",
   "deps.source_search",
   "deps.source_list",
+  "explore.tree",
+  "explore.projects",
+  "explore.relations",
+  "explore.find",
+  "web.search",
+  "web.fetch",
 ]
-forbidden = ["fs.write", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
+forbidden = ["fs.write", "shell.exec", "web.docs_rs", "web.crates_io"]
 
 [spawn]
 max_depth = 1

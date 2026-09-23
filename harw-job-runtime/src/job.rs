@@ -140,11 +140,6 @@ impl Job {
         Ok(lease)
     }
 
-    /// Delay before the next retry, given attempts recorded so far.
-    pub fn next_retry_delay(&self) -> JobRuntimeResult<SignedDuration> {
-        self.retry.next_delay(self.attempts)
-    }
-
     /// Reject lifecycle transitions that are only legal for an active claim.
     fn require_running(&self) -> JobRuntimeResult<()> {
         if self.state == JobState::Running {

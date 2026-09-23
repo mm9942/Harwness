@@ -39,18 +39,16 @@
 //! Entscheidung ist [`DEFAULT_STEWARD_WINDOW_SPAN_DAYS`] `= 7` (eine
 //! Kalenderwoche), umgesetzt über [`StewardWindow::trailing`] — **keine
 //! Systemuhr**: `as_of` wird immer vom Aufrufer hereingereicht (z. B. der
-//! Zeitpunkt, zu dem ein künftiger Dream-Job-Lauf beginnt), nie aus
+//! Zeitpunkt, zu dem ein von [`DreamSchedule`] freigegebener Lauf beginnt), nie aus
 //! `jiff::Timestamp::now()` gelesen. Begründung:
 //!
-//! - Ein durabler, periodischer Aufrufer (Dream-Job/Scheduler) existiert für
-//!   diesen Teilbaum noch nicht — [`crate::model_behavior_proposal`]s eigene
-//!   Moduldoku nennt das ausdrücklich als offenen Knoten ("Ein Scheduler, der
-//!   sie periodisch mit echten Beobachtungen aufruft ... ist ein eigener,
-//!   noch offener Knoten"), und `croner` (Cron-Parsing für Dream-Jobs) steht
-//!   in `harw-knowledge/Cargo.toml` noch als `TODO(parent cargo add)`. Es
-//!   gibt also keine etablierte Lauf-Kadenz, an der sich dieser Knoten
-//!   orientieren könnte — die Fensterlänge ist eine eigenständige
-//!   Entscheidung, kein Spiegel eines bereits fixierten Zeitplans.
+//! - Die Lauf-Kadenz liefert dieses Modul selbst: [`DreamSchedule`] über
+//!   einem abhängigkeitsfreien 5-Feld-Cron-Ausdruck ([`CronSchedule`], siehe
+//!   Abschnitt "Der Dream-Job-Zeitplan" unten), mit
+//!   [`DEFAULT_DREAM_CRON_EXPRESSION`] `= "0 3 * * 1"` (montags 03:00 UTC) als
+//!   Empfehlung. Wöchentlicher Lauf und siebentägiges Fenster sind bewusst
+//!   aufeinander abgestimmt: jeder planmäßige Lauf sieht genau die Woche seit
+//!   dem vorigen Lauf, ohne Lücke und ohne Doppelzählung.
 //! - Sieben Tage sind lang genug, dass die Wiederholungsschwellen, die
 //!   `ContextProposal`/`ModelBehaviorProposal` selbst voraussetzen
 //!   ([`crate::context_proposal::OVER_BUDGET_PROMOTION_THRESHOLD`] `= 3`,
@@ -59,9 +57,9 @@
 //!   bevor sie zusammengefasst würden.
 //! - Sieben Tage sind kurz genug, dass ein `Pending`-Vorschlag nicht über
 //!   Wochen unbemerkt liegen bleibt, bevor ihn ein Operator zu Gesicht
-//!   bekommt — eine Kalenderwoche ist die kürzeste Spanne, die sich ohne
-//!   Rückgriff auf eine noch nicht existierende Betriebs-Kadenz plausibel
-//!   als "ein Mensch schaut mindestens so oft vorbei" begründen lässt.
+//!   bekommt — eine Kalenderwoche ist die kürzeste Spanne, die sich
+//!   unabhängig von der konkret konfigurierten Lauf-Kadenz plausibel als
+//!   "ein Mensch schaut mindestens so oft vorbei" begründen lässt.
 //!
 //! Das Fenster bleibt trotzdem immer ein expliziter Parameter, nie ein
 //! interner Default, den eine Funktion selbst zieht: [`curate_context_proposals`]
@@ -69,6 +67,34 @@
 //! [`DEFAULT_STEWARD_WINDOW_SPAN_DAYS`]/[`StewardWindow::trailing`] sind nur
 //! die dokumentierte Empfehlung für den Aufrufer, der noch keine eigene
 //! Spanne hat.
+//!
+//! # Der Dream-Job-Zeitplan
+//! [`CronSchedule`] ist ein kleiner, abhängigkeitsfreier Parser/Auswerter für
+//! klassische 5-Feld-Cron-Ausdrücke (`Minute Stunde Monatstag Monat
+//! Wochentag`), ausgewertet **immer in UTC** über `jiff::Timestamp` — keine
+//! Zeitzonendatenbank, keine Sommerzeit-Sonderfälle. Unterstützt werden `*`,
+//! Einzelwerte, Listen (`a,b`), Bereiche (`a-b`) und Schritte (`*/n`,
+//! `a-b/n`, sowie `a/n` als Kurzform für `a-<max>/n`). Wochentag `0` und `7`
+//! bedeuten beide Sonntag. Namen (`MON`, `JAN`) und Erweiterungen (`L`, `W`,
+//! `#`, `?`, Sekundenfeld) werden bewusst **nicht** unterstützt und als
+//! [`CronParseError`] abgewiesen.
+//!
+//! Monatstag/Wochentag folgen der Vixie-Cron-Semantik: sind **beide** Felder
+//! eingeschränkt (beginnen nicht mit `*`), feuert der Ausdruck, wenn
+//! **eines** der beiden passt (`0 0 1 * 1` = jeden Monatsersten *und* jeden
+//! Montag); sonst müssen beide passen (ein mit `*` beginnendes Feld wie
+//! `*/2` gilt dabei — wie bei Vixie-Cron — als nicht eingeschränkt).
+//!
+//! [`DreamSchedule`] entscheidet über einem solchen Ausdruck, ob ein
+//! Dream-/Konsolidierungslauf fällig ist ([`DreamSchedule::decide`]) — rein
+//! aus dem hereingereichten letzten Laufzeitpunkt und `now`, **nie** aus der
+//! Systemuhr. Versäumte Feuerzeitpunkte werden zu **einem** Nachholauf
+//! zusammengefasst (wie `anacron`), nie einzeln nachgespielt; ein nie
+//! gelaufener Job ist sofort fällig. [`steward_digest_if_due`] verbindet
+//! Zeitplan und Steward: ist der Lauf fällig, baut es den [`StewardDigest`]
+//! über dem Standardfenster, sonst nichts. Der Aufrufer bleibt für das
+//! dauerhafte Festhalten von `last_run` und das eigentliche Anstoßen des
+//! Jobs (z. B. über `harw-job-runtime`) zuständig.
 //!
 //! # Die drei Nullzähler
 //! Alle drei liegen — wie die Mechanik es verlangt (`harw-observe`,
@@ -128,16 +154,17 @@
 //! `model_behavior_proposal`).
 //!
 //! # Nebenläufigkeit
-//! [`StewardWindow`], [`CuratedContextProposals`], [`CuratedModelBehaviorProposals`]
-//! und [`StewardDigest`] sind reine `Send + Sync`-Werttypen ohne innere
-//! Veränderlichkeit. Die drei `NullCounter` sind nach ihrer eigenen
+//! [`StewardWindow`], [`CuratedContextProposals`], [`CuratedModelBehaviorProposals`],
+//! [`StewardDigest`], [`CronSchedule`] und [`DreamSchedule`] sind reine
+//! `Send + Sync`-Werttypen ohne innere Veränderlichkeit. Die drei `NullCounter` sind nach ihrer eigenen
 //! Dokumentation `Sync` und beliebig nebenläufig erhöh-/lesbar
 //! (`AtomicU64`, `Ordering::Relaxed`).
 //!
 //! # Fehler
 //! [`crate::error::KnowledgeError::StewardWindowInvalid`], wenn
 //! [`StewardWindow::new`]/[`StewardWindow::trailing`] mit einer
-//! widersprüchlichen Spanne aufgerufen wird.
+//! widersprüchlichen Spanne aufgerufen wird; [`CronParseError`] (ein eigener,
+//! modullokaler Fehlertyp) für einen ungültigen Cron-Ausdruck.
 
 use harw_observe::{Cardinality, MetricKey, MetricKind, NullCounter, NullCounterRegistry, Unit};
 
@@ -627,6 +654,656 @@ pub fn render_digest_summary(digest: &StewardDigest) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Dream-Job-Zeitplan: abhängigkeitsfreier 5-Feld-Cron (siehe Moduldoku).
+// ---------------------------------------------------------------------------
+
+/// Empfohlener Cron-Ausdruck für den Dream-/Konsolidierungslauf: montags um
+/// 03:00 UTC — abgestimmt auf [`DEFAULT_STEWARD_WINDOW_SPAN_DAYS`] (siehe
+/// Moduldoku, "Die Fensterlänge — Entscheidung und Begründung").
+pub const DEFAULT_DREAM_CRON_EXPRESSION: &str = "0 3 * * 1";
+
+/// Wie viele Jahre [`CronSchedule::next_after`] höchstens vorausschaut: ein
+/// voller gregorianischer Zyklus. Jeder überhaupt erfüllbare Ausdruck feuert
+/// innerhalb dieses Horizonts; ein unerfüllbarer (z. B. `0 0 30 2 *`) liefert
+/// danach `None`, statt endlos zu suchen.
+const CRON_SEARCH_HORIZON_YEARS: i64 = 400;
+
+const SECONDS_PER_MINUTE: i64 = 60;
+const MINUTES_PER_DAY: i64 = 24 * 60;
+/// Tage vom 0000-03-01 (proleptisch gregorianisch) bis 1970-01-01.
+const DAYS_FROM_CIVIL_EPOCH: i64 = 719_468;
+const DAYS_PER_400_YEARS: i64 = 146_097;
+
+/// Eines der fünf Felder eines Cron-Ausdrucks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CronField {
+    /// Minute, `0..=59`.
+    Minute,
+    /// Stunde, `0..=23`.
+    Hour,
+    /// Tag des Monats, `1..=31`.
+    DayOfMonth,
+    /// Monat, `1..=12`.
+    Month,
+    /// Wochentag, `0..=7` (`0` und `7` = Sonntag).
+    DayOfWeek,
+}
+
+impl CronField {
+    /// Zulässige Einzelwerte (einschließlich) dieses Felds.
+    const fn bounds(self) -> (u32, u32) {
+        match self {
+            Self::Minute => (0, 59),
+            Self::Hour => (0, 23),
+            Self::DayOfMonth => (1, 31),
+            Self::Month => (1, 12),
+            Self::DayOfWeek => (0, 7),
+        }
+    }
+
+    /// Bereich, für den `*` steht (beim Wochentag ohne die Sonntags-Dublette `7`).
+    const fn star_bounds(self) -> (u32, u32) {
+        match self {
+            Self::DayOfWeek => (0, 6),
+            other => other.bounds(),
+        }
+    }
+}
+
+impl std::fmt::Display for CronField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Minute => "minute",
+            Self::Hour => "hour",
+            Self::DayOfMonth => "day-of-month",
+            Self::Month => "month",
+            Self::DayOfWeek => "day-of-week",
+        };
+        f.write_str(name)
+    }
+}
+
+/// Fehler beim Parsen eines Cron-Ausdrucks ([`CronSchedule::parse`]).
+///
+/// Modullokal statt einer neuen `KnowledgeError`-Variante, weil ein
+/// ungültiger Ausdruck ein reiner Konfigurationsfehler des Aufrufers ist und
+/// feldgenau geprüft werden können soll.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CronParseError {
+    /// Der Ausdruck hat nicht genau fünf durch Leerraum getrennte Felder.
+    WrongFieldCount {
+        /// Gefundene Feldanzahl.
+        found: usize,
+    },
+    /// Ein Listenelement ist syntaktisch ungültig (leer, keine Zahl, Name, …).
+    InvalidToken {
+        /// Betroffenes Feld.
+        field: CronField,
+        /// Das ungültige Listenelement.
+        token: String,
+    },
+    /// Ein Wert liegt außerhalb der Feldgrenzen.
+    OutOfRange {
+        /// Betroffenes Feld.
+        field: CronField,
+        /// Der gelesene Wert.
+        value: u32,
+        /// Kleinster zulässiger Wert.
+        min: u32,
+        /// Größter zulässiger Wert.
+        max: u32,
+    },
+    /// Ein Bereich `a-b` mit `a > b` (kein Umlauf wie `22-2`).
+    ReversedRange {
+        /// Betroffenes Feld.
+        field: CronField,
+        /// Bereichsanfang.
+        start: u32,
+        /// Bereichsende.
+        end: u32,
+    },
+    /// Eine Schrittweite `/0`.
+    ZeroStep {
+        /// Betroffenes Feld.
+        field: CronField,
+    },
+}
+
+impl std::fmt::Display for CronParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongFieldCount { found } => {
+                write!(f, "cron expression needs exactly 5 fields, found {found}")
+            }
+            Self::InvalidToken { field, token } => {
+                write!(f, "invalid cron {field} token {token:?}")
+            }
+            Self::OutOfRange {
+                field,
+                value,
+                min,
+                max,
+            } => write!(f, "cron {field} value {value} outside {min}..={max}"),
+            Self::ReversedRange { field, start, end } => {
+                write!(f, "cron {field} range {start}-{end} is reversed")
+            }
+            Self::ZeroStep { field } => write!(f, "cron {field} step must be positive"),
+        }
+    }
+}
+
+impl std::error::Error for CronParseError {}
+
+/// Ein geparster 5-Feld-Cron-Ausdruck, ausgewertet in UTC (siehe Moduldoku,
+/// "Der Dream-Job-Zeitplan").
+///
+/// # Examples
+/// ```rust
+/// use harw_knowledge::context_steward::CronSchedule;
+///
+/// let schedule = CronSchedule::parse("30 4 * * *").expect("valid expression");
+/// let after: jiff::Timestamp = "2026-01-01T05:00:00Z".parse().expect("valid timestamp");
+/// let next = schedule.next_after(after).expect("fires daily");
+/// assert_eq!(next.to_string(), "2026-01-02T04:30:00Z");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CronSchedule {
+    /// Normalisierter Quelltext (Felder durch genau ein Leerzeichen getrennt).
+    expression: String,
+    /// Bit `n` gesetzt ⇔ Minute `n` erlaubt.
+    minutes: u64,
+    /// Bit `n` gesetzt ⇔ Stunde `n` erlaubt.
+    hours: u64,
+    /// Bit `n` gesetzt ⇔ Monatstag `n` erlaubt.
+    days_of_month: u64,
+    /// Bit `n` gesetzt ⇔ Monat `n` erlaubt.
+    months: u64,
+    /// Bit `n` gesetzt ⇔ Wochentag `n` erlaubt (`0` = Sonntag; `7` ist auf `0` gefaltet).
+    days_of_week: u64,
+    /// Monatstag-Feld beginnt nicht mit `*`.
+    day_of_month_restricted: bool,
+    /// Wochentag-Feld beginnt nicht mit `*`.
+    day_of_week_restricted: bool,
+}
+
+impl CronSchedule {
+    /// Parst einen 5-Feld-Cron-Ausdruck.
+    ///
+    /// # Arguments
+    /// - `expression` (`&str`): `Minute Stunde Monatstag Monat Wochentag`,
+    ///   Felder durch beliebigen Leerraum getrennt.
+    ///
+    /// # Returns
+    /// Ein [`CronSchedule`].
+    ///
+    /// # Errors
+    /// [`CronParseError`], wenn der Ausdruck nicht genau fünf Felder hat oder
+    /// ein Feld ungültig ist (siehe die einzelnen Varianten).
+    pub fn parse(expression: &str) -> Result<Self, CronParseError> {
+        let fields: Vec<&str> = expression.split_whitespace().collect();
+        let [minute, hour, day_of_month, month, day_of_week] = fields.as_slice() else {
+            return Err(CronParseError::WrongFieldCount {
+                found: fields.len(),
+            });
+        };
+        Ok(Self {
+            expression: fields.join(" "),
+            minutes: parse_cron_field(CronField::Minute, minute)?,
+            hours: parse_cron_field(CronField::Hour, hour)?,
+            days_of_month: parse_cron_field(CronField::DayOfMonth, day_of_month)?,
+            months: parse_cron_field(CronField::Month, month)?,
+            days_of_week: parse_cron_field(CronField::DayOfWeek, day_of_week)?,
+            day_of_month_restricted: !day_of_month.starts_with('*'),
+            day_of_week_restricted: !day_of_week.starts_with('*'),
+        })
+    }
+
+    /// Der normalisierte Ausdruck (Felder durch genau ein Leerzeichen getrennt).
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.expression
+    }
+
+    /// Prüft, ob der Ausdruck zur UTC-Minute von `timestamp` feuert
+    /// (Sekunden und Sekundenbruchteile werden ignoriert).
+    #[must_use]
+    pub fn matches(&self, timestamp: jiff::Timestamp) -> bool {
+        let minute_index = floor_minutes(timestamp);
+        let days = minute_index.div_euclid(MINUTES_PER_DAY);
+        let minute_of_day = minute_index.rem_euclid(MINUTES_PER_DAY);
+        let (year, month, day) = civil_from_days(days);
+        let hour = u32::try_from(minute_of_day / 60).unwrap_or(u32::MAX);
+        let minute = u32::try_from(minute_of_day % 60).unwrap_or(u32::MAX);
+        has_bit(self.months, month)
+            && self.day_matches(year, month, day)
+            && has_bit(self.hours, hour)
+            && has_bit(self.minutes, minute)
+    }
+
+    /// Berechnet den nächsten Feuerzeitpunkt **echt nach** `after`.
+    ///
+    /// # Description
+    /// Rein und deterministisch, keine Systemuhr. Die Suche springt
+    /// monats-, tages-, stunden- und minutenweise vorwärts und bricht nach
+    /// einem vollen gregorianischen Zyklus (400 Jahre) ab.
+    ///
+    /// # Arguments
+    /// - `after` (`jiff::Timestamp`): Bezugszeitpunkt, hereingereicht.
+    ///
+    /// # Returns
+    /// `Some(t)` mit `t > after`, `t` auf eine volle UTC-Minute gerundet;
+    /// `None`, wenn der Ausdruck nie feuert (z. B. `0 0 30 2 *`) oder der
+    /// Zeitpunkt jenseits von `jiff::Timestamp::MAX` läge.
+    #[must_use]
+    pub fn next_after(&self, after: jiff::Timestamp) -> Option<jiff::Timestamp> {
+        let start = floor_minutes(after).checked_add(1)?;
+        let days = start.div_euclid(MINUTES_PER_DAY);
+        let minute_of_day = start.rem_euclid(MINUTES_PER_DAY);
+        let (mut year, mut month, mut day) = civil_from_days(days);
+        let mut hour = u32::try_from(minute_of_day / 60).ok()?;
+        let mut minute = u32::try_from(minute_of_day % 60).ok()?;
+        let horizon = year.checked_add(CRON_SEARCH_HORIZON_YEARS)?;
+
+        loop {
+            if year > horizon {
+                return None;
+            }
+            if !has_bit(self.months, month) {
+                (year, month) = next_month(year, month);
+                (day, hour, minute) = (1, 0, 0);
+                continue;
+            }
+            if !self.day_matches(year, month, day) {
+                (year, month, day) = next_day(year, month, day);
+                (hour, minute) = (0, 0);
+                continue;
+            }
+            let Some(next_hour) = next_bit_at_or_after(self.hours, hour, 23) else {
+                // Heute keine passende Stunde mehr: nächster Tag.
+                (year, month, day) = next_day(year, month, day);
+                (hour, minute) = (0, 0);
+                continue;
+            };
+            if next_hour != hour {
+                (hour, minute) = (next_hour, 0);
+            }
+            let Some(next_minute) = next_bit_at_or_after(self.minutes, minute, 59) else {
+                // In dieser Stunde keine passende Minute mehr: nächste Stunde.
+                if hour >= 23 {
+                    (year, month, day) = next_day(year, month, day);
+                    hour = 0;
+                } else {
+                    hour += 1;
+                }
+                minute = 0;
+                continue;
+            };
+            let seconds = days_from_civil(year, month, day)
+                .checked_mul(MINUTES_PER_DAY)?
+                .checked_add(i64::from(hour) * 60 + i64::from(next_minute))?
+                .checked_mul(SECONDS_PER_MINUTE)?;
+            return jiff::Timestamp::from_second(seconds).ok();
+        }
+    }
+
+    /// Monatstag/Wochentag nach Vixie-Cron-Semantik (siehe Moduldoku).
+    fn day_matches(&self, year: i64, month: u32, day: u32) -> bool {
+        let day_of_month_ok = has_bit(self.days_of_month, day);
+        let day_of_week_ok = has_bit(
+            self.days_of_week,
+            weekday_sunday_zero(days_from_civil(year, month, day)),
+        );
+        if self.day_of_month_restricted && self.day_of_week_restricted {
+            day_of_month_ok || day_of_week_ok
+        } else {
+            day_of_month_ok && day_of_week_ok
+        }
+    }
+}
+
+impl std::str::FromStr for CronSchedule {
+    type Err = CronParseError;
+
+    fn from_str(expression: &str) -> Result<Self, Self::Err> {
+        Self::parse(expression)
+    }
+}
+
+impl std::fmt::Display for CronSchedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.expression)
+    }
+}
+
+/// Parst ein einzelnes Cron-Feld zu einer Bitmaske.
+fn parse_cron_field(field: CronField, text: &str) -> Result<u64, CronParseError> {
+    let (_, max) = field.bounds();
+    let mut mask = 0u64;
+    for item in text.split(',') {
+        let invalid = || CronParseError::InvalidToken {
+            field,
+            token: item.to_owned(),
+        };
+        let (base, step) = match item.split_once('/') {
+            Some((base, step)) => (base, Some(parse_cron_number(step).ok_or_else(invalid)?)),
+            None => (item, None),
+        };
+        if step == Some(0) {
+            return Err(CronParseError::ZeroStep { field });
+        }
+        let (start, end) = if base == "*" {
+            field.star_bounds()
+        } else if let Some((start, end)) = base.split_once('-') {
+            let start = parse_cron_value(field, start).ok_or_else(invalid)??;
+            let end = parse_cron_value(field, end).ok_or_else(invalid)??;
+            if start > end {
+                return Err(CronParseError::ReversedRange { field, start, end });
+            }
+            (start, end)
+        } else {
+            let value = parse_cron_value(field, base).ok_or_else(invalid)??;
+            // `a/n` ist die Kurzform für `a-<max>/n`.
+            if step.is_some() {
+                (value, max)
+            } else {
+                (value, value)
+            }
+        };
+        let step = step.unwrap_or(1);
+        let mut value = start;
+        while value <= end {
+            mask |= 1u64 << value;
+            value = match value.checked_add(step) {
+                Some(next) => next,
+                None => break,
+            };
+        }
+    }
+    if field == CronField::DayOfWeek && has_bit(mask, 7) {
+        mask = (mask & !(1u64 << 7)) | 1;
+    }
+    Ok(mask)
+}
+
+/// Parst eine nicht-negative Dezimalzahl (nur ASCII-Ziffern, kein Vorzeichen).
+fn parse_cron_number(token: &str) -> Option<u32> {
+    if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    token.parse().ok()
+}
+
+/// Parst einen Feldwert: `None` bei Syntaxfehler, `Some(Err)` außerhalb der Grenzen.
+fn parse_cron_value(field: CronField, token: &str) -> Option<Result<u32, CronParseError>> {
+    let value = parse_cron_number(token)?;
+    let (min, max) = field.bounds();
+    if value < min || value > max {
+        return Some(Err(CronParseError::OutOfRange {
+            field,
+            value,
+            min,
+            max,
+        }));
+    }
+    Some(Ok(value))
+}
+
+/// Ist Bit `index` in `mask` gesetzt? (`index >= 64` ⇒ `false`.)
+fn has_bit(mask: u64, index: u32) -> bool {
+    index < 64 && (mask >> index) & 1 == 1
+}
+
+/// Kleinstes gesetztes Bit in `from..=last`.
+fn next_bit_at_or_after(mask: u64, from: u32, last: u32) -> Option<u32> {
+    (from..=last).find(|&index| has_bit(mask, index))
+}
+
+/// Ganze UTC-Minuten seit der Unix-Epoche, abgerundet (auch vor 1970).
+fn floor_minutes(timestamp: jiff::Timestamp) -> i64 {
+    let mut seconds = timestamp.as_second();
+    if timestamp.subsec_nanosecond() < 0 {
+        // `as_second` schneidet Richtung null ab; für negative Zeitpunkte abrunden.
+        seconds = seconds.saturating_sub(1);
+    }
+    seconds.div_euclid(SECONDS_PER_MINUTE)
+}
+
+/// Folgemonat (mit Jahreswechsel).
+fn next_month(year: i64, month: u32) -> (i64, u32) {
+    if month >= 12 {
+        (year.saturating_add(1), 1)
+    } else {
+        (year, month + 1)
+    }
+}
+
+/// Folgetag (mit Monats- und Jahreswechsel).
+fn next_day(year: i64, month: u32, day: u32) -> (i64, u32, u32) {
+    if day >= days_in_month(year, month) {
+        let (year, month) = next_month(year, month);
+        (year, month, 1)
+    } else {
+        (year, month, day + 1)
+    }
+}
+
+/// Schaltjahr nach gregorianischer Regel.
+fn is_leap_year(year: i64) -> bool {
+    year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0)
+}
+
+/// Tage im Monat.
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+/// Tage seit 1970-01-01 für ein proleptisch-gregorianisches Datum
+/// (Algorithmus `days_from_civil` nach Howard Hinnant).
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year.rem_euclid(400);
+    let month = i64::from(month);
+    let shifted_month = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * DAYS_PER_400_YEARS + day_of_era - DAYS_FROM_CIVIL_EPOCH
+}
+
+/// Umkehrung von [`days_from_civil`] (`civil_from_days` nach Howard Hinnant).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let shifted = days + DAYS_FROM_CIVIL_EPOCH;
+    let era = shifted.div_euclid(DAYS_PER_400_YEARS);
+    let day_of_era = shifted.rem_euclid(DAYS_PER_400_YEARS);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (
+        year,
+        u32::try_from(month).unwrap_or(1),
+        u32::try_from(day).unwrap_or(1),
+    )
+}
+
+/// Wochentag mit `0` = Sonntag (1970-01-01 war ein Donnerstag).
+fn weekday_sunday_zero(days: i64) -> u32 {
+    u32::try_from((days + 4).rem_euclid(7)).unwrap_or(0)
+}
+
+/// Entscheidung von [`DreamSchedule::decide`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DreamDecision {
+    /// Der Lauf ist fällig.
+    Due {
+        /// Der früheste versäumte Feuerzeitpunkt nach dem letzten Lauf;
+        /// `None`, wenn der Job noch nie gelaufen ist. Mehrere versäumte
+        /// Zeitpunkte werden zu diesem einen Lauf zusammengefasst.
+        scheduled_for: Option<jiff::Timestamp>,
+    },
+    /// Noch nicht fällig.
+    NotDue {
+        /// Der nächste Feuerzeitpunkt nach dem letzten Lauf (echt nach `now`,
+        /// sofern `last_run <= now`), ab dem der Lauf fällig wird.
+        next_fire: jiff::Timestamp,
+    },
+    /// Der Ausdruck feuert nach dem letzten Lauf nie wieder (unerfüllbar oder
+    /// jenseits des Suchhorizonts).
+    Never,
+}
+
+impl DreamDecision {
+    /// `true` genau für [`DreamDecision::Due`].
+    #[must_use]
+    pub fn is_due(&self) -> bool {
+        matches!(self, Self::Due { .. })
+    }
+}
+
+/// Zeitplan eines Dream-/Konsolidierungslaufs über einem [`CronSchedule`] —
+/// entscheidet nur, **ob** ein Lauf fällig ist; startet selbst nichts und
+/// liest nie die Systemuhr (siehe Moduldoku, "Der Dream-Job-Zeitplan").
+///
+/// # Examples
+/// ```rust
+/// use harw_knowledge::context_steward::{DreamDecision, DreamSchedule};
+///
+/// let schedule = DreamSchedule::recommended().expect("default expression parses");
+/// // 2026-01-05 ist ein Montag.
+/// let last_run: jiff::Timestamp = "2026-01-05T03:00:00Z".parse().expect("valid");
+/// let now: jiff::Timestamp = "2026-01-08T12:00:00Z".parse().expect("valid");
+/// assert!(!schedule.decide(Some(last_run), now).is_due());
+/// let later: jiff::Timestamp = "2026-01-12T03:00:00Z".parse().expect("valid");
+/// assert!(matches!(schedule.decide(Some(last_run), later), DreamDecision::Due { .. }));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DreamSchedule {
+    cron: CronSchedule,
+}
+
+impl DreamSchedule {
+    /// Baut einen Zeitplan aus einem bereits geparsten Ausdruck.
+    #[must_use]
+    pub fn new(cron: CronSchedule) -> Self {
+        Self { cron }
+    }
+
+    /// Parst `expression` und baut daraus einen Zeitplan.
+    ///
+    /// # Errors
+    /// [`CronParseError`], siehe [`CronSchedule::parse`].
+    pub fn parse(expression: &str) -> Result<Self, CronParseError> {
+        CronSchedule::parse(expression).map(Self::new)
+    }
+
+    /// Der empfohlene Zeitplan ([`DEFAULT_DREAM_CRON_EXPRESSION`]).
+    ///
+    /// # Errors
+    /// Nur theoretisch ([`CronParseError`]); der Ausdruck ist konstant und
+    /// durch Tests abgedeckt.
+    pub fn recommended() -> Result<Self, CronParseError> {
+        Self::parse(DEFAULT_DREAM_CRON_EXPRESSION)
+    }
+
+    /// Der zugrundeliegende Cron-Ausdruck.
+    #[must_use]
+    pub fn cron(&self) -> &CronSchedule {
+        &self.cron
+    }
+
+    /// Nächster planmäßiger Lauf nach `last_run` (siehe
+    /// [`CronSchedule::next_after`]).
+    #[must_use]
+    pub fn next_run_after(&self, last_run: jiff::Timestamp) -> Option<jiff::Timestamp> {
+        self.cron.next_after(last_run)
+    }
+
+    /// Entscheidet, ob ein Lauf zum Zeitpunkt `now` fällig ist.
+    ///
+    /// # Description
+    /// - `last_run == None` (nie gelaufen): sofort fällig.
+    /// - sonst: fällig, sobald der erste Feuerzeitpunkt echt nach `last_run`
+    ///   erreicht ist (`<= now`); beliebig viele versäumte Zeitpunkte ergeben
+    ///   genau **einen** fälligen Lauf. Liegt `last_run` nach `now`
+    ///   (Uhrensprung beim Aufrufer), ist der Lauf nicht fällig.
+    ///
+    /// # Arguments
+    /// - `last_run` (`Option<jiff::Timestamp>`): Beginn des letzten Laufs,
+    ///   vom Aufrufer dauerhaft festgehalten.
+    /// - `now` (`jiff::Timestamp`): Entscheidungszeitpunkt, hereingereicht.
+    ///
+    /// # Returns
+    /// Eine [`DreamDecision`].
+    #[must_use]
+    pub fn decide(&self, last_run: Option<jiff::Timestamp>, now: jiff::Timestamp) -> DreamDecision {
+        let Some(last_run) = last_run else {
+            return DreamDecision::Due {
+                scheduled_for: None,
+            };
+        };
+        match self.cron.next_after(last_run) {
+            Some(fire) if fire <= now => DreamDecision::Due {
+                scheduled_for: Some(fire),
+            },
+            Some(next_fire) => DreamDecision::NotDue { next_fire },
+            None => DreamDecision::Never,
+        }
+    }
+}
+
+/// Baut den [`StewardDigest`] für einen Dream-Lauf, **falls** er laut
+/// `schedule` fällig ist — Verbindung von Zeitplan und Steward.
+///
+/// # Description
+/// Reine Funktion ohne Systemuhr: bei [`DreamDecision::Due`] wird
+/// [`build_steward_digest`] über [`StewardWindow::default_window`]`(now)`
+/// aufgerufen, sonst nichts. Der Aufrufer hält danach `now` als neuen
+/// `last_run` fest.
+///
+/// # Arguments
+/// - `schedule` (`&DreamSchedule`): der Lauf-Zeitplan.
+/// - `last_run` (`Option<jiff::Timestamp>`): Beginn des letzten Laufs.
+/// - `now` (`jiff::Timestamp`): Entscheidungs- und Fensterendzeitpunkt.
+/// - `context_proposals`/`model_behavior_proposals`: siehe
+///   [`build_steward_digest`].
+///
+/// # Returns
+/// `Some(digest)`, wenn der Lauf fällig war; `None` sonst.
+///
+/// # Errors
+/// [`KnowledgeError::StewardWindowInvalid`], wenn das Standardfenster an
+/// `now` nicht gebildet werden kann (siehe [`StewardWindow::trailing`]).
+pub fn steward_digest_if_due(
+    schedule: &DreamSchedule,
+    last_run: Option<jiff::Timestamp>,
+    now: jiff::Timestamp,
+    context_proposals: &[ContextProposal],
+    model_behavior_proposals: &[ModelBehaviorProposal],
+) -> KnowledgeResult<Option<StewardDigest>> {
+    if !schedule.decide(last_run, now).is_due() {
+        return Ok(None);
+    }
+    let window = StewardWindow::default_window(now)?;
+    Ok(Some(build_steward_digest(
+        context_proposals,
+        model_behavior_proposals,
+        &window,
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -912,8 +1589,9 @@ mod tests {
     /// einen Modellkatalog-Eintrag zu ändern: außer `new`/`accept`/`reject`
     /// auf den importierten Vorschlagstypen (getestet in deren eigenen
     /// Modulen) exponiert dieses Modul nur `StewardWindow`-Konstruktoren,
-    /// die beiden `curate_*`-Funktionen, `build_steward_digest` und
-    /// `render_digest_summary` — alle nehmen Slices/Referenzen entgegen und
+    /// die beiden `curate_*`-Funktionen, `build_steward_digest`,
+    /// `render_digest_summary` und den reinen Zeitplan (`CronSchedule`,
+    /// `DreamSchedule`, `steward_digest_if_due`) — alle nehmen Slices/Referenzen entgegen und
     /// geben neue Werte zurück, keine schreibt irgendwohin. Dieser Test
     /// belegt die eine Hälfte davon strukturell: dieselben Eingabe-Slices
     /// bleiben nach dem Aufruf unverändert (kein `&mut`-Parameter existiert
@@ -931,6 +1609,613 @@ mod tests {
         assert_eq!(proposals.len(), before.len());
         assert_eq!(proposals[0].status, ProposalStatus::Pending);
         assert_eq!(proposals[0].id, before[0].id);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::{
+        CronField, CronParseError, CronSchedule, DEFAULT_DREAM_CRON_EXPRESSION, DreamDecision,
+        DreamSchedule, civil_from_days, days_from_civil, steward_digest_if_due,
+        weekday_sunday_zero,
+    };
+    use crate::artifact::ArtifactId;
+    use crate::context_proposal::ContextProposal;
+    use crate::test_support::{TestError, TestResult};
+
+    use harw_agent_dsl::ids::DefinitionId;
+
+    fn ts(text: &str) -> TestResult<jiff::Timestamp> {
+        Ok(text.parse::<jiff::Timestamp>()?)
+    }
+
+    fn cron(expression: &str) -> TestResult<CronSchedule> {
+        CronSchedule::parse(expression).map_err(crate::test_support::ctx("valid cron expression"))
+    }
+
+    /// Asserts `next_after(after) == expected` (both RFC 3339 strings).
+    fn assert_next(expression: &str, after: &str, expected: &str) -> TestResult {
+        let next = cron(expression)?
+            .next_after(ts(after)?)
+            .ok_or(TestError::Missing("expression fires"))?;
+        assert_eq!(
+            next,
+            ts(expected)?,
+            "{expression:?} after {after} should fire at {expected}, got {next}"
+        );
+        Ok(())
+    }
+
+    fn parse_err(expression: &str) -> TestResult<CronParseError> {
+        match CronSchedule::parse(expression) {
+            Ok(schedule) => Err(TestError::Unexpected(format!(
+                "{expression:?} must be rejected, parsed as {schedule}"
+            ))),
+            Err(error) => Ok(error),
+        }
+    }
+
+    // --- Parsing ---------------------------------------------------------
+
+    #[test]
+    fn test_parse_normalizes_whitespace_and_round_trips_via_display_and_from_str() -> TestResult {
+        let schedule = cron("  0\t3  *   * 1 ")?;
+        assert_eq!(schedule.as_str(), "0 3 * * 1");
+        assert_eq!(schedule.to_string(), "0 3 * * 1");
+        let reparsed: CronSchedule = schedule
+            .as_str()
+            .parse()
+            .map_err(crate::test_support::ctx("normalized form reparses"))?;
+        assert_eq!(reparsed, schedule);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_rejects_wrong_field_count() -> TestResult {
+        assert_eq!(
+            parse_err("* * * *")?,
+            CronParseError::WrongFieldCount { found: 4 }
+        );
+        assert_eq!(
+            parse_err("0 * * * * *")?,
+            CronParseError::WrongFieldCount { found: 6 }
+        );
+        assert_eq!(parse_err("")?, CronParseError::WrongFieldCount { found: 0 });
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_rejects_out_of_range_values_per_field() -> TestResult {
+        let cases = [
+            ("60 * * * *", CronField::Minute, 60, 0, 59),
+            ("* 24 * * *", CronField::Hour, 24, 0, 23),
+            ("* * 0 * *", CronField::DayOfMonth, 0, 1, 31),
+            ("* * 32 * *", CronField::DayOfMonth, 32, 1, 31),
+            ("* * * 0 *", CronField::Month, 0, 1, 12),
+            ("* * * 13 *", CronField::Month, 13, 1, 12),
+            ("* * * * 8", CronField::DayOfWeek, 8, 0, 7),
+            ("0-60 * * * *", CronField::Minute, 60, 0, 59),
+        ];
+        for (expression, field, value, min, max) in cases {
+            assert_eq!(
+                parse_err(expression)?,
+                CronParseError::OutOfRange {
+                    field,
+                    value,
+                    min,
+                    max
+                },
+                "{expression}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_rejects_reversed_range_and_zero_step() -> TestResult {
+        assert_eq!(
+            parse_err("* 22-2 * * *")?,
+            CronParseError::ReversedRange {
+                field: CronField::Hour,
+                start: 22,
+                end: 2
+            }
+        );
+        assert_eq!(
+            parse_err("*/0 * * * *")?,
+            CronParseError::ZeroStep {
+                field: CronField::Minute
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_rejects_malformed_tokens() -> TestResult {
+        for expression in [
+            "a * * * *",
+            "1,,2 * * * *",
+            ", * * * *",
+            "-1 * * * *",
+            "+1 * * * *",
+            "1- * * * *",
+            "*/ * * * *",
+            "*/x * * * *",
+            "1-2-3 * * * *",
+            "**/2 * * * *",
+            "* * * * MON",
+            "* * * JAN *",
+            "* * ? * *",
+            "* * L * *",
+            "99999999999 * * * *",
+        ] {
+            let error = parse_err(expression)?;
+            assert!(
+                matches!(error, CronParseError::InvalidToken { .. }),
+                "{expression}: {error}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_day_of_week_seven_is_sunday_like_zero() -> TestResult {
+        let seven = cron("0 0 * * 7")?;
+        let zero = cron("0 0 * * 0")?;
+        assert_eq!(seven.days_of_week, zero.days_of_week);
+        assert_eq!(seven.days_of_week, 1);
+        // `5-7` = Fri, Sat, Sun.
+        assert_eq!(cron("0 0 * * 5-7")?.days_of_week, 0b110_0001);
+        // `*` never sets the (folded-away) bit 7.
+        assert_eq!(cron("0 0 * * *")?.days_of_week, 0b111_1111);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_builds_expected_masks_for_lists_ranges_and_steps() -> TestResult {
+        let schedule = cron("*/15 1,3-5,20-23/2 1/10 2-12/5 *")?;
+        assert_eq!(
+            schedule.minutes,
+            (1 << 0) | (1 << 15) | (1 << 30) | (1 << 45)
+        );
+        assert_eq!(
+            schedule.hours,
+            (1 << 1) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 20) | (1 << 22)
+        );
+        // `1/10` = `1-31/10`.
+        assert_eq!(
+            schedule.days_of_month,
+            (1 << 1) | (1 << 11) | (1 << 21) | (1 << 31)
+        );
+        assert_eq!(schedule.months, (1 << 2) | (1 << 7) | (1 << 12));
+        // Step larger than the range keeps just the start.
+        assert_eq!(cron("5/100 * * * *")?.minutes, 1 << 5);
+        Ok(())
+    }
+
+    // --- next_after: basics ---------------------------------------------
+
+    #[test]
+    fn test_every_minute_is_strictly_after_and_minute_aligned() -> TestResult {
+        assert_next("* * * * *", "2026-01-01T10:00:30Z", "2026-01-01T10:01:00Z")?;
+        // Exactly on a fire time: the next one, never the same.
+        assert_next("* * * * *", "2026-01-01T10:01:00Z", "2026-01-01T10:02:00Z")?;
+        assert_next(
+            "* * * * *",
+            "2026-01-01T10:01:59.999999999Z",
+            "2026-01-01T10:02:00Z",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_lists_ranges_and_steps_in_minutes() -> TestResult {
+        assert_next(
+            "5,10 * * * *",
+            "2026-01-01T10:05:00Z",
+            "2026-01-01T10:10:00Z",
+        )?;
+        assert_next(
+            "5,10 * * * *",
+            "2026-01-01T10:10:00Z",
+            "2026-01-01T11:05:00Z",
+        )?;
+        assert_next(
+            "*/15 * * * *",
+            "2026-01-01T10:46:00Z",
+            "2026-01-01T11:00:00Z",
+        )?;
+        assert_next(
+            "10-20/5 * * * *",
+            "2026-01-01T10:12:00Z",
+            "2026-01-01T10:15:00Z",
+        )?;
+        assert_next(
+            "10-20/5 * * * *",
+            "2026-01-01T10:20:00Z",
+            "2026-01-01T11:10:00Z",
+        )?;
+        assert_next(
+            "50/5 * * * *",
+            "2026-01-01T10:56:00Z",
+            "2026-01-01T11:50:00Z",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_hours_roll_over_to_the_next_day_and_month() -> TestResult {
+        assert_next("30 4 * * *", "2026-01-01T05:00:00Z", "2026-01-02T04:30:00Z")?;
+        assert_next("30 4 * * *", "2026-01-01T04:29:59Z", "2026-01-01T04:30:00Z")?;
+        assert_next("0 0 * * *", "2026-01-31T23:59:59Z", "2026-02-01T00:00:00Z")?;
+        assert_next("0 0 * * *", "2026-12-31T00:00:00Z", "2027-01-01T00:00:00Z")?;
+        assert_next(
+            "15 22-23 * * *",
+            "2026-02-28T23:15:00Z",
+            "2026-03-01T22:15:00Z",
+        )?;
+        Ok(())
+    }
+
+    // --- next_after: month boundaries -----------------------------------
+
+    #[test]
+    fn test_day_31_skips_short_months() -> TestResult {
+        assert_next(
+            "0 12 31 * *",
+            "2026-01-31T13:00:00Z",
+            "2026-03-31T12:00:00Z",
+        )?;
+        assert_next(
+            "0 12 31 * *",
+            "2026-03-31T12:00:00Z",
+            "2026-05-31T12:00:00Z",
+        )?;
+        assert_next(
+            "0 12 31 * *",
+            "2026-07-31T12:00:00Z",
+            "2026-08-31T12:00:00Z",
+        )?;
+        assert_next("0 0 30 * *", "2026-01-30T00:00:00Z", "2026-03-30T00:00:00Z")?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_february_29_only_in_leap_years_including_century_rule() -> TestResult {
+        assert_next("0 0 29 2 *", "2026-03-01T00:00:00Z", "2028-02-29T00:00:00Z")?;
+        assert_next("0 0 29 2 *", "2024-02-28T23:59:00Z", "2024-02-29T00:00:00Z")?;
+        // 2100 is not a leap year; 2000 was.
+        assert_next("0 0 29 2 *", "2096-03-01T00:00:00Z", "2104-02-29T00:00:00Z")?;
+        assert_next("0 0 29 2 *", "1999-01-01T00:00:00Z", "2000-02-29T00:00:00Z")?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_month_restriction_rolls_over_the_year() -> TestResult {
+        assert_next("0 0 1 1 *", "2026-06-15T00:00:00Z", "2027-01-01T00:00:00Z")?;
+        assert_next(
+            "0 0 1 6-8 *",
+            "2026-08-02T00:00:00Z",
+            "2027-06-01T00:00:00Z",
+        )?;
+        assert_next(
+            "0 0 1 6-8 *",
+            "2026-06-01T00:00:00Z",
+            "2026-07-01T00:00:00Z",
+        )?;
+        assert_next("0 0 * 2 *", "2026-02-28T00:00:00Z", "2027-02-01T00:00:00Z")?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_impossible_expressions_return_none() -> TestResult {
+        let after = ts("2026-01-01T00:00:00Z")?;
+        assert_eq!(cron("0 0 30 2 *")?.next_after(after), None);
+        assert_eq!(cron("0 0 31 4,6,9,11 *")?.next_after(after), None);
+        // `*/2` in DOW counts as unrestricted → AND with an impossible DOM.
+        assert_eq!(cron("0 0 31 2 */2")?.next_after(after), None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_next_after_near_timestamp_max_returns_none() -> TestResult {
+        assert_eq!(cron("0 0 1 1 *")?.next_after(jiff::Timestamp::MAX), None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_next_after_before_the_unix_epoch_with_fractional_seconds() -> TestResult {
+        assert_next(
+            "* * * * *",
+            "1969-12-31T23:59:59.5Z",
+            "1970-01-01T00:00:00Z",
+        )?;
+        assert_next("0 0 * * *", "1969-12-30T12:00:00Z", "1969-12-31T00:00:00Z")?;
+        Ok(())
+    }
+
+    // --- next_after: day-of-month / day-of-week semantics ---------------
+
+    #[test]
+    fn test_day_of_week_only() -> TestResult {
+        // 2026-01-01 is a Thursday; the next Monday is 2026-01-05.
+        assert_next("0 9 * * 1", "2026-01-01T00:00:00Z", "2026-01-05T09:00:00Z")?;
+        assert_next("0 9 * * 1", "2026-01-05T09:00:00Z", "2026-01-12T09:00:00Z")?;
+        // Sunday as 0 and as 7.
+        assert_next("0 0 * * 0", "2026-01-01T00:00:00Z", "2026-01-04T00:00:00Z")?;
+        assert_next("0 0 * * 7", "2026-01-01T00:00:00Z", "2026-01-04T00:00:00Z")?;
+        // Weekdays only: Friday evening → Monday.
+        assert_next(
+            "0 8 * * 1-5",
+            "2026-01-02T09:00:00Z",
+            "2026-01-05T08:00:00Z",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_day_of_month_only_ignores_weekday() -> TestResult {
+        assert_next("0 0 13 * *", "2026-01-01T00:00:00Z", "2026-01-13T00:00:00Z")?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_both_restricted_means_either_matches() -> TestResult {
+        // "13th of the month OR Friday": Friday 2026-01-02 comes first …
+        assert_next("0 0 13 * 5", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z")?;
+        // … and the 13th (a Tuesday) fires even though it is not a Friday.
+        assert_next("0 0 13 * 5", "2026-01-10T00:00:00Z", "2026-01-13T00:00:00Z")?;
+        assert_next("0 0 13 * 5", "2026-01-13T00:00:00Z", "2026-01-16T00:00:00Z")?;
+        // "1st OR Monday": Feb 1 2026 is a Sunday and still fires.
+        assert_next("0 0 1 * 1", "2026-01-26T00:00:00Z", "2026-02-01T00:00:00Z")?;
+        assert_next("0 0 1 * 1", "2026-02-01T00:00:00Z", "2026-02-02T00:00:00Z")?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_star_prefixed_day_of_week_step_means_both_must_match() -> TestResult {
+        // `*/2` (Sun, Tue, Thu, Sat) starts with `*` → AND with DOM 13:
+        // Jan 13 2026 = Tue (fires); Feb/Mar = Fri, Apr = Mon, May = Wed
+        // (skipped); Jun 13 = Sat (fires).
+        assert_next(
+            "0 0 13 * */2",
+            "2026-01-01T00:00:00Z",
+            "2026-01-13T00:00:00Z",
+        )?;
+        assert_next(
+            "0 0 13 * */2",
+            "2026-01-14T00:00:00Z",
+            "2026-06-13T00:00:00Z",
+        )?;
+        Ok(())
+    }
+
+    // --- Cross-checks -----------------------------------------------------
+
+    /// The hand-rolled civil calendar agrees with jiff across ±~2200 years.
+    #[test]
+    fn test_civil_conversion_agrees_with_jiff() -> TestResult {
+        let mut days: i64 = -800_000;
+        while days <= 800_000 {
+            let timestamp = jiff::Timestamp::from_second(days * 86_400)?;
+            let civil = jiff::tz::Offset::UTC.to_datetime(timestamp);
+            let (year, month, day) = civil_from_days(days);
+            assert_eq!(year, i64::from(civil.year()), "year for day {days}");
+            assert_eq!(
+                i64::from(month),
+                i64::from(civil.month()),
+                "month for day {days}"
+            );
+            assert_eq!(i64::from(day), i64::from(civil.day()), "day for day {days}");
+            assert_eq!(days_from_civil(year, month, day), days);
+            assert_eq!(
+                i64::from(weekday_sunday_zero(days)),
+                i64::from(civil.weekday().to_sunday_zero_offset()),
+                "weekday for day {days}"
+            );
+            days += 997;
+        }
+        Ok(())
+    }
+
+    /// `next_after` agrees with a brute-force minute-by-minute scan over
+    /// `matches` (result matches, nothing in between matches).
+    #[test]
+    fn test_next_after_agrees_with_brute_force_scan() -> TestResult {
+        let expressions = [
+            "* * * * *",
+            "*/7 */5 * * *",
+            "0 12 * * 1-5",
+            "30 0 1,15 * *",
+            "0 0 13 * 5",
+            "45 23 28-31 * *",
+            "0 6 * 2 0",
+            "59 23 31 12 *",
+        ];
+        let starts = [
+            "2026-01-01T00:00:00Z",
+            "2026-02-27T23:59:30Z",
+            "2027-12-31T23:58:00Z",
+            "2028-02-28T12:34:56Z",
+        ];
+        for expression in expressions {
+            let schedule = cron(expression)?;
+            for start in starts {
+                let after = ts(start)?;
+                let next = schedule
+                    .next_after(after)
+                    .ok_or(TestError::Missing("frequent expression fires"))?;
+                assert!(next > after, "{expression} after {start}");
+                assert!(schedule.matches(next), "{expression}: {next} must match");
+                let mut probe = after.checked_add(jiff::SignedDuration::from_secs(
+                    60 - after.as_second().rem_euclid(60),
+                ))?;
+                while probe < next {
+                    assert!(
+                        !schedule.matches(probe),
+                        "{expression} after {start}: {probe} matches before {next}"
+                    );
+                    probe = probe.checked_add(jiff::SignedDuration::from_secs(60))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // --- DreamSchedule ------------------------------------------------------
+
+    fn recommended() -> TestResult<DreamSchedule> {
+        DreamSchedule::recommended().map_err(crate::test_support::ctx("default expression parses"))
+    }
+
+    #[test]
+    fn test_recommended_schedule_is_weekly_monday_0300_utc() -> TestResult {
+        let schedule = recommended()?;
+        assert_eq!(schedule.cron().as_str(), DEFAULT_DREAM_CRON_EXPRESSION);
+        assert_eq!(
+            schedule.next_run_after(ts("2026-01-01T00:00:00Z")?),
+            Some(ts("2026-01-05T03:00:00Z")?)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_decide_never_run_is_due_immediately() -> TestResult {
+        assert_eq!(
+            recommended()?.decide(None, ts("2026-01-01T00:00:00Z")?),
+            DreamDecision::Due {
+                scheduled_for: None
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_decide_not_due_reports_next_fire() -> TestResult {
+        let decision = recommended()?.decide(
+            Some(ts("2026-01-05T03:00:00Z")?),
+            ts("2026-01-12T02:59:59Z")?,
+        );
+        assert_eq!(
+            decision,
+            DreamDecision::NotDue {
+                next_fire: ts("2026-01-12T03:00:00Z")?
+            }
+        );
+        assert!(!decision.is_due());
+        Ok(())
+    }
+
+    #[test]
+    fn test_decide_due_exactly_at_fire_time() -> TestResult {
+        assert_eq!(
+            recommended()?.decide(
+                Some(ts("2026-01-05T03:00:00Z")?),
+                ts("2026-01-12T03:00:00Z")?
+            ),
+            DreamDecision::Due {
+                scheduled_for: Some(ts("2026-01-12T03:00:00Z")?)
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_decide_coalesces_missed_runs_to_the_earliest() -> TestResult {
+        // Three Mondays missed; one run is due, reporting the first missed one.
+        assert_eq!(
+            recommended()?.decide(
+                Some(ts("2026-01-05T03:00:00Z")?),
+                ts("2026-01-30T00:00:00Z")?
+            ),
+            DreamDecision::Due {
+                scheduled_for: Some(ts("2026-01-12T03:00:00Z")?)
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_decide_last_run_in_the_future_is_not_due() -> TestResult {
+        let decision = recommended()?.decide(
+            Some(ts("2026-02-02T03:00:00Z")?),
+            ts("2026-01-20T00:00:00Z")?,
+        );
+        assert_eq!(
+            decision,
+            DreamDecision::NotDue {
+                next_fire: ts("2026-02-09T03:00:00Z")?
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_decide_impossible_schedule_is_never() -> TestResult {
+        let schedule = DreamSchedule::parse("0 0 30 2 *")
+            .map_err(crate::test_support::ctx("syntactically valid"))?;
+        assert_eq!(
+            schedule.decide(
+                Some(ts("2026-01-01T00:00:00Z")?),
+                ts("2030-01-01T00:00:00Z")?
+            ),
+            DreamDecision::Never
+        );
+        Ok(())
+    }
+
+    fn context_proposal_at(
+        slug: &str,
+        generated_at: jiff::Timestamp,
+    ) -> TestResult<ContextProposal> {
+        Ok(ContextProposal::new(
+            ArtifactId::new(format!("context-proposal/{slug}")),
+            "Testvorschlag",
+            DefinitionId::parse("harwness.context.security-triage@1")
+                .map_err(crate::test_support::ctx("valid definition id"))?,
+            "deadbeef".repeat(8),
+            Vec::new(),
+            Vec::new(),
+            generated_at,
+            "heuristic:must-include-promotion@1",
+        ))
+    }
+
+    #[test]
+    fn test_steward_digest_if_due_skips_when_not_due() -> TestResult {
+        let now = ts("2026-01-08T00:00:00Z")?;
+        let digest = steward_digest_if_due(
+            &recommended()?,
+            Some(ts("2026-01-05T03:00:00Z")?),
+            now,
+            &[context_proposal_at("recent", now)?],
+            &[],
+        )?;
+        assert!(digest.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_steward_digest_if_due_builds_digest_over_default_window() -> TestResult {
+        let now = ts("2026-01-12T03:00:00Z")?;
+        let digest = steward_digest_if_due(
+            &recommended()?,
+            Some(ts("2026-01-05T03:00:00Z")?),
+            now,
+            &[
+                context_proposal_at("recent", ts("2026-01-06T00:00:00Z")?)?,
+                context_proposal_at("stale", ts("2026-01-04T00:00:00Z")?)?,
+            ],
+            &[],
+        )?
+        .ok_or(TestError::Missing("due run yields a digest"))?;
+        assert_eq!(digest.context_proposals.pending_in_window.len(), 1);
+        assert_eq!(digest.context_proposals.pending_outside_window, 1);
+        assert_eq!(
+            digest.context_proposals.pending_in_window[0].id,
+            ArtifactId::new("context-proposal/recent")
+        );
         Ok(())
     }
 }

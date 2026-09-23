@@ -41,8 +41,8 @@ pub enum TelegramChannelError {
         from: &'static str,
         action: &'static str,
     },
-    /// An approved work request has no launch integration yet; see
-    /// `harw_channel_telegram::launch_sandboxed_worker`'s doc comment.
+    /// An approved work request cannot launch because no
+    /// [`crate::WorkLauncher`] is installed on the store.
     LaunchNotYetAvailable {
         work_id: WorkId,
     },
@@ -88,7 +88,7 @@ impl fmt::Display for TelegramChannelError {
             ),
             Self::LaunchNotYetAvailable { work_id } => write!(
                 f,
-                "work request '{work_id}' was approved, but this binding has no sandboxed launch integration yet"
+                "work request '{work_id}' was approved, but no work launcher is installed"
             ),
             Self::Io(err) => write!(f, "work-request store I/O error: {err}"),
             Self::Serde(err) => write!(f, "work-request store serialization error: {err}"),

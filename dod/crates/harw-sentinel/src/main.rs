@@ -174,11 +174,58 @@
 //! einer durchgesetzten Aktion weiterhin fehlt (Bruch 2, ausdrücklich nicht
 //! Teil dieses Knotens).
 //!
+//! # DoD-Systemkonfiguration und Poll-Taktung
+//! [`main`] lädt vor jedem anderen Startschritt (Sink, Socket, Landlock) den
+//! gemeinsamen DoD-Vertrag aus [`harw_dod_config`] — denselben, den auch die
+//! BPF-Sonde liest ([`load_dod_settings`]):
+//!
+//! - **Quelle.** Ein expliziter administrativer Pfad geht über
+//!   [`harw_dod_config::load_config`]; ohne ihn gilt ausschließlich der feste
+//!   Pfad [`harw_dod_config::SYSTEM_CONFIG_PATH`] über
+//!   [`harw_dod_config::load_system_config`]. Die Kommandozeile trägt heute
+//!   noch kein `--config`-Flag — [`main`] übergibt deshalb stets `None`.
+//! - **Fehlt die Systemkonfiguration** (`ENOENT` auf irgendeinem Pfadglied),
+//!   startet dieser Prozess mit den eingebauten Vorgaben und meldet das per
+//!   `tracing::warn!` deutlich — dieses Binary ist unprivilegiert und seine
+//!   Sensoren hängen an keinem Profil, ein Host ohne DoD-Installation soll
+//!   nicht jede Beobachtung verlieren. Es gibt dann **keinen**
+//!   Konfigurations-Digest; eine Bereitschaftsaussage gegenüber der Sonde
+//!   darf daraus nicht abgeleitet werden.
+//! - **Nicht vertrauenswürdig oder ungültig** (fremder Eigentümer,
+//!   gruppen-/weltschreibbar, Symlink, Parse-/Schemafehler, fehlendes oder
+//!   unbekanntes `active_profile`, sowie jeder Lesefehler eines explizit
+//!   angegebenen Pfads) — **fail closed**: [`main`] beendet sich mit
+//!   `ExitCode::FAILURE`, bevor irgendein Socket gebunden wird. Ein
+//!   Sicherheitssammler, der still mit einer manipulierten oder halb
+//!   gültigen Konfiguration liefe, wäre der teurere Fehler als einer, der
+//!   gar nicht startet.
+//! - **`SentinelConfig`.** Der DoD-Vertrag (Schema-Version 1) trägt heute
+//!   kein Feld für Rückversuchspolitik oder Ringkapazitäten;
+//!   [`DodSettings::sentinel_config`] liefert deshalb bewusst
+//!   `SentinelConfig::default()`, protokolliert aber Profil und Digest, damit
+//!   Sentinel und Sonde dieselbe Auflösung belegen.
+//! - **Programmweiter Poll-Abstand.** Auch der DoD-Vertrag legt keinen
+//!   Poll-Abstand fest. Maßgeblich ist deshalb das, was die Sammelschleife
+//!   tatsächlich taktet: `Sentinel::poll_all` hat keine eigene Uhr, sondern
+//!   wird von [`run`] je Runde aufgerufen, getrennt durch
+//!   `std::thread::sleep(`[`PollTiming::interval`]`)` — und dieser Wert
+//!   stammt aus `--interval-secs` (Vorgabe `cli::DEFAULT_INTERVAL_SECS`).
+//!   [`PollTiming`] ist die eine Stelle, aus der jedes zeitgebundene
+//!   Sensorfenster abgeleitet wird: ein Rückschaufenster ist
+//!   `max(Vorgabe, 2 × Poll-Abstand)` ([`PollTiming::lookback_for`]), damit
+//!   aufeinanderfolgende Polls sich stets überlappen statt eine Lücke zu
+//!   lassen — selbst wenn eine Runde sich um bis zu einen vollen Abstand
+//!   verspätet.
+//!
 //! # Fehler
 //! [`error::SentinelBinError`] — ausschließlich die beiden Startpfade ohne
 //! Degradationsoption: Root-Space-Auflösung und Öffnen des
 //! Telemetrie-Sinks. Ein fehlender Landlock-Support oder ein nicht
 //! bindbarer IPC-Socket sind **kein** `Err` dieses Binaries (siehe oben).
+//! Eine nicht vertrauenswürdige oder ungültige DoD-Konfiguration beendet den
+//! Prozess ebenfalls, wird aber direkt in [`main`] als
+//! [`harw_dod_config::ConfigError`] geloggt (siehe oben), weil
+//! `SentinelBinError` dafür noch keine Variante trägt.
 //!
 //! # Examples
 //! ```text
@@ -197,6 +244,7 @@ mod sensors;
 #[cfg(target_os = "linux")]
 mod ipc;
 
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
@@ -204,6 +252,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use clap::Parser as _;
+use harw_dod_config::{
+    Config, ConfigError, ResolvedObservationProfile, SYSTEM_CONFIG_PATH, load_config,
+    load_system_config,
+};
 use harw_dod_sentinel::{Sentinel, SentinelConfig};
 use harw_observe::TelemetrySink;
 use harw_observe_file::FileSink;
@@ -244,18 +296,248 @@ type IpcInboxHandle = Arc<Mutex<ipc::IpcInbox>>;
 #[cfg(not(target_os = "linux"))]
 type IpcInboxHandle = ();
 
+/// Faktor zwischen Poll-Abstand und Mindest-Rückschaufenster eines Sensors.
+///
+/// Zwei volle Abstände: ein Fenster von genau einem Abstand überlappt nur,
+/// solange jede Runde pünktlich läuft; verspätet sich eine Runde (langsamer
+/// Sensor, Last), entstünde eine Lücke. Der doppelte Abstand toleriert eine
+/// Verspätung bis zu einem vollen weiteren Abstand, ohne ein Ereignis zu
+/// verpassen — Doppelzählungen im Überlappungsbereich sind der billigere
+/// Fehler (siehe `harw_dod_authlog::sensor`-Moduldoku, Abschnitt „woher kommt
+/// `since`?").
+const LOOKBACK_POLL_FACTOR: u32 = 2;
+
+/// Der programmweite Poll-Abstand dieses Prozesses.
+///
+/// # Description
+/// Weder `harw_dod_config::Config` noch `SentinelConfig` kennen einen
+/// Poll-Abstand: `Sentinel::poll_all` hat keine eigene Uhr, sondern wird
+/// von [`run`] aufgerufen, getrennt durch `std::thread::sleep(interval)`.
+/// Genau dieser Schlafabstand (`--interval-secs`) ist deshalb der
+/// maßgebliche Poll-Abstand, und dieser Typ ist die einzige Stelle, aus der
+/// zeitgebundene Sensorfenster abgeleitet werden (siehe Moduldoku, Abschnitt
+/// „DoD-Systemkonfiguration und Poll-Taktung").
+///
+/// # Concurrency
+/// Reiner Werttyp, `Copy + Send + Sync`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PollTiming {
+    interval: Duration,
+}
+
+impl PollTiming {
+    /// Baut die Taktung aus dem über `--interval-secs` gewählten Wert.
+    ///
+    /// # Arguments
+    /// - `secs` (`u64`): Sekunden zwischen zwei Poll-Runden.
+    #[must_use]
+    const fn from_interval_secs(secs: u64) -> Self {
+        Self {
+            interval: Duration::from_secs(secs),
+        }
+    }
+
+    /// Abstand zwischen zwei Poll-Runden — exakt der Wert, den die
+    /// Dauerschleife in [`run`] schläft.
+    #[must_use]
+    const fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    /// Effektives Rückschaufenster eines Sensors mit Vorgabe `default`.
+    ///
+    /// # Description
+    /// `max(default, LOOKBACK_POLL_FACTOR × interval)` — ein Sensor mit
+    /// großzügiger Vorgabe behält sie, ein zu knappes Fenster wird auf den
+    /// doppelten Poll-Abstand angehoben (siehe [`LOOKBACK_POLL_FACTOR`]).
+    /// Gedacht für `with_lookback`-Konstruktoren wie
+    /// `harw_dod_authlog::AuthlogSensor::with_lookback`. Die Multiplikation
+    /// sättigt, statt bei einem absurd großen `--interval-secs` überzulaufen.
+    ///
+    /// **Nicht** für Lese-Timeouts (`with_timeout` von `harw-dod-procmon`/
+    /// `harw-dod-flow`): ein Timeout blockiert die Runde und muss **unter**
+    /// dem Poll-Abstand bleiben, nicht darüber.
+    ///
+    /// # Arguments
+    /// - `default` (`std::time::Duration`): die Vorgabe des Sensors.
+    #[must_use]
+    fn lookback_for(&self, default: Duration) -> Duration {
+        default.max(self.interval.saturating_mul(LOOKBACK_POLL_FACTOR))
+    }
+}
+
+/// Woher die geladenen DoD-Einstellungen stammen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfigOrigin {
+    /// Ein explizit übergebener administrativer Pfad
+    /// ([`harw_dod_config::load_config`]).
+    Explicit(std::path::PathBuf),
+    /// Der feste Systempfad [`harw_dod_config::SYSTEM_CONFIG_PATH`].
+    System,
+    /// Der feste Systempfad existiert nicht; eingebaute Vorgaben ohne
+    /// Profil und ohne Digest.
+    BuiltinDefaults,
+}
+
+impl ConfigOrigin {
+    /// Der gelesene Pfad, oder `None` bei eingebauten Vorgaben.
+    #[must_use]
+    fn source_path(&self) -> Option<&Path> {
+        match self {
+            Self::Explicit(path) => Some(path),
+            Self::System => Some(Path::new(SYSTEM_CONFIG_PATH)),
+            Self::BuiltinDefaults => None,
+        }
+    }
+}
+
+/// Die für diesen Lauf aufgelösten DoD-Einstellungen.
+///
+/// # Description
+/// Trägt das aktive Beobachtungsprofil (oder `None` im Fall
+/// [`ConfigOrigin::BuiltinDefaults`]) und leitet daraus die
+/// `SentinelConfig` ab. Wird in [`main`] vor jedem anderen Startschritt
+/// gebaut (siehe Moduldoku).
+#[derive(Debug, Clone)]
+struct DodSettings {
+    origin: ConfigOrigin,
+    profile: Option<ResolvedObservationProfile>,
+}
+
+impl DodSettings {
+    /// Eingebaute Vorgaben für einen Host ohne Systemkonfiguration.
+    #[must_use]
+    const fn builtin_defaults() -> Self {
+        Self {
+            origin: ConfigOrigin::BuiltinDefaults,
+            profile: None,
+        }
+    }
+
+    /// Die aus dem DoD-Vertrag abgeleitete `SentinelConfig`.
+    ///
+    /// # Description
+    /// Schema-Version 1 des DoD-Vertrags trägt weder Rückversuchspolitik noch
+    /// Ringkapazitäten — jede Profilauflösung ergibt deshalb bewusst
+    /// `SentinelConfig::default()`. Erhält der Vertrag solche Felder, ist
+    /// dies die eine Stelle, an der sie übernommen werden.
+    #[must_use]
+    fn sentinel_config(&self) -> SentinelConfig {
+        SentinelConfig::default()
+    }
+}
+
+/// Lädt und löst die DoD-Konfiguration für diesen Lauf auf.
+///
+/// # Description
+/// `explicit = Some(path)` liest über [`harw_dod_config::load_config`]
+/// (jeder Fehler, auch eine fehlende Datei, ist fail closed — der
+/// Administrator hat diesen Pfad ausdrücklich verlangt). `None` liest den
+/// festen Systempfad über [`harw_dod_config::load_system_config`]; nur dort
+/// führt eine fehlende Datei zu [`DodSettings::builtin_defaults`] mit einer
+/// deutlichen Warnung. Siehe [`settings_from_loaded`].
+///
+/// # Errors
+/// Jeder [`harw_dod_config::ConfigError`] außer einer fehlenden
+/// Systemkonfiguration.
+fn load_dod_settings(explicit: Option<&Path>) -> Result<DodSettings, ConfigError> {
+    match explicit {
+        Some(path) => settings_from_loaded(
+            load_config(path),
+            ConfigOrigin::Explicit(path.to_path_buf()),
+        ),
+        None => settings_from_loaded(load_system_config(), ConfigOrigin::System),
+    }
+}
+
+/// Wandelt ein Ladeergebnis in [`DodSettings`] um — getrennt von
+/// [`load_dod_settings`], damit die Fallback-/Fail-closed-Entscheidung ohne
+/// Zugriff auf `/etc` testbar ist.
+///
+/// # Arguments
+/// - `loaded` (`Result<harw_dod_config::Config, harw_dod_config::ConfigError>`):
+///   das Ergebnis von `load_config`/`load_system_config`.
+/// - `origin` (`ConfigOrigin`): die gelesene Quelle; nur
+///   [`ConfigOrigin::System`] kennt den Fallback auf Vorgaben.
+///
+/// # Errors
+/// Jeder Lese-, Vertrauens-, Parse- oder Auflösungsfehler, außer `NotFound`
+/// beim festen Systempfad. Ein fehlendes oder unbekanntes `active_profile`
+/// ist ebenfalls ein Fehler — `resolve_active` fällt nie auf ein anderes
+/// Profil zurück, und dieser Prozess auch nicht.
+fn settings_from_loaded(
+    loaded: Result<Config, ConfigError>,
+    origin: ConfigOrigin,
+) -> Result<DodSettings, ConfigError> {
+    match loaded {
+        Ok(config) => {
+            let profile = config.resolve_active()?;
+            Ok(DodSettings {
+                origin,
+                profile: Some(profile),
+            })
+        }
+        Err(ConfigError::Io(error))
+            if origin == ConfigOrigin::System && error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            tracing::warn!(
+                path = SYSTEM_CONFIG_PATH,
+                error = %error,
+                "DoD system configuration not found; running with built-in defaults \
+                 (no active profile, no config digest -- probe readiness cannot be matched)"
+            );
+            Ok(DodSettings::builtin_defaults())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Protokolliert Herkunft, Profil und Digest der geladenen Einstellungen.
+///
+/// Sentinel und Sonde müssen denselben Digest melden (siehe
+/// `harw_dod_config::ResolvedObservationProfile`); diese Zeile ist der
+/// Sentinel-Anteil dieses Abgleichs.
+fn log_dod_settings(settings: &DodSettings, timing: PollTiming) {
+    let sentinel_config = settings.sentinel_config();
+    match &settings.profile {
+        Some(profile) => tracing::info!(
+            origin = ?settings.origin,
+            source = ?settings.origin.source_path(),
+            profile = profile.profile_id().as_str(),
+            config_digest = %profile.config_digest(),
+            scope = ?profile.scope(),
+            sensors = ?profile.sensors(),
+            ?sentinel_config,
+            poll_interval = ?timing.interval(),
+            lookback_floor = ?timing.lookback_for(Duration::ZERO),
+            "DoD configuration loaded"
+        ),
+        None => tracing::warn!(
+            origin = ?settings.origin,
+            ?sentinel_config,
+            poll_interval = ?timing.interval(),
+            lookback_floor = ?timing.lookback_for(Duration::ZERO),
+            "DoD configuration absent; using built-in defaults"
+        ),
+    }
+}
+
 /// Einstiegspunkt.
 ///
 /// # Description
 /// Parst die Kommandozeile ohne `clap::Parser::parse` (das bei einem
 /// Fehler oder `--help`/`--version` selbst `std::process::exit` aufriefe
 /// und diese Funktion nie zu ihrem eigenen `ExitCode` zurückkehren ließe),
-/// initialisiert `tracing` und delegiert an [`run`].
+/// initialisiert `tracing`, bedient das Unterkommando `completions`, lädt
+/// sonst die DoD-Konfiguration ([`load_dod_settings`], fail closed — siehe
+/// Moduldoku) und delegiert an [`run`].
 ///
 /// # Returns
-/// `ExitCode::SUCCESS` bei normalem Ende (nur nach `--once`; die
-/// Dauerschleife endet sonst nur durch ein Signal). `ExitCode::FAILURE` bei
-/// einem CLI-Parse-Fehler oder einem [`error::SentinelBinError`].
+/// `ExitCode::SUCCESS` bei normalem Ende (nur nach `--once` oder
+/// `completions`; die Dauerschleife endet sonst nur durch ein Signal).
+/// `ExitCode::FAILURE` bei einem CLI-Parse-Fehler, einer nicht
+/// vertrauenswürdigen oder ungültigen DoD-Konfiguration oder einem
+/// [`error::SentinelBinError`].
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -274,13 +556,57 @@ fn main() -> ExitCode {
 
     init_tracing(cli.log);
 
-    match run(cli) {
+    // `completions` läuft vor dem Konfigurationsladen und jedem Sink-,
+    // Socket- oder Landlock-Schritt: es schreibt nur ein Skript (bzw.
+    // installiert es) und beendet sich — ein Host ohne DoD-Konfiguration soll
+    // trotzdem Completions erzeugen können.
+    let result = if cli.command.is_some() {
+        run_completions_command(&cli)
+    } else {
+        // `--config` wählt einen expliziten, vertrauten Pfad; ohne ihn gilt
+        // ausschließlich der feste Systempfad.
+        let settings = match load_dod_settings(cli.config.as_deref()) {
+            Ok(settings) => settings,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "refusing to start: DoD configuration is untrusted or invalid"
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        run(cli, settings)
+    };
+
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             tracing::error!(error = %err, "harw-sentinel exiting");
             ExitCode::FAILURE
         }
     }
+}
+
+/// Bedient das Unterkommando `completions`.
+///
+/// # Returns
+/// `Ok(())` nach geschriebenem/installiertem Skript, ebenso ohne
+/// `completions`-Unterkommando (No-Op).
+///
+/// # Errors
+/// [`error::SentinelBinError::Completions`].
+fn run_completions_command(cli: &Cli) -> SentinelBinResult<()> {
+    let Some(harw_completions::CompletionsSubcommand::Completions(args)) = &cli.command else {
+        return Ok(());
+    };
+    harw_completions::run_completions(
+        &mut <Cli as clap::CommandFactory>::command(),
+        "harw-sentinel",
+        args,
+        &harw_completions::HomeEnv::from_process(),
+        &mut std::io::stdout().lock(),
+    )?;
+    Ok(())
 }
 
 /// Initialisiert den globalen `tracing`-Subscriber.
@@ -336,27 +662,24 @@ fn init_tracing(level: cli::LogLevel) {
 /// ersten Poll-Zyklus — in den Puffer nachgereicht, weil zum Zeitpunkt des
 /// Selbstbeschränkungsversuchs noch kein `Sentinel` existiert.
 ///
+/// Die `SentinelConfig` stammt aus `settings` ([`DodSettings::sentinel_config`]),
+/// der Schlafabstand der Dauerschleife aus [`PollTiming`] — derselbe Wert,
+/// aus dem Sensor-Rückschaufenster abgeleitet werden (siehe Moduldoku,
+/// Abschnitt „DoD-Systemkonfiguration und Poll-Taktung").
+///
 /// # Arguments
 /// - `cli` (`cli::Cli`): die geparste Kommandozeile.
+/// - `settings` (`DodSettings`): die bereits in [`main`] geladene und
+///   aufgelöste DoD-Konfiguration.
 ///
 /// # Errors
 /// [`error::SentinelBinError::Home`], [`error::SentinelBinError::Sink`] —
 /// siehe dortige Dokumentation. Ein nicht bindbarer IPC-Socket oder eine
 /// fehlende Landlock-Unterstützung sind **kein** `Err` (siehe
 /// Moduldoku).
-fn run(cli: Cli) -> SentinelBinResult<()> {
-    // `completions` läuft vor jedem Sink-, Socket- oder Landlock-Schritt:
-    // es schreibt nur ein Skript (bzw. installiert es) und beendet sich.
-    if let Some(harw_completions::CompletionsSubcommand::Completions(args)) = &cli.command {
-        harw_completions::run_completions(
-            &mut <Cli as clap::CommandFactory>::command(),
-            "harw-sentinel",
-            args,
-            &harw_completions::HomeEnv::from_process(),
-            &mut std::io::stdout().lock(),
-        )?;
-        return Ok(());
-    }
+fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
+    let timing = PollTiming::from_interval_secs(cli.interval_secs);
+    log_dod_settings(&settings, timing);
 
     let home = match cli.home.clone() {
         Some(path) => path,
@@ -413,6 +736,9 @@ fn run(cli: Cli) -> SentinelBinResult<()> {
         cgroup_root: cli.cgroup_root.clone(),
         home: home.clone(),
     };
+    // Keiner der hier registrierten Sensoren hat heute ein Rückschaufenster
+    // (`with_lookback`); sobald `harw-dod-authlog` o. Ä. hier gebaut wird,
+    // erhält er `timing.lookback_for(<Vorgabe>)` — siehe `PollTiming`.
     let sensor_list = sensors::build_sensors(&sensor_roots);
     tracing::info!(
         sensor_count = sensor_list.len(),
@@ -420,7 +746,7 @@ fn run(cli: Cli) -> SentinelBinResult<()> {
         "sensors registered"
     );
 
-    let mut sentinel = Sentinel::new(sensor_list, Arc::clone(&sink), SentinelConfig::default());
+    let mut sentinel = Sentinel::new(sensor_list, Arc::clone(&sink), settings.sentinel_config());
 
     // Der zwischengespeicherte Landlock-Befund wird hier nachgereicht — vor
     // dem ersten Poll-Zyklus, direkt nachdem der `Sentinel` überhaupt zum
@@ -437,7 +763,7 @@ fn run(cli: Cli) -> SentinelBinResult<()> {
 
     loop {
         poll_once(&mut sentinel, inbox.as_ref(), sink.as_ref());
-        std::thread::sleep(Duration::from_secs(cli.interval_secs));
+        std::thread::sleep(timing.interval());
     }
 }
 
@@ -676,7 +1002,7 @@ mod tests {
         let cli = Cli::try_parse_from(["harw-sentinel", "--once", "--home", path])
             .map_err(ctx("valid cli"))?;
 
-        let result = run(cli);
+        let result = run(cli, DodSettings::builtin_defaults());
         assert!(
             matches!(
                 result,
@@ -721,6 +1047,132 @@ mod tests {
             sandbox::LANDLOCK_STATUS_SENSOR_ID
         );
         Ok(())
+    }
+
+    const HOST_PROFILE: &str = r#"
+schema_version = 1
+mode = "observe"
+active_profile = "host"
+
+[profiles.host]
+scope = "host"
+sensors = ["exec", "tcp-connect"]
+egress_allow_cidrs = []
+"#;
+
+    fn not_found() -> ConfigError {
+        ConfigError::Io(std::io::Error::from(std::io::ErrorKind::NotFound))
+    }
+
+    #[test]
+    fn test_lookback_keeps_a_generous_default_and_raises_a_tight_one() {
+        let default = Duration::from_secs(300);
+        assert_eq!(
+            PollTiming::from_interval_secs(5).lookback_for(default),
+            default
+        );
+        assert_eq!(
+            PollTiming::from_interval_secs(200).lookback_for(default),
+            Duration::from_secs(400),
+            "lookback must be at least twice the poll interval"
+        );
+        assert_eq!(
+            PollTiming::from_interval_secs(0).lookback_for(default),
+            default
+        );
+    }
+
+    #[test]
+    fn test_lookback_saturates_instead_of_overflowing() {
+        let timing = PollTiming::from_interval_secs(u64::MAX);
+        assert!(timing.lookback_for(Duration::ZERO) >= timing.interval());
+    }
+
+    #[test]
+    fn test_poll_interval_is_the_cli_interval() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel", "--interval-secs", "7"])
+            .map_err(ctx("valid cli"))?;
+        assert_eq!(
+            PollTiming::from_interval_secs(cli.interval_secs).interval(),
+            Duration::from_secs(7)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_missing_system_config_falls_back_to_builtin_defaults() -> TestResult {
+        let settings = settings_from_loaded(Err(not_found()), ConfigOrigin::System)
+            .map_err(ctx("missing system config degrades"))?;
+        assert_eq!(settings.origin, ConfigOrigin::BuiltinDefaults);
+        assert!(settings.profile.is_none());
+        assert_eq!(settings.sentinel_config(), SentinelConfig::default());
+        Ok(())
+    }
+
+    #[test]
+    fn test_missing_explicit_config_fails_closed() {
+        let result = settings_from_loaded(
+            Err(not_found()),
+            ConfigOrigin::Explicit(std::path::PathBuf::from("/etc/harw-dod/other.toml")),
+        );
+        assert!(matches!(result, Err(ConfigError::Io(_))));
+    }
+
+    #[test]
+    fn test_untrusted_system_config_fails_closed() {
+        let result = settings_from_loaded(
+            Err(ConfigError::UntrustedSystemPath {
+                path: SYSTEM_CONFIG_PATH,
+            }),
+            ConfigOrigin::System,
+        );
+        assert!(matches!(
+            result,
+            Err(ConfigError::UntrustedSystemPath { .. })
+        ));
+    }
+
+    #[test]
+    fn test_other_io_errors_on_the_system_config_fail_closed() {
+        let result = settings_from_loaded(
+            Err(ConfigError::Io(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            ))),
+            ConfigOrigin::System,
+        );
+        assert!(matches!(result, Err(ConfigError::Io(_))));
+    }
+
+    #[test]
+    fn test_valid_config_resolves_the_active_profile() -> TestResult {
+        let config = Config::from_toml(HOST_PROFILE).map_err(ctx("valid config"))?;
+        let settings = settings_from_loaded(Ok(config), ConfigOrigin::System)
+            .map_err(ctx("resolvable config"))?;
+        let profile = settings
+            .profile
+            .as_ref()
+            .ok_or(TestError::Missing("active profile"))?;
+        assert_eq!(profile.profile_id().as_str(), "host");
+        assert_eq!(settings.sentinel_config(), SentinelConfig::default());
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_without_active_profile_fails_closed() -> TestResult {
+        let config = Config::from_toml(&HOST_PROFILE.replace("active_profile = \"host\"\n", ""))
+            .map_err(ctx("valid config without selection"))?;
+        let result = settings_from_loaded(Ok(config), ConfigOrigin::System);
+        assert!(matches!(result, Err(ConfigError::MissingActiveProfile)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_explicit_relative_config_path_is_rejected() {
+        let result = load_dod_settings(Some(Path::new("config.toml")));
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidExplicitPath { .. })
+        ));
     }
 
     /// Deckt die IPC-Inbox-Entleerung ab — ausschließlich über

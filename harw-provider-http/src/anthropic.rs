@@ -151,6 +151,8 @@ pub struct AnthropicMessagesProvider {
     /// heißt: dieser Provider nutzt ausschließlich `credential`/`messages_url`
     /// oben (unverändertes Verhalten ohne Pool).
     credential_pool: Option<Arc<crate::credential_pool::CredentialPool<AnthropicCredential>>>,
+    /// Pro-Modell-Entscheidung für SSE-Streaming (siehe [`crate::sse::StreamPolicy`]).
+    stream_policy: crate::sse::StreamPolicy,
 }
 
 impl AnthropicMessagesProvider {
@@ -185,6 +187,7 @@ impl AnthropicMessagesProvider {
             rate_limiter: std::sync::Arc::new(crate::rate_limiter::ProviderRateLimiter::new(None)),
             concurrency_limiter: None,
             credential_pool: None,
+            stream_policy: crate::sse::StreamPolicy::default(),
         })
     }
 
@@ -223,6 +226,10 @@ impl AnthropicMessagesProvider {
         pool: Option<crate::credential_pool::CredentialPool<AnthropicCredential>>,
     ) {
         self.credential_pool = pool.map(Arc::new);
+    }
+
+    pub(crate) fn configure_stream_policy(&mut self, policy: crate::sse::StreamPolicy) {
+        self.stream_policy = policy;
     }
 
     pub(crate) fn configure_rate_limit(&mut self, rate_limit: Option<harw_config::RateLimitToml>) {
@@ -732,6 +739,7 @@ pub fn extract_anthropic_usage(body: &Value) -> TokenUsage {
         reasoning_tokens: None,
         cached_tokens,
         cache_write_tokens,
+        cache_separate: true,
     }
 }
 
@@ -852,6 +860,13 @@ impl AnthropicMessagesProvider {
             crate::cache_strategy::resolve_cache_strategy(&self.provider_id, model, None);
         let mut wire = build_messages_body(model, self.max_tokens, &request);
         crate::cache_strategy::apply_messages_cache_control(&mut wire, strategy);
+        let stream_sink = request
+            .stream
+            .as_ref()
+            .filter(|_| self.stream_policy.enabled(model));
+        if stream_sink.is_some() {
+            wire["stream"] = Value::Bool(true);
+        }
         tracing::debug!(
             model,
             strategy = strategy.label(),
@@ -918,6 +933,14 @@ impl AnthropicMessagesProvider {
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
         let request_id = super::provider_request_id(response.headers());
+        if status.is_success()
+            && let Some(sink) = stream_sink
+        {
+            let mut accumulator = crate::sse::AnthropicStreamAccumulator::default();
+            crate::sse::read_sse(response, |frame| accumulator.push(&frame, Some(sink))).await?;
+            let value = accumulator.finish()?;
+            return self.interpret_body(&request, model, &value);
+        }
         let body = response.text().await.map_err(|error| {
             ModelError::RequestFailed(super::HttpProviderError::from(error).to_string())
         })?;
@@ -957,9 +980,20 @@ impl AnthropicMessagesProvider {
         }
 
         let value: Value = serde_json::from_str(&body)?;
-        let text = extract_anthropic_text(&value);
-        let names = ToolNameCodec::for_request(&request);
-        let tool_calls = extract_anthropic_tool_calls(&value)
+        self.interpret_body(&request, model, &value)
+    }
+
+    /// Projiziert einen (ggf. aus SSE rekonstruierten) Messages-Body auf eine
+    /// [`ModelResponse`].
+    fn interpret_body(
+        &self,
+        request: &ModelRequest,
+        model: &str,
+        value: &Value,
+    ) -> Result<ModelResponse, ModelError> {
+        let text = extract_anthropic_text(value);
+        let names = ToolNameCodec::for_request(request);
+        let tool_calls = extract_anthropic_tool_calls(value)
             .map_err(|_| {
                 ModelError::RequestFailed(
                     "Anthropic response contained a tool-use block with invalid input".to_owned(),
@@ -978,9 +1012,9 @@ impl AnthropicMessagesProvider {
         Ok(ModelResponse {
             message: text,
             tool_calls,
-            usage: extract_anthropic_usage(&value),
-            stop: extract_anthropic_stop_reason(&value),
-            reasoning: extract_anthropic_reasoning(&value, model),
+            usage: extract_anthropic_usage(value),
+            stop: extract_anthropic_stop_reason(value),
+            reasoning: extract_anthropic_reasoning(value, model),
         })
     }
 }
@@ -1064,6 +1098,7 @@ mod tests {
 
     fn request_with_ids(model_id: Option<&str>, provider_id: Option<&str>) -> ModelRequest {
         ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -1238,6 +1273,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Hi there");
         let request = ModelRequest {
+            stream: None,
             system_prompt: "You are terse.".to_owned(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -1285,6 +1321,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Only user");
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -1309,6 +1346,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Hi there");
         let request = ModelRequest {
+            stream: None,
             system_prompt: "You are terse.".to_owned(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -1335,6 +1373,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Hi there");
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -1362,6 +1401,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Hi there");
         let request = ModelRequest {
+            stream: None,
             system_prompt: "You are terse.".to_owned(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -1389,6 +1429,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("hi");
         ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -1523,6 +1564,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("weather?");
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -1579,6 +1621,7 @@ mod tests {
             strict: false,
         });
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -1631,6 +1674,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("hi");
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -1659,6 +1703,7 @@ mod tests {
             serde_json::json!({"location": "Paris"}),
         );
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -1716,6 +1761,7 @@ mod tests {
             5,
         );
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -1765,6 +1811,7 @@ mod tests {
             5,
         );
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -1825,6 +1872,7 @@ mod tests {
             5,
         );
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -1919,6 +1967,7 @@ mod tests {
             5,
         );
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -1961,6 +2010,7 @@ mod tests {
             serde_json::json!({"location": "Paris"}),
         );
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),

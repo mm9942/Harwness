@@ -125,6 +125,12 @@ pub fn input_history_path(home: &Path) -> PathBuf {
     home.join("input_history")
 }
 
+/// Log-Verzeichnis (`<home>/logs`), z. B. für das Datei-Log der TUI.
+#[must_use]
+pub fn logs_dir(home: &Path) -> PathBuf {
+    home.join("logs")
+}
+
 /// Regenerierbares Cache-Verzeichnis.
 #[must_use]
 pub fn cache_dir(home: &Path) -> PathBuf {

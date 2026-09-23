@@ -1236,10 +1236,51 @@ pub fn notify_turn_stop(session: &AgentSession, input: &TurnStopInput) {
 /// No-op, wenn kein Sink konfiguriert ist oder der Empfänger bereits
 /// abgehängt hat (Best-Effort, blockiert den Turn-Hot-Path nie).
 fn emit(session: &AgentSession, event: TurnEvent) {
-    if let Some(tx) = session.turn_event_tx() {
-        let _ = tx.send(event);
-    }
+    session.live_emitter().emit(event);
 }
+
+/// Baut den Streaming-Sink einer Modell-Runde: Text-/Reasoning-Deltas und der
+/// laufende Usage-Stand gehen live als [`TurnEvent`] hinaus. `None`, wenn
+/// niemand zuhört (dann spart sich der Provider auch das SSE-Parsing nicht,
+/// aber der Turn-Loop fordert kein Streaming an).
+fn stream_sink_for_round(
+    session: &AgentSession,
+    turn_id: &harw_types::TurnId,
+    turn_usage_so_far: &harw_types::TokenUsage,
+) -> Option<crate::stream::StreamSink> {
+    let emitter = session.live_emitter();
+    if !emitter.is_observed() {
+        return None;
+    }
+    let turn_id = turn_id.clone();
+    let base = turn_usage_so_far.clone();
+    Some(crate::stream::StreamSink::new(move |event| match event {
+        crate::stream::ModelStreamEvent::TextDelta(text) if !text.is_empty() => {
+            emitter.emit(TurnEvent::AssistantDelta {
+                turn_id: turn_id.clone(),
+                text,
+            });
+        }
+        crate::stream::ModelStreamEvent::ReasoningDelta(text) if !text.is_empty() => {
+            emitter.emit(TurnEvent::ReasoningDelta {
+                turn_id: turn_id.clone(),
+                text,
+            });
+        }
+        crate::stream::ModelStreamEvent::Usage(round) => {
+            let mut turn_total = base.clone();
+            turn_total.add(&round);
+            emitter.emit(TurnEvent::UsageUpdated {
+                turn_id: turn_id.clone(),
+                round,
+                turn_total,
+                final_round: false,
+            });
+        }
+        _ => {}
+    }))
+}
+
 
 /// Prüft einen `ToolCall` gegen alle `ApprovalHandler` und aggregiert.
 ///
@@ -1593,6 +1634,7 @@ fn notify_tool_outcome(
     arguments: &serde_json::Value,
     result: &ToolCallResult,
 ) {
+    emit_plan_update(session, tool_name, arguments, result);
     let Some(observer) = session.tool_outcome_observer().cloned() else {
         return;
     };
@@ -1604,6 +1646,55 @@ fn notify_tool_outcome(
             arguments,
             status,
             output_text: &output_text,
+        },
+    );
+}
+
+/// Meldet [`TurnEvent::PlanUpdated`] nach einem erfolgreichen Aufruf des
+/// Plan-Werkzeugs (Operation `plan` als Modell-Tool). Plan-ID
+/// und Revision stammen aus dem Ergebnis, sofern es sie trägt, sonst aus den
+/// Argumenten; die Zusammenfassung ist die ausgeführte Aktion.
+fn emit_plan_update(
+    session: &AgentSession,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    result: &ToolCallResult,
+) {
+    let is_plan_tool = tool_name == "plan";
+    let ToolCallResult::Success { value } = result else {
+        return;
+    };
+    if !is_plan_tool {
+        return;
+    }
+    let lookup = |key: &str| {
+        value
+            .get(key)
+            .or_else(|| value.get("data").and_then(|data| data.get(key)))
+            .or_else(|| arguments.get(key))
+    };
+    let plan_id = lookup("plan_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("current")
+        .to_owned();
+    let revision = lookup("revision")
+        .and_then(|rev| {
+            rev.as_u64()
+                .or_else(|| rev.as_str().and_then(|text| text.parse().ok()))
+        })
+        .unwrap_or(0);
+    let summary = arguments
+        .get("action")
+        .or_else(|| arguments.get("command"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Plan aktualisiert")
+        .to_owned();
+    emit(
+        session,
+        TurnEvent::PlanUpdated {
+            plan_id,
+            revision,
+            summary,
         },
     );
 }
@@ -1620,6 +1711,24 @@ fn notify_progress(session: &AgentSession) {
     if let Some(observer) = session.progress_observer() {
         observer.on_progress(session.id());
     }
+}
+
+/// Wie [`notify_progress`], nach einem Tool-Ergebnis: zählt zusätzlich den
+/// Aufruf für die Live-Beobachtung.
+fn notify_tool_progress(session: &AgentSession) {
+    if let Some(observer) = session.progress_observer() {
+        observer.on_tool_call(session.id());
+    }
+    notify_progress(session);
+}
+
+/// Wie [`notify_progress`], nach einer Modell-Runde: verbucht zusätzlich
+/// deren Token-Nutzung.
+fn notify_round_progress(session: &AgentSession, usage: &harw_types::TokenUsage) {
+    if let Some(observer) = session.progress_observer() {
+        observer.on_round_usage(session.id(), usage);
+    }
+    notify_progress(session);
 }
 
 // Status + Textform eines `ToolCallResult`, wie sie sowohl
@@ -1897,7 +2006,16 @@ async fn run_turn_with_approvals(
     // `resume_after_approval` ihn nach einer Handoff-/Rückfrage-Pause
     // zurücklesen können, statt sich einen frischen, unbegrenzten Block zu
     // bauen.
-    let control = input.control.clone();
+    // Ein Aufrufer ohne eigene Grenzen (TUI, Gateway: `TurnControl::new()`)
+    // bekommt die Vorgabe-Grenzen der Session (aus dem Budget des Laufs,
+    // `AgentSession::with_default_turn_limits`); explizit gesetzte Grenzen
+    // haben Vorrang.
+    let control = match session.default_turn_limits() {
+        Some(limits) if *input.control.limits() == TurnLimits::unlimited() => {
+            input.control.clone().with_limits(limits)
+        }
+        _ => input.control.clone(),
+    };
     session.set_active_turn_control(control.clone());
 
     // Outer span covering the entire turn's lifecycle.
@@ -2009,6 +2127,13 @@ fn transition_after_turn_failure(
         session.fail(error.to_string());
     }
 
+    // Der Fehler wird Teil des Verlaufs (sichtbar in Export/Resume) und
+    // zusätzlich als Session-Ereignis gemeldet.
+    session
+        .history_mut()
+        .push_error(error.to_string(), retryable);
+    session.report_error(error.to_string(), retryable);
+
     emit(
         session,
         TurnEvent::TurnFailed {
@@ -2089,6 +2214,11 @@ async fn resume_after_child_with_approvals(
     };
 
     let call_id_for_completion = call_id.clone();
+    let child_outcome = match &child_result {
+        ToolCallResult::Success { .. } => "completed",
+        _ => "failed",
+    };
+    let child_duration_ms = session.take_handoff_elapsed_ms();
     session
         .history_mut()
         .push_tool_result(call_id, child_result, 0);
@@ -2107,19 +2237,15 @@ async fn resume_after_child_with_approvals(
     // Korrelation gegen ihren offenen Handoff bestätigt. Vorher wäre es die
     // Meldung eines Kindes, das gar nicht das erwartete sein muss.
     //
-    // `duration_ms = 0`: die Laufzeit des Kindes ist an dieser Stelle nicht
-    // verfügbar. Der Eltern-Turn kennt weder den Spawn-Zeitpunkt noch eine vom
-    // Spawner durchgereichte Dauer; geraten wird nichts. `outcome` ist aus
-    // demselben Grund konstant "completed" — dieser Pfad wird nur betreten,
-    // wenn das Kind ein terminales Ergebnis geliefert hat. Ein Abbruch oder
-    // Budget-Überlauf müsste vom Spawner explizit durchgereicht werden.
+    // `duration_ms` misst ab `begin_handoff` (Wanduhr des Eltern-Turns);
+    // `outcome` folgt dem Ergebnis-Typ des Kindes.
     emit(
         session,
         TurnEvent::ChildCompleted {
             turn_id: turn_id.clone(),
             child: child.clone(),
-            outcome: "completed".to_owned(),
-            duration_ms: 0,
+            outcome: child_outcome.to_owned(),
+            duration_ms: child_duration_ms,
         },
     );
     if let Some(spawner) = session.registry().spawner() {
@@ -2270,7 +2396,7 @@ async fn resume_after_approval_with_store(
                     &pending.call.arguments,
                     &denied_result,
                 );
-                notify_progress(session);
+                notify_tool_progress(session);
                 session
                     .history_mut()
                     .push_tool_result(pending.call.id, denied_result, 0);
@@ -2444,7 +2570,7 @@ async fn resume_after_approval_with_store(
                             &pending.call.arguments,
                             &result_value,
                         );
-                        notify_progress(session);
+                        notify_tool_progress(session);
                         session
                             .history_mut()
                             .push_tool_result(pending.call.id, result_value, result_duration_ms);
@@ -2470,7 +2596,7 @@ async fn resume_after_approval_with_store(
                         },
                     );
                     notify_tool_outcome(session, &tool_name, &pending.call.arguments, &result_value);
-                    notify_progress(session);
+                    notify_tool_progress(session);
                     session
                         .history_mut()
                         .push_tool_result(pending.call.id, result_value, result_duration_ms);
@@ -2618,6 +2744,11 @@ async fn drive_turn(
         .with_tool_result_max_bytes(control.limits().tool_result_max_bytes_hint())
         .with_cancel_token(control.cancel_token().clone())
         .with_identity(request_identity(session));
+        let request = match stream_sink_for_round(session, &handle.turn_id, &total_usage) {
+            Some(sink) => request.with_stream_sink(sink),
+            None => request,
+        };
+        let history_items_dropped = request.context_assembly.history_items_dropped;
 
         // Emit model.request event: byte-count proxy via system_prompt +
         // instruction fragments length (ModelRequest is not serde::Serialize).
@@ -2673,10 +2804,35 @@ async fn drive_turn(
         };
         control.record_model_round();
         control.record_usage(&response.usage);
-        notify_progress(session);
+        notify_round_progress(session, &response.usage);
         total_usage.add(&response.usage);
         round += 1;
         last_round_usage = response.usage.clone();
+        // Live-Stand nach abgeschlossener Runde (auch der Pro-Runde-Fallback
+        // nicht streamender Provider landet hier).
+        emit(
+            session,
+            TurnEvent::UsageUpdated {
+                turn_id: handle.turn_id.clone(),
+                round: response.usage.clone(),
+                turn_total: total_usage.clone(),
+                final_round: true,
+            },
+        );
+        emit(
+            session,
+            TurnEvent::ContextUpdated {
+                turn_id: handle.turn_id.clone(),
+                used_tokens: response
+                    .usage
+                    .prompt_tokens()
+                    .saturating_add(response.usage.output_tokens),
+                window_tokens: session
+                    .auto_compact()
+                    .map_or(0, crate::auto_compact::AutoCompactPolicy::context_window_tokens),
+                history_items_dropped: u32::try_from(history_items_dropped).unwrap_or(u32::MAX),
+            },
+        );
 
         // Nutzung dieser Runde persistieren (best effort — ein Store-Fehler
         // darf den Turn niemals scheitern lassen, siehe Vertrag
@@ -2981,7 +3137,7 @@ async fn drive_turn(
                         &call.arguments,
                         &denied_result,
                     );
-                    notify_progress(session);
+                    notify_tool_progress(session);
                     session
                         .history_mut()
                         .push_tool_result(call.id.clone(), denied_result, 0);
@@ -3076,7 +3232,7 @@ async fn drive_turn(
                         )
                         .await;
                         notify_tool_outcome(session, call.name.as_str(), &call.arguments, &result);
-                        notify_progress(session);
+                        notify_tool_progress(session);
                         session.history_mut().push_tool_result(call.id, result, 0);
                         persist_last(session, store).await?;
                         if let Some(abort_reason) = abort_reason {
@@ -3215,7 +3371,7 @@ async fn drive_turn(
                     },
                 );
                 notify_tool_outcome(session, &tool_name, &call.arguments, &result_value);
-                notify_progress(session);
+                notify_tool_progress(session);
                 session
                     .history_mut()
                     .push_tool_result(call.id, result_value, result_duration_ms);
@@ -3259,7 +3415,7 @@ async fn drive_turn(
             );
             // d. ToolResult in History.
             notify_tool_outcome(session, &tool_name, &call.arguments, &result_value);
-            notify_progress(session);
+            notify_tool_progress(session);
             session
                 .history_mut()
                 .push_tool_result(call.id, result_value, result_duration_ms);
@@ -3376,14 +3532,11 @@ async fn drive_turn(
 /// ([`AgentSession::auto_compact`] liefert `None` — der Default für jede
 /// Session, die sich nicht explizit für Auto-Compaction entscheidet).
 ///
-/// `tokens_used` wird aus `last_round_usage.input_tokens` allein gebildet,
-/// **ohne** `cached_tokens` zusätzlich zu addieren: `extract_openai_usage`
-/// (harw-provider-http/src/lib.rs) liest `prompt_tokens` (Chat) bzw.
-/// `input_tokens` (Responses) direkt aus der Provider-Antwort, und beide
-/// Felder umfassen laut OpenAI-API bereits die zwischengespeicherten
-/// Präfix-Tokens — `cached_tokens`/`cache_creation_input_tokens` sind dort
-/// nur eine Aufschlüsselung desselben Werts, kein zusätzlicher Anteil. Eine
-/// Addition würde die Nutzung also doppelt zählen.
+/// `tokens_used` ist [`harw_types::TokenUsage::prompt_tokens`]: bei
+/// OpenAI-Semantik (`cached_tokens` ⊆ `input_tokens`) genau `input_tokens`,
+/// bei Anthropic (`cache_separate`) die Summe aus ungecachtem Input,
+/// Cache-Read und Cache-Write — sonst würde ein fast vollständig gecachter
+/// Prompt die Schwelle nie erreichen.
 ///
 /// Ist ein Compact laut Policy fällig, läuft [`crate::compaction::compact_session`]
 /// mit einem aus `policy.context_window_tokens()` abgeleiteten
@@ -3420,10 +3573,9 @@ async fn maybe_compact(
         return;
     };
 
-    // Siehe Funktionsdoku: `input_tokens` umfasst bereits die
-    // zwischengespeicherten Tokens, `cached_tokens` wird bewusst nicht
-    // addiert.
-    let tokens_used = last_round_usage.input_tokens;
+    // Siehe Funktionsdoku: provider-korrekte Prompt-Belegung inklusive
+    // Cache (Anthropic meldet Cache-Tokens getrennt von `input_tokens`).
+    let tokens_used = last_round_usage.prompt_tokens();
     let decision = policy.decide(tokens_used, task_completed);
     if !decision.should_compact() {
         return;
@@ -3986,7 +4138,7 @@ async fn try_execute_parallel_calls(
             },
         );
         notify_tool_outcome(session, &tool_name, &arguments, &value);
-        notify_progress(session);
+        notify_tool_progress(session);
         session
             .history_mut()
             .push_tool_result(call_id, value, duration_ms);
@@ -6953,6 +7105,7 @@ mod tests {
         session = session.with_compaction_observer(Some(observer.clone()));
         let store = crate::state_store::InMemoryStateStore::new();
         let usage = harw_types::TokenUsage {
+            cache_separate: false,
             input_tokens: u64::MAX,
             output_tokens: 0,
             reasoning_tokens: None,
@@ -7008,6 +7161,7 @@ mod tests {
         // Über der Task-Ende-Schwelle (30), unter der Budget-Schwelle (70)
         // ⇒ `CompactDecision::TaskCompleted`.
         let usage = harw_types::TokenUsage {
+            cache_separate: false,
             input_tokens: 40,
             output_tokens: 0,
             reasoning_tokens: None,
@@ -7152,6 +7306,7 @@ mod tests {
         let store = crate::state_store::InMemoryStateStore::new();
         let model = ScriptedModel::new(vec![crate::model::ModelResponse {
             usage: harw_types::TokenUsage {
+                cache_separate: false,
                 input_tokens: 80,
                 output_tokens: 5,
                 reasoning_tokens: None,

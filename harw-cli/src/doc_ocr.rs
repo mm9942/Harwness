@@ -211,6 +211,7 @@ mod tests {
     // `enabled` variieren je Test.
     fn test_provider(base_url: &str, enabled: bool) -> ProviderToml {
         ProviderToml {
+            stream: None,
             name: "test".to_owned(),
             api: "openai-compatible".to_owned(),
             base_url: base_url.to_owned(),

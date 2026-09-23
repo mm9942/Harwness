@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub(crate) mod agent_monitor;
 pub(crate) mod agent_tree;
 pub mod app;
 pub mod approval;
@@ -20,6 +21,7 @@ pub(crate) mod command_exec;
 pub(crate) mod command_popup;
 mod error;
 pub(crate) mod events;
+pub(crate) mod explorer_panel;
 pub mod export;
 pub(crate) mod frame_requester;
 pub mod gateway;
@@ -29,8 +31,10 @@ mod input;
 pub(crate) mod input_editor;
 pub(crate) mod input_history;
 pub(crate) mod input_reader;
+pub(crate) mod markdown;
 pub mod model_picker;
 pub(crate) mod model_switch_picker;
+pub(crate) mod panes;
 mod registry;
 pub mod relative_time;
 pub(crate) mod runtime_commands;
@@ -40,7 +44,6 @@ pub mod session_controller;
 pub mod session_picker;
 pub mod setup;
 pub(crate) mod spinner;
-pub(crate) mod streaming;
 pub(crate) mod style;
 pub mod tools_command;
 pub(crate) mod tui_event;

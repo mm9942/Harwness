@@ -101,7 +101,7 @@ use harw_observe::TraceContext;
 use harw_protocol::items::{ContentPart, TurnItem};
 use harw_protocol::{AgentOrchestrationEvent, AgentOrchestrationStatus};
 use harw_session_store::{ApprovalStore, ChildLeaseRecord, ChildLeaseStore};
-use harw_types::{AgentRole, ReasoningEffort, SessionId, ToolCallId};
+use harw_types::{AgentRole, ReasoningEffort, SessionId, TokenUsage, ToolCallId};
 use jiff::{SignedDuration, Timestamp};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
@@ -578,6 +578,15 @@ pub struct ChildRecord {
     /// keine Einstufung mitgegeben hat. Wird beim Kind-Start an
     /// [`ChildRegistryFactory::model_for_task`] weitergereicht.
     pub task_complexity: Option<TaskComplexity>,
+    /// Live-Zähler (Tokens, Tool-Aufrufe) für Beobachter.
+    pub live: ChildLiveStats,
+}
+
+/// Laufende Zähler eines Kindes, fortgeschrieben vom Progress-Observer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChildLiveStats {
+    pub usage: TokenUsage,
+    pub tool_calls: u32,
 }
 
 impl ChildRecord {
@@ -651,6 +660,13 @@ pub enum ChildStatus {
     /// Das Kind wurde abgebrochen; es wird nicht wieder ausgeführt.
     Cancelled,
 }
+
+/// Löst das Kontextfenster (Tokens) für eine Modell-ID auf (`None` =
+/// Vorgabemodell). Siehe [`ManagedAgentSpawner::with_context_window_resolver`].
+pub type ContextWindowResolver = dyn Fn(Option<&str>) -> u64 + Send + Sync;
+
+/// Kontextfenster eines Kindes ohne Resolver (Addendum D).
+pub const DEFAULT_CHILD_CONTEXT_WINDOW: u64 = 200_000;
 
 /// Receives bounded lifecycle snapshots after controller locks have been
 /// released. Implementations may persist, forward, or fan out the event but
@@ -1349,6 +1365,9 @@ pub struct ManagedAgentSpawner {
     /// (Rolle + Anweisung, whitespace-normalisiert, kleingeschrieben) —
     /// erkennt eine doppelt vergebene Delegation (Addendum F+G).
     recent_delegation_hashes: Mutex<BTreeMap<String, VecDeque<u64>>>,
+    /// Kontextfenster (Tokens) je Modell-ID des Kindes; `None`-Argument =
+    /// Vorgabemodell. Ohne Resolver gilt [`DEFAULT_CHILD_CONTEXT_WINDOW`].
+    context_window_resolver: Option<Arc<ContextWindowResolver>>,
     /// Optional sink for user-safe lifecycle snapshots. Invocation happens
     /// only after the active/cancellation/manager locks are released.
     orchestration_observer: Option<Arc<dyn OrchestrationObserver>>,
@@ -1473,7 +1492,27 @@ struct ActiveLeaseProgressObserver {
     orchestration_observer: Option<Arc<dyn OrchestrationObserver>>,
 }
 
+impl ActiveLeaseProgressObserver {
+    fn update_live(&self, session_id: &SessionId, update: impl FnOnce(&mut ChildLiveStats)) {
+        if let Ok(mut active) = self.active.lock()
+            && let Some(record) = active.get_mut(session_id.as_str())
+        {
+            update(&mut record.live);
+        }
+    }
+}
+
 impl crate::guard::ProgressObserver for ActiveLeaseProgressObserver {
+    fn on_round_usage(&self, session_id: &SessionId, usage: &TokenUsage) {
+        self.update_live(session_id, |live| live.usage.add(usage));
+    }
+
+    fn on_tool_call(&self, session_id: &SessionId) {
+        self.update_live(session_id, |live| {
+            live.tool_calls = live.tool_calls.saturating_add(1);
+        });
+    }
+
     fn on_progress(&self, session_id: &SessionId) {
         renew_active_lease(
             &self.active,
@@ -1522,11 +1561,17 @@ fn emit_orchestration_event(
         depth: record.depth,
         task: AgentOrchestrationEvent::bounded_detail(task),
         status,
-        usage: None,
-        duration_ms: None,
+        usage: Some(record.live.usage.clone()),
+        duration_ms: Some(elapsed_ms(record.admitted_at)),
         progress: None,
         detail: None,
+        tool_calls: Some(record.live.tool_calls),
     });
+}
+
+/// Millisekunden seit `since` (0 bei Uhrensprung).
+fn elapsed_ms(since: Timestamp) -> u64 {
+    u64::try_from(Timestamp::now().duration_since(since).as_millis()).unwrap_or(0)
 }
 
 /// Normalisiert einen Delegations-Auftragstext für den Duplikat-Vergleich:
@@ -1592,6 +1637,27 @@ impl ManagedAgentSpawner {
         emit_orchestration_event(observer, root_session_id, record, task, status);
     }
 
+    /// Setzt den Resolver, der jedem Kind das Kontextfenster **seines**
+    /// Modells zuweist (statt eines festen Werts). Grundlage für Auto-
+    /// Compaction und das Byte-Budget des Kindes.
+    #[must_use]
+    pub fn with_context_window_resolver(mut self, resolver: Arc<ContextWindowResolver>) -> Self {
+        self.context_window_resolver = Some(resolver);
+        self
+    }
+
+    /// Liefert die globalen Admission-Limits dieses Controllers.
+    #[must_use]
+    pub fn limits(&self) -> ChildLimits {
+        self.limits
+    }
+
+    fn context_window_for(&self, model: Option<&str>) -> u64 {
+        self.context_window_resolver
+            .as_ref()
+            .map_or(DEFAULT_CHILD_CONTEXT_WINDOW, |resolve| resolve(model))
+    }
+
     #[must_use]
     pub fn new(manager: Arc<Mutex<SessionManager>>, limits: ChildLimits) -> Self {
         Self {
@@ -1610,6 +1676,7 @@ impl ManagedAgentSpawner {
             guard_policy: crate::guard::GuardPolicy::default(),
             pitfall_advisor: None,
             recent_delegation_hashes: Mutex::new(BTreeMap::new()),
+            context_window_resolver: None,
             orchestration_observer: None,
             freed: tokio::sync::Notify::new(),
         }
@@ -4307,11 +4374,23 @@ impl ManagedAgentSpawner {
                     "child session {child} disappeared before the auto-compact policy was set: {error}"
                 ))
             })?;
-            // 200_000: Default-Kontextfenster laut Addendum D, unabhängig vom
-            // tatsächlich aktiven Modell — die relative 70 %-Schwelle bleibt
-            // für reale Fenster maßgeblich; der feste Deckel (s. u.) begrenzt
-            // zusätzlich die kumulierte Input-Nutzung langer Sessions (Standard: 500 000).
-            let base_policy = crate::auto_compact::AutoCompactPolicy::for_context_window(200_000)
+            // Kontextfenster des tatsächlich aktiven Kind-Modells (Resolver
+            // aus der Runtime: Config → Modellkatalog → 200 000). Die relative
+            // 70 %-Schwelle gilt gegen dieses Fenster; der feste Deckel (s. u.)
+            // begrenzt zusätzlich die kumulierte Input-Nutzung langer
+            // Sessions (Standard: 500 000).
+            let window = self.context_window_for(
+                child_session.active_model().map(harw_types::ModelId::as_str),
+            );
+            let history_budget = usize::try_from(window.saturating_mul(3)).unwrap_or(usize::MAX);
+            let budget = child_session.context_budget();
+            if history_budget > budget.max_history_bytes {
+                child_session.set_context_budget(crate::context_budget::ContextBudget {
+                    max_context_bytes: budget.max_context_bytes,
+                    max_history_bytes: history_budget,
+                });
+            }
+            let base_policy = crate::auto_compact::AutoCompactPolicy::for_context_window(window)
                 .with_absolute_ceiling(Some(crate::auto_compact::DEFAULT_ABSOLUTE_CEILING_TOKENS));
             let policy = match definition.organizational_role {
                 harw_agent_dsl::roles::AgentRoleId::RootOrchestrator
@@ -4388,6 +4467,7 @@ impl ManagedAgentSpawner {
             .ok_or_else(|| Self::reject("child parent lineage contains a cycle"))?;
         let task = input.instructions.clone();
         let record = ChildRecord {
+            live: crate::child_controller::ChildLiveStats::default(),
             child: child.clone(),
             parent: input.parent_session_id,
             handoff_call_id: input.handoff_call_id,
@@ -5084,6 +5164,7 @@ specialization = "child-controller-test"
         };
         let now = Timestamp::now();
         let record = ChildRecord {
+            live: crate::child_controller::ChildLiveStats::default(),
             child: child.clone(),
             parent: SessionId::new(),
             handoff_call_id: ToolCallId::new(),
@@ -5429,6 +5510,7 @@ specialization = "child-controller-test"
                 .insert(
                     child.as_str().to_owned(),
                     ChildRecord {
+                        live: crate::child_controller::ChildLiveStats::default(),
                         child: child.clone(),
                         parent: parent.clone(),
                         handoff_call_id: ToolCallId::new(),
@@ -5517,6 +5599,7 @@ specialization = "child-controller-test"
                 .insert(
                     child.as_str().to_owned(),
                     ChildRecord {
+                        live: crate::child_controller::ChildLiveStats::default(),
                         child: child.clone(),
                         parent: parent.clone(),
                         handoff_call_id: ToolCallId::new(),
@@ -7233,6 +7316,7 @@ max_trust = "instruction"
         let trace = test_trace(&"e".repeat(32), &"f".repeat(16))?;
         let now = Timestamp::now();
         let record = ChildRecord {
+            live: crate::child_controller::ChildLiveStats::default(),
             child: SessionId::new(),
             parent: SessionId::new(),
             handoff_call_id: ToolCallId::new(),
@@ -7756,6 +7840,7 @@ admitted = ["fs.read", "shell.exec"]
             .insert(
                 child.as_str().to_owned(),
                 ChildRecord {
+                    live: crate::child_controller::ChildLiveStats::default(),
                     child: child.clone(),
                     parent,
                     handoff_call_id: ToolCallId::new(),

@@ -1156,6 +1156,7 @@ async fn uia_root_session_is_admitted_its_uia_explorer_and_uia_writer_specializa
 fn two_provider_config() -> harw_config::ResolvedConfig {
     fn loopback_provider(name: &str) -> harw_config::ProviderToml {
         harw_config::ProviderToml {
+            stream: None,
             name: name.to_owned(),
             api: "openai-chat".to_owned(),
             base_url: "http://127.0.0.1:11434/v1".to_owned(),

@@ -81,6 +81,7 @@ pub mod fetch;
 pub mod hop;
 pub mod html;
 pub mod provider;
+pub mod search;
 
 #[cfg(test)]
 mod test_support;
@@ -94,3 +95,7 @@ pub use fetch::{
     install_fetcher, scoped_fetcher, shared_fetcher,
 };
 pub use provider::{WebToolProvider, configure};
+pub use search::{
+    SearchArgs, SearchBackend, SearchResponse, SearchResult, WebSearchConfig, WebSearchTool,
+    install_search_config,
+};

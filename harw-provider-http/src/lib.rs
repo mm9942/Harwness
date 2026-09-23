@@ -83,6 +83,7 @@ mod error;
 pub mod rate_limiter;
 pub mod retry;
 pub mod routing;
+mod sse;
 mod text_tool_calls;
 mod tool_names;
 
@@ -136,8 +137,10 @@ pub trait SecretResolver {
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const SECRET_RESOLVER_FAILURE_REASON: &str = "secret resolver failed";
 const EMPTY_CREDENTIAL_REASON: &str = "credential is empty";
-const INVALID_KEYRING_REFERENCE_REASON: &str = "invalid keyring reference";
-const KEYRING_FAILURE_REASON: &str = "keyring credential unavailable";
+const INVALID_KEYRING_REFERENCE_REASON: &str =
+    "invalid keyring reference (expected keyring:<service>/<account>)";
+const KEYRING_FAILURE_REASON: &str =
+    "keyring credential unavailable (no entry for service/account or system keyring not reachable)";
 // Gründe für `file:`/`file-json:`-Fehler: bewusst ohne Pfad und ohne Inhalt,
 // damit Fehlertexte (UI, Telegram, Logs) kein Datei-Orakel werden.
 const FILE_CREDENTIAL_NO_HOME_REASON: &str =
@@ -547,6 +550,11 @@ fn build_named_provider(
             configured_headers(provider_name, &provider.headers, sources)?,
         );
         backend.configure_rate_limit(provider.rate_limit.clone());
+        backend.configure_stream_policy(sse::StreamPolicy::from_config(
+            provider_name,
+            provider,
+            config,
+        ));
         backend.configure_credential_pool(pool);
         backend.configure_concurrency(provider.max_concurrency);
         // Beide `Arc`s werden geklont, *bevor* `backend` unten per Wert in
@@ -1319,6 +1327,8 @@ pub struct OpenAiResponsesProvider {
     /// gebaut wurde — dann entscheidet [`cache_strategy::resolve_cache_strategy`]
     /// allein anhand von Provider-Name/Modell.
     cache_overrides: std::collections::HashMap<String, harw_config::PromptCachingMode>,
+    /// Pro-Modell-Entscheidung für SSE-Streaming (siehe [`sse::StreamPolicy`]).
+    stream_policy: sse::StreamPolicy,
     /// Client-seitiger Rate-Limiter (siehe [`rate_limiter::ProviderRateLimiter`]);
     /// standardmäßig deaktiviert (`ProviderRateLimiter::new(None)`).
     rate_limiter: std::sync::Arc<rate_limiter::ProviderRateLimiter>,
@@ -1483,6 +1493,7 @@ impl OpenAiResponsesProvider {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             reasoning_replay: ReasoningReplay::default(),
             cache_overrides: std::collections::HashMap::new(),
+            stream_policy: sse::StreamPolicy::default(),
             rate_limiter: std::sync::Arc::new(rate_limiter::ProviderRateLimiter::new(None)),
             concurrency_limiter: None,
             credential_pool: None,
@@ -1704,6 +1715,7 @@ impl OpenAiResponsesProvider {
                 }
             }
         }
+        http_provider.stream_policy = sse::StreamPolicy::from_config(provider_name, provider, config);
         http_provider.rate_limiter = std::sync::Arc::new(rate_limiter::ProviderRateLimiter::new(
             provider.rate_limit.clone(),
         ));
@@ -1954,8 +1966,21 @@ fn transport_from_api(api: &str) -> Transport {
 /// Unterstützt `env:`, `file:`, `file-json:` und `keyring:`. Für `env:`-Refs wird
 /// zusätzlich der `env_layer` aus `~/.harw/.env` als Fallback konsultiert:
 /// Prozess-Umgebung gewinnt, wenn die Variable dort gesetzt und nicht leer
-/// ist; andernfalls wird der Env-Layer konsultiert. `keyring:` erwartet exakt
-/// `service/account`; `secrets:` wird an den injizierten Resolver delegiert.
+/// ist; andernfalls wird der Env-Layer konsultiert.
+///
+/// `keyring:` erwartet exakt `keyring:<service>/<account>` (genau ein `/`,
+/// beide Teile nicht leer) und liest den Eintrag über das `keyring`-Crate aus
+/// dem System-Keyring (macOS Keychain, Windows Credential Manager, Secret
+/// Service). Der injizierte [`SecretResolver`] wird dafür bewusst **nicht**
+/// befragt: sein Vertrag deckt nur den Bezeichner nach `secrets:` ab.
+///
+/// `secrets:` wird an den injizierten [`SecretResolver`] delegiert (er erhält
+/// den Bezeichner ohne Präfix). Ohne Resolver schlägt die Auflösung fail-closed
+/// mit [`HttpProviderError::UnsupportedCredentialReference`] fehl; Aufrufer
+/// müssen dann einen Resolver über die `*_with_resolver`-Konstruktoren
+/// injizieren oder auf `env:`/`file:`/`keyring:` ausweichen.
+/// Resolver- und Keyring-Fehler werden auf feste Gründe abgebildet, damit weder
+/// Secret-Werte noch Resolver-Diagnosen in Fehlertexte gelangen.
 /// `file:`/`file-json:` lesen nur unterhalb von `<home>/secrets/` (siehe
 /// [`read_private_secret_file`]); ihre Fehler nennen weder Pfad noch Inhalt.
 /// Ausnahme für `file-json:`: liegt der Pfad außerhalb von `<home>/secrets`,
@@ -1967,6 +1992,13 @@ fn transport_from_api(api: &str) -> Transport {
 /// # Arguments
 /// - `secret_ref` (`&harw_config::SecretRef`): Zu lösende Referenz.
 /// - `sources` ([`SecretSources`]): Env-Layer, optionaler Resolver, optionales Home.
+///
+/// # Errors
+/// - [`HttpProviderError::UnsupportedCredentialReference`]: `secrets:` ohne
+///   injizierten [`SecretResolver`].
+/// - [`HttpProviderError::UnresolvedCredential`]: Referenz nicht auflösbar
+///   (Variable fehlt, Datei unsicher/unlesbar, Resolver- oder Keyring-Fehler,
+///   ungültige `keyring:`-Form) oder aufgelöster Wert leer.
 fn resolve_secret(
     secret_ref: &harw_config::SecretRef,
     sources: SecretSources<'_>,
@@ -2288,7 +2320,10 @@ fn secret_file_location(home: &Path, path: &Path) -> Option<(PathBuf, PathBuf)> 
     })
 }
 
-/// Parses a `keyring:` payload in the required `service/account` form.
+/// Zerlegt die Nutzlast einer `keyring:`-Referenz in (`service`, `account`).
+///
+/// Akzeptiert nur exakt `service/account` mit genau einem `/` und zwei
+/// nicht-leeren Teilen; alles andere ergibt `None`.
 fn parse_keyring_reference(payload: &str) -> Option<(&str, &str)> {
     let (service, account) = payload.split_once('/')?;
     (!service.is_empty() && !account.is_empty() && !account.contains('/'))
@@ -3307,6 +3342,7 @@ fn extract_openai_usage(body: &Value, transport: Transport) -> TokenUsage {
         .and_then(Value::as_u64);
 
     TokenUsage {
+        cache_separate: false,
         input_tokens,
         output_tokens,
         reasoning_tokens,
@@ -3498,6 +3534,17 @@ impl OpenAiResponsesProvider {
         if self.codex_route.is_some() {
             codex::prepare_body(&mut wire);
         }
+        // Natives SSE-Streaming (Codex streamt ohnehin, siehe oben).
+        let stream_sink = request
+            .stream
+            .as_ref()
+            .filter(|_| self.codex_route.is_none() && self.stream_policy.enabled(model));
+        if stream_sink.is_some() {
+            wire["stream"] = Value::Bool(true);
+            if self.transport == Transport::Chat {
+                wire["stream_options"] = serde_json::json!({ "include_usage": true });
+            }
+        }
 
         // Hartes Nebenläufigkeits-Limit (siehe [`Self::concurrency_limiter`]):
         // blockiert, bis ein Slot frei wird, statt fehlzuschlagen. Der
@@ -3546,7 +3593,11 @@ impl OpenAiResponsesProvider {
         let retry_after_ms = header_string(response.headers(), "retry-after-ms");
         let request_id = provider_request_id(response.headers());
         let value: Value = if status.is_success() && self.codex_route.is_some() {
-            codex::read_response(response).await?
+            codex::read_response(response, request.stream.as_ref()).await?
+        } else if status.is_success()
+            && let Some(sink) = stream_sink
+        {
+            read_native_stream(response, self.transport, sink).await?
         } else {
             let body = response
                 .text()
@@ -3607,6 +3658,37 @@ impl OpenAiResponsesProvider {
             call.name = ToolName::new(names.decode(call.name.as_str()));
         }
         Ok(response)
+    }
+}
+
+/// Liest eine gestreamte Responses-/Chat-Antwort und rekonstruiert daraus den
+/// nicht-gestreamten Body; Deltas gehen live an `sink`.
+async fn read_native_stream(
+    response: reqwest::Response,
+    transport: Transport,
+    sink: &harw_core::StreamSink,
+) -> Result<Value, ModelError> {
+    match transport {
+        Transport::Chat => {
+            let mut accumulator = sse::ChatStreamAccumulator::default();
+            sse::read_sse(response, |frame| accumulator.push(&frame, Some(sink))).await?;
+            accumulator.finish()
+        }
+        Transport::Responses => {
+            let mut terminal = None;
+            sse::read_sse(response, |frame| {
+                if frame.data.trim().is_empty() || frame.data.trim() == "[DONE]" {
+                    return Ok(false);
+                }
+                let event: Value = serde_json::from_str(&frame.data)?;
+                terminal = sse::responses_event(&event, Some(sink))?;
+                Ok(terminal.is_some())
+            })
+            .await?;
+            terminal.ok_or_else(|| ModelError::Truncated {
+                message: "response stream ended before its terminal event".into(),
+            })
+        }
     }
 }
 
@@ -4416,6 +4498,7 @@ mod tests {
         auth_env: &str,
     ) -> harw_config::ProviderToml {
         harw_config::ProviderToml {
+            stream: None,
             name: name.to_owned(),
             api: "openai-chat".to_owned(),
             base_url,
@@ -4928,6 +5011,7 @@ mod tests {
 
     fn request_with_ids(model_id: Option<&str>, provider_id: Option<&str>) -> ModelRequest {
         ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -5180,6 +5264,101 @@ mod tests {
         Ok(())
     }
 
+    /// Fake-Resolver, der alle angefragten Bezeichner mitschreibt.
+    struct RecordingSecretResolver {
+        value: &'static str,
+        seen: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl SecretResolver for RecordingSecretResolver {
+        fn resolve(&self, reference: &str) -> Result<SecretString, String> {
+            self.seen.borrow_mut().push(reference.to_owned());
+            Ok(SecretString::new(self.value.to_owned().into()))
+        }
+    }
+
+    #[test]
+    fn test_resolve_secret_routes_secrets_reference_to_resolver_without_prefix() -> TestResult {
+        let resolver = RecordingSecretResolver {
+            value: "resolved-via-fake",
+            seen: std::cell::RefCell::new(Vec::new()),
+        };
+        let env_layer = BTreeMap::new();
+
+        let secret = resolve_secret(
+            &harw_config::SecretRef::Secrets("tenant/provider-token".to_owned()),
+            test_sources(&env_layer, Some(&resolver), None),
+        )
+        .map_err(ctx("secrets reference resolves through injected resolver"))?;
+
+        assert_eq!(secret.expose_secret(), "resolved-via-fake");
+        assert_eq!(
+            *resolver.seen.borrow(),
+            vec!["tenant/provider-token".to_owned()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolve_secret_rejects_invalid_keyring_reference_without_resolver_call() -> TestResult {
+        let resolver = RecordingSecretResolver {
+            value: "must-not-be-used",
+            seen: std::cell::RefCell::new(Vec::new()),
+        };
+        let env_layer = BTreeMap::new();
+
+        for payload in ["service", "service/", "/account", "a/b/c"] {
+            let Err(error) = resolve_secret(
+                &harw_config::SecretRef::Keyring(payload.to_owned()),
+                test_sources(&env_layer, Some(&resolver), None),
+            ) else {
+                return Err(TestError::Unexpected(format!(
+                    "invalid keyring reference {payload:?} must fail"
+                )));
+            };
+            assert!(
+                matches!(
+                    &error,
+                    HttpProviderError::UnresolvedCredential { reason, .. }
+                        if reason == INVALID_KEYRING_REFERENCE_REASON
+                ),
+                "{payload:?}"
+            );
+        }
+        assert!(resolver.seen.borrow().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolve_secret_missing_keyring_entry_is_redacted_and_skips_resolver() -> TestResult {
+        // Mock-Backend statt echtem System-Keyring: jede neue `Entry` ist leer,
+        // `get_password` liefert daher `NoEntry`.
+        keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+        let resolver = RecordingSecretResolver {
+            value: "must-not-be-used",
+            seen: std::cell::RefCell::new(Vec::new()),
+        };
+        let env_layer = BTreeMap::new();
+
+        let Err(error) = resolve_secret(
+            &harw_config::SecretRef::Keyring("harwness/openai".to_owned()),
+            test_sources(&env_layer, Some(&resolver), None),
+        ) else {
+            return Err(TestError::Unexpected(
+                "missing keyring entry must fail".to_owned(),
+            ));
+        };
+
+        assert!(matches!(
+            &error,
+            HttpProviderError::UnresolvedCredential { reason, .. }
+                if reason == KEYRING_FAILURE_REASON
+        ));
+        assert!(!error.to_string().contains("must-not-be-used"));
+        assert!(resolver.seen.borrow().is_empty());
+        Ok(())
+    }
+
     #[test]
     fn test_sanitized_provider_error_preserves_status_and_request_id() {
         let error = sanitized_provider_error(
@@ -5351,6 +5530,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Hi there");
         let request = ModelRequest {
+            stream: None,
             system_prompt: "You are terse.".to_owned(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -5401,6 +5581,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Only user");
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -5572,6 +5753,7 @@ mod tests {
         assert_eq!(
             usage,
             TokenUsage {
+                cache_separate: false,
                 input_tokens: 12,
                 output_tokens: 34,
                 reasoning_tokens: Some(7),
@@ -5595,6 +5777,7 @@ mod tests {
         assert_eq!(
             usage,
             TokenUsage {
+                cache_separate: false,
                 input_tokens: 20,
                 output_tokens: 5,
                 reasoning_tokens: Some(2),
@@ -5659,6 +5842,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Hi there");
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -5689,6 +5873,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Hi there");
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -5719,6 +5904,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Hi there");
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -5856,6 +6042,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("weather?");
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -5886,6 +6073,7 @@ mod tests {
             serde_json::json!({"location": "Paris"}),
         );
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -5931,6 +6119,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("weather?");
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -5971,6 +6160,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("hi");
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -5999,6 +6189,7 @@ mod tests {
             serde_json::json!({"location": "Paris"}),
         );
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -6063,6 +6254,7 @@ mod tests {
             5,
         );
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -6119,6 +6311,7 @@ mod tests {
             5,
         );
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -6193,6 +6386,7 @@ mod tests {
             serde_json::json!({"location": "Paris"}),
         );
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -6246,6 +6440,7 @@ mod tests {
             5,
         );
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -6711,6 +6906,7 @@ mod tests {
 
     fn anthropic_provider_without_auth(base_url: &str) -> harw_config::ProviderToml {
         harw_config::ProviderToml {
+            stream: None,
             name: "anthropic".to_owned(),
             api: "anthropic-messages".to_owned(),
             base_url: base_url.to_owned(),
@@ -7503,6 +7699,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Say hello in one word.");
         let request = ModelRequest {
+            stream: None,
             system_prompt: "You are terse.".to_owned(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),

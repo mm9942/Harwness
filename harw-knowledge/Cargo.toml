@@ -71,17 +71,6 @@ serde_norway = "0.9.42"
 toml = { workspace = true }
 # External crates are LISTED here for the parent build to `cargo add` (this
 # worker never runs cargo); no version is invented for them.
-# TODO(parent cargo add): jiff --features serde   # Timestamp for frontmatter / diary / dream (NOT chrono)
-# TODO(parent cargo add): serde_norway            # YAML frontmatter (de)serialization (NOT serde_yaml/serde_yml)
-# TODO(parent cargo add): pulldown-cmark          # markdown body parsing for recall/render (future; body scan is hand-rolled in v1)
-# TODO(parent cargo add): aho-corasick            # multi-pattern keyword/tag scanning (future; tokenizer is hand-rolled in v1)
-# TODO(parent cargo add): notify 9.0.0-rc.4       # workbench push-surface file watching (PIN EXACTLY — pre-1.0 rc)
-# TODO(parent cargo add): croner                  # dream-job cron schedule parsing (§4.3)
-# TODO(parent cargo add): blake3                  # content-hash for artifact versioning / index-cache keys (future)
-# TODO(parent cargo add): etcetera                # XDG/workspace-root resolution for the on-disk layout (§1.2)
-# Optional — NOT required by knowledge-surfaces.md v1; add only if a later phase needs them:
-# TODO(parent cargo add): ulid                    # OPTIONAL time-ordered ids (doc uses slug-derived ids)
-# TODO(parent cargo add): redb                    # OPTIONAL embedded index cache (doc uses a rebuildable file cache)
 
 [lints]
 workspace = true

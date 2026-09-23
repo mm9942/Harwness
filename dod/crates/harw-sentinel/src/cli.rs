@@ -53,12 +53,11 @@ pub const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// Vorgabe-Taktung der Sammelschleife in Sekunden.
 ///
-/// Bewusst kein aus einem harten Poll-Abstand abgeleiteter Wert — siehe
-/// `harw_dod_authlog::sensor`-Moduldoku, Abschnitt „woher kommt `since`?",
-/// für die Begründung, warum dieser Workspace keinen programmweiten
-/// Poll-Abstand festlegt. Fünf Sekunden ist ein für interaktive Beobachtung
-/// brauchbarer Standard; ein Betreiber mit anderen Anforderungen setzt
-/// `--interval-secs` explizit.
+/// Dieser Wert (bzw. `--interval-secs`) ist der programmweite Poll-Abstand:
+/// die Sammelschleife des Sentinels schläft genau so lange, und Sensoren mit
+/// Rückschaufenster bekommen mindestens das Doppelte (`PollTiming` in
+/// `main.rs`). Fünf Sekunden sind ein für interaktive Beobachtung
+/// brauchbarer Standard.
 pub const DEFAULT_INTERVAL_SECS: u64 = 5;
 
 /// Gültige Werte für `--log`, in `tracing_subscriber::EnvFilter`-Syntax.
@@ -144,6 +143,11 @@ pub struct Cli {
     /// Root-Space überschreiben (Vorrang vor `HARW_HOME`/`$HOME/.harw`).
     #[arg(long, value_name = "DIR")]
     pub home: Option<PathBuf>,
+
+    /// Expliziter, administrativ vertrauter Pfad der DoD-Konfiguration
+    /// (absolut, root-eigen). Ohne Angabe gilt `/etc/harw-dod/config.toml`.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
 
     /// Wurzel des `/proc`-Lesebereichs für [`harw_dod_listener::ListenerSensor`]
     /// und [`harw_dod_cpu::CpuSensor`]. Nur zum Testen gegen ein

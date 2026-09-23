@@ -533,9 +533,11 @@ fn test_field_table_exhaustive_internal_model_choice() {
 fn test_field_table_exhaustive_compaction_toml() {
     let CompactionToml {
         absolute_ceiling_tokens,
+        max_history_bytes,
     } = CompactionToml::default();
-    let _ = absolute_ceiling_tokens;
+    let _ = (absolute_ceiling_tokens, max_history_bytes);
     assert_path_in_field_table_exactly_once("compaction.absolute_ceiling_tokens");
+    assert_path_in_field_table_exactly_once("compaction.max_history_bytes");
 }
 
 // ---------------------------------------------------------------------

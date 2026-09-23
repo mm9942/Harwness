@@ -119,10 +119,6 @@ pub enum SecretsError {
     /// callers should not include record contents or secret material.
     #[msg("secret record persistence format {operation} failed: {reason}")]
     PersistenceFormat { operation: String, reason: String },
-
-    /// A skeleton body whose `crypt_guard`/`keyring` call is not yet wired.
-    #[msg("not yet implemented: {0}")]
-    NotYetImplemented(String),
 }
 
 /// Failure modes of the append-only, hash-chained audit log (§4).
@@ -160,11 +156,6 @@ pub enum AuditError {
     #[msg("i/o error accessing audit log: {0}")]
     #[from]
     Io(std::io::Error),
-
-    /// A skeleton body whose `crypt_guard` signing/verification call is not yet
-    /// wired.
-    #[msg("not yet implemented: {0}")]
-    NotYetImplemented(String),
 }
 
 /// Fehlermodi des hostexternen Audit-Spiegels ([`crate::audit::mirror`]).

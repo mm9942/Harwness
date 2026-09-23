@@ -979,6 +979,7 @@ mod tests {
         config.models.insert(
             "private-model".to_owned(),
             harw_config::ModelToml {
+                stream: None,
                 id: "private-model-2026".to_owned(),
                 name: Some("Private Model".to_owned()),
                 provider: "private-provider".to_owned(),
@@ -1069,6 +1070,7 @@ mod tests {
     fn two_provider_config() -> harw_config::ResolvedConfig {
         fn provider(name: &str, env_key: &str, model_id: &str) -> harw_config::ProviderToml {
             harw_config::ProviderToml {
+                stream: None,
                 name: name.to_owned(),
                 api: "openai-chat".to_owned(),
                 base_url: format!("https://api.example.test/{name}"),
@@ -1088,6 +1090,7 @@ mod tests {
         }
         fn model(model_id: &str, provider_name: &str) -> harw_config::ModelToml {
             harw_config::ModelToml {
+                stream: None,
                 id: model_id.to_owned(),
                 name: None,
                 provider: provider_name.to_owned(),
@@ -1269,6 +1272,7 @@ mod tests {
             config.models.insert(
                 key.to_owned(),
                 harw_config::ModelToml {
+                    stream: None,
                     id: id.to_owned(),
                     name: None,
                     provider: provider.to_owned(),

@@ -19,7 +19,9 @@ pub use error::{TelegramChannelError, TelegramChannelResult};
 pub use sandbox::TelegramSandbox;
 pub use telegram::{TelegramChannel, ThrottleNotice};
 pub use work_request::{
-    WorkRequestRecord, WorkRequestState, WorkRequestStore, launch_sandboxed_worker,
+    ApprovedWorkRequest, LaunchReceipt, TELEGRAM_WORK_REQUEST_JOB_KIND, WorkLaunchError,
+    WorkLauncher, WorkRequestRecord, WorkRequestState, WorkRequestStore,
+    launch_sandboxed_worker,
 };
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.

@@ -151,6 +151,13 @@ pub trait PitfallAdvisor: Send + Sync {
 pub trait ProgressObserver: Send + Sync {
     /// Meldet, dass `session_id` gerade Fortschritt gemacht hat.
     fn on_progress(&self, session_id: &harw_types::SessionId);
+
+    /// Meldet die Token-Nutzung einer gerade abgeschlossenen Modell-Runde.
+    fn on_round_usage(&self, _session_id: &harw_types::SessionId, _usage: &harw_types::TokenUsage) {
+    }
+
+    /// Meldet einen abgeschlossenen Tool-Aufruf.
+    fn on_tool_call(&self, _session_id: &harw_types::SessionId) {}
 }
 
 /// Schwellenwerte und Ein/Aus-Schalter der Turn-Wächter.

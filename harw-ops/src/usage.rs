@@ -278,6 +278,7 @@ mod tests {
             version: 1,
             mode: harw_core::InteractionMode::default(),
             total_usage: TokenUsage {
+                cache_separate: false,
                 input_tokens: 200,
                 output_tokens: 50,
                 reasoning_tokens: None,

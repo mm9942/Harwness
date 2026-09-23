@@ -712,6 +712,7 @@ mod tests {
             turns: 3,
             usage_rounds: 2,
             total_usage: harw_types::TokenUsage {
+                cache_separate: false,
                 input_tokens: 100,
                 output_tokens: 40,
                 reasoning_tokens: None,
@@ -1119,6 +1120,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let session = SessionId::from_str("session-a");
         let first = harw_types::TokenUsage {
+            cache_separate: false,
             input_tokens: 100,
             output_tokens: 20,
             reasoning_tokens: None,
@@ -1126,6 +1128,7 @@ mod tests {
             cache_write_tokens: None,
         };
         let second = harw_types::TokenUsage {
+            cache_separate: false,
             input_tokens: 50,
             output_tokens: 5,
             reasoning_tokens: None,

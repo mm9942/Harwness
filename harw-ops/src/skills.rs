@@ -1,28 +1,47 @@
-//! `/skills` — Skill-Kataloggrenze.
+//! `/skills` — Skill-Katalog und Aktivierungszustand.
 //!
 //! `list` und `show` lesen den konfigurierten Skill-Katalog aus dem
 //! `Arc<ResolvedConfig>`-Service in [`OpContext`]. Ohne diesen Service bleibt
 //! die Operation fail-closed ([`OpError::NotAvailable`]).
 //!
+//! `activate` und `deactivate` schalten das `enabled`-Feld des Skill-Manifests
+//! (`skills/<dir>/skill.toml`) dauerhaft um. Geschrieben wird über
+//! [`harw_config::ConfigWriter`] (kommentarerhaltend, atomar, mit Backup) —
+//! derselbe Persistenzweg, den `/permissions` und `/model switch` nutzen.
+//!
 //! # Verantwortungsbereich
 //! Implementiert die `skills`-Operation ausschließlich als `/skills`-Command
-//! (`channel_reduced`). Bis zur harw-catalog-Anbindung ist sie fail-closed und
-//! wird nicht als Model-Tool exponiert.
+//! (`channel_reduced`); sie wird nicht als Model-Tool exponiert, weil das
+//! Modell seinen eigenen Skill-Zuschnitt nicht selbst umschalten darf.
 //!
 //! # Schlüsseltypen
 //! - [`SkillsArgs`] — typisierte Felder für Action (`list` | `activate` |
 //!   `deactivate` | `show`) und optionalen Skill-Namen (`target`).
 //! - [`SkillsOperation`] — generiertes Unit-Struct (via `#[operation]`-Makro)
+//! - [`SkillStatePersistence`] — austauschbarer Dienst für das Umschalten
+//!   des `enabled`-Felds; per `Arc<dyn SkillStatePersistence>` in der
+//!   `ServiceMap` injizierbar.
+//! - [`LayeredSkillStatePersistence`] — Standard-Implementierung über die
+//!   vertrauten Config-Layer (`harw_home::config_layers`).
+//! - [`SkillStateOutcome`] — Ergebnis einer Umschaltung (Manifest-Pfad,
+//!   ob tatsächlich geschrieben wurde).
+//!
+//! # Wirksamkeit
+//! Die `ResolvedConfig` einer laufenden Sitzung ist ein unveränderlicher
+//! Snapshot. Ein Umschalten wirkt daher ab dem nächsten Config-Laden
+//! (nächste Sitzung); `/skills list` zeigt bis dahin den Snapshot-Stand.
+//!
+//! # Manifest-Auflösung
+//! Wie `harw_config::discover_config` gewinnt der **letzte** vertraute Layer,
+//! und innerhalb eines Layers das nach Verzeichnisnamen letzte Manifest, dessen
+//! `name`-Feld passt. Genau diese Datei wird geändert — also die, aus der die
+//! geladene Konfiguration den Skill tatsächlich bezieht. Nicht vertraute
+//! Repo-Layer liefert `harw_home::config_layers` gar nicht erst.
 //!
 //! # Surface-Matrix
 //! | Surface | Sichtbarkeit      |
 //! |---------|-------------------|
 //! | Command | `channel_reduced` |
-//!
-//! # Ausstehende Anbindung
-//! Der Skill-Katalog ist noch nicht verfügbar. Die Operation gibt für jede
-//! Aktion denselben statischen [`OpError::NotAvailable`] zurück und echo't
-//! keine vom Aufrufer gelieferten Werte.
 //!
 //! # Beispiel
 //! ```rust,no_run
@@ -33,10 +52,14 @@
 //! assert_eq!(op.meta().name, "skills");
 //! ```
 
-use harw_config::ResolvedConfig;
+use harw_config::{ResolvedConfig, SkillToml};
 use harw_macros::operation;
 use harw_operations::{OpContext, OpError, OpOutput};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Dateiname des Skill-Manifests innerhalb eines Skill-Verzeichnisses.
+const SKILL_MANIFEST: &str = "skill.toml";
 
 // ── Args ──────────────────────────────────────────────────────────────────────
 
@@ -48,15 +71,15 @@ use std::sync::Arc;
 /// den tokenisierten TUI-Rohargumenten befüllt — jedes Feld erhält genau das
 /// Token an der entsprechenden Position (0-basiert).
 ///
-/// - `None` oder `action = Some("list")` → Skills auflisten (Standard-Verhalten;
-///   derzeit wegen der fehlenden Katalog-Anbindung nicht verfügbar).
-/// - `action = Some("activate")` mit `target = Some("<name>")` → benannten Skill
-///   aktivieren (derzeit nicht verfügbar).
+/// - `None` oder `action = Some("list")` → Skills auflisten (Standard-Verhalten).
+/// - `action = Some("show")` mit `target` → Details eines Skills.
+/// - `action = Some("activate")`/`Some("deactivate")` mit `target` → `enabled`
+///   im Skill-Manifest dauerhaft umschalten.
 ///
 /// # Felder
 /// - `action` (`Option<String>`): Token 0 — Sub-Kommando: `"list"` (Standard),
 ///   `"activate"`, `"deactivate"`, `"show"`. `None` wird wie `"list"` behandelt.
-/// - `target` (`Option<String>`): Token 1 — Skill-Name. Relevant für `activate`,
+/// - `target` (`Option<String>`): Token 1 — Skill-Name. Pflicht für `activate`,
 ///   `deactivate` und `show`; bei `list` ignoriert.
 /// - `value` (`Option<String>`): Token 2 — dritter Parameter (reserviert für
 ///   zukünftige Erweiterungen; aktuell ungenutzt).
@@ -65,8 +88,7 @@ use std::sync::Arc;
 /// Das `#[operation]`-Makro deserialisiert `input.json_args` via `serde_json`
 /// in diesen Typ. Bei Command-Aufrufen ist `json_args == Null`, weshalb
 /// [`Default::default`] greift und `action = None` ergibt. Die Operation ist
-/// ausschließlich über den `/skills`-Command erreichbar; jede Ausführung wird
-/// mit [`OpError::NotAvailable`] abgewiesen.
+/// ausschließlich über den `/skills`-Command erreichbar.
 ///
 /// # Spec-Referenz
 /// Spec-Abschnitt: `/skills` — Args.
@@ -88,8 +110,7 @@ use std::sync::Arc;
 pub struct SkillsArgs {
     /// Sub-Kommando: `"list"` (Standard), `"activate"`, `"deactivate"`, `"show"`. Token 0.
     ///
-    /// `None` wird wie `"list"` behandelt. Alle Werte werden derzeit nur für
-    /// das Parsen erhalten; die Ausführung bleibt fail-closed.
+    /// `None` wird wie `"list"` behandelt.
     #[serde(default)]
     #[raw(first)]
     pub action: Option<String>,
@@ -103,30 +124,234 @@ pub struct SkillsArgs {
     pub value: Option<String>,
 }
 
-// ── Operation ─────────────────────────────────────────────────────────────────
+// ── Persistenz ────────────────────────────────────────────────────────────────
 
-/// Greift auf den Skill-Katalog zu (derzeit nicht verfügbar).
+/// Ergebnis einer [`SkillStatePersistence::set_skill_enabled`]-Umschaltung.
+///
+/// # Felder
+/// - `manifest` (`PathBuf`): Pfad des Skill-Manifests, das den Skill in der
+///   geladenen Konfiguration definiert.
+/// - `changed` (`bool`): `true`, wenn das Manifest geschrieben wurde; `false`,
+///   wenn es den gewünschten Zustand bereits trug (keine Schreiboperation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillStateOutcome {
+    /// Pfad des betroffenen `skill.toml`.
+    pub manifest: PathBuf,
+    /// Ob tatsächlich geschrieben wurde.
+    pub changed: bool,
+}
+
+/// Austauschbarer Dienst, der den Aktivierungszustand eines Skills dauerhaft setzt.
 ///
 /// # Beschreibung
-/// Die harw-catalog-Anbindung fehlt noch. Deshalb werden `list`, `show`,
-/// `activate`, `deactivate` und unbekannte Sub-Befehle gleichermaßen statisch
-/// mit [`OpError::NotAvailable`] abgewiesen. Weder `action` noch `target` oder
-/// `value` werden in die Fehlermeldung interpoliert.
-///
-/// # Argumente
-/// - `_ctx` (`&OpContext`): Ausführungskontext — wird bis zur Katalog-Anbindung
-///   nicht benötigt.
-/// - `args` (`SkillsArgs`): Typisierte Sub-Kommando-Argumente; sie werden
-///   erhalten, aber bis zur Katalog-Anbindung nicht ausgewertet.
-///
-/// # Rückgabe
-/// - `Err(OpError::NotAvailable)`: Die Katalog-Anbindung ist nicht verfügbar.
-///
-/// # Fehler
-/// - [`OpError::NotAvailable`]: Jede Ausführung, bis harw-catalog angebunden ist.
+/// Die `/skills`-Operation fragt zuerst `Arc<dyn SkillStatePersistence>` aus der
+/// [`harw_operations::context::ServiceMap`] ab und fällt ohne registrierten
+/// Dienst auf [`LayeredSkillStatePersistence::from_home`] zurück. Tests und
+/// Oberflächen mit eigener Config-Wurzel injizieren so eine eigene
+/// Implementierung, ohne `HARW_HOME` zu verändern.
 ///
 /// # Nebenläufigkeit
-/// Zustandslos; sicher aus mehreren Threads aufrufbar.
+/// `Send + Sync`; Implementierungen sichern parallele Schreibzugriffe auf
+/// dieselbe Datei nicht zwingend ab (analog [`harw_config::ConfigWriter`]).
+pub trait SkillStatePersistence: Send + Sync {
+    /// Setzt `enabled` des Skills `name` dauerhaft auf `enabled`.
+    ///
+    /// # Argumente
+    /// - `name` (`&str`): Skill-Name (Feld `name` im Manifest).
+    /// - `enabled` (`bool`): gewünschter Zustand.
+    ///
+    /// # Rückgabe
+    /// [`SkillStateOutcome`] mit Manifest-Pfad und Änderungsflag.
+    ///
+    /// # Fehler
+    /// - [`OpError::InvalidArguments`]: kein Manifest mit diesem Namen gefunden.
+    /// - [`OpError::Execution`]: Lese-, Parse- oder Schreibfehler.
+    fn set_skill_enabled(&self, name: &str, enabled: bool) -> Result<SkillStateOutcome, OpError>;
+}
+
+/// Standard-[`SkillStatePersistence`] über eine Liste vertrauter Config-Layer.
+///
+/// # Beschreibung
+/// Sucht `skills/*/skill.toml` in den Layern in umgekehrter Präzedenz (letzter
+/// Layer zuerst, innerhalb eines Layers nach Verzeichnisnamen absteigend) und
+/// schreibt das erste Manifest, dessen `name` passt — exakt das Manifest, das
+/// `harw_config::discover_config` für diesen Namen zuletzt einliest und damit
+/// wirksam macht. Geschrieben wird nur, wenn sich der Zustand ändert; dann über
+/// [`harw_config::ConfigWriter`] (Kommentare bleiben erhalten, atomares
+/// Schreiben, rotierende `skill.toml.bak.<n>`-Backups, Rechte `0600`, das
+/// Skill-Verzeichnis wird dabei auf `0700` gesetzt).
+///
+/// # Nebenläufigkeit
+/// Zustandslos bis auf die unveränderliche Layer-Liste; `Send + Sync`.
+///
+/// # Beispiel
+/// ```rust,no_run
+/// use harw_ops::skills::{LayeredSkillStatePersistence, SkillStatePersistence};
+///
+/// let persistence = LayeredSkillStatePersistence::new(vec!["/home/mia/.harw".into()]);
+/// let outcome = persistence.set_skill_enabled("review", false)?;
+/// println!("{}", outcome.manifest.display());
+/// # Ok::<(), harw_operations::OpError>(())
+/// ```
+#[derive(Debug, Clone)]
+pub struct LayeredSkillStatePersistence {
+    layers: Vec<PathBuf>,
+}
+
+impl LayeredSkillStatePersistence {
+    /// Erstellt die Persistenz über die gegebenen Layer (aufsteigende Präzedenz).
+    ///
+    /// # Argumente
+    /// - `layers` (`Vec<PathBuf>`): Config-Layer in derselben Reihenfolge, wie
+    ///   sie `harw_config::discover_config` erhält.
+    #[must_use]
+    pub fn new(layers: Vec<PathBuf>) -> Self {
+        Self { layers }
+    }
+
+    /// Erstellt die Persistenz über die vertrauten Layer des aktiven `HARW_HOME`.
+    ///
+    /// # Fehler
+    /// - [`OpError::Execution`]: Home oder Layer nicht auflösbar.
+    pub fn from_home() -> Result<Self, OpError> {
+        let home = harw_home::home_dir()
+            .map_err(|error| OpError::Execution(format!("HARW_HOME nicht auflösbar: {error}")))?;
+        let layers = harw_home::config_layers(&home).map_err(|error| {
+            OpError::Execution(format!("Config-Layer nicht auflösbar: {error}"))
+        })?;
+        Ok(Self::new(layers))
+    }
+
+    /// Findet das wirksame Manifest des Skills `name` samt aktuellem `enabled`.
+    ///
+    /// # Rückgabe
+    /// `Some((pfad, enabled))` oder `None`, wenn kein Layer den Skill definiert.
+    ///
+    /// # Fehler
+    /// - [`OpError::Execution`]: Verzeichnis/Datei unlesbar oder Manifest
+    ///   kein gültiges `SkillToml` (Discovery würde hier ebenfalls scheitern).
+    fn find_manifest(&self, name: &str) -> Result<Option<(PathBuf, bool)>, OpError> {
+        for base in self.layers.iter().rev() {
+            let skills_dir = base.join("skills");
+            if !skills_dir.is_dir() {
+                continue;
+            }
+            let mut entries = std::fs::read_dir(&skills_dir)
+                .map_err(|error| read_failed(&skills_dir, error))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| read_failed(&skills_dir, error))?;
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries.iter().rev() {
+                let entry_path = entry.path();
+                let file_type = entry
+                    .file_type()
+                    .map_err(|error| read_failed(&entry_path, error))?;
+                if !file_type.is_dir() {
+                    continue;
+                }
+                let manifest = entry_path.join(SKILL_MANIFEST);
+                if !manifest.exists() {
+                    continue;
+                }
+                let content = std::fs::read_to_string(&manifest)
+                    .map_err(|error| read_failed(&manifest, error))?;
+                let skill: SkillToml = toml::from_str(&content).map_err(|error| {
+                    OpError::Execution(format!(
+                        "Skill-Manifest '{}' ist ungültig: {error}",
+                        manifest.display()
+                    ))
+                })?;
+                if skill.name == name {
+                    return Ok(Some((manifest, skill.enabled)));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl SkillStatePersistence for LayeredSkillStatePersistence {
+    /// Schaltet `enabled` im wirksamen Manifest um (siehe Typ-Doku).
+    ///
+    /// # Fehler
+    /// - [`OpError::InvalidArguments`]: kein Layer definiert den Skill.
+    /// - [`OpError::Execution`]: Lese-, Parse- oder Schreibfehler.
+    fn set_skill_enabled(&self, name: &str, enabled: bool) -> Result<SkillStateOutcome, OpError> {
+        let Some((manifest, current)) = self.find_manifest(name)? else {
+            return Err(OpError::InvalidArguments(format!(
+                "no manifest for skill '{name}' in any trusted config layer"
+            )));
+        };
+        if current == enabled {
+            return Ok(SkillStateOutcome {
+                manifest,
+                changed: false,
+            });
+        }
+        let write_failed = |error: harw_config::ConfigError| {
+            OpError::Execution(format!(
+                "Skill-Manifest '{}' konnte nicht geschrieben werden: {error}",
+                manifest.display()
+            ))
+        };
+        let mut writer = harw_config::ConfigWriter::open(&manifest).map_err(write_failed)?;
+        writer
+            .set_value("enabled", toml_edit::value(enabled))
+            .map_err(write_failed)?;
+        writer.save().map_err(write_failed)?;
+        Ok(SkillStateOutcome {
+            manifest,
+            changed: true,
+        })
+    }
+}
+
+/// Baut den einheitlichen Lesefehler für Verzeichnis- und Dateizugriffe.
+fn read_failed(path: &Path, error: std::io::Error) -> OpError {
+    OpError::Execution(format!("'{}' ist nicht lesbar: {error}", path.display()))
+}
+
+/// Liefert den injizierten Persistenzdienst oder die Layer-Standardimplementierung.
+///
+/// # Fehler
+/// - [`OpError::Execution`]: kein Dienst registriert und `HARW_HOME`/Layer
+///   nicht auflösbar.
+fn skill_state_persistence(ctx: &OpContext) -> Result<Arc<dyn SkillStatePersistence>, OpError> {
+    if let Some(persistence) = ctx.service::<Arc<dyn SkillStatePersistence>>() {
+        return Ok(Arc::clone(persistence));
+    }
+    Ok(Arc::new(LayeredSkillStatePersistence::from_home()?) as Arc<dyn SkillStatePersistence>)
+}
+
+// ── Operation ─────────────────────────────────────────────────────────────────
+
+/// Liest den Skill-Katalog und schaltet Skills dauerhaft an oder ab.
+///
+/// # Beschreibung
+/// - `list` (Standard): alle konfigurierten Skills mit Status.
+/// - `show <name>`: Details eines Skills.
+/// - `activate <name>` / `deactivate <name>`: setzt `enabled` im wirksamen
+///   Skill-Manifest über [`SkillStatePersistence`]; wirksam ab dem nächsten
+///   Config-Laden.
+///
+/// # Argumente
+/// - `ctx` (`&OpContext`): Ausführungskontext; benötigt `Arc<ResolvedConfig>`,
+///   optional `Arc<dyn SkillStatePersistence>`.
+/// - `args` (`SkillsArgs`): Typisierte Sub-Kommando-Argumente.
+///
+/// # Rückgabe
+/// - `Ok(OpOutput)`: menschenlesbare Ausgabe.
+///
+/// # Fehler
+/// - [`OpError::NotAvailable`]: kein `Arc<ResolvedConfig>`-Service (statische
+///   Meldung ohne Echo der Argumente).
+/// - [`OpError::InvalidArguments`]: fehlender/unbekannter Skill-Name oder
+///   unbekanntes Sub-Kommando.
+/// - [`OpError::Execution`]: Persistenzfehler bei `activate`/`deactivate`.
+///
+/// # Nebenläufigkeit
+/// Zustandslos; Schreibzugriffe sind nicht gegen parallele Aufrufe auf
+/// dasselbe Manifest gesperrt.
 ///
 /// # Spec-Referenz
 /// Spec-Abschnitt: `/skills` — Body, Command-Surface, Soft-Refuse.
@@ -137,7 +362,7 @@ pub struct SkillsArgs {
 /// ```
 #[operation(
     name = "skills",
-    summary = "Skill-Katalog: list/show gegen die geladene ResolvedConfig.skills.",
+    summary = "Skill-Katalog: list/show/activate/deactivate gegen ResolvedConfig.skills.",
     domain = "catalog_config",
     permission = "operator",
     command(path = "/skills", visibility = "channel_reduced")
@@ -184,9 +409,33 @@ async fn skills(ctx: &OpContext, args: SkillsArgs) -> Result<OpOutput, OpError> 
                 skill.mcps.join(", ")
             )))
         }
-        "activate" | "deactivate" => Err(OpError::NotAvailable(
-            "skill activation state changes are not available".to_owned(),
-        )),
+        action @ ("activate" | "deactivate") => {
+            let enabled = action == "activate";
+            let Some(target) = args.target.as_deref() else {
+                return Err(OpError::InvalidArguments(format!(
+                    "action '{action}' requires a skill name"
+                )));
+            };
+            if !config.skills.contains_key(target) {
+                return Err(OpError::InvalidArguments(format!(
+                    "unknown skill '{target}'"
+                )));
+            }
+            let outcome = skill_state_persistence(ctx)?.set_skill_enabled(target, enabled)?;
+            let state = if enabled { "aktiviert" } else { "deaktiviert" };
+            let text = if outcome.changed {
+                format!(
+                    "Skill '{target}' {state} ({}). Wirksam ab dem nächsten Config-Laden (nächste Sitzung).",
+                    outcome.manifest.display()
+                )
+            } else {
+                format!(
+                    "Skill '{target}' ist bereits {state} ({}).",
+                    outcome.manifest.display()
+                )
+            };
+            Ok(OpOutput::from(text))
+        }
         unknown => Err(OpError::InvalidArguments(format!(
             "unknown /skills action '{unknown}'"
         ))),
@@ -369,6 +618,233 @@ mod tests {
                 )));
             }
         }
+        Ok(())
+    }
+
+    // ── activate / deactivate ────────────────────────────────────────────────
+
+    use super::{LayeredSkillStatePersistence, SkillStateOutcome, SkillStatePersistence};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    /// Aufzeichnende Persistenz: merkt sich jeden Aufruf, schreibt nichts.
+    #[derive(Default)]
+    struct RecordingPersistence {
+        calls: Mutex<Vec<(String, bool)>>,
+    }
+
+    impl SkillStatePersistence for RecordingPersistence {
+        fn set_skill_enabled(
+            &self,
+            name: &str,
+            enabled: bool,
+        ) -> Result<SkillStateOutcome, OpError> {
+            self.calls
+                .lock()
+                .map_err(|_| OpError::Execution("poisoned".to_owned()))?
+                .push((name.to_owned(), enabled));
+            Ok(SkillStateOutcome {
+                manifest: PathBuf::from("/recorded/skills/review/skill.toml"),
+                changed: true,
+            })
+        }
+    }
+
+    fn review_config() -> harw_config::ResolvedConfig {
+        let mut config = harw_config::ResolvedConfig::default();
+        config.skills.insert(
+            "review".to_owned(),
+            harw_config::SkillToml {
+                name: "review".to_owned(),
+                enabled: true,
+                description: "code review".to_owned(),
+                instructions_file: None,
+                tools: vec![],
+                mcps: vec![],
+            },
+        );
+        config
+    }
+
+    /// Baut einen Kontext mit Config-Service und optionaler Persistenz.
+    fn context_with(
+        persistence: Option<Arc<dyn SkillStatePersistence>>,
+    ) -> TestResult<(OpContext, PathBuf)> {
+        let (base, root) = test_context()?;
+        let mut services = ServiceMap::new();
+        services.insert(Arc::new(review_config()));
+        if let Some(persistence) = persistence {
+            services.insert(persistence);
+        }
+        Ok((
+            OpContext::new(
+                base.session_id().clone(),
+                base.turn_id().clone(),
+                base.sandbox().clone(),
+                services,
+            ),
+            root,
+        ))
+    }
+
+    fn args(action: &str, target: Option<&str>) -> SkillsArgs {
+        SkillsArgs {
+            action: Some(action.to_owned()),
+            target: target.map(str::to_owned),
+            value: None,
+        }
+    }
+
+    fn write_manifest(layer: &Path, dir: &str, body: &str) -> TestResult<PathBuf> {
+        let skill_dir = layer.join("skills").join(dir);
+        std::fs::create_dir_all(&skill_dir).map_err(ctx("create skill dir"))?;
+        let manifest = skill_dir.join("skill.toml");
+        std::fs::write(&manifest, body).map_err(ctx("write skill manifest"))?;
+        Ok(manifest)
+    }
+
+    fn read_enabled(manifest: &Path) -> TestResult<bool> {
+        let content = std::fs::read_to_string(manifest).map_err(ctx("read manifest"))?;
+        let skill: harw_config::SkillToml =
+            toml::from_str(&content).map_err(ctx("parse manifest"))?;
+        Ok(skill.enabled)
+    }
+
+    #[tokio::test]
+    async fn skills_activate_without_target_is_invalid_arguments() -> TestResult {
+        let recorder = Arc::new(RecordingPersistence::default());
+        let (ctx_, root) =
+            context_with(Some(Arc::clone(&recorder) as Arc<dyn SkillStatePersistence>))?;
+        let result = super::skills(&ctx_, args("activate", None)).await;
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+        assert!(matches!(result, Err(OpError::InvalidArguments(_))));
+        let calls = recorder.calls.lock().map_err(ctx("lock calls"))?;
+        assert!(calls.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skills_deactivate_unknown_skill_is_invalid_arguments() -> TestResult {
+        let recorder = Arc::new(RecordingPersistence::default());
+        let (ctx_, root) =
+            context_with(Some(Arc::clone(&recorder) as Arc<dyn SkillStatePersistence>))?;
+        let result = super::skills(&ctx_, args("deactivate", Some("missing"))).await;
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+        assert!(matches!(
+            result,
+            Err(OpError::InvalidArguments(message)) if message.contains("unknown skill")
+        ));
+        let calls = recorder.calls.lock().map_err(ctx("lock calls"))?;
+        assert!(calls.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skills_activate_and_deactivate_delegate_to_injected_persistence() -> TestResult {
+        let recorder = Arc::new(RecordingPersistence::default());
+        let (ctx_, root) =
+            context_with(Some(Arc::clone(&recorder) as Arc<dyn SkillStatePersistence>))?;
+        let deactivated = super::skills(&ctx_, args("deactivate", Some("review"))).await;
+        let activated = super::skills(&ctx_, args("activate", Some("review"))).await;
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+
+        let deactivated = deactivated.map_err(ctx("deactivate"))?;
+        assert!(deactivated.text.contains("'review' deaktiviert"));
+        let activated = activated.map_err(ctx("activate"))?;
+        assert!(activated.text.contains("'review' aktiviert"));
+        let calls = recorder.calls.lock().map_err(ctx("lock calls"))?;
+        assert_eq!(
+            *calls,
+            vec![("review".to_owned(), false), ("review".to_owned(), true)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn layered_persistence_writes_highest_precedence_manifest_and_keeps_comments() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let global = temp.path().join("global");
+        let profile = temp.path().join("profile");
+        let global_manifest = write_manifest(
+            &global,
+            "review",
+            "name = \"review\"\ndescription = \"global\"\n",
+        )?;
+        // Verzeichnisname weicht vom Skill-Namen ab: maßgeblich ist das `name`-Feld.
+        let profile_manifest = write_manifest(
+            &profile,
+            "review-override",
+            "# Profil-Override\nname = \"review\"\nenabled = true\ndescription = \"profile\"\n",
+        )?;
+        write_manifest(&profile, "other", "name = \"other\"\n")?;
+
+        let persistence = LayeredSkillStatePersistence::new(vec![global.clone(), profile]);
+        let outcome = persistence
+            .set_skill_enabled("review", false)
+            .map_err(ctx("deactivate review"))?;
+        assert_eq!(outcome.manifest, profile_manifest);
+        assert!(outcome.changed);
+        assert!(!read_enabled(&profile_manifest)?);
+        assert!(read_enabled(&global_manifest)?);
+        let content =
+            std::fs::read_to_string(&profile_manifest).map_err(ctx("read profile manifest"))?;
+        assert!(content.contains("# Profil-Override"));
+        assert!(content.contains("description = \"profile\""));
+
+        // Zweiter Aufruf mit demselben Zustand schreibt nicht.
+        let again = persistence
+            .set_skill_enabled("review", false)
+            .map_err(ctx("deactivate review again"))?;
+        assert!(!again.changed);
+
+        // Fehlendes `enabled` gilt als `true` (Serde-Default): Aktivieren ist ein
+        // No-op, Deaktivieren schreibt.
+        let global_only = LayeredSkillStatePersistence::new(vec![global]);
+        let reactivated = global_only
+            .set_skill_enabled("review", true)
+            .map_err(ctx("activate global review"))?;
+        assert!(!reactivated.changed);
+        let deactivated = global_only
+            .set_skill_enabled("review", false)
+            .map_err(ctx("deactivate global review"))?;
+        assert!(deactivated.changed);
+        assert!(!read_enabled(&global_manifest)?);
+        Ok(())
+    }
+
+    #[test]
+    fn layered_persistence_rejects_skill_without_manifest() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let layer = temp.path().join("layer");
+        write_manifest(&layer, "other", "name = \"other\"\n")?;
+        let persistence =
+            LayeredSkillStatePersistence::new(vec![layer, temp.path().join("absent")]);
+        assert!(matches!(
+            persistence.set_skill_enabled("review", false),
+            Err(OpError::InvalidArguments(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skills_deactivate_end_to_end_with_layered_persistence() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let layer = temp.path().join("layer");
+        let manifest = write_manifest(&layer, "review", "name = \"review\"\nenabled = true\n")?;
+        let persistence: Arc<dyn SkillStatePersistence> =
+            Arc::new(LayeredSkillStatePersistence::new(vec![layer]));
+        let (ctx_, root) = context_with(Some(persistence))?;
+
+        let first = super::skills(&ctx_, args("deactivate", Some("review"))).await;
+        let second = super::skills(&ctx_, args("deactivate", Some("review"))).await;
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+
+        let first = first.map_err(ctx("first deactivate"))?;
+        assert!(first.text.contains("deaktiviert"));
+        assert!(first.text.contains("nächsten Config-Laden"));
+        let second = second.map_err(ctx("second deactivate"))?;
+        assert!(second.text.contains("bereits deaktiviert"));
+        assert!(!read_enabled(&manifest)?);
         Ok(())
     }
 }

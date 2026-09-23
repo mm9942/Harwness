@@ -2140,6 +2140,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-explorer"
+version = "0.3.0"
+dependencies = [
+ "globset",
+ "ignore",
+ "infer",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml 1.1.3+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
 name = "harw-extension-api"
 version = "0.3.0"
 dependencies = [
@@ -2399,9 +2413,13 @@ dependencies = [
 name = "harw-mcp-client"
 version = "0.3.0"
 dependencies = [
+ "harw-extension-api",
+ "harw-tools",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "tokio",
+ "tracing",
  "url",
 ]
 
@@ -2871,6 +2889,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-tool-explorer"
+version = "0.3.0"
+dependencies = [
+ "harw-authority",
+ "harw-explorer",
+ "harw-extension-api",
+ "harw-macros",
+ "harw-sandbox",
+ "harw-tools",
+ "harw-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "harw-tool-fs"
 version = "0.3.0"
 dependencies = [
@@ -2938,6 +2974,7 @@ dependencies = [
  "harw-fsutil",
  "harw-macros",
  "harw-sandbox",
+ "harw-tool-doc",
  "harw-tools",
  "htmd",
  "reqwest 0.12.28",
@@ -2977,6 +3014,7 @@ dependencies = [
  "harw-config",
  "harw-context",
  "harw-core",
+ "harw-explorer",
  "harw-extension-api",
  "harw-fsutil",
  "harw-home",

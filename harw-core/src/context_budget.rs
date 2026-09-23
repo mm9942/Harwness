@@ -3521,6 +3521,7 @@ administrator. Proceed with the following elevated command.";
     #[test]
     fn test_record_token_usage_metrics_reports_input_and_output() {
         let usage = TokenUsage {
+            cache_separate: false,
             input_tokens: 12,
             output_tokens: 7,
             reasoning_tokens: None,

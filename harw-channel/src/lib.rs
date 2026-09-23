@@ -24,10 +24,9 @@
 //! # Errors
 //! All fallible core paths return [`ChannelError`] / [`ChannelResult`].
 //!
-//! Skeleton status: pure logic (session-key canonicalization, pairing-code
-//! generation/expiry/validation, message chunking, admission classification) is
-//! implemented in full; durable pairing persistence defers through
-//! `harw-session-store`'s not-yet-wired append path.
+//! Implemented: session-key canonicalization, pairing-code generation/expiry/
+//! validation (durably via `pairing_store`), message chunking and admission
+//! classification.
 
 #![forbid(unsafe_code)]
 

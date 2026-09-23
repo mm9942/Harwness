@@ -145,6 +145,7 @@ mod tests {
 
     fn request() -> ModelRequest {
         ModelRequest {
+            stream: None,
             system_prompt: "system".to_owned(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),

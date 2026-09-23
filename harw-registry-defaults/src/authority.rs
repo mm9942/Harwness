@@ -66,7 +66,8 @@ use harw_authority::{Permission, PermissionSet};
 
 use crate::profile::{
     AGENT_DEFINITION_LIST_TOOLS, AGENT_DEFINITION_READ_TOOLS, AGENT_DEFINITION_WRITE_TOOLS,
-    BROWSER_TOOLS, DEPS_SOURCE_TOOLS, DEPS_WORKSPACE_TOOLS, DOC_TOOLS, FS_READ_ONLY_TOOLS,
+    BROWSER_TOOLS, DEPS_SOURCE_TOOLS, DEPS_WORKSPACE_TOOLS, DOC_TOOLS, EXPLORER_TOOLS,
+    FS_READ_ONLY_TOOLS,
     LENS_TOOLS, SHELL_TOOLS, WEB_TOOLS, role_names,
 };
 
@@ -377,6 +378,7 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         Some(Permission::ExecuteProcess)
     } else if listed(FS_READ_ONLY_TOOLS)
         || listed(DOC_TOOLS)
+        || listed(EXPLORER_TOOLS)
         || listed(DEPS_WORKSPACE_TOOLS)
         || listed(LENS_TOOLS)
         || listed(AGENT_DEFINITION_READ_TOOLS)

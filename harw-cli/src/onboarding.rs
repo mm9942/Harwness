@@ -208,6 +208,7 @@ Weiteres das Hauptmodell; änderbar mit `harw models internal`."
     };
 
     let provider = ProviderToml {
+        stream: None,
         name: "openrouter".to_owned(),
         api: "openai-chat".to_owned(),
         base_url: "https://openrouter.ai/api/v1".to_owned(),
@@ -341,6 +342,7 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
         models_list.push(model_id.clone());
     }
     let provider = ProviderToml {
+        stream: None,
         name: outcome.provider_id.clone(),
         api: outcome.api.clone(),
         base_url: outcome.base_url.clone(),
@@ -367,6 +369,7 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
     )?;
 
     let model = ModelToml {
+        stream: None,
         id: model_id.clone(),
         name: None,
         provider: outcome.provider_id.clone(),
@@ -399,6 +402,7 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
             continue;
         }
         let extra_model = ModelToml {
+            stream: None,
             id: extra_id.clone(),
             name: None,
             provider: outcome.provider_id.clone(),
@@ -830,6 +834,7 @@ mod tests {
                 .map_err(ctx("build_provider_with_home"))?;
             let result = provider
                 .respond(harw_core::ModelRequest {
+                    stream: None,
                     system_prompt: String::new(),
                     instruction_fragments: vec![],
                     context: vec![],

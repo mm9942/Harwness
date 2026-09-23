@@ -63,6 +63,7 @@ use harw_project_discovery::{
 };
 use harw_sandbox::{HostPermitSessionRegistry, ProcessPermitLedger, SandboxProfile};
 use harw_tool_deps::DepsToolProvider;
+use harw_tool_explorer::ExplorerToolProvider;
 use harw_tool_doc::DocToolProvider;
 use harw_tool_fs::FsToolProvider;
 use harw_tool_lens::LensToolProvider;
@@ -324,6 +325,16 @@ const MEMORY_STEWARDSHIP_TOOLS: &[&str] = FS_FULL_TOOLS;
 /// [`crate::authority::tool_permission`].
 pub(crate) const DOC_TOOLS: &[&str] = &["doc.read_pdf"];
 
+/// Die Werkzeuge von `harw-tool-explorer`: projektunabhängiger Überblick
+/// über den gesamten Baum ab der Workspace-Wurzel (Baum, Projekte,
+/// Relationen, Suche). Rein lesend, `Permission::ReadWorkspace`.
+pub(crate) const EXPLORER_TOOLS: &[&str] = &[
+    "explore.tree",
+    "explore.projects",
+    "explore.relations",
+    "explore.find",
+];
+
 /// Die Werkzeuge von `harw-tool-deps`, in Provider-Reihenfolge.
 const DEPS_TOOLS: &[&str] = &[
     "deps.graph",
@@ -343,7 +354,7 @@ pub(crate) const DEPS_SOURCE_TOOLS: &[&str] =
     &["deps.source_read", "deps.source_search", "deps.source_list"];
 
 /// Die Werkzeuge von `harw-tool-web`, in Provider-Reihenfolge.
-pub(crate) const WEB_TOOLS: &[&str] = &["web.fetch", "web.docs_rs", "web.crates_io"];
+pub(crate) const WEB_TOOLS: &[&str] = &["web.fetch", "web.docs_rs", "web.crates_io", "web.search"];
 
 /// Das einzige Netz-Werkzeug von [`RegistryProfile::UiaQuickHelper`]
 /// (Addendum I): nur `web.fetch`, ohne `web.docs_rs`/`web.crates_io` — die
@@ -821,6 +832,7 @@ impl RegistryProfile {
             RegistryProfile::Full => FS_FULL_TOOLS
                 .iter()
                 .chain(DOC_TOOLS.iter())
+                .chain(EXPLORER_TOOLS.iter())
                 .chain(SHELL_TOOLS.iter())
                 .copied()
                 .collect(),
@@ -828,7 +840,13 @@ impl RegistryProfile {
             RegistryProfile::ReadOnlyExplore => FS_READ_ONLY_TOOLS
                 .iter()
                 .chain(DOC_TOOLS.iter())
+                .chain(EXPLORER_TOOLS.iter())
                 .chain(DEPS_TOOLS.iter())
+                // Der Explorer darf auch das Netz durchsuchen (`web.search`,
+                // `web.fetch`); welche davon eine Rolle wirklich bekommt,
+                // entscheidet ihr `admitted` in der Agent-Definition, und jeder
+                // Abruf braucht weiterhin `NetworkAccess` im Sandbox-Scope.
+                .chain(WEB_TOOLS.iter())
                 .copied()
                 .collect(),
             // `Planning` teilt den read-only Kern mit `ReadOnlyExplore`, hängt
@@ -838,6 +856,7 @@ impl RegistryProfile {
             RegistryProfile::Planning => FS_READ_ONLY_TOOLS
                 .iter()
                 .chain(DOC_TOOLS.iter())
+                .chain(EXPLORER_TOOLS.iter())
                 .chain(DEPS_TOOLS.iter())
                 .chain(LENS_TOOLS.iter())
                 .copied()
@@ -1445,19 +1464,25 @@ fn profile_tool_providers(
             FS_READ_ONLY_TOOLS,
         ));
         let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
+        let explorer: Arc<dyn ToolProvider> = Arc::new(ExplorerToolProvider::new());
         let dependencies: Arc<dyn ToolProvider> = Arc::new(DepsToolProvider::new());
-        vec![filesystem, doc, dependencies]
+        vec![filesystem, doc, explorer, dependencies]
     }
 
     match profile {
         RegistryProfile::Full => {
             let filesystem: Arc<dyn ToolProvider> = Arc::new(FsToolProvider::default());
             let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
+            let explorer: Arc<dyn ToolProvider> = Arc::new(ExplorerToolProvider::new());
             let shell = build_shell_provider(sandbox_profile);
-            vec![filesystem, doc, shell]
+            vec![filesystem, doc, explorer, shell]
         }
         RegistryProfile::ShellExecution => vec![build_shell_provider(sandbox_profile)],
-        RegistryProfile::ReadOnlyExplore => read_only_base(),
+        RegistryProfile::ReadOnlyExplore => {
+            let mut providers = read_only_base();
+            providers.push(Arc::new(WebToolProvider::new()));
+            providers
+        }
         // `LensToolProvider::new()` ist zustandslos (keine Bau-, Home- oder
         // Indexpfad-Konfiguration nötig): `derive_read_scope` leitet den
         // `ReadScope` beim Aufruf aus dem `ToolExecutionContext` ab, nie aus

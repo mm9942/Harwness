@@ -882,6 +882,7 @@ fn write_discovered_model_file(
         source,
     })?;
     let toml_model = harw_config::ModelToml {
+        stream: None,
         id: model.id.clone(),
         name: None,
         provider: provider_name.to_owned(),
@@ -1238,6 +1239,7 @@ mod tests {
         )
         .map_err(ctx("provider"))?;
         let live = harw_config::ModelToml {
+            stream: None,
             id: "model/with-slash".to_owned(),
             name: None,
             provider: "acme".to_owned(),
@@ -1310,6 +1312,7 @@ mod tests {
         let models_dir = home.join("profiles/default/models");
         std::fs::create_dir_all(&models_dir).map_err(ctx("models dir"))?;
         let old = harw_config::ModelToml {
+            stream: None,
             id: "gone".to_owned(),
             name: None,
             provider: "acme".to_owned(),
@@ -1323,6 +1326,7 @@ mod tests {
             default_reasoning_effort: None,
         };
         let other = harw_config::ModelToml {
+            stream: None,
             provider: "other".to_owned(),
             ..old.clone()
         };
@@ -1418,6 +1422,7 @@ mod tests {
         .map_err(ctx("write provider"))?;
 
         let stale = harw_config::ModelToml {
+            stream: None,
             id: "stale-model".to_owned(),
             name: None,
             provider: "acme".to_owned(),
@@ -1431,6 +1436,7 @@ mod tests {
             default_reasoning_effort: None,
         };
         let default_model = harw_config::ModelToml {
+            stream: None,
             id: "gpt-5.6-terra".to_owned(),
             ..stale.clone()
         };
@@ -1638,6 +1644,7 @@ mod tests {
     /// und den `base_url` benötigen.
     fn test_provider_toml(base_url: &str, models: &[&str]) -> harw_config::ProviderToml {
         harw_config::ProviderToml {
+            stream: None,
             name: "test".to_owned(),
             api: "openai-chat".to_owned(),
             base_url: base_url.to_owned(),
