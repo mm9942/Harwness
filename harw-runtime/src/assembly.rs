@@ -1448,8 +1448,10 @@ impl RuntimeAssemblyBuilder {
         // `NotConfigured`. Ein ungültiger Host-Eintrag deaktiviert nur das
         // Netz (Warnung), nicht die ganze Sitzung.
         if let Ok(home) = harw_home::home_dir()
-            && let Err(error) =
-                harw_registry_defaults::install_web_tools(&config, &harw_home::paths::cache_dir(&home))
+            && let Err(error) = harw_registry_defaults::install_web_tools(
+                &config,
+                &harw_home::paths::cache_dir(&home),
+            )
         {
             tracing::warn!(%error, "runtime.web_tools_not_configured");
         }

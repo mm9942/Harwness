@@ -1240,8 +1240,7 @@ mod tests {
         let linked = freeze("cgroup-linked", "finding-linked", Timestamp::now());
         let target = temp.path().join("outside-active.json");
         std::fs::write(&target, serde_json::to_vec(&linked)?)?;
-        let link_path =
-            store.active_path(&linked.cgroup, &linked.finding, linked.frozen_at)?;
+        let link_path = store.active_path(&linked.cgroup, &linked.finding, linked.frozen_at)?;
         symlink(&target, &link_path)?;
 
         assert!(store.active()?.is_empty());

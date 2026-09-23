@@ -160,7 +160,11 @@ pub struct BrowserRootContributor;
 
 #[cfg(feature = "browser")]
 impl AssemblyContributor for BrowserRootContributor {
-    fn contribute(&self, inputs: &AssemblyInputs<'_>, parts: &mut AssemblyParts) -> RuntimeResult<()> {
+    fn contribute(
+        &self,
+        inputs: &AssemblyInputs<'_>,
+        parts: &mut AssemblyParts,
+    ) -> RuntimeResult<()> {
         if !inputs.config.browser.grants_role("root") {
             return Ok(());
         }

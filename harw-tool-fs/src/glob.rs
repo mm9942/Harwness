@@ -213,8 +213,12 @@ fn glob_blocking(root: &Path, args: &GlobArgs) -> ToolOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{Fixture, SECRET, TestError, TestResult, call as tool_call, ctx, render};
-    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use crate::test_support::{
+        Fixture, SECRET, TestError, TestResult, call as tool_call, ctx, render,
+    };
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_tools::ToolExecutor;
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::fs;
@@ -239,7 +243,10 @@ mod tests {
         let binding = registry
             .resolve(&TenantId::from_str("t"), &WorkspaceId::from_str("w"))
             .map_err(ctx("binding"))?;
-        Ok(SandboxSpec::from_resolved(binding, PermissionSet::from_policy(permissions)))
+        Ok(SandboxSpec::from_resolved(
+            binding,
+            PermissionSet::from_policy(permissions),
+        ))
     }
 
     fn make_ctx(sandbox: SandboxSpec) -> ToolExecutionContext {
@@ -266,7 +273,9 @@ mod tests {
                         .ok_or(TestError::Missing("match"))
                 })
                 .collect(),
-            other => Err(TestError::Unexpected(format!("expected json output, got: {other:?}"))),
+            other => Err(TestError::Unexpected(format!(
+                "expected json output, got: {other:?}"
+            ))),
         }
     }
 
@@ -349,14 +358,20 @@ mod tests {
         let output = fs_glob(&ctx, args).await?;
         match output {
             ToolOutput::Json { content } => {
-                let matches = content["matches"].as_array().ok_or(TestError::Missing("matches"))?;
+                let matches = content["matches"]
+                    .as_array()
+                    .ok_or(TestError::Missing("matches"))?;
                 assert_eq!(matches.len(), 2, "expected result capped at 2");
                 assert!(
                     content["note"].as_str().is_some(),
                     "expected a truncation note"
                 );
             }
-            other => return Err(TestError::Unexpected(format!("expected json output, got: {other:?}"))),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected json output, got: {other:?}"
+                )));
+            }
         }
         Ok(())
     }
@@ -376,7 +391,11 @@ mod tests {
             ToolOutput::Error { message } => {
                 assert!(message.contains("ungültiges Muster"), "got: {message}");
             }
-            other => return Err(TestError::Unexpected(format!("expected error output, got: {other:?}"))),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected error output, got: {other:?}"
+                )));
+            }
         }
         Ok(())
     }
@@ -401,7 +420,11 @@ mod tests {
             ToolOutput::Error { message } => {
                 assert!(message.contains("ReadWorkspace"), "unexpected: {message}");
             }
-            other => return Err(TestError::Unexpected(format!("expected error output, got: {other:?}"))),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected error output, got: {other:?}"
+                )));
+            }
         }
         Ok(())
     }
@@ -420,7 +443,10 @@ mod tests {
         for path in ["link_dir", "loop", "nested/up", "../outside"] {
             let args = glob_args("**/*", Some(path), None);
             let output = fs_glob(&ctx, args).await?;
-            assert!(matches!(output, ToolOutput::Error { .. }), "{path}: {output:?}");
+            assert!(
+                matches!(output, ToolOutput::Error { .. }),
+                "{path}: {output:?}"
+            );
             assert!(!render(&output)?.contains(SECRET));
         }
         Ok(())
@@ -435,7 +461,10 @@ mod tests {
 
         let args = glob_args("src/**/*.rs", Some("src"), None);
         let output = fs_glob(&ctx, args).await?;
-        assert_eq!(extract_matches(output)?, vec!["src/nested/lib.rs".to_owned()]);
+        assert_eq!(
+            extract_matches(output)?,
+            vec!["src/nested/lib.rs".to_owned()]
+        );
         Ok(())
     }
 
@@ -451,12 +480,19 @@ mod tests {
         match output {
             ToolOutput::Json { content } => {
                 assert_eq!(
-                    content["matches"].as_array().ok_or(TestError::Missing("matches"))?.len(),
+                    content["matches"]
+                        .as_array()
+                        .ok_or(TestError::Missing("matches"))?
+                        .len(),
                     HARD_MAX_RESULTS
                 );
                 assert_eq!(content["stopped"], "result_limit");
             }
-            other => return Err(TestError::Unexpected(format!("expected json output, got: {other:?}"))),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected json output, got: {other:?}"
+                )));
+            }
         }
         Ok(())
     }

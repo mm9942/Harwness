@@ -140,7 +140,15 @@ pub const FORBIDDEN: &[ForbiddenEdge] = &[
 pub const PURE_CRATES: &[(&str, &[&str])] = &[(
     "harw-lens-rank",
     &[
-        "jiff", "time", "chrono", "rand", "getrandom", "tokio", "reqwest", "fs4", "tempfile",
+        "jiff",
+        "time",
+        "chrono",
+        "rand",
+        "getrandom",
+        "tokio",
+        "reqwest",
+        "fs4",
+        "tempfile",
         "std-fs",
     ],
 )];
@@ -184,10 +192,7 @@ pub fn evaluate(graph: &WorkspaceGraph) -> GateReport {
             checked += 1;
             for edge in FORBIDDEN {
                 if edge.from.matches(&node.name) && edge.to.matches(dep) && node.name != *dep {
-                    violations.push(format!(
-                        "{} → {} verletzt: {}",
-                        node.name, dep, edge.rule
-                    ));
+                    violations.push(format!("{} → {} verletzt: {}", node.name, dep, edge.rule));
                 }
             }
         }
@@ -305,7 +310,11 @@ mod tests {
         // eine Zugriffsschicht — genau der Fall, den eine Präfixregel falsch
         // erwischt hätte.
         let g = graph(vec![
-            node("harw-dod-thermal", &["harw-dod-readfs", "harw-dod-cap"], &[]),
+            node(
+                "harw-dod-thermal",
+                &["harw-dod-readfs", "harw-dod-cap"],
+                &[],
+            ),
             node("harw-dod-readfs", &[], &[]),
             node("harw-dod-cap", &[], &[]),
         ]);

@@ -7029,8 +7029,8 @@ fn handle_explorer_key(app: &mut ChatApp, key: KeyEvent) -> bool {
         }
         ExplorerAction::Redraw | ExplorerAction::Rebuild => true,
         ExplorerAction::InsertPath(path) => {
-            let needs_space = !app.input.is_empty()
-                && !app.input.text().ends_with(char::is_whitespace);
+            let needs_space =
+                !app.input.is_empty() && !app.input.text().ends_with(char::is_whitespace);
             if needs_space {
                 app.input.insert_str(" ");
             }
@@ -7171,7 +7171,9 @@ fn render_viewport(
     if let Some(explorer_area) = pane_areas.explorer {
         render_explorer_panel(app, explorer_area, frame.buffer_mut(), theme);
     }
-    let history_area = pane_areas.chat.unwrap_or(Rect::new(chunks[0].x, chunks[0].y, 0, 0));
+    let history_area = pane_areas
+        .chat
+        .unwrap_or(Rect::new(chunks[0].x, chunks[0].y, 0, 0));
     let permission = match app.current_permission_stage() {
         PermissionCycleStage::Ask => "Ask",
         PermissionCycleStage::Auto => "Auto",
@@ -7326,7 +7328,10 @@ fn render_viewport(
     // Transient: live gestreamtes Reasoning/Text der laufenden Runde.
     if !app.live_reasoning.is_empty() {
         all_lines.push(Line::styled(
-            format!("  ∴ {}", crate::sanitize::sanitize_inline(&app.live_reasoning)),
+            format!(
+                "  ∴ {}",
+                crate::sanitize::sanitize_inline(&app.live_reasoning)
+            ),
             style::dim_style(theme),
         ));
     }

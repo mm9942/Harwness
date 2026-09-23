@@ -180,7 +180,10 @@ mod tests {
     #[test]
     fn test_static_uid_tier_map_resolves_listed_uid() {
         let authz = StaticUidTierMap::new(vec![(1000, PermissionTier::Maintainer)]);
-        assert_eq!(authz.tier_for(&peer(1000)), Some(PermissionTier::Maintainer));
+        assert_eq!(
+            authz.tier_for(&peer(1000)),
+            Some(PermissionTier::Maintainer)
+        );
     }
 
     #[test]
@@ -191,8 +194,10 @@ mod tests {
 
     #[test]
     fn test_static_uid_tier_map_unknown_uid_with_default_falls_back() {
-        let authz =
-            StaticUidTierMap::with_default(vec![(1000, PermissionTier::Owner)], PermissionTier::Observer);
+        let authz = StaticUidTierMap::with_default(
+            vec![(1000, PermissionTier::Owner)],
+            PermissionTier::Observer,
+        );
         assert_eq!(authz.tier_for(&peer(9999)), Some(PermissionTier::Observer));
         assert_eq!(authz.tier_for(&peer(1000)), Some(PermissionTier::Owner));
     }
@@ -208,32 +213,50 @@ mod tests {
 
     #[test]
     fn test_tier_permits_observer_caller_allowed_for_observer_route() {
-        assert!(tier_permits(PermissionTier::Observer, PermissionTier::Observer));
+        assert!(tier_permits(
+            PermissionTier::Observer,
+            PermissionTier::Observer
+        ));
     }
 
     #[test]
     fn test_tier_permits_observer_caller_denied_for_operator_route() {
-        assert!(!tier_permits(PermissionTier::Observer, PermissionTier::Operator));
+        assert!(!tier_permits(
+            PermissionTier::Observer,
+            PermissionTier::Operator
+        ));
     }
 
     #[test]
     fn test_tier_permits_operator_caller_allowed_for_operator_route() {
-        assert!(tier_permits(PermissionTier::Operator, PermissionTier::Operator));
+        assert!(tier_permits(
+            PermissionTier::Operator,
+            PermissionTier::Operator
+        ));
     }
 
     #[test]
     fn test_tier_permits_operator_caller_denied_for_maintainer_route() {
-        assert!(!tier_permits(PermissionTier::Operator, PermissionTier::Maintainer));
+        assert!(!tier_permits(
+            PermissionTier::Operator,
+            PermissionTier::Maintainer
+        ));
     }
 
     #[test]
     fn test_tier_permits_maintainer_caller_allowed_for_maintainer_route() {
-        assert!(tier_permits(PermissionTier::Maintainer, PermissionTier::Maintainer));
+        assert!(tier_permits(
+            PermissionTier::Maintainer,
+            PermissionTier::Maintainer
+        ));
     }
 
     #[test]
     fn test_tier_permits_maintainer_caller_denied_for_owner_route() {
-        assert!(!tier_permits(PermissionTier::Maintainer, PermissionTier::Owner));
+        assert!(!tier_permits(
+            PermissionTier::Maintainer,
+            PermissionTier::Owner
+        ));
     }
 
     #[test]
@@ -245,6 +268,9 @@ mod tests {
     fn test_tier_permits_owner_caller_allowed_for_observer_route_too() {
         // Owner ist die höchste Stufe; sie darf jede niedrigere Route erreichen —
         // das ist kein abgelehnter Fall, sondern belegt die Totalordnung nach oben.
-        assert!(tier_permits(PermissionTier::Owner, PermissionTier::Observer));
+        assert!(tier_permits(
+            PermissionTier::Owner,
+            PermissionTier::Observer
+        ));
     }
 }

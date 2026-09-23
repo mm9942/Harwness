@@ -63,11 +63,11 @@ use harw_project_discovery::{
 };
 use harw_sandbox::{HostPermitSessionRegistry, ProcessPermitLedger, SandboxProfile};
 use harw_tool_deps::DepsToolProvider;
-use harw_tool_explorer::ExplorerToolProvider;
-use harw_tool_process::ProcessToolProvider;
 use harw_tool_doc::DocToolProvider;
+use harw_tool_explorer::ExplorerToolProvider;
 use harw_tool_fs::FsToolProvider;
 use harw_tool_lens::LensToolProvider;
+use harw_tool_process::ProcessToolProvider;
 use harw_tool_shell::{HostPermitPromptSender, HostPermitVariant, ShellToolProvider};
 use harw_tool_web::WebToolProvider;
 

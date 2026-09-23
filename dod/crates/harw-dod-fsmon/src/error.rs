@@ -153,7 +153,10 @@ mod tests {
         let err = FsMonError::Io(source);
         let message = err.to_string();
         assert!(message.starts_with("fanotify read failed: "));
-        assert!(!message.contains('/'), "generische OS-Meldung darf keinen Pfad enthalten: {message}");
+        assert!(
+            !message.contains('/'),
+            "generische OS-Meldung darf keinen Pfad enthalten: {message}"
+        );
     }
 
     #[test]

@@ -20,8 +20,8 @@
 //! bindet nur die Harness ein.
 
 use harw_dod_cap::Capability;
-use harw_dod_memory::sensor::MAX_CARDINALITY;
 use harw_dod_memory::MemorySensor;
+use harw_dod_memory::sensor::MAX_CARDINALITY;
 
 harw_dod_fixtures::sensor_suite! {
     sensor: MemorySensor,

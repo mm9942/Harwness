@@ -49,7 +49,7 @@ pub trait TelegramOutbound: Send + Sync {
 
     /// Replaces the content of an existing Telegram message.
     fn edit(&self, chat_id: i64, message_id: i64, content: &OutboundContent)
-        -> TransportResult<()>;
+    -> TransportResult<()>;
 }
 
 #[cfg(test)]

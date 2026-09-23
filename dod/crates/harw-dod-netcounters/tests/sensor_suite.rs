@@ -18,8 +18,8 @@
 //! Harness ein.
 
 use harw_dod_cap::Capability;
-use harw_dod_netcounters::sensor::MAX_CARDINALITY;
 use harw_dod_netcounters::NetCountersSensor;
+use harw_dod_netcounters::sensor::MAX_CARDINALITY;
 
 harw_dod_fixtures::sensor_suite! {
     sensor: NetCountersSensor,

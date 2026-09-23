@@ -152,7 +152,11 @@ fn connect_blocking(specs: Vec<McpServerSpec>) -> Option<Arc<McpToolProvider>> {
 pub struct McpContributor;
 
 impl AssemblyContributor for McpContributor {
-    fn contribute(&self, inputs: &AssemblyInputs<'_>, parts: &mut AssemblyParts) -> RuntimeResult<()> {
+    fn contribute(
+        &self,
+        inputs: &AssemblyInputs<'_>,
+        parts: &mut AssemblyParts,
+    ) -> RuntimeResult<()> {
         let specs = server_specs(inputs.config);
         if specs.is_empty() {
             return Ok(());
@@ -193,9 +197,10 @@ mod tests {
     #[test]
     fn only_enabled_servers_become_specs_with_key_as_fallback_name() {
         let mut config = ResolvedConfig::default();
-        config
-            .mcps
-            .insert("docs".to_owned(), server(McpTransportToml::StreamableHttp, true));
+        config.mcps.insert(
+            "docs".to_owned(),
+            server(McpTransportToml::StreamableHttp, true),
+        );
         config
             .mcps
             .insert("off".to_owned(), server(McpTransportToml::Stdio, false));

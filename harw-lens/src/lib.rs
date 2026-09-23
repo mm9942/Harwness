@@ -367,16 +367,16 @@ pub use harw_lens_types::{
 
 // --- harw-lens-embed: Katalog, Präfixe, Embedder (siehe Begründung oben) ---
 pub use harw_lens_embed::{
-    route, DeterministicEmbedder, DimensionCheckedEmbedder, Embedder, EmbeddingCatalog,
+    DeterministicEmbedder, DimensionCheckedEmbedder, Embedder, EmbeddingCatalog,
     EmbeddingDescriptor, EmbeddingRole, HttpEmbedBackend, ModelEntry, RemoteEmbedder,
-    RuntimeProfile,
+    RuntimeProfile, route,
 };
 
 // --- harw-lens-source: Quellenbindung, Indexaufbau (siehe Begründung oben) ---
 pub use harw_lens_source::{
+    CHUNKER_VERSION, DEFAULT_VISIBILITY, DOCS_DESIGN_INDEX, IndexBuildReport, IndexStatus,
+    KNOWLEDGE_PALACE_INDEX, OPERATOR_ONLY_VISIBILITY, RawDocument, SourceError,
     collect_design_docs, collect_palace_documents, index_status, visibility_of_scope,
-    IndexBuildReport, IndexStatus, RawDocument, SourceError, CHUNKER_VERSION, DEFAULT_VISIBILITY,
-    DOCS_DESIGN_INDEX, KNOWLEDGE_PALACE_INDEX, OPERATOR_ONLY_VISIBILITY,
 };
 
 // --- harw-lens-query: Abfragepfad (siehe Begründung oben) ---

@@ -424,7 +424,8 @@ fn test_settings_permissions_allow_and_deny_parse() -> TestResult {
 
 #[test]
 fn test_models_without_action_parses_for_list() -> TestResult {
-    let cli = Cli::try_parse_from(["harw", "models"]).map_err(ctx("`harw models` sollte parsen"))?;
+    let cli =
+        Cli::try_parse_from(["harw", "models"]).map_err(ctx("`harw models` sollte parsen"))?;
     assert!(matches!(
         cli.command,
         Some(Command::Models { action: None })
@@ -717,8 +718,8 @@ fn test_lens_build_parses_with_source_and_force() -> TestResult {
 
 #[test]
 fn test_lens_build_without_flags_defaults_source_to_none_and_force_to_false() -> TestResult {
-    let cli =
-        Cli::try_parse_from(["harw", "lens", "build"]).map_err(ctx("`harw lens build` muss parsen"))?;
+    let cli = Cli::try_parse_from(["harw", "lens", "build"])
+        .map_err(ctx("`harw lens build` muss parsen"))?;
     let Some(Command::Lens {
         action: Some(LensAction::Build { source, force }),
     }) = cli.command

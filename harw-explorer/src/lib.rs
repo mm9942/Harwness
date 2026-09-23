@@ -28,7 +28,9 @@ pub enum FileKind {
     Dir,
     /// Quelltext; `lang` ist ein kurzer, kleingeschriebener Sprachname
     /// (`rust`, `typescript`, `python`, …).
-    Source { lang: String },
+    Source {
+        lang: String,
+    },
     Markdown,
     Pdf,
     Image,
@@ -218,9 +220,13 @@ pub enum ExplorerError {
 impl fmt::Display for ExplorerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidRoot(path) => write!(f, "explorer root is not a directory: {}", path.display()),
+            Self::InvalidRoot(path) => {
+                write!(f, "explorer root is not a directory: {}", path.display())
+            }
             Self::Io(error) => write!(f, "explorer i/o error: {error}"),
-            Self::OutsideRoot(path) => write!(f, "path is outside the explorer root: {}", path.display()),
+            Self::OutsideRoot(path) => {
+                write!(f, "path is outside the explorer root: {}", path.display())
+            }
         }
     }
 }

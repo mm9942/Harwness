@@ -52,8 +52,8 @@
 use crate::crates_io::WebCratesIoTool;
 use crate::docs_rs::WebDocsRsTool;
 use crate::error::WebToolResult;
-use crate::search::WebSearchTool;
 use crate::fetch::{WebFetchOptions, WebFetchTool, WebFetcher, install_fetcher};
+use crate::search::WebSearchTool;
 use harw_egress::EgressPolicy;
 use std::path::PathBuf;
 use std::sync::Arc;

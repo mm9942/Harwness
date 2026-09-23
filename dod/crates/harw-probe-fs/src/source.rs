@@ -166,7 +166,7 @@ use std::time::Duration;
 use harw_dod_cap::ReadScope;
 use harw_dod_fsmon::{FsEventSource, FsMonError, RawFsEvent};
 use nix::sys::fanotify::{EventFFlags, Fanotify, InitFlags, MarkFlags, MaskFlags};
-use rustix::event::{poll, PollFd, PollFlags, Timespec};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 
 use crate::error::ProbeError;
 
@@ -291,8 +291,8 @@ impl RealFanotifySource {
     ///   scheitert (fehlende Berechtigung, Kernel ohne `CONFIG_FANOTIFY`)
     ///   oder keine der übergebenen Wurzeln markiert werden konnte.
     fn new(scope: &ReadScope) -> Result<Self, ProbeError> {
-        let fanotify =
-            Fanotify::init(init_flags(), event_f_flags()).map_err(|_| ProbeError::FanotifySourceUnavailable)?;
+        let fanotify = Fanotify::init(init_flags(), event_f_flags())
+            .map_err(|_| ProbeError::FanotifySourceUnavailable)?;
 
         let source = Self { fanotify };
 
@@ -371,23 +371,34 @@ impl FsEventSource for RealFanotifySource {
             }
 
             let Some(fd) = event.fd() else {
-                tracing::warn!("fanotify event queue overflowed; an unknown number of events was lost");
+                tracing::warn!(
+                    "fanotify event queue overflowed; an unknown number of events was lost"
+                );
                 continue;
             };
 
             let Ok(pid) = u32::try_from(event.pid()) else {
-                tracing::warn!(pid = event.pid(), "fanotify reported a negative pid; dropping the event");
+                tracing::warn!(
+                    pid = event.pid(),
+                    "fanotify reported a negative pid; dropping the event"
+                );
                 continue;
             };
 
             let link_path = proc_self_fd_link_path(fd.as_raw_fd());
             let Ok(target) = std::fs::read_link(&link_path) else {
-                tracing::warn!(pid, "could not resolve the fanotify event's descriptor target; dropping it");
+                tracing::warn!(
+                    pid,
+                    "could not resolve the fanotify event's descriptor target; dropping it"
+                );
                 continue;
             };
 
             let Ok(process_metadata) = std::fs::metadata(proc_pid_dir_path(pid)) else {
-                tracing::warn!(pid, "process exited before its uid could be resolved; dropping the event");
+                tracing::warn!(
+                    pid,
+                    "process exited before its uid could be resolved; dropping the event"
+                );
                 continue;
             };
 

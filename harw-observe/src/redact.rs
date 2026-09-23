@@ -112,9 +112,6 @@ mod tests {
 
     #[test]
     fn test_field_value_u64_redacts_to_shown() {
-        assert_eq!(
-            FieldValue::U64(7).redact(),
-            Redacted::Shown("7".to_owned())
-        );
+        assert_eq!(FieldValue::U64(7).redact(), Redacted::Shown("7".to_owned()));
     }
 }

@@ -405,6 +405,8 @@ pub fn parse_flow_payload(payload: &[u8]) -> Result<FlowEvent, FlowError> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv6Addr};
+
     use super::{ADDR_OFFSET, Direction, PAYLOAD_LEN, Protocol};
     use crate::error::FlowError;
     use crate::event::parse_flow_payload;

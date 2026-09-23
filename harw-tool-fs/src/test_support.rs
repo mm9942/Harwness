@@ -8,7 +8,9 @@
 //! Tests (Bible R087/R165/R182). Jeder Fehlschlag wird als `Err`
 //! zurückgegeben statt zu paniken.
 
-use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+use harw_authority::{
+    Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+};
 use harw_tools::{ToolCall, ToolExecutionContext, ToolName, ToolOutput, ToolsError};
 use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
 use std::fmt;
@@ -159,7 +161,11 @@ impl Fixture {
             .resolve(&TenantId::from_str("t"), &WorkspaceId::from_str("w"))
             .map_err(ctx("binding"))?;
         let sandbox = SandboxSpec::from_resolved(binding, PermissionSet::from_policy(permissions));
-        Ok(ToolExecutionContext::new(SessionId::new(), TurnId::new(), sandbox))
+        Ok(ToolExecutionContext::new(
+            SessionId::new(),
+            TurnId::new(),
+            sandbox,
+        ))
     }
 }
 

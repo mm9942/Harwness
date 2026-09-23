@@ -47,7 +47,11 @@ fn main() -> ExitCode {
         }
     };
     let report: RelayReporter = Arc::new(|err: &RelayError| eprintln!("harw-netns-relay: {err}"));
-    let RelayConfig { proxy_socket, command, .. } = config;
+    let RelayConfig {
+        proxy_socket,
+        command,
+        ..
+    } = config;
 
     let Some(command) = command else {
         // `run_relay` ist als `-> Infallible` deklariert (endlose Schleife,
@@ -57,12 +61,24 @@ fn main() -> ExitCode {
         // unreachable, weil `Infallible` keine Werte hat — kein echter Bug,
         // Verhalten bleibt unverändert.
         #[allow(unreachable_code)]
-        match run_relay(listener, &proxy_socket, DEFAULT_RELAY_MAX_CONNECTIONS, report) {}
+        match run_relay(
+            listener,
+            &proxy_socket,
+            DEFAULT_RELAY_MAX_CONNECTIONS,
+            report,
+        ) {}
     };
 
-    let forwarder = thread::Builder::new().name("harw-relay-accept".to_owned()).spawn(move || {
-        run_relay(listener, &proxy_socket, DEFAULT_RELAY_MAX_CONNECTIONS, report)
-    });
+    let forwarder = thread::Builder::new()
+        .name("harw-relay-accept".to_owned())
+        .spawn(move || {
+            run_relay(
+                listener,
+                &proxy_socket,
+                DEFAULT_RELAY_MAX_CONNECTIONS,
+                report,
+            )
+        });
     if let Err(source) = forwarder {
         eprintln!("harw-netns-relay: {}", RelayError::Thread { source });
         return ExitCode::from(EXIT_CHILD_FAILED);

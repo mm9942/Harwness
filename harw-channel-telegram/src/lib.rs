@@ -14,8 +14,8 @@ mod telegram;
 mod work_request;
 
 pub use approval_tokens::{
-    ApprovalCallbackContext, ApprovalTokenStore, PendingApproval, TelegramChatId, TelegramMessageId,
-    TelegramThreadId,
+    ApprovalCallbackContext, ApprovalTokenStore, PendingApproval, TelegramChatId,
+    TelegramMessageId, TelegramThreadId,
 };
 pub use config::{DEFAULT_MAX_UPDATES_PER_PEER_PER_MIN, TelegramChannelConfig, TopicMode};
 pub use error::{TelegramChannelError, TelegramChannelResult};
@@ -23,8 +23,7 @@ pub use sandbox::TelegramSandbox;
 pub use telegram::{PairingNotice, PairingOutcome, TelegramChannel, ThrottleNotice};
 pub use work_request::{
     ApprovedWorkRequest, LaunchReceipt, TELEGRAM_WORK_REQUEST_JOB_KIND, WorkLaunchError,
-    WorkLauncher, WorkRequestRecord, WorkRequestState, WorkRequestStore,
-    launch_sandboxed_worker,
+    WorkLauncher, WorkRequestRecord, WorkRequestState, WorkRequestStore, launch_sandboxed_worker,
 };
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.

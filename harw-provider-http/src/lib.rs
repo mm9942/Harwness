@@ -1715,7 +1715,8 @@ impl OpenAiResponsesProvider {
                 }
             }
         }
-        http_provider.stream_policy = sse::StreamPolicy::from_config(provider_name, provider, config);
+        http_provider.stream_policy =
+            sse::StreamPolicy::from_config(provider_name, provider, config);
         http_provider.rate_limiter = std::sync::Arc::new(rate_limiter::ProviderRateLimiter::new(
             provider.rate_limit.clone(),
         ));

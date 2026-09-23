@@ -43,7 +43,11 @@ mod tests {
         let caller = std::thread::current().id();
         let output = run_blocking("fs.test", move || {
             let worker = std::thread::current().id();
-            Ok(ToolOutput::text(if worker == caller { "gleich" } else { "anders" }))
+            Ok(ToolOutput::text(if worker == caller {
+                "gleich"
+            } else {
+                "anders"
+            }))
         })
         .await?;
         match output {

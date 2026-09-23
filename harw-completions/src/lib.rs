@@ -27,13 +27,15 @@
 //! assert!(!script.is_empty());
 //! ```
 
+#[cfg(feature = "clap-args")]
+pub mod args;
 pub mod error;
 pub mod install;
 pub mod locations;
 pub mod shell;
-#[cfg(feature = "clap-args")]
-pub mod args;
 
+#[cfg(feature = "clap-args")]
+pub use args::{CompletionsArgs, CompletionsSubcommand, run_completions};
 pub use clap_complete::Shell;
 pub use error::{CompletionError, CompletionResult};
 pub use install::{InstallOptions, InstallReport, SkippedPath, install, uninstall};
@@ -42,5 +44,3 @@ pub use shell::{
     MANAGED_MARKER_PREFIX, block_begin, block_end, detect_shell, generate_script,
     has_clap_signature, is_managed_script, is_ours, marker_line,
 };
-#[cfg(feature = "clap-args")]
-pub use args::{CompletionsArgs, CompletionsSubcommand, run_completions};

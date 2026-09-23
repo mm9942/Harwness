@@ -165,9 +165,7 @@ impl SensorError {
     #[must_use]
     pub const fn permanence(&self) -> Permanence {
         match self {
-            Self::OutsideScope | Self::SourceUnavailable | Self::ToolFault => {
-                Permanence::Permanent
-            }
+            Self::OutsideScope | Self::SourceUnavailable | Self::ToolFault => Permanence::Permanent,
             Self::MalformedSource | Self::Io(_) => Permanence::Transient,
         }
     }
@@ -179,17 +177,26 @@ mod tests {
 
     #[test]
     fn test_permanence_outside_scope_is_permanent() {
-        assert_eq!(SensorError::OutsideScope.permanence(), Permanence::Permanent);
+        assert_eq!(
+            SensorError::OutsideScope.permanence(),
+            Permanence::Permanent
+        );
     }
 
     #[test]
     fn test_permanence_source_unavailable_is_permanent() {
-        assert_eq!(SensorError::SourceUnavailable.permanence(), Permanence::Permanent);
+        assert_eq!(
+            SensorError::SourceUnavailable.permanence(),
+            Permanence::Permanent
+        );
     }
 
     #[test]
     fn test_permanence_malformed_source_is_transient() {
-        assert_eq!(SensorError::MalformedSource.permanence(), Permanence::Transient);
+        assert_eq!(
+            SensorError::MalformedSource.permanence(),
+            Permanence::Transient
+        );
     }
 
     #[test]

@@ -313,6 +313,7 @@ pub fn release_command_args(target: &NftCgroupTarget) -> Vec<String> {
 ///
 /// # Returns
 /// `add table inet harw_warden ; delete table inet harw_warden`.
+#[cfg(test)]
 #[must_use]
 pub fn release_all_command_args() -> Vec<String> {
     let mut args = Vec::new();
@@ -431,6 +432,7 @@ impl NftNetworkIsolator {
     ///
     /// # Returns
     /// Den geänderten Isolator.
+    #[cfg(test)]
     #[must_use]
     pub fn with_nft_binary(mut self, nft_binary: impl Into<PathBuf>) -> Self {
         self.nft_binary = nft_binary.into();
@@ -441,6 +443,7 @@ impl NftNetworkIsolator {
     ///
     /// # Returns
     /// Den Pfad.
+    #[cfg(test)]
     #[must_use]
     pub fn nft_binary(&self) -> &Path {
         &self.nft_binary
@@ -489,6 +492,7 @@ impl NftNetworkIsolator {
     /// # Errors
     /// [`WardenError::Io`]: `nft` fehlt, Rechte fehlen, Nicht-Linux oder
     /// ein sonstiger `nft`-Fehlschlag.
+    #[cfg(test)]
     pub fn release_all(&self) -> WardenResult<()> {
         self.run(&release_all_command_args()).inspect_err(|err| {
             tracing::error!(error = %err, "network release of all cgroups failed");
@@ -588,8 +592,8 @@ impl NetworkIsolator for NftNetworkIsolator {
 #[cfg(test)]
 mod tests {
     use super::{
-        NftCgroupTarget, NftNetworkIsolator, classify_nft_failure,
-        isolate_command_args, release_all_command_args, release_command_args,
+        NftCgroupTarget, NftNetworkIsolator, classify_nft_failure, isolate_command_args,
+        release_all_command_args, release_command_args,
     };
     use crate::test_support::{TestError, TestResult, ctx};
     use harw_dod_warden::{NetworkIsolator, WardenError};

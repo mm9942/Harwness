@@ -4380,7 +4380,9 @@ impl ManagedAgentSpawner {
             // begrenzt zusätzlich die kumulierte Input-Nutzung langer
             // Sessions (Standard: 500 000).
             let window = self.context_window_for(
-                child_session.active_model().map(harw_types::ModelId::as_str),
+                child_session
+                    .active_model()
+                    .map(harw_types::ModelId::as_str),
             );
             let history_budget = usize::try_from(window.saturating_mul(3)).unwrap_or(usize::MAX);
             let budget = child_session.context_budget();

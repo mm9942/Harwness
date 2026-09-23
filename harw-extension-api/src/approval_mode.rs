@@ -219,7 +219,9 @@ impl ApprovalModeCell {
 
 impl std::fmt::Debug for ApprovalModeCell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ApprovalModeCell").field("mode", &self.get()).finish()
+        f.debug_struct("ApprovalModeCell")
+            .field("mode", &self.get())
+            .finish()
     }
 }
 

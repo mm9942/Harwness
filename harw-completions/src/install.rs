@@ -123,8 +123,16 @@ impl InstallReport {
 impl fmt::Display for InstallReport {
     /// Renders one item per line; verbs get a "would " prefix in dry-run mode.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let action = if self.uninstall { "uninstall" } else { "install" };
-        write!(f, "harw completions {action} for {} ({})", self.shell, self.bin)?;
+        let action = if self.uninstall {
+            "uninstall"
+        } else {
+            "install"
+        };
+        write!(
+            f,
+            "harw completions {action} for {} ({})",
+            self.shell, self.bin
+        )?;
         if self.dry_run {
             f.write_str(" [dry run]")?;
         }
@@ -243,7 +251,13 @@ pub fn install(
     }
     report.written = Some(canonical);
 
-    update_rc_files(&rc_cleanup, bin, rc_block.as_ref(), opts.dry_run, &mut report)?;
+    update_rc_files(
+        &rc_cleanup,
+        bin,
+        rc_block.as_ref(),
+        opts.dry_run,
+        &mut report,
+    )?;
     purge_caches(&cache_dirs, bin, opts.dry_run, &mut report)?;
     report.next_step = Some(next_step(&reload_hint));
 
@@ -614,7 +628,10 @@ fn purge_caches(
 
 // Byte-substring search.
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 // Resolves a symlinked target so the link itself (e.g. a dotfile-manager rc link) survives the rename.
@@ -666,7 +683,8 @@ fn write_and_swap(temp: &Path, target: &Path, bytes: &[u8]) -> CompletionResult<
     fs::write(temp, bytes).map_err(io_err("write", temp))?;
     match fs::metadata(target) {
         Ok(meta) => {
-            fs::set_permissions(temp, meta.permissions()).map_err(io_err("set permissions on", temp))?;
+            fs::set_permissions(temp, meta.permissions())
+                .map_err(io_err("set permissions on", temp))?;
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(io_err("inspect", target)(err)),

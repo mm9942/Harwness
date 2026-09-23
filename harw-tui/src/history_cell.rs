@@ -345,7 +345,11 @@ fn wrap_styled(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
         for ch in span.content.chars() {
             let ws = ch == ' ';
             if current_ws.is_some_and(|prev| prev != ws) {
-                tokens.push((std::mem::take(&mut current), span.style, current_ws == Some(true)));
+                tokens.push((
+                    std::mem::take(&mut current),
+                    span.style,
+                    current_ws == Some(true),
+                ));
             }
             current.push(ch);
             current_ws = Some(ws);

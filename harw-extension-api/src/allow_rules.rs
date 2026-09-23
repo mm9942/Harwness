@@ -190,7 +190,11 @@ impl AllowRuleSet {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if index < guard.len() { Some(guard.remove(index)) } else { None }
+        if index < guard.len() {
+            Some(guard.remove(index))
+        } else {
+            None
+        }
     }
 
     /// Liefert eine Kopie aller aktuell gespeicherten Regeln.
@@ -269,13 +273,19 @@ impl AllowRuleSet {
             }
         }
 
-        if any_allow { Some(RuleDecision::Allow) } else { None }
+        if any_allow {
+            Some(RuleDecision::Allow)
+        } else {
+            None
+        }
     }
 }
 
 impl std::fmt::Debug for AllowRuleSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AllowRuleSet").field("rules", &self.snapshot()).finish()
+        f.debug_struct("AllowRuleSet")
+            .field("rules", &self.snapshot())
+            .finish()
     }
 }
 
@@ -337,7 +347,10 @@ const DANGEROUS_SHELL_MARKERS: [&str; 9] = [";", "&&", "||", "|", "`", "$(", ">"
 /// Prüft, ob ein Befehl eines der gefährlichen Shell-Metazeichen enthält,
 /// oder ein Token token-endständig mit `&` abschließt (Hintergrundjob).
 fn has_dangerous_shell_chars(command: &str) -> bool {
-    if DANGEROUS_SHELL_MARKERS.iter().any(|marker| command.contains(marker)) {
+    if DANGEROUS_SHELL_MARKERS
+        .iter()
+        .any(|marker| command.contains(marker))
+    {
         return true;
     }
     command.split_whitespace().any(|token| token.ends_with('&'))
@@ -375,7 +388,11 @@ fn shell_pattern_matches(pattern: &str, command: &str, decision: RuleDecision) -
         return false;
     }
 
-    let segment = if dangerous { first_safe_segment(command) } else { command };
+    let segment = if dangerous {
+        first_safe_segment(command)
+    } else {
+        command
+    };
 
     let mut pattern_tokens: Vec<&str> = pattern.split_whitespace().collect();
     if pattern_tokens.last() == Some(&"*") {
@@ -506,7 +523,12 @@ mod tests {
     };
     use serde_json::json;
 
-    fn rule(tool: &str, pattern: Option<&str>, decision: RuleDecision, scope: RuleScope) -> ApprovalRule {
+    fn rule(
+        tool: &str,
+        pattern: Option<&str>,
+        decision: RuleDecision,
+        scope: RuleScope,
+    ) -> ApprovalRule {
         ApprovalRule {
             tool: tool.to_owned(),
             pattern: pattern.map(str::to_owned),
@@ -527,7 +549,10 @@ mod tests {
 
         let result = rules.evaluate("shell.exec", &json!({"command": "git status; rm -rf /"}));
 
-        assert_eq!(result, None, "a dangerous compound command must never be allowed by a prefix rule");
+        assert_eq!(
+            result, None,
+            "a dangerous compound command must never be allowed by a prefix rule"
+        );
     }
 
     #[test]
@@ -574,9 +599,15 @@ mod tests {
 
     #[test]
     fn test_glob_double_star_matches_across_segments() {
-        assert!(glob_match_path("/home/user/**/*.rs", "/home/user/a/b/c/main.rs"));
+        assert!(glob_match_path(
+            "/home/user/**/*.rs",
+            "/home/user/a/b/c/main.rs"
+        ));
         assert!(glob_match_path("/home/user/**/*.rs", "/home/user/main.rs"));
-        assert!(!glob_match_path("/home/user/**/*.rs", "/home/user/main.txt"));
+        assert!(!glob_match_path(
+            "/home/user/**/*.rs",
+            "/home/user/main.txt"
+        ));
     }
 
     #[test]
@@ -621,7 +652,12 @@ mod tests {
     #[test]
     fn test_evaluate_poisoned_lock_returns_deny() {
         let rules = AllowRuleSet::new();
-        rules.add(rule("shell.exec", None, RuleDecision::Allow, RuleScope::Session));
+        rules.add(rule(
+            "shell.exec",
+            None,
+            RuleDecision::Allow,
+            RuleScope::Session,
+        ));
 
         let poison_rules = rules.clone();
         let handle = std::thread::spawn(move || {
@@ -640,8 +676,18 @@ mod tests {
     #[test]
     fn test_add_dedupes_identical_rules() {
         let rules = AllowRuleSet::new();
-        let a = rule("shell.exec", Some("git status"), RuleDecision::Allow, RuleScope::Session);
-        let b = rule("shell.exec", Some("git status"), RuleDecision::Allow, RuleScope::Session);
+        let a = rule(
+            "shell.exec",
+            Some("git status"),
+            RuleDecision::Allow,
+            RuleScope::Session,
+        );
+        let b = rule(
+            "shell.exec",
+            Some("git status"),
+            RuleDecision::Allow,
+            RuleScope::Session,
+        );
 
         assert!(rules.add(a));
         assert!(!rules.add(b));
@@ -660,7 +706,12 @@ mod tests {
 
     #[test]
     fn test_from_rules_seeds_initial_state() {
-        let seed = vec![rule("shell.exec", None, RuleDecision::Allow, RuleScope::Global)];
+        let seed = vec![rule(
+            "shell.exec",
+            None,
+            RuleDecision::Allow,
+            RuleScope::Global,
+        )];
         let rules = AllowRuleSet::from_rules(seed.clone());
         assert_eq!(rules.snapshot(), seed);
     }
@@ -668,16 +719,32 @@ mod tests {
     #[test]
     fn test_other_tool_only_matches_pattern_none_rules() {
         let rules = AllowRuleSet::new();
-        rules.add(rule("agent.spawn", Some("anything"), RuleDecision::Allow, RuleScope::Session));
-        rules.add(rule("agent.stop", None, RuleDecision::Allow, RuleScope::Session));
+        rules.add(rule(
+            "agent.spawn",
+            Some("anything"),
+            RuleDecision::Allow,
+            RuleScope::Session,
+        ));
+        rules.add(rule(
+            "agent.stop",
+            None,
+            RuleDecision::Allow,
+            RuleScope::Session,
+        ));
 
         assert_eq!(rules.evaluate("agent.spawn", &json!({})), None);
-        assert_eq!(rules.evaluate("agent.stop", &json!({})), Some(RuleDecision::Allow));
+        assert_eq!(
+            rules.evaluate("agent.stop", &json!({})),
+            Some(RuleDecision::Allow)
+        );
     }
 
     #[test]
     fn test_derive_shell_rule_two_tokens_when_second_is_not_a_flag() {
-        assert_eq!(derive_shell_rule("git status --short"), Some("git status".to_owned()));
+        assert_eq!(
+            derive_shell_rule("git status --short"),
+            Some("git status".to_owned())
+        );
     }
 
     #[test]

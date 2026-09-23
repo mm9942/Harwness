@@ -52,7 +52,10 @@ impl AgentPhase {
     }
 
     fn is_active(self) -> bool {
-        matches!(self, Self::Admitted | Self::Thinking | Self::Tool | Self::Waiting)
+        matches!(
+            self,
+            Self::Admitted | Self::Thinking | Self::Tool | Self::Waiting
+        )
     }
 }
 
@@ -502,7 +505,10 @@ pub(crate) fn render_agents_panel(
         } else if let Some(task) = &live.task
             && live.phase.is_active()
         {
-            let task: String = sanitize_inline(task).chars().take(inner_width.max(8)).collect();
+            let task: String = sanitize_inline(task)
+                .chars()
+                .take(inner_width.max(8))
+                .collect();
             lines.push(Line::styled(
                 format!("{indent}    „{task}“"),
                 style::dim_style(theme),
@@ -524,7 +530,8 @@ pub(crate) fn render_agents_panel(
             ));
         }
     }
-    if focused && let Some(live) = monitor.selected_agent()
+    if focused
+        && let Some(live) = monitor.selected_agent()
         && !live.preview.is_empty()
     {
         lines.push(Line::raw(""));
@@ -547,7 +554,12 @@ mod tests {
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-    fn ev(agent: &str, parent: Option<&str>, role: &str, turn: TurnEvent) -> TestResult<AgentEvent> {
+    fn ev(
+        agent: &str,
+        parent: Option<&str>,
+        role: &str,
+        turn: TurnEvent,
+    ) -> TestResult<AgentEvent> {
         Ok(AgentEvent {
             agent: SessionId::try_from_str(agent)?,
             parent: parent.map(SessionId::try_from_str).transpose()?,
@@ -605,7 +617,10 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].1.id, "root");
         assert_eq!(rows[1].0, 1, "child is nested under root");
-        assert_eq!(monitor.agent("child").map(|a| a.phase), Some(AgentPhase::Done));
+        assert_eq!(
+            monitor.agent("child").map(|a| a.phase),
+            Some(AgentPhase::Done)
+        );
         Ok(())
     }
 

@@ -355,7 +355,8 @@ impl AnthropicStreamAccumulator {
         }
         let blocks = self.blocks.into_iter().filter(|b| !b.is_null()).collect();
         self.message.insert("content".into(), Value::Array(blocks));
-        self.message.insert("usage".into(), Value::Object(self.usage));
+        self.message
+            .insert("usage".into(), Value::Object(self.usage));
         if !self.done && !self.message.contains_key("stop_reason") {
             self.message
                 .insert("stop_reason".into(), Value::String("max_tokens".into()));
@@ -425,7 +426,9 @@ impl ChatStreamAccumulator {
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown stream error");
-            return Err(ModelError::RequestFailed(format!("stream error: {message}")));
+            return Err(ModelError::RequestFailed(format!(
+                "stream error: {message}"
+            )));
         }
         if self.id.is_none() {
             self.id = chunk.get("id").cloned();
@@ -488,9 +491,7 @@ impl ChatStreamAccumulator {
                     entry.insert("id".into(), Value::String(id.to_owned()));
                 }
                 let function = call.get("function");
-                let name = function
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str);
+                let name = function.and_then(|f| f.get("name")).and_then(Value::as_str);
                 let args = function
                     .and_then(|f| f.get("arguments"))
                     .and_then(Value::as_str)
@@ -546,9 +547,8 @@ impl ChatStreamAccumulator {
         choice.insert("message".into(), Value::Object(message));
         choice.insert(
             "finish_reason".into(),
-            self.finish_reason.unwrap_or_else(|| {
-                Value::String(if self.done { "stop" } else { "length" }.into())
-            }),
+            self.finish_reason
+                .unwrap_or_else(|| Value::String(if self.done { "stop" } else { "length" }.into())),
         );
         let mut body = Map::new();
         body.insert("object".into(), Value::String("chat.completion".into()));
@@ -592,9 +592,7 @@ pub(crate) fn responses_event(
                 emit(sink, ModelStreamEvent::TextDelta(text.to_owned()));
             }
         }
-        Some(
-            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta",
-        ) => {
+        Some("response.reasoning_summary_text.delta" | "response.reasoning_text.delta") => {
             if let Some(text) = event.get("delta").and_then(Value::as_str) {
                 emit(sink, ModelStreamEvent::ReasoningDelta(text.to_owned()));
             }
@@ -609,7 +607,10 @@ pub(crate) fn responses_event(
                 sink,
                 ModelStreamEvent::ToolCallDelta {
                     index,
-                    id: event.get("item_id").and_then(Value::as_str).map(str::to_owned),
+                    id: event
+                        .get("item_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
                     name: None,
                     arguments_fragment: event
                         .get("delta")
@@ -644,7 +645,9 @@ pub(crate) fn responses_event(
                 .or_else(|| event.get("message"))
                 .and_then(Value::as_str)
                 .unwrap_or("response failed");
-            return Err(ModelError::RequestFailed(format!("stream error: {message}")));
+            return Err(ModelError::RequestFailed(format!(
+                "stream error: {message}"
+            )));
         }
         _ => {}
     }
@@ -748,8 +751,8 @@ mod tests {
             crate::anthropic::extract_anthropic_text(&body).as_deref(),
             Some("Hallo")
         );
-        let calls = crate::anthropic::extract_anthropic_tool_calls(&body)
-            .map_err(|_| "tool calls")?;
+        let calls =
+            crate::anthropic::extract_anthropic_tool_calls(&body).map_err(|_| "tool calls")?;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].arguments, serde_json::json!({"path": "a.rs"}));
         let usage = crate::anthropic::extract_anthropic_usage(&body);

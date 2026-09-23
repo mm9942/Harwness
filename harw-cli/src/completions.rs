@@ -41,7 +41,8 @@ pub fn run(command: CompletionsCommand) -> Result<(), String> {
         let mut out = stdout.lock();
         run_completions(&mut Cli::command(), BIN_NAME, &command.args, &env, &mut out)
             .map_err(|error| error.to_string())?;
-        out.flush().map_err(|error| format!("write '<stdout>' failed: {error}"))?;
+        out.flush()
+            .map_err(|error| format!("write '<stdout>' failed: {error}"))?;
     }
 
     if !command.all_binaries {
@@ -89,7 +90,10 @@ pub fn run(command: CompletionsCommand) -> Result<(), String> {
             }
             Err(error) => {
                 tracing::warn!(binary = name, %error, "cannot start DoD binary");
-                failures.push(format!("{name}: cannot run '{}': {error}", binary.display()));
+                failures.push(format!(
+                    "{name}: cannot run '{}': {error}",
+                    binary.display()
+                ));
             }
         }
     }

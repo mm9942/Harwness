@@ -31,7 +31,7 @@
 use std::path::Path;
 
 use harw_lens_embed::{Embedder, EmbeddingDescriptor};
-use harw_lens_source::{build_index, IndexBuildReport, RawDocument};
+use harw_lens_source::{IndexBuildReport, RawDocument, build_index};
 use harw_lens_types::{Locality, Metric};
 
 use crate::LensResult;

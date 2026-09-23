@@ -313,7 +313,9 @@
 //! `harw-dod-fsmon`, `harw-dod-bpf`, `harw-dod-procmon`, `harw-dod-flow`.
 
 // --- harw-dod-cap: Zugriffsvokabular (siehe Begründung oben) ---
-pub use harw_dod_cap::{Bound, Capability, CapabilityClass, Permanence, ReadScope, SensorError, SensorHandle, Unbound};
+pub use harw_dod_cap::{
+    Bound, Capability, CapabilityClass, Permanence, ReadScope, SensorError, SensorHandle, Unbound,
+};
 
 // --- harw-dod-signals: Datenvokabular (siehe Begründung oben) ---
 pub use harw_dod_signals::{
@@ -323,8 +325,8 @@ pub use harw_dod_signals::{
 
 // --- harw-dod-sentinel: der Aggregator (siehe Begründung oben) ---
 pub use harw_dod_sentinel::{
-    DegradeReason, EvidenceBuffer, RetryPolicy, Sentinel, SentinelConfig, SentinelError,
-    SentinelResult, SensorHealth,
+    DegradeReason, EvidenceBuffer, RetryPolicy, SensorHealth, Sentinel, SentinelConfig,
+    SentinelError, SentinelResult,
 };
 
 // --- harw-dod-rules: "bewerte einen Befund" (siehe Begründung oben) ---
@@ -371,7 +373,9 @@ pub use harw_dod_bpf::{
 
 /// Bpf-Fähigkeit: Prozessausführung.
 #[cfg(feature = "privileged")]
-pub use harw_dod_procmon::{DEFAULT_READ_TIMEOUT, ExecEvent, ProcmonError, ProcmonResult, ProcmonSensor, parse_exec_payload};
+pub use harw_dod_procmon::{
+    DEFAULT_READ_TIMEOUT, ExecEvent, ProcmonError, ProcmonResult, ProcmonSensor, parse_exec_payload,
+};
 
 /// Bpf-Fähigkeit: Egress-Fluss. `observe`/`to_security_event` verlangen ein
 /// `&harw_authority::NetworkScope` — diese Fassade re-exportiert
@@ -379,7 +383,10 @@ pub use harw_dod_procmon::{DEFAULT_READ_TIMEOUT, ExecEvent, ProcmonError, Procmo
 /// „Bewerte einen Befund"); ein Konsument dieser Funktionen hat
 /// `harw-sandbox` ohnehin bereits vorliegen.
 #[cfg(feature = "privileged")]
-pub use harw_dod_flow::{Direction, FlowError, FlowEvent, FlowResult, Protocol, observe, parse_flow_payload, to_security_event};
+pub use harw_dod_flow::{
+    Direction, FlowError, FlowEvent, FlowResult, Protocol, observe, parse_flow_payload,
+    to_security_event,
+};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

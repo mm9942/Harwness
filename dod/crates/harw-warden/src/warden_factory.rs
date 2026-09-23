@@ -57,7 +57,7 @@ pub fn build_production_warden(cgroup_root: &Path) -> Warden {
 #[cfg(test)]
 mod tests {
     use super::build_production_warden;
-    use crate::test_support::{TestResult, ctx};
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_dod_warden::WardenOutcome;
     use harw_dod_warden_proto::{
         AuthorizationProof, EscalationStage, ProposedAction, WardenAction, WardenActionRequest,
@@ -141,7 +141,7 @@ mod tests {
         let outcome = warden.handle(&finding, &request);
         let response = outcome
             .to_wire()
-            .map_err(ctx("Denied maps to WardenResponse"))?;
+            .ok_or(TestError::Missing("Denied maps to WardenResponse"))?;
         let json = serde_json::to_string(&response).map_err(ctx("serializes"))?;
 
         assert!(!json.contains("very-identifiable"));

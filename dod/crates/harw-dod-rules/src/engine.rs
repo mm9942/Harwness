@@ -61,12 +61,14 @@ pub fn run_rules(ctx: &RuleContext<'_>) -> Vec<Finding<Raw>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rule::Rule;
     use crate::rules::EgressFlowRule;
+    use harw_authority::NetworkScope;
     use harw_dod_signals::{EventKind, SecurityEvent};
     use harw_types::SensorId;
     use jiff::Timestamp;
 
-    fn ctx_with(events: &[SecurityEvent], scope: &NetworkScope) -> RuleContext<'_> {
+    fn ctx_with<'a>(events: &'a [SecurityEvent], scope: &'a NetworkScope) -> RuleContext<'a> {
         RuleContext {
             now: Timestamp::UNIX_EPOCH,
             samples: &[],
@@ -86,20 +88,25 @@ mod tests {
     #[test]
     fn test_egress_flow_rule_is_included() {
         // Keine Exhaustivität, nur ein Rauchtest, dass die Regelliste nicht
-        // leer ist.
-        assert_eq!(ALL_RULES.len(), 1);
-        assert_eq!(ALL_RULES[0].id(), EgressFlowRule.id());
+        // leer ist und die Egress-Regel enthält.
+        assert_eq!(ALL_RULES.len(), 3);
+        assert!(
+            ALL_RULES
+                .iter()
+                .any(|rule| rule.id() == EgressFlowRule.id())
+        );
     }
 
     #[test]
     fn test_run_rules_collects_findings() {
-        let scope = NetworkScope::from_hosts(["evil.example".to_owned()]);
+        let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
         let events = vec![SecurityEvent {
             sensor: SensorId::from_str("net"),
             observed_at: Timestamp::UNIX_EPOCH,
-            kind: EventKind::NetworkConnection {
-                remote_host: "evil.example".to_owned(),
-                remote_port: 443,
+            actor: None,
+            kind: EventKind::EgressFlow {
+                destination: "evil.example".to_owned(),
+                port: 443,
             },
         }];
         let ctx = ctx_with(&events, &scope);

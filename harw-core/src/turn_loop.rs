@@ -1281,7 +1281,6 @@ fn stream_sink_for_round(
     }))
 }
 
-
 /// Prüft einen `ToolCall` gegen alle `ApprovalHandler` und aggregiert.
 ///
 /// # Beschreibung
@@ -2827,9 +2826,10 @@ async fn drive_turn(
                     .usage
                     .prompt_tokens()
                     .saturating_add(response.usage.output_tokens),
-                window_tokens: session
-                    .auto_compact()
-                    .map_or(0, crate::auto_compact::AutoCompactPolicy::context_window_tokens),
+                window_tokens: session.auto_compact().map_or(
+                    0,
+                    crate::auto_compact::AutoCompactPolicy::context_window_tokens,
+                ),
                 history_items_dropped: u32::try_from(history_items_dropped).unwrap_or(u32::MAX),
             },
         );

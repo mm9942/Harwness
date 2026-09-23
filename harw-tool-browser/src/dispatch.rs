@@ -30,8 +30,8 @@ use harw_browser::session::BrowserSessionHandle;
 
 use crate::tool_set::BrowserToolSet;
 use crate::types::{
-    ActResponse, BrowserToolResponse, CloseResponse, EventsResponse, FindResponse,
-    ObserveResponse, OpenResponse, PreparedBrowserCall, PreparedBrowserRequest, WaitResponse,
+    ActResponse, BrowserToolResponse, CloseResponse, EventsResponse, FindResponse, ObserveResponse,
+    OpenResponse, PreparedBrowserCall, PreparedBrowserRequest, WaitResponse,
 };
 
 impl BrowserToolSet {
@@ -55,7 +55,11 @@ impl BrowserToolSet {
     ///
     /// # Concurrency
     /// Safe to call concurrently; budget accounting is atomic per call.
-    pub async fn dispatch(&self, owner: &str, prepared: PreparedBrowserCall) -> Result<BrowserToolResponse> {
+    pub async fn dispatch(
+        &self,
+        owner: &str,
+        prepared: PreparedBrowserCall,
+    ) -> Result<BrowserToolResponse> {
         tracing::debug!(
             operation = ?prepared.scope().action,
             session_id = ?prepared.scope().session_id,
@@ -78,14 +82,19 @@ impl BrowserToolSet {
                 let session_id = observe.session_id;
                 let handle = self.session_handle(session_id).await?;
                 let observation = handle.observe(&observe.context_id, observe.mode).await?;
-                self.enforce_url(session_id, &observation.url, &authority).await?;
-                Ok(BrowserToolResponse::Observe(ObserveResponse { observation }))
+                self.enforce_url(session_id, &observation.url, &authority)
+                    .await?;
+                Ok(BrowserToolResponse::Observe(ObserveResponse {
+                    observation,
+                }))
             }
             PreparedBrowserRequest::Find(find) => {
                 let authority = authority.ok_or_else(missing_admission)?;
                 let session_id = find.session_id;
                 let handle = self.session_handle(session_id).await?;
-                let found = handle.find(&find.context_id, &find.target, find.revision).await;
+                let found = handle
+                    .find(&find.context_id, &find.target, find.revision)
+                    .await;
                 let element = self
                     .settle(session_id, &handle, &find.context_id, &authority, found)
                     .await?;
@@ -106,7 +115,9 @@ impl BrowserToolSet {
                 let authority = authority.ok_or_else(missing_admission)?;
                 let session_id = wait.session_id;
                 let handle = self.session_handle(session_id).await?;
-                let waited = handle.wait(&wait.context_id, wait.condition, wait.timeout).await;
+                let waited = handle
+                    .wait(&wait.context_id, wait.condition, wait.timeout)
+                    .await;
                 let outcome = self
                     .settle(session_id, &handle, &wait.context_id, &authority, waited)
                     .await?;
@@ -134,7 +145,11 @@ impl BrowserToolSet {
     }
 
     // Opens a session, checks its initial location, then binds it to `owner`.
-    async fn dispatch_open(&self, owner: &str, open: OpenBrowserRequest) -> Result<BrowserToolResponse> {
+    async fn dispatch_open(
+        &self,
+        owner: &str,
+        open: OpenBrowserRequest,
+    ) -> Result<BrowserToolResponse> {
         let handle = self.host().open(open.clone()).await?;
         let authority = Arc::new(open);
         let session_id = handle.id();
@@ -147,7 +162,10 @@ impl BrowserToolSet {
             });
         }
 
-        let observation = match handle.observe(&primary_context_id, ObservationMode::PageSummary).await {
+        let observation = match handle
+            .observe(&primary_context_id, ObservationMode::PageSummary)
+            .await
+        {
             Ok(observation) => observation,
             Err(error) => {
                 // Unverifiable start location: never hand out the session.
@@ -155,7 +173,8 @@ impl BrowserToolSet {
                 return Err(error);
             }
         };
-        self.enforce_url(session_id, &observation.url, &authority).await?;
+        self.enforce_url(session_id, &observation.url, &authority)
+            .await?;
         self.register_session(owner, session_id, authority)?;
         tracing::info!(%session_id, "browser session opened and bound to its owner");
 
@@ -185,10 +204,13 @@ impl BrowserToolSet {
         authority: &OpenBrowserRequest,
         operation: Result<T>,
     ) -> Result<T> {
-        let observed = handle.observe(context_id, ObservationMode::PageSummary).await;
+        let observed = handle
+            .observe(context_id, ObservationMode::PageSummary)
+            .await;
         match (operation, observed) {
             (operation, Ok(observation)) => {
-                self.enforce_url(session_id, &observation.url, authority).await?;
+                self.enforce_url(session_id, &observation.url, authority)
+                    .await?;
                 operation
             }
             (Err(error), Err(_)) => Err(error),

@@ -206,8 +206,7 @@ pub fn install_web_tools(
         max_bytes: research.max_fetch_bytes,
         ..harw_tool_web::WebFetchOptions::default()
     };
-    if let Err(error) =
-        harw_tool_web::configure(Arc::new(policy), cache_root.join("web"), options)
+    if let Err(error) = harw_tool_web::configure(Arc::new(policy), cache_root.join("web"), options)
     {
         tracing::debug!(%error, "web_tools.already_configured");
     }
@@ -238,8 +237,14 @@ mod tests {
 
     #[test]
     fn test_url_host_extracts_plain_host() {
-        assert_eq!(url_host("https://search.example.org:8443/x").as_deref(), Some("search.example.org"));
-        assert_eq!(url_host("https://u:p@Host.test").as_deref(), Some("host.test"));
+        assert_eq!(
+            url_host("https://search.example.org:8443/x").as_deref(),
+            Some("search.example.org")
+        );
+        assert_eq!(
+            url_host("https://u:p@Host.test").as_deref(),
+            Some("host.test")
+        );
         assert_eq!(url_host("https://"), None);
     }
 

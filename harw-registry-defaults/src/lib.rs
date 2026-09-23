@@ -216,7 +216,8 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
 /// Schickt SIGKILL an Host-Prozesse — nicht umkehrbar. Deshalb fragt es wie
 /// die beiden Agenten-Werkzeuge immer, auch unter `FullAccess` und trotz
 /// passender Allow-Regel.
-pub const ALWAYS_ASK_TOOLS: &[&str] = &["agents.write_uia", "agents.commit_proposal", "process.kill"];
+pub const ALWAYS_ASK_TOOLS: &[&str] =
+    &["agents.write_uia", "agents.commit_proposal", "process.kill"];
 
 /// Default approval boundary for the built-in coding-agent tool set.
 ///

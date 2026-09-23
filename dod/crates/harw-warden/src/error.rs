@@ -57,7 +57,9 @@ use harw_macros::HarwError;
 pub enum WardenBinError {
     /// `LISTEN_PID` ist nicht gesetzt — dieser Prozess wurde nicht über
     /// systemd-Socket-Aktivierung gestartet.
-    #[msg("LISTEN_PID ist nicht gesetzt; dieses Binary muss über systemd-Socket-Aktivierung gestartet werden")]
+    #[msg(
+        "LISTEN_PID ist nicht gesetzt; dieses Binary muss über systemd-Socket-Aktivierung gestartet werden"
+    )]
     ListenPidMissing,
 
     /// `LISTEN_PID` enthält keinen gültigen Prozess-Bezeichner.
@@ -69,7 +71,9 @@ pub enum WardenBinError {
     /// `crate::systemd`-Moduldoku für die Begründung, warum das ein
     /// eigenständig geprüfter Fall ist, nicht nur eine Spielart von
     /// [`Self::ListenPidMissing`]).
-    #[msg("LISTEN_PID zeigt auf einen anderen Prozess; die übergebenen Deskriptoren gehören nicht diesem Prozess")]
+    #[msg(
+        "LISTEN_PID zeigt auf einen anderen Prozess; die übergebenen Deskriptoren gehören nicht diesem Prozess"
+    )]
     ListenPidForeign,
 
     /// `LISTEN_FDS` ist nicht gesetzt — kein Deskriptor wurde übergeben.
@@ -85,7 +89,9 @@ pub enum WardenBinError {
     /// # Arguments
     /// - `actual` (`usize`): die tatsächlich deklarierte oder tatsächlich
     ///   erhaltene Anzahl.
-    #[msg("erwartete genau einen von systemd übergebenen Deskriptor, tatsächlich waren es {actual}")]
+    #[msg(
+        "erwartete genau einen von systemd übergebenen Deskriptor, tatsächlich waren es {actual}"
+    )]
     UnexpectedListenFdCount {
         /// Die tatsächliche Anzahl.
         actual: usize,
@@ -108,14 +114,18 @@ pub enum WardenBinError {
     /// öffenbaren Wurzelverzeichnisses). Für dieses Binary immer ein harter
     /// Startfehler — siehe `crate::landlock`-Moduldoku, Abschnitt „Die harte
     /// Entscheidung".
-    #[msg("Landlock hat den Zugriff auf das cgroup-Wurzelverzeichnis nicht vollständig durchgesetzt; Start wird verweigert")]
+    #[msg(
+        "Landlock hat den Zugriff auf das cgroup-Wurzelverzeichnis nicht vollständig durchgesetzt; Start wird verweigert"
+    )]
     LandlockUnavailable,
 
     /// Die IPC-Annahmeschleife hat sich endgültig beendet (`accept()`
     /// scheitert dauerhaft, z. B. weil systemd den Socket geschlossen hat).
     /// Der Prozess kann danach keine weitere Anfrage mehr annehmen und
     /// beendet sich deshalb mit einem Fehlschlag statt regulär.
-    #[msg("die IPC-Annahmeschleife hat sich endgültig beendet; dieser Prozess kann keine weitere Anfrage mehr annehmen")]
+    #[msg(
+        "die IPC-Annahmeschleife hat sich endgültig beendet; dieser Prozess kann keine weitere Anfrage mehr annehmen"
+    )]
     IpcAcceptLoopTerminated,
 
     /// Das Unterkommando `completions` ist fehlgeschlagen (läuft vor jedem

@@ -203,10 +203,7 @@ impl std::fmt::Debug for WebSearchConfig {
         f.debug_struct("WebSearchConfig")
             .field("provider", &self.provider)
             .field("endpoint", &self.endpoint)
-            .field(
-                "api_key",
-                &self.api_key.as_ref().map(|_| "<redacted>"),
-            )
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("max_results", &self.max_results)
             .finish()
     }
@@ -356,12 +353,13 @@ impl SearchQuery {
         let max_results = u8::try_from(requested.clamp(1, u64::from(HARD_MAX_RESULTS)))
             .unwrap_or(HARD_MAX_RESULTS);
 
-        let site = match args.site.as_deref().map(str::trim) {
-            None | Some("") => None,
-            Some(raw) => Some(normalize_site(raw).ok_or_else(|| {
-                "site must be a plain domain name such as 'docs.rs'".to_owned()
-            })?),
-        };
+        let site =
+            match args.site.as_deref().map(str::trim) {
+                None | Some("") => None,
+                Some(raw) => Some(normalize_site(raw).ok_or_else(|| {
+                    "site must be a plain domain name such as 'docs.rs'".to_owned()
+                })?),
+            };
 
         Ok(Self {
             query,
@@ -439,7 +437,10 @@ fn clean_text(raw: &str, max_chars: usize, is_html: bool) -> String {
     if collapsed.chars().count() <= max_chars {
         return collapsed;
     }
-    let mut kept: String = collapsed.chars().take(max_chars.saturating_sub(1)).collect();
+    let mut kept: String = collapsed
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect();
     kept.truncate(kept.trim_end().len());
     kept.push('…');
     kept
@@ -473,12 +474,7 @@ fn url_matches_site(url: &str, site: &str) -> bool {
 ///
 /// `is_html` gibt an, ob Titel und Snippets noch HTML-Markup enthalten können
 /// (JSON-Backends) oder bereits reiner Text sind (DuckDuckGo-DOM).
-fn collect_results<I>(
-    raw: I,
-    limit: usize,
-    site: Option<&str>,
-    is_html: bool,
-) -> Vec<SearchResult>
+fn collect_results<I>(raw: I, limit: usize, site: Option<&str>, is_html: bool) -> Vec<SearchResult>
 where
     I: IntoIterator<Item = (String, String, String)>,
 {
@@ -1053,7 +1049,11 @@ mod tests {
         }
     }
 
-    fn config(provider: SearchBackend, endpoint: Option<&str>, key: Option<&str>) -> WebSearchConfig {
+    fn config(
+        provider: SearchBackend,
+        endpoint: Option<&str>,
+        key: Option<&str>,
+    ) -> WebSearchConfig {
         WebSearchConfig {
             provider,
             endpoint: endpoint.map(str::to_owned),
@@ -1130,14 +1130,18 @@ mod tests {
     fn test_parse_brave_sanitizes_and_dedups() -> TestResult {
         let results = parse_brave(BRAVE_FIXTURE, 10, None).map_err(ctx("brave"))?;
         assert_eq!(results.len(), 2);
-        let first = results.first().ok_or(TestError::Missing("erster Treffer"))?;
+        let first = results
+            .first()
+            .ok_or(TestError::Missing("erster Treffer"))?;
         assert_eq!(first.title, "serde - Rust");
         assert_eq!(first.url, "https://docs.rs/serde/latest/serde/");
         assert_eq!(
             first.snippet,
             "A generic serialization & deserialization framework"
         );
-        let second = results.get(1).ok_or(TestError::Missing("zweiter Treffer"))?;
+        let second = results
+            .get(1)
+            .ok_or(TestError::Missing("zweiter Treffer"))?;
         assert_eq!(second.url, "https://crates.io/crates/serde");
         Ok(())
     }
@@ -1176,7 +1180,10 @@ mod tests {
         let urls: Vec<&str> = results.iter().map(|r| r.url.as_str()).collect();
         assert_eq!(
             urls,
-            vec!["https://docs.rs/reqwest", "https://github.com/seanmonstar/reqwest"]
+            vec![
+                "https://docs.rs/reqwest",
+                "https://github.com/seanmonstar/reqwest"
+            ]
         );
         let last = results.get(1).ok_or(TestError::Missing("Treffer"))?;
         assert_eq!(last.title, last.url);
@@ -1197,7 +1204,10 @@ mod tests {
         );
         let first = results.first().ok_or(TestError::Missing("Treffer"))?;
         assert_eq!(first.title, "scraper - Rust");
-        assert_eq!(first.snippet, "HTML parsing and querying with CSS selectors.");
+        assert_eq!(
+            first.snippet,
+            "HTML parsing and querying with CSS selectors."
+        );
         let second = results.get(1).ok_or(TestError::Missing("Treffer"))?;
         assert_eq!(second.snippet, "Repository <script> text");
         Ok(())
@@ -1264,7 +1274,13 @@ mod tests {
         let q = SearchQuery::from_args(&args("serde", None, Some(" Docs.RS ")), 8)
             .map_err(TestError::Unexpected)?;
         assert_eq!(q.site.as_deref(), Some("docs.rs"));
-        for bad in ["https://docs.rs", "docs rs", "localhost", "-a.example", "a..b"] {
+        for bad in [
+            "https://docs.rs",
+            "docs rs",
+            "localhost",
+            "-a.example",
+            "a..b",
+        ] {
             assert!(
                 SearchQuery::from_args(&args("serde", None, Some(bad)), 8).is_err(),
                 "{bad} muss abgelehnt werden"
@@ -1299,7 +1315,10 @@ mod tests {
         assert!(!plan.url.contains("SECRET"));
         assert!(!format!("{plan:?}").contains("SECRET"));
         assert!(matches!(
-            build_plan(&config(SearchBackend::Brave, None, Some("  ")), &query("x", 5, None)),
+            build_plan(
+                &config(SearchBackend::Brave, None, Some("  ")),
+                &query("x", 5, None)
+            ),
             Err(WebToolError::NotConfigured { .. })
         ));
         Ok(())
@@ -1329,11 +1348,18 @@ mod tests {
     #[test]
     fn test_build_plan_searxng_and_duckduckgo() -> TestResult {
         assert!(matches!(
-            build_plan(&config(SearchBackend::Searxng, None, None), &query("x", 5, None)),
+            build_plan(
+                &config(SearchBackend::Searxng, None, None),
+                &query("x", 5, None)
+            ),
             Err(WebToolError::NotConfigured { .. })
         ));
         let plan = build_plan(
-            &config(SearchBackend::Searxng, Some("https://searx.example.org/"), None),
+            &config(
+                SearchBackend::Searxng,
+                Some("https://searx.example.org/"),
+                None,
+            ),
             &query("a&b", 5, None),
         )
         .map_err(ctx("searxng"))?;
@@ -1342,8 +1368,8 @@ mod tests {
             "https://searx.example.org/search?format=json&q=a%26b"
         );
 
-        let plan = build_plan(&WebSearchConfig::default(), &query("x y", 5, None))
-            .map_err(ctx("ddg"))?;
+        let plan =
+            build_plan(&WebSearchConfig::default(), &query("x y", 5, None)).map_err(ctx("ddg"))?;
         assert_eq!(plan.url, "https://html.duckduckgo.com/html/?q=x+y");
         assert!(plan.auth.is_none());
         Ok(())
@@ -1367,8 +1393,8 @@ mod tests {
     #[test]
     fn test_plan_url_passes_hop_check_only_when_allowed() -> TestResult {
         use harw_authority::NetworkScope;
-        let plan = build_plan(&WebSearchConfig::default(), &query("x", 5, None))
-            .map_err(ctx("plan"))?;
+        let plan =
+            build_plan(&WebSearchConfig::default(), &query("x", 5, None)).map_err(ctx("plan"))?;
         let policy = EgressPolicy::new(vec!["html.duckduckgo.com".to_owned()], false)
             .map_err(ctx("policy"))?;
         let allowed = NetworkScope::from_hosts(["html.duckduckgo.com".to_owned()]);

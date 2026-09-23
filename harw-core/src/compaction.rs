@@ -321,12 +321,14 @@ pub async fn compact_session(
             usage: summary_usage,
         });
     }
-    session.live_emitter().emit(harw_protocol::TurnEvent::CompactionApplied {
-        turn_id: session.current_turn().cloned(),
-        reason: reason.map_or_else(|| "manual".to_owned(), |r| format!("{r:?}")),
-        items_before: u32::try_from(items_before).unwrap_or(u32::MAX),
-        items_after: u32::try_from(session.history().len()).unwrap_or(u32::MAX),
-    });
+    session
+        .live_emitter()
+        .emit(harw_protocol::TurnEvent::CompactionApplied {
+            turn_id: session.current_turn().cloned(),
+            reason: reason.map_or_else(|| "manual".to_owned(), |r| format!("{r:?}")),
+            items_before: u32::try_from(items_before).unwrap_or(u32::MAX),
+            items_after: u32::try_from(session.history().len()).unwrap_or(u32::MAX),
+        });
 
     if let Some(observer) = session.compaction_observer() {
         observer.on_compacted(session.id(), &outcome);

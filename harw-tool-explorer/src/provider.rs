@@ -157,10 +157,7 @@ fn truncate_text(mut text: String, limit: usize) -> String {
         cut -= 1;
     }
     text.truncate(cut);
-    text.push_str(&format!(
-        "\n… [output truncated at {} KiB]",
-        limit / 1024
-    ));
+    text.push_str(&format!("\n… [output truncated at {} KiB]", limit / 1024));
     text
 }
 
@@ -300,7 +297,10 @@ async fn explore_tree(
         }
     }
 
-    let depth = args.depth.unwrap_or(DEFAULT_TREE_DEPTH).clamp(1, MAX_TREE_DEPTH);
+    let depth = args
+        .depth
+        .unwrap_or(DEFAULT_TREE_DEPTH)
+        .clamp(1, MAX_TREE_DEPTH);
     let index = match build_index(context, args.include_ignored.unwrap_or(false)) {
         Ok(index) => index,
         Err(message) => return Ok(error_output(TOOL, &message)),
@@ -428,15 +428,16 @@ async fn explore_relations(
     );
 
     let total = matching.len();
-    let (relations, omitted) =
-        bounded_items(matching.into_iter().map(relation_json), ITEM_BUDGET);
+    let (relations, omitted) = bounded_items(matching.into_iter().map(relation_json), ITEM_BUDGET);
     let mut value = json!({
         "relations": relations,
         "total": total,
         "truncated": index.truncated || omitted > 0,
     });
     if omitted > 0 {
-        value["note"] = json!(format!("{omitted} relations omitted (output limit ~64 KiB)"));
+        value["note"] = json!(format!(
+            "{omitted} relations omitted (output limit ~64 KiB)"
+        ));
     }
     Ok(ToolOutput::json(value))
 }
@@ -463,7 +464,10 @@ async fn explore_find(
     if query.is_empty() {
         return Ok(error_output(TOOL, "query must not be empty"));
     }
-    let limit = args.limit.unwrap_or(DEFAULT_FIND_LIMIT).clamp(1, MAX_FIND_LIMIT);
+    let limit = args
+        .limit
+        .unwrap_or(DEFAULT_FIND_LIMIT)
+        .clamp(1, MAX_FIND_LIMIT);
 
     let index = match build_index(context, false) {
         Ok(index) => index,
@@ -488,7 +492,9 @@ async fn explore_find(
         "truncated": hit_limit || omitted > 0 || index.truncated,
     });
     if hit_limit {
-        value["note"] = json!(format!("limit of {limit} matches reached; refine the query"));
+        value["note"] = json!(format!(
+            "limit of {limit} matches reached; refine the query"
+        ));
     } else if omitted > 0 {
         value["note"] = json!(format!("{omitted} matches omitted (output limit ~64 KiB)"));
     }
@@ -581,19 +587,19 @@ mod tests {
         let ws = harness.path().join("ws");
         fs::create_dir_all(ws.join("a/src")).map_err(ctx("a/src anlegen"))?;
         fs::create_dir_all(ws.join("docs")).map_err(ctx("docs anlegen"))?;
-        fs::write(
-            ws.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"a\"]\n",
-        )
-        .map_err(ctx("Wurzel-Manifest"))?;
+        fs::write(ws.join("Cargo.toml"), "[workspace]\nmembers = [\"a\"]\n")
+            .map_err(ctx("Wurzel-Manifest"))?;
         fs::write(
             ws.join("a/Cargo.toml"),
             "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
         )
         .map_err(ctx("Member-Manifest"))?;
         fs::write(ws.join("a/src/lib.rs"), "pub fn a() {}\n").map_err(ctx("lib.rs"))?;
-        fs::write(ws.join("README.md"), "# Demo\n\nSee [guide](docs/guide.md).\n")
-            .map_err(ctx("README"))?;
+        fs::write(
+            ws.join("README.md"),
+            "# Demo\n\nSee [guide](docs/guide.md).\n",
+        )
+        .map_err(ctx("README"))?;
         fs::write(ws.join("docs/guide.md"), "# Guide\n").map_err(ctx("guide"))?;
         let context = sandbox_context(harness.path(), vec![Permission::ReadWorkspace])?;
         Ok((harness, context))
@@ -641,13 +647,13 @@ mod tests {
 
     #[test]
     fn test_provider_lists_all_four_tools_in_order() {
-        assert_eq!(ExplorerToolProvider::TOOL_NAMES, EXPLORER_TOOL_NAMES.as_slice());
+        assert_eq!(
+            ExplorerToolProvider::TOOL_NAMES,
+            EXPLORER_TOOL_NAMES.as_slice()
+        );
         let provider = ExplorerToolProvider::new();
         let tools = provider.tools();
-        let names: Vec<&str> = tools
-            .iter()
-            .map(harw_tools::ToolSpec::name)
-            .collect();
+        let names: Vec<&str> = tools.iter().map(harw_tools::ToolSpec::name).collect();
         for expected in EXPLORER_TOOL_NAMES {
             assert!(names.contains(&expected), "{expected} fehlt");
         }
@@ -665,13 +671,20 @@ mod tests {
             assert_eq!(*permission, Some(Permission::ReadWorkspace), "{name}");
         }
         assert!(!provider.parallel_safe(&ToolName::new("explore.unknown")));
-        assert!(provider.executor(&ToolName::new("explore.unknown")).is_none());
+        assert!(
+            provider
+                .executor(&ToolName::new("explore.unknown"))
+                .is_none()
+        );
     }
 
     #[test]
     fn test_validate_relative_rejects_escapes() -> TestResult {
         assert_eq!(validate_relative("").map_err(ctx("leer"))?, PathBuf::new());
-        assert_eq!(validate_relative("./").map_err(ctx("punkt"))?, PathBuf::new());
+        assert_eq!(
+            validate_relative("./").map_err(ctx("punkt"))?,
+            PathBuf::new()
+        );
         assert_eq!(
             validate_relative("./a/b").map_err(ctx("a/b"))?,
             PathBuf::from("a/b")
@@ -702,7 +715,10 @@ mod tests {
 
     #[test]
     fn test_parse_relation_kind_accepts_label_and_snake_case() {
-        assert_eq!(parse_relation_kind("member"), Some(RelationKind::WorkspaceMember));
+        assert_eq!(
+            parse_relation_kind("member"),
+            Some(RelationKind::WorkspaceMember)
+        );
         assert_eq!(
             parse_relation_kind("workspace_member"),
             Some(RelationKind::WorkspaceMember)
@@ -723,15 +739,22 @@ mod tests {
     #[test]
     fn test_tree_subpath_and_escape_rejection() -> TestResult {
         let (_harness, context) = fixture()?;
-        let text = expect_text(run(&context, "explore.tree", json!({ "path": "a", "depth": 5 }))?)?;
+        let text = expect_text(run(
+            &context,
+            "explore.tree",
+            json!({ "path": "a", "depth": 5 }),
+        )?)?;
         assert!(text.contains("lib.rs"), "{text}");
 
         let message = expect_error(run(&context, "explore.tree", json!({ "path": "../" }))?)?;
         assert!(message.contains(".."), "{message}");
         let message = expect_error(run(&context, "explore.tree", json!({ "path": "/etc" }))?)?;
         assert!(message.contains("relative"), "{message}");
-        let message =
-            expect_error(run(&context, "explore.tree", json!({ "path": "README.md" }))?)?;
+        let message = expect_error(run(
+            &context,
+            "explore.tree",
+            json!({ "path": "README.md" }),
+        )?)?;
         assert!(message.contains("not a directory"), "{message}");
         Ok(())
     }
@@ -770,10 +793,7 @@ mod tests {
         let relations = value["relations"]
             .as_array()
             .ok_or(TestError::Missing("relations-Array"))?;
-        assert!(
-            relations.iter().all(|r| r["kind"] == "member"),
-            "{value}"
-        );
+        assert!(relations.iter().all(|r| r["kind"] == "member"), "{value}");
         assert!(
             relations.iter().any(|r| r["from"] == "." && r["to"] == "a"),
             "{value}"

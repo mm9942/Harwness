@@ -133,8 +133,8 @@ use harw_protocol::events::SessionEvent;
 use harw_protocol::events::TurnEvent;
 use harw_tools::{ToolCall, ToolName};
 use harw_types::{
-    AgentRole, ApprovalActor, ItemId, ModelId, ProviderId, ReasoningEffort, SessionId, TokenUsage,
-    ThreadId, ToolCallId, TurnId,
+    AgentRole, ApprovalActor, ItemId, ModelId, ProviderId, ReasoningEffort, SessionId, ThreadId,
+    TokenUsage, ToolCallId, TurnId,
 };
 use std::collections::BTreeSet;
 use tokio::sync::mpsc;
@@ -1044,15 +1044,14 @@ impl AgentSession {
     pub fn set_active_model(&mut self, model: Option<ModelId>) {
         let changed = self.active_model != model;
         self.active_model = model;
-        if changed
-            && let Some(resolve) = &self.context_window_resolver
-        {
+        if changed && let Some(resolve) = &self.context_window_resolver {
             let window = resolve(self.active_model.as_ref().map(ModelId::as_str));
             if let Some(policy) = self.auto_compact {
                 self.auto_compact = Some(policy.rescaled(window));
             }
             let history = usize::try_from(window.saturating_mul(3)).unwrap_or(usize::MAX);
-            self.context_budget.max_history_bytes = history.max(ContextBudget::conservative().max_history_bytes);
+            self.context_budget.max_history_bytes =
+                history.max(ContextBudget::conservative().max_history_bytes);
         }
     }
 
@@ -1545,9 +1544,9 @@ impl AgentSession {
     /// Entnimmt die bisherige Laufzeit des zuletzt begonnenen Handoffs in
     /// Millisekunden (0, wenn kein Startzeitpunkt bekannt ist).
     pub fn take_handoff_elapsed_ms(&mut self) -> u64 {
-        self.handoff_started_at
-            .take()
-            .map_or(0, |start| u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX))
+        self.handoff_started_at.take().map_or(0, |start| {
+            u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+        })
     }
 
     /// Pausiert die Session für eine Freigabeentscheidung.

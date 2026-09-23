@@ -143,7 +143,10 @@ pub(crate) fn prepare_browser_call_with_policy(
 /// - `Error::InvalidArgument`: selector/target/text/key/scroll/URL/wait
 ///   limits violated, or an element-targeted action lacks an expected revision.
 /// - `Error::OriginNotAllowed`: an authorized open request no longer validates.
-pub(crate) fn validate_request(request: &PreparedBrowserRequest, limits: &BrowserLimits) -> Result<()> {
+pub(crate) fn validate_request(
+    request: &PreparedBrowserRequest,
+    limits: &BrowserLimits,
+) -> Result<()> {
     match request {
         PreparedBrowserRequest::Open(open) => open.validate(),
         PreparedBrowserRequest::Observe(observe) => match &observe.mode {
@@ -159,11 +162,13 @@ pub(crate) fn validate_request(request: &PreparedBrowserRequest, limits: &Browse
         },
         PreparedBrowserRequest::Find(find) => validate_target(&find.target, limits),
         PreparedBrowserRequest::Act(act) => {
-            if action_targets_element(&act.request.action) && act.request.expected_revision.is_none()
+            if action_targets_element(&act.request.action)
+                && act.request.expected_revision.is_none()
             {
                 return Err(Error::InvalidArgument {
-                    detail: "element-targeted browser actions require an expected observation revision"
-                        .to_owned(),
+                    detail:
+                        "element-targeted browser actions require an expected observation revision"
+                            .to_owned(),
                 });
             }
             act.request.validate(limits)

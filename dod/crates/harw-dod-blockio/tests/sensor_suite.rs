@@ -15,9 +15,9 @@
 //! privaten Logik in `src/sensor.rs`, weil sie diese isoliert und teils ohne
 //! Dateisystem-Umweg prüfen; diese Datei bindet nur die Harness ein.
 
-use harw_dod_cap::Capability;
-use harw_dod_blockio::sensor::MAX_CARDINALITY;
 use harw_dod_blockio::BlockioSensor;
+use harw_dod_blockio::sensor::MAX_CARDINALITY;
+use harw_dod_cap::Capability;
 
 harw_dod_fixtures::sensor_suite! {
     sensor: BlockioSensor,

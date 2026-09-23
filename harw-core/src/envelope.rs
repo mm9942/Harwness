@@ -363,8 +363,8 @@ mod tests {
     }
 
     #[test]
-    fn test_render_tool_result_untrusted_has_header_notice_fence_and_matching_footer()
-    -> TestResult {
+    fn test_render_tool_result_untrusted_has_header_notice_fence_and_matching_footer() -> TestResult
+    {
         let result = ToolCallResult::success(json!("line one\nline two"));
 
         let rendered = render_tool_result("web.fetch", ResultTrust::Untrusted, &result, 4096);

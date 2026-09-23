@@ -95,9 +95,10 @@ mod tests {
     #[test]
     fn test_io_display_interpolates_inner_message() {
         let err = WardenError::from(sample_io_error());
-        assert!(err
-            .to_string()
-            .starts_with("Dateisystemzugriff für die cgroup-Operation ist fehlgeschlagen:"));
+        assert!(
+            err.to_string()
+                .starts_with("Dateisystemzugriff für die cgroup-Operation ist fehlgeschlagen:")
+        );
     }
 
     #[test]

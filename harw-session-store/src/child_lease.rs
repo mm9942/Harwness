@@ -577,8 +577,9 @@ mod tests {
             "lease_expires_at": "2024-01-01T01:00:00Z"
         }"#;
 
-        let decoded: ChildLeaseRecord = serde_json::from_str(legacy)
-            .map_err(ctx("a pre-trace ChildLeaseRecord file must still deserialize"))?;
+        let decoded: ChildLeaseRecord = serde_json::from_str(legacy).map_err(ctx(
+            "a pre-trace ChildLeaseRecord file must still deserialize",
+        ))?;
 
         assert_eq!(decoded.trace, None);
         assert_eq!(decoded.child, SessionId::from_str("child-legacy"));
@@ -602,8 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn admitted_lease_without_trace_context_roundtrips_through_the_real_store_path() -> TestResult
-    {
+    fn admitted_lease_without_trace_context_roundtrips_through_the_real_store_path() -> TestResult {
         let temp = tempfile::tempdir()?;
         let store = ChildLeaseStore::new(temp.path());
         let admitted = lease("child-store-untraced", 60)?;
@@ -707,11 +707,7 @@ mod tests {
             store.complete(&record.child, Timestamp::now()),
             Err(SessionStoreError::ChildLeaseNotFound { .. })
         ));
-        assert!(
-            std::fs::symlink_metadata(&active)?
-                .file_type()
-                .is_symlink()
-        );
+        assert!(std::fs::symlink_metadata(&active)?.file_type().is_symlink());
         assert!(target.exists());
         Ok(())
     }

@@ -19,7 +19,8 @@ use crate::{
 };
 
 const UNPAIRED_TENANT: &str = "harw:unpaired";
-const INGRESS_UNAVAILABLE_MESSAGE: &str = "Telegram ingress is not configured, already running, or its sink/lock is gone";
+const INGRESS_UNAVAILABLE_MESSAGE: &str =
+    "Telegram ingress is not configured, already running, or its sink/lock is gone";
 const CHANNEL_MISMATCH_REASON: &str = "inbound event channel does not match Telegram binding";
 /// Sliding-window width for `max_updates_per_peer_per_min` (§3.5) and for the
 /// "at most one throttle notice per window" de-duplication.

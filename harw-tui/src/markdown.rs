@@ -306,23 +306,64 @@ impl Lang {
         match self {
             Self::Rust => &[
                 "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else",
-                "enum", "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop",
-                "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self", "static",
-                "struct", "super", "trait", "true", "type", "unsafe", "use", "where", "while",
+                "enum", "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match",
+                "mod", "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct",
+                "super", "trait", "true", "type", "unsafe", "use", "where", "while",
             ],
             Self::Python => &[
                 "and", "as", "assert", "async", "await", "break", "class", "continue", "def",
-                "del", "elif", "else", "except", "False", "finally", "for", "from", "global",
-                "if", "import", "in", "is", "lambda", "None", "nonlocal", "not", "or", "pass",
-                "raise", "return", "True", "try", "while", "with", "yield",
+                "del", "elif", "else", "except", "False", "finally", "for", "from", "global", "if",
+                "import", "in", "is", "lambda", "None", "nonlocal", "not", "or", "pass", "raise",
+                "return", "True", "try", "while", "with", "yield",
             ],
             Self::Js => &[
-                "async", "await", "break", "case", "catch", "class", "const", "continue",
-                "default", "delete", "do", "else", "enum", "export", "extends", "false",
-                "finally", "for", "from", "function", "if", "implements", "import", "in",
-                "instanceof", "interface", "let", "new", "null", "private", "public",
-                "readonly", "return", "static", "super", "switch", "this", "throw", "true",
-                "try", "type", "typeof", "undefined", "var", "void", "while", "yield",
+                "async",
+                "await",
+                "break",
+                "case",
+                "catch",
+                "class",
+                "const",
+                "continue",
+                "default",
+                "delete",
+                "do",
+                "else",
+                "enum",
+                "export",
+                "extends",
+                "false",
+                "finally",
+                "for",
+                "from",
+                "function",
+                "if",
+                "implements",
+                "import",
+                "in",
+                "instanceof",
+                "interface",
+                "let",
+                "new",
+                "null",
+                "private",
+                "public",
+                "readonly",
+                "return",
+                "static",
+                "super",
+                "switch",
+                "this",
+                "throw",
+                "true",
+                "try",
+                "type",
+                "typeof",
+                "undefined",
+                "var",
+                "void",
+                "while",
+                "yield",
             ],
             Self::Shell => &[
                 "case", "do", "done", "echo", "elif", "else", "esac", "exit", "export", "fi",
@@ -426,7 +467,9 @@ fn highlight_code(line: &str, lang: Lang, theme: Theme) -> Vec<Span<'static>> {
         let prev_is_ident = i > 0 && chars.get(i - 1).is_some_and(|p| is_ident_char(*p));
         if c.is_ascii_digit() && !prev_is_ident {
             flush_plain(&mut plain, Style::default(), &mut spans);
-            let end = scan_while(&chars, i, |ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.');
+            let end = scan_while(&chars, i, |ch| {
+                ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'
+            });
             push_token(&chars[i..end], number_style(theme), &mut spans);
             i = end;
             continue;
@@ -532,7 +575,10 @@ fn parse_inline(chars: &[char], base: Style, theme: Theme, out: &mut Vec<Span<'s
                     flush_plain(&mut buf, base, out);
                     let inner: String = chars[i + run..close].iter().collect();
                     let inner = strip_code_padding(&inner);
-                    out.push(Span::styled(sanitize_inline(inner), inline_code_style(theme)));
+                    out.push(Span::styled(
+                        sanitize_inline(inner),
+                        inline_code_style(theme),
+                    ));
                     i = close + run;
                 } else {
                     buf.extend(&chars[i..i + run]);
@@ -604,7 +650,11 @@ fn parse_inline(chars: &[char], base: Style, theme: Theme, out: &mut Vec<Span<'s
 
 /// Entfernt je ein umschließendes Leerzeichen eines Inline-Code-Inhalts.
 fn strip_code_padding(inner: &str) -> &str {
-    if inner.len() >= 2 && inner.starts_with(' ') && inner.ends_with(' ') && !inner.trim().is_empty() {
+    if inner.len() >= 2
+        && inner.starts_with(' ')
+        && inner.ends_with(' ')
+        && !inner.trim().is_empty()
+    {
         inner.get(1..inner.len() - 1).unwrap_or(inner)
     } else {
         inner
@@ -977,7 +1027,11 @@ mod tests {
 
         // Bezeichner mit Ziffern sind keine Zahlen, Keywords in Wörtern keine Keywords.
         let r = render_markdown("```rs\nlet v2 = format_fn;\n```", T);
-        assert!(r[0].spans.iter().all(|s| s.content != "2" && s.content != "fn"));
+        assert!(
+            r[0].spans
+                .iter()
+                .all(|s| s.content != "2" && s.content != "fn")
+        );
 
         // Unbekannte Sprache: keine Hervorhebung.
         let plain = render_markdown("```text\nfn x\n```", T);

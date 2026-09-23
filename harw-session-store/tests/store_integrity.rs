@@ -49,7 +49,10 @@ fn quarantine_entries(dir: &Path) -> TestResult<Vec<String>> {
     for entry in std::fs::read_dir(dir)? {
         names.push(entry?.file_name().to_string_lossy().into_owned());
     }
-    Ok(names.into_iter().filter(|name| name.contains(".corrupt-")).collect())
+    Ok(names
+        .into_iter()
+        .filter(|name| name.contains(".corrupt-"))
+        .collect())
 }
 
 fn replay(store: &TranscriptStore, session: &str) -> TestResult<Vec<TranscriptRecord>> {
@@ -148,9 +151,9 @@ fn test_repair_tail_parallel_callers_repair_exactly_once() -> TestResult {
     let mut outcomes = Vec::with_capacity(handles.len());
     for handle in handles {
         outcomes.push(
-            handle
-                .join()
-                .map_err(|_| TestError::Unexpected("repair_tail worker thread panicked".to_owned()))?,
+            handle.join().map_err(|_| {
+                TestError::Unexpected("repair_tail worker thread panicked".to_owned())
+            })?,
         );
     }
 
@@ -171,7 +174,9 @@ fn test_repair_tail_parallel_callers_repair_exactly_once() -> TestResult {
 
 /// Builds a record whose JSONL line (including `\n`) is exactly `line_len` bytes.
 fn record_with_line_len(line_len: usize) -> TestResult<TranscriptRecord> {
-    let base = transcript_record("session-a", 0, "")?.to_jsonl_line()?.len();
+    let base = transcript_record("session-a", 0, "")?
+        .to_jsonl_line()?
+        .len();
     transcript_record("session-a", 0, &"a".repeat(line_len - base))
 }
 

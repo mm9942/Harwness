@@ -612,7 +612,10 @@ mod tests {
         let mut decoder = ResponseDecoder::default();
         let mut result = None;
         for chunk in stream.as_bytes().chunks(3) {
-            result = decoder.push(chunk, None).map_err(ctx("decoder push"))?.or(result);
+            result = decoder
+                .push(chunk, None)
+                .map_err(ctx("decoder push"))?
+                .or(result);
         }
         assert_eq!(result, Some(response));
         Ok(())
@@ -620,16 +623,20 @@ mod tests {
 
     #[test]
     fn sse_failure_and_incomplete_are_not_successful_tool_responses() -> TestResult {
-        let Err(error) = ResponseDecoder::default()
-            .push(b"data: {\"type\":\"error\",\"message\":\"private\"}\n\n", None)
-        else {
+        let Err(error) = ResponseDecoder::default().push(
+            b"data: {\"type\":\"error\",\"message\":\"private\"}\n\n",
+            None,
+        ) else {
             return Err(TestError::Unexpected(
                 "decoder push must fail on an error event".into(),
             ));
         };
         assert!(error.to_string().find("private").is_none());
         let value = ResponseDecoder::default()
-            .push(b"data: {\"type\":\"response.incomplete\",\"response\":{\"output\":[]}}\n\n", None)
+            .push(
+                b"data: {\"type\":\"response.incomplete\",\"response\":{\"output\":[]}}\n\n",
+                None,
+            )
             .map_err(ctx("decoder push"))?
             .ok_or(TestError::Missing("decoded response value"))?;
         assert_eq!(value["status"], "incomplete");

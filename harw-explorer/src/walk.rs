@@ -18,7 +18,14 @@ use crate::{ExplorerError, ExplorerOptions, ExplorerResult, FileKind, Node};
 
 /// Ordner, die selbst gelistet, aber ohne `include_ignored` nicht betreten
 /// werden (Build-Artefakte, Abhängigkeiten, virtuelle Umgebungen).
-pub const HEAVY_DIRS: &[&str] = &["target", "node_modules", ".venv", "__pycache__", "dist", "build"];
+pub const HEAVY_DIRS: &[&str] = &[
+    "target",
+    "node_modules",
+    ".venv",
+    "__pycache__",
+    "dist",
+    "build",
+];
 
 /// Läuft ab `root` durch den Baum und liefert alle Einträge (ohne die Wurzel)
 /// sortiert nach Pfad – Verzeichnisse stehen vor ihrem Inhalt – sowie ob
@@ -82,7 +89,12 @@ fn has_any_entry(root: &Path) -> bool {
 
 /// Kern-Durchlauf: ruft `visit` für jeden Eintrag (ohne Wurzel) mit relativem
 /// Pfad auf; liefert `visit` `false`, wird abgebrochen.
-fn run(root: &Path, opts: &ExplorerOptions, filtered: bool, mut visit: impl FnMut(&Path, &DirEntry) -> bool) {
+fn run(
+    root: &Path,
+    opts: &ExplorerOptions,
+    filtered: bool,
+    mut visit: impl FnMut(&Path, &DirEntry) -> bool,
+) {
     let filter_root = root.to_path_buf();
     let mut builder = WalkBuilder::new(root);
     builder
@@ -133,10 +145,13 @@ fn keep_entry(root: &Path, entry: &DirEntry, filtered: bool) -> bool {
 fn inside_heavy_dir(rel: &Path) -> bool {
     let components: Vec<Component<'_>> = rel.components().collect();
     let ancestors = components.len().saturating_sub(1);
-    components.iter().take(ancestors).any(|component| match component {
-        Component::Normal(name) => name.to_str().is_some_and(|name| HEAVY_DIRS.contains(&name)),
-        _ => false,
-    })
+    components
+        .iter()
+        .take(ancestors)
+        .any(|component| match component {
+            Component::Normal(name) => name.to_str().is_some_and(|name| HEAVY_DIRS.contains(&name)),
+            _ => false,
+        })
 }
 
 fn make_node(rel: &Path, entry: &DirEntry, ignored: bool) -> Node {
@@ -171,7 +186,10 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn paths(nodes: &[Node]) -> Vec<String> {
-        nodes.iter().map(|n| n.path.to_string_lossy().replace('\\', "/")).collect()
+        nodes
+            .iter()
+            .map(|n| n.path.to_string_lossy().replace('\\', "/"))
+            .collect()
     }
 
     fn find<'a>(nodes: &'a [Node], path: &str) -> Option<&'a Node> {
@@ -183,7 +201,10 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let file = dir.path().join("f.txt");
         fs::write(&file, "x")?;
-        assert!(matches!(walk(&file, &ExplorerOptions::default()), Err(ExplorerError::InvalidRoot(_))));
+        assert!(matches!(
+            walk(&file, &ExplorerOptions::default()),
+            Err(ExplorerError::InvalidRoot(_))
+        ));
         assert!(matches!(
             walk(&dir.path().join("missing"), &ExplorerOptions::default()),
             Err(ExplorerError::InvalidRoot(_))
@@ -209,12 +230,19 @@ mod tests {
         assert!(!main.ignored);
         assert_eq!(find(&nodes, "src").ok_or("src fehlt")?.kind, FileKind::Dir);
 
-        let opts = ExplorerOptions { include_ignored: true, ..ExplorerOptions::default() };
+        let opts = ExplorerOptions {
+            include_ignored: true,
+            ..ExplorerOptions::default()
+        };
         let (nodes, _) = walk(root, &opts)?;
         let secret = find(&nodes, "secret.log").ok_or("secret.log fehlt")?;
         assert!(secret.ignored);
         // Versteckte Datei `.gitignore` ist nur mit include_ignored sichtbar.
-        assert!(find(&nodes, ".gitignore").ok_or(".gitignore fehlt")?.ignored);
+        assert!(
+            find(&nodes, ".gitignore")
+                .ok_or(".gitignore fehlt")?
+                .ignored
+        );
         assert!(!find(&nodes, "src/main.rs").ok_or("main.rs fehlt")?.ignored);
         Ok(())
     }
@@ -227,9 +255,16 @@ mod tests {
         fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n")?;
         fs::write(root.join("a.txt"), "a")?;
         for include_ignored in [false, true] {
-            let opts = ExplorerOptions { include_ignored, ..ExplorerOptions::default() };
+            let opts = ExplorerOptions {
+                include_ignored,
+                ..ExplorerOptions::default()
+            };
             let (nodes, _) = walk(root, &opts)?;
-            assert!(nodes.iter().all(|n| !n.path.starts_with(".git")), "{:?}", paths(&nodes));
+            assert!(
+                nodes.iter().all(|n| !n.path.starts_with(".git")),
+                "{:?}",
+                paths(&nodes)
+            );
             assert!(find(&nodes, "a.txt").is_some());
         }
         Ok(())
@@ -241,12 +276,19 @@ mod tests {
         for i in 0..10 {
             fs::write(dir.path().join(format!("f{i}.txt")), "x")?;
         }
-        let opts = ExplorerOptions { max_nodes: 3, ..ExplorerOptions::default() };
+        let opts = ExplorerOptions {
+            max_nodes: 3,
+            ..ExplorerOptions::default()
+        };
         let (nodes, truncated) = walk(dir.path(), &opts)?;
         assert!(truncated);
         assert_eq!(nodes.len(), 3);
 
-        let opts = ExplorerOptions { max_nodes: 3, include_ignored: true, ..ExplorerOptions::default() };
+        let opts = ExplorerOptions {
+            max_nodes: 3,
+            include_ignored: true,
+            ..ExplorerOptions::default()
+        };
         let (nodes, truncated) = walk(dir.path(), &opts)?;
         assert!(truncated);
         assert_eq!(nodes.len(), 3);
@@ -258,7 +300,10 @@ mod tests {
     fn max_depth_limits() -> TestResult {
         let dir = tempfile::tempdir()?;
         fs::create_dir_all(dir.path().join("a/b/c"))?;
-        let opts = ExplorerOptions { max_depth: 2, ..ExplorerOptions::default() };
+        let opts = ExplorerOptions {
+            max_depth: 2,
+            ..ExplorerOptions::default()
+        };
         let (nodes, _) = walk(dir.path(), &opts)?;
         assert_eq!(paths(&nodes), vec!["a", "a/b"]);
         Ok(())
@@ -274,12 +319,28 @@ mod tests {
 
         let (nodes, _) = walk(root, &ExplorerOptions::default())?;
         assert_eq!(paths(&nodes), vec!["node_modules", "package.json"]);
-        assert_eq!(find(&nodes, "node_modules").ok_or("node_modules fehlt")?.kind, FileKind::Dir);
+        assert_eq!(
+            find(&nodes, "node_modules")
+                .ok_or("node_modules fehlt")?
+                .kind,
+            FileKind::Dir
+        );
 
-        let opts = ExplorerOptions { include_ignored: true, ..ExplorerOptions::default() };
+        let opts = ExplorerOptions {
+            include_ignored: true,
+            ..ExplorerOptions::default()
+        };
         let (nodes, _) = walk(root, &opts)?;
-        assert!(!find(&nodes, "node_modules").ok_or("node_modules fehlt")?.ignored);
-        assert!(find(&nodes, "node_modules/pkg/index.js").ok_or("index.js fehlt")?.ignored);
+        assert!(
+            !find(&nodes, "node_modules")
+                .ok_or("node_modules fehlt")?
+                .ignored
+        );
+        assert!(
+            find(&nodes, "node_modules/pkg/index.js")
+                .ok_or("index.js fehlt")?
+                .ignored
+        );
         Ok(())
     }
 

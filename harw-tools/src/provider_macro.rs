@@ -283,12 +283,12 @@ macro_rules! tool_provider {
 
 #[cfg(test)]
 mod tests {
+    use crate::schema::{JsonSchema, JsonSchemaType};
+    use crate::spec::FunctionToolSpec;
     use crate::{
         Permission, ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName,
         ToolOutput, ToolSpec,
     };
-    use crate::schema::{JsonSchema, JsonSchemaType};
-    use crate::spec::FunctionToolSpec;
 
     /// Baut die Minimal-Spezifikation, die ein `#[tool]`-erzeugtes `spec()`
     /// liefern würde. Die Dummies sind handgeschrieben, weil `#[harw_macros::tool]`

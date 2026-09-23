@@ -894,7 +894,8 @@ mod tests {
         assert_eq!(healed.display_title(), "Wie geht es dir heute?");
 
         // The healed sidecar was persisted, so the next `load` sees it too.
-        let reloaded = load(temp.path(), &session)?.ok_or(TestError::Missing("reloaded sidecar"))?;
+        let reloaded =
+            load(temp.path(), &session)?.ok_or(TestError::Missing("reloaded sidecar"))?;
         assert_eq!(reloaded, healed);
         Ok(())
     }
@@ -996,7 +997,8 @@ mod tests {
 
         assert_eq!(touched.last_opened_at, later);
         assert_eq!(touched.created_at, initial.created_at);
-        let reloaded = load(temp.path(), &session)?.ok_or(TestError::Missing("reloaded sidecar"))?;
+        let reloaded =
+            load(temp.path(), &session)?.ok_or(TestError::Missing("reloaded sidecar"))?;
         assert_eq!(reloaded.last_opened_at, later);
         Ok(())
     }
@@ -1149,7 +1151,8 @@ mod tests {
         assert_eq!(after_second.total_usage.cached_tokens, Some(15));
         assert_eq!(after_second.total_usage.cache_write_tokens, Some(3));
 
-        let reloaded = load(temp.path(), &session)?.ok_or(TestError::Missing("reloaded sidecar"))?;
+        let reloaded =
+            load(temp.path(), &session)?.ok_or(TestError::Missing("reloaded sidecar"))?;
         assert_eq!(reloaded, after_second);
         Ok(())
     }
