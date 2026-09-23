@@ -424,7 +424,10 @@ mod tests {
         // Projekte.
         assert!(content.contains("\nProjekte:\n"), "{content}");
         assert!(content.contains("- cargo-workspace "), "{content}");
-        assert!(content.contains("- cargo-crate core-lib @ crates/core"), "{content}");
+        assert!(
+            content.contains("- cargo-crate core-lib @ crates/core"),
+            "{content}"
+        );
         assert!(content.contains("- node web-app @ web"), "{content}");
         // Relationen: Workspace-Mitgliedschaft steht vorn.
         assert!(content.contains("\nRelationen:\n"), "{content}");
@@ -497,8 +500,10 @@ mod tests {
     #[test]
     fn repo_tree_refreshes_after_a_structural_change() -> TestResult {
         let dir = fixture()?;
-        let provider =
-            RepoTreeContextProvider::with_refresh_interval(dir.path().to_path_buf(), Duration::ZERO);
+        let provider = RepoTreeContextProvider::with_refresh_interval(
+            dir.path().to_path_buf(),
+            Duration::ZERO,
+        );
         let first = block_on(provider.contribute(&TurnInputContext::default()));
         assert!(!content_of(&first)?.contains("added_later"));
 

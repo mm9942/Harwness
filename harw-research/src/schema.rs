@@ -43,19 +43,7 @@ pub fn finding_json_schema() -> Value {
             },
             "produced_by": { "type": "string" },
             "produced_at": { "type": "string", "format": "date-time" },
-            "likelihood": {
-                "type": ["string", "null"],
-                "enum": [
-                    "remote",
-                    "very_unlikely",
-                    "unlikely",
-                    "roughly_even",
-                    "likely",
-                    "very_likely",
-                    "almost_certain",
-                    null
-                ]
-            },
+            "likelihood": likelihood_schema(),
             "confidence_rationale": { "type": "string" },
             "hypotheses": {
                 "type": "array",
@@ -78,6 +66,23 @@ pub fn finding_json_schema() -> Value {
             "confidence",
             "produced_by",
             "produced_at"
+        ]
+    })
+}
+
+/// Teilschema für [`crate::types::Likelihood`] (optional, `null` erlaubt).
+fn likelihood_schema() -> Value {
+    json!({
+        "type": ["string", "null"],
+        "enum": [
+            "remote",
+            "very_unlikely",
+            "unlikely",
+            "roughly_even",
+            "likely",
+            "very_likely",
+            "almost_certain",
+            null
         ]
     })
 }
@@ -396,6 +401,12 @@ mod tests {
             "confidence",
             "produced_by",
             "produced_at",
+            "likelihood",
+            "confidence_rationale",
+            "hypotheses",
+            "key_assumptions",
+            "indicators",
+            "dissent",
         ] {
             assert!(
                 properties.contains_key(field),
@@ -460,11 +471,80 @@ mod tests {
             "confidence",
             "produced_by",
             "produced_at",
+            "likelihood",
+            "confidence_rationale",
+            "hypotheses",
+            "key_assumptions",
+            "indicators",
+            "dissent",
+            "package",
+            "ecosystem",
+            "reliability",
+            "credibility",
+            "derived_from",
         ] {
             assert!(
                 prompt.contains(field),
                 "die Feldliste muss '{field}' nennen: {prompt}"
             );
         }
+    }
+
+    #[test]
+    fn test_finding_schema_prompt_with_example_points_to_explore_tools_first() -> TestResult {
+        let prompt = finding_schema_prompt_with_example("q-1");
+        for tool in [
+            "explore.tree",
+            "explore.projects",
+            "explore.relations",
+            "explore.find",
+        ] {
+            assert!(
+                prompt.contains(tool),
+                "Prompt muss '{tool}' nennen: {prompt}"
+            );
+        }
+        let explore_at = prompt
+            .find("explore.tree")
+            .ok_or(TestError::Missing("explore.tree im Prompt"))?;
+        let fs_at = prompt
+            .find("fs.read")
+            .ok_or(TestError::Missing("fs.read im Prompt"))?;
+        assert!(
+            explore_at < fs_at,
+            "explore.* muss vor fs.read empfohlen werden: {prompt}"
+        );
+        assert!(prompt.contains("package_registry_source"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_source_kind_enum_lists_package_registry_source() -> TestResult {
+        let schema = finding_json_schema();
+        let kinds = schema["properties"]["evidence"]["items"]["properties"]["kind"]["enum"]
+            .as_array()
+            .ok_or(TestError::Missing("kind-enum als Array"))?;
+        assert!(kinds.iter().any(|v| v == "package_registry_source"));
+        assert!(kinds.iter().any(|v| v == "cargo_registry_source"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_version_reference_schema_is_ecosystem_neutral_and_back_compatible() -> TestResult {
+        let schema = finding_json_schema();
+        let version = &schema["properties"]["verified_versions"]["items"];
+        let properties = version["properties"].as_object().ok_or(TestError::Missing(
+            "verified_versions-Properties als Objekt",
+        ))?;
+        for field in ["package", "ecosystem", "crate_name"] {
+            assert!(properties.contains_key(field), "fehlt: {field}");
+        }
+        let required = version["required"]
+            .as_array()
+            .ok_or(TestError::Missing("verified_versions-required als Array"))?;
+        assert!(!required.iter().any(|v| v == "crate_name"));
+        assert!(!required.iter().any(|v| v == "package"));
+        assert!(version["anyOf"].is_array());
+        Ok(())
     }
 }
