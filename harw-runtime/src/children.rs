@@ -1421,8 +1421,8 @@ mod tests {
         for role in [
             // Builtin definition, but not a worker role.
             role_names::ROOT_ORCHESTRATOR,
-            // Known registry role without a builtin definition.
-            role_names::SECURITY_EGRESS_TRIAGE,
+            // Repo-local role without a builtin definition.
+            "some-repo-local-role",
         ] {
             let (provider_default, model_default) =
                 factory.reasoning_effort_defaults_for_role_task(role, None);

@@ -10,8 +10,10 @@
 //!    `shell.exec` nur in `Full`/`ShellExecution`/`UiaQuickHelper`
 //!    (Addendum I)/`UiaShellWorker`, jeweils nur mit dem passenden Recht;
 //!    `deps.source_*` nur mit `ReadCargoRegistry`; `web.*` nur in `Research`
-//!    (alle drei Werkzeuge), `UiaQuickHelper`, `UiaExplorer` oder `UiaWriter`
-//!    (nur `web.fetch`), jeweils nur mit `NetworkAccess`; `browser.*` in
+//!    (alle vier Werkzeuge), `ReadOnlyExplore`/`UiaExplorer` (nur
+//!    `web.fetch`/`web.search`, Nutzerentscheidung: der Explorer durchsucht
+//!    auch das Internet) oder `UiaQuickHelper`/`UiaWriter` (nur `web.fetch`),
+//!    jeweils nur mit `NetworkAccess`; `browser.*` in
 //!    keinem Profil — **außer** `browser.open` in `UiaQuickHelper`
 //!    (Nutzerentscheidung, siehe `UIA_QUICK_HELPER_BROWSER_TOOLS`).
 //! 3. **Rolle × Rechtesatz**: nach dem Rollen-Reducer sieht keine Rolle
@@ -23,7 +25,7 @@
 //! 4. **TOML-Seite** (andere Quelle): keine Rolle admittiert `fs.write`,
 //!    `shell.exec` oder `browser.*` — außer `uia-worker`, die einzige Rolle
 //!    mit der einzigen `browser.*`-Ausnahme `browser.open`;
-//!    `researcher-web` admittiert nur `web.*` und verbietet `fs.*`/`deps.*`
+//!    `researcher-web` admittiert genau die vier `web.*` und verbietet `fs.*`/`deps.*`
 //!    ausdrücklich.
 //! 5. **Montage**: die tatsächlich gebaute Registry entspricht Punkt 2 — mit
 //!    der dokumentierten Ausnahme `UiaQuickHelper`/`browser.open`, das ohne
@@ -274,17 +276,33 @@ fn test_profile_by_permission_matrix_never_registers_ungranted_tools() -> TestRe
                     "{profile:?}"
                 );
             }
-            if tools.iter().any(|tool| tool.starts_with("web.")) {
-                // `Research` führt alle drei `web.*`-Werkzeuge; `UiaQuickHelper`
-                // (Addendum I), `UiaExplorer` und `UiaWriter` ausschließlich
+            let web: Vec<&str> = tools
+                .iter()
+                .copied()
+                .filter(|tool| tool.starts_with("web."))
+                .collect();
+            if !web.is_empty() {
+                // `Research` führt alle vier `web.*`-Werkzeuge;
+                // `ReadOnlyExplore`/`UiaExplorer` (Explorer-Netz,
+                // `EXPLORER_WEB_TOOLS`) nur `web.fetch`/`web.search`;
+                // `UiaQuickHelper` (Addendum I) und `UiaWriter` ausschließlich
                 // `web.fetch` (`UIA_QUICK_HELPER_WEB_TOOLS`).
-                assert!(matches!(
-                    *profile,
-                    RegistryProfile::Research
-                        | RegistryProfile::UiaQuickHelper
-                        | RegistryProfile::UiaExplorer
-                        | RegistryProfile::UiaWriter
-                ));
+                let allowed_web: &[&str] = match *profile {
+                    RegistryProfile::Research => {
+                        &["web.fetch", "web.docs_rs", "web.crates_io", "web.search"]
+                    }
+                    RegistryProfile::ReadOnlyExplore | RegistryProfile::UiaExplorer => {
+                        &["web.fetch", "web.search"]
+                    }
+                    RegistryProfile::UiaQuickHelper | RegistryProfile::UiaWriter => &["web.fetch"],
+                    _ => &[],
+                };
+                for tool in &web {
+                    assert!(
+                        allowed_web.contains(tool),
+                        "{profile:?}: {tool} ist kein zulässiges Netz-Werkzeug dieses Profils"
+                    );
+                }
                 assert!(granted.contains(Permission::NetworkAccess));
             }
             if *profile == RegistryProfile::Research {
@@ -415,7 +433,8 @@ fn test_role_tomls_never_admit_write_shell_or_browser_and_researcher_web_is_web_
         .iter()
         .map(String::as_str)
         .collect();
-    let expected: BTreeSet<&str> = ["web.fetch", "web.docs_rs", "web.crates_io"].into();
+    let expected: BTreeSet<&str> =
+        ["web.fetch", "web.docs_rs", "web.crates_io", "web.search"].into();
     assert_eq!(admitted, expected, "researcher-web admittiert nur web.*");
 
     let forbidden: BTreeSet<&str> = web

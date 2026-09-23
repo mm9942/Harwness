@@ -1988,13 +1988,31 @@ mod tests {
                 "fs.search",
                 "fs.glob",
                 "fs.grep",
+                "doc.read_pdf",
                 "deps.graph",
                 "deps.locked",
                 "deps.source_read",
                 "deps.source_search",
                 "deps.source_list",
+                "explore.tree",
+                "explore.projects",
+                "explore.relations",
+                "explore.find",
+                // Nutzerentscheidung: der Explorer durchsucht auch das Netz.
+                "web.search",
+                "web.fetch",
             ]
         );
+        for tool in ["fs.write", "shell.exec", "web.docs_rs", "web.crates_io"] {
+            assert!(
+                explorer
+                    .tool_surface()
+                    .forbidden()
+                    .iter()
+                    .any(|t| t == tool),
+                "explorer muss {tool} ausdruecklich verbieten"
+            );
+        }
         assert_eq!(explorer.spawn_contract().max_depth(), Some(1));
         let budget = explorer
             .spawn_contract()
@@ -2010,33 +2028,43 @@ mod tests {
         Ok(())
     }
 
+    /// Welche Rollen `web.*` admittieren — und welche davon genau.
+    ///
+    /// - `researcher-web` (`RegistryProfile::Research`): alle vier
+    ///   Netz-Werkzeuge, ohne Workspace-Zugriff (A5).
+    /// - `explorer` (`ReadOnlyExplore`) und `uia-explorer` (`UiaExplorer`):
+    ///   ausschließlich `web.fetch`/`web.search` (`EXPLORER_WEB_TOOLS`) —
+    ///   Nutzerentscheidung „der Explorer durchsucht alles … auch das
+    ///   Internet“.
+    /// - `uia-worker` (Addendum I) und `uia-writer`: ausschließlich
+    ///   `web.fetch` (`UIA_QUICK_HELPER_WEB_TOOLS`).
+    ///
+    /// Jede andere Rolle — insbesondere `analyst`/`researcher-deps`, die sich
+    /// das Profil `ReadOnlyExplore` mit dem `explorer` teilen — admittiert
+    /// kein `web.*`.
     #[test]
-    fn test_researcher_web_is_the_only_role_with_web_tools() -> TestResult {
-        // Addendum I: `uia-worker` (`RegistryProfile::UiaQuickHelper`)
-        // admittiert seit der Korrektur ebenfalls ein Netz-Werkzeug —
-        // ausschließlich `web.fetch`, siehe `agents/uia-worker.toml`.
-        //
-        // `uia-explorer` (`RegistryProfile::UiaExplorer`) und `uia-writer`
-        // (`RegistryProfile::UiaWriter`) admittieren dieselbe alleinige
-        // `web.fetch`-Konstante wie `uia-worker`
-        // (`UIA_QUICK_HELPER_WEB_TOOLS`, `harw-registry-defaults/src/profile.rs`)
-        // — beide sind UIA-Erkundungsspezialisierungen mit derselben
-        // Begründung, siehe `agents/uia-explorer.toml` und
-        // `agents/uia-writer.toml`.
+    fn test_web_tools_are_admitted_only_by_researcher_web_explorers_and_uia_roles() -> TestResult {
         let definitions = builtin()?;
         for (role, ir) in &definitions {
-            let has_web = ir
+            let web: BTreeSet<&str> = ir
                 .tool_surface()
                 .admitted()
                 .iter()
-                .any(|name| name.starts_with("web."));
-            let expects_web = role == role_names::RESEARCHER_WEB
-                || role == role_names::UIA_WORKER
-                || role == role_names::UIA_EXPLORER
-                || role == role_names::UIA_WRITER;
+                .map(String::as_str)
+                .filter(|name| name.starts_with("web."))
+                .collect();
+            let expected: BTreeSet<&str> = if role == role_names::RESEARCHER_WEB {
+                ["web.fetch", "web.docs_rs", "web.crates_io", "web.search"].into()
+            } else if role == role_names::EXPLORER || role == role_names::UIA_EXPLORER {
+                ["web.fetch", "web.search"].into()
+            } else if role == role_names::UIA_WORKER || role == role_names::UIA_WRITER {
+                ["web.fetch"].into()
+            } else {
+                BTreeSet::new()
+            };
             assert_eq!(
-                has_web, expects_web,
-                "{role}: web.* darf nur der Web-Rechercheur und die UIA-Erkundungsrollen führen"
+                web, expected,
+                "{role}: web.* führen nur der Web-Rechercheur, die Explorer und die UIA-Rollen"
             );
         }
         Ok(())

@@ -123,7 +123,33 @@ fn every_profile_registered_tool_is_admitted_by_its_role() -> TestResult {
             .map(String::as_str)
             .collect();
 
+        let forbidden: BTreeSet<&str> = ir
+            .tool_surface()
+            .forbidden()
+            .iter()
+            .map(String::as_str)
+            .collect();
+
         for tool in profile.tool_names() {
+            // Einzige dokumentierte Ausnahme: das Explorer-Netz
+            // (`web.fetch`/`web.search`, Nutzerentscheidung „der Explorer
+            // durchsucht auch das Internet“) hängt am geteilten Profil
+            // `ReadOnlyExplore`. `analyst`/`researcher-deps` teilen dieses
+            // Profil, sollen aber kein Netz bekommen — sie müssen beide
+            // Werkzeuge deshalb **ausdrücklich** verbieten (die Aktivierung
+            // schaltet `forbidden` ab), statt sie nur stillschweigend
+            // wegzulassen, und der `explorer` muss sie admittieren.
+            let is_explorer_web_on_shared_profile = profile == RegistryProfile::ReadOnlyExplore
+                && ["web.fetch", "web.search"].contains(&tool)
+                && *role != role_names::EXPLORER;
+            if is_explorer_web_on_shared_profile {
+                assert!(
+                    forbidden.contains(tool),
+                    "Rolle {role} teilt ReadOnlyExplore mit dem explorer und muss \
+                     {tool} ausdrücklich verbieten"
+                );
+                continue;
+            }
             assert!(
                 admitted.contains(tool),
                 "Rolle {role} ({profile:?}) sieht {tool} in ihrem beworbenen \
