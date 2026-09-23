@@ -154,8 +154,8 @@ use crate::export::{
 use crate::frame_requester::{FrameRequester, MIN_FRAME_INTERVAL};
 use crate::history_cell::{
     AssistantHistoryCell, GoalCell, HistoryCell, PlainHistoryCell, PlanGraphCell,
-    ReasoningHistoryCell, SharedToolCell, SubAgentCell, SubAgentStatus, ToolCell, ToolGroupCell,
-    ToolState, ToolVerbosity, UserHistoryCell,
+    ReasoningHistoryCell, SharedReasoningCell, SharedToolCell, SubAgentCell, SubAgentStatus,
+    ToolCell, ToolGroupCell, ToolState, ToolVerbosity, UserHistoryCell,
 };
 use crate::host_permit_dialog::{HostPermitPrompt, HostPermitPromptReceiver, HostPermitVariant};
 use crate::keybindings::{KeyAction, KeyBindings};
@@ -365,6 +365,9 @@ enum ToolCellHandle {
     Single(SharedToolCell),
     /// Eine Sammelzelle aufeinanderfolgender lesender `fs.*`-Aufrufe.
     Group(Arc<Mutex<ToolGroupCell>>),
+    /// Eine einklappbare Reasoning-Zelle (Ctrl+O klappt sie wie
+    /// Werkzeugzellen auf/zu).
+    Reasoning(SharedReasoningCell),
 }
 
 impl ToolCellHandle {
@@ -377,6 +380,10 @@ impl ToolCellHandle {
         match self {
             Self::Single(cell) => cell.lock().map(|guard| guard.expanded).unwrap_or(false),
             Self::Group(group) => group.lock().map(|guard| guard.expanded).unwrap_or(false),
+            Self::Reasoning(cell) => cell
+                .lock()
+                .map(|guard| guard.is_expanded())
+                .unwrap_or(false),
         }
     }
 
@@ -391,6 +398,11 @@ impl ToolCellHandle {
             Self::Group(group) => {
                 if let Ok(mut guard) = group.lock() {
                     guard.expanded = expanded;
+                }
+            }
+            Self::Reasoning(cell) => {
+                if let Ok(mut guard) = cell.lock() {
+                    guard.set_expanded(expanded);
                 }
             }
         }
@@ -441,6 +453,8 @@ impl HistoryCell for ToolHistoryCell {
                     style::warning_style(theme),
                 ))],
             },
+            // Reasoning-Zellen rendern sich selbst (Verbosity irrelevant).
+            ToolCellHandle::Reasoning(cell) => cell.display_lines(width, theme),
         }
     }
 }
@@ -1984,7 +1998,24 @@ impl ChatApp {
         true
     }
 
-    /// Gibt `true` zurück, wenn mindestens eine Werkzeugzelle eingeklappt ist
+    /// Hängt eine (eingeklappte) Reasoning-Zelle an den Verlauf und merkt sie
+    /// für Ctrl+O vor (Runde 2 / Welle 2).
+    ///
+    /// # Argumente
+    /// - `summary` (`String`): Zusammengefasster Denkprozess-Text.
+    /// - `origin` (`Option<&str>`): Rolle eines Kind-Agenten; `None` für den
+    ///   Hauptagenten.
+    fn push_reasoning_cell(&mut self, summary: String, origin: Option<&str>) {
+        let mut cell = ReasoningHistoryCell::new(summary);
+        if let Some(role) = origin {
+            cell = cell.with_origin(role);
+        }
+        let shared = cell.into_shared();
+        self.push_cell(Box::new(Arc::clone(&shared)));
+        self.tool_cells.push(ToolCellHandle::Reasoning(shared));
+    }
+
+    /// Gibt `true` zurück, wenn mindestens eine Werkzeug- oder Reasoning-Zelle eingeklappt ist
     /// (Statuszeilen-Hinweis auf Ctrl+O, Plan Schritt 5).
     #[must_use]
     fn has_collapsed_tool_cells(&self) -> bool {
@@ -2924,7 +2955,7 @@ fn hydrate_visible_history(app: &mut ChatApp, history: &ConversationHistory) {
                 if !summary.trim().is_empty() {
                     app.export_entries
                         .push(ExportEntry::Reasoning(summary.clone()));
-                    app.push_cell(Box::new(ReasoningHistoryCell { summary }));
+                    app.push_reasoning_cell(summary, None);
                 }
             }
             TurnItem::Error(error) => {
@@ -3966,7 +3997,7 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             app.close_tool_group();
             app.export_entries
                 .push(ExportEntry::Reasoning(summary.clone()));
-            app.push_cell(Box::new(ReasoningHistoryCell { summary }));
+            app.push_reasoning_cell(summary, None);
             true
         }
         TurnEvent::AssistantDelta { text, .. } => {

@@ -1233,9 +1233,22 @@ fn analysis_question(
         .as_deref()
         .map(|version| format!("Version {version}, "))
         .unwrap_or_default();
+    let manifest = unit
+        .manifest
+        .as_deref()
+        .map(|manifest| format!("Manifest `{}`, ", path_key(manifest)))
+        .unwrap_or_default();
+    let external = if unit.external_deps.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Externe Abhängigkeiten laut Manifest: {}.\n",
+            unit.external_deps.join(", ")
+        )
+    };
     let header = format!(
-        "Analysiere {description} (Pfad `{path}`, {version}Ebene {level}) vollständig und liefere \
-         genau diese fünf Punkte:\n",
+        "Analysiere {description} (Pfad `{path}`, {manifest}{version}Ebene {level}) vollständig \
+         und liefere genau diese fünf Punkte:\n{external}",
         path = unit.rel_display(),
         level = unit.level,
     );
@@ -1746,7 +1759,7 @@ fn cell_json(cell: Option<(&RawClanSpec, &RawCellSpec)>) -> Value {
 
 // ── Operation ────────────────────────────────────────────────────────────────
 
-/// Analysiert einen Workspace bottom-up über Analyst-Kindagenten.
+/// Analysiert einen Arbeitsbereich bottom-up über Analyst-Kindagenten.
 ///
 /// # Beschreibung
 /// Siehe Modul-Dokumentation für den vollständigen Ablauf. Die Operation trägt
@@ -1766,8 +1779,8 @@ fn cell_json(cell: Option<(&RawClanSpec, &RawCellSpec)>) -> Value {
 /// # Fehler
 /// - [`OpError::InvalidArguments`]: siehe [`AnalyzeArgs::from_raw_args`].
 /// - [`OpError::NotAvailable`]: kein Plan-Store oder kein Agent-Spawner.
-/// - [`OpError::Execution`]: Workspace-Graph nicht ladbar oder Plan-Mutation
-///   abgelehnt.
+/// - [`OpError::Execution`]: Wurzel nicht lesbar, genannte Einheit unbekannt
+///   oder Plan-Mutation abgelehnt.
 ///
 /// # Nebenläufigkeit
 /// Die Kinder einer Welle laufen nebenläufig, gedeckelt durch `max_parallel`;
@@ -1799,28 +1812,16 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
     let max_parallel = args.max_parallel.unwrap_or(DEFAULT_MAX_PARALLEL).max(1);
 
     let workspace_root = ctx.sandbox().workspace().canonical_root();
-    let full_graph = if workspace_root.join("Cargo.toml").is_file() {
-        WorkspaceGraph::load(workspace_root).map_err(|error| {
-            OpError::Execution(format!(
-                "Workspace-Graph konnte nicht geladen werden: {error}"
-            ))
-        })?
-    } else {
-        synthesize_directory_graph(workspace_root)?
-    };
-    let graph = match args.crate_name.as_deref() {
-        Some(name) => full_graph.subgraph(name).map_err(|error| {
-            OpError::Execution(format!("Teilgraph für '{name}' nicht bildbar: {error}"))
-        })?,
+    let (full_graph, graph_info) = build_unit_graph(workspace_root)?;
+    let graph = match args.unit_name() {
+        Some(unit_name) => full_graph.subgraph(unit_name)?,
         None => full_graph,
     };
 
-    let levels = graph
-        .topological_levels()
-        .map_err(|error| OpError::Execution(format!("Ebenen nicht berechenbar: {error}")))?;
+    let levels = graph.levels();
     if levels.is_empty() {
         return Err(OpError::Execution(
-            "der Workspace enthält kein analysierbares Crate".to_owned(),
+            "der Arbeitsbereich enthält keine analysierbare Einheit".to_owned(),
         ));
     }
 
@@ -1828,12 +1829,10 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
     let leaf_first: Vec<String> = levels
         .iter()
         .flatten()
-        .map(|crate_node| node_id(&crate_node.name))
+        .map(|unit| node_id(&unit.name))
         .collect();
-    let crate_count = leaf_first.len();
-    let rendered = graph
-        .render_levels()
-        .map_err(|error| OpError::Execution(format!("Ebenen nicht darstellbar: {error}")))?;
+    let unit_count = leaf_first.len();
+    let rendered = graph.render_levels();
 
     // Die Wellensteuerung kommt aus der eingebauten Organisation; jede Stufe
     // fällt einzeln auf das bisherige Verhalten zurück (siehe Modul-Doku).
@@ -1843,14 +1842,14 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
         .and_then(|organization| clan_cell(organization, RESEARCH_CLAN_ID));
     let waves: Vec<WavePlan<'_>> = levels
         .iter()
-        .map(|crates| plan_wave(cell, root, crates))
+        .map(|units| plan_wave(cell, root, units))
         .collect();
 
     let waves_json: Vec<Value> = levels
         .iter()
         .zip(waves.iter())
         .enumerate()
-        .map(|(level, (crates, wave))| wave_json(level, crates, bottom_up, &wave.batches))
+        .map(|(level, (units, wave))| wave_json(level, units, bottom_up, &wave.batches))
         .collect();
 
     if dry_run {
@@ -1858,7 +1857,9 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
             "dry_run": true,
             "root": root.display().to_string(),
             "bottom_up": bottom_up,
-            "crate_count": crate_count,
+            "crate_count": unit_count,
+            "unit_count": unit_count,
+            "graph": graph_info,
             "cell": cell_json(cell),
             "waves": waves_json,
             "leaf_first": leaf_first,
@@ -1874,11 +1875,10 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
 
     // Immer leaf-first anlegen: `AddNode` akzeptiert keine unbekannte Dependency.
     let mut created = 0_usize;
-    for crates in &levels {
-        for crate_node in crates {
+    for units in &levels {
+        for unit in units {
             let dependencies: Vec<TaskId> = if bottom_up {
-                crate_node
-                    .deps
+                unit.deps
                     .iter()
                     .filter(|dep| graph.get(dep.as_str()).is_some())
                     .map(|dep| TaskId::new(node_id(dep.as_str())))
@@ -1886,7 +1886,7 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
             } else {
                 Vec::new()
             };
-            if ensure_node(plan.as_ref(), analysis_node(root, crate_node, dependencies))? {
+            if ensure_node(plan.as_ref(), analysis_node(root, unit, dependencies))? {
                 created += 1;
             }
         }
@@ -1917,9 +1917,10 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
 
             let questions: Vec<Value> = batch
                 .iter()
-                .map(|crate_node| {
-                    let consumers = graph.consumers_of(&crate_node.name);
-                    child_payload(&analysis_question(root, crate_node, &consumers))
+                .map(|unit| {
+                    let consumers = graph.consumers_of(&unit.name);
+                    let nested = graph.nested_in(unit);
+                    child_payload(&analysis_question(root, unit, &consumers, &nested))
                 })
                 .collect::<Result<Vec<Value>, OpError>>()?;
 
@@ -1928,7 +1929,7 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
                 batch = batch_index,
                 batches = wave.batches.len(),
                 cell = wave.cell_id.as_deref().unwrap_or("<rückfall>"),
-                crates = questions.len(),
+                units = questions.len(),
                 max_parallel,
                 "analyze.wave.start"
             );
@@ -1945,8 +1946,8 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
             )
             .await?;
 
-            for (crate_node, outcome) in batch.iter().zip(results) {
-                let id = node_id(&crate_node.name);
+            for (unit, outcome) in batch.iter().zip(results) {
+                let id = node_id(&unit.name);
                 match outcome {
                     Ok(value) => match finding_from_value(value) {
                         Ok(finding) => {
@@ -1998,7 +1999,9 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
         "dry_run": false,
         "root": root.display().to_string(),
         "bottom_up": bottom_up,
-        "crate_count": crate_count,
+        "crate_count": unit_count,
+        "unit_count": unit_count,
+        "graph": graph_info,
         "nodes_created": created,
         "cell": cell_json(cell),
         "waves": waves_json,
@@ -2029,14 +2032,15 @@ fn render(report: &Value) -> Result<OpOutput, OpError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnalyzeArgs, AnalyzeOperation, cell_plan_for_wave, load_organization, node_id,
-        parse_max_parallel, plan_wave, wave_batches,
+        AnalysisUnit, AnalyzeArgs, AnalyzeOperation, analysis_question, build_unit_graph,
+        cell_plan_for_wave, directory_unit, load_organization, node_id, parse_max_parallel,
+        plan_wave, wave_batches,
     };
     use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
     use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
-    use harw_code_graph::CrateNode;
     use harw_core::child_controller::JoinSemantics;
+    use harw_explorer::ProjectKind;
     use harw_operations::context::ServiceMap;
     use harw_operations::{FromRawArgs, OpContext, OpError, Operation, Surface};
     use harw_plan::{
@@ -2533,18 +2537,18 @@ mod tests {
         }
     }
 
-    /// Baut einen Crate-Knoten unterhalb von `/ws`.
-    fn crate_node(name: &str, level: u32) -> CrateNode {
-        CrateNode {
+    /// Baut eine Cargo-Einheit unterhalb von `/ws`.
+    fn crate_node(name: &str, level: u32) -> AnalysisUnit {
+        AnalysisUnit {
             name: name.to_owned(),
-            version: "0.1.0".to_owned(),
-            manifest_path: PathBuf::from(format!("/ws/{name}/Cargo.toml")),
+            kinds: vec![ProjectKind::CargoCrate],
+            rel: PathBuf::from(name),
             dir: PathBuf::from(format!("/ws/{name}")),
+            manifest: Some(PathBuf::from(format!("{name}/Cargo.toml"))),
+            cargo_name: Some(name.to_owned()),
+            version: Some("0.1.0".to_owned()),
             deps: Vec::new(),
-            dev_deps: Vec::new(),
-            build_deps: Vec::new(),
             external_deps: Vec::new(),
-            is_leaf: true,
             level,
         }
     }
@@ -2665,7 +2669,7 @@ mod tests {
     #[test]
     fn test_wave_batches_without_a_cell_is_one_batch_in_graph_order() {
         let crates = [crate_node("a", 0), crate_node("b", 0)];
-        let level: Vec<&CrateNode> = crates.iter().collect();
+        let level: Vec<&AnalysisUnit> = crates.iter().collect();
 
         let batches = wave_batches(None, &level);
 
@@ -2677,7 +2681,7 @@ mod tests {
     #[test]
     fn test_wave_batches_follows_the_cell_batch_order() {
         let crates = [crate_node("a", 0), crate_node("b", 0)];
-        let level: Vec<&CrateNode> = crates.iter().collect();
+        let level: Vec<&AnalysisUnit> = crates.iter().collect();
         let cell = CellPlan {
             cell_id: "research-wave".to_owned(),
             members: vec![TaskId::new(node_id("b")), TaskId::new(node_id("a"))],
@@ -2701,7 +2705,7 @@ mod tests {
         // Eine Zelle darf die Ebene aufteilen und umsortieren, aber kein Crate
         // verschlucken: deckt sie nicht alle ab, gilt die ungeteilte Welle.
         let crates = [crate_node("a", 0), crate_node("b", 0)];
-        let level: Vec<&CrateNode> = crates.iter().collect();
+        let level: Vec<&AnalysisUnit> = crates.iter().collect();
         let cell = CellPlan {
             cell_id: "research-wave".to_owned(),
             members: vec![TaskId::new(node_id("a"))],
@@ -2722,7 +2726,7 @@ mod tests {
         // Der Rückfall: ohne Clan/Zelle läuft die Welle wie vor der
         // Organisation — ein Batch, `AllTerminal`, kein Fehler.
         let crates = [crate_node("a", 0), crate_node("b", 0)];
-        let level: Vec<&CrateNode> = crates.iter().collect();
+        let level: Vec<&AnalysisUnit> = crates.iter().collect();
 
         assert!(cell_plan_for_wave(None, Path::new("/ws"), &level).is_none());
 
@@ -2738,7 +2742,7 @@ mod tests {
         let organization = organization()?;
         let cell = clan_cell(&organization, RESEARCH_CLAN_ID);
         let crates = [crate_node("a", 0), crate_node("b", 0)];
-        let level: Vec<&CrateNode> = crates.iter().collect();
+        let level: Vec<&AnalysisUnit> = crates.iter().collect();
 
         let wave = plan_wave(cell, Path::new("/ws"), &level);
 

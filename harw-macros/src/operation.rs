@@ -49,6 +49,8 @@ const KNOWN_AUTHORITY_REDUCERS: &[&str] = &[
     "reduce_to_read_execute",
     "reduce_to_read_registry",
     "reduce_to_read_network",
+    "reduce_to_read_explore",
+    "reduce_to_read_workspace_network",
 ];
 
 /// All parsed attribute arguments for `#[operation]`, collected into a single struct
