@@ -41,7 +41,8 @@ pub use ingress_long_poll::{LongPollConfig, LongPollShutdown, spawn_long_poll_th
 pub use ingress_webhook::{WebhookConfig, run_webhook_server, webhook_router};
 pub use mapping::{
     RawCallbackQuery, RawChat, RawDocument, RawMedia, RawMessage, RawMessageEntity, RawPhotoSize,
-    RawUpdate, RawUser, TelegramCommand, map_update, parse_command,
+    RawUpdate, RawUser, TelegramCallback, TelegramCommand, map_callback_query, map_update,
+    parse_command,
 };
 pub use media::{AttachmentIntake, DownloadedAttachment};
 pub use mirror::TelegramMirrorTransport;
