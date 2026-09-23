@@ -70,7 +70,7 @@ use harw_authority::{
 use harw_config::{PermissionsSection, PlanSection, ResolvedConfig};
 use harw_context::ContextCeiling;
 use harw_core::{
-    AgentSession, ChildRegistryFactory, DriftObserver, GuardPolicy, InteractionMode,
+    AgentSession, ChildRegistryFactory, ContextBudget, DriftObserver, GuardPolicy, InteractionMode,
     ManagedAgentSpawner, ModelProvider, OrchestrationObserver, PitfallAdvisor, RoleEffortWeights,
     SessionActivation, SessionManager, SpawnContext, StateStore, ToolProfile,
 };
@@ -2948,17 +2948,67 @@ impl ContextProvider for MemoryFactsContextProvider {
 /// # Rückgabe
 /// Die Token-Zahl des effektiven Kontextfensters, nie 0 (Vorgabe greift).
 fn resolve_context_window(config: &ResolvedConfig) -> u64 {
-    let Some(model_id) = config.harness.default_model.as_deref() else {
-        return DEFAULT_CONTEXT_WINDOW_TOKENS;
-    };
-    let entry = config.models.get(model_id).or_else(|| {
-        config.models.values().find(|model| {
-            model.id == model_id || model.aliases.iter().any(|alias| alias.as_str() == model_id)
+    match config.harness.default_model.as_deref() {
+        Some(model_id) => context_window_for_model(config, model_id),
+        None => DEFAULT_CONTEXT_WINDOW_TOKENS,
+    }
+}
+
+/// Kontextfenster eines Modells in Tokens.
+///
+/// Rangfolge: `[models.<id>].context_window` (per ID oder Alias) →
+/// eingebauter Modellkatalog (`harw-model-catalog`, verifizierte
+/// Vendor-Angaben) → [`DEFAULT_CONTEXT_WINDOW_TOKENS`].
+#[must_use]
+pub fn context_window_for_model(config: &ResolvedConfig, model_id: &str) -> u64 {
+    static CATALOG: std::sync::OnceLock<HashMap<String, u64>> = std::sync::OnceLock::new();
+    let configured = config
+        .models
+        .get(model_id)
+        .or_else(|| {
+            config.models.values().find(|model| {
+                model.id == model_id || model.aliases.iter().any(|alias| alias.as_str() == model_id)
+            })
         })
+        .and_then(|model| model.context_window);
+    if let Some(window) = configured {
+        return window;
+    }
+    let catalog = CATALOG.get_or_init(|| {
+        harw_model_catalog::descriptor::bootstrap_descriptors()
+            .into_iter()
+            .map(|d| (d.model.as_str().to_owned(), u64::from(d.context_window)))
+            .collect()
     });
-    entry
-        .and_then(|model| model.context_window)
+    // Konfigurierte ID kann auf ein Katalogmodell zeigen (`id` ≠ Schlüssel).
+    let canonical = config
+        .models
+        .get(model_id)
+        .map_or(model_id, |model| model.id.as_str());
+    catalog
+        .get(canonical)
+        .or_else(|| catalog.get(model_id))
+        .copied()
         .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS)
+}
+
+/// Byte-Budget der Request-Montage aus dem Kontextfenster abgeleitet: der
+/// Verlauf darf ~3 Bytes je Token belegen (konservativ, Text ≈ 4 B/Token),
+/// damit Auto-Compaction (70 % des Fensters) greift, **bevor** die harte
+/// Byte-Kappung still Verlauf verwirft. `[context].max_history_bytes`
+/// übersteuert.
+#[must_use]
+pub fn context_budget_for_window(config: &ResolvedConfig, window_tokens: u64) -> ContextBudget {
+    let conservative = ContextBudget::conservative();
+    let derived = usize::try_from(window_tokens.saturating_mul(3)).unwrap_or(usize::MAX);
+    ContextBudget {
+        max_context_bytes: conservative.max_context_bytes,
+        max_history_bytes: config
+            .harness
+            .compaction
+            .max_history_bytes
+            .unwrap_or_else(|| derived.max(conservative.max_history_bytes)),
+    }
 }
 
 /// Bridges controller lifecycle snapshots into the runtime's existing durable
@@ -3210,7 +3260,15 @@ fn build_spawner(
     let manager = Arc::new(std::sync::Mutex::new(
         SessionManager::new(events).with_agent_events(agent_events.clone()),
     ));
+    let window_config = Arc::new(config.clone());
     let mut spawner = ManagedAgentSpawner::new(manager, child_limits(config, model_id))
+        // Jedes Kind bekommt das Kontextfenster seines tatsächlichen Modells.
+        .with_context_window_resolver(Arc::new(move |model: Option<&str>| {
+            match model.or(window_config.harness.default_model.as_deref()) {
+                Some(model) => context_window_for_model(&window_config, model),
+                None => DEFAULT_CONTEXT_WINDOW_TOKENS,
+            }
+        }))
         // Orchestrierungs-Events gehen live auf den Bus und danach in den
         // persistierenden StateStore-Observer.
         .with_orchestration_observer(Arc::new(harw_core::HubOrchestrationObserver::new(
@@ -3920,6 +3978,16 @@ impl RuntimeAssembly {
                 .with_reasoning_effort(reasoning_effort)
                 .with_turn_event_sink(turn_events)
                 .with_agent_events(self.agent_events.clone())
+                .with_context_budget(context_budget_for_window(&self.config, context_window))
+                .with_context_window_resolver({
+                    let config = Arc::clone(&self.config);
+                    Arc::new(move |model: Option<&str>| {
+                        match model.or(config.harness.default_model.as_deref()) {
+                            Some(model) => context_window_for_model(&config, model),
+                            None => DEFAULT_CONTEXT_WINDOW_TOKENS,
+                        }
+                    })
+                })
                 .with_auto_compact(Some(
                     harw_core::AutoCompactPolicy::for_context_window(context_window)
                         .with_absolute_ceiling(Some(

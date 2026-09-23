@@ -209,6 +209,9 @@ pub struct AgentSession {
     /// [`crate::agent_events`]); jedes Turn-Event wird mit Absender-Kennung
     /// zusätzlich hierher gespiegelt.
     agent_events: Option<crate::agent_events::AgentEventHub>,
+    /// Löst bei einem Modellwechsel das neue Kontextfenster auf, damit
+    /// Auto-Compaction und Byte-Budget dem aktiven Modell folgen.
+    context_window_resolver: Option<std::sync::Arc<crate::child_controller::ContextWindowResolver>>,
     /// Startzeitpunkt des offenen Handoffs (für `ChildCompleted::duration_ms`).
     handoff_started_at: Option<std::time::Instant>,
     /// Session-level filter controlling which tools, instructions providers,
@@ -578,6 +581,7 @@ impl AgentSession {
             auto_compact: None,
             agent_events: None,
             handoff_started_at: None,
+            context_window_resolver: None,
             compaction_observer: None,
             tool_outcome_observer: None,
             compaction_summary_model: (None, None),
@@ -783,6 +787,11 @@ impl AgentSession {
     pub fn with_context_budget(mut self, context_budget: ContextBudget) -> Self {
         self.context_budget = context_budget;
         self
+    }
+
+    /// Nicht-konsumierende Variante von [`Self::with_context_budget`].
+    pub fn set_context_budget(&mut self, context_budget: ContextBudget) {
+        self.context_budget = context_budget;
     }
 
     #[must_use]
@@ -1030,7 +1039,29 @@ impl AgentSession {
     /// already registered in the session manager. `None` falls back to the
     /// provider's catalog default.
     pub fn set_active_model(&mut self, model: Option<ModelId>) {
+        let changed = self.active_model != model;
         self.active_model = model;
+        if changed
+            && let Some(resolve) = &self.context_window_resolver
+        {
+            let window = resolve(self.active_model.as_ref().map(ModelId::as_str));
+            if let Some(policy) = self.auto_compact {
+                self.auto_compact = Some(policy.rescaled(window));
+            }
+            let history = usize::try_from(window.saturating_mul(3)).unwrap_or(usize::MAX);
+            self.context_budget.max_history_bytes = history.max(ContextBudget::conservative().max_history_bytes);
+        }
+    }
+
+    /// Setzt den Resolver für Kontextfenster je Modell (siehe
+    /// [`Self::set_active_model`]).
+    #[must_use]
+    pub fn with_context_window_resolver(
+        mut self,
+        resolver: std::sync::Arc<crate::child_controller::ContextWindowResolver>,
+    ) -> Self {
+        self.context_window_resolver = Some(resolver);
+        self
     }
 
     /// Builder-style setter: overrides the provider used for every turn of

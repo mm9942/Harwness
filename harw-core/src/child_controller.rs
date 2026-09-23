@@ -661,6 +661,13 @@ pub enum ChildStatus {
     Cancelled,
 }
 
+/// Löst das Kontextfenster (Tokens) für eine Modell-ID auf (`None` =
+/// Vorgabemodell). Siehe [`ManagedAgentSpawner::with_context_window_resolver`].
+pub type ContextWindowResolver = dyn Fn(Option<&str>) -> u64 + Send + Sync;
+
+/// Kontextfenster eines Kindes ohne Resolver (Addendum D).
+pub const DEFAULT_CHILD_CONTEXT_WINDOW: u64 = 200_000;
+
 /// Receives bounded lifecycle snapshots after controller locks have been
 /// released. Implementations may persist, forward, or fan out the event but
 /// must not make scheduling decisions inside the controller.
@@ -1358,6 +1365,9 @@ pub struct ManagedAgentSpawner {
     /// (Rolle + Anweisung, whitespace-normalisiert, kleingeschrieben) —
     /// erkennt eine doppelt vergebene Delegation (Addendum F+G).
     recent_delegation_hashes: Mutex<BTreeMap<String, VecDeque<u64>>>,
+    /// Kontextfenster (Tokens) je Modell-ID des Kindes; `None`-Argument =
+    /// Vorgabemodell. Ohne Resolver gilt [`DEFAULT_CHILD_CONTEXT_WINDOW`].
+    context_window_resolver: Option<Arc<ContextWindowResolver>>,
     /// Optional sink for user-safe lifecycle snapshots. Invocation happens
     /// only after the active/cancellation/manager locks are released.
     orchestration_observer: Option<Arc<dyn OrchestrationObserver>>,
@@ -1627,6 +1637,21 @@ impl ManagedAgentSpawner {
         emit_orchestration_event(observer, root_session_id, record, task, status);
     }
 
+    /// Setzt den Resolver, der jedem Kind das Kontextfenster **seines**
+    /// Modells zuweist (statt eines festen Werts). Grundlage für Auto-
+    /// Compaction und das Byte-Budget des Kindes.
+    #[must_use]
+    pub fn with_context_window_resolver(mut self, resolver: Arc<ContextWindowResolver>) -> Self {
+        self.context_window_resolver = Some(resolver);
+        self
+    }
+
+    fn context_window_for(&self, model: Option<&str>) -> u64 {
+        self.context_window_resolver
+            .as_ref()
+            .map_or(DEFAULT_CHILD_CONTEXT_WINDOW, |resolve| resolve(model))
+    }
+
     #[must_use]
     pub fn new(manager: Arc<Mutex<SessionManager>>, limits: ChildLimits) -> Self {
         Self {
@@ -1645,6 +1670,7 @@ impl ManagedAgentSpawner {
             guard_policy: crate::guard::GuardPolicy::default(),
             pitfall_advisor: None,
             recent_delegation_hashes: Mutex::new(BTreeMap::new()),
+            context_window_resolver: None,
             orchestration_observer: None,
             freed: tokio::sync::Notify::new(),
         }
@@ -4342,11 +4368,23 @@ impl ManagedAgentSpawner {
                     "child session {child} disappeared before the auto-compact policy was set: {error}"
                 ))
             })?;
-            // 200_000: Default-Kontextfenster laut Addendum D, unabhängig vom
-            // tatsächlich aktiven Modell — die relative 70 %-Schwelle bleibt
-            // für reale Fenster maßgeblich; der feste Deckel (s. u.) begrenzt
-            // zusätzlich die kumulierte Input-Nutzung langer Sessions (Standard: 500 000).
-            let base_policy = crate::auto_compact::AutoCompactPolicy::for_context_window(200_000)
+            // Kontextfenster des tatsächlich aktiven Kind-Modells (Resolver
+            // aus der Runtime: Config → Modellkatalog → 200 000). Die relative
+            // 70 %-Schwelle gilt gegen dieses Fenster; der feste Deckel (s. u.)
+            // begrenzt zusätzlich die kumulierte Input-Nutzung langer
+            // Sessions (Standard: 500 000).
+            let window = self.context_window_for(
+                child_session.active_model().map(harw_types::ModelId::as_str),
+            );
+            let history_budget = usize::try_from(window.saturating_mul(3)).unwrap_or(usize::MAX);
+            let budget = child_session.context_budget();
+            if history_budget > budget.max_history_bytes {
+                child_session.set_context_budget(crate::context_budget::ContextBudget {
+                    max_context_bytes: budget.max_context_bytes,
+                    max_history_bytes: history_budget,
+                });
+            }
+            let base_policy = crate::auto_compact::AutoCompactPolicy::for_context_window(window)
                 .with_absolute_ceiling(Some(crate::auto_compact::DEFAULT_ABSOLUTE_CEILING_TOKENS));
             let policy = match definition.organizational_role {
                 harw_agent_dsl::roles::AgentRoleId::RootOrchestrator

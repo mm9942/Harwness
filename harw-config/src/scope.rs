@@ -365,8 +365,9 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "internal_models.worker_simple", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "internal_models.worker_complex", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "InternalModelChoice.provider/.model", scope: Scope::Profile, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: false },
-    // 1.14 [compaction] (1)
+    // 1.14 [compaction] (2)
     FieldScope { path: "compaction.absolute_ceiling_tokens", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "compaction.max_history_bytes", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // 1.15 [reasoning] (6)
     FieldScope { path: "reasoning.uia", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "reasoning.root_orchestrator", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
@@ -390,7 +391,7 @@ mod merge_rule_tests {
 
     #[test]
     fn test_field_table_has_exactly_89_entries() {
-        assert_eq!(FIELD_TABLE.len(), 89);
+        assert_eq!(FIELD_TABLE.len(), 90);
     }
 
     #[test]

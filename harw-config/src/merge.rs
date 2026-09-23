@@ -1212,6 +1212,12 @@ fn merge_compaction(
         layer_path,
         out,
     );
+    profile_replaces(
+        &mut trusted.compaction.max_history_bytes,
+        incoming.max_history_bytes,
+        field_present(raw, &["compaction", "max_history_bytes"]),
+        role,
+    );
 }
 
 // `[reasoning]` (Abschnitt 1.15) — alle sechs Felder `ProfileReplaces`.

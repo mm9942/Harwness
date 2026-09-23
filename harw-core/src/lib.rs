@@ -57,7 +57,7 @@ pub use capture::{ToolOutcome, ToolOutcomeObserver, ToolOutcomeStatus};
 pub use child_controller::{
     AgentBudget, BudgetDimension, ChildLimits, ChildRecord, ChildRegistryFactory, ChildRunResult,
     ExpiredChild, FanoutRequest, JoinSemantics, ManagedAgentSpawner, OrchestrationObserver,
-    ParentGrant, RoleEffortWeights, TaskComplexity,
+    ParentGrant, RoleEffortWeights, TaskComplexity, ContextWindowResolver, DEFAULT_CHILD_CONTEXT_WINDOW,
 };
 pub use compaction::{
     CompactionObserver, CompactionOutcome, CompactionPlan, SUMMARY_MARKER, compact_session,
