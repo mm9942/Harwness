@@ -17,6 +17,7 @@ use std::fmt;
 use crate::error::NetlinkError;
 
 /// Fehler eines Tests; jeder Fehlschlag wird als `Err` zurückgegeben statt zu paniken.
+#[allow(dead_code)] // nicht jede Testdatei nutzt jedes Element
 pub(crate) enum TestError {
     /// Ein erwarteter Wert fehlte (`Option` war `None`).
     Missing(&'static str),
@@ -65,6 +66,7 @@ impl From<NetlinkError> for TestError {
 }
 
 /// Kurzform für `Result<T, TestError>`.
+#[allow(dead_code)] // nicht jede Testdatei nutzt jedes Element
 pub(crate) type TestResult<T = ()> = Result<T, TestError>;
 
 /// Hilfsfunktion, die einen Fremdfehler mit Kontext in [`TestError::Context`] überführt.
@@ -77,6 +79,7 @@ pub(crate) type TestResult<T = ()> = Result<T, TestError>;
 ///
 /// # Returns
 /// Eine Closure, die einen `Display`-fähigen Fremdfehler in [`TestError::Context`] überführt.
+#[allow(dead_code)] // nicht jede Testdatei nutzt jedes Element
 pub(crate) fn ctx<E: fmt::Display>(context: &'static str) -> impl FnOnce(E) -> TestError {
     move |source| TestError::Context {
         context,

@@ -7,6 +7,10 @@ use std::fmt;
 /// Fehler eines Tests; jeder Fehlschlag wird als `Err` zurückgegeben.
 pub(crate) enum TestError {
     /// Ein erwarteter Wert fehlte (`Option` war `None`).
+    #[allow(
+        dead_code,
+        reason = "gemeinsamer Test-Helfer; derzeit von keinem Test benutzt"
+    )]
     Missing(&'static str),
     /// Ein Ergebnis hatte eine unerwartete Form.
     Unexpected(String),

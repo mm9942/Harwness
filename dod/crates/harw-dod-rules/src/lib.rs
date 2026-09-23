@@ -68,12 +68,17 @@
 //! # Examples
 //! ```rust
 //! use harw_authority::NetworkScope;
+//! use harw_code_graph::lockfile::LockedPackage;
+//! use harw_dod_rules::advisory::{Advisory, correlate_advisories};
 //! use harw_dod_rules::rule::{Rule, RuleContext};
 //! use harw_dod_rules::rules::EgressFlowRule;
-//! use harw_dod_rules::{run_rules, triage, Verdict};
-//! use harw_dod_signals::{EventKind, SecurityEvent};
+//! use harw_dod_rules::{FindingKind, run_rules, triage, Verdict};
+//! use harw_dod_signals::{EventKind, SecurityEvent, Severity};
 //! use harw_types::SensorId;
+//! use semver::VersionReq;
 //!
+//! // 1. Regeln auswerten: `run_rules` führt alle Regeln aus und liefert
+//! //    rohe, noch nicht geprüfte Befunde (`Finding<Raw>`).
 //! let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
 //! let events = vec![SecurityEvent {
 //!     sensor: SensorId::from_str("net-0"),
@@ -91,10 +96,33 @@
 //!     baselines: &[],
 //!     network_scope: &scope,
 //! };
+//! let raw = run_rules(&ctx)
+//!     .into_iter()
+//!     .find(|f| f.rule_id() == EgressFlowRule.id())
+//!     .expect("EgressFlowRule löst aus");
+//! assert_eq!(raw.kind(), FindingKind::RuleTriggered);
 //!
-//! let rule: &dyn Rule = &EgressFlowRule;
-//! let checked = run_rules(&[rule], &ctx);
-//! let finding = checked.into_iter().next().expect("EgressFlowRule löst aus");
+//! // 2. Einen geprüften Befund triagieren.
+//!
+//! let locked = vec![LockedPackage {
+//!     name: "example-crate".to_owned(),
+//!     version: "1.9.0".to_owned(),
+//!     source: None,
+//!     checksum: None,
+//! }];
+//! let advisories = vec![Advisory {
+//!     id: "RUSTSEC-2024-0001".to_owned(),
+//!     crate_name: "example-crate".to_owned(),
+//!     vulnerable_ranges: vec![VersionReq::parse("<1.10.0").expect("gültiger Bereich")],
+//!     severity: Severity::High,
+//!     summary: "Beispiel-Advisory".to_owned(),
+//! }];
+//! // `run_rules` liefert nur `Finding<Raw>`; `correlate_advisories` ist die
+//! // öffentliche Prägestelle für einen geprüften `Finding<RuleChecked>`.
+//! let finding = correlate_advisories(&advisories, &locked, jiff::Timestamp::UNIX_EPOCH)
+//!     .into_iter()
+//!     .next()
+//!     .expect("Advisory trifft");
 //! let triaged = triage(finding, Verdict::Confirmed);
 //! assert_eq!(*triaged.verdict(), Verdict::Confirmed);
 //! ```

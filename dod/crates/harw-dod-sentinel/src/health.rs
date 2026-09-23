@@ -371,7 +371,7 @@ impl SensorHealth {
 #[cfg(test)]
 mod tests {
     use super::{DegradeReason, RetryPolicy, SensorHealth};
-    use crate::test_support::{TestError, TestResult};
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_dod_cap::Permanence;
     use jiff::{SignedDuration, Timestamp};
 
@@ -487,7 +487,7 @@ mod tests {
             next_attempt,
             Timestamp::UNIX_EPOCH
                 .checked_add(backoff)
-                .ok_or(TestError::Missing("in range"))?
+                .map_err(ctx("timestamp in range"))?
         );
         Ok(())
     }
@@ -509,7 +509,7 @@ mod tests {
     fn test_is_due_false_before_next_attempt_and_true_after() -> TestResult {
         let next_attempt = Timestamp::UNIX_EPOCH
             .checked_add(SignedDuration::from_secs(30))
-            .ok_or(TestError::Missing("in range"))?;
+            .map_err(ctx("timestamp in range"))?;
         let retrying = SensorHealth::Retrying {
             failures: 1,
             next_attempt,

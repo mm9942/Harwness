@@ -639,7 +639,7 @@ impl WorkRequestStore {
     ///
     /// # Errors
     /// - [`TelegramChannelError::WorkRequestNotFound`]: unbekannte `WorkId`.
-    /// - [`TelegramChannelError::WorkRequestInvalidTransition`]: Zustand
+    /// - [`TelegramChannelError::WorkRequestInvalidTransition`] bei Zustand
     ///   `Requested`, `Denied` oder `Cancelled`.
     /// - [`TelegramChannelError::Io`] / [`TelegramChannelError::Serde`]:
     ///   Persistenzfehler des Datensatzes. Ein Launch-Fehlschlag ist **kein**

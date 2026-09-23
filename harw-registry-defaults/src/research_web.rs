@@ -171,10 +171,7 @@ pub fn install_web_tools(
         SearchBackend::Brave => Some("api.search.brave.com".to_owned()),
         SearchBackend::Tavily => Some("api.tavily.com".to_owned()),
         SearchBackend::DuckDuckGo => Some("html.duckduckgo.com".to_owned()),
-        SearchBackend::Searxng => search
-            .endpoint
-            .as_deref()
-            .and_then(|endpoint| url_host(endpoint)),
+        SearchBackend::Searxng => search.endpoint.as_deref().and_then(url_host),
     };
     install_search_config(WebSearchConfig {
         provider: backend,

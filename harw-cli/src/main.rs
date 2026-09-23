@@ -217,11 +217,11 @@ fn resolve_log_directive(
         return level.to_owned();
     }
     let valid = |value: &str| !value.trim().is_empty() && EnvFilter::try_new(value).is_ok();
-    if let Some(value) = rust_log.filter(|value| valid(*value)) {
+    if let Some(value) = rust_log.filter(|value| valid(value)) {
         return value.to_owned();
     }
     if let Some(value) = config_level.filter(|value| {
-        !value.trim().eq_ignore_ascii_case(CONFIG_DEFAULT_LOG_LEVEL) && valid(*value)
+        !value.trim().eq_ignore_ascii_case(CONFIG_DEFAULT_LOG_LEVEL) && valid(value)
     }) {
         return value.to_owned();
     }

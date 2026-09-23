@@ -19,9 +19,9 @@ use common::{TestError, TestResult, ctx};
 use harw_authority::NetworkScope;
 use harw_dod::{
     Actor, Capability, CpuSensor, EgressFlowRule, EventKind, ReadScope, Rule, RuleContext,
-    SecurityEvent, Sensor, SensorHandle, Verdict, run_rules, triage,
+    SecurityEvent, Sensor, SensorHandle, Verdict, run_rules,
 };
-use harw_types::SensorId;
+use harw_types::{FindingId, SensorId};
 
 /// "Beobachte den Host": ein Griff bauen, einen der neun re-exportierten
 /// Sensor-Typen daraus konstruieren, abrufen — ausschließlich über
@@ -74,20 +74,33 @@ fn test_facade_evaluates_a_finding_end_to_end() -> TestResult {
         baselines: &[],
         network_scope: &scope,
     };
-    let rule: &dyn Rule = &EgressFlowRule;
-
-    let checked = run_rules(&[rule], &ctx);
+    let fired: Vec<_> = run_rules(&ctx)
+        .into_iter()
+        .filter(|finding| finding.rule_id() == EgressFlowRule.id())
+        .collect();
     assert_eq!(
-        checked.len(),
+        fired.len(),
         1,
         "a destination outside the allowed scope must trigger exactly one finding"
     );
 
-    let finding = checked
+    let finding = fired
         .into_iter()
         .next()
         .ok_or(TestError::Missing("checked above"))?;
-    let triaged = triage(finding, Verdict::Confirmed);
+    // `run_rules` liefert `Finding<Raw>`; `Raw -> RuleChecked` ist in
+    // `harw-dod-rules` `pub(crate)`. Die Testhilfe `triaged_finding_for_test`
+    // (Feature `test-support`) geht intern exakt `raw(..).check(id)` + `triage`.
+    let triaged = harw_dod_rules::triaged_finding_for_test(
+        finding.rule_id(),
+        finding.kind(),
+        finding.severity(),
+        finding.hardness(),
+        finding.summary(),
+        finding.observed_at(),
+        FindingId::new(),
+        Verdict::Confirmed,
+    );
     assert_eq!(*triaged.verdict(), Verdict::Confirmed);
     Ok(())
 }

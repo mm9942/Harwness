@@ -973,6 +973,7 @@ name = "harw-dod-sentinel"
 version = "0.3.0"
 dependencies = [
  "harw-authority",
+ "harw-code-graph",
  "harw-dod-cap",
  "harw-dod-rules",
  "harw-dod-signals",
@@ -982,6 +983,7 @@ dependencies = [
  "harw-sandbox",
  "harw-types",
  "jiff",
+ "semver",
  "serde_json",
  "tempfile",
 ]

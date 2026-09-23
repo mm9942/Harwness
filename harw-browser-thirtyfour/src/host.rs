@@ -123,13 +123,16 @@ impl BrowserHost for FirefoxHost {
         request: OpenBrowserRequest,
     ) -> harw_browser::Result<BrowserSessionHandle> {
         self.validate_open_request(&request)?;
-        let pin = self.config.geckodriver_pin().ok_or_else(|| {
-            BrowserError::CapabilityUnavailable {
+        let pin =
+            self.config
+                .geckodriver_pin()
+                .ok_or_else(|| {
+                    BrowserError::CapabilityUnavailable {
                 detail:
                     "no pinned geckodriver (path + SHA-256) is configured for the Firefox adapter"
                         .to_owned(),
             }
-        })?;
+                })?;
         let launcher =
             self.config
                 .launcher()

@@ -82,6 +82,11 @@ harw-types = { path = "../../../harw-types" }
 # nicht (siehe `//!`-Block).
 harw-sandbox = { path = "../../../harw-sandbox" }
 jiff = { workspace = true }
+# `triaged_finding_for_test` (Feature `test-support`): `run_rules` liefert
+# `Finding<Raw>`, der Übergang zu `Finding<RuleChecked>` ist in
+# `harw-dod-rules` `pub(crate)`. Der Fassaden-Integrationstest triagiert den
+# echten Regelbefund deshalb über diese Testhilfe; im Release-Build nie aktiv.
+harw-dod-rules = { path = "../harw-dod-rules", features = ["test-support"] }
 # Baut eine synthetische `stat`-Datei für den Sensor-Integrationstest, statt
 # sich auf ein reales `/proc` zu verlassen (Testrichtlinie: kein Dateisystem
 # ohne `#[ignore]`).

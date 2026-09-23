@@ -273,11 +273,13 @@
 //! assert!(reading.is_ok());
 //! ```
 //!
-//! „Bewerte einen Befund" — eine Regel gegen ein beobachtetes Ereignis
-//! auswerten und triagieren:
+//! „Bewerte einen Befund" — die Regeln gegen ein beobachtetes Ereignis
+//! auswerten. `run_rules` liefert derzeit `Finding<Raw>`; der Übergang zu
+//! `Finding<RuleChecked>` (und damit [`triage`]) ist in `harw-dod-rules`
+//! `pub(crate)` und über diese Fassade nicht erreichbar:
 //!
 //! ```rust
-//! use harw_dod::{Actor, EgressFlowRule, EventKind, Rule, RuleContext, SecurityEvent, Verdict, run_rules, triage};
+//! use harw_dod::{Actor, EgressFlowRule, EventKind, Rule, RuleContext, SecurityEvent, run_rules};
 //! use harw_authority::NetworkScope;
 //! use harw_types::SensorId;
 //!
@@ -298,11 +300,8 @@
 //!     baselines: &[],
 //!     network_scope: &scope,
 //! };
-//! let rule: &dyn Rule = &EgressFlowRule;
-//! let checked = run_rules(&[rule], &ctx);
-//! let finding = checked.into_iter().next().expect("EgressFlowRule loest aus");
-//! let triaged = triage(finding, Verdict::Confirmed);
-//! assert_eq!(*triaged.verdict(), Verdict::Confirmed);
+//! let findings = run_rules(&ctx);
+//! assert!(findings.iter().any(|finding| finding.rule_id() == EgressFlowRule.id()));
 //! ```
 //!
 //! # Stand

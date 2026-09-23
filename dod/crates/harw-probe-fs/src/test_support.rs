@@ -5,6 +5,7 @@
 use std::fmt;
 
 /// Fehler eines Tests; jeder Fehlschlag wird als `Err` zurückgegeben.
+#[allow(dead_code)] // nicht jede Testdatei nutzt jedes Element
 pub(crate) enum TestError {
     /// Ein erwarteter Wert fehlte (`Option` war `None`).
     Missing(&'static str),
@@ -20,6 +21,7 @@ pub(crate) enum TestError {
 }
 
 /// Ergebnis einer Testfunktion bzw. eines Test-Helfers.
+#[allow(dead_code)] // nicht jede Testdatei nutzt jedes Element
 pub(crate) type TestResult<T = ()> = Result<T, TestError>;
 
 impl fmt::Display for TestError {
@@ -47,6 +49,7 @@ impl std::error::Error for TestError {}
 /// ```rust,ignore
 /// let text = std::fs::read_to_string(path).map_err(ctx("Datei lesen"))?;
 /// ```
+#[allow(dead_code)] // nicht jede Testdatei nutzt jedes Element
 pub(crate) fn ctx<E: fmt::Display>(context: &'static str) -> impl FnOnce(E) -> TestError {
     move |error| TestError::Context {
         context,

@@ -126,15 +126,12 @@ fn connect_blocking(specs: Vec<McpServerSpec>) -> Option<Arc<McpToolProvider>> {
         scope
             .spawn(move || {
                 handle.block_on(async move {
-                    match tokio::time::timeout(
+                    tokio::time::timeout(
                         CONNECT_BUDGET,
                         McpToolProvider::connect(specs, "harw", env!("CARGO_PKG_VERSION")),
                     )
                     .await
-                    {
-                        Ok(result) => Some(result),
-                        Err(_) => None,
-                    }
+                    .ok()
                 })
             })
             .join()
