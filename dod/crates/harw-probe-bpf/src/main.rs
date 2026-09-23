@@ -96,27 +96,18 @@
 //! Betreiber mehrere Instanzen dieser Sonde nebeneinander betreibt (z. B.
 //! je Netzwerk-Namensraum).
 //!
-//! # Mein Urteil zur Schnittstellen-Unstimmigkeit: `harw-dod-procmon` vs.
-//! `harw-dod-flow`
-//! Siehe [`sensors`]-Moduldoku für die vollständige Begründung — hier nur
-//! die Kurzfassung, weil dieses Modul der Ort ist, an dem ein Leser zuerst
-//! sucht. `harw-dod-procmon` implementiert `harw_dod_signals::Sensor`;
-//! `harw-dod-flow` implementiert ihn bewusst nicht und bietet stattdessen
-//! `observe()`. Als der einzige echte Aufrufer beider Crates halte ich
-//! `harw-dod-procmon`s Form für die richtige: sie lässt sich mit einer
-//! einzigen, generischen Zeile ansteuern
-//! (`Vec<Arc<dyn Sensor>>`/`sensor.poll(now)`, siehe [`collect`]), während
-//! `harw-dod-flow` ohne einen eigenen Adapter einen zweiten, andersartigen
-//! Ansteuerungspfad verlangt hätte. Der von `harw-dod-flow` angeführte
-//! Grund (`harw_dod_fixtures::sensor_suite!` ließe sich durch einen Sensor
-//! austricksen, der `handle.scope()` nie anfasst) ist real, aber bereits von
-//! `harw-dod-procmon` selbst gelöst: dieselbe Beobachtung, aber die
-//! gegenteilige Konsequenz — `Sensor` implementieren, `sensor_suite!`
-//! bewusst nicht verwenden, stattdessen ehrliche, von Hand geschriebene
-//! Tests liefern. Diese Sonde kann `harw-dod-flow` nicht ändern (außerhalb
-//! ihres Schreibbereichs) und baut deshalb lokal [`sensors::FlowSensor`] —
-//! einen Adapter, der die Unstimmigkeit an genau der einen Stelle auffängt,
-//! an der sie sonst jeden künftigen Aufrufer dieser Sonde getroffen hätte.
+//! # Zwei Ansteuerungspfade in einer Schleife
+//! Geladene Sensoren werden nicht über `harw_dod_signals::Sensor::poll`
+//! gelesen, sondern direkt über den gemeinsamen `RealBpfLoader`
+//! ([`collect::drain_wire_once`]): der produktive Ladepfad
+//! (`load_contracts`, `read_wire_events`, `loss_counters`) ist ein
+//! inhärenter Teil von `RealBpfLoader`, nicht des `BpfLoader`-Traits, dessen
+//! `load` für reale Objekte bewusst immer scheitert. Nur degradierte
+//! Sensoren ([`sensors::UnavailableSensor`]) laufen weiter über den
+//! generischen `Sensor`-Pfad ([`collect::run_once`]). [`collect_forever`]
+//! bedient beide Pfade in derselben Runde. Das Urteil zur
+//! Schnittstellen-Unstimmigkeit zwischen `harw-dod-procmon` und
+//! `harw-dod-flow` steht in der [`sensors`]-Moduldoku.
 //!
 //! # Stand der eBPF-Bindung
 //! Produktiv lädt diese Sonde über **einen** gemeinsamen

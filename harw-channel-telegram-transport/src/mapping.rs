@@ -178,10 +178,17 @@ pub fn map_update(
 }
 
 /// Parses only the closed remote-command syntax; it performs no resolution.
+///
+/// Die Gruppenform `/cmd@botname args` wird akzeptiert: ein `@username`-Suffix
+/// am Befehlstoken wird entfernt, sofern er nicht leer ist und nur aus dem
+/// Telegram-Username-Zeichensatz `[A-Za-z0-9_]` besteht. Welcher Bot adressiert
+/// ist, wird hier bewusst nicht geprüft; die Adressierung entscheidet die
+/// Mention-/Admission-Logik.
 #[must_use]
 pub fn parse_command(text: &str) -> Option<TelegramCommand> {
     let text = text.trim();
     let (command, arguments) = text.split_once(char::is_whitespace)?;
+    let command = strip_bot_suffix(command)?;
 
     match command {
         "/request" => parse_request(arguments),
