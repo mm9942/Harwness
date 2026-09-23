@@ -8,16 +8,20 @@
 //!   Liste von `harw_dod_signals::Sensor`-Trait-Objekten aus:
 //!   `sensor.poll(now)` je Sensor, jedes dabei geformte Ereignis wird an
 //!   [`crate::sink::EventSink`] weitergereicht. Diese Funktion iteriert
-//!   generisch über `Vec<std::sync::Arc<dyn harw_dod_signals::Sensor>>` —
-//!   **eine** Sammelschleife für alle Sensoren (u. a.
-//!   `crate::sensors::UnavailableSensor`), nicht mehrere. [`run_forever`]
-//!   ruft [`run_once`] wiederholt auf, bis ein dauerhafter Fehler auftritt.
+//!   generisch über `Vec<std::sync::Arc<dyn harw_dod_signals::Sensor>>`.
+//!   Produktiv tragen diesen Weg nur degradierte Sensoren
+//!   (`crate::sensors::UnavailableSensor`); geladene Sensoren laufen
+//!   ausschließlich über den Wire-Weg.
 //! - **Wire-Weg.** [`drain_wire_once`] liest je [`WireSource`] (ein Sensor,
 //!   dessen v1-Objekte über `harw_dod_bpf::RealBpfLoader::load_contracts`
 //!   geladen sind) die versionierten Wire-Records aller Griffe, formt sie
 //!   über einen privaten v1-Wandler zu `SecurityEvent`s und rechnet die
 //!   Verlustzähler der Ladeschicht ab. [`unload_all`] entfernt beim
 //!   kontrollierten Stopp alle Griffe wieder.
+//!
+//! Die Schleife selbst lebt nicht hier: `main::collect_forever` ruft je
+//! Runde [`run_once`] und [`drain_wire_once`] auf, entscheidet über
+//! vorübergehende Fehler und liest die Systemuhr (Kompositionswurzel).
 //!
 //! # Zeitbudget einer Wire-Runde
 //! [`WIRE_ROUND_BUDGET`] (200 ms, dieselbe Wartezeit wie
@@ -92,20 +96,19 @@
 //! sind.
 //!
 //! # Ohne Kernel, ohne Socket testbar
-//! Jeder Test dieses Moduls konstruiert seine Sensoren entweder als reine
-//! Mock-Implementierungen von `harw_dod_signals::Sensor` oder über
-//! `crate::sensors::build_procmon_sensor`/`build_flow_sensor` mit je einer
-//! eigenen `harw_dod_bpf::fixture::FixtureBpfLoader`-Instanz. Der Wire-Weg
-//! wird über seine reinen Bausteine getestet (Wandler, Verlustdifferenz,
-//! Degradierungsauswahl); kein Test lädt ein echtes eBPF-Programm, öffnet
-//! einen echten Socket oder bindet Landlock.
+//! Der Sensor-Weg wird mit reinen Mock-Implementierungen von
+//! `harw_dod_signals::Sensor` und mit `crate::sensors::UnavailableSensor`
+//! getestet (dessen erste Lesung kommt ohne Kernel und ohne Wartezeit aus).
+//! Der Wire-Weg wird über seine reinen Bausteine getestet (Wandler,
+//! Verlustdifferenz, Degradierungsauswahl); kein Test lädt ein echtes
+//! eBPF-Programm, öffnet einen echten Socket oder bindet Landlock.
 //!
 //! # Exportierte Typen
-//! [`run_once`], [`run_forever`], [`WireSource`], [`WIRE_ROUND_BUDGET`],
+//! [`run_once`], [`WireSource`], [`WIRE_ROUND_BUDGET`],
 //! [`drain_wire_once`], [`unload_all`].
 //!
 //! # Nebenläufigkeit
-//! [`run_once`]/[`run_forever`] haben keine innere Veränderlichkeit.
+//! [`run_once`] hat keine innere Veränderlichkeit.
 //! [`WireSource`] hält seinen letzten Verluststand hinter einem `Mutex`
 //! (vergiftet → der innere Wert wird weiterverwendet, wie in
 //! `RealBpfLoader`); [`drain_wire_once`] ist für genau einen Aufrufer je
@@ -130,7 +133,6 @@ use harw_authority::NetworkScope;
 use harw_dod_bpf::{
     BpfHandle, BpfLossCounters, KernelTimeMapper, RealBpfLoader, TimedWireEvent, WireEventType,
 };
-use harw_dod_cap::Permanence;
 use harw_dod_flow::{Direction, FlowEvent, Protocol};
 use harw_dod_procmon::ExecutablePathCapture;
 use harw_dod_signals::{Actor, EventKind, SecurityEvent, Sensor};
@@ -178,44 +180,6 @@ pub fn run_once(
         }
     }
     Ok(sent)
-}
-
-/// Läuft unbegrenzt: ruft [`run_once`] wiederholt auf, bis ein dauerhafter
-/// Fehler auftritt.
-///
-/// # Description
-/// Ein Sensorfehler mit `harw_dod_cap::Permanence::Transient` wird geloggt
-/// und die Schleife läuft weiter; jeder andere Fehler (dauerhafte
-/// Sensorfehler, jeder Sendefehler der Senke) beendet die Schleife. Liest
-/// die Systemuhr selbst — das ist an dieser Stelle richtig, nicht in einem
-/// Sensor selbst (siehe `harw_dod_signals::sensor`-Moduldoku, Abschnitt
-/// „Nie die Systemuhr lesen"): diese Funktion ist die Kompositionswurzel,
-/// die laut Konvention dieses Workspace die Systemuhr lesen darf (Muster:
-/// `harw-probe-fs::collect::run_forever`, `harw-sentinel::main::poll_once`).
-///
-/// # Arguments
-/// - `sensors` (`&[std::sync::Arc<dyn harw_dod_signals::Sensor>]`): die
-///   Sensoren, die wiederholt abgefragt werden.
-/// - `sink` (`&dyn crate::sink::EventSink`): die Senke, an die jedes
-///   geformte Ereignis gesendet wird.
-///
-/// # Returns
-/// Diese Funktion kehrt nur über einen Fehler zurück; es gibt keinen
-/// regulären `Ok`-Rückweg außer einem Abbruch von außen (Prozesssignal).
-///
-/// # Errors
-/// Der erste dauerhafte Fehler aus [`run_once`].
-pub fn run_forever(sensors: &[Arc<dyn Sensor>], sink: &dyn EventSink) -> Result<(), ProbeError> {
-    loop {
-        let now = Timestamp::now();
-        match run_once(sensors, sink, now) {
-            Ok(_) => {}
-            Err(ProbeError::Sensor(err)) if err.permanence() == Permanence::Transient => {
-                tracing::warn!(error = %err, "transient sensor error; retrying");
-            }
-            Err(err) => return Err(err),
-        }
-    }
 }
 
 /// Gesamtes Zeitbudget einer [`drain_wire_once`]-Runde über alle Griffe.
@@ -694,22 +658,16 @@ pub fn unload_all(loader: &RealBpfLoader, sources: &[WireSource]) {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use harw_authority::NetworkScope;
-    use harw_dod_bpf::BpfProgramSource;
-    use harw_dod_bpf::event::RawBpfEvent;
-    use harw_dod_bpf::fixture::FixtureBpfLoader;
     use harw_dod_cap::{Bound, Capability, ReadScope, SensorError, SensorHandle};
     use harw_dod_signals::{EventKind, SecurityEvent, Sensor, SensorReading};
     use harw_types::{ContentDigest, SensorId};
     use jiff::Timestamp;
 
-    use super::{run_forever, run_once};
+    use super::run_once;
     use crate::error::ProbeError;
-    use crate::sensors::{build_flow_sensor, build_procmon_sensor};
+    use crate::sensors::UnavailableSensor;
     use crate::sink::EventSink;
     use crate::test_support::{TestError, TestResult, ctx};
 
@@ -851,138 +809,29 @@ mod tests {
         Ok(())
     }
 
-    /// Ein Sensor, der zweimal einen transienten Fehler liefert und danach
-    /// einen dauerhaften — belegt [`run_forever`]s Retry-Verhalten, ohne
-    /// unbegrenzt zu laufen.
-    #[derive(Debug)]
-    struct FlakySensor {
-        handle: SensorHandle<Bound>,
-        call_count: AtomicUsize,
-    }
-
-    impl Sensor for FlakySensor {
-        fn handle(&self) -> &SensorHandle<Bound> {
-            &self.handle
-        }
-        fn poll(&self, _now: Timestamp) -> Result<SensorReading, SensorError> {
-            let n = self.call_count.fetch_add(1, Ordering::SeqCst);
-            if n < 2 {
-                Err(SensorError::MalformedSource)
-            } else {
-                Err(SensorError::OutsideScope)
-            }
-        }
-    }
-
+    /// Der generische `Sensor`-Zweig trägt im Betrieb nur degradierte
+    /// Sensoren: deren einmalige `SensorDegraded`-Meldung muss unter der
+    /// Kennung des vertretenen Sensors bei der Senke ankommen.
     #[test]
-    fn test_run_forever_retries_transient_errors_and_stops_on_a_permanent_one() -> TestResult {
-        let handle = SensorHandle::new(SensorId::from_str("flaky-0"), Capability::LoadBpfProgram)
-            .bind(ReadScope::from_roots(Vec::<std::path::PathBuf>::new()));
-        let sensors: Vec<Arc<dyn Sensor>> = vec![Arc::new(FlakySensor {
-            handle,
-            call_count: AtomicUsize::new(0),
-        })];
-        let sink = RecordingSink::default();
-
-        let Err(err) = run_forever(&sensors, &sink) else {
-            return Err(TestError::Unexpected(
-                "a permanent error must terminate the loop".into(),
-            ));
-        };
-        assert!(matches!(err, ProbeError::Sensor(SensorError::OutsideScope)));
-        Ok(())
-    }
-
-    /// Der wichtigste Integrationstest dieser Crate: beide geerbten
-    /// Formungscrates kommen durch dieselbe Sammelschleife, mit
-    /// unterscheidbarer Herkunft (`SensorId`) — genau die Zusage aus
-    /// `crate::sensors`-Moduldoku, mein Urteil zur
-    /// Schnittstellen-Unstimmigkeit.
-    #[test]
-    fn test_run_once_carries_both_inherited_sources_through_with_distinguishable_sensor_ids()
-    -> TestResult {
-        let procmon_payload = {
-            let mut payload = Vec::new();
-            payload.extend_from_slice(&4_242u32.to_le_bytes()); // pid
-            payload.extend_from_slice(&1u32.to_le_bytes()); // ppid
-            payload.extend_from_slice(&0u32.to_le_bytes()); // uid
-            payload.extend_from_slice(&[0u8; 16]); // comm
-            let mut filename = [0u8; 256];
-            filename[.."/usr/sbin/sshd".len()].copy_from_slice(b"/usr/sbin/sshd");
-            payload.extend_from_slice(&filename);
-            payload.extend_from_slice(b"-D");
-            payload
-        };
-        let procmon_loader = FixtureBpfLoader::new(vec![RawBpfEvent {
-            pid: 4_242,
-            comm: String::new(),
-            observed_at: Timestamp::UNIX_EPOCH,
-            payload: procmon_payload,
-        }]);
-
-        let flow_payload = {
-            let mut bytes = vec![0u8; 32];
-            bytes[0..4].copy_from_slice(&100u32.to_le_bytes());
-            bytes[4..8].copy_from_slice(&1_000u32.to_le_bytes());
-            bytes[8] = 0; // TCP
-            bytes[9] = 1; // ausgehend
-            bytes[10] = 0; // IPv4
-            bytes[12..14].copy_from_slice(&443u16.to_be_bytes());
-            bytes[16..20].copy_from_slice(&[203, 0, 113, 9]);
-            bytes
-        };
-        let flow_loader = FixtureBpfLoader::new(vec![RawBpfEvent {
-            pid: 100,
-            comm: "curl".to_owned(),
-            observed_at: Timestamp::UNIX_EPOCH,
-            payload: flow_payload,
-        }]);
-
-        let placeholder = BpfProgramSource::Embedded(Cow::Borrowed(&[]));
-        let procmon_sensor = build_procmon_sensor(
-            Box::new(procmon_loader),
-            SensorId::from_str("probe-bpf-procmon-0"),
-            placeholder.clone(),
-        )
-        .map_err(ctx("fixture loader with capability always succeeds"))?;
-        let flow_sensor = build_flow_sensor(
-            Box::new(flow_loader),
-            SensorId::from_str("probe-bpf-flow-0"),
-            placeholder,
-            NetworkScope::empty(),
-        )
-        .map_err(ctx("fixture loader with capability always succeeds"))?;
-
-        let sensors: Vec<Arc<dyn Sensor>> = vec![Arc::new(procmon_sensor), Arc::new(flow_sensor)];
+    fn test_run_once_forwards_the_degradation_of_an_unavailable_sensor() -> TestResult {
+        let id = SensorId::from_str("probe-bpf-flow-0");
+        let sensors: Vec<Arc<dyn Sensor>> =
+            vec![Arc::new(UnavailableSensor::new(id.clone(), Vec::new()))];
         let sink = RecordingSink::default();
 
         let sent = run_once(&sensors, &sink, Timestamp::UNIX_EPOCH)
-            .map_err(ctx("both fixture sensors never fail"))?;
-        assert_eq!(sent, 2);
+            .map_err(ctx("an unavailable sensor never fails to poll"))?;
+        assert_eq!(sent, 1);
 
         let recorded = sink
             .sent
             .lock()
             .map_err(ctx("test mutex is never poisoned"))?;
-        assert_eq!(recorded.len(), 2);
-
-        let procmon_event = recorded
-            .iter()
-            .find(|event| event.sensor == SensorId::from_str("probe-bpf-procmon-0"))
-            .ok_or(TestError::Missing(
-                "the procmon event carries the procmon sensor id",
-            ))?;
-        assert!(matches!(procmon_event.kind, EventKind::ProcessExec { .. }));
-
-        let flow_event = recorded
-            .iter()
-            .find(|event| event.sensor == SensorId::from_str("probe-bpf-flow-0"))
-            .ok_or(TestError::Missing(
-                "the flow event carries the flow sensor id",
-            ))?;
-        assert!(matches!(flow_event.kind, EventKind::EgressFlow { .. }));
-
-        assert_ne!(procmon_event.sensor, flow_event.sensor);
+        let event = recorded
+            .first()
+            .ok_or(TestError::Missing("the degradation event"))?;
+        assert_eq!(event.sensor, id);
+        assert_eq!(event.kind, EventKind::SensorDegraded { sensor: id.clone() });
         Ok(())
     }
 }

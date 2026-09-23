@@ -115,12 +115,13 @@ use jiff::{SignedDuration, Timestamp};
 
 use harw_channel::{Admission, ChannelAdapter, InboundEvent, PairingStore, SessionKey};
 use harw_channel_telegram::{
-    TelegramChannel, TelegramChannelConfig, ThrottleNotice, TopicMode, WorkRequestStore,
+    ApprovalCallbackContext, PairingNotice, TelegramChannel, TelegramChannelConfig, TelegramChatId,
+    TelegramMessageId, TelegramThreadId, ThrottleNotice, TopicMode, WorkRequestStore,
 };
 use harw_channel_telegram_transport::{
-    AdmittedEventConsumer, BotCommand, LongPollConfig, LongPollShutdown, RendererConfig,
-    TelegramClient, TelegramOffsetStore, TelegramOutbound, TelegramRenderer, TransportResult,
-    WebhookConfig, run_webhook_server, spawn_long_poll_thread,
+    AdmittedEventConsumer, BotCommand, CallbackConsumer, LongPollConfig, LongPollShutdown,
+    RendererConfig, TelegramCallback, TelegramClient, TelegramOffsetStore, TelegramOutbound,
+    TelegramRenderer, TransportResult, WebhookConfig, run_webhook_server, spawn_long_poll_thread,
 };
 use harw_config::{
     ChannelToml, InternalModelPoint, ResolvedConfig, SecretRef, TelegramChannelToml,
@@ -489,6 +490,161 @@ impl AdmittedEventConsumer for GatewayTelegramConsumer {
     }
 }
 
+/// Kurzantwort (`answerCallbackQuery`), wenn eine Button-Entscheidung
+/// ausgeführt wurde; das eigentliche Ergebnis folgt als Chat-Nachricht.
+const CALLBACK_DONE_TEXT: &str = "Entscheidung übernommen";
+/// Kurzantwort für unbekannte, abgelaufene, bereits verwendete oder nicht zum
+/// Nachrichtenkontext passende Tokens. Unterscheidet die Ursachen bewusst
+/// nicht, damit ein Klickender den Token-Raum nicht abtasten kann.
+const CALLBACK_EXPIRED_TEXT: &str = "Schaltfläche ungültig oder abgelaufen";
+/// Kurzantwort, wenn der Klickende nicht gepinnt oder der Chat nicht
+/// gepairt ist; das Token wird dabei nicht verbraucht.
+const CALLBACK_UNAUTHORIZED_TEXT: &str = "Keine Berechtigung für diese Entscheidung";
+/// Kurzantwort, wenn die Entscheidung erkannt, aber nicht ausführbar war.
+const CALLBACK_FAILED_TEXT: &str = "Entscheidung fehlgeschlagen";
+
+/// Callback-Consumer dieser Gateway-Komposition für Inline-Button-Klicks
+/// (`callback_query`), installiert auf Long-Poll- **und** Webhook-Ingress.
+///
+/// # Description
+/// [`CallbackConsumer::handle_callback`] ist synchron, läuft aber im
+/// Long-Poll-Thread bzw. innerhalb eines asynchronen axum-Handlers. Er
+/// blockiert deshalb nie: der Callback wird nur an einen eigenen Worker-
+/// Thread ([`GatewayCallbackWorker`]) übergeben, der Token-Prüfung,
+/// Work-Request-Übergang, Chat-Antwort und `answerCallbackQuery` erledigt.
+/// Die Callback-Nutzlast (`data`) wird nie geloggt.
+struct GatewayCallbackConsumer {
+    callbacks: mpsc::Sender<TelegramCallback>,
+}
+
+impl CallbackConsumer for GatewayCallbackConsumer {
+    fn handle_callback(&self, callback: TelegramCallback) {
+        if self.callbacks.send(callback).is_err() {
+            tracing::warn!("Telegram callback worker is gone; callback dropped unanswered");
+        }
+    }
+}
+
+/// Worker-Seite von [`GatewayCallbackConsumer`]; läuft auf einem eigenen
+/// `std`-Thread und endet, sobald der Consumer (mit dem Transport)
+/// verworfen wird.
+struct GatewayCallbackWorker {
+    /// Klon des Admission-Adapters: teilt dessen Approval-Token-Store und
+    /// Pairing-Store, damit Callbacks gegen dieselbe Grenze geprüft werden
+    /// wie Text-Befehle.
+    adapter: TelegramChannel,
+    /// Derselbe Store wie für `/approve` und `/deny` als Text-Befehl.
+    work_requests: Arc<WorkRequestStore>,
+    outbound: Arc<dyn TelegramOutbound>,
+    bot_client: Arc<TelegramClient>,
+}
+
+impl GatewayCallbackWorker {
+    fn run(self, callbacks: mpsc::Receiver<TelegramCallback>) {
+        for callback in callbacks {
+            let notice = self.decide(&callback);
+            self.answer(&callback.callback_id, notice);
+        }
+    }
+
+    /// Prüft Absender, Pairing und Token-Kontext und führt eine erkannte
+    /// Entscheidung wie `/approve`/`/deny` aus. Liefert die Kurzantwort für
+    /// `answerCallbackQuery`.
+    ///
+    /// Button-Klicks durchlaufen nicht die Admission des Nachrichtenpfads;
+    /// deshalb werden hier dieselben Mindest-Gates vorgezogen (gepinnter
+    /// Absender, gepairter Chat), **bevor** das Einmal-Token verbraucht wird,
+    /// damit ein fremder Klick kein gültiges Token entwerten kann.
+    fn decide(&self, callback: &TelegramCallback) -> &'static str {
+        if !self
+            .adapter
+            .config()
+            .is_sender_identity_pinned(&callback.sender.id)
+        {
+            tracing::warn!("Telegram callback from an unpinned sender rejected");
+            return CALLBACK_UNAUTHORIZED_TEXT;
+        }
+        let peer = PeerId::from_str(callback.chat_id.to_string());
+        match self.adapter.resolve_tenant(&peer) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tracing::warn!("Telegram callback from an unpaired chat rejected");
+                return CALLBACK_UNAUTHORIZED_TEXT;
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "Telegram callback pairing lookup failed");
+                return CALLBACK_FAILED_TEXT;
+            }
+        }
+        let mut context = ApprovalCallbackContext::new(
+            TelegramChatId(callback.chat_id),
+            TelegramMessageId(callback.message_id),
+            peer,
+        );
+        if let Some(thread_id) = callback.thread_id {
+            context = context.with_thread(TelegramThreadId(thread_id));
+        }
+        let Some(pending) = self
+            .adapter
+            .consume_approval_callback(&callback.data, &context)
+        else {
+            tracing::warn!("Telegram callback token is unknown, stale, or out of context");
+            return CALLBACK_EXPIRED_TEXT;
+        };
+        let work_id = WorkId::from_str(pending.request_id);
+        let now = Timestamp::now();
+        let reply = match pending.decision.as_str() {
+            "approve" => self.work_requests.approve(&work_id, now),
+            "deny" => self.work_requests.deny(&work_id, now),
+            _ => {
+                tracing::warn!("Telegram callback carried an unsupported approval decision");
+                return CALLBACK_FAILED_TEXT;
+            }
+        };
+        let (markdown, notice) = match reply {
+            Ok(message) => (message, CALLBACK_DONE_TEXT),
+            Err(error) => {
+                tracing::warn!(error = %error, "Telegram callback work-request decision failed");
+                (
+                    format!("Anfrage fehlgeschlagen: {error}"),
+                    CALLBACK_FAILED_TEXT,
+                )
+            }
+        };
+        if let Err(error) = self.outbound.send(
+            callback.chat_id,
+            callback.thread_id,
+            &harw_channel::OutboundContent::Message { markdown },
+        ) {
+            tracing::error!(error = %error, "Telegram callback decision reply delivery failed");
+        }
+        notice
+    }
+
+    /// Beantwortet die Query, damit der Ladeindikator beim Nutzer endet.
+    /// Eigene kurzlebige Runtime wie der synchrone Renderer-Pfad: dieser
+    /// Thread gehört keiner Tokio-Runtime.
+    fn answer(&self, callback_id: &str, text: &str) {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::error!(error = %error, "Telegram callback answer runtime could not start");
+                return;
+            }
+        };
+        if let Err(error) = runtime.block_on(self.bot_client.answer_callback_query(
+            callback_id,
+            Some(text),
+            false,
+        )) {
+            tracing::warn!(error = %error, "Telegram callback query could not be answered");
+        }
+    }
+}
+
 /// Wie lange ohne Channel-Aktivität, bevor die KI „schlafen" darf.
 const DREAM_IDLE_THRESHOLD: Duration = Duration::from_secs(15 * 60);
 /// Kürzester Abstand zwischen zwei Traumläufen (verhindert Dauer-Träumen).
@@ -559,9 +715,13 @@ pub fn run(
         .map_err(|error| format!("gateway: Arbeitsverzeichnis nicht lesbar: {error}"))?;
 
     // Profil vor der Montage auflösen: der Telegram-Verlaufsspeicher der
-    // Assembly liegt unter `<profil>/sessions`, derselben Wurzel wie Dream.
+    // Assembly liegt unter der Session-Wurzel des Profils (`[session]
+    // store_dir`, Vorgabe `<profil>/sessions`), derselben Wurzel wie Dream.
     let profile_name = harw_home::active_profile_name(&home);
     let profile = harw_home::profile_dir(&home, &profile_name).map_err(|e| e.to_string())?;
+    // Einmal auflösen und überall durchreichen (Montage, Dream, Telegram-
+    // Consumer), damit ein angepasstes `store_dir` nirgends auseinanderläuft.
+    let sessions_root = crate::runtime_entry::profile_sessions_root(&home)?;
 
     // Die Gateway-Montagen ersetzen `config_layers` + `discover_config` +
     // `validate` und den früher separat gebauten Provider. Scheitert der
@@ -569,7 +729,7 @@ pub fn run(
     // Dream und jede aktivierte Telegram-Bindung bekommen je eine eigene
     // Montage (G1/G3), damit Audit und Trace den auslösenden Kanal — und bei
     // Telegram die auslösende Bindung — unterscheiden.
-    let assemblies = mount_gateway_assembly(&home, &cwd, &profile.join("sessions"))?;
+    let assemblies = mount_gateway_assembly(&home, &cwd, &sessions_root)?;
     // Shared with `audit_chain_scheduler`, which clones this `Arc` into a
     // fresh `spawn_blocking` closure on every tick (see its doc for why it
     // re-opens the configured secret store each tick instead of holding one).
@@ -604,7 +764,10 @@ pub fn run(
     // Dream turns use the same active-profile transcript root as CLI turns.
     // Keep the root derived before entering the runtime so a profile switch
     // cannot make an in-flight gateway write into another profile.
-    let dream_transcript_root = profile.join("sessions");
+    let roots = GatewayProfileRoots {
+        profile,
+        sessions: sessions_root,
+    };
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -616,7 +779,7 @@ pub fn run(
         Arc::clone(&config),
         providers,
         &knowledge,
-        &dream_transcript_root,
+        &roots,
         Arc::clone(&telemetry_sinks.sink),
         audit_chain_check_interval_secs,
     ));
@@ -668,6 +831,20 @@ struct GatewayProviders {
     /// Modell der **eigenen** Dream-Montage (`GatewayAssemblies::dream`,
     /// Befunde G1/G3); geht an [`dream_scheduler`].
     dream: Arc<dyn ModelProvider>,
+}
+
+/// Die vor dem Runtime-Eintritt aufgelösten Profil-Wurzeln eines
+/// Gateway-Starts, gebündelt für [`supervise`] (hält dessen Parameterliste
+/// unter der `clippy::too_many_arguments`-Schwelle, ohne `#[allow]`).
+struct GatewayProfileRoots {
+    /// Aktives Profilverzeichnis; Wurzel für `channel-state` (Pairing,
+    /// Offsets, Work-Requests) und den Profil-Jobstore. Bewusst explizit und
+    /// nicht aus `sessions` abgeleitet: ein angepasstes `[session] store_dir`
+    /// liegt nicht zwingend unter dem Profil.
+    profile: PathBuf,
+    /// Aufgelöste Session-Wurzel (`crate::runtime_entry::profile_sessions_root`);
+    /// Transkripte von Dream und Telegram.
+    sessions: PathBuf,
 }
 
 /// Öffnet den Secret-Resolver für die Gateway-Montagen genau einmal, verengt
@@ -908,6 +1085,9 @@ fn gateway_provider_status(config: &ResolvedConfig) -> String {
 ///   Montagen (je Bindung) und der **eigenen** Dream-Montage
 ///   (`RuntimeAssembly::model`, Befunde G1/G3); `telegram` geht je Bindung an
 ///   [`supervise_telegram_binding`], `dream` an [`dream_scheduler`].
+/// - `roots` ([`GatewayProfileRoots`]): explizites Profilverzeichnis
+///   (`channel-state`, Jobstore) und aufgelöste Session-Wurzel (Dream- und
+///   Telegram-Transkripte).
 ///
 /// # Shutdown
 /// Nach einem Shutdown-Signal wird für jede im Webhook-Modus gestartete
@@ -927,7 +1107,7 @@ async fn supervise(
     config: Arc<ResolvedConfig>,
     providers: GatewayProviders,
     knowledge: &KnowledgeStore,
-    dream_transcript_root: &Path,
+    roots: &GatewayProfileRoots,
     telemetry_sink: Arc<dyn TelemetrySink>,
     audit_chain_check_interval_secs: u64,
 ) -> Result<(), String> {
@@ -972,10 +1152,7 @@ async fn supervise(
         telegram: mut telegram_providers,
         dream: dream_provider,
     } = providers;
-    let telegram_profile = dream_transcript_root
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let telegram_profile = roots.profile.clone();
     // Authoritative workspace-alias resolver for Telegram `/request`
     // (docs/design/telegram-sandbox-work-requests.md, "Typed request
     // boundary"). Built with **zero** registrations: `harw-config` has no
@@ -1031,6 +1208,7 @@ async fn supervise(
                     *plan,
                     provider,
                     telegram_profile.clone(),
+                    roots.sessions.clone(),
                     Arc::clone(&workspaces),
                     Arc::clone(&work_requests),
                 )));
@@ -1055,7 +1233,7 @@ async fn supervise(
     let dream = dream_scheduler(
         Arc::clone(&dream_provider),
         knowledge,
-        dream_transcript_root,
+        &roots.sessions,
         &activity,
         config.as_ref(),
     );
@@ -1428,15 +1606,16 @@ fn describe_audit_chain_check(result: &AuditResult<PersistedChainStatus>) -> Aud
 /// vor der Mehrfachbindungs-Unterstützung ihren Offset persistiert.
 const TELEGRAM_LEGACY_OFFSET_BINDING: &str = "telegram:default";
 
-/// Update-Arten, die Telegram per Long-Poll bzw. Webhook zustellen soll.
+/// Update-Arten, die Telegram per Webhook zustellen soll (`setWebhook`).
 ///
-/// Entspricht bewusst der Vorgabe des Long-Poll-Runners
-/// (`message`/`edited_message`): `callback_query` wird nicht abonniert, weil
-/// die Transport-Abbildung (`map_update`) Button-Taps nicht als
-/// `InboundEvent` weiterreicht und dieser Gateway keine Inline-Buttons
-/// rendert — ein abonnierter, aber nie beantworteter Callback würde beim
-/// Nutzer nur als hängender Ladeindikator enden.
-const TELEGRAM_ALLOWED_UPDATES: [&str; 2] = ["message", "edited_message"];
+/// Enthält neben `message`/`edited_message` auch `callback_query`: jede
+/// Webhook-Bindung installiert [`GatewayCallbackConsumer`]
+/// (`WebhookConfig::with_callback_consumer`), der jeden Button-Klick per
+/// `answerCallbackQuery` beantwortet — ohne dieses Abonnement stellte
+/// Telegram keine Klicks zu. Der Long-Poll-Pfad nutzt diese Konstante nicht:
+/// `LongPollConfig::with_callback_consumer` nimmt `callback_query` selbst in
+/// seine `allowed_updates` auf.
+const TELEGRAM_ALLOWED_UPDATES: [&str; 3] = ["message", "edited_message", "callback_query"];
 
 /// Von Telegram für Webhooks akzeptierte Ports (Bot-API `setWebhook`).
 const TELEGRAM_WEBHOOK_PORTS: [u16; 4] = [443, 80, 88, 8443];
@@ -1905,7 +2084,8 @@ fn telegram_offset_root(channel_state: &Path, binding_id: &str) -> PathBuf {
 /// Long-Poll-Modus ein `deleteWebhook` (ein nach einem Absturz verwaister
 /// Webhook würde `getUpdates` sonst dauerhaft mit 409 blockieren), im
 /// Webhook-Modus `setWebhook` mit `public_url` und `secret_token` —, erst
-/// danach die Admission-/Throttle-Threads und der Transport selbst. Scheitert
+/// danach die Throttle-/Pairing-Notice-, Callback- und Admission-Threads und
+/// der Transport selbst (mit installiertem [`GatewayCallbackConsumer`]). Scheitert
 /// ein Schritt vor den Threads, bleibt nichts halb gestartet zurück.
 ///
 /// # Errors
@@ -1916,6 +2096,7 @@ async fn start_telegram_binding(
     plan: &TelegramIngressPlan,
     provider: Arc<dyn ModelProvider>,
     profile: &Path,
+    sessions_root: &Path,
     workspaces: Arc<harw_authority::WorkspaceRegistry>,
     work_requests: Arc<WorkRequestStore>,
 ) -> Result<RunningTelegramIngress, String> {
@@ -1994,15 +2175,19 @@ async fn start_telegram_binding(
         renderer_config,
     ));
     let throttle_outbound = Arc::clone(&renderer);
+    let pairing_outbound = Arc::clone(&renderer);
+    let callback_outbound = Arc::clone(&renderer);
+    let callback_work_requests = Arc::clone(&work_requests);
     let consumer = Arc::new(GatewayTelegramConsumer {
         provider,
-        transcript_root: profile.join("sessions"),
+        transcript_root: sessions_root.to_path_buf(),
         outbound: renderer,
         work_requests,
         workspaces,
     });
     let (ingress_tx, ingress_rx) = mpsc::sync_channel(128);
     let (throttle_tx, throttle_rx) = mpsc::channel::<ThrottleNotice>();
+    let (pairing_tx, pairing_rx) = mpsc::channel::<PairingNotice>();
     let adapter = TelegramChannel::with_ingress_receiver(
         channel_config,
         Arc::new(PairingStore::new(
@@ -2010,7 +2195,8 @@ async fn start_telegram_binding(
         )),
         ingress_rx,
     )
-    .with_throttle_sink(throttle_tx);
+    .with_throttle_sink(throttle_tx)
+    .with_pairing_sink(pairing_tx);
     // Delivers at most one "you're sending too fast" reply per rate-limit
     // window (§3.5): the admission perimeter (`TelegramChannel::admit`) only
     // decides and emits the notice, it never sends network traffic itself.
@@ -2032,6 +2218,43 @@ async fn start_telegram_binding(
             }
         })
         .map_err(|_| "Telegram throttle-notice thread could not start".to_owned())?;
+    // Delivers the confirmation or the uniform failure reply of an in-channel
+    // `/pair <code>` redemption (§3.2). Like throttling, the adapter only
+    // decides and emits the notice. The notice content is never logged.
+    std::thread::Builder::new()
+        .name("harw-telegram-pairing-notice".to_owned())
+        .spawn(move || {
+            for notice in pairing_rx {
+                let Ok(chat_id) = notice.peer.as_str().parse::<i64>() else {
+                    tracing::warn!("Telegram pairing notice has a non-numeric peer");
+                    continue;
+                };
+                let thread_id = notice
+                    .thread
+                    .as_ref()
+                    .and_then(|thread| thread.as_str().parse::<i64>().ok());
+                if let Err(error) = pairing_outbound.send(chat_id, thread_id, &notice.content) {
+                    tracing::error!(error = %error, "Telegram pairing notice delivery failed");
+                }
+            }
+        })
+        .map_err(|_| "Telegram pairing-notice thread could not start".to_owned())?;
+    // Inline-button clicks: the transport hands them to a non-blocking
+    // consumer; this worker validates and answers them off the ingress path.
+    let (callback_tx, callback_rx) = mpsc::channel::<TelegramCallback>();
+    let callback_worker = GatewayCallbackWorker {
+        adapter: adapter.clone(),
+        work_requests: callback_work_requests,
+        outbound: callback_outbound,
+        bot_client: Arc::clone(&bot_client),
+    };
+    std::thread::Builder::new()
+        .name("harw-telegram-callback".to_owned())
+        .spawn(move || callback_worker.run(callback_rx))
+        .map_err(|_| "Telegram callback thread could not start".to_owned())?;
+    let callback_consumer: Arc<dyn CallbackConsumer> = Arc::new(GatewayCallbackConsumer {
+        callbacks: callback_tx,
+    });
     std::thread::Builder::new()
         .name("harw-telegram-admission".to_owned())
         .spawn(move || {
@@ -2066,13 +2289,14 @@ async fn start_telegram_binding(
                 offset_store,
                 ingress_tx,
                 LongPollShutdown::default(),
-            );
+            )
+            .with_callback_consumer(callback_consumer);
             spawn_long_poll_thread(long_poll)
                 .map(RunningTelegramIngress::LongPoll)
                 .map_err(|_| "Telegram long-poll thread could not start".to_owned())
         }
-        TelegramTransportPlan::Webhook(webhook) => {
-            Ok(RunningTelegramIngress::Webhook(WebhookConfig::new(
+        TelegramTransportPlan::Webhook(webhook) => Ok(RunningTelegramIngress::Webhook(
+            WebhookConfig::new(
                 webhook.listen_addr,
                 webhook.route.clone(),
                 webhook.secret_token.expose_secret(),
@@ -2080,8 +2304,9 @@ async fn start_telegram_binding(
                 bot.id,
                 bot.username.clone(),
                 ingress_tx,
-            )))
-        }
+            )
+            .with_callback_consumer(callback_consumer),
+        )),
     }
 }
 
@@ -2104,6 +2329,7 @@ async fn supervise_telegram_binding(
     plan: TelegramIngressPlan,
     provider: Arc<dyn ModelProvider>,
     profile: PathBuf,
+    sessions_root: PathBuf,
     workspaces: Arc<harw_authority::WorkspaceRegistry>,
     work_requests: Arc<WorkRequestStore>,
 ) -> Infallible {
@@ -2115,6 +2341,7 @@ async fn supervise_telegram_binding(
             &plan,
             Arc::clone(&provider),
             &profile,
+            &sessions_root,
             Arc::clone(&workspaces),
             Arc::clone(&work_requests),
         )

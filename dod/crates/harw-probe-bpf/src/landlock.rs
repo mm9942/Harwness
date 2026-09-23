@@ -24,17 +24,36 @@
 //! `harw-probe-fs::landlock::enforce_read_scope` nimmt einen
 //! `harw_dod_cap::ReadScope` entgegen, weil seine Sensoren (fanotify auf
 //! konfigurierten Verzeichnissen) einen echten, vom Betreiber gewählten
-//! Lesebereich haben. Die beiden Sensoren dieser Sonde lesen dagegen **nie**
-//! über `handle.scope()`/`ReadScope` — ihre einzige Quelle ist ein
-//! injizierter `harw_dod_bpf::BpfLoader` (siehe `crate::sensors`-Moduldoku).
-//! Der einzige Dateisystemzugriff, den dieser Prozess je braucht, ist ein
-//! optionaler eBPF-Programmrumpf (`--procmon-program-path`/
-//! `--flow-program-path`, `harw_dod_bpf::BpfProgramSource::Path`) — deshalb
-//! nimmt [`enforce_fs_scope`] eine einfache Liste erlaubter Wurzeln
-//! entgegen, keinen `ReadScope`. Ohne einen konfigurierten Programmpfad ist
-//! diese Liste leer: der Prozess wird dann auf **kein** lesbares
-//! Dateisystemziel beschränkt, was für eine Sonde ohne eigenen
-//! Dateisystembedarf die korrekte, maximal enge Voreinstellung ist.
+//! Lesebereich haben. Die Sensoren dieser Sonde lesen dagegen **nie** über
+//! `handle.scope()`/`ReadScope` — sie lesen Kernel-Ringpuffer über den
+//! gemeinsamen `harw_dod_bpf::RealBpfLoader`. [`enforce_fs_scope`] nimmt
+//! deshalb eine einfache Liste erlaubter Wurzeln entgegen.
+//!
+//! # Welche Wurzeln: nur Kernel-Schnittstellen, nie das Objektverzeichnis
+//! Die Wurzeln sind ausschließlich **Kernel-Schnittstellenverzeichnisse**,
+//! die der Lade-, Anheft- und Lesepfad nach der Durchsetzung noch braucht
+//! (`main::KERNEL_INTERFACE_ROOTS`, gefiltert auf vorhandene Verzeichnisse
+//! von `main::fs_scope_roots`): `/proc/self`, `/sys/kernel/btf`,
+//! `/sys/kernel/tracing`, `/sys/kernel/debug/tracing`,
+//! `/sys/devices/system/cpu`. Das eBPF-Objektverzeichnis
+//! (`--*-program-path`, `$HARW_DOD_BPF_DIR`, `/usr/local/lib/harw-dod/bpf`)
+//! gehört **nicht** dazu: `main::run` liest alle vier Objekte vor dem Aufruf
+//! dieser Funktion vollständig in den Speicher
+//! (`crate::sensors::resolve_procmon_objects`/`resolve_flow_objects`,
+//! `harw_dod_bpf::BpfProgramSource::Embedded`), danach öffnet dieser Prozess
+//! keine Objektdatei mehr. Diese Datei selbst kennt keine Pfade; sie setzt
+//! genau die übergebene Liste durch und nimmt nichts hinzu. Eine leere Liste
+//! ist zulässig und ergibt die engste Regel (kein lesbares Dateisystemziel).
+//!
+//! Nur Verzeichnisse, nie Einzeldateien: die Regel verwendet
+//! `AccessFs::from_read`, das auch Verzeichnisrechte (`ReadDir`) enthält —
+//! eine solche Regel auf einer Datei lehnt die `landlock`-Crate ab.
+//!
+//! # Was die Regel beschränkt
+//! Behandelt werden die lesenden Zugriffsrechte der ABI-Stufe V1
+//! (`AccessFs::from_read`: Lesen von Dateien, Auflisten von Verzeichnissen,
+//! Ausführen). Außerhalb der Wurzeln ist danach jeder lesende Zugriff
+//! gesperrt; schreibende Rechte behandelt dieses Regelwerk nicht.
 //!
 //! # Warum diese Sonde Landlock bauen kann, obwohl der ursprüngliche Auftrag
 //! das Gegenteil vermutete
@@ -91,8 +110,9 @@
 //! use crate::landlock::enforce_fs_scope;
 //! use std::path::PathBuf;
 //!
-//! let roots: Vec<PathBuf> = Vec::new();
-//! let _ = enforce_fs_scope(&roots);
+//! // Objekte sind zu diesem Zeitpunkt bereits eingelesen.
+//! let roots = vec![PathBuf::from("/proc/self"), PathBuf::from("/sys/kernel/btf")];
+//! enforce_fs_scope(&roots)?;
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -118,9 +138,11 @@ use crate::error::ProbeError;
 /// `roots`-Liste (dann eine Regel, die kein Dateisystemziel erlaubt).
 ///
 /// # Arguments
-/// - `roots` (`&[std::path::PathBuf]`): die Wurzeln, auf die sich diese
-///   Sonde beschränken soll (typischerweise die Elternverzeichnisse
-///   konfigurierter eBPF-Programmpfade, siehe Moduldoku).
+/// - `roots` (`&[std::path::PathBuf]`): die einzigen danach noch lesbaren
+///   Wurzeln — ausschließlich Kernel-Schnittstellenverzeichnisse
+///   (`main::fs_scope_roots`), nie das eBPF-Objektverzeichnis (siehe
+///   Moduldoku, Abschnitt „Welche Wurzeln"). Nicht öffenbare Einträge werden
+///   ausgelassen (fail-closed).
 ///
 /// # Returns
 /// `Ok(())` ausschließlich bei `RulesetStatus::FullyEnforced`.
