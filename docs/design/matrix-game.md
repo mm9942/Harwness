@@ -305,12 +305,11 @@ tracks = [
   { id = "plant_sabotage_risk", label = "Sabotagerisiko Anlage",        min = 0,  max = 3, start = 1,  visibility = "umpire" },
 ]
 states = [
-  { id = "plant_control", label = "Kontrolle Entsalzungsanlage",
-    values = ["rat", "gilde", "nord", "mission", "umstritten"], start = "rat", visibility = "public" },
+  { id = "plant_control", label = "Kontrolle Entsalzungsanlage", values = ["rat", "gilde", "nord", "mission", "umstritten"], start = "rat", visibility = "public" },
 ]
 objects = [
-  { id = "reservoir_altmark", label = "Altes Reservoir von Altmark", hidden = true, protection = 1,
-    visibility_when_found = "public", note = "Stillgelegtes Reservoir mit Restwasser; nur der Umpire kennt es zu Beginn." },
+  # nur der Umpire kennt das Reservoir zu Beginn; verdeckt, 1 Schutzstufe
+  { id = "reservoir_altmark", label = "Altes Reservoir von Altmark", hidden = true, protection = 1, visibility_when_found = "public" },
 ]
 projects = [
   { id = "pipeline", label = "Notleitung vom Festland", stages = 3, progress = 0, visibility = "public" },
