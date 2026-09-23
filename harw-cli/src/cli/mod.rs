@@ -10,6 +10,7 @@
 //! [`values`] und speisen sowohl die Parse-Validierung als auch die
 //! Shell-Completions.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueHint};
@@ -296,5 +297,26 @@ pub enum Command {
         /// Auszuführende Lens-Aktion; ohne Angabe wird der Status gezeigt.
         #[command(subcommand)]
         action: Option<LensAction>,
+    },
+    /// Prozesse präzise auswählen und per doppeltem SIGKILL beenden (killer).
+    ///
+    /// Reicht alle folgenden Argumente unverändert an `harw-killer` durch;
+    /// `harw kill --help` zeigt deshalb die Hilfe von killer selbst. Nur
+    /// unter Linux verfügbar (pidfd). `main.rs` erkennt `harw kill …` bereits
+    /// vor dem clap-Parse, damit globale `harw`-Flags wie `--log` oder
+    /// `--verbose` hinter `kill` bei killer ankommen statt vom Root-Parser
+    /// verschluckt zu werden; diese Variante dient Hilfe, Completions und dem
+    /// Fall `harw <Root-Flags> kill …`.
+    #[command(disable_help_flag = true)]
+    Kill {
+        /// Argumente für killer (z. B. `-p NAME`, `--pid PID`, `--dry-run`).
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            num_args = 0..,
+            value_name = "KILLER_ARGS",
+            value_hint = ValueHint::Other
+        )]
+        args: Vec<OsString>,
     },
 }

@@ -130,8 +130,8 @@ pub enum ProbeError {
     ///
     /// # Arguments
     /// - `source` (`harw_dod_cap::SensorError`): der zugrunde liegende,
-    ///   inhaltsfreie Sensorfehler — entsteht sowohl bei `ProcmonSensor::poll`
-    ///   als auch bei `sensors::FlowSensor::poll`. Über
+    ///   inhaltsfreie Sensorfehler — entsteht bei `Sensor::poll` im
+    ///   generischen Zweig der Sammelschleife (`crate::collect::run_once`). Über
     ///   `std::error::Error::source()` verlinkt.
     Sensor(harw_dod_cap::SensorError),
 

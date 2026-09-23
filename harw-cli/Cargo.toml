@@ -121,6 +121,12 @@ harw-observe-otlp = { path = "../harw-observe-otlp" }
 harw-runtime = { path = "../harw-runtime" }
 harw-protocol = { path = "../harw-protocol" }
 
+# `harw kill` (src/main.rs::run_kill): reicht alle Argumente an killer durch.
+# killer braucht pidfd und ist deshalb Linux-only; auf anderen Systemen meldet
+# `harw kill` einen Fehler (Exit-Code 2).
+[target.'cfg(target_os = "linux")'.dependencies]
+harw-killer = { path = "../harw-killer" }
+
 [dev-dependencies]
 tempfile = "3"
 serde_json = "1"

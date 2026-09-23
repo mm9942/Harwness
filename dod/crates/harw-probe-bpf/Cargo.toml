@@ -15,22 +15,16 @@ harw-dod-bpf = { path = "../harw-dod-bpf" }
 # Die Probe akzeptiert weder eine implizite Home-Suche noch eigene CIDR- oder
 # Scope-Flags; beides wird aus diesem Vertrag abgeleitet.
 harw-dod-config = { path = "../harw-dod-config" }
-# Prozessstart-Formung: `ProcmonSensor` — implementiert bereits
-# `harw_dod_signals::Sensor`. Siehe `src/sensors.rs`-Moduldoku für das hier
-# gefällte Urteil zur Schnittstellen-Unstimmigkeit gegenüber `harw-dod-flow`.
+# Prozessstart: `procmon_contracts` und der v1-Wire-Parser für Exec/Exit.
 harw-dod-procmon = { path = "../harw-dod-procmon" }
-# Verbindungs-Formung und Melderegel: `observe`, `flow_program_spec`,
-# `FlowError`, `REQUIRED_CAPABILITY`. Implementiert `harw_dod_signals::Sensor`
-# bewusst nicht — siehe `src/sensors.rs`-Moduldoku für den lokalen
-# `FlowSensor`-Adapter, der das für diese Sonde ausgleicht.
+# Verbindungen: `flow_contracts`, der v1-TCP-Parser und die Melderegel
+# `to_security_event`.
 harw-dod-flow = { path = "../harw-dod-flow" }
 # Zugriffsvokabular: `Capability`, `CapabilityClass`, `ReadScope`,
 # `SensorHandle`, `SensorError`, `Permanence`.
 harw-dod-cap = { path = "../harw-dod-cap" }
 # Daten-/Trait-Vokabular: `trait Sensor`, `SensorReading`, `SecurityEvent`.
-# Direkte Abhängigkeit, weil diese Sonde selbst einen `Sensor`-Adapter
-# (`sensors::FlowSensor`) implementiert, nicht nur die beiden Formungscrates
-# aufruft.
+# Gebraucht für `sensors::UnavailableSensor` und `collect`.
 harw-dod-signals = { path = "../harw-dod-signals" }
 # `NetworkScope`/`EgressTarget` — die Melderegel-Eingabe, die
 # `harw_dod_flow::observe` verlangt. Zulässige Kantenrichtung: `harw-sandbox`

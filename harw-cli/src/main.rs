@@ -52,9 +52,10 @@ mod uia_bootstrap;
 mod web;
 mod worker_cancellation;
 
+use std::ffi::OsString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, ExitCode};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -398,8 +399,61 @@ fn log_flag_explicit(matches: &clap::ArgMatches) -> bool {
     )
 }
 
-fn main() {
-    let (cli, log_explicit) = parse_cli();
+/// Erkennt `harw kill …` direkt in den rohen Prozessargumenten.
+///
+/// Liefert die Argumente hinter `kill` unverändert, wenn `kill` das erste
+/// Argument nach dem Programmnamen ist, sonst `None`. Läuft **vor** dem
+/// clap-Parse von [`Cli`]: dessen globale Flags (`--log`, `--verbose`,
+/// `--home`, …) würden killer-eigene gleichnamige Flags sonst abfangen.
+fn kill_passthrough_args<I>(args: I) -> Option<Vec<OsString>>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    let _program = args.next()?;
+    let first = args.next()?;
+    (first == "kill").then(|| args.collect())
+}
+
+/// Führt `harw kill` aus: reicht `args` unverändert an killer weiter.
+///
+/// killer parst selbst (inkl. `--help`), initialisiert sein eigenes Tracing
+/// (`--log`) und startet den sudo-Helfer bei Bedarf als
+/// `<harw> kill --helper …` neu. Deshalb läuft dieser Pfad vor
+/// [`init_tracing`].
+#[cfg(target_os = "linux")]
+fn run_kill(args: Vec<OsString>) -> ExitCode {
+    let argv = std::iter::once(OsString::from("harw kill")).chain(args);
+    harw_killer::run_cli(
+        argv,
+        harw_killer::HelperInvocation::Subcommand(vec![OsString::from("kill")]),
+    )
+}
+
+/// `harw kill` gibt es nur unter Linux (killer braucht pidfd).
+#[cfg(not(target_os = "linux"))]
+fn run_kill(_args: Vec<OsString>) -> ExitCode {
+    eprintln!("harw: `harw kill` ist nur unter Linux verfügbar");
+    ExitCode::from(2)
+}
+
+fn main() -> ExitCode {
+    if let Some(args) = kill_passthrough_args(std::env::args_os()) {
+        return run_kill(args);
+    }
+    let cli = match parse_cli() {
+        // `harw <Root-Flags> kill …`: ebenfalls vor dem Tracing-Init an
+        // killer übergeben.
+        (
+            Cli {
+                command: Some(Command::Kill { args }),
+                ..
+            },
+            _,
+        ) => return run_kill(args),
+        parsed => parsed,
+    };
+    let (cli, log_explicit) = cli;
     let tui_active = cli.command.is_none() && cli.chat.prompt.is_none();
     let logging = load_logging_section(cli.chat.home.clone(), tui_active).unwrap_or_default();
     let rust_log = std::env::var("RUST_LOG").ok();
@@ -569,6 +623,10 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             &args,
         ),
         Some(Command::Lens { action }) => lens::run(home_override, action),
+        // `main` leitet `harw kill` vor dem Tracing-Init an killer weiter.
+        Some(Command::Kill { .. }) => {
+            Err("interner Fehler: `harw kill` erreichte dispatch".to_owned())
+        }
     }
 }
 
@@ -625,7 +683,8 @@ fn run_startup_migrations(
             | Command::Sandbox { .. }
             | Command::Mcp { .. }
             | Command::BugReport { .. }
-            | Command::Lens { .. },
+            | Command::Lens { .. }
+            | Command::Kill { .. },
         ) => return Ok(()),
     };
 
@@ -2916,6 +2975,36 @@ mod tests {
             .try_get_matches_from(["harw", "doctor", "--log", "debug"])
             .map_err(ctx("--log after subcommand parses"))?;
         assert!(log_flag_explicit(&after_subcommand));
+        Ok(())
+    }
+
+    #[test]
+    fn kill_passthrough_forwards_everything_after_kill_verbatim() {
+        let os = |items: &[&str]| items.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            kill_passthrough_args(os(&["harw", "kill", "--log", "debug", "-p", "x", "--help"])),
+            Some(os(&["--log", "debug", "-p", "x", "--help"]))
+        );
+        assert_eq!(kill_passthrough_args(os(&["harw", "kill"])), Some(Vec::new()));
+        assert_eq!(kill_passthrough_args(os(&["harw", "doctor", "kill"])), None);
+        assert_eq!(kill_passthrough_args(os(&["harw"])), None);
+    }
+
+    #[test]
+    fn cli_parses_kill_with_hyphen_args_and_help_verbatim() -> TestResult {
+        let cli = Cli::try_parse_from(["harw", "kill", "-p", "sleep", "--dry-run", "--help"])
+            .map_err(ctx("harw kill parses"))?;
+        let Some(Command::Kill { args }) = cli.command else {
+            return Err(TestError::Unexpected(format!(
+                "erwartete Command::Kill, bekam {:?}",
+                cli.command
+            )));
+        };
+        let expected: Vec<OsString> = ["-p", "sleep", "--dry-run", "--help"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        assert_eq!(args, expected);
         Ok(())
     }
 
