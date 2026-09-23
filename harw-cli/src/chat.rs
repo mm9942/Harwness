@@ -257,6 +257,12 @@ pub fn run_chat(
                 assembly,
                 TuiRunOptions {
                     wiring,
+                    keybindings_path: harw_home::profile_dir(
+                        &home,
+                        &harw_home::active_profile_name(&home),
+                    )
+                    .ok()
+                    .map(|dir| dir.join(&config.harness.tui.keybindings_file)),
                     verbose_tools: factory.verbose_tools(),
                     resume: Some(TuiResume {
                         selector: Box::new(ProfileResumeSelector::new(
