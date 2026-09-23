@@ -1476,7 +1476,10 @@ fn telegram_ingress_modes(config: &ResolvedConfig) -> Vec<TelegramBindingIngress
 /// Identitäten, Transportwahl ([`telegram_transport_choice`]), Bot-
 /// Credential und — nur im Webhook-Modus — das `secret_token`. Meldungen
 /// nennen nie einen Geheimniswert oder den Namen einer Umgebungsvariable.
-fn telegram_binding_mode(binding: &TelegramChannelToml, config: &ResolvedConfig) -> TelegramIngressMode {
+fn telegram_binding_mode(
+    binding: &TelegramChannelToml,
+    config: &ResolvedConfig,
+) -> TelegramIngressMode {
     if ChannelId::try_from(binding.id.clone()).is_err() {
         return TelegramIngressMode::Disabled("Telegram channel id is invalid".to_owned());
     }
@@ -1627,9 +1630,9 @@ fn is_supported_webhook_route(path: &str) -> bool {
         !segment.is_empty()
             && segment != "."
             && segment != ".."
-            && segment
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
+            && segment.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~')
+            })
     })
 }
 
@@ -1676,13 +1679,14 @@ fn disable_conflicting_telegram_bindings(bindings: &mut [TelegramBindingIngress]
                 shared_token.insert(left_index);
                 shared_token.insert(right_index);
             }
-            if let (TelegramTransportPlan::Webhook(left_hook), TelegramTransportPlan::Webhook(right_hook)) =
-                (&left_plan.transport, &right_plan.transport)
-            {
-                if left_hook.listen_addr == right_hook.listen_addr {
-                    shared_listener.insert(left_index);
-                    shared_listener.insert(right_index);
-                }
+            let same_listener = matches!(
+                (&left_plan.transport, &right_plan.transport),
+                (TelegramTransportPlan::Webhook(left_hook), TelegramTransportPlan::Webhook(right_hook))
+                    if left_hook.listen_addr == right_hook.listen_addr
+            );
+            if same_listener {
+                shared_listener.insert(left_index);
+                shared_listener.insert(right_index);
             }
         }
     }
@@ -1853,10 +1857,7 @@ fn telegram_menu_commands(menu_source: &str) -> Result<Option<Vec<BotCommand>>, 
 /// Veröffentlicht das Befehlsmenü einer Bindung (best effort: ein Fehler wird
 /// geloggt, schließt die Bindung aber nicht — das Menü ist reine Anzeige,
 /// die Autorisierung liegt in Admission und Befehlsverarbeitung).
-async fn publish_telegram_command_menu(
-    binding: &TelegramChannelToml,
-    client: &TelegramClient,
-) {
+async fn publish_telegram_command_menu(binding: &TelegramChannelToml, client: &TelegramClient) {
     match telegram_menu_commands(&binding.commands.menu_source) {
         Ok(Some(commands)) => {
             if let Err(error) = client.set_my_commands(&commands).await {
@@ -3077,6 +3078,452 @@ pinned_identities = [123456789]
         assert_eq!(telegram_restart_backoff(u32::MAX), Duration::from_secs(60));
     }
 
+    /// Baut eine `ResolvedConfig` aus einer `channels/*.toml`-Datei und
+    /// einem Env-Layer (statt Prozessumgebung, damit Tests isoliert bleiben).
+    fn telegram_test_config(
+        channel_file: &str,
+        env: &[(&str, &str)],
+    ) -> TestResult<ResolvedConfig> {
+        let file: harw_config::ChannelFileToml =
+            toml::from_str(channel_file).map_err(ctx("parse channel file"))?;
+        let mut config = ResolvedConfig {
+            channels: harw_config::channel_toml::flatten_channel_file(file),
+            ..Default::default()
+        };
+        for (name, value) in env {
+            config
+                .env_layer
+                .insert((*name).to_owned(), (*value).to_owned());
+        }
+        Ok(config)
+    }
+
+    /// Erste (einzige) Telegram-Bindung einer Test-Konfiguration.
+    fn first_telegram_binding(config: &ResolvedConfig) -> TestResult<&TelegramChannelToml> {
+        enabled_telegram_bindings(config)
+            .into_iter()
+            .next()
+            .ok_or(TestError::Missing("an enabled Telegram binding"))
+    }
+
+    #[test]
+    fn telegram_principal_is_derived_from_the_binding_id() {
+        assert_eq!(
+            telegram_principal_peer("telegram:support-bot"),
+            "support-bot"
+        );
+        assert_eq!(telegram_principal_peer("support-bot"), "support-bot");
+        assert_eq!(telegram_principal_peer("telegram:"), "telegram:");
+        let principal = channel_principal(
+            GatewayEntry::Telegram,
+            telegram_principal_peer("telegram:ops"),
+        );
+        assert_eq!(principal.id(), "telegram:ops");
+        assert_ne!(principal.id(), "telegram:gateway");
+    }
+
+    #[test]
+    fn enabled_telegram_binding_ids_are_sorted_and_skip_disabled_bindings() -> TestResult {
+        let config = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:zulu"
+bot_token_ref = "env:HARW_GW_TEST_TOKEN_Z"
+
+[[channel.telegram]]
+id = "telegram:alpha"
+bot_token_ref = "env:HARW_GW_TEST_TOKEN_A"
+
+[[channel.telegram]]
+id = "telegram:off"
+enabled = false
+bot_token_ref = "env:HARW_GW_TEST_TOKEN_O"
+"#,
+            &[],
+        )?;
+        assert_eq!(
+            enabled_telegram_binding_ids(&config),
+            vec!["telegram:alpha".to_owned(), "telegram:zulu".to_owned()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_telegram_bindings_each_get_their_own_ingress_plan() -> TestResult {
+        let config = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:ops"
+bot_token_ref = "env:HARW_GW_TEST_MULTI_TOKEN_OPS"
+[channel.telegram.security]
+pinned_identities = [1]
+
+[[channel.telegram]]
+id = "telegram:support"
+bot_token_ref = "env:HARW_GW_TEST_MULTI_TOKEN_SUPPORT"
+[channel.telegram.security]
+pinned_identities = [2]
+"#,
+            &[
+                ("HARW_GW_TEST_MULTI_TOKEN_OPS", "111:ops-token"),
+                ("HARW_GW_TEST_MULTI_TOKEN_SUPPORT", "222:support-token"),
+            ],
+        )?;
+
+        let bindings = telegram_ingress_modes(&config);
+
+        assert_eq!(bindings.len(), 2);
+        assert!(
+            bindings
+                .iter()
+                .all(|binding| matches!(binding.mode, TelegramIngressMode::Enabled(_)))
+        );
+        let status = telegram_ingress_status(&bindings);
+        assert!(status.contains("telegram:ops: bereit"));
+        assert!(status.contains("telegram:support: bereit"));
+        assert!(!status.contains("ops-token"));
+        assert!(!status.contains("support-token"));
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_bindings_sharing_a_bot_token_are_all_disabled() -> TestResult {
+        let config = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:one"
+bot_token_ref = "env:HARW_GW_TEST_SHARED_TOKEN_ONE"
+[channel.telegram.security]
+pinned_identities = [1]
+
+[[channel.telegram]]
+id = "telegram:two"
+bot_token_ref = "env:HARW_GW_TEST_SHARED_TOKEN_TWO"
+[channel.telegram.security]
+pinned_identities = [1]
+"#,
+            &[
+                ("HARW_GW_TEST_SHARED_TOKEN_ONE", "333:same-token"),
+                ("HARW_GW_TEST_SHARED_TOKEN_TWO", "333:same-token"),
+            ],
+        )?;
+
+        let bindings = telegram_ingress_modes(&config);
+
+        assert_eq!(bindings.len(), 2);
+        for binding in &bindings {
+            let TelegramIngressMode::Disabled(reason) = &binding.mode else {
+                return Err(TestError::Unexpected(format!(
+                    "{} must be disabled when its bot token is shared",
+                    binding.id
+                )));
+            };
+            assert!(reason.contains("share one bot credential"));
+        }
+        assert!(!telegram_ingress_status(&bindings).contains("same-token"));
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_webhook_binding_resolves_url_route_listener_and_secret() -> TestResult {
+        let config = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:hook"
+bot_token_ref = "env:HARW_GW_TEST_HOOK_TOKEN"
+transport = "webhook"
+[channel.telegram.transport_webhook]
+public_url = "https://ingress.example.com/telegram/hook-bot"
+secret_token_ref = "env:HARW_GW_TEST_HOOK_SECRET"
+listen_addr = "127.0.0.1:8443"
+[channel.telegram.security]
+pinned_identities = [7]
+"#,
+            &[
+                ("HARW_GW_TEST_HOOK_TOKEN", "444:hook-token"),
+                ("HARW_GW_TEST_HOOK_SECRET", "hook_secret-value"),
+            ],
+        )?;
+
+        let bindings = telegram_ingress_modes(&config);
+        let [binding] = bindings.as_slice() else {
+            return Err(TestError::Unexpected("exactly one binding expected".into()));
+        };
+        let TelegramIngressMode::Enabled(plan) = &binding.mode else {
+            return Err(TestError::Unexpected(
+                "webhook binding must be enabled".into(),
+            ));
+        };
+        let TelegramTransportPlan::Webhook(webhook) = &plan.transport else {
+            return Err(TestError::Unexpected("webhook transport expected".into()));
+        };
+        assert_eq!(
+            webhook.public_url,
+            "https://ingress.example.com/telegram/hook-bot"
+        );
+        assert_eq!(webhook.route, "/telegram/hook-bot");
+        assert_eq!(webhook.listen_addr.to_string(), "127.0.0.1:8443");
+        assert_eq!(webhook.secret_token.expose_secret(), "hook_secret-value");
+
+        let status = telegram_ingress_status(&bindings);
+        assert!(status.contains("Webhook-Adapter auf 127.0.0.1:8443/telegram/hook-bot"));
+        assert!(!status.contains("hook_secret-value"));
+        assert!(!status.contains("hook-token"));
+        assert!(!status.contains("ingress.example.com"));
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_webhook_without_resolvable_secret_fails_closed() -> TestResult {
+        let config = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:hook"
+bot_token_ref = "env:HARW_GW_TEST_NOSECRET_TOKEN"
+transport = "webhook"
+[channel.telegram.transport_webhook]
+public_url = "https://ingress.example.com/telegram"
+secret_token_ref = "env:HARW_GW_TEST_NOSECRET_UNSET"
+listen_addr = "127.0.0.1:8443"
+[channel.telegram.security]
+pinned_identities = [7]
+"#,
+            &[("HARW_GW_TEST_NOSECRET_TOKEN", "555:token")],
+        )?;
+
+        let status = telegram_ingress_status(&telegram_ingress_modes(&config));
+
+        assert!(status.contains("fail closed"));
+        assert!(status.contains("webhook secret"));
+        assert!(!status.contains("HARW_GW_TEST_NOSECRET_UNSET"));
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_webhook_bindings_sharing_a_listener_are_disabled() -> TestResult {
+        let config = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:a"
+bot_token_ref = "env:HARW_GW_TEST_LISTEN_TOKEN_A"
+transport = "webhook"
+[channel.telegram.transport_webhook]
+public_url = "https://ingress.example.com/a"
+secret_token_ref = "env:HARW_GW_TEST_LISTEN_SECRET"
+listen_addr = "127.0.0.1:8443"
+[channel.telegram.security]
+pinned_identities = [7]
+
+[[channel.telegram]]
+id = "telegram:b"
+bot_token_ref = "env:HARW_GW_TEST_LISTEN_TOKEN_B"
+transport = "webhook"
+[channel.telegram.transport_webhook]
+public_url = "https://ingress.example.com/b"
+secret_token_ref = "env:HARW_GW_TEST_LISTEN_SECRET"
+listen_addr = "127.0.0.1:8443"
+[channel.telegram.security]
+pinned_identities = [7]
+"#,
+            &[
+                ("HARW_GW_TEST_LISTEN_TOKEN_A", "601:a"),
+                ("HARW_GW_TEST_LISTEN_TOKEN_B", "602:b"),
+                ("HARW_GW_TEST_LISTEN_SECRET", "secret"),
+            ],
+        )?;
+
+        let bindings = telegram_ingress_modes(&config);
+
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings.iter().all(|binding| matches!(
+            &binding.mode,
+            TelegramIngressMode::Disabled(reason) if reason.contains("listen_addr is shared")
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_transport_choice_falls_back_to_long_poll_only_when_webhook_is_unconfigured()
+    -> TestResult {
+        let long_poll = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:lp"
+bot_token_ref = "env:HARW_GW_TEST_CHOICE"
+"#,
+            &[],
+        )?;
+        assert_eq!(
+            telegram_transport_choice(first_telegram_binding(&long_poll)?),
+            Ok(TelegramTransportChoice::LongPoll {
+                webhook_fallback: false
+            })
+        );
+
+        let fallback = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:fb"
+bot_token_ref = "env:HARW_GW_TEST_CHOICE"
+transport = "webhook"
+"#,
+            &[],
+        )?;
+        assert_eq!(
+            telegram_transport_choice(first_telegram_binding(&fallback)?),
+            Ok(TelegramTransportChoice::LongPoll {
+                webhook_fallback: true
+            })
+        );
+
+        let bad_listener = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:bad"
+bot_token_ref = "env:HARW_GW_TEST_CHOICE"
+transport = "webhook"
+[channel.telegram.transport_webhook]
+public_url = "https://ingress.example.com/hook"
+secret_token_ref = "env:HARW_GW_TEST_CHOICE_SECRET"
+listen_addr = "localhost"
+"#,
+            &[],
+        )?;
+        assert!(telegram_transport_choice(first_telegram_binding(&bad_listener)?).is_err());
+
+        let unknown = telegram_test_config(
+            r#"
+[[channel.telegram]]
+id = "telegram:unknown"
+bot_token_ref = "env:HARW_GW_TEST_CHOICE"
+transport = "carrier_pigeon"
+"#,
+            &[],
+        )?;
+        assert!(telegram_transport_choice(first_telegram_binding(&unknown)?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_webhook_route_requires_https_supported_port_and_safe_path() {
+        assert_eq!(
+            telegram_webhook_route("https://ingress.example.com/telegram/support-bot"),
+            Ok("/telegram/support-bot".to_owned())
+        );
+        assert_eq!(
+            telegram_webhook_route("https://ingress.example.com:8443"),
+            Ok("/".to_owned())
+        );
+        assert_eq!(
+            telegram_webhook_route("https://ingress.example.com/hook?x=1"),
+            Ok("/hook".to_owned())
+        );
+        assert!(telegram_webhook_route("http://ingress.example.com/hook").is_err());
+        assert!(telegram_webhook_route("https://ingress.example.com:8080/hook").is_err());
+        assert!(telegram_webhook_route("https://user:pw@ingress.example.com/hook").is_err());
+        assert!(telegram_webhook_route("https://ingress.example.com/{capture}").is_err());
+        assert!(telegram_webhook_route("https://ingress.example.com/hook/").is_err());
+        assert!(telegram_webhook_route("not a url").is_err());
+    }
+
+    #[test]
+    fn webhook_routes_exclude_router_placeholder_syntax() {
+        assert!(is_supported_webhook_route("/"));
+        assert!(is_supported_webhook_route("/telegram/bot-1_a.b~c"));
+        assert!(!is_supported_webhook_route(""));
+        assert!(!is_supported_webhook_route("telegram"));
+        assert!(!is_supported_webhook_route("//double"));
+        assert!(!is_supported_webhook_route("/:param"));
+        assert!(!is_supported_webhook_route("/*rest"));
+        assert!(!is_supported_webhook_route("/{id}"));
+        assert!(!is_supported_webhook_route("/a/../b"));
+    }
+
+    #[test]
+    fn telegram_webhook_secret_follows_the_bot_api_charset() {
+        assert!(is_valid_telegram_webhook_secret("abc_DEF-123"));
+        assert!(is_valid_telegram_webhook_secret(&"a".repeat(256)));
+        assert!(!is_valid_telegram_webhook_secret(""));
+        assert!(!is_valid_telegram_webhook_secret(&"a".repeat(257)));
+        assert!(!is_valid_telegram_webhook_secret("has space"));
+        assert!(!is_valid_telegram_webhook_secret("umlaut-ä"));
+    }
+
+    #[test]
+    fn telegram_menu_lists_exactly_the_commands_the_gateway_handles() -> TestResult {
+        let commands = telegram_menu_commands("policy_visible")
+            .map_err(TestError::Unexpected)?
+            .ok_or(TestError::Missing("policy_visible publishes a menu"))?;
+        assert_eq!(commands.len(), 5);
+        for command in &commands {
+            assert!((1..=32).contains(&command.command.len()));
+            assert!(
+                command
+                    .command
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            );
+            assert!((3..=256).contains(&command.description.chars().count()));
+            let sample = if command.command == "request" {
+                "/request ws role task".to_owned()
+            } else {
+                format!("/{} w-1", command.command)
+            };
+            assert!(
+                harw_channel_telegram_transport::parse_command(&sample).is_some(),
+                "menu advertises /{} but the gateway does not handle it",
+                command.command
+            );
+        }
+        assert!(!commands.iter().any(|command| command.command == "pair"));
+        Ok(())
+    }
+
+    #[test]
+    fn telegram_menu_source_none_skips_and_unknown_is_reported() {
+        assert_eq!(telegram_menu_commands("none"), Ok(None));
+        assert!(telegram_menu_commands("bogus").is_err());
+    }
+
+    #[test]
+    fn telegram_offset_roots_are_per_binding_and_keep_the_legacy_default() {
+        let state = Path::new("/state");
+        assert_eq!(
+            telegram_offset_root(state, "telegram:default"),
+            PathBuf::from("/state/telegram-offset")
+        );
+        let ops = telegram_offset_root(state, "telegram:ops");
+        assert_eq!(
+            ops,
+            PathBuf::from("/state/telegram-offset/74656c656772616d3a6f7073")
+        );
+        assert_ne!(ops, telegram_offset_root(state, "telegram_ops"));
+    }
+
+    #[test]
+    fn telegram_backoff_resets_only_after_a_stable_run() {
+        assert_eq!(telegram_attempt_after_run(5, TELEGRAM_STABLE_RUN), 0);
+        assert_eq!(
+            telegram_attempt_after_run(5, TELEGRAM_STABLE_RUN + Duration::from_secs(1)),
+            0
+        );
+        assert_eq!(telegram_attempt_after_run(5, Duration::from_millis(10)), 5);
+        assert_eq!(telegram_attempt_after_run(0, Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn telegram_topic_mode_accepts_only_documented_values() {
+        assert_eq!(
+            telegram_topic_mode("per_topic_session"),
+            Some(TopicMode::PerTopicSession)
+        );
+        assert_eq!(
+            telegram_topic_mode("shared_session"),
+            Some(TopicMode::SharedSession)
+        );
+        assert_eq!(telegram_topic_mode("per_user"), None);
+    }
+
     #[test]
     fn audit_chain_check_interval_defaults_when_unset() {
         assert_eq!(
@@ -3507,9 +3954,10 @@ pinned_identities = [123456789]
     /// Regression B3/G2: ein aktivierter Provider mit `secrets:`-Credential,
     /// konfiguriertem KEK und versiegeltem Token muss über den Resolver
     /// montieren — nicht mit „sealed secret … could not be resolved" bzw.
-    /// „secret resolver failed" scheitern. Zugleich Beleg für G1: Telegram
-    /// und Dream bekommen je eine eigene Montage mit eigener `EntryKind` und
-    /// eigenem Principal. Kein Netz: der Provider wird nur gebaut, nie
+    /// „secret resolver failed" scheitern. Zugleich Beleg für G1: jede
+    /// aktivierte Telegram-Bindung und Dream bekommen je eine eigene Montage
+    /// mit eigener `EntryKind` und eigenem, aus der Bindung abgeleitetem
+    /// Principal. Kein Netz: der Provider wird nur gebaut, nie
     /// angefragt.
     #[test]
     fn test_mount_gateway_assembly_sealed_secret_provider_resolves_with_kek() -> TestResult {
@@ -3518,6 +3966,15 @@ pinned_identities = [123456789]
         let key_path = write_gateway_test_kek(home.path())?;
         seal_gateway_test_provider_token(home.path(), &key_path)?;
         write_gateway_sealed_provider_home(home.path(), Some(&key_path))?;
+        // Eine aktivierte Telegram-Bindung: ihre Montage muss einen aus der
+        // Bindungs-ID abgeleiteten Principal tragen (kein Platzhalter mehr).
+        std::fs::create_dir_all(home.path().join("channels"))
+            .map_err(ctx("create channels dir"))?;
+        std::fs::write(
+            home.path().join("channels").join("telegram.toml"),
+            "[[channel.telegram]]\nid = \"telegram:ops\"\nbot_token_ref = \"env:HARW_GW_TEST_MOUNT_TOKEN\"\n\n[channel.telegram.security]\npinned_identities = [42]\n",
+        )
+        .map_err(ctx("write telegram channel"))?;
         let sessions_root = home.path().join("sessions");
 
         let result = mount_gateway_assembly(home.path(), cwd.path(), &sessions_root);
@@ -3535,20 +3992,21 @@ pinned_identities = [123456789]
         };
 
         assert_eq!(
-            assemblies
-                .telegram
-                .config()
-                .harness
-                .default_provider
-                .as_deref(),
+            assemblies.dream.config().harness.default_provider.as_deref(),
             Some("sealed")
         );
-        let telegram_rights = assemblies.telegram.rights_snapshot();
+        let [telegram] = assemblies.telegram.as_slice() else {
+            return Err(TestError::Unexpected(
+                "exactly one Telegram assembly per enabled binding expected".into(),
+            ));
+        };
+        assert_eq!(telegram.binding_id, "telegram:ops");
+        let telegram_rights = telegram.assembly.rights_snapshot();
         assert_eq!(
             telegram_rights.entry,
             harw_runtime::EntryKind::GatewayTelegram
         );
-        assert_eq!(telegram_rights.principal.id(), "telegram:gateway");
+        assert_eq!(telegram_rights.principal.id(), "telegram:ops");
         let dream_rights = assemblies.dream.rights_snapshot();
         assert_eq!(dream_rights.entry, harw_runtime::EntryKind::GatewayDream);
         assert_eq!(dream_rights.principal.id(), "gateway-dream");

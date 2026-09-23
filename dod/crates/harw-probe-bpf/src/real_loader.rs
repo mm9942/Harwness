@@ -1,98 +1,164 @@
-//! Reale eBPF-Ladeschicht für diese Sonde — jetzt verdrahtet.
+//! Reale eBPF-Ladeschicht für diese Sonde.
 //!
-//! # Der frühere Stand, und was sich geändert hat
-//! Diese Datei lieferte zuvor immer einen Fehler „kein realer Ladeteil":
-//! `harw-dod-bpf` (Knoten AW7-01a) hatte damals bewusst **keine**
-//! `aya`-Abhängigkeit gezogen, mit zwei Begründungen — `SocketFilter::attach`
-//! bräuchte einen bereits offenen, vom Aufrufer besessenen Socket, den eine
-//! generische Ladeschicht nicht besitzen darf, und ein neuer, in dieser
-//! Aufgabenform nicht per `cargo` verifizierbarer Abhängigkeitszuwachs sei im
-//! Binary, das später mit `CAP_BPF` läuft, ein zu großes Risiko.
+//! # Verantwortungsbereich
+//! Diese Datei ist die einzige Stelle dieser Sonde, die einen
+//! [`harw_dod_bpf::RealBpfLoader`] baut, und die einzige, die Objektverträge
+//! ([`harw_dod_bpf::BpfObjectContract`]) tatsächlich in den Kernel lädt.
 //!
-//! Beide Punkte sind inzwischen bearbeitet, an der Quelle, nicht hier:
-//! `harw-dod-procmon` und `harw-dod-flow` hängen beide an einem Tracepoint
-//! (`sched:sched_process_exec` bzw. `sock:inet_sock_set_state`), keiner
-//! braucht mehr `SocketFilter` — das erste Hindernis ist gegenstandslos.
-//! `harw-dod-bpf` selbst trägt jetzt [`harw_dod_bpf::real::RealBpfLoader`],
-//! eine vollständige, `aya`-gestützte [`harw_dod_bpf::BpfLoader`]-
-//! Implementierung — siehe deren Moduldoku (`harw-dod-bpf/src/real.rs`) für
-//! die vollständige Recherche (Fassung, `unsafe`-Fläche, `build.rs`-Frage,
-//! transitive Crate-Zahl, jeweils mit Quelle) und die Begründung, warum sie
-//! zwar vollständig, aber **ungefüttert** ist: sie lädt ein bereits
-//! übersetztes eBPF-ELF-Objekt, erzeugt aber keines — die Objekterzeugung
-//! selbst (ein `aya-ebpf`/`nightly`/`bpfel-unknown-none`-Übersetzungslauf)
-//! bleibt ein eigener, künftiger Baustein.
+//! # Warum ein konkretes `Arc<RealBpfLoader>` statt `Box<dyn BpfLoader>`
+//! Die Trait-Methode `harw_dod_bpf::BpfLoader::load` auf `RealBpfLoader`
+//! scheitert bewusst **immer** mit
+//! [`harw_dod_bpf::BpfError::InvalidProgramContract`]: ein `BpfProgramSpec`
+//! trägt keinen Profil-/Scope-Anteil, der Lader könnte also nicht belegen,
+//! dass die Scope-Map vor dem Anheften befüllt wurde. Der Produktionsweg
+//! läuft deshalb ausschließlich über die inhärenten Methoden
+//! `load_contracts`, `read_wire_events`, `loss_counters` und `unload` — die
+//! es nur auf dem konkreten Typ gibt. Das `Arc` erlaubt, denselben Lader
+//! (und damit denselben laderweiten Zähler `invalid_wire_events`) zwischen
+//! Ladeschritt, Sammelschleife ([`crate::collect`]) und kontrolliertem Stopp
+//! zu teilen.
 //!
-//! # Was [`build_real_loader`] heute tut
-//! Baut und liefert einen [`harw_dod_bpf::real::RealBpfLoader`] — das
-//! Konstruieren selbst führt **keinen** Kernel- oder Berechtigungszugriff
-//! aus (siehe dessen Moduldoku, `RealBpfLoader::new`) und schlägt deshalb nie
-//! fehl. Ob ein späterer `loader.load(&spec)`-Aufruf gelingt, hängt von drei
-//! Dingen ab, die diese Funktion nicht beeinflusst: `CAP_BPF` auf dem Host,
-//! ein tatsächlich erreichbares `BpfProgramSource` (siehe oben, „Was sich
-//! geändert hat“), und ein Objekt, das dem in `RealBpfLoader`s Moduldoku
-//! dokumentierten Vertrag folgt (genau ein Programm, eine Ringpuffer-Map
-//! namens `"EVENTS"`).
+//! # Was [`build_real_loader`] tut
+//! Baut einen leeren [`harw_dod_bpf::RealBpfLoader`]. Das Konstruieren führt
+//! **keinen** Kernel- oder Berechtigungszugriff aus (siehe
+//! `RealBpfLoader::new`) und schlägt deshalb nie fehl; die `Result`-Form
+//! bleibt nur, damit Aufrufer sie einheitlich mit `?` behandeln können.
 //!
-//! [`crate::sensors::build_procmon_sensor`] und
-//! [`crate::sensors::build_flow_sensor`] nehmen bereits einen
-//! `Box<dyn harw_dod_bpf::BpfLoader>` entgegen, unabhängig davon, ob er von
-//! hier oder von einem Test-Fixture stammt — kein Aufrufer dieser Crate
-//! musste sich ändern, als diese Funktion von einem dokumentierten
-//! Platzhalter zu einer echten Verdrahtung wurde.
+//! # Was [`load_sensor`] tut
+//! Lädt alle Objektverträge **eines** Sensors transaktional über
+//! `RealBpfLoader::load_contracts`: scheitert ein Objekt, werden alle in
+//! diesem Aufruf bereits angehefteten Objekte wieder entfernt, bevor der
+//! Fehler zurückkommt. Eine leere Vertragsliste wird abgelehnt.
 //!
 //! # Exportierte Typen
-//! Keine — nur die Funktion [`build_real_loader`].
+//! Keine — nur die Funktionen [`build_real_loader`] und [`load_sensor`].
 //!
 //! # Nebenläufigkeit
-//! Zustandslos; das zurückgegebene `Box<dyn harw_dod_bpf::BpfLoader>` ist
-//! `Send + Sync` (Trait-Anforderung), siehe
-//! `harw_dod_bpf::real::RealBpfLoader`-Moduldoku für die Nebenläufigkeits-
-//! annahme über `aya`s eigene Typen.
+//! Zustandslos. `RealBpfLoader` schützt seine Registrierung selbst mit einem
+//! `Mutex` und ist `Send + Sync`; das zurückgegebene `Arc` darf frei geteilt
+//! werden.
 //!
 //! # Fehler
-//! Keine — [`build_real_loader`] selbst ist total. Fehler entstehen erst bei
-//! einem späteren `load`/`read_events`-Aufruf auf dem zurückgegebenen Lader
-//! (siehe `harw_dod_bpf::error::BpfError`).
+//! [`build_real_loader`] ist total. [`load_sensor`] bildet jeden
+//! `harw_dod_bpf::BpfError` auf [`ProbeError::BpfLoad`] ab — u. a.
+//! `AttachCapabilitiesUnavailable`/`CapabilityUnavailable` (fehlende
+//! Berechtigungen) und `InvalidProgramContract` (Vertrag oder Objekt passt
+//! nicht, leere Liste).
 //!
 //! # Examples
 //! ```rust,ignore
-//! use crate::real_loader::build_real_loader;
+//! use crate::real_loader::{build_real_loader, load_sensor};
 //!
-//! let loader = build_real_loader().expect("building the loader never fails");
+//! let loader = build_real_loader()?;
+//! let handles = load_sensor(&loader, &contracts)?;
 //! ```
 
-use harw_dod_bpf::BpfLoader;
-use harw_dod_bpf::real::RealBpfLoader;
+use std::sync::Arc;
+
+use harw_dod_bpf::{BpfHandle, BpfObjectContract, RealBpfLoader};
 
 use crate::error::ProbeError;
 
 /// Baut die reale eBPF-Ladeschicht.
 ///
 /// # Description
-/// Siehe Moduldoku für den Stand dieser Funktion und was sich seit ihrem
-/// früheren, immer fehlschlagenden Platzhalter geändert hat.
+/// Siehe Moduldoku: kein Kernel-, kein Berechtigungszugriff.
 ///
 /// # Returns
-/// Einen `Box<dyn harw_dod_bpf::BpfLoader>`, gestützt auf
-/// [`harw_dod_bpf::real::RealBpfLoader`].
+/// Einen leeren, teilbaren [`harw_dod_bpf::RealBpfLoader`].
 ///
 /// # Errors
 /// Keine — diese Funktion ist total; siehe Moduldoku.
-pub fn build_real_loader() -> Result<Box<dyn BpfLoader>, ProbeError> {
-    Ok(Box::new(RealBpfLoader::new()))
+pub fn build_real_loader() -> Result<Arc<RealBpfLoader>, ProbeError> {
+    Ok(Arc::new(RealBpfLoader::new()))
+}
+
+/// Lädt den vollständigen Objektsatz eines Sensors transaktional.
+///
+/// # Description
+/// Delegiert an `RealBpfLoader::load_contracts`. Entweder sind danach alle
+/// `contracts` geladen und angeheftet, oder keiner.
+///
+/// # Arguments
+/// - `loader`: die gemeinsame reale Ladeschicht.
+/// - `contracts`: die Objektverträge genau eines Sensors, z. B. aus
+///   `harw_dod_procmon::procmon_contracts` oder `harw_dod_flow::flow_contracts`.
+///
+/// # Returns
+/// Die Handles in der Reihenfolge von `contracts`.
+///
+/// # Errors
+/// [`ProbeError::BpfLoad`] mit dem zugrunde liegenden
+/// `harw_dod_bpf::BpfError`, u. a.:
+/// - `InvalidProgramContract`: leere Liste, ungültiger Vertrag oder ein
+///   Objekt, das dem v1-Vertrag nicht entspricht.
+/// - `AttachCapabilitiesUnavailable`: dem Prozess fehlen die zum Anheften
+///   nötigen Fähigkeiten.
+/// - `Io`, `ProgramLoadFailed`: Objekt nicht lesbar bzw. `aya`-seitiger
+///   Lade-/Anheftfehler.
+pub fn load_sensor(
+    loader: &RealBpfLoader,
+    contracts: &[BpfObjectContract],
+) -> Result<Vec<BpfHandle>, ProbeError> {
+    loader.load_contracts(contracts).map_err(ProbeError::from)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::build_real_loader;
+    use std::borrow::Cow;
+
+    use harw_dod_bpf::{BpfError, BpfObjectContract, BpfProgramKind, BpfProgramSource, BpfScope};
+    use harw_types::SensorId;
+
+    use super::{build_real_loader, load_sensor};
+    use crate::error::ProbeError;
+    use crate::test_support::{TestError, TestResult};
 
     #[test]
-    fn test_build_real_loader_succeeds_and_holds_no_programs_yet() {
+    fn test_build_real_loader_succeeds_without_kernel_access() -> TestResult {
         // Kein Kernel-, kein Berechtigungszugriff: das Bauen selbst schlägt
         // nie fehl. Siehe Aufgabenregel „Lade in keinem Test ein echtes
-        // eBPF-Programm" — dieser Test ruft `load` bewusst nicht auf.
-        let loader = build_real_loader();
-        assert!(loader.is_ok());
+        // eBPF-Programm".
+        let loader = build_real_loader().map_err(|err| TestError::Context {
+            context: "build_real_loader",
+            source: err.to_string(),
+        })?;
+        assert_eq!(std::sync::Arc::strong_count(&loader), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_sensor_rejects_an_empty_contract_list() -> TestResult {
+        // `load_contracts` prüft die leere Liste vor jedem Kernelzugriff.
+        let loader = build_real_loader().map_err(|err| TestError::Context {
+            context: "build_real_loader",
+            source: err.to_string(),
+        })?;
+        match load_sensor(&loader, &[]) {
+            Err(ProbeError::BpfLoad(BpfError::InvalidProgramContract)) => Ok(()),
+            other => Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
+    #[test]
+    fn test_load_sensor_rejects_an_invalid_contract_before_kernel_access() -> TestResult {
+        // Ein unbekannter Programmname scheitert in `BpfObjectContract::validate`,
+        // also vor Berechtigungsprüfung und `aya`.
+        let loader = build_real_loader().map_err(|err| TestError::Context {
+            context: "build_real_loader",
+            source: err.to_string(),
+        })?;
+        let contract = BpfObjectContract::new(
+            SensorId::from_str("procmon-0"),
+            "not_a_dod_program",
+            BpfProgramKind::Tracepoint,
+            "sched:sched_process_exec",
+            BpfProgramSource::Embedded(Cow::Borrowed(b"ELF")),
+            BpfScope::Host,
+        );
+        match load_sensor(&loader, &[contract]) {
+            Err(ProbeError::BpfLoad(BpfError::InvalidProgramContract)) => Ok(()),
+            other => Err(TestError::Unexpected(format!("{other:?}"))),
+        }
     }
 }
