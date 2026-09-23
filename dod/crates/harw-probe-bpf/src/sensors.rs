@@ -413,10 +413,21 @@ fn resolve_bpf_object(
         return Err(unavailable(reason));
     }
 
+    // Blockweises, begrenztes Einlesen (höchstens ein Byte über der
+    // Obergrenze, damit `size_violation` Überlänge erkennt). Bewusst kein
+    // Einlesen „bis zum Streamende“ über `std::io::Read`: der
+    // `push_only_guard` verbietet diesen Bezeichner in der ganzen Sonde.
     let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
-    file.take(MAX_BPF_OBJECT_BYTES.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|err| unavailable(io_reason(&err)))?;
+    let mut limited = file.take(MAX_BPF_OBJECT_BYTES.saturating_add(1));
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        match limited.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => bytes.extend_from_slice(chunk.get(..n).unwrap_or_default()),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(unavailable(io_reason(&err))),
+        }
+    }
     if let Some(reason) = size_violation(u64::try_from(bytes.len()).unwrap_or(u64::MAX)) {
         return Err(unavailable(reason));
     }

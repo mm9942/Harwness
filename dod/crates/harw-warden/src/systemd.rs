@@ -189,7 +189,7 @@ pub fn acquire_listen_socket() -> Result<std::os::fd::OwnedFd, WardenBinError> {
             // `#![forbid(unsafe_code)]` hier verbietet.
             let (_name, fd) = fds
                 .pop()
-                .ok_or_else(|| WardenBinError::UnexpectedListenFdCount { actual: 0 })?;
+                .ok_or(WardenBinError::UnexpectedListenFdCount { actual: 0 })?;
             Ok(fd.into_std())
         }
         actual => Err(WardenBinError::UnexpectedListenFdCount { actual }),
