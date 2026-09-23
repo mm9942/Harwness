@@ -3992,7 +3992,12 @@ transport = "carrier_pigeon"
         };
 
         assert_eq!(
-            assemblies.dream.config().harness.default_provider.as_deref(),
+            assemblies
+                .dream
+                .config()
+                .harness
+                .default_provider
+                .as_deref(),
             Some("sealed")
         );
         let [telegram] = assemblies.telegram.as_slice() else {
@@ -4045,7 +4050,7 @@ transport = "carrier_pigeon"
         let cwd = tempfile::tempdir().map_err(ctx("temp cwd"))?;
         let principal = channel_principal(GatewayEntry::Dream, "");
 
-        let resolver =
+        let (resolver, _config) =
             open_gateway_secret_resolver(GatewayEntry::Dream, home.path(), cwd.path(), &principal)
                 .map_err(ctx("an empty home has no sealed provider and needs no KEK"))?;
 
@@ -4094,7 +4099,7 @@ transport = "carrier_pigeon"
         write_gateway_home_with_unused_sealed_provider(home.path())?;
         let principal = channel_principal(GatewayEntry::Dream, "");
 
-        let resolver = open_gateway_secret_resolver(
+        let (resolver, _config) = open_gateway_secret_resolver(
             GatewayEntry::Dream,
             home.path(),
             cwd.path(),
