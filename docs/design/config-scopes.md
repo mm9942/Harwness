@@ -217,6 +217,7 @@ Section-Default zurückgesetzt (Bug); **ÜBERNOMMEN** = explizite Ausnahme
 | TOML-Pfad | Typ | Default | Datei:Zeile | Merge heute |
 |---|---|---|---|---|
 | `compaction.absolute_ceiling_tokens` | `Option<u64>` | `None` | `harness_config.rs:116` | ERSETZT |
+| `compaction.max_history_bytes` | `Option<usize>` | `None` | `harness_config.rs:130` | ERSETZT |
 
 ### 1.15 `[reasoning]` (`harness_config.rs:119-148`)
 
@@ -240,7 +241,7 @@ Section-Default zurückgesetzt (Bug); **ÜBERNOMMEN** = explizite Ausnahme
 | `guards.no_progress_rounds_abort` | `Option<u32>` | `None` → `8` | `harness_config.rs:171` | ERSETZT |
 | `guards.plan_stale_rounds` | `Option<u32>` | `None` → `6` | `harness_config.rs:174` | ERSETZT |
 
-**Gesamtzahl dokumentierter `HarnessConfig`-Felder: 89** (Blattfelder inkl.
+**Gesamtzahl dokumentierter `HarnessConfig`-Felder: 90** (Blattfelder inkl.
 verschachtelter Typen wie `McpPrincipalToml`, `RuleToml`,
 `CargoSandboxToml`/`TmuxSandboxToml`, `InternalModelChoice`,
 `OnboardingSeen`; dazu `base_dir` als 90. Tabellenzeile in Abschnitt 1.1,
@@ -604,7 +605,7 @@ festgelegt**, da sie im heutigen Code an keiner Stelle kodiert sind:
   dritter Wert nie stillschweigend in die Ordnung einsortiert wird;
   abgesichert durch Test #24 (Abschnitt 7h).
 
-### 6.3 Vollständige Feld-für-Feld-Zuordnung (alle 89 Felder)
+### 6.3 Vollständige Feld-für-Feld-Zuordnung (alle 90 Felder)
 
 Eine Zeile je Blattfeld aus Abschnitt 1, in derselben Reihenfolge und mit
 denselben Unterabschnittsnummern, damit die Tabelle 1:1 gegen Abschnitt 1
@@ -731,8 +732,8 @@ Variante.
 | `internal_models.worker_complex` | Profile | `ProfileReplaces` |
 | `InternalModelChoice.provider`/`.model` (Feld jeder Stelle) | — | `CompositeMember` (reist als Teil der atomaren `Option<InternalModelChoice>` der jeweiligen Stelle, s. o.; nie einzeln gemergt) |
 
-**1.14 `[compaction]`** (1): `compaction.absolute_ceiling_tokens` — Global /
-`MinBound`.
+**1.14 `[compaction]`** (2): `compaction.absolute_ceiling_tokens` — Global /
+`MinBound`; `compaction.max_history_bytes` — Profil / `ProfileReplaces`.
 
 **1.15 `[reasoning]`** (6): `reasoning.uia`, `.root_orchestrator`,
 `.root_orchestrator_with_subs`, `.sub_orchestrator`, `.worker_complex`,
@@ -749,9 +750,9 @@ Variante.
 | `guards.no_progress_rounds_abort` | Global | `MinBound` |
 | `guards.plan_stale_rounds` | Global | `MinBound` |
 
-**Verteilung (Kontrollsumme = 89, Stand 2026-09-21 nach R1/R2-Entscheidung
-plus Ergänzung `uia_worker_model`):**
-`ProfileReplaces` 41 · `GlobalOnly` 11 · `MinBound` 12 · `CompositeMember` 11 ·
+**Verteilung (Kontrollsumme = 90, Stand 2026-09-23 nach R1/R2-Entscheidung
+plus Ergänzungen `uia_worker_model` und `compaction.max_history_bytes`):**
+`ProfileReplaces` 42 · `GlobalOnly` 11 · `MinBound` 12 · `CompositeMember` 11 ·
 `Intersection` 4 · `OrBool` 3 · `Union` 2 · `AndBool` 2 · `StricterOf` 2 ·
 `PerFileValidated` 1. (Vor der R2-Entscheidung: `GlobalOnly` 17 ·
 `CompositeMember` 6 · `Intersection` 3 — die Ummappung von
@@ -763,7 +764,9 @@ Listenelements reisen — netto `GlobalOnly` −6, `CompositeMember` +5,
 `Intersection` +1, Summe unverändert 88 zu diesem Zeitpunkt. Die spätere
 Ergänzung von `uia_worker_model` als `ProfileReplaces` erhöht die Summe auf
 89 und `ProfileReplaces` von 40 auf 41, ohne die übrigen Varianten zu
-berühren.)
+berühren; `compaction.max_history_bytes` (Byte-Budget der Verlaufsfenster,
+überschreibt die aus dem Kontextfenster abgeleitete Grenze) hebt sie auf 90 und
+`ProfileReplaces` auf 42.)
 
 ---
 
