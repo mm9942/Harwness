@@ -2,13 +2,16 @@
 //! The parent holds all descriptors while synchronously waiting for the helper.
 //! No worker threads or locks. Kernel, transport and subprocess failures return
 //! structured errors; there is deliberately no numeric-PID fallback.
-//! Binary-crate examples are illustrative and are not executed by Cargo doctests.
+//! The helper re-executes the current binary as described by
+//! [`HelperInvocation`](crate::HelperInvocation): standalone or behind a host
+//! CLI's subcommand prefix.
 //! # Examples
 //! ```no_run
 //! std::process::Command::new("killer").args(["--pid", "1234", "--no-sudo", "--dry-run"]).status()?;
 //! # Ok::<(), std::io::Error>(())
 //! ```
 use crate::{
+    HelperInvocation,
     cli::Cli,
     engine,
     error::{Error, Result},
@@ -32,7 +35,7 @@ pub(crate) trait CommandRunner {
     /// child completion before returning, so borrowed target handles stay alive.
     /// The native implementation blocks the calling thread and creates no workers.
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// use crate::privilege::CommandRunner;
     /// let output = crate::privilege::SystemRunner.output(
     ///     std::path::Path::new("/usr/bin/sudo"), &["--version".into()])?;
@@ -76,7 +79,9 @@ fn sudo_path() -> Result<PathBuf> {
 /// ProcFormat/Parse for parent metadata; Helper or Json for invalid helper output.
 /// # Arguments and ownership
 /// `targets` borrows the previously selected foreign-owned targets. `cli` borrows
-/// wait/escalation options. `runner` borrows the synchronous process boundary.
+/// wait/escalation options. `invocation` borrows how the current executable is
+/// re-entered (`<exe> --helper ...` or `<exe> <prefix...> --helper ...`).
+/// `runner` borrows the synchronous process boundary.
 /// Descriptors must remain open throughout this call; no selection is repeated.
 /// # Returns and concurrency
 /// Owned reports, one per target in input order. Blocks through sudo interaction
@@ -90,33 +95,49 @@ fn sudo_path() -> Result<PathBuf> {
 pub(crate) fn terminate_foreign<R: CommandRunner>(
     targets: &[&Target],
     cli: &Cli,
+    invocation: &HelperInvocation,
     runner: &R,
 ) -> Result<Vec<Outcome>> {
     let executable =
         std::env::current_exe().map_err(|e| Error::io("resolve killer executable", None, e))?;
     let parent = process::read(std::process::id())?;
-    let mut args = vec![
-        OsString::from("--"),
+    let tokens = targets
+        .iter()
+        .map(|t| OsString::from(format!("{}:{}", t.process.pid, t.fd.raw())));
+    let args = helper_args(
         executable.into_os_string(),
+        invocation,
+        cli,
+        (parent.pid, parent.start_ticks),
+        tokens,
+    );
+    tracing::info!(count = targets.len(), "requesting sudo for foreign targets");
+    decode(runner.output(&sudo_path()?, &args)?, targets)
+}
+// Build the sudo argument vector: `-- <exe> [prefix...] <options> --helper <parent> <start> PID:FD...`.
+// The subcommand prefix precedes all options so the host CLI routes back to `run_cli`.
+fn helper_args(
+    executable: OsString,
+    invocation: &HelperInvocation,
+    cli: &Cli,
+    (parent_pid, parent_start): (u32, u64),
+    tokens: impl IntoIterator<Item = OsString>,
+) -> Vec<OsString> {
+    let mut args = vec![OsString::from("--"), executable];
+    args.extend(invocation.prefix().iter().cloned());
+    args.extend([
         OsString::from("--timeout"),
         OsString::from(cli.timeout.as_secs_f64().to_string()),
         OsString::from("--kill-wait"),
         OsString::from(cli.kill_wait.as_secs_f64().to_string()),
         OsString::from("--log"),
         OsString::from(cli.log.to_string()),
-    ];
-    args.extend([
         OsString::from("--helper"),
-        OsString::from(parent.pid.to_string()),
-        OsString::from(parent.start_ticks.to_string()),
+        OsString::from(parent_pid.to_string()),
+        OsString::from(parent_start.to_string()),
     ]);
-    args.extend(
-        targets
-            .iter()
-            .map(|t| OsString::from(format!("{}:{}", t.process.pid, t.fd.raw()))),
-    );
-    tracing::info!(count = targets.len(), "requesting sudo for foreign targets");
-    decode(runner.output(&sudo_path()?, &args)?, targets)
+    args.extend(tokens);
+    args
 }
 // Validate subprocess status and the one-to-one report mapping before merging.
 fn decode(output: Output, targets: &[&Target]) -> Result<Vec<Outcome>> {
