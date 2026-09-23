@@ -700,7 +700,7 @@ fn units_from_explorer(root: &Path, index: &ExplorerIndex) -> Vec<AnalysisUnit> 
             .projects
             .iter()
             .filter(|project| project.root.as_path() == rel)
-            .filter(|project| !(project.kind == ProjectKind::Node && !project.members.is_empty()))
+            .filter(|project| project.kind != ProjectKind::Node || project.members.is_empty())
             .collect();
         let kinds: Vec<ProjectKind> = UNIT_KIND_PRIORITY
             .iter()
