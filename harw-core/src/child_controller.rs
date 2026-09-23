@@ -1646,6 +1646,12 @@ impl ManagedAgentSpawner {
         self
     }
 
+    /// Liefert die globalen Admission-Limits dieses Controllers.
+    #[must_use]
+    pub fn limits(&self) -> ChildLimits {
+        self.limits
+    }
+
     fn context_window_for(&self, model: Option<&str>) -> u64 {
         self.context_window_resolver
             .as_ref()

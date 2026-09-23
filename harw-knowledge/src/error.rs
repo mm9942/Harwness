@@ -4,9 +4,8 @@
 //! The derive emits `Display`, `std::error::Error` (with `source()` wired
 //! through `#[from]` variants) and the `KnowledgeResult<T>` alias (the enum
 //! name ends in `Error`). No `anyhow`/`thiserror`. Foreign errors that
-//! implemented skeleton flows actually propagate via `?` get a `#[from]`
-//! variant (io, YAML frontmatter, index-cache JSON, job runtime); flows that
-//! are deferred surface as [`KnowledgeError::NotYetImplemented`].
+//! implemented flows actually propagate via `?` get a `#[from]` variant
+//! (io, YAML frontmatter, index-cache JSON, TOML, job runtime, time).
 //!
 //! Spec: `docs/design/knowledge-surfaces.md` §8.1 (verbatim message variants),
 //! extended with `MalformedFrontmatter`, `IllegalTransition` and `Json` for the
@@ -92,10 +91,6 @@ pub enum KnowledgeError {
     /// transient one.
     #[msg("invalid steward observation window: {detail}")]
     StewardWindowInvalid { detail: String },
-
-    /// A skeleton code path whose real body is deferred to the parent build.
-    #[msg("not yet implemented: {0}")]
-    NotYetImplemented(String),
 
     /// Filesystem I/O failure; defers `Display`/`source()` to the inner error.
     #[from]

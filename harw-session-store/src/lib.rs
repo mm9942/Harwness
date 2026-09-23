@@ -15,10 +15,8 @@
 //! rename for full-file rewrites. Time is `jiff::Timestamp`. IDs are reused
 //! from `harw-types` (`SessionId`, `ThreadRef`) — never redefined here.
 //!
-//! Skeleton status: record codec, path derivation and the replay reader are
-//! implemented; the locked-append and atomic-rewrite bodies return
-//! [`error::SessionStoreError::NotYetImplemented`] pending `fs4`/`tempfile`
-//! wiring by the parent build.
+//! Status: record codec, path derivation, replay reader, locked append and
+//! atomic rewrite are implemented.
 
 #![forbid(unsafe_code)]
 

@@ -134,7 +134,7 @@ use harw_protocol::events::TurnEvent;
 use harw_tools::{ToolCall, ToolName};
 use harw_types::{
     AgentRole, ApprovalActor, ItemId, ModelId, ProviderId, ReasoningEffort, SessionId, TokenUsage,
-    ToolCallId, TurnId,
+    ThreadId, ToolCallId, TurnId,
 };
 use std::collections::BTreeSet;
 use tokio::sync::mpsc;
@@ -212,6 +212,8 @@ pub struct AgentSession {
     /// Löst bei einem Modellwechsel das neue Kontextfenster auf, damit
     /// Auto-Compaction und Byte-Budget dem aktiven Modell folgen.
     context_window_resolver: Option<std::sync::Arc<crate::child_controller::ContextWindowResolver>>,
+    /// Vorgabe-Grenzen für Turns ohne eigene Grenzen (siehe `run_turn`).
+    default_turn_limits: Option<crate::turn_loop::TurnLimits>,
     /// Startzeitpunkt des offenen Handoffs (für `ChildCompleted::duration_ms`).
     handoff_started_at: Option<std::time::Instant>,
     /// Session-level filter controlling which tools, instructions providers,
@@ -581,6 +583,7 @@ impl AgentSession {
             auto_compact: None,
             agent_events: None,
             handoff_started_at: None,
+            default_turn_limits: None,
             context_window_resolver: None,
             compaction_observer: None,
             tool_outcome_observer: None,
@@ -1494,6 +1497,49 @@ impl AgentSession {
         self.handoff_started_at = Some(std::time::Instant::now());
         self.state = SessionState::WaitingForChild;
         Ok(())
+    }
+
+    /// Setzt die Vorgabe-Grenzen, die jeder Turn ohne eigene
+    /// [`crate::turn_loop::TurnLimits`] bekommt.
+    #[must_use]
+    pub fn with_default_turn_limits(mut self, limits: crate::turn_loop::TurnLimits) -> Self {
+        self.default_turn_limits = Some(limits);
+        self
+    }
+
+    /// Die Vorgabe-Grenzen dieser Session, falls gesetzt.
+    #[must_use]
+    pub fn default_turn_limits(&self) -> Option<crate::turn_loop::TurnLimits> {
+        self.default_turn_limits
+    }
+
+    /// Meldet, dass die Session konfiguriert ist (Modell steht fest).
+    pub fn announce_configured(&self) {
+        let _ = self.event_tx.send(SessionEvent::SessionConfigured {
+            session_id: self.id.clone(),
+            thread_id: ThreadId::new(),
+            model: self
+                .active_model
+                .as_ref()
+                .map_or_else(|| "default".to_owned(), |m| m.as_str().to_owned()),
+        });
+    }
+
+    /// Meldet das saubere Ende der Session.
+    pub fn announce_closed(&self, reason: Option<String>) {
+        let _ = self.event_tx.send(SessionEvent::SessionClosed {
+            session_id: self.id.clone(),
+            reason,
+        });
+    }
+
+    /// Meldet einen Fehler auf Session-Ebene (z. B. einen gescheiterten Turn).
+    pub fn report_error(&self, message: String, retryable: bool) {
+        let _ = self.event_tx.send(SessionEvent::SessionError {
+            session_id: self.id.clone(),
+            message,
+            retryable,
+        });
     }
 
     /// Entnimmt die bisherige Laufzeit des zuletzt begonnenen Handoffs in

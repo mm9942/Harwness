@@ -1,4 +1,4 @@
-//! Implementierung der `/new`-Operation — lehnt nicht verfügbare Session-Starts ab.
+//! `/new`-Operation: Katalogeintrag und Rückfall für Flächen ohne Sitzungswechsel.
 //!
 //! # Verantwortlichkeit
 //! Dieses Modul registriert den `/new`-Command als reine Governance-Operation
@@ -17,11 +17,11 @@
 //! [`OpError::NotAvailable`], weil [`OpContext`] keine `SessionManager`-Boundary
 //! für das Erzeugen oder Wechseln einer TUI/Core-Session bereitstellt.
 //!
-//! # Ausstehende Integration
-//! Die eigentliche SessionManager-Verdrahtung (Turn-Counter-Reset, Kontext-
-//! Flush, Session-ID-Vergabe und TUI/Core-Wechsel) liegt außerhalb des aktuellen
-//! `OpContext`-Vertrags. Bis diese Boundary explizit verfügbar ist, schlägt der
-//! Handler fail-closed fehl.
+//! # Wo `/new` wirklich wirkt
+//! Die TUI fängt `/new` vor der Operations-Pipeline ab und montiert eine
+//! frische Wurzelsitzung (`TuiRunOutcome::NewSession`, gleicher Austausch
+//! wie `/resume`). Flächen ohne lebende Sitzung (Web, Telegram, Jobs)
+//! erreichen diesen Handler und bekommen weiterhin `NotAvailable`.
 //!
 //! # Beispiel
 //! ```no_run
@@ -90,7 +90,7 @@ pub struct NewArgs {
 /// ```
 #[operation(
     name = "new",
-    summary = "Neue Session ist nicht verfügbar: OpContext hat keinen SessionManager.",
+    summary = "Startet eine neue Sitzung (in der TUI; andere Flächen: nicht verfügbar).",
     domain = "session",
     permission = "operator",
     command(path = "/new", visibility = "channel_parity")

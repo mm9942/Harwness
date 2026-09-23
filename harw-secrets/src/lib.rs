@@ -19,11 +19,10 @@
 //! `ml-kem`, `ml-dsa`, `hkdf`, or the raw AEAD crates directly (§2.1). In-memory
 //! secret material uses `secrecy::SecretString` / `secrecy::SecretBox<[u8]>`.
 //!
-//! Skeleton status: function bodies that require an unconfirmed `crypt_guard` /
-//! `keyring` API signature return [`error::SecretsError::NotYetImplemented`]
-//! (or [`error::AuditError::NotYetImplemented`]); pure logic (hash chaining,
-//! canonical serialization, permission checks, in-memory bookkeeping) is
-//! implemented in full.
+//! Status: envelope encryption, the hash-chained audit log and ML-DSA-65
+//! signed checkpoints (`SecretStore::sign_checkpoint` /
+//! `SecretStore::verify_checkpoints`) are implemented; the checkpoint signing
+//! key is supplied by the caller and is distinct from the KEK.
 
 pub mod audit;
 pub mod envelope;

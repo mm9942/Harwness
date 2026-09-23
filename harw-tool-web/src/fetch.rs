@@ -35,9 +35,14 @@
 //! 4. **Kappung.** Bytes beim Lesen ([`push_chunk`], vor dem Dekodieren),
 //!    Text nach der Aufbereitung ([`crate::html::truncate_utf8`],
 //!    UTF-8-grenzsicher).
-//! 5. **Content-Type-Positivliste.** Nur Text-, JSON- und XML-artige Typen.
-//! 6. **Blockierendes außerhalb des Reaktors.** HTML-Parsing, Markdown und
-//!    Cache-I/O laufen über [`run_blocking`] (`spawn_blocking`).
+//! 5. **Content-Type-Positivliste.** Text-, JSON- und XML-artige Typen sowie
+//!    PDF (`application/pdf`, `application/x-pdf`, `application/octet-stream`
+//!    nur mit `%PDF-`-Signatur, siehe [`classify_content_type`]). PDF-Körper
+//!    unterliegen **demselben** Byte-Limit und werden vor dem Cachen lokal zu
+//!    Text extrahiert ([`extract_pdf_text`]); der Cache enthält nie PDF-Bytes.
+//! 6. **Blockierendes außerhalb des Reaktors.** HTML-Parsing, Markdown,
+//!    PDF-Extraktion und Cache-I/O laufen über [`run_blocking`]
+//!    (`spawn_blocking`).
 //! 7. **Meldungen ohne interne Adressen** (siehe [`crate::hop`]).
 //!
 //! # Nebenläufigkeit
@@ -79,6 +84,8 @@ use crate::html::{html_to_markdown, html_to_text, truncate_utf8};
 use harw_authority::NetworkScope;
 use harw_egress::EgressPolicy;
 use harw_macros::Tool;
+use harw_tool_doc::native::extract_pages;
+use harw_tool_doc::types::ExtractedDocument;
 use harw_tools::{ToolExecutionContext, ToolOutput, ToolsError};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -120,6 +127,15 @@ const ALLOWED_MEDIA_TYPES: &[&str] = &[
     "application/javascript",
 ];
 
+/// Normalisierter Medientyp aller PDF-Antworten (auch im Cache-Eintrag).
+pub const PDF_MEDIA_TYPE: &str = "application/pdf";
+
+/// Signatur am Anfang jeder PDF-Datei (für das Sniffen von `octet-stream`).
+const PDF_MAGIC: &[u8] = b"%PDF-";
+
+/// Hinweis für PDFs ohne extrahierbaren Text (gescannte Seiten).
+const PDF_OCR_HINT: &str = "gescannte PDFs ohne Textebene bitte mit `doc.read_pdf` (OCR) lesen";
+
 /// Der prozessweit geteilte Basis-Fetcher (ohne Sandbox-Scope).
 static SHARED_FETCHER: OnceLock<Arc<WebFetcher>> = OnceLock::new();
 
@@ -135,7 +151,7 @@ static SHARED_FETCHER: OnceLock<Arc<WebFetcher>> = OnceLock::new();
 #[derive(Debug, Clone, Tool, Deserialize)]
 #[tool(
     name = "web.fetch",
-    description = "Lädt eine HTTPS-Ressource und liefert Text oder Markdown."
+    description = "Lädt eine HTTPS-Ressource und liefert Text oder Markdown; PDFs werden als Text extrahiert."
 )]
 pub struct FetchArgs {
     /// Vollständige HTTPS-URL.
@@ -340,6 +356,185 @@ pub fn check_content_type(raw: &str, host: &str) -> WebToolResult<String> {
             host: host.to_owned(),
         })
     }
+}
+
+/// Einordnung einer Antwort anhand ihres `Content-Type`.
+///
+/// # Description
+/// Ergebnis von [`classify_content_type`]; steuert, ob der Körper als Text
+/// dekodiert, als PDF extrahiert oder erst nach dem Sniffen der Signatur
+/// angenommen wird.
+///
+/// # Concurrency
+/// Reine Daten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentClass {
+    /// Text-, JSON- oder XML-artiger Typ (normalisierter Medientyp).
+    Text(String),
+    /// Ausdrücklich deklariertes PDF (`application/pdf`, `application/x-pdf`).
+    Pdf,
+    /// `application/octet-stream`: nur als PDF zulässig, wenn der Körper mit
+    /// `%PDF-` beginnt ([`is_pdf_magic`]).
+    SniffPdf,
+}
+
+/// Ordnet den `Content-Type` einer Antwort für `web.fetch` ein.
+///
+/// # Description
+/// Erweitert [`check_content_type`] (unverändert Text-only, auch für
+/// `web.search`) um PDF: `application/pdf` und `application/x-pdf` gelten als
+/// PDF, `application/octet-stream` nur unter Vorbehalt der Signaturprüfung.
+/// Alles andere wird wie bisher abgelehnt.
+///
+/// # Arguments
+/// - `raw` (`&str`): roher Header-Wert.
+/// - `host` (`&str`): antwortender Host (nur Meldung).
+///
+/// # Returns
+/// Die [`ContentClass`] der Antwort.
+///
+/// # Errors
+/// - [`WebToolError::UnexpectedContentType`]: Typ weder Text noch PDF.
+///
+/// # Concurrency
+/// Rein.
+///
+/// # Examples
+/// ```rust
+/// use harw_tool_web::fetch::{classify_content_type, ContentClass};
+///
+/// assert_eq!(classify_content_type("application/PDF", "a.test").unwrap(), ContentClass::Pdf);
+/// assert_eq!(
+///     classify_content_type("application/octet-stream", "a.test").unwrap(),
+///     ContentClass::SniffPdf
+/// );
+/// assert!(classify_content_type("image/png", "a.test").is_err());
+/// ```
+pub fn classify_content_type(raw: &str, host: &str) -> WebToolResult<ContentClass> {
+    let media = raw
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match media.as_str() {
+        "application/pdf" | "application/x-pdf" => Ok(ContentClass::Pdf),
+        "application/octet-stream" => Ok(ContentClass::SniffPdf),
+        _ => check_content_type(raw, host).map(ContentClass::Text),
+    }
+}
+
+/// Sagt, ob `bytes` mit der PDF-Signatur `%PDF-` beginnen.
+///
+/// # Examples
+/// ```rust
+/// use harw_tool_web::fetch::is_pdf_magic;
+///
+/// assert!(is_pdf_magic(b"%PDF-1.4\n"));
+/// assert!(!is_pdf_magic(b"PK\x03\x04"));
+/// ```
+#[must_use]
+pub fn is_pdf_magic(bytes: &[u8]) -> bool {
+    bytes.starts_with(PDF_MAGIC)
+}
+
+/// Prüft den Medientyp eines Cache-Eintrags.
+///
+/// # Description
+/// Wie [`check_content_type`], zusätzlich ist [`PDF_MEDIA_TYPE`] erlaubt —
+/// solche Einträge enthalten ausschließlich extrahierten Text.
+fn check_cached_content_type(content_type: &str, host: &str) -> WebToolResult<()> {
+    if content_type == PDF_MEDIA_TYPE {
+        return Ok(());
+    }
+    check_content_type(content_type, host).map(|_| ())
+}
+
+/// Formatiert ein extrahiertes PDF als Markdown-artigen Text.
+///
+/// # Description
+/// Kopfzeile `PDF · <N> Seiten · <url>`, danach je Seite ein Abschnitt
+/// `## Seite n`. Enthält keine Seite Text, folgt ein Hinweis auf
+/// `doc.read_pdf` mit OCR.
+///
+/// # Arguments
+/// - `document` (`&ExtractedDocument`): Ergebnis von
+///   `harw_tool_doc::native::extract_pages`.
+/// - `url` (`&str`): Endziel des Abrufs (Kopfzeile).
+///
+/// # Returns
+/// Den aufbereiteten Text (ungekappt).
+///
+/// # Concurrency
+/// Rein.
+#[must_use]
+pub fn render_pdf_text(document: &ExtractedDocument, url: &str) -> String {
+    let total = document
+        .total_pages
+        .map_or(document.pages.len(), |pages| pages as usize);
+    let mut out = format!("PDF · {total} Seiten · {url}\n");
+    for page in &document.pages {
+        out.push_str(&format!("\n## Seite {}\n\n", page.number));
+        let text = page.text.trim();
+        if !text.is_empty() {
+            out.push_str(text);
+            out.push('\n');
+        }
+    }
+    if document
+        .pages
+        .iter()
+        .all(|page| page.text.trim().is_empty())
+    {
+        out.push_str(&format!("\n_Kein Text extrahierbar — {PDF_OCR_HINT}._\n"));
+    }
+    out
+}
+
+/// Extrahiert den Text eines PDF-Körpers und formatiert ihn.
+///
+/// # Description
+/// Lokale Extraktion über `harw_tool_doc::native::extract_pages` (panik-
+/// isoliert), danach [`render_pdf_text`] und UTF-8-sichere Kappung auf
+/// `max_bytes`, damit der Cache-Eintrag dieselbe Größengrenze einhält wie ein
+/// Text-Körper.
+///
+/// # Arguments
+/// - `bytes` (`&[u8]`): der (byte-gekappte) PDF-Körper.
+/// - `url` (`&str`): Endziel (Kopfzeile).
+/// - `host` (`&str`): antwortender Host (nur Meldung).
+/// - `max_bytes` (`usize`): Obergrenze des gespeicherten Texts.
+///
+/// # Returns
+/// Den extrahierten Text.
+///
+/// # Errors
+/// - [`WebToolError::UnexpectedContentType`]: das PDF ließ sich nicht lesen
+///   (beschädigt, verschlüsselt, keine PDF-Signatur); die Meldung nennt die
+///   Ursache und verweist auf `doc.read_pdf` mit OCR. Eine Ablehnung, kein
+///   Transportfehler — also nie fail-open.
+///
+/// # Concurrency
+/// Blockierend; über [`run_blocking`] aufrufen.
+pub fn extract_pdf_text(
+    bytes: &[u8],
+    url: &str,
+    host: &str,
+    max_bytes: usize,
+) -> WebToolResult<String> {
+    let failure = |detail: String| WebToolError::UnexpectedContentType {
+        content_type: format!(
+            "{PDF_MEDIA_TYPE}: Textextraktion fehlgeschlagen ({detail}); {PDF_OCR_HINT}"
+        ),
+        host: host.to_owned(),
+    };
+    if !is_pdf_magic(bytes) {
+        return Err(failure("Signatur '%PDF-' fehlt".to_owned()));
+    }
+    let document = extract_pages(bytes, None).map_err(|error| failure(error.to_string()))?;
+    let rendered = render_pdf_text(&document, url);
+    let (kept, _) = truncate_utf8(&rendered, max_bytes);
+    Ok(kept.to_owned())
 }
 
 /// Hängt einen Chunk an den Puffer an, sofern das Limit das zulässt.
@@ -732,7 +927,8 @@ impl WebFetcher {
     /// Formale Übereinstimmung ([`entry_matches`]), Kettenlänge höchstens
     /// [`MAX_REDIRECTS`]` + 1`, **jede** URL der Kette besteht erneut
     /// [`Self::check_target`] in unveränderter Normalform, der Medientyp steht
-    /// noch auf der Positivliste und der Körper passt ins aktuelle Byte-Limit.
+    /// noch auf der Positivliste (Text-Typen oder [`PDF_MEDIA_TYPE`] mit
+    /// extrahiertem Text) und der Körper passt ins aktuelle Byte-Limit.
     ///
     /// # Arguments
     /// - `entry` (`&CacheEntry`): gelesener Eintrag.
@@ -769,7 +965,7 @@ impl WebFetcher {
             }
             last_host = checked.host().to_owned();
         }
-        check_content_type(&entry.content_type, &last_host)?;
+        check_cached_content_type(&entry.content_type, &last_host)?;
         if entry.body.len() > self.options.max_bytes {
             return Err(WebToolError::ResponseTooLarge {
                 limit: self.options.max_bytes,
@@ -814,7 +1010,10 @@ impl WebFetcher {
     /// Conditional-GET unter [`TOTAL_DEADLINE_SECS`] → `304` erneuert den
     /// Zeitstempel, `2xx` schreibt den Eintrag. Bei Transportfehlern Fail-open
     /// nur auf den validierten Eintrag. `body` ist **nicht** textgekappt; der
-    /// Aufrufer kappt, bevor er ihn an das Modell gibt.
+    /// Aufrufer kappt, bevor er ihn an das Modell gibt. PDF-Körper werden vor
+    /// dem Schreiben auf dem Blocking-Pool zu Text extrahiert
+    /// ([`extract_pdf_text`]); Eintrag und Ergebnis tragen dann
+    /// [`PDF_MEDIA_TYPE`] und den extrahierten Text, nie die Rohbytes.
     ///
     /// # Arguments
     /// - `url` (`&str`): vollständige URL.
@@ -902,6 +1101,17 @@ impl WebFetcher {
                     hops = chain.len().saturating_sub(1),
                     "web.fetch.done"
                 );
+                let body = if content_type == PDF_MEDIA_TYPE {
+                    let final_url = chain.last().cloned().unwrap_or_default();
+                    let host = start.host().to_owned();
+                    let limit = self.options.max_bytes;
+                    run_blocking("web-pdf-extract", move || {
+                        extract_pdf_text(&bytes, &final_url, &host, limit)
+                    })
+                    .await?
+                } else {
+                    String::from_utf8_lossy(&bytes).into_owned()
+                };
                 let entry = CacheEntry {
                     format_version: CACHE_FORMAT_VERSION,
                     key: key_hex,
@@ -910,7 +1120,7 @@ impl WebFetcher {
                     etag,
                     fetched_at: now_secs(),
                     content_type,
-                    body: String::from_utf8_lossy(&bytes).into_owned(),
+                    body,
                 };
                 (entry, status, false)
             }
@@ -1032,7 +1242,7 @@ impl WebFetcher {
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or("")
                 .to_owned();
-            let content_type = check_content_type(&raw_content_type, current.host())?;
+            let class = classify_content_type(&raw_content_type, current.host())?;
 
             let limit = self.options.max_bytes;
             if let Some(announced) = response.content_length() {
@@ -1050,6 +1260,14 @@ impl WebFetcher {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
 
+            // `octet-stream` ist nur als PDF zulässig: die Signatur wird geprüft,
+            // sobald genug Bytes vorliegen, damit Fremdbinärdaten nicht bis zum
+            // Limit gelesen werden.
+            let mut sniff_pending = class == ContentClass::SniffPdf;
+            let reject_sniffed = || WebToolError::UnexpectedContentType {
+                content_type: "application/octet-stream".to_owned(),
+                host: current.host().to_owned(),
+            };
             let mut response = response;
             let mut buffer: Vec<u8> = Vec::new();
             while let Some(chunk) = response
@@ -1058,7 +1276,22 @@ impl WebFetcher {
                 .map_err(|error| map_send_error(error, hop))?
             {
                 push_chunk(&mut buffer, &chunk, limit, current.host())?;
+                if sniff_pending && buffer.len() >= PDF_MAGIC.len() {
+                    if !is_pdf_magic(&buffer) {
+                        return Err(reject_sniffed());
+                    }
+                    sniff_pending = false;
+                }
             }
+            if sniff_pending {
+                // Körper kürzer als die Signatur.
+                return Err(reject_sniffed());
+            }
+
+            let content_type = match class {
+                ContentClass::Text(media) => media,
+                ContentClass::Pdf | ContentClass::SniffPdf => PDF_MEDIA_TYPE.to_owned(),
+            };
 
             return Ok(RawOutcome::Body {
                 status: status.as_u16(),
@@ -1183,7 +1416,7 @@ pub fn document_output(document: &FetchedDocument) -> ToolOutput {
 /// Formatwahl, Scope-Ableitung und Abruf.
 #[harw_macros::tool(
     name = "web.fetch",
-    description = "Lädt eine HTTPS-Ressource und liefert Text oder Markdown.",
+    description = "Lädt eine HTTPS-Ressource und liefert Text oder Markdown; PDFs werden als Text extrahiert.",
     permission = "network_access",
     host_from = "url",
     parallel_safe
@@ -1850,6 +2083,257 @@ mod tests {
             .map_err(ctx("lesen"))?
             .ok_or(TestError::Missing("vorhanden"))?;
         assert!(refreshed.fetched_at > 1);
+        Ok(())
+    }
+
+    // --- PDF ----------------------------------------------------------------
+
+    /// Baut ein minimales, gültiges einseitiges PDF (Helvetica, ein `Tj`)
+    /// mit korrekt berechneter Xref-Tabelle.
+    fn minimal_pdf(text: &str) -> String {
+        let content = format!("BT /F1 24 Tf 72 700 Td ({text}) Tj ET");
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                .to_owned(),
+            format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            ),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_owned(),
+        ];
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (index, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj\n{body}\nendobj\n", index + 1));
+        }
+        let xref_at = pdf.len();
+        pdf.push_str(&format!(
+            "xref\n0 {}\n0000000000 65535 f \n",
+            objects.len() + 1
+        ));
+        for offset in offsets {
+            pdf.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n",
+            objects.len() + 1
+        ));
+        pdf
+    }
+
+    /// PDF-Typen werden erkannt, `octet-stream` nur zum Sniffen zugelassen,
+    /// Text bleibt Text, andere Binärtypen werden abgelehnt.
+    #[test]
+    fn test_classify_content_type_pdf_octet_stream_text_and_binary() -> TestResult {
+        assert_eq!(
+            classify_content_type("application/pdf", "a.test").map_err(ctx("pdf"))?,
+            ContentClass::Pdf
+        );
+        assert_eq!(
+            classify_content_type("Application/X-PDF; name=x.pdf", "a.test")
+                .map_err(ctx("x-pdf"))?,
+            ContentClass::Pdf
+        );
+        assert_eq!(
+            classify_content_type("application/octet-stream", "a.test").map_err(ctx("octet"))?,
+            ContentClass::SniffPdf
+        );
+        assert_eq!(
+            classify_content_type("text/html; charset=utf-8", "a.test").map_err(ctx("html"))?,
+            ContentClass::Text("text/html".to_owned())
+        );
+        for rejected in ["image/png", "application/zip", ""] {
+            assert!(
+                matches!(
+                    classify_content_type(rejected, "a.test"),
+                    Err(WebToolError::UnexpectedContentType { .. })
+                ),
+                "{rejected}"
+            );
+        }
+        // `check_content_type` (auch von `web.search` genutzt) bleibt Text-only.
+        assert!(check_content_type("application/pdf", "a.test").is_err());
+        Ok(())
+    }
+
+    /// Die Signaturprüfung erkennt `%PDF-` und nichts sonst.
+    #[test]
+    fn test_is_pdf_magic_sniffs_signature() {
+        assert!(is_pdf_magic(minimal_pdf("x").as_bytes()));
+        assert!(!is_pdf_magic(b"%PD"));
+        assert!(!is_pdf_magic(b"\x89PNG\r\n"));
+        assert!(!is_pdf_magic(b" %PDF-1.4"));
+    }
+
+    /// Cache-Einträge mit PDF-Medientyp sind zulässig, `octet-stream` nicht.
+    #[test]
+    fn test_check_cached_content_type_allows_pdf_text_entries() {
+        assert!(check_cached_content_type(PDF_MEDIA_TYPE, "a.test").is_ok());
+        assert!(check_cached_content_type("text/plain", "a.test").is_ok());
+        assert!(check_cached_content_type("application/octet-stream", "a.test").is_err());
+    }
+
+    /// Kopfzeile und Seitenabschnitte; leere Seiten führen zum OCR-Hinweis.
+    #[test]
+    fn test_render_pdf_text_header_sections_and_ocr_hint() {
+        let document = ExtractedDocument {
+            total_pages: Some(2),
+            pages: vec![
+                harw_tool_doc::types::ExtractedPage {
+                    number: 1,
+                    text: "  Erste Seite \n".to_owned(),
+                },
+                harw_tool_doc::types::ExtractedPage {
+                    number: 2,
+                    text: "Zweite".to_owned(),
+                },
+            ],
+            backend: harw_tool_doc::types::Backend::Native,
+        };
+        let rendered = render_pdf_text(&document, "https://a.test/x.pdf");
+        assert_eq!(
+            rendered,
+            "PDF · 2 Seiten · https://a.test/x.pdf\n\n## Seite 1\n\nErste Seite\n\n## Seite 2\n\nZweite\n"
+        );
+
+        let scanned = ExtractedDocument {
+            total_pages: Some(1),
+            pages: vec![harw_tool_doc::types::ExtractedPage {
+                number: 1,
+                text: " \n".to_owned(),
+            }],
+            backend: harw_tool_doc::types::Backend::Native,
+        };
+        let rendered = render_pdf_text(&scanned, "https://a.test/s.pdf");
+        assert!(rendered.starts_with("PDF · 1 Seiten · https://a.test/s.pdf\n"));
+        assert!(rendered.contains("doc.read_pdf"), "{rendered}");
+    }
+
+    /// Ein echtes Mini-PDF wird extrahiert und gerendert.
+    #[test]
+    fn test_extract_pdf_text_from_minimal_pdf() -> TestResult {
+        let pdf = minimal_pdf("Hallo PDF");
+        let text = extract_pdf_text(pdf.as_bytes(), "https://a.test/d.pdf", "a.test", 4_096)
+            .map_err(ctx("Extraktion"))?;
+        assert!(
+            text.starts_with("PDF · 1 Seiten · https://a.test/d.pdf\n"),
+            "{text}"
+        );
+        assert!(text.contains("## Seite 1"), "{text}");
+        assert!(text.contains("Hallo"), "{text}");
+
+        // Kappung auf das Byte-Limit, UTF-8-sicher ("·" ist zwei Bytes).
+        let capped = extract_pdf_text(pdf.as_bytes(), "https://a.test/d.pdf", "a.test", 5)
+            .map_err(ctx("gekappt"))?;
+        assert_eq!(capped, "PDF ");
+        Ok(())
+    }
+
+    /// Kaputte PDFs liefern einen klaren Fehler mit OCR-Hinweis, keine Panik.
+    #[test]
+    fn test_extract_pdf_text_failure_is_clear_error() {
+        for bytes in [&b"%PDF-1.4\nkaputt"[..], &b"kein pdf"[..], &b""[..]] {
+            let Err(err) = extract_pdf_text(bytes, "https://a.test/k.pdf", "a.test", 4_096) else {
+                continue;
+            };
+            assert!(!err.is_transport());
+            let message = err.to_string();
+            assert!(message.contains("doc.read_pdf"), "{message}");
+            assert!(message.contains("a.test"), "{message}");
+        }
+        assert!(extract_pdf_text(b"kein pdf", "https://a.test/", "a.test", 64).is_err());
+    }
+
+    /// Ende-zu-Ende über Loopback: `octet-stream` mit PDF-Signatur wird
+    /// extrahiert; der Cache enthält den Text, nicht die Rohbytes, und ein
+    /// zweiter Abruf wird (erneut validiert) aus dem Cache bedient.
+    #[tokio::test]
+    async fn test_fetch_pdf_octet_stream_extracts_and_caches_text() -> TestResult {
+        let pdf = minimal_pdf("Hallo PDF");
+        let server = TestServer::spawn(vec![http_response(
+            "200 OK",
+            &[("Content-Type", "application/octet-stream")],
+            &pdf,
+        )])?;
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
+        let fetcher = fetcher_for(dir.path(), &["127.0.0.1"], true, loopback_options())?;
+        let start = fetcher
+            .check_target(&format!("{}/d.pdf", server.base), 0)
+            .map_err(ctx("Start"))?;
+
+        let document = fetcher
+            .fetch(start.url(), OutputFormat::Text)
+            .await
+            .map_err(ctx("Abruf"))?;
+        assert_eq!(document.content_type, PDF_MEDIA_TYPE);
+        assert!(!document.from_cache);
+        assert!(
+            document
+                .body
+                .starts_with(&format!("PDF · 1 Seiten · {}\n", start.url())),
+            "{}",
+            document.body
+        );
+        assert!(document.body.contains("Hallo"), "{}", document.body);
+        assert_eq!(server.requests()?.len(), 1);
+
+        let key = cache_key(
+            &fetcher.policy().digest(),
+            &fetcher.cache_scope(),
+            start.url(),
+        );
+        let stored = read_cache_entry(&cache_path(fetcher.cache_dir(), &key))
+            .map_err(ctx("lesen"))?
+            .ok_or(TestError::Missing("Cache-Eintrag"))?;
+        assert_eq!(stored.content_type, PDF_MEDIA_TYPE);
+        assert!(!stored.body.contains("%PDF"), "Rohbytes im Cache");
+        assert!(stored.body.starts_with("PDF · "));
+
+        let again = fetcher
+            .fetch(start.url(), OutputFormat::Raw)
+            .await
+            .map_err(ctx("Cache"))?;
+        assert!(again.from_cache);
+        assert_eq!(again.body, document.body);
+        Ok(())
+    }
+
+    /// `octet-stream` ohne PDF-Signatur wird abgelehnt und nicht gecacht.
+    #[tokio::test]
+    async fn test_fetch_octet_stream_without_pdf_magic_is_rejected() -> TestResult {
+        let server = TestServer::spawn(vec![http_response(
+            "200 OK",
+            &[("Content-Type", "application/octet-stream")],
+            "PK\u{3}\u{4}binaer",
+        )])?;
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
+        let fetcher = fetcher_for(dir.path(), &["127.0.0.1"], true, loopback_options())?;
+        let start = fetcher
+            .check_target(&format!("{}/x.bin", server.base), 0)
+            .map_err(ctx("Start"))?;
+
+        let Err(err) = fetcher.fetch(start.url(), OutputFormat::Text).await else {
+            return Err(TestError::Unexpected("Err erwartet: kein PDF".into()));
+        };
+        assert!(
+            matches!(err, WebToolError::UnexpectedContentType { .. }),
+            "{err:?}"
+        );
+        server.requests()?;
+        let key = cache_key(
+            &fetcher.policy().digest(),
+            &fetcher.cache_scope(),
+            start.url(),
+        );
+        assert!(
+            read_cache_entry(&cache_path(fetcher.cache_dir(), &key))
+                .map_err(ctx("lesen"))?
+                .is_none()
+        );
         Ok(())
     }
 

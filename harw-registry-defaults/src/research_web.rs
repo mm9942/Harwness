@@ -135,6 +135,94 @@ pub fn researcher_web_network_scope(policy: &EgressPolicy) -> NetworkScope {
     NetworkScope::from_hosts(policy.allow_hosts().iter().cloned())
 }
 
+/// Richtet die Netz-Werkzeuge (`web.fetch`, `web.docs_rs`, `web.crates_io`,
+/// `web.search`) einmal je Prozess ein.
+///
+/// # Beschreibung
+/// Ohne diesen Aufruf scheitert jeder Abruf mit `NotConfigured` (fail-closed).
+/// Die Prozess-Policy ist die **Obermenge** der erlaubten Ziele:
+/// `[network].allow_hosts` ∪ `[network].researcher_web_hosts` ∪
+/// `[research].network_allow_hosts` ∪ der Host des konfigurierten
+/// Such-Backends. Welche Ziele ein einzelner Agent tatsächlich erreicht,
+/// bestimmt weiterhin sein Sandbox-`NetworkScope` (Schnittmenge je Aufruf).
+/// Limits und Cache-TTL kommen aus `[research]`, das Such-Backend aus
+/// `[web.search]` (Schlüssel nur aus der Umgebung).
+///
+/// Ein zweiter Aufruf im selben Prozess (z. B. nach `/resume`) ist ein
+/// No-op für den Fetcher; die Such-Konfiguration wird aktualisiert.
+///
+/// # Fehler
+/// [`RegistryDefaultsError::ResearcherWebPolicy`] bei einem ungültigen
+/// Host-Eintrag.
+pub fn install_web_tools(
+    config: &harw_config::ResolvedConfig,
+    cache_root: &std::path::Path,
+) -> RegistryDefaultsResult<()> {
+    use harw_tool_web::search::{SearchBackend, WebSearchConfig, install_search_config};
+
+    let search = &config.web.search;
+    let backend = match search.provider.as_str() {
+        "brave" => SearchBackend::Brave,
+        "tavily" => SearchBackend::Tavily,
+        "searxng" => SearchBackend::Searxng,
+        _ => SearchBackend::DuckDuckGo,
+    };
+    let search_host = match backend {
+        SearchBackend::Brave => Some("api.search.brave.com".to_owned()),
+        SearchBackend::Tavily => Some("api.tavily.com".to_owned()),
+        SearchBackend::DuckDuckGo => Some("html.duckduckgo.com".to_owned()),
+        SearchBackend::Searxng => search
+            .endpoint
+            .as_deref()
+            .and_then(|endpoint| url_host(endpoint)),
+    };
+    install_search_config(WebSearchConfig {
+        provider: backend,
+        endpoint: search.endpoint.clone(),
+        api_key: search
+            .api_key_env
+            .as_deref()
+            .and_then(|name| std::env::var(name).ok())
+            .filter(|key| !key.trim().is_empty()),
+        max_results: search.max_results,
+    });
+
+    let mut hosts: Vec<String> = config
+        .network
+        .allow_hosts
+        .iter()
+        .chain(config.network.researcher_web_hosts.iter())
+        .chain(config.harness.research.network_allow_hosts.iter())
+        .cloned()
+        .chain(search_host)
+        .collect();
+    hosts.sort();
+    hosts.dedup();
+    let policy = EgressPolicy::new(hosts, config.network.allow_private)
+        .map_err(|source| RegistryDefaultsError::ResearcherWebPolicy { source })?;
+    let research = &config.harness.research;
+    let options = harw_tool_web::WebFetchOptions {
+        ttl: std::time::Duration::from_secs(research.cache_ttl_secs),
+        max_bytes: research.max_fetch_bytes,
+        ..harw_tool_web::WebFetchOptions::default()
+    };
+    if let Err(error) =
+        harw_tool_web::configure(Arc::new(policy), cache_root.join("web"), options)
+    {
+        tracing::debug!(%error, "web_tools.already_configured");
+    }
+    Ok(())
+}
+
+/// Host-Anteil einer `http(s)://host[:port]/…`-URL (ohne Userinfo).
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit('@').next()?;
+    let host = host.split(':').next()?;
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +234,13 @@ mod tests {
             allow_private,
             researcher_web_hosts: researcher.iter().map(|host| (*host).to_owned()).collect(),
         }
+    }
+
+    #[test]
+    fn test_url_host_extracts_plain_host() {
+        assert_eq!(url_host("https://search.example.org:8443/x").as_deref(), Some("search.example.org"));
+        assert_eq!(url_host("https://u:p@Host.test").as_deref(), Some("host.test"));
+        assert_eq!(url_host("https://"), None);
     }
 
     #[test]

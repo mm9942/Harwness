@@ -50,8 +50,9 @@ pub enum HttpProviderError {
         /// Grund des Fehlschlags (Variablen-/Datei-Fehler oder "unsupported").
         reason: String,
     },
-    /// Eine Credential-Referenz verwendet einen Resolver, den dieser Provider
-    /// nicht implementiert (`keyring:` oder `secrets:`).
+    /// Eine `secrets:`-Referenz wurde ohne injizierten `SecretResolver`
+    /// aufgelöst (`keyring:` wird direkt über den System-Schlüsselbund
+    /// aufgelöst).
     ///
     /// Die Referenz wird zur Diagnose mitgeführt, aber nicht ausgegeben: Sie
     /// kann neben dem Namen des Resolvers auch sensible Metadaten enthalten.
@@ -126,7 +127,11 @@ impl fmt::Display for HttpProviderError {
                 write!(f, "could not resolve credential '{reference}': {reason}")
             }
             Self::UnsupportedCredentialReference { .. } => {
-                write!(f, "unsupported credential reference (keyring:/secrets:)")
+                write!(
+                    f,
+                    "unsupported credential reference: secrets: requires an injected \
+                     SecretResolver (use a *_with_resolver constructor) or use env:/file:/keyring:"
+                )
             }
             Self::MissingEnv { var } => {
                 write!(f, "required environment variable not set: {var}")
@@ -509,7 +514,7 @@ mod tests {
     #[test]
     fn unsupported_credential_reference_does_not_disclose_reference() {
         let error = HttpProviderError::UnsupportedCredentialReference {
-            reference: "keyring:service/api-key-with-secret-material".to_owned(),
+            reference: "secrets:service/api-key-with-secret-material".to_owned(),
         };
         let rendered = error.to_string();
         assert!(rendered.contains("unsupported credential reference"));

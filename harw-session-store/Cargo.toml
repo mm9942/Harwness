@@ -22,11 +22,6 @@ fs4 = "1.1.0"
 tempfile = "3.27.0"
 
 # External deps — parent resolves exact versions via `cargo add` (no invented pins).
-# TODO(parent cargo add): jiff --features serde     # jiff::Timestamp (serde feature required — TranscriptRecord derives Serialize/Deserialize)
-# TODO(parent cargo add): fs4                       # advisory exclusive file lock for durable JSONL append
-# TODO(parent cargo add): tempfile                  # atomic-rename (persist()) durability for full-file rewrites
-# TODO(parent cargo add): serde_norway              # YAML frontmatter codec (reserved for future transcript sidecars)
-# TODO(parent cargo add): uuid --features v7        # time-ordered record identities (reserved; see drift notes)
 
 [lints]
 workspace = true

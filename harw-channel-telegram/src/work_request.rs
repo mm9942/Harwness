@@ -3,17 +3,29 @@
 //!
 //! # Responsibility
 //! This module owns the *typed* boundary between a parsed
-//! [`harw_channel_telegram_transport::TelegramCommand`] and an eventual
-//! sandboxed worker launch: it resolves a closed-grammar workspace alias
-//! through the authoritative `harw_authority::WorkspaceRegistry` (never
-//! trusting the alias string directly as a filesystem selector), mints a
-//! [`WorkId`], and durably tracks the request through its lifecycle states.
-//! It deliberately does **not** own launching the worker itself — see
-//! [`launch_sandboxed_worker`]'s doc comment for why and what remains.
+//! [`harw_channel_telegram_transport::TelegramCommand`] and a sandboxed
+//! worker launch: it resolves a closed-grammar workspace alias through the
+//! authoritative `harw_authority::WorkspaceRegistry` (never trusting the alias
+//! string directly as a filesystem selector), mints a [`WorkId`], durably
+//! tracks the request through its lifecycle states and, on `/approve`, hands
+//! the immutable approved payload to an injected [`WorkLauncher`].
+//!
+//! Der Launch selbst ist bewusst entkoppelt: dieses Crate hängt weder von
+//! `harw-session-store`s `JobStore` noch von `harw-job-runtime` ab. Die
+//! Komposition (`harw-cli/src/gateway.rs`) installiert über
+//! [`WorkRequestStore::with_launcher`] eine [`WorkLauncher`]-Implementierung,
+//! die den genehmigten Auftrag als durablen Job zulässt. Ohne installierten
+//! Launcher bleibt ein genehmigter Auftrag `Approved` und
+//! [`launch_sandboxed_worker`] meldet
+//! [`TelegramChannelError::LaunchNotYetAvailable`].
 //!
 //! # Key types
 //! - [`WorkRequestRecord`] — the durable, typed request.
 //! - [`WorkRequestState`] — its closed lifecycle.
+//! - [`ApprovedWorkRequest`] — the digest-verified, immutable payload a
+//!   launcher receives.
+//! - [`WorkLauncher`] / [`LaunchReceipt`] / [`WorkLaunchError`] — the
+//!   injectable launch seam.
 //! - [`WorkRequestStore`] — a small file-backed durable store keyed by
 //!   [`WorkId`], modelled after `harw_channel::PairingStore`'s atomic
 //!   temp-file-plus-rename persistence but with a single in-process
@@ -32,22 +44,36 @@
 //! callback payloads never reach [`WorkRequestStore::submit`]'s alias
 //! parameter.
 //!
+//! Ein Launch verwendet ausschließlich die bei `/request` gespeicherte
+//! Aufgabe, und nur, wenn ihr SHA-256-Digest mit dem im Datensatz fixierten
+//! `task_digest` übereinstimmt (Design-Doc §"Telegram lifecycle" Schritt 7:
+//! "resume only the stored request payload"). Ein fehlender oder
+//! manipulierter Payload schlägt geschlossen fehl, bevor der Launcher
+//! aufgerufen wird.
+//!
 //! # Concurrency
 //! [`WorkRequestStore`] is `Clone` (`Arc`-backed) and `Send + Sync`; every
-//! mutation is serialized through its internal [`Mutex`].
+//! mutation is serialized through its internal [`Mutex`]. `/approve` hält
+//! diesen Mutex auch über den Launcher-Aufruf, damit ein gleichzeitiges
+//! `/cancel` nie zwischen Zulassung des Jobs und dem Übergang nach
+//! `Launched` greifen kann.
 //!
 //! # Errors
 //! All fallible paths return [`TelegramChannelResult`]; see
 //! [`TelegramChannelError`]'s `WorkspaceUnresolved`, `InvalidWorkRequestRole`,
 //! `WorkRequestNotFound`, `WorkRequestInvalidTransition`,
-//! `LaunchNotYetAvailable`, `Io`, and `Serde` variants.
+//! `LaunchNotYetAvailable`, `Io`, and `Serde` variants. Ein vom Launcher
+//! gemeldeter [`WorkLaunchError`] wird von [`launch_sandboxed_worker`] bis zu
+//! einer eigenen Fehlervariante als `Io` (`ErrorKind::Other`, Quelle ist der
+//! `WorkLaunchError`) weitergereicht.
 //!
 //! # Audit
 //! Every admitted `/request /review /approve /deny /cancel` invocation
 //! appends a `channel.command` record to a `harw_session_store::TranscriptStore`
 //! journal under this store's root (§5 "Full audit of inbound commands"),
 //! the same durable append-only mechanism `harw_channel::PairingStore`
-//! already uses for pairing lifecycle events. This is **not** the
+//! already uses for pairing lifecycle events; launch attempts add `launch`
+//! bzw. `launch_failed` records. This is **not** the
 //! `harw-secrets` cryptographic audit chain (hash-chained, tamper-evident,
 //! used for secret create/rotate/delete): `harw-cli/src/gateway.rs`
 //! deliberately holds no writable handle to that chain (see its
@@ -60,6 +86,7 @@
 //! command it audits — the durable lifecycle transition already succeeded by
 //! the time the journal is written.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -74,6 +101,15 @@ use harw_types::{ChannelId, PeerId, SessionId, TenantId, ThreadRef, WorkId, Work
 
 use crate::error::{TelegramChannelError, TelegramChannelResult};
 
+/// Empfohlener `JobKind::Custom`-Diskriminator für durable Jobs, die aus
+/// einem genehmigten Telegram-Auftrag entstehen.
+///
+/// Bewusst **nicht** `JobKind::Worker`: `harw-cli/src/job_worker.rs`
+/// (`check_prompt_claim_scope`) führt Prompt-Jobs nur für konfigurierte
+/// MCP-Operatoren aus und lehnt `ApprovalActor::ChannelPeer`-Einreicher ab.
+/// Ein Telegram-Auftrag braucht einen eigenen, sandboxed Ausführungspfad.
+pub const TELEGRAM_WORK_REQUEST_JOB_KIND: &str = "telegram-work-request";
+
 /// Closed lifecycle of a Telegram-originated work request
 /// (docs/design/telegram-sandbox-work-requests.md's integration order + the
 /// `/review /approve /deny /cancel` grammar).
@@ -83,18 +119,22 @@ use crate::error::{TelegramChannelError, TelegramChannelResult};
 /// - `UnderReview` — `/review` rendered the resolved workspace/role/sandbox
 ///   preview; the immutable request digest an `/approve` acts on is fixed
 ///   from this point.
-/// - `Approved` — `/approve` accepted the reviewed request. Does not imply a
-///   worker has launched — see [`launch_sandboxed_worker`].
+/// - `Approved` — `/approve` accepted the reviewed request, but no worker has
+///   been launched yet (no [`WorkLauncher`] installed, or the last launch
+///   attempt failed; a repeated `/approve` retries the launch).
+/// - `Launched` — terminal for this store: the installed [`WorkLauncher`]
+///   accepted the request; [`WorkRequestRecord::launch`] names the durable
+///   job. Weitere Steuerung (z. B. Abbruch) läuft über den Job-Store.
 /// - `Denied` — terminal: `/deny` rejected the request.
 /// - `Cancelled` — terminal: `/cancel` withdrew the request (by the
-///   requester or an operator) before or after approval, but always before
-///   launch, since no launch path exists yet.
+///   requester or an operator) before launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkRequestState {
     Requested,
     UnderReview,
     Approved,
+    Launched,
     Denied,
     Cancelled,
 }
@@ -107,6 +147,7 @@ impl WorkRequestState {
             Self::Requested => "requested",
             Self::UnderReview => "under_review",
             Self::Approved => "approved",
+            Self::Launched => "launched",
             Self::Denied => "denied",
             Self::Cancelled => "cancelled",
         }
@@ -119,7 +160,9 @@ impl WorkRequestState {
 /// The task text itself is never stored here — only its normalized digest —
 /// mirroring the audit rule elsewhere in this codebase that a durable record
 /// keeps a content hash rather than a second copy of possibly-sensitive
-/// message bodies.
+/// message bodies. Der für den Launch nötige Aufgabentext liegt getrennt in
+/// einer privaten Payload-Datei des [`WorkRequestStore`] und wird nach
+/// erfolgreichem Launch bzw. bei `/deny`/`/cancel` gelöscht.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkRequestRecord {
     pub work_id: WorkId,
@@ -142,31 +185,180 @@ pub struct WorkRequestRecord {
     pub state: WorkRequestState,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+    /// Quittung des Launchers; gesetzt genau dann, wenn `state == Launched`.
+    /// Fehlt in Datensätzen, die vor dieser Erweiterung geschrieben wurden.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<LaunchReceipt>,
 }
 
-/// Launches the sandboxed worker for an `Approved` work request.
+/// Quittung eines erfolgreichen Launches: der durable Job, unter dem der
+/// genehmigte Auftrag nun läuft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchReceipt {
+    /// `WorkId` des zugelassenen durablen Jobs. Die Referenz-Implementierung
+    /// verwendet die `WorkId` des Auftrags selbst, damit ein wiederholter
+    /// Launch idempotent auf denselben Job trifft.
+    pub job_id: WorkId,
+    /// Zeitpunkt der Zulassung durch den Launcher.
+    pub launched_at: Timestamp,
+}
+
+/// Vom [`WorkLauncher`] gemeldeter Fehlschlag; der Auftrag bleibt `Approved`
+/// und ein erneutes `/approve` versucht den Launch nochmals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkLaunchError {
+    reason: String,
+}
+
+impl WorkLaunchError {
+    /// Erzeugt einen Fehler mit einer operator-lesbaren Begründung. Die
+    /// Begründung wird dem Telegram-Anfragenden angezeigt und darf daher
+    /// keine Pfade, Secrets oder Tokens enthalten.
+    #[must_use]
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    /// Die Begründung dieses Fehlschlags.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl fmt::Display for WorkLaunchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "work launch failed: {}", self.reason)
+    }
+}
+
+impl std::error::Error for WorkLaunchError {}
+
+/// Ein genehmigter Auftrag samt der digest-geprüften, gespeicherten Aufgabe
+/// — die einzige Eingabe, die ein [`WorkLauncher`] erhält.
 ///
-/// # Description
-/// `harw-channel-telegram`/`harw-channel-telegram-transport` deliberately
-/// have no job/worker submission path today: `harw-cli/src/gateway.rs`'s
-/// Telegram consumer drives an ordinary, toolless
-/// `harw_core::run_turn` per admitted message (no sandbox, no workspace
-/// mount), and the durable job-worker/plan-node launch path
-/// (`harw-cli/src/job_worker.rs`, `harw_plan_bridge`) is a separate
-/// subsystem this crate does not depend on and this task's file scope does
-/// not include. Wiring an approved [`WorkRequestRecord`] to an actual
-/// `harw-sandbox`/`bwrap` launch (docs/design/telegram-sandbox-work-requests.md
-/// §"Worker filesystem and process isolation") is follow-up work outside
-/// this change; this function exists so that follow-up has one, clearly
-/// named integration point instead of a TODO scattered across the lifecycle
-/// handlers below.
+/// Konstruierbar nur über [`ApprovedWorkRequest::new`], das den Zustand
+/// `Approved` und die Übereinstimmung von Aufgabe und `task_digest` erzwingt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedWorkRequest {
+    record: WorkRequestRecord,
+    task: String,
+}
+
+impl ApprovedWorkRequest {
+    /// Bindet `task` an einen genehmigten `record`.
+    ///
+    /// # Errors
+    /// - [`TelegramChannelError::WorkRequestInvalidTransition`]: `record` ist
+    ///   nicht im Zustand `Approved`.
+    /// - [`TelegramChannelError::Io`] (`InvalidData`): der normalisierte
+    ///   Digest von `task` weicht vom fixierten `task_digest` ab.
+    pub fn new(record: WorkRequestRecord, task: impl Into<String>) -> TelegramChannelResult<Self> {
+        if record.state != WorkRequestState::Approved {
+            return Err(TelegramChannelError::WorkRequestInvalidTransition {
+                work_id: record.work_id.clone(),
+                from: record.state.as_str(),
+                action: "launched",
+            });
+        }
+        let task = task.into();
+        if task_digest(&task) != record.task_digest {
+            return Err(TelegramChannelError::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stored task payload does not match the approved task digest",
+            )));
+        }
+        Ok(Self {
+            record,
+            task: task.trim().to_owned(),
+        })
+    }
+
+    /// Der genehmigte Datensatz (Tenant, Workspace, Rolle, Anfragender, …).
+    #[must_use]
+    pub fn record(&self) -> &WorkRequestRecord {
+        &self.record
+    }
+
+    /// Der normalisierte (getrimmte) Aufgabentext. Bleibt unvertrauenswürdige
+    /// Nutzereingabe: er ist Daten für den Worker, nie eine Autorität über
+    /// Pfade oder Berechtigungen.
+    #[must_use]
+    pub fn task(&self) -> &str {
+        &self.task
+    }
+
+    /// Serverseitig aufgelöste Job-Eingabe für `StoredJob::input`.
+    ///
+    /// `tenant` und `workspace` entsprechen exakt dem `JobScope`, den der
+    /// Launcher aus demselben Datensatz bildet — `harw-cli/src/job_worker.rs`
+    /// (`check_input_declared_scope`) lehnt jede Abweichung ab.
+    #[must_use]
+    pub fn job_input(&self) -> serde_json::Value {
+        serde_json::json!({
+            "task": self.task,
+            "role": self.record.role,
+            "tenant": self.record.tenant.as_str(),
+            "workspace": self.record.workspace.as_str(),
+            "work_request": {
+                "work_id": self.record.work_id.as_str(),
+                "channel": self.record.channel.as_str(),
+                "requester": self.record.requester.as_str(),
+                "task_digest": self.record.task_digest,
+                "source_update_id": self.record.source_update_id,
+            },
+        })
+    }
+}
+
+/// Injizierbare Launch-Naht: übergibt einen genehmigten Auftrag an ein
+/// durables Job-System.
+///
+/// # Contract
+/// - Idempotent pro `request.record().work_id`: ein zweiter Aufruf für
+///   denselben Auftrag (z. B. nach einem Absturz zwischen Job-Zulassung und
+///   dem Übergang nach `Launched`) darf keinen zweiten Job erzeugen, sondern
+///   muss die Quittung des bestehenden liefern.
+/// - Der Launcher leitet Scope und Berechtigungen ausschließlich aus
+///   `request.record()` und der serverseitigen Konfiguration ab — nie aus
+///   `request.task()`.
+/// - Blockierend erlaubt: [`WorkRequestStore::approve`] ruft ihn synchron
+///   unter dem Store-Mutex auf.
+pub trait WorkLauncher: Send + Sync {
+    /// Lässt `request` als durablen Job zu.
+    ///
+    /// # Errors
+    /// [`WorkLaunchError`], wenn der Job nicht zugelassen werden konnte; der
+    /// Auftrag bleibt dann `Approved`.
+    fn launch(&self, request: &ApprovedWorkRequest) -> Result<LaunchReceipt, WorkLaunchError>;
+}
+
+/// Launches the sandboxed worker for an `Approved` work request through the
+/// configured [`WorkLauncher`].
+///
+/// # Arguments
+/// - `launcher`: der installierte Launcher, oder `None`, wenn die
+///   Komposition keinen installiert hat.
+/// - `request`: der digest-geprüfte genehmigte Auftrag.
 ///
 /// # Errors
-/// Always returns [`TelegramChannelError::LaunchNotYetAvailable`].
-pub fn launch_sandboxed_worker(record: &WorkRequestRecord) -> TelegramChannelResult<()> {
-    Err(TelegramChannelError::LaunchNotYetAvailable {
-        work_id: record.work_id.clone(),
-    })
+/// - [`TelegramChannelError::LaunchNotYetAvailable`]: `launcher` ist `None`.
+/// - [`TelegramChannelError::Io`] (`ErrorKind::Other`, Quelle
+///   [`WorkLaunchError`]): der Launcher hat den Auftrag abgelehnt.
+pub fn launch_sandboxed_worker(
+    launcher: Option<&dyn WorkLauncher>,
+    request: &ApprovedWorkRequest,
+) -> TelegramChannelResult<LaunchReceipt> {
+    let Some(launcher) = launcher else {
+        return Err(TelegramChannelError::LaunchNotYetAvailable {
+            work_id: request.record.work_id.clone(),
+        });
+    };
+    launcher
+        .launch(request)
+        .map_err(|error| TelegramChannelError::from(std::io::Error::other(error)))
 }
 
 /// Normalizes and hashes task text for durable storage (never the raw text).
@@ -208,6 +400,8 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> TelegramChannelResu
     }
 }
 
+// `NamedTempFile` legt die Datei unter Unix mit Modus 0600 an; der
+// Aufgaben-Payload ist damit nur für den Gateway-Nutzer lesbar.
 fn persist_json<T: Serialize>(path: &Path, value: &T) -> TelegramChannelResult<()> {
     let parent = path.parent().ok_or_else(|| {
         TelegramChannelError::from(std::io::Error::other(
@@ -223,28 +417,63 @@ fn persist_json<T: Serialize>(path: &Path, value: &T) -> TelegramChannelResult<(
     Ok(())
 }
 
+/// Gespeicherter Aufgabentext eines Auftrags, getrennt vom Datensatz.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredTaskPayload {
+    work_id: WorkId,
+    /// Normalisierter (getrimmter) Aufgabentext.
+    task: String,
+}
+
 /// Durable, file-backed store for [`WorkRequestRecord`]s. See the module
 /// docs for why this uses one in-process [`Mutex`] rather than `fs4`
 /// cross-process advisory locks.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WorkRequestStore {
     root: PathBuf,
     guard: Arc<Mutex<()>>,
+    launcher: Option<Arc<dyn WorkLauncher>>,
+}
+
+impl fmt::Debug for WorkRequestStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkRequestStore")
+            .field("root", &self.root)
+            .field("launcher_installed", &self.launcher.is_some())
+            .finish()
+    }
 }
 
 impl WorkRequestStore {
-    /// Creates a store rooted at `root` (created lazily on first write).
+    /// Creates a store rooted at `root` (created lazily on first write),
+    /// ohne installierten [`WorkLauncher`].
     #[must_use]
     pub fn new(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
             guard: Arc::new(Mutex::new(())),
+            launcher: None,
         }
+    }
+
+    /// Installiert den [`WorkLauncher`], über den `/approve` genehmigte
+    /// Aufträge startet.
+    #[must_use]
+    pub fn with_launcher(mut self, launcher: Arc<dyn WorkLauncher>) -> Self {
+        self.launcher = Some(launcher);
+        self
     }
 
     fn path(&self, work_id: &WorkId) -> PathBuf {
         self.root
             .join("records")
+            .join(record_filename(work_id))
+            .with_extension("json")
+    }
+
+    fn payload_path(&self, work_id: &WorkId) -> PathBuf {
+        self.root
+            .join("payloads")
             .join(record_filename(work_id))
             .with_extension("json")
     }
@@ -264,8 +493,9 @@ impl WorkRequestStore {
     /// - `workspace_alias` (`&str`): the closed-grammar alias from `/request`
     ///   — resolved through `workspaces`, never trusted directly.
     /// - `role` (`&str`): the closed-grammar role atom from `/request`.
-    /// - `task` (`&str`): untrusted task text; only its normalized digest is
-    ///   persisted.
+    /// - `task` (`&str`): untrusted task text; der Datensatz enthält nur den
+    ///   normalisierten Digest, der normalisierte Text selbst liegt in einer
+    ///   separaten privaten Payload-Datei für den späteren Launch.
     /// - `workspaces` (`&WorkspaceRegistry`): the authoritative registry;
     ///   resolution failure fails closed.
     ///
@@ -317,10 +547,20 @@ impl WorkRequestStore {
             state: WorkRequestState::Requested,
             created_at: now,
             updated_at: now,
+            launch: None,
+        };
+        let payload = StoredTaskPayload {
+            work_id: record.work_id.clone(),
+            task: task.trim().to_owned(),
         };
 
         let _guard = self.guard.lock().unwrap_or_else(|p| p.into_inner());
-        persist_json(&self.path(&record.work_id), &record)?;
+        // Payload zuerst: ein Datensatz ohne Payload wäre nie startbar.
+        persist_json(&self.payload_path(&record.work_id), &payload)?;
+        if let Err(error) = persist_json(&self.path(&record.work_id), &record) {
+            self.remove_payload(&record.work_id);
+            return Err(error);
+        }
         drop(_guard);
         self.record_command_audit("request", now, &record);
         Ok(record)
@@ -384,23 +624,140 @@ impl WorkRequestStore {
         ))
     }
 
-    /// `/approve <work-id>`: accepts a reviewed request. Never launches a
-    /// worker itself — see [`launch_sandboxed_worker`].
+    /// `/approve <work-id>`: accepts a reviewed request (`UnderReview ->
+    /// Approved`) and launches it through the installed [`WorkLauncher`]
+    /// (`Approved -> Launched`).
+    ///
+    /// # Description
+    /// - Ohne installierten Launcher bleibt der Auftrag `Approved`; die
+    ///   Antwort meldet, dass der Launch noch nicht verfügbar ist.
+    /// - Schlägt der Launch fehl (Launcher-Fehler, fehlender oder
+    ///   manipulierter Payload), bleibt der Auftrag `Approved`; ein erneutes
+    ///   `/approve` auf einen `Approved`-Auftrag wiederholt nur den Launch.
+    /// - Ein `/approve` auf einen bereits `Launched`-Auftrag ist idempotent
+    ///   und startet nichts erneut.
+    ///
+    /// # Errors
+    /// - [`TelegramChannelError::WorkRequestNotFound`]: unbekannte `WorkId`.
+    /// - [`TelegramChannelError::WorkRequestInvalidTransition`]: Zustand
+    ///   `Requested`, `Denied` oder `Cancelled`.
+    /// - [`TelegramChannelError::Io`] / [`TelegramChannelError::Serde`]:
+    ///   Persistenzfehler des Datensatzes. Ein Launch-Fehlschlag ist **kein**
+    ///   `Err`, sondern wird in der Antwort gemeldet.
     pub fn approve(&self, work_id: &WorkId, now: Timestamp) -> TelegramChannelResult<String> {
-        let record = self.transition(
-            work_id,
-            &[WorkRequestState::UnderReview],
-            WorkRequestState::Approved,
-            now,
-        )?;
-        self.record_command_audit("approve", now, &record);
-        match launch_sandboxed_worker(&record) {
-            Ok(()) => Ok(format!("Approved {}", record.work_id)),
-            Err(TelegramChannelError::LaunchNotYetAvailable { work_id }) => Ok(format!(
-                "Approved {work_id}, but sandboxed launch is not yet available"
-            )),
-            Err(other) => Err(other),
+        let guard = self.guard.lock().unwrap_or_else(|p| p.into_inner());
+        let path = self.path(work_id);
+        let mut record: WorkRequestRecord =
+            read_json(&path)?.ok_or_else(|| TelegramChannelError::WorkRequestNotFound {
+                work_id: work_id.clone(),
+            })?;
+        let current = record.state;
+        let newly_approved = match current {
+            WorkRequestState::UnderReview => {
+                record.state = WorkRequestState::Approved;
+                record.updated_at = now;
+                persist_json(&path, &record)?;
+                true
+            }
+            WorkRequestState::Approved => false,
+            WorkRequestState::Launched => {
+                drop(guard);
+                let job = record
+                    .launch
+                    .as_ref()
+                    .map(|receipt| receipt.job_id.as_str().to_owned())
+                    .unwrap_or_default();
+                return Ok(format!(
+                    "{} is already launched as job {job}",
+                    record.work_id
+                ));
+            }
+            WorkRequestState::Requested
+            | WorkRequestState::Denied
+            | WorkRequestState::Cancelled => {
+                return Err(TelegramChannelError::WorkRequestInvalidTransition {
+                    work_id: work_id.clone(),
+                    from: current.as_str(),
+                    action: transition_action(WorkRequestState::Approved),
+                });
+            }
+        };
+
+        let outcome = match self.launcher.as_deref() {
+            Some(launcher) => self
+                .approved_request(&record)
+                .and_then(|approved| launch_sandboxed_worker(Some(launcher), &approved)),
+            None => Err(TelegramChannelError::LaunchNotYetAvailable {
+                work_id: record.work_id.clone(),
+            }),
+        };
+
+        match outcome {
+            Ok(receipt) => {
+                let approved_record = record.clone();
+                record.state = WorkRequestState::Launched;
+                record.updated_at = now;
+                record.launch = Some(receipt.clone());
+                persist_json(&path, &record)?;
+                self.remove_payload(work_id);
+                drop(guard);
+                if newly_approved {
+                    self.record_command_audit("approve", now, &approved_record);
+                }
+                self.record_command_audit("launch", now, &record);
+                Ok(format!(
+                    "Approved {}, launched as job {}",
+                    record.work_id, receipt.job_id
+                ))
+            }
+            Err(TelegramChannelError::LaunchNotYetAvailable { work_id }) => {
+                drop(guard);
+                if newly_approved {
+                    self.record_command_audit("approve", now, &record);
+                }
+                Ok(format!(
+                    "Approved {work_id}, but sandboxed launch is not yet available"
+                ))
+            }
+            Err(error) => {
+                drop(guard);
+                if newly_approved {
+                    self.record_command_audit("approve", now, &record);
+                }
+                self.record_command_audit("launch_failed", now, &record);
+                tracing::warn!(
+                    work_id = %record.work_id,
+                    error = %error,
+                    "approved Telegram work request could not be launched"
+                );
+                Ok(format!(
+                    "Approved {id}, but launch failed: {error}; /approve {id} retries the launch",
+                    id = record.work_id
+                ))
+            }
         }
+    }
+
+    /// Lädt den gespeicherten Payload von `record` und bindet ihn
+    /// digest-geprüft an den Datensatz. Aufrufer hält den Store-Mutex.
+    fn approved_request(
+        &self,
+        record: &WorkRequestRecord,
+    ) -> TelegramChannelResult<ApprovedWorkRequest> {
+        let payload: StoredTaskPayload = read_json(&self.payload_path(&record.work_id))?
+            .ok_or_else(|| {
+                TelegramChannelError::from(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "stored task payload for the approved work request is missing",
+                ))
+            })?;
+        if payload.work_id != record.work_id {
+            return Err(TelegramChannelError::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stored task payload belongs to another work request",
+            )));
+        }
+        ApprovedWorkRequest::new(record.clone(), payload.task)
     }
 
     /// `/deny <work-id>`: terminally rejects a request that has not yet been
@@ -412,13 +769,16 @@ impl WorkRequestStore {
             WorkRequestState::Denied,
             now,
         )?;
+        self.remove_payload(work_id);
         self.record_command_audit("deny", now, &record);
         Ok(format!("Denied {}", record.work_id))
     }
 
-    /// `/cancel <work-id>`: terminally withdraws a request in any
-    /// non-terminal state. Safe even after `/approve`, since no launch path
-    /// exists yet to race against.
+    /// `/cancel <work-id>`: terminally withdraws a request that has not yet
+    /// been launched. Ein `Launched`-Auftrag ist hier ein ungültiger
+    /// Übergang: sein durabler Job muss über den Job-Store abgebrochen
+    /// werden. Da `/approve` den Store-Mutex über den gesamten Launch hält,
+    /// kann ein `/cancel` nie mit einem laufenden Launch verschränken.
     pub fn cancel(&self, work_id: &WorkId, now: Timestamp) -> TelegramChannelResult<String> {
         let record = self.transition(
             work_id,
@@ -430,8 +790,23 @@ impl WorkRequestStore {
             WorkRequestState::Cancelled,
             now,
         )?;
+        self.remove_payload(work_id);
         self.record_command_audit("cancel", now, &record);
         Ok(format!("Cancelled {}", record.work_id))
+    }
+
+    /// Löscht den gespeicherten Aufgabentext (best effort): nach Launch,
+    /// `/deny` oder `/cancel` wird er von diesem Store nicht mehr gebraucht.
+    fn remove_payload(&self, work_id: &WorkId) {
+        match std::fs::remove_file(self.payload_path(work_id)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                work_id = %work_id,
+                error = %error,
+                "work-request task payload could not be removed"
+            ),
+        }
     }
 
     /// Appends a `channel.command` record to this store's audit journal
@@ -456,6 +831,7 @@ impl WorkRequestStore {
             "task_digest": record.task_digest,
             "source_update_id": record.source_update_id,
             "state": record.state.as_str(),
+            "launch_job_id": record.launch.as_ref().map(|receipt| receipt.job_id.as_str()),
         });
         let transcript_record = TranscriptRecord::new(
             command_audit_session_id(&record.channel),
@@ -495,6 +871,7 @@ fn transition_action(next: WorkRequestState) -> &'static str {
         WorkRequestState::Requested => "reset to requested",
         WorkRequestState::UnderReview => "reviewed",
         WorkRequestState::Approved => "approved",
+        WorkRequestState::Launched => "launched",
         WorkRequestState::Denied => "denied",
         WorkRequestState::Cancelled => "cancelled",
     }
@@ -505,6 +882,7 @@ mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
     use harw_authority::{WorkspaceRegistration, WorkspaceRegistry};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn registry(
         tenant: &TenantId,
@@ -755,26 +1133,281 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn launch_sandboxed_worker_reports_not_yet_available() -> TestResult {
-        let record = WorkRequestRecord {
+    fn approved_record(task: &str) -> WorkRequestRecord {
+        WorkRequestRecord {
             work_id: WorkId::new(),
             channel: ChannelId::from_str("telegram:ops"),
             requester: PeerId::from_str("100"),
             tenant: TenantId::from_str("ops"),
             workspace: WorkspaceId::from_str("ops-room"),
             role: "implementer".to_owned(),
-            task_digest: task_digest("task"),
+            task_digest: task_digest(task),
             source_update_id: "1".to_owned(),
             state: WorkRequestState::Approved,
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
-        };
+            launch: None,
+        }
+    }
+
+    #[test]
+    fn launch_sandboxed_worker_reports_not_yet_available_without_launcher() -> TestResult {
+        let record = approved_record("task");
+        let approved =
+            ApprovedWorkRequest::new(record.clone(), "task").map_err(ctx("approved request"))?;
 
         assert!(matches!(
-            launch_sandboxed_worker(&record),
+            launch_sandboxed_worker(None, &approved),
             Err(TelegramChannelError::LaunchNotYetAvailable { work_id }) if work_id == record.work_id
         ));
+        Ok(())
+    }
+
+    /// Test-Launcher: zeichnet jeden Aufruf auf und schlägt auf Wunsch fehl.
+    #[derive(Default)]
+    struct FakeLauncher {
+        calls: Mutex<Vec<ApprovedWorkRequest>>,
+        fail: AtomicBool,
+    }
+
+    impl FakeLauncher {
+        fn calls(&self) -> Vec<ApprovedWorkRequest> {
+            self.calls.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }
+    }
+
+    impl WorkLauncher for FakeLauncher {
+        fn launch(&self, request: &ApprovedWorkRequest) -> Result<LaunchReceipt, WorkLaunchError> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(request.clone());
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(WorkLaunchError::new("job store unavailable"));
+            }
+            Ok(LaunchReceipt {
+                job_id: request.record().work_id.clone(),
+                launched_at: Timestamp::now(),
+            })
+        }
+    }
+
+    #[test]
+    fn launch_sandboxed_worker_uses_configured_launcher() -> TestResult {
+        let record = approved_record("task");
+        let approved =
+            ApprovedWorkRequest::new(record.clone(), "  task ").map_err(ctx("approved request"))?;
+        let launcher = FakeLauncher::default();
+
+        let receipt = launch_sandboxed_worker(Some(&launcher as &dyn WorkLauncher), &approved)
+            .map_err(ctx("launch"))?;
+
+        assert_eq!(receipt.job_id, record.work_id);
+        assert_eq!(launcher.calls().len(), 1);
+
+        launcher.fail.store(true, Ordering::SeqCst);
+        let Err(TelegramChannelError::Io(error)) =
+            launch_sandboxed_worker(Some(&launcher as &dyn WorkLauncher), &approved)
+        else {
+            return Err(TestError::Unexpected(
+                "launcher failure must surface as an error".into(),
+            ));
+        };
+        assert!(error.to_string().contains("job store unavailable"));
+        Ok(())
+    }
+
+    // Reicht einen Auftrag ein und bringt ihn nach `UnderReview`.
+    fn reviewed_request(
+        store: &WorkRequestStore,
+        registry: &WorkspaceRegistry,
+        tenant: &TenantId,
+        task: &str,
+        now: Timestamp,
+    ) -> TestResult<WorkRequestRecord> {
+        let record = store
+            .submit(
+                &ChannelId::from_str("telegram:ops"),
+                &PeerId::from_str("100"),
+                tenant,
+                "ops-room",
+                "implementer",
+                task,
+                "7",
+                registry,
+                now,
+            )
+            .map_err(ctx("submit"))?;
+        store.review(&record.work_id, now).map_err(ctx("review"))?;
+        Ok(record)
+    }
+
+    fn state_of(store: &WorkRequestStore, work_id: &WorkId) -> TestResult<WorkRequestRecord> {
+        store
+            .get(work_id)
+            .map_err(ctx("get record"))?
+            .ok_or(TestError::Missing("record"))
+    }
+
+    #[test]
+    fn approve_with_launcher_launches_stored_task_once() -> TestResult {
+        let harness = tempfile::tempdir().map_err(ctx("harness dir"))?;
+        let store_dir = tempfile::tempdir().map_err(ctx("store dir"))?;
+        let tenant = TenantId::from_str("ops");
+        let workspace = WorkspaceId::from_str("ops-room");
+        let registry = registry(&tenant, &workspace, harness.path())?;
+        let launcher = Arc::new(FakeLauncher::default());
+        let store = WorkRequestStore::new(store_dir.path())
+            .with_launcher(Arc::clone(&launcher) as Arc<dyn WorkLauncher>);
+        let now = Timestamp::now();
+        let record = reviewed_request(&store, &registry, &tenant, "  fix the build  ", now)?;
+
+        let reply = store
+            .approve(&record.work_id, now)
+            .map_err(ctx("approve"))?;
+
+        assert!(reply.contains("launched as job"));
+        let calls = launcher.calls();
+        assert_eq!(calls.len(), 1);
+        let call = calls.first().ok_or(TestError::Missing("launch call"))?;
+        assert_eq!(call.task(), "fix the build");
+        assert_eq!(call.record().tenant, tenant);
+        assert_eq!(call.record().workspace, workspace);
+        let input = call.job_input();
+        assert_eq!(input["task"], "fix the build");
+        assert_eq!(input["tenant"], "ops");
+        assert_eq!(input["workspace"], "ops-room");
+        assert_eq!(input["work_request"]["work_id"], record.work_id.as_str());
+
+        let stored = state_of(&store, &record.work_id)?;
+        assert_eq!(stored.state, WorkRequestState::Launched);
+        assert_eq!(
+            stored.launch.map(|receipt| receipt.job_id),
+            Some(record.work_id.clone())
+        );
+        assert!(!store.payload_path(&record.work_id).exists());
+
+        // Ein wiederholtes `/approve` startet nichts erneut.
+        let again = store
+            .approve(&record.work_id, now)
+            .map_err(ctx("approve again"))?;
+        assert!(again.contains("already launched"));
+        assert_eq!(launcher.calls().len(), 1);
+
+        // Ein gestarteter Auftrag lässt sich hier nicht mehr abbrechen.
+        assert!(matches!(
+            store.cancel(&record.work_id, now),
+            Err(TelegramChannelError::WorkRequestInvalidTransition { from, .. }) if from == "launched"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_launch_keeps_approved_and_retry_launches() -> TestResult {
+        let harness = tempfile::tempdir().map_err(ctx("harness dir"))?;
+        let store_dir = tempfile::tempdir().map_err(ctx("store dir"))?;
+        let tenant = TenantId::from_str("ops");
+        let workspace = WorkspaceId::from_str("ops-room");
+        let registry = registry(&tenant, &workspace, harness.path())?;
+        let launcher = Arc::new(FakeLauncher::default());
+        launcher.fail.store(true, Ordering::SeqCst);
+        let store = WorkRequestStore::new(store_dir.path())
+            .with_launcher(Arc::clone(&launcher) as Arc<dyn WorkLauncher>);
+        let now = Timestamp::now();
+        let record = reviewed_request(&store, &registry, &tenant, "task", now)?;
+
+        let reply = store
+            .approve(&record.work_id, now)
+            .map_err(ctx("approve"))?;
+        assert!(reply.contains("launch failed"));
+        assert_eq!(
+            state_of(&store, &record.work_id)?.state,
+            WorkRequestState::Approved
+        );
+        assert!(store.payload_path(&record.work_id).exists());
+
+        launcher.fail.store(false, Ordering::SeqCst);
+        let retry = store
+            .approve(&record.work_id, now)
+            .map_err(ctx("approve retry"))?;
+        assert!(retry.contains("launched as job"));
+        assert_eq!(launcher.calls().len(), 2);
+        assert_eq!(
+            state_of(&store, &record.work_id)?.state,
+            WorkRequestState::Launched
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tampered_payload_fails_closed_without_calling_launcher() -> TestResult {
+        let harness = tempfile::tempdir().map_err(ctx("harness dir"))?;
+        let store_dir = tempfile::tempdir().map_err(ctx("store dir"))?;
+        let tenant = TenantId::from_str("ops");
+        let workspace = WorkspaceId::from_str("ops-room");
+        let registry = registry(&tenant, &workspace, harness.path())?;
+        let launcher = Arc::new(FakeLauncher::default());
+        let store = WorkRequestStore::new(store_dir.path())
+            .with_launcher(Arc::clone(&launcher) as Arc<dyn WorkLauncher>);
+        let now = Timestamp::now();
+        let record = reviewed_request(&store, &registry, &tenant, "read the docs", now)?;
+
+        persist_json(
+            &store.payload_path(&record.work_id),
+            &StoredTaskPayload {
+                work_id: record.work_id.clone(),
+                task: "delete everything".to_owned(),
+            },
+        )
+        .map_err(ctx("tamper payload"))?;
+
+        let reply = store
+            .approve(&record.work_id, now)
+            .map_err(ctx("approve"))?;
+        assert!(reply.contains("launch failed"));
+        assert!(launcher.calls().is_empty());
+        assert_eq!(
+            state_of(&store, &record.work_id)?.state,
+            WorkRequestState::Approved
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn approved_request_rejects_wrong_state_and_digest() -> TestResult {
+        let mut record = approved_record("task");
+        assert!(matches!(
+            ApprovedWorkRequest::new(record.clone(), "other task"),
+            Err(TelegramChannelError::Io(_))
+        ));
+        record.state = WorkRequestState::UnderReview;
+        assert!(matches!(
+            ApprovedWorkRequest::new(record, "task"),
+            Err(TelegramChannelError::WorkRequestInvalidTransition { from, .. }) if from == "under_review"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn deny_and_cancel_remove_stored_payload() -> TestResult {
+        let harness = tempfile::tempdir().map_err(ctx("harness dir"))?;
+        let store_dir = tempfile::tempdir().map_err(ctx("store dir"))?;
+        let tenant = TenantId::from_str("ops");
+        let workspace = WorkspaceId::from_str("ops-room");
+        let registry = registry(&tenant, &workspace, harness.path())?;
+        let store = WorkRequestStore::new(store_dir.path());
+        let now = Timestamp::now();
+
+        let denied = reviewed_request(&store, &registry, &tenant, "task", now)?;
+        assert!(store.payload_path(&denied.work_id).exists());
+        store.deny(&denied.work_id, now).map_err(ctx("deny"))?;
+        assert!(!store.payload_path(&denied.work_id).exists());
+
+        let cancelled = reviewed_request(&store, &registry, &tenant, "task", now)?;
+        store
+            .cancel(&cancelled.work_id, now)
+            .map_err(ctx("cancel"))?;
+        assert!(!store.payload_path(&cancelled.work_id).exists());
         Ok(())
     }
 }

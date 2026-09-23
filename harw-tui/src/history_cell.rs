@@ -267,9 +267,9 @@ impl HistoryCell for UserHistoryCell {
 /// # Beschreibung
 /// Speichert den Quelltext der Antwort als `String`. Bei jedem `display_lines(width)`-
 /// Aufruf wird der Text neu umbrochen — dadurch passt sich die Darstellung korrekt an
-/// unterschiedliche Terminalbreiten an (z.B. nach einem Resize-Event). In dieser
-/// Iteration wird kein Markdown-Renderer eingesetzt; stattdessen kommt [`wrap_plain`]
-/// zum Einsatz.
+/// unterschiedliche Terminalbreiten an (z.B. nach einem Resize-Event). Der Text
+/// wird als Markdown gerendert ([`crate::markdown::render_markdown`]) und
+/// anschließend stilerhaltend wortweise umbrochen.
 ///
 /// # Felder
 /// - `source` (`String`): Quelltext der Assistenten-Antwort.
@@ -288,39 +288,123 @@ pub(crate) struct AssistantHistoryCell {
 }
 
 impl HistoryCell for AssistantHistoryCell {
-    /// Bricht den Quelltext für die gegebene Breite neu um und setzt einen
-    /// cyanfarbenen `» `-Präfix auf die erste Zeile (Folgezeilen: `  `), damit
+    /// Rendert den Quelltext als Markdown (Überschriften, Listen, Code mit
+    /// Hervorhebung, Tabellen, Links — siehe [`crate::markdown`]) und setzt
+    /// einen `» `-Präfix auf die erste Zeile (Folgezeilen: `  `), damit
     /// Assistenten-Antworten visuell klar von Nutzer-Zeilen (`> `-Präfix, grün)
-    /// unterschieden werden können.
+    /// unterschieden werden können. Das Umbrechen übernimmt der Verlauf
+    /// (`Paragraph` mit `Wrap`).
     fn display_lines(&self, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
-        let prefix_len = 2_u16;
-        let text_width = width.saturating_sub(prefix_len).max(1);
-        let sanitized = sanitize_display(&self.source);
-        let source = if sanitized.is_empty() {
-            " "
-        } else {
-            &sanitized
-        };
-        let wrapped = wrap_plain(source, text_width);
         let assistant_style = style::assistant_style(theme);
-        wrapped
+        let text_width = usize::from(width.saturating_sub(2).max(1));
+        let mut lines: Vec<Line<'static>> = crate::markdown::render_markdown(&self.source, theme)
+            .into_iter()
+            .flat_map(|line| wrap_styled(line, text_width))
+            .collect();
+        if lines.is_empty() {
+            lines.push(Line::raw(" "));
+        }
+        lines
             .into_iter()
             .enumerate()
             .map(|(i, line)| {
-                let raw: String = line
-                    .spans
-                    .into_iter()
-                    .map(|s| s.content.into_owned())
-                    .collect();
                 let prefix_span = if i == 0 {
                     Span::styled("» ", assistant_style)
                 } else {
                     Span::raw("  ")
                 };
-                Line::from(vec![prefix_span, Span::raw(raw)])
+                let mut spans = Vec::with_capacity(line.spans.len() + 1);
+                spans.push(prefix_span);
+                spans.extend(line.spans);
+                Line::from(spans).style(line.style)
             })
             .collect()
     }
+}
+
+/// Bricht eine gestylte Zeile wortweise auf `width` Spalten um und erhält
+/// dabei die Styles der einzelnen Spans. Wörter, die allein breiter sind als
+/// `width`, werden hart geteilt.
+fn wrap_styled(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let line_style = line.style;
+    let total: usize = line
+        .spans
+        .iter()
+        .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    if total <= width {
+        return vec![line];
+    }
+    // Tokens: (Text, Style, ist Leerraum)
+    let mut tokens: Vec<(String, ratatui::style::Style, bool)> = Vec::new();
+    for span in &line.spans {
+        let mut current = String::new();
+        let mut current_ws: Option<bool> = None;
+        for ch in span.content.chars() {
+            let ws = ch == ' ';
+            if current_ws.is_some_and(|prev| prev != ws) {
+                tokens.push((std::mem::take(&mut current), span.style, current_ws == Some(true)));
+            }
+            current.push(ch);
+            current_ws = Some(ws);
+        }
+        if !current.is_empty() {
+            tokens.push((current, span.style, current_ws == Some(true)));
+        }
+    }
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let flush = |spans: &mut Vec<Span<'static>>, out: &mut Vec<Line<'static>>, used: &mut usize| {
+        out.push(Line::from(std::mem::take(spans)).style(line_style));
+        *used = 0;
+    };
+    for (text, span_style, is_ws) in tokens {
+        let token_width = unicode_width::UnicodeWidthStr::width(text.as_str());
+        if is_ws {
+            // Leerraum am Zeilenumbruch entfällt.
+            if used > 0 && used + token_width <= width {
+                spans.push(Span::styled(text, span_style));
+                used += token_width;
+            } else if used > 0 {
+                flush(&mut spans, &mut out, &mut used);
+            }
+            continue;
+        }
+        if used + token_width <= width {
+            spans.push(Span::styled(text, span_style));
+            used += token_width;
+            continue;
+        }
+        if used > 0 && token_width <= width {
+            flush(&mut spans, &mut out, &mut used);
+            spans.push(Span::styled(text, span_style));
+            used = token_width;
+            continue;
+        }
+        // Überlanges Wort: zeichenweise teilen.
+        let mut chunk = String::new();
+        for ch in text.chars() {
+            let cw = ch.width().unwrap_or(0);
+            if used + cw > width && used > 0 {
+                if !chunk.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut chunk), span_style));
+                }
+                flush(&mut spans, &mut out, &mut used);
+            }
+            chunk.push(ch);
+            used += cw;
+        }
+        if !chunk.is_empty() {
+            spans.push(Span::styled(chunk, span_style));
+        }
+    }
+    if !spans.is_empty() || out.is_empty() {
+        out.push(Line::from(spans).style(line_style));
+    }
+    out
 }
 
 // ─── ReasoningHistoryCell ─────────────────────────────────────────────────────

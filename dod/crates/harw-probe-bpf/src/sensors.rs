@@ -88,24 +88,58 @@
 //! erfindet keine zweite Fähigkeit für den Verbindungs-Sensor.
 //!
 //! # Der Anknüpfungspunkt des Prozessstart-Programms
-//! `harw-dod-flow` exportiert einen festen Anknüpfungspunkt
-//! ([`harw_dod_flow::FLOW_TRACEPOINT_ATTACH_POINT`]) und einen Konstruktor
-//! ([`harw_dod_flow::flow_program_spec`]). `harw-dod-procmon` tut das
-//! **nicht** — es dokumentiert den Tracepoint, an dem sein Format orientiert
-//! ist (`sched:sched_process_exec`, siehe dessen `event`-Moduldoku), legt
-//! ihn aber nicht als Konstante fest. Diese Sonde muss den Anknüpfungspunkt
-//! deshalb selbst wählen: [`PROCMON_TRACEPOINT_ATTACH_POINT`] übernimmt
-//! genau den in `harw-dod-procmon`s eigener Dokumentation genannten Wert.
-//! Ein `harw_dod_procmon::PROCMON_TRACEPOINT_ATTACH_POINT` plus ein
-//! `procmon_program_spec()`-Konstruktor, symmetrisch zu `harw-dod-flow`s
-//! eigenen, wären ein kleiner, wünschenswerter Ausgleich gewesen (siehe
-//! Abschlussbericht dieses Knotens).
+//! `harw-dod-procmon` exportiert seinen Anknüpfungspunkt inzwischen selbst
+//! (`harw_dod_procmon::PROCMON_TRACEPOINT_ATTACH_POINT`, abgeleitet aus
+//! `harw_dod_bpf::EXEC_ATTACH_POINT`); [`PROCMON_TRACEPOINT_ATTACH_POINT`]
+//! dieser Sonde ist nur noch ein Alias darauf, keine eigene Wahl mehr.
+//!
+//! # Woher die Programmobjekte kommen
+//! `make build-bpf` (bzw. `scripts/build-bpf.sh` → `dod/bpf/Makefile`)
+//! übersetzt `dod/bpf/src/*.bpf.c` zu genau vier ELF-Objekten —
+//! `exec.bpf.o`, `exit.bpf.o`, `tcp_v4_connect.bpf.o`,
+//! `tcp_v6_connect.bpf.o` — und `scripts/install.sh` legt sie unter
+//! `$(BPFDIR)` ab (Vorgabe `/usr/local/lib/harw-dod/bpf`). Diese Datei löst
+//! je Objekt genau einen Pfad auf ([`resolve_procmon_objects`],
+//! [`resolve_flow_objects`]), in dieser Rangfolge:
+//!
+//! 1. der explizite Kommandozeilenpfad (`--exec-program-path` usw., so wie
+//!    `harw-dod-bpf.service` ihn setzt);
+//! 2. `$HARW_DOD_BPF_DIR/<name>.bpf.o` ([`BPF_OBJECT_DIR_ENV`]) — für einen
+//!    Entwicklungsaufbau, der direkt gegen `BPF_ARTIFACT_DIR` (`dod/bpf`)
+//!    läuft;
+//! 3. [`DEFAULT_BPF_OBJECT_DIR`]`/<name>.bpf.o`.
+//!
+//! Der aufgelöste Pfad muss absolut sein, darf kein Symlink sein, muss eine
+//! reguläre Datei sein, zwischen 1 Byte und [`MAX_BPF_OBJECT_BYTES`] groß
+//! sein und mit der ELF-Kennung beginnen. Die Bytes werden **einmal**, bei
+//! der Auflösung, gelesen und als
+//! `harw_dod_bpf::BpfProgramSource::Embedded` weitergereicht: Größen- und
+//! Formprüfung gelten damit für genau die Bytes, die später geladen werden
+//! (kein zweites Lesen, das zwischen Prüfung und Laden eine andere Datei
+//! sehen könnte), und nach der Auflösung braucht dieser Prozess keinen
+//! Lesezugriff auf das Objektverzeichnis mehr (Landlock).
+//!
+//! # Degradierung statt leerem Programm
+//! Fehlt eines der beiden Objekte eines Sensors (oder verletzt es eine der
+//! obigen Prüfungen), wird **kein** leerer Platzhalterrumpf geladen. Der
+//! Sensor wird stattdessen als [`UnavailableSensor`] registriert: er loggt
+//! beim Aufbau jedes fehlende Objekt mit Pfad und Grund und meldet bei jedem
+//! `poll` `harw_dod_cap::SensorError::SourceUnavailable`. Ein leerer
+//! Platzhalterrumpf existiert nur noch in den Tests dieser Datei.
 //!
 //! # Exportierte Typen
 //! [`PROCMON_TRACEPOINT_ATTACH_POINT`], [`FLOW_DEFAULT_READ_TIMEOUT`],
-//! [`build_procmon_sensor`], [`build_flow_sensor`], [`FlowSensor`].
+//! [`build_procmon_sensor`], [`build_flow_sensor`], [`FlowSensor`],
+//! [`BPF_OBJECT_DIR_ENV`], [`DEFAULT_BPF_OBJECT_DIR`],
+//! [`MAX_BPF_OBJECT_BYTES`], [`BpfObjectKind`], [`ResolvedBpfObject`],
+//! [`ObjectUnavailable`], [`ObjectUnavailableReason`],
+//! [`resolve_procmon_objects`], [`resolve_flow_objects`],
+//! [`UnavailableSensor`].
 //!
 //! # Nebenläufigkeit
+//! [`UnavailableSensor`] hält nur Griff und Fehlerliste (`Send + Sync`).
+//! Die Objektauflösung liest das Dateisystem und die Umgebung einmalig beim
+//! Aufbau, nie während eines `poll`.
 //! [`FlowSensor`] ist `Send + Sync + Debug` (Anforderung von
 //! `harw_dod_signals::Sensor`): `SensorHandle<Bound>`,
 //! `Box<dyn harw_dod_bpf::BpfLoader>`, `harw_dod_bpf::BpfHandle`,
@@ -118,6 +152,10 @@
 //! # Fehler
 //! [`crate::error::ProbeError::BpfLoad`] aus [`build_procmon_sensor`]/
 //! [`build_flow_sensor`], wenn `loader.load(&spec)` scheitert.
+//! [`ObjectUnavailable`] (je fehlendem oder ungültigem Objekt) aus
+//! [`resolve_procmon_objects`]/[`resolve_flow_objects`] — kein
+//! `ProbeError`, weil ein fehlendes Objekt den Sensor degradiert, nicht den
+//! Prozess beendet.
 //! `harw_dod_cap::SensorError`, wie vom `Sensor`-Trait verlangt, aus
 //! [`FlowSensor::poll`] — sowohl `harw_dod_bpf::BpfError` (aus dem
 //! gehaltenen Lader) als auch `harw_dod_flow::FlowError` (aus
@@ -127,27 +165,24 @@
 //!
 //! # Examples
 //! ```rust,ignore
-//! use crate::sensors::{build_flow_sensor, build_procmon_sensor};
-//! use harw_dod_bpf::BpfProgramSource;
-//! use harw_authority::NetworkScope;
+//! use std::sync::Arc;
+//! use crate::sensors::{build_procmon_sensor, resolve_procmon_objects, UnavailableSensor};
+//! use harw_dod_signals::Sensor;
 //! use harw_types::SensorId;
-//! use std::borrow::Cow;
 //!
-//! let source = BpfProgramSource::Embedded(Cow::Borrowed(&[]));
-//! let procmon = build_procmon_sensor(
-//!     Box::new(harw_dod_bpf::fixture::FixtureBpfLoader::new(Vec::new())),
-//!     SensorId::from_str("probe-bpf-procmon-0"),
-//!     source.clone(),
-//! )?;
-//! let flow = build_flow_sensor(
-//!     Box::new(harw_dod_bpf::fixture::FixtureBpfLoader::new(Vec::new())),
-//!     SensorId::from_str("probe-bpf-flow-0"),
-//!     source,
-//!     NetworkScope::empty(),
-//! )?;
+//! let id = SensorId::from_str("probe-bpf-procmon-0");
+//! let sensor: Arc<dyn Sensor> = match resolve_procmon_objects(None, None) {
+//!     Ok([exec, _exit]) => Arc::new(build_procmon_sensor(loader, id, exec.into_source())?),
+//!     Err(missing) => Arc::new(UnavailableSensor::new(id, missing)),
+//! };
 //! # Ok::<(), crate::error::ProbeError>(())
 //! ```
 
+use std::borrow::Cow;
+use std::ffi::OsStr;
+use std::fmt;
+use std::io::{ErrorKind, Read as _};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use harw_authority::NetworkScope;
@@ -166,11 +201,10 @@ use crate::error::ProbeError;
 /// Anknüpfungspunkt des Prozessstart-Programms, das diese Sonde lädt.
 ///
 /// # Description
-/// `harw-dod-procmon` exportiert diesen Wert nicht selbst — siehe
-/// Moduldoku, Abschnitt „Der Anknüpfungspunkt des Prozessstart-Programms".
-/// Übernommen aus `harw_dod_procmon`s eigener Dokumentation
-/// (`event`-Moduldoku: „orientiert am `sched_process_exec`-Tracepoint").
-pub const PROCMON_TRACEPOINT_ATTACH_POINT: &str = "sched:sched_process_exec";
+/// Alias auf `harw_dod_procmon::PROCMON_TRACEPOINT_ATTACH_POINT`
+/// (`"sched:sched_process_exec"`) — siehe Moduldoku, Abschnitt „Der
+/// Anknüpfungspunkt des Prozessstart-Programms".
+pub const PROCMON_TRACEPOINT_ATTACH_POINT: &str = harw_dod_procmon::PROCMON_TRACEPOINT_ATTACH_POINT;
 
 /// Vorgabe-Wartezeit für [`FlowSensor::poll`]s `read_events`-Aufruf:
 /// **200 Millisekunden**.
@@ -437,6 +471,433 @@ fn bpf_error_to_sensor_error(err: BpfError) -> SensorError {
 fn flow_error_to_sensor_error(err: FlowError) -> SensorError {
     match err {
         FlowError::MalformedEvent => SensorError::MalformedSource,
+    }
+}
+
+/// Umgebungsvariable, die das Objektverzeichnis für Entwicklungsaufbauten
+/// überschreibt: `HARW_DOD_BPF_DIR`.
+///
+/// # Description
+/// Nur Rang 2 der Auflösung (siehe Moduldoku, Abschnitt „Woher die
+/// Programmobjekte kommen"): ein expliziter Kommandozeilenpfad gewinnt
+/// immer. Ein leerer Wert gilt als nicht gesetzt. Typische Verwendung:
+/// `HARW_DOD_BPF_DIR=$PWD/bpf` nach `make build-bpf` (dessen Vorgabe für
+/// `BPF_ARTIFACT_DIR` genau `dod/bpf` ist).
+pub const BPF_OBJECT_DIR_ENV: &str = "HARW_DOD_BPF_DIR";
+
+/// Vorgabe-Objektverzeichnis: `/usr/local/lib/harw-dod/bpf`.
+///
+/// # Description
+/// Entspricht `BPFDIR = $(LIBDIR)/bpf` mit `LIBDIR = $(PREFIX)/lib/harw-dod`
+/// und `PREFIX = /usr/local` aus `dod/Makefile` — genau der Ort, an den
+/// `scripts/install.sh` die vier Objekte installiert. Ein Paketbau mit
+/// anderem `PREFIX` setzt die Pfade ohnehin explizit über die
+/// systemd-Unit (`@BPFDIR@`).
+pub const DEFAULT_BPF_OBJECT_DIR: &str = "/usr/local/lib/harw-dod/bpf";
+
+/// Größenobergrenze eines einzelnen Objekts: **8 MiB**.
+///
+/// # Description
+/// Die v1-Objekte sind wenige Kilobyte groß; die Grenze liegt weit darüber
+/// und verhindert nur, dass ein falsch konfigurierter Pfad (z. B. ein
+/// Abbild oder eine Gerätedatei hinter einem Umweg) unbegrenzt in den
+/// Speicher dieses privilegierten Prozesses gelesen wird.
+pub const MAX_BPF_OBJECT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Die ersten vier Bytes jeder ELF-Datei.
+const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+
+/// Eines der vier Objekte, die `make build-bpf` erzeugt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BpfObjectKind {
+    /// `exec.bpf.o` — `sched:sched_process_exec`.
+    Exec,
+    /// `exit.bpf.o` — `sched:sched_process_exit`.
+    Exit,
+    /// `tcp_v4_connect.bpf.o` — `fentry/tcp_v4_connect`.
+    TcpV4Connect,
+    /// `tcp_v6_connect.bpf.o` — `fentry/tcp_v6_connect`.
+    TcpV6Connect,
+}
+
+impl BpfObjectKind {
+    /// Der Dateiname, unter dem `scripts/build-bpf.sh` und
+    /// `scripts/install.sh` dieses Objekt ablegen.
+    ///
+    /// # Returns
+    /// Einen der vier festen Namen, z. B. `"exec.bpf.o"`.
+    #[must_use]
+    pub const fn file_name(self) -> &'static str {
+        match self {
+            Self::Exec => "exec.bpf.o",
+            Self::Exit => "exit.bpf.o",
+            Self::TcpV4Connect => "tcp_v4_connect.bpf.o",
+            Self::TcpV6Connect => "tcp_v6_connect.bpf.o",
+        }
+    }
+}
+
+impl fmt::Display for BpfObjectKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.file_name())
+    }
+}
+
+/// Warum ein Objekt nicht verwendbar ist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectUnavailableReason {
+    /// Der aufgelöste Pfad ist relativ — abhängig vom Arbeitsverzeichnis
+    /// eines privilegierten Prozesses, deshalb abgelehnt.
+    RelativePath,
+    /// Unter dem Pfad existiert nichts (typisch: `make build-bpf`/`make
+    /// install` wurde nicht ausgeführt).
+    Missing,
+    /// Der Pfad ist ein Symlink, ein Verzeichnis oder eine andere
+    /// Nicht-Datei.
+    NotRegularFile,
+    /// Die Datei ist leer.
+    Empty,
+    /// Die Datei überschreitet [`MAX_BPF_OBJECT_BYTES`].
+    TooLarge {
+        /// Die beobachtete Größe in Bytes (bzw. mindestens diese).
+        size: u64,
+    },
+    /// Die Datei beginnt nicht mit der ELF-Kennung.
+    NotElf,
+    /// Metadaten oder Inhalt ließen sich nicht lesen.
+    Unreadable(ErrorKind),
+}
+
+impl fmt::Display for ObjectUnavailableReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RelativePath => f.write_str("path is not absolute"),
+            Self::Missing => f.write_str("file does not exist (run `make build-bpf` and install)"),
+            Self::NotRegularFile => f.write_str("not a regular file (symlinks are rejected)"),
+            Self::Empty => f.write_str("file is empty"),
+            Self::TooLarge { size } => write!(
+                f,
+                "file has {size} bytes, more than the limit of {MAX_BPF_OBJECT_BYTES}"
+            ),
+            Self::NotElf => f.write_str("file is not an ELF object"),
+            Self::Unreadable(kind) => write!(f, "file is unreadable: {kind}"),
+        }
+    }
+}
+
+/// Ein nicht verwendbares Objekt: welches, wo gesucht, und warum.
+///
+/// # Description
+/// Trägt den Pfad, weil er vom Betreiber bzw. vom Paket stammt (kein
+/// Hostgeheimnis) und ohne ihn eine Degradierungsmeldung nicht behebbar
+/// wäre. Nie Dateiinhalt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectUnavailable {
+    /// Das betroffene Objekt.
+    pub object: BpfObjectKind,
+    /// Der aufgelöste Pfad, unter dem gesucht wurde.
+    pub path: PathBuf,
+    /// Der Grund.
+    pub reason: ObjectUnavailableReason,
+}
+
+impl fmt::Display for ObjectUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "bpf object {} at '{}' is unavailable: {}",
+            self.object,
+            self.path.display(),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for ObjectUnavailable {}
+
+/// Ein erfolgreich aufgelöstes und gelesenes Objekt.
+///
+/// # Description
+/// `source` ist immer `harw_dod_bpf::BpfProgramSource::Embedded` mit den
+/// bereits geprüften Bytes — siehe Moduldoku, warum nicht `Path`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedBpfObject {
+    /// Welches Objekt.
+    pub object: BpfObjectKind,
+    /// Woher es gelesen wurde (nur für Protokoll und Audit).
+    pub path: PathBuf,
+    /// Die geprüften Objektbytes.
+    pub source: BpfProgramSource,
+}
+
+impl ResolvedBpfObject {
+    /// Gibt die Programmquelle für `harw_dod_bpf::BpfObjectContract`/
+    /// `BpfProgramSpec` heraus.
+    #[must_use]
+    pub fn into_source(self) -> BpfProgramSource {
+        self.source
+    }
+}
+
+/// Bestimmt den Pfad eines Objekts nach der Rangfolge der Moduldoku.
+///
+/// # Arguments
+/// - `object` (`BpfObjectKind`): das gesuchte Objekt.
+/// - `explicit` (`Option<&Path>`): der Kommandozeilenpfad, falls gesetzt.
+/// - `env_dir` (`Option<&OsStr>`): der Wert von [`BPF_OBJECT_DIR_ENV`],
+///   injiziert, damit Tests die Prozessumgebung nicht verändern müssen.
+///
+/// # Returns
+/// Den zu prüfenden Pfad; noch keine Dateisystemprüfung.
+fn bpf_object_path(
+    object: BpfObjectKind,
+    explicit: Option<&Path>,
+    env_dir: Option<&OsStr>,
+) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_path_buf();
+    }
+    match env_dir {
+        Some(dir) if !dir.is_empty() => Path::new(dir).join(object.file_name()),
+        _ => Path::new(DEFAULT_BPF_OBJECT_DIR).join(object.file_name()),
+    }
+}
+
+/// Prüft eine beobachtete Größe gegen die Grenzen `1..=MAX_BPF_OBJECT_BYTES`.
+fn size_violation(size: u64) -> Option<ObjectUnavailableReason> {
+    if size == 0 {
+        Some(ObjectUnavailableReason::Empty)
+    } else if size > MAX_BPF_OBJECT_BYTES {
+        Some(ObjectUnavailableReason::TooLarge { size })
+    } else {
+        None
+    }
+}
+
+/// Bildet einen I/O-Fehler auf einen Grund ab.
+fn io_reason(err: &std::io::Error) -> ObjectUnavailableReason {
+    if err.kind() == ErrorKind::NotFound {
+        ObjectUnavailableReason::Missing
+    } else {
+        ObjectUnavailableReason::Unreadable(err.kind())
+    }
+}
+
+/// Prüft und liest genau ein Objekt.
+///
+/// # Description
+/// Reihenfolge: absolut? → `symlink_metadata` (kein Symlink, reguläre
+/// Datei, Größe) → öffnen → Metadaten des **geöffneten** Deskriptors erneut
+/// prüfen → höchstens `MAX_BPF_OBJECT_BYTES + 1` Bytes lesen → Größe der
+/// tatsächlich gelesenen Bytes und ELF-Kennung prüfen. Die erste Prüfung vor
+/// dem Öffnen verhindert, dass ein FIFO oder Gerät geöffnet wird; die
+/// begrenzte Lesung macht die Grenze unabhängig von einer zwischenzeitlich
+/// gewachsenen Datei.
+///
+/// # Errors
+/// [`ObjectUnavailable`] mit dem ersten verletzten Grund.
+fn resolve_bpf_object(
+    object: BpfObjectKind,
+    path: PathBuf,
+) -> Result<ResolvedBpfObject, ObjectUnavailable> {
+    let unavailable = |reason: ObjectUnavailableReason| ObjectUnavailable {
+        object,
+        path: path.clone(),
+        reason,
+    };
+
+    if !path.is_absolute() {
+        return Err(unavailable(ObjectUnavailableReason::RelativePath));
+    }
+    let link_meta = std::fs::symlink_metadata(&path).map_err(|err| unavailable(io_reason(&err)))?;
+    if !link_meta.file_type().is_file() {
+        return Err(unavailable(ObjectUnavailableReason::NotRegularFile));
+    }
+    if let Some(reason) = size_violation(link_meta.len()) {
+        return Err(unavailable(reason));
+    }
+
+    let file = std::fs::File::open(&path).map_err(|err| unavailable(io_reason(&err)))?;
+    let meta = file
+        .metadata()
+        .map_err(|err| unavailable(io_reason(&err)))?;
+    if !meta.is_file() {
+        return Err(unavailable(ObjectUnavailableReason::NotRegularFile));
+    }
+    if let Some(reason) = size_violation(meta.len()) {
+        return Err(unavailable(reason));
+    }
+
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    file.take(MAX_BPF_OBJECT_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|err| unavailable(io_reason(&err)))?;
+    if let Some(reason) = size_violation(u64::try_from(bytes.len()).unwrap_or(u64::MAX)) {
+        return Err(unavailable(reason));
+    }
+    if !bytes.starts_with(&ELF_MAGIC) {
+        return Err(unavailable(ObjectUnavailableReason::NotElf));
+    }
+
+    Ok(ResolvedBpfObject {
+        object,
+        path,
+        source: BpfProgramSource::Embedded(Cow::Owned(bytes)),
+    })
+}
+
+/// Löst die beiden Objekte eines Sensors auf — beide oder keins.
+///
+/// # Description
+/// Ein Sensor mit nur einem seiner zwei Objekte (z. B. Verbindungen nur
+/// über IPv4) wäre eine stille Teilabdeckung; deshalb liefert diese
+/// Funktion nur dann Objekte, wenn **beide** verwendbar sind, und sonst
+/// **jeden** gefundenen Mangel, nicht nur den ersten.
+fn resolve_object_pair(
+    objects: [(BpfObjectKind, Option<&Path>); 2],
+    env_dir: Option<&OsStr>,
+) -> Result<[ResolvedBpfObject; 2], Vec<ObjectUnavailable>> {
+    let [(first_kind, first_explicit), (second_kind, second_explicit)] = objects;
+    let first = resolve_bpf_object(
+        first_kind,
+        bpf_object_path(first_kind, first_explicit, env_dir),
+    );
+    let second = resolve_bpf_object(
+        second_kind,
+        bpf_object_path(second_kind, second_explicit, env_dir),
+    );
+    match (first, second) {
+        (Ok(first), Ok(second)) => {
+            for resolved in [&first, &second] {
+                tracing::info!(
+                    object = %resolved.object,
+                    path = %resolved.path.display(),
+                    "bpf object resolved"
+                );
+            }
+            Ok([first, second])
+        }
+        (first, second) => Err(first.err().into_iter().chain(second.err()).collect()),
+    }
+}
+
+/// Löst die Objekte des Prozess-Sensors auf: `[exec, exit]`.
+///
+/// # Arguments
+/// - `exec` (`Option<&Path>`): `--exec-program-path`, falls gesetzt.
+/// - `exit` (`Option<&Path>`): `--exit-program-path`, falls gesetzt.
+///
+/// # Returns
+/// `[exec, exit]` in dieser Reihenfolge — passend zu
+/// `harw_dod_procmon::procmon_contracts(sensor, exec_source, exit_source, scope)`.
+///
+/// # Errors
+/// Jeder Mangel beider Objekte als [`ObjectUnavailable`]; der Aufrufer
+/// registriert dann [`UnavailableSensor`].
+pub fn resolve_procmon_objects(
+    exec: Option<&Path>,
+    exit: Option<&Path>,
+) -> Result<[ResolvedBpfObject; 2], Vec<ObjectUnavailable>> {
+    let env_dir = std::env::var_os(BPF_OBJECT_DIR_ENV);
+    resolve_object_pair(
+        [(BpfObjectKind::Exec, exec), (BpfObjectKind::Exit, exit)],
+        env_dir.as_deref(),
+    )
+}
+
+/// Löst die Objekte des Verbindungs-Sensors auf: `[tcp_v4, tcp_v6]`.
+///
+/// # Arguments
+/// - `tcp_v4` (`Option<&Path>`): `--tcp-v4-program-path`, falls gesetzt.
+/// - `tcp_v6` (`Option<&Path>`): `--tcp-v6-program-path`, falls gesetzt.
+///
+/// # Returns
+/// `[tcp_v4, tcp_v6]` in dieser Reihenfolge — passend zu
+/// `harw_dod_flow::flow_contracts(sensor, ipv4_source, ipv6_source, scope)`.
+///
+/// # Errors
+/// Siehe [`resolve_procmon_objects`].
+pub fn resolve_flow_objects(
+    tcp_v4: Option<&Path>,
+    tcp_v6: Option<&Path>,
+) -> Result<[ResolvedBpfObject; 2], Vec<ObjectUnavailable>> {
+    let env_dir = std::env::var_os(BPF_OBJECT_DIR_ENV);
+    resolve_object_pair(
+        [
+            (BpfObjectKind::TcpV4Connect, tcp_v4),
+            (BpfObjectKind::TcpV6Connect, tcp_v6),
+        ],
+        env_dir.as_deref(),
+    )
+}
+
+/// Ein Sensor, dessen Programmobjekte fehlen: meldet sich als nicht
+/// verfügbar, statt ein leeres Programm zu laden.
+///
+/// # Description
+/// Trägt dieselbe Kennung und dieselbe Fähigkeit
+/// (`Capability::LoadBpfProgram`) wie der Sensor, den er vertritt, damit
+/// die Degradierung beim Sentinel dem richtigen Sensor zugeordnet wird.
+/// Siehe Moduldoku, Abschnitt „Degradierung statt leerem Programm".
+#[derive(Debug)]
+pub struct UnavailableSensor {
+    handle: SensorHandle<Bound>,
+    missing: Vec<ObjectUnavailable>,
+}
+
+impl UnavailableSensor {
+    /// Baut den Platzhalter-Sensor und protokolliert jeden Mangel einmal
+    /// als Warnung.
+    ///
+    /// # Arguments
+    /// - `sensor_id` (`harw_types::SensorId`): die Kennung des vertretenen
+    ///   Sensors.
+    /// - `missing` (`Vec<ObjectUnavailable>`): die Mängel aus
+    ///   [`resolve_procmon_objects`]/[`resolve_flow_objects`].
+    ///
+    /// # Returns
+    /// Einen Sensor, dessen `poll` immer
+    /// `SensorError::SourceUnavailable` liefert.
+    #[must_use]
+    pub fn new(sensor_id: SensorId, missing: Vec<ObjectUnavailable>) -> Self {
+        for item in &missing {
+            tracing::warn!(
+                sensor = %sensor_id,
+                object = %item.object,
+                path = %item.path.display(),
+                reason = %item.reason,
+                "bpf sensor unavailable: required object missing or invalid"
+            );
+        }
+        let handle = SensorHandle::new(sensor_id, Capability::LoadBpfProgram).bind(empty_scope());
+        Self { handle, missing }
+    }
+
+    /// Die Mängel, derentwegen dieser Sensor nicht verfügbar ist.
+    #[cfg(test)]
+    #[must_use]
+    pub fn missing(&self) -> &[ObjectUnavailable] {
+        &self.missing
+    }
+}
+
+impl Sensor for UnavailableSensor {
+    /// Der gebundene Griff dieses Sensors.
+    fn handle(&self) -> &SensorHandle<Bound> {
+        &self.handle
+    }
+
+    /// Meldet immer `SensorError::SourceUnavailable` (dauerhaft).
+    ///
+    /// # Errors
+    /// Immer `harw_dod_cap::SensorError::SourceUnavailable`.
+    fn poll(&self, _now: Timestamp) -> Result<SensorReading, SensorError> {
+        tracing::debug!(
+            sensor = %self.handle.id(),
+            missing_objects = self.missing.len(),
+            "polled an unavailable bpf sensor"
+        );
+        Err(SensorError::SourceUnavailable)
     }
 }
 

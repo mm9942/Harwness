@@ -32,23 +32,27 @@
 //! wohldefiniertes Ergebnis); abgelehnte Lockerungsversuche werden über den
 //! `Vec<ScopeDiagnostic>`-Rückgabewert sichtbar gemacht, nicht über `Result`.
 //!
-//! # Bekannte Lücke: `tracing`
-//! `docs/design/config-scopes.md` Abschnitt 7e verlangt zusätzlich zum
-//! `Vec<ScopeDiagnostic>`-Rückgabewert einen synchronen
-//! `tracing::warn!(...)`-Aufruf pro abgelehntem Lockerungsversuch
-//! (Projekt-Tracing-Konvention). `harw-config/Cargo.toml` hat aber
-//! **keine** `tracing`-Abhängigkeit, und dieser Arbeitsauftrag beschränkt
-//! Änderungen ausdrücklich auf `scope.rs`/`merge.rs`/zwei Zeilen in
-//! `lib.rs` (kein `Cargo.toml`). Jede Stelle, an der `tracing::warn!`
-//! ergänzt werden müsste, trägt unten einen `// TODO(scope-diagnostics)`-
-//! Kommentar; der Rückgabewert selbst (`Vec<ScopeDiagnostic>`) ist bereits
-//! vollständig befüllt und für `ResolvedConfig::scope_warnings` sowie Tests
-//! nutzbar. Nachtrag für einen künftigen Patch: `tracing = { workspace =
-//! true }` zu `harw-config/Cargo.toml` hinzufügen (Muster wie in
-//! `harw-runtime/Cargo.toml`), dann an den markierten Stellen
-//! `tracing::warn!(field = %diagnostic.field, file = %diagnostic.file,
-//! rejected_value = %diagnostic.rejected_value, "scope loosening attempt
-//! ignored");` ergänzen.
+//! # Logging (`tracing`)
+//! `docs/design/config-scopes.md` Abschnitt 7e: zusätzlich zum
+//! `Vec<ScopeDiagnostic>`-Rückgabewert erzeugt jeder verworfene Layer-Wert
+//! synchron **genau ein** `tracing::warn!` mit den strukturierten Feldern
+//! `field` (gepunkteter Feldpfad), `layer_role` (`baseline`/`refinement`/
+//! `untrusted_project`), `layer_path` (die `config.toml` bzw. das
+//! Layer-Verzeichnis) und `reason` (maschinenlesbarer Ablehnungsgrund, z. B.
+//! `exceeds_min_bound`, `global_only_override`, `untrusted_project_layer`).
+//! - Ablehnungen mit `ScopeDiagnostic` (Regel-Helfer `global_only`,
+//!   `intersection_list`, `min_bound`, `and_bool`, `or_bool`, `stricter_of`,
+//!   Principals) laufen über `reject` und loggen zusätzlich den nicht
+//!   geheimen `rejected_value`.
+//! - Werte, die der nicht vertraute Projekt-Layer setzt, die aber per
+//!   Scope-Regel still verworfen werden (`profile_replaces`,
+//!   `config_version`, `default_provider`/`default_model`/
+//!   `active_uia_definition`, `[onboarding]`, `[internal_models]`), laufen
+//!   über `warn_untrusted_ignored`: nur Warnung, keine `ScopeDiagnostic`,
+//!   und nie mit dem Wert selbst.
+//!
+//! Stilles Verengen (z. B. Entfernen eines `Intersection`-Eintrags) ist
+//! keine Ablehnung und wird nicht geloggt.
 //!
 //! # Examples
 //! ```rust,no_run
@@ -162,6 +166,106 @@ impl std::fmt::Display for ScopeDiagnostic {
     }
 }
 
+impl LayerRole {
+    // Stabiler, maschinenlesbarer Bezeichner fuer das strukturierte
+    // `layer_role`-Feld der `tracing::warn!`-Aufrufe unten.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Refinement => "refinement",
+            Self::UntrustedProject => "untrusted_project",
+        }
+    }
+}
+
+// Grund, aus dem ein Layer-Wert verworfen wurde; landet als strukturiertes
+// `reason`-Feld in genau einem `tracing::warn!` pro Ablehnung.
+#[derive(Debug, Clone, Copy)]
+enum RejectionReason {
+    // `GlobalOnly`: spaeterer Layer setzt einen vom globalen Wert
+    // abweichenden Wert.
+    GlobalOnlyOverride,
+    // `Intersection`: spaeterer Layer fuegt einen im Home-Layer fehlenden
+    // Eintrag hinzu.
+    IntersectionNewEntry,
+    // `MinBound`: spaeterer Layer setzt einen hoeheren Wert (oder den
+    // Default-/Sentinel-Wert) als die bisherige Obergrenze.
+    ExceedsMinBound,
+    // `AndBool`: spaeterer Layer versucht einzuschalten.
+    AndBoolEnable,
+    // `OrBool`: spaeterer Layer versucht abzuschalten.
+    OrBoolDisable,
+    // `StricterOf`: spaeterer Layer setzt einen weniger strengen Wert.
+    LessStrictValue,
+    // `StricterOf`-Fallback (R1): Wert ausserhalb der Strenge-Ordnung.
+    UnorderedValue,
+    // `mcp_listener.principals`: neue Principal-`id`.
+    PrincipalAdded,
+    // `mcp_listener.principals`: bekannte `id` mit geaenderten Unterfeldern.
+    PrincipalChanged,
+    // Nicht vertrauter Projekt-Layer setzt ein Feld, das nur vertraute
+    // Layer setzen duerfen (`ProfileReplaces`/`PerFileValidated`/
+    // Sonderfaelle, Abschnitt 7c).
+    UntrustedProjectLayer,
+}
+
+impl RejectionReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::GlobalOnlyOverride => "global_only_override",
+            Self::IntersectionNewEntry => "intersection_new_entry",
+            Self::ExceedsMinBound => "exceeds_min_bound",
+            Self::AndBoolEnable => "and_bool_enable",
+            Self::OrBoolDisable => "or_bool_disable",
+            Self::LessStrictValue => "less_strict_value",
+            Self::UnorderedValue => "unordered_value",
+            Self::PrincipalAdded => "principal_added",
+            Self::PrincipalChanged => "principal_changed",
+            Self::UntrustedProjectLayer => "untrusted_project_layer",
+        }
+    }
+}
+
+// Meldet einen abgelehnten Lockerungsversuch: genau ein `tracing::warn!`
+// plus die zugehoerige `ScopeDiagnostic` in `out` (Abschnitt 7e).
+// `rejected_value` ist per `ScopeDiagnostic`-Vertrag nie ein Secret
+// (Principals werden nur ueber ihre `id` beschrieben, nie ueber
+// `credential_ref`).
+fn reject(
+    out: &mut Vec<ScopeDiagnostic>,
+    diagnostic: ScopeDiagnostic,
+    role: LayerRole,
+    reason: RejectionReason,
+) {
+    tracing::warn!(
+        field = %diagnostic.field,
+        layer_role = role.label(),
+        layer_path = %diagnostic.file,
+        reason = reason.as_str(),
+        rejected_value = %diagnostic.rejected_value,
+        "config: scope loosening attempt ignored"
+    );
+    out.push(diagnostic);
+}
+
+// Meldet einen vom nicht vertrauten Projekt-Layer gesetzten, aber per
+// Scope-Regel still verworfenen Wert (`ProfileReplaces` und die
+// Sonderfaelle `config_version`/`default_provider`/`default_model`/
+// `active_uia_definition`/`[onboarding]`/`[internal_models]`). Genau ein
+// `tracing::warn!`, **keine** `ScopeDiagnostic` (unveraendertes
+// Rueckgabeverhalten von `merge_layer_into`) und bewusst **ohne** den Wert
+// selbst — diese Felder sind nicht durch den `ScopeDiagnostic`-Vertrag als
+// nicht-geheim abgesichert.
+fn warn_untrusted_ignored(field: &str, layer_path: &Path) {
+    tracing::warn!(
+        field = %field,
+        layer_role = LayerRole::UntrustedProject.label(),
+        layer_path = %layer_path.display(),
+        reason = RejectionReason::UntrustedProjectLayer.as_str(),
+        "config: value from untrusted project layer ignored"
+    );
+}
+
 // Ob `path` (Kette verschachtelter Tabellen-Keys) im geparsten Dokument
 // `fields` ausdrücklich gesetzt ist. Bewusst als eigene, private Kopie von
 // `discovery::field_present` gehalten statt importiert: `discovery::
@@ -194,9 +298,21 @@ fn min_positive<T: Ord + Default + Copy>(trusted: T, incoming: T) -> T {
 // ausdrücklich gesetzt hat (`present`); ein Layer, der das Feld nicht
 // setzt, lässt `trusted` unverändert (kein Reset auf den Section-Default —
 // das ist die eigentliche Bugfix-Wirkung, Abschnitt 4/7f). Nie vom nicht
-// vertrauten Projekt-Layer angewendet (Abschnitt 7c).
-fn profile_replaces<T: Clone>(trusted: &mut T, incoming: T, present: bool, role: LayerRole) {
+// vertrauten Projekt-Layer angewendet (Abschnitt 7c) — setzt dieser das
+// Feld dennoch, wird der Wert verworfen und genau einmal per
+// `warn_untrusted_ignored` gemeldet.
+fn profile_replaces<T: Clone>(
+    trusted: &mut T,
+    incoming: T,
+    present: bool,
+    role: LayerRole,
+    field: &str,
+    layer_path: &Path,
+) {
     if role == LayerRole::UntrustedProject {
+        if present {
+            warn_untrusted_ignored(field, layer_path);
+        }
         return;
     }
     if present {
@@ -230,13 +346,7 @@ fn global_only<T: Clone + PartialEq + std::fmt::Debug>(
     }
     if incoming != *trusted {
         let diagnostic = ScopeDiagnostic::new(field, layer_path, &incoming);
-        tracing::warn!(
-            field = %diagnostic.field,
-            file = %diagnostic.file,
-            rejected_value = %diagnostic.rejected_value,
-            "config: Profil-/Projekt-Ebene versucht globale Beschränkung zu lockern, ignoriert"
-        );
-        out.push(diagnostic);
+        reject(out, diagnostic, role, RejectionReason::GlobalOnlyOverride);
     }
 }
 
@@ -297,13 +407,7 @@ fn intersection_list<T: Clone + PartialEq + std::fmt::Debug>(
     trusted.retain(|item| incoming.contains(item));
     for item in rejected {
         let diagnostic = ScopeDiagnostic::new(field, layer_path, item);
-        tracing::warn!(
-            field = %diagnostic.field,
-            file = %diagnostic.file,
-            rejected_value = %diagnostic.rejected_value,
-            "config: Profil-/Projekt-Ebene versucht globale Beschränkung zu lockern, ignoriert"
-        );
-        out.push(diagnostic);
+        reject(out, diagnostic, role, RejectionReason::IntersectionNewEntry);
     }
 }
 
@@ -331,13 +435,7 @@ fn min_bound<T: Ord + Default + Copy + std::fmt::Debug>(
     let bounded = min_positive(*trusted, incoming);
     if bounded != incoming {
         let diagnostic = ScopeDiagnostic::new(field, layer_path, &incoming);
-        tracing::warn!(
-            field = %diagnostic.field,
-            file = %diagnostic.file,
-            rejected_value = %diagnostic.rejected_value,
-            "config: Profil-/Projekt-Ebene versucht globale Beschränkung zu lockern, ignoriert"
-        );
-        out.push(diagnostic);
+        reject(out, diagnostic, role, RejectionReason::ExceedsMinBound);
     }
     *trusted = bounded;
 }
@@ -365,6 +463,9 @@ fn merge_optional_min_bound<T: Ord + Default + Copy + std::fmt::Debug>(
             min_bound(&mut current, value, true, role, field, layer_path, out);
             *trusted = Some(current);
         }
+        // `present` mit `None` ist per Serde nicht erreichbar (ein gesetzter
+        // Schluessel deserialisiert immer zu `Some`) — nichts verworfen,
+        // daher auch keine Warnung.
         (_, None) => {}
     }
 }
@@ -392,13 +493,7 @@ fn and_bool(
     let result = *trusted && incoming;
     if result != incoming {
         let diagnostic = ScopeDiagnostic::new(field, layer_path, &incoming);
-        tracing::warn!(
-            field = %diagnostic.field,
-            file = %diagnostic.file,
-            rejected_value = %diagnostic.rejected_value,
-            "config: Profil-/Projekt-Ebene versucht globale Beschränkung zu lockern, ignoriert"
-        );
-        out.push(diagnostic);
+        reject(out, diagnostic, role, RejectionReason::AndBoolEnable);
     }
     *trusted = result;
 }
@@ -426,13 +521,7 @@ fn or_bool(
     let result = *trusted || incoming;
     if result != incoming {
         let diagnostic = ScopeDiagnostic::new(field, layer_path, &incoming);
-        tracing::warn!(
-            field = %diagnostic.field,
-            file = %diagnostic.file,
-            rejected_value = %diagnostic.rejected_value,
-            "config: Profil-/Projekt-Ebene versucht globale Beschränkung zu lockern, ignoriert"
-        );
-        out.push(diagnostic);
+        reject(out, diagnostic, role, RejectionReason::OrBoolDisable);
     }
     *trusted = result;
 }
@@ -457,6 +546,9 @@ fn merge_optional_or_bool(
             or_bool(&mut current, value, true, role, field, layer_path, out);
             *trusted = Some(current);
         }
+        // `present` mit `None` ist per Serde nicht erreichbar (ein gesetzter
+        // Schluessel deserialisiert immer zu `Some`) — nichts verworfen,
+        // daher auch keine Warnung.
         (_, None) => {}
     }
 }
@@ -500,13 +592,7 @@ fn stricter_of(
         (Some(t), Some(i)) if i <= t => *trusted = incoming,
         (Some(_), Some(_)) => {
             let diagnostic = ScopeDiagnostic::new(field, layer_path, &incoming);
-            tracing::warn!(
-                field = %diagnostic.field,
-                file = %diagnostic.file,
-                rejected_value = %diagnostic.rejected_value,
-                "config: Profil-/Projekt-Ebene versucht globale Beschränkung zu lockern, ignoriert"
-            );
-            out.push(diagnostic);
+            reject(out, diagnostic, role, RejectionReason::LessStrictValue);
         }
         _ => {
             // Mindestens einer der beiden Werte liegt ausserhalb der
@@ -514,13 +600,7 @@ fn stricter_of(
             // abgelehnt, kein Vergleichsversuch.
             if incoming != *trusted {
                 let diagnostic = ScopeDiagnostic::new(field, layer_path, &incoming);
-                tracing::warn!(
-                    field = %diagnostic.field,
-                    file = %diagnostic.file,
-                    rejected_value = %diagnostic.rejected_value,
-                    "config: Profil-/Projekt-Ebene versucht globale Beschränkung zu lockern, ignoriert"
-                );
-                out.push(diagnostic);
+                reject(out, diagnostic, role, RejectionReason::UnorderedValue);
             }
         }
     }
@@ -559,6 +639,9 @@ fn merge_optional_stricter_of(
             );
             *trusted = Some(current);
         }
+        // `present` mit `None` ist per Serde nicht erreichbar (ein gesetzter
+        // Schluessel deserialisiert immer zu `Some`) — nichts verworfen,
+        // daher auch keine Warnung.
         (_, None) => {}
     }
 }
@@ -605,13 +688,7 @@ fn merge_mcp_listener_principals(
                     layer_path,
                     &format!("new principal id {:?} rejected", candidate.id),
                 );
-                tracing::warn!(
-                    field = %diagnostic.field,
-                    file = %diagnostic.file,
-                    rejected_value = %diagnostic.rejected_value,
-                    "config: Profil-/Projekt-Ebene versucht globale Beschränkung zu lockern, ignoriert"
-                );
-                out.push(diagnostic);
+                reject(out, diagnostic, role, RejectionReason::PrincipalAdded);
             }
             Some(existing) if !principal_eq(existing, candidate) => {
                 let diagnostic = ScopeDiagnostic::new(
@@ -622,13 +699,7 @@ fn merge_mcp_listener_principals(
                         candidate.id
                     ),
                 );
-                tracing::warn!(
-                    field = %diagnostic.field,
-                    file = %diagnostic.file,
-                    rejected_value = %diagnostic.rejected_value,
-                    "config: Profil-/Projekt-Ebene versucht globale Beschränkung zu lockern, ignoriert"
-                );
-                out.push(diagnostic);
+                reject(out, diagnostic, role, RejectionReason::PrincipalChanged);
             }
             Some(_) => {}
         }
@@ -661,6 +732,8 @@ fn merge_top_level(
     // `apply_restricted_layer` nie `resolved.harness` wholesale ersetzt).
     if role != LayerRole::UntrustedProject {
         trusted.config_version = incoming.config_version;
+    } else if field_present(raw, &["config_version"]) {
+        warn_untrusted_ignored("config_version", layer_path);
     }
 
     // Reproduziert discovery.rs:631-639 wortgleich (Abschnitt 7f): ein
@@ -679,6 +752,12 @@ fn merge_top_level(
         trusted.default_provider = incoming.default_provider.clone();
         trusted.default_model = incoming.default_model.clone();
         trusted.active_uia_definition = incoming.active_uia_definition.clone();
+    } else {
+        for field in ["default_provider", "default_model", "active_uia_definition"] {
+            if field_present(raw, &[field]) {
+                warn_untrusted_ignored(field, layer_path);
+            }
+        }
     }
 
     let present = |field: &str| field_present(raw, &[field]);
@@ -688,36 +767,48 @@ fn merge_top_level(
         incoming.workspace_root.clone(),
         present("workspace_root"),
         role,
+        "workspace_root",
+        layer_path,
     );
     profile_replaces(
         &mut trusted.active_agent_definition,
         incoming.active_agent_definition.clone(),
         present("active_agent_definition"),
         role,
+        "active_agent_definition",
+        layer_path,
     );
     profile_replaces(
         &mut trusted.uia_provider,
         incoming.uia_provider.clone(),
         present("uia_provider"),
         role,
+        "uia_provider",
+        layer_path,
     );
     profile_replaces(
         &mut trusted.uia_model,
         incoming.uia_model.clone(),
         present("uia_model"),
         role,
+        "uia_model",
+        layer_path,
     );
     profile_replaces(
         &mut trusted.uia_worker_model,
         incoming.uia_worker_model.clone(),
         present("uia_worker_model"),
         role,
+        "uia_worker_model",
+        layer_path,
     );
     profile_replaces(
         &mut trusted.project_root_markers,
         incoming.project_root_markers.clone(),
         present("project_root_markers"),
         role,
+        "project_root_markers",
+        layer_path,
     );
     global_only(
         &mut trusted.policy_profile,
@@ -737,6 +828,7 @@ fn merge_logging(
     incoming: crate::harness_config::LoggingSection,
     raw: &toml::Value,
     role: LayerRole,
+    layer_path: &Path,
 ) {
     let present = |field: &str| field_present(raw, &["logging", field]);
     profile_replaces(
@@ -744,18 +836,24 @@ fn merge_logging(
         incoming.level,
         present("level"),
         role,
+        "logging.level",
+        layer_path,
     );
     profile_replaces(
         &mut trusted.logging.target_module_paths,
         incoming.target_module_paths,
         present("target_module_paths"),
         role,
+        "logging.target_module_paths",
+        layer_path,
     );
     profile_replaces(
         &mut trusted.logging.json,
         incoming.json,
         present("json"),
         role,
+        "logging.json",
+        layer_path,
     );
 }
 
@@ -765,6 +863,7 @@ fn merge_tui(
     incoming: TuiSection,
     raw: &toml::Value,
     role: LayerRole,
+    layer_path: &Path,
 ) {
     let present = |field: &str| field_present(raw, &["tui", field]);
     profile_replaces(
@@ -772,12 +871,16 @@ fn merge_tui(
         incoming.theme,
         present("theme"),
         role,
+        "tui.theme",
+        layer_path,
     );
     profile_replaces(
         &mut trusted.tui.keybindings_file,
         incoming.keybindings_file,
         present("keybindings_file"),
         role,
+        "tui.keybindings_file",
+        layer_path,
     );
 }
 
@@ -797,12 +900,16 @@ fn merge_session(
         incoming.store_dir,
         present("store_dir"),
         role,
+        "session.store_dir",
+        layer_path,
     );
     profile_replaces(
         &mut trusted.session.journal_format,
         incoming.journal_format,
         present("journal_format"),
         role,
+        "session.journal_format",
+        layer_path,
     );
     min_bound(
         &mut trusted.session.retention_days,
@@ -818,12 +925,16 @@ fn merge_session(
         incoming.title_generation,
         present("title_generation"),
         role,
+        "session.title_generation",
+        layer_path,
     );
     profile_replaces(
         &mut trusted.session.title_model,
         incoming.title_model,
         present("title_model"),
         role,
+        "session.title_model",
+        layer_path,
     );
 }
 
@@ -916,8 +1027,13 @@ fn merge_onboarding(
     incoming: OnboardingSection,
     raw: &toml::Value,
     role: LayerRole,
+    layer_path: &Path,
 ) {
     if role == LayerRole::UntrustedProject {
+        // Atomare Tabelle: genau eine Warnung fuer die ganze Tabelle.
+        if field_present(raw, &["onboarding"]) {
+            warn_untrusted_ignored("onboarding", layer_path);
+        }
         return;
     }
     if field_present(raw, &["onboarding"]) {
@@ -942,18 +1058,24 @@ fn merge_tools_plan(
         plan.enabled,
         present("enabled"),
         role,
+        "tools.plan.enabled",
+        layer_path,
     );
     profile_replaces(
         &mut trusted.tools.plan.persist,
         plan.persist,
         present("persist"),
         role,
+        "tools.plan.persist",
+        layer_path,
     );
     profile_replaces(
         &mut trusted.tools.plan.require_for_complex_work,
         plan.require_for_complex_work,
         present("require_for_complex_work"),
         role,
+        "tools.plan.require_for_complex_work",
+        layer_path,
     );
     or_bool(
         &mut trusted.tools.plan.validate_dependency_cycles,
@@ -987,12 +1109,16 @@ fn merge_tools_plan(
         plan.require_exploration_for,
         present("require_exploration_for"),
         role,
+        "tools.plan.require_exploration_for",
+        layer_path,
     );
     profile_replaces(
         &mut trusted.tools.plan.exploration_ttl_secs,
         plan.exploration_ttl_secs,
         present("exploration_ttl_secs"),
         role,
+        "tools.plan.exploration_ttl_secs",
+        layer_path,
     );
     min_bound(
         &mut trusted.tools.plan.max_expand_depth,
@@ -1011,9 +1137,17 @@ fn merge_mode(
     incoming: ModeSection,
     raw: &toml::Value,
     role: LayerRole,
+    layer_path: &Path,
 ) {
     let present = field_present(raw, &["mode", "default"]);
-    profile_replaces(&mut trusted.mode.default, incoming.default, present, role);
+    profile_replaces(
+        &mut trusted.mode.default,
+        incoming.default,
+        present,
+        role,
+        "mode.default",
+        layer_path,
+    );
 }
 
 // `[research]` (Abschnitt 1.10) — vier Felder sicherheitskritisch (🔒) und
@@ -1068,6 +1202,8 @@ fn merge_research(
         incoming.cache_ttl_secs,
         present("cache_ttl_secs"),
         role,
+        "research.cache_ttl_secs",
+        layer_path,
     );
 }
 
@@ -1174,8 +1310,14 @@ fn merge_internal_models(
     mut incoming: InternalModelsToml,
     raw: &toml::Value,
     role: LayerRole,
+    layer_path: &Path,
 ) {
     if role == LayerRole::UntrustedProject {
+        // Eine Warnung fuer die ganze Tabelle (nie uebernommen, egal
+        // welche Unterfelder gesetzt sind).
+        if field_present(raw, &["internal_models"]) {
+            warn_untrusted_ignored("internal_models", layer_path);
+        }
         return;
     }
     let Some(raw_table) = raw.get("internal_models") else {
@@ -1217,6 +1359,8 @@ fn merge_compaction(
         incoming.max_history_bytes,
         field_present(raw, &["compaction", "max_history_bytes"]),
         role,
+        "compaction.max_history_bytes",
+        layer_path,
     );
 }
 
@@ -1226,6 +1370,7 @@ fn merge_reasoning(
     incoming: ReasoningWeightsToml,
     raw: &toml::Value,
     role: LayerRole,
+    layer_path: &Path,
 ) {
     let present = |field: &str| field_present(raw, &["reasoning", field]);
     profile_replaces(
@@ -1233,36 +1378,48 @@ fn merge_reasoning(
         incoming.uia,
         present("uia"),
         role,
+        "reasoning.uia",
+        layer_path,
     );
     profile_replaces(
         &mut trusted.reasoning.root_orchestrator,
         incoming.root_orchestrator,
         present("root_orchestrator"),
         role,
+        "reasoning.root_orchestrator",
+        layer_path,
     );
     profile_replaces(
         &mut trusted.reasoning.root_orchestrator_with_subs,
         incoming.root_orchestrator_with_subs,
         present("root_orchestrator_with_subs"),
         role,
+        "reasoning.root_orchestrator_with_subs",
+        layer_path,
     );
     profile_replaces(
         &mut trusted.reasoning.sub_orchestrator,
         incoming.sub_orchestrator,
         present("sub_orchestrator"),
         role,
+        "reasoning.sub_orchestrator",
+        layer_path,
     );
     profile_replaces(
         &mut trusted.reasoning.worker_complex,
         incoming.worker_complex,
         present("worker_complex"),
         role,
+        "reasoning.worker_complex",
+        layer_path,
     );
     profile_replaces(
         &mut trusted.reasoning.worker_simple,
         incoming.worker_simple,
         present("worker_simple"),
         role,
+        "reasoning.worker_simple",
+        layer_path,
     );
 }
 
@@ -1399,8 +1556,8 @@ pub fn merge_layer_into(
     let mut incoming = incoming;
 
     merge_top_level(trusted, &mut incoming, raw, role, layer_path, &mut out);
-    merge_logging(trusted, incoming.logging, raw, role);
-    merge_tui(trusted, incoming.tui, raw, role);
+    merge_logging(trusted, incoming.logging, raw, role, layer_path);
+    merge_tui(trusted, incoming.tui, raw, role, layer_path);
     merge_session(trusted, incoming.session, raw, role, layer_path, &mut out);
     merge_policy(trusted, incoming.policy, raw, role, layer_path, &mut out);
     merge_mcp_listener(
@@ -1411,9 +1568,9 @@ pub fn merge_layer_into(
         layer_path,
         &mut out,
     );
-    merge_onboarding(trusted, incoming.onboarding, raw, role);
+    merge_onboarding(trusted, incoming.onboarding, raw, role, layer_path);
     merge_tools_plan(trusted, incoming.tools, raw, role, layer_path, &mut out);
-    merge_mode(trusted, incoming.mode, raw, role);
+    merge_mode(trusted, incoming.mode, raw, role, layer_path);
     merge_research(trusted, incoming.research, raw, role, layer_path, &mut out);
     merge_permissions(
         trusted,
@@ -1424,7 +1581,7 @@ pub fn merge_layer_into(
         &mut out,
     );
     merge_sandbox(trusted, incoming.sandbox, raw, role, layer_path, &mut out);
-    merge_internal_models(trusted, incoming.internal_models, raw, role);
+    merge_internal_models(trusted, incoming.internal_models, raw, role, layer_path);
     merge_compaction(
         trusted,
         incoming.compaction,
@@ -1433,7 +1590,7 @@ pub fn merge_layer_into(
         layer_path,
         &mut out,
     );
-    merge_reasoning(trusted, incoming.reasoning, raw, role);
+    merge_reasoning(trusted, incoming.reasoning, raw, role, layer_path);
     merge_guards(trusted, incoming.guards, raw, role, layer_path, &mut out);
 
     // `base_dir`: `#[serde(skip)]`, kein TOML-Feld, kein `FIELD_TABLE`-

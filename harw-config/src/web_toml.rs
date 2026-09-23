@@ -53,6 +53,71 @@ pub struct WebSection {
     /// als `Authorization: Bearer`-Token nicht mehr akzeptiert wird.
     #[serde(default = "default_token_ttl_secs")]
     pub token_ttl_secs: u64,
+    /// `[web.search]` — Backend des Agent-Werkzeugs `web.search`.
+    #[serde(default)]
+    pub search: WebSearchToml,
+}
+
+/// `[web.search]` — Such-Backend für `web.search`.
+///
+/// `provider` ist `duckduckgo` (Default, ohne Schlüssel), `brave`, `tavily`
+/// oder `searxng`. Der API-Schlüssel wird nie in der Datei abgelegt, sondern
+/// aus der Umgebungsvariable `api_key_env` gelesen; `endpoint` ist nur für
+/// SearXNG nötig (Basis-URL der Instanz).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSearchToml {
+    #[serde(default = "default_search_provider")]
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    #[serde(default = "default_search_max_results")]
+    pub max_results: u8,
+}
+
+impl Default for WebSearchToml {
+    fn default() -> Self {
+        Self {
+            provider: default_search_provider(),
+            endpoint: None,
+            api_key_env: None,
+            max_results: default_search_max_results(),
+        }
+    }
+}
+
+impl WebSearchToml {
+    /// Prüft Provider-Namen, Endpoint-Pflicht für SearXNG und die
+    /// Ergebnisobergrenze (1–20).
+    ///
+    /// # Errors
+    /// `Err(String)` mit Begründung.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.provider.as_str() {
+            "duckduckgo" | "brave" | "tavily" => {}
+            "searxng" if self.endpoint.is_some() => {}
+            "searxng" => return Err("web.search.endpoint ist für searxng Pflicht".to_owned()),
+            other => {
+                return Err(format!(
+                    "web.search.provider muss duckduckgo|brave|tavily|searxng sein, gefunden {other:?}"
+                ));
+            }
+        }
+        if !(1..=20).contains(&self.max_results) {
+            return Err("web.search.max_results muss zwischen 1 und 20 liegen".to_owned());
+        }
+        Ok(())
+    }
+}
+
+fn default_search_provider() -> String {
+    "duckduckgo".to_owned()
+}
+
+fn default_search_max_results() -> u8 {
+    8
 }
 
 impl Default for WebSection {
@@ -61,6 +126,7 @@ impl Default for WebSection {
             bind: default_bind(),
             port: 0,
             token_ttl_secs: default_token_ttl_secs(),
+            search: WebSearchToml::default(),
         }
     }
 }
@@ -82,6 +148,7 @@ impl WebSection {
         if self.token_ttl_secs == 0 {
             return Err("web.token_ttl_secs muss größer als 0 sein".to_owned());
         }
+        self.search.validate()?;
         Ok(())
     }
 }

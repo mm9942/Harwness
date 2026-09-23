@@ -23,6 +23,14 @@
 //! `provider`/`model default` wirken immer auf die globale Ebene (Profil),
 //! wie der Onboarding-Wizard.
 //!
+//! # Löschen
+//! `harw settings set <key>` **ohne** Wert löscht den punktgetrennten
+//! Schlüssel aus der Ziel-Ebene (siehe [`unset_value`]). Tabellen auf dem
+//! Pfad, die dadurch leer werden, fallen ebenfalls weg; alle übrigen
+//! Kommentare und Formatierungen bleiben erhalten. Ein nicht gesetzter
+//! Schlüssel ist kein Fehler — es wird nur ein Hinweis gedruckt und nichts
+//! geschrieben.
+//!
 //! # Secrets
 //! `--auth` akzeptiert ausschließlich eine [`harw_config::SecretRef`]
 //! (`env:VAR`, `secrets:NAME`, …); ein Klartext-Wert wird abgelehnt und
@@ -46,7 +54,7 @@ use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use toml_edit::value;
+use toml_edit::{DocumentMut, Item, Table, value};
 
 use harw_config::{ConfigWriter, ProviderToml, RuleKind, RuleToml, SecretRef, SettingScope};
 
@@ -85,8 +93,6 @@ pub enum SettingsError {
     InvalidBaseUrl(String),
     /// `--auth` war ein Klartext-Wert statt einer Secret-Referenz.
     PlaintextAuthRejected { name: String },
-    /// `settings set` ohne Wert (Löschen ist noch nicht implementiert).
-    MissingValue { key: String },
     /// Ein ungültiger Freigabemodus wurde übergeben.
     InvalidMode { mode: String },
     /// Ein Regel-Index lag außerhalb der aktuellen Liste.
@@ -125,10 +131,6 @@ impl fmt::Display for SettingsError {
             Self::PlaintextAuthRejected { name } => write!(
                 f,
                 "--auth für Provider {name:?} muss eine Secret-Referenz sein (env:VAR, secrets:NAME, …), kein Klartext-Schlüssel; benutze `harw auth`, um Credentials sicher abzulegen"
-            ),
-            Self::MissingValue { key } => write!(
-                f,
-                "`harw settings set {key}` benötigt einen Wert; Löschen eines Schlüssels wird derzeit nicht unterstützt"
             ),
             Self::InvalidMode { mode } => write!(
                 f,
@@ -310,7 +312,14 @@ fn run_provider(home: &Path, action: SettingsProviderAction) -> Result<(), Setti
             auth,
             models,
         } => {
-            add_provider(home, &name, api.as_str(), &base_url, auth.as_deref(), models)?;
+            add_provider(
+                home,
+                &name,
+                api.as_str(),
+                &base_url,
+                auth.as_deref(),
+                models,
+            )?;
             print_validation_result(home);
             Ok(())
         }
@@ -547,17 +556,151 @@ fn run_set(
     new_value: Option<String>,
     scope: SettingScope,
 ) -> Result<(), SettingsError> {
-    let Some(new_value) = new_value else {
-        return Err(SettingsError::MissingValue {
-            key: key.to_owned(),
-        });
-    };
     let path = config_path_for_scope(home, scope)?;
+    let Some(new_value) = new_value else {
+        return run_unset(home, key, &path);
+    };
     let mut writer = ConfigWriter::open(&path)?;
     writer.set_value(key, value(new_value.as_str()))?;
     writer.save()?;
     print_validation_result(home);
     Ok(())
+}
+
+/// Ergebnis von [`unset_value`].
+#[derive(Debug, PartialEq, Eq)]
+enum UnsetOutcome {
+    /// Der Schlüssel wurde entfernt; `pruned` nennt die dadurch leer
+    /// gewordenen und ebenfalls entfernten Tabellen (tiefste zuerst,
+    /// punktgetrennt).
+    Removed { pruned: Vec<String> },
+    /// Der Schlüssel war in der Datei nicht gesetzt; nichts wurde geschrieben.
+    NotSet,
+}
+
+/// `harw settings set <key>` ohne Wert: löscht `key` aus `path` und druckt
+/// das Ergebnis. Ein fehlender Schlüssel ist kein Fehler.
+///
+/// # Errors
+/// Siehe [`unset_value`].
+fn run_unset(home: &Path, key: &str, path: &Path) -> Result<(), SettingsError> {
+    match unset_value(path, key)? {
+        UnsetOutcome::NotSet => {
+            println!(
+                "{key} ist in {} nicht gesetzt; nichts zu löschen",
+                path.display()
+            );
+        }
+        UnsetOutcome::Removed { pruned } => {
+            println!("{key} aus {} gelöscht", path.display());
+            for table in &pruned {
+                println!("leere Tabelle [{table}] entfernt");
+            }
+            print_validation_result(home);
+        }
+    }
+    Ok(())
+}
+
+/// Entfernt den punktgetrennten Schlüssel `key` aus der TOML-Datei `path`
+/// und räumt dadurch leer gewordene Eltern-Tabellen auf.
+///
+/// # Description
+/// Geschrieben wird ausschließlich über [`ConfigWriter`] (Kommentare
+/// bleiben erhalten, Backup, atomar, Validierung). Weil
+/// [`ConfigWriter::remove_value`] leere Zwischentabellen bewusst stehen
+/// lässt und das Dokument nicht nach außen reicht, ermittelt diese Funktion
+/// die zu entfernenden Eltern-Tabellen an einer zweiten, nur gelesenen
+/// Kopie des Dokuments (identische Navigation: nur echte Tabellen, keine
+/// Inline-Tabellen — wie `get_value`/`remove_value`) und entfernt sie
+/// danach ebenfalls über den Writer. Aufgeräumt wird von innen nach außen
+/// und nur, solange eine Tabelle wirklich leer ist.
+///
+/// # Returns
+/// [`UnsetOutcome::NotSet`], wenn `key` (oder ein Elternteil davon) fehlt
+/// bzw. ein Elternteil keine Tabelle ist — die Datei bleibt dann unberührt.
+///
+/// # Errors
+/// - [`SettingsError::Io`]: die Datei ist vorhanden, aber nicht lesbar.
+/// - [`SettingsError::Toml`]: die Datei ist kein gültiges TOML.
+/// - [`SettingsError::Config`]: Öffnen, Validieren oder Schreiben über
+///   [`ConfigWriter`] schlug fehl.
+fn unset_value(path: &Path, key: &str) -> Result<UnsetOutcome, SettingsError> {
+    let mut shadow = read_toml_document(path)?;
+    let segments: Vec<&str> = key.split('.').collect();
+    if !remove_from_table(shadow.as_table_mut(), &segments) {
+        return Ok(UnsetOutcome::NotSet);
+    }
+
+    let mut pruned = Vec::new();
+    for depth in (1..segments.len()).rev() {
+        let parent = &segments[..depth];
+        let is_empty = table_at(shadow.as_table(), parent).is_some_and(Table::is_empty);
+        if !is_empty {
+            break;
+        }
+        remove_from_table(shadow.as_table_mut(), parent);
+        pruned.push(parent.join("."));
+    }
+
+    let mut writer = ConfigWriter::open(path)?;
+    if !writer.remove_value(key) {
+        // Die Datei hat sich zwischen den beiden Lesevorgängen geändert;
+        // dann gibt es nichts mehr zu löschen.
+        return Ok(UnsetOutcome::NotSet);
+    }
+    for parent in &pruned {
+        writer.remove_value(parent);
+    }
+    writer.save()?;
+    Ok(UnsetOutcome::Removed { pruned })
+}
+
+/// Liest `path` als formatierungserhaltendes TOML-Dokument; eine fehlende
+/// Datei ergibt ein leeres Dokument (wie [`ConfigWriter::open`]).
+///
+/// # Errors
+/// [`SettingsError::Io`] bei Lesefehlern außer „nicht gefunden“,
+/// [`SettingsError::Toml`] bei ungültigem TOML.
+fn read_toml_document(path: &Path) -> Result<DocumentMut, SettingsError> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DocumentMut::new());
+        }
+        Err(source) => {
+            return Err(SettingsError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    content
+        .parse::<DocumentMut>()
+        .map_err(|error| SettingsError::Toml {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        })
+}
+
+/// Navigiert über echte Tabellen (keine Inline-Tabellen) zu `segments`.
+fn table_at<'a>(table: &'a Table, segments: &[&str]) -> Option<&'a Table> {
+    segments.iter().try_fold(table, |current, segment| {
+        current.get(segment).and_then(Item::as_table)
+    })
+}
+
+/// Entfernt das Element unter `segments`; `true`, wenn es existierte.
+/// Spiegelt die Navigation von [`ConfigWriter::remove_value`].
+fn remove_from_table(table: &mut Table, segments: &[&str]) -> bool {
+    match segments {
+        [] => false,
+        [key] => table.remove(key).is_some(),
+        [key, rest @ ..] => table
+            .get_mut(key)
+            .and_then(Item::as_table_mut)
+            .is_some_and(|child| remove_from_table(child, rest)),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1252,16 +1395,131 @@ mod tests {
         Ok(())
     }
 
+    /// Schreibt `content` als globale Config und liefert deren Pfad.
+    fn write_global_config(home: &Path, content: &str) -> TestResult<PathBuf> {
+        let path = global_config_path(home).map_err(ctx("global config path"))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(ctx("create profile dir"))?;
+        }
+        std::fs::write(&path, content).map_err(ctx("write config"))?;
+        Ok(path)
+    }
+
     #[test]
-    fn test_set_without_value_is_rejected() -> TestResult {
+    fn test_set_without_value_deletes_key() -> TestResult {
         let (_guard, home) = temp_home()?;
-        let result = run_set(&home, "policy_profile", None, SettingScope::Global);
-        let Err(error) = result else {
-            return Err(TestError::Unexpected(
-                "missing value must be rejected".into(),
-            ));
-        };
-        assert!(matches!(error, SettingsError::MissingValue { .. }));
+        run_set(
+            &home,
+            "policy_profile",
+            Some("strict".to_owned()),
+            SettingScope::Global,
+        )
+        .map_err(ctx("set key"))?;
+        run_set(&home, "policy_profile", None, SettingScope::Global).map_err(ctx("unset key"))?;
+
+        let path = global_config_path(&home).map_err(ctx("global config path"))?;
+        let writer = ConfigWriter::open(&path).map_err(ctx("reopen"))?;
+        assert_eq!(writer.get_value("policy_profile"), None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_unset_prunes_empty_parents_and_keeps_comments() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        let path = write_global_config(
+            &home,
+            "# Kopfkommentar bleibt\n\
+             policy_profile = \"strict\" # Zeilenkommentar bleibt\n\
+             \n\
+             [session]\n\
+             title_model = \"m1\"\n\
+             \n\
+             [outer]\n\
+             # Kommentar an keep\n\
+             keep = 1\n\
+             \n\
+             [outer.inner.deep]\n\
+             x = 1\n",
+        )?;
+
+        let outcome = unset_value(&path, "outer.inner.deep.x").map_err(ctx("unset deep"))?;
+        assert_eq!(
+            outcome,
+            UnsetOutcome::Removed {
+                pruned: vec!["outer.inner.deep".to_owned(), "outer.inner".to_owned()],
+            }
+        );
+        let outcome = unset_value(&path, "session.title_model").map_err(ctx("unset session"))?;
+        assert_eq!(
+            outcome,
+            UnsetOutcome::Removed {
+                pruned: vec!["session".to_owned()],
+            }
+        );
+
+        let content = std::fs::read_to_string(&path).map_err(ctx("read back"))?;
+        assert!(content.contains("# Kopfkommentar bleibt"), "{content}");
+        assert!(content.contains("# Zeilenkommentar bleibt"), "{content}");
+        assert!(content.contains("# Kommentar an keep"), "{content}");
+        assert!(content.contains("[outer]"), "{content}");
+        assert!(!content.contains("[outer.inner"), "{content}");
+        assert!(!content.contains("[session]"), "{content}");
+
+        let writer = ConfigWriter::open(&path).map_err(ctx("reopen"))?;
+        assert_eq!(writer.get_value("outer.keep"), Some("1".to_owned()));
+        assert_eq!(
+            writer.get_value("policy_profile"),
+            Some("strict".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_unset_prunes_dotted_key_parents() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        let path = write_global_config(&home, "a.b.c = 1\nother = 2\n")?;
+        let outcome = unset_value(&path, "a.b.c").map_err(ctx("unset dotted"))?;
+        assert_eq!(
+            outcome,
+            UnsetOutcome::Removed {
+                pruned: vec!["a.b".to_owned(), "a".to_owned()],
+            }
+        );
+        let content = std::fs::read_to_string(&path).map_err(ctx("read back"))?;
+        assert_eq!(content.trim(), "other = 2");
+        Ok(())
+    }
+
+    #[test]
+    fn test_unset_missing_key_is_not_an_error_and_leaves_file_untouched() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        let original = "# Kommentar\npolicy_profile = \"strict\"\n\n[session]\n";
+        let path = write_global_config(&home, original)?;
+
+        for key in [
+            "missing",
+            "session.missing",
+            "nowhere.at.all",
+            "policy_profile.child",
+            "",
+        ] {
+            let outcome = unset_value(&path, key).map_err(ctx("unset missing"))?;
+            assert_eq!(outcome, UnsetOutcome::NotSet, "key {key:?}");
+        }
+        run_set(&home, "missing", None, SettingScope::Global).map_err(ctx("run_set unset"))?;
+
+        let content = std::fs::read_to_string(&path).map_err(ctx("read back"))?;
+        assert_eq!(content, original);
+        Ok(())
+    }
+
+    #[test]
+    fn test_unset_without_config_file_is_not_set() -> TestResult {
+        let (_guard, home) = temp_home()?;
+        let path = home.join("nirgends").join("config.toml");
+        let outcome = unset_value(&path, "policy_profile").map_err(ctx("unset"))?;
+        assert_eq!(outcome, UnsetOutcome::NotSet);
+        assert!(!path.exists());
         Ok(())
     }
 

@@ -72,6 +72,24 @@ pub struct BrowserSection {
     /// [`Self::geckodriver_path`] erwarteten Binarys.
     #[serde(default)]
     pub geckodriver_sha256: Option<String>,
+    /// Rollen, deren Sitzungen die `browser.*`-Werkzeuge bekommen (nur bei
+    /// `enabled = true`). `root` steht für die Wurzel-/UIA-Sitzung, sonst
+    /// Rollennamen wie `uia-worker`, `explorer`, `uia-explorer`. Default:
+    /// nur `uia-worker` (bisheriges Verhalten).
+    #[serde(default = "default_browser_roles")]
+    pub roles: Vec<String>,
+}
+
+fn default_browser_roles() -> Vec<String> {
+    vec!["uia-worker".to_owned()]
+}
+
+impl BrowserSection {
+    /// `true`, wenn `role` die Browser-Werkzeuge bekommen soll.
+    #[must_use]
+    pub fn grants_role(&self, role: &str) -> bool {
+        self.enabled && self.roles.iter().any(|r| r == role)
+    }
 }
 
 impl Default for BrowserSection {
@@ -82,6 +100,7 @@ impl Default for BrowserSection {
             max_actions: default_max_actions(),
             geckodriver_path: None,
             geckodriver_sha256: None,
+            roles: default_browser_roles(),
         }
     }
 }

@@ -43,10 +43,6 @@ pub enum SessionStoreError {
     #[msg("transcript session id component is unsafe for filesystem storage: '{0}'")]
     UnsafeTranscriptPath(String),
 
-    /// A skeleton code path whose durable-I/O body is not yet wired.
-    #[msg("session-store operation not yet implemented: {0}")]
-    NotYetImplemented(String),
-
     #[msg("approval '{request}' already exists for session '{session}'")]
     ApprovalAlreadyExists { session: SessionId, request: ItemId },
 

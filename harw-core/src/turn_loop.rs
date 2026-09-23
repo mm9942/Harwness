@@ -1634,6 +1634,7 @@ fn notify_tool_outcome(
     arguments: &serde_json::Value,
     result: &ToolCallResult,
 ) {
+    emit_plan_update(session, tool_name, arguments, result);
     let Some(observer) = session.tool_outcome_observer().cloned() else {
         return;
     };
@@ -1645,6 +1646,55 @@ fn notify_tool_outcome(
             arguments,
             status,
             output_text: &output_text,
+        },
+    );
+}
+
+/// Meldet [`TurnEvent::PlanUpdated`] nach einem erfolgreichen Aufruf des
+/// Plan-Werkzeugs (Operation `plan` als Modell-Tool). Plan-ID
+/// und Revision stammen aus dem Ergebnis, sofern es sie trägt, sonst aus den
+/// Argumenten; die Zusammenfassung ist die ausgeführte Aktion.
+fn emit_plan_update(
+    session: &AgentSession,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    result: &ToolCallResult,
+) {
+    let is_plan_tool = tool_name == "plan";
+    let ToolCallResult::Success { value } = result else {
+        return;
+    };
+    if !is_plan_tool {
+        return;
+    }
+    let lookup = |key: &str| {
+        value
+            .get(key)
+            .or_else(|| value.get("data").and_then(|data| data.get(key)))
+            .or_else(|| arguments.get(key))
+    };
+    let plan_id = lookup("plan_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("current")
+        .to_owned();
+    let revision = lookup("revision")
+        .and_then(|rev| {
+            rev.as_u64()
+                .or_else(|| rev.as_str().and_then(|text| text.parse().ok()))
+        })
+        .unwrap_or(0);
+    let summary = arguments
+        .get("action")
+        .or_else(|| arguments.get("command"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Plan aktualisiert")
+        .to_owned();
+    emit(
+        session,
+        TurnEvent::PlanUpdated {
+            plan_id,
+            revision,
+            summary,
         },
     );
 }
@@ -1956,7 +2006,16 @@ async fn run_turn_with_approvals(
     // `resume_after_approval` ihn nach einer Handoff-/Rückfrage-Pause
     // zurücklesen können, statt sich einen frischen, unbegrenzten Block zu
     // bauen.
-    let control = input.control.clone();
+    // Ein Aufrufer ohne eigene Grenzen (TUI, Gateway: `TurnControl::new()`)
+    // bekommt die Vorgabe-Grenzen der Session (aus dem Budget des Laufs,
+    // `AgentSession::with_default_turn_limits`); explizit gesetzte Grenzen
+    // haben Vorrang.
+    let control = match session.default_turn_limits() {
+        Some(limits) if *input.control.limits() == TurnLimits::unlimited() => {
+            input.control.clone().with_limits(limits)
+        }
+        _ => input.control.clone(),
+    };
     session.set_active_turn_control(control.clone());
 
     // Outer span covering the entire turn's lifecycle.
@@ -2067,6 +2126,13 @@ fn transition_after_turn_failure(
     } else {
         session.fail(error.to_string());
     }
+
+    // Der Fehler wird Teil des Verlaufs (sichtbar in Export/Resume) und
+    // zusätzlich als Session-Ereignis gemeldet.
+    session
+        .history_mut()
+        .push_error(error.to_string(), retryable);
+    session.report_error(error.to_string(), retryable);
 
     emit(
         session,

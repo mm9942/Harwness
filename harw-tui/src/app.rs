@@ -599,6 +599,9 @@ pub enum TuiRunOutcome {
     /// The active terminal must list or resolve a durable session. `None`
     /// represents `/resume` without an argument.
     Resume { selector: Option<String> },
+    /// `/new`: eine frische Sitzung beginnen (die aktuelle bleibt gespeichert
+    /// und ist per `/resume` erreichbar).
+    NewSession,
 }
 
 /// Resolves the durable sessions that can be selected from the local TUI.
@@ -921,6 +924,9 @@ pub struct ChatApp {
     live_reasoning: String,
     /// Sichtbarkeit und Fokus der Seitenpanels.
     panels: crate::panes::PanelState,
+    /// Explorer-Panel über den gesamten Projektbaum; beim ersten Einblenden
+    /// angelegt und im Hintergrund indiziert.
+    explorer: Option<crate::explorer_panel::ExplorerPanel>,
     /// `/`-Command-Adapter, gebaut aus der `OperationRegistry`
     /// (`CommandAdapter::from_operation` pro registrierter Op). Treibt die
     /// echte Ausführung von `/command`-Zeilen (siehe [`Self::adapters`]).
@@ -1215,6 +1221,7 @@ impl ChatApp {
             live_stream: String::new(),
             live_reasoning: String::new(),
             panels: crate::panes::PanelState::default(),
+            explorer: None,
             adapters,
             sandbox,
             session_id,
@@ -2056,10 +2063,10 @@ impl ChatApp {
     /// Leert den Live-Bus nicht-blockierend in den [`crate::agent_monitor::AgentMonitor`].
     /// Liefert `true`, wenn sich Sichtbares geändert hat.
     pub(crate) fn drain_agent_events(&mut self) -> bool {
+        let mut changed = self.poll_explorer();
         let Some(rx) = self.agent_rx.as_mut() else {
-            return false;
+            return changed;
         };
-        let mut changed = false;
         loop {
             match rx.try_recv() {
                 Ok(event) => changed |= self.agent_monitor.apply(&event),
@@ -2074,6 +2081,29 @@ impl ChatApp {
             }
         }
         changed
+    }
+
+    /// Legt das Explorer-Panel beim ersten Einblenden an und startet die
+    /// Hintergrund-Indizierung ab der Projektwurzel (sonst ab dem cwd).
+    fn ensure_explorer(&mut self) {
+        if self.explorer.is_some() || !self.panels.explorer_visible {
+            return;
+        }
+        let root = if self.project_root.is_empty() {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        } else {
+            std::path::PathBuf::from(&self.project_root)
+        };
+        let mut panel = crate::explorer_panel::ExplorerPanel::new(root);
+        panel.start_indexing();
+        self.explorer = Some(panel);
+    }
+
+    /// Übernimmt einen fertigen Explorer-Index (nicht-blockierend).
+    fn poll_explorer(&mut self) -> bool {
+        self.explorer
+            .as_mut()
+            .is_some_and(crate::explorer_panel::ExplorerPanel::poll)
     }
 
     /// Verwirft den transienten Streaming-Text (finale Zelle liegt vor).
@@ -2520,8 +2550,10 @@ impl Drop for TerminalGuard {
 
 fn resume_request(raw: &str) -> Option<TuiRunOutcome> {
     let mut words = raw.split_whitespace();
-    if words.next()? != "/resume" {
-        return None;
+    match words.next()? {
+        "/new" => return Some(TuiRunOutcome::NewSession),
+        "/resume" => {}
+        _ => return None,
     }
     match words.next() {
         None => Some(TuiRunOutcome::Resume { selector: None }),
@@ -4943,7 +4975,10 @@ fn handle_panel_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
     }
     match app.panels.handle_key(key) {
         crate::panes::PanelKey::Ignored => None,
-        crate::panes::PanelKey::Changed => Some(true),
+        crate::panes::PanelKey::Changed => {
+            app.ensure_explorer();
+            Some(true)
+        }
         crate::panes::PanelKey::ForFocused(key) => Some(match app.panels.focus {
             crate::panes::PaneFocus::Agents => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -6926,19 +6961,16 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
     }
 }
 
-/// Enthüllt die Antwort simuliert gestreamt, zeilenweise via [`StreamCollector`].
+/// Übernimmt die finale Antwort als Zelle.
 ///
 /// # Beschreibung
-/// Da [`harw_core::ModelProvider`] keine Token-Deltas liefert, wird der Volltext hier in
-/// kleinen Häppchen ([`REVEAL_CHUNK_CHARS`]) durch einen [`StreamCollector`]
-/// geschoben. Sobald eine vollständige Zeile vorliegt, wird sie als
-/// [`AssistantHistoryCell`] in `app.cells` gepusht und ein Frame gezeichnet.
-/// Am Ende wird der verbleibende Rest (ohne abschließendes `\n`) ausgeliefert.
-/// Die vollständige Antwort wird abschließend in [`ChatApp::push_line`] übernommen.
+/// Der Text wurde (bei streamenden Providern) bereits live als transiente
+/// Vorschau gezeigt (`ChatApp::live_stream`); hier wird er durch genau eine
+/// finale [`AssistantHistoryCell`] ersetzt und ein Frame gezeichnet.
 ///
 /// # Argumente
 /// - `guard` (`&mut TerminalGuard`): Terminal-Guard zum Zeichnen der Frames.
-/// - `app` (`&mut ChatApp`): Chat-Zustand; erhält die Stream-Fragmente und die finale Zelle.
+/// - `app` (`&mut ChatApp`): Chat-Zustand; erhält die finale Zelle.
 /// - `reply` (`&str`): die vollständige Modell-Antwort.
 ///
 /// # Fehler
@@ -6958,26 +6990,52 @@ async fn reveal_reply(
 }
 
 /// Tasten für das fokussierte Explorer-Panel.
-fn handle_explorer_key(_app: &mut ChatApp, _key: KeyEvent) -> bool {
-    false
+fn handle_explorer_key(app: &mut ChatApp, key: KeyEvent) -> bool {
+    use crate::explorer_panel::ExplorerAction;
+    app.ensure_explorer();
+    let Some(panel) = app.explorer.as_mut() else {
+        return false;
+    };
+    match panel.handle_key(key) {
+        ExplorerAction::None => {
+            // Esc ohne offenen Filter/Vorschau gibt den Fokus an den Chat.
+            if key.code == KeyCode::Esc {
+                app.panels.focus = crate::panes::PaneFocus::Chat;
+                app.panels.maximized = false;
+                return true;
+            }
+            false
+        }
+        ExplorerAction::Redraw | ExplorerAction::Rebuild => true,
+        ExplorerAction::InsertPath(path) => {
+            let needs_space = !app.input.is_empty()
+                && !app.input.text().ends_with(char::is_whitespace);
+            if needs_space {
+                app.input.insert_str(" ");
+            }
+            app.input.insert_str(&format!("@{path} "));
+            app.panels.focus = crate::panes::PaneFocus::Chat;
+            app.panels.maximized = false;
+            true
+        }
+    }
 }
 
 /// Zeichnet das Explorer-Panel.
 fn render_explorer_panel(
-    _app: &ChatApp,
+    app: &ChatApp,
     area: Rect,
     buf: &mut ratatui::buffer::Buffer,
     theme: style::Theme,
 ) {
-    use ratatui::widgets::{Block, Borders, Widget};
-    Paragraph::new(Line::styled("Explorer wird indiziert…", style::dim_style(theme)))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(style::border_color(theme)))
-                .title(" Explorer "),
-        )
-        .render(area, buf);
+    if let Some(panel) = &app.explorer {
+        panel.render(
+            area,
+            buf,
+            theme,
+            app.panels.focus == crate::panes::PaneFocus::Explorer,
+        );
+    }
 }
 
 /// Zeichnet die Fullscreen-Viewport: scrollbare History oben und Eingabebox unten.
@@ -7124,6 +7182,15 @@ fn render_viewport(
             )
         })
         .unwrap_or_default();
+    let explorer_suffix = if app
+        .explorer
+        .as_ref()
+        .is_some_and(crate::explorer_panel::ExplorerPanel::is_indexing)
+    {
+        " | Explorer indiziert…"
+    } else {
+        ""
+    };
     let agents_suffix = match app.agent_monitor.active_count() {
         0 | 1 => String::new(),
         n => format!(" | {n} Agenten aktiv"),
@@ -7198,7 +7265,7 @@ fn render_viewport(
         .map(|_| " · Freigabemodus wird nach dem Turn übernommen")
         .unwrap_or("");
     let status = format!(
-        " {spinner_prefix}Shift+Tab: {permission} | Modus: {} | Σ Tokens: {} (in {}, out {}{cache_suffix}){context_suffix}{agents_suffix}{cancel_suffix}{queue_cleared_suffix}{quit_suffix}{queue_suffix}{tool_suffix}{pending_permission_suffix}",
+        " {spinner_prefix}Shift+Tab: {permission} | Modus: {} | Σ Tokens: {} (in {}, out {}{cache_suffix}){context_suffix}{agents_suffix}{explorer_suffix}{cancel_suffix}{queue_cleared_suffix}{quit_suffix}{queue_suffix}{tool_suffix}{pending_permission_suffix}",
         app.active_mode().as_str(),
         crate::agent_monitor::human_tokens(usage.total()),
         crate::agent_monitor::human_tokens(usage.prompt_tokens()),
@@ -8921,6 +8988,8 @@ forbidden = [{forbidden}]
         );
         assert_eq!(resume_request("/resume too many"), None);
         assert_eq!(resume_request("/resume-other"), None);
+        assert_eq!(resume_request("/new"), Some(TuiRunOutcome::NewSession));
+        assert_eq!(resume_request("/news"), None);
         Ok(())
     }
 

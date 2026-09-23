@@ -47,6 +47,11 @@ admitted = [
   "fs.grep",
   "doc.read_pdf",
   "web.fetch",
+  "explore.tree",
+  "explore.projects",
+  "explore.relations",
+  "explore.find",
+  "web.search",
 ]
 forbidden = [
   "fs.write",

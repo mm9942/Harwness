@@ -741,7 +741,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                 slot: Arc::clone(&self.spawner_slot),
             }));
         #[cfg(feature = "browser")]
-        if role == role_names::UIA_WORKER {
+        if self.browser.grants_role(role) {
             let browser_provider =
                 harw_registry_defaults::profile::browser_tool_provider_for_config(&self.browser)
                     .map_err(|error| AgentSpawnError {

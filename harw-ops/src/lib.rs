@@ -125,9 +125,10 @@
 //!    labeln) noch ein pauschales `approval` auf die lesenden Sub-Kommandos
 //!    (unnötige Bestätigungspflicht) ist korrekt, ohne die Operation in
 //!    getrennte Surfaces aufzuteilen — das liegt außerhalb dieses Knotens.
-//! 5. **Ausschluss bei fail-closed-Stubs.** Operationen, die heute für jede
-//!    Aktion `OpError::NotAvailable` liefern (`new`, `skills`, `plugins`,
-//!    `compact`), bekommen keine Web-Fläche — es gäbe nichts zu bedienen.
+//! 5. **Ausschluss bei sitzungsgebundenen bzw. dateiändernden Operationen.**
+//!    `new` und `compact` wirken auf die lebende TUI-Sitzung, `skills` und
+//!    `plugins` lesen bzw. ändern Manifeste auf der Platte — beides hat
+//!    (noch) keine sinnvolle, getrennte Web-Fläche.
 //! 6. **Ausschluss bei Selbstautoritäts-Operationen.** `mode`, `model`,
 //!    `provider` und `effort` verweigern bewusst schon die `ModelTool`-Fläche,
 //!    weil das laufende Sprachmodell seine eigene Steuerung nicht selbst

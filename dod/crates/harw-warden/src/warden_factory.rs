@@ -14,9 +14,10 @@
 //!   eigene [`harw_dod_warden::CgroupV2Executor`]-Instanz (echte
 //!   Dateisystemschreibzugriffe auf `cgroup_root`, siehe dessen
 //!   Moduldoku).
-//! - `IsolateNetwork` läuft über [`crate::isolation::UnimplementedNetworkIsolator`]
-//!   (siehe dessen Moduldoku für die Begründung, warum kein echtes Backend
-//!   existiert).
+//! - `IsolateNetwork` läuft über [`crate::isolation::NftNetworkIsolator`]
+//!   (nftables-Tabelle `inet harw_warden`, je cgroup eigene Ein-/Ausgangs-
+//!   Chains; `ReleaseCgroup` hebt die Isolation wieder auf). Braucht
+//!   `CAP_NET_ADMIN` und `nft` ≥ 0.9.4.
 //! - Das Audit-Ziel ist [`crate::audit::TracingAuditSink`] (siehe dessen
 //!   Moduldoku für die Begründung, warum dieses Binary es liefern muss).
 
@@ -25,7 +26,7 @@ use std::path::Path;
 use harw_dod_warden::{CgroupV2Executor, Warden};
 
 use crate::audit::TracingAuditSink;
-use crate::isolation::UnimplementedNetworkIsolator;
+use crate::isolation::NftNetworkIsolator;
 
 /// Baut den produktiven Warden für das gegebene cgroup-v2-Wurzelverzeichnis.
 ///
@@ -47,7 +48,7 @@ pub fn build_production_warden(cgroup_root: &Path) -> Warden {
     Warden::new(
         CgroupV2Executor::new(cgroup_root),
         CgroupV2Executor::new(cgroup_root),
-        UnimplementedNetworkIsolator::new(),
+        NftNetworkIsolator::from_cgroup_root(cgroup_root),
         CgroupV2Executor::new(cgroup_root),
         TracingAuditSink::new(),
     )

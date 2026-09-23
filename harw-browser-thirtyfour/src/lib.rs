@@ -12,8 +12,20 @@
 //! sandbox whose only egress is the `harw-netns-relay` SOCKS relay
 //! ([`firefox_prefs`]). Every action, navigation, wait, find and observation is
 //! followed by an origin check of all open windows; a breach aborts the session.
-//! The event journal is bounded by entries and bytes ([`journal`]). File upload
-//! and model-supplied script waits are not implemented.
+//! The event journal is bounded by entries and bytes ([`journal`]).
+//!
+//! Out of scope by contract, not by omission: the `harw-browser` vocabulary
+//! has no upload action (`BrowserAction` has no `Upload` variant; remediation
+//! F-007) and no script-predicate wait (`WaitCondition` has no `CustomScript`
+//! variant; F-008). Its policy has no upload/workspace root either
+//! (`OpenBrowserRequest` rejects `upload_root`). This adapter therefore never
+//! reads local files for a page and never evaluates model-supplied JavaScript.
+//! `WaitCondition::ScriptMessage` only listens on a page-bridge channel; like
+//! the other BiDi-event waits (network quiescence, request observed, log
+//! match, download complete) it currently returns
+//! `Error::CapabilityUnavailable` until the normalized BiDi event wait
+//! pipeline exists. Element, URL, title and navigation-complete waits are
+//! implemented.
 
 mod element_actions;
 mod wait_navigation;

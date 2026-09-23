@@ -96,7 +96,9 @@ impl PanelState {
                 self.maximized = !self.maximized;
                 PanelKey::Changed
             }
-            KeyCode::Esc if self.focus != PaneFocus::Chat => {
+            // Im Explorer gehört Esc zuerst dem Panel (Filter/Vorschau
+            // schließen); das Panel gibt den Fokus selbst zurück.
+            KeyCode::Esc if self.focus == PaneFocus::Agents => {
                 self.focus = PaneFocus::Chat;
                 self.maximized = false;
                 PanelKey::Changed

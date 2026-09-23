@@ -11,6 +11,7 @@ harw-agent-dsl = { path = "../harw-agent-dsl" }
 harw-catalog = { path = "../harw-catalog" }
 harw-config = { path = "../harw-config" }
 harw-core = { path = "../harw-core" }
+harw-explorer = { path = "../harw-explorer" }
 harw-context = { path = "../harw-context" }
 harw-lens-types = { path = "../harw-lens-types" }
 harw-extension-api = { path = "../harw-extension-api" }

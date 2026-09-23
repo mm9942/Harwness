@@ -137,7 +137,8 @@ use crate::trace::new_root_trace;
 /// Aus [`RootBudget::max_model_rounds`] allein folgt keine Obergrenze für
 /// Werkzeugaufrufe: eine Runde darf mehrere Aufrufe parallel enthalten
 /// (`harw-core/src/turn_loop.rs`, Parallelpfad). Der Faktor ist bewusst
-/// konservativ und dokumentiert; die **Durchsetzung** folgt in Welle W4a.
+/// konservativ und dokumentiert; durchgesetzt wird er im Turn-Loop über
+/// [`TurnLimits::to_core`].
 const TOOL_CALLS_PER_ROUND: u32 = 8;
 
 /// Obergrenze eines einzelnen gerenderten Werkzeugergebnisses in Bytes.
@@ -166,9 +167,8 @@ const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
 /// `harw-core` kennt heute keinen solchen Typ (`grep TurnLimits` über den
 /// Workspace ist leer), deshalb steht er hier. Er ist **reine Ableitung**:
 /// jedes Feld folgt aus dem Budget des Laufs oder aus einer dokumentierten
-/// Konstante dieses Moduls. Die Durchsetzung (Abbruch bei Überschreitung)
-/// gehört in den Turn-Loop und folgt in Welle W4a; bis dahin ist dieser Typ
-/// der eine Ort, an dem die Zahlen stehen, statt fünf verstreuter Literale.
+/// Konstante dieses Moduls. Durchgesetzt werden die Werte im Turn-Loop von
+/// `harw-core` ([`Self::to_core`], als Vorgabe-Grenzen der Wurzelsitzung).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TurnLimits {
     /// Maximale Anzahl Modell-Runden eines Turns.
@@ -184,6 +184,18 @@ pub struct TurnLimits {
 }
 
 impl TurnLimits {
+    /// Die durchsetzbare Form für den Turn-Loop von `harw-core`.
+    #[must_use]
+    pub const fn to_core(&self) -> harw_core::turn_loop::TurnLimits {
+        harw_core::turn_loop::TurnLimits {
+            max_model_rounds: self.max_model_rounds,
+            max_tool_calls: self.max_tool_calls,
+            max_output_tokens_total: self.max_output_tokens_total,
+            wall_time: self.wall_time,
+            tool_result_max_bytes: self.tool_result_max_bytes,
+        }
+    }
+
     /// Leitet die Turn-Grenzwerte aus dem Budget des Laufs ab.
     ///
     /// # Argumente
@@ -1430,6 +1442,17 @@ impl RuntimeAssemblyBuilder {
         // 1. Konfiguration mit Vertrauensbericht.
         let (config, trust_report) = load_config(&spec)?;
         let config = Arc::new(config);
+        // Netz-Werkzeuge (web.fetch/web.search/…) einmal je Prozess mit der
+        // Egress-Policy aus `[network]`/`[research]` und dem Such-Backend aus
+        // `[web.search]` einrichten — ohne das scheitert jeder Abruf mit
+        // `NotConfigured`. Ein ungültiger Host-Eintrag deaktiviert nur das
+        // Netz (Warnung), nicht die ganze Sitzung.
+        if let Ok(home) = harw_home::home_dir()
+            && let Err(error) =
+                harw_registry_defaults::install_web_tools(&config, &harw_home::cache_dir(&home))
+        {
+            tracing::warn!(%error, "runtime.web_tools_not_configured");
+        }
 
         // 2. Projekterkennung — genau einmal je Lauf.
         let project =
@@ -3476,7 +3499,7 @@ impl RuntimeAssembly {
             memory: None,
             session_controller: None,
             session_events: None,
-            contributors: Vec::new(),
+            contributors: crate::contributors::default_contributors(),
             root_session_id: None,
             secret_resolver: None,
             narrowing: None,
@@ -3979,6 +4002,9 @@ impl RuntimeAssembly {
                 .with_turn_event_sink(turn_events)
                 .with_agent_events(self.agent_events.clone())
                 .with_context_budget(context_budget_for_window(&self.config, context_window))
+                // Die aus dem Budget abgeleiteten Turn-Grenzen werden jetzt
+                // tatsächlich im Turn-Loop durchgesetzt.
+                .with_default_turn_limits(self.turn_limits.to_core())
                 .with_context_window_resolver({
                     let config = Arc::clone(&self.config);
                     Arc::new(move |model: Option<&str>| {
@@ -4040,6 +4066,9 @@ impl RuntimeAssembly {
             context_window = context_window,
             "runtime.root_session.created"
         );
+        // `SessionConfigured` an alle Beobachter (TUI übernimmt das Modell
+        // für den Export).
+        session.announce_configured();
 
         Ok(RootSession {
             session,

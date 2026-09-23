@@ -38,7 +38,6 @@
 //! [`ModelSwitchPicker::on_key`] aufruft und `PickerAction::Accept` je nach
 //! [`ModelSwitchPicker::target`] in `/model switch …`- bzw.
 //! `/uia model …`-Befehle übersetzt.
-#![allow(dead_code)]
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{buffer::Buffer, layout::Rect};
@@ -284,7 +283,7 @@ impl ModelSwitchPicker {
     /// wurde.
     ///
     /// # Rückgabe
-    /// Referenz auf [`PickerTarget`], u. a. damit der spätere
+    /// Referenz auf [`PickerTarget`], u. a. damit der
     /// `app.rs`-Umsetzer bei `Accept` unterscheiden kann, welches Modell
     /// (Orchestrator/UIA/UIA-Worker) tatsächlich umgeschaltet werden soll.
     #[must_use]

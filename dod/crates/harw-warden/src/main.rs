@@ -12,7 +12,7 @@
 //! Autorisierungsentscheidung, es verdrahtet nur Transport, Startreihenfolge
 //! und die beiden produktiven Implementierungen, die die Bibliothek
 //! bewusst nicht selbst mitbringt ([`audit::TracingAuditSink`],
-//! [`isolation::UnimplementedNetworkIsolator`]).
+//! [`isolation::NftNetworkIsolator`]).
 //!
 //! # Abhängigkeitsbudget (K53)
 //! Das Plan-Dokument setzt für den gesamten Warden-Teilbaum eine Obergrenze
@@ -101,9 +101,9 @@
 //!
 //! # Kein Netz
 //! Dieses Binary öffnet keinen TCP-Socket, macht keine DNS-Auflösung und
-//! nimmt keine Netz-Crate auf. [`isolation::UnimplementedNetworkIsolator`]
-//! baut die von der Bibliothek bewusst ausgelassene `NetworkIsolator`-
-//! Implementierung nicht nach (siehe dessen Moduldoku).
+//! nimmt keine Netz-Crate auf. [`isolation::NftNetworkIsolator`] isoliert
+//! cgroups ausschließlich über das lokale `nft`-Binary (nftables), ohne
+//! selbst Netzverkehr zu erzeugen.
 //!
 //! # Audit vor jedem Fehlerpfad — auch hier durchgesetzt, nicht umgangen
 //! `Warden::handle` schreibt einen Audit-Eintrag vor jedem Ausführungs-
@@ -323,7 +323,7 @@ mod tests {
     // `systemd::verify_listen_pid`/`verify_listen_fds_count` in
     // `systemd.rs`, `warden_factory::build_production_warden` gegen den
     // echten `Warden` in `warden_factory.rs`, `protocol::WardenRequestEnvelope`
-    // in `protocol.rs`, `audit::TracingAuditSink`/`isolation::UnimplementedNetworkIsolator`
+    // in `protocol.rs`, `audit::TracingAuditSink`/`isolation::NftNetworkIsolator`
     // in ihren eigenen Modulen. `landlock::enforce_cgroup_root` bleibt wie
     // bei `harw-sentinel`/`harw-probe-fs` ungetestet (siehe dessen
     // Moduldoku).

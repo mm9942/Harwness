@@ -49,10 +49,6 @@ pub enum JobRuntimeError {
         actual: JobState,
     },
 
-    /// A code path awaiting the async scheduler/executor is not built yet.
-    #[msg("not yet implemented: {0}")]
-    NotYetImplemented(String),
-
     /// Timestamp arithmetic overflowed the representable `jiff` range.
     #[from]
     Time(jiff::Error),

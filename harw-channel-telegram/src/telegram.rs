@@ -19,7 +19,7 @@ use crate::{
 };
 
 const UNPAIRED_TENANT: &str = "harw:unpaired";
-const INGRESS_UNAVAILABLE_MESSAGE: &str = "Telegram ingress is not configured";
+const INGRESS_UNAVAILABLE_MESSAGE: &str = "Telegram ingress is not configured, already running, or its sink/lock is gone";
 const CHANNEL_MISMATCH_REASON: &str = "inbound event channel does not match Telegram binding";
 /// Sliding-window width for `max_updates_per_peer_per_min` (§3.5) and for the
 /// "at most one throttle notice per window" de-duplication.
@@ -614,9 +614,10 @@ impl From<TelegramChannelError> for ChannelError {
                 channel: actual,
                 reason: CHANNEL_MISMATCH_REASON.to_owned(),
             },
-            TelegramChannelError::IngressUnavailable => {
-                ChannelError::NotYetImplemented(INGRESS_UNAVAILABLE_MESSAGE.to_owned())
-            }
+            TelegramChannelError::IngressUnavailable => ChannelError::IngressUnavailable {
+                channel: harw_types::ChannelId::from_str("telegram"),
+                reason: INGRESS_UNAVAILABLE_MESSAGE.to_owned(),
+            },
             TelegramChannelError::UnpairedPeer { peer } => ChannelError::Unpaired {
                 // This legacy error variant predates channel context. Keep
                 // the conversion typed and fail closed rather than claiming
@@ -627,7 +628,7 @@ impl From<TelegramChannelError> for ChannelError {
             // The work-request variants below likewise predate a channel-id
             // field (they are surfaced directly to a Telegram reply by
             // `harw-cli/src/gateway.rs`, not through this admission-pipeline
-            // conversion); folded into `AdmissionDenied`/`NotYetImplemented`
+            // conversion); folded into `AdmissionDenied`/`OperationUnsupported`
             // with the same "telegram" placeholder channel used above so this
             // match stays exhaustive without inventing new `ChannelError`
             // shapes for a path that does not exercise them today.
@@ -658,9 +659,11 @@ impl From<TelegramChannelError> for ChannelError {
                 reason: format!("work request '{work_id}' cannot be {action} from state '{from}'"),
             },
             TelegramChannelError::LaunchNotYetAvailable { work_id } => {
-                ChannelError::NotYetImplemented(format!(
-                    "sandboxed launch for work request '{work_id}'"
-                ))
+                ChannelError::OperationUnsupported {
+                    channel: harw_types::ChannelId::from_str("telegram"),
+                    operation: "sandboxed-launch",
+                    detail: format!("work request '{work_id}'"),
+                }
             }
             TelegramChannelError::Io(error) => ChannelError::Io(error),
             TelegramChannelError::Serde(error) => ChannelError::Serde(error),
@@ -1200,11 +1203,13 @@ mod tests {
 
     #[test]
     fn pairing_error_conversion_preserves_core_error() {
-        let error = ChannelError::NotYetImplemented("pairing boundary test".to_owned());
+        let error = ChannelError::PairingExpired {
+            code: "pairing boundary test".to_owned(),
+        };
 
         assert!(matches!(
             ChannelError::from(TelegramChannelError::Pairing(error)),
-            ChannelError::NotYetImplemented(message) if message == "pairing boundary test"
+            ChannelError::PairingExpired { code } if code == "pairing boundary test"
         ));
     }
 

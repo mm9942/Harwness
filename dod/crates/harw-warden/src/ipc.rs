@@ -70,7 +70,7 @@
 //! veränderlichen inneren Zustand außerhalb seiner Ausführer/seines
 //! Audit-Ziels (siehe `harw_dod_warden::warden`-Moduldoku), die ihrerseits
 //! entweder zustandslos sind (`CgroupV2Executor`,
-//! `crate::isolation::UnimplementedNetworkIsolator`,
+//! `crate::isolation::NftNetworkIsolator`,
 //! `crate::audit::TracingAuditSink`) oder — in Produktion nicht verwendet —
 //! ihre eigene Synchronisation mitbringen (`RecordingExecutor`,
 //! `RecordingAuditSink`, nur in Tests der Bibliothek). Gleichzeitige

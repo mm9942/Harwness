@@ -1,4 +1,3 @@
-#![allow(dead_code)] // pub API-Fläche; volle Nutzung folgt in späteren Waves
 //! Scroll-State-Verwaltung für die Chat-Historie-Ansicht.
 //!
 //! # Verantwortlichkeit
@@ -25,12 +24,10 @@
 //! use harw_tui::chat_scroll::{ChatScroll, ScrollAction};
 //!
 //! let mut scroll = ChatScroll::new();
-//! assert!(scroll.is_at_tail());
+//! assert_eq!(scroll.offset(), 0);
 //!
 //! scroll.scroll_up(5, 100, 20);
-//! let (start, end) = scroll.visible_range(100, 20);
-//! assert_eq!(end, 95);
-//! assert_eq!(start, 75);
+//! assert_eq!(scroll.offset(), 5);
 //! ```
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -40,11 +37,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKi
 /// `offset` ist die Anzahl Zeilen VOM ENDE aus gemessen:
 /// - `offset = 0` → am neuesten Ende (Standard, Auto-Follow neuer Nachrichten).
 /// - `offset = N` → N Zeilen zurückgescrollt.
+///
+/// Auto-Follow ist implizit: Solange `offset = 0` ist, zeigt die Ansicht stets
+/// das Ende der Historie, auch wenn neue Zeilen hinzukommen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChatScroll {
     offset: usize,
-    /// Ob Auto-Follow bei neuen Nachrichten aktiv ist (wird auf false gesetzt sobald User scrollt).
-    follow_tail: bool,
 }
 
 /// Ergebnis einer Event-Bearbeitung.
@@ -60,7 +58,7 @@ impl ChatScroll {
     /// Erstellt einen neuen `ChatScroll` im Auto-Follow-Modus am Ende der Historie.
     ///
     /// # Description
-    /// Der initiale Zustand ist `offset = 0` (am Ende) und `follow_tail = true`.
+    /// Der initiale Zustand ist `offset = 0` (am Ende, Auto-Follow aktiv).
     /// Entspricht dem typischen Verhalten bei einem frisch geöffneten Chat-Fenster.
     ///
     /// # Returns
@@ -70,14 +68,10 @@ impl ChatScroll {
     /// ```ignore
     /// use harw_tui::chat_scroll::ChatScroll;
     /// let s = ChatScroll::new();
-    /// assert!(s.is_at_tail());
-    /// assert!(s.follows_tail());
+    /// assert_eq!(s.offset(), 0);
     /// ```
     pub fn new() -> Self {
-        Self {
-            offset: 0,
-            follow_tail: true,
-        }
+        Self { offset: 0 }
     }
 
     /// Gibt den aktuellen Scroll-Offset zurück (Zeilen vom Ende gemessen).
@@ -95,24 +89,13 @@ impl ChatScroll {
         self.offset
     }
 
-    /// Gibt zurück, ob Auto-Follow aktiv ist.
-    ///
-    /// # Description
-    /// Auto-Follow bedeutet, dass bei neuen Nachrichten der Offset auf 0 gehalten wird.
-    /// Wird deaktiviert, sobald der Nutzer manuell scrollt (Offset > 0).
-    /// Wird reaktiviert, sobald der Offset wieder 0 erreicht.
-    ///
-    /// # Returns
-    /// `true` wenn Auto-Follow aktiv, `false` wenn der Nutzer manuell hochgescrollt hat.
-    pub fn follows_tail(&self) -> bool {
-        self.follow_tail
-    }
-
-    /// Gibt `true` zurück, wenn der Nutzer aktuell am Ende der Historie ist (offset = 0).
+    /// Gibt `true` zurück, wenn der Nutzer aktuell am Ende der Historie ist (offset = 0),
+    /// d. h. Auto-Follow aktiv ist.
     ///
     /// # Returns
     /// `true` wenn `offset == 0`.
-    pub fn is_at_tail(&self) -> bool {
+    #[cfg(test)]
+    fn is_at_tail(&self) -> bool {
         self.offset == 0
     }
 
@@ -120,7 +103,7 @@ impl ChatScroll {
     ///
     /// # Description
     /// Erhöht den Offset um `lines`, begrenzt auf `total_lines.saturating_sub(viewport)`.
-    /// Deaktiviert Auto-Follow, da der Nutzer aktiv scrollt.
+    /// Ein Offset > 0 beendet Auto-Follow.
     ///
     /// # Arguments
     /// - `lines` (`usize`): Anzahl Zeilen, um die nach oben gescrollt wird.
@@ -129,30 +112,23 @@ impl ChatScroll {
     pub fn scroll_up(&mut self, lines: usize, total_lines: usize, viewport: usize) {
         let max_offset = total_lines.saturating_sub(viewport);
         self.offset = self.offset.saturating_add(lines).min(max_offset);
-        if self.offset > 0 {
-            self.follow_tail = false;
-        }
     }
 
     /// Scrollt um `lines` Zeilen nach unten (in Richtung neuerer Nachrichten).
     ///
     /// # Description
-    /// Reduziert den Offset um `lines`. Erreicht der Offset 0, wird Auto-Follow reaktiviert.
+    /// Reduziert den Offset um `lines`. Erreicht der Offset 0, ist Auto-Follow wieder aktiv.
     ///
     /// # Arguments
     /// - `lines` (`usize`): Anzahl Zeilen, um die nach unten gescrollt wird.
     pub fn scroll_down(&mut self, lines: usize) {
         self.offset = self.offset.saturating_sub(lines);
-        if self.offset == 0 {
-            self.follow_tail = true;
-        }
     }
 
     /// Springt um eine Viewport-Höhe nach oben (Seite rauf).
     ///
     /// # Description
     /// Erhöht den Offset um `viewport` Zeilen, clamped auf das Maximum.
-    /// Deaktiviert Auto-Follow.
     ///
     /// # Arguments
     /// - `total_lines` (`usize`): Gesamtanzahl aller Zeilen in der Historie.
@@ -164,7 +140,7 @@ impl ChatScroll {
     /// Springt um eine Viewport-Höhe nach unten (Seite runter).
     ///
     /// # Description
-    /// Reduziert den Offset um `viewport` Zeilen. Reaktiviert Auto-Follow bei Offset 0.
+    /// Reduziert den Offset um `viewport` Zeilen.
     ///
     /// # Arguments
     /// - `viewport` (`usize`): Höhe des sichtbaren Bereichs in Zeilen.
@@ -176,46 +152,40 @@ impl ChatScroll {
     ///
     /// # Description
     /// Setzt den Offset auf den maximalen Wert `total_lines.saturating_sub(viewport)`.
-    /// Deaktiviert Auto-Follow.
     ///
     /// # Arguments
     /// - `total_lines` (`usize`): Gesamtanzahl aller Zeilen in der Historie.
     /// - `viewport` (`usize`): Höhe des sichtbaren Bereichs in Zeilen.
     pub fn jump_to_top(&mut self, total_lines: usize, viewport: usize) {
         self.offset = total_lines.saturating_sub(viewport);
-        if self.offset > 0 {
-            self.follow_tail = false;
-        }
     }
 
     /// Springt an das Ende der Historie (neueste Nachrichten) und reaktiviert Auto-Follow.
     ///
     /// # Description
-    /// Setzt Offset auf 0 und `follow_tail` auf `true`.
+    /// Setzt Offset auf 0.
     pub fn jump_to_bottom(&mut self) {
         self.offset = 0;
-        self.follow_tail = true;
     }
 
     /// Reagiert auf neue Inhalte in der Chat-Historie.
     ///
     /// # Description
-    /// Wenn Auto-Follow aktiv ist (`follow_tail = true`), bleibt der Offset 0 (kein State-Change
-    /// notwendig). Wenn der Nutzer manuell hochgescrollt hat (`follow_tail = false`), wird der
+    /// Wenn Auto-Follow aktiv ist (`offset = 0`), bleibt der Offset 0 (kein State-Change
+    /// notwendig). Wenn der Nutzer manuell hochgescrollt hat (`offset > 0`), wird der
     /// Offset nicht verändert, damit die aktuelle Position erhalten bleibt.
     pub fn on_new_content(&mut self) {
-        // Bei follow_tail=true: offset ist bereits 0, kein State-Change nötig.
-        // Bei follow_tail=false: Nutzer hat manuell gescrollt — offset bleibt unverändert.
+        // Bei offset=0: Ansicht folgt bereits dem Ende, kein State-Change nötig.
+        // Bei offset>0: Nutzer hat manuell gescrollt — offset bleibt unverändert.
     }
 
     /// Erzwingt Auto-Follow, unabhängig vom aktuellen Zustand.
     ///
     /// # Description
-    /// Setzt `offset = 0` und `follow_tail = true`. Sinnvoll nach dem Absenden einer Nachricht
+    /// Setzt `offset = 0`. Sinnvoll nach dem Absenden einer Nachricht
     /// (Enter/Submit), damit die neue Antwort direkt sichtbar ist.
     pub fn force_follow(&mut self) {
         self.offset = 0;
-        self.follow_tail = true;
     }
 
     /// Berechnet den sichtbaren Zeilen-Range `[start, end)` für das Rendering.
@@ -232,15 +202,8 @@ impl ChatScroll {
     ///
     /// # Returns
     /// `(start, end)` als `(usize, usize)` wobei `start <= end <= total_lines`.
-    ///
-    /// # Examples
-    /// ```ignore
-    /// use harw_tui::chat_scroll::ChatScroll;
-    /// let mut s = ChatScroll::new();
-    /// let (start, end) = s.visible_range(100, 20);
-    /// assert_eq!((start, end), (80, 100));
-    /// ```
-    pub fn visible_range(&self, total_lines: usize, viewport: usize) -> (usize, usize) {
+    #[cfg(test)]
+    fn visible_range(&self, total_lines: usize, viewport: usize) -> (usize, usize) {
         let end = total_lines.saturating_sub(self.offset);
         let start = end.saturating_sub(viewport);
         (start, end)
@@ -365,7 +328,7 @@ mod tests {
     fn test_new_starts_at_tail() {
         let s = ChatScroll::new();
         assert!(s.is_at_tail(), "Neuer Scroll muss am Ende sein");
-        assert!(s.follows_tail(), "Auto-Follow muss initial aktiv sein");
+        assert!(s.is_at_tail(), "Auto-Follow muss initial aktiv sein");
         assert_eq!(s.offset(), 0);
     }
 
@@ -375,8 +338,8 @@ mod tests {
         s.scroll_up(5, 100, 20);
         assert_eq!(s.offset(), 5);
         assert!(
-            !s.follows_tail(),
-            "Nach scroll_up darf follow_tail nicht aktiv sein"
+            !s.is_at_tail(),
+            "Nach scroll_up darf Auto-Follow nicht aktiv sein"
         );
         assert!(!s.is_at_tail());
     }
@@ -391,8 +354,8 @@ mod tests {
             "Nach scroll_down auf 0 muss is_at_tail true sein"
         );
         assert!(
-            s.follows_tail(),
-            "Nach Rückkehr an Tail muss follow_tail wieder aktiv sein"
+            s.is_at_tail(),
+            "Nach Rückkehr an Tail muss Auto-Follow wieder aktiv sein"
         );
     }
 
@@ -436,7 +399,7 @@ mod tests {
             80,
             "jump_to_top muss offset = total - viewport setzen"
         );
-        assert!(!s.follows_tail());
+        assert!(!s.is_at_tail());
     }
 
     #[test]
@@ -446,22 +409,22 @@ mod tests {
         s.jump_to_bottom();
         assert_eq!(s.offset(), 0, "jump_to_bottom muss offset auf 0 setzen");
         assert!(
-            s.follows_tail(),
-            "jump_to_bottom muss follow_tail reaktivieren"
+            s.is_at_tail(),
+            "jump_to_bottom muss Auto-Follow reaktivieren"
         );
     }
 
     #[test]
     fn test_on_new_content_when_following_stays_at_tail() {
         let mut s = ChatScroll::new();
-        assert!(s.follows_tail());
+        assert!(s.is_at_tail());
         s.on_new_content();
         assert_eq!(
             s.offset(),
             0,
-            "Bei follow_tail muss on_new_content offset bei 0 halten"
+            "Bei Auto-Follow muss on_new_content offset bei 0 halten"
         );
-        assert!(s.follows_tail());
+        assert!(s.is_at_tail());
     }
 
     #[test]
@@ -469,14 +432,14 @@ mod tests {
         let mut s = ChatScroll::new();
         s.scroll_up(5, 100, 20);
         assert_eq!(s.offset(), 5);
-        assert!(!s.follows_tail());
+        assert!(!s.is_at_tail());
         s.on_new_content();
         assert_eq!(
             s.offset(),
             5,
-            "on_new_content darf bei follow_tail=false den Offset nicht ändern"
+            "on_new_content darf bei Auto-Follow aus den Offset nicht ändern"
         );
-        assert!(!s.follows_tail());
+        assert!(!s.is_at_tail());
     }
 
     #[test]
@@ -534,12 +497,9 @@ mod tests {
         let mut s = ChatScroll::new();
         s.scroll_up(5, 100, 20);
         assert_eq!(s.offset(), 5);
-        assert!(!s.follows_tail());
+        assert!(!s.is_at_tail());
         s.force_follow();
         assert_eq!(s.offset(), 0, "force_follow muss offset auf 0 setzen");
-        assert!(
-            s.follows_tail(),
-            "force_follow muss follow_tail reaktivieren"
-        );
+        assert!(s.is_at_tail(), "force_follow muss Auto-Follow reaktivieren");
     }
 }

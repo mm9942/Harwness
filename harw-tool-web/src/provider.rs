@@ -1,4 +1,4 @@
-//! `WebToolProvider` — aggregierter `ToolProvider` der drei Web-Tools.
+//! `WebToolProvider` — aggregierter `ToolProvider` der vier Web-Tools.
 //!
 //! Spezifikationsquelle: AP W2-04..08, Abschnitt „6. `provider.rs`".
 //!
@@ -34,7 +34,7 @@
 //!
 //! # Nebenläufigkeit
 //! [`WebToolProvider`] ist zustandslos und damit `Send + Sync + Copy`. Alle
-//! drei Tools sind `parallel_safe` (reine Lesezugriffe).
+//! vier Tools sind `parallel_safe` (reine Lesezugriffe).
 //!
 //! # Fehler
 //! Der Provider selbst erzeugt keine Fehler; unbekannte Tool-Namen liefern
@@ -46,20 +46,21 @@
 //! use harw_tool_web::WebToolProvider;
 //!
 //! let provider = WebToolProvider::new();
-//! assert_eq!(provider.tools().len(), 3);
+//! assert_eq!(provider.tools().len(), 4);
 //! ```
 
 use crate::crates_io::WebCratesIoTool;
 use crate::docs_rs::WebDocsRsTool;
 use crate::error::WebToolResult;
+use crate::search::WebSearchTool;
 use crate::fetch::{WebFetchOptions, WebFetchTool, WebFetcher, install_fetcher};
 use harw_egress::EgressPolicy;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 harw_tools::tool_provider! {
-    /// Stellt die drei Recherche-Tools `web.fetch`, `web.docs_rs` und
-    /// `web.crates_io` bereit.
+    /// Stellt die vier Recherche-Tools `web.fetch`, `web.docs_rs`, `web.crates_io`
+    /// und `web.search` bereit.
     ///
     /// # Description
     /// Zustandslose Unit-Struktur; der geteilte HTTP-Client und der
@@ -72,6 +73,7 @@ harw_tools::tool_provider! {
         WebFetchTool,
         WebDocsRsTool,
         WebCratesIoTool,
+        WebSearchTool,
     }
 }
 
@@ -132,19 +134,22 @@ mod tests {
     use harw_extension_api::contributors::ToolProvider;
     use harw_tools::{ToolName, ToolSpec};
 
-    /// Der Provider bewirbt genau die drei Tools in Deklarationsreihenfolge.
+    /// Der Provider bewirbt genau die vier Tools in Deklarationsreihenfolge.
     #[test]
-    fn test_web_tool_provider_lists_three_tools() {
+    fn test_web_tool_provider_lists_four_tools() {
         assert_eq!(
             WebToolProvider::TOOL_NAMES,
-            &["web.fetch", "web.docs_rs", "web.crates_io"]
+            &["web.fetch", "web.docs_rs", "web.crates_io", "web.search"]
         );
 
         let provider = WebToolProvider::new();
         // `tools()` muss gebunden werden: die `&str` in `names` zeigen in diesen Vec.
         let specs = provider.tools();
         let names: Vec<&str> = specs.iter().map(ToolSpec::name).collect();
-        assert_eq!(names, vec!["web.fetch", "web.docs_rs", "web.crates_io"]);
+        assert_eq!(
+            names,
+            vec!["web.fetch", "web.docs_rs", "web.crates_io", "web.search"]
+        );
     }
 
     /// Jedes beworbene Tool ist auch auflösbar — sonst bewirbt der Provider
@@ -169,7 +174,7 @@ mod tests {
         assert!(!provider.parallel_safe(&ToolName::new("web.unbekannt")));
     }
 
-    /// Alle drei Tools sind reine Lesezugriffe und damit parallelsicher.
+    /// Alle vier Tools sind reine Lesezugriffe und damit parallelsicher.
     #[test]
     fn test_web_tool_provider_all_tools_are_parallel_safe() {
         let provider = WebToolProvider::new();

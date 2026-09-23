@@ -40,6 +40,10 @@ admitted = [
   "deps.source_search",
   "deps.source_list",
   "lens.ask",
+  "explore.tree",
+  "explore.projects",
+  "explore.relations",
+  "explore.find",
 ]
 forbidden = ["fs.write", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
 

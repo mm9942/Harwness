@@ -8,8 +8,9 @@
 //!
 //! # Scope
 //! Pure governance arithmetic (budget charging, lease expiry, backoff delay) is
-//! implemented fully. Anything requiring a running async scheduler/executor is
-//! deferred via [`JobRuntimeError::NotYetImplemented`].
+//! implemented fully. Scheduling and execution live in the callers
+//! (`harw-session-store::JobStore`, `harw-core::DurableJobRunner`, the
+//! `harw-cli` job worker).
 //!
 //! # Errors
 //! Every fallible path returns [`JobRuntimeError`] / [`JobRuntimeResult`].

@@ -137,8 +137,10 @@ pub trait SecretResolver {
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const SECRET_RESOLVER_FAILURE_REASON: &str = "secret resolver failed";
 const EMPTY_CREDENTIAL_REASON: &str = "credential is empty";
-const INVALID_KEYRING_REFERENCE_REASON: &str = "invalid keyring reference";
-const KEYRING_FAILURE_REASON: &str = "keyring credential unavailable";
+const INVALID_KEYRING_REFERENCE_REASON: &str =
+    "invalid keyring reference (expected keyring:<service>/<account>)";
+const KEYRING_FAILURE_REASON: &str =
+    "keyring credential unavailable (no entry for service/account or system keyring not reachable)";
 // Gründe für `file:`/`file-json:`-Fehler: bewusst ohne Pfad und ohne Inhalt,
 // damit Fehlertexte (UI, Telegram, Logs) kein Datei-Orakel werden.
 const FILE_CREDENTIAL_NO_HOME_REASON: &str =
@@ -1964,8 +1966,21 @@ fn transport_from_api(api: &str) -> Transport {
 /// Unterstützt `env:`, `file:`, `file-json:` und `keyring:`. Für `env:`-Refs wird
 /// zusätzlich der `env_layer` aus `~/.harw/.env` als Fallback konsultiert:
 /// Prozess-Umgebung gewinnt, wenn die Variable dort gesetzt und nicht leer
-/// ist; andernfalls wird der Env-Layer konsultiert. `keyring:` erwartet exakt
-/// `service/account`; `secrets:` wird an den injizierten Resolver delegiert.
+/// ist; andernfalls wird der Env-Layer konsultiert.
+///
+/// `keyring:` erwartet exakt `keyring:<service>/<account>` (genau ein `/`,
+/// beide Teile nicht leer) und liest den Eintrag über das `keyring`-Crate aus
+/// dem System-Keyring (macOS Keychain, Windows Credential Manager, Secret
+/// Service). Der injizierte [`SecretResolver`] wird dafür bewusst **nicht**
+/// befragt: sein Vertrag deckt nur den Bezeichner nach `secrets:` ab.
+///
+/// `secrets:` wird an den injizierten [`SecretResolver`] delegiert (er erhält
+/// den Bezeichner ohne Präfix). Ohne Resolver schlägt die Auflösung fail-closed
+/// mit [`HttpProviderError::UnsupportedCredentialReference`] fehl; Aufrufer
+/// müssen dann einen Resolver über die `*_with_resolver`-Konstruktoren
+/// injizieren oder auf `env:`/`file:`/`keyring:` ausweichen.
+/// Resolver- und Keyring-Fehler werden auf feste Gründe abgebildet, damit weder
+/// Secret-Werte noch Resolver-Diagnosen in Fehlertexte gelangen.
 /// `file:`/`file-json:` lesen nur unterhalb von `<home>/secrets/` (siehe
 /// [`read_private_secret_file`]); ihre Fehler nennen weder Pfad noch Inhalt.
 /// Ausnahme für `file-json:`: liegt der Pfad außerhalb von `<home>/secrets`,
@@ -1977,6 +1992,13 @@ fn transport_from_api(api: &str) -> Transport {
 /// # Arguments
 /// - `secret_ref` (`&harw_config::SecretRef`): Zu lösende Referenz.
 /// - `sources` ([`SecretSources`]): Env-Layer, optionaler Resolver, optionales Home.
+///
+/// # Errors
+/// - [`HttpProviderError::UnsupportedCredentialReference`]: `secrets:` ohne
+///   injizierten [`SecretResolver`].
+/// - [`HttpProviderError::UnresolvedCredential`]: Referenz nicht auflösbar
+///   (Variable fehlt, Datei unsicher/unlesbar, Resolver- oder Keyring-Fehler,
+///   ungültige `keyring:`-Form) oder aufgelöster Wert leer.
 fn resolve_secret(
     secret_ref: &harw_config::SecretRef,
     sources: SecretSources<'_>,
@@ -2298,7 +2320,10 @@ fn secret_file_location(home: &Path, path: &Path) -> Option<(PathBuf, PathBuf)> 
     })
 }
 
-/// Parses a `keyring:` payload in the required `service/account` form.
+/// Zerlegt die Nutzlast einer `keyring:`-Referenz in (`service`, `account`).
+///
+/// Akzeptiert nur exakt `service/account` mit genau einem `/` und zwei
+/// nicht-leeren Teilen; alles andere ergibt `None`.
 fn parse_keyring_reference(payload: &str) -> Option<(&str, &str)> {
     let (service, account) = payload.split_once('/')?;
     (!service.is_empty() && !account.is_empty() && !account.contains('/'))
@@ -5236,6 +5261,101 @@ mod tests {
             HttpProviderError::UnsupportedCredentialReference { .. }
         ));
         assert!(!error.to_string().contains(reference));
+        Ok(())
+    }
+
+    /// Fake-Resolver, der alle angefragten Bezeichner mitschreibt.
+    struct RecordingSecretResolver {
+        value: &'static str,
+        seen: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl SecretResolver for RecordingSecretResolver {
+        fn resolve(&self, reference: &str) -> Result<SecretString, String> {
+            self.seen.borrow_mut().push(reference.to_owned());
+            Ok(SecretString::new(self.value.to_owned().into()))
+        }
+    }
+
+    #[test]
+    fn test_resolve_secret_routes_secrets_reference_to_resolver_without_prefix() -> TestResult {
+        let resolver = RecordingSecretResolver {
+            value: "resolved-via-fake",
+            seen: std::cell::RefCell::new(Vec::new()),
+        };
+        let env_layer = BTreeMap::new();
+
+        let secret = resolve_secret(
+            &harw_config::SecretRef::Secrets("tenant/provider-token".to_owned()),
+            test_sources(&env_layer, Some(&resolver), None),
+        )
+        .map_err(ctx("secrets reference resolves through injected resolver"))?;
+
+        assert_eq!(secret.expose_secret(), "resolved-via-fake");
+        assert_eq!(
+            *resolver.seen.borrow(),
+            vec!["tenant/provider-token".to_owned()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolve_secret_rejects_invalid_keyring_reference_without_resolver_call() -> TestResult {
+        let resolver = RecordingSecretResolver {
+            value: "must-not-be-used",
+            seen: std::cell::RefCell::new(Vec::new()),
+        };
+        let env_layer = BTreeMap::new();
+
+        for payload in ["service", "service/", "/account", "a/b/c"] {
+            let Err(error) = resolve_secret(
+                &harw_config::SecretRef::Keyring(payload.to_owned()),
+                test_sources(&env_layer, Some(&resolver), None),
+            ) else {
+                return Err(TestError::Unexpected(format!(
+                    "invalid keyring reference {payload:?} must fail"
+                )));
+            };
+            assert!(
+                matches!(
+                    &error,
+                    HttpProviderError::UnresolvedCredential { reason, .. }
+                        if reason == INVALID_KEYRING_REFERENCE_REASON
+                ),
+                "{payload:?}"
+            );
+        }
+        assert!(resolver.seen.borrow().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolve_secret_missing_keyring_entry_is_redacted_and_skips_resolver() -> TestResult {
+        // Mock-Backend statt echtem System-Keyring: jede neue `Entry` ist leer,
+        // `get_password` liefert daher `NoEntry`.
+        keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+        let resolver = RecordingSecretResolver {
+            value: "must-not-be-used",
+            seen: std::cell::RefCell::new(Vec::new()),
+        };
+        let env_layer = BTreeMap::new();
+
+        let Err(error) = resolve_secret(
+            &harw_config::SecretRef::Keyring("harwness/openai".to_owned()),
+            test_sources(&env_layer, Some(&resolver), None),
+        ) else {
+            return Err(TestError::Unexpected(
+                "missing keyring entry must fail".to_owned(),
+            ));
+        };
+
+        assert!(matches!(
+            &error,
+            HttpProviderError::UnresolvedCredential { reason, .. }
+                if reason == KEYRING_FAILURE_REASON
+        ));
+        assert!(!error.to_string().contains("must-not-be-used"));
+        assert!(resolver.seen.borrow().is_empty());
         Ok(())
     }
 

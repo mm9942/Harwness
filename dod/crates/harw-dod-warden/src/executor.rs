@@ -124,6 +124,15 @@ pub trait NetworkIsolator {
     /// # Errors
     /// Implementierungsabhängig.
     fn isolate(&self, cgroup: &CgroupId) -> WardenResult<()>;
+
+    /// Hebt eine zuvor gesetzte Netz-Isolation wieder auf (idempotent).
+    /// Standard: nichts zu tun (Isolatoren ohne dauerhaften Zustand).
+    ///
+    /// # Errors
+    /// Implementierungsabhängig.
+    fn release_isolation(&self, _cgroup: &CgroupId) -> WardenResult<()> {
+        Ok(())
+    }
 }
 
 /// Beendet den Prozessbaum einer cgroup (Aktion
