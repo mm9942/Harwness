@@ -613,7 +613,8 @@ pub enum RegistryProfile {
     /// Nur web.* — kein Workspace-Lesen (A5); Netz nur über
     /// `[network].researcher_web_hosts`.
     Research,
-    /// ReadOnlyExplore + `lens.ask`. Die Plan-/Goal-Operationen der
+    /// ReadOnlyExplore ohne `web.*` + `lens.ask` (root-orchestrator und
+    /// planner verbieten Netz-Werkzeuge). Die Plan-/Goal-Operationen der
     /// Composition-Root gehören **nicht** dazu (siehe W1-05).
     Planning,
     /// Registriert und bewirbt keine Werkzeuge — für Rollen, die bereits
@@ -2262,7 +2263,20 @@ pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_
     .filter_map(|provider| restrict_provider(provider, &allowed))
     .collect();
 
-    let advertised_tools: Vec<String> = allowed.iter().map(|name| (*name).to_owned()).collect();
+    // Beworben wird nur, wofür tatsächlich ein Provider-Werkzeug registriert
+    // ist: `allowed` ist die statische Vertrags-Obermenge (etwa
+    // `browser.open` bei `UiaQuickHelper`, das ohne `BrowserOpenGrant` keinen
+    // Provider hat). Ein beworbenes Werkzeug ohne Executor schickte das
+    // Modell in einen sicheren Fehlschlag.
+    let registered: Vec<ToolSpec> = providers
+        .iter()
+        .flat_map(|provider| provider.tools())
+        .collect();
+    let advertised_tools: Vec<String> = allowed
+        .iter()
+        .filter(|name| registered.iter().any(|spec| spec.name() == **name))
+        .map(|name| (*name).to_owned())
+        .collect();
 
     let IdentityOverrides {
         agent_name,
@@ -2482,11 +2496,19 @@ mod tests {
                 "fs.glob",
                 "fs.grep",
                 "doc.read_pdf",
+                "explore.tree",
+                "explore.projects",
+                "explore.relations",
+                "explore.find",
                 "deps.graph",
                 "deps.locked",
                 "deps.source_read",
                 "deps.source_search",
                 "deps.source_list",
+                // Nutzerentscheidung: der Explorer darf auch das Netz
+                // durchsuchen — nur diese zwei, nie `web.docs_rs`/`web.crates_io`.
+                "web.fetch",
+                "web.search",
             ]
         );
         Ok(())
@@ -2552,7 +2574,11 @@ mod tests {
         );
         assert_eq!(
             RegistryProfile::ReadOnlyExplore.required_permissions(),
-            set(&[Permission::ReadWorkspace, Permission::ReadCargoRegistry])
+            set(&[
+                Permission::ReadWorkspace,
+                Permission::ReadCargoRegistry,
+                Permission::NetworkAccess
+            ])
         );
         assert_eq!(
             RegistryProfile::Planning.required_permissions(),
@@ -2583,6 +2609,10 @@ mod tests {
                 "fs.glob",
                 "fs.grep",
                 "doc.read_pdf",
+                "explore.tree",
+                "explore.projects",
+                "explore.relations",
+                "explore.find",
                 "deps.graph",
                 "deps.locked"
             ]
@@ -2652,16 +2682,23 @@ mod tests {
     fn test_planning_profile_registers_read_only_tools_and_does_not_advertise_plan_or_goal()
     -> TestResult {
         let assembled = assemble(RegistryProfile::Planning)?;
-        // Registriert werden die read-only Provider von `ReadOnlyExplore`
-        // plus `lens.ask` — der einzige Grund, warum `Planning` sich
-        // überhaupt vom read-only Kern unterscheidet (siehe `LENS_TOOLS`).
-        let mut expected: Vec<String> = RegistryProfile::ReadOnlyExplore
-            .registered_tool_names()
+        // Registriert wird der read-only Kern von `ReadOnlyExplore` (fs.*,
+        // doc.read_pdf, explore.*, deps.*) **ohne** dessen Explorer-Netz
+        // (`web.fetch`/`web.search`, nur für `explorer`), plus `lens.ask`
+        // (siehe `LENS_TOOLS`).
+        let expected: Vec<String> = FS_READ_ONLY_TOOLS
             .iter()
+            .chain(DOC_TOOLS.iter())
+            .chain(EXPLORER_TOOLS.iter())
+            .chain(DEPS_TOOLS.iter())
+            .chain(LENS_TOOLS.iter())
             .map(|name| (*name).to_owned())
             .collect();
-        expected.push("lens.ask".to_owned());
         assert_eq!(registered_names(&assembled), expected);
+        assert!(
+            !expected.iter().any(|name| name.starts_with("web.")),
+            "Planning (root-orchestrator, planner) führt kein Netz-Werkzeug"
+        );
         // … und beworben wird genau das Registrierte: `plan`/`goal` sind
         // Composition-Root-Operationen ohne Executor im Kind (W1-05).
         assert_eq!(assembled.identity.tools_available, expected);
