@@ -300,6 +300,118 @@ fn ceil_char_boundary(s: &str, idx: usize) -> usize {
     i
 }
 
+/// Obergrenze (in Zeichen, nicht Bytes) für `task` und `detail` eines vom
+/// Controller erzeugten [`AgentOrchestrationEvent`].
+///
+/// # Beschreibung
+/// Liegt bewusst unter [`AgentOrchestrationEvent::MAX_DETAIL_CHARS`], damit
+/// das Protokoll-seitige Kürzen nie ein bereits gesetztes Kürzungszeichen
+/// abschneidet. Siehe [`orchestration_detail_head`].
+pub const ORCHESTRATION_DETAIL_MAX_CHARS: usize = 500;
+
+/// Mindestabstand zwischen zwei [`TurnEvent::ChildProgress`]-Meldungen
+/// desselben Kindes (Drosselung, siehe
+/// [`ManagedAgentSpawner::attach_child_progress_sink`]).
+pub const CHILD_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Liefert einen kurzen, zeichengrenzen-sicheren Kopf eines Textes für
+/// Orchestrierungs-Events (`task`/`detail`).
+///
+/// # Beschreibung
+/// Entfernt führenden und abschließenden Leerraum. Ist der Rest länger als
+/// [`ORCHESTRATION_DETAIL_MAX_CHARS`] Zeichen, werden die ersten
+/// `ORCHESTRATION_DETAIL_MAX_CHARS - 1` Zeichen behalten und ein `…`
+/// angehängt — das Ergebnis hat damit höchstens
+/// [`ORCHESTRATION_DETAIL_MAX_CHARS`] Zeichen. Gezählt wird in `char`s, ein
+/// Mehrbyte-Zeichen wird also nie zerschnitten.
+///
+/// # Arguments
+/// - `text` (`&str`): der ungekürzte Text.
+///
+/// # Returns
+/// `None` für einen leeren bzw. reinen Leerraum-Text, sonst den Kopf.
+///
+/// # Examples
+/// ```rust
+/// use harw_core::child_controller::{ORCHESTRATION_DETAIL_MAX_CHARS, orchestration_detail_head};
+///
+/// assert_eq!(orchestration_detail_head("  kurz \n"), Some("kurz".to_owned()));
+/// assert_eq!(orchestration_detail_head("   "), None);
+/// let long = "ä".repeat(2_000);
+/// let head = orchestration_detail_head(&long).unwrap_or_default();
+/// assert_eq!(head.chars().count(), ORCHESTRATION_DETAIL_MAX_CHARS);
+/// assert!(head.ends_with('…'));
+/// ```
+#[must_use]
+pub fn orchestration_detail_head(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() <= ORCHESTRATION_DETAIL_MAX_CHARS {
+        return Some(trimmed.to_owned());
+    }
+    let mut head: String = trimmed
+        .chars()
+        .take(ORCHESTRATION_DETAIL_MAX_CHARS.saturating_sub(1))
+        .collect();
+    head.push('…');
+    Some(head)
+}
+
+/// Leitet den Auftragstext eines Kindes aus seinem [`SpawnInput`] ab.
+///
+/// # Beschreibung
+/// Vorrang hat `instructions` (sofern nicht leer). Sonst wird ein nicht
+/// leerer `context` verwendet: ein JSON-String direkt, jeder andere Wert
+/// (außer `null`, `{}` und `[]`) als kompaktes JSON.
+///
+/// # Returns
+/// Den **ungekürzten** Auftragstext oder `None`, wenn keiner vorliegt.
+fn spawn_task_text(instructions: Option<&str>, context: &serde_json::Value) -> Option<String> {
+    if let Some(text) = instructions
+        && !text.trim().is_empty()
+    {
+        return Some(text.to_owned());
+    }
+    match context {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) if text.trim().is_empty() => None,
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Object(map) if map.is_empty() => None,
+        serde_json::Value::Array(items) if items.is_empty() => None,
+        other => Some(other.to_string()),
+    }
+}
+
+/// Auftrags- und Ergebniszustand eines admittierten Kindes, der nicht im
+/// öffentlichen [`ChildRecord`] liegt (dessen Literal-Konstruktion in anderen
+/// Crates sonst bräche).
+#[derive(Debug, Clone, Default)]
+struct ChildTaskState {
+    /// Der ungekürzte Auftrag; wird vom ersten Lauf mit leerem
+    /// [`TurnInput`] als User-Text verbraucht.
+    pending_task: Option<String>,
+    /// Kurzkopf des Auftrags für `AgentOrchestrationEvent::task`.
+    task: Option<String>,
+    /// Kurzkopf der finalen Antwort bzw. des Fehlergrunds für
+    /// `AgentOrchestrationEvent::detail` (`Completed`/`Failed`).
+    outcome_detail: Option<String>,
+}
+
+/// Ziel der [`TurnEvent::ChildProgress`]-Meldungen eines Kindes: der
+/// Live-Kanal seines Elternteils samt dessen Turn-ID.
+#[derive(Debug, Clone)]
+struct ChildProgressSink {
+    turn_id: TurnId,
+    emitter: LiveEmitter,
+    /// Zeitpunkt der letzten gesendeten Meldung (Drosselung).
+    last_emitted: Option<std::time::Instant>,
+}
+
+/// Geteilte Registry der Fortschritts-Senken je Kind (Schlüssel: Kind-ID).
+type ProgressSinks = Arc<Mutex<BTreeMap<String, ChildProgressSink>>>;
+
 /// Ein bereits geboxtes Kind-Future im Fan-out-Scheduler.
 ///
 /// `Send` bleibt bewusst gefordert: sonst wäre das Future von
@@ -627,6 +739,13 @@ pub struct ExpiredChild {
 pub struct ChildRunResult {
     pub child: SessionId,
     pub outcome: TurnOutcome,
+    /// Die **ungekürzte** finale Assistenten-Antwort des Kindes, gesetzt bei
+    /// `TurnOutcome::Completed`, sofern das Kind Text geliefert hat; sonst
+    /// `None`. Typisierte Rückgabe-Verträge parsen diesen Text; für eine
+    /// Freitext-Rückgabe an den Elternteil kappt der Aufrufer ihn selbst über
+    /// [`cap_child_return_text`] (die gekappte Form liefert weiterhin
+    /// [`ManagedAgentSpawner::child_final_assistant_text`]).
+    pub full_text: Option<String>,
 }
 
 /// Lebenszyklus-Status eines admittierten Kindes.
