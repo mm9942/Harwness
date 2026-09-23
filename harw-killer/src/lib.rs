@@ -335,7 +335,10 @@ mod tests {
     fn test_helper_invocation_prefix() {
         assert!(HelperInvocation::Standalone.prefix().is_empty());
         let host = HelperInvocation::Subcommand(vec!["tools".into(), "kill".into()]);
-        assert_eq!(host.prefix(), [OsString::from("tools"), OsString::from("kill")]);
+        assert_eq!(
+            host.prefix(),
+            [OsString::from("tools"), OsString::from("kill")]
+        );
         assert_eq!(HelperInvocation::default(), HelperInvocation::Standalone);
     }
     // Usage errors never reach selection; help exits successfully.

@@ -14,5 +14,8 @@ use std::process::ExitCode;
 
 // Forward process arguments; exit semantics are documented on `run_cli`.
 fn main() -> ExitCode {
-    harw_killer::run_cli(std::env::args_os(), harw_killer::HelperInvocation::Standalone)
+    harw_killer::run_cli(
+        std::env::args_os(),
+        harw_killer::HelperInvocation::Standalone,
+    )
 }

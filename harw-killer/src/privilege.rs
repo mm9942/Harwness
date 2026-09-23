@@ -337,8 +337,18 @@ mod tests {
             [OsString::from("43:3")],
         );
         let expected = os(&[
-            "--", "/opt/killer", "--timeout", "3", "--kill-wait", "0.5", "--log", "INFO",
-            "--helper", "42", "900", "43:3",
+            "--",
+            "/opt/killer",
+            "--timeout",
+            "3",
+            "--kill-wait",
+            "0.5",
+            "--log",
+            "INFO",
+            "--helper",
+            "42",
+            "900",
+            "43:3",
         ]);
         assert_eq!(args, expected);
         Ok(())
@@ -356,8 +366,20 @@ mod tests {
             os(&["43:3", "44:4"]),
         );
         let expected = os(&[
-            "--", "/usr/bin/harw", "kill", "--timeout", "3", "--kill-wait", "0.5", "--log",
-            "INFO", "--helper", "42", "900", "43:3", "44:4",
+            "--",
+            "/usr/bin/harw",
+            "kill",
+            "--timeout",
+            "3",
+            "--kill-wait",
+            "0.5",
+            "--log",
+            "INFO",
+            "--helper",
+            "42",
+            "900",
+            "43:3",
+            "44:4",
         ]);
         assert_eq!(args, expected);
         // The re-executed helper line parses again as a valid helper invocation.
