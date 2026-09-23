@@ -101,7 +101,7 @@ use harw_observe::TraceContext;
 use harw_protocol::items::{ContentPart, TurnItem};
 use harw_protocol::{AgentOrchestrationEvent, AgentOrchestrationStatus};
 use harw_session_store::{ApprovalStore, ChildLeaseRecord, ChildLeaseStore};
-use harw_types::{AgentRole, ReasoningEffort, SessionId, ToolCallId};
+use harw_types::{AgentRole, ReasoningEffort, SessionId, TokenUsage, ToolCallId};
 use jiff::{SignedDuration, Timestamp};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
@@ -578,6 +578,15 @@ pub struct ChildRecord {
     /// keine Einstufung mitgegeben hat. Wird beim Kind-Start an
     /// [`ChildRegistryFactory::model_for_task`] weitergereicht.
     pub task_complexity: Option<TaskComplexity>,
+    /// Live-Zähler (Tokens, Tool-Aufrufe) für Beobachter.
+    pub live: ChildLiveStats,
+}
+
+/// Laufende Zähler eines Kindes, fortgeschrieben vom Progress-Observer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChildLiveStats {
+    pub usage: TokenUsage,
+    pub tool_calls: u32,
 }
 
 impl ChildRecord {
@@ -1473,7 +1482,27 @@ struct ActiveLeaseProgressObserver {
     orchestration_observer: Option<Arc<dyn OrchestrationObserver>>,
 }
 
+impl ActiveLeaseProgressObserver {
+    fn update_live(&self, session_id: &SessionId, update: impl FnOnce(&mut ChildLiveStats)) {
+        if let Ok(mut active) = self.active.lock()
+            && let Some(record) = active.get_mut(session_id.as_str())
+        {
+            update(&mut record.live);
+        }
+    }
+}
+
 impl crate::guard::ProgressObserver for ActiveLeaseProgressObserver {
+    fn on_round_usage(&self, session_id: &SessionId, usage: &TokenUsage) {
+        self.update_live(session_id, |live| live.usage.add(usage));
+    }
+
+    fn on_tool_call(&self, session_id: &SessionId) {
+        self.update_live(session_id, |live| {
+            live.tool_calls = live.tool_calls.saturating_add(1);
+        });
+    }
+
     fn on_progress(&self, session_id: &SessionId) {
         renew_active_lease(
             &self.active,
@@ -1522,11 +1551,17 @@ fn emit_orchestration_event(
         depth: record.depth,
         task: AgentOrchestrationEvent::bounded_detail(task),
         status,
-        usage: None,
-        duration_ms: None,
+        usage: Some(record.live.usage.clone()),
+        duration_ms: Some(elapsed_ms(record.admitted_at)),
         progress: None,
         detail: None,
+        tool_calls: Some(record.live.tool_calls),
     });
+}
+
+/// Millisekunden seit `since` (0 bei Uhrensprung).
+fn elapsed_ms(since: Timestamp) -> u64 {
+    u64::try_from(Timestamp::now().duration_since(since).as_millis()).unwrap_or(0)
 }
 
 /// Normalisiert einen Delegations-Auftragstext für den Duplikat-Vergleich:
@@ -4388,6 +4423,7 @@ impl ManagedAgentSpawner {
             .ok_or_else(|| Self::reject("child parent lineage contains a cycle"))?;
         let task = input.instructions.clone();
         let record = ChildRecord {
+            live: crate::child_controller::ChildLiveStats::default(),
             child: child.clone(),
             parent: input.parent_session_id,
             handoff_call_id: input.handoff_call_id,
@@ -5084,6 +5120,7 @@ specialization = "child-controller-test"
         };
         let now = Timestamp::now();
         let record = ChildRecord {
+            live: crate::child_controller::ChildLiveStats::default(),
             child: child.clone(),
             parent: SessionId::new(),
             handoff_call_id: ToolCallId::new(),
@@ -5429,6 +5466,7 @@ specialization = "child-controller-test"
                 .insert(
                     child.as_str().to_owned(),
                     ChildRecord {
+                        live: crate::child_controller::ChildLiveStats::default(),
                         child: child.clone(),
                         parent: parent.clone(),
                         handoff_call_id: ToolCallId::new(),
@@ -5517,6 +5555,7 @@ specialization = "child-controller-test"
                 .insert(
                     child.as_str().to_owned(),
                     ChildRecord {
+                        live: crate::child_controller::ChildLiveStats::default(),
                         child: child.clone(),
                         parent: parent.clone(),
                         handoff_call_id: ToolCallId::new(),
@@ -7233,6 +7272,7 @@ max_trust = "instruction"
         let trace = test_trace(&"e".repeat(32), &"f".repeat(16))?;
         let now = Timestamp::now();
         let record = ChildRecord {
+            live: crate::child_controller::ChildLiveStats::default(),
             child: SessionId::new(),
             parent: SessionId::new(),
             handoff_call_id: ToolCallId::new(),
@@ -7756,6 +7796,7 @@ admitted = ["fs.read", "shell.exec"]
             .insert(
                 child.as_str().to_owned(),
                 ChildRecord {
+                    live: crate::child_controller::ChildLiveStats::default(),
                     child: child.clone(),
                     parent,
                     handoff_call_id: ToolCallId::new(),

@@ -83,6 +83,7 @@ mod error;
 pub mod rate_limiter;
 pub mod retry;
 pub mod routing;
+mod sse;
 mod text_tool_calls;
 mod tool_names;
 
@@ -547,6 +548,11 @@ fn build_named_provider(
             configured_headers(provider_name, &provider.headers, sources)?,
         );
         backend.configure_rate_limit(provider.rate_limit.clone());
+        backend.configure_stream_policy(sse::StreamPolicy::from_config(
+            provider_name,
+            provider,
+            config,
+        ));
         backend.configure_credential_pool(pool);
         backend.configure_concurrency(provider.max_concurrency);
         // Beide `Arc`s werden geklont, *bevor* `backend` unten per Wert in
@@ -1319,6 +1325,8 @@ pub struct OpenAiResponsesProvider {
     /// gebaut wurde — dann entscheidet [`cache_strategy::resolve_cache_strategy`]
     /// allein anhand von Provider-Name/Modell.
     cache_overrides: std::collections::HashMap<String, harw_config::PromptCachingMode>,
+    /// Pro-Modell-Entscheidung für SSE-Streaming (siehe [`sse::StreamPolicy`]).
+    stream_policy: sse::StreamPolicy,
     /// Client-seitiger Rate-Limiter (siehe [`rate_limiter::ProviderRateLimiter`]);
     /// standardmäßig deaktiviert (`ProviderRateLimiter::new(None)`).
     rate_limiter: std::sync::Arc<rate_limiter::ProviderRateLimiter>,
@@ -1483,6 +1491,7 @@ impl OpenAiResponsesProvider {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             reasoning_replay: ReasoningReplay::default(),
             cache_overrides: std::collections::HashMap::new(),
+            stream_policy: sse::StreamPolicy::default(),
             rate_limiter: std::sync::Arc::new(rate_limiter::ProviderRateLimiter::new(None)),
             concurrency_limiter: None,
             credential_pool: None,
@@ -1704,6 +1713,7 @@ impl OpenAiResponsesProvider {
                 }
             }
         }
+        http_provider.stream_policy = sse::StreamPolicy::from_config(provider_name, provider, config);
         http_provider.rate_limiter = std::sync::Arc::new(rate_limiter::ProviderRateLimiter::new(
             provider.rate_limit.clone(),
         ));
@@ -3307,6 +3317,7 @@ fn extract_openai_usage(body: &Value, transport: Transport) -> TokenUsage {
         .and_then(Value::as_u64);
 
     TokenUsage {
+        cache_separate: false,
         input_tokens,
         output_tokens,
         reasoning_tokens,
@@ -3498,6 +3509,17 @@ impl OpenAiResponsesProvider {
         if self.codex_route.is_some() {
             codex::prepare_body(&mut wire);
         }
+        // Natives SSE-Streaming (Codex streamt ohnehin, siehe oben).
+        let stream_sink = request
+            .stream
+            .as_ref()
+            .filter(|_| self.codex_route.is_none() && self.stream_policy.enabled(model));
+        if stream_sink.is_some() {
+            wire["stream"] = Value::Bool(true);
+            if self.transport == Transport::Chat {
+                wire["stream_options"] = serde_json::json!({ "include_usage": true });
+            }
+        }
 
         // Hartes Nebenläufigkeits-Limit (siehe [`Self::concurrency_limiter`]):
         // blockiert, bis ein Slot frei wird, statt fehlzuschlagen. Der
@@ -3546,7 +3568,11 @@ impl OpenAiResponsesProvider {
         let retry_after_ms = header_string(response.headers(), "retry-after-ms");
         let request_id = provider_request_id(response.headers());
         let value: Value = if status.is_success() && self.codex_route.is_some() {
-            codex::read_response(response).await?
+            codex::read_response(response, request.stream.as_ref()).await?
+        } else if status.is_success()
+            && let Some(sink) = stream_sink
+        {
+            read_native_stream(response, self.transport, sink).await?
         } else {
             let body = response
                 .text()
@@ -3607,6 +3633,37 @@ impl OpenAiResponsesProvider {
             call.name = ToolName::new(names.decode(call.name.as_str()));
         }
         Ok(response)
+    }
+}
+
+/// Liest eine gestreamte Responses-/Chat-Antwort und rekonstruiert daraus den
+/// nicht-gestreamten Body; Deltas gehen live an `sink`.
+async fn read_native_stream(
+    response: reqwest::Response,
+    transport: Transport,
+    sink: &harw_core::StreamSink,
+) -> Result<Value, ModelError> {
+    match transport {
+        Transport::Chat => {
+            let mut accumulator = sse::ChatStreamAccumulator::default();
+            sse::read_sse(response, |frame| accumulator.push(&frame, Some(sink))).await?;
+            accumulator.finish()
+        }
+        Transport::Responses => {
+            let mut terminal = None;
+            sse::read_sse(response, |frame| {
+                if frame.data.trim().is_empty() || frame.data.trim() == "[DONE]" {
+                    return Ok(false);
+                }
+                let event: Value = serde_json::from_str(&frame.data)?;
+                terminal = sse::responses_event(&event, Some(sink))?;
+                Ok(terminal.is_some())
+            })
+            .await?;
+            terminal.ok_or_else(|| ModelError::Truncated {
+                message: "response stream ended before its terminal event".into(),
+            })
+        }
     }
 }
 
@@ -4416,6 +4473,7 @@ mod tests {
         auth_env: &str,
     ) -> harw_config::ProviderToml {
         harw_config::ProviderToml {
+            stream: None,
             name: name.to_owned(),
             api: "openai-chat".to_owned(),
             base_url,
@@ -4928,6 +4986,7 @@ mod tests {
 
     fn request_with_ids(model_id: Option<&str>, provider_id: Option<&str>) -> ModelRequest {
         ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -5351,6 +5410,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Hi there");
         let request = ModelRequest {
+            stream: None,
             system_prompt: "You are terse.".to_owned(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -5401,6 +5461,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Only user");
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -5572,6 +5633,7 @@ mod tests {
         assert_eq!(
             usage,
             TokenUsage {
+                cache_separate: false,
                 input_tokens: 12,
                 output_tokens: 34,
                 reasoning_tokens: Some(7),
@@ -5595,6 +5657,7 @@ mod tests {
         assert_eq!(
             usage,
             TokenUsage {
+                cache_separate: false,
                 input_tokens: 20,
                 output_tokens: 5,
                 reasoning_tokens: Some(2),
@@ -5659,6 +5722,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Hi there");
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -5689,6 +5753,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Hi there");
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -5719,6 +5784,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Hi there");
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -5856,6 +5922,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("weather?");
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -5886,6 +5953,7 @@ mod tests {
             serde_json::json!({"location": "Paris"}),
         );
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -5931,6 +5999,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("weather?");
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -5971,6 +6040,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("hi");
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -5999,6 +6069,7 @@ mod tests {
             serde_json::json!({"location": "Paris"}),
         );
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -6063,6 +6134,7 @@ mod tests {
             5,
         );
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -6119,6 +6191,7 @@ mod tests {
             5,
         );
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -6193,6 +6266,7 @@ mod tests {
             serde_json::json!({"location": "Paris"}),
         );
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -6246,6 +6320,7 @@ mod tests {
             5,
         );
         let request = ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),
@@ -6711,6 +6786,7 @@ mod tests {
 
     fn anthropic_provider_without_auth(base_url: &str) -> harw_config::ProviderToml {
         harw_config::ProviderToml {
+            stream: None,
             name: "anthropic".to_owned(),
             api: "anthropic-messages".to_owned(),
             base_url: base_url.to_owned(),
@@ -7503,6 +7579,7 @@ mod tests {
         let mut history = harw_core::ConversationHistory::new();
         history.push_user_text("Say hello in one word.");
         let request = ModelRequest {
+            stream: None,
             system_prompt: "You are terse.".to_owned(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),

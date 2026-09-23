@@ -282,14 +282,17 @@ pub(crate) fn prepare_body(body: &mut Value) {
 
 /// Read SSE incrementally and retain only one bounded event. Never execute
 /// partial tool calls: the terminal response is the sole source of results.
-pub(crate) async fn read_response(mut response: reqwest::Response) -> Result<Value, ModelError> {
+pub(crate) async fn read_response(
+    mut response: reqwest::Response,
+    sink: Option<&harw_core::StreamSink>,
+) -> Result<Value, ModelError> {
     let mut decoder = ResponseDecoder::default();
     while let Some(chunk) = response
         .chunk()
         .await
         .map_err(|error| crate::error::model_error_for_transport(error, true))?
     {
-        if let Some(value) = decoder.push(&chunk)? {
+        if let Some(value) = decoder.push(&chunk, sink)? {
             return Ok(value);
         }
     }
@@ -305,7 +308,11 @@ struct ResponseDecoder {
 }
 
 impl ResponseDecoder {
-    fn push(&mut self, bytes: &[u8]) -> Result<Option<Value>, ModelError> {
+    fn push(
+        &mut self,
+        bytes: &[u8],
+        sink: Option<&harw_core::StreamSink>,
+    ) -> Result<Option<Value>, ModelError> {
         for &byte in bytes {
             if byte != b'\n' {
                 if self.line.len() + self.data.len() >= MAX_EVENT_BYTES {
@@ -345,7 +352,11 @@ impl ResponseDecoder {
                             "Codex response stream reported a failure".into(),
                         ));
                     }
-                    _ => {}
+                    // Live-Deltas (Text/Reasoning/Tool-Argumente) weiterreichen;
+                    // ausgeführt wird weiterhin nur die Terminal-Antwort.
+                    _ => {
+                        crate::sse::responses_event(&event, sink)?;
+                    }
                 }
             } else if let Some(data) = self.line.strip_prefix(b"data:") {
                 let data = data.strip_prefix(b" ").unwrap_or(data);
@@ -369,6 +380,7 @@ mod tests {
     fn provider(base_url: &str, pointer: &str) -> TestResult<ProviderToml> {
         let home = std::env::var_os("HOME").ok_or(TestError::Missing("HOME"))?;
         Ok(ProviderToml {
+            stream: None,
             name: "openai".into(),
             api: "openai-responses".into(),
             base_url: base_url.into(),
@@ -600,7 +612,7 @@ mod tests {
         let mut decoder = ResponseDecoder::default();
         let mut result = None;
         for chunk in stream.as_bytes().chunks(3) {
-            result = decoder.push(chunk).map_err(ctx("decoder push"))?.or(result);
+            result = decoder.push(chunk, None).map_err(ctx("decoder push"))?.or(result);
         }
         assert_eq!(result, Some(response));
         Ok(())
@@ -609,7 +621,7 @@ mod tests {
     #[test]
     fn sse_failure_and_incomplete_are_not_successful_tool_responses() -> TestResult {
         let Err(error) = ResponseDecoder::default()
-            .push(b"data: {\"type\":\"error\",\"message\":\"private\"}\n\n")
+            .push(b"data: {\"type\":\"error\",\"message\":\"private\"}\n\n", None)
         else {
             return Err(TestError::Unexpected(
                 "decoder push must fail on an error event".into(),
@@ -617,18 +629,18 @@ mod tests {
         };
         assert!(error.to_string().find("private").is_none());
         let value = ResponseDecoder::default()
-            .push(b"data: {\"type\":\"response.incomplete\",\"response\":{\"output\":[]}}\n\n")
+            .push(b"data: {\"type\":\"response.incomplete\",\"response\":{\"output\":[]}}\n\n", None)
             .map_err(ctx("decoder push"))?
             .ok_or(TestError::Missing("decoded response value"))?;
         assert_eq!(value["status"], "incomplete");
         assert!(
             ResponseDecoder::default()
-                .push(b"data: not-json\n\n")
+                .push(b"data: not-json\n\n", None)
                 .is_err()
         );
         assert!(
             ResponseDecoder::default()
-                .push(b"data: {\"type\":\"response.completed\"}\n\n")
+                .push(b"data: {\"type\":\"response.completed\"}\n\n", None)
                 .is_err()
         );
         Ok(())

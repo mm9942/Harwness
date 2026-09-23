@@ -907,6 +907,20 @@ pub struct ChatApp {
     /// Über die Session-Laufzeit aufsummierte Token-Nutzung (aus
     /// `SessionEvent::TurnCompleted`). Wird in der Statuszeile angezeigt.
     total_usage: TokenUsage,
+    /// Live-Zustand aller Agenten (Wurzel, Kinder, UIA-Worker) aus dem
+    /// agenten-übergreifenden Bus; speist Agenten-Panel und Statuszeile.
+    agent_monitor: crate::agent_monitor::AgentMonitor,
+    /// Abonnement auf [`harw_core::AgentEventHub`]; nicht-blockierend geleert
+    /// bei jedem Spinner-Tick und jedem Turn-Event ([`Self::drain_agent_events`]).
+    agent_rx: Option<tokio::sync::broadcast::Receiver<harw_core::AgentEvent>>,
+    /// Live gestreamter Assistant-Text der laufenden Modell-Runde der Wurzel;
+    /// transient unter dem Verlauf gezeichnet, geleert sobald die finale
+    /// Nachricht als Zelle vorliegt.
+    live_stream: String,
+    /// Live gestreamtes Reasoning der laufenden Runde (nur Vorschau).
+    live_reasoning: String,
+    /// Sichtbarkeit und Fokus der Seitenpanels.
+    panels: crate::panes::PanelState,
     /// `/`-Command-Adapter, gebaut aus der `OperationRegistry`
     /// (`CommandAdapter::from_operation` pro registrierter Op). Treibt die
     /// echte Ausführung von `/command`-Zeilen (siehe [`Self::adapters`]).
@@ -1196,6 +1210,11 @@ impl ChatApp {
             command_popup: None,
             theme: style::detect_theme(),
             total_usage: TokenUsage::default(),
+            agent_monitor: crate::agent_monitor::AgentMonitor::default(),
+            agent_rx: None,
+            live_stream: String::new(),
+            live_reasoning: String::new(),
+            panels: crate::panes::PanelState::default(),
             adapters,
             sandbox,
             session_id,
@@ -2014,9 +2033,64 @@ impl ChatApp {
     /// The project root as set by [`with_project_root`][Self::with_project_root],
     /// or an empty string if none was detected.
     #[must_use]
-    #[allow(dead_code)] // Consumed by header rendering in a future wave.
     pub(crate) fn project_root(&self) -> &str {
         &self.project_root
+    }
+
+    /// Abonniert den agenten-übergreifenden Live-Bus des Laufs.
+    pub(crate) fn attach_agent_events(&mut self, hub: &harw_core::AgentEventHub) {
+        self.agent_rx = Some(hub.subscribe());
+    }
+
+    /// Übernimmt die bereits verbrauchte Nutzung einer fortgesetzten Sitzung
+    /// in Statuszeile und Agenten-Panel (sonst begänne `/resume` bei 0).
+    pub(crate) fn seed_session_usage(&mut self, agent: &str, usage: &TokenUsage) {
+        if *usage == TokenUsage::default() {
+            return;
+        }
+        self.total_usage = usage.clone();
+        self.agent_monitor
+            .seed_usage(agent, "assistant", usage.clone());
+    }
+
+    /// Leert den Live-Bus nicht-blockierend in den [`crate::agent_monitor::AgentMonitor`].
+    /// Liefert `true`, wenn sich Sichtbares geändert hat.
+    pub(crate) fn drain_agent_events(&mut self) -> bool {
+        let Some(rx) = self.agent_rx.as_mut() else {
+            return false;
+        };
+        let mut changed = false;
+        loop {
+            match rx.try_recv() {
+                Ok(event) => changed |= self.agent_monitor.apply(&event),
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                    tracing::debug!(skipped, "tui.agent_events.lagged");
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                    self.agent_rx = None;
+                    break;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Verwirft den transienten Streaming-Text (finale Zelle liegt vor).
+    pub(crate) fn clear_live_stream(&mut self) {
+        self.live_stream.clear();
+        self.live_reasoning.clear();
+    }
+
+    /// Token-Summe für die Statuszeile: live über alle Agenten, sobald der
+    /// Bus Daten liefert, sonst die Turn-Summen aus `SessionEvent`s.
+    fn display_usage(&self) -> TokenUsage {
+        let live = self.agent_monitor.totals();
+        if live.total() >= self.total_usage.total() {
+            live
+        } else {
+            self.total_usage.clone()
+        }
     }
 
     /// Gibt das optional registrierte Memory-Backend zurück.
@@ -3728,6 +3802,7 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             arguments,
             ..
         } => {
+            app.clear_live_stream();
             let already_known = state.pending_tool_cells.contains_key(&call_id);
             let call = ToolCall {
                 id: call_id.clone(),
@@ -3851,10 +3926,44 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             app.push_cell(Box::new(ReasoningHistoryCell { summary }));
             true
         }
+        TurnEvent::AssistantDelta { text, .. } => {
+            app.live_stream.push_str(&text);
+            true
+        }
+        TurnEvent::ReasoningDelta { text, .. } => {
+            app.live_reasoning.push_str(&text);
+            // Nur ein kurzer Schwanz bleibt sichtbar.
+            let count = app.live_reasoning.chars().count();
+            if count > 400 {
+                app.live_reasoning = app.live_reasoning.chars().skip(count - 400).collect();
+            }
+            true
+        }
+        TurnEvent::CompactionApplied {
+            reason,
+            items_before,
+            items_after,
+            ..
+        } => {
+            app.push_line(
+                Role::System,
+                format!("⟲ Kontext verdichtet ({reason}): {items_before} → {items_after} Einträge"),
+            );
+            true
+        }
+        TurnEvent::UsageUpdated { .. } | TurnEvent::ContextUpdated { .. } => {
+            // Die Werte selbst liest die Statuszeile aus dem Agenten-Monitor
+            // (Bus); hier nur ein Redraw-Anstoß.
+            app.drain_agent_events();
+            true
+        }
         TurnEvent::ItemAdded {
             item: TurnItem::AssistantMessage(message),
             ..
         } => {
+            // Die Runde ist fertig: der gestreamte Vorschautext wird durch die
+            // echte Nachricht ersetzt (Commentary hier, Final via reveal_reply).
+            app.clear_live_stream();
             // Nur der kurze Zwischentext vor einem Tool-Aufruf wird hier live
             // gerendert. Die finale Turn-Antwort bleibt exklusiv `reveal_reply`
             // am Turn-Ende vorbehalten (sonst erschiene sie doppelt: einmal
@@ -4816,7 +4925,41 @@ fn handle_agent_tree_key(app: &mut ChatApp, key: KeyEvent) {
 /// # Rückgabe
 /// `true` wenn ein Redraw angefordert werden soll, sonst `false`.
 fn handle_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
+    if let Some(redraw) = handle_panel_key(app, key) {
+        return redraw;
+    }
     scroll_and_composer_key(app, key, bus)
+}
+
+/// Panel-Tasten (F2/F3/F4/F11/Esc und Navigation im fokussierten Panel).
+/// `None`: Taste gehört dem Chat/Composer.
+fn handle_panel_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
+    // Ein offenes Popup/Dialog behält Esc & Pfeile für sich.
+    if app.command_popup.as_ref().is_some_and(|p| !p.is_empty())
+        || app.pending_approval_dialog.is_some()
+        || app.pending_host_permit_dialog.is_some()
+    {
+        return None;
+    }
+    match app.panels.handle_key(key) {
+        crate::panes::PanelKey::Ignored => None,
+        crate::panes::PanelKey::Changed => Some(true),
+        crate::panes::PanelKey::ForFocused(key) => Some(match app.panels.focus {
+            crate::panes::PaneFocus::Agents => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.agent_monitor.select_next();
+                    true
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.agent_monitor.select_prev();
+                    true
+                }
+                _ => false,
+            },
+            crate::panes::PaneFocus::Explorer => handle_explorer_key(app, key),
+            crate::panes::PaneFocus::Chat => false,
+        }),
+    }
 }
 
 /// Entscheidet, ob eine Taste zuerst dem Transkript-Scroll ([`ChatScroll`])
@@ -4836,7 +4979,7 @@ fn handle_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
 fn scroll_claims_key(app: &ChatApp, key: &KeyEvent) -> bool {
     let is_ctrl_home_end = key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Home | KeyCode::End);
-    !(is_ctrl_home_end && !app.input.is_empty())
+    !is_ctrl_home_end || app.input.is_empty()
 }
 
 fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
@@ -5522,6 +5665,7 @@ async fn drive_turn_animated(
                     }
                     _ = tokio::time::sleep(SPINNER_INTERVAL) => {
                         spinner.tick();
+                        app.drain_agent_events();
                         draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                     }
                 }
@@ -5546,6 +5690,7 @@ async fn drive_turn_animated(
                 while tokio::time::Instant::now() < deadline {
                     tokio::time::sleep(SPINNER_INTERVAL).await;
                     spinner.tick();
+                    app.drain_agent_events();
                     draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                 }
                 // Nächster Schleifendurchlauf: leerer Retry-Input.
@@ -6539,6 +6684,7 @@ async fn drive_pauses_to_completion(
             }
             _ = tokio::time::sleep(SPINNER_INTERVAL) => {
                 spinner.tick();
+                app.drain_agent_events();
                 draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
             }
         }
@@ -6685,6 +6831,18 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
             handle_agent_tree_key(app, *key);
             return BusyKeyOutcome::Redraw;
         }
+        // Panels bleiben auch während eines Turns bedienbar — gerade dann
+        // will man den Agenten zusehen.
+        if !(key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c' | 'C')))
+            && let Some(redraw) = handle_panel_key(app, *key)
+        {
+            return if redraw {
+                BusyKeyOutcome::Redraw
+            } else {
+                BusyKeyOutcome::Idle
+            };
+        }
     }
     let total = app.last_history_total_lines() as usize;
     let rows = app.last_history_visible_rows() as usize;
@@ -6790,13 +6948,36 @@ async fn reveal_reply(
     app: &mut ChatApp,
     reply: &str,
 ) -> Result<(), TuiError> {
-    // Vollständige Antwort in genau EINE finalisierte Zelle. Kein Chunk-Push
-    // mehr — der frühere Streaming-Preview hat für jede Zeile eine eigene
-    // Fragment-Zelle erzeugt und danach die Gesamtantwort noch einmal
-    // gepusht, was zu doppelten Antworten im Chat führte.
+    // Vollständige Antwort in genau EINE finalisierte Zelle. Der live
+    // gestreamte Vorschautext (`live_stream`) war nur transient und wird hier
+    // durch die finale Zelle ersetzt — so entsteht keine Doppelanzeige.
+    app.clear_live_stream();
     app.push_line(Role::Assistant, reply);
     draw_viewport(guard, app, &Spinner::new(), None)?;
     Ok(())
+}
+
+/// Tasten für das fokussierte Explorer-Panel.
+fn handle_explorer_key(_app: &mut ChatApp, _key: KeyEvent) -> bool {
+    false
+}
+
+/// Zeichnet das Explorer-Panel.
+fn render_explorer_panel(
+    _app: &ChatApp,
+    area: Rect,
+    buf: &mut ratatui::buffer::Buffer,
+    theme: style::Theme,
+) {
+    use ratatui::widgets::{Block, Borders, Widget};
+    Paragraph::new(Line::styled("Explorer wird indiziert…", style::dim_style(theme)))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(style::border_color(theme)))
+                .title(" Explorer "),
+        )
+        .render(area, buf);
 }
 
 /// Zeichnet die Fullscreen-Viewport: scrollbare History oben und Eingabebox unten.
@@ -6894,21 +7075,58 @@ fn render_viewport(
             Constraint::Length(input_height),
         ])
         .split(area);
-    let history_area = chunks[0];
     let status_area = chunks[1];
     let input_area = chunks[2];
+    // Seitenpanels (Explorer links, Agenten rechts) teilen sich die obere
+    // Fläche mit dem Verlauf; auf schmalen Terminals bleibt nur der Chat.
+    let pane_areas = crate::panes::split(chunks[0], &app.panels);
+    if let Some(agents_area) = pane_areas.agents {
+        crate::agent_monitor::render_agents_panel(
+            &app.agent_monitor,
+            agents_area,
+            frame.buffer_mut(),
+            theme,
+            app.panels.focus == crate::panes::PaneFocus::Agents,
+        );
+    }
+    if let Some(explorer_area) = pane_areas.explorer {
+        render_explorer_panel(app, explorer_area, frame.buffer_mut(), theme);
+    }
+    let history_area = pane_areas.chat.unwrap_or(Rect::new(chunks[0].x, chunks[0].y, 0, 0));
     let permission = match app.current_permission_stage() {
         PermissionCycleStage::Ask => "Ask",
         PermissionCycleStage::Auto => "Auto",
         PermissionCycleStage::Full => "Full Access",
         PermissionCycleStage::Plan => "Plan",
     };
-    let cached = app.total_usage.cached_tokens.unwrap_or(0);
-    let cache_write = app.total_usage.cache_write_tokens.unwrap_or(0);
+    let usage = app.display_usage();
+    let cached = usage.cached_tokens.unwrap_or(0);
+    let cache_write = usage.cache_write_tokens.unwrap_or(0);
     let cache_suffix = if cached > 0 || cache_write > 0 {
-        format!(", cache {cached} / neu {cache_write}")
+        format!(
+            ", cache {} / neu {}",
+            crate::agent_monitor::human_tokens(cached),
+            crate::agent_monitor::human_tokens(cache_write)
+        )
     } else {
         String::new()
+    };
+    // Kontextfenster der Wurzel als Balken (aus `ContextUpdated`).
+    let context_suffix = app
+        .agent_monitor
+        .agent(app.session_id().as_str())
+        .and_then(|root| Some((root.context_percent()?, root.context_window)))
+        .map(|(pct, window)| {
+            format!(
+                " | ctx {} {pct}% / {}",
+                crate::agent_monitor::gauge(pct, 8),
+                crate::agent_monitor::human_tokens(window)
+            )
+        })
+        .unwrap_or_default();
+    let agents_suffix = match app.agent_monitor.active_count() {
+        0 | 1 => String::new(),
+        n => format!(" | {n} Agenten aktiv"),
     };
     // Spinner-Präfix: solange ein Turn läuft, zeigt die Statuszeile das
     // animierte Glyph plus Label — vorher wurde `spinner`/`quit_hint` zwar
@@ -6980,11 +7198,11 @@ fn render_viewport(
         .map(|_| " · Freigabemodus wird nach dem Turn übernommen")
         .unwrap_or("");
     let status = format!(
-        " {spinner_prefix}Shift+Tab: {permission} | Modus: {} | Tokens: {} (in {}, out {}{cache_suffix}){cancel_suffix}{queue_cleared_suffix}{quit_suffix}{queue_suffix}{tool_suffix}{pending_permission_suffix}",
+        " {spinner_prefix}Shift+Tab: {permission} | Modus: {} | Σ Tokens: {} (in {}, out {}{cache_suffix}){context_suffix}{agents_suffix}{cancel_suffix}{queue_cleared_suffix}{quit_suffix}{queue_suffix}{tool_suffix}{pending_permission_suffix}",
         app.active_mode().as_str(),
-        app.total_usage.total(),
-        app.total_usage.input_tokens,
-        app.total_usage.output_tokens,
+        crate::agent_monitor::human_tokens(usage.total()),
+        crate::agent_monitor::human_tokens(usage.prompt_tokens()),
+        crate::agent_monitor::human_tokens(usage.output_tokens),
     );
     // Solange eine Host-Arbeitsphase läuft, muss die Statuszeile das gemäß
     // `docs/design/mediated-process-execution.md` („permanent und
@@ -7012,11 +7230,28 @@ fn render_viewport(
     // ── History ──────────────────────────────────────────────────────
     // Alle Zellen zu einem flachen Zeilen-Vec zusammenführen.
     let width = history_area.width;
-    let all_lines: Vec<Line<'static>> = app
+    let mut all_lines: Vec<Line<'static>> = app
         .cells
         .iter()
         .flat_map(|cell| cell.display_lines(width, theme))
         .collect();
+    // Transient: live gestreamtes Reasoning/Text der laufenden Runde.
+    if !app.live_reasoning.is_empty() {
+        all_lines.push(Line::styled(
+            format!("  ∴ {}", crate::sanitize::sanitize_inline(&app.live_reasoning)),
+            style::dim_style(theme),
+        ));
+    }
+    if !app.live_stream.is_empty() {
+        for (index, text) in app.live_stream.lines().enumerate() {
+            let prefix = if index == 0 { "● " } else { "  " };
+            all_lines.push(Line::styled(
+                format!("{prefix}{}", crate::sanitize::sanitize_inline(text)),
+                style::assistant_style(theme),
+            ));
+        }
+        all_lines.push(Line::styled("  ▍", style::dim_style(theme)));
+    }
 
     // Scroll-Offset: 0 = ganz unten; wächst nach oben.
     // Gesamtzeilen → sichtbaren Bereich berechnen → Paragraph.scroll() aufrufen.

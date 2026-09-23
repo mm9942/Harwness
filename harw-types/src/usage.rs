@@ -14,6 +14,12 @@ pub struct TokenUsage {
     /// angefallen sind (z. B. `cache_creation_input_tokens`).
     #[serde(default)]
     pub cache_write_tokens: Option<u64>,
+    /// `true`, wenn der Provider Cache-Tokens **getrennt** von
+    /// `input_tokens` meldet (Anthropic: `input_tokens` zählt nur den
+    /// ungecachten Rest). `false` (OpenAI-Semantik): `cached_tokens` ist eine
+    /// Teilmenge von `input_tokens`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cache_separate: bool,
 }
 
 impl TokenUsage {
@@ -23,6 +29,19 @@ impl TokenUsage {
         self.input_tokens.saturating_add(self.output_tokens)
     }
 
+    /// Alle Prompt-Tokens dieses Aufrufs inklusive Cache-Read/-Write —
+    /// die tatsächliche Kontextfenster-Belegung vor der Ausgabe.
+    #[must_use]
+    pub fn prompt_tokens(&self) -> u64 {
+        if self.cache_separate {
+            self.input_tokens
+                .saturating_add(self.cached_tokens.unwrap_or(0))
+                .saturating_add(self.cache_write_tokens.unwrap_or(0))
+        } else {
+            self.input_tokens
+        }
+    }
+
     /// Akkumuliert eine weitere Nutzung in `self`.
     pub fn add(&mut self, other: &TokenUsage) {
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
@@ -30,6 +49,7 @@ impl TokenUsage {
         self.reasoning_tokens = sum_opt(self.reasoning_tokens, other.reasoning_tokens);
         self.cached_tokens = sum_opt(self.cached_tokens, other.cached_tokens);
         self.cache_write_tokens = sum_opt(self.cache_write_tokens, other.cache_write_tokens);
+        self.cache_separate |= other.cache_separate;
     }
 }
 
@@ -37,5 +57,28 @@ fn sum_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     match (a, b) {
         (None, None) => None,
         (x, y) => Some(x.unwrap_or(0).saturating_add(y.unwrap_or(0))),
+    }
+}
+
+#[cfg(test)]
+mod prompt_token_tests {
+    use super::TokenUsage;
+
+    #[test]
+    fn prompt_tokens_respects_cache_semantics() {
+        let anthropic = TokenUsage {
+            input_tokens: 10,
+            cached_tokens: Some(90),
+            cache_write_tokens: Some(5),
+            cache_separate: true,
+            ..TokenUsage::default()
+        };
+        assert_eq!(anthropic.prompt_tokens(), 105);
+        let openai = TokenUsage {
+            input_tokens: 100,
+            cached_tokens: Some(90),
+            ..TokenUsage::default()
+        };
+        assert_eq!(openai.prompt_tokens(), 100);
     }
 }

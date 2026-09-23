@@ -91,6 +91,7 @@ pub fn seed_profile_providers(profile_dir: &Path) -> CatalogResult<Vec<PathBuf>>
 /// Bildet einen Katalogeintrag auf seine deaktivierte Profil-Repräsentation ab.
 fn provider_toml_from(spec: &ProviderSpec) -> ProviderToml {
     ProviderToml {
+        stream: None,
         name: spec.id.clone(),
         api: api_name(spec),
         base_url: spec.base_url.clone(),

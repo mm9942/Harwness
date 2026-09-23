@@ -179,6 +179,7 @@ mod tests {
     // Historie, angelehnt an `request_with_ids` in `anthropic.rs`.
     fn request_with_tools(tools: Vec<ToolSpec>) -> ModelRequest {
         ModelRequest {
+            stream: None,
             system_prompt: String::new(),
             instruction_fragments: Vec::new(),
             context: Vec::new(),

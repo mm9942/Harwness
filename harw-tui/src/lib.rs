@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub(crate) mod agent_monitor;
 pub(crate) mod agent_tree;
 pub mod app;
 pub mod approval;
@@ -31,6 +32,7 @@ pub(crate) mod input_history;
 pub(crate) mod input_reader;
 pub mod model_picker;
 pub(crate) mod model_switch_picker;
+pub(crate) mod panes;
 mod registry;
 pub mod relative_time;
 pub(crate) mod runtime_commands;

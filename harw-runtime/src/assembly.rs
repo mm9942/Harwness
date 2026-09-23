@@ -1145,6 +1145,9 @@ pub struct RuntimeAssemblyBuilder {
     /// [`Self::build`] mit den Beiträgen der [`AssemblyContributor`]s
     /// zusammengeführt.
     extra_lifecycle_hooks: Vec<Arc<dyn SessionLifecycleHook>>,
+    /// Agenten-übergreifender Live-Bus; ohne expliziten Aufruf legt
+    /// [`Self::build`] einen frischen an.
+    agent_events: Option<harw_core::AgentEventHub>,
 }
 
 impl std::fmt::Debug for RuntimeAssemblyBuilder {
@@ -1263,6 +1266,13 @@ impl RuntimeAssemblyBuilder {
     /// genau diese Kennung als vertrauenswürdige Wurzel registriert
     /// (`ManagedAgentSpawner::with_external_root_parent`), und eine zweite
     /// Registrierung ist dort ausgeschlossen.
+    #[must_use]
+    pub fn agent_events(mut self, hub: harw_core::AgentEventHub) -> Self {
+        self.agent_events = Some(hub);
+        self
+    }
+
+    /// Setzt die Kennung der Wurzelsitzung (siehe unten).
     #[must_use]
     pub fn root_session_id(mut self, id: SessionId) -> Self {
         self.root_session_id = Some(id);
@@ -1392,7 +1402,9 @@ impl RuntimeAssemblyBuilder {
             project_facts,
             global_facts,
             extra_lifecycle_hooks,
+            agent_events,
         } = self;
+        let agent_events = agent_events.unwrap_or_default();
 
         let model_source = model.ok_or_else(|| RuntimeError::Provider {
             detail: "no model source was given to the runtime builder".to_owned(),
@@ -1909,6 +1921,7 @@ impl RuntimeAssemblyBuilder {
                 sandbox_profile: &sandbox_profile,
                 host_permit_wiring: &host_permit_wiring_for_children,
                 state_store: Arc::clone(&stores.state_store),
+                agent_events: agent_events.clone(),
             },
             session_events,
         )?;
@@ -2129,6 +2142,7 @@ impl RuntimeAssemblyBuilder {
             stores,
             spawner,
             spawner_roles,
+            agent_events,
             lifecycle_hooks,
             tools,
             root_session_id,
@@ -3069,6 +3083,8 @@ struct SpawnerInputs<'a> {
     host_permit_wiring: &'a Option<HostPermitWiring>,
     /// Shared transcript/state store used by lifecycle observer records.
     state_store: Arc<dyn StateStore>,
+    /// Live-Bus des Laufs; jedes Kind bekommt ihn über den SessionManager.
+    agent_events: harw_core::AgentEventHub,
 }
 
 /// Montiert den Spawner eines Laufs nach seiner [`SpawnerPolicy`].
@@ -3108,6 +3124,7 @@ fn build_spawner(
         sandbox_profile,
         host_permit_wiring,
         state_store,
+        agent_events,
     } = inputs;
 
     let events = session_events.ok_or_else(|| RuntimeError::Spawner {
@@ -3190,9 +3207,16 @@ fn build_spawner(
     );
 
     let model_id = config.harness.default_model.as_deref().unwrap_or_default();
-    let manager = Arc::new(std::sync::Mutex::new(SessionManager::new(events)));
+    let manager = Arc::new(std::sync::Mutex::new(
+        SessionManager::new(events).with_agent_events(agent_events.clone()),
+    ));
     let mut spawner = ManagedAgentSpawner::new(manager, child_limits(config, model_id))
-        .with_orchestration_observer(Arc::new(StateStoreOrchestrationObserver { state_store }))
+        // Orchestrierungs-Events gehen live auf den Bus und danach in den
+        // persistierenden StateStore-Observer.
+        .with_orchestration_observer(Arc::new(harw_core::HubOrchestrationObserver::new(
+            agent_events,
+            Some(Arc::new(StateStoreOrchestrationObserver { state_store })),
+        )))
         // Addendum F+G: Rollen-Reasoning-Gewichtung und Drift-Beobachter
         // gelten für jedes über diesen Spawner admittierte Kind.
         .with_role_effort_weights(Some(crate::guard_wiring::role_effort_weights_from_config(
@@ -3304,6 +3328,8 @@ pub struct RuntimeAssembly {
     stores: RuntimeStores,
     spawner: Option<Arc<ManagedAgentSpawner>>,
     spawner_roles: Vec<String>,
+    /// Agenten-übergreifender Live-Bus (Wurzel + alle Kinder).
+    agent_events: harw_core::AgentEventHub,
     lifecycle_hooks: Vec<Arc<dyn SessionLifecycleHook>>,
     tools: Vec<String>,
     root_session_id: SessionId,
@@ -3399,6 +3425,7 @@ impl RuntimeAssembly {
             project_facts: None,
             global_facts: None,
             extra_lifecycle_hooks: Vec::new(),
+            agent_events: None,
         }
     }
 
@@ -3738,6 +3765,14 @@ impl RuntimeAssembly {
         self.spawner.as_ref()
     }
 
+    /// Der agenten-übergreifende Live-Bus dieses Laufs. Beobachter (TUI,
+    /// Web, Telemetrie) abonnieren ihn über
+    /// [`harw_core::AgentEventHub::subscribe`].
+    #[must_use]
+    pub fn agent_events(&self) -> &harw_core::AgentEventHub {
+        &self.agent_events
+    }
+
     /// Die Kennung der Wurzelsitzung.
     ///
     /// # Beschreibung
@@ -3884,6 +3919,7 @@ impl RuntimeAssembly {
                 .with_spawn_context(self.spawn_context.clone())
                 .with_reasoning_effort(reasoning_effort)
                 .with_turn_event_sink(turn_events)
+                .with_agent_events(self.agent_events.clone())
                 .with_auto_compact(Some(
                     harw_core::AutoCompactPolicy::for_context_window(context_window)
                         .with_absolute_ceiling(Some(
@@ -4148,6 +4184,7 @@ mod tests {
     fn two_provider_config() -> ResolvedConfig {
         fn loopback_provider(name: &str) -> harw_config::ProviderToml {
             harw_config::ProviderToml {
+                stream: None,
                 name: name.to_owned(),
                 api: "openai-chat".to_owned(),
                 base_url: "http://127.0.0.1:11434/v1".to_owned(),

@@ -36,6 +36,11 @@ pub struct ModelToml {
     /// gegenüber Provider-/Agenten-Ebene ist NICHT Teil dieser Änderung.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_reasoning_effort: Option<ReasoningEffort>,
+    /// Token-Streaming (SSE) für genau dieses Modell; übersteuert
+    /// `ProviderToml::stream`. `false` erzwingt den Pro-Runde-Fallback
+    /// (z. B. für Gateways ohne SSE-Unterstützung).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
 }
 
 /// Steuert, wie Prompt-Caching für ein Modell angewendet wird.

@@ -13,6 +13,9 @@ use tokio::sync::mpsc;
 pub struct SessionManager {
     sessions: HashMap<String, AgentSession>,
     event_tx: mpsc::UnboundedSender<SessionEvent>,
+    /// Live-Bus, den jede hier angelegte oder wieder eingesetzte Session
+    /// bekommt (Wurzel, Kinder, UIA-Worker).
+    agent_events: Option<crate::agent_events::AgentEventHub>,
 }
 
 impl SessionManager {
@@ -20,6 +23,26 @@ impl SessionManager {
         Self {
             sessions: HashMap::new(),
             event_tx,
+            agent_events: None,
+        }
+    }
+
+    /// Hängt jeder von diesem Manager verwalteten Session den Live-Bus an.
+    #[must_use]
+    pub fn with_agent_events(mut self, hub: crate::agent_events::AgentEventHub) -> Self {
+        self.agent_events = Some(hub);
+        self
+    }
+
+    /// Der Live-Bus dieses Managers, falls gesetzt.
+    #[must_use]
+    pub fn agent_events(&self) -> Option<&crate::agent_events::AgentEventHub> {
+        self.agent_events.as_ref()
+    }
+
+    fn attach_hub(&self, session: &mut AgentSession) {
+        if session.agent_events().is_none() {
+            session.set_agent_events(self.agent_events.clone());
         }
     }
 
@@ -29,7 +52,8 @@ impl SessionManager {
         parent: Option<SessionId>,
         registry: ExtensionRegistry,
     ) -> SessionId {
-        let session = AgentSession::new(role, parent, registry, self.event_tx.clone());
+        let mut session = AgentSession::new(role, parent, registry, self.event_tx.clone());
+        self.attach_hub(&mut session);
         let id = session.id().clone();
         self.sessions.insert(id.as_str().to_owned(), session);
         id
@@ -44,8 +68,9 @@ impl SessionManager {
         registry: ExtensionRegistry,
         spawn_context: SpawnContext,
     ) -> SessionId {
-        let session = AgentSession::new(role, parent, registry, self.event_tx.clone())
+        let mut session = AgentSession::new(role, parent, registry, self.event_tx.clone())
             .with_spawn_context(spawn_context);
+        self.attach_hub(&mut session);
         let id = session.id().clone();
         self.sessions.insert(id.as_str().to_owned(), session);
         id
@@ -103,7 +128,8 @@ impl SessionManager {
     /// Restores a session temporarily removed for asynchronous execution. A
     /// duplicate id is rejected so a runner cannot overwrite a concurrently
     /// managed session.
-    pub fn restore(&mut self, session: AgentSession) -> CoreResult<()> {
+    pub fn restore(&mut self, mut session: AgentSession) -> CoreResult<()> {
+        self.attach_hub(&mut session);
         let id = session.id().clone();
         if self.sessions.contains_key(id.as_str()) {
             return Err(CoreError::TurnRejected(format!(

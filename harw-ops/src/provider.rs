@@ -1318,6 +1318,7 @@ mod tests {
         config.providers.insert(
             "operator-alias".to_owned(),
             harw_config::ProviderToml {
+                stream: None,
                 name: "canonical-provider".to_owned(),
                 api: "openai-chat".to_owned(),
                 base_url: "https://api.example.test/v1".to_owned(),
@@ -1465,6 +1466,7 @@ mod tests {
         config.providers.insert(
             name.to_owned(),
             harw_config::ProviderToml {
+                stream: None,
                 name: name.to_owned(),
                 api: "openai-chat".to_owned(),
                 base_url: "https://api.example.test/v1".to_owned(),

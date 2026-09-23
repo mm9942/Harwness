@@ -769,6 +769,7 @@ mod tests {
         config.providers.insert(
             "local".to_owned(),
             ProviderToml {
+                stream: None,
                 name: "local".to_owned(),
                 api: "openai-chat".to_owned(),
                 base_url: "http://127.0.0.1:11434/v1".to_owned(),
@@ -795,6 +796,7 @@ mod tests {
         config.providers.insert(
             name.to_owned(),
             ProviderToml {
+                stream: None,
                 name: name.to_owned(),
                 api: "openai-chat".to_owned(),
                 base_url: "http://127.0.0.1:11434/v1".to_owned(),
@@ -817,6 +819,7 @@ mod tests {
     /// Minimale Katalog-Modell-Fixtur für `config.models`.
     fn model_toml(id: &str, provider: &str) -> harw_config::ModelToml {
         harw_config::ModelToml {
+            stream: None,
             id: id.to_owned(),
             name: None,
             provider: provider.to_owned(),
@@ -948,6 +951,7 @@ mod tests {
         config.models.insert(
             "local-model".to_owned(),
             harw_config::ModelToml {
+                stream: None,
                 id: "local-model".to_owned(),
                 name: None,
                 provider: "local".to_owned(),

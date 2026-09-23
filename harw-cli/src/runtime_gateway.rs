@@ -437,6 +437,7 @@ mod tests {
         config.models.insert(
             "catalog-model".to_owned(),
             harw_config::ModelToml {
+                stream: None,
                 id: "catalog-model".to_owned(),
                 name: None,
                 provider: "catalog".to_owned(),
@@ -464,6 +465,7 @@ mod tests {
     /// Minimaler `ProviderToml`-Testfixture mit explizit gesetztem `enabled`.
     fn enabled_provider_toml(name: &str, enabled: bool) -> harw_config::ProviderToml {
         harw_config::ProviderToml {
+            stream: None,
             name: name.to_owned(),
             api: "openai-chat".to_owned(),
             base_url: "https://example.test/v1".to_owned(),

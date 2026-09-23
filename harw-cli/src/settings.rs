@@ -422,6 +422,7 @@ fn add_provider(
     let auth_ref = parse_auth_ref(name, auth)?;
 
     let provider = ProviderToml {
+        stream: None,
         name: name.to_owned(),
         api: api.to_owned(),
         base_url: base_url.to_owned(),

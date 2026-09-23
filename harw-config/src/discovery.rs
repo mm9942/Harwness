@@ -1071,6 +1071,7 @@ fn legacy_provider_references(resolved: &ResolvedConfig) -> HashSet<String> {
 fn legacy_provider(name: &str, enabled: bool) -> Option<ProviderToml> {
     match name {
         "anthropic" => Some(ProviderToml {
+            stream: None,
             name: "anthropic".to_owned(),
             api: "anthropic-messages".to_owned(),
             base_url: "https://api.anthropic.com/v1".to_owned(),

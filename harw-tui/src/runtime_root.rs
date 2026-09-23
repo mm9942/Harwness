@@ -582,6 +582,7 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
     };
     let history = session.history().clone();
     install_loaded_history(&mut session, &mut app, history);
+    app.seed_session_usage(session.id().as_str(), session.total_usage());
     app.set_active_mode(session.mode());
     app.set_historic_agent_events(historic_agents);
     let uia_user_name = active_uia_user_name(&assembly);
@@ -921,7 +922,13 @@ fn build_root_runtime(
         let session_config = &assembly.config().harness.session;
         if session_config.title_generation {
             app = app.with_title_job_context(TitleJobContext {
-                provider: Arc::clone(assembly.model()),
+                // Titel-Aufrufe zählen als interne Nutzung im Agenten-Panel.
+                provider: Arc::new(harw_core::UsageReportingProvider::new(
+                    Arc::clone(assembly.model()),
+                    assembly.agent_events().clone(),
+                    session.id().clone(),
+                    "title",
+                )),
                 session_store_root: store_root.to_path_buf(),
                 title_model: session_config.title_model.clone(),
                 config: Arc::clone(assembly.config()),
@@ -929,6 +936,8 @@ fn build_root_runtime(
         }
     }
     app.set_active_mode(session.mode());
+    // Live-Bus des Laufs: Agenten-Panel, Streaming-Vorschau und Σ-Tokens.
+    app.attach_agent_events(assembly.agent_events());
     tracing::info!(
         session_id = %session.id(),
         mode = session.mode().as_str(),
@@ -1007,6 +1016,9 @@ async fn resume_session(
     };
     let history = runtime.session.history().clone();
     install_loaded_history(&mut runtime.session, &mut runtime.app, history);
+    runtime
+        .app
+        .seed_session_usage(runtime.session.id().as_str(), runtime.session.total_usage());
     runtime.app.set_active_mode(runtime.session.mode());
     runtime.app.set_historic_agent_events(historic_agents);
     let uia_user_name = active_uia_user_name(&assembly);

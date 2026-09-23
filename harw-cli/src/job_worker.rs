@@ -3914,6 +3914,7 @@ mod prompt_claim_guard_tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut response = harw_core::ModelResponse::text("fixed");
             response.usage = TokenUsage {
+                cache_separate: false,
                 input_tokens: self.tokens_per_call,
                 output_tokens: 0,
                 reasoning_tokens: None,

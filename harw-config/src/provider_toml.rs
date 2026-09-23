@@ -58,6 +58,12 @@ pub struct ProviderToml {
     /// bestimmte Wahl, validiert den Wert aber (siehe [`Self::validate`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub originator: Option<String>,
+    /// Token-Streaming (SSE) für alle Modelle dieses Providers. `None` =
+    /// Default: an für native Anthropic-/OpenAI-APIs. Ein Modell kann das
+    /// per `ModelToml::stream` übersteuern. Ohne Streaming meldet der
+    /// Turn-Loop Text und Usage pro Modell-Runde.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
     /// Standard-Reasoning-Effort für Sessions/Kinder, die über diesen
     /// Provider laufen, sofern nicht durch eine spezifischere Ebene
     /// überschrieben (Modell, Agenten-Definition). `None` = keine

@@ -36,6 +36,9 @@ pub struct AgentOrchestrationEvent {
     pub duration_ms: Option<u64>,
     pub progress: Option<u8>,
     pub detail: Option<String>,
+    /// Bisher abgeschlossene Tool-Aufrufe des Kindes (Live-Fortschritt).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<u32>,
 }
 
 impl AgentOrchestrationEvent {

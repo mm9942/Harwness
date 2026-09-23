@@ -166,6 +166,9 @@ pub struct ModelRequest {
     /// `AgentSession`; jeder andere Aufrufer (Tests, `harw-cli`) darf `None`
     /// lassen.
     pub identity: Option<RequestIdentity>,
+    /// Optionaler Live-Sink für Token-Streaming (siehe [`crate::stream`]).
+    /// `None` oder ein nicht streamender Provider ⇒ Pro-Runde-Fallback.
+    pub stream: Option<crate::stream::StreamSink>,
 }
 
 /// Identität des anfragenden Agenten für optionale Gateway-Header (x-harw-*).
@@ -226,6 +229,7 @@ impl ModelRequest {
             tool_result_max_bytes: None,
             cancel: None,
             identity: None,
+            stream: None,
         }
     }
 
@@ -354,6 +358,7 @@ impl ModelRequest {
                     tool_result_max_bytes: None,
                     cancel: None,
                     identity: None,
+                    stream: None,
                 })
             }
             _ => {
@@ -437,6 +442,14 @@ impl ModelRequest {
     #[must_use]
     pub fn with_cancel_token(mut self, cancel: CancelToken) -> Self {
         self.cancel = Some(cancel);
+        self
+    }
+
+    /// Hängt einen Streaming-Sink an. Streaming-fähige Provider liefern
+    /// darüber Deltas; alle anderen ignorieren ihn.
+    #[must_use]
+    pub fn with_stream_sink(mut self, sink: crate::stream::StreamSink) -> Self {
+        self.stream = Some(sink);
         self
     }
 }
@@ -775,6 +788,7 @@ impl ModelProvider for EchoModelProvider {
         let approx = |chars: usize| ((chars / 4) as u64).max(1);
         let mut response = ModelResponse::text(reply.clone());
         response.usage = TokenUsage {
+            cache_separate: false,
             input_tokens: approx(input_chars),
             output_tokens: approx(reply.len()),
             reasoning_tokens: None,

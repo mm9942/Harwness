@@ -19,6 +19,7 @@ fn make_request(effort: Option<ReasoningEffort>) -> ModelRequest {
     let mut history = ConversationHistory::new();
     history.push_user_text("hello");
     ModelRequest {
+        stream: None,
         system_prompt: String::new(),
         instruction_fragments: Vec::new(),
         context: Vec::new(),

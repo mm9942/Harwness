@@ -1256,6 +1256,7 @@ mod tests {
             .transpose()
             .map_err(ctx("test fixture uses a valid ReasoningEffort label"))?;
         Ok(harw_config::ProviderToml {
+            stream: None,
             name: "acme".to_owned(),
             api: "openai-chat".to_owned(),
             base_url: "https://example.invalid/v1".to_owned(),
@@ -1282,6 +1283,7 @@ mod tests {
             .transpose()
             .map_err(ctx("test fixture uses a valid ReasoningEffort label"))?;
         Ok(harw_config::ModelToml {
+            stream: None,
             id: "acme-model".to_owned(),
             name: None,
             provider: "acme".to_owned(),
