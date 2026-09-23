@@ -6151,6 +6151,11 @@ specialization = "child-controller-test"
 
         assert_eq!(result.child, child);
         assert!(matches!(result.outcome, TurnOutcome::Completed));
+        let texts = child_user_texts(&spawner, &child)?;
+        assert!(
+            texts.iter().any(|text| text == "Fasse die Datei zusammen"),
+            "pending task must become the user turn: {texts:?}"
+        );
         Ok(())
     }
 
@@ -8571,6 +8576,352 @@ max_depth = 0
         };
 
         assert_eq!(rejection.message, "child depth 2 exceeds maximum 1");
+        Ok(())
+    }
+
+    // --- Runde 2 / Welle 1: Auftrag, Detail, Volltext, ChildProgress -------
+
+    #[test]
+    fn admission_seeds_pending_task_from_instructions_and_context() -> TestResult {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
+        let parent = SessionId::new();
+        let spawner = worker_spawner(manager)
+            .with_external_root_parent(
+                parent.clone(),
+                external_root_context(
+                    sandbox.clone(),
+                    harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+                ),
+                Some(ReasoningEffort::Medium),
+                SessionActivation::default(),
+            )
+            .map_err(ctx("trusted external root registers during construction"))?;
+
+        let mut with_instructions = spawn_input(parent.clone());
+        with_instructions.instructions = Some("Analysiere das Modul".to_owned());
+        let first = spawner
+            .admit("worker", with_instructions, sandbox.clone(), None)
+            .map_err(ctx("child with instructions admits"))?;
+        let state = spawner
+            .child_task_state(&first)
+            .ok_or(TestError::Missing("task state is seeded"))?;
+        assert_eq!(state.pending_task.as_deref(), Some("Analysiere das Modul"));
+        assert_eq!(state.task.as_deref(), Some("Analysiere das Modul"));
+
+        let mut with_context = spawn_input(parent.clone());
+        with_context.context = serde_json::json!({"question": "Wo liegt der Fehler?"});
+        let second = spawner
+            .admit("worker", with_context, sandbox.clone(), None)
+            .map_err(ctx("child with context admits"))?;
+        let state = spawner
+            .child_task_state(&second)
+            .ok_or(TestError::Missing("task state is seeded"))?;
+        assert_eq!(
+            state.pending_task.as_deref(),
+            Some(r#"{"question":"Wo liegt der Fehler?"}"#)
+        );
+
+        let third = spawner
+            .admit("worker", spawn_input(parent), sandbox, None)
+            .map_err(ctx("child without task admits"))?;
+        let state = spawner
+            .child_task_state(&third)
+            .ok_or(TestError::Missing("task state exists"))?;
+        assert_eq!(state.pending_task, None);
+        assert_eq!(state.task, None);
+        Ok(())
+    }
+
+    /// Liest alle User-Texte aus dem Verlauf eines Kindes.
+    fn child_user_texts(
+        spawner: &ManagedAgentSpawner,
+        child: &SessionId,
+    ) -> TestResult<Vec<String>> {
+        let manager = spawner
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session = manager.get(child).map_err(ctx("child is manager-owned"))?;
+        Ok(session
+            .history()
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::UserMessage(message) => Some(
+                    message
+                        .content
+                        .iter()
+                        .filter_map(|part| match part {
+                            ContentPart::Text { text } => Some(text.as_str()),
+                            ContentPart::ImageUrl { .. } => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect())
+    }
+
+    fn seed_pending_task(spawner: &ManagedAgentSpawner, child: &SessionId, task: &str) {
+        spawner
+            .child_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                child.as_str().to_owned(),
+                ChildTaskState {
+                    pending_task: Some(task.to_owned()),
+                    task: orchestration_detail_head(task),
+                    outcome_detail: None,
+                },
+            );
+    }
+
+    #[tokio::test]
+    async fn first_run_with_empty_input_receives_the_pending_task() -> TestResult {
+        let (spawner, children) = runnable_children(
+            Arc::new(EchoChildRegistry { reply: "erledigt" }),
+            true,
+            1,
+            empty_registry,
+        )?;
+        let child = children[0].clone();
+        seed_pending_task(&spawner, &child, "Fasse die Datei zusammen");
+        let store = InMemoryStateStore::new();
+
+        let result = spawner
+            .run_child(&child, &store, TurnInput::default())
+            .await
+            .map_err(ctx("child with a pending task runs"))?;
+
+        assert!(matches!(result.outcome, TurnOutcome::Completed));
+        assert_eq!(
+            child_user_texts(&spawner, &child)?,
+            vec!["Fasse die Datei zusammen".to_owned()]
+        );
+        let state = spawner
+            .child_task_state(&child)
+            .ok_or(TestError::Missing("task state remains until release"))?;
+        assert_eq!(
+            state.pending_task, None,
+            "the task is consumed exactly once"
+        );
+        assert_eq!(result.full_text.as_deref(), Some("erledigt"));
+        assert_eq!(state.outcome_detail.as_deref(), Some("erledigt"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_user_text_wins_and_still_consumes_the_pending_task() -> TestResult {
+        let (spawner, children) = runnable_children(
+            Arc::new(EchoChildRegistry { reply: "erledigt" }),
+            true,
+            1,
+            empty_registry,
+        )?;
+        let child = children[0].clone();
+        seed_pending_task(&spawner, &child, "Auftrag aus der Admission");
+        let store = InMemoryStateStore::new();
+
+        spawner
+            .run_child(&child, &store, TurnInput::user("expliziter Auftrag"))
+            .await
+            .map_err(ctx("child runs with explicit text"))?;
+
+        let texts = child_user_texts(&spawner, &child)?;
+        assert!(texts.iter().any(|text| text == "expliziter Auftrag"));
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.contains("Auftrag aus der Admission")),
+            "explicit user text must not be replaced: {texts:?}"
+        );
+        let state = spawner
+            .child_task_state(&child)
+            .ok_or(TestError::Missing("task state remains until release"))?;
+        assert_eq!(state.pending_task, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_text_is_uncapped_while_the_plain_return_is_capped() -> TestResult {
+        let long: &'static str = Box::leak("x".repeat(CHILD_RETURN_MAX_BYTES * 2).into_boxed_str());
+        let (spawner, children) = runnable_children(
+            Arc::new(EchoChildRegistry { reply: long }),
+            true,
+            1,
+            empty_registry,
+        )?;
+        let child = children[0].clone();
+        let store = InMemoryStateStore::new();
+
+        let result = spawner
+            .run_child(&child, &store, TurnInput::user("liefere viel Text"))
+            .await
+            .map_err(ctx("child completes"))?;
+
+        assert_eq!(result.full_text.as_deref(), Some(long));
+        let capped = spawner
+            .child_final_assistant_text(&child)
+            .map_err(ctx("capped text is available"))?;
+        assert!(capped.len() < long.len());
+        assert!(capped.contains("gekürzt"));
+        let detail = spawner
+            .child_task_state(&child)
+            .and_then(|state| state.outcome_detail)
+            .ok_or(TestError::Missing("completion detail is recorded"))?;
+        assert_eq!(detail.chars().count(), ORCHESTRATION_DETAIL_MAX_CHARS);
+        Ok(())
+    }
+
+    #[test]
+    fn orchestration_detail_head_truncates_on_char_boundaries() {
+        assert_eq!(orchestration_detail_head(""), None);
+        assert_eq!(orchestration_detail_head(" \n\t "), None);
+        assert_eq!(
+            orchestration_detail_head("  genau so  "),
+            Some("genau so".to_owned())
+        );
+
+        let exact = "é".repeat(ORCHESTRATION_DETAIL_MAX_CHARS);
+        assert_eq!(orchestration_detail_head(&exact), Some(exact.clone()));
+
+        let long = "日本".repeat(ORCHESTRATION_DETAIL_MAX_CHARS);
+        let head = orchestration_detail_head(&long).unwrap_or_default();
+        assert_eq!(head.chars().count(), ORCHESTRATION_DETAIL_MAX_CHARS);
+        assert!(head.ends_with('…'));
+        assert!(long.starts_with(head.trim_end_matches('…')));
+    }
+
+    /// Beobachter, der jedes Orchestrierungs-Event aufzeichnet.
+    #[derive(Default)]
+    struct RecordingOrchestrationObserver {
+        events: Mutex<Vec<AgentOrchestrationEvent>>,
+    }
+
+    impl OrchestrationObserver for RecordingOrchestrationObserver {
+        fn on_orchestration_event(&self, event: AgentOrchestrationEvent) {
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_release_event_carries_task_and_truncated_reason() -> TestResult {
+        let (spawner, children) =
+            runnable_children(Arc::new(ToolCallingChildRegistry), true, 1, empty_registry)?;
+        let observer = Arc::new(RecordingOrchestrationObserver::default());
+        let spawner = spawner.with_orchestration_observer(observer.clone());
+        let child = children[0].clone();
+        let long_task = format!("Aufgabe {}", "ü".repeat(900));
+        seed_pending_task(&spawner, &child, &long_task);
+        let long_reason = "grund ".repeat(300);
+        spawner.set_failed(&child, &long_reason);
+
+        spawner
+            .release_child(&child)
+            .map_err(ctx("failed child releases"))?;
+
+        let events = observer
+            .events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let event = events
+            .iter()
+            .find(|event| event.status == AgentOrchestrationStatus::Failed)
+            .ok_or(TestError::Missing("failed event is emitted"))?;
+        let task = event
+            .task
+            .as_deref()
+            .ok_or(TestError::Missing("task head is filled"))?;
+        assert_eq!(task.chars().count(), ORCHESTRATION_DETAIL_MAX_CHARS);
+        assert!(task.starts_with("Aufgabe ü"));
+        let detail = event
+            .detail
+            .as_deref()
+            .ok_or(TestError::Missing("failure reason is filled"))?;
+        assert!(detail.chars().count() <= ORCHESTRATION_DETAIL_MAX_CHARS);
+        assert!(detail.starts_with("grund grund"));
+        assert!(
+            spawner.child_task_state(&child).is_none(),
+            "release forgets the task state"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn child_progress_is_emitted_to_the_attached_sink_and_throttled() -> TestResult {
+        let (spawner, child) = spawner_with_admitted_child()?;
+        let (events, _session_events) = mpsc::unbounded_channel();
+        let (turn_tx, mut turn_rx) = mpsc::unbounded_channel();
+        let parent = AgentSession::new(
+            AgentRole::Agent {
+                name: "parent".to_owned(),
+            },
+            None,
+            ExtensionRegistryBuilder::default().build(),
+            events,
+        )
+        .with_turn_event_sink(turn_tx);
+        let turn_id = TurnId::new();
+        assert!(spawner.attach_child_progress_sink(&child, turn_id.clone(), parent.live_emitter()));
+        assert!(!spawner.attach_child_progress_sink(
+            &SessionId::new(),
+            turn_id.clone(),
+            parent.live_emitter()
+        ));
+
+        let record = spawner
+            .child_record(&child)
+            .ok_or(TestError::Missing("child is tracked"))?;
+        let start = std::time::Instant::now();
+        assert!(emit_child_progress(&spawner.progress_sinks, &record, start));
+        assert!(!emit_child_progress(
+            &spawner.progress_sinks,
+            &record,
+            start + Duration::from_millis(100)
+        ));
+        assert!(emit_child_progress(
+            &spawner.progress_sinks,
+            &record,
+            start + CHILD_PROGRESS_MIN_INTERVAL
+        ));
+
+        let mut received = Vec::new();
+        while let Ok(event) = turn_rx.try_recv() {
+            received.push(event);
+        }
+        assert_eq!(received.len(), 2);
+        match &received[0] {
+            TurnEvent::ChildProgress {
+                turn_id: got_turn,
+                child: got_child,
+                tool_calls,
+                tokens,
+            } => {
+                assert_eq!(got_turn, &turn_id);
+                assert_eq!(got_child, &child);
+                assert_eq!(*tool_calls, 0);
+                assert_eq!(*tokens, 0);
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "unerwartetes Event: {other:?}"
+                )));
+            }
+        }
+
+        spawner.close_child(&child);
+        assert!(!emit_child_progress(
+            &spawner.progress_sinks,
+            &record,
+            start + CHILD_PROGRESS_MIN_INTERVAL * 4
+        ));
         Ok(())
     }
 }
