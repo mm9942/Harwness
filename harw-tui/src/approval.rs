@@ -104,12 +104,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use harw_core::{
-    AgentSession, ApprovalResolution, CoreError, ManagedAgentSpawner, ModelProvider,
+    AgentSession, ApprovalResolution, CoreError, LiveEmitter, ManagedAgentSpawner, ModelProvider,
     PendingApproval, StateStore, ToolCallResult, TurnInput, TurnOutcome, resume_after_approval,
     resume_after_child,
 };
 use harw_extension_api::{AgentSpawnError, ApprovalDecision, ApprovalHandler, ExtFuture, ToolCall};
-use harw_types::{ItemId, SessionId, ToolCallId};
+use harw_types::{ItemId, SessionId, ToolCallId, TurnId};
 use tokio::sync::{mpsc, oneshot};
 
 // ── Konstanten ───────────────────────────────────────────────────────────────
@@ -793,16 +793,40 @@ pub trait ChildTurnDriver: Send + Sync {
         child: &'a SessionId,
         store: &'a dyn StateStore,
     ) -> ChildDriveFuture<'a>;
+
+    /// Hängt den Live-Kanal des Eltern-Turns als Fortschritts-Senke an das
+    /// Kind, bevor es getrieben wird.
+    ///
+    /// # Description
+    /// Die TUI-Wurzel ist ein externer Elternteil (nicht im Session-Manager),
+    /// daher registriert die Admission für ihre Kinder keine Senke
+    /// automatisch. Der [`ApprovalDriver`] kennt die Wurzel-Session und
+    /// reicht deren Turn-ID und [`LiveEmitter`] hier durch, damit
+    /// `TurnEvent::ChildProgress` im Eltern-Turn ankommt. Standard: nichts
+    /// anhängen (Attrappen, Treiber ohne Fortschrittsmeldung).
+    ///
+    /// # Arguments
+    /// - `child` (`&SessionId`): das admittierte Kind.
+    /// - `turn_id` (`TurnId`): der pausierte Eltern-Turn.
+    /// - `emitter` (`LiveEmitter`): der Live-Kanal der Eltern-Session.
+    ///
+    /// # Returns
+    /// `true`, wenn die Senke registriert wurde.
+    fn attach_progress(&self, child: &SessionId, turn_id: TurnId, emitter: LiveEmitter) -> bool {
+        let _ = (child, turn_id, emitter);
+        false
+    }
 }
 
 impl ChildTurnDriver for ManagedAgentSpawner {
     /// Führt das Kind über [`ManagedAgentSpawner::run_child`] aus.
     ///
     /// # Description
-    /// Das Kind erhält [`TurnInput::default`]: sein Auftrag steckt bereits im
-    /// `SpawnInput`, den der Kern beim Handoff übergeben hat; ein zusätzlicher
-    /// Nutzer-Text würde den Verlauf verfälschen. Nach einem regulären Ende
-    /// wird die letzte Assistant-Antwort des Kindes zum Werkzeugergebnis.
+    /// Das Kind erhält [`TurnInput::default`]: bei leerer Eingabe setzt der
+    /// Spawner den bei der Admission hinterlegten Auftrag (`instructions`
+    /// bzw. `context` des `SpawnInput`) als ersten User-Turn ein. Nach einem
+    /// regulären Ende wird die letzte Assistant-Antwort des Kindes zum
+    /// Werkzeugergebnis.
     ///
     /// Pausiert das Kind selbst, endet es hier: verschachtelte Pausen werden
     /// von der TUI **nicht** weitergetrieben, sondern als Fehler-Ergebnis an
@@ -872,6 +896,12 @@ impl ChildTurnDriver for ManagedAgentSpawner {
                 }
             }
         })
+    }
+
+    /// Registriert die Senke über
+    /// [`ManagedAgentSpawner::attach_child_progress_sink`].
+    fn attach_progress(&self, child: &SessionId, turn_id: TurnId, emitter: LiveEmitter) -> bool {
+        self.attach_child_progress_sink(child, turn_id, emitter)
     }
 }
 
@@ -1178,7 +1208,11 @@ impl ApprovalDriver {
                         "tui.resume.child_pause"
                     );
 
-                    let result = Self::child_result(children, &child, &role, store).await;
+                    let progress = session
+                        .current_turn()
+                        .cloned()
+                        .map(|turn_id| (turn_id, session.live_emitter()));
+                    let result = Self::child_result(children, &child, &role, store, progress).await;
                     outcome = resume_after_child(session, model, store, child, call_id, result)
                         .await
                         .map_err(|source| ApprovalDriverError::Resume {
@@ -1249,11 +1283,16 @@ impl ApprovalDriver {
     /// Auch ein Spawn-Fehler und ein fehlender Treiber werden zu einem
     /// Fehler-Ergebnis: der Eltern-Turn muss das Kind-Werkzeug beantwortet
     /// bekommen, sonst bliebe er in `WaitingForChild` stehen.
+    ///
+    /// `progress` (Turn-ID und Live-Kanal des pausierten Eltern-Turns) wird
+    /// vor dem Lauf als Fortschritts-Senke des Kindes registriert
+    /// ([`ChildTurnDriver::attach_progress`]).
     async fn child_result(
         children: Option<&dyn ChildTurnDriver>,
         child: &SessionId,
         role: &str,
         store: &dyn StateStore,
+        progress: Option<(TurnId, LiveEmitter)>,
     ) -> ToolCallResult {
         let Some(driver) = children else {
             tracing::warn!(child = %child, role = %role, "tui.child.no_driver");
@@ -1261,6 +1300,12 @@ impl ApprovalDriver {
                 "child agent '{role}' could not be run: this terminal session has no child driver"
             ));
         };
+
+        if let Some((turn_id, emitter)) = progress
+            && !driver.attach_progress(child, turn_id, emitter)
+        {
+            tracing::debug!(child = %child, role = %role, "tui.child.progress_sink_not_attached");
+        }
 
         match driver.drive_child(child, store).await {
             Ok(result) => result,
@@ -2172,7 +2217,7 @@ mod tests {
     async fn test_child_result_without_a_driver_is_an_error_result_not_a_hang() -> TestResult {
         let store = InMemoryStateStore::new();
         let result =
-            ApprovalDriver::child_result(None, &SessionId::new(), "reviewer", &store).await;
+            ApprovalDriver::child_result(None, &SessionId::new(), "reviewer", &store, None).await;
 
         let ToolCallResult::Error { message } = result else {
             return Err(TestError::Unexpected(
@@ -2190,12 +2235,72 @@ mod tests {
             calls: AtomicUsize::new(0),
         };
 
-        let result =
-            ApprovalDriver::child_result(Some(&driver), &SessionId::new(), "reviewer", &store)
-                .await;
+        let result = ApprovalDriver::child_result(
+            Some(&driver),
+            &SessionId::new(),
+            "reviewer",
+            &store,
+            Some((TurnId::new(), LiveEmitter::default())),
+        )
+        .await;
 
         assert!(result.is_success());
         assert_eq!(driver.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Attrappe, die registrierte Fortschritts-Senken zählt.
+    struct ProgressRecordingDriver {
+        attached: AtomicUsize,
+    }
+
+    impl ChildTurnDriver for ProgressRecordingDriver {
+        fn drive_child<'a>(
+            &'a self,
+            _child: &'a SessionId,
+            _store: &'a dyn StateStore,
+        ) -> ChildDriveFuture<'a> {
+            Box::pin(async { Ok(ToolCallResult::success(json!({"child": "done"}))) })
+        }
+
+        fn attach_progress(
+            &self,
+            _child: &SessionId,
+            _turn_id: TurnId,
+            _emitter: LiveEmitter,
+        ) -> bool {
+            self.attached.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn test_child_result_attaches_the_parent_progress_sink_before_driving() {
+        let store = InMemoryStateStore::new();
+        let driver = ProgressRecordingDriver {
+            attached: AtomicUsize::new(0),
+        };
+
+        let without = ApprovalDriver::child_result(
+            Some(&driver),
+            &SessionId::new(),
+            "reviewer",
+            &store,
+            None,
+        )
+        .await;
+        assert!(without.is_success());
+        assert_eq!(driver.attached.load(Ordering::SeqCst), 0);
+
+        let with = ApprovalDriver::child_result(
+            Some(&driver),
+            &SessionId::new(),
+            "reviewer",
+            &store,
+            Some((TurnId::new(), LiveEmitter::default())),
+        )
+        .await;
+        assert!(with.is_success());
+        assert_eq!(driver.attached.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

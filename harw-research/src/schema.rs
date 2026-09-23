@@ -42,7 +42,34 @@ pub fn finding_json_schema() -> Value {
                 "enum": ["low", "medium", "high", "verified"]
             },
             "produced_by": { "type": "string" },
-            "produced_at": { "type": "string", "format": "date-time" }
+            "produced_at": { "type": "string", "format": "date-time" },
+            "likelihood": {
+                "type": ["string", "null"],
+                "enum": [
+                    "remote",
+                    "very_unlikely",
+                    "unlikely",
+                    "roughly_even",
+                    "likely",
+                    "very_likely",
+                    "almost_certain",
+                    null
+                ]
+            },
+            "confidence_rationale": { "type": "string" },
+            "hypotheses": {
+                "type": "array",
+                "items": hypothesis_schema()
+            },
+            "key_assumptions": {
+                "type": "array",
+                "items": key_assumption_schema()
+            },
+            "indicators": {
+                "type": "array",
+                "items": indicator_schema()
+            },
+            "dissent": { "type": "array", "items": { "type": "string" } }
         },
         "required": [
             "question_id",
@@ -66,6 +93,7 @@ fn source_reference_schema() -> Value {
                 "enum": [
                     "local_source",
                     "cargo_registry_source",
+                    "package_registry_source",
                     "official_docs",
                     "repository",
                     "release_notes",
@@ -76,25 +104,115 @@ fn source_reference_schema() -> Value {
             "locator": { "type": "string" },
             "retrieved_at": { "type": "string", "format": "date-time" },
             "digest": { "type": ["string", "null"] },
-            "excerpt": { "type": "string" }
+            "excerpt": { "type": "string" },
+            "reliability": {
+                "type": ["string", "null"],
+                "enum": ["a", "b", "c", "d", "e", "f", "A", "B", "C", "D", "E", "F", null]
+            },
+            "credibility": {
+                "type": ["string", "null"],
+                "enum": [
+                    "confirmed",
+                    "probably_true",
+                    "possibly_true",
+                    "doubtful",
+                    "improbable",
+                    "cannot_judge",
+                    null
+                ]
+            },
+            "derived_from": { "type": ["string", "null"] }
         },
         "required": ["kind", "locator", "retrieved_at"]
     })
 }
 
+/// Teilschema für [`crate::types::HypothesisAssessment`].
+fn hypothesis_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "id": { "type": "string" },
+            "statement": { "type": "string" },
+            "status": {
+                "type": "string",
+                "enum": ["leading", "viable", "weakened", "refuted"]
+            },
+            "consistent_evidence": {
+                "type": "array",
+                "items": { "type": "integer", "minimum": 0 }
+            },
+            "inconsistent_evidence": {
+                "type": "array",
+                "items": { "type": "integer", "minimum": 0 }
+            },
+            "inconsistency_score": { "type": "number" }
+        },
+        "required": ["id", "statement", "status"]
+    })
+}
+
+/// Teilschema für [`crate::types::KeyAssumption`].
+fn key_assumption_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "id": { "type": "string" },
+            "statement": { "type": "string" },
+            "status": {
+                "type": "string",
+                "enum": ["supported", "caveated", "unsupported"]
+            },
+            "on_critical_path": { "type": "boolean" },
+            "rationale": { "type": "string" }
+        },
+        "required": ["id", "statement", "status"]
+    })
+}
+
+/// Teilschema für [`crate::types::Indicator`].
+fn indicator_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "id": { "type": "string" },
+            "observable": { "type": "string" },
+            "supports": { "type": "array", "items": { "type": "string" } },
+            "baseline": { "type": "string" },
+            "threshold": { "type": "string" },
+            "check_every": { "type": ["string", "null"] }
+        },
+        "required": ["id", "observable", "supports"]
+    })
+}
+
 /// Teilschema für [`crate::types::VersionReference`].
+///
+/// # Description
+/// Ökosystem-neutral: `package` + `ecosystem` (Vorgabe `"cargo"`). Das
+/// Alt-Feld `crate_name` bleibt als Alternative zu `package` zulässig
+/// (`anyOf`), damit ältere Findings gegen das Schema gültig bleiben.
 fn version_reference_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
+            "package": { "type": "string" },
             "crate_name": { "type": "string" },
+            "ecosystem": { "type": "string", "default": "cargo" },
             "version": { "type": "string" },
             "msrv": { "type": ["string", "null"] },
             "features": { "type": "array", "items": { "type": "string" } },
             "verified_against": { "type": "string" }
         },
-        "required": ["crate_name", "version", "verified_against"]
+        "required": ["version", "verified_against"],
+        "anyOf": [
+            { "required": ["package"] },
+            { "required": ["crate_name"] }
+        ]
     })
 }
 
@@ -178,7 +296,9 @@ pub fn finding_schema_prompt_with_example(question_id: &str) -> String {
     let pretty = serde_json::to_string_pretty(&example).unwrap_or_else(|_| example.to_string());
     format!(
         "Antworte ausschließlich mit EINEM JSON-Objekt dieser Form, nicht mit dem Schema. \
-         Rufe zuerst Werkzeuge auf (fs.read/fs.grep/…), belege jede Aussage mit tatsächlich \
+         Rufe zuerst Werkzeuge auf: orientiere dich mit den explore.*-Werkzeugen \
+         (explore.tree, explore.projects, explore.relations, explore.find), lies und durchsuche \
+         danach gezielt mit fs.read/fs.grep; belege jede Aussage mit tatsächlich \
          gelesenen Stellen; erfinde keine Zeitstempel — retrieved_at/produced_at setzt du auf \
          den tatsächlichen aktuellen Zeitpunkt.\n\
          \n\
@@ -187,16 +307,31 @@ pub fn finding_schema_prompt_with_example(question_id: &str) -> String {
          übernehmen.\n\
          - conclusion (string, Pflicht): Schlussfolgerung in Prosa.\n\
          - evidence (array, Pflicht ab confidence \"medium\"): je Eintrag {{ kind, locator, \
-         retrieved_at, digest?, excerpt? }} — kind ist eine der Arten local_source, \
-         cargo_registry_source, official_docs, repository, release_notes, standard, web.\n\
-         - verified_versions (array, optional): je Eintrag {{ crate_name, version, msrv?, \
-         features?, verified_against }}.\n\
+         retrieved_at, digest?, excerpt?, reliability?, credibility?, derived_from? }} — kind \
+         ist eine der Arten local_source, package_registry_source, cargo_registry_source, \
+         official_docs, repository, release_notes, standard, web; reliability a–f \
+         (Quellenzuverlässigkeit), credibility confirmed|probably_true|possibly_true|doubtful|\
+         improbable|cannot_judge; derived_from = locator der Quelle, von der diese abhängt.\n\
+         - verified_versions (array, optional): je Eintrag {{ package, ecosystem? (Vorgabe \
+         \"cargo\"; z. B. npm, pypi, maven), version, msrv?, features?, verified_against }}.\n\
          - constraints (array<string>, optional).\n\
          - compatibility_notes (array<string>, optional).\n\
          - unresolved_questions (array<string>, optional).\n\
          - confidence (string, Pflicht): eine der Stufen low, medium, high, verified.\n\
          - produced_by (string, Pflicht): dein Rollenname.\n\
          - produced_at (string, Pflicht): ISO-8601-Zeitstempel.\n\
+         - likelihood (string, optional): Wahrscheinlichkeit der Aussage, getrennt von \
+         confidence — remote, very_unlikely, unlikely, roughly_even, likely, very_likely, \
+         almost_certain.\n\
+         - confidence_rationale (string, optional): Begründung der Konfidenzstufe.\n\
+         - hypotheses (array, optional): je Eintrag {{ id, statement, status \
+         (leading|viable|weakened|refuted), consistent_evidence?, inconsistent_evidence? \
+         (Indizes in evidence), inconsistency_score? }}.\n\
+         - key_assumptions (array, optional): je Eintrag {{ id, statement, status \
+         (supported|caveated|unsupported), on_critical_path?, rationale? }}.\n\
+         - indicators (array, optional): je Eintrag {{ id, observable, supports (IDs), \
+         baseline?, threshold?, check_every? }}.\n\
+         - dissent (array<string>, optional): abweichende Einschätzungen.\n\
          \n\
          Beispielinstanz (Platzhalterwerte ersetzen, question_id unverändert übernehmen):\n\
          {pretty}"

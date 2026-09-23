@@ -38,7 +38,9 @@
 //! - [`UserHistoryCell`]: Nutzer-Eingabe mit `"> "`-Präfix und Wort-Wrapping.
 //! - [`AssistantHistoryCell`]: Assistenten-Antwort, speichert Quelltext; bricht bei
 //!   unterschiedlichem `width` unterschiedlich um (Re-Render-on-Resize).
-//! - [`ReasoningHistoryCell`]: Reasoning-Zusammenfassung, gedimmter `"· "`-Präfix.
+//! - [`ReasoningHistoryCell`]: Reasoning-Zusammenfassung, gedimmt-kursiv mit
+//!   `"∴ "`-Markierung und optionaler Agenten-Herkunft; standardmäßig
+//!   eingeklappt, per Ctrl+O über [`SharedReasoningCell`] ausklappbar.
 //! - [`SubAgentCell`]: laufender/beendeter Kind-Agent (`TurnEvent::ChildSpawned`
 //!   / `ChildProgress` / `ChildCompleted`); **aktualisierbar** über
 //!   [`SubAgentCell::apply_progress`] / [`SubAgentCell::apply_completion`].
@@ -413,63 +415,202 @@ fn wrap_styled(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
 
 // ─── ReasoningHistoryCell ─────────────────────────────────────────────────────
 
-/// Zeigt eine Reasoning-Zusammenfassung des Modells an.
+/// Markierung der ersten Zeile einer [`ReasoningHistoryCell`].
+const REASONING_MARKER: &str = "∴ ";
+
+/// Obergrenze (in Zeichen) der Herkunftskennung einer [`ReasoningHistoryCell`]
+/// (`[rolle] `), bevor char-sicher mit [`truncate_chars`] gekürzt wird.
+const REASONING_ORIGIN_MAX_CHARS: usize = 24;
+
+/// Zeigt eine Reasoning-Zusammenfassung des Modells an — eingeklappt oder
+/// ausgeklappt.
 ///
 /// # Beschreibung
 /// Wird bei `TurnEvent::ItemAdded { item: TurnItem::Reasoning(..), .. }`
-/// erzeugt. Rendert einen gedimmten (`style::dim_style()`) `"· "`-Präfix auf
-/// der ersten Zeile (Folgezeilen: `"  "`-Einzug).
+/// erzeugt. Der Text wird gedimmt-kursiv gerendert, die erste Zeile trägt die
+/// gedimmte Markierung `"∴ "` (optional gefolgt von der Herkunft
+/// `"[rolle] "`), Folgezeilen sind bündig darunter eingerückt.
+///
+/// Standardmäßig **eingeklappt**: sichtbar ist nur die erste umgebrochene
+/// Zeile plus der Hinweis `"… (N Zeilen · Ctrl+O)"`, wobei `N` die Zahl der
+/// Zeilen der ausgeklappten Darstellung bei der aktuellen Breite ist. Passt
+/// der gesamte Text in eine Zeile, entfällt der Hinweis. Ausgeklappt wird
+/// genau wie bei [`ToolCell`]: über das Feld `expanded` bzw.
+/// [`ReasoningHistoryCell::set_expanded`] — geteilt über
+/// [`SharedReasoningCell`], damit `app.rs` (Ctrl+O) den Zustand einer bereits
+/// in den Verlauf geschobenen Zelle umschalten kann.
 ///
 /// # Felder
 /// - `summary` (`String`): Zusammengefasster Denkprozess-Text (bereits aus
 ///   `ReasoningItem::summary_text` zusammengefügt).
+/// - `expanded` (`bool`): Nutzer-Umschalter (Ctrl+O); Standard `false`.
+/// - `origin` (`Option<String>`): Rolle des Agenten, von dem das Reasoning
+///   stammt (z. B. ein Kind-Agent); `None` für den Hauptagenten.
 ///
 /// # Spec-Referenz
 /// Welle 3 — Verdrahtung von `TurnEvent::ItemAdded(Reasoning)` in
-/// `app.rs::run_loop`.
-#[derive(Debug)]
+/// `app.rs::run_loop`; Runde 2 / Welle 2 — einklappbares Reasoning.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ReasoningHistoryCell {
     /// Zusammengefasster Denkprozess-Text.
     pub summary: String,
+    /// Nutzer-Umschalter (Ctrl+O): `true` zeigt den vollständigen Text.
+    pub expanded: bool,
+    /// Rolle des Ursprungs-Agenten (roh, unsanitisiert); `None` = Hauptagent.
+    pub origin: Option<String>,
+}
+
+/// Geteilte Reasoning-Zelle (`Arc<Mutex<ReasoningHistoryCell>>`).
+///
+/// # Beschreibung
+/// Analog zu [`SharedToolCell`]: `app.rs` schiebt `Box::new(Arc::clone(&cell))`
+/// in den Verlauf (siehe `impl HistoryCell for SharedReasoningCell`) und hält
+/// eine zweite Referenz, um den Ausklapp-Zustand per Ctrl+O zu schreiben.
+pub(crate) type SharedReasoningCell = Arc<Mutex<ReasoningHistoryCell>>;
+
+impl ReasoningHistoryCell {
+    /// Erzeugt eine eingeklappte Reasoning-Zelle ohne Herkunftskennung.
+    ///
+    /// # Argumente
+    /// - `summary` (`impl Into<String>`): Zusammengefasster Denkprozess-Text.
+    pub(crate) fn new(summary: impl Into<String>) -> Self {
+        Self {
+            summary: summary.into(),
+            expanded: false,
+            origin: None,
+        }
+    }
+
+    /// Versieht die Zelle mit der Rolle des Ursprungs-Agenten (Builder).
+    ///
+    /// # Argumente
+    /// - `role` (`&str`): Rolle, z. B. `"explorer"`. Leer bzw. nur aus
+    ///   Leerraum bestehend entfernt die Herkunft wieder.
+    ///
+    /// # Rückgabe
+    /// Die Zelle mit gesetzter (bzw. entfernter) Herkunft; gerendert als
+    /// gedimmter Präfix `"[rolle] "` hinter der Markierung `"∴ "`.
+    #[must_use]
+    pub(crate) fn with_origin(mut self, role: &str) -> Self {
+        let trimmed = role.trim();
+        self.origin = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        };
+        self
+    }
+
+    /// Setzt den Ausklapp-Zustand direkt (Ctrl+O) — dieselbe Semantik wie
+    /// [`ToolCell::set_expanded`]: der Aufrufer liest den vorherigen Zustand
+    /// über [`ReasoningHistoryCell::is_expanded`] und schreibt hier nur.
+    pub(crate) fn set_expanded(&mut self, expanded: bool) {
+        self.expanded = expanded;
+    }
+
+    /// Liefert den aktuellen Ausklapp-Zustand.
+    #[must_use]
+    pub(crate) fn is_expanded(&self) -> bool {
+        self.expanded
+    }
+
+    /// Erzeugt die geteilte Variante dieser Zelle (siehe [`SharedReasoningCell`]).
+    #[must_use]
+    pub(crate) fn into_shared(self) -> SharedReasoningCell {
+        Arc::new(Mutex::new(self))
+    }
 }
 
 impl HistoryCell for ReasoningHistoryCell {
-    /// Rendert die Reasoning-Zusammenfassung mit gedimmtem `"· "`-Präfix und
-    /// wortweisem Wrapping.
+    /// Rendert die Reasoning-Zusammenfassung gedimmt-kursiv mit `"∴ "`-Markierung,
+    /// optionaler Herkunft `"[rolle] "` und wortweisem Wrapping; eingeklappt
+    /// nur die erste Zeile plus `"… (N Zeilen · Ctrl+O)"`.
     ///
     /// # Argumente
     /// - `width` (`u16`): Gesamtbreite in Spalten (inklusive Präfix).
     ///
     /// # Rückgabe
-    /// Liste der darstellbaren Zeilen beginnend mit `"· <summary>"`.
+    /// Liste der darstellbaren Zeilen beginnend mit `"∴ <summary>"`.
     fn display_lines(&self, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
-        let prefix_len = 2_u16;
-        let text_width = width.saturating_sub(prefix_len).max(1);
-        let sanitized = sanitize_display(&self.summary);
-        let summary = if sanitized.is_empty() {
-            " "
-        } else {
-            &sanitized
-        };
-        let wrapped = wrap_plain(summary, text_width);
         let dim = style::dim_style(theme);
-        wrapped
+        let text_style = dim.add_modifier(Modifier::ITALIC);
+
+        // Kürzung vor Bereinigung (siehe Modul-Doku, W1-08).
+        let origin = self.origin.as_deref().map(|role| {
+            format!(
+                "[{}] ",
+                sanitize_inline(&truncate_chars(role, REASONING_ORIGIN_MAX_CHARS))
+            )
+        });
+        let lead_chars =
+            REASONING_MARKER.chars().count() + origin.as_deref().map_or(0, |o| o.chars().count());
+        let lead_width = u16::try_from(lead_chars).unwrap_or(u16::MAX);
+        let text_width = width.saturating_sub(lead_width).max(1);
+        let continuation = " ".repeat(lead_chars);
+
+        let sanitized = sanitize_display(&self.summary);
+        let body = sanitized.trim_matches('\n');
+        let mut rows: Vec<String> = wrap_plain(body, text_width)
             .into_iter()
-            .enumerate()
-            .map(|(i, line)| {
-                let raw: String = line
-                    .spans
+            .map(|line| {
+                line.spans
                     .into_iter()
                     .map(|s| s.content.into_owned())
-                    .collect();
-                let prefix_span = if i == 0 {
-                    Span::styled("· ", dim)
-                } else {
-                    Span::raw("  ")
-                };
-                Line::from(vec![prefix_span, Span::raw(raw)])
+                    .collect()
             })
-            .collect()
+            .collect();
+        if rows.is_empty() {
+            rows.push(String::new());
+        }
+        let total = rows.len();
+
+        let first_row = |text: String| -> Line<'static> {
+            let mut spans = vec![Span::styled(REASONING_MARKER, dim)];
+            if let Some(origin) = &origin {
+                spans.push(Span::styled(origin.clone(), dim));
+            }
+            spans.push(Span::styled(text, text_style));
+            Line::from(spans)
+        };
+
+        let mut rows = rows.into_iter();
+        let mut out: Vec<Line<'static>> = Vec::new();
+        if let Some(first) = rows.next() {
+            out.push(first_row(first));
+        }
+
+        if self.expanded || total <= 1 {
+            out.extend(rows.map(|text| {
+                Line::from(vec![
+                    Span::raw(continuation.clone()),
+                    Span::styled(text, text_style),
+                ])
+            }));
+        } else {
+            let hint = format!("… ({total} Zeilen · Ctrl+O)");
+            for piece in wrap_plain(&hint, text_width) {
+                let raw: String = piece.spans.iter().map(|s| s.content.as_ref()).collect();
+                out.push(Line::from(vec![
+                    Span::raw(continuation.clone()),
+                    Span::styled(raw, dim),
+                ]));
+            }
+        }
+        out
+    }
+}
+
+impl HistoryCell for SharedReasoningCell {
+    /// Delegiert an die geteilte [`ReasoningHistoryCell`]; ein vergifteter
+    /// Lock ergibt eine sichtbare Hinweiszeile statt eines Panics.
+    fn display_lines(&self, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
+        match self.lock() {
+            Ok(guard) => guard.display_lines(width, theme),
+            Err(_) => vec![Line::from(Span::styled(
+                "⚠ Reasoning-Zelle nicht lesbar (Sperre vergiftet)".to_owned(),
+                style::warning_style(theme),
+            ))],
+        }
     }
 }
 
@@ -2209,7 +2350,7 @@ impl HistoryCell for ToolGroupCell {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestResult, ctx};
+    use crate::test_support::{TestError, TestResult, ctx};
     use harw_plan::ids::{PathOrSymbol, PlanId, RevisionId, TaskId};
     use harw_plan::{PlanNode, PlanNodeKind};
     use time::OffsetDateTime;
@@ -2338,21 +2479,142 @@ mod tests {
         );
     }
 
-    /// Prüft, dass `ReasoningHistoryCell::display_lines` den `"· "`-Präfix
-    /// gefolgt vom Zusammenfassungstext liefert.
+    /// Prüft, dass `ReasoningHistoryCell::display_lines` die `"∴ "`-Markierung
+    /// gefolgt vom Zusammenfassungstext liefert und eine einzeilige
+    /// Zusammenfassung keinen Ausklapp-Hinweis bekommt.
     #[test]
-    fn test_reasoning_cell_has_dot_prefix() {
-        let cell = ReasoningHistoryCell {
-            summary: "Denke über die Lösung nach".to_owned(),
+    fn test_reasoning_cell_has_marker_prefix() -> TestResult {
+        let cell = ReasoningHistoryCell::new("Denke über die Lösung nach");
+        let lines = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
+        let first = lines.first().ok_or(TestError::Missing("erste Zeile"))?;
+        if first != "∴ Denke über die Lösung nach" || lines.len() != 1 {
+            return Err(TestError::Unexpected(format!("war: {lines:?}")));
+        }
+        Ok(())
+    }
+
+    /// Eingeklappt (Standard): nur die erste Zeile plus Hinweis mit der
+    /// Gesamtzahl der Zeilen der ausgeklappten Darstellung.
+    #[test]
+    fn test_reasoning_cell_collapsed_by_default_shows_first_line_and_hint() -> TestResult {
+        let cell = ReasoningHistoryCell::new("Erste Zeile\nZweite Zeile\nDritte Zeile");
+        if cell.is_expanded() {
+            return Err(TestError::Unexpected(
+                "Standard muss eingeklappt sein".to_owned(),
+            ));
+        }
+        let lines = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
+        if lines
+            != vec![
+                "∴ Erste Zeile".to_owned(),
+                "  … (3 Zeilen · Ctrl+O)".to_owned(),
+            ]
+        {
+            return Err(TestError::Unexpected(format!("war: {lines:?}")));
+        }
+        Ok(())
+    }
+
+    /// Ausgeklappt: vollständiger Text, bündig eingerückt, ohne Hinweis.
+    #[test]
+    fn test_reasoning_cell_expanded_shows_full_text() -> TestResult {
+        let mut cell = ReasoningHistoryCell::new("Erste Zeile\nZweite Zeile\nDritte Zeile");
+        cell.set_expanded(true);
+        let lines = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
+        let expected = vec![
+            "∴ Erste Zeile".to_owned(),
+            "  Zweite Zeile".to_owned(),
+            "  Dritte Zeile".to_owned(),
+        ];
+        if lines != expected {
+            return Err(TestError::Unexpected(format!("war: {lines:?}")));
+        }
+        Ok(())
+    }
+
+    /// Ein langer Absatz ohne Zeilenumbruch wird eingeklappt ebenfalls auf eine
+    /// Zeile reduziert; `N` entspricht der ausgeklappten Zeilenzahl.
+    #[test]
+    fn test_reasoning_cell_long_paragraph_collapses_to_one_row() -> TestResult {
+        let text = "wort ".repeat(40);
+        let collapsed = ReasoningHistoryCell::new(text.clone());
+        let expanded = ReasoningHistoryCell {
+            expanded: true,
+            ..ReasoningHistoryCell::new(text)
         };
+        let full = expanded.display_lines(30, style::Theme::Dark);
+        let short = lines_to_strings(&collapsed.display_lines(30, style::Theme::Dark));
+        let hint = format!("… ({} Zeilen · Ctrl+O)", full.len());
+        if full.len() < 2 || short.len() != 2 || !short[1].contains(&hint) {
+            return Err(TestError::Unexpected(format!(
+                "voll: {} Zeilen, kurz: {short:?}",
+                full.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Der Text ist gedimmt-kursiv gestylt.
+    #[test]
+    fn test_reasoning_cell_text_is_italic() -> TestResult {
+        let cell = ReasoningHistoryCell::new("Kursiv");
         let lines = cell.display_lines(80, style::Theme::Dark);
-        assert!(!lines.is_empty(), "Mindestens eine Zeile erwartet");
-        let first_content: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(
-            first_content, "· Denke über die Lösung nach",
-            "Erste Zeile muss mit '· ' beginnen, war: {:?}",
-            first_content
-        );
+        let first = lines.first().ok_or(TestError::Missing("erste Zeile"))?;
+        let text_span = first.spans.last().ok_or(TestError::Missing("Text-Span"))?;
+        if !text_span.style.add_modifier.contains(Modifier::ITALIC) {
+            return Err(TestError::Unexpected(format!(
+                "Stil: {:?}",
+                text_span.style
+            )));
+        }
+        Ok(())
+    }
+
+    /// `with_origin` rendert `"[rolle] "` hinter der Markierung; Folgezeilen
+    /// sind bündig unter dem Text eingerückt; leere Rolle entfernt die Herkunft.
+    #[test]
+    fn test_reasoning_cell_with_origin_renders_role_prefix() -> TestResult {
+        let mut cell =
+            ReasoningHistoryCell::new("Plan prüfen\nDann lesen").with_origin(" explorer ");
+        cell.set_expanded(true);
+        let lines = lines_to_strings(&cell.display_lines(80, style::Theme::Dark));
+        let expected = vec![
+            "∴ [explorer] Plan prüfen".to_owned(),
+            "             Dann lesen".to_owned(),
+        ];
+        if lines != expected {
+            return Err(TestError::Unexpected(format!("war: {lines:?}")));
+        }
+        let cleared = ReasoningHistoryCell::new("x").with_origin("   ");
+        if cleared.origin.is_some() {
+            return Err(TestError::Unexpected(
+                "leere Rolle muss None ergeben".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Die geteilte Variante rendert wie die Zelle selbst und folgt dem über
+    /// eine zweite Referenz gesetzten Ausklapp-Zustand (Ctrl+O-Pfad in `app.rs`).
+    #[test]
+    fn test_shared_reasoning_cell_follows_expansion_toggle() -> TestResult {
+        let shared = ReasoningHistoryCell::new("a\nb").into_shared();
+        let boxed: Box<dyn HistoryCell> = Box::new(Arc::clone(&shared));
+        if boxed.display_lines(80, style::Theme::Dark).len() != 2 {
+            return Err(TestError::Unexpected(
+                "eingeklappt: 2 Zeilen erwartet".to_owned(),
+            ));
+        }
+        {
+            let mut guard = shared.lock().map_err(ctx("Mutex vergiftet"))?;
+            let next = !guard.is_expanded();
+            guard.set_expanded(next);
+        }
+        let lines = lines_to_strings(&boxed.display_lines(80, style::Theme::Dark));
+        if lines != vec!["∴ a".to_owned(), "  b".to_owned()] {
+            return Err(TestError::Unexpected(format!("war: {lines:?}")));
+        }
+        Ok(())
     }
 
     // ── SubAgentCell ────────────────────────────────────────────────────
@@ -2618,8 +2880,10 @@ mod tests {
             Box::new(AssistantHistoryCell {
                 source: format!("{HOSTILE}\n{HOSTILE}"),
             }),
+            Box::new(ReasoningHistoryCell::new(HOSTILE)),
             Box::new(ReasoningHistoryCell {
-                summary: HOSTILE.to_owned(),
+                expanded: true,
+                ..ReasoningHistoryCell::new(format!("{HOSTILE}\n{HOSTILE}")).with_origin(HOSTILE)
             }),
             Box::new(SubAgentCell {
                 child_id: HOSTILE.to_owned(),
