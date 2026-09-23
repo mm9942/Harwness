@@ -49,3 +49,19 @@ noch leben. Kein zweites Signal an eine wiederverwendete PID.
 -p/--process nimmt mehrere exakte ausführbare Namen entgegen; --pid mehrere
 positive PIDs. Beide Selektoren bilden eine Vereinigung, --uid filtert diese.
 Keine Rust-spezifischen Flags, Regex, Teilstrings oder Positionsargumente.
+
+## Integration in Harwness
+
+Das Projekt lebt als Workspace-Crate `harw-killer` weiter; Semantik unverändert.
+
+- `src/lib.rs`: gesamte CLI-Orchestrierung (`run_cli`, `HelperInvocation`).
+  `main.rs` ist nur noch ein dünner Einstieg für das `killer`-Binary.
+- `HelperInvocation::Standalone` startet den sudo-Helfer wie bisher als
+  `<exe> --helper …`; `HelperInvocation::Subcommand(["kill"])` als
+  `<exe> kill --helper …`, damit `harw kill …` denselben Weg nimmt.
+- `src/api.rs`: programmatische Schnittstelle für Agenten (`preview`,
+  `kill_own`). Sie verwendet dieselbe Auswahl und dieselbe KILL/Warte/KILL-
+  Engine, startet aber **nie** sudo: fremde Ziele erhalten ein Fehlerergebnis.
+- `harw kill` (harw-cli) reicht alle Argumente unverändert an `run_cli` durch.
+- Agent-Werkzeuge `process.list` (nur Vorschau) und `process.kill`
+  (freigabepflichtig) liegen im Crate `harw-tool-process`.
