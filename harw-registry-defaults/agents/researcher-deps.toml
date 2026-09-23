@@ -33,8 +33,22 @@ admitted = [
   "deps.source_read",
   "deps.source_search",
   "deps.source_list",
+  "explore.tree",
+  "explore.projects",
+  "explore.relations",
+  "explore.find",
 ]
-forbidden = ["fs.write", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
+# `ReadOnlyExplore` registriert zusaetzlich `web.fetch`/`web.search` fuer den
+# `explorer` (Nutzerentscheidung "der Explorer durchsucht auch das Internet").
+# Diese Rolle bleibt ohne Netz und verbietet beide deshalb ausdruecklich.
+forbidden = [
+  "fs.write",
+  "shell.exec",
+  "web.fetch",
+  "web.search",
+  "web.docs_rs",
+  "web.crates_io",
+]
 
 [spawn]
 max_depth = 1

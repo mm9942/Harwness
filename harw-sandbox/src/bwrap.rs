@@ -2238,7 +2238,11 @@ mod tests {
         assert_eq!(
             count_window(
                 &args,
-                &["--ro-bind-try", "/home/tester/.cargo/bin", "/home/tester/.cargo/bin"]
+                &[
+                    "--ro-bind-try",
+                    "/home/tester/.cargo/bin",
+                    "/home/tester/.cargo/bin"
+                ]
             ),
             1,
             "{args:?}"

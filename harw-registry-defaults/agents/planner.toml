@@ -52,8 +52,14 @@ admitted = [
   # Index abfragt; ohne ihn muesste der Planner dieselbe Frage nur noch per
   # `fs.grep`/`fs.search` erraten.
   "lens.ask",
+  # `explore.*` (harw-tool-explorer): rein lesender Ueberblick ueber den
+  # Workspace-Baum, `RegistryProfile::Planning` registriert ihn.
+  "explore.tree",
+  "explore.projects",
+  "explore.relations",
+  "explore.find",
 ]
-forbidden = ["fs.write", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
+forbidden = ["fs.write", "shell.exec", "web.fetch", "web.search", "web.docs_rs", "web.crates_io"]
 
 [spawn]
 max_depth = 1

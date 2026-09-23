@@ -45,7 +45,7 @@ admitted = [
   "explore.relations",
   "explore.find",
 ]
-forbidden = ["fs.write", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
+forbidden = ["fs.write", "shell.exec", "web.fetch", "web.search", "web.docs_rs", "web.crates_io"]
 
 [spawn]
 max_depth = 2

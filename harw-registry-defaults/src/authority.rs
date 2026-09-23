@@ -239,7 +239,8 @@ pub fn reduce_to_read_network(granted: &PermissionSet) -> PermissionSet {
 ///   Reducer trägt je `WriteWorkspace` weiter).
 /// - `uia-explorer` → [`AuthorityReducer::ReadOnly`] (Profil
 ///   `UiaExplorer`; **Muster `uia-worker`**, dieselbe Ausnahme — die Rolle
-///   registriert `fs.read/list/search/glob/grep` **und** `web.fetch`, kein
+///   registriert `fs.read/list/search/glob/grep`, `explore.*` **und**
+///   `web.fetch`/`web.search`, kein
 ///   Reducer trägt je `NetworkAccess` gemeinsam mit `ReadWorkspace` weiter,
 ///   siehe die Ausnahme-Begründung unten).
 /// - `uia-writer` → [`AuthorityReducer::ReadOnly`] (Profil `UiaWriter`;
@@ -255,7 +256,14 @@ pub fn reduce_to_read_network(granted: &PermissionSet) -> PermissionSet {
 ///
 /// Invariante (Test): Für jede eingebaute Rolle gilt
 /// `profile.required_permissions() ⊆ reducer.ceiling()` — keine Rolle bewirbt
-/// ein Werkzeug, das ihre Obergrenze nie tragen kann. **Ausnahme:**
+/// ein Werkzeug, das ihre Obergrenze nie tragen kann. **Teilausnahme
+/// Explorer-Netz:** `ReadOnlyExplore` (`explorer`, `analyst`,
+/// `researcher-deps`) registriert zusätzlich `web.fetch`/`web.search`
+/// (`crate::profile::EXPLORER_WEB_TOOLS`, `NetworkAccess`, Nutzerentscheidung
+/// „der Explorer durchsucht auch das Internet“); `ReadRegistry` trägt
+/// `NetworkAccess` bewusst nicht weiter (A5), die Invariante gilt deshalb für
+/// das Profil ohne genau diese zwei Werkzeuge. Nur `explorer` admittiert sie,
+/// `analyst`/`researcher-deps` verbieten sie ausdrücklich. **Ausnahme:**
 /// `memory-steward` (braucht `WriteWorkspace` für `fs.write`), `executor`
 /// (braucht `ExecuteProcess` für `shell.exec`), `uia-worker` (braucht
 /// zusätzlich zu `ReadWorkspace` auch `ExecuteProcess` für `shell.exec` und
@@ -403,7 +411,7 @@ pub(crate) fn permissions_of(tools: &[&str]) -> PermissionSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::RegistryProfile;
+    use crate::profile::{EXPLORER_WEB_TOOLS, RegistryProfile};
 
     fn every_permission() -> PermissionSet {
         PermissionSet::from_policy([
@@ -565,10 +573,25 @@ mod tests {
             if exempt_from_subset_bound.contains(role) {
                 continue;
             }
-            assert!(
+            // Explorer-Netz (Nutzerentscheidung „der Explorer durchsucht auch
+            // das Internet“): `ReadOnlyExplore` registriert zusätzlich
+            // `web.fetch`/`web.search` (`EXPLORER_WEB_TOOLS`, `NetworkAccess`),
+            // das `ReadRegistry` nie weiterträgt — A5 bleibt damit auf
+            // Reducer-Ebene intakt. Genau diese zwei Werkzeuge sind von der
+            // Untermengen-Invariante ausgenommen, sonst nichts: ohne sie muss
+            // das Profil vollständig unter die Obergrenze passen.
+            let bounded = PermissionSet::from_policy(
                 profile
-                    .required_permissions()
-                    .is_subset_of(&reducer.ceiling()),
+                    .registered_tool_names()
+                    .into_iter()
+                    .filter(|tool| {
+                        !(profile == RegistryProfile::ReadOnlyExplore
+                            && EXPLORER_WEB_TOOLS.contains(tool))
+                    })
+                    .filter_map(tool_permission),
+            );
+            assert!(
+                bounded.is_subset_of(&reducer.ceiling()),
                 "{role}: {profile:?} braucht mehr, als {reducer:?} je trägt"
             );
         }

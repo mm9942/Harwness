@@ -1,6 +1,9 @@
 # Eingebauter Web-Rechercheur (AP W3-04) — Registry-Profil `Research`.
 #
-# Die einzige eingebaute Rolle mit Netzzugang. Der Zugang bleibt doppelt
+# Die einzige eingebaute Rolle mit allen vier Netz-Werkzeugen (`web.fetch`,
+# `web.search`, `web.docs_rs`, `web.crates_io`); `explorer`/`uia-explorer`
+# fuehren nur `web.fetch`/`web.search`, die uebrigen UIA-Rollen nur
+# `web.fetch`. Der Zugang bleibt doppelt
 # begrenzt: `web.*` ist nur die Tool-Oberflaeche, die tatsaechlich erreichbaren
 # Hosts bestimmt die Egress-Policy aus `[network].researcher_web_hosts`
 # (`harw_registry_defaults::research_web::researcher_web_policy`; leer = kein
@@ -33,6 +36,7 @@ admitted = [
   "web.fetch",
   "web.docs_rs",
   "web.crates_io",
+  "web.search",
 ]
 forbidden = [
   "fs.read",

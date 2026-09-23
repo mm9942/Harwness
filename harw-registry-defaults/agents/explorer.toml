@@ -1,7 +1,10 @@
 # Eingebauter Explore-Worker (AP W3-04) — Registry-Profil `ReadOnlyExplore`.
 #
-# Liest den Workspace und den entpackten Dependency-Quellcode, um eine Frage zu
-# belegen. Er schreibt nichts und startet keinen Subprozess.
+# Liest den Workspace (auch projektuebergreifend ueber `explore.*`) und den
+# entpackten Dependency-Quellcode, um eine Frage zu belegen, und darf auf
+# Nutzerwunsch auch das Netz durchsuchen (`web.search`/`web.fetch`; jeder
+# Abruf braucht `NetworkAccess` im Sandbox-Scope und laeuft ueber die
+# Egress-Policy). Er schreibt nichts und startet keinen Subprozess.
 
 schema = "harwness.agent/v1"
 id = "harwness.agent.explorer@1"

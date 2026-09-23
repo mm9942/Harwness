@@ -99,9 +99,11 @@ pub use research_web::{install_web_tools, researcher_web_network_scope, research
 /// Die Liste umfasst ausschließlich Werkzeuge, die **nachweislich** nur lesen
 /// und an keiner Fläche eine Freigabe (`ApprovalPolicy != None`) deklarieren:
 /// lesende Dateisystem-Werkzeuge, das lesende PDF-Werkzeug (`doc.read_pdf`,
-/// `harw-tool-doc`), die Dependency-Werkzeuge, `lens.ask`, die Web-Recherche
-/// (deren Netzgrenze die Host-Allowlist der Sandbox zieht, nicht die
-/// Freigabe) und die lesenden Status-Operationen `status`/`ps`.
+/// `harw-tool-doc`), die Explorer-Werkzeuge (`explore.*`), die
+/// Dependency-Werkzeuge, `lens.ask`, die Web-Recherche (deren Netzgrenze die
+/// Host-Allowlist der Sandbox zieht, nicht die Freigabe) und die lesenden
+/// Status-Operationen `status`/`ps`. `process.list`/`process.kill` gehören
+/// nie dazu (`ExecuteProcess`, nur im Profil `Full`).
 ///
 /// Alles Mutierende — `fs.write`, `shell.exec`, `stop`, `plan`, `goal` —, alles
 /// mit Nebenwirkung über einen anderen Weg (`diff`, `explore`, `research_*`,
@@ -147,6 +149,13 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // Eigenschaft wie `fs.read`, erscheint deshalb überall, wo ein lesender
     // FS-Provider registriert wird (siehe `profile::DOC_TOOLS`).
     "doc.read_pdf",
+    // Workspace-Explorer (`harw-tool-explorer`) — Baum, Projekte, Relationen,
+    // Suche ab der Workspace-Wurzel; rein lesend, `Permission::ReadWorkspace`
+    // wie `fs.read` (siehe `profile::EXPLORER_TOOLS`).
+    "explore.tree",
+    "explore.projects",
+    "explore.relations",
+    "explore.find",
     // Dependency-Werkzeuge (`harw-tool-deps`) — ausnahmslos read-only.
     "deps.graph",
     "deps.locked",
@@ -159,12 +168,16 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // Agenten. Die Sichtbarkeitsgrenze zieht `ReadScope`, nicht die
     // Genehmigung — der Aufrufer kann seinen Bereich nicht selbst wählen.
     "lens.ask",
-    // Web-Recherche (`harw-tool-web`) — nur im Profil `Research` (Rolle
-    // `researcher-web`, ohne `fs.*`/`deps.*`); die Netzgrenze zieht die
-    // `EgressPolicy` aus `[network].researcher_web_hosts` (W5 RD).
+    // Web-Recherche (`harw-tool-web`) — alle vier im Profil `Research` (Rolle
+    // `researcher-web`, ohne `fs.*`/`deps.*`); `web.fetch`/`web.search`
+    // zusätzlich in den Erkundungsprofilen (`explorer`, `uia-explorer`,
+    // Nutzerentscheidung) und `web.fetch` in den übrigen UIA-Profilen. Die
+    // Netzgrenze zieht jeweils der `NetworkScope` der Sandbox bzw. die
+    // `EgressPolicy` (W5 RD), nicht die Freigabe — rein lesend.
     "web.fetch",
     "web.docs_rs",
     "web.crates_io",
+    "web.search",
     // Lesende Status-Operationen (`harw-ops`, `model_tool(readonly, approval =
     // "none")`, ohne Seitenpfad in andere Executor).
     "status",
@@ -472,7 +485,14 @@ mod tests {
             "fs.glob".to_owned(),
             "fs.grep".to_owned(),
             "doc.read_pdf".to_owned(),
+            "explore.tree".to_owned(),
+            "explore.projects".to_owned(),
+            "explore.relations".to_owned(),
+            "explore.find".to_owned(),
             "shell.exec".to_owned(),
+            // `process.kill` steht in `ALWAYS_ASK_TOOLS`, fragt also immer.
+            "process.list".to_owned(),
+            "process.kill".to_owned(),
         ];
 
         let advertised_tools = registered_names(&ar);
