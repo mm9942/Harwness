@@ -996,9 +996,14 @@ async fn supervise(
     // seine Dateizugriffe nur über einen prozessinternen Mutex, zwei parallel
     // laufende Instanzen auf demselben Verzeichnis dürften sich also nicht
     // gegenseitig überschreiben.
-    let work_requests = Arc::new(WorkRequestStore::new(
-        &telegram_profile.join("channel-state").join("work-requests"),
-    ));
+    // Genehmigte Aufträge werden als durabler Job im Profil-Jobstore
+    // zugelassen; `harw job-worker` führt sie aus.
+    let work_requests = Arc::new(
+        WorkRequestStore::new(&telegram_profile.join("channel-state").join("work-requests"))
+            .with_launcher(Arc::new(
+                crate::telegram_launcher::JobStoreWorkLauncher::for_profile_dir(&telegram_profile),
+            )),
+    );
 
     let mut webhook_teardowns = Vec::new();
     let mut binding_tasks: Vec<TelegramBindingTask> = Vec::new();
