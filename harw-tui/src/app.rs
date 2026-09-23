@@ -158,6 +158,7 @@ use crate::history_cell::{
     ToolState, ToolVerbosity, UserHistoryCell,
 };
 use crate::host_permit_dialog::{HostPermitPrompt, HostPermitPromptReceiver, HostPermitVariant};
+use crate::keybindings::{KeyAction, KeyBindings};
 use crate::model_switch_picker::{
     ModelEntry, ModelSwitchPicker, PickerAction as ModelSwitchAction, PickerTarget, ProviderEntry,
 };
@@ -924,6 +925,9 @@ pub struct ChatApp {
     live_reasoning: String,
     /// Sichtbarkeit und Fokus der Seitenpanels.
     panels: crate::panes::PanelState,
+    /// Aktive Tastenbelegung (Standard oder aus der Keybindings-Datei, siehe
+    /// [`Self::set_key_bindings`]); gilt für Panels und Composer.
+    key_bindings: KeyBindings,
     /// Explorer-Panel über den gesamten Projektbaum; beim ersten Einblenden
     /// angelegt und im Hintergrund indiziert.
     explorer: Option<crate::explorer_panel::ExplorerPanel>,
@@ -1221,6 +1225,7 @@ impl ChatApp {
             live_stream: String::new(),
             live_reasoning: String::new(),
             panels: crate::panes::PanelState::default(),
+            key_bindings: KeyBindings::default(),
             explorer: None,
             adapters,
             sandbox,
@@ -1296,6 +1301,18 @@ impl ChatApp {
     /// Orchestrierungshistorie für die Agentenbaum-Projektion.
     pub(crate) fn set_historic_agent_events(&mut self, events: Vec<AgentOrchestrationEvent>) {
         self.historic_agent_events = events;
+    }
+
+    /// Ersetzt die aktive Tastenbelegung (z. B. aus der Keybindings-Datei
+    /// geladen); gilt ab der nächsten Taste für Panels und Composer.
+    pub(crate) fn set_key_bindings(&mut self, bindings: KeyBindings) {
+        self.key_bindings = bindings;
+    }
+
+    /// Aktive Tastenbelegung — etwa um sie nach `/resume`/`/new` in die neu
+    /// gebaute App zu übernehmen.
+    pub(crate) fn key_bindings(&self) -> &KeyBindings {
+        &self.key_bindings
     }
 
     /// Rebinds persistent input history to the runtime-selected Harw home.
@@ -4963,7 +4980,8 @@ fn handle_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
     scroll_and_composer_key(app, key, bus)
 }
 
-/// Panel-Tasten (F2/F3/F4/F11/Esc und Navigation im fokussierten Panel).
+/// Panel-Tasten (Standard F2/F3/F4/F11/Ctrl+E laut [`ChatApp::key_bindings`],
+/// Esc und Navigation im fokussierten Panel).
 /// `None`: Taste gehört dem Chat/Composer.
 fn handle_panel_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
     // Ein offenes Popup/Dialog behält Esc & Pfeile für sich.
@@ -4973,7 +4991,7 @@ fn handle_panel_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
     {
         return None;
     }
-    match app.panels.handle_key(key) {
+    match app.panels.handle_key(key, &app.key_bindings) {
         crate::panes::PanelKey::Ignored => None,
         crate::panes::PanelKey::Changed => {
             app.ensure_explorer();
@@ -5064,6 +5082,9 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
 
     // Jede andere Taste macht eine Scharfstellung rückgängig.
     app.pending_quit = None;
+
+    // Konfigurierbare Aktionen (Standardbelegung siehe `keybindings.rs`).
+    let action = app.key_bindings.action_for(&key);
     if !matches!(key.code, KeyCode::Esc) {
         app.escape_armed = false;
     }
@@ -5084,10 +5105,11 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
         return true;
     }
 
-    // Shift+Tab — Zyklus ask → auto → full → plan (Plan Schritt 5). Nur
-    // außerhalb eines offenen `/command`-Popups: sonst hätte dieselbe Taste
-    // zwei Bedeutungen (Popup-Navigation vs. Moduszyklus).
-    if matches!(key.code, KeyCode::BackTab) && !app.has_popup() {
+    // CyclePermissionMode (Standard Shift+Tab) — Zyklus ask → auto → full →
+    // plan (Plan Schritt 5). Nur außerhalb eines offenen `/command`-Popups:
+    // sonst hätte dieselbe Taste zwei Bedeutungen (Popup-Navigation vs.
+    // Moduszyklus).
+    if action == Some(KeyAction::CyclePermissionMode) && !app.has_popup() {
         // `handle_key` läuft ausschließlich außerhalb eines laufenden Turns
         // (während eines Turns übernimmt `handle_busy_event`) — der Wechsel
         // wirkt hier also sofort, nicht vorgemerkt.
@@ -5095,24 +5117,25 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
         return true;
     }
 
-    // Ctrl+K löscht die komplette aktuelle Zeile (nicht nur bis Zeilenende),
-    // auch bei offenem Command-Popup — nachfolgende Zeilen rücken nach oben.
-    if ctrl && matches!(key.code, KeyCode::Char('k' | 'K')) {
+    // DeleteLine (Standard Ctrl+K) löscht die komplette aktuelle Zeile (nicht
+    // nur bis Zeilenende), auch bei offenem Command-Popup — nachfolgende
+    // Zeilen rücken nach oben.
+    if action == Some(KeyAction::DeleteLine) {
         app.input.delete_current_line();
         app.sync_popup();
         return true;
     }
 
-    // Ctrl+O — klappt die letzte bzw. bei erneutem Druck alle Werkzeugzellen
-    // auf/zu (Plan Schritt 2).
-    if ctrl && matches!(key.code, KeyCode::Char('o' | 'O')) {
+    // ToggleToolCells (Standard Ctrl+O) — klappt die letzte bzw. bei erneutem
+    // Druck alle Werkzeugzellen auf/zu (Plan Schritt 2).
+    if action == Some(KeyAction::ToggleToolCells) {
         return app.toggle_tool_cells();
     }
 
-    // Ctrl+H — beendet eine laufende Host-Arbeitsphase sofort (Plan
-    // „UIA-Shell-Worker und Shell-Modus", Schritt 2: „eine Möglichkeit, sie
-    // zu beenden"). Ohne aktive Phase tut die Taste nichts (kein Redraw).
-    if ctrl && matches!(key.code, KeyCode::Char('h' | 'H')) {
+    // EndHostMode (Standard Ctrl+H) — beendet eine laufende Host-Arbeitsphase
+    // sofort (Plan „UIA-Shell-Worker und Shell-Modus", Schritt 2: „eine
+    // Möglichkeit, sie zu beenden"). Ohne aktive Phase tut die Taste nichts (kein Redraw).
+    if action == Some(KeyAction::EndHostMode) {
         return app.end_host_mode();
     }
 
@@ -5132,8 +5155,9 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
         }
     }
 
-    // Ctrl+J — neue Zeile einfügen (schließt ein offenes Popup).
-    if ctrl && matches!(key.code, KeyCode::Char('j' | 'J')) {
+    // InsertNewline (Standard Ctrl+J) — neue Zeile einfügen (schließt ein
+    // offenes Popup).
+    if action == Some(KeyAction::InsertNewline) {
         app.command_popup = None;
         app.input.insert_newline();
         return true;
@@ -6941,9 +6965,12 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
         {
             BusyKeyOutcome::Redraw
         }
-        // Shift+Tab gilt sofort und wird nicht in `deferred_input` eingereiht,
-        // damit der Zyklus nach Turn-Ende nicht ein zweites Mal läuft.
-        TuiEvent::Key(key) if matches!(key.code, KeyCode::BackTab) => {
+        // CyclePermissionMode (Standard Shift+Tab) gilt sofort und wird nicht
+        // in `deferred_input` eingereiht, damit der Zyklus nach Turn-Ende
+        // nicht ein zweites Mal läuft.
+        TuiEvent::Key(key)
+            if app.key_bindings.action_for(&key) == Some(KeyAction::CyclePermissionMode) =>
+        {
             app.cycle_permission_stage(false);
             BusyKeyOutcome::Redraw
         }

@@ -9,6 +9,11 @@
 //! eine einfache Task-Beschreibung (XML) rein (ohne I/O) und führt Installation,
 //! Statusabfrage und Deinstallation über das `schtasks`-Kommando aus. Der Code
 //! ist auf allen Plattformen kompilierbar; sinnvoll ausführbar nur unter Windows.
+//! Die Deinstallation ist idempotent: `schtasks /End` beendet eine laufende
+//! Instanz (Fehlschlag wird ignoriert), `schtasks /Delete … /F` entfernt den
+//! Task (ein nicht vorhandener Task gilt als Erfolg); optional räumt
+//! [`SchtasksServiceManager::uninstall_with_runtime_dir`] die nach dem Dienst
+//! benannten Einträge im `run/`-Verzeichnis auf.
 //!
 //! # Exportierte Typen
 //! - [`SchtasksServiceManager`]: die konkrete Manager-Implementierung.
@@ -39,6 +44,7 @@
 //! println!("{}", mgr.render_unit(&spec));
 //! ```
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::ServiceError;
@@ -76,6 +82,37 @@ impl SchtasksServiceManager {
                 command: format!("schtasks {}", args.join(" ")),
                 detail: e.to_string(),
             })
+    }
+
+    /// Deinstalliert den Task und räumt zusätzlich Laufzeitdateien auf.
+    ///
+    /// # Description
+    /// Wie [`ServiceManager::uninstall`] (`schtasks /End`, `schtasks /Delete`);
+    /// danach werden in `run_dir` die nach dem Dienst benannten Laufzeit-
+    /// einträge `<name>.pid` und `<name>.sock` entfernt (siehe
+    /// `runtime_entries`). Das Verzeichnis selbst und alle anderen Einträge
+    /// bleiben unangetastet. Fehlende Dateien gelten als bereits entfernt.
+    ///
+    /// Hinweis: `install` dieses Backends schreibt selbst nichts nach `run/`;
+    /// die Einträge stammen ggf. vom gestarteten Dienst bzw. vom PID-Rückfall
+    /// der CLI (`<home>/run/<name>.pid`) und würden sonst verwaist liegen
+    /// bleiben.
+    ///
+    /// # Arguments
+    /// - `name` (`&str`): Dienstname (= Task-Name).
+    /// - `run_dir` (`&Path`): Laufzeitverzeichnis, typisch `<harw-home>/run`.
+    ///
+    /// # Errors
+    /// - [`ServiceError::Command`]: wenn `schtasks` nicht startbar ist oder
+    ///   `/Delete` mit einem anderen Fehler als „Task nicht gefunden" scheitert.
+    /// - [`ServiceError::Io`]: wenn ein vorhandener Eintrag nicht löschbar ist.
+    pub fn uninstall_with_runtime_dir(
+        &self,
+        name: &str,
+        run_dir: &Path,
+    ) -> Result<(), ServiceError> {
+        self.uninstall(name)?;
+        remove_files_if_present(&runtime_entries(run_dir, name))
     }
 }
 
@@ -124,16 +161,112 @@ impl ServiceManager for SchtasksServiceManager {
         }
     }
 
+    /// Beendet und löscht den Task (idempotent).
+    ///
+    /// Zuerst `schtasks /End /TN <name>`; scheitert das (Task läuft nicht oder
+    /// existiert nicht), wird das ignoriert. Danach `schtasks /Delete /TN
+    /// <name> /F`; meldet `schtasks`, dass der Task nicht gefunden wurde, gilt
+    /// das als Erfolg.
     fn uninstall(&self, name: &str) -> Result<(), ServiceError> {
-        let out = Self::schtasks(&["/Delete", "/TN", name, "/F"])?;
-        if !out.status.success() {
-            return Err(ServiceError::Command {
-                command: format!("schtasks /Delete /TN {name}"),
-                detail: String::from_utf8_lossy(&out.stderr).into_owned(),
-            });
+        let end = end_args(name);
+        let end_refs: Vec<&str> = end.iter().map(String::as_str).collect();
+        // Exit-Status bewusst ignoriert: ein nicht laufender Task ist kein Fehler.
+        let _ = Self::schtasks(&end_refs)?;
+
+        let delete = delete_args(name);
+        let delete_refs: Vec<&str> = delete.iter().map(String::as_str).collect();
+        let out = Self::schtasks(&delete_refs)?;
+        if out.status.success() {
+            return Ok(());
         }
-        Ok(())
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if is_task_missing(&stderr) || is_task_missing(&stdout) {
+            return Ok(());
+        }
+        Err(ServiceError::Command {
+            command: format!("schtasks {}", delete.join(" ")),
+            detail: stderr.into_owned(),
+        })
     }
+}
+
+/// Argumente für `schtasks /End /TN <name>` (rein, ohne Programmnamen).
+///
+/// # Arguments
+/// - `name` (`&str`): Task-Name.
+fn end_args(name: &str) -> Vec<String> {
+    vec!["/End".to_owned(), "/TN".to_owned(), name.to_owned()]
+}
+
+/// Argumente für `schtasks /Delete /TN <name> /F` (rein, ohne Programmnamen).
+///
+/// # Arguments
+/// - `name` (`&str`): Task-Name.
+fn delete_args(name: &str) -> Vec<String> {
+    vec![
+        "/Delete".to_owned(),
+        "/TN".to_owned(),
+        name.to_owned(),
+        "/F".to_owned(),
+    ]
+}
+
+/// Erkennt, ob eine `schtasks`-Fehlermeldung nur „Task nicht gefunden"
+/// bedeutet (rein).
+///
+/// # Description
+/// `schtasks` endet bei jedem Fehler mit Exit-Code 1; ein fehlender Task ist
+/// nur am Text erkennbar („The system cannot find the file specified." bzw.
+/// „The specified task name … does not exist in the system."; deutsch „Das
+/// System kann die angegebene Datei nicht finden.").
+///
+/// # Arguments
+/// - `output` (`&str`): Standardfehler bzw. -ausgabe von `schtasks`.
+fn is_task_missing(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    [
+        "cannot find",
+        "does not exist",
+        "nicht finden",
+        "nicht gefunden",
+        "ist nicht vorhanden",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// Laufzeiteinträge eines Dienstes in `run_dir` (rein): `<name>.pid` und
+/// `<name>.sock`.
+///
+/// # Arguments
+/// - `run_dir` (`&Path`): Laufzeitverzeichnis, typisch `<harw-home>/run`.
+/// - `name` (`&str`): Dienstname.
+fn runtime_entries(run_dir: &Path, name: &str) -> Vec<PathBuf> {
+    vec![
+        run_dir.join(format!("{name}.pid")),
+        run_dir.join(format!("{name}.sock")),
+    ]
+}
+
+/// Löscht die angegebenen Dateien; fehlende Dateien sind kein Fehler.
+///
+/// # Errors
+/// - [`ServiceError::Io`]: beim ersten Löschfehler außer `NotFound`.
+fn remove_files_if_present(paths: &[PathBuf]) -> Result<(), ServiceError> {
+    for path in paths {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(ServiceError::Io {
+                    path: path.display().to_string(),
+                    source: e,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Rendert eine einfache Task-Scheduler-Beschreibung (XML) rein (ohne I/O).
@@ -206,7 +339,7 @@ fn xml_escape(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::test_support::{TestResult, ctx};
 
     fn spec() -> ServiceSpec {
         ServiceSpec {
@@ -245,5 +378,103 @@ mod tests {
     #[test]
     fn test_kind_is_schtasks() {
         assert_eq!(SchtasksServiceManager::new().kind(), ServiceKind::Schtasks);
+    }
+
+    /// Legt ein eindeutiges temporäres Verzeichnis an.
+    fn temp_dir(tag: &str) -> TestResult<PathBuf> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "harw-schtasks-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).map_err(ctx("temp dir anlegen"))?;
+        Ok(dir)
+    }
+
+    #[test]
+    fn test_end_args_target_task_name() {
+        assert_eq!(
+            end_args("harw"),
+            vec!["/End".to_owned(), "/TN".to_owned(), "harw".to_owned()]
+        );
+    }
+
+    #[test]
+    fn test_delete_args_force_delete_task_name() {
+        assert_eq!(
+            delete_args("harw"),
+            vec![
+                "/Delete".to_owned(),
+                "/TN".to_owned(),
+                "harw".to_owned(),
+                "/F".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_is_task_missing_recognises_messages() {
+        assert!(is_task_missing(
+            "ERROR: The system cannot find the file specified.\r\n"
+        ));
+        assert!(is_task_missing(
+            "ERROR: The specified task name \"\\harw\" does not exist in the system.\r\n"
+        ));
+        assert!(is_task_missing(
+            "FEHLER: Das System kann die angegebene Datei nicht finden.\r\n"
+        ));
+        assert!(!is_task_missing("ERROR: Access is denied.\r\n"));
+        assert!(!is_task_missing(""));
+    }
+
+    #[test]
+    fn test_runtime_entries_are_named_after_service() {
+        let entries = runtime_entries(Path::new("/h/.harw/run"), "harw-gateway");
+        assert_eq!(
+            entries,
+            vec![
+                PathBuf::from("/h/.harw/run/harw-gateway.pid"),
+                PathBuf::from("/h/.harw/run/harw-gateway.sock"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_remove_files_if_present_removes_owned_and_keeps_others() -> TestResult {
+        let home = temp_dir("remove")?;
+        let run_dir = home.join("run");
+        std::fs::create_dir_all(&run_dir).map_err(ctx("run anlegen"))?;
+        std::fs::write(run_dir.join("harw.pid"), "42").map_err(ctx("pid"))?;
+        std::fs::write(run_dir.join("harw.sock"), "").map_err(ctx("sock"))?;
+        std::fs::write(run_dir.join("other.pid"), "7").map_err(ctx("fremd"))?;
+
+        let targets = runtime_entries(&run_dir, "harw");
+        remove_files_if_present(&targets).map_err(ctx("erstes Entfernen"))?;
+
+        assert!(!run_dir.join("harw.pid").exists());
+        assert!(!run_dir.join("harw.sock").exists());
+        assert!(run_dir.join("other.pid").exists());
+        assert!(run_dir.exists());
+
+        // Idempotent: ein zweiter Lauf auf fehlende Dateien ist kein Fehler.
+        remove_files_if_present(&targets).map_err(ctx("zweites Entfernen"))?;
+
+        std::fs::remove_dir_all(&home).map_err(ctx("aufräumen"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_remove_files_if_present_reports_non_notfound_error() -> TestResult {
+        let home = temp_dir("dir-error")?;
+        // Ein Verzeichnis lässt sich nicht per remove_file löschen.
+        let blocker = home.join("harw.pid");
+        std::fs::create_dir_all(&blocker).map_err(ctx("blocker anlegen"))?;
+        let result = remove_files_if_present(&[blocker]);
+        assert!(matches!(result, Err(ServiceError::Io { .. })));
+        std::fs::remove_dir_all(&home).map_err(ctx("aufräumen"))?;
+        Ok(())
     }
 }
