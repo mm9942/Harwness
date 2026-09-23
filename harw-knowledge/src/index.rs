@@ -535,6 +535,94 @@ mod tests {
         Ok(())
     }
 
+    /// Regression (R2/W1): ein über `KnowledgeStore::write_dream_report`
+    /// geschriebener Traumbericht trägt gültiges Frontmatter und wird von
+    /// `rebuild` als `DreamReport` indexiert, statt den Rebuild abzubrechen.
+    #[test]
+    fn rebuild_indexes_a_written_dream_report() -> TestResult {
+        use crate::dream::DreamReport;
+
+        let root = temporary_root("harw-knowledge-rebuild-dream")?;
+        let store = KnowledgeStore::new(&root);
+        let report = DreamReport {
+            work_id: harw_job_runtime::WorkId::from_str("dream-20260923T010203"),
+            created_at: jiff::Timestamp::UNIX_EPOCH,
+            summary: "Konsolidierte Reflexion".to_owned(),
+            proposed_topic_updates: Vec::new(),
+            proposed_palace_promotions: Vec::new(),
+            follow_ups: vec!["Deploy prüfen".to_owned()],
+        };
+
+        let path = store.write_dream_report(&report)?;
+        assert_eq!(
+            path,
+            store.dream_path("1970-01-01", "dream-20260923T010203")
+        );
+
+        let (rebuilt, index_report) = KnowledgeIndex::rebuild_with_report(&store)?;
+
+        assert!(
+            index_report.is_clean(),
+            "skipped: {:?}",
+            index_report.skipped
+        );
+        assert_eq!(index_report.indexed, 1);
+        let indexed = rebuilt
+            .get(&report.artifact_id())
+            .ok_or(TestError::Missing("dream report is indexed"))?;
+        assert_eq!(indexed.kind, ArtifactKind::DreamReport);
+        assert_eq!(
+            indexed.frontmatter.visibility,
+            VisibilityScope::OperatorOnly
+        );
+        assert!(indexed.body.contains("Konsolidierte Reflexion"));
+
+        std::fs::remove_dir_all(root)
+            .map_err(crate::test_support::ctx("remove temporary knowledge root"))?;
+        Ok(())
+    }
+
+    /// Eine einzelne defekte Datei (hier: Markdown ohne Frontmatter, wie der
+    /// frühere Gateway-Traumbericht) wird übersprungen und berichtet; gültige
+    /// Artefakte daneben werden weiterhin indexiert.
+    #[test]
+    fn rebuild_skips_and_reports_a_malformed_artifact() -> TestResult {
+        let root = temporary_root("harw-knowledge-rebuild-malformed")?;
+        let store = KnowledgeStore::new(&root);
+
+        let malformed = store.dream_path("2026-09-23", "legacy");
+        std::fs::create_dir_all(
+            malformed
+                .parent()
+                .ok_or(TestError::Missing("dream path has a parent"))?,
+        )?;
+        std::fs::write(&malformed, "# Traumbericht ohne Frontmatter\n")?;
+
+        let palace = KnowledgeArtifact::new(
+            ArtifactId::new("palace/deploy"),
+            ArtifactKind::PalaceNode,
+            frontmatter(),
+            "deployment detail",
+        );
+        store.write_artifact(&store.palace_path(&ArtifactId::new("deploy")), &palace)?;
+
+        let (rebuilt, index_report) = KnowledgeIndex::rebuild_with_report(&store)?;
+
+        assert_eq!(rebuilt.len(), 1);
+        assert!(rebuilt.get(&ArtifactId::new("palace/deploy")).is_some());
+        assert_eq!(index_report.indexed, 1);
+        assert_eq!(index_report.skipped.len(), 1);
+        assert_eq!(index_report.skipped[0].0, malformed);
+        assert!(index_report.skipped[0].1.contains("frontmatter"));
+
+        // Die bequeme `rebuild`-Variante bricht ebenfalls nicht ab.
+        assert_eq!(KnowledgeIndex::rebuild(&store)?.len(), 1);
+
+        std::fs::remove_dir_all(root)
+            .map_err(crate::test_support::ctx("remove temporary knowledge root"))?;
+        Ok(())
+    }
+
     #[test]
     fn rebuild_treats_a_missing_root_as_an_empty_store() -> TestResult {
         let nonce = std::time::SystemTime::now()

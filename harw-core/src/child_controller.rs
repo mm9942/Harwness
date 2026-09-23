@@ -1490,6 +1490,13 @@ pub struct ManagedAgentSpawner {
     /// Optional sink for user-safe lifecycle snapshots. Invocation happens
     /// only after the active/cancellation/manager locks are released.
     orchestration_observer: Option<Arc<dyn OrchestrationObserver>>,
+    /// Auftrag (`pending_task`, Kurzkopf) und Ergebnis-Kurzkopf je
+    /// admittiertem Kind (Schlüssel: Kind-ID), siehe [`ChildTaskState`].
+    child_tasks: Mutex<BTreeMap<String, ChildTaskState>>,
+    /// Live-Kanäle der Elternteile je Kind für gedrosselte
+    /// [`TurnEvent::ChildProgress`]-Meldungen; geteilt mit dem
+    /// [`Self::progress_observer`].
+    progress_sinks: ProgressSinks,
     /// Woken every time a slot in `active` is freed (`release_in_memory`,
     /// `reap_expired`, `reap_expired_durable` — every path that removes an
     /// entry from `active`). Lets [`Self::admit_or_wait`] wait for capacity
@@ -1609,6 +1616,8 @@ struct ActiveLeaseProgressObserver {
     active: Arc<Mutex<BTreeMap<String, ChildRecord>>>,
     lease_seconds: i64,
     orchestration_observer: Option<Arc<dyn OrchestrationObserver>>,
+    /// Live-Kanäle der Elternteile für [`TurnEvent::ChildProgress`].
+    progress_sinks: ProgressSinks,
 }
 
 impl ActiveLeaseProgressObserver {
@@ -1647,16 +1656,68 @@ impl crate::guard::ProgressObserver for ActiveLeaseProgressObserver {
             let root = ManagedAgentSpawner::root_from_active(&active, session_id)?;
             Some((root, record))
         });
+        if let Some((_, record)) = snapshot.as_ref() {
+            emit_child_progress(&self.progress_sinks, record, std::time::Instant::now());
+        }
         if let (Some(observer), Some((root, record))) = (&self.orchestration_observer, snapshot) {
             emit_orchestration_event(
                 observer,
                 root,
                 &record,
                 None,
+                None,
                 AgentOrchestrationStatus::Progress,
             );
         }
     }
+}
+
+/// Sendet gedrosselt ein [`TurnEvent::ChildProgress`] für `record` an die
+/// registrierte Fortschritts-Senke seines Elternteils.
+///
+/// # Beschreibung
+/// Höchstens eine Meldung je [`CHILD_PROGRESS_MIN_INTERVAL`] und Kind; eine
+/// gedrosselte Meldung wird verworfen (die nächste trägt ohnehin die dann
+/// aktuellen Zähler). Ohne Senke ist das ein No-op. Die Sperre der Registry
+/// ist beim Senden bereits freigegeben.
+///
+/// # Arguments
+/// - `sinks` (`&ProgressSinks`): die geteilte Senken-Registry.
+/// - `record` (`&ChildRecord`): Schnappschuss des Kindes (Zähler aus `live`).
+/// - `now` (`std::time::Instant`): Referenzzeitpunkt der Drosselung.
+///
+/// # Returns
+/// `true`, wenn eine Meldung gesendet wurde.
+fn emit_child_progress(
+    sinks: &ProgressSinks,
+    record: &ChildRecord,
+    now: std::time::Instant,
+) -> bool {
+    let target = {
+        let Ok(mut sinks) = sinks.lock() else {
+            tracing::warn!(child = %record.child, "child_progress.lock_poisoned");
+            return false;
+        };
+        let Some(sink) = sinks.get_mut(record.child.as_str()) else {
+            return false;
+        };
+        let throttled = sink
+            .last_emitted
+            .is_some_and(|last| now.saturating_duration_since(last) < CHILD_PROGRESS_MIN_INTERVAL);
+        if throttled {
+            return false;
+        }
+        sink.last_emitted = Some(now);
+        (sink.turn_id.clone(), sink.emitter.clone())
+    };
+    let (turn_id, emitter) = target;
+    emitter.emit(TurnEvent::ChildProgress {
+        turn_id,
+        child: record.child.clone(),
+        tool_calls: record.live.tool_calls,
+        tokens: record.live.usage.total(),
+    });
+    true
 }
 
 /// Builds one user-safe lifecycle observation. Callers must invoke this only
@@ -1667,6 +1728,7 @@ fn emit_orchestration_event(
     root_session_id: SessionId,
     record: &ChildRecord,
     task: Option<String>,
+    detail: Option<String>,
     status: AgentOrchestrationStatus,
 ) {
     observer.on_orchestration_event(AgentOrchestrationEvent {
@@ -1683,7 +1745,7 @@ fn emit_orchestration_event(
         usage: Some(record.live.usage.clone()),
         duration_ms: Some(elapsed_ms(record.admitted_at)),
         progress: None,
-        detail: None,
+        detail: AgentOrchestrationEvent::bounded_detail(detail),
         tool_calls: Some(record.live.tool_calls),
     });
 }
@@ -1753,7 +1815,137 @@ impl ManagedAgentSpawner {
         let Some(observer) = &self.orchestration_observer else {
             return;
         };
-        emit_orchestration_event(observer, root_session_id, record, task, status);
+        let state = self.child_task_state(&record.child);
+        let task = task
+            .as_deref()
+            .and_then(orchestration_detail_head)
+            .or_else(|| state.as_ref().and_then(|state| state.task.clone()));
+        let detail = match status {
+            AgentOrchestrationStatus::Completed | AgentOrchestrationStatus::Failed => {
+                state.and_then(|state| state.outcome_detail)
+            }
+            _ => None,
+        };
+        emit_orchestration_event(observer, root_session_id, record, task, detail, status);
+    }
+
+    /// Kopie des Auftrags-/Ergebniszustands eines Kindes (`None`, wenn
+    /// unbekannt oder die Sperre vergiftet ist).
+    fn child_task_state(&self, child: &SessionId) -> Option<ChildTaskState> {
+        self.child_tasks
+            .lock()
+            .ok()
+            .and_then(|tasks| tasks.get(child.as_str()).cloned())
+    }
+
+    /// Hinterlegt den Kurzkopf der finalen Antwort bzw. des Fehlergrunds
+    /// eines Kindes für das spätere `Completed`/`Failed`-Orchestrierungs-Event.
+    fn set_outcome_detail(&self, child: &SessionId, text: &str) {
+        match self.child_tasks.lock() {
+            Ok(mut tasks) => {
+                tasks
+                    .entry(child.as_str().to_owned())
+                    .or_default()
+                    .outcome_detail = orchestration_detail_head(text);
+            }
+            Err(_) => tracing::warn!(child = %child, "child_task_state.lock_poisoned"),
+        }
+    }
+
+    /// Markiert ein Kind als gescheitert und merkt sich den Grund als
+    /// `detail` des späteren `Failed`-Orchestrierungs-Events.
+    fn set_failed(&self, child: &SessionId, reason: &str) {
+        self.set_outcome_detail(child, reason);
+        self.set_status(child, ChildStatus::Failed);
+    }
+
+    /// Entnimmt den noch nicht verbrauchten Auftrag eines Kindes (einmalig).
+    fn take_pending_task(&self, child: &SessionId) -> Option<String> {
+        self.child_tasks
+            .lock()
+            .ok()
+            .and_then(|mut tasks| tasks.get_mut(child.as_str())?.pending_task.take())
+    }
+
+    /// Meldet den Abschluss-/Freigabestatus eines eben freigegebenen Kindes
+    /// und räumt danach dessen Auftrags- und Fortschrittszustand ab.
+    fn observe_release(
+        &self,
+        child: &SessionId,
+        root: Option<SessionId>,
+        record: Option<&ChildRecord>,
+    ) {
+        if let (Some(root), Some(record)) = (root, record) {
+            let status = match record.status {
+                ChildStatus::Completed => AgentOrchestrationStatus::Completed,
+                ChildStatus::Failed => AgentOrchestrationStatus::Failed,
+                ChildStatus::Cancelled => AgentOrchestrationStatus::Cancelled,
+                ChildStatus::Paused => AgentOrchestrationStatus::Paused,
+                ChildStatus::Running => AgentOrchestrationStatus::Running,
+                ChildStatus::Admitted => AgentOrchestrationStatus::Cancelled,
+            };
+            self.observe_orchestration(root, record, None, status);
+        }
+        self.forget_child_state(child);
+    }
+
+    /// Entfernt Auftrags- und Fortschrittszustand eines nicht mehr aktiven Kindes.
+    fn forget_child_state(&self, child: &SessionId) {
+        if let Ok(mut tasks) = self.child_tasks.lock() {
+            tasks.remove(child.as_str());
+        }
+        if let Ok(mut sinks) = self.progress_sinks.lock() {
+            sinks.remove(child.as_str());
+        }
+    }
+
+    /// Registriert den Live-Kanal, über den dieses Kind gedrosselte
+    /// [`TurnEvent::ChildProgress`]-Meldungen an seinen Elternteil sendet.
+    ///
+    /// # Beschreibung
+    /// Die Admission registriert die Senke automatisch, wenn die
+    /// Elternsitzung beim Spawn im [`SessionManager`] liegt und einen
+    /// laufenden Turn hat (deren [`AgentSession::live_emitter`] und
+    /// [`AgentSession::current_turn`]). Für Elternteile außerhalb des
+    /// Managers (externe Wurzel, gerade laufende Kind-Sitzung) ruft der
+    /// Aufrufer, der den Eltern-Turn fährt, diese Methode nach dem Spawn.
+    /// Eine vorhandene Senke wird ersetzt. Gesendet wird aus dem
+    /// [`Self::progress_observer`] nach jeder Modellrunde bzw. jedem
+    /// Tool-Ergebnis, höchstens alle [`CHILD_PROGRESS_MIN_INTERVAL`].
+    ///
+    /// # Arguments
+    /// - `child` (`&SessionId`): das admittierte Kind.
+    /// - `turn_id` (`TurnId`): der Turn des Elternteils, der das Kind startete.
+    /// - `emitter` (`LiveEmitter`): der Live-Kanal des Elternteils.
+    ///
+    /// # Returns
+    /// `true`, wenn das Kind admittiert ist und die Senke registriert wurde.
+    pub fn attach_child_progress_sink(
+        &self,
+        child: &SessionId,
+        turn_id: TurnId,
+        emitter: LiveEmitter,
+    ) -> bool {
+        if self.child_record(child).is_none() {
+            return false;
+        }
+        match self.progress_sinks.lock() {
+            Ok(mut sinks) => {
+                sinks.insert(
+                    child.as_str().to_owned(),
+                    ChildProgressSink {
+                        turn_id,
+                        emitter,
+                        last_emitted: None,
+                    },
+                );
+                true
+            }
+            Err(_) => {
+                tracing::warn!(child = %child, "child_progress.attach_lock_poisoned");
+                false
+            }
+        }
     }
 
     /// Setzt den Resolver, der jedem Kind das Kontextfenster **seines**
@@ -1797,6 +1989,8 @@ impl ManagedAgentSpawner {
             recent_delegation_hashes: Mutex::new(BTreeMap::new()),
             context_window_resolver: None,
             orchestration_observer: None,
+            child_tasks: Mutex::new(BTreeMap::new()),
+            progress_sinks: Arc::new(Mutex::new(BTreeMap::new())),
             freed: tokio::sync::Notify::new(),
         }
     }
@@ -2000,6 +2194,7 @@ impl ManagedAgentSpawner {
             active: Arc::clone(&self.active),
             lease_seconds: self.limits.lease_seconds,
             orchestration_observer: self.orchestration_observer.clone(),
+            progress_sinks: Arc::clone(&self.progress_sinks),
         })
     }
 
@@ -2013,20 +2208,8 @@ impl ManagedAgentSpawner {
     pub fn close_child(&self, child: &SessionId) {
         let root = self.root_for(child);
         match self.release_in_memory(child) {
-            Ok(Some(record)) => {
-                if let Some(root) = root {
-                    let status = match record.status {
-                        ChildStatus::Completed => AgentOrchestrationStatus::Completed,
-                        ChildStatus::Failed => AgentOrchestrationStatus::Failed,
-                        ChildStatus::Cancelled => AgentOrchestrationStatus::Cancelled,
-                        ChildStatus::Paused => AgentOrchestrationStatus::Paused,
-                        ChildStatus::Running => AgentOrchestrationStatus::Running,
-                        ChildStatus::Admitted => AgentOrchestrationStatus::Cancelled,
-                    };
-                    self.observe_orchestration(root, &record, None, status);
-                }
-            }
-            Ok(None) => {}
+            Ok(Some(record)) => self.observe_release(child, root, Some(&record)),
+            Ok(None) => self.forget_child_state(child),
             Err(error) => {
                 tracing::warn!(child = %child, error = %error, "child_close.release_failed");
             }
@@ -2052,17 +2235,7 @@ impl ManagedAgentSpawner {
         }
         let root = self.root_for(child);
         let released = self.release_in_memory(child)?;
-        if let (Some(root), Some(record)) = (root, released.as_ref()) {
-            let status = match record.status {
-                ChildStatus::Completed => AgentOrchestrationStatus::Completed,
-                ChildStatus::Failed => AgentOrchestrationStatus::Failed,
-                ChildStatus::Cancelled => AgentOrchestrationStatus::Cancelled,
-                ChildStatus::Paused => AgentOrchestrationStatus::Paused,
-                ChildStatus::Running => AgentOrchestrationStatus::Running,
-                ChildStatus::Admitted => AgentOrchestrationStatus::Cancelled,
-            };
-            self.observe_orchestration(root, record, None, status);
-        }
+        self.observe_release(child, root, released.as_ref());
         Ok(())
     }
 
@@ -2115,24 +2288,17 @@ impl ManagedAgentSpawner {
         let root = self.root_for(child);
         let record = self.release_in_memory(child)?;
         if let (Some(lease_store), Some(record)) = (&self.lease_store, record.as_ref()) {
-            lease_store.complete(child, Timestamp::now()).map_err(|error| {
-                Self::reject(format!(
+            if let Err(error) = lease_store.complete(child, Timestamp::now()) {
+                // Der Slot ist trotzdem frei: Auftrags-/Fortschrittszustand
+                // abräumen, bevor der Fehler zurückgeht.
+                self.forget_child_state(child);
+                return Err(Self::reject(format!(
                     "child {child} was released but its durable lease could not be closed: {error}"
-                ))
-            })?;
+                )));
+            }
             tracing::info!(child = %child, status = record.status.as_str(), "child_release.lease_closed");
         }
-        if let (Some(root), Some(record)) = (root, record.as_ref()) {
-            let status = match record.status {
-                ChildStatus::Completed => AgentOrchestrationStatus::Completed,
-                ChildStatus::Failed => AgentOrchestrationStatus::Failed,
-                ChildStatus::Cancelled => AgentOrchestrationStatus::Cancelled,
-                ChildStatus::Paused => AgentOrchestrationStatus::Paused,
-                ChildStatus::Running => AgentOrchestrationStatus::Running,
-                ChildStatus::Admitted => AgentOrchestrationStatus::Cancelled,
-            };
-            self.observe_orchestration(root, record, None, status);
-        }
+        self.observe_release(child, root, record.as_ref());
         Ok(record)
     }
 
@@ -3084,6 +3250,9 @@ impl ManagedAgentSpawner {
     }
 
     fn mark_expired(&self, expired: &[ExpiredChild]) {
+        for record in expired {
+            self.forget_child_state(&record.child);
+        }
         if let Ok(mut tombstones) = self.expired.lock() {
             for record in expired {
                 tombstones.insert(record.child.as_str().to_owned(), record.clone());

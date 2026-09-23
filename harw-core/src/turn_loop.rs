@@ -7593,17 +7593,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_thinking_block_emits_no_reasoning_item_for_non_uia_session() -> TestResult {
+    async fn test_thinking_block_emits_reasoning_item_for_non_uia_session() -> TestResult {
         // Identische Antwort wie im UIA-Test, aber eine Session mit
-        // Standard-Rolle (`test_spawn_context()` ⇒ `RootOrchestrator`) —
-        // das UIA-Filter-Kriterium darf hier nicht greifen.
+        // Standard-Rolle ohne `SpawnContext` — seit Runde 2 wird Reasoning
+        // für JEDE Session persistiert, nicht nur für die UIA-Root.
         let provider = StubToolProvider::with_names(&[]);
         let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
         let store = crate::state_store::InMemoryStateStore::new();
         let model = ScriptedModel::new(vec![crate::model::ModelResponse {
             reasoning: Some(anthropic_reasoning(vec![serde_json::json!({
                 "type": "thinking",
-                "thinking": "unsichtbarer Denkprozess",
+                "thinking": "Denkprozess einer Nicht-UIA-Session",
             })])),
             ..crate::model::ModelResponse::text("Antwort")
         }]);
@@ -7614,14 +7614,309 @@ mod tests {
         assert!(matches!(outcome, TurnOutcome::Completed));
 
         assert!(
-            !session
+            session.history().items().iter().any(|item| matches!(
+                item,
+                TurnItem::Reasoning(reasoning)
+                    if reasoning.summary_text
+                        == vec!["Denkprozess einer Nicht-UIA-Session".to_owned()]
+            )),
+            "auch eine Nicht-UIA-Session muss ihr Reasoning-Item bekommen"
+        );
+        Ok(())
+    }
+
+    /// Skriptiertes Modell, das jede Anfrage protokolliert: Werkzeuge,
+    /// History-Items und die provider-neutrale Nachrichtensicht, die echte
+    /// Provider an das Modell senden.
+    struct RecordingModel {
+        responses: Mutex<std::collections::VecDeque<crate::model::ModelResponse>>,
+        requests: Mutex<Vec<RecordedRequest>>,
+    }
+
+    struct RecordedRequest {
+        tools: Vec<ToolSpec>,
+        items: Vec<TurnItem>,
+        messages: Vec<crate::history::ModelMessage>,
+    }
+
+    impl RecordingModel {
+        fn new(responses: Vec<crate::model::ModelResponse>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into_iter().collect()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn take_requests(&self) -> Vec<RecordedRequest> {
+            std::mem::take(
+                &mut *self
+                    .requests
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+        }
+    }
+
+    impl ModelProvider for RecordingModel {
+        fn respond<'a>(&'a self, request: ModelRequest) -> crate::model::ModelFuture<'a> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(RecordedRequest {
+                    tools: request.tools.clone(),
+                    items: request.history.items().to_vec(),
+                    messages: request.history.to_model_messages(),
+                });
+            let next = self
+                .responses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front();
+            Box::pin(async move { next.ok_or(crate::model::ModelError::EmptyResponse) })
+        }
+    }
+
+    #[tokio::test]
+    async fn child_session_persists_reasoning_but_never_sends_it_to_the_model() -> TestResult {
+        // Kind-Session (mit Parent): das Reasoning-Item landet in History und
+        // Store, der nächste Modell-Request sieht es aber nicht als Nachricht.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .tool_provider(StubToolProvider::with_names(&[]))
+            .build();
+        let mut session =
+            AgentSession::new(AgentRole::Assistant, Some(SessionId::new()), registry, tx);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let thought = "geheimer Gedankengang des Kindes";
+        let model = RecordingModel::new(vec![
+            crate::model::ModelResponse {
+                reasoning: Some(anthropic_reasoning(vec![serde_json::json!({
+                    "type": "thinking",
+                    "thinking": thought,
+                })])),
+                ..crate::model::ModelResponse::text("erste Antwort")
+            },
+            crate::model::ModelResponse::text("zweite Antwort"),
+        ]);
+
+        run_turn(&mut session, &model, &store, TurnInput::user("eins"))
+            .await
+            .map_err(ctx("erster Turn"))?;
+        assert!(
+            session
                 .history()
                 .items()
                 .iter()
                 .any(|item| matches!(item, TurnItem::Reasoning(_))),
-            "eine Nicht-UIA-Session darf kein Reasoning-Item bekommen"
+            "die Kind-Session muss das Reasoning-Item persistieren"
+        );
+        let persisted = store
+            .load_history(session.id())
+            .await
+            .map_err(ctx("History aus dem Store laden"))?;
+        assert!(
+            persisted
+                .items()
+                .iter()
+                .any(|item| matches!(item, TurnItem::Reasoning(_))),
+            "das Reasoning-Item muss auch im StateStore stehen"
+        );
+
+        run_turn(&mut session, &model, &store, TurnInput::user("zwei"))
+            .await
+            .map_err(ctx("zweiter Turn"))?;
+        let requests = model.take_requests();
+        let second = requests
+            .get(1)
+            .ok_or(TestError::Missing("ein zweiter Modell-Request"))?;
+        assert!(
+            second
+                .items
+                .iter()
+                .any(|item| matches!(item, TurnItem::Reasoning(_))),
+            "die mitgegebene History trägt das Item weiterhin"
+        );
+        assert!(
+            !format!("{:?}", second.messages).contains(thought),
+            "Reasoning-Text darf nie Teil der Modell-Nachrichten werden"
+        );
+        assert!(
+            format!("{:?}", second.messages).contains("erste Antwort"),
+            "die übrige History wird normal übertragen"
         );
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Handoff: Auftrag + Werkzeugdefinitionen (Runde 2)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn handoff_instructions_prefer_task_fields_then_fall_back_to_json() {
+        assert_eq!(
+            handoff_instructions(&serde_json::json!({"task": "  prüfe X  "})),
+            Some("prüfe X".to_owned())
+        );
+        assert_eq!(
+            handoff_instructions(&serde_json::json!({"task": "prüfe X", "context": "Pfad a/b"})),
+            Some("prüfe X\n\nKontext:\nPfad a/b".to_owned())
+        );
+        assert_eq!(
+            handoff_instructions(&serde_json::json!({"instructions": "baue Y"})),
+            Some("baue Y".to_owned())
+        );
+        assert_eq!(
+            handoff_instructions(&serde_json::json!({"objective": "Ziel Z", "task": ""})),
+            Some("Ziel Z".to_owned())
+        );
+        assert_eq!(
+            handoff_instructions(&serde_json::json!({"question": "wo?"})),
+            Some("wo?".to_owned())
+        );
+        assert_eq!(
+            handoff_instructions(&serde_json::json!({"files": ["a.rs"], "task": 3})),
+            Some(r#"{"files":["a.rs"],"task":3}"#.to_owned())
+        );
+        assert_eq!(
+            handoff_instructions(&serde_json::json!("nackter Auftrag")),
+            Some("nackter Auftrag".to_owned())
+        );
+        assert_eq!(handoff_instructions(&serde_json::json!({})), None);
+        assert_eq!(handoff_instructions(&serde_json::Value::Null), None);
+    }
+
+    /// Spawner, der den übergebenen `SpawnInput` festhält und feste
+    /// Delegationsziele meldet.
+    struct CapturingSpawner {
+        child: SessionId,
+        targets: Vec<String>,
+        captured: Mutex<Option<SpawnInput>>,
+    }
+
+    impl AgentSpawner for CapturingSpawner {
+        fn spawn_child<'a>(
+            &'a self,
+            _role: &'a str,
+            input: SpawnInput,
+            _sandbox: SandboxSpec,
+            _suggestions: Option<AgentSuggestions>,
+        ) -> SpawnFuture<'a> {
+            *self
+                .captured
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(input);
+            let child = self.child.clone();
+            Box::pin(async move { Ok(child) })
+        }
+
+        fn delegation_target_names(&self, _parent_session_id: &SessionId) -> Vec<String> {
+            self.targets.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn handoff_fills_spawn_instructions_and_offers_transfer_tools() -> TestResult {
+        let spawner = Arc::new(CapturingSpawner {
+            child: SessionId::new(),
+            targets: vec![
+                "explorer".to_owned(),
+                "worker".to_owned(),
+                "bad name".to_owned(),
+            ],
+            captured: Mutex::new(None),
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .tool_provider(StubToolProvider::with_names(&["fs.read"]))
+            .spawner(spawner.clone())
+            .build();
+        let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx)
+            .with_activation(SessionActivation::new(ToolProfile::Minimal))
+            .with_spawn_context(test_spawn_context()?);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = RecordingModel::new(vec![response_with(vec![ToolCall {
+            id: ToolCallId::new(),
+            name: ToolName::new("transfer_to_worker"),
+            arguments: serde_json::json!({"task": "finde den Fehler", "context": "in lib.rs"}),
+        }])]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("delegiere"))
+            .await
+            .map_err(ctx("der Handoff pausiert den Turn"))?;
+        assert!(matches!(outcome, TurnOutcome::AwaitingChild { .. }));
+
+        // (1) Auftrag im SpawnInput.
+        let input = spawner
+            .captured
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .ok_or(TestError::Missing("der Spawner muss aufgerufen werden"))?;
+        assert_eq!(
+            input.instructions.as_deref(),
+            Some("finde den Fehler\n\nKontext:\nin lib.rs")
+        );
+        assert_eq!(
+            input.context,
+            serde_json::json!({"task": "finde den Fehler", "context": "in lib.rs"})
+        );
+
+        // (3) Werkzeugdefinitionen: auch unter `Minimal` sichtbar, gültige
+        // Namen nur, stabil sortiert.
+        let requests = model.take_requests();
+        let first = requests
+            .first()
+            .ok_or(TestError::Missing("ein Modell-Request"))?;
+        let names: Vec<&str> = first.tools.iter().map(ToolSpec::name).collect();
+        assert!(names.contains(&"transfer_to_explorer"));
+        assert!(names.contains(&"transfer_to_worker"));
+        assert!(!names.iter().any(|name| name.contains(' ')));
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "Werkzeugliste bleibt nach Namen sortiert");
+        let worker = first
+            .tools
+            .iter()
+            .find(|spec| spec.name() == "transfer_to_worker")
+            .ok_or(TestError::Missing("transfer_to_worker-Definition"))?;
+        let ToolSpec::Function(function) = worker;
+        assert_eq!(function.parameters.required, Some(vec!["task".to_owned()]));
+        let properties = function
+            .parameters
+            .properties
+            .as_ref()
+            .ok_or(TestError::Missing("Schema-Properties"))?;
+        assert!(properties.contains_key("task"));
+        assert!(properties.contains_key("context"));
+        Ok(())
+    }
+
+    #[test]
+    fn explicitly_disabled_handoff_tool_is_not_offered() {
+        let mut activation = SessionActivation::new(ToolProfile::Full);
+        activation.disable_tool(ToolName::new("transfer_to_worker"));
+        let session = make_session(StubToolProvider::with_names(&[]), activation);
+        let mut tools = Vec::new();
+        append_handoff_tools(
+            &session,
+            &mut tools,
+            &["explorer".to_owned(), "worker".to_owned()],
+        );
+        let names: Vec<&str> = tools.iter().map(ToolSpec::name).collect();
+        assert_eq!(names, vec!["transfer_to_explorer"]);
+    }
+
+    #[test]
+    fn registry_tool_wins_over_generated_handoff_definition() {
+        let session = make_session(
+            StubToolProvider::with_names(&["transfer_to_worker"]),
+            SessionActivation::new(ToolProfile::Full),
+        );
+        let mut tools = vec![handoff_tool_spec("placeholder")];
+        tools[0] = StubToolProvider::with_names(&["transfer_to_worker"]).tools()[0].clone();
+        let before = tools.clone();
+        append_handoff_tools(&session, &mut tools, &["worker".to_owned()]);
+        assert_eq!(tools, before, "kein Duplikat neben dem Registry-Werkzeug");
     }
 
     #[tokio::test]
