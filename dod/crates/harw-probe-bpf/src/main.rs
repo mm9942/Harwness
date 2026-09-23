@@ -9,15 +9,16 @@
 //! an `harw-sentinel`. Es hat **keinen** Empfangspfad — siehe Abschnitt
 //! „Push-Only" unten.
 //!
-//! # Die eine Fähigkeit: `CAP_BPF`
+//! # Die Fähigkeiten: `CAP_BPF` und `CAP_PERFMON`
 //! `harw_dod_cap::Capability::LoadBpfProgram`, Klasse
-//! `harw_dod_cap::CapabilityClass::Bpf` — die einzige erhöhte Fähigkeit, für
-//! die dieses Binary existiert. Beide Sensoren dieser Sonde
-//! (`harw_dod_procmon::ProcmonSensor` und der lokale
-//! [`sensors::FlowSensor`]) tragen exakt diese eine Fähigkeit, keine
-//! zweite. Produktiv liefe dieser Prozess mit `CAP_BPF`; im heutigen Stand
-//! kommt der Prozess nie so weit, dass diese Fähigkeit tatsächlich gebraucht
-//! würde (siehe unten, Abschnitt „Stand der eBPF-Bindung").
+//! `harw_dod_cap::CapabilityClass::Bpf` — die einzige erhöhte Fähigkeit im
+//! Vokabular dieses Programms, für die dieses Binary existiert. Beide
+//! logischen Sensoren dieser Sonde (Prozessstart/-ende, Verbindung) tragen
+//! exakt diese eine Fähigkeit. Der reale Anheftpfad
+//! (`harw_dod_bpf::RealBpfLoader::load_contracts`) prüft zusätzlich
+//! `CAP_PERFMON`, weil Tracepoint- und `fentry`-Anheftung auf aktuellen
+//! Kerneln beides verlangen; fehlt eine der beiden, degradiert der
+//! betroffene Sensor (siehe Abschnitt „Stand der eBPF-Bindung").
 //!
 //! # Push-Only: woran man die Eigenschaft erkennt, und wie sie erzwungen ist
 //! Ein Prozess mit `CAP_BPF`, der Nachrichten **annimmt**, ist ein
@@ -50,13 +51,21 @@
 //! anderes: dort ist Landlock nicht eine von mehreren Verteidigungslinien,
 //! sondern die einzige, die den tatsächlichen Dateisystemzugriff dieses
 //! Prozesses gegen sein volles Berechtigungsvermögen einschränkt. [`run`]
-//! ruft deshalb [`landlock::enforce_fs_scope`] vor jedem weiteren
-//! privilegierten Schritt auf und bricht bei jedem Ausgang außer
-//! vollständiger Durchsetzung hart ab — Entscheidung Nr. 4 des
-//! Architekturberichts dieses Programms, und dieselbe Asymmetrie, die
-//! `harw-probe-fs` bereits für sich trifft. Siehe [`landlock`]-Moduldoku für
-//! die vollständige Begründung, insbesondere dafür, warum diese Sonde eine
-//! einfache Wurzelliste statt eines `harw_dod_cap::ReadScope` entgegennimmt.
+//! ruft deshalb [`landlock::enforce_fs_scope`] vor jedem Lade- und
+//! Anheftschritt auf und bricht bei jedem Ausgang außer vollständiger
+//! Durchsetzung hart ab — Entscheidung Nr. 4 des Architekturberichts dieses
+//! Programms, und dieselbe Asymmetrie, die `harw-probe-fs` bereits für sich
+//! trifft. Siehe [`landlock`]-Moduldoku für die vollständige Begründung.
+//!
+//! Die Reihenfolge in [`run`] ist deshalb fest: Sentinel verbinden →
+//! **alle vier eBPF-Objekte auflösen und einlesen**
+//! ([`sensors::resolve_procmon_objects`], [`sensors::resolve_flow_objects`]:
+//! die Bytes liegen danach als `BpfProgramSource::Embedded` im Speicher) →
+//! Landlock durchsetzen → laden und anheften. Das Objektverzeichnis
+//! (`--*-program-path`, `$HARW_DOD_BPF_DIR`, `/usr/local/lib/harw-dod/bpf`)
+//! ist damit **nicht** Teil des Landlock-Ausschnitts. Lesbar bleiben nur die
+//! Kernel-Schnittstellen, die der Lade-, Anheft- und Lesepfad selbst braucht
+//! ([`KERNEL_INTERFACE_ROOTS`], siehe [`fs_scope_roots`]).
 //!
 //! # Das `SensorId`-Schema
 //! `harw_dod_signals::SecurityEvent::sensor` ist die **einzige**
@@ -109,22 +118,34 @@
 //! einen Adapter, der die Unstimmigkeit an genau der einen Stelle auffängt,
 //! an der sie sonst jeden künftigen Aufrufer dieser Sonde getroffen hätte.
 //!
-//! # Stand der eBPF-Bindung: weiterhin nicht gebaut
-//! `harw-dod-bpf` (Knoten AW7-01a) liefert den `BpfLoader`-Trait und den
-//! Formungsteil, aber keine reale, Linux-spezifische Implementierung —
-//! dessen eigene Moduldoku benennt diesen Knoten ausdrücklich als den Ort,
-//! an dem sie entstehen sollte, „wo die erhöhte Berechtigung ohnehin sitzt
-//! und `cargo` tatsächlich laufen darf". `cargo` darf in diesem Knoten aber
-//! gerade **nicht** laufen — die wichtigste Regel dieser Aufgabe. Ein realer
-//! Ladeteil bräuchte `aya`, eine neue, in dieser Sitzung nicht kompilier-
-//! oder verifizierbare Abhängigkeit, ausgerechnet im privilegierten Teil
-//! dieses Programms. [`real_loader::build_real_loader`] liefert deshalb
-//! einen dokumentierten Platzhalter, der immer fehlschlägt — der einzige
-//! verbleibende, tatsächlich unfertige Teil dieses Knotens. Der Betrieb ist
-//! heute ausschließlich über `harw_dod_bpf::fixture::FixtureBpfLoader`
-//! möglich (siehe [`sensors`]- und [`collect`]-Modultests): jeder Teil der
-//! Sammel- und Sendelogik ist damit bereits vollständig, ohne Kernel und
-//! ohne Berechtigungen, geprüft.
+//! # Stand der eBPF-Bindung
+//! Produktiv lädt diese Sonde über **einen** gemeinsamen
+//! `harw_dod_bpf::RealBpfLoader` ([`real_loader::build_real_loader`]) je
+//! Sensor einen vollständigen, transaktionalen Vertragssatz
+//! ([`real_loader::load_sensor`]): `harw_dod_procmon::procmon_contracts`
+//! (`exec.bpf.o`, `exit.bpf.o`) und `harw_dod_flow::flow_contracts`
+//! (`tcp_v4_connect.bpf.o`, `tcp_v6_connect.bpf.o`), beide mit
+//! `harw_dod_bpf::BpfScope::Host` — der einzige heute baubare Scope. Die
+//! geladenen Griffe werden als [`collect::WireSource`] von
+//! [`collect::drain_wire_once`] gelesen (v1-Wire-Ereignisse, Verlustzähler).
+//!
+//! Degradierung statt Prozessende, je Sensor unabhängig:
+//! - fehlt ein Objekt oder ist es ungültig, registriert [`run`] einen
+//!   [`sensors::UnavailableSensor`] mit der Mängelliste;
+//! - scheitert das Laden mit `AttachCapabilitiesUnavailable`,
+//!   `CapabilityUnavailable` oder `InvalidProgramContract` (siehe
+//!   [`degrades_sensor`]), ebenfalls — ein Host ohne die nötigen
+//!   Fähigkeiten oder mit einem nicht vertragsgemäßen Objekt ist ein
+//!   dokumentierter Betriebsfall, den der Sentinel als `SensorDegraded`
+//!   sieht;
+//! - jeder andere Ladefehler beendet den Prozess; bereits geladene Griffe
+//!   werden vorher entladen.
+//!
+//! Endet die Sammelschleife (dauerhafter Fehler, z. B. Sentinel weg), werden
+//! alle geladenen Objekte über [`collect::unload_all`] kontrolliert
+//! entladen, bevor [`run`] den Fehler zurückgibt. Ein Prozessende per Signal
+//! entlädt nicht explizit; die Kernel-Anheftungen hängen dann nur an den
+//! Dateideskriptoren dieses Prozesses und verschwinden mit ihm.
 //!
 //! # Fehler
 //! Kommandozeilenfehler sind `clap::Error`, direkt in [`main`] behandelt.
@@ -132,11 +153,9 @@
 //! Moduldoku für die vollständige Varianteneinteilung.
 //!
 //! # Nebenläufigkeit
-//! [`run`] läuft im Hauptthread; [`collect::run_forever`] startet keinen
-//! weiteren Thread — beide Sensoren werden sequenziell im selben Thread
-//! gepollt (siehe [`collect`]-Moduldoku). `harw_dod_signals::Sensor` und
-//! `harw_dod_bpf::BpfLoader` sind `Send + Sync`, was diese Sonde nicht
-//! ausnutzt, aber nicht verhindert.
+//! [`run`] läuft im Hauptthread; [`collect_forever`] startet keinen weiteren
+//! Thread — degradierte Sensoren und Wire-Quellen werden sequenziell im
+//! selben Thread bedient (siehe [`collect`]-Moduldoku).
 //!
 //! # Examples
 //! ```text
