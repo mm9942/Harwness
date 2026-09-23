@@ -17,7 +17,7 @@ pub use approval_tokens::{ApprovalTokenStore, PendingApproval};
 pub use config::{DEFAULT_MAX_UPDATES_PER_PEER_PER_MIN, TelegramChannelConfig, TopicMode};
 pub use error::{TelegramChannelError, TelegramChannelResult};
 pub use sandbox::TelegramSandbox;
-pub use telegram::{TelegramChannel, ThrottleNotice};
+pub use telegram::{PairingNotice, PairingOutcome, TelegramChannel, ThrottleNotice};
 pub use work_request::{
     ApprovedWorkRequest, LaunchReceipt, TELEGRAM_WORK_REQUEST_JOB_KIND, WorkLaunchError,
     WorkLauncher, WorkRequestRecord, WorkRequestState, WorkRequestStore,

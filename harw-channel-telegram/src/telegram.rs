@@ -28,6 +28,17 @@ const RATE_LIMIT_WINDOW: SignedDuration = SignedDuration::from_secs(60);
 /// intentionally short and free of Telegram MarkdownV2 reserved characters so
 /// no downstream escaping decision is required for it.
 const THROTTLE_NOTICE_TEXT: &str = "Zu schnell — bitte kurz warten und erneut senden.";
+/// Antwort nach erfolgreicher In-Channel-Einlösung eines `/pair <Code>`.
+/// Enthält bewusst weder Code noch Tenant.
+const PAIRING_SUCCESS_TEXT: &str = "Pairing erfolgreich — du kannst jetzt schreiben";
+/// Einheitliche Antwort für *jeden* fehlgeschlagenen Einlöseversuch
+/// (ungültig, abgelaufen, bereits verwendet, Speicherfehler). Unterscheidet
+/// die Ursachen absichtlich nicht, damit ein Absender den Code-Raum nicht
+/// über unterschiedliche Antworten abtasten kann.
+const PAIRING_FAILURE_TEXT: &str =
+    "Pairing fehlgeschlagen — Code ungültig, abgelaufen oder bereits verwendet";
+/// Crockford-Base32-Alphabet der Pairing-Codes (`harw_channel::PairingCode`).
+const PAIRING_CODE_ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// One per-rate-limit-key sliding-window counter (§3.5).
 ///
@@ -55,6 +66,39 @@ pub struct ThrottleNotice {
     /// same topic as the throttled traffic.
     pub thread: Option<ThreadRef>,
     /// The harness-native content to render; always a plain [`OutboundContent::Message`].
+    pub content: OutboundContent,
+}
+
+/// Ergebnis einer In-Channel-Einlösung von `/pair <Code>` (§3.2).
+///
+/// Trägt niemals den Code selbst: weder Notice noch Outcome dürfen den
+/// einmaligen Geheimwert in Logs oder Antworten tragen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairingOutcome {
+    /// Der Code wurde eingelöst; der Peer ist nun durable an `tenant` gebunden.
+    Paired {
+        /// Der Tenant, an den der Peer gebunden wurde.
+        tenant: TenantId,
+    },
+    /// Einlösung fehlgeschlagen (ungültig, abgelaufen, bereits eingelöst,
+    /// umkämpft oder Speicherfehler) — bewusst ohne Ursache.
+    Failed,
+}
+
+/// Antwort der Adapter-Perimeter auf einen `/pair <Code>`-DM eines
+/// ungepairten Peers, analog zu [`ThrottleNotice`]: der Adapter entscheidet
+/// und erzeugt nur die Notice, die Zustellung übernimmt die Transport-
+/// Komposition (z. B. `harw gateway`) über [`TelegramChannel::with_pairing_sink`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingNotice {
+    /// Der DM-Peer, an den die Antwort geht (entspricht `InboundEvent::peer`).
+    pub peer: PeerId,
+    /// Der ursprüngliche Thread, falls vorhanden.
+    pub thread: Option<ThreadRef>,
+    /// Das Ergebnis der Einlösung, ohne Code.
+    pub outcome: PairingOutcome,
+    /// Der zu rendernde harness-native Inhalt; immer eine schlichte
+    /// [`OutboundContent::Message`] ohne Code.
     pub content: OutboundContent,
 }
 
@@ -93,6 +137,10 @@ pub struct TelegramChannel {
     /// composition (e.g. `harw gateway`) opts in via
     /// [`Self::with_throttle_sink`].
     throttle_sink: Option<Arc<Mutex<Sender<ThrottleNotice>>>>,
+    /// Optionale Übergabe für [`PairingNotice`]s nach einer In-Channel-
+    /// Einlösung von `/pair <Code>`. Die Einlösung selbst passiert auch ohne
+    /// Sink; `None` bedeutet nur, dass der Peer keine Rückmeldung bekommt.
+    pairing_sink: Option<Arc<Mutex<Sender<PairingNotice>>>>,
 }
 
 impl std::fmt::Debug for TelegramChannel {
@@ -108,6 +156,7 @@ impl std::fmt::Debug for TelegramChannel {
                 &self.rejected_unpinned.load(Ordering::Relaxed),
             )
             .field("throttle_sink_configured", &self.throttle_sink.is_some())
+            .field("pairing_sink_configured", &self.pairing_sink.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -125,6 +174,7 @@ impl TelegramChannel {
             rate_limits: Arc::new(Mutex::new(HashMap::new())),
             last_throttle_notice: Arc::new(Mutex::new(HashMap::new())),
             throttle_sink: None,
+            pairing_sink: None,
         }
     }
 
@@ -151,6 +201,7 @@ impl TelegramChannel {
             rate_limits: Arc::new(Mutex::new(HashMap::new())),
             last_throttle_notice: Arc::new(Mutex::new(HashMap::new())),
             throttle_sink: None,
+            pairing_sink: None,
         }
     }
 
@@ -162,6 +213,17 @@ impl TelegramChannel {
     #[must_use]
     pub fn with_throttle_sink(mut self, sink: Sender<ThrottleNotice>) -> Self {
         self.throttle_sink = Some(Arc::new(Mutex::new(sink)));
+        self
+    }
+
+    /// Registriert eine Übergabe für [`PairingNotice`]s (§3.2).
+    ///
+    /// Die Transport-Komposition stellt darüber die Bestätigung bzw. die
+    /// einheitliche Fehlermeldung einer In-Channel-Einlösung von
+    /// `/pair <Code>` zu. Ohne Sink wird trotzdem eingelöst, nur still.
+    #[must_use]
+    pub fn with_pairing_sink(mut self, sink: Sender<PairingNotice>) -> Self {
+        self.pairing_sink = Some(Arc::new(Mutex::new(sink)));
         self
     }
 
@@ -346,6 +408,65 @@ impl TelegramChannel {
         }
     }
 
+    /// Löst einen `/pair <Code>`-DM eines gepinnten, aber ungepairten Peers
+    /// direkt im Channel ein (§3.2) — das In-Channel-Gegenstück zu
+    /// `harw connect --pair`.
+    ///
+    /// Nur aufgerufen für Events mit `Admission::Deferred(Onboarding)`, also
+    /// nachdem Struktur-, Pinning-, Replay-, Rate-Limit- (§3.5, begrenzt
+    /// damit auch Einlöseversuche pro Absender) und Gruppen-Gates gegriffen
+    /// haben. Zusätzlich gilt: nur private DMs (Absender == DM-Peer, keine
+    /// konfigurierte Gruppe) und nur ein syntaktisch gültiger Code berühren
+    /// den Pairing-Store — beliebiger Text erzeugt dort keine Lock-Datei.
+    /// Alle anderen zurückgestellten Events werden wie bisher verworfen.
+    ///
+    /// Fehler der Einlösung sind nicht fatal für die Ingress-Schleife und
+    /// werden nie geloggt oder in die Antwort übernommen, da die Fehler-
+    /// Varianten des Stores den Code enthalten.
+    fn redeem_deferred_pairing(&self, event: &InboundEvent) {
+        let Some(sender) = event.sender.as_ref() else {
+            return;
+        };
+        if sender.id != event.peer.as_str() || self.config.is_group(&event.peer) {
+            return;
+        }
+        let Some(code) = event.text.as_deref().and_then(parse_pair_command) else {
+            return;
+        };
+        let outcome = match self.redeem_pairing(&code, &event.peer, event.received_at) {
+            Ok(record) => PairingOutcome::Paired {
+                tenant: record.tenant,
+            },
+            Err(_) => PairingOutcome::Failed,
+        };
+        self.notify_pairing(event, outcome);
+    }
+
+    /// Übergibt eine [`PairingNotice`] best-effort an den optionalen Sink.
+    fn notify_pairing(&self, event: &InboundEvent, outcome: PairingOutcome) {
+        let Some(sink) = self.pairing_sink.as_ref() else {
+            return;
+        };
+        let text = match outcome {
+            PairingOutcome::Paired { .. } => PAIRING_SUCCESS_TEXT,
+            PairingOutcome::Failed => PAIRING_FAILURE_TEXT,
+        };
+        let notice = PairingNotice {
+            peer: event.peer.clone(),
+            thread: event.thread.clone(),
+            outcome,
+            content: OutboundContent::Message {
+                markdown: text.to_owned(),
+            },
+        };
+        if let Ok(sink) = sink.lock() {
+            // Best-effort wie beim Throttle-Sink: eine volle/geschlossene
+            // Übergabe darf die bereits durchgeführte Einlösung nicht
+            // zurückdrehen oder die Ingress-Schleife stoppen.
+            let _ = sink.send(notice);
+        }
+    }
+
     /// Returns the intersection-only capability profile for this remote binding.
     #[must_use]
     pub fn sandbox(&self) -> &TelegramSandbox {
@@ -418,7 +539,10 @@ impl TelegramChannel {
     /// single file or journal entry (F-040/F-041 remediation of S5 — the plan
     /// and §2.3 both require unauthenticated traffic to create no journal
     /// entries). Only events that survive pinning, durable replay claiming,
-    /// pairing/session resolution, and admission enter the runtime sink. The
+    /// pairing/session resolution, and admission enter the runtime sink.
+    /// Events deferred for onboarding never enter the runtime sink; a private
+    /// `/pair <Code>` DM among them is redeemed in-channel via
+    /// [`Self::redeem_deferred_pairing`], everything else is dropped. The
     /// reduced sandbox remains attached to this adapter and is never widened
     /// by ingress.
     fn forward_ingress_event(
@@ -455,10 +579,46 @@ impl TelegramChannel {
             Admission::Rejected(RejectionReason::RateLimited) => {
                 self.maybe_notify_throttled(&event);
             }
-            Admission::Rejected(_) | Admission::Deferred(_) => {}
+            Admission::Deferred(DeferralReason::Onboarding) => {
+                self.redeem_deferred_pairing(&event);
+            }
+            Admission::Rejected(_) => {}
         }
         Ok(())
     }
+}
+
+/// Extrahiert den Code aus einem `/pair <Code>`- bzw. `/pair@bot <Code>`-
+/// Kommando (Befehl case-insensitiv, wie `harw gateway` ihn erkennt).
+///
+/// Genau zwei Tokens; der Code wird auf ASCII-Großbuchstaben normalisiert
+/// und muss die Form `XXXX-XXXX` im Crockford-Base32-Alphabet haben, sonst
+/// `None` — so erreicht kein Freitext den Pairing-Store.
+fn parse_pair_command(text: &str) -> Option<String> {
+    let mut tokens = text.split_ascii_whitespace();
+    let command = tokens.next()?.to_ascii_lowercase();
+    let code = tokens.next()?;
+    if tokens.next().is_some() {
+        return None;
+    }
+    let is_pair = command == "/pair"
+        || command
+            .strip_prefix("/pair@")
+            .is_some_and(|bot| !bot.is_empty());
+    if !is_pair {
+        return None;
+    }
+    let code = code.to_ascii_uppercase();
+    let bytes = code.as_bytes();
+    let well_formed = bytes.len() == 9
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if index == 4 {
+                *byte == b'-'
+            } else {
+                PAIRING_CODE_ALPHABET.contains(byte)
+            }
+        });
+    well_formed.then_some(code)
 }
 
 /// Whether more than [`RATE_LIMIT_WINDOW`] has elapsed since `window_start`,
@@ -1357,6 +1517,264 @@ mod tests {
 
         adapter.run_ingress(sink_tx).map_err(ctx("run_ingress"))?;
         assert!(sink_rx.try_recv().is_err());
+        Ok(())
+    }
+
+    /// Konfiguration, in der der DM-Absender `100` gepinnt, aber (noch)
+    /// nicht gepairt ist — der Zustand vor einer In-Channel-Einlösung.
+    fn dm_config() -> TelegramChannelConfig {
+        let mut config = config(ChannelId::from_str("telegram:ops"));
+        config.pinned_sender_ids.insert("100".to_owned());
+        config
+    }
+
+    /// Privater DM: Absender == Peer (Telegram-DM-Chat-ID == User-ID).
+    fn dm_event(update: &str, text: &str) -> InboundEvent {
+        let mut inbound = event("100", false);
+        inbound.thread = None;
+        inbound.sender = Some(SenderRef {
+            id: "100".to_owned(),
+            display_name: None,
+        });
+        inbound.text = Some(text.to_owned());
+        inbound.raw_event_id = Some(update.to_owned());
+        inbound
+    }
+
+    fn issue(store: &PairingStore, tenant: &str, seed: &[u8]) -> TestResult<String> {
+        store
+            .issue_code(
+                &ChannelId::from_str("telegram:ops"),
+                &TenantId::from_str(tenant),
+                seed,
+                Timestamp::now(),
+            )
+            .map_err(ctx("issue"))
+    }
+
+    /// Führt die Ingress-Schleife über `events` aus und liefert die an den
+    /// Runtime-Sink weitergereichten Events sowie die Pairing-Notices.
+    fn run_pairing_ingress(
+        adapter_config: TelegramChannelConfig,
+        store: Arc<PairingStore>,
+        events: Vec<InboundEvent>,
+    ) -> TestResult<(TelegramChannel, Vec<InboundEvent>, Vec<PairingNotice>)> {
+        let (ingress_tx, ingress_rx) = mpsc::channel();
+        let (pairing_tx, pairing_rx) = mpsc::channel();
+        let adapter = TelegramChannel::with_ingress_receiver(adapter_config, store, ingress_rx)
+            .with_pairing_sink(pairing_tx);
+        let (sink_tx, sink_rx) = mpsc::channel();
+        for inbound in events {
+            ingress_tx.send(inbound).map_err(ctx("send"))?;
+        }
+        drop(ingress_tx);
+        adapter.run_ingress(sink_tx).map_err(ctx("run_ingress"))?;
+        let forwarded = sink_rx.try_iter().collect();
+        let notices = pairing_rx.try_iter().collect();
+        Ok((adapter, forwarded, notices))
+    }
+
+    #[test]
+    fn pair_command_parser_accepts_only_well_formed_codes() {
+        assert_eq!(
+            parse_pair_command("/pair Y2GQ-DEYE"),
+            Some("Y2GQ-DEYE".to_owned())
+        );
+        assert_eq!(
+            parse_pair_command("  /PAIR@LinLinBot y2gq-deye "),
+            Some("Y2GQ-DEYE".to_owned())
+        );
+        assert_eq!(parse_pair_command("/pair"), None);
+        assert_eq!(parse_pair_command("/pair@ Y2GQ-DEYE"), None);
+        assert_eq!(parse_pair_command("/pairing Y2GQ-DEYE"), None);
+        assert_eq!(parse_pair_command("hey /pair Y2GQ-DEYE"), None);
+        assert_eq!(parse_pair_command("/pair Y2GQ-DEYE extra"), None);
+        assert_eq!(parse_pair_command("/pair Y2GQDEYE"), None);
+        assert_eq!(parse_pair_command("/pair ILOU-ILOU"), None);
+        assert_eq!(parse_pair_command("/pair ../../etc"), None);
+    }
+
+    #[test]
+    fn unpaired_dm_pair_command_redeems_in_channel() -> TestResult {
+        let (_dir, store) = store()?;
+        let code = issue(&store, "ops", b"seed12345")?;
+        let (adapter, forwarded, notices) = run_pairing_ingress(
+            dm_config(),
+            Arc::clone(&store),
+            vec![dm_event("1", &format!("/pair {code}"))],
+        )?;
+
+        // Das `/pair`-Kommando selbst erreicht nie die Runtime ...
+        assert!(forwarded.is_empty());
+        // ... der Peer ist aber nun durable gebunden.
+        assert_eq!(
+            adapter
+                .resolve_tenant(&PeerId::from_str("100"))
+                .map_err(ctx("resolve_tenant"))?,
+            Some(TenantId::from_str("ops"))
+        );
+        let [notice] = notices.as_slice() else {
+            return Err(TestError::Unexpected(format!(
+                "expected one pairing notice, got {}",
+                notices.len()
+            )));
+        };
+        assert_eq!(notice.peer.as_str(), "100");
+        assert_eq!(
+            notice.outcome,
+            PairingOutcome::Paired {
+                tenant: TenantId::from_str("ops")
+            }
+        );
+        let OutboundContent::Message { markdown } = &notice.content else {
+            return Err(TestError::Unexpected("notice must be a message".to_owned()));
+        };
+        assert!(!markdown.contains(&code));
+        Ok(())
+    }
+
+    #[test]
+    fn pair_command_with_bot_suffix_and_lowercase_code_redeems() -> TestResult {
+        let (_dir, store) = store()?;
+        let code = issue(&store, "ops", b"seed12345")?;
+        let text = format!("/pair@HarwBot {}", code.to_ascii_lowercase());
+        let (adapter, forwarded, notices) =
+            run_pairing_ingress(dm_config(), store, vec![dm_event("1", &text)])?;
+
+        assert!(forwarded.is_empty());
+        assert_eq!(notices.len(), 1);
+        assert!(
+            adapter
+                .resolve_tenant(&PeerId::from_str("100"))
+                .map_err(ctx("resolve_tenant"))?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_or_reused_pair_code_fails_without_pairing_or_leaking_code() -> TestResult {
+        let (_dir, store) = store()?;
+        let channel = ChannelId::from_str("telegram:ops");
+        let code = issue(&store, "ops", b"seed12345")?;
+        // Der Code wurde bereits von einem anderen Peer eingelöst.
+        store
+            .redeem_once(&channel, &code, &PeerId::from_str("999"), Timestamp::now())
+            .map_err(ctx("redeem"))?;
+
+        let (adapter, forwarded, notices) = run_pairing_ingress(
+            dm_config(),
+            store,
+            vec![
+                dm_event("1", &format!("/pair {code}")),
+                dm_event("2", "/pair ZZZZ-ZZZZ"),
+            ],
+        )?;
+
+        assert!(forwarded.is_empty());
+        assert_eq!(
+            adapter
+                .resolve_tenant(&PeerId::from_str("100"))
+                .map_err(ctx("resolve_tenant"))?,
+            None
+        );
+        assert_eq!(notices.len(), 2);
+        for notice in &notices {
+            assert_eq!(notice.outcome, PairingOutcome::Failed);
+            let OutboundContent::Message { markdown } = &notice.content else {
+                return Err(TestError::Unexpected("notice must be a message".to_owned()));
+            };
+            assert!(!markdown.contains(&code));
+            assert!(!markdown.contains("ZZZZ-ZZZZ"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_non_pair_and_non_dm_events_are_still_dropped_silently() -> TestResult {
+        let (_dir, store) = store()?;
+        let code = issue(&store, "ops", b"seed12345")?;
+        // Absender weicht vom Peer ab (kein privater DM mit diesem Absender).
+        let mut foreign = dm_event("2", &format!("/pair {code}"));
+        foreign.sender = Some(SenderRef {
+            id: "alice".to_owned(),
+            display_name: None,
+        });
+        let (adapter, forwarded, notices) = run_pairing_ingress(
+            dm_config(),
+            Arc::clone(&store),
+            vec![dm_event("1", "hello"), foreign],
+        )?;
+
+        assert!(forwarded.is_empty());
+        assert!(notices.is_empty());
+        assert_eq!(
+            adapter
+                .resolve_tenant(&PeerId::from_str("100"))
+                .map_err(ctx("resolve_tenant"))?,
+            None
+        );
+        // Der Code blieb unberührt und ist weiterhin einlösbar.
+        store
+            .redeem_once(
+                &ChannelId::from_str("telegram:ops"),
+                &code,
+                &PeerId::from_str("100"),
+                Timestamp::now(),
+            )
+            .map_err(ctx("code must still be redeemable"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn pair_attempts_are_bounded_by_the_per_sender_rate_limit() -> TestResult {
+        let (_dir, store) = store()?;
+        let code = issue(&store, "ops", b"seed12345")?;
+        let mut adapter_config = dm_config();
+        adapter_config.max_updates_per_peer_per_min = 1;
+        let (adapter, forwarded, notices) = run_pairing_ingress(
+            adapter_config,
+            store,
+            vec![
+                dm_event("1", "/pair ZZZZ-ZZZZ"),
+                dm_event("2", &format!("/pair {code}")),
+            ],
+        )?;
+
+        // Nur der erste Versuch passiert das Rate-Limit; der zweite wird
+        // abgewiesen, bevor er den Pairing-Store erreicht.
+        assert!(forwarded.is_empty());
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].outcome, PairingOutcome::Failed);
+        assert_eq!(
+            adapter
+                .resolve_tenant(&PeerId::from_str("100"))
+                .map_err(ctx("resolve_tenant"))?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pair_command_redeems_even_without_a_pairing_sink() -> TestResult {
+        let (_dir, store) = store()?;
+        let code = issue(&store, "ops", b"seed12345")?;
+        let (ingress_tx, ingress_rx) = mpsc::channel();
+        let adapter = TelegramChannel::with_ingress_receiver(dm_config(), store, ingress_rx);
+        let (sink_tx, sink_rx) = mpsc::channel();
+        ingress_tx
+            .send(dm_event("1", &format!("/pair {code}")))
+            .map_err(ctx("send"))?;
+        drop(ingress_tx);
+
+        adapter.run_ingress(sink_tx).map_err(ctx("run_ingress"))?;
+        assert!(sink_rx.try_recv().is_err());
+        assert!(
+            adapter
+                .resolve_tenant(&PeerId::from_str("100"))
+                .map_err(ctx("resolve_tenant"))?
+                .is_some()
+        );
         Ok(())
     }
 }
