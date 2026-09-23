@@ -1934,7 +1934,7 @@ pub fn record_context_assembly_metrics(assembly: &ContextAssemblyV2, sink: &dyn 
 /// use harw_observe::NullSink;
 /// use harw_types::TokenUsage;
 ///
-/// let usage = TokenUsage { input_tokens: 10, output_tokens: 4, reasoning_tokens: None, cached_tokens: None, cache_write_tokens: None };
+/// let usage = TokenUsage { input_tokens: 10, output_tokens: 4, reasoning_tokens: None, cached_tokens: None, cache_write_tokens: None, cache_separate: false };
 /// record_token_usage_metrics(&usage, &NullSink);
 /// ```
 pub fn record_token_usage_metrics(usage: &TokenUsage, sink: &dyn TelemetrySink) {

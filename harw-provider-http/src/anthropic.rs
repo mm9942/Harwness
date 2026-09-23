@@ -1544,7 +1544,15 @@ mod tests {
     #[test]
     fn test_extract_anthropic_usage_missing_object_defaults() {
         let body = serde_json::json!({ "content": [] });
-        assert_eq!(extract_anthropic_usage(&body), TokenUsage::default());
+        // Anthropic meldet Cache-Tokens stets getrennt von `input_tokens`;
+        // die Semantik-Markierung bleibt auch ohne `usage`-Objekt gesetzt.
+        assert_eq!(
+            extract_anthropic_usage(&body),
+            TokenUsage {
+                cache_separate: true,
+                ..TokenUsage::default()
+            }
+        );
     }
 
     fn sample_tool_spec() -> ToolSpec {

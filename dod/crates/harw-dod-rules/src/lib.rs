@@ -8,8 +8,10 @@
 //!   siehe unten, warum sie hier liegen und nicht in `harw-dod-signals`.
 //! - `trait` [`rule::Rule`] und [`rule::RuleContext`] (Modul [`rule`]) — die
 //!   reine Schnittstelle, die aus Beobachtungen Befunde macht.
-//! - [`engine::run_rules`] (Modul [`engine`]) — führt Regeln aus und
-//!   zertifiziert ihre Befunde mit einer stabilen Identität.
+//! - [`engine::run_rules`] (Modul [`engine`]) — führt alle Regeln aus und
+//!   liefert ihre rohen Befunde (`Finding<Raw>`);
+//!   [`engine::run_rules_checked`] zertifiziert sie zusätzlich mit einer
+//!   stabilen Identität (`Finding<RuleChecked>`).
 //! - Drei konkrete Regeln (Modul [`rules`]): [`rules::EgressFlowRule`],
 //!   [`rules::StructureDriftRule`], [`rules::BaselineDeviationRule`] — siehe
 //!   [`rules`]-Moduldoku für die zwei Regeln, die hier absichtlich fehlen,
@@ -72,7 +74,7 @@
 //! use harw_dod_rules::advisory::{Advisory, correlate_advisories};
 //! use harw_dod_rules::rule::{Rule, RuleContext};
 //! use harw_dod_rules::rules::EgressFlowRule;
-//! use harw_dod_rules::{FindingKind, run_rules, triage, Verdict};
+//! use harw_dod_rules::{FindingKind, run_rules, run_rules_checked, triage, Verdict};
 //! use harw_dod_signals::{EventKind, SecurityEvent, Severity};
 //! use harw_types::SensorId;
 //! use semver::VersionReq;
@@ -102,7 +104,12 @@
 //!     .expect("EgressFlowRule löst aus");
 //! assert_eq!(raw.kind(), FindingKind::RuleTriggered);
 //!
-//! // 2. Einen geprüften Befund triagieren.
+//! // 2. Zertifizieren: `run_rules_checked` liefert dieselben Befunde als
+//! //    `Finding<RuleChecked>`, jeweils mit frischer `FindingId`.
+//! let checked = run_rules_checked(&ctx);
+//! assert!(checked.iter().any(|f| f.rule_id() == EgressFlowRule.id()));
+//!
+//! // 3. Einen geprüften Befund triagieren.
 //!
 //! let locked = vec![LockedPackage {
 //!     name: "example-crate".to_owned(),
@@ -117,8 +124,8 @@
 //!     severity: Severity::High,
 //!     summary: "Beispiel-Advisory".to_owned(),
 //! }];
-//! // `run_rules` liefert nur `Finding<Raw>`; `correlate_advisories` ist die
-//! // öffentliche Prägestelle für einen geprüften `Finding<RuleChecked>`.
+//! // `run_rules` liefert nur `Finding<Raw>`; öffentliche Prägestellen für
+//! // `Finding<RuleChecked>` sind `run_rules_checked` und `correlate_advisories`.
 //! let finding = correlate_advisories(&advisories, &locked, jiff::Timestamp::UNIX_EPOCH)
 //!     .into_iter()
 //!     .next()
@@ -144,7 +151,7 @@ pub mod rules;
 pub use advisory::{Advisory, correlate_advisories};
 pub use baseline::{Baseline, PalaceStatus, finding_kind_for_status};
 pub use confidence::epistemic_confidence_for;
-pub use engine::run_rules;
+pub use engine::{run_rules, run_rules_checked};
 pub use finding::{Finding, FindingKind, Raw, RuleChecked, Triaged, Verdict, triage};
 // Nur für Tests abhängiger Crates (Feature `test-support`, z. B. von
 // `harw-dod-escalate`s `Ladder`-Tests genutzt) — siehe `finding.rs`-Moduldoku

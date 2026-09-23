@@ -70,8 +70,9 @@
 //! (typischerweise einer [`crate::rule::Rule`], die `ctx.now` injiziert
 //! bekommt) oder ist eine reine Berechnung daraus. Dasselbe gilt für
 //! [`Finding::record`] und [`triage_record`]: beide sind reine Funktionen
-//! ihrer Eingaben. Die einzige Stelle dieser Crate, die einen Zufallswert
-//! erzeugt, ist [`crate::engine::run_rules`].
+//! ihrer Eingaben. Zufallswerte (die [`FindingId`] eines geprüften Befundes)
+//! erzeugen nur die Prägestellen [`crate::engine::run_rules_checked`] und
+//! [`crate::advisory::correlate_advisories`].
 //!
 //! # Die Baseline-Regel
 //! [`FindingKind`] unterscheidet, ob ein Befund seine Existenz einer
@@ -119,8 +120,8 @@
 //!     severity: Severity::High,
 //!     summary: "Beispiel-Advisory".to_owned(),
 //! }];
-//! // `run_rules` liefert nur `Finding<Raw>`; `correlate_advisories` ist die
-//! // öffentliche Prägestelle für einen geprüften `Finding<RuleChecked>`.
+//! // `run_rules` liefert nur `Finding<Raw>`; öffentliche Prägestellen für
+//! // `Finding<RuleChecked>` sind `run_rules_checked` und `correlate_advisories`.
 //! let finding = correlate_advisories(&advisories, &locked, jiff::Timestamp::UNIX_EPOCH)
 //!     .into_iter()
 //!     .next()
@@ -566,8 +567,11 @@ impl Finding<Raw> {
     /// `pub(crate)`: der einzige Weg zu einem `Finding<RuleChecked>`.
     ///
     /// # Description
-    /// Konsumiert `self` (Typestate-Übergang). Aufgerufen von
-    /// [`crate::engine::run_rules`] und `crate::advisory::correlate_advisories`.
+    /// Konsumiert `self` (Typestate-Übergang). Aufgerufen von den beiden
+    /// öffentlichen Prägestellen [`crate::engine::run_rules_checked`] und
+    /// [`crate::advisory::correlate_advisories`] (sowie der Testhilfe
+    /// `triaged_finding_for_test`). Außerhalb dieser Crate entsteht ein
+    /// `Finding<RuleChecked>` ausschließlich über diese Prägestellen.
     ///
     /// # Arguments
     /// - `id` (`harw_types::FindingId`): die dem Befund zugewiesene Identität.
@@ -1201,8 +1205,8 @@ pub fn triage_record(
 ///     severity: Severity::High,
 ///     summary: "Beispiel-Advisory".to_owned(),
 /// }];
-/// // `run_rules` liefert nur `Finding<Raw>`; `correlate_advisories` ist die
-/// // öffentliche Prägestelle für einen geprüften `Finding<RuleChecked>`.
+/// // `run_rules` liefert nur `Finding<Raw>`; öffentliche Prägestellen für
+/// // `Finding<RuleChecked>` sind `run_rules_checked` und `correlate_advisories`.
 /// let finding = correlate_advisories(&advisories, &locked, jiff::Timestamp::UNIX_EPOCH)
 ///     .into_iter()
 ///     .next()

@@ -62,7 +62,7 @@
 //! Eingabe (dieselben Advisories, dasselbe Lockfile) ergibt deshalb immer
 //! dieselbe Reihenfolge, unabhängig von der internen Iterationsreihenfolge
 //! über `advisories` und `locked`. Die je Fund zufällig vergebene
-//! [`harw_types::FindingId`] (siehe [`crate::engine::run_rules`]-Moduldoku für
+//! [`harw_types::FindingId`] (siehe [`crate::engine`]-Moduldoku für
 //! dieselbe Begründung) ist davon ausgenommen — sie ist per Konstruktion bei
 //! jedem Aufruf verschieden; der Determinismus-Test dieses Moduls vergleicht
 //! deshalb die inhaltlichen Felder (Reihenfolge, Zusammenfassung, Anzahl),
@@ -79,7 +79,7 @@
 //! Aufrufer (`harw-dod-escalate` eingeschlossen) zum Anpassen gezwungen — ein
 //! nicht-additiver Eingriff, den der Arbeitsauftrag ausdrücklich ausschließt.
 //! Diese Funktion zertifiziert ihre Befunde deshalb direkt über dieselben
-//! `pub(crate)`-Konstruktoren, die auch [`crate::engine::run_rules`] benutzt
+//! `pub(crate)`-Konstruktoren, die auch [`crate::engine::run_rules_checked`] benutzt
 //! ([`Finding::raw`], [`Finding::check`]) — kein zweiter, nicht sanktionierter
 //! Weg zu `Finding<RuleChecked>`, sondern derselbe, innerhalb derselben Crate.
 //!

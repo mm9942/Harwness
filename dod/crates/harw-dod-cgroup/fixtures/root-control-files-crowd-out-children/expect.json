@@ -1,0 +1,20 @@
+{
+  "now": "1970-01-01T00:00:00Z",
+  "reading": {
+    "samples": [
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "memory_current_bytes_system_slice",
+        "value": 52428800.0
+      },
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "memory_current_bytes_user_slice",
+        "value": 10485760.0
+      }
+    ],
+    "events": []
+  }
+}
