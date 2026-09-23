@@ -28,11 +28,13 @@ jobs:
           workspaces: "."
 
       # The sandbox tests (harw-sandbox and friends) exec bubblewrap directly,
-      # so it must be present before `cargo test` runs.
-      - name: Install bubblewrap
+      # so it must be present before `cargo test` runs. libdbus-1-dev and
+      # pkg-config are needed by the OS-keyring backend (`keyring` feature ->
+      # libdbus-sys) that harw-secrets builds with.
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          sudo apt-get install -y bubblewrap libdbus-1-dev pkg-config
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -58,10 +60,12 @@ jobs:
         with:
           workspaces: "dod -> target"
 
-      - name: Install bubblewrap
+      # bubblewrap for the sandbox tests; libdbus-1-dev + pkg-config for the
+      # OS-keyring backend (`keyring` feature -> libdbus-sys) used by harw-secrets.
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          sudo apt-get install -y bubblewrap libdbus-1-dev pkg-config
 
       - name: cargo test --workspace --locked
         working-directory: dod
