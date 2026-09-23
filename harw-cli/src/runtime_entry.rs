@@ -10,8 +10,8 @@
 //! §1.3, `docs/remediation/ledger/W2d1/A1.md`):
 //!
 //! - [`runtime_spec`] — die Eingangsbeschreibung eines Laufs ohne Overrides.
-//! - [`profile_sessions_root`] — das Transkriptverzeichnis des aktiven Profils,
-//!   angelegt bei Bedarf.
+//! - [`profile_sessions_root`] — das Transkriptverzeichnis des aktiven Profils
+//!   (`[session].store_dir`, `[session].journal_format`), angelegt bei Bedarf.
 //! - [`transcript_state_store`] — der durable [`StateStore`] darüber.
 //! - [`build_assembly`] — die eine Bau-Aufrufstelle, Fehler als `String` für
 //!   Aufrufer, die (noch) keinen eigenen Fehlertyp tragen.
@@ -39,7 +39,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use harw_config::ResolvedConfig;
+use harw_config::{ResolvedConfig, SessionSection};
 use harw_core::{InMemoryStateStore, SessionThreadMapper, StateStore, TranscriptStateStore};
 use harw_home::{active_profile_name, profile_dir};
 use harw_protocol::SessionEvent;
@@ -82,13 +82,23 @@ pub(crate) fn runtime_spec(
     }
 }
 
+/// Einziges vom [`TranscriptStore`] unterstütztes Journal-Format
+/// (`[session].journal_format`): eine JSON-Zeile je Datensatz.
+const SUPPORTED_JOURNAL_FORMAT: &str = "jsonl";
+
 /// Löst das Transkriptverzeichnis des aktiven Profils auf und legt es an.
 ///
 /// # Beschreibung
-/// `<profile_dir(home, active_profile_name(home))>/sessions`. Das aktive
-/// Profil folgt `HARW_PROFILE`/der `active_profile`-Zeigerdatei
+/// Das aktive Profil folgt `HARW_PROFILE`/der `active_profile`-Zeigerdatei
 /// ([`active_profile_name`]); der Profilordner selbst folgt
-/// [`profile_dir`]. Das Verzeichnis wird über
+/// [`profile_dir`]. Der Speicherort kommt aus `[session].store_dir` der
+/// vertrauten Home- und Profil-Layer ([`session_store_settings`]):
+/// ein absoluter Pfad wird unverändert übernommen, ein relativer gegen den
+/// Profilordner (innerhalb des HARW-Homes) aufgelöst — der Default
+/// `"sessions"` ergibt damit wie bisher `<profil>/sessions`.
+/// `[session].journal_format` wird geprüft: der [`TranscriptStore`] kennt
+/// nur `"jsonl"`; jeder andere Wert erzeugt eine `tracing::warn!`-Zeile und
+/// es wird trotzdem JSONL geschrieben. Das Verzeichnis wird über
 /// [`std::fs::create_dir_all`] angelegt, falls es noch nicht existiert —
 /// ohne durables Transkriptverzeichnis gibt es keinen [`StateStore`] für
 /// diesen Lauf.
@@ -97,19 +107,23 @@ pub(crate) fn runtime_spec(
 /// - `home` (`&Path`): aufgelöster Root-Space.
 ///
 /// # Rückgabe
-/// Den angelegten Pfad `<profil>/sessions`.
+/// Den angelegten Pfad (Default `<profil>/sessions`).
 ///
 /// # Fehler
 /// `Err(String)`, wenn der Profilname ungültig ist
 /// ([`harw_home::HomeError`]) oder das Verzeichnis nicht angelegt werden
 /// kann. Der Fehlertext nennt den Pfad, aber keine Geheimnisse — es gibt
-/// hier keine.
+/// hier keine. Eine nicht ladbare Konfiguration ist hier **kein** Fehler:
+/// sie wird gewarnt und der Default verwendet (die eigentliche
+/// Konfigurationsprüfung meldet sie beim Montieren der Runtime).
 pub(crate) fn profile_sessions_root(home: &Path) -> Result<PathBuf, String> {
     let profile = active_profile_name(home);
     let dir = profile_dir(home, &profile).map_err(|error| {
         format!("could not resolve the profile directory for profile '{profile}': {error}")
     })?;
-    let sessions_root = dir.join("sessions");
+    let settings = session_store_settings(home, &dir);
+    let sessions_root = resolve_store_dir(&dir, &settings.store_dir);
+    check_journal_format(&settings.journal_format);
     std::fs::create_dir_all(&sessions_root).map_err(|error| {
         format!(
             "could not create the sessions directory at '{}': {error}",
@@ -117,6 +131,81 @@ pub(crate) fn profile_sessions_root(home: &Path) -> Result<PathBuf, String> {
         )
     })?;
     Ok(sessions_root)
+}
+
+/// Liest `[session]` aus den vertrauten Home- und Profil-Layern.
+///
+/// # Beschreibung
+/// Lädt ausschließlich `home` und `profile_dir` über
+/// [`harw_config::discover_config`] — kein Repo-Layer, denn `[session]` ist
+/// profilbezogen und wird aus nicht vertrauten Repos nie übernommen.
+/// Scheitert das Laden, wird gewarnt und [`SessionSection::default`]
+/// zurückgegeben.
+///
+/// # Argumente
+/// - `home` (`&Path`): aufgelöster Root-Space.
+/// - `profile_dir` (`&Path`): Ordner des aktiven Profils.
+///
+/// # Rückgabe
+/// Die wirksame [`SessionSection`].
+fn session_store_settings(home: &Path, profile_dir: &Path) -> SessionSection {
+    let layers = [home.to_path_buf(), profile_dir.to_path_buf()];
+    match harw_config::discover_config(&layers) {
+        Ok(config) => config.harness.session,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "session store: configuration not loadable, using default [session] settings"
+            );
+            SessionSection::default()
+        }
+    }
+}
+
+/// Löst `[session].store_dir` gegen den Profilordner auf.
+///
+/// # Argumente
+/// - `profile_dir` (`&Path`): Ordner des aktiven Profils.
+/// - `store_dir` (`&str`): konfigurierter Wert; leer (nach `trim`) bedeutet
+///   Default `"sessions"`.
+///
+/// # Rückgabe
+/// `store_dir` selbst, wenn absolut; sonst `profile_dir.join(store_dir)`.
+fn resolve_store_dir(profile_dir: &Path, store_dir: &str) -> PathBuf {
+    let trimmed = store_dir.trim();
+    if trimmed.is_empty() {
+        tracing::warn!("session store: empty [session].store_dir, using 'sessions'");
+        return profile_dir.join("sessions");
+    }
+    let configured = Path::new(trimmed);
+    if configured.is_absolute() {
+        configured.to_path_buf()
+    } else {
+        profile_dir.join(configured)
+    }
+}
+
+/// Prüft `[session].journal_format` gegen das einzige unterstützte Format.
+///
+/// # Beschreibung
+/// Groß-/Kleinschreibung und umgebende Leerzeichen werden ignoriert. Jeder
+/// andere Wert als `"jsonl"` erzeugt eine Warnung; der Lauf schreibt
+/// trotzdem JSONL.
+///
+/// # Rückgabe
+/// `true`, wenn das Format unterstützt wird.
+fn check_journal_format(journal_format: &str) -> bool {
+    let supported = journal_format
+        .trim()
+        .eq_ignore_ascii_case(SUPPORTED_JOURNAL_FORMAT);
+    if !supported {
+        tracing::warn!(
+            journal_format = %journal_format,
+            supported = SUPPORTED_JOURNAL_FORMAT,
+            "session store: unsupported [session].journal_format, writing jsonl instead"
+        );
+    }
+    supported
 }
 
 /// Baut den durablen Verlaufsspeicher eines Laufs über [`TranscriptStore`].
@@ -379,6 +468,64 @@ mod tests {
         assert!(sessions_root.ends_with("sessions"));
         assert!(sessions_root.starts_with(home.path()));
         Ok(())
+    }
+
+    #[test]
+    fn test_profile_sessions_root_honors_relative_store_dir() -> TestResult {
+        let home = TempDir::new().map_err(ctx("home tempdir"))?;
+        let profile = profile_dir(home.path(), &active_profile_name(home.path()))
+            .map_err(ctx("profile dir"))?;
+        std::fs::create_dir_all(&profile).map_err(ctx("create profile dir"))?;
+        std::fs::write(
+            profile.join("config.toml"),
+            "[session]\nstore_dir = \"journal/custom\"\n",
+        )
+        .map_err(ctx("write profile config"))?;
+
+        let sessions_root = profile_sessions_root(home.path())
+            .map_err(ctx("sessions root resolves and is created"))?;
+
+        assert_eq!(sessions_root, profile.join("journal").join("custom"));
+        assert!(sessions_root.is_dir(), "{}", sessions_root.display());
+        Ok(())
+    }
+
+    #[test]
+    fn test_profile_sessions_root_honors_absolute_store_dir() -> TestResult {
+        let home = TempDir::new().map_err(ctx("home tempdir"))?;
+        let target = TempDir::new().map_err(ctx("target tempdir"))?;
+        let absolute = target.path().join("abs-sessions");
+        std::fs::write(
+            home.path().join("config.toml"),
+            format!("[session]\nstore_dir = '{}'\n", absolute.display()),
+        )
+        .map_err(ctx("write home config"))?;
+
+        let sessions_root = profile_sessions_root(home.path())
+            .map_err(ctx("sessions root resolves and is created"))?;
+
+        assert_eq!(sessions_root, absolute);
+        assert!(sessions_root.is_dir(), "{}", sessions_root.display());
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolve_store_dir_empty_falls_back_to_sessions() {
+        let profile = PathBuf::from("/does/not/exist/profile");
+
+        assert_eq!(resolve_store_dir(&profile, "  "), profile.join("sessions"));
+        assert_eq!(
+            resolve_store_dir(&profile, "sessions"),
+            profile.join("sessions")
+        );
+    }
+
+    #[test]
+    fn test_check_journal_format_accepts_only_jsonl() {
+        assert!(check_journal_format("jsonl"));
+        assert!(check_journal_format(" JSONL "));
+        assert!(!check_journal_format("sqlite"));
+        assert!(!check_journal_format(""));
     }
 
     #[test]
