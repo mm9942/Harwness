@@ -308,7 +308,7 @@ impl std::fmt::Display for GatewayBackend {
 /// Backend-unabhängige Gateway-Operation.
 ///
 /// Entkoppelt die Befehlsbauer von der CLI-Grammatik ([`GatewayAction`]). Der
-/// Status ist keine Operation, sondern [`gateway_state`].
+/// Status ist keine Operation, sondern ein reiner Bericht ([`gateway_status`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GatewayOp {
     Install,
@@ -321,14 +321,19 @@ enum GatewayOp {
 
 impl GatewayOp {
     /// Bildet die CLI-Aktion auf die Operation ab.
-    fn from_action(action: &GatewayAction) -> Self {
+    ///
+    /// # Returns
+    /// `None` für [`GatewayAction::Status`], das nichts verändert, sondern nur
+    /// den Zustand berichtet.
+    fn from_action(action: &GatewayAction) -> Option<Self> {
         match action {
-            GatewayAction::Install => Self::Install,
-            GatewayAction::Start => Self::Start,
-            GatewayAction::Stop => Self::Stop,
-            GatewayAction::Restart => Self::Restart,
-            GatewayAction::Enable => Self::Enable,
-            GatewayAction::Disable => Self::Disable,
+            GatewayAction::Install => Some(Self::Install),
+            GatewayAction::Start => Some(Self::Start),
+            GatewayAction::Stop => Some(Self::Stop),
+            GatewayAction::Restart => Some(Self::Restart),
+            GatewayAction::Enable => Some(Self::Enable),
+            GatewayAction::Disable => Some(Self::Disable),
+            GatewayAction::Status => None,
         }
     }
 }
@@ -352,6 +357,30 @@ impl std::fmt::Display for GatewayRunState {
             Self::Stopped => f.write_str("gestoppt"),
             Self::NotInstalled => f.write_str("nicht installiert"),
         }
+    }
+}
+
+/// Beobachteter Autostart (Start beim Login) des Gateway-Dienstes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayAutostart {
+    /// Der Dienstmanager startet den Gateway beim Login.
+    Enabled,
+    /// Eingerichtet, aber ohne Start beim Login.
+    Disabled,
+    /// Das Backend kennt keinen Autostart (Hintergrundprozess).
+    Unavailable,
+    /// Abfrage nicht möglich oder Ausgabe nicht deutbar.
+    Unknown,
+}
+
+impl std::fmt::Display for GatewayAutostart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Enabled => "aktiviert",
+            Self::Disabled => "deaktiviert",
+            Self::Unavailable => "nicht verfügbar (kein Dienstmanager)",
+            Self::Unknown => "unbekannt",
+        })
     }
 }
 
@@ -385,10 +414,15 @@ impl ProcFamily {
 /// losgelöster Hintergrundprozess mit PID-Datei unter `<home>/run`. Nach jeder
 /// erfolgreichen Aktion wird der beobachtete Zustand ausgegeben.
 ///
+/// `status` verändert nichts und berichtet Backend, Laufzustand, Autostart und
+/// die maßgeblichen Dateien ([`gateway_status`]); ein gestoppter oder nicht
+/// installierter Dienst ist dabei kein Fehler.
+///
 /// # Errors
 /// Home-/Executable-Auflösung, ungültiges [`GATEWAY_BACKEND_ENV`], fehlschlagende
-/// Dienstmanager-Befehle (mit deren Diagnose) sowie `enable`/`disable` im
-/// Rückfall-Backend, das keinen Autostart kennt.
+/// Dienstmanager-Befehle (mit deren Diagnose), eine nicht durchführbare
+/// Zustandsabfrage bei `status` sowie `enable`/`disable` im Rückfall-Backend,
+/// das keinen Autostart kennt.
 pub fn gateway_service(
     home_override: Option<PathBuf>,
     action: GatewayAction,
@@ -399,7 +433,10 @@ pub fn gateway_service(
         &std::env::current_exe().map_err(|error| error.to_string())?,
         &home,
     );
-    let op = GatewayOp::from_action(&action);
+    let Some(op) = GatewayOp::from_action(&action) else {
+        tracing::info!(backend = ?backend, "gateway.service.status");
+        return gateway_status(backend, &gateway, &home);
+    };
     tracing::info!(backend = ?backend, op = ?op, "gateway.service.action");
     match backend {
         GatewayBackend::SystemdUser => systemd_gateway(op, &gateway)?,
@@ -503,6 +540,90 @@ fn gateway_state(
     }
 }
 
+/// `harw gateway status`: gibt den Zustand des Gateway-Dienstes aus, ohne
+/// etwas zu verändern.
+///
+/// # Description
+/// Nutzt dieselben Abfragen wie die Zustandszeile nach einer Aktion
+/// ([`gateway_state`]) und ergänzt den Autostart ([`gateway_autostart`]) sowie
+/// die Dateien des Backends (Unit, Plist bzw. PID-Datei und Log).
+///
+/// # Errors
+/// Wenn der Laufzustand nicht abgefragt werden kann (z. B. `systemctl` oder
+/// `launchctl` nicht ausführbar, PID-Datei unlesbar). Eine fehlschlagende
+/// Autostart-Abfrage wird als „unbekannt" berichtet.
+fn gateway_status(backend: GatewayBackend, spec: &ServiceSpec, home: &Path) -> Result<(), String> {
+    let state = gateway_state(backend, spec, home)?;
+    let autostart = match (backend, state) {
+        (GatewayBackend::Detached, _) => Some(GatewayAutostart::Unavailable),
+        (_, GatewayRunState::NotInstalled) => None,
+        _ => Some(gateway_autostart(backend, &spec.name)),
+    };
+    let files: Vec<(&str, PathBuf)> = match backend {
+        GatewayBackend::SystemdUser => systemd_user_unit_dir(
+            std::env::var_os("XDG_CONFIG_HOME"),
+            std::env::var_os("HOME"),
+        )
+        .map(|dir| vec![("Unit", dir.join(format!("{}.service", spec.name)))])
+        .unwrap_or_default(),
+        GatewayBackend::Launchd => launch_agent_plist_path(std::env::var_os("HOME"), &spec.name)
+            .map(|plist| vec![("Plist", plist)])
+            .unwrap_or_default(),
+        GatewayBackend::Detached => vec![
+            ("PID-Datei", gateway_pid_path(home)),
+            ("Log", gateway_log_path(home)),
+        ],
+    };
+    for line in render_gateway_status(backend, state, autostart, &files) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Formatiert den Statusbericht (rein).
+///
+/// # Arguments
+/// - `autostart`: `None`, wenn er nicht sinnvoll ist (Dienst nicht installiert).
+/// - `files`: beschriftete Pfade des Backends, in Ausgabereihenfolge.
+///
+/// # Returns
+/// Die auszugebenden Zeilen; die erste nennt Backend und Laufzustand.
+fn render_gateway_status(
+    backend: GatewayBackend,
+    state: GatewayRunState,
+    autostart: Option<GatewayAutostart>,
+    files: &[(&str, PathBuf)],
+) -> Vec<String> {
+    let mut lines = vec![format!("Gateway-Dienst [{backend}]: {state}")];
+    if let Some(autostart) = autostart {
+        lines.push(format!("  Autostart: {autostart}"));
+    }
+    lines.extend(
+        files
+            .iter()
+            .map(|(label, path)| format!("  {label}: {}", path.display())),
+    );
+    if state == GatewayRunState::NotInstalled {
+        lines.push("  Einrichten mit: harw gateway install".to_owned());
+    }
+    lines
+}
+
+/// Fragt den Autostart über den Dienstmanager ab; Fehler werden als
+/// [`GatewayAutostart::Unknown`] berichtet (nur Diagnose, kein Abbruch).
+fn gateway_autostart(backend: GatewayBackend, name: &str) -> GatewayAutostart {
+    let observed = match backend {
+        GatewayBackend::SystemdUser => run_command(&systemd_enabled_command(name))
+            .map(|output| systemd_enabled_state(&String::from_utf8_lossy(&output.stdout))),
+        GatewayBackend::Launchd => launchd_autostart(name),
+        GatewayBackend::Detached => Ok(GatewayAutostart::Unavailable),
+    };
+    observed.unwrap_or_else(|error| {
+        tracing::warn!(error = %error, "gateway.service.autostart_unavailable");
+        GatewayAutostart::Unknown
+    })
+}
+
 // ---------------------------------------------------------------------------
 // systemd
 // ---------------------------------------------------------------------------
@@ -558,6 +679,31 @@ fn systemd_status_command(name: &str) -> Vec<String> {
         "is-active".to_owned(),
         format!("{name}.service"),
     ]
+}
+
+/// Argumentvektor der Autostart-Abfrage `systemctl --user is-enabled <name>.service` (rein).
+fn systemd_enabled_command(name: &str) -> Vec<String> {
+    vec![
+        "systemctl".to_owned(),
+        "--user".to_owned(),
+        "is-enabled".to_owned(),
+        format!("{name}.service"),
+    ]
+}
+
+/// Deutet die Ausgabe von `systemctl --user is-enabled` (rein).
+///
+/// `is-enabled` endet bei deaktivierten Units mit Status != 0; maßgeblich ist
+/// die ausgegebene Zustandszeile.
+fn systemd_enabled_state(stdout: &str) -> GatewayAutostart {
+    match stdout.lines().next().map(str::trim) {
+        Some("enabled" | "enabled-runtime") => GatewayAutostart::Enabled,
+        Some(
+            "disabled" | "masked" | "masked-runtime" | "linked" | "linked-runtime" | "static"
+            | "indirect",
+        ) => GatewayAutostart::Disabled,
+        _ => GatewayAutostart::Unknown,
+    }
 }
 
 /// Deutet die Ausgabe von `systemctl --user is-active` (rein).
@@ -692,6 +838,56 @@ fn launchd_gateway_commands(
 /// Exit-Status 0 heißt „geladen".
 fn launchd_status_command(label: &str) -> Vec<String> {
     vec!["launchctl".to_owned(), "list".to_owned(), label.to_owned()]
+}
+
+/// Argumentvektor der Abfrage `launchctl print-disabled <domain>` (rein), die
+/// die per `launchctl disable` abgeschalteten Labels der Domain auflistet.
+fn launchd_print_disabled_command(domain: &str) -> Vec<String> {
+    vec![
+        "launchctl".to_owned(),
+        "print-disabled".to_owned(),
+        domain.to_owned(),
+    ]
+}
+
+/// Liest aus `launchctl print-disabled`, ob `label` abgeschaltet ist (rein).
+///
+/// Erwartet Zeilen der Form `"<label>" => disabled|enabled` (ältere
+/// macOS-Versionen: `=> true|false`).
+///
+/// # Returns
+/// `Some(true)` für abgeschaltet, `Some(false)` für ausdrücklich zugelassen,
+/// `None`, wenn das Label nicht aufgeführt ist.
+fn launchctl_label_disabled(stdout: &str, label: &str) -> Option<bool> {
+    let quoted = format!("\"{label}\"");
+    stdout.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix(quoted.as_str())?.trim_start();
+        let value = rest.strip_prefix("=>")?.trim().trim_end_matches(';').trim();
+        match value {
+            "disabled" | "true" => Some(true),
+            "enabled" | "false" => Some(false),
+            _ => None,
+        }
+    })
+}
+
+/// Autostart des LaunchAgent: Das Plist setzt `RunAtLoad`, daher startet der
+/// Agent beim Login, solange das Plist existiert und das Label nicht per
+/// `launchctl disable` abgeschaltet ist.
+fn launchd_autostart(label: &str) -> Result<GatewayAutostart, String> {
+    let plist = launch_agent_plist_path(std::env::var_os("HOME"), label)?;
+    if !plist.is_file() {
+        return Ok(GatewayAutostart::Disabled);
+    }
+    let uid_output = run_checked(&["id".to_owned(), "-u".to_owned()])?;
+    let domain = launchd_domain(parse_uid(&String::from_utf8_lossy(&uid_output.stdout))?);
+    let output = run_checked(&launchd_print_disabled_command(&domain))?;
+    Ok(
+        match launchctl_label_disabled(&String::from_utf8_lossy(&output.stdout), label) {
+            Some(true) => GatewayAutostart::Disabled,
+            Some(false) | None => GatewayAutostart::Enabled,
+        },
+    )
 }
 
 /// Liest die PID aus der Ausgabe von `launchctl list <label>` (rein).
@@ -1815,6 +2011,119 @@ mod tests {
         assert_eq!(
             systemd_status_command(GATEWAY_SERVICE_NAME),
             ["systemctl", "--user", "is-active", "harw-gateway.service"]
+        );
+    }
+
+    #[test]
+    fn test_gateway_op_from_action_maps_status_to_report() {
+        assert_eq!(GatewayOp::from_action(&GatewayAction::Status), None);
+        assert_eq!(
+            GatewayOp::from_action(&GatewayAction::Install),
+            Some(GatewayOp::Install)
+        );
+        assert_eq!(
+            GatewayOp::from_action(&GatewayAction::Stop),
+            Some(GatewayOp::Stop)
+        );
+    }
+
+    #[test]
+    fn test_systemd_enabled_command_and_state() {
+        assert_eq!(
+            systemd_enabled_command(GATEWAY_SERVICE_NAME),
+            ["systemctl", "--user", "is-enabled", "harw-gateway.service"]
+        );
+        assert_eq!(
+            systemd_enabled_state("enabled\n"),
+            GatewayAutostart::Enabled
+        );
+        assert_eq!(
+            systemd_enabled_state("enabled-runtime\n"),
+            GatewayAutostart::Enabled
+        );
+        assert_eq!(
+            systemd_enabled_state("disabled\n"),
+            GatewayAutostart::Disabled
+        );
+        assert_eq!(
+            systemd_enabled_state("masked\n"),
+            GatewayAutostart::Disabled
+        );
+        assert_eq!(systemd_enabled_state(""), GatewayAutostart::Unknown);
+    }
+
+    #[test]
+    fn test_launchctl_label_disabled_parses_print_disabled() {
+        assert_eq!(
+            launchd_print_disabled_command("gui/501"),
+            ["launchctl", "print-disabled", "gui/501"]
+        );
+        let out = "disabled services = {\n\t\"com.apple.x\" => enabled\n\t\
+                   \"harw-gateway\" => disabled\n}\n";
+        assert_eq!(launchctl_label_disabled(out, "harw-gateway"), Some(true));
+        assert_eq!(launchctl_label_disabled(out, "com.apple.x"), Some(false));
+        assert_eq!(launchctl_label_disabled(out, "harw-serve"), None);
+        let legacy = "\t\"harw-gateway\" => false\n";
+        assert_eq!(
+            launchctl_label_disabled(legacy, "harw-gateway"),
+            Some(false)
+        );
+        // Ein Label, das nur mit dem gesuchten beginnt, zählt nicht.
+        let prefixed = "\t\"harw-gateway-old\" => true\n";
+        assert_eq!(launchctl_label_disabled(prefixed, "harw-gateway"), None);
+    }
+
+    #[test]
+    fn test_render_gateway_status_reports_state_autostart_and_files() {
+        let files = [
+            ("PID-Datei", PathBuf::from("/srv/harw/run/harw-gateway.pid")),
+            ("Log", PathBuf::from("/srv/harw/logs/harw-gateway.log")),
+        ];
+        assert_eq!(
+            render_gateway_status(
+                GatewayBackend::Detached,
+                GatewayRunState::Stopped,
+                Some(GatewayAutostart::Unavailable),
+                &files,
+            ),
+            [
+                "Gateway-Dienst [Hintergrundprozess (PID-Datei)]: gestoppt",
+                "  Autostart: nicht verfügbar (kein Dienstmanager)",
+                "  PID-Datei: /srv/harw/run/harw-gateway.pid",
+                "  Log: /srv/harw/logs/harw-gateway.log",
+            ]
+        );
+        let unit = [(
+            "Unit",
+            PathBuf::from("/home/u/.config/systemd/user/harw-gateway.service"),
+        )];
+        assert_eq!(
+            render_gateway_status(
+                GatewayBackend::SystemdUser,
+                GatewayRunState::Running(None),
+                Some(GatewayAutostart::Enabled),
+                &unit,
+            ),
+            [
+                "Gateway-Dienst [systemd (User-Unit)]: läuft",
+                "  Autostart: aktiviert",
+                "  Unit: /home/u/.config/systemd/user/harw-gateway.service",
+            ]
+        );
+        let lines = render_gateway_status(
+            GatewayBackend::SystemdUser,
+            GatewayRunState::NotInstalled,
+            None,
+            &unit,
+        );
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("Gateway-Dienst [systemd (User-Unit)]: nicht installiert")
+        );
+        assert!(!lines.iter().any(|line| line.contains("Autostart")));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("  Einrichten mit: harw gateway install")
         );
     }
 

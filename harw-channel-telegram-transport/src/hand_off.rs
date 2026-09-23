@@ -6,7 +6,7 @@
 //! the outbound capability. Keeping the seam here avoids a dependency on
 //! `harw-core` or `harw-sandbox`.
 
-use crate::TransportResult;
+use crate::{TelegramCallback, TransportResult};
 use harw_channel::{InboundEvent, OutboundContent, SessionKey};
 
 /// Sink registered by a runtime bridge to receive events that passed Telegram
@@ -19,6 +19,17 @@ use harw_channel::{InboundEvent, OutboundContent, SessionKey};
 pub trait AdmittedEventConsumer: Send + Sync {
     /// Handles one admitted event and its already-derived session key.
     fn handle_admitted(&self, key: SessionKey, event: InboundEvent);
+}
+
+/// Sink für Inline-Button-Klicks (`callback_query`).
+///
+/// Die Ingress-Pfade (Long-Poll und Webhook) reichen deduplizierte
+/// Callbacks hierher weiter; die Laufzeit prüft das Freigabe-Token in
+/// [`TelegramCallback::data`] gegen den Chat-/Nachrichtenkontext und
+/// beantwortet die Query per `answerCallbackQuery`.
+pub trait CallbackConsumer: Send + Sync {
+    /// Verarbeitet einen Button-Klick.
+    fn handle_callback(&self, callback: TelegramCallback);
 }
 
 /// Capability a runtime bridge uses to render output into a Telegram chat.

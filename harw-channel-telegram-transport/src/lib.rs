@@ -36,7 +36,7 @@ pub use client::{
 };
 pub use dedup::DedupWindow;
 pub use error::{OffsetPersistenceOperation, TelegramTransportError, TransportResult};
-pub use hand_off::{AdmittedEventConsumer, TelegramOutbound};
+pub use hand_off::{AdmittedEventConsumer, CallbackConsumer, TelegramOutbound};
 pub use ingress_long_poll::{LongPollConfig, LongPollShutdown, spawn_long_poll_thread};
 pub use ingress_webhook::{WebhookConfig, run_webhook_server, webhook_router};
 pub use mapping::{
