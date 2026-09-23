@@ -352,6 +352,24 @@ impl TurnEventState {
 
 // ── Werkzeugzellen: Handle, Verbosity-Wrapper (Plan Schritt 2) ───────────────
 
+/// Zustand der Agenten-Detailansicht (Enter im Agenten-Panel).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentDetailState {
+    /// Der angezeigte Agent.
+    agent: SessionId,
+    /// Abstand in umbrochenen Zeilen vom Ende der Spur; `0` folgt dem
+    /// neuesten Eintrag.
+    scroll: u16,
+    /// Reasoning-Einträge vollständig zeigen (`r` schaltet um).
+    show_reasoning: bool,
+    /// Vollbild-Zustand des Panels vor dem Öffnen (wird beim Schließen
+    /// wiederhergestellt).
+    prev_maximized: bool,
+}
+
+/// Seitenweite (Zeilen) für PageUp/PageDown in der Agenten-Detailansicht.
+const AGENT_DETAIL_PAGE: u16 = 10;
+
 /// Kennung einer einzelnen oder gruppierten Werkzeugzelle, wie sie
 /// [`ChatApp`] für Ctrl+O „letzte bzw. alle aufklappen“ vorhält.
 ///
@@ -939,6 +957,9 @@ pub struct ChatApp {
     live_reasoning: String,
     /// Sichtbarkeit und Fokus der Seitenpanels.
     panels: crate::panes::PanelState,
+    /// Offene Detailansicht eines Agenten im Agenten-Panel (Enter);
+    /// `None` = Listenansicht.
+    agent_detail: Option<AgentDetailState>,
     /// Aktive Tastenbelegung (Standard oder aus der Keybindings-Datei, siehe
     /// [`Self::set_key_bindings`]); gilt für Panels und Composer.
     key_bindings: KeyBindings,
@@ -1142,6 +1163,7 @@ impl std::fmt::Debug for ChatApp {
             .field("has_runtime", &self.runtime.is_some())
             .field("tool_verbosity", &self.tool_verbosity)
             .field("tool_cells_len", &self.tool_cells.len())
+            .field("agent_detail", &self.agent_detail)
             .field(
                 "has_pending_approval_dialog",
                 &self.pending_approval_dialog.is_some(),
@@ -1239,6 +1261,7 @@ impl ChatApp {
             live_stream: String::new(),
             live_reasoning: String::new(),
             panels: crate::panes::PanelState::default(),
+            agent_detail: None,
             key_bindings: KeyBindings::default(),
             explorer: None,
             adapters,
@@ -1996,6 +2019,55 @@ impl ChatApp {
             self.ctrl_o_expand_last_armed = true;
         }
         true
+    }
+
+    /// Öffnet die Detailansicht für den im Agenten-Panel ausgewählten Agenten
+    /// und maximiert das Panel dafür.
+    ///
+    /// # Rückgabe
+    /// `true`, wenn ein Agent ausgewählt war (Redraw nötig).
+    fn open_agent_detail(&mut self) -> bool {
+        let Some(agent) = self.agent_monitor.selected_agent() else {
+            return false;
+        };
+        let prev_maximized = self
+            .agent_detail
+            .as_ref()
+            .map_or(self.panels.maximized, |detail| detail.prev_maximized);
+        self.agent_detail = Some(AgentDetailState {
+            agent,
+            scroll: 0,
+            show_reasoning: true,
+            prev_maximized,
+        });
+        self.panels.maximized = true;
+        true
+    }
+
+    /// Schließt die Detailansicht und stellt den vorherigen Vollbild-Zustand
+    /// des Agenten-Panels wieder her.
+    fn close_agent_detail(&mut self) {
+        if let Some(detail) = self.agent_detail.take() {
+            self.panels.maximized = detail.prev_maximized;
+        }
+    }
+
+    /// Schließt die Detailansicht, wenn das Agenten-Panel Fokus oder
+    /// Sichtbarkeit verloren hat (F3/F4/Esc über die Panel-Logik).
+    fn sync_agent_detail(&mut self) {
+        let agents_active =
+            self.panels.focus == crate::panes::PaneFocus::Agents && self.panels.agents_visible;
+        if agents_active || self.agent_detail.is_none() {
+            return;
+        }
+        let keep_maximized = self.panels.maximized;
+        self.close_agent_detail();
+        // Ein anderes Panel behält einen gerade gewählten Vollbild-Zustand;
+        // der Chat braucht keinen.
+        self.panels.maximized = match self.panels.focus {
+            crate::panes::PaneFocus::Chat => false,
+            _ => keep_maximized && self.panels.maximized,
+        };
     }
 
     /// Hängt eine (eingeklappte) Reasoning-Zelle an den Verlauf und merkt sie
@@ -5054,12 +5126,23 @@ fn handle_panel_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
     {
         return None;
     }
+    // Die Agenten-Detailansicht bekommt ihre Tasten (insbesondere Esc) vor
+    // der Panel-Logik, die Esc sonst als „Fokus zurück an den Chat" deutet.
+    if app.agent_detail.is_some() && app.panels.focus == crate::panes::PaneFocus::Agents {
+        if let Some(redraw) = handle_agent_detail_key(app, key) {
+            return Some(redraw);
+        }
+    }
     match app.panels.handle_key(key, &app.key_bindings) {
         crate::panes::PanelKey::Ignored => None,
         crate::panes::PanelKey::Changed => {
+            app.sync_agent_detail();
             app.ensure_explorer();
             Some(true)
         }
+        // Übrige Tasten verschluckt die Detailansicht (kein Rückfall auf
+        // die Listennavigation).
+        crate::panes::PanelKey::ForFocused(_) if app.agent_detail.is_some() => Some(false),
         crate::panes::PanelKey::ForFocused(key) => Some(match app.panels.focus {
             crate::panes::PaneFocus::Agents => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -5070,12 +5153,48 @@ fn handle_panel_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
                     app.agent_monitor.select_prev();
                     true
                 }
+                KeyCode::Enter => app.open_agent_detail(),
                 _ => false,
             },
             crate::panes::PaneFocus::Explorer => handle_explorer_key(app, key),
             crate::panes::PaneFocus::Chat => false,
         }),
     }
+}
+
+/// Tasten der Agenten-Detailansicht.
+///
+/// # Beschreibung
+/// Esc/q zurück zur Liste, j/↓ Richtung neuester Einträge, k/↑ ältere,
+/// PageUp/PageDown um [`AGENT_DETAIL_PAGE`] Zeilen, Home/g an den Anfang,
+/// End/G ans Ende (folgt dem Neuesten), `r` schaltet Reasoning um.
+///
+/// # Rückgabe
+/// `Some(redraw)`, wenn die Taste verarbeitet wurde; `None` für Tasten, die
+/// an die Panel-Logik weitergehen (z. B. F2/F3/F4/F11).
+fn handle_agent_detail_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+        app.close_agent_detail();
+        return Some(true);
+    }
+    let detail = app.agent_detail.as_mut()?;
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => detail.scroll = detail.scroll.saturating_sub(1),
+        KeyCode::Up | KeyCode::Char('k') => detail.scroll = detail.scroll.saturating_add(1),
+        KeyCode::PageDown => detail.scroll = detail.scroll.saturating_sub(AGENT_DETAIL_PAGE),
+        KeyCode::PageUp => detail.scroll = detail.scroll.saturating_add(AGENT_DETAIL_PAGE),
+        KeyCode::Home | KeyCode::Char('g') => detail.scroll = u16::MAX,
+        KeyCode::End | KeyCode::Char('G') => detail.scroll = 0,
+        KeyCode::Char('r') => detail.show_reasoning = !detail.show_reasoning,
+        _ => return None,
+    }
+    Some(true)
 }
 
 /// Entscheidet, ob eine Taste zuerst dem Transkript-Scroll ([`ChatScroll`])
@@ -7229,13 +7348,23 @@ fn render_viewport(
     // Fläche mit dem Verlauf; auf schmalen Terminals bleibt nur der Chat.
     let pane_areas = crate::panes::split(chunks[0], &app.panels);
     if let Some(agents_area) = pane_areas.agents {
-        crate::agent_monitor::render_agents_panel(
-            &app.agent_monitor,
-            agents_area,
-            frame.buffer_mut(),
-            theme,
-            app.panels.focus == crate::panes::PaneFocus::Agents,
-        );
+        if let Some(detail) = app.agent_detail.as_ref() {
+            app.agent_monitor.render_agent_detail(
+                &detail.agent,
+                agents_area,
+                frame.buffer_mut(),
+                detail.scroll,
+                detail.show_reasoning,
+            );
+        } else {
+            crate::agent_monitor::render_agents_panel(
+                &app.agent_monitor,
+                agents_area,
+                frame.buffer_mut(),
+                theme,
+                app.panels.focus == crate::panes::PaneFocus::Agents,
+            );
+        }
     }
     if let Some(explorer_area) = pane_areas.explorer {
         render_explorer_panel(app, explorer_area, frame.buffer_mut(), theme);

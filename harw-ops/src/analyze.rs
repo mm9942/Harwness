@@ -796,14 +796,9 @@ fn enrich_with_cargo(
                 continue;
             }
         };
-        let unit_of = |crate_name: &str, units: &[AnalysisUnit]| -> Option<usize> {
-            units.iter().position(|unit| {
-                unit.cargo_name.as_deref() == Some(crate_name) && unit.dir.starts_with(&ws_dir)
-            })
-        };
         let mut matched = 0_usize;
         for crate_node in &graph.crates {
-            let Some(position) = unit_of(&crate_node.name, units) else {
+            let Some(position) = cargo_unit(units, &ws_dir, &crate_node.name) else {
                 continue;
             };
             matched += 1;
@@ -813,7 +808,7 @@ fn enrich_with_cargo(
             }
             units[position].external_deps = crate_node.external_deps.clone();
             for dep in &crate_node.deps {
-                if let Some(target) = unit_of(dep, units) {
+                if let Some(target) = cargo_unit(units, &ws_dir, dep) {
                     edges.add(position, target);
                 }
             }
@@ -821,6 +816,13 @@ fn enrich_with_cargo(
         report.push(json!({ "workspace": ws_label, "crates": matched }));
     }
     (enriched, report)
+}
+
+/// Index der Cargo-Einheit `crate_name` unterhalb von `ws_dir`.
+fn cargo_unit(units: &[AnalysisUnit], ws_dir: &Path, crate_name: &str) -> Option<usize> {
+    units.iter().position(|unit| {
+        unit.cargo_name.as_deref() == Some(crate_name) && unit.dir.starts_with(ws_dir)
+    })
 }
 
 /// Baut den Einheiten-Graphen aus einem Explorer-Index.

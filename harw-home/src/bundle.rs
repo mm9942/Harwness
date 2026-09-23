@@ -3,8 +3,10 @@
 //! # Verantwortung
 //! Dieses Modul besitzt die eingebettete Startausstattung des Root-Space: die
 //! Delegationshierarchie (ein Root-Orchestrator, vier Child-Orchestratoren,
-//! zwölf Worker) und die Skills, auf die deren `agent.toml` verweist. Es
-//! besitzt **nicht** das Schreiben — das leistet [`crate::scaffold::ensure_home`].
+//! zwölf Worker), die Skills, auf die deren `agent.toml` verweist, sowie
+//! eigenständige Anleitungs-Skills (`skill.toml` + `instructions.md`, u. a.
+//! `rust-*`, `version-bump`). Es besitzt **nicht** das Schreiben — das leistet
+//! [`crate::scaffold::ensure_home`].
 //!
 //! # Schlüsseltypen
 //! - [`BundledFile`] — ein eingebetteter Dateiinhalt samt Zielpfad.
