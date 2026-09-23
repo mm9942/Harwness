@@ -6,6 +6,7 @@ members = [
     "harw-code-graph",
     "harw-explorer",
     "harw-tool-explorer",
+    "harw-killer",
     "harw-config",
     "harw-home",
     "harw-plan",

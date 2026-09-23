@@ -1,0 +1,25 @@
+[package]
+name = "harw-killer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Linux-Prozessterminator mit pidfd-Identität und wiederholtem SIGKILL (Bibliothek, `killer`-Binary und Grundlage für `harw kill` sowie das Agent-Werkzeug `process.kill`)."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "killer"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
+rustix = { workspace = true, features = ["process", "event", "fs"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["ansi", "env-filter", "fmt", "registry", "std"], default-features = false }
+
+[lints]
+workspace = true

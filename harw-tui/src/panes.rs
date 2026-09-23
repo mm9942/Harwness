@@ -7,11 +7,15 @@
 //! ```
 //!
 //! Panels erscheinen nur, wenn die Fläche breit genug ist
-//! ([`MIN_CHAT_WIDTH`] bleibt immer für den Chat reserviert). `F4` wechselt
-//! den Fokus reihum, `Esc` gibt ihn an den Chat zurück.
+//! ([`MIN_CHAT_WIDTH`] bleibt immer für den Chat reserviert). In der
+//! Standard-Belegung wechselt `F4` den Fokus reihum; `Esc` gibt ihn an den
+//! Chat zurück. Die Tasten sind über `[tui].keybindings_file` umbelegbar
+//! (siehe [`crate::keybindings`]).
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+
+use crate::keybindings::{KeyAction, KeyBindings};
 
 /// Mindestbreite, die der Chat neben den Panels behält.
 pub(crate) const MIN_CHAT_WIDTH: u16 = 48;
@@ -62,40 +66,45 @@ pub(crate) enum PanelKey {
 }
 
 impl PanelState {
-    /// Globale Panel-Tasten: `F2` Explorer, `F3` Agenten, `F4` Fokus,
-    /// `F11` Vollbild des fokussierten Panels, `Esc` zurück zum Chat.
-    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> PanelKey {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::F(2) => {
+    /// Globale Panel-Tasten gemäß `bindings`. In der Standard-Belegung
+    /// ([`KeyBindings::default`]): `F2` Explorer, `F3` Agenten, `F4` Fokus,
+    /// `Ctrl+E` Explorer fokussieren, `F11` Vollbild des fokussierten
+    /// Panels. `Esc` (nicht umbelegbar) gibt den Fokus aus dem
+    /// Agenten-Panel an den Chat zurück.
+    pub(crate) fn handle_key(&mut self, key: KeyEvent, bindings: &KeyBindings) -> PanelKey {
+        match bindings.action_for(&key) {
+            Some(KeyAction::ToggleExplorer) => {
                 self.explorer_visible = !self.explorer_visible;
                 if !self.explorer_visible && self.focus == PaneFocus::Explorer {
                     self.focus = PaneFocus::Chat;
                     self.maximized = false;
                 }
-                PanelKey::Changed
+                return PanelKey::Changed;
             }
-            KeyCode::F(3) => {
+            Some(KeyAction::ToggleAgents) => {
                 self.agents_visible = !self.agents_visible;
                 if !self.agents_visible && self.focus == PaneFocus::Agents {
                     self.focus = PaneFocus::Chat;
                     self.maximized = false;
                 }
-                PanelKey::Changed
+                return PanelKey::Changed;
             }
-            KeyCode::F(4) => {
+            Some(KeyAction::CycleFocus) => {
                 self.cycle_focus();
-                PanelKey::Changed
+                return PanelKey::Changed;
             }
-            KeyCode::Char('e' | 'E') if ctrl => {
+            Some(KeyAction::FocusExplorer) => {
                 self.explorer_visible = true;
                 self.focus = PaneFocus::Explorer;
-                PanelKey::Changed
+                return PanelKey::Changed;
             }
-            KeyCode::F(11) if self.focus != PaneFocus::Chat => {
+            Some(KeyAction::MaximizePanel) if self.focus != PaneFocus::Chat => {
                 self.maximized = !self.maximized;
-                PanelKey::Changed
+                return PanelKey::Changed;
             }
+            _ => {}
+        }
+        match key.code {
             // Im Explorer gehört Esc zuerst dem Panel (Filter/Vorschau
             // schließen); das Panel gibt den Fokus selbst zurück.
             KeyCode::Esc if self.focus == PaneFocus::Agents => {
@@ -188,6 +197,7 @@ pub(crate) fn split(area: Rect, state: &PanelState) -> PaneAreas {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyModifiers;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -209,20 +219,66 @@ mod tests {
 
     #[test]
     fn focus_cycles_through_visible_panels_and_escape_returns() {
+        let bindings = KeyBindings::default();
         let mut state = PanelState::default();
-        assert_eq!(state.handle_key(key(KeyCode::F(4))), PanelKey::Changed);
+        assert_eq!(
+            state.handle_key(key(KeyCode::F(4)), &bindings),
+            PanelKey::Changed
+        );
         assert_eq!(state.focus, PaneFocus::Agents, "explorer hidden → skipped");
         assert!(matches!(
-            state.handle_key(key(KeyCode::Down)),
+            state.handle_key(key(KeyCode::Down), &bindings),
             PanelKey::ForFocused(_)
         ));
-        state.handle_key(key(KeyCode::F(11)));
+        state.handle_key(key(KeyCode::F(11)), &bindings);
         let areas = split(Rect::new(0, 0, 100, 20), &state);
         assert_eq!(areas.agents.map(|r| r.width), Some(100));
         assert!(areas.chat.is_none());
-        state.handle_key(key(KeyCode::Esc));
+        state.handle_key(key(KeyCode::Esc), &bindings);
         assert_eq!(state.focus, PaneFocus::Chat);
         assert!(!state.maximized);
-        assert_eq!(state.handle_key(key(KeyCode::Down)), PanelKey::Ignored);
+        assert_eq!(
+            state.handle_key(key(KeyCode::Down), &bindings),
+            PanelKey::Ignored
+        );
+    }
+
+    #[test]
+    fn ctrl_e_focuses_explorer_and_f2_hides_it() {
+        let bindings = KeyBindings::default();
+        let mut state = PanelState::default();
+        let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(state.handle_key(ctrl_e, &bindings), PanelKey::Changed);
+        assert!(state.explorer_visible);
+        assert_eq!(state.focus, PaneFocus::Explorer);
+        assert_eq!(
+            state.handle_key(key(KeyCode::F(2)), &bindings),
+            PanelKey::Changed
+        );
+        assert!(!state.explorer_visible);
+        assert_eq!(state.focus, PaneFocus::Chat);
+        assert_eq!(
+            state.handle_key(key(KeyCode::F(11)), &bindings),
+            PanelKey::Ignored,
+            "F11 im Chat bleibt wirkungslos"
+        );
+    }
+
+    #[test]
+    fn custom_bindings_replace_defaults() -> Result<(), Box<dyn std::error::Error>> {
+        let bindings =
+            KeyBindings::from_toml_str("cycle_focus = \"F6\"\n", std::path::Path::new("kb.toml"))?;
+        let mut state = PanelState::default();
+        assert_eq!(
+            state.handle_key(key(KeyCode::F(4)), &bindings),
+            PanelKey::Ignored
+        );
+        assert_eq!(state.focus, PaneFocus::Chat);
+        assert_eq!(
+            state.handle_key(key(KeyCode::F(6)), &bindings),
+            PanelKey::Changed
+        );
+        assert_eq!(state.focus, PaneFocus::Agents);
+        Ok(())
     }
 }
