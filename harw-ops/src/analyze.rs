@@ -699,7 +699,7 @@ fn units_from_explorer(root: &Path, index: &ExplorerIndex) -> Vec<AnalysisUnit> 
         let at_root: Vec<&harw_explorer::Project> = index
             .projects
             .iter()
-            .filter(|project| project.root == rel)
+            .filter(|project| project.root.as_path() == rel)
             .filter(|project| !(project.kind == ProjectKind::Node && !project.members.is_empty()))
             .collect();
         let kinds: Vec<ProjectKind> = UNIT_KIND_PRIORITY
@@ -796,7 +796,7 @@ fn enrich_with_cargo(
                 continue;
             }
         };
-        let unit_of = |crate_name: &str, units: &[AnalysisUnit]| {
+        let unit_of = |crate_name: &str, units: &[AnalysisUnit]| -> Option<usize> {
             units.iter().position(|unit| {
                 unit.cargo_name.as_deref() == Some(crate_name) && unit.dir.starts_with(&ws_dir)
             })
@@ -849,7 +849,8 @@ fn unit_graph_from_explorer(root: &Path, index: &ExplorerIndex) -> Option<(UnitG
     let (enriched, cargo_report) = enrich_with_cargo(root, index, &mut units, &mut edges);
 
     let dependency_kinds = [RelationKind::PathDependency, RelationKind::CrateDependency];
-    for pass in [&dependency_kinds[..], &[RelationKind::DocLink][..]] {
+    let doc_kinds = [RelationKind::DocLink];
+    for pass in [&dependency_kinds[..], &doc_kinds[..]] {
         for relation in index
             .relations
             .iter()
@@ -1024,44 +1025,61 @@ fn directory_unit(root: &Path, dir: PathBuf) -> AnalysisUnit {
 
 // ── Plan-Bausteine ───────────────────────────────────────────────────────────
 
-/// Bildet den Plan-Knoten-Bezeichner eines Crates.
+/// Bildet den Plan-Knoten-Bezeichner einer Einheit.
 ///
 /// # Beschreibung
-/// Der Bezeichner trägt den Clan, dem der Knoten gehört: `research-<crate>`.
+/// Der Bezeichner trägt den Clan, dem der Knoten gehört: `research-<einheit>`.
 /// Das ist keine Kosmetik, sondern die Bedingung dafür, dass die Zelle des
 /// Research-Clans ihn überhaupt finden kann — `CellPlan::from_cell` wählt
 /// Mitglieder über einen Glob gegen die `TaskId` und den `write_scope`, und ein
 /// Analyse-Knoten hat keinen `write_scope`. Der Präfix kommt deshalb aus
 /// [`RESEARCH_CLAN_ID`] und nicht aus einem Literal: ändert sich die Clan-ID der
 /// eingebauten Organisation, ändern sich die Knotennamen mit.
-fn node_id(crate_name: &str) -> String {
-    format!("{RESEARCH_CLAN_ID}-{crate_name}")
+///
+/// Einheiten-Namen sind nicht mehr auf Crate-Namen beschränkt (`@scope/pkg`,
+/// Pfade, Leerzeichen); jedes Zeichen außer ASCII-Alphanumerik, `-`, `_` und
+/// `.` wird deshalb zu `-`, damit kein `/` den Glob der Zelle bricht. Für
+/// Crate-Namen ist die Abbildung die Identität.
+fn node_id(unit_name: &str) -> String {
+    let slug: String = unit_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("{RESEARCH_CLAN_ID}-{slug}")
 }
 
-/// Bildet den Lesebereich eines Crates relativ zur Workspace-Wurzel.
+/// Bildet den Lesebereich einer Einheit relativ zur Wurzel.
 ///
-/// Fällt auf den Crate-Namen zurück, wenn das Verzeichnis nicht unterhalb der
-/// Wurzel liegt — dann ist der Name die einzige Kennung, die der Knoten hat.
-fn read_scope_for(root: &Path, crate_node: &CrateNode) -> String {
-    match crate_node.dir.strip_prefix(root) {
-        Ok(relative) if !relative.as_os_str().is_empty() => format!("{}/**", relative.display()),
-        _ => format!("{}/**", crate_node.name),
+/// Die Wurzel-Einheit selbst liest `**`. Fällt auf den Namen zurück, wenn das
+/// Verzeichnis nicht unterhalb der Wurzel liegt — dann ist der Name die
+/// einzige Kennung, die der Knoten hat.
+fn read_scope_for(root: &Path, unit: &AnalysisUnit) -> String {
+    match unit.dir.strip_prefix(root) {
+        Ok(relative) if relative.as_os_str().is_empty() => "**".to_owned(),
+        Ok(relative) => format!("{}/**", path_key(relative)),
+        Err(_) => format!("{}/**", unit.name),
     }
 }
 
-/// Baut den `Analysis`-Knoten eines Crates.
+/// Baut den `Analysis`-Knoten einer Einheit.
 ///
 /// `created_at`/`updated_at` werden vom Plan-Store überschrieben (Design-Doc
 /// §7); die hier gesetzten Werte sind nur Platzhalter für den Typ.
-fn analysis_node(root: &Path, crate_node: &CrateNode, dependencies: Vec<TaskId>) -> PlanNode {
+fn analysis_node(root: &Path, unit: &AnalysisUnit, dependencies: Vec<TaskId>) -> PlanNode {
     let now = offset_from_timestamp(jiff::Timestamp::now());
     PlanNode {
-        id: TaskId::new(node_id(&crate_node.name)),
-        objective: format!("Bottom-up-Analyse von {}", crate_node.name),
+        id: TaskId::new(node_id(&unit.name)),
+        objective: format!("Bottom-up-Analyse von {}", unit.name),
         dependencies,
         input_contracts: Vec::new(),
         output_contracts: Vec::new(),
-        read_scope: vec![PathOrSymbol::new(read_scope_for(root, crate_node))],
+        read_scope: vec![PathOrSymbol::new(read_scope_for(root, unit))],
         write_scope: Vec::new(),
         forbidden_scope: Vec::new(),
         acceptance_criteria: Vec::new(),
@@ -1069,7 +1087,7 @@ fn analysis_node(root: &Path, crate_node: &CrateNode, dependencies: Vec<TaskId>)
         status: PlanNodeStatus::Draft,
         evidence: Vec::new(),
         kind: PlanNodeKind::Analysis,
-        wave: Some(crate_node.level),
+        wave: Some(unit.level),
         assignment: None,
         parent: None,
         created_at: now,
@@ -1082,7 +1100,7 @@ fn synthesis_node(dependencies: Vec<TaskId>) -> PlanNode {
     let now = offset_from_timestamp(jiff::Timestamp::now());
     PlanNode {
         id: TaskId::new(SYNTHESIS_NODE_ID),
-        objective: "Verdichtung der Crate-Analysen zu einem Workspace-Bild".to_owned(),
+        objective: "Verdichtung der Einheiten-Analysen zu einem Gesamtbild".to_owned(),
         dependencies,
         input_contracts: Vec::new(),
         output_contracts: Vec::new(),
@@ -1102,67 +1120,186 @@ fn synthesis_node(dependencies: Vec<TaskId>) -> PlanNode {
     }
 }
 
-/// Baut die gebundene Frage an das Analyst-Kind eines Crates.
+/// Sprachspezifische Hinweise für den Analyse-Prompt.
+///
+/// Jede Angabe ist ein kurzer Einschub, den [`analysis_question`] in die
+/// sprachneutral formulierten fünf Punkte einsetzt.
+struct LanguageHints {
+    /// Sprache/Ökosystem für die Anzeige.
+    language: &'static str,
+    /// Was hier als öffentliche Oberfläche zählt.
+    api: &'static str,
+    /// Sprachübliche Platzhalter- und Stub-Marker.
+    markers: &'static str,
+    /// Sprachübliche Doku-Kommentare.
+    docs: &'static str,
+}
+
+/// Liefert die Hinweise zu einer Projektart; `None` für Dokumentsammlungen
+/// und Arten ohne eigene Sprache.
+fn language_hints(kind: ProjectKind) -> Option<LanguageHints> {
+    match kind {
+        ProjectKind::CargoCrate | ProjectKind::CargoWorkspace => Some(LanguageHints {
+            language: "Rust",
+            api: "jedes `pub`-Item",
+            markers: "`todo!()`, `unimplemented!()`",
+            docs: "`//!`/`///`",
+        }),
+        ProjectKind::Node => Some(LanguageHints {
+            language: "JavaScript/TypeScript",
+            api: "jede `export`-Deklaration sowie die Einstiegspunkte aus `package.json` \
+                  (`main`, `exports`, `bin`)",
+            markers: "`throw new Error(\"not implemented\")` und ähnliche Platzhalter-Würfe",
+            docs: "JSDoc/TSDoc `/** … */`",
+        }),
+        ProjectKind::Python => Some(LanguageHints {
+            language: "Python",
+            api: "jeder Name auf Modulebene ohne führenden Unterstrich bzw. laut `__all__`, \
+                  sowie Kommandozeilen-Einstiegspunkte",
+            markers: "`raise NotImplementedError`, Rümpfe aus nur `pass` oder `...`",
+            docs: "Docstrings",
+        }),
+        ProjectKind::Go => Some(LanguageHints {
+            language: "Go",
+            api: "jeder exportierte (großgeschriebene) Bezeichner",
+            markers: "`panic(\"not implemented\")` und ähnliche Platzhalter",
+            docs: "Kommentare direkt vor Deklarationen und `doc.go`",
+        }),
+        ProjectKind::Git | ProjectKind::Documents => None,
+    }
+}
+
+/// Baut die gebundene Frage an das Analyst-Kind einer Einheit.
 ///
 /// # Beschreibung
 /// Die Frage ist absichtlich nummeriert und abschließend: das Kind soll nicht
-/// „das Crate anschauen", sondern fünf benannte Dinge liefern. Der Scope
-/// begrenzt es auf das Crate-Verzeichnis; die Konsumentenliste steht schon in
-/// der Frage, damit das Kind sie nicht selbst erlaufen muss.
+/// „die Einheit anschauen", sondern fünf benannte Dinge liefern. Der Text ist
+/// sprachneutral; die sprachüblichen Begriffe (öffentliche Oberfläche,
+/// Stub-Marker, Doku-Kommentare) kommen aus [`language_hints`] der erkannten
+/// Projektarten, für reine Verzeichnisse aus einer allgemeinen Aufzählung. Eine
+/// Dokumentsammlung bekommt Punkte, die auf Dokumente passen. Der Scope
+/// begrenzt das Kind auf das Verzeichnis der Einheit; eigenständig analysierte
+/// verschachtelte Einheiten werden ausdrücklich ausgenommen, und die
+/// Konsumentenliste steht schon in der Frage.
 fn analysis_question(
     root: &Path,
-    crate_node: &CrateNode,
-    consumers: &[&CrateNode],
+    unit: &AnalysisUnit,
+    consumers: &[&AnalysisUnit],
+    nested: &[&AnalysisUnit],
 ) -> ResearchQuestion {
-    let consumer_names: Vec<&str> = consumers.iter().map(|node| node.name.as_str()).collect();
+    let consumer_names: Vec<&str> = consumers.iter().map(|other| other.name.as_str()).collect();
     let consumer_hint = if consumer_names.is_empty() {
-        "Keine Workspace-Crate konsumiert es (Stand Graph).".to_owned()
+        "Keine andere Einheit des Arbeitsbereichs benutzt sie (Stand Graph).".to_owned()
     } else {
         format!(
-            "Laut Graph konsumieren es: {}. Prüfe für jedes, welche Symbole es tatsächlich \
-             benutzt.",
+            "Laut Graph benutzen sie: {}. Prüfe für jede, was sie tatsächlich davon verwendet.",
             consumer_names.join(", ")
         )
     };
-    // Pseudo-Crates aus `synthesize_directory_graph` tragen keine
-    // `manifest_path` — dann ist "Verzeichnis" die ehrliche Bezeichnung.
-    let noun = if crate_node.manifest_path.as_os_str().is_empty() {
-        "Verzeichnis"
+    let nested_hint = if nested.is_empty() {
+        String::new()
     } else {
-        "Crate"
+        let entries: Vec<String> = nested
+            .iter()
+            .map(|other| format!("`{}` ({})", other.rel_display(), other.name))
+            .collect();
+        format!(
+            "Verschachtelte Einheiten werden eigenständig analysiert und gehören nicht zu \
+             dieser Analyse: {}.\n",
+            entries.join(", ")
+        )
+    };
+
+    let hints: Vec<LanguageHints> = unit.kinds.iter().copied().filter_map(language_hints).collect();
+    let is_documents = hints.is_empty() && unit.kinds.contains(&ProjectKind::Documents);
+    let description = match unit.kinds.first() {
+        Some(_) => {
+            let labels: Vec<&str> = unit.kinds.iter().map(|kind| kind.label()).collect();
+            format!("Einheit `{}` (Projektart {})", unit.name, labels.join(" + "))
+        }
+        None => format!("Verzeichnis `{}`", unit.name),
+    };
+    let version = unit
+        .version
+        .as_deref()
+        .map(|version| format!("Version {version}, "))
+        .unwrap_or_default();
+    let header = format!(
+        "Analysiere {description} (Pfad `{path}`, {version}Ebene {level}) vollständig und liefere \
+         genau diese fünf Punkte:\n",
+        path = unit.rel_display(),
+        level = unit.level,
+    );
+
+    let points = if is_documents {
+        format!(
+            "1. Inhalt: jedes Dokument mit Titel, Zweck und Kernaussagen, gruppiert nach \
+                Unterordner.\n\
+             2. Konsumenten: welche anderen Einheiten auf diese Dokumente verweisen und wofür. \
+                {consumer_hint}\n\
+             3. Lücken: jedes `TODO`, `FIXME`, `TBD`, jeder leere oder als Platzhalter \
+                markierte Abschnitt.\n\
+             4. Querverweise: welche Dokumente aufeinander verweisen und welche Links ins \
+                Leere zeigen.\n\
+             5. Widersprüche: jede Stelle, an der zwei Dokumente (oder ein Dokument und der \
+                Stand des Arbeitsbereichs) einander widersprechen.\n"
+        )
+    } else {
+        let (api, markers, docs) = if hints.is_empty() {
+            (
+                "alles, was von außen benutzt werden soll — öffentliche bzw. exportierte \
+                 Symbole in der jeweiligen Sprache, Einstiegspunkte, Kommandos, Schnittstellen"
+                    .to_owned(),
+                "sprachübliche Platzhalter (z. B. `todo!()`, `raise NotImplementedError`, \
+                 `throw new Error(\"not implemented\")`, `panic(\"not implemented\")`)"
+                    .to_owned(),
+                "Doku-Kommentare/Docstrings".to_owned(),
+            )
+        } else {
+            let join = |pick: fn(&LanguageHints) -> &'static str| -> String {
+                hints
+                    .iter()
+                    .map(|hint| format!("{}: {}", hint.language, pick(hint)))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            (
+                join(|hint| hint.api),
+                join(|hint| hint.markers),
+                join(|hint| hint.docs),
+            )
+        };
+        format!(
+            "1. Öffentliche Oberfläche ({api}) mit Signatur bzw. Fundstelle, gruppiert nach \
+                Modul oder Datei, und wofür sie da ist.\n\
+             2. Konsumenten: welche anderen Einheiten des Arbeitsbereichs diese benutzen und \
+                was sie davon verwenden. {consumer_hint}\n\
+             3. Stubs und Lücken: jedes `TODO`, `FIXME`, `XXX`, `HACK`, jeder Platzhalter \
+                ({markers}), jede Funktion, die einen Platzhalterwert liefert, und jeder \
+                Fehlerfall, der nie ausgelöst wird.\n\
+             4. Testabdeckung: welche öffentlichen Teile haben Tests, welche nicht, und welche \
+                Tests prüfen nur, dass nichts abstürzt.\n\
+             5. Abweichungen zwischen Doku und Verhalten: jede Stelle, an der Dokumentation \
+                ({docs}; README und weitere Markdown-Dateien) etwas behauptet, das der Code \
+                nicht tut.\n"
+        )
     };
 
     ResearchQuestion {
-        id: QuestionId::new(node_id(&crate_node.name)),
+        id: QuestionId::new(node_id(&unit.name)),
         question: format!(
-            "Analysiere das {noun} `{name}` (Version {version}, Ebene {level}) vollständig und \
-             liefere genau diese fünf Punkte:\n\
-             1. Öffentliche API: jedes `pub`-Item mit Signatur, gruppiert nach Modul, und wofür \
-                es da ist.\n\
-             2. Konsumenten: welche Workspace-Crates dieses Crate benutzen und welche Symbole \
-                sie davon ziehen. {consumer_hint}\n\
-             3. Stubs und Lücken: jedes `todo!()`, `unimplemented!()`, `TODO`, `FIXME`, jede \
-                Funktion, die einen Platzhalterwert liefert, und jede Fehlervariante, die nie \
-                erzeugt wird.\n\
-             4. Testabdeckung: welche öffentlichen Funktionen haben Tests, welche nicht, und \
-                welche Tests prüfen nur, dass nichts panickt.\n\
-             5. Abweichungen zwischen Doku und Verhalten: jede Stelle, an der `//!`- oder \
-                `///`-Dokumentation etwas behauptet, das der Code nicht tut.\n\
-             Belege jede Aussage mit Dateipfad und Zeilenbereich.",
-            name = crate_node.name,
-            version = crate_node.version,
-            level = crate_node.level,
+            "{header}{points}{nested_hint}Belege jede Aussage mit Dateipfad und Zeilenbereich."
         ),
         scope: QuestionScope {
-            paths: vec![read_scope_for(root, crate_node)],
-            crates: vec![crate_node.name.clone()],
+            paths: vec![read_scope_for(root, unit)],
+            crates: unit.cargo_name.iter().cloned().collect(),
             urls: Vec::new(),
             sources: vec![SourceClass::LocalSource],
         },
         expected_output: ANALYSIS_EXPECTED_OUTPUT.to_owned(),
         freshness: Freshness::AnyTime,
         stop_condition: ANALYSIS_STOP_CONDITION.to_owned(),
-        owner_task: Some(node_id(&crate_node.name)),
+        owner_task: Some(node_id(&unit.name)),
     }
 }
 

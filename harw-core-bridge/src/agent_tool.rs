@@ -1777,8 +1777,9 @@ fn paused_child_result(
 ///
 /// Muss mit `KNOWN_AUTHORITY_REDUCERS` in `harw-macros/src/operation.rs`
 /// übereinstimmen (das Makro weist unbekannte Kennungen zur Compile-Zeit ab).
-/// Die Kennungen `reduce_to_read_only`, `reduce_to_read_registry` und
-/// `reduce_to_read_network` sind wortgleich mit
+/// Die Kennungen `reduce_to_read_only`, `reduce_to_read_registry`,
+/// `reduce_to_read_network`, `reduce_to_read_explore` und
+/// `reduce_to_read_workspace_network` sind wortgleich mit
 /// `harw_registry_defaults::authority::REDUCE_TO_READ_*` (W5/RD), ebenso ihre
 /// Permission-Obergrenzen (siehe [`reducer_ceiling`]).
 const KNOWN_AUTHORITY_REDUCERS: &[&str] = &[
@@ -1786,6 +1787,8 @@ const KNOWN_AUTHORITY_REDUCERS: &[&str] = &[
     "reduce_to_read_execute",
     "reduce_to_read_registry",
     "reduce_to_read_network",
+    "reduce_to_read_explore",
+    "reduce_to_read_workspace_network",
 ];
 
 /// Liefert die Permission-Obergrenze einer bekannten Reducer-Kennung.
@@ -1804,10 +1807,18 @@ const KNOWN_AUTHORITY_REDUCERS: &[&str] = &[
 /// | `reduce_to_read_execute` | `{ReadWorkspace, ExecuteProcess}` (nur Bridge) |
 /// | `reduce_to_read_registry` | `{ReadWorkspace, ReadCargoRegistry}` |
 /// | `reduce_to_read_network` | `{NetworkAccess}` — **ohne** `ReadWorkspace` |
+/// | `reduce_to_read_explore` | `{ReadWorkspace, ReadCargoRegistry, NetworkAccess}` |
+/// | `reduce_to_read_workspace_network` | `{ReadWorkspace, NetworkAccess}` |
 ///
 /// `reduce_to_read_network` liest den Workspace absichtlich nicht: ein Kind mit
 /// Netz und Workspace-Lesezugriff könnte Workspace-Daten über Anfrageparameter
-/// hinaustragen (Plan-Annahme A5).
+/// hinaustragen (Plan-Annahme A5). Die zwei Explorer-Kennungen sind die
+/// bewusste Ausnahme (Nutzerentscheidung „der Explorer durchsucht auch das
+/// Internet“) für genau die Rollen, deren TOML `web.fetch`/`web.search`
+/// admittiert (`explorer`, `uia-explorer`); ihr Host-Scope bleibt wie bei
+/// `reduce_to_read_network` an den egress-gebundenen Scope des Parents
+/// gebunden. `reduce_to_read_registry` (`analyst`, `researcher-deps`,
+/// `planner`) bleibt ohne Netz.
 ///
 /// # Returns
 /// `Some(PermissionSet)` für eine bekannte Kennung, sonst `None`.
@@ -1817,6 +1828,14 @@ fn reducer_ceiling(name: &str) -> Option<PermissionSet> {
         "reduce_to_read_execute" => &[Permission::ReadWorkspace, Permission::ExecuteProcess],
         "reduce_to_read_registry" => &[Permission::ReadWorkspace, Permission::ReadCargoRegistry],
         "reduce_to_read_network" => &[Permission::NetworkAccess],
+        "reduce_to_read_explore" => &[
+            Permission::ReadWorkspace,
+            Permission::ReadCargoRegistry,
+            Permission::NetworkAccess,
+        ],
+        "reduce_to_read_workspace_network" => {
+            &[Permission::ReadWorkspace, Permission::NetworkAccess]
+        }
         _ => return None,
     };
     Some(PermissionSet::from_policy(permissions.iter().copied()))
@@ -1858,6 +1877,8 @@ fn resolve_authority_reducer(name: &str) -> fn(&SandboxSpec) -> SandboxSpec {
         "reduce_to_read_execute" => reduce_to_read_execute,
         "reduce_to_read_registry" => reduce_to_read_registry,
         "reduce_to_read_network" => reduce_to_read_network,
+        "reduce_to_read_explore" => reduce_to_read_explore,
+        "reduce_to_read_workspace_network" => reduce_to_read_workspace_network,
         unknown => {
             tracing::warn!(
                 unknown,
@@ -1899,7 +1920,7 @@ fn reduce_to_read_execute(parent: &SandboxSpec) -> SandboxSpec {
 /// Reduziert eine Sandbox auf lesende Workspace- und Registry-Quellen.
 ///
 /// Schnittmenge mit `{ ReadWorkspace, ReadCargoRegistry }`, Host-Scope geleert
-/// (explorer, analyst, researcher-deps, planner laut W5/RD).
+/// (analyst, researcher-deps, planner laut W5/RD; bewusst ohne Netz).
 /// `ReadCargoRegistry` bleibt nur, wenn der Parent es selbst hat.
 fn reduce_to_read_registry(parent: &SandboxSpec) -> SandboxSpec {
     restrict_without_network(parent, "reduce_to_read_registry")
@@ -1910,15 +1931,43 @@ fn reduce_to_read_registry(parent: &SandboxSpec) -> SandboxSpec {
 /// Schnittmenge mit `{ NetworkAccess }` (researcher-web laut W5/RD). Der
 /// Host-Scope des Parents bleibt als Obergrenze unverändert (`restrict`);
 /// verengt wird er von der Composition (`researcher_web_network_scope`), nie
-/// erweitert. `NetworkAccess` bleibt nur, wenn der Parent es selbst hat.
+/// erweitert. `NetworkAccess` bleibt nur, wenn der Parent es selbst hat
+/// (siehe [`restrict_with_parent_network`]).
+fn reduce_to_read_network(parent: &SandboxSpec) -> SandboxSpec {
+    restrict_with_parent_network(parent, "reduce_to_read_network")
+}
+
+/// Reduziert eine Sandbox auf lesende Workspace- und Registry-Quellen plus
+/// ausgehendes Netz (explorer mit Websuche).
+///
+/// Schnittmenge mit `{ ReadWorkspace, ReadCargoRegistry, NetworkAccess }`;
+/// der Host-Scope des Parents (egress-gebunden) bleibt Obergrenze, wie bei
+/// [`reduce_to_read_network`]. Jedes Recht bleibt nur, wenn der Parent es
+/// selbst hat.
+fn reduce_to_read_explore(parent: &SandboxSpec) -> SandboxSpec {
+    restrict_with_parent_network(parent, "reduce_to_read_explore")
+}
+
+/// Reduziert eine Sandbox auf lesenden Workspace-Zugriff plus ausgehendes
+/// Netz (uia-explorer mit Websuche).
+///
+/// Schnittmenge mit `{ ReadWorkspace, NetworkAccess }`; Host-Scope wie bei
+/// [`reduce_to_read_network`].
+fn reduce_to_read_workspace_network(parent: &SandboxSpec) -> SandboxSpec {
+    restrict_with_parent_network(parent, "reduce_to_read_workspace_network")
+}
+
+/// Schneidet `parent` auf die Obergrenze einer Kennung mit Netzrecht und
+/// reicht den Host-Scope des Parents als Obergrenze durch.
 ///
 /// `PermissionRequest::from_permissions` setzt `network_scope` standardmäßig
 /// auf `NetworkScope::empty()`, und `restrict` schneidet immer nur (leer ∩
 /// irgendwas = leer). Ohne den expliziten `.with_network_scope(...)`-Aufruf
-/// unten würde dieser Reduzierer den Host-Scope des Parents also entgegen der
-/// Doku oben stets leeren, statt ihn als Obergrenze durchzureichen.
-fn reduce_to_read_network(parent: &SandboxSpec) -> SandboxSpec {
-    let ceiling = reducer_ceiling("reduce_to_read_network").unwrap_or_else(PermissionSet::empty);
+/// würde der Host-Scope des Parents stets geleert, statt ihn als Obergrenze
+/// durchzureichen. Erweitert wird er nie: die Composition verengt ihn
+/// höchstens (`researcher_web_network_scope`).
+fn restrict_with_parent_network(parent: &SandboxSpec, name: &str) -> SandboxSpec {
+    let ceiling = reducer_ceiling(name).unwrap_or_else(PermissionSet::empty);
     parent.restrict(
         &PermissionRequest::from_permissions(ceiling.iter())
             .with_network_scope(parent.network_scope().clone()),
@@ -4296,14 +4345,43 @@ contract = "{contract}"
             Some(set(&[Permission::NetworkAccess])),
             "W5/RD: die Netz-Obergrenze enthält kein ReadWorkspace"
         );
+        assert_eq!(
+            reducer_ceiling("reduce_to_read_explore"),
+            Some(set(&[
+                Permission::ReadWorkspace,
+                Permission::ReadCargoRegistry,
+                Permission::NetworkAccess
+            ]))
+        );
+        assert_eq!(
+            reducer_ceiling("reduce_to_read_workspace_network"),
+            Some(set(&[Permission::ReadWorkspace, Permission::NetworkAccess]))
+        );
+        // Netz tragen nur die Netz-Kennungen; `reduce_to_read_registry`
+        // (analyst, researcher-deps) bleibt ohne Netz.
+        for name in KNOWN_AUTHORITY_REDUCERS {
+            let networked = reducer_ceiling(name)
+                .is_some_and(|ceiling| ceiling.contains(Permission::NetworkAccess));
+            assert_eq!(
+                networked,
+                matches!(
+                    *name,
+                    "reduce_to_read_network"
+                        | "reduce_to_read_explore"
+                        | "reduce_to_read_workspace_network"
+                ),
+                "{name}"
+            );
+        }
         assert_eq!(reducer_ceiling("reduce_ro"), None);
         for name in KNOWN_AUTHORITY_REDUCERS {
             assert!(reducer_ceiling(name).is_some(), "{name} ohne Obergrenze");
         }
     }
 
-    /// `reduce_to_read_network` reicht die Parent-Hosts unverändert durch,
-    /// während die drei anderen Reduzierer den Host-Scope leeren. Der Parent
+    /// `reduce_to_read_network` (und die zwei Explorer-Kennungen) reichen die
+    /// Parent-Hosts unverändert durch, während die drei anderen Reduzierer den
+    /// Host-Scope leeren. Der Parent
     /// trägt hierfür über `SandboxSpec::from_resolved_for_test` (Feature
     /// `test-support` von `harw-authority`, nur in `[dev-dependencies]`) eine
     /// echte, nicht-leere Host-Allow-Liste — vorher konnte von außerhalb von
@@ -4328,6 +4406,34 @@ contract = "{contract}"
         assert!(
             network.network_scope().allows("docs.rs"),
             "reduce_to_read_network muss die Parent-Hosts durchreichen"
+        );
+
+        for name in ["reduce_to_read_explore", "reduce_to_read_workspace_network"] {
+            let child = resolve_authority_reducer(name)(&parent);
+            assert!(
+                child.permissions().contains(Permission::ReadWorkspace),
+                "{name}"
+            );
+            assert!(
+                child.permissions().contains(Permission::NetworkAccess),
+                "{name}"
+            );
+            assert_eq!(
+                child.network_scope(),
+                parent.network_scope(),
+                "{name}: Host-Scope bleibt an den Parent gebunden"
+            );
+            assert!(!child.network_scope().allows("example.org"), "{name}");
+        }
+        assert!(
+            resolve_authority_reducer("reduce_to_read_explore")(&parent)
+                .permissions()
+                .contains(Permission::ReadCargoRegistry)
+        );
+        assert!(
+            !resolve_authority_reducer("reduce_to_read_workspace_network")(&parent)
+                .permissions()
+                .contains(Permission::ReadCargoRegistry)
         );
 
         for name in [

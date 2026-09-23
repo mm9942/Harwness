@@ -1599,9 +1599,14 @@ mod tests {
         assert_eq!(trace.len(), 1);
 
         // Wiederholte identische Statusmeldungen werden zusammengefasst.
+        // (Der volle Text-Eintrag fällt dabei wegen der Byte-Grenze heraus.)
         trace.push_status("x");
         trace.push_status("x");
-        assert_eq!(trace.len(), 2);
+        assert_eq!(trace.len(), 1);
+        assert_eq!(
+            trace.entries().last(),
+            Some(&TraceEntry::Status("x".into()))
+        );
         Ok(())
     }
 
