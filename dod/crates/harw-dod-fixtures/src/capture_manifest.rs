@@ -374,7 +374,9 @@ fn lexically_resolve_under_root(
 ///
 /// # Errors
 /// [`io::ErrorKind::InvalidInput`] für einen Eintrag mit `..`-Segment
-/// (siehe [`resolve_under_root`]); jeder andere `io::Error`, den
+/// (siehe [`resolve_under_root`]) oder wenn unterhalb eines Symlinks
+/// geschrieben werden soll, dessen Ziel absolut ist bzw. `root` verlassen
+/// würde (siehe [`ensure_dir_under_root`]); jeder andere `io::Error`, den
 /// `fs::create_dir_all`, `fs::write`, `fs::remove_file` oder
 /// `std::os::unix::fs::symlink` liefern (z. B. fehlende Berechtigung).
 ///
@@ -547,6 +549,38 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_materialize_rejects_symlink_target_escaping_root() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let manifest = CaptureManifest {
+            kernel: "test".to_owned(),
+            captured_at: "2026-01-01T00:00:00Z".to_owned(),
+            entries: vec![
+                CaptureEntry {
+                    path: "/sys/evil".to_owned(),
+                    kind: CaptureEntryKind::Symlink {
+                        target: "../../../outside".to_owned(),
+                    },
+                },
+                CaptureEntry {
+                    path: "/sys/evil/file".to_owned(),
+                    kind: CaptureEntryKind::File {
+                        content: "escape".to_owned(),
+                    },
+                },
+            ],
+        };
+
+        let result = materialize(&manifest, dir.path());
+        let Err(err) = result else {
+            return Err(TestError::Unexpected(
+                "Schreiben durch einen aus root führenden Symlink muss scheitern".to_owned(),
+            ));
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         Ok(())
     }
 
