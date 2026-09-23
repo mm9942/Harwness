@@ -135,7 +135,8 @@ use std::time::{Duration, Instant};
 use harw_authority::{Permission, PermissionRequest, PermissionSet, SandboxSpec};
 use harw_core::cancel::CancelToken;
 use harw_core::child_controller::{
-    AgentBudget, ChildRegistryFactory, ChildRunResult, JoinSemantics, ManagedAgentSpawner,
+    AgentBudget, CHILD_RETURN_MAX_BYTES, ChildRegistryFactory, ChildRunResult, JoinSemantics,
+    ManagedAgentSpawner, cap_child_return_text,
 };
 use harw_core::turn_loop::{TurnInput, TurnOutcome};
 use harw_core::{ModelMessage, StateStore};
@@ -387,8 +388,9 @@ impl AgentToolAdapter {
     ///   sowie optional `ManagedAgentSpawner`, `StateStore` und
     ///   `Arc<dyn ChildRegistryFactory>`.
     /// - `args` (`serde_json::Value`): JSON-Argumente aus dem Modell-Tool-Call.
-    ///   Werden unverändert als `context` in `SpawnInput` sowie als Text
-    ///   (`args.to_string()`) im initialen Child-Turn übergeben.
+    ///   Werden unverändert als `context` in `SpawnInput`, als Auftrag
+    ///   (`SpawnInput::instructions`) sowie als Text (`args.to_string()`) im
+    ///   initialen Child-Turn übergeben.
     ///
     /// # Returns
     /// - `Ok(OpOutput)` mit dem kanonisch serialisierten JSON des validierten
@@ -501,7 +503,9 @@ impl AgentToolAdapter {
             let spawn_input = harw_extension_api::SpawnInput {
                 parent_session_id: ctx.session_id().clone(),
                 handoff_call_id: harw_types::ToolCallId::new(),
-                instructions: None,
+                // Der Auftrag des Kindes: derselbe Argument-Text, der auch als
+                // initialer Turn-Input übergeben wird (siehe unten).
+                instructions: Some(task_instructions(&args)),
                 context: args.clone(),
                 // This tool declares no ceiling demand of its own: the child
                 // simply inherits whatever ceiling its parent already
@@ -621,11 +625,13 @@ impl AgentToolAdapter {
                         // Rückwärtskompatibel: der Freitext des Kindes geht
                         // unverändert (und ohne JSON-Quoting) an das Parent-Modell.
                         ChildReturnContract::Text => {
-                            completed_child_output(spawner.child_final_assistant_text(&child))
+                            completed_child_output(plain_child_return_text(spawner, &run_result))
                         }
+                        // Typisierte Contracts parsen den ungekürzten Text: ein
+                        // gekürztes JSON wäre sonst ein falscher Vertragsbruch.
                         typed => {
                             let text =
-                                spawner.child_final_assistant_text(&child).map_err(|error| {
+                                full_child_return_text(spawner, &run_result).map_err(|error| {
                                     OpError::NotAvailable(format!(
                                         "Child-Agent-Abschlussantwort nicht verfügbar: {error}"
                                     ))
@@ -968,6 +974,64 @@ fn ensure_owned_child_target(
         Ok(())
     } else {
         Err(OpError::NotAvailable(CHILD_TARGET_UNAVAILABLE.to_owned()))
+    }
+}
+
+/// Leitet den Auftragstext (`SpawnInput::instructions`) eines Kindes aus
+/// seinen Tool-Argumenten bzw. seiner Frage ab.
+///
+/// # Arguments
+/// - `args` (`&Value`): Tool-Argumente bzw. gestellte Frage.
+///
+/// # Returns
+/// Einen JSON-String unverändert (ohne JSON-Quoting) als Text, jeden anderen
+/// Wert als kompaktes JSON — für Objekte identisch zum Text des initialen
+/// Kind-Turns.
+fn task_instructions(args: &Value) -> String {
+    match args {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Liefert den **ungekürzten** Abschlusstext eines Kindes für typisierte
+/// Contracts.
+///
+/// # Description
+/// Bevorzugt [`ChildRunResult::full_text`] (vom Controller ungekürzt
+/// mitgeliefert); fehlt er (`None`), fällt die Funktion auf
+/// [`ManagedAgentSpawner::child_final_assistant_text`] zurück.
+///
+/// # Errors
+/// [`harw_extension_api::AgentSpawnError`], wenn kein `full_text` vorliegt
+/// und der Spawner keine Abschlussantwort liefern kann.
+fn full_child_return_text(
+    spawner: &ManagedAgentSpawner,
+    result: &ChildRunResult,
+) -> Result<String, harw_extension_api::AgentSpawnError> {
+    match &result.full_text {
+        Some(text) => Ok(text.clone()),
+        None => spawner.child_final_assistant_text(&result.child),
+    }
+}
+
+/// Liefert den Abschlusstext eines Kindes für den Freitext-Contract
+/// ([`ChildReturnContract::Text`]), gekappt auf [`CHILD_RETURN_MAX_BYTES`].
+///
+/// # Description
+/// Liegt [`ChildRunResult::full_text`] vor, wird er hier über
+/// [`cap_child_return_text`] gekappt; sonst gilt der Text von
+/// [`ManagedAgentSpawner::child_final_assistant_text`] unverändert.
+///
+/// # Errors
+/// Wie [`full_child_return_text`].
+fn plain_child_return_text(
+    spawner: &ManagedAgentSpawner,
+    result: &ChildRunResult,
+) -> Result<String, harw_extension_api::AgentSpawnError> {
+    match &result.full_text {
+        Some(text) => Ok(cap_child_return_text(text, CHILD_RETURN_MAX_BYTES)),
+        None => spawner.child_final_assistant_text(&result.child),
     }
 }
 
@@ -2178,7 +2242,9 @@ async fn run_fanout_slot(
     let spawn_input = harw_extension_api::SpawnInput {
         parent_session_id: shared.ctx.session_id().clone(),
         handoff_call_id: harw_types::ToolCallId::new(),
-        instructions: None,
+        // Der Auftrag des Kindes: dieselbe Frage, die auch als initialer
+        // Turn-Input übergeben wird (siehe unten).
+        instructions: Some(task_instructions(question)),
         context: question.clone(),
         // This fan-out tool declares no ceiling demand of its own: each
         // question-child simply inherits whatever ceiling its parent
@@ -2371,14 +2437,14 @@ async fn fanout_child_value(
         ));
     }
 
-    let text = spawner
-        .child_final_assistant_text(&result.child)
-        .map_err(|error| {
-            format!(
-                "Child-Agent-Abschlussantwort von '{}' nicht verfügbar: {error}",
-                result.child
-            )
-        })?;
+    // Typisierte Contracts parsen den ungekürzten Text (`full_text`), damit
+    // ein langes, gültiges JSON nicht an der Rückgabe-Kappung zerbricht.
+    let text = full_child_return_text(spawner, result).map_err(|error| {
+        format!(
+            "Child-Agent-Abschlussantwort von '{}' nicht verfügbar: {error}",
+            result.child
+        )
+    })?;
     let value =
         evaluate_with_repair(spawner, store, contract, &result.child, budget, &text).await?;
     if contract == ChildReturnContract::ResearchFinding {
@@ -2404,7 +2470,15 @@ async fn fanout_child_value(
 /// `release_notes`/`standard`/`web`, die ein Kind auch ohne lokale
 /// Werkzeuge (aus Trainingswissen oder mitgelieferten Web-Belegen) kennen
 /// darf.
-const GROUNDED_EVIDENCE_KINDS: [&str; 2] = ["local_source", "cargo_registry_source"];
+///
+/// `package_registry_source` ist die sprachneutrale Form (npm, PyPI, crates.io,
+/// Maven, …); `cargo_registry_source` bleibt aus Kompatibilitätsgründen
+/// erhalten.
+const GROUNDED_EVIDENCE_KINDS: [&str; 3] = [
+    "local_source",
+    "package_registry_source",
+    "cargo_registry_source",
+];
 
 /// Ob ein kanonisches `ResearchFinding`-JSON mindestens einen Beleg einer
 /// [`GROUNDED_EVIDENCE_KINDS`]-Art führt.
@@ -2502,7 +2576,7 @@ async fn evaluate_return_with_grounding(
         Ok(0) => Err(ContractViolation::new(
             contract,
             "Befund ohne Werkzeugaufruf — Belege nicht verifiziert (das Finding behauptet \
-             lokale Belege der Art local_source/cargo_registry_source, aber die Kind-Session \
+             lokale Belege der Art local_source/package_registry_source/cargo_registry_source, aber die Kind-Session \
              hat keinen einzigen Werkzeugaufruf ausgeführt)"
                 .to_owned(),
             text,
@@ -2617,7 +2691,7 @@ async fn evaluate_with_repair(
             repair_run.outcome
         ));
     }
-    let repaired_text = spawner.child_final_assistant_text(child).map_err(|error| {
+    let repaired_text = full_child_return_text(spawner, &repair_run).map_err(|error| {
         format!(
             "{} (nach 1 Reparaturversuch: Abschlussantwort nicht verfügbar: {error})",
             violation.to_message()
@@ -3613,6 +3687,8 @@ contract = "{contract}"
 
         assert!(claims_local_evidence(&local));
         assert!(claims_local_evidence(&registry));
+        let package = serde_json::json!({ "evidence": [{ "kind": "package_registry_source" }] });
+        assert!(claims_local_evidence(&package));
         assert!(!claims_local_evidence(&web));
         assert!(!claims_local_evidence(&empty));
         assert!(!claims_local_evidence(&missing));

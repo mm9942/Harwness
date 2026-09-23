@@ -836,6 +836,51 @@ fn apply_anthropic_credential(
     })
 }
 
+/// Übersetzt eine nicht-erfolgreiche Anthropic-Antwort in den
+/// `ModelError`-Vertrag.
+///
+/// # Description
+/// Nutzt dieselbe Klassifikation wie der OpenAI-kompatible Pfad
+/// ([`crate::error::model_error_for_status`] plus
+/// [`crate::error::retry_after_hint`] für `retry-after-ms`/`Retry-After`/
+/// Body-Hinweis): 529 (overloaded) und 408/5xx → `Transient`, 401/403 →
+/// `Auth`, Kontextlängen-/Kontingent-Fehler → `ContextLength`/
+/// `QuotaExceeded`, übrige 4xx → `RequestFailed`. Einzige Abweichung: ein
+/// kurzfristiges 429 wird wie bisher als [`ModelError::RateLimited`]
+/// gemeldet (ebenfalls retryable); ohne Wartehinweis gilt der Fallback von
+/// [`super::parse_retry_after`] (30 s).
+///
+/// # Arguments
+/// - `status` (`u16`): HTTP-Status.
+/// - `request_id` (`Option<&str>`): begrenzte Gateway-Request-ID.
+/// - `retry_after` (`Option<&str>`): Wert des `Retry-After`-Headers.
+/// - `retry_after_ms` (`Option<&str>`): Wert des `retry-after-ms`-Headers.
+/// - `body` (`&str`): unvertrauenswürdiger Antwort-Body (nie im Ergebnis).
+///
+/// # Returns
+/// Die passende [`ModelError`]-Variante.
+fn anthropic_error_for_status(
+    status: u16,
+    request_id: Option<&str>,
+    retry_after: Option<&str>,
+    retry_after_ms: Option<&str>,
+    body: &str,
+) -> ModelError {
+    let hint = crate::error::retry_after_hint(retry_after, retry_after_ms, body);
+    match crate::error::model_error_for_status(status, request_id, hint, body) {
+        ModelError::Transient {
+            status: Some(429),
+            retry_after_secs,
+            message,
+        } => ModelError::RateLimited {
+            retry_after_secs: retry_after_secs
+                .unwrap_or_else(|| super::parse_retry_after(retry_after, body).as_secs()),
+            message,
+        },
+        other => other,
+    }
+}
+
 impl AnthropicMessagesProvider {
     /// Sendet **einen** Versuch mit dem durch `credential_idx` gewählten
     /// Credential (siehe [`Self::request_target`]). Der eigentliche Körper
@@ -848,7 +893,12 @@ impl AnthropicMessagesProvider {
     /// Siehe [`ModelProvider::respond`]; zusätzlich [`ModelError::Auth`] bei
     /// HTTP 401/403 (zuvor Teil von [`ModelError::RequestFailed`] — die
     /// Unterscheidung ist nötig, damit `credential_pool::should_failover`
-    /// einen ungültigen/entzogenen Schlüssel erkennen kann).
+    /// einen ungültigen/entzogenen Schlüssel erkennen kann). Fehlerstatus und
+    /// Transportfehler werden wie im OpenAI-kompatiblen Pfad klassifiziert
+    /// (siehe [`anthropic_error_for_status`] bzw.
+    /// [`crate::error::model_error_for_transport`]): 429 → `RateLimited`,
+    /// 408/5xx/529 und Verbindungsfehler → `Transient`, Zeitüberschreitung →
+    /// `Timeout` — alle vom `RetryingProvider` wiederholbar.
     async fn respond_once(
         &self,
         request: ModelRequest,
@@ -901,6 +951,10 @@ impl AnthropicMessagesProvider {
             }
         }
 
+        // Header-Pacing zuerst: eine Pacing-Pause darf keinen
+        // Nebenläufigkeits-Slot belegen, sonst blockiert ein wartender Request
+        // andere, die sofort senden dürften.
+        self.rate_limiter.wait_for_slot().await;
         // Hartes Nebenläufigkeits-Limit (siehe [`Self::concurrency_limiter`]):
         // blockiert, bis ein Slot frei wird, statt fehlzuschlagen. Der Guard
         // bleibt bis zum Ende dieser Funktion (also bis der Response-Body
@@ -915,23 +969,20 @@ impl AnthropicMessagesProvider {
             })?),
             None => None,
         };
-        self.rate_limiter.wait_for_slot().await;
+        // Transportfehler laufen über dieselbe Klassifikation wie der
+        // OpenAI-kompatible Pfad: Timeout → `Timeout`, Verbindungs-/Sendefehler
+        // → `Transient` (beide vom `RetryingProvider` wiederholbar).
         let response = builder
             .json(&wire)
             .timeout(self.request_timeout)
             .send()
             .await
-            .map_err(|error| {
-                ModelError::RequestFailed(super::HttpProviderError::from(error).to_string())
-            })?;
+            .map_err(|error| crate::error::model_error_for_transport(error, false))?;
 
         self.rate_limiter.observe_headers(response.headers());
         let status = response.status();
-        let retry_after_header = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
+        let retry_after_header = super::header_string(response.headers(), "retry-after");
+        let retry_after_ms_header = super::header_string(response.headers(), "retry-after-ms");
         let request_id = super::provider_request_id(response.headers());
         if status.is_success()
             && let Some(sink) = stream_sink
@@ -941,42 +992,31 @@ impl AnthropicMessagesProvider {
             let value = accumulator.finish()?;
             return self.interpret_body(&request, model, &value);
         }
-        let body = response.text().await.map_err(|error| {
-            ModelError::RequestFailed(super::HttpProviderError::from(error).to_string())
-        })?;
-
-        if status.as_u16() == 429 {
-            // W6b — UIA-Sichtbarkeit: zählt jede beobachtete 429-Antwort
-            // dieses Providers (siehe
-            // `rate_limiter::ProviderRateLimiter::record_rate_limited`).
-            self.rate_limiter.record_rate_limited();
-            let retry_after = super::parse_retry_after(retry_after_header.as_deref(), &body);
-            return Err(ModelError::RateLimited {
-                retry_after_secs: retry_after.as_secs(),
-                message: super::sanitized_provider_error(
-                    status.as_u16(),
-                    request_id.as_deref(),
-                    &body,
-                ),
-            });
-        }
-
-        if status.as_u16() == 401 || status.as_u16() == 403 {
-            return Err(ModelError::Auth {
-                message: super::sanitized_provider_error(
-                    status.as_u16(),
-                    request_id.as_deref(),
-                    &body,
-                ),
-            });
-        }
+        let body = response
+            .text()
+            .await
+            .map_err(|error| crate::error::model_error_for_transport(error, true))?;
 
         if !status.is_success() {
-            return Err(ModelError::RequestFailed(super::sanitized_provider_error(
+            if status.as_u16() == 429 {
+                // W6b — UIA-Sichtbarkeit: zählt jede beobachtete 429-Antwort
+                // dieses Providers (siehe
+                // `rate_limiter::ProviderRateLimiter::record_rate_limited`).
+                self.rate_limiter.record_rate_limited();
+            }
+            let error = anthropic_error_for_status(
                 status.as_u16(),
                 request_id.as_deref(),
+                retry_after_header.as_deref(),
+                retry_after_ms_header.as_deref(),
                 &body,
-            )));
+            );
+            tracing::debug!(
+                status = status.as_u16(),
+                retryable = error.is_retryable(),
+                "anthropic provider returned an error status"
+            );
+            return Err(error);
         }
 
         let value: Value = serde_json::from_str(&body)?;
@@ -2471,6 +2511,126 @@ mod tests {
             .join()
             .map_err(|_| TestError::Unexpected("mock server thread panicked".to_owned()))??;
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_anthropic_error_for_status_529_overloaded_is_transient() {
+        let body = r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        let error = anthropic_error_for_status(529, Some("req-1"), None, None, body);
+        assert!(matches!(
+            error,
+            ModelError::Transient {
+                status: Some(529),
+                retry_after_secs: None,
+                ..
+            }
+        ));
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn test_anthropic_error_for_status_503_is_transient_with_retry_after() {
+        let error = anthropic_error_for_status(503, None, Some("4"), None, "upstream down");
+        assert!(matches!(
+            error,
+            ModelError::Transient {
+                status: Some(503),
+                retry_after_secs: Some(4),
+                ..
+            }
+        ));
+        assert!(error.is_retryable());
+        assert!(!error.to_string().contains("upstream down"));
+    }
+
+    #[test]
+    fn test_anthropic_error_for_status_429_uses_retry_after_ms() {
+        let body =
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}"#;
+        let error = anthropic_error_for_status(429, None, Some("30"), Some("1500"), body);
+        assert!(matches!(
+            error,
+            ModelError::RateLimited {
+                retry_after_secs: 2,
+                ..
+            }
+        ));
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn test_anthropic_error_for_status_429_without_hint_falls_back_to_default() {
+        let error = anthropic_error_for_status(429, None, None, None, "{}");
+        assert!(matches!(
+            error,
+            ModelError::RateLimited {
+                retry_after_secs: 30,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_anthropic_error_for_status_auth_and_invalid_are_not_retryable() {
+        let auth = anthropic_error_for_status(401, None, None, None, "{}");
+        assert!(matches!(auth, ModelError::Auth { .. }));
+        assert!(!auth.is_retryable());
+        let forbidden = anthropic_error_for_status(403, None, None, None, "{}");
+        assert!(matches!(forbidden, ModelError::Auth { .. }));
+        let invalid = anthropic_error_for_status(
+            400,
+            None,
+            None,
+            None,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#,
+        );
+        assert!(matches!(invalid, ModelError::RequestFailed(_)));
+        assert!(!invalid.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn respond_maps_request_timeout_to_retryable_timeout() -> TestResult {
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("bind mock server"))?;
+        let base_url = format!(
+            "http://{}/v1/messages",
+            listener.local_addr().map_err(ctx("mock address"))?
+        );
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let server = thread::spawn(move || -> TestResult {
+            // Verbindung annehmen, aber nie antworten, bis der Test fertig ist.
+            let (_stream, _) = listener.accept().map_err(ctx("accept mock request"))?;
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+            Ok(())
+        });
+
+        let mut provider = AnthropicMessagesProvider::new(
+            base_url,
+            "configured-model",
+            AnthropicCredential::ApiKey(SecretString::new("sk-secret".into())),
+        )
+        .map_err(ctx("AnthropicMessagesProvider::new"))?;
+        provider.request_timeout = Duration::from_millis(100);
+
+        let response = provider.respond(request_with_ids(None, None)).await;
+        let _ = release_tx.send(());
+        server
+            .join()
+            .map_err(|_| TestError::Unexpected("mock server thread panicked".to_owned()))??;
+
+        let Err(error) = response else {
+            return Err(TestError::Unexpected(
+                "stalled server must surface as an error".to_owned(),
+            ));
+        };
+        assert!(
+            matches!(error, ModelError::Timeout { .. }),
+            "expected Timeout, got {error:?}"
+        );
+        assert!(error.is_retryable());
         Ok(())
     }
 }

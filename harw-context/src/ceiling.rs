@@ -11,8 +11,10 @@
 //!
 //! # Exportierte Typen
 //! [`ContextCeiling`], [`CeilingViolation`], die Konstanten
-//! [`ROOT_CONTEXT_SECTIONS`] (Obergrenze jeder lokal-vertrauten Wurzeldecke)
-//! und [`LEGACY_V1_SECTION`] (Sektion der v1-Brücke, W3 C-PROTO / F-163).
+//! [`ROOT_CONTEXT_SECTIONS`] (Obergrenze jeder lokal-vertrauten Wurzeldecke),
+//! [`LEGACY_V1_SECTION`] (Sektion der v1-Brücke, W3 C-PROTO / F-163) sowie
+//! [`DELEGATION_TARGETS_SECTION`] und [`CONTINUATION_INSTRUCTION_SECTION`]
+//! (vom Turn-Loop selbst erzeugte Instruktionsfragmente).
 //!
 //! # Kosten
 //! [`ContextCeiling::admits`] vertraut `Fragment::cost` nicht blind: die
@@ -62,6 +64,26 @@ use crate::fragment::{Fragment, SectionName, TrustClass};
 /// production fragment was omitted as `BelowCeiling` in child sessions).
 pub const LEGACY_V1_SECTION: &str = "legacy.v1";
 
+/// Section of the turn-loop-generated list of delegation targets.
+///
+/// # Description
+/// `harw_core`'s turn loop renders the names reachable via
+/// `transfer_to_<name>` into a fragment of this section (trust class
+/// `Instruction`). Without it in [`ROOT_CONTEXT_SECTIONS`] every ceiling
+/// derived from the root list would omit the block as `BelowCeiling`, and a
+/// child could never learn whom it may delegate to.
+pub const DELEGATION_TARGETS_SECTION: &str = "delegation.targets";
+
+/// Section of the turn-loop-generated continuation hint after `MaxTokens`.
+///
+/// # Description
+/// After a response is cut off by `MaxTokens`, `harw_core`'s turn loop injects
+/// an instruction fragment of this section so the provider continues
+/// seamlessly. Like [`DELEGATION_TARGETS_SECTION`] it is produced by the
+/// harness itself, never by an extension, and must therefore always be
+/// admitted by root ceilings.
+pub const CONTINUATION_INSTRUCTION_SECTION: &str = "continuation.instruction";
+
 /// Upper bound of sections a locally trusted root session may expose.
 ///
 /// # Description
@@ -78,6 +100,10 @@ pub const LEGACY_V1_SECTION: &str = "legacy.v1";
 /// - [`LEGACY_V1_SECTION`]: data from v1 context providers. These fragments are
 ///   always `TrustClass::Data`, so admitting the section never lets content
 ///   reach the instruction block.
+/// - [`DELEGATION_TARGETS_SECTION`]: the turn loop's own list of delegation
+///   targets (`transfer_to_<name>`).
+/// - [`CONTINUATION_INSTRUCTION_SECTION`]: the turn loop's own continuation
+///   hint after a `MaxTokens` cut-off.
 ///
 /// Deliberately absent: `credential.*`, `secret.*`, full or sibling
 /// transcripts, `plan.current`, `web.fetch_allowlist`, and every other
@@ -85,10 +111,15 @@ pub const LEGACY_V1_SECTION: &str = "legacy.v1";
 ///
 /// # Examples
 /// ```rust
-/// use harw_context::ceiling::{LEGACY_V1_SECTION, ROOT_CONTEXT_SECTIONS};
+/// use harw_context::ceiling::{
+///     CONTINUATION_INSTRUCTION_SECTION, DELEGATION_TARGETS_SECTION, LEGACY_V1_SECTION,
+///     ROOT_CONTEXT_SECTIONS,
+/// };
 ///
 /// assert!(ROOT_CONTEXT_SECTIONS.contains(&LEGACY_V1_SECTION));
 /// assert!(ROOT_CONTEXT_SECTIONS.contains(&"history.tail"));
+/// assert!(ROOT_CONTEXT_SECTIONS.contains(&DELEGATION_TARGETS_SECTION));
+/// assert!(ROOT_CONTEXT_SECTIONS.contains(&CONTINUATION_INSTRUCTION_SECTION));
 /// ```
 pub const ROOT_CONTEXT_SECTIONS: &[&str] = &[
     "task.objective",
@@ -96,6 +127,8 @@ pub const ROOT_CONTEXT_SECTIONS: &[&str] = &[
     "new.trigger_return",
     "history.tail",
     LEGACY_V1_SECTION,
+    DELEGATION_TARGETS_SECTION,
+    CONTINUATION_INSTRUCTION_SECTION,
 ];
 
 /// Lower bound for the cost of a fragment, derived from its body.
@@ -285,7 +318,10 @@ impl ContextCeiling {
 
 #[cfg(test)]
 mod tests {
-    use super::{CeilingViolation, ContextCeiling, LEGACY_V1_SECTION, ROOT_CONTEXT_SECTIONS};
+    use super::{
+        CONTINUATION_INSTRUCTION_SECTION, CeilingViolation, ContextCeiling,
+        DELEGATION_TARGETS_SECTION, LEGACY_V1_SECTION, ROOT_CONTEXT_SECTIONS,
+    };
     use crate::budget::ContextBudgetSpec;
     use crate::fragment::{
         Fragment, FragmentLabel, FragmentOrigin, SectionName, Stability, TrustClass,
@@ -495,6 +531,18 @@ mod tests {
         let fragment = fragment(LEGACY_V1_SECTION, TrustClass::Data, 4)?;
 
         assert_eq!(ceiling.admits(&fragment), Ok(()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_root_context_sections_admit_turn_loop_instruction_fragments() -> TestResult {
+        assert_eq!(DELEGATION_TARGETS_SECTION, "delegation.targets");
+        assert_eq!(CONTINUATION_INSTRUCTION_SECTION, "continuation.instruction");
+        let ceiling = ceiling(ROOT_CONTEXT_SECTIONS, TrustClass::Instruction, &[])?;
+        for name in [DELEGATION_TARGETS_SECTION, CONTINUATION_INSTRUCTION_SECTION] {
+            let fragment = fragment(name, TrustClass::Instruction, 4)?;
+            assert_eq!(ceiling.admits(&fragment), Ok(()), "{name} must be admitted");
+        }
         Ok(())
     }
 

@@ -10,10 +10,18 @@ use crate::artifact::{ArtifactId, ArtifactKind, Frontmatter, KnowledgeArtifact};
 use crate::error::{KnowledgeError, KnowledgeResult};
 use crate::store::KnowledgeStore;
 
-/// Stable id of the core-memory artifact.
+/// Einzige kanonische Id des Core-Memory-Artefakts.
+///
+/// Sowohl [`read`]/[`commit_promotion`] als auch
+/// [`crate::index::KnowledgeIndex::rebuild`] verwenden genau diese Konstante,
+/// damit ein über den Index gefundenes Core-Memory dieselbe Id trägt wie ein
+/// direkt gelesenes (vorher: `core/memory` im Index vs. `core/MEMORY` hier).
+pub const CORE_MEMORY_ID: &str = "core/MEMORY";
+
+/// Stable id of the core-memory artifact ([`CORE_MEMORY_ID`]).
 #[must_use]
 pub fn core_memory_id() -> ArtifactId {
-    ArtifactId::new("core/MEMORY")
+    ArtifactId::new(CORE_MEMORY_ID)
 }
 
 /// Read the core-memory artifact from disk (bootstrap load, §2.1).
