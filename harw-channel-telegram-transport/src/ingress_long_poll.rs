@@ -19,11 +19,15 @@ use harw_channel::{ChannelId, InboundEvent};
 use crate::{
     BotInfo, DedupWindow, TelegramClient, TelegramOffsetStore, TransportResult,
     error::TelegramTransportError,
-    mapping::{RawUpdate, map_update},
+    hand_off::CallbackConsumer,
+    mapping::{RawUpdate, map_callback_query, map_update},
 };
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_ALLOWED_UPDATES: [&str; 2] = ["message", "edited_message"];
+/// Update-Arten, sobald ein [`CallbackConsumer`] registriert ist: zusätzlich
+/// `callback_query`, damit Inline-Button-Klicks überhaupt zugestellt werden.
+const CALLBACK_ALLOWED_UPDATES: [&str; 3] = ["message", "edited_message", "callback_query"];
 
 /// Cooperative shutdown signal for a long-poll runner.
 ///
@@ -58,7 +62,7 @@ pub struct LongPollConfig {
     shutdown: LongPollShutdown,
     dedup: DedupWindow,
     timeout_secs: u64,
-    allowed_updates: Vec<String>,
+    callback_consumer: Option<Arc<dyn CallbackConsumer>>,
 }
 
 impl LongPollConfig {
@@ -81,11 +85,19 @@ impl LongPollConfig {
             shutdown,
             dedup: DedupWindow::new(1_024),
             timeout_secs: DEFAULT_TIMEOUT_SECS,
-            allowed_updates: DEFAULT_ALLOWED_UPDATES
-                .iter()
-                .map(|kind| (*kind).to_owned())
-                .collect(),
+            callback_consumer: None,
         }
+    }
+
+    /// Registriert einen Empfänger für Inline-Button-Klicks (`callback_query`).
+    ///
+    /// Erst mit gesetztem Consumer fordert der Runner `callback_query` bei
+    /// Telegram an; ohne Consumer bleiben die Standard-Update-Arten aktiv.
+    /// Callbacks laufen durch dieselbe Deduplizierung wie Nachrichten.
+    #[must_use]
+    pub fn with_callback_consumer(mut self, consumer: Arc<dyn CallbackConsumer>) -> Self {
+        self.callback_consumer = Some(consumer);
+        self
     }
 
     /// Replaces the process-local deduplication window.
@@ -145,12 +157,9 @@ async fn run_long_poll(config: LongPollConfig) -> TransportResult<()> {
         shutdown,
         dedup,
         timeout_secs,
-        allowed_updates,
+        callback_consumer,
     } = config;
-    let allowed_updates = allowed_updates
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
+    let allowed_updates = allowed_updates_for(callback_consumer.is_some());
     let mut persisted_offset = restart_offset(offset_store.load()?);
     // Zaehlt nicht dekodierbare ("Poison"-)Updates seit Threadstart. Rein
     // diagnostisch (Log-Feld), nicht durabel — siehe `decode_update`s Doku.
@@ -158,7 +167,7 @@ async fn run_long_poll(config: LongPollConfig) -> TransportResult<()> {
 
     'poll: while !shutdown.is_requested() {
         let updates = client
-            .get_updates(persisted_offset, timeout_secs, &allowed_updates)
+            .get_updates(persisted_offset, timeout_secs, allowed_updates)
             .await?;
 
         for value in updates {
@@ -207,7 +216,10 @@ async fn run_long_poll(config: LongPollConfig) -> TransportResult<()> {
                     }
                 }
                 Some(_) => true,
-                None => true,
+                None => {
+                    dispatch_callback(&update, callback_consumer.as_deref(), &dedup);
+                    true
+                }
             };
 
             if safely_processed {
@@ -220,6 +232,41 @@ async fn run_long_poll(config: LongPollConfig) -> TransportResult<()> {
     }
 
     Ok(())
+}
+
+/// Liefert die bei `getUpdates` angeforderten Update-Arten: `callback_query`
+/// nur, wenn ein [`CallbackConsumer`] registriert ist.
+fn allowed_updates_for(has_callback_consumer: bool) -> &'static [&'static str] {
+    if has_callback_consumer {
+        &CALLBACK_ALLOWED_UPDATES
+    } else {
+        &DEFAULT_ALLOWED_UPDATES
+    }
+}
+
+/// Reicht eine `callback_query` an den registrierten Consumer weiter.
+///
+/// Liefert `true`, wenn der Callback zugestellt wurde. Ohne Consumer, ohne
+/// abbildbare Callback-Query oder bei einem bereits beanspruchten
+/// `update_id` (gleiche Deduplizierung wie Nachrichten) wird nichts
+/// zugestellt; der Offset rückt in jedem Fall normal vor. Die opake
+/// Callback-Nutzlast wird niemals geloggt.
+fn dispatch_callback(
+    update: &RawUpdate,
+    consumer: Option<&dyn CallbackConsumer>,
+    dedup: &DedupWindow,
+) -> bool {
+    let Some(consumer) = consumer else {
+        return false;
+    };
+    let Some(callback) = map_callback_query(update) else {
+        return false;
+    };
+    if !dedup.claim_update(update.update_id) {
+        return false;
+    }
+    consumer.handle_callback(callback);
+    true
 }
 
 /// Decodes one raw Telegram update, also returning its `update_id` when that
@@ -344,16 +391,19 @@ fn next_offset_after_safe_processing(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
+    use std::sync::{Mutex, mpsc};
 
     use jiff::Timestamp;
 
     use super::{
-        LongPollShutdown, SendOutcome, advance_offset_past_poison_update, decode_update,
-        next_offset_after_safe_processing, restart_offset, send_event_with_backoff,
+        LongPollShutdown, SendOutcome, advance_offset_past_poison_update, allowed_updates_for,
+        decode_update, dispatch_callback, next_offset_after_safe_processing, restart_offset,
+        send_event_with_backoff,
     };
-    use crate::TelegramOffsetStore;
+    use crate::hand_off::CallbackConsumer;
+    use crate::mapping::{RawUpdate, TelegramCallback};
     use crate::test_support::{TestError, TestResult, ctx};
+    use crate::{DedupWindow, TelegramOffsetStore};
     use harw_channel::{ChannelId, InboundEvent, PeerId};
 
     #[test]
@@ -526,6 +576,97 @@ mod tests {
             .await
             .map_err(ctx("shutdown must not be reported as an error"))?;
         assert!(matches!(outcome, SendOutcome::ShutdownRequested));
+        Ok(())
+    }
+
+    #[test]
+    fn allowed_updates_request_callback_queries_only_with_a_consumer() {
+        assert_eq!(allowed_updates_for(false), ["message", "edited_message"]);
+        assert_eq!(
+            allowed_updates_for(true),
+            ["message", "edited_message", "callback_query"]
+        );
+    }
+
+    /// Test-Consumer, der zugestellte Callbacks mitschreibt.
+    #[derive(Default)]
+    struct RecordingConsumer(Mutex<Vec<TelegramCallback>>);
+
+    impl CallbackConsumer for RecordingConsumer {
+        fn handle_callback(&self, callback: TelegramCallback) {
+            if let Ok(mut seen) = self.0.lock() {
+                seen.push(callback);
+            }
+        }
+    }
+
+    impl RecordingConsumer {
+        fn seen(&self) -> TestResult<Vec<TelegramCallback>> {
+            self.0
+                .lock()
+                .map(|seen| seen.clone())
+                .map_err(|_| TestError::Unexpected("consumer mutex poisoned".to_owned()))
+        }
+    }
+
+    fn callback_update(update_id: i64) -> TestResult<RawUpdate> {
+        serde_json::from_value(serde_json::json!({
+            "update_id": update_id,
+            "callback_query": {
+                "id": "cb-1",
+                "from": { "id": 44, "is_bot": false, "first_name": "Op" },
+                "message": {
+                    "message_id": 12,
+                    "chat": { "id": 99, "type": "private" }
+                },
+                "data": "opaque-token"
+            }
+        }))
+        .map_err(ctx("callback update JSON is valid"))
+    }
+
+    #[test]
+    fn callback_is_dispatched_once_and_deduplicated() -> TestResult {
+        let consumer = RecordingConsumer::default();
+        let dedup = DedupWindow::new(16);
+        let update = callback_update(7)?;
+
+        assert!(dispatch_callback(&update, Some(&consumer), &dedup));
+        assert!(!dispatch_callback(&update, Some(&consumer), &dedup));
+
+        let seen = consumer.seen()?;
+        assert_eq!(seen.len(), 1);
+        let callback = seen
+            .first()
+            .ok_or(TestError::Missing("dispatched callback"))?;
+        assert_eq!(callback.update_id, 7);
+        assert_eq!(callback.callback_id, "cb-1");
+        assert_eq!(callback.data, "opaque-token");
+        assert_eq!(callback.chat_id, 99);
+        assert_eq!(callback.message_id, 12);
+        Ok(())
+    }
+
+    #[test]
+    fn callback_without_consumer_is_not_dispatched_and_not_claimed() -> TestResult {
+        let dedup = DedupWindow::new(16);
+        let update = callback_update(8)?;
+
+        assert!(!dispatch_callback(&update, None, &dedup));
+        // Ohne Consumer wurde die `update_id` nicht beansprucht.
+        assert!(dedup.claim_update(8));
+        Ok(())
+    }
+
+    #[test]
+    fn non_callback_update_is_not_dispatched() -> TestResult {
+        let consumer = RecordingConsumer::default();
+        let dedup = DedupWindow::new(16);
+        let update: RawUpdate = serde_json::from_value(serde_json::json!({ "update_id": 9 }))
+            .map_err(ctx("bare update JSON is valid"))?;
+
+        assert!(!dispatch_callback(&update, Some(&consumer), &dedup));
+        assert!(consumer.seen()?.is_empty());
         Ok(())
     }
 }

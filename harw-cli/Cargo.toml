@@ -97,7 +97,7 @@ harw-install = { path = "../harw-install" }
 harw-model-catalog = { path = "../harw-model-catalog" }
 clap_complete = "4.6.7"
 harw-completions = { path = "../harw-completions", features = ["clap-args"] }
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 tracing = "0.1.44"
 tikv-jemallocator = { version = "0.7.0", optional = true }
 # Telemetrie-Senken für Gateway und `src/observe.rs`.

@@ -45,6 +45,7 @@ mod runtime_web;
 mod sandbox_cmd;
 mod secret_store;
 mod settings;
+mod telegram_launcher;
 #[cfg(test)]
 mod test_support;
 mod uia_bootstrap;
@@ -146,34 +147,6 @@ pub fn log_sensitive_enabled() -> bool {
     LOG_SENSITIVE.load(Ordering::Relaxed)
 }
 
-/// Initializes the global `tracing` subscriber for the binary.
-///
-/// # Description
-///
-/// Must be called exactly once, as the very first statement after argument
-/// parsing. Libraries must **never** call this function — subscriber
-/// installation is the binary's exclusive responsibility.
-///
-/// The subscriber uses `tracing_subscriber::EnvFilter`, which accepts the same
-/// directive syntax as `RUST_LOG` (e.g. `"debug"`,
-/// `"harw_core=trace,info"`). If `level` cannot be parsed, the filter falls
-/// back to `"info"` so the process always starts with a usable subscriber.
-///
-/// When `log_sensitive` is `true` the global [`LOG_SENSITIVE`] flag is set and
-/// a `warn!` event is emitted immediately after subscriber installation to
-/// remind operators that sensitive data may appear in logs.
-///
-/// # Arguments
-///
-/// - `level` (`&str`): tracing filter directive passed verbatim to
-///   [`tracing_subscriber::EnvFilter::try_new`].
-/// - `log_sensitive` (`bool`): when `true`, enables [`log_sensitive_enabled`]
-///   and emits a startup warning.
-///
-/// # Panics
-///
-/// Panics if a global subscriber has already been installed (only possible if
-/// this function is called twice, which is a programming error).
 /// Öffnet (und rotiert bei Bedarf) das Datei-Log der TUI.
 fn open_tui_log_file() -> Option<std::fs::File> {
     const MAX_BYTES: u64 = 10 * 1024 * 1024;
@@ -190,19 +163,164 @@ fn open_tui_log_file() -> Option<std::fs::File> {
         .ok()
 }
 
-fn init_tracing(level: &str, log_sensitive: bool, tui_active: bool) {
+/// Filter-Vorgabe, wenn weder `--log`, `RUST_LOG` noch ein vom Default
+/// abweichendes `[logging] level` gesetzt ist.
+///
+/// Standardmäßig auf `warn` reduziert, damit die interaktive TUI (Alternate
+/// Screen) nicht durch Info-Spans überschrieben wird und Subcommands ruhig
+/// bleiben. Ein explizites `--log info` (oder `RUST_LOG=info`) bleibt möglich.
+const DEFAULT_LOG_FILTER: &str = "warn";
+
+/// Default-Wert von `[logging] level` (siehe `harw_config::LoggingSection`).
+///
+/// Da das Feld kein `Option` ist, lässt sich ein explizit gesetztes
+/// `level = "info"` nicht vom Default unterscheiden; beides fällt deshalb auf
+/// [`DEFAULT_LOG_FILTER`] zurück.
+const CONFIG_DEFAULT_LOG_LEVEL: &str = "info";
+
+/// Wählt die wirksame Tracing-Filter-Direktive.
+///
+/// # Description
+///
+/// Präzedenz (erste gültige gewinnt):
+/// 1. explizit auf der Kommandozeile übergebenes `--log` (beim Parsen bereits
+///    über `LogFilterParser` validiert);
+/// 2. die Umgebungsvariable `RUST_LOG`, sofern nicht leer und als
+///    `EnvFilter`-Direktive gültig;
+/// 3. `[logging] level` der effektiven Harness-Konfiguration, sofern gültig
+///    und vom Default (`"info"`) verschieden;
+/// 4. [`DEFAULT_LOG_FILTER`].
+///
+/// Ungültige Werte der Stufen 2 und 3 werden übersprungen, damit der Prozess
+/// immer mit einem brauchbaren Subscriber startet.
+///
+/// # Arguments
+///
+/// - `cli_explicit` (`Option<&str>`): `--log`, nur wenn auf der Kommandozeile
+///   gesetzt (nicht der clap-Default).
+/// - `rust_log` (`Option<&str>`): Wert von `RUST_LOG`, falls gesetzt.
+/// - `config_level` (`Option<&str>`): `[logging] level`, falls die
+///   Konfiguration geladen werden konnte.
+///
+/// # Returns
+///
+/// Die Direktive, die an `EnvFilter::try_new` geht.
+fn resolve_log_directive(
+    cli_explicit: Option<&str>,
+    rust_log: Option<&str>,
+    config_level: Option<&str>,
+) -> String {
     use tracing_subscriber::EnvFilter;
-    // Standardmäßig auf `warn` reduzieren, damit die interaktive TUI (Alternate
-    // Screen) nicht durch Info-Spans überschrieben wird. `--log info` bleibt
-    // explizit möglich, wenn Nutzer:innen tiefere Traces wollen.
-    let effective = if level.eq_ignore_ascii_case("info") {
-        "warn"
-    } else {
-        level
-    };
-    // `--log` wird bereits beim Parsen validiert (`LogFilterParser`); der
-    // `warn`-Fallback ist nur noch eine defensive No-op-Absicherung.
-    let filter = EnvFilter::try_new(effective).unwrap_or_else(|_| EnvFilter::new("warn"));
+    if let Some(level) = cli_explicit {
+        return level.to_owned();
+    }
+    let valid = |value: &str| !value.trim().is_empty() && EnvFilter::try_new(value).is_ok();
+    if let Some(value) = rust_log.filter(|value| valid(*value)) {
+        return value.to_owned();
+    }
+    if let Some(value) = config_level.filter(|value| {
+        !value.trim().eq_ignore_ascii_case(CONFIG_DEFAULT_LOG_LEVEL) && valid(*value)
+    }) {
+        return value.to_owned();
+    }
+    DEFAULT_LOG_FILTER.to_owned()
+}
+
+/// Lädt best-effort den `[logging]`-Abschnitt der effektiven Konfiguration.
+///
+/// # Description
+///
+/// Läuft *vor* der Installation des Subscribers: Home auflösen
+/// ([`home::resolve_home`]), vertraute Layer bestimmen
+/// ([`harw_home::config_layers`]) und die Kette über
+/// [`discover_config`] zusammenführen — dieselbe Kette wie `harw settings`.
+/// Es wird nichts angelegt und nichts migriert: existiert das Home noch nicht
+/// (Erststart, `harw init`), gelten stumm die Defaults. Andere Fehler werden
+/// nur außerhalb der TUI auf `stderr` gemeldet (der Alternate Screen darf
+/// nicht beschrieben werden); der eigentliche Befehl meldet eine kaputte
+/// Konfiguration ohnehin selbst.
+///
+/// # Arguments
+///
+/// - `home_override` (`Option<PathBuf>`): `--home`.
+/// - `tui_active` (`bool`): unterdrückt die `stderr`-Warnung.
+///
+/// # Returns
+///
+/// `Some(section)` bei erfolgreich geladener Konfiguration, sonst `None`.
+fn load_logging_section(
+    home_override: Option<PathBuf>,
+    tui_active: bool,
+) -> Option<harw_config::LoggingSection> {
+    let home = home::resolve_home(home_override).ok()?;
+    if !home.is_dir() {
+        return None;
+    }
+    let loaded = harw_home::config_layers(&home)
+        .map_err(|error| error.to_string())
+        .and_then(|layers| discover_config(&layers).map_err(|error| error.to_string()));
+    match loaded {
+        Ok(config) => Some(config.harness.logging),
+        Err(error) => {
+            if !tui_active {
+                eprintln!("harw: [logging] nicht geladen, verwende Defaults: {error}");
+            }
+            None
+        }
+    }
+}
+
+/// Wirksame Tracing-Einstellungen nach Auflösung von CLI, Umgebung und
+/// Konfiguration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TracingSettings {
+    /// `EnvFilter`-Direktive (siehe [`resolve_log_directive`]).
+    directive: String,
+    /// `[logging] json`: Ereignisse als zeilenweises JSON formatieren.
+    json: bool,
+    /// `[logging] target_module_paths`: Modulpfad (`target`) je Ereignis
+    /// anzeigen (entspricht `fmt().with_target(..)`).
+    target_module_paths: bool,
+    /// `--log-sensitive`.
+    log_sensitive: bool,
+}
+
+/// Initializes the global `tracing` subscriber for the binary.
+///
+/// # Description
+///
+/// Must be called exactly once, as the very first statement after argument
+/// parsing. Libraries must **never** call this function — subscriber
+/// installation is the binary's exclusive responsibility.
+///
+/// The subscriber uses `tracing_subscriber::EnvFilter` with
+/// `settings.directive` (already resolved by [`resolve_log_directive`]:
+/// `--log` > `RUST_LOG` > `[logging] level` > `warn`). If the directive cannot
+/// be parsed, the filter falls back to `"warn"` so the process always starts
+/// with a usable subscriber.
+///
+/// Außerhalb der TUI geht die Ausgabe nach `stderr`; `[logging] json` schaltet
+/// auf den JSON-Formatter, `[logging] target_module_paths` blendet den
+/// Modulpfad ein. In der TUI wird nie ins Terminal geschrieben, sondern nur in
+/// `<HARW_HOME>/logs/tui.log` (Target immer an, JSON gemäß Konfiguration).
+///
+/// When `log_sensitive` is `true` the global [`LOG_SENSITIVE`] flag is set and
+/// a `warn!` event is emitted immediately after subscriber installation to
+/// remind operators that sensitive data may appear in logs.
+///
+/// # Arguments
+///
+/// - `settings` (`&TracingSettings`): aufgelöste Einstellungen.
+/// - `tui_active` (`bool`): interaktive TUI läuft (Alternate Screen).
+///
+/// # Panics
+///
+/// Panics if a global subscriber has already been installed (only possible if
+/// this function is called twice, which is a programming error).
+fn init_tracing(settings: &TracingSettings, tui_active: bool) {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_new(&settings.directive)
+        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
     // Im Alternate-Screen ist auch STDERR sichtbar. Ein `fmt`-Layer darf in
     // der TUI daher gar nicht installiert werden: Ein Sink-Writer schützt nur
     // diesen einen Layer, nicht spätere Writer/Layers. Die reine Registry
@@ -214,25 +332,40 @@ fn init_tracing(level: &str, log_sensitive: bool, tui_active: bool) {
         // (bei > 10 MiB beim Start nach `tui.log.1` rotiert). Ohne auflösbares
         // Home bleibt es bei der reinen Registry.
         match open_tui_log_file() {
-            Some(file) => tracing_subscriber::registry()
-                .with(filter)
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .with_ansi(false)
-                        .with_target(true)
-                        .with_writer(std::sync::Mutex::new(file)),
-                )
-                .init(),
+            Some(file) => {
+                let layer = tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_target(true)
+                    .with_writer(std::sync::Mutex::new(file));
+                if settings.json {
+                    tracing_subscriber::registry()
+                        .with(filter)
+                        .with(layer.json())
+                        .init();
+                } else {
+                    tracing_subscriber::registry()
+                        .with(filter)
+                        .with(layer)
+                        .init();
+                }
+            }
             None => tracing_subscriber::registry().with(filter).init(),
         }
+    } else if settings.json {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .with_target(settings.target_module_paths)
+            .with_writer(std::io::stderr)
+            .init();
     } else {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
-            .with_target(false)
+            .with_target(settings.target_module_paths)
             .with_writer(std::io::stderr)
             .init();
     }
-    if log_sensitive {
+    if settings.log_sensitive {
         LOG_SENSITIVE.store(true, Ordering::Relaxed);
         tracing::warn!(
             "--log-sensitive is enabled: prompts, tool-args and responses will be logged. \
@@ -241,10 +374,46 @@ fn init_tracing(level: &str, log_sensitive: bool, tui_active: bool) {
     }
 }
 
+/// Parst die Kommandozeile und meldet, ob `--log` explizit gesetzt wurde.
+///
+/// Entspricht `Cli::parse()` (Fehler/`--help` beenden den Prozess über
+/// `clap::Error::exit`), behält aber die `ArgMatches`, um den clap-Default
+/// `info` von einem expliziten `--log info` zu unterscheiden.
+fn parse_cli() -> (Cli, bool) {
+    use clap::{CommandFactory, FromArgMatches};
+    let mut matches = Cli::command().get_matches();
+    let log_explicit = log_flag_explicit(&matches);
+    match Cli::from_arg_matches_mut(&mut matches) {
+        Ok(cli) => (cli, log_explicit),
+        Err(error) => error.format(&mut Cli::command()).exit(),
+    }
+}
+
+/// `true`, wenn `--log` auf der Kommandozeile stand (auch hinter einem
+/// Subcommand; clap propagiert globale Argumente zur Wurzel).
+fn log_flag_explicit(matches: &clap::ArgMatches) -> bool {
+    matches!(
+        matches.value_source("log"),
+        Some(clap::parser::ValueSource::CommandLine)
+    )
+}
+
 fn main() {
-    let cli = Cli::parse();
+    let (cli, log_explicit) = parse_cli();
     let tui_active = cli.command.is_none() && cli.chat.prompt.is_none();
-    init_tracing(&cli.chat.log, cli.chat.log_sensitive, tui_active);
+    let logging = load_logging_section(cli.chat.home.clone(), tui_active).unwrap_or_default();
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let settings = TracingSettings {
+        directive: resolve_log_directive(
+            log_explicit.then_some(cli.chat.log.as_str()),
+            rust_log.as_deref(),
+            Some(logging.level.as_str()),
+        ),
+        json: logging.json,
+        target_module_paths: logging.target_module_paths,
+        log_sensitive: cli.chat.log_sensitive,
+    };
+    init_tracing(&settings, tui_active);
     let code = match dispatch(cli) {
         Ok(()) => 0,
         Err(error) => {
@@ -2693,6 +2862,62 @@ fn print_runtime_rights(home: &Path) {
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
+
+    #[test]
+    fn log_directive_prefers_explicit_cli_flag() {
+        assert_eq!(
+            resolve_log_directive(Some("info"), Some("trace"), Some("debug")),
+            "info"
+        );
+    }
+
+    #[test]
+    fn log_directive_prefers_rust_log_over_config() {
+        assert_eq!(
+            resolve_log_directive(None, Some("harw_core=trace"), Some("debug")),
+            "harw_core=trace"
+        );
+    }
+
+    #[test]
+    fn log_directive_skips_empty_or_invalid_rust_log() {
+        assert_eq!(
+            resolve_log_directive(None, Some("  "), Some("debug")),
+            "debug"
+        );
+        assert_eq!(
+            resolve_log_directive(None, Some("harw_core=notalevel"), Some("debug")),
+            "debug"
+        );
+    }
+
+    #[test]
+    fn log_directive_uses_config_level_unless_default() {
+        assert_eq!(resolve_log_directive(None, None, Some("error")), "error");
+        assert_eq!(
+            resolve_log_directive(None, None, Some("info")),
+            DEFAULT_LOG_FILTER
+        );
+        assert_eq!(resolve_log_directive(None, None, None), DEFAULT_LOG_FILTER);
+    }
+
+    #[test]
+    fn log_flag_source_distinguishes_default_from_explicit() -> TestResult {
+        use clap::CommandFactory;
+        let default = Cli::command()
+            .try_get_matches_from(["harw"])
+            .map_err(ctx("bare harw parses"))?;
+        assert!(!log_flag_explicit(&default));
+        let explicit = Cli::command()
+            .try_get_matches_from(["harw", "--log", "info"])
+            .map_err(ctx("--log parses"))?;
+        assert!(log_flag_explicit(&explicit));
+        let after_subcommand = Cli::command()
+            .try_get_matches_from(["harw", "doctor", "--log", "debug"])
+            .map_err(ctx("--log after subcommand parses"))?;
+        assert!(log_flag_explicit(&after_subcommand));
+        Ok(())
+    }
 
     #[test]
     fn cli_parses_bare_invocation_as_chat() -> TestResult {

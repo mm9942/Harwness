@@ -3,8 +3,16 @@
 //! Authentication is deliberately performed against the request headers before
 //! the body is read. The resolved secret is supplied by the caller; this
 //! boundary does not resolve `SecretRef` values or touch gateway state.
+//!
+//! Inline-Button-Klicks (`callback_query`) werden – sofern ein
+//! [`CallbackConsumer`] installiert ist – nach erfolgreicher Dedup-Claim ihrer
+//! `update_id` an diesen weitergereicht. Die opake Callback-Nutzlast wird
+//! dabei niemals geloggt.
 
-use std::{net::SocketAddr, sync::mpsc::SyncSender};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, mpsc::SyncSender},
+};
 
 use axum::{
     Router,
@@ -16,10 +24,14 @@ use axum::{
 };
 use harw_channel::{ChannelId, InboundEvent};
 
-use crate::mapping::{RawUpdate, map_update};
+use crate::dedup::DedupWindow;
+use crate::hand_off::CallbackConsumer;
+use crate::mapping::{RawUpdate, map_callback_query, map_update};
 
 const SECRET_HEADER: &str = "X-Telegram-Bot-Api-Secret-Token";
 const MAX_UPDATE_BYTES: usize = 1_048_576;
+/// Standardgröße des Dedup-Fensters für Callback-Updates (wie Long-Poll).
+const DEFAULT_DEDUP_CAPACITY: usize = 1_024;
 
 /// Runtime inputs for one Telegram webhook binding.
 #[derive(Clone)]
@@ -38,6 +50,12 @@ pub struct WebhookConfig {
     pub bot_username: Option<String>,
     /// Bounded synchronous sink owned by the runtime bridge.
     pub sender: SyncSender<InboundEvent>,
+    /// Optionaler Empfänger für Inline-Button-Klicks. Ohne Consumer werden
+    /// `callback_query`-Updates angenommen (204) und verworfen.
+    pub callback_consumer: Option<Arc<dyn CallbackConsumer>>,
+    /// Prozesslokales Replay-Fenster für Callback-`update_id`s. Wird über
+    /// Klone der Konfiguration (Axum-State) hinweg geteilt.
+    pub dedup: Arc<DedupWindow>,
 }
 
 impl WebhookConfig {
@@ -60,7 +78,26 @@ impl WebhookConfig {
             bot_id,
             bot_username,
             sender,
+            callback_consumer: None,
+            dedup: Arc::new(DedupWindow::new(DEFAULT_DEDUP_CAPACITY)),
         }
+    }
+
+    /// Installiert den Empfänger für Inline-Button-Klicks.
+    ///
+    /// Der Aufrufer muss `callback_query` zusätzlich in `allowed_updates` von
+    /// `setWebhook` aufnehmen, sonst stellt Telegram keine Klicks zu.
+    #[must_use]
+    pub fn with_callback_consumer(mut self, consumer: Arc<dyn CallbackConsumer>) -> Self {
+        self.callback_consumer = Some(consumer);
+        self
+    }
+
+    /// Ersetzt das Dedup-Fenster, z. B. um es mit dem Long-Poll-Pfad zu teilen.
+    #[must_use]
+    pub fn with_dedup_window(mut self, dedup: Arc<DedupWindow>) -> Self {
+        self.dedup = dedup;
+        self
     }
 }
 
@@ -100,6 +137,7 @@ async fn webhook_handler(State(config): State<WebhookConfig>, request: Request<B
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
     let Some(mut event) = map_update(&update, config.bot_id, config.bot_username.as_deref()) else {
+        dispatch_callback(&config, &update);
         return StatusCode::NO_CONTENT.into_response();
     };
     event.channel = ChannelId::from_str(config.channel_id.clone());
@@ -112,6 +150,23 @@ async fn webhook_handler(State(config): State<WebhookConfig>, request: Request<B
         Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
+    }
+}
+
+/// Reicht eine abbildbare `callback_query` an den installierten Consumer
+/// weiter, sofern ihre `update_id` noch nicht beansprucht wurde.
+///
+/// Die Nutzlast (`data`) ist ein Approval-Token und wird bewusst nicht
+/// geloggt. Duplikate und Updates ohne Consumer werden still verworfen.
+fn dispatch_callback(config: &WebhookConfig, update: &RawUpdate) {
+    let Some(consumer) = config.callback_consumer.as_ref() else {
+        return;
+    };
+    let Some(callback) = map_callback_query(update) else {
+        return;
+    };
+    if config.dedup.claim_update(callback.update_id) {
+        consumer.handle_callback(callback);
     }
 }
 
@@ -254,6 +309,123 @@ mod tests {
             .await,
             StatusCode::SERVICE_UNAVAILABLE
         );
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct RecordingConsumer {
+        callbacks: std::sync::Mutex<Vec<crate::mapping::TelegramCallback>>,
+    }
+
+    impl CallbackConsumer for RecordingConsumer {
+        fn handle_callback(&self, callback: crate::mapping::TelegramCallback) {
+            if let Ok(mut callbacks) = self.callbacks.lock() {
+                callbacks.push(callback);
+            }
+        }
+    }
+
+    impl RecordingConsumer {
+        fn recorded(&self) -> TestResult<Vec<crate::mapping::TelegramCallback>> {
+            self.callbacks
+                .lock()
+                .map(|callbacks| callbacks.clone())
+                .map_err(ctx("recording consumer lock"))
+        }
+    }
+
+    fn callback_body() -> &'static str {
+        r#"{"update_id":77,"callback_query":{"id":"cb-1","from":{"id":8,"is_bot":false,"first_name":"Mia"},"message":{"message_id":9,"chat":{"id":123,"type":"private"},"text":"approve?"},"data":"opaque-token"}}"#
+    }
+
+    fn config_with_consumer(
+        sender: SyncSender<InboundEvent>,
+        consumer: &Arc<RecordingConsumer>,
+    ) -> TestResult<WebhookConfig> {
+        let consumer: Arc<dyn CallbackConsumer> = consumer.clone();
+        Ok(config(sender)?.with_callback_consumer(consumer))
+    }
+
+    #[tokio::test]
+    async fn callback_query_reaches_consumer_without_forwarding_event() -> TestResult {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let consumer = Arc::new(RecordingConsumer::default());
+        assert_eq!(
+            call(
+                config_with_consumer(sender, &consumer)?,
+                request(Some("correct-secret"), callback_body())?
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        assert!(receiver.try_recv().is_err());
+        let recorded = consumer.recorded()?;
+        let callback = recorded
+            .first()
+            .ok_or(crate::test_support::TestError::Missing(
+                "callback delivered",
+            ))?;
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(callback.update_id, 77);
+        assert_eq!(callback.callback_id, "cb-1");
+        assert_eq!(callback.data, "opaque-token");
+        assert_eq!(callback.chat_id, 123);
+        assert_eq!(callback.message_id, 9);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_callback_update_is_delivered_once() -> TestResult {
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
+        let consumer = Arc::new(RecordingConsumer::default());
+        let config = config_with_consumer(sender, &consumer)?;
+        for _ in 0..2 {
+            assert_eq!(
+                call(
+                    config.clone(),
+                    request(Some("correct-secret"), callback_body())?
+                )
+                .await,
+                StatusCode::NO_CONTENT
+            );
+        }
+        assert_eq!(consumer.recorded()?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn callback_with_wrong_secret_never_reaches_consumer() -> TestResult {
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
+        let consumer = Arc::new(RecordingConsumer::default());
+        assert_eq!(
+            call(
+                config_with_consumer(sender, &consumer)?,
+                request(Some("wrong-secret"), callback_body())?
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(consumer.recorded()?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unmappable_callback_is_not_delivered() -> TestResult {
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
+        let consumer = Arc::new(RecordingConsumer::default());
+        // Ohne `message`/`data` lässt sich der Klick nicht sicher zuordnen.
+        assert_eq!(
+            call(
+                config_with_consumer(sender, &consumer)?,
+                request(
+                    Some("correct-secret"),
+                    r#"{"update_id":43,"callback_query":{"id":"query","from":{"id":8,"is_bot":false,"first_name":"Mia"}}}"#,
+                )?,
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        assert!(consumer.recorded()?.is_empty());
         Ok(())
     }
 
