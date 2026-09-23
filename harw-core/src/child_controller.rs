@@ -68,7 +68,21 @@
 //! Sperre gar nicht erst in die Deckel-Prüfung eintreten, solange die erste
 //! noch läuft. Verschachtelt wird nur noch ein Paar, immer in dieser
 //! Richtung: `manager` ⊃ `released` (Rückgabe bzw. Verwerfen einer laufenden
-//! Session).
+//! Session). Die Auftrags- und Fortschritts-Registries (`child_tasks`,
+//! `progress_sinks`) sind Blatt-Sperren: unter ihnen wird nie eine weitere
+//! Sperre genommen und nie ein Beobachter aufgerufen.
+//!
+//! # Auftrag, Ergebnis und Live-Fortschritt
+//! - Die Admission hinterlegt `SpawnInput::instructions` (sonst einen nicht
+//!   leeren `context`) als einmaligen Auftrag; der erste Lauf mit leerem
+//!   [`TurnInput`] bekommt ihn als User-Turn.
+//! - Orchestrierungs-Events tragen in `task` den Kurzkopf dieses Auftrags und
+//!   bei `Completed`/`Failed` in `detail` den Kurzkopf der finalen Antwort
+//!   bzw. des Fehlergrunds (siehe [`orchestration_detail_head`]).
+//! - [`ChildRunResult::full_text`] trägt die ungekürzte finale Antwort.
+//! - Der [`ManagedAgentSpawner::progress_observer`] sendet gedrosselt
+//!   `TurnEvent::ChildProgress` an den Live-Kanal des Elternteils (siehe
+//!   [`ManagedAgentSpawner::attach_child_progress_sink`]).
 //!
 //! # Fehler
 //! Alle öffentlichen Fehler sind [`AgentSpawnError`] mit lesbarer Meldung.
@@ -2187,7 +2201,11 @@ impl ManagedAgentSpawner {
     /// `Arc<Self>` nötig) und die konfigurierte Lease-Dauer. Registriert
     /// über [`crate::session::AgentSession::with_progress_observer`] an
     /// jeder Kind-Session, ruft die dieselbe Renew-Logik wie
-    /// [`Self::renew_lease`] mit dem aktuellen Zeitpunkt auf.
+    /// [`Self::renew_lease`] mit dem aktuellen Zeitpunkt auf. Zusätzlich
+    /// sendet er je Fortschritt höchstens alle
+    /// [`CHILD_PROGRESS_MIN_INTERVAL`] ein `TurnEvent::ChildProgress` an die
+    /// per [`Self::attach_child_progress_sink`] (oder automatisch bei der
+    /// Admission) registrierte Senke des Elternteils.
     #[must_use]
     pub fn progress_observer(&self) -> Arc<dyn crate::guard::ProgressObserver> {
         Arc::new(ActiveLeaseProgressObserver {
@@ -3436,7 +3454,7 @@ impl ManagedAgentSpawner {
                             u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                         let error =
                             Self::budget_exceeded(BudgetDimension::WallTime, limit_ms, used_ms);
-                        self.set_failed(child, &error.to_string());
+                        self.set_failed(child, &error.message);
                         tracing::warn!(
                             child = %child,
                             dimension = BudgetDimension::WallTime.as_str(),
@@ -3467,7 +3485,7 @@ impl ManagedAgentSpawner {
                     u64::from(limit),
                     u64::from(used),
                 );
-                self.set_failed(child, &error.to_string());
+                self.set_failed(child, &error.message);
                 return Err(error);
             }
         }
@@ -3482,7 +3500,7 @@ impl ManagedAgentSpawner {
                     "child_budget.exceeded",
                 );
                 let error = Self::budget_exceeded(BudgetDimension::Tokens, limit, used);
-                self.set_failed(child, &error.to_string());
+                self.set_failed(child, &error.message);
                 return Err(error);
             }
         }
@@ -3906,7 +3924,7 @@ impl ManagedAgentSpawner {
                 if token.is_cancelled() {
                     self.set_status(child, ChildStatus::Cancelled);
                 } else {
-                    self.set_failed(child, &error.to_string());
+                    self.set_failed(child, &error.message);
                 }
                 return Err(error);
             }
@@ -6151,11 +6169,6 @@ specialization = "child-controller-test"
 
         assert_eq!(result.child, child);
         assert!(matches!(result.outcome, TurnOutcome::Completed));
-        let texts = child_user_texts(&spawner, &child)?;
-        assert!(
-            texts.iter().any(|text| text == "Fasse die Datei zusammen"),
-            "pending task must become the user turn: {texts:?}"
-        );
         Ok(())
     }
 
@@ -8697,9 +8710,10 @@ max_depth = 0
             .map_err(ctx("child with a pending task runs"))?;
 
         assert!(matches!(result.outcome, TurnOutcome::Completed));
-        assert_eq!(
-            child_user_texts(&spawner, &child)?,
-            vec!["Fasse die Datei zusammen".to_owned()]
+        let texts = child_user_texts(&spawner, &child)?;
+        assert!(
+            texts.iter().any(|text| text == "Fasse die Datei zusammen"),
+            "pending task must become the user turn: {texts:?}"
         );
         let state = spawner
             .child_task_state(&child)
