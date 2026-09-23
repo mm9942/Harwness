@@ -1600,6 +1600,24 @@ mod tests {
             "diff",
             "stop",
             "cancel",
+            // Explorer-Werkzeuge (`explore.*`) gehören seit der Explorer-
+            // Verdrahtung zum Full-Profil, `doc.read_pdf` seit dem PDF-Fetch
+            // (harw-registry-defaults/src/profile.rs `DOC_TOOLS`).
+            "explore.find",
+            "explore.tree",
+            "explore.relations",
+            "explore.projects",
+            "doc.read_pdf",
+            // `process.list`/`process.kill` im Full-Profil; `process.kill`
+            // bleibt über ALWAYS_ASK_TOOLS immer freigabepflichtig.
+            "process.list",
+            "process.kill",
+            // Weitere `harw-ops`-Operationen mit `model_tool(...)`:
+            // `/provider-concurrency` (harw-ops/src/provider.rs,
+            // approval = "always") und `/sandbox-lease`
+            // (harw-ops/src/sandbox_lease.rs).
+            "provider-concurrency",
+            "sandbox-lease",
         ]
         .into_iter()
         .collect();
