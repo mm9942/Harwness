@@ -31,6 +31,7 @@ mod input;
 pub(crate) mod input_editor;
 pub(crate) mod input_history;
 pub(crate) mod input_reader;
+pub(crate) mod keybindings;
 pub(crate) mod markdown;
 pub mod model_picker;
 pub(crate) mod model_switch_picker;
