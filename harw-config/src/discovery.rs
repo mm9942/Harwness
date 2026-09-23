@@ -325,11 +325,13 @@ fn validate_telegram_binding(
             }
         }
         "webhook" => {
-            let webhook = telegram.transport_webhook.as_ref().ok_or_else(|| {
-                ConfigError::Invalid(format!(
-                    "Telegram channel {channel_id:?} uses webhook and requires transport_webhook"
-                ))
-            })?;
+            // Fehlt `[transport_webhook]`, fällt das Gateway mit einer Warnung
+            // auf Long-Poll zurück (`harw-cli/src/gateway.rs`,
+            // `webhook_fallback`); das ist daher kein Konfigurationsfehler.
+            // Ein vorhandener Abschnitt muss aber vollständig sein.
+            let Some(webhook) = telegram.transport_webhook.as_ref() else {
+                return Ok(());
+            };
             if webhook.public_url.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!(
                     "Telegram channel {channel_id:?} webhook transport requires a non-empty public_url"
@@ -2283,7 +2285,9 @@ pinned_identities = [123456789]
     }
 
     #[test]
-    fn validate_rejects_webhook_telegram_without_webhook_configuration() -> TestResult {
+    fn validate_accepts_webhook_telegram_without_webhook_configuration() -> TestResult {
+        // Das Gateway fällt in diesem Fall mit einer Warnung auf Long-Poll
+        // zurück; die Validierung darf den Start daher nicht verweigern.
         let config = config_with_telegram_channel(
             r#"
 [[channel.telegram]]
@@ -2296,12 +2300,9 @@ pinned_identities = [123456789]
 "#,
         )?;
 
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::Invalid(message))
-                if message.contains("telegram:missing-webhook")
-                    && message.contains("requires transport_webhook")
-        ));
+        config
+            .validate()
+            .map_err(ctx("webhook ohne transport_webhook muss gültig sein"))?;
         Ok(())
     }
 

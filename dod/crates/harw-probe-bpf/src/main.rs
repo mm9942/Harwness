@@ -175,12 +175,17 @@ use std::sync::Arc;
 use clap::Parser as _;
 use harw_authority::{EgressTarget, NetworkScope};
 use harw_completions::CompletionsSubcommand;
-use harw_dod_bpf::BpfProgramSource;
+use harw_dod_bpf::{BpfError, BpfObjectContract, BpfProgramSource, BpfScope, RealBpfLoader};
+use harw_dod_cap::Permanence;
 use harw_dod_signals::Sensor;
 use harw_types::SensorId;
+use jiff::Timestamp;
 
 use cli::{Cli, LogLevel};
+use collect::WireSource;
 use error::ProbeError;
+use sensors::{ObjectUnavailable, ResolvedBpfObject, UnavailableSensor};
+use sink::EventSink;
 
 /// Einstiegspunkt.
 ///
@@ -191,10 +196,11 @@ use error::ProbeError;
 /// initialisiert `tracing` und delegiert an [`run`].
 ///
 /// # Returns
-/// `ExitCode::SUCCESS` nur, wenn [`run`] regulär zurückkehrt (heute
-/// unerreichbar, siehe Moduldoku „Stand der eBPF-Bindung"). `ExitCode::FAILURE`
-/// bei jedem Fehlerpfad — Kommandozeile, Landlock-Schranke, fehlender
-/// eBPF-Loader, fehlender Sentinel.
+/// `ExitCode::SUCCESS` nur, wenn [`run`] regulär zurückkehrt (heute nur,
+/// wenn kein einziger Sensor registriert wäre — die Sammelschleife endet
+/// sonst nur über einen Fehler). `ExitCode::FAILURE` bei jedem Fehlerpfad —
+/// Kommandozeile, Landlock-Schranke, nicht degradierender Ladefehler,
+/// fehlender Sentinel.
 /// Der `completions`-Unterbefehl endet mit `ExitCode::SUCCESS` bzw.
 /// `ExitCode::FAILURE`, bevor Socket, Landlock oder Sensoren angefasst werden.
 fn main() -> ExitCode {
@@ -302,21 +308,52 @@ fn run_completions(args: &harw_completions::CompletionsArgs) -> Result<(), Probe
     Ok(())
 }
 
+/// Kernel-Schnittstellen, die der Lade-, Anheft- und Lesepfad nach der
+/// Landlock-Durchsetzung noch lesen muss.
+///
+/// # Description
+/// `landlock::enforce_fs_scope` sperrt jeden lesenden Dateisystemzugriff
+/// außerhalb der übergebenen Wurzeln. Das Laden selbst liest aber weiterhin
+/// ein paar feste Kernel-Dateien (nicht das Objektverzeichnis — die Objekte
+/// sind zu diesem Zeitpunkt bereits eingelesen):
+/// - `/proc/self`: `CapEff` aus `/proc/self/status`
+///   (`RealBpfLoader`s Fähigkeitsprüfung vor dem Anheften);
+/// - `/sys/kernel/btf`: `vmlinux`-BTF für CO-RE-Relokationen und das
+///   Laden der `fentry`-Programme;
+/// - `/sys/kernel/tracing` und `/sys/kernel/debug/tracing`: Tracepoint-IDs
+///   für das Anheften an `sched:*` (je nach Mount einer von beiden);
+/// - `/sys/devices/system/cpu`: die möglichen CPUs, gebraucht beim Lesen
+///   der per-CPU-Verlustzähler in der Sammelschleife.
+///
+/// Nur Verzeichnisse, nie Einzeldateien: eine `PathBeneath`-Regel auf einer
+/// Datei vertrüge die Verzeichnisrechte aus `AccessFs::from_read` nicht.
+const KERNEL_INTERFACE_ROOTS: [&str; 5] = [
+    "/proc/self",
+    "/sys/kernel/btf",
+    "/sys/kernel/tracing",
+    "/sys/kernel/debug/tracing",
+    "/sys/devices/system/cpu",
+];
+
 /// Führt den eigentlichen Sondenbetrieb aus.
 ///
 /// # Description
-/// Reihenfolge: sich **zuerst** mit dem Sentinel verbinden (ein
-/// Dateisystempfad-Zugriff, der nach einer Landlock-Regel scheitern könnte,
-/// falls der Socket-Pfad nicht im gewährten Bereich liegt — Muster:
-/// `harw-sentinel::main::run`, `harw-probe-fs::main::run`, die ihre eigenen
-/// Sockets ebenfalls vor `restrict_self` binden bzw. verbinden), **dann**
-/// über Landlock selbst einschränken (harter Abbruch bei jedem Ausgang
-/// außer vollständiger Durchsetzung, siehe [`landlock`]-Moduldoku), **dann**
-/// die reale eBPF-Ladeschicht aufbauen (siehe [`real_loader`]-Moduldoku:
-/// das Konstruieren selbst greift weder auf den Kernel noch auf
-/// Berechtigungen zu und schlägt deshalb nie fehl) und erst danach die
-/// beiden Sensoren
-/// registrieren und die Sammelschleife starten.
+/// Reihenfolge (siehe Moduldoku, Abschnitt „Die Landlock-Asymmetrie"):
+/// 1. Sentinel verbinden — ein Dateisystempfad-Zugriff, der nach Landlock
+///    scheitern würde (Muster: `harw-sentinel::main::run`,
+///    `harw-probe-fs::main::run`).
+/// 2. Alle vier eBPF-Objekte auflösen und einlesen
+///    ([`sensors::resolve_procmon_objects`],
+///    [`sensors::resolve_flow_objects`]) — **vor** Landlock, damit das
+///    Objektverzeichnis nicht im Landlock-Ausschnitt stehen muss.
+/// 3. Landlock durchsetzen (harter Abbruch bei jedem Ausgang außer
+///    vollständiger Durchsetzung).
+/// 4. Eine gemeinsame reale Ladeschicht bauen und je Sensor den
+///    Vertragssatz laden ([`setup_sensor`]); fehlende Objekte oder ein
+///    degradierender Ladefehler registrieren einen
+///    [`sensors::UnavailableSensor`].
+/// 5. Die Sammelschleife betreiben ([`collect_forever`]); endet sie, werden
+///    alle geladenen Objekte entladen.
 ///
 /// # Arguments
 /// - `cli` (`cli::Cli`): die geparste Kommandozeile.
@@ -326,108 +363,284 @@ fn run_completions(args: &harw_completions::CompletionsArgs) -> Result<(), Probe
 /// [`error::ProbeError::SentinelConnectFailed`] wenn der Sentinel nicht
 /// erreichbar ist; [`error::ProbeError::LandlockUnavailable`] wenn Landlock
 /// den Ausschnitt nicht vollständig durchsetzt;
-/// [`error::ProbeError::BpfLoad`] wenn ein `load`-Aufruf auf dem realen
-/// Ladeteil scheitert — etwa auf einem Host ohne `CAP_BPF` oder mit einem
-/// Objekt, das dem in `RealBpfLoader`s Moduldoku beschriebenen Vertrag nicht
-/// folgt.
+/// [`error::ProbeError::BpfLoad`] wenn das Laden eines Sensors mit einem
+/// nicht degradierenden Fehler scheitert (siehe [`degrades_sensor`]); jeder
+/// dauerhafte Fehler der Sammelschleife.
 fn run(cli: Cli, sentinel_socket: &Path) -> Result<(), ProbeError> {
     let sink = sink::build_sentinel_sink(sentinel_socket)?;
     tracing::info!(path = %sentinel_socket.display(), "connected to sentinel");
 
-    let fs_roots = fs_scope_roots(&cli);
-    landlock::enforce_fs_scope(&fs_roots)?;
+    // Objekte vor Landlock einlesen: danach braucht dieser Prozess keinen
+    // Lesezugriff auf das Objektverzeichnis mehr.
+    let procmon_objects = sensors::resolve_procmon_objects(
+        cli.exec_program_path.as_deref(),
+        cli.exit_program_path.as_deref(),
+    );
+    let flow_objects = sensors::resolve_flow_objects(
+        cli.tcp_v4_program_path.as_deref(),
+        cli.tcp_v6_program_path.as_deref(),
+    );
 
-    let procmon_source = program_source(cli.exec_program_path.clone());
-    let procmon_loader = real_loader::build_real_loader()?;
-    let procmon_sensor = sensors::build_procmon_sensor(
-        procmon_loader,
+    landlock::enforce_fs_scope(&fs_scope_roots())?;
+
+    let loader = real_loader::build_real_loader()?;
+    let mut degraded: Vec<Arc<dyn Sensor>> = Vec::new();
+    let mut sources: Vec<WireSource> = Vec::new();
+
+    setup_sensor(
+        &loader,
         SensorId::from_str(cli.sensor_id_procmon.clone()),
-        procmon_source,
-    )?;
+        procmon_objects,
+        |sensor, exec, exit| {
+            harw_dod_procmon::procmon_contracts(sensor, exec, exit, BpfScope::Host)
+        },
+        None,
+    )?
+    .register(&mut degraded, &mut sources);
 
-    let flow_source = program_source(cli.tcp_v4_program_path.clone());
-    let flow_loader = real_loader::build_real_loader()?;
-    let scope = network_scope(&[]);
-    let flow_sensor = sensors::build_flow_sensor(
-        flow_loader,
+    let flow = setup_sensor(
+        &loader,
         SensorId::from_str(cli.sensor_id_flow.clone()),
-        flow_source,
-        scope,
-    )?;
+        flow_objects,
+        |sensor, tcp_v4, tcp_v6| {
+            harw_dod_flow::flow_contracts(sensor, tcp_v4, tcp_v6, BpfScope::Host)
+        },
+        Some(network_scope(&[])),
+    );
+    match flow {
+        Ok(setup) => setup.register(&mut degraded, &mut sources),
+        Err(err) => {
+            // Bereits geladene Prozess-Objekte nicht angeheftet zurücklassen.
+            collect::unload_all(&loader, &sources);
+            return Err(err);
+        }
+    }
 
-    let sensor_list: Vec<Arc<dyn Sensor>> = vec![Arc::new(procmon_sensor), Arc::new(flow_sensor)];
-    tracing::info!(sensor_count = sensor_list.len(), "sensors registered");
+    tracing::info!(
+        wire_sources = sources.len(),
+        degraded_sensors = degraded.len(),
+        "sensors registered"
+    );
 
-    collect::run_forever(&sensor_list, sink.as_ref())
+    let result = collect_forever(&loader, &degraded, &sources, sink.as_ref());
+    collect::unload_all(&loader, &sources);
+    tracing::info!("bpf objects unloaded after the collect loop ended");
+    result
+}
+
+/// Ergebnis des Aufbaus eines Sensors: geladen oder degradiert.
+enum SensorSetup {
+    /// Alle Objekte des Sensors sind geladen und angeheftet.
+    Wire(WireSource),
+    /// Der Sensor meldet sich beim Sentinel als degradiert.
+    Degraded(UnavailableSensor),
+}
+
+impl SensorSetup {
+    /// Sortiert den Sensor in die passende Liste der Sammelschleife ein.
+    ///
+    /// # Arguments
+    /// - `degraded` (`&mut Vec<Arc<dyn Sensor>>`): Sensoren für
+    ///   [`collect::run_once`].
+    /// - `sources` (`&mut Vec<WireSource>`): Quellen für
+    ///   [`collect::drain_wire_once`].
+    fn register(self, degraded: &mut Vec<Arc<dyn Sensor>>, sources: &mut Vec<WireSource>) {
+        match self {
+            Self::Wire(source) => sources.push(source),
+            Self::Degraded(sensor) => degraded.push(Arc::new(sensor)),
+        }
+    }
+}
+
+/// Baut einen Sensor aus seinen aufgelösten Objekten.
+///
+/// # Description
+/// Fehlen Objekte, entsteht ohne jeden Ladeversuch ein
+/// [`sensors::UnavailableSensor`] mit der Mängelliste. Sonst baut `contracts`
+/// den Vertragssatz (Reihenfolge wie die Objekte), und
+/// [`real_loader::load_sensor`] lädt ihn transaktional. Ein Ladefehler, den
+/// [`degrades_sensor`] als Betriebsfall einstuft, wird geloggt und ebenfalls
+/// zu einem `UnavailableSensor`; jeder andere Ladefehler wird
+/// zurückgegeben.
+///
+/// # Arguments
+/// - `loader` (`&harw_dod_bpf::RealBpfLoader`): die gemeinsame Ladeschicht.
+/// - `sensor` (`harw_types::SensorId`): die Kennung des Sensors.
+/// - `objects`: das Ergebnis von [`sensors::resolve_procmon_objects`] bzw.
+///   [`sensors::resolve_flow_objects`].
+/// - `contracts`: baut aus Kennung und den beiden Objektquellen den
+///   Vertragssatz, z. B. `harw_dod_procmon::procmon_contracts` mit
+///   `BpfScope::Host`.
+/// - `net_scope` (`Option<harw_authority::NetworkScope>`): Melderegel für
+///   Verbindungsereignisse; `None` für den Prozess-Sensor.
+///
+/// # Returns
+/// [`SensorSetup::Wire`] oder [`SensorSetup::Degraded`].
+///
+/// # Errors
+/// [`ProbeError::BpfLoad`] (bzw. jeder andere Fehler aus
+/// [`real_loader::load_sensor`]), wenn der Ladefehler nicht degradierend ist.
+fn setup_sensor(
+    loader: &RealBpfLoader,
+    sensor: SensorId,
+    objects: Result<[ResolvedBpfObject; 2], Vec<ObjectUnavailable>>,
+    contracts: impl FnOnce(SensorId, BpfProgramSource, BpfProgramSource) -> [BpfObjectContract; 2],
+    net_scope: Option<NetworkScope>,
+) -> Result<SensorSetup, ProbeError> {
+    let [first, second] = match objects {
+        Ok(objects) => objects,
+        Err(missing) => {
+            return Ok(SensorSetup::Degraded(UnavailableSensor::new(
+                sensor, missing,
+            )));
+        }
+    };
+    let contracts = contracts(sensor.clone(), first.into_source(), second.into_source());
+    match real_loader::load_sensor(loader, &contracts) {
+        Ok(handles) => {
+            tracing::info!(
+                sensor = %sensor,
+                programs = handles.len(),
+                "bpf sensor loaded and attached"
+            );
+            Ok(SensorSetup::Wire(WireSource::new(
+                sensor, handles, net_scope,
+            )))
+        }
+        Err(ProbeError::BpfLoad(err)) if degrades_sensor(&err) => {
+            tracing::warn!(
+                sensor = %sensor,
+                error = %err,
+                "bpf sensor unavailable: loading or attaching failed"
+            );
+            Ok(SensorSetup::Degraded(UnavailableSensor::new(
+                sensor,
+                Vec::new(),
+            )))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Entscheidet, ob ein Ladefehler den Sensor nur degradiert.
+///
+/// # Description
+/// Degradierend sind die dokumentierten Betriebsfälle: fehlende Fähigkeiten
+/// (`AttachCapabilitiesUnavailable`, `CapabilityUnavailable`) und ein
+/// Objekt, das dem v1-Vertrag nicht entspricht (`InvalidProgramContract`).
+/// Alles andere (z. B. `ProgramLoadFailed`, `Io`) beendet den Prozess.
+///
+/// # Arguments
+/// - `err` (`&harw_dod_bpf::BpfError`): der Ladefehler.
+///
+/// # Returns
+/// `true`, wenn der Sensor als [`sensors::UnavailableSensor`] weiterläuft.
+fn degrades_sensor(err: &BpfError) -> bool {
+    matches!(
+        err,
+        BpfError::AttachCapabilitiesUnavailable
+            | BpfError::CapabilityUnavailable
+            | BpfError::InvalidProgramContract
+    )
+}
+
+/// Die Sammelschleife: bedient degradierte Sensoren und Wire-Quellen im
+/// Wechsel, bis ein dauerhafter Fehler auftritt.
+///
+/// # Description
+/// Je Runde: [`collect::run_once`] über die degradierten Sensoren (liefert
+/// deren einmalige `SensorDegraded`-Meldung, danach wartet jeder
+/// `UnavailableSensor` selbst), dann [`collect::drain_wire_once`] über die
+/// geladenen Quellen (mit eigenem Zeitbudget). Leere Listen werden
+/// übersprungen. Liest die Systemuhr selbst — die Kompositionswurzel darf
+/// das (Muster: `harw-probe-fs::collect::run_forever`).
+///
+/// # Arguments
+/// - `loader` (`&harw_dod_bpf::RealBpfLoader`): die gemeinsame Ladeschicht.
+/// - `degraded` (`&[Arc<dyn Sensor>]`): die degradierten Sensoren.
+/// - `sources` (`&[WireSource]`): die geladenen Quellen.
+/// - `sink` (`&dyn EventSink`): die Senke zum Sentinel.
+///
+/// # Returns
+/// `Ok(())` nur, wenn beide Listen leer sind (dann gibt es nichts zu
+/// sammeln); sonst kehrt diese Funktion nur über einen Fehler zurück.
+///
+/// # Errors
+/// Der erste Fehler, den [`retry_transient`] nicht als vorübergehend
+/// einstuft.
+fn collect_forever(
+    loader: &RealBpfLoader,
+    degraded: &[Arc<dyn Sensor>],
+    sources: &[WireSource],
+    sink: &dyn EventSink,
+) -> Result<(), ProbeError> {
+    if degraded.is_empty() && sources.is_empty() {
+        tracing::warn!("no bpf sensor registered; nothing to collect");
+        return Ok(());
+    }
+    loop {
+        if !degraded.is_empty() {
+            retry_transient(collect::run_once(degraded, sink, Timestamp::now()))?;
+        }
+        if !sources.is_empty() {
+            retry_transient(collect::drain_wire_once(loader, sources, sink))?;
+        }
+    }
+}
+
+/// Lässt einen vorübergehenden Sensorfehler durch, jeden anderen nicht.
+///
+/// # Arguments
+/// - `result` (`Result<usize, ProbeError>`): das Ergebnis einer Runde.
+///
+/// # Returns
+/// `Ok(())` bei Erfolg oder bei `ProbeError::Sensor` mit
+/// `Permanence::Transient` (dann geloggt).
+///
+/// # Errors
+/// Jeder andere Fehler, unverändert.
+fn retry_transient(result: Result<usize, ProbeError>) -> Result<(), ProbeError> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(ProbeError::Sensor(err)) if err.permanence() == Permanence::Transient => {
+            tracing::warn!(error = %err, "transient sensor error; retrying");
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Baut die Landlock-Wurzelliste dieses Prozesses.
 ///
 /// # Description
-/// Beide Sensoren dieser Sonde lesen nie über einen `ReadScope` — ihre
-/// einzige Quelle ist der injizierte `harw_dod_bpf::BpfLoader` (siehe
-/// [`sensors`]-Moduldoku). Der einzige Dateisystemzugriff, den dieser
-/// Prozess je braucht, sind die optionalen eBPF-Programmpfade; diese
-/// Funktion sammelt deren Elternverzeichnisse. Ohne konfigurierte Pfade ist
-/// das Ergebnis leer — die korrekte, maximal enge Voreinstellung.
-///
-/// # Arguments
-/// - `cli` (`&cli::Cli`): die geparste Kommandozeile.
+/// Enthält ausschließlich die vorhandenen Verzeichnisse aus
+/// [`KERNEL_INTERFACE_ROOTS`] — **nie** das eBPF-Objektverzeichnis: die
+/// Objekte sind vor Landlock bereits eingelesen (siehe [`run`]). Fehlende
+/// Verzeichnisse (z. B. `/sys/kernel/debug/tracing` ohne debugfs) werden
+/// ausgelassen, statt bei jedem Start eine Warnung aus
+/// `landlock::enforce_fs_scope` zu erzeugen; ausgelassen heißt dort ohnehin
+/// unlesbar.
 ///
 /// # Returns
-/// Die Liste der Elternverzeichnisse konfigurierter Programmpfade, ohne
-/// Duplikate zu entfernen (Landlock verkraftet doppelte Regeln
-/// unproblematisch).
-fn fs_scope_roots(cli: &Cli) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    for path in [
-        &cli.exec_program_path,
-        &cli.exit_program_path,
-        &cli.tcp_v4_program_path,
-        &cli.tcp_v6_program_path,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if let Some(parent) = path.parent() {
-            roots.push(parent.to_path_buf());
-        }
-    }
-    roots
+/// Die vorhandenen Kernel-Schnittstellenverzeichnisse, in der Reihenfolge
+/// von [`KERNEL_INTERFACE_ROOTS`].
+fn fs_scope_roots() -> Vec<PathBuf> {
+    KERNEL_INTERFACE_ROOTS
+        .iter()
+        .map(PathBuf::from)
+        .filter(|root| root.is_dir())
+        .collect()
 }
 
-/// Baut die `harw_dod_bpf::BpfProgramSource` für einen optionalen
-/// Programmpfad.
+/// Baut den `harw_authority::NetworkScope`, den die Verbindungs-Quelle
+/// gegen jede beobachtete Verbindung prüft.
 ///
 /// # Arguments
-/// - `path` (`Option<std::path::PathBuf>`): der über `--procmon-program-path`
-///   bzw. `--flow-program-path` konfigurierte Pfad.
+/// - `cidrs` (`&[ipnet::IpNet]`): erlaubte Zielnetze.
 ///
 /// # Returns
-/// [`harw_dod_bpf::BpfProgramSource::Path`], wenn `path` gesetzt ist, sonst
-/// ein leerer, eingebetteter Platzhalterrumpf
-/// ([`harw_dod_bpf::BpfProgramSource::Embedded`]) — siehe
-/// [`real_loader`]-Moduldoku für die Begründung, warum in dieser Lieferung
-/// ohnehin kein realer Lader existiert, der einen Rumpf tatsächlich
-/// verwenden würde.
-fn program_source(path: Option<PathBuf>) -> BpfProgramSource {
-    match path {
-        Some(path) => BpfProgramSource::Path(path),
-        None => BpfProgramSource::Embedded(std::borrow::Cow::Borrowed(&[])),
-    }
-}
-
-/// Baut den `harw_authority::NetworkScope`, den [`sensors::FlowSensor`] gegen
-/// jede beobachtete Verbindung prüft.
-///
-/// # Arguments
-/// - `cli` (`&cli::Cli`): die geparste Kommandozeile.
-///
-/// # Returns
-/// Einen `NetworkScope` aus den über `--egress-allow-cidr` konfigurierten
-/// Netzen. Ohne Angabe ein leerer Scope, der jede ausgehende Verbindung
-/// meldet — siehe [`cli`]-Moduldoku für die Begründung, warum
-/// `Host`/`DnsSuffix`-Ziele hier nicht angeboten werden.
+/// Einen `NetworkScope` aus den übergebenen Netzen. Ohne Angabe ein leerer
+/// Scope, der jede ausgehende Verbindung meldet.
 fn network_scope(cidrs: &[ipnet::IpNet]) -> NetworkScope {
     let targets: Vec<EgressTarget> = cidrs.iter().cloned().map(EgressTarget::Cidr).collect();
     NetworkScope::from_targets(targets)
@@ -436,84 +649,127 @@ fn network_scope(cidrs: &[ipnet::IpNet]) -> NetworkScope {
 #[cfg(test)]
 mod tests {
     // `main`/`run` selbst werden hier bewusst nicht getestet: `run` würde
-    // einen echten Socket verbinden und ein echtes Landlock-Ruleset binden
-    // — beides nach Aufgabenstellung untersagt. Jede darin verkettete
-    // Teilfunktion ist einzeln geprüft: `cli::Cli::try_parse_from` in
-    // `cli.rs`, `sensors::build_procmon_sensor`/`build_flow_sensor` und
-    // `FlowSensor::poll` in `sensors.rs`, `collect::run_once`/`run_forever`
-    // in `collect.rs` (mit `FixtureBpfLoader`), `real_loader::build_real_loader`
-    // in `real_loader.rs`. Zusammen decken sie jeden Schritt von `run` ab,
-    // ohne dass ein Test dieser Crate einen echten Socket öffnet, ein
-    // echtes Landlock bindet oder echtes eBPF lädt.
+    // einen echten Socket verbinden, ein echtes Landlock-Ruleset binden und
+    // echtes eBPF laden. Geprüft werden die reinen Entscheidungen dieser
+    // Datei; Objektauflösung (`sensors.rs`), Laden (`real_loader.rs`) und
+    // Sammeln (`collect.rs`) haben eigene Tests.
 
-    use super::{fs_scope_roots, network_scope, program_source};
-    use crate::test_support::{TestResult, ctx};
-    use harw_dod_bpf::BpfProgramSource;
+    use std::cell::Cell;
+    use std::path::{Path, PathBuf};
+
+    use harw_dod_bpf::{BpfError, RealBpfLoader};
+    use harw_dod_cap::SensorError;
+    use harw_types::SensorId;
     use ipnet::IpNet;
-    use std::path::PathBuf;
 
-    fn minimal_cli() -> TestResult<super::Cli> {
-        use clap::Parser as _;
-        super::Cli::try_parse_from([
-            "harw-probe-bpf",
-            "--sentinel-socket",
-            "/run/harw-sentinel.sock",
-        ])
-        .map_err(ctx("minimal valid arguments"))
+    use super::{
+        KERNEL_INTERFACE_ROOTS, SensorSetup, degrades_sensor, fs_scope_roots, network_scope,
+        retry_transient, setup_sensor,
+    };
+    use crate::error::ProbeError;
+    use crate::sensors::{
+        BpfObjectKind, DEFAULT_BPF_OBJECT_DIR, ObjectUnavailable, ObjectUnavailableReason,
+    };
+    use crate::test_support::{TestError, TestResult, ctx};
+
+    #[test]
+    fn test_fs_scope_roots_contains_only_kernel_interfaces_never_bpf_object_dirs() {
+        let object_dir = Path::new(DEFAULT_BPF_OBJECT_DIR);
+        for root in fs_scope_roots() {
+            assert!(root.is_absolute());
+            assert!(
+                KERNEL_INTERFACE_ROOTS
+                    .iter()
+                    .any(|allowed| Path::new(allowed) == root)
+            );
+            assert!(!object_dir.starts_with(&root));
+            assert!(!root.starts_with(object_dir));
+        }
     }
 
     #[test]
-    fn test_program_source_defaults_to_embedded_placeholder_when_no_path_given() {
-        assert!(matches!(
-            program_source(None),
-            BpfProgramSource::Embedded(_)
-        ));
+    fn test_kernel_interface_roots_are_absolute_and_outside_the_object_dir() {
+        let object_dir = Path::new(DEFAULT_BPF_OBJECT_DIR);
+        for root in KERNEL_INTERFACE_ROOTS.map(PathBuf::from) {
+            assert!(root.is_absolute());
+            assert!(!object_dir.starts_with(&root));
+        }
     }
 
     #[test]
-    fn test_program_source_uses_path_when_given() {
-        let path = PathBuf::from("/opt/harw/procmon.bpf.o");
-        assert!(matches!(
-            program_source(Some(path)),
-            BpfProgramSource::Path(_)
-        ));
+    fn test_degrades_sensor_on_capability_and_contract_errors() {
+        assert!(degrades_sensor(&BpfError::AttachCapabilitiesUnavailable));
+        assert!(degrades_sensor(&BpfError::CapabilityUnavailable));
+        assert!(degrades_sensor(&BpfError::InvalidProgramContract));
     }
 
     #[test]
-    fn test_fs_scope_roots_is_empty_without_configured_program_paths() -> TestResult {
-        let cli = minimal_cli()?;
-        assert!(fs_scope_roots(&cli).is_empty());
+    fn test_degrades_sensor_is_false_for_other_load_errors() {
+        assert!(!degrades_sensor(&BpfError::ProgramLoadFailed));
+        assert!(!degrades_sensor(&BpfError::UnknownHandle));
+        assert!(!degrades_sensor(&BpfError::MalformedEvent));
+    }
+
+    #[test]
+    fn test_setup_sensor_degrades_without_loading_when_objects_are_missing() -> TestResult {
+        // Kein Kernelzugriff: bei fehlenden Objekten wird der Vertragssatz
+        // gar nicht erst gebaut, `load_sensor` nie aufgerufen.
+        let loader = RealBpfLoader::new();
+        let contracts_built = Cell::new(false);
+        let missing = vec![ObjectUnavailable {
+            object: BpfObjectKind::Exec,
+            path: PathBuf::from("/nonexistent/exec.bpf.o"),
+            reason: ObjectUnavailableReason::Missing,
+        }];
+        let setup = setup_sensor(
+            &loader,
+            SensorId::from_str("probe-bpf-procmon-0"),
+            Err(missing),
+            |sensor, exec, exit| {
+                contracts_built.set(true);
+                harw_dod_procmon::procmon_contracts(
+                    sensor,
+                    exec,
+                    exit,
+                    harw_dod_bpf::BpfScope::Host,
+                )
+            },
+            None,
+        )
+        .map_err(ctx("setup_sensor with missing objects"))?;
+        assert!(matches!(setup, SensorSetup::Degraded(_)));
+        assert!(!contracts_built.get());
         Ok(())
     }
 
     #[test]
-    fn test_fs_scope_roots_collects_parent_directories_of_configured_paths() -> TestResult {
-        let mut cli = minimal_cli()?;
-        cli.exec_program_path = Some(PathBuf::from("/opt/harw/bpf/exec.o"));
-        cli.tcp_v4_program_path = Some(PathBuf::from("/opt/harw/bpf/flow.o"));
-
-        let roots = fs_scope_roots(&cli);
-        assert_eq!(
-            roots,
-            vec![
-                PathBuf::from("/opt/harw/bpf"),
-                PathBuf::from("/opt/harw/bpf")
-            ]
-        );
+    fn test_retry_transient_passes_success_and_transient_sensor_errors() -> TestResult {
+        retry_transient(Ok(3)).map_err(ctx("success passes"))?;
+        retry_transient(Err(ProbeError::Sensor(SensorError::MalformedSource)))
+            .map_err(ctx("transient sensor error passes"))?;
         Ok(())
     }
 
     #[test]
-    fn test_network_scope_is_empty_without_configured_cidrs() -> TestResult {
-        let _cli = minimal_cli()?;
+    fn test_retry_transient_returns_permanent_and_non_sensor_errors() -> TestResult {
+        match retry_transient(Err(ProbeError::Sensor(SensorError::OutsideScope))) {
+            Err(ProbeError::Sensor(SensorError::OutsideScope)) => {}
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        match retry_transient(Err(ProbeError::SentinelSendFailed)) {
+            Err(ProbeError::SentinelSendFailed) => Ok(()),
+            other => Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
+    #[test]
+    fn test_network_scope_is_empty_without_configured_cidrs() {
         let scope = network_scope(&[]);
         assert!(!scope.allows_addr(std::net::IpAddr::from([127, 0, 0, 1])));
-        Ok(())
     }
 
     #[test]
     fn test_network_scope_allows_a_configured_cidr() -> TestResult {
-        let _cli = minimal_cli()?;
         let cidrs = vec![
             "10.0.0.0/24"
                 .parse::<IpNet>()
