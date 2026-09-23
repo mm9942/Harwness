@@ -357,6 +357,21 @@ pub(crate) const DEPS_SOURCE_TOOLS: &[&str] =
 /// Die Werkzeuge von `harw-tool-web`, in Provider-Reihenfolge.
 pub(crate) const WEB_TOOLS: &[&str] = &["web.fetch", "web.docs_rs", "web.crates_io", "web.search"];
 
+/// Die Netz-Werkzeuge der Erkundungsprofile [`RegistryProfile::ReadOnlyExplore`]
+/// und [`RegistryProfile::UiaExplorer`]: `web.fetch` und `web.search`, in
+/// Provider-Reihenfolge — kein `web.docs_rs`/`web.crates_io` (die tiefere
+/// Crate-Recherche bleibt bei [`RegistryProfile::Research`]).
+///
+/// # Warum Erkundung Netz bekommt (Nutzerentscheidung)
+/// „Der Explorer durchsucht alles … auch das Internet“: `explorer` und
+/// `uia-explorer` admittieren beide Werkzeuge in ihrer TOML. Jeder Abruf
+/// braucht weiterhin `Permission::NetworkAccess` im Sandbox-Scope der Rolle
+/// (Prolog, Host-Allowlist); ohne dieses Recht fallen beide Werkzeuge über
+/// [`RegistryProfile::tool_names_for`] heraus. Die übrigen Rollen auf
+/// `ReadOnlyExplore` (`analyst`, `researcher-deps`) verbieten beide Werkzeuge
+/// ausdrücklich in ihrem `[tools].forbidden`.
+pub(crate) const EXPLORER_WEB_TOOLS: &[&str] = &["web.fetch", "web.search"];
+
 /// Das einzige Netz-Werkzeug von [`RegistryProfile::UiaQuickHelper`]
 /// (Addendum I): nur `web.fetch`, ohne `web.docs_rs`/`web.crates_io` — die
 /// Schnellhelfer-Rolle braucht keinen automatischen Crate-/Doku-Index, nur
@@ -581,15 +596,19 @@ pub(crate) const BROWSER_TOOLS: &[&str] = &[
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistryProfile {
-    /// Voller Coding-Satz: fs.*, doc.read_pdf, shell.exec. Browser nur über
-    /// expliziten Grant.
+    /// Voller Coding-Satz: fs.*, doc.read_pdf, explore.*, shell.exec sowie
+    /// `process.list`/`process.kill` (`ExecuteProcess`; `process.kill` fragt
+    /// immer, siehe [`crate::ALWAYS_ASK_TOOLS`]). Browser nur über expliziten
+    /// Grant.
     Full,
     /// Dedizierter Prozessworker: ausschließlich `shell.exec`. Das Profil ist
     /// absichtlich kein Fallback und erhält weder `fs.write` noch lesende
     /// Workspace-Werkzeuge.
     ShellExecution,
     /// Ausschließlich lesend: fs.read/list/search/glob/grep + doc.read_pdf +
-    /// deps.*.
+    /// explore.* + deps.* + `web.fetch`/`web.search` ([`EXPLORER_WEB_TOOLS`],
+    /// nur mit `NetworkAccess`; Nutzerentscheidung „der Explorer durchsucht
+    /// auch das Internet“). Kein Schreib- und kein Ausführungswerkzeug.
     ReadOnlyExplore,
     /// Nur web.* — kein Workspace-Lesen (A5); Netz nur über
     /// `[network].researcher_web_hosts`.
@@ -668,9 +687,9 @@ pub enum RegistryProfile {
     /// Agenten-Werkzeuge schreiben darf.
     AgentStewardship,
     /// Read-only Erkundungsspezialisierung der UIA: [`FS_READ_ONLY_TOOLS`]
-    /// plus [`DOC_TOOLS`] (`doc.read_pdf`) plus [`UIA_QUICK_HELPER_WEB_TOOLS`]
-    /// (`web.fetch`) — kein `fs.write`, kein `shell.exec`, kein `deps.*`,
-    /// kein `lens.ask`.
+    /// plus [`DOC_TOOLS`] (`doc.read_pdf`) plus [`EXPLORER_TOOLS`]
+    /// (`explore.*`) plus [`EXPLORER_WEB_TOOLS`] (`web.fetch`, `web.search`)
+    /// — kein `fs.write`, kein `shell.exec`, kein `deps.*`, kein `lens.ask`.
     ///
     /// # Warum dieses Profil existiert
     /// Die Spawn-Matrix (`harw-agent-dsl/src/roles.rs::can_spawn`) lässt die
@@ -682,8 +701,8 @@ pub enum RegistryProfile {
     /// stattdessen die bereits zugelassene Organisationsrolle
     /// `role = "uia-worker"` (`AgentRoleId::UiaWorker`) bei derselben
     /// read-only Werkzeugoberfläche wie
-    /// [`RegistryProfile::ReadOnlyExplore`] plus `web.fetch` (ohne `deps.*`,
-    /// das dort zusätzlich registriert wäre) — siehe
+    /// [`RegistryProfile::ReadOnlyExplore`] (inklusive `explore.*` und
+    /// `web.fetch`/`web.search`), aber ohne `deps.*` — siehe
     /// `agents/uia-explorer.toml`.
     UiaExplorer,
     /// Schreibende Erkundungsspezialisierung der UIA: [`UiaExplorer`] plus
@@ -850,11 +869,11 @@ impl RegistryProfile {
                 .chain(DOC_TOOLS.iter())
                 .chain(EXPLORER_TOOLS.iter())
                 .chain(DEPS_TOOLS.iter())
-                // Der Explorer darf auch das Netz durchsuchen (`web.search`,
-                // `web.fetch`); welche davon eine Rolle wirklich bekommt,
-                // entscheidet ihr `admitted` in der Agent-Definition, und jeder
+                // Der Explorer darf auch das Netz durchsuchen (`web.fetch`,
+                // `web.search`, siehe `EXPLORER_WEB_TOOLS`); `analyst` und
+                // `researcher-deps` verbieten beide in ihrer TOML, und jeder
                 // Abruf braucht weiterhin `NetworkAccess` im Sandbox-Scope.
-                .chain(WEB_TOOLS.iter())
+                .chain(EXPLORER_WEB_TOOLS.iter())
                 .copied()
                 .collect(),
             // `Planning` teilt den read-only Kern mit `ReadOnlyExplore`, hängt
@@ -913,12 +932,13 @@ impl RegistryProfile {
                 .collect(),
             // Read-only Erkundungsspezialisierung der UIA (siehe die
             // Begründung bei `RegistryProfile::UiaExplorer`): lesender
-            // fs.*-Kern plus `doc.read_pdf` plus ausschließlich `web.fetch`
-            // — kein `deps.*`.
+            // fs.*-Kern plus `doc.read_pdf` plus `explore.*` plus
+            // `web.fetch`/`web.search` — kein `deps.*`.
             RegistryProfile::UiaExplorer => FS_READ_ONLY_TOOLS
                 .iter()
                 .chain(DOC_TOOLS.iter())
-                .chain(UIA_QUICK_HELPER_WEB_TOOLS.iter())
+                .chain(EXPLORER_TOOLS.iter())
+                .chain(EXPLORER_WEB_TOOLS.iter())
                 .copied()
                 .collect(),
             // Schreibende Erkundungsspezialisierung der UIA (siehe die
@@ -1487,9 +1507,14 @@ fn profile_tool_providers(
             vec![filesystem, doc, explorer, shell, process]
         }
         RegistryProfile::ShellExecution => vec![build_shell_provider(sandbox_profile)],
+        // Der Web-Provider wird auf `EXPLORER_WEB_TOOLS` gefiltert, damit
+        // `web.docs_rs`/`web.crates_io` nicht per Namensraten erreichbar sind.
         RegistryProfile::ReadOnlyExplore => {
             let mut providers = read_only_base();
-            providers.push(Arc::new(WebToolProvider::new()));
+            providers.push(Arc::new(RestrictedToolProvider::new(
+                Arc::new(WebToolProvider::new()),
+                EXPLORER_WEB_TOOLS,
+            )));
             providers
         }
         // `LensToolProvider::new()` ist zustandslos (keine Bau-, Home- oder
@@ -1570,8 +1595,9 @@ fn profile_tool_providers(
             vec![filesystem, doc, agent_definitions]
         }
         // Read-only Erkundungsspezialisierung der UIA: gefilterter, lesender
-        // FS-Provider + lesender Doc-Provider + auf `web.fetch` gefilterter
-        // Web-Provider — siehe die Begründung bei
+        // FS-Provider + lesender Doc-Provider + Explorer-Provider + auf
+        // `web.fetch`/`web.search` gefilterter Web-Provider — siehe die
+        // Begründung bei
         // `RegistryProfile::UiaExplorer`.
         RegistryProfile::UiaExplorer => {
             let filesystem: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
@@ -1579,11 +1605,12 @@ fn profile_tool_providers(
                 FS_READ_ONLY_TOOLS,
             ));
             let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
+            let explorer: Arc<dyn ToolProvider> = Arc::new(ExplorerToolProvider::new());
             let web: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
                 Arc::new(WebToolProvider::new()),
-                UIA_QUICK_HELPER_WEB_TOOLS,
+                EXPLORER_WEB_TOOLS,
             ));
-            vec![filesystem, doc, web]
+            vec![filesystem, doc, explorer, web]
         }
         // Schreibende Erkundungsspezialisierung der UIA: voller, ungefilterter
         // FS-Provider (alle sechs `fs.*`, inklusive `fs.write`) + lesender

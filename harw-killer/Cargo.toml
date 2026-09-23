@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "Linux-Prozessterminator mit pidfd-Identität und wiederholtem SIGKILL (Bibliothek, `killer`-Binary und Grundlage für `harw kill` sowie das Agent-Werkzeug `process.kill`)."
-publish = false
+publish.workspace = true
 
 [lib]
 path = "src/lib.rs"

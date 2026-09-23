@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "Agent-Werkzeuge process.list/process.kill über die Bibliotheks-API von harw-killer (nur Linux)."
-publish = false
+publish.workspace = true
 
 [dependencies]
 harw-authority = { path = "../harw-authority" }
