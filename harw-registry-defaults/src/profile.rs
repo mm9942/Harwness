@@ -358,29 +358,23 @@ pub(crate) const DEPS_SOURCE_TOOLS: &[&str] =
 pub(crate) const WEB_TOOLS: &[&str] = &["web.fetch", "web.docs_rs", "web.crates_io", "web.search"];
 
 /// Die Netz-Werkzeuge der Erkundungsprofile [`RegistryProfile::ReadOnlyExplore`]
-/// und [`RegistryProfile::UiaExplorer`]: `web.fetch` und `web.search`, in
-/// Provider-Reihenfolge — kein `web.docs_rs`/`web.crates_io` (die tiefere
-/// Crate-Recherche bleibt bei [`RegistryProfile::Research`]).
+/// und [`RegistryProfile::UiaExplorer`] sowie der UIA-Helfer
+/// [`RegistryProfile::UiaQuickHelper`] und [`RegistryProfile::UiaWriter`]:
+/// `web.fetch` und `web.search`, in Provider-Reihenfolge — kein
+/// `web.docs_rs`/`web.crates_io` (die tiefere Crate-Recherche bleibt bei
+/// [`RegistryProfile::Research`]).
 ///
-/// # Warum Erkundung Netz bekommt (Nutzerentscheidung)
+/// # Warum diese Profile Netz bekommen (Nutzerentscheidungen)
 /// „Der Explorer durchsucht alles … auch das Internet“: `explorer` und
-/// `uia-explorer` admittieren beide Werkzeuge in ihrer TOML. Jeder Abruf
-/// braucht weiterhin `Permission::NetworkAccess` im Sandbox-Scope der Rolle
-/// (Prolog, Host-Allowlist); ohne dieses Recht fallen beide Werkzeuge über
-/// [`RegistryProfile::tool_names_for`] heraus. Die übrigen Rollen auf
-/// `ReadOnlyExplore` (`analyst`, `researcher-deps`) verbieten beide Werkzeuge
-/// ausdrücklich in ihrem `[tools].forbidden`.
+/// `uia-explorer` admittieren beide Werkzeuge in ihrer TOML. Dasselbe gilt
+/// für `uia-worker` und `uia-writer` (Nutzerentscheidung „die UIA-Helfer
+/// recherchieren kurz online und fügen manchmal Abhängigkeiten hinzu“).
+/// Jeder Abruf braucht weiterhin `Permission::NetworkAccess` im
+/// Sandbox-Scope der Rolle (Prolog, Host-Allowlist); ohne dieses Recht fallen
+/// beide Werkzeuge über [`RegistryProfile::tool_names_for`] heraus. Die
+/// übrigen Rollen auf `ReadOnlyExplore` (`analyst`, `researcher-deps`)
+/// verbieten beide Werkzeuge ausdrücklich in ihrem `[tools].forbidden`.
 pub(crate) const EXPLORER_WEB_TOOLS: &[&str] = &["web.fetch", "web.search"];
-
-/// Das einzige Netz-Werkzeug von [`RegistryProfile::UiaQuickHelper`]
-/// (Addendum I): nur `web.fetch`, ohne `web.docs_rs`/`web.crates_io` — die
-/// Schnellhelfer-Rolle braucht keinen automatischen Crate-/Doku-Index, nur
-/// gezieltes Nachschlagen einer einzelnen URL.
-///
-/// Dieselbe Begründung gilt für [`RegistryProfile::UiaExplorer`] und
-/// [`RegistryProfile::UiaWriter`] — beide teilen sich diese Konstante statt
-/// eine eigene, wertgleiche Liste zu pflegen.
-pub(crate) const UIA_QUICK_HELPER_WEB_TOOLS: &[&str] = &["web.fetch"];
 
 /// Das einzige Browser-Werkzeug von [`RegistryProfile::UiaQuickHelper`]
 /// (Nutzerentscheidung, ersetzt Addendum I in diesem Punkt): `uia-worker`
@@ -389,7 +383,7 @@ pub(crate) const UIA_QUICK_HELPER_WEB_TOOLS: &[&str] = &["web.fetch"];
 /// (`browser_tool_provider`, das sonst für **jedes** `browser.*`-Werkzeug der
 /// einzige Weg ist, siehe die Moduldokumentation oben) registriert und
 /// bewirbt `UiaQuickHelper` dieses eine Werkzeug statisch, im selben Muster
-/// wie [`UIA_QUICK_HELPER_WEB_TOOLS`] es für `web.fetch` tut — genau ein
+/// wie [`EXPLORER_WEB_TOOLS`] es für `web.fetch`/`web.search` tut — genau ein
 /// benanntes Werkzeug, nicht die ganze Werkzeugfläche seines Providers.
 /// Bewusst **kein** weiteres Browser-Werkzeug: `browser.observe`/`find`/
 /// `act`/`wait`/`events`/`close` bleiben für jedes Profil (inklusive
