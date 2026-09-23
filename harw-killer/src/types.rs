@@ -70,7 +70,7 @@ impl Outcome {
     /// error is retained by its caller. Returns an `Error` completion with owned
     /// diagnostic text. Infallible; no I/O, locks or threads.
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let error = crate::error::Error::Permission { reason: "denied" };
     /// let outcome = crate::types::Outcome::error(42, &error);
     /// assert!(!outcome.success());
@@ -86,7 +86,7 @@ impl Outcome {
     /// Borrows `self`; returns false for `Survived` and `Error`. Infallible,
     /// allocation-free and safe to call concurrently on shared report references.
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let report = crate::types::Outcome {
     ///     pid: 42, outcome: crate::types::Completion::AlreadyExited, detail: None,
     /// };

@@ -31,6 +31,7 @@ use std::time::Duration;
 // consistent without a parallel handwritten argument definition.
 #[derive(Debug, Parser)]
 #[command(
+    name = "killer",
     version,
     about = "Terminate Linux processes: KILL, wait, retry KILL",
     after_help = "Examples:\n  killer -p rustc rust-analyzer cargo -n\n  killer --process cargo --pid 1234 5678 --yes\n  killer -p node python3 -y -t 3",

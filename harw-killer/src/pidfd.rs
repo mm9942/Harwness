@@ -30,7 +30,7 @@ impl PidFd {
     /// # Errors
     /// InvalidInput for zero/out-of-range PID; Io for kernel denial or missing PID.
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let handle = crate::pidfd::PidFd::open(std::process::id())?;
     /// # Ok::<(), crate::error::Error>(())
     /// ```
@@ -56,7 +56,7 @@ impl PidFd {
     /// A newly owned duplicate. The caller must supply a descriptor known to be
     /// a pidfd; this method does not independently validate its descriptor type.
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let parent = crate::pidfd::PidFd::open(1234)?;
     /// let target = crate::pidfd::PidFd::duplicate_from(&parent, 7)?;
     /// # Ok::<(), crate::error::Error>(())
@@ -76,7 +76,7 @@ impl PidFd {
     /// Returns a nonnegative copied descriptor number, valid only while `self`
     /// remains alive. Infallible; no kernel call, locking or ownership transfer.
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let handle = crate::pidfd::PidFd::open(std::process::id())?;
     /// let descriptor = handle.raw();
     /// assert!(descriptor >= 0);
@@ -92,7 +92,7 @@ impl PidFd {
     /// Borrows `self` and copies the typed `signal`. `Ok(())` means signal
     /// submission succeeded, not that the target has exited. No wait is performed.
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let handle = crate::pidfd::PidFd::open(1234)?;
     /// handle.send(rustix::process::Signal::Term)?;
     /// # Ok::<(), crate::error::Error>(())
@@ -108,7 +108,7 @@ impl PidFd {
     /// Borrows `self`. `Ok(true)` observes exit readiness; `Ok(false)` means no
     /// exit event was observed. Poll timeout is zero; interrupted polls retry.
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let handle = crate::pidfd::PidFd::open(std::process::id())?;
     /// let observed_exit = handle.exited()?;
     /// # Ok::<(), crate::error::Error>(())

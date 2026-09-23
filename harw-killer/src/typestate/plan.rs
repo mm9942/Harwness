@@ -28,7 +28,7 @@ impl Plan<Selected> {
     /// `targets` transfers its vector and all kernel handles to the returned
     /// selected plan. Empty collections are allowed. Infallible; does no I/O.
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let selected = crate::typestate::plan::Plan::new(Vec::new());
     /// assert!(selected.targets().is_empty());
     /// ```
@@ -44,7 +44,7 @@ impl Plan<Selected> {
     /// confirmation or accepted `--yes`; this method does not prompt or signal.
     /// Infallible and does not clone descriptors or spawn threads.
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let selected = crate::typestate::plan::Plan::new(Vec::new());
     /// let approved: crate::typestate::plan::Plan<crate::typestate::plan::Approved>
     ///     = selected.approve();
@@ -63,7 +63,7 @@ impl<State> Plan<State> {
     /// Borrows `self` and returns a slice valid for the same borrow duration.
     /// Available in either state. Infallible, allocation-free and lock-free.
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let plan = crate::typestate::plan::Plan::new(Vec::new());
     /// let targets = plan.targets();
     /// assert!(targets.is_empty());

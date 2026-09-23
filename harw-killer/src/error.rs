@@ -2,12 +2,11 @@
 //!
 //! Owns diagnostic context and preserves source chains; does not perform I/O,
 //! spawn threads or acquire locks. Formatting can fail only through the supplied
-//! formatter. This binary crate's documentation examples are illustrative and
-//! are not executed by Cargo doctests.
+//! formatter. The error type is public as `harw_killer::Error`.
 //!
 //! # Examples
-//! ```no_run
-//! let error = crate::error::Error::io("read metadata", None,
+//! ```
+//! let error = harw_killer::Error::io("read metadata", None,
 //!     std::io::Error::from(std::io::ErrorKind::NotFound));
 //! assert!(error.is_gone());
 //! ```
@@ -83,8 +82,8 @@ impl Error {
     /// # Returns
     /// An owned `Io` variant; construction itself is infallible and does no I/O.
     /// # Examples
-    /// ```no_run
-    /// let error = crate::error::Error::io("poll", None,
+    /// ```
+    /// let error = harw_killer::Error::io("poll", None,
     ///     std::io::Error::from(std::io::ErrorKind::PermissionDenied));
     /// assert!(!error.is_gone());
     /// ```
@@ -103,8 +102,8 @@ impl Error {
     /// Borrows `self`; returns a classification without consuming its source.
     /// This is infallible, creates no resources and performs no synchronization.
     /// # Examples
-    /// ```no_run
-    /// let error = crate::error::Error::IdentityChanged { pid: 42 };
+    /// ```
+    /// let error = harw_killer::Error::IdentityChanged { pid: 42 };
     /// assert!(!error.is_gone());
     /// ```
     pub fn is_gone(&self) -> bool {

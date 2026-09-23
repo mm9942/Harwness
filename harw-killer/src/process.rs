@@ -32,7 +32,7 @@ use std::{collections::HashSet, fs, io, path::Path};
 /// Returns owned `(parent_pid, start_ticks, comm)` values; `text` remains borrowed.
 /// Performs no I/O and creates no threads or locks.
 /// # Examples
-/// ```
+/// ```ignore
 /// let record = format!("42 (cargo) S 7 {} 123", ["0"; 17].join(" "));
 /// let (parent, ticks, name) = crate::process::stat(42, &record)?;
 /// assert_eq!((parent, ticks, name.as_str()), (7, 123, "cargo"));
@@ -105,7 +105,7 @@ pub(crate) fn stat(pid: u32, text: &str) -> Result<(u32, u64, String)> {
 /// Returns an owned process snapshot; the numeric PID is only an inspection key.
 /// Blocking procfs reads execute on the calling thread without locks or workers.
 /// # Examples
-/// ```no_run
+/// ```ignore
 /// let snapshot = crate::process::read(std::process::id())?;
 /// assert_eq!(snapshot.pid, std::process::id());
 /// # Ok::<(), crate::error::Error>(())
@@ -194,7 +194,7 @@ pub(crate) fn read(pid: u32) -> Result<Process> {
 /// Ancestry is an observation, not a guarantee against later reparenting. Procfs
 /// reads block the calling thread; no locks or worker threads are created.
 /// # Examples
-/// ```no_run
+/// ```ignore
 /// let ids = crate::process::protected()?;
 /// assert!(ids.contains(&1) && ids.contains(&std::process::id()));
 /// # Ok::<(), crate::error::Error>(())
@@ -220,7 +220,7 @@ pub(crate) fn protected() -> Result<HashSet<u32>> {
 /// Returns whether a name or PID matches and the UID filter permits it.
 /// Borrows every input; no I/O, allocation, locks or threads.
 /// # Examples
-/// ```no_run
+/// ```ignore
 /// use clap::Parser;
 /// let cli = crate::cli::Cli::parse_from(["killer", "-p", "cargo"]);
 /// let snapshot = crate::process::read(std::process::id())?;
@@ -292,7 +292,7 @@ fn candidate_ids(cli: &Cli) -> Result<Vec<u32>> {
 /// Callers must retain these handles through preview, approval and execution.
 /// Blocks for procfs/kernel inspection; no threads or locks are created.
 /// # Examples
-/// ```no_run
+/// ```ignore
 /// use clap::Parser;
 /// let cli = crate::cli::Cli::parse_from(["killer", "-p", "cargo", "--dry-run"]);
 /// let targets = crate::process::select(&cli)?;
