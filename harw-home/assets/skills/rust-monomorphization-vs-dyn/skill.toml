@@ -1,0 +1,5 @@
+name = "rust-monomorphization-vs-dyn"
+description = "Use when deciding between a generic type parameter and `Box<dyn Trait>` / `Arc<dyn Trait>` — teaches wann statischer Dispatch (Generics, monomorphisiert, schnell) vs. dynamischer Dispatch (heterogene Sammlung, Plugin-Muster) die richtige Wahl ist (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

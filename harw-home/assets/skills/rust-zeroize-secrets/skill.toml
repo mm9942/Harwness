@@ -1,0 +1,5 @@
+name = "rust-zeroize-secrets"
+description = "Use when a Rust struct or function handles cryptographic key material, passwords, tokens, or any secret bytes — teaches `#[derive(Zeroize, ZeroizeOnDrop)]` for owned structs and `Zeroizing<Vec<u8>>` for transient buffers, so secrets are overwritten in memory when dropped rather than lingering in freed heap (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

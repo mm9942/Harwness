@@ -1,0 +1,5 @@
+name = "rust-map-err"
+description = "Use when ein fremder Fehlertyp (z. B. aus einer externen Crate) in den eigenen `Error`-Enum übersetzt werden muss — lehrt `.map_err(Error::from)` vs. `.map_err(|e| Error::Variant { … })` (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

@@ -1,0 +1,5 @@
+name = "rust-error-from-impls"
+description = "Use when ein Rust-Fehlertyp fremde Fehler (std::io::Error, serde_json::Error, sqlx::Error, …) per `?` automatisch konvertieren soll — lehrt `impl From<ForeignError> for MyError` so dass `?` ohne manuelles `.map_err()` funktioniert. Verbotene Crates: anyhow, thiserror. (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

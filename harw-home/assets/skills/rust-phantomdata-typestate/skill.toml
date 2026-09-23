@@ -1,0 +1,5 @@
+name = "rust-phantomdata-typestate"
+description = "Use when modelling an object lifecycle or permission boundary where invalid state transitions must be compile errors — teaches Zero-Sized-Marker-Structs + PhantomData<State> so transitions consume `self` and illegal moves never compile (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

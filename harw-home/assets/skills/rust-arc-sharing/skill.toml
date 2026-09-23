@@ -1,0 +1,5 @@
+name = "rust-arc-sharing"
+description = "Use when sharing immutable data across threads — teaches Arc::clone(&a) to clone only the pointer (atomic ref-count bump), never the inner data (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

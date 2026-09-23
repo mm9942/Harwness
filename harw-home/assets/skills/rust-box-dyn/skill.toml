@@ -1,0 +1,5 @@
+name = "rust-box-dyn"
+description = "Use when verschiedene Typen denselben Trait implementieren und gemeinsam in einer Collection oder als Rückgabetyp erscheinen sollen — teaches Box<dyn Trait> für Trait-Objekte und dynamic dispatch (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

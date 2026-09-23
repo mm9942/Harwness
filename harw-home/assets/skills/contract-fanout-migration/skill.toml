@@ -1,0 +1,5 @@
+name = "contract-fanout-migration"
+description = "Coordinate a mechanical, cross-file migration or rewrite (e.g. swapping one library for another across N tightly-coupled files) using a Contract Master document plus one file-orchestrator per file, each fanning out to parallel subagents per responsibility area. Use when the user asks for a specific \"N agents per file\" / \"contract master\" / \"file orchestrator\" harness, or when a migration touches several files that must share exact type/function signatures and a single agent doing it inline would be riskier to keep consistent, or the user explicitly wants heavy parallel subagent usage for a bounded mechanical task."
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read", "filesystem.write", "process.execute"]

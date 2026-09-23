@@ -1,0 +1,5 @@
+name = "rust-cargo-add-and-dep-research"
+description = "Use when adding or upgrading a Rust dependency, resolving a version/feature conflict (e.g. \"failed to select a version for X\"), or looking up the exact API/syntax of a crate — teaches `cargo add <crate> --features …`, resolving conflicts to the newest compatible version, and researching syntax via docs.rs + the `~/.cargo` registry source, always through subagents (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read", "process.execute", "web.search", "web.fetch"]

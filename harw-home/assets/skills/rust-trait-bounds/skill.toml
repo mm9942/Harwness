@@ -1,0 +1,5 @@
+name = "rust-trait-bounds"
+description = "Use when a generic function needs multiple constraints on a type parameter — teaches `where`-Klauseln und kombinierten Bounds wie `T: AsyncRead + Unpin + Send + 'static` (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

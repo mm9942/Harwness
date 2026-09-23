@@ -1,0 +1,5 @@
+name = "rust-as-ref"
+description = "Use when converting Option<String> to Option<&str>, or writing a function that accepts multiple string/path/byte types — teaches Option::as_ref, Option::as_deref, and the AsRef trait (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

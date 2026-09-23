@@ -1,0 +1,5 @@
+name = "rust-borrow-checker-e0505"
+description = "Use when the borrow checker rejects a move because a value is still borrowed (E0505), especially when matching on request.method() then moving the request — teaches how to own a derived value up-front so no reference outlives the move (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

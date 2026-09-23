@@ -1,0 +1,5 @@
+name = "rust-loops-and-labels"
+description = "Use when du eine Schleife mit Index-Zugriff schreibst, verschachtelte Schleifen per Label verlassen willst, oder `loop` einen Wert zurückgeben soll — lehrt `loop`/`while`/`for`, Loop-Labels (`'outer:`), `break` mit Rückgabewert, und warum Iterator-Chains Index-Schleifen ersetzen (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

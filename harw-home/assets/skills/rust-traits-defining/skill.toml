@@ -1,0 +1,5 @@
+name = "rust-traits-defining"
+description = "Use when extracting a shared interface across two or more types — teaches naming traits after BEHAVIOR (Builder/Resolver/Installer/Repository), not after the type or technology (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

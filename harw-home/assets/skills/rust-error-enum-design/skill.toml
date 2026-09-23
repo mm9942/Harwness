@@ -1,0 +1,5 @@
+name = "rust-error-enum-design"
+description = "Use when ein neues Rust-Modul einen eigenen Fehlertyp braucht oder ein bestehender Error-Enum erweitert wird — lehrt den vollständigen handgeschriebenen Error-Enum mit Display, Debug (delegiert an Display) und impl std::error::Error mit source(). Verbotene Crates: anyhow, thiserror. (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

@@ -1,0 +1,5 @@
+name = "rust-generic-functions"
+description = "Use when writing a function that duplicates logic across two or more concrete types — teaches `fn foo<T: Trait>(x: &T)` to eliminate duplication without runtime cost (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

@@ -1,0 +1,5 @@
+name = "rust-if-let-let-else"
+description = "Use when du einen `Option`- oder `Result`-Wert entpacken willst ohne vollständiges `match` — lehrt `if let Some(x) = …` für einfache Fälle und `let Ok(x) = … else { return Err(…) }` als Guard-Klausel für frühe Rückkehr (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

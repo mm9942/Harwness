@@ -1,0 +1,5 @@
+name = "rust-move-semantics"
+description = "Use when writing a function that consumes an owned value or transitions state via `self`, or when debugging \"value used after move\" errors — teaches Move vs Copy, when functions eat ownership, and how the Copy trait exempts stack types (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

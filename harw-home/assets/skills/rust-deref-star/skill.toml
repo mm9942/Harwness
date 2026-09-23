@@ -1,0 +1,5 @@
+name = "rust-deref-star"
+description = "Use when reading a Copy field through a smart pointer, guard, or wrapper (MutexGuard, Arc, Ref) and tempted to call .clone() — teaches `*deref` to copy out a Copy value without allocation (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

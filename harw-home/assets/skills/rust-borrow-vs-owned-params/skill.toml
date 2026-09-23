@@ -1,0 +1,5 @@
+name = "rust-borrow-vs-owned-params"
+description = "Use when writing a function signature and deciding whether to take &str/&[T]/&Path or String/Vec<T>/PathBuf — teaches \"borrow in parameters, return owned only when the caller must own the result\" (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

@@ -1,0 +1,5 @@
+name = "rust-question-mark-operator"
+description = "Use when Fehler-Propagation per `?` unklar ist, ein `?` einen Compiler-Fehler verursacht (E0277/E0308), oder manuelles `match`/`map_err` vereinfacht werden soll — lehrt wie `?` funktioniert, wie es `From` nutzt und wo es nicht erlaubt ist. (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

@@ -1,0 +1,5 @@
+name = "rust-explicit-lifetimes"
+description = "Use when a function returns a reference derived from one of multiple input references and the compiler cannot infer which input it comes from — teaches `<'a>` syntax in fn signatures and how to tie output lifetimes to the correct input (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

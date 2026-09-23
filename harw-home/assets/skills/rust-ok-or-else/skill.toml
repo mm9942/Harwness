@@ -1,0 +1,5 @@
+name = "rust-ok-or-else"
+description = "Use when ein `Option<T>` in ein `Result<T, Error>` überführt werden muss — lehrt `.ok_or_else(|| Error::…)` als kanonisches Muster (Rust Edition 2024)"
+enabled = true
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]
