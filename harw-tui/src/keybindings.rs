@@ -54,7 +54,7 @@ const COMMAND_MODIFIERS: KeyModifiers = KeyModifiers::CONTROL
 
 /// Eine per Tastenbelegung auslösbare Aktion.
 ///
-/// Panel-Aktionen ([`KeyAction::is_panel_action`]) wertet
+/// Panel-Aktionen (Explorer/Agenten umschalten, Fokus, Vollbild) wertet
 /// `PanelState::handle_key` aus, die übrigen der Chat-/Composer-Zweig in
 /// `app.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -115,18 +115,6 @@ impl KeyAction {
     /// Umkehrung von [`KeyAction::name`]; `None` für unbekannte Namen.
     pub(crate) fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|action| action.name() == name)
-    }
-
-    /// `true` für Aktionen, die `PanelState::handle_key` behandelt.
-    pub(crate) const fn is_panel_action(self) -> bool {
-        matches!(
-            self,
-            Self::ToggleExplorer
-                | Self::ToggleAgents
-                | Self::CycleFocus
-                | Self::MaximizePanel
-                | Self::FocusExplorer
-        )
     }
 
     /// Voreingestellte Chords (entsprechen der bisherigen festen Belegung).
@@ -428,6 +416,7 @@ impl Default for KeyBindings {
 
 impl KeyBindings {
     /// Chords einer Aktion (leer, wenn aufgehoben) — etwa für Hilfetexte.
+    #[cfg(test)]
     pub(crate) fn chords(&self, action: KeyAction) -> &[KeyChord] {
         self.bindings
             .get(&action)

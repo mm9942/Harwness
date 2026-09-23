@@ -64,6 +64,7 @@ pub(crate) struct TelegramWorkPayload {
 ///
 /// # Errors
 /// [`serde_json::Error`], falls die Serialisierung scheitert.
+#[cfg(test)]
 pub(crate) fn encode_payload(p: &TelegramWorkPayload) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(p)
 }
@@ -114,14 +115,6 @@ impl JobStoreWorkLauncher {
     #[must_use]
     pub(crate) fn for_profile_dir(profile_dir: &Path) -> Self {
         Self::new(Arc::new(JobStore::new(profile_dir)))
-    }
-
-    /// Ersetzt Budget und Retry-Policy neu zugelassener Jobs.
-    #[must_use]
-    pub(crate) fn with_policy(mut self, budget: Budget, retry: RetryPolicy) -> Self {
-        self.budget = budget;
-        self.retry = retry;
-        self
     }
 
     /// Baut den durablen Datensatz für `request`.

@@ -1309,12 +1309,6 @@ impl ChatApp {
         self.key_bindings = bindings;
     }
 
-    /// Aktive Tastenbelegung — etwa um sie nach `/resume`/`/new` in die neu
-    /// gebaute App zu übernehmen.
-    pub(crate) fn key_bindings(&self) -> &KeyBindings {
-        &self.key_bindings
-    }
-
     /// Rebinds persistent input history to the runtime-selected Harw home.
     ///
     /// `ChatApp::new` has a standalone fallback for tests and embedders. The

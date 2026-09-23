@@ -59,6 +59,7 @@ use std::process::{Command as ProcessCommand, ExitCode};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
 use clap::Parser;
 use harw_config::{
     McpJobCapabilityToml, OriginAllowlistToml, PlanSection, ProviderToml, ResolvedConfig,
@@ -151,7 +152,7 @@ pub fn log_sensitive_enabled() -> bool {
 /// Öffnet (und rotiert bei Bedarf) das Datei-Log der TUI.
 fn open_tui_log_file() -> Option<std::fs::File> {
     const MAX_BYTES: u64 = 10 * 1024 * 1024;
-    let dir = harw_home::logs_dir(&harw_home::home_dir().ok()?);
+    let dir = harw_home::paths::logs_dir(&harw_home::home_dir().ok()?);
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join("tui.log");
     if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > MAX_BYTES) {

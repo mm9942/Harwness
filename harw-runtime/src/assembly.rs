@@ -1449,7 +1449,7 @@ impl RuntimeAssemblyBuilder {
         // Netz (Warnung), nicht die ganze Sitzung.
         if let Ok(home) = harw_home::home_dir()
             && let Err(error) =
-                harw_registry_defaults::install_web_tools(&config, &harw_home::cache_dir(&home))
+                harw_registry_defaults::install_web_tools(&config, &harw_home::paths::cache_dir(&home))
         {
             tracing::warn!(%error, "runtime.web_tools_not_configured");
         }
