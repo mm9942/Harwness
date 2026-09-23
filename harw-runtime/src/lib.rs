@@ -21,6 +21,7 @@ pub mod sandbox;
 pub mod services;
 pub mod session_title;
 pub mod spec;
+pub mod task_context;
 pub mod trace;
 
 #[cfg(test)]

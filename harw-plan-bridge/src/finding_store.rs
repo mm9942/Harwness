@@ -505,7 +505,7 @@ fn render_document(finding: &ResearchFinding) -> Result<String, PlanBridgeError>
         finding.verified_versions.iter().map(|version| {
             format!(
                 "`{} = \"{}\"` (geprüft gegen {})",
-                version.crate_name, version.version, version.verified_against
+                version.package, version.version, version.verified_against
             )
         }),
     );
@@ -596,16 +596,26 @@ mod tests {
     fn finding(question_id: &str) -> ResearchFinding {
         ResearchFinding {
             question_id: QuestionId::new(question_id),
+            likelihood: None,
+            confidence_rationale: String::new(),
+            hypotheses: vec![],
+            key_assumptions: vec![],
+            indicators: vec![],
+            dissent: vec![],
             conclusion: "jiff 0.2.32 ist die aktuelle Version.".to_owned(),
             evidence: vec![SourceReference {
                 kind: SourceClass::CargoRegistrySource,
+                reliability: None,
+                credibility: None,
+                derived_from: None,
                 locator: "crates.io/crates/jiff".to_owned(),
                 retrieved_at: timestamp(),
                 digest: None,
                 excerpt: "version = \"0.2.32\"".to_owned(),
             }],
             verified_versions: vec![VersionReference {
-                crate_name: "jiff".to_owned(),
+                package: "jiff".to_owned(),
+                ecosystem: "cargo".to_owned(),
                 version: "0.2.32".to_owned(),
                 msrv: Some("1.85".to_owned()),
                 features: vec!["serde".to_owned()],

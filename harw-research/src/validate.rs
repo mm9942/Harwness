@@ -118,6 +118,12 @@ mod tests {
     ) -> TestResult<ResearchFinding> {
         Ok(ResearchFinding {
             question_id: QuestionId::new("q-1"),
+            likelihood: None,
+            confidence_rationale: String::new(),
+            hypotheses: vec![],
+            key_assumptions: vec![],
+            indicators: vec![],
+            dissent: vec![],
             conclusion: "some conclusion".to_owned(),
             evidence,
             verified_versions: vec![],
@@ -133,6 +139,9 @@ mod tests {
     fn evidence() -> TestResult<Vec<SourceReference>> {
         Ok(vec![SourceReference {
             kind: SourceClass::OfficialDocs,
+            reliability: None,
+            credibility: None,
+            derived_from: None,
             locator: "https://docs.rs/jiff".to_owned(),
             retrieved_at: ts()?,
             digest: None,

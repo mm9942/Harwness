@@ -1456,13 +1456,19 @@ impl RuntimeAssemblyBuilder {
             tracing::warn!(%error, "runtime.web_tools_not_configured");
         }
 
-        // 2. Projekterkennung — genau einmal je Lauf.
-        let project =
-            discover_project(&spec.cwd, &DiscoveryConfig::default()).map_err(|error| {
-                RuntimeError::Discovery {
-                    detail: format!("could not discover the project below the cwd: {error}"),
-                }
-            })?;
+        // 2. Projekterkennung — genau einmal je Lauf. Profil-eigene
+        //    `project_root_markers` ersetzen die Standardmarker.
+        let discovery_config = match config.harness.project_root_markers.as_ref() {
+            Some(markers) if !markers.is_empty() => {
+                DiscoveryConfig::default().with_root_markers(markers.clone())
+            }
+            _ => DiscoveryConfig::default(),
+        };
+        let project = discover_project(&spec.cwd, &discovery_config).map_err(|error| {
+            RuntimeError::Discovery {
+                detail: format!("could not discover the project below the cwd: {error}"),
+            }
+        })?;
 
         // 2b. Projekt-Home nach Contract §3 (`harw_home::project`) —
         //     eigenständig von der Projekterkennung oben: jene speist den
@@ -2119,6 +2125,21 @@ impl RuntimeAssemblyBuilder {
                     detail: format!(
                         "could not register the memory facts context provider: {error}"
                     ),
+                })?
+        } else {
+            registry_builder
+        };
+
+        // 12d. Repository-Überblick (`repo.tree`) aus dem verzeichnis-
+        //      gebundenen Explorer — nur für Einstiege mit Projektkontext,
+        //      sonst würden Host-Pfade durchsickern.
+        let registry_builder = if profile.project_context {
+            registry_builder
+                .context_provider(Arc::new(crate::task_context::RepoTreeContextProvider::new(
+                    bound_root.clone(),
+                )))
+                .map_err(|error| RuntimeError::Registry {
+                    detail: format!("could not register the repo tree context provider: {error}"),
                 })?
         } else {
             registry_builder

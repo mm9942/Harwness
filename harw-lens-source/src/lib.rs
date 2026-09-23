@@ -235,9 +235,12 @@ mod status;
 mod test_support;
 
 pub use build::{IndexBuildReport, LENS_REMOTE_EMBED_ON_OPERATOR_ONLY, build_index};
+#[allow(deprecated)]
+pub use document::collect_rust_sources;
 pub use document::{
-    RawDocument, collect_design_docs, collect_diary_documents, collect_palace_documents,
-    collect_rust_sources, visibility_of_scope,
+    CODE_SOURCE_EXTENSIONS, CODE_SOURCE_MAX_BYTES, CodeChunker, RawDocument, SKIPPED_SOURCE_DIRS,
+    chunker_for_path, collect_code_sources, collect_design_docs, collect_diary_documents,
+    collect_palace_documents, visibility_of_scope,
 };
 pub use error::{SourceError, SourceResult};
 pub use status::{IndexStatus, index_status};

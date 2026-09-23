@@ -559,9 +559,18 @@ pub(crate) mod testing {
     pub(crate) fn sample_finding(question_id: &str, unresolved: &[&str]) -> ResearchFinding {
         ResearchFinding {
             question_id: QuestionId::new(question_id),
+            likelihood: None,
+            confidence_rationale: String::new(),
+            hypotheses: vec![],
+            key_assumptions: vec![],
+            indicators: vec![],
+            dissent: vec![],
             conclusion: format!("Antwort auf {question_id}"),
             evidence: vec![SourceReference {
                 kind: SourceClass::LocalSource,
+                reliability: None,
+                credibility: None,
+                derived_from: None,
                 locator: "src/lib.rs".to_owned(),
                 retrieved_at: timestamp(),
                 digest: None,

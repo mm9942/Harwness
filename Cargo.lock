@@ -2768,6 +2768,7 @@ dependencies = [
  "harw-config",
  "harw-context",
  "harw-core",
+ "harw-explorer",
  "harw-extension-api",
  "harw-fsutil",
  "harw-home",

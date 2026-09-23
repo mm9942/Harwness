@@ -210,6 +210,9 @@ pub(crate) fn parse_source_class(raw: &str) -> Result<SourceClass, OpError> {
     match normalized.as_str() {
         "local_source" | "local" => Ok(SourceClass::LocalSource),
         "cargo_registry_source" | "registry" | "crates_io" => Ok(SourceClass::CargoRegistrySource),
+        "package_registry_source" | "package_registry" | "npm" | "pypi" | "maven" => {
+            Ok(SourceClass::PackageRegistrySource)
+        }
         "official_docs" | "docs" => Ok(SourceClass::OfficialDocs),
         "repository" | "repo" => Ok(SourceClass::Repository),
         "release_notes" | "changelog" => Ok(SourceClass::ReleaseNotes),
@@ -217,7 +220,8 @@ pub(crate) fn parse_source_class(raw: &str) -> Result<SourceClass, OpError> {
         "web" => Ok(SourceClass::Web),
         other => Err(OpError::InvalidArguments(format!(
             "unbekannte Quellklasse '{other}'; erlaubt sind: local_source, \
-             cargo_registry_source, official_docs, repository, release_notes, standard, web"
+             cargo_registry_source, package_registry_source, official_docs, repository, \
+             release_notes, standard, web"
         ))),
     }
 }

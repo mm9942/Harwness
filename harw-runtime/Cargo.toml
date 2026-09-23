@@ -10,6 +10,7 @@ default = ["browser"]
 browser = ["harw-registry-defaults/browser"]
 
 [dependencies]
+harw-explorer = { path = "../harw-explorer" }
 harw-authority = { path = "../harw-authority" }
 # Gemeinsame Runtime-Montage (L12): darf nur von `harw-tui` und `harw-cli`
 # genutzt werden, sonst entsteht ein Zyklus.

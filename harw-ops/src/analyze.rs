@@ -128,9 +128,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use harw_code_graph::WorkspaceGraph;
-use harw_explorer::{ExplorerIndex, ExplorerOptions, ProjectKind, RelationKind};
 use harw_core::child_controller::JoinSemantics;
 use harw_core_bridge::{ChildReturnContract, fanout_children, parse_budget_hint};
+use harw_explorer::{ExplorerIndex, ExplorerOptions, ProjectKind, RelationKind};
 use harw_macros::operation;
 use harw_operations::require_service;
 use harw_operations::{FromRawArgs, OpContext, OpError, OpOutput};
@@ -323,14 +323,14 @@ fn parse_max_parallel(raw: &str) -> Result<usize, OpError> {
     Ok(value)
 }
 
-// ── Graph ohne Cargo.toml ────────────────────────────────────────────────────
+// ── Einheiten-Graph ──────────────────────────────────────────────────────────
 
-/// Verzeichnisnamen, die nie als Pseudo-Crate gezählt werden.
+/// Verzeichnisnamen, die im Verzeichnis-Rückfall nie als Einheit zählen.
 ///
-/// Feste Ausschlussliste für gängige Build-/Abhängigkeits-Artefakte, die auch
-/// in einem Nicht-Rust-Projekt im Wurzelverzeichnis liegen können. Versteckte
-/// Verzeichnisse (führendes `.`, siehe [`synthesize_directory_graph`]) deckt
-/// diese Liste bewusst nicht ab — dafür reicht der Namenstest allein.
+/// Feste Ausschlussliste für gängige Build-/Abhängigkeits-Artefakte, die im
+/// Wurzelverzeichnis liegen können. Versteckte Verzeichnisse (führendes `.`,
+/// siehe [`synthesize_directory_graph`]) deckt diese Liste bewusst nicht ab —
+/// dafür reicht der Namenstest allein.
 const SYNTHETIC_EXCLUDED_DIRS: [&str; 6] = [
     "target",
     "node_modules",
@@ -340,36 +340,617 @@ const SYNTHETIC_EXCLUDED_DIRS: [&str; 6] = [
     "__pycache__",
 ];
 
-/// Baut einen [`WorkspaceGraph`] für ein Wurzelverzeichnis ohne `Cargo.toml`.
+/// Projektarten, die selbst eine Analyse-Einheit bilden, in Vorrang-Reihenfolge.
+///
+/// Die erste vorhandene Art einer Projektwurzel bestimmt Name und Etikett der
+/// Einheit. `CargoWorkspace` (Hülle) und `Git` (Repository-Grenze) fehlen
+/// bewusst: sie beschreiben Gruppierungen, keinen analysierbaren Inhalt.
+const UNIT_KIND_PRIORITY: [ProjectKind; 5] = [
+    ProjectKind::CargoCrate,
+    ProjectKind::Node,
+    ProjectKind::Python,
+    ProjectKind::Go,
+    ProjectKind::Documents,
+];
+
+/// Eine Analyse-Einheit: ein Projekt oder (im Rückfall) ein Verzeichnis.
 ///
 /// # Beschreibung
-/// Liest die direkten Unterverzeichnisse von `root` (nicht rekursiv);
-/// unterhalb liegende Verzeichnisse werden nicht betrachtet. Übersprungen
-/// werden Verzeichnisse mit führendem `.` (deckt `.git`, `.harw`, `.claude`,
-/// `.codex`, `.venv` einheitlich ab) sowie [`SYNTHETIC_EXCLUDED_DIRS`]. Für
-/// jedes verbleibende Unterverzeichnis entsteht ein synthetischer
-/// [`CrateNode`] auf Ebene 0 ohne hergeleitete Abhängigkeitskanten — ein
-/// ehrlicher Stand für ein Projekt ohne bekannte interne Abhängigkeiten.
-/// Gibt es kein qualifizierendes Unterverzeichnis (ein flaches Projekt, z. B.
-/// ein Ordner voller Markdown-Dateien), entsteht genau ein Pseudo-Crate für
-/// `root` selbst.
+/// Sprach- und ökosystemneutrale Entsprechung des früheren Crate-Knotens.
+/// `deps` enthält die **Namen** anderer Einheiten desselben Graphen, von denen
+/// diese Einheit abhängt; der Graph ist per Konstruktion azyklisch.
 ///
-/// # Argumente
-/// - `root` (`&Path`): die Workspace-Wurzel; muss als Verzeichnis lesbar
-///   sein.
+/// # Nebenläufigkeit
+/// Reiner Werttyp.
+#[derive(Debug, Clone)]
+struct AnalysisUnit {
+    /// Eindeutiger Anzeigename (Manifest-Name, sonst Ordnername; bei
+    /// Kollision um den relativen Pfad ergänzt).
+    name: String,
+    /// Erkannte Projektarten dieser Wurzel in [`UNIT_KIND_PRIORITY`]-Ordnung;
+    /// leer für eine reine Verzeichnis-Einheit.
+    kinds: Vec<ProjectKind>,
+    /// Pfad relativ zur Wurzel (leer = die Wurzel selbst).
+    rel: PathBuf,
+    /// Absolutes Verzeichnis der Einheit.
+    dir: PathBuf,
+    /// Manifest relativ zur Wurzel, falls vorhanden.
+    manifest: Option<PathBuf>,
+    /// `[package].name`, wenn die Einheit ein Cargo-Crate ist.
+    cargo_name: Option<String>,
+    /// Version aus der Cargo-Anreicherung, falls bekannt.
+    version: Option<String>,
+    /// Namen der Einheiten, von denen diese abhängt.
+    deps: Vec<String>,
+    /// Externe Abhängigkeiten aus der Cargo-Anreicherung.
+    external_deps: Vec<String>,
+    /// Ebene von unten: `0` für Blätter, sonst `1 + max(Ebene der deps)`.
+    level: u32,
+}
+
+impl AnalysisUnit {
+    /// Etikett der vorrangigen Projektart (`cargo-crate`, `node`, …) oder
+    /// `directory` für eine reine Verzeichnis-Einheit.
+    fn kind_label(&self) -> &'static str {
+        self.kinds.first().map_or("directory", |kind| kind.label())
+    }
+
+    /// Relativer Pfad für Anzeige und Prompt (`.` für die Wurzel).
+    fn rel_display(&self) -> String {
+        if self.rel.as_os_str().is_empty() {
+            ".".to_owned()
+        } else {
+            path_key(&self.rel)
+        }
+    }
+}
+
+/// Der Einheiten-Graph eines Arbeitsbereichs.
+///
+/// # Beschreibung
+/// Ersetzt den früheren Cargo-only [`WorkspaceGraph`] als Arbeitsstruktur von
+/// `/analyze`. Die Ebenen sind nach [`assign_levels`] in jeder Einheit
+/// gespeichert und mit ihren `deps` konsistent.
+#[derive(Debug, Clone)]
+struct UnitGraph {
+    /// Wurzel des Arbeitsbereichs.
+    root: PathBuf,
+    /// Alle Einheiten.
+    units: Vec<AnalysisUnit>,
+}
+
+impl UnitGraph {
+    /// Sucht eine Einheit anhand ihres Namens.
+    fn get(&self, name: &str) -> Option<&AnalysisUnit> {
+        self.units.iter().find(|unit| unit.name == name)
+    }
+
+    /// Sucht eine Einheit über Namen, Cargo-Crate-Namen oder relativen Pfad.
+    fn find(&self, query: &str) -> Option<&AnalysisUnit> {
+        let trimmed = query.trim().trim_end_matches('/');
+        let path_query = trimmed.strip_prefix("./").unwrap_or(trimmed);
+        self.get(query)
+            .or_else(|| {
+                self.units
+                    .iter()
+                    .find(|unit| unit.cargo_name.as_deref() == Some(query))
+            })
+            .or_else(|| {
+                self.units
+                    .iter()
+                    .find(|unit| unit.rel_display() == path_query)
+            })
+    }
+
+    /// Alle Einheiten, die `name` direkt (über `deps`) benutzen, nach Name
+    /// sortiert.
+    fn consumers_of(&self, name: &str) -> Vec<&AnalysisUnit> {
+        let mut consumers: Vec<&AnalysisUnit> = self
+            .units
+            .iter()
+            .filter(|unit| unit.deps.iter().any(|dep| dep == name))
+            .collect();
+        consumers.sort_by(|a, b| a.name.cmp(&b.name));
+        consumers
+    }
+
+    /// Einheiten, die verzeichnismäßig **innerhalb** von `unit` liegen und
+    /// eigenständig analysiert werden, nach Name sortiert.
+    fn nested_in(&self, unit: &AnalysisUnit) -> Vec<&AnalysisUnit> {
+        let mut nested: Vec<&AnalysisUnit> = self
+            .units
+            .iter()
+            .filter(|other| other.rel != unit.rel && other.rel.starts_with(&unit.rel))
+            .collect();
+        nested.sort_by(|a, b| a.name.cmp(&b.name));
+        nested
+    }
+
+    /// Teilgraph aus der Einheit `query` und allen transitiven Abhängigkeiten.
+    ///
+    /// # Errors
+    /// - [`OpError::Execution`]: keine Einheit passt auf `query`.
+    fn subgraph(&self, query: &str) -> Result<Self, OpError> {
+        let Some(start) = self.find(query) else {
+            let known: Vec<&str> = self.units.iter().map(|unit| unit.name.as_str()).collect();
+            return Err(OpError::Execution(format!(
+                "Teilgraph für '{query}' nicht bildbar: keine Einheit dieses Namens oder Pfads \
+                 (bekannt: {})",
+                known.join(", ")
+            )));
+        };
+        let mut included: BTreeSet<String> = BTreeSet::new();
+        let mut stack: Vec<String> = vec![start.name.clone()];
+        while let Some(current) = stack.pop() {
+            if !included.insert(current.clone()) {
+                continue;
+            }
+            if let Some(unit) = self.get(&current) {
+                stack.extend(
+                    unit.deps
+                        .iter()
+                        .filter(|dep| !included.contains(*dep))
+                        .cloned(),
+                );
+            }
+        }
+        let mut units: Vec<AnalysisUnit> = self
+            .units
+            .iter()
+            .filter(|unit| included.contains(&unit.name))
+            .cloned()
+            .collect();
+        assign_levels(&mut units);
+        Ok(Self {
+            root: self.root.clone(),
+            units,
+        })
+    }
+
+    /// Gruppiert alle Einheiten in Ebenen von unten (Index `0` = Blätter),
+    /// innerhalb einer Ebene nach Name sortiert.
+    fn levels(&self) -> Vec<Vec<&AnalysisUnit>> {
+        let Some(max_level) = self.units.iter().map(|unit| unit.level).max() else {
+            return Vec::new();
+        };
+        let mut levels: Vec<Vec<&AnalysisUnit>> = (0..=max_level).map(|_| Vec::new()).collect();
+        for unit in &self.units {
+            if let Some(bucket) = levels.get_mut(unit.level as usize) {
+                bucket.push(unit);
+            }
+        }
+        for bucket in &mut levels {
+            bucket.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        levels.retain(|bucket| !bucket.is_empty());
+        levels
+    }
+
+    /// Kompakte Textprojektion (`Ebene N: a, b`) für Prompts und Berichte.
+    fn render_levels(&self) -> String {
+        let mut out = String::new();
+        for (index, bucket) in self.levels().iter().enumerate() {
+            let names: Vec<&str> = bucket.iter().map(|unit| unit.name.as_str()).collect();
+            out.push_str(&format!("Ebene {index}: {}\n", names.join(", ")));
+        }
+        out
+    }
+}
+
+/// Berechnet die Ebenen aller Einheiten und hält `deps` konsistent.
+///
+/// # Beschreibung
+/// Unbekannte Abhängigkeitsnamen werden entfernt. Sollte trotz azyklischer
+/// Konstruktion ein Zyklus übrig sein, werden die offenen Kanten der ersten
+/// blockierten Einheit verworfen (protokolliert) — so passen gespeicherte
+/// Ebenen und `deps` immer zusammen, und `harw_plan` sieht nie eine Kante auf
+/// einen später angelegten Knoten.
+fn assign_levels(units: &mut [AnalysisUnit]) {
+    let index: HashMap<String, usize> = units
+        .iter()
+        .enumerate()
+        .map(|(position, unit)| (unit.name.clone(), position))
+        .collect();
+    for unit in units.iter_mut() {
+        unit.deps.retain(|dep| index.contains_key(dep));
+    }
+
+    let mut levels: Vec<Option<u32>> = vec![None; units.len()];
+    loop {
+        let mut progressed = false;
+        let mut pending = false;
+        for position in 0..units.len() {
+            if levels[position].is_some() {
+                continue;
+            }
+            let mut ready = true;
+            let mut max_dep: Option<u32> = None;
+            for dep in &units[position].deps {
+                match index.get(dep).and_then(|&other| levels[other]) {
+                    Some(level) => max_dep = Some(max_dep.map_or(level, |max| max.max(level))),
+                    None => {
+                        ready = false;
+                        break;
+                    }
+                }
+            }
+            if ready {
+                levels[position] = Some(max_dep.map_or(0, |max| max + 1));
+                progressed = true;
+            } else {
+                pending = true;
+            }
+        }
+        if !pending {
+            break;
+        }
+        if !progressed {
+            if let Some(blocked) = levels.iter().position(Option::is_none) {
+                tracing::warn!(
+                    unit = units[blocked].name.as_str(),
+                    "analyze.graph.cycle — offene Kanten verworfen"
+                );
+                let resolved: BTreeSet<String> = index
+                    .iter()
+                    .filter(|&(_, &other)| levels[other].is_some())
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                units[blocked].deps.retain(|dep| resolved.contains(dep));
+            }
+        }
+    }
+    for (unit, level) in units.iter_mut().zip(levels) {
+        unit.level = level.unwrap_or(0);
+    }
+}
+
+/// Kanten-Sammler, der nur azyklische Kanten zulässt.
+///
+/// `deps[i]` sind die Indizes der Einheiten, von denen Einheit `i` abhängt.
+struct EdgeSet {
+    deps: Vec<BTreeSet<usize>>,
+    dropped: usize,
+}
+
+impl EdgeSet {
+    /// Leerer Sammler für `count` Einheiten.
+    fn new(count: usize) -> Self {
+        Self {
+            deps: vec![BTreeSet::new(); count],
+            dropped: 0,
+        }
+    }
+
+    /// `true`, wenn `target` von `start` aus über Kanten erreichbar ist.
+    fn reaches(&self, start: usize, target: usize) -> bool {
+        let mut visited = vec![false; self.deps.len()];
+        let mut stack = vec![start];
+        while let Some(current) = stack.pop() {
+            if current == target {
+                return true;
+            }
+            if visited.get(current).copied().unwrap_or(true) {
+                continue;
+            }
+            visited[current] = true;
+            if let Some(next) = self.deps.get(current) {
+                stack.extend(next.iter().copied());
+            }
+        }
+        false
+    }
+
+    /// Fügt `from → to` hinzu, sofern die Kante neu ist und keinen Zyklus
+    /// schließt; eine zyklusschließende Kante wird gezählt und verworfen.
+    fn add(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.deps.len() || to >= self.deps.len() {
+            return;
+        }
+        if self.deps[from].contains(&to) {
+            return;
+        }
+        if self.reaches(to, from) {
+            self.dropped += 1;
+            return;
+        }
+        self.deps[from].insert(to);
+    }
+}
+
+/// Pfad als `/`-getrennte Zeichenkette (plattformunabhängig).
+fn path_key(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Die innerste Einheit, deren Verzeichnis `path` enthält.
+fn innermost_unit(units: &[AnalysisUnit], path: &Path) -> Option<usize> {
+    units
+        .iter()
+        .enumerate()
+        .filter(|(_, unit)| path.starts_with(&unit.rel))
+        .max_by_key(|(_, unit)| unit.rel.components().count())
+        .map(|(position, _)| position)
+}
+
+/// Baut die Einheiten aus den Projekten eines Explorer-Index.
+///
+/// # Beschreibung
+/// Projekte werden nach Wurzel gruppiert. Eine Wurzel wird zur Einheit, wenn
+/// sie mindestens eine Art aus [`UNIT_KIND_PRIORITY`] trägt; ein
+/// `package.json` mit aufgelösten `workspaces`-Mitgliedern gilt dabei als
+/// Hülle (wie ein virtuelles `Cargo.toml`) und zählt nicht. Namen werden
+/// eindeutig gemacht — auch über [`node_id`], damit keine zwei Einheiten auf
+/// denselben Plan-Knoten fallen.
+fn units_from_explorer(root: &Path, index: &ExplorerIndex) -> Vec<AnalysisUnit> {
+    let mut roots: Vec<&Path> = index
+        .projects
+        .iter()
+        .map(|project| project.root.as_path())
+        .collect();
+    roots.sort();
+    roots.dedup();
+
+    let mut units: Vec<AnalysisUnit> = Vec::new();
+    let mut taken: BTreeSet<String> = BTreeSet::new();
+    for rel in roots {
+        let at_root: Vec<&harw_explorer::Project> = index
+            .projects
+            .iter()
+            .filter(|project| project.root == rel)
+            .filter(|project| !(project.kind == ProjectKind::Node && !project.members.is_empty()))
+            .collect();
+        let kinds: Vec<ProjectKind> = UNIT_KIND_PRIORITY
+            .iter()
+            .copied()
+            .filter(|kind| at_root.iter().any(|project| project.kind == *kind))
+            .collect();
+        let Some(primary_kind) = kinds.first().copied() else {
+            continue;
+        };
+        let Some(primary) = at_root.iter().find(|project| project.kind == primary_kind) else {
+            continue;
+        };
+        let cargo_name = at_root
+            .iter()
+            .find(|project| project.kind == ProjectKind::CargoCrate)
+            .map(|project| project.name.clone());
+
+        let mut name = primary.name.clone();
+        if taken.contains(&node_id(&name)) {
+            name = format!("{}@{}", primary.name, path_key(rel));
+        }
+        let mut suffix = 2_usize;
+        while taken.contains(&node_id(&name)) {
+            name = format!("{}@{}-{suffix}", primary.name, path_key(rel));
+            suffix += 1;
+        }
+        taken.insert(node_id(&name));
+
+        units.push(AnalysisUnit {
+            name,
+            kinds,
+            rel: rel.to_path_buf(),
+            dir: if rel.as_os_str().is_empty() {
+                root.to_path_buf()
+            } else {
+                root.join(rel)
+            },
+            manifest: primary.manifest.clone(),
+            cargo_name,
+            version: None,
+            deps: Vec::new(),
+            external_deps: Vec::new(),
+            level: 0,
+        });
+    }
+    units
+}
+
+/// Reichert Cargo-Einheiten über [`WorkspaceGraph`] an.
+///
+/// # Beschreibung
+/// Lädt je erkanntem Cargo-Workspace den [`WorkspaceGraph`] und überträgt
+/// Version und externe Abhängigkeiten auf die passenden Einheiten (gleicher
+/// Crate-Name, Verzeichnis unterhalb des Workspace). Die internen
+/// `[dependencies]` gehen als Kanten in `edges`.
 ///
 /// # Rückgabe
-/// Ein [`WorkspaceGraph`] mit mindestens einem Pseudo-[`CrateNode`].
+/// `(angereichert, bericht)`: je Einheit, ob sie aus einem erfolgreich
+/// geladenen Workspace stammt, und je Workspace ein JSON-Eintrag mit Anzahl
+/// oder Fehler. Ein Ladefehler ist **kein** Fehler von `/analyze`.
+fn enrich_with_cargo(
+    root: &Path,
+    index: &ExplorerIndex,
+    units: &mut [AnalysisUnit],
+    edges: &mut EdgeSet,
+) -> (Vec<bool>, Vec<Value>) {
+    let mut enriched = vec![false; units.len()];
+    let mut report: Vec<Value> = Vec::new();
+    for workspace in index
+        .projects
+        .iter()
+        .filter(|project| project.kind == ProjectKind::CargoWorkspace)
+    {
+        let ws_dir = if workspace.root.as_os_str().is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(&workspace.root)
+        };
+        let ws_label = if workspace.root.as_os_str().is_empty() {
+            ".".to_owned()
+        } else {
+            path_key(&workspace.root)
+        };
+        let graph = match WorkspaceGraph::load(&ws_dir) {
+            Ok(graph) => graph,
+            Err(error) => {
+                tracing::warn!(
+                    workspace = ws_label.as_str(),
+                    error = %error,
+                    "analyze.cargo_enrichment.failed"
+                );
+                report.push(json!({ "workspace": ws_label, "error": error.to_string() }));
+                continue;
+            }
+        };
+        let unit_of = |crate_name: &str, units: &[AnalysisUnit]| {
+            units.iter().position(|unit| {
+                unit.cargo_name.as_deref() == Some(crate_name) && unit.dir.starts_with(&ws_dir)
+            })
+        };
+        let mut matched = 0_usize;
+        for crate_node in &graph.crates {
+            let Some(position) = unit_of(&crate_node.name, units) else {
+                continue;
+            };
+            matched += 1;
+            enriched[position] = true;
+            if crate_node.version != "0.0.0" {
+                units[position].version = Some(crate_node.version.clone());
+            }
+            units[position].external_deps = crate_node.external_deps.clone();
+            for dep in &crate_node.deps {
+                if let Some(target) = unit_of(dep, units) {
+                    edges.add(position, target);
+                }
+            }
+        }
+        report.push(json!({ "workspace": ws_label, "crates": matched }));
+    }
+    (enriched, report)
+}
+
+/// Baut den Einheiten-Graphen aus einem Explorer-Index.
+///
+/// # Beschreibung
+/// Kanten in fester Reihenfolge, jeweils nur azyklisch ([`EdgeSet::add`]):
+/// 1. Cargo-Anreicherung ([`enrich_with_cargo`]),
+/// 2. Explorer-Pfad- und Namensabhängigkeiten — zwischen zwei angereicherten
+///    Cargo-Einheiten übersprungen, weil der [`WorkspaceGraph`] dort präziser
+///    ist (keine Dev-Abhängigkeiten),
+/// 3. Dokument-Links zwischen verschiedenen Einheiten.
+///
+/// Endpunkte einer Relation werden auf die innerste enthaltende Einheit
+/// abgebildet; Mitgliedschaft und Verschachtelung sind Enthaltensein, keine
+/// Abhängigkeit, und erzeugen keine Kante.
+///
+/// # Rückgabe
+/// Graph plus JSON-Beschreibung seiner Herkunft; `None`, wenn der Index keine
+/// einzige Einheit ergibt.
+fn unit_graph_from_explorer(root: &Path, index: &ExplorerIndex) -> Option<(UnitGraph, Value)> {
+    let mut units = units_from_explorer(root, index);
+    if units.is_empty() {
+        return None;
+    }
+    let mut edges = EdgeSet::new(units.len());
+    let (enriched, cargo_report) = enrich_with_cargo(root, index, &mut units, &mut edges);
+
+    let dependency_kinds = [RelationKind::PathDependency, RelationKind::CrateDependency];
+    for pass in [&dependency_kinds[..], &[RelationKind::DocLink][..]] {
+        for relation in index
+            .relations
+            .iter()
+            .filter(|relation| pass.contains(&relation.kind))
+        {
+            let (Some(from), Some(to)) = (
+                innermost_unit(&units, &relation.from),
+                innermost_unit(&units, &relation.to),
+            ) else {
+                continue;
+            };
+            if relation.kind != RelationKind::DocLink && enriched[from] && enriched[to] {
+                continue;
+            }
+            edges.add(from, to);
+        }
+    }
+
+    let names: Vec<String> = units.iter().map(|unit| unit.name.clone()).collect();
+    for (unit, deps) in units.iter_mut().zip(&edges.deps) {
+        unit.deps = deps
+            .iter()
+            .filter_map(|&target| names.get(target).cloned())
+            .collect();
+    }
+    assign_levels(&mut units);
+
+    let info = json!({
+        "source": "explorer",
+        "projects": index.projects.len(),
+        "relations": index.relations.len(),
+        "truncated": index.truncated,
+        "dropped_edges": edges.dropped,
+        "cargo_enrichment": cargo_report,
+    });
+    Some((
+        UnitGraph {
+            root: root.to_path_buf(),
+            units,
+        },
+        info,
+    ))
+}
+
+/// Baut den Einheiten-Graphen der Wurzel: Explorer, sonst Verzeichnis-Rückfall.
+///
+/// # Beschreibung
+/// Läuft [`ExplorerIndex::build`] (unter Beachtung von `.gitignore`) und leitet
+/// daraus über [`unit_graph_from_explorer`] den Graphen ab. Scheitert der
+/// Explorer oder findet er keine Einheit, greift
+/// [`synthesize_directory_graph`].
+///
+/// # Rückgabe
+/// Graph plus JSON-Beschreibung seiner Herkunft (`graph` im Bericht).
+///
+/// # Errors
+/// - [`OpError::Execution`]: auch der Verzeichnis-Rückfall kann die Wurzel
+///   nicht lesen.
+fn build_unit_graph(root: &Path) -> Result<(UnitGraph, Value), OpError> {
+    let explorer_error = match ExplorerIndex::build(root, &ExplorerOptions::default()) {
+        Ok(index) => match unit_graph_from_explorer(root, &index) {
+            Some(result) => return Ok(result),
+            None => None,
+        },
+        Err(error) => {
+            tracing::warn!(error = %error, "analyze.explorer.failed — Verzeichnis-Rückfall");
+            Some(error.to_string())
+        }
+    };
+    let graph = synthesize_directory_graph(root)?;
+    Ok((
+        graph,
+        json!({ "source": "directories", "explorer_error": explorer_error }),
+    ))
+}
+
+/// Baut einen Verzeichnis-Graphen für eine Wurzel ohne erkanntes Projekt.
+///
+/// # Beschreibung
+/// Liest die direkten Unterverzeichnisse von `root` (nicht rekursiv).
+/// Übersprungen werden Verzeichnisse mit führendem `.` (deckt `.git`, `.harw`,
+/// `.claude`, `.codex`, `.venv` einheitlich ab) sowie
+/// [`SYNTHETIC_EXCLUDED_DIRS`]. Für jedes verbleibende Unterverzeichnis
+/// entsteht eine Verzeichnis-Einheit auf Ebene 0 ohne Kanten. Gibt es kein
+/// qualifizierendes Unterverzeichnis (z. B. ein Ordner mit wenigen losen
+/// Dateien), entsteht genau eine Einheit für `root` selbst.
+///
+/// # Argumente
+/// - `root` (`&Path`): die Wurzel; muss als Verzeichnis lesbar sein.
+///
+/// # Rückgabe
+/// Ein [`UnitGraph`] mit mindestens einer Einheit.
 ///
 /// # Errors
 /// - [`OpError::Execution`]: `root` ist nicht als Verzeichnis lesbar, oder
 ///   ein einzelner Verzeichniseintrag ist nicht auflösbar. Kein Panic in
 ///   beiden Fällen.
-fn synthesize_directory_graph(root: &Path) -> Result<WorkspaceGraph, OpError> {
+fn synthesize_directory_graph(root: &Path) -> Result<UnitGraph, OpError> {
     let entries = fs::read_dir(root).map_err(|error| {
         OpError::Execution(format!(
-            "Verzeichnis '{}' ist ohne 'Cargo.toml' auch nicht als einfaches \
-             Verzeichnis lesbar: {error}",
+            "Verzeichnis '{}' ist nicht als Verzeichnis lesbar: {error}",
             root.display()
         ))
     })?;
@@ -396,43 +977,47 @@ fn synthesize_directory_graph(root: &Path) -> Result<WorkspaceGraph, OpError> {
     }
     subdirs.sort();
 
-    let crates: Vec<CrateNode> = if subdirs.is_empty() {
-        vec![pseudo_crate_node(root.to_path_buf())]
+    let units: Vec<AnalysisUnit> = if subdirs.is_empty() {
+        vec![directory_unit(root, root.to_path_buf())]
     } else {
-        subdirs.into_iter().map(pseudo_crate_node).collect()
+        subdirs
+            .into_iter()
+            .map(|dir| directory_unit(root, dir))
+            .collect()
     };
 
-    Ok(WorkspaceGraph {
+    Ok(UnitGraph {
         root: root.to_path_buf(),
-        crates,
+        units,
     })
 }
 
-/// Baut einen einzelnen Pseudo-[`CrateNode`] für [`synthesize_directory_graph`].
+/// Baut eine einzelne Verzeichnis-Einheit für [`synthesize_directory_graph`].
 ///
 /// # Beschreibung
 /// `name` ist der Basisname von `dir`, Rückfall `"project"`, falls er nicht
-/// ermittelbar ist (z. B. Wurzelpfad `/`). `manifest_path` bleibt bewusst
-/// leer — das markiert den Knoten als synthetisch, ausgewertet in
-/// [`analysis_question`]. `deps`/`dev_deps`/`build_deps`/`external_deps`
-/// bleiben leer und `level` auf `0`: ohne geparste Manifeste sind keine
-/// Abhängigkeiten bekannt.
-fn pseudo_crate_node(dir: PathBuf) -> CrateNode {
+/// ermittelbar ist (z. B. Wurzelpfad `/`). `kinds` bleibt leer — das markiert
+/// die Einheit als reines Verzeichnis, ausgewertet in [`analysis_question`].
+fn directory_unit(root: &Path, dir: PathBuf) -> AnalysisUnit {
     let name = dir
         .file_name()
         .and_then(|name| name.to_str())
         .map(str::to_owned)
         .unwrap_or_else(|| "project".to_owned());
-    CrateNode {
+    let rel = dir
+        .strip_prefix(root)
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    AnalysisUnit {
         name,
-        version: "0.0.0".to_owned(),
-        manifest_path: PathBuf::new(),
+        kinds: Vec::new(),
+        rel,
         dir,
+        manifest: None,
+        cargo_name: None,
+        version: None,
         deps: Vec::new(),
-        dev_deps: Vec::new(),
-        build_deps: Vec::new(),
         external_deps: Vec::new(),
-        is_leaf: true,
         level: 0,
     }
 }
