@@ -11,11 +11,14 @@
 //! ([`crate::KNOWLEDGE_PALACE_INDEX`]), [`collect_diary_documents`]
 //! ([`crate::KNOWLEDGE_DIARY_INDEX`], Knoten AW7-05 — wörtlich
 //! [`collect_palace_documents`] mit vertauschtem `ArtifactKind`-Filter) und
-//! [`collect_rust_sources`] ([`crate::CODE_RUST_INDEX`], Knoten AW7-05 —
-//! wörtlich [`collect_design_docs`] mit vertauschter Dateiendung und
-//! `target/`-Ausschluss). Dieses Modul tut kein Chunking und kein
-//! Einbetten — das übernimmt [`crate::build_index`] mit dem Ergebnis dieses
-//! Moduls als Eingabe.
+//! [`collect_code_sources`] (Quelltext aller gängigen Sprachen, Endungen aus
+//! [`CODE_SOURCE_EXTENSIONS`], Build-/Abhängigkeitsverzeichnisse aus
+//! [`SKIPPED_SOURCE_DIRS`] ausgeschlossen; die Zerlegungsstrategie je Datei
+//! liefert [`chunker_for_path`]). Der veraltete Einstiegspunkt
+//! [`collect_rust_sources`] ([`crate::CODE_RUST_INDEX`], Knoten AW7-05)
+//! ist dieselbe Erfassung, eingeschränkt auf `.rs`. Dieses Modul tut kein
+//! Chunking und kein Einbetten — das übernimmt [`crate::build_index`] mit
+//! dem Ergebnis dieses Moduls als Eingabe.
 //!
 //! # Warum `visibility_of_scope` nur zwei Buckets kennt
 //! [`harw_knowledge::VisibilityScope`] hat vier Varianten
@@ -815,6 +818,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_collect_rust_sources_missing_root_returns_empty_list() -> TestResult {
         let root = std::path::Path::new("/does/not/exist/harw-lens-source-rust-test");
         assert_eq!(collect_rust_sources(root)?, Vec::new());
@@ -822,6 +826,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_collect_rust_sources_reads_rust_files_recursively_and_sorted() -> TestResult {
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join("b.rs"), "fn b() {}\n")?;
@@ -848,6 +853,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_collect_rust_sources_skips_target_directory() -> TestResult {
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join("lib.rs"), "fn lib() {}\n")?;
@@ -863,5 +869,143 @@ mod tests {
             }
         );
         Ok(())
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_collect_rust_sources_stays_rust_only() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("lib.rs"), "fn lib() {}\n")?;
+        std::fs::write(dir.path().join("app.ts"), "export const x = 1;\n")?;
+
+        let documents = collect_rust_sources(dir.path())?;
+        assert_eq!(documents.len(), 1);
+        assert_eq!(
+            documents[0].source,
+            SourceRef::File {
+                path: "lib.rs".to_owned()
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_collect_code_sources_missing_root_returns_empty_list() -> TestResult {
+        let root = std::path::Path::new("/does/not/exist/harw-lens-source-code-test");
+        assert_eq!(collect_code_sources(root)?, Vec::new());
+        Ok(())
+    }
+
+    #[test]
+    fn test_collect_code_sources_reads_common_extensions_sorted() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("main.go"), "package main\n")?;
+        std::fs::write(dir.path().join("lib.rs"), "fn lib() {}\n")?;
+        std::fs::create_dir(dir.path().join("web"))?;
+        std::fs::write(dir.path().join("web/app.tsx"), "export {};\n")?;
+        std::fs::write(dir.path().join("web/Util.PY"), "x = 1\n")?;
+        std::fs::write(dir.path().join("config.yaml"), "a: 1\n")?;
+        std::fs::write(dir.path().join("README.md"), "# Prosa\n")?;
+        std::fs::write(dir.path().join("image.png"), "not text")?;
+        std::fs::write(dir.path().join("Makefile"), "all:\n")?;
+
+        let documents = collect_code_sources(dir.path())?;
+        let paths: Vec<&str> = documents
+            .iter()
+            .filter_map(|d| match &d.source {
+                SourceRef::File { path } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "config.yaml",
+                "lib.rs",
+                "main.go",
+                "web/Util.PY",
+                "web/app.tsx"
+            ]
+        );
+        assert!(documents.iter().all(|d| d.visibility == DEFAULT_VISIBILITY));
+        Ok(())
+    }
+
+    #[test]
+    fn test_collect_code_sources_skips_build_and_dependency_directories() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("index.ts"), "export {};\n")?;
+        for skipped in SKIPPED_SOURCE_DIRS {
+            let sub = dir.path().join(skipped);
+            std::fs::create_dir(&sub)?;
+            std::fs::write(sub.join("hidden.js"), "var x;\n")?;
+        }
+        std::fs::create_dir(dir.path().join("src"))?;
+        std::fs::write(dir.path().join("src/kept.js"), "var y;\n")?;
+
+        let documents = collect_code_sources(dir.path())?;
+        let paths: Vec<&str> = documents
+            .iter()
+            .filter_map(|d| match &d.source {
+                SourceRef::File { path } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths, vec!["index.ts", "src/kept.js"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_collect_code_sources_skips_invalid_utf8_and_oversized_files() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("ok.c"), "int main(void) { return 0; }\n")?;
+        std::fs::write(dir.path().join("latin1.c"), b"//\xe4\n")?;
+        assert_eq!(CODE_SOURCE_MAX_BYTES, 1024 * 1024);
+        std::fs::write(dir.path().join("bundle.js"), "a".repeat(1024 * 1024 + 1))?;
+
+        let documents = collect_code_sources(dir.path())?;
+        assert_eq!(documents.len(), 1);
+        assert_eq!(
+            documents[0].source,
+            SourceRef::File {
+                path: "ok.c".to_owned()
+            }
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_collect_code_sources_does_not_follow_symlinks() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        std::fs::write(outside.path().join("secret.py"), "TOKEN = 1\n")?;
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("linked"))?;
+        std::fs::write(dir.path().join("real.py"), "x = 1\n")?;
+
+        let documents = collect_code_sources(dir.path())?;
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].text, "x = 1\n");
+        Ok(())
+    }
+
+    #[test]
+    fn test_chunker_for_path_maps_extensions() {
+        use std::path::Path;
+        assert_eq!(chunker_for_path(Path::new("src/lib.rs")), CodeChunker::Rust);
+        assert_eq!(chunker_for_path(Path::new("MOD.RS")), CodeChunker::Rust);
+        assert_eq!(
+            chunker_for_path(Path::new("docs/a.md")),
+            CodeChunker::Markdown
+        );
+        for plain in [
+            "a.ts", "b.py", "c.go", "d.java", "e.toml", "f.yaml", "Makefile",
+        ] {
+            assert_eq!(
+                chunker_for_path(Path::new(plain)),
+                CodeChunker::Plain,
+                "{plain}"
+            );
+        }
     }
 }

@@ -8,6 +8,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # ~80 workspace crates produce hundreds of test binaries; full debuginfo
+  # (debuginfo=2) fills the hosted runner's disk. Line tables keep panic
+  # backtraces useful at a fraction of the size.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   check:
@@ -31,6 +36,13 @@ jobs:
       # so it must be present before `cargo test` runs. libdbus-1-dev and
       # pkg-config are needed by the OS-keyring backend (`keyring` feature ->
       # libdbus-sys) that harw-secrets builds with.
+      # Hosted runners ship toolchains we never use; reclaim ~20 GB for the
+      # target directory.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - name: Install system dependencies
         run: |
           sudo apt-get update

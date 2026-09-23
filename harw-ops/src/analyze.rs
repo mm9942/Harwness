@@ -1,23 +1,46 @@
-//! `/analyze` — Bottom-up-Analyse eines Workspace über Analyst-Kindagenten.
+//! `/analyze` — Bottom-up-Analyse eines Arbeitsbereichs über Analyst-Kindagenten.
 //!
 //! # Verantwortungsbereich
 //! Implementiert die `analyze`-Operation gemäß AP W4-04. Sie ist die einzige
-//! Operation dieses APs, die **selbst orchestriert**: sie lädt den
-//! Workspace-Graph, legt je Crate einen `Analysis`-Plan-Knoten an, fährt die
-//! Ebenen von den Blättern aufwärts als Fan-out-Wellen und verdichtet das
-//! Ergebnis in einem `Synthesis`-Knoten.
+//! Operation dieses APs, die **selbst orchestriert**: sie baut den
+//! Einheiten-Graphen des Arbeitsbereichs, legt je Analyse-Einheit einen
+//! `Analysis`-Plan-Knoten an, fährt die Ebenen von den Blättern aufwärts als
+//! Fan-out-Wellen und verdichtet das Ergebnis in einem `Synthesis`-Knoten.
 //!
 //! Deshalb trägt sie **kein** `agent_tool`-Attribut: eine Operation, die selbst
 //! Kinder startet, darf nicht zusätzlich als einzelnes Kind-Werkzeug erscheinen
 //! — das Modell würde sonst eine Orchestrierung für einen Einzelaufruf halten.
 //!
+//! # Einheiten statt Crates
+//! `/analyze` ist verzeichnis- und projektneutral. Eine **Einheit** ist ein von
+//! [`harw_explorer`] erkanntes Projekt (Cargo-Crate, npm/pnpm-Paket,
+//! Python-Projekt, Go-Modul, Dokumentsammlung — beliebig verschachtelt); die
+//! Kanten zwischen Einheiten stammen aus den Explorer-Relationen
+//! (Pfad-Abhängigkeiten, namentliche Abhängigkeiten, Dokument-Links). Reine
+//! Workspace-Hüllen (virtuelles `Cargo.toml`, `package.json` mit `workspaces`)
+//! und Git-Wurzeln sind selbst keine Einheit — ihre Mitglieder sind es.
+//!
+//! [`WorkspaceGraph`] ist nur noch eine **Anreicherung** für Cargo: für jeden
+//! erkannten Cargo-Workspace wird er geladen und liefert Version, externe
+//! Abhängigkeiten und die präzisen internen Kanten (nur `[dependencies]`, ohne
+//! Dev-/Build-Abhängigkeiten). Kanten zwischen zwei so angereicherten Crates
+//! kommen dann ausschließlich aus dem [`WorkspaceGraph`]. Scheitert das Laden,
+//! bleibt es bei den Explorer-Kanten; der Fehler steht im Bericht
+//! (`graph.cargo_enrichment`), `/analyze` scheitert daran nicht.
+//!
+//! Kanten werden in fester Reihenfolge eingefügt (Cargo-Anreicherung,
+//! Explorer-Abhängigkeiten, Dokument-Links) und nur, wenn sie keinen Zyklus
+//! schließen — verworfene Kanten zählt `graph.dropped_edges`. Der Graph ist
+//! dadurch immer azyklisch und in Ebenen zerlegbar.
+//!
 //! # Ablauf
-//! 1. [`WorkspaceGraph::load`] auf der kanonischen Sandbox-Wurzel.
-//! 2. Optional [`WorkspaceGraph::subgraph`], wenn ein Crate genannt ist.
-//! 3. Je Crate ein [`PlanNode`] (`kind = Analysis`, `read_scope = <dir>/**`),
-//!    dessen Abhängigkeiten die **internen** Dependencies des Crates sind —
-//!    [`WorkspaceGraph::topological_levels`] liefert genau diese Ordnung,
-//!    Ebene 0 sind die Blätter.
+//! 1. [`build_unit_graph`] auf der kanonischen Sandbox-Wurzel.
+//! 2. Optional [`UnitGraph::subgraph`], wenn eine Einheit genannt ist (Name,
+//!    Cargo-Crate-Name oder relativer Pfad).
+//! 3. Je Einheit ein [`PlanNode`] (`kind = Analysis`, `read_scope = <dir>/**`),
+//!    dessen Abhängigkeiten die Kanten der Einheit sind —
+//!    [`UnitGraph::levels`] liefert genau diese Ordnung, Ebene 0 sind die
+//!    Blätter.
 //! 4. Je Ebene wird die Zelle des Clans [`RESEARCH_CLAN_ID`] der eingebauten
 //!    Organisation über [`CellPlan::from_cell`] aufgelöst; ihre Batches sind die
 //!    Startgruppen der Welle (siehe „Zell-gesteuerter Fan-out" unten).
@@ -30,7 +53,7 @@
 //! 7. Zum Schluss ein `Synthesis`-Knoten, der von allen Analyse-Knoten abhängt.
 //!
 //! # Zell-gesteuerter Fan-out
-//! Welche Knoten gemeinsam starten dürfen, steht nicht mehr hier, sondern in
+//! Welche Knoten gemeinsam starten dürfen, steht nicht hier, sondern in
 //! `harw-registry-defaults/agents/organization/default.toml`: die Zelle
 //! `research-wave` des Clans `research` trägt Muster, Barriere und
 //! Schreibtrennung. [`CellPlan::from_cell`] löst sie gegen den Plan der Ebene
@@ -39,9 +62,9 @@
 //! [`JoinSemantics`] der Welle. Die Batches laufen **nacheinander**, ihre
 //! Mitglieder nebenläufig — genau das bedeutet eine erzwungene Schreibtrennung.
 //!
-//! Deshalb tragen die Plan-Knoten den Clan im Namen (`research-<crate>`, siehe
-//! [`node_id`]): [`CellPlan::from_cell`] wählt Mitglieder über einen Glob gegen
-//! die `TaskId` **und** den `write_scope`; Analyse-Knoten haben keinen
+//! Deshalb tragen die Plan-Knoten den Clan im Namen (`research-<einheit>`,
+//! siehe [`node_id`]): [`CellPlan::from_cell`] wählt Mitglieder über einen Glob
+//! gegen die `TaskId` **und** den `write_scope`; Analyse-Knoten haben keinen
 //! `write_scope`, also entscheidet allein die `TaskId`.
 //!
 //! # Rückfall — `/analyze` darf daran nicht scheitern
@@ -50,7 +73,7 @@
 //! einen Fehler zu erzeugen: eine nicht ladbare Organisation, ein fehlender
 //! Clan, eine fehlende Zelle, ein Muster ohne Treffer, ein Auflösungsfehler und
 //! sogar eine Zelle, die nur einen *Teil* der Ebene auswählt, führen alle zu
-//! einer einzigen Welle mit allen Crates der Ebene in Graph-Reihenfolge
+//! einer einzigen Welle mit allen Einheiten der Ebene in Graph-Reihenfolge
 //! ([`wave_batches`]). Eine Zelle darf die Arbeit einer Ebene umsortieren und
 //! aufteilen — sie darf sie niemals verschlucken.
 //!
@@ -62,19 +85,14 @@
 //! trotzdem immer in Leaf-first-Reihenfolge **angelegt**, weil `AddNode` keine
 //! unbekannten Abhängigkeiten akzeptiert.
 //!
-//! # Ohne `Cargo.toml`
-//! Fehlt `<root>/Cargo.toml`, wird [`WorkspaceGraph::load`] gar nicht erst
-//! aufgerufen — [`synthesize_directory_graph`] baut stattdessen einen
-//! synthetischen Graphen: ein [`CrateNode`] je direktem Unterverzeichnis der
-//! Wurzel (versteckte Verzeichnisse und eine feste Rauschliste wie `target`
-//! oder `node_modules` ausgenommen), alle auf Ebene 0 ohne hergeleitete
-//! Abhängigkeitskanten — `bottom_up` wird dadurch zu einer einzigen Welle.
-//! Ohne qualifizierendes Unterverzeichnis entsteht genau ein Pseudo-Knoten für
-//! die Wurzel selbst. Das macht `/analyze` in jedem Nicht-Rust-Projekt
-//! nutzbar, statt am internen `CodeGraphError::ManifestMissing`
-//! durchzuschlagen. Existiert `Cargo.toml`, bleibt der bisherige
-//! [`WorkspaceGraph::load`]-Pfad unverändert, inklusive echter Fehler bei
-//! einem kaputten oder unvollständigen Cargo-Workspace.
+//! # Ohne erkanntes Projekt
+//! Findet der Explorer keine Einheit (oder scheitert er),
+//! baut [`synthesize_directory_graph`] einen Verzeichnis-Graphen: eine Einheit
+//! je direktem Unterverzeichnis der Wurzel (versteckte Verzeichnisse und eine
+//! feste Rauschliste wie `target` oder `node_modules` ausgenommen), alle auf
+//! Ebene 0 ohne Kanten — `bottom_up` wird dadurch zu einer einzigen Welle.
+//! Ohne qualifizierendes Unterverzeichnis entsteht genau eine Einheit für die
+//! Wurzel selbst.
 //!
 //! # Schlüsseltypen
 //! - [`AnalyzeArgs`] — Argument-Container mit Flag-Parsing auf der
@@ -87,11 +105,11 @@
 //!
 //! # Fehler
 //! - [`OpError::InvalidArguments`]: unbekanntes Flag, ungültiges
-//!   `--max-parallel`, zweiter Crate-Name.
+//!   `--max-parallel`, zweiter Einheiten-Name.
 //! - [`OpError::NotAvailable`]: kein Plan-Store (nur im Nicht-Dry-Run) oder
 //!   kein Agent-Spawner im Kontext.
-//! - [`OpError::Execution`]: der Workspace-Graph ist nicht ladbar, oder eine
-//!   Plan-Mutation wurde abgelehnt.
+//! - [`OpError::Execution`]: die Wurzel ist nicht lesbar, die genannte Einheit
+//!   existiert nicht, oder eine Plan-Mutation wurde abgelehnt.
 //!
 //! # Beispiel
 //! ```rust,no_run
@@ -102,13 +120,15 @@
 //! let args = AnalyzeArgs::from_raw_args(&["--dry-run".to_owned(), "harw-core".to_owned()])
 //!     .expect("gültige Flags");
 //! assert_eq!(args.dry_run, Some(true));
-//! assert_eq!(args.crate_name.as_deref(), Some("harw-core"));
+//! assert_eq!(args.unit_name(), Some("harw-core"));
 //! ```
 
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use harw_code_graph::{CrateNode, WorkspaceGraph};
+use harw_code_graph::WorkspaceGraph;
+use harw_explorer::{ExplorerIndex, ExplorerOptions, ProjectKind, RelationKind};
 use harw_core::child_controller::JoinSemantics;
 use harw_core_bridge::{ChildReturnContract, fanout_children, parse_budget_hint};
 use harw_macros::operation;
@@ -138,7 +158,7 @@ use crate::explore::{READ_ONLY_REDUCER, child_payload, finding_from_value, persi
 /// Budget je Analyst-Kind einer Welle.
 ///
 /// Grammatik siehe [`parse_budget_hint`]. Großzügiger als der Einzel-Lauf in
-/// [`crate::explore`], weil ein Analyst ein ganzes Crate lesen muss.
+/// [`crate::explore`], weil ein Analyst eine ganze Einheit lesen muss.
 const ANALYST_BUDGET: &str = "90k_tokens,60_tool_calls,300s";
 
 /// Vorgabe für die Zahl gleichzeitiger Kinder je Welle.
@@ -159,8 +179,8 @@ const ANALYSIS_EXPECTED_OUTPUT: &str = "Ein ResearchFinding, dessen Schlussfolge
      Dateipfad und Zeilenbereich; alles Unbelegte gehört in unresolved_questions.";
 
 /// Stop-Bedingung eines Analyst-Kindes.
-const ANALYSIS_STOP_CONDITION: &str = "Alle fünf Punkte sind für dieses Crate beantwortet oder \
-     ausdrücklich als offen markiert. Kein Blick über die Crate-Grenze hinaus außer für die \
+const ANALYSIS_STOP_CONDITION: &str = "Alle fünf Punkte sind für diese Einheit beantwortet oder \
+     ausdrücklich als offen markiert. Kein Blick über die Grenze der Einheit hinaus außer für die \
      Konsumentenliste.";
 
 // ── Argumente ────────────────────────────────────────────────────────────────
@@ -173,8 +193,12 @@ const ANALYSIS_STOP_CONDITION: &str = "Alle fünf Punkte sind für dieses Crate 
 /// `/analyze --dry-run` sonst nur über einen Tool-Call erreichbar wäre.
 ///
 /// # Felder
-/// - `crate_name` (`Option<String>`): einzelnes Crate; ohne Angabe der ganze
-///   Workspace.
+/// - `crate_name` (`Option<String>`): einzelne Analyse-Einheit (Projektname,
+///   Cargo-Crate-Name oder relativer Pfad); ohne Angabe der ganze
+///   Arbeitsbereich. Der Feldname bleibt aus Kompatibilitätsgründen
+///   `crate_name` (JSON-Schema, Web-/Modell-Fläche); auf den JSON-Flächen wird
+///   zusätzlich `unit_name` angenommen. Intern immer über
+///   [`AnalyzeArgs::unit_name`] lesen.
 /// - `bottom_up` (`Option<bool>`): von den Blättern aufwärts (Vorgabe: `true`).
 /// - `dry_run` (`Option<bool>`): nur den Plan erzeugen, keine Kinder starten.
 /// - `max_parallel` (`Option<usize>`): Obergrenze gleichzeitiger Kinder je
@@ -184,8 +208,9 @@ const ANALYSIS_STOP_CONDITION: &str = "Alle fünf Punkte sind für dieses Crate 
 /// AP W4-04 — `/analyze`.
 #[derive(Debug, Default, serde::Deserialize, harw_macros::OpArgs)]
 pub struct AnalyzeArgs {
-    /// Einzelnes Crate; ohne Angabe der ganze Workspace.
-    #[serde(default)]
+    /// Einzelne Analyse-Einheit (Projektname, Crate-Name oder relativer Pfad);
+    /// ohne Angabe der ganze Arbeitsbereich. Auch als `unit_name` annehmbar.
+    #[serde(default, alias = "unit_name")]
     #[raw(first)]
     pub crate_name: Option<String>,
     /// Von den Blättern aufwärts (Standard: true).
@@ -199,13 +224,29 @@ pub struct AnalyzeArgs {
     pub max_parallel: Option<usize>,
 }
 
+impl AnalyzeArgs {
+    /// Liefert den Namen der gewählten Analyse-Einheit.
+    ///
+    /// # Beschreibung
+    /// Das serialisierte Feld heißt aus Kompatibilitätsgründen weiterhin
+    /// `crate_name`; gemeint ist aber jede Einheit, nicht nur ein Cargo-Crate.
+    ///
+    /// # Rückgabe
+    /// `Some(name)`, wenn eine Einheit genannt ist, sonst `None`.
+    #[must_use]
+    pub fn unit_name(&self) -> Option<&str> {
+        self.crate_name.as_deref()
+    }
+}
+
 impl FromRawArgs for AnalyzeArgs {
-    /// Parst Crate-Name und Flags aus der Command-Zeile.
+    /// Parst Einheiten-Name und Flags aus der Command-Zeile.
     ///
     /// # Beschreibung
     /// Erkannt werden `--dry-run` / `--no-dry-run`, `--bottom-up` /
     /// `--top-down` (alias `--no-bottom-up`) sowie `--max-parallel <n>` und
-    /// `--max-parallel=<n>`. Das erste flag-freie Token ist der Crate-Name.
+    /// `--max-parallel=<n>`. Das erste flag-freie Token ist der Name der
+    /// Analyse-Einheit.
     ///
     /// Ein unbekanntes Flag ist ein **Fehler**: still ignoriert würde
     /// `/analyze --dry-runn` einen echten Fan-out starten, den der Aufrufer
@@ -219,7 +260,7 @@ impl FromRawArgs for AnalyzeArgs {
     ///
     /// # Fehler
     /// - [`OpError::InvalidArguments`]: unbekanntes Flag, fehlender oder
-    ///   ungültiger `--max-parallel`-Wert, zweiter Crate-Name.
+    ///   ungültiger `--max-parallel`-Wert, zweiter Einheiten-Name.
     fn from_raw_args(tokens: &[String]) -> Result<Self, OpError> {
         let mut args = Self::default();
         let mut index = 0;
@@ -252,7 +293,7 @@ impl FromRawArgs for AnalyzeArgs {
                     } else {
                         return Err(OpError::InvalidArguments(format!(
                             "unerwartetes Argument '{other}'; /analyze nimmt höchstens einen \
-                             Crate-Namen"
+                             Einheiten-Namen"
                         )));
                     }
                 }
