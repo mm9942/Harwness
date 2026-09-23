@@ -93,24 +93,27 @@
 //!   vergessener Fall (siehe „Bekannte Lücke" unten).
 //!
 //! ## „Bewerte einen Befund" ([`harw_dod_rules`])
-//! [`run_rules`], [`Rule`], [`RuleContext`], die drei mitgelieferten Regeln
+//! [`run_rules`], [`run_rules_checked`], [`Rule`], [`RuleContext`], die drei mitgelieferten Regeln
 //! ([`EgressFlowRule`], [`BaselineDeviationRule`], [`StructureDriftRule`]),
 //! [`Finding`], [`FindingKind`], [`RuleChecked`], [`Triaged`], [`Verdict`],
 //! [`triage`], [`Baseline`], [`PalaceStatus`] — alles direkte Parameter-,
-//! Rückgabe- oder Feldtypen von `run_rules`/`triage`/`RuleContext`.
+//! Rückgabe- oder Feldtypen von
+//! `run_rules`/`run_rules_checked`/`triage`/`RuleContext`.
 //!
-//! **Nein** — `harw_dod_rules::Raw` (der dritte Zustandsmarker): kein
-//! re-exportierter Name dieser Fassade gibt oder nimmt je ein
-//! `Finding<Raw>` entgegen — `run_rules` liefert bereits `Finding<RuleChecked>`
-//! (`Finding::raw`/`Finding::check` sind in `harw-dod-rules` `pub(crate)`,
-//! siehe dessen `finding.rs`-Moduldoku). Ihn zu benennen böte keinem
-//! Aufrufer dieser Fassade etwas.
+//! **Nein** — `harw_dod_rules::Raw` (der dritte Zustandsmarker) als Name:
+//! `run_rules` liefert zwar `Finding<Raw>` (rohe, identitätslose Befunde),
+//! aber ein Aufrufer muss den Marker dafür nie ausschreiben (`Vec<_>` genügt),
+//! und nichts in dieser Fassade *nimmt* ein `Finding<Raw>` entgegen. Den
+//! zertifizierten `Finding<RuleChecked>` — die Eingabe von [`triage`] —
+//! liefert [`run_rules_checked`] (`Finding::raw`/`Finding::check` bleiben in
+//! `harw-dod-rules` `pub(crate)`, siehe dessen `engine.rs`- und
+//! `finding.rs`-Moduldoku).
 //!
 //! **Nein** — `finding_kind_for_status`: ausschließlich ein internes
 //! Werkzeug von `BaselineDeviationRule::evaluate` (siehe
 //! `harw-dod-rules/src/rules/baseline_deviation.rs`); ein Aufrufer, der
-//! `run_rules` mit dieser Regel aufruft, bekommt das Ergebnis bereits als
-//! fertigen `Finding<RuleChecked>` zurück und ruft diese Funktion nie
+//! `run_rules`/`run_rules_checked` aufruft, bekommt die bereits
+//! eingestufte `FindingKind` im Befund zurück und ruft diese Funktion nie
 //! selbst auf.
 //!
 //! **Nein** — `epistemic_confidence_for`: von keiner Regel in
@@ -274,12 +277,15 @@
 //! ```
 //!
 //! „Bewerte einen Befund" — die Regeln gegen ein beobachtetes Ereignis
-//! auswerten. `run_rules` liefert derzeit `Finding<Raw>`; der Übergang zu
-//! `Finding<RuleChecked>` (und damit [`triage`]) ist in `harw-dod-rules`
-//! `pub(crate)` und über diese Fassade nicht erreichbar:
+//! auswerten. `run_rules` liefert rohe `Finding<Raw>`; [`run_rules_checked`]
+//! liefert dieselben Befunde zertifiziert als `Finding<RuleChecked>` (mit
+//! frischer `FindingId`), bereit für [`triage`]:
 //!
 //! ```rust
-//! use harw_dod::{Actor, EgressFlowRule, EventKind, Rule, RuleContext, SecurityEvent, run_rules};
+//! use harw_dod::{
+//!     Actor, EgressFlowRule, EventKind, Rule, RuleContext, SecurityEvent, Verdict, run_rules,
+//!     run_rules_checked, triage,
+//! };
 //! use harw_authority::NetworkScope;
 //! use harw_types::SensorId;
 //!
@@ -302,6 +308,13 @@
 //! };
 //! let findings = run_rules(&ctx);
 //! assert!(findings.iter().any(|finding| finding.rule_id() == EgressFlowRule.id()));
+//!
+//! let checked = run_rules_checked(&ctx)
+//!     .into_iter()
+//!     .find(|finding| finding.rule_id() == EgressFlowRule.id())
+//!     .expect("EgressFlowRule löst aus");
+//! let triaged = triage(checked, Verdict::Confirmed);
+//! assert_eq!(*triaged.verdict(), Verdict::Confirmed);
 //! ```
 //!
 //! # Stand
@@ -331,7 +344,8 @@ pub use harw_dod_sentinel::{
 // --- harw-dod-rules: "bewerte einen Befund" (siehe Begründung oben) ---
 pub use harw_dod_rules::{
     Baseline, BaselineDeviationRule, EgressFlowRule, Finding, FindingKind, PalaceStatus, Rule,
-    RuleChecked, RuleContext, StructureDriftRule, Triaged, Verdict, run_rules, triage,
+    RuleChecked, RuleContext, StructureDriftRule, Triaged, Verdict, run_rules, run_rules_checked,
+    triage,
 };
 
 // --- die neun unprivilegierten Instrumente (siehe Begründung oben) ---

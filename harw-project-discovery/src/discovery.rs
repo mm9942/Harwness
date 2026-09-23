@@ -1253,16 +1253,36 @@ mod tests {
             .map_err(ctx("Rechte setzen"))?;
         write(&mid, "HARW.md", "readable mid doc")?;
 
-        let ctx_result = discover_project(&mid, &default_cfg()).map_err(ctx("Discovery"))?;
+        // Läuft der Test mit DAC-Override (z. B. als root im Container), macht
+        // `0o000` die Datei nicht unlesbar. Dann wird derselbe Fehlerpfad
+        // (I/O-Fehler an einem einzelnen Kandidaten, kein `NotFound`) anders
+        // ausgelöst: ein Kandidatenname über `NAME_MAX` (255 Byte) lässt
+        // `symlink_metadata` deterministisch mit `ENAMETOOLONG` scheitern —
+        // in *jedem* Verzeichnis der Kette, auch vor dem lesbaren `mid`-Dokument.
+        // Das Root-Dokument wird in diesem Fall entfernt, damit es nicht
+        // (lesbar) mitgezählt wird.
+        let permissions_enforced = fs::File::open(root.join("HARW.md")).is_err();
+        let cfg = if permissions_enforced {
+            default_cfg()
+        } else {
+            fs::remove_file(root.join("HARW.md")).map_err(ctx("Root-Dokument entfernen"))?;
+            let mut names = vec!["x".repeat(300)];
+            names.extend(default_cfg().doc_filenames);
+            default_cfg().with_doc_filenames(names)
+        };
 
-        // Das unlesbare Root-Dokument wird übersprungen (kein Abbruch der
+        let ctx_result = discover_project(&mid, &cfg).map_err(ctx("Discovery"))?;
+
+        // Der fehlerhafte Kandidat wird übersprungen (kein Abbruch der
         // gesamten Discovery); das Dokument aus `mid` lädt trotzdem.
         assert_eq!(ctx_result.docs.len(), 1);
         assert_eq!(ctx_result.docs[0].content, "readable mid doc");
 
         // Aufräumen, damit TempDir sich beim Drop löschen lässt.
-        fs::set_permissions(root.join("HARW.md"), fs::Permissions::from_mode(0o644))
-            .map_err(ctx("Rechte setzen"))?;
+        if permissions_enforced {
+            fs::set_permissions(root.join("HARW.md"), fs::Permissions::from_mode(0o644))
+                .map_err(ctx("Rechte setzen"))?;
+        }
         Ok(())
     }
 

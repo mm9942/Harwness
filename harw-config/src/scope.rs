@@ -264,8 +264,8 @@ pub struct FieldScope {
 /// Die zentrale, öffentliche Deklarationstabelle: ein Eintrag pro
 /// `HarnessConfig`-Blattfeld (`docs/design/config-scopes.md` Abschnitt 6.3),
 /// in derselben Reihenfolge wie Abschnitt 1/6.3 der Spezifikation, damit die
-/// Tabelle 1:1 dagegen geprüft werden kann. Exakt 89 Einträge (Abschnitt 6.3
-/// Kontrollsumme: `ProfileReplaces` 41 · `GlobalOnly` 11 · `MinBound` 12 ·
+/// Tabelle 1:1 dagegen geprüft werden kann. Exakt 90 Einträge (Abschnitt 6.3
+/// Kontrollsumme: `ProfileReplaces` 42 · `GlobalOnly` 11 · `MinBound` 12 ·
 /// `CompositeMember` 11 · `Intersection` 4 · `OrBool` 3 · `Union` 2 ·
 /// `AndBool` 2 · `StricterOf` 2 · `PerFileValidated` 1).
 ///
@@ -406,7 +406,7 @@ mod merge_rule_tests {
     #[test]
     fn test_merge_rule_variant_control_sum_matches_abschnitt_6_3() {
         let count = |rule: MergeRule| FIELD_TABLE.iter().filter(|f| f.merge == rule).count();
-        assert_eq!(count(MergeRule::ProfileReplaces), 41);
+        assert_eq!(count(MergeRule::ProfileReplaces), 42);
         assert_eq!(count(MergeRule::GlobalOnly), 11);
         assert_eq!(count(MergeRule::MinBound), 12);
         assert_eq!(count(MergeRule::CompositeMember), 11);

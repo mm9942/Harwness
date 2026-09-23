@@ -905,9 +905,9 @@ mod tests {
     use crate::test_support::{TestError, TestResult, ctx};
 
     // Erzeugt `n` echte Records über die öffentliche Advisory-Korrelation
-    // (`correlate_advisories` ist die einzige öffentliche Prägestelle für
-    // `Finding<RuleChecked>` außerhalb von `harw-dod-rules`; `run_rules`
-    // liefert nur noch `Finding<Raw>`).
+    // (neben `run_rules_checked` eine der beiden öffentlichen Prägestellen
+    // für `Finding<RuleChecked>`; sie erlaubt hier `n` unterscheidbare
+    // Befunde).
     fn records(n: usize, detail: &str) -> TestResult<Vec<FindingRecord>> {
         let locked = vec![LockedPackage {
             name: "example-crate".to_owned(),

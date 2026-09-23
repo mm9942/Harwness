@@ -5168,7 +5168,16 @@ mod tests {
         };
 
         assert!(matches!(error, CoreError::TurnRejected(_)));
-        assert!(session.history().is_empty());
+        // The user item must never be admitted. The only permitted entry is
+        // the error record `transition_after_turn_failure` appends so the
+        // failure stays visible in export/resume.
+        let items = session.history().items();
+        assert_eq!(items.len(), 1, "only the failure record may be recorded");
+        assert!(
+            matches!(&items[0], TurnItem::Error(_)),
+            "expected a single error item, got {:?}",
+            items[0]
+        );
         assert!(matches!(
             session.state(),
             crate::session::SessionState::Failed(_)

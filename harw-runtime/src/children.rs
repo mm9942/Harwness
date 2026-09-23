@@ -1411,15 +1411,24 @@ mod tests {
 
     #[test]
     fn reasoning_effort_defaults_for_role_task_yields_none_for_main_model_fallback() -> TestResult {
-        // A role with no builtin `TaskComplexity`-mapped point and no
-        // internal-model-point override falls back to the parent's main
-        // model — whose provider/model id this factory does not track (see
-        // field doc on `reasoning_effort_config`).
+        // A role with no internal-model-point override that is not a builtin
+        // `worker` role falls back to the parent's main model — whose
+        // provider/model id this factory does not track (see field doc on
+        // `reasoning_effort_config`). `planner` is deliberately *not* used
+        // here: its builtin definition has `role = "worker"`, so it takes the
+        // `WorkerSimple`/`WorkerComplex` path exactly like `model_for_task`.
         let factory = factory_with_worker_complex_effort_defaults(Some("high"), Some("high"))?;
-        let (provider_default, model_default) =
-            factory.reasoning_effort_defaults_for_role_task(role_names::PLANNER, None);
-        assert_eq!(provider_default, None);
-        assert_eq!(model_default, None);
+        for role in [
+            // Builtin definition, but not a worker role.
+            role_names::ROOT_ORCHESTRATOR,
+            // Known registry role without a builtin definition.
+            role_names::SECURITY_EGRESS_TRIAGE,
+        ] {
+            let (provider_default, model_default) =
+                factory.reasoning_effort_defaults_for_role_task(role, None);
+            assert_eq!(provider_default, None, "role {role}");
+            assert_eq!(model_default, None, "role {role}");
+        }
         Ok(())
     }
 
