@@ -1405,7 +1405,7 @@ fn handoff_instructions(arguments: &serde_json::Value) -> Option<String> {
     };
     if let Some(task) = HANDOFF_TASK_FIELDS
         .iter()
-        .find_map(|field| non_empty_field(*field))
+        .find_map(|field| non_empty_field(field))
     {
         return Some(match non_empty_field("context") {
             Some(context) => format!("{task}\n\nKontext:\n{context}"),

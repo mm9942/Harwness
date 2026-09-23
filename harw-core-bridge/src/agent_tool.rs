@@ -625,13 +625,13 @@ impl AgentToolAdapter {
                         // Rückwärtskompatibel: der Freitext des Kindes geht
                         // unverändert (und ohne JSON-Quoting) an das Parent-Modell.
                         ChildReturnContract::Text => {
-                            completed_child_output(plain_child_return_text(spawner, &run_result))
+                            completed_child_output(plain_child_return_text(&spawner, &run_result))
                         }
                         // Typisierte Contracts parsen den ungekürzten Text: ein
                         // gekürztes JSON wäre sonst ein falscher Vertragsbruch.
                         typed => {
                             let text =
-                                full_child_return_text(spawner, &run_result).map_err(|error| {
+                                full_child_return_text(&spawner, &run_result).map_err(|error| {
                                     OpError::NotAvailable(format!(
                                         "Child-Agent-Abschlussantwort nicht verfügbar: {error}"
                                     ))
