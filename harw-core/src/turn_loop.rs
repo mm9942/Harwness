@@ -7492,7 +7492,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Reasoning-Sichtbarkeit für die UIA-Root-Session (Teil 2 / Welle 3 — 3e)
+    // Reasoning-Persistenz (Welle 3 — 3e, seit Runde 2 für jede Session)
     // ------------------------------------------------------------------
 
     /// UIA-Root-Fixture: kein Parent, `organizational_role` =
@@ -7907,16 +7907,16 @@ mod tests {
     }
 
     #[test]
-    fn registry_tool_wins_over_generated_handoff_definition() {
+    fn registry_tool_wins_over_generated_handoff_definition() -> TestResult {
         let session = make_session(
             StubToolProvider::with_names(&["transfer_to_worker"]),
             SessionActivation::new(ToolProfile::Full),
         );
-        let mut tools = vec![handoff_tool_spec("placeholder")];
-        tools[0] = StubToolProvider::with_names(&["transfer_to_worker"]).tools()[0].clone();
+        let mut tools = collect_tools(&session).map_err(ctx("Werkzeuge sammeln"))?;
         let before = tools.clone();
         append_handoff_tools(&session, &mut tools, &["worker".to_owned()]);
         assert_eq!(tools, before, "kein Duplikat neben dem Registry-Werkzeug");
+        Ok(())
     }
 
     #[tokio::test]

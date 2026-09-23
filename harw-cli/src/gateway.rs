@@ -2681,7 +2681,6 @@ async fn run_dream_job(
     config: &ResolvedConfig,
 ) -> Result<PathBuf, String> {
     let now = Timestamp::now();
-    let date = now.strftime("%Y-%m-%d").to_string();
     let job_id = format!("dream-{}", now.strftime("%Y%m%dT%H%M%S"));
 
     // Governance: budgetierter, retry-fähiger Job (tokens/wall/tools gedeckelt).
@@ -2791,8 +2790,7 @@ async fn run_dream_job(
     })
     .map_err(|e| e.to_string())?;
 
-    let report_path =
-        write_review_gated_dream_report(knowledge, &date, &job_id, &now, idle, &reflection)?;
+    let report_path = write_review_gated_dream_report(knowledge, &job_id, &now, idle, &reflection)?;
 
     Ok(report_path)
 }
@@ -2873,33 +2871,27 @@ fn last_assistant_text(session: &AgentSession) -> String {
 /// Diary oder andere dauerhafte Wissensbereiche übernommen werden.
 fn write_review_gated_dream_report(
     knowledge: &KnowledgeStore,
-    date: &str,
     job_id: &str,
     at: &Timestamp,
     idle: Duration,
     reflection: &str,
 ) -> Result<PathBuf, String> {
-    let report = render_dream_report(job_id, at, idle, reflection);
-    let report_path = knowledge.dream_path(date, job_id);
-    harw_knowledge::store::write_atomic(&report_path, &report)
-        .map_err(|error| error.to_string())?;
-    Ok(report_path)
-}
-
-/// Rendert einen `DreamReport` als review-gated Markdown-Dokument.
-fn render_dream_report(job_id: &str, at: &Timestamp, idle: Duration, reflection: &str) -> String {
-    format!(
-        "# Traumbericht {job_id}\n\n\
-         - Zeit: {}\n\
-         - Idle vor dem Schlaf: {} min\n\
-         - Status: **review-gated** (keine automatische Übernahme in Memory/Palace)\n\n\
-         ## Reflexion\n\n{reflection}\n\n\
-         ## Vorschläge\n\n\
-         _Keine automatisch übernommenen Änderungen. Prüfe die Reflexion und \
-         promote sie bei Bedarf manuell nach `topics/` oder `palace/`._\n",
-        at.strftime("%Y-%m-%d %H:%M:%S"),
-        idle.as_secs() / 60,
-    )
+    let report = harw_knowledge::DreamReport {
+        work_id: harw_job_runtime::WorkId::from_str(job_id),
+        created_at: *at,
+        summary: format!(
+            "Idle vor dem Schlaf: {} min\n\n{reflection}",
+            idle.as_secs() / 60
+        ),
+        proposed_topic_updates: Vec::new(),
+        proposed_palace_promotions: Vec::new(),
+        follow_ups: Vec::new(),
+    };
+    // Gültige Frontmatter (kind `dream_report`, operator_only): der Bericht
+    // bleibt review-gated und bricht den Wissensindex nicht mehr.
+    knowledge
+        .write_dream_report(&report)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -3012,13 +3004,24 @@ mod tests {
     }
 
     #[test]
-    fn dream_report_marks_review_gated_and_embeds_reflection() {
+    fn dream_report_is_indexable_and_review_gated() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("temp dir"))?;
+        let store = KnowledgeStore::new(tmp.path());
         let now = Timestamp::now();
-        let report =
-            render_dream_report("dream-x", &now, Duration::from_secs(20 * 60), "Wichtig: A.");
+        let path = write_review_gated_dream_report(
+            &store,
+            "dream-x",
+            &now,
+            Duration::from_secs(20 * 60),
+            "Wichtig: A.",
+        )
+        .map_err(ctx("write dream report"))?;
+        let report = std::fs::read_to_string(path).map_err(ctx("read report"))?;
         assert!(report.contains("review-gated"));
         assert!(report.contains("Wichtig: A."));
         assert!(report.contains("20 min"));
+        harw_knowledge::index::KnowledgeIndex::rebuild(&store).map_err(ctx("index rebuild"))?;
+        Ok(())
     }
 
     #[test]
@@ -3232,7 +3235,6 @@ mod tests {
         let reflection = "nur im Bericht";
         let report_path = write_review_gated_dream_report(
             &store,
-            "2026-07-15",
             "dream-test",
             &now,
             Duration::from_secs(20 * 60),
@@ -3245,7 +3247,11 @@ mod tests {
         assert!(report.contains(reflection));
 
         let agent = harw_knowledge::AgentId::new("gateway");
-        assert!(!store.diary_path(&agent, "2026-07-15").exists());
+        assert!(
+            !store
+                .diary_path(&agent, &now.strftime("%Y-%m-%d").to_string())
+                .exists()
+        );
         Ok(())
     }
 

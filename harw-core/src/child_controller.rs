@@ -2956,10 +2956,35 @@ impl ManagedAgentSpawner {
     /// independently (e.g. the child's own transcript/state store); this
     /// method only shrinks what is handed back to the parent.
     ///
+    /// Für typisierte Rückgabe-Verträge liefert
+    /// [`Self::child_final_assistant_text_full`] (bzw.
+    /// [`ChildRunResult::full_text`]) denselben Text ungekürzt.
+    ///
     /// # Errors
     /// Returns [`AgentSpawnError`] when the child is not admitted, its restored
     /// session is unavailable, or its history contains no assistant text.
     pub fn child_final_assistant_text(&self, child: &SessionId) -> Result<String, AgentSpawnError> {
+        let text = self.child_final_assistant_text_full(child)?;
+        Ok(cap_child_return_text(&text, CHILD_RETURN_MAX_BYTES))
+    }
+
+    /// Liefert die neueste Text-Antwort eines admittierten Kindes
+    /// **ungekürzt**.
+    ///
+    /// # Beschreibung
+    /// Gleiche Quelle und gleiche Fehler wie
+    /// [`Self::child_final_assistant_text`], aber ohne
+    /// [`cap_child_return_text`]. Gedacht für typisierte Rückgabe-Verträge,
+    /// deren Parser an einem gekürzten JSON fälschlich scheitern würden; eine
+    /// Freitext-Rückgabe an den Elternteil muss der Aufrufer selbst kappen.
+    ///
+    /// # Errors
+    /// [`AgentSpawnError`], wenn das Kind nicht admittiert ist, seine Session
+    /// nicht verfügbar ist oder sein Verlauf keinen Antworttext enthält.
+    pub fn child_final_assistant_text_full(
+        &self,
+        child: &SessionId,
+    ) -> Result<String, AgentSpawnError> {
         self.child_record(child)
             .ok_or_else(|| Self::reject(format!("child {child} is not admitted")))?;
         let manager = self
@@ -2991,8 +3016,7 @@ impl ManagedAgentSpawner {
             })
             .filter(|text: &String| !text.is_empty())
             .ok_or_else(|| Self::reject(format!("child {child} has no assistant response text")))?;
-
-        Ok(cap_child_return_text(&text, CHILD_RETURN_MAX_BYTES))
+        Ok(text)
     }
 
     #[must_use]
@@ -3408,9 +3432,11 @@ impl ManagedAgentSpawner {
                             );
                             drop(turn);
                         }
-                        self.set_status(child, ChildStatus::Failed);
                         let used_ms =
                             u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        let error =
+                            Self::budget_exceeded(BudgetDimension::WallTime, limit_ms, used_ms);
+                        self.set_failed(child, &error.to_string());
                         tracing::warn!(
                             child = %child,
                             dimension = BudgetDimension::WallTime.as_str(),
@@ -3418,11 +3444,7 @@ impl ManagedAgentSpawner {
                             used = used_ms,
                             "child_budget.exceeded",
                         );
-                        return Err(Self::budget_exceeded(
-                            BudgetDimension::WallTime,
-                            limit_ms,
-                            used_ms,
-                        ));
+                        return Err(error);
                     }
                 }
             }
@@ -3433,7 +3455,6 @@ impl ManagedAgentSpawner {
         if let Some(limit) = budget.max_tool_calls {
             let used = self.child_tool_call_count(child)?;
             if used > limit {
-                self.set_status(child, ChildStatus::Failed);
                 tracing::warn!(
                     child = %child,
                     dimension = BudgetDimension::ToolCalls.as_str(),
@@ -3441,17 +3462,18 @@ impl ManagedAgentSpawner {
                     used = used,
                     "child_budget.exceeded",
                 );
-                return Err(Self::budget_exceeded(
+                let error = Self::budget_exceeded(
                     BudgetDimension::ToolCalls,
                     u64::from(limit),
                     u64::from(used),
-                ));
+                );
+                self.set_failed(child, &error.to_string());
+                return Err(error);
             }
         }
         if let Some(limit) = budget.max_tokens {
             let used = self.child_token_usage(child)?;
             if used > limit {
-                self.set_status(child, ChildStatus::Failed);
                 tracing::warn!(
                     child = %child,
                     dimension = BudgetDimension::Tokens.as_str(),
@@ -3459,7 +3481,9 @@ impl ManagedAgentSpawner {
                     used = used,
                     "child_budget.exceeded",
                 );
-                return Err(Self::budget_exceeded(BudgetDimension::Tokens, limit, used));
+                let error = Self::budget_exceeded(BudgetDimension::Tokens, limit, used);
+                self.set_failed(child, &error.to_string());
+                return Err(error);
             }
         }
         Ok(outcome)
@@ -3780,7 +3804,7 @@ impl ManagedAgentSpawner {
         child: &SessionId,
         store: &dyn StateStore,
         approvals: Option<&ApprovalStore>,
-        input: TurnInput,
+        mut input: TurnInput,
     ) -> Result<ChildRunResult, AgentSpawnError> {
         let record = self
             .child_record(child)
@@ -3826,6 +3850,18 @@ impl ManagedAgentSpawner {
             child: child.clone(),
             session: Some(session),
         };
+        // Der bei der Admission hinterlegte Auftrag wird genau einmal
+        // verbraucht: vom ersten Lauf. Bringt dieser keinen eigenen User-Text
+        // mit (z. B. `TurnInput::default()`), wird der Auftrag sein User-Turn;
+        // der Steuerblock des Aufrufers bleibt erhalten.
+        let pending_task = self.take_pending_task(child);
+        let has_user_text = input
+            .user_text
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty());
+        if !has_user_text && let Some(task) = pending_task {
+            input.user_text = Some(task);
+        }
 
         let turn = {
             let session = running.session_mut()?;
@@ -3867,12 +3903,11 @@ impl ManagedAgentSpawner {
             Err(error) => {
                 // Nur echter Abschluss ist `Completed`: Abbruch und Fehler
                 // werden unterschieden und nie als Erfolg verbucht.
-                let status = if token.is_cancelled() {
-                    ChildStatus::Cancelled
+                if token.is_cancelled() {
+                    self.set_status(child, ChildStatus::Cancelled);
                 } else {
-                    ChildStatus::Failed
-                };
-                self.set_status(child, status);
+                    self.set_failed(child, &error.to_string());
+                }
                 return Err(error);
             }
         };
@@ -3885,23 +3920,44 @@ impl ManagedAgentSpawner {
         let pause_label = Self::pause_label(&outcome);
         match pause_label {
             Some(label) if !record.allow_pause => {
-                self.set_status(child, ChildStatus::Failed);
-                Err(Self::reject(format!(
-                    "child paused but its lifecycle forbids pausing: {label}"
-                )))
+                let reason = format!("child paused but its lifecycle forbids pausing: {label}");
+                self.set_failed(child, &reason);
+                Err(Self::reject(reason))
             }
             Some(_) => {
                 self.set_status(child, ChildStatus::Paused);
                 Ok(ChildRunResult {
                     child: child.clone(),
                     outcome,
+                    full_text: None,
                 })
             }
             None => {
+                // Ungekürzt für typisierte Verträge; fehlt Antworttext, bleibt
+                // `full_text` leer (der Aufrufer fällt dann auf
+                // `child_final_assistant_text` und dessen Fehler zurück).
+                let full_text = match &outcome {
+                    TurnOutcome::Completed => self.child_final_assistant_text_full(child).ok(),
+                    _ => None,
+                };
+                match (&outcome, full_text.as_deref()) {
+                    (_, Some(text)) => self.set_outcome_detail(child, text),
+                    (TurnOutcome::Failed { reason }, None) => {
+                        self.set_outcome_detail(child, reason);
+                    }
+                    (
+                        TurnOutcome::Refused {
+                            detail: Some(detail),
+                        },
+                        None,
+                    ) => self.set_outcome_detail(child, detail),
+                    _ => {}
+                }
                 self.set_status(child, ChildStatus::Completed);
                 Ok(ChildRunResult {
                     child: child.clone(),
                     outcome,
+                    full_text,
                 })
             }
         }
@@ -4755,7 +4811,24 @@ impl ManagedAgentSpawner {
         // auf SpawnContext.
         let root_session_id = Self::root_from_active(&active, &input.parent_session_id)
             .ok_or_else(|| Self::reject("child parent lineage contains a cycle"))?;
-        let task = input.instructions.clone();
+        // Auftrag des Kindes: `instructions`, sonst ein nicht leerer
+        // `context`. Der ungekürzte Text wird als `pending_task` für den
+        // ersten Lauf mit leerem `TurnInput` hinterlegt, sein Kurzkopf
+        // speist `AgentOrchestrationEvent::task`.
+        let pending_task = spawn_task_text(input.instructions.as_deref(), &input.context);
+        let task = pending_task.as_deref().and_then(orchestration_detail_head);
+        // Liegt der Elternteil mit laufendem Turn im Manager, bekommt das
+        // Kind sofort dessen Live-Kanal als Fortschritts-Senke; sonst muss
+        // der Aufrufer `attach_child_progress_sink` nutzen.
+        let parent_progress = manager
+            .get(&input.parent_session_id)
+            .ok()
+            .and_then(|parent| {
+                parent
+                    .current_turn()
+                    .cloned()
+                    .map(|turn_id| (turn_id, parent.live_emitter()))
+            });
         let record = ChildRecord {
             live: crate::child_controller::ChildLiveStats::default(),
             child: child.clone(),
@@ -4808,6 +4881,34 @@ impl ManagedAgentSpawner {
                 .child()
         };
         cancellations.insert(child.as_str().to_owned(), child_cancel);
+        match self.child_tasks.lock() {
+            Ok(mut tasks) => {
+                tasks.insert(
+                    child.as_str().to_owned(),
+                    ChildTaskState {
+                        pending_task,
+                        task: task.clone(),
+                        outcome_detail: None,
+                    },
+                );
+            }
+            Err(_) => tracing::warn!(child = %child, "child_task_state.lock_poisoned"),
+        }
+        if let Some((turn_id, emitter)) = parent_progress {
+            match self.progress_sinks.lock() {
+                Ok(mut sinks) => {
+                    sinks.insert(
+                        child.as_str().to_owned(),
+                        ChildProgressSink {
+                            turn_id,
+                            emitter,
+                            last_emitted: None,
+                        },
+                    );
+                }
+                Err(_) => tracing::warn!(child = %child, "child_progress.attach_lock_poisoned"),
+            }
+        }
         // Never invoke runtime code while controller locks are live: an
         // observer may persist synchronously or inspect the tree.
         drop(cancellations);
