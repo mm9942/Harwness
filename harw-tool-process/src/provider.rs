@@ -72,6 +72,7 @@ pub const MAX_PIDS: usize = 256;
 pub const MAX_NAME_BYTES: usize = 256;
 
 /// Budget für Listenelemente: Gesamtbudget abzüglich Reserve für Kopfdaten.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const ITEM_BUDGET: usize = MAX_OUTPUT_BYTES - 4 * 1024;
 
 // ---------------------------------------------------------------------------

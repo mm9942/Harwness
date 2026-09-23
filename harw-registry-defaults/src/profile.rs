@@ -64,6 +64,7 @@ use harw_project_discovery::{
 use harw_sandbox::{HostPermitSessionRegistry, ProcessPermitLedger, SandboxProfile};
 use harw_tool_deps::DepsToolProvider;
 use harw_tool_explorer::ExplorerToolProvider;
+use harw_tool_process::ProcessToolProvider;
 use harw_tool_doc::DocToolProvider;
 use harw_tool_fs::FsToolProvider;
 use harw_tool_lens::LensToolProvider;
@@ -431,6 +432,12 @@ const AGENT_DEFINITION_TOOLS: &[&str] = &[
 
 /// Die Werkzeuge von `harw-tool-shell`.
 pub(crate) const SHELL_TOOLS: &[&str] = &["shell.exec"];
+
+/// Die Werkzeuge von `harw-tool-process`: `process.list` (Vorschau, sendet
+/// nie ein Signal) und `process.kill` (destruktiv, immer freigabepflichtig
+/// über [`crate::ALWAYS_ASK_TOOLS`]). Beide verlangen
+/// `Permission::ExecuteProcess`; nur unter Linux wirksam.
+pub(crate) const PROCESS_TOOLS: &[&str] = &["process.list", "process.kill"];
 
 /// Das eine Werkzeug von `harw-tool-lens` (AW6-10): semantische Abfrage über
 /// `docs.design` und `knowledge.palace`.
@@ -834,6 +841,7 @@ impl RegistryProfile {
                 .chain(DOC_TOOLS.iter())
                 .chain(EXPLORER_TOOLS.iter())
                 .chain(SHELL_TOOLS.iter())
+                .chain(PROCESS_TOOLS.iter())
                 .copied()
                 .collect(),
             RegistryProfile::ShellExecution => SHELL_TOOLS.to_vec(),
@@ -1475,7 +1483,8 @@ fn profile_tool_providers(
             let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
             let explorer: Arc<dyn ToolProvider> = Arc::new(ExplorerToolProvider::new());
             let shell = build_shell_provider(sandbox_profile);
-            vec![filesystem, doc, explorer, shell]
+            let process: Arc<dyn ToolProvider> = Arc::new(ProcessToolProvider::new());
+            vec![filesystem, doc, explorer, shell, process]
         }
         RegistryProfile::ShellExecution => vec![build_shell_provider(sandbox_profile)],
         RegistryProfile::ReadOnlyExplore => {

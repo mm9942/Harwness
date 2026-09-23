@@ -204,14 +204,19 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
 /// hier gelistete Werkzeug bleibt zusätzlich außerhalb von
 /// [`AUTO_APPROVED_TOOLS`] (das gilt bereits, da beide Werkzeuge schreiben).
 ///
-/// # Warum nur diese zwei
+/// # Warum nur diese beiden Agenten-Werkzeuge
 /// `agents.write_definition` legt lediglich einen Vorschlag ab (nie eine
 /// aktive Definition) — dessen Prüfung ist Sache von `agents.commit_proposal`,
 /// nicht des Ablegens selbst. `agents.reject_proposal` verwirft nur, verleiht
 /// keine Rechte. Beide bleiben normal freigabepflichtig über
 /// [`AUTO_APPROVED_TOOLS`]/die Modus-Logik, aber nicht zusätzlich über diese
 /// Liste.
-pub const ALWAYS_ASK_TOOLS: &[&str] = &["agents.write_uia", "agents.commit_proposal"];
+///
+/// # `process.kill`
+/// Schickt SIGKILL an Host-Prozesse — nicht umkehrbar. Deshalb fragt es wie
+/// die beiden Agenten-Werkzeuge immer, auch unter `FullAccess` und trotz
+/// passender Allow-Regel.
+pub const ALWAYS_ASK_TOOLS: &[&str] = &["agents.write_uia", "agents.commit_proposal", "process.kill"];
 
 /// Default approval boundary for the built-in coding-agent tool set.
 ///

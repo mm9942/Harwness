@@ -21,6 +21,7 @@ harw-project-discovery = { path = "../harw-project-discovery" }
 harw-sandbox = { path = "../harw-sandbox" }
 harw-tool-deps = { path = "../harw-tool-deps" }
 harw-tool-explorer = { path = "../harw-tool-explorer" }
+harw-tool-process = { path = "../harw-tool-process" }
 # `doc.read_pdf` (Anbindung W3): lesendes PDF-Werkzeug, erscheint überall, wo
 # ein lesender `FsToolProvider` registriert wird (siehe `profile::DOC_TOOLS`).
 harw-tool-doc = { version = "0.3.0", path = "../harw-tool-doc" }

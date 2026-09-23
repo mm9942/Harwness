@@ -68,7 +68,7 @@ use crate::profile::{
     AGENT_DEFINITION_LIST_TOOLS, AGENT_DEFINITION_READ_TOOLS, AGENT_DEFINITION_WRITE_TOOLS,
     BROWSER_TOOLS, DEPS_SOURCE_TOOLS, DEPS_WORKSPACE_TOOLS, DOC_TOOLS, EXPLORER_TOOLS,
     FS_READ_ONLY_TOOLS,
-    LENS_TOOLS, SHELL_TOOLS, WEB_TOOLS, role_names,
+    LENS_TOOLS, PROCESS_TOOLS, SHELL_TOOLS, WEB_TOOLS, role_names,
 };
 
 /// Kennung des Reducers „nur Workspace lesen“.
@@ -374,7 +374,7 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
     let listed = |list: &[&str]| list.contains(&tool);
     if tool == "fs.write" || listed(AGENT_DEFINITION_WRITE_TOOLS) {
         Some(Permission::WriteWorkspace)
-    } else if listed(SHELL_TOOLS) {
+    } else if listed(SHELL_TOOLS) || listed(PROCESS_TOOLS) {
         Some(Permission::ExecuteProcess)
     } else if listed(FS_READ_ONLY_TOOLS)
         || listed(DOC_TOOLS)
@@ -422,6 +422,16 @@ mod tests {
     fn test_tool_permission_matches_deps_provider_declarations() {
         let names = harw_tool_deps::DepsToolProvider::TOOL_NAMES;
         let declared = harw_tool_deps::DepsToolProvider::TOOL_PERMISSIONS;
+        assert_eq!(names.len(), declared.len());
+        for (name, permission) in names.iter().zip(declared.iter()) {
+            assert_eq!(tool_permission(name), *permission, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_tool_permission_matches_process_provider_declarations() {
+        let names = harw_tool_process::ProcessToolProvider::TOOL_NAMES;
+        let declared = harw_tool_process::ProcessToolProvider::TOOL_PERMISSIONS;
         assert_eq!(names.len(), declared.len());
         for (name, permission) in names.iter().zip(declared.iter()) {
             assert_eq!(tool_permission(name), *permission, "{name}");
