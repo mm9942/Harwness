@@ -28,7 +28,7 @@ jobs:
             use_cross: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Gepinnte Toolchain aus rust-toolchain.toml (wie in ci.yml). Ein
       # `dtolnay/rust-toolchain@stable` würde hier ins Leere laufen: rustup
@@ -71,7 +71,7 @@ jobs:
           sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: harw-${{ matrix.target }}
           path: |
@@ -85,7 +85,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -98,7 +98,7 @@ jobs:
           rm -f -- *.tar.gz.sha256
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*.tar.gz
