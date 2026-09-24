@@ -7,6 +7,6 @@
 # (Ökosystem `rust-toolchain`, siehe `.github/dependabot.yml`).
 # Die MSRV in `Cargo.toml` (`rust-version`) bleibt davon unberührt.
 [toolchain]
-channel = "1.98.0"
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
