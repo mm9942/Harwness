@@ -164,9 +164,26 @@ pub mod role_names {
     pub const ROOT_ORCHESTRATOR: &str = "root-orchestrator";
     /// Read-only Erkundung von Workspace und Dependency-Quellen.
     pub const EXPLORER: &str = "explorer";
-    /// Dependency-Recherche aus `Cargo.lock` und dem lokalen Registry-Quellcache.
+    /// Rust/Cargo-Spezialist der Dependency-Recherche: belegt Verhalten aus
+    /// `Cargo.lock`, dem lokalen Registry-Quellcache, docs.rs und crates.io.
+    /// Für jedes andere Ökosystem (npm, PyPI, Go, Maven …) ist
+    /// [`DEPENDENCY_RESEARCHER`] zuständig.
     pub const RESEARCHER_DEPS: &str = "researcher-deps";
-    /// Web-Recherche über die Host-Allowlist der Sandbox.
+    /// Ökosystem-neutrale Dependency-Recherche (npm/pnpm/yarn, PyPI/uv/poetry,
+    /// Go-Module, Maven/Gradle, Cargo): liest Manifeste und Lockfiles im
+    /// Workspace und die offiziellen Paket-Registries/Dokus über das Netz —
+    /// ohne die Cargo-spezifischen `deps.*`-Werkzeuge
+    /// ([`crate::profile::RegistryProfile::ReadOnlyResearch`]).
+    pub const DEPENDENCY_RESEARCHER: &str = "dependency-researcher";
+    /// Allgemeine Recherche zu beliebigen Themen (Technik, Markt, Business,
+    /// Dokumente): Web, Workspace-Dokumente und PDFs, mit analytischem
+    /// Handwerk (Hypothesen, Schlüsselannahmen, Quellenbewertung,
+    /// Wahrscheinlichkeit getrennt von Konfidenz) im `ResearchFinding`
+    /// ([`crate::profile::RegistryProfile::ReadOnlyResearch`]).
+    pub const RESEARCHER: &str = "researcher";
+    /// Dokumentations-Web-Recherche über die Host-Allowlist der Sandbox —
+    /// ausschließlich Netz, kein Workspace-Lesen (A5), einschließlich der
+    /// Crate-Werkzeuge `web.docs_rs`/`web.crates_io`.
     pub const RESEARCHER_WEB: &str = "researcher-web";
     /// Erzeugt Planvorschläge, ohne den autoritativen Plan zu mutieren.
     pub const PLANNER: &str = "planner";
@@ -273,6 +290,8 @@ pub mod role_names {
         ROOT_ORCHESTRATOR,
         EXPLORER,
         RESEARCHER_DEPS,
+        DEPENDENCY_RESEARCHER,
+        RESEARCHER,
         RESEARCHER_WEB,
         PLANNER,
         ANALYST,
@@ -374,6 +393,8 @@ pub(crate) const WEB_TOOLS: &[&str] = &["web.fetch", "web.docs_rs", "web.crates_
 /// beide Werkzeuge über [`RegistryProfile::tool_names_for`] heraus. Die
 /// übrigen Rollen auf `ReadOnlyExplore` (`analyst`, `researcher-deps`)
 /// verbieten beide Werkzeuge ausdrücklich in ihrem `[tools].forbidden`.
+/// [`RegistryProfile::ReadOnlyResearch`] (`researcher`,
+/// `dependency-researcher`) führt dieselben zwei Werkzeuge.
 pub(crate) const EXPLORER_WEB_TOOLS: &[&str] = &["web.fetch", "web.search"];
 
 /// Das einzige Browser-Werkzeug von [`RegistryProfile::UiaQuickHelper`]
@@ -756,6 +777,27 @@ pub enum RegistryProfile {
     /// damit permitpflichtig und fail-closed, siehe
     /// `agents/uia-shell-worker.toml` und [`role_names::UIA_SHELL_WORKER`].
     UiaShellWorker,
+    /// Lesende Recherche mit Netz: [`FS_READ_ONLY_TOOLS`] plus [`DOC_TOOLS`]
+    /// (`doc.read_pdf`) plus [`EXPLORER_TOOLS`] (`explore.*`) plus
+    /// [`EXPLORER_WEB_TOOLS`] (`web.fetch`, `web.search`) — kein `fs.write`,
+    /// kein `shell.exec`, kein `deps.*`, kein `lens.ask`,
+    /// kein `web.docs_rs`/`web.crates_io`.
+    ///
+    /// # Warum dieses Profil existiert
+    /// Harwness ist nicht Rust-zentriert: Recherche zu npm-, PyPI-, Go- oder
+    /// Maven-Abhängigkeiten, zu Märkten, Wettbewerbern oder Fachdokumenten
+    /// braucht Workspace-Dokumente (Manifeste, Lockfiles, PDFs) **und**
+    /// offizielle Quellen im Netz — aber keine Cargo-spezifischen
+    /// `deps.*`-Werkzeuge (die nur `Cargo.lock` und den Cargo-Registry-Cache
+    /// kennen). `ReadOnlyExplore` bringt genau diese `deps.*` mit, `Research`
+    /// liest keinen Workspace (A5), `UiaExplorer` hat dieselbe
+    /// Werkzeugmenge, gehört aber zur Organisationsrolle der UIA und trägt
+    /// deren Rollenbeschreibung. Rollen: [`role_names::DEPENDENCY_RESEARCHER`]
+    /// und [`role_names::RESEARCHER`], beide mit dem Reducer
+    /// [`crate::authority::AuthorityReducer::ReadWorkspaceNetwork`] — Netz
+    /// nur, wenn der Elternteil es trägt, und nur zu dessen
+    /// (egress-gebundenen) Hosts.
+    ReadOnlyResearch,
 }
 
 impl RegistryProfile {
@@ -775,6 +817,7 @@ impl RegistryProfile {
         RegistryProfile::UiaExplorer,
         RegistryProfile::UiaWriter,
         RegistryProfile::UiaShellWorker,
+        RegistryProfile::ReadOnlyResearch,
     ];
 
     /// Liefert die Rollenbeschreibung, die im System-Prompt erscheint.
@@ -810,6 +853,7 @@ impl RegistryProfile {
             RegistryProfile::UiaShellWorker => {
                 "host shell execution specialization of the user interface agent"
             }
+            RegistryProfile::ReadOnlyResearch => "read-only research agent",
         }
     }
 
@@ -983,6 +1027,17 @@ impl RegistryProfile {
                 .chain(SHELL_TOOLS.iter())
                 .copied()
                 .collect(),
+            // Lesende Recherche mit Netz (siehe die Begründung bei
+            // `RegistryProfile::ReadOnlyResearch`): lesender fs.*-Kern plus
+            // `doc.read_pdf` plus `explore.*` plus `web.fetch`/`web.search` —
+            // kein `deps.*` (Cargo-spezifisch).
+            RegistryProfile::ReadOnlyResearch => FS_READ_ONLY_TOOLS
+                .iter()
+                .chain(DOC_TOOLS.iter())
+                .chain(EXPLORER_TOOLS.iter())
+                .chain(EXPLORER_WEB_TOOLS.iter())
+                .copied()
+                .collect(),
         }
     }
 
@@ -1111,6 +1166,12 @@ pub fn profile_for_role(role: &str) -> Option<RegistryProfile> {
             Some(RegistryProfile::ReadOnlyExplore)
         }
         role_names::RESEARCHER_WEB => Some(RegistryProfile::Research),
+        // Ökosystem-neutrale und allgemeine Recherche: Workspace-Dokumente
+        // plus Netz, ohne die Cargo-spezifischen `deps.*` — siehe die
+        // Begründung bei `RegistryProfile::ReadOnlyResearch`.
+        role_names::DEPENDENCY_RESEARCHER | role_names::RESEARCHER => {
+            Some(RegistryProfile::ReadOnlyResearch)
+        }
         role_names::PLANNER => Some(RegistryProfile::Planning),
         // Die vier Triage-Rollen admittieren kein Werkzeug (`[tools].admitted
         // = []`) — sie bekommen bereits ausgewertete Befund-Batches als
@@ -1671,6 +1732,23 @@ fn profile_tool_providers(
             let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
             let shell = build_shell_provider(&SandboxProfile::Host);
             vec![filesystem, doc, shell]
+        }
+        // Lesende Recherche mit Netz: gefilterter, lesender FS-Provider +
+        // lesender Doc-Provider + Explorer-Provider + auf
+        // `web.fetch`/`web.search` gefilterter Web-Provider — siehe die
+        // Begründung bei `RegistryProfile::ReadOnlyResearch`.
+        RegistryProfile::ReadOnlyResearch => {
+            let filesystem: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
+                Arc::new(FsToolProvider::default()),
+                FS_READ_ONLY_TOOLS,
+            ));
+            let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
+            let explorer: Arc<dyn ToolProvider> = Arc::new(ExplorerToolProvider::new());
+            let web: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
+                Arc::new(WebToolProvider::new()),
+                EXPLORER_WEB_TOOLS,
+            ));
+            vec![filesystem, doc, explorer, web]
         }
     }
 }

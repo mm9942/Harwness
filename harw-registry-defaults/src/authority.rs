@@ -150,7 +150,7 @@ pub enum AuthorityReducer {
     /// Egress-Policy (`explorer`, `uia-worker`, `uia-writer`).
     ReadExplore,
     /// Workspace lesen plus ausgehendes Netz über die Egress-Policy
-    /// (`uia-explorer`).
+    /// (`uia-explorer`, `dependency-researcher`, `researcher`).
     ReadWorkspaceNetwork,
 }
 
@@ -303,6 +303,11 @@ pub fn reduce_to_read_workspace_network(granted: &PermissionSet) -> PermissionSe
 ///   `deps.source_*`, deren Prolog `ReadCargoRegistry` verlangt; ihre TOML
 ///   verbietet `web.*`, sie bekommen deshalb kein Netz.
 /// - `researcher-web` → [`AuthorityReducer::ReadNetwork`].
+/// - `dependency-researcher`, `researcher` →
+///   [`AuthorityReducer::ReadWorkspaceNetwork`] (Profil `ReadOnlyResearch`:
+///   `fs.read/list/search/glob/grep`, `doc.read_pdf`, `explore.*`,
+///   `web.fetch`/`web.search` — die Obergrenze trägt genau `ReadWorkspace`
+///   und `NetworkAccess`, kein `ReadCargoRegistry`).
 /// - die vier `security-*-triage`-Rollen → [`AuthorityReducer::ReadOnly`]
 ///   (Profil `NoTools`, sie brauchen gar kein Recht; `ReadOnly` ist die engste
 ///   Kennung des Vokabulars).
@@ -386,6 +391,13 @@ pub fn authority_reducer_for_role(role: &str) -> Option<AuthorityReducer> {
             Some(AuthorityReducer::ReadRegistry)
         }
         role_names::RESEARCHER_WEB => Some(AuthorityReducer::ReadNetwork),
+        // Ökosystem-neutrale bzw. allgemeine Recherche
+        // (`RegistryProfile::ReadOnlyResearch`): Workspace-Dokumente lesen
+        // plus egress-gebundenes Netz, kein Registry-Quellcache (die Rollen
+        // registrieren kein `deps.*`) — trägt ihr ganzes Profil.
+        role_names::DEPENDENCY_RESEARCHER | role_names::RESEARCHER => {
+            Some(AuthorityReducer::ReadWorkspaceNetwork)
+        }
         role_names::SECURITY_EGRESS_TRIAGE
         | role_names::SECURITY_BASELINE_TRIAGE
         | role_names::SECURITY_STRUCTURE_TRIAGE
