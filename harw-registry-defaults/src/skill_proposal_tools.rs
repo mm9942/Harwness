@@ -1059,8 +1059,8 @@ pub struct LoadedSkillProposal {
 pub enum SkillProposalListing {
     /// Ein lesbarer Vorschlag.
     Proposal {
-        /// Metadaten.
-        meta: SkillProposalMeta,
+        /// Metadaten (geboxt: die Variante wäre sonst ~600 Byte größer).
+        meta: Box<SkillProposalMeta>,
         /// Ob er abgelaufen ist.
         expired: bool,
     },
@@ -1376,7 +1376,10 @@ impl SkillProposalStore {
             match self.read_meta(&proposal_id) {
                 Ok(meta) => {
                     let expired = is_expired(&meta.expires_at);
-                    listings.push(SkillProposalListing::Proposal { meta, expired });
+                    listings.push(SkillProposalListing::Proposal {
+                        meta: Box::new(meta),
+                        expired,
+                    });
                 }
                 Err(error) => listings.push(SkillProposalListing::Broken {
                     proposal_id,
@@ -2360,7 +2363,7 @@ mod tests {
     fn only_proposal(store: &SkillProposalStore) -> TestResult<SkillProposalMeta> {
         let mut listings = store.list().map_err(ctx("list"))?;
         match (listings.pop(), listings.is_empty()) {
-            (Some(SkillProposalListing::Proposal { meta, .. }), true) => Ok(meta),
+            (Some(SkillProposalListing::Proposal { meta, .. }), true) => Ok(*meta),
             other => Err(TestError::Unexpected(format!(
                 "expected exactly one proposal, got {other:?}"
             ))),

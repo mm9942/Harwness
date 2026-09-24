@@ -144,6 +144,9 @@ pub(crate) fn content_height(area: Rect, has_header: bool) -> usize {
 /// - `lines`: alle Inhaltszeilen; sichtbar ist das Fenster ab `scroll`.
 /// - `scroll`: erster sichtbarer Zeilenindex (wird auf das Ende geklemmt).
 /// - `footer`: Tastenhinweis in der letzten Zeile.
+// Reine Zeichenfunktion: die Parameter sind unabhängige Layout-Eingaben,
+// ein Hilfs-Struct brächte hier keine Klarheit.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_panel(
     area: Rect,
     buf: &mut Buffer,

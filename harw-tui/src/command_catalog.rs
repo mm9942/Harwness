@@ -385,7 +385,7 @@ pub(crate) const PLANNED_COMMANDS: &[(&str, &str)] = &[
 pub(crate) fn subcommand_hints(name: &str) -> &'static [SubcommandHint] {
     for (command, _, hints) in HINT_TABLE {
         if *command == name {
-            return *hints;
+            return hints;
         }
     }
     &[]

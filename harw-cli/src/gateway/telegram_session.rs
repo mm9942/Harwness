@@ -334,7 +334,7 @@ struct ResumeJob {
 }
 
 enum Job {
-    Message(InboundEvent),
+    Message(Box<InboundEvent>),
     Resume(Box<ResumeJob>),
 }
 
@@ -468,7 +468,7 @@ impl Engine {
 
     fn process(&self, runtime: &Runtime, key: &SessionKey, job: Job) {
         match job {
-            Job::Message(event) => self.process_message(runtime, key, event),
+            Job::Message(event) => self.process_message(runtime, key, *event),
             Job::Resume(resume) => self.process_resume(runtime, *resume),
         }
     }
@@ -1044,7 +1044,7 @@ impl TelegramSessionDispatcher {
         if self
             .engine
             .pool
-            .with(|state| state.enqueue(key, Job::Message(event)))
+            .with(|state| state.enqueue(key, Job::Message(Box::new(event))))
             .is_err()
         {
             tracing::warn!(channel = %channel, peer = %peer, "Telegram session queue full or closed; message dropped");
