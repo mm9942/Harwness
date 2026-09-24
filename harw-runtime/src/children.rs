@@ -1298,6 +1298,7 @@ mod tests {
             .map_err(ctx("test fixture uses a valid ReasoningEffort label"))?;
         Ok(harw_config::ModelToml {
             stream: None,
+            rate_limit: None,
             id: "acme-model".to_owned(),
             name: None,
             provider: "acme".to_owned(),

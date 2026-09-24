@@ -834,6 +834,7 @@ mod tests {
     fn model_toml(id: &str, provider: &str) -> harw_config::ModelToml {
         harw_config::ModelToml {
             stream: None,
+            rate_limit: None,
             id: id.to_owned(),
             name: None,
             provider: provider.to_owned(),
@@ -966,6 +967,7 @@ mod tests {
             "local-model".to_owned(),
             harw_config::ModelToml {
                 stream: None,
+                rate_limit: None,
                 id: "local-model".to_owned(),
                 name: None,
                 provider: "local".to_owned(),

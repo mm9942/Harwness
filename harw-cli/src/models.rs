@@ -883,6 +883,7 @@ fn write_discovered_model_file(
     })?;
     let toml_model = harw_config::ModelToml {
         stream: None,
+        rate_limit: None,
         id: model.id.clone(),
         name: None,
         provider: provider_name.to_owned(),
@@ -1240,6 +1241,7 @@ mod tests {
         .map_err(ctx("provider"))?;
         let live = harw_config::ModelToml {
             stream: None,
+            rate_limit: None,
             id: "model/with-slash".to_owned(),
             name: None,
             provider: "acme".to_owned(),
@@ -1313,6 +1315,7 @@ mod tests {
         std::fs::create_dir_all(&models_dir).map_err(ctx("models dir"))?;
         let old = harw_config::ModelToml {
             stream: None,
+            rate_limit: None,
             id: "gone".to_owned(),
             name: None,
             provider: "acme".to_owned(),
@@ -1327,6 +1330,7 @@ mod tests {
         };
         let other = harw_config::ModelToml {
             stream: None,
+            rate_limit: None,
             provider: "other".to_owned(),
             ..old.clone()
         };
@@ -1423,6 +1427,7 @@ mod tests {
 
         let stale = harw_config::ModelToml {
             stream: None,
+            rate_limit: None,
             id: "stale-model".to_owned(),
             name: None,
             provider: "acme".to_owned(),
@@ -1437,6 +1442,7 @@ mod tests {
         };
         let default_model = harw_config::ModelToml {
             stream: None,
+            rate_limit: None,
             id: "gpt-5.6-terra".to_owned(),
             ..stale.clone()
         };

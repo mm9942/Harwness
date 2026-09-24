@@ -171,6 +171,10 @@ impl ResolvedConfig {
             }
         }
 
+        for model_name in sorted_keys(&self.models) {
+            self.models[model_name].validate()?;
+        }
+
         for agent_name in sorted_keys(&self.agents) {
             let agent = &self.agents[agent_name];
             for provider in agent

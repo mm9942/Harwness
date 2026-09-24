@@ -3021,9 +3021,7 @@ async fn drive_turn(
                     estimated_tokens,
                     "turn_loop.context_length_recovery"
                 );
-                let target = budget
-                    .emergency_target(EMERGENCY_RECOVERY_TARGET_PERCENT)
-                    .min(estimated_tokens / 2);
+                let target = budget.recovery_target(estimated_tokens);
                 match run_budget_compaction(
                     session,
                     model,
@@ -3126,9 +3124,7 @@ async fn drive_turn(
                 estimated_tokens,
                 "turn_loop.context_window_exceeded_recovery"
             );
-            let target = budget
-                .emergency_target(EMERGENCY_RECOVERY_TARGET_PERCENT)
-                .min(estimated_tokens / 2);
+            let target = budget.recovery_target(estimated_tokens);
             if let Some(outcome) = run_budget_compaction(
                 session,
                 model,
@@ -4039,6 +4035,21 @@ impl RoundBudget {
             .saturating_sub(self.reserve_tokens)
             .saturating_mul(percent)
             / 100
+    }
+
+    /// Ziel-Token-Zahl der Notfall-Verdichtung nach einer vom Provider
+    /// gemeldeten Kontextüberschreitung: höchstens die Hälfte der Schätzung
+    /// des gescheiterten Requests (sonst ändert die Wiederholung nichts) und
+    /// bei bekanntem Fenster höchstens
+    /// [`EMERGENCY_RECOVERY_TARGET_PERCENT`] % von `Fenster − Reserve`.
+    fn recovery_target(&self, estimated_tokens: u64) -> u64 {
+        let half = estimated_tokens / 2;
+        if self.window_tokens > 0 {
+            self.emergency_target(EMERGENCY_RECOVERY_TARGET_PERCENT)
+                .min(half)
+        } else {
+            half
+        }
     }
 
     /// Verdoppeltes Ausgabelimit für die Wiederholung nach `MaxTokens` mit

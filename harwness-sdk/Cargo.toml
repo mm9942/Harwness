@@ -1,0 +1,58 @@
+[package]
+publish.workspace = true
+name = "harwness-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Stabile, dokumentierte Einbettungs-API für Harwness"
+
+# Die SDK ist die semver-Grenze: ihre öffentliche Fläche nennt keinen Typ aus
+# einem `harw-*`-Crate. Alles darunter ist Implementierungsdetail und darf sich
+# ohne Major-Sprung der SDK ändern. Einzige Ausnahme ist das Feature
+# `unstable-internals`, das rohe Erweiterungspunkte ausdrücklich ohne
+# Stabilitätszusage freischaltet.
+
+[features]
+default = ["browser"]
+# Browser-Werkzeuge der Wurzelsitzung (reicht an `harw-runtime/browser` durch).
+browser = ["harw-runtime/browser"]
+# Rohe Erweiterungspunkte (eigene `ToolProvider`/`ContextProvider`/
+# `ModelProvider`, `secrets:`-Resolver). KEINE semver-Zusage.
+unstable-internals = ["dep:harw-provider-http"]
+
+[dependencies]
+harw-config = { path = "../harw-config" }
+harw-core = { path = "../harw-core" }
+harw-extension-api = { path = "../harw-extension-api" }
+harw-home = { path = "../harw-home" }
+harw-protocol = { path = "../harw-protocol" }
+harw-provider-http = { path = "../harw-provider-http", optional = true }
+harw-runtime = { path = "../harw-runtime", default-features = false }
+harw-session-store = { path = "../harw-session-store" }
+harw-tools = { path = "../harw-tools" }
+harw-types = { path = "../harw-types" }
+# Öffentlich: Werkzeug-Argumente/-Ergebnisse und Ereignis-Nutzdaten sind JSON.
+serde_json = { workspace = true }
+# `Stream`-Trait für `EventStream` (identisch zu `tokio_stream::Stream`).
+futures-core = "0.3.32"
+# Kein `[workspace.dependencies]`-Eintrag für tokio; Version = Cargo.lock.
+tokio = { version = "1.53.0", features = ["rt", "sync", "time"] }
+# `BroadcastStream` über den `AgentEventHub` (Version = Cargo.lock).
+tokio-stream = { version = "0.1.18", features = ["sync"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { version = "1.53.0", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+
+[[example]]
+name = "minimal_chat"
+
+[[example]]
+name = "streaming_events"
+
+[[example]]
+name = "custom_tool"
+
+[lints]
+workspace = true

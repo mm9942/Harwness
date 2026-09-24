@@ -444,6 +444,7 @@ mod tests {
             "catalog-model".to_owned(),
             harw_config::ModelToml {
                 stream: None,
+                rate_limit: None,
                 id: "catalog-model".to_owned(),
                 name: None,
                 provider: "catalog".to_owned(),
