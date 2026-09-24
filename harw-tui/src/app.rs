@@ -167,13 +167,23 @@ use crate::model_switch_picker::{
 // Moduldoku) — der Fragevertrag und die Ausstellungslogik leben dort bzw. in
 // `harw_tool_shell::exec::ShellExecutor::authorize_host_command`; `app.rs`
 // besitzt nur noch Rendering, Vorauswahl-Anzeige und das Arming-Delay.
+use crate::CommandRegistry;
+use crate::command_data;
+use crate::help_overlay::{HelpOverlay, HelpTab};
 use crate::input_editor::{InputAction, InputEditor};
 use crate::input_history::InputHistoryStore;
-use crate::runtime_commands;
-use crate::{
-    CapabilitySet, CommandAction, CommandRegistry, DispatchContext, Invocation, InvocationSurface,
-    ShellCapability,
+use crate::kanban_board::KanbanBoard;
+use crate::local_commands::{self, LocalCommandContext, LocalIntercept, PanelToggle};
+use crate::mention::{MentionLimits, expand_file_mentions, scan_mention_candidates};
+use crate::mention_popup::{
+    MentionCandidate, MentionPopup, MentionPopupAction, current_mention_query,
 };
+use crate::mode_picker::ModePicker;
+use crate::model_roles_view::ModelRolesView;
+use crate::overlay_view::{OverlayOutcome, OverlayView};
+use crate::runtime_commands;
+use crate::status_line;
+use crate::workbench_pane::{PaneCommand, WorkbenchPane};
 // Nur Tests (über `use super::*`) rufen die in `runtime_root` gewanderte
 // Coercion-Hilfe noch unqualifiziert auf; Prod in app.rs nutzt sie nicht.
 use crate::runtime_root::TitleJobContext;
@@ -563,7 +573,39 @@ enum Overlay {
         /// Der eigentliche Auswahldialog.
         dialog: ChoiceDialog,
     },
+    /// Generische Ansicht (Hilfe, Modelle je Rolle, Modus-Auswahl, Kanban,
+    /// Wissensbrowser). Schreibaktionen erzeugen Slash-Zeilen; Daten kommen
+    /// über [`OverlayView::refresh_command`] bzw. `Fetch` aus `OpOutput.data`.
+    View(Box<dyn OverlayView>),
 }
+
+/// Ausstehender Datenabruf (`OpOutput.data`) für eine Ansicht oder das
+/// Werkbank-Panel.
+///
+/// # Beschreibung
+/// Tastenbehandlung ist synchron; die eigentliche Ausführung über
+/// [`command_data::execute_command_with_data`] ist `async` und läuft deshalb
+/// erst am Anfang der nächsten Runde von [`run_loop`]
+/// ([`process_pending_fetches`]). Die Ergebnisse landen nie im Chat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DataFetch {
+    /// Befehl für die generische Ansicht der angegebenen Generation; ein
+    /// Ergebnis für eine inzwischen ersetzte Ansicht wird verworfen.
+    Overlay {
+        /// Auszuführende Slash-Zeile.
+        command: String,
+        /// Generation der Ansicht beim Einreihen.
+        generation: u64,
+    },
+    /// `/workbench show` für das Werkbank-Panel.
+    Workbench,
+}
+
+/// Bekannte Agentenrollen für `@rolle`-Erwähnungen und das `@`-Popup.
+const KNOWN_ROLES: &[&str] = harw_registry_defaults::profile::role_names::ALL;
+
+/// Höchstzahl der Dateikandidaten im `@`-Popup.
+const MENTION_CANDIDATE_CAP: usize = 200;
 
 /// Plan- und Ziel-Dienste, die der Renderer für [`PlanGraphCell`] und
 /// [`GoalCell`] braucht.
@@ -1137,6 +1179,21 @@ pub struct ChatApp {
     /// zur Hand ist; von einem Aufrufer, der einen Guard besitzt, über
     /// [`Self::take_needs_terminal_reassert`] konsumiert.
     needs_terminal_reassert: bool,
+    /// Werkbank-Panel (rechte Spalte, `F5`); lädt über
+    /// [`WorkbenchPane::REFRESH_COMMAND`], sobald sichtbar und veraltet.
+    workbench: WorkbenchPane,
+    /// Geöffnetes `@`-Erwähnungs-Popup oder `None`.
+    mention_popup: Option<MentionPopup>,
+    /// Ausstehende Datenabrufe, abgearbeitet am Anfang jeder
+    /// [`run_loop`]-Runde (siehe [`DataFetch`]).
+    pending_fetches: Vec<DataFetch>,
+    /// Slash-Zeilen aus synchronen Pfaden ohne Ereigniskanal (z. B.
+    /// Werkbank-Tasten), die [`run_loop`] im Leerlauf als
+    /// [`HarwEvent::Command`] abschickt.
+    pending_commands: std::collections::VecDeque<String>,
+    /// Generation der aktuell offenen generischen Ansicht
+    /// ([`Overlay::View`]); wächst bei jedem Öffnen.
+    overlay_generation: u64,
 }
 
 /// Handgeschriebene `Debug`-Implementierung, da [`CommandAdapter`] (enthält
@@ -1252,7 +1309,8 @@ impl ChatApp {
             escape_armed: false,
             scroll: ChatScroll::new(),
             input_history,
-            command_registry: CommandRegistry::from_command_adapters(&adapters),
+            command_registry: CommandRegistry::from_command_adapters(&adapters)
+                .with_local_specs(crate::command_catalog::local_command_specs()),
             command_popup: None,
             theme: style::detect_theme(),
             total_usage: TokenUsage::default(),
@@ -1301,6 +1359,11 @@ impl ChatApp {
             last_shell_command: None,
             pending_turn_user_cell_override: None,
             needs_terminal_reassert: false,
+            workbench: WorkbenchPane::new(),
+            mention_popup: None,
+            pending_fetches: Vec::new(),
+            pending_commands: std::collections::VecDeque::new(),
+            overlay_generation: 0,
         }
     }
 
