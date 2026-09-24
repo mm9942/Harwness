@@ -302,10 +302,26 @@ pub(crate) fn knowledge_store(ctx: &OpContext) -> Result<Arc<KnowledgeStore>, Op
 
 /// Die Identität, unter der eine Wissens-Op schreibt: die Principal-Id,
 /// sonst `operator`.
+///
+/// Pfadtrenner und Steuerzeichen werden durch `-` ersetzt, weil die Id als
+/// Pfadkomponente dient (`diary/<agent-id>/…`).
 pub(crate) fn caller_agent(ctx: &OpContext) -> AgentId {
-    ctx.service::<Principal>()
-        .map(|principal| AgentId::new(principal.id()))
-        .unwrap_or_else(|| AgentId::new("operator"))
+    let raw = ctx
+        .service::<Principal>()
+        .map(|principal| principal.id().to_owned())
+        .filter(|id| !id.trim().is_empty() && id != "." && id != "..")
+        .unwrap_or_else(|| "operator".to_owned());
+    let safe: String = raw
+        .chars()
+        .map(|c| {
+            if c == '/' || c == '\\' || c.is_control() {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    AgentId::new(safe)
 }
 
 /// Übersetzt [`KnowledgeError`] in [`OpError`]: Eingabe-/Zustandsfehler

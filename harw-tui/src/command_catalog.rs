@@ -200,12 +200,22 @@ const WORKBENCH: &[SubcommandHint] = &[
     ),
 ];
 
-/// `/kanban` (Vertrag, Schreibbefehle).
+/// `/kanban`, Grammatik aus `harw-ops/src/kanban.rs` (`--board=<id>` davor
+/// möglich).
 const KANBAN: &[SubcommandHint] = &[
-    SubcommandHint::new("show", "", "Board anzeigen"),
+    SubcommandHint::new("show", "[karte]", "Board oder eine Karte anzeigen"),
+    SubcommandHint::new("list", "", "Karten des Boards auflisten"),
+    SubcommandHint::new("boards", "", "Boards auflisten"),
     SubcommandHint::new("add", "<titel>", "Karte anlegen"),
-    SubcommandHint::new("move", "<karte> <status>", "Karte verschieben"),
-    SubcommandHint::new("block", "<karte> <art>", "Karte blockieren"),
+    SubcommandHint::new(
+        "move",
+        "<karte> <todo|ready|running|done|blocked|archived>",
+        "Karte verschieben",
+    ),
+    SubcommandHint::new("todo", "<karte>", "Karte auf Todo setzen"),
+    SubcommandHint::new("ready", "<karte>", "Karte bereitstellen"),
+    SubcommandHint::new("claim", "<karte>", "Karte übernehmen"),
+    SubcommandHint::new("block", "<karte> <grund>", "Karte blockieren"),
     SubcommandHint::new("unblock", "<karte>", "Blockade aufheben"),
     SubcommandHint::new("done", "<karte>", "Karte erledigen"),
     SubcommandHint::new("archive", "<karte>", "Karte archivieren"),
@@ -311,7 +321,7 @@ const HINT_TABLE: &[(&str, &str, &[SubcommandHint])] = &[
     ),
     (
         "kanban",
-        "/kanban [show|add|move|block|unblock|done|archive] …",
+        "/kanban [--board=<id>] [show|list|boards|add|move|block|done|…] …",
         KANBAN,
     ),
     (
@@ -397,7 +407,9 @@ fn shorten_summary(summary: &str) -> String {
     }
     if let Some(end) = summary.find(". ") {
         let first = &summary[..end];
-        if first.chars().count() <= MAX_SUMMARY_CHARS {
+        // Mindestlänge schützt vor Abkürzungen wie „z. B.".
+        let len = first.chars().count();
+        if (20..=MAX_SUMMARY_CHARS).contains(&len) {
             return first.to_owned();
         }
     }
@@ -784,8 +796,12 @@ mod tests {
 
     #[test]
     fn shorten_summary_prefers_the_first_sentence() {
-        let long = format!("Erster Satz. {}", "y".repeat(200));
-        assert_eq!(shorten_summary(&long), "Erster Satz");
+        let long = format!("Das ist der erste Satz. {}", "y".repeat(200));
+        assert_eq!(shorten_summary(&long), "Das ist der erste Satz");
+        let abbreviation = format!("Etwa z. B. {}", "y".repeat(200));
+        let cut = shorten_summary(&abbreviation);
+        assert_eq!(cut.chars().count(), MAX_SUMMARY_CHARS);
+        assert!(cut.ends_with('…'));
         assert_eq!(shorten_summary("kurz"), "kurz");
     }
 }
