@@ -1,6 +1,8 @@
 # Config Structure — the `.harw/` Tree
 
-Status: draft, implemented in `harw-config` (this doc is the source of truth
+> Status: implemented · Last reviewed: 2026-09-24
+
+Implemented in `harw-config` (this doc is the source of truth
 for the schema; the crate is kept in sync with it).
 
 Inspiration: OpenClaw's single `openclaw.json` (`inspirations/openclaw/docs/gateway/configuration.md`,

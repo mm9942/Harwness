@@ -1,75 +1,70 @@
-# Build-Voraussetzungen
+# Build prerequisites
 
-Status: Ist (ab Welle W0b)
+This document lists what must be installed and correctly configured on a
+machine before `cargo build`/`cargo test`/`xtask` can even start in this
+workspace — tool versions and, for the Raspberry Pi 5 as a target platform,
+kernel properties that no `Cargo.toml` entry can enforce. It does not
+replace an installation guide (see `harw-install`/
+`docs/design/CONTRACT-setup-install.md` for that) — it records **which**
+prerequisites apply and **why**, so a deviation is visible instead of
+silent.
 
-Dieses Dokument listet, was auf einer Maschine installiert und passend
-konfiguriert sein muss, bevor `cargo build`/`cargo test`/`xtask` in diesem
-Workspace überhaupt starten können — Werkzeugversionen und, für den
-Raspberry Pi 5 als Zielplattform, Kernel-Eigenschaften, die kein
-`Cargo.toml`-Eintrag erzwingen kann. Es ersetzt keine Installationsanleitung
-(siehe dafür `harw-install`/`docs/design/CONTRACT-setup-install.md`) — es
-hält fest, **welche** Voraussetzungen gelten und **warum**, damit ein
-Abweichen sichtbar und nicht stillschweigend ist.
+## 1. Rust toolchain: `1.98.1` (pinned)
 
-## 1. Rust-Toolchain: `1.98.1` (gepinnt)
+The toolchain is pinned in **`rust-toolchain.toml`** at the repository
+root (`channel = "1.98.1"`, components `rustfmt` and `clippy`, profile
+`minimal`). rustup reads this file automatically — including in the
+standalone `dod/` workspace, which therefore has no file of its own — and
+installs the version on the first `cargo` invocation. CI
+(`.github/workflows/ci.yml`, `release.yml`) installs exactly this file via
+`rustup toolchain install`; locally and in CI the same compiler, the same
+`rustfmt` and the same `clippy` are used.
 
-Die Toolchain ist in **`rust-toolchain.toml`** im Repo-Wurzelverzeichnis
-gepinnt (`channel = "1.98.1"`, Komponenten `rustfmt` und `clippy`, Profil
-`minimal`). rustup liest die Datei automatisch – auch im eigenständigen
-`dod/`-Workspace, der deshalb keine eigene Datei hat – und installiert die
-Version beim ersten `cargo`-Aufruf nach. Die CI (`.github/workflows/ci.yml`,
-`release.yml`) installiert genau diese Datei per `rustup toolchain install`;
-lokal und in der CI prüfen damit derselbe Compiler, dasselbe `rustfmt` und
-dasselbe `clippy`. Neue Versionen kommen bewusst über Dependabot
-(Ökosystem `rust-toolchain`), nicht stillschweigend über `stable`.
-
-Davon getrennt setzt die Workspace-Root-`Cargo.toml` `rust-version = "1.85"`
-als MSRV-Boden – die *niedrigste* Version, gegen die dieser Workspace laut
-Manifest kompilieren muss, keine Aussage über die geprüfte Toolchain.
+Separately, the workspace root `Cargo.toml` sets `rust-version = "1.85"` as
+the MSRV floor — the *lowest* version this workspace must compile against
+per the manifest, not a statement about the toolchain that is actually
+tested.
 
 ```
 $ rustup show active-toolchain
 1.98.1-x86_64-unknown-linux-gnu (overridden by '…/rust-toolchain.toml')
 ```
 
-## 2. `crypt_guard` `3.0.1` (crates.io, Hybrid-KEM)
+## 2. `crypt_guard` `3.0.1` (crates.io, hybrid KEM)
 
-`harw-secrets` hängt von `crypt_guard` in der **crates.io**-Version `3.0.1`
-ab — nicht von einer Pfad-Abhängigkeit auf ein Nachbar-Repository, das auf
-keiner bekannten Maschine existiert. Diese Version deckt reines ML-KEM für
-die hier gebrauchte deterministische Seed→KEK-Ableitung nicht ab, weshalb
-`harw-secrets` stattdessen eine Hybrid-KEM-Konstruktion einsetzt. Die
-vollständige Begründung, die betroffenen Module
-(`harw-secrets/src/{policy.rs,kek.rs,envelope.rs}`) und die Migrations-
-entscheidung stehen in **`docs/setup/crypt-guard.md`** — dieses Dokument
-verweist nur darauf, statt sie zu duplizieren.
+`harw-secrets` depends on `crypt_guard` at the **crates.io** version
+`3.0.1` — not on a path dependency pointing at a sibling repository. This
+version does not cover plain ML-KEM for the deterministic seed→KEK
+derivation used here, so `harw-secrets` instead uses a hybrid-KEM
+construction. The full rationale, the affected modules
+(`harw-secrets/src/{policy.rs,kek.rs,envelope.rs}`) and the migration
+decision are in **`docs/setup/crypt-guard.md`** — this document only
+points there instead of duplicating it.
 
 ## 3. Bubblewrap (`bwrap`)
 
-`harw-sandbox`/`harw-tool-shell` isolieren Kindprozesse über Bubblewrap
-(siehe `harw-sandbox/src/bwrap.rs`); `harw-install`s Doctor-Prüfung
-`sandbox/bwrap` (`harw-install/src/doctor.rs:126-146`) sucht das Binary im
-`PATH`. Auf Debian-artigen Systemen (Debian, Raspberry Pi OS) installiert
-das Paket `bubblewrap` es unter dem festen Pfad `/usr/bin/bwrap`:
+`harw-sandbox`/`harw-tool-shell` isolate child processes via Bubblewrap
+(see `harw-sandbox/src/bwrap.rs`); `harw-install`'s doctor check
+`sandbox/bwrap` (`harw-install/src/doctor.rs:126-146`) looks for the
+binary in `PATH`. On Debian-based systems (Debian, Raspberry Pi OS), the
+`bubblewrap` package installs it at the fixed path `/usr/bin/bwrap`:
 
 ```
 $ apt install bubblewrap
 $ /usr/bin/bwrap --version
 ```
 
-Fehlt `bwrap`, meldet der Doctor-Check das als
-„Bubblewrap-Isolation nicht verfügbar" statt eines harten Abbruchs — die
-Sandbox-Isolation ist damit aber tatsächlich nicht aktiv, kein bloßer
-Warnhinweis ohne Konsequenz.
+If `bwrap` is missing, the doctor check reports "Bubblewrap isolation not
+available" instead of a hard failure — but sandbox isolation is then
+genuinely inactive, not just a warning without consequence.
 
-## 4. `prlimit` (aus `util-linux`)
+## 4. `prlimit` (from `util-linux`)
 
-Ressourcenlimits für Kindprozesse werden über `prlimit` gesetzt/gelesen,
-nicht über eine reimplementierte `setrlimit`-Bibliothek. `prlimit` ist Teil
-des `util-linux`-Pakets, das auf praktisch jeder Linux-Distribution ohnehin
-zur Grundausstattung gehört (auch Raspberry Pi OS); es ist hier trotzdem
-explizit als Voraussetzung aufgeführt, weil ein minimales Container- oder
-Chroot-Image es auslassen kann.
+Resource limits for child processes are set/read via `prlimit`, not via a
+reimplemented `setrlimit` library. `prlimit` is part of the `util-linux`
+package, which is practically standard on every Linux distribution
+(including Raspberry Pi OS); it is listed as an explicit prerequisite here
+anyway because a minimal container or chroot image can omit it.
 
 ```
 $ prlimit --version
@@ -77,57 +72,51 @@ $ prlimit --version
 
 ## 5. `git` ≥ `2.40`
 
-Wird für Werkzeuge gebraucht, die auf modernere Git-Fähigkeiten setzen
-(u. a. `git worktree`-Nutzung in der Remediation-Tooling-Kette und
-partielle/sparse Checkouts an anderer Stelle im Ausbauprogramm). Ältere
-`git`-Versionen (insbesondere die auf manchen Langzeit-Support-Distros
-vorinstallierten 2.3x-Stände) unterstützen einzelne dieser Flags nicht oder
-verhalten sich dabei abweichend.
+Needed for tooling that relies on more modern Git features (including
+`git worktree` usage and partial/sparse checkouts elsewhere in the
+project). Older `git` versions (in particular the 2.3x releases
+preinstalled on some long-term-support distributions) do not support some
+of these flags, or behave differently.
 
 ```
 $ git --version
-git version 2.40.0 (oder neuer)
+git version 2.40.0 (or newer)
 ```
 
-## 6. Raspberry Pi 5 (aarch64) — abweichendes Kernel-Verhalten
+## 6. Raspberry Pi 5 (aarch64) — divergent kernel behavior
 
-Der Raspberry Pi 5 ist eine Zielplattform dieses Projekts (siehe
-`user-sway-setup`/Mia-TV-Desktop-Kontext), aber sein Standard-Kernel weicht
-in drei sicherheitsrelevanten Punkten von einem gewöhnlichen
-x86_64-Server-Kernel ab. Alle drei wirken sich auf privilegierte Warden-/
-Sentinel-Binaries aus, nicht auf einen gewöhnlichen `cargo build`:
+The Raspberry Pi 5 is a target platform for this project, but its default
+kernel diverges from a typical x86_64 server kernel in three
+security-relevant ways. All three affect the privileged warden/sentinel
+binaries, not a normal `cargo build`:
 
-- **Kein Landlock.** Der auf Raspberry Pi OS ausgelieferte Kernel bringt
-  standardmäßig keine Landlock-Unterstützung mit. Der Verifikationsplan
-  behandelt das bereits als eigenen Fall (`docs/aw-plan.md:921`,
-  Entscheidung Nr. 4 „Landlock ohne Kernelunterstützung"): **asymmetrisch**
-  behandelt — harter Startfehler für die drei privilegierten Binaries,
-  Degradation mit `SensorDegraded` für den Sentinel. Ein Build auf einem
-  Pi 5 mit Standard-Kernel muss also mit genau diesem Verhalten rechnen,
-  nicht mit einem stillschweigenden Fallback.
-- **Kein BTF** (BPF Type Format) im Standard-Kernel-Image. Jede
-  BPF-gestützte Beobachtung (`harw-probe-bpf`, `harw-dod-bpf`), die auf
-  `CO-RE` (Compile Once – Run Everywhere) über BTF setzt, braucht entweder
-  einen eigens gebauten Kernel mit `CONFIG_DEBUG_INFO_BTF=y` oder einen
-  Verzicht auf die BTF-gestützten Pfade zugunsten der jeweiligen
-  Degradations-Strategie.
-- **16K-Seitengröße.** Aktuelle Raspberry-Pi-OS-Kernel bieten (teils als
-  Standard, teils als Option) eine Seitengröße von 16 KiB statt der auf den
-  meisten Linux-Systemen üblichen 4 KiB. Code, der Seitengröße annimmt statt
-  sie über `sysconf(_SC_PAGESIZE)`/das Rust-Äquivalent zu erfragen, oder der
-  mit gemappten Speicherbereichen in 4-KiB-Schritten rechnet, liefert auf
-  dieser Plattform falsche Ergebnisse, ohne dass der Build selbst
-  fehlschlägt.
-- **`cgroup_disable=memory`.** Manche Raspberry-Pi-OS-Images setzen dieses
-  Boot-Argument standardmäßig (ursprünglich, um dem Pi angesichts
-  begrenzten RAMs das Cgroup-Memory-Accounting zu ersparen). Jede Komponente,
-  die Speicherlimits oder -zähler über die Memory-Cgroup liest
-  (`harw-dod-cgroup`, `harw-dod-memory`), sieht auf einer so konfigurierten
-  Maschine keine Daten — das ist von einem echten Lesefehler zu
-  unterscheiden. Wer auf dem Pi 5 mit aktivem Memory-Cgroup-Accounting
-  arbeiten will, muss `cgroup_enable=memory cgroup_memory=1` explizit in
-  `/boot/firmware/cmdline.txt` ergänzen und neu starten.
+- **No Landlock.** The kernel shipped with Raspberry Pi OS does not
+  include Landlock support by default. This is handled as an explicit
+  case (`docs/aw-plan.md`, decision #4, "Landlock without kernel
+  support"): handled **asymmetrically** — a hard startup failure for the
+  three privileged binaries, degradation with `SensorDegraded` for the
+  sentinel. A build on a Pi 5 with the default kernel must expect exactly
+  this behavior, not a silent fallback.
+- **No BTF** (BPF Type Format) in the default kernel image. Any
+  BPF-backed observation (`harw-probe-bpf`, `harw-dod-bpf`) that relies on
+  `CO-RE` (Compile Once – Run Everywhere) via BTF needs either a
+  custom-built kernel with `CONFIG_DEBUG_INFO_BTF=y`, or must fall back to
+  the respective degradation strategy instead of the BTF-backed path.
+- **16K page size.** Current Raspberry Pi OS kernels offer (sometimes by
+  default, sometimes as an option) a page size of 16 KiB instead of the
+  4 KiB common on most Linux systems. Code that assumes a page size
+  instead of querying it via `sysconf(_SC_PAGESIZE)`/the Rust equivalent,
+  or that computes mapped memory regions in 4 KiB steps, produces wrong
+  results on this platform without the build itself failing.
+- **`cgroup_disable=memory`.** Some Raspberry Pi OS images set this boot
+  argument by default (originally to spare the Pi's limited RAM the cost
+  of memory-cgroup accounting). Any component that reads memory limits or
+  counters via the memory cgroup (`harw-dod-cgroup`, `harw-dod-memory`)
+  sees no data on such a machine — which must be distinguished from an
+  actual read error. Anyone who wants memory-cgroup accounting active on
+  the Pi 5 must explicitly add `cgroup_enable=memory cgroup_memory=1` to
+  `/boot/firmware/cmdline.txt` and reboot.
 
-Keiner dieser vier Punkte verhindert einen `cargo build` auf dem Pi 5 selbst
-— sie verändern das **Laufzeitverhalten** der privilegierten Binaries und
-der DoD-Sensoren gegenüber einem gewöhnlichen Entwicklungsrechner.
+None of these four points prevents a `cargo build` on the Pi 5 itself —
+they change the **runtime behavior** of the privileged binaries and the
+DoD sensors compared to a typical development machine.

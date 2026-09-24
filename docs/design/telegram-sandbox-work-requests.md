@@ -1,6 +1,8 @@
 # Telegram work requests and sandboxed execution
 
-Status: implementation contract. This document turns a Telegram request into
+> Status: partially implemented · Last reviewed: 2026-09-24
+
+This document turns a Telegram request into
 an auditable, server-resolved work launch without ever treating chat text or
 model output as an authority over a filesystem path or capability set.
 

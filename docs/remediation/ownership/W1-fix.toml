@@ -1,9 +1,0 @@
-# Fix-Schritt Z1-F (nach Reviews Z1-R1..R3)
-[Z1-F1]
-files = ["harw-cli/src/gateway.rs", "harw-cli/src/chat.rs", "harw-cli/src/main.rs", "harw-cli/src/onboarding.rs", "harw-cli/src/job_worker.rs", "docs/remediation/ledger/W1/Z1-F1.md"]
-[Z1-F2]
-files = ["harw-config/src/discovery.rs", "harw-registry-defaults/src/embedded_agents.rs", "docs/remediation/ledger/W1/Z1-F2.md"]
-[Z1-F3]
-files = ["harw-ops/src/diff.rs", "harw-tool-shell/src/limits.rs", "docs/remediation/ledger/W1/Z1-F3.md"]
-[Z1-F4]
-files = ["harw-tui/src/app.rs", "harw-mcp-server/src/transport.rs", "harw-mcp-server/src/lib.rs", "docs/remediation/ledger/W1/Z1-F4.md"]
