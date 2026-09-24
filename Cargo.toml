@@ -80,6 +80,7 @@ members = [
     "harw-egress",
     "harw-fsutil",
     "harw-runtime",
+    "harwness-sdk",
     "xtask",
 ]
 # DoD ist ein eigener Cargo-Workspace in derselben Repository-Domäne: eigener
