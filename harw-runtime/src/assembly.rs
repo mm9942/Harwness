@@ -1030,9 +1030,9 @@ fn narrowed_registry_profile(
     requested: RegistryProfile,
 ) -> RuntimeResult<RegistryProfile> {
     use RegistryProfile::{
-        AgentStewardship, Full, MemoryStewardship, NoTools, Planning, ReadOnlyExplore,
-        ReadOnlyResearch, Research, ShellExecution, UiaExplorer, UiaQuickHelper, UiaShellWorker,
-        UiaWriter, WorkspaceEdit,
+        AgentStewardship, Full, MatrixReader, MemoryStewardship, NoTools, Planning,
+        ReadOnlyExplore, ReadOnlyResearch, Research, ShellExecution, UiaExplorer, UiaQuickHelper,
+        UiaShellWorker, UiaWriter, WorkspaceEdit,
     };
 
     match (entry_profile, requested) {
@@ -1143,9 +1143,10 @@ fn narrowed_registry_profile(
         )
         // `ReadOnlyResearch` (researcher / dependency-researcher) ist wie
         // `Research` ein reines Kind-Profil mit Netz: kein Einstieg darf
-        // auf es verengen, und es selbst verengt nie.
-        | (ReadOnlyExplore | Research | ReadOnlyResearch | Planning, _)
-        | (_, ReadOnlyResearch) => Err(RuntimeError::Registry {
+        // auf es verengen, und es selbst verengt nie. `MatrixReader`
+        // (Matrix-Sitze) ist ebenso ein reines Kind-Profil.
+        | (ReadOnlyExplore | Research | ReadOnlyResearch | Planning | MatrixReader, _)
+        | (_, ReadOnlyResearch | MatrixReader) => Err(RuntimeError::Registry {
             detail: format!(
                 "refusing to narrow entry {entry:?} from registry profile {entry_profile:?} \
                  to {requested:?}: a narrowing may only reduce the tool set"

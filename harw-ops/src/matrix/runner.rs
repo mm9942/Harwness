@@ -53,7 +53,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use harw_authority::{PermissionRequest, SandboxSpec};
+use harw_authority::{
+    Permission, PermissionRequest, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+};
 use harw_core::StateStore;
 use harw_core::agent_events::AgentEventHub;
 use harw_core::cancel::CancelToken;
@@ -77,6 +79,7 @@ use harw_matrix_game::phases::{
 use harw_matrix_game::prompts::{self, SeatRole};
 use harw_matrix_game::scenario::{
     AdjudicationSystem, LoadedScenario, Rules, Scenario, ScheduledInject, SeedSpec,
+    materials_for_seat, pair_folder_members,
 };
 use harw_matrix_game::state::{
     Audience, EntryKind, GameEntry, GameLog, Journal, PlayerId, RevealedBy, Seat, replay,
@@ -87,7 +90,7 @@ use harw_matrix_game::visibility::{
 };
 use harw_operations::{OpContext, OpError};
 use harw_registry_defaults::profile::role_names;
-use harw_types::{SessionId, ToolCallId};
+use harw_types::{SessionId, ToolCallId, WorkspaceId};
 use jiff::Timestamp;
 use serde_json::{Value, json};
 
@@ -100,9 +103,10 @@ pub const SCENARIO_FILE: &str = "scenario.toml";
 /// Dateiname des After-Action-Reviews im Laufverzeichnis.
 pub const AAR_FILE: &str = "aar.md";
 
-/// Budget eines einzelnen Sitz-Turns (Text, keine Werkzeuge). Die
-/// Rollendefinition (`[spawn.budget]`) kann es nur weiter verschärfen.
-const SEAT_TURN_BUDGET: &str = "60k_tokens,300s";
+/// Budget eines einzelnen Sitz-Turns (Text plus Lesezugriffe auf die
+/// Unterlagen). Die Rollendefinition (`[spawn.budget]`) kann es nur weiter
+/// verschärfen.
+const SEAT_TURN_BUDGET: &str = "60k_tokens,16_tool_calls,300s";
 
 /// Höchstwartezeit auf einen freien Admission-Slot beim ersten Aufruf eines Sitzes.
 const SEAT_SLOT_WAIT: Duration = Duration::from_secs(120);
@@ -112,6 +116,15 @@ const REPAIR_ATTEMPTS: u32 = 1;
 
 /// Sitz-Schlüssel des Umpires in `views`/`seats`.
 pub const UMPIRE_KEY: &str = "umpire";
+
+/// Unterordner des Laufverzeichnisses mit den Unterlagen-Kopien je Sitz.
+pub const MATERIALS_DIR: &str = "materials";
+/// Höchstgröße einer kopierten Unterlagen-Datei.
+pub const MAX_MATERIAL_FILE_BYTES: u64 = 5 * 1024 * 1024;
+/// Höchstgröße aller Unterlagen einer Sitz-Kopie.
+pub const MAX_MATERIAL_TOTAL_BYTES: u64 = 50 * 1024 * 1024;
+/// Höchste Verzeichnistiefe beim Kopieren.
+const MAX_MATERIAL_DEPTH: usize = 16;
 
 // ── Status und Berichte ──────────────────────────────────────────────────────
 
@@ -216,6 +229,12 @@ pub trait SeatDriver: Send {
 
     /// Gibt alle gehaltenen Sitze frei (Spielende).
     fn release_all(&mut self) {}
+
+    /// Hinweise seit dem letzten Aufruf (z. B. Unterlagen nicht einsehbar);
+    /// der Runner journalisiert sie für den Beobachter.
+    fn take_warnings(&mut self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Treiber ohne Agenten: jeder Aufruf scheitert (Sitz passt). Dient `end`
@@ -235,11 +254,19 @@ impl SeatDriver for NullDriver {
 pub struct SpawnerDriver {
     spawner: Arc<ManagedAgentSpawner>,
     store: Arc<dyn StateStore>,
+    /// Sandbox der aufrufenden Session (Obergrenze jedes Sitzes).
+    parent_sandbox: SandboxSpec,
+    /// Rückfall ohne jede Berechtigung (Unterlagen nicht bindbar).
     sandbox: SandboxSpec,
     parent: SessionId,
     cancel: CancelToken,
     budget: AgentBudget,
     children: BTreeMap<String, SessionId>,
+    /// `<run_dir>/materials`, falls Unterlagen-Kopien existieren.
+    materials_root: Option<PathBuf>,
+    /// Präfix der Workspace-IDs der Sitz-Sandboxen.
+    run_tag: String,
+    warnings: Vec<String>,
 }
 
 impl SpawnerDriver {
@@ -262,12 +289,43 @@ impl SpawnerDriver {
         Ok(Self {
             spawner,
             store,
+            parent_sandbox: ctx.sandbox().clone(),
             sandbox: ctx.sandbox().restrict(&PermissionRequest::empty()),
             parent: ctx.session_id().clone(),
             cancel: ctx.cancel_token().cloned().unwrap_or_else(CancelToken::new),
             budget: parse_budget_hint(SEAT_TURN_BUDGET)?,
             children: BTreeMap::new(),
+            materials_root: None,
+            run_tag: String::new(),
+            warnings: Vec::new(),
         })
+    }
+
+    /// Bindet die Sitze an ihre Unterlagen-Kopien unter `root`
+    /// (`<root>/<seat_id>/`).
+    #[must_use]
+    pub fn with_materials(mut self, root: Option<PathBuf>, run_tag: &str) -> Self {
+        self.materials_root = root;
+        self.run_tag = run_tag.to_owned();
+        self
+    }
+
+    /// Sandbox eines Sitzes: seine Unterlagen-Kopie, nur lesend, ohne Netz;
+    /// ohne Kopie die berechtigungslose Rückfall-Sandbox.
+    fn seat_sandbox_for(&mut self, key: &str) -> SandboxSpec {
+        let Some(root) = &self.materials_root else {
+            return self.sandbox.clone();
+        };
+        let workspace = format!("matrix-{}-{key}", self.run_tag);
+        match seat_sandbox(&self.parent_sandbox, &root.join(key), &workspace) {
+            Ok(sandbox) => sandbox,
+            Err(error) => {
+                self.warnings.push(format!(
+                    "Sitz `{key}`: Unterlagen nicht bindbar ({error}) — Sitz liest ohne Unterlagen"
+                ));
+                self.sandbox.clone()
+            }
+        }
     }
 
     /// Übernimmt die bereits zugelassenen Sitze eines Laufs.
@@ -301,28 +359,57 @@ impl SeatDriver for SpawnerDriver {
             let child = match self.children.get(key) {
                 Some(child) => child.clone(),
                 None => {
-                    let input = harw_extension_api::SpawnInput {
-                        parent_session_id: self.parent.clone(),
+                    let bound = self.seat_sandbox_for(key);
+                    let parent = self.parent.clone();
+                    let system = request.system;
+                    let input = || harw_extension_api::SpawnInput {
+                        parent_session_id: parent.clone(),
                         handoff_call_id: ToolCallId::new(),
-                        instructions: Some(request.system.to_owned()),
+                        instructions: Some(system.to_owned()),
                         context: json!({ "matrix_seat": key }),
                         ceiling: None,
                     };
-                    let guard = self
+                    let first = self
                         .spawner
                         .spawn_child_or_wait(
                             request.role,
-                            input,
-                            self.sandbox.clone(),
+                            input(),
+                            bound,
                             None,
                             SEAT_SLOT_WAIT,
                             &self.cancel,
                         )
                         .await
-                        .map_err(|error| format!("Spawn fehlgeschlagen: {error}"))?;
+                        .map(harw_core::child_controller::ChildGuard::keep);
+                    let child = match first {
+                        Ok(child) => child,
+                        // Die Admission verlangt dieselbe Workspace-Bindung
+                        // wie beim Parent: dann ohne Unterlagen, aber nie
+                        // mit mehr Rechten (fail-closed).
+                        Err(error)
+                            if self.materials_root.is_some()
+                                && error.to_string().contains("escalation") =>
+                        {
+                            self.warnings.push(format!(
+                                "Sitz `{key}`: Unterlagen-Sandbox abgewiesen ({error}) — Sitz liest ohne Unterlagen"
+                            ));
+                            self.spawner
+                                .spawn_child_or_wait(
+                                    request.role,
+                                    input(),
+                                    self.sandbox.clone(),
+                                    None,
+                                    SEAT_SLOT_WAIT,
+                                    &self.cancel,
+                                )
+                                .await
+                                .map(harw_core::child_controller::ChildGuard::keep)
+                                .map_err(|error| format!("Spawn fehlgeschlagen: {error}"))?
+                        }
+                        Err(error) => return Err(format!("Spawn fehlgeschlagen: {error}")),
+                    };
                     // Der Sitz bleibt über alle Phasen zugelassen; die
                     // Freigabe übernimmt `release_all` bzw. `forget`.
-                    let child = guard.keep();
                     self.children.insert(key.to_owned(), child.clone());
                     child
                 }
@@ -369,6 +456,10 @@ impl SeatDriver for SpawnerDriver {
         for key in keys {
             self.forget(&key);
         }
+    }
+
+    fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
     }
 }
 
