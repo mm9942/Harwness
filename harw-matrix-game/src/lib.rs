@@ -12,7 +12,9 @@
 //!
 //! Dieses Crate enthält **keine** Modellaufrufe. Module:
 //! - [`scenario`]: `harwness.matrix-scenario/v1` (klassisch und `business`),
-//!   Parsing und Validierung.
+//!   Parsing und Validierung; optionaler Unterlagen-Ordner `[materials]`
+//!   ([`scenario::materials_for_seat`] wählt rein ohne IO aus, was ein Sitz
+//!   lesen darf — kopiert wird im Runner).
 //! - [`state`]: Sitze, Audiences, Weltvariablen, Journal (JSONL), Zustand,
 //!   Replay.
 //! - [`visibility`]: `project(journal, seat)`, Leak-Guards (5-Gramm-Scanner).
@@ -48,6 +50,7 @@ pub mod state;
 pub mod visibility;
 
 pub use error::{MatrixError, MatrixResult};
+pub use scenario::{MaterialsSelection, MaterialsSpec, materials_for_seat, pair_folder_members};
 
 /// Gemeinsame Test-Fixtures: Beispielszenarien und ein geskriptetes Spiel.
 #[cfg(test)]

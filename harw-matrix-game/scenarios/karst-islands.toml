@@ -115,3 +115,10 @@ round = 3
 audience = "public"
 text = "Eine Hitzewelle verdoppelt den Wasserbedarf."
 effects = [{ op = "add", var = "water", by = -1 }]
+
+# Optional: Unterlagen, die Sitze lesend einsehen dürfen (relativ zu dieser
+# Datei, absolut oder mit ~). Layout unter dir: geteilt/ (alle Sitze),
+# <sitz-id>/ (nur dieser Sitz), paare/<a>+<b>/ (nur a und b, alphabetisch),
+# umpire/ (nur Schiedsrichter; er sieht alles).
+# [materials]
+# dir = "unterlagen"
