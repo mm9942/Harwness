@@ -21,7 +21,6 @@ use std::io::Read;
 use crypt_guard::pq_hpke::{RecipientPrivateKey, RecipientPublicKey};
 use secrecy::zeroize::Zeroizing;
 use secrecy::{ExposeSecret, SecretBox};
-use sha2::digest::generic_array::GenericArray;
 use sha2::{Digest, Sha256};
 
 use crate::error::{SecretsError, SecretsResult};
@@ -333,7 +332,7 @@ pub(crate) fn derive_kem_seed(kem: KemAlgo, seed: &[u8]) -> Zeroizing<[u8; KEK_S
     let mut derived = Zeroizing::new([0_u8; KEK_SEED_LEN]);
     // Write straight into the zeroizing buffer instead of returning a
     // non-zeroizing digest copy.
-    hasher.finalize_into(GenericArray::from_mut_slice(&mut derived[..]));
+    hasher.finalize_into((&mut *derived).into());
     derived
 }
 

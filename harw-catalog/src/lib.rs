@@ -299,7 +299,7 @@ impl CatalogSnapshot {
         .map_err(|error| {
             CatalogError::InvalidConfig(format!("cannot serialize {name} for provenance: {error}"))
         })?;
-        Ok(format!("{:x}", Sha256::digest(encoded)))
+        Ok(sha256_hex(encoded))
     }
 
     /// Resolves only directly activated MCP capabilities into process/HTTP
@@ -550,7 +550,7 @@ pub fn load_skill_runtime_snapshot(
             limit: MAX_INSTRUCTIONS_BYTES,
         });
     }
-    let sha256 = format!("{:x}", Sha256::digest(instructions.as_bytes()));
+    let sha256 = sha256_hex(instructions.as_bytes());
     Ok(SkillRuntimeSnapshot {
         name: skill.name.clone(),
         description: skill.description.clone(),
@@ -761,7 +761,7 @@ impl SkillWorkspace {
                 "skill '{name}' instructions are not UTF-8: {error}"
             ))
         })?;
-        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        let sha256 = sha256_hex(bytes);
         Ok(SkillRuntimeSnapshot {
             name: skill.name,
             description: skill.description,
@@ -931,6 +931,23 @@ impl fmt::Display for CatalogError {
 }
 
 impl std::error::Error for CatalogError {}
+
+/// SHA-256 als klein geschriebene Hex-Zeichenkette.
+///
+/// # Beschreibung
+/// sha2 0.11 liefert ein `hybrid_array::Array` ohne `LowerHex`; die
+/// Hex-Darstellung (bitgleich zu früher `format!("{:x}", …)`) wird deshalb
+/// hier gebaut.
+fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write as _;
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            // Schreiben in einen `String` kann nicht fehlschlagen.
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
 
 #[cfg(test)]
 mod tests {
@@ -1311,7 +1328,7 @@ mod tests {
             mcps: Vec::new(),
         };
         let snapshot = load_skill_runtime_snapshot(&dir, &skill).map_err(ctx("load"))?;
-        let expected = format!("{:x}", Sha256::digest(b"Read tests first.\n"));
+        let expected = sha256_hex(b"Read tests first.\n");
         assert_eq!(snapshot.sha256, expected);
         let fragment = snapshot.instruction_fragment();
         assert!(fragment.starts_with(&format!("# Skill: review (sha256 {expected})")));

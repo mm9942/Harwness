@@ -537,8 +537,7 @@ mod tests {
 
     /// SHA-256 als Hex, wie ihn das Bundle-Manifest führt.
     fn sha256_hex_for_test(contents: &str) -> String {
-        use sha2::Digest;
-        format!("{:x}", sha2::Sha256::digest(contents.as_bytes()))
+        crate::bundle_manifest::sha256_hex(contents.as_bytes())
     }
 
     /// Das Bundle liegt auf der Home-Ebene und muss über die reguläre

@@ -219,9 +219,21 @@ fn write_manifest(path: &Path, manifest: &BundleManifest) -> HomeResult<()> {
     write_file(path, &format!("{MANIFEST_HEADER}{body}"))
 }
 
-/// SHA-256 von `bytes` als Kleinbuchstaben-Hex.
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+/// SHA-256 als klein geschriebene Hex-Zeichenkette.
+///
+/// # Beschreibung
+/// sha2 0.11 liefert ein `hybrid_array::Array` ohne `LowerHex`; die
+/// Hex-Darstellung (bitgleich zu früher `format!("{:x}", …)`) wird deshalb
+/// hier gebaut.
+pub(crate) fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write as _;
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            // Schreiben in einen `String` kann nicht fehlschlagen.
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 #[cfg(test)]
