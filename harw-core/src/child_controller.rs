@@ -2391,7 +2391,10 @@ impl ManagedAgentSpawner {
     pub fn close_child(&self, child: &SessionId) {
         let root = self.root_for(child);
         match self.release_in_memory(child) {
-            Ok(Some(record)) => self.observe_release(child, root, Some(&record)),
+            Ok(Some(record)) => {
+                self.charge_released_child(&record);
+                self.observe_release(child, root, Some(&record));
+            }
             Ok(None) => self.forget_child_state(child),
             Err(error) => {
                 tracing::warn!(child = %child, error = %error, "child_close.release_failed");
@@ -2418,6 +2421,9 @@ impl ManagedAgentSpawner {
         }
         let root = self.root_for(child);
         let released = self.release_in_memory(child)?;
+        if let Some(record) = released.as_ref() {
+            self.charge_released_child(record);
+        }
         self.observe_release(child, root, released.as_ref());
         Ok(())
     }
@@ -3587,7 +3593,113 @@ impl ManagedAgentSpawner {
         input: TurnInput,
         budget: AgentBudget,
     ) -> Result<ChildRunResult, AgentSpawnError> {
+        // Budget-Anrechnung: Ausgangsstand vor dem Lauf. Solange das Kind
+        // nicht läuft, liegt seine Session im Manager; fehlt sie, zählt der
+        // Lauf ab 0 (der Lauf selbst scheitert dann ohnehin).
+        let baseline_tokens = self.child_token_usage(child).unwrap_or(0);
+        let baseline_tool_calls = self.child_tool_call_count(child).unwrap_or(0);
         let started = std::time::Instant::now();
+        let result = self
+            .enforce_child_budget(child, store, approvals, input, budget, started)
+            .await;
+        // Auch ein gescheiterter oder über das Budget gelaufener Lauf hat
+        // verbraucht — die Anrechnung erfolgt auf jedem Ausgang. Ist die
+        // Session inzwischen verworfen, gilt der Ausgangsstand (Differenz 0).
+        let usage = ChildUsage {
+            tokens: self
+                .child_token_usage(child)
+                .unwrap_or(baseline_tokens)
+                .saturating_sub(baseline_tokens),
+            tool_calls: self
+                .child_tool_call_count(child)
+                .unwrap_or(baseline_tool_calls)
+                .saturating_sub(baseline_tool_calls),
+            wall_time_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        };
+        self.charge_run_usage(child, usage);
+        result.map(|mut run| {
+            run.usage = usage;
+            run
+        })
+    }
+
+    /// Rechnet den Verbrauch eines Laufs dem Kind an und reicht die noch
+    /// nicht verrechnete Differenz an den direkten Elternteil weiter.
+    ///
+    /// # Beschreibung
+    /// Die Weitergabe geht genau **eine** Ebene nach oben: der Elternteil
+    /// verrechnet seinerseits erst, wenn sein eigener Lauf endet oder er
+    /// freigegeben wird. Ein Elternteil ohne Record (Wurzel) wird nicht
+    /// belastet. Unbekannte Kinder sind ein No-op.
+    ///
+    /// # Concurrency
+    /// Nimmt kurz den `active`-Lock.
+    fn charge_run_usage(&self, child: &SessionId, run: ChildUsage) {
+        let Ok(mut active) = self.active.lock() else {
+            tracing::warn!(child = %child, "child_budget.charge_lock_poisoned");
+            return;
+        };
+        let Some(record) = active.get_mut(child.as_str()) else {
+            return;
+        };
+        record.consumed = record.consumed.saturating_add(run);
+        let delta = record.consumed.saturating_sub(record.charged_to_parent);
+        record.charged_to_parent = record.consumed;
+        let parent = record.parent.as_str().to_owned();
+        if let Some(parent_record) = active.get_mut(&parent) {
+            parent_record.consumed = parent_record.consumed.saturating_add(delta);
+        }
+    }
+
+    /// Rechnet einem Elternteil den noch offenen Verbrauch eines eben
+    /// freigegebenen Kindes an (Nachkommen, die erst nach dem letzten Lauf
+    /// des Kindes abgeschlossen wurden).
+    fn charge_released_child(&self, record: &ChildRecord) {
+        let delta = record.consumed.saturating_sub(record.charged_to_parent);
+        if delta == ChildUsage::default() {
+            return;
+        }
+        match self.active.lock() {
+            Ok(mut active) => {
+                if let Some(parent) = active.get_mut(record.parent.as_str()) {
+                    parent.consumed = parent.consumed.saturating_add(delta);
+                }
+            }
+            Err(_) => tracing::warn!(child = %record.child, "child_budget.charge_lock_poisoned"),
+        }
+    }
+
+    /// Restbudget einer admittierten Sitzung: ihr Budget-Deckel abzüglich
+    /// des bisher angerechneten Verbrauchs (eigener plus Nachkommen).
+    ///
+    /// # Argumente
+    /// - `session` (`&SessionId`): ein admittiertes Kind.
+    ///
+    /// # Returns
+    /// `Some(AgentBudget)` mit dimensionsweise abgezogenem Verbrauch (nicht
+    /// gesetzte Dimensionen bleiben nicht gesetzt, gesetzte sättigen bei 0);
+    /// `None` für unbekannte Sitzungen (auch Wurzeln ohne Record) oder bei
+    /// vergifteter Registry-Sperre.
+    ///
+    /// # Concurrency
+    /// Nimmt kurz den `active`-Lock.
+    #[must_use]
+    pub fn remaining_budget(&self, session: &SessionId) -> Option<AgentBudget> {
+        self.child_record(session)
+            .map(|record| budget_minus_usage(record.budget, record.consumed))
+    }
+
+    /// Setzt `budget` für einen Lauf durch (Kern von
+    /// [`Self::run_child_with_budget`], ohne Verbrauchsanrechnung).
+    async fn enforce_child_budget(
+        &self,
+        child: &SessionId,
+        store: &dyn StateStore,
+        approvals: Option<&ApprovalStore>,
+        input: TurnInput,
+        budget: AgentBudget,
+        started: std::time::Instant,
+    ) -> Result<ChildRunResult, AgentSpawnError> {
         let mut turn = Box::pin(self.run_child_with_approvals(child, store, approvals, input));
 
         let outcome = match budget.max_wall_time_ms {
@@ -4693,6 +4805,55 @@ impl ManagedAgentSpawner {
             ))));
         }
 
+        // Budget-Anrechnung: ein Kind darf nie mehr bekommen, als seinem
+        // Elternteil noch bleibt (Budget minus angerechneter Verbrauch). Ein
+        // Elternteil ohne Record (Wurzel) setzt keinen Deckel. Ist eine
+        // gesetzte Dimension erschöpft, wird fail-closed abgelehnt.
+        let child_budget = match active.get(input.parent_session_id.as_str()) {
+            Some(parent_record) => {
+                let remaining = budget_minus_usage(parent_record.budget, parent_record.consumed);
+                let exhausted = [
+                    (
+                        BudgetDimension::Tokens,
+                        parent_record.budget.max_tokens,
+                        remaining.max_tokens,
+                        parent_record.consumed.tokens,
+                    ),
+                    (
+                        BudgetDimension::ToolCalls,
+                        parent_record.budget.max_tool_calls.map(u64::from),
+                        remaining.max_tool_calls.map(u64::from),
+                        u64::from(parent_record.consumed.tool_calls),
+                    ),
+                    (
+                        BudgetDimension::WallTime,
+                        parent_record.budget.max_wall_time_ms,
+                        remaining.max_wall_time_ms,
+                        parent_record.consumed.wall_time_ms,
+                    ),
+                ]
+                .into_iter()
+                .find_map(|(dimension, limit, left, used)| match (limit, left) {
+                    (Some(limit), Some(0)) => Some((dimension, limit, used)),
+                    _ => None,
+                });
+                if let Some((dimension, limit, used)) = exhausted {
+                    tracing::warn!(
+                        parent = %input.parent_session_id,
+                        dimension = dimension.as_str(),
+                        limit = limit,
+                        used = used,
+                        "child_admission.parent_budget_exhausted",
+                    );
+                    return Err(AdmitRejection::Other(Self::budget_exceeded(
+                        dimension, limit, used,
+                    )));
+                }
+                tighten_agent_budget(child_budget, remaining)
+            }
+            None => child_budget,
+        };
+
         sandbox
             .ensure_child_of(&parent_context.sandbox)
             .map_err(|error| Self::reject(format!("child sandbox escalation rejected: {error}")))?;
@@ -4897,6 +5058,9 @@ impl ManagedAgentSpawner {
         let child_pinned_model: Option<String> = definition
             .registry_factory
             .pinned_model_for_task(role_name, task_complexity);
+        // Für `ChildRecord::model`: gepinntes Modell, sonst `active_model`;
+        // gesetzt im Auto-Compact-Block unten, der die Kind-Session ohnehin liest.
+        let mut child_model: Option<String> = child_pinned_model.clone();
         // Addendum D: Auto-Compact-Policy des Kindes nach organisatorischer
         // Rolle. Root-/Sub-Orchestrator-Sessions bekommen zusätzlich zur
         // relativen Schwelle einen festen Deckel und ein Turn-Start-
@@ -4923,6 +5087,7 @@ impl ManagedAgentSpawner {
                 .active_model()
                 .map(|model| model.as_str().to_owned());
             let model = child_pinned_model.clone().or(active_model);
+            child_model.clone_from(&model);
             let window = self.context_window_for(model.as_deref());
             let history_budget = usize::try_from(window.saturating_mul(3)).unwrap_or(usize::MAX);
             let budget = child_session.context_budget();
@@ -5070,6 +5235,9 @@ impl ManagedAgentSpawner {
             trace: child_trace,
             status: ChildStatus::Admitted,
             task_complexity,
+            model: child_model,
+            consumed: ChildUsage::default(),
+            charged_to_parent: ChildUsage::default(),
         };
         if let Some(lease_store) = &self.lease_store {
             if let Err(error) = lease_store.admit(&record.durable_lease()) {

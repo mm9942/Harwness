@@ -83,6 +83,10 @@ use harw_tool_browser::{
 use crate::agent_definition_tools::{DefinitionAuthorCeiling, DefinitionWriteMode};
 use crate::authority::{permissions_of, tool_permission};
 use crate::error::{RegistryDefaultsError, RegistryDefaultsResult};
+use crate::skill_proposal_tools::{
+    SKILL_PROPOSAL_DECIDE_TOOLS, SKILL_PROPOSAL_PROPOSE_TOOLS, SKILL_PROPOSAL_READ_TOOLS,
+    SkillAuthorCeiling, SkillProposalToolProvider,
+};
 use crate::{AssembledRegistry, DefaultApprovalPolicy};
 
 /// Die Namen der eingebauten Rollen — Single Source of Truth.
@@ -560,6 +564,11 @@ pub(crate) const AGENT_DEFINITION_WRITE_TOOLS: &[&str] = &[
 /// dieselbe Reihenfolge, in der
 /// `crate::agent_definition_tools::AgentDefinitionToolProvider` sie im
 /// Commit-Modus (der maximalen Werkzeugmenge) bewirbt.
+///
+/// Danach folgen die fünf Skill-Vorschlagswerkzeuge von
+/// `crate::skill_proposal_tools::SkillProposalToolProvider` (neben dem
+/// Agentendefinitions-Provider montiert), ebenfalls in ihrer
+/// Commit-Modus-Ausprägung und Registrierungsreihenfolge.
 const AGENT_DEFINITION_TOOLS: &[&str] = &[
     "agents.validate",
     "agents.list_proposals",
@@ -567,6 +576,11 @@ const AGENT_DEFINITION_TOOLS: &[&str] = &[
     "agents.write_uia",
     "agents.commit_proposal",
     "agents.reject_proposal",
+    "skills.validate",
+    "skills.list_proposals",
+    "skills.propose",
+    "skills.commit_proposal",
+    "skills.reject_proposal",
 ];
 
 /// Die Werkzeuge von `harw-tool-shell`.
@@ -1567,6 +1581,18 @@ pub fn agent_definition_tool_names_for_access(
             }
         }
     }
+    // Danach die Werkzeuge des daneben montierten
+    // `SkillProposalToolProvider` — dieselbe Staffelung: lesend immer, mit
+    // Decke `skills.propose`, im Commit-Modus zusätzlich Commit/Reject.
+    tools.extend_from_slice(SKILL_PROPOSAL_READ_TOOLS);
+    if let Some(access) = access {
+        if access.ceiling.is_some() {
+            tools.extend_from_slice(SKILL_PROPOSAL_PROPOSE_TOOLS);
+            if access.mode == DefinitionWriteMode::Commit {
+                tools.extend_from_slice(SKILL_PROPOSAL_DECIDE_TOOLS);
+            }
+        }
+    }
     tools
 }
 
@@ -1789,6 +1815,26 @@ fn profile_tool_providers(
                 FS_READ_ONLY_TOOLS,
             ));
             let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
+            // Skill-Vorschläge liegen neben `<profil>/agents` unter
+            // `<profil>/skills`; die Decke übernimmt Rolle und Werkzeuge der
+            // Agentendefinitions-Decke (MCPs kennt dieser Pfad nicht —
+            // fail-closed leer).
+            let skill_proposals: Arc<dyn ToolProvider> = Arc::new(SkillProposalToolProvider::new(
+                agent_definition_access
+                    .profile_agents_dir
+                    .as_ref()
+                    .and_then(|dir| dir.parent())
+                    .map(|profile| profile.join("skills")),
+                agent_definition_access.mode,
+                agent_definition_access
+                    .ceiling
+                    .as_ref()
+                    .map(|ceiling| SkillAuthorCeiling {
+                        role: ceiling.role,
+                        tools: ceiling.tools.clone(),
+                        mcps: Default::default(),
+                    }),
+            ));
             let agent_definitions: Arc<dyn ToolProvider> = Arc::new(
                 crate::agent_definition_tools::AgentDefinitionToolProvider::new(
                     agent_definition_access.project_agents_dir,
@@ -1797,7 +1843,7 @@ fn profile_tool_providers(
                     agent_definition_access.ceiling,
                 ),
             );
-            vec![filesystem, doc, agent_definitions]
+            vec![filesystem, doc, agent_definitions, skill_proposals]
         }
         // Read-only Erkundungsspezialisierung der UIA: gefilterter, lesender
         // FS-Provider + lesender Doc-Provider + Explorer-Provider + auf
@@ -2657,6 +2703,8 @@ mod tests {
             .collect();
         expected.push("agents.validate".to_owned());
         expected.push("agents.list_proposals".to_owned());
+        expected.push("skills.validate".to_owned());
+        expected.push("skills.list_proposals".to_owned());
         assert_eq!(registered_names(&assembled), expected);
         assert_eq!(assembled.identity.tools_available, expected);
         Ok(())

@@ -86,7 +86,10 @@ use crate::error::{RuntimeError, RuntimeResult};
 /// [`crate::model::build_uia_model_with_resolver`] +
 /// [`crate::model::build_uia_worker_model`]). Jede andere Rolle (inklusive
 /// `planner`, `executor`, `security-*` und unbekannter/repo-lokaler Rollen)
-/// bleibt unverändert beim Eltern-Modell — `None`.
+/// liefert hier `None`. Orchestrator-Rollen bekommen ihre Stelle nicht über
+/// den Namen, sondern über die Organisationsrolle ihrer eingebauten
+/// Definition ([`orchestrator_point_for_organizational_role`], R1); die
+/// Fabrik kombiniert beide Zuordnungen.
 ///
 /// # Returns
 /// `Some(point)` für eine der oben genannten Rollen, sonst `None`.
@@ -357,6 +360,12 @@ pub struct RuntimeChildRegistryFactory {
     /// [`ChildRegistryFactory::capability_snapshot`] bleibt `None`, genau wie
     /// vor dieser Ergänzung.
     skill_catalog: Option<SkillCatalogWiring>,
+    /// Der geteilte `StateStore` des Laufs für die `delegate_wave`-Fläche der
+    /// Orchestrator-Kinder (R1/B). `None`, solange
+    /// [`Self::with_delegate_wave_store`] nicht aufgerufen wurde — die
+    /// Operation wird dennoch montiert, scheitert dann aber beim Aufruf
+    /// fail-closed mit `OpError::NotAvailable` (kein StateStore).
+    delegate_wave_store: Option<Arc<dyn StateStore>>,
 }
 
 /// Der Skill-Katalog einer Kind-Fabrik: ein über die ganze Lebensdauer des
@@ -448,6 +457,7 @@ impl RuntimeChildRegistryFactory {
             sandbox_profile: harw_sandbox::SandboxProfile::Strict,
             host_permit_wiring: None,
             skill_catalog: None,
+            delegate_wave_store: None,
         }
     }
 
@@ -664,6 +674,95 @@ impl RuntimeChildRegistryFactory {
         Ok(self)
     }
 
+    /// Hinterlegt den geteilten `StateStore` für die `delegate_wave`-Fläche
+    /// der Orchestrator-Kinder.
+    ///
+    /// # Description
+    /// Reiner Erbauer-Schritt, analog [`Self::with_internal_models`]. Jede
+    /// Orchestrator-Registry (`composition_tools_for_role(role)` enthält
+    /// `delegate_wave`) bekommt eine
+    /// [`harw_core_bridge::DelegateWaveOperation`], deren `OpContext` den
+    /// `ManagedAgentSpawner` (über den schwachen Spawner-Slot, erst beim
+    /// Aufruf aufgelöst) und diesen `StateStore` trägt — genau die beiden
+    /// Dienste, die `delegate_wave` verlangt.
+    ///
+    /// # Arguments
+    /// - `state_store` (`Arc<dyn StateStore>`): derselbe Store wie der der
+    ///   Wurzel (`RuntimeServicesParts::state_store`).
+    #[must_use]
+    pub fn with_delegate_wave_store(mut self, state_store: Arc<dyn StateStore>) -> Self {
+        self.delegate_wave_store = Some(state_store);
+        self
+    }
+
+    /// Die interne Modellstelle einer Kind-Rolle (Addendum C + R1).
+    ///
+    /// # Description
+    /// Zuerst die namensbasierte Zuordnung [`internal_point_for_role`];
+    /// sonst die Orchestrator-Stellen über die Organisationsrolle der
+    /// eingebauten Definition
+    /// ([`orchestrator_point_for_organizational_role`]). Eine Rolle ohne
+    /// eingebaute Definition bekommt nie eine Orchestrator-Stelle.
+    fn internal_point_for_child(&self, role: &str) -> Option<InternalModelPoint> {
+        internal_point_for_role(role).or_else(|| {
+            self.builtin_definitions
+                .get(role)
+                .map(ExecutableAgentIr::role)
+                .and_then(orchestrator_point_for_organizational_role)
+        })
+    }
+
+    /// Die `delegate_wave`-Fläche einer Orchestrator-Registry.
+    ///
+    /// # Description
+    /// Baut einen [`ModelToolProvider`] mit genau einer
+    /// [`harw_core_bridge::DelegateWaveOperation`]. Die Politik liefert die
+    /// Reducer-Kennung je Zielrolle
+    /// ([`harw_registry_defaults::authority_reducer_for_role`]) und die
+    /// deklarierten Ziele je Aufruferrolle
+    /// ([`harw_registry_defaults::authority::delegation_targets_for_role`]).
+    /// Der `OpContext` entsteht je Aufruf aus dem
+    /// [`harw_extension_api::ToolExecutionContext`] (Sitzung, Turn, Sandbox,
+    /// `CancelToken` des Turn-Loops — dasselbe Muster wie
+    /// `assembly.rs::install_operation_model_tools`); seine `ServiceMap`
+    /// trägt `Arc<ManagedAgentSpawner>` (nur, solange der Spawner lebt) und
+    /// `Arc<dyn StateStore>` (sofern hinterlegt). Fehlt einer der beiden
+    /// Dienste, scheitert `delegate_wave` selbst fail-closed mit
+    /// `OpError::NotAvailable`.
+    fn delegate_wave_provider(&self) -> ModelToolProvider {
+        let policy = harw_core_bridge::DelegateWavePolicy::new(
+            |role: &str| {
+                harw_registry_defaults::authority_reducer_for_role(role).map(|reducer| reducer.id())
+            },
+            harw_registry_defaults::authority::delegation_targets_for_role,
+        );
+        let operation: Arc<dyn Operation> =
+            Arc::new(harw_core_bridge::DelegateWaveOperation::new(policy));
+        let slot = Arc::clone(&self.spawner_slot);
+        let state_store = self.delegate_wave_store.clone();
+        ModelToolProvider::new([operation], move |execution_context| {
+            let mut services = ServiceMap::new();
+            if let Some(spawner) = slot.get().and_then(Weak::upgrade) {
+                services.insert(spawner);
+            }
+            if let Some(store) = &state_store {
+                services.insert(Arc::clone(store));
+            }
+            let ctx = OpContext::new(
+                execution_context.session_id().clone(),
+                execution_context.turn_id().clone(),
+                execution_context.sandbox().clone(),
+                services,
+            );
+            // Wie `install_operation_model_tools`: ohne den `CancelToken` des
+            // Turn-Loops sähe `fanout_children` nie den echten Turn-Abbruch.
+            match execution_context.cancel() {
+                Some(cancel) => ctx.with_cancel_token(cancel.clone()),
+                None => ctx,
+            }
+        })
+    }
+
     /// Die Skill-Fragmente einer Kind-Rolle (leer ohne Katalog oder ohne
     /// `agent.toml` für diese Rolle).
     ///
@@ -856,9 +955,12 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             extra_context: self.skill_fragments_for_role(role)?,
             ..IdentityOverrides::default()
         };
-        // Eine Kette je Kind: `for_child` löst die Modus-Zelle
-        // ([`ApprovalModeCell::detached`]), Geschwister beeinflussen sich also
-        // nicht.
+        // Eine Kette je Kind: `for_child` legt eine Folgezelle an
+        // ([`ApprovalModeCell::follower`], gedeckelt auf
+        // `ApprovalMode::Delegated`). Eine Umstellung der Wurzel erreicht
+        // laufende Kinder sofort; ein `set` im Kind koppelt nur dieses Kind ab
+        // — Geschwister bleiben voneinander unabhängig, folgen aber weiter der
+        // Wurzel.
         let child_chain = self.chain.for_child();
         // Teil B4: ruft dieselbe Delegationskette wie zuvor
         // `assemble_registry_for_project` mit exakt deren bisherigen
@@ -913,6 +1015,13 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                 registry_builder = registry_builder.tool_provider(provider);
             }
         }
+        // `delegate_wave` nur für Orchestrator-Rollen (Root oder Child); die
+        // `SessionActivation` des Kindes schaltet das Werkzeug zusätzlich nur
+        // frei, wenn seine Definition es admittiert.
+        if composition_tools_for_role(role).contains(&harw_core_bridge::DELEGATE_WAVE_TOOL) {
+            registry_builder =
+                registry_builder.tool_provider(Arc::new(self.delegate_wave_provider()));
+        }
         let registry = registry_builder.build();
         tracing::debug!(
             role,
@@ -953,8 +1062,9 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
     /// Liefert den Modellanbieter für eine Kind-Rolle.
     ///
     /// # Beschreibung
-    /// [`internal_point_for_role`] bildet `role` auf eine interne
-    /// Modellstelle ab (Addendum C). Ist keine Stelle zuständig, keine
+    /// [`internal_point_for_role`] bzw. — für Orchestrator-Definitionen —
+    /// [`orchestrator_point_for_organizational_role`] (R1) bildet `role` auf
+    /// eine interne Modellstelle ab (Addendum C). Ist keine Stelle zuständig, keine
     /// aufgelöste Stelle bekannt (`self.internal_models` leer, z. B. weil
     /// [`Self::with_internal_models`] nie aufgerufen wurde) oder die
     /// aufgelöste Stelle das Hauptmodell ([`ResolvedInternalModel::is_main_model`]),
@@ -966,7 +1076,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
     /// Nie: jede Auflösung fällt bei Unklarheit auf das Eltern-Modell
     /// zurück, statt zu scheitern.
     fn model_for(&self, role: &str) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
-        let Some(point) = internal_point_for_role(role) else {
+        let Some(point) = self.internal_point_for_child(role) else {
             return Ok(Arc::clone(&self.model));
         };
         Ok(self.pinned_model_for_point(role, point))
@@ -996,7 +1106,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         role: &str,
         complexity: Option<harw_core::TaskComplexity>,
     ) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
-        if let Some(point) = internal_point_for_role(role) {
+        if let Some(point) = self.internal_point_for_child(role) {
             return Ok(self.pinned_model_for_point(role, point));
         }
         let is_worker = self
@@ -1042,7 +1152,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         Option<harw_types::ReasoningEffort>,
         Option<harw_types::ReasoningEffort>,
     ) {
-        let Some(point) = internal_point_for_role(role) else {
+        let Some(point) = self.internal_point_for_child(role) else {
             return (None, None);
         };
         self.reasoning_effort_defaults_for_point(point)
@@ -1068,7 +1178,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         Option<harw_types::ReasoningEffort>,
         Option<harw_types::ReasoningEffort>,
     ) {
-        if let Some(point) = internal_point_for_role(role) {
+        if let Some(point) = self.internal_point_for_child(role) {
             return self.reasoning_effort_defaults_for_point(point);
         }
         let is_worker = self
