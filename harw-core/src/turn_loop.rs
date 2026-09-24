@@ -8579,4 +8579,302 @@ mod tests {
         })]);
         assert_eq!(extract_thinking_text(&reasoning), None);
     }
+
+    // ------------------------------------------------------------------
+    // Welle 3: Kontextfenster-Wächter (Pre-flight, ContextLength-Recovery,
+    // MaxTokens-Wiederholung)
+    // ------------------------------------------------------------------
+
+    /// Modell-Double für die Fenster-Wächter: Turn-Requests (erkennbar an
+    /// mitgelieferten Tools) werden protokolliert und aus dem Skript
+    /// bedient (leer ⇒ Text „fertig"); Requests ohne Tools sind
+    /// Zusammenfassungs-Aufrufe der Verdichtung und bekommen immer eine
+    /// kurze Zusammenfassung, ohne das Skript zu verbrauchen.
+    struct GuardModel {
+        script: Mutex<
+            std::collections::VecDeque<
+                Result<crate::model::ModelResponse, crate::model::ModelError>,
+            >,
+        >,
+        /// Je Turn-Request: geschätzte Bytes und gesetztes Ausgabelimit.
+        requests: Mutex<Vec<(u64, Option<u32>)>>,
+    }
+
+    impl GuardModel {
+        fn new(script: Vec<Result<crate::model::ModelResponse, crate::model::ModelError>>) -> Self {
+            Self {
+                script: Mutex::new(script.into_iter().collect()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<(u64, Option<u32>)> {
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl ModelProvider for GuardModel {
+        fn respond<'a>(&'a self, request: ModelRequest) -> crate::model::ModelFuture<'a> {
+            if request.tools.is_empty() {
+                return Box::pin(async {
+                    Ok(crate::model::ModelResponse::text(
+                        "Zusammenfassung: ältere Runden lasen große Dateien.",
+                    ))
+                });
+            }
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((
+                    crate::context_budget::estimate_request_bytes(&request),
+                    request.max_output_tokens,
+                ));
+            let next = self
+                .script
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front()
+                .unwrap_or_else(|| Ok(crate::model::ModelResponse::text("fertig")));
+            Box::pin(async move { next })
+        }
+    }
+
+    /// Session mit dem Tool `lookup` (damit Turn-Requests Tools tragen),
+    /// optionaler Auto-Compact-Policy und zehn älteren Runden mit je einem
+    /// 20-KB-Tool-Ergebnis — genug Masse, die eine Verdichtung sicher
+    /// verkleinert.
+    fn bulky_session(policy: Option<crate::auto_compact::AutoCompactPolicy>) -> AgentSession {
+        let mut session = make_session(
+            StubToolProvider::with_names(&["lookup"]),
+            SessionActivation::new(ToolProfile::Full),
+        )
+        .with_auto_compact(policy);
+        for i in 0..10 {
+            let call_id = ToolCallId::new();
+            session.history_mut().push_user_text(format!("frage {i}"));
+            session.history_mut().push_tool_call(
+                call_id.clone(),
+                "lookup",
+                serde_json::json!({ "i": i }),
+            );
+            session.history_mut().push_tool_result(
+                call_id,
+                ToolCallResult::success(serde_json::json!("x".repeat(20_000))),
+                0,
+            );
+            session
+                .history_mut()
+                .push_assistant_text(format!("antwort {i}"), None);
+        }
+        session
+    }
+
+    #[tokio::test]
+    async fn context_length_error_triggers_one_emergency_compaction_and_a_retry() -> TestResult {
+        let policy = crate::auto_compact::AutoCompactPolicy::for_context_window(200_000);
+        let mut session = bulky_session(Some(policy));
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = GuardModel::new(vec![
+            Err(crate::model::ModelError::ContextLength {
+                message: "prompt is too long".to_owned(),
+            }),
+            Ok(crate::model::ModelResponse::text(
+                "nach Verdichtung erledigt",
+            )),
+        ]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("weiter"))
+            .await
+            .map_err(ctx("ContextLength muss einmal abgefangen werden"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        let requests = model.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "genau ein fehlgeschlagener Request plus eine Wiederholung"
+        );
+        assert!(
+            requests[1].0 < requests[0].0,
+            "die Wiederholung muss nach der Notfall-Verdichtung kleiner sein \
+             (vorher={}, nachher={})",
+            requests[0].0,
+            requests[1].0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_second_context_length_error_is_returned_to_the_caller() -> TestResult {
+        let policy = crate::auto_compact::AutoCompactPolicy::for_context_window(200_000);
+        let mut session = bulky_session(Some(policy));
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = GuardModel::new(vec![
+            Err(crate::model::ModelError::ContextLength {
+                message: "prompt is too long".to_owned(),
+            }),
+            Err(crate::model::ModelError::ContextLength {
+                message: "prompt is still too long".to_owned(),
+            }),
+        ]);
+
+        let result = run_turn(&mut session, &model, &store, TurnInput::user("weiter")).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(CoreError::Model(
+                    crate::model::ModelError::ContextLength { .. }
+                ))
+            ),
+            "der zweite Fehlschlag geht an den Aufrufer: {result:?}"
+        );
+        assert_eq!(model.requests().len(), 2, "höchstens eine Wiederholung");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_compaction_runs_an_emergency_compaction_before_the_first_request() -> TestResult
+    {
+        let policy = crate::auto_compact::AutoCompactPolicy::for_context_window(200_000);
+        let mut session = bulky_session(Some(policy));
+        session.set_pending_compaction(true);
+        let bytes_before: u64 = session
+            .history()
+            .items()
+            .iter()
+            .map(|item| serde_json::to_vec(item).map_or(0, |v| v.len() as u64))
+            .sum();
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = GuardModel::new(vec![Ok(crate::model::ModelResponse::text("ok"))]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("weiter"))
+            .await
+            .map_err(ctx("der Turn läuft nach der Notfall-Verdichtung durch"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        assert!(
+            !session.pending_compaction(),
+            "die vorgemerkte Verdichtung ist nach dem Lauf erledigt"
+        );
+        let requests = model.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].0 < bytes_before / 2,
+            "schon der erste Request muss verdichtet sein (Request={}, Verlauf vorher={})",
+            requests[0].0,
+            bytes_before
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_request_that_cannot_fit_ends_with_context_exhausted_before_sending() -> TestResult {
+        // 1 000-Token-Fenster, aber eine einzelne Nutzernachricht von rund
+        // 3 000 Tokens: die aktuelle Nachricht lässt sich nicht verdichten.
+        let policy = crate::auto_compact::AutoCompactPolicy::for_context_window(1_000);
+        let mut session = make_session(
+            StubToolProvider::with_names(&["lookup"]),
+            SessionActivation::new(ToolProfile::Full),
+        )
+        .with_auto_compact(Some(policy));
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = GuardModel::new(Vec::new());
+
+        let result = run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("y".repeat(9_000)),
+        )
+        .await;
+
+        match result {
+            Err(CoreError::Model(crate::model::ModelError::ContextLength { message })) => {
+                assert!(
+                    message.contains("Kontext erschöpft"),
+                    "klare deutsche Meldung erwartet: {message}"
+                );
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet wurde „Kontext erschöpft\", war: {other:?}"
+                )));
+            }
+        }
+        assert!(
+            model.requests().is_empty(),
+            "ein Request, der nicht passt, darf nie gesendet werden"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn max_tokens_with_tool_calls_retries_once_with_a_doubled_output_limit() -> TestResult {
+        let policy = crate::auto_compact::AutoCompactPolicy::for_context_window(200_000);
+        let mut session = make_session(
+            StubToolProvider::with_names(&["lookup"]),
+            SessionActivation::new(ToolProfile::Full),
+        )
+        .with_auto_compact(Some(policy));
+        session.set_max_output_tokens(Some(1_000));
+        let store = crate::state_store::InMemoryStateStore::new();
+        let truncated_call = ToolCallId::new();
+        let model = GuardModel::new(vec![
+            Ok(crate::model::ModelResponse {
+                stop: crate::model::StopReason::MaxTokens,
+                ..response_with(vec![call(&truncated_call, "lookup")])
+            }),
+            Ok(crate::model::ModelResponse::text("mit mehr Platz erledigt")),
+        ]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("los"))
+            .await
+            .map_err(ctx("die Wiederholung mit doppeltem Limit läuft durch"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        let limits: Vec<Option<u32>> = model.requests().into_iter().map(|(_, l)| l).collect();
+        assert_eq!(limits, vec![Some(1_000), Some(2_000)]);
+        assert!(
+            !session
+                .history()
+                .items()
+                .iter()
+                .any(|item| matches!(item, TurnItem::ToolCall(_))),
+            "abgeschnittene Tool-Calls dürfen nie in den Verlauf gelangen"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raised_output_limit_is_capped_by_reserve_and_half_window() {
+        let budget = RoundBudget {
+            window_tokens: 10_000,
+            reserve_tokens: 4_000,
+            threshold_tokens: None,
+        };
+        assert_eq!(budget.raised_output_limit(1_000), 2_000);
+        assert_eq!(
+            budget.raised_output_limit(3_000),
+            5_000,
+            "Fenster/2 deckelt"
+        );
+        let small_reserve = RoundBudget {
+            window_tokens: 100_000,
+            reserve_tokens: 1_500,
+            threshold_tokens: None,
+        };
+        assert_eq!(small_reserve.raised_output_limit(1_000), 2_000);
+        assert_eq!(
+            small_reserve.raised_output_limit(2_000),
+            3_000,
+            "2 × Reserve deckelt"
+        );
+        assert!(budget.overflows(6_001));
+        assert!(!budget.overflows(6_000));
+        assert_eq!(budget.emergency_target(60), 3_600);
+    }
 }

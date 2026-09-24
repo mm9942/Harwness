@@ -134,6 +134,9 @@ impl ProviderToml {
     /// - [`ConfigError::Invalid`]: `originator` ist gesetzt, aber leer, länger
     ///   als [`MAX_ORIGINATOR_CHARS`] Zeichen oder enthält Nicht-ASCII-/
     ///   Steuerzeichen (siehe [`is_printable_ascii`]).
+    /// - [`ConfigError::Invalid`]: `[rate_limit]` verletzt
+    ///   [`RateLimitToml::validate`] (Budget-Feld `0`, Marge > 100,
+    ///   `mode = "budget"` ohne Budget).
     pub fn validate(&self) -> ConfigResult<()> {
         let mut headers: Vec<(&String, &String)> = self.headers.iter().collect();
         headers.sort_by(|left, right| left.0.cmp(right.0));
@@ -150,6 +153,9 @@ impl ProviderToml {
                 "provider '{}': max_concurrency = 0 would block every request forever; omit the field for unlimited concurrency or set it to a positive value",
                 self.name
             )));
+        }
+        if let Some(rate_limit) = &self.rate_limit {
+            rate_limit.validate(&format!("provider '{}'", self.name))?;
         }
         if let Some(originator) = &self.originator {
             if originator.len() > MAX_ORIGINATOR_CHARS || !is_printable_ascii(originator) {
@@ -183,17 +189,90 @@ fn default_safety_margin_pct() -> u8 {
     10
 }
 
-/// Client-seitiges Rate-Limiting-Konfiguration für einen Provider.
+/// Welche Rate-Limit-Mechanismen für einen Provider bzw. ein Modell wirken.
+///
+/// - `header`: nur das reaktive Header-Pacing (`x-ratelimit-*`/
+///   `anthropic-ratelimit-*`, siehe `harw-provider-http::rate_limiter`),
+///   gesteuert über [`RateLimitToml::enabled`]; konfigurierte Budgets werden
+///   ignoriert.
+/// - `budget`: nur die client-seitigen Token-Buckets (RPM/TPM, siehe
+///   `harw-provider-http::budget`); das Header-Pacing bleibt aus, auch wenn
+///   `enabled = true` gesetzt ist.
+/// - `both`: beides (Default, sobald mindestens ein Budget-Feld gesetzt ist).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitMode {
+    /// Nur reaktives Header-Pacing.
+    Header,
+    /// Nur client-seitige Budgets.
+    Budget,
+    /// Header-Pacing und Budgets gemeinsam.
+    Both,
+}
+
+impl RateLimitMode {
+    /// `true`, wenn dieser Modus das Header-Pacing einschließt.
+    #[must_use]
+    pub fn uses_header(self) -> bool {
+        matches!(self, Self::Header | Self::Both)
+    }
+
+    /// `true`, wenn dieser Modus die client-seitigen Budgets einschließt.
+    #[must_use]
+    pub fn uses_budget(self) -> bool {
+        matches!(self, Self::Budget | Self::Both)
+    }
+}
+
+/// Client-seitiges Rate-Limiting-Konfiguration für einen Provider (Sektion
+/// `[rate_limit]` in `providers/<name>.toml`) oder als Override für ein
+/// einzelnes Modell (Sektion `[rate_limit]` in `models/<name>.toml`).
+///
+/// # Description
+/// Zwei unabhängige Mechanismen, gewählt über [`Self::mode`]:
+/// - **Header-Pacing** (reaktiv): `enabled` + `safety_margin_pct`; wartet,
+///   wenn die vom Provider gemeldeten Rest-Kontingente knapp werden.
+/// - **Budgets** (proaktiv): `requests_per_minute`, `tokens_per_minute`,
+///   `input_tokens_per_minute`, `output_tokens_per_minute`, `max_concurrent`;
+///   kontinuierlich auffüllende Token-Buckets, die Requests vor dem Senden
+///   zurückhalten, bis Kapazität frei ist. Budgets wirken unabhängig von
+///   `enabled` (das nur das Header-Pacing schaltet).
+///
+/// Als Modell-Override (`ModelToml::rate_limit`) bilden die Budget-Felder
+/// einen eigenen Bucket je (Provider, Modell), der **zusätzlich** zum
+/// Provider-Bucket gilt; `enabled`/`safety_margin_pct` sind dort ohne
+/// Wirkung.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitToml {
-    /// `true` aktiviert client-seitiges Rate-Limiting/Throttling.
+    /// `true` aktiviert das reaktive Header-Pacing/Throttling.
     #[serde(default)]
     pub enabled: bool,
     /// Sicherheitsmarge (Prozent) unterhalb des vom Provider gemeldeten
     /// Limits, die eingehalten wird, bevor gewartet wird.
     #[serde(default = "default_safety_margin_pct")]
     pub safety_margin_pct: u8,
+    /// Höchstzahl Requests pro Minute (RPM-Budget); `None` = unbegrenzt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests_per_minute: Option<u32>,
+    /// Höchstzahl Tokens (Eingabe + Ausgabe) pro Minute (TPM-Budget).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_per_minute: Option<u64>,
+    /// Höchstzahl Eingabe-Tokens pro Minute (ITPM-Budget).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens_per_minute: Option<u64>,
+    /// Höchstzahl Ausgabe-Tokens pro Minute (OTPM-Budget).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens_per_minute: Option<u64>,
+    /// Höchstzahl gleichzeitig in Flug befindlicher Requests dieses Buckets.
+    /// Anders als `ProviderToml::max_concurrency` (Provider-weit, zur
+    /// Laufzeit verstellbar) gilt dies je Budget-Bucket und damit auch je
+    /// Modell-Override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
+    /// Welche Mechanismen wirken; `None` = [`Self::effective_mode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<RateLimitMode>,
 }
 
 impl Default for RateLimitToml {
@@ -201,7 +280,101 @@ impl Default for RateLimitToml {
         Self {
             enabled: false,
             safety_margin_pct: default_safety_margin_pct(),
+            requests_per_minute: None,
+            tokens_per_minute: None,
+            input_tokens_per_minute: None,
+            output_tokens_per_minute: None,
+            max_concurrent: None,
+            mode: None,
         }
+    }
+}
+
+impl RateLimitToml {
+    /// `true`, wenn mindestens ein Budget-Feld gesetzt ist.
+    #[must_use]
+    pub fn has_budget(&self) -> bool {
+        self.requests_per_minute.is_some()
+            || self.tokens_per_minute.is_some()
+            || self.input_tokens_per_minute.is_some()
+            || self.output_tokens_per_minute.is_some()
+            || self.max_concurrent.is_some()
+    }
+
+    /// Wirksamer Modus: explizites `mode`, sonst `both`, sobald ein Budget
+    /// gesetzt ist, sonst `header` (bisheriges Verhalten).
+    #[must_use]
+    pub fn effective_mode(&self) -> RateLimitMode {
+        self.mode.unwrap_or(if self.has_budget() {
+            RateLimitMode::Both
+        } else {
+            RateLimitMode::Header
+        })
+    }
+
+    /// `true`, wenn das reaktive Header-Pacing laufen soll (`enabled` und
+    /// ein Modus mit Header-Anteil).
+    #[must_use]
+    pub fn header_pacing_enabled(&self) -> bool {
+        self.enabled && self.effective_mode().uses_header()
+    }
+
+    /// `true`, wenn client-seitige Budgets greifen sollen (mindestens ein
+    /// Budget-Feld und ein Modus mit Budget-Anteil).
+    #[must_use]
+    pub fn budget_enabled(&self) -> bool {
+        self.has_budget() && self.effective_mode().uses_budget()
+    }
+
+    /// Kopie für den Header-Pacer: `enabled` spiegelt
+    /// [`Self::header_pacing_enabled`], damit `mode = "budget"` das
+    /// Header-Pacing abschaltet, ohne dass der Pacer den Modus kennen muss.
+    #[must_use]
+    pub fn header_pacer_config(&self) -> Self {
+        Self {
+            enabled: self.header_pacing_enabled(),
+            ..self.clone()
+        }
+    }
+
+    /// Prüft die Budget-Felder.
+    ///
+    /// # Arguments
+    /// - `owner`: Bezeichner für Fehlermeldungen, z. B. `provider 'openai'`.
+    ///
+    /// # Errors
+    /// [`ConfigError::Invalid`], wenn ein Budget-Feld `0` ist (würde jeden
+    /// Request für immer blockieren), `safety_margin_pct` über 100 liegt oder
+    /// `mode = "budget"` ohne ein einziges Budget-Feld gesetzt ist.
+    pub fn validate(&self, owner: &str) -> ConfigResult<()> {
+        let zero_fields = [
+            (
+                "requests_per_minute",
+                self.requests_per_minute.map(u64::from),
+            ),
+            ("tokens_per_minute", self.tokens_per_minute),
+            ("input_tokens_per_minute", self.input_tokens_per_minute),
+            ("output_tokens_per_minute", self.output_tokens_per_minute),
+            ("max_concurrent", self.max_concurrent.map(u64::from)),
+        ];
+        for (field, value) in zero_fields {
+            if value == Some(0) {
+                return Err(ConfigError::Invalid(format!(
+                    "{owner}: rate_limit.{field} = 0 would block every request forever; omit the field for no limit or set it to a positive value"
+                )));
+            }
+        }
+        if self.safety_margin_pct > 100 {
+            return Err(ConfigError::Invalid(format!(
+                "{owner}: rate_limit.safety_margin_pct must be between 0 and 100"
+            )));
+        }
+        if self.mode == Some(RateLimitMode::Budget) && !self.has_budget() {
+            return Err(ConfigError::Invalid(format!(
+                "{owner}: rate_limit.mode = \"budget\" requires at least one of requests_per_minute, tokens_per_minute, input_tokens_per_minute, output_tokens_per_minute or max_concurrent"
+            )));
+        }
+        Ok(())
     }
 }
 
