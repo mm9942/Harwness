@@ -53,9 +53,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use harw_authority::{
-    Permission, PermissionRequest, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-};
+use harw_authority::{PermissionRequest, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
 use harw_core::StateStore;
 use harw_core::agent_events::AgentEventHub;
 use harw_core::cancel::CancelToken;
@@ -66,15 +64,17 @@ use harw_matrix_game::MatrixError;
 use harw_matrix_game::aar::{AarInput, build_aar, validate_goal_ratings};
 use harw_matrix_game::commitments::{DOMAIN, sha256_parts, to_hex};
 use harw_matrix_game::events::events_for_entry;
+use harw_matrix_game::library;
 use harw_matrix_game::phases::{
     ArgumentBox, ContractKind, CounterArgument, EffectOp, ExpectedCall, NegotiationRequest, Phase,
-    PhaseConfig, PhaseOutput, PhaseStep, PlayerDebrief, RoundArgument, RoundCursor,
-    UmpireAdjudication, UmpireNarration, UmpireRuling, UmpireSynthesis, Verdict, apply_inject,
-    close_negotiation, close_round, end_game, enter_phase, expected_calls, open_channels,
-    open_game, post_messages, record_briefing, record_narration, record_standing, resolve_argument,
-    reveal_round, reveal_secret, submit_counters, validate_counter_argument,
-    validate_negotiation_messages, validate_negotiation_request, validate_player_argument,
-    validate_umpire_adjudication, validate_umpire_narration,
+    PhaseConfig, PhaseOutput, PhaseStep, PlayerDebrief, RedCellObjection, RoundArgument,
+    RoundCursor, UmpireAdjudication, UmpireNarration, UmpireRuling, UmpireSynthesis, Verdict,
+    apply_inject, close_negotiation, close_round, end_game, enter_phase, expected_calls,
+    open_channels, open_game, post_messages, record_briefing, record_narration, record_standing,
+    resolve_argument, reveal_round, reveal_secret, submit_counters, submit_red_cell,
+    validate_counter_argument, validate_negotiation_messages, validate_negotiation_request,
+    validate_player_argument, validate_red_cell_objection, validate_umpire_adjudication,
+    validate_umpire_narration,
 };
 use harw_matrix_game::prompts::{self, SeatRole};
 use harw_matrix_game::scenario::{
@@ -116,6 +116,8 @@ const REPAIR_ATTEMPTS: u32 = 1;
 
 /// Sitz-Schlüssel des Umpires in `views`/`seats`.
 pub const UMPIRE_KEY: &str = "umpire";
+/// Sitz-Schlüssel der Red Cell (reservierte Sitz-Id im Szenario).
+pub const RED_CELL_KEY: &str = harw_matrix_game::scenario::RED_CELL_KEY;
 
 /// Unterordner des Laufverzeichnisses mit den Unterlagen-Kopien je Sitz.
 pub const MATERIALS_DIR: &str = "materials";
@@ -256,7 +258,7 @@ pub struct SpawnerDriver {
     store: Arc<dyn StateStore>,
     /// Sandbox der aufrufenden Session (Obergrenze jedes Sitzes).
     parent_sandbox: SandboxSpec,
-    /// Rückfall ohne jede Berechtigung (Unterlagen nicht bindbar).
+    /// Sandbox ohne jede Berechtigung für Läufe ohne Unterlagen-Kopien.
     sandbox: SandboxSpec,
     parent: SessionId,
     cancel: CancelToken,
@@ -311,22 +313,21 @@ impl SpawnerDriver {
         self
     }
 
-    /// Sandbox eines Sitzes: seine Unterlagen-Kopie, nur lesend, ohne Netz;
-    /// ohne Kopie die berechtigungslose Rückfall-Sandbox.
-    fn seat_sandbox_for(&mut self, key: &str) -> SandboxSpec {
+    /// Sandbox eines Sitzes: seine Unterlagen-Kopie als Harness-Lesesicht
+    /// (nur lesend, ohne Netz); ohne Kopien die berechtigungslose Sandbox.
+    ///
+    /// # Errors
+    /// Deutsche Fehlerbeschreibung, wenn die Lesesicht nicht gebaut werden
+    /// kann — der Sitz verwirkt dann den Zug; es gibt bewusst keinen
+    /// Rückfall auf eine andere Sandbox.
+    fn seat_sandbox_for(&self, key: &str) -> Result<SandboxSpec, String> {
         let Some(root) = &self.materials_root else {
-            return self.sandbox.clone();
+            return Ok(self.sandbox.clone());
         };
         let workspace = format!("matrix-{}-{key}", self.run_tag);
-        match seat_sandbox(&self.parent_sandbox, &root.join(key), &workspace) {
-            Ok(sandbox) => sandbox,
-            Err(error) => {
-                self.warnings.push(format!(
-                    "Sitz `{key}`: Unterlagen nicht bindbar ({error}) — Sitz liest ohne Unterlagen"
-                ));
-                self.sandbox.clone()
-            }
-        }
+        seat_sandbox(&self.parent_sandbox, &root.join(key), &workspace).map_err(|error| {
+            format!("Unterlagen-Sandbox für Sitz `{key}` nicht erzeugbar: {error}")
+        })
     }
 
     /// Übernimmt die bereits zugelassenen Sitze eines Laufs.
@@ -360,55 +361,30 @@ impl SeatDriver for SpawnerDriver {
             let child = match self.children.get(key) {
                 Some(child) => child.clone(),
                 None => {
-                    let bound = self.seat_sandbox_for(key);
-                    let parent = self.parent.clone();
-                    let system = request.system;
-                    let input = || harw_extension_api::SpawnInput {
-                        parent_session_id: parent.clone(),
+                    // Kein Rückfall: ist die Lesesicht nicht baubar oder
+                    // weist die Admission sie ab, verwirkt der Sitz den Zug
+                    // (fail-closed).
+                    let bound = self.seat_sandbox_for(key)?;
+                    let input = harw_extension_api::SpawnInput {
+                        parent_session_id: self.parent.clone(),
                         handoff_call_id: ToolCallId::new(),
-                        instructions: Some(system.to_owned()),
+                        instructions: Some(request.system.to_owned()),
                         context: json!({ "matrix_seat": key }),
                         ceiling: None,
                     };
-                    let first = self
+                    let child = self
                         .spawner
                         .spawn_child_or_wait(
                             request.role,
-                            input(),
+                            input,
                             bound,
                             None,
                             SEAT_SLOT_WAIT,
                             &self.cancel,
                         )
                         .await
-                        .map(harw_core::child_controller::ChildGuard::keep);
-                    let child = match first {
-                        Ok(child) => child,
-                        // Die Admission verlangt dieselbe Workspace-Bindung
-                        // wie beim Parent: dann ohne Unterlagen, aber nie
-                        // mit mehr Rechten (fail-closed).
-                        Err(error)
-                            if self.materials_root.is_some()
-                                && error.to_string().contains("escalation") =>
-                        {
-                            self.warnings.push(format!(
-                                "Sitz `{key}`: Unterlagen-Sandbox abgewiesen ({error}) — Sitz liest ohne Unterlagen"
-                            ));
-                            self.spawner
-                                .spawn_child_or_wait(
-                                    request.role,
-                                    input(),
-                                    self.sandbox.clone(),
-                                    None,
-                                    SEAT_SLOT_WAIT,
-                                    &self.cancel,
-                                )
-                                .await
-                                .map(harw_core::child_controller::ChildGuard::keep)
-                                .map_err(|error| format!("Spawn fehlgeschlagen: {error}"))?
-                        }
-                        Err(error) => return Err(format!("Spawn fehlgeschlagen: {error}")),
-                    };
+                        .map(harw_core::child_controller::ChildGuard::keep)
+                        .map_err(|error| format!("Spawn fehlgeschlagen: {error}"))?;
                     // Der Sitz bleibt über alle Phasen zugelassen; die
                     // Freigabe übernimmt `release_all` bzw. `forget`.
                     self.children.insert(key.to_owned(), child.clone());
@@ -562,6 +538,7 @@ pub fn seat_key(seat: &Seat) -> String {
     match seat {
         Seat::Player(p) => p.as_str().to_owned(),
         Seat::Umpire => UMPIRE_KEY.to_owned(),
+        Seat::RedCell => RED_CELL_KEY.to_owned(),
     }
 }
 
@@ -571,6 +548,7 @@ fn role_name(role: SeatRole) -> &'static str {
         SeatRole::Player => role_names::MATRIX_PLAYER,
         SeatRole::Umpire => role_names::MATRIX_UMPIRE,
         SeatRole::Market => role_names::MATRIX_MARKET,
+        SeatRole::RedCell => role_names::MATRIX_REDCELL,
     }
 }
 
@@ -579,6 +557,7 @@ fn role_label(role: SeatRole) -> &'static str {
         SeatRole::Player => "player",
         SeatRole::Umpire => "umpire",
         SeatRole::Market => "market",
+        SeatRole::RedCell => "red-cell",
     }
 }
 
@@ -588,10 +567,16 @@ impl MatrixRun {
     /// Unterlagen-Kopien je Sitz (`materials/<sitz>/`) angelegt.
     /// `scenario_path` ist der Pfad der Szenario-Datei (für relative
     /// `[materials]`-Ordner; `None` bei gebündelten Szenarien).
+    /// `package` wählt ein Inject-Paket der Szenario-Bibliothek; ohne Angabe
+    /// wählt der Seed eines (nur wenn das Szenario Pakete hat).
     ///
     /// # Errors
     /// [`OpError::Execution`] bei Kern- oder Dateifehlern,
     /// [`OpError::InvalidArguments`], wenn der Unterlagen-Ordner fehlt.
+    // Jeder Parameter ist ein eigenständiger Laufwert (Szenario, Quelle, Pfad,
+    // Seed, Kennung, Verzeichnis, Zeitstempel, Paket); ein Hilfs-Struct brächte
+    // hier nur Umverpackung.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         loaded: LoadedScenario,
         source: String,
@@ -600,9 +585,12 @@ impl MatrixRun {
         run_id: String,
         run_dir: Option<PathBuf>,
         timestamps: bool,
+        package: Option<&str>,
     ) -> Result<Self, OpError> {
         let at = timestamps.then(Timestamp::now);
-        let log = open_game(&loaded, &master_seed, at).map_err(matrix_err)?;
+        let mut log = open_game(&loaded, &master_seed, at).map_err(matrix_err)?;
+        library::record_inject_package(&mut log, &loaded.scenario, package, at)
+            .map_err(matrix_err)?;
         let cfg = PhaseConfig::from_scenario(&loaded.scenario);
         let mut run = Self::from_log(
             loaded,
@@ -655,6 +643,9 @@ impl MatrixRun {
                 .map(Seat::Player)
                 .collect();
             seats.push(Seat::Umpire);
+            if loaded.scenario.red_cell().is_some() {
+                seats.push(Seat::RedCell);
+            }
             for seat in &seats {
                 let key = seat_key(seat);
                 if !safe_component(&key) {
@@ -795,6 +786,9 @@ impl MatrixRun {
             .map(Seat::Player)
             .collect();
         seats.push(Seat::Umpire);
+        if self.loaded.scenario.red_cell().is_some() {
+            seats.push(Seat::RedCell);
+        }
         seats
     }
 
@@ -929,7 +923,13 @@ impl MatrixRun {
         let mut report = StepReport::new(next);
         if next.phase == Phase::Briefing {
             self.args.clear();
-            for inject in self.loaded.scenario.injects_for_round(next.round) {
+            let mut injects = self.loaded.scenario.injects_for_round(next.round);
+            injects.extend(library::package_injects_for_round(
+                &self.loaded.scenario,
+                &self.log.journal,
+                next.round,
+            ));
+            for inject in injects {
                 apply_inject(&mut self.log, self.loaded.scenario.rules(), &inject, at)
                     .map_err(matrix_err)?;
             }
@@ -983,6 +983,7 @@ impl MatrixRun {
             &self.log.state.players,
             &members,
             self.loaded.scenario.rules(),
+            self.loaded.scenario.red_cell().is_some(),
         )
     }
 
@@ -1072,7 +1073,7 @@ impl MatrixRun {
         let rules = self.rules();
         let player = match &call.seat {
             Seat::Player(p) => Some(p),
-            Seat::Umpire => None,
+            Seat::Umpire | Seat::RedCell => None,
         };
         let result = match (output, player) {
             (PhaseOutput::BriefingAck(_), _) | (PhaseOutput::PlayerDebrief(_), Some(_)) => Ok(()),
@@ -1104,6 +1105,14 @@ impl MatrixRun {
                     Ok(())
                 } else {
                     Err(MatrixError::Contract(errors))
+                }
+            }
+            (PhaseOutput::RedCellObjection(o), None) if call.seat == Seat::RedCell => {
+                match self.loaded.scenario.red_cell() {
+                    Some(settings) => validate_red_cell_objection(o, &self.args, settings),
+                    None => Err(MatrixError::Contract(vec![
+                        "Red Cell ist in diesem Szenario nicht aktiv".to_owned(),
+                    ])),
                 }
             }
             _ => Err(MatrixError::Contract(vec![format!(
@@ -1178,7 +1187,7 @@ impl MatrixRun {
                     record_briefing(&mut self.log, &seat, &ack, at).map_err(matrix_err)?;
                 }
                 (None, Seat::Player(p)) => self.record_forfeit(p, Phase::Briefing)?,
-                (None, Seat::Umpire) => {}
+                (None, Seat::Umpire | Seat::RedCell) => {}
             }
         }
         Ok(())
@@ -1295,6 +1304,26 @@ impl MatrixRun {
         for (player, counter) in counters {
             submit_counters(&mut self.log, &mut self.args, &player, &counter, at)
                 .map_err(matrix_err)?;
+        }
+        // Die Red Cell kommt nach allen Spielern und sieht deren Contras schon.
+        // Fehlt ihre Antwort oder ist sie ungültig, gilt sie als kein Einwand.
+        for call in calls.iter().filter(|c| c.seat == Seat::RedCell) {
+            let objection = match self.call_seat(driver, call, &vis, report).await? {
+                Some((PhaseOutput::RedCellObjection(objection), _)) => objection,
+                _ => RedCellObjection {
+                    no_objection: true,
+                    ..RedCellObjection::default()
+                },
+            };
+            let at = self.at();
+            submit_red_cell(
+                &mut self.log,
+                &self.loaded.scenario,
+                &mut self.args,
+                &objection,
+                at,
+            )
+            .map_err(matrix_err)?;
         }
         Ok(())
     }
@@ -1812,6 +1841,7 @@ impl MatrixRun {
                 let name = match seat {
                     Seat::Player(p) => scenario.display_name(p),
                     Seat::Umpire => "Umpire".to_owned(),
+                    Seat::RedCell => "Red Cell".to_owned(),
                 };
                 json!({
                     "id": seat_key(seat),
@@ -1899,13 +1929,20 @@ fn public_texts(output: &PhaseOutput, args: &[RoundArgument]) -> Vec<(String, St
                 args.iter()
                     .any(|arg| arg.id == r.argument_id && !arg.is_secret())
             })
-            .filter_map(|r| {
-                r.public_rationale.as_ref().map(|text| {
+            .flat_map(|r| {
+                let rationale = r.public_rationale.as_ref().map(|text| {
                     (
                         format!("umpire:{}:public_rationale", r.argument_id),
                         text.clone(),
                     )
-                })
+                });
+                let precedent = r.precedent.as_ref().map(|flag| {
+                    (
+                        format!("umpire:{}:precedent", r.argument_id),
+                        flag.principle.clone(),
+                    )
+                });
+                rationale.into_iter().chain(precedent)
             })
             .collect(),
         PhaseOutput::UmpireNarration(n) => {
@@ -1978,6 +2015,7 @@ fn neutral_ruling(arg: &RoundArgument, rules: &Rules) -> UmpireRuling {
         on_success: Vec::new(),
         on_failure: Vec::new(),
         triggers_secret: None,
+        precedent: None,
     }
 }
 
@@ -2028,6 +2066,8 @@ fn entry_from(kind: &EntryKind) -> Option<String> {
         | EntryKind::StandingSet { .. } => Some(UMPIRE_KEY.to_owned()),
         EntryKind::FacilitatorNote { .. } => Some("facilitator".to_owned()),
         EntryKind::InjectApplied { attributed, .. } => attributed.then(|| "facilitator".to_owned()),
+        EntryKind::RedCellObjection { .. } => Some(RED_CELL_KEY.to_owned()),
+        EntryKind::PrecedentSet { .. } => Some(UMPIRE_KEY.to_owned()),
         _ => None,
     }
 }
@@ -2108,7 +2148,38 @@ pub fn entry_text(kind: &EntryKind, scenario: &Scenario) -> String {
         | EntryKind::Forfeit { text, .. }
         | EntryKind::Narrated { text, .. }
         | EntryKind::FactAdded { text }
-        | EntryKind::InjectApplied { text, .. } => text.clone(),
+        | EntryKind::InjectApplied { text, .. }
+        | EntryKind::SuspicionRaised { text, .. } => text.clone(),
+        EntryKind::BehaviorBriefing { faction, profile } => format!(
+            "Verhaltensprofil {}: {} Regel(n), Risiko {:.1}, {} rote Linie(n)",
+            scenario.display_name(faction),
+            profile.rules.len(),
+            profile.risk,
+            profile.red_lines.len()
+        ),
+        EntryKind::RedCellObjection {
+            target,
+            assumption,
+            cons,
+        } => match target {
+            Some(target) => format!(
+                "Red Cell gegen {target}: Annahme „{}“ — {}",
+                assumption.as_deref().unwrap_or("?"),
+                cons.join(" | ")
+            ),
+            None => "Red Cell: kein Einwand.".to_owned(),
+        },
+        EntryKind::PrecedentSet { precedent } => format!(
+            "Präzedenzfall {} ({}): {}",
+            precedent.id, precedent.argument_id, precedent.principle
+        ),
+        EntryKind::InjectPackageSelected { package_id, plan } => {
+            let parts: Vec<String> = plan
+                .iter()
+                .map(|p| format!("{} (Runde {})", p.inject_id, p.round))
+                .collect();
+            format!("Inject-Paket `{package_id}` gewählt: {}", parts.join(", "))
+        }
         EntryKind::CountersSubmitted { counters, .. } => {
             let parts: Vec<String> = counters
                 .iter()
@@ -2477,15 +2548,40 @@ fn copy_limited(
 }
 
 /// Sandbox eines Sitzes: Workspace = seine Unterlagen-Kopie, Rechte =
-/// `{ReadWorkspace}` ∩ Parent-Rechte, kein Netz.
+/// `{ReadWorkspace}` ∩ Parent-Rechte, kein Netz, Ursprung
+/// `AuthorityOrigin::HarnessReadView` (über
+/// [`SandboxSpec::harness_read_view`]). Nur dieser Ursprung besteht die
+/// Admission (`ensure_child_of`) trotz abweichendem Workspace.
+///
+/// Die Lesesicht darf nur auf eine vom Runner selbst angelegte
+/// Unterlagen-Kopie zeigen: `seat_dir` muss ein echtes Verzeichnis (kein
+/// Symlink) direkt unter einem Ordner [`MATERIALS_DIR`] sein, und sein Name
+/// muss ein sicherer Pfadbestandteil sein. So kann ein fehlerhafter Aufrufer
+/// keine beliebigen Verzeichnisse als harness-eigene Sicht freigeben.
 ///
 /// # Errors
-/// Deutsche Fehlerbeschreibung, wenn die Kopie nicht bindbar ist.
+/// Deutsche Fehlerbeschreibung, wenn die Kopie nicht bindbar ist, nicht wie
+/// eine Unterlagen-Kopie aussieht oder der Parent kein `ReadWorkspace` hält.
 pub fn seat_sandbox(
     parent: &SandboxSpec,
     seat_dir: &Path,
     workspace: &str,
 ) -> Result<SandboxSpec, String> {
+    let is_copy = seat_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(safe_component)
+        && seat_dir
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == MATERIALS_DIR)
+        && std::fs::symlink_metadata(seat_dir).is_ok_and(|meta| meta.file_type().is_dir());
+    if !is_copy {
+        return Err(format!(
+            "`{}` ist keine Unterlagen-Kopie des Runners (<lauf>/{MATERIALS_DIR}/<sitz>/)",
+            seat_dir.display()
+        ));
+    }
     let tenant = parent.workspace().tenant().clone();
     let workspace = WorkspaceId::from_str(workspace);
     let registry = WorkspaceRegistry::build(
@@ -2500,13 +2596,8 @@ pub fn seat_sandbox(
     let binding = registry
         .resolve(&tenant, &workspace)
         .map_err(|e| e.to_string())?;
-    let permissions = parent
-        .restrict(&PermissionRequest::from_permissions([
-            Permission::ReadWorkspace,
-        ]))
-        .permissions()
-        .clone();
-    Ok(SandboxSpec::from_resolved(binding, permissions))
+    SandboxSpec::harness_read_view(parent, binding)
+        .map_err(|e| format!("Lesesicht auf die Unterlagen abgewiesen: {e}"))
 }
 
 #[cfg(test)]
@@ -2581,6 +2672,7 @@ mod tests {
             "test-run".to_owned(),
             None,
             false,
+            None,
         )?)
     }
 
@@ -2851,6 +2943,44 @@ mod tests {
                 "sitze/c/plan.txt",
             ]
         );
+        Ok(())
+    }
+
+    fn parent_sandbox(root: &Path) -> Result<SandboxSpec, Box<dyn std::error::Error>> {
+        let tenant = harw_types::TenantId::from_str("t");
+        let workspace = WorkspaceId::from_str("ws");
+        let registry = WorkspaceRegistry::build(
+            root,
+            [WorkspaceRegistration {
+                tenant: tenant.clone(),
+                workspace: workspace.clone(),
+                root: root.to_path_buf(),
+            }],
+        )?;
+        Ok(SandboxSpec::from_resolved(
+            registry.resolve(&tenant, &workspace)?,
+            harw_authority::PermissionSet::from_policy([harw_authority::Permission::ReadWorkspace]),
+        ))
+    }
+
+    #[test]
+    fn seat_sandbox_only_accepts_runner_materials_copies() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let parent = parent_sandbox(tmp.path())?;
+        let copy = tmp.path().join(MATERIALS_DIR).join("a");
+        std::fs::create_dir_all(&copy)?;
+        let view = seat_sandbox(&parent, &copy, "matrix-test-a")?;
+        assert!(
+            view.permissions()
+                .contains(harw_authority::Permission::ReadWorkspace)
+        );
+        assert!(view.network_scope().is_empty());
+
+        let elsewhere = tmp.path().join("beliebig");
+        std::fs::create_dir_all(&elsewhere)?;
+        assert!(seat_sandbox(&parent, &elsewhere, "matrix-test-x").is_err());
+        let missing = tmp.path().join(MATERIALS_DIR).join("fehlt");
+        assert!(seat_sandbox(&parent, &missing, "matrix-test-y").is_err());
         Ok(())
     }
 

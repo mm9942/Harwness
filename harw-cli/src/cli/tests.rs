@@ -1608,8 +1608,10 @@ fn test_session_flags_used_lists_every_set_flag_in_order() -> TestResult {
         "/tmp/a",
         "--goal",
         "Ziel",
+        // Ein echter Agentenname: `uia` ist zugleich das versteckte
+        // Alt-Unterkommando und gewinnt wegen `subcommand_precedence_over_arg`.
         "--agent",
-        "uia",
+        "explorer",
         "--model",
         "m",
         "--approval",

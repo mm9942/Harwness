@@ -1560,10 +1560,7 @@ network_targets = []
             &PermissionSet::from_test_permissions([Permission::ReadWorkspace])
         );
         assert!(view.network_scope().is_empty());
-        assert_eq!(
-            view.authority().origin(),
-            &AuthorityOrigin::HarnessReadView
-        );
+        assert_eq!(view.authority().origin(), &AuthorityOrigin::HarnessReadView);
         view.ensure_child_of(&parent)?;
         // Eine weitere Einschränkung der Sicht bleibt Kind der Sicht.
         view.restrict(&PermissionRequest::empty())
@@ -1672,7 +1669,7 @@ network_targets = []
         }
         let rights_free = sandbox_with(
             view_workspace(),
-            [],
+            std::iter::empty(),
             NetworkScope::empty(),
             AuthorityOrigin::Runtime,
         );

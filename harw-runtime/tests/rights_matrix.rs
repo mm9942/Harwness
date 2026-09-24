@@ -422,16 +422,17 @@ fn telegram_reads_and_writes_without_shell_network_or_relaxed_approval() -> Test
             "Telegram darf {tool} nicht führen: {tools:?}"
         );
     }
+    // Lesen läuft ohne Button durch, jedes Schreiben fragt (erzwungen).
     assert_eq!(
         assembled.assembly.approval_mode().get(),
-        ApprovalMode::AlwaysAsk
+        ApprovalMode::Delegated
     );
 
     // Auch ein expliziter Aufrufer-Override lockert den Modus nicht.
     let mut spec = spec_for(EntryKind::GatewayTelegram, &fixture);
     spec.approval_override = Some(ApprovalMode::FullAccess);
     let relaxed = build_with_spec(spec).map_err(ctx("Telegram mit Override montiert"))?;
-    assert_eq!(relaxed.approval_mode().get(), ApprovalMode::AlwaysAsk);
+    assert_eq!(relaxed.approval_mode().get(), ApprovalMode::Delegated);
     Ok(())
 }
 

@@ -105,6 +105,22 @@ pub fn bundled_files() -> &'static [BundledFile] {
 /// eingetragen werden; `test_every_asset_file_is_embedded` erzwingt das.
 static BUNDLED_FILES: &[BundledFile] = &[
     BundledFile {
+        relative_path: "agents/business-author/agent.toml",
+        contents: include_str!("../assets/agents/business-author/agent.toml"),
+    },
+    BundledFile {
+        relative_path: "agents/business-author/system.md",
+        contents: include_str!("../assets/agents/business-author/system.md"),
+    },
+    BundledFile {
+        relative_path: "agents/business-reviewer/agent.toml",
+        contents: include_str!("../assets/agents/business-reviewer/agent.toml"),
+    },
+    BundledFile {
+        relative_path: "agents/business-reviewer/system.md",
+        contents: include_str!("../assets/agents/business-reviewer/system.md"),
+    },
+    BundledFile {
         relative_path: "agents/coding-orchestrator/agent.toml",
         contents: include_str!("../assets/agents/coding-orchestrator/agent.toml"),
     },
@@ -177,6 +193,14 @@ static BUNDLED_FILES: &[BundledFile] = &[
         contents: include_str!("../assets/agents/log-analyst/system.md"),
     },
     BundledFile {
+        relative_path: "agents/matrix-scenario-author/agent.toml",
+        contents: include_str!("../assets/agents/matrix-scenario-author/agent.toml"),
+    },
+    BundledFile {
+        relative_path: "agents/matrix-scenario-author/system.md",
+        contents: include_str!("../assets/agents/matrix-scenario-author/system.md"),
+    },
+    BundledFile {
         relative_path: "agents/refactorer/agent.toml",
         contents: include_str!("../assets/agents/refactorer/agent.toml"),
     },
@@ -217,6 +241,14 @@ static BUNDLED_FILES: &[BundledFile] = &[
         contents: include_str!("../assets/agents/security-inspection-orchestrator/system.md"),
     },
     BundledFile {
+        relative_path: "agents/slides-builder/agent.toml",
+        contents: include_str!("../assets/agents/slides-builder/agent.toml"),
+    },
+    BundledFile {
+        relative_path: "agents/slides-builder/system.md",
+        contents: include_str!("../assets/agents/slides-builder/system.md"),
+    },
+    BundledFile {
         relative_path: "agents/source-researcher/agent.toml",
         contents: include_str!("../assets/agents/source-researcher/agent.toml"),
     },
@@ -239,6 +271,22 @@ static BUNDLED_FILES: &[BundledFile] = &[
     BundledFile {
         relative_path: "agents/test-engineer/system.md",
         contents: include_str!("../assets/agents/test-engineer/system.md"),
+    },
+    BundledFile {
+        relative_path: "skills/author-review-pipeline/instructions.md",
+        contents: include_str!("../assets/skills/author-review-pipeline/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/author-review-pipeline/skill.toml",
+        contents: include_str!("../assets/skills/author-review-pipeline/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/business-writing-pyramid/instructions.md",
+        contents: include_str!("../assets/skills/business-writing-pyramid/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/business-writing-pyramid/skill.toml",
+        contents: include_str!("../assets/skills/business-writing-pyramid/skill.toml"),
     },
     BundledFile {
         relative_path: "skills/contract-fanout-migration/instructions.md",
@@ -329,12 +377,28 @@ static BUNDLED_FILES: &[BundledFile] = &[
         contents: include_str!("../assets/skills/interfaces-and-abstraction/skill.toml"),
     },
     BundledFile {
+        relative_path: "skills/learning-loop/instructions.md",
+        contents: include_str!("../assets/skills/learning-loop/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/learning-loop/skill.toml",
+        contents: include_str!("../assets/skills/learning-loop/skill.toml"),
+    },
+    BundledFile {
         relative_path: "skills/loops-and-control-flow/instructions.md",
         contents: include_str!("../assets/skills/loops-and-control-flow/instructions.md"),
     },
     BundledFile {
         relative_path: "skills/loops-and-control-flow/skill.toml",
         contents: include_str!("../assets/skills/loops-and-control-flow/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/matrix-scenario-design/instructions.md",
+        contents: include_str!("../assets/skills/matrix-scenario-design/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/matrix-scenario-design/skill.toml",
+        contents: include_str!("../assets/skills/matrix-scenario-design/skill.toml"),
     },
     BundledFile {
         relative_path: "skills/null-and-optional-handling/instructions.md",
@@ -752,7 +816,7 @@ mod tests {
                 file.relative_path
             );
         }
-        assert_eq!(agents, 17, "das Bundle liefert 17 Agentendefinitionen");
+        assert_eq!(agents, 21, "das Bundle liefert 21 Agentendefinitionen");
         Ok(())
     }
 
@@ -771,7 +835,7 @@ mod tests {
                 ))
             })?;
         }
-        assert_eq!(skills, 54, "das Bundle liefert 54 Skills");
+        assert_eq!(skills, 58, "das Bundle liefert 58 Skills");
         Ok(())
     }
 

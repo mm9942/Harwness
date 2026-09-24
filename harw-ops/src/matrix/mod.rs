@@ -117,6 +117,8 @@ pub enum MatrixCommand {
         scenario: String,
         /// Expliziter Seed.
         seed: Option<u64>,
+        /// Inject-Paket der Szenario-Bibliothek (`--package <id>`).
+        package: Option<String>,
     },
     /// `step`.
     Step,
@@ -159,6 +161,8 @@ pub enum MatrixCommand {
     Show,
     /// `list`.
     List,
+    /// `compare <lauf> <lauf> …`: Vergleich mehrerer Läufe (Design-Lehren).
+    Compare(Vec<String>),
 }
 
 /// Befehl plus optional gewählter Lauf (`--run=<id>`).
@@ -170,7 +174,7 @@ pub struct ParsedCommand {
     pub command: MatrixCommand,
 }
 
-const USAGE: &str = "start <szenario> [--seed N], step, auto N, pause, inject <text>, override <json>, veto <arg> [grund], reveal <arg>, fork <runde>, end, replay [--seed N], show, list";
+const USAGE: &str = "start <szenario> [--seed N], step, auto N, pause, inject <text>, override <json>, veto <arg> [grund], reveal <arg>, fork <runde>, end, replay [--seed N], show, list, compare <lauf> <lauf> …";
 
 fn invalid(message: impl Into<String>) -> OpError {
     OpError::InvalidArguments(message.into())
@@ -246,17 +250,26 @@ pub fn parse_command(tokens: &[String]) -> Result<ParsedCommand, OpError> {
             no_extra(&rest, "show")?;
             MatrixCommand::Show
         }
+        "compare" => {
+            if rest.len() < 2 {
+                return Err(invalid(
+                    "mindestens zwei Läufe erwartet: /matrix compare <lauf> <lauf> …",
+                ));
+            }
+            MatrixCommand::Compare(rest)
+        }
         "list" => {
             no_extra(&rest, "list")?;
             MatrixCommand::List
         }
         "start" => {
             let seed = parse_seed(take_value_flag(&mut rest, "seed")?)?;
+            let package = take_value_flag(&mut rest, "package")?;
             let scenario = match rest.as_slice() {
                 [one] => one.clone(),
                 [] => {
                     return Err(invalid(
-                        "Szenario fehlt: /matrix start <szenario-id|pfad> [--seed N]",
+                        "Szenario fehlt: /matrix start <szenario-id|pfad> [--seed N] [--package ID]",
                     ));
                 }
                 more => {
@@ -266,7 +279,11 @@ pub fn parse_command(tokens: &[String]) -> Result<ParsedCommand, OpError> {
                     )));
                 }
             };
-            MatrixCommand::Start { scenario, seed }
+            MatrixCommand::Start {
+                scenario,
+                seed,
+                package,
+            }
         }
         "step" => {
             no_extra(&rest, "step")?;
@@ -545,7 +562,7 @@ fn new_run_location(root: &Path, scenario_id: &str) -> (String, PathBuf) {
 /// Siehe Moduldoku.
 #[operation(
     name = "matrix",
-    summary = "Matrix Game: start, step, auto, pause, inject, override, veto, reveal, fork, end, replay, show, list.",
+    summary = "Matrix Game: start, step, auto, pause, inject, override, veto, reveal, fork, end, replay, show, list, compare.",
     domain = "knowledge",
     permission = "operator",
     command(path = "/matrix", visibility = "channel_reduced")
@@ -559,10 +576,15 @@ async fn run_command(ctx: &OpContext, parsed: ParsedCommand) -> Result<OpOutput,
     let ParsedCommand { run, command } = parsed;
     match command {
         MatrixCommand::List => list_output(),
+        MatrixCommand::Compare(ids) => compare_output(&ids),
         MatrixCommand::Show => show_output(&current_id(run)?),
-        MatrixCommand::Start { scenario, seed } => {
+        MatrixCommand::Start {
+            scenario,
+            seed,
+            package,
+        } => {
             let resolved = resolve_scenario(&scenario)?;
-            start_run(ctx, resolved, seed, None)
+            start_run(ctx, resolved, seed, package.as_deref(), None)
         }
         MatrixCommand::Step => step_command(ctx, &current_id(run)?).await,
         MatrixCommand::Auto(rounds) => auto_command(ctx, &current_id(run)?, rounds).await,
@@ -624,6 +646,7 @@ fn start_run(
     ctx: &OpContext,
     resolved: ResolvedScenario,
     seed: Option<u64>,
+    package: Option<&str>,
     note: Option<String>,
 ) -> Result<OpOutput, OpError> {
     let ResolvedScenario {
@@ -642,6 +665,7 @@ fn start_run(
         run_id.clone(),
         Some(dir.clone()),
         true,
+        package,
     )?;
     if let Some(note) = note {
         run.note("replay", note)?;
@@ -832,8 +856,42 @@ fn replay_command(ctx: &OpContext, id: &str, seed: Option<u64>) -> Result<OpOutp
         ctx,
         resolved,
         Some(seed),
+        None,
         Some(format!("Neustart von `{id}` mit Seed {seed}")),
     )
+}
+
+/// Vergleicht mehrere Läufe dieser Sitzung (Kennzahlen je Lauf plus
+/// Design-Lehren) und schreibt den Bericht neben den ersten Lauf.
+fn compare_output(ids: &[String]) -> Result<OpOutput, OpError> {
+    let mut summaries = Vec::with_capacity(ids.len());
+    let mut first_dir = None;
+    for id in ids {
+        let (summary, dir) = with_run(id, |run| {
+            Ok((
+                harw_matrix_game::aar::summarize_run(
+                    id,
+                    run.loaded(),
+                    &run.log().journal,
+                    &run.log().state,
+                ),
+                run.run_dir().map(Path::to_path_buf),
+            ))
+        })?;
+        if first_dir.is_none() {
+            first_dir = dir;
+        }
+        summaries.push(summary);
+    }
+    let mut text = harw_matrix_game::aar::compare_runs(&summaries);
+    if let Some(parent) = first_dir.as_deref().and_then(Path::parent) {
+        let path = parent.join(format!("compare-{}.md", ids.join("+")));
+        match std::fs::write(&path, &text) {
+            Ok(()) => text.push_str(&format!("\nGespeichert: {}\n", path.display())),
+            Err(e) => text.push_str(&format!("\nNicht gespeichert ({}): {e}\n", path.display())),
+        }
+    }
+    Ok(OpOutput { text, data: None })
 }
 
 fn show_output(id: &str) -> Result<OpOutput, OpError> {
@@ -937,18 +995,33 @@ mod tests {
             parse(&["start", "karst-islands"])?,
             MatrixCommand::Start {
                 scenario: "karst-islands".to_owned(),
-                seed: None
+                seed: None,
+                package: None
             }
         );
         let expected = MatrixCommand::Start {
             scenario: "karst-islands".to_owned(),
             seed: Some(42),
+            package: None,
         };
         assert_eq!(
             parse(&["start", "karst-islands", "--seed", "42"])?,
             expected
         );
         assert_eq!(parse(&["start", "--seed=42", "karst-islands"])?, expected);
+        assert_eq!(
+            parse(&["start", "karst-islands", "--package", "sturm"])?,
+            MatrixCommand::Start {
+                scenario: "karst-islands".to_owned(),
+                seed: None,
+                package: Some("sturm".to_owned()),
+            }
+        );
+        assert_eq!(
+            parse(&["compare", "a", "b"])?,
+            MatrixCommand::Compare(vec!["a".to_owned(), "b".to_owned()])
+        );
+        assert!(parse(&["compare", "a"]).is_err());
         assert!(parse(&["start"]).is_err());
         assert!(parse(&["start", "a", "b"]).is_err());
         assert!(parse(&["start", "a", "--seed", "x"]).is_err());
@@ -1062,6 +1135,7 @@ mod tests {
             id.clone(),
             None,
             false,
+            None,
         )?;
         put_run(run)?;
 

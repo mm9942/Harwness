@@ -686,7 +686,15 @@ mod tests {
     fn doctor_shares_tui_rights_but_not_ask_or_spawner() {
         let tui = EntryKind::Tui.profile();
         let doctor = EntryKind::Doctor.profile();
-        assert_eq!(doctor.permissions, tui.permissions);
+        // Runde 3: die TUI-Wurzel hat egress-gebundenes Netz, die Diagnose
+        // braucht keins — sonst sind die Rechte gleich.
+        let tui_without_network = PermissionSet::from_policy(
+            tui.permissions
+                .iter()
+                .filter(|p| *p != Permission::NetworkAccess),
+        );
+        assert_eq!(doctor.permissions, tui_without_network);
+        assert!(!doctor.permissions.contains(Permission::NetworkAccess));
         assert_eq!(doctor.registry_profile, tui.registry_profile);
         assert_eq!(doctor.operations, tui.operations);
         assert_eq!(doctor.ask, AskResolution::Fail);

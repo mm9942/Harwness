@@ -239,6 +239,21 @@ const DREAM: &[SubcommandHint] = &[
     SubcommandHint::new("show", "<id>", "Traumbericht anzeigen"),
 ];
 
+/// `/learn`, Grammatik aus `harw-ops/src/learn.rs`: schlägt nur vor, jede
+/// Übernahme braucht ein ausdrückliches `accept`.
+const LEARN: &[SubcommandHint] = &[
+    SubcommandHint::new("scan", "", "Sitzung nach Lernkandidaten durchsuchen"),
+    SubcommandHint::new(
+        "note",
+        "<text> [--target memory|skill|agent]",
+        "Vorschlag aus eigenem Text anlegen",
+    ),
+    SubcommandHint::new("list", "[--all]", "Vorschläge auflisten"),
+    SubcommandHint::new("show", "<id>", "Vorschlag anzeigen"),
+    SubcommandHint::new("accept", "<id>", "Vorschlag annehmen"),
+    SubcommandHint::new("reject", "<id> [grund]", "Vorschlag ablehnen"),
+];
+
 /// `/diary`, Grammatik aus `harw-ops/src/diary.rs` plus `today` (Vertrag).
 const DIARY: &[SubcommandHint] = &[
     SubcommandHint::new("today", "", "Heutige Einträge anzeigen"),
@@ -252,7 +267,11 @@ const DIARY: &[SubcommandHint] = &[
 
 /// `/matrix`, Grammatik der Matrix-Game-Operation (`harw-ops/src/matrix`).
 const MATRIX: &[SubcommandHint] = &[
-    SubcommandHint::new("start", "<szenario>", "Neues Matrix-Spiel starten"),
+    SubcommandHint::new(
+        "start",
+        "<szenario> [--seed N] [--package ID]",
+        "Neues Matrix-Spiel starten",
+    ),
     SubcommandHint::new("step", "", "Eine Phase weiter"),
     SubcommandHint::new("auto", "<n>", "N Runden ohne Halt spielen"),
     SubcommandHint::new("pause", "", "Nach laufenden Aufrufen anhalten"),
@@ -273,6 +292,11 @@ const MATRIX: &[SubcommandHint] = &[
     ),
     SubcommandHint::new("show", "", "Laufendes Spiel anzeigen (Panel: F9)"),
     SubcommandHint::new("list", "", "Szenarien und Läufe auflisten"),
+    SubcommandHint::new(
+        "compare",
+        "<lauf> <lauf> …",
+        "Läufe vergleichen (Design-Lehren)",
+    ),
 ];
 
 /// `/tools`, Grammatik aus `crate::tools_command`.
@@ -355,6 +379,11 @@ const HINT_TABLE: &[(&str, &str, &[SubcommandHint])] = &[
         PALACE,
     ),
     ("dream", "/dream [list|show <id>]", DREAM),
+    (
+        "learn",
+        "/learn [scan|note <text>|list [--all]|show <id>|accept <id>|reject <id>]",
+        LEARN,
+    ),
     ("diary", "/diary [today|show [agent]|note <text>]", DIARY),
     (
         "matrix",
@@ -635,9 +664,9 @@ mod tests {
         "agents",
     ];
 
-    /// Befehle, deren Operation fehlen darf. `matrix` hat eine
-    /// Ersatz-Spezifikation, bis die `/matrix`-Operation registriert ist.
-    const ALLOWED_MISSING: &[&str] = &["matrix"];
+    /// Befehle, deren Operation fehlen darf. Seit `/matrix` registriert ist,
+    /// ist die Liste leer; `matrix` behält nur seine Ersatz-Spezifikation.
+    const ALLOWED_MISSING: &[&str] = &[];
 
     #[test]
     fn local_specs_cover_every_local_and_fallback_name_once() {
@@ -736,7 +765,7 @@ mod tests {
             names("matrix"),
             [
                 "start", "step", "auto", "pause", "inject", "override", "veto", "reveal", "fork",
-                "end", "replay", "show", "list"
+                "end", "replay", "show", "list", "compare"
             ]
         );
         assert!(subcommand_hints("no-such-command").is_empty());

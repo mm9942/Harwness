@@ -2406,7 +2406,7 @@ mod tests {
                     && ROOT_CEILING_SECTIONS.contains(&section.name.as_str())
                 {
                     assert!(
-                        bound.must_include().iter().any(|s| *s == section.name),
+                        bound.must_include().contains(&section.name),
                         "{role}: must-include-Sektion {} aus {program_name} fehlt",
                         section.name
                     );
@@ -2854,7 +2854,7 @@ mod tests {
         // Matrix-Game-Sitze (Runde 3, Welle E: ein Zug, ein Urteil bzw. eine
         // Schätzung ist eine einzelne Textantwort, kein Fan-out — siehe
         // `agents/roles/matrix-*/matrix-*.toml`, jeweils `[spawn] max_depth = 0`).
-        const ZERO_DEPTH_ROLES: [&str; 14] = [
+        const ZERO_DEPTH_ROLES: [&str; 15] = [
             role_names::SECURITY_EGRESS_TRIAGE,
             role_names::SECURITY_BASELINE_TRIAGE,
             role_names::SECURITY_STRUCTURE_TRIAGE,
@@ -2869,6 +2869,7 @@ mod tests {
             role_names::MATRIX_PLAYER,
             role_names::MATRIX_UMPIRE,
             role_names::MATRIX_MARKET,
+            role_names::MATRIX_REDCELL,
         ];
 
         let definitions = builtin()?;

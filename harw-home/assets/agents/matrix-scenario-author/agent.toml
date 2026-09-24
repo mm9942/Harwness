@@ -1,0 +1,7 @@
+name = "matrix-scenario-author"
+role = "worker"
+description = "Erarbeitet im schrittweisen Interview ein Matrix-Game-Szenario und liefert einen geprüften matrix-scenario/v1-TOML-Entwurf."
+system_file = "system.md"
+skills = ["matrix-scenario-design"]
+timeout_seconds = 300
+max_retries = 1

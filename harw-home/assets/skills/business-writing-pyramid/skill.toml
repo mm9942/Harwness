@@ -1,0 +1,4 @@
+name = "business-writing-pyramid"
+description = "Geschäftstexte von der Kernaussage her aufbauen: Einleitung aus Lage, Störung und Leserfrage, Frage-Antwort-Logik nach unten, überschneidungsfreie Gruppen, geordnete Argumente, Checkliste."
+instructions_file = "instructions.md"
+tools = ["filesystem.read"]

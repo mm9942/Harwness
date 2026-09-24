@@ -2595,6 +2595,7 @@ dependencies = [
  "harw-job-runtime",
  "harw-knowledge",
  "harw-macros",
+ "harw-matrix-game",
  "harw-memory",
  "harw-model-catalog",
  "harw-operations",

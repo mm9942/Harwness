@@ -704,7 +704,7 @@ mod tests {
             !plan.contains(&"fs.write") && !plan.contains(&"shell.exec"),
             "Plan bleibt mutationsfrei"
         );
-        assert_eq!(plan.len(), explore.len() + 8);
+        assert_eq!(plan.len(), explore.len() + 9);
         Ok(())
     }
 

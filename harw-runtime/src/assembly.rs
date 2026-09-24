@@ -302,24 +302,25 @@ impl std::fmt::Debug for RootSession {
 ///   sondern ein *funktionsloser* Zustand: jede Rückfrage liefe sofort in die
 ///   [`crate::spec::AskResolution`] des Einstiegs.
 ///
-/// Einzige Ausnahme ist [`EntryKind::GatewayTelegram`] (Runde 3, Welle D):
-/// der Chat liest und schreibt im gebundenen Workspace, und die Person
-/// beantwortet jede Rückfrage über Freigabe-Buttons. Für ihn ist der Modus
-/// [`ApprovalMode::AlwaysAsk`] — und zwar nicht nur als Vorgabe, sondern
+/// Besonders ist [`EntryKind::GatewayTelegram`] (Runde 3, Welle D): der Chat
+/// liest und schreibt im gebundenen Workspace, und die Person beantwortet jede
+/// Rückfrage über Freigabe-Buttons. Lesende Werkzeuge laufen durch, jedes
+/// Schreiben (`fs.write`/`fs.edit`) fragt. Der Modus ist dort
+/// [`ApprovalMode::Delegated`] — und zwar nicht nur als Vorgabe, sondern
 /// **erzwungen**: [`forced_approval_mode`] übersteuert Konfiguration und
-/// Aufrufer-Override.
+/// Aufrufer-Override, damit kein `full` das Schreiben freischaltet.
 ///
 /// # Argumente
 /// - `entry` ([`EntryKind`]): der Einstieg.
 ///
 /// # Rückgabe
-/// [`ApprovalMode::AlwaysAsk`] für `GatewayTelegram`, sonst
-/// [`ApprovalMode::Delegated`].
+/// Immer [`ApprovalMode::Delegated`]; für `GatewayTelegram` zusätzlich
+/// erzwungen (siehe [`forced_approval_mode`]).
 #[must_use]
 pub const fn default_approval_mode(entry: EntryKind) -> ApprovalMode {
     match entry {
-        EntryKind::GatewayTelegram => ApprovalMode::AlwaysAsk,
-        EntryKind::Tui
+        EntryKind::GatewayTelegram
+        | EntryKind::Tui
         | EntryKind::OneShot
         | EntryKind::LocalEcho
         | EntryKind::Analyze
@@ -337,20 +338,21 @@ pub const fn default_approval_mode(entry: EntryKind) -> ApprovalMode {
 ///
 /// # Beschreibung
 /// [`EntryKind::GatewayTelegram`] schreibt im Workspace eines entfernten
-/// Chats; `fs.write`/`fs.edit` (und jeder andere Aufruf) stehen dort immer
-/// unter Freigabe, auch wenn `[permissions].default_mode` oder ein
-/// `--approval` etwas anderes sagt (Runde 3, Welle D). Alle anderen
-/// Einstiege haben keinen erzwungenen Modus.
+/// Chats; `fs.write`/`fs.edit` (und jeder andere nicht lesende Aufruf)
+/// stehen dort immer unter Freigabe, auch wenn `[permissions].default_mode`
+/// oder ein `--approval` etwas anderes sagt (Runde 3, Welle D). Lesende
+/// Werkzeuge laufen ohne Button durch. Alle anderen Einstiege haben keinen
+/// erzwungenen Modus.
 ///
 /// # Argumente
 /// - `entry` ([`EntryKind`]): der Einstieg.
 ///
 /// # Rückgabe
-/// `Some(ApprovalMode::AlwaysAsk)` für `GatewayTelegram`, sonst `None`.
+/// `Some(ApprovalMode::Delegated)` für `GatewayTelegram`, sonst `None`.
 #[must_use]
 pub const fn forced_approval_mode(entry: EntryKind) -> Option<ApprovalMode> {
     match entry {
-        EntryKind::GatewayTelegram => Some(ApprovalMode::AlwaysAsk),
+        EntryKind::GatewayTelegram => Some(ApprovalMode::Delegated),
         EntryKind::Tui
         | EntryKind::OneShot
         | EntryKind::LocalEcho
@@ -4783,40 +4785,39 @@ mod tests {
         );
     }
 
-    /// Der Rustdoc von [`default_approval_mode`] sagt „`Delegated`, nur
-    /// `GatewayTelegram` fragt immer" — dann ist das auch die Zusage, die der
-    /// Test prüft (Befund Z2c-12, Runde 3 Welle D).
+    /// Der Rustdoc von [`default_approval_mode`] sagt „immer `Delegated`“ —
+    /// auch Telegram, dort zusätzlich erzwungen (Befund Z2c-12, Runde 3
+    /// Welle D: Lesen läuft durch, Schreiben fragt).
     #[test]
-    fn every_entry_but_telegram_starts_delegated() {
+    fn every_entry_starts_delegated() {
         for entry in ALL_ENTRIES {
-            let expected = if entry == EntryKind::GatewayTelegram {
-                ApprovalMode::AlwaysAsk
-            } else {
-                ApprovalMode::Delegated
-            };
-            assert_eq!(default_approval_mode(entry), expected, "{entry:?}");
+            assert_eq!(
+                default_approval_mode(entry),
+                ApprovalMode::Delegated,
+                "{entry:?}"
+            );
         }
     }
 
-    /// Telegram fragt immer — auch wenn Global- und Projekt-Konfiguration
-    /// `full` bzw. `auto` verlangen. Kein anderer Einstieg hat einen
+    /// Telegram fragt bei jedem Schreiben — auch wenn Global- und
+    /// Projekt-Konfiguration `full` verlangen. Kein anderer Einstieg hat einen
     /// erzwungenen Modus.
     #[test]
-    fn telegram_approval_mode_is_forced_to_ask_regardless_of_config() {
+    fn telegram_approval_mode_is_forced_to_delegated_regardless_of_config() {
         let global = PermissionsSection {
             default_mode: Some("full".to_owned()),
             ..PermissionsSection::default()
         };
         let project = PermissionsSection {
-            default_mode: Some("auto".to_owned()),
+            default_mode: Some("full".to_owned()),
             ..PermissionsSection::default()
         };
         assert_eq!(
             effective_approval_mode(EntryKind::GatewayTelegram, &global, &project),
-            ApprovalMode::AlwaysAsk
+            ApprovalMode::Delegated
         );
         for entry in ALL_ENTRIES {
-            let expected = (entry == EntryKind::GatewayTelegram).then_some(ApprovalMode::AlwaysAsk);
+            let expected = (entry == EntryKind::GatewayTelegram).then_some(ApprovalMode::Delegated);
             assert_eq!(forced_approval_mode(entry), expected, "{entry:?}");
         }
     }

@@ -451,6 +451,10 @@ fn all_registered_ops_are_reachable_by_name() {
         "diary",
         "palace",
         "dream",
+        // Runde 3: `/learn` (nur Vorschläge, `channel_reduced`) und `/matrix`
+        // (Matrix-Game, `channel_reduced`), beide Surface::Command.
+        "learn",
+        "matrix",
     ];
 
     // Jede Operation muss mindestens eine Fläche tragen. Eine ohne wäre über

@@ -2,9 +2,16 @@
 //!
 //! # Beschreibung
 //! Vertrag: `docs/remediation/CONTRACTS.md` §runtime-spec
-//! (`EntryKind::GatewayTelegram`/`GatewayDream`, beide `{}`-Rechte,
-//! `RegistryProfile::NoTools`, `AskResolution::Fail`, `SpawnerPolicy::None`,
-//! `CeilingPolicy::Closed`). Dieses Modul baut aus einem Kanal-Ereignis genau
+//! (`EntryKind::GatewayDream`: `{}`-Rechte, `RegistryProfile::NoTools`,
+//! `AskResolution::Fail`; `EntryKind::GatewayTelegram`: `{Read, Write}`,
+//! `RegistryProfile::WorkspaceEdit` ohne Shell und Netz,
+//! `AskResolution::Interactive` mit erzwungener Freigabe per Button; beide
+//! `SpawnerPolicy::None`, `CeilingPolicy::Closed`). Die Telegram-Montage
+//! dieses Moduls liefert Modell, Config und Speicher der Bindung; ihre
+//! Werkzeuge führt kein Turn aus. Werkzeuge bekommt ein Chat erst pro Turn in
+//! `crate::gateway::telegram_session`, über eine an seinen Workspace
+//! gebundene Montage; ohne Workspace läuft der Turn mit leerer Registry.
+//! Dieses Modul baut aus einem Kanal-Ereignis genau
 //! einen [`harw_runtime::RuntimeAssembly`]:
 //!
 //! 1. [`channel_principal`] leitet den vertrauenswürdigen [`Principal`] an

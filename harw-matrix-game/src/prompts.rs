@@ -19,11 +19,12 @@ use std::fmt::Write as _;
 
 use crate::dice::{Grade, Outcome};
 use crate::phases::{ContractKind, ExpectedCall, Phase, Verdict};
+use crate::precedents::{MAX_RELEVANT_PRECEDENTS, relevant_precedents};
 use crate::scenario::{
-    AdjudicationSystem, ArgumentSystem, BusinessScenario, Ending, LoadedScenario, Scenario,
-    ScenarioMode, TeamRole,
+    AdjudicationSystem, ArgumentSystem, BehaviorProfile, BusinessScenario, Ending, LoadedScenario,
+    RED_CELL_KEY, RedCellSettings, Scenario, ScenarioMode, TeamRole,
 };
-use crate::state::{Audience, EntryKind, PlayerId, RevealedBy, Seat, VarValue};
+use crate::state::{Audience, EntryKind, PlayerId, RevealedBy, Seat, SuspicionLevel, VarValue};
 use crate::visibility::{SeatView, ViewEntry, Viewer, var_visible_to};
 
 /// Rolle eines Agenten am Tisch.
@@ -35,6 +36,8 @@ pub enum SeatRole {
     Umpire,
     /// Bewertendes Marktteam (Business-Modus, `market_role = "player"`).
     Market,
+    /// Red Cell (`[red_cell]`): prüft Kernannahmen, ohne Siegbedingung.
+    RedCell,
 }
 
 impl SeatRole {
@@ -45,6 +48,7 @@ impl SeatRole {
     pub fn for_seat(loaded: &LoadedScenario, seat: &Seat) -> Self {
         match (seat, &loaded.scenario) {
             (Seat::Umpire, _) => Self::Umpire,
+            (Seat::RedCell, _) => Self::RedCell,
             (Seat::Player(p), Scenario::Business(b)) => {
                 if b.teams
                     .iter()
@@ -66,6 +70,7 @@ impl SeatRole {
             Self::Player => "matrix-player",
             Self::Umpire => "matrix-umpire",
             Self::Market => "matrix-market",
+            Self::RedCell => "matrix-redcell",
         }
     }
 }
@@ -84,6 +89,7 @@ pub fn contract_name(kind: ContractKind) -> &'static str {
         ContractKind::FinalArgument => "final_argument",
         ContractKind::PlayerDebrief => "player_debrief",
         ContractKind::UmpireSynthesis => "umpire_synthesis",
+        ContractKind::RedCellObjection => "red_cell_objection",
     }
 }
 
@@ -111,14 +117,17 @@ pub fn contract_schema(kind: ContractKind) -> &'static str {
             r#"{"counters": [{"argument_id": "<ID eines fremden öffentlichen Arguments dieser Runde>", "cons": ["<Contra>", …]}]}  — höchstens 3 Contras je Argument"#
         }
         ContractKind::UmpireAdjudication => {
-            r#"{"rulings": [{"argument_id": "<ID>", "verdict": "roll" | "no_roll" | "veto", "pro_weights": [0|1|2, …], "con_weights": {"<Sitz-ID>": [0|1|2, …]}, "umpire_cons": [{"text": "<Contra>", "weight": 0|1|2}], "context_modifier": -2..2, "context_reason": "<Pflicht bei Modifikator ≠ 0>" | null, "probability": <Leiterstufe> | null, "inconsistent_with": "<Argument-ID>" | null, "public_rationale": "<öffentlich>" | null, "private_notes": "<nur Umpire>" | null, "on_success": [<Effekt>], "on_failure": [<Effekt>], "triggers_secret": "<Geheimnis-ID>" | null}], "conflicts": [{"a": "<ID>", "b": "<ID>"}], "standing": ["<Sitz-ID>", …]}
-Effekte: {"op": "add", "var": "<Track>", "by": <Schritt>} | {"op": "set", "var": "<Zustand>", "value": "<Wert>"} | {"op": "fact", "text": "<Fakt>", "audience": "public" | "seat:<id>" | "seat+umpire:<id>" | "umpire"} | {"op": "ongoing", "id": "<ID>", "text": "<Beschreibung>", "each_round": [<Effekt>]} | {"op": "stop_ongoing", "id": "<ID>"} | {"op": "project_advance", "id": "<Projekt>"} | {"op": "discover", "object": "<Objekt>"} | {"op": "breach", "object": "<Objekt>"} | {"op": "reveal_secret", "secret_id": "<ID>"}"#
+            r#"{"rulings": [{"argument_id": "<ID>", "verdict": "roll" | "no_roll" | "veto", "pro_weights": [0|1|2, …], "con_weights": {"<Sitz-ID>": [0|1|2, …]}, "umpire_cons": [{"text": "<Contra>", "weight": 0|1|2}], "context_modifier": -2..2, "context_reason": "<Pflicht bei Modifikator ≠ 0>" | null, "probability": <Leiterstufe> | null, "inconsistent_with": "<Argument-ID>" | null, "public_rationale": "<öffentlich>" | null, "private_notes": "<nur Umpire>" | null, "on_success": [<Effekt>], "on_failure": [<Effekt>], "triggers_secret": "<Geheimnis-ID>" | null, "precedent": {"principle": "<Maßstab in einem Satz, nur öffentlich Bekanntes>", "tags": ["<Schlagwort>", …]} | null}], "conflicts": [{"a": "<ID>", "b": "<ID>"}], "standing": ["<Sitz-ID>", …]}
+Effekte: {"op": "add", "var": "<Track>", "by": <Schritt>} | {"op": "set", "var": "<Zustand>", "value": "<Wert>"} | {"op": "fact", "text": "<Fakt>", "audience": "public" | "seat:<id>" | "seat+umpire:<id>" | "umpire"} | {"op": "ongoing", "id": "<ID>", "text": "<Beschreibung>", "each_round": [<Effekt>]} | {"op": "stop_ongoing", "id": "<ID>"} | {"op": "project_advance", "id": "<Projekt>"} | {"op": "discover", "object": "<Objekt>"} | {"op": "breach", "object": "<Objekt>"} | {"op": "reveal_secret", "secret_id": "<ID>"} | {"op": "raise_suspicion", "secret_id": "<ID>", "by": 1 | 2}"#
         }
         ContractKind::UmpireNarration => {
             r#"{"narrations": [{"argument_id": "<ID>", "audience": "public" | "seat:<id>" | "seat+umpire:<id>" | "umpire", "text": "<kurze Erzählung>"}], "round_summary": "<öffentliche Rundenzusammenfassung>" | null}"#
         }
         ContractKind::PlayerDebrief => {
             r#"{"wanted": "<was wolltest du>", "happened": "<was ist passiert>", "surprised": "<was hat dich überrascht>", "differently": "<was würdest du anders machen>"}"#
+        }
+        ContractKind::RedCellObjection => {
+            r#"{"target": "<ID des führenden öffentlichen Arguments dieser Runde>", "assumption": "<die tragende Annahme dieses Arguments>", "cons": ["<Contra gegen genau diese Annahme>", …]}  — oder ausdrücklich {"no_objection": true}"#
         }
         ContractKind::UmpireSynthesis => {
             r#"{"key_moments": ["<Wendepunkt>", …], "fork_rounds": [<Runde>, …], "plausibility": "<Plausibilitätscheck>" | null, "goal_ratings": [{"faction": "<Sitz-ID>", "goal": "<Ziel wörtlich>", "secret": false, "score": 0..3, "rationale": "<Begründung>"}], "summary": "<Zusammenfassung>" | null}"#
@@ -383,6 +392,108 @@ Dein Arbeitsordner enthält Unterlagen, die du mit den Datei-Werkzeugen lesen da
 - `paare/<a>+<b>/`: Unterlagen, die nur die Sitze `a` und `b` teilen (dort `mit-<partner>/`).\n\
 Nur `geteilt/` ist allen bekannt. Inhalte aus `schiedsrichter/`, `sitze/` und `paare/` sind privat und gehören nie in öffentliche Felder (öffentliche Begründungen, Erzählungen, Synthese); in öffentlichen Texten darfst du sie weder zitieren noch andeuten.\n\n";
 
+fn framing_text(profile: &BehaviorProfile) -> &'static str {
+    if profile.loss_framing {
+        "Deine Fraktion erlebt die Lage als drohenden Verlust gegenüber ihrem Bezugspunkt. Verluste wiegen für sie schwerer als gleich große Gewinne; um einen Verlust abzuwenden, nimmt sie mehr Risiko in Kauf, als sie es für einen Gewinn täte."
+    } else {
+        "Deine Fraktion sieht vor allem Chancen gegenüber ihrem Bezugspunkt. Einen sicheren Gewinn gibt sie ungern für einen unsicheren größeren auf."
+    }
+}
+
+fn behavior_section(profile: &BehaviorProfile, out: &mut String) {
+    out.push_str("## Dein Verhaltensprofil (vertraulich)\n");
+    out.push_str("So handelt deine Fraktion. Bleib diesem Profil treu, auch wenn ein anderer Zug kurzfristig klüger aussähe — das Spiel soll zeigen, wie dieser Akteur tatsächlich entscheidet.\n");
+    let _ = writeln!(
+        out,
+        "- Risikoneigung: {} ({:.2} auf einer Skala von 0 = meidet jedes Risiko bis 1 = sucht das Risiko).",
+        profile.risk_label(),
+        profile.risk
+    );
+    if let Some(anchor) = &profile.anchor {
+        let _ = writeln!(
+            out,
+            "- Bezugspunkt: {} — daran misst deine Fraktion Gewinn und Verlust.",
+            anchor.trim()
+        );
+    }
+    let _ = writeln!(out, "- Rahmung: {}", framing_text(profile));
+    if !profile.rules.is_empty() {
+        out.push_str("- Handlungsregeln:\n");
+        for r in &profile.rules {
+            let _ = writeln!(out, "  - {}", r.trim());
+        }
+    }
+    if !profile.red_lines.is_empty() {
+        out.push_str(
+            "- Rote Linien — diese Schritte tut deine Fraktion unter keinen Umständen, auch nicht verdeckt oder über Dritte:\n",
+        );
+        for r in &profile.red_lines {
+            let _ = writeln!(out, "  - {}", r.trim());
+        }
+    }
+    out.push_str("Das Profil ist privat: Es gehört nie in öffentliche Felder.\n\n");
+}
+
+fn behavior_reminder(profile: &BehaviorProfile, out: &mut String) {
+    out.push_str("## Erinnerung: dein Verhaltensprofil\n");
+    let mut parts = vec![format!(
+        "Risiko {} ({:.2})",
+        profile.risk_label(),
+        profile.risk
+    )];
+    parts.push(if profile.loss_framing {
+        "Verlustrahmung: Verluste abwenden wiegt schwerer als Gewinne".to_owned()
+    } else {
+        "Chancenrahmung: Gesichertes nicht leichtfertig riskieren".to_owned()
+    });
+    if let Some(anchor) = &profile.anchor {
+        parts.push(format!("Bezugspunkt: {}", anchor.trim()));
+    }
+    let _ = writeln!(out, "- {}", parts.join(" · "));
+    if !profile.red_lines.is_empty() {
+        let lines: Vec<&str> = profile.red_lines.iter().map(|l| l.trim()).collect();
+        let _ = writeln!(out, "- Rote Linien: {}", lines.join("; "));
+    }
+    out.push('\n');
+}
+
+fn red_cell_system(loaded: &LoadedScenario) -> String {
+    let scenario = &loaded.scenario;
+    let settings = scenario
+        .red_cell()
+        .cloned()
+        .unwrap_or_else(|| RedCellSettings {
+            enabled: true,
+            ..RedCellSettings::default()
+        });
+    let mut out = String::new();
+    language_hint(scenario, &mut out);
+    let _ = writeln!(
+        out,
+        "# Rolle\nDu bist die Red Cell im Matrix Game „{}“. Zweck des Spiels: {}\n\
+         Du bist keine Fraktion und hast keine Siegbedingung: Du gewinnst nichts und verlierst nichts. Deine Aufgabe ist, tragende Annahmen sichtbar und angreifbar zu machen, bevor die Würfel fallen — damit der Tisch keiner bequemen Erzählung aufsitzt.\n",
+        scenario.title(),
+        scenario.purpose().trim()
+    );
+    seat_table(scenario, None, &mut out);
+    out.push_str("## Was du weißt\nDu siehst nur Öffentliches: Lage, öffentliche Argumente, Contras, Urteile und Ergebnisse. Private Kanäle, geheime Ziele, verdeckte Werte und den Inhalt geheimer Argumente kennst du nicht — erfinde darüber nichts und spekuliere nicht darüber.\n\n");
+    let _ = writeln!(
+        out,
+        "## Vorgehen in der Gegenargument-Phase\n\
+         1. Bestimme das öffentliche Argument dieser Runde, das am ehesten durchgeht oder die Richtung des Spiels bestimmt (das führende Argument) — gleich, welche Fraktion es vorbringt.\n\
+         2. Benenne die eine Annahme, ohne die es zusammenbricht (`assumption`): das Fundament, nicht ein Detail.\n\
+         3. Greife genau diese Annahme mit sachlichen, plausiblen Contras an (`cons`, höchstens {}).\n\
+         4. Findest du keine tragfähige Schwachstelle, antworte ehrlich mit `{{\"no_objection\": true}}` — ein erzwungener Einwand schadet mehr als keiner.\n\
+         Ton: {} (Schärfe {:.2} von 1). Du bleibst fair: keine Polemik, keine Unterstellungen, keine erfundenen Fakten. Der Umpire gewichtet deine Contras wie alle anderen.\n",
+        settings.max_cons(),
+        settings.sharpness_label(),
+        settings.sharpness
+    );
+    out.push_str("## Vertraulichkeit\nAlles, was du schreibst, ist öffentlich. Du hast keine privaten Felder und brauchst keine.\n\n");
+    contracts_section(&[ContractKind::RedCellObjection], &mut out);
+    out
+}
+
 fn player_system(loaded: &LoadedScenario, player: &PlayerId, market: bool) -> String {
     let scenario = &loaded.scenario;
     let name = scenario.display_name(player);
@@ -424,6 +535,9 @@ fn player_system(loaded: &LoadedScenario, player: &PlayerId, market: bool) -> St
         business_context(b, &mut out);
     }
     own_brief(scenario, player, &mut out);
+    if let Some(profile) = scenario.behavior_of(player) {
+        behavior_section(&profile, &mut out);
+    }
     seat_table(scenario, Some(player), &mut out);
 
     out.push_str("## Was du weißt\nDu kennst ausschließlich, was in deinem Lagebild und deinem Protokoll steht. Andere Sitze haben eigene, teils geheime Ziele und können privat miteinander sprechen, ohne dass du davon erfährst. Erfinde kein Wissen über fremde geheime Ziele, Absprachen oder verdeckte Werte.\n\n");
@@ -508,7 +622,15 @@ fn umpire_system(loaded: &LoadedScenario) -> String {
 - Konsistenz: Achte auf frühere erfolgreiche Argumente, laufende Effekte und Projekte; melde Widersprüche (`inconsistent_with`), statt sie still zu übergehen.\n\
 - Geheime Argumente: `umpire_cons` statt `con_weights`, `public_rationale` bleibt `null`.\n\
 - Erzählen: kurz und konkret, Ergebnis gemäß Würfelgrad, keine neuen Zustandsänderungen.\n\
-- Spielende: Du wechselst in die Rolle des Seminarleiters — Muster, Wendepunkte, Alternativen und Bezug zum Zweck.\n\n");
+- Spielende: Du wechselst in die Rolle des Seminarleiters — Muster, Wendepunkte, Alternativen und Bezug zum Zweck.\n\
+- Präzedenzfälle: Setzt dein Urteil über ein öffentliches Argument einen Maßstab, den du künftig wieder anlegen willst, markiere es mit `precedent` (ein Satz, 1–5 Schlagworte; nur öffentlich Bekanntes). Einschlägige frühere Maßstäbe stehen in deinem Auftrag; weichst du von einem ab, begründe es.\n\
+- Verdachtsleiter: Mit `raise_suspicion` (1–2 Stufen, nur in Urteilen über öffentliche Argumente) wird ein geheimes Argument sichtbarer: unbemerkt → Gerücht → Verdacht → Belege → aufgeflogen. Öffentlich erscheint nur eine feste Standardzeile; auf der obersten Stufe wird das Geheimnis offengelegt.\n\n");
+    if scenario.red_cell().is_some() {
+        let _ = writeln!(
+            out,
+            "## Red Cell\nEin zusätzlicher Sitz ohne eigene Ziele greift in der Gegenargument-Phase die tragende Annahme eines öffentlichen Arguments an. Ihre Contras gewichtest du in `con_weights` unter dem Schlüssel `{RED_CELL_KEY}` — nüchtern wie jedes andere Contra. Sie ist kein Spieler und gehört nicht in `standing`.\n"
+        );
+    }
     rules_section(scenario, SeatRole::Umpire, &mut out);
     out.push_str(CONFIDENTIALITY);
     out.push_str("\n- Was du nur als Umpire oder aus geheimen Argumenten weißt, darf in öffentlichen Texten weder zitiert noch angedeutet werden. Öffentliche Begründungen stützen sich nur auf öffentlich Bekanntes. Private Verhandlungen erwähnst du nie — nicht einmal, dass sie stattfanden.\n\n");
@@ -538,6 +660,7 @@ pub fn system_prompt(role: SeatRole, loaded: &LoadedScenario, seat: Option<&Seat
     };
     match (role, player) {
         (SeatRole::Umpire, _) => umpire_system(loaded),
+        (SeatRole::RedCell, _) => red_cell_system(loaded),
         (SeatRole::Player, Some(p)) => player_system(loaded, &p, false),
         (SeatRole::Market, Some(p)) => player_system(loaded, &p, true),
         (SeatRole::Player | SeatRole::Market, None) => player_system(
@@ -697,6 +820,7 @@ fn render_kind(kind: &EntryKind, me: &Seat) -> String {
             let seat = match seat {
                 Seat::Player(p) => who(me, p),
                 Seat::Umpire => "Umpire".to_owned(),
+                Seat::RedCell => "Red Cell".to_owned(),
             };
             match intent {
                 Some(i) => format!("{seat} bestätigt das Briefing; Absicht: {i}"),
@@ -873,6 +997,7 @@ fn render_kind(kind: &EntryKind, me: &Seat) -> String {
                 RevealedBy::Facilitator => "durch den Facilitator".to_owned(),
                 RevealedBy::GameEnd => "zum Spielende".to_owned(),
                 RevealedBy::Effect(e) => format!("durch Effekt {e}"),
+                RevealedBy::Suspicion(c) => format!("Verdachtsleiter, zuletzt {c}"),
             };
             format!(
                 "Geheimnis {secret_id} offengelegt ({by}): {}",
@@ -890,6 +1015,48 @@ fn render_kind(kind: &EntryKind, me: &Seat) -> String {
             format!("Facilitator ({command}): {detail}")
         }
         EntryKind::GameEnded { reason } => format!("Spielende: {reason}"),
+        EntryKind::BehaviorBriefing { faction, profile } => {
+            let mut s = format!(
+                "Verhaltensprofil {}: Risiko {} ({:.2})",
+                who(me, faction),
+                profile.risk_label(),
+                profile.risk
+            );
+            if profile.loss_framing {
+                s.push_str(" | Verlustrahmung");
+            }
+            if let Some(a) = &profile.anchor {
+                let _ = write!(s, " | Bezugspunkt: {a}");
+            }
+            if !profile.rules.is_empty() {
+                let _ = write!(s, " | Regeln: {}", profile.rules.join("; "));
+            }
+            if !profile.red_lines.is_empty() {
+                let _ = write!(s, " | rote Linien: {}", profile.red_lines.join("; "));
+            }
+            s
+        }
+        EntryKind::RedCellObjection {
+            target,
+            assumption,
+            cons,
+        } => match target {
+            Some(t) => format!(
+                "Red Cell gegen {t}: Kernannahme „{}“ | Contras: {}",
+                assumption.as_deref().unwrap_or("—"),
+                numbered(cons)
+            ),
+            None => "Die Red Cell erhebt keinen Einwand.".to_owned(),
+        },
+        EntryKind::SuspicionRaised { text, .. } => format!("Verdachtsleiter: {text}"),
+        EntryKind::PrecedentSet { precedent } => format!(
+            "Präzedenzfall {} zu {}: {} (Schlagworte: {})",
+            precedent.id,
+            precedent.argument_id,
+            precedent.principle,
+            precedent.tags.join(", ")
+        ),
+        EntryKind::InjectPackageSelected { .. } => "Interner Vermerk.".to_owned(),
     }
 }
 
@@ -1035,6 +1202,13 @@ fn situation_section(view: &SeatView, me: &Seat, out: &mut String) {
     if !projects.is_empty() {
         let _ = writeln!(out, "### Vorhaben\n- {}", projects.join("\n- "));
     }
+    let suspicion = suspicion_overview(view);
+    if suspicion
+        .values()
+        .any(|l| !matches!(l, SuspicionLevel::Unknown | SuspicionLevel::Revealed))
+    {
+        let _ = writeln!(out, "### Verdachtslage\n- {}", suspicion_line(&suspicion));
+    }
     if matches!(me, Seat::Player(_)) {
         let channels = channels_of(view, me);
         if !channels.is_empty() {
@@ -1045,6 +1219,36 @@ fn situation_section(view: &SeatView, me: &Seat, out: &mut String) {
         }
     }
     out.push('\n');
+}
+
+/// Verdachtsleiter aller öffentlich angekündigten Geheimnisse laut Projektion.
+fn suspicion_overview(view: &SeatView) -> BTreeMap<String, SuspicionLevel> {
+    let mut levels = BTreeMap::new();
+    for e in view.entries() {
+        match &e.kind {
+            EntryKind::SecretArgumentAnnounced { secret_id, .. } => {
+                levels
+                    .entry(secret_id.clone())
+                    .or_insert(SuspicionLevel::Unknown);
+            }
+            EntryKind::SuspicionRaised { secret_id, to, .. } => {
+                levels.insert(secret_id.clone(), *to);
+            }
+            EntryKind::SecretRevealed { secret_id, .. } => {
+                levels.insert(secret_id.clone(), SuspicionLevel::Revealed);
+            }
+            _ => {}
+        }
+    }
+    levels
+}
+
+fn suspicion_line(levels: &BTreeMap<String, SuspicionLevel>) -> String {
+    levels
+        .iter()
+        .map(|(id, level)| format!("#{id} {}", level.label()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn round_arguments(view: &SeatView, round: u32) -> Vec<(String, PlayerId, bool)> {
@@ -1197,6 +1401,58 @@ fn task_section(view: &SeatView, call: &ExpectedCall, me: &Seat, out: &mut Strin
             if !vars.is_empty() {
                 let _ = writeln!(out, "Weltgrößen für Effekte: {}", vars.join(", "));
             }
+            let red_cell: Vec<String> = view
+                .entries()
+                .iter()
+                .filter(|e| e.round == round)
+                .filter_map(|e| match &e.kind {
+                    EntryKind::RedCellObjection {
+                        target: Some(t), ..
+                    } => Some(format!("`{t}`")),
+                    _ => None,
+                })
+                .collect();
+            if !red_cell.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "Contras der Red Cell (Schlüssel `{RED_CELL_KEY}` in `con_weights`, nicht in `standing`): gegen {}",
+                    red_cell.join(", ")
+                );
+            }
+            let open: BTreeMap<String, SuspicionLevel> = suspicion_overview(view)
+                .into_iter()
+                .filter(|(_, l)| *l != SuspicionLevel::Revealed)
+                .collect();
+            if !open.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "Verdachtsleiter offener Geheimnisse (`raise_suspicion`): {}",
+                    suspicion_line(&open)
+                );
+            }
+            let precedents = relevant_precedents(view, round, MAX_RELEVANT_PRECEDENTS);
+            if !precedents.is_empty() {
+                out.push_str("Einschlägige Präzedenzfälle (Maßstäbe früherer Urteile — lege sie wieder an oder begründe die Abweichung):\n");
+                for r in &precedents {
+                    let p = &r.precedent;
+                    let _ = writeln!(
+                        out,
+                        "- {} (Runde {}, `{}`, Netto {:+}, {} %): {} [{}] → betrifft {}",
+                        p.id,
+                        p.round,
+                        p.argument_id,
+                        p.net,
+                        p.probability_pct,
+                        p.principle,
+                        p.tags.join(", "),
+                        r.arguments
+                            .iter()
+                            .map(|a| format!("`{a}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+            }
         }
         ContractKind::UmpireNarration => {
             out.push_str("Erzähle die Ergebnisse dieser Runde (Aufruf B, nach dem Wurf): kurz, konkret, gemäß Ergebnis und Grad, ohne neue Zustandsänderungen. Die Audience einer Erzählung ist nie weiter als die des Arguments; geheime Argumente erzählst du nur `seat+umpire:<id>`.\n");
@@ -1223,6 +1479,19 @@ fn task_section(view: &SeatView, call: &ExpectedCall, me: &Seat, out: &mut Strin
                 out.push_str("Ergebnisse: keine\n");
             } else {
                 let _ = writeln!(out, "Ergebnisse: {}", results.join(", "));
+            }
+        }
+        ContractKind::RedCellObjection => {
+            let targets: Vec<String> = round_arguments(view, round)
+                .into_iter()
+                .filter(|(_, _, secret)| !secret)
+                .map(|(id, seat, _)| format!("`{id}` ({seat})"))
+                .collect();
+            out.push_str("Wähle das führende öffentliche Argument dieser Runde, benenne seine tragende Annahme und greife genau diese an (Höchstzahl der Contras: siehe deine Rolle). Hast du nichts Tragfähiges, antworte mit `{\"no_objection\": true}`.\n");
+            if targets.is_empty() {
+                out.push_str("Öffentliche Argumente: keine — antworte mit `{\"no_objection\": true}`.\n");
+            } else {
+                let _ = writeln!(out, "Öffentliche Argumente: {}", targets.join(", "));
             }
         }
         ContractKind::PlayerDebrief => out.push_str(
@@ -1257,6 +1526,15 @@ pub fn turn_prompt(
     let (round, phase) = cursor_of(view);
     let mut out = String::new();
     let _ = writeln!(out, "# Runde {round} — Phase {}\n", phase.label());
+    if let Seat::Player(p) = &me {
+        let own = view.entries().iter().find_map(|e| match &e.kind {
+            EntryKind::BehaviorBriefing { faction, profile } if faction == p => Some(profile),
+            _ => None,
+        });
+        if let Some(profile) = own {
+            behavior_reminder(profile, &mut out);
+        }
+    }
     if situation_report {
         situation_section(view, &me, &mut out);
     }

@@ -2214,10 +2214,10 @@ pub(crate) fn build_plan_services(
 /// # Description
 /// Nur noch Testhilfe: Produktionspfade finden Operationen über
 /// [`harw_runtime::RuntimeAssembly::operations`]. Dieselbe [`PlanToolConfig`],
-/// die [`build_plan_services`] bekommen hat, gated hier die sechs
+/// die [`build_plan_services`] bekommen hat, gated hier die sieben
 /// Planungs-Operationen. Ist sie abgeschaltet, erscheinen `plan`, `goal`,
-/// `explore`, `research_deps`, `research_web` und `analyze` gar nicht erst in
-/// der Werkzeugliste.
+/// `explore`, `research`, `research_deps`, `research_web` und `analyze` gar
+/// nicht erst in der Werkzeugliste.
 ///
 /// # Arguments
 /// - `config` (`&PlanToolConfig`): das Gate; geliehen.
@@ -3608,6 +3608,7 @@ mod tests {
             "/plan",
             "/goal",
             "/explore",
+            "/research",
             "/research-deps",
             "/research-web",
             "/analyze",
@@ -3621,7 +3622,7 @@ mod tests {
     }
 
     #[test]
-    fn enabled_plan_surface_registers_six_operations_and_four_services() -> TestResult {
+    fn enabled_plan_surface_registers_seven_operations_and_four_services() -> TestResult {
         let config = PlanToolConfig::enabled_defaults();
         let (_home, services) = plan_services_over_temp_home(&config)?;
 
@@ -3636,6 +3637,7 @@ mod tests {
             "plan",
             "goal",
             "explore",
+            "research",
             "research_deps",
             "research_web",
             "analyze",

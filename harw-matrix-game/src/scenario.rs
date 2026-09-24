@@ -23,7 +23,8 @@ use crate::commitments::{DOMAIN, from_hex, sha256_parts, to_hex};
 use crate::error::{MatrixError, MatrixResult};
 use crate::phases::{EffectContext, EffectOp, validate_effects};
 use crate::state::{
-    Audience, AudienceSpec, Ongoing, PlayerId, Seat, SecretRecord, VarValue, WorldVar,
+    Audience, AudienceSpec, Ongoing, PlayerId, Seat, SecretRecord, SuspicionLevel, VarValue,
+    WorldVar,
 };
 
 /// Schema-Kennung, die jedes Szenario tragen muss.
@@ -34,6 +35,21 @@ pub const PLAYER_SEATS: usize = 4;
 
 /// Höchstzahl Ziele je Kategorie und Fraktion.
 pub const MAX_GOALS: usize = 4;
+
+/// Reservierte Kennung der Red Cell (Schlüssel ihrer Contras in
+/// `con_weights`); keine Fraktion und kein Team darf so heißen.
+pub const RED_CELL_KEY: &str = "red_cell";
+
+/// Höchstzahl Verhaltensregeln je Profil.
+pub const MAX_BEHAVIOR_RULES: usize = 6;
+/// Mindestzahl roter Linien eines Verhaltensprofils.
+pub const MIN_RED_LINES: usize = 2;
+/// Höchstzahl roter Linien eines Verhaltensprofils.
+pub const MAX_RED_LINES: usize = 5;
+/// Zeichenlimit je Profiltext.
+pub const MAX_BEHAVIOR_TEXT: usize = 300;
+/// Höchstzahl Injects, die ein Lauf aus einem Paket zieht.
+pub const MAX_PACKAGE_INJECTS: usize = 3;
 
 /// Ab dieser Track-Zahl warnt die Validierung (Sabin: einfach halten).
 pub const TRACK_WARNING_THRESHOLD: usize = 10;
@@ -433,6 +449,201 @@ pub struct ModelSettings {
 }
 
 // ---------------------------------------------------------------------------
+// Verhaltensprofil, Red Cell, Inject-Bibliothek
+// ---------------------------------------------------------------------------
+
+fn default_risk() -> f64 {
+    0.5
+}
+
+/// Verhaltensprofil einer Fraktion bzw. eines Teams
+/// (`[factions.behavior]` bzw. `[teams.behavior]` direkt unter dem
+/// jeweiligen Eintrag). Es ist privat: Es steht im System-Prompt dieses
+/// Sitzes, als Kurz-Erinnerung in jedem seiner Zug-Prompts und im AAR —
+/// sonst nirgends.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BehaviorProfile {
+    /// Handlungsregeln („Wir eskalieren nie als Erste.“).
+    #[serde(default)]
+    pub rules: Vec<String>,
+    /// Risikoneigung 0 (meidet jedes Risiko) bis 1 (sucht das Risiko).
+    #[serde(default = "default_risk")]
+    pub risk: f64,
+    /// Verlustrahmung: Die Lage wird als drohender Verlust gegenüber dem
+    /// Bezugspunkt erlebt; Verluste wiegen schwerer als gleich große Gewinne.
+    #[serde(default)]
+    pub loss_framing: bool,
+    /// Bezugspunkt, an dem die Fraktion Erfolg und Verlust misst.
+    #[serde(default)]
+    pub anchor: Option<String>,
+    /// Rote Linien, die die Fraktion nicht überschreitet (mindestens 2).
+    #[serde(default)]
+    pub red_lines: Vec<String>,
+}
+
+// `risk` wird auf einen endlichen Wert in [0, 1] validiert (kein NaN).
+impl Eq for BehaviorProfile {}
+
+impl BehaviorProfile {
+    /// Deutsche Einordnung der Risikoneigung.
+    #[must_use]
+    pub fn risk_label(&self) -> &'static str {
+        match self.risk {
+            r if r < 0.2 => "sehr vorsichtig",
+            r if r < 0.4 => "vorsichtig",
+            r if r <= 0.6 => "abwägend",
+            r if r <= 0.8 => "risikobereit",
+            _ => "sehr risikobereit",
+        }
+    }
+}
+
+fn check_behavior_text(text: &str, label: &str, errors: &mut Vec<String>) {
+    if text.trim().is_empty() {
+        errors.push(format!("{label}: leer"));
+    }
+    let n = text.chars().count();
+    if n > MAX_BEHAVIOR_TEXT {
+        errors.push(format!("{label}: {n} Zeichen (max. {MAX_BEHAVIOR_TEXT})"));
+    }
+}
+
+fn validate_behavior(profile: &BehaviorProfile, context: &str, errors: &mut Vec<String>) {
+    if !profile.risk.is_finite() || !(0.0..=1.0).contains(&profile.risk) {
+        errors.push(format!(
+            "{context}: behavior.risk = {} (erlaubt 0..=1)",
+            profile.risk
+        ));
+    }
+    if profile.rules.len() > MAX_BEHAVIOR_RULES {
+        errors.push(format!(
+            "{context}: behavior.rules hat mehr als {MAX_BEHAVIOR_RULES} Einträge"
+        ));
+    }
+    for (i, rule) in profile.rules.iter().enumerate() {
+        check_behavior_text(rule, &format!("{context}: behavior.rules[{i}]"), errors);
+    }
+    if let Some(anchor) = &profile.anchor {
+        check_behavior_text(anchor, &format!("{context}: behavior.anchor"), errors);
+    }
+    if !(MIN_RED_LINES..=MAX_RED_LINES).contains(&profile.red_lines.len()) {
+        errors.push(format!(
+            "{context}: behavior.red_lines braucht {MIN_RED_LINES}–{MAX_RED_LINES} Einträge, gefunden {}",
+            profile.red_lines.len()
+        ));
+    }
+    for (i, line) in profile.red_lines.iter().enumerate() {
+        check_behavior_text(line, &format!("{context}: behavior.red_lines[{i}]"), errors);
+    }
+}
+
+fn default_sharpness() -> f64 {
+    0.5
+}
+
+/// Optionaler Red-Cell-Sitz (`[red_cell]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RedCellSettings {
+    /// Aktiv.
+    pub enabled: bool,
+    /// Schärfe 0 (sachlich-knapp) bis 1 (bohrend); bestimmt Ton und die
+    /// Höchstzahl Contras (1–3).
+    #[serde(default = "default_sharpness")]
+    pub sharpness: f64,
+}
+
+impl Default for RedCellSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sharpness: default_sharpness(),
+        }
+    }
+}
+
+// `sharpness` wird auf einen endlichen Wert in [0, 1] validiert (kein NaN).
+impl Eq for RedCellSettings {}
+
+impl RedCellSettings {
+    /// Höchstzahl Contras eines Einwands: 1 bei geringer, 3 bei hoher Schärfe.
+    #[must_use]
+    pub fn max_cons(&self) -> usize {
+        let s = if self.sharpness.is_finite() {
+            self.sharpness.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if s < 1.0 / 3.0 {
+            1
+        } else if s < 2.0 / 3.0 {
+            2
+        } else {
+            3
+        }
+    }
+
+    /// Deutsche Einordnung der Schärfe.
+    #[must_use]
+    pub fn sharpness_label(&self) -> &'static str {
+        match self.max_cons() {
+            1 => "sachlich und knapp",
+            2 => "direkt und fordernd",
+            _ => "bohrend und unnachgiebig",
+        }
+    }
+}
+
+/// Ein Inject der Bibliothek.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageInject {
+    /// Kennung (eindeutig über alle Injects des Szenarios).
+    pub id: String,
+    /// Audience (`public`, `seat:x`, `seat+umpire:x`, `pair:a,b`, `umpire`).
+    #[serde(default)]
+    pub audience: AudienceSpec,
+    /// Text.
+    pub text: String,
+    /// Effekte.
+    #[serde(default)]
+    pub effects: Vec<EffectOp>,
+    /// Früheste Runde (Default 1).
+    #[serde(default)]
+    pub earliest: Option<u32>,
+    /// Späteste Runde (Default letzte Runde).
+    #[serde(default)]
+    pub latest: Option<u32>,
+    /// Öffentlich mit Urheber „Facilitator“.
+    #[serde(default)]
+    pub attributed: bool,
+}
+
+fn default_package_max() -> usize {
+    MAX_PACKAGE_INJECTS
+}
+
+/// Varianz-Paket der Inject-Bibliothek (`[[inject_packages]]`). Ein Lauf
+/// zieht seed-deterministisch höchstens drei Injects daraus, nie zwei in
+/// derselben Runde ([`crate::library`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InjectPackage {
+    /// Kennung.
+    pub id: String,
+    /// Anzeigename.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Höchstzahl gezogener Injects (1–3).
+    #[serde(default = "default_package_max")]
+    pub max_injects: usize,
+    /// Kandidaten.
+    #[serde(default)]
+    pub injects: Vec<PackageInject>,
+}
+
+// ---------------------------------------------------------------------------
 // Klassischer Modus
 // ---------------------------------------------------------------------------
 
@@ -555,6 +766,9 @@ pub struct Faction {
     /// Machtmittel.
     #[serde(default)]
     pub assets: Vec<String>,
+    /// Verhaltensprofil (optional, privat).
+    #[serde(default)]
+    pub behavior: Option<BehaviorProfile>,
 }
 
 /// Sitzordnung (`[seating]`).
@@ -635,6 +849,12 @@ pub struct ClassicScenario {
     /// Unterlagen-Ordner (optional).
     #[serde(default)]
     pub materials: Option<MaterialsSpec>,
+    /// Red-Cell-Sitz (optional).
+    #[serde(default)]
+    pub red_cell: Option<RedCellSettings>,
+    /// Inject-Bibliothek mit Varianz-Paketen (optional).
+    #[serde(default)]
+    pub inject_packages: Vec<InjectPackage>,
 }
 
 fn default_rounds() -> u32 {
@@ -911,6 +1131,9 @@ pub struct Team {
     /// Bewertungsskala des Marktteams.
     #[serde(default)]
     pub assessment_scale: Option<Vec<i64>>,
+    /// Verhaltensprofil (optional, privat).
+    #[serde(default)]
+    pub behavior: Option<BehaviorProfile>,
 }
 
 /// `[channels]`.
@@ -1041,6 +1264,12 @@ pub struct BusinessScenario {
     /// Unterlagen-Ordner (optional).
     #[serde(default)]
     pub materials: Option<MaterialsSpec>,
+    /// Red-Cell-Sitz (optional).
+    #[serde(default)]
+    pub red_cell: Option<RedCellSettings>,
+    /// Inject-Bibliothek mit Varianz-Paketen (optional).
+    #[serde(default)]
+    pub inject_packages: Vec<InjectPackage>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,6 +1331,14 @@ pub fn materials_for_seat(seat: &Seat) -> MaterialsSelection {
             all_seats: true,
             all_pairs: true,
             umpire: true,
+        },
+        Seat::RedCell => MaterialsSelection {
+            shared: true,
+            own: None,
+            pairs_with: false,
+            all_seats: false,
+            all_pairs: false,
+            umpire: false,
         },
     }
 }
@@ -1173,6 +1410,8 @@ pub struct FactionInfo {
     pub assets: Vec<String>,
     /// Private Zusatzinformation (Gamebook-Verweis).
     pub private_brief: Option<String>,
+    /// Verhaltensprofil (privat).
+    pub behavior: Option<BehaviorProfile>,
 }
 
 /// Für eine Runde fälliges Inject in modusunabhängiger Form.
@@ -1274,6 +1513,34 @@ impl Scenario {
         }
     }
 
+    /// Red-Cell-Einstellungen, nur wenn `[red_cell] enabled = true`.
+    #[must_use]
+    pub fn red_cell(&self) -> Option<&RedCellSettings> {
+        let settings = match self {
+            Self::Classic(s) => s.red_cell.as_ref(),
+            Self::Business(s) => s.red_cell.as_ref(),
+        };
+        settings.filter(|r| r.enabled)
+    }
+
+    /// Inject-Bibliothek (`[[inject_packages]]`).
+    #[must_use]
+    pub fn inject_packages(&self) -> &[InjectPackage] {
+        match self {
+            Self::Classic(s) => &s.inject_packages,
+            Self::Business(s) => &s.inject_packages,
+        }
+    }
+
+    /// Verhaltensprofil eines Sitzes.
+    #[must_use]
+    pub fn behavior_of(&self, player: &PlayerId) -> Option<BehaviorProfile> {
+        self.factions()
+            .into_iter()
+            .find(|f| &f.id == player)
+            .and_then(|f| f.behavior)
+    }
+
     /// Sichtbarkeitsoptionen.
     #[must_use]
     pub fn visibility(&self) -> &VisibilitySettings {
@@ -1333,6 +1600,7 @@ impl Scenario {
                             secret_goals: f.goals.secret.clone(),
                             assets: f.assets.clone(),
                             private_brief: None,
+                            behavior: f.behavior.clone(),
                         });
                     }
                 }
@@ -1350,6 +1618,7 @@ impl Scenario {
                     secret_goals: Vec::new(),
                     assets: Vec::new(),
                     private_brief: t.strategy_brief.clone(),
+                    behavior: t.behavior.clone(),
                 })
                 .collect(),
         }
@@ -1428,6 +1697,7 @@ impl Scenario {
             }
         }
         self.validate_injects_effects(&mut errors);
+        self.validate_extensions(&mut errors, &mut warnings);
         if errors.is_empty() {
             Ok(warnings)
         } else {
@@ -1443,6 +1713,7 @@ impl Scenario {
             .collect();
         let ongoing: BTreeMap<String, Ongoing> = BTreeMap::new();
         let secrets: BTreeMap<String, SecretRecord> = BTreeMap::new();
+        let suspicion: BTreeMap<String, SuspicionLevel> = BTreeMap::new();
         let players = self.seat_order();
         for round in 1..=self.rounds() {
             for inject in self.injects_for_round(round) {
@@ -1451,6 +1722,7 @@ impl Scenario {
                         vars: &vars,
                         ongoing: &ongoing,
                         secrets: &secrets,
+                        suspicion: &suspicion,
                         players: &players,
                         rules: self.rules(),
                         argument_audience: audience.clone(),
@@ -1462,6 +1734,120 @@ impl Scenario {
                             inject.id, violation.index, violation.reason
                         ));
                     }
+                }
+            }
+        }
+    }
+}
+
+impl Scenario {
+    /// Verhaltensprofile, Red Cell und Inject-Bibliothek.
+    fn validate_extensions(&self, errors: &mut Vec<String>, warnings: &mut Vec<String>) {
+        let players = self.seat_order();
+        for f in self.factions() {
+            if f.id.as_str() == RED_CELL_KEY {
+                errors.push(format!(
+                    "Sitz-ID `{RED_CELL_KEY}` ist für die Red Cell reserviert"
+                ));
+            }
+            if let Some(profile) = &f.behavior {
+                validate_behavior(profile, &format!("Fraktion `{}`", f.id), errors);
+            }
+        }
+        let red_cell = match self {
+            Self::Classic(s) => s.red_cell.as_ref(),
+            Self::Business(s) => s.red_cell.as_ref(),
+        };
+        if let Some(rc) = red_cell {
+            if !rc.sharpness.is_finite() || !(0.0..=1.0).contains(&rc.sharpness) {
+                errors.push(format!(
+                    "red_cell.sharpness = {} (erlaubt 0..=1)",
+                    rc.sharpness
+                ));
+            }
+            if rc.enabled && self.rules().argument_system != ArgumentSystem::ProsCons {
+                errors.push(
+                    "red_cell braucht argument_system = \"pros_cons\" (Gegenargument-Phase)"
+                        .to_owned(),
+                );
+            }
+        }
+
+        let mut inject_ids: BTreeSet<String> = match self {
+            Self::Classic(s) => s.injects.iter().map(|i| i.id.clone()).collect(),
+            Self::Business(s) => s.injects.iter().map(|i| i.id.clone()).collect(),
+        };
+        let mut package_ids = BTreeSet::new();
+        let rounds = self.rounds();
+        let vars: BTreeMap<String, WorldVar> = self
+            .initial_vars()
+            .into_iter()
+            .map(|v| (v.id.clone(), v))
+            .collect();
+        let ongoing: BTreeMap<String, Ongoing> = BTreeMap::new();
+        let secrets: BTreeMap<String, SecretRecord> = BTreeMap::new();
+        let suspicion: BTreeMap<String, SuspicionLevel> = BTreeMap::new();
+        for package in self.inject_packages() {
+            let ctx_label = format!("inject_packages `{}`", package.id);
+            check_id(&package.id, "inject_packages.id", errors);
+            if !package_ids.insert(package.id.as_str()) {
+                errors.push(format!("{ctx_label} doppelt"));
+            }
+            if !(1..=MAX_PACKAGE_INJECTS).contains(&package.max_injects) {
+                errors.push(format!(
+                    "{ctx_label}: max_injects = {} (erlaubt 1..={MAX_PACKAGE_INJECTS})",
+                    package.max_injects
+                ));
+            }
+            if package.injects.is_empty() {
+                errors.push(format!("{ctx_label}: keine Injects"));
+            } else if package.injects.len() < package.max_injects {
+                warnings.push(format!(
+                    "{ctx_label}: nur {} Kandidaten für max_injects = {} — keine Varianz in der Auswahl",
+                    package.injects.len(),
+                    package.max_injects
+                ));
+            }
+            for inject in &package.injects {
+                let label = format!("{ctx_label} Inject `{}`", inject.id);
+                check_id(&inject.id, &label, errors);
+                if !inject_ids.insert(inject.id.clone()) {
+                    errors.push(format!("{label}: ID doppelt"));
+                }
+                if inject.text.trim().is_empty() {
+                    errors.push(format!("{label}: text leer"));
+                }
+                let earliest = inject.earliest.unwrap_or(1);
+                let latest = inject.latest.unwrap_or(rounds);
+                if earliest == 0 || latest > rounds || earliest > latest {
+                    errors.push(format!(
+                        "{label}: Rundenfenster {earliest}..={latest} liegt nicht in 1..={rounds}"
+                    ));
+                }
+                let audience = &inject.audience.0;
+                if matches!(audience, Audience::ObserverOnly) {
+                    errors.push(format!("{label}: audience `observer` ist unzulässig"));
+                }
+                for p in audience.players() {
+                    if !players.contains(p) {
+                        errors.push(format!("{label}: unbekannter Sitz `{p}`"));
+                    }
+                }
+                let ctx = EffectContext {
+                    vars: &vars,
+                    ongoing: &ongoing,
+                    secrets: &secrets,
+                    suspicion: &suspicion,
+                    players: &players,
+                    rules: self.rules(),
+                    argument_audience: audience.clone(),
+                    secret_owner: None,
+                };
+                for violation in validate_effects(&ctx, &inject.effects) {
+                    errors.push(format!(
+                        "{label} effects[{}]: {}",
+                        violation.index, violation.reason
+                    ));
                 }
             }
         }

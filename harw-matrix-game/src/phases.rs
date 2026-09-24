@@ -17,13 +17,14 @@ use serde::{Deserialize, Serialize};
 use crate::commitments::{DOMAIN, Salt, commit, sha256_parts, to_hex, verify};
 use crate::dice::{self, DiceSystem, Outcome, RollKind};
 use crate::error::{MatrixError, MatrixResult};
+use crate::precedents::{Precedent, PrecedentFlag, check_precedent_flag, normalize_tag};
 use crate::scenario::{
-    AdjudicationSystem, ArgumentSystem, Ending, LoadedScenario, Rules, Scenario, ScheduledInject,
-    TurnOrder, VarVisibility,
+    AdjudicationSystem, ArgumentSystem, Ending, LoadedScenario, RED_CELL_KEY, RedCellSettings,
+    Rules, Scenario, ScheduledInject, TurnOrder, VarVisibility,
 };
 use crate::state::{
     Audience, AudienceSpec, EntryKind, GameEntry, GameLog, GameState, Ongoing, PlayerId,
-    RevealedBy, Seat, SecretRecord, VarValue, WorldVar,
+    RevealedBy, Seat, SecretRecord, SuspicionLevel, VarValue, WorldVar,
 };
 
 // ---------------------------------------------------------------------------
@@ -182,6 +183,8 @@ pub enum ContractKind {
     PlayerDebrief,
     /// Umpire-Synthese im AAR.
     UmpireSynthesis,
+    /// Einwand der Red Cell (Gegenargument-Phase).
+    RedCellObjection,
 }
 
 /// Teilschritt innerhalb einer Phase.
@@ -208,7 +211,9 @@ pub struct ExpectedCall {
 /// Aufrufmenge einer Phase in kanonischer Reihenfolge. Rust-Phasen
 /// (Setup, Veröffentlichung, Rundenende) haben keine Aufrufe. In einem
 /// Verhandlungsaustausch werden nur Sitze mit offenem Kanal aufgerufen — die
-/// Aufrufzahl eines Sitzes hängt nur von seinen eigenen Kanälen ab.
+/// Aufrufzahl eines Sitzes hängt nur von seinen eigenen Kanälen ab. Mit
+/// `red_cell` (aktive `[red_cell]`, siehe [`Scenario::red_cell`]) folgt in der
+/// Gegenargument-Phase nach allen Spielern ein Aufruf der Red Cell.
 #[must_use]
 pub fn expected_calls(
     phase: Phase,
@@ -216,6 +221,7 @@ pub fn expected_calls(
     players: &[PlayerId],
     channel_members: &BTreeSet<PlayerId>,
     rules: &Rules,
+    red_cell: bool,
 ) -> Vec<ExpectedCall> {
     let each = |contract: ContractKind| -> Vec<ExpectedCall> {
         players
@@ -251,7 +257,14 @@ pub fn expected_calls(
             .collect(),
         (Phase::Argumente, _) => each(ContractKind::PlayerArgument),
         (Phase::Gegenargumente, _) if rules.argument_system == ArgumentSystem::ProsCons => {
-            each(ContractKind::CounterArgument)
+            let mut calls = each(ContractKind::CounterArgument);
+            if red_cell {
+                calls.push(ExpectedCall {
+                    seat: Seat::RedCell,
+                    contract: ContractKind::RedCellObjection,
+                });
+            }
+            calls
         }
         (Phase::Adjudikation, PhaseStep::Umpire) => umpire(ContractKind::UmpireNarration),
         (Phase::Adjudikation, _) => umpire(ContractKind::UmpireAdjudication),
@@ -463,6 +476,25 @@ pub struct CounterArgument {
     pub counters: Vec<CounterEntry>,
 }
 
+/// `red_cell_objection`: Angriff auf die Kernannahme des führenden
+/// öffentlichen Arguments — oder ausdrücklich kein Einwand.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedCellObjection {
+    /// Ausdrücklich kein Einwand (dann bleiben alle anderen Felder leer).
+    #[serde(default)]
+    pub no_objection: bool,
+    /// Angegriffenes Argument (öffentlich, laufende Runde).
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Die Kernannahme, auf der das Argument ruht.
+    #[serde(default)]
+    pub assumption: Option<String>,
+    /// Contras gegen diese Annahme (1 bis `max_cons` der Schärfe).
+    #[serde(default)]
+    pub cons: Vec<String>,
+}
+
 /// Urteil des Umpires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -529,6 +561,9 @@ pub struct UmpireRuling {
     /// Löst Offenlegung eines Geheimnisses aus.
     #[serde(default)]
     pub triggers_secret: Option<String>,
+    /// Markiert das Urteil als Präzedenzfall (nur öffentliche Argumente).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precedent: Option<PrecedentFlag>,
 }
 
 /// Konfliktpaar.
@@ -635,6 +670,8 @@ pub enum PhaseOutput {
     PlayerDebrief(PlayerDebrief),
     /// Synthese.
     UmpireSynthesis(UmpireSynthesis),
+    /// Red-Cell-Einwand.
+    RedCellObjection(RedCellObjection),
 }
 
 impl PhaseOutput {
@@ -655,6 +692,7 @@ impl PhaseOutput {
             ContractKind::UmpireNarration => Self::UmpireNarration(parse_contract(raw)?),
             ContractKind::PlayerDebrief => Self::PlayerDebrief(parse_contract(raw)?),
             ContractKind::UmpireSynthesis => Self::UmpireSynthesis(parse_contract(raw)?),
+            ContractKind::RedCellObjection => Self::RedCellObjection(parse_contract(raw)?),
         })
     }
 }
@@ -830,6 +868,63 @@ pub fn validate_counter_argument(
                 &mut errors,
             );
         }
+    }
+    contract_result(errors)
+}
+
+/// Validiert `red_cell_objection`: entweder ausdrücklich kein Einwand oder
+/// genau ein öffentliches Argument der Runde mit benannter Kernannahme und
+/// 1..=`max_cons` Contras.
+///
+/// # Errors
+/// [`MatrixError::Contract`].
+pub fn validate_red_cell_objection(
+    objection: &RedCellObjection,
+    args: &[RoundArgument],
+    settings: &RedCellSettings,
+) -> MatrixResult<()> {
+    let mut errors = Vec::new();
+    if objection.no_objection {
+        if objection.target.is_some()
+            || objection.assumption.is_some()
+            || !objection.cons.is_empty()
+        {
+            errors.push(
+                "no_objection = true: target, assumption und cons müssen leer sein".to_owned(),
+            );
+        }
+        return contract_result(errors);
+    }
+    match &objection.target {
+        None => {
+            errors.push("target fehlt (oder no_objection = true für „kein Einwand“)".to_owned())
+        }
+        Some(target) => {
+            if !args.iter().any(|a| &a.id == target && !a.is_secret()) {
+                errors.push(format!(
+                    "target `{target}` ist kein öffentliches Argument dieser Runde"
+                ));
+            }
+        }
+    }
+    match objection.assumption.as_deref() {
+        Some(a) if !a.trim().is_empty() => {
+            check_len(a, MAX_REASON_CHARS, "assumption", &mut errors)
+        }
+        _ => errors.push("assumption fehlt: benenne die Kernannahme".to_owned()),
+    }
+    let max = settings.max_cons();
+    if objection.cons.is_empty() || objection.cons.len() > max {
+        errors.push(format!(
+            "cons braucht 1–{max} Einträge, erhalten {}",
+            objection.cons.len()
+        ));
+    }
+    for (i, con) in objection.cons.iter().enumerate() {
+        if con.trim().is_empty() {
+            errors.push(format!("cons[{i}] leer"));
+        }
+        check_len(con, MAX_REASON_CHARS, &format!("cons[{i}]"), &mut errors);
     }
     contract_result(errors)
 }
@@ -1041,6 +1136,14 @@ fn validate_ruling(
             errors,
         );
     }
+    if let Some(flag) = &ruling.precedent {
+        if arg.is_secret() {
+            errors.push(format!(
+                "{label}: Präzedenzfälle nur für öffentliche Argumente (precedent muss null sein)"
+            ));
+        }
+        check_precedent_flag(flag, label, errors);
+    }
     let owner = arg.is_secret().then(|| arg.seat.clone());
     let ctx = EffectContext::for_state(state, rules, arg.audience(), owner);
     for v in validate_effects(&ctx, &ruling.on_success) {
@@ -1202,7 +1305,25 @@ pub enum EffectOp {
         /// Geheimnis-ID.
         secret_id: String,
     },
+    /// Verdachtsleiter eines Geheimnisses anheben (1..=2 Stufen; nicht aus
+    /// geheimen Argumenten, nicht in `each_round`). Oben angekommen wird das
+    /// Geheimnis offengelegt.
+    RaiseSuspicion {
+        /// Geheimnis-ID.
+        secret_id: String,
+        /// Stufen (Default 1).
+        #[serde(default = "one_step")]
+        by: u8,
+    },
 }
+
+fn one_step() -> u8 {
+    1
+}
+
+/// Höchstzahl Stufen, um die ein Effekt-Zweig die Verdachtsleiter eines
+/// Geheimnisses anheben darf.
+pub const MAX_SUSPICION_STEP: u8 = 2;
 
 impl EffectOp {
     fn name(&self) -> &'static str {
@@ -1216,6 +1337,7 @@ impl EffectOp {
             Self::Discover { .. } => "discover",
             Self::Breach { .. } => "breach",
             Self::RevealSecret { .. } => "reveal_secret",
+            Self::RaiseSuspicion { .. } => "raise_suspicion",
         }
     }
 }
@@ -1229,6 +1351,8 @@ pub struct EffectContext<'a> {
     pub ongoing: &'a BTreeMap<String, Ongoing>,
     /// Geheimnisse.
     pub secrets: &'a BTreeMap<String, SecretRecord>,
+    /// Verdachtsleiter (fehlend = `Unknown`).
+    pub suspicion: &'a BTreeMap<String, SuspicionLevel>,
     /// Spieler.
     pub players: &'a [PlayerId],
     /// Regeln.
@@ -1252,6 +1376,7 @@ impl<'a> EffectContext<'a> {
             vars: &state.vars,
             ongoing: &state.ongoing,
             secrets: &state.secrets,
+            suspicion: &state.suspicion,
             players: &state.players,
             rules,
             argument_audience,
@@ -1278,6 +1403,8 @@ pub struct EffectPlan {
     pub violations: Vec<EffectViolation>,
     /// Auszulösende Offenlegungen.
     pub reveals: Vec<String>,
+    /// Offenlegungen, weil die Verdachtsleiter oben angekommen ist.
+    pub suspicion_reveals: Vec<String>,
 }
 
 struct Scratch {
@@ -1286,6 +1413,9 @@ struct Scratch {
     steps: BTreeMap<String, i32>,
     advanced: BTreeSet<String>,
     reveals: Vec<String>,
+    suspicion: BTreeMap<String, SuspicionLevel>,
+    suspicion_steps: BTreeMap<String, u8>,
+    suspicion_reveals: Vec<String>,
 }
 
 fn secret_guard(
@@ -1337,6 +1467,9 @@ impl Scratch {
             steps: BTreeMap::new(),
             advanced: BTreeSet::new(),
             reveals: Vec::new(),
+            suspicion: ctx.suspicion.clone(),
+            suspicion_steps: BTreeMap::new(),
+            suspicion_reveals: Vec::new(),
         }
     }
 
@@ -1464,6 +1597,9 @@ impl Scratch {
                     steps: BTreeMap::new(),
                     advanced: BTreeSet::new(),
                     reveals: Vec::new(),
+                    suspicion: self.suspicion.clone(),
+                    suspicion_steps: BTreeMap::new(),
+                    suspicion_reveals: Vec::new(),
                 };
                 let mut sink = Vec::new();
                 for (i, inner) in each_round.iter().enumerate() {
@@ -1472,6 +1608,7 @@ impl Scratch {
                         EffectOp::Ongoing { .. }
                             | EffectOp::StopOngoing { .. }
                             | EffectOp::RevealSecret { .. }
+                            | EffectOp::RaiseSuspicion { .. }
                     ) {
                         return Err(format!("each_round[{i}]: `{}` nicht erlaubt", inner.name()));
                     }
@@ -1616,6 +1753,58 @@ impl Scratch {
                     self.reveals.push(secret_id.clone());
                 }
             }
+            EffectOp::RaiseSuspicion { secret_id, by } => {
+                if nested {
+                    return Err("raise_suspicion nicht in each_round".to_owned());
+                }
+                if ctx.secret_owner.is_some() {
+                    return Err("geheime Argumente dürfen keine Verdachtsleiter bewegen".to_owned());
+                }
+                if !(1..=MAX_SUSPICION_STEP).contains(by) {
+                    return Err(format!(
+                        "raise_suspicion: by = {by} (erlaubt 1..={MAX_SUSPICION_STEP})"
+                    ));
+                }
+                if ctx.secrets.get(secret_id).is_none_or(|s| s.revealed) {
+                    return Err(format!(
+                        "Geheimnis `{secret_id}` unbekannt oder bereits offen"
+                    ));
+                }
+                let total = self
+                    .suspicion_steps
+                    .get(secret_id)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(*by);
+                if total > MAX_SUSPICION_STEP {
+                    return Err(format!(
+                        "Verdacht zu `{secret_id}` steigt je Urteil höchstens um {MAX_SUSPICION_STEP} Stufen"
+                    ));
+                }
+                if self.suspicion_reveals.contains(secret_id) {
+                    return Err(format!(
+                        "Geheimnis `{secret_id}` fliegt in diesem Zweig bereits auf"
+                    ));
+                }
+                let from = self.suspicion.get(secret_id).copied().unwrap_or_default();
+                let to = from.raised(*by);
+                self.suspicion_steps.insert(secret_id.clone(), total);
+                self.suspicion.insert(secret_id.clone(), to);
+                out.push(GameEntry::new(
+                    round,
+                    Audience::Public,
+                    EntryKind::SuspicionRaised {
+                        secret_id: secret_id.clone(),
+                        from,
+                        to,
+                        cause: cause.to_owned(),
+                        text: to.public_line(secret_id),
+                    },
+                ));
+                if to == SuspicionLevel::Revealed {
+                    self.suspicion_reveals.push(secret_id.clone());
+                }
+            }
         }
         Ok(())
     }
@@ -1641,6 +1830,7 @@ pub fn plan_effects(
         }
     }
     plan.reveals = scratch.reveals;
+    plan.suspicion_reveals = scratch.suspicion_reveals;
     plan
 }
 
@@ -1820,6 +2010,16 @@ pub fn open_game(
                 },
             ));
         }
+        if let Some(profile) = &faction.behavior {
+            entries.push(GameEntry::new(
+                0,
+                Audience::Seat(faction.id.clone()),
+                EntryKind::BehaviorBriefing {
+                    faction: faction.id.clone(),
+                    profile: profile.clone(),
+                },
+            ));
+        }
     }
     entries.push(GameEntry::new(
         0,
@@ -1867,6 +2067,9 @@ pub fn record_briefing(
     let audience = match seat {
         Seat::Player(p) => Audience::Seat(p.clone()),
         Seat::Umpire => Audience::UmpireOnly,
+        // Die Red Cell hat kein privates Protokoll; ihre Bestätigung sieht
+        // nur der Beobachter.
+        Seat::RedCell => Audience::ObserverOnly,
     };
     log.record(
         GameEntry::new(
@@ -2173,6 +2376,48 @@ pub fn submit_counters(
     Ok(())
 }
 
+/// Journalisiert den (validierten) Beitrag der Red Cell öffentlich und hängt
+/// ihre Contras unter dem Schlüssel [`RED_CELL_KEY`] an das Zielargument;
+/// der Umpire gewichtet sie in `con_weights["red_cell"]` wie jedes Contra.
+/// Aufruf nach den Contras aller Spieler.
+///
+/// # Errors
+/// [`MatrixError::Phase`] ohne aktive Red Cell, Contract- oder Zustandsfehler.
+pub fn submit_red_cell(
+    log: &mut GameLog,
+    scenario: &Scenario,
+    args: &mut [RoundArgument],
+    objection: &RedCellObjection,
+    at: Option<Timestamp>,
+) -> MatrixResult<()> {
+    let settings = scenario.red_cell().ok_or_else(|| {
+        MatrixError::Phase("Red Cell ist in diesem Szenario nicht aktiv".to_owned())
+    })?;
+    validate_red_cell_objection(objection, args, settings)?;
+    let round = log.state.round;
+    let entry = if objection.no_objection {
+        EntryKind::RedCellObjection {
+            target: None,
+            assumption: None,
+            cons: Vec::new(),
+        }
+    } else {
+        EntryKind::RedCellObjection {
+            target: objection.target.clone(),
+            assumption: objection.assumption.clone(),
+            cons: objection.cons.clone(),
+        }
+    };
+    log.record(GameEntry::new(round, Audience::Public, entry), at)?;
+    if let Some(target) = &objection.target {
+        if let Some(arg) = args.iter_mut().find(|a| &a.id == target) {
+            arg.counters
+                .insert(PlayerId::new(RED_CELL_KEY), objection.cons.clone());
+        }
+    }
+    Ok(())
+}
+
 /// Rust-Teil der Adjudikation eines Arguments: Netto → Zielwert → Wurf
 /// (seeded, mit Fail-Chit) → Ergebnis → vorab festgelegter Effekt-Zweig →
 /// ausgelöste Offenlegungen. Das Urteil muss vorher mit
@@ -2311,6 +2556,34 @@ pub fn resolve_argument(
         )
         .with_secret(secret),
     );
+    if let (Some(flag), false) = (&ruling.precedent, arg.is_secret()) {
+        let number = log
+            .journal
+            .entries()
+            .filter(|e| matches!(e.kind, EntryKind::PrecedentSet { .. }))
+            .count()
+            + 1;
+        entries.push(GameEntry::new(
+            round,
+            Audience::Public,
+            EntryKind::PrecedentSet {
+                precedent: Precedent {
+                    id: format!("p{number}"),
+                    argument_id: arg.id.clone(),
+                    round,
+                    principle: flag.principle.trim().to_owned(),
+                    tags: flag
+                        .tags
+                        .iter()
+                        .map(|t| normalize_tag(t))
+                        .filter(|t| !t.is_empty())
+                        .collect(),
+                    net,
+                    probability_pct,
+                },
+            },
+        ));
+    }
     log.record_all(entries, at)?;
 
     let branch: &[EffectOp] = match outcome {
@@ -2339,6 +2612,9 @@ pub fn resolve_argument(
 
     for secret_id in &plan.reveals {
         reveal_secret(log, secret_id, RevealedBy::Effect(arg.id.clone()), at)?;
+    }
+    for secret_id in &plan.suspicion_reveals {
+        reveal_secret(log, secret_id, RevealedBy::Suspicion(arg.id.clone()), at)?;
     }
     if let Some(secret_id) = &ruling.triggers_secret {
         reveal_secret(log, secret_id, RevealedBy::Trigger(arg.id.clone()), at)?;
@@ -2540,7 +2816,14 @@ pub fn apply_inject(
             },
         ));
     }
-    log.record_all(entries, at)
+    log.record_all(entries, at)?;
+    for secret_id in &plan.reveals {
+        reveal_secret(log, secret_id, RevealedBy::Effect(inject.id.clone()), at)?;
+    }
+    for secret_id in &plan.suspicion_reveals {
+        reveal_secret(log, secret_id, RevealedBy::Suspicion(inject.id.clone()), at)?;
+    }
+    Ok(())
 }
 
 /// Rundenende: laufende Effekte anwenden, dann `RoundClosed{state_hash}`.
@@ -2712,7 +2995,15 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(
-            expected_calls(Phase::Briefing, PhaseStep::Main, &players, &members, &rules).len(),
+            expected_calls(
+                Phase::Briefing,
+                PhaseStep::Main,
+                &players,
+                &members,
+                &rules,
+                false
+            )
+            .len(),
             5
         );
         let exchange = expected_calls(
@@ -2721,6 +3012,7 @@ mod tests {
             &players,
             &members,
             &rules,
+            false,
         );
         assert_eq!(
             exchange.iter().map(|c| c.seat.clone()).collect::<Vec<_>>(),
@@ -2732,7 +3024,8 @@ mod tests {
                 PhaseStep::Main,
                 &players,
                 &members,
-                &rules
+                &rules,
+                false
             )
             .is_empty()
         );
@@ -2742,7 +3035,8 @@ mod tests {
                 PhaseStep::Main,
                 &players,
                 &members,
-                &rules
+                &rules,
+                false
             ),
             vec![ExpectedCall {
                 seat: Seat::Umpire,
@@ -2759,9 +3053,38 @@ mod tests {
                 PhaseStep::Main,
                 &players,
                 &members,
-                &three
+                &three,
+                true
             )
             .is_empty()
+        );
+        let counters = expected_calls(
+            Phase::Gegenargumente,
+            PhaseStep::Main,
+            &players,
+            &members,
+            &rules,
+            true,
+        );
+        assert_eq!(counters.len(), 5);
+        assert_eq!(
+            counters.last(),
+            Some(&ExpectedCall {
+                seat: Seat::RedCell,
+                contract: ContractKind::RedCellObjection
+            })
+        );
+        assert_eq!(
+            expected_calls(
+                Phase::Gegenargumente,
+                PhaseStep::Main,
+                &players,
+                &members,
+                &rules,
+                false
+            )
+            .len(),
+            4
         );
     }
 

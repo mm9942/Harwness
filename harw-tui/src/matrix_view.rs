@@ -213,7 +213,7 @@ impl MatrixView {
             let mut own = self
                 .channels
                 .iter()
-                .filter(|channel| channel.members.iter().any(|member| *member == entry.from));
+                .filter(|channel| channel.members.contains(&entry.from));
             if let (Some(channel), None) = (own.next(), own.next()) {
                 return Some(channel.members.clone());
             }

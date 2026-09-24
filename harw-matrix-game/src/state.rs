@@ -18,8 +18,10 @@ use serde::{Deserialize, Serialize};
 use crate::commitments::{Commitment, canonical_json, from_hex, sha256_parts, to_hex};
 use crate::dice::{self, DiceRoll, Grade, Outcome};
 use crate::error::{MatrixError, MatrixResult};
+use crate::library::PlannedInject;
 use crate::phases::{ArgumentBody, CounterEntry, EffectOp, Phase, UmpireRuling};
-use crate::scenario::{Scenario, ScenarioMode, VarVisibility};
+use crate::precedents::Precedent;
+use crate::scenario::{BehaviorProfile, Scenario, ScenarioMode, VarVisibility};
 
 // ---------------------------------------------------------------------------
 // Sitze und Audiences
@@ -59,6 +61,10 @@ pub enum Seat {
     Player(PlayerId),
     /// Umpire-Agent.
     Umpire,
+    /// Optionaler Red-Cell-Sitz (`[red_cell]`): sieht nur Öffentliches, hat
+    /// keine Siegbedingung und greift in der Gegenargument-Phase die
+    /// Kernannahme des führenden Arguments an.
+    RedCell,
 }
 
 impl Seat {
@@ -74,6 +80,7 @@ impl fmt::Display for Seat {
         match self {
             Self::Player(p) => write!(f, "{p}"),
             Self::Umpire => f.write_str("umpire"),
+            Self::RedCell => f.write_str("red_cell"),
         }
     }
 }
@@ -409,6 +416,106 @@ pub enum RevealedBy {
     GameEnd,
     /// Effekt-Op `reveal_secret`.
     Effect(String),
+    /// Verdachtsleiter hat die oberste Stufe erreicht (Ursache).
+    Suspicion(String),
+}
+
+// ---------------------------------------------------------------------------
+// Verdachtsleiter
+// ---------------------------------------------------------------------------
+
+/// Stufe der Verdachtsleiter eines geheimen Arguments. Jede Stufe außer
+/// `Unknown` erzeugt genau eine öffentliche Zeile aus einem festen
+/// Rust-Template — nie mit Inhalt des Geheimnisses. `Revealed` löst die
+/// Offenlegung aus.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SuspicionLevel {
+    /// Niemand ahnt etwas (Ausgangslage).
+    #[default]
+    Unknown,
+    /// Gerüchte.
+    Rumor,
+    /// Begründeter Verdacht.
+    Suspicion,
+    /// Greifbare Belege.
+    Evidence,
+    /// Aufgeflogen — Offenlegung.
+    Revealed,
+}
+
+impl SuspicionLevel {
+    /// Alle Stufen in Leiterreihenfolge.
+    pub const LADDER: [Self; 5] = [
+        Self::Unknown,
+        Self::Rumor,
+        Self::Suspicion,
+        Self::Evidence,
+        Self::Revealed,
+    ];
+
+    /// Position auf der Leiter (0..=4).
+    #[must_use]
+    pub fn index(self) -> u8 {
+        match self {
+            Self::Unknown => 0,
+            Self::Rumor => 1,
+            Self::Suspicion => 2,
+            Self::Evidence => 3,
+            Self::Revealed => 4,
+        }
+    }
+
+    /// Stufe zur Position (oberhalb 4: `Revealed`).
+    #[must_use]
+    pub fn from_index(index: u8) -> Self {
+        match index {
+            0 => Self::Unknown,
+            1 => Self::Rumor,
+            2 => Self::Suspicion,
+            3 => Self::Evidence,
+            _ => Self::Revealed,
+        }
+    }
+
+    /// Um `by` Stufen angehoben (gekappt bei `Revealed`).
+    #[must_use]
+    pub fn raised(self, by: u8) -> Self {
+        Self::from_index(self.index().saturating_add(by))
+    }
+
+    /// Deutsche Anzeige.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unbemerkt",
+            Self::Rumor => "Gerücht",
+            Self::Suspicion => "Verdacht",
+            Self::Evidence => "Belege",
+            Self::Revealed => "aufgeflogen",
+        }
+    }
+
+    /// Die einzige öffentliche Zeile zu einer Stufe — ein festes Template,
+    /// das außer der ohnehin öffentlichen Geheimnis-ID nichts enthält.
+    #[must_use]
+    pub fn public_line(self, secret_id: &str) -> String {
+        match self {
+            Self::Unknown => format!("Um #{secret_id} ist es still."),
+            Self::Rumor => format!(
+                "Gerüchte machen die Runde: Hinter #{secret_id} wird etwas vermutet, Genaues weiß niemand."
+            ),
+            Self::Suspicion => {
+                format!("Der Verdacht verdichtet sich: Zu #{secret_id} häufen sich Hinweise.")
+            }
+            Self::Evidence => {
+                format!("Es gibt greifbare Spuren zu #{secret_id}; eine Aufdeckung rückt näher.")
+            }
+            Self::Revealed => format!("#{secret_id} ist aufgeflogen."),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -703,6 +810,48 @@ pub enum EntryKind {
         /// Grund.
         reason: String,
     },
+    /// Verhaltensprofil einer Fraktion (nur dieser Sitz; AAR).
+    BehaviorBriefing {
+        /// Fraktion.
+        faction: PlayerId,
+        /// Profil.
+        profile: BehaviorProfile,
+    },
+    /// Beitrag der Red Cell in der Gegenargument-Phase (öffentlich).
+    RedCellObjection {
+        /// Angegriffenes Argument (`None` = kein Einwand).
+        target: Option<String>,
+        /// Benannte Kernannahme.
+        assumption: Option<String>,
+        /// Contras gegen diese Annahme.
+        cons: Vec<String>,
+    },
+    /// Stufe der Verdachtsleiter gestiegen (öffentlich, Template-Text).
+    SuspicionRaised {
+        /// Geheimnis-ID.
+        secret_id: String,
+        /// Vorherige Stufe.
+        from: SuspicionLevel,
+        /// Neue Stufe.
+        to: SuspicionLevel,
+        /// Auslöser (öffentliches Argument oder Inject).
+        cause: String,
+        /// Öffentliche Zeile ([`SuspicionLevel::public_line`]).
+        text: String,
+    },
+    /// Umpire-Urteil als Präzedenzfall markiert (öffentlich).
+    PrecedentSet {
+        /// Präzedenzfall.
+        precedent: Precedent,
+    },
+    /// Auswahl aus der Inject-Bibliothek (nur Beobachter; seed-deterministisch,
+    /// beim Replay nachgerechnet).
+    InjectPackageSelected {
+        /// Paket.
+        package_id: String,
+        /// Gewählte Injects mit Runde.
+        plan: Vec<PlannedInject>,
+    },
 }
 
 impl EntryKind {
@@ -766,6 +915,18 @@ impl EntryKind {
             }
             Self::RulingPublished { rationale, .. } => out.extend(rationale.as_deref()),
             Self::OngoingStarted { ongoing } => out.push(&ongoing.text),
+            Self::BehaviorBriefing { profile, .. } => {
+                out.extend(profile.rules.iter().map(String::as_str));
+                out.extend(profile.anchor.as_deref());
+                out.extend(profile.red_lines.iter().map(String::as_str));
+            }
+            Self::RedCellObjection {
+                assumption, cons, ..
+            } => {
+                out.extend(assumption.as_deref());
+                out.extend(cons.iter().map(String::as_str));
+            }
+            Self::PrecedentSet { precedent } => out.push(&precedent.principle),
             _ => {}
         }
         out
@@ -1015,6 +1176,10 @@ pub struct GameState {
     pub outcomes: BTreeMap<String, Outcome>,
     /// Spiel beendet.
     pub ended: bool,
+    /// Verdachtsleiter je Geheimnis (fehlend = `Unknown`). Leer wird das Feld
+    /// nicht serialisiert, damit `state_hash` älterer Journale gleich bleibt.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub suspicion: BTreeMap<String, SuspicionLevel>,
 }
 
 impl GameState {
@@ -1038,6 +1203,7 @@ impl GameState {
             standing: Vec::new(),
             outcomes: BTreeMap::new(),
             ended: false,
+            suspicion: BTreeMap::new(),
         }
     }
 
@@ -1074,6 +1240,16 @@ impl GameState {
     #[must_use]
     pub fn fail_chits_of(&self, player: &PlayerId) -> u32 {
         self.fail_chits.get(player).copied().unwrap_or(0)
+    }
+
+    /// Stufe der Verdachtsleiter eines Geheimnisses (offengelegt ⇒
+    /// `Revealed`, unbekannt ⇒ `Unknown`).
+    #[must_use]
+    pub fn suspicion_of(&self, secret_id: &str) -> SuspicionLevel {
+        if self.secrets.get(secret_id).is_some_and(|s| s.revealed) {
+            return SuspicionLevel::Revealed;
+        }
+        self.suspicion.get(secret_id).copied().unwrap_or_default()
     }
 
     /// Verbrauchte geheime Argumente eines Sitzes.
@@ -1196,6 +1372,33 @@ impl GameState {
                 })?;
                 record.revealed = true;
             }
+            EntryKind::SuspicionRaised {
+                secret_id,
+                from,
+                to,
+                ..
+            } => {
+                let record = self.secrets.get(secret_id).ok_or_else(|| {
+                    MatrixError::State(format!(
+                        "SuspicionRaised: unbekanntes Geheimnis `{secret_id}`"
+                    ))
+                })?;
+                if record.revealed {
+                    return Err(MatrixError::State(format!(
+                        "SuspicionRaised: `{secret_id}` ist bereits offen"
+                    )));
+                }
+                let current = self.suspicion_of(secret_id);
+                if current != *from || to <= from {
+                    return Err(MatrixError::State(format!(
+                        "SuspicionRaised `{secret_id}`: {} → {} passt nicht zu {}",
+                        from.label(),
+                        to.label(),
+                        current.label()
+                    )));
+                }
+                self.suspicion.insert(secret_id.clone(), *to);
+            }
             EntryKind::StandingSet { order } => self.standing.clone_from(order),
             EntryKind::GameEnded { .. } => self.ended = true,
             _ => {}
@@ -1271,6 +1474,17 @@ pub fn replay(scenario: &Scenario, journal: &Journal) -> MatrixResult<GameState>
                     return Err(MatrixError::Replay(format!(
                         "Wurf {} (Versuch {}) in Zeile {} weicht ab",
                         roll.argument_id, roll.attempt, record.seq
+                    )));
+                }
+            }
+            EntryKind::InjectPackageSelected { package_id, plan } => {
+                let master = state.master_seed()?;
+                let expected =
+                    crate::library::plan_inject_package(scenario, &master, Some(package_id))?;
+                if expected.as_ref().map(|p| &p.injects) != Some(plan) {
+                    return Err(MatrixError::Replay(format!(
+                        "Inject-Paket `{package_id}` in Zeile {} weicht von der Seed-Auswahl ab",
+                        record.seq
                     )));
                 }
             }

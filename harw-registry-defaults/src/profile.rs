@@ -226,10 +226,16 @@ pub mod role_names {
     /// Entwicklungen. Liest nur Unterlagen (ohne Netz, ohne Schreiben/Exec)
     /// (`agents/roles/matrix-market/matrix-market.toml`).
     pub const MATRIX_MARKET: &str = "matrix-market";
-    /// Die drei Sitz-Rollen des Matrix-Games. Alle bekommen
+    /// Red-Cell-Sitz des Matrix-Games: widerspricht aus der öffentlichen Lage
+    /// den tragenden Annahmen der Argumente einer Runde. Liest nur Unterlagen
+    /// (ohne Netz, ohne Schreiben/Exec)
+    /// (`agents/roles/matrix-redcell/matrix-redcell.toml`).
+    pub const MATRIX_REDCELL: &str = "matrix-redcell";
+    /// Die vier Sitz-Rollen des Matrix-Games. Alle bekommen
     /// [`crate::profile::RegistryProfile::MatrixReader`] und den Reducer
     /// [`crate::authority::AuthorityReducer::ReadOnly`].
-    pub const MATRIX_ROLES: [&str; 3] = [MATRIX_PLAYER, MATRIX_UMPIRE, MATRIX_MARKET];
+    pub const MATRIX_ROLES: [&str; 4] =
+        [MATRIX_PLAYER, MATRIX_UMPIRE, MATRIX_MARKET, MATRIX_REDCELL];
 
     /// Führt Befehls- und Dateioperationen im Auftrag des Haupt-Agenten aus
     /// und liefert eine Zusammenfassung statt Rohausgaben (Slice B7). Die
@@ -352,6 +358,7 @@ pub mod role_names {
         MATRIX_PLAYER,
         MATRIX_UMPIRE,
         MATRIX_MARKET,
+        MATRIX_REDCELL,
         EXECUTOR,
         MEMORY_STEWARD,
         UIA_WORKER,
@@ -1401,14 +1408,15 @@ pub fn profile_for_role(role: &str) -> Option<RegistryProfile> {
         | role_names::SECURITY_BASELINE_TRIAGE
         | role_names::SECURITY_STRUCTURE_TRIAGE
         | role_names::SECURITY_ENDPOINT_TRIAGE => Some(RegistryProfile::NoTools),
-        // Die drei Matrix-Game-Sitze lesen nur ihre Unterlagen (lesende
+        // Die vier Matrix-Game-Sitze lesen nur ihre Unterlagen (lesende
         // `fs.*` plus `doc.read_pdf`, ohne Netz, Schreiben oder Exec); der
         // Matrix-Runner übergibt jedem Sitz seine Sicht im Prompt und liest
         // die Antwort als Text (`agents/roles/matrix-*/matrix-*.toml`). Siehe
         // die Begründung bei `RegistryProfile::MatrixReader`.
-        role_names::MATRIX_PLAYER | role_names::MATRIX_UMPIRE | role_names::MATRIX_MARKET => {
-            Some(RegistryProfile::MatrixReader)
-        }
+        role_names::MATRIX_PLAYER
+        | role_names::MATRIX_UMPIRE
+        | role_names::MATRIX_MARKET
+        | role_names::MATRIX_REDCELL => Some(RegistryProfile::MatrixReader),
         // Einzige eingebaute Rolle mit der Prozessoberfläche: sie führt nur
         // beauftragte Sandbox-Prozesse aus. Das ist eine ausdrückliche,
         // dokumentierte Ausnahme (siehe `agents/executor.toml` und den Test
@@ -3531,8 +3539,8 @@ mod tests {
             assert!(role_names::ALL.contains(&role), "{role} fehlt in ALL");
             assert_eq!(
                 profile_for_role(role),
-                Some(RegistryProfile::NoTools),
-                "Matrix-Rolle {role} muss NoTools bekommen"
+                Some(RegistryProfile::MatrixReader),
+                "Matrix-Rolle {role} muss MatrixReader bekommen"
             );
         }
         for role in role_names::ALL {

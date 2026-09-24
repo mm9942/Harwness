@@ -1,0 +1,7 @@
+name = "business-author"
+role = "worker"
+description = "Entwickelt Storyline und Erstentwurf für Business-Texte: Kernaussage zuerst, tragende Gründe gruppiert, Belege darunter."
+system_file = "system.md"
+skills = ["business-writing-pyramid", "author-review-pipeline"]
+timeout_seconds = 300
+max_retries = 1

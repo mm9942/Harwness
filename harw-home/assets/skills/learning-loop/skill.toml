@@ -1,0 +1,4 @@
+name = "learning-loop"
+description = "Spot durable learnings in a session (corrections, explicit remember requests, repeated instructions, decisions, recurring workflows) and turn them into review-gated proposals — never write memory, skills or agent profiles directly."
+instructions_file = "instructions.md"
+tools = []

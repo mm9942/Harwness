@@ -26,6 +26,11 @@
 //! - [`prompts`]: System-, Zug- und Korrektur-Prompts für Spieler-, Markt-
 //!   und Umpire-Agenten; Zug-Prompts entstehen nur aus [`visibility::SeatView`].
 //! - [`events`]: [`events::MatrixGameEvent`] für das TUI-Panel.
+//! - [`library`]: Inject-Bibliothek mit Varianz-Paketen (seed-deterministische
+//!   Auswahl, beim Replay nachgerechnet).
+//! - [`precedents`]: Präzedenzregister und Auswahl einschlägiger Maßstäbe.
+//! - [`lessons`]: Design-Lehren im AAR, [`lessons::AarSummary`] und
+//!   [`lessons::compare_runs`] für Mehrfachläufe.
 //!
 //! # Concurrency
 //! Alle Typen sind reine Daten ohne interne Mutabilität. Parallele
@@ -43,7 +48,10 @@ pub mod commitments;
 pub mod dice;
 pub mod error;
 pub mod events;
+pub mod lessons;
+pub mod library;
 pub mod phases;
+pub mod precedents;
 pub mod prompts;
 pub mod scenario;
 pub mod state;
@@ -51,6 +59,9 @@ pub mod visibility;
 
 pub use error::{MatrixError, MatrixResult};
 pub use scenario::{MaterialsSelection, MaterialsSpec, materials_for_seat, pair_folder_members};
+
+#[cfg(test)]
+mod extension_tests;
 
 /// Gemeinsame Test-Fixtures: Beispielszenarien und ein geskriptetes Spiel.
 #[cfg(test)]
@@ -72,6 +83,79 @@ pub(crate) mod test_support {
 
     pub(crate) type Fixture<T> = Result<T, Box<dyn std::error::Error>>;
 
+    /// Kanonische Sitzreihenfolge des Karst-Szenarios.
+    pub(crate) const ORDER: [&str; 4] = ["rat", "gilde", "nord", "mission"];
+
+    /// Rote Linie des Inselrats (Marker für Sichtbarkeitstests).
+    pub(crate) const RAT_RED_LINE: &str = "Niemals Polizei gegen Hafenarbeiter einsetzen";
+
+    /// Karst mit Verhaltensprofilen (Rat, Gilde), aktiver Red Cell und
+    /// Inject-Bibliothek aus zwei Paketen.
+    pub(crate) fn karst_extended() -> Fixture<String> {
+        let anchor = "assets = [\"Inselpolizei\", \"Rationierungsbehörde\"]\n";
+        let gilde_anchor = "assets = [\"Tankerflotte\", \"Hafenarbeiter-Syndikat\"]\n";
+        if !KARST.contains(anchor) || !KARST.contains(gilde_anchor) {
+            return Err("Ankerzeilen im Karst-Szenario fehlen".into());
+        }
+        let rat_behavior = format!(
+            "{anchor}\n[factions.behavior]\nrules = [\"Erst verhandeln, dann handeln\", \"Öffentlich nie Schwäche zeigen\"]\nrisk = 0.25\nloss_framing = true\nanchor = \"Die Wahl in drei Monaten\"\nred_lines = [\"{RAT_RED_LINE}\", \"Keine Anlage in fremder Hand dulden\"]\n"
+        );
+        let gilde_behavior = format!(
+            "{gilde_anchor}\n[factions.behavior]\nrisk = 0.8\nred_lines = [\"Den Zoll nie offen angreifen\", \"Keine Tanker verkaufen\"]\n"
+        );
+        let mut src =
+            KARST
+                .replacen(anchor, &rat_behavior, 1)
+                .replacen(gilde_anchor, &gilde_behavior, 1);
+        src.push_str(
+            r#"
+[red_cell]
+enabled = true
+sharpness = 0.7
+
+[[inject_packages]]
+id = "sturm"
+label = "Sturmsaison"
+max_injects = 3
+
+[[inject_packages.injects]]
+id = "sturm-hafen"
+text = "Ein Sturm legt den Hafen für Tage lahm."
+earliest = 2
+effects = [{ op = "add", var = "stability", by = -1 }]
+
+[[inject_packages.injects]]
+id = "sturm-leitung"
+text = "Sturmschäden an der Küstenstraße verzögern alle Bauarbeiten."
+latest = 4
+
+[[inject_packages.injects]]
+id = "sturm-regen"
+text = "Ein kurzer Regenguss füllt die Zisternen."
+effects = [{ op = "add", var = "water", by = 1 }]
+
+[[inject_packages.injects]]
+id = "sturm-gilde"
+audience = "seat:gilde"
+text = "Zwei Tanker der Gilde liegen sturmbedingt im Nordhafen fest."
+
+[[inject_packages]]
+id = "unruhen"
+max_injects = 2
+
+[[inject_packages.injects]]
+id = "unruhen-demo"
+text = "Tausende demonstrieren vor dem Ratsgebäude gegen die Rationierung."
+
+[[inject_packages.injects]]
+id = "unruhen-streik"
+text = "Die Hafenarbeiter drohen mit Streik."
+earliest = 3
+"#,
+        );
+        Ok(src)
+    }
+
     /// Klassisches Beispielszenario (matrix-game.md §5.1).
     pub(crate) const KARST: &str = include_str!("../scenarios/karst-islands.toml");
     /// Business-Beispielszenario (wargaming-and-analysis.md §1.9).
@@ -84,7 +168,12 @@ pub(crate) mod test_support {
     pub(crate) const NORD_REPLY: &str =
         "Gegen ein Landerecht am Nordkai liefern wir zwei Tankschiffe noch diese Woche.";
 
-    fn argument(action: &str, pros: &[&str], secret: bool, note: Option<&str>) -> PlayerArgument {
+    pub(crate) fn argument(
+        action: &str,
+        pros: &[&str],
+        secret: bool,
+        note: Option<&str>,
+    ) -> PlayerArgument {
         PlayerArgument {
             action: action.to_owned(),
             pros: pros.iter().map(|p| (*p).to_owned()).collect(),
@@ -140,7 +229,7 @@ pub(crate) mod test_support {
         subs
     }
 
-    fn ruling(argument_id: &str) -> UmpireRuling {
+    pub(crate) fn ruling(argument_id: &str) -> UmpireRuling {
         UmpireRuling {
             argument_id: argument_id.to_owned(),
             verdict: Verdict::Roll,
@@ -156,6 +245,7 @@ pub(crate) mod test_support {
             on_success: Vec::new(),
             on_failure: Vec::new(),
             triggers_secret: None,
+            precedent: None,
         }
     }
 

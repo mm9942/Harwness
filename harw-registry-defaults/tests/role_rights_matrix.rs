@@ -172,7 +172,7 @@ fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer
             RegistryProfile::NoTools,
             AuthorityReducer::ReadOnly,
         ),
-        // Runde 3, Welle E + Matrix-Unterlagen: die drei Matrix-Game-Sitze
+        // Runde 3, Welle E + Matrix-Unterlagen: die vier Matrix-Game-Sitze
         // lesen nur ihre Unterlagen (`MatrixReader`: lesende `fs.*` plus
         // `doc.read_pdf`) — ohne Netz, Schreiben oder Exec.
         (
@@ -187,6 +187,11 @@ fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer
         ),
         (
             role_names::MATRIX_MARKET,
+            RegistryProfile::MatrixReader,
+            AuthorityReducer::ReadOnly,
+        ),
+        (
+            role_names::MATRIX_REDCELL,
             RegistryProfile::MatrixReader,
             AuthorityReducer::ReadOnly,
         ),

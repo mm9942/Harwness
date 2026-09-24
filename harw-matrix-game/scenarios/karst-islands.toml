@@ -122,3 +122,25 @@ effects = [{ op = "add", var = "water", by = -1 }]
 # umpire/ (nur Schiedsrichter; er sieht alles).
 # [materials]
 # dir = "unterlagen"
+
+# Optional (matrix-game.md §11): Verhaltensprofil direkt unter einer Fraktion,
+# Red Cell und Inject-Bibliothek. Beispiel:
+# [factions.behavior]                      # unter dem jeweiligen [[factions]]-Eintrag
+# rules = ["Erst verhandeln, dann handeln"]
+# risk = 0.3                               # 0 = meidet Risiko … 1 = sucht es
+# loss_framing = true
+# anchor = "Die Wahl in drei Monaten"
+# red_lines = ["Keine Gewalt gegen Hafenarbeiter", "Keine Anlage in fremder Hand"]
+#
+# [red_cell]
+# enabled = true
+# sharpness = 0.6                          # 0..1: Ton und Höchstzahl Contras (1–3)
+#
+# [[inject_packages]]
+# id = "sturm"
+# max_injects = 3                          # höchstens 3, nie zwei in derselben Runde
+# [[inject_packages.injects]]
+# id = "sturm-hafen"
+# text = "Ein Sturm legt den Hafen für Tage lahm."
+# earliest = 2
+# effects = [{ op = "add", var = "stability", by = -1 }]
