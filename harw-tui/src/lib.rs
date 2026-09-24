@@ -17,6 +17,8 @@ pub(crate) mod chat_scroll;
 pub(crate) mod choice_dialog;
 pub mod clipboard;
 mod command;
+pub(crate) mod command_catalog;
+pub(crate) mod command_data;
 pub(crate) mod command_exec;
 pub(crate) mod command_popup;
 mod error;
@@ -25,16 +27,25 @@ pub(crate) mod explorer_panel;
 pub mod export;
 pub(crate) mod frame_requester;
 pub mod gateway;
+pub(crate) mod help_overlay;
 pub(crate) mod history_cell;
 pub mod host_permit_dialog;
 mod input;
 pub(crate) mod input_editor;
 pub(crate) mod input_history;
 pub(crate) mod input_reader;
+pub(crate) mod kanban_board;
 pub(crate) mod keybindings;
+pub(crate) mod knowledge_view;
+pub(crate) mod local_commands;
 pub(crate) mod markdown;
+pub(crate) mod mention;
+pub(crate) mod mention_popup;
+pub(crate) mod mode_picker;
 pub mod model_picker;
+pub(crate) mod model_roles_view;
 pub(crate) mod model_switch_picker;
+pub(crate) mod overlay_view;
 pub(crate) mod panes;
 mod registry;
 pub mod relative_time;
@@ -45,9 +56,11 @@ pub mod session_controller;
 pub mod session_picker;
 pub mod setup;
 pub(crate) mod spinner;
+pub(crate) mod status_line;
 pub(crate) mod style;
 pub mod tools_command;
 pub(crate) mod tui_event;
+pub(crate) mod workbench_pane;
 
 pub use app::{ChatApp, TuiError};
 pub use approval::{
@@ -57,7 +70,8 @@ pub use approval::{
 pub use approval_dialog::{ApprovalChoice, ApprovalDialog, ApprovalDialogRequest, DialogAction};
 pub use clipboard::{ClipboardTarget, copy_or_sequence, copy_to_clipboard, osc52_sequence};
 pub use command::{
-    CommandDomain, CommandName, CommandScope, CommandSpec, OutputSurface, PermissionTier,
+    CommandDomain, CommandName, CommandOrigin, CommandScope, CommandSpec, OutputSurface,
+    PermissionTier, SubcommandHint,
 };
 pub use error::{CommandError, CommandResult};
 pub use export::{
