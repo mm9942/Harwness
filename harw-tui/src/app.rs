@@ -3093,6 +3093,14 @@ fn resume_request(raw: &str) -> Option<TuiRunOutcome> {
     }
 }
 
+/// `true`, wenn nach `/befehl` nur Leerraum steht (Unterkommando-Popup ohne
+/// Suchtext).
+fn subcommand_query_is_empty(text: &str) -> bool {
+    text.strip_prefix('/')
+        .and_then(|rest| rest.split_once(char::is_whitespace))
+        .is_none_or(|(_, query)| query.trim().is_empty())
+}
+
 /// `true` für jede `/workbench …`-Zeile (Werkbank danach neu laden).
 fn is_workbench_command(raw: &str) -> bool {
     raw.split_whitespace().next() == Some("/workbench")
@@ -5756,6 +5764,13 @@ fn handle_panel_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
         crate::panes::PanelKey::Changed => {
             app.sync_agent_detail();
             app.ensure_explorer();
+            // Frisch eingeblendete Werkbank lädt neu (siehe
+            // `process_pending_fetches`).
+            if app.panels.workbench_visible
+                && app.key_bindings.action_for(&key) == Some(KeyAction::ToggleWorkbench)
+            {
+                app.workbench.mark_stale();
+            }
             Some(true)
         }
         // Übrige Tasten verschluckt die Detailansicht (kein Rückfall auf
@@ -5898,6 +5913,12 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
         return handle_overlay_key(app, key, bus);
     }
 
+    // `@`-Erwähnungs-Popup: Navigation/Übernahme vor Composer und
+    // Befehls-Popup (beide schließen sich gegenseitig aus).
+    if let Some(redraw) = handle_mention_popup_key(app, key) {
+        return redraw;
+    }
+
     // Das erste Escape schließt ausschließlich die Autovervollständigung.
     // Ein direkt folgendes Escape erreicht danach den Composer und leert ihn.
     if matches!(key.code, KeyCode::Esc) && app.has_popup() {
@@ -5977,13 +5998,23 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
             app.sync_popup();
             return true;
         }
-        if let Some(name) = app
+        // Im Unterkommando-Modus ohne getippten Suchtext (`/kanban `) sendet
+        // Enter die Zeile ab, statt still das erste Unterkommando zu wählen.
+        let completion = app
             .command_popup
             .as_ref()
-            .and_then(CommandPopup::selected_name)
-        {
+            .filter(|popup| {
+                !(matches!(popup.mode(), PopupMode::Subcommand { .. })
+                    && subcommand_query_is_empty(app.input.text()))
+            })
+            .and_then(|popup| {
+                popup
+                    .selected_name()
+                    .map(|name| popup.completion_line(name))
+            });
+        if let Some(line) = completion {
             app.input.clear();
-            app.input.insert_str(&format!("/{name} "));
+            app.input.insert_str(&line);
             app.command_popup = None;
             return true;
         }
@@ -6019,21 +6050,39 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
                 let outcome = app
                     .command_popup
                     .as_ref()
-                    .map(CommandPopup::tab_outcome)
-                    .unwrap_or(TabOutcome::None);
-                match outcome {
+                    .map(|popup| match popup.tab_outcome() {
+                        TabOutcome::None => TabOutcome::None,
+                        TabOutcome::Accept(name) => {
+                            TabOutcome::Accept(popup.completion_line(&name))
+                        }
+                        TabOutcome::ExtendQuery(common) => {
+                            TabOutcome::ExtendQuery(popup.query_line(&common))
+                        }
+                    });
+                match outcome.unwrap_or(TabOutcome::None) {
                     TabOutcome::None => {}
-                    TabOutcome::Accept(name) => {
+                    TabOutcome::Accept(line) => {
                         app.input.clear();
-                        app.input.insert_str(&format!("/{name} "));
+                        app.input.insert_str(&line);
                         app.command_popup = None;
                     }
-                    TabOutcome::ExtendQuery(common) => {
+                    TabOutcome::ExtendQuery(line) => {
                         app.input.clear();
-                        app.input.insert_str(&format!("/{common}"));
+                        app.input.insert_str(&line);
                         app.sync_popup();
                     }
                 }
+                true
+            }
+            // Im Unterkommando-Modus sind Ziffern normale Eingabe.
+            KeyCode::Char(character @ '1'..='9')
+                if !app
+                    .command_popup
+                    .as_ref()
+                    .is_some_and(CommandPopup::digits_select) =>
+            {
+                app.input.insert_char(character);
+                app.sync_popup();
                 true
             }
             KeyCode::Up | KeyCode::Down | KeyCode::Esc | KeyCode::Char('1'..='9') => {
@@ -6044,8 +6093,9 @@ fn scroll_and_composer_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSend
                             app.command_popup = None;
                         }
                         PopupAction::Accept(name) => {
+                            let line = popup.completion_line(&name);
                             app.input.clear();
-                            app.input.insert_str(&format!("/{name} "));
+                            app.input.insert_str(&line);
                             app.command_popup = None;
                         }
                     }
@@ -7640,8 +7690,11 @@ fn queue_busy_key(app: &mut ChatApp, key: KeyEvent) -> BusyKeyOutcome {
                     if raw.trim() == "/agent" {
                         return BusyKeyOutcome::RunImmediate(raw);
                     }
+                    // TUI-lokale Befehle haben keinen Adapter; sie laufen
+                    // nach dem Turn über den regulären Abfang in `run_loop`.
                     if busy_availability_for(&app.command_registry, &raw)
                         == BusyAvailability::Immediate
+                        && !is_tui_local_command(&app.command_registry, &raw)
                     {
                         return BusyKeyOutcome::RunImmediate(raw);
                     }

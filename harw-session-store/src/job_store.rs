@@ -2246,4 +2246,193 @@ mod tests {
         assert!(claim.token.epoch > 5);
         Ok(())
     }
+
+    fn pending_record(id: &str) -> TestResult<StoredJob> {
+        let mut job = record(id)?;
+        job.job.state = JobState::Pending;
+        Ok(job)
+    }
+
+    fn operator() -> ApprovalActor {
+        ApprovalActor::Operator {
+            id: "operator-a".to_owned(),
+        }
+    }
+
+    fn claim_for(store: &JobStore, work_id: &WorkId, now: Timestamp) -> TestResult<JobClaim> {
+        Ok(store.claim(
+            work_id,
+            &ClaimRequest {
+                worker_id: "worker-a".to_owned(),
+                lease_ttl: SignedDuration::from_secs(60),
+                now,
+            },
+        )?)
+    }
+
+    fn recorded_events(sink: &RecordingSink) -> Vec<JobLifecycleEvent> {
+        sink.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    #[test]
+    fn mark_ready_moves_a_pending_job_to_ready_and_is_idempotent() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let sink = Arc::new(RecordingSink::default());
+        let store = JobStore::new_with_event_sink(temp.path(), sink.clone());
+        let work_id = WorkId::from_str("work-mark-ready");
+        store.admit(&pending_record(work_id.as_str())?)?;
+        let now = Timestamp::now();
+
+        let event = store.mark_ready(&work_id, now)?;
+        assert_eq!(event.state, JobState::Ready);
+        assert_eq!(event.revision, 1);
+        let persisted = store.get(&work_id)?;
+        assert_eq!(persisted.job.state, JobState::Ready);
+        assert_eq!(persisted.job.updated_at, now);
+        assert_eq!(persisted.revision, 1);
+        assert!(persisted.lease.is_none());
+
+        // Ein zweiter Aufruf ändert nichts und veröffentlicht nichts.
+        let again = store.mark_ready(&work_id, now)?;
+        assert_eq!(again, event);
+        assert_eq!(store.get(&work_id)?.revision, 1);
+        assert_eq!(recorded_events(&sink), vec![event]);
+
+        // Der freigegebene Job ist beanspruchbar.
+        claim_for(&store, &work_id, now)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mark_ready_rejects_every_state_other_than_pending_or_ready() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = JobStore::new(temp.path());
+        let blocked = WorkId::from_str("work-mark-ready-blocked");
+        store.admit(&blocked_record(blocked.as_str())?)?;
+        let running = WorkId::from_str("work-mark-ready-running");
+        store.admit(&record(running.as_str())?)?;
+        claim_for(&store, &running, Timestamp::now())?;
+        let failed = WorkId::from_str("work-mark-ready-failed");
+        store.admit(&terminal_record(failed.as_str(), JobState::Failed, 1)?)?;
+
+        for (work_id, state) in [
+            (&blocked, JobState::Blocked),
+            (&running, JobState::Running),
+            (&failed, JobState::Failed),
+        ] {
+            let before = store.get(work_id)?;
+            assert!(matches!(
+                store.mark_ready(work_id, Timestamp::now()),
+                Err(SessionStoreError::JobRuntime { .. })
+            ));
+            let after = store.get(work_id)?;
+            assert_eq!(after.job.state, state);
+            assert_eq!(after.revision, before.revision);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reclaim_returns_a_live_running_job_to_ready_and_fences_the_old_lease() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let sink = Arc::new(RecordingSink::default());
+        let store = JobStore::new_with_event_sink(temp.path(), sink.clone());
+        let work_id = WorkId::from_str("work-reclaim");
+        store.admit(&record(work_id.as_str())?)?;
+        let now = Timestamp::now();
+        let claim = claim_for(&store, &work_id, now)?;
+
+        // Die Lease läuft noch (60 s) — der Einzel-Reclaim verlangt keinen Ablauf.
+        let reclaimed = store.reclaim(&work_id, now, operator())?;
+        assert_eq!(reclaimed.work_id, work_id);
+        assert_eq!(reclaimed.expired_lease, claim.lease);
+        assert_eq!(reclaimed.reclaimed_at, now);
+        let retry_at = now
+            .checked_add(SignedDuration::from_secs(1))
+            .map_err(ctx("now + 1s"))?;
+        assert_eq!(reclaimed.retry_scheduled_for, Some(retry_at));
+
+        let persisted = store.get(&work_id)?;
+        assert_eq!(persisted.job.state, JobState::Ready);
+        assert_eq!(persisted.job.attempts, 1);
+        assert!(persisted.lease.is_none());
+        assert!(persisted.completion.is_none());
+        assert_eq!(persisted.not_before, retry_at);
+        assert!(persisted.lease_epoch > claim.token.epoch);
+        assert_eq!(
+            recorded_events(&sink).last(),
+            Some(&JobLifecycleEvent {
+                work_id: work_id.clone(),
+                state: JobState::Ready,
+                revision: persisted.revision,
+            })
+        );
+
+        // Der alte Halter kann weder abschließen noch verlängern.
+        assert!(matches!(
+            store.complete(
+                &work_id,
+                &CompleteRequest {
+                    token: claim.token.clone(),
+                    completed_at: now,
+                    outcome: JobOutcome::Succeeded {
+                        result: serde_json::json!({}),
+                    },
+                },
+            ),
+            Err(SessionStoreError::LeaseTokenMismatch { .. })
+        ));
+        assert!(matches!(
+            store.renew(&RenewalRequest {
+                token: claim.token,
+                now,
+            }),
+            Err(SessionStoreError::LeaseTokenMismatch { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn reclaim_fails_the_job_once_the_retry_budget_is_exhausted() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-reclaim-exhausted");
+        let mut stored = record(work_id.as_str())?;
+        stored.job.attempts = 1;
+        store.admit(&stored)?;
+        let now = Timestamp::now();
+        claim_for(&store, &work_id, now)?;
+
+        let reclaimed = store.reclaim(&work_id, now, operator())?;
+        assert_eq!(reclaimed.retry_scheduled_for, None);
+        let persisted = store.get(&work_id)?;
+        assert_eq!(persisted.job.state, JobState::Failed);
+        assert_eq!(persisted.job.attempts, 2);
+        assert!(persisted.lease.is_none());
+        assert!(matches!(
+            persisted.completion.map(|done| done.outcome),
+            Some(JobOutcome::Failed { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn reclaim_rejects_a_job_that_is_not_running_and_writes_nothing() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-reclaim-ready");
+        store.admit(&record(work_id.as_str())?)?;
+        let before = store.get(&work_id)?;
+
+        assert!(matches!(
+            store.reclaim(&work_id, Timestamp::now(), operator()),
+            Err(SessionStoreError::JobRuntime { .. })
+        ));
+        let after = store.get(&work_id)?;
+        assert_eq!(after, before);
+        Ok(())
+    }
 }
