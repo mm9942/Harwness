@@ -156,8 +156,12 @@ async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
             let mut lines = vec![format!("{} aktive(r) Child-Agent(s):", children.len())];
             for record in &children {
                 lines.push(format!(
-                    "- {} (role={}, depth={}, lease_expires_at={})",
-                    record.child, record.role, record.depth, record.lease_expires_at
+                    "- {} (role={}, model={}, depth={}, lease_expires_at={})",
+                    record.child,
+                    record.role,
+                    record.model.as_deref().unwrap_or("-"),
+                    record.depth,
+                    record.lease_expires_at
                 ));
             }
             Ok(OpOutput::from(lines.join(
@@ -611,6 +615,9 @@ mod tests {
             trace: None,
             status: harw_core::child_controller::ChildStatus::Running,
             task_complexity: None,
+            model: None,
+            consumed: harw_core::child_controller::ChildUsage::default(),
+            charged_to_parent: harw_core::child_controller::ChildUsage::default(),
             live: harw_core::child_controller::ChildLiveStats {
                 usage: harw_types::TokenUsage {
                     input_tokens: tokens.0,

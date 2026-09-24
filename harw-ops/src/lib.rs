@@ -14,13 +14,14 @@
 //!   registriert (z. B. via `inventory::submit!` durch Extension-Crate).
 //!
 //! # Op-Set
-//! **Grundausstattung** ([`register_all`], 37 Ops): `help`, `status`, `quit`,
+//! **Grundausstattung** ([`register_all`], 42 Ops): `help`, `status`, `quit`,
 //! `new`, `work`, `ps`, `attach`, `stop`, `diff`, `agent`, `skills`, `plugins`,
 //! `model`, `provider`, `uia-model`, `uia-provider`, `permissions`, `compact`,
 //! `memory`, `effort`, `mode`, `context-proposal`, `approval.pending`,
 //! `approval.resolve`, `add-workdir`, `export`, `usage`, `bug-report`,
 //! `approve`, `deny`, `review`, `cancel`, `retry`, `provider-concurrency`,
-//! `uia-worker-model`, `uia-effort`, `sandbox-lease`.
+//! `uia-worker-model`, `uia-effort`, `sandbox-lease`, `models`, `workbench`,
+//! `kanban`, `diary`, `palace`.
 //! `uia-worker-model` (Welle 2, harw-ops/src/model.rs) und `uia-effort`
 //! (harw-ops/src/effort.rs) waren implementiert, aber bis zu diesem Knoten
 //! nicht in `register_all` eingetragen — dadurch existierten `/uia-worker-model`
@@ -160,16 +161,20 @@ pub mod compact;
 pub(crate) mod config_util;
 pub mod context_proposal;
 pub mod deny;
+pub mod diary;
 pub mod diff;
 pub mod effort;
 pub mod explore;
 pub mod export;
 pub mod goal;
 pub mod help;
+pub mod kanban;
 pub mod memory;
 pub mod mode;
 pub mod model;
+pub mod models;
 pub mod new;
+pub mod palace;
 pub mod permissions;
 pub mod plan;
 pub mod plugins;
@@ -189,6 +194,7 @@ pub(crate) mod test_support;
 pub(crate) mod testutil;
 pub mod usage;
 pub mod work;
+pub mod workbench;
 
 use std::sync::{Arc, OnceLock};
 
@@ -237,7 +243,7 @@ fn compact_unavailable_output() -> OpOutput {
     OpOutput::from(crate::compact::COMPACT_HINT.to_owned())
 }
 
-/// Registriert alle 36 in dieser Crate definierten Kern-Operationen in der Registry.
+/// Registriert alle 42 in dieser Crate definierten Kern-Operationen in der Registry.
 ///
 /// # Beschreibung
 /// Fügt der übergebenen [`OperationRegistry`] eine `Arc<dyn Operation>`-Instanz
@@ -246,7 +252,8 @@ fn compact_unavailable_output() -> OpOutput {
 /// plugins, model, provider, uia-model, uia-provider, permissions, compact,
 /// memory, effort, mode, context-proposal, approval.pending, approval.resolve,
 /// add-workdir, export, usage, bug-report, approve, deny, review, cancel, retry,
-/// provider-concurrency, uia-worker-model, uia-effort, sandbox-lease`.
+/// provider-concurrency, uia-worker-model, uia-effort, sandbox-lease, models,
+/// workbench, kanban, diary, palace`.
 ///
 /// Die Reihenfolge steuert nur die `iter()`-Reihenfolge und den Fallback-Namens-
 /// Vorschlag; die eigentliche Auflösung erfolgt über `find_by_name` /
@@ -266,7 +273,7 @@ fn compact_unavailable_output() -> OpOutput {
 ///
 /// let mut registry = OperationRegistry::new();
 /// harw_ops::register_all(&mut registry);
-/// assert_eq!(registry.len(), 37);
+/// assert_eq!(registry.len(), 42);
 /// assert!(registry.find_by_name("help").is_some());
 /// assert!(registry.find_by_command("/uia-provider").is_some());
 /// assert!(registry.find_by_command("/uia-model").is_some());
@@ -288,9 +295,14 @@ fn compact_unavailable_output() -> OpOutput {
 /// assert!(registry.find_by_command("/cancel").is_some());
 /// assert!(registry.find_by_command("/retry").is_some());
 /// assert!(registry.find_by_command("/sandbox-lease").is_some());
+/// assert!(registry.find_by_command("/models").is_some());
+/// assert!(registry.find_by_command("/workbench").is_some());
+/// assert!(registry.find_by_command("/kanban").is_some());
+/// assert!(registry.find_by_command("/diary").is_some());
+/// assert!(registry.find_by_command("/palace").is_some());
 /// ```
 pub fn register_all(registry: &mut OperationRegistry) {
-    let ops: [Arc<dyn Operation>; 37] = [
+    let ops: [Arc<dyn Operation>; 42] = [
         Arc::new(help::HelpOperation),
         Arc::new(status::StatusOperation),
         Arc::new(quit::QuitOperation),
@@ -375,6 +387,17 @@ pub fn register_all(registry: &mut OperationRegistry) {
         // anfordern kann (siehe Moduldoku, Abschnitt „Op-Set", und
         // `crate::sandbox_lease`-Moduldoku).
         Arc::new(sandbox_lease::SandboxLeaseOperation),
+        // `/models`: rollenbezogene Modellwahl (UIA, Worker, Orchestrator,
+        // interne Stellen) — Katalog-/Konfigurationsfläche wie `model` oben,
+        // Grundausstattung statt Planungsfläche.
+        Arc::new(models::ModelsOperation),
+        // Wissensfläche (`workbench`, `kanban`, `diary`, `palace`): Operator-
+        // Befehle auf dem Knowledge-Store der Session, unabhängig vom
+        // `[tools.plan]`-Gate.
+        Arc::new(workbench::WorkbenchOperation),
+        Arc::new(kanban::KanbanOperation),
+        Arc::new(diary::DiaryOperation),
+        Arc::new(palace::PalaceOperation),
     ];
     for op in ops {
         registry.register(op);
@@ -694,10 +717,10 @@ mod tests {
     }
 
     #[test]
-    fn register_all_adds_thirty_seven_operations() {
+    fn register_all_adds_forty_two_operations() {
         let mut reg = OperationRegistry::new();
         register_all(&mut reg);
-        assert_eq!(reg.len(), 37);
+        assert_eq!(reg.len(), 42);
     }
 
     #[test]
@@ -788,6 +811,11 @@ mod tests {
             "/cancel",
             "/retry",
             "/sandbox-lease",
+            "/models",
+            "/workbench",
+            "/kanban",
+            "/diary",
+            "/palace",
         ] {
             assert!(
                 reg.find_by_command(path).is_some(),
@@ -894,6 +922,11 @@ mod tests {
             // über den ein Modell selbst eine Host-Freigabe für
             // `shell.exec` anfordern kann.
             "sandbox-lease",
+            "models",
+            "workbench",
+            "kanban",
+            "diary",
+            "palace",
             "plan",
             "goal",
             "explore",
@@ -943,8 +976,8 @@ mod tests {
         register_all(&mut reg);
         assert_eq!(
             reg.len(),
-            37,
-            "first register_all must produce exactly 37 ops"
+            42,
+            "first register_all must produce exactly 42 ops"
         );
 
         // Attempt to register HelpOperation a second time via the fallible path.
@@ -958,8 +991,8 @@ mod tests {
         // Registry must not have grown — the rejected op was not inserted.
         assert_eq!(
             reg.len(),
-            37,
-            "registry must stay at 37 after a rejected duplicate"
+            42,
+            "registry must stay at 42 after a rejected duplicate"
         );
     }
 }

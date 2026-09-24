@@ -2903,16 +2903,16 @@ mod tests {
         let tampered = crate::state::Journal::from_jsonl(&text)?;
         assert!(matches!(replay(&loaded.scenario, &tampered), Err(MatrixError::Replay(_))));
 
-        // Weltwert manipulieren → state_hash weicht ab
+        // Verdeckten Weltwert manipulieren, den kein Argument berührt →
+        // state_hash am Rundenende weicht ab.
         let text = log.journal.to_jsonl()?;
-        let needle = "\"id\":\"stability\",\"label\":\"Öffentliche Ordnung\",\"visibility\":\"public\",\"value\":{\"kind\":\"track\",\"value\":0";
-        if text.contains(needle) {
-            let changed = text.replacen(needle, &needle.replace("\"value\":0", "\"value\":1"), 1);
-            let tampered = crate::state::Journal::from_jsonl(&changed)?;
-            assert!(replay(&loaded.scenario, &tampered).is_err());
-        } else {
-            return Err("Deklaration von stability nicht gefunden".into());
+        let needle = "\"id\":\"north_agents\",\"label\":\"Nordreich-Agenten im Hafen\",\"visibility\":\"seat:nord\",\"value\":{\"kind\":\"track\",\"value\":1";
+        if !text.contains(needle) {
+            return Err("Deklaration von north_agents nicht gefunden".into());
         }
+        let changed = text.replacen(needle, &needle.replace("\"value\":1", "\"value\":2"), 1);
+        let tampered = crate::state::Journal::from_jsonl(&changed)?;
+        assert!(matches!(replay(&loaded.scenario, &tampered), Err(MatrixError::Replay(_))));
         Ok(())
     }
 

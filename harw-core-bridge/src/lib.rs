@@ -18,6 +18,10 @@
 //!   Verschärfung von Agent-Budgets.
 //! - [`fanout_children`] — nebenläufiger Fan-out gleichartiger Kinder als
 //!   Grundlage für `/analyze` und den Explore-Fan-out.
+//! - [`DelegateWaveOperation`] / [`delegate_wave`] — die Fan-out-Operation
+//!   der Orchestratoren (`delegate_wave`): eine Welle von Kind-Agenten mit
+//!   Ziel-Admission ([`admit_targets`]) und Budget-Deckel
+//!   ([`wave_budget_cap`]).
 //!
 //! # Nebenläufigkeit
 //! Alle exportierten Typen sind `Send + Sync`, sofern die Trait-Implementierung
@@ -25,12 +29,19 @@
 
 mod agent_tool;
 mod context_ext;
+mod delegate_wave;
 
 pub use agent_tool::{
     AgentProductAdapter, AgentToolAdapter, ChildReturnContract, fanout_children, parse_budget_hint,
     tighten_budget,
 };
 pub use context_ext::OpContextCoreExt;
+pub use delegate_wave::{
+    DEFAULT_MAX_PARALLEL, DELEGATE_WAVE_TOOL, DeclaredTargets, DelegateWaveOperation,
+    DelegateWavePolicy, DelegateWaveReport, DelegateWaveRequest, MAX_WAVE_TARGETS, ReducerForRole,
+    TargetReport, TargetStatus, TargetsForCaller, WaveComplexity, WaveJoin, WaveTarget,
+    admit_targets, delegate_wave, wave_budget_cap,
+};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

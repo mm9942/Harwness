@@ -39,6 +39,10 @@ pub struct AgentOrchestrationEvent {
     /// Bisher abgeschlossene Tool-Aufrufe des Kindes (Live-Fortschritt).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<u32>,
+    /// Das vom Kind angesprochene Modell (gepinntes Kind-Modell, sonst das
+    /// `active_model` der Kind-Session); `None`, wenn unbekannt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl AgentOrchestrationEvent {

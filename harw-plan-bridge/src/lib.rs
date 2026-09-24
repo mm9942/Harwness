@@ -94,7 +94,10 @@ pub mod metrics;
 pub mod plan_context;
 pub mod security_bridge;
 
-pub use crate::cells::CellPlan;
+pub use crate::cells::{
+    CellPlan, CellRun, CellSchedule, CellStage, MemberOutcome, ResolvedWave, SkipReason,
+    batches_for_items, resolve_wave, run_cell,
+};
 pub use crate::context_ext::{OpContextPlanExt, register_plan_services};
 pub use crate::controller::{PlanController, ReconcileInput, ReconcileStep};
 pub use crate::error::{PlanBridgeError, PlanBridgeResult};

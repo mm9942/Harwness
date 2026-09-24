@@ -9504,4 +9504,230 @@ max_depth = 0
         );
         Ok(())
     }
+
+    // --- Budget-Anrechnung an den Elternteil --------------------------------
+
+    fn edit_record(
+        spawner: &ManagedAgentSpawner,
+        child: &SessionId,
+        edit: impl FnOnce(&mut ChildRecord),
+    ) -> TestResult {
+        let mut active = spawner
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let record = active
+            .get_mut(child.as_str())
+            .ok_or(TestError::Missing("child record exists"))?;
+        edit(record);
+        Ok(())
+    }
+
+    fn consumed_of(spawner: &ManagedAgentSpawner, child: &SessionId) -> TestResult<ChildUsage> {
+        spawner
+            .child_record(child)
+            .map(|record| record.consumed)
+            .ok_or(TestError::Missing("child record exists"))
+    }
+
+    #[test]
+    fn remaining_budget_subtracts_consumption_and_keeps_unset_dimensions() -> TestResult {
+        let (spawner, children) = runnable_children(
+            Arc::new(EchoChildRegistry { reply: "done" }),
+            true,
+            1,
+            empty_registry,
+        )?;
+        let child = children[0].clone();
+        edit_record(&spawner, &child, |record| {
+            record.budget = AgentBudget {
+                max_tokens: Some(100),
+                max_wall_time_ms: Some(50),
+                ..AgentBudget::default()
+            };
+            record.consumed = ChildUsage {
+                tokens: 30,
+                tool_calls: 7,
+                wall_time_ms: 80,
+            };
+        })?;
+
+        let remaining = spawner
+            .remaining_budget(&child)
+            .ok_or(TestError::Missing("admitted child has a remaining budget"))?;
+        assert_eq!(remaining.max_tokens, Some(70));
+        assert_eq!(remaining.max_tool_calls, None, "unset stays unset");
+        assert_eq!(remaining.max_wall_time_ms, Some(0), "saturates at zero");
+        assert_eq!(spawner.remaining_budget(&SessionId::new()), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_reports_its_usage_and_charges_the_direct_parent() -> TestResult {
+        let (spawner, children) = runnable_children(
+            Arc::new(EchoChildRegistry { reply: "done" }),
+            true,
+            2,
+            empty_registry,
+        )?;
+        let (parent, child) = (children[0].clone(), children[1].clone());
+        edit_record(&spawner, &child, |record| record.parent = parent.clone())?;
+        let store = InMemoryStateStore::new();
+
+        let result = spawner
+            .run_child_with_budget(
+                &child,
+                &store,
+                None,
+                TurnInput::user("work"),
+                AgentBudget::default(),
+            )
+            .await
+            .map_err(ctx("child run completes"))?;
+
+        assert_eq!(consumed_of(&spawner, &child)?, result.usage);
+        assert_eq!(consumed_of(&spawner, &parent)?, result.usage);
+        Ok(())
+    }
+
+    #[test]
+    fn usage_propagates_one_level_at_a_time_without_double_counting() -> TestResult {
+        let (spawner, children) = runnable_children(
+            Arc::new(EchoChildRegistry { reply: "done" }),
+            true,
+            3,
+            empty_registry,
+        )?;
+        let (top, middle, leaf) = (
+            children[0].clone(),
+            children[1].clone(),
+            children[2].clone(),
+        );
+        edit_record(&spawner, &middle, |record| record.parent = top.clone())?;
+        edit_record(&spawner, &leaf, |record| record.parent = middle.clone())?;
+
+        let run = ChildUsage {
+            tokens: 10,
+            tool_calls: 2,
+            wall_time_ms: 5,
+        };
+        spawner.charge_run_usage(&leaf, run);
+        assert_eq!(consumed_of(&spawner, &leaf)?, run);
+        assert_eq!(consumed_of(&spawner, &middle)?, run);
+        assert_eq!(
+            consumed_of(&spawner, &top)?,
+            ChildUsage::default(),
+            "only the direct parent is charged"
+        );
+
+        spawner.charge_run_usage(&middle, ChildUsage::default());
+        assert_eq!(consumed_of(&spawner, &top)?, run);
+        // Ein zweiter Lauf ohne neuen Verbrauch verbucht nichts doppelt.
+        spawner.charge_run_usage(&middle, ChildUsage::default());
+        assert_eq!(consumed_of(&spawner, &top)?, run);
+
+        // Nachträglicher Verbrauch des Blatts kommt über `close_child` nach oben.
+        edit_record(&spawner, &leaf, |record| {
+            record.consumed = record.consumed.saturating_add(ChildUsage {
+                tokens: 5,
+                ..ChildUsage::default()
+            });
+        })?;
+        spawner.close_child(&leaf);
+        assert_eq!(consumed_of(&spawner, &middle)?.tokens, 15);
+        spawner.close_child(&middle);
+        assert_eq!(consumed_of(&spawner, &top)?.tokens, 15);
+        assert_eq!(consumed_of(&spawner, &top)?.tool_calls, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn admission_caps_the_child_budget_by_the_parents_remainder() -> TestResult {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events.clone())));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
+        let root_session = AgentSession::new(
+            AgentRole::Agent {
+                name: "root".to_owned(),
+            },
+            None,
+            ExtensionRegistryBuilder::default().build(),
+            events,
+        )
+        .with_spawn_context(SpawnContext {
+            sandbox: sandbox.clone(),
+            suggestions: None,
+            capability_snapshot: None,
+            approval_actor: None,
+            organizational_role: harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+            allowed_child_orchestrators: vec!["manager".to_owned()],
+            trace: None,
+            ceiling: None,
+        });
+        let root = root_session.id().clone();
+        manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .restore(root_session)
+            .map_err(ctx("root session restores"))?;
+        let spawner = ManagedAgentSpawner::new(Arc::clone(&manager), ChildLimits::conservative())
+            .with_role(
+                "manager",
+                AgentRole::Agent {
+                    name: "manager".to_owned(),
+                },
+                harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator,
+                Arc::new(EmptyChildRegistry),
+            )
+            .with_role(
+                "worker",
+                AgentRole::Agent {
+                    name: "worker".to_owned(),
+                },
+                harw_agent_dsl::roles::AgentRoleId::Worker,
+                Arc::new(EmptyChildRegistry),
+            );
+
+        let child = spawner
+            .admit("manager", spawn_input(root.clone()), sandbox.clone(), None)
+            .map_err(ctx("child is admitted"))?;
+        assert_eq!(
+            spawner.remaining_budget(&root),
+            None,
+            "a root has no record"
+        );
+        edit_record(&spawner, &child, |record| {
+            record.budget = AgentBudget {
+                max_tokens: Some(100),
+                ..AgentBudget::default()
+            };
+            record.consumed = ChildUsage {
+                tokens: 40,
+                ..ChildUsage::default()
+            };
+        })?;
+
+        let grandchild = spawner
+            .admit("worker", spawn_input(child.clone()), sandbox.clone(), None)
+            .map_err(ctx("grandchild is admitted inside the remainder"))?;
+        let capped = spawner
+            .child_budget(&grandchild)
+            .ok_or(TestError::Missing("grandchild is tracked"))?;
+        assert_eq!(capped.max_tokens, Some(60));
+        assert_eq!(capped.max_tool_calls, None);
+
+        edit_record(&spawner, &child, |record| {
+            record.consumed.tokens = 100;
+        })?;
+        let Err(error) = spawner.admit("worker", spawn_input(child), sandbox, None) else {
+            return Err(TestError::Unexpected(
+                "an exhausted parent budget must reject the admission".to_owned(),
+            ));
+        };
+        assert_eq!(
+            error.message,
+            "budget_exceeded: tokens (limit=100, used=100)"
+        );
+        Ok(())
+    }
 }
