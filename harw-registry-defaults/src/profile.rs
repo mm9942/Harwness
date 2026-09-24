@@ -636,10 +636,12 @@ pub enum RegistryProfile {
     /// Schnellhelfer der UIA (Addendum I, korrigiert REG-DE): lesender
     /// Workspace-Zugriff (`FS_READ_ONLY_TOOLS`) plus `doc.read_pdf`
     /// (`DOC_TOOLS`) plus `shell.exec` (`SHELL_TOOLS`, läuft wie überall über
-    /// Sandbox+Freigabe) plus ausschließlich `web.fetch` plus ausschließlich
-    /// `browser.open` (Nutzerentscheidung, siehe
-    /// [`UIA_QUICK_HELPER_BROWSER_TOOLS`]) — kein `fs.write`, kein `deps.*`,
-    /// kein `lens.ask`, keine der übrigen sechs `browser.*`-Werkzeuge.
+    /// Sandbox+Freigabe) plus die fünf lesenden `deps.*`-Werkzeuge
+    /// ([`DEPS_TOOLS`]) plus `web.fetch`/`web.search`
+    /// ([`EXPLORER_WEB_TOOLS`]) plus ausschließlich `browser.open`
+    /// (Nutzerentscheidung, siehe [`UIA_QUICK_HELPER_BROWSER_TOOLS`]) — kein
+    /// `fs.write`, kein `web.docs_rs`/`web.crates_io`, kein `lens.ask`, keine
+    /// der übrigen sechs `browser.*`-Werkzeuge.
     ///
     /// # Warum dieses Profil existiert (Addendum I)
     /// [`role_names::UIA_WORKER`] war zuvor auf [`RegistryProfile::Research`]
@@ -647,9 +649,22 @@ pub enum RegistryProfile {
     /// Addendum I korrigiert das: `uia-worker` ist der exklusive
     /// Schnellhelfer der UIA für kleine Schnelleingriffe — eine Frage mit
     /// einem Aufruf beantworten, schnell etwas in der Shell regeln, eine
-    /// Datei lesen — nicht nur Netz-Recherche. `web.fetch` bleibt die
-    /// einzige Netz-Oberfläche (kein `web.docs_rs`/`web.crates_io`, die für
-    /// tiefere Recherche gedacht sind, siehe `RegistryProfile::Research`).
+    /// Datei lesen — nicht nur Netz-Recherche.
+    ///
+    /// # Warum `web.search` und `deps.*` (spätere Nutzerentscheidung)
+    /// `uia-worker` recherchiert kurz online und fügt manchmal eine
+    /// Abhängigkeit hinzu. Dafür bekommt das Profil neben `web.fetch` auch
+    /// `web.search` ([`EXPLORER_WEB_TOOLS`], wie der Explorer) und die rein
+    /// lesenden Dependency-Werkzeuge ([`DEPS_TOOLS`]: `deps.graph`/
+    /// `deps.locked` über `ReadWorkspace`, `deps.source_*` über
+    /// `ReadCargoRegistry`), um vorhandene Versionen und Quellen zu prüfen,
+    /// bevor eine Abhängigkeit dazukommt. `web.docs_rs`/`web.crates_io`
+    /// bleiben der tieferen Recherche vorbehalten
+    /// (`RegistryProfile::Research`). Das Netz ist dabei nie weiter als das
+    /// des Elternteils: der Reducer der Rolle ist
+    /// [`crate::authority::AuthorityReducer::ReadExplore`], die Kind-Sandbox
+    /// erbt Recht und Host-Scope des Elternteils, und jeder Abruf läuft
+    /// zusätzlich durch die prozessweite Egress-Policy.
     ///
     /// # Warum `browser.open` (spätere Nutzerentscheidung)
     /// `uia-worker` darf `browser.open` benutzen — `agents/uia-worker.toml`
@@ -700,10 +715,12 @@ pub enum RegistryProfile {
     /// `web.fetch`/`web.search`), aber ohne `deps.*` — siehe
     /// `agents/uia-explorer.toml`.
     UiaExplorer,
-    /// Schreibende Erkundungsspezialisierung der UIA: [`UiaExplorer`] plus
-    /// `fs.write` (alle sechs `fs.*`-Werkzeuge, [`FS_FULL_TOOLS`]) plus
-    /// [`DOC_TOOLS`] (`doc.read_pdf`) plus [`UIA_QUICK_HELPER_WEB_TOOLS`] —
-    /// kein `shell.exec`, kein `deps.*`, kein `lens.ask`.
+    /// Schreibende Erkundungsspezialisierung der UIA: alle sechs
+    /// `fs.*`-Werkzeuge inklusive `fs.write` ([`FS_FULL_TOOLS`]) plus
+    /// [`DOC_TOOLS`] (`doc.read_pdf`) plus die fünf lesenden
+    /// `deps.*`-Werkzeuge ([`DEPS_TOOLS`]) plus `web.fetch`/`web.search`
+    /// ([`EXPLORER_WEB_TOOLS`]) — kein `shell.exec`, kein
+    /// `web.docs_rs`/`web.crates_io`, kein `lens.ask`, kein `explore.*`.
     ///
     /// # Warum dieses Profil existiert
     /// Dieselbe Begründung wie bei [`RegistryProfile::UiaExplorer`]: ein
@@ -711,6 +728,14 @@ pub enum RegistryProfile {
     /// braucht `fs.write` unter der für die UIA zugelassenen
     /// Organisationsrolle `role = "uia-worker"` — siehe
     /// `agents/uia-writer.toml` und [`role_names::UIA_WRITER`].
+    ///
+    /// # Warum `web.search` und `deps.*` (Nutzerentscheidung)
+    /// `uia-writer` fügt manchmal eine Abhängigkeit hinzu und recherchiert
+    /// dafür kurz online: `web.search`/`web.fetch` für die Recherche,
+    /// `deps.*` (rein lesend), um `Cargo.lock` und vorhandene Quellen zu
+    /// prüfen, bevor `fs.write` das Manifest ändert. Netz bleibt an den
+    /// Elternteil gebunden — siehe dieselbe Begründung bei
+    /// [`RegistryProfile::UiaQuickHelper`].
     UiaWriter,
     /// Host-Shell-Spezialisierung der UIA: [`FS_READ_ONLY_TOOLS`] plus
     /// [`DOC_TOOLS`] (`doc.read_pdf`) plus [`SHELL_TOOLS`] — kein `fs.write`,
@@ -897,15 +922,16 @@ impl RegistryProfile {
                 .copied()
                 .collect(),
             // Schnellhelfer der UIA (Addendum I): lesender fs.*-Kern plus
-            // `doc.read_pdf` plus `shell.exec` plus ausschließlich
-            // `web.fetch` plus ausschließlich `browser.open`
-            // (Nutzerentscheidung) — siehe die Begründung bei
-            // `RegistryProfile::UiaQuickHelper`.
+            // `doc.read_pdf` plus `shell.exec` plus die lesenden `deps.*`
+            // plus `web.fetch`/`web.search` plus ausschließlich
+            // `browser.open` (Nutzerentscheidungen) — siehe die Begründung
+            // bei `RegistryProfile::UiaQuickHelper`.
             RegistryProfile::UiaQuickHelper => FS_READ_ONLY_TOOLS
                 .iter()
                 .chain(DOC_TOOLS.iter())
                 .chain(SHELL_TOOLS.iter())
-                .chain(UIA_QUICK_HELPER_WEB_TOOLS.iter())
+                .chain(DEPS_TOOLS.iter())
+                .chain(EXPLORER_WEB_TOOLS.iter())
                 .chain(UIA_QUICK_HELPER_BROWSER_TOOLS.iter())
                 .copied()
                 .collect(),
@@ -939,11 +965,13 @@ impl RegistryProfile {
             // Schreibende Erkundungsspezialisierung der UIA (siehe die
             // Begründung bei `RegistryProfile::UiaWriter`): alle sechs
             // fs.*-Werkzeuge (inklusive `fs.write`) plus `doc.read_pdf` plus
-            // ausschließlich `web.fetch` — kein `deps.*`, kein `shell.exec`.
+            // die lesenden `deps.*` plus `web.fetch`/`web.search` — kein
+            // `shell.exec`.
             RegistryProfile::UiaWriter => FS_FULL_TOOLS
                 .iter()
                 .chain(DOC_TOOLS.iter())
-                .chain(UIA_QUICK_HELPER_WEB_TOOLS.iter())
+                .chain(DEPS_TOOLS.iter())
+                .chain(EXPLORER_WEB_TOOLS.iter())
                 .copied()
                 .collect(),
             // Host-Shell-Spezialisierung der UIA (siehe die Begründung bei
@@ -1105,7 +1133,8 @@ pub fn profile_for_role(role: &str) -> Option<RegistryProfile> {
         // `uia-worker` ist der exklusive Schnellhelfer der UIA (Addendum I,
         // korrigiert REG-DE) — nicht mehr nur Netz-Recherche
         // (`RegistryProfile::Research`), sondern lesender Workspace-Zugriff
-        // plus `shell.exec` plus `web.fetch`, siehe `agents/uia-worker.toml`
+        // plus `shell.exec` plus lesende `deps.*` plus `web.fetch`/
+        // `web.search`, siehe `agents/uia-worker.toml`
         // und die Begründung bei `RegistryProfile::UiaQuickHelper`.
         role_names::UIA_WORKER => Some(RegistryProfile::UiaQuickHelper),
         // Read-only Erkundungsspezialisierung der UIA — siehe die Begründung
@@ -1542,8 +1571,9 @@ fn profile_tool_providers(
         }
         // Schnellhelfer der UIA (Addendum I): gefilterter, lesender
         // FS-Provider + lesender Doc-Provider + voller Shell-Provider
-        // (Sandbox+Freigabe greifen wie überall) + auf `web.fetch`
-        // gefilterter Web-Provider.
+        // (Sandbox+Freigabe greifen wie überall) + vollständig lesender
+        // Deps-Provider + auf `web.fetch`/`web.search` gefilterter
+        // Web-Provider.
         RegistryProfile::UiaQuickHelper => {
             let filesystem: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
                 Arc::new(FsToolProvider::default()),
@@ -1551,11 +1581,12 @@ fn profile_tool_providers(
             ));
             let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
             let shell = build_shell_provider(sandbox_profile);
+            let dependencies: Arc<dyn ToolProvider> = Arc::new(DepsToolProvider::new());
             let web: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
                 Arc::new(WebToolProvider::new()),
-                UIA_QUICK_HELPER_WEB_TOOLS,
+                EXPLORER_WEB_TOOLS,
             ));
-            vec![filesystem, doc, shell, web]
+            vec![filesystem, doc, shell, dependencies, web]
         }
         // `agent-steward` (Addendum K + Nachtrag K/K2/K3): gefilterter,
         // lesender FS-Provider + der Agentendefinitions-Provider, dessen
@@ -1609,17 +1640,19 @@ fn profile_tool_providers(
         }
         // Schreibende Erkundungsspezialisierung der UIA: voller, ungefilterter
         // FS-Provider (alle sechs `fs.*`, inklusive `fs.write`) + lesender
-        // Doc-Provider + auf `web.fetch` gefilterter Web-Provider — kein
+        // Doc-Provider + vollständig lesender Deps-Provider + auf
+        // `web.fetch`/`web.search` gefilterter Web-Provider — kein
         // `ShellToolProvider`. Siehe die Begründung bei
         // `RegistryProfile::UiaWriter`.
         RegistryProfile::UiaWriter => {
             let filesystem: Arc<dyn ToolProvider> = Arc::new(FsToolProvider::default());
             let doc: Arc<dyn ToolProvider> = Arc::new(DocToolProvider);
+            let dependencies: Arc<dyn ToolProvider> = Arc::new(DepsToolProvider::new());
             let web: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
                 Arc::new(WebToolProvider::new()),
-                UIA_QUICK_HELPER_WEB_TOOLS,
+                EXPLORER_WEB_TOOLS,
             ));
-            vec![filesystem, doc, web]
+            vec![filesystem, doc, dependencies, web]
         }
         // Host-Shell-Spezialisierung der UIA: gefilterter, lesender
         // FS-Provider + lesender Doc-Provider + Shell-Provider — anders als
@@ -2505,6 +2538,59 @@ mod tests {
                 "web.search",
             ]
         );
+        Ok(())
+    }
+
+    /// Nutzerentscheidung „UIA-Helfer recherchieren kurz online und fügen
+    /// manchmal Abhängigkeiten hinzu“: `UiaQuickHelper` (`uia-worker`) und
+    /// `UiaWriter` (`uia-writer`) registrieren tatsächlich die fünf lesenden
+    /// `deps.*`-Werkzeuge und `web.fetch`/`web.search` — nie
+    /// `web.docs_rs`/`web.crates_io` — und brauchen dafür genau
+    /// `ReadCargoRegistry` und `NetworkAccess` zusätzlich.
+    #[test]
+    fn test_uia_helpers_register_web_search_and_read_only_deps_tools() -> TestResult {
+        use harw_authority::Permission;
+
+        const DEPS_AND_WEB: [&str; 7] = [
+            "deps.graph",
+            "deps.locked",
+            "deps.source_read",
+            "deps.source_search",
+            "deps.source_list",
+            "web.fetch",
+            "web.search",
+        ];
+        let quick = registered_names(&assemble(RegistryProfile::UiaQuickHelper)?);
+        let mut expected_quick: Vec<&str> = FS_READ_ONLY_TOOLS
+            .iter()
+            .chain(DOC_TOOLS.iter())
+            .chain(SHELL_TOOLS.iter())
+            .copied()
+            .collect();
+        expected_quick.extend(DEPS_AND_WEB);
+        assert_eq!(quick, expected_quick);
+
+        let writer = registered_names(&assemble(RegistryProfile::UiaWriter)?);
+        let mut expected_writer: Vec<&str> = FS_FULL_TOOLS
+            .iter()
+            .chain(DOC_TOOLS.iter())
+            .copied()
+            .collect();
+        expected_writer.extend(DEPS_AND_WEB);
+        assert_eq!(writer, expected_writer);
+
+        for profile in [RegistryProfile::UiaQuickHelper, RegistryProfile::UiaWriter] {
+            let names = profile.registered_tool_names();
+            for deeper in ["web.docs_rs", "web.crates_io", "lens.ask"] {
+                assert!(!names.contains(&deeper), "{profile:?}: {deeper}");
+            }
+            let required = profile.required_permissions();
+            assert!(required.contains(Permission::NetworkAccess), "{profile:?}");
+            assert!(
+                required.contains(Permission::ReadCargoRegistry),
+                "{profile:?}"
+            );
+        }
         Ok(())
     }
 

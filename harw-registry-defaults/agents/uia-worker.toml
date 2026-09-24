@@ -27,6 +27,18 @@
 # Die uebrigen sechs `browser.*`-Werkzeuge (`observe`/`find`/`act`/`wait`/
 # `events`/`close`) bleiben ausdruecklich verboten — keine Rolle admittiert
 # sie, `uia-worker` eingeschlossen.
+#
+# Nutzerentscheidung (ersetzt "ausschliesslich `web.fetch` — kein `deps.*`"
+# aus Addendum I): `uia-worker` recherchiert kurz online und fuegt manchmal
+# eine Abhaengigkeit hinzu. Die Rolle admittiert deshalb zusaetzlich
+# `web.search` und die fuenf rein lesenden `deps.*`-Werkzeuge
+# (`deps.graph`/`deps.locked` ueber `ReadWorkspace`, `deps.source_*` ueber
+# `ReadCargoRegistry`), um Versionen und Quellen vor dem Hinzufuegen zu
+# pruefen. `web.docs_rs`/`web.crates_io` bleiben `researcher-web`
+# vorbehalten. Netz ist nie weiter als das des Elternteils: Reducer
+# `reduce_to_read_explore` (`AuthorityReducer::ReadExplore`), die
+# Kind-Sandbox erbt Recht und Host-Scope des Elternteils, und jeder Abruf
+# laeuft zusaetzlich durch die Egress-Policy.
 
 schema = "harwness.agent/v1"
 id = "harwness.agent.uia-worker@1"
@@ -47,18 +59,19 @@ admitted = [
   "fs.grep",
   "doc.read_pdf",
   "shell.exec",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
   "web.fetch",
+  "web.search",
   "browser.open",
 ]
 forbidden = [
   "fs.write",
   "web.docs_rs",
   "web.crates_io",
-  "deps.graph",
-  "deps.locked",
-  "deps.source_read",
-  "deps.source_search",
-  "deps.source_list",
   "lens.ask",
   "browser.observe",
   "browser.find",

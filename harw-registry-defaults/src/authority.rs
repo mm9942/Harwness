@@ -101,16 +101,22 @@ pub const REDUCE_TO_READ_WORKSPACE_NETWORK: &str = "reduce_to_read_workspace_net
 /// `ReadWorkspace` (Annahme A5): wer ins Netz darf, liest keine
 /// Workspace-Daten, die er hinaustragen könnte.
 ///
-/// **Ausnahme Explorer-Netz** (Nutzerentscheidung „der Explorer durchsucht
-/// auch das Internet“): `ReadExplore` und `ReadWorkspaceNetwork` tragen
-/// `NetworkAccess` gemeinsam mit `ReadWorkspace` — ausschließlich für die
-/// Rollen, deren TOML `web.fetch`/`web.search` admittiert und die das per
+/// **Ausnahme Explorer-Netz** (Nutzerentscheidungen „der Explorer durchsucht
+/// auch das Internet“ und „die UIA-Helfer recherchieren kurz online und
+/// fügen manchmal Abhängigkeiten hinzu“): `ReadExplore` und
+/// `ReadWorkspaceNetwork` tragen `NetworkAccess` gemeinsam mit
+/// `ReadWorkspace` — ausschließlich für die Rollen, deren TOML
+/// `web.fetch`/`web.search` admittiert und die das per
 /// [`authority_reducer_for_role`] zugewiesen bekommen (`explorer`,
-/// `uia-explorer`). Der Host-Scope des Kindes bleibt dabei an die
+/// `uia-worker`, `uia-writer` → `ReadExplore`; `uia-explorer` →
+/// `ReadWorkspaceNetwork`). Der Host-Scope des Kindes bleibt dabei an die
 /// Egress-Policy gebunden: die Sandbox-Hälfte in `harw-core-bridge` reicht nur
 /// den (egress-gebundenen) Scope des Elternteils als Obergrenze durch, genau
-/// wie bei `ReadNetwork` (`researcher-web`). `ReadRegistry` (`analyst`,
-/// `researcher-deps`, `planner` …) bleibt ohne Netz.
+/// wie bei `ReadNetwork` (`researcher-web`); ein über den Handoff gestartetes
+/// Kind erbt Sandbox und Host-Scope des Elternteils unverändert
+/// (`ensure_child_of`), nie mehr. `ReadRegistry` (`analyst`,
+/// `researcher-deps`, `planner` …) und `ReadOnly` (Triage-Rollen …) bleiben
+/// ohne Netz.
 ///
 /// # Varianten
 /// - `ReadOnly` — `{ReadWorkspace}`.
@@ -141,7 +147,7 @@ pub enum AuthorityReducer {
     /// Nur ausgehendes Netz über die Egress-Policy; kein Workspace.
     ReadNetwork,
     /// Workspace und Registry-Quellcache lesen plus ausgehendes Netz über die
-    /// Egress-Policy (`explorer`).
+    /// Egress-Policy (`explorer`, `uia-worker`, `uia-writer`).
     ReadExplore,
     /// Workspace lesen plus ausgehendes Netz über die Egress-Policy
     /// (`uia-explorer`).
@@ -258,7 +264,9 @@ pub fn reduce_to_read_network(granted: &PermissionSet) -> PermissionSet {
 }
 
 /// Verengt `granted` auf `{ReadWorkspace, ReadCargoRegistry, NetworkAccess}` —
-/// der Reducer für `explorer` (Workspace, Dependency-Quellen und Websuche).
+/// der Reducer für `explorer` (Workspace, Dependency-Quellen und Websuche)
+/// sowie für den weitergebbaren Lese-/Netzanteil von `uia-worker` und
+/// `uia-writer`.
 ///
 /// # Argumente
 /// - `granted` (`&PermissionSet`): Rechte des Elternteils.
@@ -302,11 +310,13 @@ pub fn reduce_to_read_workspace_network(granted: &PermissionSet) -> PermissionSe
 ///   `MemoryStewardship`; nächstliegender Reducer gleicher Lese-Reichweite).
 /// - `executor` → [`AuthorityReducer::ReadOnly`] (Profil `ShellExecution`;
 ///   engste Kennung des Vokabulars, analog den Triage-Rollen).
-/// - `uia-worker` → [`AuthorityReducer::ReadOnly`] (Profil
-///   `UiaQuickHelper`, Addendum I; **Muster `executor`**, dieselbe
-///   Ausnahme — die Rolle registriert `shell.exec`/`web.fetch`, kein
-///   Reducer trägt je `ExecuteProcess` oder `NetworkAccess` gemeinsam mit
-///   `ReadWorkspace` weiter, siehe die Ausnahme-Begründung unten).
+/// - `uia-worker` → [`AuthorityReducer::ReadExplore`] (Profil
+///   `UiaQuickHelper`, Addendum I + Nutzerentscheidung „kurz online
+///   recherchieren, manchmal Abhängigkeiten hinzufügen“): die Obergrenze
+///   trägt den Workspace-Lesezugriff, den Registry-Quellcache für
+///   `deps.source_*` und `NetworkAccess` für `web.fetch`/`web.search`/
+///   `browser.open`. `shell.exec` (`ExecuteProcess`) bleibt die
+///   dokumentierte **Ausnahme nach Muster `executor`**, siehe unten.
 /// - `agent-steward` → [`AuthorityReducer::ReadOnly`] (Profil
 ///   `AgentStewardship`, Addendum K; ebenfalls **Muster `executor`** — die
 ///   Rolle registriert die schreibenden Agentendefinitions-Werkzeuge, kein
@@ -315,11 +325,11 @@ pub fn reduce_to_read_workspace_network(granted: &PermissionSet) -> PermissionSe
 ///   `UiaExplorer`: `fs.read/list/search/glob/grep`, `doc.read_pdf`,
 ///   `explore.*` und `web.fetch`/`web.search` — die Obergrenze trägt genau
 ///   `ReadWorkspace` und `NetworkAccess`).
-/// - `uia-writer` → [`AuthorityReducer::ReadOnly`] (Profil `UiaWriter`;
-///   ebenfalls **Muster `uia-worker`** — die Rolle registriert zusätzlich zu
-///   `fs.write` (`WriteWorkspace`) auch `web.fetch` (`NetworkAccess`), kein
-///   Reducer trägt je `WriteWorkspace` oder `NetworkAccess` gemeinsam mit
-///   `ReadWorkspace` weiter).
+/// - `uia-writer` → [`AuthorityReducer::ReadExplore`] (Profil `UiaWriter`;
+///   dieselbe Nutzerentscheidung wie `uia-worker`): Workspace lesen,
+///   `deps.*` inklusive `deps.source_*` und `web.fetch`/`web.search`.
+///   `fs.write` (`WriteWorkspace`) bleibt die dokumentierte **Ausnahme nach
+///   Muster `executor`**, siehe unten.
 /// - `uia-shell-worker` → [`AuthorityReducer::ReadOnly`] (Profil
 ///   `UiaShellWorker`; **Muster `uia-worker`**, dieselbe Ausnahme — die
 ///   Rolle registriert `fs.read/list/search/glob/grep` **und** `shell.exec`,
@@ -338,8 +348,8 @@ pub fn reduce_to_read_workspace_network(granted: &PermissionSet) -> PermissionSe
 /// vollständig. **Ausnahme:**
 /// `memory-steward` (braucht `WriteWorkspace` für `fs.write`), `executor`
 /// (braucht `ExecuteProcess` für `shell.exec`), `uia-worker` (braucht
-/// zusätzlich zu `ReadWorkspace` auch `ExecuteProcess` für `shell.exec` und
-/// `NetworkAccess` für `web.fetch`), `agent-steward` (Addendum K, braucht
+/// über `ReadExplore` hinaus nur noch `ExecuteProcess` für `shell.exec`),
+/// `agent-steward` (Addendum K, braucht
 /// `WriteWorkspace` für `agents.write_definition`/`agents.write_uia`/
 /// `agents.commit_proposal`/`agents.reject_proposal`), `uia-writer` (braucht
 /// zusätzlich zu `ReadWorkspace` auch `WriteWorkspace` für `fs.write` und
