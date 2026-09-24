@@ -4,7 +4,8 @@
 //! 1. Context sammeln (ContextProvider)
 //! 2. Instructions laden (InstructionsProvider)
 //! 3. Observer benachrichtigen (TurnObserver::on_turn_start)
-//! 4. Model Call (provider-neutral — noch nicht implementiert)
+//! 4. Model Call (provider-neutral, mit Kontextfenster-Wächter — siehe
+//!    „Neunter Nachtrag")
 //! 5. Für jeden ToolCall:
 //!    a. Guardrail (ApprovalHandler)
 //!    b. Handoff? → AgentSpawner → WaitingForChild
@@ -446,6 +447,37 @@
 //!   jetzt explizit („Es gibt keinen Antwort-Cache — jeder Aufruf wurde echt
 //!   ausgeführt"). Die Schwellenwerte selbst (`no_progress_rounds_warn`/
 //!   `_abort`) sind unverändert.
+//!
+//! ## Neunter Nachtrag (Welle 3): Kontextfenster-Wächter
+//!
+//! - **Pre-flight**: vor jedem Modellaufruf schätzt
+//!   [`crate::context_budget::estimate_request_tokens`] den fertig gebauten
+//!   Request (kalibriert über [`AgentSession::token_calibration`]). Ist eine
+//!   Verdichtung vorgemerkt ([`AgentSession::pending_compaction`], z. B. nach
+//!   einem Wechsel auf ein kleineres Modell), meldet
+//!   `AutoCompactPolicy::must_compact_before_send` einen Notfall oder sprengt
+//!   Schätzung + Output-Reserve das Fenster, läuft vor dem Senden
+//!   [`crate::compaction::compact_for_budget`] (Ziel 60 % von
+//!   `Fenster − Reserve`) und der Request wird neu gebaut. Passt er danach
+//!   immer noch nicht, endet der Turn mit „Kontext erschöpft"
+//!   (`ModelError::ContextLength` mit deutscher Meldung).
+//! - **Ausgabelimit**: jeder Request trägt
+//!   [`AgentSession::max_output_tokens`] als `max_output_tokens`.
+//! - **Kalibrierung**: nach jeder Antwort wird die geschätzte Byte-Zahl mit
+//!   `usage.prompt_tokens()` verglichen (`TokenCalibration::observe`).
+//! - **Recovery**: `ModelError::ContextLength` bzw.
+//!   `StopReason::ContextWindowExceeded` lösen genau eine Notfall-Verdichtung
+//!   (Ziel 50 %) plus eine Wiederholung aus; ein zweiter Fehlschlag geht an
+//!   den Aufrufer bzw. endet als `Truncated`.
+//! - **`MaxTokens` mit Tool-Calls**: die Runde wird einmal mit verdoppeltem
+//!   Ausgabelimit (≤ 2 × Reserve, ≤ Fenster/2) wiederholt, bevor der Turn
+//!   `Truncated` endet. Eine verworfene Antwort hinterlässt nichts im Verlauf.
+//! - **Auto-Compaction** (`maybe_compact`): entscheidet über Prompt- +
+//!   Output-Tokens der letzten Runde plus die geschätzten seither angehängten
+//!   Tool-Ergebnisse, mit Hysterese (`AutoCompactPolicy::worth_compacting`);
+//!   ein No-op wird weder persistiert noch gemeldet.
+//! - `TurnEvent::ContextUpdated` trägt zusätzlich Schätzung, Schwelle und
+//!   Reserve.
 //!
 use crate::cancel::{CancelReason, CancelToken};
 use crate::capture::{ToolOutcome, ToolOutcomeStatus};
@@ -2877,6 +2909,7 @@ async fn drive_turn(
             crate::context_budget::estimate_request_tokens(&request, session.token_calibration());
         let needs_emergency = budget.window_tokens > 0
             && (session.pending_compaction()
+                || budget.overflows(estimated_tokens)
                 || session
                     .auto_compact()
                     .is_some_and(|policy| policy.must_compact_before_send(estimated_tokens)));
@@ -2915,9 +2948,7 @@ async fn drive_turn(
                 session.token_calibration(),
             );
         }
-        if budget.window_tokens > 0
-            && estimated_tokens.saturating_add(budget.reserve_tokens) > budget.window_tokens
-        {
+        if budget.overflows(estimated_tokens) {
             return Err(context_exhausted_error(
                 estimated_tokens,
                 budget.reserve_tokens,
@@ -3848,77 +3879,374 @@ async fn drive_turn(
 /// ([`AgentSession::auto_compact`] liefert `None` — der Default für jede
 /// Session, die sich nicht explizit für Auto-Compaction entscheidet).
 ///
-/// `tokens_used` ist [`harw_types::TokenUsage::prompt_tokens`]: bei
-/// OpenAI-Semantik (`cached_tokens` ⊆ `input_tokens`) genau `input_tokens`,
-/// bei Anthropic (`cache_separate`) die Summe aus ungecachtem Input,
-/// Cache-Read und Cache-Write — sonst würde ein fast vollständig gecachter
-/// Prompt die Schwelle nie erreichen.
+/// Die Belegung, gegen die die Policy entscheidet, ist die Schätzung des
+/// **nächsten** Requests: [`harw_types::TokenUsage::prompt_tokens`] der
+/// letzten Runde (bei OpenAI-Semantik genau `input_tokens`, bei Anthropic
+/// (`cache_separate`) ungecachter Input + Cache-Read + Cache-Write — sonst
+/// würde ein fast vollständig gecachter Prompt die Schwelle nie erreichen)
+/// plus deren `output_tokens` (die Antwort steht jetzt im Verlauf) plus
+/// `appended_tokens` (seitdem angehängte Tool-Ergebnisse, siehe
+/// [`appended_tokens_since`]).
 ///
-/// Ist ein Compact laut Policy fällig, läuft [`crate::compaction::compact_session`]
-/// mit einem aus `policy.context_window_tokens()` abgeleiteten
-/// [`crate::compaction::CompactionPlan`]; das Ergebnis wird bei Erfolg über
-/// `store.save_history` persistiert (der Store-Standardimpl **ersetzt** den
-/// gespeicherten Verlauf vollständig, siehe Doku von
-/// [`crate::state_store::StateStore::save_history`] — kein Anhängen, daher
-/// hier sicher verwendbar).
+/// Hysterese: auch bei fälliger Policy wird nur verdichtet, wenn
+/// [`crate::auto_compact::AutoCompactPolicy::worth_compacting`] gegenüber dem
+/// Ergebnis der letzten Verdichtung (`last_compaction_tokens_after`) zustimmt
+/// — sonst verdichtete jede Runde einen Verlauf, der sich nicht weiter
+/// verkleinern lässt. Die Verdichtung selbst läuft über
+/// [`run_budget_compaction`] (Ziel: 30 % des Fensters, wie bisher
+/// [`crate::compaction::CompactionPlan::for_context_window`]); ein No-op wird
+/// weder persistiert noch gemeldet.
 ///
 /// # Arguments
 /// - `session` (`&mut AgentSession`): deren Historie ggf. ersetzt wird.
 /// - `model` (`&dyn ModelProvider`): für den optionalen
-///   Zusammenfassungs-Aufruf innerhalb von `compact_session`.
+///   Zusammenfassungs-Aufruf.
 /// - `store` (`&dyn StateStore`): Ziel der Persistenz nach erfolgreichem
 ///   Compact.
 /// - `last_round_usage` (`&harw_types::TokenUsage`): Nutzung der zuletzt
 ///   abgeschlossenen Modell-Runde.
+/// - `appended_tokens` (`u64`): geschätzte Tokens der seit dieser Runde
+///   angehängten Items.
 /// - `task_completed` (`bool`): `true`, wenn der gerade beendete Abschnitt
 ///   einen Plan-Schritt abgeschlossen hat (siehe
 ///   [`turn_completed_a_plan_step`]).
+/// - `last_compaction_tokens_after` (`&mut Option<u64>`): Ergebnis der
+///   letzten Verdichtung dieses `drive_turn`-Aufrufs; wird nach einer
+///   Verdichtung (auch einem No-op) fortgeschrieben.
 ///
 /// # Concurrency
-/// `async`; führt höchstens einen Modellaufruf aus (innerhalb von
-/// `compact_session`) und einen Store-Aufruf. Fehler beider Seiten werden
-/// nur geloggt — ein Compact-Fehlschlag darf den Turn nie abbrechen.
+/// `async`; führt höchstens einen Modellaufruf aus (Zusammenfassung) und
+/// einen Store-Aufruf. Fehler beider Seiten werden nur geloggt — ein
+/// Compact-Fehlschlag darf den Turn nie abbrechen.
 async fn maybe_compact(
     session: &mut AgentSession,
     model: &dyn ModelProvider,
     store: &dyn StateStore,
     last_round_usage: &harw_types::TokenUsage,
+    appended_tokens: u64,
     task_completed: bool,
+    last_compaction_tokens_after: &mut Option<u64>,
 ) {
     let Some(policy) = session.auto_compact().copied() else {
         return;
     };
 
-    // Siehe Funktionsdoku: provider-korrekte Prompt-Belegung inklusive
-    // Cache (Anthropic meldet Cache-Tokens getrennt von `input_tokens`).
-    let tokens_used = last_round_usage.prompt_tokens();
+    let tokens_used = last_round_usage
+        .prompt_tokens()
+        .saturating_add(last_round_usage.output_tokens)
+        .saturating_add(appended_tokens);
     let decision = policy.decide(tokens_used, task_completed);
     if !decision.should_compact() {
         return;
     }
+    if !policy.worth_compacting(tokens_used, *last_compaction_tokens_after) {
+        tracing::debug!(
+            tokens_used,
+            last_compaction_tokens_after = ?*last_compaction_tokens_after,
+            "turn_loop.auto_compact_skipped_hysteresis",
+        );
+        return;
+    }
 
-    let mut plan =
-        crate::compaction::CompactionPlan::for_context_window(policy.context_window_tokens());
-    let (summary_provider, summary_model) = session.compaction_summary_model();
-    plan.summary_provider = summary_provider.cloned();
-    plan.summary_model = summary_model.cloned();
-    match crate::compaction::compact_session(session, model, &plan, Some(decision)).await {
-        Ok(outcome) => {
-            tracing::info!(
-                bytes_before = outcome.bytes_before,
-                bytes_after = outcome.bytes_after,
-                items_dropped = outcome.items_dropped,
-                summarized = outcome.summarized,
-                "turn_loop.auto_compact_applied",
-            );
-            if let Err(error) = store.save_history(session.id(), session.history()).await {
-                tracing::warn!(%error, "turn_loop.auto_compact_save_history_failed");
+    let target = policy
+        .context_window_tokens()
+        .saturating_mul(REGULAR_COMPACTION_TARGET_PERCENT)
+        / 100;
+    if let Some(outcome) = run_budget_compaction(session, model, store, target, decision).await {
+        *last_compaction_tokens_after = Some(outcome.tokens_after);
+    }
+}
+
+/// Ziel der regulären Auto-Verdichtung in Prozent des Fensters (wie
+/// [`crate::compaction::CompactionPlan::for_context_window`]).
+const REGULAR_COMPACTION_TARGET_PERCENT: u64 = 30;
+
+/// Ziel der Notfall-Verdichtung vor dem Senden, in Prozent von
+/// `Fenster − Output-Reserve`.
+const EMERGENCY_PREFLIGHT_TARGET_PERCENT: u64 = 60;
+
+/// Ziel der Notfall-Verdichtung nach einer vom Provider gemeldeten
+/// Kontextüberschreitung, in Prozent von `Fenster − Output-Reserve`.
+const EMERGENCY_RECOVERY_TARGET_PERCENT: u64 = 50;
+
+/// Rückfall-Ausgabelimit, wenn weder Session noch Fenster eines liefern
+/// (entspricht `context_budget::output_reserve_tokens` ohne Konfiguration).
+const FALLBACK_OUTPUT_RESERVE_TOKENS: u64 = 16_384;
+
+/// Fenster-Kennzahlen einer Modellrunde (Welle 3), einmal je Runde aus der
+/// Session gelesen.
+#[derive(Debug, Clone, Copy)]
+struct RoundBudget {
+    /// Kontextfenster des aktiven Modells laut Auto-Compact-Policy; 0, wenn
+    /// die Session keine Policy trägt (dann greifen keine Fenster-Wächter).
+    window_tokens: u64,
+    /// Für die Antwort freizuhaltende Tokens.
+    reserve_tokens: u64,
+    /// Effektive Compact-Schwelle der Policy, sofern vorhanden.
+    threshold_tokens: Option<u64>,
+}
+
+impl RoundBudget {
+    /// Liest Fenster, Reserve und Schwelle aus der Session.
+    ///
+    /// # Description
+    /// Die Reserve kommt bevorzugt aus der Policy
+    /// (`AutoCompactPolicy::output_reserve_tokens`, dieselbe Zahl, mit der
+    /// `must_compact_before_send` rechnet); ist dort keine gesetzt, wird sie
+    /// über [`crate::context_budget::output_reserve_tokens`] aus Fenster und
+    /// [`AgentSession::max_output_tokens`] abgeleitet. Ohne Fenster gilt das
+    /// konfigurierte Ausgabelimit bzw. [`FALLBACK_OUTPUT_RESERVE_TOKENS`].
+    fn of(session: &AgentSession) -> Self {
+        match session.auto_compact() {
+            Some(policy) if policy.context_window_tokens() > 0 => {
+                let window_tokens = policy.context_window_tokens();
+                let reserve_tokens = match policy.output_reserve_tokens() {
+                    0 => crate::context_budget::output_reserve_tokens(
+                        window_tokens,
+                        session.max_output_tokens(),
+                        None,
+                        false,
+                    ),
+                    reserve => reserve,
+                };
+                Self {
+                    window_tokens,
+                    reserve_tokens,
+                    threshold_tokens: Some(policy.effective_compact_threshold_tokens()),
+                }
             }
-        }
-        Err(error) => {
-            tracing::warn!(%error, "turn_loop.auto_compact_failed");
+            _ => Self {
+                window_tokens: 0,
+                reserve_tokens: session
+                    .max_output_tokens()
+                    .unwrap_or(FALLBACK_OUTPUT_RESERVE_TOKENS),
+                threshold_tokens: None,
+            },
         }
     }
+
+    /// `true`, wenn ein Request mit `estimated_tokens` zusammen mit der
+    /// Reserve das bekannte Fenster sprengt (ohne Fenster nie).
+    fn overflows(&self, estimated_tokens: u64) -> bool {
+        self.window_tokens > 0
+            && estimated_tokens.saturating_add(self.reserve_tokens) > self.window_tokens
+    }
+
+    /// Ziel-Token-Zahl einer Notfall-Verdichtung: `percent` % von
+    /// `Fenster − Reserve`.
+    fn emergency_target(&self, percent: u64) -> u64 {
+        self.window_tokens
+            .saturating_sub(self.reserve_tokens)
+            .saturating_mul(percent)
+            / 100
+    }
+
+    /// Verdoppeltes Ausgabelimit für die Wiederholung nach `MaxTokens` mit
+    /// Tool-Calls: `min(2 × current, 2 × Reserve)` und bei bekanntem Fenster
+    /// höchstens dessen Hälfte.
+    fn raised_output_limit(&self, current: u64) -> u64 {
+        let mut raised = current
+            .saturating_mul(2)
+            .min(self.reserve_tokens.saturating_mul(2));
+        if self.window_tokens > 0 {
+            raised = raised.min(self.window_tokens / 2);
+        }
+        raised
+    }
+}
+
+/// Baut den Model-Request einer Runde: Context, Instructions, Tools,
+/// Delegationsziele, Kontextmontage und alle Request-Optionen.
+///
+/// # Description
+/// Ausgelagert, damit der Pre-flight-Wächter und die Wiederholungen nach
+/// einer Notfall-Verdichtung den Request über exakt denselben Weg neu bauen
+/// können. `continuation` hängt die Fortsetzungsanweisung nach einem
+/// abgeschnittenen Text an; `max_output_override` ersetzt für genau diese
+/// Runde [`AgentSession::max_output_tokens`] (Wiederholung mit verdoppeltem
+/// Limit).
+///
+/// # Errors
+/// Fehler von [`collect_tools`] und der Kontextmontage
+/// ([`ModelRequest::with_context_program`]).
+async fn assemble_round_request(
+    session: &AgentSession,
+    ctx: &TurnInputContext,
+    control: &TurnControl,
+    turn_id: &harw_types::TurnId,
+    total_usage: &harw_types::TokenUsage,
+    continuation: Option<&str>,
+    max_output_override: Option<u64>,
+) -> CoreResult<ModelRequest> {
+    let mut fragments = gather_context(session, ctx).await;
+    if let Some(instruction) = continuation {
+        match continuation_fragment(instruction) {
+            Some(fragment) => fragments.push(fragment),
+            None => {
+                tracing::warn!("turn_loop.continuation_fragment_unavailable");
+            }
+        }
+    }
+    let instructions = load_instructions(session).await;
+    let mut tools = collect_tools(session)?;
+
+    // Nachtrag F (Delegationsprojektion): EIN deterministischer
+    // Kontextblock, NACH den Tools angehängt (stabiler Teil — die Liste
+    // ändert sich selten, sortiert vom Spawner geliefert). Leer ⇒ nichts.
+    // Dieselben Ziele werden zusätzlich als echte Werkzeugdefinitionen
+    // `transfer_to_<role>` angeboten — erst damit kann das Modell den
+    // Handoff tatsächlich aufrufen (siehe `append_handoff_tools`).
+    if let Some(spawner) = session.registry().spawner() {
+        let delegation_targets = spawner.delegation_target_names(session.id());
+        append_handoff_tools(session, &mut tools, &delegation_targets);
+        if let Some(fragment) = delegation_targets_fragment(&delegation_targets) {
+            fragments.push(fragment);
+        }
+    }
+
+    // Programm- und Decken-bewusste Montage (siehe
+    // `ModelRequest::with_context_program`s Moduldoku, Abschnitt „Zwei
+    // Wege zur Kontextmontage"): läuft nur, wenn die Sitzung **beide**
+    // deklariert; sonst fällt sie intern auf denselben Byte-Budget-Pfad
+    // zurück — eine Sitzung ohne `ContextProgram` sieht dadurch keine
+    // Änderung.
+    let program = session.context_program();
+    let ceiling = session
+        .spawn_context()
+        .and_then(|spawn_context| spawn_context.ceiling.as_ref());
+
+    let max_output_tokens = max_output_override
+        .or(session.max_output_tokens())
+        .map(|tokens| u32::try_from(tokens).unwrap_or(u32::MAX));
+
+    // 4. Model-Call (provider-neutral).
+    let request = ModelRequest::with_context_program(
+        instructions,
+        fragments,
+        session.history().clone(),
+        tools,
+        session.context_budget(),
+        program,
+        ceiling,
+    )?
+    .with_reasoning_effort(session.reasoning_effort())
+    .with_model_id(session.active_model().cloned())
+    .with_provider_id(session.active_provider().cloned())
+    .with_tool_result_max_bytes(control.limits().tool_result_max_bytes_hint())
+    .with_max_output_tokens(max_output_tokens)
+    .with_cancel_token(control.cancel_token().clone())
+    .with_identity(request_identity(session));
+    Ok(match stream_sink_for_round(session, turn_id, total_usage) {
+        Some(sink) => request.with_stream_sink(sink),
+        None => request,
+    })
+}
+
+/// Verdichtet die Historie auf ein Token-Ziel
+/// ([`crate::compaction::compact_for_budget`]) und persistiert das Ergebnis.
+///
+/// # Description
+/// Gemeinsamer Weg für die reguläre Auto-Verdichtung ([`maybe_compact`]),
+/// den Pre-flight-Wächter und die Wiederholung nach einer
+/// Kontextüberschreitung. Nach einem erfolgreichen Lauf ist eine per
+/// Modellwechsel vorgemerkte Verdichtung erledigt
+/// ([`AgentSession::set_pending_compaction`]`(false)`). Ein No-op
+/// (`outcome.no_op`) wird nicht persistiert.
+///
+/// # Returns
+/// `Some(outcome)` nach einem erfolgreichen Lauf (auch No-op), `None`, wenn
+/// die Verdichtung scheiterte (nur geloggt — ein Compact-Fehlschlag bricht
+/// den Turn nie ab; der Aufrufer entscheidet, ob er ohne Verdichtung
+/// weitermacht).
+async fn run_budget_compaction(
+    session: &mut AgentSession,
+    model: &dyn ModelProvider,
+    store: &dyn StateStore,
+    target_tokens: u64,
+    reason: crate::auto_compact::CompactDecision,
+) -> Option<crate::compaction::CompactionOutcome> {
+    match crate::compaction::compact_for_budget(session, model, target_tokens, Some(reason)).await {
+        Ok(outcome) => {
+            session.set_pending_compaction(false);
+            if outcome.no_op {
+                tracing::info!(
+                    target_tokens,
+                    reason = ?reason,
+                    tokens_before = outcome.tokens_before,
+                    "turn_loop.compaction_no_op",
+                );
+                return Some(outcome);
+            }
+            tracing::info!(
+                target_tokens,
+                reason = ?reason,
+                tokens_before = outcome.tokens_before,
+                tokens_after = outcome.tokens_after,
+                summarized = outcome.summarized,
+                elided_results = outcome.elided_results,
+                "turn_loop.compaction_applied",
+            );
+            if let Err(error) = store.save_history(session.id(), session.history()).await {
+                tracing::warn!(%error, "turn_loop.compaction_save_history_failed");
+            }
+            Some(outcome)
+        }
+        Err(error) => {
+            tracing::warn!(%error, reason = ?reason, "turn_loop.compaction_failed");
+            None
+        }
+    }
+}
+
+/// Schätzt die Tokens der seit `mark` angehängten Verlaufs-Items, die in der
+/// Nutzung der letzten Modellrunde noch nicht enthalten sind.
+///
+/// # Description
+/// Assistant-Text und Tool-Calls ab `mark` stammen aus der Antwort selbst
+/// und sind über `output_tokens` bereits gezählt; Reasoning geht nie an das
+/// Modell. Gezählt werden alle übrigen Items (vor allem Tool-Ergebnisse) über
+/// ihre JSON-Größe, umgerechnet mit der kalibrierten Bytes/Token-Rate der
+/// Session.
+fn appended_tokens_since(session: &AgentSession, mark: usize) -> u64 {
+    let bytes = session
+        .history()
+        .items()
+        .iter()
+        .skip(mark)
+        .filter(|item| {
+            !matches!(
+                item,
+                TurnItem::AssistantMessage(_) | TurnItem::ToolCall(_) | TurnItem::Reasoning(_)
+            )
+        })
+        .map(|item| serde_json::to_vec(item).map_or(0, |encoded| encoded.len()))
+        .fold(0_u64, |total, len| {
+            total.saturating_add(u64::try_from(len).unwrap_or(u64::MAX))
+        });
+    session.token_calibration().bytes_to_tokens(bytes)
+}
+
+/// Fehler „Kontext erschöpft": der Request passt auch nach einer
+/// Notfall-Verdichtung nicht in das Fenster des aktiven Modells.
+///
+/// # Description
+/// Als [`crate::model::ModelError::ContextLength`] geformt (nicht
+/// wiederholbar, dieselbe Kategorie wie eine Provider-Meldung), damit
+/// Aufrufer und Beobachter ihn ohne neue Fehlervariante einordnen können.
+fn context_exhausted_error(
+    estimated_tokens: u64,
+    reserve_tokens: u64,
+    window_tokens: u64,
+) -> CoreError {
+    CoreError::Model(crate::model::ModelError::ContextLength {
+        message: format!(
+            "Kontext erschöpft: die Anfrage umfasst geschätzt {estimated_tokens} Tokens, \
+             mit {reserve_tokens} Tokens Antwort-Reserve passt sie auch nach einer \
+             Notfall-Kompaktierung nicht in das Kontextfenster von {window_tokens} Tokens. \
+             Bitte den Verlauf kürzen (/compact), einen neuen Verlauf beginnen oder ein \
+             Modell mit größerem Fenster wählen."
+        ),
+    })
 }
 
 /// Harte Verdichtung am Beginn eines neuen Auftrags-Turns einer bestehenden
@@ -7391,7 +7719,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// Sammelt den letzten `CompactionOutcome`, den `maybe_compact` über
-    /// `compact_session` erzeugt hat — Test-Double für
+    /// `compact_for_budget` erzeugt hat — Test-Double für
     /// [`crate::compaction::CompactionObserver`].
     struct RecordingCompactionObserver {
         last: Mutex<Option<crate::compaction::CompactionOutcome>>,
@@ -7443,7 +7771,9 @@ mod tests {
             &crate::model::EchoModelProvider::default(),
             &store,
             &usage,
+            0,
             true,
+            &mut None,
         )
         .await;
 
@@ -7499,7 +7829,9 @@ mod tests {
             &crate::model::EchoModelProvider::default(),
             &store,
             &usage,
+            0,
             true,
+            &mut None,
         )
         .await;
 

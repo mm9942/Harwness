@@ -108,6 +108,6 @@ pub use operation::{
     WebMethod,
 };
 pub use session_control::{
-    NullSessionController, SessionControlError, SessionControlSnapshot, SessionController,
-    SharedSessionController,
+    ContextUsageSnapshot, LastCompaction, NullSessionController, SessionControlError,
+    SessionControlSnapshot, SessionController, SharedSessionController,
 };

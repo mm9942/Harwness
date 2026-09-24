@@ -586,6 +586,20 @@ impl ModelProvider for UiaDefaultRouteProvider {
         }
         self.inner.respond(request)
     }
+
+    /// Reicht die gepinnte Modell-ID des inneren Routers durch.
+    ///
+    /// # Description
+    /// `default_model_id` ist **kein** Pin: es füllt nur fehlende Werte auf,
+    /// eine gesetzte `model_id` des Aufrufers hat Vorrang (siehe
+    /// [`Self::respond`]). Deshalb wird nicht `default_model_id`, sondern der
+    /// Wert des umhüllten Providers gemeldet.
+    ///
+    /// # Returns
+    /// `self.inner.pinned_model_id()`.
+    fn pinned_model_id(&self) -> Option<String> {
+        self.inner.pinned_model_id()
+    }
 }
 
 /// Löst die Modell-Kennung der uia-worker-Rollenfamilie auf.

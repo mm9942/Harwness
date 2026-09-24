@@ -452,6 +452,19 @@ impl<P: ModelProvider> ModelProvider for RetryingProvider<P> {
             }
         })
     }
+
+    /// Reicht die gepinnte Modell-ID des umhüllten Providers durch.
+    ///
+    /// # Description
+    /// Wiederholungen ändern das angesprochene Modell nicht; ohne dieses
+    /// Durchreichen ginge ein Pin des inneren Providers (z. B.
+    /// [`harw_core::PinnedModelProvider`]) hinter der Retry-Hülle verloren.
+    ///
+    /// # Returns
+    /// `self.inner.pinned_model_id()`.
+    fn pinned_model_id(&self) -> Option<String> {
+        self.inner.pinned_model_id()
+    }
 }
 
 #[cfg(test)]
@@ -596,6 +609,26 @@ mod tests {
             provider.respond(request).await,
             Err(ModelError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn test_pinned_model_id_is_forwarded_to_the_inner_provider() {
+        let echo: Arc<dyn ModelProvider> = Arc::new(harw_core::EchoModelProvider::default());
+        let unpinned = RetryingProvider::new(
+            harw_core::PinnedModelProvider::new(Arc::clone(&echo), None, None),
+            policy(),
+        );
+        assert_eq!(unpinned.pinned_model_id(), None);
+
+        let pinned = RetryingProvider::new(
+            harw_core::PinnedModelProvider::new(
+                echo,
+                None,
+                Some(harw_types::ModelId::from("pinned-model")),
+            ),
+            policy(),
+        );
+        assert_eq!(pinned.pinned_model_id().as_deref(), Some("pinned-model"));
     }
 
     // Provider, der `delay` lang "arbeitet" bevor er erfolgreich antwortet —

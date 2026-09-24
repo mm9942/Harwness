@@ -1041,6 +1041,19 @@ impl ModelProvider for BudgetedModelProvider {
             Ok::<harw_core::ModelResponse, harw_core::ModelError>(response)
         })
     }
+
+    /// Reicht die gepinnte Modell-ID des umhüllten Providers durch.
+    ///
+    /// # Description
+    /// Das Budget begrenzt nur die Runden, nicht das angesprochene Modell;
+    /// ein Pin des inneren Providers darf hinter der Hülle nicht verloren
+    /// gehen.
+    ///
+    /// # Returns
+    /// `self.inner.pinned_model_id()`.
+    fn pinned_model_id(&self) -> Option<String> {
+        self.inner.pinned_model_id()
+    }
 }
 
 // Operator id used to build a plan-node job's own trust principal (R7).

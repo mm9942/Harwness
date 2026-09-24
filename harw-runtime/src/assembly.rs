@@ -4330,6 +4330,8 @@ impl RuntimeAssembly {
                 .with_turn_event_sink(turn_events)
                 .with_agent_events(self.agent_events.clone())
                 .with_context_budget(context_budget_for_window(&self.config, context_window))
+                // Eine konfigurierte Verlaufsgrenze übersteht Modellwechsel.
+                .with_configured_max_history_bytes(self.config.harness.compaction.max_history_bytes)
                 // Die aus dem Budget abgeleiteten Turn-Grenzen werden jetzt
                 // tatsächlich im Turn-Loop durchgesetzt.
                 .with_default_turn_limits(self.turn_limits.to_core())

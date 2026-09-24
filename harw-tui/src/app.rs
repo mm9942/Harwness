@@ -4127,15 +4127,52 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             reason,
             items_before,
             items_after,
+            tokens_before,
+            tokens_after,
+            summarized,
+            elided_results,
             ..
         } => {
+            // `turn_event_rx` trägt nur die Ereignisse der Root-Session
+            // (Kind-Sessions melden über den Agenten-Bus) — die Momentaufnahme
+            // für `/status` und `/usage` bleibt damit root-exklusiv.
+            app.session_controller
+                .record_compaction(harw_operations::LastCompaction {
+                    reason: reason.clone(),
+                    tokens_before,
+                    tokens_after,
+                    summarized,
+                    elided_results,
+                });
             app.push_line(
                 Role::System,
                 format!("⟲ Kontext verdichtet ({reason}): {items_before} → {items_after} Einträge"),
             );
             true
         }
-        TurnEvent::UsageUpdated { .. } | TurnEvent::ContextUpdated { .. } => {
+        TurnEvent::ContextUpdated {
+            used_tokens,
+            window_tokens,
+            estimated_next_tokens,
+            threshold_tokens,
+            reserve_tokens,
+            ..
+        } => {
+            // Nur Root-Ereignisse erreichen `turn_event_rx` (siehe oben);
+            // die Momentaufnahme speist `/status` und `/usage`.
+            app.session_controller.record_context_updated(
+                used_tokens,
+                window_tokens,
+                estimated_next_tokens,
+                threshold_tokens,
+                reserve_tokens,
+            );
+            // Die Werte der Statuszeile liest weiterhin der Agenten-Monitor
+            // (Bus); hier nur ein Redraw-Anstoß.
+            app.drain_agent_events();
+            true
+        }
+        TurnEvent::UsageUpdated { .. } => {
             // Die Werte selbst liest die Statuszeile aus dem Agenten-Monitor
             // (Bus); hier nur ein Redraw-Anstoß.
             app.drain_agent_events();
@@ -7396,8 +7433,18 @@ fn render_viewport(
         .agent(app.session_id().as_str())
         .and_then(|root| Some((root.context_percent()?, root.context_window)))
         .map(|(pct, window)| {
+            // Schwelle der nächsten Kompaktierung (aus `ContextUpdated`), falls bekannt.
+            let threshold = SessionController::context_usage(app.session_controller.as_ref())
+                .and_then(|usage| usage.threshold_tokens)
+                .map(|tokens| {
+                    format!(
+                        ", verdichtet ab {}",
+                        crate::agent_monitor::human_tokens(tokens)
+                    )
+                })
+                .unwrap_or_default();
             format!(
-                " | ctx {} {pct}% / {}",
+                " | ctx {} {pct}% / {}{threshold}",
                 crate::agent_monitor::gauge(pct, 8),
                 crate::agent_monitor::human_tokens(window)
             )
