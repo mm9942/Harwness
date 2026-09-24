@@ -168,9 +168,8 @@ fn node_summary(node: &KnowledgeArtifact) -> serde_json::Value {
 fn list(store: &KnowledgeStore) -> Result<OpOutput, OpError> {
     let index = rebuild(store)?;
     let nodes = visible_nodes(&index)?;
-    let data = serde_json::json!({
-        "nodes": nodes.iter().map(node_summary).collect::<Vec<_>>(),
-    });
+    let summaries: Vec<serde_json::Value> = nodes.iter().map(node_summary).collect();
+    let data = serde_json::json!({ "nodes": summaries });
     if nodes.is_empty() {
         return Ok(OpOutput {
             text: "Keine sichtbaren Palace-Knoten.".to_owned(),
