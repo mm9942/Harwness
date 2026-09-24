@@ -478,15 +478,6 @@ impl DeclaredTargets {
     }
 }
 
-/// Ein zugelassenes Ziel samt allem, was sein Platz braucht.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdmittedTarget {
-    /// Position in der Welle.
-    pub position: usize,
-    /// Reducer-Kennung für die Sandbox des Kindes.
-    pub reducer: &'static str,
-}
-
 /// Entscheidet je Ziel über die Zulassung (reine Schnittmenge).
 ///
 /// # Argumente
