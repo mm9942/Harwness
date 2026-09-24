@@ -142,6 +142,10 @@ impl harw_core::compaction::CompactionObserver for HandoffWriter {
         session_id: &harw_types::SessionId,
         outcome: &harw_core::compaction::CompactionOutcome,
     ) {
+        // Eine Leerlauf-Verdichtung ändert nichts; die letzte Übergabe bleibt.
+        if outcome.no_op {
+            return;
+        }
         let handoff = SessionHandoff {
             session_id: session_id.to_string(),
             written_at: jiff::Timestamp::now().to_string(),

@@ -252,7 +252,13 @@ const EXTERNAL_CLI_CREDENTIALS: &[(&str, &[&str], &[&str])] = &[
 pub fn build_provider(
     config: &harw_config::ResolvedConfig,
 ) -> HttpProviderResult<Box<dyn ModelProvider>> {
-    build_provider_with_optional_resolver(config, None, None).map(|(provider, _)| provider)
+    build_provider_with_optional_resolver(
+        config,
+        None,
+        None,
+        &budget::ProviderBudgetRegistry::global(),
+    )
+    .map(|(provider, _)| provider)
 }
 
 /// Builds configured providers with an injected synchronous `secrets:` resolver.
@@ -262,8 +268,13 @@ pub fn build_provider_with_resolver(
     config: &harw_config::ResolvedConfig,
     resolver: &dyn SecretResolver,
 ) -> HttpProviderResult<Box<dyn ModelProvider>> {
-    build_provider_with_optional_resolver(config, Some(resolver), None)
-        .map(|(provider, _)| provider)
+    build_provider_with_optional_resolver(
+        config,
+        Some(resolver),
+        None,
+        &budget::ProviderBudgetRegistry::global(),
+    )
+    .map(|(provider, _)| provider)
 }
 
 /// Wie [`build_provider`], liefert zusätzlich eine [`ProviderLoadRegistry`]
@@ -283,7 +294,12 @@ pub fn build_provider_with_resolver(
 pub fn build_provider_with_load_registry(
     config: &harw_config::ResolvedConfig,
 ) -> HttpProviderResult<(Box<dyn ModelProvider>, ProviderLoadRegistry)> {
-    build_provider_with_optional_resolver(config, None, None)
+    build_provider_with_optional_resolver(
+        config,
+        None,
+        None,
+        &budget::ProviderBudgetRegistry::global(),
+    )
 }
 
 /// Wie [`build_provider_with_load_registry`] mit injiziertem `secrets:`-Resolver.
@@ -291,7 +307,12 @@ pub fn build_provider_with_load_registry_and_resolver(
     config: &harw_config::ResolvedConfig,
     resolver: &dyn SecretResolver,
 ) -> HttpProviderResult<(Box<dyn ModelProvider>, ProviderLoadRegistry)> {
-    build_provider_with_optional_resolver(config, Some(resolver), None)
+    build_provider_with_optional_resolver(
+        config,
+        Some(resolver),
+        None,
+        &budget::ProviderBudgetRegistry::global(),
+    )
 }
 
 /// Wie [`build_provider_with_load_registry`] mit bekanntem harw-Home (siehe
@@ -301,7 +322,33 @@ pub fn build_provider_with_load_registry_and_home(
     home: &Path,
     resolver: Option<&dyn SecretResolver>,
 ) -> HttpProviderResult<(Box<dyn ModelProvider>, ProviderLoadRegistry)> {
-    build_provider_with_optional_resolver(config, resolver, Some(home))
+    build_provider_with_optional_resolver(
+        config,
+        resolver,
+        Some(home),
+        &budget::ProviderBudgetRegistry::global(),
+    )
+}
+
+/// Wie [`build_provider_with_load_registry_and_home`], aber mit injizierter
+/// [`budget::ProviderBudgetRegistry`] statt der prozessweiten
+/// ([`budget::ProviderBudgetRegistry::global`]).
+///
+/// # Composition-Root-Hinweis
+/// Wer dieselbe Registry zusätzlich in die `ServiceMap` legt, kann über
+/// [`budget::ProviderBudgetRegistry::snapshots`] alle RPM/TPM-Buckets
+/// (auch Modell-Overrides) providerübergreifend anzeigen. Bei einem
+/// Neuaufbau mit unveränderten Grenzen bleibt der Bucket-Zustand erhalten.
+///
+/// # Errors
+/// Wie [`build_provider`].
+pub fn build_provider_with_load_registry_and_budgets(
+    config: &harw_config::ResolvedConfig,
+    home: Option<&Path>,
+    resolver: Option<&dyn SecretResolver>,
+    budgets: &budget::ProviderBudgetRegistry,
+) -> HttpProviderResult<(Box<dyn ModelProvider>, ProviderLoadRegistry)> {
+    build_provider_with_optional_resolver(config, resolver, home, budgets)
 }
 
 /// Baut die konfigurierten Provider mit bekanntem harw-Home.
@@ -326,14 +373,20 @@ pub fn build_provider_with_home(
     home: &Path,
     resolver: Option<&dyn SecretResolver>,
 ) -> HttpProviderResult<Box<dyn ModelProvider>> {
-    build_provider_with_optional_resolver(config, resolver, Some(home))
-        .map(|(provider, _)| provider)
+    build_provider_with_optional_resolver(
+        config,
+        resolver,
+        Some(home),
+        &budget::ProviderBudgetRegistry::global(),
+    )
+    .map(|(provider, _)| provider)
 }
 
 fn build_provider_with_optional_resolver(
     config: &harw_config::ResolvedConfig,
     resolver: Option<&dyn SecretResolver>,
     home: Option<&Path>,
+    budgets: &budget::ProviderBudgetRegistry,
 ) -> HttpProviderResult<(Box<dyn ModelProvider>, ProviderLoadRegistry)> {
     let sources = SecretSources {
         env_layer: &config.env_layer,
@@ -360,7 +413,7 @@ fn build_provider_with_optional_resolver(
         .filter(|(_, provider)| provider.enabled)
         .collect::<BTreeMap<_, _>>()
     {
-        let backend = match build_named_provider(name, provider, config, model, sources) {
+        let backend = match build_named_provider(name, provider, config, model, sources, budgets) {
             Ok((backend, load_control)) => {
                 if let Some(load_control) = load_control {
                     load_controls.insert(name.to_owned(), load_control);
@@ -442,6 +495,7 @@ fn build_named_provider(
     config: &harw_config::ResolvedConfig,
     default_model: &str,
     sources: SecretSources<'_>,
+    budgets: &budget::ProviderBudgetRegistry,
 ) -> HttpProviderResult<NamedProviderBuild> {
     validate_endpoint(&provider.base_url)?;
     let sources = SecretSources {
@@ -550,7 +604,17 @@ fn build_named_provider(
             provider_name,
             configured_headers(provider_name, &provider.headers, sources)?,
         );
-        backend.configure_rate_limit(provider.rate_limit.clone());
+        backend.configure_rate_limit(
+            provider
+                .rate_limit
+                .as_ref()
+                .map(harw_config::RateLimitToml::header_pacer_config),
+        );
+        // Client-seitige RPM/TPM-Budgets (siehe [`budget`]). Die Durchsetzung
+        // im Anthropic-Pfad verdrahtet `anthropic.rs` über
+        // `configure_budgets`; bis dahin sind die Buckets nur im Status
+        // sichtbar.
+        let anthropic_budgets = budgets.configure_provider(provider_name, provider, config);
         backend.configure_stream_policy(sse::StreamPolicy::from_config(
             provider_name,
             provider,
@@ -567,6 +631,7 @@ fn build_named_provider(
                 provider_id: provider_name.to_owned(),
                 concurrency_limiter: backend.concurrency_limiter(),
                 rate_limiter: backend.rate_limiter_handle(),
+                budgets: anthropic_budgets,
             });
         return Ok((
             Box::new(RetryingProvider::new(backend, network_retry_policy())),
@@ -574,12 +639,13 @@ fn build_named_provider(
         ));
     }
 
-    let http_provider = OpenAiResponsesProvider::from_named_config(
+    let http_provider = OpenAiResponsesProvider::from_named_config_with_budgets(
         provider_name,
         provider,
         config,
         model,
         sources,
+        budgets,
     )?;
     // Beide `Arc`s werden geklont, *bevor* `http_provider` unten per Wert in
     // `RetryingProvider::new` verschoben wird — siehe [`ProviderLoadHandle`]-Doku.
@@ -588,6 +654,7 @@ fn build_named_provider(
             provider_id: provider_name.to_owned(),
             concurrency_limiter: http_provider.concurrency_limiter(),
             rate_limiter: http_provider.rate_limiter_handle(),
+            budgets: http_provider.budgets(),
         });
     Ok((
         Box::new(RetryingProvider::new(http_provider, network_retry_policy())),
@@ -3610,6 +3677,23 @@ impl OpenAiResponsesProvider {
             }
         }
 
+        // Client-seitige RPM/TPM-Budgets (siehe [`budget`]): vor dem
+        // Nebenläufigkeits-Permit reservieren, damit ein auf Budget wartender
+        // Request keinen Slot blockiert. Fail-fast, wenn schon die
+        // Eingabe-Schätzung ein Minutenlimit sprengt. Der Permit lebt bis zum
+        // Abgleich mit der tatsächlichen Nutzung unten.
+        let budget_permit = if self.budgets.is_empty() {
+            budget::BudgetPermit::empty()
+        } else {
+            self.budgets
+                .acquire(
+                    model,
+                    budget::estimate_wire_tokens(&wire),
+                    request.max_output_tokens.map(u64::from).unwrap_or(0),
+                )
+                .await?
+        };
+
         // Hartes Nebenläufigkeits-Limit (siehe [`Self::concurrency_limiter`]):
         // blockiert, bis ein Slot frei wird, statt fehlzuschlagen. Der
         // Guard bleibt bis zum Ende dieses async-Blocks (also bis der
@@ -3679,6 +3763,11 @@ impl OpenAiResponsesProvider {
                 }
                 let hint =
                     retry_after_hint(retry_after.as_deref(), retry_after_ms.as_deref(), &body);
+                if status.as_u16() == 429 {
+                    // Sperrt alle Budget-Buckets dieses Requests (auch für
+                    // bereits Wartende) für die `Retry-After`-Dauer.
+                    self.budgets.penalize(model, hint.map(Duration::from_secs));
+                }
                 let error =
                     model_error_for_status(status.as_u16(), request_id.as_deref(), hint, &body);
                 tracing::debug!(
@@ -3721,6 +3810,7 @@ impl OpenAiResponsesProvider {
         for call in &mut response.tool_calls {
             call.name = ToolName::new(names.decode(call.name.as_str()));
         }
+        budget_permit.reconcile(&response.usage);
         Ok(response)
     }
 }

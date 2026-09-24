@@ -44,7 +44,13 @@
 //!
 //! # Beispiel
 //! ```rust,ignore
-//! let startup = ChatStartup { mode: InteractionMode::Chat, plan: None, goal_context: None };
+//! let startup = ChatStartup {
+//!     mode: InteractionMode::Chat,
+//!     plan: None,
+//!     goal_context: None,
+//!     approval: None,
+//!     model: None,
+//! };
 //! chat::run_chat(None, Some("Hallo".to_owned()), None, startup, chat::ChatOptions::default())?;
 //! ```
 
@@ -60,7 +66,7 @@ use harw_core::{
     ApprovalResolution, InteractionMode, ModelMessage, StateStore, TurnInput, TurnOutcome,
     resume_after_approval, run_turn,
 };
-use harw_extension_api::ContextProvider;
+use harw_extension_api::{ApprovalMode, ContextProvider};
 use harw_memory::facts::{FactScope, FactStore};
 use harw_protocol::{SessionEvent, TurnEvent};
 use harw_runtime::{
@@ -116,6 +122,13 @@ pub(crate) struct ChatStartup {
     pub(crate) plan: Option<PlanServices>,
     /// Kontext-Beitrag für jeden Turn (Ziel-Kontext); `None` heißt keiner.
     pub(crate) goal_context: Option<Arc<dyn ContextProvider>>,
+    /// Explizit gewählter Freigabemodus (`--approval`,
+    /// `RuntimeSpec::approval_override`); `None` lässt die Konfiguration
+    /// entscheiden.
+    pub(crate) approval: Option<ApprovalMode>,
+    /// Explizit gewähltes Modell (`--model`, `RuntimeSpec::model_override`)
+    /// als Schlüssel, Modell-ID oder Alias; `None` lässt die Vorgabe stehen.
+    pub(crate) model: Option<String>,
 }
 
 /// Zusätzliche Chat-Flags, die `harw-cli/src/cli.rs::ChatArgs` heute noch
@@ -365,6 +378,14 @@ impl ChatRuntimeInputs {
         verbose: bool,
     ) -> Result<Self, String> {
         spec.mode_override = Some(startup.mode);
+        spec.approval_override = startup.approval;
+        spec.model_override = startup.model.clone();
+        if startup.approval == Some(ApprovalMode::FullAccess) {
+            eprintln!(
+                "Warnung: Freigabemodus „full“ aktiv – Schreib- und Shell-Aktionen \
+                 laufen in dieser Sitzung ohne Rückfrage."
+            );
+        }
         spec.active_agent = config.harness.active_agent_definition.clone();
 
         let home = spec.home.clone();
@@ -1112,6 +1133,8 @@ mod tests {
             mode,
             plan: None,
             goal_context: None,
+            approval: None,
+            model: None,
         }
     }
 

@@ -1157,9 +1157,11 @@ mod tests {
                         | harw_agent_dsl::roles::AgentRoleId::UiaWorker
                         | harw_agent_dsl::roles::AgentRoleId::AgentSteward
                         | harw_agent_dsl::roles::AgentRoleId::RootOrchestrator
+                        | harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator
                 ),
                 "{name}: eingebaute Rollen tragen organisatorisch Worker, UiaWorker, \
-                 AgentSteward oder RootOrchestrator (Addenda J + K)"
+                 AgentSteward, RootOrchestrator oder ChildOrchestrator (Addenda J + K, \
+                 Plan Punkt 1)"
             );
             assert_eq!(raw.specialization, *name, "{name}");
         }
@@ -1699,6 +1701,7 @@ mod tests {
                         | harw_agent_dsl::roles::AgentRoleId::UiaWorker
                         | harw_agent_dsl::roles::AgentRoleId::AgentSteward
                         | harw_agent_dsl::roles::AgentRoleId::RootOrchestrator
+                        | harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator
                 ),
                 "{role} muss eine zulässige organisatorische Rolle tragen"
             );
@@ -2326,8 +2329,9 @@ mod tests {
         );
         assert_eq!(
             role_names_of(&resolved.orchestrators),
-            vec![role_names::ANALYST],
-            "nur der Analyst darf zwei Ebenen tief delegieren"
+            vec![role_names::RESEARCH_ORCHESTRATOR, role_names::ANALYST],
+            "der Research-Orchestrator führt, der Analyst bleibt als \
+             verdichtender Zwei-Ebenen-Worker zugelassen"
         );
         Ok(())
     }
@@ -2515,6 +2519,120 @@ mod tests {
                 "die Organisation verweist auf die unbekannte Rolle '{}'",
                 reference.id.name
             );
+        }
+        Ok(())
+    }
+
+    /// Plan Punkt 1 / §15 („a clan leader must be a ChildOrchestrator“):
+    /// jeder Clan der Default-Organisation wird von einem eingebauten
+    /// Child-Orchestrator geführt, den der Root-Orchestrator über seine
+    /// exakte Freigabeliste (`[spawn].child_orchestrators`) auch starten
+    /// darf.
+    #[test]
+    fn test_every_clan_leader_is_a_child_orchestrator() -> TestResult {
+        let resolved = organization()?;
+        let definitions = builtin()?;
+        let root = definitions
+            .get(role_names::ROOT_ORCHESTRATOR)
+            .ok_or(TestError::Missing("root-orchestrator ist eingebaut"))?;
+        let granted = root.spawn_contract().child_orchestrators();
+        for clan in &resolved.clans {
+            let leader = clan.leader.id.name.as_str();
+            let ir = definitions.get(leader).ok_or_else(|| {
+                TestError::Unexpected(format!("Clan {}: Leader {leader} fehlt", clan.id))
+            })?;
+            assert_eq!(
+                ir.role(),
+                harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator,
+                "Clan {}: Leader {leader} muss ein Child-Orchestrator sein",
+                clan.id
+            );
+            assert!(
+                granted.iter().any(|name| name == leader),
+                "Clan {}: root-orchestrator gibt {leader} nicht frei",
+                clan.id
+            );
+            assert_eq!(clan.child_depth_cost, 1, "Clan {}", clan.id);
+        }
+        Ok(())
+    }
+
+    /// Die drei eingebauten Child-Orchestratoren: organisatorisch
+    /// `ChildOrchestrator`, darunter ausschließlich Worker (`max_depth = 1`,
+    /// leere eigene Freigabeliste), ein ReturnEnvelope-Vertrag und ein
+    /// Budget, das in keiner Dimension über dem des Root-Orchestrators liegt.
+    #[test]
+    fn test_child_orchestrators_are_bounded_by_the_root_orchestrator() -> TestResult {
+        let definitions = builtin()?;
+        let root = definitions
+            .get(role_names::ROOT_ORCHESTRATOR)
+            .ok_or(TestError::Missing("root-orchestrator ist eingebaut"))?;
+        let root_budget = root.spawn_contract().budget().ok_or(TestError::Missing(
+            "root-orchestrator braucht [spawn.budget]",
+        ))?;
+        let mut granted: Vec<&str> = root
+            .spawn_contract()
+            .child_orchestrators()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        granted.sort_unstable();
+        let mut expected: Vec<&str> = role_names::CHILD_ORCHESTRATORS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(granted, expected, "exakte Freigabeliste des Roots");
+
+        for role in role_names::CHILD_ORCHESTRATORS {
+            let ir = definitions
+                .get(*role)
+                .ok_or_else(|| TestError::Unexpected(format!("{role} fehlt")))?;
+            assert_eq!(
+                ir.role(),
+                harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator,
+                "{role}"
+            );
+            assert_eq!(ir.spawn_contract().max_depth(), Some(1), "{role}");
+            assert!(
+                ir.spawn_contract().child_orchestrators().is_empty(),
+                "{role}: keine verschachtelten Sub-Orchestratoren ohne Freigabe"
+            );
+            assert_eq!(
+                ir.return_pipeline().contract(),
+                Some("harwness.return.envelope@1"),
+                "{role}"
+            );
+            let budget = ir
+                .spawn_contract()
+                .budget()
+                .ok_or_else(|| TestError::Unexpected(format!("{role} ohne [spawn.budget]")))?;
+            for (dimension, child, parent) in [
+                ("max_tokens", budget.max_tokens(), root_budget.max_tokens()),
+                (
+                    "max_wall_secs",
+                    budget.max_wall_secs(),
+                    root_budget.max_wall_secs(),
+                ),
+            ] {
+                let (Some(child), Some(parent)) = (child, parent) else {
+                    return Err(TestError::Unexpected(format!(
+                        "{role}: {dimension} muss bei Kind und Root gesetzt sein"
+                    )));
+                };
+                assert!(child <= parent, "{role}: {dimension} {child} > {parent}");
+            }
+            let (Some(child_calls), Some(root_calls)) =
+                (budget.max_tool_calls(), root_budget.max_tool_calls())
+            else {
+                return Err(TestError::Unexpected(format!(
+                    "{role}: max_tool_calls muss bei Kind und Root gesetzt sein"
+                )));
+            };
+            assert!(child_calls <= root_calls, "{role}: max_tool_calls");
+            for tool in ["fs.write", "shell.exec", "web.fetch", "web.search"] {
+                assert!(
+                    !ir.tool_surface().admitted().iter().any(|name| name == tool),
+                    "{role} darf {tool} nicht admittieren"
+                );
+            }
         }
         Ok(())
     }

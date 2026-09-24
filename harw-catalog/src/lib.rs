@@ -1262,6 +1262,123 @@ mod tests {
         ));
         Ok(())
     }
+
+    fn write_skill(root: &Path, dir: &str, manifest: &str, body: &str) -> TestResult<PathBuf> {
+        let skill_dir = root.join("skills").join(dir);
+        std::fs::create_dir_all(&skill_dir).map_err(ctx("mkdir skill"))?;
+        std::fs::write(skill_dir.join("skill.toml"), manifest).map_err(ctx("write manifest"))?;
+        std::fs::write(skill_dir.join("instructions.md"), body).map_err(ctx("write body"))?;
+        Ok(skill_dir)
+    }
+
+    #[test]
+    fn resolve_skill_directory_follows_discovery_precedence() -> TestResult {
+        let temporary = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let global = temporary.path().join("global");
+        let profile = temporary.path().join("profile");
+        write_skill(&global, "review", "name = \"review\"\n", "global")?;
+        let winner = write_skill(&profile, "renamed", "name = \"review\"\n", "profile")?;
+        std::fs::create_dir_all(profile.join("skills/.proposals/x"))
+            .map_err(ctx("mkdir proposals"))?;
+
+        let roots = vec![global, profile];
+        assert_eq!(
+            resolve_skill_directory(&roots, "review").map_err(ctx("resolve"))?,
+            Some(winner)
+        );
+        assert_eq!(
+            resolve_skill_directory(&roots, "missing").map_err(ctx("resolve missing"))?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn loaded_skill_snapshot_carries_sha256_provenance_in_its_fragment() -> TestResult {
+        let temporary = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let dir = write_skill(
+            temporary.path(),
+            "review",
+            "name = \"review\"\ndescription = \"Review code\"\ntools = [\"fs.read\"]\n",
+            "Read tests first.\n",
+        )?;
+        let skill = SkillToml {
+            name: "review".to_owned(),
+            enabled: true,
+            description: "Review code".to_owned(),
+            instructions_file: None,
+            tools: vec!["fs.read".to_owned()],
+            mcps: Vec::new(),
+        };
+        let snapshot = load_skill_runtime_snapshot(&dir, &skill).map_err(ctx("load"))?;
+        let expected = format!("{:x}", Sha256::digest(b"Read tests first.\n"));
+        assert_eq!(snapshot.sha256, expected);
+        let fragment = snapshot.instruction_fragment();
+        assert!(fragment.starts_with(&format!("# Skill: review (sha256 {expected})")));
+        assert!(fragment.contains("Review code"));
+        assert!(fragment.contains("Read tests first."));
+        assert!(fragment.contains("keine Freigabe"));
+
+        let escaping = SkillToml {
+            instructions_file: Some("../escape.md".to_owned()),
+            ..skill
+        };
+        assert!(matches!(
+            load_skill_runtime_snapshot(&dir, &escaping),
+            Err(CatalogError::InvalidInstructionPath(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn direct_skills_snapshot_activates_only_enabled_direct_skills() -> TestResult {
+        let mut config = ResolvedConfig::default();
+        config.agents.insert(
+            "worker".to_owned(),
+            AgentToml {
+                name: "worker".to_owned(),
+                role: "worker".to_owned(),
+                description: String::new(),
+                system_file: None,
+                providers: Vec::new(),
+                models: Vec::new(),
+                skills: vec!["review".to_owned(), "off".to_owned()],
+                suggestions: AgentSuggestionsToml::default(),
+                primary_provider: None,
+                secondary_providers: Vec::new(),
+                timeout_seconds: 120,
+                max_retries: 2,
+            },
+        );
+        for (name, enabled) in [("review", true), ("off", false)] {
+            config.skills.insert(
+                name.to_owned(),
+                SkillToml {
+                    name: name.to_owned(),
+                    enabled,
+                    description: format!("{name} skill"),
+                    instructions_file: None,
+                    tools: Vec::new(),
+                    mcps: Vec::new(),
+                },
+            );
+        }
+        let catalog = CatalogSnapshot::from_config(&config).map_err(ctx("from_config"))?;
+        let snapshot = catalog
+            .direct_skills_snapshot("worker")
+            .map_err(ctx("direct_skills_snapshot"))?
+            .ok_or(crate::test_support::TestError::Missing("worker snapshot"))?;
+        assert_eq!(snapshot.activated.len(), 1);
+        assert_eq!(snapshot.activated[0].name, "review");
+        assert_eq!(snapshot.activated[0].definition_sha256.len(), 64);
+        assert!(
+            catalog
+                .direct_skills_snapshot("unknown")
+                .map_err(ctx("unknown agent"))?
+                .is_none()
+        );
+        Ok(())
+    }
 }
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.

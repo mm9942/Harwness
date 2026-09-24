@@ -24,10 +24,18 @@
 //! - [`RuntimeServicesParts`] — alle Zutaten der Komposition (Composition Root)
 //! - [`RuntimeServices`] — die Fabrik selbst
 //!
+//! # Wissensfläche (L6)
+//! `Arc<harw_knowledge::KnowledgeStore>` wird aus
+//! `harw_home::knowledge_dir(profile_dir)` des gebundenen
+//! [`harw_home::ResolvedHomeContext`] gebaut ([`RuntimeServices::with_home_context`])
+//! und — dritte deklarierte Differenz, [`ServiceSurface::allows_knowledge_store`]
+//! — nur auf Slash und Modell-Werkzeug gelegt. Damit finden `/workbench`,
+//! `/kanban`, `/diary`, `/palace` und `/context-proposal` ihren Speicher.
+//! Web und Job bekommen ihn bewusst noch nicht: beide haben keine Sitzung,
+//! deren Workbench sie beschreiben dürften, und die Sichtbarkeitsprüfung der
+//! Wissensfläche kennt noch keinen Web-/Job-Aufrufer.
+//!
 //! # Was hier bewusst NICHT registriert wird
-//! - `harw_knowledge::KnowledgeStore`: latenter Befund L6 (w3-knowledge) bleibt
-//!   offen; die Wissensfläche wird erst in Welle W3 montiert. Der Test
-//!   `no_surface_registers_a_knowledge_store` hält das fest.
 //! - Web-eigene Dienste (`PeerCredentials`, `Arc<dyn ApprovalActorResolver>`,
 //!   `Arc<ApprovalStore>`): sie stammen pro Verbindung aus dem Kernel bzw. aus
 //!   dem Web-Server und gehören nicht in eine prozessweit gebaute
@@ -57,6 +65,7 @@ use harw_config::ResolvedConfig;
 use harw_core::{ManagedAgentSpawner, StateStore};
 use harw_extension_api::allow_rules::AllowRuleSet;
 use harw_extension_api::approval_mode::ApprovalModeCell;
+use harw_knowledge::KnowledgeStore;
 use harw_memory::Memory;
 use harw_operations::registry::OperationRegistry;
 use harw_operations::{ServiceMap, SharedSessionController};
@@ -162,7 +171,8 @@ impl ServiceSurface {
     /// Ob diese Fläche den Sitzungs-Controller erhält.
     ///
     /// # Beschreibung
-    /// Zweite und letzte **deklarierte** Differenz. Der
+    /// Zweite **deklarierte** Differenz (die dritte ist
+    /// [`Self::allows_knowledge_store`]). Der
     /// [`SharedSessionController`] mutiert den Zustand *einer laufenden,
     /// interaktiven* Sitzung (`/model`, `/effort`, `/provider`, `/mode`). Eine
     /// Web-Anfrage und ein durabler Job haben keine solche Sitzung — dort wäre
@@ -178,6 +188,28 @@ impl ServiceSurface {
     /// ```
     #[must_use]
     pub const fn allows_session_controller(self) -> bool {
+        matches!(self, Self::Slash | Self::ModelTool)
+    }
+
+    /// Ob diese Fläche den Wissensspeicher (`Arc<KnowledgeStore>`) erhält.
+    ///
+    /// # Beschreibung
+    /// Dritte **deklarierte** Differenz (L6): Workbench, Kanban, Diary und
+    /// Palace sind Flächen einer laufenden Sitzung — Slash-Kommando und
+    /// Modell-Werkzeug. Web und Job bleiben ohne, bis ihre Aufrufer eine
+    /// eigene Sichtbarkeitsprüfung haben (siehe Moduldoku).
+    ///
+    /// # Rückgabe
+    /// `true` für [`Self::Slash`] und [`Self::ModelTool`], sonst `false`.
+    ///
+    /// # Beispiel
+    /// ```rust
+    /// use harw_runtime::services::ServiceSurface;
+    /// assert!(ServiceSurface::ModelTool.allows_knowledge_store());
+    /// assert!(!ServiceSurface::Job.allows_knowledge_store());
+    /// ```
+    #[must_use]
+    pub const fn allows_knowledge_store(self) -> bool {
         matches!(self, Self::Slash | Self::ModelTool)
     }
 }
@@ -306,6 +338,7 @@ pub struct RuntimeServicesParts {
 pub struct RuntimeServices {
     parts: RuntimeServicesParts,
     home_context: Option<Arc<harw_home::ResolvedHomeContext>>,
+    knowledge: Option<Arc<KnowledgeStore>>,
 }
 
 /// Legt `service` in `map` ab und merkt sich seinen Typnamen in `names`.
@@ -344,13 +377,52 @@ impl RuntimeServices {
         Self {
             parts,
             home_context: None,
+            knowledge: None,
         }
     }
 
-    /// Bind the filesystem scope inherited by every operation surface.
+    /// Bindet den Dateisystem-Scope, den jede Operationsfläche erbt.
+    ///
+    /// # Beschreibung
+    /// Baut zugleich den Wissensspeicher unter
+    /// `harw_home::knowledge_dir(&context.profile_dir)`, sofern nicht schon
+    /// über [`Self::with_knowledge_store`] einer gesetzt ist. Der Speicher
+    /// legt nichts an; Verzeichnisse entstehen erst beim ersten Schreiben.
+    #[must_use]
     pub fn with_home_context(mut self, context: Arc<harw_home::ResolvedHomeContext>) -> Self {
+        if self.knowledge.is_none() {
+            self.knowledge = Some(Arc::new(KnowledgeStore::new(&harw_home::knowledge_dir(
+                &context.profile_dir,
+            ))));
+        }
         self.home_context = Some(context);
         self
+    }
+
+    /// Setzt den Wissensspeicher ausdrücklich (Tests, fremde Kompositionen).
+    ///
+    /// # Beschreibung
+    /// Überschreibt einen aus [`Self::with_home_context`] abgeleiteten
+    /// Speicher; ein späteres `with_home_context` ersetzt ihn nicht mehr.
+    #[must_use]
+    pub fn with_knowledge_store(mut self, store: Arc<KnowledgeStore>) -> Self {
+        self.knowledge = Some(store);
+        self
+    }
+
+    /// Der Wissensspeicher dieser Komposition.
+    ///
+    /// # Beschreibung
+    /// Dieselbe `Arc`-Instanz, die [`Self::service_map`] auf Slash und
+    /// Modell-Werkzeug legt — die Montage reicht sie an Werkzeug-Provider
+    /// (`workbench.note`/`workbench.hypothesis`) weiter, statt einen zweiten
+    /// Speicher zu öffnen.
+    ///
+    /// # Rückgabe
+    /// `Some`, sobald ein Home-Kontext oder ein Speicher gebunden ist.
+    #[must_use]
+    pub fn knowledge_store(&self) -> Option<&Arc<KnowledgeStore>> {
+        self.knowledge.as_ref()
     }
 
     /// Das authentifizierte Subjekt dieser Komposition.
@@ -437,9 +509,10 @@ impl RuntimeServices {
     /// Baut die [`ServiceMap`] einer Fläche.
     ///
     /// # Beschreibung
-    /// Jede Fläche bekommt dieselbe Menge, bis auf zwei deklarierte
+    /// Jede Fläche bekommt dieselbe Menge, bis auf drei deklarierte
     /// Unterschiede ([`ServiceSurface::allows_spawner`],
-    /// [`ServiceSurface::allows_session_controller`]):
+    /// [`ServiceSurface::allows_session_controller`],
+    /// [`ServiceSurface::allows_knowledge_store`]):
     ///
     /// | Dienst | Slash | ModelTool | Web | Job |
     /// |---|---|---|---|---|
@@ -458,6 +531,7 @@ impl RuntimeServices {
     /// | Plan-Dienste (falls vorhanden) | ✓ | ✓ | ✓ | ✓ |
     /// | `Arc<ManagedAgentSpawner>` (falls vorhanden) | ✓ | ✓ | — | — |
     /// | [`SharedSessionController`] (falls vorhanden) | ✓ | ✓ | — | — |
+    /// | `Arc<KnowledgeStore>` (falls gebunden, L6) | ✓ | ✓ | — | — |
     ///
     /// Die Zeile [`OperationRegistry`] trägt in jeder Fläche dieselbe Menge —
     /// nämlich die, die [`crate::spec::EntryProfile::operations`] dem Einstieg
@@ -571,7 +645,7 @@ impl RuntimeServices {
         if let Some(host_permit_handles) = &self.parts.host_permit_handles {
             insert_service(&mut map, &mut names, Arc::clone(host_permit_handles));
         }
-        // Die beiden deklarierten Differenzen — und nur sie.
+        // Die drei deklarierten Differenzen — und nur sie.
         if let Some(spawner) = self
             .parts
             .spawner
@@ -587,6 +661,13 @@ impl RuntimeServices {
             .filter(|_| surface.allows_session_controller())
         {
             insert_service(&mut map, &mut names, Arc::clone(controller));
+        }
+        if let Some(knowledge) = self
+            .knowledge
+            .as_ref()
+            .filter(|_| surface.allows_knowledge_store())
+        {
+            insert_service(&mut map, &mut names, Arc::clone(knowledge));
         }
         if let Some(plan) = &self.parts.plan {
             // `register_plan_services` legt genau diese vier Typen ab
@@ -620,6 +701,7 @@ mod tests {
     use harw_core::{ChildLimits, InMemoryStateStore, ManagedAgentSpawner, SessionManager};
     use harw_extension_api::allow_rules::AllowRuleSet;
     use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
+    use harw_knowledge::KnowledgeStore;
     use harw_memory::{Entry, MaintenanceReport, Memory, MemoryResult, RecallQuery, Signal, Stats};
     use harw_operations::registry::OperationRegistry;
     use harw_operations::session_control::NullSessionController;
@@ -1101,19 +1183,118 @@ mod tests {
 
     // ── Abgrenzung ────────────────────────────────────────────────────────────
 
+    /// L6: ohne gebundenen Home-Kontext/Speicher erfindet keine Fläche einen
+    /// Wissensspeicher.
     #[test]
-    fn no_surface_registers_a_knowledge_store() {
+    fn without_a_bound_store_no_surface_registers_a_knowledge_store() {
         let services = RuntimeServices::new(full_parts());
+        assert!(services.knowledge_store().is_none());
         for surface in ServiceSurface::ALL {
             assert!(
                 !services
                     .registered(surface)
                     .iter()
                     .any(|name| name.contains("KnowledgeStore")),
-                "L6 (w3-knowledge) bleibt offen: {} darf keinen KnowledgeStore tragen",
+                "{} darf ohne gebundenen Speicher keinen KnowledgeStore tragen",
                 surface.as_str()
             );
         }
+    }
+
+    /// L6 umgedreht: ein gebundener Speicher liegt auf Slash und
+    /// Modell-Werkzeug — dieselbe `Arc`-Instanz —, nicht auf Web und Job.
+    #[test]
+    fn knowledge_store_reaches_slash_and_model_tool_only() -> TestResult {
+        let store = Arc::new(KnowledgeStore::new(Path::new("/nonexistent/l6/knowledge")));
+        let services = RuntimeServices::new(full_parts()).with_knowledge_store(Arc::clone(&store));
+        for surface in ServiceSurface::ALL {
+            let map = services.service_map(surface);
+            let found = map.get::<Arc<KnowledgeStore>>();
+            if surface.allows_knowledge_store() {
+                let Some(found) = found else {
+                    return Err(TestError::Missing("Slash/ModelTool ohne KnowledgeStore"));
+                };
+                assert!(Arc::ptr_eq(found, &store), "{}", surface.as_str());
+                assert!(
+                    services
+                        .registered(surface)
+                        .contains(&type_name::<Arc<KnowledgeStore>>())
+                );
+            } else {
+                assert!(
+                    found.is_none(),
+                    "{} darf keinen KnowledgeStore tragen",
+                    surface.as_str()
+                );
+            }
+        }
+        assert_eq!(
+            services.registered(ServiceSurface::Slash),
+            services.registered(ServiceSurface::ModelTool)
+        );
+        Ok(())
+    }
+
+    /// Mit Speicher unterscheiden sich Web/Job vom Slash-Pfad um genau die
+    /// drei deklarierten Einträge.
+    #[test]
+    fn with_a_store_surfaces_differ_only_in_the_three_declared_entries() {
+        let store = Arc::new(KnowledgeStore::new(Path::new("/nonexistent/l6/knowledge")));
+        let services = RuntimeServices::new(full_parts()).with_knowledge_store(store);
+        let slash = services.registered(ServiceSurface::Slash);
+        for surface in [ServiceSurface::Web, ServiceSurface::Job] {
+            let here = services.registered(surface);
+            let missing: Vec<&'static str> = slash
+                .iter()
+                .filter(|name| !here.contains(*name))
+                .copied()
+                .collect();
+            assert_eq!(
+                sorted(missing),
+                sorted(vec![
+                    type_name::<Arc<ManagedAgentSpawner>>(),
+                    type_name::<SharedSessionController>(),
+                    type_name::<Arc<KnowledgeStore>>(),
+                ]),
+                "Fläche {}",
+                surface.as_str()
+            );
+        }
+    }
+
+    /// Der Speicher liegt unter `harw_home::knowledge_dir(profile_dir)` des
+    /// gebundenen Home-Kontexts; ein ausdrücklich gesetzter Speicher gewinnt.
+    #[test]
+    fn home_context_derives_the_store_from_the_profile_dir() -> TestResult {
+        let home = tempfile::tempdir().map_err(|error| TestError::Unexpected(error.to_string()))?;
+        let project_dir = home.path().join("project");
+        let project = harw_home::ProjectRoot {
+            root: project_dir.clone(),
+            trust_key: project_dir,
+            kind: harw_home::ProjectKind::Directory,
+        };
+        let context = Arc::new(
+            harw_home::ResolvedHomeContext::new(home.path(), "default".to_owned(), project)
+                .map_err(|error| TestError::Unexpected(error.to_string()))?,
+        );
+        let services =
+            RuntimeServices::new(minimal_parts()).with_home_context(Arc::clone(&context));
+        let Some(store) = services.knowledge_store() else {
+            return Err(TestError::Missing(
+                "with_home_context muss den Speicher binden",
+            ));
+        };
+        assert_eq!(store.root(), harw_home::knowledge_dir(&context.profile_dir));
+
+        let explicit = Arc::new(KnowledgeStore::new(Path::new("/nonexistent/explicit")));
+        let services = RuntimeServices::new(minimal_parts())
+            .with_knowledge_store(Arc::clone(&explicit))
+            .with_home_context(context);
+        let Some(kept) = services.knowledge_store() else {
+            return Err(TestError::Missing("ausdrücklicher Speicher fehlt"));
+        };
+        assert!(Arc::ptr_eq(kept, &explicit));
+        Ok(())
     }
 
     #[test]
