@@ -5,7 +5,7 @@
 //! - [`local_command_specs`]: Spezifikationen der rein TUI-lokal abgefangenen
 //!   Befehle (`/tools`, `/exit`, …) plus Ersatz-Spezifikationen für Befehle,
 //!   deren Operation (noch) nicht registriert ist (`/workbench`, `/kanban`,
-//!   `/palace`, `/dream`, `/diary`, `/models`, `/mode`). Beim Einmischen über
+//!   `/palace`, `/dream`, `/diary`, `/models`, `/mode`, `/matrix`). Beim Einmischen über
 //!   `CommandRegistry::with_local_specs` gewinnt immer die Operation; der
 //!   Ersatz entfällt dann.
 //! - [`enrich`]: ergänzt eine aus einer Operation abgeleitete Spezifikation um
@@ -250,6 +250,31 @@ const DIARY: &[SubcommandHint] = &[
     SubcommandHint::new("note", "<text>", "Tagebuchnotiz schreiben"),
 ];
 
+/// `/matrix`, Grammatik der Matrix-Game-Operation (`harw-ops/src/matrix`).
+const MATRIX: &[SubcommandHint] = &[
+    SubcommandHint::new("start", "<szenario>", "Neues Matrix-Spiel starten"),
+    SubcommandHint::new("step", "", "Eine Phase weiter"),
+    SubcommandHint::new("auto", "<n>", "N Runden ohne Halt spielen"),
+    SubcommandHint::new("pause", "", "Nach laufenden Aufrufen anhalten"),
+    SubcommandHint::new("inject", "<text…>", "Ereignis einspielen (nächste Phase)"),
+    SubcommandHint::new(
+        "override",
+        "<argument> …",
+        "Adjudikation überschreiben (vor/nach dem Wurf)",
+    ),
+    SubcommandHint::new("veto", "<argument>", "Argument verwerfen (Neuversuch)"),
+    SubcommandHint::new("reveal", "<geheimnis>", "Geheimes Argument offenlegen"),
+    SubcommandHint::new("fork", "<runde>", "Neues Spiel ab Rundenende abzweigen"),
+    SubcommandHint::new("end", "", "Direkt zu Schlussargumenten und AAR"),
+    SubcommandHint::new(
+        "replay",
+        "[--seed <seed>]",
+        "Journal deterministisch nachspielen",
+    ),
+    SubcommandHint::new("show", "", "Laufendes Spiel anzeigen (Panel: F9)"),
+    SubcommandHint::new("list", "", "Szenarien und Läufe auflisten"),
+];
+
 /// `/tools`, Grammatik aus `crate::tools_command`.
 const TOOLS: &[SubcommandHint] = &[
     SubcommandHint::new("on", "<name>", "Werkzeug einschalten"),
@@ -331,6 +356,11 @@ const HINT_TABLE: &[(&str, &str, &[SubcommandHint])] = &[
     ),
     ("dream", "/dream [list|show <id>]", DREAM),
     ("diary", "/diary [today|show [agent]|note <text>]", DIARY),
+    (
+        "matrix",
+        "/matrix [start <szenario>|step|auto <n>|pause|inject|show|end|…]",
+        MATRIX,
+    ),
     (
         "tools",
         "/tools [on <name>|off <name>|reset [name]|profile <p>]",
@@ -471,7 +501,7 @@ fn local_spec(
 
 /// Namen der Ersatz-Spezifikationen für (noch) fehlende Operationen.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const FALLBACK_COMMANDS: &[&str] = &["mode"];
+pub(crate) const FALLBACK_COMMANDS: &[&str] = &["mode", "matrix"];
 
 /// Spezifikationen aller TUI-lokalen Befehle plus Ersatz-Spezifikationen
 /// ([`FALLBACK_COMMANDS`]).
@@ -578,6 +608,14 @@ pub(crate) fn local_command_specs() -> Vec<CommandSpec> {
             "Interaktionsmodus anzeigen oder wechseln",
             "",
         ),
+        local_spec(
+            "matrix",
+            Misc,
+            Operator,
+            Deferred,
+            "Matrix-Game: Spiel starten, steuern und beobachten (bare: Panel)",
+            "",
+        ),
     ]
     .into_iter()
     .flatten()
@@ -597,9 +635,9 @@ mod tests {
         "agents",
     ];
 
-    /// Befehle, deren Operation fehlen darf. Leer: alle Wissens-Ops und
-    /// `/models` sind inzwischen Operationen.
-    const ALLOWED_MISSING: &[&str] = &[];
+    /// Befehle, deren Operation fehlen darf. `matrix` hat eine
+    /// Ersatz-Spezifikation, bis die `/matrix`-Operation registriert ist.
+    const ALLOWED_MISSING: &[&str] = &["matrix"];
 
     #[test]
     fn local_specs_cover_every_local_and_fallback_name_once() {
@@ -694,6 +732,13 @@ mod tests {
         assert_eq!(names("sandbox-lease"), ["status", "revoke"]);
         assert!(names("mode").contains(&"default"));
         assert!(names("tools").contains(&"profile"));
+        assert_eq!(
+            names("matrix"),
+            [
+                "start", "step", "auto", "pause", "inject", "override", "veto", "reveal", "fork",
+                "end", "replay", "show", "list"
+            ]
+        );
         assert!(subcommand_hints("no-such-command").is_empty());
     }
 

@@ -15,6 +15,7 @@
 //! open_kanban = "F6"
 //! open_mode_picker = "F7"
 //! open_models = "F8"
+//! open_matrix = "F9"
 //! show_help = "F1"
 //! end_host_mode = []
 //! ```
@@ -94,11 +95,13 @@ pub(crate) enum KeyAction {
     OpenModels,
     /// Hilfe (Befehle, Tasten, Präfixe) öffnen (Standard `F1`).
     ShowHelp,
+    /// Matrix-Game-Panel öffnen (Standard `F9`).
+    OpenMatrix,
 }
 
 impl KeyAction {
     /// Alle Aktionen in fester Reihenfolge (auch Vorrang bei Gleichstand).
-    pub(crate) const ALL: [Self; 15] = [
+    pub(crate) const ALL: [Self; 16] = [
         Self::ToggleExplorer,
         Self::ToggleAgents,
         Self::CycleFocus,
@@ -114,6 +117,7 @@ impl KeyAction {
         Self::OpenModePicker,
         Self::OpenModels,
         Self::ShowHelp,
+        Self::OpenMatrix,
     ];
 
     /// Name der Aktion in der Keybindings-Datei.
@@ -134,6 +138,7 @@ impl KeyAction {
             Self::OpenModePicker => "open_mode_picker",
             Self::OpenModels => "open_models",
             Self::ShowHelp => "show_help",
+            Self::OpenMatrix => "open_matrix",
         }
     }
 
@@ -155,6 +160,7 @@ impl KeyAction {
             Self::OpenModePicker => "Modus und Freigabe wählen",
             Self::OpenModels => "Modelle je Rolle anzeigen",
             Self::ShowHelp => "Hilfe anzeigen",
+            Self::OpenMatrix => "Matrix-Game-Panel öffnen",
         }
     }
 
@@ -181,6 +187,7 @@ impl KeyAction {
             Self::OpenModePicker => (KeyCode::F(7), KeyModifiers::NONE),
             Self::OpenModels => (KeyCode::F(8), KeyModifiers::NONE),
             Self::ShowHelp => (KeyCode::F(1), KeyModifiers::NONE),
+            Self::OpenMatrix => (KeyCode::F(9), KeyModifiers::NONE),
         };
         vec![KeyChord { code, modifiers }]
     }
@@ -773,6 +780,10 @@ mod tests {
                 event(KeyCode::F(1), KeyModifiers::NONE),
                 KeyAction::ShowHelp,
             ),
+            (
+                event(KeyCode::F(9), KeyModifiers::NONE),
+                KeyAction::OpenMatrix,
+            ),
         ];
         for (key, expected) in cases {
             assert_eq!(bindings.action_for(&key), Some(expected), "{key:?}");
@@ -803,6 +814,7 @@ mod tests {
             ("open_mode_picker", KeyAction::OpenModePicker),
             ("open_models", KeyAction::OpenModels),
             ("show_help", KeyAction::ShowHelp),
+            ("open_matrix", KeyAction::OpenMatrix),
         ] {
             assert_eq!(KeyAction::from_name(name), Some(action));
         }
@@ -851,7 +863,7 @@ mod tests {
     fn keybindings_file_accepts_new_action_names() -> TestResult {
         let text = r#"
 toggle_workbench = "ctrl+w"
-open_kanban = "F9"
+open_kanban = "F20"
 open_mode_picker = "alt+m"
 open_models = "F10"
 show_help = "F12"
@@ -863,7 +875,7 @@ show_help = "F12"
                 KeyAction::ToggleWorkbench,
             ),
             (
-                event(KeyCode::F(9), KeyModifiers::NONE),
+                event(KeyCode::F(20), KeyModifiers::NONE),
                 KeyAction::OpenKanban,
             ),
             (
@@ -896,7 +908,7 @@ show_help = "F12"
     #[test]
     fn overrides_replace_only_named_actions() -> TestResult {
         let text = r#"
-toggle_explorer = "F9"
+toggle_explorer = "F20"
 toggle_agents = ["F10", "ctrl+g"]
 end_host_mode = []
 "#;
@@ -906,7 +918,7 @@ end_host_mode = []
             None
         );
         assert_eq!(
-            bindings.action_for(&event(KeyCode::F(9), KeyModifiers::NONE)),
+            bindings.action_for(&event(KeyCode::F(20), KeyModifiers::NONE)),
             Some(KeyAction::ToggleExplorer)
         );
         assert_eq!(

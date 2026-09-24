@@ -37,6 +37,7 @@ use crate::help_overlay::{HelpOverlay, HelpTab};
 use crate::kanban_board::KanbanBoard;
 use crate::keybindings::KeyBindings;
 use crate::knowledge_view::{KnowledgeBrowser, KnowledgeKind};
+use crate::matrix_view::MatrixView;
 use crate::mention::role_mention_text;
 use crate::mode_picker::ModePicker;
 use crate::model_roles_view::ModelRolesView;
@@ -200,6 +201,7 @@ pub(crate) fn intercept(raw: &str, ctx: &LocalCommandContext<'_>) -> Option<Loca
         "help" if bare => Some(help(ctx, HelpTab::Commands)),
         "keys" => Some(help(ctx, HelpTab::Keys)),
         "kanban" if bare => Some(LocalIntercept::OpenOverlay(Box::new(KanbanBoard::new()))),
+        "matrix" if bare => Some(LocalIntercept::OpenOverlay(Box::new(MatrixView::new()))),
         "workbench" if bare => Some(LocalIntercept::TogglePanel(PanelToggle::Workbench)),
         "palace" if bare => Some(knowledge(KnowledgeKind::Palace)),
         "dream" if bare => Some(knowledge(KnowledgeKind::Dream)),
@@ -581,6 +583,8 @@ mod tests {
         let fx = empty();
         assert!(overlay_debug(fx.run("/kanban"))?.contains("KanbanBoard"));
         assert!(fx.run("/kanban move c1 done").is_none());
+        assert!(overlay_debug(fx.run("/matrix"))?.contains("MatrixView"));
+        assert!(fx.run("/matrix step").is_none());
         for (raw, kind) in [
             ("/palace", "Palace"),
             ("/dream", "Dream"),

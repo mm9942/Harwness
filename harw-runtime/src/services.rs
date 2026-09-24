@@ -35,6 +35,14 @@
 //! deren Workbench sie beschreiben dürften, und die Sichtbarkeitsprüfung der
 //! Wissensfläche kennt noch keinen Web-/Job-Aufrufer.
 //!
+//! # Agenten-Event-Bus
+//! Ist per [`RuntimeServices::with_agent_events`] ein `Arc<AgentEventHub>`
+//! gebunden, legt die Fabrik ihn — vierte deklarierte Differenz,
+//! [`ServiceSurface::allows_agent_events`] — auf Slash und Modell-Werkzeug.
+//! Damit veröffentlicht `/matrix` Live-Ereignisse
+//! ([`harw_core::AgentEventKind::Matrix`]) für die TUI-Matrix-Ansicht. Web und
+//! Job haben keine laufende Sitzung mit Beobachter und bleiben ohne.
+//!
 //! # Kanban-Job-Ledger
 //! Liegen ein Wissensspeicher **und** ein `JobStore` vor und trägt das
 //! [`Principal`] einen Freigabe-Akteur (`Principal::approval_actor`), legt
@@ -72,7 +80,7 @@ use std::any::{Any, type_name};
 use std::sync::Arc;
 
 use harw_config::ResolvedConfig;
-use harw_core::{ManagedAgentSpawner, StateStore};
+use harw_core::{AgentEventHub, ManagedAgentSpawner, StateStore};
 use harw_extension_api::allow_rules::AllowRuleSet;
 use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_job_runtime::JobScope;
@@ -232,6 +240,27 @@ impl ServiceSurface {
     pub const fn allows_knowledge_store(self) -> bool {
         matches!(self, Self::Slash | Self::ModelTool)
     }
+
+    /// Ob diese Fläche den Agenten-Event-Bus (`Arc<AgentEventHub>`) erhält.
+    ///
+    /// # Beschreibung
+    /// Vierte **deklarierte** Differenz: Live-Ereignisse (etwa aus `/matrix`)
+    /// haben nur in einer laufenden, beobachteten Sitzung einen Empfänger —
+    /// Slash-Kommando und Modell-Werkzeug. Web und Job bleiben ohne.
+    ///
+    /// # Rückgabe
+    /// `true` für [`Self::Slash`] und [`Self::ModelTool`], sonst `false`.
+    ///
+    /// # Beispiel
+    /// ```rust
+    /// use harw_runtime::services::ServiceSurface;
+    /// assert!(ServiceSurface::Slash.allows_agent_events());
+    /// assert!(!ServiceSurface::Web.allows_agent_events());
+    /// ```
+    #[must_use]
+    pub const fn allows_agent_events(self) -> bool {
+        matches!(self, Self::Slash | Self::ModelTool)
+    }
 }
 
 // ── PlanServices ──────────────────────────────────────────────────────────────
@@ -359,6 +388,7 @@ pub struct RuntimeServices {
     parts: RuntimeServicesParts,
     home_context: Option<Arc<harw_home::ResolvedHomeContext>>,
     knowledge: Option<Arc<KnowledgeStore>>,
+    agent_events: Option<Arc<AgentEventHub>>,
 }
 
 /// Legt `service` in `map` ab und merkt sich seinen Typnamen in `names`.
@@ -398,7 +428,33 @@ impl RuntimeServices {
             parts,
             home_context: None,
             knowledge: None,
+            agent_events: None,
         }
+    }
+
+    /// Bindet den Agenten-Event-Bus der Montage.
+    ///
+    /// # Beschreibung
+    /// Derselbe Hub, den die Montage an Sitzungen und Spawner hängt; die
+    /// Fabrik legt ihn nur auf Flächen mit
+    /// [`ServiceSurface::allows_agent_events`]. Ohne Aufruf fehlt der Dienst
+    /// überall (Operationen melden dann keine Live-Ereignisse).
+    ///
+    /// # Argumente
+    /// - `hub` (`Arc<AgentEventHub>`): der geteilte Bus.
+    #[must_use]
+    pub fn with_agent_events(mut self, hub: Arc<AgentEventHub>) -> Self {
+        self.agent_events = Some(hub);
+        self
+    }
+
+    /// Der gebundene Agenten-Event-Bus dieser Komposition.
+    ///
+    /// # Rückgabe
+    /// `Some`, sobald [`Self::with_agent_events`] aufgerufen wurde.
+    #[must_use]
+    pub fn agent_events(&self) -> Option<&Arc<AgentEventHub>> {
+        self.agent_events.as_ref()
     }
 
     /// Bindet den Dateisystem-Scope, den jede Operationsfläche erbt.
@@ -529,10 +585,11 @@ impl RuntimeServices {
     /// Baut die [`ServiceMap`] einer Fläche.
     ///
     /// # Beschreibung
-    /// Jede Fläche bekommt dieselbe Menge, bis auf drei deklarierte
+    /// Jede Fläche bekommt dieselbe Menge, bis auf vier deklarierte
     /// Unterschiede ([`ServiceSurface::allows_spawner`],
     /// [`ServiceSurface::allows_session_controller`],
-    /// [`ServiceSurface::allows_knowledge_store`]):
+    /// [`ServiceSurface::allows_knowledge_store`],
+    /// [`ServiceSurface::allows_agent_events`]):
     ///
     /// | Dienst | Slash | ModelTool | Web | Job |
     /// |---|---|---|---|---|
@@ -553,6 +610,7 @@ impl RuntimeServices {
     /// | [`SharedSessionController`] (falls vorhanden) | ✓ | ✓ | — | — |
     /// | `Arc<KnowledgeStore>` (falls gebunden, L6) | ✓ | ✓ | — | — |
     /// | `Arc<dyn JobTransitions>` (Speicher + `JobStore` + Freigabe-Akteur) | ✓ | ✓ | — | — |
+    /// | `Arc<AgentEventHub>` (falls gebunden, `/matrix`) | ✓ | ✓ | — | — |
     ///
     /// Die Zeile [`OperationRegistry`] trägt in jeder Fläche dieselbe Menge —
     /// nämlich die, die [`crate::spec::EntryProfile::operations`] dem Einstieg
@@ -666,7 +724,7 @@ impl RuntimeServices {
         if let Some(host_permit_handles) = &self.parts.host_permit_handles {
             insert_service(&mut map, &mut names, Arc::clone(host_permit_handles));
         }
-        // Die drei deklarierten Differenzen — und nur sie.
+        // Die vier deklarierten Differenzen — und nur sie.
         if let Some(spawner) = self
             .parts
             .spawner
@@ -692,6 +750,13 @@ impl RuntimeServices {
         }
         if let Some(ledger) = self.kanban_ledger(surface) {
             insert_service(&mut map, &mut names, ledger);
+        }
+        if let Some(hub) = self
+            .agent_events
+            .as_ref()
+            .filter(|_| surface.allows_agent_events())
+        {
+            insert_service(&mut map, &mut names, Arc::clone(hub));
         }
         if let Some(plan) = &self.parts.plan {
             // `register_plan_services` legt genau diese vier Typen ab
@@ -749,7 +814,9 @@ mod tests {
     };
     use crate::test_support::{TestError, TestResult};
     use harw_config::ResolvedConfig;
-    use harw_core::{ChildLimits, InMemoryStateStore, ManagedAgentSpawner, SessionManager};
+    use harw_core::{
+        AgentEventHub, ChildLimits, InMemoryStateStore, ManagedAgentSpawner, SessionManager,
+    };
     use harw_extension_api::allow_rules::AllowRuleSet;
     use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
     use harw_knowledge::KnowledgeStore;
@@ -1284,6 +1351,76 @@ mod tests {
             services.registered(ServiceSurface::Slash),
             services.registered(ServiceSurface::ModelTool)
         );
+        Ok(())
+    }
+
+    /// Ohne [`RuntimeServices::with_agent_events`] trägt keine Fläche einen Hub.
+    #[test]
+    fn without_a_bound_hub_no_surface_registers_agent_events() {
+        let services = RuntimeServices::new(full_parts());
+        assert!(services.agent_events().is_none());
+        for surface in ServiceSurface::ALL {
+            assert!(
+                services
+                    .service_map(surface)
+                    .get::<Arc<AgentEventHub>>()
+                    .is_none(),
+                "{} darf ohne gebundenen Hub keinen AgentEventHub tragen",
+                surface.as_str()
+            );
+        }
+    }
+
+    /// Ein gebundener Hub liegt auf Slash und Modell-Werkzeug — dieselbe
+    /// `Arc`-Instanz —, nicht auf Web und Job.
+    #[test]
+    fn agent_events_reach_slash_and_model_tool_only() -> TestResult {
+        let hub = Arc::new(AgentEventHub::new(4));
+        let services = RuntimeServices::new(full_parts()).with_agent_events(Arc::clone(&hub));
+        for surface in ServiceSurface::ALL {
+            let map = services.service_map(surface);
+            let found = map.get::<Arc<AgentEventHub>>();
+            if surface.allows_agent_events() {
+                let Some(found) = found else {
+                    return Err(TestError::Missing("Slash/ModelTool ohne AgentEventHub"));
+                };
+                assert!(Arc::ptr_eq(found, &hub), "{}", surface.as_str());
+                assert!(
+                    services
+                        .registered(surface)
+                        .contains(&type_name::<Arc<AgentEventHub>>())
+                );
+            } else {
+                assert!(
+                    found.is_none(),
+                    "{} darf keinen AgentEventHub tragen",
+                    surface.as_str()
+                );
+            }
+        }
+        assert_eq!(
+            services.registered(ServiceSurface::Slash),
+            services.registered(ServiceSurface::ModelTool)
+        );
+        let slash = services.registered(ServiceSurface::Slash);
+        for surface in [ServiceSurface::Web, ServiceSurface::Job] {
+            let here = services.registered(surface);
+            let missing: Vec<&'static str> = slash
+                .iter()
+                .filter(|name| !here.contains(*name))
+                .copied()
+                .collect();
+            assert_eq!(
+                sorted(missing),
+                sorted(vec![
+                    type_name::<Arc<ManagedAgentSpawner>>(),
+                    type_name::<SharedSessionController>(),
+                    type_name::<Arc<AgentEventHub>>(),
+                ]),
+                "Fläche {}",
+                surface.as_str()
+            );
+        }
         Ok(())
     }
 

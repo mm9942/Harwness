@@ -1,0 +1,65 @@
+# Eingebaute Matrix-Game-Rolle `matrix-umpire` (Runde 3, Welle E) — einer der drei
+# Sitz-Typen des Matrix-Games (`harw-matrix-game`), neben
+# `matrix-player` (Spieler) und `matrix-market` (Markt).
+#
+# Namensableitung (AW6-00-Konvention): Dateistamm `matrix-umpire` unter
+# `agents/roles/matrix-umpire/` ergibt den Rollennamen `"matrix-umpire"`
+# (`role_names::MATRIX_UMPIRE` in `src/profile.rs`).
+#
+# ── Warum keine Werkzeuge ───────────────────────────────────────────────────
+# Der Matrix-Runner (`harw-ops/src/matrix/runner.rs`) übergibt jedem Sitz
+# seine Sicht auf das Spiel (Szenario, Journal-Auszug, erwarteter Aufruf)
+# vollständig im Prompt und liest die Antwort als Text zurück. Die Rolle
+# ruft deshalb selbst nichts auf: `[tools].admitted` bleibt leer, das
+# Registry-Profil ist `RegistryProfile::NoTools`, der Reducer
+# `AuthorityReducer::ReadOnly` — kein Schreiben, keine Ausführung, kein Netz.
+# `forbidden` benennt jedes Schreib-, Ausführungs- und Netzwerkzeug
+# trotzdem ausdrücklich, damit eine Ablehnung nachvollziehbar bleibt
+# (dieselbe Disziplin wie bei den `security-*-triage`-Rollen).
+#
+# ── Rückgabevertrag ──────────────────────────────────────────────────────────
+# `harwness.matrix.umpire-ruling@1` ist ein undurchsichtiges Label: `ChildReturnContract::parse`
+# kennt es nicht und reicht die Antwort als Freitext durch. Die Prüfung der
+# Antwortform übernimmt der Matrix-Runner selbst (Reparatur-Prompt bei
+# Vertragsbruch).
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.matrix-umpire@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "matrix-umpire"
+
+name = "Matrix Umpire"
+description = "Schiedsrichter im Matrix-Game: bewertet die Züge der Spieler nach Plausibilität, entscheidet über Ergebnisse und schreibt den Lagebericht; ohne Werkzeuge und ohne Netz."
+
+[work]
+mode = "matrix-game-umpire"
+may_write_code = false
+may_research_web = false
+
+# Keine Werkzeugoberfläche — siehe Begründung oben.
+[tools]
+admitted = []
+forbidden = [
+    "fs.write",
+    "shell.exec",
+    "process.kill",
+    "web.fetch",
+    "web.search",
+    "web.docs_rs",
+    "web.crates_io",
+]
+
+# Ein Sitz spielt seinen Zug selbst und startet keine Kind-Agenten.
+[spawn]
+max_depth = 0
+
+# Reiner Textzug: großzügiges Token-Budget, kein einziger Werkzeugaufruf.
+[spawn.budget]
+max_tokens = 60000
+max_tool_calls = 0
+max_wall_secs = 300
+
+[return]
+contract = "harwness.matrix.umpire-ruling@1"

@@ -188,6 +188,19 @@ pub enum DslError {
         location: DiagLocation,
     },
 
+    /// Ein Skill-Eintrag (`skills = [...]`) ist ungültig: Name verletzt
+    /// `[a-z0-9-]{1,64}`, ist in derselben Liste doppelt oder hat den falschen Typ.
+    InvalidSkill {
+        /// ID der Definition, die den Skill führt (geboxt).
+        of: Box<DefinitionId>,
+        /// Der beanstandete Eintrag (roh).
+        skill: String,
+        /// Grund der Ablehnung.
+        reason: &'static str,
+        /// Feldpfad, z. B. `"skills[2]"` (§20).
+        location: DiagLocation,
+    },
+
     /// Eine unbekannte Merge-Operation wurde angetroffen (§7).
     UnknownMergeOp {
         /// Name der unbekannten Operation.
@@ -294,6 +307,18 @@ impl std::fmt::Display for DslError {
                     location.format_suffix()
                 )
             }
+            DslError::InvalidSkill {
+                of,
+                skill,
+                reason,
+                location,
+            } => {
+                write!(
+                    f,
+                    "Definition '{of}' führt ungültigen Skill '{skill}': {reason}{}",
+                    location.format_suffix()
+                )
+            }
             DslError::UnknownMergeOp { name } => {
                 write!(f, "Unbekannte Merge-Operation: '{name}'")
             }
@@ -389,6 +414,12 @@ mod tests {
                 mixin: Box::new(make_id()?),
                 role: AgentRoleId::Worker,
                 location: DiagLocation::none(),
+            },
+            DslError::InvalidSkill {
+                of: Box::new(make_id()?),
+                skill: "Bad_Name".to_owned(),
+                reason: "ungültig",
+                location: DiagLocation::field("skills[0]"),
             },
             DslError::UnknownMergeOp {
                 name: "supermerge".to_owned(),
