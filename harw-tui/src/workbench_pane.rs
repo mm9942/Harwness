@@ -572,9 +572,15 @@ mod tests {
             PaneCommand::Run("/workbench unpin src/a.rs".into())
         );
         // Auf einer Datei gibt es keine Hypothese zu bestätigen.
-        assert_eq!(pane.handle_key(key(KeyCode::Char('c'))), PaneCommand::Redraw);
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('c'))),
+            PaneCommand::Redraw
+        );
         for _ in 0..3 {
-            assert_eq!(pane.handle_key(key(KeyCode::Char('j'))), PaneCommand::Redraw);
+            assert_eq!(
+                pane.handle_key(key(KeyCode::Char('j'))),
+                PaneCommand::Redraw
+            );
         }
         assert_eq!(
             pane.handle_key(key(KeyCode::Char('c'))),
@@ -586,8 +592,14 @@ mod tests {
             PaneCommand::Run("/workbench hypothesis reject 7".into())
         );
         assert_eq!(pane.handle_key(key(KeyCode::Char('j'))), PaneCommand::None);
-        assert_eq!(pane.handle_key(key(KeyCode::Char('x'))), PaneCommand::Redraw);
-        assert_eq!(pane.handle_key(key(KeyCode::Char('k'))), PaneCommand::Redraw);
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('x'))),
+            PaneCommand::Redraw
+        );
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Char('k'))),
+            PaneCommand::Redraw
+        );
         assert_eq!(
             pane.handle_key(key(KeyCode::Char('n'))),
             PaneCommand::Prefill("/workbench note ".into())
@@ -601,7 +613,10 @@ mod tests {
             PaneCommand::Run(WorkbenchPane::REFRESH_COMMAND.into())
         );
         assert!(pane.is_stale());
-        assert_eq!(pane.handle_key(key(KeyCode::Esc)), PaneCommand::ReleaseFocus);
+        assert_eq!(
+            pane.handle_key(key(KeyCode::Esc)),
+            PaneCommand::ReleaseFocus
+        );
     }
 
     #[test]

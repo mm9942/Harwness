@@ -178,7 +178,9 @@ impl KanbanBoard {
     fn status_lane_of(&self, card: &Card) -> Option<usize> {
         self.lanes
             .iter()
-            .position(|lane| lane.is_status() && !card.lane_id.is_empty() && lane.id == card.lane_id)
+            .position(|lane| {
+                lane.is_status() && !card.lane_id.is_empty() && lane.id == card.lane_id
+            })
             .or_else(|| {
                 self.lanes.iter().position(|lane| {
                     lane.is_status() && !card.state.is_empty() && lane.target_state() == card.state
@@ -246,13 +248,7 @@ impl KanbanBoard {
         }
     }
 
-    fn render_lane(
-        &self,
-        lane_index: usize,
-        area: Rect,
-        buf: &mut Buffer,
-        theme: Theme,
-    ) {
+    fn render_lane(&self, lane_index: usize, area: Rect, buf: &mut Buffer, theme: Theme) {
         let Some(lane) = self.lanes.get(lane_index) else {
             return;
         };
@@ -446,7 +442,8 @@ impl OverlayView for KanbanBoard {
         };
 
         if board_area.height > 0 {
-            let visible = usize::from((board_area.width / MIN_LANE_WIDTH).max(1)).min(self.lanes.len());
+            let visible =
+                usize::from((board_area.width / MIN_LANE_WIDTH).max(1)).min(self.lanes.len());
             let first = self
                 .lane_index
                 .saturating_sub(visible.saturating_sub(1))
@@ -816,9 +813,15 @@ mod tests {
         let mut board = loaded();
         board.on_key(key(KeyCode::Enter));
         assert!(board.detail);
-        assert!(matches!(board.on_key(key(KeyCode::Esc)), OverlayOutcome::Stay));
+        assert!(matches!(
+            board.on_key(key(KeyCode::Esc)),
+            OverlayOutcome::Stay
+        ));
         assert!(!board.detail);
-        assert!(matches!(board.on_key(key(KeyCode::Esc)), OverlayOutcome::Close));
+        assert!(matches!(
+            board.on_key(key(KeyCode::Esc)),
+            OverlayOutcome::Close
+        ));
         // Leere Lane: kein Detail.
         board.on_key(key(KeyCode::Right));
         board.on_key(key(KeyCode::Right));

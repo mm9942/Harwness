@@ -259,7 +259,8 @@ impl CommandPopup {
     /// wenn `query` irgendwo im Namen vorkommt). Einträge ohne Treffer
     /// entfallen. Innerhalb eines Rangs sortiert stabil nach Namenslänge,
     /// dann alphabetisch — deterministisch unabhängig von der
-    /// Registrierungsreihenfolge. Setzt `selected` auf `0` und
+    /// Registrierungsreihenfolge. Im Unterkommando-Modus gilt innerhalb eines
+    /// Rangs stattdessen die Katalog-Reihenfolge der Hinweise. Setzt `selected` auf `0` und
     /// `selection_moved` auf `false`.
     pub(crate) fn on_query_change(&mut self, query: &str) {
         self.query = query.to_owned();
@@ -284,9 +285,16 @@ impl CommandPopup {
             })
             .collect();
         let items = &self.items;
+        // Unterkommandos behalten innerhalb eines Rangs die Katalog-Reihenfolge
+        // (`show` zuerst usw.); Befehlsnamen sortieren nach Länge, dann
+        // alphabetisch.
+        let keep_order = matches!(self.mode, PopupMode::Subcommand { .. });
         ranked.sort_by(|(idx_a, tier_a), (idx_b, tier_b)| {
-            tier_a
-                .cmp(tier_b)
+            let by_tier = tier_a.cmp(tier_b);
+            if keep_order {
+                return by_tier.then_with(|| idx_a.cmp(idx_b));
+            }
+            by_tier
                 .then_with(|| items[*idx_a].name.len().cmp(&items[*idx_b].name.len()))
                 .then_with(|| items[*idx_a].name.cmp(&items[*idx_b].name))
         });
@@ -494,7 +502,13 @@ impl CommandPopup {
 
             // Die Ordnungszahl bleibt der Index in der vollständigen gefilterten
             // Liste, damit beim Scrollen klar ist, dass weitere Treffer folgen.
-            let label = format!("{:>2}. /{}", filtered_idx + 1, item.name);
+            // Im Unterkommando-Modus keine Ordnungszahl: Ziffern wählen dort
+            // nicht aus und sollen es auch nicht suggerieren.
+            let label = if self.digits_select() {
+                format!("{:>2}. /{}", filtered_idx + 1, item.name)
+            } else {
+                format!("  {}", item.name)
+            };
             let name_width = area.width.min(NAME_COLUMN_WIDTH);
             let name_area = Rect::new(area.left(), y, name_width, 1);
             Widget::render(Line::styled(label, name_style), name_area, buf);
@@ -662,17 +676,19 @@ mod tests {
         let mut popup = built_in_popup()?;
         popup.on_query_change("mo");
 
-        assert_eq!(
-            popup.prefix_count, 2,
-            "expected exactly two prefix matches ('mode', 'model') for 'mo'"
+        // `/models` kommt hinzu, sobald die Operation registriert ist — der
+        // Test verlangt deshalb nur, dass `mode`, `model` die Spitze bilden.
+        assert!(
+            popup.prefix_count >= 2,
+            "expected at least the prefix matches 'mode' and 'model' for 'mo'"
         );
         let leading: Vec<&str> = popup.filtered[..popup.prefix_count]
             .iter()
             .map(|&idx| popup.items[idx].name.as_str())
             .collect();
         assert_eq!(
-            leading,
-            vec!["mode", "model"],
+            leading[..2],
+            ["mode", "model"],
             "prefix matches must lead, sorted by length then alphabetically"
         );
 
@@ -711,6 +727,166 @@ mod tests {
 
         assert_eq!(popup.visible_range(8), 1..9);
         assert!(popup.visible_range(8).contains(&popup.selected));
+        Ok(())
+    }
+    // ── Beschreibung, Fußzeile, Unterkommando-Modus ─────────────────────────
+
+    fn model_spec() -> TestResult<crate::CommandSpec> {
+        let registry = CommandRegistry::built_in().map_err(ctx("built_in"))?;
+        registry
+            .find("model")
+            .cloned()
+            .ok_or(TestError::Missing("model spec"))
+    }
+
+    fn render_rows(popup: &CommandPopup, width: u16, height: u16) -> Vec<String> {
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        popup.render(area, &mut buf, style::Theme::Dark);
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf[(x, y)].symbol().to_owned())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn description_uses_the_spec_summary_when_present() -> TestResult {
+        let registry = CommandRegistry::built_in().map_err(ctx("built_in"))?;
+        let popup = CommandPopup::new(&registry);
+        let spec = registry
+            .find("model")
+            .ok_or(TestError::Missing("model spec"))?;
+        let item = popup
+            .items
+            .iter()
+            .find(|item| item.name == "model")
+            .ok_or(TestError::Missing("model item"))?;
+        assert_eq!(item.description, spec.summary);
+        assert_eq!(item.usage, spec.usage);
+        Ok(())
+    }
+
+    #[test]
+    fn description_falls_back_to_domain_and_permission() -> TestResult {
+        let spec = crate::CommandSpec::new(
+            "bare",
+            Vec::<String>::new(),
+            crate::CommandScope::TuiOnly,
+            crate::PermissionTier::Operator,
+            crate::OutputSurface::Inline,
+            crate::CommandDomain::Misc,
+        )
+        .map_err(ctx("valid spec"))?;
+        let popup = CommandPopup::new(&CommandRegistry::new(vec![spec]));
+        assert_eq!(
+            popup.items[0].description,
+            "Allgemein · Berechtigung: Operator"
+        );
+        assert_eq!(popup.footer_line(), None, "no usage → no footer");
+        Ok(())
+    }
+
+    #[test]
+    fn footer_shows_usage_of_the_selected_command() -> TestResult {
+        let mut popup = built_in_popup()?;
+        popup.on_query_change("model");
+        assert_eq!(popup.selected_name(), Some("model"));
+        assert_eq!(
+            popup.footer_line().as_deref(),
+            Some("Nutzung: /model [show|list|switch <modell-id>]")
+        );
+        let rows = render_rows(&popup, 80, 3);
+        assert!(rows[2].starts_with("Nutzung: /model"), "{rows:?}");
+        assert!(rows[0].contains("/model"), "{rows:?}");
+        let hits = u16::try_from(popup.filtered.len()).map_err(ctx("hit count"))?;
+        assert_eq!(popup.preferred_height(20), hits + 1, "hits plus footer");
+        assert_eq!(popup.preferred_height(2), 2, "capped at max_rows");
+
+        // In einer einzeiligen Fläche hat die Liste Vorrang.
+        let single = render_rows(&popup, 80, 1);
+        assert!(single[0].contains("/model"), "{single:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn for_subcommands_lists_hints_in_catalog_order() -> TestResult {
+        let spec = model_spec()?;
+        let popup = CommandPopup::for_subcommands(&spec)
+            .ok_or(TestError::Missing("model has subcommands"))?;
+        assert_eq!(
+            popup.mode(),
+            &PopupMode::Subcommand {
+                command: "model".to_owned()
+            }
+        );
+        let names: Vec<&str> = popup
+            .filtered
+            .iter()
+            .map(|&idx| popup.items[idx].name.as_str())
+            .collect();
+        assert_eq!(names, ["show", "list", "switch"]);
+        Ok(())
+    }
+
+    #[test]
+    fn for_subcommands_is_none_without_hints() -> TestResult {
+        let mut spec = model_spec()?;
+        spec.subcommands.clear();
+        assert!(CommandPopup::for_subcommands(&spec).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn subcommand_mode_filters_and_builds_the_usage_footer() -> TestResult {
+        let spec = model_spec()?;
+        let mut popup = CommandPopup::for_subcommands(&spec)
+            .ok_or(TestError::Missing("model has subcommands"))?;
+        popup.on_query_change("sw");
+        assert_eq!(popup.selected_name(), Some("switch"));
+        assert_eq!(
+            popup.footer_line().as_deref(),
+            Some("Nutzung: /model switch <modell-id>")
+        );
+        assert_eq!(popup.tab_outcome(), TabOutcome::Accept("switch".to_owned()));
+        assert_eq!(popup.completion_line("switch"), "/model switch ");
+        assert_eq!(popup.query_line("sw"), "/model sw");
+
+        popup.on_query_change("show");
+        assert_eq!(
+            popup.footer_line().as_deref(),
+            Some("Nutzung: /model show"),
+            "no args → no trailing space"
+        );
+        let rows = render_rows(&popup, 60, 2);
+        assert!(
+            rows[0].starts_with("  show"),
+            "no ordinal, no slash: {rows:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn digits_do_not_select_in_subcommand_mode() -> TestResult {
+        let spec = model_spec()?;
+        let mut popup = CommandPopup::for_subcommands(&spec)
+            .ok_or(TestError::Missing("model has subcommands"))?;
+        assert!(!popup.digits_select());
+        assert_eq!(
+            popup.on_key(make_key(KeyCode::Char('1'))),
+            PopupAction::Stay
+        );
+        assert_eq!(
+            popup.on_key(make_key(KeyCode::Enter)),
+            PopupAction::Accept("show".to_owned())
+        );
+
+        let command_popup = built_in_popup()?;
+        assert!(command_popup.digits_select());
+        assert_eq!(command_popup.completion_line("model"), "/model ");
+        assert_eq!(command_popup.query_line("mo"), "/mo");
         Ok(())
     }
 }

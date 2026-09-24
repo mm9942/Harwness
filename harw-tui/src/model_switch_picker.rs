@@ -804,4 +804,87 @@ mod tests {
         );
         Ok(())
     }
+
+    /// `command_line` reproduziert die bisherigen `app.rs`-Befehle und
+    /// liefert für Rollen `/models set <rolle> <provider>/<modell>`.
+    #[test]
+    fn test_command_line_per_target() {
+        assert_eq!(
+            PickerTarget::Orchestrator.command_line("anthropic", "claude-opus"),
+            "/model switch claude-opus"
+        );
+        assert_eq!(
+            PickerTarget::Uia.command_line("anthropic", "claude-opus"),
+            "/uia-model switch claude-opus"
+        );
+        assert_eq!(
+            PickerTarget::UiaWorker {
+                fixed_provider: "openai".to_owned(),
+            }
+            .command_line("openai", "gpt-5"),
+            "/uia-worker-model switch gpt-5"
+        );
+        assert_eq!(
+            PickerTarget::Role {
+                role: ModelRole::Explorer,
+            }
+            .command_line("openrouter", "vendor/model"),
+            "/models set explorer openrouter/vendor/model"
+        );
+    }
+
+    /// Kontextbeschriftungen: Orchestrator heißt jetzt
+    /// „Sitzungs-/Standardmodell (/model)“, Rollen nennen ihr Label.
+    #[test]
+    fn test_context_label_per_target() {
+        assert_eq!(
+            PickerTarget::Orchestrator.context_label(),
+            "Sitzungs-/Standardmodell (/model)"
+        );
+        let label = PickerTarget::Role {
+            role: ModelRole::Explorer,
+        }
+        .context_label();
+        assert!(label.contains(ModelRole::Explorer.label()));
+        assert!(label.contains("ab nächster Sitzung"));
+    }
+
+    /// `Role` durchläuft die Provider-Stufe (inkl. `Left` zurück) und liefert
+    /// `Accept` mit gewähltem Provider.
+    #[test]
+    fn test_role_target_keeps_provider_stage() -> TestResult {
+        let mut picker = ModelSwitchPicker::new(
+            PickerTarget::Role {
+                role: ModelRole::Research,
+            },
+            providers_fixture(),
+            models_fixture(),
+            None,
+            None,
+        )
+        .ok_or(TestError::Missing("providers fixture ist nicht leer"))?;
+
+        assert_eq!(picker.stage, PickerStage::Provider);
+        assert_eq!(picker.on_key(make_key(KeyCode::Down)), PickerAction::Stay);
+        assert_eq!(picker.on_key(make_key(KeyCode::Enter)), PickerAction::Stay);
+        assert_eq!(picker.stage, PickerStage::Model);
+        assert_eq!(picker.on_key(make_key(KeyCode::Left)), PickerAction::Stay);
+        assert_eq!(picker.stage, PickerStage::Provider);
+        assert_eq!(picker.on_key(make_key(KeyCode::Enter)), PickerAction::Stay);
+        let accepted = picker.on_key(make_key(KeyCode::Enter));
+        assert_eq!(
+            accepted,
+            PickerAction::Accept {
+                provider: "openai".to_owned(),
+                model: "gpt-5".to_owned(),
+            }
+        );
+        if let PickerAction::Accept { provider, model } = accepted {
+            assert_eq!(
+                picker.target().command_line(&provider, &model),
+                "/models set research openai/gpt-5"
+            );
+        }
+        Ok(())
+    }
 }
