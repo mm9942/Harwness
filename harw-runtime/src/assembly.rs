@@ -2161,12 +2161,22 @@ impl RuntimeAssemblyBuilder {
         );
         // 12a. Workbench-Werkzeuge der Wurzelsitzung: nur, wenn die Dienste
         //      einen `KnowledgeStore` tragen (`RuntimeServices::with_home_context`
-        //      baut ihn aus dem aufgelösten Home-Kontext).
+        //      baut ihn aus dem aufgelösten Home-Kontext) **und** die Sitzung
+        //      überhaupt Werkzeuge führen darf: ein `NoTools`-Profil
+        //      (`McpServe`, `JobPrompt`, Gateways) bleibt werkzeuglos, und die
+        //      (ggf. verengte) Sandbox muss jede Rechteklasse der Werkzeuge
+        //      (`WorkbenchToolProvider::TOOL_PERMISSIONS`, `ReadWorkspace`)
+        //      tragen — sonst wäre die Rechte-Tabelle der Einstiege gebrochen.
+        let workbench_allowed = registry_profile != RegistryProfile::NoTools
+            && harw_registry_defaults::WorkbenchToolProvider::TOOL_PERMISSIONS
+                .iter()
+                .flatten()
+                .all(|needed| sandbox.permissions().contains(*needed));
         let registry_builder = match services.knowledge_store() {
-            Some(store) => registry_builder.tool_provider(Arc::new(
+            Some(store) if workbench_allowed => registry_builder.tool_provider(Arc::new(
                 harw_registry_defaults::WorkbenchToolProvider::new(Arc::clone(store)),
             )),
-            None => registry_builder,
+            _ => registry_builder,
         };
 
         // 12b. Handoff-Kontext: liest, falls vorhanden,
@@ -5686,13 +5696,16 @@ mod tests {
         assert!(!snapshot.tools.iter().any(|tool| tool == "fs.write"));
         assert!(!snapshot.tools.iter().any(|tool| tool == "shell.exec"));
         assert!(snapshot.tools.iter().any(|tool| tool == "fs.read"));
+        // Neben dem Profil darf die Wurzel nur die sitzungsgebundenen
+        // Workbench-Werkzeuge führen (Schritt 12a, Rechteklasse
+        // `ReadWorkspace`, keine Workspace-Schreibrechte).
         let read_only = RegistryProfile::ReadOnlyExplore.registered_tool_names();
+        let workbench = harw_registry_defaults::WorkbenchToolProvider::TOOL_NAMES;
         assert!(
-            snapshot
-                .tools
-                .iter()
-                .all(|tool| read_only.contains(&tool.as_str())),
-            "nur Werkzeuge des Profils ReadOnlyExplore: {:?}",
+            snapshot.tools.iter().all(|tool| {
+                read_only.contains(&tool.as_str()) || workbench.contains(&tool.as_str())
+            }),
+            "nur Werkzeuge des Profils ReadOnlyExplore (plus Workbench): {:?}",
             snapshot.tools
         );
         assert_eq!(snapshot.permissions, vec!["ReadWorkspace".to_owned()]);

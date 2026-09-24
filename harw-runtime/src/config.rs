@@ -517,12 +517,22 @@ mod tests {
         let cwd = TempDir::new()?;
         home_with_model(home.path())?;
 
-        for requested in ["fast", "gpt-fast-1", "schnell"] {
+        // Der Katalogschlüssel eines Modells ist seine `id`
+        // (`harw_config::discovery`, `HasName for ModelToml`), nicht der
+        // Dateistamm von `models/fast.toml` — Schlüssel und ID fallen also
+        // zusammen; ein Alias löst auf denselben Schlüssel auf.
+        for requested in ["gpt-fast-1", "schnell"] {
             let mut spec = spec_for(home.path(), cwd.path());
             spec.model_override = Some(requested.to_owned());
             let (config, _trust) = load_config(&spec).map_err(ctx("load_config"))?;
-            assert_eq!(config.harness.default_model.as_deref(), Some("fast"));
+            assert_eq!(
+                config.harness.default_model.as_deref(),
+                Some("gpt-fast-1"),
+                "{requested}"
+            );
             assert_eq!(config.harness.default_provider.as_deref(), Some("openai"));
+            assert_eq!(config.harness.uia_model, None, "{requested}");
+            assert_eq!(config.harness.uia_provider, None, "{requested}");
         }
         Ok(())
     }

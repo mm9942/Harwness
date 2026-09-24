@@ -351,7 +351,11 @@ mod tests {
 
         assert_eq!(assembly.root_session_id(), &session_id);
         assert_eq!(assembly.spec().entry, EntryKind::JobPrompt);
-        assert!(assembly.rights_snapshot().tools.is_empty());
+        assert!(
+            assembly.rights_snapshot().tools.is_empty(),
+            "JobPrompt darf keine Werkzeuge tragen: {:?}",
+            assembly.rights_snapshot().tools
+        );
         assert_eq!(assembly.sandbox().permissions().iter().count(), 0);
         assert!(assembly.job_store().is_some());
         assert_eq!(assembly.spawn_context().approval_actor, None);

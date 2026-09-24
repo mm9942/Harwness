@@ -1153,8 +1153,9 @@ async fn uia_root_session_is_admitted_its_uia_explorer_and_uia_writer_specializa
 /// der UIA über denselben `ManagedAgentSpawner` admittiert, den ein
 /// montierter `EntryKind::Tui`-Lauf registriert, und ihre Kind-Registry
 /// (dieselbe [`RuntimeChildRegistryFactory::build_registry`]-Kette) trägt
-/// `web.fetch`/`web.search` plus die fünf lesenden `deps.*`-Werkzeuge — nie
-/// `web.docs_rs`/`web.crates_io`.
+/// alle vier `web.*`-Werkzeuge (`web.fetch`/`web.search` plus die
+/// Crate-Werkzeuge `web.docs_rs`/`web.crates_io`, `UIA_HELPER_WEB_TOOLS`)
+/// und die fünf lesenden `deps.*`-Werkzeuge — nie `lens.ask`.
 ///
 /// Das Netz selbst ist nie breiter als das des Elternteils: das Kind erbt
 /// über den Handoff die Sandbox des Elternteils (`ManagedAgentSpawner::admit`
@@ -1202,6 +1203,8 @@ async fn uia_helpers_get_web_search_and_deps_tools_but_never_more_network_than_t
             .collect();
         for expected in [
             "web.fetch",
+            "web.docs_rs",
+            "web.crates_io",
             "web.search",
             "deps.graph",
             "deps.locked",
@@ -1214,12 +1217,10 @@ async fn uia_helpers_get_web_search_and_deps_tools_but_never_more_network_than_t
                 "{uia_role}: {expected} fehlt in {tools:?}"
             );
         }
-        for deeper in ["web.docs_rs", "web.crates_io", "lens.ask"] {
-            assert!(
-                !tools.iter().any(|tool| tool == deeper),
-                "{uia_role}: {deeper} darf nicht registriert sein"
-            );
-        }
+        assert!(
+            !tools.iter().any(|tool| tool == "lens.ask"),
+            "{uia_role}: lens.ask darf nicht registriert sein"
+        );
 
         spawner
             .spawn_child(
