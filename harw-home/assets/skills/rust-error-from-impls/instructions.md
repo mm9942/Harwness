@@ -109,3 +109,5 @@ impl From<broadcast::error::SendError<crate::events::InvoiceEvent>> for AppError
 ## Quelle
 
 - https://doc.rust-lang.org/book/ch09-02-recoverable-errors-with-result.html
+
+Allgemeine Variante: `error-type-design` (siehe auch `error-propagation`)

@@ -90,3 +90,5 @@ pub async fn dispatch(
 
 - <https://doc.rust-lang.org/book/ch04-02-references-and-borrowing.html>
 - `rustc --explain E0505` (Cannot move out of value because it is borrowed)
+
+Allgemeine Variante: `ownership-and-resource-lifetimes`

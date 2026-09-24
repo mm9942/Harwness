@@ -73,3 +73,5 @@ Faustregel: Generics für Performance-kritische Pfade, `Box<dyn>` für Factory-F
 ## Quelle
 
 - <https://doc.rust-lang.org/book/ch18-02-trait-objects.html> — Kap. 18.2: Using Trait Objects That Allow for Values of Different Types
+
+Allgemeine Variante: `interfaces-and-abstraction` (siehe auch `shared-state-and-concurrency`)

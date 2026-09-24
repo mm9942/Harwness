@@ -41,3 +41,5 @@ where
 
 ## Quelle
 - https://doc.rust-lang.org/book/ch10-02-traits.html
+
+Allgemeine Variante: `interfaces-and-abstraction`

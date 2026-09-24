@@ -45,3 +45,5 @@ fn dto_response<T: Serialize>(status: StatusCode, value: &T) -> HandlerResult {
 
 ## Quelle
 - https://doc.rust-lang.org/book/ch10-01-syntax.html
+
+Allgemeine Variante: `interfaces-and-abstraction`

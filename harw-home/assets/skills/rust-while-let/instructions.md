@@ -64,3 +64,5 @@ while let Some(envelope) = rx.recv().await {
 
 - https://doc.rust-lang.org/book/ch19-01-all-the-places-for-patterns.html (Listing 19-4: `while let` Conditional Loops)
 - https://doc.rust-lang.org/book/ch17-02-concurrency-with-async.html (Listing 17-10: `while let` mit async Channels)
+
+Allgemeine Variante: `loops-and-control-flow` (siehe auch `null-and-optional-handling`)

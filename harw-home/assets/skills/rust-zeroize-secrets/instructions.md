@@ -73,3 +73,5 @@ fn unwrap_secret_key(&self, encrypted_secret_key: &[u8]) -> Result<Zeroizing<Vec
 
 - <https://docs.rs/zeroize/latest/zeroize/> — `Zeroize`, `ZeroizeOnDrop`, `Zeroizing<T>` API + Sicherheitsgarantien
 - <https://doc.rust-lang.org/book/ch15-03-drop.html> — Kapitel 15: Drop trait (wann Rust Destruktoren aufruft; Basis für ZeroizeOnDrop)
+
+Allgemeine Variante: `secret-handling`

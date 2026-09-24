@@ -119,3 +119,5 @@ impl Session<Admin> {
 ## Quelle
 
 - https://doc.rust-lang.org/std/marker/struct.PhantomData.html
+
+Allgemeine Variante: `typestate-and-illegal-states`

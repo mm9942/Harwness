@@ -68,3 +68,5 @@ fn main() {
 ## Quelle
 - https://doc.rust-lang.org/book/ch04-02-references-and-borrowing.html
 - https://doc.rust-lang.org/book/ch04-03-slices.html
+
+Allgemeine Variante: `function-signature-design` (siehe auch `ownership-and-resource-lifetimes`)

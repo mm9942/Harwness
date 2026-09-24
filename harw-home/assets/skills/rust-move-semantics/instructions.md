@@ -63,3 +63,5 @@ fn main() {
 
 ## Quelle
 - https://doc.rust-lang.org/book/ch04-01-what-is-ownership.html
+
+Allgemeine Variante: `ownership-and-resource-lifetimes` (siehe auch `typestate-and-illegal-states`)

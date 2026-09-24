@@ -57,3 +57,5 @@ fn serialize_response<T: serde::Serialize>(value: &T) -> Vec<u8> {
 
 ## Quelle
 - https://doc.rust-lang.org/book/ch18-02-trait-objects.html
+
+Allgemeine Variante: `interfaces-and-abstraction`

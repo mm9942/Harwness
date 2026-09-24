@@ -53,3 +53,5 @@ fn toml_path<'a>(root: &'a toml::Value, path: &str) -> Option<&'a toml::Value> {
 
 ## Quelle
 - <https://doc.rust-lang.org/book/ch10-03-lifetime-syntax.html> (Abschnitt "Lifetime Elision")
+
+Allgemeine Variante: `ownership-and-resource-lifetimes`

@@ -131,3 +131,5 @@ impl std::error::Error for Error {
 ## Quelle
 
 - https://doc.rust-lang.org/book/ch09-00-error-handling.html
+
+Allgemeine Variante: `error-type-design`

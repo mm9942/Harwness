@@ -78,3 +78,5 @@ _ => Err(Error::UnsupportedAlgorithm {
 
 ## Quelle
 - https://doc.rust-lang.org/book/ch06-02-match.html
+
+Allgemeine Variante: `exhaustive-case-handling`

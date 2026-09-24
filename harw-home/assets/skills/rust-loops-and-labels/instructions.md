@@ -84,3 +84,5 @@ let resolved: Vec<_> = env_vars
 
 - https://doc.rust-lang.org/book/ch03-05-control-flow.html (`loop`, `while`, `for`, Loop-Labels, `break` mit Wert)
 - https://doc.rust-lang.org/book/ch13-02-iterators.html (Iterator-Chains: Adapter-Methoden und Consuming Adapters)
+
+Allgemeine Variante: `loops-and-control-flow`

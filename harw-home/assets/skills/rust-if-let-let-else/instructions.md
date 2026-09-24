@@ -102,3 +102,5 @@ Stattdessen immer explizit behandeln oder mit `?` und einem eigenen Fehler-Enum 
 
 ## Quelle
 - https://doc.rust-lang.org/book/ch06-03-if-let.html
+
+Allgemeine Variante: `null-and-optional-handling`

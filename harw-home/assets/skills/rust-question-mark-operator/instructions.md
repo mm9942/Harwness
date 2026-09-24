@@ -127,3 +127,5 @@ fn parse_and_store(raw: &str) -> Result<(), IcebergError> {
 ## Quelle
 
 - https://doc.rust-lang.org/book/ch09-02-recoverable-errors-with-result.html
+
+Allgemeine Variante: `error-propagation`

@@ -59,3 +59,5 @@ fn section_entries<'a>(payload: &'a JsonValue, key: &str) -> Option<Vec<&'a Json
 
 ## Quelle
 - <https://doc.rust-lang.org/book/ch10-03-lifetime-syntax.html> (Abschnitte "Generic Lifetimes in Functions" und "Lifetime Annotations in Function Signatures")
+
+Allgemeine Variante: `ownership-and-resource-lifetimes`

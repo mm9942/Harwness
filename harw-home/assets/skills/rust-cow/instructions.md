@@ -74,3 +74,5 @@ let xml_bytes: Cow<'_, [u8]> = if bytes.starts_with(b"%PDF") {
 ## Quelle
 
 - <https://doc.rust-lang.org/std/borrow/enum.Cow.html> — std::borrow::Cow (Enum, Clone-On-Write Semantics)
+
+Allgemeine Variante: `function-signature-design`

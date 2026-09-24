@@ -67,3 +67,5 @@ fn read_key(path: &std::path::Path) -> Result<Vec<u8>> {
 
 ## Quelle
 - https://doc.rust-lang.org/book/ch09-02-recoverable-errors-with-result.html
+
+Allgemeine Variante: `error-propagation`

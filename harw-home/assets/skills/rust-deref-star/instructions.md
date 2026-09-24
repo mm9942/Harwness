@@ -48,3 +48,5 @@ fn read_arc_value(arc: &Arc<u64>) -> u64 {
 
 ## Quelle
 - https://doc.rust-lang.org/book/ch15-02-deref.html
+
+Allgemeine Variante: `ownership-and-resource-lifetimes`

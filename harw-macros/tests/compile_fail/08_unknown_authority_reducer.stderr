@@ -1,4 +1,4 @@
-error: unbekannter authority-Reducer `reduce_to_read_excute`; erlaubt sind: reduce_to_read_only, reduce_to_read_execute, reduce_to_read_registry, reduce_to_read_network
+error: unbekannter authority-Reducer `reduce_to_read_excute`; erlaubt sind: reduce_to_read_only, reduce_to_read_execute, reduce_to_read_registry, reduce_to_read_network, reduce_to_read_explore, reduce_to_read_workspace_network
   --> tests/compile_fail/08_unknown_authority_reducer.rs:29:21
    |
 29 |         authority = "reduce_to_read_excute",

@@ -58,3 +58,5 @@ let vv: Vec<i32> = v.to_owned(); // via ToOwned blanket impl ✅
 ## Quelle
 - https://doc.rust-lang.org/book/ch04-03-slices.html (The Slice Type, Kapitel 4.3 — &str vs String)
 - https://doc.rust-lang.org/std/borrow/trait.ToOwned.html (ToOwned Trait — to_owned() Implementierungen)
+
+Allgemeine Variante: `ownership-and-resource-lifetimes`

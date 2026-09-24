@@ -53,3 +53,5 @@ tokio::spawn(async move { use_kek(kek_for_task).await });
 ## Quelle
 
 - <https://doc.rust-lang.org/book/ch15-04-rc.html> — Kap. 15.4: Rc<T>, the Reference Counted Smart Pointer (Arc = thread-safe Variante, gleiche Clone-Konvention)
+
+Allgemeine Variante: `shared-state-and-concurrency`

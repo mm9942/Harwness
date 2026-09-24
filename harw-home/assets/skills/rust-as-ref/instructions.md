@@ -56,3 +56,5 @@ assert_eq!(x.as_deref(), Some("hey")); // Option<&str>, kein Clone
 - https://doc.rust-lang.org/book/ch06-03-if-let.html (if let mit Option, Kapitel 6.3)
 - https://doc.rust-lang.org/std/option/enum.Option.html#method.as_ref (Option::as_ref, stabil seit 1.0.0)
 - https://doc.rust-lang.org/std/option/enum.Option.html#method.as_deref (Option::as_deref, stabil seit 1.40.0)
+
+Allgemeine Variante: `function-signature-design` (siehe auch `null-and-optional-handling`)

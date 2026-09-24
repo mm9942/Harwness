@@ -145,3 +145,5 @@ Mehrere unabhängige Crates → mehrere Subagents **parallel** (ein Message, meh
 - <https://doc.rust-lang.org/cargo/commands/cargo-update.html>
 - <https://doc.rust-lang.org/cargo/reference/resolver.html> (Version-Auflösung & Konflikte)
 - `cargo add --help`, `cargo update --help`
+
+Allgemeine Variante: `dependency-add-and-research`

@@ -77,3 +77,5 @@ Bevorzuge `.ok_or_else` im Zweifel — korrekt, keine Allokation im Erfolgsfall.
 
 ## Quelle
 - https://doc.rust-lang.org/book/ch09-02-recoverable-errors-with-result.html
+
+Allgemeine Variante: `null-and-optional-handling` (siehe auch `error-propagation`)

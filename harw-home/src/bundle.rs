@@ -5,7 +5,8 @@
 //! Delegationshierarchie (ein Root-Orchestrator, vier Child-Orchestratoren,
 //! zwölf Worker), die Skills, auf die deren `agent.toml` verweist, sowie
 //! eigenständige Anleitungs-Skills (`skill.toml` + `instructions.md`, u. a.
-//! `rust-*`, `version-bump`). Es besitzt **nicht** das Schreiben — das leistet
+//! `rust-*`, deren sprachunabhängige Varianten wie
+//! `error-type-design`, `version-bump`). Es besitzt **nicht** das Schreiben — das leistet
 //! [`crate::scaffold::ensure_home`].
 //!
 //! # Schlüsseltypen
@@ -252,8 +253,48 @@ static BUNDLED_FILES: &[BundledFile] = &[
         contents: include_str!("../assets/skills/debugging/skill.toml"),
     },
     BundledFile {
+        relative_path: "skills/dependency-add-and-research/instructions.md",
+        contents: include_str!("../assets/skills/dependency-add-and-research/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/dependency-add-and-research/skill.toml",
+        contents: include_str!("../assets/skills/dependency-add-and-research/skill.toml"),
+    },
+    BundledFile {
         relative_path: "skills/dependency-research/skill.toml",
         contents: include_str!("../assets/skills/dependency-research/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/error-propagation/instructions.md",
+        contents: include_str!("../assets/skills/error-propagation/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/error-propagation/skill.toml",
+        contents: include_str!("../assets/skills/error-propagation/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/error-type-design/instructions.md",
+        contents: include_str!("../assets/skills/error-type-design/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/error-type-design/skill.toml",
+        contents: include_str!("../assets/skills/error-type-design/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/exhaustive-case-handling/instructions.md",
+        contents: include_str!("../assets/skills/exhaustive-case-handling/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/exhaustive-case-handling/skill.toml",
+        contents: include_str!("../assets/skills/exhaustive-case-handling/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/function-signature-design/instructions.md",
+        contents: include_str!("../assets/skills/function-signature-design/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/function-signature-design/skill.toml",
+        contents: include_str!("../assets/skills/function-signature-design/skill.toml"),
     },
     BundledFile {
         relative_path: "skills/implementation/skill.toml",
@@ -262,6 +303,38 @@ static BUNDLED_FILES: &[BundledFile] = &[
     BundledFile {
         relative_path: "skills/incident-response/skill.toml",
         contents: include_str!("../assets/skills/incident-response/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/interfaces-and-abstraction/instructions.md",
+        contents: include_str!("../assets/skills/interfaces-and-abstraction/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/interfaces-and-abstraction/skill.toml",
+        contents: include_str!("../assets/skills/interfaces-and-abstraction/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/loops-and-control-flow/instructions.md",
+        contents: include_str!("../assets/skills/loops-and-control-flow/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/loops-and-control-flow/skill.toml",
+        contents: include_str!("../assets/skills/loops-and-control-flow/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/null-and-optional-handling/instructions.md",
+        contents: include_str!("../assets/skills/null-and-optional-handling/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/null-and-optional-handling/skill.toml",
+        contents: include_str!("../assets/skills/null-and-optional-handling/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/ownership-and-resource-lifetimes/instructions.md",
+        contents: include_str!("../assets/skills/ownership-and-resource-lifetimes/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/ownership-and-resource-lifetimes/skill.toml",
+        contents: include_str!("../assets/skills/ownership-and-resource-lifetimes/skill.toml"),
     },
     BundledFile {
         relative_path: "skills/planning/skill.toml",
@@ -524,12 +597,36 @@ static BUNDLED_FILES: &[BundledFile] = &[
         contents: include_str!("../assets/skills/schematron-beschaffung/skill.toml"),
     },
     BundledFile {
+        relative_path: "skills/secret-handling/instructions.md",
+        contents: include_str!("../assets/skills/secret-handling/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/secret-handling/skill.toml",
+        contents: include_str!("../assets/skills/secret-handling/skill.toml"),
+    },
+    BundledFile {
         relative_path: "skills/security-inspection/skill.toml",
         contents: include_str!("../assets/skills/security-inspection/skill.toml"),
     },
     BundledFile {
         relative_path: "skills/server-operations/skill.toml",
         contents: include_str!("../assets/skills/server-operations/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/shared-state-and-concurrency/instructions.md",
+        contents: include_str!("../assets/skills/shared-state-and-concurrency/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/shared-state-and-concurrency/skill.toml",
+        contents: include_str!("../assets/skills/shared-state-and-concurrency/skill.toml"),
+    },
+    BundledFile {
+        relative_path: "skills/typestate-and-illegal-states/instructions.md",
+        contents: include_str!("../assets/skills/typestate-and-illegal-states/instructions.md"),
+    },
+    BundledFile {
+        relative_path: "skills/typestate-and-illegal-states/skill.toml",
+        contents: include_str!("../assets/skills/typestate-and-illegal-states/skill.toml"),
     },
     BundledFile {
         relative_path: "skills/verification/skill.toml",
@@ -642,7 +739,7 @@ mod tests {
                 ))
             })?;
         }
-        assert_eq!(skills, 42, "das Bundle liefert 42 Skills");
+        assert_eq!(skills, 54, "das Bundle liefert 54 Skills");
         Ok(())
     }
 

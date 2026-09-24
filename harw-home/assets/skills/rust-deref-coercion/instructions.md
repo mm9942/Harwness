@@ -61,3 +61,5 @@ securehub_crypto::wrapper::open_envelope(
 ## Quelle
 
 - <https://doc.rust-lang.org/book/ch15-02-deref.html> (Kapitel 15.2 "Treating Smart Pointers Like Regular References with the Deref Trait")
+
+Allgemeine Variante: `function-signature-design`

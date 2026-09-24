@@ -81,3 +81,5 @@ impl<'a> ImportantExcerpt<'a> {
 ## Quelle
 - <https://doc.rust-lang.org/book/ch10-03-lifetime-syntax.html> (Abschnitt "Lifetime Annotations in Struct Definitions")
 - <https://doc.rust-lang.org/std/borrow/enum.Cow.html>
+
+Allgemeine Variante: `ownership-and-resource-lifetimes` (siehe auch `function-signature-design`)

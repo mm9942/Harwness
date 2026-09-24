@@ -65,3 +65,5 @@ unsafe impl Sync for RawBuf {}
 
 - <https://doc.rust-lang.org/book/ch04-02-references-and-borrowing.html> — Kapitel 4: References and Borrowing (Borrow-Checker-Regeln, &T / &mut T)
 - <https://doc.rust-lang.org/book/ch20-01-unsafe-rust.html> — Kapitel 20: Unsafe Rust (raw pointers, `unsafe impl Send/Sync`, SAFETY-Kommentar-Konvention)
+
+Allgemeine Variante: `shared-state-and-concurrency`
