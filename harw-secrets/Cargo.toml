@@ -7,7 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 aes-gcm-siv = "0.12.1"
-chacha20poly1305 = "0.10.1"
+chacha20poly1305 = "0.11.0"
 # Exact pin: persisted secrets depend on crypt_guard's draft-pinned hybrid
 # seed-to-key derivation. Any upgrade must re-bless `tests/fixtures/kem_kat.txt`
 # and ship a migration plan (see `kek.rs` KAT tests).
