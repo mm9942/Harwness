@@ -306,7 +306,15 @@ fn agent_steward_admits_the_commit_mode_tool_set_even_though_two_tools_are_mode_
 #[test]
 fn agent_definition_tool_provider_without_access_registers_only_read_and_list_tools() {
     let names = harw_registry_defaults::agent_definition_tool_names_for_access(None);
-    assert_eq!(names, vec!["agents.validate", "agents.list_proposals"]);
+    assert_eq!(
+        names,
+        vec![
+            "agents.validate",
+            "agents.list_proposals",
+            "skills.validate",
+            "skills.list_proposals",
+        ]
+    );
 }
 
 /// Nutzerentscheidung „die UIA-Helfer recherchieren kurz online und fügen

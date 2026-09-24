@@ -1533,7 +1533,9 @@ pub struct AgentDefinitionAccess {
     pub mode: DefinitionWriteMode,
     /// Die Urheber-Decke des Eltern-Aufrufers des Stewards (Nachtrag K3);
     /// `None` ⇒ fail-closed — der Provider registriert dann ausschließlich
-    /// `agents.validate`/`agents.list_proposals`.
+    /// `agents.validate`/`agents.list_proposals` (und der daneben montierte
+    /// `SkillProposalToolProvider` nur `skills.validate`/
+    /// `skills.list_proposals`).
     pub ceiling: Option<DefinitionAuthorCeiling>,
 }
 
@@ -2171,7 +2173,8 @@ pub fn assemble_registry_for_project(
 /// None)`: ohne `access` bleibt `crate::agent_definition_tools::
 /// AgentDefinitionToolProvider` fail-closed bei
 /// `DefinitionWriteMode::ProposalOnly` ohne Decke — registriert also nur
-/// `agents.validate`/`agents.list_proposals`, unabhängig vom Profil. Wer eine
+/// `agents.validate`/`agents.list_proposals` (plus `skills.validate`/
+/// `skills.list_proposals`), unabhängig vom Profil. Wer eine
 /// Kind-Registry für `RegistryProfile::AgentStewardship` montiert und dem
 /// Steward tatsächlich Schreibrechte geben will, übergibt `Some(access)` mit
 /// den Verzeichnissen, dem gewählten Modus (`Commit` nur, wenn der Eltern-

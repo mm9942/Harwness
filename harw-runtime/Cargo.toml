@@ -22,6 +22,11 @@ harw-catalog = { path = "../harw-catalog" }
 harw-config = { path = "../harw-config" }
 harw-context = { path = "../harw-context" }
 harw-core = { path = "../harw-core" }
+# `delegate_wave` (Operation + Politik) für die Registries der
+# Orchestrator-Kinder (`children.rs`). Kein Zyklus: `harw-core-bridge` hängt
+# nicht von `harw-runtime` ab (nur harw-authority/-types/-sandbox/-operations/
+# -core/-extension-api/-research und `harw-dod-signals`).
+harw-core-bridge = { path = "../harw-core-bridge" }
 harw-extension-api = { path = "../harw-extension-api" }
 # `handoff.rs` (Agent OPS): symlinkfestes, atomares Schreiben der
 # `handoff.json` (Tempdatei im Zielverzeichnis + `rename`), analog zu

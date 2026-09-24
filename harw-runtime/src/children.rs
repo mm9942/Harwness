@@ -144,6 +144,18 @@ pub fn orchestrator_point_for_organizational_role(
     }
 }
 
+/// Ob die Kind-Registry von `role` die `delegate_wave`-Fläche bekommt.
+///
+/// # Description
+/// Genau dann, wenn die Composition-Tools der Rolle
+/// ([`composition_tools_for_role`]) [`harw_core_bridge::DELEGATE_WAVE_TOOL`]
+/// enthalten — heute der Root-Orchestrator und jeder Child-Orchestrator.
+/// Worker bekommen nie eine Delegationsoberfläche.
+#[must_use]
+pub fn role_gets_delegate_wave(role: &str) -> bool {
+    composition_tools_for_role(role).contains(&harw_core_bridge::DELEGATE_WAVE_TOOL)
+}
+
 /// Deckelt die höchstens gleichzeitig laufende Anzahl Instanzen einer Rolle
 /// (Welle 6a, Singleton-Erzwingung).
 ///
@@ -1018,7 +1030,7 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         // `delegate_wave` nur für Orchestrator-Rollen (Root oder Child); die
         // `SessionActivation` des Kindes schaltet das Werkzeug zusätzlich nur
         // frei, wenn seine Definition es admittiert.
-        if composition_tools_for_role(role).contains(&harw_core_bridge::DELEGATE_WAVE_TOOL) {
+        if role_gets_delegate_wave(role) {
             registry_builder =
                 registry_builder.tool_provider(Arc::new(self.delegate_wave_provider()));
         }
@@ -2089,6 +2101,235 @@ mod tests {
         assert_eq!(all, fragments);
         // Ein aktivierter Skill ohne auffindbares Verzeichnis: fail-closed.
         assert!(skill_instruction_fragments(&config, &[], &["review".to_owned()]).is_err());
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------
+    // R1 — Orchestrator-Modellstellen und `delegate_wave` (B).
+    // -------------------------------------------------------------------
+
+    /// Eine Fabrik über den eingebauten Definitionen mit einer explizit
+    /// aufgelösten Orchestrator-Stelle `point` (Provider `acme`, Modell
+    /// `acme-model`, beide mit `default_reasoning_effort`).
+    fn factory_with_orchestrator_point(
+        point: InternalModelPoint,
+    ) -> TestResult<RuntimeChildRegistryFactory> {
+        let mut config = harw_config::ResolvedConfig::default();
+        config
+            .providers
+            .insert("acme".to_owned(), test_provider_toml(Some("high"))?);
+        config
+            .models
+            .insert("acme-model".to_owned(), test_model_toml(Some("low"))?);
+        let chain = test_chain(&config);
+        let mut internal_models = HashMap::new();
+        internal_models.insert(
+            point,
+            harw_config::ResolvedInternalModel {
+                point,
+                provider: Some("acme".to_owned()),
+                model: Some("acme-model".to_owned()),
+                source: harw_config::InternalModelSource::Explicit,
+            },
+        );
+        Ok(RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            chain,
+        )
+        .map_err(ctx("factory builds"))?
+        .with_internal_models(internal_models)
+        .with_reasoning_effort_config(Arc::new(config)))
+    }
+
+    #[test]
+    fn orchestrator_point_for_organizational_role_maps_only_orchestrators() {
+        use harw_agent_dsl::roles::AgentRoleId;
+
+        assert_eq!(
+            orchestrator_point_for_organizational_role(AgentRoleId::RootOrchestrator),
+            Some(InternalModelPoint::RootOrchestrator)
+        );
+        assert_eq!(
+            orchestrator_point_for_organizational_role(AgentRoleId::ChildOrchestrator),
+            Some(InternalModelPoint::SubOrchestrator)
+        );
+        for role in [
+            AgentRoleId::UserInterface,
+            AgentRoleId::Worker,
+            AgentRoleId::UiaWorker,
+            AgentRoleId::AgentSteward,
+        ] {
+            assert_eq!(
+                orchestrator_point_for_organizational_role(role),
+                None,
+                "{role:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_orchestrators_resolve_to_their_orchestrator_points() -> TestResult {
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&harw_config::ResolvedConfig::default()),
+        )
+        .map_err(ctx("factory builds"))?;
+        assert_eq!(
+            factory.internal_point_for_child(role_names::ROOT_ORCHESTRATOR),
+            Some(InternalModelPoint::RootOrchestrator)
+        );
+        for role in [
+            role_names::CODING_ORCHESTRATOR,
+            role_names::RESEARCH_ORCHESTRATOR,
+            role_names::ANALYSIS_ORCHESTRATOR,
+        ] {
+            assert_eq!(
+                factory.internal_point_for_child(role),
+                Some(InternalModelPoint::SubOrchestrator),
+                "role {role}"
+            );
+        }
+        for role in role_names::CHILD_ORCHESTRATORS {
+            assert_eq!(
+                factory.internal_point_for_child(role),
+                Some(InternalModelPoint::SubOrchestrator),
+                "role {role}"
+            );
+        }
+        // Die namensbasierten Stellen bleiben unverändert; Worker und
+        // unbekannte Rollen bekommen keine Orchestrator-Stelle.
+        assert_eq!(
+            factory.internal_point_for_child(role_names::EXPLORER),
+            Some(InternalModelPoint::Explorer)
+        );
+        assert_eq!(factory.internal_point_for_child(role_names::EXECUTOR), None);
+        assert_eq!(
+            factory.internal_point_for_child("some-repo-local-role"),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reasoning_effort_defaults_follow_the_orchestrator_points() -> TestResult {
+        let root = factory_with_orchestrator_point(InternalModelPoint::RootOrchestrator)?;
+        assert_eq!(
+            root.reasoning_effort_defaults_for_role_task(role_names::ROOT_ORCHESTRATOR, None),
+            (
+                Some(harw_types::ReasoningEffort::High),
+                Some(harw_types::ReasoningEffort::Low)
+            )
+        );
+        // Die Root-Stelle gilt nicht für Child-Orchestratoren.
+        assert_eq!(
+            root.reasoning_effort_defaults_for_role(role_names::CODING_ORCHESTRATOR),
+            (None, None)
+        );
+
+        let sub = factory_with_orchestrator_point(InternalModelPoint::SubOrchestrator)?;
+        for role in [
+            role_names::CODING_ORCHESTRATOR,
+            role_names::RESEARCH_ORCHESTRATOR,
+            role_names::ANALYSIS_ORCHESTRATOR,
+        ] {
+            assert_eq!(
+                sub.reasoning_effort_defaults_for_role_task(
+                    role,
+                    Some(harw_core::TaskComplexity::Simple)
+                ),
+                (
+                    Some(harw_types::ReasoningEffort::High),
+                    Some(harw_types::ReasoningEffort::Low)
+                ),
+                "role {role}"
+            );
+        }
+        assert_eq!(
+            sub.reasoning_effort_defaults_for_role(role_names::ROOT_ORCHESTRATOR),
+            (None, None)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn orchestrators_keep_the_parent_model_on_the_main_model_fallback() -> TestResult {
+        // Ohne explizite Wahl lösen beide Orchestrator-Stellen auf das
+        // Hauptmodell auf — das Kind behält exakt den Eltern-Anbieter.
+        let config = harw_config::ResolvedConfig::default();
+        let parent: Arc<dyn ModelProvider> = Arc::new(harw_core::EchoModelProvider::new("echo"));
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::clone(&parent),
+            test_chain(&config),
+        )
+        .map_err(ctx("factory builds"))?
+        .with_internal_models(resolve_internal_models_for_children(&config));
+        for role in [
+            role_names::ROOT_ORCHESTRATOR,
+            role_names::CODING_ORCHESTRATOR,
+            role_names::RESEARCH_ORCHESTRATOR,
+            role_names::ANALYSIS_ORCHESTRATOR,
+        ] {
+            let model = factory
+                .model_for_task(role, Some(harw_core::TaskComplexity::Complex))
+                .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?;
+            assert!(Arc::ptr_eq(&model, &parent), "role {role}");
+            let model = factory
+                .model_for(role)
+                .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?;
+            assert!(Arc::ptr_eq(&model, &parent), "role {role}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_orchestrator_point_pins_the_child_model() -> TestResult {
+        let factory = factory_with_orchestrator_point(InternalModelPoint::SubOrchestrator)?;
+        let pinned = factory
+            .model_for_task(role_names::CODING_ORCHESTRATOR, None)
+            .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?;
+        let unpinned = factory
+            .model_for_task(role_names::ROOT_ORCHESTRATOR, None)
+            .map_err(|error| crate::test_support::TestError::Unexpected(error.message))?;
+        assert!(
+            !Arc::ptr_eq(&pinned, &unpinned),
+            "a resolved SubOrchestrator point must pin, the unresolved root point must not"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delegate_wave_is_offered_only_to_orchestrators() -> TestResult {
+        assert!(role_gets_delegate_wave(role_names::ROOT_ORCHESTRATOR));
+        for role in role_names::CHILD_ORCHESTRATORS {
+            assert!(role_gets_delegate_wave(role), "role {role}");
+        }
+        for role in [
+            role_names::EXPLORER,
+            role_names::EXECUTOR,
+            role_names::PLANNER,
+            role_names::UIA_WORKER,
+            role_names::AGENT_STEWARD,
+            "some-repo-local-role",
+        ] {
+            assert!(!role_gets_delegate_wave(role), "role {role}");
+        }
+
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            test_chain(&harw_config::ResolvedConfig::default()),
+        )
+        .map_err(ctx("factory builds"))?
+        .with_delegate_wave_store(Arc::new(harw_core::InMemoryStateStore::default()));
+        let names: Vec<String> =
+            harw_extension_api::ToolProvider::tools(&factory.delegate_wave_provider())
+                .iter()
+                .map(|spec| spec.name().to_owned())
+                .collect();
+        assert_eq!(names, vec![harw_core_bridge::DELEGATE_WAVE_TOOL.to_owned()]);
         Ok(())
     }
 }

@@ -30,6 +30,12 @@
 # nicht ausführen — keine Rechteausweitung, nur ein enger werdender
 # Laufzeitzustand desselben admittierten Namens.
 #
+# Dasselbe gilt für die Skill-Vorschlagswerkzeuge
+# (`harw_registry_defaults::skill_proposal_tools::SkillProposalToolProvider`):
+# `skills.validate`/`skills.list_proposals` immer, `skills.propose` nur mit
+# Urheber-Decke, `skills.commit_proposal`/`skills.reject_proposal` nur im
+# Commit-Modus.
+#
 # ── Kein Fan-out ─────────────────────────────────────────────────────────
 # `max_depth = 0`: ein Umsetzungslauf ist ein einzelner, in sich
 # geschlossener Validieren-dann-Schreiben-Schritt, kein Fan-out — dieselbe
@@ -64,6 +70,11 @@ admitted = [
   "agents.write_uia",
   "agents.commit_proposal",
   "agents.reject_proposal",
+  "skills.validate",
+  "skills.list_proposals",
+  "skills.propose",
+  "skills.commit_proposal",
+  "skills.reject_proposal",
 ]
 forbidden = [
   "fs.write",

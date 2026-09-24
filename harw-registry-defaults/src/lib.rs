@@ -65,6 +65,7 @@ pub mod embedded_agents;
 pub mod profile;
 pub mod research_web;
 pub mod skill_proposal_tools;
+pub mod workbench_tools;
 
 #[cfg(test)]
 mod test_support;
@@ -96,6 +97,7 @@ pub use profile::{
 };
 pub use research_web::{install_web_tools, researcher_web_network_scope, researcher_web_policy};
 pub use skill_proposal_tools::{SkillAuthorCeiling, SkillProposalStore, SkillProposalToolProvider};
+pub use workbench_tools::WorkbenchToolProvider;
 
 /// Die Werkzeuge, die ohne Nutzerrückfrage ausgeführt werden dürfen.
 ///

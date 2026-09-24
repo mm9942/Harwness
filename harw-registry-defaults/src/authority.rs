@@ -77,6 +77,7 @@ use crate::profile::{
 use crate::skill_proposal_tools::{
     SKILL_PROPOSAL_DECIDE_TOOLS, SKILL_PROPOSAL_PROPOSE_TOOLS, SKILL_PROPOSAL_READ_TOOLS,
 };
+use crate::workbench_tools::WorkbenchToolProvider;
 
 /// Kennung des Reducers „nur Workspace lesen“.
 pub const REDUCE_TO_READ_ONLY: &str = "reduce_to_read_only";
@@ -556,6 +557,8 @@ fn delegation_targets_of(tables: &toml::Table) -> Option<Vec<String>> {
 /// - `skills.validate`, `skills.list_proposals` → `ReadWorkspace`;
 ///   `skills.propose`, `skills.commit_proposal`, `skills.reject_proposal` →
 ///   `WriteWorkspace` (`crate::skill_proposal_tools::SkillProposalToolProvider`).
+/// - `workbench.note`, `workbench.hypothesis` → `ReadWorkspace`
+///   (`crate::workbench_tools::WorkbenchToolProvider::TOOL_PERMISSIONS`).
 /// - `delegate_wave` (und die übrigen Operationen der Composition-Root wie
 ///   `plan`/`goal`/`explore`) → `None`: keine Provider-Werkzeuge, sondern
 ///   `harw-ops`-/`harw-core-bridge`-Operationen mit eigenem
@@ -603,6 +606,7 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         || listed(AGENT_DEFINITION_READ_TOOLS)
         || listed(AGENT_DEFINITION_LIST_TOOLS)
         || listed(SKILL_PROPOSAL_READ_TOOLS)
+        || listed(WorkbenchToolProvider::TOOL_NAMES)
     {
         Some(Permission::ReadWorkspace)
     } else if listed(DEPS_SOURCE_TOOLS) {
@@ -690,6 +694,16 @@ mod tests {
         );
         assert_eq!(tool_permission("plan"), None);
         assert_eq!(tool_permission("delegate_wave"), None);
+    }
+
+    #[test]
+    fn test_tool_permission_matches_workbench_provider_declarations() {
+        let names = WorkbenchToolProvider::TOOL_NAMES;
+        let declared = WorkbenchToolProvider::TOOL_PERMISSIONS;
+        assert_eq!(names.len(), declared.len());
+        for (name, permission) in names.iter().zip(declared.iter()) {
+            assert_eq!(tool_permission(name), *permission, "{name}");
+        }
     }
 
     #[test]

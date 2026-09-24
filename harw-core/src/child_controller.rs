@@ -5963,6 +5963,9 @@ specialization = "child-controller-test"
             trace: None,
             status: ChildStatus::Admitted,
             task_complexity: None,
+            model: None,
+            consumed: ChildUsage::default(),
+            charged_to_parent: ChildUsage::default(),
         };
         if let Some(lease_store) = lease_store {
             lease_store
@@ -6309,6 +6312,9 @@ specialization = "child-controller-test"
                         trace: None,
                         status: ChildStatus::Admitted,
                         task_complexity: None,
+                        model: None,
+                        consumed: ChildUsage::default(),
+                        charged_to_parent: ChildUsage::default(),
                     },
                 );
             spawner
@@ -6398,6 +6404,9 @@ specialization = "child-controller-test"
                         trace: None,
                         status: ChildStatus::Admitted,
                         task_complexity: None,
+                        model: None,
+                        consumed: ChildUsage::default(),
+                        charged_to_parent: ChildUsage::default(),
                     },
                 );
             spawner
@@ -8124,6 +8133,9 @@ max_trust = "instruction"
             trace: Some(trace.clone()),
             status: ChildStatus::Admitted,
             task_complexity: None,
+            model: None,
+            consumed: ChildUsage::default(),
+            charged_to_parent: ChildUsage::default(),
         };
 
         let lease = record.durable_lease();
@@ -8648,6 +8660,9 @@ admitted = ["fs.read", "shell.exec"]
                     trace: None,
                     status: ChildStatus::Admitted,
                     task_complexity: None,
+                    model: None,
+                    consumed: ChildUsage::default(),
+                    charged_to_parent: ChildUsage::default(),
                 },
             );
         child
