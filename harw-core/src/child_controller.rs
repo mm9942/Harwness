@@ -706,6 +706,99 @@ pub struct ChildRecord {
     pub task_complexity: Option<TaskComplexity>,
     /// Live-Zähler (Tokens, Tool-Aufrufe) für Beobachter.
     pub live: ChildLiveStats,
+    /// Das Modell, das dieses Kind anspricht: das bei der Admission gepinnte
+    /// Kind-Modell, sonst das `active_model` der Kind-Session. `None`, wenn
+    /// keines von beiden bekannt ist (dann gilt der Provider-Default).
+    pub model: Option<String>,
+    /// Bisher abgerechneter Verbrauch dieses Kindes **samt Nachkommen**.
+    ///
+    /// Das Kind selbst trägt am Ende jedes
+    /// [`ManagedAgentSpawner::run_child_with_budget`] den Verbrauch des Laufs
+    /// ein; Nachkommen werden beim Abschluss ihres Laufs bzw. bei ihrer
+    /// Freigabe (`close_child`) jeweils eine Ebene nach oben verrechnet.
+    /// Grundlage für [`ManagedAgentSpawner::remaining_budget`].
+    pub consumed: ChildUsage,
+    /// Der Teil von [`Self::consumed`], der dem direkten Elternteil bereits
+    /// angerechnet wurde. Weitere Anrechnungen übertragen nur die Differenz,
+    /// damit Lauf-Ende und Freigabe nichts doppelt verbuchen.
+    pub charged_to_parent: ChildUsage,
+}
+
+/// Verbrauch eines Kindes in den drei durchgesetzten Budget-Dimensionen.
+///
+/// # Beschreibung
+/// In [`ChildRunResult::usage`] der Verbrauch **eines** Laufs, in
+/// [`ChildRecord::consumed`] die aufsummierte Anrechnung (Kind plus
+/// Nachkommen). Alle Rechnungen sättigen, statt überzulaufen.
+///
+/// # Concurrency
+/// `Copy`; enthält keinen geteilten Zustand.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChildUsage {
+    /// Verbrauchte Modell-Token.
+    pub tokens: u64,
+    /// Ausgeführte Werkzeugaufrufe.
+    pub tool_calls: u32,
+    /// Verbrauchte Wanduhrzeit in Millisekunden.
+    pub wall_time_ms: u64,
+}
+
+impl ChildUsage {
+    /// Sättigende, dimensionsweise Summe.
+    #[must_use]
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            tokens: self.tokens.saturating_add(other.tokens),
+            tool_calls: self.tool_calls.saturating_add(other.tool_calls),
+            wall_time_ms: self.wall_time_ms.saturating_add(other.wall_time_ms),
+        }
+    }
+
+    /// Sättigende, dimensionsweise Differenz (nie unter 0).
+    #[must_use]
+    pub fn saturating_sub(self, other: Self) -> Self {
+        Self {
+            tokens: self.tokens.saturating_sub(other.tokens),
+            tool_calls: self.tool_calls.saturating_sub(other.tool_calls),
+            wall_time_ms: self.wall_time_ms.saturating_sub(other.wall_time_ms),
+        }
+    }
+}
+
+/// Zieht den Verbrauch dimensionsweise von einem Budget ab.
+///
+/// Eine nicht gesetzte Dimension bleibt nicht gesetzt (kein Deckel); eine
+/// gesetzte sättigt bei 0. `reasoning_effort` bleibt unverändert.
+fn budget_minus_usage(budget: AgentBudget, usage: ChildUsage) -> AgentBudget {
+    AgentBudget {
+        max_tokens: budget
+            .max_tokens
+            .map(|limit| limit.saturating_sub(usage.tokens)),
+        max_tool_calls: budget
+            .max_tool_calls
+            .map(|limit| limit.saturating_sub(usage.tool_calls)),
+        max_wall_time_ms: budget
+            .max_wall_time_ms
+            .map(|limit| limit.saturating_sub(usage.wall_time_ms)),
+        reasoning_effort: budget.reasoning_effort,
+    }
+}
+
+/// Infimum zweier Budgets je Dimension; `None` ist das neutrale Element.
+fn tighten_agent_budget(left: AgentBudget, right: AgentBudget) -> AgentBudget {
+    fn tighter<T: Ord>(left: Option<T>, right: Option<T>) -> Option<T> {
+        match (left, right) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        }
+    }
+    AgentBudget {
+        max_tokens: tighter(left.max_tokens, right.max_tokens),
+        max_tool_calls: tighter(left.max_tool_calls, right.max_tool_calls),
+        max_wall_time_ms: tighter(left.max_wall_time_ms, right.max_wall_time_ms),
+        reasoning_effort: tighter(left.reasoning_effort, right.reasoning_effort),
+    }
 }
 
 /// Laufende Zähler eines Kindes, fortgeschrieben vom Progress-Observer.
@@ -760,6 +853,11 @@ pub struct ChildRunResult {
     /// [`cap_child_return_text`] (die gekappte Form liefert weiterhin
     /// [`ManagedAgentSpawner::child_final_assistant_text`]).
     pub full_text: Option<String>,
+    /// Verbrauch **dieses** Laufs (Token- und Tool-Aufruf-Differenz der
+    /// Kind-Session plus Wanduhrzeit). Gesetzt von
+    /// [`ManagedAgentSpawner::run_child_with_budget`]; die übrigen
+    /// Lauf-Einstiege liefern [`ChildUsage::default`].
+    pub usage: ChildUsage,
 }
 
 /// Lebenszyklus-Status eines admittierten Kindes.
@@ -1801,6 +1899,7 @@ fn emit_orchestration_event(
         progress: None,
         detail: AgentOrchestrationEvent::bounded_detail(detail),
         tool_calls: Some(record.live.tool_calls),
+        model: record.model.clone(),
     });
 }
 
@@ -4014,6 +4113,7 @@ impl ManagedAgentSpawner {
                     child: child.clone(),
                     outcome,
                     full_text: None,
+                    usage: ChildUsage::default(),
                 })
             }
             None => {
@@ -4042,6 +4142,7 @@ impl ManagedAgentSpawner {
                     child: child.clone(),
                     outcome,
                     full_text,
+                    usage: ChildUsage::default(),
                 })
             }
         }

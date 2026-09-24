@@ -74,6 +74,9 @@ use crate::profile::{
     BROWSER_TOOLS, DEPS_SOURCE_TOOLS, DEPS_WORKSPACE_TOOLS, DOC_TOOLS, EXPLORER_TOOLS,
     FS_READ_ONLY_TOOLS, LENS_TOOLS, PROCESS_TOOLS, SHELL_TOOLS, WEB_TOOLS, role_names,
 };
+use crate::skill_proposal_tools::{
+    SKILL_PROPOSAL_DECIDE_TOOLS, SKILL_PROPOSAL_PROPOSE_TOOLS, SKILL_PROPOSAL_READ_TOOLS,
+};
 
 /// Kennung des Reducers „nur Workspace lesen“.
 pub const REDUCE_TO_READ_ONLY: &str = "reduce_to_read_only";
@@ -550,6 +553,17 @@ fn delegation_targets_of(tables: &toml::Table) -> Option<Vec<String>> {
 ///   `agents.write_definition`, `agents.write_uia`, `agents.commit_proposal`,
 ///   `agents.reject_proposal` → `WriteWorkspace` (Addendum K + Nachtrag K/K2,
 ///   `crate::agent_definition_tools::AgentDefinitionToolProvider`, K-C).
+/// - `skills.validate`, `skills.list_proposals` → `ReadWorkspace`;
+///   `skills.propose`, `skills.commit_proposal`, `skills.reject_proposal` →
+///   `WriteWorkspace` (`crate::skill_proposal_tools::SkillProposalToolProvider`).
+/// - `delegate_wave` (und die übrigen Operationen der Composition-Root wie
+///   `plan`/`goal`/`explore`) → `None`: keine Provider-Werkzeuge, sondern
+///   `harw-ops`-/`harw-core-bridge`-Operationen mit eigenem
+///   `PermissionTier`; ihre Zulassung regelt
+///   [`crate::profile::composition_tools_for_role`] bzw. die
+///   Operations-Registry, nicht dieser Rechtefilter. Jedes von
+///   `delegate_wave` gestartete Kind bekommt seine Rechte über den
+///   [`AuthorityReducer`] seiner eigenen Rolle.
 ///
 /// Die Deps- und Lens-Zuordnung prüft ein Test zusätzlich gegen die
 /// `TOOL_PERMISSIONS`-Konstanten der Provider (andere Quelle als diese Tabelle).
@@ -573,7 +587,11 @@ fn delegation_targets_of(tables: &toml::Table) -> Option<Vec<String>> {
 #[must_use]
 pub fn tool_permission(tool: &str) -> Option<Permission> {
     let listed = |list: &[&str]| list.contains(&tool);
-    if tool == "fs.write" || listed(AGENT_DEFINITION_WRITE_TOOLS) {
+    if tool == "fs.write"
+        || listed(AGENT_DEFINITION_WRITE_TOOLS)
+        || listed(SKILL_PROPOSAL_PROPOSE_TOOLS)
+        || listed(SKILL_PROPOSAL_DECIDE_TOOLS)
+    {
         Some(Permission::WriteWorkspace)
     } else if listed(SHELL_TOOLS) || listed(PROCESS_TOOLS) {
         Some(Permission::ExecuteProcess)
@@ -584,6 +602,7 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         || listed(LENS_TOOLS)
         || listed(AGENT_DEFINITION_READ_TOOLS)
         || listed(AGENT_DEFINITION_LIST_TOOLS)
+        || listed(SKILL_PROPOSAL_READ_TOOLS)
     {
         Some(Permission::ReadWorkspace)
     } else if listed(DEPS_SOURCE_TOOLS) {
@@ -670,6 +689,28 @@ mod tests {
             Some(Permission::ExecuteProcess)
         );
         assert_eq!(tool_permission("plan"), None);
+        assert_eq!(tool_permission("delegate_wave"), None);
+    }
+
+    #[test]
+    fn test_tool_permission_covers_every_skill_proposal_tool() {
+        for tool in SKILL_PROPOSAL_READ_TOOLS {
+            assert_eq!(
+                tool_permission(tool),
+                Some(Permission::ReadWorkspace),
+                "{tool}"
+            );
+        }
+        for tool in SKILL_PROPOSAL_PROPOSE_TOOLS
+            .iter()
+            .chain(SKILL_PROPOSAL_DECIDE_TOOLS.iter())
+        {
+            assert_eq!(
+                tool_permission(tool),
+                Some(Permission::WriteWorkspace),
+                "{tool}"
+            );
+        }
     }
 
     #[test]
