@@ -10,6 +10,8 @@ Most agent loops give a model a prompt and a collection of tools. Harwness start
 
 The `harw` binary provides an interactive terminal UI, one-shot runs, durable plans and jobs, an optional local web surface, an MCP listener and MCP client connections, and a gateway for external channels. The workspace also includes an embeddable SDK and a Defense-on-Device subsystem for collecting and acting on host-security findings under separate privilege boundaries.
 
+The current workspace version is **0.3.0**.
+
 ## Core principles
 
 - **Authority is derived, never prompted.** Every runtime entry point has an `EntryKind`; its tool surface, permission tier, approval behavior, context ceiling, and spawning ability are derived from a central runtime profile.
