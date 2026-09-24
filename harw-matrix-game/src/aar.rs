@@ -669,7 +669,7 @@ pub fn build_aar(input: &AarInput<'_>) -> MatrixResult<String> {
     // 5. Zielerreichung
     push_line(&mut out, "## Zielerreichung");
     push_line(&mut out, "");
-    let ratings: &[GoalRating] = input.synthesis.map_or(&[], |s| s.goal_ratings.as_slice());
+    let ratings: &[GoalRating] = input.synthesis.map_or(&[][..], |s| s.goal_ratings.as_slice());
     push_line(&mut out, "| Fraktion | Ziel | Art | Bewertung (0–3) | Begründung |");
     push_line(&mut out, "|---|---|---|---|---|");
     for faction in scenario.factions() {
@@ -871,7 +871,7 @@ mod tests {
         assert!(md.contains("smuggling_net"), "verdeckte Tracks im Endzustand");
         assert!(md.contains("| 3 | Die Anlage blieb beim Rat. |"));
         assert!(md.contains("nicht bewertet"));
-        assert!(md.contains("Mission"), "Forfeit-Text der Mission");
+        assert!(md.contains("bringt kein Argument vor"), "Forfeit-Text der Mission");
         Ok(())
     }
 

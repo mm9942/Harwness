@@ -1766,12 +1766,22 @@ fn telegram_binding_services(
     let registrations = binding
         .workspaces
         .iter()
-        .map(|workspace| harw_authority::WorkspaceRegistration {
-            tenant: TenantId::from_str(workspace.tenant.trim()),
-            workspace: WorkspaceId::from_str(workspace.alias.trim()),
-            root: PathBuf::from(workspace.root.trim()),
+        .map(|workspace| {
+            let tenant = TenantId::try_from_str(workspace.tenant.trim()).map_err(|_| {
+                format!(
+                    "Arbeitsbereich {:?}: ungültiger Mandant",
+                    workspace.alias.trim()
+                )
+            })?;
+            let alias = WorkspaceId::try_from_str(workspace.alias.trim())
+                .map_err(|_| "Arbeitsbereich mit ungültigem Alias".to_owned())?;
+            Ok(harw_authority::WorkspaceRegistration {
+                tenant,
+                workspace: alias,
+                root: PathBuf::from(workspace.root.trim()),
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, String>>()?;
     let workspaces = harw_authority::WorkspaceRegistry::build(home, registrations)
         .map_err(|error| format!("Arbeitsbereiche nicht auflösbar: {error}"))?;
     let unknown_command_fallback =
@@ -1821,8 +1831,9 @@ async fn start_telegram_binding(
     provider: Arc<dyn ModelProvider>,
     profile: &Path,
     sessions_root: &Path,
-    workspaces: Arc<harw_authority::WorkspaceRegistry>,
+    services: &TelegramBindingServices,
     work_requests: Arc<WorkRequestStore>,
+    approval_tokens: Arc<ApprovalTokenStore>,
 ) -> Result<RunningTelegramIngress, String> {
     let channel_id = ChannelId::try_from(plan.binding.id.clone())
         .map_err(|_| "Telegram channel id is invalid".to_owned())?;
@@ -1851,6 +1862,12 @@ async fn start_telegram_binding(
         plan.binding.rate_limit.max_updates_per_peer_per_min;
     channel_config.topic_mode = telegram_topic_mode(&plan.binding.topics.mode)
         .ok_or_else(|| "Telegram topic mode is invalid".to_owned())?;
+    channel_config.allow_unpinned_pairing = plan.binding.security.allow_unpinned_pairing;
+    channel_config.admin_sender_ids = services.admin_sender_ids.clone();
+    channel_config.attachment_max_bytes = plan.binding.attachments.max_bytes;
+    channel_config.attachment_max_count =
+        usize::try_from(plan.binding.attachments.max_count_per_message).unwrap_or(usize::MAX);
+    channel_config.attachment_allowed_kinds = plan.binding.attachments.mime_allowlist.clone();
 
     let bot_http = telegram_http_client(TELEGRAM_CLIENT_REQUEST_TIMEOUT)?;
     let bot_client = Arc::new(TelegramClient::with_http_client(
@@ -1861,7 +1878,7 @@ async fn start_telegram_binding(
         .get_me()
         .await
         .map_err(|_| "Telegram bot identity lookup failed".to_owned())?;
-    publish_telegram_command_menu(&plan.binding, &bot_client).await;
+    telegram_commands::publish_telegram_command_menu(&plan.binding, &bot_client).await;
     match &plan.transport {
         TelegramTransportPlan::LongPoll { webhook_fallback } => {
             if *webhook_fallback {
@@ -1894,20 +1911,51 @@ async fn start_telegram_binding(
         per_chat_per_sec: plan.binding.rate_limit.max_outbound_per_chat_per_sec,
         ..RendererConfig::default()
     };
-    let renderer: Arc<dyn TelegramOutbound> = Arc::new(TelegramRenderer::with_config(
+    // Derselbe Token-Store wie der Adapter (und über Neustarts hinweg):
+    // ausgegebene Freigabe-Schaltflächen bleiben nach einem Transport-Neustart
+    // einlösbar.
+    let renderer = Arc::new(TelegramRenderer::with_config_and_approval_tokens(
         Arc::clone(&bot_client),
         renderer_config,
+        Arc::clone(&approval_tokens),
     ));
-    let throttle_outbound = Arc::clone(&renderer);
-    let pairing_outbound = Arc::clone(&renderer);
-    let callback_outbound = Arc::clone(&renderer);
+    let outbound: Arc<dyn TelegramOutbound> = renderer.clone();
+    let throttle_outbound = Arc::clone(&outbound);
+    let pairing_outbound = Arc::clone(&outbound);
+    let callback_outbound = Arc::clone(&outbound);
     let callback_work_requests = Arc::clone(&work_requests);
-    let consumer = Arc::new(GatewayTelegramConsumer {
+    let attachments = match TelegramAttachmentIntake::from_binding(
+        &plan.binding,
+        Arc::clone(&bot_client),
+        &telegram_attachment_cache_root(profile),
+    ) {
+        Ok(intake) => Some(Arc::new(intake)),
+        Err(reason) => {
+            tracing::warn!(binding = %plan.binding.id, reason = %reason, "Telegram attachment intake unavailable; attachments will be rejected");
+            None
+        }
+    };
+    let sessions = TelegramSessionDispatcher::new(TelegramSessionConfig {
         provider,
         transcript_root: sessions_root.to_path_buf(),
-        outbound: renderer,
-        work_requests,
-        workspaces,
+        renderer,
+        chat_state: Arc::clone(&services.chat_state),
+        attachments,
+        max_parallel_sessions: TELEGRAM_MAX_PARALLEL_SESSIONS,
+        approval_ttl: TELEGRAM_APPROVAL_TTL,
+    });
+    let turn_approvals = sessions.turn_approvals();
+    let consumer = Arc::new(GatewayTelegramConsumer {
+        commands: TelegramCommandHandler {
+            outbound,
+            work_requests,
+            workspaces: Arc::clone(&services.workspaces),
+            chat_state: Arc::clone(&services.chat_state),
+            admin_sender_ids: services.admin_sender_ids.clone(),
+            unknown_command_fallback: services.unknown_command_fallback,
+            default_workspace_alias: services.default_workspace_alias.clone(),
+        },
+        sessions,
     });
     let (ingress_tx, ingress_rx) = mpsc::sync_channel(128);
     let (throttle_tx, throttle_rx) = mpsc::channel::<ThrottleNotice>();
@@ -1920,7 +1968,8 @@ async fn start_telegram_binding(
         ingress_rx,
     )
     .with_throttle_sink(throttle_tx)
-    .with_pairing_sink(pairing_tx);
+    .with_pairing_sink(pairing_tx)
+    .with_approval_tokens(approval_tokens);
     // Delivers at most one "you're sending too fast" reply per rate-limit
     // window (§3.5): the admission perimeter (`TelegramChannel::admit`) only
     // decides and emits the notice, it never sends network traffic itself.
@@ -1965,20 +2014,13 @@ async fn start_telegram_binding(
         .map_err(|_| "Telegram pairing-notice thread could not start".to_owned())?;
     // Inline-button clicks: the transport hands them to a non-blocking
     // consumer; this worker validates and answers them off the ingress path.
-    let (callback_tx, callback_rx) = mpsc::channel::<TelegramCallback>();
-    let callback_worker = GatewayCallbackWorker {
+    let callback_consumer = spawn_callback_worker(GatewayCallbackWorker {
         adapter: adapter.clone(),
         work_requests: callback_work_requests,
         outbound: callback_outbound,
         bot_client: Arc::clone(&bot_client),
-    };
-    std::thread::Builder::new()
-        .name("harw-telegram-callback".to_owned())
-        .spawn(move || callback_worker.run(callback_rx))
-        .map_err(|_| "Telegram callback thread could not start".to_owned())?;
-    let callback_consumer: Arc<dyn CallbackConsumer> = Arc::new(GatewayCallbackConsumer {
-        callbacks: callback_tx,
-    });
+        turn_approvals: Some(turn_approvals),
+    })?;
     std::thread::Builder::new()
         .name("harw-telegram-admission".to_owned())
         .spawn(move || {
