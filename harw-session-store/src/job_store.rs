@@ -16,7 +16,9 @@
 //! `persist_noclobber`. `reconcile_expired` arbeitet seitenweise
 //! (`limit`/`cursor`) und überspringt einzelne gesperrte/defekte Jobs, statt
 //! den ganzen Lauf abzubrechen. `unblock` führt einen `Blocked`-Job
-//! (Approval-Pause) nach `Ready` zurück.
+//! (Approval-Pause) nach `Ready` zurück. `mark_ready` gibt einen
+//! `Pending`-Job frei (`Pending → Ready`, idempotent für `Ready`); `reclaim`
+//! holt einen einzelnen `Running`-Job wie der Massen-Reclaim zurück.
 
 use std::fs::File;
 #[cfg(not(unix))]
@@ -767,6 +769,192 @@ impl JobStore {
         })?;
         self.publish(event.clone());
         Ok(event)
+    }
+
+    /// Gibt einen `Pending`-Job für einen Worker-Claim frei (`Pending → Ready`).
+    ///
+    /// # Beschreibung
+    /// Unter der Datensatz-Sperre validiert [`harw_job_runtime::Job::mark_ready`]
+    /// den Übergang (Zustandsmaschine aus `harw-job-runtime`); der Job wird
+    /// `Ready`, `updated_at` wird `now`, die Revision steigt, und nach dem
+    /// durablen Schreiben wird ein redigiertes [`JobLifecycleEvent`]
+    /// veröffentlicht. `not_before`, Versuche, Lease und Fencing-Epoch bleiben
+    /// unverändert.
+    ///
+    /// Idempotent: ein bereits `Ready` stehender Job bleibt unverändert
+    /// (keine Revision, kein Event); zurückgegeben wird dann sein aktueller
+    /// Stand.
+    ///
+    /// # Argumente
+    /// - `work_id` (`&WorkId`): der freizugebende Job.
+    /// - `now` (`Timestamp`): Serverzeit des Übergangs (injiziert).
+    ///
+    /// # Rückgabe
+    /// Das [`JobLifecycleEvent`] mit `state == Ready` und der aktuellen Revision.
+    ///
+    /// # Fehler
+    /// - [`SessionStoreError::JobRuntime`]: der Job ist weder `Pending` noch
+    ///   `Ready` (abgelehnt von der Zustandsmaschine, `InvalidState`); nichts
+    ///   wird geschrieben.
+    /// - [`SessionStoreError::JobNotFound`], [`SessionStoreError::CorruptJob`]
+    ///   (der Datensatz wird in Quarantäne verschoben),
+    ///   [`SessionStoreError::JobLockContended`],
+    ///   [`SessionStoreError::UnsafeJobPath`], [`SessionStoreError::Io`],
+    ///   [`SessionStoreError::Serde`].
+    ///
+    /// # Nebenläufigkeit
+    /// Nimmt die exklusive Try-Sperre des Jobs; blockiert nie.
+    pub fn mark_ready(
+        &self,
+        work_id: &WorkId,
+        now: Timestamp,
+    ) -> SessionStoreResult<JobLifecycleEvent> {
+        let (event, changed) = self.with_locked(work_id, |record| {
+            if record.job.state == JobState::Ready {
+                return Ok((
+                    JobLifecycleEvent {
+                        work_id: work_id.clone(),
+                        state: JobState::Ready,
+                        revision: record.revision,
+                    },
+                    false,
+                ));
+            }
+            record
+                .job
+                .mark_ready(now)
+                .map_err(|error| map_job_error(work_id, error))?;
+            record.revision = record.revision.saturating_add(1);
+            tracing::info!(
+                work_id = %work_id,
+                revision = record.revision,
+                "job marked ready"
+            );
+            Ok((
+                JobLifecycleEvent {
+                    work_id: work_id.clone(),
+                    state: JobState::Ready,
+                    revision: record.revision,
+                },
+                true,
+            ))
+        })?;
+        if changed {
+            self.publish(event.clone());
+        }
+        Ok(event)
+    }
+
+    /// Holt einen einzelnen `Running`-Job von seinem Halter zurück
+    /// (`Running → Ready`, bzw. `Failed` bei erschöpfter Retry-Politik).
+    ///
+    /// # Beschreibung
+    /// Einzel-Gegenstück zu [`JobStore::reconcile_expired`] mit denselben
+    /// Schritten je Job: die Lease wird entfernt, die Fencing-Epoch
+    /// weitergeschaltet, und [`harw_job_runtime::Job::record_failure`]
+    /// (Zustandsmaschine aus `harw-job-runtime`) zählt einen Versuch. Bleibt
+    /// Budget, wird der Job `Ready` und `not_before` auf `now + Backoff`
+    /// gesetzt; ist die Retry-Politik erschöpft, wird er terminal `Failed`
+    /// mit einer `JobOutcome::Failed`-Completion — genau wie beim
+    /// Massen-Reclaim. Anders als dieser verlangt `reclaim` **keine**
+    /// abgelaufene Lease: es ist ein ausdrücklicher, vertrauenswürdiger
+    /// Übergang (z. B. ein Operator zieht eine Karte zurück). Die
+    /// Fencing-Epoch sorgt dafür, dass der alte Halter danach weder
+    /// verlängern noch abschließen kann.
+    ///
+    /// `reclaimed_by` hat im [`StoredJob`] keinen durablen Platz (gleiche
+    /// Einschränkung wie bei [`JobStore::retry`]) und wird deshalb als
+    /// Audit-Spur geloggt.
+    ///
+    /// # Argumente
+    /// - `work_id` (`&WorkId`): der laufende Job.
+    /// - `now` (`Timestamp`): Serverzeit des Übergangs (injiziert).
+    /// - `reclaimed_by` (`ApprovalActor`): die vertrauenswürdige Identität,
+    ///   die den Reclaim auslöst.
+    ///
+    /// # Rückgabe
+    /// Ein [`ExpiredJob`] mit der entzogenen Lease; `retry_scheduled_for` ist
+    /// `None`, wenn der Job wegen erschöpfter Retry-Politik `Failed` wurde.
+    ///
+    /// # Fehler
+    /// - [`SessionStoreError::JobRuntime`]: der Job ist nicht `Running`
+    ///   (`InvalidState` der Zustandsmaschine), trägt trotz `Running` keine
+    ///   Lease, oder die Backoff-Zeit ist nicht darstellbar; nichts wird
+    ///   geschrieben.
+    /// - [`SessionStoreError::JobLeaseEpochExhausted`], plus dieselben
+    ///   Datensatz-Zugriffsfehler wie [`JobStore::mark_ready`].
+    ///
+    /// # Nebenläufigkeit
+    /// Nimmt die exklusive Try-Sperre des Jobs; blockiert nie. Der Aufrufer
+    /// ist die vertrauenswürdige Autoritätsgrenze — Modell-Eingaben sind
+    /// keine zulässige Quelle.
+    pub fn reclaim(
+        &self,
+        work_id: &WorkId,
+        now: Timestamp,
+        reclaimed_by: ApprovalActor,
+    ) -> SessionStoreResult<ExpiredJob> {
+        let (reclaimed, state, revision) = self.with_locked(work_id, |record| {
+            // Fehler im Closure werden nicht persistiert; die Reihenfolge der
+            // Mutationen ist deshalb unkritisch.
+            let prior_lease = record.lease.take();
+            let retry_scheduled_for = match record.job.record_failure(now) {
+                Ok(delay) => Some(
+                    now.checked_add(delay)
+                        .map_err(|error| map_job_error(work_id, JobRuntimeError::Time(error)))?,
+                ),
+                Err(JobRuntimeError::RetryExhausted { .. }) => {
+                    record.completion = Some(JobCompletion {
+                        completed_at: now,
+                        outcome: JobOutcome::Failed {
+                            reason: "job reclaimed and retry budget is exhausted".to_owned(),
+                        },
+                    });
+                    None
+                }
+                Err(error) => return Err(map_job_error(work_id, error)),
+            };
+            let Some(expired_lease) = prior_lease else {
+                return Err(SessionStoreError::JobRuntime {
+                    work_id: work_id.clone(),
+                    detail: "job is Running but carries no lease to reclaim".to_owned(),
+                });
+            };
+            record.lease_epoch = record.lease_epoch.checked_add(1).ok_or_else(|| {
+                SessionStoreError::JobLeaseEpochExhausted {
+                    work_id: work_id.clone(),
+                }
+            })?;
+            if let Some(not_before) = retry_scheduled_for {
+                record.not_before = not_before;
+            }
+            record.revision = record.revision.saturating_add(1);
+            tracing::info!(
+                work_id = %work_id,
+                reclaimed_by = ?reclaimed_by,
+                holder = %expired_lease.holder,
+                attempts = record.job.attempts,
+                max_attempts = record.job.retry.max_attempts,
+                state = ?record.job.state,
+                "job reclaimed from its lease holder"
+            );
+            Ok((
+                ExpiredJob {
+                    work_id: work_id.clone(),
+                    expired_lease,
+                    reclaimed_at: now,
+                    retry_scheduled_for,
+                },
+                record.job.state,
+                record.revision,
+            ))
+        })?;
+        self.publish(JobLifecycleEvent {
+            work_id: reclaimed.work_id.clone(),
+            state,
+            revision,
+        });
+        Ok(reclaimed)
     }
 
     /// Revokes expired leases once, schedules retry eligibility, and returns

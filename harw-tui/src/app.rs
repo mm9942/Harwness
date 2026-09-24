@@ -3211,14 +3211,24 @@ fn apply_local_intercept(
 
 /// Führt `raw` über [`command_data::execute_command_with_data`] aus, ohne
 /// etwas in den Chat zu schreiben.
-async fn fetch_command_data(app: &ChatApp, raw: &str) -> Result<OpOutput, String> {
-    let Some(rt) = app.runtime() else {
+///
+/// Nimmt bewusst nur Feld-Referenzen statt `&ChatApp` (dieselbe Form wie die
+/// übrigen Dispatch-Aufrufe in [`run_loop`]), damit über das `await` keine
+/// Referenz auf den ganzen App-Zustand gehalten wird.
+async fn fetch_command_data(
+    runtime: Option<&Arc<harw_runtime::RuntimeAssembly>>,
+    adapters: &[CommandAdapter],
+    sandbox: &SandboxSpec,
+    session_id: &SessionId,
+    raw: &str,
+) -> Result<OpOutput, String> {
+    let Some(rt) = runtime else {
         return Err("Fehler: keine Runtime-Montage".to_owned());
     };
     command_data::execute_command_with_data(
-        app.adapters(),
-        app.sandbox(),
-        app.session_id(),
+        adapters,
+        sandbox,
+        session_id,
         runtime_commands::caller_tier(rt.principal()),
         raw,
         || runtime_commands::slash_service_map(rt.services()),
@@ -3250,7 +3260,14 @@ async fn process_pending_fetches(app: &mut ChatApp) -> bool {
                 {
                     continue;
                 }
-                let result = fetch_command_data(app, &command).await;
+                let result = fetch_command_data(
+                    app.runtime.as_ref(),
+                    &app.adapters,
+                    &app.sandbox,
+                    &app.session_id,
+                    &command,
+                )
+                .await;
                 if generation != app.overlay_generation {
                     continue;
                 }
@@ -3265,7 +3282,14 @@ async fn process_pending_fetches(app: &mut ChatApp) -> bool {
                 }
             }
             DataFetch::Workbench => {
-                let result = fetch_command_data(app, WorkbenchPane::REFRESH_COMMAND).await;
+                let result = fetch_command_data(
+                    app.runtime.as_ref(),
+                    &app.adapters,
+                    &app.sandbox,
+                    &app.session_id,
+                    WorkbenchPane::REFRESH_COMMAND,
+                )
+                .await;
                 match result {
                     Ok(output) => match output.data {
                         Some(data) => app.workbench.apply_data(&data),
@@ -3892,6 +3916,9 @@ const QUIT_HINT_WINDOW: Duration = Duration::from_secs(2);
 
 /// Maximale Popup-Höhe in Zeilen (ohne Rahmen).
 const POPUP_MAX_ROWS: u16 = 8;
+
+/// Höchstlänge des Modell-Segments in der Statuszeile (Zeichen).
+const STATUS_MODEL_MAX_CHARS: usize = 32;
 
 /// „Scharfgestellter" Beenden-Zustand: welches Label + wann gedrückt.
 ///
@@ -5601,19 +5628,16 @@ fn handle_overlay_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -
         Some(Overlay::ModelSwitch(picker)) => match picker.on_key(key) {
             ModelSwitchAction::Stay => {}
             ModelSwitchAction::Cancel => app.overlay = None,
-            ModelSwitchAction::Accept { model, .. } => {
-                let target = picker.target().clone();
+            ModelSwitchAction::Accept { provider, model } => {
+                let command = picker.target().command_line(&provider, &model);
                 app.overlay = None;
-                let command = match target {
-                    PickerTarget::Orchestrator => format!("/model switch {model}"),
-                    PickerTarget::Uia => format!("/uia-model switch {model}"),
-                    PickerTarget::UiaWorker { .. } => {
-                        format!("/uia-worker-model switch {model}")
-                    }
-                };
                 bus.send(HarwEvent::Command(command));
             }
         },
+        Some(Overlay::View(view)) => {
+            let outcome = view.on_key(key);
+            apply_overlay_outcome(app, outcome, bus);
+        }
         Some(Overlay::EffortChoice { target, dialog }) => {
             let target = *target;
             match dialog.handle_key(key) {
@@ -5699,6 +5723,9 @@ fn handle_agent_tree_key(app: &mut ChatApp, key: KeyEvent) {
 /// # Rückgabe
 /// `true` wenn ein Redraw angefordert werden soll, sonst `false`.
 fn handle_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
+    if let Some(redraw) = handle_view_hotkey(app, key) {
+        return redraw;
+    }
     if let Some(redraw) = handle_panel_key(app, key) {
         return redraw;
     }
@@ -5711,6 +5738,7 @@ fn handle_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
 fn handle_panel_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
     // Ein offenes Popup/Dialog behält Esc & Pfeile für sich.
     if app.command_popup.as_ref().is_some_and(|p| !p.is_empty())
+        || app.mention_popup.as_ref().is_some_and(|p| !p.is_empty())
         || app.pending_approval_dialog.is_some()
         || app.pending_host_permit_dialog.is_some()
     {
@@ -5747,6 +5775,7 @@ fn handle_panel_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
                 _ => false,
             },
             crate::panes::PaneFocus::Explorer => handle_explorer_key(app, key),
+            crate::panes::PaneFocus::Workbench => app.handle_workbench_key(key),
             crate::panes::PaneFocus::Chat => false,
         }),
     }
@@ -7894,6 +7923,11 @@ fn render_viewport(
             dialog.render(area, frame.buffer_mut(), theme);
             return;
         }
+        Some(Overlay::View(view)) => {
+            frame.render_widget(Clear, area);
+            view.render(area, frame.buffer_mut(), theme);
+            return;
+        }
         None => {}
     }
 
@@ -7958,6 +7992,14 @@ fn render_viewport(
     }
     if let Some(explorer_area) = pane_areas.explorer {
         render_explorer_panel(app, explorer_area, frame.buffer_mut(), theme);
+    }
+    if let Some(workbench_area) = pane_areas.workbench {
+        app.workbench.render(
+            workbench_area,
+            frame.buffer_mut(),
+            theme,
+            app.panels.focus == crate::panes::PaneFocus::Workbench,
+        );
     }
     let history_area = pane_areas
         .chat
@@ -8102,9 +8144,19 @@ fn render_viewport(
         .pending_permission_stage()
         .map(|_| " · Freigabemodus wird nach dem Turn übernommen")
         .unwrap_or("");
+    let mode_segment = status_line::mode_segment(
+        app.active_mode(),
+        app.current_approval(),
+        app.pending_permission_stage().is_some(),
+    );
+    let (live_provider, live_model) = app.live_model();
+    let model_segment = status_line::model_segment(
+        live_provider.as_deref(),
+        live_model.as_deref(),
+        STATUS_MODEL_MAX_CHARS,
+    );
     let status = format!(
-        " {spinner_prefix}Shift+Tab: {permission} | Modus: {} | Σ Tokens: {} (in {}, out {}{cache_suffix}){context_suffix}{agents_suffix}{explorer_suffix}{cancel_suffix}{queue_cleared_suffix}{quit_suffix}{queue_suffix}{tool_suffix}{agents_hint}{pending_permission_suffix}",
-        app.active_mode().as_str(),
+        " {spinner_prefix}Shift+Tab: {permission} | {mode_segment} | {model_segment} | Σ Tokens: {} (in {}, out {}{cache_suffix}){context_suffix}{agents_suffix}{explorer_suffix}{cancel_suffix}{queue_cleared_suffix}{quit_suffix}{queue_suffix}{tool_suffix}{agents_hint}{pending_permission_suffix}",
         crate::agent_monitor::human_tokens(usage.total()),
         crate::agent_monitor::human_tokens(usage.prompt_tokens()),
         crate::agent_monitor::human_tokens(usage.output_tokens),
@@ -8187,7 +8239,9 @@ fn render_viewport(
         .is_some_and(|popup| !popup.is_empty());
     if popup_open {
         if let Some(popup) = app.command_popup.as_ref() {
-            let popup_height = POPUP_MAX_ROWS.min(history_area.height);
+            let popup_height = popup
+                .preferred_height(POPUP_MAX_ROWS)
+                .min(history_area.height);
             if popup_height > 0 {
                 let popup_area = Rect::new(
                     history_area.x,
@@ -8202,6 +8256,22 @@ fn render_viewport(
                 frame.render_widget(Clear, popup_area);
                 popup.render(popup_area, frame.buffer_mut(), theme);
             }
+        }
+    }
+
+    // `@`-Erwähnungs-Popup (nur mit Treffern; schließt das Befehls-Popup
+    // aus, siehe `ChatApp::sync_mention_popup`).
+    if let Some(popup) = app.mention_popup.as_ref().filter(|popup| !popup.is_empty()) {
+        let popup_height = POPUP_MAX_ROWS.min(history_area.height);
+        if popup_height > 0 {
+            let popup_area = Rect::new(
+                history_area.x,
+                history_area.y + history_area.height - popup_height,
+                history_area.width,
+                popup_height,
+            );
+            frame.render_widget(Clear, popup_area);
+            popup.render(popup_area, frame.buffer_mut(), theme);
         }
     }
 
