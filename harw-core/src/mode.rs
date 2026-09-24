@@ -102,6 +102,14 @@ const PLAN_TOOLS: &[&str] = &[
     "research",
     "research_deps",
     "research_web",
+    // — Runde 5, Teil F: Plan-Datei, Freigabe und Rückfrage —
+    // `plan.write` ist das einzige Schreibwerkzeug im Plan-Modus und schreibt
+    // ausschließlich `.harw/plans/<slug>.md` (`harw_tool_plan::plan_file`).
+    // `plan.exit` legt den Plan im Freigabefenster der TUI vor, `ask_user`
+    // fragt nach — beide nur für die Wurzel in der TUI, sonst fail-closed.
+    "plan.write",
+    "plan.exit",
+    "ask_user",
 ];
 
 /// Prompt-Abschnitt für [`InteractionMode::Chat`].
@@ -110,11 +118,27 @@ Werkzeugsatz. Der Modus schränkt weder Werkzeuge noch Sandbox-Permissions ein; 
 jede Mutation unterliegt weiterhin den normalen Guardrails.";
 
 /// Prompt-Abschnitt für [`InteractionMode::Plan`].
-const PLAN_PROMPT: &str = "Modus: plan. Du planst und recherchierst. Verfügbar \
-sind lesende Werkzeuge, Web-Recherche sowie die Plan- und Ziel-Werkzeuge. \
+///
+/// Runde 5, Teil F: ein Ablauf wie in Claude Code — verstehen → erkunden →
+/// Rückfragen → Plan schreiben → `plan.exit`. Erst erkunden, dann fragen,
+/// nicht raten.
+const PLAN_PROMPT: &str = "Modus: plan. Du planst, du setzt nichts um. \
 Schreiben, Shell und jede andere Mutation sind in diesem Modus nicht nur \
-unerwünscht, sondern abgeschaltet — schlage Änderungen vor, führe sie nicht \
-aus.";
+unerwünscht, sondern abgeschaltet; einzige Ausnahme ist `plan.write`, das nur \
+die Plan-Datei unter `.harw/plans/` schreibt. Arbeite in dieser Reihenfolge: \
+1. Verstehen: Was will die Nutzerin genau erreichen, was ist ausdrücklich \
+nicht gewünscht? \
+2. Erkunden: Lies den relevanten Code mit den lesenden Werkzeugen; für breite \
+Suchen darfst du schreibgeschützte Kinder über `explore`/`research` starten \
+(höchstens 3 parallel). Rate nichts, was du nachlesen kannst. \
+3. Rückfragen: Bleiben echte Entscheidungen offen, frage mit `ask_user` \
+(1–4 Fragen mit je 2–4 Optionen) statt eine Annahme zu treffen. \
+4. Plan schreiben: `plan.write` mit den Abschnitten Kontext, Vorgehen in \
+Schritten, betroffene Dateien, Verifikation. Ein erneutes `plan.write` \
+überschreibt denselben Plan. \
+5. Vorlegen: `plan.exit` mit dem Pfad aus `plan.write`. Die Nutzerin gibt \
+frei (Umsetzung im nächsten Turn) oder gibt Rückmeldung — dann überarbeite \
+den Plan und lege ihn erneut vor. Beginne die Umsetzung nie selbst.";
 
 /// Prompt-Abschnitt für [`InteractionMode::Explore`].
 const EXPLORE_PROMPT: &str = "Modus: explore. Du liest ausschließlich: \
@@ -602,6 +626,7 @@ mod tests {
             .ok_or(TestError::Missing("Explore hat eine Positivliste"))?;
         for forbidden in [
             "fs.write",
+            "fs.edit",
             "shell.exec",
             "web.fetch",
             "plan",
@@ -669,6 +694,10 @@ mod tests {
             "research",
             "research_deps",
             "research_web",
+            // Runde 5, Teil F.
+            "plan.write",
+            "plan.exit",
+            "ask_user",
         ];
         assert_eq!(InteractionMode::Plan.allowed_tools(), Some(expected));
     }
@@ -697,14 +726,26 @@ mod tests {
             "research",
             "research_deps",
             "research_web",
+            "plan.write",
+            "plan.exit",
+            "ask_user",
         ] {
             assert!(plan.contains(&added), "Plan muss '{added}' anbieten");
         }
-        assert!(
-            !plan.contains(&"fs.write") && !plan.contains(&"shell.exec"),
-            "Plan bleibt mutationsfrei"
-        );
-        assert_eq!(plan.len(), explore.len() + 9);
+        for forbidden in [
+            "fs.write",
+            "fs.edit",
+            "shell.exec",
+            "host.sudo_exec",
+            "process.kill",
+            "plan.enter",
+        ] {
+            assert!(
+                !plan.contains(&forbidden),
+                "Plan bleibt mutationsfrei: '{forbidden}'"
+            );
+        }
+        assert_eq!(plan.len(), explore.len() + 12);
         Ok(())
     }
 
@@ -814,6 +855,34 @@ mod tests {
             "SHELL_PROMPT darf nicht mehr auf den für die UIA unerreichbaren \
              uia-shell-worker verweisen"
         );
+    }
+
+    /// Runde 5, Teil F: der Plan-Prompt ist ein Ablauf und nennt die
+    /// Werkzeuge, mit denen das Modell ihn gehen kann.
+    #[test]
+    fn test_plan_prompt_is_a_workflow_naming_its_tools() -> TestResult {
+        let steps = [
+            "Verstehen",
+            "Erkunden",
+            "Rückfragen",
+            "Plan schreiben",
+            "Vorlegen",
+        ];
+        let mut last = 0;
+        for step in steps {
+            let position = PLAN_PROMPT.find(step).ok_or_else(|| {
+                TestError::Unexpected(format!("Schritt '{step}' fehlt im PLAN_PROMPT"))
+            })?;
+            assert!(position >= last, "Schritt '{step}' steht außer der Reihe");
+            last = position;
+        }
+        for tool in ["plan.write", "plan.exit", "ask_user", ".harw/plans/"] {
+            assert!(
+                PLAN_PROMPT.contains(tool),
+                "PLAN_PROMPT muss '{tool}' nennen"
+            );
+        }
+        Ok(())
     }
 
     #[test]

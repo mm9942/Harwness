@@ -75,9 +75,14 @@ admitted = [
   "skills.propose",
   "skills.commit_proposal",
   "skills.reject_proposal",
+  # Runde 5, Teil M: Zwischenstand (info) oder Frage (question) an den direkten
+  # Elternteil; nur Text, keine Rechte (siehe
+  # `harw_registry_defaults::profile::parent_message_tools_for_role`).
+  "parent.message",
 ]
 forbidden = [
   "fs.write",
+  "fs.edit",
   "shell.exec",
   "web.fetch",
   "web.docs_rs",

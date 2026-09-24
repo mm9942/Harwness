@@ -424,6 +424,24 @@ impl InputEditor {
         self.buffer.is_empty()
     }
 
+    /// `true`, solange der Puffer unverändert einen per Hoch/Runter
+    /// zurückgeholten History-Eintrag zeigt (Runde 5, Teil G).
+    ///
+    /// # Beschreibung
+    /// Die TUI öffnet währenddessen kein `/`- oder `@`-Popup, damit das
+    /// nächste Hoch/Runter weiter durch die History blättert, statt im Popup
+    /// eines zurückgeholten `/befehl`s zu landen. Sobald getippt oder
+    /// editiert wird, weicht der Puffer vom Eintrag ab und das Popup gilt
+    /// wieder.
+    #[must_use]
+    pub fn is_browsing_history(&self) -> bool {
+        self.history_pos.is_some()
+            && self
+                .last_recalled
+                .as_deref()
+                .is_some_and(|recalled| recalled == self.buffer)
+    }
+
     /// Gibt die gespeicherten History-Einträge zurück (älteste vorne, jüngste hinten).
     ///
     /// # Returns

@@ -69,7 +69,11 @@ pub struct RuleToml {
     pub tool: String,
     /// Optionales Muster (Shell-Präfix bzw. Pfad-Glob je nach `tool`); die
     /// genaue Semantik gehört `harw-extension-api::allow_rules`.
-    #[serde(default)]
+    ///
+    /// Runde 5, Teil E: in TOML auch als `match = "cargo test*"` (Shell)
+    /// bzw. `path = "src/**"` (Dateisystem) schreibbar — beides sind
+    /// Aliasse desselben Feldes; geschrieben wird immer `pattern`.
+    #[serde(default, alias = "match", alias = "path")]
     pub pattern: Option<String>,
 }
 
@@ -289,6 +293,24 @@ mod tests {
             ..PermissionsSection::default()
         };
         assert!(section.validate().is_ok());
+    }
+
+    /// Runde 5, Teil E: `match`/`path` als Aliasse von `pattern`.
+    #[test]
+    fn test_rule_accepts_match_and_path_aliases() -> TestResult {
+        let src = r#"
+            [[allow]]
+            tool = "shell.exec"
+            match = "cargo test*"
+
+            [[deny]]
+            tool = "fs.write"
+            path = "src/**"
+        "#;
+        let section: PermissionsSection = toml::from_str(src).map_err(ctx("parse toml"))?;
+        assert_eq!(section.allow[0].pattern.as_deref(), Some("cargo test*"));
+        assert_eq!(section.deny[0].pattern.as_deref(), Some("src/**"));
+        Ok(())
     }
 
     #[test]

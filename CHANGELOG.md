@@ -6,6 +6,219 @@ Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
 
+### Runde 5 (2026-09-24)
+
+**CI und Toolchain**
+- Toolchain gepinnt: `rust-toolchain.toml` mit `channel = "1.98.0"`
+  (Komponenten `rustfmt`, `clippy`); lokal und in der CI prüfen damit derselbe
+  Compiler, dasselbe `rustfmt` und dasselbe `clippy`. Details in
+  `docs/setup/build-prerequisites.md`.
+- `ci.yml`: `concurrency` mit `cancel-in-progress` (ein neuer Push bricht den
+  alten Lauf ab); ein Filter-Job mit `dorny/paths-filter` entscheidet, welche
+  Jobs laufen. Reine Doku-PRs (`docs/**`, `*.md`) fahren nur den Filter-Job,
+  `deny` läuft nur bei Änderungen an Manifesten, `Cargo.lock` oder
+  `deny.toml`. Bei Workflow-Änderungen läuft zusätzlich `actionlint`. Der
+  Root-Job testet mit `cargo nextest`, Doc-Tests weiter mit `cargo test --doc`.
+- Dependabot: alle GitHub-Actions-Updates (auch Major) in einer Gruppe, neues
+  Ökosystem `rust-toolchain`, `open-pull-requests-limit: 3` je Ökosystem.
+
+**Sicherheit: sudo-Freigabe im eigenen Fenster**
+- Neues Werkzeug `host.sudo_exec {argv, reason}`, nur für `uia-shell-worker`
+  und `host-process-worker` und nur in der TUI; überall sonst schlägt es
+  geschlossen fehl. Es steht in `ALWAYS_ASK_TOOLS`: jeder Root-Befehl braucht
+  eine eigene Freigabe.
+- Die TUI zeigt ein eigenes Fenster mit exaktem argv, cwd und Worker. Das
+  Passwort wird maskiert eingegeben und erreicht nie Modell, Verlauf,
+  Eingabe-Historie, Logs, Traces oder Platte. Das Fenster fängt alle Tasten
+  und Pastes ab.
+- Zwei Varianten wie beim Host-Modus: **Einmalig** oder **Für diese
+  Sitzung**. Die Sitzungsvariante behält das Passwort nur im Speicher der
+  TUI, höchstens `[host] sudo_session_minutes` lang (Vorgabe 10, höchstens
+  60, `0` = aus). Gelöscht wird es auch bei `/new`, `/resume`, Beenden und
+  falschem Passwort. sudo läuft immer mit `-k`.
+- Passwortloses sudo wird erkannt; dann fragt das Fenster nur „Freigeben /
+  Ablehnen“.
+- `shell.exec` lehnt Befehle ab, die mit `sudo`, `doas` oder `pkexec`
+  beginnen, und verweist auf `host.sudo_exec`.
+- Jede Entscheidung wird als Audit-Ereignis ohne Geheimnis protokolliert
+  (argv, argv-Hash, Modus, Entscheidung, Exit-Code, Dauer).
+
+**Werkzeuge**
+- `fs.edit {path, old_string, new_string, replace_all?}`: gezieltes Ersetzen
+  statt ganze Datei schreiben. `old_string` muss genau einmal vorkommen
+  (außer mit `replace_all`), sonst gibt es einen Fehler mit Trefferzahl.
+  Gleiche Grenzen wie `fs.write` (Workspace, Symlinks, Größe, atomar), braucht
+  immer eine Freigabe. Die Werkzeugzelle zeigt „N Ersetzung(en) in <pfad>“ mit
+  Diff-Ausschnitt. Zugelassen überall, wo `fs.write` zugelassen ist.
+- `agent.result {child_id, offset?, max_bytes?, part?}`: lädt den ungekürzten
+  Antworttext eines eigenen Kind-Laufs seitenweise nach; `part: "journal"`
+  liefert stattdessen das Aktivitätsjournal (auch nach Abbruch).
+- `agent.status {child_id?}` (lesend) und `agent.cancel {child_id}` (immer mit
+  Freigabe) für Hintergrund-Agenten.
+- `agent.message {child_id, text}` (Eltern → eigenes, laufendes Kind) und
+  `parent.message {text, kind?: info|question}` (Kind → direkter Elternteil).
+- `ask_user`: 1–4 Fragen mit je 2–4 Optionen plus Freitext, auch
+  Mehrfachauswahl; nur Wurzel-Agent in der TUI.
+- Plan-Modus-Werkzeuge `plan.write` (schreibt nur unter `.harw/plans/`),
+  `plan.exit {plan_path}` und `plan.enter` (nur Vorschlag); nur Wurzel, nur
+  TUI.
+- `shell.exec` nimmt `request_host {reason}` an (Host-Mode-Anfrage, siehe
+  unten) und `timeout_secs` bis `[shell] max_timeout_secs`.
+
+**Agenten**
+- Hintergrund-Orchestratoren: Ein Orchestrator, den die UIA in der TUI
+  startet, läuft im Hintergrund weiter; der Turn der UIA endet sofort.
+  `background: false` erzwingt den synchronen Lauf, Worker bleiben immer
+  synchron. Ist ein Ergebnis da, startet im Leerlauf automatisch ein Turn der
+  UIA; während eines Turns kommt es als Kontext in den nächsten. Beim Beenden
+  fragt die TUI einmal nach, solange Hintergrund-Agenten laufen; `/new`
+  bricht sie ab. Freigaben der Hintergrund-Agenten (auch sudo und Host-Modus)
+  erscheinen auch im Leerlauf.
+- Orchestrierungsgrenzen in `[agents]`: `max_root_orchestrators` (Vorgabe 1,
+  erlaubt 1–4), `max_sub_orchestrators` (2, 1–6),
+  `max_sub_orchestrator_depth` (2, 1–3), `max_spawn_depth` (4, 1–6).
+  Ungültige Werte werden geklemmt. Eine Ablehnung erreicht das Modell als
+  Werkzeugfehler, der Turn läuft weiter.
+- Übergabe am Budget-Ende: Der Spawner hält eine Reserve des Token-Budgets
+  zurück (5 %, mindestens 8000, höchstens 25 %) und lässt das Kind damit eine
+  strukturierte Übergabe schreiben (höchstens 3072 Tokens, Zeitlimit 60 s).
+  Scheitert das, geht wie bisher die letzte Antwort zurück. Mit
+  `continue_from: <child_id>` (in `delegate_wave`-Zielen und bei
+  `transfer_to_*`) setzt der Elternteil ein solches Kind mit derselben Rolle
+  und frischem Budget fort, höchstens dreimal je ursprünglichem Kind.
+- Aktivitätsjournal je Kind (Aufträge, Werkzeugaufrufe, geänderte Dateien,
+  Enkel, Nachrichten). Endet ein Kind nicht regulär, bekommt der Elternteil
+  einen Endbericht mit der Kopfzeile `[child_end status=… handoff=…]`, Grund,
+  Übergabe und Journal-Kurzfassung.
+- Nachrichten: `parent.message` mit `kind: "info"` höchstens einmal je 30 s,
+  `kind: "question"` wartet bis zu 10 min auf eine Antwort über
+  `agent.message`. Nachrichten sind auf 4 KiB gedeckelt.
+- Host-Mode-Anfrage: `shell.exec` mit `request_host {reason}` öffnet das
+  Host-Mode-Fenster mit Anfragendem (Rolle, Kind-ID, Baum-Pfad) und Grund,
+  Varianten einmalig oder für die Sitzung. Scheitert ein Sandbox-Lauf
+  erkennbar an der Sandbox, bekommt das Modell die Felder `sandbox_denial`
+  und `host_mode_hint`, aber keine automatische Wiederholung.
+- Freigaben von Kind-Agenten erscheinen im normalen Freigabedialog mit
+  „angefragt von …“ (Wartezeit bis 10 min). Jede Zustimmung gilt nur für
+  diesen einen Aufruf.
+- Lease-Herzschlag: Solange ein Kind läuft, verlängert ein Takt seine Lease
+  und die aller Vorfahren. Lange Builds oder Tests laufen damit nicht mehr in
+  den Lease-Ablauf. Die Wanduhrgrenze gilt weiter; für Orchestratoren beträgt
+  sie 3600 s.
+- Diary auch für Kind-Agenten: Einträge nach einer Verdichtung und am Ende
+  des Laufs, höchstens ein Endeintrag je Lauf, nichts bei Läufen ohne Turn.
+- Auto-Modus: `auto` gibt Aufrufe außerhalb der festen Listen nach einem
+  deterministischen Vorfilter und einem Klassifizierer frei (Rolle
+  `auto-classifier`, `[internal_models.auto_classifier]`, ohne Wahl das
+  schnelle Modell des aktiven Providers, bei Anthropic Haiku 4.5). Fehler oder
+  mehr als 10 s führen zur Rückfrage, nie zur Freigabe. `ALWAYS_ASK_TOOLS`
+  bleiben unberührt. Nach 3 Ablehnungen in Folge oder 20 insgesamt fällt die
+  Sitzung auf `ask` zurück.
+- Eigene Regeln: `[[permissions.allow]]`/`[[permissions.deny]]` nehmen
+  Argument-Muster (`match = "cargo test*"` für Shell, `path = "src/**"` für
+  Dateien). Deny gilt vor Allow und vor dem Klassifizierer, Deny-Regeln auch
+  im Modus `ask`. Ab der dritten gleichartigen manuellen Freigabe bietet der
+  Dialog „Ja, und künftig erlauben: <muster>“ an; nie für `ALWAYS_ASK_TOOLS`
+  oder riskante Muster.
+- Plan-Graphen: Der Plan-Store hält mehrere Pläne (`plan list|switch|archive`).
+  Ein Plan der Modell-Fläche ist zunächst ein Vorschlag; `plan submit` legt
+  ihn in der TUI zur Bestätigung vor und bindet ihn danach an ein Goal.
+  `plan step <id> done <beleg>` meldet Fortschritt (`done` nur mit Beleg).
+- Die Regeln für UIA-Worker erlauben kleine, abgegrenzte Code-Pakete.
+
+**TUI**
+- Das `/`-Popup reagiert auch während der Arbeit auf Hoch/Runter/Tab/Esc/
+  Enter. Die Eingabe-Historie enthält auch `/`-Befehle.
+- `Ctrl+O` klappt Werkzeugzellen auch während eines Turns auf und zu.
+- `/btw <frage>`: flüchtige Nebenfrage zum Gespräch, ohne Werkzeuge und ohne
+  den Agenten zu unterbrechen. Sie landet weder im Verlauf noch in der
+  Historie; Esc bricht ab, Zeitlimit 60 s. Nur in der TUI.
+- `/agent` zeigt den Agentenbaum mit Live-Werten, die Wurzel heißt
+  „UIA · <name>“. Neu: `/agent stream <orchestrators|all|none>`, `/agent bg`
+  und `/agent cancel <id>`. `/agents` entfällt; die Eingabe zeigt einen
+  Hinweis auf `/agent`.
+- Live-Stream: Orchestrator-Kinder zeigen Werkzeugaufrufe, Reasoning und
+  Text als eingerückten Block unter ihrer Agent-Zeile
+  (`[tui] child_stream`, Vorgabe `orchestrators`).
+- Goal-Marke „◎ Goal: … · n/m“ in der Statuszeile für einen bestätigten,
+  an ein Goal gebundenen Plan.
+- Esc mit laufenden Kind-Agenten fragt nach („nochmal Esc zum Bestätigen“);
+  ohne Kinder bricht Esc wie bisher sofort ab. Enter reiht während eines
+  Turns ein und bricht nie ab.
+- Plan-Modus: `Shift+Tab` schaltet `ask → auto → full → plan`; die Stufe
+  `plan` zeigt „⏸ plan mode on (shift+tab to cycle)“ und sperrt schreibende
+  und ausführende Werkzeuge sofort, auch mitten im Turn. `plan.exit` öffnet
+  ein Fenster mit dem gerenderten Plan und drei Optionen (umsetzen mit
+  `auto`, umsetzen mit `ask`, weiter planen mit Rückmeldung). Der
+  freigegebene Plan bleibt angeheftet und übersteht die Verdichtung.
+  `/plan show|list|open|edit` für Plan-Dateien, `/plan
+  plans|switch|archive|inspect|submit|step` für Plan-Graphen.
+- Auto-Modus in der Anzeige: automatisch freigegebene Aufrufe tragen
+  „auto ✓ <Grund>“, abgelehnte „Vom Auto-Modus abgelehnt · <Kategorie>“.
+  Neu: `/permissions allow|deny <tool> [muster] [--session|--project|--user]`,
+  `/permissions rules`, `/permissions rm <nr>`, `/permissions log [anzahl]`.
+- `/models worker [<rolle|all> <uia|ziel>]`; nach der UIA-Wahl in `/models`
+  öffnet sich direkt der Bereich „UIA-Worker-Modelle“.
+- Wissensbrowser: im Palace-Browser listet `T` die vorläufigen Topics, `p`
+  belegt nach Rückfrage `/palace promote topic/<slug>` vor. Die Werkbank
+  aktualisiert sich live bei Modell-Notizen, das Kanban-Board lädt Änderungen
+  aus `harw serve` alle 2 s nach.
+- „Host-Modus beendet (neue Sitzung)“, wenn ein Sitzungswechsel die
+  Host-Phase beendet; `Ctrl+H` beendet auch eine prozessweite Host-Phase.
+
+**Konfiguration**
+- `[host] sudo_session_minutes` (Vorgabe 10, höchstens 60, `0` = aus;
+  global, Profil darf nur verkürzen).
+- `[internal_models.auto_classifier]` (Modell des Auto-Modus-Klassifizierers).
+- `[uia_worker_models]` mit einem Eintrag je Rolle (`uia_worker`,
+  `uia_shell_worker`, `uia_writer`, `uia_latex_writer`, `uia_explorer`), Wert
+  `"uia"` (wie UIA) oder `"provider/modell"`. Ohne Eintrag gilt der alte
+  `uia_worker_model`-Pin, jetzt mit dem Provider aus dem Katalog.
+- `[tui] child_stream = "orchestrators" | "all" | "none"`.
+- `[agents] max_root_orchestrators`, `max_sub_orchestrators`,
+  `max_sub_orchestrator_depth`, `max_spawn_depth`.
+- `[shell] max_timeout_secs` (Vorgabe 900, erlaubt 30–3600).
+- Für `[agents]` und `[shell]` setzen Home und Profil frei; ein nicht
+  vertrautes Projekt darf nur senken. Die Feldtabelle
+  (`harw-config/src/scope.rs`) hat jetzt 111 Einträge, siehe
+  `docs/design/config-scopes.md` §1.19–§1.22.
+
+**Fehlerbehebungen**
+- `.gitignore` in für alle beschreibbaren Projektordnern: best-effort, sonst
+  Eintrag in `.git/info/exclude`.
+- Credentials werden normalisiert: aller ASCII-Leerraum wird entfernt
+  (Zeilenumbrüche, CRLF aus `.env`, umbrochene Pastes), auch bei
+  `CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_API_KEY`. `harw auth token` prüft das
+  Format eines Anthropic-Tokens, ohne ihn auszugeben; `harw auth status` zeigt
+  einen Formatbefund.
+- `harw -r` und Sitzungsauswahl: Sitzungen ohne Nutzer-Turn werden nicht mehr
+  gespeichert und im Picker ausgeblendet; eine fortgesetzte Sitzung zeigt
+  einen Resume-Hinweis statt einer neuen Begrüßung.
+- Verdichtung behält die letzten zwei Nutzer-Turns und den Arbeitsstand.
+- `analyze` aus UIA-Sitzungen startet `uia-explorer` statt `analyst` (die
+  Spawn-Matrix verbietet UIA → Worker); der Bericht trägt `status`/`notice`
+  und markiert unvollständige Ergebnisse.
+- `fs.read`: `null` bzw. `0` gilt als „nicht gesetzt“; die Fehlermeldung
+  nennt die Felder.
+- Kind-Antworten dürfen 32 KiB statt 8 KiB lang sein; beim Kürzen bekommen
+  Anfang und Schluss je die Hälfte, die Marke verweist auf `agent.result`.
+- `/mode` ändert das Modell nicht mehr.
+- Das Transkript speichert die echten Ergebnisse von `transfer_to_*`.
+- `shell.exec`-Zeitlimits: Vorgabe 30 s, Build- und Testbefehle (`cargo`,
+  `make`, `npm`, `pytest`, `go`, …) 600 s, eigenes `timeout_secs` bis
+  `[shell] max_timeout_secs`. Das CPU-Limit skaliert mit dem Zeitlimit.
+
+**Modellkatalog**
+- Aktuelle Anthropic-Modelle Fable 5.1, Opus 5.5, Sonnet 5 und Haiku 4.5
+  sowie die Legacy-Modelle; Standardmodell ist Opus 5.5.
+
+**Doku**
+- Neue Anleitung `docs/guides/hintergrund-agenten.md` (Hintergrund-Orchestratoren,
+  Nachrichten, Übergabe, Host-Mode-Anfrage, Grenzen).
+- `README.md`, `docs/cli.md`, `docs/design/tui-command-contract.md` §8,
+  `interaction-contract.md` §2.6, `tui-roles-models-modes.md` und
+  `config-scopes.md` nachgezogen.
+
 ### Runde 4 (2026-09-24)
 
 **Fehlerbehebungen**

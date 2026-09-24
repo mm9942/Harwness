@@ -1213,7 +1213,8 @@ fn is_sensitive_key(key: &str) -> bool {
 
 /// Redigiert strukturierte Werte zentral, bevor sie irgendeinen Renderer
 /// erreichen. Systemprompt-Felder werden vollständig ausgelassen.
-fn redact_json_value(value: &Value) -> Value {
+/// Runde 5, Teil I: auch vom Kind-Live-Stream (`crate::child_stream`) genutzt.
+pub(crate) fn redact_json_value(value: &Value) -> Value {
     match value {
         Value::Object(object) => {
             let mut redacted = Map::new();
@@ -1240,7 +1241,8 @@ fn redact_json_value(value: &Value) -> Value {
 
 /// Redigiert typische `key=value`, `key: value` und Authorization-Felder in
 /// Freitext. Das deckt auch Legacy-Toollabels und normale Chattexte ab.
-fn redact_text(text: &str) -> String {
+/// Runde 5, Teil I: auch vom Kind-Live-Stream (`crate::child_stream`) genutzt.
+pub(crate) fn redact_text(text: &str) -> String {
     let lower = text.to_ascii_lowercase();
     let markers = [
         "authorization",

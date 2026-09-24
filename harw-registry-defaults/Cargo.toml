@@ -29,6 +29,10 @@ harw-tool-doc = { version = "0.3.0", path = "../harw-tool-doc" }
 harw-tool-fs = { path = "../harw-tool-fs" }
 harw-tool-lens = { path = "../harw-tool-lens" }
 harw-tool-shell = { path = "../harw-tool-shell" }
+# Runde 5, Teil F: Namen und Rechteklasse der Plan-Werkzeuge (`plan.*`,
+# `ask_user`) für `authority::tool_permission` und die Standardpolitik.
+# Kein Zyklus: `harw-tool-plan` hängt nicht von dieser Crate ab.
+harw-tool-plan = { path = "../harw-tool-plan" }
 harw-tool-web = { path = "../harw-tool-web" }
 harw-browser = { path = "../harw-browser", optional = true }
 harw-browser-thirtyfour = { path = "../harw-browser-thirtyfour", optional = true }

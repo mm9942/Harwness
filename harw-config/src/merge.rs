@@ -75,9 +75,9 @@
 use std::path::Path;
 
 use crate::harness_config::{
-    CompactionToml, DreamToml, GuardsToml, HarnessConfig, KnowledgeToml, McpListenerSection,
-    McpPrincipalToml, OnboardingSection, PolicySection, ReasoningWeightsToml, SandboxSection,
-    SessionSection, TuiSection,
+    CompactionToml, DreamToml, GuardsToml, HarnessConfig, HostToml, KnowledgeToml,
+    McpListenerSection, McpPrincipalToml, OnboardingSection, PolicySection, ReasoningWeightsToml,
+    SandboxSection, SessionSection, TuiSection,
 };
 use crate::internal_models::InternalModelsToml;
 use crate::mode_toml::ModeSection;
@@ -85,6 +85,7 @@ use crate::permissions_toml::PermissionsSection;
 use crate::plan_toml::ToolsSection;
 use crate::research_toml::ResearchSection;
 use crate::scope::{PERMISSIONS_DEFAULT_MODE_ORDER, POLICY_VISIBILITY_SCOPE_ORDER};
+use crate::uia_worker_models::UiaWorkerModelsToml;
 
 /// Grober Vertrauens-/Ebenen-Kontext eines [`merge_layer_into`]-Aufrufs;
 /// bestimmt, welche [`crate::scope::MergeRule`]-Varianten überhaupt wirken
@@ -882,6 +883,15 @@ fn merge_tui(
         "tui.keybindings_file",
         layer_path,
     );
+    // Runde 5, Teil I: `[tui] child_stream` (rein darstellend, `ProfileReplaces`).
+    profile_replaces(
+        &mut trusted.tui.child_stream,
+        incoming.child_stream,
+        present("child_stream"),
+        role,
+        "tui.child_stream",
+        layer_path,
+    );
 }
 
 // `[session]` (Abschnitt 1.4) — `retention_days` ist `MinBound`
@@ -1336,6 +1346,44 @@ fn merge_internal_models(
     trusted.internal_models = incoming;
 }
 
+// `[uia_worker_models]` (Abschnitt 1.20, Runde 5 Teil G) — wie
+// `[internal_models]`: jede Rolle `ProfileReplaces`, ein Feld, das der Layer
+// nicht setzt, erbt den akkumulierten `trusted`-Wert. Nie vom nicht
+// vertrauten Projekt-Layer angewendet (ein Projekt darf nicht bestimmen,
+// welches Modell die UIA-Worker ansprechen).
+fn merge_uia_worker_models(
+    trusted: &mut HarnessConfig,
+    mut incoming: UiaWorkerModelsToml,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+) {
+    if role == LayerRole::UntrustedProject {
+        if field_present(raw, &["uia_worker_models"]) {
+            warn_untrusted_ignored("uia_worker_models", layer_path);
+        }
+        return;
+    }
+    let Some(raw_table) = raw.get("uia_worker_models") else {
+        return;
+    };
+    for worker_role in crate::uia_worker_models::UIA_WORKER_ROLES {
+        let Some(key) = UiaWorkerModelsToml::toml_key(worker_role) else {
+            continue;
+        };
+        if raw_table.get(key).is_none() {
+            incoming.set(
+                worker_role,
+                trusted
+                    .uia_worker_models
+                    .get(worker_role)
+                    .map(str::to_owned),
+            );
+        }
+    }
+    trusted.uia_worker_models = incoming;
+}
+
 // `[compaction]` (Abschnitt 1.14) — einziges Feld `MinBound` (Kostenobergrenze).
 fn merge_compaction(
     trusted: &mut HarnessConfig,
@@ -1430,6 +1478,138 @@ fn merge_dream(
         "dream.schedule",
         layer_path,
     );
+}
+
+// `[host]` (Abschnitt 1.19, Runde 5 Teil B) — `sudo_session_minutes` ist
+// `MinBound` (global): nur der Home-Layer setzt frei; jeder spaetere Layer
+// (Profil wie nicht vertrautes Projekt) kann die Merkfrist nur verkuerzen.
+// Anders als `merge_optional_min_bound` gilt ein ungesetzter Home-Wert hier
+// als Vorgabe (`DEFAULT_SUDO_SESSION_MINUTES`) — ein spaeterer Layer kann
+// die Frist also auch dann nicht ueber die Vorgabe hinaus verlaengern
+// (fail-closed fuer ein Geheimnis im Speicher). `0` (kein Sitzungs-Merken)
+// ist als Verkuerzung immer erlaubt.
+fn merge_host(
+    trusted: &mut HarnessConfig,
+    incoming: HostToml,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+    out: &mut Vec<ScopeDiagnostic>,
+) {
+    const FIELD: &str = "host.sudo_session_minutes";
+    if !field_present(raw, &["host", "sudo_session_minutes"]) {
+        return;
+    }
+    let Some(value) = incoming.sudo_session_minutes else {
+        return;
+    };
+    if role == LayerRole::Baseline {
+        trusted.host.sudo_session_minutes = Some(value);
+        return;
+    }
+    let current = trusted
+        .host
+        .sudo_session_minutes
+        .unwrap_or(crate::harness_config::DEFAULT_SUDO_SESSION_MINUTES);
+    if value <= current {
+        trusted.host.sudo_session_minutes = Some(value);
+    } else {
+        let diagnostic = ScopeDiagnostic::new(FIELD, layer_path, &value);
+        reject(out, diagnostic, role, RejectionReason::ExceedsMinBound);
+    }
+}
+
+// `[agents]` (Abschnitt 1.21, Runde 5 Teil K) — vier Orchestrierungsgrenzen.
+// Vertraute Layer (Home und Profil) setzen frei, auch nach oben; ein nicht
+// vertrautes Projekt darf jede Zahl nur senken. Vergleichswert ist der bisher
+// gesetzte Wert, sonst die Vorgabe — ein Projekt kommt also auch ohne
+// Home-Wert nie ueber die Vorgabe hinaus. Das Klemmen auf den erlaubten
+// Bereich geschieht erst beim Lesen (`AgentLimitsToml::effective`).
+fn merge_agent_limits(
+    trusted: &mut HarnessConfig,
+    incoming: crate::agent_limits::AgentLimitsToml,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+    out: &mut Vec<ScopeDiagnostic>,
+) {
+    use crate::agent_limits::{
+        DEFAULT_MAX_ROOT_ORCHESTRATORS, DEFAULT_MAX_SPAWN_DEPTH,
+        DEFAULT_MAX_SUB_ORCHESTRATOR_DEPTH, DEFAULT_MAX_SUB_ORCHESTRATORS,
+    };
+    let limits = &mut trusted.agents;
+    let fields: [(&str, Option<u32>, &mut Option<u32>, u32); 4] = [
+        (
+            "max_root_orchestrators",
+            incoming.max_root_orchestrators,
+            &mut limits.max_root_orchestrators,
+            DEFAULT_MAX_ROOT_ORCHESTRATORS,
+        ),
+        (
+            "max_sub_orchestrators",
+            incoming.max_sub_orchestrators,
+            &mut limits.max_sub_orchestrators,
+            DEFAULT_MAX_SUB_ORCHESTRATORS,
+        ),
+        (
+            "max_sub_orchestrator_depth",
+            incoming.max_sub_orchestrator_depth,
+            &mut limits.max_sub_orchestrator_depth,
+            DEFAULT_MAX_SUB_ORCHESTRATOR_DEPTH,
+        ),
+        (
+            "max_spawn_depth",
+            incoming.max_spawn_depth,
+            &mut limits.max_spawn_depth,
+            DEFAULT_MAX_SPAWN_DEPTH,
+        ),
+    ];
+    for (name, value, slot, default) in fields {
+        if !field_present(raw, &["agents", name]) {
+            continue;
+        }
+        let Some(value) = value else {
+            continue;
+        };
+        if role != LayerRole::UntrustedProject || value <= slot.unwrap_or(default) {
+            *slot = Some(value);
+        } else {
+            let diagnostic = ScopeDiagnostic::new(&format!("agents.{name}"), layer_path, &value);
+            reject(out, diagnostic, role, RejectionReason::ExceedsMinBound);
+        }
+    }
+}
+
+// `[shell]` (Abschnitt 1.22, Runde 5 Teil N) — `max_timeout_secs`.
+// Vertraute Layer (Home und Profil) setzen frei, auch nach oben; ein nicht
+// vertrautes Projekt darf die Obergrenze nur senken (Vergleichswert: der
+// bisher gesetzte Wert, sonst die Vorgabe 900 s). Geklemmt wird erst beim
+// Lesen (`ShellToml::effective_max_timeout_secs`).
+fn merge_shell_limits(
+    trusted: &mut HarnessConfig,
+    incoming: crate::shell_limits::ShellToml,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+    out: &mut Vec<ScopeDiagnostic>,
+) {
+    const FIELD: &str = "shell.max_timeout_secs";
+    if !field_present(raw, &["shell", "max_timeout_secs"]) {
+        return;
+    }
+    let Some(value) = incoming.max_timeout_secs else {
+        return;
+    };
+    let current = trusted
+        .shell
+        .max_timeout_secs
+        .unwrap_or(crate::shell_limits::DEFAULT_SHELL_MAX_TIMEOUT_SECS);
+    if role != LayerRole::UntrustedProject || value <= current {
+        trusted.shell.max_timeout_secs = Some(value);
+    } else {
+        let diagnostic = ScopeDiagnostic::new(FIELD, layer_path, &value);
+        reject(out, diagnostic, role, RejectionReason::ExceedsMinBound);
+    }
 }
 
 // `[reasoning]` (Abschnitt 1.15) — alle sechs Felder `ProfileReplaces`.
@@ -1650,6 +1830,8 @@ pub fn merge_layer_into(
     );
     merge_sandbox(trusted, incoming.sandbox, raw, role, layer_path, &mut out);
     merge_internal_models(trusted, incoming.internal_models, raw, role, layer_path);
+    // Runde 5, Teil G: eigene Modellwahl je UIA-Worker-Rolle.
+    merge_uia_worker_models(trusted, incoming.uia_worker_models, raw, role, layer_path);
     merge_compaction(
         trusted,
         incoming.compaction,
@@ -1662,6 +1844,11 @@ pub fn merge_layer_into(
     merge_guards(trusted, incoming.guards, raw, role, layer_path, &mut out);
     merge_knowledge(trusted, incoming.knowledge, raw, role, layer_path);
     merge_dream(trusted, incoming.dream, raw, role, layer_path);
+    merge_host(trusted, incoming.host, raw, role, layer_path, &mut out);
+    // Runde 5, Teil K: `[agents]` — Orchestrierungsgrenzen.
+    merge_agent_limits(trusted, incoming.agents, raw, role, layer_path, &mut out);
+    // Runde 5, Teil N: `[shell]` — Obergrenze für `shell.exec`-Zeitlimits.
+    merge_shell_limits(trusted, incoming.shell, raw, role, layer_path, &mut out);
 
     // `base_dir`: `#[serde(skip)]`, kein TOML-Feld, kein `FIELD_TABLE`-
     // Eintrag (Abschnitt 1.1, "89. Zeile"). Reine Buchführung, die dem
@@ -1777,6 +1964,294 @@ mod tests {
             &layer_path(),
         );
         assert_eq!(untouched.dream, DreamToml::default());
+        Ok(())
+    }
+
+    // [host] sudo_session_minutes (Abschnitt 1.19, Runde 5 Teil B):
+    // MinBound — ein spaeterer Layer kann die Merkfrist nur verkuerzen.
+    #[test]
+    fn test_host_sudo_session_minutes_is_min_bound() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert_eq!(trusted.host.effective_sudo_session_minutes(), 10);
+        let home = "[host]\nsudo_session_minutes = 5";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(trusted.host.sudo_session_minutes, Some(5));
+
+        let longer = "[host]\nsudo_session_minutes = 30";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(longer).map_err(ctx("parse longer"))?,
+            &raw_from(longer)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(
+            trusted.host.sudo_session_minutes,
+            Some(5),
+            "ein Profil darf die Frist nicht verlaengern"
+        );
+
+        let shorter = "[host]\nsudo_session_minutes = 2";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(shorter).map_err(ctx("parse shorter"))?,
+            &raw_from(shorter)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.host.sudo_session_minutes, Some(2));
+
+        // Ohne Home-Wert gilt die Vorgabe (10) als Obergrenze: weder ein
+        // Profil noch ein nicht vertrautes Projekt verlaengern sie.
+        let mut fresh = HarnessConfig::default();
+        for role in [LayerRole::Refinement, LayerRole::UntrustedProject] {
+            let diagnostics = merge_layer_into(
+                &mut fresh,
+                toml::from_str(longer).map_err(ctx("parse longer"))?,
+                &raw_from(longer)?,
+                role,
+                &layer_path(),
+            );
+            assert_eq!(fresh.host.sudo_session_minutes, None, "{role:?}");
+            assert!(!diagnostics.is_empty(), "{role:?}: Ablehnung sichtbar");
+        }
+
+        let capped = HostToml {
+            sudo_session_minutes: Some(10_000),
+        };
+        assert_eq!(capped.effective_sudo_session_minutes(), 60);
+        Ok(())
+    }
+
+    // [agents] (Abschnitt 1.21, Runde 5 Teil K): Home und Profil setzen
+    // frei (auch nach oben), ein nicht vertrautes Projekt senkt nur.
+    #[test]
+    fn test_agent_limits_trusted_layers_raise_untrusted_project_only_lowers() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert_eq!(trusted.agents.effective().max_root_orchestrators, 1);
+
+        let home = "[agents]\nmax_root_orchestrators = 2\nmax_spawn_depth = 5";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(trusted.agents.max_root_orchestrators, Some(2));
+        assert_eq!(trusted.agents.max_spawn_depth, Some(5));
+
+        // Ein Profil darf erhöhen.
+        let profile = "[agents]\nmax_root_orchestrators = 3\nmax_sub_orchestrators = 4";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(profile).map_err(ctx("parse profile"))?,
+            &raw_from(profile)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.agents.max_root_orchestrators, Some(3));
+        assert_eq!(trusted.agents.max_sub_orchestrators, Some(4));
+
+        // Ein nicht vertrautes Projekt kann nicht erhöhen …
+        let raise = "[agents]\nmax_root_orchestrators = 4\nmax_spawn_depth = 6";
+        let diagnostics = merge_layer_into(
+            &mut trusted,
+            toml::from_str(raise).map_err(ctx("parse raise"))?,
+            &raw_from(raise)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(trusted.agents.max_root_orchestrators, Some(3));
+        assert_eq!(trusted.agents.max_spawn_depth, Some(5));
+        assert_eq!(diagnostics.len(), 2, "beide Erhöhungen sichtbar abgelehnt");
+
+        // … aber senken.
+        let lower = "[agents]\nmax_root_orchestrators = 1\nmax_sub_orchestrator_depth = 1";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(lower).map_err(ctx("parse lower"))?,
+            &raw_from(lower)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(trusted.agents.max_root_orchestrators, Some(1));
+        assert_eq!(trusted.agents.max_sub_orchestrator_depth, Some(1));
+
+        // Ohne Home-Wert gilt die Vorgabe als Obergrenze für das Projekt.
+        let mut fresh = HarnessConfig::default();
+        let over_default = "[agents]\nmax_root_orchestrators = 2";
+        let diagnostics = merge_layer_into(
+            &mut fresh,
+            toml::from_str(over_default).map_err(ctx("parse over default"))?,
+            &raw_from(over_default)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(fresh.agents.max_root_orchestrators, None);
+        assert!(!diagnostics.is_empty());
+        Ok(())
+    }
+
+    // [shell] max_timeout_secs (Runde 5, Teil N): Home/Profil erhöhen,
+    // ein nicht vertrautes Projekt senkt nur.
+    #[test]
+    fn test_shell_max_timeout_trusted_layers_raise_untrusted_project_only_lowers() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert_eq!(trusted.shell.effective_max_timeout_secs(), 900);
+
+        let home = "[shell]\nmax_timeout_secs = 1800";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(trusted.shell.max_timeout_secs, Some(1800));
+
+        let profile = "[shell]\nmax_timeout_secs = 3600";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(profile).map_err(ctx("parse profile"))?,
+            &raw_from(profile)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.shell.max_timeout_secs, Some(3600));
+
+        let raise = "[shell]\nmax_timeout_secs = 3601";
+        let diagnostics = merge_layer_into(
+            &mut trusted,
+            toml::from_str(raise).map_err(ctx("parse raise"))?,
+            &raw_from(raise)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(trusted.shell.max_timeout_secs, Some(3600));
+        assert_eq!(diagnostics.len(), 1, "Erhöhung sichtbar abgelehnt");
+
+        let lower = "[shell]\nmax_timeout_secs = 120";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(lower).map_err(ctx("parse lower"))?,
+            &raw_from(lower)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(trusted.shell.effective_max_timeout_secs(), 120);
+
+        // Ohne Home-Wert ist die Vorgabe 900 die Obergrenze für das Projekt.
+        let mut fresh = HarnessConfig::default();
+        let over_default = "[shell]\nmax_timeout_secs = 1200";
+        let diagnostics = merge_layer_into(
+            &mut fresh,
+            toml::from_str(over_default).map_err(ctx("parse over default"))?,
+            &raw_from(over_default)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(fresh.shell.max_timeout_secs, None);
+        assert!(!diagnostics.is_empty());
+        Ok(())
+    }
+
+    // [tui] child_stream (Runde 5, Teil I): ProfileReplaces; Vorgabe
+    // `orchestrators`, ein nicht vertrautes Projekt wird ignoriert, ein
+    // unbekannter Wert parst nicht.
+    #[test]
+    fn test_tui_child_stream_profile_replaces() -> TestResult {
+        use crate::ChildStreamModeToml;
+        let mut trusted = HarnessConfig::default();
+        assert_eq!(trusted.tui.child_stream, ChildStreamModeToml::Orchestrators);
+
+        let all = "[tui]\nchild_stream = \"all\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(all).map_err(ctx("parse all"))?,
+            &raw_from(all)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(trusted.tui.child_stream, ChildStreamModeToml::All);
+
+        let none = "[tui]\nchild_stream = \"none\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(none).map_err(ctx("parse none"))?,
+            &raw_from(none)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(
+            trusted.tui.child_stream,
+            ChildStreamModeToml::All,
+            "nicht vertrautes Projekt bleibt wirkungslos"
+        );
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(none).map_err(ctx("parse none"))?,
+            &raw_from(none)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.tui.child_stream, ChildStreamModeToml::Off);
+        assert_eq!(ChildStreamModeToml::Off.as_str(), "none");
+
+        let bogus = "[tui]\nchild_stream = \"workers\"";
+        assert!(toml::from_str::<HarnessConfig>(bogus).is_err());
+        Ok(())
+    }
+
+    // [uia_worker_models] (Runde 5, Teil G): ProfileReplaces je Rolle; ein
+    // Profil erbt nicht gesetzte Rollen vom Home-Layer, ein nicht vertrautes
+    // Projekt wird ignoriert.
+    #[test]
+    fn test_uia_worker_models_merge_per_role_and_ignore_untrusted_project() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        let home = "[uia_worker_models]\nuia_writer = \"openai/gpt-5\"\nuia_explorer = \"uia\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        let profile = "[uia_worker_models]\nuia_explorer = \"anthropic/claude-opus-5-5\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(profile).map_err(ctx("parse profile"))?,
+            &raw_from(profile)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(
+            trusted.uia_worker_models.get("uia-writer"),
+            Some("openai/gpt-5")
+        );
+        assert_eq!(
+            trusted.uia_worker_models.get("uia-explorer"),
+            Some("anthropic/claude-opus-5-5")
+        );
+
+        let evil = "[uia_worker_models]\nuia_writer = \"evil/model\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(evil).map_err(ctx("parse evil"))?,
+            &raw_from(evil)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(
+            trusted.uia_worker_models.get("uia-writer"),
+            Some("openai/gpt-5")
+        );
         Ok(())
     }
 

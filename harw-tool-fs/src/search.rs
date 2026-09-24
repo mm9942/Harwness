@@ -210,7 +210,12 @@ impl FsSearchExecutor {
                 }
             };
 
-        let start_input = args.path.as_deref().unwrap_or(".");
+        // Strict-Schema: `null` und `""` gelten als „nicht gesetzt“ (Wurzel).
+        let start_input = args
+            .path
+            .as_deref()
+            .filter(|path| !path.is_empty())
+            .unwrap_or(".");
         let start_rel = match normalize_relative(start_input) {
             Ok(rel) => rel,
             Err(reason) => return Ok(ToolOutput::error(format!("fs.search: {reason}"))),
@@ -219,6 +224,7 @@ impl FsSearchExecutor {
         // harten Grenzen klemmen (mindestens ein Treffer).
         let cap = args
             .max_matches
+            .filter(|&matches| matches > 0)
             .unwrap_or(self.max_matches)
             .min(self.max_matches)
             .clamp(1, HARD_MAX_RESULTS);

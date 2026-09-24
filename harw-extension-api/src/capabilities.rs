@@ -75,6 +75,16 @@ pub trait AgentSpawner: Send + Sync {
     fn delegation_target_names(&self, _parent_session_id: &SessionId) -> Vec<String> {
         Vec::new()
     }
+
+    /// Runde 5, Teil K: `true`, wenn `child` abgekoppelt im Hintergrund
+    /// weiterläuft, obwohl sein Elternteil das Handoff-Ergebnis schon
+    /// bekommen hat. Der Kern meldet dann **kein** `ChildCompleted` beim
+    /// Wiederaufnehmen des Elternteils (das Kind ist nicht fertig); der
+    /// Hintergrund-Treiber meldet es beim echten Ende. Der Default `false`
+    /// lässt jede andere Implementierung unverändert.
+    fn child_runs_in_background(&self, _child: &SessionId) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone)]

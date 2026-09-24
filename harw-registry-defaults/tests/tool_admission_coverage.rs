@@ -53,6 +53,15 @@ use harw_registry_defaults::profile::{
     KANBAN_READ_TOOLS, KNOWLEDGE_READ_TOOLS, RegistryProfile, composition_tools_for_role,
     knowledge_tools_for_role, profile_for_role, role_names,
 };
+// Runde 5, Teil B: `host.sudo_exec` steuert ebenfalls die Composition-Root bei.
+use harw_registry_defaults::profile::{SUDO_ROLES, SUDO_TOOLS, sudo_tools_for_role};
+// Runde 5, Teil H: `agent.result` steuert ebenfalls die Composition-Root bei.
+use harw_registry_defaults::profile::{CHILD_RESULT_TOOLS, child_result_tools_for_role};
+// Runde 5, Teil M: `agent.message`/`parent.message` ebenso.
+use harw_registry_defaults::profile::{
+    CHILD_MESSAGE_TOOLS, PARENT_MESSAGE_TOOLS, child_message_tools_for_role,
+    parent_message_tools_for_role,
+};
 
 mod common;
 use common::{TestError, TestResult, ctx};
@@ -95,6 +104,14 @@ fn every_role_admitted_tool_is_registered_by_its_profile() -> TestResult {
             .into_iter()
             .chain(composition_tools_for_role(role).iter().copied())
             .chain(knowledge_tools_for_role(role).iter().copied())
+            // Runde 5, Teil B: `host.sudo_exec` (nur TUI, nur Host-Shell-Worker).
+            .chain(sudo_tools_for_role(role).iter().copied())
+            // Runde 5, Teil H: `agent.result` (nur Rollen, die Kinder starten).
+            .chain(child_result_tools_for_role(role).iter().copied())
+            // Runde 5, Teil M: `agent.message` (Rollen, die Kinder starten)
+            // und `parent.message` (Kind-Rollen mit Elternteil).
+            .chain(child_message_tools_for_role(role).iter().copied())
+            .chain(parent_message_tools_for_role(role).iter().copied())
             .collect();
 
         for admitted in ir.tool_surface().admitted() {
@@ -257,11 +274,14 @@ fn agent_steward_admits_the_commit_mode_tool_set_even_though_two_tools_are_mode_
     let ir = roles
         .get(role_names::AGENT_STEWARD)
         .ok_or(TestError::Missing("agent-steward ist eingebaut"))?;
+    // Runde 5, Teil M: `parent.message` steuert die Composition-Root bei
+    // (kein Profil-Werkzeug) — für den Profilvergleich ausgenommen.
     let admitted: BTreeSet<&str> = ir
         .tool_surface()
         .admitted()
         .iter()
         .map(String::as_str)
+        .filter(|tool| !PARENT_MESSAGE_TOOLS.contains(tool))
         .collect();
 
     let profile = profile_for_role(role_names::AGENT_STEWARD)
@@ -422,6 +442,42 @@ fn orchestrators_admit_exactly_their_composition_tools() -> TestResult {
     Ok(())
 }
 
+/// Runde 5, Teil H: jede Rolle, die Kinder starten darf, admittiert
+/// `agent.result` — sonst hängt die Kind-Registry einen Provider an, den die
+/// `SessionActivation` nie freischaltet, und die Kürzungsmarke verwiese ins
+/// Leere. Umgekehrt admittiert keine andere Rolle das Werkzeug.
+#[test]
+fn spawning_roles_admit_exactly_their_child_result_tools() -> TestResult {
+    let roles = resolved_roles()?;
+    for role in role_names::ALL {
+        let ir = roles
+            .get(*role)
+            .ok_or(TestError::Unexpected(format!("{role} fehlt")))?;
+        let admitted: BTreeSet<&str> = ir
+            .tool_surface()
+            .admitted()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let granted = child_result_tools_for_role(role);
+        // Wer `delegate_wave` bekommt, startet Kinder und braucht auch
+        // `agent.result`.
+        assert_eq!(
+            granted.is_empty(),
+            composition_tools_for_role(role).is_empty(),
+            "{role}: agent.result folgt der Delegationsfläche"
+        );
+        for tool in CHILD_RESULT_TOOLS {
+            assert_eq!(
+                admitted.contains(tool),
+                granted.contains(tool),
+                "{role}: admitted({tool}) muss child_result_tools_for_role entsprechen"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Runde 3, Welle E + Matrix-Unterlagen: die drei Matrix-Game-Sitze
 /// admittieren genau die lesenden Unterlagen-Werkzeuge (fünf lesende `fs.*`
 /// plus `doc.read_pdf`), und ihr Profil (`MatrixReader`) bewirbt genau
@@ -462,6 +518,7 @@ fn matrix_roles_admit_and_advertise_exactly_the_read_tools() -> TestResult {
         for tool in &admitted {
             assert!(
                 *tool != "fs.write"
+                    && *tool != "fs.edit"
                     && !tool.starts_with("shell.")
                     && !tool.starts_with("process.")
                     && !tool.starts_with("web.")
@@ -484,6 +541,7 @@ fn workspace_edit_profile_never_includes_shell_or_web_tools() {
 
     let tools = RegistryProfile::WorkspaceEdit.tool_names();
     assert!(tools.contains(&"fs.write"), "{tools:?}");
+    assert!(tools.contains(&"fs.edit"), "{tools:?}");
     assert!(tools.contains(&"fs.read"), "{tools:?}");
     for tool in &tools {
         assert!(
@@ -509,7 +567,7 @@ fn workspace_edit_profile_never_includes_shell_or_web_tools() {
 }
 
 /// Runde 4, Teil E: `uia-latex-writer` admittiert genau lesende `fs.*`,
-/// `fs.write`, `doc.read_pdf` und das typisierte `latex.build` — und sein
+/// `fs.write`/`fs.edit`, `doc.read_pdf` und das typisierte `latex.build` — und sein
 /// Profil (`UiaLatexWriter`) registriert/bewirbt genau diese Menge. Freie
 /// Shell, Prozesswerkzeuge, Netz, `deps.*` und `lens.ask` sind ausdrücklich
 /// verboten; Rückgabevertrag `execution-summary`, keine Spawn-Tiefe.
@@ -526,6 +584,7 @@ fn uia_latex_writer_admits_exactly_files_pdf_and_latex_build() -> TestResult {
     let expected: BTreeSet<&str> = [
         "fs.read",
         "fs.write",
+        "fs.edit",
         "fs.list",
         "fs.search",
         "fs.glob",
@@ -541,7 +600,11 @@ fn uia_latex_writer_admits_exactly_files_pdf_and_latex_build() -> TestResult {
         .map(String::as_str)
         .collect();
     let advertised: BTreeSet<&str> = profile.tool_names().into_iter().collect();
-    assert_eq!(admitted, expected, "{role}: admitted");
+    // Runde 5, Teil M: zusätzlich `parent.message` aus der Composition-Root
+    // (reiner Text an den Elternteil, keine Rechteklasse).
+    let mut expected_admitted = expected.clone();
+    expected_admitted.extend(PARENT_MESSAGE_TOOLS.iter().copied());
+    assert_eq!(admitted, expected_admitted, "{role}: admitted");
     assert_eq!(advertised, expected, "{profile:?}: beworben");
     let forbidden: BTreeSet<&str> = ir
         .tool_surface()
@@ -613,6 +676,155 @@ fn roles_admit_exactly_their_offered_knowledge_read_tools() -> TestResult {
                 admitted.contains(tool),
                 *role == role_names::ROOT_ORCHESTRATOR,
                 "{role}: {tool} nur für den Root-Orchestrator"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Runde 5, Teil B: `host.sudo_exec` admittieren genau die beiden
+/// Host-Shell-Worker (`uia-shell-worker`, `host-process-worker`); keine
+/// andere eingebaute Rolle admittiert es.
+#[test]
+fn only_the_host_shell_workers_admit_host_sudo_exec() -> TestResult {
+    let roles = resolved_roles()?;
+    // `host-process-worker` ist (noch) keine spawnbare Rolle und fehlt deshalb
+    // in `resolved_roles()`; geprüft wird jede Sudo-Rolle, die aufgelöst wird
+    // — mindestens aber `uia-shell-worker`.
+    assert!(
+        roles.contains_key("uia-shell-worker"),
+        "uia-shell-worker fehlt"
+    );
+    for role in SUDO_ROLES {
+        let Some(ir) = roles.get(*role) else {
+            continue;
+        };
+        for tool in SUDO_TOOLS {
+            assert!(
+                ir.tool_surface().admitted().iter().any(|name| name == tool),
+                "{role} muss {tool} admittieren"
+            );
+        }
+    }
+    for (role, ir) in &roles {
+        if SUDO_ROLES.contains(&role.as_str()) {
+            continue;
+        }
+        for tool in SUDO_TOOLS {
+            assert!(
+                !ir.tool_surface().admitted().iter().any(|name| name == tool),
+                "{role} darf {tool} nicht admittieren"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Runde 5, Teil F: `plan.write`, `plan.exit`, `plan.enter` und `ask_user`
+/// gehören ausschließlich der Wurzel (Composition-Root in `harw-runtime`,
+/// nur mit TUI-Kanal wirksam). Keine eingebaute Rolle admittiert oder
+/// bewirbt sie — ein Kind kann sie nie aufrufen.
+#[test]
+fn no_builtin_role_admits_or_advertises_the_root_only_plan_tools() -> TestResult {
+    let roles = resolved_roles()?;
+    for (role, ir) in &roles {
+        for tool in harw_tool_plan::PlanToolProvider::TOOL_NAMES {
+            assert!(
+                !ir.tool_surface().admitted().iter().any(|name| name == tool),
+                "{role} darf {tool} nicht admittieren (nur Wurzel)"
+            );
+            assert!(
+                !composition_tools_for_role(role).contains(tool)
+                    && !knowledge_tools_for_role(role).contains(tool)
+                    && !sudo_tools_for_role(role).contains(tool),
+                "{role} darf {tool} nicht über die Composition-Root bekommen"
+            );
+            if let Some(profile) = profile_for_role(role) {
+                assert!(
+                    !profile.tool_names().contains(tool),
+                    "{profile:?} ({role}) darf {tool} nicht registrieren"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Runde 5, Teil F, Punkt 4: im Plan-Modus startet der Agent nur
+/// schreibgeschützte Kinder (`explore`/`research*` → Explorer- und
+/// Researcher-Rollen). Weder ihr Profil noch ihre TOML enthält ein
+/// schreibendes oder ausführendes Werkzeug.
+#[test]
+fn plan_mode_child_roles_are_read_only() -> TestResult {
+    use harw_authority::Permission;
+    use harw_registry_defaults::authority::tool_permission;
+
+    let roles = resolved_roles()?;
+    let is_mutating = |tool: &str| {
+        matches!(
+            tool_permission(tool),
+            Some(Permission::WriteWorkspace | Permission::ExecuteProcess)
+        ) || matches!(
+            tool,
+            "fs.write" | "fs.edit" | "shell.exec" | "host.sudo_exec" | "plan.write"
+        )
+    };
+    for role in [
+        role_names::EXPLORER,
+        role_names::UIA_EXPLORER,
+        role_names::RESEARCHER,
+        role_names::RESEARCHER_DEPS,
+        role_names::RESEARCHER_WEB,
+        role_names::DEPENDENCY_RESEARCHER,
+    ] {
+        if let Some(profile) = profile_for_role(role) {
+            for tool in profile.tool_names() {
+                assert!(!is_mutating(tool), "{role}: Profil registriert {tool}");
+            }
+        }
+        if let Some(ir) = roles.get(role) {
+            for tool in ir.tool_surface().admitted() {
+                assert!(
+                    !is_mutating(tool.as_str()),
+                    "{role}: TOML admittiert {}",
+                    tool.as_str()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Runde 5, Teil M: jede Rolle, die Kinder starten darf, admittiert
+/// `agent.message`; jede Kind-Rolle aus `PARENT_MESSAGE_ROLES` admittiert
+/// `parent.message` — sonst hängt die Kind-Registry einen Provider an, den
+/// die `SessionActivation` nie freischaltet. Umgekehrt admittiert keine
+/// andere Rolle die Werkzeuge.
+#[test]
+fn roles_admit_exactly_their_messaging_tools() -> TestResult {
+    let roles = resolved_roles()?;
+    for role in role_names::ALL {
+        let ir = roles
+            .get(*role)
+            .ok_or(TestError::Unexpected(format!("{role} fehlt")))?;
+        let admitted: BTreeSet<&str> = ir
+            .tool_surface()
+            .admitted()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for tool in CHILD_MESSAGE_TOOLS {
+            assert_eq!(
+                admitted.contains(tool),
+                child_message_tools_for_role(role).contains(tool),
+                "{role}: admitted({tool}) muss child_message_tools_for_role entsprechen"
+            );
+        }
+        for tool in PARENT_MESSAGE_TOOLS {
+            assert_eq!(
+                admitted.contains(tool),
+                parent_message_tools_for_role(role).contains(tool),
+                "{role}: admitted({tool}) muss parent_message_tools_for_role entsprechen"
             );
         }
     }

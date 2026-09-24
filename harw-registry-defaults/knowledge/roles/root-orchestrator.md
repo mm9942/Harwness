@@ -27,5 +27,6 @@ und zurückmelden statt weiterzusuchen. Die Sitzung wird an jeder
 Auftragsgrenze hart verdichtet.
 
 ## Übergabe
+Frage/Stand an die UIA: `parent.message`; Kinder: `agent.message`.
 An die UIA nach Return-Contract: Ergebnis, Belege, Vorschlags-IDs, Blocker,
 offene Punkte.

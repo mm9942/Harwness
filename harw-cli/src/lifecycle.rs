@@ -1590,6 +1590,7 @@ mod tests {
         let base: HashSet<&str> = [
             "fs.read",
             "fs.write",
+            "fs.edit",
             "fs.list",
             "fs.search",
             "fs.glob",
@@ -1631,6 +1632,13 @@ mod tests {
             "palace.search",
             "palace.recall",
             "diary.read",
+            // Runde 5, Teil F: Plan-Modus-Werkzeuge der Wurzel (Schritt 12e,
+            // `AllWithModelTools`); ohne TUI-Kanal schlagen sie fail-closed
+            // mit klarer Meldung fehl.
+            "plan.write",
+            "plan.exit",
+            "plan.enter",
+            "ask_user",
         ]
         .into_iter()
         .collect();

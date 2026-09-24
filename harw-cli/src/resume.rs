@@ -357,6 +357,24 @@ pub fn session_matches_project(
     }
 }
 
+/// Runde 5, Teil H: `true` für eine Sitzung ohne jeden Nutzer-Turn.
+///
+/// # Beschreibung
+/// Leer ist eine Sitzung nur, wenn ihr Sidecar **sowohl** keine Runde
+/// (`turns == 0`) **als auch** keine erste Nutzernachricht kennt
+/// (`first_user_message` wird von `meta::load_or_derive` aus dem Transcript
+/// nachgetragen). Ohne Sidecar ist nichts sicher — die Sitzung gilt dann
+/// nicht als leer. Der Picker blendet leere Sitzungen aus
+/// (`ProfileResumeSelector::available_sessions`, `chat.rs`); über `--all`
+/// oder eine explizite ID bleiben sie erreichbar.
+#[must_use]
+pub fn is_empty_session(session: &DiscoveredSession) -> bool {
+    session
+        .meta
+        .as_ref()
+        .is_some_and(|meta| meta.turns == 0 && meta.first_user_message.is_none())
+}
+
 /// Obergrenze für den Transcript-Scan in [`backfill_project_key`]: nur der
 /// Anfang der Datei wird gelesen, damit ein Backfill-Versuch auf einem
 /// riesigen Transcript nicht spürbar Zeit kostet.
@@ -640,6 +658,28 @@ mod tests {
             total_usage: harw_types::TokenUsage::default(),
             drift_events: std::collections::BTreeMap::new(),
         })
+    }
+
+    /// Runde 5, Teil H: leer ist nur, was weder Runden noch eine erste
+    /// Nutzernachricht kennt; ohne Sidecar gilt nichts als leer.
+    #[test]
+    fn empty_session_needs_zero_turns_and_no_first_user_message() -> TestResult {
+        let empty = session_with_meta("empty", 1, fresh_meta("empty")?)?;
+        assert!(is_empty_session(&empty));
+
+        let mut with_turns = fresh_meta("busy")?;
+        with_turns.turns = 19;
+        assert!(!is_empty_session(&session_with_meta(
+            "busy", 2, with_turns
+        )?));
+
+        // Alt-Sitzung ohne Rundenzähler, aber mit Nutzernachricht.
+        let mut legacy = fresh_meta("legacy")?;
+        legacy.first_user_message = Some("analysiere die library".to_owned());
+        assert!(!is_empty_session(&session_with_meta("legacy", 3, legacy)?));
+
+        assert!(!is_empty_session(&session("unknown", 4)?));
+        Ok(())
     }
 
     #[test]

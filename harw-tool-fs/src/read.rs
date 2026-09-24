@@ -17,13 +17,18 @@
 //!   echten Zeilennummern im selben Ausgabeformat. Ein einziger Durchlauf
 //!   mit Ringpuffer ([`std::collections::VecDeque`]) hält nur die letzten
 //!   `tail` Zeilen im Speicher, während bis Dateiende weitergezählt wird.
-//!   `tail` schließt `line`/`limit`/`offset`/`max_bytes` aus.
+//!   `tail` schließt `line` > 1/`offset` > 0/`max_bytes` aus; ein `limit`
+//!   begrenzt die Zeilenzahl zusätzlich.
 //! - **Byte-Modus** (Rückfall, `offset`/`max_bytes` gesetzt): unverändertes
 //!   Verhalten von vor W1-03 — Kürzung statt Ablehnung (siehe unten).
 //!
-//! Werden Parameter mehrerer Modi gemischt (z. B. `line` und `offset`, oder
-//! `tail` und `line`), liefert der Executor `Ok(ToolOutput::error(...))` mit
-//! einer eindeutigen Meldung statt stillschweigend einen Modus zu bevorzugen.
+//! `null` gilt überall als „nicht gesetzt“, ebenso `0` bei
+//! `tail`/`limit`/`max_bytes`. Harmlose Kombinationen werden toleriert
+//! (Standardwerte `line` = 1 bzw. `offset` = 0 neben einem anderen Modus;
+//! `limit` neben `tail` begrenzt die Tail-Zeilen). Echte Widersprüche (z. B.
+//! `line` = 50 und `offset` = 100, oder `tail` und `line` = 50) liefern
+//! `Ok(ToolOutput::error(...))` mit einer Meldung, die die Felder samt Werten
+//! nennt und sagt, welche auf `null` müssen — siehe `resolve_read_mode`.
 //!
 //! # Kürzung statt Ablehnung (W1-02, Byte-Modus)
 //! Dateien über dem Byte-Limit (höchstens 64 KiB) werden gekürzt geliefert.
@@ -115,6 +120,127 @@ struct FsReadArgs {
     tail: Option<u64>,
 }
 
+/// Der aus den Argumenten bestimmte Lesemodus von `fs.read`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadMode {
+    /// Zeilenmodus (Standard): `line`/`limit`.
+    Line,
+    /// Tail-Modus: die letzten `tail` Zeilen.
+    Tail,
+    /// Byte-Modus (Rückfall): `offset`/`max_bytes`.
+    Byte,
+}
+
+/// Bestimmt den Lesemodus und bereinigt die Argumente dafür.
+///
+/// # Beschreibung
+/// Im Strict-Schema sind alle Parameter `required` und nullable; Modelle
+/// senden deshalb oft Werte für Felder, die sie gar nicht meinen (Bugreport
+/// Runde 5: `tail` zusammen mit `line`/`limit`, oder `0` statt `null`).
+/// Regeln, in dieser Reihenfolge:
+/// 1. `null` ist überall „nicht gesetzt“ (erledigt schon die
+///    Deserialisierung); ebenso `0` bei `tail`, `limit` und `max_bytes`,
+///    die mit `0` keinen Sinn ergeben.
+/// 2. Tail-Modus (`tail` gesetzt): `line` = 0/1 und `offset` = 0 sind
+///    harmlose Standardwerte und fallen weg; ein zusätzliches `limit`
+///    begrenzt die Zeilenzahl (`min(tail, limit)`). Ein echtes `line` > 1,
+///    `offset` > 0 oder `max_bytes` widerspricht dem Tail-Modus.
+/// 3. Zeilen- und Byte-Parameter zugleich: `offset` = 0 neben `line`/`limit`
+///    fällt weg (Zeilenmodus), `line` = 0/1 ohne `limit` neben
+///    `offset`/`max_bytes` fällt weg (Byte-Modus). Bleibt danach beides
+///    übrig, ist das ein Widerspruch.
+/// 4. Sonst: `offset`/`max_bytes` gesetzt → Byte-Modus (auch `offset` = 0
+///    allein, wie bisher), andernfalls Zeilenmodus.
+///
+/// # Errors
+/// Eine Meldung für das Modell, die die widersprüchlichen Felder mit ihren
+/// Werten nennt und sagt, welche davon `null` sein müssen.
+fn resolve_read_mode(args: &mut FsReadArgs) -> Result<ReadMode, String> {
+    for field in [&mut args.tail, &mut args.limit, &mut args.max_bytes] {
+        if *field == Some(0) {
+            *field = None;
+        }
+    }
+
+    if let Some(tail) = args.tail {
+        if matches!(args.line, Some(0 | 1)) {
+            args.line = None;
+        }
+        if args.offset == Some(0) {
+            args.offset = None;
+        }
+        let conflicts = set_fields(&[
+            ("line", args.line),
+            ("offset", args.offset),
+            ("max_bytes", args.max_bytes),
+        ]);
+        if !conflicts.is_empty() {
+            let names = field_names(&conflicts);
+            return Err(format!(
+                "fs.read: widersprüchliche Parameter — 'tail'={tail} (letzte Zeilen) passt nicht \
+                 zu {}. Für die letzten {tail} Zeilen {names} auf null setzen; für einen \
+                 anderen Modus stattdessen 'tail' auf null setzen. (null = nicht gesetzt)",
+                conflicts.join(", ")
+            ));
+        }
+        if let Some(limit) = args.limit.take() {
+            args.tail = Some(tail.min(limit));
+        }
+        return Ok(ReadMode::Tail);
+    }
+
+    let line_requested = args.line.is_some() || args.limit.is_some();
+    let byte_requested = args.offset.is_some() || args.max_bytes.is_some();
+    if line_requested && byte_requested {
+        if args.offset == Some(0) {
+            args.offset = None;
+        }
+        if (args.offset.is_some() || args.max_bytes.is_some())
+            && args.limit.is_none()
+            && matches!(args.line, Some(0 | 1))
+        {
+            args.line = None;
+        }
+    }
+
+    let line_fields = set_fields(&[("line", args.line), ("limit", args.limit)]);
+    let byte_fields = set_fields(&[("offset", args.offset), ("max_bytes", args.max_bytes)]);
+    match (line_fields.is_empty(), byte_fields.is_empty()) {
+        (false, false) => Err(format!(
+            "fs.read: widersprüchliche Parameter — Zeilenmodus ({}) und Byte-Modus ({}) \
+             zugleich gesetzt. Für den Zeilenmodus {} auf null setzen; für den Byte-Modus {} \
+             auf null setzen. (null = nicht gesetzt)",
+            line_fields.join(", "),
+            byte_fields.join(", "),
+            field_names(&byte_fields),
+            field_names(&line_fields),
+        )),
+        (true, false) => Ok(ReadMode::Byte),
+        _ => Ok(ReadMode::Line),
+    }
+}
+
+/// Formatiert die gesetzten Felder als `'name'=wert`.
+fn set_fields(fields: &[(&str, Option<u64>)]) -> Vec<String> {
+    fields
+        .iter()
+        .filter_map(|(name, value)| value.map(|value| format!("'{name}'={value}")))
+        .collect()
+}
+
+/// Macht aus `'name'=wert`-Einträgen die reine Namensliste `'a'/'b'`.
+fn field_names(fields: &[String]) -> String {
+    fields
+        .iter()
+        .map(|field| {
+            field
+                .split_once('=')
+                .map_or(field.as_str(), |(name, _)| name)
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Führt `fs.read`-Aufrufe aus.
 ///
 /// # Description
@@ -170,37 +296,24 @@ impl FsReadExecutor {
         }
 
         // Parse arguments
-        let args: FsReadArgs = match serde_json::from_value::<FsReadArgs>(call.arguments.clone()) {
-            Ok(a) => a,
-            Err(err) => {
-                return Err(ToolsError::InvalidArguments {
-                    name: "fs.read".to_owned(),
-                    reason: err.to_string(),
-                });
-            }
+        let mut args: FsReadArgs =
+            match serde_json::from_value::<FsReadArgs>(call.arguments.clone()) {
+                Ok(a) => a,
+                Err(err) => {
+                    return Err(ToolsError::InvalidArguments {
+                        name: "fs.read".to_owned(),
+                        reason: err.to_string(),
+                    });
+                }
+            };
+
+        // Modus bestimmen: `null`, sinnlose Nullen und harmlose Standardwerte
+        // gelten als nicht gesetzt; nur echte Widersprüche werden abgelehnt
+        // (siehe `resolve_read_mode`).
+        let mode = match resolve_read_mode(&mut args) {
+            Ok(mode) => mode,
+            Err(message) => return Ok(ToolOutput::error(message)),
         };
-
-        // Modi schließen sich gegenseitig aus: Byte-Modus (offset/max_bytes),
-        // Zeilenmodus (line/limit), Tail-Modus (tail) und Byte-Modus
-        // (offset/max_bytes) schließen sich gegenseitig aus.
-        let byte_requested = args.offset.is_some() || args.max_bytes.is_some();
-        let line_requested = args.line.is_some() || args.limit.is_some();
-        let tail_requested = args.tail.is_some();
-
-        if tail_requested && (byte_requested || line_requested) {
-            return Ok(ToolOutput::error(
-                "fs.read: 'tail' kann nicht mit 'line'/'limit'/'offset'/'max_bytes' kombiniert werden \
-                 (die drei Lesemodi schließen sich gegenseitig aus)"
-                    .to_owned(),
-            ));
-        }
-        if byte_requested && line_requested {
-            return Ok(ToolOutput::error(
-                "fs.read: 'offset'/'max_bytes' (Byte-Modus) und 'line'/'limit' (Zeilen-Modus) \
-                 können nicht gleichzeitig angegeben werden"
-                    .to_owned(),
-            ));
-        }
 
         let relative = match normalize_relative(&args.path) {
             Ok(rel) => rel,
@@ -234,13 +347,11 @@ impl FsReadExecutor {
             ));
         }
 
-        if tail_requested {
-            return Ok(Self::read_tail_mode(&file, &args));
+        match mode {
+            ReadMode::Tail => Ok(Self::read_tail_mode(&file, &args)),
+            ReadMode::Byte => Ok(self.read_byte_mode(&mut file, &args, metadata.len())),
+            ReadMode::Line => Ok(Self::read_line_mode(&file, &args)),
         }
-        if byte_requested {
-            return Ok(self.read_byte_mode(&mut file, &args, metadata.len()));
-        }
-        Ok(Self::read_line_mode(&file, &args))
     }
 
     // Byte-Modus (Rückfall): unverändertes Verhalten von vor W1-03. Liefert
@@ -1043,15 +1154,16 @@ mod tests {
         let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
         let call = call(
             "fs.read",
-            serde_json::json!({ "path": "mix.txt", "offset": 0, "line": 1 }),
+            serde_json::json!({ "path": "mix.txt", "offset": 5, "line": 3 }),
         );
         match executor.read_file(&ctx, &call)? {
             ToolOutput::Error { message } => {
-                assert!(message.contains("line"), "{message}");
-                assert!(
-                    message.contains("offset") || message.contains("max_bytes"),
-                    "{message}"
-                );
+                // Die Meldung nennt die widersprüchlichen Felder samt Werten
+                // und sagt, welche auf null müssen.
+                assert!(message.contains("'line'=3"), "{message}");
+                assert!(message.contains("'offset'=5"), "{message}");
+                assert!(message.contains("'offset' auf null"), "{message}");
+                assert!(message.contains("'line' auf null"), "{message}");
             }
             other => {
                 return Err(TestError::Unexpected(format!(
@@ -1132,12 +1244,13 @@ mod tests {
         let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
         let call = call(
             "fs.read",
-            serde_json::json!({ "path": "mix2.txt", "tail": 1, "line": 1 }),
+            serde_json::json!({ "path": "mix2.txt", "tail": 1, "line": 2 }),
         );
         match executor.read_file(&ctx, &call)? {
             ToolOutput::Error { message } => {
-                assert!(message.contains("tail"), "{message}");
-                assert!(message.contains("line"), "{message}");
+                assert!(message.contains("'tail'=1"), "{message}");
+                assert!(message.contains("'line'=2"), "{message}");
+                assert!(message.contains("'line' auf null"), "{message}");
             }
             other => {
                 return Err(TestError::Unexpected(format!(
@@ -1149,19 +1262,173 @@ mod tests {
     }
 
     #[test]
-    fn test_fs_read_rejects_tail_combined_with_limit() -> TestResult {
+    fn test_fs_read_tail_with_limit_takes_the_smaller_count() -> TestResult {
+        // Bugreport Runde 5: `tail` zusammen mit `limit` ist kein Widerspruch
+        // mehr — `limit` begrenzt die Tail-Zeilen zusätzlich.
         let fixture = Fixture::new()?;
-        fs::write(fixture.ws.join("mix3.txt"), "a\nb\n")?;
+        fs::write(fixture.ws.join("mix3.txt"), "a\nb\nc\nd\n")?;
         let executor = FsReadExecutor { max_bytes: 65_536 };
         let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
         let call = call(
             "fs.read",
-            serde_json::json!({ "path": "mix3.txt", "tail": 1, "limit": 5 }),
+            serde_json::json!({ "path": "mix3.txt", "tail": 3, "limit": 2 }),
+        );
+        match executor.read_file(&ctx, &call)? {
+            ToolOutput::Text { content } => {
+                assert!(
+                    content.starts_with("mix3.txt — Zeilen 3–4 von 4"),
+                    "{content}"
+                );
+                assert!(!content.contains("2\tb"), "{content}");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected text output, got: {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    // --- Runde 5: Strict-Schema, null und harmlose Kombinationen ----------
+
+    #[test]
+    fn test_fs_read_all_fields_null_is_the_default_line_mode() -> TestResult {
+        // Strict-Schema: alle Felder required, ungenutzte kommen als null.
+        let fixture = Fixture::new()?;
+        fs::write(fixture.ws.join("nulls.txt"), "eins\nzwei\n")?;
+        let executor = FsReadExecutor { max_bytes: 65_536 };
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
+        let call = call(
+            "fs.read",
+            serde_json::json!({
+                "path": "nulls.txt",
+                "max_bytes": null,
+                "offset": null,
+                "line": null,
+                "limit": null,
+                "tail": null,
+            }),
+        );
+        match executor.read_file(&ctx, &call)? {
+            ToolOutput::Text { content } => {
+                assert!(
+                    content.starts_with("nulls.txt — Zeilen 1–2 von 2"),
+                    "{content}"
+                );
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected text output, got: {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_fs_read_line_mode_tolerates_zeros_for_unused_fields() -> TestResult {
+        // Der Aufruf aus dem Bugreport: line + limit, die übrigen Felder
+        // mit 0 statt null.
+        let fixture = Fixture::new()?;
+        let content: String = (1..=5).map(|i| format!("z{i}\n")).collect();
+        fs::write(fixture.ws.join("zeros.txt"), content)?;
+        let executor = FsReadExecutor { max_bytes: 65_536 };
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
+        let call = call(
+            "fs.read",
+            serde_json::json!({
+                "path": "zeros.txt",
+                "line": 1,
+                "limit": 2,
+                "offset": 0,
+                "max_bytes": 0,
+                "tail": 0,
+            }),
+        );
+        match executor.read_file(&ctx, &call)? {
+            ToolOutput::Text { content } => {
+                assert!(
+                    content.starts_with("zeros.txt — Zeilen 1–2 von 5"),
+                    "{content}"
+                );
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected text output, got: {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_fs_read_tail_tolerates_default_line_and_offset() -> TestResult {
+        let fixture = Fixture::new()?;
+        let content: String = (1..=10).map(|i| format!("t{i}\n")).collect();
+        fs::write(fixture.ws.join("tail.txt"), content)?;
+        let executor = FsReadExecutor { max_bytes: 65_536 };
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
+        let call = call(
+            "fs.read",
+            serde_json::json!({ "path": "tail.txt", "tail": 2, "line": 1, "offset": 0 }),
+        );
+        match executor.read_file(&ctx, &call)? {
+            ToolOutput::Text { content } => {
+                assert!(
+                    content.starts_with("tail.txt — Zeilen 9–10 von 10"),
+                    "{content}"
+                );
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected text output, got: {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_fs_read_default_line_next_to_offset_uses_byte_mode() -> TestResult {
+        let fixture = Fixture::new()?;
+        fs::write(fixture.ws.join("bytes.txt"), "0123456789")?;
+        let executor = FsReadExecutor { max_bytes: 65_536 };
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
+        let call = call(
+            "fs.read",
+            serde_json::json!({ "path": "bytes.txt", "offset": 4, "line": 1 }),
+        );
+        match executor.read_file(&ctx, &call)? {
+            ToolOutput::Text { content } => assert!(content.starts_with("456789"), "{content}"),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "expected text output, got: {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_fs_read_rejects_tail_with_offset_and_names_the_fields() -> TestResult {
+        let fixture = Fixture::new()?;
+        fs::write(fixture.ws.join("mix4.txt"), "a\nb\n")?;
+        let executor = FsReadExecutor { max_bytes: 65_536 };
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace])?;
+        let call = call(
+            "fs.read",
+            serde_json::json!({ "path": "mix4.txt", "tail": 5, "offset": 10, "max_bytes": 100 }),
         );
         match executor.read_file(&ctx, &call)? {
             ToolOutput::Error { message } => {
-                assert!(message.contains("tail"), "{message}");
-                assert!(message.contains("limit"), "{message}");
+                assert!(message.contains("'offset'=10"), "{message}");
+                assert!(message.contains("'max_bytes'=100"), "{message}");
+                assert!(
+                    message.contains("'offset'/'max_bytes' auf null"),
+                    "{message}"
+                );
+                assert!(message.contains("'tail' auf null"), "{message}");
             }
             other => {
                 return Err(TestError::Unexpected(format!(

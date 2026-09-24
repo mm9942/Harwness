@@ -29,6 +29,9 @@ harw-plan = { path = "../harw-plan" }
 harw-protocol = { path = "../harw-protocol" }
 harw-sandbox = { path = "../harw-sandbox" }
 harw-tool-shell = { path = "../harw-tool-shell" }
+# Runde 5, Teil F: Plan-Fragekanal (`plan.exit`/`plan.enter`/`ask_user`) und
+# geteilter Plan-Zustand (`/plan show|edit|list|open`, Shift+Tab-Sperre).
+harw-tool-plan = { path = "../harw-tool-plan" }
 harw-tools = { path = "../harw-tools" }
 harw-session-store = { path = "../harw-session-store" }
 harw-types = { path = "../harw-types" }
@@ -51,6 +54,9 @@ harw-runtime = { path = "../harw-runtime" }
 jiff = { workspace = true }
 # Uhrzeit und Datum für die einmalige, kontextbezogene TUI-Begrüßung.
 time = { version = "0.3.53", features = ["formatting"] }
+# Runde 5, Teil B: genullter Passwortpuffer des sudo-Fensters (`src/sudo_dialog.rs`);
+# dieselbe Fassung wie im übrigen Baum (Cargo.lock: zeroize 1.8).
+zeroize = "1"
 
 [dev-dependencies]
 harw-tools = { path = "../harw-tools" }

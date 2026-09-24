@@ -57,11 +57,16 @@ pub enum InternalModelPoint {
     /// Unter-Orchestrator (von einem Orchestrator gestarteter Orchestrator).
     /// Ohne explizite Wahl gilt das Hauptmodell — kein OpenRouter-Standard.
     SubOrchestrator,
+    /// Runde 5, Teil E: Klassifizierer des Auto-Modus (Rolle
+    /// `auto-classifier`). Ohne explizite Wahl kein OpenRouter-Standard,
+    /// sondern das schnelle Modell des aktiven Providers
+    /// ([`fast_model_for_active_provider`]).
+    AutoClassifier,
 }
 
 impl InternalModelPoint {
     /// Alle Stellen in stabiler Reihenfolge (u. a. für Iteration/Merge).
-    pub const ALL: [InternalModelPoint; 10] = [
+    pub const ALL: [InternalModelPoint; 11] = [
         InternalModelPoint::SessionTitle,
         InternalModelPoint::CompactionSummary,
         InternalModelPoint::MemoryConsolidation,
@@ -72,6 +77,7 @@ impl InternalModelPoint {
         InternalModelPoint::WorkerComplex,
         InternalModelPoint::RootOrchestrator,
         InternalModelPoint::SubOrchestrator,
+        InternalModelPoint::AutoClassifier,
     ];
 
     /// TOML-/Config-Schlüssel dieser Stelle, z. B. `"session_title"`.
@@ -88,6 +94,7 @@ impl InternalModelPoint {
             Self::WorkerComplex => "worker_complex",
             Self::RootOrchestrator => "root_orchestrator",
             Self::SubOrchestrator => "sub_orchestrator",
+            Self::AutoClassifier => "auto_classifier",
         }
     }
 
@@ -122,6 +129,9 @@ impl InternalModelPoint {
             Self::WorkerComplex => "Worker-Kind mit komplexer Aufgabe (auch wenn klein).",
             Self::RootOrchestrator => "Wurzel-Orchestrator, der die Arbeit plant und verteilt.",
             Self::SubOrchestrator => "Unter-Orchestrator, der Teilaufgaben weiter verteilt.",
+            Self::AutoClassifier => {
+                "Beurteilt im Auto-Modus Werkzeugaufrufe (erlauben, fragen, ablehnen)."
+            }
         }
     }
 
@@ -132,7 +142,10 @@ impl InternalModelPoint {
     /// explizite Wahl immer das Hauptmodell.
     #[must_use]
     pub fn uses_openrouter_default(self) -> bool {
-        !matches!(self, Self::RootOrchestrator | Self::SubOrchestrator)
+        !matches!(
+            self,
+            Self::RootOrchestrator | Self::SubOrchestrator | Self::AutoClassifier
+        )
     }
 
     /// NVIDIA-Nemotron-Standardmodell dieser Stelle über OpenRouter.
@@ -156,7 +169,8 @@ impl InternalModelPoint {
             | Self::CompactionSummary
             | Self::MemoryConsolidation
             | Self::DreamReflection
-            | Self::WorkerSimple => "nvidia/nemotron-3.5-lightning",
+            | Self::WorkerSimple
+            | Self::AutoClassifier => "nvidia/nemotron-3.5-lightning",
         }
     }
 }
@@ -210,6 +224,9 @@ pub struct InternalModelsToml {
     pub root_orchestrator: Option<InternalModelChoice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub_orchestrator: Option<InternalModelChoice>,
+    /// Runde 5, Teil E: `[internal_models.auto_classifier]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_classifier: Option<InternalModelChoice>,
 }
 
 impl Default for InternalModelsToml {
@@ -226,6 +243,7 @@ impl Default for InternalModelsToml {
             worker_complex: None,
             root_orchestrator: None,
             sub_orchestrator: None,
+            auto_classifier: None,
         }
     }
 }
@@ -245,6 +263,7 @@ impl InternalModelsToml {
             InternalModelPoint::WorkerComplex => self.worker_complex.as_ref(),
             InternalModelPoint::RootOrchestrator => self.root_orchestrator.as_ref(),
             InternalModelPoint::SubOrchestrator => self.sub_orchestrator.as_ref(),
+            InternalModelPoint::AutoClassifier => self.auto_classifier.as_ref(),
         }
     }
 
@@ -261,6 +280,7 @@ impl InternalModelsToml {
             InternalModelPoint::WorkerComplex => self.worker_complex = choice,
             InternalModelPoint::RootOrchestrator => self.root_orchestrator = choice,
             InternalModelPoint::SubOrchestrator => self.sub_orchestrator = choice,
+            InternalModelPoint::AutoClassifier => self.auto_classifier = choice,
         }
     }
 }
@@ -375,6 +395,96 @@ pub fn resolve_internal_model(
         model: None,
         source: InternalModelSource::MainModel,
     }
+}
+
+/// Runde 5, Teil E: schnelles Modell für Anthropic-Provider (Klassifizierer
+/// des Auto-Modus ohne explizite Wahl).
+pub const ANTHROPIC_FAST_MODEL: &str = "claude-haiku-4-5";
+
+/// Namensbestandteile, die ein Modell als klein/schnell ausweisen, in
+/// absteigender Bevorzugung.
+const FAST_MODEL_HINTS: &[&str] = &[
+    "haiku",
+    "nano",
+    "mini",
+    "flash-lite",
+    "lite",
+    "flash",
+    "small",
+    "instant",
+    "8b",
+];
+
+/// Runde 5, Teil E: das schnelle Standardmodell des aktiven Providers.
+///
+/// # Beschreibung
+/// Vorgabe für [`InternalModelPoint::AutoClassifier`], wenn keine explizite
+/// Wahl vorliegt. Der aktive Provider ist `default_provider`, sonst der
+/// Provider des `default_model`-Eintrags in `[models]`.
+/// - Provider mit `api = "anthropic-messages"` (oder Name `anthropic`) →
+///   [`ANTHROPIC_FAST_MODEL`].
+/// - Sonst das erste bekannte Modell dieses Providers (aus `[models]` und
+///   der Modellliste des Providers), dessen Id einen der Hinweise aus
+///   `FAST_MODEL_HINTS` trägt (in deren Reihenfolge), sonst das mit dem
+///   kleinsten bekannten `max_tokens`/`context_window`.
+///
+/// # Arguments
+/// - `config` (`&crate::ResolvedConfig`): die aufgelöste Konfiguration.
+///
+/// # Returns
+/// `Some((provider, model))`, oder `None`, wenn kein Provider/Modell
+/// bestimmbar ist — der Aufrufer nutzt dann das Hauptmodell.
+#[must_use]
+pub fn fast_model_for_active_provider(
+    config: &crate::ResolvedConfig,
+) -> Option<(Option<String>, String)> {
+    let default_model = config.harness.default_model.clone();
+    let provider_name = config
+        .harness
+        .default_provider
+        .clone()
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            default_model
+                .as_deref()
+                .and_then(|model| config.models.get(model))
+                .map(|entry| entry.provider.clone())
+        })?;
+    let provider = config.providers.get(&provider_name);
+    let is_anthropic = provider_name.eq_ignore_ascii_case("anthropic")
+        || provider.is_some_and(|entry| entry.api.starts_with("anthropic"));
+    if is_anthropic {
+        return Some((Some(provider_name), ANTHROPIC_FAST_MODEL.to_owned()));
+    }
+
+    let mut candidates: Vec<(String, Option<u64>)> = config
+        .models
+        .values()
+        .filter(|entry| entry.provider == provider_name)
+        .map(|entry| (entry.id.clone(), entry.max_tokens.or(entry.context_window)))
+        .collect();
+    if let Some(entry) = provider {
+        for id in &entry.models {
+            if !candidates.iter().any(|(known, _)| known == id) {
+                candidates.push((id.clone(), None));
+            }
+        }
+    }
+    candidates.sort();
+
+    for hint in FAST_MODEL_HINTS {
+        if let Some((id, _)) = candidates
+            .iter()
+            .find(|(id, _)| id.to_ascii_lowercase().contains(hint))
+        {
+            return Some((Some(provider_name), id.clone()));
+        }
+    }
+    candidates
+        .iter()
+        .filter_map(|(id, size)| size.map(|size| (size, id)))
+        .min()
+        .map(|(_, id)| (Some(provider_name), id.clone()))
 }
 
 #[cfg(test)]
@@ -563,7 +673,8 @@ mod tests {
 
     #[test]
     fn test_all_points_have_unique_keys_and_roundtrip() {
-        assert_eq!(InternalModelPoint::ALL.len(), 10);
+        // Runde 5, Teil E: +1 für `auto_classifier`.
+        assert_eq!(InternalModelPoint::ALL.len(), 11);
         for point in InternalModelPoint::ALL {
             assert_eq!(InternalModelPoint::parse(point.key()), Some(point));
             let mut toml = InternalModelsToml::default();
@@ -595,6 +706,59 @@ mod tests {
             Some(InternalModelPoint::DreamReflection)
         );
         assert_eq!(InternalModelPoint::parse("unknown-point"), None);
+    }
+
+    /// Runde 5, Teil E: der Klassifizierer fällt nie auf den
+    /// OpenRouter-Standard, sondern auf das schnelle Modell des aktiven
+    /// Providers.
+    #[test]
+    fn test_auto_classifier_never_uses_openrouter_default() -> TestResult {
+        let config = config_with_openrouter(true, true)?;
+        let resolved = resolve_internal_model(&config, InternalModelPoint::AutoClassifier);
+        assert_eq!(resolved.source, InternalModelSource::MainModel);
+        assert_eq!(
+            InternalModelPoint::parse("auto-classifier"),
+            Some(InternalModelPoint::AutoClassifier)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fast_model_for_anthropic_is_haiku() {
+        let mut config = ResolvedConfig::default();
+        config.harness.default_provider = Some("anthropic".to_owned());
+        assert_eq!(
+            fast_model_for_active_provider(&config),
+            Some((
+                Some("anthropic".to_owned()),
+                ANTHROPIC_FAST_MODEL.to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_fast_model_prefers_small_model_names_of_the_active_provider() -> TestResult {
+        let mut config = config_with_openrouter(true, true)?;
+        config.harness.default_provider = Some(OPENROUTER_PROVIDER.to_owned());
+        if let Some(provider) = config.providers.get_mut(OPENROUTER_PROVIDER) {
+            provider.models = vec!["vendor/big-model".to_owned(), "vendor/gpt-mini".to_owned()];
+        }
+        assert_eq!(
+            fast_model_for_active_provider(&config),
+            Some((
+                Some(OPENROUTER_PROVIDER.to_owned()),
+                "vendor/gpt-mini".to_owned()
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fast_model_without_active_provider_is_none() {
+        assert_eq!(
+            fast_model_for_active_provider(&ResolvedConfig::default()),
+            None
+        );
     }
 
     #[test]

@@ -64,9 +64,18 @@ admitted = [
   "fs.glob",
   "fs.grep",
   "doc.read_pdf",
+  # Runde 5, Teil B: Root-Befehle mit exaktem argv, jeder einzeln im
+  # TUI-Fenster freigegeben (nur in der TUI registriert, sonst fehlt das
+  # Werkzeug; steht in ALWAYS_ASK_TOOLS).
+  "host.sudo_exec",
+  # Runde 5, Teil M: Zwischenstand (info) oder Frage (question) an den direkten
+  # Elternteil; nur Text, keine Rechte (siehe
+  # `harw_registry_defaults::profile::parent_message_tools_for_role`).
+  "parent.message",
 ]
 forbidden = [
   "fs.write",
+  "fs.edit",
   "web.fetch",
   "web.docs_rs",
   "web.crates_io",

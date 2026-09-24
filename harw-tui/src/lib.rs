@@ -10,10 +10,16 @@
 
 pub(crate) mod agent_monitor;
 pub(crate) mod agent_tree;
+// Runde 5, Teil I: Live-Werte der Agentenbaum-Ansicht `/agent`.
+pub(crate) mod agent_tree_live;
 pub mod app;
 pub mod approval;
 pub mod approval_dialog;
+// Runde 5, Teil F: Auswahlfenster für `ask_user`.
+pub(crate) mod ask_user_dialog;
 pub(crate) mod chat_scroll;
+// Runde 5, Teil I: Live-Stream der Kind-Agenten im Verlauf.
+pub(crate) mod child_stream;
 pub(crate) mod choice_dialog;
 pub mod clipboard;
 mod command;
@@ -48,17 +54,27 @@ pub(crate) mod model_roles_view;
 pub(crate) mod model_switch_picker;
 pub(crate) mod overlay_view;
 pub(crate) mod panes;
+// Runde 5, Teil E: Auto-Modus-Vermerke und Lern-Angebot (`pub`, weil
+// `approval_dialog::ApprovalChoice` die Typen trägt).
+pub mod permissions_view;
+// Runde 5, Teil F: Plan-Freigabe (`plan.exit`), Plan-Vorschlag (`plan.enter`), `/plan …`.
+pub(crate) mod plan_dialog;
+// Runde 5, Teil P: Goal-Marke der Statuszeile und Goal-/Schritt-Verlaufszeilen.
+pub(crate) mod goal_marker;
 mod registry;
 pub mod relative_time;
 pub(crate) mod runtime_commands;
 pub(crate) mod runtime_root;
 pub(crate) mod sanitize;
 pub mod session_controller;
+// Runde 5, Teil H: leere Sitzungen nicht persistieren, Sidecars aufräumen.
+pub(crate) mod session_lifecycle;
 pub mod session_picker;
 pub mod setup;
 pub(crate) mod spinner;
 pub(crate) mod status_line;
 pub(crate) mod style;
+pub(crate) mod sudo_dialog;
 pub mod tools_command;
 pub(crate) mod tui_event;
 pub(crate) mod workbench_pane;

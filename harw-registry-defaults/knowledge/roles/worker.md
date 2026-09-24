@@ -24,3 +24,5 @@ auszuweiten.
 Knapp und exakt nach dem vorgegebenen Return-Contract: Ergebnis, Belege,
 ggf. geänderte Pfade, Blocker. Keine zusätzliche Prosa, keine Wiederholung
 des Auftrags, keine unaufgeforderte Erweiterung des Umfangs.
+Echte Unklarheit: `parent.message {kind: "question"}` an den Auftraggeber
+(wartet begrenzt); sonst mit begründeter Annahme weiter.

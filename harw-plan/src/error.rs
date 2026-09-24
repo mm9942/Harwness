@@ -157,16 +157,40 @@ pub enum PlanError {
     )]
     InvalidId { field: &'static str, value: String },
 
-    /// `Create` wurde auf einem Store aufgerufen, der bereits einen Plan hält.
+    /// `Create` mit einer Plan-ID, die im Store bereits vergeben ist.
     ///
     /// # Auslöser
-    /// Zweiter `Create`-Aufruf gegen denselben Store, ohne dass zuvor
-    /// invalidiert/neu erstellt wurde.
+    /// `Create` für eine ID, unter der schon ein Plan liegt (aktiv, inaktiv
+    /// oder archiviert). Seit Runde 5, Teil P hält ein Store mehrere Pläne;
+    /// ein `Create` mit **neuer** ID ist immer erlaubt und macht den neuen
+    /// Plan aktiv. Nur die doppelte ID wird abgelehnt — mit dem Hinweis auf
+    /// `switch`, denn meist ist genau das gemeint.
     ///
     /// # Arguments
-    /// - `id` (`PlanId`): ID des bereits vorhandenen Plans.
-    #[msg("Plan '{id}' existiert bereits: Create ist nur für einen leeren Store erlaubt")]
+    /// - `id` (`PlanId`): die bereits vergebene ID.
+    #[msg(
+        "Plan '{id}' existiert bereits; wechsle mit `plan switch {id}` zu ihm oder wähle eine andere id"
+    )]
     PlanExists { id: PlanId },
+
+    /// Ein per ID angesprochener Plan liegt nicht im Store (Runde 5, Teil P).
+    ///
+    /// # Auslöser
+    /// `switch`, `archive` oder `inspect <id>` mit einer unbekannten ID.
+    ///
+    /// # Arguments
+    /// - `id` (`PlanId`): die unbekannte ID.
+    #[msg("Plan '{id}' ist im Store nicht vorhanden; `plan plans` listet alle Pläne")]
+    PlanUnknown { id: PlanId },
+
+    /// Der Store verwaltet nur einen Plan und kann die Katalog-Operation
+    /// nicht ausführen (Runde 5, Teil P; nur Test-/Fremd-Stores, die die
+    /// Standardmethoden von `PlanStore` nicht überschreiben).
+    ///
+    /// # Arguments
+    /// - `operation` (`&'static str`): Name der Katalog-Operation.
+    #[msg("Dieser Plan-Store verwaltet nur einen Plan; '{operation}' wird nicht unterstützt")]
+    CatalogUnsupported { operation: &'static str },
 
     /// Ein Knoten soll gestartet werden, obwohl eine Abhängigkeit noch nicht
     /// abgeschlossen ist.
@@ -580,7 +604,22 @@ mod tests {
         let err = PlanError::PlanExists {
             id: PlanId::new("p-1"),
         };
-        assert!(err.to_string().contains("p-1"));
+        let msg = err.to_string();
+        assert!(msg.contains("p-1"));
+        // Runde 5, Teil P: kein „nur für einen leeren Store" mehr, sondern
+        // der Hinweis auf `switch`.
+        assert!(msg.contains("plan switch p-1"), "msg={msg}");
+        assert!(!msg.contains("leeren Store"), "msg={msg}");
+    }
+
+    #[test]
+    fn test_plan_unknown_display_points_at_the_listing() {
+        let err = PlanError::PlanUnknown {
+            id: PlanId::new("p-weg"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("p-weg"), "msg={msg}");
+        assert!(msg.contains("plan plans"), "msg={msg}");
     }
 
     #[test]

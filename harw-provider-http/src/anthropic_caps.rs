@@ -16,7 +16,7 @@
 //! Reasoning-Felder und klemmt `max_tokens` nicht (fail closed — ein
 //! falsches `thinking`-Feld erzeugt HTTP 400).
 //!
-//! ## Quellen (Stand 2026-09-13, offizielle Anthropic-Doku)
+//! ## Quellen (Stand 2026-09-24, offizielle Anthropic-Doku)
 //! - Modelle, IDs, Aliase, Max-Output:
 //!   <https://platform.claude.com/docs/en/about-claude/models/overview>
 //! - Effort-Modelle und `xhigh`/`max`-Verfügbarkeit:
@@ -25,6 +25,13 @@
 //!   <https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting>
 //! - 128k-Ausgabe für alle 1M-Kontext-Modelle:
 //!   <https://platform.claude.com/docs/en/build-with-claude/context-windows>
+//! - 64k-Ausgabe für Opus 4.5 und Sonnet 4.5: Modellseiten
+//!   `…/docs/en/models/opus-4-5/overview`, `…/docs/en/models/sonnet-4-5/overview`
+//! - Extended thinking (`enabled` + `budget_tokens`) ist auf Opus 4.6 und
+//!   Sonnet 4.6 veraltet und auf allen späteren Modellen nicht mehr
+//!   akzeptiert; Opus 5.5 und Fable/Mythos 5.1 denken immer adaptiv
+//!   (`thinking: {"type": "disabled"}` → HTTP 400). Der Harness sendet weder
+//!   `budget_tokens` noch `disabled`.
 //!
 //! ## Nebenläufigkeit
 //! Reine `'static`-Daten und reine Funktionen; `Send + Sync`, lock-frei.
@@ -38,7 +45,8 @@ use harw_types::ReasoningEffort;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThinkingSupport {
     /// `thinking: {"type": "adaptive"}` wird akzeptiert (Claude 4.6 und neuer,
-    /// Mythos Preview).
+    /// Mythos Preview). Ab Opus 4.7 ist das der einzige Thinking-Modus; bei
+    /// Opus 5.5 und Fable/Mythos 5.1 ist er immer an.
     Adaptive,
     /// Nur Legacy-`{"type": "enabled", "budget_tokens": N}`; `adaptive`
     /// liefert HTTP 400 („adaptive thinking is not supported on this model“).
@@ -69,6 +77,8 @@ pub(crate) struct AnthropicModelCaps {
 
 // 128k Ausgabe-Tokens: context-windows-Seite, gilt für alle 1M-Kontext-Modelle.
 const OUT_128K: Option<u32> = Some(128_000);
+// 64k Ausgabe-Tokens: Haiku 4.5, Opus 4.5, Sonnet 4.5 (models/overview, Modellseiten).
+const OUT_64K: Option<u32> = Some(64_000);
 
 // Die Tabelle. Jede Zeile ist gegen die im Modulkopf genannten Seiten geprüft.
 const MODELS: &[AnthropicModelCaps] = &[
@@ -114,6 +124,15 @@ const MODELS: &[AnthropicModelCaps] = &[
         thinking: ThinkingSupport::Adaptive,
         effort: true,
         xhigh: false,
+        max: true,
+        max_output_tokens: OUT_128K,
+    },
+    AnthropicModelCaps {
+        id: "claude-opus-5-5",
+        aliases: &[],
+        thinking: ThinkingSupport::Adaptive,
+        effort: true,
+        xhigh: true,
         max: true,
         max_output_tokens: OUT_128K,
     },
@@ -178,7 +197,7 @@ const MODELS: &[AnthropicModelCaps] = &[
         effort: true,
         xhigh: false,
         max: false,
-        max_output_tokens: None,
+        max_output_tokens: OUT_64K,
     },
     AnthropicModelCaps {
         id: "claude-sonnet-4-5-20250929",
@@ -187,7 +206,7 @@ const MODELS: &[AnthropicModelCaps] = &[
         effort: false,
         xhigh: false,
         max: false,
-        max_output_tokens: None,
+        max_output_tokens: OUT_64K,
     },
     AnthropicModelCaps {
         id: "claude-haiku-4-5-20251001",
@@ -196,7 +215,7 @@ const MODELS: &[AnthropicModelCaps] = &[
         effort: false,
         xhigh: false,
         max: false,
-        max_output_tokens: Some(64_000),
+        max_output_tokens: OUT_64K,
     },
 ];
 
@@ -272,6 +291,7 @@ mod tests {
     fn test_lookup_finds_current_models_and_aliases() {
         for id in [
             "claude-fable-5-1",
+            "claude-opus-5-5",
             "claude-opus-5",
             "claude-sonnet-5",
             "claude-haiku-4-5-20251001",
@@ -301,6 +321,7 @@ mod tests {
             "claude-fable-5",
             "claude-mythos-5",
             "claude-mythos-preview",
+            "claude-opus-5-5",
             "claude-opus-5",
             "claude-opus-4-8",
             "claude-opus-4-7",
@@ -369,7 +390,34 @@ mod tests {
     }
 
     #[test]
+    fn test_opus_5_5_and_fable_5_1_are_adaptive_with_all_effort_levels() -> TestResult {
+        for id in ["claude-opus-5-5", "claude-fable-5-1"] {
+            let caps = lookup(id).ok_or(TestError::Missing("current flagship row"))?;
+            assert_eq!(caps.thinking, ThinkingSupport::Adaptive, "{id}");
+            assert!(caps.effort && caps.xhigh && caps.max, "{id}");
+            assert_eq!(caps.max_output_tokens, Some(128_000), "{id}");
+            assert_eq!(
+                effort_wire_value(caps, ReasoningEffort::Medium),
+                Some("medium")
+            );
+            assert_eq!(
+                effort_wire_value(caps, ReasoningEffort::Xhigh),
+                Some("xhigh")
+            );
+            assert_eq!(effort_wire_value(caps, ReasoningEffort::Max), Some("max"));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_clamp_max_tokens_respects_model_limits() {
+        assert_eq!(clamp_max_tokens("claude-opus-5-5", 500_000), 128_000);
+        assert_eq!(clamp_max_tokens("claude-fable-5-1", 500_000), 128_000);
+        assert_eq!(clamp_max_tokens("claude-opus-4-5", 500_000), 64_000);
+        assert_eq!(
+            clamp_max_tokens("claude-sonnet-4-5-20250929", 500_000),
+            64_000
+        );
         assert_eq!(clamp_max_tokens("claude-opus-5", 500_000), 128_000);
         assert_eq!(clamp_max_tokens("claude-haiku-4-5", 100_000), 64_000);
         assert_eq!(clamp_max_tokens("claude-opus-5", 4096), 4096);

@@ -390,6 +390,11 @@ pub struct RuntimeServices {
     knowledge: Option<Arc<KnowledgeStore>>,
     agent_events: Option<Arc<AgentEventHub>>,
     dream_launcher: Option<Arc<dyn harw_ops::dream_run::DreamLauncher>>,
+    /// Runde 5, Teil E: Protokoll des Auto-Modus für `/permissions log`.
+    auto_decision_log: Option<harw_extension_api::auto_mode::AutoDecisionLog>,
+    /// Runde 5, Teil P: Bestätigungskanal der `plan`-Operation zum
+    /// Freigabefenster der TUI (nur TUI-Montage).
+    plan_confirm: Option<harw_tool_plan::PlanConfirmChannel>,
 }
 
 /// Legt `service` in `map` ab und merkt sich seinen Typnamen in `names`.
@@ -431,7 +436,30 @@ impl RuntimeServices {
             knowledge: None,
             agent_events: None,
             dream_launcher: None,
+            auto_decision_log: None,
+            plan_confirm: None,
         }
+    }
+
+    /// Runde 5, Teil P: legt den Bestätigungskanal der `plan`-Operation auf
+    /// jede Fläche (`ctx.service::<PlanConfirmChannel>()`). Die Montage ruft
+    /// das nur für `EntryKind::Tui`; ohne Kanal legt die Operation Pläne der
+    /// Modell-Fläche als Vorschlag an und fragt nicht.
+    #[must_use]
+    pub fn with_plan_confirm(mut self, channel: harw_tool_plan::PlanConfirmChannel) -> Self {
+        self.plan_confirm = Some(channel);
+        self
+    }
+
+    /// Runde 5, Teil E: legt das Auto-Modus-Protokoll auf jede Fläche
+    /// (`/permissions log` liest es über `ctx.service::<AutoDecisionLog>()`).
+    #[must_use]
+    pub fn with_auto_decision_log(
+        mut self,
+        log: harw_extension_api::auto_mode::AutoDecisionLog,
+    ) -> Self {
+        self.auto_decision_log = Some(log);
+        self
     }
 
     /// Bindet den Traum-Starter für `/dream run` (Plan D5).
@@ -743,6 +771,14 @@ impl RuntimeServices {
         }
         if let Some(host_permit_handles) = &self.parts.host_permit_handles {
             insert_service(&mut map, &mut names, Arc::clone(host_permit_handles));
+        }
+        // Runde 5, Teil P.
+        if let Some(channel) = &self.plan_confirm {
+            insert_service(&mut map, &mut names, channel.clone());
+        }
+        // Runde 5, Teil E.
+        if let Some(log) = &self.auto_decision_log {
+            insert_service(&mut map, &mut names, log.clone());
         }
         // Die vier deklarierten Differenzen — und nur sie.
         if let Some(spawner) = self
@@ -1708,5 +1744,64 @@ mod tests {
     fn test_memory_none_without_memory() {
         assert!(RuntimeServices::new(minimal_parts()).memory().is_none());
         assert!(RuntimeServices::new(full_parts()).memory().is_some());
+    }
+
+    /// Runde 5, Teil E: `/permissions log` findet das Auto-Modus-Protokoll
+    /// auf jeder Fläche, sobald es gebunden ist — und nur dann.
+    #[test]
+    fn auto_decision_log_is_on_every_surface_once_bound() {
+        use harw_extension_api::auto_mode::AutoDecisionLog;
+
+        let unbound = RuntimeServices::new(full_parts());
+        for surface in ServiceSurface::ALL {
+            assert!(
+                unbound
+                    .service_map(surface)
+                    .get::<AutoDecisionLog>()
+                    .is_none()
+            );
+        }
+        let bound =
+            RuntimeServices::new(full_parts()).with_auto_decision_log(AutoDecisionLog::new());
+        for surface in ServiceSurface::ALL {
+            assert!(
+                bound
+                    .service_map(surface)
+                    .get::<AutoDecisionLog>()
+                    .is_some(),
+                "{} braucht das Auto-Modus-Protokoll",
+                surface.as_str()
+            );
+        }
+    }
+
+    /// Runde 5, Teil P: die `plan`-Operation findet den Bestätigungskanal
+    /// nur, wenn die (TUI-)Montage ihn gebunden hat.
+    #[test]
+    fn plan_confirm_channel_is_only_present_once_bound() {
+        use harw_tool_plan::PlanConfirmChannel;
+
+        let unbound = RuntimeServices::new(full_parts());
+        for surface in ServiceSurface::ALL {
+            assert!(
+                unbound
+                    .service_map(surface)
+                    .get::<PlanConfirmChannel>()
+                    .is_none()
+            );
+        }
+        let (sender, _receiver) = harw_tool_plan::plan_ui_channel();
+        let bound =
+            RuntimeServices::new(full_parts()).with_plan_confirm(PlanConfirmChannel::new(sender));
+        for surface in ServiceSurface::ALL {
+            assert!(
+                bound
+                    .service_map(surface)
+                    .get::<PlanConfirmChannel>()
+                    .is_some(),
+                "{} braucht den Bestätigungskanal",
+                surface.as_str()
+            );
+        }
     }
 }

@@ -352,6 +352,10 @@ impl OverlayView for ModePicker {
             }
             KeyCode::Enter => match self.section {
                 ModeSection::Mode => match self.cursor_mode() {
+                    // Runde 5, Teil F: `plan` läuft wie Shift+Tab über die
+                    // Stufe `plan` (`/plan`): sofortige Sperre, Freigabe
+                    // `ask`, Rückkehr zum vorherigen Modus beim Verlassen.
+                    Some(InteractionMode::Plan) => OverlayOutcome::RunAndClose("/plan".to_owned()),
                     Some(mode) => OverlayOutcome::RunAndClose(format!("/mode {}", mode.as_str())),
                     None => OverlayOutcome::Stay,
                 },
@@ -427,10 +431,25 @@ mod tests {
     fn test_cursor_moves_and_enter_selects_next_mode() {
         let mut picker = picker();
         picker.on_key(key(KeyCode::Char('j')));
-        let expected = InteractionMode::ALL[1].as_str();
+        picker.on_key(key(KeyCode::Char('j')));
+        let expected = InteractionMode::ALL[2].as_str();
         assert_eq!(
             picker.on_key(key(KeyCode::Enter)),
             OverlayOutcome::RunAndClose(format!("/mode {expected}"))
+        );
+    }
+
+    /// Runde 5, Teil F: `plan` im Picker schaltet über `/plan` die Stufe
+    /// `plan` (sofortige Sperre) statt über das an der Turn-Grenze
+    /// gestaffelte `/mode plan`.
+    #[test]
+    fn test_picking_plan_runs_the_plan_stage_command() {
+        let mut picker = picker();
+        picker.on_key(key(KeyCode::Char('j')));
+        assert_eq!(InteractionMode::ALL[1], InteractionMode::Plan);
+        assert_eq!(
+            picker.on_key(key(KeyCode::Enter)),
+            OverlayOutcome::RunAndClose("/plan".to_owned())
         );
     }
 

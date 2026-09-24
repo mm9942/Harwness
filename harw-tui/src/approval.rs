@@ -842,7 +842,38 @@ impl ChildTurnDriver for ManagedAgentSpawner {
         store: &'a dyn StateStore,
     ) -> ChildDriveFuture<'a> {
         Box::pin(async move {
-            let run = self.run_child(child, store, TurnInput::default()).await?;
+            // Runde 5, Teil M: ein nicht reguläres Ende (Lease, Abbruch,
+            // Provider-Fehler …) liefert statt eines nackten Fehlers den
+            // Endbericht mit Journal und ggf. Übergabe.
+            let run = match self.run_child(child, store, TurnInput::default()).await {
+                Ok(run) => run,
+                Err(error) => {
+                    return match self.child_end_report(child) {
+                        Some(report) => {
+                            tracing::warn!(
+                                child = %child,
+                                status = report.status.as_str(),
+                                "tui.child.ended_with_report"
+                            );
+                            Ok(ToolCallResult::error(format!(
+                                "{}\n\n(Ursprüngliche Meldung: {})",
+                                report.to_parent_text(),
+                                error.message
+                            )))
+                        }
+                        None => Err(error),
+                    };
+                }
+            };
+            if !matches!(
+                run.outcome,
+                TurnOutcome::Completed
+                    | TurnOutcome::AwaitingApproval { .. }
+                    | TurnOutcome::AwaitingChild { .. }
+            ) && let Some(report) = self.child_end_report(child)
+            {
+                return Ok(ToolCallResult::error(report.to_parent_text()));
+            }
             match run.outcome {
                 TurnOutcome::Completed => {
                     let text = self.child_final_assistant_text(child)?;
@@ -1043,6 +1074,9 @@ pub struct ApprovalDriver {
     handler: Arc<TuiApprovalHandler>,
     /// Abbruchgrenze für aufeinanderfolgende Wiederaufnahmen.
     max_resumes: usize,
+    /// Runde 5, Teil K: startet Orchestratoren der TUI-Wurzel im Hintergrund
+    /// (`crate::app::background_agents`); `None` = immer synchron.
+    background: Option<Arc<crate::app::background_agents::BackgroundLauncher>>,
 }
 
 impl ApprovalDriver {
@@ -1060,6 +1094,7 @@ impl ApprovalDriver {
         Self {
             handler,
             max_resumes: MAX_CONSECUTIVE_RESUMES,
+            background: None,
         }
     }
 
@@ -1078,7 +1113,22 @@ impl ApprovalDriver {
         Self {
             handler,
             max_resumes,
+            background: None,
         }
+    }
+
+    /// Runde 5, Teil K: lässt Orchestrator-Handoffs der TUI-Wurzel im
+    /// Hintergrund laufen (siehe `crate::app::background_agents`).
+    ///
+    /// # Returns
+    /// Den Treiber mit Hintergrund-Starter.
+    #[must_use]
+    pub(crate) fn with_background(
+        mut self,
+        launcher: Arc<crate::app::background_agents::BackgroundLauncher>,
+    ) -> Self {
+        self.background = Some(launcher);
+        self
     }
 
     /// Gibt den geteilten Handler zurück.
@@ -1208,11 +1258,23 @@ impl ApprovalDriver {
                         "tui.resume.child_pause"
                     );
 
-                    let progress = session
-                        .current_turn()
-                        .cloned()
-                        .map(|turn_id| (turn_id, session.live_emitter()));
-                    let result = Self::child_result(children, &child, &role, store, progress).await;
+                    // Runde 5, Teil K: ein Orchestrator der TUI-Wurzel läuft im
+                    // Hintergrund weiter; der Eltern-Turn bekommt sofort
+                    // `{child_id, status: "running", hint}`.
+                    let launched = self
+                        .background
+                        .as_ref()
+                        .and_then(|launcher| launcher.try_launch(session, &child, &call_id, &role));
+                    let result = match launched {
+                        Some(result) => result,
+                        None => {
+                            let progress = session
+                                .current_turn()
+                                .cloned()
+                                .map(|turn_id| (turn_id, session.live_emitter()));
+                            Self::child_result(children, &child, &role, store, progress).await
+                        }
+                    };
                     outcome = resume_after_child(session, model, store, child, call_id, result)
                         .await
                         .map_err(|source| ApprovalDriverError::Resume {

@@ -30,10 +30,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      # Gepinnte Toolchain aus rust-toolchain.toml (wie in ci.yml). Ein
+      # `dtolnay/rust-toolchain@stable` würde hier ins Leere laufen: rustup
+      # nimmt ohnehin die Datei, das Ziel landete dann in der falschen Toolchain.
+      - name: Install pinned Rust (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+          rustc --version
 
       - name: Install cross
         if: matrix.use_cross

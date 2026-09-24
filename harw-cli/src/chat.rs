@@ -626,6 +626,10 @@ impl harw_tui::app::ResumeSessionSelector for ProfileResumeSelector {
             .discover()?
             .into_iter()
             .filter(|session| self.all || session_matches_project(session, project_key.as_deref()))
+            // Runde 5, Teil H: Sitzungen ohne jeden Turn (z. B. Platzhalter
+            // früherer Starts) blendet der Picker aus; `--all` und eine
+            // explizite ID (`resolve_session`) erreichen sie weiterhin.
+            .filter(|session| self.all || !crate::resume::is_empty_session(session))
             .map(|session| session.id)
             .collect())
     }
@@ -1405,6 +1409,16 @@ mod tests {
             Some("some-other-project-key"),
         )
         .map_err(ctx("tag other-project session with a foreign project key"))?;
+        // Runde 5, Teil H: der Picker blendet Sitzungen ohne Turn aus — die
+        // beiden getaggten Sitzungen bekommen deshalb je eine Runde.
+        for id in ["in-project", "other-project"] {
+            harw_session_store::meta::add_usage_round(
+                sessions_dir.path(),
+                &SessionId::from_str(id),
+                &harw_types::TokenUsage::default(),
+            )
+            .map_err(ctx("record one round"))?;
+        }
 
         let filtered = ProfileResumeSelector::new(
             sessions_dir.path().to_path_buf(),
@@ -1546,6 +1560,16 @@ mod tests {
             Some("some-other-project-key"),
         )
         .map_err(ctx("tag other-project session with a foreign project key"))?;
+        // Runde 5, Teil H: der Picker blendet Sitzungen ohne Turn aus — die
+        // beiden getaggten Sitzungen bekommen deshalb je eine Runde.
+        for id in ["in-project", "other-project"] {
+            harw_session_store::meta::add_usage_round(
+                sessions_dir.path(),
+                &SessionId::from_str(id),
+                &harw_types::TokenUsage::default(),
+            )
+            .map_err(ctx("record one round"))?;
+        }
         // `legacy-untagged` gets no `set_project` call and an empty
         // transcript: `meta::load_or_derive` leaves `project_key` as `None`,
         // and `crate::resume::backfill_project_key` finds no path candidate
@@ -1577,6 +1601,77 @@ mod tests {
                 SessionId::from_str("in-project"),
                 SessionId::from_str("legacy-untagged"),
                 SessionId::from_str("other-project"),
+            ]
+        );
+        Ok(())
+    }
+
+    /// Runde 5, Teil H: Sitzungen ohne jeden Turn (Platzhalter früherer
+    /// Starts) erscheinen nicht im Picker, bleiben aber über `--all` und eine
+    /// explizite ID erreichbar.
+    #[test]
+    fn profile_resume_selector_hides_sessions_without_turns_unless_all() -> TestResult {
+        use harw_tui::app::ResumeSessionSelector;
+
+        let project_dir = tempfile::tempdir().map_err(ctx("create project directory"))?;
+        let sessions_dir = tempfile::tempdir().map_err(ctx("create sessions directory"))?;
+        let current_key = current_project_key(project_dir.path()).ok_or(TestError::Missing(
+            "a real directory always yields a project key",
+        ))?;
+        for id in ["worked", "placeholder"] {
+            std::fs::File::create(sessions_dir.path().join(format!("{id}.jsonl")))
+                .map_err(ctx("create transcript"))?;
+            harw_session_store::meta::set_project(
+                sessions_dir.path(),
+                &SessionId::from_str(id),
+                None,
+                None,
+                Some(current_key.as_str()),
+            )
+            .map_err(ctx("tag session with the current project"))?;
+        }
+        for _ in 0..19 {
+            harw_session_store::meta::add_usage_round(
+                sessions_dir.path(),
+                &SessionId::from_str("worked"),
+                &harw_types::TokenUsage::default(),
+            )
+            .map_err(ctx("record a round"))?;
+        }
+
+        let filtered = ProfileResumeSelector::new(
+            sessions_dir.path().to_path_buf(),
+            project_dir.path().to_path_buf(),
+            false,
+        );
+        assert_eq!(
+            filtered
+                .available_sessions()
+                .map_err(ctx("list filtered sessions"))?,
+            vec![SessionId::from_str("worked")]
+        );
+        // Explizite ID: weiterhin auflösbar.
+        assert_eq!(
+            filtered
+                .resolve_session("placeholder")
+                .map_err(ctx("resolve an empty session by id"))?,
+            SessionId::from_str("placeholder")
+        );
+
+        let all = ProfileResumeSelector::new(
+            sessions_dir.path().to_path_buf(),
+            project_dir.path().to_path_buf(),
+            true,
+        );
+        let mut all_ids = all
+            .available_sessions()
+            .map_err(ctx("list all sessions with --all"))?;
+        all_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        assert_eq!(
+            all_ids,
+            vec![
+                SessionId::from_str("placeholder"),
+                SessionId::from_str("worked"),
             ]
         );
         Ok(())

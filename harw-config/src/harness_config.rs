@@ -6,6 +6,7 @@ use crate::mode_toml::ModeSection;
 use crate::permissions_toml::PermissionsSection;
 use crate::plan_toml::ToolsSection;
 use crate::research_toml::ResearchSection;
+use crate::uia_worker_models::UiaWorkerModelsToml;
 
 /// Globale Harness-Konfiguration aus `.harw/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -37,14 +38,12 @@ pub struct HarnessConfig {
     /// `default_model`. `None` → die UIA nutzt `default_model` wie bisher.
     #[serde(default)]
     pub uia_model: Option<String>,
-    /// Pinnt das Modell der uia-worker-Rollenfamilie (`uia-worker`,
-    /// `uia-explorer`, `uia-writer`, `uia-shell-worker`, `uia-latex-writer`)
-    /// unabhängig von
-    /// `default_model`/`uia_model`. Der Provider ist hier bewusst **nicht**
-    /// separat wählbar — er muss zwingend mit dem effektiven `uia_provider`
-    /// übereinstimmen (Kopplungsregel, wird an anderer Stelle durchgesetzt,
-    /// hier nur die Feld-Deklaration). `None` → die Rollenfamilie nutzt
-    /// `uia_model`.
+    /// Alter Pin für das Modell der uia-worker-Rollenfamilie (`uia-worker`,
+    /// `uia-explorer`, `uia-writer`, `uia-shell-worker`, `uia-latex-writer`).
+    /// Seit Runde 5, Teil G gilt er nur noch für Rollen ohne eigenen Eintrag
+    /// unter `[uia_worker_models]`, und zwar mit dem Provider, dem das Modell
+    /// im Katalog gehört — nicht mehr gekoppelt an `uia_provider`. `None` →
+    /// die Rollen folgen der UIA.
     #[serde(default)]
     pub uia_worker_model: Option<String>,
     #[serde(default)]
@@ -96,6 +95,11 @@ pub struct HarnessConfig {
     /// gelesen.
     #[serde(default)]
     pub internal_models: InternalModelsToml,
+    /// `[uia_worker_models]` — eigene Modellwahl je UIA-Worker-Rolle
+    /// (`"uia"` = wie UIA oder `"provider/modell"`), Runde 5, Teil G. Siehe
+    /// `uia_worker_models.rs`.
+    #[serde(default)]
+    pub uia_worker_models: UiaWorkerModelsToml,
     /// `[compaction]` — Verdichtungs-Obergrenzen (Addendum D+E). Siehe
     /// [`CompactionToml`].
     #[serde(default)]
@@ -116,6 +120,18 @@ pub struct HarnessConfig {
     /// [`DreamToml`].
     #[serde(default)]
     pub dream: DreamToml,
+    /// `[host]` — Host-Ausführung, derzeit nur die Merkfrist des
+    /// sudo-Passworts (Runde 5, Teil B). Siehe [`HostToml`].
+    #[serde(default)]
+    pub host: HostToml,
+    /// `[agents]` — Orchestrierungsgrenzen (Runde 5, Teil K). Siehe
+    /// [`crate::agent_limits::AgentLimitsToml`].
+    #[serde(default)]
+    pub agents: crate::agent_limits::AgentLimitsToml,
+    /// `[shell]` — Zeitlimits für `shell.exec` (Runde 5, Teil N). Siehe
+    /// [`crate::shell_limits::ShellToml`].
+    #[serde(default)]
+    pub shell: crate::shell_limits::ShellToml,
     #[serde(skip)]
     pub base_dir: Option<std::path::PathBuf>,
 }
@@ -245,6 +261,43 @@ impl DreamToml {
             .as_deref()
             .map(str::trim)
             .filter(|schedule| !schedule.is_empty())
+    }
+}
+
+/// Vorgabe für `[host] sudo_session_minutes`: so lange behält die TUI ein
+/// „für diese Sitzung“ eingegebenes sudo-Passwort (Runde 5, Teil B).
+pub const DEFAULT_SUDO_SESSION_MINUTES: u32 = 10;
+
+/// Obergrenze für `[host] sudo_session_minutes`; größere Werte werden auf
+/// diese Frist gekappt.
+pub const MAX_SUDO_SESSION_MINUTES: u32 = 60;
+
+/// `[host]` — Host-Ausführung (Runde 5, Teil B).
+///
+/// # Beschreibung
+/// - `sudo_session_minutes`: wie lange die TUI ein mit „Für diese Sitzung“
+///   freigegebenes sudo-Passwort im Speicher behält (Vorgabe
+///   [`DEFAULT_SUDO_SESSION_MINUTES`], höchstens
+///   [`MAX_SUDO_SESSION_MINUTES`]). `0` schaltet das Sitzungs-Merken ab —
+///   dann gibt es nur „Einmalig“. Jeder Root-Befehl braucht unabhängig davon
+///   eine eigene Freigabe. Merge-Regel `MinBound` (global): ein Profil kann
+///   die Frist nur verkürzen.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostToml {
+    /// Merkfrist in Minuten; `None` → [`DEFAULT_SUDO_SESSION_MINUTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sudo_session_minutes: Option<u32>,
+}
+
+impl HostToml {
+    /// Wirksame Merkfrist in Minuten (gekappt auf
+    /// [`MAX_SUDO_SESSION_MINUTES`]; `0` = kein Sitzungs-Merken).
+    #[must_use]
+    pub fn effective_sudo_session_minutes(&self) -> u32 {
+        self.sudo_session_minutes
+            .unwrap_or(DEFAULT_SUDO_SESSION_MINUTES)
+            .min(MAX_SUDO_SESSION_MINUTES)
     }
 }
 
@@ -415,8 +468,8 @@ impl Default for LoggingSection {
     }
 }
 
-/// `[tui]` — Theme und Verweis auf die Keybindings-Datei (relativ zum
-/// Layer-Verzeichnis dieser `config.toml`).
+/// `[tui]` — Theme, Verweis auf die Keybindings-Datei (relativ zum
+/// Layer-Verzeichnis dieser `config.toml`) und Live-Stream der Kind-Agenten.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TuiSection {
@@ -424,6 +477,12 @@ pub struct TuiSection {
     pub theme: String,
     #[serde(default = "default_keybindings_file")]
     pub keybindings_file: String,
+    /// Runde 5, Teil I: welche Kind-Agenten ihre Werkzeugaufrufe, ihr
+    /// Reasoning und ihren Text live als eingerückten Block unter ihrer
+    /// Agent-Zeile im Hauptverlauf zeigen (Vorgabe
+    /// [`ChildStreamModeToml::Orchestrators`]).
+    #[serde(default)]
+    pub child_stream: ChildStreamModeToml,
 }
 
 impl Default for TuiSection {
@@ -431,6 +490,43 @@ impl Default for TuiSection {
         Self {
             theme: default_theme(),
             keybindings_file: default_keybindings_file(),
+            child_stream: ChildStreamModeToml::default(),
+        }
+    }
+}
+
+/// `[tui] child_stream` — Live-Stream der Kind-Agenten im Verlauf
+/// (Runde 5, Teil I).
+///
+/// # Beschreibung
+/// - `"orchestrators"` (Vorgabe): nur Kinder, deren Rollendefinition ein
+///   Orchestrator ist (Root- oder Child-Orchestrator), in beliebiger Tiefe.
+/// - `"all"`: jedes Kind, auch Worker.
+/// - `"none"`: kein Live-Block; Kinder erscheinen nur als Zusammenfassungszeile.
+///
+/// Rein darstellend, kein Sicherheitsfeld: der Block zeigt nur, was das
+/// Kind ohnehin als Turn-Ereignis meldet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChildStreamModeToml {
+    /// Nur Orchestrator-Kinder (Vorgabe).
+    #[default]
+    Orchestrators,
+    /// Alle Kinder.
+    All,
+    /// Kein Live-Stream.
+    #[serde(rename = "none")]
+    Off,
+}
+
+impl ChildStreamModeToml {
+    /// Konfigurationswert als Text (`orchestrators`, `all`, `none`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Orchestrators => "orchestrators",
+            Self::All => "all",
+            Self::Off => "none",
         }
     }
 }

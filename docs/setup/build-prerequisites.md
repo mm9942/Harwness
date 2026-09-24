@@ -11,21 +11,25 @@ Raspberry Pi 5 als Zielplattform, Kernel-Eigenschaften, die kein
 hält fest, **welche** Voraussetzungen gelten und **warum**, damit ein
 Abweichen sichtbar und nicht stillschweigend ist.
 
-## 1. Rust-Toolchain: `1.85.1`
+## 1. Rust-Toolchain: `1.98.0` (gepinnt)
 
-Die Workspace-Root-`Cargo.toml` setzt `rust-version = "1.85"`
-(`Cargo.toml:112`) als MSRV-Boden — das ist die *niedrigste* Version, gegen
-die dieser Workspace laut Manifest kompilieren muss, keine Empfehlung für
-die tatsächlich installierte Toolchain. Der Referenz-Build dieses Projekts
-läuft gegen den ersten Patch-Release der 1.85-Reihe, `1.85.1`: er enthält
-gegenüber `1.85.0` ausschließlich Fehlerkorrekturen im Compiler selbst,
-keine Sprachänderung, auf die dieser Workspace verzichten könnte oder
-müsste. Eine neuere Toolchain (`1.86`+) baut diesen Workspace ebenfalls,
-gilt hier aber nicht als geprüfte Referenz.
+Die Toolchain ist in **`rust-toolchain.toml`** im Repo-Wurzelverzeichnis
+gepinnt (`channel = "1.98.0"`, Komponenten `rustfmt` und `clippy`, Profil
+`minimal`). rustup liest die Datei automatisch – auch im eigenständigen
+`dod/`-Workspace, der deshalb keine eigene Datei hat – und installiert die
+Version beim ersten `cargo`-Aufruf nach. Die CI (`.github/workflows/ci.yml`,
+`release.yml`) installiert genau diese Datei per `rustup toolchain install`;
+lokal und in der CI prüfen damit derselbe Compiler, dasselbe `rustfmt` und
+dasselbe `clippy`. Neue Versionen kommen bewusst über Dependabot
+(Ökosystem `rust-toolchain`), nicht stillschweigend über `stable`.
+
+Davon getrennt setzt die Workspace-Root-`Cargo.toml` `rust-version = "1.85"`
+als MSRV-Boden – die *niedrigste* Version, gegen die dieser Workspace laut
+Manifest kompilieren muss, keine Aussage über die geprüfte Toolchain.
 
 ```
-$ rustc --version
-rustc 1.85.1 (…)
+$ rustup show active-toolchain
+1.98.0-x86_64-unknown-linux-gnu (overridden by '…/rust-toolchain.toml')
 ```
 
 ## 2. `crypt_guard` `3.0.1` (crates.io, Hybrid-KEM)

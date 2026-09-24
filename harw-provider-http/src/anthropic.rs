@@ -1576,6 +1576,32 @@ mod tests {
     }
 
     #[test]
+    fn test_build_messages_body_opus_5_5_and_fable_5_1_use_adaptive_effort_without_budget() {
+        // Opus 5.5 und Fable 5.1: adaptive thinking (immer an) + effort,
+        // kein Legacy-`budget_tokens`, Ausgabe auf 128k geklemmt.
+        let request = request_with_effort(Some(harw_types::ReasoningEffort::Xhigh));
+        for model in ["claude-opus-5-5", "claude-fable-5-1"] {
+            let body = build_messages_body(model, 500_000, &request);
+            assert_eq!(
+                body["thinking"]["type"].as_str(),
+                Some("adaptive"),
+                "{model}"
+            );
+            assert!(body["thinking"].get("budget_tokens").is_none(), "{model}");
+            assert_eq!(
+                body["output_config"]["effort"].as_str(),
+                Some("xhigh"),
+                "{model}"
+            );
+            assert_eq!(
+                body.get("max_tokens").and_then(Value::as_u64),
+                Some(128_000),
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
     fn test_build_messages_body_model_without_thinking_support_omits_thinking_field() {
         let request = request_with_effort(Some(harw_types::ReasoningEffort::High));
 

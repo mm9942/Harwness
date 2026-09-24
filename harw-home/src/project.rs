@@ -448,14 +448,17 @@ impl ProjectHome {
     /// idempotent um `.harw/` ergänzt; im Home-Verzeichnis nicht, weil `~`
     /// kein Repository ist und keine `~/.gitignore` entstehen soll.
     ///
+    /// Die Ignore-Regel ist best-effort (siehe `ensure_gitignore_best_effort`):
+    /// ein nicht beschreibbarer oder für alle beschreibbarer Projektroot
+    /// blockiert den Start nicht.
+    ///
     /// # Returns
-    /// `Ok(())`, wenn alle Verzeichnisse existieren und `.gitignore`
-    /// ergänzt ist (oder die Regel bereits enthielt bzw. der Root `$HOME` ist).
+    /// `Ok(())`, wenn alle Verzeichnisse existieren.
     ///
     /// # Errors
     /// - [`HomeError::UnsupportedProjectHomeRoot`]: `root` ist `/`.
-    /// - [`HomeError::Io`]: `root` nicht kanonisierbar, Anlegen eines
-    ///   Verzeichnisses oder Schreiben von `.gitignore` schlägt fehl.
+    /// - [`HomeError::Io`]: `root` nicht kanonisierbar oder Anlegen eines
+    ///   Verzeichnisses schlägt fehl.
     pub fn ensure(&self) -> HomeResult<()> {
         let root = self
             .dir
@@ -474,9 +477,33 @@ impl ProjectHome {
         }
 
         if !root_is_user_home {
-            ensure_root_gitignore(root)?;
+            ensure_gitignore_best_effort(root);
         }
         Ok(())
+    }
+}
+
+/// Trägt `.harw/` best-effort als Ignore-Regel ein; scheitert nie.
+///
+/// Zuerst die Root-`.gitignore`. Lässt sie sich nicht schreiben – etwa weil
+/// der Projektroot ein für alle beschreibbares Gemeinschaftsverzeichnis ohne
+/// Sticky-Bit ist, in dem `write_atomic` aus Sicherheitsgründen ablehnt, oder
+/// weil er schreibgeschützt ist –, wird `.git/info/exclude` versucht (liegt
+/// im privaten Git-Verzeichnis und landet nicht im Repository). Scheitert
+/// auch das, fehlt die Regel eben: eine fehlende Ignore-Regel darf
+/// den Start nie blockieren.
+fn ensure_gitignore_best_effort(root: &Path) {
+    if ensure_root_gitignore(root).is_ok() {
+        return;
+    }
+    let info_dir = root.join(".git").join("info");
+    let git_dir_present =
+        std::fs::symlink_metadata(root.join(".git")).is_ok_and(|meta| meta.is_dir());
+    if git_dir_present {
+        // Ergebnis bewusst verworfen: best-effort, siehe oben.
+        let _ = std::fs::create_dir_all(&info_dir)
+            .map_err(|error| HomeError::io(&info_dir, error))
+            .and_then(|()| ensure_ignore_rule(&info_dir.join("exclude")));
     }
 }
 
@@ -485,11 +512,16 @@ impl ProjectHome {
 /// Bestehende Regeln bleiben bytegenau erhalten. Die Erkennung akzeptiert auch
 /// die äquivalente Regel `/.harw/`, damit wiederholte Starts keinen Diff erzeugen.
 fn ensure_root_gitignore(root: &Path) -> HomeResult<()> {
-    let gitignore = root.join(".gitignore");
-    let existing = match std::fs::read_to_string(&gitignore) {
+    ensure_ignore_rule(&root.join(".gitignore"))
+}
+
+/// Ergänzt eine Ignore-Datei (`.gitignore` oder `.git/info/exclude`)
+/// idempotent um [`ROOT_GITIGNORE_RULE`].
+fn ensure_ignore_rule(gitignore: &Path) -> HomeResult<()> {
+    let existing = match std::fs::read_to_string(gitignore) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(HomeError::io(&gitignore, error)),
+        Err(error) => return Err(HomeError::io(gitignore, error)),
     };
     if existing
         .lines()
@@ -504,11 +536,11 @@ fn ensure_root_gitignore(root: &Path) -> HomeResult<()> {
     };
     let updated = format!("{existing}{separator}{ROOT_GITIGNORE_RULE}\n");
     write_atomic(
-        &gitignore,
+        gitignore,
         updated.as_bytes(),
         AtomicWriteOptions::with_mode(0o644),
     )
-    .map_err(|error| HomeError::io(&gitignore, error))
+    .map_err(|error| HomeError::io(gitignore, error))
 }
 
 /// Baut den `std::io::Error`, der [`HomeError::io`] beschreibt, wenn
@@ -838,6 +870,30 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&gitignore)?, "custom\n.harw/\n");
         home.ensure()?;
         assert_eq!(std::fs::read_to_string(&gitignore)?, "custom\n.harw/\n");
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_tolerates_world_writable_root_without_sticky_bit() -> TestResult {
+        let repo = TempDir::new("ensure-shared")?;
+        std::fs::create_dir_all(repo.path().join(".git").join("info"))?;
+        std::fs::set_permissions(repo.path(), std::fs::Permissions::from_mode(0o777))?;
+        let project = ProjectRoot {
+            trust_key: repo.path().to_path_buf(),
+            root: repo.path().to_path_buf(),
+            kind: ProjectKind::Directory,
+        };
+        let home = ProjectHome::at(&project);
+
+        home.ensure()?;
+
+        assert!(home.state_dir().is_dir());
+        assert!(!repo.path().join(".gitignore").exists());
+        let exclude = repo.path().join(".git").join("info").join("exclude");
+        assert_eq!(std::fs::read_to_string(&exclude)?, ".harw/\n");
+        home.ensure()?;
+        assert_eq!(std::fs::read_to_string(&exclude)?, ".harw/\n");
+        std::fs::set_permissions(repo.path(), std::fs::Permissions::from_mode(0o700))?;
         Ok(())
     }
 

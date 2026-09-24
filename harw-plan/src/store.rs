@@ -24,6 +24,7 @@
 use time::OffsetDateTime;
 
 use crate::actions::{PlanAction, PlanEvent};
+use crate::catalog::{PlanApproval, PlanMeta, PlanSummary};
 use crate::config::PlanToolConfig;
 use crate::error::{PlanError, PlanResult};
 use crate::ids::{PlanId, RevisionId, TaskId};
@@ -219,6 +220,102 @@ pub trait PlanStore: Send + Sync {
         actor: &str,
         expected_rev: RevisionId,
     ) -> PlanResult<PlanRevision>;
+
+    // ── Plan-Katalog (Runde 5, Teil P) ──────────────────────────────────────
+    //
+    // Die Standardimplementierungen beschreiben einen Store mit höchstens
+    // einem Plan (Test- und Fremd-Stores). `InMemoryPlanStore` und
+    // `FilePlanStore` überschreiben alle sechs Methoden.
+
+    /// Listet alle Pläne des Stores (auch archivierte) in Anlagereihenfolge.
+    ///
+    /// # Returns
+    /// Eine [`PlanSummary`] je Plan; genau eine trägt `active = true`, sofern
+    /// ein Plan aktiv ist. Ein leerer Store liefert eine leere Liste.
+    ///
+    /// # Errors
+    /// Lese- bzw. Lock-Fehler der Implementierung.
+    fn list_plans(&self) -> PlanResult<Vec<PlanSummary>> {
+        match self.current() {
+            Ok(plan) => Ok(vec![PlanSummary::from_plan(
+                &plan,
+                true,
+                PlanMeta::default(),
+            )]),
+            Err(PlanError::PlanNotFound) => Ok(Vec::new()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Liest einen Plan per ID — aktiv oder nicht.
+    ///
+    /// # Errors
+    /// - [`PlanError::PlanUnknown`]: kein Plan mit dieser ID.
+    fn plan_by_id(&self, id: &PlanId) -> PlanResult<Plan> {
+        match self.current() {
+            Ok(plan) if &plan.id == id => Ok(plan),
+            Ok(_) | Err(PlanError::PlanNotFound) => Err(PlanError::PlanUnknown { id: id.clone() }),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Liest die Katalogdaten eines Plans (Archiv-Flag, Freigabestand).
+    ///
+    /// # Errors
+    /// - [`PlanError::PlanUnknown`]: kein Plan mit dieser ID.
+    fn plan_meta(&self, id: &PlanId) -> PlanResult<PlanMeta> {
+        self.plan_by_id(id).map(|_| PlanMeta::default())
+    }
+
+    /// Macht den Plan `id` aktiv; ein archivierter Plan wird dabei wieder
+    /// eingeblendet.
+    ///
+    /// # Arguments
+    /// - `id` (`&PlanId`): Ziel-Plan.
+    /// - `actor` (`&str`): Akteur (nur Protokoll; Katalogänderungen erzeugen
+    ///   kein Plan-Event und keine neue Revision).
+    ///
+    /// # Returns
+    /// Den nun aktiven Plan.
+    ///
+    /// # Errors
+    /// - [`PlanError::PlanUnknown`]: kein Plan mit dieser ID.
+    /// - [`PlanError::Io`] / [`PlanError::Serde`] beim Schreiben des Index.
+    fn switch_plan(&self, id: &PlanId, actor: &str) -> PlanResult<Plan> {
+        let _ = actor;
+        self.plan_by_id(id)
+    }
+
+    /// Blendet den Plan `id` aus, ohne ihn zu löschen. War er aktiv, ist
+    /// danach **kein** Plan aktiv, bis `create` oder `switch` einen wählt.
+    ///
+    /// # Errors
+    /// - [`PlanError::PlanUnknown`]: kein Plan mit dieser ID.
+    /// - [`PlanError::CatalogUnsupported`] bei einem Einzelplan-Store.
+    /// - [`PlanError::Io`] / [`PlanError::Serde`] beim Schreiben des Index.
+    fn archive_plan(&self, id: &PlanId, actor: &str) -> PlanResult<()> {
+        let _ = (id, actor);
+        Err(PlanError::CatalogUnsupported {
+            operation: "archive",
+        })
+    }
+
+    /// Setzt den Freigabestand des Plans `id`.
+    ///
+    /// # Errors
+    /// - [`PlanError::PlanUnknown`]: kein Plan mit dieser ID.
+    /// - [`PlanError::CatalogUnsupported`]: Einzelplan-Store und `Proposed`.
+    /// - [`PlanError::Io`] / [`PlanError::Serde`] beim Schreiben des Index.
+    fn set_approval(&self, id: &PlanId, approval: PlanApproval, actor: &str) -> PlanResult<()> {
+        let _ = actor;
+        self.plan_by_id(id)?;
+        match approval {
+            PlanApproval::Confirmed => Ok(()),
+            PlanApproval::Proposed => Err(PlanError::CatalogUnsupported {
+                operation: "set_approval",
+            }),
+        }
+    }
 
     /// Gibt die IDs aller aktuell ausführbaren Knoten zurück.
     ///

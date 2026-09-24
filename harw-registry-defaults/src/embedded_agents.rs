@@ -2101,8 +2101,8 @@ mod tests {
             let admitted = ir.tool_surface().admitted();
             let forbidden = ir.tool_surface().forbidden();
             let may_write = ALLOWED_TO_WRITE_ONLY.contains(&role.as_str());
-            for tool in ["fs.write", "shell.exec"] {
-                if may_write && tool == "fs.write" {
+            for tool in ["fs.write", "fs.edit", "shell.exec"] {
+                if may_write && tool != "shell.exec" {
                     assert!(
                         admitted.iter().any(|name| name == tool),
                         "{role} muss {tool} zulassen"
@@ -2172,6 +2172,10 @@ mod tests {
                     admitted.iter().any(|name| name == "fs.write"),
                     "{role} must admit fs.write to consolidate memory facts"
                 );
+                assert!(
+                    admitted.iter().any(|name| name == "fs.edit"),
+                    "{role} must admit fs.edit alongside fs.write"
+                );
             } else if role == role_names::UIA_LATEX_WRITER {
                 // `uia-latex-writer` (`RegistryProfile::UiaLatexWriter`)
                 // admits fs.write for its `.tex`/`.bib` sources and builds only
@@ -2180,6 +2184,10 @@ mod tests {
                 assert!(
                     admitted.iter().any(|name| name == "fs.write"),
                     "{role} must admit fs.write (RegistryProfile::UiaLatexWriter)"
+                );
+                assert!(
+                    admitted.iter().any(|name| name == "fs.edit"),
+                    "{role} must admit fs.edit (RegistryProfile::UiaLatexWriter)"
                 );
                 assert!(
                     admitted.iter().any(|name| name == "latex.build"),
@@ -2194,10 +2202,18 @@ mod tests {
                     admitted.iter().any(|name| name == "fs.write"),
                     "{role} must admit fs.write (RegistryProfile::UiaWriter)"
                 );
+                assert!(
+                    admitted.iter().any(|name| name == "fs.edit"),
+                    "{role} must admit fs.edit (RegistryProfile::UiaWriter)"
+                );
             } else {
                 assert!(
                     !admitted.iter().any(|name| name == "fs.write"),
                     "{role} must not admit fs.write; process execution and file mutation are separate capabilities"
+                );
+                assert!(
+                    !admitted.iter().any(|name| name == "fs.edit"),
+                    "{role} must not admit fs.edit (same capability as fs.write)"
                 );
             }
         }
@@ -2289,7 +2305,7 @@ mod tests {
                 .map_err(|error| TestError::Unexpected(format!("{name} muss lowern: {error}")))?;
             let admitted = ir.tool_surface().admitted();
             let forbidden = ir.tool_surface().forbidden();
-            for tool in ["fs.write", "shell.exec"] {
+            for tool in ["fs.write", "fs.edit", "shell.exec"] {
                 assert!(
                     !admitted.iter().any(|t| t == tool),
                     "{name} darf {tool} nicht zulassen"
@@ -2660,6 +2676,7 @@ mod tests {
             );
             for tool in [
                 "fs.write",
+                "fs.edit",
                 "shell.exec",
                 "process.kill",
                 "web.fetch",
@@ -2726,9 +2743,17 @@ mod tests {
                 "diary.read",
                 "palace.search",
                 "palace.recall",
+                // Runde 5, Teil M: Zwischenstand/Frage an den Elternteil.
+                "parent.message",
             ]
         );
-        for tool in ["fs.write", "shell.exec", "web.docs_rs", "web.crates_io"] {
+        for tool in [
+            "fs.write",
+            "fs.edit",
+            "shell.exec",
+            "web.docs_rs",
+            "web.crates_io",
+        ] {
             assert!(
                 explorer
                     .tool_surface()
@@ -3080,7 +3105,7 @@ mod tests {
             let ir = definitions
                 .get(name)
                 .ok_or_else(|| TestError::Unexpected(format!("{name} fehlt")))?;
-            for tool in ["fs.write", "shell.exec"] {
+            for tool in ["fs.write", "fs.edit", "shell.exec"] {
                 assert!(
                     ir.tool_surface().forbidden().iter().any(|t| t == tool),
                     "{name} muss {tool} verbieten"
@@ -3392,7 +3417,13 @@ mod tests {
                 )));
             };
             assert!(child_calls <= root_calls, "{role}: max_tool_calls");
-            for tool in ["fs.write", "shell.exec", "web.fetch", "web.search"] {
+            for tool in [
+                "fs.write",
+                "fs.edit",
+                "shell.exec",
+                "web.fetch",
+                "web.search",
+            ] {
                 assert!(
                     !ir.tool_surface().admitted().iter().any(|name| name == tool),
                     "{role} darf {tool} nicht admittieren"
@@ -3466,10 +3497,18 @@ mod tests {
         // großzügigeres Budget als die übrigen Rollenregeln — sie bleibt die
         // einzige Rolle mit dieser Auflage, weil nur sie die direkte
         // Nutzeroberfläche ist.
+        // Runde 5, Teil P: +„Pläne“ (Vorschlag → submit → Schritte mit
+        // Beleg) und die Zuschnittsregel uia-worker/uia-writer/Root.
         assert!(
-            UIA_KNOWLEDGE.len() <= 2600,
-            "roles/uia.md: {} Bytes > 2600",
+            UIA_KNOWLEDGE.len() <= 3100,
+            "roles/uia.md: {} Bytes > 3100",
             UIA_KNOWLEDGE.len()
+        );
+        // Runde 5, Teil P: Umfangsregel der `uia-worker`-Rollen.
+        assert!(
+            UIA_WORKER_KNOWLEDGE.len() <= 2000,
+            "roles/uia-worker.md: {} Bytes > 2000",
+            UIA_WORKER_KNOWLEDGE.len()
         );
         for (name, text) in [
             ("root-orchestrator.md", ROOT_ORCHESTRATOR_KNOWLEDGE),
@@ -3480,6 +3519,51 @@ mod tests {
                 "roles/{name}: {} Bytes > 1500",
                 text.len()
             );
+        }
+    }
+
+    /// Runde 5, Teil P: ein `uia-worker` lehnte „0600 + Regressionstest,
+    /// cargo fmt/test“ nach 4 s ohne ein Werkzeug als „zu großer Umfang“ ab.
+    /// Das Regelwerk nimmt kleine Code-Pakete ausdrücklich auf, verlangt
+    /// Lesen vor dem Urteil und bei Ablehnung einen Zerlegungsvorschlag.
+    #[test]
+    fn test_uia_worker_knowledge_admits_small_code_packages() {
+        let text = UIA_WORKER_KNOWLEDGE;
+        for phrase in [
+            "kleine Code-Änderungen",
+            "3 Dateien bzw. ein Modul",
+            "plus zugehörige Tests",
+            "`cargo fmt`/`cargo test`",
+            "Erst lesen, dann urteilen",
+            "Nie ohne einen einzigen Werkzeugaufruf ablehnen",
+            "Zerlegungsvorschlag",
+            "kein Grund abzulehnen",
+        ] {
+            assert!(text.contains(phrase), "uia-worker.md: fehlt „{phrase}“");
+        }
+        assert!(
+            !text.contains("klares Nein"),
+            "die pauschale Ablehnung „klares Nein“ ist entfallen"
+        );
+        // Rechte bleiben unverändert: das Regelwerk nennt die Grenzen der
+        // Spezialisierungen, es erweitert sie nicht.
+        assert!(text.contains("`uia-worker`: kein\n  `fs.write`/`fs.edit`"));
+    }
+
+    /// Runde 5, Teil P: die UIA schneidet kleine Pakete passend zu und
+    /// verfolgt Pläne über Schritte mit Beleg.
+    #[test]
+    fn test_uia_knowledge_routes_small_packages_and_tracks_plans() {
+        let text = UIA_KNOWLEDGE;
+        for phrase in [
+            "`uia-writer`",
+            "bis ca. 3 Dateien bzw. ein Modul",
+            "Mehrere Module, Umbau, unklarer Umfang → Root",
+            "`plan submit`",
+            "`plan step <id> done <beleg>`",
+            "anhand\ndes Plans berichten",
+        ] {
+            assert!(text.contains(phrase), "uia.md: fehlt „{phrase}“");
         }
     }
 

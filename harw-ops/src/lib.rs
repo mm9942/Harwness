@@ -181,10 +181,14 @@ pub mod memory;
 pub mod mode;
 pub mod model;
 pub mod models;
+// Runde 5, Teil G: `/models worker` — Modellwahl je UIA-Worker-Rolle.
+pub(crate) mod models_workers;
 pub mod new;
 pub mod palace;
 pub mod permissions;
 pub mod plan;
+// Runde 5, Teil P: Plan-Katalog, Bestätigung, Schritt-Verfolgung.
+pub(crate) mod plan_catalog;
 pub mod plugins;
 pub mod provider;
 pub mod ps;

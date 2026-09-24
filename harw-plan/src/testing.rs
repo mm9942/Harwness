@@ -743,6 +743,9 @@ macro_rules! impl_store_conformance_tests {
                 Ok(())
             }
 
+            // Runde 5, Teil P: ein Store hält mehrere Pläne. Nur eine bereits
+            // vergebene ID wird abgelehnt; der bestehende Plan bleibt dabei
+            // unverändert.
             #[test]
             fn second_create_is_rejected_with_plan_exists()
             -> ::core::result::Result<(), $crate::testing::ExpectationError> {
@@ -753,16 +756,57 @@ macro_rules! impl_store_conformance_tests {
                     $crate::store::PlanStore::apply(
                         &store,
                         $crate::actions::PlanAction::Create {
-                            plan_id: $crate::ids::PlanId::new("p-zweiter"),
+                            plan_id: $crate::ids::PlanId::new("p-conformance"),
                             goal: ::std::string::String::from("darf nicht überschreiben"),
                         },
                         "conformance",
                     ),
-                    "zweites Create",
+                    "zweites Create mit derselben ID",
                 )?;
                 assert!(
                     matches!(error, $crate::error::PlanError::PlanExists { .. }),
                     "erwartet PlanExists, war: {error}"
+                );
+                let plan = $crate::testing::expect_ok(
+                    $crate::store::PlanStore::current(&store),
+                    "current() nach abgelehntem Create",
+                )?;
+                assert_eq!(plan.goal_statement, "Conformance-Ziel");
+                Ok(())
+            }
+
+            // Runde 5, Teil P: ein Create mit neuer ID legt einen weiteren
+            // Plan an und macht ihn aktiv; der erste bleibt erhalten.
+            #[test]
+            fn create_with_new_id_adds_a_second_active_plan()
+            -> ::core::result::Result<(), $crate::testing::ExpectationError> {
+                let (store, _guard) = fresh_store!();
+                seed(&store)?;
+                $crate::testing::expect_ok(
+                    $crate::store::PlanStore::apply(
+                        &store,
+                        $crate::actions::PlanAction::Create {
+                            plan_id: $crate::ids::PlanId::new("p-zweiter"),
+                            goal: ::std::string::String::from("zweites Ziel"),
+                        },
+                        "conformance",
+                    ),
+                    "zweites Create mit neuer ID",
+                )?;
+                let plan = $crate::testing::expect_ok(
+                    $crate::store::PlanStore::current(&store),
+                    "current() nach zweitem Create",
+                )?;
+                assert_eq!(plan.id, $crate::ids::PlanId::new("p-zweiter"));
+                let plans = $crate::testing::expect_ok(
+                    $crate::store::PlanStore::list_plans(&store),
+                    "list_plans()",
+                )?;
+                assert_eq!(plans.len(), 2, "beide Pläne sind gelistet");
+                assert_eq!(
+                    plans.iter().filter(|summary| summary.active).count(),
+                    1,
+                    "genau ein Plan ist aktiv"
                 );
                 Ok(())
             }

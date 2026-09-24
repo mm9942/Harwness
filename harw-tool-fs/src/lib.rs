@@ -1,18 +1,19 @@
 //! `harw-tool-fs` — Filesystem-Tool-Provider für den Harwness Coding-Agent.
 //!
-//! Stellt sechs Tools bereit (`fs.read`, `fs.write`, `fs.list`, `fs.search`,
-//! `fs.glob`, `fs.grep`), die den ExtensionRegistry-fähigen
+//! Stellt sieben Tools bereit (`fs.read`, `fs.write`, `fs.edit`, `fs.list`,
+//! `fs.search`, `fs.glob`, `fs.grep`), die den ExtensionRegistry-fähigen
 //! ToolProvider-Kontrakt aus `harw-extension-api` erfüllen. Alle Pfad- und
 //! Berechtigungs-Entscheidungen erfolgen pro-Call aus dem
 //! [`harw_tools::ToolExecutionContext`]. `fs.glob` und `fs.grep` sind über
-//! `#[harw_macros::tool]` erzeugt (AP W2-01..03); die übrigen vier Tools sind
-//! weiterhin handgeschriebene Executors (siehe `provider.rs` für die
+//! `#[harw_macros::tool]` erzeugt (AP W2-01..03); die übrigen fünf Tools sind
+//! handgeschriebene Executors (siehe `provider.rs` für die
 //! Migrationsentscheidung).
 //!
 //! # Schlüsseltypen
-//! - [`FsToolProvider`]: aggregierter Provider für alle sechs Tools.
-//! - [`FsReadExecutor`], [`FsWriteExecutor`], [`FsListExecutor`], [`FsSearchExecutor`]:
-//!   handgeschriebene Executors pro Tool.
+//! - [`FsToolProvider`]: aggregierter Provider für alle sieben Tools.
+//! - [`FsReadExecutor`], [`FsWriteExecutor`], [`FsEditExecutor`],
+//!   [`FsListExecutor`], [`FsSearchExecutor`]: handgeschriebene Executors pro
+//!   Tool.
 //! - [`FsGlobTool`], [`FsGrepTool`]: makro-generierte Executors für `fs.glob`/`fs.grep`.
 //! - [`FsToolError`]: crate-weiter Fehlertyp.
 //!
@@ -23,7 +24,9 @@
 //! `tree`-Modul) mit harten Grenzen für Treffer, Tiefe, Einträge, Laufzeit,
 //! Dateigröße und Ausgabemenge; der Abbruchgrund steht als `stopped` im
 //! Ergebnis. `fs.write` schreibt atomar über `harw_fsutil::write_atomic` und
-//! lehnt `.git/`- und `.harw/`-Pfade ab.
+//! lehnt `.git/`- und `.harw/`-Pfade ab; `fs.edit` nutzt dieselben Regeln,
+//! verlangt eine vorhandene reguläre UTF-8-Datei und ersetzt `old_string`
+//! (ohne `replace_all` genau ein Treffer).
 //!
 //! # Nebenläufigkeit
 //! Alle Typen sind `Send + Sync`. Lesende Tools sind als `parallel_safe`
@@ -32,6 +35,7 @@
 #![forbid(unsafe_code)]
 
 mod blocking;
+pub mod edit;
 pub mod error;
 pub mod glob;
 pub mod grep;
@@ -44,6 +48,7 @@ mod test_support;
 mod tree;
 pub mod write;
 
+pub use edit::FsEditExecutor;
 pub use error::FsToolError;
 pub use glob::{FsGlobTool, GlobArgs};
 pub use grep::{FsGrepTool, GrepArgs};

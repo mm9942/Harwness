@@ -407,7 +407,7 @@ fn telegram_reads_and_writes_without_shell_network_or_relaxed_approval() -> Test
     assert_eq!(snapshot.permissions, ["ReadWorkspace", "WriteWorkspace"]);
     assert!(assembled.assembly.sandbox().network_scope().is_empty());
     let tools = snapshot.tools;
-    for expected in ["fs.read", "fs.write"] {
+    for expected in ["fs.read", "fs.write", "fs.edit"] {
         assert!(
             tools.iter().any(|tool| tool == expected),
             "{expected} fehlt: {tools:?}"
@@ -1045,6 +1045,73 @@ const PLAN_TOOL_NAMES: &[&str] = &[
     "analyze",
     "research",
 ];
+
+/// Runde 5, Teil H: `agent.result` steht an der Wurzel genau dann, wenn sie
+/// Kinder starten kann (Spawner) und dem Modell Werkzeuge anbietet.
+#[test]
+fn agent_result_is_offered_exactly_where_the_root_can_spawn_children() -> TestResult {
+    for entry in ALL_ENTRIES {
+        let fixture = fixture()?;
+        let assembled = assemble(entry, &fixture)
+            .map_err(|error| TestError::Unexpected(format!("{entry:?} muss montieren: {error}")))?;
+        let profile = entry.profile();
+        let spawns = profile.spawner != SpawnerPolicy::None
+            && profile.operations == OperationSurface::AllWithModelTools;
+        let tools = assembled.assembly.rights_snapshot().tools;
+        assert_eq!(
+            tools.iter().any(|tool| tool == "agent.result"),
+            spawns,
+            "{entry:?}: agent.result folgt Spawner + Modell-Werkzeugfläche: {tools:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Runde 5, Teil M: `agent.message` steht an der Wurzel genau dort, wo
+/// `agent.result` steht (Spawner + Modell-Werkzeugfläche); `parent.message`
+/// nie — die Wurzel hat keinen Elternteil.
+#[test]
+fn agent_message_follows_agent_result_and_the_root_never_has_parent_message() -> TestResult {
+    for entry in ALL_ENTRIES {
+        let fixture = fixture()?;
+        let assembled = assemble(entry, &fixture)
+            .map_err(|error| TestError::Unexpected(format!("{entry:?} muss montieren: {error}")))?;
+        let tools = assembled.assembly.rights_snapshot().tools;
+        assert_eq!(
+            tools.iter().any(|tool| tool == "agent.message"),
+            tools.iter().any(|tool| tool == "agent.result"),
+            "{entry:?}: agent.message folgt agent.result: {tools:?}"
+        );
+        assert!(
+            !tools.iter().any(|tool| tool == "parent.message"),
+            "{entry:?}: die Wurzel führt nie parent.message: {tools:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Runde 5, Teil K: `agent.status`/`agent.cancel` gibt es nur an der
+/// TUI-Wurzel — nur dort laufen Orchestratoren im Hintergrund. Jeder andere
+/// Einstieg (One-Shot, Telegram, serve, Jobs) bleibt synchron und ohne diese
+/// Werkzeuge.
+#[test]
+fn background_agent_tools_are_offered_only_at_the_tui_root() -> TestResult {
+    for entry in ALL_ENTRIES {
+        let fixture = fixture()?;
+        let assembled = assemble(entry, &fixture)
+            .map_err(|error| TestError::Unexpected(format!("{entry:?} muss montieren: {error}")))?;
+        let tools = assembled.assembly.rights_snapshot().tools;
+        let expected = entry == EntryKind::Tui;
+        for tool in ["agent.status", "agent.cancel"] {
+            assert_eq!(
+                tools.iter().any(|name| name == tool),
+                expected,
+                "{entry:?}: {tool} nur an der TUI-Wurzel: {tools:?}"
+            );
+        }
+    }
+    Ok(())
+}
 
 /// Z2c-01, zweite Hälfte: **nur** [`OperationSurface::AllWithModelTools`]
 /// legt die Operationen dem Modell als Werkzeuge vor. Vor W2c bekamen

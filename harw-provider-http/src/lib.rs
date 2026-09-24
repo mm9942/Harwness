@@ -167,8 +167,9 @@ const MAX_REDIRECTS: usize = 10;
 const REDIRECT_CROSS_ORIGIN_REASON: &str =
     "provider redirect to a different scheme, host or port was blocked";
 const REDIRECT_LIMIT_REASON: &str = "provider redirect limit exceeded";
-const INVALID_CREDENTIAL_HEADER_REASON: &str =
-    "provider credential is not a valid HTTP header value";
+const INVALID_CREDENTIAL_HEADER_REASON: &str = "provider credential is not a valid HTTP header value \
+     (it contains a control or non-ASCII character, e.g. quotes or a smart quote from a paste); \
+     re-enter it with `harw auth` or fix the variable";
 /// Byte-Deckel je gerendertem Tool-Ergebnis, wenn der Request keinen setzt
 /// (`ModelRequest::tool_result_max_bytes == None`). Für den ganzen Verlauf
 /// gleich, damit bereits gesendete Ergebnisse bytegleich (cache-stabil) bleiben.
@@ -796,6 +797,7 @@ fn resolve_anthropic(
 /// der `ANTHROPIC_API_KEY`-Env-Variable ablegen; ohne Prefix-Check würde der
 /// Token als `x-api-key` gesendet und von Anthropic mit HTTP 401 abgelehnt.
 fn classify_anthropic_secret(raw: String) -> AnthropicCredential {
+    let raw = normalize_credential(&raw);
     if raw.starts_with("sk-ant-oat") {
         AnthropicCredential::OAuth(SecretString::new(raw.into()))
     } else {
@@ -2482,13 +2484,29 @@ fn validate_resolved_secret(
     reference: String,
     secret: SecretString,
 ) -> HttpProviderResult<SecretString> {
-    if secret.expose_secret().trim().is_empty() {
+    let normalized = normalize_credential(secret.expose_secret());
+    if normalized.is_empty() {
         return Err(HttpProviderError::UnresolvedCredential {
             reference,
             reason: EMPTY_CREDENTIAL_REASON.to_owned(),
         });
     }
-    Ok(secret)
+    Ok(SecretString::new(normalized.into()))
+}
+
+/// Bereinigt ein Credential: Leerraum am Rand weg, Zeilenumbrüche und Tabs
+/// überall weg.
+///
+/// Ein abschließender Zeilenumbruch (`echo … > datei`, `.env` mit CRLF) oder
+/// ein beim Einfügen umbrochener Token würde sonst als ungültiger
+/// HTTP-Header-Wert scheitern („provider credential is not a valid HTTP
+/// header value“). Einzelne Leerzeichen *innerhalb* bleiben erhalten — ein
+/// konfigurierter Header-Wert wie `Bearer <token>` braucht sie.
+fn normalize_credential(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .filter(|character| !matches!(character, '\r' | '\n' | '\t'))
+        .collect()
 }
 
 /// Liefert das Parameter-Schema eines Function-Tools in der Form, die der
@@ -7865,6 +7883,36 @@ mod tests {
                 .get("x-harw-agent")
                 .ok_or(TestError::Missing("x-harw-agent"))?,
             "agent-b"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn credentials_with_line_breaks_and_padding_are_normalized() -> TestResult {
+        let secret = validate_resolved_secret(
+            "env:TEST".to_owned(),
+            SecretString::new(" sk-ant-api03-abc\r\ndef\n".to_owned().into()),
+        )
+        .map_err(|error| TestError::Unexpected(error.to_string()))?;
+        assert_eq!(secret.expose_secret(), "sk-ant-api03-abcdef");
+        sensitive_header_value(secret.expose_secret())
+            .map_err(|_| TestError::Unexpected("normalized secret must be a header".to_owned()))?;
+
+        let AnthropicCredential::OAuth(token) =
+            classify_anthropic_secret("sk-ant-oat01-xyz\n".to_owned())
+        else {
+            return Err(TestError::Unexpected(
+                "OAuth prefix must be detected".to_owned(),
+            ));
+        };
+        assert_eq!(token.expose_secret(), "sk-ant-oat01-xyz");
+
+        assert!(
+            validate_resolved_secret(
+                "env:TEST".to_owned(),
+                SecretString::new(" \r\n ".to_owned().into())
+            )
+            .is_err()
         );
         Ok(())
     }

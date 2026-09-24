@@ -93,6 +93,14 @@
 //! Danach kann diese Operation auf `approval = "require_for_scope"` wechseln,
 //! ohne dass sich am Rumpf etwas ändert.
 //!
+//! # Mehrere Pläne, Freigabe, Schritte (Runde 5, Teil P)
+//! Der Store hält mehrere Pläne, genau einer ist aktiv (`list`, `switch`,
+//! `archive`, `inspect [id]`). Ein Plan der Modell-Fläche ist zunächst ein
+//! Vorschlag; `submit` legt ihn in der TUI zur Bestätigung vor, erst danach
+//! ist er verbindlich und an ein Goal gebunden. `step` meldet den
+//! Fortschritt eines Schritts (`done` nur mit Beleg). Die Logik liegt in
+//! `crate::plan_catalog`; hier stehen nur die Einhängepunkte.
+//!
 //! # Gate
 //! Vor jedem Subcommand wird [`PlanToolConfig::require_enabled`] geprüft. Fehlt
 //! die Konfiguration oder ist `[tools.plan] enabled = false`, antwortet die
@@ -134,6 +142,8 @@ use harw_plan::{PlanStore, PlanToolConfig};
 use harw_plan_bridge::{
     OpContextPlanExt, PlanBridgeError, PlanController, ReconcileInput, ReconcileStep,
 };
+
+use crate::plan_catalog::{self, ChangeGate};
 use harw_types::{Principal, PrincipalKind, SessionId};
 use time::OffsetDateTime;
 
@@ -423,7 +433,7 @@ impl<A: harw_operations::OpArgsSchema> harw_operations::OpArgsSchema for Surface
 ///
 /// # Spec-Referenz
 /// AP W4-01; Design-Doc `planning-tool-v1.md` §3 (Aktionsvokabular).
-#[derive(Debug, Default, serde::Deserialize, harw_macros::FromRawArgs, harw_macros::OpArgs)]
+#[derive(Debug, serde::Deserialize, harw_macros::FromRawArgs, harw_macros::OpArgs)]
 #[raw(subcommand)]
 #[serde(tag = "action", rename_all = "kebab-case")]
 pub enum PlanArgs {
@@ -438,10 +448,63 @@ pub enum PlanArgs {
         #[raw(join_from = 1)]
         goal: Option<String>,
     },
-    /// `plan inspect` — Plan als Übersicht (Knoten, Status, Wellen).
-    #[default]
+    /// `plan inspect [plan-id]` — Plan als Übersicht (Knoten, Status,
+    /// Freigabe, Fortschritt); ohne ID der aktive Plan.
     #[raw(default_subcommand)]
-    Inspect,
+    Inspect {
+        /// Optional: ein anderer Plan als der aktive (Runde 5, Teil P).
+        #[serde(default)]
+        #[raw(nth = 0)]
+        id: Option<String>,
+    },
+    /// `plan list` — alle Pläne des Stores (aktiv, Freigabe, Fortschritt,
+    /// archiviert). In der TUI heißt der Befehl `/plan plans`, weil
+    /// `/plan list` dort die Plan-Dateien unter `.harw/plans` zeigt
+    /// (Runde 5, Teil P).
+    #[raw(alias = "plans")]
+    #[serde(alias = "plans")]
+    List,
+    /// `plan switch <plan-id>` — anderen Plan aktiv machen (holt ihn auch
+    /// aus dem Archiv).
+    Switch {
+        /// Bezeichner des Plans.
+        #[serde(default)]
+        #[raw(nth = 0)]
+        id: Option<String>,
+    },
+    /// `plan archive <plan-id>` — Plan ausblenden, ohne ihn zu löschen.
+    Archive {
+        /// Bezeichner des Plans.
+        #[serde(default)]
+        #[raw(nth = 0)]
+        id: Option<String>,
+    },
+    /// `plan submit [plan-id]` — vorgeschlagenen Plan zur Bestätigung
+    /// vorlegen (TUI: Freigabefenster; erst danach aktiv und als Goal
+    /// verfolgt).
+    Submit {
+        /// Optional: ein anderer Plan als der aktive.
+        #[serde(default)]
+        #[raw(nth = 0)]
+        id: Option<String>,
+    },
+    /// `plan step <task-id> <open|running|done|blocked> [beleg…]` —
+    /// Fortschritt eines Schritts melden; `done` zählt nur mit Beleg
+    /// (z. B. `cargo_test:cargo test -p x`, `diff:src/a.rs`).
+    Step {
+        /// Bezeichner des Schritts (Knotens).
+        #[serde(default)]
+        #[raw(nth = 0)]
+        id: Option<String>,
+        /// Neuer Zustand: open, running, done, blocked.
+        #[serde(default)]
+        #[raw(nth = 1)]
+        state: Option<String>,
+        /// Beleg (bei `done`) bzw. Grund (bei `blocked`).
+        #[serde(default)]
+        #[raw(join_from = 2)]
+        evidence: Option<String>,
+    },
     /// `plan add <task-id> <kind> <ziel…>` — fügt einen Knoten hinzu.
     Add {
         /// Bezeichner des neuen Knotens.
@@ -573,6 +636,13 @@ pub enum PlanArgs {
     },
 }
 
+impl Default for PlanArgs {
+    /// `inspect` ohne ID — wie ein leerer `/plan`-Aufruf.
+    fn default() -> Self {
+        Self::Inspect { id: None }
+    }
+}
+
 /// Argumenttyp der `/plan`-Operation: Subcommand **plus** Aufruf-Fläche.
 ///
 /// # Beschreibung
@@ -694,7 +764,7 @@ impl harw_operations::OpArgsSchema for PlanCall {
     command(
         path = "/plan",
         visibility = "channel_parity",
-        busy_subcommands = "-=immediate, inspect=immediate, ready=immediate, waves=immediate"
+        busy_subcommands = "-=immediate, inspect=immediate, ready=immediate, waves=immediate, list=immediate"
     ),
     model_tool(approval = "always"),
     // Web-Fläche übernimmt dieselbe Achse wie das ModelTool: die Operation
@@ -719,7 +789,35 @@ async fn plan(ctx: &OpContext, call: PlanCall) -> Result<OpOutput, OpError> {
     let store: &dyn PlanStore = store_handle.as_ref();
 
     let text = match call.args {
-        PlanArgs::Inspect => render_inspect(&current_plan(store)?),
+        // Runde 5, Teil P: Katalog, Freigabe und Schritt-Verfolgung
+        // (Logik in `crate::plan_catalog`).
+        PlanArgs::Inspect { id } => {
+            let plan = plan_catalog::plan_or_active(store, id)?;
+            render_inspect(&plan, &plan_catalog::inspect_status_lines(store, &plan))
+        }
+        PlanArgs::List => plan_catalog::render_list(store)?,
+        PlanArgs::Switch { id } => plan_catalog::switch(store, id, &actor)?,
+        PlanArgs::Archive { id } => plan_catalog::archive(store, id, &actor)?,
+        PlanArgs::Submit { id } => {
+            plan_catalog::submit(ctx, store, id, call.surface, &actor).await?
+        }
+        PlanArgs::Step {
+            id,
+            state,
+            evidence,
+        } => {
+            let probe = PlanAction::SetStatus {
+                id: TaskId::new(id.as_deref().unwrap_or_default()),
+                status: PlanNodeStatus::InProgress,
+                reason: None,
+            };
+            match plan_catalog::gate_change(ctx, store, call.surface, &probe, "Schritt melden")
+                .await?
+            {
+                ChangeGate::Refused(text) => text,
+                ChangeGate::Proceed => plan_catalog::step(store, id, state, evidence, &actor)?,
+            }
+        }
         PlanArgs::Ready => render_ready(&current_plan(store)?),
         PlanArgs::Waves => render_waves(&current_plan(store)?)?,
         PlanArgs::Reconcile => run_reconcile(ctx, store, &config, &actor)?,
@@ -735,7 +833,12 @@ async fn plan(ctx: &OpContext, call: PlanCall) -> Result<OpOutput, OpError> {
                 },
                 &actor,
             )?;
-            format!("Plan '{plan_id}' angelegt (Revision {}).", event.revision)
+            // Runde 5, Teil P: Modell-Fläche → Vorschlag, Befehlsfläche → bestätigt.
+            let note = plan_catalog::after_create(ctx, store, &plan_id, call.surface, &actor)?;
+            format!(
+                "Plan '{plan_id}' angelegt (Revision {}) und aktiv. {note}",
+                event.revision
+            )
         }
 
         PlanArgs::Add {
@@ -747,18 +850,21 @@ async fn plan(ctx: &OpContext, call: PlanCall) -> Result<OpOutput, OpError> {
             let id = require_arg(id, usage)?;
             let kind = parse_kind(&require_arg(kind, usage)?)?;
             let objective = require_arg(objective, usage)?;
-            let event = apply(
-                store,
-                PlanAction::AddNode {
-                    node: new_node(&id, kind, objective),
-                },
-                &actor,
-            )?;
-            format!(
-                "Knoten '{id}' [{}] hinzugefügt (Revision {}).",
-                kind_label(kind),
-                event.revision
-            )
+            let action = PlanAction::AddNode {
+                node: new_node(&id, kind, objective),
+            };
+            let label = format!("Knoten '{id}' [{}] hinzufügen", kind_label(kind));
+            match plan_catalog::gate_change(ctx, store, call.surface, &action, &label).await? {
+                ChangeGate::Refused(text) => text,
+                ChangeGate::Proceed => {
+                    let event = apply(store, action, &actor)?;
+                    format!(
+                        "Knoten '{id}' [{}] hinzugefügt (Revision {}).",
+                        kind_label(kind),
+                        event.revision
+                    )
+                }
+            }
         }
 
         PlanArgs::Patch { id, field, value } => {
@@ -803,20 +909,23 @@ async fn plan(ctx: &OpContext, call: PlanCall) -> Result<OpOutput, OpError> {
             let usage = "plan status <task-id> <status>";
             let id = require_arg(id, usage)?;
             let status = parse_status(&require_arg(status, usage)?)?;
-            let event = apply(
-                store,
-                PlanAction::SetStatus {
-                    id: TaskId::new(id.as_str()),
-                    status,
-                    reason: None,
-                },
-                &actor,
-            )?;
-            format!(
-                "Knoten '{id}' ist jetzt {} (Revision {}).",
-                status_label(status),
-                event.revision
-            )
+            let action = PlanAction::SetStatus {
+                id: TaskId::new(id.as_str()),
+                status,
+                reason: None,
+            };
+            let label = format!("Knoten '{id}' → {}", status_label(status));
+            match plan_catalog::gate_change(ctx, store, call.surface, &action, &label).await? {
+                ChangeGate::Refused(text) => text,
+                ChangeGate::Proceed => {
+                    let event = apply(store, action, &actor)?;
+                    format!(
+                        "Knoten '{id}' ist jetzt {} (Revision {}).",
+                        status_label(status),
+                        event.revision
+                    )
+                }
+            }
         }
 
         PlanArgs::Evidence { id, kind, locator } => {
@@ -860,20 +969,23 @@ async fn plan(ctx: &OpContext, call: PlanCall) -> Result<OpOutput, OpError> {
                 .map(|child| child.id.to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let event = apply(
-                store,
-                PlanAction::Expand {
-                    parent: TaskId::new(parent_id.as_str()),
-                    children,
-                },
-                &actor,
-            )?;
-            format!(
-                "Knoten '{parent_id}' in {names} zerlegt (Revision {}).\n\
-                 Hinweis: Kinder starten ohne Schreibbereich — weise ihn mit \
-                 `plan patch <id> write-scope …` zu.",
-                event.revision
-            )
+            let action = PlanAction::Expand {
+                parent: TaskId::new(parent_id.as_str()),
+                children,
+            };
+            let label = format!("Knoten '{parent_id}' in {names} zerlegen");
+            match plan_catalog::gate_change(ctx, store, call.surface, &action, &label).await? {
+                ChangeGate::Refused(text) => text,
+                ChangeGate::Proceed => {
+                    let event = apply(store, action, &actor)?;
+                    format!(
+                        "Knoten '{parent_id}' in {names} zerlegt (Revision {}).\n\
+                         Hinweis: Kinder starten ohne Schreibbereich — weise ihn mit \
+                         `plan patch <id> write-scope …` zu.",
+                        event.revision
+                    )
+                }
+            }
         }
 
         PlanArgs::Condense {
@@ -890,20 +1002,23 @@ async fn plan(ctx: &OpContext, call: PlanCall) -> Result<OpOutput, OpError> {
             }
             let replacement_id = require_arg(replacement, usage)?;
             let summary = require_arg(summary, usage)?;
-            let event = apply(
-                store,
-                PlanAction::Condense {
-                    superseded: group.iter().map(|id| TaskId::new(id.as_str())).collect(),
-                    replacement: new_node(&replacement_id, PlanNodeKind::Contract, summary.clone()),
-                    summary,
-                },
-                &actor,
-            )?;
-            format!(
-                "{} Knoten zu Contract-Knoten '{replacement_id}' verdichtet (Revision {}).",
-                group.len(),
-                event.revision
-            )
+            let action = PlanAction::Condense {
+                superseded: group.iter().map(|id| TaskId::new(id.as_str())).collect(),
+                replacement: new_node(&replacement_id, PlanNodeKind::Contract, summary.clone()),
+                summary,
+            };
+            let label = format!("{} Knoten zu '{replacement_id}' verdichten", group.len());
+            match plan_catalog::gate_change(ctx, store, call.surface, &action, &label).await? {
+                ChangeGate::Refused(text) => text,
+                ChangeGate::Proceed => {
+                    let event = apply(store, action, &actor)?;
+                    format!(
+                        "{} Knoten zu Contract-Knoten '{replacement_id}' verdichtet (Revision {}).",
+                        group.len(),
+                        event.revision
+                    )
+                }
+            }
         }
 
         PlanArgs::Reopen { id, reason } => {
@@ -932,17 +1047,20 @@ async fn plan(ctx: &OpContext, call: PlanCall) -> Result<OpOutput, OpError> {
                     "'{raw}' ist keine Revisionsnummer; Aufruf: {usage}"
                 ))
             })?;
-            let event = apply(
-                store,
-                PlanAction::Supersede {
-                    new_parent_revision: RevisionId::new(parsed),
-                },
-                &actor,
-            )?;
-            format!(
-                "Plan auf Eltern-Revision {parsed} abgelöst (Revision {}).",
-                event.revision
-            )
+            let action = PlanAction::Supersede {
+                new_parent_revision: RevisionId::new(parsed),
+            };
+            let label = format!("Plan-Revision auf Eltern-Revision {parsed} ablösen");
+            match plan_catalog::gate_change(ctx, store, call.surface, &action, &label).await? {
+                ChangeGate::Refused(text) => text,
+                ChangeGate::Proceed => {
+                    let event = apply(store, action, &actor)?;
+                    format!(
+                        "Plan auf Eltern-Revision {parsed} abgelöst (Revision {}).",
+                        event.revision
+                    )
+                }
+            }
         }
 
         PlanArgs::BindGoal { goal_id } => {
@@ -989,10 +1107,12 @@ fn find_node<'a>(plan: &'a Plan, id: &str) -> Result<&'a PlanNode, OpError> {
 /// `PlanNotFound` ist kein Ausführungsfehler, sondern eine Aussage über den
 /// Zustand: es gibt noch keinen Plan. Das gehört zu `InvalidArguments`, damit
 /// ein Modell den nächsten Schritt (`plan create`) ableiten kann.
-fn map_plan_error(error: PlanError) -> OpError {
+pub(crate) fn map_plan_error(error: PlanError) -> OpError {
     match error {
         PlanError::PlanNotFound => OpError::InvalidArguments(
-            "es existiert noch kein Plan; lege ihn mit `plan create <plan-id> <ziel…>` an"
+            "es existiert noch kein Plan bzw. keiner ist aktiv; lege ihn mit `plan create \
+             <plan-id> <ziel…>` an oder wähle einen mit `plan switch <plan-id>` (`plan list` \
+             zeigt alle)"
                 .to_owned(),
         ),
         other => OpError::Execution(format!("Plan-Store lehnt ab: {other}")),
@@ -1012,7 +1132,7 @@ fn map_bridge_error(error: PlanBridgeError) -> OpError {
 // ── Argument-Helfer ──────────────────────────────────────────────────────────
 
 /// Fordert ein Pflichtargument oder meldet die Aufrufform.
-fn require_arg(value: Option<String>, usage: &str) -> Result<String, OpError> {
+pub(crate) fn require_arg(value: Option<String>, usage: &str) -> Result<String, OpError> {
     match value {
         Some(raw) if !raw.trim().is_empty() => Ok(raw.trim().to_owned()),
         _ => Err(OpError::InvalidArguments(format!(
@@ -1090,7 +1210,7 @@ fn parse_status(raw: &str) -> Result<PlanNodeStatus, OpError> {
 ///
 /// # Errors
 /// [`OpError::InvalidArguments`], wenn der Name unbekannt ist.
-fn parse_evidence_kind(raw: &str) -> Result<EvidenceKind, OpError> {
+pub(crate) fn parse_evidence_kind(raw: &str) -> Result<EvidenceKind, OpError> {
     match normalize(raw).as_str() {
         "finding" => Ok(EvidenceKind::Finding),
         "cargo_test" => Ok(EvidenceKind::CargoTest),
@@ -1216,7 +1336,7 @@ fn parse_children(spec: &str, parent: &PlanNode, usage: &str) -> Result<Vec<Plan
 // ── Ausgabe ──────────────────────────────────────────────────────────────────
 
 /// Kanonischer Name einer Knotenart (identisch zur Serde-Repräsentation).
-fn kind_label(kind: PlanNodeKind) -> &'static str {
+pub(crate) fn kind_label(kind: PlanNodeKind) -> &'static str {
     match kind {
         PlanNodeKind::Research => "research",
         PlanNodeKind::Explore => "explore",
@@ -1232,7 +1352,7 @@ fn kind_label(kind: PlanNodeKind) -> &'static str {
 }
 
 /// Kanonischer Name eines Knotenstatus (identisch zur Serde-Repräsentation).
-fn status_label(status: PlanNodeStatus) -> &'static str {
+pub(crate) fn status_label(status: PlanNodeStatus) -> &'static str {
     match status {
         PlanNodeStatus::Draft => "draft",
         PlanNodeStatus::Ready => "ready",
@@ -1245,7 +1365,7 @@ fn status_label(status: PlanNodeStatus) -> &'static str {
 }
 
 /// Verbindet Scope-Einträge zu einer Kommaliste.
-fn join_scope(scope: &[PathOrSymbol]) -> String {
+pub(crate) fn join_scope(scope: &[PathOrSymbol]) -> String {
     scope
         .iter()
         .map(PathOrSymbol::as_str)
@@ -1341,9 +1461,13 @@ fn render_plan_header(plan: &Plan) -> String {
     )
 }
 
-/// `plan inspect` — Kopf plus alle Knoten.
-fn render_inspect(plan: &Plan) -> String {
+/// `plan inspect` — Kopf, Freigabe/Fortschritt (Runde 5, Teil P) und alle
+/// Knoten.
+fn render_inspect(plan: &Plan, status_lines: &str) -> String {
     let mut lines = vec![render_plan_header(plan)];
+    if !status_lines.is_empty() {
+        lines.push(status_lines.to_owned());
+    }
     if plan.nodes.is_empty() {
         lines.push("Noch keine Knoten. `plan add <task-id> <kind> <ziel…>`".to_owned());
     } else {
@@ -1659,7 +1783,7 @@ mod tests {
             }
         };
         assert_eq!(call.surface, CallSurface::Command);
-        assert!(matches!(call.args, PlanArgs::Inspect));
+        assert!(matches!(call.args, PlanArgs::Inspect { id: None }));
         Ok(())
     }
 
@@ -1808,7 +1932,7 @@ mod tests {
         ));
         assert!(matches!(
             PlanCall::from_raw_args(&toks(&["inspect"])).map(|call| call.args),
-            Ok(PlanArgs::Inspect)
+            Ok(PlanArgs::Inspect { id: None })
         ));
     }
 
@@ -1911,7 +2035,7 @@ mod tests {
     fn default_call_is_model_surface_inspect() {
         let call = PlanCall::default();
         assert_eq!(call.surface, CallSurface::Model);
-        assert!(matches!(call.args, PlanArgs::Inspect));
+        assert!(matches!(call.args, PlanArgs::Inspect { id: None }));
     }
 
     #[test]
@@ -2040,7 +2164,8 @@ mod tests {
     #[tokio::test]
     async fn missing_plan_store_is_not_available() -> TestResult {
         let (ctx, root) = context_with(ServiceMap::new())?;
-        let result = super::plan(&ctx, PlanCall::from_command(PlanArgs::Inspect)).await;
+        let result =
+            super::plan(&ctx, PlanCall::from_command(PlanArgs::Inspect { id: None })).await;
         cleanup(root);
 
         match result {
@@ -2065,7 +2190,8 @@ mod tests {
         services.insert(PlanToolConfig::default());
         let (ctx, root) = context_with(services)?;
 
-        let result = super::plan(&ctx, PlanCall::from_command(PlanArgs::Inspect)).await;
+        let result =
+            super::plan(&ctx, PlanCall::from_command(PlanArgs::Inspect { id: None })).await;
         cleanup(root);
 
         match result {
@@ -2391,7 +2517,8 @@ mod tests {
     #[tokio::test]
     async fn inspect_without_a_plan_points_at_plan_create() -> TestResult {
         let (ctx, _store, root) = context_with_store()?;
-        let result = super::plan(&ctx, PlanCall::from_command(PlanArgs::Inspect)).await;
+        let result =
+            super::plan(&ctx, PlanCall::from_command(PlanArgs::Inspect { id: None })).await;
         cleanup(root);
 
         match result {
@@ -2435,6 +2562,427 @@ mod tests {
                 )));
             }
         }
+        Ok(())
+    }
+
+    // ── Runde 5, Teil P: Katalog, Freigabe, Goal-Verfolgung, Schritte ───────
+
+    /// Kontext mit Plan- und Goal-Store; `tui = true` legt zusätzlich den
+    /// Bestätigungskanal ab (wie die TUI-Montage) und gibt den Empfänger zurück.
+    #[allow(clippy::type_complexity)]
+    fn catalog_context(
+        tui: bool,
+    ) -> TestResult<(
+        OpContext,
+        Arc<dyn PlanStore>,
+        Arc<dyn harw_plan::goal::GoalStore>,
+        Option<harw_tool_plan::PlanUiReceiver>,
+        std::path::PathBuf,
+    )> {
+        let store: Arc<dyn PlanStore> = Arc::new(InMemoryPlanStore::new());
+        let goals: Arc<dyn harw_plan::goal::GoalStore> =
+            Arc::new(harw_plan::InMemoryGoalStore::new());
+        let mut services = ServiceMap::new();
+        services.insert(Arc::clone(&store));
+        services.insert(Arc::clone(&goals));
+        services.insert(PlanToolConfig::enabled_defaults());
+        let receiver = if tui {
+            let (sender, receiver) = harw_tool_plan::plan_ui_channel();
+            services.insert(harw_tool_plan::PlanConfirmChannel::new(sender));
+            Some(receiver)
+        } else {
+            None
+        };
+        let (op, root) = context_with(services)?;
+        Ok((op, store, goals, receiver, root))
+    }
+
+    async fn run_model(ctx: &OpContext, args: PlanArgs) -> Result<String, OpError> {
+        super::plan(ctx, PlanCall::from_model(args))
+            .await
+            .map(|output| output.text)
+    }
+
+    fn create_args(id: &str, goal: &str) -> PlanArgs {
+        PlanArgs::Create {
+            id: Some(id.to_owned()),
+            goal: Some(goal.to_owned()),
+        }
+    }
+
+    fn add_args(id: &str) -> PlanArgs {
+        PlanArgs::Add {
+            id: Some(id.to_owned()),
+            kind: Some("docs".to_owned()),
+            objective: Some(format!("Schritt {id}")),
+        }
+    }
+
+    fn approval_of(store: &Arc<dyn PlanStore>, id: &str) -> TestResult<harw_plan::PlanApproval> {
+        store
+            .plan_meta(&PlanId::new(id))
+            .map(|meta| meta.approval)
+            .map_err(ctx("plan_meta"))
+    }
+
+    /// Antwortet auf die nächste Bestätigungsfrage und liefert ihren Inhalt.
+    async fn answer_next(
+        receiver: &mut harw_tool_plan::PlanUiReceiver,
+        decision: harw_tool_plan::PlanConfirmDecision,
+    ) -> Option<String> {
+        match receiver.recv().await {
+            Some(harw_tool_plan::PlanUiRequest::ConfirmPlan(prompt)) => {
+                let content = prompt.content().to_owned();
+                prompt.decide(decision);
+                Some(content)
+            }
+            _ => None,
+        }
+    }
+
+    /// Transkript-Fall: ein automatisch angelegter Plan (`plan-analyze`)
+    /// blockiert das eigene `create` nicht mehr; der alte Plan bleibt gelistet.
+    #[tokio::test]
+    async fn create_after_an_auto_plan_succeeds_and_list_shows_both() -> TestResult {
+        let (op, store, _goals, _rx, root) = catalog_context(false)?;
+        store
+            .apply(
+                PlanAction::Create {
+                    plan_id: PlanId::new("plan-analyze"),
+                    goal: "Analyse".to_owned(),
+                },
+                "op:analyze",
+            )
+            .map_err(ctx("Auto-Plan"))?;
+        let created = run_model(&op, create_args("crypt-guard-hardening-v1", "Härtung")).await;
+        let listed = run_command(&op, &["plans"]).await;
+        cleanup(root);
+        let created = created.map_err(ctx("create"))?;
+        assert!(created.contains("angelegt"), "{created}");
+        let listed = listed.map_err(ctx("list"))?;
+        assert!(listed.contains("plan-analyze"), "{listed}");
+        assert!(
+            listed.contains("* crypt-guard-hardening-v1 [aktiv"),
+            "{listed}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_create_points_at_switch() -> TestResult {
+        let (op, _store, _goals, _rx, root) = catalog_context(false)?;
+        run_command(&op, &["create", "p-a", "A"])
+            .await
+            .map_err(ctx("create"))?;
+        let again = run_command(&op, &["create", "p-a", "nochmal"]).await;
+        cleanup(root);
+        match again {
+            Err(OpError::Execution(message)) => {
+                assert!(message.contains("plan switch p-a"), "{message}");
+                Ok(())
+            }
+            other => Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
+    #[tokio::test]
+    async fn switch_archive_and_inspect_by_id_on_the_command_surface() -> TestResult {
+        let (op, store, _goals, _rx, root) = catalog_context(false)?;
+        run_command(&op, &["create", "p-a", "A"])
+            .await
+            .map_err(ctx("create a"))?;
+        run_command(&op, &["create", "p-b", "B"])
+            .await
+            .map_err(ctx("create b"))?;
+        let switched = run_command(&op, &["switch", "p-a"]).await;
+        let archived = run_command(&op, &["archive", "p-b"]).await;
+        let inspected = run_command(&op, &["inspect", "p-b"]).await;
+        let active = store.current().map(|plan| plan.id);
+        cleanup(root);
+        assert!(switched.map_err(ctx("switch"))?.contains("'p-a'"));
+        assert!(archived.map_err(ctx("archive"))?.contains("nicht gelöscht"));
+        let inspected = inspected.map_err(ctx("inspect p-b"))?;
+        assert!(inspected.contains("Plan p-b"), "{inspected}");
+        assert!(inspected.contains("archiviert"), "{inspected}");
+        assert_eq!(active.map_err(ctx("current"))?, PlanId::new("p-a"));
+        Ok(())
+    }
+
+    /// Befehlsfläche: die Nutzerin legt selbst an — sofort bestätigt.
+    #[tokio::test]
+    async fn human_create_is_confirmed_immediately() -> TestResult {
+        let (op, store, _goals, _rx, root) = catalog_context(true)?;
+        let created = run_command(&op, &["create", "p-mensch", "Ziel"]).await;
+        let approval = approval_of(&store, "p-mensch");
+        cleanup(root);
+        created.map_err(ctx("create"))?;
+        assert_eq!(approval?, harw_plan::PlanApproval::Confirmed);
+        Ok(())
+    }
+
+    /// „Nicht-TUI legt proposed an“ und meldet, dass niemand bestätigen kann.
+    #[tokio::test]
+    async fn model_create_without_tui_is_proposed_and_says_so() -> TestResult {
+        let (op, store, _goals, _rx, root) = catalog_context(false)?;
+        let created = run_model(&op, create_args("p-x", "Ziel")).await;
+        run_model(&op, add_args("t-1")).await.map_err(ctx("add"))?;
+        let submitted = run_model(&op, PlanArgs::Submit { id: None }).await;
+        let approval = approval_of(&store, "p-x");
+        cleanup(root);
+        let created = created.map_err(ctx("create"))?;
+        assert!(created.contains("VORSCHLAG"), "{created}");
+        assert!(created.contains("kein Bestätigungsfenster"), "{created}");
+        assert!(
+            submitted
+                .map_err(ctx("submit"))?
+                .contains("bleibt ein Vorschlag")
+        );
+        assert_eq!(approval?, harw_plan::PlanApproval::Proposed);
+        Ok(())
+    }
+
+    /// „create zeigt den Plan und wartet auf Bestätigung“ und „bestätigter
+    /// Plan wird an ein Goal gebunden“: Entwurf ohne Rückfragen, `submit`
+    /// zeigt den gerenderten Plan, erst die Bestätigung macht ihn verbindlich.
+    #[tokio::test]
+    async fn submit_shows_the_plan_waits_and_binds_a_goal_on_confirm() -> TestResult {
+        let (op, store, goals, rx, root) = catalog_context(true)?;
+        let mut rx = rx.ok_or(TestError::Missing("Bestätigungskanal"))?;
+        run_model(&op, create_args("p-tui", "Secret-Key 0600"))
+            .await
+            .map_err(ctx("create"))?;
+        // Entwurf: Knoten und Kanten ohne Rückfrage.
+        run_model(&op, add_args("t-1"))
+            .await
+            .map_err(ctx("add 1"))?;
+        run_model(&op, add_args("t-2"))
+            .await
+            .map_err(ctx("add 2"))?;
+        run_model(
+            &op,
+            PlanArgs::Dep {
+                child: Some("t-2".to_owned()),
+                parent: Some("t-1".to_owned()),
+            },
+        )
+        .await
+        .map_err(ctx("dep"))?;
+        assert!(rx.try_recv().is_err(), "der Entwurf fragt nicht");
+        assert_eq!(
+            approval_of(&store, "p-tui")?,
+            harw_plan::PlanApproval::Proposed
+        );
+
+        let submit = run_model(&op, PlanArgs::Submit { id: None });
+        let answer = answer_next(&mut rx, harw_tool_plan::PlanConfirmDecision::Confirm);
+        let (submitted, shown) = tokio::join!(submit, answer);
+        let approval = approval_of(&store, "p-tui");
+        let plan = store.current().map_err(ctx("current"));
+        let goal = goals.current().map_err(ctx("goal"));
+        cleanup(root);
+
+        let shown = shown.ok_or(TestError::Missing("Freigabefenster"))?;
+        assert!(shown.contains("Secret-Key 0600"), "Ziel: {shown}");
+        assert!(shown.contains("**t-2**"), "Schritte: {shown}");
+        assert!(shown.contains("nach: t-1"), "Abhängigkeiten: {shown}");
+        assert!(shown.contains("## Wellen"), "Wellen: {shown}");
+        assert!(shown.contains("Verifikation"), "Verifikation: {shown}");
+        let submitted = submitted.map_err(ctx("submit"))?;
+        assert!(submitted.contains("bestätigt und aktiv"), "{submitted}");
+        assert_eq!(approval?, harw_plan::PlanApproval::Confirmed);
+        let plan = plan?;
+        let goal = goal?;
+        assert_eq!(plan.goal_id.as_deref(), Some("goal-p-tui"));
+        assert_eq!(goal.id.as_str(), "goal-p-tui");
+        assert_eq!(goal.statement, "Secret-Key 0600");
+        assert_eq!(goal.plan_id, Some(PlanId::new("p-tui")));
+        Ok(())
+    }
+
+    /// „Ablehnung gibt die Rückmeldung weiter“; der Plan bleibt Vorschlag,
+    /// und seine Umsetzung ist in der TUI gesperrt.
+    #[tokio::test]
+    async fn rejected_submit_returns_feedback_and_blocks_execution() -> TestResult {
+        let (op, store, goals, rx, root) = catalog_context(true)?;
+        let mut rx = rx.ok_or(TestError::Missing("Bestätigungskanal"))?;
+        run_model(&op, create_args("p-nein", "Ziel"))
+            .await
+            .map_err(ctx("create"))?;
+        run_model(&op, add_args("t-1")).await.map_err(ctx("add"))?;
+        let submit = run_model(&op, PlanArgs::Submit { id: None });
+        let answer = answer_next(
+            &mut rx,
+            harw_tool_plan::PlanConfirmDecision::Reject {
+                feedback: "erst Tests schreiben".to_owned(),
+            },
+        );
+        let (submitted, _) = tokio::join!(submit, answer);
+        let started = run_model(
+            &op,
+            PlanArgs::Step {
+                id: Some("t-1".to_owned()),
+                state: Some("running".to_owned()),
+                evidence: None,
+            },
+        )
+        .await;
+        let approval = approval_of(&store, "p-nein");
+        let has_goal = goals.current().is_ok();
+        cleanup(root);
+        let submitted = submitted.map_err(ctx("submit"))?;
+        assert!(submitted.contains("NICHT bestätigt"), "{submitted}");
+        assert!(submitted.contains("erst Tests schreiben"), "{submitted}");
+        assert_eq!(approval?, harw_plan::PlanApproval::Proposed);
+        assert!(!has_goal, "ohne Bestätigung kein Goal");
+        let started = started.map_err(ctx("step"))?;
+        assert!(started.contains("nur ein Vorschlag"), "{started}");
+        Ok(())
+    }
+
+    /// Wesentliche Änderung eines bestätigten Plans fragt in der TUI; eine
+    /// Ablehnung übernimmt nichts.
+    #[tokio::test]
+    async fn adding_a_node_to_a_confirmed_plan_asks_first() -> TestResult {
+        let (op, store, _goals, rx, root) = catalog_context(true)?;
+        let mut rx = rx.ok_or(TestError::Missing("Bestätigungskanal"))?;
+        // Von der Nutzerin selbst angelegt → bestätigt.
+        run_command(&op, &["create", "p-fest", "Ziel"])
+            .await
+            .map_err(ctx("create"))?;
+        let add = run_model(&op, add_args("t-neu"));
+        let answer = answer_next(
+            &mut rx,
+            harw_tool_plan::PlanConfirmDecision::Reject {
+                feedback: String::new(),
+            },
+        );
+        let (added, shown) = tokio::join!(add, answer);
+        let nodes = store.current().map(|plan| plan.nodes.len());
+        cleanup(root);
+        let shown = shown.ok_or(TestError::Missing("Freigabefenster"))?;
+        assert!(
+            shown.contains("t-neu"),
+            "die Vorschau zeigt den neuen Knoten: {shown}"
+        );
+        assert!(shown.contains("**Änderung:**"), "{shown}");
+        assert!(added.map_err(ctx("add"))?.contains("NICHT übernommen"));
+        assert_eq!(nodes.map_err(ctx("current"))?, 0);
+        Ok(())
+    }
+
+    /// „Schritt-Status mit bzw. ohne Evidenz“ und „Fortschrittsanzeige“.
+    #[tokio::test]
+    async fn step_done_needs_evidence_and_inspect_shows_progress() -> TestResult {
+        let (op, _store, _goals, _rx, root) = catalog_context(false)?;
+        run_command(&op, &["create", "p-steps", "Ziel"])
+            .await
+            .map_err(ctx("create"))?;
+        run_command(&op, &["add", "t-1", "docs", "erster"])
+            .await
+            .map_err(ctx("add 1"))?;
+        run_command(&op, &["add", "t-2", "docs", "zweiter"])
+            .await
+            .map_err(ctx("add 2"))?;
+        let without = run_command(&op, &["step", "t-1", "done"]).await;
+        let with = run_command(
+            &op,
+            &["step", "t-1", "done", "cargo_test:cargo", "test", "-p", "x"],
+        )
+        .await;
+        let blocked =
+            run_command(&op, &["step", "t-2", "blocked", "wartet", "auf", "Review"]).await;
+        let inspected = run_command(&op, &["inspect"]).await;
+        cleanup(root);
+
+        let without = without.map_err(ctx("done ohne Beleg"))?;
+        assert!(without.contains("→ läuft"), "{without}");
+        assert!(without.contains("Ohne Beleg"), "{without}");
+        let with = with.map_err(ctx("done mit Beleg"))?;
+        assert!(with.contains("→ erledigt"), "{with}");
+        assert!(with.contains("1/2"), "{with}");
+        assert!(blocked.map_err(ctx("blocked"))?.contains("blockiert"));
+        let inspected = inspected.map_err(ctx("inspect"))?;
+        assert!(
+            inspected.contains("Fortschritt [█████░░░░░] 1/2"),
+            "{inspected}"
+        );
+        assert!(
+            inspected.contains("aktueller Schritt: t-2 (blockiert)"),
+            "{inspected}"
+        );
+        assert!(inspected.contains("⚠"), "{inspected}");
+        Ok(())
+    }
+
+    /// „Fortschrittsanzeige“ in `/goal show`: n/m Schritte des gebundenen Plans.
+    #[tokio::test]
+    async fn goal_show_progress_line_follows_the_bound_plan() -> TestResult {
+        let (op, _store, goals, _rx, root) = catalog_context(false)?;
+        run_command(&op, &["create", "p-g", "Ziel"])
+            .await
+            .map_err(ctx("create"))?;
+        run_command(&op, &["add", "t-1", "docs", "eins"])
+            .await
+            .map_err(ctx("add"))?;
+        // Die Nutzerin bestätigt selbst: bindet ein Goal.
+        let submitted = run_command(&op, &["submit"]).await;
+        run_command(&op, &["step", "t-1", "running"])
+            .await
+            .map_err(ctx("step"))?;
+        let goal = goals.current().map_err(ctx("goal"));
+        let line = goal
+            .as_ref()
+            .ok()
+            .and_then(|goal| crate::plan_catalog::goal_progress_line(&op, goal));
+        cleanup(root);
+        assert!(
+            submitted
+                .map_err(ctx("submit"))?
+                .contains("neues Goal 'goal-p-g'")
+        );
+        let line = line.ok_or(TestError::Missing("Fortschrittszeile"))?;
+        assert!(line.contains("0/1"), "{line}");
+        assert!(line.contains("aktueller Schritt: t-1 (läuft)"), "{line}");
+        Ok(())
+    }
+
+    #[test]
+    fn new_subcommands_parse_from_raw_tokens() -> TestResult {
+        let parse = |tokens: &[&str]| PlanCall::from_raw_args(&toks(tokens)).map(|call| call.args);
+        assert!(matches!(parse(&["plans"]), Ok(PlanArgs::List)));
+        assert!(matches!(parse(&["list"]), Ok(PlanArgs::List)));
+        assert!(matches!(
+            parse(&["inspect", "p-1"]),
+            Ok(PlanArgs::Inspect { id: Some(ref id) }) if id == "p-1"
+        ));
+        assert!(matches!(
+            parse(&["switch", "p-1"]),
+            Ok(PlanArgs::Switch { id: Some(ref id) }) if id == "p-1"
+        ));
+        assert!(matches!(
+            parse(&["archive", "p-1"]),
+            Ok(PlanArgs::Archive { .. })
+        ));
+        assert!(matches!(
+            parse(&["submit"]),
+            Ok(PlanArgs::Submit { id: None })
+        ));
+        match parse(&["step", "t-1", "done", "diff:src/a.rs"]) {
+            Ok(PlanArgs::Step {
+                id,
+                state,
+                evidence,
+            }) => {
+                assert_eq!(id.as_deref(), Some("t-1"));
+                assert_eq!(state.as_deref(), Some("done"));
+                assert_eq!(evidence.as_deref(), Some("diff:src/a.rs"));
+            }
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        // Modell-Fläche: `list` ist der kanonische Name.
+        let from_json: PlanCall = serde_json::from_value(serde_json::json!({"action": "list"}))
+            .map_err(ctx("json list"))?;
+        assert!(matches!(from_json.args, PlanArgs::List));
         Ok(())
     }
 }

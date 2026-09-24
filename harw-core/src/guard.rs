@@ -158,6 +158,17 @@ pub trait ProgressObserver: Send + Sync {
 
     /// Meldet einen abgeschlossenen Tool-Aufruf.
     fn on_tool_call(&self, _session_id: &harw_types::SessionId) {}
+
+    /// Runde 5, Teil M: meldet an einer Runden-Grenze den jüngsten
+    /// Assistententext der Sitzung (Aktivitätsjournal des Kindes).
+    fn on_assistant_text(&self, _session_id: &harw_types::SessionId, _text: &str) {}
+
+    /// Runde 5, Teil M: entnimmt an einer Runden-Grenze die wartenden
+    /// Nachrichten des Elternteils (`agent.message`) bzw. der Kinder
+    /// (`parent.message`) für diese Sitzung. Standard: keine.
+    fn take_inbound_messages(&self, _session_id: &harw_types::SessionId) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Schwellenwerte und Ein/Aus-Schalter der Turn-Wächter.

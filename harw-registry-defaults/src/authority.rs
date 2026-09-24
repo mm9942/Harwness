@@ -566,7 +566,8 @@ fn delegation_targets_of(tables: &toml::Table) -> Option<Vec<String>> {
 /// Belegt an den Werkzeug-Crates (Stand W5 RD):
 /// - `fs.read/list/search/glob/grep` → `ReadWorkspace`
 ///   (`harw-tool-fs/src/{read.rs:97,list.rs:107,search.rs:191,glob.rs:114,grep.rs:256}`),
-///   `fs.write` → `WriteWorkspace` (`write.rs:115`).
+///   `fs.write` → `WriteWorkspace` (`write.rs:115`); ebenso `fs.edit`
+///   (`edit.rs`, Runde 5, Teil D).
 /// - `doc.read_pdf` → `ReadWorkspace` (`harw-tool-doc/src/tool.rs`, dieselbe
 ///   Berechtigung wie `fs.read`: Datei muss innerhalb des Workspace liegen).
 /// - `shell.exec` → `ExecuteProcess` (`harw-tool-shell/src/exec.rs:574`).
@@ -626,12 +627,17 @@ fn delegation_targets_of(tables: &toml::Table) -> Option<Vec<String>> {
 pub fn tool_permission(tool: &str) -> Option<Permission> {
     let listed = |list: &[&str]| list.contains(&tool);
     if tool == "fs.write"
+        || tool == "fs.edit"
         || listed(AGENT_DEFINITION_WRITE_TOOLS)
         || listed(SKILL_PROPOSAL_PROPOSE_TOOLS)
         || listed(SKILL_PROPOSAL_DECIDE_TOOLS)
     {
         Some(Permission::WriteWorkspace)
-    } else if listed(SHELL_TOOLS) || listed(PROCESS_TOOLS) || listed(LATEX_TOOLS) {
+    } else if listed(SHELL_TOOLS)
+        || listed(PROCESS_TOOLS)
+        || listed(LATEX_TOOLS)
+        || listed(crate::profile::SUDO_TOOLS)
+    {
         Some(Permission::ExecuteProcess)
     } else if listed(FS_READ_ONLY_TOOLS)
         || listed(DOC_TOOLS)
@@ -646,6 +652,11 @@ pub fn tool_permission(tool: &str) -> Option<Permission> {
         || listed(DiaryToolProvider::TOOL_NAMES)
         || listed(PalaceToolProvider::TOOL_NAMES)
         || listed(KanbanReadToolProvider::TOOL_NAMES)
+        // Runde 5, Teil F: `plan.write` schreibt ausschließlich das
+        // Harness-Artefakt `.harw/plans/<slug>.md` und muss unter der
+        // Plan-Decke (ohne `WriteWorkspace`) laufen; die übrigen drei lesen
+        // nur die Antwort der Nutzerin. Registriert nur für die Wurzel.
+        || listed(harw_tool_plan::PlanToolProvider::TOOL_NAMES)
     {
         Some(Permission::ReadWorkspace)
     } else if listed(DEPS_SOURCE_TOOLS) {
@@ -727,12 +738,21 @@ mod tests {
             tool_permission("fs.write"),
             Some(Permission::WriteWorkspace)
         );
+        assert_eq!(tool_permission("fs.edit"), Some(Permission::WriteWorkspace));
         assert_eq!(
             tool_permission("shell.exec"),
             Some(Permission::ExecuteProcess)
         );
         assert_eq!(tool_permission("plan"), None);
         assert_eq!(tool_permission("delegate_wave"), None);
+        // Runde 5, Teil H: `agent.result` liest nur eigene Kind-Ergebnisse —
+        // die Grenze zieht der Spawner (Eltern-Kind-Bindung), keine
+        // Sandbox-Rechteklasse.
+        assert_eq!(tool_permission("agent.result"), None);
+        // Runde 5, Teil K: `agent.status`/`agent.cancel` wirken nur auf
+        // eigene Hintergrund-Agenten; die Grenze zieht der Spawner.
+        assert_eq!(tool_permission("agent.status"), None);
+        assert_eq!(tool_permission("agent.cancel"), None);
     }
 
     #[test]
@@ -742,6 +762,24 @@ mod tests {
         assert_eq!(names.len(), declared.len());
         for (name, permission) in names.iter().zip(declared.iter()) {
             assert_eq!(tool_permission(name), *permission, "{name}");
+        }
+    }
+
+    /// Runde 5, Teil F: die Plan-Werkzeuge tragen `ReadWorkspace` — weder
+    /// `WriteWorkspace` noch `ExecuteProcess`, sonst liefen sie unter der
+    /// Plan-Decke nicht bzw. wären mehr als „nur `.harw/plans/`“.
+    #[test]
+    fn test_tool_permission_matches_plan_tool_provider_declarations() {
+        let names = harw_tool_plan::PlanToolProvider::TOOL_NAMES;
+        let declared = harw_tool_plan::PlanToolProvider::TOOL_PERMISSIONS;
+        assert_eq!(names.len(), declared.len());
+        for (name, permission) in names.iter().zip(declared.iter()) {
+            assert_eq!(tool_permission(name), *permission, "{name}");
+            assert_eq!(
+                tool_permission(name),
+                Some(Permission::ReadWorkspace),
+                "{name}"
+            );
         }
     }
 

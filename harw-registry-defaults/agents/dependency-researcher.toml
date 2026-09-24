@@ -75,9 +75,14 @@ admitted = [
   "diary.read",
   "palace.search",
   "palace.recall",
+  # Runde 5, Teil M: Zwischenstand (info) oder Frage (question) an den direkten
+  # Elternteil; nur Text, keine Rechte (siehe
+  # `harw_registry_defaults::profile::parent_message_tools_for_role`).
+  "parent.message",
 ]
 forbidden = [
   "fs.write",
+  "fs.edit",
   "shell.exec",
   "deps.graph",
   "deps.locked",

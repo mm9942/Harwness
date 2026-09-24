@@ -10,6 +10,8 @@
 //! | `/models` / `/models show` | Tabelle aller Rollen (Provider, Modell, Quelle, Effort) plus Live-Modell der Sitzung |
 //! | `/models set <rolle> <ziel>` | Persistiert das Modell der Rolle in der Profil-`config.toml` |
 //! | `/models reset <rolle>` | Entfernt die explizite Wahl der Rolle (zurück auf ihren Standard) |
+//! | `/models worker` | Wahl je UIA-Worker-Rolle („wie UIA“ oder Provider/Modell), Runde 5 Teil G |
+//! | `/models worker <rolle\|all> <uia\|ziel>` | Setzt die Wahl einer bzw. aller UIA-Worker-Rollen |
 //!
 //! `<ziel>` ist entweder eine bekannte Modell-ID (Schlüssel, `id` oder Alias
 //! aus `config.models`; der Provider wird aus dem Katalog übernommen) oder
@@ -135,7 +137,10 @@ fn canonical_provider_name(config: &ResolvedConfig, name: &str) -> String {
 ///
 /// # Fehler
 /// [`OpError::InvalidArguments`] mit deutscher Meldung, wenn beides scheitert.
-fn resolve_target(config: &ResolvedConfig, target: &str) -> Result<(String, String), OpError> {
+pub(crate) fn resolve_target(
+    config: &ResolvedConfig,
+    target: &str,
+) -> Result<(String, String), OpError> {
     let known = config
         .models
         .get(target)
@@ -162,7 +167,7 @@ fn resolve_target(config: &ResolvedConfig, target: &str) -> Result<(String, Stri
 
 /// Liefert den effektiven UIA-Provider: Live-/Config-UIA-Auswahl, sonst
 /// `default_provider` (die UIA erbt ihn ohne eigenen Pin).
-fn effective_uia_provider(
+pub(crate) fn effective_uia_provider(
     controller: Option<&SharedSessionController>,
     config: &ResolvedConfig,
 ) -> Option<String> {
@@ -175,7 +180,7 @@ fn effective_uia_provider(
 }
 
 /// Hängt eine Persistenz-Notiz an bzw. meldet den Erfolg.
-fn finish_text(mut text: String, note: Option<&str>) -> String {
+pub(crate) fn finish_text(mut text: String, note: Option<&str>) -> String {
     match note {
         Some(note) => {
             text.push('\n');
@@ -300,19 +305,12 @@ fn handle_set(
         ModelRole::Uia => {
             persistence.persist_uia_selection(Some(provider.as_str()), Some(model.as_str()))
         }
-        ModelRole::UiaWorker => {
-            let controller = ctx.service::<SharedSessionController>();
-            if let Some(uia_provider) = effective_uia_provider(controller, config)
-                && uia_provider != provider
-            {
-                return Err(OpError::InvalidArguments(format!(
-                    "Das UIA-Worker-Modell muss vom UIA-Provider '{uia_provider}' stammen, \
-                     '{model}' gehört zu '{provider}'. Zuerst die UIA umstellen: \
-                     /models set uia <modell>."
-                )));
-            }
-            persistence.persist_uia_worker_model(Some(model.as_str()))
-        }
+        // Runde 5, Teil G: keine Kopplung an den UIA-Provider mehr — die
+        // Rolle `uia-worker` bekommt eine eigene Wahl mit eigenem Provider.
+        ModelRole::UiaWorker => persistence.persist_uia_worker_role_model(
+            "uia-worker",
+            Some(format!("{provider}/{model}").as_str()),
+        ),
         other => {
             let point = other.internal_point().ok_or_else(|| {
                 OpError::InvalidArguments(format!(
@@ -346,7 +344,13 @@ fn handle_reset(ctx: &OpContext, role: ModelRole) -> Result<OpOutput, OpError> {
     let persistence = crate::config_util::selection_persistence(ctx);
     let note = match role {
         ModelRole::Uia => persistence.clear_uia_selection(),
-        ModelRole::UiaWorker => persistence.persist_uia_worker_model(None),
+        // Runde 5, Teil G: eigener Eintrag und alter Familien-Pin weg → die
+        // Rolle folgt wieder der UIA.
+        ModelRole::UiaWorker => {
+            let role_note = persistence.persist_uia_worker_role_model("uia-worker", None);
+            let legacy_note = persistence.persist_uia_worker_model(None);
+            role_note.or(legacy_note)
+        }
         other => {
             let point = other.internal_point().ok_or_else(|| {
                 OpError::InvalidArguments(format!(
@@ -440,9 +444,20 @@ async fn models(ctx: &OpContext, args: ModelsArgs) -> Result<OpOutput, OpError> 
             let role = parse_role(args.role.as_deref(), "/models reset <rolle>")?;
             handle_reset(ctx, role)
         }
+        // Runde 5, Teil G: eigene Modellwahl je UIA-Worker-Rolle.
+        "worker" | "workers" => {
+            let config = crate::provider::resolved_config(ctx)?;
+            crate::models_workers::handle_worker(
+                ctx,
+                &config,
+                args.role.as_deref(),
+                args.target.as_deref(),
+            )
+        }
         other => Err(OpError::InvalidArguments(format!(
             "Unbekanntes /models-Sub-Kommando: '{other}'. Gültig: show, \
-             set <rolle> <modell|provider/modell>, reset <rolle>."
+             set <rolle> <modell|provider/modell>, reset <rolle>, \
+             worker [<rolle|all> <uia|modell|provider/modell>]."
         ))),
     }
 }
@@ -785,27 +800,32 @@ mod tests {
         Ok(())
     }
 
+    /// Runde 5, Teil G: ein UIA-Worker-Modell eines anderen Providers als
+    /// die UIA wird angenommen und als eigene Rollenwahl gespeichert.
     #[tokio::test]
-    async fn models_set_uia_worker_requires_uia_provider() -> TestResult {
+    async fn models_set_uia_worker_accepts_another_provider() -> TestResult {
         let mut config = test_config();
         config.harness.uia_provider = Some("provider-a".to_owned());
         let fixture = fixture(config, None)?;
 
-        let rejected = run(&fixture, &["set", "uia-worker", "openrouter/some-model"]).await;
-        assert!(
-            matches!(rejected, Err(OpError::InvalidArguments(ref message)) if message.contains("UIA-Provider")),
-            "fremder Provider muss abgelehnt werden: {rejected:?}"
-        );
-        assert!(fixture.recorder.calls().is_empty());
-
+        run(&fixture, &["set", "uia-worker", "openrouter/some-model"])
+            .await
+            .map_err(ctx("fremder Provider"))?;
         run(&fixture, &["set", "uia-worker", "model-a"])
             .await
             .map_err(ctx("passender Provider"))?;
         assert_eq!(
             fixture.recorder.calls(),
-            vec![RecordedSelectionPersistCall::UiaWorkerModel {
-                model: Some("model-a-2026".to_owned()),
-            }]
+            vec![
+                RecordedSelectionPersistCall::UiaWorkerRoleModel {
+                    role: "uia-worker".to_owned(),
+                    value: Some("openrouter/some-model".to_owned()),
+                },
+                RecordedSelectionPersistCall::UiaWorkerRoleModel {
+                    role: "uia-worker".to_owned(),
+                    value: Some("provider-a/model-a-2026".to_owned()),
+                },
+            ]
         );
         Ok(())
     }
@@ -826,6 +846,10 @@ mod tests {
             fixture.recorder.calls(),
             vec![
                 RecordedSelectionPersistCall::ClearUia,
+                RecordedSelectionPersistCall::UiaWorkerRoleModel {
+                    role: "uia-worker".to_owned(),
+                    value: None,
+                },
                 RecordedSelectionPersistCall::UiaWorkerModel { model: None },
                 RecordedSelectionPersistCall::InternalModel {
                     point: InternalModelPoint::WorkerSimple,

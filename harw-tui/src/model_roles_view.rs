@@ -11,6 +11,13 @@
 //! zurück. Frische Daten kommen über [`OverlayView::refresh_command`]
 //! (`/models show`) und [`OverlayView::apply_data`].
 //!
+//! Runde 5, Teil G: [`ModelRolesView::uia_workers`] zeigt denselben
+//! Tabellenrahmen als Bereich „UIA-Worker-Modelle“ — je UIA-Worker-Rolle
+//! ihre Wahl („wie UIA“ oder Provider/Modell). `Enter` öffnet über
+//! `/models pick <rolle>` die Modellwahl der Rolle, `r` setzt sie auf „wie
+//! UIA“, `a` alle Rollen (`/models worker all uia`), `Esc` schließt; Daten
+//! kommen über `/models worker`.
+//!
 //! # Nebenläufigkeit
 //! Keine; der Aufrufer hält die Ansicht exklusiv.
 //!
@@ -18,7 +25,10 @@
 //! Keine — ein fehlgeschlagenes Nachladen wird als Hinweiszeile angezeigt.
 
 use crossterm::event::{KeyCode, KeyEvent};
-use harw_config::{ModelRole, ResolvedConfig, resolve_role_models};
+use harw_config::{
+    ModelRole, ResolvedConfig, UIA_WORKER_ROLES, UiaWorkerModelChoice, resolve_role_models,
+    resolve_uia_worker_models,
+};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -51,6 +61,26 @@ const FOOTER: &str = "j/k wählen · Enter Modell wählen · r zurücksetzen · 
 /// Spaltenbreiten (Zeichen): Rolle, Provider, Modell, Quelle, Effort.
 const WIDTHS: [usize; 5] = [24, 14, 30, 22, 8];
 
+/// Runde 5, Teil G: Befehl, der die Daten des Worker-Bereichs liefert.
+pub(crate) const WORKERS_REFRESH_COMMAND: &str = "/models worker";
+
+/// Runde 5, Teil G: Fußzeile des Worker-Bereichs.
+const WORKERS_FOOTER: &str =
+    "j/k wählen · Enter Modell wählen · r wie UIA · a alle wie UIA · Esc schließen";
+
+/// Runde 5, Teil G: Wirkungs-Spalte des Worker-Bereichs.
+const WORKER_EFFECT: &str = "neue Worker";
+
+/// Welche Tabelle die Ansicht zeigt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    /// Modelle je Rolle (`/models`, F8).
+    Roles,
+    /// Runde 5, Teil G: Bereich „UIA-Worker-Modelle“ — eine Zeile je
+    /// UIA-Worker-Rolle mit ihrer Wahl („wie UIA“ oder Provider/Modell).
+    UiaWorkers,
+}
+
 /// Eine Tabellenzeile (Rolle oder Live-Sitzung).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RoleRow {
@@ -82,11 +112,29 @@ impl RoleRow {
     }
 
     /// Wirkungs-Spalte.
-    fn effect(&self) -> &'static str {
-        if self.key.is_some() {
-            ROLE_EFFECT
-        } else {
-            LIVE_EFFECT
+    fn effect(&self, mode: ViewMode) -> &'static str {
+        match (mode, self.key.is_some()) {
+            (ViewMode::UiaWorkers, _) => WORKER_EFFECT,
+            (ViewMode::Roles, true) => ROLE_EFFECT,
+            (ViewMode::Roles, false) => LIVE_EFFECT,
+        }
+    }
+
+    /// Runde 5, Teil G: Zeile einer UIA-Worker-Rolle.
+    fn worker(resolved: &harw_config::ResolvedUiaWorkerModel) -> Self {
+        let (provider, model) = match &resolved.choice {
+            UiaWorkerModelChoice::Fixed { provider, model } => {
+                (Some(provider.clone()), Some(model.clone()))
+            }
+            UiaWorkerModelChoice::FollowUia => (None, Some(resolved.choice.label())),
+        };
+        Self {
+            key: Some(resolved.role.clone()),
+            label: resolved.role.clone(),
+            provider,
+            model,
+            source: resolved.source.label().to_owned(),
+            effort: None,
         }
     }
 }
@@ -94,12 +142,17 @@ impl RoleRow {
 /// Ansicht „Modelle je Rolle“ (implementiert [`OverlayView`]).
 #[derive(Debug, Clone)]
 pub(crate) struct ModelRolesView {
-    /// Zeile 0 ist die Live-Sitzung, danach die Rollen.
+    /// Zeile 0 ist die Live-Sitzung, danach die Rollen (im Worker-Bereich:
+    /// nur die UIA-Worker-Rollen, keine Live-Zeile).
     rows: Vec<RoleRow>,
     /// Ausgewählte Zeile.
     selected: usize,
     /// Letzter Fehler beim Nachladen.
     error: Option<String>,
+    /// Runde 5, Teil G: gezeigte Tabelle.
+    mode: ViewMode,
+    /// Runde 5, Teil G: Hinweise (Rückfall auf „wie UIA“), unter der Tabelle.
+    notices: Vec<String>,
 }
 
 impl ModelRolesView {
@@ -127,6 +180,8 @@ impl ModelRolesView {
             rows,
             selected: 0,
             error: None,
+            mode: ViewMode::Roles,
+            notices: Vec::new(),
         }
     }
 
@@ -147,6 +202,37 @@ impl ModelRolesView {
             rows,
             selected: 0,
             error: None,
+            mode: ViewMode::Roles,
+            notices: Vec::new(),
+        }
+    }
+
+    /// Runde 5, Teil G: Bereich „UIA-Worker-Modelle“ — je UIA-Worker-Rolle
+    /// ihre aktuelle Wahl. Ohne Konfiguration folgen alle Rollen der UIA
+    /// (`apply_data` füllt nach).
+    #[must_use]
+    pub(crate) fn uia_workers(config: Option<&ResolvedConfig>) -> Self {
+        let resolved: Vec<harw_config::ResolvedUiaWorkerModel> = match config {
+            Some(config) => resolve_uia_worker_models(config),
+            None => UIA_WORKER_ROLES
+                .iter()
+                .map(|role| harw_config::ResolvedUiaWorkerModel {
+                    role: (*role).to_owned(),
+                    choice: UiaWorkerModelChoice::FollowUia,
+                    source: harw_config::UiaWorkerModelSource::Default,
+                    notice: None,
+                })
+                .collect(),
+        };
+        Self {
+            rows: resolved.iter().map(RoleRow::worker).collect(),
+            selected: 0,
+            error: None,
+            mode: ViewMode::UiaWorkers,
+            notices: resolved
+                .iter()
+                .filter_map(|resolved| resolved.notice.clone())
+                .collect(),
         }
     }
 
@@ -201,10 +287,19 @@ impl ModelRolesView {
                 );
                 Line::from(vec![
                     Span::styled(text, row_style),
-                    Span::styled(row.effect().to_owned(), style::dim_style(theme)),
+                    Span::styled(row.effect(self.mode).to_owned(), style::dim_style(theme)),
                 ])
             })
             .collect();
+        if !self.notices.is_empty() {
+            lines.push(Line::from(""));
+            for notice in &self.notices {
+                lines.push(Line::styled(
+                    sanitize_inline(notice),
+                    style::dim_style(theme),
+                ));
+            }
+        }
         if let Some(error) = &self.error {
             lines.push(Line::from(""));
             lines.push(Line::styled(
@@ -247,19 +342,89 @@ fn row_from_json(value: &serde_json::Value) -> Option<RoleRow> {
     })
 }
 
+impl ModelRolesView {
+    /// Runde 5, Teil G: Tasten des Worker-Bereichs (Navigation erledigt
+    /// bereits der Aufrufer).
+    fn on_worker_key(&mut self, key: KeyEvent) -> OverlayOutcome {
+        match key.code {
+            KeyCode::Esc => OverlayOutcome::Close,
+            KeyCode::Char('q') if plain(&key) => OverlayOutcome::Close,
+            KeyCode::Enter => match self.selected_key() {
+                Some(role) => OverlayOutcome::RunAndClose(format!("/models pick {role}")),
+                None => OverlayOutcome::Stay,
+            },
+            KeyCode::Char('r') if plain(&key) => match self.selected_key() {
+                Some(role) => OverlayOutcome::Run(format!("/models worker {role} uia")),
+                None => OverlayOutcome::Stay,
+            },
+            KeyCode::Char('a') if plain(&key) => {
+                OverlayOutcome::Run("/models worker all uia".to_owned())
+            }
+            _ => OverlayOutcome::Stay,
+        }
+    }
+
+    /// Runde 5, Teil G: übernimmt `/models worker`-Daten
+    /// (`{"workers":[{"role","choice","source","notice"}]}`); eine
+    /// unbrauchbare Antwort lässt die Tabelle stehen.
+    fn apply_worker_data(&mut self, data: &serde_json::Value) {
+        let Some(items) = data.get("workers").and_then(serde_json::Value::as_array) else {
+            return;
+        };
+        let mut rows = Vec::new();
+        let mut notices = Vec::new();
+        for item in items {
+            let Some(role) = json_str(item, "role") else {
+                continue;
+            };
+            let choice = json_str(item, "choice")
+                .and_then(|value| UiaWorkerModelChoice::parse(&value))
+                .unwrap_or(UiaWorkerModelChoice::FollowUia);
+            let (provider, model) = match &choice {
+                UiaWorkerModelChoice::Fixed { provider, model } => {
+                    (Some(provider.clone()), Some(model.clone()))
+                }
+                UiaWorkerModelChoice::FollowUia => (None, Some(choice.label())),
+            };
+            if let Some(notice) = json_str(item, "notice") {
+                notices.push(notice);
+            }
+            rows.push(RoleRow {
+                key: Some(role.clone()),
+                label: role,
+                provider,
+                model,
+                source: json_str(item, "source").unwrap_or_else(|| "—".to_owned()),
+                effort: None,
+            });
+        }
+        if rows.is_empty() {
+            return;
+        }
+        self.rows = rows;
+        self.notices = notices;
+        self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+        self.error = None;
+    }
+}
+
 impl OverlayView for ModelRolesView {
     fn render(&self, area: Rect, buf: &mut Buffer, theme: Theme) {
         let lines = self.body_lines(theme);
         let scroll = scroll_offset_for(self.selected, content_height(area, true));
+        let (title, footer) = match self.mode {
+            ViewMode::Roles => ("Modelle je Rolle", FOOTER),
+            ViewMode::UiaWorkers => ("UIA-Worker-Modelle", WORKERS_FOOTER),
+        };
         render_panel(
             area,
             buf,
             theme,
-            "Modelle je Rolle",
+            title,
             Some(Self::header_line(theme)),
             &lines,
             scroll,
-            FOOTER,
+            footer,
         );
     }
 
@@ -271,6 +436,9 @@ impl OverlayView for ModelRolesView {
         if is_up(&key) {
             self.selected = self.selected.saturating_sub(1);
             return OverlayOutcome::Stay;
+        }
+        if self.mode == ViewMode::UiaWorkers {
+            return self.on_worker_key(key);
         }
         match key.code {
             KeyCode::Esc => OverlayOutcome::Close,
@@ -288,10 +456,20 @@ impl OverlayView for ModelRolesView {
     }
 
     fn refresh_command(&self) -> Option<String> {
-        Some(REFRESH_COMMAND.to_owned())
+        Some(
+            match self.mode {
+                ViewMode::Roles => REFRESH_COMMAND,
+                ViewMode::UiaWorkers => WORKERS_REFRESH_COMMAND,
+            }
+            .to_owned(),
+        )
     }
 
     fn apply_data(&mut self, data: &serde_json::Value) {
+        if self.mode == ViewMode::UiaWorkers {
+            self.apply_worker_data(data);
+            return;
+        }
         let live = data.get("live");
         let live_row = match live {
             Some(live) => RoleRow::live(
@@ -345,9 +523,10 @@ mod tests {
     }
 
     #[test]
-    fn test_has_live_row_plus_twelve_roles() {
+    fn test_has_live_row_plus_thirteen_roles() {
+        // Runde 5, Teil E: `auto-classifier` ist die dreizehnte Rolle.
         let view = view();
-        assert_eq!(view.rows.len(), 13);
+        assert_eq!(view.rows.len(), 14);
         assert_eq!(view.rows[0].key, None);
         assert_eq!(view.rows[0].label, LIVE_LABEL);
     }
@@ -391,7 +570,7 @@ mod tests {
         for _ in 0..50 {
             view.on_key(key(KeyCode::Down));
         }
-        assert_eq!(view.selected, 12);
+        assert_eq!(view.selected, 13);
         for _ in 0..50 {
             view.on_key(key(KeyCode::Char('k')));
         }
@@ -430,7 +609,7 @@ mod tests {
     fn test_apply_data_ignores_garbage() {
         let mut view = view();
         view.apply_data(&serde_json::json!({"foo": 1}));
-        assert_eq!(view.rows.len(), 13);
+        assert_eq!(view.rows.len(), 14);
     }
 
     #[test]
@@ -452,5 +631,67 @@ mod tests {
     fn test_cell_truncates_and_pads() {
         assert_eq!(cell("abc", 5), "abc   ");
         assert_eq!(cell("abcdefgh", 5), "abcd… ");
+    }
+
+    // ── Runde 5, Teil G: Bereich „UIA-Worker-Modelle“ ────────────────────
+
+    #[test]
+    fn test_uia_workers_lists_every_worker_role_following_the_uia() {
+        let view = ModelRolesView::uia_workers(None);
+        assert_eq!(view.rows.len(), UIA_WORKER_ROLES.len());
+        for (row, role) in view.rows.iter().zip(UIA_WORKER_ROLES) {
+            assert_eq!(row.key.as_deref(), Some(role));
+            assert_eq!(row.model.as_deref(), Some("wie UIA"));
+        }
+        assert_eq!(
+            view.refresh_command().as_deref(),
+            Some(WORKERS_REFRESH_COMMAND)
+        );
+    }
+
+    #[test]
+    fn test_uia_workers_keys_pick_reset_all_and_close() {
+        let mut view = ModelRolesView::uia_workers(None);
+        view.on_key(key(KeyCode::Down));
+        let second = UIA_WORKER_ROLES[1];
+        assert_eq!(
+            view.on_key(key(KeyCode::Enter)),
+            OverlayOutcome::RunAndClose(format!("/models pick {second}"))
+        );
+        assert_eq!(
+            view.on_key(key(KeyCode::Char('r'))),
+            OverlayOutcome::Run(format!("/models worker {second} uia"))
+        );
+        assert_eq!(
+            view.on_key(key(KeyCode::Char('a'))),
+            OverlayOutcome::Run("/models worker all uia".to_owned())
+        );
+        assert_eq!(view.on_key(key(KeyCode::Esc)), OverlayOutcome::Close);
+    }
+
+    #[test]
+    fn test_uia_workers_apply_data_shows_fixed_choice_and_notice() {
+        let mut view = ModelRolesView::uia_workers(None);
+        view.apply_data(&serde_json::json!({
+            "workers": [
+                {"role": "uia-worker", "choice": "uia", "source": "Vorgabe"},
+                {"role": "uia-writer", "choice": "openai/gpt-5", "source": "eigene Wahl"},
+                {"role": "uia-explorer", "choice": "uia", "source": "Rückfall",
+                 "notice": "uia-explorer: Provider „x“ ist nicht angemeldet"}
+            ]
+        }));
+        assert_eq!(view.rows.len(), 3);
+        assert_eq!(view.rows[1].provider.as_deref(), Some("openai"));
+        assert_eq!(view.rows[1].model.as_deref(), Some("gpt-5"));
+        assert_eq!(view.notices.len(), 1);
+
+        let area = Rect::new(0, 0, 140, 16);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf, Theme::Dark);
+        let text = buffer_text(&buf);
+        assert!(text.contains("UIA-Worker-Modelle"));
+        assert!(text.contains("wie UIA"));
+        assert!(text.contains("nicht angemeldet"));
+        assert!(text.contains(WORKER_EFFECT));
     }
 }

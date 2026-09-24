@@ -1635,8 +1635,9 @@ fn is_valid_handoff_role(role: &str) -> bool {
 /// Baut die Werkzeugdefinition `transfer_to_<role>` für ein Delegationsziel.
 ///
 /// # Beschreibung
-/// Schema: `{"task": string (Pflicht), "context": string (optional)}`, keine
-/// weiteren Felder. Die Ausführung übernimmt die Handoff-Erkennung in
+/// Schema: `{"task": string (Pflicht), "context": string (optional),
+/// "background": bool (optional, Runde 5 Teil K), "continue_from": string
+/// (optional, Runde 5 Teil J)}`, keine weiteren Felder. Die Ausführung übernimmt die Handoff-Erkennung in
 /// `drive_turn` ([`handoff_role`]), nicht ein `ToolExecutor`.
 ///
 /// # Arguments
@@ -1665,10 +1666,40 @@ fn handoff_tool_spec(role: &str) -> ToolSpec {
              Optional extra context (facts, paths, constraints).",
         ),
     );
+    // Runde 5, Teil J: Fortsetzung eines am Budget beendeten eigenen Kindes
+    // derselben Rolle; geprüft von `ManagedAgentSpawner::admit`.
+    properties.insert(
+        "continue_from".to_owned(),
+        string_property(
+            "Optional: ID eines eigenen Kindes dieser Rolle, das am Token-Budget endete. Das \
+             neue Kind bekommt dessen Übergabe als Kontext und ein frisches Budget (höchstens 3 \
+             Fortsetzungen je ursprünglichem Kind). / Optional: id of an own child of this role \
+             that ended at its token budget; the new child continues from its handoff.",
+        ),
+    );
+    // Runde 5, Teil K: Hintergrundlauf. Ausgewertet nur von der TUI für
+    // Orchestrator-Ziele der UIA-Wurzel (Vorgabe dort `true`); jeder andere
+    // Einstieg und jedes Worker-Ziel läuft synchron.
+    properties.insert(
+        "background".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::Boolean),
+            description: Some(
+                "Optional: im Hintergrund laufen lassen (nur Orchestratoren der UIA in der TUI; \
+                 Vorgabe dort true). Das Werkzeug kehrt dann sofort mit {child_id, status, hint} \
+                 zurück, das Ergebnis kommt später als Benachrichtigung. false erzwingt \
+                 synchrones Warten. / Optional: run in the background (UIA orchestrators in the \
+                 TUI only; default true there); false forces a synchronous wait."
+                    .to_owned(),
+            ),
+            ..JsonSchema::default()
+        },
+    );
     ToolSpec::Function(FunctionToolSpec {
         name: ToolName::new(format!("{HANDOFF_PREFIX}{role}")),
         description: format!(
-            "Delegiert eine Aufgabe an den Unteragenten '{role}' und wartet auf sein Ergebnis. / \
+            "Delegiert eine Aufgabe an den Unteragenten '{role}' und wartet auf sein Ergebnis \
+             (ein Orchestrator der UIA läuft in der TUI im Hintergrund). / \
              Delegates a task to the '{role}' sub-agent and waits for its result."
         ),
         parameters: JsonSchema {
@@ -1703,7 +1734,10 @@ fn handoff_tool_spec(role: &str) -> ToolSpec {
 /// - `tools` (`&mut Vec<ToolSpec>`): Ergebnis von [`collect_tools`].
 /// - `targets` (`&[String]`): sortierte Rollennamen der Delegationsziele.
 fn append_handoff_tools(session: &AgentSession, tools: &mut Vec<ToolSpec>, targets: &[String]) {
-    if targets.is_empty() {
+    // Runde 5 (Integration Teil F): im Plan-Modus keine Übergaben anbieten —
+    // Erkundung läuft dort über die lesenden `explore`/`research`-Werkzeuge;
+    // ein `transfer_to_*` würde erst an der Plan-Sperre scheitern.
+    if targets.is_empty() || session.mode() == crate::mode::InteractionMode::Plan {
         return;
     }
     let activation = session.activation();
@@ -2055,6 +2089,52 @@ fn notify_tool_progress(session: &AgentSession) {
         observer.on_tool_call(session.id());
     }
     notify_progress(session);
+}
+
+/// Runde 5, Teil M: Runden-Grenze eines Kindes (alle Tool-Ergebnisse der
+/// Runde stehen im Verlauf, der nächste Modellaufruf ist noch nicht gebaut).
+///
+/// # Beschreibung
+/// Meldet dem [`crate::guard::ProgressObserver`] den jüngsten
+/// Assistententext (Aktivitätsjournal) und hängt die wartenden Nachrichten
+/// (`agent.message` vom Elternteil, `parent.message` der Kinder) als
+/// Hinweis an das letzte Verlaufs-Item an — provider-gültig, weil das
+/// letzte Item hier ein Tool-Ergebnis ist. Ohne Beobachter (Wurzel) ein
+/// No-op.
+fn deliver_round_boundary(session: &mut AgentSession) {
+    let Some(observer) = session.progress_observer().cloned() else {
+        return;
+    };
+    let last_text = session.history().items().iter().rev().find_map(|item| {
+        let TurnItem::AssistantMessage(message) = item else {
+            return None;
+        };
+        let text: String = message
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::ImageUrl { .. } => None,
+            })
+            .collect();
+        (!text.trim().is_empty()).then_some(text)
+    });
+    if let Some(text) = last_text {
+        observer.on_assistant_text(session.id(), &text);
+    }
+    let messages = observer.take_inbound_messages(session.id());
+    if messages.is_empty() {
+        return;
+    }
+    let block = messages.join("\n\n");
+    if !session.history_mut().append_hint_to_last(&block) {
+        let _ = session.history_mut().push_user_text(block);
+    }
+    tracing::info!(
+        session = %session.id(),
+        count = messages.len(),
+        "turn_loop.inbound_messages_delivered"
+    );
 }
 
 /// Wie [`notify_progress`], nach einer Modell-Runde: verbucht zusätzlich
@@ -2549,18 +2629,40 @@ async fn resume_after_child_with_approvals(
     };
 
     let call_id_for_completion = call_id.clone();
+    // Runde 5, Teil K: ein im Hintergrund weiterlaufendes Kind ist nicht
+    // fertig — sein `ChildCompleted` meldet der Hintergrund-Treiber beim
+    // echten Ende.
+    let runs_in_background = session
+        .registry()
+        .spawner()
+        .is_some_and(|spawner| spawner.child_runs_in_background(&child));
     let child_outcome = match &child_result {
         ToolCallResult::Success { .. } => "completed",
         _ => "failed",
     };
     let child_duration_ms = session.take_handoff_elapsed_ms();
+    // Runde 5, Teil O: das echte Ergebnis mit echter Dauer (vorher 0 ms) —
+    // und unten ein `ToolCallCompleted` für den Handoff-Aufruf. Ohne dieses
+    // Ereignis blieb die Werkzeugzelle der TUI für `transfer_to_*` auf
+    // „läuft“ stehen und wurde beim nächsten Turn-Abbruch nachträglich als
+    // „unvollständig (abgebrochen)“ exportiert, obwohl das Kind längst
+    // erfolgreich geendet hatte.
+    let completed_event = TurnEvent::ToolCallCompleted {
+        turn_id: turn_id.clone(),
+        call_id: call_id.clone(),
+        result: child_result.clone(),
+        duration_ms: child_duration_ms,
+    };
     session
         .history_mut()
-        .push_tool_result(call_id, child_result, 0);
+        .push_tool_result(call_id, child_result, child_duration_ms);
     if let Err(error) = persist_last(session, store).await {
         transition_after_turn_failure(session, &ctx, &error);
         return Err(error);
     }
+    // Runde 5, Teil O: erst nach dem Persistieren melden (wie jedes andere
+    // Werkzeugergebnis).
+    emit(session, completed_event);
 
     // Do not release the child's admission until its terminal ToolResult is
     // durable in the parent transcript. A failed write leaves the lease intact
@@ -2574,15 +2676,17 @@ async fn resume_after_child_with_approvals(
     //
     // `duration_ms` misst ab `begin_handoff` (Wanduhr des Eltern-Turns);
     // `outcome` folgt dem Ergebnis-Typ des Kindes.
-    emit(
-        session,
-        TurnEvent::ChildCompleted {
-            turn_id: turn_id.clone(),
-            child: child.clone(),
-            outcome: child_outcome.to_owned(),
-            duration_ms: child_duration_ms,
-        },
-    );
+    if !runs_in_background {
+        emit(
+            session,
+            TurnEvent::ChildCompleted {
+                turn_id: turn_id.clone(),
+                child: child.clone(),
+                outcome: child_outcome.to_owned(),
+                duration_ms: child_duration_ms,
+            },
+        );
+    }
     if let Some(spawner) = session.registry().spawner() {
         if approvals.is_some() {
             let completion = spawner
@@ -2778,13 +2882,37 @@ async fn resume_after_approval_with_store(
                                 .await;
                         }
                     };
-                    let child = spawner
+                    let child = match spawner
                         .spawn_child(&role, input, context.sandbox, context.suggestions)
                         .await
-                        .map_err(|error| CoreError::HandoffFailed {
-                            role: role.clone(),
-                            reason: error.to_string(),
-                        })?;
+                    {
+                        Ok(child) => child,
+                        // Runde 5, Teil K: eine Orchestrierungsgrenze ist eine
+                        // Antwort an das Modell, kein Turn-Abbruch.
+                        // Runde 5, Teil J: ebenso eine abgelehnte Fortsetzung.
+                        Err(error)
+                            if crate::background_children::is_orchestration_limit_rejection(
+                                &error.message,
+                            ) || crate::child_handoff::is_continuation_rejection(
+                                &error.message,
+                            ) =>
+                        {
+                            session.history_mut().push_tool_result(
+                                pending.call.id,
+                                ToolCallResult::error(error.message),
+                                0,
+                            );
+                            persist_last(session, store).await?;
+                            return drive_turn(session, model, store, approvals, &ctx, handle, control)
+                                .await;
+                        }
+                        Err(error) => {
+                            return Err(CoreError::HandoffFailed {
+                                role: role.clone(),
+                                reason: error.to_string(),
+                            });
+                        }
+                    };
                     session.begin_handoff(child.clone(), pending.call.id.clone(), role.clone())?;
                     // Ein genehmigungspflichtiger Handoff wird ausschließlich hier
                     // gespawnt (`drive_turn` kehrt vorher mit `AwaitingApproval`
@@ -3747,6 +3875,47 @@ async fn drive_turn(
                 let spawned = spawner
                     .spawn_child(&role, spawn_input, context.sandbox, context.suggestions)
                     .await;
+                // Runde 5, Teil K: eine Orchestrierungsgrenze (`[agents]`) ist
+                // eine Antwort an das Modell — Werkzeugfehler statt Turn-Abbruch.
+                // Runde 5, Teil J: ebenso eine abgelehnte Fortsetzung
+                // (`continue_from`), damit das Modell nachsteuern kann.
+                if let Err(error) = &spawned
+                    && (crate::background_children::is_orchestration_limit_rejection(
+                        &error.message,
+                    ) || crate::child_handoff::is_continuation_rejection(&error.message))
+                {
+                    let mut result = ToolCallResult::error(error.message.clone());
+                    let abort_reason = apply_tool_guard(
+                        session,
+                        store,
+                        guard.as_mut(),
+                        &mut turn_seen_success_signatures,
+                        &mut pending_guard_hint,
+                        &mut round_progressed_by_tools,
+                        call.name.as_str(),
+                        &call.arguments,
+                        &mut result,
+                    )
+                    .await;
+                    notify_tool_outcome(session, call.name.as_str(), &call.arguments, &result);
+                    notify_tool_progress(session);
+                    session.history_mut().push_tool_result(call.id, result, 0);
+                    persist_last(session, store).await?;
+                    if let Some(abort_reason) = abort_reason {
+                        let remaining: Vec<ToolCall> =
+                            tool_call_iter.map(|(_, call)| call).collect();
+                        return cancel_turn_with_pending_calls(
+                            session,
+                            store,
+                            handle,
+                            total_usage,
+                            abort_reason,
+                            remaining,
+                        )
+                        .await;
+                    }
+                    continue;
+                }
                 let child = spawned.map_err(|e| CoreError::HandoffFailed {
                     role: role.clone(),
                     reason: e.to_string(),
@@ -3961,6 +4130,9 @@ async fn drive_turn(
         // verschachtelter `turn_completed_a_plan_step(session)`-Aufruf als
         // Argumentausdruck würde eine gleichzeitige unveränderliche Ausleihe
         // gegen die bereits laufende veränderliche Ausleihe erzeugen.
+        // Runde 5, Teil M: Nachrichten von Elternteil/Kindern an der
+        // Runden-Grenze einreihen; letzten Assistententext ins Journal.
+        deliver_round_boundary(session);
         let task_completed = turn_completed_a_plan_step(session);
         let appended_tokens = appended_tokens_since(session, history_mark);
         maybe_compact(
@@ -6915,6 +7087,83 @@ mod tests {
         Ok(())
     }
 
+    /// Runde 5, Teil K: ein Spawner, der jede Admission mit einer
+    /// Orchestrierungsgrenze ablehnt.
+    struct LimitRejectingSpawner;
+
+    impl AgentSpawner for LimitRejectingSpawner {
+        fn spawn_child<'a>(
+            &'a self,
+            _role: &'a str,
+            _input: SpawnInput,
+            _sandbox: SandboxSpec,
+            _suggestions: Option<AgentSuggestions>,
+        ) -> SpawnFuture<'a> {
+            Box::pin(async move {
+                Err(harw_extension_api::AgentSpawnError {
+                    message: format!(
+                        "{} Grenze max_root_orchestrators=1 erreicht — es läuft bereits: \
+                         root-orchestrator (r1).",
+                        crate::background_children::ORCHESTRATION_LIMIT_MARKER
+                    ),
+                })
+            })
+        }
+    }
+
+    /// Runde 5, Teil K: eine Orchestrierungsgrenze bricht den Turn nicht ab,
+    /// sondern kommt als Werkzeugfehler beim Modell an.
+    #[tokio::test]
+    async fn an_orchestration_limit_rejection_is_a_tool_error_not_a_turn_failure() -> TestResult {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .spawner(Arc::new(LimitRejectingSpawner))
+            .build();
+        let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx)
+            .with_spawn_context(test_spawn_context()?);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let call_id = ToolCallId::new();
+        let model = ScriptedModel::new(vec![
+            response_with(vec![ToolCall {
+                id: call_id.clone(),
+                name: ToolName::new("transfer_to_root-orchestrator"),
+                arguments: serde_json::json!({"task": "zweiter Lauf"}),
+            }]),
+            response_with(Vec::new()),
+        ]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("los")).await;
+        assert!(
+            !matches!(outcome, Err(CoreError::HandoffFailed { .. })),
+            "die Grenze darf den Turn nicht als Handoff-Fehler beenden: {outcome:?}"
+        );
+        let result = session
+            .history()
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                TurnItem::ToolResult(result) if result.call_id == call_id => {
+                    Some(result.result.clone())
+                }
+                _ => None,
+            })
+            .ok_or(TestError::Missing(
+                "der abgelehnte Handoff bekommt ein Werkzeugergebnis",
+            ))?;
+        match result {
+            ToolCallResult::Error { message } => {
+                assert!(crate::background_children::is_orchestration_limit_rejection(&message));
+                assert!(message.contains("root-orchestrator (r1)"));
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartet ein Werkzeugfehler, nicht {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn handoff_with_only_a_task_argument_reports_the_task() -> TestResult {
         let child = SessionId::new();
@@ -7012,6 +7261,88 @@ mod tests {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// Runde 5, Teil O: der Handoff-Aufruf bekommt sein echtes Ergebnis als
+    /// `ToolCallCompleted` (gleiche `call_id`, gleiche Dauer wie
+    /// `ChildCompleted`), und der persistierte `ToolResult` trägt dieselbe
+    /// Dauer statt fest 0 ms. Ohne das Ereignis blieb die Zelle der TUI auf
+    /// „läuft“ und wurde später als „unvollständig (abgebrochen)“ markiert.
+    #[tokio::test]
+    async fn child_completion_reports_the_real_handoff_result_with_its_duration() -> TestResult {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (turn_tx, mut turn_rx) = mpsc::unbounded_channel();
+        let child = SessionId::new();
+        let registry = ExtensionRegistryBuilder::default()
+            .spawner(Arc::new(FixedChildSpawner {
+                child: child.clone(),
+            }))
+            .build();
+        let mut session = AgentSession::new(AgentRole::Assistant, None, registry, tx)
+            .with_spawn_context(test_spawn_context()?)
+            .with_turn_event_sink(turn_tx);
+        session.try_start_turn().map_err(ctx("Turn startet"))?;
+        let call_id = ToolCallId::new();
+        session
+            .begin_handoff(
+                child.clone(),
+                call_id.clone(),
+                "root-orchestrator".to_owned(),
+            )
+            .map_err(ctx("Handoff pausiert"))?;
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        resume_after_child(
+            &mut session,
+            &crate::model::EchoModelProvider::new("Zusammenfassung"),
+            &store,
+            child.clone(),
+            call_id.clone(),
+            ToolCallResult::success(serde_json::json!({"report": "Exploration fertig"})),
+        )
+        .await
+        .map_err(ctx("das Kind-Ergebnis nimmt den Eltern-Turn wieder auf"))?;
+
+        let events = drain_turn_events(&mut turn_rx);
+        let child_duration = events
+            .iter()
+            .find_map(|event| match event {
+                TurnEvent::ChildCompleted { duration_ms, .. } => Some(*duration_ms),
+                _ => None,
+            })
+            .ok_or(TestError::Missing("ChildCompleted"))?;
+        let (result, tool_duration) = events
+            .iter()
+            .find_map(|event| match event {
+                TurnEvent::ToolCallCompleted {
+                    call_id: completed,
+                    result,
+                    duration_ms,
+                    ..
+                } if completed == &call_id => Some((result.clone(), *duration_ms)),
+                _ => None,
+            })
+            .ok_or(TestError::Missing(
+                "der Handoff-Aufruf meldet ToolCallCompleted",
+            ))?;
+        assert!(
+            result.is_success(),
+            "das echte Ergebnis, kein Fehler: {result:?}"
+        );
+        assert_eq!(tool_duration, child_duration);
+
+        let persisted = session
+            .history()
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                TurnItem::ToolResult(result) if result.call_id == call_id => Some(result.clone()),
+                _ => None,
+            })
+            .ok_or(TestError::Missing("persistierter ToolResult des Handoffs"))?;
+        assert_eq!(persisted.duration_ms, child_duration);
+        assert!(persisted.result.is_success());
         Ok(())
     }
 
@@ -8631,6 +8962,10 @@ mod tests {
             .ok_or(TestError::Missing("Schema-Properties"))?;
         assert!(properties.contains_key("task"));
         assert!(properties.contains_key("context"));
+        // Runde 5, Teil K: optionaler Hintergrundlauf.
+        assert!(properties.contains_key("background"));
+        // Runde 5, Teil J: optionale Fortsetzung, der Auftrag bleibt Pflicht.
+        assert!(properties.contains_key("continue_from"));
         Ok(())
     }
 
@@ -8647,6 +8982,18 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(ToolSpec::name).collect();
         assert_eq!(names, vec!["transfer_to_explorer"]);
+    }
+
+    #[test]
+    fn plan_mode_offers_no_handoff_tools() {
+        let mut session = make_session(
+            StubToolProvider::with_names(&[]),
+            SessionActivation::new(ToolProfile::Full),
+        );
+        session.set_mode(crate::mode::InteractionMode::Plan);
+        let mut tools = Vec::new();
+        append_handoff_tools(&session, &mut tools, &["worker".to_owned()]);
+        assert!(tools.is_empty(), "Plan-Modus bietet keine transfer_to_* an");
     }
 
     #[test]

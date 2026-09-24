@@ -47,12 +47,17 @@ admitted = [
   "diary.read",
   "palace.search",
   "palace.recall",
+  # Runde 5, Teil M: Zwischenstand (info) oder Frage (question) an den direkten
+  # Elternteil; nur Text, keine Rechte (siehe
+  # `harw_registry_defaults::profile::parent_message_tools_for_role`).
+  "parent.message",
 ]
 # `ReadOnlyExplore` registriert zusaetzlich `web.fetch`/`web.search` fuer den
 # `explorer` (Nutzerentscheidung "der Explorer durchsucht auch das Internet").
 # Diese Rolle bleibt ohne Netz und verbietet beide deshalb ausdruecklich.
 forbidden = [
   "fs.write",
+  "fs.edit",
   "shell.exec",
   "web.fetch",
   "web.search",

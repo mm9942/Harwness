@@ -8,8 +8,15 @@
 # bereits die versiegelte Spawn-Matrix selbst (kein
 # `exclusive_parent_role` mehr noetig). Zweck sind kleine Schnelleingriffe:
 # eine Frage mit einem Aufruf beantworten, schnell etwas in der Shell
-# regeln, eine Datei lesen — vergleichbar schnelle Dinge. Alles darueber
-# hinaus ist ein klares Nein und geht als Auftrag an Root.
+# regeln, eine Datei lesen — vergleichbar schnelle Dinge.
+#
+# Runde 5, Teil P: kleine, klar umrissene Pakete liegen ausdruecklich im
+# Auftrag der `uia-worker`-Rollen — auch Code-Aenderungen bis ca. 3 Dateien
+# bzw. ein Modul (eine Funktion plus Tests) samt lokalem `cargo fmt`/`cargo
+# test`, soweit die Werkzeuge der Spezialisierung reichen (hier: lesen und
+# `shell.exec`, schreiben tut `uia-writer`). Erst lesen, dann urteilen;
+# abgelehnt wird nur wirklich Grosses, und dann mit Zerlegungsvorschlag
+# (`knowledge/roles/uia-worker.md`). Rechte und Werkzeuge unveraendert.
 #
 # Vorher war diese Rolle reine Netz-Recherche
 # (`RegistryProfile::Research`, identisch zu `researcher-web`). Addendum I
@@ -53,7 +60,7 @@ role = "uia-worker"
 specialization = "uia-worker"
 
 name = "UIA Quick Helper"
-description = "Schnellhelfer der UIA fuer kleine Schnelleingriffe: eine Frage, ein Shell-Griff, ein Dateilesen."
+description = "Schnellhelfer der UIA fuer kleine, klar umrissene Pakete: eine Frage, Shell-Griffe (auch cargo fmt/test), Dateien lesen."
 
 [tools]
 admitted = [
@@ -84,9 +91,14 @@ admitted = [
   "diary.read",
   "palace.search",
   "palace.recall",
+  # Runde 5, Teil M: Zwischenstand (info) oder Frage (question) an den direkten
+  # Elternteil; nur Text, keine Rechte (siehe
+  # `harw_registry_defaults::profile::parent_message_tools_for_role`).
+  "parent.message",
 ]
 forbidden = [
   "fs.write",
+  "fs.edit",
   "lens.ask",
   "browser.observe",
   "browser.find",

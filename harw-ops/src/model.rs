@@ -703,11 +703,10 @@ async fn uia_model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError
 }
 
 /// Wechselt ausschließlich das für UIA-Worker-Sitzungen gepinnte Modell
-/// (`uia_worker_model`) und validiert es gegen den EFFEKTIVEN UIA-Provider
-/// (Live-Auswahl, sonst `harness.uia_provider` — via
-/// [`effective_uia_selection`], genau wie [`handle_uia_model_switch`]). Es
-/// gibt bewusst **kein** eigenes `uia_worker_provider`-Konzept: der Worker
-/// teilt sich den Provider mit der UIA.
+/// (`uia_worker_model`, alter Familien-Pin). Seit Runde 5, Teil G ist er
+/// nicht mehr an den UIA-Provider gekoppelt: er läuft über den Provider, dem
+/// das Modell im Katalog gehört; eigene Wahlen je Rolle setzt
+/// `/models worker`.
 ///
 /// # Beschreibung
 /// Im Gegensatz zu [`handle_uia_model_switch`] mutiert dieser Pfad **keinen**
@@ -741,8 +740,8 @@ async fn uia_model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError
 /// # Fehler
 /// - [`OpError::Execution`]: Config-Discovery fehlgeschlagen, oder der
 ///   konfigurierte Modellkatalog ist leer.
-/// - [`OpError::InvalidArguments`]: unbekannte Modell-ID, oder das Ziel-Modell
-///   gehört zu einem anderen Provider als dem effektiven UIA-Provider.
+/// - [`OpError::InvalidArguments`]: unbekannte Modell-ID. Seit Runde 5,
+///   Teil G nicht mehr: ein Modell eines anderen Providers als der UIA.
 ///
 /// # Spec
 /// harwness Plan v2 — Welle 2 (2d), Teil 2 — `/uia-worker-model`.
@@ -762,27 +761,12 @@ fn handle_uia_worker_model_switch(
         ));
     }
 
-    let controller = ctx.service::<harw_operations::SharedSessionController>();
-    let selection = effective_uia_selection(controller, &config);
+    // Runde 5, Teil G: keine Kopplung an den UIA-Provider mehr — der Pin
+    // läuft über den Provider, dem das Modell im Katalog gehört
+    // (`harw_config::resolve_uia_worker_model`); ein UIA-Providerwechsel
+    // scheitert so nie an einer Worker-Bindung.
     let configured = configured_model(&config, &target)
         .ok_or_else(|| OpError::InvalidArguments(format!("unknown model: {target}")))?;
-
-    if let Some(uia_provider) = selection.provider() {
-        let model_provider = config
-            .providers
-            .iter()
-            .find(|(key, provider)| {
-                key.as_str() == configured.provider || provider.name == configured.provider
-            })
-            .map(|(_, provider)| provider.name.as_str())
-            .unwrap_or(configured.provider.as_str());
-        if model_provider != uia_provider {
-            return Err(OpError::InvalidArguments(format!(
-                "UIA worker model {target} requires provider {model_provider}, but effective UIA provider is {uia_provider}; \
-                 use `/uia-provider switch {model_provider}` first"
-            )));
-        }
-    }
 
     let configured_id = configured.id.clone();
     let mut text = format!("UIA worker model set to {configured_id}");
@@ -1535,12 +1519,11 @@ mod tests {
 
     // ── Welle 2 (2d), Teil 2: `/uia-worker-model` ──────────────────────────────
 
-    /// Ein Ziel-Modell, dessen konfigurierter Provider nicht dem effektiven
-    /// UIA-Provider entspricht, muss `InvalidArguments` liefern. Validation
-    /// fails before any persistence is attempted, so no `HARW_HOME` isolation
-    /// is needed.
+    /// Runde 5, Teil G: ein Ziel-Modell eines anderen Providers als der
+    /// effektive UIA-Provider wird angenommen (Kopplung aufgehoben). Uses a
+    /// no-op `persist` closure, so no `HARW_HOME` isolation is needed.
     #[test]
-    fn handle_uia_worker_model_switch_rejects_a_model_from_a_different_provider() -> TestResult {
+    fn handle_uia_worker_model_switch_accepts_a_model_from_a_different_provider() -> TestResult {
         let ctrl = Arc::new(NullSessionController::new());
         ctrl.set_uia_selection(harw_operations::session_control::UiaSelection::new(
             Some("provider-a".to_owned()),
@@ -1552,21 +1535,18 @@ mod tests {
         let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
         let (ctx, _tmp) = make_test_ctx(Some(shared), Some(config))?;
 
-        let result = super::handle_uia_worker_model_switch(&ctx, "model-b".to_owned(), |_| None);
-
-        match result {
-            Err(OpError::InvalidArguments(msg)) => {
-                assert!(
-                    msg.contains("model-b") && msg.contains("provider-a"),
-                    "message must name both the rejected model and the effective UIA provider: {msg}"
-                );
-            }
-            other => {
-                return Err(TestError::Unexpected(format!(
-                    "Expected InvalidArguments, got: {other:?}"
-                )));
-            }
-        }
+        let mut persisted = None;
+        let output = super::handle_uia_worker_model_switch(&ctx, "model-b".to_owned(), |model| {
+            persisted = model.map(str::to_owned);
+            None
+        })
+        .map_err(|error| {
+            TestError::Unexpected(format!(
+                "fremder Provider muss angenommen werden: {error:?}"
+            ))
+        })?;
+        assert!(output.text.contains("model-b"), "{}", output.text);
+        assert_eq!(persisted.as_deref(), Some("model-b"));
         Ok(())
     }
 

@@ -11,9 +11,11 @@
 //!   Provider → [`RoleModelSource::UiaPin`]; sonst `default_model` →
 //!   [`RoleModelSource::DefaultModel`]; sonst [`RoleModelSource::Unset`].
 //!   (Spiegelt `harw-runtime` `resolve_uia_model`.)
-//! - **UIA-Worker**: Provider stets aus der UIA-Zeile (Kopplungsregel);
-//!   `uia_worker_model` → [`RoleModelSource::UiaWorkerPin`], sonst das Modell
-//!   der UIA-Zeile → [`RoleModelSource::InheritsUia`].
+//! - **UIA-Worker** (Rolle `uia-worker`, Runde 5 Teil G): feste Wahl aus
+//!   `[uia_worker_models]` bzw. dem alten `uia_worker_model` mit eigenem
+//!   Provider → [`RoleModelSource::UiaWorkerPin`], sonst Provider/Modell der
+//!   UIA-Zeile → [`RoleModelSource::InheritsUia`] (siehe
+//!   [`crate::resolve_uia_worker_model`]).
 //! - **Orchestrator**: explizite Wahl `internal_models.root_orchestrator` →
 //!   [`RoleModelSource::Explicit`], sonst Hauptmodell →
 //!   [`RoleModelSource::DefaultModel`] (bzw. `Unset` ohne `default_model`).
@@ -30,7 +32,9 @@
 //! Modells, sonst des aufgelösten Providers, sonst `None`.
 
 use crate::ResolvedConfig;
-use crate::internal_models::{InternalModelPoint, InternalModelSource, resolve_internal_model};
+use crate::internal_models::{
+    InternalModelPoint, InternalModelSource, fast_model_for_active_provider, resolve_internal_model,
+};
 
 /// Rolle, für die ein Modell gewählt bzw. angezeigt werden kann.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -59,11 +63,13 @@ pub enum ModelRole {
     MemoryConsolidation,
     /// Traum-Reflexion.
     DreamReflection,
+    /// Runde 5, Teil E: Klassifizierer des Auto-Modus.
+    AutoClassifier,
 }
 
 impl ModelRole {
     /// Alle Rollen in stabiler Anzeige-Reihenfolge.
-    pub const ALL: [ModelRole; 12] = [
+    pub const ALL: [ModelRole; 13] = [
         ModelRole::Uia,
         ModelRole::UiaWorker,
         ModelRole::Orchestrator,
@@ -76,6 +82,7 @@ impl ModelRole {
         ModelRole::SessionTitle,
         ModelRole::MemoryConsolidation,
         ModelRole::DreamReflection,
+        ModelRole::AutoClassifier,
     ];
 
     /// Kurzer, stabiler Schlüssel für Befehle (`/models set <rolle> …`).
@@ -94,6 +101,7 @@ impl ModelRole {
             Self::SessionTitle => "title",
             Self::MemoryConsolidation => "memory",
             Self::DreamReflection => "dream",
+            Self::AutoClassifier => "auto-classifier",
         }
     }
 
@@ -113,6 +121,7 @@ impl ModelRole {
             Self::SessionTitle => "Sitzungstitel",
             Self::MemoryConsolidation => "Gedächtnis-Konsolidierung",
             Self::DreamReflection => "Traum-Reflexion",
+            Self::AutoClassifier => "Auto-Modus-Klassifizierer",
         }
     }
 
@@ -150,6 +159,7 @@ impl ModelRole {
             Self::SessionTitle => Some(InternalModelPoint::SessionTitle),
             Self::MemoryConsolidation => Some(InternalModelPoint::MemoryConsolidation),
             Self::DreamReflection => Some(InternalModelPoint::DreamReflection),
+            Self::AutoClassifier => Some(InternalModelPoint::AutoClassifier),
         }
     }
 }
@@ -232,11 +242,17 @@ type ProviderModelSource = (Option<String>, Option<String>, RoleModelSource);
 fn resolve_provider_model(config: &ResolvedConfig, role: ModelRole) -> ProviderModelSource {
     match role {
         ModelRole::Uia => resolve_uia(config),
+        // Runde 5, Teil G: die Zeile zeigt die Rolle `uia-worker`; eine feste
+        // Wahl trägt ihren eigenen Provider (keine Kopplung an die UIA mehr).
         ModelRole::UiaWorker => {
-            let (provider, uia_model, _) = resolve_uia(config);
-            match non_empty(config.harness.uia_worker_model.as_deref()) {
-                Some(model) => (provider, Some(model), RoleModelSource::UiaWorkerPin),
-                None => (provider, uia_model, RoleModelSource::InheritsUia),
+            match crate::uia_worker_models::resolve_uia_worker_model(config, "uia-worker").choice {
+                crate::uia_worker_models::UiaWorkerModelChoice::Fixed { provider, model } => {
+                    (Some(provider), Some(model), RoleModelSource::UiaWorkerPin)
+                }
+                crate::uia_worker_models::UiaWorkerModelChoice::FollowUia => {
+                    let (provider, uia_model, _) = resolve_uia(config);
+                    (provider, uia_model, RoleModelSource::InheritsUia)
+                }
             }
         }
         ModelRole::Orchestrator => {
@@ -287,6 +303,25 @@ fn resolve_provider_model(config: &ResolvedConfig, role: ModelRole) -> ProviderM
                     RoleModelSource::OpenRouterDefault,
                 ),
                 InternalModelSource::MainModel => default_model(config),
+            }
+        }
+        // Runde 5, Teil E: ohne explizite Wahl das schnelle Modell des
+        // aktiven Providers (claude-haiku-4-5 bzw. das kleinste), sonst das
+        // Hauptmodell.
+        ModelRole::AutoClassifier => {
+            let resolved = resolve_internal_model(config, InternalModelPoint::AutoClassifier);
+            match resolved.source {
+                InternalModelSource::Explicit => {
+                    (resolved.provider, resolved.model, RoleModelSource::Explicit)
+                }
+                InternalModelSource::OpenRouterDefault | InternalModelSource::MainModel => {
+                    match fast_model_for_active_provider(config) {
+                        Some((provider, model)) => {
+                            (provider, Some(model), RoleModelSource::DefaultModel)
+                        }
+                        None => default_model(config),
+                    }
+                }
             }
         }
     }
@@ -350,7 +385,8 @@ fn resolve_effort(
         | ModelRole::CompactionSummary
         | ModelRole::SessionTitle
         | ModelRole::MemoryConsolidation
-        | ModelRole::DreamReflection => None,
+        | ModelRole::DreamReflection
+        | ModelRole::AutoClassifier => None,
     };
     if let Some(effort) = non_empty(role_weight) {
         return Some(effort);
@@ -520,16 +556,50 @@ mod tests {
         assert!(row.model.is_none());
     }
 
+    /// Runde 5, Teil G: der alte Pin trägt den Provider aus dem Katalog,
+    /// nicht mehr den UIA-Provider.
     #[test]
-    fn test_uia_worker_pin_uses_uia_provider() -> TestResult {
+    fn test_uia_worker_pin_uses_catalog_provider() -> TestResult {
         let mut config = base_config()?;
         config.harness.uia_provider = Some("pin".to_owned());
         config.harness.uia_model = Some("pin-model".to_owned());
         config.harness.uia_worker_model = Some("worker-model".to_owned());
+        config.models.insert(
+            "worker-model".to_owned(),
+            toml::from_str("id = \"worker-model\"\nprovider = \"main\"\n")
+                .map_err(ctx("model toml"))?,
+        );
         let row = resolve_role_model(&config, ModelRole::UiaWorker);
         assert_eq!(row.source, RoleModelSource::UiaWorkerPin);
-        assert_eq!(row.provider.as_deref(), Some("pin"));
+        assert_eq!(row.provider.as_deref(), Some("main"));
         assert_eq!(row.model.as_deref(), Some("worker-model"));
+        Ok(())
+    }
+
+    /// Runde 5, Teil G: eine eigene Rollenwahl mit anderem Provider als die
+    /// UIA wird angezeigt; „uia“ zeigt wieder die UIA-Zeile.
+    #[test]
+    fn test_uia_worker_own_choice_is_independent_of_uia_provider() -> TestResult {
+        let mut config = base_config()?;
+        config.harness.uia_provider = Some("pin".to_owned());
+        config.harness.uia_model = Some("pin-model".to_owned());
+        config
+            .harness
+            .uia_worker_models
+            .set("uia-worker", Some("main/fast-model".to_owned()));
+        let row = resolve_role_model(&config, ModelRole::UiaWorker);
+        assert_eq!(row.source, RoleModelSource::UiaWorkerPin);
+        assert_eq!(row.provider.as_deref(), Some("main"));
+        assert_eq!(row.model.as_deref(), Some("fast-model"));
+
+        config
+            .harness
+            .uia_worker_models
+            .set("uia-worker", Some("uia".to_owned()));
+        let row = resolve_role_model(&config, ModelRole::UiaWorker);
+        assert_eq!(row.source, RoleModelSource::InheritsUia);
+        assert_eq!(row.provider.as_deref(), Some("pin"));
+        assert_eq!(row.model.as_deref(), Some("pin-model"));
         Ok(())
     }
 
@@ -678,6 +748,29 @@ mod tests {
         let rows = resolve_role_models(&config);
         let roles: Vec<ModelRole> = rows.iter().map(|row| row.role).collect();
         assert_eq!(roles, ModelRole::ALL.to_vec());
+        Ok(())
+    }
+
+    /// Runde 5, Teil E: `auto-classifier` bekommt ohne Wahl das schnelle
+    /// Modell des aktiven Providers, mit Wahl die explizite.
+    #[test]
+    fn test_auto_classifier_role_resolves_fast_model_or_explicit_choice() -> TestResult {
+        let mut config = base_config()?;
+        config.harness.default_provider = Some("anthropic".to_owned());
+        let row = resolve_role_model(&config, ModelRole::AutoClassifier);
+        assert_eq!(row.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(
+            ModelRole::parse("auto-classifier"),
+            Some(ModelRole::AutoClassifier)
+        );
+
+        config
+            .harness
+            .internal_models
+            .set_choice(InternalModelPoint::AutoClassifier, explicit("pin", "tiny"));
+        let row = resolve_role_model(&config, ModelRole::AutoClassifier);
+        assert_eq!(row.source, RoleModelSource::Explicit);
+        assert_eq!(row.model.as_deref(), Some("tiny"));
         Ok(())
     }
 

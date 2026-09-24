@@ -24,21 +24,35 @@
 //!   [`HostPermitHandles`] (gebündelter ServiceMap-Eintrag, Plan Teil B3) und
 //!   [`SANDBOX_LEASE_WORKER_DEFINITION`] (Worker-Definition der
 //!   `sandbox-lease`-Operation, Plan Teil B5)
+//! - [`host_escalation`] — [`HostEscalation`], [`HostRequesterBook`],
+//!   [`HostRequester`]: Host-Mode-Anfrage aus dem Orchestrator-Baum
+//!   (`shell.exec` mit `request_host`, nur mit TUI-Freigabekanal; Runde 5,
+//!   Teil N)
 //! - [`latex`] — [`LatexToolProvider`]: typisiertes Werkzeug `latex.build`
 //!   (festes `latexmk`-argv in derselben Bubblewrap-Sandbox, Runde 4 Teil E)
+//! - [`sudo`] — [`SudoToolProvider`]: Werkzeug `host.sudo_exec` (ein Root-Befehl
+//!   mit exaktem argv über festgepinntes `sudo`, freigegeben im eigenen
+//!   TUI-Fenster; Fragekanal [`SudoPrompt`]/[`SudoAnswer`], Runde 5 Teil B)
 //! - `capture` (intern) — streamende, gekappte Erfassung von stdout/stderr (W1-03)
 
 #![forbid(unsafe_code)]
 
 mod capture;
 pub mod exec;
+pub mod host_escalation;
 pub mod host_permit_prompt;
 pub mod latex;
 pub mod limits;
+pub mod sudo;
 
 pub use exec::{
-    HOST_PERMIT_PROMPT_TIMEOUT, HOST_SESSION_LEASE_TTL, ShellExecError, ShellExecutor,
-    ShellToolProvider,
+    BUILD_COMMAND_DEFAULT_TIMEOUT_SECS, DEFAULT_MAX_TIMEOUT_SECS, HOST_PERMIT_PROMPT_TIMEOUT,
+    HOST_SESSION_LEASE_TTL, ShellExecError, ShellExecutor, ShellToolProvider,
+};
+// Runde 5, Teil N: Host-Mode-Anfrage aus dem Orchestrator-Baum.
+pub use host_escalation::{
+    HOST_ESCALATION_DENIED_MSG, HOST_MODE_REQUIRES_TUI_MSG, HostEscalation, HostRequester,
+    HostRequesterBook, SandboxDenial, classify_sandbox_denial,
 };
 pub use host_permit_prompt::{
     HostPermitHandles, HostPermitPrompt, HostPermitPromptReceiver, HostPermitPromptSender,
@@ -46,6 +60,11 @@ pub use host_permit_prompt::{
 };
 pub use latex::{LATEX_BUILD_TOOL, LatexEngine, LatexToolProvider};
 pub use limits::{ShellLimits, ShellLimitsError};
+pub use sudo::{
+    SUDO_EXEC_TOOL, SUDO_MAX_SECRET_BYTES, SUDO_PROMPT_TIMEOUT, SudoAnswer, SudoAuditRecord,
+    SudoAuditSink, SudoAuthFailureHook, SudoPrompt, SudoPromptReceiver, SudoPromptSender,
+    SudoSecret, SudoSecretError, SudoToolProvider, TracingSudoAudit, sudo_prompt_channel,
+};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

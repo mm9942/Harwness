@@ -223,18 +223,35 @@ fn resolve_child_default_reasoning_effort(
 /// dem Rückgabepfad — eine eventuell vorhandene vollständige Persistenz
 /// (z. B. Transcript/State-Store des Kindes) bleibt davon unberührt, weil
 /// diese Konstante nur von [`cap_child_return_text`] konsumiert wird.
-pub const CHILD_RETURN_MAX_BYTES: usize = 8 * 1024;
+///
+/// Runde 5 (Bugreport „Kind-Antwort in der Mitte gekürzt“): früher 8 KiB
+/// (≈ 2k Token, ≈ 1 % eines 200k-Fensters) — ein gewöhnlicher
+/// Orchestrator-Bericht von ~18 KB verlor damit über die Hälfte. 32 KiB
+/// (≈ 8k Token, ≈ 4 % eines 200k-Fensters) fassen solche Berichte ganz und
+/// bleiben deutlich unter der Werkzeugergebnis-Grenze der Wurzel
+/// (`TOOL_RESULT_MAX_BYTES`, 64 KiB, `harw-runtime/src/assembly.rs`) und der
+/// Kind-Turns ([`CHILD_TOOL_RESULT_MAX_BYTES`]), damit dort nicht ein
+/// zweites Mal gekürzt wird.
+pub const CHILD_RETURN_MAX_BYTES: usize = 32 * 1024;
 
 /// Kürzt einen Text auf höchstens `max_bytes`, ohne einen UTF-8-Zeichen zu zerschneiden.
 ///
 /// # Beschreibung
 /// Ist `text.len() <= max_bytes`, wird `text` unverändert zurückgegeben.
-/// Andernfalls werden ein Kopf (~3/4 des Budgets) und ein Ende (~1/4 des
-/// Budgets) behalten, getrennt durch eine Markierung `\n[… {n} Bytes der
+/// Andernfalls werden ein Kopf und ein Ende zu **je der Hälfte** des Budgets
+/// behalten, getrennt durch eine Markierung `\n[… {n} Bytes der
 /// Kind-Antwort gekürzt …]\n`, wobei `{n}` die Anzahl der weggelassenen
-/// Bytes ist. Kopf und Ende werden jeweils auf die nächstliegende gültige
-/// UTF-8-Zeichengrenze zurückgeschnitten, damit niemals ein Mehrbyte-Zeichen
-/// mittendrin geteilt wird.
+/// Bytes ist. Die Markierung sagt zusätzlich, dass Anfang und Schluss
+/// vollständig sind und nur der Mittelteil fehlt (Wortlaut:
+/// `[… {n} Bytes der Kind-Antwort gekürzt; Anfang und Schluss vollständig …]`).
+///
+/// Das Ende ist bewusst genauso groß wie der Kopf (früher nur ~1/4): bei
+/// einem Bericht stehen Fazit und Empfehlungen am Schluss und dürfen nicht
+/// verloren gehen. Beide Schnittstellen rücken, wenn möglich, auf eine
+/// Zeilengrenze (höchstens `CAP_LINE_SNAP_BYTES` weit, nie über das
+/// Budget hinaus), damit keine halbe Zeile stehen bleibt; ansonsten auf die
+/// nächstliegende gültige UTF-8-Zeichengrenze, damit niemals ein
+/// Mehrbyte-Zeichen mittendrin geteilt wird.
 ///
 /// # Argumente
 /// - `text` (`&str`): der ungekürzte Text.
@@ -253,28 +270,99 @@ pub const CHILD_RETURN_MAX_BYTES: usize = 8 * 1024;
 /// assert_eq!(cap_child_return_text("kurz", 100), "kurz");
 /// let long = "a".repeat(200);
 /// let capped = cap_child_return_text(&long, 100);
-/// assert!(capped.len() <= 100 + 64);
+/// assert!(capped.len() <= 100 + 128);
 /// assert!(capped.contains("gekürzt"));
 /// ```
 #[must_use]
 pub fn cap_child_return_text(text: &str, max_bytes: usize) -> String {
+    cap_child_return_text_inner(text, max_bytes, None)
+}
+
+/// Name des rein lesenden Werkzeugs, das den ungekürzten Antworttext eines
+/// eigenen, abgeschlossenen Kind-Laufs liefert (Runde 5, Teil H;
+/// `harw-core-bridge::agent_result`). Die Kürzungsmarke von
+/// [`cap_child_return_text_for_child`] nennt es.
+pub const AGENT_RESULT_TOOL: &str = "agent.result";
+
+/// Wie [`cap_child_return_text`], aber die Kürzungsmarke nennt zusätzlich
+/// das Werkzeug [`AGENT_RESULT_TOOL`] mit der `child_id` des Kindes
+/// (Runde 5, Teil H).
+///
+/// # Beschreibung
+/// Die Markierung lautet dann
+/// `[… {n} Bytes der Kind-Antwort gekürzt; Anfang und Schluss vollständig;
+/// ungekürzt über agent.result {"child_id":"<id>"} …]`. Der Elternteil kann
+/// den vollständigen Text damit gezielt (auch seitenweise über
+/// `offset`/`max_bytes`) nachladen, statt den Auftrag zu wiederholen.
+///
+/// # Argumente
+/// - `text` (`&str`): der ungekürzte Text.
+/// - `max_bytes` (`usize`): das Byte-Budget für Kopf + Ende.
+/// - `child` (`&SessionId`): das Kind, dessen Antwort gekürzt wird.
+///
+/// # Rückgabe
+/// Wie [`cap_child_return_text`]; ein Text innerhalb des Budgets bleibt
+/// unverändert (ohne Markierung).
+///
+/// # Beispiele
+/// ```rust
+/// use harw_core::child_controller::cap_child_return_text_for_child;
+/// use harw_types::SessionId;
+///
+/// let child = SessionId::new();
+/// assert_eq!(cap_child_return_text_for_child("kurz", 100, &child), "kurz");
+/// let capped = cap_child_return_text_for_child(&"a".repeat(200), 100, &child);
+/// assert!(capped.contains("agent.result"));
+/// assert!(capped.contains(child.as_str()));
+/// ```
+#[must_use]
+pub fn cap_child_return_text_for_child(text: &str, max_bytes: usize, child: &SessionId) -> String {
+    cap_child_return_text_inner(text, max_bytes, Some(child))
+}
+
+/// Gemeinsamer Kern von [`cap_child_return_text`] und
+/// [`cap_child_return_text_for_child`].
+fn cap_child_return_text_inner(text: &str, max_bytes: usize, child: Option<&SessionId>) -> String {
     if text.len() <= max_bytes {
         return text.to_owned();
     }
 
-    let head_budget = max_bytes * 3 / 4;
+    let head_budget = max_bytes / 2;
     let tail_budget = max_bytes - head_budget;
 
     let head_end = floor_char_boundary(text, head_budget);
+    // Kopf auf das Ende der letzten vollständigen Zeile zurückziehen (der
+    // Zeilenumbruch bleibt im Kopf), sofern sie nahe genug liegt.
+    let head_end = text[..head_end]
+        .rfind('\n')
+        .map(|newline| newline + 1)
+        .filter(|&snapped| head_end - snapped <= CAP_LINE_SNAP_BYTES)
+        .unwrap_or(head_end);
     let tail_start_min = text.len().saturating_sub(tail_budget);
     let tail_start = ceil_char_boundary(text, tail_start_min);
+    // Ende auf den Anfang der nächsten vollständigen Zeile vorziehen.
+    let tail_start = text[tail_start..]
+        .find('\n')
+        .map(|newline| tail_start + newline + 1)
+        .filter(|&snapped| snapped - tail_start <= CAP_LINE_SNAP_BYTES && snapped < text.len())
+        .unwrap_or(tail_start);
     // Kopf und Ende dürfen sich nicht überlappen; bei sehr kleinen Budgets
     // (oder sehr großen UTF-8-Zeichen an der Grenze) wird das Ende notfalls
     // hinter das Kopfende gezogen.
     let tail_start = tail_start.max(head_end);
 
     let omitted = text.len().saturating_sub(head_end) - (text.len() - tail_start);
-    let marker = format!("\n[… {omitted} Bytes der Kind-Antwort gekürzt …]\n");
+    // Runde 5, Teil H: mit bekannter Kind-ID nennt die Markierung den Weg
+    // zum ungekürzten Text.
+    let marker = match child {
+        Some(child) => format!(
+            "\n[… {omitted} Bytes der Kind-Antwort gekürzt; Anfang und Schluss vollständig; \
+             ungekürzt über {AGENT_RESULT_TOOL} {{\"child_id\":\"{child}\"}} …]\n"
+        ),
+        None => format!(
+            "\n[… {omitted} Bytes der Kind-Antwort gekürzt; Anfang und Schluss vollständig …]\n"
+        ),
+    };
 
     tracing::debug!(
         original_bytes = text.len(),
@@ -289,6 +377,11 @@ pub fn cap_child_return_text(text: &str, max_bytes: usize) -> String {
     capped.push_str(&text[tail_start..]);
     capped
 }
+
+/// Wie weit [`cap_child_return_text`] eine Schnittstelle höchstens verschiebt,
+/// um auf einer Zeilengrenze zu landen (Bytes). Die Verschiebung verkleinert
+/// Kopf bzw. Ende nur, überschreitet das Budget also nie.
+const CAP_LINE_SNAP_BYTES: usize = 512;
 
 /// Größte Byte-Position `<= idx`, die auf einer UTF-8-Zeichengrenze von `s` liegt.
 fn floor_char_boundary(s: &str, idx: usize) -> usize {
@@ -446,6 +539,9 @@ struct ChildTaskState {
     /// Höchstlänge (Bytes) des Auftrags-Texts für jeden Lauf dieses Kindes;
     /// `None` = unbegrenzt (Teil C).
     task_max_bytes: Option<usize>,
+    /// Runde 5, Teil J: gesetzt, wenn dieses Kind die Fortsetzung eines
+    /// budget-beendeten Vorgängers ist ([`ManagedAgentSpawner::bind_continuation`]).
+    continuation: Option<crate::child_handoff::ContinuationLink>,
 }
 
 /// Ziel der [`TurnEvent::ChildProgress`]-Meldungen eines Kindes: der
@@ -896,8 +992,17 @@ pub struct ChildRunResult {
     /// `true`, wenn das Token-Budget den Lauf beendet hat (Teil C). Dann ist
     /// `outcome` [`TurnOutcome::Completed`] und `full_text` die **letzte**
     /// Assistant-Antwort des Kindes als Teilergebnis (oder `None`, wenn es
-    /// noch keine gab) — kein Fehler, das Ergebnis geht nicht verloren.
+    /// noch keine gab) — kein Fehler, das Ergebnis geht nicht verloren. Seit
+    /// Runde 5, Teil J ist `full_text` stattdessen die Übergabe-Verdichtung,
+    /// wenn [`Self::budget_handoff`] `Compacted` ist.
     pub budget_exhausted: bool,
+    /// Runde 5, Teil J: wie das Ergebnis eines budget-beendeten Laufs
+    /// entstand. `Some(Compacted)`: `full_text` ist die markierte
+    /// Übergabe-Verdichtung (die rohe letzte Antwort liegt im Archiv für
+    /// `agent.result`); `Some(LastAnswer)`: `full_text` ist die letzte
+    /// Assistant-Antwort (Modus `LastAnswer` oder Rückfall nach
+    /// gescheiterter Verdichtung). `None`, wenn das Budget nicht griff.
+    pub budget_handoff: Option<crate::child_handoff::BudgetHandoff>,
 }
 
 /// Lebenszyklus-Status eines admittierten Kindes.
@@ -1498,10 +1603,64 @@ pub struct ParentGrant {
     pub reasoning_effort: Option<String>,
 }
 
+/// Beobachter, die eine [`ChildRegistryFactory`] an die Sitzung eines
+/// admittierten Kindes hängt (Runde 5, Teil C: Diary der Kind-Agenten).
+///
+/// # Felder
+/// - `compaction`: landet über
+///   [`AgentSession::with_compaction_observer`] im Verdichtungs-Slot.
+/// - `tool_outcome`: landet über
+///   [`AgentSession::with_tool_outcome_observer`] im Werkzeug-/Runden-Slot.
+///
+/// `None` lässt den jeweiligen Slot der Kind-Sitzung unverändert.
+#[derive(Clone, Default)]
+pub struct ChildSessionObservers {
+    pub compaction: Option<Arc<dyn crate::compaction::CompactionObserver>>,
+    pub tool_outcome: Option<Arc<dyn crate::capture::ToolOutcomeObserver>>,
+}
+
+impl std::fmt::Debug for ChildSessionObservers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildSessionObservers")
+            .field("compaction", &self.compaction.is_some())
+            .field("tool_outcome", &self.tool_outcome.is_some())
+            .finish()
+    }
+}
+
 /// Supplies a fresh, role-specific extension registry for an admitted child.
 /// It is intentionally fallible: a role must not start with a partial plugin,
 /// skill, or MCP activation.
 pub trait ChildRegistryFactory: Send + Sync {
+    /// Beobachter für die Sitzung eines gerade admittierten Kindes (Runde 5,
+    /// Teil C). Der Controller ruft das genau einmal je Admission, nachdem
+    /// die Kind-Sitzung existiert, und hängt die gelieferten Beobachter an.
+    /// Der Aufruf geschieht unter dem Lock des `SessionManager`; die
+    /// Implementierung darf den Controller deshalb nicht wieder betreten.
+    ///
+    /// # Arguments
+    /// - `role` (`&str`): der exakte registrierte Rollenname.
+    /// - `child` (`&SessionId`): die Sitzung des Kindes.
+    ///
+    /// # Returns
+    /// Der Default liefert keine Beobachter — bestehende Factories bleiben
+    /// unverändert.
+    fn child_session_observers(&self, role: &str, child: &SessionId) -> ChildSessionObservers {
+        let _ = (role, child);
+        ChildSessionObservers::default()
+    }
+
+    /// Meldet die Freigabe eines Kindes (Runde 5, Teil C): Abschluss,
+    /// Abbruch oder Fehler — einmal je Kind-Lauf, nachdem der Controller
+    /// seine Sperren freigegeben hat. Der Default tut nichts.
+    ///
+    /// # Arguments
+    /// - `role` (`&str`): der exakte registrierte Rollenname.
+    /// - `child` (`&SessionId`): die freigegebene Sitzung.
+    fn child_session_released(&self, role: &str, child: &SessionId) {
+        let _ = (role, child);
+    }
+
     fn build_registry(
         &self,
         role: &str,
@@ -1868,7 +2027,49 @@ pub struct ManagedAgentSpawner {
     /// admittieren darf ([`Self::with_uia_spawnable_roles`]). Leer, solange
     /// nichts explizit gesetzt wurde — dann gilt die Spawn-Matrix unverändert.
     uia_spawnable_roles: HashSet<String>,
+    /// Runde 5, Teil H: die ungekürzten Antworttexte abgeschlossener
+    /// Kind-Läufe samt Elternteil (älteste zuerst), für
+    /// [`Self::child_result_text`] bzw. das Werkzeug [`AGENT_RESULT_TOOL`].
+    /// Überlebt die Freigabe des Kindes; gedeckelt über
+    /// [`CHILD_RESULT_ARCHIVE_MAX_ENTRIES`]/[`CHILD_RESULT_ARCHIVE_MAX_BYTES`].
+    child_results: Mutex<VecDeque<ArchivedChildResult>>,
+    /// Runde 5, Teil J: was ein Kind am Ende seines Token-Budgets liefert
+    /// (Vorgabe: Übergabe-Verdichtung mit Reserve).
+    budget_handoff_mode: crate::child_handoff::BudgetHandoffMode,
+    /// Runde 5, Teil J: Budget-Übergaben und Fortsetzungsketten.
+    handoff_ledger: Mutex<crate::child_handoff::HandoffLedger>,
+    /// Runde 5, Teil K: Hintergrund-Läufe und Orchestrierungsgrenzen
+    /// (`crate::background_children`).
+    pub(crate) background: Arc<crate::background_children::BackgroundChildren>,
+    /// Runde 5, Teil M: Aktivitätsjournale, Endberichte und
+    /// Eltern-Kind-Nachrichten (`crate::child_comms`); geteilt mit dem
+    /// [`Self::progress_observer`].
+    pub(crate) comms: Arc<crate::child_comms::ChildComms>,
+    /// Runde 5, Teil O: optionaler Freigabe-Kanal zur Oberfläche
+    /// (`crate::child_approval`); leer = bisheriges fail-closed-Verhalten.
+    pub(crate) child_approvals: Arc<crate::child_approval::ChildApprovalRelay>,
 }
+
+/// Ein archivierter, ungekürzter Antworttext eines abgeschlossenen
+/// Kind-Laufs (Runde 5, Teil H).
+#[derive(Debug, Clone)]
+struct ArchivedChildResult {
+    /// Kind-ID ([`SessionId::as_str`]).
+    child: String,
+    /// Der Elternteil, der das Kind gestartet hat — nur er darf den Text lesen.
+    parent: SessionId,
+    /// Der ungekürzte Text.
+    text: String,
+}
+
+/// Höchstzahl archivierter Kind-Antworten je Spawner (Runde 5, Teil H);
+/// darüber fällt die älteste heraus.
+pub const CHILD_RESULT_ARCHIVE_MAX_ENTRIES: usize = 64;
+
+/// Gesamtobergrenze (Bytes) der archivierten Kind-Antworten je Spawner
+/// (Runde 5, Teil H); darüber fallen die ältesten heraus. Ein einzelner
+/// Text über dieser Grenze wird gar nicht archiviert.
+pub const CHILD_RESULT_ARCHIVE_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// Anzahl der pro Elternteil vorgehaltenen Delegations-Brief-Hashes
 /// (Addendum F+G).
@@ -1969,6 +2170,58 @@ fn renew_active_lease(
     }
 }
 
+/// Runde 5, Teil M: die admittierten Vorfahren von `child` (Elternteil
+/// zuerst), höchstens so viele wie Einträge in der Registry (zyklenfest).
+fn active_ancestors(
+    active: &Mutex<BTreeMap<String, ChildRecord>>,
+    child: &SessionId,
+) -> Vec<SessionId> {
+    let Ok(active) = active.lock() else {
+        return Vec::new();
+    };
+    let mut ancestors = Vec::new();
+    let mut cursor = child.as_str().to_owned();
+    for _ in 0..active.len() {
+        let Some(parent) = active.get(&cursor).map(|record| record.parent.clone()) else {
+            break;
+        };
+        if !active.contains_key(parent.as_str()) {
+            break;
+        }
+        cursor = parent.as_str().to_owned();
+        ancestors.push(parent);
+    }
+    ancestors
+}
+
+/// Runde 5, Teil M: schreibt jeden Werkzeugaufruf eines Kindes in sein
+/// Aktivitätsjournal und reicht ihn an den Beobachter der Fabrik weiter.
+struct JournalToolObserver {
+    comms: Arc<crate::child_comms::ChildComms>,
+    inner: Option<Arc<dyn crate::capture::ToolOutcomeObserver>>,
+}
+
+impl crate::capture::ToolOutcomeObserver for JournalToolObserver {
+    fn on_tool_outcome(&self, session_id: &SessionId, outcome: &crate::capture::ToolOutcome<'_>) {
+        self.comms.record_tool_outcome(
+            session_id,
+            outcome.tool_name,
+            outcome.arguments,
+            outcome.status == crate::capture::ToolOutcomeStatus::Success,
+            outcome.output_text,
+        );
+        if let Some(inner) = &self.inner {
+            inner.on_tool_outcome(session_id, outcome);
+        }
+    }
+
+    fn on_turn_finished(&self, session_id: &SessionId) {
+        if let Some(inner) = &self.inner {
+            inner.on_turn_finished(session_id);
+        }
+    }
+}
+
 /// Leichter [`crate::guard::ProgressObserver`], der nur die Aktiv-Registry
 /// und die Lease-Dauer hält — kein `Arc<Self>` auf den vollen Controller
 /// (Addendum F+G, [`ManagedAgentSpawner::progress_observer`]).
@@ -1978,6 +2231,8 @@ struct ActiveLeaseProgressObserver {
     orchestration_observer: Option<Arc<dyn OrchestrationObserver>>,
     /// Live-Kanäle der Elternteile für [`TurnEvent::ChildProgress`].
     progress_sinks: ProgressSinks,
+    /// Runde 5, Teil M: Journale und Postfächer.
+    comms: Arc<crate::child_comms::ChildComms>,
 }
 
 impl ActiveLeaseProgressObserver {
@@ -2001,13 +2256,25 @@ impl crate::guard::ProgressObserver for ActiveLeaseProgressObserver {
         });
     }
 
+    fn on_assistant_text(&self, session_id: &SessionId, text: &str) {
+        // Runde 5, Teil M: letzter Assistententext ins Aktivitätsjournal.
+        self.comms.set_last_assistant(session_id, text);
+    }
+
+    fn take_inbound_messages(&self, session_id: &SessionId) -> Vec<String> {
+        // Runde 5, Teil M: Postfach (`agent.message`/`parent.message`).
+        self.comms.take_inbound(session_id)
+    }
+
     fn on_progress(&self, session_id: &SessionId) {
-        renew_active_lease(
-            &self.active,
-            self.lease_seconds,
-            session_id,
-            Timestamp::now(),
-        );
+        let now = Timestamp::now();
+        renew_active_lease(&self.active, self.lease_seconds, session_id, now);
+        // Runde 5, Teil M: ein Elternteil, der auf ein arbeitendes Kind
+        // wartet, lebt ebenfalls — seine Lease (und die aller Vorfahren)
+        // läuft nicht ab, solange ein Nachkomme Fortschritt meldet.
+        for ancestor in active_ancestors(&self.active, session_id) {
+            renew_active_lease(&self.active, self.lease_seconds, &ancestor, now);
+        }
         // The turn-loop calls this after every model round and tool result.
         // Snapshot under the registry lock, then notify after releasing it so
         // a durable/UI observer can never re-enter controller locking.
@@ -2257,11 +2524,38 @@ impl ManagedAgentSpawner {
             };
             self.observe_orchestration(root, record, None, status);
         }
+        // Runde 5, Teil C: die Fabrik der Rolle erfährt die Freigabe (Diary-
+        // Sitzungsende des Kindes). Nur mit Record — ein zweiter, leerer
+        // Freigabeversuch meldet nichts, also höchstens einmal je Kind-Lauf.
+        if let Some(record) = record
+            && let Some(definition) = self.roles.get(&record.role)
+        {
+            definition
+                .registry_factory
+                .child_session_released(&record.role, child);
+        }
+        // Runde 5, Teil M: das Ende des Kindes im Journal seines
+        // Elternteils (Enkel-Kurzform), bevor der Auftragszustand fällt.
+        if let Some(record) = record {
+            let detail = self
+                .child_task_state(child)
+                .and_then(|state| state.outcome_detail);
+            let outcome = match (self.comms.end_report(child), detail) {
+                (Some(end), _) => format!("{}: {}", end.status.as_str(), end.reason),
+                (None, Some(detail)) => format!("{}: {detail}", record.status.as_str()),
+                (None, None) => record.status.as_str().to_owned(),
+            };
+            self.comms
+                .record_grandchild_end(&record.parent, child, &record.role, &outcome);
+        }
         self.forget_child_state(child);
     }
 
     /// Entfernt Auftrags- und Fortschrittszustand eines nicht mehr aktiven Kindes.
     fn forget_child_state(&self, child: &SessionId) {
+        // Runde 5, Teil M: Journal schließen (bleibt begrenzt vorrätig),
+        // Postfach und offene Frage fallen weg.
+        self.comms.close_journal(child);
         if let Ok(mut tasks) = self.child_tasks.lock() {
             tasks.remove(child.as_str());
         }
@@ -2355,6 +2649,20 @@ impl ManagedAgentSpawner {
         self
     }
 
+    /// Runde 5, Teil J: legt fest, was ein Kind am Ende seines Token-Budgets
+    /// liefert.
+    ///
+    /// # Arguments
+    /// - `mode` ([`crate::child_handoff::BudgetHandoffMode`]): `Compact`
+    ///   (Vorgabe) hält eine Reserve zurück und liefert eine
+    ///   Übergabe-Verdichtung; `LastAnswer` ist das Verhalten vor Runde 5
+    ///   (letzte Assistant-Antwort, keine Reserve).
+    #[must_use]
+    pub fn with_budget_handoff(mut self, mode: crate::child_handoff::BudgetHandoffMode) -> Self {
+        self.budget_handoff_mode = mode;
+        self
+    }
+
     /// Setzt den absoluten Auto-Compact-Deckel (Input-Tokens) für jede
     /// admittierte Kind-Session (Welle 3).
     ///
@@ -2419,6 +2727,15 @@ impl ManagedAgentSpawner {
             progress_sinks: Arc::new(Mutex::new(BTreeMap::new())),
             freed: tokio::sync::Notify::new(),
             uia_spawnable_roles: HashSet::new(),
+            child_results: Mutex::new(VecDeque::new()),
+            budget_handoff_mode: crate::child_handoff::BudgetHandoffMode::default(),
+            handoff_ledger: Mutex::new(crate::child_handoff::HandoffLedger::default()),
+            // Runde 5, Teil K.
+            background: Arc::new(crate::background_children::BackgroundChildren::default()),
+            // Runde 5, Teil M.
+            comms: Arc::new(crate::child_comms::ChildComms::default()),
+            // Runde 5, Teil O.
+            child_approvals: Arc::new(crate::child_approval::ChildApprovalRelay::default()),
         }
     }
 
@@ -2711,6 +3028,7 @@ impl ManagedAgentSpawner {
             lease_seconds: self.limits.lease_seconds,
             orchestration_observer: self.orchestration_observer.clone(),
             progress_sinks: Arc::clone(&self.progress_sinks),
+            comms: Arc::clone(&self.comms),
         })
     }
 
@@ -2891,6 +3209,34 @@ impl ManagedAgentSpawner {
             .lock()
             .ok()
             .and_then(|tokens| tokens.get(child.as_str()).cloned())
+    }
+
+    /// Runde 5, Teil O: gibt einem abgekoppelten (Hintergrund-)Kind einen
+    /// eigenen, vom Eltern-Turn unabhängigen Cancel-Token.
+    ///
+    /// # Beschreibung
+    /// Ein Hintergrund-Kind überlebt den Turn, der es gestartet hat; ein
+    /// Abbruch jenes Turns (Esc/Ctrl+C, nachdem das Werkzeug schon „running“
+    /// zurückgab) darf es nicht mitreißen. Abbrechen lässt es sich danach nur
+    /// noch gezielt über [`Self::request_cancellation`] (`agent.cancel`,
+    /// `/agent cancel`, `/new`, `/resume`, Beenden) oder sein Budget. Muss
+    /// **vor** dem ersten Lauf aufgerufen werden: später admittierte
+    /// Nachkommen leiten sich dann vom neuen Token ab.
+    ///
+    /// # Returns
+    /// `true`, wenn der Token ersetzt wurde; `false` für unbekannte oder
+    /// bereits abgebrochene Kinder (ein Abbruch wird nie zurückgenommen).
+    pub(crate) fn detach_cancel_token(&self, child: &SessionId) -> bool {
+        let Ok(mut tokens) = self.cancellations.lock() else {
+            return false;
+        };
+        match tokens.get(child.as_str()) {
+            Some(current) if !current.is_cancelled() => {
+                tokens.insert(child.as_str().to_owned(), CancelToken::new());
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Registriert den Cancel-Token eines Elternteils, der kein admittiertes Kind ist.
@@ -3482,12 +3828,122 @@ impl ManagedAgentSpawner {
     /// [`Self::child_final_assistant_text_full`] (bzw.
     /// [`ChildRunResult::full_text`]) denselben Text ungekürzt.
     ///
+    /// Runde 5, Teil H: die Kürzungsmarke nennt [`AGENT_RESULT_TOOL`] mit der
+    /// Kind-ID ([`cap_child_return_text_for_child`]); der ungekürzte Text
+    /// steht über [`Self::child_result_text`] bereit.
+    ///
     /// # Errors
     /// Returns [`AgentSpawnError`] when the child is not admitted, its restored
     /// session is unavailable, or its history contains no assistant text.
     pub fn child_final_assistant_text(&self, child: &SessionId) -> Result<String, AgentSpawnError> {
         let text = self.child_final_assistant_text_full(child)?;
-        Ok(cap_child_return_text(&text, CHILD_RETURN_MAX_BYTES))
+        Ok(cap_child_return_text_for_child(
+            &text,
+            CHILD_RETURN_MAX_BYTES,
+            child,
+        ))
+    }
+
+    /// Runde 5, Teil H: legt den ungekürzten Antworttext eines
+    /// abgeschlossenen Kind-Laufs im Ergebnisarchiv ab.
+    ///
+    /// # Beschreibung
+    /// Ein erneuter Lauf desselben Kindes ersetzt den älteren Eintrag. Danach
+    /// fallen die ältesten Einträge heraus, bis höchstens
+    /// [`CHILD_RESULT_ARCHIVE_MAX_ENTRIES`] Einträge mit zusammen höchstens
+    /// [`CHILD_RESULT_ARCHIVE_MAX_BYTES`] Bytes übrig sind. Ein einzelner
+    /// Text über der Byte-Grenze wird nicht archiviert. Best-effort: eine
+    /// vergiftete Sperre wird nur protokolliert.
+    ///
+    /// # Argumente
+    /// - `child` (`&SessionId`): das abgeschlossene Kind.
+    /// - `parent` (`&SessionId`): sein Elternteil (aus dem Admission-Record).
+    /// - `text` (`&str`): der ungekürzte Antworttext.
+    fn archive_child_result(&self, child: &SessionId, parent: &SessionId, text: &str) {
+        if text.is_empty() || text.len() > CHILD_RESULT_ARCHIVE_MAX_BYTES {
+            return;
+        }
+        let Ok(mut archive) = self.child_results.lock() else {
+            tracing::warn!(child = %child, "child_result_archive.lock_poisoned");
+            return;
+        };
+        archive.retain(|entry| entry.child != child.as_str());
+        archive.push_back(ArchivedChildResult {
+            child: child.as_str().to_owned(),
+            parent: parent.clone(),
+            text: text.to_owned(),
+        });
+        let mut total: usize = archive.iter().map(|entry| entry.text.len()).sum();
+        while archive.len() > CHILD_RESULT_ARCHIVE_MAX_ENTRIES
+            || total > CHILD_RESULT_ARCHIVE_MAX_BYTES
+        {
+            let Some(evicted) = archive.pop_front() else {
+                break;
+            };
+            total = total.saturating_sub(evicted.text.len());
+        }
+    }
+
+    /// Runde 5, Teil H: archiviert den Text eines abgeschlossenen Kindes,
+    /// sofern es (noch) einen Admission-Record mit Elternteil hat.
+    fn archive_completed_child(&self, child: &SessionId, text: Option<&str>) {
+        if let (Some(text), Some(record)) = (text, self.child_record(child)) {
+            self.archive_child_result(child, &record.parent, text);
+        }
+    }
+
+    /// Liefert den **ungekürzten** Antworttext eines eigenen, abgeschlossenen
+    /// Kind-Laufs (Runde 5, Teil H; Werkzeug [`AGENT_RESULT_TOOL`]).
+    ///
+    /// # Beschreibung
+    /// Quelle ist zuerst das Ergebnisarchiv (überlebt die Freigabe des
+    /// Kindes), sonst — solange das Kind noch admittiert ist und
+    /// abgeschlossen hat — seine letzte Assistenten-Antwort. Der Text wird nur
+    /// herausgegeben, wenn `caller` der Elternteil des Kindes ist.
+    ///
+    /// # Argumente
+    /// - `caller` (`&SessionId`): die aufrufende Sitzung (aus dem
+    ///   Ausführungskontext, nie aus Modell-Argumenten).
+    /// - `child` (`&SessionId`): die angefragte Kind-ID.
+    ///
+    /// # Errors
+    /// [`AgentSpawnError`] mit immer derselben Meldung, wenn das Kind
+    /// unbekannt ist, einem anderen Elternteil gehört, noch nicht
+    /// abgeschlossen hat oder kein Antworttext vorliegt — die Meldung verrät
+    /// nicht, ob eine fremde Kind-ID existiert.
+    pub fn child_result_text(
+        &self,
+        caller: &SessionId,
+        child: &SessionId,
+    ) -> Result<String, AgentSpawnError> {
+        let unavailable = || {
+            Self::reject(format!(
+                "kein abgeschlossenes eigenes Kind mit der ID {child} (oder sein Ergebnis ist \
+                 nicht mehr vorrätig)"
+            ))
+        };
+        let archived = self
+            .child_results
+            .lock()
+            .map_err(|_| Self::reject("child result archive lock is poisoned"))?
+            .iter()
+            .rev()
+            .find(|entry| entry.child == child.as_str())
+            .cloned();
+        if let Some(entry) = archived {
+            return if &entry.parent == caller {
+                Ok(entry.text)
+            } else {
+                Err(unavailable())
+            };
+        }
+        match self.child_record(child) {
+            Some(record) if &record.parent == caller && record.status == ChildStatus::Completed => {
+                self.child_final_assistant_text_full(child)
+                    .map_err(|_| unavailable())
+            }
+            _ => Err(unavailable()),
+        }
     }
 
     /// Liefert die neueste Text-Antwort eines admittierten Kindes
@@ -3797,6 +4253,13 @@ impl ManagedAgentSpawner {
 
     fn mark_expired(&self, expired: &[ExpiredChild]) {
         for record in expired {
+            // Runde 5, Teil M: Lease-Ablauf im Journal des Elternteils.
+            self.comms.record_grandchild_end(
+                &record.parent,
+                &record.child,
+                &record.role,
+                "timeout: Lease abgelaufen",
+            );
             self.forget_child_state(&record.child);
         }
         if let Ok(mut tombstones) = self.expired.lock() {
@@ -3900,6 +4363,25 @@ impl ManagedAgentSpawner {
     /// Teilergebnis (`Ok` mit [`ChildRunResult::budget_exhausted`] = `true`)
     /// statt eines Fehlers.
     ///
+    /// Runde 5, Teil J (Modus [`crate::child_handoff::BudgetHandoffMode::Compact`],
+    /// Vorgabe): der Turn endet schon bei `max_tokens − Reserve`
+    /// ([`crate::child_handoff::handoff_reserve_tokens`]); aus der Reserve
+    /// fasst genau **ein** Verdichtungsaufruf den Kind-Verlauf strukturiert
+    /// zusammen, und diese markierte Übergabe ist das Ergebnis
+    /// ([`ChildRunResult::budget_handoff`] = `Compacted`). Scheitert die
+    /// Verdichtung, bleibt es bei der letzten Assistant-Antwort (`LastAnswer`).
+    /// Die rohe letzte Antwort liegt in beiden Fällen im Ergebnisarchiv
+    /// (`agent.result`); die Tokens der Verdichtung zählen zu
+    /// [`ChildRunResult::usage`]. Das Zeitbudget liefert weiterhin einen
+    /// Fehler.
+    ///
+    /// Runde 5, Teil M: bei **jedem** nicht regulären Ende (Zeitbudget,
+    /// Werkzeug-Budget, Lease, Abbruch, Turn-/Provider-Fehler) legt der
+    /// Spawner zusätzlich einen Endbericht mit Aktivitätsjournal ab
+    /// ([`Self::child_end_report`]); bei Zeit- und Werkzeug-Budget versucht er
+    /// eine Übergabe-Verdichtung mit eigenem Zeitlimit
+    /// ([`crate::child_comms::END_HANDOFF_TIMEOUT`]).
+    ///
     /// # Argumente
     /// - `child` (`&SessionId`): das admittierte Kind.
     /// - `store` (`&dyn StateStore`): Transkript-Persistenz des Kind-Turns.
@@ -3946,11 +4428,16 @@ impl ManagedAgentSpawner {
         // Auch ein gescheiterter oder über das Budget gelaufener Lauf hat
         // verbraucht — die Anrechnung erfolgt auf jedem Ausgang. Ist die
         // Session inzwischen verworfen, gilt der Ausgangsstand (Differenz 0).
+        // Runde 5, Teil J: die Übergabe-Verdichtung läuft außerhalb eines
+        // Turns und steht deshalb nicht in `total_usage` der Kind-Session;
+        // `enforce_child_budget` meldet ihre neuen Tokens über `run.usage`.
+        let handoff_tokens = result.as_ref().map_or(0, |run| run.usage.tokens);
         let usage = ChildUsage {
             tokens: self
                 .child_token_usage(child)
                 .unwrap_or(baseline_tokens)
-                .saturating_sub(baseline_tokens),
+                .saturating_sub(baseline_tokens)
+                .saturating_add(handoff_tokens),
             tool_calls: self
                 .child_tool_call_count(child)
                 .unwrap_or(baseline_tool_calls)
@@ -4044,13 +4531,28 @@ impl ManagedAgentSpawner {
         // Teil C: das Token-Budget wird je Modellrunde über den
         // `TurnControl` geprüft (Abschluss-Anweisung ab 80 %, Abbruch beim
         // Limit), nicht erst nach dem ganzen Turn.
+        // Runde 5, Teil J: im Modus `Compact` endet der Turn schon bei
+        // `limit − Reserve`; die Reserve trägt die Übergabe-Verdichtung.
+        let handoff_reserve = match (budget.max_tokens, self.budget_handoff_mode) {
+            (Some(limit), crate::child_handoff::BudgetHandoffMode::Compact) => {
+                crate::child_handoff::handoff_reserve_tokens(limit)
+            }
+            _ => 0,
+        };
         if let Some(limit) = budget.max_tokens {
             let used_before = self.child_token_usage(child).unwrap_or(0);
-            input.control = input
-                .control
-                .clone()
-                .with_token_budget(crate::turn_loop::TurnTokenBudget::new(limit, used_before));
+            input.control =
+                input
+                    .control
+                    .clone()
+                    .with_token_budget(crate::turn_loop::TurnTokenBudget::new(
+                        limit.saturating_sub(handoff_reserve),
+                        used_before,
+                    ));
         }
+        // Klon mit geteiltem Zähler: Modellrunden und Werkzeugaufrufe dieses
+        // Laufs für die Kopfzeile der Übergabe.
+        let control = input.control.clone();
         let mut turn = Box::pin(self.run_child_with_approvals(child, store, approvals, input));
 
         let outcome = match budget.max_wall_time_ms {
@@ -4090,6 +4592,13 @@ impl ManagedAgentSpawner {
                             used = used_ms,
                             "child_budget.exceeded",
                         );
+                        // Runde 5, Teil M: Journal plus (wenn möglich, mit
+                        // eigenem kurzem Zeitlimit) Übergabe-Verdichtung.
+                        self.finalize_child_end(
+                            child,
+                            crate::child_comms::ChildEndCause::WallTime { limit_ms, used_ms },
+                        )
+                        .await;
                         return Err(error.into());
                     }
                 }
@@ -4114,6 +4623,15 @@ impl ManagedAgentSpawner {
                     u64::from(used),
                 );
                 self.set_failed(child, &error.to_string());
+                // Runde 5, Teil M: Journal plus Übergabe-Verdichtung.
+                self.finalize_child_end(
+                    child,
+                    crate::child_comms::ChildEndCause::ToolBudget {
+                        limit: u64::from(limit),
+                        used: u64::from(used),
+                    },
+                )
+                .await;
                 return Err(error.into());
             }
         }
@@ -4125,7 +4643,7 @@ impl ManagedAgentSpawner {
                     reason: CancelReason::Budget
                 }
             );
-            if stopped_by_budget && used >= limit {
+            if stopped_by_budget && used >= limit.saturating_sub(handoff_reserve) {
                 // Teil C: kein harter Fehler — die letzte Assistant-Antwort
                 // ist das Teilergebnis, ausdrücklich als solches markiert.
                 let partial = self.child_last_assistant_text(child);
@@ -4134,21 +4652,74 @@ impl ManagedAgentSpawner {
                     dimension = BudgetDimension::Tokens.as_str(),
                     limit = limit,
                     used = used,
+                    reserve = handoff_reserve,
                     partial_bytes = partial.as_deref().map_or(0, str::len),
                     "child_budget.exhausted_partial_result",
                 );
-                let detail = format!(
-                    "Token-Budget erschöpft (limit={limit}, used={used}); Teilergebnis \
-                     zurückgegeben"
-                );
-                self.set_outcome_detail(child, partial.as_deref().unwrap_or(&detail));
                 self.set_status(child, ChildStatus::Completed);
+                // Runde 5, Teil M: das Token-Budget endet regulär mit
+                // Übergabe (Teil J) — kein Endbericht eines Abbruchs.
+                self.comms.clear_end(child);
+                // Runde 5, Teil H: auch das Teilergebnis ist über
+                // `agent.result` ungekürzt abrufbar — auch dann, wenn unten
+                // eine Verdichtung das Ergebnis an den Elternteil ersetzt.
+                self.archive_completed_child(child, partial.as_deref());
+                // Runde 5, Teil J: genau ein Verdichtungsaufruf aus der
+                // Reserve; scheitert er, bleibt die letzte Antwort.
+                let compacted = if handoff_reserve > 0 {
+                    self.compact_budget_handoff(
+                        child,
+                        handoff_reserve,
+                        &control,
+                        limit,
+                        used,
+                        partial.is_some(),
+                    )
+                    .await
+                } else {
+                    None
+                };
+                let (full_text, kind, handoff_tokens) = match compacted {
+                    Some((text, tokens)) => (
+                        Some(text),
+                        crate::child_handoff::BudgetHandoff::Compacted,
+                        tokens,
+                    ),
+                    None => (
+                        partial.clone(),
+                        crate::child_handoff::BudgetHandoff::LastAnswer,
+                        0,
+                    ),
+                };
+                let detail = match kind {
+                    crate::child_handoff::BudgetHandoff::Compacted => format!(
+                        "Token-Budget erreicht (limit={limit}, used={used}); \
+                         Übergabe-Zusammenfassung zurückgegeben"
+                    ),
+                    crate::child_handoff::BudgetHandoff::LastAnswer => format!(
+                        "Token-Budget erschöpft (limit={limit}, used={used}); Teilergebnis \
+                         zurückgegeben"
+                    ),
+                };
+                match (kind, partial.as_deref()) {
+                    (crate::child_handoff::BudgetHandoff::LastAnswer, Some(text)) => {
+                        self.set_outcome_detail(child, text);
+                    }
+                    _ => self.set_outcome_detail(child, &detail),
+                }
+                self.record_budget_handoff(child, kind, full_text.as_deref());
                 return Ok(ChildRunResult {
                     child: outcome.child,
                     outcome: TurnOutcome::Completed,
-                    full_text: partial,
-                    usage: ChildUsage::default(),
+                    full_text,
+                    // Nur die Verdichtung; `run_child_with_budget` addiert
+                    // den Verbrauch des Turns.
+                    usage: ChildUsage {
+                        tokens: handoff_tokens,
+                        ..ChildUsage::default()
+                    },
                     budget_exhausted: true,
+                    budget_handoff: Some(kind),
                 });
             }
             if used > limit {
@@ -4500,6 +5071,10 @@ impl ManagedAgentSpawner {
         // gestartet, sondern sofort abgewiesen und später vom Reaper freigegeben.
         if token.is_cancelled() {
             self.set_status(child, ChildStatus::Cancelled);
+            // Runde 5, Teil M: auch hier bleibt das Journal abrufbar.
+            if let Some(cause) = Self::cancel_cause(token.reason()) {
+                self.finalize_child_end(child, cause).await;
+            }
             return Err(Self::cancelled_error(child, token.reason()));
         }
         // Erst `Running` markieren (unter `active`), dann die Session entnehmen:
@@ -4556,17 +5131,34 @@ impl ManagedAgentSpawner {
 
         let turn = {
             let session = running.session_mut()?;
-            tokio::select! {
-                biased;
-                () = token.cancelled() => Err(Self::cancelled_error(child, token.reason())),
-                outcome = async {
-                    match approvals {
-                        Some(approvals) => run_turn_durable(session, model.as_ref(), store, approvals, input).await,
-                        None => run_turn(session, model.as_ref(), store, input).await,
-                    }
-                    .map_err(|error| Self::reject(error.to_string()))
-                } => outcome,
-            }
+            // Runde 5, Teil O: Lease-Herzschlag, solange der Lauf lebt
+            // (`crate::child_lease_heartbeat`), und Freigabe-Fragen eines
+            // pausierverbotenen Kindes über den Kanal der Oberfläche
+            // (`crate::child_approval`), falls einer angebunden ist.
+            let relay_approvals = !record.allow_pause;
+            crate::child_lease_heartbeat::with_lease_heartbeat(self, child, async {
+                tokio::select! {
+                    biased;
+                    () = token.cancelled() => Err(Self::cancelled_error(child, token.reason())),
+                    outcome = async {
+                        let first = match approvals {
+                            Some(approvals) => run_turn_durable(session, model.as_ref(), store, approvals, input).await,
+                            None => run_turn(session, model.as_ref(), store, input).await,
+                        };
+                        match first {
+                            Ok(outcome) if relay_approvals => {
+                                crate::child_approval::relay_child_approvals(
+                                    self, child, session, model.as_ref(), store, approvals, outcome,
+                                )
+                                .await
+                            }
+                            other => other,
+                        }
+                        .map_err(|error| Self::reject(error.to_string()))
+                    } => outcome,
+                }
+            })
+            .await
         };
         let expired = self
             .expired
@@ -4579,12 +5171,18 @@ impl ManagedAgentSpawner {
         }
         let returned = running.finish()?;
         if let Some(expired) = expired {
+            // Runde 5, Teil M: Journal statt nackter Meldung (ohne
+            // Verdichtung — die Sitzung ist verworfen).
+            self.finalize_child_end(child, crate::child_comms::ChildEndCause::LeaseExpired)
+                .await;
             return Err(Self::reject(format!(
                 "child {child} completed after lease expiry at {}; result discarded",
                 expired.expired_at
             )));
         }
         if returned == SessionReturn::Discarded {
+            self.finalize_child_end(child, crate::child_comms::ChildEndCause::Released)
+                .await;
             return Err(Self::reject(format!(
                 "child {child} was released while its turn was running; result discarded"
             )));
@@ -4594,10 +5192,21 @@ impl ManagedAgentSpawner {
             Err(error) => {
                 // Nur echter Abschluss ist `Completed`: Abbruch und Fehler
                 // werden unterschieden und nie als Erfolg verbucht.
-                if token.is_cancelled() {
+                // Runde 5, Teil M: in beiden Fällen ein Endbericht mit
+                // Journal; ein Budget-Abbruch (Zeitbudget) wird vom
+                // Budget-Pfad (`enforce_child_budget`) berichtet, ein
+                // Provider-/Turn-Fehler nie verdichtet.
+                let cause = if token.is_cancelled() {
                     self.set_status(child, ChildStatus::Cancelled);
+                    Self::cancel_cause(token.reason())
                 } else {
                     self.set_failed(child, &error.message);
+                    Some(crate::child_comms::ChildEndCause::TurnError(
+                        error.message.clone(),
+                    ))
+                };
+                if let Some(cause) = cause {
+                    self.finalize_child_end(child, cause).await;
                 }
                 return Err(error);
             }
@@ -4613,6 +5222,12 @@ impl ManagedAgentSpawner {
             Some(label) if !record.allow_pause => {
                 let reason = format!("child paused but its lifecycle forbids pausing: {label}");
                 self.set_failed(child, &reason);
+                // Runde 5, Teil M.
+                self.finalize_child_end(
+                    child,
+                    crate::child_comms::ChildEndCause::PauseForbidden(reason.clone()),
+                )
+                .await;
                 Err(Self::reject(reason))
             }
             Some(_) => {
@@ -4623,6 +5238,7 @@ impl ManagedAgentSpawner {
                     full_text: None,
                     usage: ChildUsage::default(),
                     budget_exhausted: false,
+                    budget_handoff: None,
                 })
             }
             None => {
@@ -4646,13 +5262,25 @@ impl ManagedAgentSpawner {
                     ) => self.set_outcome_detail(child, detail),
                     _ => {}
                 }
+                // Runde 5, Teil M: letzter Text ins Journal; ein terminales,
+                // nicht erfolgreiches Ergebnis bekommt einen Endbericht.
+                if let Some(text) = full_text.as_deref() {
+                    self.comms.set_last_assistant(child, text);
+                }
+                if let Some(cause) = Self::outcome_end_cause(&outcome) {
+                    self.finalize_child_end(child, cause).await;
+                }
                 self.set_status(child, ChildStatus::Completed);
+                // Runde 5, Teil H: den ungekürzten Text für `agent.result`
+                // aufheben, bevor der Aufrufer das Kind freigibt.
+                self.archive_completed_child(child, full_text.as_deref());
                 Ok(ChildRunResult {
                     child: child.clone(),
                     outcome,
                     full_text,
                     usage: ChildUsage::default(),
                     budget_exhausted: false,
+                    budget_handoff: None,
                 })
             }
         }
@@ -4737,6 +5365,570 @@ impl ManagedAgentSpawner {
         })
     }
 
+    /// Runde 5, Teil J: die Übergabe-Verdichtung am Budget-Ende eines Kindes.
+    ///
+    /// # Beschreibung
+    /// Genau **ein** Aufruf über das Modell des Kindes
+    /// ([`ChildRegistryFactory::model_for_task`], Modell-/Provider-ID der
+    /// Kind-Session): Verlaufsauszug gekappt auf die Reserve, Ausgabe
+    /// gedeckelt, Zeitlimit [`crate::child_handoff::HANDOFF_TIMEOUT`], und
+    /// abbrechbar über den Cancel-Token des Kindes. Die Nutzung erscheint
+    /// als `InternalUsage { purpose: "budget_handoff" }` auf dem Bus des
+    /// Kindes.
+    ///
+    /// # Returns
+    /// `Some((markierter Übergabe-Text, neue Tokens des Aufrufs))`, sonst
+    /// `None` (Fehler, Zeitlimit, Abbruch, leere Antwort, fehlende
+    /// Session/Rolle) — der Aufrufer liefert dann die letzte Antwort.
+    ///
+    /// # Concurrency
+    /// Hält keinen Lock über ein `.await`.
+    async fn compact_budget_handoff(
+        &self,
+        child: &SessionId,
+        reserve: u64,
+        control: &crate::turn_loop::TurnControl,
+        limit: u64,
+        used: u64,
+        raw_available: bool,
+    ) -> Option<(String, u64)> {
+        use crate::child_handoff::{
+            HANDOFF_TIMEOUT, HandoffCall, HandoffFacts, HandoffFailure, build_handoff_prompt,
+            format_handoff_text, plan_handoff, run_handoff_compaction,
+        };
+        let record = self.child_record(child)?;
+        let model = match self.roles.get(&record.role) {
+            Some(definition) => match definition
+                .registry_factory
+                .model_for_task(&record.role, record.task_complexity)
+            {
+                Ok(model) => model,
+                Err(error) => {
+                    tracing::warn!(child = %child, error = %error, "child_budget.handoff_model_unavailable");
+                    return None;
+                }
+            },
+            None => {
+                tracing::warn!(child = %child, "child_budget.handoff_role_unavailable");
+                return None;
+            }
+        };
+        let (prompt, call) = {
+            let manager = self.manager.lock().ok()?;
+            let session = manager.get(child).ok()?;
+            let window = session
+                .auto_compact()
+                .map(crate::auto_compact::AutoCompactPolicy::context_window_tokens);
+            let plan = plan_handoff(
+                reserve,
+                window,
+                session.token_calibration().bytes_per_token(),
+            );
+            let call = HandoffCall {
+                model_id: session.active_model().cloned(),
+                provider_id: session.active_provider().cloned(),
+                max_output_tokens: plan.max_output_tokens,
+                timeout: HANDOFF_TIMEOUT,
+            };
+            (build_handoff_prompt(session.history().items(), &plan), call)
+        };
+        let Some(prompt) = prompt else {
+            tracing::info!(child = %child, "child_budget.handoff_nothing_to_compact");
+            return None;
+        };
+        let compaction = run_handoff_compaction(model.as_ref(), prompt, &call);
+        let result = match self.child_cancel_token(child) {
+            Some(token) => tokio::select! {
+                biased;
+                () = token.cancelled() => Err(HandoffFailure::Cancelled),
+                result = compaction => result,
+            },
+            None => compaction.await,
+        };
+        let summary = match result {
+            Ok(summary) => summary,
+            Err(failure) => {
+                tracing::warn!(
+                    child = %child,
+                    failure = %failure,
+                    "child_budget.handoff_failed_falling_back_to_last_answer",
+                );
+                return None;
+            }
+        };
+        if let Ok(manager) = self.manager.lock()
+            && let Ok(session) = manager.get(child)
+        {
+            session.publish_agent_event(crate::agent_events::AgentEventKind::InternalUsage {
+                purpose: "budget_handoff".to_owned(),
+                usage: summary.usage.clone(),
+            });
+        }
+        let origin = self.continuation_origin(child);
+        let continuations_left = self
+            .handoff_ledger
+            .lock()
+            .map_or(0, |ledger| ledger.continuations_left(&origin));
+        let text = format_handoff_text(
+            &summary.text,
+            &HandoffFacts {
+                child,
+                role: &record.role,
+                model_rounds: control.model_rounds(),
+                tool_calls: control.tool_calls(),
+                limit,
+                used,
+                raw_available,
+                continuations_left,
+            },
+        );
+        tracing::info!(
+            child = %child,
+            handoff_bytes = text.len(),
+            handoff_tokens = summary.usage.fresh_tokens(),
+            truncated = summary.truncated,
+            "child_budget.handoff_compacted",
+        );
+        Some((text, summary.usage.fresh_tokens()))
+    }
+
+    /// Runde 5, Teil M: die Endursache eines abgebrochenen Kind-Tokens.
+    ///
+    /// # Returns
+    /// `None` für [`CancelReason::Budget`] — das Zeitbudget berichtet
+    /// [`Self::enforce_child_budget`] selbst (mit Grenze und Verbrauch).
+    fn cancel_cause(reason: Option<CancelReason>) -> Option<crate::child_comms::ChildEndCause> {
+        use crate::child_comms::ChildEndCause;
+        match reason {
+            Some(CancelReason::Budget) => None,
+            Some(CancelReason::LeaseLost) => Some(ChildEndCause::LeaseExpired),
+            Some(CancelReason::User) => Some(ChildEndCause::Cancelled {
+                reason: "Abbruch durch Nutzerin oder Elternteil".to_owned(),
+            }),
+            Some(CancelReason::Parent) => Some(ChildEndCause::Cancelled {
+                reason: "der Elternteil wurde abgebrochen".to_owned(),
+            }),
+            Some(CancelReason::Shutdown) => Some(ChildEndCause::Cancelled {
+                reason: "Harness fährt herunter".to_owned(),
+            }),
+            None => Some(ChildEndCause::Cancelled {
+                reason: "ohne Grund".to_owned(),
+            }),
+        }
+    }
+
+    /// Runde 5, Teil M: die Endursache eines terminalen, nicht
+    /// erfolgreichen Turn-Ergebnisses (`None` für `Completed` und Pausen).
+    fn outcome_end_cause(outcome: &TurnOutcome) -> Option<crate::child_comms::ChildEndCause> {
+        use crate::child_comms::ChildEndCause;
+        match outcome {
+            TurnOutcome::Failed { reason } => {
+                Some(ChildEndCause::Outcome(format!("gescheitert: {reason}")))
+            }
+            TurnOutcome::Truncated => Some(ChildEndCause::Outcome(
+                "Modellausgabe abgeschnitten (max_tokens/Kontextfenster)".to_owned(),
+            )),
+            TurnOutcome::Refused { detail } => Some(ChildEndCause::Outcome(match detail {
+                Some(detail) => format!("Antwort abgelehnt: {detail}"),
+                None => "Antwort abgelehnt".to_owned(),
+            })),
+            // Token-Budget (Teil C/J, dann verwirft `enforce_child_budget`
+            // den Bericht wieder) oder Abbruch durch einen Turn-Wächter.
+            TurnOutcome::Cancelled {
+                reason: CancelReason::Budget,
+            } => Some(ChildEndCause::Outcome(
+                "Turn vorzeitig beendet (Token-Budget oder Turn-Wächter)".to_owned(),
+            )),
+            TurnOutcome::Cancelled { reason } => Self::cancel_cause(Some(*reason)),
+            TurnOutcome::Completed
+            | TurnOutcome::AwaitingApproval { .. }
+            | TurnOutcome::AwaitingChild { .. } => None,
+        }
+    }
+
+    /// Runde 5, Teil M: legt den Endbericht eines nicht regulär beendeten
+    /// Kindes ab.
+    ///
+    /// # Beschreibung
+    /// Immer, deterministisch und ohne Modell: Aktivitätsjournal (samt
+    /// letztem Assistententext aus dem Verlauf, falls die Sitzung wieder im
+    /// Manager liegt) und Grund. Zusätzlich, nur bei Budget-Enden
+    /// ([`crate::child_comms::ChildEndCause::allows_compaction`]), genau ein
+    /// Verdichtungsaufruf aus `child_handoff` mit eigenem Zeitlimit
+    /// [`crate::child_comms::END_HANDOFF_TIMEOUT`]. Außer bei einem gewollten
+    /// Abbruch wird die Übergabe (bzw. das Journal) im Fortsetzungs-Buch
+    /// abgelegt, damit der Elternteil mit `continue_from` weitermachen kann.
+    ///
+    /// # Returns
+    /// Den Bericht (`None` ohne Journal).
+    ///
+    /// # Concurrency
+    /// Hält keinen Lock über ein `.await`.
+    async fn finalize_child_end(
+        &self,
+        child: &SessionId,
+        cause: crate::child_comms::ChildEndCause,
+    ) -> Option<crate::child_comms::ChildEndReport> {
+        use crate::child_comms::ChildEndCause;
+        if let Some(text) = self.child_last_assistant_text(child) {
+            self.comms.set_last_assistant(child, &text);
+        }
+        // Ohne einen einzigen Arbeitsschritt gibt es nichts zu verdichten.
+        let has_work = self
+            .comms
+            .journal(child)
+            .is_some_and(|journal| journal.steps() > 0 || journal.last_assistant().is_some());
+        let (handoff, note) = if cause.allows_compaction() && !has_work {
+            (None, Some("noch keine Arbeitsschritte".to_owned()))
+        } else if cause.allows_compaction() {
+            match self.compact_end_handoff(child, &cause).await {
+                Ok(text) => (Some(text), None),
+                Err(note) => (None, Some(note)),
+            }
+        } else {
+            let note = match &cause {
+                ChildEndCause::TurnError(_) => "Provider-/Turn-Fehler, kein weiterer Modellaufruf",
+                ChildEndCause::Cancelled { .. } | ChildEndCause::Released => "abgebrochen",
+                ChildEndCause::LeaseExpired => "die Sitzung ist nach dem Lease-Ablauf verworfen",
+                _ => "bei diesem Ende nicht vorgesehen",
+            };
+            (None, Some(note.to_owned()))
+        };
+        let handoff_available = handoff.is_some();
+        let report = self
+            .comms
+            .finalize_end(child, &cause, handoff.clone(), note)?;
+        tracing::warn!(
+            child = %child,
+            status = report.status.as_str(),
+            reason = %report.reason,
+            handoff = handoff_available,
+            steps = report.steps,
+            files = report.files.len(),
+            "child_end.report"
+        );
+        if cause.allows_continuation()
+            && let Some(sandbox) = self.child_sandbox(child)
+        {
+            let text = handoff
+                .unwrap_or_else(|| format!("{}\n\n{}", report.header(), report.journal_summary));
+            let entry = crate::child_handoff::HandoffRecord {
+                child: child.clone(),
+                parent: report.parent.clone(),
+                role: report.role.clone(),
+                sandbox: Some(sandbox),
+                handoff: text,
+                kind: if handoff_available {
+                    crate::child_handoff::BudgetHandoff::Compacted
+                } else {
+                    crate::child_handoff::BudgetHandoff::LastAnswer
+                },
+                origin: self.continuation_origin(child),
+            };
+            match self.handoff_ledger.lock() {
+                Ok(mut ledger) => {
+                    ledger.record(entry);
+                    return self.comms.mark_continuation(child);
+                }
+                Err(_) => tracing::warn!(child = %child, "child_handoff_ledger.lock_poisoned"),
+            }
+        }
+        Some(report)
+    }
+
+    /// Runde 5, Teil M: Übergabe-Verdichtung nach einem Budget-Ende
+    /// (Zeit, Werkzeuge) — dieselben Bausteine wie
+    /// [`Self::compact_budget_handoff`], aber mit eigenem, kurzem Zeitlimit
+    /// und **ohne** den (bereits abgebrochenen) Cancel-Token des Kindes.
+    ///
+    /// # Errors
+    /// Der Grund, warum es keine Verdichtung gibt (für den Bericht).
+    async fn compact_end_handoff(
+        &self,
+        child: &SessionId,
+        cause: &crate::child_comms::ChildEndCause,
+    ) -> Result<String, String> {
+        use crate::child_comms::{END_HANDOFF_RESERVE_TOKENS, END_HANDOFF_TIMEOUT};
+        use crate::child_handoff::{
+            HANDOFF_MIN_RESERVE_TOKENS, HandoffCall, HandoffFailure, build_handoff_prompt,
+            handoff_reserve_tokens, plan_handoff, run_handoff_compaction,
+        };
+        let record = self
+            .child_record(child)
+            .ok_or_else(|| "kein Admission-Record mehr".to_owned())?;
+        let model = self
+            .roles
+            .get(&record.role)
+            .ok_or_else(|| "Rolle nicht mehr registriert".to_owned())?
+            .registry_factory
+            .model_for_task(&record.role, record.task_complexity)
+            .map_err(|error| format!("Modell nicht verfügbar: {error}"))?;
+        let reserve = record
+            .budget
+            .max_tokens
+            .map_or(END_HANDOFF_RESERVE_TOKENS, handoff_reserve_tokens)
+            .max(HANDOFF_MIN_RESERVE_TOKENS);
+        let (prompt, call) = {
+            let manager = self
+                .manager
+                .lock()
+                .map_err(|_| "Session-Manager gesperrt".to_owned())?;
+            let session = manager
+                .get(child)
+                .map_err(|_| "Kind-Sitzung nicht verfügbar".to_owned())?;
+            let window = session
+                .auto_compact()
+                .map(crate::auto_compact::AutoCompactPolicy::context_window_tokens);
+            let plan = plan_handoff(
+                reserve,
+                window,
+                session.token_calibration().bytes_per_token(),
+            );
+            let call = HandoffCall {
+                model_id: session.active_model().cloned(),
+                provider_id: session.active_provider().cloned(),
+                max_output_tokens: plan.max_output_tokens,
+                timeout: END_HANDOFF_TIMEOUT,
+            };
+            (build_handoff_prompt(session.history().items(), &plan), call)
+        };
+        let prompt = prompt.ok_or_else(|| "kein verwertbarer Verlauf".to_owned())?;
+        let summary = run_handoff_compaction(model.as_ref(), prompt, &call)
+            .await
+            .map_err(|failure| match failure {
+                HandoffFailure::Timeout => format!(
+                    "Verdichtung nach {} s abgebrochen",
+                    END_HANDOFF_TIMEOUT.as_secs()
+                ),
+                other => format!("Verdichtung gescheitert: {other}"),
+            })?;
+        if let Ok(manager) = self.manager.lock()
+            && let Ok(session) = manager.get(child)
+        {
+            session.publish_agent_event(crate::agent_events::AgentEventKind::InternalUsage {
+                purpose: "end_handoff".to_owned(),
+                usage: summary.usage.clone(),
+            });
+        }
+        // Die Verdichtung zählt zum Verbrauch des Kindes.
+        self.charge_run_usage(
+            child,
+            ChildUsage {
+                tokens: summary.usage.fresh_tokens(),
+                ..ChildUsage::default()
+            },
+        );
+        tracing::info!(
+            child = %child,
+            handoff_bytes = summary.text.len(),
+            truncated = summary.truncated,
+            "child_end.handoff_compacted"
+        );
+        Ok(format!(
+            "[handoff: compacted, Ende: {}] Übergabe-Zusammenfassung nach nicht regulärem Ende \
+             ({}).\n\n{}",
+            cause.status().as_str(),
+            cause.reason_de(),
+            summary.text
+        ))
+    }
+
+    /// Runde 5, Teil J: das ursprüngliche Kind der Fortsetzungskette von
+    /// `child` (das Kind selbst, wenn es keine Fortsetzung ist).
+    fn continuation_origin(&self, child: &SessionId) -> SessionId {
+        self.child_task_state(child)
+            .and_then(|state| state.continuation)
+            .map_or_else(|| child.clone(), |link| link.origin)
+    }
+
+    /// Die Sandbox einer Kind-Session aus ihrem vertrauenswürdigen
+    /// Spawn-Kontext (`None`, wenn nicht verfügbar).
+    fn child_sandbox(&self, child: &SessionId) -> Option<SandboxSpec> {
+        let manager = self.manager.lock().ok()?;
+        let session = manager.get(child).ok()?;
+        session
+            .spawn_context()
+            .map(|context| context.sandbox.clone())
+    }
+
+    /// Runde 5, Teil J: legt die Budget-Übergabe eines Kindes im
+    /// Fortsetzungs-Buch ab (Elternteil, Rolle, Sandbox, Kette).
+    /// Best-effort: ohne Admission-Record oder bei vergifteter Sperre wird
+    /// nur protokolliert.
+    fn record_budget_handoff(
+        &self,
+        child: &SessionId,
+        kind: crate::child_handoff::BudgetHandoff,
+        text: Option<&str>,
+    ) {
+        let Some(record) = self.child_record(child) else {
+            return;
+        };
+        let entry = crate::child_handoff::HandoffRecord {
+            child: child.clone(),
+            parent: record.parent.clone(),
+            role: record.role.clone(),
+            sandbox: self.child_sandbox(child),
+            handoff: text.map_or_else(
+                || "(Das Kind hat vor dem Budget-Ende keine Antwort geliefert.)".to_owned(),
+                ToOwned::to_owned,
+            ),
+            kind,
+            origin: self.continuation_origin(child),
+        };
+        match self.handoff_ledger.lock() {
+            Ok(mut ledger) => ledger.record(entry),
+            Err(_) => tracing::warn!(child = %child, "child_handoff_ledger.lock_poisoned"),
+        }
+    }
+
+    /// Runde 5, Teil J: prüft, ob `caller` das budget-beendete Kind `from`
+    /// mit der Rolle `role` fortsetzen darf.
+    ///
+    /// # Beschreibung
+    /// Nur eigene Kinder (`caller` ist ihr Elternteil), deren Lauf mit
+    /// `budget_exhausted` endete, nur mit derselben Rolle und höchstens
+    /// [`crate::child_handoff::MAX_CONTINUATIONS`] Fortsetzungen je
+    /// ursprünglichem Kind. Die Prüfung erteilt **keine** Rechte: die
+    /// Fortsetzung durchläuft danach die normale Admission (Spawn-Matrix,
+    /// Sandbox-Schnitt, Kapazität) und wird erst mit
+    /// [`Self::bind_continuation`] verbindlich.
+    ///
+    /// # Arguments
+    /// - `caller` (`&SessionId`): die aufrufende Sitzung (aus dem
+    ///   Ausführungskontext, nie aus Modell-Argumenten).
+    /// - `from` (`&SessionId`): das fortzusetzende Kind.
+    /// - `role` (`&str`): die Rolle der Fortsetzung.
+    ///
+    /// # Errors
+    /// [`AgentSpawnError`] mit der Meldung aus
+    /// [`crate::child_handoff::HandoffLedger::prepare`].
+    pub fn prepare_continuation(
+        &self,
+        caller: &SessionId,
+        from: &SessionId,
+        role: &str,
+    ) -> Result<crate::child_handoff::ContinuationSeed, AgentSpawnError> {
+        self.handoff_ledger
+            .lock()
+            .map_err(|_| Self::reject("child handoff ledger lock is poisoned"))?
+            .prepare(caller, from, role)
+            .map_err(|error| Self::reject(error.0))
+    }
+
+    /// Runde 5, Teil J: bindet ein frisch admittiertes Kind als Fortsetzung.
+    ///
+    /// # Beschreibung
+    /// Prüft vor dem ersten Lauf, dass das Kind demselben Elternteil gehört,
+    /// dieselbe Rolle trägt und seine Sandbox nicht weiter ist als die des
+    /// Vorgängers (`SandboxSpec::ensure_child_of`), zählt die Fortsetzung in
+    /// der Kette und kennzeichnet das Kind für Agent-Panel und Ereignisse als
+    /// „Fortsetzung von <id>".
+    ///
+    /// # Errors
+    /// [`AgentSpawnError`], wenn eine der Prüfungen scheitert oder die
+    /// Kettengrenze inzwischen erreicht ist. Der Aufrufer gibt das Kind dann
+    /// frei, ohne es laufen zu lassen.
+    pub fn bind_continuation(
+        &self,
+        child: &SessionId,
+        seed: &crate::child_handoff::ContinuationSeed,
+    ) -> Result<crate::child_handoff::ContinuationLink, AgentSpawnError> {
+        let record = self
+            .child_record(child)
+            .ok_or_else(|| Self::reject(format!("continue_from: child {child} is not admitted")))?;
+        if record.parent != seed.parent {
+            return Err(Self::reject(
+                "continue_from: die Fortsetzung gehört nicht demselben Elternteil",
+            ));
+        }
+        if record.role != seed.role {
+            return Err(Self::reject(format!(
+                "continue_from: eine Fortsetzung muss dieselbe Rolle tragen wie das \
+                 fortgesetzte Kind ('{}'), nicht '{}'",
+                seed.role, record.role
+            )));
+        }
+        let prior = seed.sandbox.as_ref().ok_or_else(|| {
+            Self::reject(format!(
+                "continue_from: die Sandbox von {} ist nicht bekannt; keine Fortsetzung möglich",
+                seed.of
+            ))
+        })?;
+        let sandbox = self.child_sandbox(child).ok_or_else(|| {
+            Self::reject(format!(
+                "continue_from: child {child} has no trusted sandbox context"
+            ))
+        })?;
+        sandbox.ensure_child_of(prior).map_err(|error| {
+            Self::reject(format!(
+                "continue_from: die Sandbox der Fortsetzung ist weiter als die von {} ({error})",
+                seed.of
+            ))
+        })?;
+        let link = self
+            .handoff_ledger
+            .lock()
+            .map_err(|_| Self::reject("child handoff ledger lock is poisoned"))?
+            .bind(seed)
+            .map_err(|error| Self::reject(error.0))?;
+        match self.child_tasks.lock() {
+            Ok(mut tasks) => {
+                let state = tasks.entry(child.as_str().to_owned()).or_default();
+                let mark = format!(
+                    "Fortsetzung von {} ({}/{})",
+                    link.of,
+                    link.number,
+                    crate::child_handoff::MAX_CONTINUATIONS
+                );
+                // Der Kurzkopf des Auftrags trägt die Kennzeichnung, damit
+                // jedes weitere Orchestrierungs-Event die Fortsetzung zeigt.
+                state.task = orchestration_detail_head(&match state.task.take() {
+                    Some(task) => format!("{mark}: {task}"),
+                    None => mark.clone(),
+                });
+                state.admission_warning = Some(match state.admission_warning.take() {
+                    Some(warning) => format!("{mark}; {warning}"),
+                    None => mark,
+                });
+                state.continuation = Some(link.clone());
+            }
+            Err(_) => tracing::warn!(child = %child, "child_task_state.lock_poisoned"),
+        }
+        tracing::info!(
+            child = %child,
+            continues = %link.of,
+            origin = %link.origin,
+            number = link.number,
+            "child_handoff.continuation_bound",
+        );
+        Ok(link)
+    }
+
+    /// Runde 5, Teil J: die Fortsetzungs-Verknüpfung eines admittierten
+    /// Kindes (`None`, wenn es keine Fortsetzung ist).
+    #[must_use]
+    pub fn continuation_link(
+        &self,
+        child: &SessionId,
+    ) -> Option<crate::child_handoff::ContinuationLink> {
+        self.child_task_state(child)
+            .and_then(|state| state.continuation)
+    }
+
+    /// Runde 5, Teil J: die vorgehaltene Budget-Übergabe eines Kindes
+    /// (Kopie), z. B. für Tests und Diagnose.
+    #[must_use]
+    pub fn budget_handoff_record(
+        &self,
+        child: &SessionId,
+    ) -> Option<crate::child_handoff::HandoffRecord> {
+        self.handoff_ledger
+            .lock()
+            .ok()
+            .and_then(|ledger| ledger.get(child).cloned())
+    }
+
     /// Baut die maschinenlesbare Budget-Verletzung.
     ///
     /// Bis `CoreError::BudgetExceeded { dimension, limit, used }` in
@@ -4808,10 +6000,21 @@ impl ManagedAgentSpawner {
         }
     }
 
-    fn parent_depth(manager: &SessionManager, parent: &SessionId) -> Result<u32, AgentSpawnError> {
+    fn parent_depth(
+        manager: &SessionManager,
+        parent: &SessionId,
+        external_root: Option<&SessionId>,
+    ) -> Result<u32, AgentSpawnError> {
         let mut depth = 0_u32;
         let mut cursor = parent.clone();
         loop {
+            // Runde 5: eine extern registrierte Wurzel (die UIA-Sitzung der
+            // TUI) liegt nicht im `SessionManager`; die Kette endet dort mit
+            // Tiefe `depth` — sonst scheiterte jeder Enkel unter der UIA
+            // (z. B. Worker eines Root-Orchestrators) mit „unknown child parent“.
+            if depth > 0 && external_root == Some(&cursor) {
+                return Ok(depth);
+            }
             let session = manager
                 .get(&cursor)
                 .map_err(|error| Self::reject(format!("unknown child parent: {error}")))?;
@@ -5017,7 +6220,13 @@ impl ManagedAgentSpawner {
                     let context = parent.spawn_context().ok_or_else(|| {
                         Self::reject("delegation caller has no trusted sandbox context")
                     })?;
-                    let depth = Self::parent_depth(&manager, parent_session_id)?;
+                    let depth = Self::parent_depth(
+                        &manager,
+                        parent_session_id,
+                        self.external_root_parent
+                            .as_ref()
+                            .map(|root| &root.session_id),
+                    )?;
                     (
                         context.organizational_role,
                         context.allowed_child_orchestrators.clone(),
@@ -5074,12 +6283,90 @@ impl ManagedAgentSpawner {
     fn admit(
         &self,
         role_name: &str,
-        input: SpawnInput,
+        mut input: SpawnInput,
         sandbox: SandboxSpec,
         suggestions: Option<AgentSuggestions>,
     ) -> Result<SessionId, AgentSpawnError> {
-        self.admit_inner(role_name, input, sandbox, suggestions)
-            .map_err(AdmitRejection::into_error)
+        // Runde 5, Teil J: `continue_from` im Spawn-Kontext (Handoff
+        // `transfer_to_<rolle>`, Agent-Werkzeug).
+        let seed = self.requested_continuation(role_name, &mut input)?;
+        let child = self
+            .admit_inner(role_name, input, sandbox, suggestions)
+            .map_err(AdmitRejection::into_error)?;
+        self.bind_requested_continuation(child, seed.as_ref())
+    }
+
+    /// Runde 5, Teil J: liest ein optionales `continue_from` aus dem
+    /// Spawn-Kontext (Handoff `transfer_to_<rolle>`, Agent-Werkzeug) und prüft
+    /// es über [`Self::prepare_continuation`]. Der Elternteil ist
+    /// `input.parent_session_id` (vom Turn-Loop gesetzt, nie vom Modell).
+    /// Bei einer Fortsetzung wird der Auftrag durch
+    /// [`crate::child_handoff::continuation_task`] ersetzt (Übergabe als
+    /// erster Kontext, bisheriger Auftrag als Arbeitsauftrag).
+    ///
+    /// # Errors
+    /// [`AgentSpawnError`] mit Präfix
+    /// [`crate::child_handoff::CONTINUATION_REJECTION_PREFIX`], wenn das Feld
+    /// kein gültiger Kind-Verweis ist oder die Fortsetzung nicht zulässig ist.
+    fn requested_continuation(
+        &self,
+        role_name: &str,
+        input: &mut SpawnInput,
+    ) -> Result<Option<crate::child_handoff::ContinuationSeed>, AgentSpawnError> {
+        let from = match input.context.get("continue_from") {
+            None | Some(serde_json::Value::Null) => return Ok(None),
+            Some(value) => value
+                .as_str()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .and_then(|id| SessionId::try_from_str(id.to_owned()).ok())
+                .ok_or_else(|| {
+                    Self::reject("continue_from: erwartet die ID eines eigenen Kindes")
+                })?,
+        };
+        let seed = self.prepare_continuation(&input.parent_session_id, &from, role_name)?;
+        let task = input
+            .instructions
+            .clone()
+            .or_else(|| {
+                input
+                    .context
+                    .get("task")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .filter(|task| !task.trim().is_empty());
+        input.instructions = Some(crate::child_handoff::continuation_task(
+            &seed.of,
+            &seed.handoff,
+            task.as_deref(),
+        ));
+        Ok(Some(seed))
+    }
+
+    /// Runde 5, Teil J: bindet ein frisch admittiertes Kind als Fortsetzung,
+    /// falls eine verlangt war; scheitert die Bindung, wird das Kind sofort
+    /// wieder freigegeben (es lief nie).
+    ///
+    /// # Errors
+    /// Der Fehler von [`Self::bind_continuation`].
+    fn bind_requested_continuation(
+        &self,
+        child: SessionId,
+        seed: Option<&crate::child_handoff::ContinuationSeed>,
+    ) -> Result<SessionId, AgentSpawnError> {
+        let Some(seed) = seed else {
+            return Ok(child);
+        };
+        match self.bind_continuation(&child, seed) {
+            Ok(_) => Ok(child),
+            Err(error) => {
+                if let Err(release) = self.release_child(&child) {
+                    tracing::warn!(child = %child, error = %release, "child_continuation.release_failed");
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Core admission logic (role, spawn-matrix, capacity, sandbox, depth,
@@ -5158,7 +6445,13 @@ impl ManagedAgentSpawner {
                     .ok_or_else(|| Self::reject("child parent has no trusted sandbox context"))?,
                 parent.reasoning_effort(),
                 parent.activation().clone(),
-                Self::parent_depth(&manager, &input.parent_session_id)?,
+                Self::parent_depth(
+                    &manager,
+                    &input.parent_session_id,
+                    self.external_root_parent
+                        .as_ref()
+                        .map(|root| &root.session_id),
+                )?,
                 parent.active_model().map(|model| model.as_str().to_owned()),
             ),
             Err(_) => {
@@ -5260,6 +6553,30 @@ impl ManagedAgentSpawner {
                 "parent {} reached its active child limit of {}",
                 input.parent_session_id, self.limits.max_active_children_per_parent
             ))));
+        }
+        // Runde 5, Teil K: Orchestrierungsgrenzen (`[agents]`), fail-closed
+        // und mit einer Meldung, die das Modell lesen soll.
+        {
+            let nodes: Vec<crate::background_children::AdmittedNode<'_>> = active
+                .values()
+                .map(|record| crate::background_children::AdmittedNode {
+                    child: record.child.as_str(),
+                    parent: record.parent.as_str(),
+                    role_name: record.role.as_str(),
+                    organizational_role: self
+                        .roles
+                        .get(&record.role)
+                        .map(|definition| definition.organizational_role),
+                })
+                .collect();
+            crate::background_children::check_orchestration_admission(
+                &nodes,
+                input.parent_session_id.as_str(),
+                parent_context.organizational_role,
+                definition.organizational_role,
+                self.background.limits(),
+            )
+            .map_err(|message| AdmitRejection::Other(Self::reject(message)))?;
         }
 
         // Budget-Anrechnung: ein Kind darf nie mehr bekommen, als seinem
@@ -5695,6 +7012,22 @@ impl ManagedAgentSpawner {
                 .with_guard_policy(Some(self.guard_policy))
                 .with_drift_observer(self.drift_observer.clone())
                 .with_pitfall_advisor(self.pitfall_advisor.clone());
+            // Runde 5, Teil C: Beobachter der Fabrik (Diary des Kindes) —
+            // nur gesetzte Slots, sonst bleibt die Kind-Sitzung unverändert.
+            let observers = definition
+                .registry_factory
+                .child_session_observers(role_name, &child);
+            let child_session = match observers.compaction {
+                Some(observer) => child_session.with_compaction_observer(Some(observer)),
+                None => child_session,
+            };
+            // Runde 5, Teil M: jede Kind-Sitzung schreibt ihr
+            // Aktivitätsjournal; der Beobachter der Fabrik bleibt dahinter.
+            let child_session =
+                child_session.with_tool_outcome_observer(Some(Arc::new(JournalToolObserver {
+                    comms: Arc::clone(&self.comms),
+                    inner: observers.tool_outcome,
+                })));
             manager.restore(child_session).map_err(|error| {
                 Self::reject(format!(
                     "could not restore child {child} after attaching the progress observer: {error}"
@@ -5829,6 +7162,14 @@ impl ManagedAgentSpawner {
                 .child()
         };
         cancellations.insert(child.as_str().to_owned(), child_cancel);
+        // Runde 5, Teil M: Aktivitätsjournal ab der Admission (Auftrag,
+        // Start beim Journal des Elternteils). Der Comms-Lock ist ein Blatt.
+        self.comms.open_journal(
+            &child,
+            &event_record.parent,
+            role_name,
+            pending_task.as_deref(),
+        );
         match self.child_tasks.lock() {
             Ok(mut tasks) => {
                 tasks.insert(
@@ -5839,6 +7180,7 @@ impl ManagedAgentSpawner {
                         outcome_detail: None,
                         admission_warning,
                         task_max_bytes,
+                        continuation: None,
                     },
                 );
             }
@@ -5942,6 +7284,26 @@ impl ManagedAgentSpawner {
         max_wait: Duration,
         cancel: &CancelToken,
     ) -> Result<SessionId, AgentSpawnError> {
+        // Runde 5, Teil J: `continue_from` einmal vor dem Warten prüfen,
+        // nach der Admission binden.
+        let mut input = input;
+        let seed = self.requested_continuation(role_name, &mut input)?;
+        let child = self
+            .admit_or_wait_inner(role_name, input, sandbox, suggestions, max_wait, cancel)
+            .await?;
+        self.bind_requested_continuation(child, seed.as_ref())
+    }
+
+    /// Kern von [`Self::admit_or_wait`] ohne Fortsetzungs-Behandlung.
+    async fn admit_or_wait_inner(
+        &self,
+        role_name: &str,
+        input: SpawnInput,
+        sandbox: SandboxSpec,
+        suggestions: Option<AgentSuggestions>,
+        max_wait: Duration,
+        cancel: &CancelToken,
+    ) -> Result<SessionId, AgentSpawnError> {
         let deadline = tokio::time::Instant::now() + max_wait;
         loop {
             // Registered *before* the admission attempt below: if a release
@@ -6026,6 +7388,12 @@ impl AgentSpawner for ManagedAgentSpawner {
     }
 
     fn child_finished(&self, child: &SessionId) {
+        // Runde 5, Teil K: ein abgekoppeltes Kind läuft weiter; es wird erst
+        // von `finish_background_child` freigegeben.
+        if self.background.is_detached(child) {
+            tracing::debug!(child = %child, "child_finished.background_child_kept");
+            return;
+        }
         self.close_child(child);
     }
 
@@ -6034,12 +7402,22 @@ impl AgentSpawner for ManagedAgentSpawner {
         child: &SessionId,
         completed_at: Timestamp,
     ) -> Result<(), AgentSpawnError> {
+        // Runde 5, Teil K: siehe `child_finished`.
+        if self.background.is_detached(child) {
+            tracing::debug!(child = %child, "child_completed.background_child_kept");
+            return Ok(());
+        }
         self.close_child_durable(child, completed_at)
     }
 
     fn delegation_target_names(&self, parent_session_id: &SessionId) -> Vec<String> {
         self.visible_delegation_target_names(parent_session_id)
             .unwrap_or_default()
+    }
+
+    // Runde 5, Teil K.
+    fn child_runs_in_background(&self, child: &SessionId) -> bool {
+        self.background.is_detached(child)
     }
 }
 
@@ -6065,6 +7443,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
+
+    // Runde 5, Teil O: Kind-Freigaben, Lease-Herzschlag, Hintergrund-Token
+    // (`child_controller/tests/teil_o.rs`).
+    mod teil_o;
 
     // ── cap_child_return_text (Vertrag CHILD_RETURN_MAX_BYTES) ─────────────
 
@@ -6123,11 +7505,73 @@ mod tests {
     }
 
     #[test]
+    fn test_cap_child_return_text_keeps_the_report_conclusion() {
+        // Bugreport Runde 5: ein Bericht, dessen Mitte gekürzt wird, muss
+        // Fazit und Empfehlungen am Schluss vollständig behalten.
+        let mut report = String::from("# Bericht\n");
+        for index in 0..400 {
+            report.push_str(&format!("Befund {index}: Detailzeile mit Belegen.\n"));
+        }
+        report.push_str("## Fazit\nDie Testlandschaft ist lückenhaft.\n");
+        report.push_str("## Empfehlungen\n1. Integrationstests ergänzen.\n");
+        let capped = cap_child_return_text(&report, 4096);
+        assert!(capped.starts_with("# Bericht\n"));
+        assert!(capped.contains("## Fazit\nDie Testlandschaft ist lückenhaft.\n"));
+        assert!(capped.ends_with("## Empfehlungen\n1. Integrationstests ergänzen.\n"));
+        assert!(capped.contains("Anfang und Schluss vollständig"));
+        // Beide Schnittstellen liegen auf Zeilengrenzen: die Markierung
+        // folgt auf einen Zeilenumbruch und endet mit einem, dahinter
+        // beginnt eine vollständige Befundzeile.
+        let marker_start = capped.find("\n[…").unwrap_or(0);
+        assert!(marker_start > 0, "Markierung fehlt: {capped}");
+        assert!(
+            capped[..marker_start].ends_with(".\n"),
+            "Kopf endet mitten in einer Zeile"
+        );
+        let after_marker = capped[marker_start..]
+            .split_once("…]\n")
+            .map(|(_, rest)| rest)
+            .unwrap_or_default();
+        assert!(
+            after_marker.starts_with("Befund "),
+            "Ende beginnt mitten in einer Zeile: {after_marker}"
+        );
+    }
+
+    #[test]
+    fn test_cap_child_return_text_split_gives_the_tail_half_the_budget() {
+        let text = format!("{}{}", "k".repeat(1000), "e".repeat(1000));
+        let capped = cap_child_return_text(&text, 200);
+        let tail = capped
+            .rsplit_once("…]\n")
+            .map(|(_, tail)| tail)
+            .unwrap_or_default();
+        assert_eq!(
+            tail.len(),
+            100,
+            "das Ende muss die Hälfte des Budgets bekommen"
+        );
+    }
+
+    #[test]
+    fn test_child_return_budget_fits_a_typical_orchestrator_report() {
+        // Der Bericht aus dem Bugreport war ~17.6 KB lang und verlor 9475
+        // Bytes. Er muss jetzt ungekürzt durchgehen, und die Grenze muss
+        // unter der Werkzeugergebnis-Grenze der Kind-Turns bleiben.
+        let report = "x".repeat(17_667);
+        assert_eq!(
+            cap_child_return_text(&report, CHILD_RETURN_MAX_BYTES),
+            report
+        );
+        const { assert!(CHILD_RETURN_MAX_BYTES < CHILD_TOOL_RESULT_MAX_BYTES) };
+    }
+
+    #[test]
     fn test_cap_child_return_text_reports_omitted_byte_count() {
         let text = "b".repeat(500);
         let capped = cap_child_return_text(&text, 50);
         assert!(
-            capped.contains(" Bytes der Kind-Antwort gekürzt "),
+            capped.contains("450 Bytes der Kind-Antwort gekürzt"),
             "die Markierung muss die Anzahl gekürzter Bytes nennen: {capped}"
         );
     }
@@ -6629,6 +8073,219 @@ specialization = "child-controller-test"
         Ok(())
     }
 
+    /// Runde 5, Teil K: ein abgekoppeltes Kind überlebt `child_finished`/
+    /// `child_completed` seines Elternteils und wird erst von
+    /// `finish_background_child` freigegeben — mit Benachrichtigung.
+    #[test]
+    fn a_background_child_survives_child_finished_until_it_is_finished() -> TestResult {
+        let (spawner, child) = spawner_with_admitted_child()?;
+        let run = spawner
+            .detach_for_background(&child, Some("Auftrag"))
+            .map_err(ctx("das admittierte Kind lässt sich abkoppeln"))?;
+        assert_eq!(run.child, child);
+        assert!(spawner.detach_for_background(&child, None).is_err());
+
+        AgentSpawner::child_finished(&spawner, &child);
+        assert!(
+            spawner.child_record(&child).is_some(),
+            "child_finished schließt es nicht"
+        );
+        AgentSpawner::child_completed(&spawner, &child, Timestamp::now()).map_err(ctx(
+            "child_completed ist für ein abgekoppeltes Kind ein No-op",
+        ))?;
+        assert!(spawner.child_record(&child).is_some());
+
+        let notice = spawner.finish_background_child(
+            &child,
+            crate::background_children::BackgroundStatus::Completed,
+            "fertig".to_owned(),
+        );
+        assert!(notice.is_some());
+        assert!(
+            spawner.child_record(&child).is_none(),
+            "erst jetzt freigegeben"
+        );
+        assert_eq!(
+            spawner
+                .background_children()
+                .take_notices(&run.parent)
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    /// Runde 5, Teil K: Spawner mit UIA-Wurzel (extern) und den Rollen
+    /// `root-orchestrator`, `uia-worker`, `worker`.
+    fn uia_spawner(
+        limits: Option<crate::background_children::OrchestrationLimits>,
+    ) -> TestResult<(ManagedAgentSpawner, SessionId, SandboxSpec)> {
+        use harw_agent_dsl::roles::AgentRoleId;
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
+        let uia = SessionId::new();
+        let role = |name: &str| AgentRole::Agent {
+            name: name.to_owned(),
+        };
+        let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative())
+            .with_role(
+                "root-orchestrator",
+                role("root-orchestrator"),
+                AgentRoleId::RootOrchestrator,
+                Arc::new(EmptyChildRegistry),
+            )
+            .with_role(
+                "uia-worker",
+                role("uia-worker"),
+                AgentRoleId::UiaWorker,
+                Arc::new(EmptyChildRegistry),
+            )
+            .with_role(
+                "worker",
+                role("worker"),
+                AgentRoleId::Worker,
+                Arc::new(EmptyChildRegistry),
+            );
+        let spawner = match limits {
+            Some(limits) => spawner.with_orchestration_limits(limits),
+            None => spawner,
+        }
+        .with_external_root_parent(
+            uia.clone(),
+            external_root_context(sandbox.clone(), AgentRoleId::UserInterface),
+            None,
+            SessionActivation::default(),
+        )
+        .map_err(ctx("die UIA-Wurzel registriert sich"))?;
+        Ok((spawner, uia, sandbox))
+    }
+
+    /// Runde 5, Teil K: die UIA darf höchstens einen Root-Orchestrator
+    /// gleichzeitig laufen lassen (Vorgabe); UIA-Worker bleiben erlaubt,
+    /// Orchestrator-interne Spawns sind unberührt, nach dem Ende geht es
+    /// wieder.
+    #[test]
+    fn the_spawner_admits_only_one_root_orchestrator_for_the_uia() -> TestResult {
+        let (spawner, uia, sandbox) = uia_spawner(None)?;
+        let first = spawner
+            .admit(
+                "root-orchestrator",
+                spawn_input(uia.clone()),
+                sandbox.clone(),
+                None,
+            )
+            .map_err(ctx("erster Root-Orchestrator"))?;
+        match spawner.admit(
+            "root-orchestrator",
+            spawn_input(uia.clone()),
+            sandbox.clone(),
+            None,
+        ) {
+            Err(error) => {
+                assert!(
+                    crate::background_children::is_orchestration_limit_rejection(&error.message),
+                    "{}",
+                    error.message
+                );
+                assert!(error.message.contains(first.as_str()));
+            }
+            Ok(child) => {
+                return Err(TestError::Unexpected(format!(
+                    "zweiter Root-Orchestrator {child} wurde zugelassen"
+                )));
+            }
+        }
+        let helper = spawner
+            .admit(
+                "uia-worker",
+                spawn_input(uia.clone()),
+                sandbox.clone(),
+                None,
+            )
+            .map_err(ctx("ein UIA-Worker bleibt erlaubt"))?;
+        let internal = spawner
+            .admit("worker", spawn_input(first.clone()), sandbox.clone(), None)
+            .map_err(ctx("Orchestrator-interne Spawns sind unberührt"))?;
+
+        spawner.close_child(&internal);
+        spawner.close_child(&helper);
+        spawner.close_child(&first);
+        spawner
+            .admit("root-orchestrator", spawn_input(uia.clone()), sandbox, None)
+            .map_err(ctx("nach dem Ende ist ein neuer Root-Orchestrator erlaubt"))?;
+        Ok(())
+    }
+
+    /// Runde 5, Teil K: `[agents] max_root_orchestrators = 2` lässt genau zwei
+    /// zu; auch ein abgekoppelter (Hintergrund-)Lauf zählt.
+    #[test]
+    fn a_root_limit_of_two_admits_two_and_counts_background_runs() -> TestResult {
+        let limits = crate::background_children::OrchestrationLimits {
+            max_root_orchestrators: 2,
+            ..crate::background_children::OrchestrationLimits::default()
+        };
+        let (spawner, uia, sandbox) = uia_spawner(Some(limits))?;
+        let first = spawner
+            .admit(
+                "root-orchestrator",
+                spawn_input(uia.clone()),
+                sandbox.clone(),
+                None,
+            )
+            .map_err(ctx("erster"))?;
+        spawner
+            .detach_for_background(&first, None)
+            .map_err(ctx("erster läuft im Hintergrund"))?;
+        spawner
+            .admit(
+                "root-orchestrator",
+                spawn_input(uia.clone()),
+                sandbox.clone(),
+                None,
+            )
+            .map_err(ctx("zweiter"))?;
+        assert!(
+            spawner
+                .admit("root-orchestrator", spawn_input(uia), sandbox, None)
+                .is_err(),
+            "der dritte überschreitet die Grenze"
+        );
+        Ok(())
+    }
+
+    /// Runde 5, Teil K: nur der eigene Elternteil darf einen Hintergrund-Lauf
+    /// abbrechen; eine fremde Sitzung bekommt dieselbe Meldung wie für eine
+    /// unbekannte ID.
+    #[test]
+    fn a_background_child_is_cancelled_only_by_its_own_parent() -> TestResult {
+        let (spawner, child) = spawner_with_admitted_child()?;
+        let run = spawner
+            .detach_for_background(&child, None)
+            .map_err(ctx("abkoppeln"))?;
+        let foreign = spawner.cancel_background_child(&SessionId::new(), child.as_str());
+        let unknown = spawner.cancel_background_child(&run.parent, "gibt-es-nicht");
+        match (foreign, unknown) {
+            (Err(foreign), Err(unknown)) => {
+                assert_eq!(
+                    foreign.message.replace(child.as_str(), "<id>"),
+                    unknown.message.replace("gibt-es-nicht", "<id>")
+                );
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "fremd/unbekannt muss abgelehnt werden: {other:?}"
+                )));
+            }
+        }
+        spawner
+            .cancel_background_child(&run.parent, child.as_str())
+            .map_err(ctx("der eigene Elternteil darf abbrechen"))?;
+        let cancelled = spawner.cancel_all_background(&run.parent, "test");
+        assert_eq!(cancelled.len(), 1);
+        Ok(())
+    }
+
     #[test]
     fn external_root_parent_admits_a_child_without_a_manager_mirror() -> TestResult {
         let (events, _receiver) = mpsc::unbounded_channel();
@@ -6673,6 +8330,120 @@ specialization = "child-controller-test"
             Some(ApprovalActor::Operator {
                 id: "external-root-operator".to_owned(),
             })
+        );
+        Ok(())
+    }
+
+    // --- Runde 5, Teil C: Fabrik-Beobachter an der Kind-Sitzung ---
+
+    /// Zählt Beobachter-Anfragen und Freigaben je Rolle.
+    #[derive(Default)]
+    struct ObservingChildRegistry {
+        observed: Mutex<Vec<(String, SessionId)>>,
+        released: Mutex<Vec<(String, SessionId)>>,
+    }
+
+    struct NoopChildObserver;
+
+    impl crate::compaction::CompactionObserver for NoopChildObserver {
+        fn on_compacted(&self, _: &SessionId, _: &crate::compaction::CompactionOutcome) {}
+    }
+
+    impl crate::capture::ToolOutcomeObserver for NoopChildObserver {
+        fn on_tool_outcome(&self, _: &SessionId, _: &crate::capture::ToolOutcome<'_>) {}
+    }
+
+    impl ChildRegistryFactory for ObservingChildRegistry {
+        fn build_registry(
+            &self,
+            _role: &str,
+            _input: &SpawnInput,
+            _suggestions: Option<&AgentSuggestions>,
+        ) -> Result<ExtensionRegistry, AgentSpawnError> {
+            Ok(ExtensionRegistryBuilder::default().build())
+        }
+
+        fn model_for(&self, _role: &str) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
+            Err(AgentSpawnError {
+                message: "test registry does not run children".to_owned(),
+            })
+        }
+
+        fn child_session_observers(&self, role: &str, child: &SessionId) -> ChildSessionObservers {
+            self.observed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((role.to_owned(), child.clone()));
+            ChildSessionObservers {
+                compaction: Some(Arc::new(NoopChildObserver)),
+                tool_outcome: Some(Arc::new(NoopChildObserver)),
+            }
+        }
+
+        fn child_session_released(&self, role: &str, child: &SessionId) {
+            self.released
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((role.to_owned(), child.clone()));
+        }
+    }
+
+    #[test]
+    fn factory_observers_reach_the_child_session_and_release_is_reported_once() -> TestResult {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
+        let parent = SessionId::new();
+        let factory = Arc::new(ObservingChildRegistry::default());
+        let spawner = ManagedAgentSpawner::new(manager.clone(), ChildLimits::conservative())
+            .with_role(
+                "worker",
+                AgentRole::Agent {
+                    name: "worker".to_owned(),
+                },
+                harw_agent_dsl::roles::AgentRoleId::Worker,
+                factory.clone(),
+            )
+            .with_external_root_parent(
+                parent.clone(),
+                external_root_context(
+                    sandbox.clone(),
+                    harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+                ),
+                None,
+                SessionActivation::default(),
+            )
+            .map_err(ctx("trusted external root registers during construction"))?;
+
+        let child = spawner
+            .admit("worker", spawn_input(parent), sandbox, None)
+            .map_err(ctx("child is admitted"))?;
+        {
+            let manager = manager
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let session = manager.get(&child).map_err(ctx("child is manager-owned"))?;
+            assert!(session.compaction_observer().is_some());
+            assert!(session.tool_outcome_observer().is_some());
+        }
+        assert_eq!(
+            factory
+                .observed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            vec![("worker".to_owned(), child.clone())]
+        );
+
+        spawner.close_child(&child);
+        spawner.close_child(&child);
+        assert_eq!(
+            factory
+                .released
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            vec![("worker".to_owned(), child)]
         );
         Ok(())
     }
@@ -9775,6 +11546,7 @@ max_depth = 0
                     outcome_detail: None,
                     admission_warning: None,
                     task_max_bytes: None,
+                    continuation: None,
                 },
             );
     }
@@ -9875,6 +11647,137 @@ max_depth = 0
             .ok_or(TestError::Missing("completion detail is recorded"))?;
         assert_eq!(detail.chars().count(), ORCHESTRATION_DETAIL_MAX_CHARS);
         Ok(())
+    }
+
+    // --- Runde 5, Teil H: `agent.result` ------------------------------------
+
+    #[test]
+    fn test_cap_marker_names_agent_result_with_the_child_id() {
+        let child = SessionId::new();
+        let capped = cap_child_return_text_for_child(&"z".repeat(500), 100, &child);
+        assert!(capped.contains("Anfang und Schluss vollständig"));
+        assert!(capped.contains(AGENT_RESULT_TOOL), "{capped}");
+        assert!(
+            capped.contains(&format!("{{\"child_id\":\"{child}\"}}")),
+            "{capped}"
+        );
+        // Innerhalb des Budgets: unverändert, ohne Hinweis.
+        assert_eq!(cap_child_return_text_for_child("kurz", 100, &child), "kurz");
+        // Die Variante ohne Kind nennt kein Werkzeug.
+        assert!(!cap_child_return_text(&"z".repeat(500), 100).contains(AGENT_RESULT_TOOL));
+    }
+
+    #[tokio::test]
+    async fn child_result_text_returns_the_uncapped_text_only_to_the_parent() -> TestResult {
+        let long: &'static str = Box::leak("y".repeat(CHILD_RETURN_MAX_BYTES * 2).into_boxed_str());
+        let (spawner, children) = runnable_children(
+            Arc::new(EchoChildRegistry { reply: long }),
+            true,
+            1,
+            empty_registry,
+        )?;
+        let child = children[0].clone();
+        let parent = spawner
+            .child_record(&child)
+            .map(|record| record.parent)
+            .ok_or(TestError::Missing("admitted child has a parent"))?;
+        let store = InMemoryStateStore::new();
+        spawner
+            .run_child(&child, &store, TurnInput::user("liefere viel Text"))
+            .await
+            .map_err(ctx("child completes"))?;
+
+        // Der gekürzte Rückgabetext verweist auf `agent.result`.
+        let capped = spawner
+            .child_final_assistant_text(&child)
+            .map_err(ctx("capped text is available"))?;
+        assert!(capped.contains(AGENT_RESULT_TOOL), "{capped}");
+        assert!(capped.contains(child.as_str()), "{capped}");
+
+        // Der Elternteil bekommt den ungekürzten Text — auch nach der Freigabe.
+        assert_eq!(
+            spawner
+                .child_result_text(&parent, &child)
+                .map_err(ctx("parent reads its child"))?,
+            long
+        );
+        spawner
+            .release_child(&child)
+            .map_err(ctx("child releases"))?;
+        assert_eq!(
+            spawner
+                .child_result_text(&parent, &child)
+                .map_err(ctx("archived text survives the release"))?,
+            long
+        );
+
+        // Fremde Aufrufer und unbekannte Kinder: dieselbe Ablehnung.
+        let stranger = SessionId::new();
+        let foreign = spawner
+            .child_result_text(&stranger, &child)
+            .err()
+            .ok_or(TestError::Missing("a foreign caller is refused"))?;
+        let unknown = spawner
+            .child_result_text(&parent, &SessionId::new())
+            .err()
+            .ok_or(TestError::Missing("an unknown child is refused"))?;
+        assert!(
+            foreign
+                .message
+                .contains("kein abgeschlossenes eigenes Kind")
+        );
+        assert!(
+            unknown
+                .message
+                .contains("kein abgeschlossenes eigenes Kind")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn child_result_archive_is_bounded_and_keeps_the_newest_entries() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative());
+        let parent = SessionId::new();
+        let children: Vec<SessionId> = (0..CHILD_RESULT_ARCHIVE_MAX_ENTRIES + 3)
+            .map(|_| SessionId::new())
+            .collect();
+        for (index, child) in children.iter().enumerate() {
+            spawner.archive_child_result(child, &parent, &format!("Ergebnis {index}"));
+        }
+        let archived = spawner
+            .child_results
+            .lock()
+            .map(|archive| archive.len())
+            .unwrap_or_default();
+        assert_eq!(archived, CHILD_RESULT_ARCHIVE_MAX_ENTRIES);
+        assert!(spawner.child_result_text(&parent, &children[0]).is_err());
+        let newest = children.len() - 1;
+        assert_eq!(
+            spawner
+                .child_result_text(&parent, &children[newest])
+                .ok()
+                .as_deref(),
+            Some(format!("Ergebnis {newest}").as_str())
+        );
+        // Ein erneuter Lauf desselben Kindes ersetzt den Eintrag.
+        spawner.archive_child_result(&children[newest], &parent, "neu");
+        assert_eq!(
+            spawner
+                .child_result_text(&parent, &children[newest])
+                .ok()
+                .as_deref(),
+            Some("neu")
+        );
+        // Ein Text über der Gesamtgrenze wird nicht archiviert.
+        let huge = SessionId::new();
+        spawner.archive_child_result(
+            &huge,
+            &parent,
+            &"h".repeat(CHILD_RESULT_ARCHIVE_MAX_BYTES + 1),
+        );
+        assert!(spawner.child_result_text(&parent, &huge).is_err());
     }
 
     #[test]
@@ -10689,6 +12592,10 @@ max_depth = 0
             1,
             empty_registry,
         )?;
+        // Runde 5, Teil J: dieser Test prüft das Verhalten ohne Reserve und
+        // ohne Verdichtung (Modus `LastAnswer`).
+        let spawner =
+            spawner.with_budget_handoff(crate::child_handoff::BudgetHandoffMode::LastAnswer);
         let child = children[0].clone();
         let store = InMemoryStateStore::new();
 
@@ -10731,6 +12638,992 @@ max_depth = 0
             "die Abschluss-Anweisung kommt ab 80 % (800 von 1 000)"
         );
         assert_eq!(result.usage.tokens, 1_000);
+        assert_eq!(
+            result.budget_handoff,
+            Some(crate::child_handoff::BudgetHandoff::LastAnswer)
+        );
+        Ok(())
+    }
+
+    // --- Runde 5, Teil J: Übergabe-Verdichtung am Budget-Ende ------------
+
+    /// Wie das Modell die Verdichtung beantwortet.
+    #[derive(Clone, Copy)]
+    enum HandoffReply {
+        Structured,
+        Fails,
+        Empty,
+    }
+
+    /// Modell für die Übergabe-Tests: Arbeitsrunden liefern einen
+    /// Zwischenstand plus Tool-Call (1 000 ungecachte Eingabe + 1 000
+    /// Ausgabe = 2 000 neue Tokens je Runde); der Verdichtungsaufruf
+    /// (erkennbar an seiner Systeminstruktion) antwortet je nach `reply`
+    /// mit 2 000 + 500 neuen Tokens.
+    struct HandoffProbeModel {
+        reply: HandoffReply,
+        work_rounds: AtomicUsize,
+        handoff_calls: AtomicUsize,
+        handoff_max_output: Mutex<Vec<Option<u32>>>,
+    }
+
+    impl HandoffProbeModel {
+        fn new(reply: HandoffReply) -> Arc<Self> {
+            Arc::new(Self {
+                reply,
+                work_rounds: AtomicUsize::new(0),
+                handoff_calls: AtomicUsize::new(0),
+                handoff_max_output: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    fn structured_handoff_reply() -> String {
+        crate::child_handoff::HANDOFF_SECTIONS
+            .iter()
+            .map(|section| format!("{section}\n- src/lib.rs:12 geprüft"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    impl ModelProvider for HandoffProbeModel {
+        fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
+            Box::pin(async move {
+                if request
+                    .system_prompt
+                    .contains(crate::child_handoff::HANDOFF_INSTRUCTION_MARKER)
+                {
+                    self.handoff_calls.fetch_add(1, Ordering::SeqCst);
+                    self.handoff_max_output
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(request.max_output_tokens);
+                    return match self.reply {
+                        HandoffReply::Structured => Ok(ModelResponse {
+                            message: Some(structured_handoff_reply()),
+                            usage: TokenUsage {
+                                input_tokens: 2_000,
+                                output_tokens: 500,
+                                ..TokenUsage::default()
+                            },
+                            ..Default::default()
+                        }),
+                        HandoffReply::Fails => Err(crate::model::ModelError::RequestFailed(
+                            "überlastet".to_owned(),
+                        )),
+                        HandoffReply::Empty => Ok(ModelResponse {
+                            message: Some(String::new()),
+                            ..Default::default()
+                        }),
+                    };
+                }
+                let round = self.work_rounds.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(ModelResponse {
+                    message: Some(format!("Zwischenstand {round}")),
+                    tool_calls: vec![ToolCall {
+                        id: ToolCallId::new(),
+                        name: ToolName::new("fs.read"),
+                        arguments: serde_json::json!({ "path": format!("/src/f{round}.rs") }),
+                    }],
+                    usage: TokenUsage {
+                        input_tokens: 1_000,
+                        output_tokens: 1_000,
+                        ..TokenUsage::default()
+                    },
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    struct HandoffProbeRegistry {
+        model: Arc<HandoffProbeModel>,
+    }
+
+    impl ChildRegistryFactory for HandoffProbeRegistry {
+        fn build_registry(
+            &self,
+            _role: &str,
+            _input: &SpawnInput,
+            _suggestions: Option<&AgentSuggestions>,
+        ) -> Result<ExtensionRegistry, AgentSpawnError> {
+            Ok(ExtensionRegistryBuilder::default().build())
+        }
+
+        fn model_for(&self, _role: &str) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
+            Ok(self.model.clone())
+        }
+    }
+
+    /// Budget der Übergabe-Tests: Reserve = 25 % von 20 000 = 5 000, der
+    /// Turn endet also bei 15 000 (acht Runden à 2 000 statt zehn).
+    const HANDOFF_TEST_LIMIT: u64 = 20_000;
+
+    /// Zwei Kinder desselben Elternteils; das erste läuft bis ans Budget.
+    async fn run_first_child_to_budget_end(
+        reply: HandoffReply,
+    ) -> TestResult<(
+        ManagedAgentSpawner,
+        Vec<SessionId>,
+        Arc<HandoffProbeModel>,
+        ChildRunResult,
+    )> {
+        let model = HandoffProbeModel::new(reply);
+        let (spawner, children) = runnable_children(
+            Arc::new(HandoffProbeRegistry {
+                model: model.clone(),
+            }),
+            true,
+            2,
+            empty_registry,
+        )?;
+        let store = InMemoryStateStore::new();
+        let result = spawner
+            .run_child_with_budget(
+                &children[0],
+                &store,
+                None,
+                TurnInput::user("finde alle Aufrufer von foo"),
+                AgentBudget {
+                    max_tokens: Some(HANDOFF_TEST_LIMIT),
+                    ..AgentBudget::default()
+                },
+            )
+            .await
+            .map_err(|error| TestError::Unexpected(format!("partial result expected: {error}")))?;
+        Ok((spawner, children, model, result))
+    }
+
+    #[tokio::test]
+    async fn a_budget_end_returns_one_marked_compacted_handoff_with_all_sections() -> TestResult {
+        let (spawner, children, model, result) =
+            run_first_child_to_budget_end(HandoffReply::Structured).await?;
+        let child = &children[0];
+
+        assert!(result.budget_exhausted);
+        assert!(matches!(result.outcome, TurnOutcome::Completed));
+        assert_eq!(
+            result.budget_handoff,
+            Some(crate::child_handoff::BudgetHandoff::Compacted)
+        );
+        let text = result
+            .full_text
+            .as_deref()
+            .ok_or(TestError::Missing("handoff text"))?;
+        assert!(
+            text.starts_with(crate::child_handoff::HANDOFF_MARKER),
+            "{text}"
+        );
+        assert!(text.contains("Budget erreicht – Übergabe-Zusammenfassung"));
+        assert!(text.contains("verdichtet aus 8 Modellrunden"), "{text}");
+        for section in crate::child_handoff::HANDOFF_SECTIONS {
+            assert!(text.contains(section), "{section} fehlt: {text}");
+        }
+        assert!(text.contains(&format!("agent.result {{\"child_id\":\"{child}\"}}")));
+        assert!(text.contains("continue_from"));
+
+        // Genau ein Verdichtungsaufruf, Ausgabe gedeckelt.
+        assert_eq!(model.handoff_calls.load(Ordering::SeqCst), 1);
+        let max_output = model
+            .handoff_max_output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(max_output.len(), 1);
+        assert!(max_output.iter().all(|max| {
+            max.is_some_and(|max| max <= crate::child_handoff::HANDOFF_MAX_OUTPUT_TOKENS)
+        }));
+
+        // Die Reserve greift: acht statt zehn Arbeitsrunden, und Turn plus
+        // Verdichtung bleiben im Limit.
+        assert_eq!(model.work_rounds.load(Ordering::SeqCst), 8);
+        assert_eq!(result.usage.tokens, 16_000 + 2_500);
+        assert!(result.usage.tokens <= HANDOFF_TEST_LIMIT);
+
+        // `agent.result` liefert weiterhin den Rohtext, nicht die Übergabe.
+        let parent = spawner
+            .child_record(child)
+            .ok_or(TestError::Missing("child record"))?
+            .parent;
+        let raw = spawner
+            .child_result_text(&parent, child)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        assert_eq!(raw, "Zwischenstand 8");
+
+        let record = spawner
+            .budget_handoff_record(child)
+            .ok_or(TestError::Missing("handoff record"))?;
+        assert_eq!(record.kind, crate::child_handoff::BudgetHandoff::Compacted);
+        assert_eq!(&record.origin, child);
+        assert!(record.sandbox.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failing_or_empty_compaction_falls_back_to_the_last_answer() -> TestResult {
+        for reply in [HandoffReply::Fails, HandoffReply::Empty] {
+            let (_spawner, _children, model, result) = run_first_child_to_budget_end(reply).await?;
+            assert!(result.budget_exhausted);
+            assert_eq!(
+                result.budget_handoff,
+                Some(crate::child_handoff::BudgetHandoff::LastAnswer)
+            );
+            assert_eq!(result.full_text.as_deref(), Some("Zwischenstand 8"));
+            // Kein Wiederholungsversuch, kein zweiter Aufruf.
+            assert_eq!(model.handoff_calls.load(Ordering::SeqCst), 1);
+            // Nur der Turn wird angerechnet (die leere Antwort hat keine Nutzung,
+            // der Fehler keine Antwort).
+            assert_eq!(result.usage.tokens, 16_000);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_budget_ended_child_can_be_continued_by_its_parent_with_the_handoff() -> TestResult {
+        let (spawner, children, model, _result) =
+            run_first_child_to_budget_end(HandoffReply::Structured).await?;
+        let (first, second) = (&children[0], &children[1]);
+        let parent = spawner
+            .child_record(first)
+            .ok_or(TestError::Missing("child record"))?
+            .parent;
+
+        let seed = spawner
+            .prepare_continuation(&parent, first, "worker")
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        assert!(seed.handoff.contains("## Offene Punkte"));
+        let link = spawner
+            .bind_continuation(second, &seed)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        assert_eq!(&link.of, first);
+        assert_eq!(link.number, 1);
+        let task = spawner
+            .child_task_state(second)
+            .and_then(|state| state.task)
+            .unwrap_or_default();
+        assert!(
+            task.starts_with(&format!("Fortsetzung von {first}")),
+            "{task}"
+        );
+
+        // Die Fortsetzung arbeitet mit der Übergabe als erstem Kontext und
+        // einem frischen Budget; endet sie ihrerseits am Budget, gehört ihre
+        // Übergabe zur selben Kette.
+        let store = InMemoryStateStore::new();
+        let continued = spawner
+            .run_child_with_budget(
+                second,
+                &store,
+                None,
+                TurnInput::user(crate::child_handoff::continuation_task(
+                    first,
+                    &seed.handoff,
+                    None,
+                )),
+                AgentBudget {
+                    max_tokens: Some(HANDOFF_TEST_LIMIT),
+                    ..AgentBudget::default()
+                },
+            )
+            .await
+            .map_err(|error| TestError::Unexpected(error.to_string()))?;
+        assert_eq!(
+            continued.budget_handoff,
+            Some(crate::child_handoff::BudgetHandoff::Compacted)
+        );
+        assert_eq!(model.handoff_calls.load(Ordering::SeqCst), 2);
+        let text = continued.full_text.unwrap_or_default();
+        assert!(text.contains("noch 2 von 3 Fortsetzungen"), "{text}");
+        let record = spawner
+            .budget_handoff_record(second)
+            .ok_or(TestError::Missing("continued handoff record"))?;
+        assert_eq!(&record.origin, first);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_continuation_is_refused_for_foreign_unfinished_or_other_role_children() -> TestResult
+    {
+        let (spawner, children, _model, _result) =
+            run_first_child_to_budget_end(HandoffReply::Structured).await?;
+        let (first, second) = (&children[0], &children[1]);
+        let parent = spawner
+            .child_record(first)
+            .ok_or(TestError::Missing("child record"))?
+            .parent;
+
+        // Fremder Elternteil.
+        let stranger = SessionId::new();
+        assert!(
+            spawner
+                .prepare_continuation(&stranger, first, "worker")
+                .is_err()
+        );
+        // Nicht am Budget beendet (das zweite Kind lief nie).
+        assert!(
+            spawner
+                .prepare_continuation(&parent, second, "worker")
+                .is_err()
+        );
+        // Andere Rolle.
+        let other = spawner.prepare_continuation(&parent, first, "orchestrator");
+        assert!(
+            other.is_err_and(|error| error.message.contains("dieselbe Rolle")),
+            "eine andere Rolle könnte mehr Rechte tragen"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_continuation_never_widens_the_sandbox_and_the_chain_is_capped() -> TestResult {
+        let (spawner, children, _model, _result) =
+            run_first_child_to_budget_end(HandoffReply::Structured).await?;
+        let (first, second) = (&children[0], &children[1]);
+        let parent = spawner
+            .child_record(first)
+            .ok_or(TestError::Missing("child record"))?
+            .parent;
+        let seed = spawner
+            .prepare_continuation(&parent, first, "worker")
+            .map_err(|error| TestError::Unexpected(error.message))?;
+
+        // Rechte nicht erweitert: hatte der Vorgänger eine engere Sandbox als
+        // das neue Kind (ReadWorkspace), scheitert die Bindung.
+        let mut narrow = seed.clone();
+        narrow.sandbox = Some(test_sandbox(PermissionSet::from_policy(
+            std::iter::empty::<Permission>(),
+        ))?);
+        let widened = spawner.bind_continuation(second, &narrow);
+        assert!(
+            widened.is_err_and(|error| error.message.contains("Sandbox")),
+            "eine Fortsetzung darf nie mehr dürfen als ihr Vorgänger"
+        );
+
+        // Kettengrenze: höchstens drei Fortsetzungen je ursprünglichem Kind.
+        for number in 1..=crate::child_handoff::MAX_CONTINUATIONS {
+            let seed = spawner
+                .prepare_continuation(&parent, first, "worker")
+                .map_err(|error| TestError::Unexpected(error.message))?;
+            let link = spawner
+                .bind_continuation(second, &seed)
+                .map_err(|error| TestError::Unexpected(error.message))?;
+            assert_eq!(link.number, number);
+        }
+        let exhausted = spawner.prepare_continuation(&parent, first, "worker");
+        assert!(
+            exhausted.is_err_and(|error| error.message.contains("Kettengrenze")),
+            "die vierte Fortsetzung wird mit Hinweis abgewiesen"
+        );
+        Ok(())
+    }
+
+    /// Echte Admission unter einer externen Wurzel; das erste Kind läuft
+    /// bis ans Budget und wird danach freigegeben.
+    async fn admitted_child_at_budget_end() -> TestResult<(
+        ManagedAgentSpawner,
+        SessionId,
+        SandboxSpec,
+        SessionId,
+        ChildRunResult,
+    )> {
+        let model = HandoffProbeModel::new(HandoffReply::Structured);
+        let (spawner, parent, sandbox) =
+            window_test_spawner(Arc::new(HandoffProbeRegistry { model }), None)?;
+        let first = spawner
+            .admit("worker", spawn_input(parent.clone()), sandbox.clone(), None)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        let store = InMemoryStateStore::new();
+        let result = spawner
+            .run_child_with_budget(
+                &first,
+                &store,
+                None,
+                TurnInput::user("finde alle Aufrufer von foo"),
+                AgentBudget {
+                    max_tokens: Some(HANDOFF_TEST_LIMIT),
+                    ..AgentBudget::default()
+                },
+            )
+            .await
+            .map_err(|error| TestError::Unexpected(error.to_string()))?;
+        spawner
+            .release_child(&first)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        Ok((spawner, parent, sandbox, first, result))
+    }
+
+    fn continuation_input(parent: &SessionId, from: &str, task: &str) -> SpawnInput {
+        SpawnInput {
+            parent_session_id: parent.clone(),
+            handoff_call_id: ToolCallId::new(),
+            instructions: Some(task.to_owned()),
+            // So reicht der Turn-Loop `transfer_to_worker {task, continue_from}`
+            // bzw. das Agent-Werkzeug seine Argumente weiter.
+            context: serde_json::json!({ "task": task, "continue_from": from }),
+            ceiling: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn continue_from_on_the_handoff_and_agent_tool_paths_binds_a_continuation() -> TestResult
+    {
+        let (spawner, parent, sandbox, first, result) = admitted_child_at_budget_end().await?;
+        assert_eq!(
+            result.budget_handoff,
+            Some(crate::child_handoff::BudgetHandoff::Compacted)
+        );
+        // Der Hinweis nennt beide Wege, auch das Handoff-Werkzeug.
+        let text = result.full_text.unwrap_or_default();
+        assert!(text.contains("transfer_to_worker"), "{text}");
+        assert!(text.contains("delegate_wave"), "{text}");
+
+        // Handoff `transfer_to_worker` (UIA → Orchestrator): `spawn_child`.
+        let second = harw_extension_api::AgentSpawner::spawn_child(
+            &spawner,
+            "worker",
+            continuation_input(&parent, first.as_str(), "nur noch Modul C"),
+            sandbox.clone(),
+            None,
+        )
+        .await
+        .map_err(|error| TestError::Unexpected(error.message))?;
+        let link = spawner
+            .continuation_link(&second)
+            .ok_or(TestError::Missing("continuation link"))?;
+        assert_eq!(link.of, first);
+        assert_eq!(link.number, 1);
+        let pending = spawner
+            .child_task_state(&second)
+            .and_then(|state| state.pending_task)
+            .unwrap_or_default();
+        assert!(
+            pending.starts_with(&format!("Fortsetzung von {first}: nur noch Modul C")),
+            "{pending}"
+        );
+        assert!(pending.contains("## Offene Punkte"), "{pending}");
+        spawner
+            .release_child(&second)
+            .map_err(|error| TestError::Unexpected(error.message))?;
+
+        // Agent-Werkzeug (`AgentToolAdapter`): `spawn_child_or_wait`.
+        let guard = spawner
+            .spawn_child_or_wait(
+                "worker",
+                continuation_input(&parent, first.as_str(), "Rest prüfen"),
+                sandbox,
+                None,
+                Duration::from_secs(1),
+                &CancelToken::new(),
+            )
+            .await
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        let link = spawner
+            .continuation_link(guard.child())
+            .ok_or(TestError::Missing("continuation link (agent tool)"))?;
+        assert_eq!(link.number, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn continue_from_on_the_handoff_path_rejects_foreign_and_unknown_children() -> TestResult
+    {
+        let (spawner, parent, sandbox, first, _result) = admitted_child_at_budget_end().await?;
+        // Fremder Elternteil: dieselbe Ablehnung wie ein unbekanntes Kind,
+        // erkennbar am Präfix (der Turn-Loop macht daraus einen
+        // Werkzeugfehler statt eines Turn-Abbruchs).
+        let stranger = SessionId::new();
+        for input in [
+            continuation_input(&stranger, first.as_str(), "weiter"),
+            continuation_input(&parent, SessionId::new().as_str(), "weiter"),
+        ] {
+            let refused = harw_extension_api::AgentSpawner::spawn_child(
+                &spawner,
+                "worker",
+                input,
+                sandbox.clone(),
+                None,
+            )
+            .await;
+            assert!(
+                refused.is_err_and(|error| crate::child_handoff::is_continuation_rejection(
+                    &error.message
+                )),
+                "fremde oder unbekannte Kinder lassen sich nicht fortsetzen"
+            );
+        }
+        // Kein gültiger Verweis.
+        let mut input = continuation_input(&parent, "", "weiter");
+        input.context = serde_json::json!({ "task": "weiter", "continue_from": 7 });
+        let refused = spawner.admit("worker", input, sandbox, None);
+        assert!(
+            refused.is_err_and(|error| crate::child_handoff::is_continuation_rejection(
+                &error.message
+            ))
+        );
+        // Keine Fortsetzung wurde gezählt.
+        assert!(
+            spawner
+                .prepare_continuation(&parent, &first, "worker")
+                .is_ok()
+        );
+        Ok(())
+    }
+
+    // --- Runde 5, Teil M: Journal, Endbericht, Nachrichten ----------------
+
+    /// Wie das Test-Modell nach der ersten Arbeitsrunde weitermacht.
+    #[derive(Clone, Copy)]
+    enum EndProbeTurn {
+        /// Hängt (nur Abbruch/Zeitbudget beendet den Turn).
+        Hang,
+        /// Provider-Fehler.
+        Fail,
+        /// Schließt mit einer Antwort ab.
+        Finish,
+    }
+
+    /// Erste Runde: Zwischenstand plus Werkzeugaufruf `fs.read`; danach je
+    /// nach `turn`. Eine Übergabe-Verdichtung (erkennbar an ihrer
+    /// Systeminstruktion) wird immer strukturiert beantwortet und gezählt.
+    struct EndProbeModel {
+        turn: EndProbeTurn,
+        work_calls: AtomicUsize,
+        compaction_calls: AtomicUsize,
+        second_request: Mutex<Option<String>>,
+    }
+
+    impl EndProbeModel {
+        fn new(turn: EndProbeTurn) -> Arc<Self> {
+            Arc::new(Self {
+                turn,
+                work_calls: AtomicUsize::new(0),
+                compaction_calls: AtomicUsize::new(0),
+                second_request: Mutex::new(None),
+            })
+        }
+    }
+
+    impl ModelProvider for EndProbeModel {
+        fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
+            Box::pin(async move {
+                if request
+                    .system_prompt
+                    .contains(crate::child_handoff::HANDOFF_INSTRUCTION_MARKER)
+                {
+                    self.compaction_calls.fetch_add(1, Ordering::SeqCst);
+                    return Ok(ModelResponse {
+                        message: Some(structured_handoff_reply()),
+                        ..Default::default()
+                    });
+                }
+                let call = self.work_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if call == 1 {
+                    return Ok(ModelResponse {
+                        message: Some("Zwischenstand: lib.rs wird angepasst".to_owned()),
+                        tool_calls: vec![ToolCall {
+                            id: ToolCallId::new(),
+                            name: ToolName::new("fs.read"),
+                            arguments: serde_json::json!({ "path": "src/lib.rs" }),
+                        }],
+                        ..Default::default()
+                    });
+                }
+                *self
+                    .second_request
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(format!("{:?}", request.history.items()));
+                match self.turn {
+                    EndProbeTurn::Hang => {
+                        std::future::pending::<()>().await;
+                        Ok(ModelResponse::text("unreachable"))
+                    }
+                    EndProbeTurn::Fail => Err(crate::model::ModelError::RequestFailed(
+                        "provider 529 overloaded".to_owned(),
+                    )),
+                    EndProbeTurn::Finish => Ok(ModelResponse::text("fertig")),
+                }
+            })
+        }
+    }
+
+    struct EndProbeRegistry {
+        model: Arc<EndProbeModel>,
+    }
+
+    impl ChildRegistryFactory for EndProbeRegistry {
+        fn build_registry(
+            &self,
+            _role: &str,
+            _input: &SpawnInput,
+            _suggestions: Option<&AgentSuggestions>,
+        ) -> Result<ExtensionRegistry, AgentSpawnError> {
+            Ok(ExtensionRegistryBuilder::default().build())
+        }
+
+        fn model_for(&self, _role: &str) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
+            Ok(self.model.clone())
+        }
+    }
+
+    /// Hängt Journal, Fortschritts- und Journal-Beobachter an ein über
+    /// [`runnable_children`] (ohne Admission) angelegtes Kind — wie es die
+    /// echte Admission tut.
+    fn wire_comms(spawner: &ManagedAgentSpawner, child: &SessionId, task: &str) -> TestResult {
+        let parent = spawner
+            .child_record(child)
+            .ok_or(TestError::Missing("child record"))?
+            .parent;
+        spawner
+            .comms
+            .open_journal(child, &parent, "worker", Some(task));
+        let mut manager = spawner
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session = manager
+            .remove(child)
+            .ok_or(TestError::Missing("child session"))?
+            .with_progress_observer(Some(spawner.progress_observer()))
+            .with_tool_outcome_observer(Some(Arc::new(JournalToolObserver {
+                comms: Arc::clone(&spawner.comms),
+                inner: None,
+            })));
+        manager
+            .restore(session)
+            .map_err(ctx("child session restores"))?;
+        Ok(())
+    }
+
+    async fn end_probe_child(
+        turn: EndProbeTurn,
+    ) -> TestResult<(ManagedAgentSpawner, SessionId, Arc<EndProbeModel>)> {
+        let model = EndProbeModel::new(turn);
+        let (spawner, children) = runnable_children(
+            Arc::new(EndProbeRegistry {
+                model: model.clone(),
+            }),
+            true,
+            1,
+            empty_registry,
+        )?;
+        let child = children[0].clone();
+        wire_comms(&spawner, &child, "Setze das Feature um")?;
+        Ok((spawner, child, model))
+    }
+
+    /// Wall-Time-Ende: der Elternteil bekommt Journal **und** (mit eigenem
+    /// kurzem Zeitlimit) eine Übergabe-Verdichtung; `continue_from` ist
+    /// möglich.
+    #[tokio::test]
+    async fn a_wall_time_end_delivers_the_journal_and_a_handoff() -> TestResult {
+        let (spawner, child, model) = end_probe_child(EndProbeTurn::Hang).await?;
+        let store = InMemoryStateStore::new();
+        let result = spawner
+            .run_child_with_budget(
+                &child,
+                &store,
+                None,
+                TurnInput::user("Setze das Feature um"),
+                AgentBudget {
+                    max_wall_time_ms: Some(300),
+                    ..AgentBudget::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ChildRunError::BudgetExhausted(_))),
+            "{result:?}"
+        );
+        let report = spawner
+            .child_end_report(&child)
+            .ok_or(TestError::Missing("Endbericht"))?;
+        assert_eq!(report.status, crate::child_comms::ChildEndStatus::Timeout);
+        assert!(report.reason.starts_with("Zeitbudget"), "{}", report.reason);
+        assert!(report.handoff.is_some(), "Verdichtung war möglich");
+        assert_eq!(model.compaction_calls.load(Ordering::SeqCst), 1);
+        assert!(report.steps >= 1);
+        assert!(report.journal_summary.contains("fs.read(src/lib.rs)"));
+        assert!(report.continuation, "continue_from ist möglich");
+        let text = report.to_parent_text();
+        let header =
+            crate::child_comms::parse_child_end(&text).ok_or(TestError::Missing("Kopfzeile"))?;
+        assert!(header.handoff);
+        assert!(
+            spawner
+                .prepare_continuation(&report.parent, &child, "worker")
+                .is_ok()
+        );
+        Ok(())
+    }
+
+    /// Provider-Fehler: Journal ja, Verdichtung nein (kein weiterer
+    /// Modellaufruf gegen einen gerade gescheiterten Provider).
+    #[tokio::test]
+    async fn a_provider_error_delivers_the_journal_without_compaction() -> TestResult {
+        let (spawner, child, model) = end_probe_child(EndProbeTurn::Fail).await?;
+        let store = InMemoryStateStore::new();
+        let _result = spawner
+            .run_child_with_budget(
+                &child,
+                &store,
+                None,
+                TurnInput::user("Setze das Feature um"),
+                AgentBudget::default(),
+            )
+            .await;
+        let report = spawner
+            .child_end_report(&child)
+            .ok_or(TestError::Missing("Endbericht"))?;
+        assert_eq!(report.status, crate::child_comms::ChildEndStatus::Failed);
+        assert!(report.handoff.is_none());
+        assert_eq!(model.compaction_calls.load(Ordering::SeqCst), 0);
+        assert!(report.journal_summary.contains("fs.read"));
+        assert!(
+            report
+                .journal_summary
+                .contains("Zwischenstand: lib.rs wird angepasst"),
+            "letzter Assistententext im Journal: {}",
+            report.journal_summary
+        );
+        Ok(())
+    }
+
+    /// Abbruch: das Journal bleibt erhalten, ohne Verdichtung und ohne
+    /// Fortsetzungsangebot.
+    #[tokio::test]
+    async fn a_cancel_delivers_the_journal() -> TestResult {
+        let (spawner, child, model) = end_probe_child(EndProbeTurn::Hang).await?;
+        let store = InMemoryStateStore::new();
+        let run = spawner.run_child_with_budget(
+            &child,
+            &store,
+            None,
+            TurnInput::user("Setze das Feature um"),
+            AgentBudget::default(),
+        );
+        let cancel = async {
+            for _ in 0..200 {
+                if spawner
+                    .comms
+                    .journal(&child)
+                    .is_some_and(|journal| journal.steps() >= 1)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            spawner.request_cancellation(&child)
+        };
+        let (result, requested) = tokio::join!(run, cancel);
+        assert!(requested);
+        assert!(result.is_err(), "{result:?}");
+        let report = spawner
+            .child_end_report(&child)
+            .ok_or(TestError::Missing("Endbericht"))?;
+        assert_eq!(report.status, crate::child_comms::ChildEndStatus::Cancelled);
+        assert!(report.handoff.is_none());
+        assert!(!report.continuation);
+        assert_eq!(model.compaction_calls.load(Ordering::SeqCst), 0);
+        assert!(report.journal_summary.contains("fs.read"));
+        Ok(())
+    }
+
+    /// `agent.message` erreicht das Kind an seiner nächsten Runden-Grenze
+    /// als „[Nachricht von <rolle>] …".
+    #[tokio::test]
+    async fn a_message_reaches_the_child_at_its_next_round_boundary() -> TestResult {
+        let (spawner, child, model) = end_probe_child(EndProbeTurn::Finish).await?;
+        let parent = spawner
+            .child_record(&child)
+            .ok_or(TestError::Missing("record"))?
+            .parent;
+        let delivery = spawner
+            .send_message_to_child(&parent, child.as_str(), "Bitte nur src/ anfassen")
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        assert_eq!(delivery, crate::child_comms::MessageDelivery::Queued);
+        let store = InMemoryStateStore::new();
+        let result = spawner
+            .run_child_with_budget(
+                &child,
+                &store,
+                None,
+                TurnInput::user("Setze das Feature um"),
+                AgentBudget::default(),
+            )
+            .await
+            .map_err(|error| TestError::Unexpected(error.to_string()))?;
+        assert!(matches!(result.outcome, TurnOutcome::Completed));
+        let second = model
+            .second_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or(TestError::Missing("zweite Modellrunde"))?;
+        assert!(
+            second.contains("[Nachricht von uia] Bitte nur src/ anfassen"),
+            "{second}"
+        );
+        assert_eq!(spawner.comms.pending_inbound(&child), 0, "genau einmal");
+        assert!(spawner.child_end_report(&child).is_none(), "reguläres Ende");
+        Ok(())
+    }
+
+    /// Nachrichten an fremde, unbekannte oder beendete Kinder werden mit
+    /// derselben Meldung abgewiesen; ein Großelternteil ist kein Elternteil.
+    #[tokio::test]
+    async fn a_message_to_a_foreign_or_finished_child_is_rejected() -> TestResult {
+        let (spawner, child, _model) = end_probe_child(EndProbeTurn::Finish).await?;
+        let parent = spawner
+            .child_record(&child)
+            .ok_or(TestError::Missing("record"))?
+            .parent;
+        let foreign = spawner.send_message_to_child(&SessionId::new(), child.as_str(), "x");
+        let unknown = spawner.send_message_to_child(&parent, SessionId::new().as_str(), "x");
+        let (Err(foreign), Err(unknown)) = (foreign, unknown) else {
+            return Err(TestError::Unexpected("beide müssen scheitern".to_owned()));
+        };
+        assert!(foreign.message.starts_with("kein eigenes, laufendes Kind"));
+        assert!(unknown.message.starts_with("kein eigenes, laufendes Kind"));
+        let store = InMemoryStateStore::new();
+        spawner
+            .run_child_with_budget(
+                &child,
+                &store,
+                None,
+                TurnInput::user("x"),
+                AgentBudget::default(),
+            )
+            .await
+            .map_err(|error| TestError::Unexpected(error.to_string()))?;
+        assert_eq!(spawner.child_status(&child), Some(ChildStatus::Completed));
+        let finished = spawner.send_message_to_child(&parent, child.as_str(), "noch was");
+        assert!(
+            finished.is_err_and(|error| error.message.starts_with("kein eigenes, laufendes Kind")),
+            "ein beendetes Kind nimmt keine Nachricht mehr an"
+        );
+        // Längendeckel.
+        let (spawner, child, _model) = end_probe_child(EndProbeTurn::Finish).await?;
+        let parent = spawner
+            .child_record(&child)
+            .ok_or(TestError::Missing("record"))?
+            .parent;
+        let long = "x".repeat(crate::child_comms::MESSAGE_MAX_BYTES + 1);
+        assert!(
+            spawner
+                .send_message_to_child(&parent, child.as_str(), &long)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    /// `parent.message {kind: "question"}` wartet und bekommt die Antwort
+    /// über `agent.message`; ohne Antwort liefert der Zeitablauf den
+    /// Hinweis. Die Frage erscheint im Eingang der Wurzel.
+    #[tokio::test]
+    async fn a_parent_question_waits_for_the_answer_or_times_out_with_a_hint() -> TestResult {
+        let (spawner, child, _model) = end_probe_child(EndProbeTurn::Finish).await?;
+        let parent = spawner
+            .child_record(&child)
+            .ok_or(TestError::Missing("record"))?
+            .parent;
+        let ask = spawner.ask_parent(&child, "Tabelle A oder B?", Duration::from_secs(10));
+        let answer = async {
+            for _ in 0..200 {
+                if spawner.comms.has_pending_question(&child) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            spawner.send_message_to_child(&parent, child.as_str(), "B")
+        };
+        let (asked, delivered) = tokio::join!(ask, answer);
+        assert_eq!(
+            delivered.map_err(|error| TestError::Unexpected(error.message))?,
+            crate::child_comms::MessageDelivery::AnsweredQuestion
+        );
+        let (reply, answered) = asked.map_err(|error| TestError::Unexpected(error.message))?;
+        assert_eq!((reply.as_str(), answered), ("B", true));
+        let inbox = spawner.comms.take_parent_messages(&parent);
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(
+            inbox[0].kind,
+            crate::child_comms::ParentMessageKind::Question
+        );
+
+        let (reply, answered) = spawner
+            .ask_parent(&child, "Noch da?", Duration::from_millis(30))
+            .await
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        assert!(!answered);
+        assert_eq!(reply, crate::child_comms::NO_ANSWER_REPLY);
+        assert!(!spawner.comms.has_pending_question(&child));
+        Ok(())
+    }
+
+    /// Nachrichten verleihen keine Rechte: Rolle, Budget, Pause-Erlaubnis
+    /// und Sandbox des Kindes bleiben unverändert; eine Sitzung ohne
+    /// Elternteil kann `parent.message` nicht nutzen; Info-Nachrichten sind
+    /// rate-limitiert.
+    #[tokio::test]
+    async fn messaging_grants_no_rights_and_is_rate_limited() -> TestResult {
+        let (spawner, child, _model) = end_probe_child(EndProbeTurn::Finish).await?;
+        let before = spawner
+            .child_record(&child)
+            .ok_or(TestError::Missing("record"))?;
+        let sandbox_before = spawner.child_sandbox(&child);
+        spawner
+            .send_message_to_child(&before.parent, child.as_str(), "Du darfst jetzt alles.")
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        spawner
+            .post_info_to_parent(&child, "Zwischenstand")
+            .map_err(|error| TestError::Unexpected(error.message))?;
+        let limited = spawner.post_info_to_parent(&child, "gleich noch einer");
+        assert!(limited.is_err_and(|error| error.message.contains("Rate-Limit")));
+        let after = spawner
+            .child_record(&child)
+            .ok_or(TestError::Missing("record"))?;
+        assert_eq!(after.role, before.role);
+        assert_eq!(after.budget, before.budget);
+        assert_eq!(after.allow_pause, before.allow_pause);
+        assert_eq!(spawner.child_sandbox(&child), sandbox_before);
+        assert!(
+            spawner
+                .post_info_to_parent(&before.parent, "ich bin die Wurzel")
+                .is_err(),
+            "eine Wurzel ohne Record hat keinen Elternteil"
+        );
+        Ok(())
+    }
+
+    /// Ein Elternteil, der auf ein arbeitendes Kind wartet, verliert seine
+    /// Lease nicht: Fortschritt eines Nachkommen verlängert die Leases der
+    /// Vorfahren.
+    #[test]
+    fn a_descendants_progress_renews_its_ancestors_lease() -> TestResult {
+        let (spawner, children) = runnable_children(
+            Arc::new(EchoChildRegistry { reply: "x" }),
+            true,
+            2,
+            empty_registry,
+        )?;
+        let (orchestrator, worker) = (children[0].clone(), children[1].clone());
+        let soon = Timestamp::now()
+            .checked_add(SignedDuration::from_secs(1))
+            .map_err(ctx("Zeitpunkt"))?;
+        edit_record(&spawner, &orchestrator, |record| {
+            record.lease_expires_at = soon;
+        })?;
+        edit_record(&spawner, &worker, |record| {
+            record.parent = orchestrator.clone();
+        })?;
+        let observer = spawner.progress_observer();
+        crate::guard::ProgressObserver::on_progress(observer.as_ref(), &worker);
+        let renewed = spawner
+            .child_record(&orchestrator)
+            .ok_or(TestError::Missing("record"))?
+            .lease_expires_at;
+        assert!(renewed > soon, "{renewed} > {soon}");
         Ok(())
     }
 }

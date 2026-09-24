@@ -43,6 +43,7 @@ forbidden = [
   "fs.glob",
   "fs.grep",
   "fs.write",
+  "fs.edit",
   "web.fetch",
   "web.docs_rs",
   "web.crates_io",

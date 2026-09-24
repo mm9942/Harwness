@@ -25,7 +25,7 @@ mod common;
 use common::{TestResult, ctx};
 
 use harw_config::harness_config::{
-    CompactionToml, DiaryToml, DreamToml, GuardsToml, KnowledgeToml, OnboardingSection,
+    CompactionToml, DiaryToml, DreamToml, GuardsToml, HostToml, KnowledgeToml, OnboardingSection,
     OnboardingSeen, ReasoningWeightsToml,
 };
 use harw_config::{
@@ -76,11 +76,17 @@ fn test_field_table_exhaustive_harness_config() {
         sandbox: _,
         project_root_markers,
         internal_models: _,
+        uia_worker_models: _,
         compaction: _,
         reasoning: _,
         guards: _,
         knowledge: _,
         dream: _,
+        host: _,
+        // Runde 5, Teil K: `[agents]`, eigener Abschnittstest unten.
+        agents: _,
+        // Runde 5, Teil N: `[shell]`, eigener Abschnittstest unten.
+        shell: _,
         base_dir: _, // #[serde(skip)], kein TOML-Feld, keine FIELD_TABLE-Zeile
     } = HarnessConfig::default();
     // Kein `..` — ein neues Feld auf HarnessConfig, das hier nicht
@@ -137,7 +143,7 @@ fn test_field_table_exhaustive_logging_section() {
 }
 
 // ---------------------------------------------------------------------
-// [tui] (Abschnitt 1.3, 2 Felder)
+// [tui] (Abschnitt 1.3, 3 Felder; Runde 5, Teil I: +`child_stream`)
 // ---------------------------------------------------------------------
 
 #[test]
@@ -145,9 +151,10 @@ fn test_field_table_exhaustive_tui_section() {
     let TuiSection {
         theme,
         keybindings_file,
+        child_stream,
     } = TuiSection::default();
-    let _ = (theme, keybindings_file);
-    for path in ["tui.theme", "tui.keybindings_file"] {
+    let _ = (theme, keybindings_file, child_stream);
+    for path in ["tui.theme", "tui.keybindings_file", "tui.child_stream"] {
         assert_path_in_field_table_exactly_once(path);
     }
 }
@@ -493,6 +500,7 @@ fn test_field_table_exhaustive_internal_models_toml() {
         worker_complex,
         root_orchestrator,
         sub_orchestrator,
+        auto_classifier,
     } = InternalModelsToml::default();
     let _ = (
         use_openrouter_defaults,
@@ -506,6 +514,7 @@ fn test_field_table_exhaustive_internal_models_toml() {
         worker_complex,
         root_orchestrator,
         sub_orchestrator,
+        auto_classifier,
     );
     for path in [
         "internal_models.use_openrouter_defaults",
@@ -519,6 +528,8 @@ fn test_field_table_exhaustive_internal_models_toml() {
         "internal_models.worker_complex",
         "internal_models.root_orchestrator",
         "internal_models.sub_orchestrator",
+        // Runde 5, Teil E.
+        "internal_models.auto_classifier",
     ] {
         assert_path_in_field_table_exactly_once(path);
     }
@@ -649,6 +660,89 @@ fn test_field_table_exhaustive_dream_toml() {
         "dream.idle_minutes",
         "dream.cooldown_minutes",
         "dream.schedule",
+    ] {
+        assert_path_in_field_table_exactly_once(path);
+    }
+}
+
+// ---------------------------------------------------------------------
+// [host] (Abschnitt 1.19, 1 Feld) — Runde 5, Teil B
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_field_table_exhaustive_host_toml() {
+    let HostToml {
+        sudo_session_minutes,
+    } = HostToml::default();
+    let _ = sudo_session_minutes;
+    assert_path_in_field_table_exactly_once("host.sudo_session_minutes");
+}
+
+// ---------------------------------------------------------------------
+// [agents] (Abschnitt 1.21, 4 Felder) — Runde 5, Teil K
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_field_table_exhaustive_agent_limits_toml() {
+    let harw_config::AgentLimitsToml {
+        max_root_orchestrators,
+        max_sub_orchestrators,
+        max_sub_orchestrator_depth,
+        max_spawn_depth,
+    } = harw_config::AgentLimitsToml::default();
+    let _ = (
+        max_root_orchestrators,
+        max_sub_orchestrators,
+        max_sub_orchestrator_depth,
+        max_spawn_depth,
+    );
+    for path in [
+        "agents.max_root_orchestrators",
+        "agents.max_sub_orchestrators",
+        "agents.max_sub_orchestrator_depth",
+        "agents.max_spawn_depth",
+    ] {
+        assert_path_in_field_table_exactly_once(path);
+    }
+}
+
+// ---------------------------------------------------------------------
+// [shell] (Abschnitt 1.22, 1 Feld) — Runde 5, Teil N
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_field_table_exhaustive_shell_toml() {
+    let harw_config::ShellToml { max_timeout_secs } = harw_config::ShellToml::default();
+    let _ = max_timeout_secs;
+    assert_path_in_field_table_exactly_once("shell.max_timeout_secs");
+}
+
+// ---------------------------------------------------------------------
+// [uia_worker_models] (Abschnitt 1.20, 5 Felder) — Runde 5, Teil G
+// ---------------------------------------------------------------------
+
+#[test]
+fn test_field_table_exhaustive_uia_worker_models_toml() {
+    let harw_config::UiaWorkerModelsToml {
+        uia_worker,
+        uia_shell_worker,
+        uia_writer,
+        uia_latex_writer,
+        uia_explorer,
+    } = harw_config::UiaWorkerModelsToml::default();
+    let _ = (
+        uia_worker,
+        uia_shell_worker,
+        uia_writer,
+        uia_latex_writer,
+        uia_explorer,
+    );
+    for path in [
+        "uia_worker_models.uia_worker",
+        "uia_worker_models.uia_shell_worker",
+        "uia_worker_models.uia_writer",
+        "uia_worker_models.uia_latex_writer",
+        "uia_worker_models.uia_explorer",
     ] {
         assert_path_in_field_table_exactly_once(path);
     }

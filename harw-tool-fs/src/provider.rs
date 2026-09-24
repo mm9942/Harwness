@@ -1,8 +1,8 @@
-//! `FsToolProvider` — aggregierter ToolProvider für alle sechs FS-Tools.
+//! `FsToolProvider` — aggregierter ToolProvider für alle sieben FS-Tools.
 //!
 //! # Verantwortung
-//! Dieses Modul fasst `fs.read`, `fs.write`, `fs.list`, `fs.search`,
-//! `fs.glob` und `fs.grep` unter einem einzigen [`ToolProvider`]-Implementor
+//! Dieses Modul fasst `fs.read`, `fs.write`, `fs.edit`, `fs.list`,
+//! `fs.search`, `fs.glob` und `fs.grep` unter einem einzigen [`ToolProvider`]-Implementor
 //! zusammen. Der Provider ist zustandslos bezüglich Pfaden — alle
 //! Pfad-Entscheidungen erfolgen pro-Call aus dem [`ToolExecutionContext`].
 //!
@@ -38,6 +38,7 @@
 //! let provider = FsToolProvider::new();
 //! ```
 
+use crate::edit::FsEditExecutor;
 use crate::glob::FsGlobTool;
 use crate::grep::FsGrepTool;
 use crate::list::{DEFAULT_MAX_ENTRIES, FsListExecutor};
@@ -56,11 +57,11 @@ use std::sync::Arc;
 /// Standard-Maximum für lesbare Bytes in `fs.read`.
 pub const DEFAULT_MAX_READ_BYTES: u64 = 65_536;
 
-/// Aggregierter ToolProvider für alle sechs Filesystem-Tools.
+/// Aggregierter ToolProvider für alle sieben Filesystem-Tools.
 ///
 /// # Description
-/// Stellt `fs.read`, `fs.write`, `fs.list`, `fs.search`, `fs.glob` und
-/// `fs.grep` bereit. Konfiguration der vier handgeschriebenen Tools erfolgt
+/// Stellt `fs.read`, `fs.write`, `fs.edit`, `fs.list`, `fs.search`, `fs.glob`
+/// und `fs.grep` bereit. Konfiguration der vier handgeschriebenen Tools erfolgt
 /// über den Konstruktor; `fs.glob`/`fs.grep` sind zustandslose,
 /// makro-generierte Unit-Structs ohne Konfigurationsfelder. Pfad- und
 /// Berechtigungs-Entscheidungen erfolgen per-Call aus dem
@@ -75,7 +76,7 @@ pub const DEFAULT_MAX_READ_BYTES: u64 = 65_536;
 /// use harw_extension_api::contributors::ToolProvider;
 ///
 /// let provider = FsToolProvider::new();
-/// let tools = provider.tools(); // returns 6 ToolSpecs
+/// let tools = provider.tools(); // returns 7 ToolSpecs
 /// ```
 pub struct FsToolProvider {
     /// Maximale Bytes pro `fs.read`-Aufruf.
@@ -127,11 +128,11 @@ impl Default for FsToolProvider {
 }
 
 impl ToolProvider for FsToolProvider {
-    /// Gibt die Liste aller sechs FS-Tools zurück.
+    /// Gibt die Liste aller sieben FS-Tools zurück.
     ///
     /// # Returns
-    /// `Vec<ToolSpec>` mit sechs Einträgen: `fs.read`, `fs.write`, `fs.list`,
-    /// `fs.search`, `fs.glob`, `fs.grep`.
+    /// `Vec<ToolSpec>` mit sieben Einträgen: `fs.read`, `fs.write`, `fs.edit`,
+    /// `fs.list`, `fs.search`, `fs.glob`, `fs.grep`.
     ///
     /// # Concurrency
     /// Zustandslos; sicher für parallele Aufrufe.
@@ -139,6 +140,7 @@ impl ToolProvider for FsToolProvider {
         vec![
             fs_read_spec(),
             fs_write_spec(),
+            fs_edit_spec(),
             fs_list_spec(),
             fs_search_spec(),
             FsGlobTool::spec(),
@@ -162,6 +164,7 @@ impl ToolProvider for FsToolProvider {
                 max_bytes: self.max_read_bytes,
             })),
             "fs.write" => Some(Arc::new(FsWriteExecutor)),
+            "fs.edit" => Some(Arc::new(FsEditExecutor)),
             "fs.list" => Some(Arc::new(FsListExecutor {
                 max_entries: self.max_list_entries,
             })),
@@ -182,7 +185,8 @@ impl ToolProvider for FsToolProvider {
     ///
     /// # Returns
     /// `true` für `fs.read`, `fs.list`, `fs.search`, `fs.glob`, `fs.grep`
-    /// (Reads sind commutative). `false` für `fs.write` und unbekannte Namen.
+    /// (Reads sind commutative). `false` für `fs.write`, `fs.edit` und unbekannte
+    /// Namen.
     ///
     /// # Concurrency
     /// Zustandslos.
@@ -215,8 +219,8 @@ fn fs_read_spec() -> ToolSpec {
         JsonSchema {
             schema_type: Some(JsonSchemaType::Integer),
             description: Some(
-                "Optional byte limit for this call. Cannot exceed the provider's configured \
-                 limit (at most 65536)."
+                "Byte mode only: byte limit for this call (at most 65536). null (or 0) = not \
+                 set."
                     .to_owned(),
             ),
             ..Default::default()
@@ -227,8 +231,8 @@ fn fs_read_spec() -> ToolSpec {
         JsonSchema {
             schema_type: Some(JsonSchemaType::Integer),
             description: Some(
-                "Optional byte offset to start reading at. Use the offset reported in the \
-                 truncation hint to continue reading a large file."
+                "Byte mode only: byte offset to start at; use the offset from the truncation \
+                 hint to continue. null = not set; 0 is ignored when line mode or tail is used."
                     .to_owned(),
             ),
             ..Default::default()
@@ -239,8 +243,8 @@ fn fs_read_spec() -> ToolSpec {
         JsonSchema {
             schema_type: Some(JsonSchemaType::Integer),
             description: Some(
-                "1-based line number to start reading from (line mode, the default). Cannot \
-                 be combined with 'offset'/'max_bytes'/'tail'. Default: 1."
+                "Line mode: 1-based first line. null = 1. With 'offset'/'max_bytes' or 'tail' \
+                 it must be null (or 1)."
                     .to_owned(),
             ),
             ..Default::default()
@@ -251,8 +255,8 @@ fn fs_read_spec() -> ToolSpec {
         JsonSchema {
             schema_type: Some(JsonSchemaType::Integer),
             description: Some(
-                "Number of lines to return (line mode). Default: 400, hard maximum: 2000. \
-                 Cannot be combined with 'offset'/'max_bytes'."
+                "Line mode: number of lines (null = 400, max 2000). With 'tail' it caps the \
+                 tail line count. Must be null in byte mode."
                     .to_owned(),
             ),
             ..Default::default()
@@ -263,8 +267,9 @@ fn fs_read_spec() -> ToolSpec {
         JsonSchema {
             schema_type: Some(JsonSchemaType::Integer),
             description: Some(
-                "Return only the last N lines (e.g. for logs), numbered with their real line \
-                 numbers. Hard maximum: 2000. Cannot be combined with 'line'/'offset'/'max_bytes'."
+                "Tail mode: return the last N lines (e.g. logs) with real line numbers, max \
+                 2000. null (or 0) = not set. Requires 'offset'/'max_bytes' null and 'line' \
+                 null (or 1)."
                     .to_owned(),
             ),
             ..Default::default()
@@ -274,12 +279,13 @@ fn fs_read_spec() -> ToolSpec {
     ToolSpec::Function(FunctionToolSpec {
         name: ToolName::new("fs.read"),
         description:
-            "Liest eine Textdatei zeilenweise mit Zeilennummern (`line`, `limit`; Vorgabe ab \
-             Zeile 1, 400 Zeilen). Für bestimmte Stellen zuerst `fs.grep` (ripgrep, mit \
-             grep-Rückfall; liefert Zeilennummern), dann `fs.read` mit `line`. Kein \
-             `sed`/`head`/`tail`/`grep` über `shell.exec` nötig. `offset`/`max_bytes` lesen \
-             byteweise (Rückfall). `tail` = letzte N Zeilen, z. B. für Logs. Für PDFs \
-             `doc.read_pdf` verwenden."
+            "Liest eine Textdatei mit Zeilennummern. Genau ein Modus; alle nicht benutzten \
+             Parameter auf null setzen (null = nicht gesetzt): (1) Zeilenmodus, Standard: \
+             `line` (Vorgabe 1) + `limit` (Vorgabe 400, max 2000). (2) Tail: `tail` = letzte N \
+             Zeilen, z. B. für Logs (`limit` begrenzt zusätzlich). (3) Byte-Modus (Rückfall): \
+             `offset`/`max_bytes`. Für bestimmte Stellen zuerst `fs.grep` (liefert \
+             Zeilennummern), dann `fs.read` mit `line`. Kein `sed`/`head`/`tail`/`grep` über \
+             `shell.exec` nötig. Für PDFs `doc.read_pdf` verwenden."
                 .to_owned(),
         parameters: JsonSchema {
             schema_type: Some(JsonSchemaType::Object),
@@ -331,6 +337,75 @@ fn fs_write_spec() -> ToolSpec {
     })
 }
 
+fn fs_edit_spec() -> ToolSpec {
+    let mut props = BTreeMap::new();
+    props.insert(
+        "path".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some(
+                "Path to the existing file to edit, relative to the workspace root.".to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
+    props.insert(
+        "old_string".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some(
+                "Exact text to replace (non-empty). Without replace_all it must occur exactly \
+                 once; include enough surrounding context to make it unique."
+                    .to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
+    props.insert(
+        "new_string".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some("Replacement text (must differ from old_string).".to_owned()),
+            ..Default::default()
+        },
+    );
+    props.insert(
+        "replace_all".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::Boolean),
+            description: Some(
+                "Replace every occurrence of old_string instead of exactly one. Default: false."
+                    .to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
+
+    ToolSpec::Function(FunctionToolSpec {
+        name: ToolName::new("fs.edit"),
+        description: "Replace text in an existing UTF-8 file relative to the workspace root, \
+             atomically. old_string must occur exactly once unless replace_all is true; \
+             otherwise the call fails and reports the match count. Returns {path, \
+             replacements, diff_excerpt}. Prefer fs.edit over fs.write for changes to \
+             existing files. Requires WriteWorkspace permission. Path traversal, symlinks \
+             and the protected areas .git/ and .harw/ are rejected; files larger than 8 MiB \
+             are not edited."
+            .to_owned(),
+        parameters: JsonSchema {
+            schema_type: Some(JsonSchemaType::Object),
+            properties: Some(props),
+            required: Some(vec![
+                "path".to_owned(),
+                "old_string".to_owned(),
+                "new_string".to_owned(),
+            ]),
+            additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
+            ..Default::default()
+        },
+        strict: true,
+    })
+}
+
 fn fs_list_spec() -> ToolSpec {
     let mut props = BTreeMap::new();
     props.insert(
@@ -346,7 +421,8 @@ fn fs_list_spec() -> ToolSpec {
         JsonSchema {
             schema_type: Some(JsonSchemaType::Integer),
             description: Some(
-                "Maximum number of directory entries to return. Default: 200.".to_owned(),
+                "Maximum number of directory entries to return. null (or 0) = default 200."
+                    .to_owned(),
             ),
             ..Default::default()
         },
@@ -478,14 +554,15 @@ mod tests {
     }
 
     #[test]
-    fn test_fs_tool_provider_lists_six_tools() -> TestResult {
+    fn test_fs_tool_provider_lists_seven_tools() -> TestResult {
         let provider = FsToolProvider::new();
         let tools = provider.tools();
-        assert_eq!(tools.len(), 6, "expected exactly 6 tools");
+        assert_eq!(tools.len(), 7, "expected exactly 7 tools");
 
         let names: HashSet<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains("fs.read"), "missing fs.read");
         assert!(names.contains("fs.write"), "missing fs.write");
+        assert!(names.contains("fs.edit"), "missing fs.edit");
         assert!(names.contains("fs.list"), "missing fs.list");
         assert!(names.contains("fs.search"), "missing fs.search");
         assert!(names.contains("fs.glob"), "missing fs.glob");
@@ -503,6 +580,7 @@ mod tests {
         assert!(provider.parallel_safe(&ToolName::new("fs.glob")));
         assert!(provider.parallel_safe(&ToolName::new("fs.grep")));
         assert!(!provider.parallel_safe(&ToolName::new("fs.write")));
+        assert!(!provider.parallel_safe(&ToolName::new("fs.edit")));
         assert!(!provider.parallel_safe(&ToolName::new("unknown")));
         Ok(())
     }
@@ -513,6 +591,7 @@ mod tests {
 
         assert!(provider.executor(&ToolName::new("fs.read")).is_some());
         assert!(provider.executor(&ToolName::new("fs.write")).is_some());
+        assert!(provider.executor(&ToolName::new("fs.edit")).is_some());
         assert!(provider.executor(&ToolName::new("fs.list")).is_some());
         assert!(provider.executor(&ToolName::new("fs.search")).is_some());
         assert!(provider.executor(&ToolName::new("fs.glob")).is_some());
@@ -568,5 +647,25 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_fs_read_spec_explains_modes_and_null() {
+        // Bugreport Runde 5: im Strict-Schema sind alle Felder required; die
+        // Beschreibung muss sagen, dass ungenutzte Felder null sein dürfen
+        // und welcher Modus welche Felder nutzt.
+        let ToolSpec::Function(spec) = fs_read_spec();
+        assert!(spec.description.contains("null = nicht gesetzt"));
+        for mode in ["Zeilenmodus", "Tail", "Byte-Modus"] {
+            assert!(spec.description.contains(mode), "{mode}");
+        }
+        let props = spec.parameters.properties.unwrap_or_default();
+        for field in ["max_bytes", "offset", "line", "limit", "tail"] {
+            let description = props
+                .get(field)
+                .and_then(|schema| schema.description.clone())
+                .unwrap_or_default();
+            assert!(description.contains("null"), "{field}: {description}");
+        }
     }
 }

@@ -189,7 +189,7 @@ Legend for **Tier**: `Obs` `Op` `Maint` `Own`.
 |---|---|---|---|---|
 | `/doctor` | `[--fix] [--section=catalog\|config\|provider\|mcp\|sandbox\|policy]` | Health check across catalog/config/provider/MCP/sandbox/policy | Obs (plain), Maint (`--fix`) | Y |
 | `/model` | `show \| list \| switch <id>` | Inspect the active model, or atomically switch provider+model together (implemented grammar; see `interaction-contract.md` §2.6.1 for the full Ist-Stand table, including the new `/uia-model`, `/uia-worker-model`, `/effort`, `/uia-effort`, `/provider-concurrency` siblings) | Op | Y |
-| `/models` (neu) | `[show \| set <rolle> <ziel> \| reset <rolle> \| pick <rolle>]` | Modelle **je Rolle** (12 Rollen, siehe `tui-roles-models-modes.md`) anzeigen/setzen/zurücksetzen; wirkt **ab nächster Sitzung** — nur `/model` wechselt live. `pick` öffnet TUI-lokal den Modell-Picker der Rolle. Details §8.2 | Op | - |
+| `/models` (neu) | `[show \| set <rolle> <ziel> \| reset <rolle> \| pick <rolle> \| worker [<rolle\|all> <uia\|ziel>]]` | Modelle **je Rolle** (12 Rollen, siehe `tui-roles-models-modes.md`) anzeigen/setzen/zurücksetzen; wirkt **ab nächster Sitzung** — nur `/model` wechselt live. `pick` öffnet TUI-lokal den Modell-Picker der Rolle. Details §8.2 | Op | - |
 | `/mode` (aktualisiert) | `[show \| <modus> \| default <modus>]` | Interaktionsmodus (`chat\|plan\|explore\|work\|shell`) anzeigen, für die laufende Sitzung anfordern (wirkt an der nächsten Turn-Grenze) oder als `[mode] default` persistieren (neue Sitzungen). Bare `/mode` öffnet in der TUI die Modus-/Freigabe-Auswahl (F7) | Op | - |
 | `/provider` | `show \| list \| test` | Inspect provider status and credentials only — **`/provider switch` no longer exists**; a provider (and model) switch is exclusively driven by `/model switch <id>` (atomic, works even across providers) | Op | R |
 | `/skills` | `[SkillRef] [--search=text] [--install]` | Browse, search, or install skills | Op (browse), Maint (`--install`) | R |
@@ -781,7 +781,7 @@ levels plus a "Provider-Default (zurücksetzen)" entry that emits `clear`.
 
 ---
 
-## 8. Ist-Stand der Befehlsfläche (2026-09-24, Runde 4)
+## 8. Ist-Stand der Befehlsfläche (2026-09-24, Runde 5)
 
 Dieser Abschnitt beschreibt, was der Code liefert, und hat bei Widerspruch
 Vorrang vor §§1–7. Quellen: `harw-ops/src/lib.rs` (`register_all`,
@@ -831,17 +831,17 @@ Turn; sonst bis Turn-Ende zurückgestellt; Einzelheiten §6.1).
 | `/attach` | — | Op | - | sofort |
 | `/stop` | `[job-id]` | Op | Y | sofort |
 | `/diff` | — | Obs | Y | sofort |
-| `/agent` | `[list \| stop <agent-id> \| budget [agent-id] \| use <name> \| use --clear]`; `use` setzt den Wurzel-Agenten ab der nächsten Sitzung (Profil-`active_agent_definition`) | Op | Y | sofort |
+| `/agent` | `[list \| stop <agent-id> \| budget [agent-id] \| use <name> \| use --clear \| stream <orchestrators\|all\|none> \| bg \| cancel <agent-id>]`; bare öffnet den Agentenbaum mit Live-Werten (Wurzel „UIA · <name>“); `use` setzt den Wurzel-Agenten ab der nächsten Sitzung (Profil-`active_agent_definition`); `stream`, `bg` und `cancel` fängt die TUI lokal ab (Runde 5, siehe unten) | Op | Y | sofort (auch `stream`/`bg`/`cancel`) |
 | `/skills` | `[list \| show <name> \| …]` | Op | R | sofort (bare/`list`/`show`) |
 | `/plugins` | — | Maint | - | sofort (außer `install`/`activate`/`uninstall`) |
 | `/model` | `[show \| list \| switch <modell-id>]` — **live** ab dem nächsten Turn | Op | - | sofort (`show`/`list`), sonst vorgemerkt |
 | `/provider` | `[show \| list \| test]` (kein `switch`) | Op | - | sofort (außer `test`) |
 | `/uia-model` | `[show \| list \| switch <modell-id>]` — ab nächster Sitzung | Op | - | sofort (bare/`show`/`list`), sonst vorgemerkt |
 | `/uia-provider` | `[show \| list \| test]` (kein `switch`) | Op | - | sofort (bare/`show`/`list`), `test` zurückgestellt |
-| `/uia-worker-model` | `[show \| list \| switch <modell-id>]` — ab nächster Sitzung, nur Modelle des UIA-Providers | Op | - | sofort (bare/`show`/`list`), sonst vorgemerkt |
+| `/uia-worker-model` | `[show \| list \| switch <modell-id>]` — alter Familien-Pin `uia_worker_model`, ab nächster Sitzung; seit Runde 5 ohne Kopplung an den UIA-Provider (Provider aus dem Katalog). Je Rolle: `/models worker` | Op | - | sofort (bare/`show`/`list`), sonst vorgemerkt |
 | `/effort` | `[show \| minimal \| low \| medium \| high \| xhigh \| max \| clear]` | Op | - | sofort (bare/`show`), sonst vorgemerkt |
 | `/uia-effort` | wie `/effort`, ab nächster Sitzung | Op | - | sofort (bare/`show`), sonst vorgemerkt |
-| `/permissions` | `[show \| mode <ask\|auto\|full> [--session\|--project\|--global] \| allow <tool> [muster] … \| deny <tool> [muster] … \| remove <nr>]` | Op | - | sofort (bare/`show`/`mode`/`set`) |
+| `/permissions` | `[show \| mode <ask\|auto\|full> [--session\|--project\|--global] \| allow <tool> [muster] [--session\|--project\|--user] \| deny <tool> [muster] [--session\|--project\|--user] \| rules \| remove <nr> \| rm <nr> \| log [anzahl]]`; `--user` ist Alias von `--global`; `rules` listet die Regeln mit Herkunft, `log` die letzten Auto-Modus-Entscheidungen samt Deckelstand; Allow-Regeln für `ALWAYS_ASK_TOOLS` werden abgelehnt | Op | - | sofort (bare/`show`/`mode`/`set`/`rules`/`log`) |
 | `/mode` | `[show \| <modus> \| default <modus>]` | Op | - | sofort (bare/`show`), sonst vorgemerkt |
 | `/compact` | — | Op | Y | |
 | `/memory` | siehe §2.6 | Op | Y | |
@@ -852,7 +852,7 @@ Turn; sonst bis Turn-Ende zurückgestellt; Einzelheiten §6.1).
 | `/dream` | siehe §2.6 | Op | R | geplant sofort (bare/`list`/`show`/`status`), beim Schreiben noch zurückgestellt |
 | `/learn` | siehe §2.6 | Op | R | |
 | `/matrix` | siehe §2.6 | Op | R | sofort (`show`/`list`) |
-| `/models` | `[show \| set <rolle> <ziel> \| reset <rolle>]`; `pick <rolle>` ist TUI-lokal (öffnet den Picker) | Op | - | sofort |
+| `/models` | `[show \| set <rolle> <ziel> \| reset <rolle> \| worker [<rolle\|all> <uia\|ziel>]]`; `pick <rolle>` ist TUI-lokal (öffnet den Picker); `worker` zeigt bzw. setzt die Wahl je UIA-Worker-Rolle (`uia` = wie UIA) | Op | - | sofort |
 | `/context-proposal` | `list \| view \| accept \| reject` | Op | Y | |
 | `/add-workdir` | `<pfad>` | Op | - | |
 | `/export` | `[--format md\|json] [--datei <pfad>] [--tools\|--no-tools] [--reasoning-summary] [--max-chars <n>]` | Op | - | |
@@ -870,8 +870,21 @@ Slash-Befehl.
 **Operationen hinter `[tools.plan] enabled`**: `/plan`, `/goal`, `/explore`,
 `/research`, `/research-deps` (mit `--generic` bzw. `ecosystem=<x>`
 ökosystem-neutral über `dependency-researcher`), `/research-web`, `/analyze`
-(alle Op). `/plan` (bare/`inspect`/`ready`/`waves`) und `/goal`
+(alle Op). `/plan` (bare/`inspect`/`ready`/`waves`/`list`) und `/goal`
 (bare/`show`/`check`) laufen während eines Turns sofort.
+
+`/plan` hat seit Runde 5 zwei Bereiche. Die Plan-**Dateien** des Plan-Modus
+fängt die TUI lokal ab: `/plan` (Plan-Modus an), `/plan show` (aktueller bzw.
+angehefteter Plan), `/plan list` (Pläne unter `.harw/plans`), `/plan open
+<name>` (früheren Plan zum Weiterplanen laden), `/plan edit` (im `$EDITOR`).
+Die Plan-**Graphen** der `plan`-Operation (Teil P): `/plan plans` (alle
+Graphen des Plan-Stores), `/plan switch <id>` (anderen Graphen aktiv machen),
+`/plan archive <id>` (ausblenden, nicht löschen), `/plan inspect [id]`,
+`/plan submit [id]` (öffnet in der TUI das Bestätigungsfenster; erst danach
+ist der Plan verbindlich und an ein Goal gebunden) und `/plan step <id>
+<open|running|done|blocked> [beleg]` (`done` nur mit Beleg). Modellseitig
+heißt die Graphen-Liste `plan list`. Ein bestätigter, gebundener Plan zeigt in
+der Statuszeile „◎ Goal: … · n/m“.
 
 `/models`: `<rolle>` ist ein Schlüssel aus `ModelRole::key`
 (`uia`, `uia-worker`, `orchestrator`, `sub-orchestrator`, `worker-simple`,
@@ -903,10 +916,19 @@ anderen Providers als dem der UIA ab. `reset` entfernt die explizite Wahl
 | `/keys` | Tastenbelegung anzeigen | Obs | sofort |
 | `/whoami` | Sitzung, Berechtigung, aktives Modell | Obs | sofort |
 | `/rename` | `<titel>` | Op | sofort |
-| `/agents` | Agenten-Panel ein-/ausblenden | Obs | sofort |
+| `/btw` | `<frage>` — flüchtige Nebenfrage zum Gespräch ohne Werkzeuge; unterbricht den Agenten nicht, landet weder im Verlauf noch in der Historie; Esc bricht ab, Zeitlimit 60 s | Op | sofort |
+| `/plan` | Plan-Modus an; `show \| list \| open <name> \| edit` (Plan-Dateien, siehe oben); Ersatz-Spezifikation, solange die `plan`-Operation fehlt | Op | sofort (`edit` wartet auf das Terminal) |
+| `/agent stream` | `<orchestrators\|all\|none>` — Live-Stream der Kind-Agenten im Verlauf für diese Sitzung (Vorgabe aus `[tui] child_stream`) | Obs | sofort |
+| `/agent bg` | Hintergrund-Agenten mit Fortschritt auflisten | Obs | sofort |
+| `/agent cancel` | `<agent-id>` — eigenen Hintergrund-Agenten abbrechen | Op | sofort |
 
-Die Ersatz-Spezifikationen (`/mode`, `/matrix`) sind wirkungslos, solange die
-Operationen registriert sind.
+`/agents` gibt es seit Runde 5 nicht mehr; die Eingabe zeigt den Hinweis
+„/agents gibt es nicht mehr – nutze /agent“ und wird nicht weitergeleitet.
+`/btw` gibt es nur in der TUI; Telegram antwortet mit einer klaren Absage.
+
+Die Ersatz-Spezifikationen (`/mode`, `/matrix`, `/plan`) sind wirkungslos, solange die
+Operationen registriert sind; die lokalen `/plan`-Formen für Plan-Dateien
+bleiben davon unberührt.
 
 Bare-Formen öffnen Ansichten statt Text: `/model`, `/uia-model`,
 `/uia-worker-model` → Modell-Picker; `/effort`, `/uia-effort` →
@@ -955,14 +977,18 @@ Umbelegbar über `[tui].keybindings_file` (flache TOML-Tabelle
 | `F9` | Matrix-Game-Panel öffnen (`open_matrix`) |
 | `F11` | Panel im Vollbild (`maximize_panel`) |
 | `Ctrl+E` | Explorer fokussieren (`focus_explorer`) |
-| `Ctrl+O` | Werkzeugzellen auf/zu (`toggle_tool_cells`) |
-| `Ctrl+H` | Host-Arbeitsphase beenden (`end_host_mode`) |
+| `Ctrl+O` | Werkzeugzellen auf/zu (`toggle_tool_cells`), auch während eines Turns |
+| `Ctrl+H` | Host-Arbeitsphase beenden (`end_host_mode`), auch eine prozessweite aus `/sandbox-lease` oder `request_host` |
 | `Ctrl+K` | Eingabezeile löschen (`delete_line`) |
 | `Ctrl+J` | neue Zeile (`insert_newline`) |
-| `Shift+Tab` | Freigabe-Zyklus `ask → auto → full → plan → ask` (`cycle_permission_mode`); nicht bei offenem `/`-Popup |
+| `Shift+Tab` | Freigabe-Zyklus `ask → auto → full → plan → ask` (`cycle_permission_mode`); die Stufe `plan` ist der Plan-Modus (Marke „⏸ plan mode on (shift+tab to cycle)“, Sperre sofort); nicht bei offenem `/`-Popup |
 
 Nicht umbelegbar: `Ctrl+C`/`Ctrl+D`, `Esc`, `Enter` samt `Shift/Alt+Enter`,
-Tasten in Dialogen/Overlays. Die Statuszeile zeigt
+Tasten in Dialogen/Overlays. Das `/`-Popup reagiert seit Runde 5 auch während
+eines Turns auf Hoch/Runter/Tab/Esc/Enter; die Eingabe-Historie enthält auch
+`/`-Befehle (nie `/btw`). Laufen Kind-Agenten, fragt `Esc` im Turn zuerst nach
+(„nochmal Esc zum Bestätigen“); `Enter` reiht während eines Turns ein und
+bricht nie ab. Die Statuszeile zeigt
 `Modus: <modus> · Freigabe: <ask|auto|full>` (Zusatz „(ausstehend)“, solange
 ein Moduswechsel auf die Turn-Grenze wartet) und das aktive Modell.
 

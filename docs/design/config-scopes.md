@@ -101,6 +101,7 @@ Section-Default zurückgesetzt (Bug); **ÜBERNOMMEN** = explizite Ausnahme
 |---|---|---|---|---|
 | `tui.theme` | `String` | `"default-dark"` | `harness_config.rs:292` | ERSETZT |
 | `tui.keybindings_file` | `String` | `"keybindings.toml"` | `harness_config.rs:294` | ERSETZT |
+| `tui.child_stream` | `ChildStreamModeToml` (`orchestrators`/`all`/`none`) | `orchestrators` | `harness_config.rs` (`TuiSection`, Runde 5 Teil I) | `ProfileReplaces` (`merge.rs`) |
 
 ### 1.4 `[session]` (`harness_config.rs:306-343`, Defaults `429-437`)
 
@@ -212,6 +213,7 @@ Section-Default zurückgesetzt (Bug); **ÜBERNOMMEN** = explizite Ausnahme
 | `internal_models.worker_complex` | `Option<InternalModelChoice>` | `None` | `internal_models.rs:176` | ÜBERNOMMEN, feingranular |
 | `internal_models.root_orchestrator` | `Option<InternalModelChoice>` | `None` (→ Hauptmodell, nie OpenRouter-Standard) | `internal_models.rs` | ÜBERNOMMEN, feingranular |
 | `internal_models.sub_orchestrator` | `Option<InternalModelChoice>` | `None` (→ Hauptmodell, nie OpenRouter-Standard) | `internal_models.rs` | ÜBERNOMMEN, feingranular |
+| `internal_models.auto_classifier` | `Option<InternalModelChoice>` | `None` (→ schnelles Modell des aktiven Providers, bei Anthropic `claude-haiku-4-5`; nie OpenRouter-Standard) | `internal_models.rs` (Runde 5 Teil E) | ÜBERNOMMEN, feingranular |
 | `InternalModelChoice.provider`/`.model` (Feld jeder Stelle) | `Option<String>` je | `None` | `internal_models.rs:143-145` | Teil der jeweiligen Stelle, s.o. |
 
 ### 1.14 `[compaction]` (`harness_config.rs:105-117`)
@@ -291,8 +293,91 @@ cooldown_minutes = 60
 # schedule = "0 3 * * *"   # optional, UTC; ersetzt die Leerlauf-Auslösung
 ```
 
-**Gesamtzahl dokumentierter `HarnessConfig`-Felder: 98** (Stand Runde 4:
-92 + `knowledge.diary.retention_days` + fünf `[dream]`-Felder; Blattfelder inkl.
+### 1.19 `[host]` (`harness_config.rs`, `HostToml`, Runde 5 Teil B)
+
+| TOML-Pfad | Typ | Default | Datei:Zeile | Merge heute |
+|---|---|---|---|---|
+| `host.sudo_session_minutes` | `Option<u32>` | `None` → `10` (`DEFAULT_SUDO_SESSION_MINUTES`), gekappt auf `60` (`MAX_SUDO_SESSION_MINUTES`) | `harness_config.rs` | `MinBound`, Scope Global (`merge.rs`, Abschnitt 1.19) — 🔒 |
+
+Wie lange die TUI ein mit „Für diese Sitzung“ eingegebenes sudo-Passwort für
+`host.sudo_exec` im Speicher behält. `0` schaltet das Sitzungs-Merken ab
+(dann gibt es nur „Einmalig“). Jeder Root-Befehl braucht unabhängig davon eine
+eigene Freigabe. Ein Profil kann die Frist nur verkürzen.
+
+```toml
+[host]
+sudo_session_minutes = 10
+```
+
+### 1.20 `[uia_worker_models]` (`uia_worker_models.rs`, Runde 5 Teil G)
+
+| TOML-Pfad | Typ | Default | Datei:Zeile | Merge heute |
+|---|---|---|---|---|
+| `uia_worker_models.uia_worker` | `Option<String>` (`"uia"` oder `"provider/modell"`) | `None` → alter Pin `uia_worker_model`, sonst „wie UIA“ | `uia_worker_models.rs` | `ProfileReplaces` je Rolle |
+| `uia_worker_models.uia_shell_worker` | wie oben | wie oben | `uia_worker_models.rs` | `ProfileReplaces` |
+| `uia_worker_models.uia_writer` | wie oben | wie oben | `uia_worker_models.rs` | `ProfileReplaces` |
+| `uia_worker_models.uia_latex_writer` | wie oben | wie oben | `uia_worker_models.rs` | `ProfileReplaces` |
+| `uia_worker_models.uia_explorer` | wie oben | wie oben | `uia_worker_models.rs` | `ProfileReplaces` |
+
+`"uia"` folgt dem (auch live gewechselten) UIA-Modell; `"provider/modell"`
+ist eine feste Wahl, getrennt am ersten `/`. Eine feste Wahl bleibt nur,
+solange ihr Provider angemeldet ist, sonst Rückfall auf „wie UIA“ mit Hinweis.
+Details: `tui-roles-models-modes.md` §1.1.
+
+### 1.21 `[agents]` (`agent_limits.rs`, `AgentLimitsToml`, Runde 5 Teil K)
+
+| TOML-Pfad | Typ | Default | erlaubt | Merge heute |
+|---|---|---|---|---|
+| `agents.max_root_orchestrators` | `Option<u32>` | `1` | 1–4 | `MinBound` für das nicht vertraute Projekt (`merge_agent_limits`) — 🔒 |
+| `agents.max_sub_orchestrators` | `Option<u32>` | `2` | 1–6 | wie oben — 🔒 |
+| `agents.max_sub_orchestrator_depth` | `Option<u32>` | `2` | 1–3 | wie oben — 🔒 |
+| `agents.max_spawn_depth` | `Option<u32>` | `4` | 1–6 | wie oben — 🔒 |
+
+- `max_root_orchestrators`: gleichzeitig laufende Orchestratoren der
+  UIA-Wurzel (Hintergrund und synchron).
+- `max_sub_orchestrators`: gleichzeitig laufende Sub-Orchestratoren je
+  Root-Orchestrator-Baum.
+- `max_sub_orchestrator_depth`: Verschachtelung der Sub-Orchestratoren
+  (direkt unter dem Root-Orchestrator = 1).
+- `max_spawn_depth`: allgemeine Kind-Tiefe unter der Wurzelsitzung
+  (`ChildLimits::max_depth`).
+
+Ungültige Werte werden in den erlaubten Bereich **geklemmt**, nie abgelehnt.
+Zusätzlich gilt `max_sub_orchestrator_depth + 1 ≤ max_spawn_depth` (die
+Sub-Tiefe wird notfalls gekappt, Warnung im Log). Home und Profil setzen frei,
+auch nach oben; ein nicht vertrautes Projekt darf jede Zahl nur senken, ein
+Erhöhungsversuch wird ignoriert und als `ScopeDiagnostic` gemeldet.
+
+```toml
+[agents]
+max_root_orchestrators = 1
+max_sub_orchestrators = 2
+max_sub_orchestrator_depth = 2
+max_spawn_depth = 4
+```
+
+### 1.22 `[shell]` (`shell_limits.rs`, `ShellToml`, Runde 5 Teil N)
+
+| TOML-Pfad | Typ | Default | erlaubt | Merge heute |
+|---|---|---|---|---|
+| `shell.max_timeout_secs` | `Option<u64>` | `900` | 30–3600 | `MinBound` für das nicht vertraute Projekt (`merge_shell_limits`) — 🔒 |
+
+Obergrenze für `timeout_secs` eines `shell.exec`-Aufrufs (Sandbox, Host und
+Host-Mode-Anfrage). Ohne `timeout_secs` gilt weiter 30 s, für Build- und
+Testbefehle (`cargo`, `make`, `npm`, `pytest`, `go`, …) 600 s, beides durch
+`max_timeout_secs` gedeckelt. Das CPU-Limit des Prozesses skaliert mit dem
+Zeitlimit. Merge-Verhalten wie `[agents]`.
+
+```toml
+[shell]
+max_timeout_secs = 900
+```
+
+**Gesamtzahl dokumentierter `HarnessConfig`-Felder: 111** (Stand Runde 5:
+98 aus Runde 4 + `host.sudo_session_minutes` + `internal_models.auto_classifier`
++ fünf `uia_worker_models.*` + `tui.child_stream` + vier `agents.*` +
+`shell.max_timeout_secs`; entspricht `FIELD_TABLE` in
+`harw-config/src/scope.rs`). Stand Runde 4: **98** (92 + `knowledge.diary.retention_days` + fünf `[dream]`-Felder; Blattfelder inkl.
 verschachtelter Typen wie `McpPrincipalToml`, `RuleToml`,
 `CargoSandboxToml`/`TmuxSandboxToml`, `InternalModelChoice`,
 `OnboardingSeen`; dazu `base_dir` als zusätzliche Tabellenzeile in Abschnitt 1.1,
@@ -348,6 +433,7 @@ Gruppierung hier fasst strukturgleiche Unterfelder weiterhin zusammen).
 | `logging.json` | PROFIL | letzter gesetzter Wert gewinnt | s.o. | |
 | `tui.theme` | PROFIL | letzter gesetzter Wert gewinnt | Reine UI-Präferenz. | |
 | `tui.keybindings_file` | PROFIL | letzter gesetzter Wert gewinnt | s.o. | |
+| `tui.child_stream` | PROFIL | `ProfileReplaces` | Rein darstellend (Live-Stream der Kind-Agenten), keine Beschränkung. | |
 | `session.store_dir` | PROFIL | letzter gesetzter Wert gewinnt | Ablagepfad ist Profil-lokal. | |
 | `session.journal_format` | PROFIL | letzter gesetzter Wert gewinnt | Reines Format. | |
 | `session.retention_days` | **GLOBAL als Obergrenze (Minimum)** (entschieden 2026-09-21) | `MinBound` | Admin erzwingt eine Höchst-Aufbewahrung als Compliance-Leitplanke; das Profil darf nur kürzer aufbewahren, nie länger als global erlaubt. | |
@@ -382,7 +468,7 @@ Gruppierung hier fasst strukturgleiche Unterfelder weiterhin zusammen).
 | `permissions.extra_roots` | **GLOBAL, Schnittmenge** (entschieden 2026-09-21) | `Intersection` | Erweitert erlaubte Arbeitswurzeln — analog zu `permissions.allow` eine potenzielle Rechteausweitung; dieselbe Schnittmengen-Logik: ein Profil kann nur eine Teilmenge der global gesetzten Wurzeln referenzieren, nichts Neues öffnen. | 🔒 |
 | `sandbox.cargo.*` | GLOBAL exklusiv | Profil darf nicht setzen/überschreiben | Vertrauensanker für die Cargo-Sandbox; Moduldoku (`harness_config.rs:70-74`) verlangt ausdrücklich, dass diese Werte nur beim Runtime-Aufbau aus der (vertrauten) Konfiguration gelesen werden. Direkte Analogie zu `browser.geckodriver_path`/`geckodriver_sha256` und `dod.proof_key_dir`, die bereits nie aus einem Repo-Layer übernommen werden (`browser_toml.rs:18-25`, `dod_toml.rs:22-31`). | 🔒 |
 | `sandbox.tmux.*` | GLOBAL exklusiv | Profil darf nicht setzen/überschreiben | s.o. | 🔒 |
-| `internal_models.*` (alle 11 Felder) | PROFIL | letzter gesetzter Wert gewinnt (bereits korrekt implementiert) | Modell-Routing für Hilfsaufgaben ist Nutzerpräferenz/Kostensteuerung, keine Zugriffsbeschränkung. | |
+| `internal_models.*` (alle 12 Felder, seit Runde 5 inkl. `auto_classifier`) | PROFIL | letzter gesetzter Wert gewinnt (bereits korrekt implementiert) | Modell-Routing für Hilfsaufgaben ist Nutzerpräferenz/Kostensteuerung, keine Zugriffsbeschränkung. | |
 | `compaction.absolute_ceiling_tokens` | **GLOBAL als Obergrenze (Minimum)** (entschieden 2026-09-21) | `MinBound` | Admin erzwingt eine Kostenobergrenze; das Profil darf nur senken, nie über die globale Grenze hinausgehen. | |
 | `reasoning.*` (alle 6 Felder) | PROFIL | letzter gesetzter Wert gewinnt | Reasoning-Effort ist ein Kosten-/Geschwindigkeits-Kompromiss, keine Zugriffsbeschränkung. | |
 | `guards.enabled` | GLOBAL (Baseline) + Profil darf nur verschärfen | **OR** (Wert `true` gewinnt) | Sicherheits-/Stabilitäts-Wächter; Abschalten wäre eine Lockerung, analog `tools.plan.validate_*`. | |
@@ -391,6 +477,10 @@ Gruppierung hier fasst strukturgleiche Unterfelder weiterhin zusammen).
 | `guards.no_progress_rounds_warn` | GLOBAL (Baseline) + Profil darf nur verengen | **Minimum** | s.o. | |
 | `guards.no_progress_rounds_abort` | GLOBAL (Baseline) + Profil darf nur verengen | **Minimum** | s.o. | |
 | `guards.plan_stale_rounds` | GLOBAL (Baseline) + Profil darf nur verengen | **Minimum** | s.o. | |
+| `host.sudo_session_minutes` | **GLOBAL als Obergrenze (Minimum)** (Runde 5) | `MinBound` | Merkfrist eines Root-Passworts; ein Profil darf sie nur verkürzen. | 🔒 |
+| `uia_worker_models.*` (5 Felder) | PROFIL (Runde 5) | `ProfileReplaces` | Modellwahl je UIA-Worker-Rolle ist Nutzerpräferenz wie `uia_worker_model`. | |
+| `agents.*` (4 Felder) | PROFIL, nicht vertrautes Projekt nur senken (Runde 5) | `MinBound` | Kosten- und Ausuferungsgrenze der Orchestrierung; Home und Profil setzen frei, auch nach oben. | 🔒 |
+| `shell.max_timeout_secs` | PROFIL, nicht vertrautes Projekt nur senken (Runde 5) | `MinBound` | Ressourcengrenze für Shell-Befehle; wie `agents.*`. | 🔒 |
 
 ---
 
@@ -656,7 +746,7 @@ festgelegt**, da sie im heutigen Code an keiner Stelle kodiert sind:
   dritter Wert nie stillschweigend in die Ordnung einsortiert wird;
   abgesichert durch Test #24 (Abschnitt 7h).
 
-### 6.3 Vollständige Feld-für-Feld-Zuordnung (alle 98 Felder, Stand Runde 4)
+### 6.3 Vollständige Feld-für-Feld-Zuordnung (alle 111 Felder, Stand Runde 5)
 
 Eine Zeile je Blattfeld aus Abschnitt 1, in derselben Reihenfolge und mit
 denselben Unterabschnittsnummern, damit die Tabelle 1:1 gegen Abschnitt 1
@@ -682,8 +772,8 @@ Variante.
 **1.2 `[logging]`** (3): `logging.level`, `logging.target_module_paths`,
 `logging.json` — alle Profile / `ProfileReplaces`.
 
-**1.3 `[tui]`** (2): `tui.theme`, `tui.keybindings_file` — alle Profile /
-`ProfileReplaces`.
+**1.3 `[tui]`** (3): `tui.theme`, `tui.keybindings_file`, `tui.child_stream`
+(Runde 5) — alle Profile / `ProfileReplaces`.
 
 **1.4 `[session]`** (5 Felder)
 
@@ -768,7 +858,7 @@ Variante.
 `sandbox.cargo.rustup_home`, `sandbox.cargo.cargo_home`, `sandbox.tmux`,
 `sandbox.tmux.mode`, `sandbox.tmux.socket_path`.
 
-**1.13 `[internal_models]`** (12 Felder)
+**1.13 `[internal_models]`** (13 Felder, seit Runde 5 mit `auto_classifier`)
 
 | Pfad | Scope | Regel |
 |---|---|---|
@@ -783,6 +873,7 @@ Variante.
 | `internal_models.worker_complex` | Profile | `ProfileReplaces` |
 | `internal_models.root_orchestrator` | Profile | `ProfileReplaces` |
 | `internal_models.sub_orchestrator` | Profile | `ProfileReplaces` |
+| `internal_models.auto_classifier` | Profile | `ProfileReplaces` (Runde 5) |
 | `InternalModelChoice.provider`/`.model` (Feld jeder Stelle) | — | `CompositeMember` (reist als Teil der atomaren `Option<InternalModelChoice>` der jeweiligen Stelle, s. o.; nie einzeln gemergt) |
 
 **1.14 `[compaction]`** (2): `compaction.absolute_ceiling_tokens` — Global /
@@ -809,6 +900,30 @@ Variante.
 **1.18 `[dream]`** (5): `dream.enabled`, `.budget`, `.idle_minutes`,
 `.cooldown_minutes`, `.schedule` — alle Profil / `ProfileReplaces`, keines
 sicherheitskritisch (`scope.rs`, `FIELD_TABLE`).
+
+**1.19 `[host]`** (1): `host.sudo_session_minutes` — Global / `MinBound`,
+sicherheitskritisch.
+
+**1.20 `[uia_worker_models]`** (5): `uia_worker_models.uia_worker`,
+`.uia_shell_worker`, `.uia_writer`, `.uia_latex_writer`, `.uia_explorer` —
+alle Profil / `ProfileReplaces`.
+
+**1.21 `[agents]`** (4): `agents.max_root_orchestrators`,
+`.max_sub_orchestrators`, `.max_sub_orchestrator_depth`, `.max_spawn_depth` —
+alle Profil / `MinBound`, sicherheitskritisch.
+
+**1.22 `[shell]`** (1): `shell.max_timeout_secs` — Profil / `MinBound`,
+sicherheitskritisch.
+
+**Nachtrag Runde 5 (Kontrollsumme = 111):** Neu sind 13 Felder:
+`tui.child_stream`, `internal_models.auto_classifier` und die fünf
+`uia_worker_models.*` (alle `ProfileReplaces`, damit 57) sowie
+`host.sudo_session_minutes`, die vier `agents.*` und `shell.max_timeout_secs`
+(alle `MinBound`, damit 18). Verteilung: `ProfileReplaces` 57 · `GlobalOnly` 11 ·
+`MinBound` 18 · `CompositeMember` 11 · `Intersection` 4 · `OrBool` 3 ·
+`Union` 2 · `AndBool` 2 · `StricterOf` 2 · `PerFileValidated` 1 (abgesichert
+durch `test_merge_rule_variant_control_sum_matches_abschnitt_6_3` in
+`scope.rs`).
 
 **Nachtrag Runde 4 (Kontrollsumme = 98):** Die sechs neuen Felder aus 1.17
 und 1.18 sind alle `ProfileReplaces`; damit `ProfileReplaces` 50, alle

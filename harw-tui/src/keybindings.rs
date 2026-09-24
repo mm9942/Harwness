@@ -154,7 +154,8 @@ impl KeyAction {
             Self::EndHostMode => "Host-Arbeitsphase beenden",
             Self::DeleteLine => "Eingabezeile löschen",
             Self::InsertNewline => "Neue Zeile in der Eingabe",
-            Self::CyclePermissionMode => "Freigabemodus wechseln",
+            // Runde 5, Teil F: die vierte Stufe ist der Plan-Modus.
+            Self::CyclePermissionMode => "Freigabe wechseln: ask → auto → full → plan",
             Self::ToggleWorkbench => "Workbench ein-/ausblenden",
             Self::OpenKanban => "Kanban-Board öffnen",
             Self::OpenModePicker => "Modus und Freigabe wählen",

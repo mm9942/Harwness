@@ -1,0 +1,12 @@
+# Gepinnte Rust-Toolchain für lokale Builds und die CI.
+#
+# rustup liest diese Datei im Repo-Wurzelverzeichnis und in jedem
+# Unterordner (auch im eigenständigen `dod/`-Workspace, der deshalb keine
+# eigene Datei braucht). Lokal und in der CI prüfen damit dieselbe Compiler-,
+# rustfmt- und clippy-Version. Updates kommen bewusst über Dependabot
+# (Ökosystem `rust-toolchain`, siehe `.github/dependabot.yml`).
+# Die MSRV in `Cargo.toml` (`rust-version`) bleibt davon unberührt.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

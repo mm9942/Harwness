@@ -77,10 +77,31 @@ pub const WORKBENCH_CONTEXT_NAMESPACE: &str = "workbench";
 /// Notizzeilen, die `workbench.show` aus dem Tail zeigt.
 const SHOW_NOTES_LINES: usize = 12;
 
+/// Meldet einen erfolgreichen Schreibvorgang der Modell-Werkzeuge
+/// (Runde 5, Teil C): `(session_id, scope)`, wobei `scope` die
+/// Pfadkomponente des Workbench-Scopes ist (`session:<id>`).
+///
+/// # Beschreibung
+/// Die Montage hängt hier `AgentEventHub::publish_knowledge(session,
+/// "workbench", Some(scope))` ein, damit eine offene `/workbench`-Ansicht
+/// sofort neu lädt. Als Rückruf statt als `AgentEventHub`, weil
+/// `harw-registry-defaults` nicht von `harw-core` abhängt.
+pub type WorkbenchChangeNotifier = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
 /// Die Workbench-Modell-Werkzeuge über einem geteilten Wissensspeicher.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WorkbenchToolProvider {
     store: Arc<KnowledgeStore>,
+    notifier: Option<WorkbenchChangeNotifier>,
+}
+
+impl std::fmt::Debug for WorkbenchToolProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkbenchToolProvider")
+            .field("store", &self.store.root())
+            .field("notifier", &self.notifier.is_some())
+            .finish()
+    }
 }
 
 impl WorkbenchToolProvider {
@@ -101,7 +122,20 @@ impl WorkbenchToolProvider {
     ///   `RuntimeServices::knowledge_store` auf Slash/Modell-Werkzeug legt.
     #[must_use]
     pub fn new(store: Arc<KnowledgeStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            notifier: None,
+        }
+    }
+
+    /// Hängt den Live-Update-Rückruf an (Runde 5, Teil C): nach jedem
+    /// erfolgreichen `workbench.note`/`workbench.hypothesis` wird er mit
+    /// Sitzungs-Id und Scope aufgerufen; fehlgeschlagene Aufrufe melden
+    /// nichts.
+    #[must_use]
+    pub fn with_change_notifier(mut self, notifier: WorkbenchChangeNotifier) -> Self {
+        self.notifier = Some(notifier);
+        self
     }
 }
 
@@ -119,6 +153,7 @@ impl ToolProvider for WorkbenchToolProvider {
         Some(Arc::new(WorkbenchExecutor {
             store: Arc::clone(&self.store),
             tool,
+            notifier: self.notifier.clone(),
         }))
     }
 }
@@ -198,6 +233,7 @@ enum WorkbenchTool {
 struct WorkbenchExecutor {
     store: Arc<KnowledgeStore>,
     tool: WorkbenchTool,
+    notifier: Option<WorkbenchChangeNotifier>,
 }
 
 impl ToolExecutor for WorkbenchExecutor {
@@ -210,12 +246,15 @@ impl ToolExecutor for WorkbenchExecutor {
         let arguments = call.arguments.clone();
         Box::pin(async move {
             let now = jiff::Timestamp::now();
-            Ok(match self.tool {
+            let output = match self.tool {
                 WorkbenchTool::Note => execute_note(&self.store, &session_id, arguments, now),
                 WorkbenchTool::Hypothesis => {
                     execute_hypothesis(&self.store, &session_id, arguments, now)
                 }
-            })
+            };
+            // Runde 5, Teil C: Live-Update nur nach erfolgreichem Schreiben.
+            notify_change(self.notifier.as_ref(), &session_id, &output);
+            Ok(output)
         })
     }
 }
@@ -231,6 +270,23 @@ struct NoteArgs {
 struct HypothesisArgs {
     action: String,
     text: String,
+}
+
+/// Ruft `notifier` nach einem erfolgreichen Werkzeugaufruf mit dem
+/// Sitzungs-Scope auf (Runde 5, Teil C); Fehler melden nichts.
+fn notify_change(
+    notifier: Option<&WorkbenchChangeNotifier>,
+    session_id: &str,
+    output: &ToolOutput,
+) {
+    let Some(notifier) = notifier else {
+        return;
+    };
+    if matches!(output, ToolOutput::Error { .. }) {
+        return;
+    }
+    let scope = WorkbenchScope::Session(session_id.to_owned());
+    notifier(session_id, &scope.path_component());
 }
 
 /// Der Autor, unter dem das Modell in seine Sitzungs-Workbench schreibt.
@@ -551,6 +607,56 @@ mod tests {
 
     fn is_error(output: &ToolOutput) -> bool {
         matches!(output, ToolOutput::Error { .. })
+    }
+
+    /// Runde 5, Teil C: nur erfolgreiche Schreibvorgänge melden sich mit
+    /// Sitzung und Scope; ohne Rückruf passiert nichts.
+    #[test]
+    fn change_notifier_fires_only_after_successful_writes() -> TestResult {
+        let store = temporary_store("notify")?;
+        let seen: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        let notifier: WorkbenchChangeNotifier = Arc::new(move |session: &str, scope: &str| {
+            if let Ok(mut seen) = sink.lock() {
+                seen.push((session.to_owned(), scope.to_owned()));
+            }
+        });
+        let provider = WorkbenchToolProvider::new(Arc::clone(&store))
+            .with_change_notifier(Arc::clone(&notifier));
+        assert!(format!("{provider:?}").contains("notifier: true"));
+
+        let now = jiff::Timestamp::now();
+        let ok = execute_note(
+            &store,
+            "s-7",
+            serde_json::json!({"text": "Zwischenstand"}),
+            now,
+        );
+        assert!(!is_error(&ok));
+        notify_change(Some(&notifier), "s-7", &ok);
+        let failed = execute_note(&store, "s-7", serde_json::json!({"nope": 1}), now);
+        assert!(is_error(&failed));
+        notify_change(Some(&notifier), "s-7", &failed);
+        let added = execute_hypothesis(
+            &store,
+            "s-7",
+            serde_json::json!({"action": "add", "text": "Cache ist schuld"}),
+            now,
+        );
+        notify_change(Some(&notifier), "s-7", &added);
+        notify_change(None, "s-7", &added);
+
+        let scope = WorkbenchScope::Session("s-7".to_owned()).path_component();
+        let seen = seen
+            .lock()
+            .map_err(|_| TestError::Unexpected("notifier lock poisoned".to_owned()))?
+            .clone();
+        assert_eq!(
+            seen,
+            vec![("s-7".to_owned(), scope.clone()), ("s-7".to_owned(), scope),]
+        );
+        std::fs::remove_dir_all(store.root()).ok();
+        Ok(())
     }
 
     #[test]

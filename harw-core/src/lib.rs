@@ -14,9 +14,19 @@ pub mod activation;
 pub mod admission;
 pub mod agent_events;
 pub mod auto_compact;
+// Runde 5, Teil K: Hintergrund-Kinder und Orchestrierungsgrenzen.
+pub mod background_children;
 pub mod cancel;
 pub mod capture;
+// Runde 5, Teil O: Freigabe-Fragen von Kindern an die Nutzerin.
+pub mod child_approval;
+// Runde 5, Teil M: Aktivitätsjournal, Endbericht und Eltern-Kind-Nachrichten.
+pub mod child_comms;
 pub mod child_controller;
+// Runde 5, Teil J: Übergabe-Verdichtung am Budget-Ende eines Kindes.
+pub mod child_handoff;
+// Runde 5, Teil O: Lease-Herzschlag laufender Kinder.
+pub mod child_lease_heartbeat;
 pub mod compaction;
 pub mod context_budget;
 pub mod delegation_visibility;
@@ -53,12 +63,24 @@ pub use auto_compact::{
     AutoCompactPolicy, CompactDecision, DEFAULT_ABSOLUTE_CEILING_TOKENS,
     DEFAULT_ORCHESTRATOR_TURN_START_TARGET_TOKENS,
 };
+// Runde 5, Teil K.
+pub use background_children::{
+    BackgroundChildren, BackgroundNotice, BackgroundProgress, BackgroundRun, BackgroundStatus,
+    ORCHESTRATION_LIMIT_MARKER, OrchestrationLimits, is_orchestration_limit_rejection,
+};
 pub use capture::{ToolOutcome, ToolOutcomeObserver, ToolOutcomeStatus};
+// Runde 5, Teil M.
+pub use child_comms::{
+    AGENT_MESSAGE_TOOL, CHILD_END_MARKER, ChildComms, ChildEndCause, ChildEndHeader,
+    ChildEndReport, ChildEndStatus, ChildJournal, MessageDelivery, PARENT_MESSAGE_TOOL,
+    ParentMessage, ParentMessageKind, child_end_label, parse_child_end,
+};
 pub use child_controller::{
     AgentBudget, BudgetDimension, ChildContextOverload, ChildLimits, ChildRecord,
-    ChildRegistryFactory, ChildRunError, ChildRunResult, ChildUsage, ContextWindowResolver,
-    DEFAULT_CHILD_CONTEXT_WINDOW, ExpiredChild, FanoutRequest, JoinSemantics, ManagedAgentSpawner,
-    ModelKnownProbe, OrchestrationObserver, ParentGrant, RoleEffortWeights, TaskComplexity,
+    ChildRegistryFactory, ChildRunError, ChildRunResult, ChildSessionObservers, ChildUsage,
+    ContextWindowResolver, DEFAULT_CHILD_CONTEXT_WINDOW, ExpiredChild, FanoutRequest,
+    JoinSemantics, ManagedAgentSpawner, ModelKnownProbe, OrchestrationObserver, ParentGrant,
+    RoleEffortWeights, TaskComplexity,
 };
 pub use compaction::{
     CompactionObserver, CompactionOutcome, CompactionPlan, SUMMARY_MARKER, compact_session,

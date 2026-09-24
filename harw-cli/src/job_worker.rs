@@ -4085,7 +4085,7 @@ mod tests {
             tools.iter().any(|tool| tool == "fs.read"),
             "tools: {tools:?}"
         );
-        for forbidden in ["fs.write", "shell.exec"] {
+        for forbidden in ["fs.write", "fs.edit", "shell.exec"] {
             assert!(
                 !tools.iter().any(|tool| tool == forbidden),
                 "a research node must not see '{forbidden}': {tools:?}"

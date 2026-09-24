@@ -47,9 +47,12 @@
 //! 5. Bei `dry_run` endet die Operation hier und gibt den Plan **samt Batches**
 //!    aus.
 //! 6. Sonst je Batch ein [`fanout_children`]-Lauf mit der Rolle
-//!    [`role_names::ANALYST`]; Findings werden abgelegt, als Evidenz angehängt
-//!    und die Knoten auf `Completed` gefahren. Nach jeder Welle läuft
-//!    [`PlanController::reconcile`]; seine Vorschläge gehen in die Ausgabe.
+//!    [`role_names::ANALYST`] (aus einer UIA-Sitzung
+//!    [`role_names::UIA_EXPLORER`], siehe [`analyst_role_for`]); Findings
+//!    werden abgelegt, als Evidenz angehängt und die Knoten auf `Completed`
+//!    gefahren. Nach jeder Welle läuft [`PlanController::reconcile`]; seine
+//!    Vorschläge gehen in die Ausgabe. Der Bericht trägt `status`/`notice`
+//!    ([`completion_status`]).
 //! 7. Zum Schluss ein `Synthesis`-Knoten, der von allen Analyse-Knoten abhängt.
 //!
 //! # Zell-gesteuerter Fan-out
@@ -127,9 +130,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use harw_agent_dsl::roles::AgentRoleId;
 use harw_code_graph::WorkspaceGraph;
 use harw_core::child_controller::JoinSemantics;
-use harw_core_bridge::{ChildReturnContract, fanout_children, parse_budget_hint};
+use harw_core_bridge::{ChildReturnContract, OpContextCoreExt, fanout_children, parse_budget_hint};
 use harw_explorer::{ExplorerIndex, ExplorerOptions, ProjectKind, RelationKind};
 use harw_macros::operation;
 use harw_operations::require_service;
@@ -160,6 +164,11 @@ use crate::explore::{READ_ONLY_REDUCER, child_payload, finding_from_value, persi
 /// Grammatik siehe [`parse_budget_hint`]. Großzügiger als der Einzel-Lauf in
 /// [`crate::explore`], weil ein Analyst eine ganze Einheit lesen muss.
 const ANALYST_BUDGET: &str = "90k_tokens,60_tool_calls,300s";
+
+/// Kennzeichen der Spawn-Ablehnung aus `ManagedAgentSpawner::admit`
+/// (`harw-core/src/child_controller.rs`): die aufrufende Sitzung darf die
+/// Kind-Rolle laut Spawn-Matrix nicht starten.
+const NO_DELEGATION_MARKER: &str = "no delegation capability";
 
 /// Vorgabe für die Zahl gleichzeitiger Kinder je Welle.
 const DEFAULT_MAX_PARALLEL: usize = 4;
@@ -1336,6 +1345,17 @@ fn ensure_plan(plan: &dyn PlanStore) -> Result<(), OpError> {
     if plan.current().is_ok() {
         return Ok(());
     }
+    // Runde 5, Teil P: der Store hält mehrere Pläne. Ist kein Plan aktiv
+    // (etwa nach `plan archive`), aber `plan-analyze` liegt schon im Store,
+    // wird er wieder aktiv statt an `PlanExists` zu scheitern.
+    let analysis_id = PlanId::new(ANALYSIS_PLAN_ID);
+    if plan.plan_by_id(&analysis_id).is_ok() {
+        plan.switch_plan(&analysis_id, ACTOR_ANALYZE)
+            .map_err(|error| {
+                OpError::Execution(format!("Plan konnte nicht aktiviert werden: {error}"))
+            })?;
+        return Ok(());
+    }
     plan.apply(
         PlanAction::Create {
             plan_id: PlanId::new(ANALYSIS_PLAN_ID),
@@ -1896,6 +1916,13 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
 
     // ── Wellen fahren ────────────────────────────────────────────────────────
     let budget = parse_budget_hint(ANALYST_BUDGET)?;
+    // Dieselbe Rollenwahl wie `/explore` und `/research*`: eine UIA-Wurzel
+    // darf den `Worker` `analyst` nie starten (Spawn-Matrix), siehe
+    // [`analyst_role_for`].
+    let child_role = analyst_role_for(
+        ctx.managed_spawner()
+            .and_then(|spawner| spawner.session_organizational_role(ctx.session_id())),
+    );
     let mut wave_order: Vec<&WavePlan<'_>> = waves.iter().collect();
     if !bottom_up {
         wave_order.reverse();
@@ -1938,7 +1965,7 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
 
             let results = fanout_children(
                 ctx,
-                role_names::ANALYST,
+                child_role,
                 &questions,
                 READ_ONLY_REDUCER,
                 budget,
@@ -1997,7 +2024,11 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
     open_questions.sort();
     open_questions.dedup();
 
+    let (status, notice) = completion_status(unit_count, completed.len(), &failures);
     let report = json!({
+        "status": status,
+        "notice": notice,
+        "child_role": child_role,
         "dry_run": false,
         "root": root.display().to_string(),
         "bottom_up": bottom_up,
@@ -2017,6 +2048,94 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
         "synthesis": { "id": SYNTHESIS_NODE_ID, "created": synthesis_created },
     });
     render(&report)
+}
+
+/// Wählt die Kind-Rolle der Analyse-Wellen passend zur aufrufenden Sitzung.
+///
+/// # Beschreibung
+/// `analyst` trägt `role = "worker"`. Die Spawn-Matrix
+/// (`harw-agent-dsl/src/roles.rs::can_spawn`) lässt eine UIA-Sitzung
+/// (`AgentRoleId::UserInterface`, die TUI-Wurzel im Modus `chat`) nie einen
+/// `Worker` starten — `analyze` scheiterte dort an jedem Kind mit „no
+/// delegation capability is available for this request“, obwohl derselbe
+/// Turn `root-orchestrator` spawnen durfte. Wie `/explore` und `/research*`
+/// weicht `/analyze` deshalb für UIA-Aufrufer auf
+/// [`role_names::UIA_EXPLORER`] aus (`AgentRoleId::UiaWorker`, von der UIA
+/// bereits spawnbar, read-only Datei-Werkzeuge). Die Rechte bleiben dabei
+/// unverändert: die Kind-Sandbox wird weiterhin über
+/// [`READ_ONLY_REDUCER`] aus der Eltern-Sandbox verengt (kein Netz, kein
+/// Schreiben, keine Ausführung), und die `uia-worker`-Familie läuft höchstens
+/// mit einer gleichzeitigen Instanz. Alle anderen Aufrufer (oder eine nicht
+/// ermittelbare Rolle) behalten [`role_names::ANALYST`].
+///
+/// # Argumente
+/// - `caller` (`Option<AgentRoleId>`): Organisationsrolle der aufrufenden
+///   Sitzung laut Spawner.
+///
+/// # Rückgabe
+/// Der Registry-Name der Kind-Rolle.
+fn analyst_role_for(caller: Option<AgentRoleId>) -> &'static str {
+    match caller {
+        Some(AgentRoleId::UserInterface) => role_names::UIA_EXPLORER,
+        _ => role_names::ANALYST,
+    }
+}
+
+/// Bewertet, ob der Analyse-Bericht vollständig ist.
+///
+/// # Beschreibung
+/// Ohne diese Kennzeichnung sah ein Bericht, in dem **jedes** Kind gescheitert
+/// war, genauso aus wie ein erfolgreicher: Wellen, Ebenen und Plan-Knoten
+/// stehen immer darin, weil sie vor dem Fan-out entstehen. Das Modell hielt
+/// ihn für ein „Prototype-Ergebnis“. Jetzt trägt der Bericht `status`
+/// (`complete`, `partial`, `incomplete`) und bei Lücken einen `notice`, der
+/// ausdrücklich sagt, dass Wellen/Ebenen nur der Plan sind — und bei einer
+/// Spawn-Ablehnung, warum sie kam und was stattdessen geht.
+///
+/// # Argumente
+/// - `units` (`usize`): Zahl der geplanten Einheiten.
+/// - `completed` (`usize`): Zahl der abgeschlossenen Einheiten.
+/// - `failures` (`&[Value]`): Fehlschläge je Knoten (`{"node", "error"}`).
+///
+/// # Rückgabe
+/// `(status, notice)`; `notice` ist `None` genau bei `complete`.
+fn completion_status(
+    units: usize,
+    completed: usize,
+    failures: &[Value],
+) -> (&'static str, Option<String>) {
+    if failures.is_empty() && completed >= units {
+        return ("complete", None);
+    }
+    let status = if completed == 0 {
+        "incomplete"
+    } else {
+        "partial"
+    };
+    let mut notice = format!(
+        "UNVOLLSTÄNDIG: nur {completed} von {units} Einheiten wurden analysiert, \
+         {} Kind-Läufe sind gescheitert (siehe `failures`). `waves`/`levels` \
+         zeigen nur den geplanten Aufbau, keine Analyseergebnisse — den Bericht \
+         nicht als fertige Analyse ausgeben.",
+        failures.len()
+    );
+    let delegation_denied = failures.iter().any(|failure| {
+        failure
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| error.contains(NO_DELEGATION_MARKER))
+    });
+    if delegation_denied {
+        notice.push_str(
+            " Grund: diese Sitzung darf die Analyse-Kindrolle laut Spawn-Matrix \
+             nicht starten (z. B. ein Kind-Agent ohne Delegationsrecht). \
+             Stattdessen: die Einheiten mit den lesenden `fs.*`-Werkzeugen \
+             selbst prüfen oder die Analyse von einer Sitzung mit \
+             Delegationsrecht (UIA-Wurzel oder `root-orchestrator`) ausführen \
+             lassen.",
+        );
+    }
+    (status, Some(notice))
 }
 
 /// Serialisiert einen Bericht als [`OpOutput`].
@@ -3165,5 +3284,65 @@ mod tests {
                 .map_err(ctx("unit_name muss gelten"))?;
         assert_eq!(neutral.unit_name(), Some("web"));
         Ok(())
+    }
+}
+
+/// Regressionstests zum Bugreport „analyze: no delegation capability“ (Runde 5).
+#[cfg(test)]
+mod delegation_tests {
+    use super::{analyst_role_for, completion_status};
+    use harw_agent_dsl::roles::AgentRoleId;
+    use harw_registry_defaults::profile::role_names;
+    use serde_json::json;
+
+    #[test]
+    fn test_uia_caller_gets_the_uia_spawnable_analysis_role() {
+        // Die UIA darf `analyst` (`role = "worker"`) nie spawnen; die
+        // Ausweichrolle muss eine sein, die die Spawn-Matrix ihr erlaubt.
+        assert_eq!(
+            analyst_role_for(Some(AgentRoleId::UserInterface)),
+            role_names::UIA_EXPLORER
+        );
+    }
+
+    #[test]
+    fn test_other_callers_keep_the_analyst_role() {
+        for caller in [
+            None,
+            Some(AgentRoleId::RootOrchestrator),
+            Some(AgentRoleId::ChildOrchestrator),
+            Some(AgentRoleId::Worker),
+        ] {
+            assert_eq!(analyst_role_for(caller), role_names::ANALYST, "{caller:?}");
+        }
+    }
+
+    #[test]
+    fn test_complete_report_has_no_notice() {
+        assert_eq!(completion_status(2, 2, &[]), ("complete", None));
+    }
+
+    #[test]
+    fn test_report_without_any_finding_is_marked_incomplete() {
+        let failures = vec![json!({ "node": "research-a", "error": "Budget erschöpft" })];
+        let (status, notice) = completion_status(1, 0, &failures);
+        assert_eq!(status, "incomplete");
+        let notice = notice.unwrap_or_default();
+        assert!(notice.starts_with("UNVOLLSTÄNDIG"), "{notice}");
+        assert!(notice.contains("keine Analyseergebnisse"), "{notice}");
+        assert!(!notice.contains("Spawn-Matrix"), "{notice}");
+    }
+
+    #[test]
+    fn test_partial_report_names_the_delegation_denial_and_the_alternative() {
+        let failures = vec![json!({
+            "node": "research-b",
+            "error": "Agent-Spawn fehlgeschlagen: no delegation capability is available for this request",
+        })];
+        let (status, notice) = completion_status(2, 1, &failures);
+        assert_eq!(status, "partial");
+        let notice = notice.unwrap_or_default();
+        assert!(notice.contains("Spawn-Matrix"), "{notice}");
+        assert!(notice.contains("root-orchestrator"), "{notice}");
     }
 }

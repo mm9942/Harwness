@@ -360,6 +360,11 @@ fn test_profile_by_permission_matrix_never_registers_ungranted_tools() -> TestRe
                 "{profile:?}: fs.write"
             );
             assert_eq!(
+                has("fs.edit"),
+                has("fs.write"),
+                "{profile:?}: fs.edit genau dort, wo fs.write sichtbar ist"
+            );
+            assert_eq!(
                 has("shell.exec"),
                 may_exec && granted.contains(Permission::ExecuteProcess),
                 "{profile:?}: shell.exec"
@@ -476,6 +481,7 @@ fn test_role_by_permission_matrix_after_reducer() {
                     && child.contains(Permission::NetworkAccess);
                 assert!(
                     *tool != "fs.write"
+                        && *tool != "fs.edit"
                         && *tool != "shell.exec"
                         && *tool != "latex.build"
                         && (is_uia_worker_browser_open || !BROWSER.contains(tool)),
@@ -594,7 +600,10 @@ fn test_role_tomls_never_admit_write_shell_or_browser_and_researcher_web_is_web_
                 continue;
             }
             assert!(
-                tool != "fs.write" && tool != "shell.exec" && !tool.starts_with("browser."),
+                tool != "fs.write"
+                    && tool != "fs.edit"
+                    && tool != "shell.exec"
+                    && !tool.starts_with("browser."),
                 "{role} admittiert {tool}"
             );
         }
@@ -609,8 +618,16 @@ fn test_role_tomls_never_admit_write_shell_or_browser_and_researcher_web_is_web_
         .iter()
         .map(String::as_str)
         .collect();
-    let expected: BTreeSet<&str> =
-        ["web.fetch", "web.docs_rs", "web.crates_io", "web.search"].into();
+    // Runde 5, Teil M: dazu nur das Text-Werkzeug `parent.message` (keine
+    // Rechteklasse, siehe `test_agent_messaging_tools_grant_no_rights`).
+    let expected: BTreeSet<&str> = [
+        "web.fetch",
+        "web.docs_rs",
+        "web.crates_io",
+        "web.search",
+        "parent.message",
+    ]
+    .into();
     assert_eq!(admitted, expected, "researcher-web admittiert nur web.*");
 
     let forbidden: BTreeSet<&str> = web
@@ -626,6 +643,7 @@ fn test_role_tomls_never_admit_write_shell_or_browser_and_researcher_web_is_web_
         "fs.glob",
         "fs.grep",
         "fs.write",
+        "fs.edit",
         "shell.exec",
         "deps.graph",
         "deps.locked",
@@ -787,6 +805,7 @@ fn test_matrix_roles_read_only_materials_no_network_and_zero_depth() -> TestResu
                 );
                 assert!(
                     *tool != "fs.write"
+                        && *tool != "fs.edit"
                         && !tool.starts_with("shell.")
                         && !tool.starts_with("process.")
                         && !tool.starts_with("web.")
@@ -818,6 +837,7 @@ fn test_matrix_roles_read_only_materials_no_network_and_zero_depth() -> TestResu
         let forbidden = ir.tool_surface().forbidden();
         for tool in [
             "fs.write",
+            "fs.edit",
             "shell.exec",
             "process.kill",
             "web.fetch",
@@ -878,4 +898,75 @@ fn test_uia_root_profile_never_registers_web_tools() -> TestResult {
         );
     }
     Ok(())
+}
+
+/// Runde 5, Teil H: `agent.result` ist nie Teil eines `RegistryProfile` —
+/// die Composition-Root hängt es nur an Sitzungen, die Kinder starten dürfen
+/// (`profile::child_result_tools_for_role`), und es verlangt keine
+/// Sandbox-Rechteklasse (die Grenze zieht die Eltern-Kind-Bindung im
+/// Spawner).
+#[test]
+fn test_agent_result_is_never_part_of_a_registry_profile() {
+    for profile in RegistryProfile::ALL {
+        for granted in every_permission_subset() {
+            assert!(
+                !profile.tool_names_for(&granted).contains(&"agent.result"),
+                "{profile:?} bewirbt agent.result unter {granted:?}"
+            );
+        }
+    }
+    assert_eq!(
+        harw_registry_defaults::tool_permission("agent.result"),
+        None
+    );
+    for role in role_names::ALL {
+        let granted = harw_registry_defaults::profile::child_result_tools_for_role(role);
+        assert_eq!(
+            !granted.is_empty(),
+            harw_registry_defaults::profile::is_orchestrator_role(role),
+            "{role}: agent.result genau für die Rollen, die Kinder starten"
+        );
+    }
+}
+
+/// Runde 5, Teil M: `agent.message`/`parent.message` sind nie Teil eines
+/// `RegistryProfile`, tragen keine Sandbox-Rechteklasse (keine
+/// Rechte-Erweiterung) und stehen genau bei den vorgesehenen Rollen:
+/// `agent.message` bei jeder Rolle, die Kinder startet, `parent.message` bei
+/// den Kind-Rollen mit Elternteil.
+#[test]
+fn test_agent_messaging_tools_grant_no_rights() {
+    use harw_registry_defaults::profile::{
+        PARENT_MESSAGE_ROLES, child_message_tools_for_role, parent_message_tools_for_role,
+    };
+    for tool in ["agent.message", "parent.message"] {
+        for profile in RegistryProfile::ALL {
+            for granted in every_permission_subset() {
+                assert!(
+                    !profile.tool_names_for(&granted).contains(&tool),
+                    "{profile:?} bewirbt {tool} unter {granted:?}"
+                );
+            }
+        }
+        assert_eq!(
+            harw_registry_defaults::tool_permission(tool),
+            None,
+            "{tool}"
+        );
+    }
+    for role in role_names::ALL {
+        assert_eq!(
+            !child_message_tools_for_role(role).is_empty(),
+            harw_registry_defaults::profile::is_orchestrator_role(role),
+            "{role}: agent.message genau für die Rollen, die Kinder starten"
+        );
+        assert_eq!(
+            !parent_message_tools_for_role(role).is_empty(),
+            PARENT_MESSAGE_ROLES.contains(role),
+            "{role}: parent.message"
+        );
+    }
+    for role in role_names::MATRIX_ROLES {
+        assert!(parent_message_tools_for_role(role).is_empty(), "{role}");
+    }
 }
