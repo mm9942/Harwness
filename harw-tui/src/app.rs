@@ -109,6 +109,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use harw_authority::SandboxSpec;
 use harw_core::cancel::{CancelReason, CancelToken};
@@ -145,7 +147,7 @@ use crate::command_exec::{
     ShellRunOutcome, busy_availability_for, dispatch_command_with_shell_result,
     dispatch_slash_command, execute_command_as,
 };
-use crate::command_popup::{CommandPopup, PopupAction, TabOutcome};
+use crate::command_popup::{CommandPopup, PopupAction, PopupMode, TabOutcome};
 use crate::events::{HarwEvent, HarwEventSender};
 use crate::export::{
     self, ExportAgentEntry, ExportEntry, ExportError, ExportErrorEntry, ExportMeta,
@@ -2589,24 +2591,133 @@ impl ChatApp {
     /// Aktualisiert den Filtertext (ohne führendes `/`) wenn das Popup bereits
     /// offen ist. (Spec-Abschnitt 2.8 / SLICE 5)
     fn sync_popup(&mut self) {
-        // Das Popup ist Autocomplete für den COMMAND-NAMEN. Sobald ein
-        // Leerzeichen getippt wird (Argument-Eingabe beginnt), wird es
-        // geschlossen: sonst fängt der Popup-Zweig Ziffern in Argumenten
-        // (z. B. Job-IDs `job-42`) als Auswahl-Index ab und die Zeichen
-        // erreichen die Eingabe nie.
-        if let Some(query) = self.input.text().strip_prefix('/') {
-            if !query.contains(char::is_whitespace) {
-                if let Some(popup) = self.command_popup.as_mut() {
+        self.sync_command_popup();
+        self.sync_mention_popup();
+    }
+
+    /// Befehls-Popup in zwei Stufen.
+    ///
+    /// # Beschreibung
+    /// Stufe 1 (`/mo`): Autocomplete für den Befehlsnamen, solange kein
+    /// Leerraum getippt ist. Stufe 2 (`/kanban mo`): Folgt auf einen
+    /// vollständigen, bekannten Befehl genau ein Leerzeichen-getrenntes Wort,
+    /// bietet [`CommandPopup::for_subcommands`] dessen Unterkommandos an.
+    /// Sobald danach weiterer Leerraum folgt (Argument-Eingabe) oder nichts
+    /// passt, schließt das Popup — sonst fingen Ziffern in Argumenten (z. B.
+    /// Job-IDs `job-42`) die Eingabe ab.
+    fn sync_command_popup(&mut self) {
+        let Some(query) = self.input.text().strip_prefix('/') else {
+            self.command_popup = None;
+            return;
+        };
+        if !query.contains(char::is_whitespace) {
+            match self.command_popup.as_mut() {
+                Some(popup) if matches!(popup.mode(), PopupMode::CommandName) => {
                     popup.on_query_change(query);
-                } else {
+                }
+                _ => {
                     let mut popup = CommandPopup::new(&self.command_registry);
                     popup.on_query_change(query);
                     self.command_popup = Some(popup);
                 }
-                return;
+            }
+            return;
+        }
+        let Some((name, rest)) = query.split_once(char::is_whitespace) else {
+            self.command_popup = None;
+            return;
+        };
+        let sub_query = rest.trim_start();
+        if sub_query.contains(char::is_whitespace) {
+            self.command_popup = None;
+            return;
+        }
+        let Some(spec) = self.command_registry.find(name) else {
+            self.command_popup = None;
+            return;
+        };
+        let canonical = spec.name.as_str().to_owned();
+        let reuse = matches!(
+            self.command_popup.as_ref().map(CommandPopup::mode),
+            Some(PopupMode::Subcommand { command }) if *command == canonical
+        );
+        if !reuse {
+            self.command_popup = CommandPopup::for_subcommands(spec);
+        }
+        let sub_query = sub_query.to_owned();
+        if let Some(popup) = self.command_popup.as_mut() {
+            popup.on_query_change(&sub_query);
+            if popup.is_empty() {
+                self.command_popup = None;
             }
         }
-        self.command_popup = None;
+    }
+
+    /// Öffnet, filtert oder schließt das `@`-Erwähnungs-Popup passend zum
+    /// Wort unter dem Cursor (nur außerhalb des Befehls-Popups).
+    fn sync_mention_popup(&mut self) {
+        if self.command_popup.is_some() {
+            self.mention_popup = None;
+            return;
+        }
+        let cursor = editor_cursor_byte(&self.input);
+        let query = current_mention_query(self.input.text(), cursor).map(|(_, q)| q.to_owned());
+        match query {
+            Some(query) => {
+                if self.mention_popup.is_none() {
+                    self.mention_popup = Some(MentionPopup::new(self.mention_candidates()));
+                }
+                if let Some(popup) = self.mention_popup.as_mut() {
+                    popup.filter(&query);
+                }
+            }
+            None => self.mention_popup = None,
+        }
+    }
+
+    /// Kandidaten für das `@`-Popup: bekannte Rollen und bis zu
+    /// [`MENTION_CANDIDATE_CAP`] Dateien unter der Projektwurzel.
+    fn mention_candidates(&self) -> Vec<MentionCandidate> {
+        let mut candidates: Vec<MentionCandidate> = KNOWN_ROLES
+            .iter()
+            .map(|role| MentionCandidate::role(*role))
+            .collect();
+        if !self.project_root.is_empty() {
+            candidates.extend(
+                scan_mention_candidates(
+                    std::path::Path::new(&self.project_root),
+                    MENTION_CANDIDATE_CAP,
+                )
+                .into_iter()
+                .map(MentionCandidate::file),
+            );
+        }
+        candidates
+    }
+
+    /// Ersetzt das `@token` unter dem Cursor durch `@insert` und schließt das
+    /// Popup. Ohne folgenden Text wird ein Leerzeichen angehängt.
+    fn accept_mention(&mut self, insert: &str) {
+        let text = self.input.text().to_owned();
+        let cursor = editor_cursor_byte(&self.input);
+        self.mention_popup = None;
+        let Some((start, query)) = current_mention_query(&text, cursor) else {
+            return;
+        };
+        let end = start + 1 + query.len();
+        let (Some(before), Some(tail)) = (text.get(..start), text.get(end..)) else {
+            return;
+        };
+        let mut head = format!("{before}@{insert}");
+        if tail.is_empty() {
+            head.push(' ');
+        }
+        self.input.clear();
+        self.input.insert_str(&head);
+        self.input.insert_str(tail);
+        for _ in 0..tail.graphemes(true).count() {
+            self.input.move_left();
+        }
     }
 
     /// Gibt `true` zurück wenn das `/command`-Popup aktuell geöffnet ist.
@@ -2617,6 +2728,242 @@ impl ChatApp {
     fn has_popup(&self) -> bool {
         self.command_popup.is_some()
     }
+
+    /// Aktiver Freigabemodus aus der geteilten Zelle der Runtime-Montage.
+    fn current_approval(&self) -> Option<ApprovalMode> {
+        self.runtime.as_ref().map(|rt| rt.approval_mode().get())
+    }
+
+    /// Berechtigungsstufe des TUI-Nutzers; ohne Runtime-Montage die
+    /// niedrigste Stufe.
+    fn caller_tier(&self) -> crate::PermissionTier {
+        self.runtime
+            .as_ref()
+            .map_or(crate::PermissionTier::Observer, |rt| {
+                runtime_commands::caller_tier(rt.principal())
+            })
+    }
+
+    /// Live-Provider und -Modell der Sitzung: Controller-Snapshot, sonst das
+    /// zuletzt gemeldete Sitzungsmodell.
+    fn live_model(&self) -> (Option<String>, Option<String>) {
+        let snap = self.session_controller.snapshot();
+        let model = snap
+            .active_model
+            .clone()
+            .or_else(|| self.export_session_model.clone());
+        (snap.active_provider, model)
+    }
+
+    /// Öffnet eine generische Ansicht und reiht ihren Initial-Abruf ein.
+    fn open_overlay_view(&mut self, view: Box<dyn OverlayView>) {
+        self.overlay_generation = self.overlay_generation.wrapping_add(1);
+        self.overlay = Some(Overlay::View(view));
+        self.queue_overlay_refresh();
+    }
+
+    /// Reiht den `refresh_command` der offenen generischen Ansicht ein.
+    fn queue_overlay_refresh(&mut self) {
+        let command = match &self.overlay {
+            Some(Overlay::View(view)) => view.refresh_command(),
+            _ => None,
+        };
+        if let Some(command) = command {
+            self.queue_overlay_fetch(command);
+        }
+    }
+
+    /// Reiht einen Datenabruf für die offene generische Ansicht ein
+    /// (doppelte Einträge werden zusammengefasst).
+    fn queue_overlay_fetch(&mut self, command: String) {
+        let fetch = DataFetch::Overlay {
+            command,
+            generation: self.overlay_generation,
+        };
+        if !self.pending_fetches.contains(&fetch) {
+            self.pending_fetches.push(fetch);
+        }
+    }
+
+    /// `true`, wenn das Werkbank-Panel sichtbar ist und neu laden sollte.
+    fn workbench_needs_refresh(&self) -> bool {
+        self.panels.workbench_visible && self.workbench.is_stale()
+    }
+
+    /// Schaltet das Werkbank-Panel um (wie `F5`); beim Einblenden wird es
+    /// als veraltet markiert und damit neu geladen.
+    fn toggle_workbench(&mut self) {
+        self.panels.workbench_visible = !self.panels.workbench_visible;
+        if self.panels.workbench_visible {
+            self.workbench.mark_stale();
+        } else if self.panels.focus == crate::panes::PaneFocus::Workbench {
+            self.panels.focus = crate::panes::PaneFocus::Chat;
+            self.panels.maximized = false;
+        }
+    }
+
+    /// Setzt die Composer-Zeile auf `text` (Cursor am Ende) und gibt den
+    /// Fokus an den Chat.
+    fn prefill_composer(&mut self, text: &str) {
+        self.input.clear();
+        self.input.insert_str(text);
+        self.panels.focus = crate::panes::PaneFocus::Chat;
+        self.panels.maximized = false;
+        self.sync_popup();
+    }
+
+    /// Tasten des fokussierten Werkbank-Panels.
+    ///
+    /// # Rückgabe
+    /// `true`, wenn neu gezeichnet werden soll.
+    fn handle_workbench_key(&mut self, key: KeyEvent) -> bool {
+        match self.workbench.handle_key(key) {
+            PaneCommand::None => false,
+            PaneCommand::Redraw => true,
+            PaneCommand::Run(command) => {
+                if command == WorkbenchPane::REFRESH_COMMAND {
+                    // Neu laden ohne Chat-Ausgabe.
+                    self.workbench.mark_stale();
+                } else {
+                    self.pending_commands.push_back(command);
+                }
+                true
+            }
+            PaneCommand::Prefill(text) => {
+                self.prefill_composer(&text);
+                true
+            }
+            PaneCommand::ReleaseFocus => {
+                self.panels.focus = crate::panes::PaneFocus::Chat;
+                self.panels.maximized = false;
+                true
+            }
+        }
+    }
+
+    /// Leert die sichtbaren Verlaufszellen (`/clear`). Sitzungsverlauf,
+    /// Modellkontext und Exporteinträge bleiben unverändert.
+    fn clear_transcript(&mut self) {
+        self.cells.clear();
+        self.tool_cells.clear();
+        self.open_tool_group = None;
+        self.ctrl_o_expand_last_armed = false;
+        self.live_stream.clear();
+        self.live_reasoning.clear();
+        self.scroll.force_follow();
+    }
+
+    /// Schaltet die ausführliche Werkzeuganzeige um (`/verbose`).
+    ///
+    /// # Beschreibung
+    /// Neue Werkzeugzellen erhalten die neue [`ToolVerbosity`]; bestehende
+    /// Zellen werden passend auf- bzw. zugeklappt.
+    ///
+    /// # Rückgabe
+    /// `true`, wenn jetzt die ausführliche Anzeige aktiv ist.
+    fn toggle_verbose(&mut self) -> bool {
+        let verbose = self.tool_verbosity != ToolVerbosity::Verbose;
+        self.tool_verbosity = if verbose {
+            ToolVerbosity::Verbose
+        } else {
+            ToolVerbosity::Compact
+        };
+        for handle in &self.tool_cells {
+            handle.set_expanded(verbose);
+        }
+        self.ctrl_o_expand_last_armed = false;
+        verbose
+    }
+
+    /// `/uia-worker-model` bare: Picker für den an den effektiven
+    /// UIA-Provider gebundenen Worker.
+    ///
+    /// # Beschreibung
+    /// Der Worker ist zwingend an den effektiven UIA-Provider gebunden
+    /// (UIA-Pin, sonst der aktive/Standard-Provider) — keine eigene
+    /// `uia_worker_provider`-Konzeption.
+    fn open_uia_worker_picker(&mut self) {
+        match self.resolved_config() {
+            Some(config) => {
+                let provider = config
+                    .harness
+                    .uia_provider
+                    .clone()
+                    .or_else(|| self.active_or_default_provider(&config));
+                match provider {
+                    Some(fixed_provider) => {
+                        self.open_model_switch_picker(PickerTarget::UiaWorker { fixed_provider });
+                    }
+                    None => self.push_line(
+                        Role::System,
+                        "UIA-Worker-Modell-Auswahl nicht verfügbar: kein \
+                         UIA-Pin-, aktiver oder Standard-Provider bekannt.",
+                    ),
+                }
+            }
+            None => self.push_line(
+                Role::System,
+                "UIA-Worker-Modell-Auswahl nicht verfügbar: keine \
+                 Konfiguration geladen.",
+            ),
+        }
+    }
+
+    /// Modus-/Freigabe-Auswahl mit aktuellem Zustand (`F7`, `/mode`).
+    fn mode_picker_view(&self) -> ModePicker {
+        let config = self.resolved_config();
+        ModePicker::new(
+            self.active_mode,
+            config
+                .as_deref()
+                .map(|config| config.harness.mode.default.as_str()),
+            self.current_approval(),
+        )
+    }
+
+    /// Modelle je Rolle (`F8`, `/models`).
+    fn model_roles_view(&self) -> ModelRolesView {
+        let (provider, model) = self.live_model();
+        match self.resolved_config() {
+            Some(config) => {
+                ModelRolesView::from_config(&config, provider.as_deref(), model.as_deref())
+            }
+            None => ModelRolesView::empty(provider.as_deref(), model.as_deref()),
+        }
+    }
+}
+
+/// Byte-Offset des Composer-Cursors.
+///
+/// # Beschreibung
+/// `InputEditor::cursor` ist nur in Tests sichtbar; der Offset wird deshalb
+/// aus [`InputEditor::cursor_position`] mit Breite `0` (keine weichen
+/// Umbrüche: Zeile = harte Zeile, Spalte = Anzeigebreite davor)
+/// zurückgerechnet. Ergebnis liegt immer auf einer Zeichengrenze.
+fn editor_cursor_byte(editor: &InputEditor) -> usize {
+    let (row, col) = editor.cursor_position(0);
+    let text = editor.text();
+    let mut line_start = 0usize;
+    for _ in 0..row {
+        match text.get(line_start..).and_then(|rest| rest.find('\n')) {
+            Some(pos) => line_start += pos + 1,
+            None => return text.len(),
+        }
+    }
+    let line = text.get(line_start..).unwrap_or("");
+    let line_end = line.find('\n').map_or(text.len(), |pos| line_start + pos);
+    let mut width = 0usize;
+    for (offset, grapheme) in text
+        .get(line_start..line_end)
+        .unwrap_or("")
+        .grapheme_indices(true)
+    {
+        if width >= col {
+            return line_start + offset;
+        }
+        width += UnicodeWidthStr::width(grapheme);
+    }
+    line_end
 }
 
 /// RAII-Guard, der Raw-Mode, Bracketed-Paste und Alternate-Screen bei Drop zurückstellt.
