@@ -110,6 +110,36 @@ impl ApprovalMode {
 
     /// Alle Stufen in der Reihenfolge zunehmender Autorität.
     pub const ALL: [Self; 3] = [Self::AlwaysAsk, Self::Delegated, Self::FullAccess];
+
+    /// Die Autoritätsstufe als Zahl.
+    ///
+    /// # Rückgabe
+    /// `0` für [`Self::AlwaysAsk`], `1` für [`Self::Delegated`], `2` für
+    /// [`Self::FullAccess`] — je größer, desto weniger wird gefragt.
+    #[must_use]
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::AlwaysAsk => 0,
+            Self::Delegated => 1,
+            Self::FullAccess => 2,
+        }
+    }
+
+    /// Deckelt diesen Modus auf höchstens `cap`.
+    ///
+    /// # Beschreibung
+    /// Ein Modus mit mehr Autorität als `cap` wird auf `cap` gesenkt; ein
+    /// strengerer Modus bleibt unverändert — eine Deckelung lockert nie.
+    ///
+    /// # Arguments
+    /// - `cap` (`ApprovalMode`): die höchste zulässige Stufe.
+    ///
+    /// # Rückgabe
+    /// Den strengeren der beiden Modi.
+    #[must_use]
+    pub fn capped_at(self, cap: ApprovalMode) -> ApprovalMode {
+        if self.rank() > cap.rank() { cap } else { self }
+    }
 }
 
 impl Default for ApprovalMode {
@@ -135,6 +165,10 @@ impl std::fmt::Display for ApprovalMode {
 /// eine unabhängige Kopie erzeugt, die ab diesem Zeitpunkt keinen Zustand
 /// mehr teilt.
 ///
+/// [`Self::follower`] erzeugt eine Folgezelle, die den Modus ihrer
+/// Elternzelle live übernimmt, gedeckelt auf eine Obergrenze — so folgen
+/// laufende Kind-Sitzungen einer Umstellung der Wurzel.
+///
 /// # Nebenläufigkeit
 /// Innen ein `Arc<RwLock<ApprovalMode>>`: viele gleichzeitige Leser, ein
 /// Schreiber. Ein vergifteter Lock (ein anderer Thread ist während des
@@ -159,7 +193,54 @@ impl std::fmt::Display for ApprovalMode {
 /// assert_eq!(cell.get(), ApprovalMode::FullAccess);
 /// ```
 #[derive(Clone)]
-pub struct ApprovalModeCell(Arc<RwLock<ApprovalMode>>);
+pub struct ApprovalModeCell(Storage);
+
+/// Innerer Speicher einer [`ApprovalModeCell`].
+///
+/// # Beschreibung
+/// - `Own`: die Zelle trägt ihren Modus selbst.
+/// - `Follow`: die Zelle liest den Modus ihrer Elternzelle, gedeckelt auf
+///   `cap`, bis ein lokales [`ApprovalModeCell::set`] sie abkoppelt.
+#[derive(Clone)]
+enum Storage {
+    Own(Arc<RwLock<ApprovalMode>>),
+    Follow {
+        parent: Arc<Storage>,
+        cap: ApprovalMode,
+        local: Arc<RwLock<Option<ApprovalMode>>>,
+    },
+}
+
+impl Storage {
+    fn get(&self) -> ApprovalMode {
+        match self {
+            Self::Own(lock) => match lock.read() {
+                Ok(guard) => *guard,
+                Err(poisoned) => *poisoned.into_inner(),
+            },
+            Self::Follow { parent, cap, local } => {
+                let local_mode = match local.read() {
+                    Ok(guard) => *guard,
+                    Err(poisoned) => *poisoned.into_inner(),
+                };
+                local_mode.unwrap_or_else(|| parent.get()).capped_at(*cap)
+            }
+        }
+    }
+
+    fn set(&self, mode: ApprovalMode) {
+        match self {
+            Self::Own(lock) => match lock.write() {
+                Ok(mut guard) => *guard = mode,
+                Err(poisoned) => *poisoned.into_inner() = mode,
+            },
+            Self::Follow { local, .. } => match local.write() {
+                Ok(mut guard) => *guard = Some(mode),
+                Err(poisoned) => *poisoned.into_inner() = Some(mode),
+            },
+        }
+    }
+}
 
 impl ApprovalModeCell {
     /// Erzeugt eine neue Zelle mit `mode` als Startwert.
@@ -168,28 +249,32 @@ impl ApprovalModeCell {
     /// - `mode` (`ApprovalMode`): der anfängliche Modus dieser Zelle.
     #[must_use]
     pub fn new(mode: ApprovalMode) -> Self {
-        Self(Arc::new(RwLock::new(mode)))
+        Self(Storage::Own(Arc::new(RwLock::new(mode))))
     }
 
     /// Liest den aktuellen Modus dieser Zelle.
     ///
     /// # Rückgabe
     /// Den zuletzt über [`Self::set`] (auf dieser Zelle oder einem geteilten
-    /// Klon davon) geschriebenen Modus.
+    /// Klon davon) geschriebenen Modus. Eine Folgezelle ([`Self::follower`])
+    /// liefert ihren lokalen Wert, sonst den der Elternzelle — beides
+    /// gedeckelt auf ihre Obergrenze.
     ///
     /// # Nebenläufigkeit
     /// Blockiert nie dauerhaft: ein vergifteter Lock wird über `into_inner`
     /// aufgelöst statt weiterzureichen (siehe Typ-Doku).
     #[must_use]
     pub fn get(&self) -> ApprovalMode {
-        match self.0.read() {
-            Ok(guard) => *guard,
-            Err(poisoned) => *poisoned.into_inner(),
-        }
+        self.0.get()
     }
 
     /// Setzt den Modus dieser Zelle. Jeder geteilte Klon sieht die Änderung
     /// beim nächsten [`Self::get`].
+    ///
+    /// # Beschreibung
+    /// Auf einer Folgezelle ([`Self::follower`]) setzt der Aufruf den lokalen
+    /// Wert: diese Zelle und ihre Klone folgen der Elternzelle danach nicht
+    /// mehr, bleiben aber gedeckelt. Die Elternzelle bleibt unberührt.
     ///
     /// # Arguments
     /// - `mode` (`ApprovalMode`): der neue Modus.
@@ -198,10 +283,7 @@ impl ApprovalModeCell {
     /// Blockiert nie dauerhaft: ein vergifteter Lock wird über `into_inner`
     /// aufgelöst statt weiterzureichen (siehe Typ-Doku).
     pub fn set(&self, mode: ApprovalMode) {
-        match self.0.write() {
-            Ok(mut guard) => *guard = mode,
-            Err(poisoned) => *poisoned.into_inner() = mode,
-        }
+        self.0.set(mode);
     }
 
     /// Erzeugt eine unabhängige Kopie: eine neue Zelle mit demselben
@@ -210,10 +292,44 @@ impl ApprovalModeCell {
     /// sichtbar.
     ///
     /// # Rückgabe
-    /// Eine neue, eigenständige `ApprovalModeCell`.
+    /// Eine neue, eigenständige `ApprovalModeCell` (Momentaufnahme; auch
+    /// von einer Folgezelle aus folgt die Kopie niemandem).
     #[must_use]
     pub fn detached(&self) -> Self {
         Self::new(self.get())
+    }
+
+    /// Erzeugt eine Folgezelle, die den Modus von `self` live übernimmt,
+    /// gedeckelt auf `cap`.
+    ///
+    /// # Beschreibung
+    /// Solange niemand auf der Folgezelle [`Self::set`] aufruft, liefert
+    /// ihr [`Self::get`] den aktuellen Modus von `self`, höchstens aber
+    /// `cap`. Ein `set` auf der Folgezelle koppelt sie (und ihre Klone) ab;
+    /// die Elternzelle und andere Folgezellen bleiben unberührt.
+    ///
+    /// # Arguments
+    /// - `cap` (`ApprovalMode`): die höchste Stufe, die die Folgezelle je
+    ///   liefert.
+    ///
+    /// # Rückgabe
+    /// Eine neue Folgezelle.
+    #[must_use]
+    pub fn follower(&self, cap: ApprovalMode) -> Self {
+        Self(Storage::Follow {
+            parent: Arc::new(self.0.clone()),
+            cap,
+            local: Arc::new(RwLock::new(None)),
+        })
+    }
+
+    /// Ob diese Zelle eine Folgezelle ist ([`Self::follower`]).
+    ///
+    /// # Rückgabe
+    /// `true` für Folgezellen, auch nach einem lokalen [`Self::set`].
+    #[must_use]
+    pub fn is_follower(&self) -> bool {
+        matches!(self.0, Storage::Follow { .. })
     }
 }
 
@@ -221,6 +337,7 @@ impl std::fmt::Debug for ApprovalModeCell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ApprovalModeCell")
             .field("mode", &self.get())
+            .field("follower", &self.is_follower())
             .finish()
     }
 }
@@ -340,5 +457,99 @@ mod tests {
     fn cell_detached_starts_at_current_value_not_default() {
         let cell = ApprovalModeCell::new(ApprovalMode::FullAccess);
         assert_eq!(cell.detached().get(), ApprovalMode::FullAccess);
+    }
+
+    #[test]
+    fn rank_orders_by_authority() {
+        assert!(ApprovalMode::AlwaysAsk.rank() < ApprovalMode::Delegated.rank());
+        assert!(ApprovalMode::Delegated.rank() < ApprovalMode::FullAccess.rank());
+    }
+
+    #[test]
+    fn capped_at_lowers_but_never_loosens() {
+        assert_eq!(
+            ApprovalMode::FullAccess.capped_at(ApprovalMode::Delegated),
+            ApprovalMode::Delegated
+        );
+        assert_eq!(
+            ApprovalMode::AlwaysAsk.capped_at(ApprovalMode::Delegated),
+            ApprovalMode::AlwaysAsk
+        );
+        assert_eq!(
+            ApprovalMode::Delegated.capped_at(ApprovalMode::FullAccess),
+            ApprovalMode::Delegated
+        );
+    }
+
+    #[test]
+    fn follower_sees_parent_changes() {
+        let parent = ApprovalModeCell::new(ApprovalMode::Delegated);
+        let follower = parent.follower(ApprovalMode::FullAccess);
+        assert!(follower.is_follower());
+        assert!(!parent.is_follower());
+        assert_eq!(follower.get(), ApprovalMode::Delegated);
+
+        parent.set(ApprovalMode::AlwaysAsk);
+        assert_eq!(follower.get(), ApprovalMode::AlwaysAsk);
+    }
+
+    #[test]
+    fn follower_enforces_its_cap() {
+        let parent = ApprovalModeCell::new(ApprovalMode::FullAccess);
+        let follower = parent.follower(ApprovalMode::Delegated);
+        assert_eq!(follower.get(), ApprovalMode::Delegated);
+
+        follower.set(ApprovalMode::FullAccess);
+        assert_eq!(follower.get(), ApprovalMode::Delegated);
+        assert_eq!(parent.get(), ApprovalMode::FullAccess);
+    }
+
+    #[test]
+    fn follower_local_set_decouples_it_and_its_clones() {
+        let parent = ApprovalModeCell::new(ApprovalMode::Delegated);
+        let follower = parent.follower(ApprovalMode::Delegated);
+        let clone = follower.clone();
+
+        follower.set(ApprovalMode::AlwaysAsk);
+        parent.set(ApprovalMode::Delegated);
+
+        assert_eq!(follower.get(), ApprovalMode::AlwaysAsk);
+        assert_eq!(clone.get(), ApprovalMode::AlwaysAsk);
+        assert_eq!(parent.get(), ApprovalMode::Delegated);
+    }
+
+    #[test]
+    fn sibling_followers_are_independent() {
+        let parent = ApprovalModeCell::new(ApprovalMode::Delegated);
+        let a = parent.follower(ApprovalMode::Delegated);
+        let b = parent.follower(ApprovalMode::Delegated);
+
+        a.set(ApprovalMode::AlwaysAsk);
+
+        assert_eq!(a.get(), ApprovalMode::AlwaysAsk);
+        assert_eq!(b.get(), ApprovalMode::Delegated);
+    }
+
+    #[test]
+    fn nested_follower_sees_the_root_through_its_parent() {
+        let root = ApprovalModeCell::new(ApprovalMode::Delegated);
+        let child = root.follower(ApprovalMode::Delegated);
+        let grandchild = child.follower(ApprovalMode::FullAccess);
+
+        root.set(ApprovalMode::AlwaysAsk);
+        assert_eq!(grandchild.get(), ApprovalMode::AlwaysAsk);
+
+        root.set(ApprovalMode::FullAccess);
+        assert_eq!(grandchild.get(), ApprovalMode::Delegated);
+    }
+
+    #[test]
+    fn detached_from_a_follower_is_a_plain_snapshot() {
+        let parent = ApprovalModeCell::new(ApprovalMode::AlwaysAsk);
+        let snapshot = parent.follower(ApprovalMode::Delegated).detached();
+        assert!(!snapshot.is_follower());
+
+        parent.set(ApprovalMode::Delegated);
+        assert_eq!(snapshot.get(), ApprovalMode::AlwaysAsk);
     }
 }

@@ -231,6 +231,10 @@ async fn status(ctx: &OpContext, _args: StatusArgs) -> Result<OpOutput, OpError>
             },
             count = load_status.recent_rate_limited,
         ));
+        // Client-seitige RPM/TPM-Budgets (je Bucket eine eingerückte Zeile).
+        for budget in &load_status.budgets {
+            lines.push(format!("  Budget: {budget}"));
+        }
     }
 
     // Welle 2 (Plan Teil B5) — Host-Lease-Zustand, sofern eine
@@ -387,6 +391,7 @@ mod tests {
                 available_permits: 3,
                 rate_limit_wait: Some(Duration::from_millis(1500)),
                 recent_rate_limited: 2,
+                budgets: Vec::new(),
             })),
         );
         let (ctx, _tmp) = make_test_ctx(Some("openai"), Some(registry), None)?;
@@ -423,6 +428,7 @@ mod tests {
                 available_permits: usize::MAX,
                 rate_limit_wait: None,
                 recent_rate_limited: 0,
+                budgets: Vec::new(),
             })),
         );
         // Active provider is "openai", registry only has "anthropic".

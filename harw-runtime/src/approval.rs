@@ -24,8 +24,9 @@
 //! ihre Registry aus den Voreinstellungen und sah die Config-Politik des
 //! Wurzelprozesses nie. Ein Fan-out konnte damit tun, was dem Elternteil
 //! ausdrücklich unter Vorbehalt stand. [`ApprovalChain::for_child`] gibt die
-//! Config-Politik deshalb unverändert weiter und **senkt** dabei zugleich den
-//! Freigabemodus, statt ihn zu erben (G-009).
+//! Config-Politik deshalb unverändert weiter; den Freigabemodus übernimmt das
+//! Kind live von der Elternkette, aber **gedeckelt** auf
+//! [`ApprovalMode::Delegated`] (G-009).
 //!
 //! # Nebenläufigkeit
 //! [`ApprovalChain`] hält nur `Arc`-Zeiger und eine [`ApprovalModeCell`];
@@ -378,14 +379,17 @@ impl ApprovalChain {
     ///   `Arc`). Vorher montierte ein Kind seine Registry aus den
     ///   Voreinstellungen und sah `[policy].require_approval_for` nie — der
     ///   Fan-out durfte, was dem Elternteil unter Vorbehalt stand (F-018).
-    /// - Der Freigabemodus liegt in einer **eigenen** Zelle
-    ///   ([`ApprovalModeCell::detached`]): ein `set` im Kind erreicht die
-    ///   Wurzel nicht und umgekehrt (G-009). [`ApprovalMode::FullAccess`]
-    ///   wird dabei **nie** vererbt, sondern auf [`ApprovalMode::Delegated`]
-    ///   gesenkt — „ich vertraue diesem Turn" ist eine Aussage über den Turn,
-    ///   den eine Person vor sich sieht, nicht über beliebig viele Kinder,
-    ///   die sie nie zu Gesicht bekommt. [`ApprovalMode::AlwaysAsk`] bleibt
-    ///   erhalten: eine Absenkung auf `Delegated` wäre eine Lockerung.
+    /// - Der Freigabemodus liegt in einer **Folgezelle**
+    ///   ([`ApprovalModeCell::follower`]) mit Obergrenze
+    ///   [`ApprovalMode::Delegated`]: eine Umstellung der Elternzelle erreicht
+    ///   laufende Kinder sofort, ein `set` im Kind koppelt nur dieses Kind ab
+    ///   und erreicht weder die Wurzel noch Geschwister. [`ApprovalMode::FullAccess`]
+    ///   wird dabei **nie** vererbt, sondern durch die Deckelung auf
+    ///   [`ApprovalMode::Delegated`] gesenkt (G-009) — „ich vertraue diesem
+    ///   Turn" ist eine Aussage über den Turn, den eine Person vor sich sieht,
+    ///   nicht über beliebig viele Kinder, die sie nie zu Gesicht bekommt.
+    ///   [`ApprovalMode::AlwaysAsk`] bleibt erhalten: die Deckelung lockert
+    ///   nie.
     /// - Es gibt **keinen Responder**. Ein Kind und ein Job-Worker fragen
     ///   niemanden; sie haben keine Oberfläche, an der eine Antwort ankäme.
     /// - Die **Freigaberegeln werden unverändert weitergereicht** (dieselbe
@@ -411,14 +415,11 @@ impl ApprovalChain {
     /// Die Kind-Kette; die Elternkette bleibt unberührt.
     #[must_use]
     pub fn for_child(&self) -> Self {
-        let child_mode = self.mode.detached();
-        if child_mode.get() == ApprovalMode::FullAccess {
-            child_mode.set(ApprovalMode::Delegated);
-        }
+        let child_mode = self.mode.follower(ApprovalMode::Delegated);
 
         Self {
             // Die Ask-Auflösung ist die des Einstiegs und gilt für das Kind
-            // unverändert; nur die Zelle ist die gelöste des Kindes, damit die
+            // unverändert; nur die Zelle ist die Folgezelle des Kindes, damit die
             // Vorhersage denselben Modus liest wie die Kind-Standardpolitik.
             ask: self
                 .ask
@@ -620,8 +621,9 @@ impl ApprovalChain {
     ///
     /// # Rückgabe
     /// Eine Referenz; ein Klon davon ist der Schalter, mit dem sich der Modus
-    /// dieses Laufs umstellen lässt — und **nur** dieses Laufs, denn
-    /// [`Self::for_child`] löst die Zelle.
+    /// dieses Laufs umstellen lässt. Kinder aus [`Self::for_child`] folgen
+    /// der Umstellung live, gedeckelt auf [`ApprovalMode::Delegated`]; ein
+    /// `set` auf der Zelle eines Kindes erreicht die Elternkette nie.
     #[must_use]
     pub fn mode(&self) -> &ApprovalModeCell {
         &self.mode
@@ -834,17 +836,54 @@ mod tests {
         Ok(())
     }
 
-    /// Die Zellen sind entkoppelt: ein `set` läuft in keine Richtung über.
+    /// Eine Umstellung der Wurzel erreicht laufende Kinder live — gedeckelt
+    /// auf `Delegated`.
     #[test]
-    fn child_and_root_mode_cells_are_independent() {
+    fn root_mode_changes_reach_children_capped_at_delegated() {
         let root = root_chain(&[], ApprovalMode::Delegated);
         let child = root.for_child();
+        assert!(child.mode().is_follower());
+
+        root.mode().set(ApprovalMode::AlwaysAsk);
+        assert_eq!(child.mode().get(), ApprovalMode::AlwaysAsk);
 
         root.mode().set(ApprovalMode::FullAccess);
         assert_eq!(child.mode().get(), ApprovalMode::Delegated);
 
+        let grandchild = child.for_child();
+        root.mode().set(ApprovalMode::AlwaysAsk);
+        assert_eq!(grandchild.mode().get(), ApprovalMode::AlwaysAsk);
+    }
+
+    /// Ein `set` im Kind läuft weder zur Wurzel noch zu Geschwistern über.
+    #[test]
+    fn a_child_set_reaches_neither_root_nor_siblings() {
+        let root = root_chain(&[], ApprovalMode::Delegated);
+        let child = root.for_child();
+        let sibling = root.for_child();
+
         child.mode().set(ApprovalMode::AlwaysAsk);
-        assert_eq!(root.mode().get(), ApprovalMode::FullAccess);
+
+        assert_eq!(child.mode().get(), ApprovalMode::AlwaysAsk);
+        assert_eq!(sibling.mode().get(), ApprovalMode::Delegated);
+        assert_eq!(root.mode().get(), ApprovalMode::Delegated);
+
+        // Das abgekoppelte Kind folgt der Wurzel nicht mehr, das Geschwister
+        // schon.
+        root.mode().set(ApprovalMode::FullAccess);
+        assert_eq!(child.mode().get(), ApprovalMode::AlwaysAsk);
+        assert_eq!(sibling.mode().get(), ApprovalMode::Delegated);
+    }
+
+    /// Auch ein lokales `set` im Kind durchbricht die Deckelung nicht.
+    #[test]
+    fn a_child_cannot_raise_itself_to_full_access() {
+        let root = root_chain(&[], ApprovalMode::FullAccess);
+        let child = root.for_child();
+
+        child.mode().set(ApprovalMode::FullAccess);
+
+        assert_eq!(child.mode().get(), ApprovalMode::Delegated);
     }
 
     /// F-018: Die Config-Politik der Wurzel gilt auch im Kind.
@@ -1087,7 +1126,7 @@ mod tests {
         Ok(())
     }
 
-    /// Das Kind erbt die Auflösung und liest die **gelöste** Zelle.
+    /// Das Kind erbt die Auflösung und liest seine **gedeckelte** Folgezelle.
     #[test]
     fn a_child_keeps_the_ask_resolution_over_its_own_cell() -> TestResult {
         let root = ApprovalChain::for_root(

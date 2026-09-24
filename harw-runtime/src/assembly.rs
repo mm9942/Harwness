@@ -4601,6 +4601,7 @@ mod tests {
             capabilities: harw_config::ModelCapabilitiesToml::default(),
             default_reasoning_effort: None,
             stream: None,
+            rate_limit: None,
         }
     }
 

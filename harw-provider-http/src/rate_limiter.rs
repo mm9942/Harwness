@@ -991,6 +991,7 @@ mod tests {
         let limiter = ProviderRateLimiter::new(Some(harw_config::RateLimitToml {
             enabled: true,
             safety_margin_pct: 20,
+            ..harw_config::RateLimitToml::default()
         }));
         let headers = header_map(&[
             ("anthropic-ratelimit-requests-limit", "100"),
@@ -1011,6 +1012,7 @@ mod tests {
         let limiter = ProviderRateLimiter::new(Some(harw_config::RateLimitToml {
             enabled: true,
             safety_margin_pct: 10,
+            ..harw_config::RateLimitToml::default()
         }));
         let headers = header_map(&[
             ("x-ratelimit-limit-requests", "100"),
@@ -1027,6 +1029,7 @@ mod tests {
         let limiter = ProviderRateLimiter::new(Some(harw_config::RateLimitToml {
             enabled: true,
             safety_margin_pct: 50,
+            ..harw_config::RateLimitToml::default()
         }));
         let headers = header_map(&[
             ("anthropic-ratelimit-tokens-limit", "not-a-number"),
@@ -1043,6 +1046,7 @@ mod tests {
         let limiter = ProviderRateLimiter::new(Some(harw_config::RateLimitToml {
             enabled: true,
             safety_margin_pct: 10,
+            ..harw_config::RateLimitToml::default()
         }));
         let headers = header_map(&[("retry-after", "5")])?;
         limiter.observe_headers(&headers);
@@ -1057,6 +1061,7 @@ mod tests {
         let limiter = ProviderRateLimiter::new(Some(harw_config::RateLimitToml {
             enabled: true,
             safety_margin_pct: 100,
+            ..harw_config::RateLimitToml::default()
         }));
         let headers = header_map(&[
             ("anthropic-ratelimit-requests-limit", "10"),
@@ -1111,6 +1116,7 @@ mod tests {
         ProviderRateLimiter::new(Some(harw_config::RateLimitToml {
             enabled: true,
             safety_margin_pct,
+            ..harw_config::RateLimitToml::default()
         }))
     }
 

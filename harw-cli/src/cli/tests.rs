@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use harw_extension_api::ApprovalMode;
 
 use super::*;
 use crate::test_support::{TestError, TestResult, ctx};
@@ -756,4 +757,939 @@ fn test_lens_without_subcommand_parses_with_no_action() -> TestResult {
     let cli = Cli::try_parse_from(["harw", "lens"]).map_err(ctx("`harw lens` muss parsen"))?;
     assert!(matches!(cli.command, Some(Command::Lens { action: None })));
     Ok(())
+}
+
+// ── Gesamte Grammatik ───────────────────────────────────────────────────
+
+#[test]
+fn test_command_passes_clap_debug_assertions() {
+    // Prüft u. a. doppelte Argument-IDs, Kurzflags und Konflikt-Verweise im
+    // gesamten Baum, auch in versteckten Varianten.
+    command().debug_assert();
+}
+
+#[test]
+fn test_command_parses_the_same_as_the_derived_parser() -> TestResult {
+    let matches = command()
+        .try_get_matches_from(["harw", "--json", "session", "list", "--all"])
+        .map_err(ctx("`command()` muss `session list --all` parsen"))?;
+    assert!(matches.get_flag("json"));
+    let Some(("session", session)) = matches.subcommand() else {
+        return Err(TestError::Unexpected(format!(
+            "erwartete Subcommand `session`, bekam {:?}",
+            matches.subcommand_name()
+        )));
+    };
+    assert_eq!(session.subcommand_name(), Some("list"));
+    Ok(())
+}
+
+#[test]
+fn test_legacy_commands_are_hidden_but_still_known() -> TestResult {
+    let cmd = command();
+    for name in ["connect", "lens", "uia", "catalog", "run", "classify"] {
+        let sub = cmd
+            .find_subcommand(name)
+            .ok_or_else(|| TestError::Unexpected(format!("`{name}` fehlt in der Grammatik")))?;
+        assert!(sub.is_hide_set(), "`{name}` muss versteckt sein");
+    }
+    for name in [
+        "chat",
+        "exec",
+        "session",
+        "config",
+        "provider",
+        "model",
+        "agent",
+        "knowledge",
+        "jobs",
+        "channel",
+        "debug",
+    ] {
+        let sub = cmd
+            .find_subcommand(name)
+            .ok_or_else(|| TestError::Unexpected(format!("`{name}` fehlt in der Grammatik")))?;
+        assert!(!sub.is_hide_set(), "`{name}` muss sichtbar sein");
+    }
+    Ok(())
+}
+
+// ── Arbeiten: chat, exec, session ───────────────────────────────────────
+
+#[test]
+fn test_bare_harw_starts_chat_without_subcommand() -> TestResult {
+    let cli = Cli::try_parse_from(["harw", "hallo"]).map_err(ctx("`harw hallo` sollte parsen"))?;
+    assert!(cli.command.is_none());
+    assert_eq!(cli.chat.prompt.as_deref(), Some("hallo"));
+    assert!(!cli.chat.all);
+    Ok(())
+}
+
+#[test]
+fn test_root_all_flag_combines_with_resume() -> TestResult {
+    let cli = Cli::try_parse_from(["harw", "-r", "--all"])
+        .map_err(ctx("`harw -r --all` sollte parsen"))?;
+    assert_eq!(cli.chat.resume, Some(None));
+    assert!(cli.chat.all);
+    Ok(())
+}
+
+#[test]
+fn test_chat_subcommand_parses_prompt_resume_and_all() -> TestResult {
+    let cli = Cli::try_parse_from(["harw", "chat", "--all", "-r", "abc123"])
+        .map_err(ctx("`harw chat --all -r abc123` sollte parsen"))?;
+    let Some(Command::Chat(args)) = cli.command else {
+        return Err(TestError::Unexpected(format!(
+            "erwartete Command::Chat, bekam {:?}",
+            cli.command
+        )));
+    };
+    assert_eq!(args.resume, Some(Some("abc123".to_owned())));
+    assert!(args.all);
+    assert_eq!(args.prompt, None);
+
+    let cli = Cli::try_parse_from(["harw", "chat", "erkläre das Projekt"])
+        .map_err(ctx("`harw chat PROMPT` sollte parsen"))?;
+    let Some(Command::Chat(args)) = cli.command else {
+        return Err(TestError::Unexpected(format!(
+            "erwartete Command::Chat, bekam {:?}",
+            cli.command
+        )));
+    };
+    assert_eq!(args.prompt.as_deref(), Some("erkläre das Projekt"));
+    assert_eq!(args.resume, None);
+    Ok(())
+}
+
+#[test]
+fn test_all_flag_is_not_global() {
+    let result = Cli::try_parse_from(["harw", "doctor", "--all"]);
+    assert!(
+        result.is_err(),
+        "`--all` gehört nur zu chat bzw. `session list`, bekam {result:?}"
+    );
+}
+
+#[test]
+fn test_exec_collects_all_prompt_words() -> TestResult {
+    let cli = Cli::try_parse_from(["harw", "exec", "fix", "the", "tests"])
+        .map_err(ctx("`harw exec fix the tests` sollte parsen"))?;
+    let Some(Command::Exec(args)) = cli.command else {
+        return Err(TestError::Unexpected(format!(
+            "erwartete Command::Exec, bekam {:?}",
+            cli.command
+        )));
+    };
+    assert_eq!(args.prompt, vec!["fix", "the", "tests"]);
+    Ok(())
+}
+
+#[test]
+fn test_exec_requires_a_prompt() {
+    let result = Cli::try_parse_from(["harw", "exec"]);
+    assert!(
+        result.is_err(),
+        "`harw exec` ohne Prompt muss scheitern, bekam {result:?}"
+    );
+}
+
+#[test]
+fn test_exec_accepts_session_flags_before_the_subcommand() -> TestResult {
+    let cli = Cli::try_parse_from([
+        "harw",
+        "--approval",
+        "full",
+        "--model",
+        "openrouter/x",
+        "exec",
+        "los",
+    ])
+    .map_err(ctx("Sitzungs-Flags vor `exec` sollten parsen"))?;
+    assert_eq!(cli.global.approval, Some(ApprovalMode::FullAccess));
+    assert_eq!(cli.global.model.as_deref(), Some("openrouter/x"));
+    assert!(matches!(cli.command, Some(Command::Exec(_))));
+    Ok(())
+}
+
+#[test]
+fn test_session_list_show_and_resume_parse() -> TestResult {
+    let list = Cli::try_parse_from(["harw", "session", "list", "--all"])
+        .map_err(ctx("`harw session list --all` sollte parsen"))?;
+    assert!(matches!(
+        list.command,
+        Some(Command::Session {
+            action: SessionAction::List { all: true }
+        })
+    ));
+
+    let list = Cli::try_parse_from(["harw", "session", "list"])
+        .map_err(ctx("`harw session list` sollte parsen"))?;
+    assert!(matches!(
+        list.command,
+        Some(Command::Session {
+            action: SessionAction::List { all: false }
+        })
+    ));
+
+    let show = Cli::try_parse_from(["harw", "session", "show", "abc"])
+        .map_err(ctx("`harw session show abc` sollte parsen"))?;
+    assert!(matches!(
+        show.command,
+        Some(Command::Session {
+            action: SessionAction::Show { id }
+        }) if id == "abc"
+    ));
+
+    let resume = Cli::try_parse_from(["harw", "session", "resume", "abc"])
+        .map_err(ctx("`harw session resume abc` sollte parsen"))?;
+    assert!(matches!(
+        resume.command,
+        Some(Command::Session {
+            action: SessionAction::Resume { id }
+        }) if id == "abc"
+    ));
+
+    let missing = Cli::try_parse_from(["harw", "session", "show"]);
+    assert!(missing.is_err(), "`session show` ohne ID muss scheitern");
+    Ok(())
+}
+
+// ── Konfiguration: config, provider, model ──────────────────────────────
+
+#[test]
+fn test_config_is_the_canonical_name_of_settings() -> TestResult {
+    let cli =
+        Cli::try_parse_from(["harw", "config"]).map_err(ctx("`harw config` sollte parsen"))?;
+    assert!(matches!(
+        cli.command,
+        Some(Command::Config { action: None })
+    ));
+
+    let cli = Cli::try_parse_from(["harw", "config", "get", "default_model"])
+        .map_err(ctx("`harw config get ...` sollte parsen"))?;
+    assert!(matches!(
+        cli.command,
+        Some(Command::Config {
+            action: Some(SettingsAction::Get { key, .. })
+        }) if key == "default_model"
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_config_permissions_set_mode_does_not_leak_into_global_flags() -> TestResult {
+    let cli = Cli::try_parse_from(["harw", "config", "permissions", "set-mode", "full"])
+        .map_err(ctx("`harw config permissions set-mode full` sollte parsen"))?;
+    assert!(matches!(
+        cli.command,
+        Some(Command::Config {
+            action: Some(SettingsAction::Permissions {
+                action: SettingsPermissionsAction::SetMode { .. },
+            }),
+        })
+    ));
+    assert_eq!(cli.global.mode, None);
+    assert_eq!(cli.global.approval, None);
+    assert!(cli.global.session_flags_used().is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_provider_add_parses_all_flags() -> TestResult {
+    let cli = Cli::try_parse_from([
+        "harw",
+        "provider",
+        "add",
+        "lokal",
+        "--api",
+        "ollama",
+        "--base-url",
+        "http://localhost:11434",
+        "--models",
+        "a,b",
+    ])
+    .map_err(ctx("`harw provider add ...` sollte parsen"))?;
+    let Some(Command::Provider {
+        action:
+            ProviderAction::Add {
+                name,
+                api,
+                base_url,
+                auth,
+                models,
+            },
+    }) = cli.command
+    else {
+        return Err(TestError::Unexpected(format!(
+            "erwartete Provider(Add), bekam {:?}",
+            cli.command
+        )));
+    };
+    assert_eq!(name, "lokal");
+    assert_eq!(api, ApiDialect::Ollama);
+    assert_eq!(base_url, "http://localhost:11434");
+    assert_eq!(auth, None);
+    assert_eq!(models, vec!["a".to_owned(), "b".to_owned()]);
+    Ok(())
+}
+
+#[test]
+fn test_provider_scan_list_and_toggles_parse() -> TestResult {
+    let scan = Cli::try_parse_from([
+        "harw",
+        "provider",
+        "scan",
+        "openrouter",
+        "--free-only",
+        "--prune",
+    ])
+    .map_err(ctx("`harw provider scan ...` sollte parsen"))?;
+    let Some(Command::Provider {
+        action:
+            ProviderAction::Scan {
+                provider,
+                free_only,
+                prune,
+            },
+    }) = scan.command
+    else {
+        return Err(TestError::Unexpected(format!(
+            "erwartete Provider(Scan), bekam {:?}",
+            scan.command
+        )));
+    };
+    assert_eq!(provider.as_deref(), Some("openrouter"));
+    assert!(free_only);
+    assert!(prune);
+
+    let scan_all = Cli::try_parse_from(["harw", "provider", "scan"])
+        .map_err(ctx("`harw provider scan` sollte parsen"))?;
+    assert!(matches!(
+        scan_all.command,
+        Some(Command::Provider {
+            action: ProviderAction::Scan {
+                provider: None,
+                free_only: false,
+                prune: false,
+            }
+        })
+    ));
+
+    let list = Cli::try_parse_from(["harw", "provider", "list"])
+        .map_err(ctx("`harw provider list` sollte parsen"))?;
+    assert!(matches!(
+        list.command,
+        Some(Command::Provider {
+            action: ProviderAction::List
+        })
+    ));
+
+    for (verb, check) in [("remove", 0_u8), ("enable", 1), ("disable", 2)] {
+        let cli = Cli::try_parse_from(["harw", "provider", verb, "x"])
+            .map_err(ctx("`harw provider remove|enable|disable x` sollte parsen"))?;
+        let ok = match (check, &cli.command) {
+            (
+                0,
+                Some(Command::Provider {
+                    action: ProviderAction::Remove { name },
+                }),
+            )
+            | (
+                1,
+                Some(Command::Provider {
+                    action: ProviderAction::Enable { name },
+                }),
+            )
+            | (
+                2,
+                Some(Command::Provider {
+                    action: ProviderAction::Disable { name },
+                }),
+            ) => name == "x",
+            _ => false,
+        };
+        assert!(ok, "`provider {verb} x` falsch geparst: {:?}", cli.command);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_model_catalog_refresh_and_remove_parse() -> TestResult {
+    let catalog = Cli::try_parse_from(["harw", "model", "catalog", "--refresh"])
+        .map_err(ctx("`harw model catalog --refresh` sollte parsen"))?;
+    assert!(matches!(
+        catalog.command,
+        Some(Command::Model {
+            action: Some(ModelsAction::Catalog { refresh: true })
+        })
+    ));
+
+    let catalog = Cli::try_parse_from(["harw", "model", "catalog"])
+        .map_err(ctx("`harw model catalog` sollte parsen"))?;
+    assert!(matches!(
+        catalog.command,
+        Some(Command::Model {
+            action: Some(ModelsAction::Catalog { refresh: false })
+        })
+    ));
+
+    let remove = Cli::try_parse_from(["harw", "model", "remove", "openrouter/x"])
+        .map_err(ctx("`harw model remove ...` sollte parsen"))?;
+    assert!(matches!(
+        remove.command,
+        Some(Command::Model {
+            action: Some(ModelsAction::Remove { target })
+        }) if target == "openrouter/x"
+    ));
+
+    let bare = Cli::try_parse_from(["harw", "model"]).map_err(ctx("`harw model` sollte parsen"))?;
+    assert!(matches!(
+        bare.command,
+        Some(Command::Model { action: None })
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_model_internal_set_positional_model_does_not_set_global_model() -> TestResult {
+    // Das positionale `model` von `internal set` und das globale `--model`
+    // tragen verschiedene IDs; der Wert darf nicht nach oben durchsickern.
+    let cli = Cli::try_parse_from(["harw", "model", "internal", "set", "explorer", "some/model"])
+        .map_err(ctx("`harw model internal set ...` sollte parsen"))?;
+    assert_eq!(cli.global.model, None);
+    assert!(matches!(
+        cli.command,
+        Some(Command::Model {
+            action: Some(ModelsAction::Internal {
+                action: Some(InternalAction::Set { model, .. }),
+            }),
+        }) if model == "some/model"
+    ));
+    Ok(())
+}
+
+// ── Agenten und Wissen: agent, knowledge, jobs ──────────────────────────
+
+#[test]
+fn test_agent_skills_and_plugins_pass_hyphen_arguments_through() -> TestResult {
+    let cli = Cli::try_parse_from([
+        "harw", "agent", "skills", "install", "--force", "-x", "pfad",
+    ])
+    .map_err(ctx(
+        "`harw agent skills install --force -x pfad` sollte parsen",
+    ))?;
+    let Some(Command::Agent {
+        action: AgentAction::Skills { args },
+    }) = cli.command
+    else {
+        return Err(TestError::Unexpected(format!(
+            "erwartete Agent(Skills), bekam {:?}",
+            cli.command
+        )));
+    };
+    assert_eq!(args, vec!["install", "--force", "-x", "pfad"]);
+
+    let cli = Cli::try_parse_from(["harw", "agent", "skills"])
+        .map_err(ctx("`harw agent skills` ohne Argumente sollte parsen"))?;
+    assert!(matches!(
+        cli.command,
+        Some(Command::Agent {
+            action: AgentAction::Skills { args }
+        }) if args.is_empty()
+    ));
+
+    let cli = Cli::try_parse_from(["harw", "--json", "agent", "plugins", "list"])
+        .map_err(ctx("`harw --json agent plugins list` sollte parsen"))?;
+    assert!(cli.global.json);
+    assert!(matches!(
+        cli.command,
+        Some(Command::Agent {
+            action: AgentAction::Plugins { args }
+        }) if args == vec!["list".to_owned()]
+    ));
+
+    let cli = Cli::try_parse_from(["harw", "agent", "uia-new"])
+        .map_err(ctx("`harw agent uia-new` sollte parsen"))?;
+    assert!(matches!(
+        cli.command,
+        Some(Command::Agent {
+            action: AgentAction::UiaNew
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_knowledge_memory_proposals_and_index_parse() -> TestResult {
+    let memory = Cli::try_parse_from(["harw", "knowledge", "memory", "search", "rust --tief"])
+        .map_err(ctx("`harw knowledge memory search ...` sollte parsen"))?;
+    assert!(matches!(
+        memory.command,
+        Some(Command::Knowledge {
+            action: KnowledgeAction::Memory { args }
+        }) if args == vec!["search".to_owned(), "rust --tief".to_owned()]
+    ));
+
+    let proposals = Cli::try_parse_from(["harw", "knowledge", "proposals", "list"])
+        .map_err(ctx("`harw knowledge proposals list` sollte parsen"))?;
+    assert!(matches!(
+        proposals.command,
+        Some(Command::Knowledge {
+            action: KnowledgeAction::Proposals { args }
+        }) if args == vec!["list".to_owned()]
+    ));
+
+    let index = Cli::try_parse_from(["harw", "knowledge", "index"])
+        .map_err(ctx("`harw knowledge index` sollte parsen"))?;
+    assert!(matches!(
+        index.command,
+        Some(Command::Knowledge {
+            action: KnowledgeAction::Index { action: None }
+        })
+    ));
+
+    let build = Cli::try_parse_from([
+        "harw",
+        "knowledge",
+        "index",
+        "build",
+        "--source",
+        "knowledge",
+    ])
+    .map_err(ctx(
+        "`harw knowledge index build --source knowledge` sollte parsen",
+    ))?;
+    assert!(matches!(
+        build.command,
+        Some(Command::Knowledge {
+            action: KnowledgeAction::Index {
+                action: Some(LensAction::Build {
+                    source: Some(LensSource::Knowledge),
+                    force: false,
+                })
+            }
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_jobs_approve_note_and_deny_reason_parse() -> TestResult {
+    let approve = Cli::try_parse_from(["harw", "jobs", "approve", "job-1", "--note", "passt"])
+        .map_err(ctx("`harw jobs approve job-1 --note passt` sollte parsen"))?;
+    let Some(Command::Jobs {
+        action: JobsAction::Approve { id, note },
+    }) = approve.command
+    else {
+        return Err(TestError::Unexpected(format!(
+            "erwartete Jobs(Approve), bekam {:?}",
+            approve.command
+        )));
+    };
+    assert_eq!(id, "job-1");
+    assert_eq!(note.as_deref(), Some("passt"));
+
+    let deny = Cli::try_parse_from(["harw", "jobs", "deny", "job-2", "--reason", "zu riskant"])
+        .map_err(ctx("`harw jobs deny job-2 --reason ...` sollte parsen"))?;
+    let Some(Command::Jobs {
+        action: JobsAction::Deny { id, reason },
+    }) = deny.command
+    else {
+        return Err(TestError::Unexpected(format!(
+            "erwartete Jobs(Deny), bekam {:?}",
+            deny.command
+        )));
+    };
+    assert_eq!(id, "job-2");
+    assert_eq!(reason.as_deref(), Some("zu riskant"));
+
+    let approve_plain = Cli::try_parse_from(["harw", "jobs", "approve", "job-3"])
+        .map_err(ctx("`harw jobs approve job-3` sollte parsen"))?;
+    assert!(matches!(
+        approve_plain.command,
+        Some(Command::Jobs {
+            action: JobsAction::Approve { note: None, .. }
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_jobs_list_show_cancel_retry_parse() -> TestResult {
+    let list = Cli::try_parse_from(["harw", "jobs", "list"])
+        .map_err(ctx("`harw jobs list` sollte parsen"))?;
+    assert!(matches!(
+        list.command,
+        Some(Command::Jobs {
+            action: JobsAction::List { filter: None }
+        })
+    ));
+
+    let filtered = Cli::try_parse_from(["harw", "jobs", "list", "offen"])
+        .map_err(ctx("`harw jobs list offen` sollte parsen"))?;
+    assert!(matches!(
+        filtered.command,
+        Some(Command::Jobs {
+            action: JobsAction::List { filter: Some(f) }
+        }) if f == "offen"
+    ));
+
+    for verb in ["show", "cancel", "retry"] {
+        let cli = Cli::try_parse_from(["harw", "jobs", verb, "job-9"])
+            .map_err(ctx("`harw jobs show|cancel|retry ID` sollte parsen"))?;
+        let ok = matches!(
+            &cli.command,
+            Some(Command::Jobs {
+                action: JobsAction::Show { id } | JobsAction::Cancel { id } | JobsAction::Retry { id }
+            }) if id == "job-9"
+        );
+        assert!(ok, "`jobs {verb} job-9` falsch geparst: {:?}", cli.command);
+    }
+    Ok(())
+}
+
+// ── Dienste und System: channel, debug, sandbox ─────────────────────────
+
+#[test]
+fn test_channel_connect_telegram_with_pairing_code_parses() -> TestResult {
+    let cli = Cli::try_parse_from([
+        "harw",
+        "channel",
+        "connect",
+        "telegram",
+        "--pair",
+        "ABCD-EFGH",
+    ])
+    .map_err(ctx(
+        "`harw channel connect telegram --pair ...` sollte parsen",
+    ))?;
+    let Some(Command::Channel {
+        action: ChannelAction::Connect { channel, pair },
+    }) = cli.command
+    else {
+        return Err(TestError::Unexpected(format!(
+            "erwartete Channel(Connect), bekam {:?}",
+            cli.command
+        )));
+    };
+    assert_eq!(channel, Channel::Telegram);
+    assert_eq!(pair.as_deref(), Some("ABCD-EFGH"));
+
+    let misspelled = Cli::try_parse_from(["harw", "channel", "connect", "telegaram"]);
+    assert!(misspelled.is_err(), "`telegaram` muss abgelehnt werden");
+    Ok(())
+}
+
+#[test]
+fn test_debug_echo_and_classify_parse() -> TestResult {
+    let echo = Cli::try_parse_from(["harw", "debug", "echo", "hallo", "welt"])
+        .map_err(ctx("`harw debug echo hallo welt` sollte parsen"))?;
+    assert!(matches!(
+        echo.command,
+        Some(Command::Debug {
+            action: DebugAction::Echo { input }
+        }) if input == vec!["hallo".to_owned(), "welt".to_owned()]
+    ));
+
+    let classify = Cli::try_parse_from(["harw", "debug", "classify", "was", "ist", "das"])
+        .map_err(ctx("`harw debug classify ...` sollte parsen"))?;
+    assert!(matches!(
+        classify.command,
+        Some(Command::Debug {
+            action: DebugAction::Classify { input }
+        }) if input.len() == 3
+    ));
+
+    let empty = Cli::try_parse_from(["harw", "debug", "echo"]);
+    assert!(empty.is_err(), "`debug echo` ohne Eingabe muss scheitern");
+    Ok(())
+}
+
+#[test]
+fn test_sandbox_without_action_and_with_status_parse() -> TestResult {
+    let bare =
+        Cli::try_parse_from(["harw", "sandbox"]).map_err(ctx("`harw sandbox` sollte parsen"))?;
+    assert!(matches!(
+        bare.command,
+        Some(Command::Sandbox { action: None })
+    ));
+
+    let status = Cli::try_parse_from(["harw", "sandbox", "status"])
+        .map_err(ctx("`harw sandbox status` sollte parsen"))?;
+    assert!(matches!(
+        status.command,
+        Some(Command::Sandbox {
+            action: Some(SandboxAction::Status)
+        })
+    ));
+    Ok(())
+}
+
+// ── Versteckte ältere Schreibweisen ─────────────────────────────────────
+
+#[test]
+fn test_legacy_settings_provider_add_maps_to_config() -> TestResult {
+    let cli = Cli::try_parse_from([
+        "harw",
+        "settings",
+        "provider",
+        "add",
+        "x",
+        "--api",
+        "openai-chat",
+        "--base-url",
+        "http://localhost:1",
+    ])
+    .map_err(ctx("`harw settings provider add ...` sollte parsen"))?;
+    assert!(matches!(
+        cli.command,
+        Some(Command::Config {
+            action: Some(SettingsAction::Provider {
+                action: SettingsProviderAction::Add { .. }
+            })
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_legacy_models_delete_maps_to_model_remove() -> TestResult {
+    let cli = Cli::try_parse_from(["harw", "models", "delete", "a/b"])
+        .map_err(ctx("`harw models delete a/b` sollte parsen"))?;
+    assert!(matches!(
+        cli.command,
+        Some(Command::Model {
+            action: Some(ModelsAction::Remove { target })
+        }) if target == "a/b"
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_legacy_connect_without_pair_parses() -> TestResult {
+    let cli = Cli::try_parse_from(["harw", "connect", "--channel", "telegram"])
+        .map_err(ctx("`harw connect --channel telegram` sollte parsen"))?;
+    assert!(matches!(
+        cli.command,
+        Some(Command::Connect {
+            channel: Channel::Telegram,
+            pair: None
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_legacy_uia_new_parses() -> TestResult {
+    let cli =
+        Cli::try_parse_from(["harw", "uia", "new"]).map_err(ctx("`harw uia new` sollte parsen"))?;
+    assert!(matches!(
+        cli.command,
+        Some(Command::Uia {
+            action: UiaAction::New
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_legacy_run_classify_and_catalog_parse() -> TestResult {
+    let run = Cli::try_parse_from(["harw", "run", "hallo", "welt"])
+        .map_err(ctx("`harw run hallo welt` sollte parsen"))?;
+    assert!(matches!(
+        run.command,
+        Some(Command::Run { input }) if input == vec!["hallo".to_owned(), "welt".to_owned()]
+    ));
+
+    let classify = Cli::try_parse_from(["harw", "classify", "eine", "zeile"])
+        .map_err(ctx("`harw classify ...` sollte parsen"))?;
+    assert!(matches!(
+        classify.command,
+        Some(Command::Classify { input }) if input.len() == 2
+    ));
+
+    let catalog = Cli::try_parse_from(["harw", "catalog", "--refresh"])
+        .map_err(ctx("`harw catalog --refresh` sollte parsen"))?;
+    assert!(matches!(
+        catalog.command,
+        Some(Command::Catalog { refresh: true })
+    ));
+
+    let catalog =
+        Cli::try_parse_from(["harw", "catalog"]).map_err(ctx("`harw catalog` sollte parsen"))?;
+    assert!(matches!(
+        catalog.command,
+        Some(Command::Catalog { refresh: false })
+    ));
+    Ok(())
+}
+
+// ── Globale und Sitzungs-Flags ──────────────────────────────────────────
+
+#[test]
+fn test_approval_flag_accepts_all_three_modes() -> TestResult {
+    for (raw, expected) in [
+        ("ask", ApprovalMode::AlwaysAsk),
+        ("auto", ApprovalMode::Delegated),
+        ("full", ApprovalMode::FullAccess),
+    ] {
+        let cli = Cli::try_parse_from(["harw", "--approval", raw])
+            .map_err(ctx("`harw --approval ask|auto|full` sollte parsen"))?;
+        assert_eq!(cli.global.approval, Some(expected), "Wert `{raw}`");
+    }
+
+    let cli = Cli::try_parse_from(["harw", "chat", "--approval", "ask"])
+        .map_err(ctx("`--approval` hinter `chat` sollte parsen"))?;
+    assert_eq!(cli.global.approval, Some(ApprovalMode::AlwaysAsk));
+    Ok(())
+}
+
+#[test]
+fn test_approval_flag_rejects_an_unknown_value() -> TestResult {
+    let Err(error) = Cli::try_parse_from(["harw", "--approval", "immer"]) else {
+        return Err(TestError::Unexpected(
+            "ein unbekannter --approval-Wert muss scheitern".into(),
+        ));
+    };
+    assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+    Ok(())
+}
+
+#[test]
+fn test_profile_cwd_json_and_verbose_are_global() -> TestResult {
+    let cli = Cli::try_parse_from([
+        "harw",
+        "session",
+        "list",
+        "--profile",
+        "arbeit",
+        "-C",
+        "/tmp/projekt",
+        "--json",
+        "-v",
+    ])
+    .map_err(ctx("globale Flags hinter `session list` sollten parsen"))?;
+    assert_eq!(cli.global.profile.as_deref(), Some("arbeit"));
+    assert_eq!(cli.global.cwd, Some(PathBuf::from("/tmp/projekt")));
+    assert!(cli.global.json);
+    assert!(cli.global.verbose);
+    assert_eq!(cli.global.output(), crate::output::OutputFormat::Json);
+
+    let cli = Cli::try_parse_from(["harw", "--cwd", "/tmp/b", "--profile", "p", "doctor"])
+        .map_err(ctx("`--cwd`/`--profile` vor dem Befehl sollten parsen"))?;
+    assert_eq!(cli.global.cwd, Some(PathBuf::from("/tmp/b")));
+    assert_eq!(cli.global.profile.as_deref(), Some("p"));
+    assert!(matches!(cli.command, Some(Command::Doctor { .. })));
+    Ok(())
+}
+
+#[test]
+fn test_global_defaults_match_default_impl() -> TestResult {
+    let cli = Cli::try_parse_from(["harw"]).map_err(ctx("bare harw parses"))?;
+    let defaults = GlobalArgs::default();
+    assert_eq!(cli.global.log, defaults.log);
+    assert_eq!(cli.global.log, "info");
+    assert_eq!(cli.global.home, None);
+    assert_eq!(cli.global.profile, None);
+    assert_eq!(cli.global.cwd, None);
+    assert!(!cli.global.json);
+    assert!(!cli.global.verbose);
+    assert!(!cli.global.log_sensitive);
+    assert_eq!(cli.global.output(), crate::output::OutputFormat::Text);
+    assert!(cli.global.session_flags_used().is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_session_flags_used_lists_every_set_flag_in_order() -> TestResult {
+    let cli = Cli::try_parse_from([
+        "harw",
+        "--add-dir",
+        "/tmp/a",
+        "--goal",
+        "Ziel",
+        "--model",
+        "m",
+        "--approval",
+        "auto",
+        "--mode",
+        "explore",
+    ])
+    .map_err(ctx("alle Sitzungs-Flags sollten parsen"))?;
+    assert_eq!(
+        cli.global.session_flags_used(),
+        vec!["--mode", "--approval", "--model", "--goal", "--add-dir"]
+    );
+    Ok(())
+}
+
+#[test]
+fn test_session_flags_still_parse_on_other_commands() -> TestResult {
+    // Das Ablehnen bei Nicht-Sitzungsbefehlen geschieht nach dem Parsen;
+    // die Grammatik selbst akzeptiert die globalen Flags überall.
+    let cli = Cli::try_parse_from(["harw", "doctor", "--mode", "explore"])
+        .map_err(ctx("`harw doctor --mode explore` sollte parsen"))?;
+    assert_eq!(cli.global.session_flags_used(), vec!["--mode"]);
+    Ok(())
+}
+
+// ── analyze --order ─────────────────────────────────────────────────────
+
+#[test]
+fn test_analyze_order_top_down_parses() -> TestResult {
+    let cli = Cli::try_parse_from(["harw", "analyze", "--order", "top-down"])
+        .map_err(ctx("`harw analyze --order top-down` sollte parsen"))?;
+    let Some(Command::Analyze(args)) = cli.command else {
+        return Err(TestError::Unexpected(format!(
+            "erwartete Command::Analyze, bekam {:?}",
+            cli.command
+        )));
+    };
+    assert_eq!(args.order, AnalyzeOrder::TopDown);
+    assert_eq!(args.effective_order(), AnalyzeOrder::TopDown);
+
+    let invalid = Cli::try_parse_from(["harw", "analyze", "--order", "seitwärts"]);
+    assert!(invalid.is_err(), "unbekannte Reihenfolge muss scheitern");
+    Ok(())
+}
+
+#[test]
+fn test_analyze_hidden_order_flags_still_work_alone() -> TestResult {
+    let cli = Cli::try_parse_from(["harw", "analyze", "--top-down"])
+        .map_err(ctx("`harw analyze --top-down` sollte parsen"))?;
+    let Some(Command::Analyze(args)) = cli.command else {
+        return Err(TestError::Unexpected(format!(
+            "erwartete Command::Analyze, bekam {:?}",
+            cli.command
+        )));
+    };
+    assert_eq!(args.effective_order(), AnalyzeOrder::TopDown);
+
+    let cli = Cli::try_parse_from(["harw", "analyze", "--bottom-up"])
+        .map_err(ctx("`harw analyze --bottom-up` sollte parsen"))?;
+    let Some(Command::Analyze(args)) = cli.command else {
+        return Err(TestError::Unexpected(format!(
+            "erwartete Command::Analyze, bekam {:?}",
+            cli.command
+        )));
+    };
+    assert_eq!(args.effective_order(), AnalyzeOrder::BottomUp);
+    Ok(())
+}
+
+#[test]
+fn test_hidden_order_flags_conflict_with_order() {
+    for argv in [
+        ["harw", "analyze", "--bottom-up", "--order", "top-down"],
+        ["harw", "analyze", "--order", "top-down", "--bottom-up"],
+        ["harw", "analyze", "--bottom-up", "--order", "bottom-up"],
+        ["harw", "analyze", "--top-down", "--order", "bottom-up"],
+        ["harw", "analyze", "--order", "top-down", "--top-down"],
+    ] {
+        let result = Cli::try_parse_from(argv);
+        assert!(
+            matches!(&result, Err(error) if error.kind() == clap::error::ErrorKind::ArgumentConflict),
+            "{argv:?} muss mit einem Konflikt scheitern, bekam {result:?}"
+        );
+    }
 }

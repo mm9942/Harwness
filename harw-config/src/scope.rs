@@ -231,7 +231,7 @@ pub struct FieldScope {
     /// eindeutigen einzelnen TOML-Container zugeordnet werden können
     /// (`RuleToml` wird sowohl von `permissions.allow[]` als auch von
     /// `permissions.deny[]` verwendet; `InternalModelChoice` von jeder der
-    /// acht `internal_models.<stelle>`-Stellen), übernehmen die exakte
+    /// zehn `internal_models.<stelle>`-Stellen), übernehmen die exakte
     /// Pfad-Schreibweise aus Abschnitt 6.3 der Spezifikation
     /// (`"RuleToml.tool"`, `"RuleToml.pattern"`,
     /// `"InternalModelChoice.provider/.model"`).
@@ -264,8 +264,8 @@ pub struct FieldScope {
 /// Die zentrale, öffentliche Deklarationstabelle: ein Eintrag pro
 /// `HarnessConfig`-Blattfeld (`docs/design/config-scopes.md` Abschnitt 6.3),
 /// in derselben Reihenfolge wie Abschnitt 1/6.3 der Spezifikation, damit die
-/// Tabelle 1:1 dagegen geprüft werden kann. Exakt 90 Einträge (Abschnitt 6.3
-/// Kontrollsumme: `ProfileReplaces` 42 · `GlobalOnly` 11 · `MinBound` 12 ·
+/// Tabelle 1:1 dagegen geprüft werden kann. Exakt 92 Einträge (Abschnitt 6.3
+/// Kontrollsumme: `ProfileReplaces` 44 · `GlobalOnly` 11 · `MinBound` 12 ·
 /// `CompositeMember` 11 · `Intersection` 4 · `OrBool` 3 · `Union` 2 ·
 /// `AndBool` 2 · `StricterOf` 2 · `PerFileValidated` 1).
 ///
@@ -354,7 +354,7 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "sandbox.tmux", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "sandbox.tmux.mode", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "sandbox.tmux.socket_path", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
-    // 1.13 [internal_models] (10)
+    // 1.13 [internal_models] (12)
     FieldScope { path: "internal_models.use_openrouter_defaults", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "internal_models.session_title", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "internal_models.compaction_summary", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
@@ -364,6 +364,8 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "internal_models.research", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "internal_models.worker_simple", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "internal_models.worker_complex", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "internal_models.root_orchestrator", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "internal_models.sub_orchestrator", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "InternalModelChoice.provider/.model", scope: Scope::Profile, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: false },
     // 1.14 [compaction] (2)
     FieldScope { path: "compaction.absolute_ceiling_tokens", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
@@ -390,8 +392,8 @@ mod merge_rule_tests {
     use crate::test_support::{TestError, TestResult};
 
     #[test]
-    fn test_field_table_has_exactly_89_entries() {
-        assert_eq!(FIELD_TABLE.len(), 90);
+    fn test_field_table_has_exactly_92_entries() {
+        assert_eq!(FIELD_TABLE.len(), 92);
     }
 
     #[test]
@@ -406,7 +408,7 @@ mod merge_rule_tests {
     #[test]
     fn test_merge_rule_variant_control_sum_matches_abschnitt_6_3() {
         let count = |rule: MergeRule| FIELD_TABLE.iter().filter(|f| f.merge == rule).count();
-        assert_eq!(count(MergeRule::ProfileReplaces), 42);
+        assert_eq!(count(MergeRule::ProfileReplaces), 44);
         assert_eq!(count(MergeRule::GlobalOnly), 11);
         assert_eq!(count(MergeRule::MinBound), 12);
         assert_eq!(count(MergeRule::CompositeMember), 11);

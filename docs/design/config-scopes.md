@@ -210,6 +210,8 @@ Section-Default zurückgesetzt (Bug); **ÜBERNOMMEN** = explizite Ausnahme
 | `internal_models.research` | `Option<InternalModelChoice>` | `None` | `internal_models.rs:172` | ÜBERNOMMEN, feingranular |
 | `internal_models.worker_simple` | `Option<InternalModelChoice>` | `None` | `internal_models.rs:174` | ÜBERNOMMEN, feingranular |
 | `internal_models.worker_complex` | `Option<InternalModelChoice>` | `None` | `internal_models.rs:176` | ÜBERNOMMEN, feingranular |
+| `internal_models.root_orchestrator` | `Option<InternalModelChoice>` | `None` (→ Hauptmodell, nie OpenRouter-Standard) | `internal_models.rs` | ÜBERNOMMEN, feingranular |
+| `internal_models.sub_orchestrator` | `Option<InternalModelChoice>` | `None` (→ Hauptmodell, nie OpenRouter-Standard) | `internal_models.rs` | ÜBERNOMMEN, feingranular |
 | `InternalModelChoice.provider`/`.model` (Feld jeder Stelle) | `Option<String>` je | `None` | `internal_models.rs:143-145` | Teil der jeweiligen Stelle, s.o. |
 
 ### 1.14 `[compaction]` (`harness_config.rs:105-117`)
@@ -241,10 +243,10 @@ Section-Default zurückgesetzt (Bug); **ÜBERNOMMEN** = explizite Ausnahme
 | `guards.no_progress_rounds_abort` | `Option<u32>` | `None` → `8` | `harness_config.rs:171` | ERSETZT |
 | `guards.plan_stale_rounds` | `Option<u32>` | `None` → `6` | `harness_config.rs:174` | ERSETZT |
 
-**Gesamtzahl dokumentierter `HarnessConfig`-Felder: 90** (Blattfelder inkl.
+**Gesamtzahl dokumentierter `HarnessConfig`-Felder: 92** (Blattfelder inkl.
 verschachtelter Typen wie `McpPrincipalToml`, `RuleToml`,
 `CargoSandboxToml`/`TmuxSandboxToml`, `InternalModelChoice`,
-`OnboardingSeen`; dazu `base_dir` als 90. Tabellenzeile in Abschnitt 1.1,
+`OnboardingSeen`; dazu `base_dir` als zusätzliche Tabellenzeile in Abschnitt 1.1,
 aber **kein TOML-Feld** — `#[serde(skip)]`, daher nicht mitgezählt).
 
 Außerhalb der `HarnessConfig` selbst, aber im selben `config.toml` und mit
@@ -331,7 +333,7 @@ Gruppierung hier fasst strukturgleiche Unterfelder weiterhin zusammen).
 | `permissions.extra_roots` | **GLOBAL, Schnittmenge** (entschieden 2026-09-21) | `Intersection` | Erweitert erlaubte Arbeitswurzeln — analog zu `permissions.allow` eine potenzielle Rechteausweitung; dieselbe Schnittmengen-Logik: ein Profil kann nur eine Teilmenge der global gesetzten Wurzeln referenzieren, nichts Neues öffnen. | 🔒 |
 | `sandbox.cargo.*` | GLOBAL exklusiv | Profil darf nicht setzen/überschreiben | Vertrauensanker für die Cargo-Sandbox; Moduldoku (`harness_config.rs:70-74`) verlangt ausdrücklich, dass diese Werte nur beim Runtime-Aufbau aus der (vertrauten) Konfiguration gelesen werden. Direkte Analogie zu `browser.geckodriver_path`/`geckodriver_sha256` und `dod.proof_key_dir`, die bereits nie aus einem Repo-Layer übernommen werden (`browser_toml.rs:18-25`, `dod_toml.rs:22-31`). | 🔒 |
 | `sandbox.tmux.*` | GLOBAL exklusiv | Profil darf nicht setzen/überschreiben | s.o. | 🔒 |
-| `internal_models.*` (alle 9 Felder) | PROFIL | letzter gesetzter Wert gewinnt (bereits korrekt implementiert) | Modell-Routing für Hilfsaufgaben ist Nutzerpräferenz/Kostensteuerung, keine Zugriffsbeschränkung. | |
+| `internal_models.*` (alle 11 Felder) | PROFIL | letzter gesetzter Wert gewinnt (bereits korrekt implementiert) | Modell-Routing für Hilfsaufgaben ist Nutzerpräferenz/Kostensteuerung, keine Zugriffsbeschränkung. | |
 | `compaction.absolute_ceiling_tokens` | **GLOBAL als Obergrenze (Minimum)** (entschieden 2026-09-21) | `MinBound` | Admin erzwingt eine Kostenobergrenze; das Profil darf nur senken, nie über die globale Grenze hinausgehen. | |
 | `reasoning.*` (alle 6 Felder) | PROFIL | letzter gesetzter Wert gewinnt | Reasoning-Effort ist ein Kosten-/Geschwindigkeits-Kompromiss, keine Zugriffsbeschränkung. | |
 | `guards.enabled` | GLOBAL (Baseline) + Profil darf nur verschärfen | **OR** (Wert `true` gewinnt) | Sicherheits-/Stabilitäts-Wächter; Abschalten wäre eine Lockerung, analog `tools.plan.validate_*`. | |
@@ -605,7 +607,7 @@ festgelegt**, da sie im heutigen Code an keiner Stelle kodiert sind:
   dritter Wert nie stillschweigend in die Ordnung einsortiert wird;
   abgesichert durch Test #24 (Abschnitt 7h).
 
-### 6.3 Vollständige Feld-für-Feld-Zuordnung (alle 90 Felder)
+### 6.3 Vollständige Feld-für-Feld-Zuordnung (alle 92 Felder)
 
 Eine Zeile je Blattfeld aus Abschnitt 1, in derselben Reihenfolge und mit
 denselben Unterabschnittsnummern, damit die Tabelle 1:1 gegen Abschnitt 1
@@ -717,7 +719,7 @@ Variante.
 `sandbox.cargo.rustup_home`, `sandbox.cargo.cargo_home`, `sandbox.tmux`,
 `sandbox.tmux.mode`, `sandbox.tmux.socket_path`.
 
-**1.13 `[internal_models]`** (10 Felder)
+**1.13 `[internal_models]`** (12 Felder)
 
 | Pfad | Scope | Regel |
 |---|---|---|
@@ -730,6 +732,8 @@ Variante.
 | `internal_models.research` | Profile | `ProfileReplaces` |
 | `internal_models.worker_simple` | Profile | `ProfileReplaces` |
 | `internal_models.worker_complex` | Profile | `ProfileReplaces` |
+| `internal_models.root_orchestrator` | Profile | `ProfileReplaces` |
+| `internal_models.sub_orchestrator` | Profile | `ProfileReplaces` |
 | `InternalModelChoice.provider`/`.model` (Feld jeder Stelle) | — | `CompositeMember` (reist als Teil der atomaren `Option<InternalModelChoice>` der jeweiligen Stelle, s. o.; nie einzeln gemergt) |
 
 **1.14 `[compaction]`** (2): `compaction.absolute_ceiling_tokens` — Global /
@@ -750,9 +754,10 @@ Variante.
 | `guards.no_progress_rounds_abort` | Global | `MinBound` |
 | `guards.plan_stale_rounds` | Global | `MinBound` |
 
-**Verteilung (Kontrollsumme = 90, Stand 2026-09-23 nach R1/R2-Entscheidung
-plus Ergänzungen `uia_worker_model` und `compaction.max_history_bytes`):**
-`ProfileReplaces` 42 · `GlobalOnly` 11 · `MinBound` 12 · `CompositeMember` 11 ·
+**Verteilung (Kontrollsumme = 92, Stand 2026-09-24 nach R1/R2-Entscheidung
+plus Ergänzungen `uia_worker_model`, `compaction.max_history_bytes` und
+`internal_models.root_orchestrator`/`.sub_orchestrator`):**
+`ProfileReplaces` 44 · `GlobalOnly` 11 · `MinBound` 12 · `CompositeMember` 11 ·
 `Intersection` 4 · `OrBool` 3 · `Union` 2 · `AndBool` 2 · `StricterOf` 2 ·
 `PerFileValidated` 1. (Vor der R2-Entscheidung: `GlobalOnly` 17 ·
 `CompositeMember` 6 · `Intersection` 3 — die Ummappung von
@@ -766,7 +771,9 @@ Ergänzung von `uia_worker_model` als `ProfileReplaces` erhöht die Summe auf
 89 und `ProfileReplaces` von 40 auf 41, ohne die übrigen Varianten zu
 berühren; `compaction.max_history_bytes` (Byte-Budget der Verlaufsfenster,
 überschreibt die aus dem Kontextfenster abgeleitete Grenze) hebt sie auf 90 und
-`ProfileReplaces` auf 42.)
+`ProfileReplaces` auf 42; die Orchestrator-Modellstellen
+`internal_models.root_orchestrator`/`.sub_orchestrator` heben sie auf 92 und
+`ProfileReplaces` auf 44.)
 
 ---
 

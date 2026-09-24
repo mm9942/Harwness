@@ -9,7 +9,7 @@
 //! Blattfeld wird zusätzlich zur Laufzeit geprüft, dass `FIELD_TABLE` genau
 //! einen Eintrag mit dem erwarteten, gepunkteten Pfad trägt.
 //!
-//! Die Laufzeit-Sanity-Checks "FIELD_TABLE.len() == 88" und "keine
+//! Die Laufzeit-Sanity-Checks "FIELD_TABLE.len() == 92" und "keine
 //! doppelten Pfade" existieren bereits in `harw-config/src/scope.rs`
 //! (`mod merge_rule_tests`, Paket A) und werden hier bewusst **nicht**
 //! dupliziert — dieser Datei obliegt ausschließlich der destrukturierende
@@ -473,7 +473,7 @@ fn test_field_table_exhaustive_tmux_sandbox_toml() {
 }
 
 // ---------------------------------------------------------------------
-// [internal_models] (Abschnitt 1.13, 9 Container-Felder + InternalModelChoice)
+// [internal_models] (Abschnitt 1.13, 11 Container-Felder + InternalModelChoice)
 // ---------------------------------------------------------------------
 
 #[test]
@@ -488,6 +488,8 @@ fn test_field_table_exhaustive_internal_models_toml() {
         research,
         worker_simple,
         worker_complex,
+        root_orchestrator,
+        sub_orchestrator,
     } = InternalModelsToml::default();
     let _ = (
         use_openrouter_defaults,
@@ -499,6 +501,8 @@ fn test_field_table_exhaustive_internal_models_toml() {
         research,
         worker_simple,
         worker_complex,
+        root_orchestrator,
+        sub_orchestrator,
     );
     for path in [
         "internal_models.use_openrouter_defaults",
@@ -510,6 +514,8 @@ fn test_field_table_exhaustive_internal_models_toml() {
         "internal_models.research",
         "internal_models.worker_simple",
         "internal_models.worker_complex",
+        "internal_models.root_orchestrator",
+        "internal_models.sub_orchestrator",
     ] {
         assert_path_in_field_table_exactly_once(path);
     }
@@ -521,7 +527,7 @@ fn test_field_table_exhaustive_internal_model_choice() {
     let _ = (provider, model);
     // Ein einziger FIELD_TABLE-Eintrag deckt bewusst beide Felder ab
     // (Abschnitt 6.3/1.13: "InternalModelChoice.provider/.model" reist als
-    // atomarer CompositeMember jeder der acht Modellstellen).
+    // atomarer CompositeMember jeder der zehn Modellstellen).
     assert_path_in_field_table_exactly_once("InternalModelChoice.provider/.model");
 }
 
