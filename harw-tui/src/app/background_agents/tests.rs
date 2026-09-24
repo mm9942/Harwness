@@ -734,8 +734,8 @@ fn the_launch_result_carries_the_note_only_after_an_interrupted_start() {
 #[test]
 fn notice_first_line_names_the_child_model_route() -> TestResult {
     let notice = harw_core::background_children::BackgroundNotice {
-        child: harw_types::SessionId::try_from_str("child-1")?,
-        parent: harw_types::SessionId::try_from_str("root")?,
+        child: harw_types::SessionId::try_from_str("child-1").map_err(ctx("child id"))?,
+        parent: harw_types::SessionId::try_from_str("root").map_err(ctx("parent id"))?,
         role: "matrix-game-master".to_owned(),
         status: BackgroundStatus::Failed,
         text: "Fehler".to_owned(),

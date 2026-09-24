@@ -101,7 +101,7 @@ pub(super) fn export_model_label(
             provider
                 .as_deref()
                 .is_none_or(|provider| entry.provider == provider)
-                && (entry.id == model || entry.aliases.iter().any(|alias| *alias == model))
+                && (entry.id == model || entry.aliases.contains(&model.to_owned()))
         })
     });
     let (provider, model) = match resolved {
