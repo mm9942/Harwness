@@ -92,6 +92,10 @@ toml = { workspace = true }
 # über denselben kommentarerhaltenden Editor wie `/permissions`.
 # Version bewusst identisch zu harw-config gepinnt (ein einziges resolvtes toml_edit).
 toml_edit = "0.25.13"
+# `/matrix` (Matrix Game live): deterministischer Spielkern (Szenario,
+# Journal, Sichtbarkeit, Phasen, Prompts, AAR). Kein Zyklus: `harw-matrix-game`
+# hat keine harw-Abhängigkeiten.
+harw-matrix-game = { path = "../harw-matrix-game" }
 
 [features]
 # Forwards to harw-provider's ChatGPT OAuth flag so `--features chatgpt-oauth`

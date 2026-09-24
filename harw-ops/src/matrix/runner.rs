@@ -270,9 +270,10 @@ pub struct SpawnerDriver {
 }
 
 impl SpawnerDriver {
-    /// Baut den Treiber aus dem Op-Kontext. Die Kind-Sandbox ist die
-    /// Parent-Sandbox ohne jede Berechtigung und ohne Netz — die Sitz-Rollen
-    /// sind werkzeuglos.
+    /// Baut den Treiber aus dem Op-Kontext. Jeder Sitz bekommt (mit
+    /// [`Self::with_materials`]) seine Unterlagen-Kopie als Workspace mit
+    /// `{ReadWorkspace}` ∩ Parent-Rechten und ohne Netz; ohne Kopie die
+    /// Parent-Sandbox ohne jede Berechtigung.
     ///
     /// # Errors
     /// [`OpError::NotAvailable`] ohne Spawner oder StateStore.
@@ -583,10 +584,8 @@ fn role_label(role: SeatRole) -> &'static str {
 
 impl MatrixRun {
     /// Eröffnet ein Spiel (Setup: `GameCreated`, Deklarationen, Briefings).
-    /// Mit `run_dir` werden Verzeichnis, Szenario-Kopie und Journal angelegt.
-    ///
-    /// # Errors
-    /// [`OpError::Execution`] bei Kern- oder Dateifehlern.
+    /// Mit `run_dir` werden Verzeichnis, Szenario-Kopie, Journal und die
+    /// Unterlagen-Kopien je Sitz (`materials/<sitz>/`) angelegt.
     /// `scenario_path` ist der Pfad der Szenario-Datei (für relative
     /// `[materials]`-Ordner; `None` bei gebündelten Szenarien).
     ///
@@ -658,6 +657,11 @@ impl MatrixRun {
             seats.push(Seat::Umpire);
             for seat in &seats {
                 let key = seat_key(seat);
+                if !safe_component(&key) {
+                    return Err(OpError::InvalidArguments(format!(
+                        "Sitz-ID `{key}` taugt nicht als Ordnername"
+                    )));
+                }
                 let report = build_seat_materials(
                     source_dir.as_deref(),
                     &log.state.players,
@@ -1794,16 +1798,6 @@ impl MatrixRun {
         ))
     }
 
-    /// Gibt die Sitz-Kinder zurück (für die Freigabe außerhalb eines Schritts).
-    pub fn take_children(&mut self) -> BTreeMap<String, SessionId> {
-        std::mem::take(&mut self.children)
-    }
-
-    /// Übernimmt Sitz-Kinder zurück.
-    pub fn restore_children(&mut self, children: BTreeMap<String, SessionId>) {
-        self.children = children;
-    }
-
     // ── Anzeige ─────────────────────────────────────────────────────────────
 
     /// Daten für `/matrix show` (Form siehe Moduldoku von `super`).
@@ -2540,24 +2534,24 @@ mod tests {
     }
 
     fn scripted_answer(prompt: &str, seat: &str) -> String {
-        // Der Turn-Prompt endet mit dem Contract-Namen.
-        if prompt.contains("`briefing_ack`") {
-            r#"{"ack":true,"intent":"Wir halten Kurs."}"#.to_owned()
-        } else if prompt.contains("`negotiation_request`") {
-            r#"{"requests":[]}"#.to_owned()
-        } else if prompt.contains("`negotiation_message`") {
-            r#"{"messages":[]}"#.to_owned()
-        } else if prompt.contains("`player_argument`") {
-            format!(
+        // Turn- und Reparatur-Prompt enden mit „… nach Vertrag `<name>`.“
+        let contract = prompt
+            .rsplit_once("nach Vertrag `")
+            .and_then(|(_, rest)| rest.split('`').next())
+            .unwrap_or_default();
+        match contract {
+            "briefing_ack" => r#"{"ack":true,"intent":"Wir halten Kurs."}"#.to_owned(),
+            "negotiation_request" => r#"{"requests":[]}"#.to_owned(),
+            "negotiation_message" => r#"{"messages":[]}"#.to_owned(),
+            "player_argument" => format!(
                 r#"{{"action":"Die Fraktion {seat} verstärkt ihre Präsenz am Hafen.","pros":["Sie hat Leute vor Ort.","Die Lage verlangt Handeln."]}}"#
-            )
-        } else if prompt.contains("`counter_argument`") {
-            r#"{"counters":[]}"#.to_owned()
-        } else if prompt.contains("`umpire_narration`") {
-            r#"{"narrations":[],"round_summary":"Eine ruhige Runde."}"#.to_owned()
-        } else {
+            ),
+            "counter_argument" => r#"{"counters":[]}"#.to_owned(),
+            "umpire_narration" => {
+                r#"{"narrations":[],"round_summary":"Eine ruhige Runde."}"#.to_owned()
+            }
             // Adjudikation: absichtlich ungültig → Ersatzurteil greift.
-            "kein JSON".to_owned()
+            _ => "kein JSON".to_owned(),
         }
     }
 
