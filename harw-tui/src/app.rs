@@ -11480,6 +11480,379 @@ forbidden = [{forbidden}]
         Ok(())
     }
 
+    /// `PickerTarget::Role` synthetisiert `/models set <rolle> <provider>/<modell>`.
+    #[test]
+    fn model_switch_accept_for_role_target_emits_models_set() -> TestResult {
+        let providers = vec![ProviderEntry {
+            id: "anthropic".to_owned(),
+            label: "Anthropic".to_owned(),
+        }];
+        let models = vec![(
+            "anthropic".to_owned(),
+            vec![ModelEntry {
+                id: "claude-sonnet".to_owned(),
+                label: "Claude Sonnet".to_owned(),
+            }],
+        )];
+        let target = PickerTarget::Role {
+            role: harw_config::ModelRole::Orchestrator,
+        };
+        let expected = target.command_line("anthropic", "claude-sonnet");
+        let picker = ModelSwitchPicker::new(target, providers, models, None, None)
+            .ok_or(TestError::Missing("providers fixture ist nicht leer"))?;
+        let mut app = test_chat_app()?;
+        app.overlay = Some(Overlay::ModelSwitch(Box::new(picker)));
+        let (bus, mut receiver) = harw_event_channel();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_key(&mut app, enter, &bus);
+        if app.overlay.is_some() {
+            handle_key(&mut app, enter, &bus);
+        }
+        assert!(app.overlay.is_none());
+        match receiver.try_recv() {
+            Ok(HarwEvent::Command(command)) => {
+                assert_eq!(command, expected);
+                assert!(command.starts_with("/models set "), "{command}");
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartete /models set, bekam {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    // ── T21: lokale Befehle, Ansichten, Werkbank, Erwähnungen ──────────
+
+    /// `/help` öffnet die generische Hilfe-Ansicht, `/workbench` blendet die
+    /// Werkbank ein und markiert sie zum Laden.
+    #[test]
+    fn local_intercept_opens_views_and_toggles_workbench() -> TestResult {
+        let mut app = test_chat_app()?;
+        let (bus, _receiver) = harw_event_channel();
+
+        let help = local_intercept_for(&app, "/help").ok_or(TestError::Missing("help"))?;
+        assert!(apply_local_intercept(&mut app, help, &bus).is_none());
+        assert!(matches!(app.overlay, Some(Overlay::View(_))));
+
+        app.overlay = None;
+        let workbench =
+            local_intercept_for(&app, "/workbench").ok_or(TestError::Missing("workbench"))?;
+        assert!(apply_local_intercept(&mut app, workbench, &bus).is_none());
+        assert!(app.panels.workbench_visible);
+        assert!(app.workbench_needs_refresh());
+
+        // Befehle mit Argumenten bleiben beim regulären Dispatch.
+        assert!(local_intercept_for(&app, "/model switch x").is_none());
+        assert!(local_intercept_for(&app, "/status").is_none());
+        Ok(())
+    }
+
+    /// `#notiz` und `/sessions` werden zu Slash-Zeilen umgeschrieben und
+    /// erneut über den Command-Kanal geschickt; `@rolle` wird Chat.
+    #[test]
+    fn local_intercept_rewrites_notes_and_routes_mentions_to_chat() -> TestResult {
+        let mut app = test_chat_app()?;
+        let (bus, mut receiver) = harw_event_channel();
+
+        let note = local_intercept_for(&app, "#Merken").ok_or(TestError::Missing("note"))?;
+        assert!(apply_local_intercept(&mut app, note, &bus).is_none());
+        match receiver.try_recv() {
+            Ok(HarwEvent::Command(command)) => assert!(
+                command == "/diary note Merken" || command == "/memory record Merken",
+                "{command}"
+            ),
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "erwartete Rewrite, bekam {other:?}"
+                )));
+            }
+        }
+
+        let sessions =
+            local_intercept_for(&app, "/sessions").ok_or(TestError::Missing("sessions"))?;
+        assert!(apply_local_intercept(&mut app, sessions, &bus).is_none());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(HarwEvent::Command(command)) if command == "/resume"
+        ));
+
+        let role = KNOWN_ROLES
+            .first()
+            .ok_or(TestError::Missing("bekannte Rolle"))?;
+        let mention = local_intercept_for(&app, &format!("@{role} bitte prüfen"))
+            .ok_or(TestError::Missing("mention"))?;
+        assert!(apply_local_intercept(&mut app, mention, &bus).is_none());
+        let queued = app
+            .pending_turns
+            .pop_front()
+            .ok_or(TestError::Missing("chat turn"))?;
+        assert!(queued.contains(role), "{queued}");
+        assert!(queued.contains("bitte prüfen"), "{queued}");
+        Ok(())
+    }
+
+    /// `/clear` leert nur die Anzeige; `/verbose` schaltet die Werkzeug-
+    /// Ausführlichkeit um.
+    #[test]
+    fn local_clear_and_verbose_change_display_state() -> TestResult {
+        let mut app = test_chat_app()?;
+        let (bus, _receiver) = harw_event_channel();
+        app.push_line(Role::User, "hallo");
+        app.push_line(Role::Assistant, "welt");
+        let exported = app.export_entries.len();
+
+        let clear = local_intercept_for(&app, "/clear").ok_or(TestError::Missing("clear"))?;
+        apply_local_intercept(&mut app, clear, &bus);
+        // Nur die Hinweiszeile bleibt; der Export-Verlauf ist unverändert.
+        assert_eq!(app.cells_len(), 1);
+        assert_eq!(app.export_entries.len(), exported);
+
+        let before = app.tool_verbosity;
+        let verbose = local_intercept_for(&app, "/verbose").ok_or(TestError::Missing("verbose"))?;
+        apply_local_intercept(&mut app, verbose, &bus);
+        assert_ne!(app.tool_verbosity, before);
+        Ok(())
+    }
+
+    /// F6 öffnet das Kanban-Board als generische Ansicht und reiht dessen
+    /// Initial-Abruf ein; ohne Runtime landet ein Fehler in der Ansicht,
+    /// nicht im Chat.
+    #[tokio::test]
+    async fn view_hotkey_opens_kanban_and_fetch_does_not_touch_chat() -> TestResult {
+        let mut app = test_chat_app()?;
+        let (bus, _receiver) = harw_event_channel();
+        assert!(handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
+            &bus
+        ));
+        assert!(matches!(app.overlay, Some(Overlay::View(_))));
+        assert!(app.pending_fetches.contains(&DataFetch::Overlay {
+            command: crate::kanban_board::REFRESH_COMMAND.to_owned(),
+            generation: app.overlay_generation,
+        }));
+
+        let cells = app.cells_len();
+        assert!(process_pending_fetches(&mut app).await);
+        assert_eq!(
+            app.cells_len(),
+            cells,
+            "Datenabruf schreibt nie in den Chat"
+        );
+        assert!(app.pending_fetches.is_empty());
+        assert!(!process_pending_fetches(&mut app).await);
+        Ok(())
+    }
+
+    /// Ein Abruf für eine inzwischen ersetzte Ansicht wird verworfen.
+    #[tokio::test]
+    async fn stale_overlay_fetch_is_dropped_after_view_replaced() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.open_overlay_view(Box::new(KanbanBoard::new()));
+        let stale_generation = app.overlay_generation;
+        app.open_overlay_view(Box::new(HelpOverlay::new(
+            &app.command_registry,
+            &app.key_bindings,
+            HelpTab::Keys,
+        )));
+        assert_ne!(stale_generation, app.overlay_generation);
+        assert!(app.pending_fetches.iter().all(|fetch| matches!(
+            fetch,
+            DataFetch::Overlay { generation, .. } if *generation == stale_generation
+        )));
+        // Läuft ohne Wirkung auf die neue Ansicht durch.
+        process_pending_fetches(&mut app).await;
+        assert!(matches!(app.overlay, Some(Overlay::View(_))));
+        Ok(())
+    }
+
+    /// Generische Ansicht: `Prefill` schließt und füllt den Composer, `Run`
+    /// schickt die Zeile über den Bus und lässt die Ansicht offen.
+    #[test]
+    fn overlay_outcomes_prefill_and_run() -> TestResult {
+        let mut app = test_chat_app()?;
+        let (bus, mut receiver) = harw_event_channel();
+        app.open_overlay_view(Box::new(KanbanBoard::new()));
+
+        apply_overlay_outcome(
+            &mut app,
+            OverlayOutcome::Run("/kanban show".to_owned()),
+            &bus,
+        );
+        assert!(matches!(app.overlay, Some(Overlay::View(_))));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(HarwEvent::Command(command)) if command == "/kanban show"
+        ));
+
+        apply_overlay_outcome(
+            &mut app,
+            OverlayOutcome::Prefill("/kanban add ".to_owned()),
+            &bus,
+        );
+        assert!(app.overlay.is_none());
+        assert_eq!(app.input(), "/kanban add ");
+        Ok(())
+    }
+
+    /// Werkbank-Tasten: `n` füllt den Composer und gibt den Fokus ab, `R`
+    /// lädt still neu (kein Chat-Befehl).
+    #[test]
+    fn workbench_focus_keys_prefill_and_refresh() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.panels.workbench_visible = true;
+        app.panels.focus = crate::panes::PaneFocus::Workbench;
+        app.workbench.apply_error("noch nicht geladen".to_owned());
+        assert!(!app.workbench.is_stale());
+
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert_eq!(
+            handle_panel_key(&mut app, key(KeyCode::Char('R'))),
+            Some(true)
+        );
+        assert!(app.workbench.is_stale());
+        assert!(app.pending_commands.is_empty());
+
+        assert_eq!(
+            handle_panel_key(&mut app, key(KeyCode::Char('n'))),
+            Some(true)
+        );
+        assert_eq!(app.input(), crate::workbench_pane::NOTE_PREFILL);
+        assert_eq!(app.panels.focus, crate::panes::PaneFocus::Chat);
+        Ok(())
+    }
+
+    /// Stufe 2 des Befehls-Popups: nach `/model ` erscheinen die
+    /// Unterkommandos; Enter ohne Suchtext sendet ab, mit Suchtext wird
+    /// vervollständigt.
+    #[test]
+    fn subcommand_popup_after_complete_command() -> TestResult {
+        let mut app = test_chat_app()?;
+        let Some(spec) = app.command_registry.find("model") else {
+            return Ok(());
+        };
+        if spec.subcommands.is_empty() {
+            return Ok(());
+        }
+
+        app.input.insert_str("/model ");
+        app.sync_popup();
+        assert!(matches!(
+            app.command_popup.as_ref().map(CommandPopup::mode),
+            Some(PopupMode::Subcommand { .. })
+        ));
+        let (bus, mut receiver) = harw_event_channel();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(handle_key(&mut app, enter, &bus));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(HarwEvent::Command(command)) if command.trim() == "/model"
+        ));
+
+        app.input.insert_str("/model sh");
+        app.sync_popup();
+        assert!(handle_key(&mut app, enter, &bus));
+        assert_eq!(app.input(), "/model show ");
+        assert!(receiver.try_recv().is_err());
+
+        // Argumente nach dem Unterkommando schließen das Popup.
+        app.input.clear();
+        app.input.insert_str("/model switch x");
+        app.sync_popup();
+        assert!(app.command_popup.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn subcommand_query_is_empty_detects_bare_command_with_space() {
+        assert!(subcommand_query_is_empty("/model "));
+        assert!(subcommand_query_is_empty("/model"));
+        assert!(!subcommand_query_is_empty("/model s"));
+    }
+
+    /// Lokale Befehle laufen während eines Turns nie sofort (kein Adapter),
+    /// sondern werden eingereiht.
+    #[test]
+    fn busy_local_command_is_deferred() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.command_registry = CommandRegistry::built_in()
+            .map_err(ctx("built_in"))?
+            .with_local_specs(crate::command_catalog::local_command_specs());
+        assert!(is_tui_local_command(&app.command_registry, "/whoami"));
+        assert!(!is_tui_local_command(&app.command_registry, "/status"));
+        app.input.insert_str("/whoami");
+        assert_eq!(
+            queue_busy_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            BusyKeyOutcome::Redraw
+        );
+        assert_eq!(
+            app.deferred_input.pop_front(),
+            Some(TuiEvent::Paste("/whoami".to_owned()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workbench_command_detection() {
+        assert!(is_workbench_command("/workbench"));
+        assert!(is_workbench_command("  /workbench note x"));
+        assert!(!is_workbench_command("/workbenches"));
+        assert!(!is_workbench_command("workbench"));
+    }
+
+    /// Der rückgerechnete Cursor-Offset stimmt mit dem echten überein.
+    #[test]
+    fn editor_cursor_byte_matches_editor_cursor() {
+        let mut editor = InputEditor::new();
+        editor.insert_str("ab\nc@dé x");
+        assert_eq!(editor_cursor_byte(&editor), editor.cursor());
+        for _ in 0..4 {
+            editor.move_left();
+            assert_eq!(editor_cursor_byte(&editor), editor.cursor());
+        }
+    }
+
+    /// `@`-Popup öffnet mit Rollen; die Übernahme ersetzt das Token unter dem
+    /// Cursor und erhält den Rest der Zeile.
+    #[test]
+    fn mention_popup_opens_and_accept_replaces_token() -> TestResult {
+        let mut app = test_chat_app()?;
+        let role = KNOWN_ROLES
+            .first()
+            .ok_or(TestError::Missing("bekannte Rolle"))?;
+        app.input.insert_str("@");
+        app.sync_popup();
+        assert!(
+            app.mention_popup
+                .as_ref()
+                .is_some_and(|popup| !popup.is_empty())
+        );
+
+        app.input.clear();
+        app.input.insert_str("a @ex b");
+        app.input.move_left();
+        app.input.move_left();
+        app.accept_mention(role);
+        assert_eq!(app.input(), format!("a @{role} b"));
+        assert_eq!(app.input.cursor(), format!("a @{role}").len());
+        assert!(app.mention_popup.is_none());
+
+        app.input.clear();
+        app.input.insert_str("schau @src/ma");
+        app.accept_mention("src/main.rs");
+        assert_eq!(app.input(), "schau @src/main.rs ");
+        Ok(())
+    }
+
+    #[test]
+    fn expand_mentions_without_root_keeps_text() {
+        let (text, note) = expand_mentions_for_turn("", "hallo @datei.rs");
+        assert_eq!(text, "hallo @datei.rs");
+        assert!(note.is_none());
+    }
+
     /// `Cancel` (Esc) auf [`Overlay::ModelSwitch`] schließt das Overlay ohne
     /// eine Befehlszeile zu emittieren.
     #[test]
