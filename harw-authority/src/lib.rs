@@ -643,6 +643,15 @@ pub enum AuthorityOrigin {
     /// Policy- oder Runtime-Ursprung.
     #[cfg(any(test, feature = "test-support"))]
     TestOnly,
+    /// Harness-eigene, rein lesende Sicht auf ein vom Harness befülltes
+    /// Verzeichnis (z. B. die Unterlagen-Kopie eines Matrix-Sitzes unter
+    /// `<profile>/knowledge/matrix/<scenario>/<run>/materials/<seat>/`).
+    ///
+    /// Einziger Ursprung, dessen Kontext in [`AuthorityContext::is_subset_of`]
+    /// einen *anderen* Workspace als der Parent tragen darf — und auch das nur
+    /// mit Rechten ⊆ `{ReadWorkspace}` ∩ Parent-Rechte und leerem Netz-Scope.
+    /// Entsteht ausschließlich über [`SandboxSpec::harness_read_view`].
+    HarnessReadView,
 }
 
 impl AuthorityOrigin {
@@ -650,7 +659,7 @@ impl AuthorityOrigin {
     pub fn source(&self) -> Option<PolicySourceKind> {
         match self {
             Self::Policy { source, .. } => Some(*source),
-            Self::Runtime => None,
+            Self::Runtime | Self::HarnessReadView => None,
             #[cfg(any(test, feature = "test-support"))]
             Self::TestOnly => None,
         }
@@ -660,7 +669,7 @@ impl AuthorityOrigin {
     pub fn policy_digest(&self) -> Option<&str> {
         match self {
             Self::Policy { policy_digest, .. } => Some(policy_digest),
-            Self::Runtime => None,
+            Self::Runtime | Self::HarnessReadView => None,
             #[cfg(any(test, feature = "test-support"))]
             Self::TestOnly => None,
         }
@@ -710,11 +719,37 @@ impl AuthorityContext {
         }
     }
 
+    /// Prüft, ob dieser Kontext eine echte Teilmenge von `parent` ist.
+    ///
+    /// # Beschreibung
+    /// Regelfall: gleicher Workspace, Rechte ⊆ Parent-Rechte, Netz-Scope ⊆
+    /// Parent-Scope.
+    ///
+    /// Einzige, bewusst schmale Ausnahme: ein Kontext mit Ursprung
+    /// [`AuthorityOrigin::HarnessReadView`] darf an einen *anderen* Workspace
+    /// gebunden sein, sofern (a) derselbe Tenant, (b) Rechte ⊆
+    /// `{ReadWorkspace}` ∩ Parent-Rechte und (c) ein leerer Netz-Scope
+    /// vorliegen. Begründung: solche Sichten sind harness-eigene, rein
+    /// lesende Kopien (Matrix-Unterlagen), in die der Harness nur zulässige
+    /// Dateien kopiert; Schreiben, Ausführen und Netz sind damit
+    /// ausgeschlossen, und Lesen setzt voraus, dass schon der Parent lesen
+    /// darf. Jeder andere Ursprung verlangt weiterhin denselben Workspace
+    /// (fail-closed).
+    ///
+    /// # Returns
+    /// `true` genau dann, wenn eine der beiden Regeln greift.
     #[must_use]
     pub fn is_subset_of(&self, parent: &Self) -> bool {
-        self.workspace == parent.workspace
-            && self.permissions.is_subset_of(&parent.permissions)
-            && self.network_scope.is_subset_of(&parent.network_scope)
+        if self.workspace == parent.workspace {
+            return self.permissions.is_subset_of(&parent.permissions)
+                && self.network_scope.is_subset_of(&parent.network_scope);
+        }
+        matches!(self.origin, AuthorityOrigin::HarnessReadView)
+            && self.workspace.tenant == parent.workspace.tenant
+            && self
+                .permissions
+                .is_subset_of(&harness_read_view_permissions(&parent.permissions))
+            && self.network_scope.is_empty()
     }
 
     #[must_use]
@@ -726,6 +761,13 @@ impl AuthorityContext {
             origin: self.origin.clone(),
         }
     }
+}
+
+/// Rechte-Obergrenze einer Harness-Lesesicht: `{ReadWorkspace}` ∩ `parent`.
+fn harness_read_view_permissions(parent: &PermissionSet) -> PermissionSet {
+    parent.restrict(&PermissionRequest::from_permissions([
+        Permission::ReadWorkspace,
+    ]))
 }
 
 /// Serializable, non-authoritative display/persistence data.
@@ -864,6 +906,49 @@ impl SandboxSpec {
                 origin: AuthorityOrigin::TestOnly,
             },
         }
+    }
+
+    /// Baut eine harness-eigene, rein lesende Sicht auf `view` als Kind von
+    /// `parent`.
+    ///
+    /// # Beschreibung
+    /// Für Verzeichnisse, die der Harness selbst befüllt und in die er nur
+    /// zulässige Dateien kopiert (Unterlagen-Kopie eines Matrix-Sitzes).
+    /// Das Ergebnis trägt Rechte = `{ReadWorkspace}` ∩ Parent-Rechte, einen
+    /// leeren Netz-Scope und den Ursprung [`AuthorityOrigin::HarnessReadView`];
+    /// nur damit besteht es [`Self::ensure_child_of`] trotz abweichendem
+    /// Workspace (siehe [`AuthorityContext::is_subset_of`]).
+    ///
+    /// # Arguments
+    /// - `parent` (`&SandboxSpec`): Sandbox des Aufrufers, Obergrenze der Sicht.
+    /// - `view` (`WorkspaceBinding`): kanonisierte Bindung des Sicht-Verzeichnisses.
+    ///
+    /// # Returns
+    /// Die Sicht-Sandbox.
+    ///
+    /// # Errors
+    /// - [`AuthorityError::ReadViewWithoutReadWorkspace`], wenn der Parent
+    ///   kein `ReadWorkspace` hält (die Sicht wäre rechtelos und nutzlos).
+    /// - [`AuthorityError::ReadViewTenantMismatch`], wenn `view` zu einem
+    ///   anderen Tenant gehört als der Parent-Workspace.
+    pub fn harness_read_view(parent: &Self, view: WorkspaceBinding) -> AuthorityResult<Self> {
+        let permissions = harness_read_view_permissions(parent.permissions());
+        if !permissions.contains(Permission::ReadWorkspace) {
+            return Err(AuthorityError::ReadViewWithoutReadWorkspace);
+        }
+        if view.tenant != parent.workspace().tenant {
+            return Err(AuthorityError::ReadViewTenantMismatch);
+        }
+        let spec = Self {
+            authority: AuthorityContext {
+                workspace: view,
+                permissions,
+                network_scope: NetworkScope::empty(),
+                origin: AuthorityOrigin::HarnessReadView,
+            },
+        };
+        spec.ensure_child_of(parent)?;
+        Ok(spec)
     }
 
     #[must_use]
@@ -1151,6 +1236,10 @@ pub enum AuthorityError {
         workspace: WorkspaceId,
     },
     ChildAuthorityEscalation,
+    /// Eine Harness-Lesesicht verlangt `ReadWorkspace` beim Parent.
+    ReadViewWithoutReadWorkspace,
+    /// Eine Harness-Lesesicht muss zum Tenant des Parent-Workspace gehören.
+    ReadViewTenantMismatch,
     OperatorHomeUnavailable,
     PolicySymlink {
         path: PathBuf,
@@ -1228,6 +1317,12 @@ impl fmt::Display for AuthorityError {
             }
             Self::ChildAuthorityEscalation => {
                 write!(f, "child authority is not a subset of its parent")
+            }
+            Self::ReadViewWithoutReadWorkspace => {
+                write!(f, "harness read view requires read_workspace on the parent")
+            }
+            Self::ReadViewTenantMismatch => {
+                write!(f, "harness read view belongs to a different tenant")
             }
             Self::OperatorHomeUnavailable => {
                 write!(f, "operator home is unavailable or not absolute")
@@ -1419,6 +1514,169 @@ network_targets = []
         assert!(child.network_scope().allows("api.docs.rs"));
         assert!(!child.network_scope().allows("evil.example"));
         assert!(!child.permissions().contains(Permission::ReadWorkspace));
+    }
+
+    fn view_workspace() -> WorkspaceBinding {
+        WorkspaceBinding {
+            tenant: harw_types::TenantId::from_str("test-tenant"),
+            workspace: harw_types::WorkspaceId::from_str("matrix-run-seat"),
+            canonical_root: std::env::temp_dir().join("materials").join("seat"),
+        }
+    }
+
+    fn sandbox_with(
+        workspace: WorkspaceBinding,
+        permissions: impl IntoIterator<Item = Permission>,
+        network_scope: NetworkScope,
+        origin: AuthorityOrigin,
+    ) -> SandboxSpec {
+        SandboxSpec {
+            authority: AuthorityContext {
+                workspace,
+                permissions: PermissionSet::from_test_permissions(permissions),
+                network_scope,
+                origin,
+            },
+        }
+    }
+
+    fn full_parent() -> SandboxSpec {
+        sandbox_with(
+            test_workspace(),
+            Permission::ALL,
+            NetworkScope::from_hosts(["docs.rs".to_owned()]),
+            AuthorityOrigin::TestOnly,
+        )
+    }
+
+    #[test]
+    fn harness_read_view_is_read_only_child_of_parent() -> test_support::TestResult {
+        let parent = full_parent();
+        let view = SandboxSpec::harness_read_view(&parent, view_workspace())?;
+
+        assert_eq!(view.workspace(), &view_workspace());
+        assert_eq!(
+            view.permissions(),
+            &PermissionSet::from_test_permissions([Permission::ReadWorkspace])
+        );
+        assert!(view.network_scope().is_empty());
+        assert_eq!(
+            view.authority().origin(),
+            &AuthorityOrigin::HarnessReadView
+        );
+        view.ensure_child_of(&parent)?;
+        // Eine weitere Einschränkung der Sicht bleibt Kind der Sicht.
+        view.restrict(&PermissionRequest::empty())
+            .ensure_child_of(&view)?;
+        Ok(())
+    }
+
+    #[test]
+    fn harness_read_view_rejects_parent_without_read_workspace() {
+        let parent = sandbox_with(
+            test_workspace(),
+            [Permission::WriteWorkspace, Permission::ExecuteProcess],
+            NetworkScope::empty(),
+            AuthorityOrigin::TestOnly,
+        );
+        assert_eq!(
+            SandboxSpec::harness_read_view(&parent, view_workspace()),
+            Err(AuthorityError::ReadViewWithoutReadWorkspace)
+        );
+        // Auch ein von Hand gebauter Sicht-Kontext besteht nicht.
+        let forged = sandbox_with(
+            view_workspace(),
+            [Permission::ReadWorkspace],
+            NetworkScope::empty(),
+            AuthorityOrigin::HarnessReadView,
+        );
+        assert_eq!(
+            forged.ensure_child_of(&parent),
+            Err(AuthorityError::ChildAuthorityEscalation)
+        );
+    }
+
+    #[test]
+    fn harness_read_view_rejects_other_tenant() {
+        let other = WorkspaceBinding {
+            tenant: harw_types::TenantId::from_str("other-tenant"),
+            ..view_workspace()
+        };
+        assert_eq!(
+            SandboxSpec::harness_read_view(&full_parent(), other.clone()),
+            Err(AuthorityError::ReadViewTenantMismatch)
+        );
+        let forged = sandbox_with(
+            other,
+            [Permission::ReadWorkspace],
+            NetworkScope::empty(),
+            AuthorityOrigin::HarnessReadView,
+        );
+        assert!(forged.ensure_child_of(&full_parent()).is_err());
+    }
+
+    #[test]
+    fn harness_read_view_with_more_than_read_is_rejected() {
+        let parent = full_parent();
+        for extra in [
+            Permission::WriteWorkspace,
+            Permission::ExecuteProcess,
+            Permission::NetworkAccess,
+            Permission::ReadSecrets,
+            Permission::ManagePlugins,
+            Permission::ReadCargoRegistry,
+        ] {
+            let child = sandbox_with(
+                view_workspace(),
+                [Permission::ReadWorkspace, extra],
+                NetworkScope::empty(),
+                AuthorityOrigin::HarnessReadView,
+            );
+            assert_eq!(
+                child.ensure_child_of(&parent),
+                Err(AuthorityError::ChildAuthorityEscalation),
+                "{extra:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn harness_read_view_with_network_scope_is_rejected() {
+        let child = sandbox_with(
+            view_workspace(),
+            [Permission::ReadWorkspace],
+            NetworkScope::from_hosts(["docs.rs".to_owned()]),
+            AuthorityOrigin::HarnessReadView,
+        );
+        assert_eq!(
+            child.ensure_child_of(&full_parent()),
+            Err(AuthorityError::ChildAuthorityEscalation)
+        );
+    }
+
+    #[test]
+    fn ordinary_child_with_other_workspace_is_still_rejected() {
+        let parent = full_parent();
+        for origin in [AuthorityOrigin::Runtime, AuthorityOrigin::TestOnly] {
+            let child = sandbox_with(
+                view_workspace(),
+                [Permission::ReadWorkspace],
+                NetworkScope::empty(),
+                origin.clone(),
+            );
+            assert_eq!(
+                child.ensure_child_of(&parent),
+                Err(AuthorityError::ChildAuthorityEscalation),
+                "{origin:?}"
+            );
+        }
+        let rights_free = sandbox_with(
+            view_workspace(),
+            [],
+            NetworkScope::empty(),
+            AuthorityOrigin::Runtime,
+        );
+        assert!(rights_free.ensure_child_of(&parent).is_err());
     }
 
     fn mask_permissions(mask: u8) -> impl Iterator<Item = Permission> {
