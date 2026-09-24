@@ -14,6 +14,7 @@ pub mod contributors;
 pub mod error;
 pub mod guard_wiring;
 pub mod handoff;
+pub mod job_ledger;
 pub mod mcp_wiring;
 pub mod memory_wiring;
 pub mod model;

@@ -115,13 +115,13 @@ use jiff::{SignedDuration, Timestamp};
 
 use harw_channel::{Admission, ChannelAdapter, InboundEvent, PairingStore, SessionKey};
 use harw_channel_telegram::{
-    ApprovalCallbackContext, PairingNotice, TelegramChannel, TelegramChannelConfig, TelegramChatId,
-    TelegramMessageId, TelegramThreadId, ThrottleNotice, TopicMode, WorkRequestStore,
+    ApprovalTokenStore, ChatStateStore, PairingNotice, TelegramChannel, TelegramChannelConfig,
+    ThrottleNotice, TopicMode, WorkRequestStore,
 };
 use harw_channel_telegram_transport::{
-    AdmittedEventConsumer, BotCommand, CallbackConsumer, LongPollConfig, LongPollShutdown,
-    RendererConfig, TelegramCallback, TelegramClient, TelegramOffsetStore, TelegramOutbound,
-    TelegramRenderer, TransportResult, WebhookConfig, run_webhook_server, spawn_long_poll_thread,
+    AdmittedEventConsumer, LongPollConfig, LongPollShutdown, RendererConfig, TelegramClient,
+    TelegramOffsetStore, TelegramOutbound, TelegramRenderer, TransportResult, WebhookConfig,
+    run_webhook_server_with_shutdown, spawn_long_poll_thread,
 };
 use harw_config::{
     ChannelToml, InternalModelPoint, ResolvedConfig, SecretRef, TelegramChannelToml,
@@ -139,11 +139,21 @@ use harw_secrets::audit::chain::PersistedChainStatus;
 use harw_secrets::audit::telemetry::AUDIT_CHAIN_BREAK;
 use harw_secrets::{AuditError, AuditResult};
 use harw_session_store::{RecordKind, TranscriptStore};
-use harw_types::{AgentRole, ChannelId, PeerId, Principal, SessionId, ThreadRef};
+use harw_types::{AgentRole, ChannelId, Principal, SessionId, TenantId, ThreadRef, WorkspaceId};
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::home::resolve_home;
 use crate::runtime_gateway::{GatewayEntry, channel_principal, gateway_assembly};
+
+mod telegram_attachments;
+mod telegram_callbacks;
+mod telegram_commands;
+mod telegram_session;
+
+use telegram_attachments::{TelegramAttachmentIntake, telegram_attachment_cache_root};
+use telegram_callbacks::{GatewayCallbackWorker, spawn_callback_worker};
+use telegram_commands::{CommandDisposition, TelegramCommandHandler, UnknownCommandFallback};
+use telegram_session::{TelegramSessionConfig, TelegramSessionDispatcher};
 
 /// Zählt jeden Gateway-Start. Geroutet unter dem Präfix `"app."`
 /// (`crate::observe`) — erreicht damit optional Prometheus/OTLP, nie ohne
@@ -1311,7 +1321,8 @@ const TELEGRAM_LEGACY_OFFSET_BINDING: &str = "telegram:default";
 /// Update-Arten, die Telegram per Webhook zustellen soll (`setWebhook`).
 ///
 /// Enthält neben `message`/`edited_message` auch `callback_query`: jede
-/// Webhook-Bindung installiert [`GatewayCallbackConsumer`]
+/// Webhook-Bindung installiert den Callback-Consumer aus
+/// [`telegram_callbacks::spawn_callback_worker`]
 /// (`WebhookConfig::with_callback_consumer`), der jeden Button-Klick per
 /// `answerCallbackQuery` beantwortet — ohne dieses Abonnement stellte
 /// Telegram keine Klicks zu. Der Long-Poll-Pfad nutzt diese Konstante nicht:
@@ -1665,7 +1676,7 @@ enum RunningTelegramIngress {
     /// Eigener Long-Poll-Thread; endet mit einem `TransportResult`.
     LongPoll(std::thread::JoinHandle<TransportResult<()>>),
     /// Fertig konfigurierter Webhook-Listener; läuft, bis
-    /// [`run_webhook_server`] zurückkehrt oder der Future verworfen wird.
+    /// [`run_webhook_server_with_shutdown`] zurückkehrt oder der Future verworfen wird.
     Webhook(WebhookConfig),
 }
 
@@ -1814,13 +1825,16 @@ fn telegram_binding_services(
 ///
 /// # Description
 /// Reihenfolge: Bot-Identität (`getMe`), Befehlsmenü
-/// ([`publish_telegram_command_menu`]), Transport-Lebenszyklus — im
-/// Long-Poll-Modus ein `deleteWebhook` (ein nach einem Absturz verwaister
-/// Webhook würde `getUpdates` sonst dauerhaft mit 409 blockieren), im
-/// Webhook-Modus `setWebhook` mit `public_url` und `secret_token` —, erst
-/// danach die Throttle-/Pairing-Notice-, Callback- und Admission-Threads und
-/// der Transport selbst (mit installiertem [`GatewayCallbackConsumer`]). Scheitert
-/// ein Schritt vor den Threads, bleibt nichts halb gestartet zurück.
+/// ([`telegram_commands::publish_telegram_command_menu`]),
+/// Transport-Lebenszyklus — im Long-Poll-Modus ein `deleteWebhook` (ein nach
+/// einem Absturz verwaister Webhook würde `getUpdates` sonst dauerhaft mit
+/// 409 blockieren), im Webhook-Modus `setWebhook` mit `public_url` und
+/// `secret_token` —, danach Renderer (mit dem geteilten `approval_tokens`),
+/// Anhang-Aufnahme, Sitzungs-Dispatcher und Befehlsverarbeitung, erst dann
+/// die Throttle-/Pairing-Notice-, Callback- und Admission-Threads und der
+/// Transport selbst (mit installiertem Callback-Consumer aus
+/// [`telegram_callbacks::spawn_callback_worker`]). Scheitert ein Schritt vor
+/// den Threads, bleibt nichts halb gestartet zurück.
 ///
 /// # Errors
 /// Eine inhaltsfreie Meldung (nie Token oder Secret), wenn ein Schritt
@@ -2096,10 +2110,14 @@ async fn supervise_telegram_binding(
     provider: Arc<dyn ModelProvider>,
     profile: PathBuf,
     sessions_root: PathBuf,
-    workspaces: Arc<harw_authority::WorkspaceRegistry>,
+    services: TelegramBindingServices,
     work_requests: Arc<WorkRequestStore>,
 ) -> Infallible {
     let binding_id = plan.binding.id.clone();
+    // Ein einziger Approval-Token-Store je Bindung, bewusst außerhalb der
+    // Neustart-Schleife: Adapter (Callback-Prüfung) und Renderer (Ausgabe)
+    // teilen ihn, und offene Freigaben überleben einen Transport-Neustart.
+    let approval_tokens = Arc::new(ApprovalTokenStore::with_ttl(TELEGRAM_APPROVAL_TTL));
     let mut attempt: u32 = 0;
     loop {
         let started = Instant::now();
@@ -2108,8 +2126,9 @@ async fn supervise_telegram_binding(
             Arc::clone(&provider),
             &profile,
             &sessions_root,
-            Arc::clone(&workspaces),
+            &services,
             Arc::clone(&work_requests),
+            Arc::clone(&approval_tokens),
         )
         .await
         {
@@ -2131,14 +2150,16 @@ async fn supervise_telegram_binding(
                     }
                 }
             }
-            Ok(RunningTelegramIngress::Webhook(config)) => match run_webhook_server(config).await {
-                Ok(()) => {
-                    tracing::warn!(binding = %binding_id, "Telegram webhook listener stopped; restarting with backoff");
+            Ok(RunningTelegramIngress::Webhook(config)) => {
+                match run_webhook_server_with_shutdown(config, std::future::pending::<()>()).await {
+                    Ok(()) => {
+                        tracing::warn!(binding = %binding_id, "Telegram webhook listener stopped; restarting with backoff");
+                    }
+                    Err(error) => {
+                        tracing::error!(binding = %binding_id, error = %error, "Telegram webhook listener failed; restarting with backoff");
+                    }
                 }
-                Err(error) => {
-                    tracing::error!(binding = %binding_id, error = %error, "Telegram webhook listener failed; restarting with backoff");
-                }
-            },
+            }
             Err(error) => {
                 tracing::error!(binding = %binding_id, error = %error, "Telegram ingress setup failed; retrying with backoff");
             }

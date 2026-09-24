@@ -432,9 +432,9 @@ fn map_store_error(error: SessionStoreError) -> KnowledgeError {
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
+    use harw_knowledge::VisibilityScope;
     use harw_knowledge::kanban::board::{CardId, LaneId};
     use harw_knowledge::kanban::lifecycle::InMemoryJobTransitions;
-    use harw_knowledge::VisibilityScope;
     use harw_types::{TenantId, WorkspaceId};
 
     fn scope() -> JobScope {
@@ -521,7 +521,12 @@ mod tests {
     fn the_adapter_is_usable_as_a_shared_trait_object() -> TestResult {
         let (ledger, _store, _dir) = ledger()?;
         let shared: Arc<dyn JobTransitions> = Arc::new(ledger);
-        assert!(shared.snapshot(&WorkId::new()).map_err(ctx("snapshot"))?.is_none());
+        assert!(
+            shared
+                .snapshot(&WorkId::new())
+                .map_err(ctx("snapshot"))?
+                .is_none()
+        );
         Ok(())
     }
 
@@ -559,7 +564,9 @@ mod tests {
     fn claim_complete_round_trip_records_holder_and_done() -> TestResult {
         let (ledger, _store, _dir) = ledger()?;
         let work_id = admit_ready(&ledger.store, kanban())?;
-        ledger.mark_ready(&work_id).map_err(ctx("ready is idempotent"))?;
+        ledger
+            .mark_ready(&work_id)
+            .map_err(ctx("ready is idempotent"))?;
         ledger
             .claim(&work_id, &AgentId::new("worker-1"))
             .map_err(ctx("claim"))?;
@@ -656,7 +663,12 @@ mod tests {
     fn unknown_jobs_have_no_snapshot_and_refuse_transitions() -> TestResult {
         let (ledger, _store, _dir) = ledger()?;
         let unknown = WorkId::new();
-        assert!(ledger.snapshot(&unknown).map_err(ctx("snapshot"))?.is_none());
+        assert!(
+            ledger
+                .snapshot(&unknown)
+                .map_err(ctx("snapshot"))?
+                .is_none()
+        );
         let Err(KnowledgeError::ArtifactNotFound(_)) = ledger.cancel(&unknown) else {
             return Err(TestError::Unexpected(
                 "ein unbekannter Job muss ArtifactNotFound liefern".to_owned(),
