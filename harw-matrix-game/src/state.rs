@@ -749,7 +749,8 @@ impl EntryKind {
                 }
             }
             Self::Adjudicated { ruling, .. } => {
-                out.extend(ruling.public_rationale.as_deref());
+                // `public_rationale` wird über `RulingPublished` ohnehin
+                // öffentlich und zählt deshalb nicht als geschützter Text.
                 out.extend(ruling.private_notes.as_deref());
                 out.extend(ruling.context_reason.as_deref());
                 out.extend(ruling.umpire_cons.iter().map(|c| c.text.as_str()));

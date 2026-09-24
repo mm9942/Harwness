@@ -395,6 +395,8 @@ pub(crate) struct AgentLive {
     pub id: String,
     pub parent: Option<String>,
     pub role: String,
+    /// Vom Kind angesprochenes Modell (aus `AgentOrchestrationEvent::model`).
+    pub model: Option<String>,
     pub phase: AgentPhase,
     pub task: Option<String>,
     pub current_tool: Option<String>,
@@ -427,6 +429,7 @@ impl AgentLive {
             id,
             parent,
             role,
+            model: None,
             phase: AgentPhase::Admitted,
             task: None,
             current_tool: None,
@@ -547,6 +550,11 @@ impl AgentMonitor {
                 }
                 if let Some(calls) = orch.tool_calls {
                     live.tool_calls = live.tool_calls.max(calls);
+                }
+                if let Some(model) = &orch.model
+                    && live.model.as_deref() != Some(model.as_str())
+                {
+                    live.model = Some(model.clone());
                 }
                 let before = live.phase;
                 live.phase = match orch.status {
@@ -960,6 +968,29 @@ impl AgentMonitor {
     }
 }
 
+/// Kurzform einer Modell-ID für die Panel-Zeile.
+///
+/// # Beschreibung
+/// Entfernt ein Provider-Präfix (`anthropic/claude-x` → `claude-x`) und ein
+/// angehängtes achtstelliges Datum (`claude-x-20250101` → `claude-x`).
+/// Liefert die Eingabe unverändert, wenn danach nichts übrig bliebe.
+fn short_model_name(model: &str) -> String {
+    let base = model.rsplit('/').next().unwrap_or(model);
+    let trimmed = match base.rsplit_once('-') {
+        Some((head, tail))
+            if !head.is_empty() && tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            head
+        }
+        _ => base,
+    };
+    if trimmed.is_empty() {
+        model.to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 /// Kopfzeilen der Detailansicht.
 fn detail_header_lines(live: &AgentLive, width: usize) -> Vec<Line<'static>> {
     let dim = Style::default().add_modifier(Modifier::DIM);
@@ -986,6 +1017,12 @@ fn detail_header_lines(live: &AgentLive, width: usize) -> Vec<Line<'static>> {
             dim,
         ),
     ])];
+    if let Some(model) = &live.model {
+        lines.push(Line::from(vec![
+            Span::styled("Modell: ", dim),
+            Span::raw(sanitize_inline(model)),
+        ]));
+    }
     if let Some(task) = &live.task {
         lines.push(Line::from(vec![
             Span::styled("Aufgabe: ", dim),
@@ -1171,6 +1208,13 @@ pub(crate) fn render_agents_panel(
             Span::styled(
                 sanitize_inline(&live.role),
                 Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                live.model
+                    .as_deref()
+                    .map(|model| format!(" · {}", sanitize_inline(&short_model_name(model))))
+                    .unwrap_or_default(),
+                style::dim_style(theme),
             ),
             Span::raw(" "),
             Span::styled(live.phase.label(), phase_style),
@@ -1689,6 +1733,16 @@ mod tests {
     }
 
     #[test]
+    fn short_model_name_strips_provider_prefix_and_date_suffix() {
+        assert_eq!(
+            short_model_name("anthropic/claude-sonnet-4-5-20250929"),
+            "claude-sonnet-4-5"
+        );
+        assert_eq!(short_model_name("gpt-5-mini"), "gpt-5-mini");
+        assert_eq!(short_model_name("provider/"), "provider/");
+    }
+
+    #[test]
     fn detail_view_renders_header_and_styled_trace() -> TestResult {
         let turn = t1()?;
         let mut monitor = AgentMonitor::default();
@@ -1712,6 +1766,7 @@ mod tests {
                 progress: None,
                 detail: None,
                 tool_calls: None,
+                model: None,
             }),
         });
         let call_id = harw_types::ToolCallId::new();

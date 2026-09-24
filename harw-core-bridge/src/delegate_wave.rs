@@ -731,7 +731,7 @@ pub async fn delegate_wave(
     let declared =
         DeclaredTargets::for_caller(policy, caller.as_ref().map(|record| record.role.as_str()));
     let admission = admit_targets(request, &visible, &declared, policy);
-    let budget = wave_budget_cap(spawner.child_budget(ctx.session_id()));
+    let budget = wave_budget_cap(spawner.remaining_budget(ctx.session_id()));
 
     let size = request.targets.len();
     let payloads: Vec<Value> = request

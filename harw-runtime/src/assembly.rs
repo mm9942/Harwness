@@ -1734,6 +1734,26 @@ impl RuntimeAssemblyBuilder {
                 overrides.extra_context.extend(fragments);
             }
         }
+        // Welle 4 (Skill-Proposals): die direkt konfigurierten Skills des
+        // Wurzel-Agenten (`agents/<agent>/agent.toml`, Feld `skills`) als
+        // Instruktionsfragmente mit SHA-256-Provenienz — derselbe Weg wie für
+        // Kinder (`RuntimeChildRegistryFactory::with_skill_catalog`). Der
+        // Agent ist die aktive UIA, sonst der benannte Wurzel-Agent; ohne
+        // `agent.toml` bleibt die Liste leer. Ein aktivierter, aber nicht
+        // ladbarer Skill lässt die Montage scheitern (fail-closed).
+        let root_skill_agent = uia_ir
+            .as_ref()
+            .map(|ir| ir.id().to_string())
+            .or_else(|| overrides.agent_name.clone());
+        if let Some(agent) = root_skill_agent.as_deref() {
+            overrides
+                .extra_context
+                .extend(crate::children::agent_skill_fragments(
+                    &config,
+                    &trust_report.layers,
+                    agent,
+                )?);
+        }
         let narrowed_root = narrowing
             .as_ref()
             .and_then(|narrowing| narrowing.workspace_root.as_ref())
@@ -1799,6 +1819,27 @@ impl RuntimeAssemblyBuilder {
         // baut `host_permit_wiring` bedingungslos.
         let host_permit_wiring_for_children = Some(host_permit_wiring.clone());
 
+        // Skill-Proposals: die Urheber-Decke der UIA für `skills.*` — dieselben
+        // Werkzeuge wie ihre `DefinitionAuthorCeiling` unten, dazu die
+        // aktivierten MCPs der Konfiguration. `None` ohne UIA-Wurzel; dann
+        // wird der Provider gar nicht montiert.
+        let uia_skill_ceiling =
+            uia_ir
+                .as_ref()
+                .map(|_| harw_registry_defaults::SkillAuthorCeiling {
+                    role: AgentRoleId::UserInterface,
+                    tools: registry_profile
+                        .tool_names_for(sandbox.permissions())
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                    mcps: config
+                        .mcps
+                        .values()
+                        .filter(|mcp| mcp.enabled)
+                        .map(|mcp| mcp.name.clone())
+                        .collect(),
+                });
         let assembled = if uia_ir.is_some() {
             let default_model_id = config.harness.default_model.as_deref().unwrap_or_default();
             let ceiling = harw_registry_defaults::agent_definition_tools::DefinitionAuthorCeiling {
@@ -1868,6 +1909,21 @@ impl RuntimeAssemblyBuilder {
                 harw_registry_defaults::agent_definition_tools::UiaSelfDocumentToolProvider::new(
                     agent_dir,
                     AgentRoleId::UserInterface,
+                ),
+            ));
+        }
+        // Skill-Proposals: nur die UIA-Wurzel prüft und committet
+        // Skill-Vorschläge sofort (`DefinitionWriteMode::Commit`, analog
+        // Nachtrag K2). Ziel ist `<profil>/skills`; ein nicht auflösbares
+        // Profil lässt den Provider fail-closed ohne Ablage.
+        if let Some(ceiling) = uia_skill_ceiling {
+            registry_builder = registry_builder.tool_provider(Arc::new(
+                harw_registry_defaults::SkillProposalToolProvider::new(
+                    profile_dir(&spec.home, &profile_name)
+                        .ok()
+                        .map(|dir| dir.join("skills")),
+                    harw_registry_defaults::DefinitionWriteMode::Commit,
+                    Some(ceiling),
                 ),
             ));
         }
@@ -1971,6 +2027,9 @@ impl RuntimeAssemblyBuilder {
                 host_permit_wiring: &host_permit_wiring_for_children,
                 state_store: Arc::clone(&stores.state_store),
                 agent_events: agent_events.clone(),
+                // Welle 4: die vertrauten Config-Layer, aus denen die
+                // Kind-Fabriken die Skill-Verzeichnisse auflösen.
+                skill_roots: trust_report.layers.clone(),
             },
             session_events,
         )?;
@@ -2100,6 +2159,15 @@ impl RuntimeAssemblyBuilder {
             &operations,
             &services,
         );
+        // 12a. Workbench-Werkzeuge der Wurzelsitzung: nur, wenn die Dienste
+        //      einen `KnowledgeStore` tragen (`RuntimeServices::with_home_context`
+        //      baut ihn aus dem aufgelösten Home-Kontext).
+        let registry_builder = match services.knowledge_store() {
+            Some(store) => registry_builder.tool_provider(Arc::new(
+                harw_registry_defaults::WorkbenchToolProvider::new(Arc::clone(store)),
+            )),
+            None => registry_builder,
+        };
 
         // 12b. Handoff-Kontext: liest, falls vorhanden,
         //     `<home_project>/.harw/handoff.json` (siehe
@@ -3467,6 +3535,11 @@ struct SpawnerInputs<'a> {
     state_store: Arc<dyn StateStore>,
     /// Live-Bus des Laufs; jedes Kind bekommt ihn über den SessionManager.
     agent_events: harw_core::AgentEventHub,
+    /// Die vertrauten Config-Layer in aufsteigender Präzedenz
+    /// (`ConfigTrustReport::layers`); reicht über
+    /// [`RuntimeChildRegistryFactory::with_skill_catalog`] an `factory`
+    /// **und** `uia_worker_factory` durch (Welle 4, Skills erreichen Kinder).
+    skill_roots: Vec<PathBuf>,
 }
 
 /// Montiert den Spawner eines Laufs nach seiner [`SpawnerPolicy`].
@@ -3507,6 +3580,7 @@ fn build_spawner(
         host_permit_wiring,
         state_store,
         agent_events,
+        skill_roots,
     } = inputs;
 
     let events = session_events.ok_or_else(|| RuntimeError::Spawner {
@@ -3541,7 +3615,12 @@ fn build_spawner(
         .with_main_model_selection(
             config.harness.default_provider.clone(),
             config.harness.default_model.clone(),
-        ),
+        )
+        // B: `delegate_wave` der Orchestrator-Kinder braucht denselben
+        // StateStore wie die Wurzel (den Spawner löst die Fabrik selbst über
+        // den Spawner-Slot auf).
+        .with_delegate_wave_store(Arc::clone(&state_store))
+        .with_skill_catalog(config, skill_roots.clone())?,
     );
     // Welle 3a, Teil A: eine zweite Fabrik-Instanz, ausschließlich für die
     // `uia-worker`-Rollenfamilie (`AgentRoleId::UiaWorker`). Gleiches Projekt,
@@ -3585,7 +3664,8 @@ fn build_spawner(
         // `uia-shell-worker` und `host-process-worker` (beide Rollen der
         // `uia-worker`-Familie).
         .with_host_permits(sandbox_profile.clone(), host_permit_wiring.clone())
-        .with_main_model_selection(uia_worker_provider, uia_worker_model_id),
+        .with_main_model_selection(uia_worker_provider, uia_worker_model_id)
+        .with_skill_catalog(config, skill_roots.clone())?,
     );
 
     let model_id = config.harness.default_model.as_deref().unwrap_or_default();
