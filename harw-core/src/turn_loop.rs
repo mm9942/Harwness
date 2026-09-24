@@ -2789,6 +2789,23 @@ async fn drive_turn(
     // ein Default hier wäre vor jedem Lesezugriff unbedingt überschrieben
     // und damit ein toter Store.
     let mut last_round_usage: harw_types::TokenUsage;
+    // Welle 3 — Kontextfenster-Wächter:
+    // - `context_retry_used`: die einmalige Notfall-Verdichtung + Wiederholung
+    //   nach `ModelError::ContextLength` / `StopReason::ContextWindowExceeded`
+    //   ist für den aktuellen Request verbraucht.
+    // - `max_tokens_retry_used` / `max_output_override`: die einmalige
+    //   Wiederholung mit verdoppeltem Ausgabelimit nach `MaxTokens` mitten in
+    //   Tool-Calls.
+    // - `last_compaction_tokens_after`: Ergebnis der letzten Verdichtung
+    //   dieses Aufrufs, für die Hysterese in `maybe_compact`.
+    let mut context_retry_used = false;
+    let mut max_tokens_retry_used = false;
+    let mut max_output_override: Option<u64> = None;
+    let mut last_compaction_tokens_after: Option<u64> = None;
+    // Verlaufslänge direkt nach der zuletzt angenommenen Modellantwort — was
+    // danach angehängt wird (Tool-Ergebnisse), deckt `last_round_usage` noch
+    // nicht ab. Wie `last_round_usage` erst nach der ersten Antwort belegt.
+    let mut history_mark: usize;
     // Wanduhr-Nullpunkt dieses Aufrufs (siehe Moduldoku „Fünfter Nachtrag").
     // Wiederholte Aufrufe (weiterer Schleifendurchlauf) sind ein No-op — nur
     // der erste zählt.
@@ -2834,75 +2851,90 @@ async fn drive_turn(
             return cancel_turn(session, handle, total_usage, reason).await;
         }
 
-        // 1./2. Context + Instructions.
-        let mut fragments = gather_context(session, ctx).await;
-        if automatic_continuations > 0 {
-            match continuation_fragment(CONTINUATION_INSTRUCTION) {
-                Some(fragment) => fragments.push(fragment),
-                None => {
-                    tracing::warn!("turn_loop.continuation_fragment_unavailable");
-                }
+        // 1./2./4a. Context + Instructions + Request-Montage (siehe
+        // `assemble_round_request`). Eine Wiederholung nach Notfall-
+        // Kompaktierung baut den Request über denselben Weg neu.
+        let continuation = (automatic_continuations > 0).then_some(CONTINUATION_INSTRUCTION);
+        let mut request = assemble_round_request(
+            session,
+            ctx,
+            &control,
+            &handle.turn_id,
+            &total_usage,
+            continuation,
+            max_output_override,
+        )
+        .await?;
+
+        // 4b. Pre-flight-Wächter (Welle 3): geschätzte Request-Größe gegen
+        // das Fenster des aktiven Modells. Droht der Request das Fenster zu
+        // sprengen (oder hat ein Modellwechsel eine Verdichtung vorgemerkt),
+        // wird VOR dem Senden notfallverdichtet und der Request neu gebaut.
+        // Passt er danach immer noch nicht, endet der Turn mit einem klaren
+        // „Kontext erschöpft"-Fehler statt einem sicheren Provider-Fehler.
+        let budget = RoundBudget::of(session);
+        let mut estimated_tokens =
+            crate::context_budget::estimate_request_tokens(&request, session.token_calibration());
+        let needs_emergency = budget.window_tokens > 0
+            && (session.pending_compaction()
+                || session
+                    .auto_compact()
+                    .is_some_and(|policy| policy.must_compact_before_send(estimated_tokens)));
+        if needs_emergency {
+            tracing::warn!(
+                estimated_tokens,
+                window_tokens = budget.window_tokens,
+                reserve_tokens = budget.reserve_tokens,
+                pending = session.pending_compaction(),
+                "turn_loop.preflight_emergency_compaction",
+            );
+            let target = budget.emergency_target(EMERGENCY_PREFLIGHT_TARGET_PERCENT);
+            if let Some(outcome) = run_budget_compaction(
+                session,
+                model,
+                store,
+                target,
+                crate::auto_compact::CompactDecision::Emergency,
+            )
+            .await
+            {
+                last_compaction_tokens_after = Some(outcome.tokens_after);
             }
+            request = assemble_round_request(
+                session,
+                ctx,
+                &control,
+                &handle.turn_id,
+                &total_usage,
+                continuation,
+                max_output_override,
+            )
+            .await?;
+            estimated_tokens = crate::context_budget::estimate_request_tokens(
+                &request,
+                session.token_calibration(),
+            );
         }
-        let instructions = load_instructions(session).await;
-        let mut tools = collect_tools(session)?;
-
-        // Nachtrag F (Delegationsprojektion): EIN deterministischer
-        // Kontextblock, NACH den Tools angehängt (stabiler Teil — die Liste
-        // ändert sich selten, sortiert vom Spawner geliefert). Leer ⇒ nichts.
-        // Dieselben Ziele werden zusätzlich als echte Werkzeugdefinitionen
-        // `transfer_to_<role>` angeboten — erst damit kann das Modell den
-        // Handoff tatsächlich aufrufen (siehe `append_handoff_tools`).
-        if let Some(spawner) = session.registry().spawner() {
-            let delegation_targets = spawner.delegation_target_names(session.id());
-            append_handoff_tools(session, &mut tools, &delegation_targets);
-            if let Some(fragment) = delegation_targets_fragment(&delegation_targets) {
-                fragments.push(fragment);
-            }
+        if budget.window_tokens > 0
+            && estimated_tokens.saturating_add(budget.reserve_tokens) > budget.window_tokens
+        {
+            return Err(context_exhausted_error(
+                estimated_tokens,
+                budget.reserve_tokens,
+                budget.window_tokens,
+            ));
         }
-
-        // Programm- und Decken-bewusste Montage (siehe
-        // `ModelRequest::with_context_program`s Moduldoku, Abschnitt „Zwei
-        // Wege zur Kontextmontage"): läuft nur, wenn die Sitzung **beide**
-        // deklariert; sonst fällt sie intern auf denselben Byte-Budget-Pfad
-        // zurück, den diese Datei vor diesem Knoten direkt aufgerufen hat —
-        // eine Sitzung ohne `ContextProgram` sieht dadurch keine Änderung.
-        let program = session.context_program();
-        let ceiling = session
-            .spawn_context()
-            .and_then(|spawn_context| spawn_context.ceiling.as_ref());
-
-        // 4. Model-Call (provider-neutral).
-        let request = ModelRequest::with_context_program(
-            instructions,
-            fragments,
-            session.history().clone(),
-            tools,
-            session.context_budget(),
-            program,
-            ceiling,
-        )?
-        .with_reasoning_effort(session.reasoning_effort())
-        .with_model_id(session.active_model().cloned())
-        .with_provider_id(session.active_provider().cloned())
-        .with_tool_result_max_bytes(control.limits().tool_result_max_bytes_hint())
-        .with_cancel_token(control.cancel_token().clone())
-        .with_identity(request_identity(session));
-        let request = match stream_sink_for_round(session, &handle.turn_id, &total_usage) {
-            Some(sink) => request.with_stream_sink(sink),
-            None => request,
-        };
         let history_items_dropped = request.context_assembly.history_items_dropped;
 
-        // Emit model.request event: byte-count proxy via system_prompt +
-        // instruction fragments length (ModelRequest is not serde::Serialize).
-        let request_size_bytes: usize = request.system_prompt.len()
-            + request
-                .instruction_fragments
-                .iter()
-                .map(|s| s.len())
-                .sum::<usize>();
-        tracing::info!(size_bytes = request_size_bytes, "model.request");
+        // Emit model.request event: geschätzte Request-Größe (System-Prompt,
+        // Instruktions-Fragmente, Datenblock, Verlauf, Tool-Schemas) — dieselbe
+        // Byte-Zahl, mit der die Kalibrierung nach der Antwort nachgeführt wird.
+        let estimated_bytes = crate::context_budget::estimate_request_bytes(&request);
+        tracing::info!(
+            size_bytes = estimated_bytes,
+            estimated_tokens,
+            "model.request"
+        );
 
         // Races the model call itself against `control`'s `CancelToken`
         // (W4a A-LOOP Moduldoku: "Der Modellaufruf selbst läuft gegen
@@ -2944,6 +2976,39 @@ async fn drive_turn(
                 )
                 .await;
             }
+            // Welle 3: der Provider meldet eine Kontextüberschreitung — genau
+            // eine Notfall-Verdichtung (Ziel 50 %) plus ein erneuter Versuch.
+            // Scheitert auch der, oder bewirkt die Verdichtung nichts, geht
+            // der Fehler regulär an den Aufrufer.
+            Err(error @ crate::model::ModelError::ContextLength { .. }) => {
+                if context_retry_used {
+                    return Err(error.into());
+                }
+                context_retry_used = true;
+                tracing::warn!(
+                    %error,
+                    estimated_tokens,
+                    "turn_loop.context_length_recovery"
+                );
+                let target = budget
+                    .emergency_target(EMERGENCY_RECOVERY_TARGET_PERCENT)
+                    .min(estimated_tokens / 2);
+                match run_budget_compaction(
+                    session,
+                    model,
+                    store,
+                    target,
+                    crate::auto_compact::CompactDecision::Emergency,
+                )
+                .await
+                {
+                    Some(outcome) if !outcome.no_op => {
+                        last_compaction_tokens_after = Some(outcome.tokens_after);
+                        continue;
+                    }
+                    _ => return Err(error.into()),
+                }
+            }
             Err(error) => return Err(error.into()),
         };
         control.record_model_round();
@@ -2952,6 +3017,11 @@ async fn drive_turn(
         total_usage.add(&response.usage);
         round += 1;
         last_round_usage = response.usage.clone();
+        // Kalibrierung Bytes→Tokens mit der tatsächlichen Prompt-Belegung
+        // nachführen (EMA, siehe `TokenCalibration::observe`).
+        session
+            .token_calibration_mut()
+            .observe(estimated_bytes, response.usage.prompt_tokens());
         // Live-Stand nach abgeschlossener Runde (auch der Pro-Runde-Fallback
         // nicht streamender Provider landet hier).
         emit(
@@ -2971,11 +3041,11 @@ async fn drive_turn(
                     .usage
                     .prompt_tokens()
                     .saturating_add(response.usage.output_tokens),
-                window_tokens: session.auto_compact().map_or(
-                    0,
-                    crate::auto_compact::AutoCompactPolicy::context_window_tokens,
-                ),
+                window_tokens: budget.window_tokens,
                 history_items_dropped: u32::try_from(history_items_dropped).unwrap_or(u32::MAX),
+                estimated_next_tokens: (budget.window_tokens > 0).then_some(estimated_tokens),
+                threshold_tokens: budget.threshold_tokens,
+                reserve_tokens: (budget.window_tokens > 0).then_some(budget.reserve_tokens),
             },
         );
 
@@ -3004,6 +3074,78 @@ async fn drive_turn(
             tool_call_count = response.tool_calls.len(),
             "model.response",
         );
+
+        // Welle 3: Wiederholungen VOR jeder Übernahme der Antwort in den
+        // Verlauf — eine verworfene Antwort darf weder Text noch Tool-Calls
+        // hinterlassen (sonst stünde der Teiltext nach der Wiederholung
+        // doppelt im Verlauf). Nutzung/Kalibrierung sind oben bereits
+        // verbucht: die Tokens wurden tatsächlich verbraucht.
+        //
+        // (a) `ContextWindowExceeded` als Stop-Grund: dieselbe einmalige
+        //     Notfall-Verdichtung (Ziel 50 %) + Wiederholung wie beim
+        //     `ModelError::ContextLength` oben. Bleibt die Verdichtung
+        //     wirkungslos, gilt der bisherige `Truncated`-Pfad unten.
+        if matches!(
+            response.stop,
+            crate::model::StopReason::ContextWindowExceeded
+        ) && !context_retry_used
+        {
+            context_retry_used = true;
+            tracing::warn!(
+                estimated_tokens,
+                "turn_loop.context_window_exceeded_recovery"
+            );
+            let target = budget
+                .emergency_target(EMERGENCY_RECOVERY_TARGET_PERCENT)
+                .min(estimated_tokens / 2);
+            if let Some(outcome) = run_budget_compaction(
+                session,
+                model,
+                store,
+                target,
+                crate::auto_compact::CompactDecision::Emergency,
+            )
+            .await
+            {
+                if !outcome.no_op {
+                    last_compaction_tokens_after = Some(outcome.tokens_after);
+                    continue;
+                }
+            }
+        }
+        // (b) `MaxTokens` mitten in Tool-Calls: die Argumente sind
+        //     abgeschnitten und dürfen nie ausgeführt werden. Statt sofort
+        //     `Truncated` zu melden, wird die Runde einmal mit verdoppeltem
+        //     Ausgabelimit wiederholt (gedeckelt auf 2 × Reserve und die
+        //     Hälfte des Fensters).
+        if matches!(response.stop, crate::model::StopReason::MaxTokens)
+            && !response.tool_calls.is_empty()
+            && !max_tokens_retry_used
+        {
+            let current = max_output_override
+                .or(session.max_output_tokens())
+                .unwrap_or(budget.reserve_tokens);
+            let raised = budget.raised_output_limit(current);
+            if raised > current {
+                max_tokens_retry_used = true;
+                max_output_override = Some(raised);
+                tracing::info!(
+                    previous_max_output_tokens = current,
+                    max_output_tokens = raised,
+                    "turn_loop.retry_after_max_tokens_with_tool_calls",
+                );
+                continue;
+            }
+        }
+        // Antwort angenommen: die Einmal-Wiederholungen gelten wieder für
+        // den nächsten Request, das angehobene Ausgabelimit nur für die
+        // eine wiederholte Runde.
+        context_retry_used = false;
+        max_tokens_retry_used = false;
+        max_output_override = None;
+        // Ab hier angehängte Tool-Ergebnisse sind in `last_round_usage`
+        // noch nicht enthalten — `maybe_compact` schätzt sie ab dieser Marke.
+        history_mark = session.history().len();
 
         // Für die Fortschritts-Erkennung des reinen Text-Zweigs unten
         // („Assistant-Text ohne Tool-Aufrufe") vor dem Move gesichert.
@@ -3146,7 +3288,17 @@ async fn drive_turn(
                         continuation = automatic_continuations,
                         "turn_loop.auto_continue_after_max_tokens"
                     );
-                    maybe_compact(session, model, store, &last_round_usage, false).await;
+                    let appended_tokens = appended_tokens_since(session, history_mark);
+                    maybe_compact(
+                        session,
+                        model,
+                        store,
+                        &last_round_usage,
+                        appended_tokens,
+                        false,
+                        &mut last_compaction_tokens_after,
+                    )
+                    .await;
                     continue;
                 }
                 crate::model::StopReason::MaxTokens
@@ -3613,7 +3765,17 @@ async fn drive_turn(
         // Argumentausdruck würde eine gleichzeitige unveränderliche Ausleihe
         // gegen die bereits laufende veränderliche Ausleihe erzeugen.
         let task_completed = turn_completed_a_plan_step(session);
-        maybe_compact(session, model, store, &last_round_usage, task_completed).await;
+        let appended_tokens = appended_tokens_since(session, history_mark);
+        maybe_compact(
+            session,
+            model,
+            store,
+            &last_round_usage,
+            appended_tokens,
+            task_completed,
+            &mut last_compaction_tokens_after,
+        )
+        .await;
 
         // Zurück zu Schritt 4 (nächster Model-Call).
     }
@@ -3649,7 +3811,17 @@ async fn drive_turn(
     // dem nächsten `run_turn`-Aufruf. `task_completed` wird wie oben vor dem
     // Aufruf ausgewertet (siehe Kommentar an der ersten Call-Site).
     let task_completed = turn_completed_a_plan_step(session);
-    maybe_compact(session, model, store, &last_round_usage, task_completed).await;
+    let appended_tokens = appended_tokens_since(session, history_mark);
+    maybe_compact(
+        session,
+        model,
+        store,
+        &last_round_usage,
+        appended_tokens,
+        task_completed,
+        &mut last_compaction_tokens_after,
+    )
+    .await;
 
     // Projektgedächtnis: alle Tool-Ergebnisse dieses Turns wurden bereits
     // über `notify_tool_outcome` gemeldet; hier, am erfolgreichen Turn-Ende,

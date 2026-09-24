@@ -537,32 +537,27 @@ impl ConversationHistory {
             }
         }
 
-        while used.saturating_add(after_bytes) > max_bytes && !after.is_empty() {
-            let removed = after.remove(0);
+        // Älteste nicht angeheftete Gruppe zuerst entfernen; angeheftete
+        // Zusammenfassungen bleiben immer stehen.
+        while used.saturating_add(after_bytes) > max_bytes {
+            let Some(position) = after.iter().position(|group| !group_is_pinned(group)) else {
+                break;
+            };
+            let removed = after.remove(position);
             items_dropped += removed.len();
             after_bytes = after_bytes.saturating_sub(group_bytes(&removed));
         }
         used = used.saturating_add(after_bytes);
 
         // Schritt 4: abgeschlossene, ältere Turns — neueste zuerst, ganz
-        // oder gar nicht, keine Kürzung.
-        let mut selected_before_reversed: Vec<Vec<TurnItem>> = Vec::new();
-        let mut before_iter = before.into_iter().rev();
-        while let Some(group) = before_iter.next() {
-            let group_size = group_bytes(&group);
-            if used.saturating_add(group_size) <= max_bytes {
-                used = used.saturating_add(group_size);
-                selected_before_reversed.push(group);
-            } else {
-                items_dropped += group.len();
-                items_dropped += before_iter.map(|g| g.len()).sum::<usize>();
-                break;
-            }
-        }
-        selected_before_reversed.reverse();
+        // oder gar nicht, keine Kürzung; nicht passende Gruppen werden
+        // übersprungen statt die Auswahl abzubrechen.
+        let selection = select_newest_first(before, used, max_bytes, false);
+        used = selection.used_bytes;
+        items_dropped += selection.items_dropped;
 
         let mut items = Vec::new();
-        for group in selected_before_reversed {
+        for group in selection.groups {
             items.extend(group);
         }
         items.extend(user_group);
@@ -582,39 +577,102 @@ impl ConversationHistory {
 }
 
 /// Rückfallpfad ohne `UserMessage` in der Historie (siehe
-/// [`ConversationHistory::tail_preserving_current_turn`]): unverändertes
-/// newest-fit-Verhalten von vor Knoten A4, nur über bereits global gekappte
-/// Items.
+/// [`ConversationHistory::tail_preserving_current_turn`]): neueste Gruppen
+/// zuerst, ganz oder gar nicht, über bereits global gekappte Items; die
+/// neueste Gruppe wird immer übernommen, angeheftete Zusammenfassungen nie
+/// entfernt.
 fn newest_first_tail(
     groups: Vec<Vec<TurnItem>>,
     max_bytes: usize,
     results_truncated: usize,
 ) -> (ConversationHistory, TailOutcome) {
-    let mut selected_reversed: Vec<Vec<TurnItem>> = Vec::new();
-    let mut used = 0_usize;
-    let mut items_dropped = 0_usize;
-    let mut iter = groups.into_iter().rev();
-    while let Some(group) = iter.next() {
-        let group_size = group_bytes(&group);
-        if used.saturating_add(group_size) <= max_bytes || selected_reversed.is_empty() {
-            used = used.saturating_add(group_size);
-            selected_reversed.push(group);
-        } else {
-            items_dropped += group.len();
-            items_dropped += iter.map(|g| g.len()).sum::<usize>();
-            break;
-        }
-    }
-    selected_reversed.reverse();
-    let items: Vec<TurnItem> = selected_reversed.into_iter().flatten().collect();
+    let selection = select_newest_first(groups, 0, max_bytes, true);
+    let items: Vec<TurnItem> = selection.groups.into_iter().flatten().collect();
     (
         ConversationHistory::from_items(items),
         TailOutcome {
-            used_bytes: used,
-            items_dropped,
+            used_bytes: selection.used_bytes,
+            items_dropped: selection.items_dropped,
             results_truncated,
         },
     )
+}
+
+/// Ergebnis von [`select_newest_first`].
+struct GroupSelection {
+    /// Die übernommenen Gruppen in chronologischer Reihenfolge.
+    groups: Vec<Vec<TurnItem>>,
+    /// Bisher verbrauchte Bytes inklusive der übernommenen Gruppen.
+    used_bytes: usize,
+    /// Anzahl Items in ausgelassenen Gruppen.
+    items_dropped: usize,
+}
+
+/// Wählt aus `groups` neueste zuerst alle Gruppen, die ganz in das
+/// Restbudget passen (Welle 3).
+///
+/// # Description
+/// - Angeheftete Zusammenfassungen ([`group_is_pinned`]) werden immer
+///   übernommen; ihre Bytes werden vorab reserviert.
+/// - Eine nicht passende Gruppe wird übersprungen (`continue`), ältere
+///   kleinere Gruppen können danach noch übernommen werden.
+/// - Die Ausgabe bleibt chronologisch geordnet.
+///
+/// # Arguments
+/// - `groups`: atomare Gruppen in Ankunftsreihenfolge.
+/// - `used`: bereits verbrauchte Bytes vor dieser Auswahl.
+/// - `max_bytes`: das Gesamtbudget.
+/// - `keep_newest`: übernimmt die neueste Gruppe auch, wenn sie das
+///   Budget allein sprengt (Rückfallpfad ohne `UserMessage`).
+///
+/// # Returns
+/// Eine [`GroupSelection`] mit Gruppen, verbrauchten Bytes und Zahl der
+/// ausgelassenen Items.
+fn select_newest_first(
+    groups: Vec<Vec<TurnItem>>,
+    used: usize,
+    max_bytes: usize,
+    keep_newest: bool,
+) -> GroupSelection {
+    let mut used_bytes = groups
+        .iter()
+        .filter(|group| group_is_pinned(group))
+        .map(|group| group_bytes(group))
+        .fold(used, usize::saturating_add);
+    let newest_index = groups.len().checked_sub(1);
+    let mut keep = vec![false; groups.len()];
+    let mut items_dropped = 0_usize;
+    for (index, group) in groups.iter().enumerate().rev() {
+        if group_is_pinned(group) {
+            keep[index] = true;
+            continue;
+        }
+        let group_size = group_bytes(group);
+        let forced = keep_newest && Some(index) == newest_index;
+        if forced || used_bytes.saturating_add(group_size) <= max_bytes {
+            used_bytes = used_bytes.saturating_add(group_size);
+            keep[index] = true;
+        } else {
+            items_dropped += group.len();
+        }
+    }
+    let groups = groups
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(group, kept)| kept.then_some(group))
+        .collect();
+    GroupSelection {
+        groups,
+        used_bytes,
+        items_dropped,
+    }
+}
+
+/// `true`, wenn die Gruppe eine angeheftete Zusammenfassung enthält, die der
+/// Byte-Budget-Trim nie entfernen darf (siehe
+/// [`crate::compaction::is_pinned_summary`]).
+fn group_is_pinned(group: &[TurnItem]) -> bool {
+    group.iter().any(crate::compaction::is_pinned_summary)
 }
 
 /// Gruppiert Item-Indizes nach derselben Atomaritätsregel wie
@@ -662,9 +720,16 @@ fn group_indices(items: &[TurnItem]) -> Vec<Vec<usize>> {
     groups
 }
 
-/// Geschätzte Serialisierungsgröße eines einzelnen Items in Bytes.
-/// `usize::MAX`, falls die Serialisierung fehlschlägt.
+/// Geschätzte Serialisierungsgröße eines einzelnen Items in Bytes für die
+/// Budgetierung. `usize::MAX`, falls die Serialisierung fehlschlägt.
+///
+/// Reasoning-Items zählen mit `0` (Welle 3): sie werden nie an den Provider
+/// gesendet (siehe [`ConversationHistory::to_model_messages`]) und dürfen
+/// deshalb kein Budget verdrängen.
 fn item_bytes(item: &TurnItem) -> usize {
+    if matches!(item, TurnItem::Reasoning(_)) {
+        return 0;
+    }
     serde_json::to_vec(item).map_or(usize::MAX, |bytes| bytes.len())
 }
 
@@ -727,11 +792,12 @@ fn full_placeholder_result(item: &ToolResultItem, original_bytes: usize) -> Tool
 /// Kürzungs-Platzhalter dazwischen — die budget-unabhängige "immer"-Regel
 /// aus Schritt 1 von [`ConversationHistory::tail_preserving_current_turn`].
 /// Ein Ergebnis, dessen Text schon innerhalb von `cap` liegt, bleibt
-/// unverändert.
-fn head_tail_truncated_result(item: &ToolResultItem, cap: usize) -> ToolResultItem {
+/// unverändert — dann liefert die Funktion `None`, damit der Aufrufer es
+/// nicht als gekürzt zählt.
+fn head_tail_truncated_result(item: &ToolResultItem, cap: usize) -> Option<ToolResultItem> {
     let text = tool_result_text(&item.result);
     if text.len() <= cap {
-        return item.clone();
+        return None;
     }
     let approx_elided = text.len().saturating_sub(cap);
     let placeholder_guess = truncated_placeholder(approx_elided);
@@ -748,13 +814,13 @@ fn head_tail_truncated_result(item: &ToolResultItem, cap: usize) -> ToolResultIt
     truncated.push_str(&placeholder);
     truncated.push_str(&text[tail_from..]);
 
-    ToolResultItem {
+    Some(ToolResultItem {
         id: item.id.clone(),
         call_id: item.call_id.clone(),
         result: tool_result_with_text(&item.result, truncated),
         duration_ms: item.duration_ms,
         trust: item.trust,
-    }
+    })
 }
 
 /// Kleinste Byteposition `>= index`, die in `value` auf einer Zeichengrenze
@@ -1248,5 +1314,151 @@ mod tests {
             "die UserMessage wurde trotz Bugfix verdrängt"
         );
         assert!(dropped > 0, "das Tool-Paar hätte weichen müssen");
+    }
+
+    // ------------------------------------------------------------------
+    // Welle 3 (owner E): Reasoning-Budget, angeheftete Zusammenfassungen,
+    // `continue` statt `break`, Kappungsgrenze.
+    // ------------------------------------------------------------------
+
+    fn text_of(item: &TurnItem) -> Option<String> {
+        match item {
+            TurnItem::UserMessage(m) => Some(flatten_content(&m.content)),
+            TurnItem::AssistantMessage(m) => Some(flatten_content(&m.content)),
+            _ => None,
+        }
+    }
+
+    fn texts(history: &ConversationHistory) -> Vec<String> {
+        history.items().iter().filter_map(text_of).collect()
+    }
+
+    #[test]
+    fn test_default_tool_result_cap_is_tenth_capped_at_64_kib() {
+        assert_eq!(default_tool_result_cap(10_000), 1_000);
+        assert_eq!(default_tool_result_cap(256 * 1024), 256 * 1024 / 10);
+        assert_eq!(default_tool_result_cap(10 * 1024 * 1024), 64 * 1024);
+        assert_eq!(default_tool_result_cap(0), 0);
+    }
+
+    #[test]
+    fn test_tail_ignores_reasoning_bytes_in_budget() -> TestResult {
+        let trigger = user("trigger");
+        let answer = assistant("answer");
+        let budget = item_bytes(&trigger) + item_bytes(&answer);
+
+        let mut history = ConversationHistory::new();
+        history.push(trigger);
+        history.push(TurnItem::Reasoning(ReasoningItem {
+            id: ItemId::new(),
+            summary_text: vec!["r".repeat(50_000)],
+            raw_content: vec!["r".repeat(50_000)],
+        }));
+        history.push(answer);
+
+        let (tail, outcome) = history.tail_preserving_current_turn(budget, budget);
+
+        assert_eq!(outcome.items_dropped, 0, "Reasoning darf nichts verdrängen");
+        assert_eq!(
+            outcome.used_bytes, budget,
+            "Reasoning zählt nicht zum Budget"
+        );
+        let sigs: Vec<&'static str> = tail.items().iter().map(signature).collect();
+        assert_eq!(sigs, vec!["user", "reasoning", "assistant"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tail_skips_oversized_older_group_and_keeps_older_small_ones() -> TestResult {
+        let oldest = user("oldest small turn");
+        let current = user("current trigger");
+        let budget = item_bytes(&oldest) + item_bytes(&current);
+
+        let mut history = ConversationHistory::new();
+        history.push(oldest);
+        history.push(assistant(&"big older answer ".repeat(1_000)));
+        history.push(current);
+
+        let (tail, outcome) = history.tail_preserving_current_turn(budget, budget);
+
+        assert_eq!(
+            texts(&tail),
+            vec!["oldest small turn".to_owned(), "current trigger".to_owned()],
+            "die übergroße Gruppe wird übersprungen, ältere kleine bleiben in Reihenfolge"
+        );
+        assert_eq!(outcome.items_dropped, 1);
+        assert_eq!(outcome.used_bytes, budget);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tail_without_user_message_skips_oversized_group() -> TestResult {
+        let first = assistant("first small");
+        let last = assistant("last small");
+        let budget = item_bytes(&first) + item_bytes(&last);
+
+        let mut history = ConversationHistory::new();
+        history.push(first);
+        history.push(assistant(&"middle big ".repeat(1_000)));
+        history.push(last);
+
+        let (tail, outcome) = history.tail_preserving_current_turn(budget, budget);
+
+        assert_eq!(
+            texts(&tail),
+            vec!["first small".to_owned(), "last small".to_owned()]
+        );
+        assert_eq!(outcome.items_dropped, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tail_never_drops_pinned_summary() -> TestResult {
+        let summary = TurnItem::AssistantMessage(AssistantMessageItem {
+            id: ItemId::new(),
+            content: vec![ContentPart::Text {
+                text: format!(
+                    "{}{}",
+                    crate::compaction::SUMMARY_MARKER,
+                    "zusammenfassung ".repeat(1_000)
+                ),
+            }],
+            phase: None,
+        });
+        if !crate::compaction::is_pinned_summary(&summary) {
+            return Err(TestError::Unexpected(
+                "Testaufbau: ein Item mit SUMMARY_MARKER muss als angeheftete \
+                 Zusammenfassung erkannt werden (compaction::is_pinned_summary)"
+                    .to_owned(),
+            ));
+        }
+        let current = user("current trigger");
+        // Budget kleiner als die Zusammenfassung allein.
+        let budget = item_bytes(&current) + 16;
+
+        let mut history = ConversationHistory::new();
+        history.push(summary);
+        history.push(assistant("older unpinned answer"));
+        history.push(current);
+
+        let (tail, outcome) = history.tail_preserving_current_turn(budget, budget);
+
+        let kept = texts(&tail);
+        assert_eq!(
+            kept.len(),
+            2,
+            "Zusammenfassung + aktuelle Nachricht: {kept:?}"
+        );
+        assert!(kept[0].starts_with(crate::compaction::SUMMARY_MARKER));
+        assert_eq!(kept[1], "current trigger");
+        assert_eq!(outcome.items_dropped, 1, "nur die ältere Antwort fällt weg");
+
+        // Auch im Rückfallpfad ohne UserMessage bleibt sie erhalten.
+        let mut no_user = ConversationHistory::new();
+        no_user.push(tail.items()[0].clone());
+        no_user.push(assistant("newest"));
+        let (tail2, _) = no_user.tail_preserving_current_turn(16, 16);
+        assert_eq!(tail2.len(), 2);
+        Ok(())
     }
 }

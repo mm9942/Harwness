@@ -17,6 +17,15 @@
 //! `drift_events` (Wächter-Ereignisse je Art, siehe
 //! [`harw_session_store::meta::add_drift_event`]).
 //!
+//! Seit Welle 3 hängt sie außerdem — sofern der registrierte
+//! [`harw_operations::SharedSessionController`] eine Momentaufnahme führt
+//! ([`harw_operations::session_control::SessionController::context_usage`]) —
+//! eine Kontextzeile an (belegt/Fenster, Kompaktierungsschwelle,
+//! Ausgabe-Reserve, letzte Kompaktierung; Format siehe
+//! `crate::status::format_context_line`). Die Zeile erscheint auch dann, wenn
+//! kein Sitzungszustand vorliegt, und fehlt stillschweigend ohne Controller
+//! oder ohne Momentaufnahme.
+//!
 //! # Datenquelle (wichtig für Aufrufer)
 //! `harw_operations::SessionControlSnapshot` — der andere Snapshot-Typ, den
 //! diese Crate kennt — trägt **keine** Nutzungsfelder (nur
@@ -48,8 +57,11 @@ use std::path::PathBuf;
 use harw_core::state_store::SessionStateSnapshot;
 use harw_core_bridge::OpContextCoreExt;
 use harw_macros::operation;
+use harw_operations::session_control::SharedSessionController;
 use harw_operations::{OpContext, OpError, OpOutput};
 use harw_session_store::meta::SessionMeta;
+
+use crate::status::format_context_line;
 
 /// Argumente der `/usage`-Operation (keine).
 #[derive(Default, serde::Deserialize, harw_macros::FromRawArgs)]
@@ -177,15 +189,36 @@ fn format_usage(snapshot: &SessionStateSnapshot, meta: Option<&SessionMeta>) -> 
     command(path = "/usage", visibility = "channel_parity", busy = "immediate")
 )]
 async fn usage(ctx: &OpContext, _args: UsageArgs) -> Result<OpOutput, OpError> {
+    let report = usage_report(ctx).await?;
+    // Welle 3 — Kontextfenster-Auslastung, sofern der Session-Controller eine
+    // Momentaufnahme führt. Unabhängig vom `StateStore`: auch ohne
+    // gespeicherten Sitzungszustand ist die Kontextzeile aussagekräftig.
+    let context_line = ctx
+        .service::<SharedSessionController>()
+        .and_then(|controller| controller.context_usage())
+        .map(|usage| format_context_line(&usage));
+    let text = match context_line {
+        Some(line) => format!("{report}\n{line}"),
+        None => report,
+    };
+    Ok(OpOutput::from(text))
+}
+
+/// Erzeugt den Nutzungsbericht ohne Kontextzeile (siehe [`usage`]).
+///
+/// # Fehler
+/// - [`OpError::Execution`]: der registrierte `StateStore` meldet einen
+///   Lesefehler.
+async fn usage_report(ctx: &OpContext) -> Result<String, OpError> {
     let Some(store) = ctx.state_store() else {
-        return Ok(OpOutput::from(NO_STATE_STORE_MESSAGE.to_owned()));
+        return Ok(NO_STATE_STORE_MESSAGE.to_owned());
     };
     let snapshot = store
         .load_session_state(ctx.session_id())
         .await
         .map_err(|error| OpError::Execution(error.to_string()))?;
     let Some(snapshot) = snapshot else {
-        return Ok(OpOutput::from(NO_SNAPSHOT_MESSAGE.to_owned()));
+        return Ok(NO_SNAPSHOT_MESSAGE.to_owned());
     };
     let meta = ctx.service::<SessionsMetaRoot>().and_then(|root| {
         match harw_session_store::meta::load_or_derive(&root.0, ctx.session_id()) {
@@ -200,7 +233,7 @@ async fn usage(ctx: &OpContext, _args: UsageArgs) -> Result<OpOutput, OpError> {
             }
         }
     });
-    Ok(OpOutput::from(format_usage(&snapshot, meta.as_ref())))
+    Ok(format_usage(&snapshot, meta.as_ref()))
 }
 
 #[cfg(test)]
@@ -373,6 +406,72 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
 
         assert!(report.contains("Wächter-Ereignisse: keine"));
+        Ok(())
+    }
+
+    // ── Welle 3 — Kontextzeile ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn usage_appends_context_line_from_the_session_controller() -> TestResult {
+        use harw_operations::session_control::{ContextUsageSnapshot, NullSessionController};
+        use std::sync::Arc;
+
+        let (base, root) = test_context()?;
+        let controller = NullSessionController::new();
+        controller
+            .set_context_usage(Some(ContextUsageSnapshot {
+                used_tokens: 1_000,
+                window_tokens: 4_000,
+                threshold_tokens: Some(3_000),
+                reserve_tokens: Some(500),
+                ..ContextUsageSnapshot::default()
+            }))
+            .map_err(ctx("set_context_usage"))?;
+        let mut services = ServiceMap::new();
+        services.insert(Arc::new(controller) as SharedSessionController);
+        let op_ctx = OpContext::new(
+            base.session_id().clone(),
+            base.turn_id().clone(),
+            base.sandbox().clone(),
+            services,
+        );
+
+        let result = super::usage(&op_ctx, UsageArgs::default()).await;
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+        let output = result.map_err(ctx("usage must not fail"))?;
+
+        assert!(output.text.starts_with(NO_STATE_STORE_MESSAGE));
+        assert!(
+            output.text.contains(
+                "Kontext: 1000/4000 Tokens (25.0%), nächste Kompaktierung bei 3000, \
+                 Ausgabe-Reserve 500, letzte Kompaktierung: keine"
+            ),
+            "expected the context line: {}",
+            output.text
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn usage_without_context_snapshot_adds_no_context_line() -> TestResult {
+        use harw_operations::session_control::NullSessionController;
+        use std::sync::Arc;
+
+        let (base, root) = test_context()?;
+        let mut services = ServiceMap::new();
+        services.insert(Arc::new(NullSessionController::new()) as SharedSessionController);
+        let op_ctx = OpContext::new(
+            base.session_id().clone(),
+            base.turn_id().clone(),
+            base.sandbox().clone(),
+            services,
+        );
+
+        let result = super::usage(&op_ctx, UsageArgs::default()).await;
+        std::fs::remove_dir_all(root).map_err(ctx("remove test workspace"))?;
+        let output = result.map_err(ctx("usage must not fail"))?;
+
+        assert_eq!(output.text, NO_STATE_STORE_MESSAGE);
         Ok(())
     }
 }

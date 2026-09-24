@@ -30,16 +30,97 @@
 //! hinweg gehalten — [`ProviderRateLimiter::wait_for_slot`] liest die nötige
 //! Wartezeit synchron aus, gibt den Lock frei und schläft danach mit
 //! `tokio::time::sleep`.
+//!
+//! ## Schätzungsbewusste Zulassung (Welle 3)
+//! [`ProviderRateLimiter::wait_for_slot_with_estimate`] berücksichtigt die
+//! geschätzte Eingabegröße des nächsten Requests:
+//! - **Fail-fast:** Übersteigt die Schätzung das *Limit* einer
+//!   Token-Dimension (`input_tokens` bzw. `tokens`) selbst, kann der Request
+//!   nie zugelassen werden — statt zu warten wird sofort
+//!   [`RateBudgetError::RequestExceedsLimit`] geliefert.
+//! - **Schätzungsbewusstes Warten:** Reicht `remaining` nicht für die
+//!   Schätzung (oder liegt es bereits im Sicherheitsabstand), wird bis zum
+//!   (geschätzten) Reset gewartet.
+//! - **Optimistisches Dekrementieren:** Jede Zulassung zieht unter dem Lock
+//!   sofort `1` Request und die geschätzten Tokens von `remaining` ab; die
+//!   nächste Antwort überschreibt den Wert wieder mit dem autoritativen
+//!   Header-Stand.
+//! - **Kein Ansturm nach dem Reset:** Nach Ablauf von `reset_at` wird
+//!   `remaining` auf `limit` aufgefüllt und ein neues Fenster
+//!   (`jetzt + beobachtete Fensterlänge`) geschätzt. Wartende, die
+//!   gleichzeitig aufwachen, werden nacheinander unter dem Lock geprüft und
+//!   dekrementieren je Zulassung — wer nicht mehr hineinpasst, wartet auf das
+//!   nächste geschätzte Fenster, statt dass alle gleichzeitig losschicken.
+//! - Insgesamt wird pro Aufruf höchstens `MAX_WAIT` gewartet; danach wird der
+//!   Request trotzdem zugelassen (der Provider antwortet notfalls mit 429).
+//!
+//! [`ProviderRateLimiter::wait_for_slot`] bleibt unverändert (ohne Schätzung,
+//! ohne Dekrementieren); [`ProviderRateLimiter::record_request_estimate`]
+//! erlaubt Aufrufern dieses Pfads, einen Request nachträglich optimistisch
+//! zu verbuchen.
 
 use std::fmt;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::header::HeaderMap;
 
 /// Obergrenze für eine einzelne Wartezeit pro `wait_for_slot`-Aufruf.
 const MAX_WAIT: Duration = Duration::from_secs(120);
+
+/// Angenommene Fensterlänge, wenn nach einem abgelaufenen Reset kein
+/// beobachtetes Fenster bekannt ist (typische Limits sind "pro Minute").
+const DEFAULT_WINDOW: Duration = Duration::from_secs(60);
+
+/// Fehler der schätzungsbewussten Zulassung
+/// ([`ProviderRateLimiter::wait_for_slot_with_estimate`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RateBudgetError {
+    /// Die geschätzte Eingabe eines einzelnen Requests übersteigt das Limit
+    /// einer Token-Dimension selbst — Warten hilft nie, der Aufrufer muss
+    /// den Request verkleinern (z. B. Kontext kompaktieren).
+    RequestExceedsLimit {
+        /// Betroffene Dimension (`"input_tokens"` oder `"tokens"`).
+        dimension: &'static str,
+        /// Geschätzte Eingabe-Tokens des Requests.
+        estimated_tokens: u64,
+        /// Vom Provider gemeldetes Limit der Dimension.
+        limit: u64,
+    },
+}
+
+impl fmt::Display for RateBudgetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RequestExceedsLimit {
+                dimension,
+                estimated_tokens,
+                limit,
+            } => write!(
+                f,
+                "Request übersteigt das Rate-Limit des Providers: geschätzt \
+                 {estimated_tokens} Tokens, Limit der Dimension '{dimension}' ist \
+                 {limit} Tokens; der Request muss verkleinert werden"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RateBudgetError {}
+
+/// Ergebnis einer einzelnen Zulassungsprüfung.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// Zugelassen; Kontingent wurde bereits optimistisch dekrementiert.
+    Admitted,
+    /// Noch nicht zugelassen; `wait` bis zur nächsten Prüfung schlafen.
+    Wait {
+        dimension: &'static str,
+        wait: Duration,
+    },
+}
 
 /// Kontingent-Zustand einer einzelnen Rate-Limit-Dimension.
 ///
@@ -51,10 +132,14 @@ struct DimensionState {
     limit: Option<u64>,
     remaining: Option<u64>,
     reset_at: Option<Instant>,
+    /// Zuletzt beobachtete Fensterlänge (`reset_at` minus
+    /// Beobachtungszeitpunkt); dient nach einem abgelaufenen Reset zur
+    /// Schätzung des nächsten Fensters.
+    window: Option<Duration>,
 }
 
 /// Gesamtzustand des Pacers über alle bekannten Dimensionen.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct State {
     requests: DimensionState,
     input_tokens: DimensionState,
@@ -264,6 +349,149 @@ impl ProviderRateLimiter {
         self.clear_dimension(dimension);
     }
 
+    /// Wartet schätzungsbewusst auf ein Kontingent für einen Request mit
+    /// `estimated_input_tokens` Eingabe-Tokens und verbucht ihn optimistisch.
+    ///
+    /// # Description
+    /// No-op (`Ok(())`), wenn der Pacer deaktiviert ist. Sonst wird in einer
+    /// Schleife unter dem Lock geprüft (Lock nie über `.await` gehalten):
+    /// 1. Übersteigt die Schätzung das Limit von `input_tokens` oder
+    ///    `tokens` → sofort [`RateBudgetError::RequestExceedsLimit`].
+    /// 2. Abgelaufene Fenster werden auf `limit` aufgefüllt und ein neues
+    ///    Fenster geschätzt.
+    /// 3. Reicht `remaining` nicht (Requests: 1, Token-Dimensionen:
+    ///    Schätzung) oder liegt es im Sicherheitsabstand, wird bis zum
+    ///    Reset geschlafen und erneut geprüft.
+    /// 4. Sonst wird zugelassen und `remaining` sofort dekrementiert.
+    ///
+    /// Nach insgesamt `MAX_WAIT` wird der Request ohne weiteres Warten
+    /// zugelassen (und trotzdem verbucht).
+    ///
+    /// # Arguments
+    /// - `estimated_input_tokens` (`u64`): geschätzte Eingabe-Tokens des
+    ///   nächsten Requests.
+    ///
+    /// # Errors
+    /// [`RateBudgetError::RequestExceedsLimit`], wenn der einzelne Request
+    /// nie in das gemeldete Limit passt.
+    pub async fn wait_for_slot_with_estimate(
+        &self,
+        estimated_input_tokens: u64,
+    ) -> Result<(), RateBudgetError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let deadline = Instant::now() + MAX_WAIT;
+        loop {
+            let now = Instant::now();
+            let force = now >= deadline;
+            match self.try_admit(estimated_input_tokens, now, force)? {
+                Admission::Admitted => return Ok(()),
+                Admission::Wait { dimension, wait } => {
+                    let wait = wait.min(deadline.saturating_duration_since(now));
+                    tracing::info!(
+                        dimension,
+                        estimated_input_tokens,
+                        wait_ms = wait.as_millis() as u64,
+                        "provider.rate_limit.pacing"
+                    );
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
+    }
+
+    /// Verbucht einen Request optimistisch, ohne zu warten.
+    ///
+    /// # Description
+    /// Für Aufrufer, die [`Self::wait_for_slot`] (ohne Schätzung) nutzen:
+    /// zieht `1` vom Request-Kontingent und `estimated_input_tokens` von
+    /// `input_tokens`/`tokens` ab (sättigend, nur wo `remaining` bekannt
+    /// ist). Abgelaufene Fenster werden vorher aufgefüllt. No-op, wenn der
+    /// Pacer deaktiviert ist. Die nächste Antwort überschreibt die Werte
+    /// wieder mit dem Header-Stand.
+    ///
+    /// # Arguments
+    /// - `estimated_input_tokens` (`u64`): geschätzte Eingabe-Tokens des
+    ///   gerade gesendeten Requests.
+    pub fn record_request_estimate(&self, estimated_input_tokens: u64) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        let mut state = self.lock_state();
+        refill_expired(&mut state, now);
+        commit_admission(&mut state, estimated_input_tokens);
+    }
+
+    /// Prüft synchron, ob ein Request dieser Größe überhaupt jemals in die
+    /// gemeldeten Limits passt (ohne zu warten oder zu verbuchen).
+    ///
+    /// # Errors
+    /// [`RateBudgetError::RequestExceedsLimit`], wenn die Schätzung das
+    /// Limit von `input_tokens` oder `tokens` übersteigt. Deaktiviert immer
+    /// `Ok(())`.
+    pub fn check_request_budget(&self, estimated_input_tokens: u64) -> Result<(), RateBudgetError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let state = self.lock_state();
+        check_fits_limit(&state, estimated_input_tokens)
+    }
+
+    /// Vorschau auf [`Self::wait_for_slot_with_estimate`] ohne
+    /// Seiteneffekt (auch für Tests/Statusanzeigen): rechnet auf einer Kopie des Zustands und liefert die
+    /// fällige Wartezeit (`None` = würde sofort zugelassen).
+    ///
+    /// # Errors
+    /// Wie [`Self::check_request_budget`].
+    pub fn pending_wait_for_estimate(
+        &self,
+        estimated_input_tokens: u64,
+    ) -> Result<Option<Duration>, RateBudgetError> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let mut snapshot = self.lock_state().clone();
+        let decision = evaluate_admission(
+            &mut snapshot,
+            estimated_input_tokens,
+            self.safety_margin_pct,
+            Instant::now(),
+            false,
+        )?;
+        Ok(match decision {
+            Admission::Admitted => None,
+            Admission::Wait { wait, .. } => Some(wait),
+        })
+    }
+
+    /// Eine Zulassungsprüfung unter dem Lock (synchron, kein `.await`).
+    fn try_admit(
+        &self,
+        estimated_input_tokens: u64,
+        now: Instant,
+        force: bool,
+    ) -> Result<Admission, RateBudgetError> {
+        let mut state = self.lock_state();
+        evaluate_admission(
+            &mut state,
+            estimated_input_tokens,
+            self.safety_margin_pct,
+            now,
+            force,
+        )
+    }
+
+    /// Sperrt den Zustand; ein vergifteter Lock wird übernommen, da der
+    /// Zustand nur aus Hinweisen besteht.
+    fn lock_state(&self) -> MutexGuard<'_, State> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     /// Liefert die aktuell fällige Wartezeit, ohne zu schlafen.
     ///
     /// # Description
@@ -337,6 +565,128 @@ impl ProviderRateLimiter {
     }
 }
 
+/// Fail-fast-Prüfung: passt ein Request dieser Größe überhaupt jemals in
+/// die Token-Limits?
+fn check_fits_limit(state: &State, estimate: u64) -> Result<(), RateBudgetError> {
+    for (dimension, dim) in [
+        ("input_tokens", &state.input_tokens),
+        ("tokens", &state.tokens),
+    ] {
+        if let Some(limit) = dim.limit {
+            if limit > 0 && estimate > limit {
+                return Err(RateBudgetError::RequestExceedsLimit {
+                    dimension,
+                    estimated_tokens: estimate,
+                    limit,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Füllt Dimensionen, deren Reset abgelaufen ist, auf `limit` auf und
+/// schätzt das nächste Fenster (`now + window`); ein abgelaufener
+/// `retry-after`-Hinweis wird verworfen.
+fn refill_expired(state: &mut State, now: Instant) {
+    for dim in [
+        &mut state.requests,
+        &mut state.input_tokens,
+        &mut state.output_tokens,
+        &mut state.tokens,
+    ] {
+        if let (Some(limit), Some(reset_at)) = (dim.limit, dim.reset_at) {
+            if reset_at <= now {
+                dim.remaining = Some(limit);
+                dim.reset_at = Some(now + dim.window.unwrap_or(DEFAULT_WINDOW));
+            }
+        }
+    }
+    if state.retry_after_until.is_some_and(|until| until <= now) {
+        state.retry_after_until = None;
+    }
+}
+
+/// Wartebedarf einer Dimension für einen Request, der `needed` Einheiten
+/// verbraucht: gewartet wird, wenn `remaining` nicht reicht oder bereits im
+/// Sicherheitsabstand liegt und ein künftiger Reset bekannt ist.
+fn dimension_wait(
+    dim: &DimensionState,
+    needed: u64,
+    safety_margin_pct: u8,
+    now: Instant,
+) -> Option<Duration> {
+    let (Some(limit), Some(remaining), Some(reset_at)) = (dim.limit, dim.remaining, dim.reset_at)
+    else {
+        return None;
+    };
+    if reset_at <= now {
+        return None;
+    }
+    let short = remaining < needed;
+    let below_margin =
+        remaining.saturating_mul(100) <= limit.saturating_mul(u64::from(safety_margin_pct));
+    (short || below_margin).then(|| (reset_at - now).min(MAX_WAIT))
+}
+
+/// Zieht einen zugelassenen Request optimistisch vom Kontingent ab.
+fn commit_admission(state: &mut State, estimate: u64) {
+    if let Some(remaining) = state.requests.remaining.as_mut() {
+        *remaining = remaining.saturating_sub(1);
+    }
+    for dim in [&mut state.input_tokens, &mut state.tokens] {
+        if let Some(remaining) = dim.remaining.as_mut() {
+            *remaining = remaining.saturating_sub(estimate);
+        }
+    }
+}
+
+/// Kern der schätzungsbewussten Zulassung (auf einem gesperrten oder
+/// kopierten Zustand): Fail-fast, Auffüllen abgelaufener Fenster, dann
+/// entweder Zulassung mit optimistischem Dekrement oder die längste fällige
+/// Wartezeit. `force` lässt ohne Warten zu (nach Ablauf von `MAX_WAIT`).
+fn evaluate_admission(
+    state: &mut State,
+    estimate: u64,
+    safety_margin_pct: u8,
+    now: Instant,
+    force: bool,
+) -> Result<Admission, RateBudgetError> {
+    check_fits_limit(state, estimate)?;
+    refill_expired(state, now);
+
+    if !force {
+        let mut longest: Option<(&'static str, Duration)> = state
+            .retry_after_until
+            .filter(|until| *until > now)
+            .map(|until| ("retry_after", (until - now).min(MAX_WAIT)));
+        for (label, dim, needed) in [
+            ("requests", &state.requests, 1),
+            ("input_tokens", &state.input_tokens, estimate),
+            ("output_tokens", &state.output_tokens, 0),
+            ("tokens", &state.tokens, estimate),
+        ] {
+            if let Some(wait) = dimension_wait(dim, needed, safety_margin_pct, now) {
+                if longest.is_none_or(|(_, current)| wait > current) {
+                    longest = Some((label, wait));
+                }
+            }
+        }
+        if let Some((dimension, wait)) = longest {
+            return Ok(Admission::Wait { dimension, wait });
+        }
+    }
+
+    commit_admission(state, estimate);
+    Ok(Admission::Admitted)
+}
+
+/// Positive Fensterlänge zwischen Beobachtung und Reset, sonst `None`.
+fn observed_window(reset_at: Instant, now: Instant) -> Option<Duration> {
+    let window = reset_at.saturating_duration_since(now);
+    (!window.is_zero()).then_some(window)
+}
+
 /// Liest einen Header-Wert als `&str`, ignoriert nicht-ASCII/ungültige
 /// Werte (`to_str()` schlägt fehl → `None`).
 fn header_str<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
@@ -376,7 +726,12 @@ fn apply_anthropic_family(
         match parse_rfc3339_epoch_seconds(value)
             .and_then(|epoch| instant_from_epoch_seconds(epoch, now))
         {
-            Some(instant) => dim.reset_at = Some(instant),
+            Some(instant) => {
+                dim.reset_at = Some(instant);
+                if let Some(window) = observed_window(instant, now) {
+                    dim.window = Some(window);
+                }
+            }
             None => {
                 tracing::debug!(header = %reset_header, value, "provider.rate_limit.header_parse_failed")
             }
@@ -411,7 +766,12 @@ fn apply_openai_family(dim: &mut DimensionState, headers: &HeaderMap, kind: &str
     let reset_header = format!("x-ratelimit-reset-{kind}");
     if let Some(value) = header_str(headers, &reset_header) {
         match parse_go_like_duration(value) {
-            Some(duration) => dim.reset_at = Some(now + duration),
+            Some(duration) => {
+                dim.reset_at = Some(now + duration);
+                if !duration.is_zero() {
+                    dim.window = Some(duration);
+                }
+            }
             None => {
                 tracing::debug!(header = %reset_header, value, "provider.rate_limit.header_parse_failed")
             }
@@ -745,6 +1105,312 @@ mod tests {
         limiter.record_rate_limited();
         limiter.record_rate_limited();
         assert_eq!(limiter.rate_limited_count(), 3);
+    }
+
+    fn enabled_limiter(safety_margin_pct: u8) -> ProviderRateLimiter {
+        ProviderRateLimiter::new(Some(harw_config::RateLimitToml {
+            enabled: true,
+            safety_margin_pct,
+        }))
+    }
+
+    /// Setzt eine Token-Dimension direkt (ohne Header-Umweg).
+    fn set_input_tokens(
+        limiter: &ProviderRateLimiter,
+        limit: u64,
+        remaining: u64,
+        reset_at: Option<Instant>,
+        window: Option<Duration>,
+    ) {
+        let mut state = limiter.lock_state();
+        state.input_tokens = DimensionState {
+            limit: Some(limit),
+            remaining: Some(remaining),
+            reset_at,
+            window,
+        };
+    }
+
+    fn input_remaining(limiter: &ProviderRateLimiter) -> Option<u64> {
+        limiter.lock_state().input_tokens.remaining
+    }
+
+    #[test]
+    fn test_estimate_exceeding_limit_fails_fast() -> TestResult {
+        let limiter = enabled_limiter(10);
+        let headers = header_map(&[
+            ("anthropic-ratelimit-input-tokens-limit", "30000"),
+            ("anthropic-ratelimit-input-tokens-remaining", "30000"),
+            (
+                "anthropic-ratelimit-input-tokens-reset",
+                "2999-01-01T00:00:00Z",
+            ),
+        ])?;
+        limiter.observe_headers(&headers);
+        let expected = RateBudgetError::RequestExceedsLimit {
+            dimension: "input_tokens",
+            estimated_tokens: 40_000,
+            limit: 30_000,
+        };
+        assert_eq!(limiter.check_request_budget(40_000), Err(expected.clone()));
+        assert_eq!(limiter.pending_wait_for_estimate(40_000), Err(expected));
+        assert_eq!(limiter.check_request_budget(30_000), Ok(()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_openai_tokens_limit_fails_fast() -> TestResult {
+        let limiter = enabled_limiter(10);
+        let headers = header_map(&[
+            ("x-ratelimit-limit-tokens", "1000"),
+            ("x-ratelimit-remaining-tokens", "1000"),
+            ("x-ratelimit-reset-tokens", "1m0s"),
+        ])?;
+        limiter.observe_headers(&headers);
+        match limiter.check_request_budget(1001) {
+            Err(RateBudgetError::RequestExceedsLimit { dimension, .. }) => {
+                assert_eq!(dimension, "tokens");
+            }
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_estimate_larger_than_remaining_waits() -> TestResult {
+        let limiter = enabled_limiter(10);
+        let reset = Instant::now() + Duration::from_secs(30);
+        set_input_tokens(&limiter, 10_000, 5_000, Some(reset), None);
+        let wait = limiter
+            .pending_wait_for_estimate(6_000)
+            .map_err(ctx("Vorschau"))?
+            .ok_or(TestError::Missing("Wartezeit erwartet"))?;
+        assert!(wait <= Duration::from_secs(30));
+        // Eine kleinere Schätzung passt sofort.
+        assert_eq!(
+            limiter
+                .pending_wait_for_estimate(1_000)
+                .map_err(ctx("Vorschau"))?,
+            None
+        );
+        // Die Vorschau verbucht nichts.
+        assert_eq!(input_remaining(&limiter), Some(5_000));
+        Ok(())
+    }
+
+    #[test]
+    fn test_admission_decrements_optimistically() -> TestResult {
+        let limiter = enabled_limiter(10);
+        let reset = Instant::now() + Duration::from_secs(30);
+        set_input_tokens(&limiter, 10_000, 10_000, Some(reset), None);
+        {
+            let mut state = limiter.lock_state();
+            state.requests = DimensionState {
+                limit: Some(50),
+                remaining: Some(50),
+                reset_at: Some(reset),
+                window: None,
+            };
+        }
+        let now = Instant::now();
+        assert_eq!(
+            limiter
+                .try_admit(4_000, now, false)
+                .map_err(ctx("Zulassung"))?,
+            Admission::Admitted
+        );
+        assert_eq!(input_remaining(&limiter), Some(6_000));
+        assert_eq!(limiter.lock_state().requests.remaining, Some(49));
+        assert_eq!(
+            limiter
+                .try_admit(4_000, now, false)
+                .map_err(ctx("Zulassung"))?,
+            Admission::Admitted
+        );
+        assert_eq!(input_remaining(&limiter), Some(2_000));
+        // Dritter Request passt nicht mehr → warten, nichts verbuchen.
+        match limiter
+            .try_admit(4_000, now, false)
+            .map_err(ctx("Zulassung"))?
+        {
+            Admission::Wait { dimension, .. } => assert_eq!(dimension, "input_tokens"),
+            Admission::Admitted => return Err(TestError::Unexpected("zugelassen".into())),
+        }
+        assert_eq!(input_remaining(&limiter), Some(2_000));
+        Ok(())
+    }
+
+    #[test]
+    fn test_no_stampede_after_reset() -> TestResult {
+        let limiter = enabled_limiter(10);
+        let window = Duration::from_secs(60);
+        let past = Instant::now();
+        set_input_tokens(&limiter, 100, 0, Some(past), Some(window));
+        let now = past + Duration::from_millis(1);
+        // Nach dem Reset wird aufgefüllt: der erste Wartende passt hinein …
+        assert_eq!(
+            limiter
+                .try_admit(60, now, false)
+                .map_err(ctx("Zulassung"))?,
+            Admission::Admitted
+        );
+        assert_eq!(input_remaining(&limiter), Some(40));
+        // … der zweite nicht mehr; er wartet auf das nächste geschätzte
+        // Fenster statt gleichzeitig loszuschicken.
+        match limiter
+            .try_admit(60, now, false)
+            .map_err(ctx("Zulassung"))?
+        {
+            Admission::Wait { dimension, wait } => {
+                assert_eq!(dimension, "input_tokens");
+                assert_eq!(wait, window);
+            }
+            Admission::Admitted => return Err(TestError::Unexpected("Ansturm".into())),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_refill_without_window_uses_default() -> TestResult {
+        let limiter = enabled_limiter(10);
+        let past = Instant::now();
+        set_input_tokens(&limiter, 100, 0, Some(past), None);
+        let now = past + Duration::from_millis(1);
+        assert_eq!(
+            limiter
+                .try_admit(100, now, false)
+                .map_err(ctx("Zulassung"))?,
+            Admission::Admitted
+        );
+        let reset = limiter
+            .lock_state()
+            .input_tokens
+            .reset_at
+            .ok_or(TestError::Missing("neues Fenster"))?;
+        assert_eq!(reset, now + DEFAULT_WINDOW);
+        Ok(())
+    }
+
+    #[test]
+    fn test_force_admits_despite_shortage() -> TestResult {
+        let limiter = enabled_limiter(10);
+        let reset = Instant::now() + Duration::from_secs(30);
+        set_input_tokens(&limiter, 10_000, 100, Some(reset), None);
+        assert_eq!(
+            limiter
+                .try_admit(5_000, Instant::now(), true)
+                .map_err(ctx("Zulassung"))?,
+            Admission::Admitted
+        );
+        assert_eq!(input_remaining(&limiter), Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn test_record_request_estimate_decrements() -> TestResult {
+        let limiter = enabled_limiter(10);
+        let headers = header_map(&[
+            ("x-ratelimit-limit-requests", "100"),
+            ("x-ratelimit-remaining-requests", "80"),
+            ("x-ratelimit-reset-requests", "6m0s"),
+            ("x-ratelimit-limit-tokens", "10000"),
+            ("x-ratelimit-remaining-tokens", "9000"),
+            ("x-ratelimit-reset-tokens", "1m0s"),
+        ])?;
+        limiter.observe_headers(&headers);
+        limiter.record_request_estimate(1_500);
+        let state = limiter.lock_state();
+        assert_eq!(state.requests.remaining, Some(79));
+        assert_eq!(state.tokens.remaining, Some(7_500));
+        assert_eq!(state.tokens.window, Some(Duration::from_secs(60)));
+        assert_eq!(state.requests.window, Some(Duration::from_secs(360)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_record_request_estimate_disabled_is_noop() {
+        let limiter = ProviderRateLimiter::new(None);
+        limiter.record_request_estimate(1_000);
+        assert_eq!(input_remaining(&limiter), None);
+    }
+
+    #[test]
+    fn test_expired_retry_after_is_cleared_on_admission() -> TestResult {
+        let limiter = enabled_limiter(10);
+        let past = Instant::now();
+        limiter.lock_state().retry_after_until = Some(past);
+        let now = past + Duration::from_millis(1);
+        assert_eq!(
+            limiter
+                .try_admit(10, now, false)
+                .map_err(ctx("Zulassung"))?,
+            Admission::Admitted
+        );
+        assert_eq!(limiter.lock_state().retry_after_until, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_safety_margin_still_applies_with_estimate() -> TestResult {
+        let limiter = enabled_limiter(20);
+        let reset = Instant::now() + Duration::from_secs(10);
+        // 15 % übrig, Sicherheitsabstand 20 % → warten, obwohl 1 Token passt.
+        set_input_tokens(&limiter, 1_000, 150, Some(reset), None);
+        assert!(
+            limiter
+                .pending_wait_for_estimate(1)
+                .map_err(ctx("Vorschau"))?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_rate_budget_error_display_is_german() {
+        let err = RateBudgetError::RequestExceedsLimit {
+            dimension: "input_tokens",
+            estimated_tokens: 5,
+            limit: 3,
+        };
+        let text = err.to_string();
+        assert!(text.contains("übersteigt"));
+        assert!(text.contains("input_tokens"));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_slot_with_estimate_disabled_ok() -> TestResult {
+        let limiter = ProviderRateLimiter::new(None);
+        limiter
+            .wait_for_slot_with_estimate(u64::MAX)
+            .await
+            .map_err(ctx("deaktiviert muss zulassen"))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_slot_with_estimate_fails_fast() {
+        let limiter = enabled_limiter(10);
+        let reset = Instant::now() + Duration::from_secs(60);
+        set_input_tokens(&limiter, 1_000, 0, Some(reset), None);
+        // Würde ohne Fail-fast 60 s warten; muss sofort scheitern.
+        let result = limiter.wait_for_slot_with_estimate(2_000).await;
+        assert!(matches!(
+            result,
+            Err(RateBudgetError::RequestExceedsLimit { limit: 1_000, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_slot_with_estimate_admits_and_decrements() -> TestResult {
+        let limiter = enabled_limiter(10);
+        let reset = Instant::now() + Duration::from_secs(60);
+        set_input_tokens(&limiter, 1_000, 900, Some(reset), None);
+        limiter
+            .wait_for_slot_with_estimate(300)
+            .await
+            .map_err(ctx("muss sofort zulassen"))?;
+        assert_eq!(input_remaining(&limiter), Some(600));
+        Ok(())
     }
 
     #[test]

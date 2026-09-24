@@ -154,12 +154,18 @@ const TOOL_RESULT_MAX_BYTES: usize = 64 * 1024;
 const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 1800;
 
 /// Rückfall-Kontextfenster (Token), wenn weder das konfigurierte Modell
-/// (`config.models[id].context_window`) noch eine andere Quelle eine Größe
-/// nennt. 200k ist die kleinste unter den heute eingebauten Modellen
-/// (siehe `harw-registry-defaults`/`config/models.toml`) — konservativ genug,
-/// dass [`harw_core::AutoCompactPolicy::for_context_window`] eher zu früh als
-/// zu spät verdichtet.
-const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
+/// (`config.models[id].context_window`) noch der eingebaute Modellkatalog
+/// eine Größe nennt (Welle 3). 32k statt früher 200k: ein unbekanntes
+/// (z. B. lokales) Modell hat oft ein kleines Fenster, und ein zu großer
+/// Rückfallwert ließe [`harw_core::AutoCompactPolicy::for_context_window`]
+/// erst verdichten, nachdem der Provider die Anfrage bereits abgelehnt hat.
+/// Jeder Rückfall wird mit `tracing::warn!` gemeldet ([`model_limits_for`]).
+pub const UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS: u64 = 32_768;
+
+/// Fester Token-Aufschlag für System-Prompt, Werkzeugschemata und
+/// Kontextfragmente, den die Auto-Verdichtung zusätzlich zur Ausgabereserve
+/// vom Fenster abzieht ([`harw_core::AutoCompactPolicy::with_fixed_overhead`]).
+const FIXED_CONTEXT_OVERHEAD_TOKENS: u64 = 4096;
 
 /// Grenzwerte eines einzelnen Turns, abgeleitet aus dem [`RootBudget`].
 ///
@@ -1643,6 +1649,8 @@ impl RuntimeAssemblyBuilder {
         // hat — nur auf die daraus geklonten Werte).
         let root_uia_reasoning_effort_defaults =
             resolve_root_uia_reasoning_effort_defaults(&config, uia_ir.as_ref());
+        // Welle 3: das Modell, dessen Fenster die Wurzel budgetiert.
+        let root_model_id = effective_root_model_id(&config, uia_ir.is_some());
 
         // 5. Ein Trace, ein Spawn-Kontext.
         let trace = new_root_trace(spec.entry).map_err(|error| RuntimeError::Spawner {
@@ -2209,6 +2217,7 @@ impl RuntimeAssemblyBuilder {
             role_effort_weights,
             root_uia_reasoning_effort_defaults,
             pitfall_advisor,
+            root_model_id,
             registry: Mutex::new(Some(registry)),
             responder: Mutex::new(None),
             host_permit_ledger,
@@ -2988,66 +2997,333 @@ impl ContextProvider for MemoryFactsContextProvider {
     }
 }
 
-/// Das Kontextfenster (Token) des Vorgabemodells dieses Laufs.
+/// Die Kennung des Modells, das die Wurzelsitzung dieses Laufs tatsächlich
+/// treibt.
 ///
 /// # Beschreibung
-/// Sucht `config.harness.default_model` in `config.models` — zuerst als
-/// direkten Schlüssel/`id`-Treffer, sonst über `ModelToml::aliases` — und
-/// liest dessen `context_window`. Ohne Vorgabemodell, ohne passenden
-/// Katalogeintrag oder ohne gesetztes `context_window` greift
-/// [`DEFAULT_CONTEXT_WINDOW_TOKENS`]: `harw-model-catalog` ist in diesem
-/// Crate nicht importiert (kein bestehender Verwendungsort in
-/// `assembly.rs`), ein zweiter Nachschlagepfad wäre deshalb unbelegte
-/// Spekulation statt eines dokumentierten Vertragswegs.
+/// Spiegelt [`crate::model::resolve_uia_model`] (dort privat): ist die Wurzel
+/// eine UIA (`uia_root`) und sind `uia_provider`/`uia_model` beide gesetzt,
+/// mit einem vorhandenen, aktivierten `uia_provider`, dann ist `uia_model`
+/// das effektive Modell; sonst `default_model`. Dieselbe Rangfolge nutzt
+/// [`resolve_root_uia_reasoning_effort_defaults`].
 ///
 /// # Argumente
 /// - `config` (`&ResolvedConfig`): die aufgelöste Konfiguration dieses Laufs.
+/// - `uia_root` (`bool`): ob die Wurzel dieses Laufs eine UIA ist.
 ///
 /// # Rückgabe
-/// Die Token-Zahl des effektiven Kontextfensters, nie 0 (Vorgabe greift).
-fn resolve_context_window(config: &ResolvedConfig) -> u64 {
-    match config.harness.default_model.as_deref() {
-        Some(model_id) => context_window_for_model(config, model_id),
-        None => DEFAULT_CONTEXT_WINDOW_TOKENS,
+/// Die Modellkennung oder `None`, wenn weder UIA- noch Vorgabemodell gesetzt
+/// ist.
+fn effective_root_model_id(config: &ResolvedConfig, uia_root: bool) -> Option<String> {
+    if uia_root {
+        let uia_provider_usable =
+            config
+                .harness
+                .uia_provider
+                .as_deref()
+                .is_some_and(|provider_id| {
+                    config
+                        .providers
+                        .get(provider_id)
+                        .is_some_and(|provider| provider.enabled)
+                });
+        if uia_provider_usable {
+            if let Some(model) = config.harness.uia_model.as_deref() {
+                return Some(model.to_owned());
+            }
+        }
+    }
+    config.harness.default_model.clone()
+}
+
+/// Die für das Kontext-/Ausgabebudget relevanten Grenzen eines Modells.
+///
+/// Ergebnis von [`model_limits_for`]; alle Token-Angaben in Tokens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelLimits {
+    /// Effektives Kontextfenster (nie 0; unbekannt →
+    /// [`UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS`]).
+    pub context_window: u64,
+    /// `[models.<id>].max_tokens`, falls konfiguriert.
+    pub configured_max_output: Option<u64>,
+    /// Maximale Ausgabe laut eingebautem Katalog, falls deklariert.
+    pub catalog_max_output: Option<u64>,
+    /// Ob das Modell einen Reasoning-/Thinking-Modus deklariert
+    /// (`[models.<id>].reasoning` oder Katalog-`ReasoningSupport` ≠ `None`).
+    pub thinking: bool,
+    /// `false`, wenn weder Konfiguration noch Katalog ein Fenster nennen und
+    /// der Rückfallwert greift.
+    pub known: bool,
+}
+
+impl ModelLimits {
+    /// Die Ausgabereserve dieses Modells nach
+    /// [`harw_core::context_budget::output_reserve_tokens`].
+    #[must_use]
+    pub fn output_reserve_tokens(&self) -> u64 {
+        harw_core::context_budget::output_reserve_tokens(
+            self.context_window,
+            self.configured_max_output,
+            self.catalog_max_output,
+            self.thinking,
+        )
+    }
+}
+
+/// Katalogwerte eines eingebauten Modells (aus `harw-model-catalog`).
+#[derive(Clone, Copy, Debug)]
+struct CatalogLimits {
+    context_window: u64,
+    max_output: Option<u64>,
+    thinking: bool,
+}
+
+/// Der einmal je Prozess aufgebaute Katalog, Schlüssel = Katalog-Modell-ID.
+fn builtin_catalog() -> &'static HashMap<String, CatalogLimits> {
+    static CATALOG: std::sync::OnceLock<HashMap<String, CatalogLimits>> =
+        std::sync::OnceLock::new();
+    CATALOG.get_or_init(|| {
+        harw_model_catalog::descriptor::bootstrap_descriptors()
+            .into_iter()
+            .map(|d| {
+                (
+                    d.model.as_str().to_owned(),
+                    CatalogLimits {
+                        context_window: u64::from(d.context_window),
+                        max_output: d.max_output_tokens.map(u64::from),
+                        thinking: !matches!(
+                            d.capabilities.reasoning,
+                            harw_model_catalog::descriptor::ReasoningSupport::None
+                        ),
+                    },
+                )
+            })
+            .collect()
+    })
+}
+
+/// Normalisiert eine Modellkennung für den Katalogvergleich.
+///
+/// # Beschreibung
+/// Kleinschreibung; ein Provider-Präfix bis zum letzten `/` entfällt
+/// (`anthropic/claude-x` → `claude-x`); danach wiederholt ein Datums-/
+/// Versionssuffix: `-latest`, `@YYYYMMDD`, `-YYYYMMDD`, `-YYYY-MM-DD` und ein
+/// vierstelliges `-YYMM` (z. B. `mistral-large-2411`).
+fn normalize_model_id(model_id: &str) -> String {
+    let lowered = model_id.trim().to_ascii_lowercase();
+    let mut id = lowered
+        .rsplit_once('/')
+        .map_or(lowered.as_str(), |(_, tail)| tail)
+        .to_owned();
+    loop {
+        let before = id.len();
+        if let Some(stripped) = id.strip_suffix("-latest") {
+            id = stripped.to_owned();
+        }
+        // `@YYYYMMDD` (Vertex-Schreibweise) bzw. jede `@`-Version.
+        if let Some((head, _)) = id.rsplit_once('@') {
+            if !head.is_empty() {
+                id = head.to_owned();
+            }
+        }
+        // `-YYYY-MM-DD`: nur ASCII-Bytes geprüft, `truncate` trifft deshalb
+        // immer eine Zeichengrenze.
+        let bytes = id.as_bytes();
+        let len = bytes.len();
+        if len > 11 {
+            let is_iso_date =
+                bytes[len - 11..]
+                    .iter()
+                    .enumerate()
+                    .all(|(index, byte)| match index {
+                        0 | 5 | 8 => *byte == b'-',
+                        _ => byte.is_ascii_digit(),
+                    });
+            if is_iso_date {
+                id.truncate(len - 11);
+            }
+        }
+        // `-YYYYMMDD` bzw. `-YYMM`
+        let strip_numeric = id.rsplit_once('-').is_some_and(|(head, tail)| {
+            !head.is_empty()
+                && (tail.len() == 8 || tail.len() == 4)
+                && tail.bytes().all(|byte| byte.is_ascii_digit())
+        });
+        if strip_numeric {
+            if let Some((head, _)) = id.rsplit_once('-') {
+                id = head.to_owned();
+            }
+        }
+        if id.len() == before {
+            return id;
+        }
+    }
+}
+
+/// Findet den passenden Katalogschlüssel zu einer Modellkennung.
+///
+/// # Beschreibung
+/// Reine Funktion (direkt getestet). Rangfolge:
+/// 1. exakter Treffer;
+/// 2. Treffer nach [`normalize_model_id`] auf beiden Seiten (Provider-Präfix,
+///    Datums-/`-latest`-Suffix, Groß-/Kleinschreibung);
+/// 3. längster Katalogschlüssel, dessen normalisierte Form ein Präfix der
+///    normalisierten Kennung ist und an einer Trennstelle (`-`, `.`, `:`,
+///    `@`, `_`, `[`) endet (`gpt-4o-mini-high` → `gpt-4o-mini`).
+///
+/// Bei gleich langen Präfix-Treffern gewinnt der lexikografisch kleinste
+/// Schlüssel, damit das Ergebnis nicht von der `HashMap`-Reihenfolge abhängt.
+///
+/// # Rückgabe
+/// Der Katalogschlüssel oder `None`.
+fn match_catalog_key<'a, I>(keys: I, model_id: &str) -> Option<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let keys: Vec<&'a str> = keys.into_iter().collect();
+    if let Some(exact) = keys.iter().copied().find(|key| *key == model_id) {
+        return Some(exact);
+    }
+    let wanted = normalize_model_id(model_id);
+    if wanted.is_empty() {
+        return None;
+    }
+    let mut normalized_hit: Option<&'a str> = None;
+    let mut prefix_hit: Option<(usize, &'a str)> = None;
+    for key in keys {
+        let normalized = normalize_model_id(key);
+        if normalized.is_empty() {
+            continue;
+        }
+        if normalized == wanted {
+            if normalized_hit.is_none_or(|current| key < current) {
+                normalized_hit = Some(key);
+            }
+            continue;
+        }
+        let at_boundary = wanted
+            .strip_prefix(normalized.as_str())
+            .is_some_and(|rest| rest.starts_with(['-', '.', ':', '@', '_', '[']));
+        if at_boundary {
+            let better = match prefix_hit {
+                None => true,
+                Some((len, current)) => {
+                    normalized.len() > len || (normalized.len() == len && key < current)
+                }
+            };
+            if better {
+                prefix_hit = Some((normalized.len(), key));
+            }
+        }
+    }
+    normalized_hit.or(prefix_hit.map(|(_, key)| key))
+}
+
+/// Kontext-/Ausgabegrenzen eines Modells.
+///
+/// # Beschreibung
+/// Rangfolge für das Fenster: `[models.<id>].context_window` (per Schlüssel,
+/// `id` oder Alias) → eingebauter Modellkatalog (`harw-model-catalog`,
+/// verifizierte Vendor-Angaben; Alias-/Präfix-Abgleich über
+/// [`match_catalog_key`], zuerst mit der konfigurierten `id`, dann mit der
+/// übergebenen Kennung) → [`UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS`] mit
+/// `tracing::warn!`. `max_tokens`/`reasoning` stammen aus dem
+/// Konfigurationseintrag, Katalog-`max_output_tokens`/Reasoning aus dem
+/// Katalogtreffer.
+///
+/// # Argumente
+/// - `config` (`&ResolvedConfig`): die aufgelöste Konfiguration.
+/// - `model_id` (`&str`): Modellkennung, Schlüssel oder Alias.
+///
+/// # Rückgabe
+/// Die [`ModelLimits`] des Modells.
+#[must_use]
+pub fn model_limits_for(config: &ResolvedConfig, model_id: &str) -> ModelLimits {
+    let configured = config.models.get(model_id).or_else(|| {
+        config.models.values().find(|model| {
+            model.id == model_id || model.aliases.iter().any(|alias| alias.as_str() == model_id)
+        })
+    });
+    let catalog = builtin_catalog();
+    let catalog_entry = configured
+        .and_then(|model| match_catalog_key(catalog.keys().map(String::as_str), &model.id))
+        .or_else(|| match_catalog_key(catalog.keys().map(String::as_str), model_id))
+        .and_then(|key| catalog.get(key));
+
+    let configured_window = configured
+        .and_then(|model| model.context_window)
+        .filter(|window| *window > 0);
+    let catalog_window = catalog_entry
+        .map(|entry| entry.context_window)
+        .filter(|window| *window > 0);
+    let known = configured_window.is_some() || catalog_window.is_some();
+    let context_window = configured_window
+        .or(catalog_window)
+        .unwrap_or(UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS);
+    if !known {
+        tracing::warn!(
+            model = model_id,
+            fallback_tokens = UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS,
+            "runtime.context_window.unknown_model: weder [models.<id>].context_window noch \
+             der Modellkatalog kennen dieses Modell; konservatives Rückfallfenster aktiv"
+        );
+    }
+    ModelLimits {
+        context_window,
+        configured_max_output: configured.and_then(|model| model.max_tokens),
+        catalog_max_output: catalog_entry.and_then(|entry| entry.max_output),
+        thinking: configured.is_some_and(|model| model.reasoning)
+            || catalog_entry.is_some_and(|entry| entry.thinking),
+        known,
+    }
+}
+
+/// Grenzen des Modells `model` oder, ohne Modell, des Rückfallmodells
+/// `fallback`; ohne beide das konservative Rückfallfenster (mit Warnung).
+fn model_limits_or_fallback(
+    config: &ResolvedConfig,
+    model: Option<&str>,
+    fallback: Option<&str>,
+) -> ModelLimits {
+    match model.or(fallback) {
+        Some(model) => model_limits_for(config, model),
+        None => {
+            tracing::warn!(
+                fallback_tokens = UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS,
+                "runtime.context_window.no_model: kein Modell konfiguriert; konservatives \
+                 Rückfallfenster aktiv"
+            );
+            ModelLimits {
+                context_window: UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS,
+                configured_max_output: None,
+                catalog_max_output: None,
+                thinking: false,
+                known: false,
+            }
+        }
     }
 }
 
 /// Kontextfenster eines Modells in Tokens.
 ///
-/// Rangfolge: `[models.<id>].context_window` (per ID oder Alias) →
-/// eingebauter Modellkatalog (`harw-model-catalog`, verifizierte
-/// Vendor-Angaben) → [`DEFAULT_CONTEXT_WINDOW_TOKENS`].
+/// Kurzform von [`model_limits_for`]`(..).context_window` — Rangfolge
+/// `[models.<id>].context_window` (per ID oder Alias) → eingebauter
+/// Modellkatalog (Alias-/Präfix-Abgleich) →
+/// [`UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS`] (mit Warnung).
 #[must_use]
 pub fn context_window_for_model(config: &ResolvedConfig, model_id: &str) -> u64 {
-    static CATALOG: std::sync::OnceLock<HashMap<String, u64>> = std::sync::OnceLock::new();
-    let configured = config
-        .models
-        .get(model_id)
-        .or_else(|| {
-            config.models.values().find(|model| {
-                model.id == model_id || model.aliases.iter().any(|alias| alias.as_str() == model_id)
-            })
-        })
-        .and_then(|model| model.context_window);
-    if let Some(window) = configured {
-        return window;
-    }
-    let catalog = CATALOG.get_or_init(|| {
-        harw_model_catalog::descriptor::bootstrap_descriptors()
-            .into_iter()
-            .map(|d| (d.model.as_str().to_owned(), u64::from(d.context_window)))
-            .collect()
-    });
-    // Konfigurierte ID kann auf ein Katalogmodell zeigen (`id` ≠ Schlüssel).
-    let canonical = config
-        .models
-        .get(model_id)
-        .map_or(model_id, |model| model.id.as_str());
-    catalog
-        .get(canonical)
-        .or_else(|| catalog.get(model_id))
-        .copied()
-        .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS)
+    model_limits_for(config, model_id).context_window
+}
+
+/// Die feste Verdichtungs-Obergrenze dieses Laufs in Tokens:
+/// `[compaction] absolute_ceiling_tokens`, sonst
+/// [`harw_core::DEFAULT_ABSOLUTE_CEILING_TOKENS`]. Gilt für Wurzel und Kinder.
+fn configured_compaction_ceiling(config: &ResolvedConfig) -> u64 {
+    config
+        .harness
+        .compaction
+        .absolute_ceiling_tokens
+        .unwrap_or(harw_core::DEFAULT_ABSOLUTE_CEILING_TOKENS)
 }
 
 /// Byte-Budget der Request-Montage aus dem Kontextfenster abgeleitet: der
@@ -3322,11 +3598,16 @@ fn build_spawner(
     let mut spawner = ManagedAgentSpawner::new(manager, child_limits(config, model_id))
         // Jedes Kind bekommt das Kontextfenster seines tatsächlichen Modells.
         .with_context_window_resolver(Arc::new(move |model: Option<&str>| {
-            match model.or(window_config.harness.default_model.as_deref()) {
-                Some(model) => context_window_for_model(&window_config, model),
-                None => DEFAULT_CONTEXT_WINDOW_TOKENS,
-            }
+            model_limits_or_fallback(
+                &window_config,
+                model,
+                window_config.harness.default_model.as_deref(),
+            )
+            .context_window
         }))
+        // Welle 3: dieselbe feste Verdichtungs-Obergrenze wie die Wurzel
+        // (`[compaction] absolute_ceiling_tokens`, sonst Kern-Vorgabe).
+        .with_compaction_ceiling(Some(configured_compaction_ceiling(config)))
         // Orchestrierungs-Events gehen live auf den Bus und danach in den
         // persistierenden StateStore-Observer.
         .with_orchestration_observer(Arc::new(harw_core::HubOrchestrationObserver::new(
@@ -3482,6 +3763,11 @@ pub struct RuntimeAssembly {
     /// [`Self::new_root_session`] hängt ihn, falls gesetzt, über
     /// `with_pitfall_advisor` an die Wurzelsitzung.
     pitfall_advisor: Option<Arc<dyn PitfallAdvisor>>,
+    /// Das effektive Modell der Wurzelsitzung (Welle 3): bei UIA-Wurzel das
+    /// UIA-Modell, sonst `default_model` ([`effective_root_model_id`]).
+    /// [`Self::new_root_session`] leitet daraus Kontextfenster und
+    /// Ausgabereserve ab.
+    root_model_id: Option<String>,
     registry: Mutex<Option<ExtensionRegistry>>,
     responder: Mutex<Option<Arc<dyn ApprovalHandler>>>,
     /// Einmal je Montage instanziierter Permit-Ledger für Host-Profil-Worker
@@ -4000,12 +4286,19 @@ impl RuntimeAssembly {
         }
 
         // Auto-Verdichtung: Schwellen aus dem Kontextfenster des
-        // Vorgabemodells (`resolve_context_window`), nie deaktiviert — es
+        // effektiven Wurzelmodells (UIA-Modell bei UIA-Wurzel, sonst
+        // Vorgabemodell; [`effective_root_model_id`]), nie deaktiviert — es
         // gibt (noch) keinen `harw_config::HarnessConfig`-Schalter, der eine
         // Abwahl erlaubte, und einen neuen zu erfinden ist außerhalb dieses
-        // Vertrags. Der Handoff-Beobachter schreibt bei jeder Verdichtung
+        // Vertrags. Die Ausgabereserve (`[models.<id>].max_tokens` bzw.
+        // Katalog-Maximum, begrenzt durch das Fenster) und ein fester
+        // Aufschlag für System-Prompt/Werkzeuge werden vom Fenster abgezogen.
+        // Der Handoff-Beobachter schreibt bei jeder Verdichtung
         // `<project>/.harw/handoff.json` (Contract §"harw-runtime/src/handoff.rs").
-        let context_window = resolve_context_window(&self.config);
+        let root_limits =
+            model_limits_or_fallback(&self.config, self.root_model_id.as_deref(), None);
+        let context_window = root_limits.context_window;
+        let output_reserve = root_limits.output_reserve_tokens();
         // Addendum F+G / Welle 8: eine UIA-Wurzel ohne expliziten Effort
         // (`spec.reasoning_effort`, die einzige Live-Einstellung, die über
         // dieser gesamten Rangfolge steht) erbt nicht mehr unverändert
@@ -4042,22 +4335,17 @@ impl RuntimeAssembly {
                 .with_default_turn_limits(self.turn_limits.to_core())
                 .with_context_window_resolver({
                     let config = Arc::clone(&self.config);
+                    let root_model_id = self.root_model_id.clone();
                     Arc::new(move |model: Option<&str>| {
-                        match model.or(config.harness.default_model.as_deref()) {
-                            Some(model) => context_window_for_model(&config, model),
-                            None => DEFAULT_CONTEXT_WINDOW_TOKENS,
-                        }
+                        model_limits_or_fallback(&config, model, root_model_id.as_deref())
+                            .context_window
                     })
                 })
                 .with_auto_compact(Some(
                     harw_core::AutoCompactPolicy::for_context_window(context_window)
-                        .with_absolute_ceiling(Some(
-                            self.config
-                                .harness
-                                .compaction
-                                .absolute_ceiling_tokens
-                                .unwrap_or(harw_core::DEFAULT_ABSOLUTE_CEILING_TOKENS),
-                        )),
+                        .with_absolute_ceiling(Some(configured_compaction_ceiling(&self.config)))
+                        .with_output_reserve(output_reserve)
+                        .with_fixed_overhead(FIXED_CONTEXT_OVERHEAD_TOKENS),
                 ))
                 .with_compaction_observer(Some(Arc::new(crate::handoff::HandoffWriter::new(
                     self.home_project.clone(),
@@ -4089,6 +4377,9 @@ impl RuntimeAssembly {
         if let Some(ir) = self.agent_ir.as_ref() {
             session = session.with_executable_agent_ir(ir);
         }
+        // Welle 3: jede Modellanfrage der Wurzel fordert höchstens die
+        // Ausgabereserve an, die die Auto-Verdichtung vom Fenster abzieht.
+        session.set_max_output_tokens(Some(output_reserve));
         if let Some(mode) = self.spec.mode_override {
             session.set_mode(mode);
         }
@@ -4098,7 +4389,10 @@ impl RuntimeAssembly {
             session_id = %self.root_session_id,
             mode = session.mode().as_str(),
             approval_mode = ?self.approval_mode.get(),
+            root_model = self.root_model_id.as_deref().unwrap_or("<none>"),
             context_window = context_window,
+            context_window_known = root_limits.known,
+            output_reserve = output_reserve,
             "runtime.root_session.created"
         );
         // `SessionConfigured` an alle Beobachter (TUI übernimmt das Modell
@@ -4285,6 +4579,193 @@ mod tests {
                 .is_none()
         );
         Ok(())
+    }
+
+    // ── Kontextfenster je effektivem Modell (Welle 3) ───────────────────
+
+    fn model_toml(
+        id: &str,
+        context_window: Option<u64>,
+        max_tokens: Option<u64>,
+    ) -> harw_config::ModelToml {
+        harw_config::ModelToml {
+            id: id.to_owned(),
+            name: None,
+            provider: "local-a".to_owned(),
+            aliases: Vec::new(),
+            context_window,
+            max_tokens,
+            prompt_caching: None,
+            reasoning: false,
+            input_types: Vec::new(),
+            capabilities: harw_config::ModelCapabilitiesToml::default(),
+            default_reasoning_effort: None,
+            stream: None,
+        }
+    }
+
+    #[test]
+    fn normalize_model_id_strips_provider_prefix_and_date_suffixes() {
+        assert_eq!(
+            normalize_model_id("anthropic/Claude-Opus-4-8"),
+            "claude-opus-4-8"
+        );
+        assert_eq!(
+            normalize_model_id("claude-haiku-4-5-20251001"),
+            "claude-haiku-4-5"
+        );
+        assert_eq!(normalize_model_id("gpt-4o-2024-08-06"), "gpt-4o");
+        assert_eq!(normalize_model_id("mistral-large-2411"), "mistral-large");
+        assert_eq!(normalize_model_id("mistral-large-latest"), "mistral-large");
+        assert_eq!(
+            normalize_model_id("claude-sonnet-5@20260101"),
+            "claude-sonnet-5"
+        );
+        assert_eq!(normalize_model_id("glm-4.6"), "glm-4.6");
+        assert_eq!(
+            normalize_model_id("llama-3.3-70b-versatile"),
+            "llama-3.3-70b-versatile"
+        );
+    }
+
+    #[test]
+    fn match_catalog_key_prefers_exact_then_normalized_then_longest_prefix() {
+        let keys = [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "claude-haiku-4-5-20251001",
+            "mistral-large-2411",
+        ];
+        assert_eq!(match_catalog_key(keys, "gpt-4o"), Some("gpt-4o"));
+        assert_eq!(
+            match_catalog_key(keys, "openai/gpt-4o-mini"),
+            Some("gpt-4o-mini")
+        );
+        assert_eq!(
+            match_catalog_key(keys, "claude-haiku-4-5"),
+            Some("claude-haiku-4-5-20251001")
+        );
+        assert_eq!(
+            match_catalog_key(keys, "mistral-large-latest"),
+            Some("mistral-large-2411")
+        );
+        // Längster Präfix an einer Trennstelle gewinnt.
+        assert_eq!(
+            match_catalog_key(keys, "gpt-4o-mini-high"),
+            Some("gpt-4o-mini")
+        );
+        assert_eq!(match_catalog_key(keys, "gpt-4o:thinking"), Some("gpt-4o"));
+        // Kein Präfix ohne Trennstelle, kein Treffer für Fremdes.
+        assert_eq!(match_catalog_key(keys, "gpt-4ox"), None);
+        assert_eq!(match_catalog_key(keys, "my-local-model"), None);
+        assert_eq!(match_catalog_key(keys, ""), None);
+    }
+
+    #[test]
+    fn unknown_models_fall_back_to_a_conservative_window() {
+        let config = ResolvedConfig::default();
+        let limits = model_limits_for(&config, "my-local-model");
+        assert_eq!(limits.context_window, UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS);
+        assert_eq!(limits.context_window, 32_768);
+        assert!(!limits.known);
+        assert_eq!(
+            context_window_for_model(&config, "my-local-model"),
+            UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(
+            model_limits_or_fallback(&config, None, None).context_window,
+            UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS
+        );
+    }
+
+    #[test]
+    fn catalog_models_resolve_through_provider_prefix_and_date_suffix() -> TestResult {
+        let config = ResolvedConfig::default();
+        let exact = model_limits_for(&config, "claude-haiku-4-5-20251001");
+        assert!(exact.known, "Katalogmodell muss bekannt sein");
+        let aliased = model_limits_for(&config, "anthropic/claude-haiku-4-5");
+        assert!(aliased.known);
+        assert_eq!(aliased.context_window, exact.context_window);
+        assert_eq!(aliased.catalog_max_output, exact.catalog_max_output);
+        let descriptor = harw_model_catalog::descriptor::bootstrap_descriptors()
+            .into_iter()
+            .find(|d| d.model.as_str() == "claude-haiku-4-5-20251001")
+            .ok_or(TestError::Missing("claude-haiku im Katalog"))?;
+        assert_eq!(exact.context_window, u64::from(descriptor.context_window));
+        Ok(())
+    }
+
+    #[test]
+    fn configured_model_entries_win_and_carry_max_tokens() {
+        let mut config = ResolvedConfig::default();
+        let mut entry = model_toml("local-model", Some(100_000), Some(8_000));
+        entry.aliases.push("lm".to_owned());
+        entry.reasoning = true;
+        config.models.insert("local".to_owned(), entry);
+        for id in ["local", "local-model", "lm"] {
+            let limits = model_limits_for(&config, id);
+            assert_eq!(limits.context_window, 100_000, "{id}");
+            assert_eq!(limits.configured_max_output, Some(8_000), "{id}");
+            assert!(limits.thinking, "{id}");
+            assert!(limits.known, "{id}");
+        }
+
+        // Konfigurationseintrag ohne Fenster, dessen `id` ein Katalogmodell
+        // ist: das Katalogfenster greift, `max_tokens` bleibt konfiguriert.
+        config.models.insert(
+            "fast".to_owned(),
+            model_toml("claude-haiku-4-5", None, Some(4_000)),
+        );
+        let limits = model_limits_for(&config, "fast");
+        assert!(limits.known);
+        assert_eq!(
+            limits.context_window,
+            model_limits_for(&config, "claude-haiku-4-5-20251001").context_window
+        );
+        assert_eq!(limits.configured_max_output, Some(4_000));
+    }
+
+    #[test]
+    fn effective_root_model_follows_the_uia_pair_only_for_uia_roots() -> TestResult {
+        let mut config = two_provider_config();
+        assert_eq!(
+            effective_root_model_id(&config, true).as_deref(),
+            Some("local-a-model"),
+            "ohne UIA-Paar gilt das Vorgabemodell"
+        );
+        config.harness.uia_provider = Some("local-b".to_owned());
+        config.harness.uia_model = Some("local-b-model".to_owned());
+        assert_eq!(
+            effective_root_model_id(&config, true).as_deref(),
+            Some("local-b-model")
+        );
+        assert_eq!(
+            effective_root_model_id(&config, false).as_deref(),
+            Some("local-a-model"),
+            "eine Nicht-UIA-Wurzel ignoriert das UIA-Paar"
+        );
+        config
+            .providers
+            .get_mut("local-b")
+            .ok_or(TestError::Missing("local-b"))?
+            .enabled = false;
+        assert_eq!(
+            effective_root_model_id(&config, true).as_deref(),
+            Some("local-a-model"),
+            "deaktivierter UIA-Provider fällt auf das Vorgabemodell zurück"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_ceiling_defaults_to_the_core_constant() {
+        let mut config = ResolvedConfig::default();
+        assert_eq!(
+            configured_compaction_ceiling(&config),
+            harw_core::DEFAULT_ABSOLUTE_CEILING_TOKENS
+        );
+        config.harness.compaction.absolute_ceiling_tokens = Some(123_456);
+        assert_eq!(configured_compaction_ceiling(&config), 123_456);
     }
 
     // ── split_root_and_uia_worker_models (Welle 3a, Teil A) ─────────────

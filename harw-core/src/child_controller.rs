@@ -801,6 +801,14 @@ pub type ContextWindowResolver = dyn Fn(Option<&str>) -> u64 + Send + Sync;
 /// Kontextfenster eines Kindes ohne Resolver (Addendum D).
 pub const DEFAULT_CHILD_CONTEXT_WINDOW: u64 = 200_000;
 
+/// Obergrenze eines einzelnen Werkzeugergebnisses in Kind-Turns (Bytes), die
+/// jedes Kind als Vorgabe-Turn-Grenze erhält (Welle 3): 64 KiB.
+pub const CHILD_TOOL_RESULT_MAX_BYTES: usize = 64 * 1024;
+
+/// Fester Token-Overhead (System-Prompt, Tool-Spezifikationen), den die
+/// Auto-Compact-Policy eines Kindes vom Fenster abzieht (Welle 3).
+pub const CHILD_FIXED_OVERHEAD_TOKENS: u64 = 4_096;
+
 /// Receives bounded lifecycle snapshots after controller locks have been
 /// released. Implementations may persist, forward, or fan out the event but
 /// must not make scheduling decisions inside the controller.
@@ -1338,6 +1346,34 @@ pub trait ChildRegistryFactory: Send + Sync {
         self.model_for(role)
     }
 
+    /// Modell-ID, die der Kind-Provider für `role`/`complexity` fest
+    /// anspricht (Welle 3), z. B. die eines `PinnedModelProvider`.
+    ///
+    /// # Description
+    /// Grundlage für das Kontextfenster, die Auto-Compact-Policy und die
+    /// Ausgabe-Reserve des Kindes bei der Admission. Der Default baut den
+    /// Provider über [`Self::model_for_task`] und liest
+    /// [`ModelProvider::pinned_model_id`]; Factories, deren `model_for`
+    /// Nebenwirkungen hat oder teuer ist, überschreiben diese Methode.
+    ///
+    /// # Arguments
+    /// - `role` (`&str`): exakter registrierter Rollenname.
+    /// - `complexity` (`Option<TaskComplexity>`): wie bei
+    ///   [`Self::model_for_task`].
+    ///
+    /// # Returns
+    /// Die gepinnte Modell-ID oder `None` (kein Pin bekannt oder
+    /// `model_for_task` scheitert — dann gilt das `active_model` der Session).
+    fn pinned_model_for_task(
+        &self,
+        role: &str,
+        complexity: Option<TaskComplexity>,
+    ) -> Option<String> {
+        self.model_for_task(role, complexity)
+            .ok()
+            .and_then(|provider| provider.pinned_model_id())
+    }
+
     /// Liefert Provider- und Modell-Standard-Reasoning-Effort für die
     /// Provider-/Modell-Zuordnung, die diese Factory für `role` tatsächlich
     /// auflöst (Welle 8: Rangfolge Provider > Modell > Agent > Rolle).
@@ -1501,6 +1537,10 @@ pub struct ManagedAgentSpawner {
     /// Kontextfenster (Tokens) je Modell-ID des Kindes; `None`-Argument =
     /// Vorgabemodell. Ohne Resolver gilt [`DEFAULT_CHILD_CONTEXT_WINDOW`].
     context_window_resolver: Option<Arc<ContextWindowResolver>>,
+    /// Absoluter Auto-Compact-Deckel (Input-Tokens) für Kind-Sessions aus der
+    /// Konfiguration ([`Self::with_compaction_ceiling`]). `None`: es gilt
+    /// [`crate::auto_compact::DEFAULT_ABSOLUTE_CEILING_TOKENS`].
+    compaction_ceiling: Option<u64>,
     /// Optional sink for user-safe lifecycle snapshots. Invocation happens
     /// only after the active/cancellation/manager locks are released.
     orchestration_observer: Option<Arc<dyn OrchestrationObserver>>,
@@ -1971,6 +2011,31 @@ impl ManagedAgentSpawner {
         self
     }
 
+    /// Setzt den absoluten Auto-Compact-Deckel (Input-Tokens) für jede
+    /// admittierte Kind-Session (Welle 3).
+    ///
+    /// # Arguments
+    /// - `ceiling` (`Option<u64>`): konfigurierter Deckel; `None` lässt den
+    ///   Standard [`crate::auto_compact::DEFAULT_ABSOLUTE_CEILING_TOKENS`]
+    ///   gelten.
+    ///
+    /// # Returns
+    /// Den Spawner mit gesetztem Deckel (verbrauchender Builder).
+    #[must_use]
+    pub fn with_compaction_ceiling(mut self, ceiling: Option<u64>) -> Self {
+        self.compaction_ceiling = ceiling;
+        self
+    }
+
+    /// Effektiver absoluter Auto-Compact-Deckel für Kind-Sessions:
+    /// konfigurierter Wert, sonst
+    /// [`crate::auto_compact::DEFAULT_ABSOLUTE_CEILING_TOKENS`].
+    #[must_use]
+    pub fn compaction_ceiling(&self) -> u64 {
+        self.compaction_ceiling
+            .unwrap_or(crate::auto_compact::DEFAULT_ABSOLUTE_CEILING_TOKENS)
+    }
+
     /// Liefert die globalen Admission-Limits dieses Controllers.
     #[must_use]
     pub fn limits(&self) -> ChildLimits {
@@ -2002,6 +2067,7 @@ impl ManagedAgentSpawner {
             pitfall_advisor: None,
             recent_delegation_hashes: Mutex::new(BTreeMap::new()),
             context_window_resolver: None,
+            compaction_ceiling: None,
             orchestration_observer: None,
             child_tasks: Mutex::new(BTreeMap::new()),
             progress_sinks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -4723,6 +4789,13 @@ impl ManagedAgentSpawner {
             // keinen Moduswechsel überleben müssen — sie muss ihn überleben.
             child_session.narrow_base_activation(&parent_activation);
         }
+        // Welle 3: das Modell, das der Kind-Provider fest anspricht (z. B. ein
+        // `PinnedModelProvider` für Explorer/Worker). Die Factory ist die
+        // einzige Stelle, die das Provider-Routing kennt. `None` blockiert
+        // die Admission nicht — dann gilt das `active_model` der Session.
+        let child_pinned_model: Option<String> = definition
+            .registry_factory
+            .pinned_model_for_task(role_name, task_complexity);
         // Addendum D: Auto-Compact-Policy des Kindes nach organisatorischer
         // Rolle. Root-/Sub-Orchestrator-Sessions bekommen zusätzlich zur
         // relativen Schwelle einen festen Deckel und ein Turn-Start-
@@ -4736,16 +4809,20 @@ impl ManagedAgentSpawner {
                     "child session {child} disappeared before the auto-compact policy was set: {error}"
                 ))
             })?;
-            // Kontextfenster des tatsächlich aktiven Kind-Modells (Resolver
-            // aus der Runtime: Config → Modellkatalog → 200 000). Die relative
-            // 70 %-Schwelle gilt gegen dieses Fenster; der feste Deckel (s. u.)
-            // begrenzt zusätzlich die kumulierte Input-Nutzung langer
-            // Sessions (Standard: 500 000).
-            let window = self.context_window_for(
-                child_session
-                    .active_model()
-                    .map(harw_types::ModelId::as_str),
-            );
+            // Kontextfenster des tatsächlich angesprochenen Kind-Modells
+            // (Resolver aus der Runtime: Config → Modellkatalog → 200 000).
+            // Ein gepinnter Kind-Provider (`ModelProvider::pinned_model_id`,
+            // z. B. ein `PinnedModelProvider` für Explorer/Worker) überschreibt
+            // das Modell jedes Requests — sein Fenster gilt, nicht das des
+            // `active_model` der Session. Die relative 70 %-Schwelle gilt gegen
+            // dieses Fenster; der feste Deckel (s. u., konfigurierbar über
+            // `with_compaction_ceiling`) begrenzt zusätzlich die kumulierte
+            // Input-Nutzung langer Sessions (Standard: 500 000).
+            let active_model = child_session
+                .active_model()
+                .map(|model| model.as_str().to_owned());
+            let model = child_pinned_model.clone().or(active_model);
+            let window = self.context_window_for(model.as_deref());
             let history_budget = usize::try_from(window.saturating_mul(3)).unwrap_or(usize::MAX);
             let budget = child_session.context_budget();
             if history_budget > budget.max_history_bytes {
@@ -4754,8 +4831,15 @@ impl ManagedAgentSpawner {
                     max_history_bytes: history_budget,
                 });
             }
+            // Ausgabe-Reserve (Welle 3): ohne Config-Zugriff gilt der
+            // Standard (16 384, gedeckelt auf 15 % des Fensters); die Runtime
+            // setzt für die Wurzel ggf. einen konfigurierten Wert.
+            let reserve = crate::context_budget::output_reserve_tokens(window, None, None, false);
+            child_session.set_max_output_tokens(Some(reserve));
             let base_policy = crate::auto_compact::AutoCompactPolicy::for_context_window(window)
-                .with_absolute_ceiling(Some(crate::auto_compact::DEFAULT_ABSOLUTE_CEILING_TOKENS));
+                .with_absolute_ceiling(Some(self.compaction_ceiling()))
+                .with_output_reserve(reserve)
+                .with_fixed_overhead(CHILD_FIXED_OVERHEAD_TOKENS);
             let policy = match definition.organizational_role {
                 harw_agent_dsl::roles::AgentRoleId::RootOrchestrator
                 | harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator => base_policy
@@ -4784,6 +4868,29 @@ impl ManagedAgentSpawner {
                     "child session {child} disappeared before the progress observer was attached"
                 ))
             })?;
+            // Welle 3: Vorgabe-Turn-Grenzen des Kindes. Bereits gesetzte
+            // Grenzen bleiben erhalten; nur eine fehlende Kappung der
+            // Werkzeugergebnisse wird auf `CHILD_TOOL_RESULT_MAX_BYTES` gesetzt.
+            let mut limits = child_session
+                .default_turn_limits()
+                .unwrap_or_else(crate::turn_loop::TurnLimits::unlimited);
+            if limits.tool_result_max_bytes == usize::MAX {
+                limits.tool_result_max_bytes = CHILD_TOOL_RESULT_MAX_BYTES;
+            }
+            let child_session = child_session.with_default_turn_limits(limits);
+            // Welle 3: Resolver an die Kind-Session, damit ein späterer
+            // Modellwechsel (`set_active_model`) Policy und History-Budget neu
+            // skaliert. Bei gepinntem Kind-Modell bleibt dessen Fenster
+            // maßgeblich — der Pin überschreibt jedes Request-Modell.
+            let child_session = match self.context_window_resolver.clone() {
+                Some(resolver) => {
+                    let pinned = child_pinned_model.clone();
+                    let scoped: Arc<ContextWindowResolver> =
+                        Arc::new(move |model: Option<&str>| resolver(pinned.as_deref().or(model)));
+                    child_session.with_context_window_resolver(scoped)
+                }
+                None => child_session,
+            };
             let child_session = child_session
                 .with_progress_observer(Some(self.progress_observer()))
                 .with_guard_policy(Some(self.guard_policy))
@@ -6459,6 +6566,15 @@ specialization = "child-controller-test"
                     Arc::new(HangingModel)
                 };
                 Ok(model)
+            }
+
+            // Die Admission darf den Sieger-Provider nicht vorab verbrauchen.
+            fn pinned_model_for_task(
+                &self,
+                _role: &str,
+                _complexity: Option<TaskComplexity>,
+            ) -> Option<String> {
+                None
             }
         }
 
@@ -8936,6 +9052,172 @@ max_depth = 0
             &record,
             start + CHILD_PROGRESS_MIN_INTERVAL * 4
         ));
+        Ok(())
+    }
+
+    // --- Welle 3: Kontextfenster, Ausgabe-Reserve und Turn-Grenzen ---
+
+    /// Registry-Factory, deren Kind-Provider auf ein festes Modell gepinnt
+    /// ist (wie `RuntimeChildRegistryFactory` für Explorer/Worker).
+    struct PinnedChildRegistry {
+        model: &'static str,
+    }
+
+    impl ChildRegistryFactory for PinnedChildRegistry {
+        fn build_registry(
+            &self,
+            _role: &str,
+            _input: &SpawnInput,
+            _suggestions: Option<&AgentSuggestions>,
+        ) -> Result<ExtensionRegistry, AgentSpawnError> {
+            Ok(ExtensionRegistryBuilder::default().build())
+        }
+
+        fn model_for(&self, _role: &str) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
+            let inner: Arc<dyn ModelProvider> = Arc::new(EchoModelProvider::new("pinned"));
+            Ok(Arc::new(crate::pinned_model::PinnedModelProvider::new(
+                inner,
+                None,
+                Some(harw_types::ModelId::from(self.model)),
+            )))
+        }
+    }
+
+    fn window_test_resolver() -> Arc<ContextWindowResolver> {
+        Arc::new(|model: Option<&str>| match model {
+            Some("small-model") => 32_000,
+            Some("big-model") => 1_000_000,
+            _ => 200_000,
+        })
+    }
+
+    fn window_test_spawner(
+        registry: Arc<dyn ChildRegistryFactory>,
+        ceiling: Option<u64>,
+    ) -> TestResult<(ManagedAgentSpawner, SessionId, SandboxSpec)> {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]))?;
+        let parent = SessionId::new();
+        let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative())
+            .with_role(
+                "worker",
+                AgentRole::Agent {
+                    name: "worker".to_owned(),
+                },
+                harw_agent_dsl::roles::AgentRoleId::Worker,
+                registry,
+            )
+            .with_context_window_resolver(window_test_resolver())
+            .with_compaction_ceiling(ceiling)
+            .with_external_root_parent(
+                parent.clone(),
+                external_root_context(
+                    sandbox.clone(),
+                    harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+                ),
+                None,
+                SessionActivation::default(),
+            )
+            .map_err(ctx("trusted external root registers during construction"))?;
+        Ok((spawner, parent, sandbox))
+    }
+
+    #[test]
+    fn compaction_ceiling_defaults_to_the_standard_ceiling() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative());
+        assert_eq!(
+            spawner.compaction_ceiling(),
+            crate::auto_compact::DEFAULT_ABSOLUTE_CEILING_TOKENS
+        );
+        let spawner = spawner.with_compaction_ceiling(Some(42_000));
+        assert_eq!(spawner.compaction_ceiling(), 42_000);
+    }
+
+    #[test]
+    fn admit_sizes_the_child_from_its_pinned_model_window() -> TestResult {
+        let (spawner, parent, sandbox) = window_test_spawner(
+            Arc::new(PinnedChildRegistry {
+                model: "small-model",
+            }),
+            Some(123_456),
+        )?;
+        let child = spawner
+            .admit("worker", spawn_input(parent), sandbox, None)
+            .map_err(ctx("child is admitted"))?;
+
+        let mut manager = spawner
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session = manager
+            .get_mut(&child)
+            .map_err(ctx("child is manager-owned"))?;
+
+        let reserve = crate::context_budget::output_reserve_tokens(32_000, None, None, false);
+        let expected = crate::auto_compact::AutoCompactPolicy::for_context_window(32_000)
+            .with_absolute_ceiling(Some(123_456))
+            .with_output_reserve(reserve)
+            .with_fixed_overhead(CHILD_FIXED_OVERHEAD_TOKENS);
+        assert_eq!(
+            session.auto_compact().copied(),
+            Some(expected),
+            "das Fenster des gepinnten Modells (32 000) und der konfigurierte Deckel gelten"
+        );
+        assert_eq!(session.max_output_tokens(), Some(reserve));
+
+        let limits = session
+            .default_turn_limits()
+            .ok_or(TestError::Missing("child must carry default turn limits"))?;
+        assert_eq!(limits.tool_result_max_bytes, CHILD_TOOL_RESULT_MAX_BYTES);
+        assert_eq!(limits.tool_result_max_bytes, 65_536);
+        assert_eq!(limits.max_model_rounds, u32::MAX);
+
+        // Ein Modellwechsel darf das Fenster eines gepinnten Kindes nicht
+        // verschieben — der Pin überschreibt jedes Request-Modell.
+        session.set_active_model(Some(harw_types::ModelId::from("big-model")));
+        assert_eq!(
+            session
+                .auto_compact()
+                .map(crate::auto_compact::AutoCompactPolicy::context_window_tokens),
+            Some(32_000)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn admit_without_a_pin_uses_the_default_ceiling_and_rescales_on_model_change() -> TestResult {
+        let (spawner, parent, sandbox) = window_test_spawner(Arc::new(EmptyChildRegistry), None)?;
+        let child = spawner
+            .admit("worker", spawn_input(parent), sandbox, None)
+            .map_err(ctx("child is admitted"))?;
+
+        let mut manager = spawner
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session = manager
+            .get_mut(&child)
+            .map_err(ctx("child is manager-owned"))?;
+
+        let reserve = crate::context_budget::output_reserve_tokens(200_000, None, None, false);
+        let expected = crate::auto_compact::AutoCompactPolicy::for_context_window(200_000)
+            .with_absolute_ceiling(Some(crate::auto_compact::DEFAULT_ABSOLUTE_CEILING_TOKENS))
+            .with_output_reserve(reserve)
+            .with_fixed_overhead(CHILD_FIXED_OVERHEAD_TOKENS);
+        assert_eq!(session.auto_compact().copied(), Some(expected));
+        assert_eq!(session.max_output_tokens(), Some(reserve));
+
+        // Die Kind-Session trägt den Resolver: ein Modellwechsel skaliert.
+        session.set_active_model(Some(harw_types::ModelId::from("big-model")));
+        assert_eq!(
+            session
+                .auto_compact()
+                .map(crate::auto_compact::AutoCompactPolicy::context_window_tokens),
+            Some(1_000_000)
+        );
         Ok(())
     }
 }

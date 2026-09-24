@@ -58,8 +58,14 @@ pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 /// Nur an diesen Host gehen implizite Umgebungs-Credentials
 /// (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`).
 pub(crate) const ANTHROPIC_API_HOST: &str = "api.anthropic.com";
-/// Default-Ausgabe-Token-Obergrenze, falls die Anfrage keine vorgibt.
-pub const DEFAULT_MAX_TOKENS: u32 = 4096;
+/// Default-Ausgabe-Token-Obergrenze, falls die Anfrage keine vorgibt
+/// (`ModelRequest::max_output_tokens == None`). Wird wie ein explizit
+/// angeforderter Wert über `anthropic_caps::clamp_max_tokens` auf das
+/// Ausgabe-Limit des Modells geklemmt.
+pub const DEFAULT_MAX_TOKENS: u32 = 16_384;
+/// Byte-Deckel je gerendertem Tool-Ergebnis im Messages-Body, wenn der
+/// Request keinen setzt (`ModelRequest::tool_result_max_bytes == None`).
+pub const DEFAULT_TOOL_RESULT_MAX_BYTES: usize = 64 * 1024;
 
 /// Warnhinweis für die Nutzung eines Abo-OAuth-/Setup-Tokens (Claude Free/Pro/Max)
 /// mit `harw` statt eines Console-API-Keys.
@@ -476,7 +482,11 @@ fn push_content_block(messages: &mut Vec<Value>, role: &str, block: Value) {
 ///   (`{"type":"tool_use","id":<call_id>,"name":<tool_name>,"input":<args>}`).
 /// - `ToolResult` → `user`-Message mit einem `tool_result`-Content-Block
 ///   (`{"type":"tool_result","tool_use_id":<call_id>,"content":<text>}`),
-///   plus `"is_error":true` bei `Err`.
+///   plus `"is_error":true` bei `Err`. `<text>` entsteht — wie im
+///   OpenAI-kompatiblen Pfad — ausschließlich über
+///   [`harw_core::envelope::render_tool_result`] (Trust-Hülle für
+///   `Untrusted`, Byte-Deckel `request.tool_result_max_bytes`, sonst
+///   [`DEFAULT_TOOL_RESULT_MAX_BYTES`]).
 ///
 /// `request.tools` wird — sofern nicht leer — via [`build_anthropic_tools`]
 /// auf `body["tools"]` abgebildet; bei leerem Tool-Set bleibt das Feld unset
@@ -501,13 +511,16 @@ fn push_content_block(messages: &mut Vec<Value>, role: &str, block: Value) {
 ///
 /// Ist `request.reasoning_effort` `None`, bleiben beide Felder unset.
 ///
-/// `max_tokens` wird über [`anthropic_caps::clamp_max_tokens`] auf das
-/// Ausgabe-Limit des Modells geklemmt, bevor es auf `body["max_tokens"]`
-/// landet; für unbekannte Modelle bleibt der angeforderte Wert unverändert.
+/// Die Ausgabe-Obergrenze ist `request.max_output_tokens`, sofern gesetzt
+/// und > 0, sonst der Provider-Default `max_tokens`. Sie wird über
+/// [`anthropic_caps::clamp_max_tokens`] auf das Ausgabe-Limit des Modells
+/// geklemmt, bevor sie auf `body["max_tokens"]` landet; für unbekannte
+/// Modelle bleibt der Wert unverändert.
 ///
 /// # Arguments
 /// - `model` (`&str`): Modell-/Deployment-Name für das `model`-Feld.
-/// - `max_tokens` (`u32`): gewünschte Ausgabe-Token-Obergrenze (vor Clamping).
+/// - `max_tokens` (`u32`): Provider-Default der Ausgabe-Token-Obergrenze
+///   (vor Clamping), greift nur ohne `request.max_output_tokens`.
 /// - `request` (`&ModelRequest`): Quelle für System-Prompt, Fragmente,
 ///   Verlauf, Tools und optionales `reasoning_effort`.
 ///
@@ -523,6 +536,10 @@ pub fn build_messages_body(model: &str, max_tokens: u32, request: &ModelRequest)
 
     // Interne Namen wie `fs.read` verletzen Anthropics Namensmuster.
     let names = ToolNameCodec::for_request(request);
+    let mut renderer = super::ToolResultRenderer::new(request);
+    if request.tool_result_max_bytes.is_none() {
+        renderer.max_bytes = DEFAULT_TOOL_RESULT_MAX_BYTES;
+    }
     let mut messages: Vec<Value> = Vec::new();
     for message in request.history.to_model_messages() {
         match message {
@@ -549,10 +566,8 @@ pub fn build_messages_body(model: &str, max_tokens: u32, request: &ModelRequest)
                 );
             }
             harw_core::ModelMessage::ToolResult { call_id, result } => {
-                let (content, is_error) = match result {
-                    ToolCallResult::Success { value } => (value.to_string(), false),
-                    ToolCallResult::Error { message } => (message, true),
-                };
+                let is_error = matches!(result, ToolCallResult::Error { .. });
+                let content = renderer.render(&call_id, &result);
                 let mut block = serde_json::json!({
                     "type": "tool_result",
                     "tool_use_id": call_id.as_str(),
@@ -566,7 +581,11 @@ pub fn build_messages_body(model: &str, max_tokens: u32, request: &ModelRequest)
         }
     }
 
-    let max_tokens = crate::anthropic_caps::clamp_max_tokens(model, max_tokens);
+    let requested = request
+        .max_output_tokens
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or(max_tokens);
+    let max_tokens = crate::anthropic_caps::clamp_max_tokens(model, requested);
     let mut body = serde_json::json!({
         "model": model,
         "max_tokens": max_tokens,
@@ -752,6 +771,9 @@ pub fn extract_anthropic_usage(body: &Value) -> TokenUsage {
 /// Anthropic-Werte werden 1:1 gemappt, ein unbekannter String landet in
 /// [`StopReason::Other`], und ein komplett fehlendes Feld fällt auf
 /// [`StopReason::EndTurn`] zurück (Default-Verhalten bei regulärer Antwort).
+/// `model_context_window_exceeded` (Eingabe + Ausgabe haben das
+/// Kontextfenster erreicht) wird zu [`StopReason::ContextWindowExceeded`],
+/// damit der Turn-Loop eine Notfall-Kompaktierung auslösen kann.
 ///
 /// # Arguments
 /// - `body` (`&Value`): der bereits geparste JSON-Response-Body.
@@ -767,6 +789,7 @@ pub fn extract_anthropic_stop_reason(body: &Value) -> StopReason {
         Some("stop_sequence") => StopReason::StopSequence,
         Some("pause_turn") => StopReason::PauseTurn,
         Some("refusal") => StopReason::Refusal { detail: None },
+        Some("model_context_window_exceeded") => StopReason::ContextWindowExceeded,
         Some(other) => StopReason::Other(other.to_owned()),
         None => StopReason::EndTurn,
     }
@@ -1884,15 +1907,154 @@ mod tests {
             .get("content")
             .and_then(Value::as_array)
             .ok_or(TestError::Missing("content array"))?;
-        assert_eq!(
-            content[0].get("content").and_then(Value::as_str),
-            Some("boom")
-        );
+        // Untrusted (Default von `push_tool_result`) ⇒ Trust-Hülle um die
+        // Fehlermeldung (gemeinsamer Renderer, W3 C-PROTO).
+        let rendered = content[0]
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or(TestError::Missing("tool_result content"))?;
+        assert!(rendered.starts_with(harw_core::envelope::UNTRUSTED_BEGIN_PREFIX));
+        assert!(rendered.contains("status=error"));
+        assert!(rendered.contains("| boom"));
         assert_eq!(
             content[0].get("is_error").and_then(Value::as_bool),
             Some(true)
         );
         Ok(())
+    }
+
+    fn request_with_history(history: harw_core::ConversationHistory) -> ModelRequest {
+        ModelRequest {
+            stream: None,
+            system_prompt: String::new(),
+            instruction_fragments: Vec::new(),
+            context: Vec::new(),
+            history,
+            tools: Vec::new(),
+            context_assembly: Default::default(),
+            reasoning_effort: None,
+            model_id: None,
+            provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
+            cancel: None,
+            identity: None,
+        }
+    }
+
+    fn first_tool_result_content(body: &Value) -> TestResult<String> {
+        body.get("messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| messages.first())
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+            .and_then(|blocks| blocks.first())
+            .and_then(|block| block.get("content"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or(TestError::Missing("tool_result content"))
+    }
+
+    #[test]
+    fn test_build_messages_body_caps_tool_result_at_default_budget() -> TestResult {
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_tool_result(
+            harw_types::ToolCallId::from_str("call_big"),
+            ToolCallResult::success(Value::String("x".repeat(200 * 1024))),
+            5,
+        );
+        let body = build_messages_body("m", 256, &request_with_history(history));
+        let content = first_tool_result_content(&body)?;
+        assert!(content.len() <= DEFAULT_TOOL_RESULT_MAX_BYTES);
+        assert!(content.contains("[truncated: showing"));
+        assert!(content.contains(harw_core::envelope::UNTRUSTED_END_PREFIX));
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_messages_body_caps_tool_result_at_request_hint() -> TestResult {
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_tool_result(
+            harw_types::ToolCallId::from_str("call_big"),
+            ToolCallResult::success(Value::String("y".repeat(16 * 1024))),
+            5,
+        );
+        let request = request_with_history(history).with_tool_result_max_bytes(Some(2_048));
+        let body = build_messages_body("m", 256, &request);
+        let content = first_tool_result_content(&body)?;
+        assert!(content.len() <= 2_048);
+        assert!(content.contains("[truncated: showing"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_messages_body_small_tool_result_is_not_truncated() -> TestResult {
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_tool_result(
+            harw_types::ToolCallId::from_str("call_small"),
+            ToolCallResult::success(serde_json::json!({"temp": 20})),
+            5,
+        );
+        let body = build_messages_body("m", 256, &request_with_history(history));
+        let content = first_tool_result_content(&body)?;
+        assert!(content.contains(r#"| {"temp":20}"#));
+        assert!(!content.contains("[truncated:"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_messages_body_honors_request_max_output_tokens() {
+        let request = request_with_history(harw_core::ConversationHistory::new())
+            .with_max_output_tokens(Some(2_000));
+        let body = build_messages_body("totally-unknown-deployment", DEFAULT_MAX_TOKENS, &request);
+        assert_eq!(body.get("max_tokens").and_then(Value::as_u64), Some(2_000));
+    }
+
+    #[test]
+    fn test_build_messages_body_request_max_output_tokens_is_clamped_by_caps() {
+        let request = request_with_history(harw_core::ConversationHistory::new())
+            .with_max_output_tokens(Some(u32::MAX));
+        let body = build_messages_body("claude-opus-5", DEFAULT_MAX_TOKENS, &request);
+        let expected = crate::anthropic_caps::clamp_max_tokens("claude-opus-5", u32::MAX);
+        assert!(
+            expected < u32::MAX,
+            "claude-opus-5 must have a known output cap"
+        );
+        assert_eq!(
+            body.get("max_tokens").and_then(Value::as_u64),
+            Some(u64::from(expected))
+        );
+    }
+
+    #[test]
+    fn test_build_messages_body_zero_or_missing_max_output_uses_default() {
+        for hint in [None, Some(0)] {
+            let request = request_with_history(harw_core::ConversationHistory::new())
+                .with_max_output_tokens(hint);
+            let body =
+                build_messages_body("totally-unknown-deployment", DEFAULT_MAX_TOKENS, &request);
+            assert_eq!(
+                body.get("max_tokens").and_then(Value::as_u64),
+                Some(u64::from(DEFAULT_MAX_TOKENS)),
+                "hint {hint:?}"
+            );
+        }
+        assert_eq!(DEFAULT_MAX_TOKENS, 16_384);
+    }
+
+    #[test]
+    fn test_extract_anthropic_stop_reason_maps_context_window_exceeded() {
+        let body = serde_json::json!({"stop_reason": "model_context_window_exceeded"});
+        assert_eq!(
+            extract_anthropic_stop_reason(&body),
+            StopReason::ContextWindowExceeded
+        );
+        let other = serde_json::json!({"stop_reason": "something_new"});
+        assert_eq!(
+            extract_anthropic_stop_reason(&other),
+            StopReason::Other("something_new".to_owned())
+        );
     }
 
     #[test]

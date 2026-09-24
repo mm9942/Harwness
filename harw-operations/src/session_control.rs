@@ -172,6 +172,51 @@ impl SessionControlSnapshot {
     }
 }
 
+// ── ContextUsageSnapshot ──────────────────────────────────────────────────────
+
+/// Letzte angewandte (Auto-)Kompaktierung einer Session (Welle 3).
+///
+/// # Beschreibung
+/// Reine Lese-Kopie der Felder des Protokoll-Ereignisses
+/// `TurnEvent::CompactionApplied`. Bewusst ohne Abhängigkeit auf
+/// `harw-protocol`: `harw-operations` liegt unter Protokoll und Laufzeit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LastCompaction {
+    /// Auslöser der Kompaktierung (z. B. `"auto"`, `"manual"`, `"emergency"`).
+    pub reason: String,
+    /// Geschätzte Verlaufs-Tokens vor der Kompaktierung, falls bekannt.
+    pub tokens_before: Option<u64>,
+    /// Geschätzte Verlaufs-Tokens nach der Kompaktierung, falls bekannt.
+    pub tokens_after: Option<u64>,
+    /// Ob eine Zusammenfassung erzeugt wurde.
+    pub summarized: bool,
+    /// Anzahl ausgelassener Werkzeugergebnisse.
+    pub elided_results: u32,
+}
+
+/// Momentaufnahme der Kontextfenster-Auslastung einer Session (Welle 3).
+///
+/// # Beschreibung
+/// Spiegelt die zuletzt beobachteten Werte der Ereignisse
+/// `TurnEvent::ContextUpdated` und `TurnEvent::CompactionApplied`, wie sie
+/// die Oberfläche (TUI/Runtime) mitliest. Wird von `/status` und `/usage`
+/// gelesen. `None`-Felder bedeuten: der Wert ist (noch) nicht bekannt.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextUsageSnapshot {
+    /// Zuletzt gemeldete belegte Tokens des Kontextfensters.
+    pub used_tokens: u64,
+    /// Größe des Kontextfensters in Tokens.
+    pub window_tokens: u64,
+    /// Schätzung der Tokens der nächsten Anfrage, falls bekannt.
+    pub estimated_next_tokens: Option<u64>,
+    /// Schwelle, ab der die nächste Kompaktierung ausgelöst wird.
+    pub threshold_tokens: Option<u64>,
+    /// Für die Modellausgabe reservierte Tokens.
+    pub reserve_tokens: Option<u64>,
+    /// Letzte angewandte Kompaktierung; `None` = in dieser Session noch keine.
+    pub last_compaction: Option<LastCompaction>,
+}
+
 // ── SessionControlError ───────────────────────────────────────────────────────
 
 /// Fehlervarianten eines [`SessionController`]-Aufrufs.
@@ -360,6 +405,20 @@ pub trait SessionController: Send + Sync {
     /// Implementierungen müssen intern locken, falls nötig. Die zurückgegebene
     /// Momentaufnahme ist lock-frei und `Send + Sync`.
     fn snapshot(&self) -> SessionControlSnapshot;
+
+    /// Liefert die zuletzt beobachtete Kontextfenster-Auslastung (Welle 3).
+    ///
+    /// # Beschreibung
+    /// Rein lesender Zugriff für `/status` und `/usage`. Oberflächen, die
+    /// `ContextUpdated`-/`CompactionApplied`-Ereignisse mitlesen, überschreiben
+    /// diese Methode.
+    ///
+    /// # Standardverhalten
+    /// `None` — die Oberfläche führt keine Kontext-Momentaufnahme; die
+    /// Aufrufer lassen die Kontextzeile dann stillschweigend weg.
+    fn context_usage(&self) -> Option<ContextUsageSnapshot> {
+        None
+    }
 }
 
 // ── SharedSessionController ───────────────────────────────────────────────────
@@ -411,6 +470,7 @@ pub type SharedSessionController = Arc<dyn SessionController>;
 #[derive(Debug, Default)]
 pub struct NullSessionController {
     inner: std::sync::Mutex<SessionControlSnapshot>,
+    context: std::sync::Mutex<Option<ContextUsageSnapshot>>,
 }
 
 impl NullSessionController {
@@ -427,6 +487,23 @@ impl NullSessionController {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Zeichnet eine Kontext-Momentaufnahme auf, die
+    /// [`SessionController::context_usage`] anschließend liefert.
+    ///
+    /// # Fehler
+    /// - [`SessionControlError::Disconnected`]: Interner Mutex ist vergiftet.
+    pub fn set_context_usage(
+        &self,
+        usage: Option<ContextUsageSnapshot>,
+    ) -> Result<(), SessionControlError> {
+        self.context
+            .lock()
+            .map(|mut guard| {
+                *guard = usage;
+            })
+            .map_err(|_| SessionControlError::Disconnected)
     }
 }
 
@@ -544,6 +621,12 @@ impl SessionController for NullSessionController {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_else(|_| SessionControlSnapshot::empty())
+    }
+
+    /// Liefert die über [`NullSessionController::set_context_usage`]
+    /// aufgezeichnete Kontext-Momentaufnahme; bei vergiftetem Mutex `None`.
+    fn context_usage(&self) -> Option<ContextUsageSnapshot> {
+        self.context.lock().ok().and_then(|guard| guard.clone())
     }
 }
 
@@ -730,5 +813,21 @@ mod tests {
         fn accepts_std_error(_e: &dyn std::error::Error) {}
         let e = SessionControlError::Disconnected;
         accepts_std_error(&e);
+    }
+
+    #[test]
+    fn null_controller_context_usage_defaults_to_none_and_records_values() -> TestResult {
+        let ctrl = NullSessionController::new();
+        assert_eq!(ctrl.context_usage(), None);
+        let usage = ContextUsageSnapshot {
+            used_tokens: 1_000,
+            window_tokens: 10_000,
+            threshold_tokens: Some(8_000),
+            ..ContextUsageSnapshot::default()
+        };
+        ctrl.set_context_usage(Some(usage.clone()))
+            .map_err(ctx("set_context_usage"))?;
+        assert_eq!(ctrl.context_usage(), Some(usage));
+        Ok(())
     }
 }

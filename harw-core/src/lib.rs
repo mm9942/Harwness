@@ -64,7 +64,10 @@ pub use compaction::{
     CompactionObserver, CompactionOutcome, CompactionPlan, SUMMARY_MARKER, compact_session,
     deterministic_pass,
 };
-pub use context_budget::{ContextAssembly, ContextBudget};
+pub use context_budget::{
+    ContextAssembly, ContextBudget, DEFAULT_BYTES_PER_TOKEN, TokenCalibration,
+    estimate_request_bytes, estimate_request_tokens, output_reserve_tokens,
+};
 pub use delegation_visibility::{
     DelegationTarget, DelegationTargetKind, visible_delegation_targets,
 };
