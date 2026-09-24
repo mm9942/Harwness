@@ -324,18 +324,19 @@ fn test_profile_by_permission_matrix_never_registers_ungranted_tools() -> TestRe
                 .filter(|tool| tool.starts_with("web."))
                 .collect();
             if !web.is_empty() {
-                // `Research` führt alle vier `web.*`-Werkzeuge;
-                // `ReadOnlyExplore`/`UiaExplorer`/`UiaQuickHelper`/`UiaWriter`
+                // `Research` und die UIA-Helfer `UiaQuickHelper`/`UiaWriter`
+                // (`UIA_HELPER_WEB_TOOLS`) führen alle vier `web.*`-Werkzeuge;
+                // `ReadOnlyExplore`/`ReadOnlyResearch`/`UiaExplorer`
                 // (`EXPLORER_WEB_TOOLS`) nur `web.fetch`/`web.search`.
                 let allowed_web: &[&str] = match *profile {
-                    RegistryProfile::Research => {
+                    RegistryProfile::Research
+                    | RegistryProfile::UiaQuickHelper
+                    | RegistryProfile::UiaWriter => {
                         &["web.fetch", "web.docs_rs", "web.crates_io", "web.search"]
                     }
                     RegistryProfile::ReadOnlyExplore
                     | RegistryProfile::ReadOnlyResearch
-                    | RegistryProfile::UiaExplorer
-                    | RegistryProfile::UiaQuickHelper
-                    | RegistryProfile::UiaWriter => &["web.fetch", "web.search"],
+                    | RegistryProfile::UiaExplorer => &["web.fetch", "web.search"],
                     _ => &[],
                 };
                 for tool in &web {

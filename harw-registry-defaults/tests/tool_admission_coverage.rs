@@ -319,15 +319,19 @@ fn agent_definition_tool_provider_without_access_registers_only_read_and_list_to
 
 /// Nutzerentscheidung „die UIA-Helfer recherchieren kurz online und fügen
 /// manchmal Abhängigkeiten hinzu“: `uia-worker` und `uia-writer` admittieren
-/// `web.fetch`/`web.search` und die fünf lesenden `deps.*`-Werkzeuge — und
-/// ihr Profil (`UiaQuickHelper` bzw. `UiaWriter`) registriert/bewirbt genau
-/// diese auch, sonst wäre der TOML-Eintrag toter Text. Die tiefere
-/// Crate-Recherche (`web.docs_rs`/`web.crates_io`) bleibt beiden verboten.
+/// alle vier `web.*`-Werkzeuge (`web.fetch`/`web.search` plus die
+/// Crate-Werkzeuge `web.docs_rs`/`web.crates_io`, `UIA_HELPER_WEB_TOOLS`) und
+/// die fünf lesenden `deps.*`-Werkzeuge — und ihr Profil (`UiaQuickHelper`
+/// bzw. `UiaWriter`) registriert/bewirbt genau diese auch, sonst wäre der
+/// TOML-Eintrag toter Text. `lens.ask` bleibt beiden verboten; das Netz
+/// selbst bindet weiterhin die Egress-Policy des Elternteils.
 #[test]
 fn uia_helpers_admit_and_register_web_search_and_read_only_deps_tools() -> TestResult {
     let roles = resolved_roles()?;
-    const RESEARCH_TOOLS: [&str; 7] = [
+    const RESEARCH_TOOLS: [&str; 9] = [
         "web.fetch",
+        "web.docs_rs",
+        "web.crates_io",
         "web.search",
         "deps.graph",
         "deps.locked",
@@ -366,11 +370,15 @@ fn uia_helpers_admit_and_register_web_search_and_read_only_deps_tools() -> TestR
             );
             assert!(!forbidden.contains(tool), "{role} verbietet {tool}");
         }
-        for tool in ["web.docs_rs", "web.crates_io", "lens.ask"] {
-            assert!(!admitted.contains(tool), "{role} admittiert {tool}");
-            assert!(!advertised.contains(tool), "{profile:?} registriert {tool}");
-            assert!(forbidden.contains(tool), "{role} muss {tool} verbieten");
-        }
+        assert!(!admitted.contains("lens.ask"), "{role} admittiert lens.ask");
+        assert!(
+            !advertised.contains("lens.ask"),
+            "{profile:?} registriert lens.ask"
+        );
+        assert!(
+            forbidden.contains("lens.ask"),
+            "{role} muss lens.ask verbieten"
+        );
     }
     Ok(())
 }

@@ -27,8 +27,11 @@ jiff = { workspace = true }
 # auf bereits aufgelösten Paketen (siehe crate-doc, Abschnitt "Die
 # HTTP-Bibliothek"). Kein `reqwest` (zusätzliche, größere Fläche) und keine
 # TLS-Bibliothek (siehe crate-doc, Abschnitt "TLS").
-hyper = { version = "1", features = ["client"] }
-hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio"] }
+# "http1" ist nötig, damit `hyper_util::client::legacy::Client` auch beim
+# alleinigen Bau (`cargo test -p harw-observe-otlp`) existiert -- im
+# Workspace-Bau kam das Feature nur zufällig über die Feature-Vereinigung.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 http-body-util = { version = "0.1" }
 bytes = "1"
 tokio = { version = "1", features = ["rt", "net", "time", "sync"] }

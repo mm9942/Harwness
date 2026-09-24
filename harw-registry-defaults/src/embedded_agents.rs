@@ -2039,14 +2039,18 @@ mod tests {
     ///   ausschließlich `web.fetch`/`web.search` (`EXPLORER_WEB_TOOLS`) —
     ///   Nutzerentscheidung „der Explorer durchsucht alles … auch das
     ///   Internet“.
+    /// - `researcher` und `dependency-researcher` (`ReadOnlyResearch`):
+    ///   genau `web.fetch`/`web.search` — allgemeine bzw.
+    ///   ökosystem-neutrale Recherche über die offiziellen Quellen, ohne die
+    ///   Crate-Werkzeuge.
     /// - `uia-worker` (`UiaQuickHelper`) und `uia-writer` (`UiaWriter`):
-    ///   ebenfalls genau `web.fetch`/`web.search` (`EXPLORER_WEB_TOOLS`) —
-    ///   Nutzerentscheidung „die UIA-Helfer recherchieren kurz online und
-    ///   fügen manchmal Abhängigkeiten hinzu“.
+    ///   alle vier Netz-Werkzeuge (`UIA_HELPER_WEB_TOOLS`) — Nutzerentscheidung
+    ///   „die UIA-Helfer recherchieren kurz online und fügen manchmal
+    ///   Abhängigkeiten hinzu“ (crates.io-Metadaten, docs.rs).
     ///
     /// Jede andere Rolle — insbesondere `analyst`/`researcher-deps`, die sich
-    /// das Profil `ReadOnlyExplore` mit dem `explorer` teilen — admittiert
-    /// kein `web.*`.
+    /// das Profil `ReadOnlyExplore` mit dem `explorer` teilen, sowie
+    /// `planner` und die Orchestratoren — admittiert kein `web.*`.
     #[test]
     fn test_web_tools_are_admitted_only_by_researcher_web_explorers_and_uia_roles() -> TestResult {
         let definitions = builtin()?;
@@ -2058,13 +2062,19 @@ mod tests {
                 .map(String::as_str)
                 .filter(|name| name.starts_with("web."))
                 .collect();
-            let expected: BTreeSet<&str> = if role == role_names::RESEARCHER_WEB {
+            let expected: BTreeSet<&str> = if [
+                role_names::RESEARCHER_WEB,
+                role_names::UIA_WORKER,
+                role_names::UIA_WRITER,
+            ]
+            .contains(&role.as_str())
+            {
                 ["web.fetch", "web.docs_rs", "web.crates_io", "web.search"].into()
             } else if [
                 role_names::EXPLORER,
                 role_names::UIA_EXPLORER,
-                role_names::UIA_WORKER,
-                role_names::UIA_WRITER,
+                role_names::RESEARCHER,
+                role_names::DEPENDENCY_RESEARCHER,
             ]
             .contains(&role.as_str())
             {
@@ -2074,7 +2084,7 @@ mod tests {
             };
             assert_eq!(
                 web, expected,
-                "{role}: web.* führen nur der Web-Rechercheur, die Explorer und die UIA-Rollen"
+                "{role}: web.* führen nur die Rechercheure, die Explorer und die UIA-Rollen"
             );
         }
         Ok(())

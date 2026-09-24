@@ -470,11 +470,21 @@ fn render_proposal_review(loaded: &LoadedSkillProposal) -> String {
     }
     lines.push("--- skill.toml ---".to_owned());
     lines.push(loaded.skill_toml.trim_end().to_owned());
-    lines.push(format!(
-        "--- instructions.md ({} Bytes), Diff gegen Bestand ---",
-        loaded.instructions.len()
-    ));
-    lines.push(meta.instructions_diff.trim_end().to_owned());
+    if meta.replaces_existing {
+        lines.push(format!(
+            "--- instructions.md ({} Bytes), Diff gegen Bestand ---",
+            loaded.instructions.len()
+        ));
+        lines.push(meta.instructions_diff.trim_end().to_owned());
+    } else {
+        // Ohne Bestand ist der Diff nur „new file" — der Operator muss den
+        // vollständigen Text sehen, den er übernimmt.
+        lines.push(format!(
+            "--- instructions.md ({} Bytes), neu ---",
+            loaded.instructions.len()
+        ));
+        lines.push(loaded.instructions.trim_end().to_owned());
+    }
     if meta.evals.is_empty() {
         lines.push("Evals: keine".to_owned());
     } else {
